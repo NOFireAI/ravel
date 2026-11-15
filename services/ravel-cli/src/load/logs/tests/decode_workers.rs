@@ -1005,16 +1005,16 @@ async fn a_panicking_delivered_hook_fails_the_decode_task_body() {
         }
     });
     let (mut rx, handle) = decode.spawn(4, Some(hook), None);
-    let received = tokio::time::timeout(RUN_GUARD, async {
-        // allow-wall-clock: hang guard only
+    let drain = async {
         let mut received = Vec::new();
         while let Some(p) = rx.recv().await {
             received.push(emitted(p, false));
         }
         received
-    })
-    .await
-    .expect("the decode stage ends");
+    };
+    let received = tokio::time::timeout(RUN_GUARD, drain) // allow-wall-clock: hang guard only
+        .await
+        .expect("the decode stage ends");
     // Batches 0-3 build at once, so the failure can arrive before either
     // earlier batch is emitted; nothing from batch 2 on is.
     assert!(received.len() <= 2, "batches 0 and 1 at most: {received:?}");
