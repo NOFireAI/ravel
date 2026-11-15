@@ -51,6 +51,19 @@
 //! horizon still pay for a GET, decode, and the authoritative
 //! [`expired_and_past_horizon`] check.
 //!
+//! # The version hold
+//!
+//! Before an hour's expired records are deleted, every data object and L1 part
+//! they name is probed with the RLOG trailer gate the retention sweep uses
+//! ([`crate::retention::held_out_of_window_rlog`], ADR-4233 decision 4, H7).
+//! One object outside this build's reader window holds the whole hour: no
+//! record or object in it is deleted this pass, and each held object is
+//! counted in [`crate::retention::held_out_of_window_objects_total`]. Such an
+//! object is readable by the other side of a rolling upgrade, so deleting it
+//! here destroys data only this build cannot read. A corrupt object is not
+//! held, as in the retention sweep. The probe is one 16-byte suffix GET per
+//! object, paid only for records the pass would otherwise delete.
+//!
 //! # Shard 0 (legal hold) is unreachable, forever
 //!
 //! This sweep is hard-scoped to [`QUERY_AUDIT_SHARD`]: it lists only that
@@ -62,6 +75,8 @@
 
 use ravel_commit::keys::{self, BucketEntry, KeyError};
 use ravel_commit::record;
+use std::collections::BTreeMap;
+
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
 use ravel_proto::commit::v1::CompactionRecord;
 use ravel_types::{Signal, TenantHash};
@@ -74,6 +89,7 @@ use crate::config::{CompactorConfig, NS_PER_HOUR};
 use crate::error::{MaintainError, Result};
 use crate::query_audit::QUERY_AUDIT_SHARD;
 use crate::read::verify_commit_key;
+use crate::retention::held_out_of_window_rlog;
 use crate::sweep::LeaseCheck;
 
 /// What one [`sweep_audit_retention`] pass over a tenant's query-audit shard
@@ -87,8 +103,12 @@ pub struct AuditRetentionOutcome {
     /// L1 part objects of expired compaction records deleted.
     pub parts_deleted: usize,
     /// Records left in place: not yet expired, still within the protection
-    /// horizon, or lease/legal-hold protected.
+    /// horizon, lease/legal-hold protected, or in an hour the version hold
+    /// kept.
     pub kept: usize,
+    /// Data objects and L1 parts outside this build's reader window that held
+    /// their hour this pass (the module docs' version hold).
+    pub held_out_of_window: usize,
     /// L0 commit records whose GET+decode was skipped because the key's
     /// `ingest_hour_bucket` alone proved the record cannot be expired. A
     /// subset of `kept`.
@@ -128,6 +148,8 @@ pub async fn sweep_audit_retention(
     let metas = list_all(store, &prefix).await?;
 
     let mut outcome = AuditRetentionOutcome::default();
+    // Delete candidates by ingest hour, so the version hold covers the hour.
+    let mut candidates: BTreeMap<u32, Vec<Candidate>> = BTreeMap::new();
     for meta in metas {
         match keys::partition_bucket_entry(&meta.key) {
             Ok(BucketEntry::CommitRecord(parsed)) => {
@@ -164,17 +186,16 @@ pub async fn sweep_audit_retention(
                     outcome.kept += 1;
                     continue;
                 }
-                // Record before data (mirrors the superseded sweep): a crash
-                // between the two leaves record-less data for orphan GC, never a
-                // record pointing at a deleted object.
-                if !config.dry_run {
-                    store.delete(&meta.key).await?;
-                    store.delete(&data_key).await?;
-                }
-                outcome.records_deleted += 1;
-                outcome.data_deleted += 1;
+                candidates
+                    .entry(parsed.ingest_hour_bucket)
+                    .or_default()
+                    .push(Candidate {
+                        record_key: meta.key,
+                        objects: vec![data_key],
+                        compacted: false,
+                    });
             }
-            Ok(BucketEntry::CompactionRecord(_)) => {
+            Ok(BucketEntry::CompactionRecord(parsed)) => {
                 let crec = get_compaction_record(store, &meta.key).await?;
                 // The window reads the parts' events, not the record's
                 // (recent) compaction time; see the module docs.
@@ -193,15 +214,14 @@ pub async fn sweep_audit_retention(
                     outcome.kept += 1;
                     continue;
                 }
-                // Record before parts, same ordering discipline as above.
-                if !config.dry_run {
-                    store.delete(&meta.key).await?;
-                    for key in &part_keys {
-                        store.delete(key).await?;
-                    }
-                }
-                outcome.records_deleted += 1;
-                outcome.parts_deleted += part_keys.len();
+                candidates
+                    .entry(parsed.ingest_hour_bucket)
+                    .or_default()
+                    .push(Candidate {
+                        record_key: meta.key,
+                        objects: part_keys,
+                        compacted: true,
+                    });
             }
             // The query-audit shard is written only by the audit pipeline (L0
             // records) and compacted by this crate (compaction records + L1
@@ -219,7 +239,53 @@ pub async fn sweep_audit_retention(
             Err(e) => return Err(MaintainError::Key(e)),
         }
     }
+
+    for (hour, hour_candidates) in candidates {
+        let objects: Vec<String> = hour_candidates
+            .iter()
+            .flat_map(|c| c.objects.iter().cloned())
+            .collect();
+        let held = held_out_of_window_rlog(store, &objects).await?;
+        if !held.is_empty() {
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                shard,
+                ingest_hour_bucket = hour,
+                held_objects = held.len(),
+                versions = ?held.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+                "audit retention held an hour: format versions outside this build's reader window"
+            );
+            outcome.held_out_of_window += held.len();
+            outcome.kept += hour_candidates.len();
+            continue;
+        }
+        for candidate in hour_candidates {
+            // Record before its objects (mirrors the superseded sweep): a crash
+            // between the two leaves record-less data for orphan GC, never a
+            // record pointing at a deleted object.
+            if !config.dry_run {
+                store.delete(&candidate.record_key).await?;
+                for key in &candidate.objects {
+                    store.delete(key).await?;
+                }
+            }
+            outcome.records_deleted += 1;
+            if candidate.compacted {
+                outcome.parts_deleted += candidate.objects.len();
+            } else {
+                outcome.data_deleted += candidate.objects.len();
+            }
+        }
+    }
     Ok(outcome)
+}
+
+/// One expired record the pass would delete, with the data object or L1 parts
+/// it names.
+struct Candidate {
+    record_key: String,
+    objects: Vec<String>,
+    compacted: bool,
 }
 
 /// Conservative, GET-free prefilter: true only when the key's
@@ -528,10 +594,12 @@ mod tests {
             .expect("sweep");
         let gets_after = store.metrics().snapshot().op(StoreOp::Get).calls;
 
+        // One record GET per expired-hour record, plus the version hold's one
+        // suffix GET per data object the pass deletes.
         assert_eq!(
             gets_after - gets_before,
-            EXPIRED as u64,
-            "GET count must equal the boundary/expired-hour records, not all {} records",
+            2 * EXPIRED as u64,
+            "GET count must follow the boundary/expired-hour records, not all {} records",
             RECENT + EXPIRED
         );
         assert_eq!(outcome.kept, RECENT as usize);
@@ -588,9 +656,11 @@ mod tests {
             .expect("sweep");
         let gets_after = store.metrics().snapshot().op(StoreOp::Get).calls;
 
+        // Both record GETs, plus the version hold's suffix GET of the one data
+        // object the pass deletes.
         assert_eq!(
             gets_after - gets_before,
-            2,
+            3,
             "the ambiguous hour cannot be cleared by the prefilter; both records need a GET"
         );
         assert_eq!(
@@ -773,6 +843,106 @@ mod tests {
                 "the held record's data object must survive"
             );
         }
+    }
+
+    /// Every L0 data object key on the query-audit shard.
+    async fn l0_data_keys(store: &dyn ObjectStoreBackend, tenant: &TenantHash) -> Vec<String> {
+        let prefix = format!("t/{}/u/l0/{:04}/", tenant.to_hex(), QUERY_AUDIT_SHARD);
+        list_all(store, &prefix)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key)
+            .collect()
+    }
+
+    /// Rewrite one stored RLOG object's trailer bytes with `edit`.
+    async fn edit_trailer(store: &dyn ObjectStoreBackend, key: &str, edit: impl Fn(&mut [u8])) {
+        let mut bytes = store
+            .get(key, GetRange::Full)
+            .await
+            .expect("object present")
+            .data
+            .to_vec();
+        let at = bytes.len() - ravel_logseg::footer::TRAILER_LEN;
+        edit(&mut bytes[at..]);
+        store
+            .put(key, bytes::Bytes::from(bytes), Default::default())
+            .await
+            .expect("overwrite");
+    }
+
+    /// ADR-4233 decision 4, H7: an expired audit object whose trailer version
+    /// is outside this build's reader window holds its whole ingest hour,
+    /// including the in-window object beside it, and the hour after it is
+    /// still swept. Hour A holds two expired objects, one of them out of
+    /// window; hour B holds one expired, readable object.
+    #[tokio::test]
+    async fn unreadable_version_audit_object_is_held() {
+        let store = MemoryStore::new();
+        let tenant = tenant();
+        let now = 400 * NS_PER_DAY;
+        let clock = FixedClock::new(now);
+        let config = CompactorConfig::default();
+        let hour_a = now - 100 * NS_PER_DAY;
+        seed_audit(&store, &tenant, hour_a, "held query").await;
+        let held_key = l0_data_keys(&store, &tenant).await.remove(0);
+        seed_audit(&store, &tenant, hour_a + 10, "held neighbour").await;
+        seed_audit(&store, &tenant, hour_a + 5 * NS_PER_HOUR, "swept query").await;
+        let version = ravel_logseg::footer::SUPPORTED_VERSIONS.newest() + 1;
+        edit_trailer(&store, &held_key, |trailer| {
+            trailer[8..10].copy_from_slice(&version.to_le_bytes());
+        })
+        .await;
+        let before = crate::retention::held_out_of_window_objects_total();
+
+        let outcome = sweep_audit_retention(&store, &clock, &config, &NoLeases, &tenant)
+            .await
+            .expect("sweep");
+
+        assert_eq!(outcome.held_out_of_window, 1, "{outcome:?}");
+        assert_eq!(
+            outcome.kept, 2,
+            "both records of the held hour: {outcome:?}"
+        );
+        assert_eq!(outcome.records_deleted, 1, "hour B is swept: {outcome:?}");
+        assert_eq!(outcome.data_deleted, 1, "{outcome:?}");
+        let remaining = l0_data_keys(&store, &tenant).await;
+        assert_eq!(remaining.len(), 2, "hour A's objects stay: {remaining:?}");
+        assert!(remaining.contains(&held_key), "{remaining:?}");
+        assert_eq!(commit_count(&store, &tenant).await, 2);
+        assert!(
+            crate::retention::held_out_of_window_objects_total() > before,
+            "the hold counter moved"
+        );
+    }
+
+    /// A corrupt expired audit object is not a version hold: it is deleted as
+    /// before.
+    #[tokio::test]
+    async fn corrupt_audit_object_is_still_deleted() {
+        let store = MemoryStore::new();
+        let tenant = tenant();
+        let now = 400 * NS_PER_DAY;
+        let clock = FixedClock::new(now);
+        let config = CompactorConfig::default();
+        seed_audit(&store, &tenant, now - 100 * NS_PER_DAY, "corrupt query").await;
+        let key = l0_data_keys(&store, &tenant).await.remove(0);
+        edit_trailer(&store, &key, |trailer| {
+            let last = trailer.len() - 1;
+            trailer[last] ^= 0xFF;
+        })
+        .await;
+
+        let outcome = sweep_audit_retention(&store, &clock, &config, &NoLeases, &tenant)
+            .await
+            .expect("sweep");
+
+        assert_eq!(outcome.held_out_of_window, 0, "{outcome:?}");
+        assert_eq!(outcome.records_deleted, 1, "{outcome:?}");
+        assert_eq!(outcome.data_deleted, 1, "{outcome:?}");
+        assert_eq!(l0_data_count(&store, &tenant).await, 0);
+        assert_eq!(commit_count(&store, &tenant).await, 0);
     }
 
     // --- helpers ------------------------------------------------------------

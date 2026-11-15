@@ -33,7 +33,8 @@ use uuid::Uuid;
 
 /// One-byte version tag on the advisory cursor payload. The cursor is not a
 /// frozen format; the tag only lets a future encoding change be detected and
-/// treated as "no usable cursor" (rescan), never misread.
+/// treated as "no usable cursor" (rescan), never misread; a payload carrying
+/// another tag is left in place.
 const CURSOR_TAG: u8 = 1;
 
 /// Outcome of one scan pass over a `(tenant, signal, shard)`.
@@ -76,7 +77,20 @@ pub async fn scan_and_compact(
     shard: u32,
 ) -> Result<ScanReport> {
     let cursor_key = keys::maint_cursor_key(&tenant_hash, signal, shard)?;
-    let cursor = read_cursor(store, &cursor_key).await?;
+    let (cursor, cursor_writable) = match read_cursor(store, &cursor_key).await? {
+        StoredCursor::Absent => (None, true),
+        StoredCursor::Usable { hour, version } => (Some((hour, version)), true),
+        StoredCursor::Unrecognized { version } => (Some((0, version)), true),
+        StoredCursor::ForeignTag { tag } => {
+            tracing::warn!(
+                cursor_key = %cursor_key,
+                tag,
+                "compaction cursor carries a tag this build does not know; scanning from the \
+                 beginning and leaving the stored cursor in place"
+            );
+            (None, false)
+        }
+    };
     let start_after = cursor.as_ref().map(|(hour, _)| *hour);
 
     let hours = list_shard_hours(store, &tenant_hash, signal, shard).await?;
@@ -144,7 +158,7 @@ pub async fn scan_and_compact(
         }
     }
 
-    if let Some(hour) = highest_done {
+    if let Some(hour) = highest_done.filter(|_| cursor_writable) {
         // Advisory: a lost CAS race just means another maintainer already
         // moved the cursor, so treat AlreadyExists/PreconditionFailed as fine.
         write_cursor(store, &cursor_key, hour, cursor.map(|(_, v)| v)).await?;
@@ -2238,23 +2252,44 @@ pub async fn scan_and_maintain_with_memo(
     Ok(report)
 }
 
-/// Read the advisory cursor. Returns the recorded hour and the object version
-/// (for the next CAS). A decode failure is treated as no cursor (advisory
-/// rescan), never an error; store faults propagate.
-async fn read_cursor(store: &dyn ObjectStoreBackend, key: &str) -> Result<Option<(u32, Version)>> {
+/// What [`read_cursor`] found at the cursor key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StoredCursor {
+    Absent,
+    Usable {
+        hour: u32,
+        version: Version,
+    },
+    /// This build's tag with a malformed body (or an empty payload): ignored
+    /// and CAS-overwritten by the next advance.
+    Unrecognized {
+        version: Version,
+    },
+    /// Another build's tag: the scan starts from the beginning and never
+    /// overwrites it (ADR-4233 decision 4, H9).
+    ForeignTag {
+        tag: u8,
+    },
+}
+
+/// Read the advisory cursor. A decode failure is treated as no cursor
+/// (advisory rescan), never an error; store faults propagate.
+async fn read_cursor(store: &dyn ObjectStoreBackend, key: &str) -> Result<StoredCursor> {
     match store.get(key, GetRange::Full).await {
         Ok(got) => {
             let data = got.data;
-            if data.len() == 5 && data[0] == CURSOR_TAG {
-                let hour = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-                Ok(Some((hour, got.version)))
-            } else {
-                // Unrecognized cursor payload: ignore it (rescan from zero),
-                // but keep the version so we can CAS-overwrite it cleanly.
-                Ok(Some((0, got.version)))
+            match data.first() {
+                Some(&tag) if tag != CURSOR_TAG => Ok(StoredCursor::ForeignTag { tag }),
+                Some(_) if data.len() == 5 => Ok(StoredCursor::Usable {
+                    hour: u32::from_le_bytes([data[1], data[2], data[3], data[4]]),
+                    version: got.version,
+                }),
+                _ => Ok(StoredCursor::Unrecognized {
+                    version: got.version,
+                }),
             }
         }
-        Err(StoreError::NotFound) => Ok(None),
+        Err(StoreError::NotFound) => Ok(StoredCursor::Absent),
         Err(e) => Err(MaintainError::Store(e)),
     }
 }

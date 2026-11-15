@@ -889,8 +889,9 @@ async fn physical_sweep(
 /// one with another's gate would call every object corrupt, which is the exact
 /// collapse this function exists to prevent. Any other signal is swept
 /// unprobed. Audit and alerts also write RLOG, but neither reaches this sweep:
-/// audit objects age out through `sweep_audit_retention`, which applies no
-/// version hold, and alerts is not a maintained signal.
+/// audit objects age out through `sweep_audit_retention`, which applies the
+/// same RLOG gate through [`held_out_of_window_rlog`], and alerts is not a
+/// maintained signal.
 ///
 /// The version comes from the trailer, not from the commit record's
 /// `segment_format_version`: that field is a writer's stamp no reader checks
@@ -916,6 +917,25 @@ async fn held_out_of_window(
             held.push((key.clone(), version));
         }
     }
+    Ok(held)
+}
+
+/// The RLOG data objects among `keys` whose trailer version is outside this
+/// build's reader window, each counted into
+/// [`held_out_of_window_objects_total`]. The audit retention sweep's version
+/// hold (ADR-4233 decision 4, H7): audit objects are RLOG whatever the signal
+/// says, so the gate is chosen here rather than from the signal.
+pub(crate) async fn held_out_of_window_rlog(
+    store: &dyn ObjectStoreBackend,
+    keys: &[String],
+) -> Result<Vec<(String, u16)>> {
+    let mut held = Vec::new();
+    for key in keys {
+        if let Some(version) = out_of_window_version(store, ProbedFormat::Rlog, key).await? {
+            held.push((key.clone(), version));
+        }
+    }
+    HELD_OUT_OF_WINDOW_OBJECTS.fetch_add(held.len() as u64, Ordering::Relaxed);
     Ok(held)
 }
 

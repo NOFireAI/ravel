@@ -35,7 +35,8 @@ use ravel_commit::erasure::compute_compaction_input_set_hash;
 use ravel_commit::keys::{self, BucketEntry};
 use ravel_commit::record;
 use ravel_object_store::{
-    DrainStep, GetRange, MAX_LIST_PAGES, ObjectMeta, ObjectStoreBackend, StoreError, drain_pages,
+    DrainStep, GetRange, MAX_LIST_PAGES, ObjectMeta, ObjectStoreBackend, StoreError, Unaddressable,
+    drain_pages,
 };
 use ravel_proto::commit::v1::{CommitRecord, CompactionInputIdentity};
 use ravel_segment::{
@@ -102,7 +103,46 @@ pub async fn list_bucket_with_ledger(
         bucket.shard,
         bucket.ingest_hour_bucket,
     )?;
-    let metas = list_all_counted(store, &prefix, ledger).await?;
+    let (metas, _) = list_all_counted(store, &prefix, ledger).await?;
+    partition_bucket_listing(metas)
+}
+
+/// [`list_bucket`] over a strict listing (ADR-4233 decision 6): a key under the
+/// bucket's prefix that the store cannot address fails with
+/// [`MaintainError::UnaddressableKey`] instead of being left out.
+pub(crate) async fn list_bucket_strict(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+) -> Result<BucketListing> {
+    let prefix = keys::commit_shard_hour_prefix(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )?;
+    let (metas, unaddressable) = list_all_counted(store, &prefix, None).await?;
+    refuse_unaddressable(&prefix, &unaddressable)?;
+    partition_bucket_listing(metas)
+}
+
+/// [`MaintainError::UnaddressableKey`] naming the first of `unaddressable`'s
+/// keys, when the listing of `prefix` skipped any.
+pub(crate) fn refuse_unaddressable(prefix: &str, unaddressable: &Unaddressable) -> Result<()> {
+    if unaddressable.count == 0 {
+        return Ok(());
+    }
+    Err(MaintainError::UnaddressableKey {
+        prefix: prefix.to_string(),
+        key: unaddressable
+            .sample
+            .first()
+            .map(|k| k.key.clone())
+            .unwrap_or_default(),
+        count: unaddressable.count,
+    })
+}
+
+fn partition_bucket_listing(metas: Vec<ObjectMeta>) -> Result<BucketListing> {
     let mut listing = BucketListing::default();
     for meta in metas {
         match keys::partition_bucket_entry(&meta.key) {
@@ -136,9 +176,9 @@ async fn list_all_counted(
     store: &dyn ObjectStoreBackend,
     prefix: &str,
     ledger: Option<&RequestLedger>,
-) -> Result<Vec<ObjectMeta>> {
+) -> Result<(Vec<ObjectMeta>, Unaddressable)> {
     let mut out: Vec<ObjectMeta> = Vec::new();
-    drain_pages(
+    let unaddressable = drain_pages(
         prefix,
         None,
         MAX_LIST_PAGES,
@@ -154,7 +194,7 @@ async fn list_all_counted(
         },
     )
     .await?;
-    Ok(out)
+    Ok((out, unaddressable))
 }
 
 /// One decoded L0 input: its commit record plus the key it was listed at.

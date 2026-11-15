@@ -250,6 +250,39 @@ pub enum MaintainError {
         /// The decoder's refusal.
         detail: String,
     },
+    /// An RSEG rewrite input recorded at a format version above the one this
+    /// build writes (ADR-0066 decision 2). Refused before any decode or PUT.
+    #[error(
+        "RSEG rewrite input {commit_key:?} is recorded as format version {version}, newer than the current output version {writable}: a rewrite migrates an older object forward and cannot write a version this build does not know, so a newer-than-writable input is refused fail-closed (ADR-0066 decision 2)"
+    )]
+    NewerThanWritable {
+        commit_key: String,
+        version: u32,
+        writable: u32,
+    },
+    /// A strict listing (ADR-4233 decision 6) found a key under `prefix` that
+    /// the census cannot address. `count` is how many such keys the listing
+    /// reported; `key` is the first of them.
+    #[error(
+        "listing {prefix:?} holds {count} key(s) the census cannot address, first {key:?}; the run fails rather than shorten the population (ADR-4233 decision 6)"
+    )]
+    UnaddressableKey {
+        prefix: String,
+        key: String,
+        count: u64,
+    },
+    /// A migrate walk held one or more buckets (ADR-4233 decision 6): the walk
+    /// went on past each, and the floor was not raised. `report` is the walk's
+    /// report as it stood when the run stopped.
+    #[error(
+        "migrate held {} bucket(s) and did not raise the floor: {}",
+        held.len(),
+        crate::migrate::display_held(held)
+    )]
+    MigrateHeld {
+        held: Vec<crate::migrate::MigrateHeldBucket>,
+        report: Box<crate::migrate::FamilyMigrateReport>,
+    },
     #[error("unknown object shape in bucket listing: {0:?}")]
     UnknownBucketEntry(String),
     #[error("decoded record signal {actual} does not match the queried signal {expected}")]
