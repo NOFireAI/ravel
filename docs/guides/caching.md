@@ -404,6 +404,14 @@ When the cache is on, `ravel-server` warms it before it reports ready
 bounded number of the most recent metric and log segments of that tenant. The
 first real query after a restart then does not pay the full cold cost.
 
+For logs it also reads the footer and directories of every log segment in the
+same window that a query plans from its directories, without the segment's
+column pages. The first log query after a restart then opens those segments
+from the cache instead of fetching their footers again. This metadata pass
+uses at most half of `--cache-max-bytes`, counting what the cache already
+holds, and stops when the next segment would not fit.
+docs/query-engine.md, "Startup warm-up of logs metadata", has the details.
+
 "Most recent" is measured from the latest ingest hour of each tenant, not from
 wall-clock time. A tenant that has not ingested in the last day still gets its
 most recent parts warmed, not zero.
@@ -471,8 +479,15 @@ Do not expect a `warn!` from this path on a normal warmup pass. A
 tenant/signal combination can produce only two `warn!` lines: the `"error"`
 case, and the "has parts but none warmed" line of `cache_warm`.
 
+A logs line also carries `metadata_objects_warmed` and `metadata_bytes_warmed`:
+the log segments whose footer and directories the metadata pass read for that
+tenant, and the bytes it fetched from storage for them.
+
 One final `info!` at the end of the pass carries the total `parts_warmed`
-across every tenant and signal and the `elapsed_ms` of the pass.
+across every tenant and signal and the `elapsed_ms` of the pass. It also
+carries the totals `metadata_objects_warmed` and `metadata_bytes_warmed`, and
+`metadata_budget_reached`, which is `true` when the metadata pass stopped at
+its share of the cache rather than at the end of the window.
 
 - A restart whose log shows this final line warmed the cache.
 - A restart that hit the time budget never reaches it. It logs the `warn!`

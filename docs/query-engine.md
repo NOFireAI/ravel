@@ -1340,7 +1340,9 @@ same instance to two more fetch paths:
   status, which the coordinator folds back into the typed
   `FetchMemoryExhausted`.
 - **Cache warmup.** The startup warm pass (`cache_warm::warm_cache`) builds its
-  own RSEG and RLOG fetchers and wires the process budget into both: a warm
+  own RSEG and RLOG fetchers, plus the RLOG fetcher of its logs metadata pass
+  (see "Startup warm-up of logs metadata"), and wires the process budget into
+  all of them: a warm
   fetch decodes the part it reads into a buffer held until the fetch returns,
   so it holds memory beyond the cache insert. A refused warm fetch is skipped
   like any other warm failure.
@@ -7266,6 +7268,51 @@ size to key a `(offset, len)` entry on. `ravel-cache`'s disk tier is wired
 to both the RSEG/RLOG fetcher cache and the catalog byte cache: passing
 `--cache-dir` attaches a RAM-over-disk `TieredCache` to each, single-
 flighted and corruption-gated per ADR-0046 decisions 3-5.
+
+### Startup warm-up of logs metadata
+
+Before `/readyz` latches, `cache_warm::warm_cache` reads the 4 most recent
+parts of each (tenant, signal) whole, then runs a logs metadata pass
+(ADR-4203 decision 8). The pass is not held to the 4-part cap: it
+visits every logs object in the warm window, the 24 hours before the tenant's
+latest ingest hour through the end of that hour, most recent first, and skips
+the objects the query path reads whole (at or below
+`LogSegmentFetcher::plan_whole_object_bound`). For each remaining object it
+calls `BlockRangeFetcher::fetch_plan_directories`, the plan phase's own read,
+on a fetcher built with the query path's logs block-range threshold, request
+cost, projection break-even and fetch bound. So the suffix probe lands under
+the key every route looks up first, `(object_size - p, p)` with `p` =
+`derive_suffix_len(object_size)`. When the footer and all four directories
+(STREAM_DIR, FIELD_DIR, SKIP_IDX, PAGE_DIR) fit in that probe, as they do on
+the test objects below, the probe is the only read either route makes before
+its column pages.
+The striped route reads it in the plan phase and again when the scan opens
+the object; the whole-segment fast path reads it when the scan opens the
+object. The pass reads no column page.
+
+Bounds. The pass runs inside the warm-up's 10-second deadline. It admits an
+object only while the read cache's resident bytes, plus the probes in flight,
+plus its own probe stay within half of `--cache-max-bytes`; the first object
+that does not fit ends the pass for every later tenant too, and startup
+continues. The other half is left for the column pages the first statements
+insert. At most the store GET concurrency's permit count of objects is read
+at once. A failed read skips that object.
+
+The `cache warmup: pass complete` log line reports `metadata_objects_warmed`,
+`metadata_bytes_warmed` (bytes fetched from the store) and
+`metadata_budget_reached` beside `parts_warmed`. When the pass runs, each
+per-(tenant, logs) line carries the first two for that tenant.
+
+`services/ravel-server/tests/cache_warm_footers_e2e.rs` pins this on a
+restarted server over six objects
+(`a_restarted_server_serves_the_first_scan_footers_from_the_warmed_cache`).
+On both routes the first statement issues no footer GET and no directory GET,
+the phase that first opens each object takes one cache hit per object, and
+column-page GETs equal an unwarmed run's. While the server starts, the
+warm-up reads one probe per object, no column page, and only 4 objects
+whole. Two more tests pin the bounds:
+`the_metadata_warm_stops_at_the_cache_budget` (footer GETs equal the objects
+the pass did not reach) and `a_failed_metadata_read_skips_only_that_object`.
 
 See docs/guides/caching.md for CLI flags, metrics, and known gaps, and
 docs/adrs/0046-read-cache-tier.md for the funnel/keying/eviction design
