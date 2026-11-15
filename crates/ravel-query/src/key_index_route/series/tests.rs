@@ -504,6 +504,7 @@ struct Run {
     key_index_gets: u64,
 }
 
+#[allow(clippy::result_large_err)]
 fn run_with(
     fx: &Fx,
     plans: &[Vec<(&str, &str)>],
@@ -523,7 +524,10 @@ fn run_with(
         .await?;
         Ok(Run {
             routing,
-            key_index_gets: accounting.key_index().snapshot().s3_requests(AccountedOp::Get),
+            key_index_gets: accounting
+                .key_index()
+                .snapshot()
+                .s3_requests(AccountedOp::Get),
         })
     })
 }
@@ -533,9 +537,7 @@ fn run(fx: &Fx, plans: &[Vec<(&str, &str)>], options: SeriesRouteOptions) -> Run
 }
 
 fn kept(routing: &MetricRouting, plan: usize, s: usize) -> bool {
-    routing.plan_keeps[plan]
-        .as_ref()
-        .is_none_or(|keep| keep[s])
+    routing.plan_keeps[plan].as_ref().is_none_or(|keep| keep[s])
 }
 
 /// Whether segment `s` holds a series matching every pair of `plan`.
@@ -611,7 +613,11 @@ fn the_row_three_shape_opens_only_the_series_holders() {
         ));
         let b = universe.len();
         universe.push(series(
-            &[("__name__", "other"), ("env", "prod"), ("instance", &instance)],
+            &[
+                ("__name__", "other"),
+                ("env", "prod"),
+                ("instance", &instance),
+            ],
             b as u64,
         ));
         entries.push(vec![a, b]);
@@ -639,7 +645,11 @@ fn the_row_three_shape_opens_only_the_series_holders() {
     assert_eq!(label_value.routing.segments_pruned_by_label_index, 0);
     assert!(label_value.routing.series.is_none());
 
-    let figures = routed.routing.series.as_ref().expect("the series route ran");
+    let figures = routed
+        .routing
+        .series
+        .as_ref()
+        .expect("the series route ran");
     assert_eq!(figures.plans_routed, 1);
     assert_eq!(figures.plan_parts_answered, 1);
     assert_eq!(figures.plan_parts_declined(), 0);
@@ -674,7 +684,10 @@ fn leaves_with_no_series_fields_route_as_the_label_value_route_does() {
     let mut second = PartSpec::simple(entries.clone());
     second.uncovered[2] = true;
     second.present[5] = false;
-    let specs = vec![PartSpec::simple(entries).without_series(), second.without_series()];
+    let specs = vec![
+        PartSpec::simple(entries).without_series(),
+        second.without_series(),
+    ];
     let fx = block_on(fixture(&universe, &specs, &[vec![0]]));
     let plans = vec![
         JOB_A.to_vec(),
@@ -688,7 +701,10 @@ fn leaves_with_no_series_fields_route_as_the_label_value_route_does() {
         let values = route_values(input(&fx, &accounting, &reader, &UNLIMITED), &plans)
             .await
             .expect("route");
-        let gets = accounting.key_index().snapshot().s3_requests(AccountedOp::Get);
+        let gets = accounting
+            .key_index()
+            .snapshot()
+            .s3_requests(AccountedOp::Get);
         (values, gets)
     });
     assert!(routed.routing.series.is_none());
@@ -734,7 +750,11 @@ fn assert_falls_back(
         "{reason:?}"
     );
     assert_eq!(routed.routing.segments_pruned_by_series_index, 0);
-    let figures = routed.routing.series.as_ref().expect("the series route ran");
+    let figures = routed
+        .routing
+        .series
+        .as_ref()
+        .expect("the series route ran");
     let pairs = figures.plans_routed * specs.len() as u64;
     assert_eq!(figures.declined(reason), pairs, "{reason:?}: {figures:?}");
     assert_eq!(figures.plan_parts_declined(), pairs, "{reason:?}");
@@ -746,7 +766,11 @@ fn assert_falls_back(
             .map(|v| (v.key8_hex.clone(), v.segments_pruned))
             .collect()
     };
-    assert_eq!(value_passes(&routed), value_passes(&reference), "{reason:?}");
+    assert_eq!(
+        value_passes(&routed),
+        value_passes(&reference),
+        "{reason:?}"
+    );
 }
 
 #[test]
@@ -1065,10 +1089,10 @@ fn a_shared_pass_over_q_a_admits_the_cheapest_plans_and_sends_the_rest_on() {
         &plans,
         SeriesRouteOptions::default(),
     );
-    for p in 0..plans.len() {
+    for (p, plan) in plans.iter().enumerate() {
         for s in 0..fx.snapshot.segments.len() {
             if p == cheapest {
-                assert_eq!(kept(&routed.routing, p, s), holds(&fx, &plans[p], s));
+                assert_eq!(kept(&routed.routing, p, s), holds(&fx, plan, s));
             } else {
                 assert_eq!(
                     kept(&routed.routing, p, s),
@@ -1167,22 +1191,24 @@ fn part_strategy(universe: usize) -> impl Strategy<Value = PartSpec> {
         1u8..7,
         1usize..4,
     )
-        .prop_map(|(entries, series_leaves, label_value, bucket_bits, slices)| {
-            let (held, flags): (Vec<Vec<usize>>, Vec<(bool, bool)>) = entries
-                .into_iter()
-                .map(|(held, uncovered, present)| (held, (uncovered, present)))
-                .unzip();
-            let (uncovered, present) = flags.into_iter().unzip();
-            PartSpec {
-                entries: held,
-                uncovered,
-                present,
-                series_leaves,
-                label_value,
-                bucket_bits,
-                slices,
-            }
-        })
+        .prop_map(
+            |(entries, series_leaves, label_value, bucket_bits, slices)| {
+                let (held, flags): (Vec<Vec<usize>>, Vec<(bool, bool)>) = entries
+                    .into_iter()
+                    .map(|(held, uncovered, present)| (held, (uncovered, present)))
+                    .unzip();
+                let (uncovered, present) = flags.into_iter().unzip();
+                PartSpec {
+                    entries: held,
+                    uncovered,
+                    present,
+                    series_leaves,
+                    label_value,
+                    bucket_bits,
+                    slices,
+                }
+            },
+        )
 }
 
 type Plans = Vec<Vec<(usize, usize)>>;

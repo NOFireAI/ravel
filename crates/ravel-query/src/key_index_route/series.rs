@@ -27,13 +27,13 @@ use std::ops::Range;
 use bytes::Bytes;
 use futures::StreamExt;
 use ravel_catalog::{
-    KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS, KEY_INDEX_MAX_PROBED_PARTS, KEY_INDEX_SET_PROBE_MAX_RUNS,
-    KeyIndexKeyAnswer, KeyIndexLeafError, KeyIndexLeafLimits, KeyIndexLeafRejection,
-    KeyIndexLeafRequest, KeyIndexPostingSetAnswer, KeyIndexPostingSetDecoder, KeyIndexSetAnswer,
-    KeyIndexSetDecline, KeyIndexSetDecoder, KeyIndexSetPlan, KeyIndexSetRunError,
-    LEAF_READ_CONCURRENCY, METRICS_CLASS_OBJECTS_FIELD, METRICS_SERIES_CLASS_FIELD,
-    METRICS_SERIES_LABEL_FIELD, Snapshot, SnapshotPartHandle, SnapshotParts,
-    key_index_leaf_prefix_range, plan_key_index_leaf_set, select_key_index_slice,
+    KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS, KEY_INDEX_MAX_PROBED_PARTS,
+    KEY_INDEX_SET_PROBE_MAX_RUNS, KeyIndexKeyAnswer, KeyIndexLeafError, KeyIndexLeafLimits,
+    KeyIndexLeafRejection, KeyIndexLeafRequest, KeyIndexPostingSetAnswer,
+    KeyIndexPostingSetDecoder, KeyIndexSetAnswer, KeyIndexSetDecline, KeyIndexSetDecoder,
+    KeyIndexSetPlan, KeyIndexSetRunError, LEAF_READ_CONCURRENCY, METRICS_CLASS_OBJECTS_FIELD,
+    METRICS_SERIES_CLASS_FIELD, METRICS_SERIES_LABEL_FIELD, Snapshot, SnapshotPartHandle,
+    SnapshotParts, key_index_leaf_prefix_range, plan_key_index_leaf_set, select_key_index_slice,
     series_label_pair_key8,
 };
 use ravel_codec::key_idx::{Key8, KeyType, key8_i64};
@@ -317,7 +317,9 @@ pub(super) async fn route_metric_statement_under(
         return Ok(MetricRouting::unrouted(plans.len()));
     }
     let series = route_series(&input, plans, options, totals).await?;
-    let masks = series.as_ref().map(|series| series.label_value_masks(parts));
+    let masks = series
+        .as_ref()
+        .map(|series| series.label_value_masks(parts));
     let values = route_values_masked(input, plans, masks.as_deref(), ADR_CEILING, totals).await?;
     Ok(combine(snapshot, parts, series, values))
 }
@@ -987,10 +989,9 @@ impl PassDecoder<'_> {
                     result.uncovered.extend(uncovered_entry_ordinals);
                     for (key, answer) in keys.iter().zip(per_key) {
                         if let KeyIndexKeyAnswer::Matches(matches) = answer {
-                            result.answers.insert(
-                                *key,
-                                matches.iter().map(|m| m.entry_ordinal).collect(),
-                            );
+                            result
+                                .answers
+                                .insert(*key, matches.iter().map(|m| m.entry_ordinal).collect());
                         }
                     }
                     Ok(())
@@ -1129,23 +1130,24 @@ async fn run_pass(
     }
 
     // The plans of `keys` over every slice, from the prefixes already read.
-    let plan_keys = |keys: &BTreeSet<Key8>| -> Result<Vec<(usize, KeyIndexSetPlan, Vec<Key8>)>, ()> {
-        let mut plans = Vec::new();
-        for (s, ((leaf_ref, _), prefix)) in slices.iter().zip(&prefixes).enumerate() {
-            let in_this: Vec<Key8> = keys
-                .iter()
-                .filter(|key| in_slice(leaf_ref, key))
-                .copied()
-                .collect();
-            if in_this.is_empty() {
-                continue;
+    let plan_keys =
+        |keys: &BTreeSet<Key8>| -> Result<Vec<(usize, KeyIndexSetPlan, Vec<Key8>)>, ()> {
+            let mut plans = Vec::new();
+            for (s, ((leaf_ref, _), prefix)) in slices.iter().zip(&prefixes).enumerate() {
+                let in_this: Vec<Key8> = keys
+                    .iter()
+                    .filter(|key| in_slice(leaf_ref, key))
+                    .copied()
+                    .collect();
+                if in_this.is_empty() {
+                    continue;
+                }
+                let plan = plan_key_index_leaf_set(prefix, leaf_ref, &request, &in_this, B_RUN)
+                    .map_err(|_| ())?;
+                plans.push((s, plan, in_this));
             }
-            let plan = plan_key_index_leaf_set(prefix, leaf_ref, &request, &in_this, B_RUN)
-                .map_err(|_| ())?;
-            plans.push((s, plan, in_this));
-        }
-        Ok(plans)
-    };
+            Ok(plans)
+        };
     let bytes_of = |keys: &BTreeSet<Key8>| -> Result<u64, ()> {
         Ok(plan_keys(keys)?
             .iter()

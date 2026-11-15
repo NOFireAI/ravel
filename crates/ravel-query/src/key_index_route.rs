@@ -668,9 +668,7 @@ async fn route_values_masked(
                 budget: input.budget,
                 limits: input.limits,
             };
-            let mask = part_masks
-                .and(value_parts.get(*value))
-                .map(Vec::as_slice);
+            let mask = part_masks.and(value_parts.get(*value)).map(Vec::as_slice);
             async move { (i, route_under_masked(pass, ceiling, totals, mask).await) }
         })
         .collect();

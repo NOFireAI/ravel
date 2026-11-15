@@ -1305,13 +1305,18 @@ async fn add_series_leaves(fixture: &Fixture) {
     for (field, leaf) in encoded {
         let key = format!("{dir}/series.{field}.kidx");
         store
-            .put(&key, Bytes::from(leaf.bytes), PutOptions::create_if_absent())
+            .put(
+                &key,
+                Bytes::from(leaf.bytes),
+                PutOptions::create_if_absent(),
+            )
             .await
             .expect("put series leaf");
-        part.key_index.push(ravel_proto::catalog::v1::SnapshotKeyIndexLeafRef {
-            key,
-            ..leaf.leaf_ref
-        });
+        part.key_index
+            .push(ravel_proto::catalog::v1::SnapshotKeyIndexLeafRef {
+                key,
+                ..leaf.leaf_ref
+            });
     }
     store
         .put(
@@ -1358,7 +1363,11 @@ async fn promql_query_range_reaches_the_series_route() {
     assert_eq!(stat(&routed, "segmentsPrunedBySeriesIndex"), non_holders);
     assert_eq!(stat(&routed, "segmentsPrunedByLabelIndex"), 0);
     assert_eq!(stat(&unrouted, "segmentsPrunedBySeriesIndex"), 0);
-    assert_eq!(matrix(&routed), matrix(&unrouted), "routing changes no answer");
+    assert_eq!(
+        matrix(&routed),
+        matrix(&unrouted),
+        "routing changes no answer"
+    );
     assert_eq!(matrix(&routed).len(), HOLDERS.len());
 
     let stats = &routed["data"]["stats"];
