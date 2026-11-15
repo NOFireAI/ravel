@@ -19,6 +19,7 @@ protox = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+blake3 = { workspace = true }
 
 [lints]
 workspace = true
