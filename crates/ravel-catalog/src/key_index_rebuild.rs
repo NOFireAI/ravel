@@ -29,11 +29,13 @@ use crate::error::CatalogError;
 use crate::fold::{
     EntryKeyIndex, EntryKeyIndexRead, HeadState, MAX_HEAD_CAS_ATTEMPTS, RequestCounters,
     build_part_key_index_leaves, declared_key_index_fields, head_object_key,
-    metrics_label_index_leaf_bytes_cap, put_key_index_leaf, read_entry_key_index,
+    metrics_label_index_leaf_bytes_cap, newer_leaf_refusal, put_key_index_leaf,
+    read_entry_key_index,
 };
 use crate::snapshot_format::{
     self, KeyIndexLeafLimits, key_index_leaf_format_version, key_index_leaf_prefix_range,
-    key_index_leaf_version_accepted, key_index_leaf_versions_for_signal,
+    key_index_leaf_version_accepted, key_index_leaf_version_is_newer,
+    key_index_leaf_versions_for_signal,
 };
 use crate::tenant_config::TenantConfigError;
 
@@ -200,6 +202,16 @@ impl KeyIndexRebuildError {
             | Self::CorruptHead { .. } => None,
         }
     }
+}
+
+/// Why [`Catalog::refused_leaf_refs`] stopped before listing a part's
+/// refused refs.
+enum RefusedLeafError {
+    /// A leaf prefix GET failed; the part is deferred to a rerun.
+    Store(StoreError),
+    /// A leaf above the signal's read set (ADR-4233 H1): the rebuild fails the
+    /// cycle rather than replace a leaf a newer build wrote.
+    Newer(snapshot_format::SnapshotFormatError),
 }
 
 /// A part HEAD names without a usable ref for some requested field, and those
@@ -414,7 +426,16 @@ impl Catalog {
                 .await
             {
                 Ok(replaces) => replaces,
-                Err(e) => {
+                // A leaf a newer build wrote: the rebuild must not replace it
+                // (ADR-4233 H1). Fail the cycle, carrying the report of what
+                // earlier batches published.
+                Err(RefusedLeafError::Newer(err)) => {
+                    return Err(KeyIndexRebuildError::Interrupted {
+                        source: CatalogError::SnapshotFormat(err),
+                        report: Box::new(report),
+                    });
+                }
+                Err(RefusedLeafError::Store(e)) => {
                     report.parts_deferred += 1;
                     tracing::warn!(
                         tenant = %tenant.to_hex(),
@@ -507,18 +528,23 @@ impl Catalog {
     }
 
     /// The keys of `part`'s refs for `requested` fields whose leaf is at a
-    /// `format_version` the signal's reader refuses, read with one ranged GET
-    /// of `[0, prefix_len)` per ref, each counted when issued. Empty, with no
-    /// GET, for a signal that accepts every version its leaves can carry
-    /// ([`key_index_leaf_versions_for_signal`]: spans and metrics). A ref whose prefix does not decode is left alone: the reader
-    /// already treats it as uncovered, and replacing it is not this repair.
+    /// `format_version` the signal's reader refuses but that is not newer than
+    /// this build reads, read with one ranged GET of `[0, prefix_len)` per
+    /// ref, each counted when issued. Empty, with no GET, for a signal that
+    /// accepts every version its leaves can carry
+    /// ([`key_index_leaf_versions_for_signal`]: spans and metrics). A ref whose
+    /// prefix does not decode is left alone: the reader already treats it as
+    /// uncovered, and replacing it is not this repair. A leaf above the
+    /// signal's read set is [`RefusedLeafError::Newer`] (ADR-4233 H1, finding
+    /// 3): replacing it would CAS a HEAD that drops the newer leaf, which the
+    /// sweep then deletes, so the rebuild fails the cycle instead.
     async fn refused_leaf_refs(
         &self,
         signal: Signal,
         part: &SnapshotPartRef,
         requested: &[(String, KeyType)],
         report: &mut KeyIndexRebuildReport,
-    ) -> Result<HashSet<String>, StoreError> {
+    ) -> Result<HashSet<String>, RefusedLeafError> {
         let mut refused = HashSet::new();
         if key_index_leaf_versions_for_signal(signal)
             .iter()
@@ -538,11 +564,17 @@ impl Catalog {
             let got = self
                 .store()
                 .get(&leaf.key, GetRange::Range(range.start, range.end))
-                .await?;
+                .await
+                .map_err(RefusedLeafError::Store)?;
             report.leaf_prefix_bytes_read += got.data.len() as u64;
             if let Ok(version) = key_index_leaf_format_version(&got.data)
                 && !key_index_leaf_version_accepted(signal, version)
             {
+                if key_index_leaf_version_is_newer(signal, version) {
+                    return Err(RefusedLeafError::Newer(newer_leaf_refusal(
+                        &leaf.key, version,
+                    )));
+                }
                 refused.insert(leaf.key.clone());
             }
         }
@@ -2443,6 +2475,85 @@ mod tests {
         assert_eq!(
             read_signal_head(store.as_ref(), Signal::Spans).await,
             before
+        );
+    }
+
+    /// ADR-4233 H1, #4235 (finding 3): a `user_id` ref naming a leaf a newer
+    /// build wrote -- a version above the logs read set -- fails the rebuild
+    /// with `NewerPart` rather than being replaced like a refused version-1
+    /// leaf. Replacing it would CAS a HEAD that drops the newer leaf for the
+    /// sweep to delete. HEAD is left unchanged.
+    ///
+    /// FLIP: classify the newer version as a plain refused ref (drop the
+    /// `key_index_leaf_version_is_newer` check in `refused_leaf_refs`) and the
+    /// rebuild replaces the leaf and returns `Ok`, so `expect_err` panics.
+    #[tokio::test]
+    async fn a_newer_leaf_fails_the_rebuild_instead_of_being_replaced() {
+        let store = recording_store();
+        let (catalog, _) = two_entry_parts(&store, 1).await;
+        rebuild(&catalog, Signal::Logs).await;
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let original = head.parts[0].key_index[0].clone();
+        let bytes = store
+            .get(&original.key, GetRange::Full)
+            .await
+            .expect("leaf")
+            .data;
+        // A version above the logs read set (1, 2): a leaf a newer build wrote.
+        let newer = snapshot_format::restamp_key_index_leaf_version(&bytes, 4).expect("restamp");
+        let newer_ref = put_key_index_leaf(
+            store.as_ref(),
+            &tenant(),
+            Signal::Logs,
+            head.parts[0].watermark_hour,
+            newer,
+        )
+        .await
+        .expect("put the newer leaf");
+        let mut swapped = head.clone();
+        swapped.parts[0].key_index = vec![newer_ref.clone()];
+        let current = store
+            .get(&head_key(Signal::Logs), GetRange::Full)
+            .await
+            .expect("head");
+        store
+            .put(
+                &head_key(Signal::Logs),
+                Bytes::from(snapshot_format::encode_head(&swapped).expect("encode")),
+                PutOptions {
+                    mode: PutMode::CasVersion(current.version),
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("swap refs");
+        let before = read_signal_head(store.as_ref(), Signal::Logs).await;
+
+        let err = catalog
+            .rebuild_key_index(&tenant(), Signal::Logs, &KeyIndexRebuildOptions::default())
+            .await
+            .expect_err("a newer leaf must fail the rebuild");
+        match &err {
+            KeyIndexRebuildError::Interrupted {
+                source:
+                    CatalogError::SnapshotFormat(snapshot_format::SnapshotFormatError::NewerPart {
+                        key,
+                        kind,
+                        version,
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(key, &newer_ref.key);
+                assert_eq!(*kind, snapshot_format::CatalogPartKind::KeyIndexLeaf);
+                assert_eq!(*version, 4);
+            }
+            other => panic!("expected Interrupted(NewerPart), got {other:?}"),
+        }
+        assert_eq!(
+            read_signal_head(store.as_ref(), Signal::Logs).await,
+            before,
+            "the rebuild left HEAD unchanged"
         );
     }
 

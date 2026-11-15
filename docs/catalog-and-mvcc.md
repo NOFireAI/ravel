@@ -1665,7 +1665,10 @@ longer decodes
 2 previous-leaf GETs before the restart, the from-scratch leaves after it),
 and when a section read names a field the tenant does not declare, since a
 carried entry might name it too
-(`a_section_naming_an_undeclared_field_drops_the_carry`). A part carried
+(`a_section_naming_an_undeclared_field_drops_the_carry`). A slice above
+every leaf version this signal reads is neither: it fails the fold with
+`SnapshotFormatError::NewerPart` (see "Parts and tenant config from a newer
+build" below). A part carried
 forward by reference, a sealed part included, keeps its refs and costs no
 GET at all (`sealed_tail_carries_its_leaf_refs_without_a_build`,
 `a_part_carried_forward_keeps_its_key_index_refs`).
@@ -2226,6 +2229,53 @@ a tenant and signal stays at version 2:
 
 The HEAD returns to version 1 when the part with retired hours re-encodes
 or leaves HEAD, and every older component then reads it again.
+
+**Parts and tenant config from a newer build.** Under a HEAD the fold can
+read, it also reads the previous `.csnap` parts, the previous `.npost`
+postings, the per-part `.cstat` objects it reuses as a statistics baseline,
+and the lowest `.kidx` slice of each previous part it carries leaves from. A
+version above the set this build reads is `SnapshotFormatError::NewerPart`,
+naming the object key, its kind, the version field and the version, and the
+fold returns it as `CatalogError::SnapshotFormat` without rebuilding over the
+object and before the HEAD CAS (ADR-4233 H1,
+`newer_previous_part_fails_cycle_without_rebuild`). The `.csnap`, `.npost`
+and `.cstat` envelope decoders check the stored version before any body or
+length field, so the version is readable from the object's front bytes
+alone; the `.kidx` decoder checks its magic, header length and header CRC
+first, then the version.
+
+A carried `.kidx` leaf is version-checked from the first bytes
+`fetch_carried_leaf` reads, before this part's leaves are PUT, so a leaf a
+newer build wrote is refused even when its frames would not verify under this
+build's reader. But the fold also *replaces* previous objects it never reads:
+a from-scratch postings rebuild (a rebuild or a reconcile) writes a fresh
+`.npost` without reading the old one, a `.cstat` is skipped for a dirty hour,
+a rebuild, or an untyped tenant, a `.kidx` carry is abandoned on a ref check
+before any GET (or the leaf switch is off), and an error-triggered rebuild
+stops reading previous `.csnap` parts at the first failure. So before its
+first PUT, for every such previous `.npost`, `.cstat` and `.kidx` object a
+part it does **not** carry forward by reference will drop or replace (and, on
+a rebuild, the `.csnap` parts too), the fold range-GETs the object's version
+prefix and refuses the cycle with the same `NewerPart` on any above its read
+set. That is one ranged GET per dropped or replaced ref
+(`FoldReport.newer_part_peek_gets`). A store error on a peek GET is not a
+newer object: it leaves that object to the read path's own
+graceful-degradation handling, and because the objects are immutable a newer
+one transiently unreadable this tick is refused on the next. A peek refusal,
+and a `.kidx` carry refusal of a single-part fold, come before any PUT and
+leave the store untouched; a `.kidx` carry refusal of a later part comes
+before that part's leaves are PUT but after an earlier re-encoded part's,
+whose now-unreferenced objects the catalog sweep removes. A version below the
+read set, or an object that is corrupt, is not newer and keeps the rebuild
+path (`older_previous_part_keeps_the_rebuild_path`). A tenant
+config record above `TENANT_CONFIG_MAX_READ_VERSION` fails the fold with
+`ProvisioningError::NewerTenantConfig` instead of folding under deployment
+defaults (ADR-4233 H11, `newer_tenant_config_fails_cycle`). Both errors are
+retryable: `is_newer_format_version` holds for the first and
+`ProvisioningError::is_retryable` for the second, so a query surface that
+meets either answers 503, not a corruption 500. The
+query-side snapshot resolve is unchanged: a part it cannot read still falls
+back to the listing resolve.
 
 **The fold.** With `build_key_index_leaves` on, every part of the previous
 HEAD but the last that carries `key_index` refs and lies within one UTC

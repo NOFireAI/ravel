@@ -340,6 +340,17 @@ pub enum ProvisioningError {
          (CasVersion precondition failed): re-read and retry rather than overwrite the other write"
     )]
     FloorCasConflict { key: String },
+    /// A fold read the tenant config record (ADR-0066 decision 6) and found a
+    /// `format_version` above [`crate::TENANT_CONFIG_MAX_READ_VERSION`]
+    /// (ADR-4233 H11). The fold refuses the cycle rather than fold under
+    /// deployment defaults, which would apply the wrong retention and drop
+    /// the typed attribute columns the newer record declares.
+    #[error(
+        "tenant config record {key:?} declares format_version {got}, above the highest version this \
+         build reads ({ceiling}): the fold refuses rather than fold under deployment defaults. \
+         Upgrade this binary to one whose reader accepts version {got}"
+    )]
+    NewerTenantConfig { key: String, got: u32, ceiling: u32 },
 }
 
 /// The exact structural rule a corrupt shard-generation history broke
@@ -1118,7 +1129,8 @@ impl ProvisioningError {
             ProvisioningError::UnsupportedVersion { got, ceiling, .. } => got > ceiling,
             ProvisioningError::RefusingToRewriteNewerRecord { .. }
             | ProvisioningError::ReshardCasConflict { .. }
-            | ProvisioningError::FloorCasConflict { .. } => true,
+            | ProvisioningError::FloorCasConflict { .. }
+            | ProvisioningError::NewerTenantConfig { .. } => true,
 
             ProvisioningError::Decode { .. }
             | ProvisioningError::VersionBelowFloor { .. }
