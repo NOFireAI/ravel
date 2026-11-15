@@ -1685,18 +1685,33 @@ mod tests {
     }
 
     /// Delegates to a `MemoryStore`, except that a suffix GET of a data object
-    /// under `hang_prefix` never completes, and records every whole-object GET.
-    /// The whole-part warm reads small logs objects with [`GetRange::Full`];
-    /// the metadata pass opens each object with a suffix probe.
+    /// under `hang_prefix` never completes, and records every whole-object GET
+    /// and every suffix GET. The whole-part warm reads small logs objects with
+    /// [`GetRange::Full`]; the metadata pass opens each object with a suffix
+    /// probe.
     struct HangsOnTenantProbe {
         inner: MemoryStore,
         hang_prefix: String,
         full_gets: parking_lot::Mutex<Vec<String>>,
+        suffix_gets: parking_lot::Mutex<Vec<String>>,
         hung_probes: std::sync::atomic::AtomicUsize,
     }
 
     impl HangsOnTenantProbe {
+        fn new(inner: MemoryStore, hang_prefix: String) -> Self {
+            Self {
+                inner,
+                hang_prefix,
+                full_gets: parking_lot::Mutex::new(Vec::new()),
+                suffix_gets: parking_lot::Mutex::new(Vec::new()),
+                hung_probes: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
         async fn read(&self, key: &str, range: GetRange) {
+            if matches!(range, GetRange::Suffix(_)) {
+                self.suffix_gets.lock().push(key.to_string());
+            }
             if key.starts_with(&self.hang_prefix) && matches!(range, GetRange::Suffix(_)) {
                 self.hung_probes
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1797,12 +1812,7 @@ mod tests {
         }
         let logs_prefix = |tenant: TenantHash| format!("t/{}/l/l0/", tenant.to_hex());
 
-        let store = Arc::new(HangsOnTenantProbe {
-            inner: memory,
-            hang_prefix: logs_prefix(first),
-            full_gets: parking_lot::Mutex::new(Vec::new()),
-            hung_probes: std::sync::atomic::AtomicUsize::new(0),
-        });
+        let store = Arc::new(HangsOnTenantProbe::new(memory, logs_prefix(first)));
         let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
         let catalog = catalog_for(dyn_store.clone());
         let cache = Arc::new(Cache::new(CacheLimits::new(
@@ -1858,5 +1868,83 @@ mod tests {
             5,
             "the 5 whole parts are resident, and the hung pass inserted nothing"
         );
+    }
+
+    /// The metadata pass's ceiling counts only the bytes the pass itself
+    /// fetches. One tenant has six logs parts: the whole-part warm reads the
+    /// 4 most recent whole, more bytes than the pass's ceiling, and the pass
+    /// then finds those 4 probes resident (a fixture object is no bigger than
+    /// its probe) and probes the 2 older parts. With the ceiling at exactly
+    /// the 2 older parts' sizes both are admitted; one byte lower, only the
+    /// first is. A ceiling charged with the whole-part warm's resident bytes
+    /// admits neither.
+    #[tokio::test]
+    async fn the_metadata_ceiling_counts_only_the_pass_s_own_bytes() {
+        let now = now_ns();
+        let tenant = TenantId::new("acme").hash();
+        let memory = MemoryStore::new();
+        for k in 1..=6u8 {
+            publish_log_segment_hashed(&memory, tenant, now - i64::from(k) * NS_PER_MIN, [k; 32])
+                .await;
+        }
+        let store = Arc::new(HangsOnTenantProbe::new(memory, "none/".to_string()));
+        let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
+        let (parts, _) =
+            most_recent_parts(&catalog_for(dyn_store.clone()), tenant, Signal::Logs, now).await;
+        assert_eq!(parts.len(), 6);
+        let whole: u64 = parts[..4].iter().map(|part| part.object_size).sum();
+        let older: u64 = parts[4..].iter().map(|part| part.object_size).sum();
+        assert!(
+            whole > older,
+            "the whole-part warm alone exceeds the pass's ceiling: {whole} vs {older}"
+        );
+        let key = |i: usize| parts[i].data_object_key.clone();
+        let data_prefix = format!("t/{}/l/l0/", tenant.to_hex());
+        let data_gets = |gets: &parking_lot::Mutex<Vec<String>>| -> Vec<String> {
+            std::mem::take(&mut *gets.lock())
+                .into_iter()
+                .filter(|key| key.starts_with(&data_prefix))
+                .collect()
+        };
+        // Every fixture object is above this plan bound, so the metadata pass
+        // reads each one.
+        let engine = EngineConfig {
+            logs_block_range_threshold: 1,
+            logs_projection_break_even_bytes: Some(1),
+            ..EngineConfig::default()
+        };
+
+        for (ceiling, probed) in [(older, vec![key(4), key(5)]), (older - 1, vec![key(4)])] {
+            data_gets(&store.full_gets);
+            data_gets(&store.suffix_gets);
+            let cache = Arc::new(Cache::new(CacheLimits::new(
+                16 * 1024 * 1024,
+                1024,
+                1024 * 1024,
+            )));
+            warm_cache(
+                dyn_store.clone(),
+                catalog_for(dyn_store.clone()),
+                ReadCache::Ram(cache.clone()),
+                &FixedClock(now),
+                Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+                Arc::new(ravel_memory::MemoryBudget::unlimited()),
+                crate::cpu_gates::CpuGates::new(Default::default()).read,
+                LogsMetadataWarm::new(&engine, ceiling * METADATA_CACHE_SHARE_DIVISOR),
+            )
+            .await;
+
+            assert_eq!(
+                data_gets(&store.full_gets),
+                (0..4).map(key).collect::<Vec<_>>(),
+                "the whole-part warm reads the 4 most recent parts whole"
+            );
+            assert_eq!(
+                data_gets(&store.suffix_gets),
+                probed,
+                "a {ceiling}-byte ceiling: the pass probes the older parts that fit it"
+            );
+            assert_eq!(cache.len(), 4 + probed.len());
+        }
     }
 }
