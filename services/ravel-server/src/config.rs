@@ -5680,8 +5680,8 @@ pub struct PerformanceFlags {
     /// `--column-stats-cache-max-bytes` (ADR-1413 decision 5): independent of
     /// both cache flags above.
     pub column_stats_cache_max_bytes: Option<u64>,
-    /// Whether this deployment's store is a `--store s3` deployment against a
-    /// loopback `--s3-endpoint`, computed by [`Cli::store_is_loopback`]: the
+    /// Whether this deployment's `--store s3`, `gcs` or `azure` points at a
+    /// loopback endpoint, computed by [`Cli::store_is_loopback`]: the
     /// same predicate [`Cli::resolve_logs_fetch_policy`] uses. Two derivations
     /// read this: the fetcher cache's share (ADR-2023) and the
     /// [`LOOPBACK_STORE_GET_CONCURRENCY_CAP`] on the derived
@@ -13567,6 +13567,28 @@ mod tests {
         assert_eq!(derived.store_get_concurrency, 64);
         assert_eq!(derived.sql_partition_count, 384);
         assert_eq!(derived.latency_first_precondition_met(), Some(false));
+
+        let (captured, guard) = capture_events(tracing::Level::INFO);
+        derived.emit();
+        drop(guard);
+        let lines = captured.lock();
+        let unmet: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("precondition_met=false"))
+            .collect();
+        assert_eq!(unmet.len(), 1, "lines: {lines:?}");
+        let line = unmet[0];
+        assert!(
+            line.contains("latency-first is the default on a loopback store"),
+            "{line}"
+        );
+        assert!(line.contains("store_get_concurrency=64"), "{line}");
+        assert!(line.contains("sql_partition_count=384"), "{line}");
+        assert!(
+            line.contains("latency_first_measured_concurrency=256"),
+            "{line}"
+        );
+        drop(lines);
 
         let mut raised_args = LOOPBACK_S3.to_vec();
         raised_args.extend([
