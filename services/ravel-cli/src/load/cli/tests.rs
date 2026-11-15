@@ -1194,3 +1194,82 @@ async fn chunk_order_string_resource_warning_matches_the_written_columns() {
          warning `{WARNING}` is stale: {columns:?}"
     );
 }
+
+/// `run_load_reporting` writes the `--page-choice exhaustive` warning to the
+/// warning stream of a metrics or spans load, and writes none for the
+/// default. The warning goes out before the mapping is read, so a missing
+/// mapping ends each load right after it.
+///
+/// Prove-the-test: delete the `unused_page_choice_warning` emit block in
+/// `run_load_reporting` and the exhaustive assertion fails.
+#[tokio::test]
+async fn the_entry_point_warns_that_metrics_and_spans_ignore_the_page_choice() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing_mapping = dir.path().join("absent.toml");
+    let missing_parquet = dir.path().join("absent.parquet");
+    for signal in [SignalArg::Metrics, SignalArg::Spans] {
+        let noun = match signal {
+            SignalArg::Metrics => "metrics",
+            SignalArg::Spans => "spans",
+            SignalArg::Logs => unreachable!("only metrics and spans are looped"),
+        };
+        for choice in [LoadPageChoice::Exhaustive, LoadPageChoice::Estimated] {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let mut sink: Vec<u8> = Vec::new();
+            let err = run_load_reporting(
+                store,
+                &missing_parquet,
+                "acme",
+                &missing_mapping,
+                signal,
+                1,
+                2,
+                0,
+                None,
+                None,
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                DEFAULT_DECODE_QUEUE_BATCHES,
+                None,
+                None,
+                None,
+                None,
+                RlogZstdLevel::DEFAULT,
+                RlogGroupTargetBlocks::DEFAULT,
+                RlogChunkOrder::DEFAULT,
+                choice,
+                LoadMemoryRequest::Derived {
+                    host_total_bytes: Some(64 << 30),
+                },
+                false,
+                &IpcryptPolicy::empty(),
+                None,
+                NOW_NS,
+                TestClock::new(NOW_NS) as Arc<dyn Clock>,
+                &mut sink,
+            )
+            .await
+            .expect_err("the mapping does not exist");
+            assert!(
+                format!("{err:#}").starts_with("failed to read --mapping"),
+                "{signal:?} {choice:?}: the load ends at the mapping read: {err:#}"
+            );
+            let emitted = String::from_utf8(sink).expect("warnings are utf-8");
+            let warning = format!(
+                "warning: a {noun} load ignores --page-choice exhaustive. The page choice \
+                 applies only to the RLOG objects a logs load writes.\n"
+            );
+            let want = usize::from(choice == LoadPageChoice::Exhaustive);
+            assert_eq!(
+                emitted.matches(&warning).count(),
+                want,
+                "{signal:?} {choice:?}: the page choice warning {want} time(s) in:\n{emitted}"
+            );
+            assert!(
+                !emitted.contains("--page-choice estimated"),
+                "{signal:?} {choice:?}: the default is not named:\n{emitted}"
+            );
+        }
+    }
+}
