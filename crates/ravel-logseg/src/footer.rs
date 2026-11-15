@@ -191,6 +191,14 @@ pub struct LogFooter {
     /// `None` with a nonzero generation; a descriptor with generation 0 is
     /// refused as corrupt.
     pub clustering_generation: u64,
+    /// Section kind ids this object's directory names that this build does
+    /// not recognize (ADR-4233 decision 4, hazard H6, reader side). Every
+    /// such kind is skipped over, bounds-checked but otherwise untouched
+    /// (docs/log-segment-format.md: unknown kinds are skipped); this is the
+    /// list of what was skipped. Empty for an object this build wrote.
+    /// Sorted ascending, deduplicated. Populated by `open`/`open_from_suffix`
+    /// via `validate_sections`; empty on a `LogFooter` built any other way.
+    pub unknown_section_kinds: Vec<u32>,
 }
 
 /// Width of the time bucket leading a clustered sort key.
@@ -429,6 +437,7 @@ impl LogFooter {
             part_index: p.part_index,
             sort_descriptor,
             clustering_generation: p.clustering_generation,
+            unknown_section_kinds: Vec::new(),
         })
     }
 }
@@ -643,20 +652,47 @@ pub fn open_from_suffix(suffix: &[u8], total_size: u64) -> Result<SuffixOutcome,
         .map_err(|e| LogSegError::Corrupted(format!("footer decode: {e}")))?;
     let footer = LogFooter::from_proto(proto)?;
 
-    validate_sections(&footer, footer_start as u64, DEFAULT_MAX_SECTION_UNCOMP)?;
+    let unknown_section_kinds =
+        validate_sections(&footer, footer_start as u64, DEFAULT_MAX_SECTION_UNCOMP)?;
+    let footer = LogFooter {
+        unknown_section_kinds,
+        ..footer
+    };
     Ok(SuffixOutcome::Ready(footer))
+}
+
+/// Every section kind this build recognizes, mandatory or not (ADR-4233
+/// decision 4, hazard H6): the five v1 kinds, PAGE_DIR (ADR-0699, mandatory
+/// since trailer version 4 but not independently counted below), KEY_IDX and
+/// POSTINGS (both optional). A kind outside this set is reported through
+/// [`validate_sections`]'s return value rather than silently skipped.
+fn is_known_kind(k: u32) -> bool {
+    matches!(
+        k,
+        kind::STREAM_DIR
+            | kind::FIELD_DIR
+            | kind::BLOCKS
+            | kind::SKIP_IDX
+            | kind::BLOOM
+            | kind::PAGE_DIR
+            | kind::KEY_IDX
+            | kind::POSTINGS
+    )
 }
 
 /// Validates the section table: at most one of each known kind, all five v1
 /// kinds present, every range inside the section area with overflow-checked
 /// arithmetic, every `uncomp_len` within the cap, and at most one KEY_IDX
 /// entry, stored raw with a `prefix_len` that is non-zero, not past the
-/// section, and at most `KEY_IDX_PREFIX_MAX`.
+/// section, and at most `KEY_IDX_PREFIX_MAX`. Returns the sorted,
+/// deduplicated list of section kind ids present that [`is_known_kind`] does
+/// not recognize (ADR-4233 decision 4, hazard H6); empty for an object this
+/// build wrote.
 pub fn validate_sections(
     footer: &LogFooter,
     section_area_end: u64,
     max_uncomp: u64,
-) -> Result<(), LogSegError> {
+) -> Result<Vec<u32>, LogSegError> {
     let known = [
         kind::STREAM_DIR,
         kind::FIELD_DIR,
@@ -675,6 +711,7 @@ pub fn validate_sections(
             )));
         }
     }
+    let mut unknown_kinds = Vec::new();
     for s in &footer.sections {
         // Unknown kinds are skipped but their ranges are still bounds-checked so
         // a hostile descriptor cannot point outside the object.
@@ -704,7 +741,11 @@ pub fn validate_sections(
             }
             key_idx_prefix_range(s.prefix_len, s.len)?;
         }
+        if !is_known_kind(s.kind) && !unknown_kinds.contains(&s.kind) {
+            unknown_kinds.push(s.kind);
+        }
     }
+    unknown_kinds.sort_unstable();
     if footer
         .sections
         .iter()
@@ -728,7 +769,7 @@ pub fn validate_sections(
             "duplicate section kind POSTINGS".into(),
         ));
     }
-    Ok(())
+    Ok(unknown_kinds)
 }
 
 #[cfg(test)]
@@ -758,6 +799,7 @@ mod tests {
             part_index: 0,
             sort_descriptor: None,
             clustering_generation: 0,
+            unknown_section_kinds: Vec::new(),
         }
     }
 

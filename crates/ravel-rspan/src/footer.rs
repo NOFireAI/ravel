@@ -156,6 +156,11 @@ pub struct SpanFooter {
     pub input_set_hash: Vec<u8>,
     /// Part ordinal within one compaction output (0 on an L0 object).
     pub part_index: u32,
+    /// Section kind ids present in the directory but not recognized by this
+    /// build, skipped rather than rejected (ADR-4233 decision 4, hazard H6).
+    /// Empty for an object this build wrote. Populated by `validate_sections`
+    /// on open; not set by `from_proto` directly.
+    pub unknown_section_kinds: Vec<u32>,
 }
 
 impl SpanFooter {
@@ -235,6 +240,7 @@ impl SpanFooter {
             level: p.level,
             input_set_hash: p.input_set_hash,
             part_index: p.part_index,
+            unknown_section_kinds: Vec::new(),
         })
     }
 }
@@ -359,7 +365,12 @@ pub fn open_from_suffix(suffix: &[u8], total_size: u64) -> Result<SuffixOutcome,
         .map_err(|e| SpanSegError::Corrupted(format!("footer decode: {e}")))?;
     let footer = SpanFooter::from_proto(proto)?;
 
-    validate_sections(&footer, footer_start as u64, DEFAULT_MAX_SECTION_UNCOMP)?;
+    let unknown_section_kinds =
+        validate_sections(&footer, footer_start as u64, DEFAULT_MAX_SECTION_UNCOMP)?;
+    let footer = SpanFooter {
+        unknown_section_kinds,
+        ..footer
+    };
     Ok(SuffixOutcome::Ready(footer))
 }
 
@@ -372,7 +383,7 @@ pub fn validate_sections(
     footer: &SpanFooter,
     section_area_end: u64,
     max_uncomp: u64,
-) -> Result<(), SpanSegError> {
+) -> Result<Vec<u32>, SpanSegError> {
     let known = [kind::BLOCKS, kind::SKIP_IDX, kind::BLOOM, kind::KEY_IDX];
     for k in known {
         let n = footer.sections.iter().filter(|s| s.kind == k).count();
@@ -385,7 +396,11 @@ pub fn validate_sections(
             )));
         }
     }
+    let mut unknown_kinds = Vec::new();
     for s in &footer.sections {
+        if !known.contains(&s.kind) && !unknown_kinds.contains(&s.kind) {
+            unknown_kinds.push(s.kind);
+        }
         let end = s
             .offset
             .checked_add(s.len)
@@ -417,7 +432,8 @@ pub fn validate_sections(
             key_idx_prefix_range(s.prefix_len, s.len)?;
         }
     }
-    Ok(())
+    unknown_kinds.sort_unstable();
+    Ok(unknown_kinds)
 }
 
 /// Reads and decompresses a whole-read section, verifying its crc first.
@@ -548,6 +564,7 @@ mod tests {
             level: 0,
             input_set_hash: Vec::new(),
             part_index: 0,
+            unknown_section_kinds: Vec::new(),
         }
     }
 

@@ -26,6 +26,13 @@ pub enum SpanSegError {
     /// `ravel_segment::SegmentError::UnsupportedVersion`.
     #[error("unsupported format version {0}")]
     UnsupportedVersion(u16),
+    /// A nested section (KEY_IDX) inside an otherwise-admitted trailer
+    /// carries a grammar version this build does not know (ADR-4233
+    /// decision 4, hazard H5). Distinct from `UnsupportedVersion`, which is
+    /// the trailer's own version: here the trailer is readable and only the
+    /// section's internal grammar is newer than this reader.
+    #[error("unsupported {section} section version {version}")]
+    UnsupportedSectionVersion { section: &'static str, version: u16 },
     /// A columnar view accessor was asked for a column the projected decode did
     /// not request. This is a caller bug (a mis-specified projection), not data
     /// corruption: the column's page may well exist in the block, but it was
@@ -57,6 +64,9 @@ impl From<ravel_codec::error::CodecError> for SpanSegError {
     fn from(e: ravel_codec::error::CodecError) -> Self {
         match e {
             ravel_codec::error::CodecError::Corrupted(s) => SpanSegError::Corrupted(s),
+            ravel_codec::error::CodecError::UnsupportedSectionVersion { section, version } => {
+                SpanSegError::UnsupportedSectionVersion { section, version }
+            }
         }
     }
 }

@@ -41,6 +41,17 @@ pub struct FooterLocation {
     /// successfully parsed object carries an admitted version and nothing else.
     /// Today the window holds only [`crate::VERSION_V7`], so this is always 7.
     pub version: u16,
+    /// Section kind ids this object's directory names that this build's
+    /// `validate_sections_v7` does not recognize (ADR-4233 decision 4,
+    /// hazard H6, reader side). Every kind the writer that produced this
+    /// object knows about is skipped over, bounds-checked but otherwise
+    /// untouched (docs/segment-format.md: unknown kinds are skipped); this
+    /// is the list of what was skipped. Empty for an object this build
+    /// wrote. Sorted ascending, deduplicated. Populated by
+    /// [`open_from_full`]/[`open_from_suffix`]; empty on a `FooterLocation`
+    /// built any other way (e.g. directly from `parse_footer`, before
+    /// `validate_sections` has run).
+    pub unknown_section_kinds: Vec<u32>,
 }
 
 /// The trailer's fixed fields, after the version gate. Parsed once, by
@@ -224,6 +235,7 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
         trailer_offset: total_size - trailer_len,
         total_size,
         version: version.number(),
+        unknown_section_kinds: Vec::new(),
     }))
 }
 
@@ -256,7 +268,7 @@ pub fn validate_sections(
     version: u16,
     page_region_end: u64,
     limits: ReaderLimits,
-) -> Result<(), SegmentError> {
+) -> Result<Vec<u32>, SegmentError> {
     let Some(version) = SegmentVersion::from_number(version) else {
         return Err(SegmentError::UnsupportedVersion(version));
     };
@@ -277,10 +289,11 @@ fn validate_sections_v7(
     footer: &Footer,
     page_region_end: u64,
     limits: ReaderLimits,
-) -> Result<(), SegmentError> {
+) -> Result<Vec<u32>, SegmentError> {
     // 0 LABEL_DICT, 1 SERIES_IDS, 2 SERIES_META, 3 TS_PAGES, 4 VAL_PAGES,
     // 5 HIST_PAGES, 6 SERIES_IDX, 7 SERIES_META_CHUNKS, 8 EXEMPLARS.
     let mut seen = [false; 9];
+    let mut unknown_kinds = Vec::new();
     for section in &footer.sections {
         let end = section
             .offset
@@ -299,7 +312,12 @@ fn validate_sections_v7(
             section_kind::SERIES_IDX => 6,
             section_kind::SERIES_META_CHUNKS => 7,
             section_kind::EXEMPLARS => 8,
-            _ => continue,
+            _ => {
+                if !unknown_kinds.contains(&section.kind) {
+                    unknown_kinds.push(section.kind);
+                }
+                continue;
+            }
         };
         if seen[idx] {
             return Err(SegmentError::DuplicateSection(section.kind));
@@ -312,6 +330,7 @@ fn validate_sections_v7(
             });
         }
     }
+    unknown_kinds.sort_unstable();
     const NAMES: [&str; 2] = ["LABEL_DICT", "SERIES_IDS"];
     for (i, name) in NAMES.iter().enumerate() {
         if !seen[i] {
@@ -337,14 +356,15 @@ fn validate_sections_v7(
     if footer.series_count > 0 && !seen[4] && !seen[5] {
         return Err(SegmentError::MissingSection("VAL_PAGES or HIST_PAGES"));
     }
-    Ok(())
+    Ok(unknown_kinds)
 }
 
 /// Convenience: parse and validate a footer from the complete object bytes.
 pub fn open_from_full(bytes: &[u8], limits: ReaderLimits) -> Result<FooterLocation, SegmentError> {
     match parse_footer(bytes.len() as u64, bytes)? {
-        FooterOutcome::Ready(loc) => {
-            validate_sections(&loc.footer, loc.version, loc.footer_offset, limits)?;
+        FooterOutcome::Ready(mut loc) => {
+            loc.unknown_section_kinds =
+                validate_sections(&loc.footer, loc.version, loc.footer_offset, limits)?;
             Ok(loc)
         }
         FooterOutcome::NeedRange { .. } => Err(SegmentError::Truncated),
@@ -360,8 +380,9 @@ pub fn open_from_suffix(
     limits: ReaderLimits,
 ) -> Result<FooterOutcome, SegmentError> {
     match parse_footer(total_size, suffix)? {
-        FooterOutcome::Ready(loc) => {
-            validate_sections(&loc.footer, loc.version, loc.footer_offset, limits)?;
+        FooterOutcome::Ready(mut loc) => {
+            loc.unknown_section_kinds =
+                validate_sections(&loc.footer, loc.version, loc.footer_offset, limits)?;
             Ok(FooterOutcome::Ready(loc))
         }
         need @ FooterOutcome::NeedRange { .. } => Ok(need),

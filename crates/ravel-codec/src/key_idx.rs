@@ -613,9 +613,10 @@ impl<'a> KeyIdxPrefix<'a> {
             .first()
             .ok_or_else(|| corrupted("header truncated at version"))?;
         if !KEY_IDX_VERSIONS.contains(&version) {
-            return Err(corrupted(format_args!(
-                "version {version} is not a known version {KEY_IDX_VERSIONS:?}"
-            )));
+            return Err(CodecError::UnsupportedSectionVersion {
+                section: "KEY_IDX",
+                version: u16::from(version),
+            });
         }
         let (raw, crc_at) = parse_raw_header(prefix)?;
         let stored_crc = read_u32(prefix, crc_at)

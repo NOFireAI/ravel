@@ -348,9 +348,10 @@ impl<'a> PostingsSection<'a> {
             .ok_or_else(|| LogSegError::Corrupted("postings version truncated".into()))?;
         pos += 1;
         if version != POSTINGS_VERSION && version != POSTINGS_VERSION_V1 {
-            return Err(LogSegError::Corrupted(format!(
-                "unsupported postings version {version}"
-            )));
+            return Err(LogSegError::UnsupportedSectionVersion {
+                section: "POSTINGS",
+                version: u16::from(version),
+            });
         }
         let count_bytes = bytes
             .get(pos..pos + 4)
