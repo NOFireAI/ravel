@@ -804,7 +804,7 @@ resolve_arm_env() {
   [ "$CLOUD" = gcp ] \
     || preload="$(ls /usr/lib64/libtcmalloc.so.4 /usr/lib64/libtcmalloc.so 2>/dev/null | head -n 1)"
   # The server's scheduled fold builds no key-index leaf either, as for
-  # do_fold: --no-fold-key-index-leaves when its --help lists it (built after
+  # do_fold: --no-fold-key-index-leaves when its --help names it (built after
   # issue #4200), nothing otherwise (no leaf unless asked).
   "$BIN_DIR/ravel-server-$SHA" --help >"$help" 2>&1 \
     || { say "ravel-server --help failed: $(head -c 300 "$help")"; return 1; }
@@ -1062,10 +1062,13 @@ timed() {
   /usr/bin/time -f "$format" -o "$file" "$@"
 }
 
-# help_lists FILE FLAG: 0 when an option line of the --help text in FILE
-# lists FLAG.
+# help_lists FILE FLAG: 0 when the --help text in FILE names FLAG anywhere,
+# as a whole word: on an option line or in another option's prose. Matching
+# any mention rather than only the option line fails closed: a binary that
+# names the flag and rejects it fails the step loudly, while a layout the
+# match missed would run the default with nothing to show for it.
 help_lists() {
-  grep -Eq -e "^ {0,6}(-[[:alnum:]], )?$2([ =]|\$)" "$1"
+  grep -Eq -e "(^|[^[:alnum:]-])$2([^[:alnum:]-]|\$)" "$1"
 }
 
 # out_field FILE KEY: the value of FILE's one `KEY: value` line. No such line,
@@ -1114,11 +1117,15 @@ fold_field() {
 # counts a commit record per object, so it is stamped beside it only.
 #
 # The fold builds no key-index leaf, the state the published figures were
-# taken in: --no-key-index-leaves is passed when the fold's --help lists it (a
+# taken in: --no-key-index-leaves is passed when the fold's --help names it (a
 # ravel-cli built after issue #4200 builds leaves and seals parts at the UTC
-# day unless told not to), and a fold that reports key_index_leaves_written
-# above 0 fails the precondition. A binary built before it builds no leaf
-# unless asked, and its report may carry no such line.
+# day unless told not to). A binary built before it names no such flag and
+# builds no leaf unless asked; its report may carry no
+# key_index_leaves_written line. The help probe is what keeps the day seal
+# off. The key_index_leaves_written check below is not a backstop for it: a
+# tenant that declares no key-index field, which this one does not at fold
+# time (do_declare runs after do_fold), writes no leaf with the switch on
+# too. The check fails a fold that wrote leaves anyway.
 do_fold() {
   local leaf_off="" help="$KIT/fold-help.out"
   "$CLI_BIN" "${STORE_ARGS[@]}" --tenant-hash-unkeyed catalog fold --help >"$help" 2>&1 \

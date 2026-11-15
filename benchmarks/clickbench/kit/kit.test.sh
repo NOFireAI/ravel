@@ -395,13 +395,15 @@ STUB
 # STUB_FOLD_ENTRIES sets the entry_count it prints (default 100), and
 # STUB_FOLD_LEAVES, when set, the key_index_leaves_written line it prints.
 # STUB_LEAF_HELP=1 makes both binaries' --help list the key-index leaf
-# switch's two spellings, as a binary built after issue #4200 does.
+# switch's two spellings, as a binary built after issue #4200 does;
+# STUB_LEAF_HELP=prose names the opt-out only inside another option's text.
 cat >"$BINSTUBS/ravel-server" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in
   --help)
     echo "Usage: ravel-server [OPTIONS]"
     [ "${STUB_LEAF_HELP:-}" != 1 ] || printf '      --fold-key-index-leaves\n      --no-fold-key-index-leaves\n'
+    [ "${STUB_LEAF_HELP:-}" != prose ] || printf '      --fold-key-index-leaves  The default; see --no-fold-key-index-leaves.\n'
     exit 0 ;;
   --version) echo "error: unexpected argument '--version' found" >&2; exit 2 ;;
 esac
@@ -473,7 +475,8 @@ case " $* " in
     [ "${STUB_LOAD_OBJECTS:-100}" = none ] || printf '  objects written  : %s\n' "${STUB_LOAD_OBJECTS:-100}" ;;
   *" catalog fold --help "*)
     echo "Usage: ravel-cli catalog fold [OPTIONS] --tenant <TENANT>"
-    [ "${STUB_LEAF_HELP:-}" != 1 ] || printf '      --key-index-leaves\n      --no-key-index-leaves\n' ;;
+    [ "${STUB_LEAF_HELP:-}" != 1 ] || printf '      --key-index-leaves\n      --no-key-index-leaves\n'
+    [ "${STUB_LEAF_HELP:-}" != prose ] || printf '      --key-index-leaves  The default; see --no-key-index-leaves.\n' ;;
   *" catalog fold "*)
     [ -z "${STUB_FOLD_LEAVES:-}" ] || echo "key_index_leaves_written: $STUB_FOLD_LEAVES"
     if [ "${STUB_FOLD:-}" = unsealed ]; then echo "seal_through_hour: None"; else echo "seal_through_hour: Some(491234)"; fi
@@ -2088,6 +2091,22 @@ if [ "$code" = 1 ] && grep -q 'fold entry_count 50 is under' "$OUT_A/FAILED" 2>/
   pass "binaries listing the leaf opt-out get it on the fold and the server, and a leafless fold passes the leaf check"
 else
   fail "leaf opt-out" "exit $code, stamp '$got', FAILED: $(head -n 2 "$OUT_A/FAILED" 2>/dev/null); fold argv: $(grep ' catalog fold ' "$STUB_DIR/cli-argv" | tail -n 1)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a probe that reads only option lines, so a --help naming the
+# opt-out in another option's text (a layout change) folds and serves with
+# the default. The leaf count cannot catch that on this tenant, which
+# declares no key-index field, so the probe must match any mention.
+code=0
+run_box A box-leafprose STUB_LEAF_HELP=prose STUB_FOLD_LEAVES=0 STUB_FOLD_ENTRIES=50 || code=$?
+got="$(leaf_stamp "$TMP/box-leafprose")"
+if [ "$code" = 1 ] && [ "$got" = "failed --no-key-index-leaves 0" ] \
+  && grep -q -- ' catalog fold .*--writers-stopped --no-key-index-leaves$' "$STUB_DIR/cli-argv" \
+  && grep -q -- '--listen-health 127.0.0.1:4319 --no-fold-key-index-leaves --memory-budget-bytes' "$TMP/box-leafprose/kit/arm.env"; then
+  pass "a --help naming the leaf opt-out only in prose still gets it on the fold and the server"
+else
+  fail "leaf opt-out in prose" "exit $code, stamp '$got'; fold argv: $(grep ' catalog fold ' "$STUB_DIR/cli-argv" | tail -n 1)"
 fi
 rm -rf "$OUT_A"
 
