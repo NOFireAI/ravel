@@ -5508,7 +5508,7 @@ pub const LOOPBACK_CACHE_MEMORY_PERCENT: u64 = 24;
 /// Share of `memory_budget_bytes` the derived catalog byte cache takes, a
 /// SEPARATE ceiling from [`CACHE_MEMORY_PERCENT`]. The fetcher cache
 /// (`store::build_cache`) and the catalog byte cache (`query::build_catalog`)
-/// are two independent LRU caches, so deriving both at the fetcher's share
+/// are two independent S3-FIFO caches, so deriving both at the fetcher's share
 /// would double the pair's claim. 5% on the 30 GiB reference host is ~1.4 GiB
 /// of catalog objects, enough for a wide fold's HEAD/part working set without
 /// doubling the fetcher's claim. Both percentages carve the same
@@ -5798,11 +5798,11 @@ pub struct ResolvedPerformanceDefaults {
     /// Reaches the query fetcher cache's byte ceiling
     /// (`store::build_cache`). NOT the catalog byte cache: that has its own
     /// [`Self::catalog_cache_max_bytes`], resolved from its own flag
-    /// (ADR-2023), so the two independent LRU caches do not each claim the
+    /// (ADR-2023), so the two independent S3-FIFO caches do not each claim the
     /// full derived share of RAM.
     pub cache_max_bytes: u64,
     /// Reaches the catalog byte cache's byte ceiling
-    /// (`query::build_catalog`), a SEPARATE LRU from the fetcher cache,
+    /// (`query::build_catalog`), a SEPARATE S3-FIFO cache from the fetcher cache,
     /// resolved from its own `--catalog-cache-max-bytes` flag rather than
     /// from [`Self::cache_max_bytes`] (ADR-2023). Derived at
     /// [`CATALOG_CACHE_MEMORY_PERCENT`] rather than sharing
@@ -6313,7 +6313,7 @@ pub fn resolve_performance_defaults(
         None => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
     };
 
-    // The catalog byte cache is a SEPARATE LRU from the fetcher cache, resolved
+    // The catalog byte cache is a SEPARATE S3-FIFO cache from the fetcher cache, resolved
     // from its own `--catalog-cache-max-bytes` flag: `--cache-max-bytes` no
     // longer reaches it (ADR-2023), and its derived share never varies with
     // `flags.store_is_loopback` -- only the fetcher cache's does.

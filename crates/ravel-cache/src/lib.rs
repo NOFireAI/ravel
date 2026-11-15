@@ -1,8 +1,9 @@
 //! ADR-0046's read cache: a RAM tier and a local-disk tier
-//! (docs/adrs/0046-read-cache-tier.md, decisions 1-7). This crate is not
-//! wired into anything yet: it does not depend on `ravel-types`, does not
-//! touch `ravel-catalog` or `ravel-query`, and does not reference
-//! `QueryAccounting`. Later tasks in this epic connect it to those.
+//! (docs/adrs/0046-read-cache-tier.md, decisions 1-7). The server builds it
+//! as the query fetcher's read cache (`services/ravel-server/src/store.rs`)
+//! and the catalog builds its byte cache on it. The crate itself depends on
+//! none of `ravel-types`, `ravel-catalog` or `ravel-query`. Eviction is
+//! S3-FIFO (`s3fifo`).
 //!
 //! This crate is consulted at a read funnel; it is never a store
 //! decorator (decision 1).
