@@ -76,8 +76,7 @@ thiserror = { workspace = true }
 proptest = { workspace = true }
 TOML
   done
-  # A dependent that turns the feature on for its tests only, the shape the
-  # compatibility tests use.
+  # A dependent with the format crates as plain dependencies.
   mkdir -p "${dir}/services/ravel-server"
   cat >"${dir}/services/ravel-server/Cargo.toml" <<'TOML'
 [package]
@@ -90,7 +89,17 @@ sql = []
 ravel-segment = { workspace = true } # format-drill only under dev-dependencies
 
 [dev-dependencies]
-ravel-segment = { workspace = true, features = ["format-drill"] }
+ravel-segment = { workspace = true }
+TOML
+  # The compatibility tests' crate, the only one allowed to turn the feature
+  # on for its tests (it is excluded from the workspace, ADR-4233 decision 9).
+  mkdir -p "${dir}/crates/ravel-compat-tests"
+  cat >"${dir}/crates/ravel-compat-tests/Cargo.toml" <<'TOML'
+[package]
+name = "ravel-compat-tests"
+
+[dev-dependencies]
+ravel-segment = { path = "../ravel-segment", features = ["format-drill"] }
 TOML
   printf '%s\n' "${dir}"
 }
@@ -291,7 +300,7 @@ check "publish_without_build_step_is_cannot_check" "${d}" 2 "no build-push-actio
 
 d="$(new_repo drill-clean-report)"
 check "format_drill_scan_says_what_it_read" "${d}" 0 \
-  "format-drill test-only: 3 defining crate(s), 5 manifest(s) scanned"
+  "format-drill test-only: 3 defining crate(s), 6 manifest(s) scanned"
 
 d="$(new_repo docker-format-drill)"
 edit "${d}/Dockerfile" 's/--features sql /--features sql,ravel-segment\/format-drill /'
@@ -369,7 +378,19 @@ check "target_dependency_enabling_format_drill_fails" "${d}" 1 \
 d="$(new_repo target-dev-dependency-drill)"
 printf "\n[target.'cfg(unix)'.dev-dependencies]\nravel-logseg = { workspace = true, features = [\"format-drill\"] }\n" \
   >>"${d}/services/ravel-server/Cargo.toml"
-check "target_dev_dependency_enabling_format_drill_passes" "${d}" 0 ""
+check "target_dev_dependency_outside_compat_tests_fails" "${d}" 1 \
+  "services/ravel-server/Cargo.toml:14: enables format-drill outside dev-dependencies"
+
+# A workspace member's dev-dependency would be unified into every crate a
+# --workspace test or clippy run builds.
+d="$(new_repo member-dev-dependency-drill)"
+edit "${d}/services/ravel-server/Cargo.toml" \
+  's/^ravel-segment = { workspace = true }$/ravel-segment = { workspace = true, features = ["format-drill"] }/'
+check "workspace_member_dev_dependency_enabling_format_drill_fails" "${d}" 1 \
+  "services/ravel-server/Cargo.toml:11: enables format-drill outside dev-dependencies"
+
+d="$(new_repo compat-tests-dev-dependency-drill)"
+check "compat_tests_dev_dependency_enabling_format_drill_passes" "${d}" 0 ""
 
 d="$(new_repo drill-crate-missing)"
 rm "${d}/crates/ravel-logseg/Cargo.toml"

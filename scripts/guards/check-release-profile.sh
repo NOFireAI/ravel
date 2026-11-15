@@ -224,8 +224,12 @@ done
 
 # Each line naming format-drill, with the table it sits in and the key it
 # belongs to (a continuation line of a multi-line array keeps the key that
-# opened it). Allowed: any dev-dependencies table, and the value of a
-# `format-drill` feature.
+# opened it). Allowed: a dev-dependencies table of crates/ravel-compat-tests
+# only, and the value of a `format-drill` feature. That crate sits in the root
+# manifest's `exclude` (ADR-4233 decision 9); a dev-dependency anywhere else
+# would let cargo's feature unification turn the drill window on for every
+# crate a `cargo test --workspace` or `cargo clippy --workspace --all-targets`
+# builds.
 manifests=("${manifest}")
 for f in crates/*/Cargo.toml services/*/Cargo.toml; do
   [[ -f "${f}" ]] && manifests+=("${f}")
@@ -233,7 +237,7 @@ done
 for f in "${manifests[@]}"; do
   while IFS= read -r hit; do
     [[ -n "${hit}" ]] || continue
-    finding "${f}:${hit%%:*}: enables format-drill outside dev-dependencies or its own definition: ${hit#*:}"
+    finding "${f}:${hit%%:*}: enables format-drill outside dev-dependencies (crates/ravel-compat-tests only) or its own definition: ${hit#*:}"
   done < <(awk '
     /^[[:space:]]*\[/ { table = $0; gsub(/[[:space:]]/, "", table); key = ""; next }
     { line = $0; sub(/(^|[[:space:]])#.*$/, "", line) }
@@ -241,7 +245,7 @@ for f in "${manifests[@]}"; do
       key = substr(line, RSTART, RLENGTH); sub(/=$/, "", key); gsub(/[[:space:]]/, "", key)
     }
     index(line, "format-drill") == 0 { next }
-    table ~ /dev-dependencies/ { next }
+    table ~ /dev-dependencies/ && FILENAME ~ /(^|\/)crates\/ravel-compat-tests\/Cargo\.toml$/ { next }
     table == "[features]" && key == "format-drill" { next }
     { print FNR ":" $0 }
   ' "${f}")
