@@ -17,7 +17,7 @@
 use prost::Message;
 use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotPartHeader};
 
-use super::error::SnapshotFormatError;
+use super::error::{CatalogObjectKind, MAX_ENTRY_LEVEL, NewerFormat, SnapshotFormatError};
 use super::{MAGIC, MIN_ENVELOPE_LEN, RESERVED, VERSION, ZSTD_LEVEL};
 use crate::snapshot_format::PartLimits;
 
@@ -124,9 +124,7 @@ pub fn decode_part_header(bytes: &[u8]) -> Result<SnapshotPartHeader, SnapshotFo
         return Err(SnapshotFormatError::BadMagic);
     }
     let version = take_bytes(bytes, &mut pos, 1)?[0];
-    if version != VERSION {
-        return Err(SnapshotFormatError::UnsupportedVersion(version));
-    }
+    check_envelope_version(version)?;
     let reserved = take_array::<3>(bytes, &mut pos)?;
     if reserved != RESERVED {
         return Err(SnapshotFormatError::ReservedNonZero);
@@ -150,9 +148,7 @@ pub fn decode_part(bytes: &[u8], limits: &PartLimits) -> Result<DecodedPart, Sna
         return Err(SnapshotFormatError::BadMagic);
     }
     let version = take_bytes(bytes, &mut pos, 1)?[0];
-    if version != VERSION {
-        return Err(SnapshotFormatError::UnsupportedVersion(version));
-    }
+    check_envelope_version(version)?;
     let reserved = take_array::<3>(bytes, &mut pos)?;
     if reserved != RESERVED {
         return Err(SnapshotFormatError::ReservedNonZero);
@@ -213,6 +209,20 @@ pub fn decode_part(bytes: &[u8], limits: &PartLimits) -> Result<DecodedPart, Sna
             .map_err(|e| SnapshotFormatError::EntryDecode(e.to_string()))?;
         entries.push(entry);
     }
+    // A newer level can change the rest of an entry's layout, so it is
+    // classified before any entry is validated against this build's rules.
+    if let Some(level) = entries
+        .iter()
+        .map(|entry| entry.level)
+        .find(|level| *level > MAX_ENTRY_LEVEL)
+    {
+        return Err(SnapshotFormatError::Newer(NewerFormat {
+            kind: CatalogObjectKind::SnapshotPart,
+            field: "entry level",
+            version: level,
+            max_known: MAX_ENTRY_LEVEL,
+        }));
+    }
     if entries.len() as u64 != header.entry_count {
         return Err(SnapshotFormatError::EntryCountMismatch {
             expected: header.entry_count,
@@ -231,6 +241,24 @@ pub fn decode_part(bytes: &[u8], limits: &PartLimits) -> Result<DecodedPart, Sna
     validate_entries(&entries, header.min_hour, header.watermark_hour)?;
 
     Ok(DecodedPart { header, entries })
+}
+
+/// The envelope version gate, read before any byte it governs: above
+/// [`VERSION`] is [`SnapshotFormatError::Newer`], any other mismatch
+/// [`SnapshotFormatError::UnsupportedVersion`].
+fn check_envelope_version(version: u8) -> Result<(), SnapshotFormatError> {
+    if version > VERSION {
+        return Err(SnapshotFormatError::Newer(NewerFormat {
+            kind: CatalogObjectKind::SnapshotPart,
+            field: "envelope version",
+            version: u32::from(version),
+            max_known: u32::from(VERSION),
+        }));
+    }
+    if version != VERSION {
+        return Err(SnapshotFormatError::UnsupportedVersion(version));
+    }
+    Ok(())
 }
 
 /// Sort/uniqueness/field validation shared by `encode_part` (defensive

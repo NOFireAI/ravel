@@ -114,7 +114,7 @@ pub use snapshot::{
     SnapshotPartHandle, SnapshotParts,
 };
 pub use snapshot_format::{
-    ColumnStatsHeaderPeek, ColumnStatsLimits, DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES,
+    CatalogObjectKind, ColumnStatsHeaderPeek, ColumnStatsLimits, NewerFormat, DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES,
     DEFAULT_MAX_COLUMN_STATS_BYTES, DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES,
     DecodedColumnStats, DecodedPart, DecodedPostings, HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSION_2,
     HEAD_FORMAT_VERSIONS, MAGIC, NamePostings, PartLimits, PostingsLimits, SnapshotFormatError,

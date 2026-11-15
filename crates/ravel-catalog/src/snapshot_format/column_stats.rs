@@ -53,10 +53,10 @@ use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsHeader, ColumnStatsSegment
 
 #[cfg(test)]
 use super::COLUMN_STATS_WRITE_VERSION;
-use super::error::SnapshotFormatError;
+use super::error::{CatalogObjectKind, NewerFormat, SnapshotFormatError};
 use super::{
-    COLUMN_STATS_MAGIC, COLUMN_STATS_RESERVED, MIN_COLUMN_STATS_ENVELOPE_LEN, ZSTD_LEVEL,
-    column_stats_version_accepted,
+    COLUMN_STATS_ACCEPTED_READ_VERSIONS, COLUMN_STATS_MAGIC, COLUMN_STATS_RESERVED,
+    MIN_COLUMN_STATS_ENVELOPE_LEN, ZSTD_LEVEL, column_stats_version_accepted,
 };
 use crate::snapshot_format::ColumnStatsLimits;
 
@@ -317,6 +317,16 @@ fn decode_column_stats_prefix(
     // version (ADR-0942): a v1 object must keep decoding after A2 bumps the
     // write version to 2, or the L0 reader path loses coverage.
     if !column_stats_version_accepted(version) {
+        if let Some(&max_known) = COLUMN_STATS_ACCEPTED_READ_VERSIONS.iter().max()
+            && version > max_known
+        {
+            return Err(SnapshotFormatError::Newer(NewerFormat {
+                kind: CatalogObjectKind::ColumnStats,
+                field: "envelope version",
+                version: u32::from(version),
+                max_known: u32::from(max_known),
+            }));
+        }
         return Err(SnapshotFormatError::ColumnStatsUnsupportedVersion(version));
     }
     let reserved = take_array::<3>(bytes, &mut pos)?;
@@ -1045,6 +1055,21 @@ mod tests {
         }
     }
 
+    /// The refusal of an envelope version outside the accepted read set
+    /// {3}: newer above it, unsupported below it.
+    fn version_refusal(version: u8) -> SnapshotFormatError {
+        if version > 3 {
+            SnapshotFormatError::Newer(NewerFormat {
+                kind: CatalogObjectKind::ColumnStats,
+                field: "envelope version",
+                version: u32::from(version),
+                max_known: 3,
+            })
+        } else {
+            SnapshotFormatError::ColumnStatsUnsupportedVersion(version)
+        }
+    }
+
     /// Both decoders' refusals of `bytes`, the filtered one both keeping and
     /// stripping every dictionary, asserted to be the same refusal; returns
     /// the whole decode's. `Decompress` and `ColumnStatsSegmentDecode` carry
@@ -1613,7 +1638,7 @@ mod tests {
             let err = both_decoders_refuse(&bytes, &ColumnStatsLimits::default());
             assert_eq!(
                 err,
-                SnapshotFormatError::ColumnStatsUnsupportedVersion(bad),
+                version_refusal(bad),
                 "version {bad} must be refused with its own version"
             );
         }
@@ -1653,7 +1678,7 @@ mod tests {
             if !expected_accept {
                 assert_eq!(
                     decoded.expect_err("rejected"),
-                    SnapshotFormatError::ColumnStatsUnsupportedVersion(version)
+                    version_refusal(version)
                 );
             }
         }

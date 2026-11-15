@@ -1120,7 +1120,7 @@ fn every_prefix_corruption_is_a_typed_rejection() {
     );
     assert_eq!(
         result.expect("no breach"),
-        KeyIndexLeafProbe::Rejected(KeyIndexLeafRejection::UnsupportedVersion(3))
+        KeyIndexLeafProbe::Rejected(KeyIndexLeafRejection::NewerVersion(3))
     );
     expect_rejected(
         &with(&|h| h.bucket_bits = 17),

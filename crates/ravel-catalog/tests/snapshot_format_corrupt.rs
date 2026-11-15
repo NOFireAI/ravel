@@ -7,7 +7,8 @@
 
 use prost::Message;
 use ravel_catalog::{
-    PartLimits, PostingsLimits, SnapshotFormatError, decode_head, decode_part, decode_postings,
+    CatalogObjectKind, NewerFormat, PartLimits, PostingsLimits, SnapshotFormatError, decode_head,
+    decode_part, decode_postings,
 };
 use ravel_proto::catalog::v1::SnapshotPostingsHeader;
 use ravel_proto::catalog::v1::{
@@ -134,7 +135,18 @@ fn unsupported_version() {
     let mut bytes = valid_part();
     bytes[4] = 2;
     let err = decode_part(&bytes, &PartLimits::default()).expect_err("decode must fail");
-    assert_eq!(err, SnapshotFormatError::UnsupportedVersion(2));
+    assert_eq!(
+        err,
+        SnapshotFormatError::Newer(NewerFormat {
+            kind: CatalogObjectKind::SnapshotPart,
+            field: "envelope version",
+            version: 2,
+            max_known: 1,
+        })
+    );
+    bytes[4] = 0;
+    let err = decode_part(&bytes, &PartLimits::default()).expect_err("decode must fail");
+    assert_eq!(err, SnapshotFormatError::UnsupportedVersion(0));
 }
 
 #[test]
@@ -837,7 +849,18 @@ fn postings_unsupported_version() {
     let mut bytes = valid_postings();
     bytes[4] = 2;
     let err = decode_valid(&bytes).expect_err("decode must fail");
-    assert_eq!(err, SnapshotFormatError::PostingsUnsupportedVersion(2));
+    assert_eq!(
+        err,
+        SnapshotFormatError::Newer(NewerFormat {
+            kind: CatalogObjectKind::Postings,
+            field: "envelope version",
+            version: 2,
+            max_known: 1,
+        })
+    );
+    bytes[4] = 0;
+    let err = decode_valid(&bytes).expect_err("decode must fail");
+    assert_eq!(err, SnapshotFormatError::PostingsUnsupportedVersion(0));
 }
 
 #[test]

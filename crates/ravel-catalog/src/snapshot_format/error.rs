@@ -3,8 +3,59 @@
 //! HEAD fields against the same rules decode enforces, so an object this
 //! crate writes can never fail its own decode validation.
 
+/// A catalog object family a version classification names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogObjectKind {
+    /// The catalog HEAD record.
+    Head,
+    /// A snapshot part (`.csnap`, magic `RCS1`).
+    SnapshotPart,
+    /// A name-postings object (`.npost`, magic `RNP1`).
+    Postings,
+    /// A per-part column-statistics object (`.cstat`, magic `RCST`).
+    ColumnStats,
+    /// A key-index leaf (`.kidx`, magic `RKI1`).
+    KeyIndexLeaf,
+    /// The tenant config record (`sys/.../config`).
+    TenantConfig,
+}
+
+impl std::fmt::Display for CatalogObjectKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CatalogObjectKind::Head => "HEAD",
+            CatalogObjectKind::SnapshotPart => ".csnap",
+            CatalogObjectKind::Postings => ".npost",
+            CatalogObjectKind::ColumnStats => ".cstat",
+            CatalogObjectKind::KeyIndexLeaf => ".kidx",
+            CatalogObjectKind::TenantConfig => "tenant config",
+        })
+    }
+}
+
+/// A stored version (or versioned value) above every one this build reads:
+/// a newer build wrote the object (ADR-4233 decision 4, H1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "{kind} {field} {version} is above the highest this build reads ({max_known}): a newer build wrote it"
+)]
+pub struct NewerFormat {
+    pub kind: CatalogObjectKind,
+    /// Which stored value is newer: `"envelope version"`, `"entry level"`,
+    /// `"declared_type"`, `"format_version"`.
+    pub field: &'static str,
+    pub version: u32,
+    pub max_known: u32,
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SnapshotFormatError {
+    /// The object's envelope version, or an entry level, is above every one
+    /// this build reads. The decoders check it before any field it governs,
+    /// and return it instead of the matching `Unsupported*` variant, which
+    /// they keep for a version below the read set.
+    #[error("{0}")]
+    Newer(NewerFormat),
     #[error("part object is smaller than the minimum envelope prefix: {size} bytes")]
     TooSmall { size: usize },
     #[error("bad magic bytes")]
@@ -325,9 +376,16 @@ impl SnapshotFormatError {
     /// True when the object carries a format version, an entry level, or a
     /// column declared type above the highest this build reads: a peer on a
     /// newer build can read it during a rolling upgrade, so a query surface
-    /// answers it as retryable. A version or value below the supported minimum
-    /// is false, like every other variant: it is a fault in immutable stored
-    /// bytes (a writer that left proto3's default 0), and no build reads it.
+    /// answers it as retryable, and the fold refuses to rebuild over it. A
+    /// version or value below the supported minimum is false, like every other
+    /// variant: it is a fault in immutable stored bytes (a writer that left
+    /// proto3's default 0), and no build reads it.
+    pub fn is_newer_format_version(&self) -> bool {
+        self.newer_format().is_some()
+    }
+
+    /// The newer-version classification of this error, see
+    /// [`SnapshotFormatError::is_newer_format_version`].
     ///
     /// `UnsupportedLevel` and `ColumnStatsUnknownDeclaredType` count as a newer
     /// version because a new value can ship without an envelope or header
@@ -338,26 +396,66 @@ impl SnapshotFormatError {
     ///
     /// Every variant is named, so a new one fails to compile until it is
     /// classified here.
-    pub fn is_newer_format_version(&self) -> bool {
+    pub fn newer_format(&self) -> Option<NewerFormat> {
         use super::{
-            COLUMN_STATS_ACCEPTED_READ_VERSIONS, POSTINGS_VERSION, VERSION,
+            COLUMN_STATS_ACCEPTED_READ_VERSIONS, HEAD_FORMAT_VERSIONS, POSTINGS_VERSION, VERSION,
             head_format_version_is_newer,
         };
+        let column_stats_max = || {
+            COLUMN_STATS_ACCEPTED_READ_VERSIONS
+                .iter()
+                .copied()
+                .max()
+                .map_or(0, u32::from)
+        };
+        let newer = |kind, field, version: u32, max_known: u32| {
+            (version > max_known).then_some(NewerFormat {
+                kind,
+                field,
+                version,
+                max_known,
+            })
+        };
         match self {
-            SnapshotFormatError::UnsupportedVersion(version) => *version > VERSION,
-            SnapshotFormatError::UnsupportedLevel(level) => *level > MAX_ENTRY_LEVEL,
+            SnapshotFormatError::Newer(newer) => Some(*newer),
+            SnapshotFormatError::UnsupportedVersion(version) => newer(
+                CatalogObjectKind::SnapshotPart,
+                "envelope version",
+                u32::from(*version),
+                u32::from(VERSION),
+            ),
+            SnapshotFormatError::UnsupportedLevel(level) => newer(
+                CatalogObjectKind::SnapshotPart,
+                "entry level",
+                *level,
+                MAX_ENTRY_LEVEL,
+            ),
             SnapshotFormatError::UnsupportedHeadVersion(version) => {
-                head_format_version_is_newer(*version)
+                head_format_version_is_newer(*version).then(|| NewerFormat {
+                    kind: CatalogObjectKind::Head,
+                    field: "format_version",
+                    version: *version,
+                    max_known: HEAD_FORMAT_VERSIONS.iter().copied().max().unwrap_or(0),
+                })
             }
-            SnapshotFormatError::PostingsUnsupportedVersion(version) => *version > POSTINGS_VERSION,
-            SnapshotFormatError::ColumnStatsUnsupportedVersion(version) => {
-                COLUMN_STATS_ACCEPTED_READ_VERSIONS
-                    .iter()
-                    .all(|accepted| version > accepted)
-            }
-            SnapshotFormatError::ColumnStatsUnknownDeclaredType { declared_type, .. } => {
-                *declared_type > MAX_DECLARED_TYPE
-            }
+            SnapshotFormatError::PostingsUnsupportedVersion(version) => newer(
+                CatalogObjectKind::Postings,
+                "envelope version",
+                u32::from(*version),
+                u32::from(POSTINGS_VERSION),
+            ),
+            SnapshotFormatError::ColumnStatsUnsupportedVersion(version) => newer(
+                CatalogObjectKind::ColumnStats,
+                "envelope version",
+                u32::from(*version),
+                column_stats_max(),
+            ),
+            SnapshotFormatError::ColumnStatsUnknownDeclaredType { declared_type, .. } => newer(
+                CatalogObjectKind::ColumnStats,
+                "declared_type",
+                *declared_type,
+                MAX_DECLARED_TYPE,
+            ),
 
             SnapshotFormatError::TooSmall { .. }
             | SnapshotFormatError::BadMagic
@@ -444,7 +542,7 @@ impl SnapshotFormatError {
             | SnapshotFormatError::ColumnStatsSumOnNonInteger { .. }
             | SnapshotFormatError::ColumnStatsSumMismatch { .. }
             | SnapshotFormatError::ColumnStatsSumWithoutValues { .. }
-            | SnapshotFormatError::DecodeJob(_) => false,
+            | SnapshotFormatError::DecodeJob(_) => None,
         }
     }
 }

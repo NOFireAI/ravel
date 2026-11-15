@@ -615,6 +615,14 @@ pub enum KeyIndexLeafRejection {
     Corrupted(String),
     #[error("unsupported key-index leaf format_version {0}")]
     UnsupportedVersion(u32),
+    /// A `format_version` above every one in
+    /// [`KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN`]: a newer build wrote the leaf.
+    /// A version below or between them stays
+    /// [`KeyIndexLeafRejection::UnsupportedVersion`].
+    #[error(
+        "key-index leaf format_version {0} is above the highest this build reads: a newer build wrote it"
+    )]
+    NewerVersion(u32),
     /// The leaf indexes another part than the one HEAD resolved.
     #[error("leaf binds part {actual}, HEAD names part {expected}")]
     PartBindingMismatch { expected: String, actual: String },
@@ -628,6 +636,19 @@ pub enum KeyIndexLeafRejection {
 
 fn corrupted(msg: impl std::fmt::Display) -> KeyIndexLeafRejection {
     KeyIndexLeafRejection::Corrupted(msg.to_string())
+}
+
+/// The rejection for a `format_version` a reader does not take: newer above
+/// every known version, unsupported otherwise.
+fn version_rejection(format_version: u32) -> KeyIndexLeafRejection {
+    if KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN
+        .iter()
+        .all(|known| format_version > *known)
+    {
+        KeyIndexLeafRejection::NewerVersion(format_version)
+    } else {
+        KeyIndexLeafRejection::UnsupportedVersion(format_version)
+    }
 }
 
 /// A leaf whose header `tenant_hash` or `signal` differs from the request:
@@ -768,9 +789,7 @@ fn validate_prefix(
         prefix_len,
     } = envelope;
     if !KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN.contains(&header.format_version) {
-        return Err(KeyIndexLeafRejection::UnsupportedVersion(
-            header.format_version,
-        ));
+        return Err(version_rejection(header.format_version));
     }
     let bucket_bits = u8::try_from(header.bucket_bits)
         .ok()
@@ -896,7 +915,7 @@ impl KeyIndexLeafPrefix {
             }));
         }
         if !version_accepted {
-            return Err(KeyIndexLeafRejection::UnsupportedVersion(header.format_version).into());
+            return Err(version_rejection(header.format_version).into());
         }
         let prefix = validate_prefix(envelope, bytes)?;
         let header = &prefix.header;

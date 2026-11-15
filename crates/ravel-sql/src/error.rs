@@ -987,6 +987,9 @@ fn redact_catalog(err: &CatalogError) -> &'static str {
                 MSG_CORRUPT
             }
         }
+        // The fold's refusal of a catalog object a newer build wrote: always
+        // above this build's read set, so retryable like a newer HEAD. 503.
+        CatalogError::NewerCatalogObject { .. } => MSG_UNAVAILABLE,
 
         // Echoed verbatim by `client_message` before it reaches here; matched
         // only for exhaustiveness.
@@ -1402,6 +1405,13 @@ mod tests {
         // decode fault carries in its source: retryable, 503.
         let unavailable = [
             SqlError::Catalog(CatalogError::UnsupportedHeadVersion { format_version: 3 }),
+            SqlError::Catalog(CatalogError::NewerCatalogObject {
+                key: key(),
+                kind: ravel_catalog::CatalogObjectKind::SnapshotPart,
+                field: "envelope version",
+                version: 2,
+                max_known: 1,
+            }),
             SqlError::Catalog(CatalogError::SnapshotFormat(
                 SnapshotFormatError::UnsupportedVersion(2),
             )),

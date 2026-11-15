@@ -6,7 +6,7 @@ use ravel_commit::record::RecordError;
 use ravel_object_store::StoreError;
 
 use crate::provisioning::ProvisioningError;
-use crate::snapshot_format::SnapshotFormatError;
+use crate::snapshot_format::{CatalogObjectKind, NewerFormat, SnapshotFormatError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -110,6 +110,23 @@ pub enum CatalogError {
         "HEAD format_version {format_version} is newer than this process understands; upgrade this process (it must not rebuild and overwrite a newer HEAD)"
     )]
     UnsupportedHeadVersion { format_version: u32 },
+    /// A previous catalog part the fold reads (`.csnap`, `.npost`, `.cstat`,
+    /// `.kidx`), or the tenant config record, carries a version above every one
+    /// this process reads (ADR-4233 decision 4, H1 and H11). The fold fails its
+    /// cycle before its HEAD CAS: rebuilding over the object would drop what
+    /// the newer build wrote, and the next sweep would delete it. A version
+    /// below the read set, or a corrupt object, is not this error: the fold
+    /// rebuilds over those as before.
+    #[error(
+        "{kind} object {key:?} carries {field} {version}, above the highest this process reads ({max_known}); the fold refuses rather than rebuild over an object a newer build wrote; upgrade this process"
+    )]
+    NewerCatalogObject {
+        key: String,
+        kind: CatalogObjectKind,
+        field: &'static str,
+        version: u32,
+        max_known: u32,
+    },
     /// A selective-erasure request (`.dreq`) failed protobuf decode or
     /// structural validation while resolving pending predicates (ADR-0064
     /// decision 2). Fatal: a corrupt request object is layout drift, never
@@ -186,4 +203,24 @@ pub enum CatalogError {
     /// tenant value.
     #[error("catalog decode refused: {0}")]
     MemoryExhausted(#[from] ravel_memory::MemoryExhausted),
+}
+
+impl CatalogError {
+    /// The fold's refusal of the object at `key` when `err` classifies it as
+    /// written by a newer build ([`SnapshotFormatError::newer_format`]), else
+    /// `None`.
+    pub(crate) fn newer_object(key: &str, err: &SnapshotFormatError) -> Option<Self> {
+        err.newer_format()
+            .map(|newer| Self::newer_object_from(key, newer))
+    }
+
+    pub(crate) fn newer_object_from(key: &str, newer: NewerFormat) -> Self {
+        CatalogError::NewerCatalogObject {
+            key: key.to_string(),
+            kind: newer.kind,
+            field: newer.field,
+            version: newer.version,
+            max_known: newer.max_known,
+        }
+    }
 }

@@ -23,10 +23,28 @@
 use prost::Message;
 use ravel_proto::catalog::v1::SnapshotPostingsHeader;
 
-use super::error::SnapshotFormatError;
+use super::error::{CatalogObjectKind, NewerFormat, SnapshotFormatError};
 use super::{
     MIN_POSTINGS_ENVELOPE_LEN, POSTINGS_MAGIC, POSTINGS_RESERVED, POSTINGS_VERSION, PostingsLimits,
 };
+
+/// The envelope version gate, read before any byte it governs: above
+/// [`POSTINGS_VERSION`] is [`SnapshotFormatError::Newer`], any other mismatch
+/// [`SnapshotFormatError::PostingsUnsupportedVersion`].
+fn check_postings_version(version: u8) -> Result<(), SnapshotFormatError> {
+    if version > POSTINGS_VERSION {
+        return Err(SnapshotFormatError::Newer(NewerFormat {
+            kind: CatalogObjectKind::Postings,
+            field: "envelope version",
+            version: u32::from(version),
+            max_known: u32::from(POSTINGS_VERSION),
+        }));
+    }
+    if version != POSTINGS_VERSION {
+        return Err(SnapshotFormatError::PostingsUnsupportedVersion(version));
+    }
+    Ok(())
+}
 
 /// One name's sorted, deduplicated entry-ordinal postings list. Ordinals
 /// index into the covered parts' entries in concatenated part order.
@@ -133,9 +151,7 @@ pub fn decode_postings(
         return Err(SnapshotFormatError::BadMagic);
     }
     let version = take_bytes(bytes, &mut pos, 1)?[0];
-    if version != POSTINGS_VERSION {
-        return Err(SnapshotFormatError::PostingsUnsupportedVersion(version));
-    }
+    check_postings_version(version)?;
     let reserved = take_array::<3>(bytes, &mut pos)?;
     if reserved != POSTINGS_RESERVED {
         return Err(SnapshotFormatError::ReservedNonZero);
@@ -277,9 +293,7 @@ pub fn decode_postings_header(bytes: &[u8]) -> Result<SnapshotPostingsHeader, Sn
         return Err(SnapshotFormatError::BadMagic);
     }
     let version = take_bytes(bytes, &mut pos, 1)?[0];
-    if version != POSTINGS_VERSION {
-        return Err(SnapshotFormatError::PostingsUnsupportedVersion(version));
-    }
+    check_postings_version(version)?;
     let reserved = take_array::<3>(bytes, &mut pos)?;
     if reserved != POSTINGS_RESERVED {
         return Err(SnapshotFormatError::ReservedNonZero);

@@ -42,8 +42,9 @@ use crate::declared_stats;
 use crate::error::CatalogError;
 use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
 use crate::snapshot_format::{
-    self, EncodedKeyIndexLeaf, HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSIONS,
-    KeyIndexLeafEncodeError, KeyIndexLeafEntry, KeyIndexLeafInput, KeyIndexLeafLimits,
+    self, CatalogObjectKind, EncodedKeyIndexLeaf, HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSIONS,
+    KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN, KeyIndexLeafEncodeError, KeyIndexLeafEntry,
+    KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexLeafRejection,
     KeyIndexLeafSummary, KeyIndexSlice, NamePostings, PartLimits, SnapshotFormatError,
     column_stats_segments_concat, encode_key_index_leaf, encoded_entry_len,
     key_index_leaf_version_accepted, select_key_index_slice, split_key_index_entries,
@@ -671,6 +672,27 @@ fn is_foreign_part(err: &CatalogError) -> bool {
             ..
         }
     )
+}
+
+/// The previous postings a fold merges forward from, and the first entry
+/// ordinal it decodes. The default is a build from scratch.
+#[derive(Default)]
+struct PostingsBaseline {
+    names: Vec<NamePostings>,
+    decode_start: usize,
+}
+
+/// Whether `err` is the fold refusing a previous object a newer build wrote
+/// (ADR-4233 decision 4, H1), which no rebuild or fallback may answer.
+fn is_newer_object(err: &CatalogError) -> bool {
+    matches!(err, CatalogError::NewerCatalogObject { .. })
+}
+
+/// A decode failure of the object at `key`: the newer-object refusal when the
+/// codec classifies the object as written by a newer build, else the plain
+/// format error.
+fn object_decode_error(key: &str, err: SnapshotFormatError) -> CatalogError {
+    CatalogError::newer_object(key, &err).unwrap_or(CatalogError::SnapshotFormat(err))
 }
 
 fn entry_identity(entry: &SnapshotEntry) -> EntryIdentity {
@@ -2649,6 +2671,65 @@ struct CarriedKeyIndex {
     hold: CarryHold,
 }
 
+/// Why a previous part's leaves are not carried into a new part's build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CarryFailure {
+    /// The leaves cannot stand in for the sections: the build drops the
+    /// carry and reads the sections.
+    Unusable(String),
+    /// A leaf a newer build wrote (ADR-4233 decision 4, H1). Fails the fold:
+    /// a rebuilt leaf would replace its ref and the sweep would delete it.
+    Newer { key: String, version: u32 },
+}
+
+impl From<String> for CarryFailure {
+    fn from(reason: String) -> Self {
+        CarryFailure::Unusable(reason)
+    }
+}
+
+impl std::fmt::Display for CarryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CarryFailure::Unusable(reason) => f.write_str(reason),
+            CarryFailure::Newer { key, version } => write!(
+                f,
+                "leaf {key} is format_version {version}, above the highest this build reads"
+            ),
+        }
+    }
+}
+
+impl CarryFailure {
+    /// A leaf verification failure: [`CarryFailure::Newer`] for a leaf a
+    /// newer build wrote, [`CarryFailure::Unusable`] for anything else.
+    fn of_rejection(key: &str, rejection: KeyIndexLeafRejection) -> Self {
+        match rejection {
+            KeyIndexLeafRejection::NewerVersion(version) => CarryFailure::Newer {
+                key: key.to_string(),
+                version,
+            },
+            other => CarryFailure::Unusable(format!("leaf {key}: {other}")),
+        }
+    }
+
+}
+
+/// The fold's refusal of a previous leaf a newer build wrote.
+fn newer_leaf_error(key: String, version: u32) -> CatalogError {
+    CatalogError::NewerCatalogObject {
+        key,
+        kind: CatalogObjectKind::KeyIndexLeaf,
+        field: "format_version",
+        version,
+        max_known: KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0),
+    }
+}
+
 /// GETs one previous leaf whole and verifies it: the leaf's own checks, its
 /// ref, its tenant, signal, part hash and part entry count, and a
 /// `format_version` the signal accepts (not a logs version-1 leaf).
@@ -2662,7 +2743,7 @@ async fn fetch_carried_leaf(
     leaf: &SnapshotKeyIndexLeafRef,
     limits: &KeyIndexLeafLimits,
     counters: &mut RequestCounters,
-) -> Result<(KeyIndexLeafSummary, Bytes), String> {
+) -> Result<(KeyIndexLeafSummary, Bytes), CarryFailure> {
     counters.get_requests += 1;
     counters.key_index_leaf_gets += 1;
     let got = store
@@ -2670,13 +2751,13 @@ async fn fetch_carried_leaf(
         .await
         .map_err(|e| format!("leaf {} GET: {e}", leaf.key))?;
     let summary = verify_key_index_leaf_frames(&got.data, limits, drop)
-        .map_err(|e| format!("leaf {}: {e}", leaf.key))?;
+        .map_err(|e| CarryFailure::of_rejection(&leaf.key, e))?;
     let expected = SnapshotKeyIndexLeafRef {
         key: String::new(),
         ..leaf.clone()
     };
     if summary.leaf_ref() != expected {
-        return Err(format!("leaf {} does not match its ref", leaf.key));
+        return Err(format!("leaf {} does not match its ref", leaf.key).into());
     }
     let header = &summary.header;
     if header.tenant_hash.as_slice() != tenant.0.as_slice()
@@ -2687,13 +2768,15 @@ async fn fetch_carried_leaf(
         return Err(format!(
             "leaf {} binds another tenant, signal or part",
             leaf.key
-        ));
+        )
+        .into());
     }
     if !key_index_leaf_version_accepted(signal, header.format_version) {
         return Err(format!(
             "leaf {} is format_version {}, which a {signal:?} carry does not take",
             leaf.key, header.format_version
-        ));
+        )
+        .into());
     }
     Ok((summary, got.data))
 }
@@ -2719,7 +2802,7 @@ async fn load_carry_source(
     limits: &KeyIndexLeafLimits,
     hold: &mut CarryHold,
     counters: &mut RequestCounters,
-) -> Result<CarriedSource, String> {
+) -> Result<CarriedSource, CarryFailure> {
     let refs = &source.part.key_index;
     if let Some(leaf) = refs.iter().find(|leaf| {
         fields
@@ -2729,16 +2812,19 @@ async fn load_carry_source(
         return Err(format!(
             "previous leaf field {:?} is not declared under key type {}",
             leaf.field, leaf.key_type
-        ));
+        )
+        .into());
     }
     if let Some(name) = fields
         .keys()
         .find(|name| !refs.iter().any(|leaf| leaf.field == **name))
     {
-        return Err(format!("declared field {name:?} has no previous leaf"));
+        return Err(format!("declared field {name:?} has no previous leaf").into());
     }
     if source.object_keys().len() as u64 != source.part.entry_count {
-        return Err("previous part entry list does not match its ref".to_string());
+        return Err("previous part entry list does not match its ref"
+            .to_string()
+            .into());
     }
     for name in fields.keys() {
         select_key_index_slice(refs, name, &[0u8; 8])
@@ -2747,7 +2833,7 @@ async fn load_carry_source(
             .iter()
             .any(|leaf| leaf.field == *name && leaf.part_blake3 != source.part.blake3)
         {
-            return Err(format!("field {name:?}: a leaf ref names another part"));
+            return Err(format!("field {name:?}: a leaf ref names another part").into());
         }
     }
     let onto: Vec<Option<u64>> = source
@@ -2778,7 +2864,9 @@ async fn load_carry_source(
                 .collect();
             slices.sort_by_key(|slice| slice.leaf.key8_lo);
             let Some(lowest) = slices.first_mut() else {
-                return Err(format!("declared field {name:?} has no previous leaf"));
+                return Err(CarryFailure::Unusable(format!(
+                    "declared field {name:?} has no previous leaf"
+                )));
             };
             let (summary, bytes) = fetch_carried_leaf(
                 store,
@@ -3014,7 +3102,7 @@ async fn feed_carried_key_index(
     share: u64,
     hold: &mut CarryHold,
     counters: &mut RequestCounters,
-) -> Result<(), String> {
+) -> Result<(), CarryFailure> {
     let CarriedSource {
         part_blake3,
         part_entry_count,
@@ -3038,7 +3126,8 @@ async fn feed_carried_key_index(
                     return Err(format!(
                         "leaf {} was dropped and is needed again",
                         slice.leaf.key
-                    ));
+                    )
+                    .into());
                 }
                 let (summary, bytes) = fetch_carried_leaf(
                     store,
@@ -3055,7 +3144,8 @@ async fn feed_carried_key_index(
                     return Err(format!(
                         "leaf {} carries other uncovered_entry_ordinals than its set's lowest slice",
                         slice.leaf.key
-                    ));
+                    )
+                    .into());
                 }
                 hold.take(bytes.len() as u64);
                 slice.fetched_in = Some(field.attempt);
@@ -3083,7 +3173,7 @@ async fn feed_carried_key_index(
                 );
             }
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| CarryFailure::of_rejection(&slice.leaf.key, e))?;
     }
     Ok(())
 }
@@ -3289,7 +3379,7 @@ pub(crate) async fn build_part_key_index(
     held: HeldPart<'_>,
     limits: &KeyIndexBuildLimits,
     counters: &mut RequestCounters,
-) -> Result<BuiltPartKeyIndex, StoreError> {
+) -> Result<BuiltPartKeyIndex, CatalogError> {
     let n = part_entries.len();
     let part_entry_count = n as u64;
     let max_pairs = limits.max_pairs.max(1);
@@ -3393,6 +3483,9 @@ pub(crate) async fn build_part_key_index(
                     }
                     carried.sources.push(loaded);
                 }
+                Err(CarryFailure::Newer { key, version }) => {
+                    return Err(newer_leaf_error(key, version));
+                }
                 Err(reason) => {
                     mark_held(source, &mut previously_covered);
                     tracing::warn!(
@@ -3490,6 +3583,9 @@ pub(crate) async fn build_part_key_index(
                     }
                 }
                 peak_held = peak_held.max(carried.hold.peak);
+                if let Some(CarryFailure::Newer { key, version }) = failure {
+                    return Err(newer_leaf_error(key, version));
+                }
                 if let Some(reason) = failure {
                     tracing::warn!(
                         tenant = %tenant.to_hex(),
@@ -4144,11 +4240,27 @@ impl Catalog {
         // a per-tenant override nor a deployment default gets no frontier
         // reconcile (nothing is being retired). The fold's index role is a pure
         // optimization and the sweep's HEAD-reachability gate is the durable
-        // delete blocker, so a config-read fault never fails the fold.
+        // delete blocker, so a config-read fault never fails the fold. A
+        // record a newer build wrote is the exception (ADR-4233 decision 4,
+        // H11): folding it with defaults would rebuild parts without the
+        // columns it declares, so the cycle fails before any read or write.
         let tenant_config = match crate::tenant_config::read_config_values(self.store(), tenant)
             .await
         {
             Ok(cfg) => cfg,
+            Err(crate::tenant_config::TenantConfigError::UnsupportedVersion {
+                key,
+                got,
+                ceiling,
+            }) => {
+                return Err(CatalogError::NewerCatalogObject {
+                    key,
+                    kind: CatalogObjectKind::TenantConfig,
+                    field: "format_version",
+                    version: got,
+                    max_known: ceiling,
+                });
+            }
             Err(err) => {
                 tracing::warn!(
                     error = %err,
@@ -4360,6 +4472,10 @@ impl Catalog {
                         // (ADR-0050 §2), which a rebuild would leave unreported,
                         // the same answer `load_previous_postings` gives.
                         Err(err) if is_foreign_part(&err) => return Err(err),
+                        // A part a newer build wrote (ADR-4233 decision 4, H1):
+                        // a rebuild would CAS a HEAD without it and the sweep
+                        // would then delete it.
+                        Err(err) if is_newer_object(&err) => return Err(err),
                         Err(err) => {
                             tracing::warn!(
                                 error = %err,
@@ -5002,6 +5118,13 @@ impl Catalog {
                                         baseline.insert(segment.writer_id.clone(), segment);
                                     }
                                 }
+                                // A newer object fails the cycle before any
+                                // PUT (ADR-4233 decision 4, H1): rebuilt stats
+                                // would replace its ref and the sweep would
+                                // delete it.
+                                Err(err) if err.is_newer_format_version() => {
+                                    return Err(object_decode_error(&stats_ref.key, err));
+                                }
                                 Err(err) => {
                                     tracing::warn!(
                                         error = %err,
@@ -5062,20 +5185,32 @@ impl Catalog {
                 .collect();
             let mut held_label_dicts =
                 HeldLabelDicts::new(wanted_spans, self.config().key_index_build_max_pairs.max(1));
+            // Read before the first PUT of this attempt, whichever build below
+            // consumes it (ADR-4233 decision 4, H1).
+            let mut postings_baseline = Some(
+                self.load_postings_baseline(
+                    tenant,
+                    &head_state,
+                    rebuilt || reconciled,
+                    previous_entries_len,
+                    &mut counters,
+                    &accounting,
+                )
+                .await?,
+            );
             let early_postings = if signal == Signal::Metrics && key_index_fields.is_some() {
+                let baseline = postings_baseline.take().unwrap_or_default();
                 Some(
-                    self.fold_postings_names(
+                    self.build_postings(
                         tenant,
                         signal,
-                        &head_state,
-                        rebuilt || reconciled,
-                        previous_entries_len,
                         &entries,
+                        baseline.decode_start,
+                        baseline.names,
                         Some(&mut held_label_dicts),
                         &mut counters,
-                        &accounting,
                     )
-                    .await?,
+                    .await,
                 )
             } else {
                 None
@@ -5456,8 +5591,7 @@ impl Catalog {
                                 },
                                 &mut counters,
                             )
-                            .await
-                            .map_err(CatalogError::Store)?;
+                            .await?;
                             if sealed_day {
                                 counters.sealed_day_leaf_puts +=
                                     counters.put_requests - puts_before;
@@ -5551,18 +5685,17 @@ impl Catalog {
             let postings_names = match early_postings {
                 Some(names) => names,
                 None => {
-                    self.fold_postings_names(
+                    let baseline = postings_baseline.take().unwrap_or_default();
+                    self.build_postings(
                         tenant,
                         signal,
-                        &head_state,
-                        rebuilt || reconciled,
-                        previous_entries_len,
                         &entries,
+                        baseline.decode_start,
+                        baseline.names,
                         None,
                         &mut counters,
-                        &accounting,
                     )
-                    .await?
+                    .await
                 }
             };
             let mut postings_built = false;
@@ -5897,7 +6030,8 @@ impl Catalog {
             });
         }
         let limits = PartLimits::default();
-        let header = snapshot_format::decode_part_header(&got.data)?;
+        let header = snapshot_format::decode_part_header(&got.data)
+            .map_err(|err| object_decode_error(&part_ref.key, err))?;
         // ADR-0050 §2, before the reservation below, exactly as
         // `snapshot_resolve` checks a part: the HEAD's blake3 binds the bytes
         // to the HEAD, and only the header's tenant_hash binds them to the
@@ -5916,7 +6050,8 @@ impl Catalog {
             header.entries_uncompressed_len,
             limits.max_snapshot_part_bytes,
         )?;
-        let decoded = snapshot_format::decode_part(&got.data, &limits)?;
+        let decoded = snapshot_format::decode_part(&got.data, &limits)
+            .map_err(|err| object_decode_error(&part_ref.key, err))?;
         Ok((decoded.entries, reservation))
     }
 
@@ -5972,7 +6107,7 @@ impl Catalog {
                     );
                     loaded.insert(part_ref.key.clone(), charged);
                 }
-                Err(err) if is_foreign_part(&err) => return Err(err),
+                Err(err) if is_foreign_part(&err) || is_newer_object(&err) => return Err(err),
                 Err(_) => return Ok((true, loaded)),
             }
         }
@@ -6083,6 +6218,9 @@ impl Catalog {
         // (ADR-1702 decision 6).
         let header = match snapshot_format::decode_postings_header(&got.data) {
             Ok(header) => header,
+            Err(err) if err.is_newer_format_version() => {
+                return Err(object_decode_error(&postings_ref.key, err));
+            }
             Err(err) => {
                 tracing::warn!(
                     error = %err,
@@ -6130,6 +6268,9 @@ impl Catalog {
         let decoded =
             match snapshot_format::decode_postings(&got.data, &limits, &expected_part_blake3) {
                 Ok(decoded) => crate::charged::Charged::new(decoded, reservation),
+                Err(err) if err.is_newer_format_version() => {
+                    return Err(object_decode_error(&postings_ref.key, err));
+                }
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
@@ -6191,25 +6332,28 @@ impl Catalog {
         }
     }
 
-    /// The fold's name postings for `entries`: merged forward from the
-    /// previous HEAD's postings unless `from_scratch` or no usable baseline
-    /// exists, then built by [`Catalog::build_postings`].
-    #[allow(clippy::too_many_arguments)]
-    async fn fold_postings_names(
+    /// The merge baseline for this fold's name postings and the ordinal
+    /// [`Catalog::build_postings`] starts decoding from: the previous HEAD's
+    /// postings and `previous_entries_len`, or nothing and 0 when
+    /// `from_scratch` or no usable baseline exists. Loaded before the fold
+    /// writes anything, so a postings object a newer build wrote fails the
+    /// cycle with nothing written.
+    async fn load_postings_baseline(
         &self,
         tenant: &TenantHash,
-        signal: Signal,
         head_state: &HeadState,
         from_scratch: bool,
         previous_entries_len: usize,
-        entries: &[SnapshotEntry],
-        held_label_dicts: Option<&mut HeldLabelDicts>,
         counters: &mut RequestCounters,
         accounting: &QueryAccounting,
-    ) -> Result<Option<Vec<NamePostings>>, CatalogError> {
-        let (baseline, decode_start): (Vec<NamePostings>, usize) = if from_scratch {
-            (Vec::new(), 0)
-        } else if let HeadState::Valid { head, .. } = head_state {
+    ) -> Result<PostingsBaseline, CatalogError> {
+        if from_scratch {
+            return Ok(PostingsBaseline::default());
+        }
+        let HeadState::Valid { head, .. } = head_state else {
+            return Ok(PostingsBaseline::default());
+        };
+        Ok(
             match self
                 .load_previous_postings(
                     tenant,
@@ -6220,23 +6364,13 @@ impl Catalog {
                 )
                 .await?
             {
-                Some(names) => (names, previous_entries_len),
-                None => (Vec::new(), 0),
-            }
-        } else {
-            (Vec::new(), 0)
-        };
-        Ok(self
-            .build_postings(
-                tenant,
-                signal,
-                entries,
-                decode_start,
-                baseline,
-                held_label_dicts,
-                counters,
-            )
-            .await)
+                Some(names) => PostingsBaseline {
+                    names,
+                    decode_start: previous_entries_len,
+                },
+                None => PostingsBaseline::default(),
+            },
+        )
     }
 
     /// Build the name-postings index for `entries`, merging forward from `baseline` rather than re-decoding every
@@ -19159,7 +19293,7 @@ pub(crate) mod tests {
                 assert_eq!(field.held.len(), 2, "both slices' pairs held");
                 assert!(later_slice.bytes.is_some());
             } else {
-                let reason = fed.expect_err("the later slice is refused");
+                let reason = fed.expect_err("the later slice is refused").to_string();
                 assert!(
                     reason.contains("other uncovered_entry_ordinals"),
                     "{reason}"

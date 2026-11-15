@@ -292,6 +292,10 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
                     MSG_CORRUPT
                 }
             }
+            // The fold's refusal of a catalog object a newer build wrote:
+            // always above this build's read set, so retryable like a newer
+            // HEAD. 503.
+            CatalogError::NewerCatalogObject { .. } => MSG_UNAVAILABLE,
 
             // Never reached: the outer arm returns None for WindowTooWide.
             // Matched only for exhaustiveness.
@@ -655,6 +659,15 @@ mod tests {
         // decode fault carries in its source: retryable 503 unavailable.
         let unavailable: Vec<fn() -> QueryError> = vec![
             || QueryError::Catalog(CatalogError::UnsupportedHeadVersion { format_version: 3 }),
+            || {
+                QueryError::Catalog(CatalogError::NewerCatalogObject {
+                    key: LEAKY_KEY.to_string(),
+                    kind: ravel_catalog::CatalogObjectKind::SnapshotPart,
+                    field: "envelope version",
+                    version: 2,
+                    max_known: 1,
+                })
+            },
             || {
                 QueryError::Catalog(CatalogError::SnapshotFormat(
                     SnapshotFormatError::UnsupportedVersion(2),
