@@ -476,11 +476,15 @@ pub struct FoldReport {
     /// the carry serves every such entry. Also counted in
     /// `key_index_ranged_gets`.
     pub key_index_unchanged_section_gets: u64,
-    /// Ranged version-prefix GETs the pre-PUT newer-part peek issued (ADR-4233
-    /// H1): one per previous `.npost`, `.cstat` or `.kidx` object this fold
-    /// drops or replaces without otherwise reading it, so a newer-build object
-    /// is refused before the first PUT rather than rebuilt over. Also counted
-    /// in `get_requests`.
+    /// GETs the pre-PUT newer-part peek issued (ADR-4233 H1): one per previous
+    /// `.csnap` part, `.npost`, `.cstat` or `.kidx` leaf this fold drops or
+    /// replaces without otherwise reading it, so a newer-build object is
+    /// refused before the first PUT rather than rebuilt over. A `.npost` peek
+    /// is a ranged GET of its first `NEWER_PART_PEEK_PREFIX_LEN` bytes and a
+    /// `.kidx` peek a ranged GET of the leaf's prefix (a full GET when that
+    /// range is malformed); `.csnap` and `.cstat` peeks are full GETs, because
+    /// their newer-version markers can sit in the body. Also counted in
+    /// `get_requests`.
     pub newer_part_peek_gets: u64,
     /// Lowercase hex blake3 of the HEAD in effect when the fold returned (the
     /// one it published, or on a no-op the one it read and left in place),
@@ -494,8 +498,9 @@ pub struct FoldReport {
     pub retired_hours: Vec<u32>,
 }
 
-/// Bytes to range-GET from the front of a `.csnap`, `.npost` or `.cstat`
-/// object when peeking its envelope version (ADR-4233 H1). The version byte
+/// Bytes to range-GET from the front of a `.npost` object when peeking its
+/// envelope version (ADR-4233 H1); `.csnap` and `.cstat` peeks read the whole
+/// object. The version byte
 /// sits at offset 4, before any body or length field, so this always covers
 /// it; a current-version object whose protobuf header runs past it yields a
 /// non-version decode error, which the peek reads as not-newer.

@@ -92,9 +92,10 @@ pub fn key_index_leaf_versions_for_signal(signal: Signal) -> &'static [u32] {
 /// signal reads ([`key_index_leaf_versions_for_signal`]): a leaf a newer
 /// build wrote, which a fold must refuse rather than rebuild over (ADR-4233
 /// H1). Distinct from `!key_index_leaf_version_accepted`, which is also true
-/// for a version the signal does not read but is not newer (a logs
-/// version-1 leaf, or a metrics v3 leaf met as logs): those keep the rebuild
-/// path, this fails the cycle.
+/// for a version below the signal's read set (a logs version-1 leaf): that
+/// keeps the rebuild path, this fails the cycle. A version above the
+/// signal's read set is newer even when another signal reads it: the logs read
+/// set is [1, 2], so a v3 leaf met as logs is refused.
 pub fn key_index_leaf_version_is_newer(signal: Signal, format_version: u32) -> bool {
     key_index_leaf_versions_for_signal(signal)
         .iter()
@@ -1053,9 +1054,9 @@ pub enum KeyIndexLeafRejection {
 impl KeyIndexLeafRejection {
     /// The header `format_version` when it is above every version `signal`
     /// reads ([`key_index_leaf_version_is_newer`]): a leaf a newer build
-    /// wrote. A version within or below the signal's read set (a metrics v3
-    /// leaf met as logs is below logs's ceiling, not newer), and every other
-    /// rejection, is `None`.
+    /// wrote, including a version another signal reads (a v3 leaf met as logs,
+    /// whose read set is [1, 2]). A version within or below the signal's read
+    /// set, and every other rejection, is `None`.
     pub fn newer_version(&self, signal: Signal) -> Option<u32> {
         match self {
             KeyIndexLeafRejection::UnsupportedVersion(version)
