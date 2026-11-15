@@ -7286,9 +7286,17 @@ and at the default thresholds (`logs_block_range_threshold` 512 KiB, so
 `plan_whole_object_bound` is at least 512 KiB) that is the key the query
 path reads for such an object, which it opens whole without a probe.
 
+"Most recent" is by ingest time, not event time. The warm set
+of a (tenant, signal) is every part filed under an ingest-hour bucket from 24
+hours before the tenant's latest ingest hour through that hour, whatever the
+parts' event times (`Catalog::resolve_ingest_hours`), ordered newest ingest
+hour first and, within an hour, by latest `max_event_ts_ns` first. Both the
+whole-part warm and the pass take parts in that order. A tenant loaded with
+event times years before its ingest time is warmed like any other; an
+event-time window anchored at its ingest hours would match none of its parts.
+
 The pass is not held to the 4-part cap: it
-visits every logs object in the warm window, the 24 hours before the tenant's
-latest ingest hour through the end of that hour, most recent first, and skips
+visits every logs object in the warm set, in that order, and skips
 the objects the query path reads whole (at or below
 `LogSegmentFetcher::plan_whole_object_bound`). For each remaining object it
 calls `BlockRangeFetcher::fetch_plan_directories`, the plan phase's own
