@@ -517,6 +517,7 @@ mod tests {
             part_index: 0,
             sort_descriptor: None,
             clustering_generation: 0,
+            unknown_section_kinds: Vec::new(),
         }
     }
 
