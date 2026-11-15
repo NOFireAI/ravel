@@ -516,6 +516,20 @@ impl Tenant {
     /// Starts a server over the tenant with a fresh read cache of
     /// `cache_bytes`, warmed unless `warm` is false, and waits for `/readyz`.
     async fn restart(&self, partitions: usize, cache_bytes: u64, warm: bool) -> Server {
+        self.restart_with_budget(partitions, cache_bytes, cache_bytes, warm)
+            .await
+    }
+
+    /// [`Tenant::restart`] with `cache_max_bytes` configured as the server's
+    /// `--cache-max-bytes`, the budget the metadata pass takes its share of,
+    /// apart from the read cache's own size.
+    async fn restart_with_budget(
+        &self,
+        partitions: usize,
+        cache_bytes: u64,
+        cache_max_bytes: u64,
+        warm: bool,
+    ) -> Server {
         let cache = Arc::new(Cache::new(CacheLimits::new(
             cache_bytes,
             16_384,
@@ -524,7 +538,7 @@ impl Tenant {
         self.store.hide_tenants.store(!warm, Ordering::SeqCst);
         let store: Arc<dyn ObjectStoreBackend> = self.store.clone();
         let running = ravel_server::start(
-            server_config(partitions, cache_bytes),
+            server_config(partitions, cache_max_bytes),
             store.clone(),
             store,
             Arc::new(ravel_object_store::StoreMetrics::default()),
@@ -823,14 +837,17 @@ async fn the_warm_covers_directories_beyond_the_suffix_probe() {
     );
 }
 
-/// A read cache too small for the whole tenant: startup still succeeds, the
-/// metadata pass stops at its share of the budget, and the first statement
-/// reads exactly the footers of the objects the pass did not reach.
+/// A metadata ceiling too small for the whole tenant: startup still succeeds,
+/// the metadata pass stops at its share of the budget, and the first
+/// statement reads exactly the footers of the objects the pass did not reach.
 ///
 /// The whole-part warm leaves the 4 newest objects resident first, `R`
-/// bytes. The pass then admits objects most recent first while resident
-/// bytes plus the admitted probes stay within half the cache, so a cache of
-/// `2 * (R + 2 * P) + P` (`P` one probe) admits exactly 2.
+/// bytes. The pass charges its ceiling only with the bytes its own reads
+/// fetch, one probe `P` per object here (every fixture object's directories
+/// fit in its probe), and admits objects most recent first while those stay
+/// within half of `--cache-max-bytes`. A budget of `2 * (2 * P) + P` admits
+/// exactly 2, though `R` alone exceeds half of it. The read cache itself is
+/// roomy, so no eviction decides which footers the statement finds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_metadata_warm_stops_at_the_cache_budget() {
     let tenant = ingest_tenant().await;
@@ -850,10 +867,16 @@ async fn the_metadata_warm_stops_at_the_cache_budget() {
         probes.iter().all(|&p| p == probe),
         "one probe length: {probes:?}"
     );
-    let cache_bytes = 2 * (resident + 2 * probe) + probe;
+    let cache_max_bytes = 2 * (2 * probe) + probe;
+    assert!(
+        resident > cache_max_bytes / 2,
+        "the whole-part warm alone exceeds the pass's ceiling: {resident} vs {cache_max_bytes}"
+    );
     const ADMITTED: usize = 2;
 
-    let server = tenant.restart(FAST_PATH.1, cache_bytes, true).await;
+    let server = tenant
+        .restart_with_budget(FAST_PATH.1, ROOMY_CACHE_BYTES, cache_max_bytes, true)
+        .await;
     assert_eq!(
         server.cache.total_bytes(),
         resident + ADMITTED as u64 * probe,
