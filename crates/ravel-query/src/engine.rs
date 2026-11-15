@@ -6366,6 +6366,33 @@ mod tests {
         QueryEngine::new(Arc::new(catalog), store, EngineConfig::default())
     }
 
+    /// The series route runs at the ADR's bounds unless a test overrides
+    /// `S_max`, and the override survives the per-query clones the route
+    /// runs on.
+    #[test]
+    fn the_series_route_s_max_override_reaches_every_query_clone() {
+        use crate::key_index_route::{SERIES_ROUTE_S_MAX, SeriesRouteOptions};
+        let engine = empty_store_engine();
+        assert_eq!(engine.series_route, SeriesRouteOptions::default());
+        assert_eq!(engine.series_route.s_max, SERIES_ROUTE_S_MAX);
+        let engine = engine.with_series_route_s_max(3);
+        let expected = SeriesRouteOptions {
+            s_max: 3,
+            ..SeriesRouteOptions::default()
+        };
+        assert_eq!(engine.series_route, expected);
+        assert_eq!(
+            engine.scoped_to(&RequestBudgets::default()).series_route,
+            expected
+        );
+        assert_eq!(
+            engine
+                .with_live_usage(&LiveQueryAccounting::default())
+                .series_route,
+            expected
+        );
+    }
+
     /// A query whose snapshot resolves to zero segments never enters the
     /// segment-fetch loop, so the incremental `max_s3_requests` check there
     /// never runs. A caller-lowered budget of zero (ADR-1374 decision 3) must

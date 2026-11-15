@@ -99,8 +99,9 @@ pub struct QueryStatsJson {
     #[serde(rename = "segmentsPruned")]
     pub segments_pruned: u64,
     /// Snapshot segments the key-index routes dropped before any was opened,
-    /// on parts the label-value route (ADR-3694 decision 3, issue #3865)
-    /// answered for at least one selector; not counted in `segmentsFetched`.
+    /// on parts where the label-value route (ADR-3694 decision 3, issue
+    /// #3865) answered at least one selector; not counted in
+    /// `segmentsFetched`.
     #[serde(rename = "segmentsPrunedByLabelIndex")]
     pub segments_pruned_by_label_index: u64,
     /// The same, on parts the series route (ADR-4146 decision 3) answered

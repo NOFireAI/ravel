@@ -1233,7 +1233,9 @@ wherever leaves are built).
   issued no leaf GET adds no check before the fetch batches' own.
 
 `segmentsPrunedByLabelIndex`, beside `segmentsPruned` in `data.stats`, counts
-the snapshot segments no plan reads. Unlike a dictionary drop, a pruned
+the snapshot segments no plan reads, except those on a part where the series
+route (below) answered every plan: `segmentsPrunedBySeriesIndex` counts
+those, and the two add up to every segment no plan reads. Unlike a dictionary drop, a pruned
 segment is not counted in `segmentsFetched`. The leaf GETs and their wire
 bytes are charged to the `keyIndex` phase, and the route's parts and leaf
 GETs to `ravel_query_key_index_parts_total` and
@@ -1277,6 +1279,114 @@ in the stats. Each object carries:
   segment only for its own values: a value another plan carries prunes
   nothing from it
   (`a_value_only_another_plan_carries_prunes_nothing_from_this_plan`).
+
+### The series route (ADR-4146 decisions 3 and 4)
+
+The label-value route proves a value absent from an object, so it cannot
+prune an object that holds `__name__="m"` on one series and `env="prod"` on
+another but no series carrying both. The series route answers that case from
+three per-part metrics key-index fields (leaf format version 3, posting kind
+for the first two): `series_label` maps a `name=value` pair to the ascending
+series keys carrying it, `series_class` maps a series key to its class, and
+`class_objects` maps a class ordinal (`key8_i64`) to the entries holding it.
+A series key is its 8-byte `key8` read as a big-endian `u64`. No fold writes
+these fields yet (W1), so on folded data today the route does not run.
+
+`route_metric_statement` (`key_index_route::series`) runs first, the
+label-value route second over what the series route left, and the
+tier-1 fetch last. A plan with at least two distinct positive equality pairs
+(non-empty value, `__name__` included) is routed; any other plan goes
+straight to the label-value route (`a_plan_with_one_pair_is_not_series_routed`).
+On each part that has a segment in the snapshot, three passes run, each one
+set probe shared by the plans admitted to it:
+
+- Pass A probes `series_label` with the union of the plans' pair keys. Each
+  admitted plan intersects its own pairs' postings into its series set `S`.
+  A plan whose `S` is empty keeps only the entries a probed leaf lists as
+  uncovered
+  (`a_plan_whose_pairs_share_no_series_keeps_only_uncovered_entries`).
+- Pass B probes `series_class` with the union of the admitted `S`, giving
+  each plan its classes.
+- Pass C probes `class_objects` with the union of those classes. Each plan
+  keeps the entries its classes name plus every entry any probed leaf of the
+  part lists as uncovered.
+
+A plan answered on a part keeps that answer there and is not probed on the
+`label_value` field for that part; a plan declined on a part is routed there
+by the label-value route exactly as it would be with no series fields.
+Neither route drops a segment holding a series the plan matches, nor an
+uncovered or unfolded segment (`the_series_route_never_drops_a_holder`, a
+property test over random layouts, bounds and declines; it fails against an
+intersection that drops uncovered entries and against a route reusing one
+plan's `S` for the whole statement). In the row-3 shape above the series
+route opens only the objects holding the matching series, where the
+label-value route opens every object
+(`the_row_three_shape_opens_only_the_series_holders`).
+
+Bounds, all on on-object bytes past the slice prefixes, per part and summed
+over a field's slices:
+
+- `Q_A` = 8 MiB for pass A. Plans are admitted cheapest-first (each plan's
+  own run bytes, ties in plan order) while the admitted union's runs fit; the
+  first plan that does not fit and every plan after it decline `over_q_a`
+  (`a_shared_pass_over_q_a_admits_the_cheapest_plans_and_sends_the_rest_on`).
+- `Q_BC` = 4 MiB shared by passes B and C. Pass B's share is `Q_BC` less the
+  whole `class_objects` body, so whenever `Q_BC` covers that body pass C has
+  room for its whole field after B; pass C gets what B left. A plan B or C does not admit declines
+  `over_q_bc` (`over_the_q_bc_share_falls_back_to_the_label_value_route`).
+- `S_max` = 192 for pass B: when the whole `series_class` body (its slices'
+  `size − prefix_len`) exceeds B's share, plans are pre-admitted smallest `S`
+  first while the union of their `S` holds at most `S_max` keys, and the rest
+  decline `over_s_max`. When the body fits B's share the pre-check is
+  skipped
+  (`over_s_max_falls_back_and_the_pre_check_is_skipped_when_the_body_fits`).
+  `QueryEngine::with_series_route_s_max` overrides `S_max` for tests and the
+  acceptance run; it is not a server flag
+  (`the_series_route_s_max_override_reaches_every_query_clone`).
+- Part admission: parts are probed largest entry count first, at most
+  `KEY_INDEX_MAX_PROBED_PARTS`, and while each pass's worst-case leaf GETs
+  stay within the label-value route's ceiling for its key count (passes B
+  and C at `B_run` keys); the rest decline `beyond_ceiling`
+  (`parts_past_the_ceiling_fall_back_to_the_label_value_route`). A pass whose
+  worst-case GETs exceed 2 per segment of the part declines `over_tier_one`
+  (`a_part_too_small_for_tier_one_falls_back_to_the_label_value_route`).
+
+The other declines: a part lacking a ref for one of the three fields
+(`no_series_refs`,
+`a_part_lacking_a_series_field_falls_back_to_the_label_value_route`); a leaf
+that fails to read, verify or agree with the other two fields (`rejected`,
+`a_rejected_series_leaf_falls_back_to_the_label_value_route`); a refused
+fetch or decode reservation (`reservation_refused`,
+`a_refused_decode_reservation_falls_back_to_the_label_value_route`); and
+`over_budget`, the probe's own backstop when a slice's runs exceed what the
+pass has left, which admission checks first over the same runs. A series leaf that names
+another tenant or signal fails the statement
+(`a_series_leaf_of_another_tenant_is_an_isolation_error`). A snapshot with
+no series ref on any part routes exactly as the label-value route alone,
+with the same leaf GETs
+(`leaves_with_no_series_fields_route_as_the_label_value_route_does`), and
+with a pending erasure nothing is routed (`a_pending_erasure_routes_nothing`).
+
+In `data.stats`:
+
+- `segmentsPrunedBySeriesIndex`: the segments no plan reads on parts where
+  the series route answered every plan
+  (`promql_query_range_reaches_the_series_route` in
+  `services/ravel-server/tests/metrics_label_index_routing.rs`).
+- `seriesIndexPasses`: one row per pass, `A`, `B`, `C` in that order, each
+  with `partsProbed`, `plansOffered`, `plansAdmitted`, `keysOffered`,
+  `keysProbed`, `distinctBuckets`, `bridgedBytes`, `prefixBytes`,
+  `bytesPastPrefix` (on-object bytes), and `leafGetRequests`,
+  `leafWireBytes` and `leafCacheHits` counted as the label-value passes'
+  are. The passes' GETs are charged to the `keyIndex` phase; for a
+  metrics-only statement the series route answered on every part, their sum
+  is the phase's GETs.
+- `seriesIndex`: `plansRouted`, `planPartsAnswered`, and `declines`, every
+  reason above with its (plan, part) count. Every routed plan counts once
+  per part with a segment in the snapshot, answered or under one reason.
+
+`seriesIndexPasses` and `seriesIndex` are absent when the series route did
+not run (`stats_json_carries_the_series_index_counters_and_pass_rows`).
 
 ### The L0 page-range bound (ADR-1306)
 
