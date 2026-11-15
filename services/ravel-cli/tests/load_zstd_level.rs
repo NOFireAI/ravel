@@ -121,6 +121,9 @@ async fn load_at(level: i32, parquet: &Path, mapping: &Path, now_ns: i64) -> Loa
         RlogZstdLevel::new(level).expect("in range"),
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
+        // The page counts below were measured under the exhaustive choice,
+        // where the level can also change which encoding a page keeps.
+        ravel_cli::load::LoadPageChoice::Exhaustive,
         None,
         false,
         &ravel_cli::ipcrypt::IpcryptPolicy::empty(),

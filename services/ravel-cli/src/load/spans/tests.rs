@@ -404,6 +404,35 @@ fn metrics_and_spans_warn_on_a_non_default_chunk_order_and_logs_does_not() {
     );
 }
 
+/// `--page-choice exhaustive` on a metrics or spans load is named as ignored;
+/// the default, or either choice on a logs load, is not.
+#[test]
+fn metrics_and_spans_warn_on_a_non_default_page_choice_and_logs_does_not() {
+    for choice in [LoadPageChoice::Exhaustive, LoadPageChoice::Estimated] {
+        assert_eq!(unused_page_choice_warning(choice, SignalArg::Logs), None);
+    }
+    for signal in [SignalArg::Metrics, SignalArg::Spans] {
+        assert_eq!(
+            unused_page_choice_warning(LoadPageChoice::Estimated, signal),
+            None
+        );
+    }
+    assert_eq!(
+        unused_page_choice_warning(LoadPageChoice::Exhaustive, SignalArg::Metrics).as_deref(),
+        Some(
+            "warning: a metrics load ignores --page-choice exhaustive. The page choice applies \
+             only to the RLOG objects a logs load writes."
+        )
+    );
+    assert_eq!(
+        unused_page_choice_warning(LoadPageChoice::Exhaustive, SignalArg::Spans).as_deref(),
+        Some(
+            "warning: a spans load ignores --page-choice exhaustive. The page choice applies \
+             only to the RLOG objects a logs load writes."
+        )
+    );
+}
+
 /// The future-skew bound is kept and the past-lag bound is relaxed,
 /// both anchored on the span's END exactly as `checked_span_interval`
 /// anchors them.

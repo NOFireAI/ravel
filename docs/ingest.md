@@ -1101,9 +1101,20 @@ exactly five places:
 - Objects are RLOG, built with `ravel_logseg::RlogWriter`, not RSEG built
   with `SegmentWriter`. The flush takes the writer's page choice from the
   ingest setting `rlog_page_choice` (ADR-3492 decision 1): `Estimated` for the
-  server's logs ingest, the default, and `Exhaustive` for `ravel-cli load`,
-  which trades write time for stored bytes. It hands a row-major buffer
-  to the writer as one `ColumnarLogBatch` through `push_columnar` (decision 2), which
+  server's logs ingest, the default. `ravel-cli load` sets it from
+  `--page-choice exhaustive|estimated`, default `estimated` (ADR-4203
+  decision 7), for every flush of the load, on the columnar and the row path
+  alike; the load summary's `page choice` line and the report JSON's
+  `page_choice` field name the value used. `exhaustive` seals every
+  candidate encoding of each page and keeps the one with the fewest stored
+  bytes; `estimated` seals one candidate picked from the page's statistics,
+  trading a few percent of stored bytes for write CPU. On the ClickBench
+  entry load (c6a.4xlarge, ADR-4203's Stage 0 amendment), `estimated` wrote
+  2.43% more l0 bytes, and cold Q21, Q28 and Q29 on that tenant were 0.1 to
+  2.6% slower than on the exhaustive one. Both choices write encodings the
+  format defines, and readers decode either the same way. The flush hands a
+  row-major buffer to the writer as one `ColumnarLogBatch` through
+  `push_columnar` (ADR-3492 decision 2), which
   writes the object byte for byte as pushing the rows one at a time would.
   The encode runs on the ADR-1702 write gate, sized by the flush's input
   bytes. Below the gate's inline floor (1 MiB by default on the server) it is one inline

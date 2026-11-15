@@ -229,6 +229,7 @@ pub async fn run(
     zstd_level: RlogZstdLevel,
     group_target_blocks: RlogGroupTargetBlocks,
     chunk_order: RlogChunkOrder,
+    page_choice: LoadPageChoice,
     load_memory_bytes: Option<u64>,
     fold_after_load: bool,
     ipcrypt: &IpcryptPolicy,
@@ -255,6 +256,7 @@ pub async fn run(
         zstd_level,
         group_target_blocks,
         chunk_order,
+        page_choice,
         LoadMemoryRequest::from_flag_on_host(load_memory_bytes),
         fold_after_load,
         ipcrypt,
@@ -423,6 +425,7 @@ pub(crate) async fn run_fold_warning_to(
         zstd_level,
         group_target_blocks,
         chunk_order,
+        LoadPageChoice::default(),
         load_memory,
         fold_after_load,
         ipcrypt,
@@ -463,6 +466,7 @@ pub async fn run_load_reporting(
     zstd_level: RlogZstdLevel,
     group_target_blocks: RlogGroupTargetBlocks,
     chunk_order: RlogChunkOrder,
+    page_choice: LoadPageChoice,
     load_memory: LoadMemoryRequest,
     fold_after_load: bool,
     ipcrypt: &IpcryptPolicy,
@@ -507,6 +511,9 @@ pub async fn run_load_reporting(
         let _ = writeln!(warnings, "{warning}");
     }
     if let Some(warning) = unused_chunk_order_warning(chunk_order, signal) {
+        let _ = writeln!(warnings, "{warning}");
+    }
+    if let Some(warning) = unused_page_choice_warning(page_choice, signal) {
         let _ = writeln!(warnings, "{warning}");
     }
     // Every signal's loader resolves the budget once it knows the read-cursor
@@ -677,6 +684,7 @@ pub async fn run_load_reporting(
             zstd_level,
             group_target_blocks,
             chunk_order,
+            page_choice,
             Some(memory_options),
             fold_after_load,
             rules,
@@ -1163,6 +1171,27 @@ pub(super) fn unused_chunk_order_warning(
             "warning: a {noun} load ignores --chunk-order {}. The chunk order applies only \
              to the RLOG objects a logs load writes.",
             chunk_order.get().join(",")
+        )
+    })
+}
+
+/// The warning for a `--page-choice` a metrics or spans load cannot use, or
+/// `None` when the choice is the default or the load is a logs load. The
+/// choice reaches only the RLOG writer a logs flush runs.
+pub(super) fn unused_page_choice_warning(
+    page_choice: LoadPageChoice,
+    signal: SignalArg,
+) -> Option<String> {
+    let noun = match signal {
+        SignalArg::Logs => return None,
+        SignalArg::Metrics => "metrics",
+        SignalArg::Spans => "spans",
+    };
+    (page_choice != LoadPageChoice::default()).then(|| {
+        format!(
+            "warning: a {noun} load ignores --page-choice {}. The page choice applies only \
+             to the RLOG objects a logs load writes.",
+            page_choice.name()
         )
     })
 }
