@@ -117,10 +117,10 @@ corruption in reports only).
 | series identity | domain `ravel-series-v1` | v1 | v1 | D | ingest |
 | local disk cache | local only | RVCD 3 | 3 | none, a miss | query |
 
-The inventory is checked into this ADR as a table, and a test
-(decision 9) asserts that every format-version constant the workspace
-exports is named in `docs/compatibility.md`, so a new family cannot be
-added without entering the contract.
+The inventory is checked into this ADR as a table, and a test asserts
+that every format-version constant the workspace exports is named in
+`docs/compatibility.md`, so a new family cannot be added without entering
+the contract (decision 9, the inventory-completeness row).
 
 ## Decision
 
@@ -319,7 +319,15 @@ fail closed, and wave 0 measures them against the released binary.
   written at
   `format_version` 4, and the baseline reads {1,2,3,4} and writes 3
   otherwise (ADR-0066 R1: readers first, and here the reader ships in the
-  baseline while only activation writes 4). **Conditional publication:** a
+  baseline while only activation writes 4). The baseline models fields 8
+  and 9, so its two rewrite paths (`append_generation` and
+  `raise_format_floor`, which today refuse any record above the writer's
+  stamp) take a separate rewrite ceiling of 4 while the default stamp stays
+  3: a rewrite of a record carrying the fields keeps them and stamps 4, a
+  rewrite of one without them stamps 3, and a record above 4 is still
+  refused with `RefusingToRewriteNewerRecord`. Without that split no fenced
+  bucket's floor could be raised and no fenced bucket could be resharded.
+  **Conditional publication:** a
   writer publishes the first object at an activated version above the
   baseline into a (tenant, signal) only after that bucket's provisioning
   record carries a `compat_epoch` at or above the family's
@@ -339,9 +347,12 @@ fail closed, and wave 0 measures them against the released binary.
   which baseline readers read. A pre-baseline flush chooses its version
   when it opens, so a flush opened inside that horizon can still land up to
   two `max_flush_lifetime` budgets later (permit wait, then its own store
-  calls). That trust horizon is the refresh hour plus two hours
-  (`crates/ravel-ingest/src/generation.rs`), so under three hours. This ADR
-  fixes `G_pre = 3 h + 2 × max_flush_lifetime + P + T_req`, measured per
+  calls). That trust horizon is the start of the refresh hour plus two
+  hours, exclusive (`crates/ravel-ingest/src/generation.rs`,
+  `trust_horizon` and its `hour_of(now) >= trust_horizon` check), so under
+  two hours after the last successful refresh. This ADR fixes
+  `G_pre = 3 h + 2 × max_flush_lifetime + P + T_req`, carrying one hour
+  of deliberate margin over that bound, measured per
   bucket from its own
   `compat_fenced_unix_ns`, so a bucket fenced late (one a pre-baseline node
   provisioned after the walk, fenced by conditional publication or by
@@ -354,11 +365,13 @@ fail closed, and wave 0 measures them against the released binary.
   creates an absent one with `CreateIfAbsent`, in both cases with holder
   `compat-fence/<epoch>`, `expiry_ns = i64::MAX` and two new fields,
   `compat_expiry_ns = 0` and `compat_epoch`. Every parked lease, including
-  one a capable evaluator holds, carries `compat_epoch`. In v0.33.0's `acquire_lease` a holder renews
-  its own lease by CAS on the version it read, so the displaced holder's
-  next renew fails its precondition and every later tick finds a lease held
-  by another whose `expiry_ns` is in the future (`held_by_other &&
-  existing.expiry_ns > now_ns`) and stops evaluating. Baseline-or-later
+  one a capable evaluator holds, carries `compat_epoch`. In v0.33.0's
+  `acquire_lease` every tick re-reads the lease before renewing it, so the
+  displaced holder's next tick finds a lease held by another whose
+  `expiry_ns` is in the future and returns at `held_by_other &&
+  existing.expiry_ns > now_ns` without writing; a renew CAS already in
+  flight against the version it read before the parking fails its
+  precondition. Either way it stops evaluating. Baseline-or-later
   evaluators read `compat_expiry_ns` as the real expiry and write the
   parked form whenever `rlog` is active above the baseline. Three rules
   keep a baseline-or-later evaluator from un-parking it:
@@ -596,6 +609,14 @@ For a class A family:
   so dispatch, activation, fencing, migration and certification run end to
   end against two real versions. `scripts/guards/check-release-profile.sh`
   is extended to refuse the feature in release builds and the Dockerfile.
+  The drill window must also be unreachable from a default workspace
+  build, where cargo unifies features across everything one invocation
+  builds: `ravel-compat-tests` is kept out of the default workspace
+  members (its own test lane builds it), so `cargo test --workspace` and
+  `cargo clippy --workspace --all-targets` never compile the other crates
+  with a two-wide window. CI's all-features job, which turns every feature
+  on by construction, type-checks only and runs no test that asserts a
+  window.
   The drill proves the mechanism; the first real bump proves the next
   layout, and its ADR must add its own corpus.
 - **Matrix tests** (in `ravel-compat-tests`, shared `MemoryStore` or a local
@@ -624,6 +645,8 @@ For a class A family:
 | a bucket provisioned at version 3 after the fence walk | fenced on first activated publish or by `certify`; `certify` waits `G_pre` from that bucket's fence time |
 | one row per closed hazard H1, H3, H5 to H11 | the baseline behaviour in decision 4's table, with the store listed before and after to show nothing was rebuilt, overwritten or deleted |
 | Flight SQL scan over an object at an unreadable version | the stream ends with a typed error, no partial result |
+| inventory completeness: every format-version constant the workspace exports | each is named in `docs/compatibility.md`; a new constant without a row fails the test |
+| fenced (version 4) provisioning record: reshard and floor raise by the baseline | both succeed and keep fields 8 and 9 at version 4; a record above 4 is refused |
 | incomplete listing (`FaultStore` failed page, unaddressable key) | migrate and certify refuse; nothing certified |
 | retention, erasure, legal hold, pinned query and Flight ticket during migrate | held objects counted; pinned inputs keep certify waiting; erasure completes at the active version |
 | retired-reader startup with no, stale, contradicted, or `Current` certificate | refuse, refuse, refuse, start |
@@ -764,7 +787,7 @@ holding versions outside B's read set (decision 1).
   provisioning record's fields 8 and 9), ADR-0066's R1 table (`ProvisioningRecord`
   read set {1,2,3,4}, `CompatRecord` added), the sys-proto classification
   test `crates/ravel-catalog/tests/sys_proto_format_version_classification.rs`,
-  `proto/ravel/sys.proto`, the alerting doc for the lease field, and
+  `proto/ravel/sys.proto`, the alerting doc for the two lease fields, and
   `docs/guides/operations/maintenance.md`.
 - **Not done here.** Rewrite-record supersession for below-version erasure
   parts (certification refuses and names them; ADR-1331's blocked buckets);
