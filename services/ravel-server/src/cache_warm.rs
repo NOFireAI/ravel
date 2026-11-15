@@ -19,11 +19,24 @@
 //! can anchor the window exactly as a fresh commit record would.
 //!
 //! Bounded on two axes. Per (tenant, signal), at most
-//! [`MAX_PARTS_PER_TENANT_PER_SIGNAL`] of the most recent parts are warmed:
-//! this pass exists to take the edge off a cold restart, not to size a
-//! working set only real query traffic can size correctly. The whole pass
+//! [`MAX_PARTS_PER_TENANT_PER_SIGNAL`] of the most recent parts are warmed
+//! whole: this pass exists to take the edge off a cold restart, not to size
+//! a working set only real query traffic can size correctly. The whole pass
 //! is wrapped in `tokio::time::timeout(`[`WARM_DEADLINE`]`, ..)`, so a large
 //! tenant count or a slow store can never hold `/readyz` back indefinitely.
+//!
+//! The logs metadata pass (ADR-4203 decision 8) is not bounded by that part
+//! cap. For every logs object in the resolved window that the query path
+//! plans from its directories (above
+//! [`LogSegmentFetcher::plan_whole_object_bound`]), it reads the footer and
+//! the four directories (STREAM_DIR, FIELD_DIR, SKIP_IDX, PAGE_DIR) through
+//! [`BlockRangeFetcher::fetch_plan_directories`], on a fetcher built from the
+//! query path's own logs fetch quantities ([`LogsMetadataWarm`]), so the
+//! probe and section extents land under the cache keys a statement reads
+//! them with. It reads no column page. It stops admitting objects once the
+//! read cache's resident bytes plus the objects in flight would pass
+//! [`METADATA_CACHE_SHARE_DIVISOR`]'s share of the cache budget, and runs at
+//! most the store GET concurrency's permit count of objects at once.
 //!
 //! Every failure degrades to "warm less than planned," never to a startup
 //! failure: tenant discovery erroring, a resolve erroring, a fetch erroring,
@@ -38,19 +51,57 @@
 //! samples") and [`LogSegmentFetcher::fetch_accounted_with_tenant`] (RLOG's
 //! only funnel, always a whole-object fetch) -- so warming a part costs
 //! exactly what a real query resolving that part would cost, and nothing
-//! here reimplements or changes either fetcher's cache behavior.
+//! here reimplements or changes either fetcher's cache behavior. The
+//! metadata pass calls the plan phase's directory read the same way.
+//!
+//! [`BlockRangeFetcher::fetch_plan_directories`]: ravel_query::BlockRangeFetcher::fetch_plan_directories
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::stream::{FuturesUnordered, StreamExt as _};
 use ravel_catalog::{Catalog, SegmentRef};
 use ravel_ingest::Clock;
 use ravel_object_store::ObjectStoreBackend;
-use ravel_query::{LogQuery, LogSegmentFetcher, ReadCache, SegmentFetcher};
+use ravel_query::{EngineConfig, LogQuery, LogSegmentFetcher, ReadCache, SegmentFetcher};
 use ravel_types::{Signal, TenantHash, TimeRange};
 
-/// Per (tenant, signal), the number of most-recent parts warmed.
+/// Per (tenant, signal), the number of most-recent parts warmed whole.
 const MAX_PARTS_PER_TENANT_PER_SIGNAL: usize = 4;
+
+/// The logs metadata pass fills at most `1 / METADATA_CACHE_SHARE_DIVISOR` of
+/// the read cache's byte budget, counting every resident byte. The rest is
+/// left for the column pages the first statements insert: a full cache would
+/// evict warmed metadata a statement has not read yet.
+const METADATA_CACHE_SHARE_DIVISOR: u64 = 2;
+
+/// The query path's logs fetch quantities and the read cache's byte budget:
+/// what the metadata pass needs to read the same cache keys a statement reads
+/// and to stay inside the cache. Build it from the same [`EngineConfig`] both
+/// query surfaces are built from.
+#[derive(Clone, Copy, Debug)]
+pub struct LogsMetadataWarm {
+    block_range_threshold: u64,
+    request_cost_bytes: u64,
+    projection_break_even_bytes: Option<u64>,
+    max_fetch_run_bytes: u64,
+    cache_max_bytes: u64,
+}
+
+impl LogsMetadataWarm {
+    /// `cache_max_bytes` is the read cache's RAM tier budget
+    /// (`--cache-max-bytes`).
+    #[must_use]
+    pub fn new(engine: &EngineConfig, cache_max_bytes: u64) -> Self {
+        Self {
+            block_range_threshold: engine.logs_block_range_threshold,
+            request_cost_bytes: engine.logs_request_cost_bytes,
+            projection_break_even_bytes: engine.logs_projection_break_even_bytes,
+            max_fetch_run_bytes: engine.logs_max_fetch_run_bytes,
+            cache_max_bytes,
+        }
+    }
+}
 
 /// Overall wall-clock budget for the whole pass, across every tenant and
 /// signal. A single deadline over the whole loop, not a per-fetch one: a
@@ -76,6 +127,7 @@ const NS_PER_HOUR: i64 = 60 * 60 * 1_000_000_000;
 /// any result a caller needs to branch on. `cache` must already be the
 /// instance attached to the real query fetchers (`with_cache`); a cache
 /// warmed here and never consulted elsewhere warms nothing that matters.
+#[allow(clippy::too_many_arguments)]
 pub async fn warm_cache(
     store: Arc<dyn ObjectStoreBackend>,
     catalog: Arc<Catalog>,
@@ -84,6 +136,7 @@ pub async fn warm_cache(
     get_limiter: Arc<ravel_query::GetLimiter>,
     memory_budget: Arc<ravel_memory::MemoryBudget>,
     read_gate: Arc<ravel_cpu_gate::ReadGate>,
+    logs_metadata: LogsMetadataWarm,
 ) {
     let now_ns = clock.now_ns();
     match tokio::time::timeout(
@@ -96,6 +149,7 @@ pub async fn warm_cache(
             get_limiter,
             memory_budget,
             read_gate,
+            logs_metadata,
         ),
     )
     .await
@@ -111,6 +165,7 @@ pub async fn warm_cache(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn warm_cache_inner(
     store: Arc<dyn ObjectStoreBackend>,
     catalog: Arc<Catalog>,
@@ -119,6 +174,7 @@ async fn warm_cache_inner(
     get_limiter: Arc<ravel_query::GetLimiter>,
     memory_budget: Arc<ravel_memory::MemoryBudget>,
     read_gate: Arc<ravel_cpu_gate::ReadGate>,
+    logs_metadata: LogsMetadataWarm,
 ) {
     let started = tokio::time::Instant::now();
     let tenants = match ravel_maintain::discover_tenants(store.as_ref()).await {
@@ -141,23 +197,187 @@ async fn warm_cache_inner(
         .with_get_limiter(get_limiter.clone())
         .with_memory_budget(memory_budget.clone())
         .with_read_gate(read_gate.clone());
-    let logs_fetcher = LogSegmentFetcher::new(store)
-        .with_cache(cache)
-        .with_get_limiter(get_limiter)
-        .with_memory_budget(memory_budget)
-        .with_read_gate(read_gate);
+    let logs_fetcher = LogSegmentFetcher::new(store.clone())
+        .with_cache(cache.clone())
+        .with_get_limiter(get_limiter.clone())
+        .with_memory_budget(memory_budget.clone())
+        .with_read_gate(read_gate.clone());
+    let mut metadata_pass = LogsMetadataPass::new(
+        store,
+        cache,
+        get_limiter,
+        memory_budget,
+        read_gate,
+        logs_metadata,
+    );
 
     let mut total_parts_warmed: usize = 0;
     for tenant in tenants {
         total_parts_warmed += warm_metrics(&catalog, &metrics_fetcher, tenant, now_ns).await;
-        total_parts_warmed += warm_logs(&catalog, &logs_fetcher, tenant, now_ns).await;
+        total_parts_warmed += warm_logs(
+            &catalog,
+            &logs_fetcher,
+            metadata_pass.as_mut(),
+            tenant,
+            now_ns,
+        )
+        .await;
     }
 
+    let metadata = metadata_pass
+        .as_ref()
+        .map_or_else(MetadataWarmed::default, |pass| pass.total);
     tracing::info!(
         parts_warmed = total_parts_warmed,
+        metadata_objects_warmed = metadata.objects,
+        metadata_bytes_warmed = metadata.bytes,
+        metadata_budget_reached = metadata_pass
+            .as_ref()
+            .is_some_and(|pass| pass.budget_reached),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "cache warmup: pass complete"
     );
+}
+
+/// What the logs metadata pass warmed: objects whose footer and four
+/// directories it read into the cache, and the wire bytes it fetched for them
+/// (cache hits fetch none).
+#[derive(Clone, Copy, Debug, Default)]
+struct MetadataWarmed {
+    objects: usize,
+    bytes: u64,
+}
+
+/// The logs metadata pass's fetcher and budget, kept across tenants: the
+/// budget is the one read cache every tenant shares.
+struct LogsMetadataPass {
+    fetcher: LogSegmentFetcher,
+    cache: ReadCache,
+    ceiling: u64,
+    concurrency: usize,
+    budget_reached: bool,
+    total: MetadataWarmed,
+}
+
+impl LogsMetadataPass {
+    /// `None`, with a warning, when the query path's fetch bound is one the
+    /// fetcher refuses: the pass is skipped, never startup.
+    fn new(
+        store: Arc<dyn ObjectStoreBackend>,
+        cache: ReadCache,
+        get_limiter: Arc<ravel_query::GetLimiter>,
+        memory_budget: Arc<ravel_memory::MemoryBudget>,
+        read_gate: Arc<ravel_cpu_gate::ReadGate>,
+        shape: LogsMetadataWarm,
+    ) -> Option<Self> {
+        let concurrency = get_limiter.permits().max(1);
+        // Built like the query path's logs fetchers (`QueryEngine::new` and
+        // `build_sql_state`): the request cost sets the coalescing gap and the
+        // two thresholds set the plan bound, so any other value here would
+        // read the directories under keys no statement looks up.
+        let mut fetcher = LogSegmentFetcher::new(store)
+            .with_block_range_threshold(shape.block_range_threshold)
+            .with_request_cost_bytes(shape.request_cost_bytes)
+            .with_projection_break_even_bytes(shape.projection_break_even_bytes)
+            .with_get_limiter(get_limiter)
+            .with_memory_budget(memory_budget)
+            .with_read_gate(read_gate)
+            .with_cache(cache.clone());
+        if shape.max_fetch_run_bytes != 0 {
+            fetcher = match fetcher.with_max_fetch_run_bytes(shape.max_fetch_run_bytes) {
+                Ok(fetcher) => fetcher,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "cache warmup: invalid logs fetch bound; skipping the logs metadata pass"
+                    );
+                    return None;
+                }
+            };
+        }
+        Some(Self {
+            fetcher,
+            cache,
+            ceiling: shape.cache_max_bytes / METADATA_CACHE_SHARE_DIVISOR,
+            concurrency,
+            budget_reached: false,
+            total: MetadataWarmed::default(),
+        })
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        match &self.cache {
+            ReadCache::Ram(ram) => ram.total_bytes(),
+            ReadCache::Tiered(tiered) => tiered.ram_total_bytes(),
+        }
+    }
+
+    /// Reads the footer and four directories of every part in `parts` the
+    /// query path plans from its directories, most recent first, up to
+    /// `concurrency` objects at once. An object is admitted only while the
+    /// resident bytes, the in-flight objects' probe lengths and its own probe
+    /// length stay within the ceiling; the first object that does not fit
+    /// ends the pass for every later tenant too. A failed read skips that
+    /// object.
+    async fn warm(&mut self, tenant: TenantHash, parts: &[SegmentRef]) -> MetadataWarmed {
+        let mut warmed = MetadataWarmed::default();
+        let fetcher = &self.fetcher;
+        let mut pending = parts.iter().filter(|part| fetcher.plans_segment(part));
+        let mut in_flight = FuturesUnordered::new();
+        let mut in_flight_bytes: u64 = 0;
+        loop {
+            while !self.budget_reached && in_flight.len() < self.concurrency {
+                let Some(part) = pending.next() else {
+                    break;
+                };
+                let estimate = ravel_query::derive_suffix_len(part.object_size)
+                    .min(part.object_size)
+                    .max(1);
+                let charged = self
+                    .resident_bytes()
+                    .saturating_add(in_flight_bytes)
+                    .saturating_add(estimate);
+                if charged > self.ceiling {
+                    self.budget_reached = true;
+                    break;
+                }
+                in_flight_bytes = in_flight_bytes.saturating_add(estimate);
+                in_flight.push(async move {
+                    let accounting = warm_accounting();
+                    let result = fetcher
+                        .block_range_fetcher()
+                        .fetch_plan_directories(part, tenant, &accounting)
+                        .await;
+                    (
+                        part,
+                        estimate,
+                        result.map(|_| accounting.snapshot().total_s3_bytes()),
+                    )
+                });
+            }
+            let Some((part, estimate, result)) = in_flight.next().await else {
+                break;
+            };
+            in_flight_bytes = in_flight_bytes.saturating_sub(estimate);
+            match result {
+                Ok(bytes) => {
+                    warmed.objects += 1;
+                    warmed.bytes = warmed.bytes.saturating_add(bytes);
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        tenant_hash = %tenant.to_hex(),
+                        key = %part.data_object_key,
+                        error = %err,
+                        "cache warmup: log part metadata read failed; skipping"
+                    );
+                }
+            }
+        }
+        self.total.objects += warmed.objects;
+        self.total.bytes = self.total.bytes.saturating_add(warmed.bytes);
+        warmed
+    }
 }
 
 /// What [`most_recent_parts`] learned about a (tenant, signal)'s latest
@@ -187,8 +407,9 @@ enum LatestHour {
     Found { hour: u32, has_ingest_part: bool },
 }
 
-/// Most-recent-first parts for one (tenant, signal), bounded to
-/// [`MAX_PARTS_PER_TENANT_PER_SIGNAL`], alongside what was learned about the
+/// Every part of one (tenant, signal) in the warm window, most recent first
+/// (callers bound the whole-part warm to [`MAX_PARTS_PER_TENANT_PER_SIGNAL`]
+/// of them), alongside what was learned about the
 /// tenant's latest ingest hour ([`LatestHour`]). A resolve error still
 /// reports [`LatestHour::Found`] alongside empty parts, so it can be told
 /// apart from "no parts for this signal at all" ([`LatestHour::None`]) or a
@@ -251,7 +472,6 @@ async fn most_recent_parts(
     };
     let mut segments = snapshot.segments;
     segments.sort_unstable_by_key(|s| std::cmp::Reverse(s.max_event_ts_ns));
-    segments.truncate(MAX_PARTS_PER_TENANT_PER_SIGNAL);
     (
         segments,
         LatestHour::Found {
@@ -269,20 +489,28 @@ async fn most_recent_parts(
 /// no ingest part of its own (`has_ingest_part = false`), an empty warm is
 /// the expected outcome (the catalog drops a tombstoned bucket outright),
 /// so this logs at `info!` instead of `warn!` for that case.
+///
+/// A logs line from a pass that ran the metadata pass also carries
+/// `metadata_objects_warmed` and `metadata_bytes_warmed` ([`MetadataWarmed`]).
 fn log_warm_result(
     tenant: TenantHash,
     signal: Signal,
     parts_warmed: usize,
     latest_hour: Option<(u32, bool)>,
+    metadata: Option<MetadataWarmed>,
 ) {
     let latest_ingest_hour =
         latest_hour.map_or_else(|| "none".to_string(), |(hour, _)| hour.to_string());
     let has_ingest_part = latest_hour.is_some_and(|(_, has_ingest_part)| has_ingest_part);
+    let metadata_objects_warmed = metadata.map(|m| m.objects as u64);
+    let metadata_bytes_warmed = metadata.map(|m| m.bytes);
     if parts_warmed == 0 && has_ingest_part {
         tracing::warn!(
             tenant_hash = %tenant.to_hex(),
             signal = ?signal,
             parts_warmed,
+            metadata_objects_warmed,
+            metadata_bytes_warmed,
             latest_ingest_hour,
             "cache warmup: tenant has parts for this signal but none were warmed"
         );
@@ -291,6 +519,8 @@ fn log_warm_result(
             tenant_hash = %tenant.to_hex(),
             signal = ?signal,
             parts_warmed,
+            metadata_objects_warmed,
+            metadata_bytes_warmed,
             latest_ingest_hour,
             "cache warmup: warmed tenant signal"
         );
@@ -316,7 +546,7 @@ async fn warm_metrics(
     let (hour, has_ingest_part) = match latest_hour {
         LatestHour::Error => return 0,
         LatestHour::None => {
-            log_warm_result(tenant, Signal::Metrics, 0, None);
+            log_warm_result(tenant, Signal::Metrics, 0, None, None);
             return 0;
         }
         LatestHour::Found {
@@ -326,7 +556,7 @@ async fn warm_metrics(
     };
 
     let mut warmed = 0usize;
-    for part in &parts {
+    for part in parts.iter().take(MAX_PARTS_PER_TENANT_PER_SIGNAL) {
         match fetcher
             .fetch_series_accounted(tenant, part, &[], &warm_accounting())
             .await
@@ -348,13 +578,18 @@ async fn warm_metrics(
         Signal::Metrics,
         warmed,
         Some((hour, has_ingest_part)),
+        None,
     );
     warmed
 }
 
+/// Warms the `MAX_PARTS_PER_TENANT_PER_SIGNAL` most recent logs parts whole,
+/// then, when `metadata` is given, runs the metadata pass over every part in
+/// the window. Returns the count of parts warmed whole.
 async fn warm_logs(
     catalog: &Catalog,
     fetcher: &LogSegmentFetcher,
+    metadata: Option<&mut LogsMetadataPass>,
     tenant: TenantHash,
     now_ns: i64,
 ) -> usize {
@@ -362,7 +597,7 @@ async fn warm_logs(
     let (hour, has_ingest_part) = match latest_hour {
         LatestHour::Error => return 0,
         LatestHour::None => {
-            log_warm_result(tenant, Signal::Logs, 0, None);
+            log_warm_result(tenant, Signal::Logs, 0, None, None);
             return 0;
         }
         LatestHour::Found {
@@ -372,7 +607,7 @@ async fn warm_logs(
     };
 
     let mut warmed = 0usize;
-    for part in &parts {
+    for part in parts.iter().take(MAX_PARTS_PER_TENANT_PER_SIGNAL) {
         let query = LogQuery::new(part.min_event_ts_ns, part.max_event_ts_ns);
         match fetcher
             .fetch_accounted_with_tenant(part, tenant, &query, &warm_accounting())
@@ -390,7 +625,18 @@ async fn warm_logs(
         }
     }
 
-    log_warm_result(tenant, Signal::Logs, warmed, Some((hour, has_ingest_part)));
+    let metadata_warmed = match metadata {
+        Some(pass) => Some(pass.warm(tenant, &parts).await),
+        None => None,
+    };
+
+    log_warm_result(
+        tenant,
+        Signal::Logs,
+        warmed,
+        Some((hour, has_ingest_part)),
+        metadata_warmed,
+    );
     warmed
 }
 
@@ -427,6 +673,10 @@ mod tests {
             .expect("clock before epoch");
         let ns = i64::try_from(dur.as_nanos()).expect("time overflow");
         (ns / NS_PER_SEC) * NS_PER_SEC
+    }
+
+    fn metadata_warm() -> LogsMetadataWarm {
+        LogsMetadataWarm::new(&EngineConfig::default(), 16 * 1024 * 1024)
     }
 
     /// Publishes one metric segment with a single sample at `event_ts_ns`,
@@ -658,6 +908,7 @@ mod tests {
             Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
             Arc::new(ravel_memory::MemoryBudget::unlimited()),
             gate.clone(),
+            metadata_warm(),
         )
         .await;
 
@@ -702,6 +953,7 @@ mod tests {
             Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
             Arc::new(ravel_memory::MemoryBudget::unlimited()),
             gate.clone(),
+            metadata_warm(),
         )
         .await;
 
@@ -754,6 +1006,7 @@ mod tests {
                 Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
                 budget.clone(),
                 crate::cpu_gates::CpuGates::new(Default::default()).read,
+                metadata_warm(),
             )
             .await;
             assert_eq!(
@@ -838,8 +1091,11 @@ mod tests {
             found_hour, latest_hour,
             "latest ingest hour must be H, not now's hour"
         );
-        let warmed_hours: std::collections::BTreeSet<u32> =
-            parts.iter().map(|part| part.ingest_hour_bucket).collect();
+        let warmed_hours: std::collections::BTreeSet<u32> = parts
+            .iter()
+            .take(MAX_PARTS_PER_TENANT_PER_SIGNAL)
+            .map(|part| part.ingest_hour_bucket)
+            .collect();
         let expected_hours: std::collections::BTreeSet<u32> = [
             latest_hour,
             latest_hour - 1,
@@ -905,6 +1161,7 @@ mod tests {
             Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
             Arc::new(ravel_memory::MemoryBudget::unlimited()),
             crate::cpu_gates::CpuGates::new(Default::default()).read,
+            metadata_warm(),
         )
         .await;
 
@@ -937,6 +1194,7 @@ mod tests {
             Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
             Arc::new(ravel_memory::MemoryBudget::unlimited()),
             crate::cpu_gates::CpuGates::new(Default::default()).read,
+            metadata_warm(),
         )
         .await;
 
@@ -1044,7 +1302,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let before = instrumented.metrics().snapshot();
-        let warmed = warm_logs(&catalog, &fetcher, tenant, now).await;
+        let warmed = warm_logs(&catalog, &fetcher, None, tenant, now).await;
         let after = instrumented.metrics().snapshot();
 
         assert_eq!(warmed, 0, "a tenant with no log parts must warm zero");
@@ -1181,7 +1439,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let warmed_metrics = warm_metrics(&catalog, &metrics_fetcher, tenant, now).await;
-        let warmed_logs = warm_logs(&catalog, &logs_fetcher, tenant, now).await;
+        let warmed_logs = warm_logs(&catalog, &logs_fetcher, None, tenant, now).await;
 
         assert_eq!(
             warmed_metrics, 0,
@@ -1352,6 +1610,7 @@ mod tests {
                 Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
                 Arc::new(ravel_memory::MemoryBudget::unlimited()),
                 crate::cpu_gates::CpuGates::new(Default::default()).read,
+                metadata_warm(),
             )
             .await;
         });
@@ -1391,6 +1650,7 @@ mod tests {
                 Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
                 Arc::new(ravel_memory::MemoryBudget::unlimited()),
                 crate::cpu_gates::CpuGates::new(Default::default()).read,
+                metadata_warm(),
             )
             .await;
         });

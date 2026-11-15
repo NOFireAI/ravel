@@ -4282,6 +4282,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 get_limiter.clone(),
                 process_memory_budget.clone(),
                 cpu_gates.read.clone(),
+                cache_warm::LogsMetadataWarm::new(&engine_config, config.cache_max_bytes),
             )
             .await;
         }
