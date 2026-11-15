@@ -8,6 +8,7 @@ mod auth_token_map;
 mod cache;
 mod catalog;
 mod charged;
+pub mod compat;
 mod column_stats_build;
 mod column_stats_resolve;
 mod config;
@@ -94,17 +95,22 @@ pub use metrics_meta::{
     merge_entries, metrics_meta_key, read_metrics_meta, read_metrics_meta_for_serve,
     read_metrics_meta_for_serve_on_gate, read_metrics_meta_on_gate, write_metrics_meta,
 };
+pub use compat::{
+    COMPAT_FORMAT_VERSION, COMPAT_KEY, COMPAT_MAX_READ_VERSION, COMPAT_MIN_READ_VERSION,
+    COMPAT_VIEW_HORIZON, CompatClock, CompatError, CompatKeys, CompatRefusal, CompatView,
+    DEFAULT_COMPAT_REFRESH_INTERVAL,
+};
 pub use provisioning::{
-    AbsentPolicy, DEFAULT_SCAN_SLACK_HOURS, FLUSH_BOUND_SLACK_HOURS, FloorBasis, FloorDefect,
+    AbsentPolicy, CompatFenceOutcome, DEFAULT_SCAN_SLACK_HOURS, FLUSH_BOUND_SLACK_HOURS, FloorBasis, FloorDefect,
     FloorEvidence, FloorObservation, FloorRaiseOutcome, FormatFloor, GenerationDefect,
-    MAX_SHARD_COUNT, PROVISIONING_FORMAT_VERSION, PROVISIONING_MAX_READ_VERSION,
-    PROVISIONING_MIN_READ_VERSION, ProvisioningCheck, ProvisioningError, ReshardOutcome,
+    MAX_SHARD_COUNT, PROVISIONING_FENCED_FORMAT_VERSION, PROVISIONING_FORMAT_VERSION,
+    PROVISIONING_MAX_READ_VERSION, PROVISIONING_MIN_READ_VERSION, PROVISIONING_REWRITE_CEILING, ProvisioningCheck, ProvisioningError, ReshardOutcome,
     ShardGeneration, active_shard_count, append_generation, classify_floor, current_floor,
     current_floor_from_store, max_scan_count_over_range, provisioning_key, raise_format_floor,
     read_floors, read_floors_checked, read_floors_from_store, read_generations,
     read_generations_checked, read_generations_from_store, scan_count, scan_shards_for_hour,
     scan_shards_over_range, shard_ceiling, shard_count_drift_count, stable_generation_for_hour,
-    validate_or_adopt,
+    raise_compat_fence, validate_or_adopt, validate_or_adopt_fenced,
 };
 pub use seal_divergence::{
     EntryIdentity, SealDivergenceError, SealDivergenceReport, SnapshotCoverage, snapshot_coverage,

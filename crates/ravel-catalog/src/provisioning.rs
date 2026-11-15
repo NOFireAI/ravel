@@ -28,6 +28,7 @@
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::num::NonZeroU64;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -38,12 +39,13 @@ use ravel_object_store::{
 use ravel_proto::sys::v1 as sysproto;
 use ravel_types::{Signal, TenantHash};
 
-/// Format version written into every provisioning record this build emits:
+/// Format version written into every provisioning record this build emits that
+/// carries neither compat field (`compat_epoch`, `compat_fenced_unix_ns`):
 /// every writer, including the CAS rewrite paths ([`append_generation`],
-/// [`raise_format_floor`]), stamps exactly this. It is also the highest version
-/// a rewrite path can reproduce byte-for-byte, so a rewrite refuses any record
-/// declaring a version above it rather than strip a field it does not model
-/// (ADR-0066 decision 5).
+/// [`raise_format_floor`]), stamps exactly this on such a record. A record
+/// that carries either field is stamped [`PROVISIONING_FENCED_FORMAT_VERSION`]
+/// instead (ADR-4233 decision 4), and the rewrite paths refuse only a record
+/// above [`PROVISIONING_REWRITE_CEILING`].
 ///
 /// ADR-0066 R2 raised this from 1 to 2, the writer half of the
 /// readers-before-writers sequence R1 opened. Version 2 carries the same field
@@ -75,10 +77,26 @@ pub const PROVISIONING_FORMAT_VERSION: u32 = 3;
 ///
 /// ADR-1746 Release A repeated the sequence for the [`FloorBasis`] fields,
 /// raising this ceiling to 3 while the writer still stamped 2, and Release B
-/// flipped the writer into it. Ceiling and writer are equal again, so the
-/// rewrite paths accept every version this reader accepts, and a record above
-/// 3 is refused by both.
-pub const PROVISIONING_MAX_READ_VERSION: u32 = 3;
+/// flipped the writer into it.
+///
+/// ADR-4233 decision 4 raises it to 4, the compat fence: a record carrying
+/// `compat_epoch` or `compat_fenced_unix_ns` is stamped 4, so a binary whose
+/// ceiling is 3 refuses every write path into a fenced bucket. The default
+/// stamp stays [`PROVISIONING_FORMAT_VERSION`].
+pub const PROVISIONING_MAX_READ_VERSION: u32 = 4;
+
+/// Highest record version the CAS rewrite paths ([`append_generation`],
+/// [`raise_format_floor`], [`raise_compat_fence`]) rewrite. Separate from
+/// [`PROVISIONING_FORMAT_VERSION`] because this build models every field of a
+/// version-4 record while it still stamps 3 on an unfenced one; without the
+/// split no fenced bucket could be resharded or have its floor raised
+/// (ADR-4233 decision 4). A record above it is refused with
+/// [`ProvisioningError::RefusingToRewriteNewerRecord`].
+pub const PROVISIONING_REWRITE_CEILING: u32 = 4;
+
+/// Format version stamped on a provisioning record that carries
+/// `compat_epoch` or `compat_fenced_unix_ns` (ADR-4233 decision 4).
+pub const PROVISIONING_FENCED_FORMAT_VERSION: u32 = 4;
 
 /// Lowest record version a reader accepts: the supported read set is a closed
 /// interval `PROVISIONING_MIN_READ_VERSION..=PROVISIONING_MAX_READ_VERSION`, a
@@ -164,20 +182,21 @@ pub enum ProvisioningError {
          future format. Refusing rather than admit a record no supported writer produced"
     )]
     VersionBelowFloor { key: String, got: u32, floor: u32 },
-    /// A CAS rewrite path ([`append_generation`], [`raise_format_floor`]) read a
-    /// record declaring a version this build's writer cannot reproduce
-    /// (> [`PROVISIONING_FORMAT_VERSION`]). Rewriting it whole would re-encode
-    /// through this build's field set and silently drop any field a newer writer
-    /// added, so the rewrite is refused and nothing is written (ADR-0066 decision
-    /// 5). Distinct from [`ProvisioningError::UnsupportedVersion`] because it
-    /// says nothing was written rather than nothing was read: while
-    /// [`PROVISIONING_MAX_READ_VERSION`] exceeds the writer's version (the state
-    /// R1 shipped, and the state any future additive field re-enters) a read-only
-    /// path accepts exactly the versions a rewrite refuses here.
+    /// A CAS rewrite path ([`append_generation`], [`raise_format_floor`],
+    /// [`raise_compat_fence`]) read a record declaring a version this build's
+    /// writer cannot reproduce (> [`PROVISIONING_REWRITE_CEILING`]). Rewriting
+    /// it whole would re-encode through this build's field set and silently
+    /// drop any field a newer writer added, so the rewrite is refused and
+    /// nothing is written (ADR-0066 decision 5). Distinct from
+    /// [`ProvisioningError::UnsupportedVersion`] because it says nothing was
+    /// written rather than nothing was read: while
+    /// [`PROVISIONING_MAX_READ_VERSION`] exceeds the rewrite ceiling (the state
+    /// R1 shipped, and the state any future additive field re-enters) a
+    /// read-only path accepts exactly the versions a rewrite refuses here.
     #[error(
-        "provisioning record {key:?} declares format_version {got}, newer than this build's writer \
-         version {PROVISIONING_FORMAT_VERSION}: refusing to rewrite it whole and strip fields this \
-         build does not model (ADR-0066 decision 5)"
+        "provisioning record {key:?} declares format_version {got}, newer than the highest version \
+         this build rewrites ({PROVISIONING_REWRITE_CEILING}): refusing to rewrite it whole and \
+         strip fields this build does not model (ADR-0066 decision 5)"
     )]
     RefusingToRewriteNewerRecord { key: String, got: u32 },
     #[error(
@@ -340,6 +359,28 @@ pub enum ProvisioningError {
          (CasVersion precondition failed): re-read and retry rather than overwrite the other write"
     )]
     FloorCasConflict { key: String },
+    /// [`raise_compat_fence`] was called on a (tenant, signal) with no
+    /// provisioning record. A bucket with no record is fenced when it is
+    /// created: a first touch after an activation creates it at version 4
+    /// ([`validate_or_adopt_fenced`]).
+    #[error(
+        "cannot raise the compat fence for tenant {tenant_hash} signal {signal}: no provisioning \
+         record exists at {key:?} (ADR-4233 decision 4)"
+    )]
+    NoRecordToFence {
+        key: String,
+        tenant_hash: String,
+        signal: &'static str,
+    },
+    /// A concurrent write moved the record's version between this fence
+    /// raise's read and its CasVersion write. The loser re-reads rather than
+    /// silently overwriting the winner.
+    #[error(
+        "a concurrent write changed provisioning record {key:?} since this compat fence raise read \
+         it (CasVersion precondition failed): re-read and retry rather than overwrite the other \
+         write"
+    )]
+    FenceCasConflict { key: String },
 }
 
 /// The exact structural rule a corrupt shard-generation history broke
@@ -1118,7 +1159,8 @@ impl ProvisioningError {
             ProvisioningError::UnsupportedVersion { got, ceiling, .. } => got > ceiling,
             ProvisioningError::RefusingToRewriteNewerRecord { .. }
             | ProvisioningError::ReshardCasConflict { .. }
-            | ProvisioningError::FloorCasConflict { .. } => true,
+            | ProvisioningError::FloorCasConflict { .. }
+            | ProvisioningError::FenceCasConflict { .. } => true,
 
             ProvisioningError::Decode { .. }
             | ProvisioningError::VersionBelowFloor { .. }
@@ -1134,7 +1176,8 @@ impl ProvisioningError {
             | ProvisioningError::FloorFamilyNotLowercase(_)
             | ProvisioningError::FloorNotAboveCurrent { .. }
             | ProvisioningError::FloorBasisEmpty { .. }
-            | ProvisioningError::NoRecordForFloor { .. } => false,
+            | ProvisioningError::NoRecordForFloor { .. }
+            | ProvisioningError::NoRecordToFence { .. } => false,
         }
     }
 }
@@ -1481,14 +1524,32 @@ async fn max_observed_shard(
     Ok(max)
 }
 
-/// Build the record to persist for this (tenant, signal, shard_count).
+/// The version a writer stamps on `record`: [`PROVISIONING_FENCED_FORMAT_VERSION`]
+/// when it carries either compat field or was already stamped at or above it,
+/// [`PROVISIONING_FORMAT_VERSION`] otherwise. A fenced record is never
+/// restamped below 4, so no rewrite path un-fences a bucket.
+fn stamp_for(record: &sysproto::ProvisioningRecord) -> u32 {
+    if record.compat_epoch != 0
+        || record.compat_fenced_unix_ns != 0
+        || record.format_version >= PROVISIONING_FENCED_FORMAT_VERSION
+    {
+        PROVISIONING_FENCED_FORMAT_VERSION
+    } else {
+        PROVISIONING_FORMAT_VERSION
+    }
+}
+
+/// Build the record to persist for this (tenant, signal, shard_count). With a
+/// compat epoch the record is born fenced: version 4, that `compat_epoch`, and
+/// `compat_fenced_unix_ns` 0 (ADR-4233 decision 4).
 fn build_record(
     tenant_hash: &TenantHash,
     signal: Signal,
     shard_count: u32,
     now_ns: i64,
+    compat_epoch: Option<NonZeroU64>,
 ) -> sysproto::ProvisioningRecord {
-    sysproto::ProvisioningRecord {
+    let mut record = sysproto::ProvisioningRecord {
         format_version: PROVISIONING_FORMAT_VERSION,
         tenant_hash: tenant_hash.0.to_vec(),
         signal: to_sys_signal(signal) as i32,
@@ -1503,7 +1564,11 @@ fn build_record(
         // raised" (ADR-0066), and encoding omits the field, keeping a
         // freshly-built record byte-identical to a pre-EM record.
         format_floors: Vec::new(),
-    }
+        compat_epoch: compat_epoch.map_or(0, NonZeroU64::get),
+        compat_fenced_unix_ns: 0,
+    };
+    record.format_version = stamp_for(&record);
+    record
 }
 
 /// Write the record with `CreateIfAbsent`. A racing loser (`AlreadyExists`)
@@ -1519,8 +1584,9 @@ async fn write_record_race_safe(
     signal: Signal,
     shard_count: u32,
     now_ns: i64,
+    compat_epoch: Option<NonZeroU64>,
 ) -> Result<ProvisioningCheck, ProvisioningError> {
-    let record = build_record(tenant_hash, signal, shard_count, now_ns);
+    let record = build_record(tenant_hash, signal, shard_count, now_ns, compat_epoch);
     match store
         .put(
             key,
@@ -1582,6 +1648,33 @@ pub async fn validate_or_adopt(
     now_ns: i64,
     absent_policy: AbsentPolicy,
 ) -> Result<ProvisioningCheck, ProvisioningError> {
+    validate_or_adopt_fenced(
+        store,
+        tenant_hash,
+        signal,
+        shard_count,
+        now_ns,
+        absent_policy,
+        None,
+    )
+    .await
+}
+
+/// [`validate_or_adopt`] for a first touch that knows the store's current
+/// `sys/compat` epoch. With `Some(epoch)`, a record this call creates is born
+/// fenced: written directly at version 4 with that `compat_epoch` and
+/// `compat_fenced_unix_ns` 0 (ADR-4233 decision 4). With `None` it is exactly
+/// [`validate_or_adopt`]. A record already present is validated and left
+/// untouched either way; raising its fence is [`raise_compat_fence`]'s job.
+pub async fn validate_or_adopt_fenced(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    shard_count: u32,
+    now_ns: i64,
+    absent_policy: AbsentPolicy,
+    compat_epoch: Option<NonZeroU64>,
+) -> Result<ProvisioningCheck, ProvisioningError> {
     let key = provisioning_key(tenant_hash, signal);
 
     if let Some(record) = read_record(store, &key).await? {
@@ -1628,7 +1721,16 @@ pub async fn validate_or_adopt(
             | AbsentPolicy::CheckOnly
             | AbsentPolicy::RefuseIfCommittedDataHidden => Ok(ProvisioningCheck::FreshNoData),
             AbsentPolicy::CreateFromConfig => {
-                write_record_race_safe(store, &key, tenant_hash, signal, shard_count, now_ns).await
+                write_record_race_safe(
+                    store,
+                    &key,
+                    tenant_hash,
+                    signal,
+                    shard_count,
+                    now_ns,
+                    compat_epoch,
+                )
+                .await
             }
         },
         Some(observed) if observed >= shard_count => {
@@ -1641,7 +1743,16 @@ pub async fn validate_or_adopt(
         }
         Some(_) => {
             // Pre-ADR data, all shard indices in range: safe to adopt.
-            write_record_race_safe(store, &key, tenant_hash, signal, shard_count, now_ns).await
+            write_record_race_safe(
+                    store,
+                    &key,
+                    tenant_hash,
+                    signal,
+                    shard_count,
+                    now_ns,
+                    compat_epoch,
+                )
+                .await
         }
     }
 }
@@ -1720,12 +1831,13 @@ pub async fn append_generation(
 
     // Rewrite refusal (ADR-0066 decision 5): this appends and writes the record
     // back whole, re-encoding through this build's field set. A record a newer
-    // writer wrote (version above what this build stamps) may carry a field this
-    // build does not model, which a whole-record rewrite would silently strip. A
-    // read-only path tolerates such a record (up to PROVISIONING_MAX_READ_VERSION);
-    // a rewrite must refuse it. Checked before read_generations_checked, which
-    // accepts the wider read set and so would let a newer record through here.
-    if record.format_version > PROVISIONING_FORMAT_VERSION {
+    // writer wrote (version above what this build rewrites) may carry a field
+    // this build does not model, which a whole-record rewrite would silently
+    // strip. A read-only path tolerates such a record (up to
+    // PROVISIONING_MAX_READ_VERSION); a rewrite must refuse it. Checked before
+    // read_generations_checked, which accepts the wider read set and so would
+    // let a newer record through here.
+    if record.format_version > PROVISIONING_REWRITE_CEILING {
         return Err(ProvisioningError::RefusingToRewriteNewerRecord {
             key,
             got: record.format_version,
@@ -1767,12 +1879,12 @@ pub async fn append_generation(
     });
 
     // Persist the full, now-explicit history. The scalar shard_count stays
-    // generation 0's count; every prior generation is carried verbatim. The
-    // stamp is this build's writer version, not the version read: these bytes
-    // are what this build's field set produces, so they must declare it (a
-    // version-1 record rewritten here comes back as version 3).
+    // generation 0's count; every prior generation and both compat fields are
+    // carried verbatim. The stamp is this build's writer version for the fields
+    // the record carries, not the version read: a version-1 record rewritten
+    // here comes back as version 3, a fenced one as version 4.
     let mut new_record = record;
-    new_record.format_version = PROVISIONING_FORMAT_VERSION;
+    new_record.format_version = stamp_for(&new_record);
     new_record.generations = history
         .iter()
         .map(|g| sysproto::ShardGeneration {
@@ -2190,7 +2302,7 @@ pub async fn raise_format_floor(
     // does not model that the rewrite would strip. A read-only path tolerates it
     // (up to PROVISIONING_MAX_READ_VERSION); this rewrite refuses it, before
     // read_floors_checked lets the wider read set through.
-    if record.format_version > PROVISIONING_FORMAT_VERSION {
+    if record.format_version > PROVISIONING_REWRITE_CEILING {
         return Err(ProvisioningError::RefusingToRewriteNewerRecord {
             key,
             got: record.format_version,
@@ -2218,11 +2330,11 @@ pub async fn raise_format_floor(
         basis: Some(basis),
     });
 
-    // Persist the full history. shard_count and generations are carried
-    // verbatim; the stamp becomes this build's writer version, same reason as
-    // in `append_generation`.
+    // Persist the full history. shard_count, generations and both compat
+    // fields are carried verbatim; the stamp follows the fields the record
+    // carries, same rule as in `append_generation`.
     let mut new_record = record;
-    new_record.format_version = PROVISIONING_FORMAT_VERSION;
+    new_record.format_version = stamp_for(&new_record);
     new_record.format_floors = floors
         .iter()
         .map(|f| {
@@ -2256,6 +2368,98 @@ pub async fn raise_format_floor(
             floors,
         }),
         Err(StoreError::PreconditionFailed) => Err(ProvisioningError::FloorCasConflict { key }),
+        Err(err) => Err(ProvisioningError::store(&key, err)),
+    }
+}
+
+/// The outcome of a successful [`raise_compat_fence`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatFenceOutcome {
+    /// The record already carried a `compat_epoch` at or above the requested
+    /// one. Nothing was written.
+    AlreadyFenced { compat_epoch: u64 },
+    /// The record was rewritten at version 4 with the requested epoch.
+    /// `compat_fenced_unix_ns` is the record's fence time after the write:
+    /// `now_ns` when the raise came from a record below version 4, the stored
+    /// value otherwise.
+    Raised {
+        previous_epoch: u64,
+        compat_epoch: u64,
+        compat_fenced_unix_ns: i64,
+    },
+}
+
+/// CAS-raise a (tenant, signal)'s provisioning record to `compat_epoch`
+/// (ADR-4233 decision 4). Never lowers: a record already at or above the epoch
+/// is left untouched ([`CompatFenceOutcome::AlreadyFenced`]). A raise stamps
+/// the record 4; a raise from a record below version 4 also sets
+/// `compat_fenced_unix_ns = now_ns`, the start of that bucket's pre-baseline
+/// grace wait, while a raise of an already-fenced record keeps its stored
+/// fence time. Generations and floors are carried verbatim.
+///
+/// Refuses a missing record ([`ProvisioningError::NoRecordToFence`]), a record
+/// above [`PROVISIONING_REWRITE_CEILING`], a misfiled or corrupt record, and a
+/// lost CAS race ([`ProvisioningError::FenceCasConflict`]).
+pub async fn raise_compat_fence(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    compat_epoch: u64,
+    now_ns: i64,
+) -> Result<CompatFenceOutcome, ProvisioningError> {
+    let key = provisioning_key(tenant_hash, signal);
+    let (record, version) = match store.get(&key, GetRange::Full).await {
+        Ok(outcome) => (decode_record(&key, outcome.data.as_ref())?, outcome.version),
+        Err(StoreError::NotFound) => {
+            return Err(ProvisioningError::NoRecordToFence {
+                key,
+                tenant_hash: tenant_hash.to_hex(),
+                signal: signal.key_prefix(),
+            });
+        }
+        Err(err) => return Err(ProvisioningError::store(&key, err)),
+    };
+    if record.format_version > PROVISIONING_REWRITE_CEILING {
+        return Err(ProvisioningError::RefusingToRewriteNewerRecord {
+            key,
+            got: record.format_version,
+        });
+    }
+    read_generations_checked(&record, &key, tenant_hash, signal)?;
+    read_floors(&record, &key)?;
+    if compat_epoch <= record.compat_epoch {
+        return Ok(CompatFenceOutcome::AlreadyFenced {
+            compat_epoch: record.compat_epoch,
+        });
+    }
+
+    let previous_epoch = record.compat_epoch;
+    let first_fence = record.format_version < PROVISIONING_FENCED_FORMAT_VERSION;
+    let mut new_record = record;
+    new_record.compat_epoch = compat_epoch;
+    if first_fence {
+        new_record.compat_fenced_unix_ns = now_ns;
+    }
+    new_record.format_version = stamp_for(&new_record);
+    let compat_fenced_unix_ns = new_record.compat_fenced_unix_ns;
+
+    match store
+        .put(
+            &key,
+            new_record.encode_to_vec().into(),
+            PutOptions {
+                mode: PutMode::CasVersion(version),
+                checksum: None,
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(CompatFenceOutcome::Raised {
+            previous_epoch,
+            compat_epoch,
+            compat_fenced_unix_ns,
+        }),
+        Err(StoreError::PreconditionFailed) => Err(ProvisioningError::FenceCasConflict { key }),
         Err(err) => Err(ProvisioningError::store(&key, err)),
     }
 }
@@ -2314,7 +2518,7 @@ pub(crate) mod tests {
         shard_count: u32,
     ) {
         let key = provisioning_key(th, signal);
-        let record = build_record(th, signal, shard_count, 1_000);
+        let record = build_record(th, signal, shard_count, 1_000, None);
         store
             .put(
                 &key,
@@ -2610,7 +2814,7 @@ pub(crate) mod tests {
         assert_eq!(store.non_get_calls(), Vec::new());
 
         let other = TenantHash([0xCDu8; 16]);
-        let misfiled = build_record(&other, Signal::Logs, 4, 1_000);
+        let misfiled = build_record(&other, Signal::Logs, 4, 1_000, None);
         store
             .inner
             .put(
@@ -2850,6 +3054,8 @@ pub(crate) mod tests {
                 appended_unix_ns: 0,
             }],
             format_floors: Vec::new(),
+            compat_epoch: 0,
+            compat_fenced_unix_ns: 0,
         };
         store
             .put(&key, record.encode_to_vec().into(), PutOptions::default())
@@ -2906,6 +3112,8 @@ pub(crate) mod tests {
                 appended_unix_ns: 0,
             }],
             format_floors: Vec::new(),
+            compat_epoch: 0,
+            compat_fenced_unix_ns: 0,
         };
         store
             .put(&key, record.encode_to_vec().into(), PutOptions::default())
@@ -3071,7 +3279,7 @@ pub(crate) mod tests {
     async fn unsupported_future_version_is_refused() {
         let store = mem();
         let key = provisioning_key(&tenant(), Signal::Metrics);
-        let mut record = build_record(&tenant(), Signal::Metrics, 4, 1_000);
+        let mut record = build_record(&tenant(), Signal::Metrics, 4, 1_000, None);
         // A version past the supported read set (4, above PROVISIONING_MAX_READ_VERSION
         // = 3). Versions 2 and 3 are inside the read set and are accepted on the
         // read path (see reader_accepts_versions_one_to_three_and_refuses_zero_and_four).
@@ -3908,6 +4116,8 @@ pub(crate) mod tests {
             created_unix_ns: 1_234,
             generations: Vec::new(),
             format_floors: Vec::new(),
+            compat_epoch: 0,
+            compat_fenced_unix_ns: 0,
         };
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let gens = read_generations(&record, &key).expect("empty history is valid");
@@ -3923,7 +4133,7 @@ pub(crate) mod tests {
         // And the routing behaviour is identical to a record with no history at
         // all: build_record must still encode to the pre-ADR-0052 byte shape
         // (no field 6), so an old reader is unaffected.
-        let built = build_record(&tenant(), Signal::Metrics, 4, 1_234);
+        let built = build_record(&tenant(), Signal::Metrics, 4, 1_234, None);
         assert!(
             built.generations.is_empty(),
             "a freshly built record carries no explicit generations"
@@ -3945,6 +4155,8 @@ pub(crate) mod tests {
             created_unix_ns: 0,
             generations: Vec::new(),
             format_floors: Vec::new(),
+            compat_epoch: 0,
+            compat_fenced_unix_ns: 0,
         };
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let err = read_generations(&record, &key).expect_err("shard_count 0 must be refused");
@@ -3978,6 +4190,8 @@ pub(crate) mod tests {
                 appended_unix_ns: 0,
             }],
             format_floors: Vec::new(),
+            compat_epoch: 0,
+            compat_fenced_unix_ns: 0,
         };
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let err = read_generations(&record, &key)
@@ -4011,6 +4225,8 @@ pub(crate) mod tests {
                 appended_unix_ns: 0,
             }],
             format_floors: Vec::new(),
+            compat_epoch: 0,
+            compat_fenced_unix_ns: 0,
         };
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let gens = read_generations(&record, &key)
@@ -4036,6 +4252,8 @@ pub(crate) mod tests {
             created_unix_ns: 0,
             generations: Vec::new(),
             format_floors: Vec::new(),
+            compat_epoch: 0,
+            compat_fenced_unix_ns: 0,
         };
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let err = read_generations_checked(&record, &key, &tenant(), Signal::Metrics)
@@ -4058,6 +4276,8 @@ pub(crate) mod tests {
             created_unix_ns: 0,
             generations: Vec::new(),
             format_floors: Vec::new(),
+            compat_epoch: 0,
+            compat_fenced_unix_ns: 0,
         };
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let err = read_generations_checked(&record, &key, &tenant(), Signal::Metrics)
@@ -4083,6 +4303,8 @@ pub(crate) mod tests {
             created_unix_ns: 0,
             generations: Vec::new(),
             format_floors: Vec::new(),
+            compat_epoch: 0,
+            compat_fenced_unix_ns: 0,
         };
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let err = read_generations_checked(&record, &key, &tenant(), Signal::Metrics)
@@ -4110,6 +4332,8 @@ pub(crate) mod tests {
                 created_unix_ns: 0,
                 generations: gens,
                 format_floors: Vec::new(),
+                compat_epoch: 0,
+                compat_fenced_unix_ns: 0,
             };
         let g = |generation, shard_count, activation_hour| sysproto::ShardGeneration {
             generation,
@@ -4547,7 +4771,7 @@ pub(crate) mod tests {
         // A well-formed record whose body names a different tenant, written under
         // this tenant's prov key: a misfile.
         let other = TenantHash([0xEE; 16]);
-        let record = build_record(&other, Signal::Metrics, 4, 1_000);
+        let record = build_record(&other, Signal::Metrics, 4, 1_000, None);
         store
             .put(
                 &provisioning_key(&tenant(), Signal::Metrics),
@@ -4586,7 +4810,7 @@ pub(crate) mod tests {
     async fn raise_floor_rejects_misfiled_signal() {
         let store = mem();
         // Record body says Logs, written under the Metrics prov key.
-        let record = build_record(&tenant(), Signal::Logs, 4, 1_000);
+        let record = build_record(&tenant(), Signal::Logs, 4, 1_000, None);
         store
             .put(
                 &provisioning_key(&tenant(), Signal::Metrics),
@@ -4633,6 +4857,8 @@ pub(crate) mod tests {
             created_unix_ns: 0,
             generations: Vec::new(),
             format_floors: floors,
+            compat_epoch: 0,
+            compat_fenced_unix_ns: 0,
         };
         let ff = |family: &str, floor_version: u32| sysproto::FormatFloor {
             family: family.to_string(),
@@ -4774,7 +5000,7 @@ pub(crate) mod tests {
     /// (ADR-0066 R2), not the presence of field 7.
     #[test]
     fn built_record_has_no_floors_and_is_byte_compatible() {
-        let built = build_record(&tenant(), Signal::Metrics, 4, 1_234);
+        let built = build_record(&tenant(), Signal::Metrics, 4, 1_234, None);
         assert!(
             built.format_floors.is_empty(),
             "a freshly built record carries no floors"
@@ -4815,6 +5041,8 @@ pub(crate) mod tests {
                 raised_by: "migrate".to_string(),
                 ..Default::default()
             }],
+            compat_epoch: 0,
+            compat_fenced_unix_ns: 0,
         }
     }
 
@@ -4852,7 +5080,7 @@ pub(crate) mod tests {
         let key = provisioning_key(&tenant(), Signal::Metrics);
 
         for version in [1u32, 2u32, 3u32] {
-            let mut record = build_record(&tenant(), Signal::Metrics, 4, 1_000);
+            let mut record = build_record(&tenant(), Signal::Metrics, 4, 1_000, None);
             record.format_version = version;
 
             // read_generations_checked (site 1) accepts it.
@@ -4881,7 +5109,7 @@ pub(crate) mod tests {
         }
 
         // Version 4 (one past the read set) is refused at each gate.
-        let mut v4 = build_record(&tenant(), Signal::Metrics, 4, 1_000);
+        let mut v4 = build_record(&tenant(), Signal::Metrics, 4, 1_000, None);
         v4.format_version = 4;
         assert!(
             matches!(
@@ -4937,7 +5165,7 @@ pub(crate) mod tests {
         // record itself is the problem. A supported set has a floor as well as a
         // ceiling: admitting version 0 would let a valid-shaped but unstamped
         // record enter shard routing and later be rewritten by a CAS path.
-        let mut v0 = build_record(&tenant(), Signal::Metrics, 4, 1_000);
+        let mut v0 = build_record(&tenant(), Signal::Metrics, 4, 1_000, None);
         v0.format_version = 0;
         assert!(
             matches!(
@@ -5336,7 +5564,7 @@ pub(crate) mod tests {
 
         // 1. Unknown (too-new) version: a well-formed record stamped past the read
         //    set is a typed UnsupportedVersion, surfaced through the checked read.
-        let mut future = build_record(&tenant(), Signal::Metrics, 4, 1_000);
+        let mut future = build_record(&tenant(), Signal::Metrics, 4, 1_000, None);
         future.format_version = PROVISIONING_MAX_READ_VERSION + 1;
         let store = mem();
         store
@@ -5353,7 +5581,7 @@ pub(crate) mod tests {
 
         // 2. Truncated body: a valid record encoding cut in half is a typed Decode
         //    error, not a panic.
-        let full = build_record(&tenant(), Signal::Metrics, 4, 1_000).encode_to_vec();
+        let full = build_record(&tenant(), Signal::Metrics, 4, 1_000, None).encode_to_vec();
         let truncated = full[..full.len() / 2].to_vec();
         let store = mem();
         store
@@ -5435,7 +5663,7 @@ pub(crate) mod tests {
         let store = mem();
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let seeded = with_unmodeled_field(
-            build_record(&tenant(), Signal::Metrics, 4, 1_000).encode_to_vec(),
+            build_record(&tenant(), Signal::Metrics, 4, 1_000, None).encode_to_vec(),
         );
         store
             .put(&key, seeded.clone().into(), PutOptions::default())
@@ -5608,7 +5836,7 @@ pub(crate) mod tests {
 
         // 2. Reshard append, starting from a stored version-1 record: the
         //    rewrite re-stamps to this build's writer version.
-        let mut v1 = build_record(&tenant(), Signal::Metrics, 4, 1_000);
+        let mut v1 = build_record(&tenant(), Signal::Metrics, 4, 1_000, None);
         v1.format_version = 1;
         store
             .put(&key, v1.encode_to_vec().into(), PutOptions::default())

@@ -7209,6 +7209,8 @@ mod tests {
             created_unix_ns: 1,
             generations: Vec::new(),
             format_floors: Vec::new(),
+            compat_epoch: 0,
+            compat_fenced_unix_ns: 0,
         };
         store
             .put(

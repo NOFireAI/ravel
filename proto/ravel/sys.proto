@@ -92,7 +92,13 @@ message ProvisioningRecord {
   // reader that only knows a lower version refuses rather than misreading a
   // future layout as v1 (matching TenancyMarker's format_version guard).
   //
-  // Version 3 is current: writers stamp 3 and readers accept the SET {1, 2, 3}.
+  // Readers accept the SET {1, 2, 3, 4}. Writers stamp 3 on a record that
+  // carries neither compat field (8, 9) and 4 on one that carries either
+  // (ADR-4233 decision 4): version 4 is the compat fence, written only when a
+  // bucket is fenced, so a binary whose reader stops at 3 refuses every write
+  // path into a fenced bucket. The rewrite paths take a separate ceiling of 4
+  // and refuse only a record above it.
+  //
   // Version 3 adds the FormatFloor basis fields 5 to 7: ADR-1746 Release A
   // (v0.20.0) made readers accept it while writers still stamped 2 and the
   // rewrite paths refused it, and Release B flipped every writer to 3, so the
@@ -177,6 +183,17 @@ message ProvisioningRecord {
   // earlier entry's floor_version, an empty family, or a zero floor_version is a
   // typed decode error (fail closed).
   repeated FormatFloor format_floors = 7;
+  // The `sys/compat` epoch this bucket is fenced at (ADR-4233 decision 4).
+  // Raised only, never lowered: by the activation's fence walk, or by a writer
+  // before it publishes the first object at an activated version above the
+  // baseline (conditional publication). 0 means never fenced. A record carrying
+  // this field or the next is stamped format_version 4.
+  uint64 compat_epoch = 8;
+  // When this bucket's fence was first raised from a record below version 4
+  // (the start of its pre-baseline grace wait, G_pre). 0 on a record created
+  // directly at version 4 by a baseline-or-later first touch after an
+  // activation (born fenced): no pre-baseline process ever saw it at version 3.
+  sfixed64 compat_fenced_unix_ns = 9;
 }
 
 // One entry in a ProvisioningRecord's append-only shard-generation history
@@ -954,4 +971,71 @@ message IpcryptPolicyMarker {
   // overlay), canonically encoded and order-independent (ADR-2993 decision
   // 9). Exactly 32 bytes; never contains key material or a raw tenant id.
   bytes fingerprint = 2;
+}
+
+// The durable, store-wide format activation record at the bucket root
+// `sys/compat` (ADR-4233 decision 3). One entry per format family says which
+// version writers emit; activation raises a family's version by exactly one
+// and raises the store-wide `compat_epoch`, and nothing ever lowers either.
+// Created once with CreateIfAbsent by `compat init`, then rewritten whole
+// under CasVersion on the store version, so it is CAS-mutable (ADR-0066 R1):
+// every additive change bumps `format_version`, readers first.
+//
+// An absent record means every family at its baseline version. A reader that
+// finds a `format_version` above the one it knows refuses it as newer, never
+// as absent and never as corrupt.
+//
+// Its own top-level message, sharing no field number with the markers above.
+message CompatRecord {
+  // The only version this build writes and reads: 1.
+  uint32 format_version = 1;
+  // The baseline release the contract started at (ADR-4233 decision 1).
+  uint32 baseline_release_major = 2;
+  uint32 baseline_release_minor = 3;
+  // One entry per family, family names unique and lowercase.
+  repeated CompatFamily families = 4;
+  // Raised by every activation of any family; never lowered.
+  uint64 compat_epoch = 5;
+  // P: the publish bound every in-contract writer is held to (decision 7).
+  sfixed64 max_publish_lifetime_ns = 6;
+  // What `compat init` found per family (decision 1).
+  repeated AdoptedVersion adopted = 7;
+  // blake3::keyed_hash(record_key, claim), 32 bytes, the WorkerHeartbeat
+  // pattern (ADR-3130 decision 2). record_key = blake3::derive_key(
+  // "ravel compat record v1", deployment_key); the first key mints, any key
+  // verifies. claim is built from field values, not these encoded bytes:
+  // ravel_catalog::compat documents the exact layout.
+  bytes mac = 8;
+}
+
+// One family's activation state inside CompatRecord (ADR-4233 decision 3).
+message CompatFamily {
+  string family = 1;                  // "rseg", "rlog", "rspan", "csnap", ...
+  uint32 active_write_version = 2;    // what writers emit
+  uint64 activated_epoch = 3;         // the compat_epoch this activation set
+  sfixed64 activated_unix_ns = 4;
+  string activated_by = 5;
+  Certificate certificate = 6;        // decision 7; absent until certified
+  sfixed64 fence_complete_unix_ns = 7; // the activation's fence walk finished
+  sfixed64 late_writes_verified_through_unix_ns = 8; // decision 7, CAS-advanced
+  bool contradicted = 9;              // decision 7, set by a late-write finding
+}
+
+// A family's reader-retirement certificate (ADR-4233 decision 7). Written once
+// under CAS by `compat certify`; nothing edits it afterwards.
+message Certificate {
+  uint32 version = 1;                 // the certified version: every member at or above it
+  sfixed64 certified_unix_ns = 2;
+  uint64 member_count = 3;
+  sfixed64 newest_created_unix_ns = 4; // newest created_unix_ns seen in the census
+  uint64 buckets_scanned = 5;
+  bytes tenant_set_digest = 6;        // digest of the tenant set the census covered
+}
+
+// One family's version histogram entry recorded by `compat init` (ADR-4233
+// decision 1).
+message AdoptedVersion {
+  string family = 1;
+  uint32 version = 2;
+  uint64 count = 3;
 }
