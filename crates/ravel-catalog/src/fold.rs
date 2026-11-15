@@ -5297,6 +5297,90 @@ impl Catalog {
                 let hash16 = &part_hash.to_hex()[..16];
                 let part_key = part_object_key(tenant, signal, part_watermark, hash16);
 
+                // ADR-2707 decision 4: this part's key-index leaves, built from
+                // its entries' KEY_IDX sections by ranged GET and PUT before
+                // the part object below. A failed leaf PUT fails the fold
+                // before this part's PUT and before any HEAD CAS, so no HEAD
+                // references a part without its leaves; parts this fold
+                // already wrote are unreferenced and left to the catalog
+                // sweep. The reads share the fold's bucket concurrency bound.
+                // Built before this part's `.cstat`, so a previous leaf a
+                // newer build wrote fails the fold before this part's first
+                // PUT (ADR-4233 decision 4, H1).
+                let mut key_index = Vec::new();
+                if metrics_erasure_gated {
+                    metrics_label_index_parts_erasure_gated += 1;
+                }
+                if let Some(declared) = &key_index_fields {
+                    let built = match key_index_built.get(part_hash.as_bytes()) {
+                        Some(built) => built.clone(),
+                        None => {
+                            // ADR-3694 decision 2: the metrics byte cap, a
+                            // ratio of the part's own data bytes.
+                            let leaf_bytes_cap = (signal == Signal::Metrics).then(|| {
+                                metrics_label_index_leaf_bytes_cap(
+                                    part_entries.iter().map(|e| e.object_size).sum(),
+                                    self.config().metrics_label_index_max_ratio_ppm,
+                                )
+                            });
+                            let sources: Vec<&CarrySource> = carry_sources
+                                .iter()
+                                .filter(|source| {
+                                    source.overlaps_hours(part_min_hour, part_watermark)
+                                        && source
+                                            .derive_object_keys(tenant, signal, &entries)
+                                            .is_some()
+                                })
+                                .collect();
+                            let sealed_day = span_index != tail_index
+                                && utc_day_of_hour(part_min_hour)
+                                    == utc_day_of_hour(part_watermark)
+                                && previously_sealed_days.contains(&utc_day_of_hour(part_min_hour));
+                            let puts_before = counters.put_requests;
+                            let leaf_gets_before = counters.key_index_leaf_gets;
+                            let built = build_part_key_index(
+                                self.store(),
+                                tenant,
+                                signal,
+                                *part_hash.as_bytes(),
+                                part_watermark,
+                                part_entries,
+                                declared,
+                                &sources,
+                                held_label_dicts.part(span.start),
+                                &KeyIndexBuildLimits {
+                                    leaf: key_index_leaf_limits(),
+                                    max_pairs: self.config().key_index_build_max_pairs,
+                                    concurrency: self.config().fold_bucket_concurrency,
+                                    leaf_bytes_cap,
+                                },
+                                &mut counters,
+                            )
+                            .await?;
+                            if sealed_day {
+                                counters.sealed_day_leaf_puts +=
+                                    counters.put_requests - puts_before;
+                                counters.sealed_day_previous_leaf_gets +=
+                                    counters.key_index_leaf_gets - leaf_gets_before;
+                            }
+                            held_label_dicts.release(span.start..span.end);
+                            key_index_built.insert(*part_hash.as_bytes(), built.clone());
+                            built
+                        }
+                    };
+                    if built.over_cap {
+                        metrics_label_index_parts_over_cap += 1;
+                    }
+                    key_index_uncovered_entries += built.uncovered_entries;
+                    key_index_leaves_written += built.refs.len() as u64;
+                    key_index_leaf_bytes_written +=
+                        built.refs.iter().map(|leaf| leaf.size).sum::<u64>();
+                    for (field, pairs) in built.field_pairs {
+                        *key_index_field_pairs.entry(field).or_insert(0) += pairs;
+                    }
+                    key_index = built.refs;
+                }
+
                 // ADR-1413: build (degrading dictionaries as needed to fit
                 // the ceiling) the per-part (v3) column-statistics object
                 // BEFORE writing the part's own `.csnap` object below. Unlike
@@ -5534,87 +5618,6 @@ impl Catalog {
                         part_blake3: vec![part_hash.as_bytes().to_vec()],
                     })
                 };
-
-                // ADR-2707 decision 4: this part's key-index leaves, built from
-                // its entries' KEY_IDX sections by ranged GET and PUT before
-                // the part object below. A failed leaf PUT fails the fold
-                // before this part's PUT and before any HEAD CAS, so no HEAD
-                // references a part without its leaves; parts this fold
-                // already wrote are unreferenced and left to the catalog
-                // sweep. The reads share the fold's bucket concurrency bound.
-                let mut key_index = Vec::new();
-                if metrics_erasure_gated {
-                    metrics_label_index_parts_erasure_gated += 1;
-                }
-                if let Some(declared) = &key_index_fields {
-                    let built = match key_index_built.get(part_hash.as_bytes()) {
-                        Some(built) => built.clone(),
-                        None => {
-                            // ADR-3694 decision 2: the metrics byte cap, a
-                            // ratio of the part's own data bytes.
-                            let leaf_bytes_cap = (signal == Signal::Metrics).then(|| {
-                                metrics_label_index_leaf_bytes_cap(
-                                    part_entries.iter().map(|e| e.object_size).sum(),
-                                    self.config().metrics_label_index_max_ratio_ppm,
-                                )
-                            });
-                            let sources: Vec<&CarrySource> = carry_sources
-                                .iter()
-                                .filter(|source| {
-                                    source.overlaps_hours(part_min_hour, part_watermark)
-                                        && source
-                                            .derive_object_keys(tenant, signal, &entries)
-                                            .is_some()
-                                })
-                                .collect();
-                            let sealed_day = span_index != tail_index
-                                && utc_day_of_hour(part_min_hour)
-                                    == utc_day_of_hour(part_watermark)
-                                && previously_sealed_days.contains(&utc_day_of_hour(part_min_hour));
-                            let puts_before = counters.put_requests;
-                            let leaf_gets_before = counters.key_index_leaf_gets;
-                            let built = build_part_key_index(
-                                self.store(),
-                                tenant,
-                                signal,
-                                *part_hash.as_bytes(),
-                                part_watermark,
-                                part_entries,
-                                declared,
-                                &sources,
-                                held_label_dicts.part(span.start),
-                                &KeyIndexBuildLimits {
-                                    leaf: key_index_leaf_limits(),
-                                    max_pairs: self.config().key_index_build_max_pairs,
-                                    concurrency: self.config().fold_bucket_concurrency,
-                                    leaf_bytes_cap,
-                                },
-                                &mut counters,
-                            )
-                            .await?;
-                            if sealed_day {
-                                counters.sealed_day_leaf_puts +=
-                                    counters.put_requests - puts_before;
-                                counters.sealed_day_previous_leaf_gets +=
-                                    counters.key_index_leaf_gets - leaf_gets_before;
-                            }
-                            held_label_dicts.release(span.start..span.end);
-                            key_index_built.insert(*part_hash.as_bytes(), built.clone());
-                            built
-                        }
-                    };
-                    if built.over_cap {
-                        metrics_label_index_parts_over_cap += 1;
-                    }
-                    key_index_uncovered_entries += built.uncovered_entries;
-                    key_index_leaves_written += built.refs.len() as u64;
-                    key_index_leaf_bytes_written +=
-                        built.refs.iter().map(|leaf| leaf.size).sum::<u64>();
-                    for (field, pairs) in built.field_pairs {
-                        *key_index_field_pairs.entry(field).or_insert(0) += pairs;
-                    }
-                    key_index = built.refs;
-                }
 
                 let put_result = self
                     .store()
@@ -21067,5 +21070,375 @@ pub(crate) mod tests {
             probe_label(&catalog, part, "west").await,
             matches(&[(ordinal[&1], &[0]), (ordinal[&3], &[0])], &[ordinal[&2]])
         );
+    }
+
+    // ---- ADR-4233 decision 4 (H1, H11): newer previous objects ----
+
+    /// Every object in the store and its bytes.
+    async fn store_contents(store: &dyn ObjectStoreBackend) -> BTreeMap<String, Bytes> {
+        let mut out = BTreeMap::new();
+        for key in list_all_keys(store, "").await {
+            let got = store
+                .get(&key, GetRange::Full)
+                .await
+                .expect("a listed object is readable");
+            out.insert(key, got.data);
+        }
+        out
+    }
+
+    /// Asserts `after` holds exactly the keys and bytes of `before`.
+    fn assert_store_unchanged(
+        before: &BTreeMap<String, Bytes>,
+        after: &BTreeMap<String, Bytes>,
+        case: &str,
+    ) {
+        assert_eq!(
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>(),
+            "{case}: the refused fold adds and deletes no object"
+        );
+        for (key, bytes) in before {
+            assert!(
+                after.get(key) == Some(bytes),
+                "{case}: the refused fold overwrites no object, {key} included"
+            );
+        }
+    }
+
+    async fn put_object(store: &dyn ObjectStoreBackend, key: &str, bytes: Vec<u8>) {
+        store
+            .put(key, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("overwrite the object");
+    }
+
+    async fn get_object(store: &dyn ObjectStoreBackend, key: &str) -> Vec<u8> {
+        store
+            .get(key, GetRange::Full)
+            .await
+            .expect("object stored")
+            .data
+            .to_vec()
+    }
+
+    /// Overwrites part `index` of `head` with `bytes`, re-stamps the part
+    /// ref's blake3 and size (and the postings binding to it), and PUTs the
+    /// HEAD, so a reader gets past the blake3 gate to the decoder.
+    async fn repoint_head_at_part(
+        store: &dyn ObjectStoreBackend,
+        signal: Signal,
+        head: &mut SnapshotHead,
+        index: usize,
+        bytes: Vec<u8>,
+    ) {
+        let hash = blake3::hash(&bytes).as_bytes().to_vec();
+        let part = &mut head.parts[index];
+        part.blake3 = hash.clone();
+        part.size = bytes.len() as u64;
+        let key = part.key.clone();
+        if let Some(postings) = head.postings.as_mut() {
+            postings.part_blake3[index] = hash;
+        }
+        put_object(store, &key, bytes).await;
+        put_head(store, signal, head).await;
+    }
+
+    async fn put_head(store: &dyn ObjectStoreBackend, signal: Signal, head: &SnapshotHead) {
+        let head_bytes = snapshot_format::encode_head(head).expect("encode head");
+        put_object(store, &head_object_key(&tenant(), signal), head_bytes).await;
+    }
+
+    /// The previous object a newer-version case raises above the read set.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum NewerTarget {
+        /// The `.csnap` envelope version byte, to `VERSION + 1`.
+        Part,
+        /// The `.kidx` header `format_version`, to one above the known set.
+        Leaf,
+    }
+
+    /// Raises `target` of the [`advancing_fixture`] HEAD above this build's
+    /// read set and re-points the HEAD at it. Returns the raised object's key,
+    /// its kind and the version it now carries.
+    async fn raise_advancing_object(
+        store: &dyn ObjectStoreBackend,
+        mut head: SnapshotHead,
+        target: NewerTarget,
+    ) -> (String, CatalogObjectKind, u32) {
+        match target {
+            NewerTarget::Part => {
+                let key = head.parts[0].key.clone();
+                let mut bytes = get_object(store, &key).await;
+                bytes[4] = snapshot_format::VERSION + 1;
+                repoint_head_at_part(store, Signal::Logs, &mut head, 0, bytes).await;
+                (
+                    key,
+                    CatalogObjectKind::SnapshotPart,
+                    u32::from(snapshot_format::VERSION) + 1,
+                )
+            }
+            NewerTarget::Leaf => {
+                let leaf_ref = &mut head.parts[0].key_index[0];
+                let key = leaf_ref.key.clone();
+                let bytes = get_object(store, &key).await;
+                let version = KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN
+                    .iter()
+                    .copied()
+                    .max()
+                    .expect("a known set")
+                    + 1;
+                let raised = snapshot_format::restamp_key_index_leaf_version(&bytes, version)
+                    .expect("restamp the fixture leaf");
+                *leaf_ref = SnapshotKeyIndexLeafRef {
+                    key: key.clone(),
+                    ..raised.leaf_ref
+                };
+                put_object(store, &key, raised.bytes).await;
+                put_head(store, Signal::Logs, &head).await;
+                (key, CatalogObjectKind::KeyIndexLeaf, version)
+            }
+        }
+    }
+
+    fn assert_newer_refusal(
+        err: &CatalogError,
+        key: &str,
+        kind: CatalogObjectKind,
+        version: u32,
+        case: &str,
+    ) {
+        match err {
+            CatalogError::NewerCatalogObject {
+                key: got_key,
+                kind: got_kind,
+                version: got_version,
+                max_known,
+                ..
+            } => {
+                assert_eq!(got_key, key, "{case}");
+                assert_eq!(*got_kind, kind, "{case}");
+                assert_eq!(*got_version, version, "{case}");
+                assert_eq!(*max_known + 1, version, "{case}");
+            }
+            other => panic!("{case}: expected NewerCatalogObject, got {other:?}"),
+        }
+    }
+
+    /// ADR-4233 decision 4, H1: a previous `.csnap`, `.cstat`, `.kidx` or
+    /// `.npost` whose version is above this build's read set fails the fold
+    /// with the typed refusal naming its key, kind and version, and the fold
+    /// writes nothing: no part, no leaf, no `.cstat`, no postings, no HEAD
+    /// CAS. The `.csnap` and `.kidx` cases raise one object of the
+    /// incremental-build fixture, whose next fold reads its part and carries
+    /// its leaf; the `.cstat` case raises the baseline of a part the next fold
+    /// grows by an hour; the `.npost` case raises the metrics postings
+    /// baseline, which a fold reads for its forward merge.
+    #[tokio::test]
+    async fn newer_previous_part_fails_cycle_without_rebuild() {
+        let store = Arc::new(MemoryStore::new());
+        set_status_column_config(store.as_ref()).await;
+        publish_logs_segment(store.as_ref(), 1, 10, &[200, 404, 200]).await;
+        publish_logs_segment(store.as_ref(), 2, 10, &[500, 200]).await;
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        fold_through(&catalog, Signal::Logs, 10).await;
+        let mut head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let stats_ref = head.parts[0]
+            .column_stats
+            .as_mut()
+            .expect("the fixture part has a .cstat");
+        let stats_key = stats_ref.key.clone();
+        let mut bytes = get_object(store.as_ref(), &stats_key).await;
+        let stats_max = snapshot_format::COLUMN_STATS_ACCEPTED_READ_VERSIONS
+            .iter()
+            .copied()
+            .max()
+            .expect("a read set");
+        bytes[4] = stats_max + 1;
+        stats_ref.blake3 = blake3::hash(&bytes).as_bytes().to_vec();
+        stats_ref.size = bytes.len() as u64;
+        put_object(store.as_ref(), &stats_key, bytes).await;
+        put_head(store.as_ref(), Signal::Logs, &head).await;
+        publish_logs_segment(store.as_ref(), 3, 11, &[200, 200]).await;
+        let before = store_contents(store.as_ref()).await;
+        let err = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect_err("a newer previous .cstat fails the fold");
+        assert_newer_refusal(
+            &err,
+            &stats_key,
+            CatalogObjectKind::ColumnStats,
+            u32::from(stats_max) + 1,
+            "ColumnStats",
+        );
+        assert_store_unchanged(&before, &store_contents(store.as_ref()).await, "ColumnStats");
+
+        for target in [NewerTarget::Part, NewerTarget::Leaf] {
+            let case = format!("{target:?}");
+            let inner = recording_store();
+            let first = advancing_fixture(&inner).await;
+            let (key, kind, version) =
+                raise_advancing_object(inner.as_ref(), first, target).await;
+            let before = store_contents(inner.as_ref()).await;
+            let catalog = Catalog::new(inner.clone(), kidx_config()).expect("catalog");
+            let err = catalog
+                .fold_with_seal_through(
+                    &tenant(),
+                    Signal::Logs,
+                    Uuid::new_v4(),
+                    now_inside(KIDX_HOUR) + 5 * 60 * 1_000_000_000,
+                    &[],
+                    None,
+                    &RefoldRequest::new(),
+                    None,
+                )
+                .await
+                .expect_err("a newer previous object fails the fold");
+            assert_newer_refusal(&err, &key, kind, version, &case);
+            assert_store_unchanged(&before, &store_contents(inner.as_ref()).await, &case);
+        }
+
+        let store = Arc::new(MemoryStore::new());
+        let (catalog, mut head, postings) = folded_postings_baseline(&store).await;
+        let postings_key = head.postings.as_ref().expect("a postings ref").key.clone();
+        let mut raised = postings.to_vec();
+        raised[4] = snapshot_format::POSTINGS_VERSION + 1;
+        repoint_head_at_postings(&store, &mut head, raised).await;
+        let now_2 = now_at_seal(12);
+        publish_real_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            2,
+            12,
+            now_2 - NS_PER_HOUR,
+            &["disk"],
+        )
+        .await;
+        let before = store_contents(store.as_ref()).await;
+        let err = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect_err("a newer previous postings object fails the fold");
+        assert_newer_refusal(
+            &err,
+            &postings_key,
+            CatalogObjectKind::Postings,
+            u32::from(snapshot_format::POSTINGS_VERSION) + 1,
+            "Postings",
+        );
+        assert_store_unchanged(&before, &store_contents(store.as_ref()).await, "Postings");
+    }
+
+    /// The other side of the refusal: a previous part below the read set
+    /// (envelope version 0) or with a corrupt body is still rebuilt from the
+    /// commit layout, and the fold CASes a HEAD that recovers every entry.
+    #[tokio::test]
+    async fn below_read_set_or_corrupt_previous_part_still_rebuilds() {
+        for case in ["below the read set", "corrupt"] {
+            let store = Arc::new(MemoryStore::new());
+            let (catalog, mut head, _) = folded_postings_baseline(&store).await;
+            let mut bytes = get_object(store.as_ref(), &head.parts[0].key).await;
+            if case == "corrupt" {
+                let last = bytes.len() - 1;
+                bytes[last] ^= 0x01;
+            } else {
+                bytes[4] = 0;
+            }
+            repoint_head_at_part(store.as_ref(), Signal::Metrics, &mut head, 0, bytes).await;
+            let head_key = head_object_key(&tenant(), Signal::Metrics);
+            let head_before = get_object(store.as_ref(), &head_key).await;
+            let now_2 = now_at_seal(12);
+            publish_real_segment(
+                &store,
+                0,
+                Uuid::new_v4(),
+                2,
+                12,
+                now_2 - NS_PER_HOUR,
+                &["disk"],
+            )
+            .await;
+            let report = catalog
+                .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+                .await
+                .unwrap_or_else(|err| panic!("{case}: the fold rebuilds: {err:?}"));
+            assert!(report.rebuilt, "{case}: {report:?}");
+            assert_eq!(report.entry_count, 2, "{case}: {report:?}");
+            assert_ne!(
+                get_object(store.as_ref(), &head_key).await,
+                head_before,
+                "{case}: the rebuild CASes a new HEAD"
+            );
+        }
+    }
+
+    /// Overwrites the tenant config record with `format_version`, keeping the
+    /// rest of the record as `set_tenant_config` wrote it. Returns the version
+    /// it replaced.
+    async fn stamp_tenant_config(store: &dyn ObjectStoreBackend, format_version: u32) -> u32 {
+        let key = crate::tenant_config::config_key(&tenant());
+        let mut record =
+            ravel_proto::sys::v1::TenantConfigRecord::decode(&get_object(store, &key).await[..])
+                .expect("the record decodes");
+        let previous = record.format_version;
+        record.format_version = format_version;
+        put_object(store, &key, record.encode_to_vec()).await;
+        previous
+    }
+
+    /// ADR-4233 decision 4, H11: a tenant config record above
+    /// `TENANT_CONFIG_MAX_READ_VERSION` fails the fold with the typed refusal
+    /// instead of folding with deployment defaults, and the fold writes
+    /// nothing. The same store folds once the record is back inside the read
+    /// set, so nothing else stopped the fold.
+    #[tokio::test]
+    async fn newer_tenant_config_fails_cycle() {
+        use crate::tenant_config::{TENANT_CONFIG_MAX_READ_VERSION, config_key};
+
+        let store = Arc::new(MemoryStore::new());
+        let now = now_at_seal(10);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now - NS_PER_HOUR).await;
+        write_retention_config(store.as_ref(), 7 * 24 * NS_PER_HOUR).await;
+        let written =
+            stamp_tenant_config(store.as_ref(), TENANT_CONFIG_MAX_READ_VERSION + 1).await;
+        let before = store_contents(store.as_ref()).await;
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let err = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect_err("a newer tenant config fails the fold");
+        match &err {
+            CatalogError::NewerCatalogObject {
+                key,
+                kind,
+                field,
+                version,
+                max_known,
+            } => {
+                assert_eq!(key, &config_key(&tenant()));
+                assert_eq!(*kind, CatalogObjectKind::TenantConfig);
+                assert_eq!(*field, "format_version");
+                assert_eq!(*version, TENANT_CONFIG_MAX_READ_VERSION + 1);
+                assert_eq!(*max_known, TENANT_CONFIG_MAX_READ_VERSION);
+            }
+            other => panic!("expected NewerCatalogObject, got {other:?}"),
+        }
+        assert_store_unchanged(&before, &store_contents(store.as_ref()).await, "config");
+
+        stamp_tenant_config(store.as_ref(), written).await;
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("a config inside the read set folds");
+        assert_eq!(report.entry_count, 1);
     }
 }
