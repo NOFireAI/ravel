@@ -147,7 +147,9 @@ most `k` logical block fetches (fewer when winners share a block), and the
 object-store request count behind them depends on the fetch path: zero on
 a cache hit, one whole-object GET at or below the block-range threshold,
 the coalesced ranges above it. Bytes are up to `k` objects', not `k`
-blocks'. See the consequences below.
+blocks'. See the consequences below. (Replaced: phase 2 now opens each
+winning segment once and fetches only the winners' blocks where the skip
+step decides the survivors; see the issue #797 amendment below.)
 
 No projection node is inserted to drop the row-ref column. Phase 2's output
 schema is `Arc::clone`d off the original scan's, so the restored column
@@ -233,6 +235,9 @@ it.
 
 ## Consequences
 
+(The first two items' request and byte figures are replaced by the issue
+#797 amendment below.)
+
 - A qualifying statement costs at most `k` extra logical block fetches.
   The store requests behind them depend on the fetch path: with ADR-0046's
   read cache wired and an object below the block-range threshold they land
@@ -270,3 +275,40 @@ it.
   variant's 24.8 s, i.e. under about 37 s, against a run that previously
   exceeded a 900 s deadline. The orchestrator runs that measurement; it is
   a prediction recorded before the fact, not a reported result.
+
+## Amendment (2026-11-15): phase 2 opens each segment once and fetches only the winners' blocks (issue #797)
+
+<!-- amendment-applies: sections="4. The two phases|Consequences" pointer="issue #797 amendment" -->
+
+Decision 4's per-`(segment, block)` re-open and the per-object byte cost in
+the consequences are replaced.
+
+- `LogsRowFetchExec` groups row refs by segment, then by block, and opens
+  each winning segment once through
+  `LogSegmentFetcher::scan_accounted_with_tenant_subset` with all of that
+  segment's winning survivor-list positions. Output order is unchanged.
+  Phase 2 therefore costs at most one open per winning segment.
+- Above the block-range threshold, for a version-4 object whose reader
+  prune is its skip step alone (ts bounds and numeric ranges; a `Contains`
+  arm drops no block), the ranged read resolves each position against the
+  same survivor list the reader decodes from and fetches only those
+  blocks' projected pages. The coverage crossover (ADR-0107) weighs those
+  pages' bridged bytes, not the whole candidate set's, so a whole-object
+  read is still taken when the winners' pages cover most of the object.
+- Any other query (a content arm a filter section decides, a
+  stream-attribute arm, an `Equals` prune) and every version-3 object keep
+  the ordinary fetch over the fetch-side candidate set, still once per
+  segment. At or below the threshold the fetch is one whole-object GET per
+  winning segment.
+- Phase 2 stays charged under the scan phase: block pages under
+  `QueryPhase::Scan`, the footer probe under `QueryPhase::Probe`.
+
+Measured on the regression fixture without a cache, `k = 10` moves from
+14 GETs and 96,370 bytes to 8 GETs and 55,154 bytes (two GETs per object:
+phase 1 and phase 2). On a ten-block object above the threshold, with
+three winners in blocks 3, 5 and 7 and blocks 0 and 1 pruned, phase 2
+moved 6 GETs and 66,990 bytes before this change and moves 116 GETs and
+9,389 bytes after it: one 6,437-byte footer probe plus 115 page ranges
+totalling exactly the winners' 2,952 projected page bytes (the test sets
+a zero coalesce gap so each page run is its own range). Both are pinned in
+`crates/ravel-sql/tests/logs_topk_late_materialization.rs`.

@@ -3476,7 +3476,10 @@ impl LogSegmentFetcher {
     /// the caller's own raw whole-object block indices: the striped route's
     /// per-partition subset open passes its `owned_work` share so the
     /// above-threshold ranged read covers only those blocks, through
-    /// [`BlockRangeFetcher::fetch_object_with_footer_subset`]. A caller with
+    /// [`BlockRangeFetcher::fetch_object_with_footer_subset`]. The ordinal
+    /// subset open passes its survivor-list positions instead (issue #797),
+    /// for a query whose survivors the skip index decides alone, so phase 2
+    /// of late materialization reads only the winners' blocks. A caller with
     /// no such list (every other funnel here) passes `None`, the unchanged
     /// behavior.
     ///
@@ -7937,9 +7940,12 @@ impl BlockRangeFetcher {
     /// open, whose `owned_work` dealt this segment's row groups across
     /// partitions, so a partition's ranged plan covers only its own blocks
     /// instead of every block the ts bounds and skip index would otherwise
-    /// keep for the WHOLE object. `None` is every other caller's unchanged
-    /// behavior (the version-4 whole-segment and ordinal-subset paths, which
-    /// have no per-partition block list to restrict by).
+    /// keep for the WHOLE object. [`BlockSubset::Positions`] narrows the
+    /// same set to the entries at the given survivor-list positions (the
+    /// ordinal subset open, issue #797); it has no fences, and the coverage
+    /// crossover weighs only those blocks' bytes. `None` is every other
+    /// caller's unchanged behavior (the version-4 whole-segment path, and an
+    /// ordinal subset whose survivors the skip index does not decide alone).
     ///
     /// # Checksums
     ///
@@ -12132,6 +12138,53 @@ mod plan_skip_decidable_span_tests {
                 "one count per missed tail section, whichever phase issued the probe"
             );
         }
+    }
+
+    /// Issue #797: the ordinal subset's ranged read resolves each position
+    /// against the skip step's survivor list. A position past that list is a
+    /// typed corruption naming the mismatch, never a panic or a read of some
+    /// other block.
+    #[tokio::test]
+    async fn a_subset_position_past_the_survivors_is_a_typed_error() {
+        let records: Vec<LogRecord> = (0..6).map(|ts| record(ts, 500)).collect();
+        let bytes = build_object(&records);
+        let seg = seg_ref(bytes.len() as u64, &records);
+        let store = store_with_object(bytes).await;
+        let f = fetcher(store);
+        let acc = QueryAccounting::new();
+        let query = LogQuery::new(0, 2);
+
+        let survivors = f
+            .plan_segment(&seg, TENANT, &query, &acc)
+            .await
+            .expect("plan_segment")
+            .expect("relevant segment")
+            .0
+            .len();
+        assert_eq!(survivors, 3, "the ts window keeps blocks 0, 1 and 2");
+
+        let err = f
+            .scan_accounted_with_tenant_subset(
+                &seg,
+                TENANT,
+                &query,
+                &ColumnSelection::all(),
+                &[survivors],
+                None,
+                None,
+                &acc,
+            )
+            .await
+            .err()
+            .expect("a position past the survivors refuses");
+        let LogFetchError::Corrupt { key, source } = err else {
+            panic!("expected a typed corruption, got {err:?}");
+        };
+        assert_eq!(key, KEY);
+        assert!(
+            source.to_string().contains("segment survivor mismatch"),
+            "the refusal names the mismatch: {source}"
+        );
     }
 }
 

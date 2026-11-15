@@ -88,21 +88,22 @@
 //!
 //! # Cost
 //!
-//! Phase 2 re-reads bytes phase 1 already read: `k` block fetches, accounted
-//! like any other scan read because they go through the same
+//! Phase 2 re-reads bytes phase 1 already read, accounted under the scan
+//! phase like any other scan read because it goes through the same
 //! `LogSegmentFetcher::scan_accounted_with_tenant_subset` funnel the striped
-//! scan path uses.
+//! scan path uses. The row refs are grouped by segment, and each winning
+//! segment is opened once for all of its winning blocks (issue #797), so
+//! phase 2 makes at most one open per winning segment, not one per row.
 //!
-//! Be precise about what a "block fetch" costs, because the request count and
-//! the byte count do not say the same thing. That entry point restricts the
-//! DECODE to the named block, but its byte fetch is the query's ordinary fetch
-//! for the whole object: one whole-object GET at or below the block-range
-//! threshold (ADR-0107), and above it the version-4 coalesced ranges over the
-//! fetch-side candidate set (ADR-0699 decision 5) -- which, for a query whose
-//! only predicate is a residual the skip index cannot decide, is every block.
-//! So phase 2 costs `k` requests and up to `k` objects' bytes, not `k` blocks'
-//! bytes. Narrowing that fetch to the named indices is a ravel-query
-//! follow-up, deliberately not done here.
+//! What one open fetches depends on the object. At or below the block-range
+//! threshold (ADR-0107) it is one whole-object GET. Above it, for a version-4
+//! object whose reader prune is its skip step alone (ts bounds and numeric
+//! ranges; a `Contains` arm is checked per row and drops no block), the
+//! ranged read covers only the winning blocks' projected pages, and the
+//! coverage crossover weighs those pages' bytes, so a whole-object read is
+//! still chosen when they bridge to most of the object. Any other query,
+//! and a version-3 object, keeps the ordinary fetch over the fetch-side
+//! candidate set (ADR-0699 decision 5), up to the whole object.
 //!
 //! Either way the cost is bounded by `k` and by one object, while what it
 //! removes is bounded by the table.
