@@ -71,7 +71,7 @@
 //!   sort; it emits in phase-1 order.
 //!
 //! The one shape where the third bullet fails is a pending selective erasure
-//! (ADR-0064): the scan layer's `retain_unerased` drops rows from the block's
+//! (ADR-0064): the scan layer's erasure exclusion drops rows from the block's
 //! record list AFTER the reader produced it, so a phase-1 position would not be
 //! a phase-2 position. [`LogsScanExec::late_materialization_candidate`] refuses
 //! there, which is also the fail-closed direction.

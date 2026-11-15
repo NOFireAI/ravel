@@ -198,6 +198,8 @@ mod sql_postings_multi_scan;
 mod sql_postings_prefix_pruning;
 #[path = "sql_postings_pruning.rs"]
 mod sql_postings_pruning;
+#[path = "sql_stats_batch_paths.rs"]
+mod sql_stats_batch_paths;
 #[path = "statement_complexity.rs"]
 mod statement_complexity;
 #[path = "stddev_var_family_rejected.rs"]

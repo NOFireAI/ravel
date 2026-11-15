@@ -4,6 +4,13 @@ use datafusion::arrow::datatypes::ToByteSlice;
 use ravel_logseg::Validity;
 use ravel_logseg::decoded_cache::{MemoSource, ReservationCell, StrBuffers, ValuesMemo};
 
+#[cfg(test)]
+thread_local! {
+    /// Records [`build_batch`] built batches from on this thread, so a test can
+    /// show a scan built no [`LogRecord`] per row.
+    pub(super) static RECORDS_BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Decode a slice of records into one [`RecordBatch`] over `schema`, which is
 /// `logs_schema_with_declared(&declared)` projected by `projection`.
 ///
@@ -31,6 +38,8 @@ pub(super) fn build_batch(
     full_len: usize,
     row_refs: Option<RowRefRange>,
 ) -> DFResult<RecordBatch> {
+    #[cfg(test)]
+    RECORDS_BUILT.with(|n| n.set(n.get() + records.len() as u64));
     // Precompute the merged attribute view once per record when any projected
     // column needs it -- the `attrs` map or any declared typed column. Hoisted
     // out of the per-column loop so a query projecting `attrs` and several
@@ -290,7 +299,7 @@ fn attr_key_values_array<'v>(values: impl Iterator<Item = Option<&'v AttrValue>>
 /// resolution looks up every merged entry of a row in a map, which costs about
 /// as much as a few linear searches of that row, so a projection naming one or
 /// two keys keeps the per-column search.
-const ONE_PASS_MIN_KEY_COLUMNS: usize = 4;
+pub(super) const ONE_PASS_MIN_KEY_COLUMNS: usize = 4;
 
 /// Each projected key column's value for every row of a row-path batch,
 /// resolved in one pass over each row's merged view.
@@ -360,7 +369,7 @@ impl<'a> KeyCells<'a> {
 /// [`build_batch`]'s dispatch: `attr_keys[index - full_len]` at or past
 /// `full_len`, else the declared column at `index - FIRST_DECLARED_COL`, else
 /// none (a fixed column).
-fn projected_key<'k>(
+pub(super) fn projected_key<'k>(
     index: usize,
     declared: &'k [DeclaredColumn],
     attr_keys: &'k [String],
@@ -1343,6 +1352,18 @@ impl<'a> DeclaredCursor<'a> {
             DeclaredCursor::Bool(c) => c.at(i).map(AttrValue::Bool),
         }
     }
+
+    /// The cell at surviving row `i`, borrowed, or `None` when NULL (or, for
+    /// `Str`, not UTF-8): [`value_at`](Self::value_at) without the owned copy.
+    fn cell_at(&self, i: usize) -> Option<Cell<'a>> {
+        match self {
+            DeclaredCursor::Str(c) => c.text_at(i).map(Cell::Str),
+            DeclaredCursor::Bytes(c) => c.at(i).map(Cell::Bytes),
+            DeclaredCursor::I64(c) => c.at(i).map(Cell::I64),
+            DeclaredCursor::F64(c) => c.at(i).map(|bits| Cell::F64(f64::from_bits(bits))),
+            DeclaredCursor::Bool(c) => c.at(i).map(Cell::Bool),
+        }
+    }
 }
 
 /// The index into `cols`/`cursors` of the record's WINNING occurrence of a key
@@ -2090,27 +2111,33 @@ impl<'a> AttrKeyPlan<'a> {
         }
     }
 
-    /// The index of the record's WINNING occurrence of the key at surviving row
-    /// `i`, or `None` when the record sets the key in no FIELD_DIR column.
-    /// Identical rule to [`DeclaredPlan::winning_idx`]: the highest FIELD_DIR
-    /// type byte wins (the record layer's last-occurrence-wins order,
-    /// docs/log-segment-format.md), and a `Str` cell that is not valid UTF-8 is
-    /// not "present", so it does not shadow the resource/scope fallback. The
-    /// `attrs_raw` overflow tier cannot appear here: a block carrying an
-    /// `attrs_raw` page falls the whole segment back to the row path before this
-    /// builds a column.
-    fn winning_idx(&self, i: usize) -> Option<usize> {
-        winner_at(&self.cols, &self.cursors, i).map(|(k, _)| k)
+    /// The record's WINNING value of the key at surviving row `i`, or `None`
+    /// when the record sets the key in no FIELD_DIR column. Identical rule to
+    /// [`DeclaredPlan::winning_idx`]: the highest FIELD_DIR type byte wins (the
+    /// record layer's last-occurrence-wins order, docs/log-segment-format.md),
+    /// and a `Str` cell that is not valid UTF-8 is not "present", so it does
+    /// not shadow the resource/scope fallback. A plain-page `Str` winner's text
+    /// is the one the presence test validated; a dictionary page's is its
+    /// entry. The `attrs_raw` overflow tier cannot appear here: a block
+    /// carrying an `attrs_raw` page falls the whole segment back to the row
+    /// path before this builds a column.
+    fn winning_cell(&self, i: usize) -> Option<Cell<'a>> {
+        let (win, text) = winner_at(&self.cols, &self.cursors, i)?;
+        match text {
+            Some(text) => Some(Cell::Str(text)),
+            None => self.cursors[win].cell_at(i),
+        }
     }
 }
 
 /// Per-key, per-block resolver for a synthetic attribute column's merged value
 /// rendered as text (issue #1768). Unlike [`DeclaredResolver`], which yields
 /// NULL for a record value whose variant does not match the declared type, this
-/// renders the WINNING value of any variant to text with
-/// [`attr_value_to_string`], reproducing the `attrs` map's own rendering and its
-/// divergence from a declared column. The resource/scope fallback is memoized
-/// per `stream_ref` exactly as `DeclaredResolver` does.
+/// renders the WINNING value of any variant to text, straight from the cursor
+/// ([`Cell::render_into`]) with the text [`attr_value_to_string`] gives the
+/// same value, reproducing the `attrs` map's own rendering and its divergence
+/// from a declared column. The resource/scope fallback is memoized per
+/// `stream_ref` exactly as `DeclaredResolver` does.
 struct AttrKeyResolver<'p, 'a> {
     plan: &'p AttrKeyPlan<'a>,
     fallback: HashMap<u32, Option<String>>,
@@ -2124,35 +2151,38 @@ impl<'p, 'a> AttrKeyResolver<'p, 'a> {
         }
     }
 
-    /// The merged value of the key at surviving row `i`, rendered to text, or
-    /// `None` (NULL) when the key is absent. The record's own winning
-    /// occurrence wins over the resource/scope value; only a record that sets
-    /// the key in no FIELD_DIR column consults the fallback.
-    fn text_at(
+    /// Appends the merged value of the key at surviving row `i` to `b`,
+    /// rendered to text, or NULL when the key is absent. The record's own
+    /// winning occurrence wins over the resource/scope value; only a record
+    /// that sets the key in no FIELD_DIR column consults the fallback.
+    fn append_at(
         &mut self,
         view: &ColumnarBlockView<'_>,
         i: usize,
         cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
-    ) -> DFResult<Option<String>> {
-        if let Some(win) = self.plan.winning_idx(i) {
-            // A winning occurrence is present by construction, so `value_at` is
-            // `Some`; render it to text like the `attrs` map column does.
-            return Ok(self.plan.cursors[win]
-                .value_at(i)
-                .as_ref()
-                .map(attr_value_to_string));
+        b: &mut StringBuilder,
+        scratch: &mut String,
+    ) -> DFResult<()> {
+        if let Some(cell) = self.plan.winning_cell(i) {
+            append_rendered(b, cell, scratch);
+            return Ok(());
         }
         let Some(stream_ref) = view.stream_ref(i) else {
-            return Ok(None);
+            b.append_null();
+            return Ok(());
         };
-        match self.fallback.entry(stream_ref) {
-            std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut().clone()),
+        let text = match self.fallback.entry(stream_ref) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
                 let resource = resource_attrs(view, cache, stream_ref)?;
-                let value = find_attr(resource, &self.plan.key).map(attr_value_to_string);
-                Ok(e.insert(value).clone())
+                e.insert(find_attr(resource, &self.plan.key).map(attr_value_to_string))
             }
+        };
+        match text {
+            Some(text) => b.append_value(text.as_str()),
+            None => b.append_null(),
         }
+        Ok(())
     }
 }
 
@@ -2167,11 +2197,9 @@ fn build_attr_key_columnar_array(
     cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
 ) -> DFResult<ArrayRef> {
     let mut b = StringBuilder::new();
+    let mut scratch = String::new();
     for i in start..end {
-        match resolver.text_at(view, i, cache)? {
-            Some(s) => b.append_value(s),
-            None => b.append_null(),
-        }
+        resolver.append_at(view, i, cache, &mut b, &mut scratch)?;
     }
     Ok(Arc::new(b.finish()))
 }

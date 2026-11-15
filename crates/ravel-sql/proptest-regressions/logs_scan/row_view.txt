@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0c82d37a21c5ba9321432a49c92bd9dc6c7e08e7f68631aa0863a2665c86ad50 # shrinks to case = Case { streams: [([("s", Str("r"))], [("s", Str("q"))]), ([], []), ([], [])], rows: [(0, [("s", Str("x"))]), (1, []), (2, [])], fetch_erasure: [], scan_erasure: [], mask: [false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false], row_refs: false }
+cc a4a3a27b7ab6a9fb4428880a28dd411cd56ed61bb44c1d7b7b4302354b4843c5 # shrinks to case = Case { streams: [([("s", Str("r"))], [("s", Str("q"))]), ([], []), ([], [])], rows: [(0, []), (1, []), (2, []), (0, []), (0, [])], fetch_erasure: [], scan_erasure: [ErasurePredicate { matchers: [("s", "r")], window_start_ns: 0, window_end_ns: 0 }], mask: [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false], row_refs: false }

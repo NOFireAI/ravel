@@ -1032,6 +1032,17 @@ pub struct SqlStats {
     /// off the scans' `str_dict_values_built` counter and summed over every
     /// logs scan in the plan. Zero for a metrics query.
     pub str_dict_values_built: u64,
+    /// Output batches the successful attempt's logs scans built through the
+    /// columnar fast path, straight from a decoded block view (ADR-0099
+    /// decisions 2-3). Read off the scans' `columnar_batches` counter and
+    /// summed over every logs scan in the plan. Zero for a metrics query.
+    pub columnar_batches: u64,
+    /// Output batches the successful attempt's logs scans built through the
+    /// row path: an `attrs` projection, a pending erasure, or a block carrying
+    /// an `attrs_raw` overflow page (ADR-2773 decision D4). Read off the
+    /// scans' `rowpath_batches` counter and summed over every logs scan in
+    /// the plan. Zero for a metrics query.
+    pub rowpath_batches: u64,
     /// This query's spill totals (ADR-0954), read off the executed plan's own
     /// DataFusion counters after the stream stopped, the same way the block
     /// counters above are. All zero on the default configuration, where the
@@ -1375,6 +1386,8 @@ struct BlockCounts {
     contains_cells_tested: u64,
     str_cells_validated: u64,
     str_dict_values_built: u64,
+    columnar_batches: u64,
+    rowpath_batches: u64,
     timing: ScanTiming,
     /// Summed from the counter `RsegScanExec` publishes (crate::scan). Lives
     /// here rather than in a second walk because one traversal already reads
@@ -1398,9 +1411,10 @@ struct BlockCounts {
 /// `segments_skipped_by_threshold` / `int_values_buffers` /
 /// `blocks_predicate_dropped` / `rows_predicate_evaluated` /
 /// `contains_cells_tested` / `str_cells_validated` /
-/// `str_dict_values_built` DataFusion counters over `plan` and its
-/// descendants, plus the metrics scan's `histogram_series_skipped`. Only
-/// `LogsScanExec` publishes the first twelve names (crate::logs_scan) and only `RsegScanExec` the last
+/// `str_dict_values_built` / `columnar_batches` / `rowpath_batches`
+/// DataFusion counters over `plan` and its descendants, plus the metrics
+/// scan's `histogram_series_skipped`. Only `LogsScanExec` publishes the first
+/// fourteen names (crate::logs_scan) and only `RsegScanExec` the last
 /// (crate::scan), so each sum is that scan's total however the optimizer
 /// nested it, and a plan carrying neither scan contributes nothing. The
 /// `segments_pruned_by_key_index` and `blocks_pruned_by_key_index` sums come
@@ -1433,6 +1447,8 @@ fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCoun
         counts.contains_cells_tested += sum("contains_cells_tested");
         counts.str_cells_validated += sum("str_cells_validated");
         counts.str_dict_values_built += sum("str_dict_values_built");
+        counts.columnar_batches += sum("columnar_batches");
+        counts.rowpath_batches += sum("rowpath_batches");
         counts.histogram_series_skipped += sum(crate::scan::HISTOGRAM_SERIES_SKIPPED_METRIC);
         if let Some(figures) = KeyIndexStats::from_metrics(&metrics) {
             counts.key_index.get_or_insert_default().add(&figures);
@@ -2984,6 +3000,8 @@ impl SqlExecutor {
                     stats.contains_cells_tested = blocks.contains_cells_tested;
                     stats.str_cells_validated = blocks.str_cells_validated;
                     stats.str_dict_values_built = blocks.str_dict_values_built;
+                    stats.columnar_batches = blocks.columnar_batches;
+                    stats.rowpath_batches = blocks.rowpath_batches;
                     stats.scan_timing = blocks.timing;
                     stats.wall = PhaseWallTiming {
                         resolve_ns,

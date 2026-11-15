@@ -39,16 +39,17 @@
 
 use std::sync::Arc;
 
+use crate::LogSegError;
 use crate::block::{BytesColRef, DecodedBlock, DictColumn, I64Column};
 use crate::decoded_cache::{DecodedEntry, MemoSource};
 use crate::dict_values::DictValues;
 use crate::field_dir::FieldDir;
 use crate::record::{
-    COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT, COL_SPAN_ID,
-    COL_STREAM_REF, COL_TRACE_ID, COL_TS, FieldType,
+    COL_ATTRS_RAW, COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT,
+    COL_SPAN_ID, COL_STREAM_REF, COL_TRACE_ID, COL_TS, FieldType,
 };
 use crate::stream_dir::StreamDir;
-use ravel_types::logstream::LogStreamId;
+use ravel_types::logstream::{AttrValue, LogStreamId};
 
 /// A dynamic attribute column resolved out of FIELD_DIR: the id to address it
 /// by and the stored type that says which accessor reads it.
@@ -590,6 +591,28 @@ impl<'a> ColumnarBlockView<'a> {
     /// none.
     pub fn span_id(&self, i: usize) -> Option<&'a [u8]> {
         self.bytes_at(COL_SPAN_ID, i)
+    }
+
+    /// Appends surviving row `i`'s `attrs_raw` overflow attributes to `out`,
+    /// in stored order, and returns how many it appended: 0 for a row with no
+    /// overflow cell. These are the entries the row exit appends to a rebuilt
+    /// record's `attrs` after its FIELD_DIR columns, decoded by the same
+    /// decoder, so a corrupt cell is the same `Corrupted` error. Appending to
+    /// a caller's buffer lets a caller decode a batch of rows into one arena.
+    pub fn attrs_raw_into(
+        &self,
+        i: usize,
+        out: &mut Vec<(String, AttrValue)>,
+    ) -> Result<usize, LogSegError> {
+        let Some(raw) = self
+            .row(i)
+            .and_then(|row| self.block.str_at(COL_ATTRS_RAW, row))
+        else {
+            return Ok(0);
+        };
+        let before = out.len();
+        crate::reader::decode_canonical_attrs_into(raw, out)?;
+        Ok(out.len() - before)
     }
 
     // --- stream identity ----------------------------------------------------

@@ -760,6 +760,56 @@ impl LogSegmentScan {
         }
     }
 
+    /// The row path's exit (ADR-2773 decision D4): the block and surviving
+    /// rows [`next_block`](Self::next_block) would rebuild records for, as a
+    /// borrowed view plus the scan's pending erasure predicates, which this
+    /// exit does not apply. A caller excludes, before it builds anything,
+    /// every row [`crate::erasure::log_row_erased`] erases over the row's
+    /// record attributes (the pre-filter `next_block` applies) or over its
+    /// merged view (what [`crate::erasure::retain_unerased_log_records`]
+    /// matches). Same bytes, pruning, `decode` span and exhaustion
+    /// counters as the other exits, and like `next_block` it never touches
+    /// the decoded-column cache.
+    ///
+    /// The view borrows this scan. The decoded block stays resident until
+    /// [`release_block`](Self::release_block) or the next decode.
+    pub fn next_block_view(&mut self) -> Result<RowBlockOutcome<'_>, LogFetchError> {
+        if self.scan.is_some() && self.remaining_blocks() == 0 {
+            self.finish();
+            return Ok(RowBlockOutcome::Exhausted);
+        }
+        let Self {
+            bytes,
+            scan: Some(scan),
+            span,
+            key,
+            erasure,
+            ..
+        } = self
+        else {
+            return Err(self.lost_error());
+        };
+        let entered = span.enter();
+        let decoded = scan.next_block_view(bytes);
+        drop(entered);
+        match decoded.map_err(|source| corrupt(key, source))? {
+            Some(view) => Ok(RowBlockOutcome::Block {
+                view,
+                erasure: erasure.as_slice(),
+            }),
+            // Unreachable, as in `next_block_columnar`.
+            None => Ok(RowBlockOutcome::Exhausted),
+        }
+    }
+
+    /// Frees the block [`next_block_view`](Self::next_block_view) left
+    /// resident.
+    pub fn release_block(&mut self) {
+        if let Some(scan) = self.scan.as_mut() {
+            scan.release_block();
+        }
+    }
+
     /// Records the scan's block counters on the `decode` span, exactly once,
     /// when an exit reports exhaustion or, failing that, when the scan is
     /// dropped (see the `Drop` impl below).
@@ -823,6 +873,21 @@ pub enum ColumnarBlockOutcome<'a> {
     /// out. Nothing was decoded and the cursor did not advance; drain
     /// [`LogSegmentScan::next_block`] instead.
     ErasurePending,
+}
+
+/// What [`LogSegmentScan::next_block_view`] produced.
+#[derive(Debug)]
+pub enum RowBlockOutcome<'a> {
+    /// The next surviving block, as a borrowed view, with the scan's pending
+    /// erasure predicates. No erasure has been applied to the view's rows:
+    /// the caller excludes every row a predicate erases before it builds
+    /// anything from the block.
+    Block {
+        view: ColumnarBlockView<'a>,
+        erasure: &'a [ErasurePredicate],
+    },
+    /// Every surviving block has been decoded.
+    Exhausted,
 }
 
 /// Errors fetching and decoding one RLOG segment. Every variant is a hard

@@ -235,13 +235,13 @@
 //! handed downstream -- and released as each goes away, so the pool bounds
 //! concurrently-held scan memory rather than cumulative bytes emitted.
 //!
-//! The two batch-building paths hold different things, and each charges what it
-//! actually holds. The row path's [`ravel_logseg::BlockScan::next_block`] drops
-//! the decoded block before it returns, so what remains resident is the
-//! `Vec<LogRecord>` it built ([`records_memory`]) plus the batch handed
-//! downstream. The columnar path's `next_block_columnar` hands out a view
-//! *borrowing* the decoded block, which the reader releases only when the next
-//! block is decoded, so the block stays resident alongside the Arrow batches
+//! Both batch-building paths build from a view *borrowing* the decoded block
+//! and charge what they actually hold. The row path's
+//! [`LogSegmentScan::next_block_view`] block is charged in
+//! `LogScanStream::resident` while its job builds the block's batches, then
+//! released with its charge before the job returns, so what remains is the
+//! batches. The columnar path's `next_block_columnar` view stays resident until
+//! the next block is decoded, so the block stays alongside the Arrow batches
 //! built from it. The two are charged separately: the batches when they are
 //! held ([`LogScanStream::hold_batches`]) and released as they are emitted, the
 //! decoded block in `LogScanStream::resident` until the decode that replaces it
@@ -412,7 +412,7 @@ use ravel_query::key_index_route::{
 use ravel_query::{
     CarriedWholeObject, ColumnarBlockOutcome, KeyEquals, KeyIn, KeyIndexPruning, LogFetchError,
     LogLeafRangeReader, LogQuery, LogSegmentFetcher, LogSegmentScan, PhaseAccounting,
-    log_key_in_set, log_key_set,
+    RowBlockOutcome, log_key_in_set, log_key_set,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -429,9 +429,7 @@ use crate::logs_schema::{
     LOG_COL_SEVERITY_NUM, LOG_COL_SEVERITY_TEXT, LOG_COL_SPAN_ID, LOG_COL_TRACE_ID, LOG_COL_TS,
     SPAN_ID_WIDTH, TRACE_ID_WIDTH, attr_key_field_name,
 };
-use crate::rlog_attrs::{
-    attr_value_to_string, decode_stream_attrs, find_attr, merged_attrs, retain_unerased,
-};
+use crate::rlog_attrs::{attr_value_to_string, decode_stream_attrs, find_attr, merged_attrs};
 use crate::scan_budget::ScanBudget;
 use ravel_logseg::record::canonical_value_bytes;
 
@@ -440,6 +438,7 @@ mod limit_hint;
 mod partition_topk;
 mod plan;
 mod row_filter;
+mod row_view;
 mod scan;
 mod threshold;
 
@@ -448,6 +447,7 @@ pub(crate) use plan::ScanExecutions;
 use plan::*;
 pub(crate) use row_filter::RowFilters;
 use row_filter::{BoundRowFilters, filter_batches};
+use row_view::*;
 use scan::*;
 use threshold::*;
 
@@ -489,6 +489,18 @@ fn rows_usize(rows: u64) -> usize {
 /// with a larger target is still emitted in pieces of at most this many rows, so
 /// one batch's Arrow footprint stays bounded whatever the writer chose.
 const BATCH_ROWS: usize = 8192;
+
+/// Merged row views the row path built on this thread, one per row it kept.
+#[cfg(test)]
+pub(crate) fn row_views_built_on_this_thread() -> u64 {
+    row_view::ROW_VIEWS_BUILT.with(std::cell::Cell::get)
+}
+
+/// Records the record-based batch build ([`build_batch`]) read on this thread.
+#[cfg(test)]
+pub(crate) fn records_batched_on_this_thread() -> u64 {
+    batch::RECORDS_BUILT.with(std::cell::Cell::get)
+}
 
 /// Rough resident size of a decoded record in row form, for the memory
 /// reservation.
@@ -593,7 +605,7 @@ impl ResolvedColumns {
 ///   reads as absent, i.e. as not matching, i.e. as dropped rows;
 /// - every attribute key a **pending erasure predicate** names, at record level
 ///   for the fetcher's own filter and at merged resource/scope/record level for
-///   [`retain_unerased`] here (ADR-0064). A key the selection omits makes an
+///   [`build_row_view_batches`] here (ADR-0064). A key the selection omits makes an
 ///   erased row reappear.
 /// - every **declared typed attribute column** the projection names (ADR-0090
 ///   decision 4). A declared column occupies a schema index at or above
@@ -2999,7 +3011,7 @@ impl LogsScanExec {
     ///
     /// The one refusal is a pending selective erasure. A row-ref addresses a
     /// row by its position in the block's surviving-row list, and the scan
-    /// layer's erasure exclusion ([`retain_unerased`]) removes rows from that
+    /// layer's erasure exclusion ([`build_row_view_batches`]) removes rows from that
     /// list after the reader produced it, so the position a phase-1 row
     /// carries would not be the position phase 2 reads. Refusing is also the
     /// fail-closed direction: the failure mode of getting erasure wrong is an
@@ -3668,7 +3680,6 @@ impl ExecutionPlan for LogsScanExec {
             current_seg_ordinal: 0,
             block_cursor: 0,
             consecutive_fallbacks: 0,
-            pending_range: None,
             current_indices: Vec::new(),
             current_survivors: None,
             current_footer: None,
@@ -3866,9 +3877,6 @@ struct LogScanStream {
     /// (`MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS + 1`) instead of one per
     /// overflowing block.
     consecutive_fallbacks: usize,
-    /// The address the row-path batch builder stamps from while draining the
-    /// held block. `None` when this scan emits no row refs.
-    pending_range: Option<RowRefRange>,
     /// The surviving-block index list this partition owns for [`Self::
     /// current_seg`], kept so the `attrs_raw` fallback re-opens the row path
     /// over the SAME list (ADR-0102). Set alongside `current_seg`.

@@ -1507,6 +1507,112 @@ mod tests {
         );
     }
 
+    /// ADR-2773 decision D4: a statement projecting `attrs` takes the row path
+    /// and builds the `attrs` map of every one of its N rows from the decoded
+    /// block, rebuilding no `LogRecord` and running no record-based batch
+    /// build. The merged-view count is the positive control that the build
+    /// ran on this thread (a `current_thread` runtime), so the zero record
+    /// counts are not counts taken on the wrong thread; rebuilding the same
+    /// object's records through the record exit afterwards counts all N, so
+    /// the record counter counts.
+    #[tokio::test]
+    async fn row_path_builds_the_attrs_map_without_a_log_record_per_row() {
+        const N: usize = 50;
+        let store = MemoryStore::new();
+        let resource = vec![("service.name".to_string(), s("api"))];
+        let records: Vec<LogRecord> = (0..N as i64)
+            .map(|ts| {
+                record(
+                    &resource,
+                    &[("k".to_string(), s(&format!("v{ts}")))],
+                    ts,
+                    "b",
+                )
+            })
+            .collect();
+        let seg = write_object(&store, "logs/row-path.rlog", &records).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            LogSegmentFetcher::new(store),
+            PhaseAccounting::new(),
+        );
+        let ctx = logs_session(provider).expect("build session");
+
+        let rebuilt = ravel_logseg::reader::records_rebuilt_on_this_thread();
+        let views = crate::logs_scan::row_views_built_on_this_thread();
+        let batched = crate::logs_scan::records_batched_on_this_thread();
+        let batches = ctx
+            .sql("SELECT ts, attrs FROM logs")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("collect");
+        let entries: usize = batches
+            .iter()
+            .map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::MapArray>()
+                    .expect("attrs map")
+                    .keys()
+                    .len()
+            })
+            .sum();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), N);
+        assert_eq!(entries, 2 * N, "service.name and k on every row");
+        assert_eq!(
+            crate::logs_scan::row_views_built_on_this_thread() - views,
+            N as u64,
+            "the row path built one merged view per row on this thread"
+        );
+        assert_eq!(
+            ravel_logseg::reader::records_rebuilt_on_this_thread() - rebuilt,
+            0,
+            "no LogRecord rebuilt"
+        );
+        assert_eq!(
+            crate::logs_scan::records_batched_on_this_thread() - batched,
+            0,
+            "no record-based batch build"
+        );
+
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        for r in &records {
+            w.push(r.clone()).expect("push");
+        }
+        let bytes = w.finish().expect("finish");
+        let reader = ravel_logseg::RlogReader::new(&bytes, &RlogConfig::default()).expect("open");
+        let mut scan = reader
+            .scan_blocks(
+                &ravel_logseg::Predicate::TsRange {
+                    min_ns: 0,
+                    max_ns: i64::MAX,
+                },
+                &[],
+                &ravel_logseg::ColumnSelection::all(),
+            )
+            .expect("scan");
+        let before = ravel_logseg::reader::records_rebuilt_on_this_thread();
+        let mut rebuilt_by_record_exit = 0;
+        while let Some(block) = scan.next_block(&bytes).expect("decode") {
+            rebuilt_by_record_exit += block.len();
+        }
+        assert_eq!(rebuilt_by_record_exit, N);
+        assert_eq!(
+            ravel_logseg::reader::records_rebuilt_on_this_thread() - before,
+            N as u64,
+            "the record exit counts every record it rebuilds"
+        );
+    }
+
     /// (ADR-0064): a subject named ONLY in a RESOURCE/scope
     /// (`stream_attrs`) attribute must also be excluded. The `attrs` column
     /// materializes the merged resource + scope + record view, so `user_id` is

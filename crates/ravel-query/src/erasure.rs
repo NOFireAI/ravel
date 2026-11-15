@@ -151,18 +151,18 @@ impl ErasurePredicate {
     /// attributes. Only string-valued attributes can satisfy an (equality)
     /// matcher; a non-string attribute never matches a v1 predicate value.
     pub fn matches_log_attrs(&self, attrs: &[(String, AttrValue)]) -> bool {
-        self.matchers_satisfied(|k| {
-            attrs.iter().find_map(|(ak, av)| {
-                if ak == k {
-                    match av {
-                        AttrValue::Str(s) => Some(s.as_str()),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            })
-        })
+        self.matches_log_entries(|| attrs.iter().map(log_entry))
+    }
+
+    /// [`matches_log_attrs`](Self::matches_log_attrs) over borrowed entries,
+    /// in order: each item is a key and its value's text when the value is a
+    /// string, `None` otherwise. A matcher on key `k` reads the first
+    /// string-valued entry named `k`. `entries` is called once per matcher.
+    pub fn matches_log_entries<'a, I>(&self, entries: impl Fn() -> I) -> bool
+    where
+        I: Iterator<Item = (&'a str, Option<&'a str>)>,
+    {
+        self.matchers_satisfied(|k| entries().find_map(|(ek, ev)| if ek == k { ev } else { None }))
     }
 
     /// Whether this predicate's conjunction matches a set of decoded
@@ -355,11 +355,36 @@ pub fn retain_log_records(records: &mut Vec<LogRecord>, predicates: &[ErasurePre
     if predicates.is_empty() {
         return;
     }
-    records.retain(|r| {
-        !predicates
-            .iter()
-            .any(|p| p.matches_log_attrs(&r.attrs) && (!p.has_window() || p.ts_in_window(r.ts_ns)))
-    });
+    records.retain(|r| !log_row_erased(predicates, r.ts_ns, || r.attrs.iter().map(log_entry)));
+}
+
+/// Whether any predicate erases a log row (ADR-0064 decision 2): its
+/// conjunction matches the row's attribute entries (as
+/// [`ErasurePredicate::matches_log_entries`] reads them) and, when the
+/// predicate is windowed, `ts_ns` falls in the window. The one rule both
+/// [`retain_log_records`] (over record attributes) and
+/// [`retain_unerased_log_records`] (over the merged view) apply, exposed for a
+/// reader that holds a row's entries without a [`LogRecord`].
+pub fn log_row_erased<'a, I>(
+    predicates: &[ErasurePredicate],
+    ts_ns: i64,
+    entries: impl Fn() -> I,
+) -> bool
+where
+    I: Iterator<Item = (&'a str, Option<&'a str>)>,
+{
+    predicates
+        .iter()
+        .any(|p| p.matches_log_entries(&entries) && (!p.has_window() || p.ts_in_window(ts_ns)))
+}
+
+/// A `(key, value)` attribute as a [`log_row_erased`] entry.
+fn log_entry((k, v): &(String, AttrValue)) -> (&str, Option<&str>) {
+    let text = match v {
+        AttrValue::Str(s) => Some(s.as_str()),
+        _ => None,
+    };
+    (k.as_str(), text)
 }
 
 /// The top-level resource and scope attributes of a `stream_attrs` blob, as
@@ -427,10 +452,7 @@ pub fn retain_unerased_log_records_by<T>(
     for item in std::mem::take(items) {
         let r = record(&item);
         let merged = merged_log_attrs(r)?;
-        let erased = predicates
-            .iter()
-            .any(|p| p.matches_log_attrs(&merged) && (!p.has_window() || p.ts_in_window(r.ts_ns)));
-        if !erased {
+        if !log_row_erased(predicates, r.ts_ns, || merged.iter().map(log_entry)) {
             survivors.push(item);
         }
     }
