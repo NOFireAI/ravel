@@ -2132,8 +2132,9 @@ enum InspectCommand {
         key: String,
     },
     /// Verify per-part key-index leaves (`.kidx`, ADR-2707 decision 4):
-    /// decode every bucket frame and print every header field, the
-    /// bucket-size distribution and, with `--entries`, every entry. Several
+    /// decode every bucket frame and print every header field (the entry
+    /// kind among them), the bucket-size distribution and, with
+    /// `--entries`, every entry or, for a posting leaf, every posting. Several
     /// keys must be the slices of one (part, field): same identity, same
     /// uncovered entries, tiling the key space. A leaf or set that fails any
     /// check exits non-zero with the typed error and prints no report.
@@ -2142,7 +2143,7 @@ enum InspectCommand {
         #[arg(required = true)]
         keys: Vec<String>,
         /// Also print every entry: its bucket, key8, entry ordinal and
-        /// block list.
+        /// block list; for a posting leaf, its bucket, key8 and values.
         #[arg(long)]
         entries: bool,
     },

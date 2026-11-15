@@ -12,6 +12,16 @@
 //! [`Catalog::probe_key_index_leaf_set_with`]) has no production caller;
 //! tests use it as the one-slice-at-a-time reference. The object key is the
 //! caller's to fill in on the returned [`SnapshotKeyIndexLeafRef`].
+//!
+//! Version 3 (ADR-4146 decision 5) adds the header `entry_kind` and the
+//! posting (entry kind 1) of the metrics series index. Its encoder
+//! ([`encode_key_index_posting_leaf`], [`split_key_index_postings`]) and
+//! decoders ([`KeyIndexLeafPrefix::probe_posting_bucket`],
+//! [`KeyIndexSetPlan::posting_decoder`],
+//! [`verify_key_index_posting_leaf_frames`]) have no production caller yet:
+//! no fold writes a posting leaf and no router reads one. What production
+//! reaches is the version gate and the `entry_kind` check every prefix
+//! parse runs, and `verify_key_index_leaf` behind `ravel-cli inspect kidx`.
 
 use std::future::Future;
 use std::ops::Range;
