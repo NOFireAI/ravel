@@ -18,7 +18,7 @@ pub use column_stats::{
 };
 pub(crate) use column_stats::{SegmentMeter, decode_column_stats_streamed};
 #[cfg(test)]
-pub use column_stats::{encode_column_stats, encode_column_stats_v2};
+pub use column_stats::{encode_column_stats, encode_column_stats_v2, frame_column_stats};
 pub use error::{CatalogPartKind, NewerPartVersion, SnapshotFormatError};
 pub use head::{
     HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSION_2, HEAD_FORMAT_VERSIONS, decode_head, encode_head,
@@ -51,6 +51,8 @@ pub use kidx::{
     split_key_index_postings, verify_key_index_leaf, verify_key_index_leaf_frames,
     verify_key_index_posting_leaf_frames,
 };
+#[cfg(test)]
+pub use part::encode_part_ranged_unvalidated;
 pub use part::{DecodedPart, decode_part, decode_part_header, encode_part, encode_part_ranged};
 pub use postings::{
     DecodedPostings, NamePostings, decode_postings, decode_postings_header, encode_postings,

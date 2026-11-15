@@ -63,7 +63,48 @@ pub fn encode_part_ranged(
     entries: &[SnapshotEntry],
 ) -> Result<Vec<u8>, SnapshotFormatError> {
     validate_entries(entries, min_hour, watermark_hour)?;
+    frame_part(
+        tenant_hash,
+        signal,
+        shard_count,
+        min_hour,
+        watermark_hour,
+        entries,
+    )
+}
 
+/// [`encode_part_ranged`] with NO entry validation, so a test can store a
+/// well-framed part carrying an entry a newer build writes (a level above
+/// this build's set), which every validating writer refuses.
+#[cfg(test)]
+pub fn encode_part_ranged_unvalidated(
+    tenant_hash: [u8; 16],
+    signal: u32,
+    shard_count: u32,
+    min_hour: u32,
+    watermark_hour: u32,
+    entries: &[SnapshotEntry],
+) -> Result<Vec<u8>, SnapshotFormatError> {
+    frame_part(
+        tenant_hash,
+        signal,
+        shard_count,
+        min_hour,
+        watermark_hour,
+        entries,
+    )
+}
+
+/// The envelope framing of [`encode_part_ranged`], over entries the caller
+/// has already validated.
+fn frame_part(
+    tenant_hash: [u8; 16],
+    signal: u32,
+    shard_count: u32,
+    min_hour: u32,
+    watermark_hour: u32,
+    entries: &[SnapshotEntry],
+) -> Result<Vec<u8>, SnapshotFormatError> {
     let mut entries_raw = Vec::new();
     for entry in entries {
         entries_raw.extend_from_slice(&entry.encode_length_delimited_to_vec());
