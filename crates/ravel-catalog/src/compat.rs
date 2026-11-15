@@ -513,8 +513,8 @@ where
     let mut after = before.clone();
     change(&mut after)?;
     after.format_version = COMPAT_FORMAT_VERSION;
-    validate(&after)?;
     check_monotone(&before, &after)?;
+    validate(&after)?;
     seal(&mut after, keys);
     let opts = PutOptions {
         mode: PutMode::CasVersion(version),
@@ -915,6 +915,7 @@ mod tests {
 
     fn baseline_record() -> sysproto::CompatRecord {
         sysproto::CompatRecord {
+            format_version: COMPAT_FORMAT_VERSION,
             baseline_release_major: 0,
             baseline_release_minor: 34,
             families: vec![
