@@ -2835,10 +2835,11 @@ fn render_ingest_shard_family(out: &mut String, mode: Mode, pipelines: &[IngestP
 /// Keyed log and span writes refused because an idempotency marker lookup
 /// probe failed with a store error (issue #2462), read from the process-global
 /// counters in [`crate::logs_ingest`], and the marker probe GETs those lookups
-/// issued, read from [`ravel_ingest::idempotency_probe_gets`]. Rendered only
-/// for the logs and spans
-/// pipelines this process runs: metrics take no idempotency key, so that
-/// sample is structurally absent, not zero.
+/// issued, read from [`ravel_ingest::idempotency_probe_gets`], and the keyed
+/// writes refused because their marker was written by a newer build, read from
+/// [`ravel_ingest::idempotency_newer_marker_refusals`]. Rendered only for the
+/// logs and spans pipelines this process runs: metrics take no idempotency
+/// key, so that sample is structurally absent, not zero.
 fn render_idempotency_lookup_family(
     out: &mut String,
     mode: Mode,
@@ -2880,6 +2881,21 @@ fn render_idempotency_lookup_family(
             PROBES,
             &[Label::Mode(mode), Label::Signal(signal)],
             ravel_ingest::idempotency_probe_gets(signal),
+        );
+    }
+    const NEWER: &str = "ravel_ingest_idempotency_newer_marker_refusals_total";
+    write_header(
+        out,
+        NEWER,
+        "Keyed log and span writes refused with a retryable 503 / UNAVAILABLE because the newest idempotency marker found for the key was written by a newer build (marker version above the one this build reads), by signal. Not counted in ravel_ingest_idempotency_lookup_failures_total. None of the request's data is written.",
+        "counter",
+    );
+    for &signal in &signals {
+        write_sample(
+            out,
+            NEWER,
+            &[Label::Mode(mode), Label::Signal(signal)],
+            ravel_ingest::idempotency_newer_marker_refusals(signal),
         );
     }
 }
@@ -10523,6 +10539,116 @@ pub fn router(state: MetricsState) -> Router {
         .with_state(state)
 }
 
+/// A scrape of the real `/metrics` handler for tests elsewhere in the crate
+/// that need a rendered family after driving an ingest handler.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) mod scrape_test_support {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse as _;
+    use ravel_catalog::{Catalog, CatalogConfig};
+    use ravel_ingest::{AdmissionController, AdmissionLimits, LogIngestRouter, SpanIngestRouter};
+    use ravel_ingest::{IngestByteBudget, IngestByteBudgetLimit, SystemClock};
+    use ravel_memory::MemoryBudget;
+    use ravel_object_store::StoreMetrics;
+    use ravel_object_store::memory::MemoryStore;
+
+    use super::{MetricsState, QueryAccountingMetrics, metrics_handler};
+    use crate::config::Mode;
+
+    /// The `/metrics` body of a gateway process whose log and span pipelines
+    /// are `logs` and `spans`, every other source left absent.
+    pub(crate) async fn scrape_gateway(
+        logs: Arc<LogIngestRouter>,
+        spans: Arc<SpanIngestRouter>,
+    ) -> String {
+        let catalog = Arc::new(
+            Catalog::new(Arc::new(MemoryStore::new()), CatalogConfig::default()).expect("catalog"),
+        );
+        let state = MetricsState {
+            mode: Mode::Gateway,
+            store_metrics: Arc::new(StoreMetrics::default()),
+            ingest_router: None,
+            log_ingest_router: Some(logs),
+            span_ingest_router: Some(spans),
+            catalog,
+            tenant_discovery: None,
+            maintenance_safety: None,
+            maintenance_ownership: None,
+            merge_memory: None,
+            scrub: None,
+            cache_metrics: None,
+            cache_disk_metrics: None,
+            catalog_cache_metrics: None,
+            catalog_cache_disk_metrics: None,
+            admission: Arc::new(AdmissionController::new(
+                Arc::new(SystemClock),
+                AdmissionLimits::default(),
+            )),
+            reconcile_cycle: Arc::new(crate::admission_reconcile::ReconcileCycleMetrics::default()),
+            metrics_tenant_labels: false,
+            metrics_tenant_allowlist: Arc::new(HashSet::new()),
+            query_accounting: Arc::new(QueryAccountingMetrics::new(HashSet::new())),
+            ingest_concurrency: crate::ingest_concurrency::IngestConcurrencyController::shared(
+                crate::ingest_concurrency::IngestConcurrencyLimit::Unlimited,
+            ),
+            ingest_buffer_budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
+            distrib: None,
+            #[cfg(feature = "flight-sql")]
+            sql_slice_rejects: None,
+            #[cfg(feature = "flight-sql")]
+            sql_slice_tls_dials: None,
+            #[cfg(feature = "agents")]
+            agents: None,
+            durable_auth: None,
+            ingest_byte_metrics: Arc::new(crate::ingest_byte_metrics::IngestByteMetrics::new()),
+            normalize_reject_metrics: Arc::new(
+                crate::normalize_reject_metrics::NormalizeRejectMetrics::new(),
+            ),
+            metadata_cache: None,
+            cache: None,
+            cache_max_bytes: 0,
+            catalog_cache_max_bytes: 0,
+            audit_pipeline: None,
+            process_memory_budget: Arc::new(MemoryBudget::unlimited()),
+            process_memory_budget_is_fallback: false,
+            cpu_gates: crate::cpu_gates::CpuGates::new(Default::default()),
+            can_fold: false,
+            fold_loop: Default::default(),
+            refold: Arc::new(crate::fold::RefoldQueue::new(1)),
+            heartbeat: crate::health_listener::Heartbeat::new(Arc::new(SystemClock)),
+            decoded_cache: None,
+        };
+        let response = metrics_handler(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        String::from_utf8(bytes.to_vec()).expect("metrics body is utf8")
+    }
+
+    /// The value of the one sample whose line starts with `series` followed
+    /// by a space; panics unless exactly one such line exists.
+    pub(crate) fn sample_value(body: &str, series: &str) -> u64 {
+        let prefix = format!("{series} ");
+        let values: Vec<u64> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix(&prefix))
+            .map(|value| value.parse().expect("integer sample"))
+            .collect();
+        assert_eq!(
+            values.len(),
+            1,
+            "{series} must render exactly once:\n{body}"
+        );
+        values[0]
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -12270,6 +12396,7 @@ mod tests {
         for name in [
             "ravel_ingest_idempotency_lookup_failures_total",
             "ravel_ingest_idempotency_probe_gets_total",
+            "ravel_ingest_idempotency_newer_marker_refusals_total",
         ] {
             assert_eq!(body.matches(&format!("# TYPE {name} counter")).count(), 1);
             for signal in ["logs", "spans"] {
