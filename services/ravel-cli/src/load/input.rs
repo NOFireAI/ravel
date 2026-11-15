@@ -64,9 +64,7 @@ pub(super) fn footer_batch_bytes(metadata: &ArrowReaderMetadata, batch_rows: usi
     if rows == 0 {
         return 0;
     }
-    bytes
-        .div_ceil(rows)
-        .saturating_mul(batch_rows as u64)
+    bytes.div_ceil(rows).saturating_mul(batch_rows as u64)
 }
 
 /// Resolve `--read-cursors` (issue #560): absent means auto-sized to

@@ -2172,39 +2172,60 @@ the `--read-cursors` cursors, and building those rows into a columnar batch
 cursors and deals every batch's rows in the same order as before. The builds
 run on `--decode-workers` threads (W), and the built batches are handed to the
 shard writers strictly in the order they were dealt, so the batch sequence the
-writers see, and the objects they write, are the same at any W. A rejected
-row ends the sequence at the same point too: every batch dealt before it is
-handed on, and nothing after it. `1` builds on the decode thread
-itself, the pipeline before this flag. Unset, W is one worker per four
-available cores, at least 1 (`available_parallelism / 4`, from ADR-4203's
-stage 0 split of about one core of build per four of flush encode), so a
-four-core host keeps one worker. `0` is rejected. Metrics and spans loads have
-no build stage to spread; they ignore the flag and warn when it is set.
+writers see is the same at any W. A rejected row ends the sequence at the same
+point too: every batch dealt before it is handed on, and nothing after it.
 
-Each batch's estimated size is charged to `--load-memory-bytes` before its
-build starts, at the bytes per row of the last batch handed on; the first batch
-builds alone, since nothing has measured a batch yet. At most W batches are
-dealt and not yet handed on at once, and fewer when the budget holds fewer
-estimated batches. The batch next in line waits for its charge; a later batch
-is built only if its charge fits now. When a batch is handed on, its charge is
-corrected to its built size. One exception keeps the oldest batch from being
-starved: if it outgrew its estimate and the growth does not fit while later
-batches hold their estimates, those estimates are refunded, and each later
-batch is charged its full built size when its turn comes instead.
+The objects written are the same at any W only when the memory budget places
+no flush boundary: with an explicit `--pipeline-depth` and
+`--load-memory-bytes`, or with a per-batch `--target-bytes`. Otherwise W can
+change them in two ways. A derived budget is host memory less the floor, and
+the floor grows with W (below), so a larger W can lower the memory-derived
+pipeline depth. And W changes how fast the decoder fills the budget, so it
+changes when the stall flusher, which flushes the shard buffers while the
+decoder waits for memory, fires.
+
+`1` builds on the decode thread itself, the pipeline before this flag. Unset,
+W is one worker per four available cores, at least 1
+(`available_parallelism / 4`), so a four-core host keeps one worker. The ratio
+is derived from the measured CPU share of a load, `build_columnar_batch` at
+17.7% against 70.5% for flush encode, about one core of build per four of
+encode, and is a starting point rather than a tuned value. When the budget is
+derived from host memory, the unset default is then capped: it is lowered to
+the largest W whose floor leaves the budget room for one batch, estimated
+before any batch is built as the Parquet footer's uncompressed bytes per row
+times `--batch-rows`, and to 1 when no W does. An explicit W is not lowered.
+`0` is rejected on every signal. Metrics and spans loads have no build stage
+to spread; they ignore any other value and warn when it is set.
+
+Every batch being built or held carries a charge on `--load-memory-bytes`, on
+every path. Its estimated size is charged before its build starts, at the
+bytes per row of the last batch handed on; the first batch builds alone, since
+nothing has measured a batch yet. At most W batches are dealt and not yet
+handed on at once, and fewer when the budget holds fewer estimated batches.
+The batch next in line waits for its charge; a later batch is built only if
+its charge fits now. When a batch is handed on, its charge is resized to its
+built size, and no charge is refunded while its batch exists. If the oldest
+batch outgrew its estimate and its built size cannot fit beside the later
+batches' estimates, the later batches' built outputs are dropped, their
+charges refunded, and they are rebuilt from their rows after it, so the
+oldest batch waits only on batches already handed on and is admitted alone
+when it is larger than the budget.
 
 A batch's rows are views into its cursors' decoded Arrow, so a batch keeps up
-to K cursor buffers alive until its build ends. The memory floor counts them
-per worker: `128 MiB + W * K * 32 MiB + F * 72 MiB`, where K is the cursor
-count and F the concurrent flushes. Built batches are inside the budget, so
-the load's high-water mark is the floor plus the budget.
+to K cursor buffers alive until it is handed on (past its build, so that it
+can be rebuilt). The memory floor counts them per worker:
+`128 MiB + W * K * 32 MiB + F * 72 MiB`, where K is the cursor count and F
+the concurrent flushes. Built batches are charged to the budget, so the
+load's high-water mark is the floor plus the budget, plus however far
+batches not yet handed on exceed their estimates; a batch larger than the
+budget is admitted alone.
 
 The load summary prints `decode_wait` and `write_wait` once each, in seconds,
 and the report JSON carries them as `decode_wait_ms` and `write_wait_ms`
 (logs loads only). `decode_wait` is the time the submit loop waited for the
 decode stage's next batch; `write_wait` is the time it spent blocked resolving
-an in-flight write. This change claims no wall-time effect: the build now runs on W
-workers, and ADR-4203's ClickBench benchmark measures what that buys on a
-real corpus.
+an in-flight write. This change claims no wall-time effect: the build runs on
+W workers, and epic #4203 measures what that buys on a real corpus.
 
 ## Metrics (self-observability)
 

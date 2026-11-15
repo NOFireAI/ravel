@@ -125,7 +125,8 @@ pub struct LoadMemoryOptions {
     /// `on_geometry`: the load advances its clock before each batch.
     pub hour_stride: Option<Arc<HourStrideLane>>,
     /// `--decode-workers`, carried here for the same reason as
-    /// `on_geometry`; `None` is [`crate::load::default_decode_workers`].
+    /// `on_geometry`; `None` is [`crate::load::default_decode_workers`]
+    /// capped by [`LoadMemory::cap_decode_workers`].
     pub decode_workers: Option<usize>,
 }
 
@@ -426,10 +427,7 @@ mod tests {
             },
             LoadMemoryRequest::Unbudgeted,
         ] {
-            assert_eq!(
-                LoadMemory::cap_decode_workers(request, 16, 8, 16, batch),
-                8
-            );
+            assert_eq!(LoadMemory::cap_decode_workers(request, 16, 8, 16, batch), 8);
         }
     }
 

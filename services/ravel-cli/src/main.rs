@@ -735,17 +735,28 @@ enum Command {
         /// and deals every batch's rows in the same order as before; the
         /// batches' builds (mapping the rows into columnar batches) run on
         /// this many workers, and the built batches are handed to the shard
-        /// writers in the order they were dealt, so the objects written are
-        /// the same at any value. `1` builds on the decode thread itself,
-        /// the pipeline before this flag. Defaults to one worker per four
-        /// available cores, at least 1 (`available_parallelism / 4`). At
-        /// most this many batches are dealt and not yet handed on at once,
-        /// each charged to `--load-memory-bytes` before its build starts, and
-        /// fewer when that budget holds fewer estimated batches; the first
-        /// batch builds alone. Each such batch keeps its cursors' decoded
-        /// Arrow alive while it builds, so the memory floor counts
-        /// `--read-cursors` buffers per worker. Metrics and spans loads
-        /// ignore it. `0` is rejected.
+        /// writers in the order they were dealt, so the batch sequence is the
+        /// same at any value. The objects written are the same only when the
+        /// memory budget places no flush boundary: with an explicit
+        /// `--pipeline-depth` and `--load-memory-bytes`, or a per-batch
+        /// `--target-bytes`. Otherwise a derived budget shrinks as workers
+        /// raise the memory floor, which can change the memory-derived
+        /// pipeline depth, and the worker count changes when a stalled
+        /// decoder flushes the shard buffers. `1` builds on the decode thread
+        /// itself, the pipeline before this flag. Defaults to one worker per
+        /// four available cores (`available_parallelism / 4`), at least 1,
+        /// a starting point derived from the measured CPU share of a load
+        /// (batch build 17.7%, flush encode 70.5%); with the budget derived
+        /// from host memory, the default is then lowered until the floor
+        /// leaves the budget room for one batch, estimated from the Parquet
+        /// footer's uncompressed bytes per row. An explicit value is not
+        /// lowered. At most this many batches are dealt and not yet handed on
+        /// at once, each charged to `--load-memory-bytes` before its build
+        /// starts, and fewer when that budget holds fewer estimated batches;
+        /// the first batch builds alone. Each such batch keeps its cursors'
+        /// decoded Arrow alive until it is handed on, so the memory floor
+        /// counts `--read-cursors` buffers per worker. Metrics and spans loads
+        /// ignore it and warn. `0` is rejected on every signal.
         #[arg(long, value_name = "W")]
         decode_workers: Option<usize>,
         /// The object-size setting: the estimated UNCOMPRESSED content a

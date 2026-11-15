@@ -259,8 +259,15 @@ async fn one_and_four_decode_workers_write_the_same_objects() {
             one_rows, total as u64,
             "{geometry:?}: the one-worker load wrote every row"
         );
-        assert_eq!(four_rows, one_rows, "{geometry:?}: both wrote the same rows");
-        assert!(one.len() > 2, "{geometry:?}: several objects: {}", one.len());
+        assert_eq!(
+            four_rows, one_rows,
+            "{geometry:?}: both wrote the same rows"
+        );
+        assert!(
+            one.len() > 2,
+            "{geometry:?}: several objects: {}",
+            one.len()
+        );
         assert_eq!(
             four.len(),
             one.len(),
