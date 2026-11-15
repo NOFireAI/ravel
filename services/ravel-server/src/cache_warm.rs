@@ -27,7 +27,8 @@
 //!
 //! The logs metadata pass (ADR-4203 decision 8) is not bounded by that part
 //! cap, and runs only after every tenant's whole-part warm has finished, so
-//! it never takes deadline time or cache room from that warm. For every logs
+//! it spends only the deadline time that warm leaves, and its ceiling counts
+//! the bytes that warm left resident. For every logs
 //! object in the resolved window that the query path plans from its
 //! directories (above [`LogSegmentFetcher::plan_whole_object_bound`]), it
 //! reads the footer and the four directories (STREAM_DIR, FIELD_DIR,
@@ -37,15 +38,16 @@
 //! does not hold whole, one coalesced read of the missing SKIP_IDX and
 //! PAGE_DIR and one of the missing STREAM_DIR and FIELD_DIR. Those are the
 //! extents and cache keys an unkeyed plan read of the same object uses. A
-//! keyed plan (a statement with key-equality arms) reads the same probe key,
-//! but also reads KEY_IDX and the BLOOM and POSTINGS sections its filter
-//! needs, none of which the pass warms, and coalesces the missing BLOOM and
-//! POSTINGS into its SKIP_IDX and PAGE_DIR read: when SKIP_IDX or PAGE_DIR
-//! lies outside the probe beside them, that read's extent differs from the
-//! warmed one and misses the cache. The pass reads no column page. It stops admitting objects once the read cache's resident
-//! bytes plus the objects in flight would pass
-//! [`METADATA_CACHE_SHARE_DIVISOR`]'s share of the cache budget, and runs at
-//! most the store GET concurrency's permit count of objects at once.
+//! keyed plan (`fetch_keyed_plan`, a statement with key-equality arms) hits
+//! the same probe key, but also reads KEY_IDX and the BLOOM and POSTINGS
+//! sections its filter needs, none of which the pass warms. A BLOOM or
+//! POSTINGS section outside the probe and within the coalesce gap of the
+//! missing SKIP_IDX and PAGE_DIR joins them in one read, whose extent then
+//! differs from the warmed one and misses the cache. The pass reads no column
+//! page. It stops admitting objects once the read cache's resident bytes plus
+//! the probes in flight would pass [`METADATA_CACHE_SHARE_DIVISOR`]'s share of
+//! the cache budget, and runs at most the store GET concurrency's permit count
+//! of objects at once.
 //!
 //! Every failure degrades to "warm less than planned," never to a startup
 //! failure: tenant discovery erroring, a resolve erroring, a fetch erroring,

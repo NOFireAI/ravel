@@ -406,9 +406,12 @@ first real query after a restart then does not pay the full cold cost.
 
 For logs it also reads the footer and directories of every log segment in the
 same window that a query plans from its directories, without the segment's
-column pages. The first log query after a restart then opens those segments
-from the cache instead of fetching their footers again. This metadata pass
-uses at most half of `--cache-max-bytes`, counting what the cache already
+column pages. This metadata pass runs after every tenant's most recent
+segments are warmed. A first log query that plans from those directories, or
+opens such a segment by range, then reads its footer from the cache instead
+of storage; a query that reads a whole segment in one request, or that also
+needs the segment's key index, bloom or postings, gains less or nothing. The
+pass uses at most half of `--cache-max-bytes`, counting what the cache already
 holds, and stops when the next segment would not fit.
 docs/query-engine.md, "Startup warm-up of logs metadata", has the details.
 
@@ -479,9 +482,11 @@ Do not expect a `warn!` from this path on a normal warmup pass. A
 tenant/signal combination can produce only two `warn!` lines: the `"error"`
 case, and the "has parts but none warmed" line of `cache_warm`.
 
-A logs line also carries `metadata_objects_warmed` and `metadata_bytes_warmed`:
-the log segments whose footer and directories the metadata pass read for that
-tenant, and the bytes it fetched from storage for them.
+When the metadata pass runs, it logs one `cache warmup: warmed tenant logs
+metadata` line per tenant that has a log segment it plans to read. The line
+carries `metadata_objects_warmed` and `metadata_bytes_warmed`: the log
+segments whose footer and directories the pass read for that tenant, and the
+bytes it fetched from storage for them.
 
 One final `info!` at the end of the pass carries the total `parts_warmed`
 across every tenant and signal and the `elapsed_ms` of the pass. It also
