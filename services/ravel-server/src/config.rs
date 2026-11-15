@@ -6313,10 +6313,11 @@ pub fn resolve_performance_defaults(
         None => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
     };
 
-    // The catalog byte cache is a SEPARATE S3-FIFO cache from the fetcher cache, resolved
-    // from its own `--catalog-cache-max-bytes` flag: `--cache-max-bytes` no
-    // longer reaches it (ADR-2023), and its derived share never varies with
-    // `flags.store_is_loopback` -- only the fetcher cache's does.
+    // The catalog byte cache is a SEPARATE S3-FIFO cache from the fetcher
+    // cache, resolved from its own `--catalog-cache-max-bytes` flag:
+    // `--cache-max-bytes` no longer reaches it (ADR-2023), and its derived
+    // share never varies with `flags.store_is_loopback` -- only the fetcher
+    // cache's does.
     let (catalog_cache_max_bytes, catalog_cache_source) = match flags.catalog_cache_max_bytes {
         Some(n) => (n, PERF_SOURCE_FLAG),
         None if flags.memory_budget_not_applicable => (0, PERF_SOURCE_NOT_APPLICABLE),
