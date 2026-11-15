@@ -1968,6 +1968,67 @@ mod tests {
         );
     }
 
+    /// Several versions above the known set (not only `KEY_IDX_VERSION_2 + 1`):
+    /// rules out an implementation that special-cases the first unknown value
+    /// and falls back to `Corrupted` for anything further out.
+    #[test]
+    fn newer_version_is_typed_unsupported() {
+        let a = acceptance_section();
+        let s = &a.section;
+        let p = s.prefix_len;
+        for version in [KEY_IDX_VERSION_2 + 1, KEY_IDX_VERSION_2 + 2, 100, 254, 255] {
+            let bytes = reseal(&s.bytes, |h| h.version = version);
+            assert!(
+                matches!(
+                    probe_user(&bytes, p, &a.key),
+                    Err(CodecError::UnsupportedSectionVersion {
+                        section: "KEY_IDX",
+                        version: v
+                    }) if v == u16::from(version)
+                ),
+                "version {version} did not probe as a typed UnsupportedSectionVersion"
+            );
+            assert!(
+                matches!(
+                    verify_key_idx(&bytes, p),
+                    Err(CodecError::UnsupportedSectionVersion {
+                        section: "KEY_IDX",
+                        version: v
+                    }) if v == u16::from(version)
+                ),
+                "version {version} did not verify as a typed UnsupportedSectionVersion"
+            );
+        }
+    }
+
+    proptest! {
+        /// Any version above the known set (1, 2) yields the typed variant,
+        /// never `Corrupted` and never a panic, however far above the known
+        /// set it lands.
+        #[test]
+        fn any_version_above_known_set_is_typed_unsupported(
+            version in (KEY_IDX_VERSION_2 + 1)..=u8::MAX,
+        ) {
+            let a = acceptance_section();
+            let s = &a.section;
+            let bytes = reseal(&s.bytes, |h| h.version = version);
+            match verify_key_idx(&bytes, s.prefix_len) {
+                Err(CodecError::UnsupportedSectionVersion { section, version: v }) => {
+                    prop_assert_eq!(section, "KEY_IDX");
+                    prop_assert_eq!(v, u16::from(version));
+                }
+                Ok(_) => prop_assert!(
+                    false,
+                    "version {version}: expected UnsupportedSectionVersion, got Ok"
+                ),
+                Err(e) => prop_assert!(
+                    false,
+                    "version {version}: expected UnsupportedSectionVersion, got {e:?}"
+                ),
+            }
+        }
+    }
+
     #[test]
     fn a_dir_offset_inside_the_header_is_corrupted() {
         let a = acceptance_section();

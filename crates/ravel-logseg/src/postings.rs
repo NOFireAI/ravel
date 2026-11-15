@@ -782,6 +782,52 @@ mod tests {
         ));
     }
 
+    /// Several versions above the known set, not only `POSTINGS_VERSION + 1`:
+    /// rules out an implementation that special-cases the first unknown value
+    /// and falls back to `Corrupted` for anything further out.
+    #[test]
+    fn newer_postings_version_is_typed_unsupported() {
+        for version in [POSTINGS_VERSION + 1, POSTINGS_VERSION + 2, 100, 254, 255] {
+            let bytes = vec![version];
+            assert!(
+                matches!(
+                    PostingsSection::parse(&bytes),
+                    Err(LogSegError::UnsupportedSectionVersion {
+                        section: "POSTINGS",
+                        version: v
+                    }) if v == u16::from(version)
+                ),
+                "version {version} did not parse as a typed UnsupportedSectionVersion"
+            );
+        }
+    }
+
+    proptest::proptest! {
+        /// Any version above the known set (1, 2) yields the typed variant,
+        /// never `Corrupted` and never a panic, however far above the known
+        /// set it lands.
+        #[test]
+        fn any_version_above_known_set_is_typed_unsupported(
+            version in (POSTINGS_VERSION + 1)..=u8::MAX,
+        ) {
+            let bytes = vec![version];
+            match PostingsSection::parse(&bytes) {
+                Err(LogSegError::UnsupportedSectionVersion { section, version: v }) => {
+                    proptest::prop_assert_eq!(section, "POSTINGS");
+                    proptest::prop_assert_eq!(v, u16::from(version));
+                }
+                Ok(_) => proptest::prop_assert!(
+                    false,
+                    "version {version}: expected UnsupportedSectionVersion, got Ok"
+                ),
+                Err(e) => proptest::prop_assert!(
+                    false,
+                    "version {version}: expected UnsupportedSectionVersion, got {e:?}"
+                ),
+            }
+        }
+    }
+
     /// Both grammar versions parse and probe identically (the byte layout is
     /// the same); only [`PostingsSection::version`] differs, and it is what the
     /// reader keys the merged-view pruning rule on. A stored v1 object must
