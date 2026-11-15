@@ -26,15 +26,24 @@
 //! tenant count or a slow store can never hold `/readyz` back indefinitely.
 //!
 //! The logs metadata pass (ADR-4203 decision 8) is not bounded by that part
-//! cap. For every logs object in the resolved window that the query path
-//! plans from its directories (above
-//! [`LogSegmentFetcher::plan_whole_object_bound`]), it reads the footer and
-//! the four directories (STREAM_DIR, FIELD_DIR, SKIP_IDX, PAGE_DIR) through
-//! [`BlockRangeFetcher::fetch_plan_directories`], on a fetcher built from the
-//! query path's own logs fetch quantities ([`LogsMetadataWarm`]), so the
-//! probe and section extents land under the cache keys a statement reads
-//! them with. It reads no column page. It stops admitting objects once the
-//! read cache's resident bytes plus the objects in flight would pass
+//! cap, and runs only after every tenant's whole-part warm has finished, so
+//! it never takes deadline time or cache room from that warm. For every logs
+//! object in the resolved window that the query path plans from its
+//! directories (above [`LogSegmentFetcher::plan_whole_object_bound`]), it
+//! reads the footer and the four directories (STREAM_DIR, FIELD_DIR,
+//! SKIP_IDX, PAGE_DIR) through [`BlockRangeFetcher::fetch_plan_directories`],
+//! on a fetcher built from the query path's own logs fetch quantities
+//! ([`LogsMetadataWarm`]): the suffix probe, then, for sections the probe
+//! does not hold whole, one coalesced read of the missing SKIP_IDX and
+//! PAGE_DIR and one of the missing STREAM_DIR and FIELD_DIR. Those are the
+//! extents and cache keys an unkeyed plan read of the same object uses. A
+//! keyed plan (a statement with key-equality arms) reads the same probe key,
+//! but also reads KEY_IDX and the BLOOM and POSTINGS sections its filter
+//! needs, none of which the pass warms, and coalesces the missing BLOOM and
+//! POSTINGS into its SKIP_IDX and PAGE_DIR read: when SKIP_IDX or PAGE_DIR
+//! lies outside the probe beside them, that read's extent differs from the
+//! warmed one and misses the cache. The pass reads no column page. It stops admitting objects once the read cache's resident
+//! bytes plus the objects in flight would pass
 //! [`METADATA_CACHE_SHARE_DIVISOR`]'s share of the cache budget, and runs at
 //! most the store GET concurrency's permit count of objects at once.
 //!
@@ -106,7 +115,8 @@ impl LogsMetadataWarm {
 /// Overall wall-clock budget for the whole pass, across every tenant and
 /// signal. A single deadline over the whole loop, not a per-fetch one: a
 /// store with many tenants must not warm zero of them just because the
-/// first several were slow.
+/// first several were slow. The logs metadata pass starts only after every
+/// tenant's whole-part warm, so it spends only the time that warm leaves.
 pub(crate) const WARM_DEADLINE: Duration = Duration::from_secs(10);
 
 /// How far back "most recent" looks when resolving parts to warm, measured
@@ -211,17 +221,33 @@ async fn warm_cache_inner(
         logs_metadata,
     );
 
+    // Every tenant's whole-part warm runs before any metadata pass, so the
+    // uncapped pass of one tenant cannot spend the deadline a later tenant's
+    // whole-part warm needs.
     let mut total_parts_warmed: usize = 0;
+    let mut logs_windows: Vec<(TenantHash, Vec<SegmentRef>)> = Vec::new();
     for tenant in tenants {
         total_parts_warmed += warm_metrics(&catalog, &metrics_fetcher, tenant, now_ns).await;
-        total_parts_warmed += warm_logs(
-            &catalog,
-            &logs_fetcher,
-            metadata_pass.as_mut(),
-            tenant,
-            now_ns,
-        )
-        .await;
+        let (warmed, mut parts) = warm_logs(&catalog, &logs_fetcher, tenant, now_ns).await;
+        total_parts_warmed += warmed;
+        if let Some(pass) = metadata_pass.as_ref() {
+            parts.retain(|part| pass.fetcher.plans_segment(part));
+            if !parts.is_empty() {
+                logs_windows.push((tenant, parts));
+            }
+        }
+    }
+    if let Some(pass) = metadata_pass.as_mut() {
+        for (tenant, parts) in &logs_windows {
+            let warmed = pass.warm(*tenant, parts).await;
+            tracing::info!(
+                tenant_hash = %tenant.to_hex(),
+                signal = ?Signal::Logs,
+                metadata_objects_warmed = warmed.objects as u64,
+                metadata_bytes_warmed = warmed.bytes,
+                "cache warmup: warmed tenant logs metadata"
+            );
+        }
     }
 
     let metadata = metadata_pass
@@ -489,28 +515,20 @@ async fn most_recent_parts(
 /// no ingest part of its own (`has_ingest_part = false`), an empty warm is
 /// the expected outcome (the catalog drops a tombstoned bucket outright),
 /// so this logs at `info!` instead of `warn!` for that case.
-///
-/// A logs line from a pass that ran the metadata pass also carries
-/// `metadata_objects_warmed` and `metadata_bytes_warmed` ([`MetadataWarmed`]).
 fn log_warm_result(
     tenant: TenantHash,
     signal: Signal,
     parts_warmed: usize,
     latest_hour: Option<(u32, bool)>,
-    metadata: Option<MetadataWarmed>,
 ) {
     let latest_ingest_hour =
         latest_hour.map_or_else(|| "none".to_string(), |(hour, _)| hour.to_string());
     let has_ingest_part = latest_hour.is_some_and(|(_, has_ingest_part)| has_ingest_part);
-    let metadata_objects_warmed = metadata.map(|m| m.objects as u64);
-    let metadata_bytes_warmed = metadata.map(|m| m.bytes);
     if parts_warmed == 0 && has_ingest_part {
         tracing::warn!(
             tenant_hash = %tenant.to_hex(),
             signal = ?signal,
             parts_warmed,
-            metadata_objects_warmed,
-            metadata_bytes_warmed,
             latest_ingest_hour,
             "cache warmup: tenant has parts for this signal but none were warmed"
         );
@@ -519,8 +537,6 @@ fn log_warm_result(
             tenant_hash = %tenant.to_hex(),
             signal = ?signal,
             parts_warmed,
-            metadata_objects_warmed,
-            metadata_bytes_warmed,
             latest_ingest_hour,
             "cache warmup: warmed tenant signal"
         );
@@ -546,7 +562,7 @@ async fn warm_metrics(
     let (hour, has_ingest_part) = match latest_hour {
         LatestHour::Error => return 0,
         LatestHour::None => {
-            log_warm_result(tenant, Signal::Metrics, 0, None, None);
+            log_warm_result(tenant, Signal::Metrics, 0, None);
             return 0;
         }
         LatestHour::Found {
@@ -578,27 +594,26 @@ async fn warm_metrics(
         Signal::Metrics,
         warmed,
         Some((hour, has_ingest_part)),
-        None,
     );
     warmed
 }
 
-/// Warms the `MAX_PARTS_PER_TENANT_PER_SIGNAL` most recent logs parts whole,
-/// then, when `metadata` is given, runs the metadata pass over every part in
-/// the window. Returns the count of parts warmed whole.
+/// Warms the `MAX_PARTS_PER_TENANT_PER_SIGNAL` most recent logs parts whole.
+/// Returns the count of parts warmed whole and every part in the window, most
+/// recent first, for the metadata pass that runs after every tenant's
+/// whole-part warm.
 async fn warm_logs(
     catalog: &Catalog,
     fetcher: &LogSegmentFetcher,
-    metadata: Option<&mut LogsMetadataPass>,
     tenant: TenantHash,
     now_ns: i64,
-) -> usize {
+) -> (usize, Vec<SegmentRef>) {
     let (parts, latest_hour) = most_recent_parts(catalog, tenant, Signal::Logs, now_ns).await;
     let (hour, has_ingest_part) = match latest_hour {
-        LatestHour::Error => return 0,
+        LatestHour::Error => return (0, parts),
         LatestHour::None => {
-            log_warm_result(tenant, Signal::Logs, 0, None, None);
-            return 0;
+            log_warm_result(tenant, Signal::Logs, 0, None);
+            return (0, parts);
         }
         LatestHour::Found {
             hour,
@@ -625,19 +640,8 @@ async fn warm_logs(
         }
     }
 
-    let metadata_warmed = match metadata {
-        Some(pass) => Some(pass.warm(tenant, &parts).await),
-        None => None,
-    };
-
-    log_warm_result(
-        tenant,
-        Signal::Logs,
-        warmed,
-        Some((hour, has_ingest_part)),
-        metadata_warmed,
-    );
-    warmed
+    log_warm_result(tenant, Signal::Logs, warmed, Some((hour, has_ingest_part)));
+    (warmed, parts)
 }
 
 #[cfg(test)]
@@ -769,6 +773,17 @@ mod tests {
         tenant_hash: TenantHash,
         event_ts_ns: i64,
     ) {
+        publish_log_segment_hashed(store, tenant_hash, event_ts_ns, [0x5au8; 32]).await;
+    }
+
+    /// [`publish_log_segment_at`] under `content_hash`, which the read cache
+    /// keys on: a tenant's parts need distinct hashes for distinct entries.
+    async fn publish_log_segment_hashed(
+        store: &MemoryStore,
+        tenant_hash: TenantHash,
+        event_ts_ns: i64,
+        content_hash: [u8; 32],
+    ) {
         use ravel_logseg::{
             AttrValue, LogRecord, ObjectIdentity, RlogConfig, RlogWriter, stream_attrs_bytes,
         };
@@ -812,7 +827,6 @@ mod tests {
         let bytes = writer.finish().expect("finish RLOG object");
         let object_size = bytes.len() as u64;
 
-        let content_hash = [0x5au8; 32];
         let data_key = keys::data_key(
             &tenant_hash,
             Signal::Logs,
@@ -1302,7 +1316,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let before = instrumented.metrics().snapshot();
-        let warmed = warm_logs(&catalog, &fetcher, None, tenant, now).await;
+        let (warmed, _) = warm_logs(&catalog, &fetcher, tenant, now).await;
         let after = instrumented.metrics().snapshot();
 
         assert_eq!(warmed, 0, "a tenant with no log parts must warm zero");
@@ -1439,7 +1453,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let warmed_metrics = warm_metrics(&catalog, &metrics_fetcher, tenant, now).await;
-        let warmed_logs = warm_logs(&catalog, &logs_fetcher, None, tenant, now).await;
+        let (warmed_logs, _) = warm_logs(&catalog, &logs_fetcher, tenant, now).await;
 
         assert_eq!(
             warmed_metrics, 0,
@@ -1666,5 +1680,181 @@ mod tests {
             .await
             .expect("warm_cache must return once its internal deadline elapses, not hang forever")
             .expect("warm_cache task must not panic");
+    }
+
+    /// Delegates to a `MemoryStore`, except that a suffix GET of a data object
+    /// under `hang_prefix` never completes, and records every whole-object GET.
+    /// The whole-part warm reads small logs objects with [`GetRange::Full`];
+    /// the metadata pass opens each object with a suffix probe.
+    struct HangsOnTenantProbe {
+        inner: MemoryStore,
+        hang_prefix: String,
+        full_gets: parking_lot::Mutex<Vec<String>>,
+        hung_probes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HangsOnTenantProbe {
+        async fn read(&self, key: &str, range: GetRange) {
+            if key.starts_with(&self.hang_prefix) && matches!(range, GetRange::Suffix(_)) {
+                self.hung_probes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }
+            if matches!(range, GetRange::Full) {
+                self.full_gets.lock().push(key.to_string());
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for HangsOnTenantProbe {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.read(key, range).await;
+            self.inner.get(key, range).await
+        }
+
+        async fn get_pinned(
+            &self,
+            key: &str,
+            range: GetRange,
+            pin: &ravel_object_store::Pin,
+        ) -> Result<ravel_object_store::PinnedRead, StoreError> {
+            self.read(key, range).await;
+            self.inner.get_pinned(key, range, pin).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The tenant discovered first has five logs parts and the second one.
+    /// The whole-part warm reads the first tenant's 4 most recent parts and
+    /// the second tenant's part; the first tenant's metadata pass then finds
+    /// those 4 probes resident (a fixture object is no bigger than its probe,
+    /// so the probe key is the whole-object key) and hangs on the fifth
+    /// part's suffix probe until [`WARM_DEADLINE`] fires. The second tenant's
+    /// part is still warmed whole: every tenant's whole-part warm runs before
+    /// any metadata pass. A pass run inside each tenant's turn spends the
+    /// deadline before the second tenant's turn, and the whole-read count
+    /// below is `(4, 0)`.
+    #[tokio::test(start_paused = true)]
+    async fn a_metadata_pass_that_spends_the_deadline_leaves_later_whole_part_warms_intact() {
+        let memory = MemoryStore::new();
+        let now = now_ns();
+        for name in ["acme", "globex"] {
+            publish_log_segment(&memory, TenantId::new(name).hash(), now).await;
+        }
+        let order = ravel_maintain::discover_tenants(&memory)
+            .await
+            .expect("discover tenants");
+        assert_eq!(order.len(), 2, "two tenants: {order:?}");
+        let (first, second) = (order[0], order[1]);
+        // The first tenant's oldest part is outside the whole-part window of 4.
+        for k in 2..=5u8 {
+            publish_log_segment_hashed(&memory, first, now - i64::from(k) * NS_PER_MIN, [k; 32])
+                .await;
+        }
+        let logs_prefix = |tenant: TenantHash| format!("t/{}/l/l0/", tenant.to_hex());
+
+        let store = Arc::new(HangsOnTenantProbe {
+            inner: memory,
+            hang_prefix: logs_prefix(first),
+            full_gets: parking_lot::Mutex::new(Vec::new()),
+            hung_probes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
+        let catalog = catalog_for(dyn_store.clone());
+        let cache = Arc::new(Cache::new(CacheLimits::new(
+            16 * 1024 * 1024,
+            1024,
+            1024 * 1024,
+        )));
+        // Every fixture object is above this plan bound, so the metadata pass
+        // reads each one.
+        let engine = EngineConfig {
+            logs_block_range_threshold: 1,
+            logs_projection_break_even_bytes: Some(1),
+            ..EngineConfig::default()
+        };
+        let warm_cache_handle = cache.clone();
+        let warm = tokio::spawn(async move {
+            warm_cache(
+                dyn_store,
+                catalog,
+                ReadCache::Ram(warm_cache_handle),
+                &FixedClock(now),
+                Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+                Arc::new(ravel_memory::MemoryBudget::unlimited()),
+                crate::cpu_gates::CpuGates::new(Default::default()).read,
+                LogsMetadataWarm::new(&engine, 16 * 1024 * 1024),
+            )
+            .await;
+        });
+        tokio::time::timeout(WARM_DEADLINE * 3, warm)
+            .await
+            .expect("warm_cache returns at its deadline")
+            .expect("warm_cache task must not panic");
+
+        assert_eq!(
+            store.hung_probes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first tenant's metadata pass reached its probe and hung there"
+        );
+        let full_gets = store.full_gets.lock().clone();
+        let read_whole = |tenant: TenantHash| {
+            full_gets
+                .iter()
+                .filter(|key| key.starts_with(&logs_prefix(tenant)))
+                .count()
+        };
+        assert_eq!(
+            (read_whole(first), read_whole(second)),
+            (4, 1),
+            "each tenant's most recent logs parts were read whole: {full_gets:?}"
+        );
+        assert_eq!(
+            cache.len(),
+            5,
+            "the 5 whole parts are resident, and the hung pass inserted nothing"
+        );
     }
 }
