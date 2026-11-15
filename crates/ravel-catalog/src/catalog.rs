@@ -3291,12 +3291,11 @@ impl Catalog {
     /// An hour text past `now_ns + clock_skew_allowance_ns` is ignored, the
     /// same guard [`Catalog::window_hour_bounds`] applies to a listing
     /// window's upper edge: a clock-skewed or corrupt future-dated bucket
-    /// must never masquerade as "most recent". Symmetrically, a part is only
-    /// treated as anchoring "now" when its event time is within
-    /// `max_ingest_lag_ns` of its ingest hour AND that ingest hour is not
-    /// itself ahead of the wall clock: a part filed into an hour within
-    /// `clock_skew_allowance_ns` of the future can still move the anchor
-    /// forward by up to an hour, but never past `max_hour_ns` above.
+    /// must never masquerade as "most recent". The anchor comes from each
+    /// key's ingest-hour bucket alone; no event time is read. A part filed
+    /// in an hour ahead of the wall clock can still be the anchor when that
+    /// hour is no later than the hour of `now_ns + clock_skew_allowance_ns`
+    /// (`max_hour` below), and never when it is later.
     ///
     /// Past the lookback cap this returns `Ok(None)` silently (a `debug!` at
     /// most, carrying the cap): a tenant that simply does not use a signal is
