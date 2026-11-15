@@ -22,7 +22,7 @@ use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
-use ravel_types::accounting::QueryAccounting;
+use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::{Signal, TenantHash, TimeRange};
 use uuid::Uuid;
 
@@ -87,6 +87,15 @@ async fn publish_filed(store: &dyn ObjectStoreBackend, ingest_hour: u32) -> Stri
 }
 
 async fn ingest_hours(catalog: &Catalog, start_hour: u32, end_hour: u32) -> BTreeSet<String> {
+    ingest_hours_accounted(catalog, start_hour, end_hour, &QueryAccounting::new()).await
+}
+
+async fn ingest_hours_accounted(
+    catalog: &Catalog,
+    start_hour: u32,
+    end_hour: u32,
+    accounting: &QueryAccounting,
+) -> BTreeSet<String> {
     catalog
         .resolve_ingest_hours(
             &tenant(),
@@ -94,7 +103,7 @@ async fn ingest_hours(catalog: &Catalog, start_hour: u32, end_hour: u32) -> BTre
             start_hour,
             end_hour,
             now_ns(),
-            &QueryAccounting::new(),
+            accounting,
         )
         .await
         .expect("resolve_ingest_hours")
@@ -105,13 +114,19 @@ async fn ingest_hours(catalog: &Catalog, start_hour: u32, end_hour: u32) -> BTre
 }
 
 /// Listing path: exactly the segments filed in the requested hours, an
-/// `end_hour` past `now` clamped to now's hour, an inverted range empty, and
-/// `resolve` over the same hours in event time still empty.
+/// `end_hour` past `now` clamped to the hour of `now` plus the clock-skew
+/// allowance (a segment filed in the hour after that is left out), an
+/// inverted range empty, and `resolve` over the same hours in event time
+/// still empty.
 #[tokio::test]
 async fn listing_selects_by_ingest_hour_not_event_time() {
+    // `now` is 40 minutes into NOW_HOUR, so `now` plus the 5-minute skew
+    // allowance is still in NOW_HOUR, and all of NOW_HOUR + 1 is past it.
+    const FUTURE_HOUR: u32 = NOW_HOUR + 1;
+    assert!(i64::from(FUTURE_HOUR) * NS_PER_HOUR > now_ns() + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS);
     let store = Arc::new(MemoryStore::new());
     let mut by_hour = Vec::new();
-    for hour in 1000..=NOW_HOUR {
+    for hour in 1000..=FUTURE_HOUR {
         by_hour.push((hour, publish_filed(store.as_ref(), hour).await));
     }
     let keys_in = |lo: u32, hi: u32| -> BTreeSet<String> {
@@ -129,7 +144,13 @@ async fn listing_selects_by_ingest_hour_not_event_time() {
     );
     assert_eq!(
         ingest_hours(&catalog, 1002, u32::MAX).await,
-        keys_in(1002, NOW_HOUR)
+        keys_in(1002, NOW_HOUR),
+        "an end hour past now is clamped to now's hour, leaving out {FUTURE_HOUR}"
+    );
+    assert_eq!(
+        ingest_hours(&catalog, FUTURE_HOUR, FUTURE_HOUR).await,
+        BTreeSet::new(),
+        "a range wholly past now plus the skew allowance is empty"
     );
     assert_eq!(ingest_hours(&catalog, 1002, 1001).await, BTreeSet::new());
 
@@ -150,7 +171,8 @@ async fn listing_selects_by_ingest_hour_not_event_time() {
 
 /// Snapshot path: with hours 999 and 1000 folded (watermark 1000), a range
 /// starting at the watermark takes hour 1000 from the snapshot and 1001..1002
-/// from the listing, and leaves hour 999 and hour 1003 out.
+/// from the listing, and leaves hour 999 and hour 1003 out. The GET count
+/// shows the snapshot served hour 1000: its commit record is never fetched.
 #[tokio::test]
 async fn a_folded_snapshot_selects_by_ingest_hour_not_event_time() {
     let store = Arc::new(MemoryStore::new());
@@ -178,10 +200,22 @@ async fn a_folded_snapshot_selects_by_ingest_hour_not_event_time() {
     let recent_1003 = publish_filed(store.as_ref(), 1003).await;
 
     let catalog = Catalog::new(store.clone(), config()).expect("catalog");
-    let got = ingest_hours(&catalog, 1000, 1002).await;
+    let accounting = QueryAccounting::new();
+    let got = ingest_hours_accounted(&catalog, 1000, 1002, &accounting).await;
     assert_eq!(
         got,
         BTreeSet::from([sealed_1000, recent_1001, recent_1002]),
         "hour 999 ({sealed_999}) and hour 1003 ({recent_1003}) are outside the range"
     );
+    // Hour 1000 came from the snapshot: the resolve GETs the commit records of
+    // hours 1001 and 1002 only. A resolve that listed hour 1000 instead GETs
+    // its commit record too, for 5 GETs.
+    let cost = accounting.snapshot();
+    assert_eq!(
+        cost.s3_requests(AccountedOp::Get),
+        4,
+        "the snapshot HEAD, its one part, and the commit records of hours 1001 and 1002"
+    );
+    assert_eq!(cost.s3_requests(AccountedOp::List), 2);
+    assert_eq!(cost.s3_requests(AccountedOp::Head), 0);
 }
