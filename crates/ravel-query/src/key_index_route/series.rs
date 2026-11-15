@@ -237,8 +237,8 @@ pub struct SeriesRouteFigures {
     pub plans_routed: u64,
     /// (plan, part) pairs the series route answered.
     pub plan_parts_answered: u64,
-    declines: [u64; SeriesDecline::ALL.len()],
-    passes: [SeriesPassFigures; SeriesPass::ALL.len()],
+    pub(crate) declines: [u64; SeriesDecline::ALL.len()],
+    pub(crate) passes: [SeriesPassFigures; SeriesPass::ALL.len()],
 }
 
 impl SeriesRouteFigures {
