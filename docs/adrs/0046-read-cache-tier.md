@@ -278,7 +278,8 @@ part's own `max_event_ts_ns`. The new window is a superset of the old
 within `max_ingest_lag_ns` of its ingest-hour bucket's span, which is the
 assumption this warm-up serves, not a guarantee `latest_ingest_hour`
 enforces. A part filed further out of that bound can still miss the warm
-pass.
+pass (superseded, see the ingest-hour selection amendment below: the warm
+set is now chosen by ingest hour with no event-time filter).
 
 `Catalog::latest_ingest_hour` itself discovers the latest hour with a
 bounded, floored listing that doubles its lookback window backwards from
@@ -470,3 +471,24 @@ window does and lowers the hot set's rate to 0.1210; at 30% it stays under
 the roughly 37% of the cache the key window spans in 25 MB objects, and
 changes neither figure. 25% would leave q32 about 160 MB of margin; 30%
 leaves about 510 MB.
+
+## Amendment (2026-11-15): the startup warm-up selects parts by ingest hour, with no event-time filter (issue #4257)
+
+<!-- amendment-supersedes: phrase="A part filed further out of that bound can still miss the warm" pointer="ingest-hour selection amendment" -->
+
+The 2026-09-05 amendment anchored the warm window to the tenant's latest
+ingest hour but still resolved it as an event-time range, so a part whose
+`max_event_ts_ns` fell outside `[latest - 24h, latest + 1h]` was not
+warmed. A tenant whose event times all predate its ingest window (a
+backfill, or a benchmark dataset loaded today with 2013 timestamps)
+warmed nothing at all.
+
+The pass now calls `Catalog::resolve_ingest_hours` over ingest hours
+`[latest - 24, latest]`, which applies no event-time filter, and orders
+the result newest ingest hour first, then latest `max_event_ts_ns` first
+within an hour (`services/ravel-server/src/cache_warm.rs`). "Most recent"
+therefore means most recently ingested: a backfill filed in the latest
+hour outranks fresh-event parts filed an hour earlier. The whole-part
+cap, the metadata share of the cache budget and the warm deadline are
+unchanged, and a warm failure still warms less and never fails startup.
+`docs/catalog-and-mvcc.md` states the accessor's contract.
