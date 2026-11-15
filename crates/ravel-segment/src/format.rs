@@ -64,6 +64,14 @@ pub const VERSION_V6: u16 = 6;
 /// uses the whole SERIES_META. Written by every writer.
 pub const VERSION_V7: u16 = 7;
 
+/// The drill version (ADR-4233 decision 9), present only with the test-only
+/// `format-drill` feature: v7's bytes with the trailer version raised by one.
+/// It exists so dispatch, activation, fencing and migration can run against
+/// two real versions without bumping a production one. A release build never
+/// enables the feature (`scripts/guards/check-release-profile.sh`).
+#[cfg(feature = "format-drill")]
+pub const VERSION_DRILL: u16 = VERSION_V7 + 1;
+
 /// One RSEG trailer version this build admits: a token that exists only for a
 /// version inside the reader window ([`SegmentVersion::WINDOW`]), and the type
 /// the structural validator dispatches on.
@@ -78,9 +86,12 @@ pub const VERSION_V7: u16 = 7;
 /// silent acceptance of a version nothing knows how to check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SegmentVersion {
-    /// RSEG v7 ([`VERSION_V7`]), the current version and the only one any
-    /// writer emits.
+    /// RSEG v7 ([`VERSION_V7`]), the current production version.
     V7,
+    /// The `format-drill` test version ([`VERSION_DRILL`]): v7's grammar under
+    /// a trailer version one higher. Validated by the v7 rule set.
+    #[cfg(feature = "format-drill")]
+    Drill,
 }
 
 impl SegmentVersion {
@@ -94,13 +105,28 @@ impl SegmentVersion {
     /// Adding N-1 at a bump is one line here. The const assertions below hold
     /// the window to ADR-0066's shape: non-empty, at most two wide, and
     /// contiguous, so it can never reach past N-1 or skip a version.
+    #[cfg(not(feature = "format-drill"))]
     pub const WINDOW: &'static [SegmentVersion] = &[SegmentVersion::V7];
+
+    /// The reader window under the test-only `format-drill` feature: the drill
+    /// version and v7, so two real versions exist in tests (ADR-4233
+    /// decision 9).
+    #[cfg(feature = "format-drill")]
+    pub const WINDOW: &'static [SegmentVersion] = &[SegmentVersion::Drill, SegmentVersion::V7];
+
+    /// The version a writer emits when its caller names none: the current
+    /// production version. ADR-4233 decision 2 has a release emit the older of
+    /// two window versions until the newer is activated, so this is never the
+    /// drill version; without `format-drill` it is the window's only version.
+    pub const CURRENT: SegmentVersion = SegmentVersion::V7;
 
     /// This version's trailer number. An exhaustive match, so a new variant
     /// must state its number here before anything else compiles.
     pub const fn number(self) -> u16 {
         match self {
             SegmentVersion::V7 => VERSION_V7,
+            #[cfg(feature = "format-drill")]
+            SegmentVersion::Drill => VERSION_DRILL,
         }
     }
 
@@ -144,12 +170,17 @@ const _: () = {
         );
         i += 1;
     }
+    assert!(
+        SegmentVersion::from_number(SegmentVersion::CURRENT.number()).is_some(),
+        "writers' default version must be inside the reader window"
+    );
 };
 
 /// The set of RSEG trailer versions this build's reader accepts (ADR-0066
-/// decision 1: "N/N-1 window, readers first"). Writers always emit the current
-/// version [`VERSION_V7`]; readers accept the current version and, once a
-/// version bump lands, the immediately preceding one. The window is at most two
+/// decision 1: "N/N-1 window, readers first"). Writers emit a caller-chosen
+/// [`SegmentVersion`] inside the window, [`SegmentVersion::CURRENT`] when the
+/// caller names none (ADR-4233 decision 2); readers accept the current version
+/// and, once a version bump lands, the other one. The window is at most two
 /// versions wide by construction and never accepts anything below the
 /// immediately preceding version, so a retired version (RSEG v1-v6) stays
 /// rejected.
@@ -173,7 +204,8 @@ impl SupportedVersions {
         Self { window }
     }
 
-    /// The current (newest, always-written) version.
+    /// The newest admitted version. Not necessarily the one writers emit by
+    /// default: that is [`SegmentVersion::CURRENT`].
     pub const fn newest(&self) -> u16 {
         let mut newest = self.window[0].number();
         let mut i = 1;
@@ -238,7 +270,8 @@ impl SupportedVersions {
 /// version [`VERSION_V7`] (ADR-0027's single-version state persists after the
 /// v7 bump, which deleted the v6 read and write paths in the same change,
 /// ADR-0092 decision 7); the machinery carries ADR-0066's two-wide shape ready
-/// for the first post-release bump.
+/// for the first post-release bump. The test-only `format-drill` feature widens
+/// it to [`VERSION_DRILL`] and [`VERSION_V7`].
 pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::over(SegmentVersion::WINDOW);
 
 /// Series-count threshold at or above which `SegmentWriter::write_v5` emits
@@ -408,29 +441,49 @@ mod tests {
     /// the reader's accepted set is byte-for-byte the pre-ADR-0066 behaviour:
     /// v7 accepted, everything else (including the now-retired v6 and a
     /// hypothetical v8) rejected. Only the window's shape is new machinery.
+    /// Without `format-drill` the window is one version wide, so the drill
+    /// version is outside it.
+    #[cfg(not(feature = "format-drill"))]
     #[test]
     fn todays_window_accepts_only_the_current_version() {
+        assert_eq!(SUPPORTED_VERSIONS.len(), 1);
         assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION_V7);
         assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION_V7);
         assert!(SUPPORTED_VERSIONS.contains(VERSION_V7));
         assert!(!SUPPORTED_VERSIONS.contains(VERSION_V6));
         assert!(!SUPPORTED_VERSIONS.contains(VERSION_V7 + 1));
+        assert!(SegmentVersion::from_number(VERSION_V7 + 1).is_none());
         assert!(!SUPPORTED_VERSIONS.contains(0));
     }
 
+    /// Under `format-drill` the window is the drill version and v7, newest
+    /// first, and nothing else; the writers' default stays v7.
+    #[cfg(feature = "format-drill")]
+    #[test]
+    fn drill_window_is_the_drill_version_and_v7() {
+        assert_eq!(VERSION_DRILL, VERSION_V7 + 1);
+        let versions: Vec<SegmentVersion> = SUPPORTED_VERSIONS.versions().collect();
+        assert_eq!(versions, [SegmentVersion::Drill, SegmentVersion::V7]);
+        assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION_DRILL);
+        assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION_V7);
+        assert!(!SUPPORTED_VERSIONS.contains(VERSION_V6));
+        assert!(!SUPPORTED_VERSIONS.contains(VERSION_DRILL + 1));
+        assert_eq!(SegmentVersion::CURRENT, SegmentVersion::V7);
+    }
+
     /// The window keeps ADR-0066 decision 1's shape: non-empty, at most two
-    /// versions wide, contiguous, newest first, and newest equal to the version
-    /// every writer emits. The const assertions beside [`SegmentVersion::WINDOW`]
-    /// already fail the build on the first three; this states them where a
-    /// reader of the test list can see the policy, and adds the two the const
-    /// block cannot check (newest-first ordering is checkable there, the tie to
-    /// [`VERSION_V7`] is the one that changes at a bump).
+    /// versions wide, contiguous, newest first, and holding the version
+    /// writers emit by default. The const assertions beside
+    /// [`SegmentVersion::WINDOW`] already fail the build on these; this states
+    /// them where a reader of the test list can see the policy, and adds the tie
+    /// to [`VERSION_V7`], the one that changes at a bump.
     #[test]
     fn the_window_keeps_the_n_and_prev_shape() {
         let window = SUPPORTED_VERSIONS;
         assert!(!window.is_empty() && window.len() <= 2, "N/N-1 at most");
         assert!(!window.is_empty());
-        assert_eq!(window.newest(), VERSION_V7, "writers emit the newest");
+        assert_eq!(SegmentVersion::CURRENT.number(), VERSION_V7);
+        assert!(window.contains(SegmentVersion::CURRENT.number()));
 
         let versions: Vec<u16> = window.versions().map(SegmentVersion::number).collect();
         assert_eq!(versions[0], window.newest(), "newest first");

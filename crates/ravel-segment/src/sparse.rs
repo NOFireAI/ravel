@@ -37,8 +37,8 @@ use crate::catalog_charge::{
 use crate::crc::footer_crc;
 use crate::error::{SegmentError, WriteError};
 use crate::format::{
-    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, V5_STRIDE, VERSION_V7, ZSTD_LEVEL, compression,
-    section_kind,
+    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, SegmentVersion, V5_STRIDE, ZSTD_LEVEL,
+    compression, section_kind,
 };
 use crate::reader::{
     DictResolver, RUN_LIVE_BYTES_CHUNK, RunEntry, SampleProvenance, SeriesEntry, SeriesEntryV4,
@@ -1921,7 +1921,10 @@ fn decode_base_footer(obj: &[u8]) -> Result<Footer, WriteError> {
         .map_err(|e| WriteError::SparseAssembly(e.to_string()))
 }
 
-pub(crate) fn build_sparse_object(base: &WrittenSegment) -> Result<WrittenSegment, WriteError> {
+pub(crate) fn build_sparse_object(
+    base: &WrittenSegment,
+    version: SegmentVersion,
+) -> Result<WrittenSegment, WriteError> {
     let obj = base.bytes.as_ref();
     let limits = ReaderLimits::default();
     // The base is this process's own freshly built v4-grammar object, so it
@@ -2010,16 +2013,11 @@ pub(crate) fn build_sparse_object(base: &WrittenSegment) -> Result<WrittenSegmen
     let footer_bytes = new_footer.encode_to_vec();
     let footer_len = u32::try_from(footer_bytes.len()).map_err(|_| WriteError::FooterTooLarge)?;
     object.extend_from_slice(&footer_bytes);
-    let crc = footer_crc(
-        &footer_bytes,
-        footer_len,
-        VERSION_V7,
-        SIGNAL_METRICS,
-        RESERVED,
-    );
+    let version = version.number();
+    let crc = footer_crc(&footer_bytes, footer_len, version, SIGNAL_METRICS, RESERVED);
     object.extend_from_slice(&footer_len.to_le_bytes());
     object.extend_from_slice(&crc.to_le_bytes());
-    object.extend_from_slice(&VERSION_V7.to_le_bytes());
+    object.extend_from_slice(&version.to_le_bytes());
     object.push(SIGNAL_METRICS);
     object.push(RESERVED);
     object.extend_from_slice(&MAGIC);

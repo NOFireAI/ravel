@@ -16,7 +16,7 @@ use crate::crc::{footer_crc, page_crc};
 use crate::error::WriteError;
 use crate::exemplars::{ExemplarInput, ResolvedExemplar, encode_exemplars_section};
 use crate::format::{
-    MAGIC, RESERVED, SIGNAL_METRICS, V5_SPARSE_THRESHOLD, VERSION_V4, VERSION_V7, ZSTD_LEVEL,
+    MAGIC, RESERVED, SIGNAL_METRICS, SegmentVersion, V5_SPARSE_THRESHOLD, VERSION_V4, ZSTD_LEVEL,
     compression, page_comp, page_enc, section_kind,
 };
 use crate::gorilla::encode_gorilla_into;
@@ -289,6 +289,25 @@ impl SegmentWriter {
     /// zero-count one: absence is the only legal representation of "no
     /// exemplars" (ADR-0047 decision 1).
     pub fn write_histograms_with_exemplars(
+        series: Vec<SeriesInputV3>,
+        identity: SegmentIdentity,
+        ingest_bounds: IngestBounds,
+        exemplars: Vec<ExemplarInput>,
+    ) -> Result<WrittenSegment, WriteError> {
+        Self::write_histograms_with_exemplars_at(
+            SegmentVersion::CURRENT,
+            series,
+            identity,
+            ingest_bounds,
+            exemplars,
+        )
+    }
+
+    /// [`SegmentWriter::write_histograms_with_exemplars`] emitting `version`, a
+    /// version inside the reader window (ADR-4233 decision 2), instead of
+    /// [`SegmentVersion::CURRENT`].
+    pub fn write_histograms_with_exemplars_at(
+        version: SegmentVersion,
         mut series: Vec<SeriesInputV3>,
         identity: SegmentIdentity,
         ingest_bounds: IngestBounds,
@@ -331,7 +350,14 @@ impl SegmentWriter {
             part_index: 0,
             level: 0,
         };
-        Self::write_v5_with_exemplars(v4_series, identity, ingest_bounds, meta, exemplars)
+        Self::write_v5_with_exemplars_at(
+            version,
+            v4_series,
+            identity,
+            ingest_bounds,
+            meta,
+            exemplars,
+        )
     }
 
     /// Builds the v4-grammar object (multi-run, run-major SERIES_META, the
@@ -835,12 +861,33 @@ impl SegmentWriter {
         meta: CompactionMetaV4,
         exemplars: Vec<ExemplarInput>,
     ) -> Result<WrittenSegment, WriteError> {
+        Self::write_v5_with_exemplars_at(
+            SegmentVersion::CURRENT,
+            series,
+            identity,
+            ingest_bounds,
+            meta,
+            exemplars,
+        )
+    }
+
+    /// [`SegmentWriter::write_v5_with_exemplars`] emitting `version`, a version
+    /// inside the reader window (ADR-4233 decision 2), instead of
+    /// [`SegmentVersion::CURRENT`].
+    pub fn write_v5_with_exemplars_at(
+        version: SegmentVersion,
+        series: Vec<SeriesInputV4>,
+        identity: SegmentIdentity,
+        ingest_bounds: IngestBounds,
+        meta: CompactionMetaV4,
+        exemplars: Vec<ExemplarInput>,
+    ) -> Result<WrittenSegment, WriteError> {
         let body = assemble_v4_body(series, identity, ingest_bounds, meta, exemplars)?;
         if body.series_count < V5_SPARSE_THRESHOLD {
-            return Ok(finalize_v4_trailer(body, VERSION_V7));
+            return Ok(finalize_v4_trailer(body, version.number()));
         }
         let base = finalize_v4_trailer(body, VERSION_V4);
-        crate::sparse::build_sparse_object(&base)
+        crate::sparse::build_sparse_object(&base, version)
     }
 
     /// Writes a segment whose runs may carry per-sample dedup provenance
@@ -858,6 +905,27 @@ impl SegmentWriter {
     /// object over a large tenant stores them rather than failing closed
     /// (ADR-0092 decision 1, issue #315).
     pub fn write_v7_with_provenance(
+        series: Vec<SeriesInputV7>,
+        identity: SegmentIdentity,
+        ingest_bounds: IngestBounds,
+        meta: CompactionMetaV4,
+        exemplars: Vec<ExemplarInput>,
+    ) -> Result<WrittenSegment, WriteError> {
+        Self::write_v7_with_provenance_at(
+            SegmentVersion::CURRENT,
+            series,
+            identity,
+            ingest_bounds,
+            meta,
+            exemplars,
+        )
+    }
+
+    /// [`SegmentWriter::write_v7_with_provenance`] emitting `version`, a
+    /// version inside the reader window (ADR-4233 decision 2), instead of
+    /// [`SegmentVersion::CURRENT`].
+    pub fn write_v7_with_provenance_at(
+        version: SegmentVersion,
         series: Vec<SeriesInputV7>,
         identity: SegmentIdentity,
         ingest_bounds: IngestBounds,
@@ -901,14 +969,14 @@ impl SegmentWriter {
             exemplars,
         )?;
         if body.series_count < V5_SPARSE_THRESHOLD {
-            return Ok(finalize_v4_trailer(body, VERSION_V7));
+            return Ok(finalize_v4_trailer(body, version.number()));
         }
         // At or above the sparse threshold the base's whole-section SERIES_META
         // (including any provenance extension) is re-laid into per-chunk frames
         // by the sparse rebuild, which carries the provenance columns per chunk
         // (ADR-0092 decision 1).
         let base = finalize_v4_trailer(body, VERSION_V4);
-        crate::sparse::build_sparse_object(&base)
+        crate::sparse::build_sparse_object(&base, version)
     }
 }
 
@@ -1718,6 +1786,7 @@ mod v4_tests {
 
     use super::*;
     use crate::ReaderLimits;
+    use crate::format::VERSION_V7;
     use crate::histogram::{HistogramCounts, HistogramSpan, ResetHint};
     use crate::varint::read_uvarint;
 
@@ -3241,6 +3310,7 @@ mod direct_v7_emit_bit_parity {
     use ravel_types::{Label, Sample};
 
     use super::*;
+    use crate::format::VERSION_V7;
 
     fn labels(metric: &str) -> LabelSet {
         LabelSet::new(vec![Label {
@@ -3702,7 +3772,7 @@ mod direct_v7_emit_bit_parity {
         if base.summary.series_count < V5_SPARSE_THRESHOLD {
             return Ok(reference_retrailer_v4_to_v7(base));
         }
-        crate::sparse::build_sparse_object(&base)
+        crate::sparse::build_sparse_object(&base, SegmentVersion::V7)
     }
 
     fn reference_write_histograms_with_exemplars(
@@ -4581,6 +4651,543 @@ mod page_codec_selection_v7 {
                 got.len(),
                 incumbent.len()
             );
+        }
+    }
+}
+
+/// The caller-chosen write version (ADR-4233 decisions 2 and 9, issue #4242):
+/// each `_at` entry point emits the [`SegmentVersion`] it is given, the default
+/// entry points emit [`SegmentVersion::CURRENT`], and under `format-drill` the
+/// drill version's object is v7's bytes with only the trailer version raised
+/// and the footer crc recomputed over it.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use proptest::prelude::*;
+    use ravel_types::{Label, Sample};
+
+    use super::*;
+    #[cfg(not(feature = "format-drill"))]
+    use crate::error::SegmentError;
+    use crate::format::{ReaderLimits, SUPPORTED_VERSIONS, VERSION_V7};
+    use crate::reader::open_from_full;
+    #[cfg(feature = "format-drill")]
+    use crate::{
+        exemplars::decode_exemplars_section,
+        format::VERSION_DRILL,
+        reader::{SeriesEntryV4, ValueKind, decode_run_histogram_pages, decode_run_pages_soa},
+        sparse::decode_catalog_v5,
+    };
+
+    fn labels(metric: &str) -> LabelSet {
+        LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels")
+    }
+
+    fn series_id_for(idx: u32) -> SeriesId {
+        let mut id = [0u8; 16];
+        id[..4].copy_from_slice(&idx.to_be_bytes());
+        SeriesId(id)
+    }
+
+    fn identity() -> SegmentIdentity {
+        SegmentIdentity {
+            tenant_hash: [0x42; 16],
+            shard: 3,
+            writer_id: "window-version-writer".to_string(),
+            writer_epoch: 5,
+            writer_seq: 17,
+        }
+    }
+
+    fn bounds() -> IngestBounds {
+        IngestBounds {
+            min_ingest_ts_ns: -1_000,
+            max_ingest_ts_ns: 2_000_000,
+        }
+    }
+
+    fn histogram_value(seed: i32) -> HistogramValue {
+        let zero_count = 1;
+        let positive = vec![2, u64::from(seed.unsigned_abs()) + 1];
+        let count = zero_count + positive.iter().sum::<u64>();
+        HistogramValue {
+            scale: 3,
+            zero_threshold: 0.001,
+            sum: Some(f64::from(seed) + 0.5),
+            custom_values: None,
+            positive_spans: vec![crate::histogram::HistogramSpan {
+                offset: 0,
+                length: 2,
+            }],
+            negative_spans: vec![],
+            counts: crate::histogram::HistogramCounts::Int {
+                zero_count,
+                count,
+                positive,
+                negative: vec![],
+            },
+            reset_hint: crate::histogram::ResetHint::Unknown,
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum Values {
+        Scalar(Vec<(i64, f64)>),
+        Histogram(Vec<(i64, i32)>),
+    }
+
+    /// One series per spec, series ids and metric names taken from position.
+    fn instantiate(specs: &[Values]) -> Vec<SeriesInputV3> {
+        specs
+            .iter()
+            .enumerate()
+            .map(|(idx, spec)| {
+                let idx = u32::try_from(idx).expect("series index fits u32");
+                let values = match spec {
+                    Values::Scalar(v) => SeriesValues::Scalar(
+                        v.iter()
+                            .map(|&(ts_ns, value)| Sample { ts_ns, value })
+                            .collect(),
+                    ),
+                    Values::Histogram(v) => SeriesValues::Histogram(
+                        v.iter()
+                            .map(|&(ts_ns, seed)| HistogramSample {
+                                ts_ns,
+                                value: histogram_value(seed),
+                            })
+                            .collect(),
+                    ),
+                };
+                SeriesInputV3 {
+                    series_id: series_id_for(idx),
+                    labels: labels(&format!("m{idx}")),
+                    values,
+                }
+            })
+            .collect()
+    }
+
+    /// Below the sparse threshold: scalar and histogram series plus one
+    /// exemplar, so LABEL_DICT, TS/VAL/HIST pages and EXEMPLARS all appear.
+    fn small_specs() -> Vec<Values> {
+        vec![
+            Values::Scalar(vec![(1_000, 1.5), (2_000, -0.0), (3_000, 7.25)]),
+            Values::Histogram(vec![(1_500, 3), (2_500, -9)]),
+            Values::Scalar(vec![(4_000, f64::from_bits(0x7ff8_0000_0000_0001))]),
+        ]
+    }
+
+    fn small_exemplars() -> Vec<ExemplarInput> {
+        vec![ExemplarInput {
+            series_id: series_id_for(0),
+            ts_ns: 2_000,
+            value: 0.75,
+            trace_id: [0xA1; 16],
+            span_id: [0xB2; 8],
+            attrs: vec![("k".to_string(), "v".to_string())],
+        }]
+    }
+
+    fn write_small(version: SegmentVersion) -> Vec<u8> {
+        SegmentWriter::write_histograms_with_exemplars_at(
+            version,
+            instantiate(&small_specs()),
+            identity(),
+            bounds(),
+            small_exemplars(),
+        )
+        .expect("small batch writes")
+        .bytes
+        .to_vec()
+    }
+
+    /// `bytes` re-stamped with trailer `version` and a footer crc recomputed
+    /// over it, so the object fails only the version gate.
+    fn restamp(bytes: &[u8], version: u16) -> Vec<u8> {
+        let n = bytes.len();
+        let mut out = bytes.to_vec();
+        let footer_len = u32::from_le_bytes(out[n - 16..n - 12].try_into().expect("4 bytes"));
+        let footer_start = n - 16 - footer_len as usize;
+        let crc = footer_crc(
+            &out[footer_start..n - 16],
+            footer_len,
+            version,
+            SIGNAL_METRICS,
+            RESERVED,
+        );
+        out[n - 12..n - 8].copy_from_slice(&crc.to_le_bytes());
+        out[n - 8..n - 6].copy_from_slice(&version.to_le_bytes());
+        out
+    }
+
+    /// Default build: the window is one version, v7; the drill version has no
+    /// [`SegmentVersion`] (so no writer can be asked to emit it), and an
+    /// object that is v7's bytes under trailer version 8, exactly what the
+    /// drill writer emits, is refused by the version gate.
+    #[cfg(not(feature = "format-drill"))]
+    #[test]
+    fn default_build_window_is_v7_alone_and_refuses_the_drill_version() {
+        assert_eq!(SegmentVersion::WINDOW, &[SegmentVersion::V7]);
+        assert_eq!(SUPPORTED_VERSIONS.len(), 1);
+        assert_eq!(SegmentVersion::from_number(VERSION_V7 + 1), None);
+        assert_eq!(SegmentVersion::CURRENT, SegmentVersion::V7);
+
+        let current = write_small(SegmentVersion::CURRENT);
+        let loc = open_from_full(&current, ReaderLimits::default()).expect("v7 opens");
+        assert_eq!(loc.version, VERSION_V7);
+
+        let drill_shaped = restamp(&current, VERSION_V7 + 1);
+        match open_from_full(&drill_shaped, ReaderLimits::default()) {
+            Err(SegmentError::UnsupportedVersion(v)) => assert_eq!(v, VERSION_V7 + 1),
+            other => panic!("default build admitted version 8: {other:?}"),
+        }
+    }
+
+    /// Both builds: the default entry point is the `_at` entry point at
+    /// [`SegmentVersion::CURRENT`], which is v7, so a default writer emits v7
+    /// even when the window also holds the drill version (ADR-4233 decision 2:
+    /// writers emit the older version until the newer is activated).
+    #[test]
+    fn default_entry_points_emit_the_current_version() {
+        let default = SegmentWriter::write_histograms_with_exemplars(
+            instantiate(&small_specs()),
+            identity(),
+            bounds(),
+            small_exemplars(),
+        )
+        .expect("default write")
+        .bytes
+        .to_vec();
+        assert_eq!(default, write_small(SegmentVersion::CURRENT));
+        let loc = open_from_full(&default, ReaderLimits::default()).expect("opens");
+        assert_eq!(loc.version, VERSION_V7);
+        assert!(SUPPORTED_VERSIONS.contains(VERSION_V7));
+    }
+
+    /// Everything a reader recovers from an object, in comparable form.
+    /// Scalar values and histogram/exemplar content compare by bit pattern
+    /// (via `to_bits` and `Debug`), so NaN payloads and -0.0 count.
+    #[cfg(feature = "format-drill")]
+    #[derive(Debug, PartialEq)]
+    struct Decoded {
+        footer: Footer,
+        catalog: Vec<SeriesEntryV4>,
+        scalar_runs: Vec<(SeriesId, Vec<i64>, Vec<u64>)>,
+        histogram_runs: Vec<(SeriesId, String)>,
+        exemplars: String,
+    }
+
+    #[cfg(feature = "format-drill")]
+    fn section<'a>(bytes: &'a [u8], footer: &Footer, kind: u32) -> &'a [u8] {
+        footer
+            .sections
+            .iter()
+            .find(|s| s.kind == kind)
+            .map_or(&[], |s| {
+                &bytes[s.offset as usize..(s.offset + s.len) as usize]
+            })
+    }
+
+    #[cfg(feature = "format-drill")]
+    fn page(section: &[u8], (offset, len): (u64, u64)) -> &[u8] {
+        &section[offset as usize..(offset + len) as usize]
+    }
+
+    /// Opens `bytes` and decodes every catalog entry, every run's pages and
+    /// every exemplar. Returns the trailer version beside the content.
+    #[cfg(feature = "format-drill")]
+    fn decode(bytes: &[u8]) -> (u16, Decoded) {
+        let limits = ReaderLimits::default();
+        let loc = open_from_full(bytes, limits).expect("object opens");
+        let footer = loc.footer;
+        let catalog = decode_catalog_v5(&footer, bytes, limits).expect("catalog decodes");
+        let ts = section(bytes, &footer, section_kind::TS_PAGES);
+        let val = section(bytes, &footer, section_kind::VAL_PAGES);
+        let hist = section(bytes, &footer, section_kind::HIST_PAGES);
+        let mut scalar_runs = Vec::new();
+        let mut histogram_runs = Vec::new();
+        for series in &catalog {
+            let id = series.entry.series_id;
+            for run in &series.runs {
+                match series.entry.value_kind {
+                    ValueKind::Scalar => {
+                        let (mut scratch, mut t, mut v) = (Vec::new(), Vec::new(), Vec::new());
+                        decode_run_pages_soa(
+                            &id,
+                            run,
+                            page(ts, run.ts_page),
+                            page(val, run.val_page),
+                            limits,
+                            &mut scratch,
+                            &mut t,
+                            &mut v,
+                        )
+                        .expect("scalar run decodes");
+                        scalar_runs.push((id, t, v.iter().map(|x| x.to_bits()).collect()));
+                    }
+                    ValueKind::Histogram => {
+                        let samples = decode_run_histogram_pages(
+                            &id,
+                            run,
+                            page(ts, run.ts_page),
+                            page(hist, run.hist_page),
+                            limits,
+                        )
+                        .expect("histogram run decodes");
+                        histogram_runs.push((id, format!("{samples:?}")));
+                    }
+                }
+            }
+        }
+        let exemplars = decode_exemplars_section(
+            &footer,
+            section(bytes, &footer, section_kind::LABEL_DICT),
+            section(bytes, &footer, section_kind::EXEMPLARS),
+            limits,
+        )
+        .expect("exemplars decode");
+        (
+            loc.version,
+            Decoded {
+                footer,
+                catalog,
+                scalar_runs,
+                histogram_runs,
+                exemplars: format!("{exemplars:?}"),
+            },
+        )
+    }
+
+    /// `drill` must be `current` with only the trailer version field raised
+    /// to the drill version and the trailer crc recomputed over it: every
+    /// other byte, page and section included, is identical.
+    #[cfg(feature = "format-drill")]
+    fn assert_only_trailer_version_and_crc_differ(current: &[u8], drill: &[u8]) {
+        assert_eq!(current.len(), drill.len(), "object lengths differ");
+        let n = current.len();
+        assert!(
+            current[..n - 12] == drill[..n - 12],
+            "bytes before the trailer crc differ"
+        );
+        assert_eq!(
+            current[n - 6..],
+            drill[n - 6..],
+            "trailer signal, reserved or magic differ"
+        );
+        assert_eq!(current[n - 8..n - 6], VERSION_V7.to_le_bytes());
+        assert_eq!(drill[n - 8..n - 6], VERSION_DRILL.to_le_bytes());
+        assert_eq!(
+            drill,
+            restamp(current, VERSION_DRILL).as_slice(),
+            "drill trailer crc is not the footer crc over the drill version"
+        );
+        assert_ne!(
+            current[n - 12..n - 8],
+            drill[n - 12..n - 8],
+            "crc not recomputed"
+        );
+    }
+
+    /// Both objects open, report their own version, and decode to identical
+    /// content; their bytes differ only in trailer version and crc.
+    #[cfg(feature = "format-drill")]
+    fn assert_window_pair(current: &[u8], drill: &[u8]) {
+        assert_only_trailer_version_and_crc_differ(current, drill);
+        let (current_version, current_content) = decode(current);
+        let (drill_version, drill_content) = decode(drill);
+        assert_eq!(current_version, VERSION_V7);
+        assert_eq!(drill_version, VERSION_DRILL);
+        assert_eq!(current_content, drill_content);
+    }
+
+    #[cfg(feature = "format-drill")]
+    fn write_provenance(version: SegmentVersion) -> Vec<u8> {
+        let merged_id = series_id_for(1);
+        let plain_id = series_id_for(2);
+        let merged_samples = SeriesValues::Scalar(vec![
+            Sample {
+                ts_ns: 10_000,
+                value: 1.0,
+            },
+            Sample {
+                ts_ns: 10_500,
+                value: 2.0,
+            },
+            Sample {
+                ts_ns: 11_000,
+                value: 3.0,
+            },
+        ]);
+        let plain_samples = SeriesValues::Scalar(vec![Sample {
+            ts_ns: 12_000,
+            value: 4.0,
+        }]);
+        let provenance = (0u32..3)
+            .map(|i| SampleProvenance {
+                created_unix_ns: 1_000 + i64::from(i) * 500,
+                writer_epoch: 7 + u64::from(i),
+                writer_seq: 100 + u64::from(i),
+                in_page_index: 0,
+            })
+            .collect();
+        let series = vec![
+            SeriesInputV7 {
+                series_id: merged_id,
+                labels: labels("merged"),
+                runs: vec![RunInputV7 {
+                    run: encode_run_v4(&merged_id, 1_000, 7, 100, &merged_samples)
+                        .expect("frame merged run"),
+                    provenance: Some(provenance),
+                }],
+            },
+            SeriesInputV7 {
+                series_id: plain_id,
+                labels: labels("plain"),
+                runs: vec![RunInputV7 {
+                    run: encode_run_v4(&plain_id, 2_000, 3, 200, &plain_samples)
+                        .expect("frame plain run"),
+                    provenance: None,
+                }],
+            },
+        ];
+        SegmentWriter::write_v7_with_provenance_at(
+            version,
+            series,
+            identity(),
+            bounds(),
+            CompactionMetaV4 {
+                ingest_hour_bucket: 4,
+                input_set_hash: [0x5C; 32],
+                part_index: 1,
+                level: 2,
+            },
+            Vec::new(),
+        )
+        .expect("provenance batch writes")
+        .bytes
+        .to_vec()
+    }
+
+    #[cfg(feature = "format-drill")]
+    fn write_sparse(version: SegmentVersion) -> Vec<u8> {
+        let specs: Vec<Values> = (0..V5_SPARSE_THRESHOLD)
+            .map(|i| {
+                let i = i64::try_from(i).expect("fits i64");
+                Values::Scalar(vec![(1_000 + i, i as f64), (2_000 + i, i as f64 + 0.5)])
+            })
+            .collect();
+        SegmentWriter::write_histograms_with_exemplars_at(
+            version,
+            instantiate(&specs),
+            identity(),
+            bounds(),
+            Vec::new(),
+        )
+        .expect("sparse batch writes")
+        .bytes
+        .to_vec()
+    }
+
+    #[cfg(feature = "format-drill")]
+    #[test]
+    fn writer_emits_each_window_version_and_reader_admits_both_under_format_drill() {
+        assert_eq!(
+            SegmentVersion::WINDOW,
+            &[SegmentVersion::Drill, SegmentVersion::V7]
+        );
+        assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION_DRILL);
+        assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION_V7);
+        assert_eq!(
+            SegmentVersion::from_number(VERSION_DRILL),
+            Some(SegmentVersion::Drill)
+        );
+
+        // Below the sparse threshold, with histograms and an exemplar.
+        assert_window_pair(
+            &write_small(SegmentVersion::V7),
+            &write_small(SegmentVersion::Drill),
+        );
+
+        // At the sparse threshold: the trailer is written by the sparse
+        // rebuild, not by the v4 body finalizer.
+        let sparse_current = write_sparse(SegmentVersion::V7);
+        let loc = open_from_full(&sparse_current, ReaderLimits::default()).expect("opens");
+        assert!(
+            loc.footer
+                .sections
+                .iter()
+                .any(|s| s.kind == section_kind::SERIES_IDX),
+            "sparse fixture did not take the sparse path"
+        );
+        assert_window_pair(&sparse_current, &write_sparse(SegmentVersion::Drill));
+
+        // The per-sample provenance entry point.
+        assert_window_pair(
+            &write_provenance(SegmentVersion::V7),
+            &write_provenance(SegmentVersion::Drill),
+        );
+    }
+
+    fn values_strategy() -> impl Strategy<Value = Values> {
+        prop_oneof![
+            prop::collection::vec((-1_000_000i64..1_000_000, any::<f64>()), 1..8)
+                .prop_map(Values::Scalar),
+            prop::collection::vec((-1_000_000i64..1_000_000, -64i32..64), 1..6)
+                .prop_map(Values::Histogram),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Random scalar/histogram batches written at v7 and at the drill
+        /// version: both open, decode to identical content, and differ only in
+        /// trailer version and crc.
+        #[cfg(feature = "format-drill")]
+        #[test]
+        fn random_batches_round_trip_at_both_window_versions(
+            specs in prop::collection::vec(values_strategy(), 1..24),
+        ) {
+            let write = |version| {
+                SegmentWriter::write_histograms_with_exemplars_at(
+                    version,
+                    instantiate(&specs),
+                    identity(),
+                    bounds(),
+                    Vec::new(),
+                )
+                .expect("random batch writes")
+                .bytes
+                .to_vec()
+            };
+            assert_window_pair(&write(SegmentVersion::V7), &write(SegmentVersion::Drill));
+        }
+
+        /// Default build: whatever the batch, the drill-shaped object (v7 bytes
+        /// under trailer version 8) is refused.
+        #[cfg(not(feature = "format-drill"))]
+        #[test]
+        fn random_batches_under_the_drill_version_are_refused_without_format_drill(
+            specs in prop::collection::vec(values_strategy(), 1..24),
+        ) {
+            let current = SegmentWriter::write_histograms_with_exemplars(
+                instantiate(&specs),
+                identity(),
+                bounds(),
+                Vec::new(),
+            )
+            .expect("random batch writes")
+            .bytes
+            .to_vec();
+            let refused = matches!(
+                open_from_full(&restamp(&current, VERSION_V7 + 1), ReaderLimits::default()),
+                Err(SegmentError::UnsupportedVersion(v)) if v == VERSION_V7 + 1
+            );
+            prop_assert!(refused);
         }
     }
 }
