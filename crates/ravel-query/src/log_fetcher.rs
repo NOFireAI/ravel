@@ -2502,6 +2502,7 @@ impl LogSegmentFetcher {
                     None,
                     None,
                     None,
+                    None,
                     primed,
                     ProbePhase::Plan,
                     accounting,
@@ -3322,6 +3323,18 @@ impl LogSegmentFetcher {
             survivors: expected_survivors,
             dirs: dirs.map(|d| &**d),
         });
+        // Issue #797: the ordinal case's ranged read resolves the positions
+        // to whole-object indices itself and fetches only those blocks. Only
+        // for strictly ascending positions: the raw open below drains in
+        // survivor order, and an ordinal open drains in the order given, so
+        // the two agree only then.
+        let resolved = std::sync::OnceLock::new();
+        let ordinal_blocks =
+            (!raw && indices.windows(2).all(|w| w[0] < w[1])).then_some(OrdinalBlocks {
+                positions: indices,
+                query,
+                resolved: &resolved,
+            });
         let Some((bytes, _blocks_read)) = self
             .tenant_bytes_with_footer(
                 seg_ref,
@@ -3331,6 +3344,7 @@ impl LogSegmentFetcher {
                 footer,
                 carried_whole,
                 owned_blocks,
+                ordinal_blocks,
                 None,
                 ProbePhase::Scan,
                 accounting,
@@ -3338,6 +3352,13 @@ impl LogSegmentFetcher {
             .await?
         else {
             return Ok(None);
+        };
+        // A resolved read holds only the resolved blocks' pages, so the open
+        // has to name them by value; the survivor check fails it closed if
+        // this open's own pruning disagrees with the resolution's.
+        let (indices, raw, expected_survivors) = match resolved.get() {
+            Some(resolved) => (&resolved.blocks[..], true, &resolved.survivors[..]),
+            None => (indices, raw, expected_survivors),
         };
         let key = &seg_ref.data_object_key;
         let span = decode_span();
@@ -3421,6 +3442,7 @@ impl LogSegmentFetcher {
             None,
             None,
             None,
+            None,
             phase,
             accounting,
         )
@@ -3472,6 +3494,12 @@ impl LogSegmentFetcher {
     /// no such list (every other funnel here) passes `None`, the unchanged
     /// behavior.
     ///
+    /// `ordinal_blocks`, when `Some` (issue #797), is a row-ref fetch's
+    /// survivor positions instead: the ranged read resolves them to raw
+    /// indices from the survivor list this query's scan computes and covers
+    /// only those blocks, as [`OrdinalBlocks`] describes. At most one of
+    /// `owned_blocks` and `ordinal_blocks` is `Some`.
+    ///
     /// `primed`, when `Some`, is the footer probe a keyed plan already read
     /// for this object; the ranged read replays it instead of probing again.
     #[allow(clippy::too_many_arguments)]
@@ -3484,6 +3512,7 @@ impl LogSegmentFetcher {
         footer: Option<&footer::LogFooter>,
         carried_whole: Option<CarriedWholeObject>,
         owned_blocks: Option<OwnedBlocks<'_>>,
+        ordinal_blocks: Option<OrdinalBlocks<'_>>,
         primed: Option<&PrimedProbe>,
         phase: ProbePhase,
         accounting: &QueryAccounting,
@@ -3552,6 +3581,7 @@ impl LogSegmentFetcher {
                         carried,
                         phases,
                         owned_blocks,
+                        ordinal_blocks,
                         primed,
                         FilterSections::for_query(query),
                         accounting,
@@ -4794,6 +4824,28 @@ struct OwnedBlocks<'a> {
     blocks: &'a [usize],
     survivors: &'a [usize],
     dirs: Option<&'a SegmentDirectories>,
+}
+
+/// A row-ref fetch's blocks (ADR-0774, issue #797): `positions` index the
+/// survivor list [`RlogReader::scan_blocks`] computes for `query` over this
+/// object, strictly ascending. A version-4 ranged read resolves them to
+/// whole-object block indices from that same survivor list, restricts its
+/// candidate set to those blocks, and stores the resolution in `resolved`, so
+/// the open names the blocks by value. A read that resolves nothing (the
+/// object was read whole, or it is version 3) leaves `resolved` empty, and the
+/// open addresses `positions` as before.
+#[derive(Clone, Copy)]
+struct OrdinalBlocks<'a> {
+    positions: &'a [usize],
+    query: &'a LogQuery,
+    resolved: &'a std::sync::OnceLock<ResolvedBlocks>,
+}
+
+/// [`OrdinalBlocks`] resolved: `blocks[i]` is the whole-object index of the
+/// block at position `positions[i]` of `survivors`, the survivor list itself.
+struct ResolvedBlocks {
+    blocks: Vec<usize>,
+    survivors: Vec<usize>,
 }
 
 /// Which of BLOOM and POSTINGS the scan over a ranged read can read, so the
@@ -7365,6 +7417,7 @@ impl BlockRangeFetcher {
             phases,
             None,
             None,
+            None,
             FilterSections::ALL,
             accounting,
         )
@@ -7394,6 +7447,7 @@ impl BlockRangeFetcher {
         plan_footer: Option<CarriedFooter<'_>>,
         phases: ReadPhases,
         owned_blocks: Option<OwnedBlocks<'_>>,
+        ordinal_blocks: Option<OrdinalBlocks<'_>>,
         primed: Option<&PrimedProbe>,
         filter_sections: FilterSections,
         accounting: &QueryAccounting,
@@ -7408,6 +7462,7 @@ impl BlockRangeFetcher {
             plan_footer,
             phases,
             owned_blocks,
+            ordinal_blocks,
             primed,
             filter_sections,
             accounting,
@@ -7427,6 +7482,7 @@ impl BlockRangeFetcher {
         plan_footer: Option<CarriedFooter<'_>>,
         phases: ReadPhases,
         owned_blocks: Option<OwnedBlocks<'_>>,
+        ordinal_blocks: Option<OrdinalBlocks<'_>>,
         primed: Option<&PrimedProbe>,
         filter_sections: FilterSections,
         accounting: &QueryAccounting,
@@ -7623,6 +7679,7 @@ impl BlockRangeFetcher {
                     &pin,
                     phases,
                     owned_blocks,
+                    ordinal_blocks,
                     filter_sections,
                     accounting,
                     stats,
@@ -7937,6 +7994,7 @@ impl BlockRangeFetcher {
         pin: &EtagPin,
         phases: ReadPhases,
         owned_blocks: Option<OwnedBlocks<'_>>,
+        ordinal_blocks: Option<OrdinalBlocks<'_>>,
         filter_sections: FilterSections,
         accounting: &QueryAccounting,
         mut stats: BlockRangeStats,
@@ -8148,6 +8206,44 @@ impl BlockRangeFetcher {
             fences = merge_fences(&foreign_extents);
             candidates.retain(|c| owned.binary_search(c).is_ok());
         }
+        // Issue #797: a row-ref fetch's positions index the survivor list the
+        // scan computes over this object, which needs the scan's own filter
+        // sections. Place those first, open the scan over them, and resolve the
+        // positions from its survivor list, so the read below covers only the
+        // winning blocks and the coverage crossover weighs only their pages.
+        // The survivors are ascending and so are the positions, so the resolved
+        // blocks are too.
+        if let (Some(ordinal), Some((skip_arc, page_arc))) = (ordinal_blocks, &local_dirs) {
+            self.place_scan_sections(
+                seg_ref,
+                tenant_hash,
+                footer,
+                probed,
+                false,
+                filter_sections,
+                phases,
+                pin,
+                &mut asm,
+                accounting,
+                &mut stats,
+            )
+            .await?;
+            let resolved = self
+                .resolve_ordinal_blocks(
+                    key,
+                    &asm,
+                    skip_arc,
+                    page_arc,
+                    local_field_dir.as_ref(),
+                    ordinal,
+                    columns,
+                    accounting,
+                )
+                .await?;
+            candidates.retain(|c| resolved.blocks.binary_search(c).is_ok());
+            // A second set cannot happen: one fetch per `OrdinalBlocks`.
+            let _ = ordinal.resolved.set(resolved);
+        }
         stats.candidate_blocks = candidates.len() as u64;
         let mut wanted = projected_page_extents(
             key,
@@ -8228,87 +8324,20 @@ impl BlockRangeFetcher {
             return Ok((bytes, stats));
         }
 
-        // The suffix probe normally places the object's tail -- the footer and
-        // trailer bytes `RlogReader` re-reads to open the placed regions,
-        // which are not themselves listed sections. A carried footer skipped the
-        // probe, so place that tail now (the version-3 path does the same).
-        if !probed {
-            let tail_start = footer
-                .sections
-                .iter()
-                .map(|s| s.offset + s.len)
-                .max()
-                .unwrap_or(0);
-            if tail_start < total_size && !asm.covers(tail_start, total_size) {
-                let (_, live) = self
-                    .place_extent(
-                        seg_ref,
-                        tenant_hash,
-                        tail_start,
-                        total_size - tail_start,
-                        GetRange::Range(tail_start, total_size),
-                        phases.metadata,
-                        pin,
-                        &mut asm,
-                        accounting,
-                    )
-                    .await?;
-                if live {
-                    stats.metadata_gets += 1;
-                }
-            }
-        }
-
-        // STREAM_DIR and FIELD_DIR: one coalesced GET over their adjacent span
-        // (ADR-2066 decision 1) for whatever the probe did not carry. On the
-        // narrow-projection path `place_and_decode_field_dir` already brought
-        // both, so this is a no-op there; on an all-columns v4 read of an
-        // object that holds them at the front it is the read's one front GET.
-        // Skipped when `dirs` carries the decoded directories (ADR-2414
-        // decision A1): the reader takes both from it.
-        if dirs.is_none() {
-            self.place_front_sections(
-                seg_ref,
-                tenant_hash,
-                footer,
-                phases.metadata,
-                pin,
-                &mut asm,
-                accounting,
-                &mut stats,
-            )
-            .await?;
-        }
-
-        // Any remaining tail section (BLOOM/POSTINGS) a short probe missed: one
-        // GET each, never coalesced with the directory pair. The
-        // reader re-verifies each section's crc on decode, so a corrupt section
-        // hit fails closed there (ADR-0046). KEY_IDX is never placed: the
-        // reader does not read it, and the plan probes it by range. With `dirs`, SKIP_IDX and PAGE_DIR
-        // are not placed either: nothing reads them from the buffer. BLOOM and
-        // POSTINGS are placed only when `filter_sections` says the scan can
-        // read them (`tail_section_placement_tests`).
-        for section in &footer.sections {
-            if matches!(
-                section.kind,
-                kind::BLOCKS | kind::STREAM_DIR | kind::FIELD_DIR | kind::KEY_IDX
-            ) || (dirs.is_some() && matches!(section.kind, kind::SKIP_IDX | kind::PAGE_DIR))
-                || filter_sections.skips(section.kind)
-            {
-                continue;
-            }
-            self.place_section(
-                seg_ref,
-                tenant_hash,
-                section,
-                phases.metadata,
-                pin,
-                &mut asm,
-                accounting,
-                &mut stats,
-            )
-            .await?;
-        }
+        self.place_scan_sections(
+            seg_ref,
+            tenant_hash,
+            footer,
+            probed,
+            dirs.is_some(),
+            filter_sections,
+            phases,
+            pin,
+            &mut asm,
+            accounting,
+            &mut stats,
+        )
+        .await?;
 
         self.fetch_chunk_ranges(
             seg_ref,
@@ -8331,6 +8360,172 @@ impl BlockRangeFetcher {
             None => asm.into_bytes(),
         };
         Ok((bytes, stats))
+    }
+
+    /// Resolves `ordinal`'s survivor positions to whole-object block indices
+    /// (issue #797) by opening the same scan the row-ref fetch's open will:
+    /// `RlogReader::scan_blocks` with the query's combined predicate and prune
+    /// channel, over the sections `asm` holds and the directories this read
+    /// already decoded. No block is decoded. Runs on the read gate as one
+    /// `log_postings` job when one is set, inline otherwise.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_ordinal_blocks(
+        &self,
+        key: &str,
+        asm: &ObjectAssembler,
+        skip: &Arc<SkipIndex>,
+        page_dir: &Arc<PageDir>,
+        field_dir: Option<&Arc<FieldDir>>,
+        ordinal: OrdinalBlocks<'_>,
+        columns: &ColumnSelection,
+        accounting: &QueryAccounting,
+    ) -> Result<ResolvedBlocks, LogFetchError> {
+        let regions = asm.placed.regions.clone();
+        let (skip, page_dir, field_dir) =
+            (Arc::clone(skip), Arc::clone(page_dir), field_dir.cloned());
+        let (cfg, query, columns) = (self.cfg, ordinal.query.clone(), columns.clone());
+        let positions = ordinal.positions.to_vec();
+        let accounting = accounting.clone();
+        let resolve = move || -> Result<ResolvedBlocks, LogSegError> {
+            let reader =
+                RlogReader::from_source_reusing(&regions, &cfg, skip, page_dir, field_dir)?;
+            let stream_ids = (!query.stream_attrs.is_empty()).then(|| {
+                matching_streams_in(reader.directories().stream_dir(), &query.stream_attrs)
+            });
+            let pred = combined_predicate_with_streams(&query, stream_ids);
+            let scan = reader.scan_blocks(&pred, &query.prune, &columns)?;
+            accounting.add_decompressed_bytes(scan.stats().decompressed_bytes);
+            let survivors = scan.survivor_block_indices();
+            let blocks = positions
+                .iter()
+                .map(|&p| {
+                    survivors.get(p).copied().ok_or_else(|| {
+                        LogSegError::Corrupted(format!(
+                            "subset block position {p} is out of range for {} surviving blocks",
+                            survivors.len()
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ResolvedBlocks { blocks, survivors })
+        };
+        let resolved = match &self.read_gate {
+            None => resolve(),
+            Some(gate) => gate
+                .run(
+                    ReadSite::LogPostings,
+                    JobSize::Bytes(asm.placed.regions.placed_len()),
+                    resolve,
+                )
+                .await
+                .map_err(|err| log_gate_failed(key, err))?,
+        };
+        resolved.map_err(|source| corrupt(key, source))
+    }
+
+    /// Places everything but BLOCKS that the reader opening a version-4
+    /// ranged read needs: the object's tail when no probe brought it, the
+    /// STREAM_DIR/FIELD_DIR pair, and the remaining tail sections the scan
+    /// reads. Placement skips what `asm` already holds, so a second call over
+    /// the same assembler issues no GET.
+    #[allow(clippy::too_many_arguments)]
+    async fn place_scan_sections(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        footer: &footer::LogFooter,
+        probed: bool,
+        has_dirs: bool,
+        filter_sections: FilterSections,
+        phases: ReadPhases,
+        pin: &EtagPin,
+        asm: &mut ObjectAssembler,
+        accounting: &QueryAccounting,
+        stats: &mut BlockRangeStats,
+    ) -> Result<(), LogFetchError> {
+        let total_size = seg_ref.object_size;
+        // The suffix probe normally places the object's tail -- the footer and
+        // trailer bytes `RlogReader` re-reads to open the placed regions,
+        // which are not themselves listed sections. A carried footer skipped the
+        // probe, so place that tail now (the version-3 path does the same).
+        if !probed {
+            let tail_start = footer
+                .sections
+                .iter()
+                .map(|s| s.offset + s.len)
+                .max()
+                .unwrap_or(0);
+            if tail_start < total_size && !asm.covers(tail_start, total_size) {
+                let (_, live) = self
+                    .place_extent(
+                        seg_ref,
+                        tenant_hash,
+                        tail_start,
+                        total_size - tail_start,
+                        GetRange::Range(tail_start, total_size),
+                        phases.metadata,
+                        pin,
+                        asm,
+                        accounting,
+                    )
+                    .await?;
+                if live {
+                    stats.metadata_gets += 1;
+                }
+            }
+        }
+
+        // STREAM_DIR and FIELD_DIR: one coalesced GET over their adjacent span
+        // (ADR-2066 decision 1) for whatever the probe did not carry. On the
+        // narrow-projection path `place_and_decode_field_dir` already brought
+        // both, so this is a no-op there; on an all-columns v4 read of an
+        // object that holds them at the front it is the read's one front GET.
+        // Skipped when `dirs` carries the decoded directories (ADR-2414
+        // decision A1): the reader takes both from it.
+        if !has_dirs {
+            self.place_front_sections(
+                seg_ref,
+                tenant_hash,
+                footer,
+                phases.metadata,
+                pin,
+                asm,
+                accounting,
+                stats,
+            )
+            .await?;
+        }
+
+        // Any remaining tail section (BLOOM/POSTINGS) a short probe missed: one
+        // GET each, never coalesced with the directory pair. The
+        // reader re-verifies each section's crc on decode, so a corrupt section
+        // hit fails closed there (ADR-0046). KEY_IDX is never placed: the
+        // reader does not read it, and the plan probes it by range. With `dirs`, SKIP_IDX and PAGE_DIR
+        // are not placed either: nothing reads them from the buffer. BLOOM and
+        // POSTINGS are placed only when `filter_sections` says the scan can
+        // read them (`tail_section_placement_tests`).
+        for section in &footer.sections {
+            if matches!(
+                section.kind,
+                kind::BLOCKS | kind::STREAM_DIR | kind::FIELD_DIR | kind::KEY_IDX
+            ) || (has_dirs && matches!(section.kind, kind::SKIP_IDX | kind::PAGE_DIR))
+                || filter_sections.skips(section.kind)
+            {
+                continue;
+            }
+            self.place_section(
+                seg_ref,
+                tenant_hash,
+                section,
+                phases.metadata,
+                pin,
+                asm,
+                accounting,
+                stats,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// The coalesced, already-covered-filtered, request-bounded byte ranges a
@@ -16635,6 +16830,7 @@ mod owned_block_plan_tests {
                 ReadPhases::SCAN,
                 owned,
                 None,
+                None,
                 FilterSections::ALL,
                 &QueryAccounting::new(),
             )
@@ -16944,6 +17140,7 @@ mod owned_block_plan_tests {
                 ReadPhases::SCAN,
                 owned,
                 None,
+                None,
                 FilterSections::ALL,
                 &QueryAccounting::new(),
             )
@@ -17166,6 +17363,7 @@ mod owned_block_plan_tests {
                     survivors,
                     dirs: None,
                 }),
+                None,
                 None,
                 FilterSections::ALL,
                 &QueryAccounting::new(),

@@ -79,7 +79,10 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{CacheFetchError, LogFetchError, LogSegmentFetcher, PhaseAccounting};
+use ravel_query::{
+    BlockRangeFetcher, CacheFetchError, LogFetchError, LogSegmentFetcher, PhaseAccounting,
+    PhaseWireByteCounts, QueryPhase,
+};
 use ravel_sql::{
     CeilingBreach, DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpillDecision,
     SqlConfig, SqlError, TenantDelegatingPool, TenantMemoryAccountant, build_session,
@@ -706,12 +709,12 @@ async fn phase_two_reads_only_the_segments_holding_the_winners() {
 }
 
 /// The same statements with no read cache, where phase 2's re-reads ARE real
-/// object-store requests: exactly one per block fetched, on top of phase 1's
-/// one per segment. This is the cost side of the trade the ADR states, pinned
-/// as a figure rather than described -- in requests AND in bytes, because the
-/// two do not say the same thing here (see the byte assertions below).
+/// object-store requests: exactly one per segment holding a winner, on top of
+/// phase 1's one per segment, however many of that segment's blocks won (issue
+/// #797). This is the cost side of the trade the ADR states, pinned as a figure
+/// rather than described -- in requests AND in bytes.
 #[tokio::test]
-async fn without_a_cache_phase_two_costs_exactly_one_get_per_fetched_block() {
+async fn without_a_cache_phase_two_costs_exactly_one_get_per_segment_holding_a_winner() {
     let one = run(&wide_statement(1), Setup::new().uncached()).await;
     let all = run(&wide_statement(10), Setup::new().uncached()).await;
     let baseline = run(&wide_statement(10), Setup::new().rule(false).uncached()).await;
@@ -726,37 +729,38 @@ async fn without_a_cache_phase_two_costs_exactly_one_get_per_fetched_block() {
     assert_eq!(
         one.gets,
         SEGMENTS as u64 + 1,
-        "one winner: four segment reads plus one block read"
+        "one winner: four segment reads plus one segment re-read"
     );
+    // Ten winners in more blocks than segments, so one open per block and one
+    // open per segment give different counts here.
+    assert!(all.blocks_fetched > all.segments_fetched);
     assert_eq!(
         all.gets,
-        SEGMENTS as u64 + MATCHES as u64,
-        "ten winners: four segment reads plus ten block reads"
+        2 * SEGMENTS as u64,
+        "ten winners in four segments: four segment reads plus four re-reads"
     );
     assert_eq!(
         all.gets - baseline.gets,
-        all.blocks_fetched as u64,
-        "the whole extra request cost is one GET per block phase 2 fetched"
+        all.segments_fetched as u64,
+        "the whole extra request cost is one GET per segment phase 2 opened"
     );
 
-    // Bytes, not just requests. Phase 2 restricts the DECODE to one block, but
-    // its byte fetch is the query's normal fetch for that object: these fixture
-    // objects are below the block-range threshold, so each block read is a
-    // whole-object GET, exactly as the baseline's segment reads are. So the
-    // cost is one object's bytes per winner, not one block's. 27,577 is the
-    // four objects a single pass moves (the baseline); 96,370 is that plus
-    // 68,793 for the ten whole-object block reads, and 34,235 is that plus
-    // 6,658 for one. See ADR-0774's consequences: narrowing that fetch to the
-    // named block indices is a ravel-query follow-up, and it is what would make
-    // the byte cost per-block rather than per-object.
+    // Bytes, not just requests. These fixture objects are below the
+    // block-range threshold, so each segment re-read is a whole-object GET,
+    // exactly as the baseline's segment reads are. 27,577 is the four objects
+    // a single pass moves (the baseline); 34,235 is that plus 6,658 for the
+    // one object holding the single winner, and 55,154 is the four objects
+    // twice. Above the threshold the re-read narrows to the winners' own pages
+    // instead (`phase_two_reads_only_the_winners_pages_and_opens_the_object_once`).
     assert_eq!(baseline.bytes, 27_577, "the four objects, once");
     assert_eq!(
         one.bytes, 34_235,
-        "one winner adds one whole-object block read"
+        "one winner adds one whole-object re-read"
     );
     assert_eq!(
-        all.bytes, 96_370,
-        "ten winners add ten whole-object block reads"
+        all.bytes,
+        2 * baseline.bytes,
+        "ten winners in four segments re-read each object once"
     );
     // And the rows are still identical, so the extra reads bought nothing but
     // the decode saving.
@@ -1273,5 +1277,345 @@ async fn a_fast_path_open_that_prunes_a_block_refuses_to_stamp_a_row_ref() {
                 && msg.contains("whole-segment open decoded block 2 at drain position 1")
         ),
         "expected the typed survivor-mismatch error, got {err:?}"
+    );
+}
+
+// ---- phase 2 over a ranged object -----------------------------------------
+
+/// Blocks in the ranged fixture: one segment, one row group.
+const RANGED_BLOCKS: usize = 6;
+const RANGED_RECORDS: usize = RANGED_BLOCKS * RECORDS_PER_BLOCK;
+const RANGED_TS_BASE: i64 = 100;
+/// The statement's lower `ts` bound: the first record of block 1, so the skip
+/// index prunes block 0 and every surviving block's position in the survivor
+/// list is its whole-object index minus one.
+const RANGED_TS_MIN: i64 = RANGED_TS_BASE + RECORDS_PER_BLOCK as i64;
+/// The three winners of [`ranged_statement`]: indices 7, 14 and 21, the first
+/// three [`NEEDLE`] records inside the window, in whole-object blocks 1, 3 and
+/// 5, which are survivor positions 0, 2 and 4.
+const RANGED_WINNER_BLOCKS: [u32; 3] = [1, 3, 5];
+
+/// Records every GET's range and returned length, in issue order.
+struct RecordingStore {
+    inner: Arc<MemoryStore>,
+    log: std::sync::Mutex<Vec<(GetRange, u64)>>,
+}
+
+impl RecordingStore {
+    fn log(&self) -> Vec<(GetRange, u64)> {
+        self.log.lock().expect("log lock").clone()
+    }
+}
+
+#[async_trait]
+impl ObjectStoreBackend for RecordingStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        let got = self.inner.get(key, range).await?;
+        self.log
+            .lock()
+            .expect("log lock")
+            .push((range, got.data.len() as u64));
+        Ok(got)
+    }
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
+    }
+}
+
+/// One segment of [`RANGED_BLOCKS`] blocks of the main fixture's records, `ts`
+/// rebased onto [`RANGED_TS_BASE`] so a window can be written as a literal. The
+/// ref is level L1, whose version-4 chunk reads are not bridged down to the L0
+/// run cap, so phase 2's wire bytes are exactly the pages it asks for.
+async fn ranged_snapshot(store: &dyn ObjectStoreBackend) -> (Snapshot, Vec<u8>) {
+    let recs: Vec<LogRecord> = (0..RANGED_RECORDS)
+        .map(|i| {
+            let mut r = record(i);
+            r.ts_ns = RANGED_TS_BASE + i as i64;
+            r.observed_ts_ns = r.ts_ns;
+            r
+        })
+        .collect();
+    let mut w = RlogWriter::new(block_config(None), identity(1));
+    for r in &recs {
+        w.push(r.clone()).expect("push");
+    }
+    let bytes = w.finish().expect("finish");
+    let key = "logs/ranged.rlog".to_string();
+    let size = bytes.len() as u64;
+    let content_hash = *blake3::hash(&bytes).as_bytes();
+    store
+        .put(
+            &key,
+            bytes::Bytes::from(bytes.clone()),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put");
+    let snapshot = Snapshot {
+        segments: vec![SegmentRef {
+            data_object_key: key,
+            object_size: size,
+            min_event_ts_ns: RANGED_TS_BASE,
+            max_event_ts_ns: RANGED_TS_BASE + RANGED_RECORDS as i64 - 1,
+            ingest_hour_bucket: 0,
+            sample_count: RANGED_RECORDS as u64,
+            series_count: 1,
+            shard: 0,
+            content_hash,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L1 {
+                input_set_hash: [0u8; 32],
+                part_index: 0,
+            },
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+    (snapshot, bytes)
+}
+
+fn ranged_statement() -> String {
+    format!(
+        "SELECT * FROM logs WHERE ts >= {} AND ts <= {} AND body LIKE '%{NEEDLE}%' \
+         ORDER BY ts LIMIT {}",
+        ts_literal(RANGED_TS_MIN),
+        ts_literal(RANGED_TS_BASE + RANGED_RECORDS as i64 - 1),
+        RANGED_WINNER_BLOCKS.len(),
+    )
+}
+
+/// One run over [`ranged_snapshot`]: no read cache, every object read ranged
+/// with no coalescing gap, so each GET is one the read asked for.
+struct RangedRun {
+    rows: Vec<RecordBatch>,
+    explain: String,
+    blocks_fetched: usize,
+    segments_fetched: usize,
+    log: Vec<(GetRange, u64)>,
+    wire: PhaseWireByteCounts,
+    object: Vec<u8>,
+}
+
+async fn run_ranged(rule: bool) -> RangedRun {
+    let base = Arc::new(MemoryStore::new());
+    let (snapshot, object) = ranged_snapshot(base.as_ref()).await;
+    let recording = Arc::new(RecordingStore {
+        inner: base,
+        log: std::sync::Mutex::new(Vec::new()),
+    });
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
+    // The probe reaches back to the end of BLOCKS and no further, so it holds
+    // every directory section and no page.
+    let (_, blocks_end) = blocks_extent(&object);
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&store))
+        .with_block_range(
+            BlockRangeFetcher::new(store)
+                .with_coalesce_gap(0)
+                .with_suffix_len(object.len() as u64 - blocks_end),
+        )
+        .with_block_range_threshold(0);
+    let wire = fetcher.phase_wire_byte_counter();
+    let provider = LogsTableProvider::new(
+        snapshot,
+        TenantHash(TENANT),
+        fetcher,
+        PhaseAccounting::pooled_over(&QueryAccounting::new()),
+    )
+    .with_declared_columns(declared_columns());
+    let ctx = session(provider, &config(Setup::new().rule(rule)));
+    let plan = ctx
+        .sql(&ranged_statement())
+        .await
+        .expect("statement plans")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let rows = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("statement runs");
+    RangedRun {
+        explain: displayable(plan.as_ref()).indent(false).to_string(),
+        blocks_fetched: metric(&plan, "LogsRowFetchExec", "blocks_fetched"),
+        segments_fetched: metric(&plan, "LogsRowFetchExec", "segments_fetched"),
+        rows,
+        log: recording.log(),
+        wire: wire.snapshot(),
+        object,
+    }
+}
+
+/// Phase 2's GETs: everything from the second footer probe on. Phase 1 probes
+/// the object once, in its plan read, and hands the footer to its scan; every
+/// phase-2 open probes for itself.
+fn phase_two_gets(log: &[(GetRange, u64)]) -> &[(GetRange, u64)] {
+    let probes: Vec<usize> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, (range, _))| matches!(range, GetRange::Suffix(_)))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        probes.len() >= 2,
+        "phase 1's plan probe and at least one phase-2 open: {log:?}"
+    );
+    &log[probes[1]..]
+}
+
+/// Every page the winners' blocks hold in every column, which is the most a
+/// `SELECT *` row fetch of them can need: the pages
+/// `PageDir::projected_page_ranges` lists for them, dictionary pages included.
+/// Returned as their total bytes and as the number of runs they form once
+/// touching ranges are joined, which is the GET count a read with no
+/// coalescing gap issues for them.
+fn winner_pages(object: &[u8]) -> (u64, usize) {
+    let reader = RlogReader::new(object, &RlogConfig::default()).expect("open");
+    let dirs = reader.directories();
+    let page_dir = dirs.page_dir();
+    assert_eq!(page_dir.groups.len(), 1, "one row group");
+    assert_eq!(page_dir.block_count(), RANGED_BLOCKS as u64);
+    let mut ranges = page_dir
+        .projected_page_ranges(0, &RANGED_WINNER_BLOCKS, None)
+        .expect("ranges");
+    ranges.sort_unstable();
+    let bytes = ranges.iter().map(|(_, len)| len).sum();
+    let mut runs = 0;
+    let mut run_end = None;
+    for (offset, len) in ranges {
+        if run_end != Some(offset) {
+            runs += 1;
+        }
+        run_end = Some(offset + len);
+    }
+    (bytes, runs)
+}
+
+/// The BLOCKS section's `[start, end)` in `object`.
+fn blocks_extent(object: &[u8]) -> (u64, u64) {
+    let footer = ravel_logseg::footer::open_source(object).expect("footer");
+    let blocks = footer
+        .section(ravel_logseg::footer::kind::BLOCKS)
+        .copied()
+        .expect("BLOCKS");
+    (blocks.offset, blocks.offset + blocks.len)
+}
+
+/// Phase 2 over an object above the block-range threshold reads only the
+/// winners' blocks' pages, opening the object once. The window prunes block 0,
+/// so the winners' row refs carry survivor positions 0, 2 and 4 for
+/// whole-object blocks 1, 3 and 5; phase 2 resolves those positions through the
+/// same survivor list and fetches the three blocks' pages in every column, and
+/// nothing of blocks 2 and 4 between them.
+///
+/// Fails against a fetch that takes the positions as whole-object indices (it
+/// fetches block 2 instead of 1, 3 and 5 and the open refuses block 0 as no
+/// survivor), against one that narrows the block set but keeps the coverage
+/// crossover on the object's whole candidate set (blocks 1 to 5 of six cross
+/// it, so the object is read whole), and against one that opens the object
+/// once per winning block (three probes, not one).
+#[tokio::test]
+async fn phase_two_reads_only_the_winners_pages_and_opens_the_object_once() {
+    let with = run_ranged(true).await;
+    let without = run_ranged(false).await;
+    assert!(
+        with.explain.contains("LogsRowFetchExec"),
+        "{}",
+        with.explain
+    );
+    assert!(!without.explain.contains("LogsRowFetchExec"));
+    assert_eq!(
+        ts_of(&with.rows),
+        vec![RANGED_TS_BASE + 7, RANGED_TS_BASE + 14, RANGED_TS_BASE + 21]
+    );
+    assert_eq!(with.rows, without.rows, "the rewrite changed the result");
+    assert_eq!(with.blocks_fetched, RANGED_WINNER_BLOCKS.len());
+    assert_eq!(with.segments_fetched, 1);
+
+    let phase_two = phase_two_gets(&with.log);
+    let (pages, page_runs) = winner_pages(&with.object);
+    let (blocks_start, blocks_end) = blocks_extent(&with.object);
+    let in_blocks = |range: &GetRange| match *range {
+        GetRange::Range(start, end) => start >= blocks_start && end <= blocks_end,
+        GetRange::Full | GetRange::Suffix(_) => false,
+    };
+    let block_bytes: u64 = phase_two
+        .iter()
+        .filter(|(range, _)| in_blocks(range))
+        .map(|(_, len)| len)
+        .sum();
+    let total: u64 = phase_two.iter().map(|(_, len)| len).sum();
+    eprintln!(
+        "phase 2: gets={} bytes={total} block_bytes={block_bytes} winner_pages={pages} \
+         object={} log={phase_two:?}",
+        phase_two.len(),
+        with.object.len(),
+    );
+    assert_eq!(
+        phase_two
+            .iter()
+            .filter(|(range, _)| matches!(range, GetRange::Suffix(_)))
+            .count(),
+        1,
+        "phase 2 opens the object once"
+    );
+    assert!(
+        phase_two
+            .iter()
+            .all(|(range, _)| !matches!(range, GetRange::Full)),
+        "phase 2 never reads the object whole"
+    );
+    assert_eq!(
+        block_bytes, pages,
+        "phase 2's BLOCKS bytes are the winners' pages, exactly"
+    );
+    // The whole of phase 2 is that one probe, which already holds every
+    // directory and filter section, and one GET per run of winner pages.
+    let probe = with.object.len() as u64 - blocks_end;
+    assert_eq!(phase_two.len(), 1 + page_runs);
+    assert_eq!(total, probe + pages);
+    assert_eq!(
+        (phase_two.len(), total, pages),
+        (115, 6_980, 2_820),
+        "phase 2's exact request and wire-byte figures on this fixture"
+    );
+    // Every BLOCKS byte either phase moved is charged to the scan phase, and
+    // nothing else is.
+    let all_block_bytes: u64 = with
+        .log
+        .iter()
+        .filter(|(range, _)| in_blocks(range))
+        .map(|(_, len)| len)
+        .sum();
+    assert_eq!(with.wire.phase(QueryPhase::Scan), all_block_bytes);
+    assert_eq!(
+        with.wire.total(),
+        with.log.iter().map(|(_, len)| len).sum::<u64>()
     );
 }
