@@ -1547,7 +1547,10 @@ decoded from them are both live the two ledgers can count overlapping bytes
 catalog resolve charges its own decodes the same way
 (`Catalog::with_memory_budget`, docs/catalog-and-mvcc.md), and the server
 passes it this same process budget, so a catalog decode that does not fit is
-refused too. The `/api/v1/metadata` cache (`MetadataCache::with_memory_budget`)
+refused too. `/api/v1/query_exemplars` charges each L1 object's catalog
+decode, per-sample provenance included, to the same process budget
+(`ravel-server`'s `exemplars.rs`) and answers a refused decode with the 422
+`FetchMemoryExhausted`. The `/api/v1/metadata` cache (`MetadataCache::with_memory_budget`)
 still defaults to an unlimited budget and the server does not pass it the real
 one, so its reservations account without refusing. These guards come from the
 same RAII `reserve` API, so they read under `component="fetch"`.

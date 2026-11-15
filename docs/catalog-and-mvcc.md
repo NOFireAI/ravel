@@ -1721,6 +1721,14 @@ LABEL_DICT sections in flight, up to `fold_bucket_concurrency`; the encoded
 leaves of one pass until their PUTs; and per-entry bookkeeping. ADR-3692's
 amendments to decision 5 list these.
 
+The metrics postings build decodes each fetched object's catalog through
+the charged decoder, so an L1 object's per-sample provenance (up to 64 B
+of columns plus 32 B per sample) is charged to the fold's memory budget
+before it is allocated (the catalog's `memory_budget()`, the process budget on
+the server) and released once the entries are taken. A
+refused charge aborts that postings build like any decode error, and the
+snapshot is published without a postings ref.
+
 A metrics fold holds one more set of pairs, against an allowance of its
 own: the `label_value` pairs its postings build read from objects it
 fetched whole, held from the postings build until the leaf of the entry's
