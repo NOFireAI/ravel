@@ -532,14 +532,21 @@ pub(super) async fn load_with_drain_reflush_period(
     // is sized with the resolved cursor count, not the flag.
     let memory_options = load_memory
         .unwrap_or_else(|| LoadMemoryOptions::new(LoadMemoryRequest::from_flag_on_host(None)));
-    let decode_workers = memory_options
-        .decode_workers
-        .unwrap_or_else(default_decode_workers);
+    let concurrent_flushes = u64::from(shards) * u64::from(max_inflight_flushes);
+    let decode_workers = memory_options.decode_workers.unwrap_or_else(|| {
+        LoadMemory::cap_decode_workers(
+            memory_options.request,
+            cursor_count,
+            default_decode_workers(),
+            concurrent_flushes,
+            footer_batch_bytes(&metadata, batch_rows),
+        )
+    });
     let load_memory = LoadMemory::resolve(
         memory_options.request,
         cursor_count,
         decode_workers,
-        u64::from(shards) * u64::from(max_inflight_flushes),
+        concurrent_flushes,
     )
     .map_err(LoadError::Setup)?;
     let charger = match load_memory {
@@ -1497,13 +1504,16 @@ impl BatchCharger {
 }
 
 /// The default `--decode-workers`: one build worker per this many available
-/// cores, at least one. Stage 0 of ADR-4203 measured `build_columnar_batch` at
-/// 17.7% of load CPU against 70.5% for flush encode, about one core of build
-/// per four of encode.
+/// cores, at least one. The ratio is derived from the measured CPU share of
+/// a load, `build_columnar_batch` at 17.7% against 70.5% for flush encode,
+/// about one core of build per four of encode. It is a starting point, not a
+/// tuned value.
 pub const DECODE_WORKERS_CORES_PER_WORKER: usize = 4;
 
 /// [`DECODE_WORKERS_CORES_PER_WORKER`] applied to this host's available
-/// parallelism, 1 when it cannot be read.
+/// parallelism, 1 when it cannot be read. The loader then caps it with
+/// [`LoadMemory::cap_decode_workers`] so a derived budget keeps room for one
+/// batch.
 pub fn default_decode_workers() -> usize {
     std::thread::available_parallelism()
         .map_or(1, |cores| cores.get() / DECODE_WORKERS_CORES_PER_WORKER)

@@ -483,6 +483,11 @@ pub async fn run_load_reporting(
              `ravel-cli catalog fold --signal {name} --writers-stopped` once the load has exited"
         );
     }
+    // Rejected on every signal, before the warning that a metrics or spans
+    // load ignores the flag: 0 is invalid wherever it would apply.
+    if decode_workers == Some(0) {
+        return Err(LoadError::Setup(DECODE_WORKERS_ZERO.to_string()).into());
+    }
     let max_flush_delay = Some(max_flush_delay.unwrap_or(DEFAULT_MAX_FLUSH_DELAY));
     // A diagnostic that cannot be written is not worth failing a durable load
     // over, here or below.
@@ -1002,10 +1007,10 @@ pub(super) const DECODE_QUEUE_BATCHES_ZERO: &str = "--decode-queue-batches must 
                                          of decoded batches allowed to queue ahead of the shard \
                                          writers); 0 was given";
 
-/// `--decode-workers 0`, rejected on the logs signal.
+/// `--decode-workers 0`, rejected on every signal.
 pub(super) const DECODE_WORKERS_ZERO: &str = "--decode-workers must be at least 1 (the number of \
                                               threads building decoded batches), or omitted for \
-                                              one per four available cores; 0 was given";
+                                              the derived default; 0 was given";
 
 /// Reject the two lever values both sequential paths call invalid and warn
 /// about a value either path would ignore, shared by the metrics and spans

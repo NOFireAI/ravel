@@ -97,10 +97,29 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     (dir, pq, mapping)
 }
 
-/// One hash per RLOG object in sorted order, and the rows the objects hold.
-/// The hash covers every section's stored bytes and the footer's content
-/// fields, leaving out the per-run random writer id the footer also carries.
-async fn rlog_objects(store: &Arc<dyn ObjectStoreBackend>) -> (Vec<[u8; 32]>, u64) {
+/// Where a logs data object sits in its shard's write order, read off its key
+/// (`.../l0/<shard>/<writer_id>.<epoch>.<seq>.<hash>.rseg`): the shard and
+/// the writer's sequence number. The writer id is random per run and the
+/// epoch is read from the wall clock, so both are left out.
+type WriteSlot = (String, u64);
+
+fn write_slot(key: &str) -> WriteSlot {
+    let (dir, name) = key.rsplit_once('/').expect("a key with a directory");
+    let shard = dir.rsplit('/').next().expect("a shard directory");
+    let parts: Vec<&str> = name.split('.').collect();
+    assert_eq!(parts.len(), 5, "a logs data key: {key}");
+    assert_eq!(parts[4], "rseg", "a logs data key: {key}");
+    let seq = parts[2]
+        .parse::<u64>()
+        .unwrap_or_else(|e| panic!("the sequence number in {key} parses: {e}"));
+    (shard.to_string(), seq)
+}
+
+/// One hash per RLOG object, in each shard's write order, and the rows the
+/// objects hold. The hash covers every section's stored bytes and the
+/// footer's content fields, leaving out the per-run random writer id the
+/// footer also carries.
+async fn rlog_objects(store: &Arc<dyn ObjectStoreBackend>) -> (Vec<(WriteSlot, [u8; 32])>, u64) {
     let mut hashes = Vec::new();
     let mut rows = 0;
     for meta in list_all(store.as_ref(), "").await.expect("list") {
@@ -134,17 +153,57 @@ async fn rlog_objects(store: &Arc<dyn ObjectStoreBackend>) -> (Vec<[u8; 32]>, u6
             let start = section.offset as usize;
             hasher.update(&data[start..start + section.len as usize]);
         }
-        hashes.push(*hasher.finalize().as_bytes());
+        hashes.push((write_slot(&meta.key), *hasher.finalize().as_bytes()));
     }
     hashes.sort_unstable();
+    let slots = hashes.len();
+    hashes.dedup_by(|a, b| a.0 == b.0);
+    assert_eq!(hashes.len(), slots, "one object per write slot");
     (hashes, rows)
+}
+
+/// The flush geometry of one comparison: both keep the memory budget from
+/// placing a flush boundary.
+#[derive(Debug, Clone, Copy)]
+enum Geometry {
+    /// `--target-bytes` at the per-batch target: every batch flushes on its
+    /// own, whatever the budget.
+    PerBatchTarget,
+    /// The derived target under an explicit `--pipeline-depth` and an
+    /// explicit `--load-memory-bytes` far above what the load holds, so the
+    /// depth is not derived from the budget and the decoder never waits on it.
+    ExplicitDepthAndMemory,
+}
+
+impl Geometry {
+    fn pipeline_depth(self) -> Option<usize> {
+        match self {
+            Self::PerBatchTarget => Some(1),
+            Self::ExplicitDepthAndMemory => Some(3),
+        }
+    }
+
+    fn target_bytes(self) -> Option<usize> {
+        match self {
+            Self::PerBatchTarget => Some(PER_BATCH_TARGET_BYTES),
+            Self::ExplicitDepthAndMemory => None,
+        }
+    }
+
+    fn load_memory_bytes(self) -> Option<u64> {
+        match self {
+            Self::PerBatchTarget => None,
+            Self::ExplicitDepthAndMemory => Some(4 << 30),
+        }
+    }
 }
 
 async fn load_with_workers(
     pq: &Path,
     mapping: &Path,
     decode_workers: usize,
-) -> (Vec<[u8; 32]>, u64) {
+    geometry: Geometry,
+) -> (Vec<(WriteSlot, [u8; 32])>, u64) {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     load::run(
         Arc::clone(&store),
@@ -156,17 +215,17 @@ async fn load_with_workers(
         BATCH_ROWS,
         0,
         Some(4),
-        Some(1),
+        geometry.pipeline_depth(),
         1,
         DEFAULT_DECODE_QUEUE_BATCHES,
         Some(decode_workers),
-        Some(PER_BATCH_TARGET_BYTES),
+        geometry.target_bytes(),
         None,
         None,
         RlogZstdLevel::DEFAULT,
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
-        None,
+        geometry.load_memory_bytes(),
         false,
         &ravel_cli::ipcrypt::IpcryptPolicy::empty(),
         None,
@@ -178,26 +237,94 @@ async fn load_with_workers(
 }
 
 /// The same file loaded with one decode worker and with four writes the same
-/// objects: the same count, the same rows, and every object's content hash
-/// equal.
+/// objects in the same order when the memory budget places no flush
+/// boundary: the same count, the same rows, and in each shard the object at
+/// each write slot has the same content hash. Run under a per-batch target,
+/// and under the derived target with an explicit `--pipeline-depth` and
+/// `--load-memory-bytes`.
 ///
-/// Prove-the-test: emit each built batch as it arrives
-/// (`ready.pop_first()` for `ready.remove(&self.next_emit)` in
-/// `DecodeCoordinator::run`) and the four-worker load writes fewer rows.
+/// Prove-the-test: in `DecodeCoordinator::run`, emit the lowest ready batch
+/// instead of `ready.remove(&self.next_emit)` (completion order, terminals
+/// still last). Under the per-batch target the four-worker load then writes
+/// the same set of objects in a different order, which the slot comparison
+/// catches and a sorted set of hashes does not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_and_four_decode_workers_write_the_same_objects() {
     let (_dir, pq, mapping) = fixture();
-    let (one, one_rows) = load_with_workers(&pq, &mapping, 1).await;
-    let (four, four_rows) = load_with_workers(&pq, &mapping, 4).await;
     let total: i64 = GROUP_ROWS.iter().sum();
-    assert_eq!(
-        one_rows, total as u64,
-        "the one-worker load wrote every row"
-    );
-    assert_eq!(four_rows, one_rows, "both loads wrote the same rows");
-    assert!(one.len() > 2, "several objects: {}", one.len());
-    assert_eq!(four.len(), one.len(), "both loads wrote the same objects");
-    assert_eq!(four, one, "every object's content hash is the same");
+    for geometry in [Geometry::PerBatchTarget, Geometry::ExplicitDepthAndMemory] {
+        let (one, one_rows) = load_with_workers(&pq, &mapping, 1, geometry).await;
+        let (four, four_rows) = load_with_workers(&pq, &mapping, 4, geometry).await;
+        assert_eq!(
+            one_rows, total as u64,
+            "{geometry:?}: the one-worker load wrote every row"
+        );
+        assert_eq!(four_rows, one_rows, "{geometry:?}: both wrote the same rows");
+        assert!(one.len() > 2, "{geometry:?}: several objects: {}", one.len());
+        assert_eq!(
+            four.len(),
+            one.len(),
+            "{geometry:?}: both wrote the same objects"
+        );
+        for (slot, (four, one)) in four.iter().zip(&one).enumerate() {
+            assert_eq!(
+                four, one,
+                "{geometry:?}: object {slot} in write order differs"
+            );
+        }
+    }
+}
+
+/// `--decode-workers 0` is refused on every signal before anything is read
+/// or written, including the metrics and spans loads that otherwise only
+/// warn that they ignore the flag.
+///
+/// Prove-the-test: delete the `decode_workers == Some(0)` refusal in
+/// `run_load_reporting` and the metrics and spans loads fail on the logs
+/// mapping instead, with a different message.
+#[tokio::test]
+async fn a_zero_decode_workers_is_refused_on_every_signal() {
+    let (_dir, pq, mapping) = fixture();
+    for signal in [SignalArg::Logs, SignalArg::Metrics, SignalArg::Spans] {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let err = load::run(
+            Arc::clone(&store),
+            &pq,
+            "acme",
+            &mapping,
+            signal,
+            2,
+            BATCH_ROWS,
+            0,
+            None,
+            None,
+            1,
+            DEFAULT_DECODE_QUEUE_BATCHES,
+            Some(0),
+            None,
+            None,
+            None,
+            RlogZstdLevel::DEFAULT,
+            RlogGroupTargetBlocks::DEFAULT,
+            RlogChunkOrder::DEFAULT,
+            None,
+            false,
+            &ravel_cli::ipcrypt::IpcryptPolicy::empty(),
+            None,
+            CLOCK_NS,
+        )
+        .await
+        .expect_err("a zero worker count is refused");
+        let message = format!("{err:#}");
+        assert!(
+            message.starts_with("--decode-workers must be at least 1"),
+            "{signal:?}: {message}"
+        );
+        assert!(
+            list_all(store.as_ref(), "").await.expect("list").is_empty(),
+            "{signal:?}: nothing written"
+        );
+    }
 }
 
 fn cli_load(pq: &Path, mapping: &Path, decode_workers: usize) -> String {
