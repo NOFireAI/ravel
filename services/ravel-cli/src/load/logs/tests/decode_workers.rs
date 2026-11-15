@@ -626,6 +626,152 @@ async fn an_oldest_batch_that_outgrows_its_estimate_is_not_starved_by_later_ones
     );
 }
 
+/// The batch a row rejection lands in, in [`rejection_fixture`].
+const REJECTED_BATCH: usize = 3;
+
+/// The input row [`rejection_fixture`] rejects: row 50 of batch 3.
+const REJECTED_ROW: u64 = 350;
+
+/// The outgrow fixture (batch 0's short bodies under-state batches 1-7) at 100
+/// rows a batch on one cursor, with row [`REJECTED_ROW`] dated past the
+/// future-skew limit, so batch 3's build rejects it.
+fn rejection_fixture(
+    body_len: usize,
+    limits: &LogIngestLimits,
+) -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
+    let long_body = "x".repeat(body_len);
+    let bodies: Vec<&str> = (0..8)
+        .map(|g| if g == 0 { "a" } else { &long_body })
+        .collect();
+    let skew = limits.max_future_skew_ns;
+    bodies_fixture_at(100, &bodies, move |g, r| {
+        if g == REJECTED_BATCH && r == 50 {
+            NOW_NS + skew + 1
+        } else {
+            NOW_NS
+        }
+    })
+}
+
+/// Runs [`rejection_fixture`] through four workers under a budget of `limit`
+/// and checks that it emits the serial sequence (batches 0-2, then the
+/// rejection), that batch 2 was dropped and rebuilt, and that every charge
+/// came back.
+async fn assert_rejection_ends_a_discarding_run(decode: &Decode<'_>, limit: u64) {
+    let serial = decode.run(1, None, None).await;
+    assert_eq!(serial.len(), REJECTED_BATCH + 1, "{serial:?}");
+    assert!(
+        matches!(
+            serial.last(),
+            Some(Emitted::Rejected {
+                row: REJECTED_ROW,
+                ..
+            })
+        ),
+        "{:?}",
+        serial.last()
+    );
+
+    let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(limit));
+    let gate = Arc::new(Gate::default());
+    let budgeted = decode
+        .run(
+            4,
+            Some(gated(&gate, |_, _| false)),
+            Some(BatchCharger::new(Arc::clone(&budget))),
+        )
+        .await;
+    assert_eq!(budgeted, serial, "the load ends with the rejection");
+    let log = gate.lock();
+    assert_eq!(
+        log.started.iter().filter(|&&s| s == 2).count(),
+        2,
+        "batch 1's correction discarded batch 2, which was rebuilt: {:?}",
+        log.started
+    );
+    assert_eq!(budget.in_flight_bytes(), 0, "every charge was returned");
+}
+
+/// A row rejected inside the window while the oldest batch outgrows its
+/// estimate: batches 1-4 are dispatched under a budget of four estimates,
+/// batch 3's build rejects a row, and batch 1 alone exceeds the budget, so
+/// its correction discards batches 2 and 4. The rejection holds no batch, so
+/// it holds no charge either, and batch 1 is admitted once nothing else is
+/// held.
+///
+/// Prove-the-test: drop the `self.charges.remove(&seq)` for a terminal
+/// outcome in `DecodeCoordinator::received` and batch 1's correction waits
+/// forever on batch 3's estimate, which only the waiting coordinator could
+/// release; `Decode::run` fails on "the decode stage finishes".
+#[test]
+fn a_rejection_in_the_window_does_not_starve_the_oldest_correction() {
+    guarded(a_rejection_in_the_window_does_not_starve_the_oldest_correction_body());
+}
+
+async fn a_rejection_in_the_window_does_not_starve_the_oldest_correction_body() {
+    let limits = LogIngestLimits::default();
+    let (_dir, pq, m) = rejection_fixture(2_000, &limits);
+    let decode = Decode {
+        pq: &pq,
+        mapping: &m,
+        read_cursors: 1,
+        batch_rows: 100,
+        limits,
+    };
+    let sizes: Vec<u64> = measured_sizes(&decode)
+        .await
+        .into_iter()
+        .map(|(_, bytes)| bytes)
+        .collect();
+    let estimate = estimate_after(sizes[0], 100);
+    assert!(sizes[1] > 4 * estimate, "batch 1 outgrows the budget alone");
+    assert_rejection_ends_a_discarding_run(&decode, 4 * estimate).await;
+}
+
+/// The same rejection under a budget where batch 1's correction fits beside
+/// batch 3's estimate but not beside batches 2-4's: batch 1 is admitted after
+/// the discard, and the rebuilt batch 2, now the oldest, is charged batch 1's
+/// bytes per row, which round up past batch 1's bytes. That charge fits the
+/// budget only once the rejection's estimate is gone.
+///
+/// Prove-the-test: drop the `self.charges.remove(&seq)` for a terminal
+/// outcome in `DecodeCoordinator::received` and the rebuilt batch 2's charge
+/// in `charge_for_build` waits forever on batch 3's estimate; `Decode::run`
+/// fails on "the decode stage finishes".
+#[test]
+fn a_rejection_in_the_window_does_not_starve_a_rebuilt_oldest_batch() {
+    guarded(a_rejection_in_the_window_does_not_starve_a_rebuilt_oldest_batch_body());
+}
+
+async fn a_rejection_in_the_window_does_not_starve_a_rebuilt_oldest_batch_body() {
+    let limits = LogIngestLimits::default();
+    let (_dir, pq, m) = rejection_fixture(2_001, &limits);
+    let decode = Decode {
+        pq: &pq,
+        mapping: &m,
+        read_cursors: 1,
+        batch_rows: 100,
+        limits,
+    };
+    let sizes: Vec<u64> = measured_sizes(&decode)
+        .await
+        .into_iter()
+        .map(|(_, bytes)| bytes)
+        .collect();
+    let estimate = estimate_after(sizes[0], 100);
+    let limit = sizes[1] + estimate;
+    assert!(
+        estimate_after(sizes[1], 100) > sizes[1],
+        "batch 1's bytes per row round up: {}",
+        sizes[1]
+    );
+    assert!(
+        sizes[1] >= 4 * estimate,
+        "batches 1-4 are dispatched beside batch 0"
+    );
+    assert_rejection_ends_a_discarding_run(&decode, limit).await;
+}
+
 /// While the oldest batch outgrows its estimate, the budget's in-flight bytes
 /// never fall below the measured bytes of the batches that exist: those the
 /// test holds, and every later batch already built (held for re-sequencing,
@@ -830,6 +976,51 @@ async fn a_build_worker_panic_fails_the_load_and_nothing_hangs_body() {
         starts.load(Ordering::SeqCst) >= 3,
         "the third build started"
     );
+}
+
+/// A build hook that panics after a worker's build fails the decode task like
+/// a build panic, instead of killing the worker without a result.
+///
+/// Prove-the-test: move `ctx.notify(seq, BuildEvent::Delivered)` in
+/// `build_worker` back out of the `catch_unwind` and the worker dies without
+/// sending batch 2's outcome; the coordinator waits on it forever and the
+/// drain fails on "the decode stage ends".
+#[test]
+fn a_panicking_delivered_hook_fails_the_decode_task() {
+    guarded(a_panicking_delivered_hook_fails_the_decode_task_body());
+}
+
+async fn a_panicking_delivered_hook_fails_the_decode_task_body() {
+    let (_dir, pq, m) = uniform_rows_fixture(100, 8);
+    let decode = Decode {
+        pq: &pq,
+        mapping: &m,
+        read_cursors: 1,
+        batch_rows: 100,
+        limits: LogIngestLimits::default(),
+    };
+    let hook: SeqBuildHook = Arc::new(|seq, event| {
+        if seq == 2 && event == BuildEvent::Delivered {
+            panic!("injected hook panic");
+        }
+    });
+    let (mut rx, handle) = decode.spawn(4, Some(hook), None);
+    let received = tokio::time::timeout(RUN_GUARD, async {
+        // allow-wall-clock: hang guard only
+        let mut received = Vec::new();
+        while let Some(p) = rx.recv().await {
+            received.push(emitted(p, false));
+        }
+        received
+    })
+    .await
+    .expect("the decode stage ends");
+    // Batches 0-3 build at once, so the failure can arrive before either
+    // earlier batch is emitted; nothing from batch 2 on is.
+    assert!(received.len() <= 2, "batches 0 and 1 at most: {received:?}");
+    assert!(received.iter().all(|e| !e.is_terminal()), "{received:?}");
+    let err = handle.await.expect_err("the decode task fails");
+    assert!(err.is_panic(), "a panic, not a cancellation: {err:?}");
 }
 
 /// The loader dropping its receiver while four builds are in flight ends the

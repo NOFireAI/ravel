@@ -1742,18 +1742,31 @@ fn bodies_fixture(
     batch_rows: usize,
     bodies: &[&str],
 ) -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
+    bodies_fixture_at(batch_rows, bodies, |_, _| NOW_NS)
+}
+
+/// [`bodies_fixture`] with row `r` of row group `g` at timestamp `ts(g, r)`.
+fn bodies_fixture_at(
+    batch_rows: usize,
+    bodies: &[&str],
+    ts: impl Fn(usize, usize) -> i64,
+) -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
     use parquet::arrow::ArrowWriter;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let pq = dir.path().join("uniform.parquet");
-    let group = |body: &str| {
+    let group = |g: usize, body: &str| {
         batch(vec![
-            ("ts", i64_col(vec![NOW_NS; batch_rows])),
+            ("ts", i64_col((0..batch_rows).map(|r| ts(g, r)).collect())),
             ("svc", str_col(vec!["api"; batch_rows])),
             ("msg", str_col(vec![body; batch_rows])),
         ])
     };
-    let groups: Vec<RecordBatch> = bodies.iter().map(|body| group(body)).collect();
+    let groups: Vec<RecordBatch> = bodies
+        .iter()
+        .enumerate()
+        .map(|(g, body)| group(g, body))
+        .collect();
     let file = std::fs::File::create(&pq).expect("create parquet");
     let mut writer = ArrowWriter::try_new(file, groups[0].schema(), None).expect("arrow writer");
     for g in &groups {
