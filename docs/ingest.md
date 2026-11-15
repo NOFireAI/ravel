@@ -2175,14 +2175,16 @@ shard writers strictly in the order they were dealt, so the batch sequence the
 writers see is the same at any W. A rejected row ends the sequence at the same
 point too: every batch dealt before it is handed on, and nothing after it.
 
-The objects written are the same at any W only when the memory budget places
-no flush boundary: with an explicit `--pipeline-depth` and
-`--load-memory-bytes`, or with a per-batch `--target-bytes`. Otherwise W can
-change them in two ways. A derived budget is host memory less the floor, and
-the floor grows with W (below), so a larger W can lower the memory-derived
-pipeline depth. And W changes how fast the decoder fills the budget, so it
-changes when the stall flusher, which flushes the shard buffers while the
-decoder waits for memory, fires.
+The objects written are the same at any W only when no flush depends on
+timing: with a per-batch `--target-bytes`, or with an explicit
+`--pipeline-depth`, a `--load-memory-bytes` the load never fills, and no shard
+buffer older than `--max-flush-delay`. Otherwise object boundaries depend on
+timing, independent of W. The stall flusher, on whenever the target is above
+per-batch, flushes the shard buffers when two wall-clock samples find the
+decoder waiting on a full budget, so where it fires can differ between two
+runs at the same W. And a derived budget is host memory less the floor, which
+grows with W (below), so a larger W can also lower the memory-derived pipeline
+depth.
 
 `1` builds on the decode thread itself, the pipeline before this flag. Unset,
 W is one worker per four available cores, at least 1
@@ -2193,14 +2195,20 @@ encode, and is a starting point rather than a tuned value. When the budget is
 derived from host memory, the unset default is then capped: it is lowered to
 the largest W whose floor leaves the budget room for one batch, estimated
 before any batch is built as the Parquet footer's uncompressed bytes per row
-times `--batch-rows`, and to 1 when no W does. An explicit W is not lowered.
+times `--batch-rows` (or the file's row count, when smaller), and to 1 when no
+W does. An explicit W is not lowered.
 `0` is rejected on every signal. Metrics and spans loads have no build stage
 to spread; they ignore any other value and warn when it is set.
 
-Every batch being built or held carries a charge on `--load-memory-bytes`, on
-every path. Its estimated size is charged before its build starts, at the
-bytes per row of the last batch handed on; the first batch builds alone, since
-nothing has measured a batch yet. At most W batches are dealt and not yet
+Every batch being built, or built and not yet handed on, carries a charge on
+`--load-memory-bytes`, on every path. Rows collected for a batch whose build
+has not started (waiting for room, or queued to be rebuilt) are not charged:
+they are views into the cursors' decoded Arrow, which the per-cursor floor
+bounds (below). A rejected row or a failed build leaves no batch, so its
+charge is refunded as soon as its outcome arrives. A batch's estimated size is
+charged before its build starts, at the bytes per row of the last batch handed
+on; the first batch builds alone, since nothing has measured a batch yet. At
+most W batches are dealt and not yet
 handed on at once, and fewer when the budget holds fewer estimated batches.
 The batch next in line waits for its charge; a later batch is built only if
 its charge fits now. When a batch is handed on, its charge is resized to its

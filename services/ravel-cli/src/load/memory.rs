@@ -1,11 +1,14 @@
 //! The logs loader's memory budget (`--load-memory-bytes`, issue #2626,
 //! ADR-2614 decision 5).
 //!
-//! Every batch being built or held is charged to the budget, on every path,
-//! from before a decode worker builds it until the last flush carrying its
-//! rows finishes: an estimate before the build (the last emitted batch's
-//! measured bytes per row, 0 for the first batch, which builds alone),
-//! resized to the built batch's measured
+//! Every batch being built, or built and not yet emitted, is charged to the
+//! budget, on every path, from before a decode worker builds it until the
+//! last flush carrying its rows finishes; rows collected for a build that has
+//! not started are bounded by the per-cursor floor rather than charged, and a
+//! build that ends the load (a rejected row, a failed batch) gives its charge
+//! back when its outcome arrives. A charge is an estimate before the build
+//! (the last emitted batch's measured bytes per row, 0 for the first batch,
+//! which builds alone), resized to the built batch's measured
 //! [`ravel_logseg::ColumnarLogBatch::heap_bytes`] when it is emitted in
 //! sequence. No charge is refunded while its batch exists. When the oldest
 //! unemitted batch's measured size cannot fit beside the later batches'
