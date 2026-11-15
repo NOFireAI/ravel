@@ -265,32 +265,56 @@ alert. A history object that cannot be read stops the tick with
 would re-fire an alert that is already firing. That covers an object that
 is corrupt or unreachable.
 
-An object written at an RLOG format version this build cannot read also
-stops the tick, by a typed refusal rather than as corruption. The evaluator
-does not rebuild alert state without the object:
+An object written at an RLOG format version outside this build's reader
+window is handled by which side of the window it falls on. Both cases apply
+only when the object's bytes match the content hash in its commit record.
+The version is read before the footer checksum, so a bit flip in the version
+bytes also reads as an out-of-window version; the hash mismatch is what marks
+that object corrupt, and it stops the tick as above without moving either
+counter below.
 
-- `ravel_alert_history_records_skipped_total{reason="unsupported_version"}`
-  rises by one for each fold that reads such an object. The family name is
-  kept from when such an object was skipped rather than the tick refused.
+**Newer than this build reads.** The object was written by a newer build,
+for example after a rollback. The tick refuses with a typed error rather
+than rebuild alert state without the object:
+
+- `ravel_alert_history_newer_version_refusals_total` rises by one for each
+  refused fold.
 - A warn log line names the tenant and the object key.
 - The tick evaluates no rule and reports `outcome="history_unavailable"`.
   The previous durable state is kept and no transition is written; no
   notification is re-queued from the incomplete fold.
 
-A tick refuses on an unreadable version only when the object's bytes match
-the content hash in its commit record and its RLOG format version is outside
-this build's reader window. The version is read before the footer checksum,
-so a bit flip in the version bytes also reads as an unsupported version; the
-hash mismatch is what marks that object corrupt, and it stops the tick as
-plain corruption, without moving the counter.
+A refused tick writes no state memo, so the object stays in every later fold:
+the counter rises on every tick that folds that history, and the tenant's
+alerts stay at their previous state. To clear it, run the evaluator on a
+build whose RLOG reader window includes that version (roll forward). A partial fold that dropped the object
+would re-fire an alert that is already firing, or drop one that is, and both
+are worse than a visible hold an operator can act on.
 
-Because a refused tick writes no memo, the object stays in every later fold,
-so the counter rises every tick and the tenant's alerts stay frozen at their
-previous state until the object is retired (retention deletes it) or every
-reader is upgraded to a build that admits its version. This is deliberate: a
-partial fold that dropped the object would re-fire an alert that is already
-firing, or drop one that is, and both are worse than a visible hold an
-operator can act on.
+**Older than this build reads.** After a format bump, every alert object
+written before it has the retired version, so refusing on it would stop
+alert evaluation for that tenant for as long as those objects stay in the
+fold. The fold skips the object instead:
+
+- `ravel_alert_history_records_skipped_total{reason="unsupported_version"}`
+  rises by one for each fold that reads the object.
+- A warn log line names the tenant and the object key.
+- The tick evaluates its rules and reports `outcome="evaluated"`, unless
+  another object in the same fold is corrupt, unreachable or newer than this
+  build reads. Then the tick stops with `outcome="history_unavailable"` as
+  above, and the skip counter has still risen for an object it skipped
+  first.
+
+The skipped object held one transition. If the alert state memo already
+holds that alert, the memo copy stands. Otherwise the newest readable
+transition for that alert stands, and with none the alert is treated as
+absent. After a forward format bump the skipped objects are older than any
+readable one, so the worst case is a condition that is still true raising the alert again and notifying
+once; the next memo write records it, and later ticks do not notify it
+again. The counter keeps rising while the object is inside the fold's tail,
+and stops once the memo's watermark passes the object's hour. A tick with no
+usable memo (missing, corrupt, or at a version this build cannot read) folds
+the whole history and counts the object again whatever its hour.
 
 ### Upgrade from per-rule alerts
 
@@ -561,7 +585,8 @@ looks the same as a condition that never occurred.
 | `ravel_alert_notifications_deferred_total` | Notifications not attempted in a tick because the per-tick delivery deadline (half the evaluation interval) elapsed first. Counted once per notification per tick: a notification deferred again on the next tick is counted again. They keep their place at the front of the queue. |
 | `ravel_alert_undelivered_notifications` | Gauge. Notifications not yet accepted by every configured sink, at most one per alert identity. While a sink keeps failing it grows by one for every identity that transitions, without bound. |
 | `ravel_alert_ticks_total` | Evaluation ticks, split by an `outcome` label: `evaluated`, `lease_not_held`, `lease_unavailable`, `history_unavailable`. |
-| `ravel_alert_history_records_skipped_total` | Ticks the history fold refused, by `reason`, because an alert history object carries an RLOG format version this build cannot read. `unsupported_version` is such an object whose bytes match its commit record's content hash. The refused tick reports `outcome="history_unavailable"`, keeps the previous state and writes nothing. The family name is kept from when the object was skipped rather than the tick refused. Exported at 0 before any refusal. |
+| `ravel_alert_history_records_skipped_total` | Alert history objects skipped by the history fold instead of failing the tick, by `reason`. `unsupported_version` is an object written at an RLOG version older than this build reads. Exported at 0 before any skip. |
+| `ravel_alert_history_newer_version_refusals_total` | Ticks the history fold refused because an alert history object carries an RLOG version newer than this build reads and its bytes match its commit record's content hash. The refused tick reports `outcome="history_unavailable"`, keeps the previous state and writes nothing. Exported at 0 before any refusal. |
 | `ravel_alert_last_tick_completed_timestamp_seconds` | Unix time this process last completed a tick. Its age is the liveness signal. |
 
 `outcome="lease_not_held"` is healthy. Only the replica that holds the alert

@@ -310,7 +310,9 @@ memo copy, or is absent on a cold fold; the worst outcome is a duplicate
 notification for a still-live condition, inside the at-least-once contract
 (ADR-0043), never a missed page. The memo advances, the object falls below
 the watermark, and retention deletes it on its normal schedule. (The
-skipped-object amendment below bounds this for a rollback past a bump.)
+skipped-object amendment below bounds this for a rollback past a bump. An
+object newer than the reader window no longer skips: see the newer-version
+refusal amendment below.)
 
 The `RavelAlertPipelineBlocked` description (`deploy/prometheus/ravel.rules.yaml`)
 and its reprint in docs/guides/observability.md are corrected: the liveness
@@ -472,7 +474,9 @@ the N/N-1 reader window is #16 T11), so a rollback past a bump is the case
 already expected to lose readability, and the skip still keeps the tenant's
 other rules evaluating. The skip also applies only to an object whose bytes match its
 commit record's content hash, since the RLOG reader checks the trailer
-version before the footer CRC.
+version before the footer CRC. (The rollback case here, an object newer
+than the reader window, now refuses the tick instead: see the newer-version
+refusal amendment below.)
 
 ## Amendment (2026-10-11): what the startup check reads (#2724)
 
@@ -561,3 +565,30 @@ already is. `object_backstop_crossed` reads
 `config.target_bytes.saturating_mul(config.flush_object_backstop_multiple)`
 in place of the former hardcoded product; nothing else about D3's deferral,
 share, or deadline logic changes.
+
+## Amendment (2026-11-15): a newer-version alert object refuses the tick (#4239)
+
+<!-- amendment-applies: sections="D6. The alert fold skips and counts an out-of-window object (#2713)|Amendment (2026-10-11): what a skipped alert object leaves (#2713)" pointer="newer-version refusal amendment" -->
+
+From ADR-4233 (decision 4, hazard H3), an alert history object written by a
+newer build, one whose RLOG trailer version is above the newest this build
+reads, refuses the evaluator's tick, while an older out-of-window object
+keeps D6's counted skip. The `UnsupportedVersion` arm in
+`fold_commit_entries` splits on `version >
+ravel_logseg::footer::SUPPORTED_VERSIONS.newest()`, after the same
+content-hash check D6 already applied to both cases. The reader window is
+contiguous, so a version it rejects that is not above its newest is below
+its oldest.
+
+A refused tick returns the typed `UnreadableHistoryVersion` error, reports
+`outcome="history_unavailable"`, keeps the previous durable state, writes no
+transition and no state memo, and counts the refusal on
+`ravel_alert_history_newer_version_refusals_total`. With no memo written the
+object stays in every later fold, so the refusal repeats on each tick that folds that history until the
+evaluator runs a build whose RLOG reader window includes that version (roll
+forward). This replaces the rollback outcome the skipped-object amendment
+accepted: a skip there let an older readable state stand in for the alert's
+latest transition, which ADR-4233 lists as a hazard rather than an accepted
+cost. `ravel_alert_history_records_skipped_total{reason="unsupported_version"}`
+keeps its name and now counts only objects older than the window, the
+forward-bump case D6 was written for.
