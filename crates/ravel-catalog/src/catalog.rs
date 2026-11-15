@@ -2092,9 +2092,9 @@ impl Catalog {
     /// content-addressed or TTL-revalidated state, so an evicted entry is
     /// re-derived on the tenant's next resolve by a re-read, never a wrong
     /// result (the caches are "already reconstructible by definition",
-    /// ADR-0069). The byte cache is a process-wide LRU keyed by content hash,
-    /// not partitioned per tenant, so it is not swept here; its own capacity
-    /// bound reclaims it.
+    /// ADR-0069). The byte cache is a process-wide S3-FIFO cache keyed by
+    /// content hash, not partitioned per tenant, so it is not swept here; its
+    /// own capacity bound reclaims it.
     ///
     /// Admission-controller state is not held by the catalog and is explicitly
     /// out of scope for eviction (ADR-0069 decision 2); nothing here touches it.
