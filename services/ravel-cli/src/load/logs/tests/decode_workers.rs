@@ -789,37 +789,35 @@ async fn a_build_worker_panic_fails_the_load_and_nothing_hangs_body() {
         })
     };
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let result = tokio::time::timeout(
-        RUN_GUARD,
-        load_instrumented_at(
-            Arc::clone(&store),
-            &pq,
-            "acme",
-            &m,
-            1,
-            100,
-            0,
-            Some(1),
-            Some(1),
-            DEFAULT_MAX_INFLIGHT_FLUSHES,
-            DEFAULT_DECODE_QUEUE_BATCHES,
-            Some(PER_BATCH_TARGET_BYTES),
-            None,
-            NOW_NS,
-            TestClock::new(NOW_NS) as Arc<dyn Clock>,
-            LoadPath::Columnar,
-            Some(hook),
-            None,
-            RlogZstdLevel::default(),
-            RlogGroupTargetBlocks::DEFAULT,
-            RlogChunkOrder::DEFAULT,
-            Some(memory),
-            false,
-            Arc::new(TenantRules::none()),
-        ),
-    )
-    .await
-    .expect("the load returns");
+    let load_fut = load_instrumented_at(
+        Arc::clone(&store),
+        &pq,
+        "acme",
+        &m,
+        1,
+        100,
+        0,
+        Some(1),
+        Some(1),
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        Some(PER_BATCH_TARGET_BYTES),
+        None,
+        NOW_NS,
+        TestClock::new(NOW_NS) as Arc<dyn Clock>,
+        LoadPath::Columnar,
+        Some(hook),
+        None,
+        RlogZstdLevel::default(),
+        RlogGroupTargetBlocks::DEFAULT,
+        RlogChunkOrder::DEFAULT,
+        Some(memory),
+        false,
+        Arc::new(TenantRules::none()),
+    );
+    let result = tokio::time::timeout(RUN_GUARD, load_fut) // allow-wall-clock: hang guard only; an uncaught worker panic would otherwise hang the load
+        .await
+        .expect("the load returns");
     match result {
         Err(LoadError::BatchFailed { reason, .. }) => assert!(
             reason.starts_with("Parquet decode/build task failed")
