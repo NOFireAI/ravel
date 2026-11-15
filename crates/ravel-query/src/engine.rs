@@ -82,12 +82,23 @@ pub struct QueryStats {
     /// decision 1, issue #3862). Counted within `segments_fetched`, which
     /// counts the objects opened, not the objects that yielded series.
     pub segments_pruned_by_dictionary: u64,
-    /// Snapshot segments the label-value route (ADR-3694 decision 3) dropped
-    /// for every selector before any was opened: a segment counts once
-    /// every distinct selector that would have read it had a positive
-    /// equality value its part's leaves prove absent. Not counted in
-    /// `segments_fetched`. Zero when no metrics leaf covers the snapshot.
+    /// Snapshot segments the key-index routes dropped for every selector
+    /// before any was opened, on parts where the label-value route
+    /// (ADR-3694 decision 3) answered at least one selector: a segment
+    /// counts once no distinct selector would read it. Not counted in
+    /// `segments_fetched`. With `segments_pruned_by_series_index` it adds
+    /// up to every segment the key-index routes dropped; both are zero when
+    /// a selector went unrouted, and this one when no metrics leaf covers
+    /// the snapshot.
     pub segments_pruned_by_label_index: u64,
+    /// Snapshot segments the key-index routes dropped for every selector, on
+    /// parts where the series route (ADR-4146 decision 3) answered every
+    /// selector. Not counted in `segments_fetched`.
+    pub segments_pruned_by_series_index: u64,
+    /// The series route's figures: (plan, part) pairs answered and declined
+    /// by reason, and one row per pass (A, B, C). `None` when the series
+    /// route did not run.
+    pub series_index: Option<crate::key_index_route::SeriesRouteFigures>,
     /// The label-value route's passes, one per distinct routed value in the
     /// order they were issued: the value's labels and `key8`, its leaf GETs,
     /// wire bytes and cache hits, its part outcomes, and the segments it
@@ -181,6 +192,8 @@ impl QueryStats {
             segments_pruned,
             segments_pruned_by_dictionary: dictionary_probe.segments_pruned_by_dictionary,
             segments_pruned_by_label_index: 0,
+            segments_pruned_by_series_index: 0,
+            series_index: None,
             label_index_values: Vec::new(),
             segments_probed_two_step: dictionary_probe.segments_probed_two_step,
             dictionary_probe_switched_off: dictionary_probe.switched_off,
@@ -206,6 +219,8 @@ impl Default for QueryStats {
             segments_pruned: 0,
             segments_pruned_by_dictionary: 0,
             segments_pruned_by_label_index: 0,
+            segments_pruned_by_series_index: 0,
+            series_index: None,
             label_index_values: Vec::new(),
             segments_probed_two_step: 0,
             dictionary_probe_switched_off: false,
@@ -519,6 +534,9 @@ pub struct QueryEngine {
     /// on. `None`, the default, keeps both inline. See
     /// [`QueryEngine::with_read_gate`].
     read_gate: Option<Arc<ReadGate>>,
+    /// The metrics series route's bounds: the ADR's unless
+    /// [`QueryEngine::with_series_route_s_max`] overrode `S_max`.
+    series_route: crate::key_index_route::SeriesRouteOptions,
 }
 
 impl QueryEngine {
@@ -594,7 +612,17 @@ impl QueryEngine {
             federation: None,
             live_usage: None,
             read_gate: None,
+            series_route: crate::key_index_route::SeriesRouteOptions::default(),
         }
+    }
+
+    /// Overrides the metrics series route's `S_max` (ADR-4146 decision 3),
+    /// the most series keys pass B probes for one part. For tests and the
+    /// acceptance run only; no server flag sets it.
+    #[must_use]
+    pub fn with_series_route_s_max(mut self, s_max: usize) -> Self {
+        self.series_route.s_max = s_max;
+        self
     }
 
     /// Runs this engine's CPU-bound read work on `gate` (ADR-1702 decisions 1
@@ -754,6 +782,7 @@ impl QueryEngine {
             federation: self.federation.clone(),
             live_usage: self.live_usage.clone(),
             read_gate: self.read_gate.clone(),
+            series_route: self.series_route,
         }
     }
 
@@ -784,6 +813,7 @@ impl QueryEngine {
             federation: self.federation.clone(),
             live_usage: Some(live.clone()),
             read_gate: self.read_gate.clone(),
+            series_route: self.series_route,
         }
     }
 
@@ -1754,11 +1784,12 @@ impl QueryEngine {
         // resolved segment count (not just the sealed subset `admit` checks)
         // as a conservative approximation -- `resolve_bounded` does not
         // return the sealed/exempt split to its caller. The metrics term is
-        // the count resolved before the label-value route: `segments_fetched`
-        // has the route's pruned segments taken out, so they are added back.
+        // the count resolved before the key-index routes: `segments_fetched`
+        // has the routes' pruned segments taken out, so they are added back.
         let metrics_resolved = stats
             .segments_fetched
-            .saturating_add(stats.segments_pruned_by_label_index);
+            .saturating_add(stats.segments_pruned_by_label_index)
+            .saturating_add(stats.segments_pruned_by_series_index);
         let total_segments = metrics_resolved + log_snapshot.segments.len() as u64;
         if total_segments as usize > self.config.max_segments {
             return Err(QueryError::TooManySegments {
@@ -2165,7 +2196,7 @@ impl QueryEngine {
                 .snapshot()
                 .phase(QueryPhase::KeyIndex)
                 .total_s3_requests();
-            let routing = self
+            let mut routing = self
                 .route_metric_plans(
                     tenant_hash,
                     &snapshot,
@@ -2174,8 +2205,7 @@ impl QueryEngine {
                     &accounting,
                 )
                 .await?;
-            let plan_keeps = routing.plan_keeps;
-            let label_index_values = routing.values;
+            let plan_keeps = std::mem::take(&mut routing.plan_keeps);
             drop(parts);
             // The route's leaf GETs are charged before any segment fetch
             // runs, and a plan whose every segment was pruned runs no fetch
@@ -2199,8 +2229,6 @@ impl QueryEngine {
                     return Err(err);
                 }
             }
-            let pruned_by_label_index =
-                segments_pruned_by_label_index(&plan_keeps, snapshot.segments.len());
             let plan_snapshots: Vec<Option<Snapshot>> = plan_keeps
                 .iter()
                 .map(|keep| {
@@ -2462,17 +2490,13 @@ impl QueryEngine {
                     fed_warnings,
                     fed_partial,
                     excludes_spend,
-                    pruned_by_label_index,
-                    label_index_values,
+                    routing,
                 ),
                 page_stats,
             ))
         };
 
-        let (
-            (source, warnings, partial, excludes_spend, pruned_by_label_index, label_index_values),
-            mut stats,
-        ) = self
+        let ((source, warnings, partial, excludes_spend, routing), mut stats) = self
             .resolve_snapshot_with_retry(
                 tenant_hash,
                 Signal::Metrics,
@@ -2491,9 +2515,14 @@ impl QueryEngine {
         stats.partial = partial;
         stats.warnings = warnings;
         stats.estimate_excludes_spend = excludes_spend;
-        stats.segments_pruned_by_label_index = pruned_by_label_index;
-        stats.label_index_values = label_index_values;
-        stats.segments_fetched = stats.segments_fetched.saturating_sub(pruned_by_label_index);
+        stats.segments_pruned_by_label_index = routing.segments_pruned_by_label_index;
+        stats.segments_pruned_by_series_index = routing.segments_pruned_by_series_index;
+        stats.label_index_values = routing.values;
+        stats.series_index = routing.series;
+        stats.segments_fetched = stats
+            .segments_fetched
+            .saturating_sub(routing.segments_pruned_by_label_index)
+            .saturating_sub(routing.segments_pruned_by_series_index);
         Ok((source, stats))
     }
 
@@ -2515,6 +2544,13 @@ impl QueryEngine {
     /// no leaf GET, settles no part and reports no pass. The value passes run
     /// at most `promql_fetch_fanout` at a time, the width the per-plan fetch
     /// passes that follow run at.
+    ///
+    /// The series route (ADR-4146 decision 3) runs first, through
+    /// [`route_metric_statement`](crate::key_index_route::route_metric_statement):
+    /// on a part carrying the series fields, a plan with two or more distinct
+    /// positive equality pairs keeps the entries its series' classes name,
+    /// and the label-value route runs only for the (plan, part) pairs the
+    /// series route declined or did not route.
     async fn route_metric_plans(
         &self,
         tenant_hash: TenantHash,
@@ -2522,10 +2558,12 @@ impl QueryEngine {
         parts: Option<&SnapshotParts>,
         plans: &[SelectorPlan],
         accounting: &PhaseAccounting,
-    ) -> Result<crate::key_index_route::ValueRouting, QueryError> {
-        use crate::key_index_route::{RouteError, ValueRouteInput, ValueRouting, route_values};
+    ) -> Result<crate::key_index_route::MetricRouting, QueryError> {
+        use crate::key_index_route::{
+            MetricRouting, RouteError, ValueRouteInput, route_metric_statement,
+        };
         let Some(parts) = parts else {
-            return Ok(ValueRouting::unrouted(plans.len()));
+            return Ok(MetricRouting::unrouted(plans.len()));
         };
         // A `__name__` value is routed too, though the resolve's name
         // postings already pruned by it where they could: postings do not
@@ -2550,14 +2588,14 @@ impl QueryEngine {
             limits: ravel_catalog::KeyIndexLeafLimits::default(),
             concurrency: self.config.promql_fetch_fanout().max(1),
         };
-        match route_values(input, &plan_values).await {
+        match route_metric_statement(input, &plan_values, self.series_route).await {
             Ok(routing) => Ok(routing),
             Err(RouteError::Isolation { source, .. }) => Err(source.into()),
             // The parts came from the same resolve as the snapshot, so a
             // mismatch is not expected; reading every segment stays exact.
             Err(RouteError::InvalidInput(reason)) => {
-                tracing::warn!(%reason, "metrics label-value route skipped");
-                Ok(ValueRouting::unrouted(plans.len()))
+                tracing::warn!(%reason, "metrics key-index route skipped");
+                Ok(MetricRouting::unrouted(plans.len()))
             }
         }
     }
@@ -4276,23 +4314,6 @@ fn snapshot_subset(snapshot: &Snapshot, keep: &[bool]) -> Snapshot {
         segments_pruned: snapshot.segments_pruned,
         pending_erasure: snapshot.pending_erasure.clone(),
     }
-}
-
-/// Segments no plan reads after the label-value route: zero when any plan
-/// went unrouted, since that plan reads every segment.
-fn segments_pruned_by_label_index(plan_keeps: &[Option<Vec<bool>>], segments: usize) -> u64 {
-    let mut read = vec![false; segments];
-    for keep in plan_keeps {
-        match keep {
-            None => return 0,
-            Some(keep) => {
-                for (read, kept) in read.iter_mut().zip(keep) {
-                    *read |= *kept;
-                }
-            }
-        }
-    }
-    read.iter().filter(|read| !**read).count() as u64
 }
 
 /// Whether every non-empty positive equality across `plans` matches
@@ -6343,6 +6364,33 @@ mod tests {
         )
         .expect("catalog");
         QueryEngine::new(Arc::new(catalog), store, EngineConfig::default())
+    }
+
+    /// The series route runs at the ADR's bounds unless a test overrides
+    /// `S_max`, and the override survives the per-query clones the route
+    /// runs on.
+    #[test]
+    fn the_series_route_s_max_override_reaches_every_query_clone() {
+        use crate::key_index_route::{SERIES_ROUTE_S_MAX, SeriesRouteOptions};
+        let engine = empty_store_engine();
+        assert_eq!(engine.series_route, SeriesRouteOptions::default());
+        assert_eq!(engine.series_route.s_max, SERIES_ROUTE_S_MAX);
+        let engine = engine.with_series_route_s_max(3);
+        let expected = SeriesRouteOptions {
+            s_max: 3,
+            ..SeriesRouteOptions::default()
+        };
+        assert_eq!(engine.series_route, expected);
+        assert_eq!(
+            engine.scoped_to(&RequestBudgets::default()).series_route,
+            expected
+        );
+        assert_eq!(
+            engine
+                .with_live_usage(&LiveQueryAccounting::default())
+                .series_route,
+            expected
+        );
     }
 
     /// A query whose snapshot resolves to zero segments never enters the

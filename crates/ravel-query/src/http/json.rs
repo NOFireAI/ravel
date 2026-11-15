@@ -98,14 +98,29 @@ pub struct QueryStatsJson {
     pub segments_fetched: u64,
     #[serde(rename = "segmentsPruned")]
     pub segments_pruned: u64,
-    /// Snapshot segments the label-value route dropped before any was opened
-    /// (ADR-3694 decision 3, issue #3865); not counted in `segmentsFetched`.
+    /// Snapshot segments the key-index routes dropped before any was opened,
+    /// on parts where the label-value route (ADR-3694 decision 3, issue
+    /// #3865) answered at least one selector; not counted in
+    /// `segmentsFetched`.
     #[serde(rename = "segmentsPrunedByLabelIndex")]
     pub segments_pruned_by_label_index: u64,
+    /// The same, on parts the series route (ADR-4146 decision 3) answered
+    /// for every selector. The two add up to the segments the key-index
+    /// routes dropped.
+    #[serde(rename = "segmentsPrunedBySeriesIndex")]
+    pub segments_pruned_by_series_index: u64,
     /// The label-value route's passes, one per distinct routed value
     /// (issue #3960). Absent when the route did not run.
     #[serde(rename = "labelIndexValues", skip_serializing_if = "Vec::is_empty")]
     pub label_index_values: Vec<LabelIndexValueJson>,
+    /// The series route's passes, one row each for A, B and C in that
+    /// order. Absent when the series route did not run.
+    #[serde(rename = "seriesIndexPasses", skip_serializing_if = "Vec::is_empty")]
+    pub series_index_passes: Vec<SeriesIndexPassJson>,
+    /// The series route's (plan, part) outcomes. Absent when the series
+    /// route did not run.
+    #[serde(rename = "seriesIndex", skip_serializing_if = "Option::is_none")]
+    pub series_index: Option<SeriesIndexJson>,
     /// Fetched sparse objects the dictionary-first probe dropped on a
     /// LABEL_DICT miss (ADR-3694 decision 1, issue #3862).
     #[serde(rename = "segmentsPrunedByDictionary")]
@@ -164,11 +179,23 @@ impl From<crate::QueryStats> for QueryStatsJson {
             segments_fetched: stats.segments_fetched,
             segments_pruned: stats.segments_pruned,
             segments_pruned_by_label_index: stats.segments_pruned_by_label_index,
+            segments_pruned_by_series_index: stats.segments_pruned_by_series_index,
             label_index_values: stats
                 .label_index_values
                 .iter()
                 .map(LabelIndexValueJson::from)
                 .collect(),
+            series_index_passes: stats
+                .series_index
+                .as_ref()
+                .map(|series| {
+                    crate::key_index_route::SeriesPass::ALL
+                        .iter()
+                        .map(|pass| SeriesIndexPassJson::new(*pass, series.pass(*pass)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            series_index: stats.series_index.as_ref().map(SeriesIndexJson::from),
             segments_pruned_by_dictionary: stats.segments_pruned_by_dictionary,
             segments_probed_two_step: stats.segments_probed_two_step,
             dictionary_probe_switched_off: stats.dictionary_probe_switched_off,
@@ -228,6 +255,81 @@ impl From<&crate::key_index_route::ValueRouteFigures> for LabelIndexValueJson {
             skipped_by_budget: figures.skipped_by_budget,
             segments_pruned: value.segments_pruned,
             segments_pruned_alone: value.segments_pruned_alone,
+        }
+    }
+}
+
+/// One series route pass, rendered as one element of
+/// `stats.seriesIndexPasses`: [`crate::key_index_route::SeriesPassFigures`].
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeriesIndexPassJson {
+    /// `A` (`series_label`), `B` (`series_class`) or `C` (`class_objects`).
+    pub pass: &'static str,
+    pub parts_probed: u64,
+    pub plans_offered: u64,
+    pub plans_admitted: u64,
+    pub keys_offered: u64,
+    pub keys_probed: u64,
+    pub distinct_buckets: u64,
+    pub bridged_bytes: u64,
+    /// On-object bytes of the slice prefixes read.
+    pub prefix_bytes: u64,
+    /// On-object bytes of the bucket runs read past the prefixes.
+    pub bytes_past_prefix: u64,
+    /// Leaf GETs the pass issued, counted in the `keyIndex` phase.
+    pub leaf_get_requests: u64,
+    /// Wire bytes of those GETs, as transferred.
+    pub leaf_wire_bytes: u64,
+    pub leaf_cache_hits: u64,
+}
+
+impl SeriesIndexPassJson {
+    fn new(
+        pass: crate::key_index_route::SeriesPass,
+        figures: &crate::key_index_route::SeriesPassFigures,
+    ) -> Self {
+        SeriesIndexPassJson {
+            pass: pass.as_str(),
+            parts_probed: figures.parts_probed,
+            plans_offered: figures.plans_offered,
+            plans_admitted: figures.plans_admitted,
+            keys_offered: figures.keys_offered,
+            keys_probed: figures.keys_probed,
+            distinct_buckets: figures.distinct_buckets,
+            bridged_bytes: figures.bridged_bytes,
+            prefix_bytes: figures.prefix_bytes,
+            bytes_past_prefix: figures.bytes_past_prefix,
+            leaf_get_requests: figures.leaf_get_requests,
+            leaf_wire_bytes: figures.leaf_wire_bytes,
+            leaf_cache_hits: figures.leaf_cache_hits,
+        }
+    }
+}
+
+/// The series route's (plan, part) outcomes, rendered as `stats.seriesIndex`:
+/// [`crate::key_index_route::SeriesRouteFigures`].
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeriesIndexJson {
+    /// Plans with two or more distinct positive equality pairs.
+    pub plans_routed: u64,
+    /// (plan, part) pairs the series route answered.
+    pub plan_parts_answered: u64,
+    /// (plan, part) pairs sent to the label-value route, by reason, every
+    /// reason present.
+    pub declines: std::collections::BTreeMap<&'static str, u64>,
+}
+
+impl From<&crate::key_index_route::SeriesRouteFigures> for SeriesIndexJson {
+    fn from(figures: &crate::key_index_route::SeriesRouteFigures) -> Self {
+        SeriesIndexJson {
+            plans_routed: figures.plans_routed,
+            plan_parts_answered: figures.plan_parts_answered,
+            declines: crate::key_index_route::SeriesDecline::ALL
+                .iter()
+                .map(|reason| (reason.as_str(), figures.declined(*reason)))
+                .collect(),
         }
     }
 }
@@ -1631,6 +1733,92 @@ mod tests {
         let value =
             serde_json::to_value(QueryStatsJson::from(crate::QueryStats::default())).expect("json");
         assert!(value.get("labelIndexValues").is_none());
+    }
+
+    /// The series route renders its prune count beside the label-value
+    /// route's, one pass row each for A, B and C, and its declines by
+    /// reason; the rows and the outcome block are absent when it did not run.
+    #[test]
+    fn stats_json_carries_the_series_index_counters_and_pass_rows() {
+        use crate::key_index_route::{SeriesPass, SeriesPassFigures, SeriesRouteFigures};
+        let mut series = SeriesRouteFigures {
+            plans_routed: 2,
+            plan_parts_answered: 3,
+            ..SeriesRouteFigures::default()
+        };
+        series.declines[crate::key_index_route::SeriesDecline::OverSMax as usize] = 4;
+        for (i, pass) in SeriesPass::ALL.iter().enumerate() {
+            let base = 100 * (i as u64 + 1);
+            series.passes[i] = SeriesPassFigures {
+                parts_probed: base + 1,
+                plans_offered: base + 2,
+                plans_admitted: base + 3,
+                keys_offered: base + 4,
+                keys_probed: base + 5,
+                distinct_buckets: base + 6,
+                bridged_bytes: base + 7,
+                prefix_bytes: base + 8,
+                bytes_past_prefix: base + 9,
+                leaf_get_requests: base + 10,
+                leaf_wire_bytes: base + 11,
+                leaf_cache_hits: base + 12,
+            };
+            assert_eq!(series.pass(*pass).parts_probed, base + 1);
+        }
+        let stats = crate::QueryStats {
+            segments_pruned_by_label_index: 5,
+            segments_pruned_by_series_index: 7,
+            series_index: Some(series),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(QueryStatsJson::from(stats)).expect("serializes");
+        assert_eq!(value["segmentsPrunedByLabelIndex"], 5);
+        assert_eq!(value["segmentsPrunedBySeriesIndex"], 7);
+        let row = |pass: &str, base: u64| {
+            serde_json::json!({
+                "pass": pass,
+                "partsProbed": base + 1,
+                "plansOffered": base + 2,
+                "plansAdmitted": base + 3,
+                "keysOffered": base + 4,
+                "keysProbed": base + 5,
+                "distinctBuckets": base + 6,
+                "bridgedBytes": base + 7,
+                "prefixBytes": base + 8,
+                "bytesPastPrefix": base + 9,
+                "leafGetRequests": base + 10,
+                "leafWireBytes": base + 11,
+                "leafCacheHits": base + 12,
+            })
+        };
+        assert_eq!(
+            value["seriesIndexPasses"],
+            serde_json::json!([row("A", 100), row("B", 200), row("C", 300)])
+        );
+        assert_eq!(
+            value["seriesIndex"],
+            serde_json::json!({
+                "plansRouted": 2,
+                "planPartsAnswered": 3,
+                "declines": {
+                    "no_series_refs": 0,
+                    "rejected": 0,
+                    "over_tier_one": 0,
+                    "beyond_ceiling": 0,
+                    "over_q_a": 0,
+                    "over_s_max": 4,
+                    "over_q_bc": 0,
+                    "over_budget": 0,
+                    "reservation_refused": 0,
+                },
+            })
+        );
+
+        let value =
+            serde_json::to_value(QueryStatsJson::from(crate::QueryStats::default())).expect("json");
+        assert_eq!(value["segmentsPrunedBySeriesIndex"], 0);
+        assert!(value.get("seriesIndexPasses").is_none());
+        assert!(value.get("seriesIndex").is_none());
     }
 
     #[test]
