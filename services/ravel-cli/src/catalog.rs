@@ -1329,6 +1329,10 @@ fn render_kidx_summary(
         "key_type: {} ({:?})\n",
         header.key_type, summary.key_type
     ));
+    out.push_str(&format!(
+        "entry_kind: {} ({:?})\n",
+        header.entry_kind, summary.entry_kind
+    ));
     out.push_str(&format!("key8_lo: {:#018x}\n", header.key8_lo));
     out.push_str(&format!("key8_hi: {:#018x}\n", header.key8_hi));
     out.push_str(&format!("bucket_bits: {}\n", header.bucket_bits));
@@ -1371,6 +1375,13 @@ fn render_kidx_summary(
                     hex::encode(entry.key8),
                     entry.entry_ordinal,
                     entry.blocks
+                ));
+            }
+            for posting in summary.postings.get(cursor..end).unwrap_or_default() {
+                out.push_str(&format!(
+                    "  bucket={bucket} key8={} values={:?}\n",
+                    hex::encode(posting.key8),
+                    posting.values
                 ));
             }
             cursor = end;

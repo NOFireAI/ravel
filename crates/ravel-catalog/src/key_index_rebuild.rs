@@ -32,8 +32,8 @@ use crate::fold::{
     metrics_label_index_leaf_bytes_cap, put_key_index_leaf, read_entry_key_index,
 };
 use crate::snapshot_format::{
-    self, KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN, KeyIndexLeafLimits, key_index_leaf_format_version,
-    key_index_leaf_prefix_range, key_index_leaf_version_accepted,
+    self, KeyIndexLeafLimits, key_index_leaf_format_version, key_index_leaf_prefix_range,
+    key_index_leaf_version_accepted, key_index_leaf_versions_for_signal,
 };
 use crate::tenant_config::TenantConfigError;
 
@@ -509,8 +509,8 @@ impl Catalog {
     /// The keys of `part`'s refs for `requested` fields whose leaf is at a
     /// `format_version` the signal's reader refuses, read with one ranged GET
     /// of `[0, prefix_len)` per ref, each counted when issued. Empty, with no
-    /// GET, for a signal that accepts every version the writer has produced
-    /// (spans). A ref whose prefix does not decode is left alone: the reader
+    /// GET, for a signal that accepts every version its leaves can carry
+    /// ([`key_index_leaf_versions_for_signal`]: spans and metrics). A ref whose prefix does not decode is left alone: the reader
     /// already treats it as uncovered, and replacing it is not this repair.
     async fn refused_leaf_refs(
         &self,
@@ -520,7 +520,7 @@ impl Catalog {
         report: &mut KeyIndexRebuildReport,
     ) -> Result<HashSet<String>, StoreError> {
         let mut refused = HashSet::new();
-        if KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN
+        if key_index_leaf_versions_for_signal(signal)
             .iter()
             .all(|&version| key_index_leaf_version_accepted(signal, version))
         {

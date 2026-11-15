@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0958acdf5eb21d79c99166584a87eb9a6cf092d14e348bdf720c1182867748f6 # shrinks to postings = [KeyIndexPostingEntry { key8: [0, 0, 0, 0, 0, 0, 0, 0], values: [1000000] }], bucket_bits = 1, probe_key = 0
+cc f5b9a463fc42dcbb4f1aa4847d78cd37f7d7b127f65efcd2a62b25d489c3d7ca # shrinks to raw = [0, 0, 0, 0, 0, 0, 0, 0, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], claimed = 1, key = 0

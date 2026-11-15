@@ -1,6 +1,7 @@
 //! `ravel-cli inspect kidx` (#2760): verifies every bucket frame of a
 //! per-part key-index leaf, then prints every header field, the bucket-size
-//! distribution and, with `--entries`, every entry. A corrupt or truncated
+//! distribution and, with `--entries`, every entry (or, for a version 3
+//! posting leaf, every posting). A corrupt or truncated
 //! leaf exits non-zero with the typed rejection and prints nothing.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -9,8 +10,9 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use ravel_catalog::{
-    KeyIndexLeafEntry, KeyIndexLeafInput, KeyIndexLeafLimits,
-    encode_key_index_leaf_with_bucket_bits,
+    KeyIndexLeafEntry, KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexPostingEntry,
+    KeyIndexPostingLeafInput, METRICS_SERIES_LABEL_FIELD, encode_key_index_leaf_with_bucket_bits,
+    encode_key_index_posting_leaf_with_bucket_bits,
 };
 use ravel_codec::key_idx::KeyType;
 use ravel_types::{Signal, TenantHash};
@@ -91,6 +93,7 @@ signal: 2 (Logs)
 part_blake3: 2222222222222222222222222222222222222222222222222222222222222222
 field: service.name
 key_type: 3 (Str)
+entry_kind: 0 (Entry)
 key8_lo: 0x0000000000000000
 key8_hi: 0xffffffffffffffff
 bucket_bits: 3
@@ -130,6 +133,62 @@ fn inspect_kidx_prints_the_golden_report() {
         String::from_utf8(output.stdout).expect("utf-8"),
         format!("{GOLDEN_HEADER}{GOLDEN_ENTRIES}")
     );
+}
+
+fn posting(key: u64, values: &[u64]) -> KeyIndexPostingEntry {
+    KeyIndexPostingEntry {
+        key8: key.to_be_bytes(),
+        values: values.to_vec(),
+    }
+}
+
+#[test]
+fn inspect_kidx_prints_a_posting_leaf_with_its_entry_kind() {
+    let postings = [
+        posting(0x0300, &[3, 4]),
+        posting(0x0100, &[0, 2, 5]),
+        posting(0x0200, &[1]),
+    ];
+    let input = KeyIndexPostingLeafInput {
+        tenant_hash: TenantHash([0x11; 16]),
+        signal: Signal::Metrics,
+        part_blake3: [0x22; 32],
+        part_entry_count: 7,
+        field: METRICS_SERIES_LABEL_FIELD,
+        key_type: KeyType::Bytes,
+        key8_lo: 0,
+        key8_hi: u64::MAX,
+        uncovered_entry_ordinals: &[6],
+        postings: &postings,
+    };
+    let bytes =
+        encode_key_index_posting_leaf_with_bucket_bits(&input, 3, &KeyIndexLeafLimits::default())
+            .expect("valid posting fixture")
+            .bytes;
+    let dir = scratch();
+    let path = write_leaf(&dir, "posting.kidx", &bytes);
+
+    let output = run_inspect(&path, true);
+    assert!(output.status.success(), "{output:?}");
+    let report = String::from_utf8(output.stdout).expect("utf-8");
+    for line in [
+        "format_version: 3\n",
+        "field: series_label\n",
+        "entry_kind: 1 (Posting)\n",
+        "buckets: 8 min=0 median=0 max=1 empty=5\n",
+    ] {
+        assert!(report.contains(line), "missing {line:?} in:\n{report}");
+    }
+    assert!(
+        report.ends_with(
+            "  bucket=1 key8=0000000000000100 values=[0, 2, 5]
+  bucket=3 key8=0000000000000200 values=[1]
+  bucket=5 key8=0000000000000300 values=[3, 4]
+"
+        ),
+        "{report}"
+    );
+    assert!(!report.contains("entry_ordinal="), "{report}");
 }
 
 #[test]
