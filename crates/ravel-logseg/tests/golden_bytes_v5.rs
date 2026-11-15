@@ -246,3 +246,16 @@ fn capture_golden_rlog_v5() {
     )
     .expect("write fixture");
 }
+
+/// BLAKE3 (hex) of [`write_golden`]'s output, computed on the commit before
+/// the writer took a version argument (issue #4242). A writer built without a
+/// version keeps emitting the window's current version byte for byte.
+const DEFAULT_BLAKE3: &str = "a6523d0c241ca4addb3ba89791515cf0666abf0775c123a988909431a95786f9";
+
+#[test]
+fn default_writer_output_matches_the_digest_pinned_before_the_version_parameter() {
+    assert_eq!(
+        blake3::hash(&write_golden()).to_hex().as_str(),
+        DEFAULT_BLAKE3
+    );
+}
