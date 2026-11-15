@@ -42,11 +42,12 @@ use crate::declared_stats;
 use crate::error::CatalogError;
 use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
 use crate::snapshot_format::{
-    self, EncodedKeyIndexLeaf, HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSIONS,
+    self, CatalogPartKind, EncodedKeyIndexLeaf, HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSIONS,
     KeyIndexLeafEncodeError, KeyIndexLeafEntry, KeyIndexLeafInput, KeyIndexLeafLimits,
-    KeyIndexLeafSummary, KeyIndexSlice, NamePostings, PartLimits, SnapshotFormatError,
-    column_stats_segments_concat, encode_key_index_leaf, encoded_entry_len,
-    key_index_leaf_version_accepted, select_key_index_slice, split_key_index_entries,
+    KeyIndexLeafSummary, KeyIndexSlice, NamePostings, NewerPartVersion, PartLimits,
+    SnapshotFormatError, column_stats_segments_concat, encode_key_index_leaf, encoded_entry_len,
+    key_index_leaf_format_version, key_index_leaf_prefix_range, key_index_leaf_version_accepted,
+    key_index_leaf_version_is_newer, select_key_index_slice, split_key_index_entries,
     verify_key_index_leaf_frames,
 };
 use crate::tenant_config::DeclaredTypedColumn;
@@ -475,6 +476,12 @@ pub struct FoldReport {
     /// the carry serves every such entry. Also counted in
     /// `key_index_ranged_gets`.
     pub key_index_unchanged_section_gets: u64,
+    /// Ranged version-prefix GETs the pre-PUT newer-part peek issued (ADR-4233
+    /// H1): one per previous `.npost`, `.cstat` or `.kidx` object this fold
+    /// drops or replaces without otherwise reading it, so a newer-build object
+    /// is refused before the first PUT rather than rebuilt over. Also counted
+    /// in `get_requests`.
+    pub newer_part_peek_gets: u64,
     /// Lowercase hex blake3 of the HEAD in effect when the fold returned (the
     /// one it published, or on a no-op the one it read and left in place),
     /// re-encoded with `folder_id` set to sixteen zero bytes and
@@ -486,6 +493,13 @@ pub struct FoldReport {
     /// (ADR-3939 decision 6).
     pub retired_hours: Vec<u32>,
 }
+
+/// Bytes to range-GET from the front of a `.csnap`, `.npost` or `.cstat`
+/// object when peeking its envelope version (ADR-4233 H1). The version byte
+/// sits at offset 4, before any body or length field, so this always covers
+/// it; a current-version object whose protobuf header runs past it yields a
+/// non-version decode error, which the peek reads as not-newer.
+const NEWER_PART_PEEK_PREFIX_LEN: u64 = 4096;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RequestCounters {
@@ -505,6 +519,12 @@ pub(crate) struct RequestCounters {
     sealed_day_leaf_puts: u64,
     sealed_day_previous_leaf_gets: u64,
     key_index_unchanged_section_gets: u64,
+    /// Ranged version-prefix GETs the pre-PUT newer-part peek issued (ADR-4233
+    /// H1): one per previous `.npost`, `.cstat` or `.kidx` object this fold
+    /// drops or replaces without otherwise reading it. Also summed into
+    /// `get_requests`; kept apart so the carry and section phase counters stay
+    /// comparable across folds.
+    newer_part_peek_gets: u64,
 }
 
 /// HEAD as read at the top of one fold attempt.
@@ -670,6 +690,39 @@ fn is_foreign_part(err: &CatalogError) -> bool {
             field: "tenant_hash",
             ..
         }
+    )
+}
+
+/// A previous part's decode failure as the fold reports it: a part a newer
+/// build wrote becomes [`SnapshotFormatError::NewerPart`] naming its key
+/// (ADR-4233 H1); any other failure stays the decoder's own error.
+fn part_decode_error(key: &str, err: SnapshotFormatError) -> CatalogError {
+    CatalogError::SnapshotFormat(match err.newer_part_version() {
+        Some(newer) => newer.refusal(key),
+        None => err,
+    })
+}
+
+/// A key-index leaf a newer build wrote, as [`SnapshotFormatError::NewerPart`]
+/// naming its key (ADR-4233 H1). The `.kidx` codec reports its version through
+/// [`crate::snapshot_format::key_index_leaf_version_is_newer`], not the
+/// envelope-version errors `newer_part_version` classifies, so the fold builds
+/// the refusal here.
+pub(crate) fn newer_leaf_refusal(key: &str, version: u32) -> SnapshotFormatError {
+    NewerPartVersion {
+        kind: CatalogPartKind::KeyIndexLeaf,
+        field: "format_version",
+        version,
+    }
+    .refusal(key)
+}
+
+/// Whether `err` is the fold refusing a previous part a newer build wrote.
+/// Never rebuilt over: the rebuild would drop what the newer format carries.
+fn is_newer_part(err: &CatalogError) -> bool {
+    matches!(
+        err,
+        CatalogError::SnapshotFormat(SnapshotFormatError::NewerPart { .. })
     )
 }
 
@@ -1296,6 +1349,42 @@ fn part_covers_dirty_hour(part: &SnapshotPartRef, dirty_hours: &HashSet<u32>) ->
     dirty_hours
         .iter()
         .any(|&h| part.min_hour <= h && h <= part.watermark_hour)
+}
+
+/// Whether a key-index carry over `part` would read its leaves: the same
+/// field and ref checks [`Catalog::load_carry_source`] makes before it fetches
+/// any leaf (ADR-4233 H1, finding 1's `.kidx` gap). When this is true the
+/// carry reads and version-checks the lowest slice of each declared field, so
+/// the newer-part peek need only cover the higher slices; when it is false no
+/// leaf is read and the peek covers them all. The entry-count check
+/// `load_carry_source` also makes needs the part's decoded entries and is not
+/// a field/ref check, so it is not replicated here: a mismatch there re-reads
+/// the sections, which cannot drop a newer leaf over anything.
+fn carry_reads_part_leaves(part: &SnapshotPartRef, declared: &[(String, KeyType)]) -> bool {
+    let refs = &part.key_index;
+    if refs.iter().any(|leaf| {
+        declared
+            .iter()
+            .find(|(name, _)| name == &leaf.field)
+            .is_none_or(|(_, key_type)| u32::from(key_type.as_u8()) != leaf.key_type)
+    }) {
+        return false;
+    }
+    for (name, _) in declared {
+        if !refs.iter().any(|leaf| &leaf.field == name) {
+            return false;
+        }
+        if select_key_index_slice(refs, name.as_str(), &[0u8; 8]).is_err() {
+            return false;
+        }
+        if refs
+            .iter()
+            .any(|leaf| &leaf.field == name && leaf.part_blake3 != part.blake3)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Retention tombstones the reconcile passes found in a previous HEAD's
@@ -2649,9 +2738,36 @@ struct CarriedKeyIndex {
     hold: CarryHold,
 }
 
+/// Why a previous part's leaves are not carried into a new part's leaves.
+#[derive(Debug, PartialEq)]
+enum CarryFailure {
+    /// The leaves cannot stand in for the sections, for the reason given;
+    /// the build reads the sections instead.
+    Unusable(String),
+    /// A leaf a newer build wrote ([`SnapshotFormatError::NewerPart`],
+    /// ADR-4233 H1). The fold fails rather than rebuild the leaf over it.
+    Newer(SnapshotFormatError),
+}
+
+impl From<String> for CarryFailure {
+    fn from(reason: String) -> Self {
+        CarryFailure::Unusable(reason)
+    }
+}
+
+impl std::fmt::Display for CarryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CarryFailure::Unusable(reason) => f.write_str(reason),
+            CarryFailure::Newer(err) => err.fmt(f),
+        }
+    }
+}
+
 /// GETs one previous leaf whole and verifies it: the leaf's own checks, its
 /// ref, its tenant, signal, part hash and part entry count, and a
-/// `format_version` the signal accepts (not a logs version-1 leaf).
+/// `format_version` the signal accepts (not a logs version-1 leaf). A leaf
+/// above every version this build knows is [`CarryFailure::Newer`].
 #[allow(clippy::too_many_arguments)]
 async fn fetch_carried_leaf(
     store: &dyn ObjectStoreBackend,
@@ -2662,21 +2778,36 @@ async fn fetch_carried_leaf(
     leaf: &SnapshotKeyIndexLeafRef,
     limits: &KeyIndexLeafLimits,
     counters: &mut RequestCounters,
-) -> Result<(KeyIndexLeafSummary, Bytes), String> {
+) -> Result<(KeyIndexLeafSummary, Bytes), CarryFailure> {
     counters.get_requests += 1;
     counters.key_index_leaf_gets += 1;
     let got = store
         .get(&leaf.key, GetRange::Full)
         .await
         .map_err(|e| format!("leaf {} GET: {e}", leaf.key))?;
-    let summary = verify_key_index_leaf_frames(&got.data, limits, drop)
-        .map_err(|e| format!("leaf {}: {e}", leaf.key))?;
+    // The envelope version comes before the frame checks (ADR-4233 H1, finding
+    // 4/5): a leaf a newer build wrote is refused here, before this part's
+    // leaves are PUT, even when its frames would not verify under this build's
+    // reader. `verify_key_index_leaf_frames` below still classifies a newer
+    // `UnsupportedVersion` it reaches first, for a leaf whose header crc or
+    // length fails this prefix decode.
+    if let Ok(version) = key_index_leaf_format_version(&got.data)
+        && key_index_leaf_version_is_newer(signal, version)
+    {
+        return Err(CarryFailure::Newer(newer_leaf_refusal(&leaf.key, version)));
+    }
+    let summary = verify_key_index_leaf_frames(&got.data, limits, drop).map_err(|e| {
+        match e.newer_version(signal) {
+            Some(version) => CarryFailure::Newer(newer_leaf_refusal(&leaf.key, version)),
+            None => CarryFailure::Unusable(format!("leaf {}: {e}", leaf.key)),
+        }
+    })?;
     let expected = SnapshotKeyIndexLeafRef {
         key: String::new(),
         ..leaf.clone()
     };
     if summary.leaf_ref() != expected {
-        return Err(format!("leaf {} does not match its ref", leaf.key));
+        return Err(format!("leaf {} does not match its ref", leaf.key).into());
     }
     let header = &summary.header;
     if header.tenant_hash.as_slice() != tenant.0.as_slice()
@@ -2684,16 +2815,25 @@ async fn fetch_carried_leaf(
         || header.part_blake3 != part_blake3
         || header.part_entry_count != part_entry_count
     {
-        return Err(format!(
-            "leaf {} binds another tenant, signal or part",
-            leaf.key
-        ));
+        return Err(format!("leaf {} binds another tenant, signal or part", leaf.key).into());
     }
     if !key_index_leaf_version_accepted(signal, header.format_version) {
+        // A version above the signal's read set decodes (it is a known
+        // version) but no reader for this signal takes it: a leaf a newer
+        // build wrote, refused rather than rebuilt over (ADR-4233 H1, finding
+        // 5). A known version below the read set (a logs version-1 leaf) is
+        // merely unusable and keeps the rebuild path.
+        if key_index_leaf_version_is_newer(signal, header.format_version) {
+            return Err(CarryFailure::Newer(newer_leaf_refusal(
+                &leaf.key,
+                header.format_version,
+            )));
+        }
         return Err(format!(
             "leaf {} is format_version {}, which a {signal:?} carry does not take",
             leaf.key, header.format_version
-        ));
+        )
+        .into());
     }
     Ok((summary, got.data))
 }
@@ -2707,6 +2847,7 @@ async fn fetch_carried_leaf(
 /// leaf, refs that do not tile the key8 space or disagree on key type,
 /// `uncovered_count` or part hash, or name another part, or a lowest slice
 /// whose GET fails or that does not verify ([`fetch_carried_leaf`]).
+/// [`CarryFailure::Newer`] when that slice is a leaf a newer build wrote.
 #[allow(clippy::too_many_arguments)]
 async fn load_carry_source(
     store: &dyn ObjectStoreBackend,
@@ -2719,7 +2860,7 @@ async fn load_carry_source(
     limits: &KeyIndexLeafLimits,
     hold: &mut CarryHold,
     counters: &mut RequestCounters,
-) -> Result<CarriedSource, String> {
+) -> Result<CarriedSource, CarryFailure> {
     let refs = &source.part.key_index;
     if let Some(leaf) = refs.iter().find(|leaf| {
         fields
@@ -2729,16 +2870,19 @@ async fn load_carry_source(
         return Err(format!(
             "previous leaf field {:?} is not declared under key type {}",
             leaf.field, leaf.key_type
-        ));
+        )
+        .into());
     }
     if let Some(name) = fields
         .keys()
         .find(|name| !refs.iter().any(|leaf| leaf.field == **name))
     {
-        return Err(format!("declared field {name:?} has no previous leaf"));
+        return Err(format!("declared field {name:?} has no previous leaf").into());
     }
     if source.object_keys().len() as u64 != source.part.entry_count {
-        return Err("previous part entry list does not match its ref".to_string());
+        return Err("previous part entry list does not match its ref"
+            .to_string()
+            .into());
     }
     for name in fields.keys() {
         select_key_index_slice(refs, name, &[0u8; 8])
@@ -2747,7 +2891,7 @@ async fn load_carry_source(
             .iter()
             .any(|leaf| leaf.field == *name && leaf.part_blake3 != source.part.blake3)
         {
-            return Err(format!("field {name:?}: a leaf ref names another part"));
+            return Err(format!("field {name:?}: a leaf ref names another part").into());
         }
     }
     let onto: Vec<Option<u64>> = source
@@ -2778,7 +2922,7 @@ async fn load_carry_source(
                 .collect();
             slices.sort_by_key(|slice| slice.leaf.key8_lo);
             let Some(lowest) = slices.first_mut() else {
-                return Err(format!("declared field {name:?} has no previous leaf"));
+                return Err(format!("declared field {name:?} has no previous leaf").into());
             };
             let (summary, bytes) = fetch_carried_leaf(
                 store,
@@ -3000,7 +3144,8 @@ fn release_carried_slices(
 /// field starts again from key8 0, so a slice dropped in its earlier attempt
 /// is fetched again, while one still kept from that attempt stays held until
 /// a pass starts past it. `Err` when a slice's GET fails, it does not
-/// verify, or a kept slice no longer decodes.
+/// verify, or a kept slice no longer decodes; [`CarryFailure::Newer`] when a
+/// fetched slice is a leaf a newer build wrote.
 #[allow(clippy::too_many_arguments)]
 async fn feed_carried_key_index(
     store: &dyn ObjectStoreBackend,
@@ -3014,7 +3159,7 @@ async fn feed_carried_key_index(
     share: u64,
     hold: &mut CarryHold,
     counters: &mut RequestCounters,
-) -> Result<(), String> {
+) -> Result<(), CarryFailure> {
     let CarriedSource {
         part_blake3,
         part_entry_count,
@@ -3035,10 +3180,9 @@ async fn feed_carried_key_index(
             Some(bytes) => bytes.clone(),
             None => {
                 if slice.fetched_in == Some(field.attempt) {
-                    return Err(format!(
-                        "leaf {} was dropped and is needed again",
-                        slice.leaf.key
-                    ));
+                    return Err(
+                        format!("leaf {} was dropped and is needed again", slice.leaf.key).into(),
+                    );
                 }
                 let (summary, bytes) = fetch_carried_leaf(
                     store,
@@ -3055,7 +3199,7 @@ async fn feed_carried_key_index(
                     return Err(format!(
                         "leaf {} carries other uncovered_entry_ordinals than its set's lowest slice",
                         slice.leaf.key
-                    ));
+                    ).into());
                 }
                 hold.take(bytes.len() as u64);
                 slice.fetched_in = Some(field.attempt);
@@ -3260,7 +3404,8 @@ pub(crate) struct BuiltPartKeyIndex {
 /// A data object mapped from two sources drops the whole carry, and so
 /// does a later slice that cannot be read or verified (the build restarts
 /// with no carry) or a section naming a field the tenant does not declare,
-/// since a carried entry might name it too.
+/// since a carried entry might name it too. A carried slice a newer build
+/// wrote fails the build with [`SnapshotFormatError::NewerPart`] instead.
 ///
 /// Passes: every field the build indexes gets a fixed share of
 /// `limits.max_pairs`, `max(1, max_pairs / fields)`, for the whole build,
@@ -3289,7 +3434,7 @@ pub(crate) async fn build_part_key_index(
     held: HeldPart<'_>,
     limits: &KeyIndexBuildLimits,
     counters: &mut RequestCounters,
-) -> Result<BuiltPartKeyIndex, StoreError> {
+) -> Result<BuiltPartKeyIndex, CatalogError> {
     let n = part_entries.len();
     let part_entry_count = n as u64;
     let max_pairs = limits.max_pairs.max(1);
@@ -3393,6 +3538,7 @@ pub(crate) async fn build_part_key_index(
                     }
                     carried.sources.push(loaded);
                 }
+                Err(CarryFailure::Newer(err)) => return Err(CatalogError::SnapshotFormat(err)),
                 Err(reason) => {
                     mark_held(source, &mut previously_covered);
                     tracing::warn!(
@@ -3484,6 +3630,9 @@ pub(crate) async fn build_part_key_index(
                         )
                         .await
                         {
+                            if let CarryFailure::Newer(err) = reason {
+                                return Err(CatalogError::SnapshotFormat(err));
+                            }
                             failure = Some(reason);
                             break 'feed;
                         }
@@ -4145,10 +4294,24 @@ impl Catalog {
         // reconcile (nothing is being retired). The fold's index role is a pure
         // optimization and the sweep's HEAD-reachability gate is the durable
         // delete blocker, so a config-read fault never fails the fold.
+        //
+        // A record above the read ceiling is different (ADR-4233 H11): a newer
+        // build wrote it, and folding under defaults would drop the typed
+        // columns and retention it declares, so it fails the fold before
+        // anything is written.
         let tenant_config = match crate::tenant_config::read_config_values(self.store(), tenant)
             .await
         {
             Ok(cfg) => cfg,
+            Err(crate::tenant_config::TenantConfigError::UnsupportedVersion {
+                key,
+                got,
+                ceiling,
+            }) if got > ceiling => {
+                return Err(CatalogError::Provisioning(
+                    crate::provisioning::ProvisioningError::NewerTenantConfig { key, got, ceiling },
+                ));
+            }
             Err(err) => {
                 tracing::warn!(
                     error = %err,
@@ -4360,6 +4523,10 @@ impl Catalog {
                         // (ADR-0050 §2), which a rebuild would leave unreported,
                         // the same answer `load_previous_postings` gives.
                         Err(err) if is_foreign_part(&err) => return Err(err),
+                        // A part a newer build wrote (ADR-4233 H1): a rebuild
+                        // from the commit layout would CAS a HEAD that drops
+                        // what the newer format carries.
+                        Err(err) if is_newer_part(&err) => return Err(err),
                         Err(err) => {
                             tracing::warn!(
                                 error = %err,
@@ -4956,6 +5123,26 @@ impl Catalog {
                 })
                 .collect();
 
+            // ADR-4233 H1: refuse the cycle, before this attempt's first PUT,
+            // if a previous object this fold drops or replaces was written by
+            // a newer build. Placed here, after the carried-by-reference set
+            // is known and before the per-part build loop (and its leaf, cstat
+            // and part PUTs), so the refusal leaves the store untouched.
+            if let HeadState::Valid { head, .. } = &head_state {
+                self.peek_dropped_objects_for_newer(
+                    signal,
+                    head,
+                    &reused_old_part_hashes,
+                    rebuilt,
+                    rebuilt || reconciled,
+                    typed_attr_columns.is_empty(),
+                    key_index_fields.as_deref(),
+                    &dirty_hours,
+                    &mut counters,
+                )
+                .await?;
+            }
+
             // ADR-1413 decision 1 (v2 semantics): reuse the previous fold's
             // per-part v3 column-stats objects the same way the field-13 (v2)
             // baseline below reuses its own predecessor, so a part that grows
@@ -5001,6 +5188,11 @@ impl Catalog {
                                     for segment in segments {
                                         baseline.insert(segment.writer_id.clone(), segment);
                                     }
+                                }
+                                // Read before this attempt PUTs anything, so
+                                // the refusal leaves the store untouched.
+                                Err(err) if err.newer_part_version().is_some() => {
+                                    return Err(part_decode_error(&stats_ref.key, err));
                                 }
                                 Err(err) => {
                                     tracing::warn!(
@@ -5062,20 +5254,28 @@ impl Catalog {
                 .collect();
             let mut held_label_dicts =
                 HeldLabelDicts::new(wanted_spans, self.config().key_index_build_max_pairs.max(1));
+            let mut previous_postings = self
+                .previous_postings_baseline(
+                    tenant,
+                    &head_state,
+                    rebuilt || reconciled,
+                    previous_entries_len,
+                    &mut counters,
+                    &accounting,
+                )
+                .await?;
             let early_postings = if signal == Signal::Metrics && key_index_fields.is_some() {
                 Some(
                     self.fold_postings_names(
                         tenant,
                         signal,
-                        &head_state,
-                        rebuilt || reconciled,
+                        previous_postings.take(),
                         previous_entries_len,
                         &entries,
                         Some(&mut held_label_dicts),
                         &mut counters,
-                        &accounting,
                     )
-                    .await?,
+                    .await,
                 )
             } else {
                 None
@@ -5370,34 +5570,17 @@ impl Catalog {
                         column_stats_object_key(tenant, signal, part_watermark, stats_hash16);
                     let size = stats_bytes.len() as u64;
                     let segment_count = v3_segments.len() as u32;
-                    let put_result = self
-                        .store()
-                        .put(
-                            &stats_key,
-                            Bytes::from(stats_bytes),
-                            PutOptions::create_if_absent()
-                                .with_checksum(UploadChecksum::Crc32c(stats_crc)),
-                        )
-                        .await;
-                    // Counted unconditionally, before matching the outcome:
-                    // this is a request-issued counter, not a
-                    // request-succeeded one (#1598).
-                    counters.put_requests += 1;
-                    match put_result {
-                        Ok(_) => {}
-                        // Content-addressed under the object's own hash:
-                        // bytes really are identical by construction here.
-                        Err(StoreError::AlreadyExists) => {}
-                        Err(e) => return Err(CatalogError::Store(e)),
-                    }
-                    column_stats_part_objects_built += 1;
-                    Some(SnapshotColumnStatsPartRef {
-                        key: stats_key,
-                        blake3: stats_hash.as_bytes().to_vec(),
-                        size,
-                        segment_count,
-                        part_blake3: vec![part_hash.as_bytes().to_vec()],
-                    })
+                    Some((
+                        stats_bytes,
+                        stats_crc,
+                        SnapshotColumnStatsPartRef {
+                            key: stats_key,
+                            blake3: stats_hash.as_bytes().to_vec(),
+                            size,
+                            segment_count,
+                            part_blake3: vec![part_hash.as_bytes().to_vec()],
+                        },
+                    ))
                 };
 
                 // ADR-2707 decision 4: this part's key-index leaves, built from
@@ -5456,8 +5639,7 @@ impl Catalog {
                                 },
                                 &mut counters,
                             )
-                            .await
-                            .map_err(CatalogError::Store)?;
+                            .await?;
                             if sealed_day {
                                 counters.sealed_day_leaf_puts +=
                                     counters.put_requests - puts_before;
@@ -5481,6 +5663,37 @@ impl Catalog {
                     }
                     key_index = built.refs;
                 }
+
+                // PUT after the key-index build, whose carry refuses a
+                // previous leaf a newer build wrote (ADR-4233 H1) before this
+                // part writes anything.
+                let column_stats = match column_stats {
+                    None => None,
+                    Some((stats_bytes, stats_crc, stats_ref)) => {
+                        let put_result = self
+                            .store()
+                            .put(
+                                &stats_ref.key,
+                                Bytes::from(stats_bytes),
+                                PutOptions::create_if_absent()
+                                    .with_checksum(UploadChecksum::Crc32c(stats_crc)),
+                            )
+                            .await;
+                        // Counted unconditionally, before matching the
+                        // outcome: this is a request-issued counter, not a
+                        // request-succeeded one (#1598).
+                        counters.put_requests += 1;
+                        match put_result {
+                            Ok(_) => {}
+                            // Content-addressed under the object's own hash:
+                            // bytes really are identical by construction here.
+                            Err(StoreError::AlreadyExists) => {}
+                            Err(e) => return Err(CatalogError::Store(e)),
+                        }
+                        column_stats_part_objects_built += 1;
+                        Some(stats_ref)
+                    }
+                };
 
                 let put_result = self
                     .store()
@@ -5554,15 +5767,13 @@ impl Catalog {
                     self.fold_postings_names(
                         tenant,
                         signal,
-                        &head_state,
-                        rebuilt || reconciled,
+                        previous_postings,
                         previous_entries_len,
                         &entries,
                         None,
                         &mut counters,
-                        &accounting,
                     )
-                    .await?
+                    .await
                 }
             };
             let mut postings_built = false;
@@ -5750,6 +5961,7 @@ impl Catalog {
                         sealed_day_leaf_puts: counters.sealed_day_leaf_puts,
                         sealed_day_previous_leaf_gets: counters.sealed_day_previous_leaf_gets,
                         key_index_unchanged_section_gets: counters.key_index_unchanged_section_gets,
+                        newer_part_peek_gets: counters.newer_part_peek_gets,
                         head_digest,
                         retired_hours: parts_retired_hours(&part_refs),
                     });
@@ -5837,7 +6049,8 @@ impl Catalog {
     /// against its recorded blake3 before trusting its entries. Any
     /// failure (GET error, hash mismatch, a part naming another tenant, decode
     /// error, refused decode reservation) is returned to the caller, which
-    /// fails the fold on a foreign part or a refused reservation and falls
+    /// fails the fold on a foreign part, a part a newer build wrote
+    /// ([`SnapshotFormatError::NewerPart`]) or a refused reservation and falls
     /// back to a full rebuild on anything else.
     ///
     /// Returns the entries together with every part's decode reservation; the
@@ -5897,7 +6110,8 @@ impl Catalog {
             });
         }
         let limits = PartLimits::default();
-        let header = snapshot_format::decode_part_header(&got.data)?;
+        let header = snapshot_format::decode_part_header(&got.data)
+            .map_err(|err| part_decode_error(&part_ref.key, err))?;
         // ADR-0050 §2, before the reservation below, exactly as
         // `snapshot_resolve` checks a part: the HEAD's blake3 binds the bytes
         // to the HEAD, and only the header's tenant_hash binds them to the
@@ -5916,8 +6130,180 @@ impl Catalog {
             header.entries_uncompressed_len,
             limits.max_snapshot_part_bytes,
         )?;
-        let decoded = snapshot_format::decode_part(&got.data, &limits)?;
+        let decoded = snapshot_format::decode_part(&got.data, &limits)
+            .map_err(|err| part_decode_error(&part_ref.key, err))?;
         Ok((decoded.entries, reservation))
+    }
+
+    /// Before this attempt's first PUT, refuse the fold if a previous HEAD
+    /// object it drops or replaces was written by a newer build (ADR-4233 H1).
+    /// The refuse-on-decode checks on the read paths do not cover an object
+    /// the fold replaces without reading, and this peek fills exactly those
+    /// gaps, so it issues no GET the read paths already issue:
+    ///
+    /// - the HEAD-level `.npost` when postings are rebuilt from scratch
+    ///   (`rebuilt || reconciled`, where `previous_postings_baseline` reads
+    ///   nothing); the merge path reads and refuses it;
+    /// - a dropped part's `.cstat` when no statistics baseline reads it -- a
+    ///   rebuild, an untyped tenant (`typed_columns_empty`), or a part
+    ///   covering a dirty hour;
+    /// - a dropped part's `.kidx` leaves only when no carry runs
+    ///   (`carry_reads_part_leaves` false -- the leaf switch is off this fold,
+    ///   or the source fails its field/ref checks and the build reads the
+    ///   sections). When a carry runs, `fetch_carried_leaf` reads and
+    ///   version-checks every slice it carries from before this part writes a
+    ///   leaf (finding 4), so the peek adds no second GET of those leaves;
+    /// - a dropped `.csnap` on a `rebuilt` fold, which `load_previous_entries`
+    ///   stopped reading at the first part that failed (finding 2); on every
+    ///   other path it read and validated every previous part.
+    ///
+    /// Each gap object is range-GET for its version prefix and refused if it
+    /// carries a version above this build's read set. A store error on a peek
+    /// GET is NOT a newer object: the object the read path would also fail to
+    /// read keeps its graceful-degradation path
+    /// (`a_failed_previous_leaf_get_falls_back_to_section_reads`,
+    /// `unreadable_previous_part_falls_back_to_rebuild`), and an immutable
+    /// newer object transiently unreadable this tick is refused on the next.
+    /// One ranged GET per gap ref, under `newer_part_peek_gets`.
+    ///
+    /// `reused_old_part_hashes` are the previous parts this fold carries
+    /// forward by reference (same key, same blake3): their objects are not
+    /// dropped and are not peeked.
+    #[allow(clippy::too_many_arguments)]
+    async fn peek_dropped_objects_for_newer(
+        &self,
+        signal: Signal,
+        head: &SnapshotHead,
+        reused_old_part_hashes: &HashSet<[u8; 32]>,
+        rebuilt: bool,
+        postings_from_scratch: bool,
+        typed_columns_empty: bool,
+        key_index_declared: Option<&[(String, KeyType)]>,
+        dirty_hours: &HashSet<u32>,
+        counters: &mut RequestCounters,
+    ) -> Result<(), CatalogError> {
+        if postings_from_scratch && let Some(postings) = &head.postings {
+            self.peek_envelope_not_newer(
+                &postings.key,
+                CatalogPartKind::Postings,
+                postings.size,
+                counters,
+            )
+            .await?;
+        }
+        for part in &head.parts {
+            let carried = <[u8; 32]>::try_from(part.blake3.as_slice())
+                .is_ok_and(|hash| reused_old_part_hashes.contains(&hash));
+            if carried {
+                continue;
+            }
+            if rebuilt {
+                self.peek_envelope_not_newer(
+                    &part.key,
+                    CatalogPartKind::Snapshot,
+                    part.size,
+                    counters,
+                )
+                .await?;
+            }
+            if let Some(stats) = &part.column_stats
+                && (rebuilt || typed_columns_empty || part_covers_dirty_hour(part, dirty_hours))
+            {
+                self.peek_envelope_not_newer(
+                    &stats.key,
+                    CatalogPartKind::ColumnStats,
+                    stats.size,
+                    counters,
+                )
+                .await?;
+            }
+            // When a carry runs it reads and version-checks every slice it
+            // carries from (`fetch_carried_leaf`, before any PUT of this
+            // part), so the peek covers a part's leaves only when no carry
+            // will: the leaf switch is off this fold, or the source fails its
+            // field/ref checks and the build reads the sections instead.
+            let carry_reads =
+                key_index_declared.is_some_and(|declared| carry_reads_part_leaves(part, declared));
+            if !carry_reads {
+                for leaf in &part.key_index {
+                    self.peek_leaf_not_newer(signal, leaf, counters).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Range-GET the front of a previous `.csnap`, `.npost` or `.cstat` object
+    /// and refuse the fold with [`SnapshotFormatError::NewerPart`] if its
+    /// envelope version is above this build's read set. Each envelope decoder
+    /// checks the version byte (offset 4) before any body or length field, so
+    /// the prefix carries the version even when it truncates the protobuf
+    /// header of a current-version object; that truncation is a non-version
+    /// error, which [`SnapshotFormatError::newer_part_version`] reads as
+    /// not-newer. A store error leaves the object to the read path's own
+    /// graceful-degradation handling (the GET is still counted, since the
+    /// request was issued).
+    async fn peek_envelope_not_newer(
+        &self,
+        key: &str,
+        kind: CatalogPartKind,
+        size: u64,
+        counters: &mut RequestCounters,
+    ) -> Result<(), CatalogError> {
+        let prefix = size.min(NEWER_PART_PEEK_PREFIX_LEN);
+        counters.get_requests += 1;
+        counters.newer_part_peek_gets += 1;
+        let Ok(got) = self.store().get(key, GetRange::Range(0, prefix)).await else {
+            return Ok(());
+        };
+        let classified = match kind {
+            CatalogPartKind::Snapshot => snapshot_format::decode_part_header(&got.data).err(),
+            CatalogPartKind::Postings => snapshot_format::decode_postings_header(&got.data).err(),
+            CatalogPartKind::ColumnStats => {
+                snapshot_format::decode_column_stats_header(&got.data).err()
+            }
+            // `.kidx` has its own envelope and classifier; it never reaches
+            // this method (see `peek_leaf_not_newer`).
+            CatalogPartKind::KeyIndexLeaf => None,
+        };
+        if let Some(newer) = classified.and_then(|err| err.newer_part_version()) {
+            return Err(CatalogError::SnapshotFormat(newer.refusal(key)));
+        }
+        Ok(())
+    }
+
+    /// Range-GET a previous leaf's header prefix (`[0, prefix_len)` from its
+    /// ref) and refuse the fold if its `format_version` is above the signal's
+    /// read set ([`key_index_leaf_version_is_newer`]). A ref whose `prefix_len`
+    /// is malformed, and a store error on the GET, are not newer objects and
+    /// leave the leaf to the carry or rebuild path (the GET, when issued, is
+    /// still counted).
+    async fn peek_leaf_not_newer(
+        &self,
+        signal: Signal,
+        leaf: &SnapshotKeyIndexLeafRef,
+        counters: &mut RequestCounters,
+    ) -> Result<(), CatalogError> {
+        let Ok(range) = key_index_leaf_prefix_range(leaf) else {
+            return Ok(());
+        };
+        counters.get_requests += 1;
+        counters.newer_part_peek_gets += 1;
+        let Ok(got) = self
+            .store()
+            .get(&leaf.key, GetRange::Range(range.start, range.end))
+            .await
+        else {
+            return Ok(());
+        };
+        if let Ok(version) = key_index_leaf_format_version(&got.data)
+            && key_index_leaf_version_is_newer(signal, version)
+        {
+            return Err(CatalogError::SnapshotFormat(newer_leaf_refusal(
+                &leaf.key, version,
+            )));
+        }
+        Ok(())
     }
 
     /// Whether the held-open hours `held` (see [`held_open_hours`]) list a
@@ -5927,9 +6313,9 @@ impl Catalog {
     /// listings name no commit record. A part that cannot be read answers
     /// true, so the caller takes the full fold path, whose own load of the
     /// same part fails and rebuilds, or fails the fold when the failure is a
-    /// refused decode reservation. A part naming another tenant is returned
-    /// as the error instead, failing the fold here, so the breach is counted
-    /// once rather than again by the main load.
+    /// refused decode reservation. A part naming another tenant, or one a
+    /// newer build wrote, is returned as the error instead, failing the fold
+    /// here, so a breach is counted once rather than again by the main load.
     ///
     /// Also returns every part read here with its decode reservation, keyed
     /// by part object key, so `load_previous_entries` does not read it again
@@ -5972,7 +6358,7 @@ impl Catalog {
                     );
                     loaded.insert(part_ref.key.clone(), charged);
                 }
-                Err(err) if is_foreign_part(&err) => return Err(err),
+                Err(err) if is_foreign_part(&err) || is_newer_part(&err) => return Err(err),
                 Err(_) => return Ok((true, loaded)),
             }
         }
@@ -6004,6 +6390,9 @@ impl Catalog {
     /// unreported; and a refused decode reservation is memory pressure, which
     /// the rebuild would answer by fetching and decoding every segment's names
     /// instead of one postings object, holding more memory rather than less.
+    /// A third, a postings object a newer build wrote, is
+    /// [`SnapshotFormatError::NewerPart`] (ADR-4233 H1): rebuilding would
+    /// publish postings that drop what the newer format carries.
     async fn load_previous_postings(
         &self,
         tenant: &TenantHash,
@@ -6083,6 +6472,9 @@ impl Catalog {
         // (ADR-1702 decision 6).
         let header = match snapshot_format::decode_postings_header(&got.data) {
             Ok(header) => header,
+            Err(err) if err.newer_part_version().is_some() => {
+                return Err(part_decode_error(&postings_ref.key, err));
+            }
             Err(err) => {
                 tracing::warn!(
                     error = %err,
@@ -6130,6 +6522,9 @@ impl Catalog {
         let decoded =
             match snapshot_format::decode_postings(&got.data, &limits, &expected_part_blake3) {
                 Ok(decoded) => crate::charged::Charged::new(decoded, reservation),
+                Err(err) if err.newer_part_version().is_some() => {
+                    return Err(part_decode_error(&postings_ref.key, err));
+                }
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
@@ -6191,52 +6586,63 @@ impl Catalog {
         }
     }
 
-    /// The fold's name postings for `entries`: merged forward from the
-    /// previous HEAD's postings unless `from_scratch` or no usable baseline
-    /// exists, then built by [`Catalog::build_postings`].
-    #[allow(clippy::too_many_arguments)]
-    async fn fold_postings_names(
+    /// The previous HEAD's postings to merge this fold's postings forward
+    /// from: `None` when `from_scratch`, when there is no valid previous HEAD,
+    /// or when [`Catalog::load_previous_postings`] finds no usable baseline.
+    /// Read before the attempt PUTs anything, so a refusal of a postings
+    /// object a newer build wrote leaves the store untouched.
+    async fn previous_postings_baseline(
         &self,
         tenant: &TenantHash,
-        signal: Signal,
         head_state: &HeadState,
         from_scratch: bool,
         previous_entries_len: usize,
-        entries: &[SnapshotEntry],
-        held_label_dicts: Option<&mut HeldLabelDicts>,
         counters: &mut RequestCounters,
         accounting: &QueryAccounting,
     ) -> Result<Option<Vec<NamePostings>>, CatalogError> {
-        let (baseline, decode_start): (Vec<NamePostings>, usize) = if from_scratch {
-            (Vec::new(), 0)
-        } else if let HeadState::Valid { head, .. } = head_state {
-            match self
-                .load_previous_postings(
+        match head_state {
+            HeadState::Valid { head, .. } if !from_scratch => {
+                self.load_previous_postings(
                     tenant,
                     head,
                     previous_entries_len as u64,
                     counters,
                     accounting,
                 )
-                .await?
-            {
-                Some(names) => (names, previous_entries_len),
-                None => (Vec::new(), 0),
+                .await
             }
-        } else {
-            (Vec::new(), 0)
+            _ => Ok(None),
+        }
+    }
+
+    /// The fold's name postings for `entries`: merged forward from
+    /// `baseline`, the first `previous_entries_len` entries' postings, when
+    /// there is one, then built by [`Catalog::build_postings`].
+    #[allow(clippy::too_many_arguments)]
+    async fn fold_postings_names(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        baseline: Option<Vec<NamePostings>>,
+        previous_entries_len: usize,
+        entries: &[SnapshotEntry],
+        held_label_dicts: Option<&mut HeldLabelDicts>,
+        counters: &mut RequestCounters,
+    ) -> Option<Vec<NamePostings>> {
+        let (baseline, decode_start) = match baseline {
+            Some(names) => (names, previous_entries_len),
+            None => (Vec::new(), 0),
         };
-        Ok(self
-            .build_postings(
-                tenant,
-                signal,
-                entries,
-                decode_start,
-                baseline,
-                held_label_dicts,
-                counters,
-            )
-            .await)
+        self.build_postings(
+            tenant,
+            signal,
+            entries,
+            decode_start,
+            baseline,
+            held_label_dicts,
+            counters,
+        )
+        .await
     }
 
     /// Build the name-postings index for `entries`, merging forward from `baseline` rather than re-decoding every
@@ -7108,6 +7514,7 @@ fn no_op_report(
         sealed_day_leaf_puts: counters.sealed_day_leaf_puts,
         sealed_day_previous_leaf_gets: counters.sealed_day_previous_leaf_gets,
         key_index_unchanged_section_gets: counters.key_index_unchanged_section_gets,
+        newer_part_peek_gets: counters.newer_part_peek_gets,
         head_digest,
         retired_hours,
     })
@@ -16003,6 +16410,558 @@ pub(crate) mod tests {
         );
     }
 
+    // ---- ADR-4233 H1 (#4235): a previous part a newer build wrote ----
+
+    /// Every object in `store`, key and bytes, in listing order.
+    async fn object_contents(store: &dyn ObjectStoreBackend) -> Vec<(String, Bytes)> {
+        let mut out = Vec::new();
+        for key in list_all_keys(store, "").await {
+            let data = store
+                .get(&key, GetRange::Full)
+                .await
+                .expect("a listed object reads")
+                .data;
+            out.push((key, data));
+        }
+        out
+    }
+
+    /// Folds `signal` at `now_ns` and asserts the cycle fails with
+    /// `NewerPart` naming `expected` (key, kind, version), and that the store
+    /// afterwards holds exactly the objects and bytes it held before: no HEAD
+    /// CAS, no part PUT.
+    async fn assert_fold_refuses_newer_part(
+        store: &dyn ObjectStoreBackend,
+        catalog: &Catalog,
+        signal: Signal,
+        now_ns: i64,
+        expected: (&str, CatalogPartKind, u32),
+    ) {
+        let head_key = head_object_key(&tenant(), signal);
+        let before = object_contents(store).await;
+        let head_before = before
+            .iter()
+            .find(|(key, _)| *key == head_key)
+            .map(|(_, data)| data.clone())
+            .expect("the fixture has a HEAD");
+        let err = catalog
+            .fold(&tenant(), signal, Uuid::new_v4(), now_ns, &[], None)
+            .await
+            .expect_err("a previous part a newer build wrote must fail the cycle");
+        match &err {
+            CatalogError::SnapshotFormat(SnapshotFormatError::NewerPart {
+                key,
+                kind,
+                version,
+                ..
+            }) => assert_eq!((key.as_str(), *kind, *version), expected, "{err}"),
+            other => panic!("expected NewerPart naming {expected:?}, got {other:?}"),
+        }
+        let after = object_contents(store).await;
+        let head_after = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("HEAD still present")
+            .data;
+        assert_eq!(head_after, head_before, "the refused cycle CAS-wrote HEAD");
+        assert_eq!(
+            after.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            before.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            "the refused cycle PUT a new object"
+        );
+        assert!(after == before, "the refused cycle overwrote an object");
+    }
+
+    /// A metrics HEAD over hour 10 whose one `.csnap` part has its envelope
+    /// version byte set to `version`, re-pointed so the part still passes
+    /// the HEAD's blake3 gate, plus a new hour-12 segment. Returns the
+    /// store, a catalog, the next fold's `now_ns` and the part key.
+    async fn csnap_version_case(version: u8) -> (Arc<MemoryStore>, Catalog, i64, String) {
+        let store = Arc::new(MemoryStore::new());
+        let (catalog, mut head, _) = folded_postings_baseline(&store).await;
+        assert_eq!(head.parts.len(), 1, "one previous part");
+        let part_key = head.parts[0].key.clone();
+        let mut part = store
+            .get(&part_key, GetRange::Full)
+            .await
+            .expect("part stored")
+            .data
+            .to_vec();
+        part[4] = version;
+        let hash = blake3::hash(&part).as_bytes().to_vec();
+        head.parts[0].blake3 = hash.clone();
+        head.parts[0].size = part.len() as u64;
+        head.postings.as_mut().expect("a postings ref").part_blake3 = vec![hash];
+        store
+            .put(&part_key, Bytes::from(part), PutOptions::default())
+            .await
+            .expect("put the restamped part");
+        store
+            .put(
+                &head_object_key(&tenant(), Signal::Metrics),
+                Bytes::from(snapshot_format::encode_head(&head).expect("encode head")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put the re-pointed HEAD");
+        let now = now_at_seal(12);
+        publish_real_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            2,
+            12,
+            now - NS_PER_HOUR,
+            &["disk"],
+        )
+        .await;
+        (store, catalog, now, part_key)
+    }
+
+    /// As [`csnap_version_case`], with the `.npost` object's envelope
+    /// version byte set to `version` instead. Returns the postings key.
+    async fn npost_version_case(version: u8) -> (Arc<MemoryStore>, Catalog, i64, String) {
+        let store = Arc::new(MemoryStore::new());
+        let (catalog, mut head, postings) = folded_postings_baseline(&store).await;
+        let postings_key = head.postings.as_ref().expect("a postings ref").key.clone();
+        let mut postings = postings.to_vec();
+        postings[4] = version;
+        repoint_head_at_postings(&store, &mut head, postings).await;
+        let now = now_at_seal(12);
+        publish_real_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            2,
+            12,
+            now - NS_PER_HOUR,
+            &["disk"],
+        )
+        .await;
+        (store, catalog, now, postings_key)
+    }
+
+    /// A logs HEAD over hour 10 with an I64 typed column, whose part's v3
+    /// `.cstat` object has its envelope version byte set to `version`, plus
+    /// a new hour-11 segment, so the next fold reads that object as its
+    /// statistics baseline. The store records whole-object GETs, so a caller
+    /// can prove the rebuild re-reads the hour-10 data segments rather than
+    /// reusing the baseline. Returns the `.cstat` key.
+    async fn cstat_version_case(version: u8) -> (Arc<RecordingStore>, Catalog, i64, String) {
+        let store = Arc::new(RecordingStore::new());
+        let cfg = crate::tenant_config::TenantConfig {
+            typed_attr_columns: Some(vec![crate::tenant_config::DeclaredTypedColumn {
+                key: "status".to_string(),
+                ty: crate::tenant_config::DeclaredColumnType::I64,
+            }]),
+            ..crate::tenant_config::TenantConfig::new(
+                crate::tenant_config::TenantLifecycleState::Active,
+            )
+        };
+        crate::tenant_config::set_tenant_config(store.as_ref(), &tenant(), &cfg, 1)
+            .await
+            .expect("write tenant config");
+        publish_logs_segment(store.as_ref(), 1, 10, &[200, 404, 200]).await;
+        publish_logs_segment(store.as_ref(), 2, 10, &[500, 200]).await;
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let stats_key = head.parts[0]
+            .column_stats
+            .as_ref()
+            .expect("a v3 column-stats ref")
+            .key
+            .clone();
+        let mut stats = store
+            .get(&stats_key, GetRange::Full)
+            .await
+            .expect("column stats stored")
+            .data
+            .to_vec();
+        stats[4] = version;
+        store
+            .put(&stats_key, Bytes::from(stats), PutOptions::default())
+            .await
+            .expect("overwrite the column stats");
+        publish_logs_segment(store.as_ref(), 3, 11, &[200, 200]).await;
+        (store, catalog, now_at_seal(11), stats_key)
+    }
+
+    /// [`advancing_fixture`] with the previous tail's one leaf restamped to
+    /// `version`. Returns the leaf key.
+    async fn kidx_version_case(version: u32) -> (Arc<RangeRecordingStore>, Catalog, i64, String) {
+        let inner = recording_store();
+        let first = advancing_fixture(&inner).await;
+        let leaf_key = first.parts[0].key_index[0].key.clone();
+        let bytes = inner
+            .inner
+            .get(&leaf_key, GetRange::Full)
+            .await
+            .expect("leaf stored")
+            .data;
+        let restamped = snapshot_format::restamp_key_index_leaf_version(&bytes, version)
+            .expect("restamp the leaf");
+        inner
+            .inner
+            .put(
+                &leaf_key,
+                Bytes::from(restamped.bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite the leaf");
+        let catalog = Catalog::new(inner.clone(), kidx_config()).expect("catalog");
+        let now = now_inside(KIDX_HOUR) + 5 * 60 * 1_000_000_000;
+        (inner, catalog, now, leaf_key)
+    }
+
+    /// ADR-4233 H1, #4235: a previous `.csnap`, `.npost`, `.cstat` or `.kidx`
+    /// object whose stored version is above this build's read set fails the
+    /// cycle with `NewerPart` naming the object, and the store is untouched:
+    /// no HEAD CAS and no part PUT, so nothing is rebuilt over the newer
+    /// object. Every kind has its own case, so refusing for `.csnap` alone
+    /// fails the other three.
+    ///
+    /// FLIP: guard the `.npost` and `.cstat` `newer_part_version` arms with
+    /// `false &&` and the `.npost` case's fold succeeds, so `expect_err`
+    /// panics. FLIP: PUT HEAD in the `.csnap` `is_newer_part` arm of
+    /// `fold_inner` before returning and the "CAS-wrote HEAD"
+    /// assertion fails. FLIP: PUT a part's `.cstat` before its key-index
+    /// build and the `.kidx` case fails on the key list.
+    #[tokio::test]
+    async fn newer_previous_part_fails_cycle_without_rebuild() {
+        let (store, catalog, now, key) = csnap_version_case(2).await;
+        assert_fold_refuses_newer_part(
+            store.as_ref(),
+            &catalog,
+            Signal::Metrics,
+            now,
+            (&key, CatalogPartKind::Snapshot, 2),
+        )
+        .await;
+
+        let (store, catalog, now, key) = npost_version_case(2).await;
+        assert_fold_refuses_newer_part(
+            store.as_ref(),
+            &catalog,
+            Signal::Metrics,
+            now,
+            (&key, CatalogPartKind::Postings, 2),
+        )
+        .await;
+
+        let (store, catalog, now, key) = cstat_version_case(4).await;
+        assert_fold_refuses_newer_part(
+            store.as_ref(),
+            &catalog,
+            Signal::Logs,
+            now,
+            (&key, CatalogPartKind::ColumnStats, 4),
+        )
+        .await;
+
+        let (store, catalog, now, key) = kidx_version_case(3).await;
+        assert_fold_refuses_newer_part(
+            store.as_ref(),
+            &catalog,
+            Signal::Logs,
+            now,
+            (&key, CatalogPartKind::KeyIndexLeaf, 3),
+        )
+        .await;
+    }
+
+    /// The other side of [`newer_previous_part_fails_cycle_without_rebuild`]:
+    /// a previous object stamped below the read set is unreadable, not newer,
+    /// and keeps the rebuild path. The `.csnap` case rebuilds from the commit
+    /// layout, the `.npost` case writes fresh version-1 postings, the
+    /// `.cstat` case rebuilds statistics, and the `.kidx` case reads every
+    /// entry's section instead of carrying.
+    #[tokio::test]
+    async fn older_previous_part_keeps_the_rebuild_path() {
+        let (_, catalog, now, _) = csnap_version_case(0).await;
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("a below-read-set part rebuilds");
+        assert!(report.rebuilt, "{report:?}");
+
+        let (store, catalog, now, key) = npost_version_case(0).await;
+        catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("below-read-set postings rebuild");
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        let postings_ref = head.postings.expect("rebuilt postings ref");
+        assert_ne!(postings_ref.key, key, "{postings_ref:?}");
+        let postings = store
+            .get(&postings_ref.key, GetRange::Full)
+            .await
+            .expect("rebuilt postings stored")
+            .data;
+        assert_eq!(postings[4], 1, "the rebuild writes this build's version");
+
+        let (store, catalog, now, _) = cstat_version_case(2).await;
+        // The hour-10 data objects. A reused baseline serves their statistics
+        // from the previous `.cstat`; a rebuild re-reads the data objects. The
+        // weaker `column_stats_part_objects_built > 0` holds either way (a
+        // re-encoded part always writes a fresh `.cstat`), so assert the
+        // re-read directly.
+        let prev = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let (entries, _reservation) = catalog
+            .load_part_entries(&tenant(), &prev.parts[0], &mut RequestCounters::default())
+            .await
+            .expect("previous part entries");
+        let data_keys: Vec<String> = entries
+            .iter()
+            .map(|e| {
+                column_stats_build::segment_data_key(&tenant(), Signal::Logs, e)
+                    .expect("data object key")
+            })
+            .collect();
+        store.clear_gets();
+        let report = catalog
+            .fold(&tenant(), Signal::Logs, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("below-read-set column stats rebuild");
+        assert!(report.column_stats_part_objects_built > 0, "{report:?}");
+        let reread: usize = data_keys.iter().map(|k| store.count_gets_of(k)).sum();
+        assert!(
+            reread > 0,
+            "the corrupt baseline is not reused: the hour-10 data segments are re-read ({report:?})"
+        );
+
+        let (_, catalog, now, _) = kidx_version_case(0).await;
+        let report = catalog
+            .fold(&tenant(), Signal::Logs, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("a below-read-set leaf falls back to section reads");
+        assert_eq!(report.key_index_entries_carried, 0, "{report:?}");
+        assert_eq!(report.key_index_sections_read, 5, "{report:?}");
+    }
+
+    /// ADR-4233 H1, #4235 (finding 1's `.kidx` gap, finding 4): a previous
+    /// `.kidx` leaf a newer build wrote is refused before any object is
+    /// written even when NO carry reads it -- here the leaf switch is off, so
+    /// `fetch_carried_leaf` never runs and only the pre-PUT peek can catch it.
+    /// Rules out a peek that fires only for `.npost` (it is a `.kidx` refusal)
+    /// and one that only covers the carry path.
+    ///
+    /// FLIP: gate the peek's `.kidx` branch on `carry_reads` instead of
+    /// `!carry_reads` and the switch-off fold rebuilds over the newer leaf, so
+    /// `expect_err` panics. FLIP: PUT a leaf before the peek and the
+    /// store-unchanged assertion fails.
+    #[tokio::test]
+    async fn newer_kidx_leaf_without_a_carry_fails_the_cycle() {
+        let inner = recording_store();
+        let first = advancing_fixture(&inner).await;
+        let leaf_ref = first.parts[0].key_index[0].clone();
+        let bytes = inner
+            .inner
+            .get(&leaf_ref.key, GetRange::Full)
+            .await
+            .expect("leaf stored")
+            .data;
+        // A newer build writes the leaf and its HEAD ref together, so restamp
+        // both: the peek reads the version from the ref's prefix range.
+        let restamped =
+            snapshot_format::restamp_key_index_leaf_version(&bytes, 3).expect("restamp the leaf");
+        let mut head = first.clone();
+        head.parts[0].key_index[0] = SnapshotKeyIndexLeafRef {
+            key: leaf_ref.key.clone(),
+            ..restamped.leaf_ref
+        };
+        inner
+            .inner
+            .put(
+                &leaf_ref.key,
+                Bytes::from(restamped.bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite the leaf");
+        inner
+            .inner
+            .put(
+                &head_object_key(&tenant(), Signal::Logs),
+                Bytes::from(snapshot_format::encode_head(&head).expect("encode head")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put the re-pointed HEAD");
+        // The leaf switch is off (`config` default), so this fold builds no
+        // leaves and runs no carry: only the peek reads the previous leaf.
+        let catalog = Catalog::new(inner.clone(), config(1)).expect("catalog");
+        let now = now_inside(KIDX_HOUR) + 5 * 60 * 1_000_000_000;
+        assert_fold_refuses_newer_part(
+            inner.as_ref(),
+            &catalog,
+            Signal::Logs,
+            now,
+            (&leaf_ref.key, CatalogPartKind::KeyIndexLeaf, 3),
+        )
+        .await;
+    }
+
+    /// ADR-4233 H1, #4235 (finding 1's `.npost` gap, bullet 1): a rebuild
+    /// writes postings from scratch and never reads the previous `.npost`, so
+    /// only the pre-PUT peek can catch one a newer build wrote. Here the
+    /// previous `.csnap` is stamped below the read set, which forces the
+    /// rebuild; the `.npost` is newer and the cycle fails on it before any
+    /// PUT.
+    #[tokio::test]
+    async fn newer_npost_on_a_rebuild_fails_the_cycle() {
+        let store = Arc::new(MemoryStore::new());
+        let (catalog, mut head, postings) = folded_postings_baseline(&store).await;
+        let part_key = head.parts[0].key.clone();
+        // Below-read-set `.csnap` forces a rebuild (no previous entries read,
+        // postings built from scratch).
+        let mut part = store
+            .get(&part_key, GetRange::Full)
+            .await
+            .expect("part stored")
+            .data
+            .to_vec();
+        part[4] = 0;
+        head.parts[0].blake3 = blake3::hash(&part).as_bytes().to_vec();
+        head.parts[0].size = part.len() as u64;
+        store
+            .put(&part_key, Bytes::from(part), PutOptions::default())
+            .await
+            .expect("put the below-version part");
+        // Newer `.npost`.
+        let postings_key = head.postings.as_ref().expect("a postings ref").key.clone();
+        let mut postings = postings.to_vec();
+        postings[4] = 2;
+        head.postings.as_mut().expect("a postings ref").part_blake3 =
+            vec![head.parts[0].blake3.clone()];
+        repoint_head_at_postings(&store, &mut head, postings).await;
+        let now = now_at_seal(12);
+        publish_real_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            2,
+            12,
+            now - NS_PER_HOUR,
+            &["disk"],
+        )
+        .await;
+        assert_fold_refuses_newer_part(
+            store.as_ref(),
+            &catalog,
+            Signal::Metrics,
+            now,
+            (&postings_key, CatalogPartKind::Postings, 2),
+        )
+        .await;
+    }
+
+    /// ADR-4233 H1, #4235 (finding 1's `.cstat` gap, bullet 2): a tenant that
+    /// no longer declares typed columns reads no statistics baseline, so a
+    /// previous part's `.cstat` is dropped without a read. Only the pre-PUT
+    /// peek catches one a newer build wrote.
+    #[tokio::test]
+    async fn newer_cstat_without_a_baseline_read_fails_the_cycle() {
+        let (store, catalog, now, stats_key) = cstat_version_case(4).await;
+        // Clear the typed-column config so the next fold reads no statistics
+        // baseline (and thus never reads the newer `.cstat` on its own).
+        let cfg = crate::tenant_config::TenantConfig::new(
+            crate::tenant_config::TenantLifecycleState::Active,
+        );
+        crate::tenant_config::set_tenant_config(store.as_ref(), &tenant(), &cfg, 2)
+            .await
+            .expect("clear typed columns");
+        assert_fold_refuses_newer_part(
+            store.as_ref(),
+            &catalog,
+            Signal::Logs,
+            now,
+            (&stats_key, CatalogPartKind::ColumnStats, 4),
+        )
+        .await;
+    }
+
+    /// ADR-4233 H11, #4235: a tenant config record stamped above
+    /// `TENANT_CONFIG_MAX_READ_VERSION` fails the cycle with
+    /// `NewerTenantConfig` instead of folding under deployment defaults, and
+    /// the store is untouched.
+    #[tokio::test]
+    async fn newer_tenant_config_fails_cycle() {
+        use crate::tenant_config::{
+            TENANT_CONFIG_MAX_READ_VERSION, TenantConfig, TenantLifecycleState, config_key,
+            set_tenant_config,
+        };
+        let store = Arc::new(MemoryStore::new());
+        set_tenant_config(
+            store.as_ref(),
+            &tenant(),
+            &TenantConfig::new(TenantLifecycleState::Active),
+            1,
+        )
+        .await
+        .expect("write tenant config");
+        let cfg_key = config_key(&tenant());
+        let raw = store
+            .get(&cfg_key, GetRange::Full)
+            .await
+            .expect("tenant config stored")
+            .data;
+        let mut record = ravel_proto::sys::v1::TenantConfigRecord::decode(raw.as_ref())
+            .expect("decode tenant config");
+        record.format_version = TENANT_CONFIG_MAX_READ_VERSION + 1;
+        store
+            .put(
+                &cfg_key,
+                record.encode_to_vec().into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put the newer record");
+        let now = now_at_seal(10);
+        publish_real_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now - NS_PER_HOUR,
+            &["cpu"],
+        )
+        .await;
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let before = object_contents(store.as_ref()).await;
+        let err = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect_err("a newer tenant config must fail the cycle");
+        match &err {
+            CatalogError::Provisioning(
+                crate::provisioning::ProvisioningError::NewerTenantConfig { key, got, ceiling },
+            ) => {
+                assert_eq!(key, &cfg_key);
+                assert_eq!(*got, TENANT_CONFIG_MAX_READ_VERSION + 1);
+                assert_eq!(*ceiling, TENANT_CONFIG_MAX_READ_VERSION);
+            }
+            other => panic!("expected NewerTenantConfig, got {other:?}"),
+        }
+        assert!(
+            object_contents(store.as_ref()).await == before,
+            "the refused cycle wrote to the store"
+        );
+    }
+
     /// Folds three entries of four distinct `user_id` values each (twelve
     /// (entry, key8) pairs, every key8 in one entry, values interleaved so
     /// each key8 range spans all three entries) under `max_pairs` and a
@@ -19168,7 +20127,7 @@ pub(crate) mod tests {
                 assert_eq!(field.held.len(), 2, "both slices' pairs held");
                 assert!(later_slice.bytes.is_some());
             } else {
-                let reason = fed.expect_err("the later slice is refused");
+                let reason = fed.expect_err("the later slice is refused").to_string();
                 assert!(
                     reason.contains("other uncovered_entry_ordinals"),
                     "{reason}"

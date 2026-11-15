@@ -19,7 +19,7 @@ pub use column_stats::{
 pub(crate) use column_stats::{SegmentMeter, decode_column_stats_streamed};
 #[cfg(test)]
 pub use column_stats::{encode_column_stats, encode_column_stats_v2};
-pub use error::SnapshotFormatError;
+pub use error::{CatalogPartKind, NewerPartVersion, SnapshotFormatError};
 pub use head::{
     HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSION_2, HEAD_FORMAT_VERSIONS, decode_head, encode_head,
     head_format_version_for, head_format_version_is_newer,
@@ -43,12 +43,13 @@ pub use kidx::{
     encode_key_index_leaf_with_bucket_bits, encode_key_index_posting_leaf,
     encode_key_index_posting_leaf_with_bucket_bits, encoded_entry_len, encoded_posting_len,
     key_index_field_entry_kind, key_index_leaf_format_version, key_index_leaf_prefix_range,
-    key_index_leaf_version_accepted, key_index_leaf_versions_for_signal, key_index_root_shape,
-    plan_key_index_leaf_set, posting_decoded_bound, probe_key_index_leaf_ranged,
-    probe_key_index_leaf_set_ranged, read_key_index_set_runs, restamp_key_index_leaf_version,
-    select_key_index_slice, series_label_pair_bytes, series_label_pair_key8,
-    split_key_index_entries, split_key_index_postings, verify_key_index_leaf,
-    verify_key_index_leaf_frames, verify_key_index_posting_leaf_frames,
+    key_index_leaf_version_accepted, key_index_leaf_version_is_newer,
+    key_index_leaf_versions_for_signal, key_index_root_shape, plan_key_index_leaf_set,
+    posting_decoded_bound, probe_key_index_leaf_ranged, probe_key_index_leaf_set_ranged,
+    read_key_index_set_runs, restamp_key_index_leaf_version, select_key_index_slice,
+    series_label_pair_bytes, series_label_pair_key8, split_key_index_entries,
+    split_key_index_postings, verify_key_index_leaf, verify_key_index_leaf_frames,
+    verify_key_index_posting_leaf_frames,
 };
 pub use part::{DecodedPart, decode_part, decode_part_header, encode_part, encode_part_ranged};
 pub use postings::{
