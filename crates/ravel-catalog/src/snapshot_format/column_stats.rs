@@ -1676,10 +1676,7 @@ mod tests {
                 "version {version} acceptance must match the hardcoded {{3}} set"
             );
             if !expected_accept {
-                assert_eq!(
-                    decoded.expect_err("rejected"),
-                    version_refusal(version)
-                );
+                assert_eq!(decoded.expect_err("rejected"), version_refusal(version));
             }
         }
     }

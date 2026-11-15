@@ -1122,6 +1122,16 @@ fn every_prefix_corruption_is_a_typed_rejection() {
         result.expect("no breach"),
         KeyIndexLeafProbe::Rejected(KeyIndexLeafRejection::NewerVersion(3))
     );
+    // The whole-object verify classifies the same way, and a version below
+    // the known set is unsupported, not newer.
+    assert_eq!(
+        verify_key_index_leaf(&with(&|h| h.format_version = 3).0, &limits).map(|_| ()),
+        Err(KeyIndexLeafRejection::NewerVersion(3))
+    );
+    assert_eq!(
+        verify_key_index_leaf(&with(&|h| h.format_version = 0).0, &limits).map(|_| ()),
+        Err(KeyIndexLeafRejection::UnsupportedVersion(0))
+    );
     expect_rejected(
         &with(&|h| h.bucket_bits = 17),
         &k,
