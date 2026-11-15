@@ -272,6 +272,7 @@ impl RspanWriter {
             level,
             input_set_hash,
             part_index,
+            unknown_section_kinds: Vec::new(),
         };
         write_footer_and_trailer(&mut object, &footer);
         Ok(object)

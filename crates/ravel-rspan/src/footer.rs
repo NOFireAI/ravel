@@ -156,6 +156,11 @@ pub struct SpanFooter {
     pub input_set_hash: Vec<u8>,
     /// Part ordinal within one compaction output (0 on an L0 object).
     pub part_index: u32,
+    /// Section kind ids present in the directory but not recognized by this
+    /// build, skipped rather than rejected (ADR-4233 decision 4, hazard H6).
+    /// Empty for an object this build wrote. Populated by `validate_sections`
+    /// on open; not set by `from_proto` directly.
+    pub unknown_section_kinds: Vec<u32>,
 }
 
 impl SpanFooter {
@@ -235,6 +240,7 @@ impl SpanFooter {
             level: p.level,
             input_set_hash: p.input_set_hash,
             part_index: p.part_index,
+            unknown_section_kinds: Vec::new(),
         })
     }
 }
@@ -268,7 +274,11 @@ pub fn write_footer_and_trailer(out: &mut Vec<u8>, footer: &SpanFooter) {
 /// protocol): either the footer parsed, or the suffix did not reach the whole
 /// footer and the caller must fetch the named absolute byte range (itself a
 /// true suffix of the object) and call [`open_from_suffix`] again with it.
+// `SpanFooter` (the `Ready` variant) outgrew `NeedRange` once H6 added
+// `unknown_section_kinds`; boxing it would change the public return type of
+// `open_from_suffix` for callers in other crates, which is out of scope here.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum SuffixOutcome {
     /// The footer was fully covered and validated.
     Ready(SpanFooter),
@@ -359,7 +369,12 @@ pub fn open_from_suffix(suffix: &[u8], total_size: u64) -> Result<SuffixOutcome,
         .map_err(|e| SpanSegError::Corrupted(format!("footer decode: {e}")))?;
     let footer = SpanFooter::from_proto(proto)?;
 
-    validate_sections(&footer, footer_start as u64, DEFAULT_MAX_SECTION_UNCOMP)?;
+    let unknown_section_kinds =
+        validate_sections(&footer, footer_start as u64, DEFAULT_MAX_SECTION_UNCOMP)?;
+    let footer = SpanFooter {
+        unknown_section_kinds,
+        ..footer
+    };
     Ok(SuffixOutcome::Ready(footer))
 }
 
@@ -372,7 +387,7 @@ pub fn validate_sections(
     footer: &SpanFooter,
     section_area_end: u64,
     max_uncomp: u64,
-) -> Result<(), SpanSegError> {
+) -> Result<Vec<u32>, SpanSegError> {
     let known = [kind::BLOCKS, kind::SKIP_IDX, kind::BLOOM, kind::KEY_IDX];
     for k in known {
         let n = footer.sections.iter().filter(|s| s.kind == k).count();
@@ -385,7 +400,11 @@ pub fn validate_sections(
             )));
         }
     }
+    let mut unknown_kinds = Vec::new();
     for s in &footer.sections {
+        if !known.contains(&s.kind) && !unknown_kinds.contains(&s.kind) {
+            unknown_kinds.push(s.kind);
+        }
         let end = s
             .offset
             .checked_add(s.len)
@@ -417,7 +436,8 @@ pub fn validate_sections(
             key_idx_prefix_range(s.prefix_len, s.len)?;
         }
     }
-    Ok(())
+    unknown_kinds.sort_unstable();
+    Ok(unknown_kinds)
 }
 
 /// Reads and decompresses a whole-read section, verifying its crc first.
@@ -548,6 +568,7 @@ mod tests {
             level: 0,
             input_set_hash: Vec::new(),
             part_index: 0,
+            unknown_section_kinds: Vec::new(),
         }
     }
 
@@ -991,6 +1012,78 @@ mod tests {
             skip.candidate_blocks_with_bloom(None, i64::MIN, i64::MAX, None, None, &bad, &probe),
             Err(SpanSegError::Corrupted(_))
         ));
+    }
+
+    /// A section kind id no `kind` constant names: real objects this build
+    /// writes never carry it.
+    const UNKNOWN_KIND: u32 = 0xFEED_0001;
+
+    /// H6 (ADR-4233 decision 4): a section kind this build does not
+    /// recognize is skipped, not rejected, and its kind id is reported on
+    /// the opened footer rather than silently dropped.
+    #[test]
+    fn unknown_section_kind_is_reported() {
+        let before = open(&build_object(SAMPLE_BODY_LEN)).expect("open before splice");
+        assert_eq!(
+            before.unknown_section_kinds,
+            Vec::<u32>::new(),
+            "an object this build wrote reports no unknown kinds"
+        );
+
+        let mut sections = sample_sections();
+        sections.push(SectionDesc {
+            kind: UNKNOWN_KIND,
+            offset: SAMPLE_BODY_LEN as u64,
+            len: 3,
+            crc32c: 0,
+            comp: COMP_NONE,
+            uncomp_len: 3,
+            prefix_len: 0,
+        });
+        let mut obj = vec![0u8; SAMPLE_BODY_LEN];
+        obj.extend_from_slice(b"fut");
+        write_footer_and_trailer(&mut obj, &sample_footer(sections));
+
+        let after = open(&obj).expect("open spliced");
+        assert_eq!(after.unknown_section_kinds, vec![UNKNOWN_KIND]);
+        // Data still decodes correctly: every known section is unaffected.
+        assert_eq!(after.section(kind::BLOCKS).map(|s| s.offset), Some(0));
+        assert_eq!(after.record_count, before.record_count);
+    }
+
+    /// Rules out an implementation that always reports an empty list
+    /// regardless of what the directory holds: a second, distinct unknown
+    /// kind is reported too, and the list is sorted and deduplicated.
+    #[test]
+    fn multiple_unknown_kinds_are_all_reported_sorted_and_deduped() {
+        let mut sections = sample_sections();
+        let kinds = [
+            UNKNOWN_KIND + 2,
+            UNKNOWN_KIND,
+            UNKNOWN_KIND + 2,
+            UNKNOWN_KIND + 1,
+        ];
+        let mut offset = SAMPLE_BODY_LEN as u64;
+        for k in kinds {
+            sections.push(SectionDesc {
+                kind: k,
+                offset,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_NONE,
+                uncomp_len: 1,
+                prefix_len: 0,
+            });
+            offset += 1;
+        }
+        let mut obj = vec![0u8; offset as usize];
+        write_footer_and_trailer(&mut obj, &sample_footer(sections));
+
+        let got = open(&obj).expect("open spliced");
+        assert_eq!(
+            got.unknown_section_kinds,
+            vec![UNKNOWN_KIND, UNKNOWN_KIND + 1, UNKNOWN_KIND + 2]
+        );
     }
 
     proptest! {

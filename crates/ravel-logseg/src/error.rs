@@ -30,6 +30,15 @@ pub enum LogSegError {
     /// `ravel_segment::SegmentError::UnsupportedVersion`.
     #[error("unsupported format version {0}")]
     UnsupportedVersion(u16),
+    /// A nested section (POSTINGS, KEY_IDX) inside an otherwise-admitted
+    /// trailer carries a grammar version this build does not know (ADR-4233
+    /// decision 4, hazard H5). Distinct from `UnsupportedVersion`, which is
+    /// the trailer's own version: here the trailer is readable and only the
+    /// section's internal grammar is newer than this reader. The reader
+    /// paths that fall back on `Corrupted` today (the retention probe,
+    /// `certify`) fall back the same way on this variant.
+    #[error("unsupported {section} section version {version}")]
+    UnsupportedSectionVersion { section: &'static str, version: u16 },
     /// A build-side limit or precondition was not met. Among them: a value
     /// that would take a `VarBytes` column past the `u32::MAX` bytes its `u32`
     /// offsets address, one byte short of 4 GiB (`VarBytes::try_push`), and a
@@ -111,6 +120,9 @@ impl From<ravel_codec::error::CodecError> for LogSegError {
     fn from(e: ravel_codec::error::CodecError) -> Self {
         match e {
             ravel_codec::error::CodecError::Corrupted(s) => LogSegError::Corrupted(s),
+            ravel_codec::error::CodecError::UnsupportedSectionVersion { section, version } => {
+                LogSegError::UnsupportedSectionVersion { section, version }
+            }
         }
     }
 }

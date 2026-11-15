@@ -191,6 +191,14 @@ pub struct LogFooter {
     /// `None` with a nonzero generation; a descriptor with generation 0 is
     /// refused as corrupt.
     pub clustering_generation: u64,
+    /// Section kind ids this object's directory names that this build does
+    /// not recognize (ADR-4233 decision 4, hazard H6, reader side). Every
+    /// such kind is skipped over, bounds-checked but otherwise untouched
+    /// (docs/log-segment-format.md: unknown kinds are skipped); this is the
+    /// list of what was skipped. Empty for an object this build wrote.
+    /// Sorted ascending, deduplicated. Populated by `open`/`open_from_suffix`
+    /// via `validate_sections`; empty on a `LogFooter` built any other way.
+    pub unknown_section_kinds: Vec<u32>,
 }
 
 /// Width of the time bucket leading a clustered sort key.
@@ -429,6 +437,7 @@ impl LogFooter {
             part_index: p.part_index,
             sort_descriptor,
             clustering_generation: p.clustering_generation,
+            unknown_section_kinds: Vec::new(),
         })
     }
 }
@@ -510,6 +519,10 @@ pub fn rewrite_trailer_version(bytes: &mut [u8], version: u16) -> Result<(), Log
 /// footer and the caller must fetch the named absolute byte range (itself a
 /// true suffix of the object) and call [`open_from_suffix`] again with it.
 #[derive(Clone, Debug, PartialEq)]
+// `LogFooter` (the `Ready` variant) outgrew `NeedRange` once H6 added
+// `unknown_section_kinds`; boxing it would change the public return type of
+// `open_from_suffix` for callers in other crates, which is out of scope here.
+#[allow(clippy::large_enum_variant)]
 pub enum SuffixOutcome {
     /// The footer was fully covered and validated.
     Ready(LogFooter),
@@ -643,20 +656,47 @@ pub fn open_from_suffix(suffix: &[u8], total_size: u64) -> Result<SuffixOutcome,
         .map_err(|e| LogSegError::Corrupted(format!("footer decode: {e}")))?;
     let footer = LogFooter::from_proto(proto)?;
 
-    validate_sections(&footer, footer_start as u64, DEFAULT_MAX_SECTION_UNCOMP)?;
+    let unknown_section_kinds =
+        validate_sections(&footer, footer_start as u64, DEFAULT_MAX_SECTION_UNCOMP)?;
+    let footer = LogFooter {
+        unknown_section_kinds,
+        ..footer
+    };
     Ok(SuffixOutcome::Ready(footer))
+}
+
+/// Every section kind this build recognizes, mandatory or not (ADR-4233
+/// decision 4, hazard H6): the five v1 kinds, PAGE_DIR (ADR-0699, mandatory
+/// since trailer version 4 but not independently counted below), KEY_IDX and
+/// POSTINGS (both optional). A kind outside this set is reported through
+/// [`validate_sections`]'s return value rather than silently skipped.
+fn is_known_kind(k: u32) -> bool {
+    matches!(
+        k,
+        kind::STREAM_DIR
+            | kind::FIELD_DIR
+            | kind::BLOCKS
+            | kind::SKIP_IDX
+            | kind::BLOOM
+            | kind::PAGE_DIR
+            | kind::KEY_IDX
+            | kind::POSTINGS
+    )
 }
 
 /// Validates the section table: at most one of each known kind, all five v1
 /// kinds present, every range inside the section area with overflow-checked
 /// arithmetic, every `uncomp_len` within the cap, and at most one KEY_IDX
 /// entry, stored raw with a `prefix_len` that is non-zero, not past the
-/// section, and at most `KEY_IDX_PREFIX_MAX`.
+/// section, and at most `KEY_IDX_PREFIX_MAX`. Returns the sorted,
+/// deduplicated list of section kind ids present that [`is_known_kind`] does
+/// not recognize (ADR-4233 decision 4, hazard H6); empty for an object this
+/// build wrote.
 pub fn validate_sections(
     footer: &LogFooter,
     section_area_end: u64,
     max_uncomp: u64,
-) -> Result<(), LogSegError> {
+) -> Result<Vec<u32>, LogSegError> {
     let known = [
         kind::STREAM_DIR,
         kind::FIELD_DIR,
@@ -675,6 +715,7 @@ pub fn validate_sections(
             )));
         }
     }
+    let mut unknown_kinds = Vec::new();
     for s in &footer.sections {
         // Unknown kinds are skipped but their ranges are still bounds-checked so
         // a hostile descriptor cannot point outside the object.
@@ -704,7 +745,11 @@ pub fn validate_sections(
             }
             key_idx_prefix_range(s.prefix_len, s.len)?;
         }
+        if !is_known_kind(s.kind) && !unknown_kinds.contains(&s.kind) {
+            unknown_kinds.push(s.kind);
+        }
     }
+    unknown_kinds.sort_unstable();
     if footer
         .sections
         .iter()
@@ -728,7 +773,7 @@ pub fn validate_sections(
             "duplicate section kind POSTINGS".into(),
         ));
     }
-    Ok(())
+    Ok(unknown_kinds)
 }
 
 #[cfg(test)]
@@ -758,6 +803,7 @@ mod tests {
             part_index: 0,
             sort_descriptor: None,
             clustering_generation: 0,
+            unknown_section_kinds: Vec::new(),
         }
     }
 
@@ -1519,5 +1565,82 @@ mod tests {
             SortDescriptor::from_proto(p, 1),
             Err(LogSegError::Corrupted(m)) if m == "footer sort descriptor bucket width 0 unknown"
         ));
+    }
+
+    /// A section kind id no `kind` constant names: real objects this build
+    /// writes never carry it.
+    const UNKNOWN_KIND: u32 = 0xFEED_0001;
+
+    /// H6 (ADR-4233 decision 4): a section kind this build does not
+    /// recognize is skipped, not rejected, and its kind id is reported on
+    /// the opened footer rather than silently dropped.
+    #[test]
+    fn unknown_section_kind_is_reported() {
+        let before = open(&{
+            let mut obj = vec![0u8; 5];
+            write_footer_and_trailer(&mut obj, &sample_footer(sample_sections()));
+            obj
+        })
+        .expect("open before splice");
+        assert_eq!(
+            before.unknown_section_kinds,
+            Vec::<u32>::new(),
+            "an object this build wrote reports no unknown kinds"
+        );
+
+        let mut sections = sample_sections();
+        sections.push(SectionDesc {
+            kind: UNKNOWN_KIND,
+            offset: 5,
+            len: 3,
+            crc32c: 0,
+            comp: COMP_NONE,
+            uncomp_len: 3,
+            prefix_len: 0,
+        });
+        let mut obj = vec![0u8; 5];
+        obj.extend_from_slice(b"fut");
+        write_footer_and_trailer(&mut obj, &sample_footer(sections));
+
+        let after = open(&obj).expect("open spliced");
+        assert_eq!(after.unknown_section_kinds, vec![UNKNOWN_KIND]);
+        // Data still decodes correctly: every known section is unaffected.
+        assert_eq!(after.section(kind::BLOCKS).map(|s| s.offset), Some(2));
+        assert_eq!(after.record_count, before.record_count);
+    }
+
+    /// Rules out an implementation that always reports an empty list
+    /// regardless of what the directory holds: a second, distinct unknown
+    /// kind is reported too, and the list is sorted and deduplicated.
+    #[test]
+    fn multiple_unknown_kinds_are_all_reported_sorted_and_deduped() {
+        let mut sections = sample_sections();
+        let kinds = [
+            UNKNOWN_KIND + 2,
+            UNKNOWN_KIND,
+            UNKNOWN_KIND + 2,
+            UNKNOWN_KIND + 1,
+        ];
+        let mut offset = 5u64;
+        for k in kinds {
+            sections.push(SectionDesc {
+                kind: k,
+                offset,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_NONE,
+                uncomp_len: 1,
+                prefix_len: 0,
+            });
+            offset += 1;
+        }
+        let mut obj = vec![0u8; offset as usize];
+        write_footer_and_trailer(&mut obj, &sample_footer(sections));
+
+        let got = open(&obj).expect("open spliced");
+        assert_eq!(
+            got.unknown_section_kinds,
+            vec![UNKNOWN_KIND, UNKNOWN_KIND + 1, UNKNOWN_KIND + 2]
+        );
     }
 }
