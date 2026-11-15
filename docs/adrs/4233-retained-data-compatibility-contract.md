@@ -10,7 +10,7 @@ retiring a reader). Supersedes the open tasks of #16 (T6, T10, T11).
 Migration classes touched (ADR-0066 decision 4): class C for two additive
 changes (`ProvisioningRecord` gains `compat_epoch` and `compat_fenced_unix_ns`
 and writes format version 4 only when it carries them; the alert lease JSON
-gains `compat_expiry_ns`),
+gains `compat_expiry_ns` and `compat_epoch`),
 and one new class C record, `sys/compat`. No class A, B or D format changes.
 No bulk data-object version is bumped by this ADR.
 
@@ -37,7 +37,9 @@ No bulk data-object version is bumped by this ADR.
   says so on purpose ("there is never a write-the-old-format mode"), which
   makes a rolling upgrade across a bump safe only when every reader is
   upgraded before any writer, an ordering nothing enforces: the operator
-  rolls every tier from one `spec.image` with plain `RollingUpdate`
+  rolls the gateway, query and maintain tiers from one `spec.image` (the
+  ingest router from its own `routerImage`), every Deployment with plain
+  `RollingUpdate` and no version gate
   (`services/ravel-operator/src/reconcile.rs`).
 - **No process records what it can read.** The maintain heartbeat carries a
   process id and timestamps, the query-worker record a protocol version; no
@@ -74,6 +76,7 @@ other than fail closed:
 | H1 | catalog fold, previous `.csnap`/`.npost`/`.cstat`/`.kidx` part | any decode error, a newer version included, rebuilds from commit records and CAS-replaces HEAD; the catalog sweep then deletes the newer peer's parts |
 | H3 | alert evaluator history fold | an RLOG object at an unreadable version is skipped and counted (`alerting.rs`, `AlertHistorySkipReason::UnsupportedVersion`), so the alert state is rebuilt without it |
 | H5 | RLOG POSTINGS and KEY_IDX nested sections | a newer section version reads as `Corrupted`; the trailer probe the retention hold uses never sees it |
+| H6 | re-encode (compaction, migrate, erasure, force 2) | the readers skip a section kind they do not know, so a re-encode of such an input writes an output without that section (the drop is inferred from the skip rule in `crates/ravel-segment/src/format.rs` and the POSTINGS rules, not observed) |
 | H7 | audit retention | deletes by age with no version hold |
 | H8 | compaction claim | an unreadable (newer) claim is stolen and overwritten as version 1 after the lease ceiling |
 | H9 | migrate and scan cursors | a newer cursor reads as absent and is CAS-overwritten |
@@ -84,8 +87,7 @@ Others are reported for follow-up rather than fixed here: H2 (a HEAD
 rebuild strips additive HEAD fields a newer build added without a version
 bump; the rule that HEAD changes bump the version already covers it), H4 (a
 magic change reads as `BadMagic` and is swept as corrupt; magic is frozen
-and this ADR says so), H6 (an older re-encode may drop an unknown section
-kind; unverified), H12 (scrub and seal-divergence label a newer version as
+and this ADR says so), H12 (scrub and seal-divergence label a newer version as
 corruption in reports only).
 
 ### Persisted-format inventory
@@ -132,9 +134,17 @@ starts at the baseline, not at v1.0.
 - **Existing stores (owner, 2026-11-15: nothing before v0.33 is in
   scope).** A store written by v0.33.x holds the baseline's bulk versions
   (RSEG 7, RLOG 5, RSPAN 5) and metadata inside the baseline's read sets,
-  and is adopted in place: `ravel-cli compat init` runs the census of
-  decision 7 over every tenant, signal and family, and only on a clean
-  result creates `sys/compat` at the baseline versions. A baseline binary
+  and is adopted in place: `ravel-cli compat init` runs a census over every
+  tenant and signal, and only on a clean result creates `sys/compat` at the
+  baseline versions. For the class A families the census is decision 7's
+  population and trailer check with "at least N+1" replaced by "inside the
+  baseline read set" (every live, held and pinned member's stamp and
+  trailer); for every other family it is the read-set check of each
+  object's own `format_version`: catalog HEAD and every part HEAD names,
+  the provisioning record, tenant config, and every commit, compaction,
+  rewrite and tombstone record the class A census already lists. Any
+  version outside the baseline read set, any listing failure and any
+  unreadable object refuses `init`. A baseline binary
   runs on such a store before `init` exactly as v0.33 does; `init` is
   required before any activation (decision 3).
 - **Unsupported starting points.** Stores, data and processes from releases
@@ -144,8 +154,11 @@ starts at the baseline, not at v1.0.
   admits and names each (tenant, signal, version, count); the remedy is to
   re-ingest or discard those objects, and the retention version hold keeps
   them, unreadable, meanwhile. A store with nothing outside the read sets
-  passes the census whatever wrote it, but only v0.33.x stores are
-  supported.
+  passes the census whatever wrote it. "Only v0.33.x stores are supported"
+  is therefore a support statement, not an enforced check: nothing in a
+  store records which release wrote it. `init` prints, and records in
+  `sys/compat`, the version histogram it found per family, so what was
+  adopted is on record.
 - **Unsupported processes.** A release before the baseline is not part of
   the contract. It may run beside the baseline until the first activation
   above the baseline (decision 3), because until then the baseline writes
@@ -198,7 +211,9 @@ message CompatRecord {
   repeated CompatFamily families = 4;
   uint64 compat_epoch = 5;           // raised by every activation of any family
   sfixed64 max_publish_lifetime_ns = 6; // P, decision 7
+  repeated AdoptedVersion adopted = 7; // decision 1: what `init` found
 }
+message AdoptedVersion { string family = 1; uint32 version = 2; uint64 count = 3; }
 ```
 
 - **Absent record.** A baseline-or-later process treats an absent
@@ -212,7 +227,7 @@ message CompatRecord {
   raised by every activation of any family; each family records the epoch
   at which it was activated. Every comparison below uses this one counter.
 - **Refresh and staleness.** Every process reads `sys/compat` at startup and
-  every 60 s (the `GenerationSwitch` horizon), off the hot path. A writer
+  every 60 s (the `GenerationSwitch` refresh interval), off the hot path. A writer
   chooses an object's version when it starts encoding it: for an ingest
   flush that is the moment the flush is granted its permit, not the moment
   the flush opens (a flush can wait up to `max_flush_lifetime` for a permit
@@ -523,11 +538,14 @@ For a class A family:
     typed at read time and the retention version hold keeps it. The remedy
     is to roll back to the release that reads both versions, `migrate`, and
     re-certify.
-- **Fresh stores.** A store with
-  no `sys/compat` and no `sys/tenancy` is a fresh store and is bootstrapped;
-  one with `sys/tenancy` and no `sys/compat` is refused. This is how an
-  unsupported upgrade path, including skipping the release that carried
-  both readers, is refused before it modifies anything.
+- **Fresh stores, for the retired-reader release only.** A release whose
+  reader for F no longer admits N treats a store with no `sys/compat` and
+  no `sys/tenancy` as fresh and bootstraps it, and refuses to start on one
+  with `sys/tenancy` and no `sys/compat`. This is how an unsupported upgrade
+  path, including skipping the release that carried both readers, is
+  refused before it modifies anything. The baseline and every release that
+  retires no reader run on a store without `sys/compat` as decision 1
+  says.
 - **What keeps it true.** Baseline-or-later writers stop starting to encode
   objects below the active version within `H` and stop publishing them within
   `H + P + T_req`, and once F is certified `--write-below-format-floor` is
@@ -602,6 +620,7 @@ For a class A family:
 | a tenant onboarded after activation | its record is born fenced; the `certify` wait does not restart |
 | lease parking: holder is a v-old evaluator; lease absent; a baseline evaluator with a pre-activation view; an evaluator that cannot write the active version holding the lease | displaced holder stops; absent lease created parked; stale evaluator refreshes before acting; incapable holder re-parks and a capable one takes over |
 | `sys/compat` deleted after activation | publishes refused with `CompatRecordMissing`; `compat init` refuses |
+| `compat init` over a corpus holding one object below the baseline read set (made with the drill version raised and the window shifted, or a hand-stamped catalog part, record or tenant config) | `init` refuses, names (tenant, signal, version, count), and writes nothing; a clean v0.33.0 corpus is adopted and its histogram recorded |
 | a bucket provisioned at version 3 after the fence walk | fenced on first activated publish or by `certify`; `certify` waits `G_pre` from that bucket's fence time |
 | one row per closed hazard H1, H3, H5 to H11 | the baseline behaviour in decision 4's table, with the store listed before and after to show nothing was rebuilt, overwritten or deleted |
 | Flight SQL scan over an object at an unreadable version | the stream ends with a typed error, no partial result |
@@ -615,9 +634,14 @@ For a class A family:
   results and `compat init` adopts it. No bulk format boundary exists
   between v0.33.0 and the baseline (both write RSEG 7, RLOG 5, RSPAN 5), and
   boundaries in older releases are out of scope by the owner's decision, so
-  a two-version boundary is exercised by the format-drill version until the
-  first real bump, whose release adds its corpus and is covered by the
-  previous-release lane below.
+  a two-version boundary is exercised by the format-drill version only, and
+  no released binary meets a version it cannot read until the first real
+  bump. The release that makes that bump must add a boundary lane of its
+  own: its corpus at N+1 after activation, opened by the previous
+  release's published image, asserting typed failure and, by listing the
+  store before and after, that it deleted and rewrote nothing. The
+  previous-release lane below does not cover that case, since it runs with
+  nothing activated.
 - **Released-binary fence drill (wave 0).** The released v0.33.0 image runs
   against an isolated RustFS bucket whose provisioning records were fenced
   and whose alert lease was parked by the baseline code, including a run
