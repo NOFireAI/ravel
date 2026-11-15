@@ -1351,42 +1351,6 @@ fn part_covers_dirty_hour(part: &SnapshotPartRef, dirty_hours: &HashSet<u32>) ->
         .any(|&h| part.min_hour <= h && h <= part.watermark_hour)
 }
 
-/// Whether a key-index carry over `part` would read its leaves: the same
-/// field and ref checks [`Catalog::load_carry_source`] makes before it fetches
-/// any leaf (ADR-4233 H1, finding 1's `.kidx` gap). When this is true the
-/// carry reads and version-checks the lowest slice of each declared field, so
-/// the newer-part peek need only cover the higher slices; when it is false no
-/// leaf is read and the peek covers them all. The entry-count check
-/// `load_carry_source` also makes needs the part's decoded entries and is not
-/// a field/ref check, so it is not replicated here: a mismatch there re-reads
-/// the sections, which cannot drop a newer leaf over anything.
-fn carry_reads_part_leaves(part: &SnapshotPartRef, declared: &[(String, KeyType)]) -> bool {
-    let refs = &part.key_index;
-    if refs.iter().any(|leaf| {
-        declared
-            .iter()
-            .find(|(name, _)| name == &leaf.field)
-            .is_none_or(|(_, key_type)| u32::from(key_type.as_u8()) != leaf.key_type)
-    }) {
-        return false;
-    }
-    for (name, _) in declared {
-        if !refs.iter().any(|leaf| &leaf.field == name) {
-            return false;
-        }
-        if select_key_index_slice(refs, name.as_str(), &[0u8; 8]).is_err() {
-            return false;
-        }
-        if refs
-            .iter()
-            .any(|leaf| &leaf.field == name && leaf.part_blake3 != part.blake3)
-        {
-            return false;
-        }
-    }
-    true
-}
-
 /// Retention tombstones the reconcile passes found in a previous HEAD's
 /// sealed, leaf-bearing parts (ADR-3939 decision 6). Such a bucket is set
 /// aside instead of being dropped from `entries` on the spot, and
@@ -2739,7 +2703,7 @@ struct CarriedKeyIndex {
 }
 
 /// Why a previous part's leaves are not carried into a new part's leaves.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 enum CarryFailure {
     /// The leaves cannot stand in for the sections, for the reason given;
     /// the build reads the sections instead.
@@ -2747,6 +2711,10 @@ enum CarryFailure {
     /// A leaf a newer build wrote ([`SnapshotFormatError::NewerPart`],
     /// ADR-4233 H1). The fold fails rather than rebuild the leaf over it.
     Newer(SnapshotFormatError),
+    /// A leaf GET failed with a store error other than `NotFound`. The fold
+    /// fails: the leaf was not read, and the HEAD this part's rebuild would
+    /// publish drops it.
+    Store(StoreError),
 }
 
 impl From<String> for CarryFailure {
@@ -2760,6 +2728,20 @@ impl std::fmt::Display for CarryFailure {
         match self {
             CarryFailure::Unusable(reason) => f.write_str(reason),
             CarryFailure::Newer(err) => err.fmt(f),
+            CarryFailure::Store(err) => err.fmt(f),
+        }
+    }
+}
+
+impl CarryFailure {
+    /// `Ok` with the fold's error for a failure that ends the cycle; `Err`
+    /// with the reason for [`CarryFailure::Unusable`], which the build
+    /// answers by reading the sections.
+    fn into_fold_error(self) -> Result<CatalogError, String> {
+        match self {
+            CarryFailure::Unusable(reason) => Err(reason),
+            CarryFailure::Newer(err) => Ok(CatalogError::SnapshotFormat(err)),
+            CarryFailure::Store(err) => Ok(CatalogError::Store(err)),
         }
     }
 }
@@ -2767,7 +2749,9 @@ impl std::fmt::Display for CarryFailure {
 /// GETs one previous leaf whole and verifies it: the leaf's own checks, its
 /// ref, its tenant, signal, part hash and part entry count, and a
 /// `format_version` the signal accepts (not a logs version-1 leaf). A leaf
-/// above every version this build knows is [`CarryFailure::Newer`].
+/// above every version this build knows is [`CarryFailure::Newer`]; a GET
+/// that fails with anything but `NotFound` is [`CarryFailure::Store`], and a
+/// `NotFound` is [`CarryFailure::Unusable`].
 #[allow(clippy::too_many_arguments)]
 async fn fetch_carried_leaf(
     store: &dyn ObjectStoreBackend,
@@ -2784,7 +2768,12 @@ async fn fetch_carried_leaf(
     let got = store
         .get(&leaf.key, GetRange::Full)
         .await
-        .map_err(|e| format!("leaf {} GET: {e}", leaf.key))?;
+        .map_err(|e| match e {
+            StoreError::NotFound => {
+                CarryFailure::Unusable(format!("leaf {} GET: {e}", leaf.key))
+            }
+            e => CarryFailure::Store(e),
+        })?;
     // The envelope version comes before the frame checks (ADR-4233 H1, finding
     // 4/5): a leaf a newer build wrote is refused here, before this part's
     // leaves are PUT, even when its frames would not verify under this build's
@@ -2846,8 +2835,9 @@ async fn fetch_carried_leaf(
 /// field not in `fields` under its key type, a field of `fields` with no
 /// leaf, refs that do not tile the key8 space or disagree on key type,
 /// `uncovered_count` or part hash, or name another part, or a lowest slice
-/// whose GET fails or that does not verify ([`fetch_carried_leaf`]).
-/// [`CarryFailure::Newer`] when that slice is a leaf a newer build wrote.
+/// whose GET finds no object or that does not verify ([`fetch_carried_leaf`]).
+/// [`CarryFailure::Newer`] when that slice is a leaf a newer build wrote, and
+/// [`CarryFailure::Store`] when its GET fails with anything but `NotFound`.
 #[allow(clippy::too_many_arguments)]
 async fn load_carry_source(
     store: &dyn ObjectStoreBackend,
@@ -3143,9 +3133,11 @@ fn release_carried_slices(
 /// the lowest slice's), then kept until a pass starts past it. A rebuilt
 /// field starts again from key8 0, so a slice dropped in its earlier attempt
 /// is fetched again, while one still kept from that attempt stays held until
-/// a pass starts past it. `Err` when a slice's GET fails, it does not
-/// verify, or a kept slice no longer decodes; [`CarryFailure::Newer`] when a
-/// fetched slice is a leaf a newer build wrote.
+/// a pass starts past it. `Err` when a slice's GET finds no object, it does
+/// not verify, or a kept slice no longer decodes; [`CarryFailure::Newer`]
+/// when a fetched slice is a leaf a newer build wrote, and
+/// [`CarryFailure::Store`] when a slice's GET fails with anything but
+/// `NotFound`.
 #[allow(clippy::too_many_arguments)]
 async fn feed_carried_key_index(
     store: &dyn ObjectStoreBackend,
@@ -3402,10 +3394,12 @@ pub(crate) struct BuiltPartKeyIndex {
 /// source whose refs or lowest slices do not check out is not carried and
 /// its entries are read.
 /// A data object mapped from two sources drops the whole carry, and so
-/// does a later slice that cannot be read or verified (the build restarts
-/// with no carry) or a section naming a field the tenant does not declare,
-/// since a carried entry might name it too. A carried slice a newer build
-/// wrote fails the build with [`SnapshotFormatError::NewerPart`] instead.
+/// does a later slice that is not found or does not verify (the build
+/// restarts with no carry) or a section naming a field the tenant does not
+/// declare, since a carried entry might name it too. A carried slice a newer
+/// build wrote fails the build with [`SnapshotFormatError::NewerPart`]
+/// instead, and a slice GET that fails with anything but `NotFound` fails it
+/// with [`CatalogError::Store`].
 ///
 /// Passes: every field the build indexes gets a fixed share of
 /// `limits.max_pairs`, `max(1, max_pairs / fields)`, for the whole build,
@@ -3538,8 +3532,11 @@ pub(crate) async fn build_part_key_index(
                     }
                     carried.sources.push(loaded);
                 }
-                Err(CarryFailure::Newer(err)) => return Err(CatalogError::SnapshotFormat(err)),
-                Err(reason) => {
+                Err(failure) => {
+                    let reason = match failure.into_fold_error() {
+                        Ok(err) => return Err(err),
+                        Err(reason) => reason,
+                    };
                     mark_held(source, &mut previously_covered);
                     tracing::warn!(
                         tenant = %tenant.to_hex(),
@@ -3630,10 +3627,10 @@ pub(crate) async fn build_part_key_index(
                         )
                         .await
                         {
-                            if let CarryFailure::Newer(err) = reason {
-                                return Err(CatalogError::SnapshotFormat(err));
+                            match reason.into_fold_error() {
+                                Ok(err) => return Err(err),
+                                Err(reason) => failure = Some(reason),
                             }
-                            failure = Some(reason);
                             break 'feed;
                         }
                     }
@@ -4485,7 +4482,10 @@ impl Catalog {
 
             // `_previous_charge` holds the previous parts' decode
             // reservations for the rest of this attempt, as long as `entries`
-            // holds what they charge for.
+            // holds what they charge for. `previous_parts_attempted` counts
+            // the previous parts the load tried to read; on a rebuild the
+            // parts after it are unread.
+            let mut previous_parts_attempted = 0usize;
             let (mut entries, buckets, rebuilt, previous_entries_len, _previous_charge) =
                 match &head_state {
                     HeadState::Valid { head, .. } => match self
@@ -4493,6 +4493,7 @@ impl Catalog {
                             tenant,
                             head,
                             &mut held_open_probe_cache,
+                            &mut previous_parts_attempted,
                             &mut counters,
                         )
                         .await
@@ -4527,6 +4528,12 @@ impl Catalog {
                         // from the commit layout would CAS a HEAD that drops
                         // what the newer format carries.
                         Err(err) if is_newer_part(&err) => return Err(err),
+                        // A GET that failed with anything but `NotFound`
+                        // left the part unread and its version unchecked; the
+                        // rebuild's HEAD would drop it (ADR-4233 H1).
+                        Err(CatalogError::Store(err)) if !matches!(err, StoreError::NotFound) => {
+                            return Err(CatalogError::Store(err));
+                        }
                         Err(err) => {
                             tracing::warn!(
                                 error = %err,
@@ -5131,12 +5138,13 @@ impl Catalog {
             if let HeadState::Valid { head, .. } = &head_state {
                 self.peek_dropped_objects_for_newer(
                     signal,
+                    tenant,
                     head,
                     &reused_old_part_hashes,
                     rebuilt,
+                    previous_parts_attempted,
                     rebuilt || reconciled,
                     typed_attr_columns.is_empty(),
-                    key_index_fields.as_deref(),
                     &dirty_hours,
                     &mut counters,
                 )
@@ -5206,13 +5214,8 @@ impl Catalog {
                         // `NotFound` is reachable: a sealed part can be
                         // deleted out from under a ref a previous fold wrote,
                         // which `rebuild_restores_a_deleted_sealed_part_instead_of_reusing_its_ref`
-                        // pins. It stays the quiet "nothing to reuse" case
-                        // rather than being promoted, because only
-                        // a non-NotFound failure (issue #1964, most commonly
-                        // AccessDenied on a missing idx/* read grant) is an
-                        // outage worth an operator's attention, since it
-                        // recurs on every fold and silently turns reuse into
-                        // a permanent full rebuild.
+                        // pins. There is no object left to drop, so it stays
+                        // the quiet "nothing to reuse" case.
                         Err(StoreError::NotFound) => {
                             tracing::warn!(
                                 key = %stats_ref.key,
@@ -5220,14 +5223,12 @@ impl Catalog {
                                 "previous per-part column-stats object not found; rebuilding every segment's statistics for parts that reuse it"
                             );
                         }
-                        Err(err) => {
-                            tracing::error!(
-                                error = %err,
-                                key = %stats_ref.key,
-                                tenant = %tenant.to_hex(),
-                                "previous per-part column-stats object GET failed; rebuilding every segment's statistics for parts that reuse it"
-                            );
-                        }
+                        // Any other failure (issue #1964, most commonly
+                        // AccessDenied on a missing idx/* read grant) leaves
+                        // an object this fold replaces unread and its version
+                        // unchecked (ADR-4233 H1), so the cycle fails before
+                        // this attempt PUTs anything.
+                        Err(err) => return Err(CatalogError::Store(err)),
                     }
                 }
                 baseline
@@ -6050,8 +6051,9 @@ impl Catalog {
     /// failure (GET error, hash mismatch, a part naming another tenant, decode
     /// error, refused decode reservation) is returned to the caller, which
     /// fails the fold on a foreign part, a part a newer build wrote
-    /// ([`SnapshotFormatError::NewerPart`]) or a refused reservation and falls
-    /// back to a full rebuild on anything else.
+    /// ([`SnapshotFormatError::NewerPart`]), a refused reservation or a GET
+    /// that fails with anything but `NotFound`, and falls back to a full
+    /// rebuild on anything else.
     ///
     /// Returns the entries together with every part's decode reservation; the
     /// caller holds the reservations for as long as it holds the entries.
@@ -6060,16 +6062,22 @@ impl Catalog {
     /// `held_open_has_unfolded` pre-check already read, keyed by part object
     /// key, so each part is read once per fold. Each one used here is moved
     /// out of it, reservation included. Empty on every other path.
+    ///
+    /// `parts_attempted` ends as the number of leading parts this load tried
+    /// to read, the failed one included, so on a failure the parts after it
+    /// are the ones it never read.
     async fn load_previous_entries(
         &self,
         tenant: &TenantHash,
         head: &SnapshotHead,
         probe_cache: &mut HashMap<String, ChargedEntries>,
+        parts_attempted: &mut usize,
         counters: &mut RequestCounters,
     ) -> Result<(Vec<SnapshotEntry>, Vec<Reservation>), CatalogError> {
         let mut entries = Vec::new();
         let mut reservations = Vec::with_capacity(head.parts.len());
         for part_ref in &head.parts {
+            *parts_attempted += 1;
             let (part_entries, reservation) = match probe_cache.remove(&part_ref.key) {
                 Some(cached) => cached,
                 None => self.load_part_entries(tenant, part_ref, counters).await?,
@@ -6100,7 +6108,18 @@ impl Catalog {
     ) -> Result<ChargedEntries, CatalogError> {
         let got = self.store().get(&part_ref.key, GetRange::Full).await?;
         counters.get_requests += 1;
-        let digest = blake3::hash(&got.data);
+        self.decode_part_bytes(tenant, part_ref, &got.data)
+    }
+
+    /// The checks and decode of [`Catalog::load_part_entries`] on bytes
+    /// already read.
+    fn decode_part_bytes(
+        &self,
+        tenant: &TenantHash,
+        part_ref: &SnapshotPartRef,
+        data: &[u8],
+    ) -> Result<ChargedEntries, CatalogError> {
+        let digest = blake3::hash(data);
         if digest.as_bytes().as_slice() != part_ref.blake3.as_slice() {
             return Err(CatalogError::FieldMismatch {
                 key: part_ref.key.clone(),
@@ -6110,7 +6129,7 @@ impl Catalog {
             });
         }
         let limits = PartLimits::default();
-        let header = snapshot_format::decode_part_header(&got.data)
+        let header = snapshot_format::decode_part_header(data)
             .map_err(|err| part_decode_error(&part_ref.key, err))?;
         // ADR-0050 §2, before the reservation below, exactly as
         // `snapshot_resolve` checks a part: the HEAD's blake3 binds the bytes
@@ -6130,41 +6149,39 @@ impl Catalog {
             header.entries_uncompressed_len,
             limits.max_snapshot_part_bytes,
         )?;
-        let decoded = snapshot_format::decode_part(&got.data, &limits)
+        let decoded = snapshot_format::decode_part(data, &limits)
             .map_err(|err| part_decode_error(&part_ref.key, err))?;
         Ok((decoded.entries, reservation))
     }
 
     /// Before this attempt's first PUT, refuse the fold if a previous HEAD
     /// object it drops or replaces was written by a newer build (ADR-4233 H1).
-    /// The refuse-on-decode checks on the read paths do not cover an object
-    /// the fold replaces without reading, and this peek fills exactly those
-    /// gaps, so it issues no GET the read paths already issue:
+    /// The read paths refuse what they decode; this peek covers every object
+    /// the fold drops or replaces that no read path is certain to have read
+    /// first:
     ///
     /// - the HEAD-level `.npost` when postings are rebuilt from scratch
     ///   (`rebuilt || reconciled`, where `previous_postings_baseline` reads
-    ///   nothing); the merge path reads and refuses it;
-    /// - a dropped part's `.cstat` when no statistics baseline reads it -- a
+    ///   nothing), by its envelope prefix, which holds its only version; the
+    ///   merge path reads and refuses it;
+    /// - a dropped part's `.cstat` when no statistics baseline reads it (a
     ///   rebuild, an untyped tenant (`typed_columns_empty`), or a part
-    ///   covering a dirty hour;
-    /// - a dropped part's `.kidx` leaves only when no carry runs
-    ///   (`carry_reads_part_leaves` false -- the leaf switch is off this fold,
-    ///   or the source fails its field/ref checks and the build reads the
-    ///   sections). When a carry runs, `fetch_carried_leaf` reads and
-    ///   version-checks every slice it carries from before this part writes a
-    ///   leaf (finding 4), so the peek adds no second GET of those leaves;
-    /// - a dropped `.csnap` on a `rebuilt` fold, which `load_previous_entries`
-    ///   stopped reading at the first part that failed (finding 2); on every
-    ///   other path it read and validated every previous part.
+    ///   covering a dirty hour), read whole and decoded, since a column's
+    ///   `declared_type` is in the body;
+    /// - every `.kidx` leaf of a dropped part, by its header prefix. Which
+    ///   slices a carry reads before the part's first leaf PUT is not known
+    ///   up front (a carry can stop at a failed field, a slice past a cut, or
+    ///   a source sharing no data object), so the peek does not depend on it;
+    /// - on a `rebuilt` fold, each dropped `.csnap` after the
+    ///   `previous_parts_attempted` that `load_previous_entries` tried, read
+    ///   whole and decoded, since an entry's level is in the body; on every
+    ///   other path the load read and validated every previous part.
     ///
-    /// Each gap object is range-GET for its version prefix and refused if it
-    /// carries a version above this build's read set. A store error on a peek
-    /// GET is NOT a newer object: the object the read path would also fail to
-    /// read keeps its graceful-degradation path
-    /// (`a_failed_previous_leaf_get_falls_back_to_section_reads`,
-    /// `unreadable_previous_part_falls_back_to_rebuild`), and an immutable
-    /// newer object transiently unreadable this tick is refused on the next.
-    /// One ranged GET per gap ref, under `newer_part_peek_gets`.
+    /// An object whose GET is `NotFound` is not peeked further: it is gone,
+    /// and nothing newer can be dropped. Any other store error fails the
+    /// cycle with [`CatalogError::Store`], since the object stays unchecked
+    /// and the HEAD this attempt would publish drops it. Every GET issued
+    /// counts under `newer_part_peek_gets`.
     ///
     /// `reused_old_part_hashes` are the previous parts this fold carries
     /// forward by reference (same key, same blake3): their objects are not
@@ -6173,130 +6190,147 @@ impl Catalog {
     async fn peek_dropped_objects_for_newer(
         &self,
         signal: Signal,
+        tenant: &TenantHash,
         head: &SnapshotHead,
         reused_old_part_hashes: &HashSet<[u8; 32]>,
         rebuilt: bool,
+        previous_parts_attempted: usize,
         postings_from_scratch: bool,
         typed_columns_empty: bool,
-        key_index_declared: Option<&[(String, KeyType)]>,
         dirty_hours: &HashSet<u32>,
         counters: &mut RequestCounters,
     ) -> Result<(), CatalogError> {
         if postings_from_scratch && let Some(postings) = &head.postings {
-            self.peek_envelope_not_newer(
-                &postings.key,
-                CatalogPartKind::Postings,
-                postings.size,
-                counters,
-            )
-            .await?;
+            self.peek_postings_not_newer(&postings.key, postings.size, counters)
+                .await?;
         }
-        for part in &head.parts {
+        for (index, part) in head.parts.iter().enumerate() {
             let carried = <[u8; 32]>::try_from(part.blake3.as_slice())
                 .is_ok_and(|hash| reused_old_part_hashes.contains(&hash));
             if carried {
                 continue;
             }
-            if rebuilt {
-                self.peek_envelope_not_newer(
-                    &part.key,
-                    CatalogPartKind::Snapshot,
-                    part.size,
-                    counters,
-                )
-                .await?;
+            if rebuilt && index >= previous_parts_attempted {
+                self.peek_part_not_newer(tenant, part, counters).await?;
             }
             if let Some(stats) = &part.column_stats
                 && (rebuilt || typed_columns_empty || part_covers_dirty_hour(part, dirty_hours))
             {
-                self.peek_envelope_not_newer(
-                    &stats.key,
-                    CatalogPartKind::ColumnStats,
-                    stats.size,
-                    counters,
-                )
-                .await?;
+                self.peek_column_stats_not_newer(&stats.key, counters)
+                    .await?;
             }
-            // When a carry runs it reads and version-checks every slice it
-            // carries from (`fetch_carried_leaf`, before any PUT of this
-            // part), so the peek covers a part's leaves only when no carry
-            // will: the leaf switch is off this fold, or the source fails its
-            // field/ref checks and the build reads the sections instead.
-            let carry_reads =
-                key_index_declared.is_some_and(|declared| carry_reads_part_leaves(part, declared));
-            if !carry_reads {
-                for leaf in &part.key_index {
-                    self.peek_leaf_not_newer(signal, leaf, counters).await?;
-                }
+            for leaf in &part.key_index {
+                self.peek_leaf_not_newer(signal, leaf, counters).await?;
             }
         }
         Ok(())
     }
 
-    /// Range-GET the front of a previous `.csnap`, `.npost` or `.cstat` object
-    /// and refuse the fold with [`SnapshotFormatError::NewerPart`] if its
-    /// envelope version is above this build's read set. Each envelope decoder
-    /// checks the version byte (offset 4) before any body or length field, so
-    /// the prefix carries the version even when it truncates the protobuf
-    /// header of a current-version object; that truncation is a non-version
-    /// error, which [`SnapshotFormatError::newer_part_version`] reads as
-    /// not-newer. A store error leaves the object to the read path's own
-    /// graceful-degradation handling (the GET is still counted, since the
-    /// request was issued).
-    async fn peek_envelope_not_newer(
+    /// One counted peek GET. `Ok(None)` when the object is not found.
+    async fn peek_get(
         &self,
         key: &str,
-        kind: CatalogPartKind,
+        range: GetRange,
+        counters: &mut RequestCounters,
+    ) -> Result<Option<Bytes>, CatalogError> {
+        counters.get_requests += 1;
+        counters.newer_part_peek_gets += 1;
+        match self.store().get(key, range).await {
+            Ok(got) => Ok(Some(got.data)),
+            Err(StoreError::NotFound) => Ok(None),
+            Err(err) => Err(CatalogError::Store(err)),
+        }
+    }
+
+    /// Range-GET the front of the previous `.npost` and refuse the fold with
+    /// [`SnapshotFormatError::NewerPart`] if its envelope version is above
+    /// this build's read set. The envelope decoder checks the version byte
+    /// (offset 4) before any body or length field, so the prefix carries the
+    /// version even when it truncates the protobuf header of a
+    /// current-version object; that truncation is a non-version error, which
+    /// [`SnapshotFormatError::newer_part_version`] reads as not-newer.
+    async fn peek_postings_not_newer(
+        &self,
+        key: &str,
         size: u64,
         counters: &mut RequestCounters,
     ) -> Result<(), CatalogError> {
         let prefix = size.min(NEWER_PART_PEEK_PREFIX_LEN);
-        counters.get_requests += 1;
-        counters.newer_part_peek_gets += 1;
-        let Ok(got) = self.store().get(key, GetRange::Range(0, prefix)).await else {
+        let Some(data) = self
+            .peek_get(key, GetRange::Range(0, prefix), counters)
+            .await?
+        else {
             return Ok(());
         };
-        let classified = match kind {
-            CatalogPartKind::Snapshot => snapshot_format::decode_part_header(&got.data).err(),
-            CatalogPartKind::Postings => snapshot_format::decode_postings_header(&got.data).err(),
-            CatalogPartKind::ColumnStats => {
-                snapshot_format::decode_column_stats_header(&got.data).err()
-            }
-            // `.kidx` has its own envelope and classifier; it never reaches
-            // this method (see `peek_leaf_not_newer`).
-            CatalogPartKind::KeyIndexLeaf => None,
-        };
-        if let Some(newer) = classified.and_then(|err| err.newer_part_version()) {
+        if let Some(newer) = snapshot_format::decode_postings_header(&data)
+            .err()
+            .and_then(|err| err.newer_part_version())
+        {
             return Err(CatalogError::SnapshotFormat(newer.refusal(key)));
         }
         Ok(())
     }
 
+    /// GET a previous `.cstat` whole and refuse the fold if the decode finds
+    /// a version above this build's read set, in the envelope or in a
+    /// column's `declared_type`. Any other decode failure is not a newer
+    /// object.
+    async fn peek_column_stats_not_newer(
+        &self,
+        key: &str,
+        counters: &mut RequestCounters,
+    ) -> Result<(), CatalogError> {
+        let Some(data) = self.peek_get(key, GetRange::Full, counters).await? else {
+            return Ok(());
+        };
+        match snapshot_format::decode_column_stats(
+            &data,
+            &snapshot_format::ColumnStatsLimits::default(),
+        ) {
+            Err(err) if err.newer_part_version().is_some() => Err(part_decode_error(key, err)),
+            _ => Ok(()),
+        }
+    }
+
+    /// GET a previous `.csnap` whole and run the same checks and decode as
+    /// [`Catalog::load_part_entries`], refusing the fold on what that load
+    /// refuses: a version above this build's read set (the envelope or an
+    /// entry's level), a part naming another tenant, or a refused decode
+    /// reservation. A hash mismatch or other decode failure is not a newer
+    /// object.
+    async fn peek_part_not_newer(
+        &self,
+        tenant: &TenantHash,
+        part: &SnapshotPartRef,
+        counters: &mut RequestCounters,
+    ) -> Result<(), CatalogError> {
+        let Some(data) = self.peek_get(&part.key, GetRange::Full, counters).await? else {
+            return Ok(());
+        };
+        match self.decode_part_bytes(tenant, part, &data) {
+            Ok(_) => Ok(()),
+            Err(err @ CatalogError::MemoryExhausted(_)) => Err(err),
+            Err(err) if is_foreign_part(&err) || is_newer_part(&err) => Err(err),
+            Err(_) => Ok(()),
+        }
+    }
+
     /// Range-GET a previous leaf's header prefix (`[0, prefix_len)` from its
     /// ref) and refuse the fold if its `format_version` is above the signal's
-    /// read set ([`key_index_leaf_version_is_newer`]). A ref whose `prefix_len`
-    /// is malformed, and a store error on the GET, are not newer objects and
-    /// leave the leaf to the carry or rebuild path (the GET, when issued, is
-    /// still counted).
+    /// read set ([`key_index_leaf_version_is_newer`]). A ref whose
+    /// `prefix_len` is malformed gives no range, so the leaf is read whole.
     async fn peek_leaf_not_newer(
         &self,
         signal: Signal,
         leaf: &SnapshotKeyIndexLeafRef,
         counters: &mut RequestCounters,
     ) -> Result<(), CatalogError> {
-        let Ok(range) = key_index_leaf_prefix_range(leaf) else {
+        let range = key_index_leaf_prefix_range(leaf)
+            .map_or(GetRange::Full, |range| GetRange::Range(range.start, range.end));
+        let Some(data) = self.peek_get(&leaf.key, range, counters).await? else {
             return Ok(());
         };
-        counters.get_requests += 1;
-        counters.newer_part_peek_gets += 1;
-        let Ok(got) = self
-            .store()
-            .get(&leaf.key, GetRange::Range(range.start, range.end))
-            .await
-        else {
-            return Ok(());
-        };
-        if let Ok(version) = key_index_leaf_format_version(&got.data)
+        if let Ok(version) = key_index_leaf_format_version(&data)
             && key_index_leaf_version_is_newer(signal, version)
         {
             return Err(CatalogError::SnapshotFormat(newer_leaf_refusal(
@@ -6313,7 +6347,8 @@ impl Catalog {
     /// listings name no commit record. A part that cannot be read answers
     /// true, so the caller takes the full fold path, whose own load of the
     /// same part fails and rebuilds, or fails the fold when the failure is a
-    /// refused decode reservation. A part naming another tenant, or one a
+    /// refused decode reservation or a GET error other than `NotFound`. A part
+    /// naming another tenant, or one a
     /// newer build wrote, is returned as the error instead, failing the fold
     /// here, so a breach is counted once rather than again by the main load.
     ///
@@ -6374,16 +6409,17 @@ impl Catalog {
     /// `load_snapshot_postings` applies at query time, plus an
     /// `entry_count` check against `previous_entry_count` -- the ordinal
     /// boundary this fold's merge carries forward, not the post-fold total.
-    /// Most failures (no postings ref, cache miss, a `NotFound` GET, hash
-    /// mismatch, decode error, entry_count mismatch) return `Ok(None)`, so the
-    /// caller decodes every current entry from scratch instead of merging.
-    /// A GET failure other than `NotFound` (issue #1964, most commonly
-    /// AccessDenied on a missing idx/* read grant) also returns `Ok(None)` --
-    /// merging is an optimization, never a correctness gate -- but is logged
-    /// at `error!`, not `warn!`, since it recurs on every fold and silently
-    /// turns postings reuse into a permanent full rebuild.
+    /// Most failures (no postings ref, a cached entry_count mismatch, a
+    /// `NotFound` GET, hash mismatch, decode error, entry_count mismatch)
+    /// return `Ok(None)`, so the caller decodes every current entry from
+    /// scratch instead of merging.
     ///
-    /// Two failures are errors instead, both for the same reason the resolve
+    /// A GET failure other than `NotFound` (most commonly AccessDenied on a
+    /// missing idx/* read grant, issue #1964) is [`CatalogError::Store`]: the
+    /// object was not read, so its version is unchecked, and the HEAD a
+    /// rebuild publishes drops it (ADR-4233 H1).
+    ///
+    /// Two more failures are errors, both for the same reason the resolve
     /// path treats them as errors (ADR-0050 §2, ADR-1702 decision 6 and the
     /// decode-refusal amendment): a postings object whose header names another
     /// tenant is an isolation breach, which a silent rebuild would leave
@@ -6431,12 +6467,8 @@ impl Catalog {
         let got = match self.store().get(&postings_ref.key, GetRange::Full).await {
             Ok(got) => got,
             // `NotFound` is reachable here too: a sealed part can be deleted
-            // out from under a ref a previous fold wrote. It stays quiet for
-            // the same reason as the `.cstat` read above; only a non-NotFound
-            // failure (issue #1964, most commonly AccessDenied on a missing
-            // idx/* read grant) is an outage worth an operator's attention,
-            // since it recurs on every fold and silently turns reuse into a
-            // permanent full rebuild.
+            // out from under a ref a previous fold wrote, and there is no
+            // object left to drop.
             Err(StoreError::NotFound) => {
                 tracing::warn!(
                     key = %postings_ref.key,
@@ -6445,15 +6477,10 @@ impl Catalog {
                 );
                 return Ok(None);
             }
-            Err(err) => {
-                tracing::error!(
-                    error = %err,
-                    key = %postings_ref.key,
-                    tenant = %tenant.to_hex(),
-                    "previous postings GET failed, rebuilding postings from scratch"
-                );
-                return Ok(None);
-            }
+            // Any other failure leaves the object unread, and rebuilding would
+            // publish a HEAD that drops it without its version checked
+            // (ADR-4233 H1). Read before this attempt PUTs anything.
+            Err(err) => return Err(CatalogError::Store(err)),
         };
         counters.get_requests += 1;
         let digest = blake3::hash(&got.data);
