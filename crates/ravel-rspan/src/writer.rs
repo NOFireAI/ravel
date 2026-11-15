@@ -20,7 +20,8 @@ use ravel_codec::tokenizer::tokens;
 use crate::block::{BlockWriteOut, ColumnPlan, write_block};
 use crate::error::SpanSegError;
 use crate::footer::{
-    COMP_NONE, COMP_ZSTD, SectionDesc, SpanFooter, kind, write_footer_and_trailer,
+    COMP_NONE, COMP_ZSTD, SectionDesc, SpanFooter, WriteVersion, kind,
+    write_footer_and_trailer_versioned,
 };
 use crate::key_index::{KEY_IDX_BUCKET_MAX_ENTRIES, encode_trace_key_idx_capped};
 use crate::record::{
@@ -81,6 +82,9 @@ pub struct RspanWriter {
     /// [`SpanSegError::KeyIdxBucketOverflow`]: the codec's
     /// [`KEY_IDX_BUCKET_MAX_ENTRIES`], lowered only by tests.
     key_idx_bucket_cap: u32,
+    /// The trailer version ([`RspanWriter::with_write_version`]);
+    /// [`WriteVersion::CURRENT`] by default.
+    write_version: WriteVersion,
 }
 
 impl RspanWriter {
@@ -90,7 +94,16 @@ impl RspanWriter {
             identity,
             records: Vec::new(),
             key_idx_bucket_cap: KEY_IDX_BUCKET_MAX_ENTRIES,
+            write_version: WriteVersion::CURRENT,
         }
+    }
+
+    /// Emits `version` in the trailer instead of [`WriteVersion::CURRENT`]
+    /// (ADR-4233 decision 2). Every other byte of the object is the same for
+    /// every version the window holds.
+    pub fn with_write_version(mut self, version: WriteVersion) -> Self {
+        self.write_version = version;
+        self
     }
 
     /// Buffers one span record.
@@ -274,7 +287,7 @@ impl RspanWriter {
             part_index,
             unknown_section_kinds: Vec::new(),
         };
-        write_footer_and_trailer(&mut object, &footer);
+        write_footer_and_trailer_versioned(&mut object, &footer, self.write_version);
         Ok(object)
     }
 }
@@ -479,6 +492,9 @@ fn push_section(object: &mut Vec<u8>, sections: &mut Vec<SectionDesc>, kind: u32
 mod tests {
     use super::*;
     use crate::footer::open;
+    #[cfg(feature = "format-drill")]
+    use crate::reader::SpanQuery;
+    use crate::reader::RspanReader;
     use crate::record::StatusCode;
 
     fn identity() -> ObjectIdentity {
@@ -608,7 +624,6 @@ mod tests {
     #[test]
     fn a_writer_refuses_an_object_whose_key_idx_bucket_passes_the_cap() {
         use crate::key_index::{TRACE_ID_FIELD, trace_id_in_bucket};
-        use crate::reader::RspanReader;
 
         let traces = |n: u64| -> Vec<SpanRecord> {
             (0..n)
@@ -679,5 +694,244 @@ mod tests {
         let w = RspanWriter::new(RspanConfig::default(), identity());
         assert_eq!(w.key_idx_bucket_cap, KEY_IDX_BUCKET_MAX_ENTRIES);
         assert_eq!(KEY_IDX_BUCKET_MAX_ENTRIES, 1 << 20);
+    }
+
+    // ---- caller-chosen write version (ADR-4233 decisions 2 and 9, #4242) ----
+
+    fn window_records(n: i64) -> Vec<SpanRecord> {
+        (0..n)
+            .map(|i| {
+                let trace = (i % 5) as u8;
+                let mut r = span(trace, i as u8, 1_000 + i, 1_000 + i + (i % 11));
+                r.status_code = if i % 4 == 0 {
+                    StatusCode::Error
+                } else {
+                    StatusCode::Ok
+                };
+                r.attrs = vec![
+                    ("service.name".into(), format!("svc{}", i % 3)),
+                    ("http.route".into(), format!("/r{}", i % 7)),
+                ];
+                r
+            })
+            .collect()
+    }
+
+    /// `records` written at `version` through both emitting paths: `finish`
+    /// and `finish_compacted`.
+    fn write_every_path(records: &[SpanRecord], version: WriteVersion) -> [Vec<u8>; 2] {
+        let cfg = RspanConfig {
+            block_target_records: 64,
+            ..RspanConfig::default()
+        };
+        let writer = || {
+            let mut w = RspanWriter::new(cfg, identity()).with_write_version(version);
+            for r in records {
+                w.push(r.clone());
+            }
+            w
+        };
+        [
+            writer().finish().expect("finish"),
+            writer()
+                .finish_compacted(1, vec![0xAB; 4], 2)
+                .expect("finish compacted"),
+        ]
+    }
+
+    fn trailer_version(obj: &[u8]) -> u16 {
+        let n = obj.len();
+        u16::from_le_bytes([obj[n - 8], obj[n - 7]])
+    }
+
+    /// `obj` with its trailer version replaced by `version` and the footer crc
+    /// recomputed over it, so the result fails only the version gate.
+    fn restamped(obj: &[u8], version: u16) -> Vec<u8> {
+        let n = obj.len();
+        let mut out = obj.to_vec();
+        let footer_len = u32::from_le_bytes([obj[n - 16], obj[n - 15], obj[n - 14], obj[n - 13]]);
+        let footer = &obj[n - 16 - footer_len as usize..n - 16];
+        let crc = crate::footer::footer_crc(
+            footer,
+            footer_len,
+            version,
+            crate::footer::SIGNAL_SPANS,
+            crate::footer::RESERVED,
+        );
+        out[n - 12..n - 8].copy_from_slice(&crc.to_le_bytes());
+        out[n - 8..n - 6].copy_from_slice(&version.to_le_bytes());
+        out
+    }
+
+    /// Both builds: `WriteVersion` holds only window versions, the writer
+    /// emits [`WriteVersion::CURRENT`] (version 5) unless told otherwise, and
+    /// `with_write_version(CURRENT)` is the default writer byte for byte.
+    #[test]
+    fn write_version_refuses_versions_outside_the_window() {
+        use crate::footer::{SUPPORTED_VERSIONS, VERSION};
+        for outside in [
+            0,
+            VERSION - 2,
+            VERSION - 1,
+            SUPPORTED_VERSIONS.newest() + 1,
+            u16::MAX,
+        ] {
+            match WriteVersion::new(outside) {
+                Err(SpanSegError::UnsupportedVersion(v)) => assert_eq!(v, outside),
+                other => panic!("WriteVersion::new({outside}) = {other:?}"),
+            }
+        }
+        assert_eq!(
+            WriteVersion::new(VERSION).expect("v5 in window"),
+            WriteVersion::CURRENT
+        );
+        assert_eq!(WriteVersion::CURRENT.number(), VERSION);
+
+        let records = window_records(40);
+        let cfg = RspanConfig {
+            block_target_records: 64,
+            ..RspanConfig::default()
+        };
+        let mut default = RspanWriter::new(cfg, identity());
+        for r in &records {
+            default.push(r.clone());
+        }
+        let default = default.finish().expect("finish");
+        assert_eq!(trailer_version(&default), VERSION);
+        assert_eq!(
+            default,
+            write_every_path(&records, WriteVersion::CURRENT)[0]
+        );
+    }
+
+    /// Default build: the window is version 5 alone, `WriteVersion` of the
+    /// drill version (6) fails typed, and an object that is version 5's bytes
+    /// under trailer version 6, exactly what the drill writer emits, is
+    /// refused by the reader.
+    #[cfg(not(feature = "format-drill"))]
+    #[test]
+    fn default_build_window_is_one_version_and_refuses_the_drill_version() {
+        use crate::footer::{SUPPORTED_VERSIONS, VERSION};
+        assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION);
+        assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION);
+        assert!(matches!(
+            WriteVersion::new(VERSION + 1),
+            Err(SpanSegError::UnsupportedVersion(6))
+        ));
+        let cfg = RspanConfig::default();
+        for obj in write_every_path(&window_records(40), WriteVersion::CURRENT) {
+            open(&obj).expect("v5 opens");
+            RspanReader::new(&obj, &cfg).expect("v5 reader");
+            let drill = restamped(&obj, VERSION + 1);
+            match open(&drill) {
+                Err(SpanSegError::UnsupportedVersion(v)) => assert_eq!(v, VERSION + 1),
+                other => panic!("default build admitted version 6: {other:?}"),
+            }
+            assert!(matches!(
+                RspanReader::new(&drill, &cfg),
+                Err(SpanSegError::UnsupportedVersion(6))
+            ));
+        }
+    }
+
+    /// `drill` is `current` with only the trailer version raised to the drill
+    /// version and the footer crc recomputed over it; both open, report their
+    /// own version, and decode to the same footer and the same records.
+    #[cfg(feature = "format-drill")]
+    fn assert_window_pair(current: &[u8], drill: &[u8]) {
+        use crate::footer::{VERSION, VERSION_DRILL};
+        assert_eq!(current.len(), drill.len(), "object lengths differ");
+        let n = current.len();
+        assert!(
+            current[..n - 12] == drill[..n - 12],
+            "bytes before the trailer crc differ"
+        );
+        assert_eq!(
+            current[n - 6..],
+            drill[n - 6..],
+            "signal, reserved or magic differ"
+        );
+        assert_eq!(trailer_version(current), VERSION);
+        assert_eq!(trailer_version(drill), VERSION_DRILL);
+        assert_eq!(
+            drill,
+            restamped(current, VERSION_DRILL).as_slice(),
+            "drill crc is not the footer crc over the drill version"
+        );
+
+        assert_eq!(
+            open(current).expect("v5 opens"),
+            open(drill).expect("v6 opens")
+        );
+        let cfg = RspanConfig::default();
+        let scan = |obj: &[u8]| {
+            RspanReader::new(obj, &cfg)
+                .expect("reader")
+                .scan(&SpanQuery::ts_range(i64::MIN, i64::MAX))
+                .expect("scan")
+                .0
+        };
+        let current_records = scan(current);
+        assert!(!current_records.is_empty());
+        assert_eq!(current_records, scan(drill));
+    }
+
+    #[cfg(feature = "format-drill")]
+    #[test]
+    fn writer_emits_each_window_version_and_reader_admits_both_under_format_drill() {
+        use crate::footer::{SUPPORTED_VERSIONS, VERSION, VERSION_DRILL};
+        assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION_DRILL);
+        assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION);
+        let drill = WriteVersion::new(VERSION_DRILL).expect("drill version is in the window");
+        assert_eq!(drill.number(), 6);
+
+        let records = window_records(300);
+        let current = write_every_path(&records, WriteVersion::CURRENT);
+        let drilled = write_every_path(&records, drill);
+        for (current, drilled) in current.iter().zip(&drilled) {
+            assert_window_pair(current, drilled);
+        }
+    }
+
+    #[cfg(feature = "format-drill")]
+    mod window_versions_proptest {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_record() -> impl Strategy<Value = SpanRecord> {
+            (
+                0u8..4,
+                any::<u8>(),
+                -1_000_000_000_000i64..1_000_000_000_000,
+                0i64..1_000_000,
+                0u8..3,
+                proptest::collection::vec(("[a-c]", "[a-z]{0,6}"), 0..3),
+            )
+                .prop_map(|(trace, span_id, start, dur, status, attrs)| {
+                    let mut r = span(trace, span_id, start, start + dur);
+                    r.status_code = StatusCode::from_u8(status).expect("status in range");
+                    r.attrs = attrs;
+                    r
+                })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(48))]
+
+            /// Random span batches written at version 5 and at the drill
+            /// version: both open and decode to the same records, and the
+            /// bytes differ only in trailer version and crc.
+            #[test]
+            fn random_batches_round_trip_at_both_window_versions(
+                records in proptest::collection::vec(arb_record(), 1..40),
+            ) {
+                let drill = WriteVersion::new(crate::footer::VERSION_DRILL).expect("in window");
+                let current = write_every_path(&records, WriteVersion::CURRENT);
+                let drilled = write_every_path(&records, drill);
+                for (current, drilled) in current.iter().zip(&drilled) {
+                    assert_window_pair(current, drilled);
+                }
+            }
+        }
     }
 }

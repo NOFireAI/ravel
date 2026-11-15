@@ -6,6 +6,14 @@ license.workspace = true
 rust-version.workspace = true
 description = "RSPAN v1: Ravel's columnar span segment format (ADR-0041)."
 
+[features]
+# Test-only (ADR-4233 decision 9, issue #4242): adds the drill version, v5's
+# bytes under trailer version 6, widens the reader window to {6, 5} and lets
+# `WriteVersion::new(6)` succeed, so compatibility tests run against two real
+# versions. Off by default and never in a default feature set;
+# scripts/guards/check-release-profile.sh refuses it in every release-built path.
+format-drill = []
+
 [dependencies]
 thiserror = { workspace = true }
 zstd = { workspace = true }
