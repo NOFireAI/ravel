@@ -1731,6 +1731,17 @@ fn bodied_rows_fixture(
     first_body: &str,
     later_body: &str,
 ) -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
+    let bodies: Vec<&str> = (0..batches)
+        .map(|g| if g == 0 { first_body } else { later_body })
+        .collect();
+    bodies_fixture(batch_rows, &bodies)
+}
+
+/// [`uniform_rows_fixture`] with row group `g`'s body `bodies[g]`.
+fn bodies_fixture(
+    batch_rows: usize,
+    bodies: &[&str],
+) -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
     use parquet::arrow::ArrowWriter;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1742,14 +1753,11 @@ fn bodied_rows_fixture(
             ("msg", str_col(vec![body; batch_rows])),
         ])
     };
-    let first = group(first_body);
-    let later = group(later_body);
+    let groups: Vec<RecordBatch> = bodies.iter().map(|body| group(body)).collect();
     let file = std::fs::File::create(&pq).expect("create parquet");
-    let mut writer = ArrowWriter::try_new(file, first.schema(), None).expect("arrow writer");
-    for g in 0..batches {
-        writer
-            .write(if g == 0 { &first } else { &later })
-            .expect("write row group");
+    let mut writer = ArrowWriter::try_new(file, groups[0].schema(), None).expect("arrow writer");
+    for g in &groups {
+        writer.write(g).expect("write row group");
         writer.flush().expect("flush row group");
     }
     writer.close().expect("close writer");
