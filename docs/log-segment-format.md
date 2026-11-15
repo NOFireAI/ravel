@@ -758,8 +758,8 @@ writer configuration (no hash-map iteration order reaches the bytes), and
 the row-major and columnar write paths produce the same bytes. Which writers
 use which: the server's logs ingest flush writes `Estimated` (the ingest
 setting `rlog_page_choice`, whose default is `Estimated`); `ravel-cli load`
-writes through the same flush but sets `Exhaustive`; compaction and the
-erasure rewrite write `Estimated`. Readers are
+writes through the same flush, `Estimated` unless `--page-choice exhaustive`;
+compaction and the erasure rewrite write `Estimated`. Readers are
 unaffected: an object decodes the same way whichever choice wrote it.
 
 **Parallel page encode (ADR-3492 decision 7).** `RlogWriter::finish_on`

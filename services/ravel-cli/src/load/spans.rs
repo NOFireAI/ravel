@@ -80,6 +80,7 @@ impl SpansLoadReport {
             synthetic_ingest_hours: self.synthetic_ingest_hours.clone(),
             decode_wait_ms: None,
             write_wait_ms: None,
+            page_choice: None,
         }
     }
 }

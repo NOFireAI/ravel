@@ -80,6 +80,7 @@ impl MetricsLoadReport {
             synthetic_ingest_hours: None,
             decode_wait_ms: None,
             write_wait_ms: None,
+            page_choice: None,
         }
     }
 }

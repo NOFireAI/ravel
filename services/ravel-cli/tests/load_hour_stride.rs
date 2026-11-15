@@ -245,6 +245,7 @@ async fn load_signal(
         RlogZstdLevel::DEFAULT,
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
+        ravel_cli::load::LoadPageChoice::default(),
         LoadMemoryRequest::Flag(256 << 20),
         false,
         &ravel_cli::ipcrypt::IpcryptPolicy::empty(),

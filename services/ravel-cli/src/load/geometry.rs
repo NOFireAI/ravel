@@ -657,6 +657,11 @@ pub struct LoadLayoutReport {
     /// from a metrics or spans load, which does not measure it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_wait_ms: Option<u64>,
+    /// The page choice a logs load sealed its RLOG pages with
+    /// (`--page-choice`, issue #4212); absent from a metrics or spans load,
+    /// which writes no RLOG object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_choice: Option<LoadPageChoice>,
 }
 
 /// The prefix of the summary line carrying [`LoadLayoutReport`] as JSON.
@@ -826,6 +831,9 @@ pub fn render_layout_summary(report: &LoadLayoutReport) -> String {
     if let Some(warning) = &report.target_bytes_no_effect_warning {
         let _ = writeln!(out, "  target warning   : {warning}");
     }
+    if let Some(choice) = report.page_choice {
+        let _ = writeln!(out, "  page choice      : {}", choice.name());
+    }
     match serde_json::to_string(report) {
         Ok(json) => {
             let _ = writeln!(out, "{LOAD_REPORT_JSON_PREFIX}{json}");
@@ -841,6 +849,33 @@ pub fn render_layout_summary(report: &LoadLayoutReport) -> String {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Issue #4212: a logs load's summary names its page choice on one line
+    /// and in one report JSON field; a metrics or spans load, which writes no
+    /// RLOG object, prints neither.
+    #[test]
+    fn only_a_logs_summary_names_the_page_choice() {
+        let logs = LoadReport {
+            page_choice: LoadPageChoice::Exhaustive,
+            ..LoadReport::default()
+        };
+        let text = render_layout_summary(&logs.layout_report());
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.contains("page choice"))
+                .collect::<Vec<_>>(),
+            vec!["  page choice      : exhaustive"],
+            "{text}"
+        );
+        assert_eq!(text.matches("\"page_choice\":\"exhaustive\"").count(), 1);
+        for text in [
+            render_layout_summary(&MetricsLoadReport::default().layout_report()),
+            render_layout_summary(&SpansLoadReport::default().layout_report()),
+        ] {
+            assert!(!text.contains("page choice"), "{text}");
+            assert!(!text.contains("page_choice"), "{text}");
+        }
+    }
 
     #[test]
     fn derived_target_is_default_object_rows_of_the_first_batch() {

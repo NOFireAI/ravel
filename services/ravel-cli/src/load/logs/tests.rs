@@ -1845,6 +1845,7 @@ async fn load_with_default_geometry_on(
         RlogZstdLevel::default(),
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
+        LoadPageChoice::default(),
         Some(LoadMemoryOptions::new(load_memory)),
         false,
         Arc::new(TenantRules::none()),
@@ -2106,6 +2107,7 @@ async fn an_explicit_target_runs_the_depth_flush() {
         RlogZstdLevel::default(),
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
+        LoadPageChoice::default(),
         Some(LoadMemoryOptions::new(LoadMemoryRequest::Derived {
             host_total_bytes: Some(GEOMETRY_HOST_BYTES),
         })),
@@ -2208,6 +2210,7 @@ async fn load_with_a_held_age_flush(
             RlogZstdLevel::default(),
             RlogGroupTargetBlocks::DEFAULT,
             RlogChunkOrder::DEFAULT,
+            LoadPageChoice::default(),
             Some(memory),
             false,
             Arc::new(TenantRules::none()),
@@ -2310,6 +2313,7 @@ async fn a_zero_ack_margin_is_refused_by_the_logs_loader() {
         RlogZstdLevel::default(),
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
+        LoadPageChoice::default(),
         Some(memory),
         false,
         Arc::new(TenantRules::none()),
@@ -2359,6 +2363,7 @@ async fn a_zero_decode_workers_is_refused_by_the_logs_loader() {
         RlogZstdLevel::default(),
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
+        LoadPageChoice::default(),
         Some(memory),
         false,
         Arc::new(TenantRules::none()),
@@ -2547,6 +2552,7 @@ async fn an_explicit_target_closes_a_sparse_shard_at_the_window() {
             RlogZstdLevel::default(),
             RlogGroupTargetBlocks::DEFAULT,
             RlogChunkOrder::DEFAULT,
+            LoadPageChoice::default(),
             None,
             false,
             Arc::new(TenantRules::none()),
@@ -3530,6 +3536,7 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
         RlogZstdLevel::DEFAULT,
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
+        LoadPageChoice::default(),
         UNREACHED_REFLUSH_PERIOD,
         None,
         false,
@@ -5228,24 +5235,162 @@ fn shell_word_quotes_what_a_shell_would_rewrite() {
     assert_eq!(shell_word(""), "''");
 }
 
-/// ADR-3492 decision 1: the loader's router config keeps the exhaustive page
-/// choice, which the shard flush hands its RLOG writer, while the default the
-/// server's logs ingest builds on estimates. The writer levers carry through.
+/// Issue #4212: the page choice reaches the row path as it reaches the
+/// columnar one. The same file loaded through each path under one choice
+/// writes the same object bytes, and the two choices write different bytes
+/// on this file, so a row path that kept one fixed choice would match the
+/// columnar load of the other choice and fail here.
+///
+/// The binary drives only the columnar path; the per-page proof that the
+/// choice reaches every page it writes is
+/// `tests/load_page_choice.rs::the_page_choice_flag_reaches_every_written_page`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_page_choice_reaches_the_row_path() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let rows = 20_000usize;
+    let words = ["alpha-bravo-charlie-delta", "echo-foxtrot-golf-hotel-india"];
+    let b = batch(vec![
+        (
+            "ts",
+            i64_col(
+                (0..rows)
+                    .map(|i| NOW_NS - 60_000_000_000 + i as i64 * 1_000)
+                    .collect(),
+            ),
+        ),
+        ("svc", str_col(vec!["api"; rows])),
+        ("user", str_col((0..rows).map(|i| words[i % 2]).collect())),
+    ]);
+    let (_dir, pq) = write_parquet(&b);
+    let m = parse_mapping(
+        "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+         [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n\n\
+         [[attribute]]\nkey = \"user\"\ncolumn = \"user\"\ntype = \"str\"\n",
+    )
+    .expect("valid mapping");
+
+    let load_through = |path: LoadPath, choice: LoadPageChoice| {
+        let pq = pq.clone();
+        let m = m.clone();
+        async move {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let report = load_instrumented_at(
+                Arc::clone(&store),
+                &pq,
+                "acme",
+                &m,
+                1,
+                rows,
+                0,
+                Some(1),
+                Some(1),
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                DEFAULT_DECODE_QUEUE_BATCHES,
+                Some(PER_BATCH_TARGET_BYTES),
+                None,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+                path,
+                None,
+                None,
+                RlogZstdLevel::DEFAULT,
+                RlogGroupTargetBlocks::DEFAULT,
+                RlogChunkOrder::DEFAULT,
+                choice,
+                None,
+                false,
+                Arc::new(TenantRules::none()),
+            )
+            .await
+            .expect("load succeeds");
+            assert_eq!(report.rows_processed, rows as u64);
+            assert_eq!(report.page_choice, choice);
+            let mut objects = Vec::new();
+            for (key, _) in list_data_objects(store.as_ref()).await {
+                let data = store
+                    .get(&key, ravel_object_store::GetRange::Full)
+                    .await
+                    .expect("get")
+                    .data;
+                objects.push(pages(&data));
+            }
+            assert_eq!(objects.len(), 1, "one batch, one shard, one object");
+            objects
+        }
+    };
+    // The pages and their directory, without the footer, which carries the
+    // writer identity each load draws afresh.
+    fn pages(data: &[u8]) -> (ravel_logseg::page_dir::PageDir, Vec<u8>) {
+        use ravel_logseg::footer::{self, kind};
+        let f = footer::open(data).expect("footer");
+        let blocks = f.section(kind::BLOCKS).expect("BLOCKS");
+        let dir = ravel_logseg::read_section(
+            data,
+            f.section(kind::PAGE_DIR).expect("PAGE_DIR"),
+            &ravel_logseg::RlogConfig::default(),
+        )
+        .expect("read PAGE_DIR");
+        (
+            ravel_logseg::page_dir::PageDir::decode(&dir).expect("decode PAGE_DIR"),
+            data[blocks.offset as usize..(blocks.offset + blocks.len) as usize].to_vec(),
+        )
+    }
+
+    let exhaustive = load_through(LoadPath::Columnar, LoadPageChoice::Exhaustive).await;
+    let estimated = load_through(LoadPath::Columnar, LoadPageChoice::Estimated).await;
+    assert_ne!(
+        exhaustive, estimated,
+        "the two choices must write different bytes on this file"
+    );
+    assert_eq!(
+        load_through(LoadPath::Row, LoadPageChoice::Exhaustive).await,
+        exhaustive,
+        "the row path under exhaustive"
+    );
+    assert_eq!(
+        load_through(LoadPath::Row, LoadPageChoice::Estimated).await,
+        estimated,
+        "the row path under estimated"
+    );
+}
+
+/// Issue #4212: the loader's router config carries `--page-choice` to the
+/// shard flush's RLOG writer whichever value it is, over a base whose own
+/// choice differs from it. The other writer levers carry through.
 #[test]
-fn the_loader_config_builds_an_exhaustive_flush_writer() {
-    let base = build_ingest_config(2, 1, 4, None);
-    assert_eq!(base.rlog_page_choice, ravel_logseg::PageChoice::Estimated);
+fn the_loader_config_builds_the_flush_writer_the_page_choice_names() {
+    let mut base = build_ingest_config(2, 1, 4, None);
     let zstd_level = RlogZstdLevel::new(19).expect("level 19");
     let group_target_blocks = RlogGroupTargetBlocks::new(3).expect("3 blocks");
+    for (choice, writer, other) in [
+        (
+            LoadPageChoice::Exhaustive,
+            ravel_logseg::PageChoice::Exhaustive,
+            ravel_logseg::PageChoice::Estimated,
+        ),
+        (
+            LoadPageChoice::Estimated,
+            ravel_logseg::PageChoice::Estimated,
+            ravel_logseg::PageChoice::Exhaustive,
+        ),
+    ] {
+        base.rlog_page_choice = other;
+        let config = log_load_ingest_config(
+            base,
+            zstd_level,
+            group_target_blocks,
+            RlogChunkOrder::DEFAULT,
+            choice,
+        );
+        assert_eq!(config.rlog_page_choice, writer, "{choice:?}");
+    }
     let config = log_load_ingest_config(
         base,
         zstd_level,
         group_target_blocks,
         RlogChunkOrder::DEFAULT,
-    );
-    assert_eq!(
-        config.rlog_page_choice,
-        ravel_logseg::PageChoice::Exhaustive
+        LoadPageChoice::default(),
     );
     assert_eq!(config.rlog_zstd_level, zstd_level);
     assert_eq!(config.rlog_group_target_blocks, group_target_blocks);

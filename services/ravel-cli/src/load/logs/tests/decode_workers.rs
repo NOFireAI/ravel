@@ -957,6 +957,7 @@ async fn a_build_worker_panic_fails_the_load_and_nothing_hangs_body() {
         RlogZstdLevel::default(),
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
+        LoadPageChoice::default(),
         Some(memory),
         false,
         Arc::new(TenantRules::none()),

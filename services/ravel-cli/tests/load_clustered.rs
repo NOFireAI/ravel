@@ -294,6 +294,7 @@ async fn load_one(store: &Arc<dyn ObjectStoreBackend>, fx: &Fixture) -> bytes::B
         RlogZstdLevel::new(3).expect("in range"),
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
+        ravel_cli::load::LoadPageChoice::default(),
         None,
         false,
         &ravel_cli::ipcrypt::IpcryptPolicy::empty(),

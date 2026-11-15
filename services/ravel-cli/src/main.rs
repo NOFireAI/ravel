@@ -894,8 +894,9 @@ enum Command {
         /// compaction's own level, so this sets only the load's own objects.
         ///
         /// A page or section is stored compressed only when that is smaller
-        /// than storing it raw, and a page's encoding is chosen by stored
-        /// size, so the level can change which encoding a page keeps. Accepts
+        /// than storing it raw. Under `--page-choice exhaustive` a page's
+        /// encoding is chosen by stored size, so the level can change which
+        /// encoding a page keeps. Accepts
         /// zstd's range, -131072 to 22, and refuses a level outside it. A
         /// metrics or spans load ignores this flag and warns when it is set
         /// to anything but 3.
@@ -942,6 +943,20 @@ enum Command {
             value_parser = ravel_cli::parse_chunk_order
         )]
         chunk_order: Option<ravel_ingest::RlogChunkOrder>,
+        /// How the RLOG writer of every flush a logs load runs picks each
+        /// page's encoding. `exhaustive` seals every candidate encoding and
+        /// keeps the one with the fewest stored bytes. `estimated` seals one
+        /// candidate, picked from the page's statistics: it spends less CPU
+        /// writing and stores slightly more bytes, about 2 to 3% on the
+        /// ClickBench corpus. Both write encodings the format defines, and
+        /// readers decode either the same way.
+        ///
+        /// The summary's `page choice` line and the report JSON's
+        /// `page_choice` field name the choice the load wrote with. A metrics
+        /// or spans load ignores this flag and warns when it is set to
+        /// anything but estimated.
+        #[arg(long, value_enum, value_name = "CHOICE", default_value_t)]
+        page_choice: ravel_cli::load::LoadPageChoice,
         /// The bytes of built batches a logs load may hold at once (issue
         /// #2626). Every batch is charged before it is built, at an estimate
         /// from the previous batch's bytes per row (zero for the first batch),
@@ -4191,6 +4206,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             zstd_level,
             group_target_blocks,
             chunk_order,
+            page_choice,
             load_memory_bytes,
             fold_after_load,
             ipcrypt_config,
@@ -4232,6 +4248,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 zstd_level,
                 group_target_blocks,
                 chunk_order.unwrap_or_default(),
+                page_choice,
                 load_memory_bytes,
                 fold_after_load,
                 &ipcrypt,
@@ -6196,6 +6213,153 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// Issue #4212: `load` with no `--page-choice` writes the pages an
+    /// explicit `--page-choice estimated` load writes, byte for byte, on a
+    /// file where the exhaustive load's pages differ. The value clap resolves
+    /// with no flag is handed to `ravel_cli::load::run`, the function `main`
+    /// dispatches `load` to; an unknown value is refused at parse time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn load_without_page_choice_writes_the_estimated_loads_pages() {
+        use std::sync::Arc;
+
+        use arrow::array::{ArrayRef, Int64Array, StringArray};
+        use ravel_cli::load::LoadPageChoice;
+        use ravel_logseg::footer::{self, kind};
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
+
+        let rows = 20_000usize;
+        let now_ns: i64 = 1_790_000_000_000_000_000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parquet = dir.path().join("logs.parquet");
+        let mapping = dir.path().join("mapping.toml");
+        std::fs::write(
+            &mapping,
+            "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n\n\
+             [[attribute]]\nkey = \"user\"\ncolumn = \"user\"\ntype = \"str\"\n",
+        )
+        .expect("write mapping");
+        let words = ["alpha-bravo-charlie-delta", "echo-foxtrot-golf-hotel-india"];
+        let batch = arrow::record_batch::RecordBatch::try_from_iter(vec![
+            (
+                "ts",
+                Arc::new(Int64Array::from_iter_values(
+                    (0..rows).map(|i| now_ns - 60_000_000_000 + i as i64 * 1_000),
+                )) as ArrayRef,
+            ),
+            (
+                "svc",
+                Arc::new(StringArray::from(vec!["api"; rows])) as ArrayRef,
+            ),
+            (
+                "user",
+                Arc::new(StringArray::from_iter_values(
+                    (0..rows).map(|i| words[i % 2]),
+                )) as ArrayRef,
+            ),
+        ])
+        .expect("batch");
+        let file = std::fs::File::create(&parquet).expect("create parquet");
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let parquet_arg = parquet.to_str().expect("utf8 path");
+        let mapping_arg = mapping.to_str().expect("utf8 path");
+        let base = [
+            "ravel",
+            "load",
+            "--parquet",
+            parquet_arg,
+            "--tenant",
+            "acme",
+            "--mapping",
+            mapping_arg,
+        ];
+        let choice_of = |extra: &[&str]| match Cli::try_parse_from(
+            base.iter().copied().chain(extra.iter().copied()),
+        )
+        .map(|cli| cli.command)
+        {
+            Ok(Command::Load { page_choice, .. }) => Ok(page_choice),
+            Ok(_) => panic!("expected the load subcommand"),
+            Err(e) => Err(e.to_string()),
+        };
+        assert_eq!(
+            choice_of(&["--page-choice", "exhaustive"]),
+            Ok(LoadPageChoice::Exhaustive)
+        );
+        let err = choice_of(&["--page-choice", "fastest"]).expect_err("an unknown choice");
+        assert!(err.contains("invalid value 'fastest'"), "{err}");
+
+        // Each written object's PAGE_DIR and BLOCKS bytes: everything but the
+        // footer, which carries the writer identity each load draws afresh.
+        let (parquet, mapping) = (&parquet, &mapping);
+        let pages_of = |choice: LoadPageChoice| async move {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            ravel_cli::load::run(
+                Arc::clone(&store),
+                parquet,
+                "acme",
+                mapping,
+                ravel_cli::maintain::SignalArg::Logs,
+                1,
+                rows,
+                0,
+                None,
+                Some(1),
+                1,
+                ravel_cli::load::DEFAULT_DECODE_QUEUE_BATCHES,
+                None,
+                Some(ravel_cli::load::PER_BATCH_TARGET_BYTES),
+                None,
+                None,
+                ravel_ingest::RlogZstdLevel::DEFAULT,
+                ravel_ingest::RlogGroupTargetBlocks::DEFAULT,
+                ravel_ingest::RlogChunkOrder::DEFAULT,
+                choice,
+                None,
+                false,
+                &ravel_cli::ipcrypt::IpcryptPolicy::empty(),
+                None,
+                now_ns,
+            )
+            .await
+            .expect("load succeeds");
+            let mut out = Vec::new();
+            for meta in list_all(store.as_ref(), "").await.expect("list") {
+                let data = store
+                    .get(&meta.key, GetRange::Full)
+                    .await
+                    .expect("get")
+                    .data;
+                let Ok(f) = footer::open(&data) else { continue };
+                let range = |k| {
+                    let s = f.section(k).expect("section");
+                    data[s.offset as usize..(s.offset + s.len) as usize].to_vec()
+                };
+                out.push((range(kind::PAGE_DIR), range(kind::BLOCKS)));
+            }
+            assert!(!out.is_empty(), "the load wrote an object");
+            out
+        };
+
+        let no_flag = choice_of(&[]).expect("parses");
+        let default_pages = pages_of(no_flag).await;
+        let estimated = pages_of(LoadPageChoice::Estimated).await;
+        let exhaustive = pages_of(LoadPageChoice::Exhaustive).await;
+        assert_ne!(
+            estimated, exhaustive,
+            "the file must make the two choices write different pages"
+        );
+        assert!(
+            default_pages == estimated,
+            "with no --page-choice the load writes {no_flag:?} pages, not the estimated load's"
+        );
     }
 
     /// Issue #1184's classification: `load`, `typed-attr-column set`,

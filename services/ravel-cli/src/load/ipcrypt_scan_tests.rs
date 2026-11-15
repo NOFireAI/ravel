@@ -289,6 +289,7 @@ async fn load_every_path(store: &Arc<dyn ObjectStoreBackend>, policy: &IpcryptPo
         RlogZstdLevel::DEFAULT,
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
+        LoadPageChoice::default(),
         None,
         false,
         Arc::new(policy.rules_for(TENANT).expect("rules resolve")),

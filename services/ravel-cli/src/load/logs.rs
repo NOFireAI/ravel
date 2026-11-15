@@ -126,6 +126,7 @@ pub async fn load_with_fold_after_load(
         RlogZstdLevel::DEFAULT,
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
+        LoadPageChoice::default(),
         None,
         true,
         Arc::new(TenantRules::none()),
@@ -178,6 +179,7 @@ pub async fn load_with_memory(
         RlogZstdLevel::DEFAULT,
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
+        LoadPageChoice::default(),
         Some(load_memory),
         false,
         Arc::new(TenantRules::none()),
@@ -269,6 +271,7 @@ pub(super) async fn load_instrumented(
         RlogZstdLevel::DEFAULT,
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
+        LoadPageChoice::default(),
         None,
         false,
         Arc::new(TenantRules::none()),
@@ -282,7 +285,8 @@ pub(super) async fn load_instrumented(
 /// is `--group-target-blocks`, the router's
 /// [`IngestConfig::rlog_group_target_blocks`], and `chunk_order` is
 /// `--chunk-order`, the router's [`IngestConfig::rlog_chunk_order`].
-/// `load_memory` is the
+/// `page_choice` is `--page-choice`, the router's
+/// [`IngestConfig::rlog_page_choice`]. `load_memory` is the
 /// memory budget's inputs, resolved once the read-cursor count is known;
 /// `None` derives the budget from this host's memory. `fold_after_load` is
 /// the `--fold-after-load` flag ([`load_with_fold_after_load`]).
@@ -313,6 +317,7 @@ pub(super) async fn load_instrumented_at(
     zstd_level: RlogZstdLevel,
     group_target_blocks: RlogGroupTargetBlocks,
     chunk_order: RlogChunkOrder,
+    page_choice: LoadPageChoice,
     load_memory: Option<LoadMemoryOptions>,
     fold_after_load: bool,
     rules: Arc<TenantRules>,
@@ -339,6 +344,7 @@ pub(super) async fn load_instrumented_at(
         zstd_level,
         group_target_blocks,
         chunk_order,
+        page_choice,
         DRAIN_REFLUSH_PERIOD,
         load_memory,
         fold_after_load,
@@ -377,6 +383,7 @@ pub(super) async fn load_with_drain_reflush_period(
     zstd_level: RlogZstdLevel,
     group_target_blocks: RlogGroupTargetBlocks,
     chunk_order: RlogChunkOrder,
+    page_choice: LoadPageChoice,
     drain_reflush_period: Duration,
     load_memory: Option<LoadMemoryOptions>,
     fold_after_load: bool,
@@ -502,6 +509,7 @@ pub(super) async fn load_with_drain_reflush_period(
                 zstd_level,
                 group_target_blocks,
                 chunk_order,
+                page_choice,
             ),
             Arc::clone(&store),
             Arc::clone(&clock),
@@ -562,7 +570,10 @@ pub(super) async fn load_with_drain_reflush_period(
     let load_memory = load_memory.unwrap_or_default();
 
     let started = Instant::now();
-    let mut report = LoadReport::default();
+    let mut report = LoadReport {
+        page_choice,
+        ..LoadReport::default()
+    };
     if budget.is_some() {
         report.load_memory = load_memory;
     }
@@ -2545,20 +2556,21 @@ fn shard_skew_warning(distinct_shards: usize, shards: u32) -> Option<String> {
     ))
 }
 
-/// The log loader's router config: `base` with the RLOG writer levers set.
-/// The loader keeps the exhaustive page choice (ADR-3492 decision 1); only the
-/// server's logs ingest flush estimates.
+/// The log loader's router config: `base` with the RLOG writer levers set,
+/// `page_choice` (`--page-choice`) among them. The router hands the config to
+/// every shard flush, so it reaches the row and the columnar path alike.
 fn log_load_ingest_config(
     base: IngestConfig,
     zstd_level: RlogZstdLevel,
     group_target_blocks: RlogGroupTargetBlocks,
     chunk_order: RlogChunkOrder,
+    page_choice: LoadPageChoice,
 ) -> IngestConfig {
     IngestConfig {
         rlog_zstd_level: zstd_level,
         rlog_group_target_blocks: group_target_blocks,
         rlog_chunk_order: chunk_order,
-        rlog_page_choice: ravel_logseg::PageChoice::Exhaustive,
+        rlog_page_choice: page_choice.page_choice(),
         ..base
     }
 }
