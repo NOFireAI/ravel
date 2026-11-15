@@ -563,6 +563,12 @@ mod tests {
             .max()
             .expect("the accepted read set is non-empty");
         let newer = [
+            SnapshotFormatError::Newer(NewerFormat {
+                kind: CatalogObjectKind::Postings,
+                field: "envelope version",
+                version: u32::from(POSTINGS_VERSION) + 1,
+                max_known: u32::from(POSTINGS_VERSION),
+            }),
             SnapshotFormatError::UnsupportedVersion(VERSION + 1),
             SnapshotFormatError::UnsupportedLevel(MAX_ENTRY_LEVEL + 1),
             SnapshotFormatError::UnsupportedHeadVersion(3),

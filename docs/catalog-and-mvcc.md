@@ -1048,8 +1048,9 @@ breach counter; `verify_key_index_leaf` and `check_key_index_leaf_set` are
 the whole-object reader `ravel-cli inspect kidx KEY...` uses. A probe
 returns `Matches` or `Absent`, each with the leaf's uncovered entry
 ordinals, or `Rejected` with the reason the part reads as uncovered:
-`Corrupted`, `UnsupportedVersion`, `PartBindingMismatch`, `RequestMismatch`
-(a valid leaf for another field, key type or key slice than the lookup), or
+`Corrupted`, `UnsupportedVersion`, `NewerVersion` (a `format_version` above
+every one this build knows), `PartBindingMismatch`, `RequestMismatch` (a
+valid leaf for another field, key type or key slice than the lookup), or
 `Read` (a failed GET).
 
 `SnapshotPartRef` carries an additive field 8, `repeated
@@ -2463,6 +2464,33 @@ itself alone, so it owns every unit and folds everything. Two `all` processes
 over one bucket therefore both fold everything; the CAS still serializes them,
 but the duplicate read cost is not bounded by a transition window. Run
 `maintain` replicas, not multiple `all` processes, when fold cost matters.
+
+## Previous objects a newer build wrote (ADR-4233 decision 4)
+
+A fold attempt reads the tenant config record, every part the previous HEAD
+names (`.csnap`), the `.cstat` of each previous part it re-encodes that covers
+no re-folded hour (for a tenant that declares typed attribute columns), the
+previous postings (`.npost`) when it merges them
+forward, and the leaves (`.kidx`) of the previous parts it carries from. Each
+codec classifies a stored version above the set this build reads as newer,
+apart from a version below that set and from corruption:
+`SnapshotFormatError::Newer` for an envelope version (`.csnap`, `.npost`,
+`.cstat`) or a `.csnap` entry level, and `KeyIndexLeafRejection::NewerVersion`
+for a leaf `format_version`. On that classification, or on a tenant config
+record above `TENANT_CONFIG_MAX_READ_VERSION`, the fold fails with
+`CatalogError::NewerCatalogObject`, which names the object key, its kind and
+the version, and never rebuilds over the object. The refusal comes before the
+HEAD CAS, so the HEAD keeps naming the newer objects and the catalog sweep
+keeps them. Every read but the leaf carry also comes before the attempt's first
+PUT. The leaf carry reads the first slice of each carried leaf set as each
+re-encoded part is built, before that part's leaf, `.cstat` and `.csnap` PUTs,
+and a later slice when a build pass reaches it. So objects of a part
+re-encoded earlier in the same attempt, or leaf slices of an earlier pass, can
+remain unreferenced after the refusal, and the sweep removes them like any
+other. A previous object below the read set, or a corrupt one, is rebuilt over
+as before, and a tenant config read that fails any other way still folds with
+the deployment defaults. A HEAD above the read set is the older
+`CatalogError::UnsupportedHeadVersion` refusal (ADR-0066 decision 2).
 
 ## Fold reconcile pass (ADR-0063 section 4)
 

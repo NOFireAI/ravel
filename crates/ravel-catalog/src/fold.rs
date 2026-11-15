@@ -44,11 +44,10 @@ use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count}
 use crate::snapshot_format::{
     self, CatalogObjectKind, EncodedKeyIndexLeaf, HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSIONS,
     KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN, KeyIndexLeafEncodeError, KeyIndexLeafEntry,
-    KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexLeafRejection,
-    KeyIndexLeafSummary, KeyIndexSlice, NamePostings, PartLimits, SnapshotFormatError,
-    column_stats_segments_concat, encode_key_index_leaf, encoded_entry_len,
-    key_index_leaf_version_accepted, select_key_index_slice, split_key_index_entries,
-    verify_key_index_leaf_frames,
+    KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexLeafRejection, KeyIndexLeafSummary,
+    KeyIndexSlice, NamePostings, PartLimits, SnapshotFormatError, column_stats_segments_concat,
+    encode_key_index_leaf, encoded_entry_len, key_index_leaf_version_accepted,
+    select_key_index_slice, split_key_index_entries, verify_key_index_leaf_frames,
 };
 use crate::tenant_config::DeclaredTypedColumn;
 
@@ -2712,7 +2711,6 @@ impl CarryFailure {
             other => CarryFailure::Unusable(format!("leaf {key}: {other}")),
         }
     }
-
 }
 
 /// The fold's refusal of a previous leaf a newer build wrote.
@@ -2765,11 +2763,7 @@ async fn fetch_carried_leaf(
         || header.part_blake3 != part_blake3
         || header.part_entry_count != part_entry_count
     {
-        return Err(format!(
-            "leaf {} binds another tenant, signal or part",
-            leaf.key
-        )
-        .into());
+        return Err(format!("leaf {} binds another tenant, signal or part", leaf.key).into());
     }
     if !key_index_leaf_version_accepted(signal, header.format_version) {
         return Err(format!(
@@ -2784,12 +2778,13 @@ async fn fetch_carried_leaf(
 /// Plans one source's leaf sets from its refs and maps its covered entries
 /// onto the new part by data object key. Per field it GETs and verifies only
 /// the lowest slice, whose header gives the uncovered entries of the whole
-/// set; the later slices are fetched by the passes that reach them. `Err`
-/// (the reason) when the leaves cannot stand in for the sections: a leaf
-/// field not in `fields` under its key type, a field of `fields` with no
-/// leaf, refs that do not tile the key8 space or disagree on key type,
-/// `uncovered_count` or part hash, or name another part, or a lowest slice
-/// whose GET fails or that does not verify ([`fetch_carried_leaf`]).
+/// set; the later slices are fetched by the passes that reach them.
+/// [`CarryFailure::Unusable`] (the reason) when the leaves cannot stand in for
+/// the sections: a leaf field not in `fields` under its key type, a field of
+/// `fields` with no leaf, refs that do not tile the key8 space or disagree on
+/// key type, `uncovered_count` or part hash, or name another part, or a lowest
+/// slice whose GET fails or that does not verify ([`fetch_carried_leaf`]).
+/// [`CarryFailure::Newer`] when a lowest slice is a newer build's.
 #[allow(clippy::too_many_arguments)]
 async fn load_carry_source(
     store: &dyn ObjectStoreBackend,
@@ -3088,7 +3083,8 @@ fn release_carried_slices(
 /// field starts again from key8 0, so a slice dropped in its earlier attempt
 /// is fetched again, while one still kept from that attempt stays held until
 /// a pass starts past it. `Err` when a slice's GET fails, it does not
-/// verify, or a kept slice no longer decodes.
+/// verify, or a kept slice no longer decodes; [`CarryFailure::Newer`] when the
+/// slice is a newer build's.
 #[allow(clippy::too_many_arguments)]
 async fn feed_carried_key_index(
     store: &dyn ObjectStoreBackend,
@@ -3123,11 +3119,9 @@ async fn feed_carried_key_index(
             Some(bytes) => bytes.clone(),
             None => {
                 if slice.fetched_in == Some(field.attempt) {
-                    return Err(format!(
-                        "leaf {} was dropped and is needed again",
-                        slice.leaf.key
-                    )
-                    .into());
+                    return Err(
+                        format!("leaf {} was dropped and is needed again", slice.leaf.key).into(),
+                    );
                 }
                 let (summary, bytes) = fetch_carried_leaf(
                     store,
@@ -5973,8 +5967,9 @@ impl Catalog {
     /// against its recorded blake3 before trusting its entries. Any
     /// failure (GET error, hash mismatch, a part naming another tenant, decode
     /// error, refused decode reservation) is returned to the caller, which
-    /// fails the fold on a foreign part or a refused reservation and falls
-    /// back to a full rebuild on anything else.
+    /// fails the fold on a foreign part, a part a newer build wrote
+    /// ([`CatalogError::NewerCatalogObject`]) or a refused reservation, and
+    /// falls back to a full rebuild on anything else.
     ///
     /// Returns the entries together with every part's decode reservation; the
     /// caller holds the reservations for as long as it holds the entries.
@@ -6067,7 +6062,8 @@ impl Catalog {
     /// same part fails and rebuilds, or fails the fold when the failure is a
     /// refused decode reservation. A part naming another tenant is returned
     /// as the error instead, failing the fold here, so the breach is counted
-    /// once rather than again by the main load.
+    /// once rather than again by the main load; so is a part a newer build
+    /// wrote.
     ///
     /// Also returns every part read here with its decode reservation, keyed
     /// by part object key, so `load_previous_entries` does not read it again
@@ -6142,6 +6138,9 @@ impl Catalog {
     /// unreported; and a refused decode reservation is memory pressure, which
     /// the rebuild would answer by fetching and decoding every segment's names
     /// instead of one postings object, holding more memory rather than less.
+    /// A third is the fold's own: a postings object a newer build wrote is
+    /// [`CatalogError::NewerCatalogObject`] (ADR-4233 decision 4, H1), since
+    /// the rebuilt postings would replace its ref and the sweep delete it.
     async fn load_previous_postings(
         &self,
         tenant: &TenantHash,
@@ -15318,17 +15317,13 @@ pub(crate) mod tests {
             tenant().to_hex(),
             Signal::Logs.key_prefix()
         );
-        // The part's `.cstat`, also built before the part PUT, may remain; it
-        // is unreferenced and swept like any other.
-        let written: Vec<String> = list_all_keys(store.as_ref(), &catalog_prefix)
-            .await
-            .into_iter()
-            .filter(|key| !key.ends_with(".cstat"))
-            .collect();
+        // The part's `.cstat` is built after its leaves, so the refusal comes
+        // before it too.
+        let written: Vec<String> = list_all_keys(store.as_ref(), &catalog_prefix).await;
         assert_eq!(
             written,
             Vec::<String>::new(),
-            "no part, no leaf and no HEAD after the refusal"
+            "no part, no leaf, no .cstat and no HEAD after the refusal"
         );
     }
 
@@ -21279,14 +21274,17 @@ pub(crate) mod tests {
             u32::from(stats_max) + 1,
             "ColumnStats",
         );
-        assert_store_unchanged(&before, &store_contents(store.as_ref()).await, "ColumnStats");
+        assert_store_unchanged(
+            &before,
+            &store_contents(store.as_ref()).await,
+            "ColumnStats",
+        );
 
         for target in [NewerTarget::Part, NewerTarget::Leaf] {
             let case = format!("{target:?}");
             let inner = recording_store();
             let first = advancing_fixture(&inner).await;
-            let (key, kind, version) =
-                raise_advancing_object(inner.as_ref(), first, target).await;
+            let (key, kind, version) = raise_advancing_object(inner.as_ref(), first, target).await;
             let before = store_contents(inner.as_ref()).await;
             let catalog = Catalog::new(inner.clone(), kidx_config()).expect("catalog");
             let err = catalog
@@ -21408,8 +21406,7 @@ pub(crate) mod tests {
         let now = now_at_seal(10);
         publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now - NS_PER_HOUR).await;
         write_retention_config(store.as_ref(), 7 * 24 * NS_PER_HOUR).await;
-        let written =
-            stamp_tenant_config(store.as_ref(), TENANT_CONFIG_MAX_READ_VERSION + 1).await;
+        let written = stamp_tenant_config(store.as_ref(), TENANT_CONFIG_MAX_READ_VERSION + 1).await;
         let before = store_contents(store.as_ref()).await;
         let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
         let err = catalog

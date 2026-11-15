@@ -114,11 +114,12 @@ pub use snapshot::{
     SnapshotPartHandle, SnapshotParts,
 };
 pub use snapshot_format::{
-    CatalogObjectKind, ColumnStatsHeaderPeek, ColumnStatsLimits, NewerFormat, DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES,
-    DEFAULT_MAX_COLUMN_STATS_BYTES, DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES,
-    DecodedColumnStats, DecodedPart, DecodedPostings, HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSION_2,
-    HEAD_FORMAT_VERSIONS, MAGIC, NamePostings, PartLimits, PostingsLimits, SnapshotFormatError,
-    VERSION, column_stats_segments_concat, decode_column_stats, decode_column_stats_filtered,
+    CatalogObjectKind, ColumnStatsHeaderPeek, ColumnStatsLimits,
+    DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES, DEFAULT_MAX_COLUMN_STATS_BYTES,
+    DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES, DecodedColumnStats, DecodedPart,
+    DecodedPostings, HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSION_2, HEAD_FORMAT_VERSIONS, MAGIC,
+    NamePostings, NewerFormat, PartLimits, PostingsLimits, SnapshotFormatError, VERSION,
+    column_stats_segments_concat, decode_column_stats, decode_column_stats_filtered,
     decode_column_stats_header, decode_head, decode_part, decode_postings, encode_column_stats_v3,
     encode_head, encode_part, encode_postings, head_format_version_for,
     head_format_version_is_newer, validate_min_max_presence,
