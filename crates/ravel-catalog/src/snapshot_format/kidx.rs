@@ -583,7 +583,10 @@ fn prepare<'a>(
 
 /// Encodes one leaf, choosing `bucket_bits` with
 /// [`choose_key_index_bucket_bits`]. A body over `limits.max_body_bytes` is
-/// [`KeyIndexLeafEncodeError::BodyOverCeiling`].
+/// [`KeyIndexLeafEncodeError::BodyOverCeiling`]. A field that carries
+/// postings ([`key_index_field_entry_kind`]) is
+/// [`KeyIndexLeafEncodeError::InvalidInput`]: use
+/// [`encode_key_index_posting_leaf`].
 pub fn encode_key_index_leaf(
     input: &KeyIndexLeafInput<'_>,
     limits: &KeyIndexLeafLimits,
