@@ -18,7 +18,12 @@ thread_local! {
     pub(super) static FRAME_DECOMPRESSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Frame crc32c computations `check_frame_header` ran on this thread.
     pub(super) static FRAME_CRC_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The capacity of every posting value list the kind-1 decoder
+    /// allocated on this thread, in order.
+    pub(super) static POSTING_ALLOCATIONS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
+
+mod posting;
 
 const TENANT: TenantHash = TenantHash([7u8; 16]);
 const SIGNAL: Signal = Signal::Logs;
@@ -441,6 +446,8 @@ fn format_constants_and_bucket_bits_balance_are_pinned() {
     assert_eq!(&KEY_INDEX_LEAF_MAGIC, b"RKI1");
     assert_eq!(KEY_INDEX_LEAF_FORMAT_VERSION, 2);
     assert_eq!(KEY_INDEX_LEAF_FORMAT_VERSION_1, 1);
+    assert_eq!(KEY_INDEX_LEAF_FORMAT_VERSION_3, 3);
+    assert_eq!(KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN, [1, 2, 3]);
     assert_eq!(KEY_INDEX_LEAF_MIN_BUCKET_BITS, 1);
     assert_eq!(KEY_INDEX_LEAF_WRITER_MAX_BUCKET_BITS, 13);
     assert_eq!(KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS, 16);
@@ -458,6 +465,10 @@ fn version_one_is_refused_for_logs_and_answers_for_spans() {
     assert!(key_index_leaf_version_accepted(Signal::Spans, 1));
     assert!(!key_index_leaf_version_accepted(Signal::Logs, 1));
     assert!(!key_index_leaf_version_accepted(Signal::Spans, 3));
+    assert!(!key_index_leaf_version_accepted(Signal::Logs, 3));
+    assert!(key_index_leaf_version_accepted(Signal::Metrics, 3));
+    assert!(key_index_leaf_version_accepted(Signal::Metrics, 2));
+    assert!(!key_index_leaf_version_accepted(Signal::Metrics, 4));
     assert!(!key_index_leaf_version_accepted(Signal::Spans, 0));
 
     let f = fixture();
@@ -821,6 +832,7 @@ fn base_header(bucket_bits: u32) -> KeyIndexLeafHeader {
         part_entry_count: PART_ENTRY_COUNT,
         uncovered_entry_ordinals: Vec::new(),
         body_len: 0,
+        entry_kind: 0,
     }
 }
 
