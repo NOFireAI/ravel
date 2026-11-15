@@ -206,7 +206,7 @@ fn encode_column_stats_versioned(
 /// `#[cfg(test)]` for the same reason as its caller: the live v3 writer frames
 /// through [`frame_column_stats_body`] directly.
 #[cfg(test)]
-fn frame_column_stats(
+pub fn frame_column_stats(
     version: u8,
     tenant_hash: [u8; 16],
     signal: u32,
