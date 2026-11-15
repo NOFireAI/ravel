@@ -375,14 +375,27 @@ fn header_min_hour_exceeds_watermark() {
 #[test]
 fn unsupported_level() {
     // Level 0 (L0 commit) and level 1 (L1 compaction part) are defined;
-    // anything higher is reserved and must be rejected, not guessed at.
+    // anything higher is reserved and must be rejected, not guessed at, as an
+    // object a newer build wrote. The newer level sits on the last entry,
+    // behind an entry this build would refuse for its writer_id length, so the
+    // level is classified before any entry is validated.
     let mut entries = base_entries();
-    entries[0].level = 2;
+    let last = entries.len() - 1;
+    entries[last].level = 2;
+    entries[0].writer_id = vec![0xAA; 3];
     let raw = encode_entries_raw(&entries);
     let header = base_header(&entries, raw.len() as u64);
     let bytes = assemble(&header, &raw, None, None);
     let err = decode_part(&bytes, &PartLimits::default()).expect_err("decode must fail");
-    assert_eq!(err, SnapshotFormatError::UnsupportedLevel(2));
+    assert_eq!(
+        err,
+        SnapshotFormatError::Newer(NewerFormat {
+            kind: CatalogObjectKind::SnapshotPart,
+            field: "entry level",
+            version: 2,
+            max_known: 1,
+        })
+    );
 }
 
 #[test]

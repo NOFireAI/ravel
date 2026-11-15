@@ -15339,9 +15339,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn entries_without_a_readable_section_are_uncovered_and_the_leaf_is_still_written() {
         // Published before the fault plan wraps the store, so the plan counts
-        // only the fold's GETs of entry 3's data object: the column-stats
-        // build's whole-object GET is the first, the footer suffix GET the
-        // second, the section GET the third.
+        // only the fold's GETs of entry 3's data object: the footer suffix GET
+        // is the first, the section GET the second, and the column-stats
+        // build's whole-object GET, after the leaf build, the third.
         let inner = MemoryStore::new();
         declare_user_id_key_index(&inner).await;
         publish_user_id_logs(&inner, 1, KIDX_HOUR, &[10, 20], 2, 0, true).await;
@@ -15354,7 +15354,7 @@ pub(crate) mod tests {
                 ScriptedFault::Permanent("section GET refused".into()),
             )
             .with_key_contains(failing.as_str())
-            .with_occurrence(Occurrence::Nth(3)),
+            .with_occurrence(Occurrence::Nth(2)),
         );
         let store = Arc::new(FaultStore::new(inner, plan));
         let catalog = Catalog::new(store.clone(), kidx_config()).expect("catalog");
@@ -16626,9 +16626,9 @@ pub(crate) mod tests {
                 "budget {max_pairs}: from scratch"
             );
 
-            // Writer 35's object: the column-stats GET, then a footer suffix
-            // GET and a section GET per pass, so the 3rd GET is its first
-            // pass's section and the 5th its second pass's.
+            // Writer 35's object: a footer suffix GET and a section GET per
+            // pass, then the column-stats GET, so the 2nd GET is its first
+            // pass's section and the 4th its second pass's.
             let section_get = |nth: u64| {
                 Rule::new(
                     Op::Get,
@@ -16638,7 +16638,7 @@ pub(crate) mod tests {
                 .with_occurrence(Occurrence::Nth(nth))
             };
             let (first_store, first_part, _, first_log, first_leaves) =
-                fault_fold(section_get(3)).await;
+                fault_fold(section_get(2)).await;
             assert!(
                 first_log.iter().all(|r| r.attempt == 0),
                 "budget {max_pairs}: a first-pass failure needs no restart"
@@ -16658,7 +16658,7 @@ pub(crate) mod tests {
             if greedy_passes(&all_pairs, max_pairs) < 2 {
                 continue;
             }
-            let (_, _, restarted, restart_log, restart_leaves) = fault_fold(section_get(5)).await;
+            let (_, _, restarted, restart_log, restart_leaves) = fault_fold(section_get(4)).await;
             assert!(
                 restart_log.iter().any(|r| r.attempt == 1),
                 "budget {max_pairs}: the build restarted: {restarted:?}"
