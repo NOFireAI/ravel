@@ -22,7 +22,10 @@
 //! crc32c over `magic || version || payload`, so a bit flip in the header is
 //! caught exactly like one in the payload); a corrupt or truncated marker
 //! decodes to a typed [`MarkerError`], never a panic, and callers treat that
-//! as a miss (fail-open to at-least-once, ADR-0051 section 5). Byte layout
+//! as a miss (fail-open to at-least-once, ADR-0051 section 5). A version above
+//! the one this build reads is not corruption: [`read_marker`] refuses the
+//! lookup with [`MarkerLookupFailure::NewerMarker`] so the request is not
+//! ingested a second time (ADR-4233 decision 4, H10). Byte layout
 //! and checksum coverage are documented in docs/catalog-and-mvcc.md.
 //!
 //! There is no dual-reader question: the `idem/` prefix is new, no old data
@@ -82,6 +85,25 @@ pub fn idempotency_probe_gets(signal: Signal) -> u64 {
     probe_gets_slot(signal).map_or(0, |slot| slot.load(Ordering::Relaxed))
 }
 
+/// Keyed writes refused because the newest marker found was written by a newer
+/// build (version above [`VERSION`]), logs then spans.
+static NEWER_MARKER_REFUSALS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+fn newer_refusals_slot(signal: Signal) -> Option<&'static AtomicU64> {
+    match signal {
+        Signal::Logs => Some(&NEWER_MARKER_REFUSALS[0]),
+        Signal::Spans => Some(&NEWER_MARKER_REFUSALS[1]),
+        _ => None,
+    }
+}
+
+/// Lookups for `signal` this process refused because the marker was written
+/// by a newer build, counted once per refused lookup. Zero for a signal that
+/// writes no markers.
+pub fn idempotency_newer_marker_refusals(signal: Signal) -> u64 {
+    newer_refusals_slot(signal).map_or(0, |slot| slot.load(Ordering::Relaxed))
+}
+
 const MAGIC: &[u8; 4] = b"RIDM";
 const VERSION: u16 = 1;
 const HEADER_LEN: usize = MAGIC.len() + 2 + 4;
@@ -104,7 +126,8 @@ pub struct IdempotencyReceipt {
 }
 
 /// Errors decoding a marker body. All are typed and non-fatal to the caller:
-/// every variant is treated as a miss (ADR-0051 section 5, fail-open).
+/// every variant but [`MarkerError::NewerVersion`] is treated as a miss
+/// (ADR-0051 section 5, fail-open); a newer version refuses the lookup.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MarkerError {
     #[error("marker body truncated: {0} bytes, need at least {HEADER_LEN}")]
@@ -113,6 +136,10 @@ pub enum MarkerError {
     BadMagic([u8; 4]),
     #[error("unsupported marker version {0}, expected {VERSION}")]
     UnsupportedVersion(u16),
+    /// The marker's version is above the one this build reads: a newer build
+    /// wrote a valid marker this one cannot interpret. Not corruption.
+    #[error("marker version {found} is newer than the version {VERSION} this build reads")]
+    NewerVersion { found: u16 },
     #[error("marker checksum mismatch: stored {stored:#010x}, computed {computed:#010x}")]
     ChecksumMismatch { stored: u32, computed: u32 },
     #[error("malformed receipt payload: {0}")]
@@ -131,15 +158,44 @@ pub enum MarkerWriteError {
     Codec(#[from] MarkerError),
 }
 
-/// A [`read_marker`] probe failed with a store error other than `NotFound`.
-/// Carries the key whose GET failed, for the caller's server-side log; it is
-/// not meant for a client-facing message.
+/// Why a [`read_marker`] lookup failed: a store error other than `NotFound`,
+/// or a marker written by a newer build.
 #[derive(Debug, thiserror::Error)]
-#[error("idempotency marker GET {key} failed: {source}")]
+pub enum MarkerLookupFailure {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// The marker's version is above the one this build reads. The request
+    /// may already have been ingested under that marker, so ingesting it again
+    /// would duplicate it; the refusal is retryable (a build that reads the
+    /// marker, or one that expires it, answers the retry).
+    #[error("marker version {found} is newer than the version {supported} this build reads")]
+    NewerMarker { found: u16, supported: u16 },
+}
+
+impl MarkerLookupFailure {
+    /// True for the newer-marker refusal, which callers surface as retryable
+    /// the same way as a failed lookup.
+    pub fn is_newer_marker(&self) -> bool {
+        matches!(self, Self::NewerMarker { .. })
+    }
+}
+
+/// A [`read_marker`] probe failed. Carries the key whose GET failed or whose
+/// marker was refused, for the caller's server-side log; it is not meant for a
+/// client-facing message.
+#[derive(Debug, thiserror::Error)]
+#[error("idempotency marker lookup at {key} failed: {source}")]
 pub struct MarkerLookupError {
     pub key: String,
     #[source]
-    pub source: StoreError,
+    pub source: MarkerLookupFailure,
+}
+
+/// Failure of one exact-key marker read.
+#[derive(Debug)]
+enum ReadAtError {
+    Store(StoreError),
+    Newer(u16),
 }
 
 /// Outcome of a marker lookup, whether reached via [`read_marker`]'s
@@ -279,6 +335,11 @@ pub fn decode_marker(bytes: &[u8]) -> Result<IdempotencyReceipt, MarkerError> {
         return Err(MarkerError::BadMagic(got));
     }
     let version = u16::from_le_bytes([header[4], header[5]]);
+    // Before the checksum and payload: a newer build may lay both out
+    // differently, so neither is meaningful to this build.
+    if version > VERSION {
+        return Err(MarkerError::NewerVersion { found: version });
+    }
     if version != VERSION {
         return Err(MarkerError::UnsupportedVersion(version));
     }
@@ -302,17 +363,18 @@ pub fn decode_marker(bytes: &[u8]) -> Result<IdempotencyReceipt, MarkerError> {
 async fn read_marker_at(
     store: &dyn ObjectStoreBackend,
     key: &str,
-) -> Result<LookupOutcome, StoreError> {
+) -> Result<LookupOutcome, ReadAtError> {
     match store.get(key, ravel_object_store::GetRange::Full).await {
         Ok(outcome) => match decode_marker(&outcome.data) {
             Ok(receipt) => Ok(LookupOutcome::Hit(receipt)),
+            Err(MarkerError::NewerVersion { found }) => Err(ReadAtError::Newer(found)),
             Err(err) => {
                 tracing::warn!(key, %err, "idempotency marker failed to decode; treating as miss");
                 Ok(LookupOutcome::Corrupt)
             }
         },
         Err(StoreError::NotFound) => Ok(LookupOutcome::Miss),
-        Err(other) => Err(other),
+        Err(other) => Err(ReadAtError::Store(other)),
     }
 }
 
@@ -346,7 +408,17 @@ pub async fn write_marker(
     {
         Ok(_) => Ok(WriteOutcome::Written),
         Err(StoreError::AlreadyExists) => {
-            Ok(WriteOutcome::Existing(read_marker_at(store, &key).await?))
+            // The data is already durable here, so a newer marker cannot
+            // refuse anything; it replays as an unreadable marker.
+            let existing = match read_marker_at(store, &key).await {
+                Ok(outcome) => outcome,
+                Err(ReadAtError::Store(err)) => return Err(err.into()),
+                Err(ReadAtError::Newer(found)) => {
+                    tracing::warn!(key, found, "idempotency marker written by a newer build");
+                    LookupOutcome::Corrupt
+                }
+            };
+            Ok(WriteOutcome::Existing(existing))
         }
         Err(other) => Err(other.into()),
     }
@@ -374,6 +446,10 @@ pub async fn write_marker(
 /// The probes are GETs, not a listing of the key's `<keyhash32>.` prefix: the
 /// S3 adapter appends `/` to every list prefix, so that listing finds no
 /// marker on S3.
+///
+/// A marker whose version is above the one this build reads fails the lookup
+/// with [`MarkerLookupFailure::NewerMarker`] instead of decoding as corrupt,
+/// by the same newest-first rule as a store error.
 ///
 /// Returns [`LookupOutcome::Miss`] when every probe answers `NotFound`, and
 /// [`LookupOutcome::Corrupt`] when the newest marker found fails to decode.
@@ -430,14 +506,37 @@ async fn probe_batch(
             )
         })
         .collect();
-    let results: Vec<(String, Result<LookupOutcome, StoreError>)> = futures::stream::iter(probes)
+    let results: Vec<(String, Result<LookupOutcome, ReadAtError>)> = futures::stream::iter(probes)
         .buffered(IDEM_MARKER_PROBE_CONCURRENCY)
         .collect()
         .await;
     // `buffered` yields in input order, so `results` runs newest hour first.
     for (key, result) in results {
         match result {
-            Err(source) => return Err(MarkerLookupError { key, source }),
+            Err(ReadAtError::Store(source)) => {
+                return Err(MarkerLookupError {
+                    key,
+                    source: source.into(),
+                });
+            }
+            Err(ReadAtError::Newer(found)) => {
+                tracing::warn!(
+                    key,
+                    found,
+                    supported = VERSION,
+                    "idempotency marker written by a newer build; refusing the keyed write"
+                );
+                if let Some(slot) = newer_refusals_slot(signal) {
+                    slot.fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(MarkerLookupError {
+                    key,
+                    source: MarkerLookupFailure::NewerMarker {
+                        found,
+                        supported: VERSION,
+                    },
+                });
+            }
             Ok(LookupOutcome::Miss) => {}
             Ok(found) => return Ok(found),
         }
@@ -449,7 +548,7 @@ async fn probe_key(
     store: &dyn ObjectStoreBackend,
     signal: Signal,
     key: String,
-) -> (String, Result<LookupOutcome, StoreError>) {
+) -> (String, Result<LookupOutcome, ReadAtError>) {
     if let Some(slot) = probe_gets_slot(signal) {
         slot.fetch_add(1, Ordering::Relaxed);
     }
@@ -1066,7 +1165,7 @@ mod tests {
 
         assert_eq!(err.key, failing);
         assert!(
-            matches!(&err.source, StoreError::Permanent(text) if text == "AccessDenied"),
+            matches!(&err.source, MarkerLookupFailure::Store(StoreError::Permanent(text)) if text == "AccessDenied"),
             "the store error must propagate untouched, got {err:?}"
         );
         assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
@@ -1237,6 +1336,159 @@ mod tests {
             decode_marker(b"RI"),
             Err(MarkerError::Truncated(2))
         ));
+    }
+
+    /// Overwrite the marker at `key` with `bytes`.
+    async fn put_raw(store: &MemoryStore, key: &str, bytes: Vec<u8>) {
+        store
+            .put(
+                key,
+                Bytes::from(bytes),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("overwrite must succeed");
+    }
+
+    /// A marker body at `version` with a valid checksum over its header and
+    /// payload, as a build that writes that version would produce it.
+    fn marker_at_version(version: u16, receipt: &IdempotencyReceipt) -> Vec<u8> {
+        let payload = encode_receipt(receipt).expect("encode");
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&version.to_le_bytes());
+        let crc = crc32c::crc32c_append(crc32c::crc32c(&out), &payload);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    async fn all_keys(store: &MemoryStore) -> Vec<String> {
+        let mut keys: Vec<String> = ravel_object_store::list_all(store, "")
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|meta| meta.key)
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn decode_separates_newer_version_from_corruption() {
+        let good = encode_marker(&receipt(1, "tok")).expect("encode");
+        let mut v2 = good.clone();
+        v2[4..6].copy_from_slice(&2u16.to_le_bytes());
+        // Stale checksum and payload: the version alone decides.
+        assert_eq!(
+            decode_marker(&v2),
+            Err(MarkerError::NewerVersion { found: 2 })
+        );
+        assert_eq!(
+            decode_marker(&marker_at_version(9, &receipt(1, "tok"))),
+            Err(MarkerError::NewerVersion { found: 9 })
+        );
+        let mut v0 = good.clone();
+        v0[4..6].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(decode_marker(&v0), Err(MarkerError::UnsupportedVersion(0)));
+        let mut bad_magic = v2.clone();
+        bad_magic[0] = b'X';
+        assert!(matches!(
+            decode_marker(&bad_magic),
+            Err(MarkerError::BadMagic(_))
+        ));
+        let mut bad_crc = good.clone();
+        let last = bad_crc.len() - 1;
+        bad_crc[last] ^= 0xFF;
+        assert!(matches!(
+            decode_marker(&bad_crc),
+            Err(MarkerError::ChecksumMismatch { .. })
+        ));
+        assert!(matches!(
+            decode_marker(&good[..HEADER_LEN - 1]),
+            Err(MarkerError::Truncated(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn newer_marker_refuses_retryably_and_ingests_nothing() {
+        let _probes = PROBE_GETS_COUNTER.lock().await;
+        let store = MemoryStore::new();
+        let tenant = tenant("acme");
+        let hour = 495_972;
+        let receipt = receipt(7, "v2:token-xyz");
+        write_marker(&store, &tenant, Signal::Logs, b"k-newer", hour, &receipt)
+            .await
+            .expect("write");
+        let key = marker_key(&tenant, Signal::Logs, b"k-newer", hour);
+        // Re-stamp the marker as version 2, checksum valid for that body.
+        put_raw(&store, &key, marker_at_version(2, &receipt)).await;
+
+        let before = all_keys(&store).await;
+        let refusals = idempotency_newer_marker_refusals(Signal::Logs);
+        let err = read_marker(&store, &tenant, Signal::Logs, b"k-newer", hour, 24)
+            .await
+            .expect_err("a newer marker must refuse, not decode as a miss");
+        assert_eq!(err.key, key);
+        assert!(
+            matches!(
+                err.source,
+                MarkerLookupFailure::NewerMarker {
+                    found: 2,
+                    supported: 1
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(err.source.is_newer_marker());
+        assert_eq!(
+            idempotency_newer_marker_refusals(Signal::Logs),
+            refusals + 1
+        );
+        assert_eq!(idempotency_newer_marker_refusals(Signal::Spans), 0);
+        // The lookup is the only thing a keyed request runs before it writes
+        // its data object and commit record; none appeared.
+        assert_eq!(all_keys(&store).await, before);
+        assert!(
+            before.iter().all(|k| k.contains("/idem/")),
+            "only the marker is in the store: {before:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_markers_stay_a_corrupt_outcome_not_a_refusal() {
+        let _probes = PROBE_GETS_COUNTER.lock().await;
+        let store = MemoryStore::new();
+        let tenant = tenant("acme");
+        let hour = 495_972;
+        let receipt = receipt(7, "v2:token-xyz");
+        let key = marker_key(&tenant, Signal::Logs, b"k-corrupt", hour);
+        let refusals = idempotency_newer_marker_refusals(Signal::Logs);
+
+        let mut bad_crc = marker_at_version(1, &receipt);
+        let last = bad_crc.len() - 1;
+        bad_crc[last] ^= 0xFF;
+        let mut bad_magic = marker_at_version(2, &receipt);
+        bad_magic[0] = b'X';
+        let mut version_zero = marker_at_version(0, &receipt);
+        version_zero[9] ^= 1;
+        for body in [
+            bad_crc,
+            bad_magic,
+            version_zero,
+            b"RI".to_vec(),
+            marker_at_version(1, &receipt)[..HEADER_LEN + 3].to_vec(),
+        ] {
+            put_raw(&store, &key, body).await;
+            let outcome = read_marker(&store, &tenant, Signal::Logs, b"k-corrupt", hour, 24)
+                .await
+                .expect("corruption is not a lookup failure");
+            assert_eq!(outcome, LookupOutcome::Corrupt);
+        }
+        assert_eq!(idempotency_newer_marker_refusals(Signal::Logs), refusals);
     }
 
     #[tokio::test]
