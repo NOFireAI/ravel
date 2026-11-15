@@ -28,6 +28,10 @@
 //! runs one one-key pass per distinct value, so the metrics label-value route
 //! issues up to the k = 1 ceiling once per distinct positive equality value
 //! of the statement.
+//!
+//! [`route_metric_statement`] puts the metrics series route (ADR-4146
+//! decisions 3 and 4) in front of the label-value route: see the `series`
+//! module.
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -54,6 +58,13 @@ use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::{Signal, TenantHash};
 
 use crate::phase_accounting::PhaseAccounting;
+
+mod series;
+
+pub use series::{
+    MetricRouting, SERIES_ROUTE_Q_A, SERIES_ROUTE_Q_BC, SERIES_ROUTE_S_MAX, SeriesDecline,
+    SeriesPass, SeriesPassFigures, SeriesRouteFigures, SeriesRouteOptions, route_metric_statement,
+};
 
 /// The most keys one [`KeySet`] holds (ADR-2983 decision 5's k).
 pub const KEY_SET_MAX_KEYS: usize = 1_024;
@@ -571,6 +582,20 @@ async fn route_values_under(
     ceiling: Ceiling,
     totals: &RouteTotals,
 ) -> Result<ValueRouting, RouteError> {
+    route_values_masked(input, plans, None, ceiling, totals).await
+}
+
+/// `part_masks`, when given, holds per plan and per part whether the plan
+/// still needs this route on that part. A value is probed only on the parts
+/// some plan carrying it needs, and is not probed at all, nor reported, when
+/// no plan carrying it needs any part.
+async fn route_values_masked(
+    input: ValueRouteInput<'_>,
+    plans: &[Vec<(&str, &str)>],
+    part_masks: Option<&[Vec<bool>]>,
+    ceiling: Ceiling,
+    totals: &RouteTotals,
+) -> Result<ValueRouting, RouteError> {
     let snapshot = input.snapshot;
     let parts = input.parts;
     if !snapshot.pending_erasure.is_empty() || snapshot.segments.is_empty() {
@@ -585,9 +610,29 @@ async fn route_values_under(
     if !has_leaf {
         return Ok(ValueRouting::unrouted(plans.len()));
     }
+    let needs_part = |plan: usize, part: usize| {
+        part_masks.is_none_or(|masks| masks.get(plan).and_then(|m| m.get(part)) == Some(&true))
+    };
     let mut labels_by_value: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for (label, value) in plans.iter().flatten() {
-        labels_by_value.entry(*value).or_default().insert(*label);
+    // Per value, the parts some plan carrying it needs.
+    let mut value_parts: BTreeMap<&str, Vec<bool>> = BTreeMap::new();
+    for (plan, values) in plans.iter().enumerate() {
+        for (label, value) in values {
+            labels_by_value.entry(*value).or_default().insert(*label);
+            let mask = value_parts
+                .entry(*value)
+                .or_insert_with(|| vec![false; parts.parts.len()]);
+            for (part, needed) in mask.iter_mut().enumerate() {
+                *needed |= needs_part(plan, part);
+            }
+        }
+    }
+    if part_masks.is_some() {
+        labels_by_value.retain(|value, _| {
+            value_parts
+                .get(value)
+                .is_some_and(|mask| mask.iter().any(|needed| *needed))
+        });
     }
     if labels_by_value.is_empty() {
         return Ok(ValueRouting::unrouted(plans.len()));
@@ -610,7 +655,7 @@ async fn route_values_under(
     let passes: Vec<_> = key_sets
         .iter()
         .enumerate()
-        .map(|(i, (_, key_set))| {
+        .map(|(i, (value, key_set))| {
             let pass = RouteInput {
                 catalog: input.catalog,
                 snapshot,
@@ -623,7 +668,10 @@ async fn route_values_under(
                 budget: input.budget,
                 limits: input.limits,
             };
-            async move { (i, route_under(pass, ceiling, totals).await) }
+            let mask = part_masks
+                .and(value_parts.get(*value))
+                .map(Vec::as_slice);
+            async move { (i, route_under_masked(pass, ceiling, totals, mask).await) }
         })
         .collect();
     let mut routed: Vec<_> = futures::stream::iter(passes)
@@ -681,9 +729,12 @@ async fn route_values_under(
             let segments_pruned = pruned[i].iter().filter(|p| **p).count() as u64;
             let segments_pruned_alone = (0..snapshot.segments.len())
                 .filter(|s| {
+                    let part = parts.origin[*s].as_ref().map(|o| o.part as usize);
                     pruned[i][*s]
-                        && plan_values.iter().any(|idx| {
-                            idx.contains(&i) && idx.iter().all(|j| *j == i || !pruned[*j][*s])
+                        && plan_values.iter().enumerate().any(|(plan, idx)| {
+                            part.is_some_and(|part| needs_part(plan, part))
+                                && idx.contains(&i)
+                                && idx.iter().all(|j| *j == i || !pruned[*j][*s])
                         })
                 })
                 .count() as u64;
@@ -728,6 +779,17 @@ async fn route_under(
     ceiling: Ceiling,
     totals: &RouteTotals,
 ) -> Result<(Vec<SegmentRoute>, RouteFigures), RouteError> {
+    route_under_masked(input, ceiling, totals, None).await
+}
+
+/// `part_mask`, when given, leaves every part it marks false out of the pass:
+/// no leaf GET, no part outcome, and its segments [`SegmentRoute::Uncovered`].
+async fn route_under_masked(
+    input: RouteInput<'_>,
+    ceiling: Ceiling,
+    totals: &RouteTotals,
+    part_mask: Option<&[bool]>,
+) -> Result<(Vec<SegmentRoute>, RouteFigures), RouteError> {
     let segment_count = input.snapshot.segments.len();
     if input.parts.origin.len() != segment_count {
         return Err(RouteError::InvalidInput(format!(
@@ -747,6 +809,13 @@ async fn route_under(
             )));
         };
         *slot += 1;
+    }
+    if let Some(mask) = part_mask {
+        for (part, segments) in segments_in_snapshot.iter_mut().enumerate() {
+            if mask.get(part) != Some(&true) {
+                *segments = 0;
+            }
+        }
     }
     let mut figures = RouteFigures {
         keys_probed: input.key_set.keys.len() as u64,
