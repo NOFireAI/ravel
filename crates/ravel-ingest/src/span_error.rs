@@ -42,7 +42,8 @@ pub enum SpanWriteError {
     /// them twice.
     ///
     /// Also the gateway's answer to a keyed write whose idempotency marker
-    /// lookup failed with a store error (issue #2462). No flush ran: the
+    /// lookup failed with a store error (issue #2462) or found a marker
+    /// written by a newer build (issue #4238). No flush ran: the
     /// write was refused before its own data was written, so a retry is safe.
     /// The message is the gateway's fixed client-facing text; the store error
     /// and the marker key go to the gateway's server-side log.

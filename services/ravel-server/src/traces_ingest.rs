@@ -249,10 +249,11 @@ pub async fn handle_export_traces_releasing(
             Ok(LookupOutcome::Corrupt) => {
                 tracing::warn!("idempotency marker found but failed to decode; treating as a miss");
             }
-            // A store error on the lookup, or a lookup past the deadline,
-            // fails the write closed, as in `crate::logs_ingest`: writing
-            // anyway would store a duplicate whenever the marker exists and
-            // the lookup could not see it.
+            // A store error on the lookup, a lookup past the deadline, or a
+            // marker written by a newer build fails the write closed, as in
+            // `crate::logs_ingest`: writing anyway would store a duplicate
+            // whenever the marker exists and the lookup could not see or read
+            // it.
             Err(message) => {
                 return Err(SpanIngestRequestError::Write(SpanWriteError::Abandoned(
                     message,
