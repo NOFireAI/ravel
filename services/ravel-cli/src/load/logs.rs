@@ -1528,7 +1528,8 @@ enum BuildEvent {
     Started,
     /// After the build finished, before its outcome is handed to the
     /// coordinator, so the coordinator cannot emit the batch before this
-    /// fires.
+    /// fires. A build that panics does not fire it; on a worker, a hook that
+    /// panics here fails the decode task as a build panic does.
     Delivered,
 }
 
@@ -1686,8 +1687,13 @@ fn build_worker(
         let Ok((seq, spans)) = job else {
             return;
         };
-        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.build(seq, &spans)));
-        ctx.notify(seq, BuildEvent::Delivered);
+        // The hook runs inside the catch too: a worker that died without
+        // sending a result would leave the coordinator waiting on it.
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let out = ctx.build(seq, &spans);
+            ctx.notify(seq, BuildEvent::Delivered);
+            out
+        }));
         if results.send((seq, out)).is_err() {
             return;
         }
@@ -1704,7 +1710,10 @@ fn build_worker(
 /// window). With a budget, each batch's estimate is charged before its build
 /// is dispatched and stays charged until the batch is emitted with its
 /// measured size, so every batch being built or held for re-sequencing
-/// carries a charge on every path. The first batch is built alone, since no
+/// carries a charge on every path. A build that ends in a terminal outcome
+/// holds no batch, so its charge is refunded when the outcome arrives; the
+/// only charges this thread then holds while it waits are those of batches
+/// that exist or are being built. The first batch is built alone, since no
 /// estimate exists before it; after it the window is also capped at the
 /// number of estimated batches the budget holds. A batch that does not fit
 /// while earlier ones are still building waits for one of them, holding only
@@ -1823,8 +1832,8 @@ impl DecodeCoordinator {
     /// refunds its charge, so no batch that still holds its output is left
     /// uncharged; builds still running are waited for first. Their spans,
     /// and any held ones, are queued for [`Self::rebuild`] in sequence order.
-    /// A terminal outcome holds no batch and stays ready, and nothing after
-    /// it is rebuilt.
+    /// A terminal outcome holds no batch and no charge ([`Self::received`]
+    /// refunded it) and stays ready, and nothing after it is rebuilt.
     fn discard_after(&mut self, seq: u64, builders: &Builders<'_>) {
         while self.building > 0 {
             let Some((done, out)) = builders.recv() else {
@@ -1868,6 +1877,11 @@ impl DecodeCoordinator {
 
     fn received(&mut self, seq: u64, out: Prefetched) {
         if !matches!(out, Prefetched::Batch(_)) {
+            // A terminal outcome holds no batch, so its estimate is refunded
+            // now: the oldest batch's correction must never wait on a charge
+            // only this thread could release.
+            drop(self.charges.remove(&seq));
+            self.dispatched.remove(&seq);
             // Nothing after a terminal outcome is emitted, so stop collecting
             // and drop spans after it that are waiting for a build.
             self.input_ended = true;

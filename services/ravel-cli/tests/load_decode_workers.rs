@@ -16,7 +16,8 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 
 use ravel_cli::load::{
-    self, DEFAULT_DECODE_QUEUE_BATCHES, LOAD_REPORT_JSON_PREFIX, PER_BATCH_TARGET_BYTES,
+    self, DEFAULT_DECODE_QUEUE_BATCHES, DEFAULT_MAX_FLUSH_DELAY, LOAD_REPORT_JSON_PREFIX,
+    PER_BATCH_TARGET_BYTES,
 };
 use ravel_cli::maintain::SignalArg;
 use ravel_ingest::{RlogChunkOrder, RlogGroupTargetBlocks, RlogZstdLevel};
@@ -46,6 +47,14 @@ column = "row"
 type = "i64"
 "#;
 
+/// Rows whose bodies are [`SLOW_BODY_BYTES`] longer. Four cursors deal a
+/// quarter of each batch from each region, so these are the first cursor's
+/// share of batch 1, which then takes longer to build than the batches after
+/// it.
+const SLOW_ROWS: std::ops::Range<i64> = 250..500;
+
+const SLOW_BODY_BYTES: usize = 60 * 1024;
+
 /// Every row distinguishable by its `row` attribute and body, spread over
 /// eight services.
 fn write_fixture(path: &Path) {
@@ -63,9 +72,13 @@ fn write_fixture(path: &Path) {
                 ),
                 (
                     "body",
-                    Arc::new(StringArray::from_iter_values(
-                        row.iter().map(|r| format!("request served id={r:06}")),
-                    )) as ArrayRef,
+                    Arc::new(StringArray::from_iter_values(row.iter().map(|&r| {
+                        if SLOW_ROWS.contains(&r) {
+                            format!("request served id={r:06} {}", "x".repeat(SLOW_BODY_BYTES))
+                        } else {
+                            format!("request served id={r:06}")
+                        }
+                    }))) as ArrayRef,
                 ),
                 (
                     "svc",
@@ -162,8 +175,8 @@ async fn rlog_objects(store: &Arc<dyn ObjectStoreBackend>) -> (Vec<(WriteSlot, [
     (hashes, rows)
 }
 
-/// The flush geometry of one comparison: both keep the memory budget from
-/// placing a flush boundary.
+/// The flush geometry of one comparison: in both, no flush depends on
+/// timing.
 #[derive(Debug, Clone, Copy)]
 enum Geometry {
     /// `--target-bytes` at the per-batch target: every batch flushes on its
@@ -220,7 +233,9 @@ async fn load_with_workers(
         DEFAULT_DECODE_QUEUE_BATCHES,
         Some(decode_workers),
         geometry.target_bytes(),
-        None,
+        // The CLI's 60 s age trigger, not the library's 2 s: an age flush on
+        // a loaded host would place a boundary by wall clock.
+        Some(DEFAULT_MAX_FLUSH_DELAY),
         None,
         RlogZstdLevel::DEFAULT,
         RlogGroupTargetBlocks::DEFAULT,
@@ -237,17 +252,22 @@ async fn load_with_workers(
 }
 
 /// The same file loaded with one decode worker and with four writes the same
-/// objects in the same order when the memory budget places no flush
-/// boundary: the same count, the same rows, and in each shard the object at
-/// each write slot has the same content hash. Run under a per-batch target,
-/// and under the derived target with an explicit `--pipeline-depth` and
-/// `--load-memory-bytes`.
+/// objects in the same order when no flush depends on timing: the same count,
+/// the same rows, and in each shard the object at each write slot has the
+/// same content hash. Run under a per-batch target, and under the derived
+/// target with an explicit `--pipeline-depth`, a `--load-memory-bytes` the
+/// load never fills, and the CLI's age trigger.
 ///
 /// Prove-the-test: in `DecodeCoordinator::run`, emit the lowest ready batch
 /// instead of `ready.remove(&self.next_emit)` (completion order, terminals
-/// still last). Under the per-batch target the four-worker load then writes
-/// the same set of objects in a different order, which the slot comparison
-/// catches and a sorted set of hashes does not.
+/// still last). The four-worker load then writes the same set of objects in a
+/// different order, which the slot comparison catches and a sorted set of
+/// hashes does not, but only when builds finish out of order, which nothing
+/// at this level forces. The [`SLOW_ROWS`] batch makes that likely: the
+/// mutation was caught in 250 of 250 runs on a 4-core aarch64 host, against
+/// 46 of 50 without it. The deterministic proof that the coordinator emits in
+/// deal order is `parallel_cursor_decode_yields_the_serial_batch_sequence` in
+/// the decode unit tests, which holds builds back through the build hook.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_and_four_decode_workers_write_the_same_objects() {
     let (_dir, pq, mapping) = fixture();

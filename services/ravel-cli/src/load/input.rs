@@ -53,7 +53,8 @@ pub(super) fn row_group_row_counts(metadata: &ArrowReaderMetadata) -> Vec<u64> {
 
 /// One `batch_rows` batch's size estimated from the footer before any batch
 /// is built: the row groups' uncompressed bytes per row, rounded up, times
-/// `batch_rows`. 0 for a file with no rows.
+/// `batch_rows` or the file's row count, whichever is smaller. 0 for a file
+/// with no rows.
 pub(super) fn footer_batch_bytes(metadata: &ArrowReaderMetadata, batch_rows: usize) -> u64 {
     let groups = metadata.metadata().row_groups();
     let rows: u64 = groups.iter().map(|rg| rg.num_rows().max(0) as u64).sum();
@@ -64,7 +65,9 @@ pub(super) fn footer_batch_bytes(metadata: &ArrowReaderMetadata, batch_rows: usi
     if rows == 0 {
         return 0;
     }
-    bytes.div_ceil(rows).saturating_mul(batch_rows as u64)
+    bytes
+        .div_ceil(rows)
+        .saturating_mul((batch_rows as u64).min(rows))
 }
 
 /// Resolve `--read-cursors` (issue #560): absent means auto-sized to

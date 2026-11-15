@@ -99,6 +99,29 @@ fn multi_row_group_fixture(groups: usize) -> (tempfile::TempDir, std::path::Path
     (dir, pq, m)
 }
 
+/// The footer's batch estimate is the bytes per row times `--batch-rows`, and
+/// times the file's row count when `--batch-rows` exceeds it: no batch can
+/// hold more rows than the file has.
+///
+/// Prove-the-test: multiply by `batch_rows` alone in `footer_batch_bytes`
+/// and the over-long batch's estimate is 1,000,000 / 8 times the file's.
+#[test]
+fn footer_batch_bytes_caps_the_batch_at_the_files_rows() {
+    let (_dir, pq, _m) = multi_row_group_fixture(8);
+    let metadata = read_input_metadata(&FileInput { path: &pq }).expect("read metadata");
+    let groups = metadata.metadata().row_groups();
+    let bytes: u64 = groups.iter().map(|rg| rg.total_byte_size() as u64).sum();
+    let per_row = bytes.div_ceil(8);
+    assert!(per_row > 0);
+    assert_eq!(footer_batch_bytes(&metadata, 4), 4 * per_row);
+    assert_eq!(footer_batch_bytes(&metadata, 8), 8 * per_row);
+    assert_eq!(
+        footer_batch_bytes(&metadata, 1_000_000),
+        8 * per_row,
+        "a batch holds at most the file's 8 rows"
+    );
+}
+
 /// The load setup parses the input's Parquet footer exactly once, no matter
 /// how many stride cursors it opens.
 ///
