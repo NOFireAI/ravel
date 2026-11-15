@@ -396,17 +396,17 @@ fn data_wire_bytes(stats: &serde_json::Value) -> u64 {
         .sum()
 }
 
-/// How far the striped run's data wire bytes may sit from the fast path's.
+/// How the striped run's data wire bytes relate to the fast path's.
 #[derive(Clone, Copy, Debug)]
 enum Band {
-    /// The footer, trailer and directory bytes of every object: the narrow
-    /// scan opens each object from the probe the plan left in the read cache,
-    /// so the routes differ by no more than the metadata itself.
+    /// Within the footer, trailer and directory bytes of every object: the
+    /// narrow scan opens each object from the probe the plan left in the read
+    /// cache, so the routes differ by no more than the metadata itself.
     FooterAndDirectories,
-    /// One suffix probe per object: the fast path reads each object whole in
-    /// one GET, and the striped scan does the same after its plan has fetched
-    /// the probe under another cache key, so the probe's bytes cross the wire
-    /// twice on that route.
+    /// Exactly one suffix probe per object more: the fast path reads each
+    /// object whole in one GET, and the striped scan does the same after its
+    /// plan has fetched the probe under another cache key, so the probe's
+    /// bytes cross the wire twice on that route.
     OneProbePerObject,
 }
 
@@ -414,14 +414,25 @@ enum Band {
 /// three partitions (striped) returns the fast path's rows at two, and its
 /// plan phase reads each object's footer and four directories through one
 /// suffix probe and nothing else. The striped run's data wire bytes stay
-/// within a band of the fast path's: the objects' footer and directory bytes
-/// for the count, one probe per object for the wide projection ([`Band`]).
+/// within the objects' footer and directory bytes of the fast path's for the
+/// count, and for the wide projection equal the object sizes plus one probe
+/// per object, where the fast path's equal the object sizes ([`Band`]).
+///
+/// The route is read from the plan phase's counters (`segmentsOpened`,
+/// `s3GetRequests`, `s3GetWireBytes`), not from
+/// `stats.timings.planningWaitMaxMs` as `sql_like_contains_e2e.rs` does: the
+/// counters are exact figures a run either matches or not, while
+/// `planningWaitMaxMs` is a wall-clock duration, and asserting it above 0 on
+/// the striped route depends on the plan barrier taking measurable time.
 ///
 /// Seen failing with #4205 reverted: the striped plan also fetched every
 /// column of each object's candidate blocks, four GETs and about 682,000
 /// plan bytes against two probes of 262,144 bytes in all, and with that
 /// assertion lifted the count's striped total sat about 420,000 bytes above
-/// the fast path's against a band of under 1 KiB.
+/// the fast path's against a band of under 1 KiB. Seen failing with the
+/// coverage crossover off (`DEFAULT_LOG_COVERAGE_THRESHOLD` 2.0): the striped
+/// wide scan read by range, 674,584 bytes against 682,008, which a band of one
+/// probe per object either side of the fast path's would have accepted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn like_scan_bytes_are_continuous_across_the_object_count_boundary() {
     let tenant = ingest_tenant().await;
@@ -467,24 +478,30 @@ async fn like_scan_bytes_are_continuous_across_the_object_count_boundary() {
 
         let fast_bytes = data_wire_bytes(&fast.stats);
         let striped_bytes = data_wire_bytes(&striped.stats);
-        let allowance = match band {
-            Band::FooterAndDirectories => footer_and_dirs,
+        match band {
+            Band::FooterAndDirectories => assert!(
+                striped_bytes.abs_diff(fast_bytes) <= footer_and_dirs,
+                "{name}: striped data wire bytes {striped_bytes} within {footer_and_dirs} \
+                 ({band:?}) of the fast path's {fast_bytes}\nfast {}\nstriped {}",
+                fast.stats,
+                striped.stats
+            ),
             Band::OneProbePerObject => {
                 assert_eq!(
                     fast_bytes, sizes,
                     "{name}: the fast path reads each object whole: {}",
                     fast.stats
                 );
-                probes
+                assert_eq!(
+                    striped_bytes,
+                    sizes + probes,
+                    "{name}: the striped route reads each object whole plus its probe \
+                     ({band:?})\nfast {}\nstriped {}",
+                    fast.stats,
+                    striped.stats
+                );
             }
-        };
-        assert!(
-            striped_bytes.abs_diff(fast_bytes) <= allowance,
-            "{name}: striped data wire bytes {striped_bytes} within {allowance} ({band:?}) of \
-             the fast path's {fast_bytes}\nfast {}\nstriped {}",
-            fast.stats,
-            striped.stats
-        );
+        }
     }
 }
 
