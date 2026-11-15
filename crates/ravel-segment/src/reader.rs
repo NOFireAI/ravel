@@ -163,7 +163,11 @@ pub fn classify_trailer(total_size: u64, tail: &[u8]) -> TrailerClass {
 
 /// Result of attempting to locate the footer from a (possibly partial)
 /// suffix of the object.
+// `FooterLocation` (the `Ready` variant) outgrew `NeedRange` once H6 added
+// `unknown_section_kinds`; boxing it would change the public return type for
+// callers in other crates, which is out of scope here.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum FooterOutcome {
     Ready(FooterLocation),
     /// Fetch `object[offset .. offset + len)` (a suffix ending at the

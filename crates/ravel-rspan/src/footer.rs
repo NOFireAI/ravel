@@ -274,7 +274,11 @@ pub fn write_footer_and_trailer(out: &mut Vec<u8>, footer: &SpanFooter) {
 /// protocol): either the footer parsed, or the suffix did not reach the whole
 /// footer and the caller must fetch the named absolute byte range (itself a
 /// true suffix of the object) and call [`open_from_suffix`] again with it.
+// `SpanFooter` (the `Ready` variant) outgrew `NeedRange` once H6 added
+// `unknown_section_kinds`; boxing it would change the public return type of
+// `open_from_suffix` for callers in other crates, which is out of scope here.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum SuffixOutcome {
     /// The footer was fully covered and validated.
     Ready(SpanFooter),

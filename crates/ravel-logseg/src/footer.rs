@@ -519,6 +519,10 @@ pub fn rewrite_trailer_version(bytes: &mut [u8], version: u16) -> Result<(), Log
 /// footer and the caller must fetch the named absolute byte range (itself a
 /// true suffix of the object) and call [`open_from_suffix`] again with it.
 #[derive(Clone, Debug, PartialEq)]
+// `LogFooter` (the `Ready` variant) outgrew `NeedRange` once H6 added
+// `unknown_section_kinds`; boxing it would change the public return type of
+// `open_from_suffix` for callers in other crates, which is out of scope here.
+#[allow(clippy::large_enum_variant)]
 pub enum SuffixOutcome {
     /// The footer was fully covered and validated.
     Ready(LogFooter),
