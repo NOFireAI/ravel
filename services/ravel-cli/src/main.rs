@@ -736,13 +736,17 @@ enum Command {
         /// batches' builds (mapping the rows into columnar batches) run on
         /// this many workers, and the built batches are handed to the shard
         /// writers in the order they were dealt, so the batch sequence is the
-        /// same at any value. The objects written are the same only when the
-        /// memory budget places no flush boundary: with an explicit
-        /// `--pipeline-depth` and `--load-memory-bytes`, or a per-batch
-        /// `--target-bytes`. Otherwise a derived budget shrinks as workers
-        /// raise the memory floor, which can change the memory-derived
-        /// pipeline depth, and the worker count changes when a stalled
-        /// decoder flushes the shard buffers. `1` builds on the decode thread
+        /// same at any value. The objects written are the same at any value
+        /// only when no flush depends on timing: with a per-batch
+        /// `--target-bytes`, or with an explicit `--pipeline-depth`, a
+        /// `--load-memory-bytes` the load never fills, and no shard buffer
+        /// older than `--max-flush-delay`. Otherwise object boundaries depend
+        /// on timing, whatever this value: a decoder waiting on a full budget
+        /// lets the stall flusher, which samples the budget on wall-clock
+        /// time, flush the shard buffers early, so two runs at the same value
+        /// can write different objects; and a budget derived from host memory
+        /// shrinks as workers raise the memory floor, which can change the
+        /// memory-derived pipeline depth. `1` builds on the decode thread
         /// itself, the pipeline before this flag. Defaults to one worker per
         /// four available cores (`available_parallelism / 4`), at least 1,
         /// a starting point derived from the measured CPU share of a load
