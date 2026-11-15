@@ -894,9 +894,11 @@ enum Command {
         /// compaction's own level, so this sets only the load's own objects.
         ///
         /// A page or section is stored compressed only when that is smaller
-        /// than storing it raw. Under `--page-choice exhaustive` a page's
-        /// encoding is chosen by stored size, so the level can change which
-        /// encoding a page keeps. Accepts
+        /// than storing it raw. Whether a string chunk stores its values on
+        /// one row-group dictionary or on per-block pages is chosen by stored
+        /// size under either `--page-choice`, and under `exhaustive` so is
+        /// each page's encoding, so the level can change which form a chunk
+        /// or a page keeps. Accepts
         /// zstd's range, -131072 to 22, and refuses a level outside it. A
         /// metrics or spans load ignores this flag and warns when it is set
         /// to anything but 3.
