@@ -1520,6 +1520,74 @@ async fn migrate_with_the_reencode_flag_reencodes_the_bucket_and_reports_it_migr
     );
 }
 
+/// With the flag on and the bucket's one compaction record naming a part above
+/// the version this build writes, the walk holds the bucket (ADR-4233 decision
+/// 6): the run prints the whole report, then one `held:` line naming the
+/// bucket, the reason and the record, and exits nonzero.
+///
+/// Non-vacuity: map `MigrateHeld` to the plain error again in `migrate_to` and
+/// the exact-output `assert_eq!` fails with nothing printed after the claims
+/// line; return `Ok(())` after printing the held lines and `expect_err` fails.
+#[tokio::test]
+async fn migrate_prints_the_report_and_a_held_line_and_exits_nonzero() {
+    let mem = seed_below_target_compaction().await;
+    let (stamped_key, mut rec) = reencode_bucket_records(mem.as_ref()).await.remove(0);
+    let newer_version = u32::from(ravel_logseg::footer::VERSION) + 1;
+    let mut newer = rec.parts[0].clone();
+    newer.part_index += 1;
+    newer.segment_format_version = newer_version;
+    rec.parts.push(newer);
+    mem.put(
+        &stamped_key,
+        record::encode_compaction(&rec),
+        PutOptions::default(),
+    )
+    .await
+    .expect("overwrite the fixture record");
+    let before = all_objects(mem.as_ref()).await;
+
+    let (result, text) = run_reencode_migrate(
+        mem.clone(),
+        MigrateSwitches {
+            dry_run: false,
+            reencode_compaction_parts: true,
+        },
+        &ClaimOptions::fresh(),
+    )
+    .await;
+
+    let (_, report) = split_claims_line(&text);
+    assert_eq!(
+        report,
+        format!(
+            "{}budget_records: 0 (0 = unlimited)\n\
+             buckets_examined: 1\n\
+             buckets_migrated: 0\n\
+             buckets_blocked: 0\n\
+             records_migrated: 0\n\
+             buckets_reencode_blocked: 0\n\
+             buckets_not_migrated: 0\n\
+             buckets_unwritable_skipped: 0\n\
+             walk_complete: true\n\
+             held: shard 0 hour 100 reason=newer_than_writable record_key={stamped_key:?} \
+             version={newer_version}\n",
+            reencode_report_head(false, true)
+        )
+    );
+    let err = result
+        .expect_err("a held bucket makes migrate exit nonzero")
+        .to_string();
+    assert!(
+        err.contains("migrate held 1 bucket(s) and did not raise the floor"),
+        "{err}"
+    );
+    assert_eq!(
+        all_objects(mem.as_ref()).await,
+        before,
+        "a held re-encode writes nothing"
+    );
+}
+
 /// With the flag on and another process holding the bucket's claim, the
 /// re-encode builds nothing and the bucket is printed as not_migrated with the
 /// claim's reason and the note that the next run, which starts over because

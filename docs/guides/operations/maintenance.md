@@ -1032,6 +1032,14 @@ corruption and is swept as usual. The check reads the trailer only, not the
 footer checksum. Damage confined to the version field therefore reads as an
 unreadable version and holds the bucket.
 
+The query-audit age sweep applies the same hold to the expired audit records
+it would delete. It probes the trailer of every L0 and L1 data object those
+records name, and one object outside this build's reader window holds the
+whole ingest hour: no record or object in that hour is deleted that pass, and
+later hours are still swept. Each held object is counted on the same
+`ravel_maintain_retention_held_out_of_window_objects_total` counter. A corrupt
+audit object is deleted as before.
+
 Compaction holds a live bucket with such an input too, and checks the
 object's content hash to tell an out-of-window object from a corrupt one. See
 [An input outside this build's reader
@@ -1342,6 +1350,40 @@ target on-object format version. One invocation:
    the newest creation time among its records, and the shard range it
    scanned.
 
+Some buckets cannot be carried forward by this build. The walk holds such a
+bucket: it writes nothing there, logs a warning, and goes on to the next
+bucket. Each hold has one of three reasons:
+
+- `input_out_of_window`: an input data object's format version is outside
+  this build's reader window.
+- `newer_than_writable`: a metrics input's commit record, or, for any
+  signal, a part of the compaction record that `--reencode-compaction-parts`
+  would re-encode, is recorded at a format version above the one this build
+  writes.
+- `corrupt_input`: an input data object fails to decode.
+
+A run that held any bucket does not re-audit and does not raise the floor,
+whatever the rest of the walk found. It prints its report, then one line per
+held bucket, and exits nonzero:
+
+```text
+held: shard 0 hour 100 reason=newer_than_writable record_key="t/.../l1.d060aa3a8525ee29.cmt" version=6
+```
+
+The detail after the reason is `object_key=` and `version=` for
+`input_out_of_window`, `record_key=` and `version=` for
+`newer_than_writable`, and `detail=` for `corrupt_input`.
+
+Every listing the walk and its re-audit make is strict. A key under a listed
+prefix that the census cannot address fails the run with an
+`UnaddressableKey` error naming the prefix, the first such key and how many
+there are. Nothing is certified: the walk stops and no floor is raised.
+
+A cursor stored under a tag this build does not know, such as one written by
+a newer build, is left in place. The run walks from the beginning, writes no
+cursor at a budget stop, deletes none when the walk drains, and logs one
+warning.
+
 The budget counts records, not requests, so it does not bound how many
 requests one invocation makes. The walk reads the compaction and rewrite
 records of every sealed, un-tombstoned bucket that it passes, and a
@@ -1357,6 +1399,15 @@ superseded-input rule still deletes them on its own schedule, which is
 storage reclamation and not a correctness precondition.
 
 ### A refused raise
+
+A run that held a bucket also refuses the raise, but it does not reach the
+re-audit and prints no verification line. Its `held:` lines name each bucket
+and reason (see [format migration](#format-migration)). Re-running does not
+clear an `input_out_of_window` or `newer_than_writable` hold under the same
+build: finish the upgrade or roll forward to a build that reads and writes
+the version. A `corrupt_input` hold names a damaged object. A run that failed
+with `UnaddressableKey` certified nothing either, and a re-run fails the same
+way while the key it names is still listed.
 
 A refused raise, reported as "FOUND STRAGGLERS", means that the fresh re-audit
 found objects that still exist below the target, some of which queries still

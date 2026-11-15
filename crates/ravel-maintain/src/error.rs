@@ -251,9 +251,11 @@ pub enum MaintainError {
         detail: String,
     },
     /// An RSEG rewrite input recorded at a format version above the one this
-    /// build writes (ADR-0066 decision 2). Refused before any decode or PUT.
+    /// build writes (ADR-0066 decision 2), or a compaction record a re-encode
+    /// would supersede that names a part recorded above it; `commit_key` is
+    /// then the compaction record's key. Refused before any decode or PUT.
     #[error(
-        "RSEG rewrite input {commit_key:?} is recorded as format version {version}, newer than the current output version {writable}: a rewrite migrates an older object forward and cannot write a version this build does not know, so a newer-than-writable input is refused fail-closed (ADR-0066 decision 2)"
+        "RSEG rewrite input or re-encoded compaction record {commit_key:?} is recorded as format version {version}, newer than the current output version {writable}: a rewrite migrates an older object forward and cannot write a version this build does not know, so a newer-than-writable input is refused fail-closed (ADR-0066 decision 2)"
     )]
     NewerThanWritable {
         commit_key: String,

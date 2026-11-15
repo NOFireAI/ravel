@@ -354,7 +354,8 @@ pub enum MigrateHoldReason {
     /// The input's trailer version is outside this build's reader window.
     InputOutOfWindow { object_key: String, version: u16 },
     /// The input's commit record is stamped at a format version above the one
-    /// this build writes.
+    /// this build writes, or, on the re-encode path, the bucket's compaction
+    /// record (named by `commit_key`) names a part stamped above it.
     NewerThanWritable { commit_key: String, version: u32 },
     /// The input object failed to decode.
     CorruptInput { detail: String },
@@ -2095,16 +2096,48 @@ pub async fn migrate_family(
                             below_target,
                             inputs,
                         }) => {
-                            let outcome =
-                                reencode_compaction_parts(store, clock, config, &bucket).await?;
-                            spent += record_reencode(
-                                &mut report,
-                                shard,
-                                hour,
-                                below_target,
-                                inputs,
-                                outcome,
-                            );
+                            match reencode_compaction_parts(store, clock, config, &bucket).await {
+                                Ok(outcome) => {
+                                    spent += record_reencode(
+                                        &mut report,
+                                        shard,
+                                        hour,
+                                        below_target,
+                                        inputs,
+                                        outcome,
+                                    );
+                                }
+                                // A part above the version this build writes
+                                // holds the bucket, as it does on the L0 path
+                                // (ADR-4233 decision 6).
+                                Err(MaintainError::NewerThanWritable {
+                                    commit_key,
+                                    version,
+                                    ..
+                                }) => {
+                                    let reason = MigrateHoldReason::NewerThanWritable {
+                                        commit_key,
+                                        version,
+                                    };
+                                    tracing::warn!(
+                                        tenant = %tenant_hash.to_hex(),
+                                        signal = ?signal,
+                                        shard,
+                                        ingest_hour = hour,
+                                        reason = reason.name(),
+                                        detail = %reason,
+                                        "migrate held a bucket whose compaction record names a \
+                                         part newer than this build writes; the walk goes on \
+                                         and the floor stays unraised"
+                                    );
+                                    held.push(MigrateHeldBucket {
+                                        shard,
+                                        ingest_hour: hour,
+                                        reason,
+                                    });
+                                }
+                                Err(err) => return Err(err),
+                            }
                         }
                     }
                 }
@@ -5188,6 +5221,9 @@ mod tests {
         /// Delete every commit record in `(shard, hour)`, so a re-audit that
         /// runs after it finds that bucket clean.
         DropCommits { shard: u32, hour: u32 },
+        /// Delete every compaction record in `(shard, hour)`, so a re-audit
+        /// that runs after it finds that bucket's parts gone.
+        DropCompactionRecords { shard: u32, hour: u32 },
         /// Store a key no operation can address.
         InsertForeign(String),
     }
@@ -5248,6 +5284,15 @@ mod tests {
                             .expect("list bucket");
                         for commit_key in listed.commit_keys {
                             self.inner.delete(&commit_key).await?;
+                        }
+                    }
+                    OnCursorDelete::DropCompactionRecords { shard, hour } => {
+                        let bucket = Bucket::new(tenant_hash(), Signal::Metrics, *shard, *hour);
+                        let listed = list_bucket(self.inner.as_ref(), &bucket)
+                            .await
+                            .expect("list bucket");
+                        for record_key in listed.compaction_record_keys {
+                            self.inner.delete(&record_key).await?;
                         }
                     }
                     OnCursorDelete::InsertForeign(foreign) => {
@@ -5372,6 +5417,125 @@ mod tests {
         assert!(
             matches!(&err, MaintainError::MigrateHeld { held, .. } if held.len() == 1),
             "{err}"
+        );
+        let floor =
+            current_floor_from_store(inner.as_ref(), &tenant_hash(), Signal::Metrics, FAMILY)
+                .await
+                .expect("read floor");
+        assert_eq!(floor, None, "a held bucket raises no floor");
+    }
+
+    /// ADR-4233 decision 6 on the re-encode path: a bucket whose one
+    /// compaction record names a part above the version this build writes is
+    /// held with reason `newer_than_writable`, the walk goes on to migrate the
+    /// next bucket, and the run fails with [`MaintainError::MigrateHeld`]. The
+    /// held bucket's compaction record is deleted after the walk, so a re-audit
+    /// would come back clean: a re-encode that held the bucket without
+    /// refusing the floor would raise it.
+    #[tokio::test]
+    async fn a_reencode_part_newer_than_writable_holds_bucket_and_walk_continues() {
+        let inner = Arc::new(MemoryStore::new());
+        provision(inner.as_ref(), 1).await;
+        let target = VERSION_V7 as u32;
+        assert_eq!(
+            crate::rewrite::current_part_version(Signal::Metrics).expect("current"),
+            target,
+            "the fixture's target is the version re-encode writes"
+        );
+        seed_at(inner.as_ref(), 0, 100, 1, "alpha", target).await;
+        seed_at(inner.as_ref(), 0, 100, 2, "beta", target).await;
+        let compacted = crate::compact::compact_bucket(
+            inner.as_ref(),
+            &FixedClock::new(sealed_now_ns_for(100)),
+            &CompactorConfig::default(),
+            &Bucket::new(tenant_hash(), Signal::Metrics, 0, 100),
+        )
+        .await
+        .expect("compact the fixture bucket");
+        assert!(
+            matches!(compacted, crate::CompactionOutcome::Compacted { .. }),
+            "{compacted:?}"
+        );
+        let held_record = {
+            let bucket = Bucket::new(tenant_hash(), Signal::Metrics, 0, 100);
+            let listed = list_bucket(inner.as_ref(), &bucket).await.expect("list");
+            let [key] = listed.compaction_record_keys.as_slice() else {
+                panic!("one compaction record: {listed:?}");
+            };
+            let bytes = inner
+                .get(key, GetRange::Full)
+                .await
+                .expect("get record")
+                .data;
+            let mut rec = record::decode_compaction(&bytes).expect("decode record");
+            assert_eq!(rec.parts.len(), 1, "{rec:?}");
+            rec.parts[0].segment_format_version = target - 1;
+            let mut newer = rec.parts[0].clone();
+            newer.part_index += 1;
+            newer.segment_format_version = target + 1;
+            rec.parts.push(newer);
+            inner
+                .put(key, record::encode_compaction(&rec), PutOptions::default())
+                .await
+                .expect("overwrite the fixture record");
+            key.clone()
+        };
+        seed_at(inner.as_ref(), 0, 101, 3, "gamma", target - 1).await;
+        let store = CursorDeleteStore::new(
+            Arc::clone(&inner),
+            OnCursorDelete::DropCompactionRecords {
+                shard: 0,
+                hour: 100,
+            },
+        );
+        let config = CompactorConfig {
+            reencode_writer_enabled: true,
+            ..CompactorConfig::default()
+        };
+
+        let err = migrate_family(
+            &store,
+            &FixedClock::new(sealed_now_ns_for(101)),
+            &config,
+            tenant_hash(),
+            Signal::Metrics,
+            FAMILY,
+            target,
+            1,
+            MigrateBudget::unlimited(),
+            "test",
+        )
+        .await
+        .expect_err("a held bucket fails the run");
+        assert!(
+            store.fired(),
+            "the injection never ran; the test is vacuous"
+        );
+        let message = err.to_string();
+        let MaintainError::MigrateHeld { held, report } = err else {
+            panic!("expected MigrateHeld, got {message}");
+        };
+        assert_eq!(
+            held,
+            vec![MigrateHeldBucket {
+                shard: 0,
+                ingest_hour: 100,
+                reason: MigrateHoldReason::NewerThanWritable {
+                    commit_key: held_record,
+                    version: target + 1,
+                },
+            }]
+        );
+        assert!(report.walk_complete, "{report:?}");
+        assert_eq!(report.buckets_examined, 2, "{report:?}");
+        assert_eq!(report.buckets_migrated, 1, "{report:?}");
+        assert_eq!(report.reencode_blocked, Vec::new(), "{report:?}");
+        assert_eq!(report.verification, None, "no re-audit ran: {report:?}");
+        assert_eq!(compaction_record_count(inner.as_ref(), 0, 100).await, 0);
+        assert_eq!(compaction_record_count(inner.as_ref(), 0, 101).await, 1);
+        assert!(
+            message.contains("newer_than_writable") && message.contains("shard 0 hour 100"),
+            "the error names the reason and the bucket: {message}"
         );
         let floor =
             current_floor_from_store(inner.as_ref(), &tenant_hash(), Signal::Metrics, FAMILY)
