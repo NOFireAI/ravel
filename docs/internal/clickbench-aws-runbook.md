@@ -469,6 +469,18 @@ objects only; the keys the load adds to the store also hold its commit
 records, so their count is not the denominator. A load report without
 `objects written` fails the box at step `load`.
 
+**Key-index leaves.** A `ravel-cli` or `ravel-server` built after issue #4200
+builds key-index leaves in every fold it runs, and seals a part at every UTC
+day boundary, unless told not to. The published figures were taken with no
+leaf. On such a binary, add `--no-key-index-leaves` to the fold above and
+`--no-fold-key-index-leaves` to the server's flags. The kit does both when the
+binary's `--help` lists the flag. It stamps the fold's choice in the fold
+stamp (`key_index_leaves_flag`, `key_index_leaves_written`); the server's is in
+`server_flags.base_flags`. The box fails at step `fold` when the fold reports
+`key_index_leaves_written` above 0, or, given the flag, reports no such line.
+run.toml's `server_flags_a` and `server_flags_b` may not carry either spelling
+of the server's switch.
+
 ### Declare the typed columns
 
 ```sh

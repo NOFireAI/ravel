@@ -334,12 +334,14 @@ STORE_BUCKET_PREFIX_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$")
 BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$")
 RUN_ID_RE = re.compile(r"^clickbench-([0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+)$")
 # Extra ravel-server flags per arm, appended by box/run.sh after the flags
-# KIT_SET_FLAGS names; an entry repeating one of those is refused.
+# KIT_SET_FLAGS names; an entry repeating one of those is refused. The kit
+# decides the key-index leaf switch for both of its folds (box/run.sh
+# resolve_arm_env and do_fold), so either spelling of it is refused too.
 ARM_FLAG_KEYS = {"A": "server_flags_a", "B": "server_flags_b"}
 KIT_SET_FLAGS = (
     "--store", "--shards", "--listen-http", "--listen-health", "--memory-budget-bytes",
     "--audit-mode", "--audit-text", "--tenant-token-file", "--tenant-hash-unkeyed",
-    "--gcs-bucket",
+    "--gcs-bucket", "--no-fold-key-index-leaves", "--fold-key-index-leaves",
 )
 # For each STAMPED_SETTINGS value, the flag that sets it directly and, for the
 # two SQL pools, the flag on the other pool that resolve_performance_defaults
