@@ -782,10 +782,10 @@ async fn fetch_rows(
         .blocks_fetched
         .add(groups.values().map(BTreeMap::len).sum());
     metrics.segments_fetched.add(groups.len());
-    let groups: Vec<(usize, Vec<(usize, Vec<(usize, usize)>)>)> = groups
+    let groups = groups
         .into_iter()
-        .map(|(segment, blocks)| (segment, blocks.into_iter().collect()))
-        .collect();
+        .map(|(segment, blocks)| (segment, blocks.into_iter().collect::<Vec<_>>()))
+        .collect::<Vec<_>>();
 
     // One open per segment, covering all of its winning blocks, `concurrency`
     // in flight. Built as a `Vec` of not-yet-polled futures for the same

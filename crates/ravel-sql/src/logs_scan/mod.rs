@@ -3125,6 +3125,18 @@ impl RowFetchSource {
         query
     }
 
+    /// One block's [`fetch_blocks`](Self::fetch_blocks), for the read-gate
+    /// tests that re-read a single block.
+    #[cfg(test)]
+    pub(crate) async fn fetch_block(
+        &self,
+        segment: usize,
+        block: usize,
+        rows: &[(usize, usize)],
+    ) -> DFResult<Vec<(usize, LogRecord)>> {
+        self.fetch_blocks(segment, &[(block, rows.to_vec())]).await
+    }
+
     /// Decode the named blocks of one segment through one open of it and
     /// return the records at the named surviving-row positions, paired with
     /// the output position each belongs at.
