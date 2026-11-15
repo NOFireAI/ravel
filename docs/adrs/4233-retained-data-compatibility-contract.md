@@ -611,10 +611,12 @@ For a class A family:
   is extended to refuse the feature in release builds and the Dockerfile.
   The drill window must also be unreachable from a default workspace
   build, where cargo unifies features across everything one invocation
-  builds: `ravel-compat-tests` is kept out of the default workspace
-  members (its own test lane builds it), so `cargo test --workspace` and
-  `cargo clippy --workspace --all-targets` never compile the other crates
-  with a two-wide window. CI's all-features job, which turns every feature
+  builds: `ravel-compat-tests` is listed in the root manifest's `exclude`,
+  so it is its own workspace built by its own CI lane, and the root
+  `members = ["crates/*"]` glob never selects it. `default-members` would
+  not do, since `--workspace` selects every member regardless of it. So
+  `cargo test --workspace` and `cargo clippy --workspace --all-targets`
+  never compile the other crates with a two-wide window. CI's all-features job, which turns every feature
   on by construction, type-checks only and runs no test that asserts a
   window.
   The drill proves the mechanism; the first real bump proves the next
@@ -647,6 +649,7 @@ For a class A family:
 | Flight SQL scan over an object at an unreadable version | the stream ends with a typed error, no partial result |
 | inventory completeness: every format-version constant the workspace exports | each is named in `docs/compatibility.md`; a new constant without a row fails the test |
 | fenced (version 4) provisioning record: reshard and floor raise by the baseline | both succeed and keep fields 8 and 9 at version 4; a record above 4 is refused |
+| unfenced (version 3) provisioning record: reshard and floor raise by the baseline | both stamp 3 and add neither field, so the pre-baseline fence never fires on an unfenced bucket |
 | incomplete listing (`FaultStore` failed page, unaddressable key) | migrate and certify refuse; nothing certified |
 | retention, erasure, legal hold, pinned query and Flight ticket during migrate | held objects counted; pinned inputs keep certify waiting; erasure completes at the active version |
 | retired-reader startup with no, stale, contradicted, or `Current` certificate | refuse, refuse, refuse, start |
@@ -728,8 +731,9 @@ holding versions outside B's read set (decision 1).
   when last written, and a missing heartbeat does not prove a process
   cannot return. The fence makes the answer unnecessary.
 - **Keep "writers always emit N" and enforce readers-first in the operator.**
-  The operator is one way to deploy among several, rolls every tier from one
-  image, and cannot fence a process it does not own. Ordering a rollout
+  The operator is one way to deploy among several, rolls its tiers with no
+  version gate (the gateway, query and maintain tiers from one image, the
+  router from its own), and cannot fence a process it does not own. Ordering a rollout
   stays advice; activation is the enforcement.
 - **Refuse to start when the active version is above the build.** Bricks the
   rollback that must keep serving and holding (the ADR-1746 argument).
