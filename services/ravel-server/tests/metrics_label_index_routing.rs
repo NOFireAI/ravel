@@ -1169,3 +1169,212 @@ async fn the_cumulative_segment_check_counts_segments_resolved_before_the_route(
         "the route pruned the non-holders the check still counts"
     );
 }
+
+/// Adds the three ADR-4146 series fields to the folded part, built with the
+/// catalog's leaf encoders from the series `publish_object` writes: object
+/// `seq` holds series `2 * seq`, and a holder also series `2 * seq + 1`.
+/// Each series is its own class. No fold writes these fields yet.
+async fn add_series_leaves(fixture: &Fixture) {
+    use ravel_catalog::{
+        KeyIndexLeafEntry, KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexPostingEntry,
+        KeyIndexPostingLeafInput, METRICS_CLASS_OBJECTS_FIELD, METRICS_LABEL_VALUE_FIELD,
+        METRICS_SERIES_CLASS_FIELD, METRICS_SERIES_LABEL_FIELD, decode_head, encode_head,
+        encode_key_index_leaf, encode_key_index_posting_leaf, series_label_pair_key8,
+        verify_key_index_leaf,
+    };
+    use ravel_logseg::key_index::{KeyType, key8_i64, key8_str};
+
+    let store = fixture.recorder.as_ref();
+    let head_key = format!(
+        "t/{}/catalog/{}/HEAD",
+        TenantId::new(TENANT).hash().to_hex(),
+        Signal::Metrics.key_prefix()
+    );
+    let current = store.get(&head_key, GetRange::Full).await.expect("HEAD");
+    let mut head = decode_head(&current.data).expect("decode HEAD");
+    assert_eq!(head.parts.len(), 1, "one part");
+    let part = &mut head.parts[0];
+    let label_leaf = part
+        .key_index
+        .iter()
+        .find(|leaf| leaf.field == METRICS_LABEL_VALUE_FIELD)
+        .expect("the fold's label_value leaf")
+        .clone();
+    let label_bytes = store
+        .get(&label_leaf.key, GetRange::Full)
+        .await
+        .expect("label_value leaf")
+        .data;
+    let summary =
+        verify_key_index_leaf(&label_bytes, &KeyIndexLeafLimits::default()).expect("verify");
+    let ordinal_of = |seq: u64| {
+        let key8 = key8_str(&format!("obj{seq}"));
+        summary
+            .entries
+            .iter()
+            .find(|entry| entry.key8 == key8)
+            .unwrap_or_else(|| panic!("object {seq} is in the label_value leaf"))
+            .entry_ordinal
+    };
+    let skey = |series: u64| (series + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 1;
+
+    let mut pairs: BTreeMap<[u8; 8], Vec<u64>> = BTreeMap::new();
+    let mut classes = Vec::new();
+    let mut class_objects = Vec::new();
+    for seq in 0..OBJECTS {
+        let instance = format!("obj{seq}");
+        let object = format!("o{seq}");
+        let mut held = vec![(2 * seq, vec![("instance", instance.as_str())])];
+        if HOLDERS.contains(&seq) {
+            held.push((
+                2 * seq + 1,
+                vec![("instance", TARGET), ("object", object.as_str())],
+            ));
+        }
+        for (series, labels) in held {
+            for (name, value) in [(METRIC_NAME_LABEL, METRIC)].into_iter().chain(labels) {
+                let key8 = series_label_pair_key8(name, value).expect("pair key8");
+                pairs.entry(key8).or_default().push(skey(series));
+            }
+            classes.push(KeyIndexPostingEntry {
+                key8: skey(series).to_be_bytes(),
+                values: vec![series],
+            });
+            class_objects.push(KeyIndexLeafEntry {
+                key8: key8_i64(series as i64),
+                entry_ordinal: ordinal_of(seq),
+                blocks: vec![0],
+            });
+        }
+    }
+    let series_label: Vec<KeyIndexPostingEntry> = pairs
+        .into_iter()
+        .map(|(key8, mut skeys)| {
+            skeys.sort_unstable();
+            KeyIndexPostingEntry {
+                key8,
+                values: skeys,
+            }
+        })
+        .collect();
+
+    let part_blake3: [u8; 32] = part.blake3.as_slice().try_into().expect("32-byte hash");
+    let uncovered = &summary.header.uncovered_entry_ordinals;
+    let mut encoded = Vec::new();
+    for (field, key_type, postings) in [
+        (METRICS_SERIES_LABEL_FIELD, KeyType::Bytes, &series_label),
+        (METRICS_SERIES_CLASS_FIELD, KeyType::Id16, &classes),
+    ] {
+        let leaf = encode_key_index_posting_leaf(
+            &KeyIndexPostingLeafInput {
+                tenant_hash: TenantId::new(TENANT).hash(),
+                signal: Signal::Metrics,
+                part_blake3,
+                part_entry_count: part.entry_count,
+                field,
+                key_type,
+                key8_lo: 0,
+                key8_hi: u64::MAX,
+                uncovered_entry_ordinals: uncovered,
+                postings,
+            },
+            &KeyIndexLeafLimits::default(),
+        )
+        .expect("encode posting leaf");
+        encoded.push((field, leaf));
+    }
+    let leaf = encode_key_index_leaf(
+        &KeyIndexLeafInput {
+            tenant_hash: TenantId::new(TENANT).hash(),
+            signal: Signal::Metrics,
+            part_blake3,
+            part_entry_count: part.entry_count,
+            field: METRICS_CLASS_OBJECTS_FIELD,
+            key_type: KeyType::I64,
+            key8_lo: 0,
+            key8_hi: u64::MAX,
+            uncovered_entry_ordinals: uncovered,
+            entries: &class_objects,
+        },
+        &KeyIndexLeafLimits::default(),
+    )
+    .expect("encode class_objects leaf");
+    encoded.push((METRICS_CLASS_OBJECTS_FIELD, leaf));
+
+    let (dir, _) = label_leaf.key.rsplit_once('/').expect("leaf key directory");
+    for (field, leaf) in encoded {
+        let key = format!("{dir}/series.{field}.kidx");
+        store
+            .put(&key, Bytes::from(leaf.bytes), PutOptions::create_if_absent())
+            .await
+            .expect("put series leaf");
+        part.key_index.push(ravel_proto::catalog::v1::SnapshotKeyIndexLeafRef {
+            key,
+            ..leaf.leaf_ref
+        });
+    }
+    store
+        .put(
+            &head_key,
+            Bytes::from(encode_head(&head).expect("encode HEAD")),
+            PutOptions {
+                mode: ravel_object_store::PutMode::CasVersion(current.version),
+                checksum: None,
+            },
+        )
+        .await
+        .expect("add the series refs");
+}
+
+/// ADR-4146 R2 reachability: `/api/v1/query_range` reaches the metrics
+/// resolve's series route. Over a part carrying the series fields, the
+/// series route answers the plan before the label-value route runs, prunes
+/// every non-holder, renders its pass rows, and the answer is bit-identical
+/// to the unrouted run.
+#[tokio::test]
+async fn promql_query_range_reaches_the_series_route() {
+    let _serial = SERIAL.lock().await;
+    let query = format!("{METRIC}{{instance=\"{TARGET}\"}}");
+    let now = Some(now_ns());
+    let off = serve(Setup {
+        now,
+        ..Setup::default()
+    })
+    .await;
+    let unrouted = off.query_range(&query).await;
+    let on = serve(Setup {
+        label_index: true,
+        now,
+        ..Setup::default()
+    })
+    .await;
+    add_series_leaves(&on).await;
+    let (code, routed) = on
+        .query_range_under(&query, ravel_query::EngineConfig::default())
+        .await;
+    assert_eq!(code, StatusCode::OK, "{routed}");
+
+    let non_holders = OBJECTS - HOLDERS.len() as u64;
+    assert_eq!(stat(&routed, "segmentsPrunedBySeriesIndex"), non_holders);
+    assert_eq!(stat(&routed, "segmentsPrunedByLabelIndex"), 0);
+    assert_eq!(stat(&unrouted, "segmentsPrunedBySeriesIndex"), 0);
+    assert_eq!(matrix(&routed), matrix(&unrouted), "routing changes no answer");
+    assert_eq!(matrix(&routed).len(), HOLDERS.len());
+
+    let stats = &routed["data"]["stats"];
+    assert_eq!(stats["seriesIndex"]["plansRouted"], 1, "{stats}");
+    assert_eq!(stats["seriesIndex"]["planPartsAnswered"], 1, "{stats}");
+    let rows = stats["seriesIndexPasses"].as_array().expect("pass rows");
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|row| row["pass"].as_str().expect("pass name"))
+        .collect();
+    assert_eq!(names, ["A", "B", "C"]);
+    let pass_gets: u64 = rows
+        .iter()
+        .map(|row| row["leafGetRequests"].as_u64().expect("leafGetRequests"))
+        .sum();
+    assert!(rows.iter().all(|row| row["partsProbed"] == 1), "{stats}");
+    let [gets, _, _] = key_index_figures(&routed);
+    assert_eq!(pass_gets, gets, "every leaf GET is a series pass's");
+}
