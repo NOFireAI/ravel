@@ -1083,13 +1083,16 @@ directory crc, so the first GET needs no probe), `bucket_bits`,
                                    cannot change header_len; the ref's copy
                                    sizes GET 1, this one is authoritative)
   header      KeyIndexLeafHeader protobuf (ravel.catalog.v1): format_version
-              (2; 1 before the leaf format version 2 amendment), tenant_hash (16), signal, part_blake3 (32), field,
+              (2, or 3 for a metrics leaf; 1 before the leaf format version 2 amendment), tenant_hash (16), signal, part_blake3 (32), field,
               key_type, key8_lo, key8_hi, bucket_bits,
               entry_count (index entries in this leaf's body),
               part_entry_count (the covered part's SnapshotEntry count;
               coverage = part_entry_count minus the uncovered ordinals),
               repeated uncovered_entry_ordinals (each below
-              part_entry_count), body_len
+              part_entry_count), body_len,
+              entry_kind (field 14; 0 entry, 1 posting; non-zero only at
+              format_version 3, see "Version 3 and the posting entry
+              kind" below)
   u32 LE      header_crc32c       (over magic, header_len, prefix_len and
                                    header)
   u32 LE      ends[2^bucket_bits] (cumulative bucket ends, relative to body)
@@ -1101,13 +1104,18 @@ directory crc, so the first GET needs no probe), `bucket_bits`,
               the body ceiling before the buffer is allocated; the
               decompressed length must equal it exactly),
               u32 LE frame_crc32c (over the zstd bytes),
-              zstd entries[entry_count]:
+              zstd entries[entry_count] (entry_kind 0):
                 key8 [8]
                 uvarint entry_ordinal      (part-local SnapshotEntry ordinal)
                 uvarint block_count        (>= 1)
                 uvarint block_delta[block_count]  (strictly ascending block
                                                    ordinals, delta-coded from
                                                    -1, so every delta >= 1)
+              or zstd postings[entry_count] (entry_kind 1, version 3 only):
+                key8 [8]
+                uvarint count              (>= 1)
+                uvarint delta[count]       (strictly ascending u64 values,
+                                            delta-coded from -1)
 ```
 
 Within a bucket, entries are sorted ascending by `(key8, entry_ordinal)`
@@ -1130,9 +1138,10 @@ counted in `ravel_catalog_isolation_breach_total`, with no fallback: the
 lookup fails. A leaf whose header `part_blake3` differs from the part's hash
 in the HEAD it resolved, or whose `format_version` it does not support, is
 rejected and the reader treats the part as uncovered for that field. The
-writer writes version 2 (`KEY_INDEX_LEAF_FORMAT_VERSION`); the reader
-accepts 2 for every signal and 1 for every signal except logs
-(`key_index_leaf_version_accepted`,
+entry writer writes version 2 (`KEY_INDEX_LEAF_FORMAT_VERSION`); the reader
+accepts 2 for every signal, 3 for metrics only
+(`KEY_INDEX_LEAF_FORMAT_VERSION_3`), and 1 for every signal except logs
+(`key_index_leaf_version_accepted`, `key_index_leaf_versions_for_signal`,
 `crates/ravel-catalog/src/snapshot_format/kidx.rs`). A logs leaf at
 version 1 was built before the leaf build listed a version 1 RLOG KEY_IDX
 section as uncovered, so it can prove absent a key such an entry holds; a
@@ -1488,6 +1497,72 @@ fold with both switches on writes for the same part, byte for byte
 (`a_rebuilt_metrics_leaf_is_byte_identical_to_the_folds_leaf`). The PromQL
 resolve routes through the metrics leaf (docs/query-engine.md, "The
 label-value route").
+
+**Version 3 and the posting entry kind (ADR-4146 decision 5).** Leaf
+format version 3 (`KEY_INDEX_LEAF_FORMAT_VERSION_3`) adds the header's
+`entry_kind` (field 14, under `header_crc32c`) and a second body shape,
+the posting (entry kind 1, the layout above): `(key8, count, delta[count])`,
+a strictly ascending list of `u64` values delta-coded from -1, one posting
+per `key8`. Version 3 is accepted for metrics only; a logs or spans leaf
+at 3 is `UnsupportedVersion`. A version 3 leaf of entry kind 0 means
+exactly what a version 2 leaf means. ADR-4146 decision 1 names three
+metrics fields, each with the kind it carries
+(`key_index_field_entry_kind`):
+
+| Field | Key type | Entry kind |
+|---|---|---|
+| `series_label` (`METRICS_SERIES_LABEL_FIELD`) | `Bytes` | 1, the ascending series keys carrying one label pair |
+| `series_class` (`METRICS_SERIES_CLASS_FIELD`) | `Id16` | 1, a one-element posting of the series' class ordinal |
+| `class_objects` (`METRICS_CLASS_OBJECTS_FIELD`) | `I64` | 0, `(key8, entry_ordinal, {0})` |
+
+Every other field, `label_value` and every logs and spans field included,
+carries kind 0. A `series_label` key is `key8_bytes` of the pair
+`u16_le(len(name)) name u16_le(len(value)) value`, with the metric name as
+the pair (`__name__`, name); `series_label_pair_bytes` and
+`series_label_pair_key8` are the one encoding the fold and the router
+share, and a name or value longer than `u16::MAX` bytes is refused. The
+reader checks the kind in GET 1, before any frame is read, in this order
+after the version gate: an `entry_kind` other than 0 or 1 is `Corrupted`;
+a non-zero `entry_kind` below version 3 is `Corrupted`; then, after the ref
+copies, the part binding and the request's field, a kind other than the
+one the header's own signal and field carry is
+`KeyIndexLeafRejection::EntryKindMismatch`, which makes the part read as
+uncovered for that field like every other rejection. The kind-0 decoders
+(the single-key probe, the set probe and `verify_key_index_leaf`'s entry
+pass) refuse a posting leaf the same way, and the posting decoders refuse a
+kind-0 leaf.
+
+A kind-1 frame's decode bound is `posting_decoded_bound`,
+`16 x uncompressed_len + 64` bytes; `decoded_bound` stays as it is for
+kind 0, and the set decoder reserves the posting bound for a posting
+frame. A posting is at least 10 wire bytes and decodes to a 32-byte entry
+plus 8 bytes per value, so the peak is the postings beside the matches a
+probe copies out (test
+`posting_decoded_bound_dominates_the_adversarial_frame`, which measures
+the most postings per byte and one posting of 4,000 one-byte deltas).
+Before it allocates, the decoder refuses a frame declaring more than
+`uncompressed_len / 10` postings, a zero `count`, and a `count` that
+leaves less than one byte per delta or less than 10 bytes for each posting
+still to come; each list is allocated at exactly its `count` (test
+`posting_count_is_checked_before_its_list_is_allocated`). A posting frame
+is also `Corrupted` for a zero or overflowing delta, postings unsorted or
+repeated by `key8`, a `key8` outside the slice or in the wrong bucket, and
+bytes past the last posting. The encoder (`encode_key_index_posting_leaf`,
+`encode_key_index_posting_leaf_with_bucket_bits`) writes version 3 and
+refuses a field that does not carry kind 1, an empty or unsorted posting,
+a repeated `key8`, and a posting whose first value is `u64::MAX`, which a
+delta from -1 cannot encode; the kind-0 encoder refuses a posting field.
+`split_key_index_postings` cuts a posting list into slices under the body
+ceiling as `split_key_index_entries` does for entries. `inspect kidx`
+prints the `entry_kind` and, with `--entries`, every posting's bucket,
+`key8` and values.
+
+No production caller reads or writes a version 3 leaf yet: no fold builds
+the three fields (ADR-4146's fold step writes them behind its own switch)
+and no router reads them (its series route step). What production reaches
+today is the version gate and the `entry_kind` checks every prefix parse
+runs, and `inspect kidx`. The readers-before-writers order of decision 5
+governs the rollout.
 
 **Incremental tail build (ADR-3692 decision 5, ADR-3939 decision 5).** The
 tail part is re-encoded on every fold that advances the watermark, and a
