@@ -2053,7 +2053,7 @@ mod tests {
         );
         assert!(collected.is_empty(), "nothing is collected on a refusal");
 
-        // In budget: the matched exemplar is served, provenance and all.
+        // In budget: the matched exemplar is served unchanged.
         let ample = Arc::new(ravel_memory::MemoryBudget::new(64 * 1024 * 1024));
         let state = build_state_with_budget(backend, &ample);
         let accounting = QueryAccounting::new();
