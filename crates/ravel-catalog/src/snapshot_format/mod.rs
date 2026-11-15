@@ -51,9 +51,9 @@ pub use kidx::{
     split_key_index_postings, verify_key_index_leaf, verify_key_index_leaf_frames,
     verify_key_index_posting_leaf_frames,
 };
-pub use part::{DecodedPart, decode_part, decode_part_header, encode_part, encode_part_ranged};
 #[cfg(test)]
 pub use part::encode_part_ranged_unvalidated;
+pub use part::{DecodedPart, decode_part, decode_part_header, encode_part, encode_part_ranged};
 pub use postings::{
     DecodedPostings, NamePostings, decode_postings, decode_postings_header, encode_postings,
     postings_declared_tenant_hash,

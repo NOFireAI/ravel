@@ -2261,7 +2261,8 @@ read set:
 - the previous `.npost` on a from-scratch postings rebuild, by a ranged GET
   of its envelope prefix, which holds its only version;
 - each `.cstat` no statistics baseline reads, by a full GET and decode, since
-  a column's `declared_type` is in the body;
+  a column's `declared_type` is in the body
+  (`newer_cstat_on_a_dirty_hour_fails_the_cycle`);
 - every `.kidx` leaf, by a ranged GET of its header prefix (a full GET when
   the ref's `prefix_len` is malformed), whether or not a carry later reads it
   (`newer_kidx_leaf_on_a_rebuilt_fold_with_the_switch_on_fails_the_cycle`);

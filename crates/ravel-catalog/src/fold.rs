@@ -2769,9 +2769,7 @@ async fn fetch_carried_leaf(
         .get(&leaf.key, GetRange::Full)
         .await
         .map_err(|e| match e {
-            StoreError::NotFound => {
-                CarryFailure::Unusable(format!("leaf {} GET: {e}", leaf.key))
-            }
+            StoreError::NotFound => CarryFailure::Unusable(format!("leaf {} GET: {e}", leaf.key)),
             e => CarryFailure::Store(e),
         })?;
     // The envelope version comes before the frame checks (ADR-4233 H1, finding
@@ -6325,8 +6323,9 @@ impl Catalog {
         leaf: &SnapshotKeyIndexLeafRef,
         counters: &mut RequestCounters,
     ) -> Result<(), CatalogError> {
-        let range = key_index_leaf_prefix_range(leaf)
-            .map_or(GetRange::Full, |range| GetRange::Range(range.start, range.end));
+        let range = key_index_leaf_prefix_range(leaf).map_or(GetRange::Full, |range| {
+            GetRange::Range(range.start, range.end)
+        });
         let Some(data) = self.peek_get(&leaf.key, range, counters).await? else {
             return Ok(());
         };
@@ -17009,7 +17008,11 @@ pub(crate) mod tests {
     }
 
     /// The stored bytes of `head.parts[index]`.
-    async fn part_bytes(store: &dyn ObjectStoreBackend, head: &SnapshotHead, index: usize) -> Vec<u8> {
+    async fn part_bytes(
+        store: &dyn ObjectStoreBackend,
+        head: &SnapshotHead,
+        index: usize,
+    ) -> Vec<u8> {
         store
             .get(&head.parts[index].key, GetRange::Full)
             .await
@@ -17054,7 +17057,10 @@ pub(crate) mod tests {
         decoded.entries[0].level = 2;
         let header = decoded.header;
         let relevelled = snapshot_format::encode_part_ranged_unvalidated(
-            header.tenant_hash.try_into().expect("a 16-byte tenant hash"),
+            header
+                .tenant_hash
+                .try_into()
+                .expect("a 16-byte tenant hash"),
             header.signal,
             header.shard_count,
             header.min_hour,
@@ -17062,7 +17068,10 @@ pub(crate) mod tests {
             &decoded.entries,
         )
         .expect("frame the part");
-        assert_eq!(relevelled[4], second[4], "the envelope version is unchanged");
+        assert_eq!(
+            relevelled[4], second[4],
+            "the envelope version is unchanged"
+        );
         replace_part(store.as_ref(), Signal::Logs, &mut head, 1, relevelled).await;
         assert_fold_refuses_newer_part(
             store.as_ref(),
@@ -17396,7 +17405,14 @@ pub(crate) mod tests {
             let store = Arc::new(FaultStore::new(Arc::clone(&case.inner), plan));
             let catalog = Catalog::new(store.clone(), case.config).expect("catalog");
             let report = catalog
-                .fold(&tenant(), case.signal, Uuid::new_v4(), case.now_ns, &[], None)
+                .fold(
+                    &tenant(),
+                    case.signal,
+                    Uuid::new_v4(),
+                    case.now_ns,
+                    &[],
+                    None,
+                )
                 .await
                 .unwrap_or_else(|err| panic!("{}: {err:?}", case.name));
             assert_eq!(
@@ -20260,7 +20276,11 @@ pub(crate) mod tests {
             2 * previous.len(),
             "each previous slice peeked once before any PUT and fetched once"
         );
-        assert_eq!(store.cstat_gets(), 1, "the dirty part's statistics are peeked");
+        assert_eq!(
+            store.cstat_gets(),
+            1,
+            "the dirty part's statistics are peeked"
+        );
         assert_eq!(
             report.newer_part_peek_gets, 13,
             "twelve leaf prefixes and the .cstat: {report:?}"
@@ -20721,7 +20741,11 @@ pub(crate) mod tests {
             vec![(DAY_D - 1, DAY_D - 1, 1), (DAY_D + 21, sealed, 1)]
         );
         assert_eq!(store.gets_of_leaves(&first.parts[0].key_index), 2);
-        assert_eq!(store.cstat_gets(), 1, "the dirty part's statistics are peeked");
+        assert_eq!(
+            store.cstat_gets(),
+            1,
+            "the dirty part's statistics are peeked"
+        );
         assert_eq!(report.key_index_leaf_gets, 1, "{report:?}");
         assert_eq!(
             report.newer_part_peek_gets, 2,
