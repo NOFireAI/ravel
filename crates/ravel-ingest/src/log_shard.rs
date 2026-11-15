@@ -410,9 +410,9 @@ pub fn est_log_records_object_bytes(records: &[NormalizedLogRecord]) -> usize {
 }
 
 /// The writer configuration of an ingest flush. The page choice comes from
-/// [`IngestConfig::rlog_page_choice`]: the server's logs ingest flush estimates
-/// each page's encoding, the bulk loader seals every candidate (ADR-3492
-/// decision 1).
+/// [`IngestConfig::rlog_page_choice`]: the server's logs ingest flush and the
+/// bulk loader estimate each page's encoding by default, and the loader seals
+/// every candidate under `--page-choice exhaustive` (ADR-3492 decision 1).
 fn flush_rlog_config(config: &IngestConfig) -> RlogConfig {
     RlogConfig {
         zstd_level: config.rlog_zstd_level.get(),
