@@ -165,7 +165,8 @@ impl ObjectStoreBackend for Counting {
     }
 }
 
-/// One data object's size and the byte ranges of its four directories.
+/// One data object's size and the byte ranges of its four directories, in the
+/// order STREAM_DIR, FIELD_DIR, SKIP_IDX, PAGE_DIR.
 struct Layout {
     size: u64,
     dirs: Vec<(u64, u64)>,
@@ -268,9 +269,128 @@ async fn data_keys(memory: &MemoryStore) -> BTreeSet<String> {
         .collect()
 }
 
+/// Streams per export in [`wide_tail_export`], each named by 128 pseudo-random
+/// hex characters, so STREAM_DIR is larger than the 128 KiB probe.
+const WIDE_TAIL_STREAMS: usize = 3_000;
+/// Per-record attribute keys in [`wide_tail_export`], each [`FIELD_KEY_LEN`]
+/// pseudo-random characters of a 64-symbol alphabet, so FIELD_DIR also starts
+/// before the probe. Under the 1000-column cap together with the declared
+/// `svc` column.
+const WIDE_TAIL_FIELDS: usize = 900;
+/// Under the logs ingest limit of 256 bytes per attribute key.
+const FIELD_KEY_LEN: usize = 250;
+const FIELD_KEY_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.";
+/// Objects in the [`wide_tail_tenant`] fixture.
+const WIDE_TAIL_OBJECTS: usize = 2;
+
+/// `WIDE_TAIL_STREAMS` streams of two records each, starting at `base_ts_ns`.
+/// Record `i` also carries attribute key `i % WIDE_TAIL_FIELDS`.
+fn wide_tail_export(seed: u64, base_ts_ns: i64) -> ExportLogsServiceRequest {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let fields: Vec<String> = (0..WIDE_TAIL_FIELDS)
+        .map(|_| {
+            (0..FIELD_KEY_LEN)
+                .map(|_| FIELD_KEY_ALPHABET[(next() % 64) as usize] as char)
+                .collect()
+        })
+        .collect();
+    let resource_logs = (0..WIDE_TAIL_STREAMS)
+        .map(|s| {
+            let host: String = (0..8).map(|_| format!("{:016x}", next())).collect();
+            let log_records = (0..2)
+                .map(|r| {
+                    let i = 2 * s + r;
+                    let ts = (base_ts_ns + i as i64) as u64;
+                    LogRecord {
+                        time_unix_nano: ts,
+                        observed_time_unix_nano: ts,
+                        severity_number: 9,
+                        severity_text: "INFO".to_string(),
+                        body: Some(AnyValue {
+                            value: Some(AnyValueVariant::StringValue(format!("row {s} {r}"))),
+                        }),
+                        attributes: vec![
+                            kv(KEY, &format!("s{}", i % 97)),
+                            kv(&fields[i % WIDE_TAIL_FIELDS], "v"),
+                        ],
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![kv("service.name", "web"), kv("host.id", &host)],
+                    ..Default::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records,
+                    schema_url: String::new(),
+                }],
+                ..Default::default()
+            }
+        })
+        .collect();
+    ExportLogsServiceRequest { resource_logs }
+}
+
 /// Writes the tenant's `OBJECTS` objects through a cacheless server, one
-/// export each, then stops that server.
+/// export each, then stops that server. Every directory of every object lies
+/// inside its suffix probe.
 async fn ingest_tenant() -> Tenant {
+    let tenant = ingest(OBJECTS, export).await;
+    for layout in tenant.layouts.values() {
+        let probe = probe_len(layout.size);
+        assert!(
+            layout.size <= 512 * 1024,
+            "every object stays a whole-object read for the default-config whole-part warm: {}",
+            layout.size
+        );
+        assert!(
+            layout
+                .dirs
+                .iter()
+                .all(|&(start, _)| start >= layout.size - probe),
+            "the suffix probe covers all four directories"
+        );
+    }
+    tenant
+}
+
+/// Writes [`WIDE_TAIL_OBJECTS`] objects of [`wide_tail_export`]: each one's
+/// FIELD_DIR starts before its suffix probe, so all four directories, which
+/// precede it in the order SKIP_IDX, PAGE_DIR, STREAM_DIR, FIELD_DIR, are only
+/// partly resident in the probe or not at all.
+async fn wide_tail_tenant() -> Tenant {
+    let tenant = ingest(WIDE_TAIL_OBJECTS, wide_tail_export).await;
+    for layout in tenant.layouts.values() {
+        let probe = probe_len(layout.size);
+        let [stream_dir, field_dir, skip_idx, page_dir] = [0, 1, 2, 3].map(|i| layout.dirs[i]);
+        assert!(
+            skip_idx.1 <= page_dir.0 && page_dir.1 <= stream_dir.0 && stream_dir.1 <= field_dir.0,
+            "directory order: {:?}",
+            layout.dirs
+        );
+        assert!(
+            field_dir.0 < layout.size - probe,
+            "FIELD_DIR at {} starts before the {probe}-byte probe of a {}-byte object",
+            field_dir.0,
+            layout.size
+        );
+    }
+    tenant
+}
+
+/// Writes `objects` objects through a cacheless server, one `export` each,
+/// then stops that server.
+async fn ingest(objects: usize, export: fn(u64, i64) -> ExportLogsServiceRequest) -> Tenant {
     let memory = Arc::new(MemoryStore::new());
     let config = TenantConfig {
         typed_attr_columns: Some(vec![DeclaredTypedColumn {
@@ -303,7 +423,7 @@ async fn ingest_tenant() -> Tenant {
     let client = reqwest::Client::new();
     let base_ts_ns = now_ns();
     let mut keys = Vec::new();
-    for i in 0..OBJECTS {
+    for i in 0..objects {
         let before = data_keys(&memory).await;
         let response = client
             .post(format!("{base}/v1/logs"))
@@ -351,18 +471,6 @@ async fn ingest_tenant() -> Tenant {
             layout.size > BLOCK_RANGE_THRESHOLD && layout.size > probe,
             "every object is above the plan bound and larger than its probe: {}",
             layout.size
-        );
-        assert!(
-            layout.size <= 512 * 1024,
-            "every object stays a whole-object read for the default-config whole-part warm: {}",
-            layout.size
-        );
-        assert!(
-            layout
-                .dirs
-                .iter()
-                .all(|&(start, _)| start >= layout.size - probe),
-            "the suffix probe covers all four directories"
         );
     }
     store.take_gets();
@@ -645,6 +753,74 @@ async fn a_restarted_server_serves_the_first_scan_footers_from_the_warmed_cache(
              whole-part warm's 4 objects whole: {warm_gets:?}"
         );
     }
+}
+
+/// Objects whose directories reach past the suffix probe: the striped route's
+/// plan reads each one's probe, then one coalesced range GET for SKIP_IDX and
+/// PAGE_DIR and one for STREAM_DIR and FIELD_DIR. On a warmed server the first
+/// statement issues none of those GETs, because the metadata pass read the
+/// same three extents under the same keys while the server started.
+///
+/// Seen failing against a pass that reads only the probe
+/// (`fetch_footer` in place of `fetch_plan_directories`): the warmed
+/// statement's directory GETs are 2 per object, not 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_warm_covers_directories_beyond_the_suffix_probe() {
+    let tenant = wide_tail_tenant().await;
+    let (query, partitions) = STRIPED;
+    assert!(partitions > WIDE_TAIL_OBJECTS, "the striped route");
+
+    let cold = tenant.restart(partitions, ROOMY_CACHE_BYTES, false).await;
+    let unwarmed = cold.sql(&tenant, query).await;
+    cold.stop().await;
+    let mut warm = tenant.restart(partitions, ROOMY_CACHE_BYTES, true).await;
+    let warmed = warm.sql(&tenant, query).await;
+    let warm_gets = std::mem::take(&mut warm.warm_gets);
+    warm.stop().await;
+
+    assert_eq!(warmed.rows, unwarmed.rows, "same rows");
+    for run in [&unwarmed, &warmed] {
+        assert_eq!(
+            phase_figure(&run.stats, "plan", "segmentsOpened"),
+            WIDE_TAIL_OBJECTS as u64,
+            "the plan phase opens every object: {}",
+            run.stats
+        );
+    }
+    assert_eq!(
+        (unwarmed.gets.footer_total(), unwarmed.gets.dir_total()),
+        (WIDE_TAIL_OBJECTS, 2 * WIDE_TAIL_OBJECTS),
+        "unwarmed, the statement reads each object's probe and two directory runs: {:?}",
+        unwarmed.gets
+    );
+    assert_eq!(
+        (warmed.gets.footer_total(), warmed.gets.dir_total()),
+        (0, 0),
+        "warmed, no footer GET and no directory GET: {:?}",
+        warmed.gets
+    );
+    assert_eq!(
+        (
+            warm_gets.footer_total(),
+            warm_gets.dir_total(),
+            warm_gets.page_total()
+        ),
+        (WIDE_TAIL_OBJECTS, 2 * WIDE_TAIL_OBJECTS, 0),
+        "the warm-up read each object's probe and two directory runs: {warm_gets:?}"
+    );
+    assert_eq!(
+        (
+            phase_figure(&warmed.stats, "plan", "s3GetRequests"),
+            phase_figure(&warmed.stats, "plan", "cacheHits"),
+        ),
+        (0, 3 * WIDE_TAIL_OBJECTS as u64),
+        "warmed, the plan phase hits the probe and both runs of every object: {}",
+        warmed.stats
+    );
+    assert_eq!(
+        warmed.gets.page, unwarmed.gets.page,
+        "the same column-page GETs as unwarmed"
+    );
 }
 
 /// A read cache too small for the whole tenant: startup still succeeds, the

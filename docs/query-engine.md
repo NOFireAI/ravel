@@ -1342,10 +1342,12 @@ same instance to two more fetch paths:
 - **Cache warmup.** The startup warm pass (`cache_warm::warm_cache`) builds its
   own RSEG and RLOG fetchers, plus the RLOG fetcher of its logs metadata pass
   (see "Startup warm-up of logs metadata"), and wires the process budget into
-  all of them: a warm
-  fetch decodes the part it reads into a buffer held until the fetch returns,
-  so it holds memory beyond the cache insert. A refused warm fetch is skipped
-  like any other warm failure.
+  all of them: a whole-part warm fetch decodes the part it reads into a buffer
+  held until the fetch returns, so it holds memory beyond the cache insert. A
+  refused whole-part warm fetch is skipped like any other warm failure. The
+  metadata pass reserves nothing: its probe and directory reads go through the
+  plan phase's cache-routed section reads, which take no reservation, and the
+  pass bounds itself by its share of the cache budget instead.
 
 So a PromQL query's RSEG and RLOG fetches, on the local or the distributed
 path, the warm pass, the SQL query path's RSEG/RLOG/RSPAN fetches, and the SQL
@@ -7275,47 +7277,83 @@ flighted and corruption-gated per ADR-0046 decisions 3-5.
 ### Startup warm-up of logs metadata
 
 Before `/readyz` latches, `cache_warm::warm_cache` reads the 4 most recent
-parts of each (tenant, signal) whole, then runs a logs metadata pass
-(ADR-4203 decision 8). The pass is not held to the 4-part cap: it
+parts of each (tenant, signal) whole, then, once every tenant's whole-part
+warm has finished, runs a logs metadata pass (ADR-4203 decision 8). The
+order keeps one tenant's pass from spending the deadline a later tenant's
+whole-part warm needs. The whole-part warm is unchanged: it still reads an
+object at or under 512 KiB in one whole-object GET keyed `(0, object_size)`,
+and at the default thresholds (`logs_block_range_threshold` 512 KiB, so
+`plan_whole_object_bound` is at least 512 KiB) that is the key the query
+path reads for such an object, which it opens whole without a probe.
+
+The pass is not held to the 4-part cap: it
 visits every logs object in the warm window, the 24 hours before the tenant's
 latest ingest hour through the end of that hour, most recent first, and skips
 the objects the query path reads whole (at or below
 `LogSegmentFetcher::plan_whole_object_bound`). For each remaining object it
-calls `BlockRangeFetcher::fetch_plan_directories`, the plan phase's own read,
-on a fetcher built with the query path's logs block-range threshold, request
-cost, projection break-even and fetch bound. So the suffix probe lands under
-the key every route looks up first, `(object_size - p, p)` with `p` =
-`derive_suffix_len(object_size)`. When the footer and all four directories
-(STREAM_DIR, FIELD_DIR, SKIP_IDX, PAGE_DIR) fit in that probe, as they do on
-the test objects below, the probe is the only read either route makes before
-its column pages.
-The striped route reads it in the plan phase and again when the scan opens
-the object; the whole-segment fast path reads it when the scan opens the
-object. The pass reads no column page.
+calls `BlockRangeFetcher::fetch_plan_directories`, the plan phase's own
+unkeyed read, on a fetcher built with the query path's logs block-range
+threshold, request cost, projection break-even and fetch bound. It reads the
+suffix probe under the key `(object_size - p, p)` with `p` =
+`derive_suffix_len(object_size)`, then, for the directories the probe does
+not hold whole, one coalesced range read of SKIP_IDX and PAGE_DIR and one of
+STREAM_DIR and FIELD_DIR, each keyed by its own `(offset, len)`. The pass
+reads no column page.
 
-Bounds. The pass runs inside the warm-up's 10-second deadline. It admits an
+Which first statements hit those entries:
+
+- Striped route (more SQL partitions than objects), a `LIKE` whose pushed
+  `Contains` arm plans from the directories: the plan phase's unkeyed
+  directory read finds the probe and both directory reads in the cache, so it
+  issues no GET for an object the pass reached, including one whose
+  directories reach past the probe.
+- Whole-segment fast path, narrow projection: the scan opens the object by
+  range and finds the probe in the cache. When the footer and all four
+  directories fit in the probe that is its only read before the column
+  pages; its own directory reads for sections beyond the probe are not
+  matched against the pass's keys by any test.
+- Whole-segment fast path, wide projection: the scan reads the whole object
+  in one GET with no probe, so the pass's entries do not serve it.
+- A keyed plan (`fetch_keyed_plan`, a statement with key-equality arms) finds
+  the probe, but also reads KEY_IDX and the BLOOM and POSTINGS sections its
+  filter needs, none of which the pass reads. When a BLOOM or POSTINGS
+  section it needs lies outside the probe within the coalesce gap of a
+  missing SKIP_IDX and PAGE_DIR, it is coalesced into the same read, and that
+  read's extent differs from the pass's and misses the cache.
+
+Bounds. The pass runs inside the warm-up's 10-second deadline, in whatever
+time the whole-part warm leaves. It admits an
 object only while the read cache's resident bytes, plus the probes in flight,
 plus its own probe stay within half of `--cache-max-bytes`; the first object
 that does not fit ends the pass for every later tenant too, and startup
-continues. The other half is left for the column pages the first statements
-insert. At most the store GET concurrency's permit count of objects is read
-at once. A failed read skips that object.
+continues. The admission check counts each object's probe length, not the
+directory reads after it, so resident bytes can end above half when
+directories reach past the probe. At most the store GET concurrency's permit
+count of objects is read at once. A failed read skips that object.
 
 The `cache warmup: pass complete` log line reports `metadata_objects_warmed`,
 `metadata_bytes_warmed` (bytes fetched from the store) and
-`metadata_budget_reached` beside `parts_warmed`. When the pass runs, each
-per-(tenant, logs) line carries the first two for that tenant.
+`metadata_budget_reached` beside `parts_warmed`. When the pass runs, a
+`cache warmup: warmed tenant logs metadata` line reports the first two for
+each tenant that has an object above the bound.
 
 `services/ravel-server/tests/cache_warm_footers_e2e.rs` pins this on a
-restarted server over six objects
-(`a_restarted_server_serves_the_first_scan_footers_from_the_warmed_cache`).
-On both routes the first statement issues no footer GET and no directory GET,
-the phase that first opens each object takes one cache hit per object, and
-column-page GETs equal an unwarmed run's. While the server starts, the
-warm-up reads one probe per object, no column page, and only 4 objects
-whole. Two more tests pin the bounds:
-`the_metadata_warm_stops_at_the_cache_budget` (footer GETs equal the objects
-the pass did not reach) and `a_failed_metadata_read_skips_only_that_object`.
+restarted server. Over six objects whose directories fit in the probe
+(`a_restarted_server_serves_the_first_scan_footers_from_the_warmed_cache`),
+on both the striped route and the fast path with a narrow projection, the
+first statement issues no footer GET and no directory GET, the phase that
+first opens each object takes one cache hit per object, and column-page GETs
+equal an unwarmed run's; while the server starts, the warm-up reads one probe
+per object, no column page, and only 4 objects whole. Over two objects whose
+STREAM_DIR and FIELD_DIR start before the probe
+(`the_warm_covers_directories_beyond_the_suffix_probe`), the striped route's
+first statement issues no footer GET and no directory GET, where an unwarmed
+run issues one probe and two directory reads per object. Two more tests pin
+the bounds: `the_metadata_warm_stops_at_the_cache_budget` (footer GETs equal
+the objects the pass did not reach) and
+`a_failed_metadata_read_skips_only_that_object`. In `cache_warm.rs`,
+`a_metadata_pass_that_spends_the_deadline_leaves_later_whole_part_warms_intact`
+pins the order.
 
 See docs/guides/caching.md for CLI flags, metrics, and known gaps, and
 docs/adrs/0046-read-cache-tier.md for the funnel/keying/eviction design
