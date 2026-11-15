@@ -775,7 +775,10 @@ mod tests {
         bytes[0] = POSTINGS_VERSION + 1;
         assert!(matches!(
             PostingsSection::parse(&bytes),
-            Err(LogSegError::Corrupted(_))
+            Err(LogSegError::UnsupportedSectionVersion {
+                section: "POSTINGS",
+                version
+            }) if version == u16::from(POSTINGS_VERSION + 1)
         ));
     }
 
