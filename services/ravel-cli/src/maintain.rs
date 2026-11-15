@@ -15,11 +15,11 @@ use ravel_ingest::Clock as _;
 use ravel_maintain::{
     BlockedBucket, BlockedReason, Bucket, ClaimParticipant, ClaimSkip, ClaimedCompaction,
     CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, GcConfigValues,
-    L1PartMemoryTargetSource, LegalHoldCheck, MergeMemoryTracker, MigrateBudget, MigrationPath,
-    NotMigratedBucket, NotMigratedReason, PublishOutcome, ReencodeBlockedBucket,
-    ReencodeBlockedReason, RequestLedger, ResolvedL1PartMemoryTarget, SweepReport,
-    UnwritableBucket, Verification, census_family, compact_bucket_claimed, count_below_target,
-    migrate_family, sweep_shard,
+    L1PartMemoryTargetSource, LegalHoldCheck, MaintainError, MergeMemoryTracker, MigrateBudget,
+    MigrateHeldBucket, MigrateHoldReason, MigrationPath, NotMigratedBucket, NotMigratedReason,
+    PublishOutcome, ReencodeBlockedBucket, ReencodeBlockedReason, RequestLedger,
+    ResolvedL1PartMemoryTarget, SweepReport, UnwritableBucket, Verification, census_family,
+    compact_bucket_claimed, count_below_target, migrate_family, sweep_shard,
 };
 use ravel_object_store::conformance::NoncurrentVersionSource;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
@@ -2700,6 +2700,12 @@ fn migrate_report_text(
 /// it gets an `unwritable_skipped` line naming the object's key, and any such
 /// line makes the run exit nonzero, however the run ended.
 ///
+/// A bucket the walk holds (ADR-4233 decision 6: an input outside the reader
+/// window, an input or compaction part recorded above the version this build
+/// writes, or an input that fails to decode) is passed over and the walk goes
+/// on. Such a run prints its report, then one `held:` line per held bucket with
+/// its reason, and exits nonzero without raising the floor.
+///
 /// "Until a later run migrates it" below is the next run when this one drained
 /// the walk, since a drained walk clears its cursor. After a budget stop the
 /// cursor is persisted past every bucket this run examined, so the next run
@@ -2826,7 +2832,7 @@ pub async fn migrate_to(
         max_records: budget_records,
     };
 
-    let report: FamilyMigrateReport = migrate_family(
+    let report: FamilyMigrateReport = match migrate_family(
         store.as_ref(),
         &clock,
         &config,
@@ -2839,9 +2845,50 @@ pub async fn migrate_to(
         "ravel-cli maintain migrate",
     )
     .await
-    .map_err(|err| anyhow::anyhow!("migrate failed: {err}"))?;
+    {
+        Ok(report) => report,
+        Err(err) => {
+            // A held run still carries the walk's report; print it and each
+            // held bucket before failing.
+            if let MaintainError::MigrateHeld { held, report } = &err {
+                write!(
+                    out,
+                    "{}{}",
+                    migrate_report_text(tenant, sig, &family, target, budget_records, report),
+                    held_bucket_report(held)
+                )?;
+            }
+            anyhow::bail!("migrate failed: {err}")
+        }
+    };
 
     migrate_verdict(out, tenant, sig, &family, target, budget_records, &report)
+}
+
+/// One `held:` line per bucket a migrate walk held (ADR-4233 decision 6), with
+/// the reason's name and what it names.
+fn held_bucket_report(held: &[MigrateHeldBucket]) -> String {
+    let mut out = String::new();
+    for bucket in held {
+        let detail = match &bucket.reason {
+            MigrateHoldReason::InputOutOfWindow {
+                object_key,
+                version,
+            } => format!("object_key={object_key:?} version={version}"),
+            MigrateHoldReason::NewerThanWritable {
+                commit_key,
+                version,
+            } => format!("record_key={commit_key:?} version={version}"),
+            MigrateHoldReason::CorruptInput { detail } => format!("detail={detail:?}"),
+        };
+        out.push_str(&format!(
+            "held: shard {} hour {} reason={} {detail}\n",
+            bucket.shard,
+            bucket.ingest_hour,
+            bucket.reason.name()
+        ));
+    }
+    out
 }
 
 /// Print a finished migrate run's report and return its exit verdict. A budget
@@ -3695,6 +3742,46 @@ mod tests {
     /// These fixtures build their own `MemoryStore`, which is the explicit
     /// `--store memory` case (issue #1024): an empty result stays a success.
     const MEMORY: StoreSelection = StoreSelection::explicit(StoreKind::Memory);
+
+    /// Each hold reason prints as its `name()` followed by what it names,
+    /// one `held:` line per bucket in the walk's order.
+    #[test]
+    fn held_bucket_report_prints_one_line_per_reason() {
+        let held = vec![
+            MigrateHeldBucket {
+                shard: 0,
+                ingest_hour: 100,
+                reason: MigrateHoldReason::InputOutOfWindow {
+                    object_key: "t/a/d/0.rseg".to_string(),
+                    version: 3,
+                },
+            },
+            MigrateHeldBucket {
+                shard: 1,
+                ingest_hour: 101,
+                reason: MigrateHoldReason::NewerThanWritable {
+                    commit_key: "t/a/c/1.cmt".to_string(),
+                    version: 9,
+                },
+            },
+            MigrateHeldBucket {
+                shard: 2,
+                ingest_hour: 102,
+                reason: MigrateHoldReason::CorruptInput {
+                    detail: "bad magic".to_string(),
+                },
+            },
+        ];
+        assert_eq!(
+            held_bucket_report(&held),
+            "held: shard 0 hour 100 reason=input_out_of_window object_key=\"t/a/d/0.rseg\" \
+             version=3\n\
+             held: shard 1 hour 101 reason=newer_than_writable record_key=\"t/a/c/1.cmt\" \
+             version=9\n\
+             held: shard 2 hour 102 reason=corrupt_input detail=\"bad magic\"\n"
+        );
+        assert_eq!(held_bucket_report(&[]), "");
+    }
 
     /// ADR-3853 core share amendment: N buckets at once each state N as the
     /// unit concurrency, so on 16 cores N = 8 derives level-1 workers from a
