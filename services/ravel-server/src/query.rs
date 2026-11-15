@@ -2199,7 +2199,7 @@ mod catalog_cache_tests {
     /// reserve amendment), not from raw `MemTotal`. On the reference profile the 30,064,771,072
     /// budget resolves to 5% for the catalog cache (1,503,238,553) while the
     /// fetcher cache `store::build_cache` bounds stays at 25%
-    /// (7,516,192,768), so the two independent LRU caches do not each claim
+    /// (7,516,192,768), so the two independent S3-FIFO caches do not each claim
     /// the full share. Since ADR-2023 an explicit `--cache-max-bytes` bounds
     /// the fetcher cache only: the catalog cache keeps deriving its own 5%
     /// share unless `--catalog-cache-max-bytes` is set.

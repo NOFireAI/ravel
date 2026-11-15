@@ -49,10 +49,11 @@
 //! `Utf8View` (`arrow_cast::cast::dictionary::dictionary_cast`) by reusing the
 //! dictionary's values buffer and building views over it. The only string
 //! bytes copied are the ones a view holds inline: all of a value of at most
-//! 12 bytes, and the first 4 bytes of a longer one. That special case takes a row's nulls from its key alone: a valid
-//! key over a NULL dictionary entry becomes a valid view of the entry slot's
-//! bytes, usually `""`, and would group apart from the NULL group (issue
-//! #3521; `the_property_rejects_keys_only_and_empty_as_null_conversions` pins
+//! 12 bytes, and the first 4 bytes of a longer one. That special case takes a
+//! row's nulls from its key alone: a valid key over a NULL dictionary entry
+//! becomes a valid view of the entry slot's bytes, usually `""`, and would
+//! group apart from the NULL group (issue #3521;
+//! `the_property_rejects_keys_only_and_empty_as_null_conversions` pins
 //! that cast's answer). So the cast in reads its input through
 //! [`NullEntriesAsNullKeys`], which nulls every key whose entry is NULL first
 //! (`prop_group_key_views_keep_logical_nulls`); the cast back, from
