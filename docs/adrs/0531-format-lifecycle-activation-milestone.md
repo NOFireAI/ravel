@@ -98,6 +98,9 @@ confirms.
 
 ## Decision
 
+Decisions 1 and 2 are replaced from the baseline release onward; see the
+ADR-4233 amendment below.
+
 1. For the format-lifecycle policy only, "first public release" in ADR-0027
    (decision 7, Status line) and ADR-0066 (decision 1) denotes the **v1.0
    release**, which has not happened. It is distinct from the software's first
@@ -131,6 +134,10 @@ The operator-facing posture edits in the format docs (below) were factual at
 HEAD under either reading and are not affected by the choice.
 
 ## Rollback stance (issue #530 / #1775, the second unlanded bullet)
+
+From the baseline release the irreversible step moves from the first write
+at a new version to the activation of that version; see the ADR-4233
+amendment below.
 
 This is the decision to record, not only a procedure to write. Under the regime
 in force at HEAD (Reading B, point 2 above):
@@ -280,3 +287,24 @@ writes below the floor, counts each such publish under
 floor above the writer means a writer older than the build whose `migrate`
 raised the floor, which across a bump is the rollback the stance above
 already calls unsafe; the policy keeps the floor true when it happens.
+
+## Amendment (2026-11-15, #4233): the window policy starts at a baseline release, with activation
+
+<!-- amendment-applies: sections="Decision|Rollback stance (issue #530 / #1775, the second unlanded bullet)" pointer="ADR-4233 amendment" -->
+
+ADR-4233 replaces decisions 1 and 2 from its baseline release onward (the
+first release that ships ADR-4233 decisions 2 to 5). The reader window no
+longer waits for v1.0: a release that introduces a bulk version N+1 ships
+the reader and the writer for N and N+1, writers keep emitting N until an
+operator activates N+1 in `sys/compat`, and the N reader is dropped only by
+a later release that starts on an ADR-4233 certificate. Releases before the
+baseline keep the history this ADR records: the 0.10.0, 0.12.0, 0.20.0 and
+0.24.0 reader deletions stand, and no bridge is built for the versions they
+retired.
+
+The rollback stance changes with it. A binary rollback is safe while
+nothing is activated above what the older binary reads; the irreversible
+step is the activation, not the install or the first write. After an
+activation an older baseline-or-later binary refuses that family's
+publishes and fails closed on objects it cannot read, and the retention
+version hold keeps them.
