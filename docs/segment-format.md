@@ -66,6 +66,30 @@ per-(tenant, signal) format floor. Support for reading N-1 is deleted only once
 every bucket's recorded floor is >= N, in a separate change that cites those
 floors.
 
+**Writer version and the test-only drill window (ADR-4233 decisions 2 and 9).**
+The window can be two versions wide, and a writer emits the version its caller
+chooses inside it: `write_histograms_with_exemplars_at`,
+`write_v5_with_exemplars_at` and `write_v7_with_provenance_at` take a
+`SegmentVersion`, which can only name a version in the window, while the
+entry points without a version argument emit `SegmentVersion::CURRENT` (7)
+byte for byte as before. The `format-drill` cargo feature, off by default,
+adds the drill version 8, which is version 7's bytes with only the trailer
+version raised and the footer crc recomputed over it; it widens the window to
+{8, 7}, the reader admits both and validates 8 with version 7's rule set.
+The feature exists only for compatibility tests: no default feature set
+includes it, and `scripts/guards/check-release-profile.sh` refuses it in every
+release-built path. Without it the window is version 7 alone and an object
+stamped 8 fails with `UnsupportedVersion(8)`. Tests, in sentence order
+(module `writer::tests` unless named):
+`writer_emits_each_window_version_and_reader_admits_both_under_format_drill`,
+`default_entry_points_emit_the_current_version`, and
+`default_writer_output_matches_the_digest_pinned_before_the_version_parameter`
+in `tests/golden_bytes_v7.rs`; the same drill test and
+`random_batches_round_trip_at_both_window_versions`; the guard's
+`format-drill` cases in `scripts/guards/check-release-profile.test.sh`;
+`default_build_window_is_v7_alone_and_refuses_the_drill_version` and
+`random_batches_under_the_drill_version_are_refused_without_format_drill`.
+
 Parsers treat every offset, length, and count as untrusted input:
 bounds-check everything, fuzz all decoders, return typed errors and never
 panic. No `unsafe`. All integers little-endian. "varint" means
