@@ -2224,8 +2224,9 @@ The load summary prints `decode_wait` and `write_wait` once each, in seconds,
 and the report JSON carries them as `decode_wait_ms` and `write_wait_ms`
 (logs loads only). `decode_wait` is the time the submit loop waited for the
 decode stage's next batch; `write_wait` is the time it spent blocked resolving
-an in-flight write. This change claims no wall-time effect: the build runs on
-W workers, and epic #4203 measures what that buys on a real corpus.
+an in-flight write. No wall-time effect is claimed here: the build runs on W
+workers, and the ClickBench load benchmark measures what that buys on a real
+corpus.
 
 ## Metrics (self-observability)
 
