@@ -674,6 +674,10 @@ fn render_fold_report(
         "key_index_unchanged_section_gets: {}\n",
         report.key_index_unchanged_section_gets
     ));
+    out.push_str(&format!(
+        "newer_part_peek_gets: {}\n",
+        report.newer_part_peek_gets
+    ));
     out.push_str(&format!("head_digest: {}\n", report.head_digest));
     // The same array `--json` carries.
     let retired_hours = serde_json::to_string(&report.retired_hours)
@@ -1793,6 +1797,7 @@ mod tests {
         report.sealed_day_leaf_puts = 5;
         report.sealed_day_previous_leaf_gets = 7;
         report.key_index_unchanged_section_gets = 11;
+        report.newer_part_peek_gets = 13;
         report.head_digest = "ab".repeat(32);
         report.retired_hours = vec![17, 19];
         let render = |json| {
@@ -1813,6 +1818,7 @@ mod tests {
             ("sealed_day_leaf_puts", serde_json::json!(5)),
             ("sealed_day_previous_leaf_gets", serde_json::json!(7)),
             ("key_index_unchanged_section_gets", serde_json::json!(11)),
+            ("newer_part_peek_gets", serde_json::json!(13)),
             ("head_digest", serde_json::json!("ab".repeat(32))),
             ("retired_hours", serde_json::json!([17, 19])),
         ] {
@@ -1825,6 +1831,7 @@ mod tests {
             "sealed_day_leaf_puts: 5".to_string(),
             "sealed_day_previous_leaf_gets: 7".to_string(),
             "key_index_unchanged_section_gets: 11".to_string(),
+            "newer_part_peek_gets: 13".to_string(),
             format!("head_digest: {}", "ab".repeat(32)),
             "retired_hours: [17,19]".to_string(),
         ] {
