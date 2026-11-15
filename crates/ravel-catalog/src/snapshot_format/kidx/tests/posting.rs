@@ -51,12 +51,15 @@ fn posting_probe(
     key8: &Key8,
 ) -> Result<Option<Vec<u64>>, KeyIndexLeafRejection> {
     let prefix_end = (leaf_ref.prefix_len as usize).min(bytes.len());
-    let prefix = KeyIndexLeafPrefix::parse(&bytes[..prefix_end], leaf_ref, request).map_err(
-        |error| match error {
-            KeyIndexLeafError::Rejected(rejection) => rejection,
-            KeyIndexLeafError::Breach(breach) => panic!("breach from an own-tenant leaf: {breach:?}"),
-        },
-    )?;
+    let prefix =
+        KeyIndexLeafPrefix::parse(&bytes[..prefix_end], leaf_ref, request).map_err(|error| {
+            match error {
+                KeyIndexLeafError::Rejected(rejection) => rejection,
+                KeyIndexLeafError::Breach(breach) => {
+                    panic!("breach from an own-tenant leaf: {breach:?}")
+                }
+            }
+        })?;
     let Some(located) = prefix.locate(key8)? else {
         return Ok(None);
     };
@@ -189,7 +192,10 @@ fn series_label_pair_bytes_are_pinned() {
 fn field_entry_kinds_and_their_codes_are_pinned() {
     assert_eq!(KeyIndexEntryKind::Entry.as_u32(), 0);
     assert_eq!(KeyIndexEntryKind::Posting.as_u32(), 1);
-    assert_eq!(KeyIndexEntryKind::from_u32(0), Some(KeyIndexEntryKind::Entry));
+    assert_eq!(
+        KeyIndexEntryKind::from_u32(0),
+        Some(KeyIndexEntryKind::Entry)
+    );
     assert_eq!(
         KeyIndexEntryKind::from_u32(1),
         Some(KeyIndexEntryKind::Posting)
@@ -215,14 +221,29 @@ fn field_entry_kinds_and_their_codes_are_pinned() {
             METRICS_CLASS_OBJECTS_FIELD,
             KeyIndexEntryKind::Entry,
         ),
-        (Signal::Logs, METRICS_SERIES_LABEL_FIELD, KeyIndexEntryKind::Entry),
-        (Signal::Spans, METRICS_SERIES_CLASS_FIELD, KeyIndexEntryKind::Entry),
+        (
+            Signal::Logs,
+            METRICS_SERIES_LABEL_FIELD,
+            KeyIndexEntryKind::Entry,
+        ),
+        (
+            Signal::Spans,
+            METRICS_SERIES_CLASS_FIELD,
+            KeyIndexEntryKind::Entry,
+        ),
         (Signal::Logs, FIELD, KeyIndexEntryKind::Entry),
     ] {
-        assert_eq!(key_index_field_entry_kind(signal, field), want, "{signal:?} {field}");
+        assert_eq!(
+            key_index_field_entry_kind(signal, field),
+            want,
+            "{signal:?} {field}"
+        );
     }
 
-    assert_eq!(key_index_leaf_versions_for_signal(Signal::Metrics), &[1, 2, 3]);
+    assert_eq!(
+        key_index_leaf_versions_for_signal(Signal::Metrics),
+        &[1, 2, 3]
+    );
     assert_eq!(key_index_leaf_versions_for_signal(Signal::Logs), &[1, 2]);
     assert_eq!(key_index_leaf_versions_for_signal(Signal::Spans), &[1, 2]);
 }
@@ -257,7 +278,10 @@ fn posting_leaf_round_trips_through_every_reader() {
     .expect("encode");
 
     let summary = verify_key_index_leaf(&leaf.bytes, &limits).expect("verifies");
-    assert_eq!(summary.header.format_version, KEY_INDEX_LEAF_FORMAT_VERSION_3);
+    assert_eq!(
+        summary.header.format_version,
+        KEY_INDEX_LEAF_FORMAT_VERSION_3
+    );
     assert_eq!(summary.header.entry_kind, 1);
     assert_eq!(summary.entry_kind, KeyIndexEntryKind::Posting);
     assert_eq!(summary.header.entry_count, postings.len() as u64);
@@ -265,7 +289,13 @@ fn posting_leaf_round_trips_through_every_reader() {
     let mut got = summary.postings.clone();
     got.sort_by_key(|p| p.key8);
     assert_eq!(got, postings);
-    assert_eq!(summary.leaf_ref(), SnapshotKeyIndexLeafRef { key: String::new(), ..leaf.leaf_ref.clone() });
+    assert_eq!(
+        summary.leaf_ref(),
+        SnapshotKeyIndexLeafRef {
+            key: String::new(),
+            ..leaf.leaf_ref.clone()
+        }
+    );
 
     let mut streamed = Vec::new();
     verify_key_index_posting_leaf_frames(&leaf.bytes, &limits, |frame| streamed.extend(frame))
@@ -430,7 +460,10 @@ fn posting_splitter_tiles_the_key_space_and_every_slice_encodes() {
     let k = key8_str("len");
     // key8, a one-byte count, deltas 1, 1, 299: 8 + 1 + 1 + 1 + 2.
     assert_eq!(encoded_posting_len(&posting(k, &[0, 1, 300])), 13);
-    assert_eq!(encoded_posting_len(&posting(k, &[u64::MAX - 1])), 8 + 1 + 10);
+    assert_eq!(
+        encoded_posting_len(&posting(k, &[u64::MAX - 1])),
+        8 + 1 + 10
+    );
 
     let postings = posting_fixture();
     let part = part_hash(b"posting part");
@@ -534,11 +567,17 @@ fn posting_encoder_refuses_invalid_input() {
         "a key8 outside the slice",
     );
     for (postings, why) in [
-        (vec![posting(k, &[1]), posting(k, &[2])], "two postings for one key8"),
+        (
+            vec![posting(k, &[1]), posting(k, &[2])],
+            "two postings for one key8",
+        ),
         (vec![posting(k, &[])], "an empty posting"),
         (vec![posting(k, &[2, 1])], "descending values"),
         (vec![posting(k, &[1, 1])], "a repeated value"),
-        (vec![posting(k, &[u64::MAX])], "a posting starting at u64::MAX"),
+        (
+            vec![posting(k, &[u64::MAX])],
+            "a posting starting at u64::MAX",
+        ),
     ] {
         refused(posting_input(part, &postings, &[]), why);
     }
@@ -583,8 +622,8 @@ fn posting_encoder_refuses_invalid_input() {
     // Unsorted input is sorted, and a posting may end at u64::MAX.
     let k2 = key8_str("b");
     let edge = [posting(k2, &[u64::MAX - 1, u64::MAX]), posting(k, &[0])];
-    let leaf = encode_key_index_posting_leaf(&posting_input(part, &edge, &[]), &limits)
-        .expect("encodes");
+    let leaf =
+        encode_key_index_posting_leaf(&posting_input(part, &edge, &[]), &limits).expect("encodes");
     let req = posting_request(&part);
     for p in &edge {
         assert_eq!(
@@ -594,8 +633,10 @@ fn posting_encoder_refuses_invalid_input() {
     }
 }
 
+type HandLeaf = (Vec<u8>, SnapshotKeyIndexLeafRef);
+
 /// A one-bucket kind-1 leaf whose header declares `count` postings.
-fn hand(key8: Key8, count: u32, raw: &[u8]) -> (Vec<u8>, SnapshotKeyIndexLeafRef) {
+fn hand(key8: Key8, count: u32, raw: &[u8]) -> HandLeaf {
     let mut header = posting_header(1);
     header.entry_count = u64::from(count);
     assemble(header, &single_bucket(key8, frame(count, raw)), None)
@@ -619,7 +660,7 @@ fn every_posting_frame_corruption_is_a_typed_rejection() {
     let keys = keys_in_bucket(0, 2);
     let (a, b) = (keys[0], keys[1]);
     let other_bucket = keys_in_bucket(1, 1)[0];
-    let cases: Vec<(&str, (Vec<u8>, SnapshotKeyIndexLeafRef), &str)> = vec![
+    let cases: Vec<(&str, HandLeaf, &str)> = vec![
         (
             "zero count",
             hand(a, 1, &raw_posting_claiming(a, 0, &[1])),
@@ -697,7 +738,11 @@ fn every_posting_frame_corruption_is_a_typed_rejection() {
     // A key8 below the slice: probed with b, which the slice still holds.
     let mut header = posting_header(1);
     header.key8_lo = u64::from_be_bytes(b);
-    let below = assemble(header, &single_bucket(a, frame(1, &raw_posting(a, &[1]))), None);
+    let below = assemble(
+        header,
+        &single_bucket(a, frame(1, &raw_posting(a, &[1]))),
+        None,
+    );
     expect_posting_rejected(&below, &b, "outside the leaf's slice");
 
     // The object cut short mid-frame.
@@ -713,10 +758,8 @@ fn an_entry_kind_the_field_does_not_carry_is_a_typed_rejection() {
     let limits = KeyIndexLeafLimits::default();
     let kind1_frame = frame(1, &raw_posting(k, &[3, 2]));
     let kind0_frame = frame(1, &raw_entry(k, 2, &[4]));
-    let mismatch = |expected: u32, actual: u32| KeyIndexLeafRejection::EntryKindMismatch {
-        expected,
-        actual,
-    };
+    let mismatch =
+        |expected: u32, actual: u32| KeyIndexLeafRejection::EntryKindMismatch { expected, actual };
     assert_eq!(
         mismatch(1, 0).to_string(),
         "leaf header entry_kind is 0, expected 1"
@@ -801,7 +844,8 @@ fn an_entry_kind_the_field_does_not_carry_is_a_typed_rejection() {
         verify_key_index_posting_leaf_frames(&leaf.0, &limits, |_| {}).map(|_| ()),
         Err(mismatch(1, 0))
     );
-    let plan = plan_key_index_leaf_set(&leaf.0[..prefix_len], &leaf.1, &req, &[k], 4).expect("plan");
+    let plan =
+        plan_key_index_leaf_set(&leaf.0[..prefix_len], &leaf.1, &req, &[k], 4).expect("plan");
     let run = plan.runs()[0].clone();
     assert_eq!(
         plan.posting_decoder::<()>().decode_next_run(
@@ -909,10 +953,7 @@ fn posting_decoded_bound_dominates_the_adversarial_frame() {
     let wide = raw_posting(keys[0], &[1; 4_000]);
 
     let mut peaks = Vec::new();
-    for (raw, count, allocations) in [
-        (&many, n as u32, vec![1; n]),
-        (&wide, 1, vec![4_000]),
-    ] {
+    for (raw, count, allocations) in [(&many, n as u32, vec![1; n]), (&wide, 1, vec![4_000])] {
         let leaf = hand(keys[0], count, raw);
         let prefix_len = leaf.1.prefix_len as usize;
         let prefix =

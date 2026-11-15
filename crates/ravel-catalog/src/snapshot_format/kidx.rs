@@ -157,11 +157,18 @@ pub const SERIES_LABEL_METRIC_NAME: &str = ravel_types::METRIC_NAME_LABEL;
 /// value`. The metric name is the pair ([`SERIES_LABEL_METRIC_NAME`],
 /// name). A name or value longer than `u16::MAX` bytes is
 /// [`KeyIndexLeafEncodeError::InvalidInput`].
-pub fn series_label_pair_bytes(name: &str, value: &str) -> Result<Vec<u8>, KeyIndexLeafEncodeError> {
+pub fn series_label_pair_bytes(
+    name: &str,
+    value: &str,
+) -> Result<Vec<u8>, KeyIndexLeafEncodeError> {
     let name_len = u16::try_from(name.len())
         .map_err(|_| invalid(format_args!("label name of {} bytes over u16", name.len())))?;
-    let value_len = u16::try_from(value.len())
-        .map_err(|_| invalid(format_args!("label value of {} bytes over u16", value.len())))?;
+    let value_len = u16::try_from(value.len()).map_err(|_| {
+        invalid(format_args!(
+            "label value of {} bytes over u16",
+            value.len()
+        ))
+    })?;
     let mut out = Vec::with_capacity(4 + name.len() + value.len());
     out.extend_from_slice(&name_len.to_le_bytes());
     out.extend_from_slice(name.as_bytes());
@@ -905,7 +912,9 @@ fn prepare_postings<'a>(
             )));
         }
         if posting.values.is_empty() {
-            return Err(invalid(format_args!("key8 {key:#018x} has an empty posting")));
+            return Err(invalid(format_args!(
+                "key8 {key:#018x} has an empty posting"
+            )));
         }
         if posting.values.windows(2).any(|w| w[0] >= w[1]) {
             return Err(invalid(format_args!(
@@ -2394,9 +2403,7 @@ impl From<KeyIndexSetRunError> for KeyIndexPostingSetAnswer {
                 KeyIndexPostingSetAnswer::Rejected(rejection)
             }
             KeyIndexSetRunError::ReservationRefused { bytes } => {
-                KeyIndexPostingSetAnswer::Declined(KeyIndexSetDecline::ReservationRefused {
-                    bytes,
-                })
+                KeyIndexPostingSetAnswer::Declined(KeyIndexSetDecline::ReservationRefused { bytes })
             }
         }
     }
