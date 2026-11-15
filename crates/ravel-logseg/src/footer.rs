@@ -99,10 +99,14 @@ impl SupportedVersions {
 /// RLOG's supported-version window: `{5}` since ADR-2135, which deleted the
 /// version-4 reader under the same pre-release posture ADR-0892 applied to
 /// version 3, keeping RLOG in line with RSPAN and RSEG. Without the
-/// test-only `format-drill` feature the writer emits `SUPPORTED_VERSIONS.newest()`
-/// and the reader accepts that and nothing else. This is the single source the writer, the reader gate,
-/// `audit-versions`, `migrate`, and the compactor's `OUTPUT_FORMAT_VERSION` all
-/// read.
+/// test-only `format-drill` feature the window is `{VERSION}`: the reader
+/// accepts that and nothing else, and a writer given no version emits
+/// [`WriteVersion::CURRENT`], which equals it. This is the window the reader
+/// gate, `audit-versions` and `migrate` read. A writer chooses its version from
+/// it ([`WriteVersion::new`] refuses anything outside it); under `format-drill`
+/// `newest()` is the drill version while `WriteVersion::CURRENT` stays
+/// `VERSION`, so code that needs "the version this build writes" reads
+/// `WriteVersion::CURRENT`, not `newest()`.
 #[cfg(not(feature = "format-drill"))]
 pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::single(VERSION);
 
