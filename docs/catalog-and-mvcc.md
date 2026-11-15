@@ -2250,18 +2250,38 @@ newer build wrote is refused even when its frames would not verify under this
 build's reader. But the fold also *replaces* previous objects it never reads:
 a from-scratch postings rebuild (a rebuild or a reconcile) writes a fresh
 `.npost` without reading the old one, a `.cstat` is skipped for a dirty hour,
-a rebuild, or an untyped tenant, a `.kidx` carry is abandoned on a ref check
-before any GET (or the leaf switch is off), and an error-triggered rebuild
-stops reading previous `.csnap` parts at the first failure. So before its
-first PUT, for every such previous `.npost`, `.cstat` and `.kidx` object a
-part it does **not** carry forward by reference will drop or replace (and, on
-a rebuild, the `.csnap` parts too), the fold range-GETs the object's version
-prefix and refuses the cycle with the same `NewerPart` on any above its read
-set. That is one ranged GET per dropped or replaced ref
-(`FoldReport.newer_part_peek_gets`). A store error on a peek GET is not a
-newer object: it leaves that object to the read path's own
-graceful-degradation handling, and because the objects are immutable a newer
-one transiently unreadable this tick is refused on the next. A peek refusal,
+a rebuild, or an untyped tenant, a `.kidx` carry may stop before it reads a
+slice (a failed field, a slice past a pass cut, a source sharing no data
+object, or the leaf switch off), and an error-triggered rebuild stops reading
+previous `.csnap` parts at the first failure. So before its first PUT the
+fold peeks every such object of a part it does **not** carry forward by
+reference, and refuses the cycle with the same `NewerPart` on any above its
+read set:
+
+- the previous `.npost` on a from-scratch postings rebuild, by a ranged GET
+  of its envelope prefix, which holds its only version;
+- each `.cstat` no statistics baseline reads, by a full GET and decode, since
+  a column's `declared_type` is in the body;
+- every `.kidx` leaf, by a ranged GET of its header prefix (a full GET when
+  the ref's `prefix_len` is malformed), whether or not a carry later reads it
+  (`newer_kidx_leaf_on_a_rebuilt_fold_with_the_switch_on_fails_the_cycle`);
+- on a rebuild, each `.csnap` part after the one whose read failed, by a full
+  GET and decode, since an entry's level is in the body
+  (`newer_second_part_on_a_rebuilt_fold_fails_the_cycle`).
+
+Every peek GET counts under `FoldReport.newer_part_peek_gets`. A peek GET
+that finds no object leaves nothing newer to drop, and the fold goes on. A
+store error other than `NotFound`, on a peek GET or on the fold's own read of
+a previous `.csnap`, `.npost`, `.cstat` baseline or carried `.kidx` slice,
+fails the cycle with `CatalogError::Store` before any PUT
+(`a_store_error_on_a_dropped_object_fails_the_cycle_before_any_put`): the
+object stays unchecked, and the catalog sweep deletes `snap/` and `idx/`
+objects HEAD no longer names. A previous `.npost` or `.cstat` GET that fails
+that way therefore no longer falls back to a from-scratch rebuild of the
+postings or statistics, and an unreadable previous `.csnap` takes the rebuild
+path only when its GET is `NotFound`, its bytes do not match the HEAD's
+hash, or it fails to decode for a reason other than a newer version
+(`unreadable_previous_part_falls_back_to_rebuild`). A peek refusal,
 and a `.kidx` carry refusal of a single-part fold, come before any PUT and
 leave the store untouched; a `.kidx` carry refusal of a later part comes
 before that part's leaves are PUT but after an earlier re-encoded part's,

@@ -8356,18 +8356,20 @@ pub(crate) mod tests {
         }
     }
 
-    /// Issue #1964: a GET failure on the previous fold's per-part
-    /// column-stats object (`.cstat`), other than `NotFound`, must surface at
-    /// `error!`, naming the key, rather than the quiet `warn!` a genuine
-    /// absence gets. Either way the fold still falls back to rebuilding the
-    /// part's statistics from scratch: the reuse baseline is an optimization,
-    /// never a correctness gate. `ScriptedFault` has no `AccessDenied` kind (a
-    /// `ravel-object-store` testing gap, out of scope here), so `Permanent`
-    /// stands in as a structurally equivalent non-`NotFound` GET failure: the
-    /// fixed code branches on `Err(StoreError::NotFound)` versus every other
-    /// `Err`, not on which variant the "other" arm carries.
+    /// ADR-4233 H1 (#4235): a GET failure on the previous fold's per-part
+    /// column-stats baseline (`.cstat`), other than `NotFound`, fails the
+    /// cycle with `CatalogError::Store` before any PUT. Rebuilding the
+    /// statistics from scratch, as issue #1964's fix did, would publish a
+    /// HEAD that drops an object whose version was never checked. Here the
+    /// tenant has typed columns and the new hour 11 leaves hour 10 clean, so
+    /// the baseline read is the only `.cstat` GET: the fault fires exactly
+    /// once and no peek reads it. `ScriptedFault` has no `AccessDenied` kind,
+    /// so `Permanent` stands in for any non-`NotFound` failure.
+    ///
+    /// Rules out a fix that logs and rebuilds (the fold returns `Ok`), and
+    /// one that fails only after the parts are PUT (the store changes).
     #[tokio::test]
-    async fn cstat_baseline_permanent_failure_logs_at_error() {
+    async fn cstat_baseline_store_error_fails_the_cycle_before_any_put() {
         let inner = MemoryStore::new();
         let plan = FaultPlan::empty().with_rule(
             Rule::new(
@@ -8401,42 +8403,26 @@ pub(crate) mod tests {
 
         publish_logs_segment(store.inner(), 3, 11, &[200, 200]).await;
 
-        let capture = LevelCapture::default();
-        let subscriber = tracing_subscriber::registry().with(capture.clone());
-        let _default = tracing::subscriber::set_default(subscriber);
-
-        let second = catalog
-            .fold(
-                &tenant(),
-                Signal::Logs,
-                Uuid::new_v4(),
-                now_at_seal(11),
-                &[],
-                None,
-            )
-            .await
-            .expect("second fold succeeds despite the faulted baseline read");
-        assert!(!second.rebuilt);
-
-        assert!(
-            store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
-            "the injected fault must actually have fired"
-        );
-        assert!(
-            capture.count_at(
-                tracing::Level::ERROR,
-                "previous per-part column-stats object GET failed"
-            ) >= 1,
-            "a non-NotFound GET failure on the .cstat baseline must log at error!, not warn!: {:?}",
-            capture.lines()
+        assert_fold_fails_on_store_error(
+            store.inner(),
+            &catalog,
+            Signal::Logs,
+            now_at_seal(11),
+            "simulated AccessDenied on idx/*",
+        )
+        .await;
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Permanent),
+            1,
+            "the baseline GET, and only it, was refused"
         );
     }
 
-    /// Counterpart to `cstat_baseline_permanent_failure_logs_at_error`: a
-    /// genuine `NotFound` on the `.cstat` baseline (modeled with
+    /// Counterpart to `cstat_baseline_store_error_fails_the_cycle_before_any_put`:
+    /// a genuine `NotFound` on the `.cstat` baseline (modeled with
     /// `NotFoundBlip`, an eventual-consistency blip rather than a permission
-    /// fault) must still degrade quietly to a `warn!`, exactly as before this
-    /// fix, never an `error!`.
+    /// fault) still degrades quietly to a `warn!` and the fold succeeds,
+    /// never an `error!` or a failed cycle.
     #[tokio::test]
     async fn cstat_baseline_not_found_blip_still_warns_quietly() {
         let inner = MemoryStore::new();
@@ -8503,17 +8489,23 @@ pub(crate) mod tests {
         );
     }
 
-    /// Issue #1964: a GET failure on the previous fold's postings object
-    /// (`.npost`), other than `NotFound`, must surface at `error!`, naming
-    /// the key, rather than the quiet `warn!` a genuine absence gets. Either
-    /// way the fold still falls back to rebuilding postings from scratch:
-    /// reuse is an optimization, never a correctness gate. Uses real metrics
-    /// segments (`publish_real_segment`), not logs: a logs RLOG object never
-    /// decodes as an RSEG, so `build_postings` returns `None` before a
-    /// `.npost` object is ever written, and the reuse path this test targets
-    /// would never be reached.
+    /// ADR-4233 H1 (#4235): a GET failure on the previous fold's postings
+    /// object (`.npost`), other than `NotFound`, fails the cycle with
+    /// `CatalogError::Store` before any PUT. Rebuilding postings from scratch,
+    /// as issue #1964's fix did, would publish a HEAD that drops an object
+    /// whose version was never checked. The fold advances without a rebuild,
+    /// so the merge baseline is the only `.npost` GET: the fault fires
+    /// exactly once and no peek reads it. Uses real metrics segments
+    /// (`publish_real_segment`), not logs: a logs RLOG object never decodes
+    /// as an RSEG, so `build_postings` returns `None` before a `.npost`
+    /// object is ever written, and the reuse path this test targets would
+    /// never be reached.
+    ///
+    /// Rules out a fix that logs and rebuilds from scratch (the fold returns
+    /// `Ok`), and one that fails only after the parts are PUT (the store
+    /// changes).
     #[tokio::test]
-    async fn npost_baseline_permanent_failure_logs_at_error() {
+    async fn npost_baseline_store_error_fails_the_cycle_before_any_put() {
         let inner = MemoryStore::new();
         let plan = FaultPlan::empty().with_rule(
             Rule::new(
@@ -8557,31 +8549,25 @@ pub(crate) mod tests {
         )
         .await;
 
-        let capture = LevelCapture::default();
-        let subscriber = tracing_subscriber::registry().with(capture.clone());
-        let _default = tracing::subscriber::set_default(subscriber);
-
-        let second = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
-            .await
-            .expect("second fold succeeds despite the faulted baseline read");
-        assert!(!second.rebuilt);
-
-        assert!(
-            store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
-            "the injected fault must actually have fired"
-        );
-        assert!(
-            capture.count_at(tracing::Level::ERROR, "previous postings GET failed") >= 1,
-            "a non-NotFound GET failure on the .npost baseline must log at error!, not warn!: {:?}",
-            capture.lines()
+        assert_fold_fails_on_store_error(
+            store.inner(),
+            &catalog,
+            Signal::Metrics,
+            now_2,
+            "simulated AccessDenied on idx/*",
+        )
+        .await;
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Permanent),
+            1,
+            "the baseline GET, and only it, was refused"
         );
     }
 
-    /// Counterpart to `npost_baseline_permanent_failure_logs_at_error`: a
-    /// genuine `NotFound` on the `.npost` baseline (modeled with
-    /// `NotFoundBlip`) must still degrade quietly to a `warn!`, exactly as
-    /// before this fix, never an `error!`.
+    /// Counterpart to `npost_baseline_store_error_fails_the_cycle_before_any_put`:
+    /// a genuine `NotFound` on the `.npost` baseline (modeled with
+    /// `NotFoundBlip`) still degrades quietly to a `warn!` and the fold
+    /// succeeds, never an `error!` or a failed cycle.
     #[tokio::test]
     async fn npost_baseline_not_found_blip_still_warns_quietly() {
         let inner = MemoryStore::new();
@@ -10771,7 +10757,7 @@ pub(crate) mod tests {
     /// (C); a non-tail part's `(min_hour, watermark_hour)` come from its own
     /// entries, not the fold's overall watermark, so this part's `.csnap`
     /// bytes -- and therefore its part hash -- never change no matter how far
-    /// later folds advance. A permanent fault on every `/snap/` GET forces the
+    /// later folds advance. A `NotFound` on every `/snap/` GET forces the
     /// second fold to rebuild from the commit layout (ADR-0063 section 4)
     /// rather than forward the byte-identical part by reference, so it
     /// genuinely re-derives that part's v3 statistics from the two segments a
@@ -10808,10 +10794,7 @@ pub(crate) mod tests {
         let key_a = keys::reconstruct_data_key(&rec_a).expect("key a");
 
         let plan = FaultPlan::empty()
-            .with_rule(
-                Rule::new(Op::Get, ScriptedFault::Permanent("part unreadable".into()))
-                    .with_key_contains("/snap/"),
-            )
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains("/snap/"))
             .with_sequence(
                 Sequence::new(Op::Get)
                     .with_key_contains(key_a.clone())
@@ -11371,16 +11354,16 @@ pub(crate) mod tests {
 
     /// Every snapshot part key contains `/snap/`; a HEAD key never does, so
     /// this rule fails exactly the previous-part reads a later incremental
-    /// fold performs, and nothing else. Simulates a part that has become
-    /// unreadable (e.g. GC raced with a stalled fold) without needing to
-    /// know its content-addressed key ahead of time.
+    /// fold performs, and nothing else. Simulates a part that has gone
+    /// missing (e.g. GC raced with a stalled fold) without needing to know
+    /// its content-addressed key ahead of time. A `NotFound` part leaves
+    /// nothing to drop, so the fold rebuilds; any other store error fails the
+    /// cycle instead (`a_store_error_on_a_dropped_object_fails_the_cycle_before_any_put`).
     #[tokio::test]
     async fn unreadable_previous_part_falls_back_to_rebuild() {
         let inner = MemoryStore::new();
-        let plan = FaultPlan::empty().with_rule(
-            Rule::new(Op::Get, ScriptedFault::Permanent("part unreadable".into()))
-                .with_key_contains("/snap/"),
-        );
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains("/snap/"));
         let store = Arc::new(FaultStore::new(inner, plan));
         let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
 
@@ -11400,7 +11383,7 @@ pub(crate) mod tests {
             .expect("fold falls back to rebuild");
         assert!(second.rebuilt);
         assert_eq!(second.entry_count, 2);
-        assert!(store.fault_count(Op::Get, FaultKind::Permanent) >= 1);
+        assert!(store.fault_count(Op::Get, FaultKind::NotFoundBlip) >= 1);
     }
 
     /// Every data-object key contains `/l0/`
@@ -16315,7 +16298,9 @@ pub(crate) mod tests {
     }
 
     /// ADR-2707's incremental tail build amendment: an advancing fold GETs
-    /// the previous tail's one leaf, reads the KEY_IDX sections of only the
+    /// the previous tail's one leaf (after the pre-PUT peek of its version
+    /// prefix, which `newer_part_peek_gets` counts), reads the KEY_IDX
+    /// sections of only the
     /// two entries that leaf does not cover (two ranged GETs each, the
     /// objects being shorter than the footer suffix), carries the other
     /// three by data object key, and writes the leaf a build from every
@@ -16339,8 +16324,17 @@ pub(crate) mod tests {
         assert_eq!(report.key_index_ranged_gets, 4, "{report:?}");
         assert_eq!(
             gets_containing(&inner, ".kidx"),
-            first.parts[0].key_index.len(),
-            "one GET per previous leaf"
+            2 * first.parts[0].key_index.len(),
+            "per previous leaf, one pre-PUT version peek and one carry GET"
+        );
+        assert_eq!(
+            gets_containing(&inner, ".cstat"),
+            1,
+            "the dirty tail's statistics are peeked, not reused"
+        );
+        assert_eq!(
+            report.newer_part_peek_gets, 2,
+            "the leaf prefix and the .cstat: {report:?}"
         );
         assert_eq!(report.key_index_leaf_gets, 1, "{report:?}");
         assert_eq!(report.key_index_build_passes, 1, "{report:?}");
@@ -16371,25 +16365,27 @@ pub(crate) mod tests {
         );
     }
 
-    /// A previous leaf whose GET fails is not carried: the fold reads every
-    /// entry's section, counts each under `key_index_sections_read`, carries
-    /// nothing, and writes the from-scratch leaf.
+    /// A previous leaf whose carry GET finds no object is not carried: the
+    /// fold reads every entry's section, counts each under
+    /// `key_index_sections_read`, carries nothing, and writes the
+    /// from-scratch leaf. The first `.kidx` GET is the pre-PUT version peek;
+    /// the second is the carry's.
     #[tokio::test]
     async fn a_failed_previous_leaf_get_falls_back_to_section_reads() {
         let inner = recording_store();
         advancing_fixture(&inner).await;
         let plan = FaultPlan::empty().with_rule(
-            Rule::new(Op::Get, ScriptedFault::Permanent("leaf GET refused".into()))
+            Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
                 .with_key_contains(".kidx")
-                .with_occurrence(Occurrence::Nth(1)),
+                .with_occurrence(Occurrence::Nth(2)),
         );
         let store = Arc::new(FaultStore::new(Arc::clone(&inner), plan));
         let catalog = Catalog::new(store.clone(), kidx_config()).expect("catalog");
         let report = advancing_fold(&catalog).await;
         assert_eq!(
-            store.fault_count(Op::Get, FaultKind::Permanent),
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip),
             1,
-            "the previous leaf GET was refused"
+            "the previous leaf's carry GET found no object"
         );
         assert_eq!(report.key_index_leaf_gets, 1, "{report:?}");
         assert_eq!(report.key_index_sections_read, 5, "{report:?}");
@@ -16497,6 +16493,36 @@ pub(crate) mod tests {
             "the refused cycle PUT a new object"
         );
         assert!(after == before, "the refused cycle overwrote an object");
+    }
+
+    /// Folds `signal` at `now_ns` through `catalog` (over a `FaultStore`
+    /// wrapping `inner`) and asserts the cycle fails with
+    /// `CatalogError::Store(StoreError::Permanent(message))`, the injected
+    /// fault, and that `inner` afterwards holds exactly the objects and bytes
+    /// it held before: no HEAD CAS, no part PUT.
+    async fn assert_fold_fails_on_store_error(
+        inner: &dyn ObjectStoreBackend,
+        catalog: &Catalog,
+        signal: Signal,
+        now_ns: i64,
+        message: &str,
+    ) {
+        let before = object_contents(inner).await;
+        let err = catalog
+            .fold(&tenant(), signal, Uuid::new_v4(), now_ns, &[], None)
+            .await
+            .expect_err("a store error on a dropped object must fail the cycle");
+        match &err {
+            CatalogError::Store(StoreError::Permanent(got)) => assert_eq!(got, message),
+            other => panic!("expected CatalogError::Store(Permanent({message})), got {other:?}"),
+        }
+        let after = object_contents(inner).await;
+        assert_eq!(
+            after.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            before.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            "the failed cycle PUT a new object"
+        );
+        assert!(after == before, "the failed cycle overwrote an object");
     }
 
     /// A metrics HEAD over hour 10 whose one `.csnap` part has its envelope
@@ -17402,8 +17428,9 @@ pub(crate) mod tests {
     /// The leaves depend on the budget and the pairs read, not on how the
     /// build got them (ADR-3692 decision 5, the #3704 open-slice amendment).
     /// The advancing fixture's tail is built three ways at each budget:
-    /// carrying the previous leaf; from scratch, the previous leaf's GET
-    /// refused so every section is read; and through a forced restart,
+    /// carrying the previous leaf; from scratch, the previous leaf's carry
+    /// GET finding no object so every section is read; and through a forced
+    /// restart,
     /// writer 35's section GET refused in the second pass after the first
     /// pass held pairs. The first two store the leaves the one-call build
     /// writes at the same budget. The restart stores the leaves the
@@ -17460,7 +17487,8 @@ pub(crate) mod tests {
                 let report = advancing_fold(&catalog).await;
                 let log = take_key_index_pass_log_for_test();
                 assert_eq!(
-                    store.fault_count(Op::Get, FaultKind::Permanent),
+                    store.fault_count(Op::Get, FaultKind::Permanent)
+                        + store.fault_count(Op::Get, FaultKind::NotFoundBlip),
                     1,
                     "budget {max_pairs}: the fault fired"
                 );
@@ -17472,10 +17500,12 @@ pub(crate) mod tests {
                 (inner, part, report, log, leaves)
             };
 
+            // The 1st `.kidx` GET is the pre-PUT version peek, the 2nd the
+            // carry's.
             let (_, _, scratch, _, scratch_leaves) = fault_fold(
-                Rule::new(Op::Get, ScriptedFault::Permanent("leaf GET refused".into()))
+                Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
                     .with_key_contains(".kidx")
-                    .with_occurrence(Occurrence::Nth(1)),
+                    .with_occurrence(Occurrence::Nth(2)),
             )
             .await;
             assert_eq!(scratch.key_index_entries_carried, 0, "budget {max_pairs}");
@@ -17957,6 +17987,16 @@ pub(crate) mod tests {
                 .count()
         }
 
+        /// GETs of `.cstat` objects.
+        fn cstat_gets(&self) -> usize {
+            self.gets
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|(key, _)| key.ends_with(".cstat"))
+                .count()
+        }
+
         /// GETs of any of `leaves`' objects.
         fn gets_of_leaves(&self, leaves: &[SnapshotKeyIndexLeafRef]) -> usize {
             self.gets
@@ -18071,8 +18111,8 @@ pub(crate) mod tests {
     /// The first fold holds day d alone, so its one part is encoded with
     /// `min_hour` 0 (the single-part override). The sealing fold encodes day
     /// d with its real first hour, so its hash changes and its leaves are
-    /// built once more, from the previous tail's leaf: one leaf GET, one
-    /// leaf PUT, no section read. With the day seal off at the caller, the
+    /// built once more, from the previous tail's leaf: one version peek and
+    /// one carry GET of that leaf, one leaf PUT, no section read. With the day seal off at the caller, the
     /// sealing fold keeps one part over both days and the first assertion on
     /// its HEAD fails.
     #[tokio::test]
@@ -18115,9 +18155,11 @@ pub(crate) mod tests {
                 store.gets_of_leaves(&first.parts[0].key_index),
                 store.section_gets_of(&day_d),
             ),
-            (1, 1, 0),
-            "the sealing fold rebuilds day d's leaf once, from the previous tail's leaf"
+            (1, 2, 0),
+            "the sealing fold rebuilds day d's leaf once, from the previous tail's leaf \
+             (one version peek, one carry GET)"
         );
+        assert_eq!(sealing.newer_part_peek_gets, 1, "{sealing:?}");
         assert_eq!(sealing.key_index_entries_carried, 2, "{sealing:?}");
 
         let mut previous = sealed;
@@ -18359,11 +18401,12 @@ pub(crate) mod tests {
     /// writers 1 (hour 20, ids 1 and 2) and 2 and 3 (hour 21, ids 10, 20 and
     /// 30, 40): 6 pairs, which the first fold cuts into 3 passes of 2 under a
     /// budget of 2, one leaf each. A rewrite record erases writer 1 at hour
-    /// 20, so 2 entries survive. The re-encode GETs each of the 3 previous leaves once, reads
+    /// 20, so 2 entries survive. The re-encode peeks and then GETs each of the
+    /// 3 previous leaves once, reads
     /// no section of the surviving entries, and writes the 2 leaves a fold of
     /// the surviving entries into a fresh store writes, byte for byte. With
     /// the carry source the previous HEAD's last part, day d's previous
-    /// leaves are never read and the survivors' sections are, 2 ranged GETs
+    /// leaves are only peeked and the survivors' sections are read, 2 ranged GETs
     /// per entry per pass.
     #[tokio::test]
     async fn a_dirty_sealed_day_carries_its_own_previous_leaves() {
@@ -18430,11 +18473,11 @@ pub(crate) mod tests {
         );
         assert_eq!(
             store.gets_of_leaves(&first.parts[0].key_index),
-            first.parts[0].key_index.len(),
-            "each of day d's previous leaves is fetched once"
+            2 * first.parts[0].key_index.len(),
+            "each of day d's previous leaves is peeked once and fetched once"
         );
         for leaf in &first.parts[0].key_index {
-            assert_eq!(store.gets_of_leaves(std::slice::from_ref(leaf)), 1);
+            assert_eq!(store.gets_of_leaves(std::slice::from_ref(leaf)), 2);
         }
 
         let fresh = OpLogStore::empty();
@@ -18454,12 +18497,13 @@ pub(crate) mod tests {
         );
     }
 
-    /// ADR-3939 decision 5: a later slice whose GET fails restarts the build
-    /// with no carry, as a slice that no longer decodes does. In the
-    /// dirty-day fixture of [`a_dirty_sealed_day_carries_its_own_previous_leaves`]
+    /// ADR-3939 decision 5: a later slice whose GET finds no object restarts
+    /// the build with no carry, as a slice that no longer decodes does. In
+    /// the dirty-day fixture of [`a_dirty_sealed_day_carries_its_own_previous_leaves`]
     /// the first pass decodes day d's lowest previous slice, fetched at load,
-    /// and reaches the second slice, whose GET is refused: 2 previous-leaf
-    /// GETs issued before the restart, 1 of them served. The restart warns
+    /// and reaches the second slice, whose carry GET (its second GET, after
+    /// the pre-PUT peek) is `NotFound`: 2 previous-leaf carry GETs issued
+    /// before the restart, 1 of them served. The restart warns
     /// once, reads both surviving entries' sections in each of its 2 passes
     /// (2 ranged GETs each, 8), and writes the from-scratch leaves. The new
     /// tail's own carry adds 1 leaf GET, so the report counts 3.
@@ -18489,20 +18533,17 @@ pub(crate) mod tests {
         publish_user_id_logs(inner.as_ref(), 5, DAY_D + 26, &[60], 2, 0, true).await;
         inner.clear();
         let plan = FaultPlan::empty().with_rule(
-            Rule::new(
-                Op::Get,
-                ScriptedFault::Permanent("slice GET refused".into()),
-            )
-            .with_key_contains(day_d[1].key.as_str())
-            .with_occurrence(Occurrence::Nth(1)),
+            Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+                .with_key_contains(day_d[1].key.as_str())
+                .with_occurrence(Occurrence::Nth(2)),
         );
         let store = Arc::new(FaultStore::new(Arc::clone(&inner), plan));
         let faulted = Catalog::new(store.clone(), budget).expect("catalog");
         let (report, warnings) = fold_capturing_warnings(&faulted, Signal::Logs, DAY_D + 26).await;
         assert_eq!(
-            store.fault_count(Op::Get, FaultKind::Permanent),
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip),
             1,
-            "the second slice's GET was refused"
+            "the second slice's carry GET found no object"
         );
         assert_eq!(
             warnings
@@ -18517,8 +18558,9 @@ pub(crate) mod tests {
                 inner.gets_of_leaves(&day_d[..1]),
                 inner.gets_of_leaves(&day_d[1..]),
             ),
-            (1, 0),
-            "the lowest slice served once; the refused GET never reached the store"
+            (2, 2),
+            "each slice peeked once; the lowest slice served once; the faulted GET never \
+             reached the store"
         );
         assert_eq!(report.key_index_leaf_gets, 3, "{report:?}");
         assert_eq!(
@@ -18633,7 +18675,8 @@ pub(crate) mod tests {
                 store.leaf_puts_for_part_watermark(DAY_D + 21),
                 store.gets_of_leaves(&first_head.parts[0].key_index),
             ),
-            (2, 3)
+            (2, 2 * 3),
+            "3 version peeks and 3 carry GETs"
         );
         assert_eq!(
             (
@@ -18679,8 +18722,8 @@ pub(crate) mod tests {
     /// `key_index_unchanged_section_gets` counts section GETs for entries a
     /// previous leaf already held. Day d is the first fold's tail; the next
     /// fold erases one of its entries, adds a day-d entry at hour 22 that no
-    /// previous part held, and seals day d. When a later slice's GET fails
-    /// the build restarts without the carry and, in each of its 3 passes,
+    /// previous part held, and seals day d. When a later slice's GET finds no
+    /// object the build restarts without the carry and, in each of its 3 passes,
     /// reads the sections of the two surviving entries the previous leaves
     /// held (12 GETs, counted) and of the new entry (6, not counted). The
     /// same re-encode with every slice served carries the held entries and
@@ -18716,20 +18759,18 @@ pub(crate) mod tests {
             inner.clear();
             let mut plan = FaultPlan::empty();
             if faulted {
+                // The 2nd GET of the slice: the 1st is the pre-PUT peek.
                 plan = plan.with_rule(
-                    Rule::new(
-                        Op::Get,
-                        ScriptedFault::Permanent("slice GET refused".into()),
-                    )
-                    .with_key_contains(day_d[1].key.as_str())
-                    .with_occurrence(Occurrence::Nth(1)),
+                    Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+                        .with_key_contains(day_d[1].key.as_str())
+                        .with_occurrence(Occurrence::Nth(2)),
                 );
             }
             let store = Arc::new(FaultStore::new(Arc::clone(&inner), plan));
             let catalog = Catalog::new(store.clone(), budget).expect("catalog");
             let second = fold_through(&catalog, Signal::Logs, DAY_D + 26).await;
             assert_eq!(
-                store.fault_count(Op::Get, FaultKind::Permanent),
+                store.fault_count(Op::Get, FaultKind::NotFoundBlip),
                 u64::from(faulted)
             );
             let held_gets = inner.section_gets_of(&[&two, &three]);
@@ -19681,7 +19722,7 @@ pub(crate) mod tests {
     /// so each of the first 6 passes reaches one slice beyond the one it
     /// starts in, and a 7th holds the late value. Every pass holds 1 or 2
     /// slices per (source, field), 2 at the most, each of the 12 slices is
-    /// fetched once, the report's peak equals the largest total the passes
+    /// fetched once (after one pre-PUT version peek each), the report's peak equals the largest total the passes
     /// held and is below the 12 slices' sum, and the leaves are the one-call
     /// build's. Fetching every slice at load holds 6 a field; fetching a
     /// slice again in each pass it overlaps issues 26 GETs.
@@ -19748,8 +19789,13 @@ pub(crate) mod tests {
         assert_eq!(most, 2, "{log:?}");
         assert_eq!(
             store.gets_of_leaves(previous),
-            previous.len(),
-            "each previous slice fetched once"
+            2 * previous.len(),
+            "each previous slice peeked once before any PUT and fetched once"
+        );
+        assert_eq!(store.cstat_gets(), 1, "the dirty part's statistics are peeked");
+        assert_eq!(
+            report.newer_part_peek_gets, 13,
+            "twelve leaf prefixes and the .cstat: {report:?}"
         );
         assert_eq!(report.key_index_leaf_gets, 12, "{report:?}");
         let largest = log
@@ -19877,7 +19923,7 @@ pub(crate) mod tests {
     /// writer 2 from A and writer 3 from B. It reads neither entry's section,
     /// carries both, and writes the one-call build's leaves. A's two slices
     /// are fetched once; B's are fetched once by each of the two re-encoded
-    /// parts that carry from it. Coverage taken from the first source alone
+    /// parts that carry from it. Each is also peeked once before any PUT. Coverage taken from the first source alone
     /// reads writer 3's section.
     #[tokio::test]
     async fn a_part_carries_from_two_previous_parts() {
@@ -19929,11 +19975,12 @@ pub(crate) mod tests {
             "both sources cover their entries"
         );
         assert_eq!(report.key_index_entries_carried, 3, "{report:?}");
+        // Each count includes the one pre-PUT version peek of the leaf.
         for leaf in &first.parts[0].key_index {
-            assert_eq!(store.gets_of_leaves(std::slice::from_ref(leaf)), 1);
+            assert_eq!(store.gets_of_leaves(std::slice::from_ref(leaf)), 1 + 1);
         }
         for leaf in &first.parts[1].key_index {
-            assert_eq!(store.gets_of_leaves(std::slice::from_ref(leaf)), 2);
+            assert_eq!(store.gets_of_leaves(std::slice::from_ref(leaf)), 1 + 2);
         }
         assert_eq!(report.key_index_leaf_gets, 6, "{report:?}");
         assert_eq!(
@@ -19946,9 +19993,9 @@ pub(crate) mod tests {
     /// ADR-3939 decision 5: a source whose lowest slice fails drops only its
     /// own entries from the carry. In the fixture of
     /// [`a_part_carries_from_two_previous_parts`] the re-encoded part holds
-    /// writer 2 from A and writer 3 from B, and the GET of A's lowest slice
-    /// is refused. A is not carried, with one warning, and A's later slice is
-    /// never fetched; writer 2's section is read in both of the part's 2
+    /// writer 2 from A and writer 3 from B, and the carry GET of A's lowest
+    /// slice finds no object. A is not carried, with one warning, and A's
+    /// later slice is only peeked, never fetched; writer 2's section is read in both of the part's 2
     /// passes (2 ranged GETs each), while B's entries, writers 3 and 4, have
     /// no section read and are carried. The leaves equal those a fold of
     /// writers 2 to 5 into a fresh store writes at the same budget, byte for
@@ -19982,21 +20029,19 @@ pub(crate) mod tests {
         publish_logs_erasure(inner.as_ref(), DAY_D + 1, &[&writers[0]]).await;
         publish_user_id_logs(inner.as_ref(), 5, DAY_D + 5, &[9], 2, 0, true).await;
         inner.clear();
+        // The 2nd GET of A's lowest slice: the 1st is the pre-PUT peek.
         let plan = FaultPlan::empty().with_rule(
-            Rule::new(
-                Op::Get,
-                ScriptedFault::Permanent("lowest slice GET refused".into()),
-            )
-            .with_key_contains(a[0].key.as_str())
-            .with_occurrence(Occurrence::Nth(1)),
+            Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+                .with_key_contains(a[0].key.as_str())
+                .with_occurrence(Occurrence::Nth(2)),
         );
         let store = Arc::new(FaultStore::new(Arc::clone(&inner), plan));
         let faulted = Catalog::new(store.clone(), config).expect("catalog");
         let (report, warnings) = fold_capturing_warnings(&faulted, Signal::Logs, DAY_D + 5).await;
         assert_eq!(
-            store.fault_count(Op::Get, FaultKind::Permanent),
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip),
             1,
-            "A's lowest slice GET was refused"
+            "A's lowest slice carry GET found no object"
         );
         assert_eq!(
             warnings
@@ -20008,8 +20053,8 @@ pub(crate) mod tests {
         );
         assert_eq!(
             inner.gets_of_leaves(&a),
-            0,
-            "A's later slice is not fetched"
+            2,
+            "A's two slices are peeked; A's later slice is not fetched"
         );
         assert_eq!(
             inner.section_gets_of(&[&writers[2], &writers[3]]),
@@ -20150,7 +20195,7 @@ pub(crate) mod tests {
             );
             let later_slice = &source.fields[USER_ID].slices[1];
             if accepted {
-                assert_eq!(fed, Ok(()));
+                assert!(fed.is_ok(), "{fed:?}");
                 assert_eq!(field.held.len(), 2, "both slices' pairs held");
                 assert!(later_slice.bytes.is_some());
             } else {
@@ -20173,8 +20218,9 @@ pub(crate) mod tests {
     /// late writer lands in held-open hour 21 of day d, so the next fold seals
     /// day d - 1 and writes a tail over hours 21 and 22: both overlap the
     /// previous part's range, and only the day d - 1 part shares its object.
-    /// The fold GETs the previous leaf once, for day d - 1; a source chosen
-    /// by hour overlap alone GETs it a second time for the tail.
+    /// The fold peeks the previous leaf once and carries it once, for day
+    /// d - 1; a source chosen by hour overlap alone GETs it a third time for
+    /// the tail.
     #[tokio::test]
     async fn an_overlapping_part_sharing_no_object_is_not_a_carry_source() {
         let store = OpLogStore::empty();
@@ -20206,8 +20252,13 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             vec![(DAY_D - 1, DAY_D - 1, 1), (DAY_D + 21, sealed, 1)]
         );
-        assert_eq!(store.gets_of_leaves(&first.parts[0].key_index), 1);
+        assert_eq!(store.gets_of_leaves(&first.parts[0].key_index), 2);
+        assert_eq!(store.cstat_gets(), 1, "the dirty part's statistics are peeked");
         assert_eq!(report.key_index_leaf_gets, 1, "{report:?}");
+        assert_eq!(
+            report.newer_part_peek_gets, 2,
+            "the leaf prefix and the .cstat: {report:?}"
+        );
         assert_eq!(report.key_index_entries_carried, 1, "{report:?}");
     }
 

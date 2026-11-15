@@ -427,8 +427,8 @@ impl Catalog {
             {
                 Ok(replaces) => replaces,
                 // A leaf a newer build wrote: the rebuild must not replace it
-                // (ADR-4233 H1). Fail the cycle, carrying the report of what
-                // earlier batches published.
+                // (ADR-4233 H1). Fail the cycle before any batch runs; the
+                // report holds only the reads made so far.
                 Err(RefusedLeafError::Newer(err)) => {
                     return Err(KeyIndexRebuildError::Interrupted {
                         source: CatalogError::SnapshotFormat(err),
