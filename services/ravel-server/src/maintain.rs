@@ -8441,23 +8441,27 @@ mod tests {
     }
 
     /// A claim of a future `format_version` (a rolled-back build meeting a
-    /// newer one's claim) holds an erasure rewrite back only until it is older
-    /// than the 24 h lease ceiling plus this process's jitter (ADR-1029, the
-    /// 2026-11-09 amendment). Before that the pass backs off and the request
-    /// stays pending; after it the pass steals the claim under CAS, publishes
-    /// the rewrite and completes the request, with no write to the claim object
-    /// by anyone in between.
+    /// newer one's claim) is version-protected and holds an erasure rewrite
+    /// back forever, at any age (ADR-4233 decision 4, H8): never stolen,
+    /// never overwritten, the request stays pending. This is a hazard the
+    /// amendment accepts in exchange for never letting a reader guess at a
+    /// lease it cannot compute; the operator remedy is a build that knows the
+    /// version, or a by-hand delete of the claim object.
     ///
-    /// Shown failing against an observation that gives an unreadable claim the
-    /// configured lease (the first pass steals: counters `(1, 1, 0)`), and
-    /// against a claim guard that never steals one (the second pass backs off
-    /// again: `(0, 0, 2, 0)`).
+    /// Two passes, run far apart, rule out two plausible wrong fixes rather
+    /// than one: a pass at the OLD 24 h-plus-jitter steal threshold rules out
+    /// a fix that left the pre-ADR-4233 ceiling in place (that exact instant
+    /// used to steal); a second pass ten times further out rules out a fix
+    /// that merely raised the ceiling to some longer-but-still-finite bound
+    /// instead of removing it. Both passes assert the claim's stored bytes
+    /// and CAS version are byte-identical to the planted claim, not only that
+    /// the counters read zero, so a steal that succeeds but is miscounted
+    /// cannot pass either.
     #[tokio::test]
-    async fn a_future_format_claim_stalls_an_erasure_for_at_most_the_lease_ceiling() {
+    async fn a_future_format_claim_is_never_stolen_at_any_age() {
         use prost::Message as _;
         use ravel_fleet::claim::{
-            CLAIM_FORMAT_VERSION, ClaimConfig, MAX_OBSERVED_LEASE_MS, WorkIdentity,
-            compaction_claim_key, jitter_ms,
+            CLAIM_FORMAT_VERSION, MAX_OBSERVED_LEASE_MS, WorkIdentity, compaction_claim_key,
         };
 
         let store = MemoryStore::new();
@@ -8491,10 +8495,11 @@ mod tests {
             lease_duration_ns: 1_000_000_000,
             owner_clock_ns: TEST_ERASURE_NOW_NS,
         };
+        let planted_bytes = future.encode_to_vec();
         let planted = store
             .put(
                 &claim_key,
-                future.encode_to_vec().into(),
+                planted_bytes.clone().into(),
                 PutOptions::create_if_absent(),
             )
             .await
@@ -8510,49 +8515,62 @@ mod tests {
             )),
             ..CompactorConfig::default()
         };
-        let lease_ms = CompactorConfig::default().claim_lease_duration.as_millis() as i64;
-        let jitter = jitter_ms(
-            &work_id,
-            &process,
-            lease_ms,
-            &ClaimConfig {
-                lease_duration: CompactorConfig::default().claim_lease_duration,
-                ..ClaimConfig::default()
-            },
-        );
         let safety = MaintenanceSafetyMetrics::default();
         let mut memo = MaintainMemo::with_default_interval();
 
-        // Older than the claim's own declared lease and the configured lease,
-        // each plus jitter: still held.
-        let clock = FixedClock::new((plant_ms + lease_ms + jitter + 1) * 1_000_000);
-        run_erasure_pass(
-            &store,
-            &clock,
-            &compactor_at(&clock),
-            &ravel_maintain::NoLeases,
-            &tenant,
-            Signal::Metrics,
-            1,
-            &mut memo,
-            &safety,
-        )
-        .await;
-        assert_eq!(
-            (
-                safety.claims_acquired(Signal::Metrics),
-                safety.claims_stolen(Signal::Metrics),
-                safety.claims_skipped(Signal::Metrics),
-            ),
-            (0, 0, 1),
-            "inside the ceiling the pass backs off"
-        );
-        assert!(rewrite_records(&store, &tenant).await.is_empty());
-        assert!(store.get(&done_key, GetRange::Full).await.is_err());
-        assert!(store.get(&dreq_key, GetRange::Full).await.is_ok());
+        async fn assert_still_held(
+            pass: u64,
+            store: &MemoryStore,
+            safety: &MaintenanceSafetyMetrics,
+            tenant: &TenantHash,
+            done_key: &str,
+            dreq_key: &str,
+            claim_key: &str,
+            planted: &ravel_object_store::Version,
+            planted_bytes: &[u8],
+        ) {
+            assert_eq!(
+                (
+                    safety.claims_acquired(Signal::Metrics),
+                    safety.claims_stolen(Signal::Metrics),
+                    safety.claims_skipped(Signal::Metrics),
+                    safety.claims_lost(Signal::Metrics),
+                ),
+                (0, 0, pass, 0),
+                "a version-protected claim is never acquired or stolen, pass {pass}"
+            );
+            assert!(
+                rewrite_records(store, tenant).await.is_empty(),
+                "no rewrite record published, pass {pass}"
+            );
+            assert!(
+                store.get(done_key, GetRange::Full).await.is_err(),
+                "the request stays pending, pass {pass}"
+            );
+            assert!(
+                store.get(dreq_key, GetRange::Full).await.is_ok(),
+                "and is not lost, pass {pass}"
+            );
+            let head = store.head(claim_key).await.expect("claim head");
+            assert_eq!(
+                &head.version, planted,
+                "the claim's CAS version is unchanged, pass {pass}"
+            );
+            let got = store
+                .get(claim_key, GetRange::Full)
+                .await
+                .expect("claim present");
+            assert_eq!(
+                got.data.as_ref(),
+                planted_bytes,
+                "the claim's stored bytes are byte-identical, pass {pass}"
+            );
+        }
 
-        // One millisecond past the ceiling plus jitter: stolen and published.
-        clock.set((plant_ms + MAX_OBSERVED_LEASE_MS + jitter + 1) * 1_000_000);
+        // At the instant that used to be the steal threshold (ADR-1029's
+        // 2026-11-09 amendment, superseded by ADR-4233): a fix that left the
+        // old ceiling in place for a future-format claim would steal here.
+        let clock = FixedClock::new((plant_ms + MAX_OBSERVED_LEASE_MS + 1) * 1_000_000);
         run_erasure_pass(
             &store,
             &clock,
@@ -8565,34 +8583,46 @@ mod tests {
             &safety,
         )
         .await;
-        assert_eq!(
-            (
-                safety.claims_acquired(Signal::Metrics),
-                safety.claims_stolen(Signal::Metrics),
-                safety.claims_skipped(Signal::Metrics),
-                safety.claims_lost(Signal::Metrics),
-            ),
-            (1, 1, 1, 0),
-            "past the ceiling the pass steals the claim"
-        );
-        let records = rewrite_records(&store, &tenant).await;
-        assert_eq!(records.len(), 1, "the stolen bucket is rewritten once");
-        assert_eq!(records[0].drops.len(), 1);
-        assert_eq!(records[0].drops[0].request_id, request_id.to_string());
-        assert_eq!(
-            rewritten_label_sets(&store, &records[0]).await,
-            vec![subject_labels(TEST_SURVIVING_SUBJECT)],
-            "the subject is gone and the bystander is intact"
-        );
-        assert!(
-            store.get(&done_key, GetRange::Full).await.is_ok(),
-            "the request completes"
-        );
-        assert_ne!(
-            store.head(&claim_key).await.expect("claim head").version,
-            planted,
-            "the steal wrote the claim object"
-        );
+        assert_still_held(
+            1,
+            &store,
+            &safety,
+            &tenant,
+            &done_key,
+            &dreq_key,
+            &claim_key,
+            &planted,
+            &planted_bytes,
+        )
+        .await;
+
+        // Ten times further out: a fix that merely widened the ceiling to a
+        // longer, still-finite bound instead of removing it would steal here.
+        clock.set((plant_ms + 10 * MAX_OBSERVED_LEASE_MS) * 1_000_000);
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor_at(&clock),
+            &ravel_maintain::NoLeases,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &mut memo,
+            &safety,
+        )
+        .await;
+        assert_still_held(
+            2,
+            &store,
+            &safety,
+            &tenant,
+            &done_key,
+            &dreq_key,
+            &claim_key,
+            &planted,
+            &planted_bytes,
+        )
+        .await;
     }
 
     /// The `.done` predicate hash is what makes a permanent completion record

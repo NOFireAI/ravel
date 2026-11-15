@@ -180,9 +180,14 @@ fn install_claims(config: &mut CompactorConfig, dry_run: bool, claims: &ClaimOpt
 ///
 /// `retry_after_unix_ms` is the earliest point a rerun can take the claim and
 /// `recheck_after_unix_ms` the point a running maintenance process looks at
-/// the bucket again. They can differ only for an unreadable claim, where the
-/// retry point is the 24 h steal threshold and the recheck comes at most one
-/// claim lease plus jitter after the observation.
+/// the bucket again. They can differ only for an unreadable claim at a known
+/// format version, where the retry point is the 24 h steal threshold and the
+/// recheck comes at most one claim lease plus jitter after the observation. A
+/// version-protected claim (`format_version` 0 or above this build's known
+/// version, ADR-4233 decision 4, H8) pins both to `i64::MAX`: it is never
+/// stolen, so there is no threshold to recheck against short of an operator
+/// fixing the claim or this process restarting on a build that knows the
+/// version.
 fn claim_skip_fields(skip: &ClaimSkip) -> String {
     let holder = skip
         .holder_process_id

@@ -78,6 +78,18 @@
 //! and a claim deleted by hand releases the bucket within that, not at the
 //! steal threshold.
 //!
+//! # A version-protected claim is never stolen
+//!
+//! A claim whose `format_version` is 0 (never written by any build) or above
+//! [`ravel_fleet::claim::CLAIM_FORMAT_VERSION`] (written by a newer build) is
+//! not merely unreadable, it is version-protected (ADR-4233 decision 4, H8):
+//! [`ClaimGuard::acquire`] never attempts a steal, at any age, and reports
+//! [`ClaimSkipReason::VersionProtectedClaim`] instead of
+//! [`ClaimSkipReason::UnreadableClaim`]. The bucket stays held until an
+//! operator deletes the claim object by hand or a build that knows the
+//! version restarts and reclaims it; this process logs the hazard once per
+//! claim at `warn`, not on every tick.
+//!
 //! # The claim fences compaction against the erasure rewrite
 //!
 //! Since the 2026-10-03 amendment a claim is not only a cost measure. The
@@ -127,7 +139,8 @@
 //! still waits out the lease as before (ADR-1029, 2026-09-30 amendment; issue
 //! #2156).
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -194,13 +207,21 @@ pub enum ClaimSkipReason {
     /// owner was not dead and renewed, which moves the version and defeats the
     /// steal), or the claim object was gone by the steal's CAS.
     StealLost,
-    /// The claim's payload does not decode, or declares a format floor this
-    /// build does not understand, and the claim is not yet older than
-    /// [`ravel_fleet::claim::MAX_OBSERVED_LEASE_MS`] plus this contender's
-    /// jitter by the store's `last_modified`. Past that age the guard steals
-    /// it, so without a write to the object the bucket is held for at most
-    /// that long.
+    /// The claim's payload does not decode, carries the never-written
+    /// `UNSPECIFIED` state, or carries owner ids that do not parse, at a
+    /// `format_version` this build understands, and the claim is not yet
+    /// older than [`ravel_fleet::claim::MAX_OBSERVED_LEASE_MS`] plus this
+    /// contender's jitter by the store's `last_modified`. Past that age the
+    /// guard steals it, so without a write to the object the bucket is held
+    /// for at most that long.
     UnreadableClaim,
+    /// The claim's `format_version` is 0 (never written by any build) or
+    /// above [`ravel_fleet::claim::CLAIM_FORMAT_VERSION`] (written by a newer
+    /// build this one does not understand): ADR-4233 decision 4 (H8). Never
+    /// stolen or overwritten at any age, unlike [`Self::UnreadableClaim`];
+    /// the bucket is held until an operator deletes the claim object by hand
+    /// or a build that knows the version reclaims it.
+    VersionProtectedClaim,
     /// The claim existed at the `CreateIfAbsent` and was gone by the read that
     /// followed, twice in a row. One retry is free; a second vanishing means
     /// something outside this protocol is deleting claims, so the bucket is
@@ -215,6 +236,7 @@ impl ClaimSkipReason {
             ClaimSkipReason::HeldByAnother => "held_by_another",
             ClaimSkipReason::StealLost => "steal_lost",
             ClaimSkipReason::UnreadableClaim => "unreadable_claim",
+            ClaimSkipReason::VersionProtectedClaim => "version_protected_claim",
             ClaimSkipReason::VanishedTwice => "vanished_twice",
         }
     }
@@ -343,6 +365,22 @@ impl std::fmt::Debug for ClaimGuard {
             .field("owner_process_id", &self.inner.owner.process_id)
             .finish_non_exhaustive()
     }
+}
+
+/// Process-wide dedup for the version-protected warn log: `true` the first
+/// time `work_id` is seen, `false` on every later observation by this
+/// process, across however many [`ClaimGuard`] instances contend for the same
+/// bucket over the process's life. Process-global rather than per-guard
+/// because a wedged bucket is re-contended by a fresh `ClaimGuard` on every
+/// maintenance tick, and the hazard is worth one line per process, not one
+/// per tick.
+fn warn_version_protected_once(work_id: WorkId) -> bool {
+    static WARNED: OnceLock<Mutex<HashSet<WorkId>>> = OnceLock::new();
+    WARNED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(work_id)
 }
 
 impl ClaimGuard {
@@ -581,6 +619,22 @@ impl ClaimGuard {
                 recheck_after_unix_ms,
             })
         };
+        if observed.version_protected {
+            // Never stolen at any age (ADR-4233 decision 4, H8): logged once
+            // per claim per process, not on every tick this bucket is
+            // reconsidered, so a wedged claim does not spam the log.
+            if warn_version_protected_once(observed.work_id) {
+                tracing::warn!(
+                    key = %observed.key,
+                    work_id = %observed.work_id.hex(),
+                    "compaction claim is version-protected (format_version 0 or above this \
+                     build's known version) and is held forever; an operator must delete the \
+                     claim object by hand or run a build that knows the version (ADR-4233 \
+                     decision 4, H8)"
+                );
+            }
+            return Ok(skip(ClaimSkipReason::VersionProtectedClaim));
+        }
         if unreadable && now_ms < observed.reschedule_after_unix_ms {
             return Ok(skip(ClaimSkipReason::UnreadableClaim));
         }
