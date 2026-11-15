@@ -760,12 +760,12 @@ pub struct ServerConfig {
     /// startup warm-up's logs metadata pass takes half of for its ceiling
     /// ([`cache_warm::LogsMetadataWarm::new`]), and hands the catalog
     /// byte cache its own
-    /// [`Self::catalog_cache_max_bytes`]. The two are independent LRU ceilings,
+    /// [`Self::catalog_cache_max_bytes`]. The two are independent S3-FIFO ceilings,
     /// so neither claims the other's derived share of RAM. Ignored when
     /// `disable_cache` is set.
     pub cache_max_bytes: u64,
     /// The resolved RAM budget for the catalog byte cache
-    /// (`ResolvedPerformanceDefaults::catalog_cache_max_bytes`), a SEPARATE LRU
+    /// (`ResolvedPerformanceDefaults::catalog_cache_max_bytes`), a SEPARATE S3-FIFO
     /// ceiling from [`Self::cache_max_bytes`]. `main` fills it from the resolved
     /// struct; [`start`] passes THIS value, not `cache_max_bytes`, to
     /// [`query::build_catalog`]. Resolved from its own `--catalog-cache-max-bytes`

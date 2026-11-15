@@ -14781,7 +14781,7 @@ mod tests {
     /// The catalog byte cache is a SEPARATE derived ceiling from the fetcher
     /// cache (issue #1141): unset, it takes 5% of `memory_budget_bytes` while
     /// the fetcher cache takes 25% of the same budget (ADR-1170 decision 3),
-    /// so the two independent LRU caches do not each claim the full share.
+    /// so the two independent S3-FIFO caches do not each claim the full share.
     /// Since ADR-2023, `--cache-max-bytes` reaches the fetcher cache only:
     /// the catalog byte cache resolves solely from its own
     /// `--catalog-cache-max-bytes` flag, independently of what
