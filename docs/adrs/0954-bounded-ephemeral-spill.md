@@ -1702,7 +1702,11 @@ one reads, and the script that judges it: `m9-judge.py` and
 scripts exit 1 on the rows the M8 binary misses. The owner set the
 concurrent QPS row to be reported against 0.95, not gated, and the upper
 edge of the string-byte row to 1.25 times the predicted cell in
-`benchmarks/clickbench/bucket-bytes/results.txt`.
+`benchmarks/clickbench/bucket-bytes/results.txt`. The registration also
+widened one band without an owner decision, and says so: statement 33 on
+c6a.large passes at `bits` 6 or 7, with 7 predicted. Decision 5 asks for
+`bits` 7 at the measured `T`, and a refusal slightly earlier than M8's
+derives 6 by the same rule. The run measured 7.
 
 The run used one box per size, all self-terminating. The server was built
 from `f5ad7c95e`, which descends from both decisions' merges, with CI
@@ -1714,6 +1718,13 @@ and no box had a null answer. The full results are #4154 comment
 
 **The gate passed.** `m9-judge.py` passed 18 row-box cells and
 `m9-retry-judge.py` passed 32, with none missed and none not judged.
+Statements 19, 34 and 35 have 49 retry lines across the serial passes
+and the three new-arm windows: 11 on c6a.large, 17 on c6a.xlarge and 21
+on c6a.2xlarge. 47 answered. The other 2 are c6a.large window lines, for
+statements 19 and 35, that ran the bucketed route and then failed. Their
+plan, routed chunk size and recomputed budget were judged like every
+other line. Their rows-read check was not, because a failed retry stops
+before it reads back; the judge records each as a note.
 
 ### M9 results against the gate rows
 
@@ -1723,7 +1734,7 @@ and no box had a null answer. The full results are #4154 comment
 | statement 33 on c6a.large: retry spill per try | at most 2.0 GB | 1.796 to 1.797 GB | inside | measured 2026-11-16, comment 6902901483 |
 | statement 33 hot, c6a.large | at most 56 s (about 35 s predicted) | 39.5 s; M8's sort-merge retry took 112 s | inside, prediction missed | measured 2026-11-16, comment 6902901483 |
 | statement 33 hot, c6a.xlarge and c6a.2xlarge | at most 1.10 x 16.8 s and 9.6 s | 17.1 s and 9.37 s | inside | measured 2026-11-16, comment 6902901483 |
-| statements 19, 34, 35: plan on every retry line | `bucket`, with a numeric `routed_chunk_bytes` equal to the recomputed budget | `bucket` on all 243 lines judged (53, 85, 105) | inside | measured 2026-11-16, comment 6902901483 |
+| statements 19, 34, 35: plan on every retry line | `bucket`, with a numeric `routed_chunk_bytes` equal to the recomputed budget | `bucket` on all 49 lines (11, 17, 21); `routed_chunk_bytes` numeric on every line and equal to the budget recomputed from the line's own inputs | inside | measured 2026-11-16, comment 6902901483 |
 | statements 19, 34, 35: bucket bytes against M8's sort-merge threshold | below it | 0.267 to 0.333 on c6a.large, 0.345 to 0.426 on c6a.xlarge, 0.373 to 0.503 on c6a.2xlarge | inside | measured 2026-11-16, comment 6902901483 |
 | statements 19, 34, 35: bucket bytes against the predicted cell | at most 1.25 x | every line inside; statement 19 at 1.002 of its `bits` 4 cell on c6a.2xlarge | inside | measured 2026-11-16, comment 6902901483 |
 | null answers, each box | 0 | 0 on all three | inside | measured 2026-11-16, comment 6902901483 |
@@ -1735,16 +1746,26 @@ and no box had a null answer. The full results are #4154 comment
   In M8 its derivation refused, and it kept the sort-merge retry.
 - In the serial passes, statements 19, 34 and 35 retried 3 times each on
   c6a.large and c6a.xlarge and not at all on c6a.2xlarge, as in M8.
-- c6a.large under concurrency did not improve. The entry's own concurrent
-  window read QPS 0.075 with error ratio 0.471, against M8's 0.190 and
-  0.269. In the four interleaved windows, the new arm's mean QPS was
-  0.0855 (M8: 0.091) and its error ratio 0.664, against v0.28.0's 0.640.
-  The judge logged failed window retries on c6a.large as notes, as the
-  registration treats a failed window line: three bucket lines (statements
-  19, 35 and one other) and three sort-merge lines (two other statements),
-  each retry refused by the process budget or the host memory gate.
-  Nothing in M9 gates these.
-  They are the next thing to look at on small hosts.
+- Concurrent QPS, as the ratio of the new arm to v0.28.0 on the same box
+  in the four interleaved windows (the gate's metric), rose on c6a.large
+  (0.847 to 0.900) and c6a.2xlarge (0.744 to 0.857) and fell on
+  c6a.xlarge (0.761 to 0.667). On c6a.xlarge the new arm's mean was 0.170
+  against M8's 0.1865, and the v0.28.0 arm's 0.255 against M8's 0.245.
+  Two windows per arm cannot tell the binary from window noise there, as
+  M8's amendment found for the same box.
+- On c6a.large, the arm's absolute throughput did not improve. The
+  entry's own concurrent window read QPS 0.075 with error ratio 0.471,
+  against M8's 0.190 and 0.269. In the interleaved windows the new arm's
+  mean QPS was 0.0855 (M8: 0.091), and its error ratio was 0.664 against
+  v0.28.0's 0.640. The judge logged six failed window retries on
+  c6a.large as notes:
+  - three on the bucketed route, statements 19 and 32 refused by the host
+    memory gate and statement 35 by the process budget;
+  - three on the sort-merge route, statement 29 twice (process budget)
+    and statement 14 once (host memory gate).
+
+  Nothing in M9 gates these. They, and the c6a.large window throughput,
+  are the next thing to look at on small hosts.
 - Rows written for statement 33 are still judged against the corpus
   counts, because #4112 (`exchange_output_rows`) is open.
 
