@@ -1609,7 +1609,8 @@ The run used one box per size, all terminated. The server was built from
 `SHA256SUMS` and the v0.28.0 arm's matched the release's. The merged tree
 differs from the measured one in test sources only. Every box returned a
 result row for all 43 statements. The full results are #4072 comment
-6802934028.
+6802934028. What M9 measured after ADR-4143 is in the M9 results
+amendment below.
 
 **The gate did not pass.** No statement returned a null answer on any box.
 The concurrent QPS rows missed on all three.
@@ -1679,3 +1680,71 @@ are in comment 6802934028.
 - Production: a deployment whose refused statements group by string keys
   gets no write-once spill from this amendment. Its retries write the
   sort-merge plan's bytes, as before.
+- ADR-4143 admits string group keys to the bucketed retry and lets the
+  chunks take what the tables leave. Its gate, M9, is recorded in the M9
+  results amendment below.
+
+## Amendment (2026-11-16): M9 results for the string-key and small-host bucketed retry (issue #4154)
+
+<!-- amendment-applies: sections="Amendment (2026-11-11): M8 results for the parallel bucket spill gate" pointer="M9 results amendment" -->
+
+This is the M9 results amendment. Refs: #4154, epic #4143. ADR-4143
+decision 5 sets the gate for its decisions 1 (#4133, the open chunks take
+what the tables leave) and 3 (#4132, string and binary group keys are
+routed in byte-budgeted chunks, in the retry only). This amendment records
+what run `m9-main-f5ad7c95e-20261115T2031Z` measured against that gate. It
+changes no code and no decision.
+
+The gate was pre-registered before the build existed, in #4154 comment
+6899799509. That registration has 18 band rows, the file and field each
+one reads, and the script that judges it: `m9-judge.py` and
+`m9-retry-judge.py`, with 35 and 109 cases. Run against the M8 logs, both
+scripts exit 1 on the rows the M8 binary misses. The owner set the
+concurrent QPS row to be reported against 0.95, not gated, and the upper
+edge of the string-byte row to 1.25 times the predicted cell in
+`benchmarks/clickbench/bucket-bytes/results.txt`.
+
+The run used one box per size, all self-terminating. The server was built
+from `f5ad7c95e`, which descends from both decisions' merges, with CI
+green on it. On every box the measured binary's sha256 matched the build's
+`SHA256SUMS` (`4fb64a5f`). The ClickBench entry was pinned at `587cec146`,
+the commit M8 ran. Every box returned a result row for all 43 statements,
+and no box had a null answer. The full results are #4154 comment
+6902901483.
+
+**The gate passed.** `m9-judge.py` passed 18 row-box cells and
+`m9-retry-judge.py` passed 32, with none missed and none not judged.
+
+### M9 results against the gate rows
+
+| figure | band | result | outcome | source |
+|---|---|---|---|---|
+| statement 33 on c6a.large: plan and `bits` | bucket, `bits` 6 or 7 (7 predicted) | bucket, `bits` 7 on every try | inside | measured 2026-11-16, comment 6902901483 |
+| statement 33 on c6a.large: retry spill per try | at most 2.0 GB | 1.796 to 1.797 GB | inside | measured 2026-11-16, comment 6902901483 |
+| statement 33 hot, c6a.large | at most 56 s (about 35 s predicted) | 39.5 s; M8's sort-merge retry took 112 s | inside, prediction missed | measured 2026-11-16, comment 6902901483 |
+| statement 33 hot, c6a.xlarge and c6a.2xlarge | at most 1.10 x 16.8 s and 9.6 s | 17.1 s and 9.37 s | inside | measured 2026-11-16, comment 6902901483 |
+| statements 19, 34, 35: plan on every retry line | `bucket`, with a numeric `routed_chunk_bytes` equal to the recomputed budget | `bucket` on all 243 lines judged (53, 85, 105) | inside | measured 2026-11-16, comment 6902901483 |
+| statements 19, 34, 35: bucket bytes against M8's sort-merge threshold | below it | 0.267 to 0.333 on c6a.large, 0.345 to 0.426 on c6a.xlarge, 0.373 to 0.503 on c6a.2xlarge | inside | measured 2026-11-16, comment 6902901483 |
+| statements 19, 34, 35: bucket bytes against the predicted cell | at most 1.25 x | every line inside; statement 19 at 1.002 of its `bits` 4 cell on c6a.2xlarge | inside | measured 2026-11-16, comment 6902901483 |
+| null answers, each box | 0 | 0 on all three | inside | measured 2026-11-16, comment 6902901483 |
+| concurrent QPS, new over v0.28.0 (reported, not gated) | 0.95 | 0.900, 0.667, 0.857 (M8: 0.847, 0.761, 0.744) | reported | measured 2026-11-16, comment 6902901483 |
+
+### What the run shows beyond the gate
+
+- On c6a.large, statement 33 now derives a tuning and retries bucketed.
+  In M8 its derivation refused, and it kept the sort-merge retry.
+- In the serial passes, statements 19, 34 and 35 retried 3 times each on
+  c6a.large and c6a.xlarge and not at all on c6a.2xlarge, as in M8.
+- c6a.large under concurrency did not improve. The entry's own concurrent
+  window read QPS 0.075 with error ratio 0.471, against M8's 0.190 and
+  0.269. In the four interleaved windows, the new arm's mean QPS was
+  0.0855 (M8: 0.091) and its error ratio 0.664, against v0.28.0's 0.640.
+  The judge logged failed window retries on c6a.large as notes, as the
+  registration treats a failed window line: three bucket lines (statements
+  19, 35 and one other) and three sort-merge lines (two other statements),
+  each retry refused by the process budget or the host memory gate.
+  Nothing in M9 gates these.
+  They are the next thing to look at on small hosts.
+- Rows written for statement 33 are still judged against the corpus
+  counts, because #4112 (`exchange_output_rows`) is open.
+
