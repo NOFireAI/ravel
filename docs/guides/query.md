@@ -569,7 +569,7 @@ host resolves to.
 | Flag | Sets | Default (unset) | Reference host |
 |---|---|---|---|
 | `--fetch-concurrency <N>` | legacy: sets the three rows below together (source `legacy-flag`) | derived: `max(8, 2 x cores)` | 32 |
-| `--store-get-concurrency <N>` | the process-wide object-store GET ceiling, one `GetLimiter` that every fetcher and engine in the process shares | derived: `max(8, 2 x cores)` | 32 |
+| `--store-get-concurrency <N>` | the process-wide object-store GET ceiling, one `GetLimiter` that every fetcher and engine in the process shares | derived: `max(8, 2 x cores)`, capped at 64 on a loopback store endpoint | 32 |
 | `--sql-partition-count <N>` | the SQL scan partition count, DataFusion `target_partitions` | derived: `max(8, 2 x cores)` | 32 |
 | `--promql-fetch-fanout <N>` | the PromQL/analytics per-query segment fetch fan-out, per selector | derived: `max(8, 2 x cores)` | 32 |
 | `--max-segments <N>` | segments one query fans out over | fixed: 1,000,000 (host-independent) | 1,000,000 |
@@ -598,7 +598,8 @@ depends on what the operator set:
 
 Startup logs both adjustments, `clamped` and `raised` on the resolved lines,
 plus a WARN. It logs every resolved value, one line per setting with its
-source (`derived`, `flag`, `fallback`, or `legacy-flag`):
+source (`derived`, `derived-loopback-cap` for a capped `store_get_concurrency`
+on a loopback store, `flag`, `fallback`, or `legacy-flag`):
 
 ```
 INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
