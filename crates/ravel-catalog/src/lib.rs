@@ -49,6 +49,7 @@ pub use catalog::{
     AuthoritativeSelection, erasure_dominated_compaction_records,
     select_authoritative_compaction_records,
 };
+pub use charged::BudgetCatalogCharge;
 pub use column_stats_resolve::{
     ColumnStatsRequest, LoadColumnStatsError, LoadedColumnStats, unique_column_stat,
 };

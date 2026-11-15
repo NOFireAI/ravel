@@ -104,7 +104,7 @@ use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use ravel_catalog::{Catalog, SegmentLevel, SegmentRef};
+use ravel_catalog::{BudgetCatalogCharge, Catalog, SegmentLevel, SegmentRef};
 use ravel_ingest::Clock;
 use ravel_maintain::QueryAuditSink;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
@@ -117,7 +117,7 @@ use ravel_query::{
 };
 use ravel_segment::{
     ExemplarRecord, ExpectedIdentity, Footer, ReaderLimits, SeriesEntryV4, check_identity,
-    decode_catalog_v5, decode_exemplars_section, open_from_full,
+    decode_catalog_v5_charged, decode_exemplars_section, open_from_full,
 };
 use ravel_types::accounting::{AccountedOp, QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{
@@ -709,11 +709,37 @@ async fn read_segment_exemplars(
         .unwrap_or(&[]);
 
     // The catalog maps each exemplar's `series_index` back to its series id
-    // and labels. `decode_catalog_v5` returns entries in the object's sorted
-    // SERIES_IDS order, which is exactly the index space the EXEMPLARS section
-    // records reference.
-    let entries: Vec<SeriesEntryV4> = decode_catalog_v5(footer, &object, limits)
-        .map_err(|source| corrupt(data_object_key, source))?;
+    // and labels. `decode_catalog_v5_charged` returns entries in the object's
+    // sorted SERIES_IDS order, which is exactly the index space the EXEMPLARS
+    // section records reference. The decode runs through the process memory
+    // budget so the per-sample provenance it materializes (ADR-0092) is charged
+    // before it allocates, rather than decoded uncharged for a surface that
+    // never reads it (issue #4194): over budget, the decode is refused before
+    // the allocation; in budget, the provenance is dropped right after, so it
+    // is not held for the rest of the walk.
+    let mut charge = BudgetCatalogCharge::new(state.catalog.memory_budget());
+    let mut entries: Vec<SeriesEntryV4> =
+        match decode_catalog_v5_charged(footer, &object, limits, &mut charge) {
+            Ok(entries) => entries,
+            Err(ravel_segment::SegmentError::CatalogChargeRefused) => {
+                // `admit` records the exhaustion before it returns false, so a
+                // `CatalogChargeRefused` always carries one; the `None` arm
+                // surfaces a typed error rather than panicking if that ever
+                // ceases to hold.
+                return Err(CollectError::Api(match charge.refused() {
+                    Some(exhausted) => memory_exhausted(*exhausted),
+                    None => corrupt(
+                        data_object_key,
+                        ravel_segment::SegmentError::CatalogChargeRefused,
+                    ),
+                }));
+            }
+            Err(source) => return Err(CollectError::Api(corrupt(data_object_key, source))),
+        };
+    for entry in &mut entries {
+        entry.per_sample_provenance = Vec::new();
+    }
+    drop(charge);
 
     // Precompute which series indices any selector matches, so each exemplar
     // record is a single set lookup rather than a re-match.
@@ -1053,6 +1079,22 @@ fn corrupt(key: &str, source: ravel_segment::SegmentError) -> ServiceError {
         key: key.to_string(),
         source,
     }))
+}
+
+/// A catalog decode the memory budget refused, mapped to the same
+/// `FetchMemoryExhausted` the sample read path returns when a fetch overruns the
+/// budget (issue #4194). It carries the same status contract through the shared
+/// query-error mapping, so an over-budget exemplar query answers with memory
+/// pressure rather than being misreported as corruption.
+fn memory_exhausted(exhausted: ravel_memory::MemoryExhausted) -> ServiceError {
+    ServiceError::from_query(QueryError::Fetch(
+        ravel_query::FetchError::FetchMemoryExhausted {
+            requested: exhausted.requested,
+            reserved: exhausted.reserved,
+            limit: exhausted.limit,
+            cause: exhausted.cause,
+        },
+    ))
 }
 
 /// The result-cap rejection: the shape `TooManySegments` and the engine's
@@ -1824,6 +1866,227 @@ mod tests {
             query_admission: QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
             query_accounting: default_query_accounting(),
         }
+    }
+
+    /// An [`ExemplarsState`] over `backend` whose catalog charges catalog
+    /// decodes against `budget` (issue #4194), so a test can drive
+    /// `read_segment_exemplars` under a chosen memory limit.
+    fn build_state_with_budget(
+        backend: Arc<dyn ObjectStoreBackend>,
+        budget: &Arc<ravel_memory::MemoryBudget>,
+    ) -> ExemplarsState {
+        let mut state = build_state(
+            backend.clone(),
+            Duration::from_secs(30),
+            EngineConfig {
+                max_segments: 1000,
+                ..EngineConfig::default()
+            },
+            DEFAULT_MAX_EXEMPLARS,
+        );
+        state.catalog = Arc::new(
+            Catalog::new(backend, CatalogConfig::default())
+                .expect("catalog")
+                .with_memory_budget(Arc::clone(budget)),
+        );
+        state
+    }
+
+    /// Writes an L1 part with one series whose single run carries a per-sample
+    /// provenance column (ADR-0092) and one exemplar, stored under `key`, and
+    /// returns the `SegmentRef` that resolves to it. The EXEMPLARS section is
+    /// what makes `read_segment_exemplars` decode the catalog (and thus the
+    /// provenance) at all.
+    async fn put_l1_with_provenance_and_exemplar(
+        store: &MemoryStore,
+        key: &str,
+        metric: &str,
+        samples: usize,
+    ) -> SegmentRef {
+        let label_set = labels(metric, &[]);
+        let series_id = SeriesId::compute(&tenant(), metric, &label_set).expect("series id");
+        let values = SeriesValues::Scalar(
+            (0..samples)
+                .map(|k| Sample {
+                    ts_ns: NOW + k as i64,
+                    value: k as f64,
+                })
+                .collect(),
+        );
+        let run = ravel_segment::encode_run_v4(&series_id, NOW, 1, 1, &values).expect("frame run");
+        let provenance = Some(
+            (0..samples)
+                .map(|k| ravel_segment::SampleProvenance {
+                    created_unix_ns: NOW,
+                    writer_epoch: 1,
+                    writer_seq: 1,
+                    in_page_index: k as u32,
+                })
+                .collect(),
+        );
+        let input_set_hash = [0x5au8; 32];
+        let hour_bucket = u32::try_from(NOW / NS_PER_HOUR).expect("hour bucket");
+        let identity = SegmentIdentity {
+            tenant_hash: tenant().hash().0,
+            shard: 0,
+            writer_id: Uuid::nil().to_string(),
+            writer_epoch: 0,
+            writer_seq: 0,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: NOW,
+            max_ingest_ts_ns: NOW,
+        };
+        let meta = ravel_segment::CompactionMetaV4 {
+            ingest_hour_bucket: hour_bucket,
+            input_set_hash,
+            part_index: 0,
+            level: 1,
+        };
+        let exemplars = vec![exemplar(
+            series_id,
+            NOW,
+            1.0,
+            [0x11u8; 16],
+            [0x22u8; 8],
+            &[("k", "v")],
+        )];
+        let series = vec![ravel_segment::SeriesInputV7 {
+            series_id,
+            labels: label_set,
+            runs: vec![ravel_segment::RunInputV7 { run, provenance }],
+        }];
+        let written: WrittenSegment =
+            SegmentWriter::write_v7_with_provenance(series, identity, bounds, meta, exemplars)
+                .expect("write L1 with provenance and exemplar");
+        store
+            .put(
+                key,
+                written.bytes.clone(),
+                ravel_object_store::PutOptions::default(),
+            )
+            .await
+            .expect("put L1 object");
+        SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: hour_bucket,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id: Uuid::nil(),
+            writer_epoch: 0,
+            writer_seq: 0,
+            created_unix_ns: NOW,
+            level: SegmentLevel::L1 {
+                input_set_hash,
+                part_index: 0,
+            },
+            segment_format_version: u32::from(ravel_segment::VERSION_V7),
+            declared_column_stats: Default::default(),
+        }
+    }
+
+    /// `read_segment_exemplars` decodes an L1 part's per-sample provenance
+    /// (ADR-0092) that this surface never reads, so that decode is charged
+    /// against the catalog memory budget before it allocates (issue #4194).
+    /// Under a budget smaller than the provenance columns the read is refused
+    /// with the sample path's `FetchMemoryExhausted`, before the allocation;
+    /// under an ample budget it returns the matched exemplar unchanged.
+    ///
+    /// FLIP: route the decode through `decode_catalog_v5` (uncharged) in
+    /// `read_segment_exemplars` and the small-budget read no longer refuses --
+    /// it decodes the provenance uncharged and serves the exemplar, the
+    /// unbounded behavior this fix removes.
+    #[tokio::test]
+    async fn query_exemplars_charges_l1_provenance_before_it_allocates() {
+        const METRIC: &str = "exemplar_provenance_total";
+        // 64 samples: 64 * 64 B = 4096 B of provenance columns, past a tiny
+        // budget.
+        const SAMPLES: usize = 64;
+        const KEY: &str = "test/l1-provenance-exemplar.rseg";
+
+        let store = Arc::new(MemoryStore::new());
+        let seg = put_l1_with_provenance_and_exemplar(&store, KEY, METRIC, SAMPLES).await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+
+        let matcher_sets = vec![vec![LabelMatcher {
+            name: METRIC_NAME_LABEL.to_string(),
+            op: MatchOp::Eq,
+            value: METRIC.to_string(),
+        }]];
+        let window = (NOW - NS_PER_HOUR, NOW + NS_PER_HOUR);
+
+        // Over budget: refused before allocating the provenance.
+        let small = Arc::new(ravel_memory::MemoryBudget::new(8));
+        let state = build_state_with_budget(Arc::clone(&backend), &small);
+        let accounting = QueryAccounting::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut collected = Vec::new();
+        let err = read_segment_exemplars(
+            &state,
+            tenant().hash(),
+            &seg,
+            &matcher_sets,
+            &[],
+            window.0,
+            window.1,
+            &accounting,
+            &mut seen,
+            &mut collected,
+        )
+        .await
+        .expect_err("an over-budget provenance decode is refused");
+        match err {
+            CollectError::Api(service_error) => assert_eq!(
+                service_error.error_type, "execution",
+                "a refused decode is memory pressure (422/execution), not corruption"
+            ),
+            CollectError::SnapshotStale => panic!("expected a memory refusal, got SnapshotStale"),
+        }
+        assert!(
+            small.accounted_refusals() >= 1,
+            "the budget counted the refused provenance admission"
+        );
+        assert!(collected.is_empty(), "nothing is collected on a refusal");
+
+        // In budget: the matched exemplar is served unchanged.
+        let ample = Arc::new(ravel_memory::MemoryBudget::new(64 * 1024 * 1024));
+        let state = build_state_with_budget(backend, &ample);
+        let accounting = QueryAccounting::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut collected = Vec::new();
+        if read_segment_exemplars(
+            &state,
+            tenant().hash(),
+            &seg,
+            &matcher_sets,
+            &[],
+            window.0,
+            window.1,
+            &accounting,
+            &mut seen,
+            &mut collected,
+        )
+        .await
+        .is_err()
+        {
+            panic!("an in-budget read serves the exemplar");
+        }
+        assert_eq!(collected.len(), 1, "the matched exemplar is collected");
+        assert_eq!(
+            collected[0].1.get(METRIC_NAME_LABEL),
+            Some(METRIC),
+            "the collected exemplar carries the matched series' name"
+        );
+        assert_eq!(
+            ample.accounted_refusals(),
+            0,
+            "the ample budget refused nothing"
+        );
     }
 
     /// Captures every submitted audit event and reports durability success.
