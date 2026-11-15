@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dd55e323b168d8adba8ca78a76937364ed3edca165d88461636fe6b22194cfce # shrinks to (universe, specs, recents, plans) = ([Series { labels: [("__name__", "v0"), ("instance", "i0")], class: 0 }], [PartSpec { entries: [[], []], uncovered: [true, false], present: [true, true], series_leaves: All, label_value: false, bucket_bits: 1, slices: 1 }], [], [[(0, 0), (0, 1)]]), options = SeriesRouteOptions { s_max: 192, q_a: 8388608, q_bc: 4194304, max_parts: 1024 }
+cc 784581f97a4b695b79962fb1353e299fdd57033360604c486913c85083beaa31 # shrinks to (universe, specs, recents, plans) = ([Series { labels: [("__name__", "v0"), ("instance", "i0"), ("job", "v0")], class: 0 }], [PartSpec { entries: [[], [], [0]], uncovered: [false, false, false], present: [true, true, true], series_leaves: All, label_value: false, bucket_bits: 1, slices: 1 }], [], [[(2, 0), (0, 0)], [(1, 0), (0, 0)]]), options = SeriesRouteOptions { s_max: 192, q_a: 8388608, q_bc: 227, max_parts: 2 }
