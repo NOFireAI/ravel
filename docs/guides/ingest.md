@@ -1751,8 +1751,13 @@ section that the RLOG objects of a logs load compress with zstd.
 - It accepts the range of zstd, -131072 to 22. A level outside it is refused
   before anything is read.
 - A page or section is stored compressed only when that is smaller than
-  storing it raw. The encoding of a page is chosen by stored size, so the
-  level can also change which encoding a page keeps.
+  storing it raw.
+- Whether a string chunk stores its values on one row-group dictionary or
+  on per-block pages is chosen by stored size under either `--page-choice`.
+  Under `--page-choice exhaustive` the encoding of each page is chosen by
+  stored size too. The level can therefore change which form a chunk or a
+  page keeps (see
+  [Page encoding with `--page-choice`](#page-encoding-with---page-choice)).
 - zstd is lossless. The level changes object size and never the records
   read back.
 - The level applies only to the objects that the load writes. Compaction
@@ -1815,6 +1820,35 @@ group, in the given order.
 - The order applies only to the objects that the load writes. Compaction
   writes its objects in name order, with PAGE_DIR still exact for them.
 - A metrics or spans load warns and ignores the flag.
+
+### Page encoding with `--page-choice`
+
+`--page-choice <CHOICE>` (default `estimated`) sets how the RLOG writer of
+every flush a logs load runs picks each page's encoding. It takes one of two
+values.
+
+- `estimated` seals one candidate encoding per page. For an i64 page it is
+  the candidate with the smallest encoded length, computed from one pass of
+  statistics. For a string page it is the candidate the dictionary
+  heuristic ranks first. A string column any of whose blocks in a row group
+  chose a plain page stays on per-block pages for that row group.
+- `exhaustive` seals every candidate encoding of each page and keeps the one
+  with the fewest stored bytes. It was the loader's only behaviour before
+  the flag existed.
+- Under either value, a string chunk moves onto one row-group dictionary
+  only when that stores strictly fewer bytes, PAGE_DIR entries included,
+  than its per-block pages.
+- The trade, measured on the ClickBench hits corpus on one c6a.4xlarge:
+  against `exhaustive`, an `estimated` load took 7.7% less wall time
+  (452.4 s against 490.1 s) and 11.1% less CPU, and its objects stored
+  2.43% more bytes (8,530,539,390 against 8,328,210,617).
+- Both values write encodings the format defines, and readers decode
+  objects from either one the same way. The choice changes object size and
+  write cost, never the records read back.
+- The summary's `page choice` line and the report JSON's `page_choice`
+  field name the choice the load wrote with, for a logs load only.
+- A metrics or spans load ignores the flag and prints a warning when it is
+  set to `exhaustive`.
 
 ### Clustering key and bloom scope
 

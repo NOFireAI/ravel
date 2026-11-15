@@ -821,10 +821,11 @@ pub struct IngestConfig {
     /// span flushes do not read it.
     pub rlog_chunk_order: RlogChunkOrder,
     /// How each RLOG object a log flush writes picks its page encodings
-    /// (ADR-3492 decision 1). [`PageChoice::Estimated`] by default, the
-    /// server's logs ingest flush; the bulk loader sets
-    /// [`PageChoice::Exhaustive`], the writer default, since it trades write
-    /// time for stored bytes. Metrics and span flushes do not read it.
+    /// (ADR-3492 decision 1). [`PageChoice::Estimated`] by default, which the
+    /// server's logs ingest flush and the bulk loader both keep; the loader
+    /// sets [`PageChoice::Exhaustive`], the writer default, only under
+    /// `--page-choice exhaustive`, which trades write time for stored bytes.
+    /// Metrics and span flushes do not read it.
     pub rlog_page_choice: PageChoice,
     /// Ceiling on pending strict-mode acks a `submit` may hold outstanding at
     /// once (ADR-2793 decision 4; [`crate::PendingAckBudget`]). It is
