@@ -1451,6 +1451,13 @@ pub(crate) mod tests {
         )
         .await;
 
+        // Checked before the statuses, so a handler that writes the batch and
+        // then answers 503 fails here on its own.
+        assert_eq!(
+            all_keys(&store).await,
+            before,
+            "a refused request must write no data object and no commit record"
+        );
         for (signal, response) in [("logs", logs_response), ("traces", traces_response)] {
             assert_eq!(
                 response.status(),
@@ -1463,11 +1470,6 @@ pub(crate) mod tests {
             let text = String::from_utf8(body.to_vec()).expect("utf8 body");
             assert!(text.contains(MARKER_NEWER_MESSAGE), "{signal}: {text}");
         }
-        assert_eq!(
-            all_keys(&store).await,
-            before,
-            "a refused request must write no data object and no commit record"
-        );
 
         let scraped_after = scrape().await;
         for signal in ["logs", "spans"] {
