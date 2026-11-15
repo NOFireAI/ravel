@@ -2700,6 +2700,12 @@ fn migrate_report_text(
 /// it gets an `unwritable_skipped` line naming the object's key, and any such
 /// line makes the run exit nonzero, however the run ended.
 ///
+/// A bucket the walk holds (ADR-4233 decision 6: an input outside the reader
+/// window, an input or compaction part recorded above the version this build
+/// writes, or an input that fails to decode) is passed over and the walk goes
+/// on. Such a run prints its report, then one `held:` line per held bucket with
+/// its reason, and exits nonzero without raising the floor.
+///
 /// "Until a later run migrates it" below is the next run when this one drained
 /// the walk, since a drained walk clears its cursor. After a budget stop the
 /// cursor is persisted past every bucket this run examined, so the next run
