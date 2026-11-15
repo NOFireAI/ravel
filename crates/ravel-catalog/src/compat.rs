@@ -553,12 +553,13 @@ pub async fn activate_family(
         });
     }
     update_compat(store, keys, |record| {
-        let epoch = record
-            .compat_epoch
-            .checked_add(1)
-            .ok_or_else(|| CompatError::EpochExhausted {
-                key: COMPAT_KEY.to_string(),
-            })?;
+        let epoch =
+            record
+                .compat_epoch
+                .checked_add(1)
+                .ok_or_else(|| CompatError::EpochExhausted {
+                    key: COMPAT_KEY.to_string(),
+                })?;
         let entry = record
             .families
             .iter_mut()
@@ -623,7 +624,9 @@ pub enum CompatRefusal {
         now_unix_ns: i64,
     },
     /// This build cannot write the family's active version.
-    #[error("family {family}: active write version {active} is not one this build writes ({writable:?})")]
+    #[error(
+        "family {family}: active write version {active} is not one this build writes ({writable:?})"
+    )]
     ActiveVersionNotWritable {
         family: String,
         active: u32,
@@ -691,7 +694,11 @@ struct ViewState {
 }
 
 impl ViewState {
-    fn merge(&mut self, record: Option<sysproto::CompatRecord>, read_unix_ns: i64) -> CompatRefresh {
+    fn merge(
+        &mut self,
+        record: Option<sysproto::CompatRecord>,
+        read_unix_ns: i64,
+    ) -> CompatRefresh {
         let mut rolled_back = Vec::new();
         let read_epoch = record.as_ref().map(|r| r.compat_epoch);
         if let Some(record) = &record {
@@ -965,7 +972,11 @@ mod tests {
         );
         assert_eq!(DEFAULT_COMPAT_REFRESH_INTERVAL, Duration::from_secs(60));
         assert_eq!(
-            (COMPAT_FORMAT_VERSION, COMPAT_MIN_READ_VERSION, COMPAT_MAX_READ_VERSION),
+            (
+                COMPAT_FORMAT_VERSION,
+                COMPAT_MIN_READ_VERSION,
+                COMPAT_MAX_READ_VERSION
+            ),
             (1, 1, 1)
         );
         for name in KNOWN_FAMILIES {
@@ -1001,7 +1012,13 @@ mod tests {
 
         view.refresh().await.expect("refresh");
         assert_eq!(
-            view.write_policy(T0 + COMPAT_VIEW_HORIZON_NS - 1, FAMILY_RSEG, &[5, 6], 5, None),
+            view.write_policy(
+                T0 + COMPAT_VIEW_HORIZON_NS - 1,
+                FAMILY_RSEG,
+                &[5, 6],
+                5,
+                None
+            ),
             Ok(6)
         );
         assert_eq!(
@@ -1029,10 +1046,7 @@ mod tests {
         );
         assert_eq!(refresh.read_epoch, Some(0));
         assert_eq!(refresh.seen_epoch, 1);
-        assert_eq!(
-            view.write_policy(t1, FAMILY_RSEG, &[5, 6], 5, None),
-            Ok(6)
-        );
+        assert_eq!(view.write_policy(t1, FAMILY_RSEG, &[5, 6], 5, None), Ok(6));
         assert_eq!(
             view.write_policy(t1, FAMILY_RSEG, &[5], 5, None),
             Err(CompatRefusal::ActiveVersionNotWritable {
@@ -1047,10 +1061,7 @@ mod tests {
 
         // A clone shares the view.
         let clone = view.clone();
-        assert_eq!(
-            clone.write_policy(t1, FAMILY_RSEG, &[5, 6], 5, None),
-            Ok(6)
-        );
+        assert_eq!(clone.write_policy(t1, FAMILY_RSEG, &[5, 6], 5, None), Ok(6));
     }
 
     #[tokio::test]
@@ -1141,7 +1152,10 @@ mod tests {
         let err = create_compat(store.as_ref(), &keys(), baseline_record())
             .await
             .expect_err("create refuses");
-        assert!(matches!(err, CompatError::AlreadyExists { .. }), "got: {err}");
+        assert!(
+            matches!(err, CompatError::AlreadyExists { .. }),
+            "got: {err}"
+        );
 
         let view = view(store.clone(), ManualClock::at(T0));
         let err = view.refresh().await.expect_err("refresh refuses");
@@ -1162,7 +1176,10 @@ mod tests {
         let err = activate_family(&store, &keys(), FAMILY_RSEG, 8, "op", T0)
             .await
             .expect_err("absent record");
-        assert!(matches!(err, CompatError::RecordAbsent { .. }), "got: {err}");
+        assert!(
+            matches!(err, CompatError::RecordAbsent { .. }),
+            "got: {err}"
+        );
 
         create_compat(&store, &keys(), baseline_record())
             .await
@@ -1221,11 +1238,17 @@ mod tests {
         let err = activate_family(&store, &keys(), "csnap", 2, "op", T0 + 1)
             .await
             .expect_err("no entry");
-        assert!(matches!(err, CompatError::FamilyNotInRecord { .. }), "got: {err}");
+        assert!(
+            matches!(err, CompatError::FamilyNotInRecord { .. }),
+            "got: {err}"
+        );
         let err = activate_family(&store, &keys(), "RSEG", 9, "op", T0 + 1)
             .await
             .expect_err("bad name");
-        assert!(matches!(err, CompatError::FamilyInvalid { .. }), "got: {err}");
+        assert!(
+            matches!(err, CompatError::FamilyInvalid { .. }),
+            "got: {err}"
+        );
         assert_eq!(stored_bytes(&store).await, before, "refusals write nothing");
 
         let (record, _) = activate_family(&store, &keys(), FAMILY_RLOG, 6, "op-b", T0 + 2)
@@ -1329,7 +1352,10 @@ mod tests {
             .await
             .expect("create");
         view.refresh().await.expect("refresh");
-        assert_eq!(view.write_policy(T0, FAMILY_RSEG, &[7], 7, Some(&fenced)), Ok(7));
+        assert_eq!(
+            view.write_policy(T0, FAMILY_RSEG, &[7], 7, Some(&fenced)),
+            Ok(7)
+        );
         store.delete(COMPAT_KEY).await.expect("delete");
         view.refresh().await.expect("refresh");
         let refusal = view

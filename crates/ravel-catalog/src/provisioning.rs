@@ -1744,15 +1744,15 @@ pub async fn validate_or_adopt_fenced(
         Some(_) => {
             // Pre-ADR data, all shard indices in range: safe to adopt.
             write_record_race_safe(
-                    store,
-                    &key,
-                    tenant_hash,
-                    signal,
-                    shard_count,
-                    now_ns,
-                    compat_epoch,
-                )
-                .await
+                store,
+                &key,
+                tenant_hash,
+                signal,
+                shard_count,
+                now_ns,
+                compat_epoch,
+            )
+            .await
         }
     }
 }
@@ -6040,7 +6040,12 @@ pub(crate) mod tests {
 
         assert!(
             matches!(
-                check_read_version(fenced.format_version, PROVISIONING_MIN_READ_VERSION, 3, &key),
+                check_read_version(
+                    fenced.format_version,
+                    PROVISIONING_MIN_READ_VERSION,
+                    3,
+                    &key
+                ),
                 Err(ProvisioningError::UnsupportedVersion {
                     got: 4,
                     ceiling: 3,
@@ -6083,10 +6088,9 @@ pub(crate) mod tests {
         assert_eq!(fence_fields(&refenced), (4, 3, 7_000));
 
         for epoch in [3, 1, 0] {
-            let out =
-                raise_compat_fence(store.as_ref(), &tenant(), Signal::Metrics, epoch, 10_000)
-                    .await
-                    .expect("no-op raise");
+            let out = raise_compat_fence(store.as_ref(), &tenant(), Signal::Metrics, epoch, 10_000)
+                .await
+                .expect("no-op raise");
             assert_eq!(out, CompatFenceOutcome::AlreadyFenced { compat_epoch: 3 });
         }
         assert_eq!(
@@ -6108,9 +6112,16 @@ pub(crate) mod tests {
         fenced.compat_fenced_unix_ns = 7_000;
         seed_exact(store.as_ref(), &fenced).await;
 
-        append_generation(store.as_ref(), &tenant(), Signal::Metrics, 8, 12, 10 * NS_PER_HOUR)
-            .await
-            .expect("reshard a fenced record");
+        append_generation(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            8,
+            12,
+            10 * NS_PER_HOUR,
+        )
+        .await
+        .expect("reshard a fenced record");
         let (resharded, _) = stored_record(store.as_ref(), Signal::Metrics).await;
         assert_eq!(fence_fields(&resharded), (4, 3, 7_000));
         assert_eq!(
@@ -6144,10 +6155,17 @@ pub(crate) mod tests {
         seed_exact(store.as_ref(), &newer).await;
         let (_, seeded) = stored_record(store.as_ref(), Signal::Metrics).await;
         let refusals = [
-            append_generation(store.as_ref(), &tenant(), Signal::Metrics, 8, 12, 10 * NS_PER_HOUR)
-                .await
-                .map(|_| ())
-                .expect_err("reshard of a version-5 record"),
+            append_generation(
+                store.as_ref(),
+                &tenant(),
+                Signal::Metrics,
+                8,
+                12,
+                10 * NS_PER_HOUR,
+            )
+            .await
+            .map(|_| ())
+            .expect_err("reshard of a version-5 record"),
             raise_format_floor(
                 store.as_ref(),
                 &tenant(),
@@ -6277,9 +6295,16 @@ pub(crate) mod tests {
             (3, 0, 0)
         );
 
-        append_generation(store.as_ref(), &tenant(), Signal::Metrics, 8, 12, 10 * NS_PER_HOUR)
-            .await
-            .expect("reshard");
+        append_generation(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            8,
+            12,
+            10 * NS_PER_HOUR,
+        )
+        .await
+        .expect("reshard");
         assert_eq!(
             fence_fields(&stored_record(store.as_ref(), Signal::Metrics).await.0),
             (3, 0, 0)
