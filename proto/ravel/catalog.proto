@@ -308,7 +308,7 @@ message SnapshotKeyIndexLeafRef {
 // header crc32c. Layout and validation: docs/catalog-and-mvcc.md,
 // "Per-part key-index leaves".
 message KeyIndexLeafHeader {
-  uint32 format_version = 1;  // 2 (logs readers reject 1, spans accept 1 and 2)
+  uint32 format_version = 1;  // 2, or 3 for metrics (logs readers reject 1)
   bytes tenant_hash = 2;      // 16
   uint32 signal = 3;
   bytes part_blake3 = 4;      // 32, binds the leaf to one exact part
@@ -321,4 +321,5 @@ message KeyIndexLeafHeader {
   uint64 part_entry_count = 11;     // the covered part's SnapshotEntry count
   repeated uint64 uncovered_entry_ordinals = 12;  // each below part_entry_count
   uint64 body_len = 13;             // stored body bytes after dir_crc32c
+  uint32 entry_kind = 14;  // 0 entry, 1 posting; non-zero only at version 3
 }

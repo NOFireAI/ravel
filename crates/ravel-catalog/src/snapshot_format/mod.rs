@@ -26,7 +26,7 @@ pub use head::{
 };
 pub use kidx::{
     DEFAULT_MAX_KEY_INDEX_LEAF_BODY_BYTES, EncodedKeyIndexLeaf, KEY_INDEX_LEAF_FORMAT_VERSION,
-    KEY_INDEX_LEAF_FORMAT_VERSION_1, KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN,
+    KEY_INDEX_LEAF_FORMAT_VERSION_1, KEY_INDEX_LEAF_FORMAT_VERSION_3, KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN, KeyIndexEntryKind, KeyIndexPostingEntry, KeyIndexPostingLeafInput, KeyIndexPostingSetAnswer, KeyIndexPostingSetDecoder, METRICS_CLASS_OBJECTS_FIELD, METRICS_SERIES_CLASS_FIELD, METRICS_SERIES_LABEL_FIELD, SERIES_LABEL_METRIC_NAME, encode_key_index_posting_leaf, encode_key_index_posting_leaf_with_bucket_bits, encoded_posting_len, key_index_field_entry_kind, key_index_leaf_versions_for_signal, posting_decoded_bound, series_label_pair_bytes, series_label_pair_key8, split_key_index_postings, verify_key_index_posting_leaf_frames,
     KEY_INDEX_LEAF_GET_CEILING, KEY_INDEX_LEAF_MAGIC, KEY_INDEX_LEAF_MIN_BUCKET_BITS,
     KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS, KEY_INDEX_LEAF_WRITER_MAX_BUCKET_BITS,
     KEY_INDEX_MAX_PROBED_PARTS, KEY_INDEX_SET_PROBE_MAX_RUNS, KEY_INDEX_T1_BYTES,
