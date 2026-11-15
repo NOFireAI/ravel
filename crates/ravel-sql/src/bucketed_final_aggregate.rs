@@ -1022,13 +1022,21 @@ impl<'a> ByteSource<'a> {
 /// is written, which every row's fixed-width values, view or offset,
 /// validity and copied string bytes come out of ([`routed_column_bytes`]).
 /// Strings are copied into the chunk's own data block, so no source batch
-/// stays alive behind it, and its buffers' capacities never sum past the
-/// budget.
+/// stays alive behind it, and once a row is in, its buffers' capacities sum
+/// to at most the chunk's charge: every buffer is sized for a row before any
+/// of the row is written ([`ByteChunk::reserve_row`]), and a write past a
+/// buffer's capacity is an error, never a reallocation ([`append`]). While
+/// one buffer grows (or is cut), its old copy is also held until the new one
+/// is filled ([`resize_capacity`]), so for that moment the allocation passes
+/// the charge by the old copy's capacity.
 struct ByteChunk {
     types: Vec<(DataType, RoutedLayout)>,
     /// Per column: the validity bitmap, the values (fixed-width values,
     /// offsets or views) and the data block.
     buffers: Vec<[MutableBuffer; 3]>,
+    /// Per column, scratch for [`ByteChunk::reserve_row`]: each buffer's
+    /// length once the next row is written.
+    lengths: Vec<[usize; 3]>,
     null_counts: Vec<usize>,
     copied: Vec<usize>,
     len: usize,
@@ -1036,10 +1044,60 @@ struct ByteChunk {
     row_cap: usize,
 }
 
-/// A chunk's buffer slots.
-const VALIDITY: usize = 0;
-const VALUES: usize = 1;
+/// A chunk's data block slot.
 const DATA: usize = 2;
+
+fn chunk_error(what: impl std::fmt::Display) -> DataFusionError {
+    DataFusionError::Internal(format!("BucketedFinalAggregateExec: {what}"))
+}
+
+/// `length` rounded up to the 64 bytes a buffer is allocated in.
+fn rounded_capacity(length: usize) -> DFResult<usize> {
+    length
+        .checked_next_multiple_of(64)
+        .ok_or_else(|| chunk_error(format!("a chunk buffer of {length} bytes passes usize")))
+}
+
+/// Move `buffer`'s bytes into a new allocation of `capacity` bytes, at
+/// least its length; the old allocation is freed once they are copied.
+fn resize_capacity(buffer: &mut MutableBuffer, capacity: usize) {
+    let mut resized = MutableBuffer::with_capacity(capacity);
+    resized.extend_from_slice(buffer.as_slice());
+    *buffer = resized;
+}
+
+/// Append `bytes` to a chunk buffer inside the capacity it already holds.
+/// A write that would grow it is refused, so a chunk buffer is only ever
+/// sized by [`ByteChunk::reserve_row`], [`ByteChunk::reserve_exact`] or
+/// `seal`, never by a write.
+fn append(buffer: &mut MutableBuffer, bytes: &[u8]) -> DFResult<()> {
+    let spare = buffer.capacity() - buffer.len();
+    if bytes.len() > spare {
+        return Err(chunk_error(format!(
+            "a chunk write of {} bytes into {spare} bytes of reserved capacity",
+            bytes.len()
+        )));
+    }
+    buffer.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// Append `offset` to an offsets buffer of `width`-byte offsets, refusing
+/// one the width cannot hold.
+fn append_offset(offsets: &mut MutableBuffer, width: usize, offset: usize) -> DFResult<()> {
+    let passes = || {
+        chunk_error(format!(
+            "a data offset {offset} passes a {width}-byte offset"
+        ))
+    };
+    if width == size_of::<i32>() {
+        let offset = i32::try_from(offset).map_err(|_| passes())?;
+        append(offsets, &offset.to_ne_bytes())
+    } else {
+        let offset = i64::try_from(offset).map_err(|_| passes())?;
+        append(offsets, &offset.to_ne_bytes())
+    }
+}
 
 impl ByteChunk {
     /// An empty chunk of `budget` bytes and at most `row_cap` rows,
@@ -1051,6 +1109,7 @@ impl ByteChunk {
                 .iter()
                 .map(|_| std::array::from_fn(|_| MutableBuffer::new(0)))
                 .collect(),
+            lengths: vec![[0; 3]; types.len()],
             null_counts: vec![0; types.len()],
             copied: vec![0; types.len()],
             len: 0,
@@ -1082,6 +1141,7 @@ impl ByteChunk {
     }
 
     /// The capacity every buffer of the chunk holds.
+    #[cfg(test)]
     fn capacity(&self) -> usize {
         self.buffers
             .iter()
@@ -1090,37 +1150,85 @@ impl ByteChunk {
             .sum()
     }
 
-    /// Make room for `len` bytes in `column`'s buffer `slot`, keeping every
-    /// buffer's capacity together within the budget: double when that fits,
-    /// else grow to exactly what is asked, after shrinking every other
-    /// buffer to its length when even that does not fit. The caller has
-    /// checked the row fits, so the exact sizes always do.
-    fn reserve(&mut self, column: usize, slot: usize, len: usize) {
-        let held = self.buffers[column][slot].capacity();
-        if len <= held {
-            return;
+    /// Size every buffer for `row` of `sources` before any of the row is
+    /// written, all of them together within the budget: every buffer short
+    /// of its new length doubles when all of them doubled still fit beside
+    /// the rest, else takes exactly its length rounded up to 64 bytes, after
+    /// every buffer is first cut to its own rounded length when even that
+    /// does not fit. Cuts run before growths, so the capacities held never
+    /// sum past the budget. The caller has checked the row
+    /// [`fits`](Self::fits), and the rounded lengths of a row that fits sum
+    /// to at most its [`routed_column_bytes`]; a set that would not is
+    /// refused before any buffer moves.
+    fn reserve_row(&mut self, sources: &[ByteSource<'_>], row: usize) -> DFResult<()> {
+        let rows = self.len + 1;
+        for (((lengths, (_, layout)), buffers), source) in self
+            .lengths
+            .iter_mut()
+            .zip(&self.types)
+            .zip(&self.buffers)
+            .zip(sources)
+        {
+            let values = match *layout {
+                RoutedLayout::Fixed(width) => rows.checked_mul(width),
+                RoutedLayout::Offsets(width) => {
+                    rows.checked_add(1).and_then(|rows| rows.checked_mul(width))
+                }
+                RoutedLayout::Views => rows.checked_mul(size_of::<u128>()),
+            };
+            let data = buffers[DATA].len().checked_add(source.copied(row));
+            let (Some(values), Some(data)) = (values, data) else {
+                return Err(chunk_error("a routed row passes usize"));
+            };
+            *lengths = [rows.div_ceil(8), values, data];
         }
-        let exact = len.next_multiple_of(64);
-        let doubled = exact.max(held.saturating_mul(2));
-        let others = self.capacity() - held;
-        let buffer = &mut self.buffers[column][slot];
-        if others.saturating_add(doubled) <= self.budget {
-            buffer.reserve(len - buffer.len());
-            return;
+        let (mut doubled, mut exact, mut cut) = (0usize, 0usize, 0usize);
+        for (buffers, lengths) in self.buffers.iter().zip(&self.lengths) {
+            for (buffer, &length) in buffers.iter().zip(lengths) {
+                let held = buffer.capacity();
+                let rounded = rounded_capacity(length)?;
+                let (grown, grown_exact) = if length > held {
+                    (rounded.max(held.saturating_mul(2)), rounded)
+                } else {
+                    (held, held)
+                };
+                doubled = doubled.saturating_add(grown);
+                exact = exact.saturating_add(grown_exact);
+                cut = cut.saturating_add(rounded);
+            }
         }
-        if others.saturating_add(exact) > self.budget {
-            for (index, buffers) in self.buffers.iter_mut().enumerate() {
-                for (at, other) in buffers.iter_mut().enumerate() {
-                    if (index, at) != (column, slot) {
-                        other.shrink_to_fit();
+        if cut > self.budget {
+            return Err(chunk_error(format!(
+                "a row needs {cut} bytes of chunk buffers, over the chunk's budget {}",
+                self.budget
+            )));
+        }
+        let double = doubled <= self.budget;
+        if !double && exact > self.budget {
+            for (buffers, lengths) in self.buffers.iter_mut().zip(&self.lengths) {
+                for (buffer, &length) in buffers.iter_mut().zip(lengths) {
+                    let rounded = rounded_capacity(length)?;
+                    if buffer.capacity() > rounded {
+                        resize_capacity(buffer, rounded);
                     }
                 }
             }
         }
-        let buffer = &mut self.buffers[column][slot];
-        let mut grown = MutableBuffer::with_capacity(exact);
-        grown.extend_from_slice(buffer.as_slice());
-        *buffer = grown;
+        for (buffers, lengths) in self.buffers.iter_mut().zip(&self.lengths) {
+            for (buffer, &length) in buffers.iter_mut().zip(lengths) {
+                let held = buffer.capacity();
+                if length > held {
+                    let rounded = rounded_capacity(length)?;
+                    let capacity = if double {
+                        rounded.max(held.saturating_mul(2))
+                    } else {
+                        rounded
+                    };
+                    resize_capacity(buffer, capacity);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Size every buffer for exactly `rows` of `sources`, on an empty chunk
@@ -1141,67 +1249,62 @@ impl ByteChunk {
         }
     }
 
-    /// Copy `row` of `sources` into the chunk. The caller has checked it
-    /// [`fits`](Self::fits), or sized the chunk for it.
-    fn push_row(&mut self, sources: &[ByteSource<'_>], row: usize) {
+    /// Copy `row` of `sources` into the chunk, every buffer sized for it by
+    /// [`reserve_row`](Self::reserve_row) before the first byte is written.
+    /// The caller has checked it [`fits`](Self::fits), or sized the chunk
+    /// for it.
+    fn push_row(&mut self, sources: &[ByteSource<'_>], row: usize) -> DFResult<()> {
+        self.reserve_row(sources, row)?;
         let at = self.len;
         for (column, source) in sources.iter().enumerate() {
             let layout = self.types[column].1;
+            let [validity, values, data] = &mut self.buffers[column];
             if at.is_multiple_of(8) {
-                self.reserve(column, VALIDITY, at / 8 + 1);
-                self.buffers[column][VALIDITY].push(0u8);
+                append(validity, &[0])?;
             }
             let null = source.is_null(row);
             if null {
                 self.null_counts[column] += 1;
             } else {
-                bit_util::set_bit(self.buffers[column][VALIDITY].as_slice_mut(), at);
+                bit_util::set_bit(validity.as_slice_mut(), at);
             }
             match (layout, source) {
                 (RoutedLayout::Fixed(width), ByteSource::Fixed(source)) => {
                     let start = (source.offset + row) * width;
-                    self.reserve(column, VALUES, (at + 1) * width);
-                    self.buffers[column][VALUES]
-                        .extend_from_slice(&source.values[start..start + width]);
+                    append(values, &source.values[start..start + width])?;
                 }
                 (RoutedLayout::Offsets(width), _) => {
-                    let value = if null { &[][..] } else { source.value(row) };
-                    let data_len = self.buffers[column][DATA].len() + value.len();
-                    self.reserve(column, VALUES, (at + 2) * width);
-                    self.reserve(column, DATA, data_len);
-                    let [_, offsets, data] = &mut self.buffers[column];
                     if at == 0 {
-                        offsets.extend_zeros(width);
+                        append_offset(values, width, 0)?;
                     }
-                    if width == size_of::<i32>() {
-                        offsets.extend_from_slice(&(data_len as i32).to_ne_bytes());
-                    } else {
-                        offsets.extend_from_slice(&(data_len as i64).to_ne_bytes());
-                    }
-                    data.extend_from_slice(value);
+                    append(data, if null { &[] } else { source.value(row) })?;
+                    append_offset(values, width, data.len())?;
                 }
                 (RoutedLayout::Views, ByteSource::Views { views, .. }) => {
-                    self.reserve(column, VALUES, (at + 1) * size_of::<u128>());
                     let view = if null { 0 } else { views[row] };
                     let len = view as u32 as usize;
                     let view = if len > VIEW_INLINE_BYTES {
-                        let value = source.value(row);
-                        let offset = self.buffers[column][DATA].len();
-                        self.reserve(column, DATA, offset + len);
-                        self.buffers[column][DATA].extend_from_slice(value);
+                        let offset = u32::try_from(data.len()).map_err(|_| {
+                            chunk_error(format!(
+                                "a view's data offset {} passes u32::MAX",
+                                data.len()
+                            ))
+                        })?;
+                        append(data, source.value(row))?;
                         // Length and prefix kept, buffer 0 of the chunk at
                         // the copy's offset.
-                        (view & u128::from(u64::MAX)) | ((offset as u128) << 96)
+                        (view & u128::from(u64::MAX)) | (u128::from(offset) << 96)
                     } else {
                         view
                     };
-                    self.buffers[column][VALUES].extend_from_slice(&view.to_ne_bytes());
+                    append(values, &view.to_ne_bytes())?;
                 }
                 _ => {}
             }
             self.copied[column] += source.copied(row);
         }
         self.len += 1;
+        Ok(())
     }
 
     /// The chunk's arrays, charged at the budget.
@@ -1223,7 +1326,9 @@ impl ByteChunk {
                 }
                 RoutedLayout::Offsets(width) => {
                     if values.is_empty() {
-                        values.extend_zeros(width);
+                        // No row was pushed, so nothing was reserved: the
+                        // one zero offset gets its own allocation.
+                        values = MutableBuffer::from_len_zeroed(width);
                     }
                     builder = builder
                         .add_buffer(Buffer::from(values))
@@ -1636,7 +1741,7 @@ impl Router {
                         "BucketedFinalAggregateExec: a bucket has no open chunk".to_string(),
                     ));
                 };
-                filling.push_row(sources, row);
+                filling.push_row(sources, row)?;
                 target.rows += 1;
                 done += 1;
             }
@@ -1768,7 +1873,7 @@ impl Router {
         let mut piece = ByteChunk::new(&self.types, usize::MAX, usize::MAX);
         piece.reserve_exact(sources, rows);
         for &row in rows {
-            piece.push_row(sources, row as usize);
+            piece.push_row(sources, row as usize)?;
         }
         spill.write(bucket, piece.seal()?.columns)?;
         self.buckets[bucket].rows += end - start;
@@ -2624,6 +2729,7 @@ impl RecordBatchStream for BucketedStream {
 mod tests {
     use super::*;
     use crate::bucket_spill_tuning::routed_chunk_charge;
+    use proptest::prelude::*;
 
     const POOL: &str = "query memory pool spill threshold reached: ";
 
@@ -2971,7 +3077,7 @@ mod tests {
                     } else {
                         for row in start..start + take {
                             assert!(chunk.fits(&sources, row), "{string}: row {row} fits");
-                            chunk.push_row(&sources, row);
+                            chunk.push_row(&sources, row).expect("push a row");
                         }
                         let end = start + take;
                         assert!(
@@ -2986,6 +3092,98 @@ mod tests {
                 if row_cap > rows {
                     assert!(slices > 12, "{string}: {slices} slices of {rows} rows");
                 }
+            }
+        }
+    }
+
+    /// The column types `prop_byte_chunk_capacity_stays_within_its_budget`
+    /// routes.
+    const BUDGET_SHAPES: [[DataType; 2]; 5] = [
+        [DataType::Int64, DataType::Utf8View],
+        [DataType::Int64, DataType::BinaryView],
+        [DataType::Int64, DataType::Utf8],
+        [DataType::Int64, DataType::LargeUtf8],
+        [DataType::Utf8View, DataType::Utf8],
+    ];
+
+    /// A value of 0 to 200 bytes, NULL or empty often enough to matter.
+    fn budget_value() -> impl Strategy<Value = Option<String>> {
+        prop_oneof![
+            1 => Just(None),
+            1 => Just(Some(String::new())),
+            8 => (0usize..=200, any::<u8>()).prop_map(|(len, seed)| {
+                Some(
+                    (0..len)
+                        .map(|j| char::from(b'a' + ((usize::from(seed) + j) % 26) as u8))
+                        .collect(),
+                )
+            }),
+        ]
+    }
+
+    /// A `data_type` column of `values`: the strings cast to that type, or
+    /// their lengths for Int64.
+    fn budget_column(data_type: &DataType, values: &[Option<String>]) -> ArrayRef {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        use datafusion::arrow::compute::cast;
+
+        if *data_type == DataType::Int64 {
+            return Arc::new(Int64Array::from_iter(
+                values
+                    .iter()
+                    .map(|value| value.as_ref().map(|value| value.len() as i64)),
+            ));
+        }
+        let strings: ArrayRef = Arc::new(values.iter().cloned().collect::<StringArray>());
+        cast(&strings, data_type).expect("cast the string column")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// ADR-4143 decision 3: a byte-budgeted chunk's buffers never hold
+        /// more capacity together than its budget, checked after every row
+        /// pushed, and the sealed chunks give back every input row exactly.
+        #[test]
+        fn prop_byte_chunk_capacity_stays_within_its_budget(
+            shape in 0..BUDGET_SHAPES.len(),
+            budget in prop::sample::select(vec![16 * 1024, 64 * 1024]),
+            rows in prop::collection::vec((budget_value(), budget_value()), 1..1500),
+        ) {
+            use datafusion::arrow::compute::concat;
+
+            let first: Vec<Option<String>> = rows.iter().map(|row| row.0.clone()).collect();
+            let second: Vec<Option<String>> = rows.iter().map(|row| row.1.clone()).collect();
+            let [left, right] = &BUDGET_SHAPES[shape];
+            let columns = vec![budget_column(left, &first), budget_column(right, &second)];
+            let types = routed_layouts(&columns);
+            let data: Vec<ArrayData> = columns.iter().map(|c| c.to_data()).collect();
+            let sources = ByteSource::of(&columns, &data, &types).expect("sources");
+
+            let mut sealed = Vec::new();
+            let mut chunk = ByteChunk::new(&types, budget, 8192);
+            for row in 0..rows.len() {
+                if !chunk.fits(&sources, row) {
+                    let full = std::mem::replace(&mut chunk, ByteChunk::new(&types, budget, 8192));
+                    sealed.push(full.seal().expect("seal a chunk"));
+                    prop_assert!(chunk.fits(&sources, row), "a 400-byte row fits {budget} B");
+                }
+                chunk.push_row(&sources, row).expect("push a row");
+                let held = chunk.capacity();
+                prop_assert!(
+                    held <= budget,
+                    "{left}, {right}: {held} B held after row {row} ({} in the chunk), \
+                     budget {budget}",
+                    chunk.len
+                );
+            }
+            sealed.push(chunk.seal().expect("seal a chunk"));
+
+            for (index, column) in columns.iter().enumerate() {
+                let parts: Vec<&dyn Array> =
+                    sealed.iter().map(|chunk| chunk.columns[index].as_ref()).collect();
+                let routed = concat(&parts).expect("concat the chunks");
+                prop_assert_eq!(routed.as_ref(), column.as_ref(), "column {}", index);
             }
         }
     }
