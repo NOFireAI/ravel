@@ -2,21 +2,22 @@
 //! recent parts before `/readyz` latches, so the first real query after a
 //! restart is not the one that pays every cold-fetch cost.
 //!
-//! "Most recent" is measured from each tenant's own latest ingest hour
-//! ([`Catalog::latest_ingest_hour`]), not from wall-clock `now` (issue
-//! #1233, ADR-0046 amendment 2026-09-05): a tenant whose last ingest predates
-//! `now` by more than [`WARM_LOOKBACK_NS`] still gets its most recent parts
-//! warmed, not zero. This anchors the window to the ingest-hour bucket a
-//! part was filed under, not to the part's own `max_event_ts_ns`; the two
-//! stay close enough for this warm-up to find the part whenever the part's
-//! event time is within `max_ingest_lag_ns` of its ingest hour AND that
-//! ingest hour is not itself ahead of the wall clock -- a part filed into an
-//! hour within `clock_skew_allowance_ns` of the future can still move the
-//! anchor forward by up to an hour, which nothing guarantees for every part
-//! in general. "Ingest hour" here means any hour holding a commit-record-
-//! shaped key of any kind (a raw commit record, a compaction record, a
-//! rewrite record, or a tombstone): a tombstone-only or rewrite-only hour
-//! can anchor the window exactly as a fresh commit record would.
+//! "Most recent" means most recently ingested, measured from each tenant's
+//! own latest ingest hour ([`Catalog::latest_ingest_hour`]), not from
+//! wall-clock `now` (issue #1233, ADR-0046 amendment 2026-09-05): a tenant
+//! whose last ingest predates `now` by more than [`WARM_LOOKBACK_HOURS`]
+//! hours still gets its most recent parts warmed, not zero. The warm set is
+//! every part filed under an ingest-hour bucket in `[latest -
+//! WARM_LOOKBACK_HOURS, latest]` ([`Catalog::resolve_ingest_hours`]),
+//! whatever its event times (issue #4257): a tenant loaded with event times
+//! years before its ingest time is warmed exactly like one whose event times
+//! sit at its ingest hours. The set is ordered newest ingest hour first and,
+//! within an hour, by greatest `max_event_ts_ns` first, and both bounds below
+//! take parts in that order. "Ingest hour" here means any hour holding a
+//! commit-record-shaped key of any kind (a raw commit record, a compaction
+//! record, a rewrite record, or a tombstone): a tombstone-only or
+//! rewrite-only hour can anchor the window exactly as a fresh commit record
+//! would.
 //!
 //! Bounded on two axes. Per (tenant, signal), at most
 //! [`MAX_PARTS_PER_TENANT_PER_SIGNAL`] of the most recent parts are warmed
@@ -28,7 +29,7 @@
 //! The logs metadata pass (ADR-4203 decision 8) is not bounded by that part
 //! cap, and runs only after every tenant's whole-part warm has finished, so
 //! it spends only the deadline time that warm leaves. For every logs
-//! object in the resolved window that the query path plans from its
+//! object in the warm set that the query path plans from its
 //! directories (above [`LogSegmentFetcher::plan_whole_object_bound`]), it
 //! reads the footer and the four directories (STREAM_DIR, FIELD_DIR,
 //! SKIP_IDX, PAGE_DIR) through [`BlockRangeFetcher::fetch_plan_directories`],
@@ -77,7 +78,7 @@ use ravel_catalog::{Catalog, SegmentRef};
 use ravel_ingest::Clock;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_query::{EngineConfig, LogQuery, LogSegmentFetcher, ReadCache, SegmentFetcher};
-use ravel_types::{Signal, TenantHash, TimeRange};
+use ravel_types::{Signal, TenantHash};
 
 /// Per (tenant, signal), the number of most-recent parts warmed whole.
 const MAX_PARTS_PER_TENANT_PER_SIGNAL: usize = 4;
@@ -123,17 +124,13 @@ impl LogsMetadataWarm {
 /// tenant's whole-part warm, so it spends only the time that warm leaves.
 pub(crate) const WARM_DEADLINE: Duration = Duration::from_secs(10);
 
-/// How far back "most recent" looks when resolving parts to warm, measured
-/// from the tenant's own latest ingest hour rather than wall-clock `now`
-/// (issue #1233, ADR-0046 amendment 2026-09-05): a tenant whose last ingest
-/// is older than this window relative to `now` must still get its most
-/// recent parts warmed, not zero. Wide enough to find a recent part for a
-/// slow ingest cadence without resolving a tenant's entire history.
-const WARM_LOOKBACK_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
-
-/// Nanoseconds per hour, for converting an ingest-hour bucket
-/// ([`Catalog::latest_ingest_hour`]) to the nanosecond range `resolve` takes.
-const NS_PER_HOUR: i64 = 60 * 60 * 1_000_000_000;
+/// How many ingest hours before the tenant's own latest ingest hour the warm
+/// set reaches back: the parts filed in `[latest - WARM_LOOKBACK_HOURS,
+/// latest]`, whatever their event times. Measured from the latest ingest hour,
+/// not wall-clock `now` (issue #1233, ADR-0046 amendment 2026-09-05), and in
+/// ingest hours, not event time (issue #4257). Wide enough to find a recent
+/// part for a slow ingest cadence without resolving a tenant's entire history.
+const WARM_LOOKBACK_HOURS: u32 = 24;
 
 /// Discovers every tenant storage holds data for and warms the read cache
 /// with each one's most recent metric and log parts. Returns nothing: this
@@ -435,9 +432,12 @@ enum LatestHour {
     Found { hour: u32, has_ingest_part: bool },
 }
 
-/// Every part of one (tenant, signal) in the warm window, most recent first
-/// (callers bound the whole-part warm to [`MAX_PARTS_PER_TENANT_PER_SIGNAL`]
-/// of them), alongside what was learned about the
+/// Every part of one (tenant, signal) filed in the ingest hours
+/// `[latest - WARM_LOOKBACK_HOURS, latest]`, whatever their event times
+/// ([`Catalog::resolve_ingest_hours`]), newest ingest hour first and, within
+/// an hour, greatest `max_event_ts_ns` first (callers bound the whole-part
+/// warm to [`MAX_PARTS_PER_TENANT_PER_SIGNAL`] of them), alongside what was
+/// learned about the
 /// tenant's latest ingest hour ([`LatestHour`]). A resolve error still
 /// reports [`LatestHour::Found`] alongside empty parts, so it can be told
 /// apart from "no parts for this signal at all" ([`LatestHour::None`]) or a
@@ -474,13 +474,17 @@ async fn most_recent_parts(
         }
     };
 
-    let latest_hour_start_ns = i64::from(latest_hour) * NS_PER_HOUR;
-    let range = TimeRange {
-        start_ns: latest_hour_start_ns.saturating_sub(WARM_LOOKBACK_NS),
-        end_ns: latest_hour_start_ns.saturating_add(NS_PER_HOUR),
-    };
-
-    let snapshot = match catalog.resolve(&tenant, signal, range, &[], now_ns).await {
+    let snapshot = match catalog
+        .resolve_ingest_hours(
+            &tenant,
+            signal,
+            latest_hour.saturating_sub(WARM_LOOKBACK_HOURS),
+            latest_hour,
+            now_ns,
+            &accounting,
+        )
+        .await
+    {
         Ok(snapshot) => snapshot,
         Err(err) => {
             tracing::debug!(
@@ -499,7 +503,7 @@ async fn most_recent_parts(
         }
     };
     let mut segments = snapshot.segments;
-    segments.sort_unstable_by_key(|s| std::cmp::Reverse(s.max_event_ts_ns));
+    segments.sort_by_key(|s| std::cmp::Reverse((s.ingest_hour_bucket, s.max_event_ts_ns)));
     (
         segments,
         LatestHour::Found {
@@ -601,9 +605,9 @@ async fn warm_metrics(
 }
 
 /// Warms the `MAX_PARTS_PER_TENANT_PER_SIGNAL` most recent logs parts whole.
-/// Returns the count of parts warmed whole and every part in the window, most
-/// recent first, for the metadata pass that runs after every tenant's
-/// whole-part warm.
+/// Returns the count of parts warmed whole and every part in the warm set, in
+/// [`most_recent_parts`]'s order, for the metadata pass that runs after every
+/// tenant's whole-part warm.
 async fn warm_logs(
     catalog: &Catalog,
     fetcher: &LogSegmentFetcher,
@@ -1036,8 +1040,8 @@ mod tests {
 
     /// Issue #1233: a tenant whose only parts are ~48h old must still get
     /// its most recent parts warmed, not zero. First asserts the pre-fix
-    /// behavior directly -- old code resolved the fixed `[now -
-    /// WARM_LOOKBACK_NS, now]` window regardless of when the tenant last
+    /// behavior directly -- old code resolved the fixed `[now - 24 h, now]`
+    /// window regardless of when the tenant last
     /// ingested, and that window finds none of these parts -- then asserts
     /// the fixed behavior: exactly `min(MAX_PARTS_PER_TENANT_PER_SIGNAL,
     /// parts)` warmed, and that they are the newest by `max_event_ts_ns`.
@@ -1060,8 +1064,8 @@ mod tests {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(memory);
         let catalog = catalog_for(store.clone());
 
-        let old_fixed_window = TimeRange {
-            start_ns: now - WARM_LOOKBACK_NS,
+        let old_fixed_window = ravel_types::TimeRange {
+            start_ns: now - i64::from(WARM_LOOKBACK_HOURS) * NS_PER_HOUR,
             end_ns: now,
         };
         let old_window_snapshot = catalog

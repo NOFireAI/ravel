@@ -2618,6 +2618,7 @@ impl Catalog {
                 name_filter,
                 accounting,
                 true,
+                self.window_hour_bounds(range, now_ns),
             )
             .await?;
         let parts = parts
@@ -2704,13 +2705,60 @@ impl Catalog {
             name_filter,
             accounting,
             false,
+            self.window_hour_bounds(range, now_ns),
         )
         .await
         .map(|(snapshot, origins, generations, _parts)| (snapshot, origins, generations))
     }
 
-    /// [`Self::resolve_impl`]'s span and fan-out; `want_parts` also builds the
-    /// part handles and per-segment part origins.
+    /// Every segment filed under an ingest-hour bucket in `[start_hour,
+    /// end_hour]` (unix hours, inclusive), whatever its event time: the same
+    /// fan-out as [`Catalog::resolve_with_accounting`] (folded snapshot below
+    /// the watermark, listing above it, the same supersession and erasure
+    /// handling), with the listing window given in ingest hours instead of
+    /// derived from an event-time range, and no event-time filter. `end_hour`
+    /// is clamped to the hour of `now_ns + clock_skew_allowance_ns`, the same
+    /// upper edge a `resolve` window has.
+    ///
+    /// For callers that select data by when it was ingested rather than by
+    /// when it happened (the server's startup cache warm-up, issue #4257): a
+    /// tenant whose event times lie years before its ingest time has no
+    /// segment in any event-time window anchored at its ingest hours.
+    pub async fn resolve_ingest_hours(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        start_hour: u32,
+        end_hour: u32,
+        now_ns: i64,
+        accounting: &QueryAccounting,
+    ) -> Result<Snapshot, CatalogError> {
+        let all_event_times = TimeRange {
+            start_ns: i64::MIN,
+            end_ns: i64::MAX,
+        };
+        let window = self
+            .window_hour_bounds(all_event_times, now_ns)
+            .map(|(_, max_hour)| (start_hour, end_hour.min(max_hour)))
+            .filter(|(start, end)| start <= end);
+        self.resolve_traced(
+            tenant,
+            signal,
+            all_event_times,
+            &[],
+            now_ns,
+            None,
+            accounting,
+            false,
+            window,
+        )
+        .await
+        .map(|(snapshot, _origins, _generations, _parts)| snapshot)
+    }
+
+    /// [`Self::resolve_impl`]'s span and fan-out over the ingest-hour
+    /// `window` (`None`: list nothing); `want_parts` also builds the part
+    /// handles and per-segment part origins.
     #[allow(clippy::too_many_arguments)]
     async fn resolve_traced(
         &self,
@@ -2722,6 +2770,7 @@ impl Catalog {
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
         want_parts: bool,
+        window: Option<(u32, u32)>,
     ) -> Result<Resolved, CatalogError> {
         // Idle-tenant eviction last-touch (ADR-0069 decision 2):
         // stamp this tenant's activity with the caller's injected `now_ns`
@@ -2744,10 +2793,10 @@ impl Catalog {
                 signal,
                 range,
                 min_tokens,
-                now_ns,
                 name_filter,
                 accounting,
                 want_parts,
+                window,
             )
             .instrument(span.clone())
             .await;
@@ -2785,10 +2834,10 @@ impl Catalog {
         signal: Signal,
         range: TimeRange,
         min_tokens: &[CommitToken],
-        now_ns: i64,
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
         want_parts: bool,
+        window: Option<(u32, u32)>,
     ) -> Result<Resolved, CatalogError> {
         // Durable shard_count enforcement on the read path (ADR-0050 section 5): fail before the `0..shard_count` listing loop below if this
         // catalog's configured shard_count disagrees with the (tenant, signal)'s
@@ -2850,7 +2899,7 @@ impl Catalog {
         // standalone after the token loop, exactly as before.
         let mut pending_erasure: Option<Vec<ErasureRequest>> = None;
 
-        if let Some((window_start_hour, window_end_hour)) = self.window_hour_bounds(range, now_ns) {
+        if let Some((window_start_hour, window_end_hour)) = window {
             // A snapshot at watermark W serves every window hour <= W
             // straight from its parts; only the suffix above W is listed.
             // No usable snapshot,
