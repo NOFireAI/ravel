@@ -447,6 +447,14 @@ pub struct BucketedFinalAggregation {
     /// MiB for one `Int64` key and a count at the defaults. Default 8192; zero
     /// is read as one.
     pub routed_chunk_rows: usize,
+    /// Bytes per bucket chunk on a route with a string or binary column
+    /// (ADR-4143 decision 3), which the refusal retry alone admits. Each
+    /// such chunk is charged this budget before a row is written to it, and
+    /// seals when the next row would pass it or at `routed_chunk_rows` rows;
+    /// a row larger than the budget takes a chunk of its own, charged at its
+    /// size. Ignored by a fixed-width route. Default 1 MiB; zero is read as
+    /// one.
+    pub routed_chunk_bytes: usize,
 }
 
 impl Default for BucketedFinalAggregation {
@@ -455,6 +463,7 @@ impl Default for BucketedFinalAggregation {
             engage_groups: 65_536,
             bits: 6,
             routed_chunk_rows: 8192,
+            routed_chunk_bytes: 1 << 20,
         }
     }
 }
@@ -608,7 +617,8 @@ pub struct SqlConfig {
     /// Bucketed final aggregation (ADR-3565 decision 1, issue #3608).
     /// `Some` installs [`crate::BucketedFinalAggregateRule`], which replaces a
     /// `FinalPartitioned` aggregate over fixed-width integer or temporal keys
-    /// with [`crate::BucketedFinalAggregateExec`]; `None`, the default,
+    /// (and, in the refusal retry alone, string or binary keys) with
+    /// [`crate::BucketedFinalAggregateExec`]; `None`, the default,
     /// installs no rule and leaves every plan unchanged
     /// (`the_plan_is_unchanged_when_the_field_is_none` in
     /// `tests/bucketed_final_aggregate.rs`). Set once at server startup, like
