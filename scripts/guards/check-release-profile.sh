@@ -23,7 +23,7 @@
 #   4. publish-images.yml builds from the root Dockerfile: it names no other
 #      Dockerfile.
 #   5. The test-only `format-drill` feature of ravel-segment, ravel-logseg and
-#      ravel-rspan (ADR-4233 decision 9) cannot reach a release build. Neither
+#      ravel-rspan (ADR-4233 decision 9) cannot reach a published image. Neither
 #      the Dockerfile nor publish-images.yml names `format-drill` or
 #      `--all-features` outside a comment. In the workspace manifests (the root
 #      one, crates/*, services/*) `format-drill` appears only under a
