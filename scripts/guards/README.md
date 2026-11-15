@@ -455,8 +455,17 @@ than passing for "no pull request open".
   file nor `publish-images.yml` may set a `CARGO_PROFILE_RELEASE_*` variable;
   and `publish-images.yml` must build the root `Dockerfile`. Test lanes are
   free to tune `profile.ci`; this is the profile that must not follow them.
+  It also keeps the test-only `format-drill` feature of ravel-segment,
+  ravel-logseg and ravel-rspan (ADR-4233 decision 9) out of every release
+  build: neither the `Dockerfile` nor `publish-images.yml` may name
+  `format-drill` or `--all-features` outside a comment, and in the workspace
+  manifests (root, `crates/*`, `services/*`) `format-drill` may appear only
+  under a dev-dependencies table or in the value of a feature itself named
+  `format-drill`, so no `default` list, renamed forward or non-dev dependency
+  can turn it on.
   Exit 1 is a finding, 2 is a missing anchor (no `[profile.release]` table, no
-  `cargo build` line, no build step in the publish workflow), which is the
+  `cargo build` line, no build step in the publish workflow, a drill crate
+  manifest missing or no longer declaring `format-drill`), which is the
   case where the scan would otherwise pass everything. Wired into `gates.sh`
   and CI's doc-scripts job, cases first; cases in
   `scripts/guards/check-release-profile.test.sh`.

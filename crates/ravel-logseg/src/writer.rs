@@ -26,8 +26,8 @@ use crate::encoding::Enc;
 use crate::error::LogSegError;
 use crate::field_dir::{FieldDir, FieldEntry};
 use crate::footer::{
-    COMP_NONE, COMP_ZSTD, LogFooter, SectionDesc, SortDescriptor, SortKeyType, kind,
-    write_footer_and_trailer,
+    COMP_NONE, COMP_ZSTD, LogFooter, SectionDesc, SortDescriptor, SortKeyType, WriteVersion, kind,
+    write_footer_and_trailer_versioned,
 };
 use crate::key_index::{
     KEY_IDX_BUCKET_MAX_ENTRIES, Key8, KeyIndexPlan, KeyType, TRACE_ID_FIELD, key8_of,
@@ -146,6 +146,9 @@ pub struct RlogWriter {
     sort_descriptor: Option<SortDescriptor>,
     clustering_generation: u64,
     bloom_scope: BloomScope,
+    /// The trailer version ([`RlogWriter::with_write_version`]);
+    /// [`WriteVersion::CURRENT`] by default.
+    write_version: WriteVersion,
     /// Set by [`RlogWriter::with_unchecked_stream_attrs`].
     #[cfg(feature = "test-support")]
     unchecked_stream_attrs: bool,
@@ -260,11 +263,20 @@ impl RlogWriter {
             sort_descriptor: None,
             clustering_generation: 0,
             bloom_scope: BloomScope::All,
+            write_version: WriteVersion::CURRENT,
             #[cfg(feature = "test-support")]
             unchecked_stream_attrs: false,
             #[cfg(test)]
             str_cell_rewrite: None,
         }
+    }
+
+    /// Emits `version` in the trailer instead of [`WriteVersion::CURRENT`]
+    /// (ADR-4233 decision 2). Every other byte of the object is the same for
+    /// every version the window holds.
+    pub fn with_write_version(mut self, version: WriteVersion) -> Self {
+        self.write_version = version;
+        self
     }
 
     /// Test-only: rewrites each resolved string attribute cell of the
@@ -1173,7 +1185,7 @@ impl RlogWriter {
             clustering_generation: self.clustering_generation,
             unknown_section_kinds: Vec::new(),
         };
-        write_footer_and_trailer(&mut object, &footer);
+        write_footer_and_trailer_versioned(&mut object, &footer, self.write_version.number());
         Ok((
             object,
             WriteStats {
@@ -2211,7 +2223,7 @@ impl RlogWriter {
             clustering_generation: self.clustering_generation,
             unknown_section_kinds: Vec::new(),
         };
-        write_footer_and_trailer(&mut object, &footer);
+        write_footer_and_trailer_versioned(&mut object, &footer, self.write_version.number());
         Ok((
             object,
             WriteStats {
@@ -7632,6 +7644,233 @@ mod tests {
                     numstat_min_max(pairs.iter().map(|(old, _)| old.1.clone())),
                     numstat_min_max(pairs.iter().map(|(_, new)| new.1.clone()))
                 );
+            }
+        }
+    }
+
+    // ---- caller-chosen write version (ADR-4233 decisions 2 and 9, #4242) ----
+
+    fn window_records(n: i64) -> Vec<LogRecord> {
+        (0..n)
+            .map(|i| {
+                let mut r = base_record((i % 3) as u8, 1_000 + i);
+                r.attrs.push(("k".into(), AttrValue::I64(i)));
+                r.attrs
+                    .push(("s".into(), AttrValue::Str(format!("v{}", i % 7))));
+                r
+            })
+            .collect()
+    }
+
+    /// `records` written at `version` through each emitting path: row-major
+    /// `finish`, row-major `finish_compacted`, and columnar `finish`.
+    fn write_every_path(records: &[LogRecord], version: WriteVersion) -> [Vec<u8>; 3] {
+        let row = || {
+            let mut w =
+                RlogWriter::new(RlogConfig::default(), identity()).with_write_version(version);
+            for r in records {
+                w.push(r.clone()).expect("push");
+            }
+            w
+        };
+        let mut columnar =
+            RlogWriter::new(RlogConfig::default(), identity()).with_write_version(version);
+        columnar
+            .push_columnar(ColumnarLogBatch::from_records(records))
+            .expect("push columnar");
+        [
+            row().finish().expect("finish"),
+            row()
+                .finish_compacted(1, vec![0xAB; 4], 2)
+                .expect("finish compacted"),
+            columnar.finish().expect("columnar finish"),
+        ]
+    }
+
+    fn trailer_version(obj: &[u8]) -> u16 {
+        let n = obj.len();
+        u16::from_le_bytes([obj[n - 8], obj[n - 7]])
+    }
+
+    /// `obj` with its trailer version replaced by `version` and the footer crc
+    /// recomputed over it, so the result fails only the version gate.
+    fn restamped(obj: &[u8], version: u16) -> Vec<u8> {
+        let n = obj.len();
+        let mut out = obj.to_vec();
+        let footer_len = u32::from_le_bytes([obj[n - 16], obj[n - 15], obj[n - 14], obj[n - 13]]);
+        let footer = &obj[n - 16 - footer_len as usize..n - 16];
+        let crc = crate::footer::footer_crc(
+            footer,
+            footer_len,
+            version,
+            crate::footer::SIGNAL_LOGS,
+            crate::footer::RESERVED,
+        );
+        out[n - 12..n - 8].copy_from_slice(&crc.to_le_bytes());
+        out[n - 8..n - 6].copy_from_slice(&version.to_le_bytes());
+        out
+    }
+
+    /// Both builds: `WriteVersion` holds only window versions, the writer
+    /// emits [`WriteVersion::CURRENT`] (version 5) unless told otherwise, and
+    /// `with_write_version(CURRENT)` is the default writer byte for byte.
+    #[test]
+    fn write_version_refuses_versions_outside_the_window() {
+        use crate::footer::{SUPPORTED_VERSIONS, VERSION};
+        for outside in [
+            0,
+            VERSION - 2,
+            VERSION - 1,
+            SUPPORTED_VERSIONS.newest() + 1,
+            u16::MAX,
+        ] {
+            match WriteVersion::new(outside) {
+                Err(LogSegError::UnsupportedVersion(v)) => assert_eq!(v, outside),
+                other => panic!("WriteVersion::new({outside}) = {other:?}"),
+            }
+        }
+        assert_eq!(
+            WriteVersion::new(VERSION).expect("v5 in window"),
+            WriteVersion::CURRENT
+        );
+        assert_eq!(WriteVersion::CURRENT.number(), VERSION);
+
+        let records = window_records(40);
+        let mut default = RlogWriter::new(RlogConfig::default(), identity());
+        for r in &records {
+            default.push(r.clone()).expect("push");
+        }
+        let default = default.finish().expect("finish");
+        assert_eq!(trailer_version(&default), VERSION);
+        assert_eq!(
+            default,
+            write_every_path(&records, WriteVersion::CURRENT)[0]
+        );
+    }
+
+    /// Default build: the window is version 5 alone, `WriteVersion` of the
+    /// drill version (6) fails typed, and an object that is version 5's bytes
+    /// under trailer version 6, exactly what the drill writer emits, is
+    /// refused by the reader.
+    #[cfg(not(feature = "format-drill"))]
+    #[test]
+    fn default_build_window_is_one_version_and_refuses_the_drill_version() {
+        use crate::footer::{SUPPORTED_VERSIONS, VERSION};
+        assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION);
+        assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION);
+        assert!(matches!(
+            WriteVersion::new(VERSION + 1),
+            Err(LogSegError::UnsupportedVersion(6))
+        ));
+        for obj in write_every_path(&window_records(40), WriteVersion::CURRENT) {
+            open(&obj).expect("v5 opens");
+            match open(&restamped(&obj, VERSION + 1)) {
+                Err(LogSegError::UnsupportedVersion(v)) => assert_eq!(v, VERSION + 1),
+                other => panic!("default build admitted version 6: {other:?}"),
+            }
+        }
+    }
+
+    /// `drill` is `current` with only the trailer version raised to the drill
+    /// version and the footer crc recomputed over it; both open, report their
+    /// own version, and decode to the same footer and the same records.
+    #[cfg(feature = "format-drill")]
+    fn assert_window_pair(current: &[u8], drill: &[u8]) {
+        use crate::footer::{VERSION, VERSION_DRILL};
+        assert_eq!(current.len(), drill.len(), "object lengths differ");
+        let n = current.len();
+        assert!(
+            current[..n - 12] == drill[..n - 12],
+            "bytes before the trailer crc differ"
+        );
+        assert_eq!(
+            current[n - 6..],
+            drill[n - 6..],
+            "signal, reserved or magic differ"
+        );
+        assert_eq!(trailer_version(current), VERSION);
+        assert_eq!(trailer_version(drill), VERSION_DRILL);
+        assert_eq!(
+            drill,
+            restamped(current, VERSION_DRILL).as_slice(),
+            "drill crc is not the footer crc over the drill version"
+        );
+
+        assert_eq!(
+            open(current).expect("v5 opens"),
+            open(drill).expect("v6 opens")
+        );
+        let cfg = RlogConfig::default();
+        let scan = |obj: &[u8]| {
+            RlogReader::new(obj, &cfg)
+                .expect("reader")
+                .scan(&Predicate::And(vec![]))
+                .expect("scan")
+                .0
+        };
+        let current_records = scan(current);
+        assert!(!current_records.is_empty());
+        assert_eq!(current_records, scan(drill));
+    }
+
+    #[cfg(feature = "format-drill")]
+    #[test]
+    fn writer_emits_each_window_version_and_reader_admits_both_under_format_drill() {
+        use crate::footer::{SUPPORTED_VERSIONS, VERSION, VERSION_DRILL};
+        assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION_DRILL);
+        assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION);
+        let drill = WriteVersion::new(VERSION_DRILL).expect("drill version is in the window");
+        assert_eq!(drill.number(), 6);
+
+        let records = window_records(300);
+        let current = write_every_path(&records, WriteVersion::CURRENT);
+        let drilled = write_every_path(&records, drill);
+        for (current, drilled) in current.iter().zip(&drilled) {
+            assert_window_pair(current, drilled);
+        }
+    }
+
+    #[cfg(feature = "format-drill")]
+    mod window_versions_proptest {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_record() -> impl Strategy<Value = LogRecord> {
+            (
+                0u8..4,
+                -1_000_000_000_000i64..1_000_000_000_000,
+                1u8..25,
+                "[a-z ]{0,24}",
+                proptest::collection::vec(("[a-c]", any::<i64>()), 0..3),
+            )
+                .prop_map(|(stream, ts, severity, body, attrs)| {
+                    let mut r = base_record(stream, ts);
+                    r.severity_num = severity;
+                    r.body = body;
+                    r.attrs = attrs
+                        .into_iter()
+                        .map(|(k, v)| (k, AttrValue::I64(v)))
+                        .collect();
+                    r
+                })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(48))]
+
+            /// Random record batches written at version 5 and at the drill
+            /// version: both open and decode to the same records, and the
+            /// bytes differ only in trailer version and crc.
+            #[test]
+            fn random_batches_round_trip_at_both_window_versions(
+                records in proptest::collection::vec(arb_record(), 1..40),
+            ) {
+                let drill = WriteVersion::new(crate::footer::VERSION_DRILL).expect("in window");
+                let current = write_every_path(&records, WriteVersion::CURRENT);
+                let drilled = write_every_path(&records, drill);
+                for (current, drilled) in current.iter().zip(&drilled) {
+                    assert_window_pair(current, drilled);
+                }
             }
         }
     }

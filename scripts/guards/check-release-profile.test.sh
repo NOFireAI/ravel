@@ -58,12 +58,53 @@ jobs:
           context: .
           target: server
 YAML
+  local c
+  for c in ravel-segment ravel-logseg ravel-rspan; do
+    mkdir -p "${dir}/crates/${c}"
+    cat >"${dir}/crates/${c}/Cargo.toml" <<TOML
+[package]
+name = "${c}"
+
+[features]
+# Test-only; format-drill named in a comment is not a finding.
+format-drill = []
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+TOML
+  done
+  # A dependent that turns the feature on for its tests only, the shape the
+  # compatibility tests use.
+  mkdir -p "${dir}/services/ravel-server"
+  cat >"${dir}/services/ravel-server/Cargo.toml" <<'TOML'
+[package]
+name = "ravel-server"
+
+[features]
+sql = []
+
+[dependencies]
+ravel-segment = { workspace = true } # format-drill only under dev-dependencies
+
+[dev-dependencies]
+ravel-segment = { workspace = true, features = ["format-drill"] }
+TOML
   printf '%s\n' "${dir}"
 }
 
 # edit <file> <sed-expression>: in-place edit that works with BSD and GNU sed.
 edit() {
   sed "$2" "$1" >"$1.new" && mv "$1.new" "$1"
+}
+
+# insert_after <file> <exact-line> <text>: adds <text> (awk escapes such as \n
+# allowed) after the first line equal to <exact-line>.
+insert_after() {
+  awk -v want="$2" -v add="$3" '{ print } $0 == want && !done { print add; done = 1 }' \
+    "$1" >"$1.new" && mv "$1.new" "$1"
 }
 
 # check <name> <repo> <want-exit> <want-substring-or-empty>
@@ -245,6 +286,100 @@ check "publish_env_override_fails" "${d}" 1 "CARGO_PROFILE_RELEASE_"
 d="$(new_repo publish-no-build)"
 edit "${d}/.github/workflows/publish-images.yml" '/build-push-action/d'
 check "publish_without_build_step_is_cannot_check" "${d}" 2 "no build-push-action step"
+
+# --- format-drill stays out of release builds (ADR-4233 decision 9) ----------
+
+d="$(new_repo drill-clean-report)"
+check "format_drill_scan_says_what_it_read" "${d}" 0 \
+  "format-drill test-only: 3 defining crate(s), 5 manifest(s) scanned"
+
+d="$(new_repo docker-format-drill)"
+edit "${d}/Dockerfile" 's/--features sql /--features sql,ravel-segment\/format-drill /'
+check "docker_build_enabling_format_drill_fails" "${d}" 1 \
+  "Dockerfile:4: release build enables format-drill or --all-features"
+
+d="$(new_repo docker-all-features)"
+edit "${d}/Dockerfile" 's/-p ravel-cli$/-p ravel-cli --all-features/'
+check "docker_build_with_all_features_fails" "${d}" 1 \
+  "Dockerfile:5: release build enables format-drill or --all-features"
+
+d="$(new_repo docker-drill-comment)"
+insert_after "${d}/Dockerfile" "FROM rust:1 AS builder" "# never --features format-drill or --all-features here"
+check "docker_comment_naming_format_drill_passes" "${d}" 0 ""
+
+d="$(new_repo publish-format-drill)"
+printf '          build-args: |\n            CARGO_FEATURES=format-drill\n' \
+  >>"${d}/.github/workflows/publish-images.yml"
+check "publish_workflow_enabling_format_drill_fails" "${d}" 1 \
+  "publish-images.yml:9: release build enables format-drill or --all-features"
+
+d="$(new_repo publish-all-features)"
+printf '      - run: cargo build --release --all-features\n' \
+  >>"${d}/.github/workflows/publish-images.yml"
+check "publish_workflow_with_all_features_fails" "${d}" 1 \
+  "publish-images.yml:8: release build enables format-drill or --all-features"
+
+d="$(new_repo default-drill)"
+insert_after "${d}/crates/ravel-segment/Cargo.toml" "format-drill = []" 'default = ["format-drill"]'
+check "default_feature_with_format_drill_fails" "${d}" 1 \
+  "crates/ravel-segment/Cargo.toml:7: enables format-drill outside dev-dependencies"
+
+# A multi-line array: the continuation line belongs to `default`, not to the
+# format-drill definition above it.
+d="$(new_repo default-drill-multiline)"
+insert_after "${d}/crates/ravel-rspan/Cargo.toml" "format-drill = []" 'default = [\n    "format-drill",\n]'
+check "multiline_default_with_format_drill_fails" "${d}" 1 \
+  "crates/ravel-rspan/Cargo.toml:8: enables format-drill outside dev-dependencies"
+
+# A forward under another name would let `--features drill` in the Dockerfile
+# enable it without naming it.
+d="$(new_repo forward-renamed)"
+insert_after "${d}/services/ravel-server/Cargo.toml" "sql = []" 'drill = ["ravel-logseg/format-drill"]'
+check "forwarding_feature_under_another_name_fails" "${d}" 1 \
+  "services/ravel-server/Cargo.toml:6: enables format-drill outside dev-dependencies"
+
+d="$(new_repo forward-same-name)"
+insert_after "${d}/services/ravel-server/Cargo.toml" "sql = []" 'format-drill = [\n    "ravel-segment/format-drill",\n]'
+check "forwarding_feature_named_format_drill_passes" "${d}" 0 ""
+
+d="$(new_repo dependency-drill)"
+edit "${d}/services/ravel-server/Cargo.toml" \
+  's/^ravel-segment = { workspace = true } #.*$/ravel-segment = { workspace = true, features = ["format-drill"] }/'
+check "non_dev_dependency_enabling_format_drill_fails" "${d}" 1 \
+  "services/ravel-server/Cargo.toml:8: enables format-drill outside dev-dependencies"
+
+d="$(new_repo dependency-table-drill)"
+printf '\n[dependencies.ravel-rspan]\nworkspace = true\nfeatures = ["format-drill"]\n' \
+  >>"${d}/services/ravel-server/Cargo.toml"
+check "dependency_table_enabling_format_drill_fails" "${d}" 1 \
+  "services/ravel-server/Cargo.toml:15: enables format-drill outside dev-dependencies"
+
+d="$(new_repo workspace-dependency-drill)"
+printf '\n[workspace.dependencies]\nravel-segment = { path = "crates/ravel-segment", features = ["format-drill"] }\n' \
+  >>"${d}/Cargo.toml"
+check "workspace_dependency_enabling_format_drill_fails" "${d}" 1 \
+  "Cargo.toml:21: enables format-drill outside dev-dependencies"
+
+d="$(new_repo target-dependency-drill)"
+printf "\n[target.'cfg(unix)'.dependencies]\nravel-logseg = { workspace = true, features = [\"format-drill\"] }\n" \
+  >>"${d}/services/ravel-server/Cargo.toml"
+check "target_dependency_enabling_format_drill_fails" "${d}" 1 \
+  "services/ravel-server/Cargo.toml:14: enables format-drill outside dev-dependencies"
+
+d="$(new_repo target-dev-dependency-drill)"
+printf "\n[target.'cfg(unix)'.dev-dependencies]\nravel-logseg = { workspace = true, features = [\"format-drill\"] }\n" \
+  >>"${d}/services/ravel-server/Cargo.toml"
+check "target_dev_dependency_enabling_format_drill_passes" "${d}" 0 ""
+
+d="$(new_repo drill-crate-missing)"
+rm "${d}/crates/ravel-logseg/Cargo.toml"
+check "missing_drill_crate_manifest_is_cannot_check" "${d}" 2 \
+  "crates/ravel-logseg/Cargo.toml does not exist"
+
+d="$(new_repo drill-definition-missing)"
+edit "${d}/crates/ravel-rspan/Cargo.toml" '/^format-drill = \[\]$/d'
+check "missing_drill_feature_definition_is_cannot_check" "${d}" 2 \
+  "crates/ravel-rspan/Cargo.toml declares no format-drill feature"
 
 printf '\n%s passed, %s failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]

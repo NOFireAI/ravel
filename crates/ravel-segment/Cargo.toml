@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Test-only (ADR-4233 decision 9, issue #4242): adds the drill version, v7's
+# bytes under trailer version 8, and widens the reader window to {8, 7} so
+# compatibility tests run against two real versions. Off by default;
+# scripts/guards/check-release-profile.sh refuses it in the published-image
+# build and in any default or non-dev feature set.
+format-drill = []
+
 [dependencies]
 ravel-types = { workspace = true }
 ravel-proto = { workspace = true }

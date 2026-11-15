@@ -62,7 +62,8 @@ pub use columns::ColumnSelection;
 pub use dict_values::{DictValues, Validity};
 pub use error::LogSegError;
 pub use footer::{
-    SortBucketWidth, SortDescriptor, SortKeyColumn, SortKeyType, SuffixOutcome, open_from_suffix,
+    SortBucketWidth, SortDescriptor, SortKeyColumn, SortKeyType, SuffixOutcome, WriteVersion,
+    open_from_suffix,
 };
 pub use ranged::{RlogRangeReader, StreamBlockLoc, StreamBlockRows, StreamBlockSpan};
 pub use reader::{

@@ -748,8 +748,9 @@ fn page_dir_page_count_over_the_cap_is_refused() {
 
 // --- version gate -----------------------------------------------------------
 
-/// The version gate accepts version 5 and nothing else: a trailer stamped 4 or
-/// 6 is refused with the typed unsupported-version error (ADR-0892 decision 1,
+/// The version gate accepts version 5 and nothing else (and the drill version 6
+/// under the test-only `format-drill` feature): a trailer stamped 4 or one past
+/// the window is refused with the typed unsupported-version error (ADR-0892 decision 1,
 /// ADR-0066 decision 2, ADR-2135). PAGE_DIR is mandatory at that one version,
 /// so an object missing it is refused rather than read under a guessed layout.
 #[test]
@@ -805,12 +806,14 @@ fn version_gate_accepts_only_5() {
     let (footer, sections) = explode(&v5);
     assert!(open_and_drain(&assemble_versioned(footer, &sections, footer::VERSION)).is_ok());
 
+    // One past the newest: 6 by default, 7 under `format-drill`.
+    let next = footer::SUPPORTED_VERSIONS.newest() + 1;
     let mut future = v5.clone();
-    future[n5 - 8..n5 - 6].copy_from_slice(&6u16.to_le_bytes());
+    future[n5 - 8..n5 - 6].copy_from_slice(&next.to_le_bytes());
     match RlogReader::new(&future, &cfg) {
-        Err(LogSegError::UnsupportedVersion(6)) => {}
+        Err(LogSegError::UnsupportedVersion(v)) if v == next => {}
         other => panic!(
-            "expected UnsupportedVersion(6), got {:?}",
+            "expected UnsupportedVersion({next}), got {:?}",
             other.map(|_| ())
         ),
     }

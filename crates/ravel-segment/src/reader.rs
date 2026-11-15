@@ -39,7 +39,8 @@ pub struct FooterLocation {
     /// ([`crate::SUPPORTED_VERSIONS`], ADR-0066 decision 1): `parse_footer`
     /// rejects anything else with [`SegmentError::UnsupportedVersion`], so a
     /// successfully parsed object carries an admitted version and nothing else.
-    /// Today the window holds only [`crate::VERSION_V7`], so this is always 7.
+    /// Without the test-only `format-drill` feature the window holds only
+    /// [`crate::VERSION_V7`], so this is always 7.
     pub version: u16,
     /// Section kind ids this object's directory names that this build's
     /// `validate_sections_v7` does not recognize (ADR-4233 decision 4,
@@ -88,8 +89,8 @@ fn parse_trailer(trailer: &[u8; TRAILER_LEN_USIZE]) -> Result<Trailer, SegmentEr
         return Err(SegmentError::BadMagic);
     }
     // The reader accepts only versions inside its supported-version window
-    // (ADR-0066 decision 1). Today that window is the single current version
-    // `VERSION_V7`; versions 1-6 and any unknown future version fail closed
+    // (ADR-0066 decision 1). Without `format-drill` that window is the single
+    // current version `VERSION_V7`; versions 1-6 and any unknown future version fail closed
     // with the same typed error, so a stray pre-v7 object (including a retired
     // v6) is rejected, never half-parsed. An object rejected here is not
     // corrupt: another build whose window covers this version can read it, and
@@ -278,6 +279,9 @@ pub fn validate_sections(
     };
     match version {
         SegmentVersion::V7 => validate_sections_v7(footer, page_region_end, limits),
+        // The drill version is v7's bytes under a raised trailer version.
+        #[cfg(feature = "format-drill")]
+        SegmentVersion::Drill => validate_sections_v7(footer, page_region_end, limits),
     }
 }
 
