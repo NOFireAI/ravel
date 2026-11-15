@@ -1,12 +1,14 @@
-//! A real server with alert rules configured keeps evaluating them when the
+//! A real server with alert rules configured refuses its alert tick when the
 //! tenant's alert history holds an object written before an RLOG format bump
-//! (ADR-2708 decision D6, issue #2713).
+//! (ADR-4233 decision 4, hazard H3; supersedes the skip of ADR-2708 decision
+//! D6, issue #2713).
 //!
 //! The object is a real alert transition object, encoded by the same
 //! `ravel_alerting::encode_record_object` the evaluator writes with, published
 //! through a real commit record, and then rewritten to a trailer version this
 //! build does not read. The server is started over that store and scraped over
-//! HTTP until its alert loop has completed an evaluated tick.
+//! HTTP until its alert loop has refused a tick, so the assertion runs against
+//! the real `/metrics` surface an operator scrapes.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -220,11 +222,12 @@ const HISTORY_UNAVAILABLE: &str =
 const SKIPPED: &str =
     r#"ravel_alert_history_records_skipped_total{mode="all",reason="unsupported_version"}"#;
 
-/// Watch it fail: delete the `UnsupportedVersion` arm in
-/// `AlertEvaluator::fold_commit_entries`. Every tick then ends in
-/// `history_unavailable`, the evaluated count stays 0 and the poll runs out.
+/// Watch it fail: restore the pre-ADR-4233 skip (replace the
+/// `UnreadableHistoryVersion` refusal in `AlertEvaluator::fold_commit_entries`
+/// with `continue`). Ticks then evaluate, `evaluated` rises past 0 and
+/// `history_unavailable` stays 0, so both assertions below fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_pre_bump_alert_object_does_not_stop_rule_evaluation() {
+async fn a_pre_bump_alert_object_refuses_the_tick() {
     let store = Arc::new(MemoryStore::new());
     seed_pre_bump_alert_object(store.as_ref()).await;
     let running = start_server(Arc::clone(&store)).await;
@@ -234,26 +237,25 @@ async fn a_pre_bump_alert_object_does_not_stop_rule_evaluation() {
     let mut body = String::new();
     for _ in 0..600 {
         body = scrape(&running).await;
-        if sample(&body, EVALUATED).is_some_and(|evaluated| evaluated >= 1.0) {
+        if sample(&body, SKIPPED).is_some_and(|refused| refused >= 1.0) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let evaluated = sample(&body, EVALUATED).expect("evaluated tick series rendered");
+    let refused = sample(&body, SKIPPED).expect("refusal counter rendered");
     assert!(
-        evaluated >= 1.0,
-        "a tick evaluated the rules despite the pre-bump object:\n{body}"
+        refused >= 1.0,
+        "the pre-bump object refused the tick and was counted:\n{body}"
     );
-    let skipped = sample(&body, SKIPPED).expect("skip counter rendered");
     assert!(
-        skipped >= 1.0,
-        "the pre-bump object was skipped and counted:\n{body}"
+        sample(&body, HISTORY_UNAVAILABLE).is_some_and(|unavailable| unavailable >= 1.0),
+        "the refused tick reported history_unavailable:\n{body}"
     );
     assert_eq!(
-        sample(&body, HISTORY_UNAVAILABLE),
+        sample(&body, EVALUATED),
         Some(0.0),
-        "no tick aborted on the pre-bump object:\n{body}"
+        "no tick evaluated rules on top of the incomplete fold:\n{body}"
     );
 
     running.shutdown().await.expect("graceful shutdown");
