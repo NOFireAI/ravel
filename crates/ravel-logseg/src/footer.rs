@@ -115,7 +115,8 @@ pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::n_and_prev(
 /// version 6, so compatibility tests run against two real window versions.
 /// No reader behaviour differs between the two; only the trailer field (and
 /// the footer crc over it) does. Exists only under the test-only
-/// `format-drill` feature, which no release build enables.
+/// `format-drill` feature, which `scripts/guards/check-release-profile.sh`
+/// refuses in the published-image build.
 #[cfg(feature = "format-drill")]
 pub const VERSION_DRILL: u16 = VERSION + 1;
 

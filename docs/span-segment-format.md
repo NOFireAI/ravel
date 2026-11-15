@@ -74,14 +74,16 @@ The window can be two versions wide, and a writer emits the version its caller
 chooses inside it: `RspanWriter::with_write_version` takes a
 `ravel_rspan::WriteVersion`, whose constructor refuses any version outside the
 window with `UnsupportedVersion`, and a writer not given one emits
-`WriteVersion::CURRENT` (5) byte for byte as before, through `finish` and
-`finish_compacted` alike. The `format-drill` cargo feature, off by default,
+`WriteVersion::CURRENT` (5) through `finish` and `finish_compacted` alike; for
+a fixed input, `finish` writes the same bytes it wrote before the version
+parameter existed. The `format-drill` cargo feature, off by default,
 adds the drill version 6, which is version 5's bytes with only the trailer
 version raised and the footer crc recomputed over it; it widens the window to
 {6, 5} and the reader admits both and decodes them identically. The feature
 exists only for compatibility tests: no default feature set includes it, and
-`scripts/guards/check-release-profile.sh` refuses it in every release-built
-path. Without it the window is version 5 alone and an object stamped 6 fails
+`scripts/guards/check-release-profile.sh` refuses it in the published-image
+build (the root `Dockerfile` and `publish-images.yml`) and in any default or
+non-dev feature set. Without it the window is version 5 alone and an object stamped 6 fails
 with `UnsupportedVersion(6)`. Tests, in sentence order (module
 `writer::tests`): `write_version_refuses_versions_outside_the_window` and
 `default_writer_output_matches_the_digest_pinned_before_the_version_parameter`

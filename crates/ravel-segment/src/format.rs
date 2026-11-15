@@ -67,8 +67,9 @@ pub const VERSION_V7: u16 = 7;
 /// The drill version (ADR-4233 decision 9), present only with the test-only
 /// `format-drill` feature: v7's bytes with the trailer version raised by one.
 /// It exists so dispatch, activation, fencing and migration can run against
-/// two real versions without bumping a production one. A release build never
-/// enables the feature (`scripts/guards/check-release-profile.sh`).
+/// two real versions without bumping a production one.
+/// `scripts/guards/check-release-profile.sh` refuses the feature in the
+/// published-image build.
 #[cfg(feature = "format-drill")]
 pub const VERSION_DRILL: u16 = VERSION_V7 + 1;
 
