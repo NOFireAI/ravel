@@ -6711,7 +6711,7 @@ mod key_cells_tests {
     #[test]
     fn one_pass_resolution_starts_at_the_threshold() {
         let declared: Vec<DeclaredColumn> = (0..ONE_PASS_MIN_KEY_COLUMNS)
-            .map(|i| DeclaredColumn::new(&format!("k{i}"), DeclaredType::I64))
+            .map(|i| DeclaredColumn::new(format!("k{i}"), DeclaredType::I64))
             .collect();
         let full_len = FIRST_DECLARED_COL + declared.len();
         let merged = vec![kv(&[("k0", AttrValue::I64(1))])];
