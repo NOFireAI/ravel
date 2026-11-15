@@ -3194,3 +3194,154 @@ mod hist_heap_bound_tests {
         );
     }
 }
+
+/// H6 (ADR-4233 decision 4): a section kind this build does not recognize is
+/// skipped, not rejected, and its kind id is reported on the opened object
+/// rather than silently dropped.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use prost::Message;
+
+    use super::*;
+    use crate::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, decode_catalog_v5};
+
+    /// A section kind id no `section_kind` constant names: real objects this
+    /// build writes never carry it.
+    const UNKNOWN_KIND: u32 = 0xFEED_0001;
+
+    fn written_object() -> Vec<u8> {
+        let labels = LabelSet::new(vec![Label {
+            name: ravel_types::METRIC_NAME_LABEL.to_string(),
+            value: "h6_unknown_kind".to_string(),
+        }])
+        .expect("labels");
+        let samples = (0..16)
+            .map(|i| ravel_types::Sample {
+                ts_ns: 1_700_000_000_000_000_000 + i as i64 * 15_000_000_000,
+                value: i as f64,
+            })
+            .collect();
+        let written = SegmentWriter::write(
+            vec![SeriesInput {
+                series_id: SeriesId([0x11; 16]),
+                labels,
+                samples,
+            }],
+            SegmentIdentity {
+                tenant_hash: [0x22; 16],
+                shard: 0,
+                writer_id: "h6-unknown-kind".to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 100_000,
+            },
+        )
+        .expect("write object");
+        written.bytes.to_vec()
+    }
+
+    /// Splices one extra section of kind `UNKNOWN_KIND` into `obj`'s
+    /// directory, its bytes stored raw (uncompressed) past the last real
+    /// section, and re-seals the footer and trailer crcs so the result opens
+    /// as a well-formed object with one more, unrecognized, section.
+    fn with_unknown_section(obj: &[u8], payload: &[u8]) -> Vec<u8> {
+        let loc = open_from_full(obj, ReaderLimits::default()).expect("open original");
+        let mut footer = loc.footer.clone();
+        let mut out = obj[..loc.footer_offset as usize].to_vec();
+        out.extend_from_slice(payload);
+        footer.sections.push(Section {
+            kind: UNKNOWN_KIND,
+            offset: loc.footer_offset,
+            len: payload.len() as u64,
+            crc32c: crc32c::crc32c(payload),
+            comp: compression::NONE,
+            uncompressed_len: payload.len() as u64,
+        });
+
+        let footer_bytes = footer.encode_to_vec();
+        let footer_len = footer_bytes.len() as u32;
+        out.extend_from_slice(&footer_bytes);
+        let trailer = &obj[loc.trailer_offset as usize..];
+        let (version, tail) = (&trailer[8..10], &trailer[10..16]);
+        let mut crc = crc32c::crc32c(&footer_bytes);
+        crc = crc32c::crc32c_append(crc, &footer_len.to_le_bytes());
+        crc = crc32c::crc32c_append(crc, version);
+        crc = crc32c::crc32c_append(crc, tail);
+        out.extend_from_slice(&footer_len.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(version);
+        out.extend_from_slice(tail);
+        out
+    }
+
+    #[test]
+    fn unknown_section_kind_is_reported() {
+        let obj = written_object();
+        let before = open_from_full(&obj, ReaderLimits::default()).expect("open before splice");
+        assert_eq!(
+            before.unknown_section_kinds,
+            Vec::<u32>::new(),
+            "an object this build wrote reports no unknown kinds"
+        );
+
+        let spliced = with_unknown_section(&obj, b"opaque future-section bytes");
+        let after = open_from_full(&spliced, ReaderLimits::default()).expect("open spliced");
+        assert_eq!(after.unknown_section_kinds, vec![UNKNOWN_KIND]);
+
+        // Data still decodes correctly: the unknown section is skipped, not
+        // mistaken for a known one, and every known section is unaffected.
+        let before_entries =
+            decode_catalog_v5(&before.footer, &obj, ReaderLimits::default()).expect("catalog");
+        let after_entries =
+            decode_catalog_v5(&after.footer, &spliced, ReaderLimits::default()).expect("catalog");
+        assert_eq!(before_entries.len(), after_entries.len());
+        assert_eq!(before_entries[0].runs, after_entries[0].runs);
+    }
+
+    /// Rules out an implementation that always reports an empty list
+    /// regardless of what the directory holds: a second, distinct unknown
+    /// kind is reported too, and the list is sorted and deduplicated.
+    #[test]
+    fn multiple_unknown_kinds_are_all_reported_sorted_and_deduped() {
+        let obj = written_object();
+        let loc = open_from_full(&obj, ReaderLimits::default()).expect("open");
+        let mut footer = loc.footer.clone();
+        let mut out = obj[..loc.footer_offset as usize].to_vec();
+        let kinds = [UNKNOWN_KIND + 2, UNKNOWN_KIND, UNKNOWN_KIND + 2, UNKNOWN_KIND + 1];
+        for kind in kinds {
+            let payload = format!("payload for {kind}").into_bytes();
+            footer.sections.push(Section {
+                kind,
+                offset: out.len() as u64,
+                len: payload.len() as u64,
+                crc32c: crc32c::crc32c(&payload),
+                comp: compression::NONE,
+                uncompressed_len: payload.len() as u64,
+            });
+            out.extend_from_slice(&payload);
+        }
+        let footer_bytes = footer.encode_to_vec();
+        let footer_len = footer_bytes.len() as u32;
+        out.extend_from_slice(&footer_bytes);
+        let trailer = &obj[loc.trailer_offset as usize..];
+        let (version, tail) = (&trailer[8..10], &trailer[10..16]);
+        let mut crc = crc32c::crc32c(&footer_bytes);
+        crc = crc32c::crc32c_append(crc, &footer_len.to_le_bytes());
+        crc = crc32c::crc32c_append(crc, version);
+        crc = crc32c::crc32c_append(crc, tail);
+        out.extend_from_slice(&footer_len.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(version);
+        out.extend_from_slice(tail);
+
+        let after = open_from_full(&out, ReaderLimits::default()).expect("open spliced");
+        assert_eq!(
+            after.unknown_section_kinds,
+            vec![UNKNOWN_KIND, UNKNOWN_KIND + 1, UNKNOWN_KIND + 2]
+        );
+    }
+}
