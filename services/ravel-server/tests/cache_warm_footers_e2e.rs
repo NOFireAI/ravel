@@ -16,6 +16,10 @@
 //! once unwarmed. The unwarmed baseline hides the store's tenant listing
 //! from the warm-up while the server starts, so the warm-up finds no tenant
 //! and leaves the cache empty.
+//!
+//! A second tenant carries 2013 event times in two current ingest hours
+//! (issue #4257): the warm-up chooses parts by ingest hour, so it is warmed
+//! the same way.
 
 #![cfg(feature = "sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -41,6 +45,7 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, Pin, PinnedRead, PutOptions, PutOutcome, StoreError, list_all,
 };
+use ravel_proto::commit::v1::CommitRecord;
 use ravel_query::{CacheFetchError, ReadCache};
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_types::{TenantHash, TenantId};
@@ -200,10 +205,13 @@ impl Gets {
 
 struct Tenant {
     store: Arc<Counting>,
-    /// Data object keys, most recent first: the order the warm-up visits them.
+    /// Data object keys, latest event time first: for a tenant filed in one
+    /// ingest hour, the order the warm-up visits them.
     keys: Vec<String>,
     layouts: BTreeMap<String, Layout>,
     base_ts_ns: i64,
+    /// The `--max-ingest-lag` every server over this tenant runs with.
+    max_ingest_lag: Duration,
 }
 
 fn kv(key: &str, value: &str) -> KeyValue {
@@ -391,6 +399,23 @@ async fn wide_tail_tenant() -> Tenant {
 /// Writes `objects` objects through a cacheless server, one `export` each,
 /// then stops that server.
 async fn ingest(objects: usize, export: fn(u64, i64) -> ExportLogsServiceRequest) -> Tenant {
+    ingest_at(
+        objects,
+        export,
+        now_ns(),
+        ravel_server::DEFAULT_MAX_INGEST_LAG,
+    )
+    .await
+}
+
+/// [`ingest`] with event times from `base_ts_ns`, on servers running with
+/// `max_ingest_lag`.
+async fn ingest_at(
+    objects: usize,
+    export: fn(u64, i64) -> ExportLogsServiceRequest,
+    base_ts_ns: i64,
+    max_ingest_lag: Duration,
+) -> Tenant {
     let memory = Arc::new(MemoryStore::new());
     let config = TenantConfig {
         typed_attr_columns: Some(vec![DeclaredTypedColumn {
@@ -411,7 +436,7 @@ async fn ingest(objects: usize, export: fn(u64, i64) -> ExportLogsServiceRequest
 
     let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
     let running = ravel_server::start(
-        server_config(2, ROOMY_CACHE_BYTES),
+        server_config(2, ROOMY_CACHE_BYTES, max_ingest_lag),
         dyn_store.clone(),
         dyn_store,
         Arc::new(ravel_object_store::StoreMetrics::default()),
@@ -421,7 +446,6 @@ async fn ingest(objects: usize, export: fn(u64, i64) -> ExportLogsServiceRequest
     .expect("ingest server starts");
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
-    let base_ts_ns = now_ns();
     let mut keys = Vec::new();
     for i in 0..objects {
         let before = data_keys(&memory).await;
@@ -479,6 +503,99 @@ async fn ingest(objects: usize, export: fn(u64, i64) -> ExportLogsServiceRequest
         keys,
         layouts,
         base_ts_ns,
+        max_ingest_lag,
+    }
+}
+
+/// 2013-07-15T00:00:00Z: years before any ingest hour this test runs in.
+const EVENT_2013_NS: i64 = 1_373_846_400_000_000_000;
+/// A `--max-ingest-lag` wide enough to admit, and list, 2013 event times.
+const BACKFILL_INGEST_LAG: Duration = Duration::from_secs(20 * 365 * 86_400);
+/// How many of the backdated tenant's objects are filed in its older ingest
+/// hour: the ones with the latest event times.
+const OLDER_HOUR_OBJECTS: usize = 2;
+
+/// [`OBJECTS`] logs objects with 2013 event times, written through the real
+/// ingest path, then filed in two ingest hours: the [`OLDER_HOUR_OBJECTS`]
+/// with the latest event times in the hour before the rest. Returns the
+/// tenant and its data object keys in the order the warm-up visits them:
+/// newest ingest hour first, latest event time first within an hour.
+async fn backdated_tenant() -> (Tenant, Vec<String>) {
+    let tenant = ingest_at(OBJECTS, export, EVENT_2013_NS, BACKFILL_INGEST_LAG).await;
+    let (older, newer) = tenant.keys.split_at(OLDER_HOUR_OBJECTS);
+    let ingested = tenant.ingest_hours().await;
+    let newest_hour = *ingested.values().min().expect("an ingest hour");
+    tenant.refile(newer, newest_hour).await;
+    tenant.refile(older, newest_hour - 1).await;
+    let refiled = tenant.ingest_hours().await;
+    assert!(
+        newer.iter().all(|key| refiled[key] == newest_hour)
+            && older.iter().all(|key| refiled[key] == newest_hour - 1),
+        "two ingest hours: {refiled:?}"
+    );
+    let warm_order = [newer, older].concat();
+    (tenant, warm_order)
+}
+
+impl Tenant {
+    /// Every logs commit record of the tenant, with its key.
+    async fn commit_records(&self) -> Vec<(String, CommitRecord)> {
+        let prefix = format!("t/{}/l/c/", tenant_hash().to_hex());
+        let mut out = Vec::new();
+        for object in list_all(self.store.inner.as_ref(), &prefix)
+            .await
+            .expect("list commit records")
+        {
+            if !object.key.ends_with(".cmt") {
+                continue;
+            }
+            let bytes = self
+                .store
+                .inner
+                .get(&object.key, GetRange::Full)
+                .await
+                .expect("get commit record")
+                .data;
+            let record = ravel_commit::record::decode(&bytes).expect("decode commit record");
+            out.push((object.key, record));
+        }
+        out
+    }
+
+    /// Each data object's ingest-hour bucket, from its commit record.
+    async fn ingest_hours(&self) -> BTreeMap<String, u32> {
+        self.commit_records()
+            .await
+            .into_iter()
+            .map(|(_, record)| (record.object_key.clone(), record.ingest_hour_bucket))
+            .collect()
+    }
+
+    /// Moves the commit record of each data object in `keys` into ingest hour
+    /// `hour`. The data object key carries no ingest hour, so the object stays
+    /// where it is and only the record's bucket changes.
+    async fn refile(&self, keys: &[String], hour: u32) {
+        for (record_key, mut record) in self.commit_records().await {
+            if !keys.contains(&record.object_key) || record.ingest_hour_bucket == hour {
+                continue;
+            }
+            record.ingest_hour_bucket = hour;
+            let moved = ravel_commit::keys::commit_key_for_record(&record).expect("commit key");
+            self.store
+                .inner
+                .put(
+                    &moved,
+                    ravel_commit::record::encode(&record),
+                    PutOptions::create_if_absent(),
+                )
+                .await
+                .expect("put the moved commit record");
+            self.store
+                .inner
+                .delete(&record_key)
+                .await
+                .expect("delete the original commit record");
+        }
     }
 }
 
@@ -538,7 +655,7 @@ impl Tenant {
         self.store.hide_tenants.store(!warm, Ordering::SeqCst);
         let store: Arc<dyn ObjectStoreBackend> = self.store.clone();
         let running = ravel_server::start(
-            server_config(partitions, cache_max_bytes),
+            server_config(partitions, cache_max_bytes, self.max_ingest_lag),
             store.clone(),
             store,
             Arc::new(ravel_object_store::StoreMetrics::default()),
@@ -926,7 +1043,163 @@ async fn a_failed_metadata_read_skips_only_that_object() {
     assert_eq!(run.gets.dir_total(), 0);
 }
 
-fn server_config(partitions: usize, cache_max_bytes: u64) -> ServerConfig {
+thread_local! {
+    /// The buffer this thread's log lines go to, while [`capture_log`] holds it.
+    static THREAD_LOG: std::cell::RefCell<Option<Arc<Mutex<Vec<u8>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The process-wide subscriber's writer: a line goes to the emitting thread's
+/// [`THREAD_LOG`] buffer, or nowhere. A global subscriber, not a scoped one,
+/// because a scoped one misses events while other tests in this binary run.
+struct ThreadLogWriter;
+
+impl std::io::Write for ThreadLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        THREAD_LOG.with(|log| {
+            if let Some(log) = log.borrow().as_ref() {
+                log.lock().expect("log buffer").extend_from_slice(buf);
+            }
+        });
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Runs `body` with this thread's `INFO` log lines captured, and returns its
+/// output with every captured line. A `#[tokio::test]` body runs on the test
+/// thread, so this captures what the server logs inline in `start`.
+async fn capture_log<T>(body: impl std::future::Future<Output = T>) -> (T, Vec<String>) {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_writer(|| ThreadLogWriter)
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .try_init()
+            .expect("the only global subscriber in this binary");
+    });
+    let log = Arc::new(Mutex::new(Vec::new()));
+    THREAD_LOG.with(|slot| *slot.borrow_mut() = Some(log.clone()));
+    let out = body.await;
+    THREAD_LOG.with(|slot| *slot.borrow_mut() = None);
+    let lines = String::from_utf8(log.lock().expect("log buffer").clone())
+        .expect("utf-8 log")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    (out, lines)
+}
+
+/// Issue #4257: a tenant whose event times are years before its ingest time
+/// is warmed. The tenant's [`OBJECTS`] objects carry 2013 event times and sit
+/// in its two latest ingest hours, the [`OLDER_HOUR_OBJECTS`] with the latest
+/// event times in the older one.
+///
+/// With a roomy budget, the warm result log reports every object's metadata
+/// warmed and the whole-part warm's 4 parts, which are the newest ingest
+/// hour's 4 objects, and the first scanning statement over the whole event
+/// range issues no footer GET and no directory GET: the plan phase takes one
+/// cache hit per object. With a metadata budget that admits 2 objects, the
+/// admitted ones are the first 2 of the newest ingest hour, so the statement
+/// reads exactly the other objects' footers.
+///
+/// Seen failing against the event-time window the warm-up resolved before
+/// (the result log reads `parts_warmed=0 metadata_objects_warmed=0`),
+/// against a selection that takes the oldest ingest hour first (the whole-part
+/// warm reads the 2 older-hour objects, and the budgeted statement reads the
+/// footers of the newest hour's first 2), and against one ordered by event
+/// time alone, which fails the same two ways.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_whose_event_times_predate_its_ingest_window_is_warmed() {
+    let (tenant, warm_order) = backdated_tenant().await;
+    let newest_hour: BTreeSet<String> = warm_order[..OBJECTS - OLDER_HOUR_OBJECTS]
+        .iter()
+        .cloned()
+        .collect();
+
+    let (query, partitions) = STRIPED;
+    let (mut server, log) = capture_log(tenant.restart(partitions, ROOMY_CACHE_BYTES, true)).await;
+    let pass_complete: Vec<&String> = log
+        .iter()
+        .filter(|line| line.contains("cache warmup: pass complete"))
+        .collect();
+    assert_eq!(pass_complete.len(), 1, "one warm result: {pass_complete:?}");
+    assert!(
+        pass_complete[0].contains(&format!("metadata_objects_warmed={OBJECTS} "))
+            && pass_complete[0].contains("parts_warmed=4 "),
+        "every object's metadata and 4 parts whole: {}",
+        pass_complete[0]
+    );
+    let warm_gets = std::mem::take(&mut server.warm_gets);
+    assert_eq!(
+        warm_gets
+            .whole
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<String>>(),
+        newest_hour,
+        "the whole-part warm reads the newest ingest hour's objects: {warm_gets:?}"
+    );
+    let run = server.sql(&tenant, query).await;
+    server.stop().await;
+    assert_eq!(
+        (run.gets.footer_total(), run.gets.dir_total()),
+        (0, 0),
+        "warmed, no footer GET and no directory GET: {:?}",
+        run.gets
+    );
+    assert!(
+        run.gets.page_total() > 0,
+        "the statement scans column pages"
+    );
+    assert_eq!(
+        (
+            phase_figure(&run.stats, "plan", "segmentsOpened"),
+            phase_figure(&run.stats, "plan", "cacheHits"),
+            phase_figure(&run.stats, "plan", "s3GetRequests"),
+        ),
+        (OBJECTS as u64, OBJECTS as u64, 0),
+        "the plan phase opens every object from the cache: {}",
+        run.stats
+    );
+
+    let probe = probe_len(tenant.layouts[&warm_order[0]].size);
+    assert!(
+        warm_order
+            .iter()
+            .all(|key| probe_len(tenant.layouts[key].size) == probe),
+        "one probe length"
+    );
+    const ADMITTED: usize = 2;
+    let server = tenant
+        .restart_with_budget(
+            FAST_PATH.1,
+            ROOMY_CACHE_BYTES,
+            2 * (ADMITTED as u64 * probe) + probe,
+            true,
+        )
+        .await;
+    let run = server.sql(&tenant, FAST_PATH.0).await;
+    server.stop().await;
+    let not_admitted: BTreeMap<String, usize> = warm_order[ADMITTED..]
+        .iter()
+        .map(|key| (key.clone(), 1))
+        .collect();
+    assert_eq!(
+        run.gets.footer, not_admitted,
+        "the budget admits the newest ingest hour's first {ADMITTED} objects"
+    );
+}
+
+fn server_config(
+    partitions: usize,
+    cache_max_bytes: u64,
+    max_ingest_lag: Duration,
+) -> ServerConfig {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     ServerConfig {
@@ -966,7 +1239,7 @@ fn server_config(partitions: usize, cache_max_bytes: u64) -> ServerConfig {
         otap_max_decoded_batch_bytes: ravel_server::config::DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
-        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
+        max_ingest_lag,
         deployment_key: None,
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
