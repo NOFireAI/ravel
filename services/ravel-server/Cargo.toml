@@ -340,6 +340,9 @@ reqwest = { version = "0.13", features = ["json", "query", "stream"] }
 # server binary itself keeps the default (server-only) tonic.
 tonic = { workspace = true, features = ["channel"] }
 snap = { workspace = true }
+# Test-only: re-stamps an idempotency marker's version with a valid checksum,
+# the bytes a newer build would write.
+crc32c = { workspace = true }
 # Test-only: the cache warmup deadline test needs virtual time
 # (`tokio::time::pause`/`advance`) to prove a `tokio::time::timeout` fires
 # without the test actually waiting out the real deadline.

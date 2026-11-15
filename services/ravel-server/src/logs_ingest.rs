@@ -153,8 +153,14 @@ impl LogIngestRequestError {
 pub(crate) const MARKER_LOOKUP_FAILED_MESSAGE: &str = "idempotency marker lookup failed; the \
      write was not accepted and is safe to retry";
 
+/// The client-facing message of a keyed write refused because its newest
+/// marker was written by a newer build (ADR-4233 decision 4). Like
+/// [`MARKER_LOOKUP_FAILED_MESSAGE`] it names no key or tenant hash.
+pub(crate) const MARKER_NEWER_MESSAGE: &str = "idempotency marker was written by a newer \
+     build; the write was not accepted and is safe to retry";
+
 /// Keyed writes refused because a marker lookup probe failed with a store
-/// error, logs then spans, rendered as
+/// error or ran past its deadline, logs then spans, rendered as
 /// `ravel_ingest_idempotency_lookup_failures_total`. Process-global with a
 /// single source per signal, like [`crate::provisioning::shard_count_mismatch_count`].
 static IDEMPOTENCY_LOOKUP_FAILURES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -177,7 +183,15 @@ pub(crate) fn idempotency_lookup_failures(signal: Signal) -> u64 {
 /// (`read_marker` maps `NotFound` to a miss, so this is never absence): log
 /// the failed GET, its key and the store error at WARN, count it, and return
 /// the client-facing message, which names none of them.
+///
+/// A marker written by a newer build is not a store error: `read_marker`
+/// already logged it and counted it on
+/// `ravel_ingest_idempotency_newer_marker_refusals_total`, so it is kept out
+/// of the lookup-failure counter and gets its own message.
 pub(crate) fn marker_lookup_failure(signal: Signal, err: &MarkerLookupError) -> String {
+    if err.source.is_newer_marker() {
+        return MARKER_NEWER_MESSAGE.to_string();
+    }
     tracing::warn!(
         signal = signal.key_prefix(),
         request = "GET",
@@ -389,11 +403,12 @@ pub async fn handle_export_logs_releasing(
             Ok(LookupOutcome::Corrupt) => {
                 tracing::warn!("idempotency marker found but failed to decode; treating as a miss");
             }
-            // A store error on the lookup, or a lookup past the deadline,
-            // fails the write closed: writing anyway would store a duplicate
-            // whenever the marker exists and the lookup could not see it. The
-            // request's own data is not written yet, so the retryable error is
-            // safe for the client to retry.
+            // A store error on the lookup, a lookup past the deadline, or a
+            // marker written by a newer build fails the write closed: writing
+            // anyway would store a duplicate whenever the marker exists and
+            // the lookup could not see or read it. The request's own data is
+            // not written yet, so the retryable error is safe for the client
+            // to retry.
             Err(message) => {
                 return Err(LogIngestRequestError::Write(LogWriteError::Abandoned(
                     message,

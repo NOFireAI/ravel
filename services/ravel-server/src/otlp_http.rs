@@ -1332,4 +1332,156 @@ pub(crate) mod tests {
             "a zero span buffer budget must shed as 429, not 503"
         );
     }
+
+    /// Writes the marker for `key` at `hour`, then re-stamps it as marker
+    /// version 2 with a checksum valid for the re-stamped body, the bytes a
+    /// build that writes version 2 would leave.
+    async fn plant_newer_marker(store: &MemoryStore, signal: Signal, key: &[u8], hour: u32) {
+        use ravel_object_store::{GetRange, PutMode, PutOptions};
+
+        let tenant = TenantId::new(TENANT);
+        let receipt = ravel_ingest::IdempotencyReceipt {
+            written_count: 1,
+            commit_token: "v9:from-a-newer-build".to_string(),
+        };
+        ravel_ingest::write_marker(store, &tenant, signal, key, hour, &receipt)
+            .await
+            .expect("write marker");
+        let marker = ravel_ingest::marker_key(&tenant, signal, key, hour);
+        let mut body = store
+            .get(&marker, GetRange::Full)
+            .await
+            .expect("read marker")
+            .data
+            .to_vec();
+        // RIDM magic (4), u16 version (2), crc32c (4), payload; the checksum
+        // covers magic, version and payload.
+        body[4..6].copy_from_slice(&2u16.to_le_bytes());
+        let crc = crc32c::crc32c_append(crc32c::crc32c(&body[..6]), &body[10..]);
+        body[6..10].copy_from_slice(&crc.to_le_bytes());
+        store
+            .put(
+                &marker,
+                Bytes::from(body),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("re-stamp marker");
+    }
+
+    async fn all_keys(store: &MemoryStore) -> Vec<String> {
+        let mut keys: Vec<String> = ravel_object_store::list_all(store, "")
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|meta| meta.key)
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// ADR-4233 decision 4 (issue #4238): a keyed logs or traces export whose
+    /// newest marker was written by a newer build gets the retryable 503 every
+    /// other retryable write refusal gets, and writes nothing: the store
+    /// listing after both requests is the listing before them, the two planted
+    /// markers and no data object or commit record. The real `/metrics`
+    /// scrape then shows one refusal per signal on
+    /// `ravel_ingest_idempotency_newer_marker_refusals_total` and none on
+    /// `ravel_ingest_idempotency_lookup_failures_total`.
+    ///
+    /// Non-vacuity: treating `NewerMarker` as a miss in the handlers' lookup
+    /// arm writes the batch (200, new keys in the listing); mapping the
+    /// refusal to a non-retryable write error answers 400; counting it in
+    /// `marker_lookup_failure` moves the lookup-failure sample.
+    #[tokio::test]
+    async fn keyed_export_over_a_newer_marker_is_refused_503_and_writes_nothing() {
+        use crate::logs_ingest::MARKER_NEWER_MESSAGE;
+        use crate::logs_ingest::marker_lookup_test_support::LOOKUP_FAILURE_COUNTER;
+        use crate::metrics::scrape_test_support::{sample_value, scrape_gateway};
+
+        let _counter = LOOKUP_FAILURE_COUNTER.lock().await;
+        let store = Arc::new(MemoryStore::new());
+        let state = state_with_store(store.clone());
+        let hour = request_ingest_hour_bucket(now_ns()).expect("valid clock");
+        plant_newer_marker(&store, Signal::Logs, b"idem-4238-logs", hour).await;
+        plant_newer_marker(&store, Signal::Spans, b"idem-4238-spans", hour).await;
+        let before = all_keys(&store).await;
+        assert_eq!(before.len(), 2, "only the two planted markers: {before:?}");
+
+        let scrape = || {
+            scrape_gateway(
+                state.logs_ingest.router.clone(),
+                state.traces_ingest.router.clone(),
+            )
+        };
+        let series =
+            |name: &str, signal: &str| format!("{name}{{mode=\"gateway\",signal=\"{signal}\"}}");
+        const NEWER: &str = "ravel_ingest_idempotency_newer_marker_refusals_total";
+        const FAILURES: &str = "ravel_ingest_idempotency_lookup_failures_total";
+        let scraped_before = scrape().await;
+
+        let keyed = |key: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(IDEMPOTENCY_KEY_HEADER, HeaderValue::from_static(key));
+            headers.insert(
+                INGEST_MODE_HEADER,
+                HeaderValue::from_static("strict-arrival"),
+            );
+            headers
+        };
+        let logs_response = export_logs(
+            State(state.clone()),
+            admitted_tenant(),
+            no_permit(),
+            no_pending_ack(),
+            keyed("idem-4238-logs"),
+            Bytes::from(minimal_log_request().encode_to_vec()),
+        )
+        .await;
+        let traces_response = export_traces(
+            State(state.clone()),
+            admitted_tenant(),
+            no_permit(),
+            no_pending_ack(),
+            keyed("idem-4238-spans"),
+            Bytes::from(minimal_trace_request().encode_to_vec()),
+        )
+        .await;
+
+        for (signal, response) in [("logs", logs_response), ("traces", traces_response)] {
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{signal}: a newer marker must refuse with the retryable 503"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+            assert!(text.contains(MARKER_NEWER_MESSAGE), "{signal}: {text}");
+        }
+        assert_eq!(
+            all_keys(&store).await,
+            before,
+            "a refused request must write no data object and no commit record"
+        );
+
+        let scraped_after = scrape().await;
+        for signal in ["logs", "spans"] {
+            assert_eq!(
+                sample_value(&scraped_after, &series(NEWER, signal))
+                    - sample_value(&scraped_before, &series(NEWER, signal)),
+                1,
+                "{signal}: one newer-marker refusal on the rendered /metrics"
+            );
+            assert_eq!(
+                sample_value(&scraped_after, &series(FAILURES, signal)),
+                sample_value(&scraped_before, &series(FAILURES, signal)),
+                "{signal}: a newer marker is not a lookup failure"
+            );
+        }
+    }
 }
