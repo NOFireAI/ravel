@@ -14,12 +14,16 @@
 //!
 //! A refresh failure is logged and counted in
 //! `ravel_compat_refresh_failures_total`, never fatal: the view keeps its last
-//! successful read. Once a GET of `sys/compat` has returned an object, writers
-//! refuse when the last successful read is older than `COMPAT_VIEW_HORIZON`.
-//! Before that the view answers each family's built-in version, so a read
-//! refused with `AccessDenied` on a store that was never activated stops no
-//! writer. A record from a newer release is logged at error with both
-//! versions.
+//! successful read. Writers refuse when the last successful read is
+//! `COMPAT_VIEW_HORIZON` old or older, or there has been none, with one
+//! exception: a blind view, one no read has succeeded for and whose every
+//! refresh error is an `AccessDenied`, answers each family's built-in version
+//! on a bucket whose provisioning record carries no `compat_epoch`, so a
+//! credential without the grant on a store that was never activated stops no
+//! writer. A single 5xx, timeout or throttle before the first successful read
+//! ends that exception for the rest of the run, and so does a read that
+//! returned an object. A record from a newer release is logged at error with
+//! both versions.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};

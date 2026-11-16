@@ -1305,17 +1305,19 @@ impl AlertEvaluator {
     /// Whether the tick that started at `tick_ns` has run past the
     /// `max_publish_lifetime_ns` (`P`) `sys/compat` records, after which it
     /// writes nothing more (ADR-4233 decision 3: an alert publish ends within
-    /// one evaluation tick, and every writer is held to `P`).
+    /// one evaluation tick, and every writer is held to `P`). With a view
+    /// but no record read, or one recording no lifetime, `P` is
+    /// [`ravel_maintain::DEFAULT_PUBLISH_LIFETIME_NS`]. Without a view there
+    /// is no bound.
     fn tick_past_publish_lifetime(&self, tick_ns: i64) -> bool {
-        let Some(lifetime_ns) = self
-            .compat
-            .as_ref()
-            .and_then(CompatView::last_record)
-            .map(|record| record.max_publish_lifetime_ns)
-            .filter(|p| *p > 0)
-        else {
+        let Some(view) = &self.compat else {
             return false;
         };
+        let lifetime_ns = view
+            .last_record()
+            .map(|record| record.max_publish_lifetime_ns)
+            .filter(|p| *p > 0)
+            .unwrap_or(ravel_maintain::DEFAULT_PUBLISH_LIFETIME_NS);
         self.clock.now_ns().saturating_sub(tick_ns) > lifetime_ns
     }
 
@@ -10121,6 +10123,82 @@ mod tick_tests {
         );
     }
 
+    /// A view whose every `sys/compat` read failed with a 5xx has no evidence
+    /// that the store was never activated: here it was, at an `rlog` version
+    /// the view never read. Past the horizon the evaluator refuses before the
+    /// lease is touched, takes no lease and writes no alert history.
+    #[tokio::test]
+    async fn a_never_read_view_with_a_5xx_past_the_horizon_takes_no_lease_and_writes_nothing() {
+        let inner = seeded_store().await;
+        ravel_catalog::compat::create_compat(
+            inner.as_ref(),
+            &compat_keys(),
+            compat_record(6, 1, 1),
+        )
+        .await
+        .expect("create sys/compat");
+        let plan = FaultPlan::empty().with_rule(
+            FaultRule::new(
+                Op::Get,
+                ScriptedFault::Transient("503 Service Unavailable".into()),
+            )
+            .with_key_contains(ravel_catalog::compat::COMPAT_KEY)
+            .with_occurrence(Occurrence::Always),
+        );
+        let fault = Arc::new(FaultStore::new(inner, plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let clock = TestClock::at(NOW_NS);
+        let view = CompatView::new(Arc::clone(&store), compat_keys(), clock.clone());
+        crate::compat::refresh_once(&view).await;
+        let horizon = NOW_NS + ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS;
+        clock.set(horizon);
+        crate::compat::refresh_once(&view).await;
+        assert_eq!(fault.fault_count(Op::Get, FaultKind::Transient), 2);
+        assert!(!view.record_seen());
+        assert_eq!(view.last_read_unix_ns(), None);
+
+        let mut ev =
+            evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view.clone()));
+        let report = ev.run_tick().await;
+        assert_eq!(report.records_written, 0, "{report:?}");
+        assert!(report.lease_unavailable, "{report:?}");
+        assert_eq!(read_lease(store.as_ref()).await, None);
+        assert_eq!(alert_object_versions(store.as_ref()).await, Vec::new());
+        assert_eq!(
+            ev.lease_step(horizon).await.expect("lease step"),
+            LeaseStep::Refused(CompatRefusal::ViewStale {
+                last_read_unix_ns: None,
+                now_unix_ns: horizon,
+            })
+        );
+        assert_eq!(read_lease(store.as_ref()).await, None);
+    }
+
+    /// With a view but no record read, a tick is held to the default `P`
+    /// rather than running unbounded: a never-refreshed view and one that
+    /// read an absent record both abandon a tick one nanosecond past
+    /// [`ravel_maintain::DEFAULT_PUBLISH_LIFETIME_NS`].
+    #[tokio::test]
+    async fn a_tick_with_no_record_read_is_held_to_the_default_publish_lifetime() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let never_refreshed = CompatView::new(Arc::clone(&store), compat_keys(), clock.clone());
+        let read_absent = refreshed_view(&store, &clock).await;
+        assert_eq!(read_absent.last_record(), None);
+        assert_eq!(read_absent.last_read_unix_ns(), Some(NOW_NS));
+        let default_p = ravel_maintain::DEFAULT_PUBLISH_LIFETIME_NS;
+        assert_eq!(default_p, 3_600 * NS_PER_SEC);
+        for view in [never_refreshed, read_absent] {
+            let ev = evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view));
+            clock.set(NOW_NS + default_p);
+            assert!(!ev.tick_past_publish_lifetime(NOW_NS), "at P exactly");
+            clock.set(NOW_NS + default_p + 1);
+            assert!(ev.tick_past_publish_lifetime(NOW_NS), "past P");
+        }
+        let without_view = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        assert!(!without_view.tick_past_publish_lifetime(NOW_NS));
+    }
+
     /// Put `lease` as the tenant's alert lease.
     async fn put_lease(store: &dyn ObjectStoreBackend, lease: &AlertLease) {
         store
@@ -10231,8 +10309,8 @@ mod tick_tests {
     }
 
     /// A tick is abandoned once it has run longer than the
-    /// `max_publish_lifetime_ns` the record states; without a view, or with
-    /// no lifetime recorded, it never is.
+    /// `max_publish_lifetime_ns` the record states; without a view it never
+    /// is.
     #[tokio::test]
     async fn a_tick_past_the_recorded_publish_lifetime_is_abandoned() {
         let store = seeded_store().await;
