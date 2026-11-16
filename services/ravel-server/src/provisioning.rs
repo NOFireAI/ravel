@@ -1075,4 +1075,108 @@ mod tests {
         writer.ensure(&th, Signal::Metrics, t2).await.expect("seen");
         assert_eq!(store.sequence_progress(0), 3, "a seen tenant reads nothing");
     }
+
+    struct FixedCompatClock(i64);
+
+    impl ravel_catalog::compat::CompatClock for FixedCompatClock {
+        fn now_unix_ns(&self) -> i64 {
+            self.0
+        }
+    }
+
+    /// A view over `store`, refreshed once, after `sys/compat` was created at
+    /// store-wide epoch `epoch` (`None`: no record at all).
+    async fn compat_view_at(
+        store: &Arc<dyn ObjectStoreBackend>,
+        epoch: Option<u64>,
+    ) -> ravel_catalog::compat::CompatView {
+        let keys = ravel_catalog::compat::CompatKeys::from_file_keys(&[[0x21; 32]]).expect("key");
+        if let Some(epoch) = epoch {
+            ravel_catalog::compat::create_compat(
+                store.as_ref(),
+                &keys,
+                sysproto::CompatRecord {
+                    compat_epoch: epoch,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create sys/compat");
+        }
+        let view = ravel_catalog::compat::CompatView::new(
+            Arc::clone(store),
+            keys,
+            Arc::new(FixedCompatClock(1_000)),
+        );
+        view.refresh().await.expect("refresh");
+        view
+    }
+
+    async fn stored_record(
+        store: &dyn ObjectStoreBackend,
+        th: &TenantHash,
+    ) -> sysproto::ProvisioningRecord {
+        let got = store
+            .get(&provisioning_key(th, Signal::Logs), GetRange::Full)
+            .await
+            .expect("record written");
+        sysproto::ProvisioningRecord::decode(got.data.as_ref()).expect("decodes")
+    }
+
+    /// After an activation (the view has seen `compat_epoch` 3), a first touch
+    /// creates the record born fenced: version 4, `compat_epoch` 3,
+    /// `compat_fenced_unix_ns` 0 (ADR-4233 decision 4).
+    #[tokio::test]
+    async fn first_touch_after_an_activation_is_born_fenced() {
+        let store = store();
+        let view = compat_view_at(&store, Some(3)).await;
+        let th = TenantId::new("born-fenced").hash();
+        let writer = ProvisioningRecordWriter::new(store.clone(), 4).with_compat_view(Some(view));
+        writer
+            .ensure(&th, Signal::Logs, 1_000)
+            .await
+            .expect("first touch");
+        let record = stored_record(store.as_ref(), &th).await;
+        assert_eq!(
+            (
+                record.format_version,
+                record.compat_epoch,
+                record.compat_fenced_unix_ns,
+                record.shard_count,
+            ),
+            (ravel_catalog::PROVISIONING_FENCED_FORMAT_VERSION, 3, 0, 4)
+        );
+    }
+
+    /// Before any activation, with a record at epoch 0, no record at all, or
+    /// no view, a first touch creates the version-3 record it always has.
+    #[tokio::test]
+    async fn first_touch_before_an_activation_is_unfenced() {
+        for epoch in [Some(0), None] {
+            let store = store();
+            let view = compat_view_at(&store, epoch).await;
+            let th = TenantId::new("unfenced").hash();
+            let writer =
+                ProvisioningRecordWriter::new(store.clone(), 4).with_compat_view(Some(view));
+            writer
+                .ensure(&th, Signal::Logs, 1_000)
+                .await
+                .expect("first touch");
+            let record = stored_record(store.as_ref(), &th).await;
+            assert_eq!(
+                (record.format_version, record.compat_epoch),
+                (3, 0),
+                "sys/compat epoch {epoch:?}"
+            );
+        }
+        let store = store();
+        let th = TenantId::new("no-view").hash();
+        let writer = ProvisioningRecordWriter::new(store.clone(), 4).with_compat_view(None);
+        writer
+            .ensure(&th, Signal::Logs, 1_000)
+            .await
+            .expect("first touch");
+        let record = stored_record(store.as_ref(), &th).await;
+        assert_eq!((record.format_version, record.compat_epoch), (3, 0));
+    }
 }
