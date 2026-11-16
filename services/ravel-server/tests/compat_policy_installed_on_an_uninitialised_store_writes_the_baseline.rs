@@ -1,21 +1,38 @@
 //! ADR-4233 decision 1 (the v0.34.0 release bar, #4301): on a keyed store that
-//! never ran compat init -- `sys/compat` absent -- a real [`ravel_server::start`]
-//! with the ingest and maintenance write policies installed must write nothing
-//! a v0.33.0 binary refuses. Here the policy is installed (the bucket is keyed,
-//! so [`ravel_server::start`] builds a [`CompatView`] and hands it to every
-//! writer), yet with no `sys/compat` the view answers each family's baseline,
-//! which is exactly the `CURRENT` version a build with no policy (`policy None`,
-//! the parent commit) writes.
+//! never ran compat init (`sys/compat` absent), a real [`ravel_server::start`]
+//! writes nothing a v0.33.0 binary refuses, with the write policy installed on
+//! every writer it runs.
 //!
-//! A metrics, log and span write lands (200), and every commit record's
-//! `segment_format_version` is its family's `CURRENT`. Two wrong policies this
-//! rules out: one that refuses on an uninitialised store writes no object (the
-//! per-family commit-record assertion finds none); one that writes a different
-//! version fails the version equality.
+//! The bucket is keyed, so `start` builds a [`ravel_catalog::compat::CompatView`]
+//! and hands it to the ingest routers, the query audit pipeline, the catalog
+//! fold and the maintenance compactor. `/metrics` renders the
+//! `ravel_compat_publish_refused_total` family, which only a process that
+//! installed the policy renders, and no series in it moves. With no
+//! `sys/compat` the view answers each family's baseline, the `CURRENT` version
+//! a build with no policy writes.
+//!
+//! [`compat_policy_installed_on_an_uninitialised_store_writes_the_baseline`]
+//! runs a `Mode::All` server (metrics, log and span ingest, a query whose
+//! audit record is written in `required` mode, and the scheduled fold of a
+//! sealed log hour), then a `Mode::Maintain` server that compacts that hour.
+//! [`a_5xx_at_startup_refuses_until_a_refresh_then_writes_the_baseline`]
+//! starts a server whose first `sys/compat` read fails with a 503: ingest is
+//! refused at admission, so nothing is acknowledged that could be lost, until
+//! a successful read, after which writes land at the baseline.
+//!
+//! Each test then checks the store as a v0.33.0 reader would meet it: every
+//! data object's trailer version and every commit record's
+//! `segment_format_version` is its family's `CURRENT`, no `sys/compat` object
+//! exists, and every provisioning record is below format version 4 with no
+//! compat field set.
+//!
+//! `ravel_compat_publish_refused_total` sums process-wide counters, so the two
+//! tests run one at a time under [`SERIAL`] and compare scrapes, not absolute
+//! values.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,7 +41,7 @@ use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequ
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
-use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use opentelemetry_proto::tonic::logs::v1::{LogRecord as OtlpLogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
 use opentelemetry_proto::tonic::metrics::v1::{
@@ -33,16 +50,30 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
-use ravel_commit::{keys, record};
+use ravel_catalog::compat::COMPAT_KEY;
+use ravel_catalog::PROVISIONING_FENCED_FORMAT_VERSION;
+use ravel_commit::keys;
+use ravel_commit::publish::{self, RetryPolicy};
+use ravel_commit::record::{self, NewCommitRecord};
+use ravel_logseg::{AttrValue, LogRecord, ObjectIdentity, RlogConfig, RlogWriter};
+use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, ScriptedFault, Sequence};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, list_all};
+use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
+use ravel_proto::sys::v1 as sysproto;
 use ravel_server::ingest_concurrency::IngestConcurrencyLimit;
 use ravel_server::{FoldTaskConfig, LimitsConfig, Mode, ServerConfig};
 use ravel_types::{Signal, TenantId};
+use uuid::Uuid;
 
 const TOKEN: &str = "testtoken";
 const TENANT: &str = "acme";
 const DEPLOYMENT_KEY: [u8; 32] = [0x4d; 32];
+const NS_PER_HOUR: i64 = 3_600_000_000_000;
+const REFUSED: &str = "ravel_compat_publish_refused_total";
+
+/// Held by each test for its whole run, so neither sees the other's
+/// process-wide refusal counts move.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn now_ns() -> i64 {
     SystemTime::now()
@@ -93,7 +124,7 @@ fn logs_body() -> Vec<u8> {
                 ..Default::default()
             }),
             scope_logs: vec![ScopeLogs {
-                log_records: vec![LogRecord {
+                log_records: vec![OtlpLogRecord {
                     time_unix_nano: ts,
                     observed_time_unix_nano: ts,
                     severity_number: 9,
@@ -137,11 +168,16 @@ fn traces_body() -> Vec<u8> {
     .encode_to_vec()
 }
 
-fn config() -> ServerConfig {
+fn config(mode: Mode) -> ServerConfig {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     ServerConfig {
-        audit_pipeline: Default::default(),
+        // `required`: a refused audit write fails the query, so a 200 proves
+        // the audit record was written.
+        audit_pipeline: matches!(mode, Mode::All).then(|| ravel_maintain::AuditPipelineConfig {
+            audit_mode: ravel_maintain::AuditMode::Required,
+            ..Default::default()
+        }),
         audit_text: Default::default(),
         query_budgets: Default::default(),
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
@@ -154,18 +190,34 @@ fn config() -> ServerConfig {
         max_flush_delay_idle: Duration::from_secs(40),
         min_flush_bytes: 0,
         idle_flush_byte_floor: 0,
-        mode: Mode::Gateway,
+        mode,
         listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
         shard_count: 1,
         tenant_resolver: ravel_server::tenant::build_resolver(tokens, false),
         mtls_listener: None,
-        fold_tenants: Vec::new(),
+        fold_tenants: vec![TenantId::new(TENANT).hash()],
         fold: FoldTaskConfig {
-            enabled: false,
+            enabled: !matches!(mode, Mode::Gateway),
+            fold_interval: Duration::from_millis(250),
             ..FoldTaskConfig::default()
         },
-        maintain: ravel_server::MaintenanceTaskConfig::default(),
+        maintain: ravel_server::MaintenanceTaskConfig {
+            enabled: matches!(mode, Mode::Maintain),
+            interval: Duration::from_secs(1),
+            shard_count: 1,
+            // Compact the tiny seeded bucket: the production geometry floor
+            // would leave it uncompacted.
+            compactor: ravel_maintain::CompactorConfig {
+                geometry_floor_decoded_rows: 0,
+                ..ravel_maintain::CompactorConfig::default()
+            },
+            worker_record_keys: matches!(mode, Mode::Maintain).then(|| {
+                ravel_maintain::worker_set::MaintainRecordKeys::from_file_keys(&[[0x5C; 32]])
+                    .expect("one maintain key")
+            }),
+            ..ravel_server::MaintenanceTaskConfig::default()
+        },
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: false,
@@ -208,6 +260,18 @@ fn config() -> ServerConfig {
     }
 }
 
+async fn start(store: Arc<dyn ObjectStoreBackend>, mode: Mode) -> ravel_server::Running {
+    ravel_server::start(
+        config(mode),
+        store.clone(),
+        store,
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts")
+}
+
 async fn post(client: &reqwest::Client, base: &str, path: &str, body: Vec<u8>) -> u16 {
     client
         .post(format!("{base}{path}"))
@@ -221,53 +285,300 @@ async fn post(client: &reqwest::Client, base: &str, path: &str, body: Vec<u8>) -
         .as_u16()
 }
 
-/// Every commit record's `segment_format_version` under `tenant`'s `signal`
-/// shard-0 commit prefix.
-async fn committed_versions(
-    store: &dyn ObjectStoreBackend,
-    tenant: &TenantId,
-    signal: Signal,
-) -> Vec<u32> {
-    let prefix = keys::commit_shard_prefix(&tenant.hash(), signal, 0).expect("commit prefix");
-    let mut versions = Vec::new();
-    for meta in list_all(store, &prefix).await.expect("list commits") {
-        if !matches!(
-            keys::partition_bucket_entry(&meta.key),
-            Ok(keys::BucketEntry::CommitRecord(_))
-        ) {
-            continue;
-        }
-        let bytes = store
-            .get(&meta.key, ravel_object_store::GetRange::Full)
-            .await
-            .expect("commit record")
-            .data;
-        versions.push(
-            record::decode(&bytes)
-                .expect("decode commit record")
-                .segment_format_version,
-        );
-    }
-    versions
+async fn scrape(addr: std::net::SocketAddr) -> String {
+    reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .expect("metrics scrape completes")
+        .text()
+        .await
+        .expect("metrics body is text")
 }
 
+/// Every `ravel_compat_publish_refused_total` sample in `body`, by its label
+/// set. Empty when the family is not rendered.
+fn refusals(body: &str) -> BTreeMap<String, u64> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix(REFUSED))
+        .filter(|rest| rest.starts_with('{'))
+        .map(|rest| {
+            let (labels, value) = rest.rsplit_once(' ').expect("a sample ends in its value");
+            (labels.to_string(), value.parse().expect("a counter value"))
+        })
+        .collect()
+}
+
+/// The policy is installed (the family renders, with the pre-filled
+/// `view_stale` series of `family` under `mode`), and no refusal series moved
+/// since `before`.
+fn assert_installed_and_nothing_refused(before: &str, after: &str, mode: &str, family: &str) {
+    let series = format!("{{mode=\"{mode}\",family=\"{family}\",reason=\"view_stale\"}}");
+    let after = refusals(after);
+    assert!(
+        after.contains_key(&series),
+        "the compat write policy is installed: {REFUSED}{series} renders:\n{after:?}"
+    );
+    let before = refusals(before);
+    for (labels, count) in &after {
+        assert_eq!(
+            *count,
+            before.get(labels).copied().unwrap_or(0),
+            "no write was refused under the compat policy: {REFUSED}{labels}"
+        );
+    }
+}
+
+/// The trailer format version each signal's writers emit with no policy.
+fn current_version(signal: Signal) -> u32 {
+    match signal {
+        Signal::Metrics => u32::from(ravel_ingest::SEGMENT_FORMAT_VERSION),
+        Signal::Logs | Signal::Audit => u32::from(ravel_ingest::LOG_SEGMENT_FORMAT_VERSION),
+        Signal::Spans => u32::from(ravel_ingest::SPAN_SEGMENT_FORMAT_VERSION),
+        other => panic!("no data writer in this test for {other:?}"),
+    }
+}
+
+/// What the store holds, read as a v0.33.0 binary meets it.
+#[derive(Debug, Default)]
+struct Written {
+    /// Trailer version of every L0 data object, by signal.
+    l0: BTreeMap<String, Vec<u32>>,
+    /// Trailer version of every L1 part, by signal.
+    l1: BTreeMap<String, Vec<u32>>,
+    /// `segment_format_version` of every commit record, by signal.
+    commits: BTreeMap<String, Vec<u32>>,
+    compaction_records: usize,
+    /// `(key, format_version, compat_epoch, compat_fenced_unix_ns)`.
+    provisioning: Vec<(String, u32, u64, i64)>,
+    catalog_heads: Vec<String>,
+    compat_object: bool,
+}
+
+/// The format version in an RSEG, RLOG or RSPAN trailer: all three end in a
+/// 16-byte trailer whose bytes 8..10 are the version, little-endian
+/// (docs/segment-format.md, docs/log-segment-format.md, the RSPAN footer).
+fn trailer_version(bytes: &[u8]) -> u32 {
+    let trailer = &bytes[bytes.len() - 16..];
+    u32::from(u16::from_le_bytes([trailer[8], trailer[9]]))
+}
+
+async fn written(store: &dyn ObjectStoreBackend) -> Written {
+    let get = |key: String| async move {
+        store
+            .get(&key, GetRange::Full)
+            .await
+            .expect("listed object reads")
+            .data
+    };
+    let mut out = Written {
+        compat_object: store.head(COMPAT_KEY).await.is_ok(),
+        ..Written::default()
+    };
+    for meta in list_all(store, "").await.expect("list the bucket") {
+        let key = meta.key;
+        if let Ok(parsed) = keys::parse_data_key(&key) {
+            let version = trailer_version(&get(key).await);
+            out.l0
+                .entry(format!("{:?}", parsed.signal))
+                .or_default()
+                .push(version);
+        } else if let Ok(parsed) = keys::parse_l1_part_key(&key) {
+            let version = trailer_version(&get(key).await);
+            out.l1
+                .entry(format!("{:?}", parsed.signal))
+                .or_default()
+                .push(version);
+        } else if let Ok(entry) = keys::partition_bucket_entry(&key) {
+            match entry {
+                keys::BucketEntry::CommitRecord(parsed) => {
+                    let commit = record::decode(&get(key).await).expect("decode commit record");
+                    out.commits
+                        .entry(format!("{:?}", parsed.signal))
+                        .or_default()
+                        .push(commit.segment_format_version);
+                }
+                keys::BucketEntry::CompactionRecord(_) => out.compaction_records += 1,
+                _ => {}
+            }
+        } else if key.ends_with("/prov") {
+            let prov = sysproto::ProvisioningRecord::decode(get(key.clone()).await.as_ref())
+                .expect("decode provisioning record");
+            out.provisioning.push((
+                key,
+                prov.format_version,
+                prov.compat_epoch,
+                prov.compat_fenced_unix_ns,
+            ));
+        } else if key.contains("/catalog/") && key.ends_with("/HEAD") {
+            out.catalog_heads.push(key);
+        }
+    }
+    out
+}
+
+/// Every object a v0.33.0 binary reads is at its family's `CURRENT`, and no
+/// object the activation protocol writes exists.
+fn assert_v0_33_readable(written: &Written) {
+    for (what, by_signal) in [
+        ("L0 data object trailer", &written.l0),
+        ("L1 part trailer", &written.l1),
+        ("commit record segment_format_version", &written.commits),
+    ] {
+        for (signal, versions) in by_signal {
+            let current = [
+                Signal::Metrics,
+                Signal::Logs,
+                Signal::Spans,
+                Signal::Audit,
+            ]
+            .into_iter()
+            .find(|s| format!("{s:?}") == *signal)
+            .map(current_version)
+            .unwrap_or_else(|| panic!("unexpected signal {signal}"));
+            assert!(
+                versions.iter().all(|v| *v == current),
+                "every {signal} {what} is at CURRENT {current}: {versions:?}"
+            );
+        }
+    }
+    assert!(
+        !written.compat_object,
+        "no {COMPAT_KEY} object is written on an uninitialised store"
+    );
+    assert!(
+        !written.provisioning.is_empty(),
+        "ingest wrote provisioning records: {written:?}"
+    );
+    for (key, format_version, compat_epoch, fenced) in &written.provisioning {
+        assert!(
+            *format_version < PROVISIONING_FENCED_FORMAT_VERSION,
+            "{key} is below the fenced format version 4: {format_version}"
+        );
+        assert_eq!(
+            (*compat_epoch, *fenced),
+            (0, 0),
+            "{key} carries no compat field"
+        );
+    }
+}
+
+/// Polls `written` until `done` holds, for up to 60 s.
+async fn wait_for(store: &dyn ObjectStoreBackend, done: impl Fn(&Written) -> bool) -> Written {
+    let mut seen = Written::default();
+    for _ in 0..600 {
+        seen = written(store).await;
+        if done(&seen) {
+            return seen;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("timed out; the store holds {seen:?}");
+}
+
+fn has(by_signal: &BTreeMap<String, Vec<u32>>, signal: Signal) -> bool {
+    by_signal
+        .get(&format!("{signal:?}"))
+        .is_some_and(|v| !v.is_empty())
+}
+
+/// Input `input`'s two tiny RLOG records in `hour`, enough for the default
+/// `min_compaction_inputs` of 2 to form a compaction unit.
+fn input_records(hour: u32, input: u32) -> Vec<LogRecord> {
+    let base = i64::from(hour) * NS_PER_HOUR + 1_000_000_000;
+    (0..2u32)
+        .map(|j| {
+            let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+            let ts = base + i64::from(j) * 1_000 + i64::from(input);
+            LogRecord {
+                stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1", &[]),
+                stream_attrs: ravel_logseg::stream_attrs_bytes(&resource, "scope", "1", &[]),
+                ts_ns: ts,
+                observed_ts_ns: ts,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: format!("in{input} r{j}"),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: vec![("a".to_string(), AttrValue::I64(i64::from(j)))],
+            }
+        })
+        .collect()
+}
+
+/// Publishes three small RLOG inputs into `hour`, each its own writer, at the
+/// build's current version.
+async fn publish_inputs(store: &dyn ObjectStoreBackend, tenant: &TenantId, hour: u32) {
+    let tenant_hash = tenant.hash();
+    for input in 0..3u32 {
+        let records = input_records(hour, input);
+        let writer_id = Uuid::from_u128(u128::from(input) + 1);
+        let identity = ObjectIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.into_bytes(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+        for rec in &records {
+            writer.push(rec.clone()).expect("push log record");
+        }
+        let bytes = writer.finish().expect("finish rlog object");
+        let created_unix_ns = i64::from(hour) * NS_PER_HOUR + 2_000_000_000;
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: bytes.len() as u64,
+            content_hash: *blake3::hash(&bytes).as_bytes(),
+            sample_count: records.len() as u64,
+            series_count: 1,
+            min_event_ts_ns: records.first().expect("records").ts_ns,
+            max_event_ts_ns: records.last().expect("records").ts_ns,
+            min_ingest_ts_ns: created_unix_ns,
+            max_ingest_ts_ns: created_unix_ns,
+            segment_format_version: u32::from(ravel_ingest::LOG_SEGMENT_FORMAT_VERSION),
+            created_unix_ns,
+            ingest_hour_bucket: hour,
+        })
+        .expect("valid log commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put log data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish log commit");
+    }
+}
+
+/// A sealed ingest hour, five hours back on the wall clock the server reads.
+fn sealed_hour() -> u32 {
+    (now_ns() / NS_PER_HOUR) as u32 - 5
+}
+
+/// Every writer `start` runs, with the policy installed on a store with no
+/// `sys/compat`, writes only what v0.33.0 reads: ingest of all three signals
+/// and a `required` query audit write in `Mode::All` (each answered 200), the
+/// scheduled fold of a sealed log hour there, and the compaction of that hour
+/// in `Mode::Maintain`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compat_policy_installed_on_an_uninitialised_store_writes_the_baseline() {
+    let _serial = SERIAL.lock().await;
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    // No create_compat: sys/compat is absent, as on a store that never ran
-    // compat init. The deployment key still installs the policy.
-    let running = ravel_server::start(
-        config(),
-        store.clone(),
-        store.clone(),
-        Arc::new(ravel_object_store::StoreMetrics::default()),
-        None,
-    )
-    .await
-    .expect("server starts");
-    let base = format!("http://{}", running.http_addr);
-    let client = reqwest::Client::new();
+    let tenant = TenantId::new(TENANT);
+    publish_inputs(store.as_ref(), &tenant, sealed_hour()).await;
 
+    let all = start(store.clone(), Mode::All).await;
+    let before = scrape(all.http_addr).await;
+    let base = format!("http://{}", all.http_addr);
+    let client = reqwest::Client::new();
     for (path, body) in [
         ("/v1/metrics", metrics_body()),
         ("/v1/logs", logs_body()),
@@ -279,46 +590,135 @@ async fn compat_policy_installed_on_an_uninitialised_store_writes_the_baseline()
             "{path} lands on an uninitialised store"
         );
     }
+    let now_s = now_ns() / 1_000_000_000;
+    let query = client
+        .get(format!("{base}/api/v1/query_range"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .query(&[
+            ("query", "baseline_e2e".to_string()),
+            ("start", (now_s - 600).to_string()),
+            ("end", now_s.to_string()),
+            ("step", "60s".to_string()),
+        ])
+        .send()
+        .await
+        .expect("query_range request sent");
+    assert_eq!(
+        query.status(),
+        200,
+        "the query succeeds, so its required audit write was not refused"
+    );
+    let logs_head = format!("t/{}/catalog/l/HEAD", tenant.hash().to_hex());
+    wait_for(store.as_ref(), |w| {
+        has(&w.commits, Signal::Metrics)
+            && has(&w.commits, Signal::Spans)
+            && has(&w.commits, Signal::Audit)
+            && w.commits.get("Logs").is_some_and(|v| v.len() > 3)
+            && w.catalog_heads.contains(&logs_head)
+    })
+    .await;
+    assert_installed_and_nothing_refused(&before, &scrape(all.http_addr).await, "all", "rseg");
+    all.shutdown().await.expect("graceful shutdown");
 
-    let tenant = TenantId::new(TENANT);
-    let expected = [
-        (
-            Signal::Metrics,
-            u32::from(ravel_ingest::SEGMENT_FORMAT_VERSION),
-        ),
-        (
-            Signal::Logs,
-            u32::from(ravel_ingest::LOG_SEGMENT_FORMAT_VERSION),
-        ),
-        (
-            Signal::Spans,
-            u32::from(ravel_ingest::SPAN_SEGMENT_FORMAT_VERSION),
-        ),
-    ];
+    let maintain = start(store.clone(), Mode::Maintain).await;
+    let before = scrape(maintain.http_addr).await;
+    let compacted = wait_for(store.as_ref(), |w| {
+        w.compaction_records >= 1 && has(&w.l1, Signal::Logs)
+    })
+    .await;
+    assert_installed_and_nothing_refused(
+        &before,
+        &scrape(maintain.http_addr).await,
+        "maintain",
+        "rlog",
+    );
+    maintain.shutdown().await.expect("graceful shutdown");
 
-    // The flush fires on max_flush_delay; poll until every family has committed.
-    let mut committed: Vec<Vec<u32>> = Vec::new();
-    for _ in 0..600 {
-        committed = Vec::new();
-        for (signal, _) in expected {
-            committed.push(committed_versions(store.as_ref(), &tenant, signal).await);
-        }
-        if committed.iter().all(|v| !v.is_empty()) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    let written = written(store.as_ref()).await;
+    for signal in [Signal::Metrics, Signal::Logs, Signal::Spans, Signal::Audit] {
+        assert!(has(&written.l0, signal), "{signal:?} wrote L0: {written:?}");
     }
+    assert!(has(&compacted.l1, Signal::Logs));
+    assert_v0_33_readable(&written);
+}
 
+/// A 503 on the first `sys/compat` read leaves the view unread and not blind,
+/// so the server cannot tell an uninitialised store from an activated one.
+/// Ingest is refused at admission (503, counted `view_stale`, nothing
+/// written), and once a read succeeds and finds no record the same writes
+/// land at the baseline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_5xx_at_startup_refuses_until_a_refresh_then_writes_the_baseline() {
+    let _serial = SERIAL.lock().await;
+    let plan = FaultPlan::empty().with_sequence(
+        Sequence::new(Op::Get)
+            .with_key_contains(COMPAT_KEY)
+            .then_fault(ScriptedFault::Transient(
+                "503 Service Unavailable".to_string(),
+            )),
+    );
+    let faults = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let store: Arc<dyn ObjectStoreBackend> = faults.clone();
+
+    let running = start(store.clone(), Mode::Gateway).await;
+    assert_eq!(
+        faults.fault_count(Op::Get, FaultKind::Transient),
+        1,
+        "the startup read of sys/compat failed with a 5xx"
+    );
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+    let before = refusals(&scrape(running.http_addr).await);
+    let stale = "{mode=\"gateway\",family=\"rseg\",reason=\"view_stale\"}";
+    assert_eq!(
+        post(&client, &base, "/v1/metrics", metrics_body()).await,
+        503,
+        "a view that never read sys/compat refuses ingest"
+    );
+    let after = refusals(&scrape(running.http_addr).await);
+    assert_eq!(
+        after.get(stale).copied().unwrap_or(0),
+        before.get(stale).copied().unwrap_or(0) + 1,
+        "the refusal is counted view_stale: {after:?}"
+    );
+    assert!(
+        list_all(store.as_ref(), "t/")
+            .await
+            .expect("list tenants")
+            .is_empty(),
+        "nothing is written while the view is unread"
+    );
+
+    running
+        .compat_view()
+        .expect("a keyed bucket builds a view")
+        .refresh()
+        .await
+        .expect("the read after the outage succeeds");
+    let before = scrape(running.http_addr).await;
+    for (path, body) in [
+        ("/v1/metrics", metrics_body()),
+        ("/v1/logs", logs_body()),
+        ("/v1/traces", traces_body()),
+    ] {
+        assert_eq!(
+            post(&client, &base, path, body).await,
+            200,
+            "{path} lands once sys/compat reads absent"
+        );
+    }
+    wait_for(store.as_ref(), |w| {
+        [Signal::Metrics, Signal::Logs, Signal::Spans]
+            .into_iter()
+            .all(|s| has(&w.commits, s))
+    })
+    .await;
+    assert_installed_and_nothing_refused(
+        &before,
+        &scrape(running.http_addr).await,
+        "gateway",
+        "rseg",
+    );
     running.shutdown().await.expect("graceful shutdown");
-
-    for ((signal, current), versions) in expected.into_iter().zip(committed) {
-        assert!(
-            !versions.is_empty(),
-            "{signal:?} committed at least one object"
-        );
-        assert!(
-            versions.iter().all(|v| *v == current),
-            "{signal:?} commit records are all at CURRENT {current}, the policy-None version: {versions:?}"
-        );
-    }
+    assert_v0_33_readable(&written(store.as_ref()).await);
 }
