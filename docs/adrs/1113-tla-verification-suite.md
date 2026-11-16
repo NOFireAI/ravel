@@ -382,7 +382,9 @@ CAS. Each row states whether the Rust code performs the transition
 atomically or whether the model assumes a helper or the backend does.
 Refinement is not claimed from shared vocabulary; where a model action
 has no atomic counterpart in Rust, the row says so. Source line numbers
-do not appear anywhere in the suite.
+do not appear anywhere in the suite. An area enrolled in Antithesis
+carries a sixth column (see the Antithesis property column amendment
+below).
 
 ### D9. Harness: `scripts/check-tla.sh`, pinned TLC, fail closed
 
@@ -597,3 +599,34 @@ The TLC suite does not depend on it and CI does not run it.
   change behind unchanged names is not caught by CI; keeping the model in
   step is a reviewer duty, and the traceability table is the reviewer's
   map from the changed symbol to the model action to re-examine.
+
+## Amendment (2026-11-16): the Antithesis property column
+
+<!-- amendment-applies: sections="D8. Traceability names symbols, not lines" pointer="Antithesis property column amendment" -->
+
+ADR-4326 (decision 6) carries the in-scope invariants into Antithesis
+properties and records each row's carrier in the area's table. D8's five
+columns stand for every area that is not enrolled; this amendment adds the
+sixth column and its check (issue #4330).
+
+- An area is enrolled when its directory holds `antithesis-mutants.tsv`.
+  Every table in an enrolled area's `traceability.md` has a sixth column,
+  "Antithesis property", and every data row's cell is one of
+  `sut: <path.rs> -- <message>` (the file exists and holds the literal
+  message), `driver: <workload> -- <message>` (the literal occurs under
+  `antithesis/<workload>/`), or `none: <reason>` with a non-empty reason.
+  The ` -- ` separator keeps the path a whole token for the existing
+  `crates/...` reference sweep.
+- A five-column table in an enrolled area fails `check-tla.sh
+  traceability`, and so does a six-column table in an area without the
+  `.tsv`. A table's first row is its header, recognised by its exact first
+  cell, `TLA+ action or property`; a table whose first cell differs fails,
+  and every data row must have the header's column count.
+- `antithesis-mutants.tsv` has one tab-separated line per
+  `negative/*.cfg` of the area: the config stem, then either the mutant
+  `<area>/<stem>`, which occurs in Rust as the literal
+  `inv_mutant!("<area>/<stem>")`, and the message of a `sut:` or `driver:`
+  cell in the area's tables, or `none: <reason>`. A missing, duplicated or
+  unknown stem fails.
+- No area is enrolled by this amendment. Each ADR-4326 child epic's last
+  task enrolls its area.
