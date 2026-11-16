@@ -32,7 +32,7 @@ use ravel_object_store::{
 use ravel_query::erasure::ErasurePredicate;
 use ravel_query::{
     CacheFetchError, ColumnarBlockOutcome, LogFetchError, LogQuery, LogSegmentFetcher,
-    StreamAttrEquals,
+    RowBlockOutcome, StreamAttrEquals,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccessIntent, AccountedOp, QueryAccounting};
@@ -1353,6 +1353,59 @@ async fn columnar_pass_through_refuses_while_erasure_is_pending() {
         "the row path's accounting is unchanged"
     );
     assert!(snapshot.s3_bytes(AccountedOp::Get) > 0);
+}
+
+/// The row-block exit hands out rows its erasure has not filtered, so it
+/// refuses a caller that passes anything but the scan's pending predicate
+/// set: no set, or a different one, gets `ErasureUnapplied`, decodes nothing
+/// and leaves the cursor where it was. A caller that passes the set gets
+/// every block, the erased rows included, for it to exclude.
+///
+/// FLIP: drop the `self.erasure != applies` test from
+/// `LogSegmentScan::next_row_block` and the empty-set call returns block 0,
+/// which holds the erased `u1` rows: the refusal assertion panics on
+/// `Block(RowBlock { .. })`.
+#[tokio::test]
+async fn row_block_exit_refuses_an_unapplied_erasure() {
+    let tenant = TenantHash([12u8; 16]);
+    let mem = MemoryStore::new();
+    let records = erasure_records();
+    let seg_ref = write_object(&mem, "logs/row_block_erase.rlog", &records).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(mem);
+    let fetcher = LogSegmentFetcher::new(store);
+    let pending = vec![erase("user_id", "u1")];
+    let query = LogQuery::new(0, 5000).with_erasure(pending.clone());
+    let mut scan = fetcher
+        .scan_accounted_with_tenant(
+            &seg_ref,
+            tenant,
+            &query,
+            &ColumnSelection::all(),
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("open scan")
+        .expect("in range");
+
+    let before = scan.remaining_blocks();
+    assert!(before > 0);
+    let other = vec![erase("user_id", "u2")];
+    for applies in [&[][..], &other[..]] {
+        let outcome = scan.next_row_block(applies).expect("row-block exit");
+        assert!(
+            matches!(outcome, RowBlockOutcome::ErasureUnapplied),
+            "an unapplied erasure must not yield a block, got {outcome:?}"
+        );
+    }
+    assert_eq!(scan.remaining_blocks(), before, "the cursor did not move");
+    assert_eq!(scan.stats().blocks_scanned, 0, "nothing decoded");
+
+    let mut rows = 0;
+    while let RowBlockOutcome::Block(block) = scan.next_row_block(&pending).expect("row-block exit")
+    {
+        rows += block.len();
+    }
+    assert_eq!(rows, records.len(), "the caller excludes the erased rows");
 }
 
 /// A corrupt block is a typed `LogFetchError::Corrupt` through the columnar

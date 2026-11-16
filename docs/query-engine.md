@@ -4307,8 +4307,13 @@ and block-level reported independently:
 - `rowpathBatches`: batches a logs scan built on the row path, straight from
   a decoded block's columns and its streams' resource and scope attributes
   with no per-row record (ADR-2773 decision D4): every batch of a statement
-  projecting `attrs` or under a pending erasure, and the batches of a block
-  carrying an `attrs_raw` overflow page.
+  projecting `attrs` or under a pending erasure, the batches of a block
+  carrying an `attrs_raw` overflow page, every batch of the rest of a
+  segment once `MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS` consecutive overflow
+  blocks commit it to the row path, and the batches of a block the columnar
+  exit refused for an unexpected pending erasure. Only batches handed
+  downstream count: a chunk whose rows were all erased, or that the scan's
+  row filters emptied, emits nothing and counts nothing.
 - `columnarBatches`: batches a logs scan built on the columnar fast path
   (ADR-0099 decision 2).
 
@@ -6757,9 +6762,11 @@ the flag.
   tag. A hit clones the entry's `Arc`s; no column data is copied.
 - Only the columnar path reads or fills it, and only from a whole-block
   decode: a hit removes the column from the decode's wanted set, and the
-  columns the decode did produce are offered afterwards. The row path
-  (`next_block`, used by `fetch_block` and `next_block_on_gate`, and by every
-  scan with a pending erasure) neither reads nor fills it. A column deferred
+  columns the decode did produce are offered afterwards. The row exits
+  neither read nor fill it: the record exit (`next_block`, used by
+  `fetch_block` and `next_block_on_gate`) and the row-block exit
+  (`next_row_block` and `next_row_block_on_gate`, which the logs SQL row
+  path and every scan with a pending erasure decode through). A column deferred
   for a `Contains` arm is never looked up or offered, unless the scan fits
   the cache (next item)
   (`decoded_cache_never_serves_the_contains_column_when_the_scan_does_not_fit`

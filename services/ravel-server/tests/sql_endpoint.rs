@@ -2586,6 +2586,8 @@ const PRUNING_KEYS: &[&str] = &[
     "rowsPredicateEvaluated",
     "containsCellsTested",
     "strCellsValidated",
+    "rowpathBatches",
+    "columnarBatches",
 ];
 
 /// ADR-2677 decision 4: the JSON response carries `stats.timings` and
@@ -2636,6 +2638,8 @@ async fn sql_response_carries_timings_and_pruning_stats() {
         "rowsPredicateEvaluated",
         "containsCellsTested",
         "strCellsValidated",
+        "rowpathBatches",
+        "columnarBatches",
     ] {
         assert_eq!(pruning[key], 0, "{key} with no logs scan: {value}");
     }

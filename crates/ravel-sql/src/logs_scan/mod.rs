@@ -412,7 +412,7 @@ use ravel_query::key_index_route::{
 use ravel_query::{
     CarriedWholeObject, ColumnarBlockOutcome, KeyEquals, KeyIn, KeyIndexPruning, LogFetchError,
     LogLeafRangeReader, LogQuery, LogSegmentFetcher, LogSegmentScan, PhaseAccounting,
-    log_key_in_set, log_key_set,
+    RowBlockOutcome, log_key_in_set, log_key_set,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -1561,7 +1561,8 @@ struct BlockMetrics {
     /// ([`build_row_batch`], from the decoded block with no `LogRecord`): an
     /// ineligible query (an `attrs` projection, a pending erasure predicate)
     /// or an eligible one that hit a block carrying an `attrs_raw` overflow
-    /// page.
+    /// page, including the rest of a segment committed to rows after
+    /// `MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS`. Non-empty emitted batches only.
     rowpath_batches: Count,
     /// Relevant segments whose plan phase had to read the whole object rather
     /// than counting survivors from the skip index (#761). Two causes: a
@@ -3697,7 +3698,9 @@ impl ExecutionPlan for LogsScanExec {
 /// back. Each is released as its data goes away, so the reservation tracks
 /// live resident memory rather than cumulative output and a pool overrun
 /// surfaces as `ResourcesExhausted` at the moment the scan genuinely holds too
-/// much.
+/// much. On the row path `held` also covers the block's decoded stream
+/// attributes, and [`build_row_batch`] charges each chunk's decoded
+/// `attrs_raw` entries and merge scratch for the length of its build.
 ///
 /// The reservations live on the stream (not on the state) so they are the same
 /// ones for the partition's lifetime, and each frees exactly once on drop.
