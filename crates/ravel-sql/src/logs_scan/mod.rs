@@ -3128,23 +3128,45 @@ impl RowFetchSource {
 
     /// Decode one block of one segment and return the records at the named
     /// surviving-row positions, paired with the output position each belongs
-    /// at.
-    ///
-    /// `block` is a position in the segment's surviving-block list for this
-    /// query, exactly as [`LogsScanExec`]'s striped path uses, and `rows` are
-    /// positions in that block's surviving-row list. Both are what phase 1
-    /// recorded while draining the same block of the same immutable object
-    /// under the same query, so both resolve; an index that does not is a typed
-    /// error, never a wrong row.
+    /// at: [`fetch_blocks`](Self::fetch_blocks) for a single block.
+    #[cfg(test)]
     pub(crate) async fn fetch_block(
         &self,
         segment: usize,
         block: usize,
         rows: &[(usize, usize)],
     ) -> DFResult<Vec<(usize, LogRecord)>> {
+        self.fetch_blocks(segment, &[(block, rows.to_vec())]).await
+    }
+
+    /// Decode several blocks of one segment through one open of it (issue
+    /// #797) and return the records at the named surviving-row positions,
+    /// paired with the output position each belongs at.
+    ///
+    /// Each `blocks` entry is a block position in the segment's surviving-block
+    /// list for this query, exactly as [`LogsScanExec`]'s striped path uses,
+    /// with positions in that block's surviving-row list. Both are what phase 1
+    /// recorded while draining the same block of the same immutable object
+    /// under the same query, so both resolve; an index that does not is a typed
+    /// error, never a wrong row. The block positions must be strictly
+    /// ascending: the open drains them in the order given, and the fetcher
+    /// narrows an above-threshold object's ranged read to exactly those blocks
+    /// only for an ascending list.
+    pub(crate) async fn fetch_blocks(
+        &self,
+        segment: usize,
+        blocks: &[(usize, Vec<(usize, usize)>)],
+    ) -> DFResult<Vec<(usize, LogRecord)>> {
         let seg = self.segments.get(segment).ok_or_else(|| {
             DataFusionError::Internal(format!("row-ref segment ordinal {segment} out of range"))
         })?;
+        if !blocks.windows(2).all(|w| w[0].0 < w[1].0) {
+            return Err(DataFusionError::Internal(format!(
+                "row-ref blocks of segment {} are not strictly ascending",
+                seg.data_object_key
+            )));
+        }
+        let positions: Vec<usize> = blocks.iter().map(|&(block, _)| block).collect();
         let query = self.query();
         let opened = self
             .fetcher
@@ -3153,7 +3175,7 @@ impl RowFetchSource {
                 self.tenant_hash,
                 &query,
                 &self.columns,
-                &[block],
+                &positions,
                 None,
                 None,
                 &self.accounting,
@@ -3170,28 +3192,31 @@ impl RowFetchSource {
                 seg.data_object_key
             )));
         };
-        // On the fetcher's read gate when it carries one, like the scan's own
-        // row path.
-        let records = scan
-            .next_block_on_gate()
-            .await
-            .map_err(SqlError::from)?
-            .ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "row-ref block {block} not in segment {}'s surviving list",
-                    seg.data_object_key
-                ))
-            })?;
-        let mut out = Vec::with_capacity(rows.len());
-        for &(row, position) in rows {
-            let record = records.get(row).ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "row-ref row {row} past block {block}'s {} surviving rows in segment {}",
-                    records.len(),
-                    seg.data_object_key
-                ))
-            })?;
-            out.push((position, record.clone()));
+        let mut out = Vec::with_capacity(blocks.iter().map(|(_, rows)| rows.len()).sum());
+        for (block, rows) in blocks {
+            // On the fetcher's read gate when it carries one, like the scan's
+            // own row path.
+            let records = scan
+                .next_block_on_gate()
+                .await
+                .map_err(SqlError::from)?
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "row-ref block {block} not in segment {}'s surviving list",
+                        seg.data_object_key
+                    ))
+                })?;
+            self.budget.check()?;
+            for &(row, position) in rows {
+                let record = records.get(row).ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "row-ref row {row} past block {block}'s {} surviving rows in segment {}",
+                        records.len(),
+                        seg.data_object_key
+                    ))
+                })?;
+                out.push((position, record.clone()));
+            }
         }
         Ok(out)
     }
