@@ -86,7 +86,7 @@ sequenceDiagram
     participant API as apiserver
     participant HPA as HPA controller
     Note over Op,API: autoscaling set, live Deployment<br/>replicas owned by ravel-operator
-    Ho->>API: apply {spec.replicas: clamp(live, min, max)}<br/>no force, shared ownership
+    Ho->>API: apply {spec.replicas: live count}<br/>no force, shared ownership
     Op->>API: apply Deployment without spec.replicas<br/>ravel-operator releases the field
     Op->>API: apply HPA (Managed only)
     HPA->>API: update scale subresource<br/>replicas now HPA-owned
@@ -95,28 +95,57 @@ sequenceDiagram
 
 On each pass for a tier with `autoscaling` set:
 
-1. Read the live Deployment. If it does not exist, or its `managedFields`
-   show `ravel-operator` owning `f:spec.f:replicas`, apply a patch holding
-   only `spec.replicas` under field manager `ravel-operator-handover`,
-   without force. The value is the live replica count (or `minReplicas` for
-   a Deployment that does not exist yet) clamped to
-   `[minReplicas, maxReplicas]`. Same value as the operator's own, so the
-   two managers share the field with no conflict.
+0. If the Deployment does not exist, apply it as today with
+   `spec.replicas` set to `minReplicas`, and stop for this tier. Creating it
+   is an owned-object change, so the next pass follows at once and takes
+   the steps below. (A handover patch cannot create the Deployment: it
+   holds no selector or template.)
+1. Read the live Deployment's `managedFields`. If they show
+   `ravel-operator` owning `f:spec.f:replicas`, apply a patch holding only
+   `spec.replicas` under field manager `ravel-operator-handover`, without
+   force, at the live replica count. That is the operator's own value, so
+   the two managers share the field with no conflict. The value is not
+   clamped to `[minReplicas, maxReplicas]`: a different value would be a
+   conflict without force, and the HPA brings a count outside its bounds
+   inside them on its first sync.
 2. Apply the Deployment without `spec.replicas`. `ravel-operator` releases
    the field; `ravel-operator-handover` still owns it, so it is kept.
 3. In `Managed` mode, apply the HPA.
+4. Record the tier in status as autoscaled (`autoscaledTiers`), which the
+   turn-off path below reads.
 
 Step 1 runs only while `ravel-operator` still owns the field, so once the
 handover lands it never runs again and never fights the scaler. Repeating
 it after an interrupted pass is safe: it is a no-op when the field is
 already shared at that value.
 
-Turning autoscaling off: the operator deletes the HPA it rendered (sweep by
-label, as for every other owned object) and applies `spec.<tier>.replicas`
-with force, taking the field back. The value is the declared one, not the
-live one, because the spec is the source of truth. The guide tells the user
-to set `replicas` to the count they want in the same edit; a stale
-`replicas: 1` on a tier that ran at twelve scales it to one.
+Turning autoscaling off keeps the live replica count. Owner decision
+(2026-11-16): a tier the scaler grew to twelve must not drop to a stale
+declared `replicas: 1` the moment the block is removed. On the first pass
+for a tier that is listed in `autoscaledTiers` and no longer has
+`autoscaling` set (or is now withheld):
+
+1. Write to status, before anything else, an adoption record for the tier:
+   the live replica count and the `spec.<tier>.replicas` declared at that
+   moment. If that write fails, the pass fails for the tier and nothing
+   else is applied.
+2. Delete the HPA it rendered (sweep by label, as for every other owned
+   object), apply the Deployment with `spec.replicas` at the adopted count,
+   with force, taking the field back, and remove the tier from
+   `autoscaledTiers`.
+
+On later passes, while `spec.<tier>.replicas` still equals the declared
+value in the record, the operator keeps applying the adopted count. When
+the user changes `spec.<tier>.replicas`, the new value applies and the
+record is cleared. A GitOps tool that keeps re-applying the old value does
+not change it, so it does not undo the adoption.
+
+The status record is what carries the adopted count across passes. Writing
+it before the apply is what keeps an interrupted pass safe: after a failed
+status write the operator has not yet taken the field, so the HPA's last
+count stands and the next pass starts again from step 1. A tier that was
+never autoscaled has no record and no `autoscaledTiers` entry, so a manual
+`kubectl scale` on it is still reverted to the declared count, as today.
 
 ### 3. Refusals
 
@@ -211,8 +240,12 @@ before any scaler should remove its pods; that is a separate issue.
   extra flush and some small L0 objects per moved `(tenant, signal, shard)`
   (docs/guides/ingest-affinity.md). Each query scale step moves rendezvous
   placement and costs cache misses on the moved shards.
-- Turning autoscaling off applies the declared `replicas`, which can be a
-  large step down if the user does not update it.
+- Turning autoscaling off keeps the tier at the count the scaler left it
+  at, until the user changes `spec.<tier>.replicas`. A user who expects the
+  declared value to apply at once has to change it in the same edit; the
+  guide says so. The adopted count lives in the RavelCluster's status, so
+  deleting and recreating the RavelCluster loses it, as it loses every
+  other status field.
 - The handover's correctness rests on apiserver field-manager semantics
   that the operator's fake-apiserver tests do not emulate. Those tests prove
   the request sequence; the kind lane (`k8s-integration`, `k8s-nightly`)
