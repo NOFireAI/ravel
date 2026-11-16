@@ -2047,9 +2047,10 @@ pub async fn publish_rewrite_record(
     // not exist. `put_part` is idempotent (`AlreadyExists` is success), so
     // re-running this on a retry is safe.
     for part in &build.parts {
-        crate::build::put_part(store, part).await?;
+        crate::build::put_part(store, part, config.compat_run.as_ref()).await?;
     }
 
+    crate::compat_policy::before_put(config.compat_run.as_ref(), store).await?;
     match store.put(&record_key, payload.into(), opts).await {
         Ok(_) => {
             tracing::info!(
@@ -2061,7 +2062,14 @@ pub async fn publish_rewrite_record(
             Ok(PublishOutcome::Published)
         }
         Err(StoreError::AlreadyExists) => {
-            resolve_already_exists_rewrite(store, &record_key, &input_set_hash, &build.parts).await
+            resolve_already_exists_rewrite(
+                store,
+                &record_key,
+                &input_set_hash,
+                &build.parts,
+                config.compat_run.as_ref(),
+            )
+            .await
         }
         Err(e) => Err(MaintainError::Store(e)),
     }
@@ -2080,6 +2088,7 @@ async fn resolve_already_exists_rewrite(
     record_key: &str,
     our_hash: &[u8; 32],
     our_parts: &[BuiltPart],
+    compat: Option<&crate::compat_policy::CompatRun>,
 ) -> Result<PublishOutcome> {
     let winner = get_rewrite_record(store, record_key).await?;
 
@@ -2098,7 +2107,7 @@ async fn resolve_already_exists_rewrite(
             Ok(_) => {}
             Err(StoreError::NotFound) => {
                 if let Some(ours) = our_parts.iter().find(|p| p.key == part_key) {
-                    crate::build::put_part(store, ours).await?;
+                    crate::build::put_part(store, ours, compat).await?;
                     repaired += 1;
                 } else {
                     tracing::warn!(

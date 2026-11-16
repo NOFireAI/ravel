@@ -154,19 +154,15 @@ use crate::read_gate::MaintainReadGate;
 use crate::request_ledger::{RequestLedger, RequestPhase, note_get};
 use ravel_cpu_gate::ReadSite;
 
-/// The RSPAN output trailer version every L1 part carries. Recorded in each
-/// part's `CompactionPart.segment_format_version`, the span analogue of RSEG's
-/// [`crate::build::OUTPUT_FORMAT_VERSION`] and RLOG's
-/// [`crate::rlog::OUTPUT_FORMAT_VERSION`].
-///
-/// Read from `ravel_rspan`'s single-sourced supported-version window
-/// (`SUPPORTED_VERSIONS.newest()`, ADR-0066 decision 1, slice A), the same
-/// single source the reader gate and the CLI `audit-versions`/`migrate` paths
-/// use. As a mirrored literal it went stale on the RSPAN v2 bump:
-/// `finish_compacted` stamps the trailer from the writer while the literal
-/// recorded 1, so the compactor wrote v2 parts that claimed to be v1; routing
-/// through the window keeps the recorded number and the emitted trailer in step.
-pub const OUTPUT_FORMAT_VERSION: u32 = ravel_rspan::footer::SUPPORTED_VERSIONS.newest() as u32;
+/// The RSPAN trailer version an L1 part is written at when no `sys/compat`
+/// policy is installed: the writer's default, `WriteVersion::CURRENT`, the
+/// span analogue of RSEG's [`crate::build::OUTPUT_FORMAT_VERSION`] and RLOG's
+/// [`crate::rlog::OUTPUT_FORMAT_VERSION`]. Recorded in each part's
+/// `CompactionPart.segment_format_version`. Under a policy the run takes the
+/// family's active version once at its start instead (ADR-4233 decision 3),
+/// so this is not "the version this build writes" in general.
+pub const OUTPUT_FORMAT_VERSION: u32 =
+    ravel_rspan::footer::WriteVersion::CURRENT.number() as u32;
 
 /// One RSPAN input's retained catalog metadata: the data-object key, its
 /// decoded footer, and an [`RspanRangeReader`] over its SKIP_IDX. Block bytes
@@ -771,17 +767,21 @@ impl PartBuilder {
         dry_run: bool,
         ledger: Option<&RequestLedger>,
     ) -> Result<BuiltPart> {
+        let writer = self
+            .writer
+            .with_write_version(crate::compat_policy::rspan_write_version(config)?);
         finalize_part(
             store,
             bucket,
             &config.read_gate,
             self.estimate,
-            self.writer,
+            writer,
             input_set_hash,
             part_index,
             self.trace_count,
             dry_run,
             ledger,
+            config.compat_run.as_ref(),
         )
         .await
     }
@@ -967,6 +967,7 @@ pub(crate) async fn finalize_part(
     trace_count: u64,
     dry_run: bool,
     ledger: Option<&RequestLedger>,
+    compat: Option<&crate::compat_policy::CompatRun>,
 ) -> Result<BuiltPart> {
     let input_set_hash_vec = input_set_hash.to_vec();
     // Authoritative summary (bounds, counts) from the object we just wrote. The
@@ -1011,7 +1012,9 @@ pub(crate) async fn finalize_part(
         run_count: 0,
         min_event_ts_ns: ftr.min_start_ts_ns,
         max_event_ts_ns: ftr.max_end_ts_ns,
-        segment_format_version: OUTPUT_FORMAT_VERSION,
+        segment_format_version: compat
+            .and_then(|run| run.version(ravel_catalog::compat::FAMILY_RSPAN))
+            .map_or(OUTPUT_FORMAT_VERSION, u32::from),
         declared_column_stats: Vec::new(),
     };
     // Spans never carry declared typed columns -- they are a logs concept
@@ -1030,7 +1033,7 @@ pub(crate) async fn finalize_part(
         put_already_existed: false,
     };
     if !dry_run {
-        put_part_with_ledger(store, &built, ledger).await?;
+        put_part_with_ledger(store, &built, ledger, compat).await?;
     }
     Ok(built)
 }

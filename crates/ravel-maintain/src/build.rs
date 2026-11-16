@@ -90,6 +90,7 @@ use ravel_types::{LabelSet, Sample, SeriesId};
 use tokio::sync::Semaphore;
 
 use crate::bucket::Bucket;
+use crate::compat_policy::CompatRun;
 use crate::config::{CompactorConfig, MergeCharges};
 use crate::error::{MaintainError, Result};
 use crate::read::{InputCatalog, InputRecord, RunPlan, SeriesPlan};
@@ -110,14 +111,14 @@ const FETCH_CONCURRENCY: usize = 16;
 /// modest.
 const COALESCE_GAP: u64 = 64 * 1024;
 
-/// The current RSEG output version: the newest version RSEG's single-sourced
-/// supported-version window writes (ADR-0066 decision 1, slice A). Recorded in
-/// each part's `CompactionPart.segment_format_version`. Read from
-/// `ravel_segment::SUPPORTED_VERSIONS.newest()` rather than a mirrored literal
-/// so a future format bump moves the writer, the reader gate, `audit-versions`,
-/// and this compactor constant together (the sixteen-hand-edited-sites hazard
-/// ADR-0049 measured). Today the window is `single(VERSION_V7)`, so this is 7.
-pub const OUTPUT_FORMAT_VERSION: u32 = ravel_segment::SUPPORTED_VERSIONS.newest() as u32;
+/// The RSEG version a compaction part is written at when no `sys/compat`
+/// policy is installed: the build's default write version
+/// (`SegmentVersion::CURRENT`), stamped into each part's
+/// `CompactionPart.segment_format_version`. Under a policy the run takes the
+/// family's active version once at its start instead (ADR-4233 decision 3),
+/// so this is not "the version this build writes" in general. Today the
+/// window is `single(VERSION_V7)`, so this is 7.
+pub const OUTPUT_FORMAT_VERSION: u32 = ravel_segment::SegmentVersion::CURRENT.number() as u32;
 
 /// One built (not yet published) L1 part: its content-addressed key, its
 /// bytes, and the [`CompactionPart`] describing it for the record.
@@ -414,7 +415,8 @@ pub async fn build_parts(
                 )
                 .await?;
                 note_encoded_part(&mut charges, &part);
-                put_and_release_part(store, &mut part, config.dry_run, ledger).await?;
+                put_and_release_part(store, &mut part, config.dry_run, ledger, config.compat_run.as_ref())
+                    .await?;
                 charges.set_writer(0);
                 // Cancellation checkpoint 4: a part boundary, after the PUT
                 // returned.
@@ -450,7 +452,8 @@ pub async fn build_parts(
         )
         .await?;
         note_encoded_part(&mut charges, &part);
-        put_and_release_part(store, &mut part, config.dry_run, ledger).await?;
+        put_and_release_part(store, &mut part, config.dry_run, ledger, config.compat_run.as_ref())
+                    .await?;
         charges.set_writer(0);
         // Cancellation checkpoint 4 for the tail part.
         crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::PartBoundary)
@@ -1259,10 +1262,13 @@ async fn flush_part(
     // only field the copy changes (ADR-0047 decision 3). An exemplar naming a
     // series this part does not carry is a writer error, not a silent drop, so
     // a mis-assignment above fails the run instead of shrinking the output.
+    let version = crate::compat_policy::rseg_write_version(config)?;
     let written = config
         .read_gate
         .run(ReadSite::Compaction, estimated_bytes, move || {
-            SegmentWriter::write_v7_with_provenance(batch, identity, ingest, meta, exemplars)
+            SegmentWriter::write_v7_with_provenance_at(
+                version, batch, identity, ingest, meta, exemplars,
+            )
         })
         .await??;
     let content_hash = written.summary.blake3;
@@ -1288,7 +1294,7 @@ async fn flush_part(
         run_count,
         min_event_ts_ns: written.summary.min_event_ts_ns,
         max_event_ts_ns: written.summary.max_event_ts_ns,
-        segment_format_version: OUTPUT_FORMAT_VERSION,
+        segment_format_version: u32::from(version.number()),
         declared_column_stats: Vec::new(),
     };
     // Metrics never carry declared typed columns -- they are a logs concept
@@ -1326,9 +1332,10 @@ async fn put_and_release_part(
     part: &mut BuiltPart,
     dry_run: bool,
     ledger: Option<&RequestLedger>,
+    compat: Option<&CompatRun>,
 ) -> Result<()> {
     if !dry_run {
-        match put_part_with_ledger(store, part, ledger).await? {
+        match put_part_with_ledger(store, part, ledger, compat).await? {
             PartPut::Created => {}
             PartPut::AlreadyExisted => part.put_already_existed = true,
         }
@@ -1346,8 +1353,16 @@ async fn put_and_release_part(
 /// The part's bytes must still be present: this is only ever called at PUT
 /// time, before any release, so a `None` here is an internal invariant breach
 /// rather than a store fault.
-pub async fn put_part(store: &dyn ObjectStoreBackend, part: &BuiltPart) -> Result<PartPut> {
-    put_part_with_ledger(store, part, None).await
+///
+/// Under a `sys/compat` run (`compat`), every attempt first re-checks the
+/// view's age and raises the bucket's fence if the run owes one
+/// ([`CompatRun`]); a refusal returns before the PUT.
+pub async fn put_part(
+    store: &dyn ObjectStoreBackend,
+    part: &BuiltPart,
+    compat: Option<&CompatRun>,
+) -> Result<PartPut> {
+    put_part_with_ledger(store, part, None, compat).await
 }
 
 /// [`put_part`], counting the PUT attempt into `ledger`'s
@@ -1359,6 +1374,7 @@ pub async fn put_part_with_ledger(
     store: &dyn ObjectStoreBackend,
     part: &BuiltPart,
     ledger: Option<&RequestLedger>,
+    compat: Option<&CompatRun>,
 ) -> Result<PartPut> {
     use ravel_object_store::{PutOptions, StoreError, UploadChecksum};
     let bytes = part.bytes.as_ref().ok_or_else(|| {
@@ -1367,6 +1383,7 @@ pub async fn put_part_with_ledger(
             part.key
         ))
     })?;
+    crate::compat_policy::before_put(compat, store).await?;
     let checksum = UploadChecksum::Crc32c(crc32c::crc32c(bytes));
     let result = store
         .put(

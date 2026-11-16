@@ -241,7 +241,9 @@ impl SegmentCodec for RsegCodec {
     ) -> Result<Vec<BuiltPart>> {
         use std::collections::HashSet;
 
-        use crate::build::OUTPUT_FORMAT_VERSION;
+        // The version this run writes: the compat run's, else the build's.
+        let output_version =
+            u32::from(crate::compat_policy::rseg_write_version(config)?.number());
 
         // The object keys of any input recorded below the current output version
         // (ADR-0066 decision 5). `catalogs` is aligned one-to-one with `inputs`
@@ -254,7 +256,7 @@ impl SegmentCodec for RsegCodec {
         let migrate_keys: HashSet<String> = inputs
             .iter()
             .zip(&catalogs)
-            .filter(|(input, _)| input.record.segment_format_version < OUTPUT_FORMAT_VERSION)
+            .filter(|(input, _)| input.record.segment_format_version < output_version)
             .map(|(_, catalog)| catalog.object_key.clone())
             .collect();
         crate::build::build_parts(

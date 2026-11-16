@@ -609,3 +609,64 @@ pub(crate) async fn begin_part_run(
         None => Ok(None),
     }
 }
+
+/// The version `config`'s run in flight writes for `family`; `None` when no
+/// run was started under a policy.
+pub(crate) fn run_version(config: &CompactorConfig, family: &str) -> Option<u16> {
+    config.compat_run.as_ref().and_then(|run| run.version(family))
+}
+
+/// The RSEG version a compaction part is written at: the run's, or the
+/// build's current one with no policy.
+pub(crate) fn rseg_write_version(config: &CompactorConfig) -> Result<ravel_segment::SegmentVersion> {
+    match run_version(config, FAMILY_RSEG) {
+        None => Ok(ravel_segment::SegmentVersion::CURRENT),
+        Some(v) => ravel_segment::SegmentVersion::from_number(v).ok_or_else(|| {
+            MaintainError::Invariant(format!("the compat run chose RSEG version {v}, outside the window"))
+        }),
+    }
+}
+
+/// The RLOG version a part is written at: the run's, or the build's current
+/// one with no policy.
+pub(crate) fn rlog_write_version(
+    config: &CompactorConfig,
+) -> Result<ravel_logseg::footer::WriteVersion> {
+    match run_version(config, FAMILY_RLOG) {
+        None => Ok(ravel_logseg::footer::WriteVersion::CURRENT),
+        Some(v) => ravel_logseg::footer::WriteVersion::new(v).map_err(|err| {
+            MaintainError::Invariant(format!("the compat run chose RLOG version {v}: {err}"))
+        }),
+    }
+}
+
+/// The RSPAN version a part is written at: the run's, or the build's current
+/// one with no policy.
+pub(crate) fn rspan_write_version(
+    config: &CompactorConfig,
+) -> Result<ravel_rspan::footer::WriteVersion> {
+    match run_version(config, FAMILY_RSPAN) {
+        None => Ok(ravel_rspan::footer::WriteVersion::CURRENT),
+        Some(v) => ravel_rspan::footer::WriteVersion::new(v).map_err(|err| {
+            MaintainError::Invariant(format!("the compat run chose RSPAN version {v}: {err}"))
+        }),
+    }
+}
+
+/// Hazard H6 (ADR-4233 decision 4): refuse to re-encode an input whose reader
+/// skipped section kinds this build does not know, since the re-encode would
+/// drop them. The caller holds the bucket.
+pub(crate) fn refuse_unknown_sections(
+    object_key: &str,
+    unknown_section_kinds: &[u32],
+    recorded_version: Option<u32>,
+) -> Result<()> {
+    if unknown_section_kinds.is_empty() {
+        return Ok(());
+    }
+    Err(MaintainError::UnknownSectionKinds {
+        object_key: object_key.to_string(),
+        kinds: unknown_section_kinds.to_vec(),
+        recorded_version,
+    })
+}

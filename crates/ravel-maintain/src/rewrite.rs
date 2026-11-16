@@ -1488,13 +1488,15 @@ async fn reencode_rseg_parts(
         let mut new_part = reencode_rseg_part(
             bucket,
             config,
+            key,
             &object,
             part,
             predecessor.level,
             input_set_hash,
         )?;
         if !config.dry_run
-            && put_part_with_ledger(store, &new_part, ledger).await? == PartPut::AlreadyExisted
+            && put_part_with_ledger(store, &new_part, ledger, config.compat_run.as_ref()).await?
+                == PartPut::AlreadyExisted
         {
             new_part.put_already_existed = true;
         }
@@ -1529,6 +1531,7 @@ fn object_range(object: &[u8], (offset, len): (u64, u64)) -> Result<&[u8]> {
 fn reencode_rseg_part(
     bucket: &Bucket,
     config: &CompactorConfig,
+    object_key: &str,
     object: &[u8],
     part: &CompactionPart,
     level: u32,
@@ -1536,6 +1539,11 @@ fn reencode_rseg_part(
 ) -> Result<BuiltPart> {
     let limits = ReaderLimits::default();
     let loc = open_from_full(object, limits)?;
+    crate::compat_policy::refuse_unknown_sections(
+        object_key,
+        &loc.unknown_section_kinds,
+        Some(u32::from(loc.version)),
+    )?;
     let footer = &loc.footer;
     let entries = decode_catalog_v5(footer, object, limits)?;
     let refs: Vec<&SeriesEntryV4> = entries.iter().collect();
@@ -1626,8 +1634,10 @@ fn reencode_rseg_part(
         part_index: part.part_index,
         level,
     };
-    let written =
-        SegmentWriter::write_v7_with_provenance(series, identity, ingest, meta, exemplars)?;
+    let version = crate::compat_policy::rseg_write_version(config)?;
+    let written = SegmentWriter::write_v7_with_provenance_at(
+        version, series, identity, ingest, meta, exemplars,
+    )?;
     let content_hash = written.summary.blake3;
     let key = keys::l1_part_key(
         &bucket.tenant_hash,
@@ -1649,7 +1659,7 @@ fn reencode_rseg_part(
         run_count,
         min_event_ts_ns: written.summary.min_event_ts_ns,
         max_event_ts_ns: written.summary.max_event_ts_ns,
-        segment_format_version: crate::build::OUTPUT_FORMAT_VERSION,
+        segment_format_version: u32::from(version.number()),
         declared_column_stats: Vec::new(),
     };
     // Metrics carry no declared columns; stamped the one way `build.rs` does.
