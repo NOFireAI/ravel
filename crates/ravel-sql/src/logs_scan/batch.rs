@@ -7330,8 +7330,8 @@ mod row_path_tests {
             .expect("attrs map");
         assert_eq!(
             attrs.value(0).len(),
-            1 + 1 + KEYS.len() - 1,
-            "resource shared and scope user, overridden in place, plus four record keys"
+            KEYS.len(),
+            "resource shared and scope user, each overwritten in place by the record, plus its four other keys"
         );
 
         let mut records_exit = scan(&reader);
