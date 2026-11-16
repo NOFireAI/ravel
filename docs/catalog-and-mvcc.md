@@ -1785,8 +1785,11 @@ they equal the leaves the one-call build over the final read set writes at
 that budget (test
 `the_leaves_are_the_same_carried_from_scratch_and_after_a_restart`, at
 budgets 1, 2, 3, 5, 6, 7, 15 and `u64::MAX`). They equal a one-pass build only
-when every field's pairs fit its share; the `--rebuild-key-index` repair
-builds in one pass, so its leaves match a fold's byte for byte only then.
+when every field's pairs fit its share. The `--rebuild-key-index` repair
+runs the same build in the same passes, so at the same budget its leaves
+match a fold's byte for byte, for a part whose sections name no field the
+tenant does not declare (the repair builds the declared fields alone, so
+an undeclared one would change the fold's share).
 Lookups stay correct wherever the slices fall: the router reads the leaf
 whose `[key8_lo, key8_hi]` holds the key8, and ADR-2707's slice rule needs
 only that the slices tile the key space. Their cost does depend on it. A
@@ -1900,9 +1903,33 @@ of 20, two of six objects held, 18 pairs at the peak, the other four read
 by range in each pass, 0 held after the build) pin it.
 The server sets the budget with `--fold-key-index-build-max-pairs` and
 `ravel-cli catalog fold` with `--key-index-build-max-pairs`, each refused
-without the leaf build flag and at 0; the `--rebuild-key-index` repair
-builds in one pass with no budget, since a part it visits has no previous
-leaf to carry and its reads are held per batch.
+without the leaf build flag and at 0.
+
+The `--rebuild-key-index` repair (`Catalog::rebuild_key_index`, under
+"Rollout") builds each part it visits with the same build under the same
+budget, `key_index_build_max_pairs` from its catalog config, which
+`ravel-cli catalog fold --rebuild-key-index` leaves at the default
+8,000,000. A part it visits has no previous leaf to carry and holds no
+LABEL_DICT pairs from a postings build, so the per-field bound above is
+the whole of what it holds in pairs: at most `max(share, R) + 1` per field,
+at most `budget + F` for the part when no key8 run exceeds a share, read
+again from the sections on every pass, and released before the next part.
+Test `the_repair_holds_at_most_the_pair_budget_and_matches_the_fold_at_that_budget`
+pins it: 40 pairs of one field under a budget of 8 build in 5 passes, each
+holding 8 pairs, a peak of 9 with the pair placed before a cut, every
+section read in each pass (40 ranged GETs for 4 entries), and leaves byte
+for byte a fold's at the same budget. A repair that built in one pass with
+no budget, holding every section read of its batch whole, would hold about
+6.8 GB of pairs for a logs day (ADR-3939, "Decision 2, clarified").
+At the default budget the same day part, two fields at a share of
+4,000,000, holds at most 8,000,002 pairs when no key8 run exceeds a share,
+about 704 MB at the 88 B upper-bound estimate above, plus what the budget
+does not bound: the sections in flight, up to `fold_bucket_concurrency`,
+the encoded leaves of one pass until their PUTs, and per-entry
+bookkeeping. Its 100,000,000 `request_id` pairs take at least
+`ceil(100,000,000 / 4,000,000) = 25` passes (ADR-3939, "Two costs the
+decision did not count"), so the repair reads every section of the part
+25 times or more.
 
 The fold report carries four figures for this build, each also a
 `/metrics` counter in the `mode` label set the other fold counters use,
@@ -2074,12 +2101,14 @@ it leaves unchanged. For every part in HEAD that lacks a `key_index` ref
 for a declared field (every part, for spans), or for `--field` alone,
 which is refused unless the tenant declares it, it reads the part object
 once, reads each entry's footer suffix and KEY_IDX section (the ranged
-GETs of the fold's own leaf build: two per entry, and a third when the
+GETs of the fold's own leaf build: two per entry in every pass of the
+build under the pair budget, see "Pair budget", and a third when the
 footer is larger than the 8 KiB suffix), writes the leaves for the
-declared fields under the fold's key layout (for a declared field the
-leaf is byte-identical to the one a fold with `build_key_index_leaves`
-on writes for the same part; a field a KEY_IDX section names that the
-tenant does not declare gets none), and publishes a HEAD whose part refs are the current
+declared fields under the fold's key layout (at the same budget, for a
+declared field the leaf is byte-identical to the one a fold with
+`build_key_index_leaves` on writes for the same part, when the part's
+sections name no undeclared field; a field a KEY_IDX section names that
+the tenant does not declare gets none), and publishes a HEAD whose part refs are the current
 ones with `key_index` attached (`SnapshotHead.parts` carries the refs
 inline, so the publish is the HEAD CAS alone). A part that already holds
 a ref for every requested field costs no GET; one that holds refs for
@@ -2096,14 +2125,17 @@ before HEAD is read, with a typed error naming the tenant
 in batches bounded in entries: a batch is the longest run of the
 remaining unindexed parts whose entry total stays at or below
 `--batch-entries`, and at least one part, so an attempt costs at most
-`2 x max(batch_entries, largest part's entries)` ranged GETs while every
-footer fits the suffix (`3 x` otherwise). The default is 250,000, the
+`2 x P x max(batch_entries, largest part's entries)` ranged GETs while
+every footer fits the suffix (`3 x P x` otherwise), `P` the most passes
+any part of the batch takes: 1 when every field's pairs fit its share. The
+batch bounds requests, not memory: the parts of a batch are built one at a
+time, each under the pair budget. The default is 250,000, the
 fold's `DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`, which is a seal threshold
 rather than a cap (`partition_parts` splits only at hour boundaries, so
 one ingest hour larger than it yields one part above it), so the ceiling
-is `2 x batch_entries` only while no unindexed part exceeds the setting
-and `2 x` the largest part otherwise (`3 x` in either case once a footer
-is larger than the 8 KiB suffix); the report states the largest
+is `2 x P x batch_entries` only while no unindexed part exceeds the
+setting and `2 x P x` the largest part otherwise (`3 x P x` in either case
+once a footer is larger than the 8 KiB suffix); the report states the largest
 unindexed part's entries up front, computed from HEAD before the first
 part GET. Each batch is one HEAD CAS, bounded like the fold's at
 `MAX_HEAD_CAS_ATTEMPTS`; on a lost CAS the attempt re-reads HEAD, keeps
@@ -2120,16 +2152,20 @@ attempt is one batch's publish including its retries, at most
 A run that stops or exhausts the CAS retries on one batch has therefore
 published every earlier batch (the error says how many parts, and the
 CLI prints the report so far), loses at most the ranged GETs of that
-batch's entries, and leaves that batch's leaves unreferenced for this
+batch's entries in every pass, and leaves that batch's leaves unreferenced for this
 sweep; the rerun skips every part whose ref an earlier batch published. A
 one-part tenant is a single batch, and an interruption there loses the
 whole run. A part none of whose entries carries the field (or whose leaf
 encode is refused) gains no ref, so every rerun reads it again; a batch
 in which no part gains a ref issues no HEAD CAS. A part with an entry
-whose ranged GET failed with a store error is deferred: no leaf is built
-for it, it gains no ref this run, the report counts it under parts
-deferred (`parts_deferred`), a warning names the object and the part,
-and a rerun reads it again. A KEY_IDX section that is absent or does not
+whose ranged GET failed with a store error is deferred once the reads of
+that pass are done, before the pass's PUTs: it gains no ref this run, the
+leaves its earlier passes PUT are referenced by nothing and swept like any
+unreferenced leaf, the report counts it under parts deferred
+(`parts_deferred`), a warning names the object and the part, and a rerun
+reads it again. Likewise a metrics part whose `label_value` leaves pass
+the byte cap at a pass end gains no ref for the field
+(`parts_over_cap`), and the leaves its earlier passes PUT are swept. A KEY_IDX section that is absent or does not
 decode is not a failed GET; that entry reads as uncovered. A failed or
 mismatched part GET stops the run with the report so far, and the batch
 it was in publishes nothing. A rebuilt
@@ -2180,11 +2216,11 @@ acts on. A sweeper that predates field 8 names no leaf in its reference
 set, so it deletes live leaves past the horizon with the same outcome: the
 parts read as uncovered until a fold re-encodes them or the repair runs.
 The cost of a bad rollout is one rebuild run over the affected
-parts, `2 x entries` ranged GETs in total while every footer fits the
-suffix (a footer suffix and a section range per entry, at most
-`2 x max(batch_entries, largest part's entries)` per attempt, 500,000 at
-the default while no part exceeds the seal threshold) plus the sections'
-bytes, and that run scans until it has run; nothing is retained and
+parts, `2 x entries x P` ranged GETs in total while every footer fits
+the suffix (a footer suffix and a section range per entry in each of a
+part's `P` passes, at most `2 x P x max(batch_entries, largest part's
+entries)` per attempt, `P x 500,000` at the default while no part exceeds
+the seal threshold) plus the sections' bytes once per pass, and that run scans until it has run; nothing is retained and
 nothing is silent. Of the mixed-version combinations ADR-0849 section 1a
 requires tested (old folder then new sweeper, old sweeper against a new
 HEAD, new folder after an old folder, then the rebuild), the first is
