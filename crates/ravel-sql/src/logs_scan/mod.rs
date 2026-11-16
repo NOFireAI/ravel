@@ -1629,7 +1629,7 @@ struct BlockMetrics {
     fan_out_narrowings: Count,
     /// Wall time in the synchronous decode and Arrow build sites inside
     /// `poll_next`: `next_block_columnar` plus `build_columnar_batches` on the
-    /// columnar path, `next_block` on the row path. A decode on the read gate
+    /// columnar path, `next_row_block` on the row path. A decode on the read gate
     /// is timed from the job's submission to its return, so this includes the
     /// wait for a permit. Nothing nested is timed twice, and the
     /// buffered-output drain is under [`Self::emit_elapsed`].
