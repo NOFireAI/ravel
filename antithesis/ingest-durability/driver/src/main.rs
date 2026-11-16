@@ -928,8 +928,7 @@ fn main(tc: TestCase) {
         eventually_lock: Mutex::new(()),
         eventually_on: cfg.eventually_on,
         max_writes: cfg.max_writes,
-        inject_missing: std::env::var("WORKLOAD_INJECT_MISSING_RECORD")
-            .is_ok_and(|v| v == "1"),
+        inject_missing: std::env::var("WORKLOAD_INJECT_MISSING_RECORD").is_ok_and(|v| v == "1"),
     });
 
     for node in 0..shared.ravel.nodes.len() {
