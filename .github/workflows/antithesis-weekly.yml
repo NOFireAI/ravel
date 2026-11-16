@@ -1,0 +1,112 @@
+name: antithesis-weekly
+
+# Weekly Antithesis run of the ingest-durability workload
+# (antithesis/ingest-durability, antithesis/README.md). It builds the
+# instrumented ravel-server and driver images on this runner, then
+# scripts/launch.sh validates the config and launches the run with snouty,
+# which pushes the images to the tenant's registry itself. Antithesis posts the
+# result to this commit as the `continuous-testing/antithesis
+# (ravel-ingest-durability)` status and emails the triage report.
+#
+# snouty in place of antithesis-trigger-action: the action takes no compute
+# budget and does not push images, while `snouty launch --max-compute-hours`
+# caps the run's spend exactly and pushes what the compose file names.
+#
+# Needs, set once in the repository settings:
+#   secrets.ANTITHESIS_API_KEY       Antithesis API key for the tenant.
+#   secrets.ANTITHESIS_GITHUB_TOKEN  fine-grained PAT on this repository with
+#                                    commit statuses read/write. Antithesis
+#                                    posts the result after this job has ended,
+#                                    when GITHUB_TOKEN has already expired.
+#   vars.ANTITHESIS_TENANT           taffy-sheep
+#   vars.ANTITHESIS_REPOSITORY       registry.taffy-sheep.antithesis.com
+on:
+  schedule:
+    # Tuesday 03:00 UTC.
+    - cron: '0 3 * * 2'
+  workflow_dispatch:
+    inputs:
+      compute_hours:
+        description: 'Compute hours for the run (at most 240)'
+        required: false
+        default: '240'
+
+# Floor for every job (scripts/guards/check-workflow-permissions.sh). The job
+# only reads the repository; the commit status is written by Antithesis with
+# its own token.
+permissions:
+  contents: read
+
+# One weekly run at a time: a manual dispatch while the scheduled one is still
+# building waits instead of launching a second run.
+concurrency:
+  group: antithesis-weekly
+  cancel-in-progress: false
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    # The instrumented ravel-server build dominates; the launch returns as soon
+    # as the run is accepted, so the run's own hours are not spent here.
+    timeout-minutes: 180
+    env:
+      MAX_COMPUTE_HOURS: '240'
+      SNOUTY_VERSION: v0.10.0
+      WORKLOAD: antithesis/ingest-durability
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/free-disk-space
+
+      - name: Resolve compute hours
+        id: hours
+        env:
+          REQUESTED: ${{ inputs.compute_hours || '240' }}
+        run: |
+          case "$REQUESTED" in
+            ''|*[!0-9]*) echo "compute_hours must be a whole number, got '$REQUESTED'" >&2; exit 1 ;;
+          esac
+          if [ "$REQUESTED" -lt 12 ] || [ "$REQUESTED" -gt "$MAX_COMPUTE_HOURS" ]; then
+            echo "compute_hours must be between 12 and $MAX_COMPUTE_HOURS, got $REQUESTED" >&2
+            exit 1
+          fi
+          echo "value=$REQUESTED" >> "$GITHUB_OUTPUT"
+
+      - name: Check the workload is present
+        run: |
+          for f in "$WORKLOAD/scripts/build.sh" "$WORKLOAD/scripts/launch.sh" "$WORKLOAD/config/docker-compose.yaml"; do
+            [ -f "$f" ] || { echo "missing $f: the ingest-durability workload has not landed on this ref" >&2; exit 1; }
+          done
+
+      - name: Install snouty
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/antithesishq/snouty/releases/download/${SNOUTY_VERSION}/snouty-installer.sh" \
+            -o snouty-installer.sh
+          sh snouty-installer.sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build the instrumented images
+        run: '"$WORKLOAD/scripts/build.sh" all'
+
+      - name: Pull the store image
+        run: |
+          set -euo pipefail
+          grep -E '^\s+image:' "$WORKLOAD/config/docker-compose.yaml" | awk '{print $2}' | sort -u > images.txt
+          while read -r image; do
+            if ! docker image inspect "$image" > /dev/null 2>&1; then
+              docker pull "$image"
+            fi
+          done < images.txt
+
+      - name: Launch
+        env:
+          ANTITHESIS_API_KEY: ${{ secrets.ANTITHESIS_API_KEY }}
+          ANTITHESIS_GITHUB_TOKEN: ${{ secrets.ANTITHESIS_GITHUB_TOKEN }}
+          ANTITHESIS_TENANT: ${{ vars.ANTITHESIS_TENANT }}
+          ANTITHESIS_REPOSITORY: ${{ vars.ANTITHESIS_REPOSITORY }}
+          HOURS: ${{ steps.hours.outputs.value }}
+        run: |
+          "$WORKLOAD/scripts/launch.sh" "$HOURS" "weekly ingest durability, ${GITHUB_SHA::12}"
