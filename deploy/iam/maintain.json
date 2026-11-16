@@ -19,7 +19,7 @@
       "Resource": "arn:aws:s3:::my-ravel-bucket",
       "Condition": {
         "StringEquals": {
-          "s3:prefix": ["sys/tenancy", "sys/qualification", "sys/gc"]
+          "s3:prefix": ["sys/tenancy", "sys/qualification", "sys/gc", "sys/compat"]
         }
       }
     },
@@ -52,6 +52,7 @@
         "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
         "arn:aws:s3:::my-ravel-bucket/sys/qualification",
         "arn:aws:s3:::my-ravel-bucket/sys/gc",
+        "arn:aws:s3:::my-ravel-bucket/sys/compat",
         "arn:aws:s3:::my-ravel-bucket/sys/maintain/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/config",
         "arn:aws:s3:::my-ravel-bucket/t/*/enc",

@@ -244,12 +244,19 @@ fn fleet_witness_keys() -> Vec<String> {
 /// `MEMO_PREFIX` in `crates/ravel-maintain/src/memo_snapshot.rs`.
 const MEMO_PREFIX: &str = "sys/maintain/memo/";
 
+/// The store-wide format activation record every server role reads at
+/// startup and every 60 s on a keyed bucket: `COMPAT_KEY` in
+/// `crates/ravel-catalog/src/compat.rs` (ADR-4233 decision 3).
+const COMPAT_KEY: &str = "sys/compat";
+
 /// The control-plane keys whose constructors live in crates this test cannot
 /// depend on without a cycle through `ravel-commit`, written in the shape each
 /// constructor produces:
 ///
 /// - `sys/auth`, the durable bearer-token map (`AUTH_KEY` in
 ///   `crates/ravel-catalog/src/auth_token_map.rs`);
+/// - `sys/compat`, the store-wide format activation record (`COMPAT_KEY` in
+///   `crates/ravel-catalog/src/compat.rs`, ADR-4233);
 /// - `sys/maintain/memo/<process_id>`, one maintain process's memo snapshot
 ///   (`memo_key` in `crates/ravel-maintain/src/memo_snapshot.rs`);
 /// - `sys/t/<tenant_hash>`, one tenant's recovery manifest
@@ -272,6 +279,7 @@ fn control_plane_witness_keys() -> Vec<String> {
     let hex = test_tenant().to_hex();
     vec![
         "sys/auth".to_string(),
+        COMPAT_KEY.to_string(),
         format!("{MEMO_PREFIX}{}", Uuid::from_u128(WITNESS_PROCESS_ID)),
         format!("sys/t/{hex}"),
         key_epoch_key(),
@@ -2315,6 +2323,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/tenancy",
             "sys/qualification",
             "sys/gc",
+            "sys/compat",
             "sys/auth",
             IPCRYPT_MARKER_KEY,
             BOOTSTRAP_CONFIG_PATTERN,
@@ -2337,6 +2346,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/tenancy",
             "sys/qualification",
             "sys/gc",
+            "sys/compat",
             "sys/auth",
             IPCRYPT_MARKER_KEY,
             "t/*/config",
@@ -2424,6 +2434,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/tenancy",
             "sys/qualification",
             "sys/gc",
+            "sys/compat",
             "sys/auth",
             BOOTSTRAP_CONFIG_PATTERN,
             BOOTSTRAP_ENC_PATTERN,
@@ -2448,6 +2459,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/tenancy",
             "sys/qualification",
             "sys/gc",
+            "sys/compat",
             "sys/auth",
             "sys/query/workers/*",
             "t/*/config",
@@ -2619,6 +2631,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/tenancy",
             "sys/qualification",
             "sys/gc",
+            "sys/compat",
             BOOTSTRAP_CONFIG_PATTERN,
             BOOTSTRAP_ENC_PATTERN,
             PROV_M_PATTERN,
@@ -2646,6 +2659,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/tenancy",
             "sys/qualification",
             "sys/gc",
+            "sys/compat",
             "sys/maintain/*",
             "t/*/config",
             "t/*/enc",
@@ -4785,6 +4799,32 @@ fn tenant_resolving_roles_read_the_auth_map() {
              durable bearer tokens are refused. Grants: {gets:?}"
         );
         assert_reaches_nothing_outside(role, "s3:GetObject Allow", &gets, AUTH_KEY, AUTH_KEY);
+    }
+}
+
+/// `CompatView::refresh` (`crates/ravel-catalog/src/compat.rs`) GETs
+/// `sys/compat` at startup and every 60 s in every mode on a keyed bucket
+/// (`build_compat_view` in `services/ravel-server/src/compat.rs`), so all three
+/// server roles need the GET and a bootstrap list grant on exactly that key: on
+/// AWS S3 an absent record would otherwise read as `AccessDenied`, not
+/// `NotFound`.
+#[test]
+fn every_server_role_reads_the_compat_record() {
+    for role in ["gateway", "query", "maintain"] {
+        let policy = load_policy(role);
+        let gets = key_patterns_for(&policy, &["s3:GetObject"], Some("Allow"));
+        assert!(
+            gets.iter().any(|p| glob_matches(p, COMPAT_KEY)),
+            "{role}: no GetObject Allow reaches {COMPAT_KEY:?}, which the compat \
+             view reads in every mode. Grants: {gets:?}"
+        );
+        assert_reaches_nothing_outside(role, "s3:GetObject Allow", &gets, COMPAT_KEY, COMPAT_KEY);
+        let lists = list_prefix_patterns(&policy, Some("Allow"));
+        assert!(
+            lists.iter().any(|p| glob_matches(p, COMPAT_KEY)),
+            "{role}: no ListBucket s3:prefix admits {COMPAT_KEY:?}, so an absent \
+             record reads as AccessDenied. s3:prefix values: {lists:?}"
+        );
     }
 }
 
@@ -11661,6 +11701,7 @@ const EXPECTED_BOOTSTRAP_GRANTS: [ExpectedBootstrapGrants; 3] = [
             "sys/tenancy",
             "sys/qualification",
             "sys/gc",
+            "sys/compat",
             "sys/auth",
             IPCRYPT_MARKER_KEY,
         ],
@@ -11679,7 +11720,13 @@ const EXPECTED_BOOTSTRAP_GRANTS: [ExpectedBootstrapGrants; 3] = [
     ExpectedBootstrapGrants {
         role: "query",
         fixed_sid: "QueryListBootstrapKeys",
-        fixed_keys: &["sys/tenancy", "sys/qualification", "sys/gc", "sys/auth"],
+        fixed_keys: &[
+            "sys/tenancy",
+            "sys/qualification",
+            "sys/gc",
+            "sys/compat",
+            "sys/auth",
+        ],
         tenant_sid: "QueryListTenantBootstrapKeys",
         tenant_patterns: &[
             BOOTSTRAP_CONFIG_PATTERN,
@@ -11698,7 +11745,7 @@ const EXPECTED_BOOTSTRAP_GRANTS: [ExpectedBootstrapGrants; 3] = [
     ExpectedBootstrapGrants {
         role: "maintain",
         fixed_sid: "MaintainListBootstrapKeys",
-        fixed_keys: &["sys/tenancy", "sys/qualification", "sys/gc"],
+        fixed_keys: &["sys/tenancy", "sys/qualification", "sys/gc", "sys/compat"],
         tenant_sid: "MaintainListTenantBootstrapKeys",
         tenant_patterns: &[
             BOOTSTRAP_CONFIG_PATTERN,
@@ -11775,6 +11822,14 @@ fn bootstrap_reads() -> Vec<BootstrapRead> {
             "sys/gc".to_string(),
             "read_gc_config in bootstrap_gc_config (crates/ravel-maintain/src/gc_config.rs), \
              startup",
+            fixed_sid,
+        );
+        add(
+            role,
+            COMPAT_KEY.to_string(),
+            "read_compat in CompatView::refresh (crates/ravel-catalog/src/compat.rs) via \
+             compat::refresh_once (services/ravel-server/src/compat.rs), startup and every \
+             60 s on a keyed bucket",
             fixed_sid,
         );
         add(
@@ -11969,6 +12024,7 @@ fn bootstrap_negative_witnesses() -> Vec<String> {
         "sys/tenancy/x",
         "sys/qualification/x",
         "sys/auth/x",
+        "sys/compat/x",
     ]
     .iter()
     .map(|k| (*k).to_string())

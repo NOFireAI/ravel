@@ -562,6 +562,54 @@ mod tests {
         assert!(out.is_none(), "a re-confirming tick writes nothing");
     }
 
+    /// `write_alert_record_at` emits the version it is given in the RLOG
+    /// trailer, for every version in this build's window. Without the
+    /// `ravel-logseg/format-drill` feature the window is one version wide;
+    /// with it, the drill version is a second, distinct case.
+    #[test]
+    fn write_alert_record_at_emits_the_given_version_in_the_trailer() {
+        let rule = Rule {
+            rule_id: "r".into(),
+            query: RuleQuery::Sql("select 1".into()),
+            condition: RuleCondition::NonEmptyResult,
+            labels: vec![],
+            annotations: vec![],
+            for_duration: None,
+            max_alert_generation: None,
+            repeat_interval: None,
+        };
+        let fire = StateTransition {
+            next_state: AlertState::Firing,
+            write_record: true,
+        };
+        let window = ravel_logseg::footer::SUPPORTED_VERSIONS;
+        for number in window.oldest()..=window.newest() {
+            let version = WriteVersion::new(number).expect("a window version");
+            let bytes = write_alert_record_at(
+                &rule,
+                &AlertInstance::new(&rule.rule_id, rule.labels.clone()),
+                &fire,
+                None,
+                &[],
+                0,
+                RlogConfig::default(),
+                identity(),
+                version,
+            )
+            .expect("write")
+            .expect("a firing transition writes a record");
+            let at = bytes.len() - ravel_logseg::footer::TRAILER_LEN + 8;
+            assert_eq!(
+                u16::from_le_bytes([bytes[at], bytes[at + 1]]),
+                number,
+                "trailer version"
+            );
+            let reader = RlogReader::new(&bytes, &RlogConfig::default()).expect("open");
+            let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+            assert_eq!(rows.len(), 1);
+        }
+    }
+
     #[test]
     fn write_alert_record_rejects_over_generation() {
         let rule = Rule {

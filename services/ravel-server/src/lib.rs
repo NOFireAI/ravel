@@ -1545,8 +1545,9 @@ async fn drain_router<R: DrainRouter>(router: Option<Arc<R>>, label: &str) -> bo
 }
 
 impl Running {
-    /// This process's `sys/compat` view (ADR-4233 decision 3), the handle every
-    /// writer's write policy comes from; `None` on an unkeyed bucket.
+    /// This process's `sys/compat` view (ADR-4233 decision 3), read by
+    /// first-touch provisioning, the catalog fold and the alert evaluator;
+    /// `None` on an unkeyed bucket.
     pub fn compat_view(&self) -> Option<&ravel_catalog::compat::CompatView> {
         self.compat_view.as_ref()
     }
@@ -2651,10 +2652,10 @@ pub async fn start_with_heartbeat_and_ipcrypt(
 
     // The one `sys/compat` view this process holds (ADR-4233 decision 3), in
     // every mode, read once here before any writer starts and then every
-    // `DEFAULT_COMPAT_REFRESH_INTERVAL` by one task. This is the handle every
-    // writer's write policy comes from: the fold (through the catalog), the
-    // alert evaluator, first-touch provisioning, and the ingest and
-    // maintenance configs built below. `None` on an unkeyed bucket.
+    // `DEFAULT_COMPAT_REFRESH_INTERVAL` by one task. Three consumers read it:
+    // first-touch provisioning, the catalog fold (through the catalog) and
+    // the alert evaluator. Ingest and maintenance do not read it yet
+    // (#4244, #4245). `None` on an unkeyed bucket.
     let compat_view = compat::build_compat_view(
         store_background.clone(),
         config.deployment_key.as_deref(),

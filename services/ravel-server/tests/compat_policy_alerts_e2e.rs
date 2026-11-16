@@ -1,8 +1,13 @@
 //! A real server on a keyed bucket installs the `sys/compat` write policy
 //! (ADR-4233 decision 3): `/metrics` renders the compat families from the
-//! record it read at startup, and its alert evaluator writes alert history at
-//! the version the policy names for `rlog`, holding the alert lease in the
-//! parked form because `rlog` is recorded as activated (decision 4).
+//! record it read at startup, its alert evaluator writes alert history under
+//! the policy, and it holds the alert lease in the parked form because `rlog`
+//! is recorded as activated (decision 4).
+//!
+//! This build's RLOG window is one version wide, so the version the policy
+//! names equals the built-in one and the trailer assertions here pin the
+//! policy wiring, not the version choice. A record carrying a second, distinct
+//! version is the drill case, which lands with #4249.
 //!
 //! The history holds one firing transition for the configured rule and no
 //! `up` series, so the first evaluated tick resolves it and writes a record.
@@ -67,10 +72,9 @@ async fn alert_objects(store: &dyn ObjectStoreBackend) -> Vec<(String, u16, u32)
 }
 
 /// Watch it fail: drop `.with_compat_policy(compat_view.clone())` from
-/// `start`, and no compat family reaches `/metrics`. The version an
-/// evaluator writes when the policy names one it cannot write is pinned by
-/// `compat_policy_refused_e2e.rs`: this build's RLOG window is one version
-/// wide, so here the policy's version and the built-in one coincide.
+/// `start`, and no compat family reaches `/metrics` and the lease is written
+/// unparked. What an evaluator does when the policy names a version it cannot
+/// write is pinned by `compat_policy_refused_e2e.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_keyed_server_renders_the_compat_view_and_writes_alerts_at_the_policy_version() {
     let store = Arc::new(MemoryStore::new());
