@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use prost::Message;
 use ravel_catalog::compat::{
     FAMILY_CATALOG_HEAD, FAMILY_COMMIT_RECORD, FAMILY_COMPACTION_RECORD, FAMILY_CSNAP,
-    FAMILY_CSTAT, FAMILY_KIDX, FAMILY_NPOST, FAMILY_REWRITE_RECORD, FAMILY_RETENTION_TOMBSTONE,
+    FAMILY_CSTAT, FAMILY_KIDX, FAMILY_NPOST, FAMILY_RETENTION_TOMBSTONE, FAMILY_REWRITE_RECORD,
     FAMILY_RLOG, FAMILY_RSEG, FAMILY_RSPAN, KNOWN_FAMILIES,
 };
 use ravel_catalog::{
@@ -104,7 +104,10 @@ pub enum StrictListError {
     NotATenant { prefix: String, name: String },
 }
 
-fn refuse_unaddressable(prefix: &str, unaddressable: &Unaddressable) -> Result<(), StrictListError> {
+fn refuse_unaddressable(
+    prefix: &str,
+    unaddressable: &Unaddressable,
+) -> Result<(), StrictListError> {
     if unaddressable.count == 0 {
         return Ok(());
     }
@@ -548,12 +551,13 @@ async fn census_tenant(
     tally: &mut Tally,
 ) -> Result<(), CompatInitError> {
     let prefix = format!("t/{}/", tenant.to_hex());
-    let listing = list_all_reporting(store, &prefix)
-        .await
-        .map_err(|source| StrictListError::Store {
-            prefix: prefix.clone(),
-            source,
-        })?;
+    let listing =
+        list_all_reporting(store, &prefix)
+            .await
+            .map_err(|source| StrictListError::Store {
+                prefix: prefix.clone(),
+                source,
+            })?;
     refuse_unaddressable(&prefix, &listing.unaddressable)?;
     for meta in &listing.objects {
         let rest = meta.key.strip_prefix(&prefix).unwrap_or(&meta.key);
@@ -649,28 +653,24 @@ async fn check_object(
                 tally.adopt(FAMILY_CATALOG_HEAD, raw.format_version);
             }
         }
-        Class::CatalogSnap => {
-            match decode_part(bytes, &PartLimits::default()) {
-                Ok(part) => tally.adopt(FAMILY_CSNAP, part.header.format_version),
-                Err(e) => catalog_refusal(tenant, None, FAMILY_CSNAP, key, &e, tally)?,
+        Class::CatalogSnap => match decode_part(bytes, &PartLimits::default()) {
+            Ok(part) => tally.adopt(FAMILY_CSNAP, part.header.format_version),
+            Err(e) => catalog_refusal(tenant, None, FAMILY_CSNAP, key, &e, tally)?,
+        },
+        Class::CatalogPostings(signal) => {
+            match decode_postings(bytes, &PostingsLimits::default(), &[]) {
+                Ok(postings) => tally.adopt(FAMILY_NPOST, postings.header.format_version),
+                // The envelope and header versions are checked before the part
+                // binding, which only HEAD can supply; reaching the binding means
+                // the object is at the version this build writes.
+                Err(SnapshotFormatError::PostingsPartBindingMismatch) => {
+                    let version = fold_write_version(FAMILY_NPOST, signal)
+                        .ok_or_else(|| unreadable(key, FAMILY_NPOST, "no npost version"))?;
+                    tally.adopt(FAMILY_NPOST, u32::from(version));
+                }
+                Err(e) => catalog_refusal(tenant, Some(signal), FAMILY_NPOST, key, &e, tally)?,
             }
         }
-        Class::CatalogPostings(signal) => match decode_postings(
-            bytes,
-            &PostingsLimits::default(),
-            &[],
-        ) {
-            Ok(postings) => tally.adopt(FAMILY_NPOST, postings.header.format_version),
-            // The envelope and header versions are checked before the part
-            // binding, which only HEAD can supply; reaching the binding means
-            // the object is at the version this build writes.
-            Err(SnapshotFormatError::PostingsPartBindingMismatch) => {
-                let version = fold_write_version(FAMILY_NPOST, signal)
-                    .ok_or_else(|| unreadable(key, FAMILY_NPOST, "no npost version"))?;
-                tally.adopt(FAMILY_NPOST, u32::from(version));
-            }
-            Err(e) => catalog_refusal(tenant, Some(signal), FAMILY_NPOST, key, &e, tally)?,
-        },
         Class::CatalogStats => match decode_column_stats_header(bytes) {
             Ok(peek) => tally.adopt(FAMILY_CSTAT, u32::from(peek.envelope_version)),
             Err(e) => catalog_refusal(tenant, None, FAMILY_CSTAT, key, &e, tally)?,
@@ -982,9 +982,7 @@ pub(crate) mod tests {
             max_event_ts_ns: 0,
             min_ingest_ts_ns: 0,
             max_ingest_ts_ns: 0,
-            segment_format_version: u32::from(
-                ravel_segment::SegmentVersion::CURRENT.number(),
-            ),
+            segment_format_version: u32::from(ravel_segment::SegmentVersion::CURRENT.number()),
             created_unix_ns: 0,
             ingest_hour_bucket: 0,
         })
@@ -994,8 +992,8 @@ pub(crate) mod tests {
             .put(&data_key, data, PutOptions::default())
             .await
             .expect("put data");
-        let commit_key = keys::commit_key(&t, Signal::Metrics, 0, 0, Uuid::nil(), 1, 1)
-            .expect("commit key");
+        let commit_key =
+            keys::commit_key(&t, Signal::Metrics, 0, 0, Uuid::nil(), 1, 1).expect("commit key");
         store
             .put(&commit_key, record::encode(&rec), PutOptions::default())
             .await
@@ -1176,8 +1174,8 @@ pub(crate) mod tests {
     async fn init_refuses_an_out_of_window_commit_record_stamp() {
         let mem = Arc::new(MemoryStore::with_page_size(2));
         provision(mem.as_ref(), tenant(1), Signal::Metrics).await;
-        let commit_key = keys::commit_key(&tenant(1), Signal::Metrics, 0, 0, Uuid::nil(), 1, 1)
-            .expect("key");
+        let commit_key =
+            keys::commit_key(&tenant(1), Signal::Metrics, 0, 0, Uuid::nil(), 1, 1).expect("key");
         let rec = record::build(record::NewCommitRecord {
             tenant_hash: tenant(1),
             signal: Signal::Metrics,
@@ -1215,8 +1213,8 @@ pub(crate) mod tests {
     async fn init_refuses_an_unaddressable_key() {
         let mem = Arc::new(MemoryStore::with_page_size(2));
         seed_metrics(mem.as_ref(), tenant(1)).await;
-        let prefix = keys::commit_shard_hour_prefix(&tenant(1), Signal::Metrics, 0, 0)
-            .expect("prefix");
+        let prefix =
+            keys::commit_shard_hour_prefix(&tenant(1), Signal::Metrics, 0, 0).expect("prefix");
         let foreign = format!("{prefix}bad%key.cmt");
         mem.insert_foreign(&foreign, Bytes::from_static(b"foreign"));
 

@@ -493,7 +493,7 @@ async fn has_alert_prefix(
         });
     }
     let alerts = format!("{prefix}{}/", Signal::Alerts.key_prefix());
-    Ok(listing.common_prefixes.iter().any(|p| *p == alerts))
+    Ok(listing.common_prefixes.contains(&alerts))
 }
 
 /// Set the family's `fence_complete_unix_ns` when its activation is still
@@ -548,7 +548,9 @@ async fn record_fence_complete(
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::compat_init::tests::{T0, TestClock, config, provision, seed_metrics, tenant, test_keys};
+    use crate::compat_init::tests::{
+        T0, TestClock, config, provision, seed_metrics, tenant, test_keys,
+    };
     use crate::compat_init::{InitOutcome, init_compat};
     use bytes::Bytes;
     use ravel_alerting::{AlertLease, alert_lease_key};
@@ -597,7 +599,8 @@ mod tests {
     }
 
     fn writable_next(family: &str) -> WritableVersions {
-        WritableVersions::current().with_family(family, vec![baseline(family), baseline(family) + 1])
+        WritableVersions::current()
+            .with_family(family, vec![baseline(family), baseline(family) + 1])
     }
 
     fn request(family: &str) -> ActivateRequest {
@@ -750,11 +753,13 @@ mod tests {
         .expect("activate");
         assert!(report.walk.complete);
         assert_eq!(report.walk.buckets_raised, 4);
-        assert_eq!(
-            report.walk.leases_created + report.walk.leases_replaced,
-            0
+        assert_eq!(report.walk.leases_created + report.walk.leases_replaced, 0);
+        assert!(
+            !lease(mem.as_ref(), tenant(1))
+                .await
+                .expect("lease")
+                .is_parked()
         );
-        assert!(!lease(mem.as_ref(), tenant(1)).await.expect("lease").is_parked());
         assert_eq!(lease(mem.as_ref(), tenant(4)).await, None);
     }
 
@@ -807,8 +812,16 @@ mod tests {
         );
         assert_eq!(walk.buckets_raised, 2);
         assert_eq!(walk.fence_complete_unix_ns, None);
-        assert_eq!(entry(mem.as_ref(), FAMILY_RLOG).await.fence_complete_unix_ns, 0);
-        assert_eq!(prov_epoch(mem.as_ref(), tenant(2), Signal::Metrics).await, 0);
+        assert_eq!(
+            entry(mem.as_ref(), FAMILY_RLOG)
+                .await
+                .fence_complete_unix_ns,
+            0
+        );
+        assert_eq!(
+            prov_epoch(mem.as_ref(), tenant(2), Signal::Metrics).await,
+            0
+        );
         assert_eq!(lease(mem.as_ref(), tenant(4)).await, None);
 
         // A fresh process repeats the request with the cursor: the pending
@@ -836,7 +849,10 @@ mod tests {
         assert_eq!(rlog.active_write_version, baseline(FAMILY_RLOG) + 1);
         assert_eq!(rlog.activated_epoch, 1);
         assert_eq!(rlog.fence_complete_unix_ns, T0 + 20);
-        assert_eq!(prov_epoch(mem.as_ref(), tenant(2), Signal::Metrics).await, 1);
+        assert_eq!(
+            prov_epoch(mem.as_ref(), tenant(2), Signal::Metrics).await,
+            1
+        );
     }
 
     #[tokio::test]
@@ -860,8 +876,16 @@ mod tests {
         .await
         .expect("activate");
         assert_eq!(store.fault_count(Op::Put, FaultKind::Transient), 1);
-        assert!(matches!(first.walk.failure, Some(FenceFailure::Lease { .. })));
-        assert_eq!(entry(mem.as_ref(), FAMILY_RLOG).await.fence_complete_unix_ns, 0);
+        assert!(matches!(
+            first.walk.failure,
+            Some(FenceFailure::Lease { .. })
+        ));
+        assert_eq!(
+            entry(mem.as_ref(), FAMILY_RLOG)
+                .await
+                .fence_complete_unix_ns,
+            0
+        );
 
         let resumed = activate(
             &store,
@@ -880,7 +904,12 @@ mod tests {
             resumed.walk.leases_created + resumed.walk.leases_replaced,
             3
         );
-        assert_eq!(entry(mem.as_ref(), FAMILY_RLOG).await.fence_complete_unix_ns, T0 + 20);
+        assert_eq!(
+            entry(mem.as_ref(), FAMILY_RLOG)
+                .await
+                .fence_complete_unix_ns,
+            T0 + 20
+        );
     }
 
     #[tokio::test]
@@ -946,7 +975,8 @@ mod tests {
         let mem = initialized().await;
         let family = FAMILY_RLOG;
         let base = baseline(family);
-        let writable = WritableVersions::current().with_family(family, vec![base - 1, base, base + 1, base + 2]);
+        let writable = WritableVersions::current()
+            .with_family(family, vec![base - 1, base, base + 1, base + 2]);
         let store = no_put_store(mem.clone());
         for (requested, lower) in [(base - 1, true), (base, true), (base + 2, false)] {
             let err = activate(
@@ -1026,7 +1056,10 @@ mod tests {
         assert_eq!(rlog.activated_epoch, 1);
         assert!(!fence_pending(rseg) && !fence_pending(rlog));
         // B's walk raised every bucket to 1, A's to 2.
-        assert_eq!(prov_epoch(mem.as_ref(), tenant(1), Signal::Metrics).await, 2);
+        assert_eq!(
+            prov_epoch(mem.as_ref(), tenant(1), Signal::Metrics).await,
+            2
+        );
     }
 
     #[tokio::test]
@@ -1051,7 +1084,12 @@ mod tests {
         assert_eq!(store.fault_count(Op::List, FaultKind::Transient), 1);
         assert!(matches!(first.walk.failure, Some(FenceFailure::Listing(_))));
         assert_eq!(first.walk.resume_from, None);
-        assert_eq!(entry(mem.as_ref(), FAMILY_RSEG).await.fence_complete_unix_ns, 0);
+        assert_eq!(
+            entry(mem.as_ref(), FAMILY_RSEG)
+                .await
+                .fence_complete_unix_ns,
+            0
+        );
 
         // Asking for the next version while the walk is pending resumes it.
         let writable = WritableVersions::current().with_family(
