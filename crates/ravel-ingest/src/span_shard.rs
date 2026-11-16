@@ -62,9 +62,9 @@ use crate::clock::Clock;
 use crate::compat::{CompatPublishRefusal, PublishGrant, PutAbort, warn_publish_refused};
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LagCheck, MAX_FLUSH_ALL_PASSES,
-    MAX_FLUSH_CLOCK_HOLD_NS, SPAN_SEGMENT_FORMAT_VERSION, StoreClockLag,
-    checked_ingest_hour_bucket, duration_nanos_saturating, grant_deadline_ns, idle_age_threshold,
-    memory_backstop_crossed, object_backstop_crossed, size_trigger_fires, store_clock_lag,
+    MAX_FLUSH_CLOCK_HOLD_NS, StoreClockLag, checked_ingest_hour_bucket, duration_nanos_saturating,
+    grant_deadline_ns, idle_age_threshold, memory_backstop_crossed, object_backstop_crossed,
+    size_trigger_fires, store_clock_lag,
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::flush_share::TenantFlushShares;
@@ -456,9 +456,9 @@ impl SpanFlushCtx {
         if let Err(refused) = grant
             .ensure_fenced(
                 self.store.as_ref(),
-                tenant_hash,
                 Signal::Spans,
                 self.clock.as_ref(),
+                self.rng.as_ref(),
                 deadline_ns,
             )
             .await
@@ -2017,11 +2017,11 @@ impl SpanShardActor {
         };
         // ADR-1746 decision 4, as in the metrics shard: refused on the cached
         // record before a `seq` is pinned or the PUT task is spawned.
-        let buf = match self.scope.floor_check(
-            tenant_hash,
-            FormatFamily::Rspan,
-            u32::from(SPAN_SEGMENT_FORMAT_VERSION),
-        ) {
+        let open_version = self.scope.writing_version(FormatFamily::Rspan);
+        let buf = match self
+            .scope
+            .floor_check(tenant_hash, FormatFamily::Rspan, open_version)
+        {
             FloorCheck::Write => buf,
             FloorCheck::WriteBelow(below) => {
                 warn_flush_written_below(Signal::Spans, self.shard, tenant_hash, &below);
@@ -2190,7 +2190,7 @@ impl SpanShardActor {
                     return;
                 }
             };
-            if grant.version() != SPAN_SEGMENT_FORMAT_VERSION {
+            if u32::from(grant.version()) != open_version {
                 match scope.floor_check(
                     pinned.tenant_hash,
                     FormatFamily::Rspan,
@@ -2433,7 +2433,7 @@ mod tests {
         let (rec, scanned) = read_back(h.store.as_ref(), &tenant.hash(), &token).await;
         assert_eq!(
             rec.segment_format_version,
-            u32::from(SPAN_SEGMENT_FORMAT_VERSION)
+            u32::from(crate::SPAN_SEGMENT_FORMAT_VERSION)
         );
         assert_eq!(rec.sample_count, 3, "every span is in one RSPAN object");
         assert_eq!(rec.series_count, 2, "two distinct trace ids");

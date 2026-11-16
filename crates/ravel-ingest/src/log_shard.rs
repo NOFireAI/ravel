@@ -67,10 +67,10 @@ use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
 use crate::compat::{CompatPublishRefusal, PublishGrant, PutAbort, warn_publish_refused};
 use crate::config::{
-    DrainIntent, FlushClockError, IngestConfig, LOG_SEGMENT_FORMAT_VERSION, LagCheck,
-    MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS, StoreClockLag, checked_ingest_hour_bucket,
-    duration_nanos_saturating, grant_deadline_ns, idle_age_threshold, memory_backstop_crossed,
-    object_backstop_crossed, size_trigger_fires, store_clock_lag,
+    DrainIntent, FlushClockError, IngestConfig, LagCheck, MAX_FLUSH_ALL_PASSES,
+    MAX_FLUSH_CLOCK_HOLD_NS, StoreClockLag, checked_ingest_hour_bucket, duration_nanos_saturating,
+    grant_deadline_ns, idle_age_threshold, memory_backstop_crossed, object_backstop_crossed,
+    size_trigger_fires, store_clock_lag,
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::flush_share::TenantFlushShares;
@@ -1167,9 +1167,9 @@ impl LogFlushCtx {
         if let Err(refused) = grant
             .ensure_fenced(
                 self.store.as_ref(),
-                tenant_hash,
                 Signal::Logs,
                 self.clock.as_ref(),
+                self.rng.as_ref(),
                 deadline_ns,
             )
             .await
@@ -2982,11 +2982,11 @@ impl LogShardActor {
         };
         // ADR-1746 decision 4, as in the metrics shard: refused on the cached
         // record before a `seq` is pinned or the PUT task is spawned.
-        let buf = match self.scope.floor_check(
-            tenant_hash,
-            FormatFamily::Rlog,
-            u32::from(LOG_SEGMENT_FORMAT_VERSION),
-        ) {
+        let open_version = self.scope.writing_version(FormatFamily::Rlog);
+        let buf = match self
+            .scope
+            .floor_check(tenant_hash, FormatFamily::Rlog, open_version)
+        {
             FloorCheck::Write => buf,
             FloorCheck::WriteBelow(below) => {
                 warn_flush_written_below(Signal::Logs, self.shard, tenant_hash, &below);
@@ -3207,7 +3207,7 @@ impl LogShardActor {
                         return;
                     }
                 };
-                if grant.version() != LOG_SEGMENT_FORMAT_VERSION {
+                if u32::from(grant.version()) != open_version {
                     match scope.floor_check(
                         pinned.tenant_hash,
                         FormatFamily::Rlog,
@@ -3538,7 +3538,7 @@ mod tests {
         let (rec, scanned) = read_back(h.store.as_ref(), &tenant.hash(), &token).await;
         assert_eq!(
             rec.segment_format_version,
-            u32::from(LOG_SEGMENT_FORMAT_VERSION)
+            u32::from(crate::LOG_SEGMENT_FORMAT_VERSION)
         );
         assert_eq!(rec.sample_count, 2, "both records are one RLOG object");
         assert_eq!(rec.series_count, 1, "both share one stream");

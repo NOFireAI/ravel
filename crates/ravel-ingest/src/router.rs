@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::budget::{BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit};
 use crate::clock::Clock;
 use crate::compat::{CompatSlot, IngestCompatPolicy, PublishLifetimeAboveCompat};
-use crate::config::{IngestConfig, SEGMENT_FORMAT_VERSION};
+use crate::config::IngestConfig;
 use crate::deferral::DeferralCapFlag;
 use crate::error::WriteError;
 use crate::format_floor::{FormatFamily, FormatFloorPolicy};
@@ -908,7 +908,7 @@ impl IngestRouter {
         self.switch.admit_floor(
             tenant.hash(),
             FormatFamily::Rseg,
-            u32::from(SEGMENT_FORMAT_VERSION),
+            self.switch.writing_version(FormatFamily::Rseg),
         )?;
         self.admit_compat(tenant.hash())?;
         let shard_count = set.len() as u32;
