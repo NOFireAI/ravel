@@ -111,6 +111,10 @@ pub enum LogWriteError {
     /// admission or at flush open the same way. Retryable.
     #[error(transparent)]
     BelowFormatFloor(#[from] crate::format_floor::BelowFormatFloor),
+    /// The `sys/compat` activation policy refused the log write's publish
+    /// (ADR-4233); the counterpart of [`crate::WriteError::CompatRefused`].
+    #[error(transparent)]
+    CompatRefused(#[from] crate::compat::CompatPublishRefusal),
     /// A multi-shard Strict write in which at least one shard failed *after*
     /// one or more sibling shards had already acked their commit durably in
     /// the same [`LogIngestRouter::write`](crate::LogIngestRouter::write) call
@@ -153,6 +157,7 @@ impl LogWriteError {
             | LogWriteError::PendingAckLimitReached
             | LogWriteError::DeferralCapReached
             | LogWriteError::BelowFormatFloor(_) => true,
+            LogWriteError::CompatRefused(refusal) => refusal.is_retryable(),
             LogWriteError::SegmentBuild(_)
             | LogWriteError::StreamIdCollision(_)
             | LogWriteError::MixedBufferRepresentation(_) => false,
