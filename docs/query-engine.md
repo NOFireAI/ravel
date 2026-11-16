@@ -6283,8 +6283,9 @@ would shift surviving-row positions between the phases.
 
 What it costs is at most `k` logical block fetches (winners in one block
 share a fetch); the object-store requests behind them depend on the fetch
-path, as the next paragraph says. Those are accounted like any other scan read,
-and `LogsRowFetchExec` publishes `row_refs`, `blocks_fetched`, and
+path, as the next paragraph says. Those are accounted under the `fetch` entry
+of `stats.phases`, apart from phase 1's `scan` (issue #797), and
+`LogsRowFetchExec` publishes `row_refs`, `blocks_fetched`, and
 `segments_fetched` as metrics (`ravel-cli sql explain --analyze` prints them)
 so a report can state phase 2's cost instead of inferring it. With a read
 cache wired and an object below the

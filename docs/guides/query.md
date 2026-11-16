@@ -1008,6 +1008,17 @@ objects in `stats.pruning.segmentsPrunedByKeyIndex`, the dropped blocks in
 `stats.pruning.blocksPrunedByKeyIndex`, and the index reads under the
 `keyIndex` entry of `stats.phases`.
 
+A logs `SELECT *`, or another projection wide enough to trigger
+[TopK late materialization](../query-engine.md#topk-late-materialization-adr-0774),
+under `ORDER BY ... LIMIT k` runs in two passes: the first scans the filter
+and sort columns to pick the `k` winning rows, the second fetches the rest of
+the columns for those rows only. The response reports the second pass under
+the `fetch` entry of `stats.phases`: its GETs, its wire bytes (as transferred,
+range reads included), its cache hits, misses and served bytes, its
+decompressed bytes and the objects it opened. The first pass is reported
+under the same phases as any other scan. `fetch` is 0 on a statement that runs no second
+pass, and the phases still sum to `stats.accounting`.
+
 Pruning is always widen-only, because Ravel applies the original predicate
 again above the scan. The coarser range of the `IN` envelope and any
 type-mismatched shape (`!=`, a range on a `str` column, a float compared to an
