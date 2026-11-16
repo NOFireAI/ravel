@@ -217,7 +217,9 @@ test breaks the check instead of drifting silently.
 
 A table's first row is its header, recognised by its exact first cell,
 `TLA+ action or property`; a table whose first cell differs fails, and every
-data row must have as many cells as the header.
+data row must have as many cells as the header. Only the row directly under
+the header may be its separator: a later row of pipes, spaces, dashes and
+colons is a data row, and fails for want of a Rust source ref.
 
 ### The Antithesis property column
 
@@ -228,12 +230,17 @@ sixth column, `Antithesis property`, and every data row's cell takes one of
 three forms:
 
 - `sut: <path.rs> -- <message>`: the repo-relative `.rs` file exists and holds
-  the literal message, the one its `inv_*!` assertion reports;
-- `driver: <workload> -- <message>`: the literal occurs in a file under
-  `antithesis/<workload>/`;
-- `none: <reason>`, with a non-empty reason.
+  `"<message>"` as a string literal, the one its `inv_*!` assertion reports;
+- `driver: <workload> -- <message>`: a `.rs` file under
+  `antithesis/<workload>/` holds `"<message>"`; markdown there does not count;
+- `none: <reason>`, a space and then a non-empty reason.
 
-The path and the message may each be wrapped in one backtick code span. The
+The message must be the whole double-quoted literal: a substring of a longer
+literal or an unquoted occurrence does not count. A literal counts only on a
+line that is not a comment (`//`, `/*` or `*` after leading whitespace) and
+that comes before the file's first `#[cfg(test)]` line; for `driver:` and for
+mutants, files under a `tests/` directory are skipped too. The path and the
+message may each be wrapped in one backtick code span. The
 ` -- ` separator keeps the path a whole token, so the `crates/...` sweep above
 resolves it too. A five-column table in an enrolled area fails, and so does a
 six-column table in an area with no `.tsv`; no area is enrolled yet.
@@ -246,11 +253,13 @@ the area; blank lines and `#` comments are skipped:
 <negative cfg stem>	none: <reason>
 ```
 
-The mutant `<area>/<stem>` must occur in a `.rs` file under `crates/` or
-`services/` as the literal `inv_mutant!("<area>/<stem>")`, and the message
-must be one a `sut:` or `driver:` cell in the area's tables carries. A
-`negative/*.cfg` with no line, a second line for one, or a line naming no
-config fails.
+The mutant `<area>/<stem>` must occur in a `.rs` file under `crates/`,
+`services/` or `antithesis/*/driver/` (the driver-side broken store of
+ADR-4326 decision 3) as the literal `inv_mutant!("<area>/<stem>")`, under the
+same comment, `#[cfg(test)]` and `tests/` rules, and the message must be one
+a `sut:` or `driver:` cell in the area's tables carries. `none:` takes a space
+before its reason, as in the cell. A `negative/*.cfg` with no line, a second
+line for one, or a line naming no config fails.
 
 ### Mutants
 

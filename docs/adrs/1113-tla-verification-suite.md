@@ -612,20 +612,25 @@ sixth column and its check (issue #4330).
 - An area is enrolled when its directory holds `antithesis-mutants.tsv`.
   Every table in an enrolled area's `traceability.md` has a sixth column,
   "Antithesis property", and every data row's cell is one of
-  `sut: <path.rs> -- <message>` (the file exists and holds the literal
-  message), `driver: <workload> -- <message>` (the literal occurs under
-  `antithesis/<workload>/`), or `none: <reason>` with a non-empty reason.
+  `sut: <path.rs> -- <message>` (the file exists and holds `"<message>"`
+  as a string literal), `driver: <workload> -- <message>` (a `.rs` file
+  under `antithesis/<workload>/` holds it), or `none: <reason>`, a space
+  and then a non-empty reason. A literal on a comment line, after the
+  file's first `#[cfg(test)]` line, or (for `driver:` and mutants) in a
+  file under a `tests/` directory does not count.
   The ` -- ` separator keeps the path a whole token for the existing
   `crates/...` reference sweep.
 - A five-column table in an enrolled area fails `check-tla.sh
   traceability`, and so does a six-column table in an area without the
   `.tsv`. A table's first row is its header, recognised by its exact first
   cell, `TLA+ action or property`; a table whose first cell differs fails,
-  and every data row must have the header's column count.
+  and every data row must have the header's column count. Only the row
+  directly under the header may be its separator.
 - `antithesis-mutants.tsv` has one tab-separated line per
   `negative/*.cfg` of the area: the config stem, then either the mutant
-  `<area>/<stem>`, which occurs in Rust as the literal
-  `inv_mutant!("<area>/<stem>")`, and the message of a `sut:` or `driver:`
+  `<area>/<stem>`, which occurs as the literal
+  `inv_mutant!("<area>/<stem>")` in a `.rs` file under `crates/`,
+  `services/` or `antithesis/*/driver/`, and the message of a `sut:` or `driver:`
   cell in the area's tables, or `none: <reason>`. A missing, duplicated or
   unknown stem fails.
 - No area is enrolled by this amendment. Each ADR-4326 child epic's last
