@@ -427,12 +427,12 @@ check "antithesis_scan_says_what_it_read" "${d}" 0 \
 d="$(new_repo docker-antithesis-mutants)"
 edit "${d}/Dockerfile" 's/--features sql /--features sql,antithesis-mutants /'
 check "antithesis-mutants in the published build is a finding" "${d}" 1 \
-  "Dockerfile:4: release build enables antithesis or antithesis-mutants"
+  "Dockerfile:4: release build enables antithesis, antithesis-mutants or ravel-invariant/capture"
 
 d="$(new_repo docker-antithesis)"
 edit "${d}/Dockerfile" 's/-p ravel-cli$/-p ravel-cli --features ravel-invariant\/antithesis/'
 check "antithesis_in_the_published_build_is_a_finding" "${d}" 1 \
-  "Dockerfile:5: release build enables antithesis or antithesis-mutants"
+  "Dockerfile:5: release build enables antithesis, antithesis-mutants or ravel-invariant/capture"
 
 # The instrumentation shim's crate name is not the feature.
 d="$(new_repo docker-antithesis-other-word)"
@@ -447,7 +447,7 @@ d="$(new_repo publish-antithesis)"
 printf '          build-args: |\n            CARGO_FEATURES=antithesis\n' \
   >>"${d}/.github/workflows/publish-images.yml"
 check "antithesis_in_the_publish_workflow_is_a_finding" "${d}" 1 \
-  "publish-images.yml:9: release build enables antithesis or antithesis-mutants"
+  "publish-images.yml:9: release build enables antithesis, antithesis-mutants or ravel-invariant/capture"
 
 d="$(new_repo antithesis-default)"
 insert_after "${d}/crates/ravel-invariant/Cargo.toml" "capture = []" 'default = ["antithesis-mutants"]'
@@ -493,6 +493,84 @@ d="$(new_repo antithesis-crate-missing)"
 rm "${d}/crates/ravel-invariant/Cargo.toml"
 check "missing_invariant_crate_manifest_is_cannot_check" "${d}" 2 \
   "crates/ravel-invariant/Cargo.toml does not exist"
+
+# Cargo takes single-quoted strings too, and the scan reads the value
+# whatever its quoting.
+d="$(new_repo antithesis-default-single-quoted)"
+insert_after "${d}/crates/ravel-invariant/Cargo.toml" "capture = []" "default = ['antithesis']"
+check "antithesis_in_a_single_quoted_default_is_a_finding" "${d}" 1 \
+  "crates/ravel-invariant/Cargo.toml:11: enables antithesis outside its own same-name feature"
+
+d="$(new_repo antithesis-default-bare)"
+insert_after "${d}/crates/ravel-invariant/Cargo.toml" "capture = []" "default = [antithesis-mutants]"
+check "antithesis_unquoted_in_a_default_is_a_finding" "${d}" 1 \
+  "crates/ravel-invariant/Cargo.toml:11: enables antithesis outside its own same-name feature"
+
+d="$(new_repo antithesis-forward-single-quoted)"
+insert_after "${d}/services/ravel-server/Cargo.toml" "sql = []" "chaos = ['ravel-invariant/antithesis-mutants']"
+check "antithesis_single_quoted_forward_under_another_name_is_a_finding" "${d}" 1 \
+  "services/ravel-server/Cargo.toml:6: enables antithesis outside its own same-name feature"
+
+# --- ravel-invariant/capture stays out of release builds too ------------------
+
+d="$(new_repo capture-default)"
+insert_after "${d}/crates/ravel-invariant/Cargo.toml" "capture = []" 'default = ["capture"]'
+check "capture_in_the_invariant_default_is_a_finding" "${d}" 1 \
+  "crates/ravel-invariant/Cargo.toml:11: enables ravel-invariant/capture"
+
+d="$(new_repo capture-default-single-quoted)"
+insert_after "${d}/crates/ravel-invariant/Cargo.toml" "capture = []" "default = ['capture']"
+check "capture_single_quoted_in_the_invariant_default_is_a_finding" "${d}" 1 \
+  "crates/ravel-invariant/Cargo.toml:11: enables ravel-invariant/capture"
+
+d="$(new_repo capture-forward-other-name)"
+insert_after "${d}/services/ravel-server/Cargo.toml" "sql = []" 'chaos = ["ravel-invariant/capture"]'
+check "capture_forwarded_by_a_dependent_is_a_finding" "${d}" 1 \
+  "services/ravel-server/Cargo.toml:6: enables ravel-invariant/capture"
+
+# The same-name exemption covers the antithesis features only.
+d="$(new_repo capture-inside-antithesis-forward)"
+insert_after "${d}/services/ravel-server/Cargo.toml" "sql = []" \
+  'antithesis = [\n    "ravel-invariant/antithesis",\n    "ravel-invariant/capture",\n]'
+check "capture_inside_the_antithesis_forward_is_a_finding" "${d}" 1 \
+  "services/ravel-server/Cargo.toml:8: enables ravel-invariant/capture"
+
+d="$(new_repo capture-dev-dependency-edge)"
+printf '\n[dev-dependencies.ravel-invariant]\npath = "../ravel-invariant"\nfeatures = [\n    "capture",\n]\n' \
+  >>"${d}/crates/ravel-compat-tests/Cargo.toml"
+check "capture_on_a_dev_dependency_edge_is_a_finding" "${d}" 1 \
+  "crates/ravel-compat-tests/Cargo.toml:10: enables ravel-invariant/capture"
+
+d="$(new_repo capture-inline-dependency-edge)"
+edit "${d}/services/ravel-server/Cargo.toml" \
+  "s/^ravel-segment = { workspace = true } #.*$/ravel-invariant = { workspace = true, features = ['capture'] }/"
+check "capture_on_an_inline_dependency_edge_is_a_finding" "${d}" 1 \
+  "services/ravel-server/Cargo.toml:8: enables ravel-invariant/capture"
+
+# Another crate's own `capture` feature is not this one.
+d="$(new_repo capture-other-crate)"
+edit "${d}/services/ravel-server/Cargo.toml" \
+  's/^ravel-segment = { workspace = true } #.*$/tracing-test = { workspace = true, features = ["capture"] }/'
+check "another_crates_capture_feature_passes" "${d}" 0 ""
+
+d="$(new_repo docker-capture)"
+edit "${d}/Dockerfile" 's/-p ravel-cli$/-p ravel-cli --features ravel-invariant\/capture/'
+check "capture_in_the_published_build_is_a_finding" "${d}" 1 \
+  "Dockerfile:5: release build enables antithesis, antithesis-mutants or ravel-invariant/capture"
+
+d="$(new_repo docker-capture-bare)"
+edit "${d}/Dockerfile" 's/--features sql /--features sql,capture /'
+check "capture_in_a_features_argument_is_a_finding" "${d}" 1 \
+  "Dockerfile:4: release build enables antithesis, antithesis-mutants or ravel-invariant/capture"
+
+d="$(new_repo docker-capture-other-word)"
+insert_after "${d}/Dockerfile" "FROM rust:1 AS builder" "LABEL note=capture"
+check "capture_outside_a_features_argument_passes" "${d}" 0 ""
+
+d="$(new_repo capture-definition-missing)"
+edit "${d}/crates/ravel-invariant/Cargo.toml" '/^capture = \[\]$/d'
+check "missing_capture_feature_definition_is_cannot_check" "${d}" 2 \
+  "crates/ravel-invariant/Cargo.toml declares no capture feature"
 
 printf '\n%s passed, %s failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
