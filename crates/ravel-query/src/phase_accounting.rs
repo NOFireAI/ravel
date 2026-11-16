@@ -166,12 +166,16 @@ impl From<QueryPhase> for GetPhase {
 ///   the footer chase, SKIP_IDX/PAGE_DIR/FIELD_DIR, and the whole-object plan
 ///   fallback. A planning read fetches no block data, so all of its bytes are
 ///   plan bytes.
-/// - [`QueryPhase::Probe`]: the metadata GETs of a DATA read -- its suffix
-///   probe, footer chase, SKIP_IDX, PAGE_DIR, STREAM_DIR and FIELD_DIR (at the
-///   object's front only in objects written before the ADR-0699 amendment of
-///   2026-10-24), BLOOM and POSTINGS, and the object's trailing bytes.
-/// - [`QueryPhase::Scan`]: the BLOCKS-section data ranges of a data read, and a
-///   whole-object GET a data read issued to obtain block data.
+/// - [`QueryPhase::Probe`]: the metadata GETs of a phase-1 (scan) DATA read
+///   (`ReadPhases::SCAN`) -- its suffix probe, footer chase, SKIP_IDX,
+///   PAGE_DIR, STREAM_DIR and FIELD_DIR (at the object's front only in objects
+///   written before the ADR-0699 amendment of 2026-10-24), BLOOM and POSTINGS,
+///   and the object's trailing bytes.
+/// - [`QueryPhase::Scan`]: the BLOCKS-section data ranges of a phase-1 data
+///   read, and a whole-object GET it issued to obtain block data.
+/// - [`QueryPhase::Fetch`]: every GET of late materialization's phase-2 row
+///   fetch (`ReadPhases::FETCH`), its metadata GETs and its BLOCKS ranges
+///   alike, so this phase's figure cannot be split into the two.
 /// - [`QueryPhase::Resolve`]: never written by the RLOG read path. The catalog
 ///   snapshot resolve's commit-record GETs are issued by `ravel-catalog`, which
 ///   has no handle on this counter.
@@ -467,7 +471,7 @@ impl PhaseAccounting {
     /// underlying counter six times and sum it, reporting 6x the real total;
     /// this reads it once instead. A [`new`](Self::new) handle's six phases
     /// are genuinely independent, so its pooled total is the real sum of the
-    /// five, exactly what `snapshot().pooled()` already computes.
+    /// six, exactly what `snapshot().pooled()` already computes.
     #[must_use]
     pub fn pooled_snapshot(&self) -> QueryAccountingSnapshot {
         if self.shared {

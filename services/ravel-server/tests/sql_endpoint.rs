@@ -2508,7 +2508,15 @@ async fn sql_response_carries_phase_and_io_shape_stats() {
 
     assert_eq!(status, StatusCode::OK, "{value}");
     let phases = value["stats"]["phases"].as_array().expect("phases array");
-    assert_eq!(phases.len(), 5, "{value}");
+    let names: Vec<&str> = phases
+        .iter()
+        .map(|p| p["phase"].as_str().expect("phase name"))
+        .collect();
+    assert_eq!(
+        names,
+        ["resolve", "plan", "probe", "scan", "keyIndex", "fetch"],
+        "{value}"
+    );
     assert_eq!(
         value["stats"]["io"]["planClass"], "exhaustive_scan",
         "{value}"
@@ -3639,7 +3647,7 @@ async fn a_samples_logs_join_returns_exact_rows_over_http() {
 /// `stats.signals` over HTTP (issue #2912): a `samples JOIN logs` statement
 /// renders one entry per table, `samples` then `logs`, each with exactly
 /// `table`, `segments`, `segmentsPruned` and `phases`; each `phases` list names
-/// the five phases `stats.phases` names, and the two entries sum to
+/// the six phases `stats.phases` names, and the two entries sum to
 /// `stats.phases` per phase and per field, and to `stats.pruning.segments`.
 #[tokio::test]
 async fn stats_signals_is_rendered_in_the_json_response() {
@@ -3673,7 +3681,11 @@ async fn stats_signals_is_rendered_in_the_json_response() {
 
     let phases = value["stats"]["phases"].as_array().expect("stats.phases");
     let phase_names: Vec<&Value> = phases.iter().map(|p| &p["phase"]).collect();
-    assert_eq!(phase_names.len(), 5);
+    assert_eq!(
+        phase_names,
+        ["resolve", "plan", "probe", "scan", "keyIndex", "fetch"],
+        "{value}"
+    );
     for entry in signals {
         let keys: std::collections::BTreeSet<&str> = entry
             .as_object()
