@@ -598,8 +598,9 @@ depends on what the operator set:
 
 Startup logs both adjustments, `clamped` and `raised` on the resolved lines,
 plus a WARN. It logs every resolved value, one line per setting with its
-source (`derived`, `derived-loopback-cap` for a capped `store_get_concurrency`
-on a loopback store, `flag`, `fallback`, or `legacy-flag`):
+source (`derived`, `derived-loopback-cap` for a `store_get_concurrency` or
+`sql_partition_count` capped on a loopback store, `flag`, `fallback`, or
+`legacy-flag`):
 
 ```
 INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
