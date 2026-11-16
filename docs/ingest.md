@@ -1077,6 +1077,41 @@ in-flight flushes on all three pipelines, the adaptive delay was
 deliberately not extended to logs and spans: those actors keep the fixed
 `max_flush_delay` / `max_flush_delay_idle` age trigger.
 
+### Format activation policy (ADR-4233)
+
+A router given an `IngestCompatPolicy` (`with_compat_policy`) writes the
+version `sys/compat` names for its family (RSEG for metrics, RLOG for logs,
+RSPAN for spans) and refuses to publish what this build may not. All three
+pipelines apply it the same way (crates/ravel-ingest/src/compat.rs):
+
+- Admission refuses a write the cached view already rejects (active version
+  not in this build's writable set, or `CompatRecordMissing`) before
+  anything is buffered or charged to a budget. A stale view is not refused
+  at admission.
+- The flush picks its version at permit grant, not at flush open, from the
+  view as it stands then. A stale view, an active version this build cannot
+  write, or a missing record refuses the flush with no PUT: its rows are
+  dropped, its byte charges released, and its strict waiters get a
+  retryable `CompatRefused` error. A version other than the writer's
+  `CURRENT` is checked against the tenant's format floor again.
+- Before the first PUT of an object above the family's baseline, the
+  tenant's provisioning record is fenced to the view's `compat_epoch`
+  (`raise_compat_fence`), unless the router's cached provisioning view
+  already carries that epoch. A fence that cannot be raised refuses the
+  flush (`fence_failed`).
+- Every data-object and commit-record PUT attempt, retries included, and
+  every fence attempt is refused once the view is `COMPAT_VIEW_HORIZON_NS`
+  old.
+- Construction refuses a `max_flush_lifetime` above the record's
+  `max_publish_lifetime_ns` (`PublishLifetimeAboveCompat`).
+
+Every refusal counts once under its reason (`view_stale`,
+`active_version_not_writable`, `compat_record_missing`, `fence_failed`) in
+the signal's metrics snapshot, `compat_publish_refused`. With no policy
+installed, the default and every shipping path until ravel-server installs
+one, each pipeline writes its writer's `CURRENT` version with none of these
+checks, byte for byte as before.
+
 ## Log pipeline
 
 Logs run a parallel pipeline, not a mode of the metrics one (ADR-0029):
@@ -1173,8 +1208,9 @@ Commit-record fields the log flush fills differently: `sample_count` is the
 log record count (a record is the RLOG analogue of a sample), `series_count`
 is the number of distinct `stream_id`s in the batch (tracked in the actor,
 since `finish()` does not report it back), and `segment_format_version` is
-`LOG_SEGMENT_FORMAT_VERSION`, RLOG's own trailer version, not
-`SEGMENT_FORMAT_VERSION`.
+the RLOG trailer version the flush wrote, not an RSEG version:
+`LOG_SEGMENT_FORMAT_VERSION` with no activation policy, else the version
+chosen at permit grant ("Format activation policy" above).
 
 The log flush writes each object with the tenant's clustering key and bloom
 scope (ADR-2135 decisions 1 and 5). Both come from config record fields 13
@@ -1285,8 +1321,9 @@ acquired inside the flush task under ADR-1642) and diverge in these places:
 
 Commit-record fields the span flush fills differently: `sample_count` is the
 span count, `series_count` is the number of distinct `trace_id`s in the batch
-(tracked in the actor), `segment_format_version` is
-`SPAN_SEGMENT_FORMAT_VERSION`, and the event-time bounds are the batch's
+(tracked in the actor), `segment_format_version` is the RSPAN version the
+flush wrote (`SPAN_SEGMENT_FORMAT_VERSION` with no activation policy, else
+the version chosen at permit grant), and the event-time bounds are the batch's
 interval (the minimum `start_ts_ns` and the maximum `end_ts_ns`), so a
 commit record advertises the same interval RSPAN's skip index prunes with.
 
