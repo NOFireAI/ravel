@@ -311,18 +311,21 @@ view of the record: a refresh never lowers a version, epoch or certificate
 it has already seen, and a failed refresh leaves the view and the time of
 its last successful read unchanged. A read that finds no object is a
 successful read. A failed read whose GET returned an object (a newer,
-unauthenticated or corrupt record) marks a record as seen, and a store
-error other than `AccessDenied` marks the view for the rest of the run.
+unauthenticated or corrupt record) marks a record as seen. The view also
+keeps whether the refresh that finished last failed with a store error other
+than `AccessDenied`; the next refresh to finish replaces that outcome.
 `CompatView::check_fresh(now, bucket_compat_epoch)`, which
 `CompatView::write_policy` applies first, refuses a write with `ViewStale`
 once the last successful read is 10 minutes old or there has been none
 (`COMPAT_VIEW_HORIZON`; the default refresh interval is 60 s), except for a
 blind view writing to a bucket whose `compat_epoch` is 0. A view is blind
-while no read has succeeded, every failed read was refused as
-`AccessDenied`, and no record was seen; a blind view answers the baseline
-with no time bound. Once any read succeeds, `NotFound` included, the
-horizon applies whether or not a record was seen, and a view that never
-read the record but saw another error refuses at once. `write_policy`
+while no read has succeeded, no record was seen, and the refresh that
+finished last, if any, was refused as `AccessDenied`; a blind view answers
+the baseline with no time bound. A never-read view whose latest refresh
+failed any other way (a 5xx, a timeout, throttling) cannot tell whether an
+activation happened, so it refuses at once and until a later refresh
+succeeds or is refused as `AccessDenied`. Once any read succeeds, `NotFound`
+included, the horizon applies whether or not a record was seen. `write_policy`
 refuses with `CompatRecordMissing` when the record is absent but the target
 bucket is fenced or this process has already seen an epoch, and with
 `ActiveVersionNotWritable` when the family's active version, or the
@@ -346,14 +349,17 @@ the highest version the fold writes for the family
 (`ravel_catalog::fold_write_version`; for `kidx` that is 2 for every
 signal), and otherwise the cycle is refused before anything is read or
 written. The fold passes no bucket, so a blind view does not stop it. With
-no policy the fold writes what it always has. A server first touch of a
-new bucket checks the view's freshness as a bucket with `compat_epoch` 0
-first: under a stale view, or a never-read view that is not blind, it is
-refused as retryable (ingest answers 503 or gRPC `UNAVAILABLE`), counted
-under `ravel_compat_publish_refused_total{reason="view_stale"}`, and writes
-no provisioning record, caches nothing and starts no backoff. Otherwise,
-after an activation (the view has seen a `compat_epoch` above 0) the
-provisioning record is born fenced at that epoch.
+no policy the fold writes what it always has. A server first touch reads
+the bucket's provisioning record. A record that exists is validated and
+adopted whatever the view's freshness. A touch that would create the record,
+for a fresh bucket or one holding pre-ADR data, checks the view's freshness
+as a bucket with `compat_epoch` 0: under a stale view, or a never-read view
+that is not blind, it is refused as retryable (ingest answers 503 or gRPC
+`UNAVAILABLE`), counted under
+`ravel_compat_publish_refused_total{reason="view_stale"}`, and writes no
+provisioning record, caches nothing and starts no backoff. Otherwise, after
+an activation (the view has seen a `compat_epoch` above 0) the record is
+created born fenced at that epoch.
 
 `t/<tenant_hash>/<signal>/prov` (ADR-0050 §5) is the durable
 `shard_count` provisioning record: a per-(tenant, signal) object holding
