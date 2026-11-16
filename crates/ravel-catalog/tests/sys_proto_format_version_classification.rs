@@ -69,7 +69,10 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         ("WorkerHeartbeat", Immutable(&[2])),
         // Read-modify-write under CAS. ProvisioningRecord accepts {1, 2, 3}
         // after ADR-1746 Release A (the FormatFloor basis fields), and its
-        // writer stamps 3 since Release B. TenantConfigRecord accepts {1, 2, 3}
+        // writer stamps 3 since Release B; {1, 2, 3, 4} after ADR-4233
+        // decision 4 (compat_epoch and compat_fenced_unix_ns, stamped 4 only on
+        // a fenced record). CompatRecord (`sys/compat`, ADR-4233 decision 3)
+        // starts at {1}. TenantConfigRecord accepts {1, 2, 3}
         // after ADR-2135's reader-first step (clustering_key and bloom_scope;
         // the writer stamps 2 by default and 3 behind the storage-layout
         // opt-in), and {1, 2, 3, 4} after ADR-2707's (key_index and
@@ -85,7 +88,8 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         // still judged by the ceiling. Every slice belonging to a
         // ravel-catalog reader is checked against that reader's own constants
         // by `catalog_read_sets_match_their_readers_constants`.
-        ("ProvisioningRecord", CasMutable(&[1, 2, 3])),
+        ("ProvisioningRecord", CasMutable(&[1, 2, 3, 4])),
+        ("CompatRecord", CasMutable(&[1])),
         ("TenantConfigRecord", CasMutable(&[1, 2, 3, 4])),
         ("MetricMetadataRecord", CasMutable(&[1, 2])),
         ("AuthTokenMap", CasMutable(&[1, 2])),
@@ -316,6 +320,10 @@ fn catalog_read_sets_match_their_readers_constants() {
         (
             "ProvisioningRecord",
             (cat::PROVISIONING_MIN_READ_VERSION..=cat::PROVISIONING_MAX_READ_VERSION).collect(),
+        ),
+        (
+            "CompatRecord",
+            (cat::COMPAT_MIN_READ_VERSION..=cat::COMPAT_MAX_READ_VERSION).collect(),
         ),
         (
             "TenantConfigRecord",
