@@ -12,14 +12,16 @@
 //! family entry.
 //!
 //! The watermark (`late_writes_verified_through_unix_ns`) is monotone across
-//! runs: a completed pass advances it to its own start only when that is later
-//! than the stored value, so two passes finishing out of order never move it
-//! back. `certify` seeds it with `S`, the start of the first census run, so the
-//! first late-write pass examines every record that landed after the census
-//! began even on a resumed certification that kept the earlier `S`.
+//! passes under one certificate: a completed pass advances it to its own start
+//! only when that is later than the stored value, so two passes finishing out
+//! of order never move it back, and a pass whose certificate was replaced
+//! while it ran writes nothing. `certify` sets it to `S`, the start of the
+//! first census run, in the CAS that writes the certificate, so the first
+//! late-write pass examines every record that landed after the census began
+//! even on a resumed certification that kept the earlier `S`.
 
 use prost::Message;
-use ravel_catalog::compat::{CompatError, CompatKeys, read_compat, update_compat};
+use ravel_catalog::compat::{COMPAT_KEY, CompatError, CompatKeys, read_compat, update_compat};
 use ravel_commit::record;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all_reporting};
 
@@ -48,6 +50,10 @@ pub struct LateWriteReport {
     /// Whether the family carried a certificate to verify against. With none,
     /// the pass examines nothing and leaves the watermark untouched.
     pub certified: bool,
+    /// The family's certificate version or certification time changed while
+    /// the pass ran: its findings were judged against a certificate that is
+    /// gone, so nothing was written and the watermark is the stored value.
+    pub certificate_replaced: bool,
 }
 
 fn compat_err(err: CompatError) -> MaintainError {
@@ -80,7 +86,10 @@ fn record_version(key: &str, bytes: &[u8]) -> Result<Option<u32>> {
 /// Reads `sys/compat`; with no certificate for the family the pass is a no-op.
 /// A found record below the certified version CAS-sets `contradicted`. The
 /// watermark is advanced to `now_ns` only when that is later than the stored
-/// value, so it never moves backward.
+/// value, so it never moves backward. When the certificate's version or
+/// certification time changed while the pass ran, the CAS writes nothing and
+/// the report says `certificate_replaced`: the new certificate's census set its
+/// own watermark, and this pass's findings were judged against the old one.
 pub async fn late_write_pass(
     store: &dyn ObjectStoreBackend,
     keys_compat: &CompatKeys,
@@ -101,6 +110,7 @@ pub async fn late_write_pass(
             late_writes: Vec::new(),
             watermark_unix_ns: 0,
             certified: false,
+            certificate_replaced: false,
         });
     };
     let Some(entry) = record.families.iter().find(|f| f.family == family) else {
@@ -109,6 +119,7 @@ pub async fn late_write_pass(
             late_writes: Vec::new(),
             watermark_unix_ns: 0,
             certified: false,
+            certificate_replaced: false,
         });
     };
     let Some(certificate) = entry.certificate.as_ref() else {
@@ -117,9 +128,11 @@ pub async fn late_write_pass(
             late_writes: Vec::new(),
             watermark_unix_ns: entry.late_writes_verified_through_unix_ns,
             certified: false,
+            certificate_replaced: false,
         });
     };
     let certified_version = certificate.version;
+    let certified_identity = (certificate.version, certificate.certified_unix_ns);
     let watermark = entry.late_writes_verified_through_unix_ns;
     let threshold_ns = watermark.saturating_sub(clock_skew_allowance_ns);
 
@@ -165,7 +178,8 @@ pub async fn late_write_pass(
 
     let contradicted = !late_writes.is_empty();
     let family_owned = family.to_string();
-    let (updated, _) = update_compat(store, keys_compat, |record| {
+    let mut replaced = false;
+    let written = update_compat(store, keys_compat, |record| {
         let entry = record
             .families
             .iter_mut()
@@ -173,6 +187,16 @@ pub async fn late_write_pass(
             .ok_or_else(|| CompatError::FamilyNotInRecord {
                 family: family_owned.clone(),
             })?;
+        let identity = entry
+            .certificate
+            .as_ref()
+            .map(|c| (c.version, c.certified_unix_ns));
+        if identity != Some(certified_identity) {
+            replaced = true;
+            return Err(CompatError::CasConflict {
+                key: COMPAT_KEY.to_string(),
+            });
+        }
         if contradicted {
             entry.contradicted = true;
         }
@@ -181,8 +205,20 @@ pub async fn late_write_pass(
         }
         Ok(())
     })
-    .await
-    .map_err(compat_err)?;
+    .await;
+    let (updated, _) = match written {
+        Ok(written) => written,
+        Err(CompatError::CasConflict { .. }) if replaced => {
+            return Ok(LateWriteReport {
+                examined,
+                late_writes,
+                watermark_unix_ns: watermark,
+                certified: true,
+                certificate_replaced: true,
+            });
+        }
+        Err(err) => return Err(compat_err(err)),
+    };
 
     let watermark_unix_ns = updated
         .families
@@ -196,5 +232,6 @@ pub async fn late_write_pass(
         late_writes,
         watermark_unix_ns,
         certified: true,
+        certificate_replaced: false,
     })
 }
