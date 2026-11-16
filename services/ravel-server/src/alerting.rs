@@ -551,16 +551,16 @@ const MSG_RULE_FAILED: &str = "alert rule evaluation failed";
 struct RuleRefusal(String);
 
 /// The history fold refused its tick: it read an alert history object whose
-/// RLOG format version this build cannot read, and whose bytes match the
-/// commit record's content hash (so it is a genuine forward-version object,
-/// not a bit flip). ADR-4233 decision 4 (hazard H3) makes this a typed tick
+/// RLOG format version is newer than any this build reads, and whose bytes
+/// match the commit record's content hash (so it was written by a newer build,
+/// not bit-flipped). ADR-4233 decision 4 (hazard H3) makes this a typed tick
 /// refusal, not a skip: the evaluator keeps the previous durable state and
 /// writes no transition, rather than rebuilding state without the object.
-/// `evaluate_tick` turns it into an `history_unavailable` tick outcome.
+/// `evaluate_tick` turns it into a `history_unavailable` tick outcome.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "alert history object {object_key} reads as RLOG version {version}, which this build cannot \
-     read; refusing the tick rather than folding alert state without it"
+    "alert history object {object_key} reads as RLOG version {version}, newer than this build \
+     reads; refusing the tick rather than folding alert state without it"
 )]
 struct UnreadableHistoryVersion {
     object_key: String,
@@ -804,9 +804,11 @@ pub struct AlertEvalReport {
     /// evaluated at all. A corrupt or unreachable object aborts the fold
     /// rather than leaving a partial history, which would re-fire an alert
     /// that is already firing. An object whose bytes match its commit record's
-    /// content hash but whose RLOG version this build cannot read refuses the
-    /// tick the same way (ADR-4233 decision 4, hazard H3), and is also counted
-    /// in `ravel_alert_history_records_skipped_total`.
+    /// content hash but whose RLOG version is newer than this build reads
+    /// refuses the tick the same way (ADR-4233 decision 4, hazard H3), and is
+    /// also counted in `ravel_alert_history_newer_version_refusals_total`. One
+    /// whose version is older than this build reads is the exception: it is
+    /// skipped and counted instead (ADR-2708 decision D6).
     pub history_unavailable: bool,
     /// `true` when another replica held the tenant's alert lease this tick, so
     /// this replica skipped rule evaluation. Expected steady state in a
@@ -887,14 +889,14 @@ impl AlertTickOutcome {
     }
 }
 
-/// Why the history fold refused its tick on an alert object, the `reason`
-/// dimension of `ravel_alert_history_records_skipped_total`. Before ADR-4233
-/// decision 4 this reason meant a skipped object (ADR-2708 decision D6); it
-/// now means a refused tick, and the family name is kept for scrape
-/// compatibility.
+/// Why the history fold skipped an alert object instead of aborting, the
+/// `reason` dimension of `ravel_alert_history_records_skipped_total`
+/// (ADR-2708 decision D6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlertHistorySkipReason {
-    /// The object's RLOG trailer names a version this build cannot read.
+    /// The object's RLOG trailer names a version older than this build's
+    /// reader window. A version newer than the window refuses the tick instead
+    /// (ADR-4233 decision 4, hazard H3).
     UnsupportedVersion,
 }
 
@@ -937,13 +939,14 @@ pub struct AlertMetrics {
     ticks_lease_not_held: AtomicU64,
     ticks_lease_unavailable: AtomicU64,
     ticks_history_unavailable: AtomicU64,
-    /// Ticks the history fold refused as
-    /// [`AlertHistorySkipReason::UnsupportedVersion`] (ADR-4233 decision 4,
-    /// hazard H3), counted once per fold that read such an object. Because a
-    /// refused tick writes no memo, the object stays in every later fold, so
-    /// this rises every tick until the object is retired or the build is
-    /// upgraded.
+    /// Alert objects the history fold skipped as
+    /// [`AlertHistorySkipReason::UnsupportedVersion`], counted once per fold
+    /// that read one.
     history_skipped_unsupported_version: AtomicU64,
+    /// Ticks the history fold refused on an object whose RLOG version is newer
+    /// than this build reads (ADR-4233 decision 4, hazard H3), counted once
+    /// per refused fold.
+    history_refused_newer_version: AtomicU64,
     /// Unix nanoseconds of the last tick that reached its end, from the
     /// injected clock; `0` until one does. Every other figure here is
     /// cumulative and stops moving when the loop dies, so only this gauge's age
@@ -1046,11 +1049,19 @@ impl AlertMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Ticks the history fold refused for `reason` (ADR-4233 decision 4). The
-    /// accessor keeps the pre-refusal name to match the retained
-    /// `ravel_alert_history_records_skipped_total` family.
     pub fn history_records_skipped(&self, reason: AlertHistorySkipReason) -> u64 {
         self.history_skip_counter(reason).load(Ordering::Relaxed)
+    }
+
+    fn record_history_refusal_newer_version(&self) {
+        self.history_refused_newer_version
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Ticks the history fold refused on a newer-version object, rendered as
+    /// `ravel_alert_history_newer_version_refusals_total`.
+    pub fn history_newer_version_refusals(&self) -> u64 {
+        self.history_refused_newer_version.load(Ordering::Relaxed)
     }
 
     pub fn ticks(&self, outcome: AlertTickOutcome) -> u64 {
@@ -2358,17 +2369,27 @@ impl AlertEvaluator {
     /// being skipped: a partial history would look like "this alert is not
     /// firing" and re-fire an alert that already is.
     ///
-    /// An RLOG object whose version this build cannot read and whose bytes
-    /// match the commit record's content hash is a genuine forward-version
-    /// object, not a bit flip (ADR-4233 decision 4, hazard H3). The fold
-    /// refuses the tick on it: it returns [`UnreadableHistoryVersion`],
-    /// counted in `ravel_alert_history_records_skipped_total` and logged with
-    /// its key. `evaluate_tick` turns that error into a `history_unavailable`
-    /// outcome, keeping the previous durable state and writing no transition,
-    /// rather than rebuilding alert state without the object and re-firing or
-    /// dropping whatever transitions it held. One whose bytes do not match the
-    /// content hash is corrupt and aborts the read like any other malformed
-    /// entry, without moving the counter.
+    /// An RLOG object whose version is outside this build's reader window and
+    /// whose bytes match the commit record's content hash is split by which
+    /// side of the window it falls on. One whose bytes do not match is corrupt
+    /// and aborts the read like any other malformed entry, moving neither
+    /// counter.
+    ///
+    /// - Newer than the window: written by a newer build (ADR-4233 decision 4,
+    ///   hazard H3). The fold refuses the tick: it returns
+    ///   [`UnreadableHistoryVersion`], counted in
+    ///   `ravel_alert_history_newer_version_refusals_total` and logged with its
+    ///   key. `evaluate_tick` turns that into a `history_unavailable` outcome,
+    ///   keeping the previous durable state and writing no transition, rather
+    ///   than rebuilding alert state without the object.
+    /// - Older than the window: left over from before a format bump (ADR-2708
+    ///   decision D6). It is skipped, counted in
+    ///   `ravel_alert_history_records_skipped_total` and logged with its key,
+    ///   so it does not stop every rule of the tenant. The alert the object
+    ///   held falls back to its memo copy, else to the newest readable
+    ///   transition for it, else to absent. The skipped object is older than
+    ///   every readable one, so the worst outcome is one duplicate
+    ///   notification, inside the at-least-once contract (ADR-0043).
     async fn fold_commit_entries(
         &self,
         entries: Vec<ObjectMeta>,
@@ -2414,21 +2435,34 @@ impl AlertEvaluator {
                     if blake3::hash(&object.data).as_bytes().as_slice()
                         == commit.content_hash.as_slice() =>
                 {
+                    // The reader window is contiguous, so a version it rejects
+                    // is either above its newest or below its oldest.
+                    if version > ravel_logseg::footer::SUPPORTED_VERSIONS.newest() {
+                        tracing::warn!(
+                            tenant = %self.tenant.to_hex(),
+                            object_key = %data_key,
+                            version,
+                            "alert evaluation: refusing the tick, an alert history object has an \
+                             RLOG version newer than this build reads; keeping the previous state \
+                             and writing no transition"
+                        );
+                        self.metrics.record_history_refusal_newer_version();
+                        return Err(UnreadableHistoryVersion {
+                            object_key: data_key.to_string(),
+                            version,
+                        }
+                        .into());
+                    }
                     tracing::warn!(
                         tenant = %self.tenant.to_hex(),
                         object_key = %data_key,
                         version,
-                        "alert evaluation: refusing the tick, an alert history object has an RLOG \
-                         version this build cannot read; keeping the previous state and writing no \
-                         transition"
+                        "alert evaluation: skipping an alert history object whose RLOG version \
+                         is older than this build reads"
                     );
                     self.metrics
                         .record_history_skip(AlertHistorySkipReason::UnsupportedVersion);
-                    return Err(UnreadableHistoryVersion {
-                        object_key: data_key.to_string(),
-                        version,
-                    }
-                    .into());
+                    continue;
                 }
                 Err(LogSegError::UnsupportedVersion(version)) => anyhow::bail!(
                     "alert history object {data_key} reads as RLOG version {version} but its \
@@ -4997,6 +5031,22 @@ mod tick_tests {
         ));
     }
 
+    /// The RLOG trailer version an object written by a newer build carries:
+    /// one past the newest this build reads.
+    const NEWER_VERSION: u16 = ravel_logseg::footer::SUPPORTED_VERSIONS.newest() + 1;
+
+    /// Rewrites an encoded alert object's trailer to [`NEWER_VERSION`]: the
+    /// shape of an object a newer build wrote before this one was rolled back
+    /// onto the bucket.
+    fn to_newer_version(bytes: &mut [u8]) {
+        ravel_logseg::footer::rewrite_trailer_version(bytes, NEWER_VERSION)
+            .expect("rewrite version");
+        assert!(matches!(
+            RlogReader::new(bytes, &RlogConfig::default()),
+            Err(LogSegError::UnsupportedVersion(NEWER_VERSION))
+        ));
+    }
+
     /// Flips the first byte of an encoded alert object, inside its first
     /// section rather than the trailer, and proves the result reads as
     /// corruption, not as an unsupported version.
@@ -5044,21 +5094,24 @@ mod tick_tests {
     }
 
     /// ADR-4233 decision 4 (hazard H3): an alert history object whose RLOG
-    /// version this build cannot read, and whose bytes match the commit
+    /// version is newer than this build reads, and whose bytes match the commit
     /// record's content hash, refuses the whole tick. The fold returns the
     /// typed [`UnreadableHistoryVersion`]; the tick reports `history_unavailable`
     /// and evaluates no rule; and nothing is written: no commit record, no data
     /// object, no state memo. The previous durable state (here none) is left
     /// exactly as it was.
     ///
-    /// Watch it fail against three wrong implementations:
-    /// - the pre-ADR-4233 skip (`continue` in `fold_commit_entries`): the tick
-    ///   evaluates, `outcome` is `Evaluated`, and the live rule writes a record.
+    /// Watch it fail against four wrong implementations:
+    /// - a split that skips a newer version as D6 skips an older one (`continue`
+    ///   on every out-of-window version): the tick evaluates, `outcome` is
+    ///   `Evaluated`, and the live rule writes a record.
+    /// - a split on `version < oldest` that refuses older and skips everything
+    ///   else: the same.
     /// - a refusal that still writes the memo: the post-tick store holds the
     ///   `a/state/latest` memo key, so the before/after key sets differ.
     /// - a refusal that does not count: the counter assertion reads 0.
     #[tokio::test]
-    async fn unreadable_history_version_refuses_tick_and_writes_nothing() {
+    async fn a_newer_version_object_refuses_the_tick_and_writes_nothing() {
         let store = seeded_store().await;
         let metrics = Arc::new(AlertMetrics::default());
         let mut ev = evaluator_with(
@@ -5071,16 +5124,8 @@ mod tick_tests {
             rule_id: "older-rule".to_string(),
             ..threshold_rule()
         };
-        let unreadable =
-            build_transition_record(&other, AlertState::Firing, 1, NOW_NS - NS_PER_SEC);
-        seed_alert_object_with(
-            &ev,
-            &unreadable,
-            10_000,
-            PRE_BUMP_VERSION,
-            to_pre_bump_version,
-        )
-        .await;
+        let newer = build_transition_record(&other, AlertState::Firing, 1, NOW_NS - NS_PER_SEC);
+        seed_alert_object_with(&ev, &newer, 10_000, NEWER_VERSION, to_newer_version).await;
 
         let tenant_prefix = format!("t/{}/", ev.tenant.to_hex());
         let before = list_keys(store.as_ref(), &tenant_prefix).await;
@@ -5099,9 +5144,14 @@ mod tick_tests {
         assert_eq!(report.rules_evaluated, 0);
         assert_eq!(report.records_written, 0);
         assert_eq!(
-            metrics.history_records_skipped(AlertHistorySkipReason::UnsupportedVersion),
+            metrics.history_newer_version_refusals(),
             1,
             "the refused tick is counted once"
+        );
+        assert_eq!(
+            metrics.history_records_skipped(AlertHistorySkipReason::UnsupportedVersion),
+            0,
+            "a refused object is not counted as skipped"
         );
         assert_eq!(metrics.ticks(AlertTickOutcome::HistoryUnavailable), 1);
 
@@ -5121,25 +5171,27 @@ mod tick_tests {
         let err = ev
             .load_latest_records()
             .await
-            .expect_err("the full fold refuses the unreadable-version object");
-        assert!(
-            err.downcast_ref::<UnreadableHistoryVersion>().is_some(),
-            "the fold refuses with the typed UnreadableHistoryVersion, got {err:#}"
-        );
+            .expect_err("the full fold refuses the newer-version object");
+        let refusal = err
+            .downcast_ref::<UnreadableHistoryVersion>()
+            .unwrap_or_else(|| {
+                panic!("the fold refuses with UnreadableHistoryVersion, got {err:#}")
+            });
+        assert_eq!(refusal.version, NEWER_VERSION);
     }
 
-    /// The refusal stops the fold at the first unreadable object; it does not
-    /// count the object and keep folding. Two unreadable objects and the live
-    /// `high-cpu` rule: the tick refuses, counts exactly one refusal (not one
-    /// per object), evaluates no rule, and writes no transition.
+    /// The refusal stops the fold at the first newer-version object; it does
+    /// not count the object and keep folding. Two newer-version objects and the
+    /// live `high-cpu` rule: the tick refuses, counts exactly one refusal (not
+    /// one per object), evaluates no rule, and writes no transition.
     ///
     /// Watch it fail against an implementation that counts the object and
-    /// `continue`s instead of returning: it reads both unreadable objects
-    /// (counter 2), folds the empty remainder, evaluates `high-cpu` against the
-    /// seeded metric, and writes a firing transition (`records_written` 1,
-    /// `outcome` `Evaluated`).
+    /// `continue`s instead of returning: it reads both newer objects (counter
+    /// 2), folds the empty remainder, evaluates `high-cpu` against the seeded
+    /// metric, and writes a firing transition (`records_written` 1, `outcome`
+    /// `Evaluated`).
     #[tokio::test]
-    async fn unreadable_history_version_refusal_does_not_fold_past_the_object() {
+    async fn a_newer_version_refusal_does_not_fold_past_the_object() {
         let store = seeded_store().await;
         let metrics = Arc::new(AlertMetrics::default());
         let mut ev = evaluator_with(
@@ -5158,8 +5210,8 @@ mod tick_tests {
         };
         let rec_a = build_transition_record(&first, AlertState::Firing, 1, NOW_NS - 2 * NS_PER_SEC);
         let rec_b = build_transition_record(&second, AlertState::Firing, 1, NOW_NS - NS_PER_SEC);
-        seed_alert_object_with(&ev, &rec_a, 10_000, PRE_BUMP_VERSION, to_pre_bump_version).await;
-        seed_alert_object_with(&ev, &rec_b, 10_001, PRE_BUMP_VERSION, to_pre_bump_version).await;
+        seed_alert_object_with(&ev, &rec_a, 10_000, NEWER_VERSION, to_newer_version).await;
+        seed_alert_object_with(&ev, &rec_b, 10_001, NEWER_VERSION, to_newer_version).await;
 
         let report = ev.run_tick().await;
 
@@ -5167,23 +5219,23 @@ mod tick_tests {
         assert_eq!(report.rules_evaluated, 0);
         assert_eq!(report.records_written, 0);
         assert_eq!(
-            metrics.history_records_skipped(AlertHistorySkipReason::UnsupportedVersion),
+            metrics.history_newer_version_refusals(),
             1,
-            "one refusal per tick, not one per unreadable object"
+            "one refusal per tick, not one per newer-version object"
         );
     }
 
     /// A refused tick does not rewrite the state memo. With a prior memo holding
-    /// a firing alert and a newer unreadable-version object in the tail, the
-    /// tick refuses and the memo is left as it was, rather than rebuilt from a
-    /// fold that dropped the object.
+    /// a firing alert and a newer-version object in the tail, the tick refuses
+    /// and the memo is left as it was, rather than rebuilt from a fold that
+    /// dropped the object.
     ///
     /// Watch it fail against a refusal that still reaches the memo-write path:
     /// it rewrites `a/state/latest` from the partial fold, moving the watermark
     /// to this tick's seal bound, so the memo's watermark after the tick differs
     /// from the one before.
     #[tokio::test]
-    async fn unreadable_history_version_refusal_leaves_the_prior_memo_intact() {
+    async fn a_newer_version_refusal_leaves_the_prior_memo_intact() {
         let store = seeded_store().await;
         let metrics = Arc::new(AlertMetrics::default());
         let mut ev = evaluator_with(
@@ -5206,24 +5258,13 @@ mod tick_tests {
             rule_id: "older-rule".to_string(),
             ..threshold_rule()
         };
-        let unreadable =
-            build_transition_record(&other, AlertState::Firing, 1, NOW_NS - NS_PER_SEC);
-        seed_alert_object_with(
-            &ev,
-            &unreadable,
-            10_000,
-            PRE_BUMP_VERSION,
-            to_pre_bump_version,
-        )
-        .await;
+        let newer = build_transition_record(&other, AlertState::Firing, 1, NOW_NS - NS_PER_SEC);
+        seed_alert_object_with(&ev, &newer, 10_000, NEWER_VERSION, to_newer_version).await;
 
         let report = ev.run_tick().await;
         assert_eq!(report.outcome(), AlertTickOutcome::HistoryUnavailable);
         assert_eq!(report.records_written, 0);
-        assert_eq!(
-            metrics.history_records_skipped(AlertHistorySkipReason::UnsupportedVersion),
-            1
-        );
+        assert_eq!(metrics.history_newer_version_refusals(), 1);
 
         let after = read_alert_state_memo(store.as_ref(), &ev.tenant)
             .await
@@ -5241,10 +5282,9 @@ mod tick_tests {
         );
     }
 
-    /// The refusal counter reaches the real `/metrics` rendering: a refused tick
-    /// moves `ravel_alert_history_records_skipped_total{reason="unsupported_version"}`
-    /// to 1 on the surface an operator scrapes, built from the live metrics
-    /// exactly as the handler builds it.
+    /// The refusal counter reaches the `/metrics` rendering: a refused tick
+    /// moves `ravel_alert_history_newer_version_refusals_total` to 1 and leaves
+    /// the skip family at 0, rendered from the live metrics handle.
     #[tokio::test]
     async fn a_refused_tick_renders_on_the_metrics_surface() {
         use crate::config::Mode;
@@ -5262,44 +5302,157 @@ mod tick_tests {
             rule_id: "older-rule".to_string(),
             ..threshold_rule()
         };
-        let unreadable =
-            build_transition_record(&other, AlertState::Firing, 1, NOW_NS - NS_PER_SEC);
+        let newer = build_transition_record(&other, AlertState::Firing, 1, NOW_NS - NS_PER_SEC);
+        seed_alert_object_with(&ev, &newer, 10_000, NEWER_VERSION, to_newer_version).await;
+
+        ev.run_tick().await;
+
+        let snapshot = AlertSnapshot {
+            history_skipped_unsupported_version: metrics
+                .history_records_skipped(AlertHistorySkipReason::UnsupportedVersion),
+            history_newer_version_refusals: metrics.history_newer_version_refusals(),
+            ..AlertSnapshot::default()
+        };
+        let mut out = String::new();
+        render_alert_family(&mut out, Mode::Query, &snapshot);
+        for expected in [
+            "ravel_alert_history_newer_version_refusals_total{mode=\"query\"} 1",
+            "ravel_alert_history_records_skipped_total{mode=\"query\",reason=\"unsupported_version\"} 0",
+        ] {
+            assert_eq!(
+                out.lines().filter(|line| *line == expected).count(),
+                1,
+                "{expected} renders exactly once on /metrics:\n{out}"
+            );
+        }
+    }
+
+    /// ADR-2708 decision D6, kept by ADR-4233 for an object older than the
+    /// reader window: an alert object at a retired RLOG version, sitting in the
+    /// fold's tail, is skipped and counted, and the tick still evaluates every
+    /// rule instead of reporting `history_unavailable` for the whole tenant.
+    ///
+    /// Watch it fail against two wrong splits in `fold_commit_entries`:
+    /// - refusing every out-of-window version (no split at all, the shape this
+    ///   test's predecessor pinned): the tick reports `history_unavailable`.
+    /// - refusing on `version != SUPPORTED_VERSIONS.newest()`: the same, since
+    ///   the pre-bump version is not the newest.
+    #[tokio::test]
+    async fn a_pre_bump_object_in_the_tail_is_skipped_and_rules_still_evaluate() {
+        let store = seeded_store().await;
+        let metrics = Arc::new(AlertMetrics::default());
+        let mut ev = evaluator_with(
+            Arc::clone(&store),
+            TestClock::at(NOW_NS),
+            Vec::new(),
+            Arc::clone(&metrics),
+        );
+        let other = Rule {
+            rule_id: "older-rule".to_string(),
+            ..threshold_rule()
+        };
+        let pre_bump = build_transition_record(&other, AlertState::Firing, 1, NOW_NS - NS_PER_SEC);
         seed_alert_object_with(
             &ev,
-            &unreadable,
+            &pre_bump,
             10_000,
             PRE_BUMP_VERSION,
             to_pre_bump_version,
         )
         .await;
+        write_empty_memo_at(store.as_ref(), &ev.tenant, pre_bump.ts_ns).await;
 
-        ev.run_tick().await;
+        let report = ev.run_tick().await;
 
-        // Build the snapshot the way the `/metrics` handler does from the live
-        // metrics handle, then render the alert family.
-        let snapshot = AlertSnapshot {
-            history_skipped_unsupported_version: metrics
-                .history_records_skipped(AlertHistorySkipReason::UnsupportedVersion),
-            ..AlertSnapshot::default()
-        };
-        let mut out = String::new();
-        render_alert_family(&mut out, Mode::Query, &snapshot);
-        let expected = "ravel_alert_history_records_skipped_total{mode=\"query\",reason=\"unsupported_version\"} 1";
+        assert_eq!(report.outcome(), AlertTickOutcome::Evaluated);
+        assert_eq!(report.rules_evaluated, 1, "the configured rule evaluates");
+        assert_eq!(report.records_written, 1, "the live condition fires");
         assert_eq!(
-            out.lines().filter(|line| *line == expected).count(),
-            1,
-            "the refused tick renders exactly once on /metrics:\n{out}"
+            metrics.history_records_skipped(AlertHistorySkipReason::UnsupportedVersion),
+            1
+        );
+        assert_eq!(metrics.history_newer_version_refusals(), 0);
+        assert_eq!(metrics.ticks(AlertTickOutcome::Evaluated), 1);
+        assert_eq!(metrics.ticks(AlertTickOutcome::HistoryUnavailable), 0);
+    }
+
+    /// An older out-of-window object is skipped and alert state is rebuilt from
+    /// the readable objects around it. A cold fold over a pre-bump object for
+    /// `older-rule` and a readable firing transition for the live `high-cpu`
+    /// rule: the tick evaluates, finds `high-cpu` already firing from the
+    /// readable object so writes no new transition, and writes a memo that
+    /// carries `high-cpu` as firing and nothing for `older-rule`.
+    ///
+    /// Watch it fail against the same two wrong splits as the test above: each
+    /// refuses the tick, so `outcome` is `history_unavailable` and no memo is
+    /// written.
+    #[tokio::test]
+    async fn a_pre_bump_object_is_skipped_and_state_rebuilt_from_readable_objects() {
+        let store = seeded_store().await;
+        let metrics = Arc::new(AlertMetrics::default());
+        let mut ev = evaluator_with(
+            Arc::clone(&store),
+            TestClock::at(NOW_NS),
+            Vec::new(),
+            Arc::clone(&metrics),
+        );
+        let older = Rule {
+            rule_id: "older-rule".to_string(),
+            ..threshold_rule()
+        };
+        let live = threshold_rule();
+        let pre_bump =
+            build_transition_record(&older, AlertState::Firing, 1, NOW_NS - 2 * NS_PER_SEC);
+        let readable = build_transition_record(&live, AlertState::Firing, 1, NOW_NS - NS_PER_SEC);
+        seed_alert_object_with(
+            &ev,
+            &pre_bump,
+            10_000,
+            PRE_BUMP_VERSION,
+            to_pre_bump_version,
+        )
+        .await;
+        seed_alert_object_with(&ev, &readable, 10_001, LOG_SEGMENT_FORMAT_VERSION, |_| {}).await;
+
+        let report = ev.run_tick().await;
+
+        assert_eq!(report.outcome(), AlertTickOutcome::Evaluated);
+        assert_eq!(report.rules_evaluated, 1);
+        assert_eq!(
+            report.records_written, 0,
+            "high-cpu is already firing from the readable object"
+        );
+        assert_eq!(
+            metrics.history_records_skipped(AlertHistorySkipReason::UnsupportedVersion),
+            1
+        );
+        assert_eq!(metrics.history_newer_version_refusals(), 0);
+        let memo = read_alert_state_memo(store.as_ref(), &ev.tenant)
+            .await
+            .expect("read memo")
+            .expect("the tick writes the memo past the skipped object");
+        let live_id = compute_alert_id(&live.rule_id, &live.labels);
+        let older_id = compute_alert_id(&older.rule_id, &older.labels);
+        assert_eq!(
+            memo.records.get(&live_id).map(|record| record.state),
+            Some(AlertState::Firing),
+            "the readable object's state is folded"
+        );
+        assert!(
+            !memo.records.contains_key(&older_id),
+            "the skipped object's alert is absent"
         );
     }
 
-    /// Only an unreadable version refuses with a count: an object whose payload
-    /// is corrupt still aborts the fold as plain corruption, the tick reports
-    /// `history_unavailable` and evaluates nothing, and the refusal counter does
-    /// not move.
+    /// Only an out-of-window version is skipped or refused with a count: an
+    /// object whose payload is corrupt still aborts the fold as plain
+    /// corruption, the tick reports `history_unavailable` and evaluates
+    /// nothing, and neither counter moves.
     ///
-    /// Watch it fail: in `fold_commit_entries`, widen the counted refusal to
-    /// every decode error (count and `return Err` for `Err(err)` too, and the
-    /// same for the `scan` error). The counter then reads 1.
+    /// Watch it fail: in `fold_commit_entries`, widen the skip to every decode
+    /// error (`Err(err) => { ...; continue; }` in place of
+    /// `Err(LogSegError::UnsupportedVersion(version))`, and the same for the
+    /// `scan` error). The tick then evaluates and the skip counter reads 1.
     #[tokio::test]
     async fn a_corrupt_object_still_aborts_the_fold() {
         let store = seeded_store().await;
@@ -5335,81 +5488,92 @@ mod tick_tests {
             metrics.history_records_skipped(AlertHistorySkipReason::UnsupportedVersion),
             0
         );
+        assert_eq!(metrics.history_newer_version_refusals(), 0);
         assert_eq!(metrics.ticks(AlertTickOutcome::HistoryUnavailable), 1);
     }
 
     /// The trailer version is read before the footer CRC, so a bit flip in an
-    /// object's version bytes reads as `UnsupportedVersion` too. Its bytes no
-    /// longer match the commit record's content hash, and that mismatch makes
-    /// it corruption: the fold aborts, the tick reports `history_unavailable`,
-    /// and the refusal counter does not move.
+    /// object's version bytes reads as `UnsupportedVersion` too, older or newer
+    /// than the window. Its bytes no longer match the commit record's content
+    /// hash, and that mismatch makes it corruption on either side: the fold
+    /// aborts, the tick reports `history_unavailable`, and neither the skip
+    /// counter nor the refusal counter moves.
     ///
     /// Watch it fail: in `fold_commit_entries`, drop the content-hash guard
-    /// from the `Err(LogSegError::UnsupportedVersion(version))` refusal arm. The
-    /// object is then counted as a refusal, and the counter reads 1.
+    /// from the `Err(LogSegError::UnsupportedVersion(version))` arm. The older
+    /// flip is then skipped (the tick evaluates, the skip counter reads 1) and
+    /// the newer flip is counted as a refusal (the refusal counter reads 1).
     #[tokio::test]
     async fn a_corrupt_trailer_version_aborts_the_fold_not_skips() {
-        let store = seeded_store().await;
-        let metrics = Arc::new(AlertMetrics::default());
-        let mut ev = evaluator_with(
-            Arc::clone(&store),
-            TestClock::at(NOW_NS),
-            Vec::new(),
-            Arc::clone(&metrics),
-        );
-        let other = Rule {
-            rule_id: "older-rule".to_string(),
-            ..threshold_rule()
-        };
-        let record = build_transition_record(&other, AlertState::Firing, 1, NOW_NS - NS_PER_SEC);
-        let mut bytes = encode_alert_object(&ev, &record, 10_000);
-        let content_hash = *blake3::hash(&bytes).as_bytes();
-        // Overwrite the version bytes alone, leaving the trailer's CRC as the
-        // writer computed it.
-        let version_at = bytes.len() - ravel_logseg::footer::TRAILER_LEN + 8;
-        bytes[version_at..version_at + 2].copy_from_slice(&PRE_BUMP_VERSION.to_le_bytes());
-        assert!(matches!(
-            RlogReader::new(&bytes, &RlogConfig::default()),
-            Err(LogSegError::UnsupportedVersion(PRE_BUMP_VERSION))
-        ));
-        assert_ne!(blake3::hash(&bytes).as_bytes(), &content_hash);
-        ev.publish_as(
-            bytes,
-            10_000,
-            record.ts_ns,
-            content_hash,
-            u32::from(LOG_SEGMENT_FORMAT_VERSION),
-        )
-        .await
-        .expect("publish alert record");
-        write_empty_memo_at(store.as_ref(), &ev.tenant, record.ts_ns).await;
+        for flipped_to in [PRE_BUMP_VERSION, NEWER_VERSION] {
+            let store = seeded_store().await;
+            let metrics = Arc::new(AlertMetrics::default());
+            let mut ev = evaluator_with(
+                Arc::clone(&store),
+                TestClock::at(NOW_NS),
+                Vec::new(),
+                Arc::clone(&metrics),
+            );
+            let other = Rule {
+                rule_id: "older-rule".to_string(),
+                ..threshold_rule()
+            };
+            let record =
+                build_transition_record(&other, AlertState::Firing, 1, NOW_NS - NS_PER_SEC);
+            let mut bytes = encode_alert_object(&ev, &record, 10_000);
+            let content_hash = *blake3::hash(&bytes).as_bytes();
+            // Overwrite the version bytes alone, leaving the trailer's CRC as
+            // the writer computed it.
+            let version_at = bytes.len() - ravel_logseg::footer::TRAILER_LEN + 8;
+            bytes[version_at..version_at + 2].copy_from_slice(&flipped_to.to_le_bytes());
+            assert!(matches!(
+                RlogReader::new(&bytes, &RlogConfig::default()),
+                Err(LogSegError::UnsupportedVersion(v)) if v == flipped_to
+            ));
+            assert_ne!(blake3::hash(&bytes).as_bytes(), &content_hash);
+            ev.publish_as(
+                bytes,
+                10_000,
+                record.ts_ns,
+                content_hash,
+                u32::from(LOG_SEGMENT_FORMAT_VERSION),
+            )
+            .await
+            .expect("publish alert record");
+            write_empty_memo_at(store.as_ref(), &ev.tenant, record.ts_ns).await;
 
-        let report = ev.run_tick().await;
+            let report = ev.run_tick().await;
 
-        assert!(report.history_unavailable);
-        assert_eq!(report.outcome(), AlertTickOutcome::HistoryUnavailable);
-        assert_eq!(report.rules_evaluated, 0);
-        assert_eq!(report.records_written, 0);
-        assert_eq!(
-            metrics.history_records_skipped(AlertHistorySkipReason::UnsupportedVersion),
-            0
-        );
-        assert_eq!(metrics.ticks(AlertTickOutcome::HistoryUnavailable), 1);
+            assert!(report.history_unavailable, "version {flipped_to}");
+            assert_eq!(report.outcome(), AlertTickOutcome::HistoryUnavailable);
+            assert_eq!(report.rules_evaluated, 0);
+            assert_eq!(report.records_written, 0);
+            assert_eq!(
+                metrics.history_records_skipped(AlertHistorySkipReason::UnsupportedVersion),
+                0,
+                "version {flipped_to}"
+            );
+            assert_eq!(
+                metrics.history_newer_version_refusals(),
+                0,
+                "version {flipped_to}"
+            );
+            assert_eq!(metrics.ticks(AlertTickOutcome::HistoryUnavailable), 1);
+        }
     }
 
-    /// ADR-4233 decision 4 (hazard H3): a cold fold whose only record of an
-    /// alert is an unreadable-version object refuses the tick instead of
-    /// rebuilding state without it. No transition is written and, crucially, no
-    /// notification is re-queued from the incomplete fold: the sink sees nothing,
-    /// on this tick or any later one, until the object is retired or the build
-    /// is upgraded. No memo is written either, so every later tick is cold and
-    /// refuses the same way.
+    /// The cost ADR-2708 decision D6 accepts for an older out-of-window object,
+    /// pinned at its bound: a cold fold whose only record of a still-live alert
+    /// is a pre-bump object treats the alert as absent, so it fires again,
+    /// exactly once. Not zero (the skip must not swallow a live page) and not
+    /// two (the refire is written, the memo advances over it, and later ticks
+    /// see the alert as firing).
     ///
-    /// Watch it fail against the pre-ADR-4233 skip: it treats the alert as
-    /// absent, fires the live rule, writes a memo, and the sink sees exactly one
-    /// notification.
+    /// Watch it fail: make the skip suppress this tick's memo write (return
+    /// early from the memo refresh in `evaluate_tick` when a skip was counted).
+    /// The memo assertion then finds no memo after the first tick.
     #[tokio::test]
-    async fn a_cold_fold_over_an_unreadable_object_refuses_and_does_not_notify() {
+    async fn a_cold_fold_over_pre_bump_history_refires_a_live_alert_once() {
         let store = seeded_store().await;
         let clock = TestClock::at(NOW_NS);
         let metrics = Arc::new(AlertMetrics::default());
@@ -5421,15 +5585,79 @@ mod tick_tests {
             Arc::clone(&metrics),
         );
         let rule = threshold_rule();
-        let unreadable = build_transition_record(&rule, AlertState::Firing, 1, NOW_NS - NS_PER_SEC);
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+        let pre_bump = build_transition_record(&rule, AlertState::Firing, 1, NOW_NS - NS_PER_SEC);
         seed_alert_object_with(
             &ev,
-            &unreadable,
+            &pre_bump,
             10_000,
             PRE_BUMP_VERSION,
             to_pre_bump_version,
         )
         .await;
+        assert!(
+            read_alert_state_memo(store.as_ref(), &ev.tenant)
+                .await
+                .expect("read memo")
+                .is_none(),
+            "the first fold is cold"
+        );
+
+        let first = ev.run_tick().await;
+        assert_eq!(first.outcome(), AlertTickOutcome::Evaluated);
+        assert_eq!(first.records_written, 1, "the live alert is fired again");
+        let memo = read_alert_state_memo(store.as_ref(), &ev.tenant)
+            .await
+            .expect("read memo")
+            .expect("the first tick writes the memo past the skipped object");
+        assert_eq!(
+            memo.records.get(&alert_id).map(|record| record.state),
+            Some(AlertState::Firing),
+            "the memo carries the refired alert"
+        );
+
+        for _ in 0..2 {
+            let later = ev.run_tick().await;
+            assert_eq!(later.outcome(), AlertTickOutcome::Evaluated);
+            assert_eq!(later.records_written, 0, "no second transition");
+        }
+
+        assert_eq!(
+            sink.seen(),
+            vec![alert_id.to_hex()],
+            "exactly one notification for the live alert"
+        );
+        assert!(
+            metrics.history_records_skipped(AlertHistorySkipReason::UnsupportedVersion) >= 1,
+            "the pre-bump object was skipped, not read"
+        );
+    }
+
+    /// ADR-4233 decision 4 (hazard H3): a cold fold whose only record of an
+    /// alert is a newer-version object refuses the tick instead of rebuilding
+    /// state without it. No transition is written and no notification is
+    /// re-queued from the incomplete fold: the sink sees nothing on any of the
+    /// three ticks. No memo is written either, so every later tick is cold and
+    /// refuses the same way.
+    ///
+    /// Watch it fail against a split that skips a newer version as D6 skips an
+    /// older one: it treats the alert as absent, fires the live rule, writes a
+    /// memo, and the sink sees exactly one notification.
+    #[tokio::test]
+    async fn a_cold_fold_over_a_newer_version_object_refuses_and_does_not_notify() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let metrics = Arc::new(AlertMetrics::default());
+        let sink = recording_sink(Arc::clone(&clock), 0, "200 OK").await;
+        let mut ev = evaluator_with(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            vec![AlertSink::webhook(sink.url.clone())],
+            Arc::clone(&metrics),
+        );
+        let rule = threshold_rule();
+        let newer = build_transition_record(&rule, AlertState::Firing, 1, NOW_NS - NS_PER_SEC);
+        seed_alert_object_with(&ev, &newer, 10_000, NEWER_VERSION, to_newer_version).await;
 
         for _ in 0..3 {
             let report = ev.run_tick().await;
@@ -5449,7 +5677,7 @@ mod tick_tests {
             "a refused tick re-queues no notification from the incomplete fold"
         );
         assert_eq!(
-            metrics.history_records_skipped(AlertHistorySkipReason::UnsupportedVersion),
+            metrics.history_newer_version_refusals(),
             3,
             "one refusal counted per refused tick"
         );

@@ -7008,13 +7008,14 @@ pub struct AlertSnapshot {
     pub ticks_lease_unavailable: u64,
     /// Ticks that evaluated nothing because the alert history was unreadable.
     pub ticks_history_unavailable: u64,
-    /// Ticks the alert evaluator refused because an alert history object's RLOG
-    /// version is unreadable by this build (ADR-4233 decision 4, hazard H3).
-    /// Rendered as
-    /// `ravel_alert_history_records_skipped_total{reason="unsupported_version"}`,
-    /// the family name kept from when the object was skipped rather than the
-    /// tick refused.
+    /// Alert history objects the fold skipped because their RLOG version is
+    /// older than this build reads (ADR-2708 decision D6). Rendered as
+    /// `ravel_alert_history_records_skipped_total{reason="unsupported_version"}`.
     pub history_skipped_unsupported_version: u64,
+    /// Ticks the alert evaluator refused because an alert history object's RLOG
+    /// version is newer than this build reads (ADR-4233 decision 4, hazard H3).
+    /// Rendered as `ravel_alert_history_newer_version_refusals_total`.
+    pub history_newer_version_refusals: u64,
     /// Unix nanoseconds the alert loop last completed a tick, `0` if none has
     /// completed yet. Rendered as
     /// `ravel_alert_last_tick_completed_timestamp_seconds`; its age is the
@@ -7174,7 +7175,7 @@ pub(crate) fn render_alert_family(out: &mut String, mode: Mode, snapshot: &Alert
     write_header(
         out,
         "ravel_alert_history_records_skipped_total",
-        "Alert evaluation ticks the history fold refused because an alert history object carries an RLOG format version this build cannot read (ADR-4233 decision 4, hazard H3), by reason, counted once per fold that read such an object. The family name is kept from when such an object was skipped rather than the tick refused (ADR-2708 decision D6). reason=\"unsupported_version\": an RLOG object whose format version this build cannot read and whose bytes match its commit record's content hash. The tick keeps the previous durable state and writes no transition, so the object stays in every later fold and this rises every tick until the object is retired or the build is upgraded. An object that reads as an unsupported version but does not match that hash is corrupt and fails the tick as history_unavailable without moving this counter. A warn log line names the tenant and object key.",
+        "Alert history objects (one transition record each) the alert evaluator's history fold skipped instead of aborting, by reason, counted once per fold that read one, so an object still in the fold's tail is counted again on each tick until the state memo's watermark passes its hour (ADR-2708 decision D6). reason=\"unsupported_version\": an RLOG object whose format version is older than this build reads and whose bytes match its commit record's content hash. An object newer than this build reads is not skipped: it refuses the tick and is counted in ravel_alert_history_newer_version_refusals_total (ADR-4233 decision 4). A skipped record's alert keeps its state memo copy, or on a full fold is treated as absent, so a still-live condition can notify once more. A warn log line names the tenant and object key.",
         "counter",
     );
     for reason in crate::alerting::AlertHistorySkipReason::ALL {
@@ -7190,6 +7191,19 @@ pub(crate) fn render_alert_family(out: &mut String, mode: Mode, snapshot: &Alert
             value,
         );
     }
+
+    write_header(
+        out,
+        "ravel_alert_history_newer_version_refusals_total",
+        "Alert evaluation ticks the history fold refused because an alert history object carries an RLOG format version newer than this build reads and its bytes match its commit record's content hash (ADR-4233 decision 4, hazard H3), counted once per refused fold. The tick reports outcome=\"history_unavailable\", keeps the previous durable state, and writes no transition and no state memo, so the object stays in every later fold and this rises on every tick that folds that history until the evaluator runs a build whose RLOG reader window includes that version. An object that reads as an out-of-window version but does not match that hash is corrupt and fails the tick without moving this counter. A warn log line names the tenant and object key.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_alert_history_newer_version_refusals_total",
+        &[Label::Mode(mode)],
+        snapshot.history_newer_version_refusals,
+    );
 
     // The liveness gauge, and the only figure in this family that moves when
     // the loop STOPS rather than when it runs. Every counter above is
@@ -9840,6 +9854,7 @@ pub fn render(
                 history_skipped_unsupported_version: metrics.history_records_skipped(
                     crate::alerting::AlertHistorySkipReason::UnsupportedVersion,
                 ),
+                history_newer_version_refusals: metrics.history_newer_version_refusals(),
                 last_tick_completed_unix_ns: metrics.last_tick_completed_unix_ns(),
             },
         );
@@ -13889,6 +13904,7 @@ mod tests {
             ticks_lease_unavailable: 9,
             ticks_history_unavailable: 10,
             history_skipped_unsupported_version: 14,
+            history_newer_version_refusals: 15,
             // 1_758_000_123_500_000_000 ns is 1758000123.5 s.
             last_tick_completed_unix_ns: 1_758_000_123_500_000_000,
         };
@@ -13906,6 +13922,7 @@ mod tests {
             "# TYPE ravel_alert_undelivered_notifications gauge",
             "# TYPE ravel_alert_ticks_total counter",
             "# TYPE ravel_alert_history_records_skipped_total counter",
+            "# TYPE ravel_alert_history_newer_version_refusals_total counter",
             "# TYPE ravel_alert_last_tick_completed_timestamp_seconds gauge",
         ] {
             assert_eq!(
@@ -13929,6 +13946,7 @@ mod tests {
             "ravel_alert_ticks_total{mode=\"query\",outcome=\"lease_unavailable\"} 9",
             "ravel_alert_ticks_total{mode=\"query\",outcome=\"history_unavailable\"} 10",
             "ravel_alert_history_records_skipped_total{mode=\"query\",reason=\"unsupported_version\"} 14",
+            "ravel_alert_history_newer_version_refusals_total{mode=\"query\"} 15",
             "ravel_alert_last_tick_completed_timestamp_seconds{mode=\"query\"} 1758000123.5",
         ] {
             assert_eq!(
@@ -13948,18 +13966,23 @@ mod tests {
         assert_eq!(tick_samples, 4, "one series per outcome, always:\n{out}");
     }
 
-    /// The history skip counter renders its zero before any skip, so an alert
-    /// rule's `increase()` over it is defined from the first scrape.
+    /// The history skip and refusal counters render their zero before any skip
+    /// or refusal, so an alert rule's `increase()` over either is defined from
+    /// the first scrape.
     #[test]
     fn alert_history_skip_counter_renders_zero_before_any_skip() {
         let mut out = String::new();
         render_alert_family(&mut out, Mode::All, &AlertSnapshot::default());
-        let expected = "ravel_alert_history_records_skipped_total{mode=\"all\",reason=\"unsupported_version\"} 0";
-        assert_eq!(
-            out.lines().filter(|line| *line == expected).count(),
-            1,
-            "expected exactly one `{expected}` sample line:\n{out}"
-        );
+        for expected in [
+            "ravel_alert_history_records_skipped_total{mode=\"all\",reason=\"unsupported_version\"} 0",
+            "ravel_alert_history_newer_version_refusals_total{mode=\"all\"} 0",
+        ] {
+            assert_eq!(
+                out.lines().filter(|line| *line == expected).count(),
+                1,
+                "expected exactly one `{expected}` sample line:\n{out}"
+            );
+        }
     }
 
     /// The scrape path reads the fold figures off the live `Catalog`, not off

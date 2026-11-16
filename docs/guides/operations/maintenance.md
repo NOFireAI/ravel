@@ -1958,9 +1958,11 @@ Limits:
 - Only metrics, logs and spans are ever folded: the server's fold loop and
   `ravel-cli catalog fold --signal` cover those three. No component folds
   alerts or audit, so those two signals have no catalog HEAD and the check
-  reports nothing for them. An alert object at a version this build cannot
-  read refuses the evaluator's tick, which is counted by the alert evaluator
-  itself (`ravel_alert_history_records_skipped_total`); no startup check
+  reports nothing for them. The alert evaluator itself counts an alert
+  object at a version this build cannot read: one older than this build
+  reads is skipped (`ravel_alert_history_records_skipped_total`), and one
+  newer refuses the evaluator's tick
+  (`ravel_alert_history_newer_version_refusals_total`). No startup check
   covers audit objects.
 - The version checked is the one the writer recorded in the catalog entry.
   The reader still checks each object's own trailer when it opens it.
