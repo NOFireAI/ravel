@@ -751,14 +751,30 @@ strip_code_span() {
 }
 
 # rust_literal_live <literal> <file.rs>: the literal occurs in the file on a
-# line that is not a comment (after leading whitespace, //, /* or *) and comes
-# before the file's first #[cfg(test)] line, so a commented-out or test-only
-# occurrence does not count. The literal is passed through the environment,
-# never as awk program text or -v, so backslashes stay literal.
+# line that is neither a comment nor part of a #[cfg(test)] item, so a
+# commented-out or test-only occurrence does not count. A comment is a line
+# starting with // after leading whitespace, or any line of a /* ... */ block
+# that starts a line. A #[cfg(test)] item is the item after the attribute
+# (and any further attributes): one line when it ends at that line, else
+# every line until its braces balance. Brace counting is textual, so a brace
+# inside a string or char literal in a test item can end the skip early or
+# late. The literal is passed through the environment, never as awk program
+# text or -v, so backslashes stay literal.
 rust_literal_live() {
     RUST_LITERAL="$1" awk '
-        /^[[:space:]]*#\[cfg\(test\)\]/ { exit }
-        /^[[:space:]]*(\/\/|\/\*|\*)/ { next }
+        function braces(s,   o, c) { o = gsub(/\{/, "{", s); c = gsub(/\}/, "}", s); return o - c }
+        in_block { if (index($0, "*/")) in_block = 0; next }
+        skipping { depth += braces($0); if (depth <= 0) skipping = 0; next }
+        /^[[:space:]]*#\[cfg\(test\)\]/ { pending = 1; next }
+        pending && /^[[:space:]]*(#\[|$)/ { next }
+        pending {
+            pending = 0
+            depth = braces($0)
+            if (depth > 0 || ($0 !~ /[;}][[:space:]]*$/)) skipping = 1
+            next
+        }
+        /^[[:space:]]*\/\// { next }
+        /^[[:space:]]*\/\*/ { if (!index(substr($0, index($0, "/*") + 2), "*/")) in_block = 1; next }
         index($0, ENVIRON["RUST_LITERAL"]) { found = 1; exit }
         END { exit !found }' "$2"
 }
@@ -811,6 +827,7 @@ check_antithesis_cell() {
     if [ "$kind" = sut ]; then
         case "$target" in
             /*|*..*) note "$where: sut: path '$target' must be repository-relative"; return 1 ;;
+            tests/*|*/tests/*) note "$where: sut: path '$target' is a test file, not code under test"; return 1 ;;
             *.rs) : ;;
             *) note "$where: sut: path '$target' is not a Rust (.rs) path"; return 1 ;;
         esac
@@ -955,7 +972,13 @@ check_traceability() {
         # later row of pipes and dashes is a data row and is checked as one.
         if [ "$after_header" -eq 1 ]; then
             after_header=0
-            [[ "$line" =~ $TRACE_DELIMITER_ROW ]] && continue
+            if [[ "$line" =~ $TRACE_DELIMITER_ROW ]]; then
+                if [ "${#TRACE_CELLS[@]}" -ne "$want" ]; then
+                    note "$area traceability: line $lineno: separator has ${#TRACE_CELLS[@]} cells, the table $want: $line"
+                    rc=1
+                fi
+                continue
+            fi
         fi
         if [ "${#TRACE_CELLS[@]}" -ne "$want" ]; then
             note "$area traceability: line $lineno: row has ${#TRACE_CELLS[@]} cells, the table $want: $line"

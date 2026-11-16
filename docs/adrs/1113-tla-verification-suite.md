@@ -615,9 +615,9 @@ sixth column and its check (issue #4330).
   `sut: <path.rs> -- <message>` (the file exists and holds `"<message>"`
   as a string literal), `driver: <workload> -- <message>` (a `.rs` file
   under `antithesis/<workload>/` holds it), or `none: <reason>`, a space
-  and then a non-empty reason. A literal on a comment line, after the
-  file's first `#[cfg(test)]` line, or (for `driver:` and mutants) in a
-  file under a `tests/` directory does not count.
+  and then a non-empty reason. A literal on a comment line, inside a
+  `#[cfg(test)]` item, or in a file under a `tests/` directory does not
+  count, and a `sut:` path under `tests/` fails.
   The ` -- ` separator keeps the path a whole token for the existing
   `crates/...` reference sweep.
 - A five-column table in an enrolled area fails `check-tla.sh

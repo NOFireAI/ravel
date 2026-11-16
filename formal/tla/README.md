@@ -238,9 +238,12 @@ three forms:
 
 The message must be the whole double-quoted literal: a substring of a longer
 literal or an unquoted occurrence does not count. A literal counts only on a
-line that is not a comment (`//`, `/*` or `*` after leading whitespace) and
-that comes before the file's first `#[cfg(test)]` line; for `driver:` and for
-mutants, files under a `tests/` directory are skipped too. The path and the
+line that is neither a comment (a line starting with `//`, or any line of a
+`/* ... */` block that starts a line) nor part of a `#[cfg(test)]` item (the
+item after the attribute, to the line where its braces balance). Brace
+counting is textual, so a brace inside a string in a test item can end the
+skip early or late. Files under a `tests/` directory are skipped, and a
+`sut:` path under one fails. The path and the
 message may each be wrapped in one backtick code span. The
 ` -- ` separator keeps the path a whole token, so the `crates/...` sweep above
 resolves it too. A five-column table in an enrolled area fails, and so does a
