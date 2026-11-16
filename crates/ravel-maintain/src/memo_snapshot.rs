@@ -13,9 +13,10 @@
 //! heartbeats under (the ADR-0057 self-owned-snapshot convention). The write is
 //! [`PutMode::Overwrite`] -- one writer per key, no CAS, no contention. On
 //! startup, and whenever a membership change moves ownership of a unit to this
-//! process, the worker lists this prefix and GETs every sibling's snapshot (its
+//! process, the worker lists this prefix and GETs the siblings' snapshots (its
 //! own previous one included) modified within [`MEMO_SNAPSHOT_MTIME_SKIP_NS`],
-//! seeding its in-memory [`crate::scan::MaintainMemo`]
+//! up to a fixed per-reseed budget of objects and bytes ([`MemoReseedBudget`],
+//! issue #3211), seeding its in-memory [`crate::scan::MaintainMemo`]
 //! from the freshest non-stale entries for the units it now owns rather than
 //! starting cold.
 //!
@@ -42,6 +43,9 @@
 //! This is **not** a lease: like the heartbeat prefix beside it, the memo
 //! prefix is membership/warm-start state, distinct from the GC reader-protection
 //! [`crate::sweep::LeaseCheck`] gate (ADR-0065 decision 1's naming split).
+
+use std::cmp::Reverse;
+use std::collections::HashSet;
 
 use ravel_fleet::worker_set::{MaintainRecordKeys, mtime_stale, reap_horizon_ns};
 use ravel_object_store::{
@@ -117,9 +121,50 @@ fn process_id_of(key: &str) -> Option<Uuid> {
 /// [`ravel_fleet::worker_set::REAP_WINDOW_FACTOR`]), so 2 hours.
 pub const MEMO_SNAPSHOT_MTIME_SKIP_NS: i64 = reap_horizon_ns(DEFAULT_MEMO_SNAPSHOT_STALENESS_NS);
 
-/// List `sys/maintain/memo/` and GET every snapshot object under it that the
+/// Most memo snapshot objects one [`read_all_memo_snapshots`] call GETs: 256.
+/// Sized for a deployment of up to 64 maintain processes, each with its live
+/// snapshot plus the snapshots of up to three earlier incarnations (every
+/// process start takes a fresh id) still inside the 2-hour
+/// [`MEMO_SNAPSHOT_MTIME_SKIP_NS`] window: 64 * 4 = 256.
+pub const MAX_MEMO_RESEED_OBJECTS: usize = 256;
+
+/// Most listed snapshot bytes one [`read_all_memo_snapshots`] call GETs: 1 GiB,
+/// 32 snapshots at the [`MAX_MEMO_SNAPSHOT_BYTES`] cap. Honest snapshots that
+/// average up to 4 MiB all fit beside [`MAX_MEMO_RESEED_OBJECTS`]
+/// (256 * 4 MiB = 1 GiB).
+pub const MAX_MEMO_RESEED_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The per-reseed read budget of [`read_all_memo_snapshots`] (issue #3211):
+/// how many snapshot objects, and how many listed bytes, one call may GET,
+/// whatever number of objects sits under [`MEMO_PREFIX`]. Production uses
+/// [`MemoReseedBudget::DEFAULT`]; tests inject small budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoReseedBudget {
+    /// Most objects one read GETs.
+    pub max_objects: usize,
+    /// Most bytes one read GETs, summed over the listed sizes of the objects
+    /// it reads.
+    pub max_bytes: u64,
+}
+
+impl MemoReseedBudget {
+    /// [`MAX_MEMO_RESEED_OBJECTS`] and [`MAX_MEMO_RESEED_BYTES`].
+    pub const DEFAULT: Self = Self {
+        max_objects: MAX_MEMO_RESEED_OBJECTS,
+        max_bytes: MAX_MEMO_RESEED_BYTES,
+    };
+}
+
+impl Default for MemoReseedBudget {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// List `sys/maintain/memo/` and GET the snapshot objects under it that the
 /// checks below do not reject unread (this process's own previous snapshot
-/// included), returning only those whose MAC
+/// included), at most `budget.max_objects` of them and at most
+/// `budget.max_bytes` of listed size, returning only those whose MAC
 /// verifies under `keys` for the process id named by the object's key
 /// (ADR-3130, memo snapshot amendment). Decoding and per-snapshot
 /// staleness/ownership filtering happen at the seed site
@@ -133,7 +178,8 @@ pub const MEMO_SNAPSHOT_MTIME_SKIP_NS: i64 = reap_horizon_ns(DEFAULT_MEMO_SNAPSH
 /// older than [`MEMO_SNAPSHOT_MTIME_SKIP_NS`] before `now_ns`
 /// ([`MemoSnapshotReject::Stale`], no GET); a listed size over
 /// `limits.max_bytes` ([`MemoSnapshotReject::Oversize`], no GET); an empty
-/// listed object ([`MemoSnapshotReject::Malformed`], no GET); then a range GET
+/// listed object ([`MemoSnapshotReject::Malformed`], no GET); outside the read
+/// budget ([`MemoSnapshotReject::OverBudget`], no GET); then a range GET
 /// of the cap plus one byte, whose body is
 /// [`MemoSnapshotReject::Oversize`] when longer than the cap, and otherwise
 /// goes through [`VerifiedSnapshot::verify`] (malformed, unknown tag, bad
@@ -142,6 +188,31 @@ pub const MEMO_SNAPSHOT_MTIME_SKIP_NS: i64 = reap_horizon_ns(DEFAULT_MEMO_SNAPSH
 /// [`MemoSnapshotLimits::DEFAULT`], whose byte cap is
 /// [`MAX_MEMO_SNAPSHOT_BYTES`] (issue #3199). Each reject is logged at debug
 /// with its key; the caller decides what to raise.
+///
+/// The budget (issue #3211) makes the GETs of one call at most
+/// `budget.max_objects`, a bound that does not grow with the number of objects
+/// under the prefix: a principal holding the `sys/maintain/*` write grant but
+/// not the key file can list any number of fresh, cap-sized objects under
+/// canonical UUID keys, and without the budget each reseed GETs and MACs every
+/// one before rejecting it. Objects that pass the unread checks are admitted in
+/// read priority, then read in listing order: first those whose key names a
+/// process in `live_set`, then the newest LIST modification time first, then
+/// listing order. Each admitted object is charged its listed size; an object
+/// that would take the read past `budget.max_bytes` is skipped and later,
+/// smaller ones are still admitted, and admission stops at `budget.max_objects`.
+/// The byte bound holds over listed sizes; a backend whose GET returns more
+/// than it listed can add at most the cap plus one byte per GET.
+///
+/// `live_set` holds only processes whose heartbeat verified under the same key
+/// file, so forged objects never displace a live writer's snapshot. The
+/// snapshot of a process that left recently, which a survivor needs for the
+/// handoff, has no such protection: it competes on modification time, and
+/// enough fresh forged objects push it past the budget. That is the accepted
+/// cost of the bound. The memo is advisory, so a skipped snapshot is a cold
+/// rescan for the units it would have seeded, never wrong maintenance. With no
+/// such flood, the snapshots of a few dozen live and recently departed
+/// processes are all read under [`MemoReseedBudget::DEFAULT`] as long as they
+/// average up to 4 MiB (256 of those fit in 1 GiB).
 ///
 /// The modification time check keeps the objects of processes long gone (a
 /// tag-1 object from before the upgrade, a snapshot MAC'd under a key since
@@ -159,41 +230,95 @@ pub async fn read_all_memo_snapshots(
     store: &dyn ObjectStoreBackend,
     keys: &MaintainRecordKeys,
     limits: MemoSnapshotLimits,
+    budget: MemoReseedBudget,
+    live_set: &[Uuid],
     now_ns: i64,
 ) -> Result<MemoSnapshotRead, StoreError> {
     let cap = limits.max_bytes;
     let objects = list_all(store, MEMO_PREFIX).await?;
     let mut read = MemoSnapshotRead::default();
-    for meta in objects {
-        let checked = check_object(store, keys, cap, now_ns, &meta).await?;
+    let mut candidates = Vec::new();
+    for meta in &objects {
+        match check_listed(cap, now_ns, meta) {
+            Ok(process_id) => candidates.push((process_id, meta)),
+            Err((reason, size)) => reject(&mut read, meta, reason, size, cap),
+        }
+    }
+    let admitted = admit(&candidates, budget, live_set);
+    for ((process_id, meta), admitted) in candidates.into_iter().zip(admitted) {
+        let checked = if admitted {
+            fetch_and_verify(store, keys, cap, meta, process_id).await?
+        } else {
+            Err((MemoSnapshotReject::OverBudget, meta.size))
+        };
         match checked {
             Ok(snapshot) => read.snapshots.push(snapshot),
-            Err((reason, size)) => {
-                tracing::debug!(
-                    key = %meta.key,
-                    size,
-                    cap,
-                    reason = reason.reason(),
-                    "maintenance: rejected a memo snapshot object"
-                );
-                read.rejects.record(reason);
-            }
+            Err((reason, size)) => reject(&mut read, meta, reason, size, cap),
         }
     }
     Ok(read)
 }
 
-/// One object of [`read_all_memo_snapshots`]: the verified snapshot, or the
-/// reject reason with the size it was judged at.
-async fn check_object(
-    store: &dyn ObjectStoreBackend,
-    keys: &MaintainRecordKeys,
+fn reject(
+    read: &mut MemoSnapshotRead,
+    meta: &ObjectMeta,
+    reason: MemoSnapshotReject,
+    size: u64,
+    cap: u64,
+) {
+    tracing::debug!(
+        key = %meta.key,
+        size,
+        cap,
+        reason = reason.reason(),
+        "maintenance: rejected a memo snapshot object"
+    );
+    read.rejects.record(reason);
+}
+
+/// Which of `candidates` (in listing order) [`read_all_memo_snapshots`] GETs
+/// under `budget`, chosen in the read priority its doc describes.
+fn admit(
+    candidates: &[(Uuid, &ObjectMeta)],
+    budget: MemoReseedBudget,
+    live_set: &[Uuid],
+) -> Vec<bool> {
+    let live: HashSet<&Uuid> = live_set.iter().collect();
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_by_key(|&index| {
+        let (process_id, meta) = candidates[index];
+        (
+            !live.contains(&process_id),
+            Reverse(meta.last_modified_unix_ms),
+            index,
+        )
+    });
+    let mut admitted = vec![false; candidates.len()];
+    let (mut objects, mut bytes) = (0usize, 0u64);
+    for index in order {
+        if objects >= budget.max_objects {
+            break;
+        }
+        let size = candidates[index].1.size;
+        let Some(after) = bytes.checked_add(size).filter(|&b| b <= budget.max_bytes) else {
+            continue;
+        };
+        admitted[index] = true;
+        objects += 1;
+        bytes = after;
+    }
+    admitted
+}
+
+/// The checks of [`read_all_memo_snapshots`] decided from the listing alone:
+/// the writer's process id, or the reject reason with the listed size.
+fn check_listed(
     cap: u64,
     now_ns: i64,
     meta: &ObjectMeta,
-) -> Result<Result<VerifiedSnapshot, (MemoSnapshotReject, u64)>, StoreError> {
+) -> Result<Uuid, (MemoSnapshotReject, u64)> {
     let Some(process_id) = process_id_of(&meta.key) else {
-        return Ok(Err((MemoSnapshotReject::NonUuidKey, meta.size)));
+        return Err((MemoSnapshotReject::NonUuidKey, meta.size));
     };
     // A backend that reports no modification time (`<= 0`, as MemoryStore's
     // default clock does) is never skipped here: the object falls through to
@@ -203,14 +328,26 @@ async fn check_object(
         meta.last_modified_unix_ms,
         MEMO_SNAPSHOT_MTIME_SKIP_NS,
     ) {
-        return Ok(Err((MemoSnapshotReject::Stale, meta.size)));
+        return Err((MemoSnapshotReject::Stale, meta.size));
     }
     if meta.size > cap {
-        return Ok(Err((MemoSnapshotReject::Oversize, meta.size)));
+        return Err((MemoSnapshotReject::Oversize, meta.size));
     }
     if meta.size == 0 {
-        return Ok(Err((MemoSnapshotReject::Malformed, 0)));
+        return Err((MemoSnapshotReject::Malformed, 0));
     }
+    Ok(process_id)
+}
+
+/// GET one admitted object of [`read_all_memo_snapshots`]: the verified
+/// snapshot, or the reject reason with the size it was judged at.
+async fn fetch_and_verify(
+    store: &dyn ObjectStoreBackend,
+    keys: &MaintainRecordKeys,
+    cap: u64,
+    meta: &ObjectMeta,
+    process_id: Uuid,
+) -> Result<Result<VerifiedSnapshot, (MemoSnapshotReject, u64)>, StoreError> {
     let got = match store
         .get(&meta.key, GetRange::Range(0, cap.saturating_add(1)))
         .await
@@ -233,7 +370,10 @@ async fn check_object(
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::scan::{MEMO_SNAPSHOT_MAC_BYTES, MIN_MEMO_SNAPSHOT_FRAME_BYTES, MaintainMemo};
+    use crate::scan::{
+        MAX_MEMO_SNAPSHOT_BYTES, MEMO_SNAPSHOT_MAC_BYTES, MIN_MEMO_SNAPSHOT_FRAME_BYTES,
+        MaintainMemo,
+    };
     use ravel_object_store::instrument::InstrumentedStore;
     use ravel_object_store::memory::MemoryStore;
 
@@ -269,9 +409,35 @@ mod tests {
     }
 
     async fn read_default(store: &dyn ObjectStoreBackend) -> MemoSnapshotRead {
-        read_all_memo_snapshots(store, &keys(), MemoSnapshotLimits::DEFAULT, NOW_NS)
-            .await
-            .expect("read")
+        read_all_memo_snapshots(
+            store,
+            &keys(),
+            MemoSnapshotLimits::DEFAULT,
+            MemoReseedBudget::DEFAULT,
+            &[],
+            NOW_NS,
+        )
+        .await
+        .expect("read")
+    }
+
+    /// [`read_all_memo_snapshots`] under `limits` and the default budget, with
+    /// no live writer.
+    async fn read_limited(
+        store: &dyn ObjectStoreBackend,
+        limits: MemoSnapshotLimits,
+        now_ns: i64,
+    ) -> MemoSnapshotRead {
+        read_all_memo_snapshots(
+            store,
+            &keys(),
+            limits,
+            MemoReseedBudget::DEFAULT,
+            &[],
+            now_ns,
+        )
+        .await
+        .expect("read")
     }
 
     #[test]
@@ -407,9 +573,7 @@ mod tests {
             .expect("write small");
 
         let before = store.metrics().snapshot();
-        let read = read_all_memo_snapshots(&store, &keys(), SMALL, NOW_NS)
-            .await
-            .expect("read");
+        let read = read_limited(&store, SMALL, NOW_NS).await;
         let after = store.metrics().snapshot();
 
         assert_eq!(read.rejects, only(MemoSnapshotReject::Oversize));
@@ -509,9 +673,7 @@ mod tests {
             .await
             .expect("write at cap");
 
-        let read = read_all_memo_snapshots(&store, &keys(), SMALL, NOW_NS)
-            .await
-            .expect("read");
+        let read = read_limited(&store, SMALL, NOW_NS).await;
         assert_eq!(read.rejects, only(MemoSnapshotReject::Oversize));
         assert_eq!(read.snapshots, vec![verified(at_id, &at_cap)]);
     }
@@ -655,9 +817,7 @@ mod tests {
     async fn a_missing_mtime_is_not_stale() {
         let store = InstrumentedStore::new(MemoryStore::new());
         write_leftovers(&store, 0).await;
-        let read = read_all_memo_snapshots(&store, &keys(), MemoSnapshotLimits::DEFAULT, i64::MAX)
-            .await
-            .expect("read");
+        let read = read_limited(&store, MemoSnapshotLimits::DEFAULT, i64::MAX).await;
         assert_eq!(read.rejects.get(MemoSnapshotReject::Stale), 0);
         assert_eq!(read.rejects.get(MemoSnapshotReject::UnknownTag), 1);
         assert_eq!(read.rejects.get(MemoSnapshotReject::BadMac), 1);
@@ -830,5 +990,200 @@ mod tests {
             .expect("decode");
         assert!(!stats.stale);
         assert_eq!(crate::scan::decode_calls::get() - before, 1);
+    }
+
+    /// The default budget is the derivation its doc gives: 64 processes times
+    /// four incarnations, and 32 snapshots at the byte cap, which is also 256
+    /// snapshots of 4 MiB.
+    #[test]
+    fn default_reseed_budget_matches_its_derivation() {
+        assert_eq!(MAX_MEMO_RESEED_OBJECTS, 64 * 4);
+        assert_eq!(MAX_MEMO_RESEED_BYTES, 32 * MAX_MEMO_SNAPSHOT_BYTES);
+        assert_eq!(MAX_MEMO_RESEED_BYTES, 256 * 4 * 1024 * 1024);
+        assert_eq!(
+            MemoReseedBudget::default(),
+            MemoReseedBudget {
+                max_objects: MAX_MEMO_RESEED_OBJECTS,
+                max_bytes: MAX_MEMO_RESEED_BYTES,
+            }
+        );
+    }
+
+    /// The store clock, in milliseconds, at the reader's [`NOW_NS`].
+    const NOW_MS: u64 = (NOW_NS / 1_000_000) as u64;
+    const HOUR_MS: u64 = 3_600_000;
+
+    /// Write `n` objects a principal without the key file can produce: a
+    /// tag-2 frame of exactly the [`SMALL`] byte cap, MAC'd under another
+    /// key, under fresh canonical UUID keys, with the store clock at
+    /// `mtime_ms`.
+    async fn plant_forged(store: &InstrumentedStore<MemoryStore>, n: u128, mtime_ms: u64) {
+        let cap = usize::try_from(SMALL.max_bytes).expect("cap fits usize");
+        let other = MaintainRecordKeys::from_file_keys(&[KEY_2]).expect("key");
+        store.inner().set_clock_ms(mtime_ms);
+        for i in 0..n {
+            let id = Uuid::from_u128(1000 + i);
+            let body = vec![0xA5u8; cap - MIN_MEMO_SNAPSHOT_FRAME_BYTES];
+            let forged = MaintainMemo::snapshot_bytes_from_body(&body, 3, &id, &other);
+            assert_eq!(forged.len(), cap);
+            write_memo_snapshot(store, &id, forged)
+                .await
+                .expect("write");
+        }
+    }
+
+    /// Write `id`'s honest 45-byte snapshot with the store clock at
+    /// `mtime_ms`, returning its bytes.
+    async fn plant_honest(
+        store: &InstrumentedStore<MemoryStore>,
+        id: Uuid,
+        mtime_ms: u64,
+    ) -> Vec<u8> {
+        let bytes = frame(id, &empty_body(), 3);
+        assert_eq!(bytes.len(), 45);
+        store.inner().set_clock_ms(mtime_ms);
+        write_memo_snapshot(store, &id, bytes.clone())
+            .await
+            .expect("write");
+        bytes
+    }
+
+    fn rejects_of(counts: &[(MemoSnapshotReject, usize)]) -> MemoSnapshotRejects {
+        let mut rejects = MemoSnapshotRejects::default();
+        for &(reason, count) in counts {
+            for _ in 0..count {
+                rejects.record(reason);
+            }
+        }
+        rejects
+    }
+
+    /// Read `store` under [`SMALL`] and `budget` with `live_set`, returning
+    /// the read and the GETs and GET bytes it issued.
+    async fn read_counting(
+        store: &InstrumentedStore<MemoryStore>,
+        budget: MemoReseedBudget,
+        live_set: &[Uuid],
+    ) -> (MemoSnapshotRead, u64, u64) {
+        let before = store.metrics().snapshot().get;
+        let read = read_all_memo_snapshots(store, &keys(), SMALL, budget, live_set, NOW_NS)
+            .await
+            .expect("read");
+        let after = store.metrics().snapshot().get;
+        (read, after.calls - before.calls, after.bytes - before.bytes)
+    }
+
+    /// Issue #3211: with an object budget of 3, a read over 4 forged objects
+    /// and one over 64 each issue exactly 3 GETs (557 bytes: the 45-byte live
+    /// snapshot and two 256-byte forgeries), and the rest are counted as over
+    /// budget, unread. The live writer's snapshot is read and verified in both
+    /// although its key lists last and its modification time is an hour older
+    /// than every forgery's: a live-set writer is read first.
+    #[tokio::test]
+    async fn reseed_gets_are_bounded_by_the_object_budget() {
+        let budget = MemoReseedBudget {
+            max_objects: 3,
+            max_bytes: u64::MAX,
+        };
+        let live = Uuid::from_u128(u128::MAX);
+        for n in [4u128, 64] {
+            let store = InstrumentedStore::new(MemoryStore::new());
+            plant_forged(&store, n, NOW_MS).await;
+            let honest = plant_honest(&store, live, NOW_MS - HOUR_MS).await;
+
+            let (read, calls, bytes) = read_counting(&store, budget, &[live]).await;
+            assert_eq!((calls, bytes), (3, 557), "GETs and GET bytes, n={n}");
+            assert_eq!(read.snapshots, vec![verified(live, &honest)], "n={n}");
+            let unread = usize::try_from(n).expect("small") - 2;
+            assert_eq!(
+                read.rejects,
+                rejects_of(&[
+                    (MemoSnapshotReject::BadMac, 2),
+                    (MemoSnapshotReject::OverBudget, unread),
+                ]),
+                "n={n}"
+            );
+        }
+    }
+
+    /// Issue #3211: with a byte budget of 768 (three [`SMALL`]-cap objects),
+    /// the live 45-byte snapshot and two 256-byte forgeries are read (557
+    /// bytes); every further forgery would pass 768 and is skipped, and a
+    /// 45-byte snapshot from a departed writer, older than every forgery,
+    /// still fits after them and is read and verified. Exactly 4 GETs of 602
+    /// bytes for 4 forged objects and for 64.
+    #[tokio::test]
+    async fn reseed_gets_are_bounded_by_the_byte_budget() {
+        let budget = MemoReseedBudget {
+            max_objects: usize::MAX,
+            max_bytes: 3 * SMALL.max_bytes,
+        };
+        let (live, departed) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        for n in [4u128, 64] {
+            let store = InstrumentedStore::new(MemoryStore::new());
+            plant_forged(&store, n, NOW_MS).await;
+            let live_bytes = plant_honest(&store, live, NOW_MS - HOUR_MS).await;
+            let departed_bytes = plant_honest(&store, departed, NOW_MS - HOUR_MS).await;
+
+            let (read, calls, bytes) = read_counting(&store, budget, &[live]).await;
+            assert_eq!((calls, bytes), (4, 602), "GETs and GET bytes, n={n}");
+            assert_eq!(
+                read.snapshots,
+                vec![
+                    verified(live, &live_bytes),
+                    verified(departed, &departed_bytes)
+                ],
+                "n={n}"
+            );
+            let unread = usize::try_from(n).expect("small") - 2;
+            assert_eq!(
+                read.rejects,
+                rejects_of(&[
+                    (MemoSnapshotReject::BadMac, 2),
+                    (MemoSnapshotReject::OverBudget, unread),
+                ]),
+                "n={n}"
+            );
+        }
+    }
+
+    /// A departed writer's snapshot (not in the live set) is read among
+    /// forged objects while they fit the budget, and when it is the newest
+    /// object. The accepted cost the read's doc names: enough forgeries
+    /// fresher than it push it past the budget, counted as over budget.
+    #[tokio::test]
+    async fn departed_snapshot_competes_on_modification_time() {
+        let budget = MemoReseedBudget {
+            max_objects: 8,
+            max_bytes: u64::MAX,
+        };
+        // Lists after every forgery, so only its modification time can put
+        // it ahead of them.
+        let departed = Uuid::from_u128(u128::MAX - 1);
+        let cases = [
+            // (forged, forged mtime, departed mtime, departed read)
+            (4u128, NOW_MS, NOW_MS - HOUR_MS, true),
+            (64, NOW_MS - HOUR_MS, NOW_MS, true),
+            (64, NOW_MS, NOW_MS - HOUR_MS, false),
+        ];
+        for (n, forged_ms, departed_ms, read_it) in cases {
+            let store = InstrumentedStore::new(MemoryStore::new());
+            plant_forged(&store, n, forged_ms).await;
+            let honest = plant_honest(&store, departed, departed_ms).await;
+            let (read, calls, _) = read_counting(&store, budget, &[]).await;
+            let n_usize = usize::try_from(n).expect("small");
+            assert_eq!(calls, u64::try_from(n_usize.min(7) + 1).expect("small"));
+            if read_it {
+                assert_eq!(read.snapshots, vec![verified(departed, &honest)], "n={n}");
+                assert_eq!(read.rejects.get(MemoSnapshotReject::BadMac), n_usize.min(7));
+            } else {
+                assert!(read.snapshots.is_empty(), "n={n}");
+                assert_eq!(read.rejects.get(MemoSnapshotReject::BadMac), 8);
+            }
+            assert_eq!(
+                read.rejects.get(MemoSnapshotReject::OverBudget),
+                n_usize + 1 - 8.min(n_usize + 1)
+            );
+        }
     }
 }
