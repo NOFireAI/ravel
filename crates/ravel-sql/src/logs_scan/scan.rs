@@ -1603,10 +1603,12 @@ impl LogScanStream {
     /// chunk's decoded `attrs_raw` entries and merge scratch are charged by
     /// [`build_row_batch`] for the length of the build.
     ///
-    /// With a row filter, each chunk's filter columns are built and filtered
-    /// first, and its other columns are built for the surviving rows only
-    /// ([`build_row_batch_filtered`]); a chunk the filter empties builds
-    /// nothing further and is skipped. `None` means the block's remaining rows
+    /// With a row filter, each chunk's filter columns are built without a
+    /// merge and filtered first, and its other columns are built for the
+    /// surviving rows only ([`build_row_batch_filtered`]; a chunk with a
+    /// pending erasure, or whose filter reads `attrs`, is built whole and then
+    /// filtered); a chunk the filter empties builds nothing further and is
+    /// skipped. `None` means the block's remaining rows
     /// all failed the filter and nothing was charged.
     fn emit_next_row_batch(&mut self) -> DFResult<Option<RecordBatch>> {
         self.reservation.shrink(std::mem::take(&mut self.emitted));

@@ -970,11 +970,7 @@ fn build_row_columns(
         None => (&[], &[]),
     };
     let overflow_len: usize = spans.iter().map(ExactSizeIterator::len).sum();
-    let max_overflow = spans
-        .iter()
-        .map(ExactSizeIterator::len)
-        .max()
-        .unwrap_or(0);
+    let max_overflow = spans.iter().map(ExactSizeIterator::len).max().unwrap_or(0);
     shape.attrs_merged.add(rows_len);
 
     // Each projected key column's slot in `key_cells`; a declared column and
@@ -9028,10 +9024,9 @@ mod row_path_tests {
         let declared = declared();
         let attr_keys = attr_keys();
         let (extended, full_len) = extended_schema(&declared, &attr_keys);
-        for (projection, merged_kept) in [
-            (vec![LOG_COL_TS], 0),
-            (vec![LOG_COL_TS, LOG_COL_ATTRS], 3),
-        ] {
+        for (projection, merged_kept) in
+            [(vec![LOG_COL_TS], 0), (vec![LOG_COL_TS, LOG_COL_ATTRS], 3)]
+        {
             let (build_projection, build_schema, filters) = k1_filter(&extended, &projection, 7);
             let shape = shape(
                 &build_schema,
