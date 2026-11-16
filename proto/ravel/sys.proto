@@ -93,8 +93,9 @@ message ProvisioningRecord {
   // future layout as v1 (matching TenancyMarker's format_version guard).
   //
   // Readers accept the SET {1, 2, 3, 4}. Writers stamp 3 on a record that
-  // carries neither compat field (8, 9) and 4 on one that carries either
-  // (ADR-4233 decision 4): version 4 is the compat fence, written only when a
+  // carries neither compat field (8, 9) and 4 on one that carries either, or
+  // that is already stamped 4 (ADR-4233 decision 4): version 4 is the compat
+  // fence, written only when a
   // bucket is fenced, so a binary whose reader stops at 3 refuses every write
   // path into a fenced bucket. The rewrite paths take a separate ceiling of 4
   // and refuse only a record above it.
@@ -1021,8 +1022,10 @@ message CompatFamily {
   bool contradicted = 9;              // decision 7, set by a late-write finding
 }
 
-// A family's reader-retirement certificate (ADR-4233 decision 7). Written once
-// under CAS by `compat certify`; nothing edits it afterwards.
+// A family's reader-retirement certificate (ADR-4233 decision 7), written
+// under CAS by `compat certify`. Its version never decreases; a later certify
+// replaces it whole, at a higher version or at the same version after a late
+// write was remedied.
 message Certificate {
   uint32 version = 1;                 // the certified version: every member at or above it
   sfixed64 certified_unix_ns = 2;

@@ -347,8 +347,10 @@ lowers it, and leaves a record already at or above the requested epoch
 untouched; only a raise from a record below version 4 sets
 `compat_fenced_unix_ns`, to the raise time, and a later raise keeps the
 stored value. A record created by `ravel_catalog::validate_or_adopt_fenced`
-with a compat epoch is born fenced: version 4, that epoch, and
-`compat_fenced_unix_ns` 0, because it holds no pre-fence data. The
+with a compat epoch for a bucket with no data is born fenced: version 4,
+that epoch, and `compat_fenced_unix_ns` 0, because it holds no pre-fence
+data. One that adopts a bucket already holding data is fenced at the
+adoption time instead, since some process wrote that data before the fence. The
 record is written with `CreateIfAbsent` at the tenant's first write for that signal
 (`ravel_catalog::validate_or_adopt`), so a racing loser re-reads and
 validates against the winner rather than erroring. It lives under the
