@@ -3,37 +3,38 @@
 //! them (`ravel-cli catalog fold --rebuild-key-index`, docs/catalog-and-mvcc.md
 //! "Rollout").
 //!
-//! The leaves are built by the fold's own leaf build from the same ranged
-//! KEY_IDX reads, in one pass with no pair budget. A fold closes a leaf at
-//! every pass end, so for a declared field a rebuilt leaf is byte-identical
-//! to the one a fold with `build_key_index_leaves` on writes for the same
-//! part only when that fold built the field in one pass, its pairs within
-//! its share of `key_index_build_max_pairs`; otherwise both tile the key
-//! space and answer every lookup the same, at different leaf boundaries.
-//! The fold also indexes fields a KEY_IDX section names that the tenant does
-//! not declare; the rebuild does not.
+//! The leaves are built by the fold's own incremental build
+//! (`build_part_key_index`) from the same ranged KEY_IDX reads, in the same
+//! passes under `key_index_build_max_pairs`, with no previous leaf to carry.
+//! Each field holds at most `max(share, R) + 1` pairs at a time, where
+//! `share = max(1, key_index_build_max_pairs / fields)` and `R` is the
+//! field's largest key8 run, so with no run over the share the part holds at
+//! most `key_index_build_max_pairs + fields` pairs, whatever its size. Each
+//! pass reads every entry's section again. With the same budget, a rebuilt
+//! leaf of a declared field is byte-identical to the one a fold with
+//! `build_key_index_leaves` on writes for the same part. The fold also
+//! indexes fields a KEY_IDX section names that the tenant does not declare;
+//! the rebuild does not, and since the share divides the budget by the
+//! fields built, its leaves match only where the fold built the same fields.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use bytes::Bytes;
-use futures::stream::{self, StreamExt};
 use ravel_codec::key_idx::KeyType;
 use ravel_object_store::{GetRange, PutMode, PutOptions, StoreError, UploadChecksum, Version};
 use ravel_proto::catalog::v1::{SnapshotHead, SnapshotKeyIndexLeafRef, SnapshotPartRef};
 use ravel_types::{Signal, TenantHash};
 
 use crate::catalog::Catalog;
-use crate::column_stats_build;
 use crate::config::DEFAULT_SNAPSHOT_PART_MAX_ENTRIES;
 use crate::error::CatalogError;
 use crate::fold::{
-    EntryKeyIndex, EntryKeyIndexRead, HeadState, MAX_HEAD_CAS_ATTEMPTS, RequestCounters,
-    build_part_key_index_leaves, declared_key_index_fields, head_object_key,
-    metrics_label_index_leaf_bytes_cap, newer_leaf_refusal, put_key_index_leaf,
-    read_entry_key_index,
+    HeadState, HeldLabelDicts, KeyIndexBuildCaller, KeyIndexBuildLimits, MAX_HEAD_CAS_ATTEMPTS,
+    RequestCounters, build_part_key_index, declared_key_index_fields, head_object_key,
+    key_index_leaf_limits, metrics_label_index_leaf_bytes_cap, newer_leaf_refusal,
 };
 use crate::snapshot_format::{
-    self, KeyIndexLeafLimits, key_index_leaf_format_version, key_index_leaf_prefix_range,
+    self, key_index_leaf_format_version, key_index_leaf_prefix_range,
     key_index_leaf_version_accepted, key_index_leaf_version_is_newer,
     key_index_leaf_versions_for_signal,
 };
@@ -106,9 +107,10 @@ pub struct KeyIndexRebuildReport {
     /// entries, or for one of their leaves' prefixes, failed with a store
     /// error; a rerun reads them again.
     pub parts_deferred: u64,
-    /// Leaves PUT, including any a lost CAS left unreferenced.
+    /// Leaves PUT, including any a lost CAS, a deferred part or a field over
+    /// the byte cap left unreferenced.
     pub leaves_written: u64,
-    /// Total bytes of those leaves.
+    /// Total bytes of those leaves, as uploaded.
     pub leaf_bytes_written: u64,
     /// Bytes the ranged GETs returned: footer suffixes, any extra footer
     /// ranges, and KEY_IDX sections, as transferred, retries excluded.
@@ -122,7 +124,8 @@ pub struct KeyIndexRebuildReport {
     /// Metrics parts given no `label_value` ref because their leaves would
     /// pass the byte cap
     /// [`CatalogConfig::metrics_label_index_max_ratio_ppm`](crate::CatalogConfig::metrics_label_index_max_ratio_ppm)
-    /// sets; no leaf of that field is PUT for them.
+    /// sets; no leaf of that field is PUT for them after the pass that
+    /// passed the cap.
     pub parts_over_cap: u64,
     /// Metrics parts left unindexed because a metrics erasure request was
     /// pending (or the pending listing failed): every part in
@@ -323,9 +326,11 @@ impl Catalog {
     /// undeclared `options.field`, before HEAD is read.
     ///
     /// Each part is read once and verified against its `blake3`; each of its
-    /// entries costs the fold's ranged KEY_IDX reads. The leaves are built and
-    /// PUT by the fold's own functions under the fold's key layout, then HEAD
-    /// is CAS-published with every part ref unchanged except its `key_index`.
+    /// entries costs the fold's ranged KEY_IDX reads once per pass. The leaves
+    /// are built and PUT by the fold's own build under the fold's key layout
+    /// and pair budget, [`crate::CatalogConfig::key_index_build_max_pairs`]
+    /// (see the module doc for the bound), then HEAD is CAS-published with
+    /// every part ref unchanged except its `key_index`.
     /// Writes no part, no `.csnap`, no `.cstat`, and lists nothing on logs
     /// and spans.
     ///
@@ -339,7 +344,8 @@ impl Catalog {
     /// unindexed part counted in [`KeyIndexRebuildReport::parts_erasure_gated`].
     /// A part whose leaves for a field would total more than the byte cap
     /// gains no ref for it and is counted in
-    /// [`KeyIndexRebuildReport::parts_over_cap`].
+    /// [`KeyIndexRebuildReport::parts_over_cap`]; the cap is checked at each
+    /// pass end, so leaves earlier passes PUT stay unreferenced.
     ///
     /// Parts go in batches (see [`KeyIndexRebuildOptions::batch_entries`]),
     /// one HEAD publish each, of up to the fold's CAS retry budget. A lost CAS
@@ -347,8 +353,9 @@ impl Catalog {
     /// new HEAD still names; it reads no section again. A part already holding
     /// a ref for every requested field costs no GET, and a part holding some
     /// keeps them and gains the rest. A part one of whose entries' ranged
-    /// GETs failed with a store error is deferred: it gains no ref this run,
-    /// so a rerun reads it again.
+    /// GETs failed with a store error is deferred once that pass's reads are
+    /// done, before its PUTs: it gains no ref this run, so a rerun reads it
+    /// again, and leaves earlier passes PUT stay unreferenced.
     ///
     /// On logs, whose reader refuses a version-1 leaf (ADR-3692 amendment
     /// "Leaf format version 2"), every ref of a requested field also costs
@@ -609,9 +616,10 @@ impl Catalog {
     ) -> Result<(), BatchError> {
         let mut attempt = KeyIndexRebuildAttempt::default();
         let mut counters = RequestCounters::default();
-        let mut reads: HashMap<String, EntryKeyIndex> = HashMap::new();
-        let mut failed_gets: HashSet<String> = HashSet::new();
         let mut built: Vec<BuiltPart> = Vec::new();
+        // A part the rebuild visits has no leaf for these fields, or only a
+        // refused one, so there is nothing to carry and no held dictionary.
+        let no_held = HeldLabelDicts::new(Vec::new(), 0);
         for target in batch {
             // A part an earlier batch's CAS loss showed replaced, or already
             // given the refs by someone else, costs nothing.
@@ -644,140 +652,62 @@ impl Catalog {
                         actual: format!("{} bytes", part.blake3.len()),
                     })?;
 
-            let data_keys: Vec<Result<String, EntryKeyIndex>> = entries
-                .iter()
-                .map(|entry| {
-                    column_stats_build::segment_data_key(tenant, signal, entry)
-                        .map_err(|e| Err(format!("data key: {e}")))
-                })
-                .collect();
-            let mut unread: Vec<(String, u64)> = Vec::new();
-            let mut queued: HashSet<&str> = HashSet::new();
-            for (entry, key) in entries.iter().zip(&data_keys) {
-                if let Ok(key) = key
-                    && !reads.contains_key(key)
-                    && queued.insert(key.as_str())
-                {
-                    unread.push((key.clone(), entry.object_size));
-                }
-            }
-            // Every section is read: the parts the rebuild visits have no leaf
-            // for these fields, or only a refused one, so there is no previous
-            // leaf to carry from, and the fold's incremental build does not
-            // apply.
-            let store = self.store();
-            let unread_ref = &unread;
-            let fresh: Vec<EntryKeyIndexRead> = stream::iter(0..unread.len())
-                .map(move |i| {
-                    let (key, object_size) = &unread_ref[i];
-                    read_entry_key_index(store, tenant, signal, key, *object_size)
-                })
-                .buffered(self.config().fold_bucket_concurrency.max(1))
-                .collect()
-                .await;
-            for ((key, _), read) in unread.into_iter().zip(fresh) {
-                attempt.ranged_gets += read.gets;
-                report.ranged_gets += read.gets;
-                report.section_bytes_read += read.bytes;
-                if read.get_failed {
-                    if let Err(reason) = &read.fields {
-                        tracing::warn!(
-                            tenant = %tenant.to_hex(),
-                            object_key = %key,
-                            reason = %reason,
-                            "KEY_IDX read GET failed; the parts naming this entry are deferred to a rerun"
-                        );
-                    }
-                    failed_gets.insert(key.clone());
-                }
-                reads.insert(key, read.fields);
-            }
-            let failed_entries = data_keys
-                .iter()
-                .filter(|key| matches!(key, Ok(key) if failed_gets.contains(key)))
-                .count();
-            if failed_entries > 0 {
+            let leaf_bytes_cap = (signal == Signal::Metrics).then(|| {
+                metrics_label_index_leaf_bytes_cap(
+                    entries.iter().map(|e| e.object_size).sum(),
+                    self.config().metrics_label_index_max_ratio_ppm,
+                )
+            });
+            // The fold's own passes under the pair budget: each field holds at
+            // most its share of `key_index_build_max_pairs` at a time.
+            let before = counters;
+            let leaves = build_part_key_index(
+                self.store(),
+                tenant,
+                signal,
+                part_blake3,
+                part.watermark_hour,
+                &entries,
+                &missing,
+                &[],
+                no_held.part(0),
+                &KeyIndexBuildLimits {
+                    leaf: key_index_leaf_limits(),
+                    max_pairs: self.config().key_index_build_max_pairs,
+                    concurrency: self.config().fold_bucket_concurrency,
+                    leaf_bytes_cap,
+                },
+                KeyIndexBuildCaller::Repair,
+                &mut counters,
+            )
+            .await?;
+            let ranged_gets = counters.key_index_ranged_gets - before.key_index_ranged_gets;
+            let leaf_puts = counters.put_requests - before.put_requests;
+            attempt.ranged_gets += ranged_gets;
+            attempt.leaf_puts += leaf_puts;
+            report.ranged_gets += ranged_gets;
+            report.section_bytes_read +=
+                counters.key_index_bytes_read - before.key_index_bytes_read;
+            report.leaves_written += leaf_puts;
+            report.leaf_bytes_written +=
+                counters.key_index_leaf_bytes_put - before.key_index_leaf_bytes_put;
+            if leaves.stopped_on_failed_get {
                 report.parts_deferred += 1;
                 tracing::warn!(
                     tenant = %tenant.to_hex(),
                     part_key = %part.key,
-                    failed_entries,
                     "a KEY_IDX GET failed for this part's entries; the part gains no key-index ref this run and a rerun reads it again"
                 );
                 continue;
             }
-            let not_read: EntryKeyIndex = Err("KEY_IDX not read".to_string());
-            let entry_fields: Vec<&EntryKeyIndex> = data_keys
-                .iter()
-                .map(|key| match key {
-                    Ok(key) => reads.get(key).unwrap_or(&not_read),
-                    Err(read) => read,
-                })
-                .collect();
-            // One pass with no pair budget, as the fold built before
-            // `key_index_build_max_pairs`: a rebuild part has no previous leaf
-            // to carry, and its reads are already held whole per batch.
-            let build = |fields: &[(String, KeyType)]| {
-                build_part_key_index_leaves(
-                    tenant,
-                    signal,
-                    part_blake3,
-                    fields,
-                    false,
-                    &entry_fields,
-                    &KeyIndexLeafLimits::default(),
-                    u64::MAX,
-                )
-            };
-            let mut leaves = build(&missing);
-            if signal == Signal::Metrics {
-                let cap = metrics_label_index_leaf_bytes_cap(
-                    entries.iter().map(|e| e.object_size).sum(),
-                    self.config().metrics_label_index_max_ratio_ppm,
-                );
-                let mut field_bytes: HashMap<&str, u64> = HashMap::new();
-                for leaf in &leaves.leaves {
-                    *field_bytes.entry(leaf.leaf_ref.field.as_str()).or_default() +=
-                        leaf.bytes.len() as u64;
-                }
-                let over: HashSet<String> = field_bytes
-                    .into_iter()
-                    .filter(|(_, bytes)| *bytes > cap)
-                    .map(|(field, _)| field.to_string())
-                    .collect();
-                if !over.is_empty() {
-                    tracing::warn!(
-                        tenant = %tenant.to_hex(),
-                        part_key = %part.key,
-                        cap,
-                        "the part's key-index leaves would exceed the byte cap; the part gains no ref for the field"
-                    );
-                    report.parts_over_cap += 1;
-                    let kept: Vec<(String, KeyType)> = missing
-                        .iter()
-                        .filter(|(field, _)| !over.contains(field))
-                        .cloned()
-                        .collect();
-                    leaves = build(&kept);
-                    leaves.uncovered_entries += entries.len() as u64 * over.len() as u64;
-                }
+            if leaves.over_cap {
+                report.parts_over_cap += 1;
             }
             report.uncovered_entries += leaves.uncovered_entries;
-            let mut refs = Vec::with_capacity(leaves.leaves.len());
-            for leaf in leaves.leaves {
-                attempt.leaf_puts += 1;
-                let leaf_ref =
-                    put_key_index_leaf(self.store(), tenant, signal, part.watermark_hour, leaf)
-                        .await
-                        .map_err(CatalogError::Store)?;
-                report.leaves_written += 1;
-                report.leaf_bytes_written += leaf_ref.size;
-                refs.push(leaf_ref);
-            }
-            if !refs.is_empty() {
+            if !leaves.refs.is_empty() {
                 built.push(BuiltPart {
                     part_blake3: part.blake3,
-                    refs,
+                    refs: leaves.refs,
                     replaces: target.replaces,
                 });
             }
@@ -899,13 +829,14 @@ mod tests {
     use crate::config::CatalogConfig;
     use crate::fold::KEY_INDEX_FOOTER_SUFFIX_LEN;
     use crate::fold::METRICS_LABEL_VALUE_FIELD;
+    use crate::fold::put_key_index_leaf;
     use crate::fold::tests::{
         KIDX_HOUR, USER_ID, assert_foreign_part_error, config, declare_user_id_key_index,
         fold_through, kidx_objects, matches, metrics_kidx_config, part_ordinals, probe_part,
         publish_label_fixture, publish_trace_spans, publish_user_id_logs,
         put_metrics_erasure_request, read_signal_head, repoint_head_at_foreign_part, tenant,
     };
-    use crate::snapshot_format::{KeyIndexLeafProbe, verify_key_index_leaf};
+    use crate::snapshot_format::{KeyIndexLeafLimits, KeyIndexLeafProbe, verify_key_index_leaf};
 
     /// Records every GET (key, range, bytes returned), every PUT key and every
     /// LIST. `head_race`, when set, is written over HEAD unconditionally just
@@ -1902,6 +1833,141 @@ mod tests {
         assert_eq!(fold_refs.len(), 1);
         assert_eq!(fold_refs, rebuild_head.parts[0].key_index);
         for leaf in &fold_refs {
+            let a = folded
+                .get(&leaf.key, GetRange::Full)
+                .await
+                .expect("fold leaf");
+            let b = rebuilt
+                .get(&leaf.key, GetRange::Full)
+                .await
+                .expect("rebuilt leaf");
+            assert_eq!(a.data, b.data, "{}", leaf.key);
+        }
+    }
+
+    /// Four logs objects of ten `user_id`s each, interleaved in key order
+    /// (object `seq` holds `i * 4 + seq` for `i` in `0..10`), two rows to a
+    /// block: one part of 40 (entry, key8) pairs, every key8 run one pair.
+    async fn forty_pair_part(store: &RecordingStore) -> Vec<(u64, i64, u32)> {
+        declare_user_id_key_index(store).await;
+        let mut placed = Vec::new();
+        for seq in 1..=4u64 {
+            let user_ids: Vec<i64> = (0..10).map(|i| i * 4 + seq as i64).collect();
+            for (row, v) in user_ids.iter().enumerate() {
+                placed.push((seq, *v, (row / 2) as u32));
+            }
+            publish_user_id_logs(store, seq, KIDX_HOUR, &user_ids, 2, 0, true).await;
+        }
+        placed
+    }
+
+    /// Issue #4018: the repair builds under the fold's pair budget. A part of
+    /// 40 `user_id` pairs, each key8 run one pair, rebuilt at
+    /// `key_index_build_max_pairs` 8 (one field, a share of 8): the passes
+    /// hold exactly the 40 pairs between them, in 5 passes, each pass's heap
+    /// peaking at most at the share plus the one pair placed before a cut,
+    /// 9, and ending holding none. Every pass reads the part's sections
+    /// again, so the run issues 5 x 2 ranged GETs for each of the 4 entries.
+    /// Every one of the 40 keys then probes to its (entry, block), and the
+    /// leaves equal, byte for byte, the ones a fold with the leaf build on
+    /// writes for the same part at the same budget.
+    ///
+    /// A repair that collects every entry's reads before building, budgeted
+    /// tiling or not, records no pass and issues 8 ranged GETs.
+    #[tokio::test]
+    async fn the_repair_holds_at_most_the_pair_budget_and_matches_the_fold_at_that_budget() {
+        const MAX_PAIRS: u64 = 8;
+        let rebuilt = recording_store();
+        let placed = forty_pair_part(&rebuilt).await;
+        let off = Catalog::new(
+            rebuilt.clone(),
+            CatalogConfig {
+                key_index_build_max_pairs: MAX_PAIRS,
+                ..config(1)
+            },
+        )
+        .expect("catalog");
+        assert!(!off.config().build_key_index_leaves);
+        fold_through(&off, Signal::Logs, KIDX_HOUR).await;
+        crate::fold::take_key_index_pass_log_for_test();
+        let report = rebuild(&off, Signal::Logs).await;
+        let log = crate::fold::take_key_index_pass_log_for_test();
+
+        let held: u64 = log.iter().map(|r| r.held).sum();
+        assert_eq!(held, 40, "the passes hold every pair once: {log:?}");
+        assert_eq!(log.len(), 5, "{log:?}");
+        for record in &log {
+            assert_eq!(record.field, USER_ID, "{record:?}");
+            assert_eq!(record.share, MAX_PAIRS, "{record:?}");
+            assert!(record.held <= MAX_PAIRS, "{record:?}");
+            assert!(
+                record.held_peak + record.open_slice <= MAX_PAIRS + 1,
+                "{record:?}"
+            );
+            assert_eq!(record.open_slice, 0, "{record:?}");
+        }
+        let peak = log.iter().map(|r| r.held_peak).max().unwrap_or(0);
+        assert_eq!(peak, MAX_PAIRS + 1, "{log:?}");
+        assert_eq!(report.ranged_gets, 5 * 2 * 4, "{report:?}");
+        assert_eq!(rebuilt.data_ranged_gets().len(), 5 * 2 * 4);
+        assert_eq!(report.parts_rebuilt, 1, "{report:?}");
+        assert_eq!(report.uncovered_entries, 0, "{report:?}");
+
+        let head = read_signal_head(rebuilt.as_ref(), Signal::Logs).await;
+        let part = &head.parts[0];
+        assert_eq!(part.entry_count, 4);
+        assert_eq!(report.leaves_written, part.key_index.len() as u64);
+        let ordinal = part_ordinals(rebuilt.as_ref(), part).await;
+        for (seq, v, block) in &placed {
+            assert_eq!(
+                probe_part(
+                    &off,
+                    Signal::Logs,
+                    part,
+                    KeyType::I64,
+                    USER_ID,
+                    key8_i64(*v)
+                )
+                .await,
+                matches(&[(ordinal[seq], &[*block])], &[]),
+                "user_id {v}"
+            );
+        }
+        for absent in [0i64, 41, -7] {
+            assert_eq!(
+                probe_part(
+                    &off,
+                    Signal::Logs,
+                    part,
+                    KeyType::I64,
+                    USER_ID,
+                    key8_i64(absent)
+                )
+                .await,
+                KeyIndexLeafProbe::Absent {
+                    uncovered_entry_ordinals: Vec::new()
+                },
+                "user_id {absent}"
+            );
+        }
+
+        let folded = recording_store();
+        forty_pair_part(&folded).await;
+        let on = Catalog::new(
+            folded.clone(),
+            CatalogConfig {
+                build_key_index_leaves: true,
+                key_index_build_max_pairs: MAX_PAIRS,
+                ..config(1)
+            },
+        )
+        .expect("catalog");
+        fold_through(&on, Signal::Logs, KIDX_HOUR).await;
+        let fold_head = read_signal_head(folded.as_ref(), Signal::Logs).await;
+        assert_eq!(fold_head.parts[0].blake3, part.blake3);
+        assert_eq!(fold_head.parts[0].key_index, part.key_index);
+        assert!(part.key_index.len() >= 5, "{:?}", part.key_index);
+        for leaf in &part.key_index {
             let a = folded
                 .get(&leaf.key, GetRange::Full)
                 .await

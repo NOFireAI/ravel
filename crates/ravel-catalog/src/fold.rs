@@ -511,9 +511,12 @@ const NEWER_PART_PEEK_PREFIX_LEN: u64 = 4096;
 pub(crate) struct RequestCounters {
     list_requests: u64,
     get_requests: u64,
-    put_requests: u64,
-    key_index_ranged_gets: u64,
-    key_index_bytes_read: u64,
+    pub(crate) put_requests: u64,
+    pub(crate) key_index_ranged_gets: u64,
+    pub(crate) key_index_bytes_read: u64,
+    /// Bytes of the leaves [`build_part_key_index`] PUT, counted when the
+    /// PUT is issued, like `put_requests`.
+    pub(crate) key_index_leaf_bytes_put: u64,
     key_index_sections_read: u64,
     key_index_entries_carried: u64,
     key_index_build_passes: u64,
@@ -1147,7 +1150,7 @@ fn set_key_index_leaf_body_ceiling_for_test(ceiling: Option<u64>) {
 }
 
 /// The leaf limits the fold builds with.
-fn key_index_leaf_limits() -> KeyIndexLeafLimits {
+pub(crate) fn key_index_leaf_limits() -> KeyIndexLeafLimits {
     #[cfg(test)]
     if let Some(max_body_bytes) = KEY_INDEX_LEAF_BODY_CEILING.with(std::cell::Cell::get) {
         return KeyIndexLeafLimits { max_body_bytes };
@@ -1978,7 +1981,7 @@ impl HeldLabelDicts {
     }
 
     /// The held entries of the part whose first entry is at `start`.
-    fn part(&self, start: usize) -> HeldPart<'_> {
+    pub(crate) fn part(&self, start: usize) -> HeldPart<'_> {
         HeldPart { held: self, start }
     }
 }
@@ -2353,6 +2356,7 @@ async fn read_entry_key_index_counted(
 
 /// One part's leaves, every `leaf_ref.key` still empty, and its uncovered
 /// (entry, field) count.
+#[cfg(test)]
 pub(crate) struct PartKeyIndexLeaves {
     pub(crate) leaves: Vec<EncodedKeyIndexLeaf>,
     pub(crate) uncovered_entries: u64,
@@ -2373,7 +2377,9 @@ pub(crate) struct PartKeyIndexLeaves {
 /// its share [`key_index_field_share`], and each pass's pairs into slices by
 /// [`key_index_pass_slices`], so for the same reads this returns the leaves
 /// the incremental build writes, byte for byte. `u64::MAX` is one pass per
-/// field.
+/// field. It holds every pair of a field at once, so it is the tests' oracle
+/// for the incremental build and is not built otherwise.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_part_key_index_leaves(
     tenant: &TenantHash,
@@ -2533,6 +2539,7 @@ pub(crate) fn build_part_key_index_leaves(
 /// and a run over `share` a pass of its own. The budget cut of
 /// [`FieldBuild::cut`] converges to these ends whatever order the pairs
 /// arrive in.
+#[cfg(test)]
 fn key_index_pass_ends(entries: &[KeyIndexLeafEntry], share: u64) -> Vec<u64> {
     let mut ends = Vec::new();
     let mut held = 0u64;
@@ -3506,12 +3513,28 @@ pub(crate) struct BuiltPartKeyIndex {
     /// Each field the build indexed, declared or named by a section, and
     /// its pairs ([`FoldReport::key_index_field_pairs`]).
     pub(crate) field_pairs: BTreeMap<String, u64>,
+    /// [`KeyIndexBuildCaller::Repair`] only: a ranged GET failed and the
+    /// build stopped before that pass's PUTs. `refs` is empty; leaves an
+    /// earlier pass PUT are referenced by nothing.
+    pub(crate) stopped_on_failed_get: bool,
+}
+
+/// What [`build_part_key_index`] does where the fold and the
+/// `--rebuild-key-index` repair ([`Catalog::rebuild_key_index`]) differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyIndexBuildCaller {
+    /// Also indexes every field a section names that `declared` does not, and
+    /// leaves an entry whose ranged GET failed uncovered.
+    Fold,
+    /// Indexes `declared` alone, and stops once the reads of a pass with a
+    /// failed ranged GET are done, so the repair can defer the part.
+    Repair,
 }
 
 /// Builds and PUTs one re-encoded part's leaves (ADR-2707 decision 4, the
-/// incremental tail build amendment), the same leaves
-/// [`build_part_key_index_leaves`] builds from every entry's section, byte
-/// for byte.
+/// incremental tail build amendment), the same leaves the test oracle
+/// `build_part_key_index_leaves` builds from every entry's section, byte for
+/// byte.
 ///
 /// Carry: `sources` are the previous HEAD's parts with leaves whose hour
 /// range overlaps this part's. Each one that shares a data object with this
@@ -3546,6 +3569,11 @@ pub(crate) struct BuiltPartKeyIndex {
 /// holding pairs keeps passing to the end of the key space, collecting every
 /// uncovered entry, and is then rebuilt once from the first range with the
 /// complete list; a further finding in the rebuild leaves it with no leaf.
+///
+/// `caller` is [`KeyIndexBuildCaller::Repair`] for the `--rebuild-key-index`
+/// repair, which passes no source and nothing held: the passes are the same,
+/// but only `declared` is indexed and a failed ranged GET stops the build
+/// ([`BuiltPartKeyIndex::stopped_on_failed_get`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_part_key_index(
     store: &dyn ObjectStoreBackend,
@@ -3558,6 +3586,7 @@ pub(crate) async fn build_part_key_index(
     sources: &[&CarrySource],
     held: HeldPart<'_>,
     limits: &KeyIndexBuildLimits,
+    caller: KeyIndexBuildCaller,
     counters: &mut RequestCounters,
 ) -> Result<BuiltPartKeyIndex, CatalogError> {
     let n = part_entries.len();
@@ -3786,6 +3815,7 @@ pub(crate) async fn build_part_key_index(
                 })
                 .collect();
             let mut failed: HashSet<u64> = HashSet::new();
+            let mut get_failed = false;
             let mut carry_conflict = false;
             {
                 let targets_ref = &targets;
@@ -3829,7 +3859,15 @@ pub(crate) async fn build_part_key_index(
                     let sections = match &read.fields {
                         Ok(sections) => sections,
                         Err(reason) => {
-                            if read.get_failed {
+                            if read.get_failed && caller == KeyIndexBuildCaller::Repair {
+                                get_failed = true;
+                                tracing::warn!(
+                                    tenant = %tenant.to_hex(),
+                                    object_key = %key,
+                                    reason = %reason,
+                                    "KEY_IDX read GET failed; the part naming this entry is deferred to a rerun"
+                                );
+                            } else if read.get_failed {
                                 tracing::warn!(
                                     tenant = %tenant.to_hex(),
                                     object_key = %key,
@@ -3849,6 +3887,9 @@ pub(crate) async fn build_part_key_index(
                     let mut added = false;
                     for section in sections {
                         if fields.contains_key(&section.name) {
+                            continue;
+                        }
+                        if caller == KeyIndexBuildCaller::Repair {
                             continue;
                         }
                         if carry_active {
@@ -3910,6 +3951,15 @@ pub(crate) async fn build_part_key_index(
                 );
                 continue 'build;
             }
+            if get_failed {
+                return Ok(BuiltPartKeyIndex {
+                    refs: Vec::new(),
+                    uncovered_entries: 0,
+                    over_cap: false,
+                    field_pairs: BTreeMap::new(),
+                    stopped_on_failed_get: true,
+                });
+            }
             first_pass = false;
             to_read.retain(|o| !failed.contains(o));
 
@@ -3962,10 +4012,12 @@ pub(crate) async fn build_part_key_index(
                 });
             }
             for (name, attempt, leaf) in pending {
+                let leaf_bytes = leaf.bytes.len() as u64;
                 let put_result =
                     put_key_index_leaf(store, tenant, signal, part_watermark, leaf).await;
                 // Request-issued, like every PUT counter here (#1598).
                 counters.put_requests += 1;
+                counters.key_index_leaf_bytes_put += leaf_bytes;
                 let leaf_ref = put_result?;
                 if let Some(field) = fields.get_mut(&name)
                     && field.attempt == attempt
@@ -3991,6 +4043,7 @@ pub(crate) async fn build_part_key_index(
             uncovered_entries: 0,
             over_cap,
             field_pairs: BTreeMap::new(),
+            stopped_on_failed_get: false,
         };
         for (name, field) in fields {
             built.field_pairs.insert(name, field.pairs);
@@ -5781,6 +5834,7 @@ impl Catalog {
                                     concurrency: self.config().fold_bucket_concurrency,
                                     leaf_bytes_cap,
                                 },
+                                KeyIndexBuildCaller::Fold,
                                 &mut counters,
                             )
                             .await?;
