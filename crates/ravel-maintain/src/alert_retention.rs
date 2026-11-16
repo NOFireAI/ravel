@@ -98,6 +98,7 @@ use crate::clock::Clock;
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::read::verify_commit_key;
+use crate::retention::held_out_of_window_rlog;
 use crate::sweep::LeaseCheck;
 
 /// What the alert state memo tells the sweep: the hour the memo is complete
@@ -184,6 +185,15 @@ pub struct AlertRetentionOutcome {
     /// `ingest_hour_bucket` alone proved the record cannot be expired. A subset
     /// of `kept`.
     pub gets_skipped_by_hour_prefilter: usize,
+    /// Expired, past-horizon records kept because their data object's trailer
+    /// version is outside this build's reader window (ADR-4233 decision 4, H7).
+    /// An object a later build can read must survive this build's sweep, so the
+    /// whole record is kept and counted here and under `kept`, never deleted,
+    /// and each held object also counts into
+    /// [`crate::retention::held_out_of_window_objects_total`]. A subset of
+    /// `kept`. A corrupt object is not a hold: no build reads it, so it is
+    /// swept as before.
+    pub held_out_of_window: usize,
 }
 
 /// Sweep expired alert transition records from a tenant's alert shard,
@@ -298,6 +308,28 @@ pub async fn sweep_alert_retention(
                 // Skip the whole record if either object is held: never leave a
                 // commit record pointing at a deleted data object, or vice versa.
                 if lease.is_protected(&meta.key) || lease.is_protected(&data_key) {
+                    outcome.kept += 1;
+                    continue;
+                }
+                // Version hold (ADR-4233 decision 4, H7): an alert data object
+                // whose trailer version is outside this build's reader window is
+                // kept, never deleted. Alert objects are RLOG, so the same RLOG
+                // gate the audit sweep applies decides it. Keeping the object
+                // means keeping its commit record too, so a later build that can
+                // read it still finds the record that names it. A corrupt object
+                // is not held: no build reads it, so it is swept as before.
+                let held = held_out_of_window_rlog(store, std::slice::from_ref(&data_key)).await?;
+                if !held.is_empty() {
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        shard,
+                        ingest_hour_bucket = parsed.ingest_hour_bucket,
+                        data_key = %data_key,
+                        version = held[0].1,
+                        "alert retention held a record: its data object's format version is \
+                         outside this build's reader window"
+                    );
+                    outcome.held_out_of_window += held.len();
                     outcome.kept += 1;
                     continue;
                 }
@@ -574,6 +606,7 @@ mod tests {
                 // watermark is consulted, and everything seeded is below it.
                 kept_at_or_above_watermark: 0,
                 gets_skipped_by_hour_prefilter: 2,
+                held_out_of_window: 0,
             },
             "exact counts, not just nonzero"
         );
@@ -777,6 +810,7 @@ mod tests {
                 kept_current_state: 0,
                 kept_at_or_above_watermark: 1,
                 gets_skipped_by_hour_prefilter: 0,
+                held_out_of_window: 0,
             },
             "a record in the watermark hour must not be deleted"
         );
@@ -805,6 +839,7 @@ mod tests {
                 kept_current_state: 0,
                 kept_at_or_above_watermark: 0,
                 gets_skipped_by_hour_prefilter: 0,
+                held_out_of_window: 0,
             },
             "one hour below the watermark the same record is deleted"
         );
@@ -866,6 +901,7 @@ mod tests {
                 kept_current_state: 1,
                 kept_at_or_above_watermark: 0,
                 gets_skipped_by_hour_prefilter: 0,
+                held_out_of_window: 0,
             },
             "exactly one of the two records is kept, and by the keep set"
         );
@@ -924,6 +960,7 @@ mod tests {
                 kept_current_state: 0,
                 kept_at_or_above_watermark: 2,
                 gets_skipped_by_hour_prefilter: 1,
+                held_out_of_window: 0,
             },
             "an empty set still sweeps, but only strictly below the watermark"
         );
@@ -1007,6 +1044,7 @@ mod tests {
                 kept_current_state: 0,
                 kept_at_or_above_watermark: 0,
                 gets_skipped_by_hour_prefilter: 0,
+                held_out_of_window: 0,
             },
             "a keep-set record that was never at risk is counted under kept alone"
         );
@@ -1058,6 +1096,7 @@ mod tests {
                 // cannot clear it: the horizon is what saves the record, and it
                 // is read from the record body.
                 gets_skipped_by_hour_prefilter: 0,
+                held_out_of_window: 0,
             },
             "the horizon gate alone must keep this record"
         );
@@ -1215,6 +1254,7 @@ mod tests {
                     kept_current_state: 0,
                     kept_at_or_above_watermark: 0,
                     gets_skipped_by_hour_prefilter: 0,
+                    held_out_of_window: 0,
                 },
                 "a held record is kept, and not counted as a keep-set record"
             );
@@ -1256,6 +1296,120 @@ mod tests {
         assert!(
             matches!(err, MaintainError::Invariant(_)),
             "got {err:?}, expected the signal dispatch to refuse Alerts"
+        );
+    }
+
+    /// Overwrite `data_key` with a real RLOG object whose trailer version is
+    /// outside this build's reader window. The commit record still names this
+    /// key (it is content addressed on the original body), and the version
+    /// probe reads whatever bytes are stored there.
+    async fn put_out_of_window_rlog(store: &dyn ObjectStoreBackend, data_key: &str) {
+        use ravel_logseg::writer::ObjectIdentity;
+        use ravel_logseg::{LogRecord, RlogConfig, RlogWriter};
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+
+        let res = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("svc".to_string()),
+        )];
+        let record = LogRecord {
+            stream_id: log_stream_id(&res, "scope", "1", &[]),
+            stream_attrs: ravel_logseg::stream_attrs_bytes(&res, "scope", "1", &[]),
+            ts_ns: 1,
+            observed_ts_ns: 1,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "held".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        };
+        let mut writer = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: [0u8; 16],
+                shard: 0,
+                writer_id: [0u8; 16],
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        writer.push(record).expect("push log record");
+        let mut bytes = writer.finish().expect("finish rlog");
+        let at = bytes.len() - ravel_logseg::footer::TRAILER_LEN;
+        let version = ravel_logseg::footer::SUPPORTED_VERSIONS.newest() + 1;
+        bytes[at + 8..at + 10].copy_from_slice(&version.to_le_bytes());
+        store
+            .put(data_key, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("overwrite with out-of-window rlog");
+    }
+
+    /// ADR-4233 decision 4, H7: an expired alert record whose data object's
+    /// trailer version is outside this build's reader window is kept, counted,
+    /// and never deleted, as retention and audit retention already do. An
+    /// equally expired, readable neighbour beside it is swept, proving the hold
+    /// is per object and does not stall the whole sweep.
+    ///
+    /// Against the old sweep, with no version hold, this fails at the first
+    /// assertion: the held record would be deleted (`held_out_of_window` 0,
+    /// `records_deleted` 2) and its object gone. It also rules out a sweep that
+    /// holds every object it cannot read as RLOG: the readable neighbour's body
+    /// is opaque, so such a sweep would hold it too and delete nothing, which
+    /// the `records_deleted == 1` assertion catches.
+    #[tokio::test]
+    async fn unreadable_version_alert_object_is_held() {
+        let store = MemoryStore::new();
+        let tenant = tenant();
+        let now = 400 * NS_PER_DAY;
+        let clock = FixedClock::new(now);
+        let config = CompactorConfig::default();
+        let writer = Uuid::from_u128(0xB1);
+        // Two expired transitions, far below the watermark and past the horizon.
+        let held = seed_alert(&store, &tenant, writer, 1, now - 100 * NS_PER_DAY).await;
+        let swept = seed_alert(&store, &tenant, writer, 2, now - 99 * NS_PER_DAY).await;
+        put_out_of_window_rlog(&store, &held.data_key).await;
+
+        let keep = keep_none_below(now);
+        let before = crate::retention::held_out_of_window_objects_total();
+        let outcome = sweep_alert_retention(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant,
+            ALERT_SHARD,
+            &keep,
+        )
+        .await
+        .expect("sweep");
+
+        assert_eq!(outcome.held_out_of_window, 1, "{outcome:?}");
+        assert_eq!(
+            outcome.records_deleted, 1,
+            "the readable expired neighbour is swept: {outcome:?}"
+        );
+        assert_eq!(outcome.data_deleted, 1, "{outcome:?}");
+        assert!(
+            exists(&store, &held.commit_key).await,
+            "the held commit record survives"
+        );
+        assert!(
+            exists(&store, &held.data_key).await,
+            "the held data object survives"
+        );
+        assert!(
+            !exists(&store, &swept.commit_key).await,
+            "the readable neighbour's commit record is swept"
+        );
+        assert!(
+            !exists(&store, &swept.data_key).await,
+            "the readable neighbour's data object is swept"
+        );
+        assert!(
+            crate::retention::held_out_of_window_objects_total() > before,
+            "the shared hold counter moved"
         );
     }
 }

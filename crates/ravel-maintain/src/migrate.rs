@@ -1905,6 +1905,14 @@ pub async fn migrate_family(
             }
         };
     let mut held: Vec<MigrateHeldBucket> = Vec::new();
+    // The resume position as it stood just before the walk held its first
+    // bucket this run, or `None` until a bucket is held. A budget stop persists
+    // at most this, never a position past the first held bucket: the cursor is
+    // advanced past a held bucket like any examined one (so a held claim never
+    // stalls the walk), but persisting that advanced position would let the
+    // next run resume past the hold and never report it. Capping at the
+    // position before the first held bucket makes the next run re-examine it.
+    let mut held_cursor_cap: Option<Option<(u32, u32)>> = None;
 
     let mut report = FamilyMigrateReport::default();
     let mut spent = 0u64;
@@ -2033,6 +2041,7 @@ pub async fn migrate_family(
                                     "migrate held a bucket; the walk goes on and the floor \
                                      stays unraised"
                                 );
+                                held_cursor_cap.get_or_insert(position);
                                 held.push(MigrateHeldBucket {
                                     shard,
                                     ingest_hour: hour,
@@ -2185,6 +2194,7 @@ pub async fn migrate_family(
                                          re-encode; the walk goes on and the floor stays \
                                          unraised"
                                     );
+                                    held_cursor_cap.get_or_insert(position);
                                     held.push(MigrateHeldBucket {
                                         shard,
                                         ingest_hour: hour,
@@ -2211,10 +2221,16 @@ pub async fn migrate_family(
     report.walk_complete = !report.budget_exhausted;
 
     if !report.walk_complete {
-        // Budget exhausted mid-walk: persist the advisory cursor at the last
-        // examined bucket (best-effort CAS) and return control; the caller
-        // re-invokes and resumes from here.
-        if let Some((shard, hour)) = position.filter(|_| cursor_writable) {
+        // Budget exhausted mid-walk: persist the advisory cursor and return
+        // control; the caller re-invokes and resumes from here. The persisted
+        // position is the last examined bucket, except that a run which held a
+        // bucket caps it just before the first held one, so the next run
+        // re-examines the hold and reports it again rather than resuming past
+        // it. `held_cursor_cap` holds the position as it stood before the first
+        // hold, which is always at or below `position`.
+        let to_persist = held_cursor_cap.unwrap_or(position);
+        report.cursor_advanced_to = to_persist;
+        if let Some((shard, hour)) = to_persist.filter(|_| cursor_writable) {
             write_cursor(store, &cursor_key, shard, hour, cursor_version).await?;
         }
         return held_or(report, held);
@@ -5365,6 +5381,32 @@ mod tests {
         ravel_segment::SUPPORTED_VERSIONS.newest() + 1
     }
 
+    /// Corrupt one stored RSEG object's body so its reader fails to decode. The
+    /// bytes flipped are in the middle, well clear of both the magic and the
+    /// trailer version field, so the version gate still admits the object and
+    /// the refusal is a decode error (`MaintainError::Segment`), not an
+    /// out-of-window one.
+    async fn corrupt_rseg_body(store: &dyn ObjectStoreBackend, key: &str) {
+        let got = store
+            .get(key, GetRange::Full)
+            .await
+            .expect("object present");
+        let mut bytes = got.data.to_vec();
+        let trailer_start = bytes.len() - ravel_segment::TRAILER_LEN as usize;
+        let at = bytes.len() / 2;
+        assert!(
+            at < trailer_start,
+            "corruption must land before the trailer"
+        );
+        for b in &mut bytes[at..at + 8] {
+            *b ^= 0xFF;
+        }
+        store
+            .put(key, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("overwrite");
+    }
+
     /// What a [`CursorDeleteStore`] does when the drained walk clears its
     /// cursor: the last store call before the held check and the re-audit.
     enum OnCursorDelete {
@@ -5537,6 +5579,133 @@ mod tests {
         assert_eq!(floor, None, "a held bucket raises no floor");
     }
 
+    /// A budget stop never persists a cursor past a bucket the same run held
+    /// (ADR-4233 decision 6): the hold must still be reported by the next run,
+    /// which only happens if the cursor resumes at or before the held bucket.
+    /// Four single-record buckets, the second (hour 101) out of window, walked
+    /// with a three-record budget so the walk holds 101, migrates 102, and the
+    /// budget then stops it past the hold. The persisted cursor is capped at
+    /// hour 100, just before the hold, so the resume re-examines 101 and reports
+    /// it again.
+    ///
+    /// Against the old cursor (persist the last examined bucket, hour 102) this
+    /// fails at the `(0, 100)` assertion: hour 102 is past the held hour 101, so
+    /// the resume would skip 101 and the hold would go unreported forever. It
+    /// also rules out an off-by-one that caps at the held bucket itself (hour
+    /// 101): resuming at `(0, 101)` skips it under the `<=` resume predicate,
+    /// and the `(0, 100)` assertion catches that too.
+    #[tokio::test]
+    async fn budget_stop_never_persists_a_cursor_past_a_held_bucket() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        let target = VERSION_V7 as u32;
+        seed_at(&store, 0, 100, 1, "alpha", target - 1).await;
+        let held_key = seed_at(&store, 0, 101, 2, "beta", target - 1).await;
+        seed_at(&store, 0, 102, 3, "gamma", target - 1).await;
+        seed_at(&store, 0, 103, 4, "delta", target - 1).await;
+        stamp_rseg_version(&store, &held_key, out_of_window_rseg_version()).await;
+
+        // First run: budget 3 holds 101, migrates 100 and 102, then stops.
+        let err = run_migrate(&store, 103, target, MigrateBudget::records(3))
+            .await
+            .expect_err("a held bucket fails the run");
+        let MaintainError::MigrateHeld { held, report } = err else {
+            panic!("expected MigrateHeld");
+        };
+        assert_eq!(
+            held.iter().map(|h| h.ingest_hour).collect::<Vec<_>>(),
+            vec![101],
+            "{held:?}"
+        );
+        assert!(
+            report.budget_exhausted && !report.walk_complete,
+            "{report:?}"
+        );
+        assert_eq!(
+            report.cursor_advanced_to,
+            Some((0, 100)),
+            "the cursor is capped just before the held bucket, not at hour 102: {report:?}"
+        );
+        let cursor_key = migrate_cursor_key(&tenant_hash(), Signal::Metrics, FAMILY);
+        match read_cursor(&store, &cursor_key).await.expect("read cursor") {
+            StoredCursor::Usable { position, .. } => assert_eq!(
+                position,
+                (0, 100),
+                "the persisted cursor is hour 100, strictly before the held hour 101"
+            ),
+            other => panic!("expected a usable cursor at hour 100, got {other:?}"),
+        }
+
+        // Second run resumes from the capped cursor and holds 101 again, which
+        // only happens because the cursor did not skip past it.
+        let err = run_migrate(&store, 103, target, MigrateBudget::unlimited())
+            .await
+            .expect_err("the held bucket is reported again on resume");
+        let MaintainError::MigrateHeld { held, .. } = err else {
+            panic!("expected MigrateHeld on resume");
+        };
+        assert_eq!(
+            held.iter().map(|h| h.ingest_hour).collect::<Vec<_>>(),
+            vec![101],
+            "the resume re-examines and re-reports the held bucket: {held:?}"
+        );
+    }
+
+    /// ADR-4233 decision 6: an input object whose bytes no build can decode
+    /// holds its bucket as `corrupt_input`, with a floor of `None`. The walk
+    /// migrates the buckets on either side and the run fails with
+    /// [`MaintainError::MigrateHeld`]. A corrupt object is held exactly like an
+    /// out-of-window one on this path, the difference being only the reason.
+    ///
+    /// The distinguishing mutation: drop the
+    /// `Segment(_) | LogSeg(_) | SpanSeg(_)` arm from
+    /// [`MigrateHoldReason::from_refusal`] and the corrupt object fails the
+    /// whole run (`return Err(err)`) instead of holding its one bucket, so the
+    /// `MigrateHeld` match and the two migrated neighbours both fail. A second
+    /// wrong shape, mapping the corruption to `input_out_of_window`, fails the
+    /// `CorruptInput` reason assertion.
+    #[tokio::test]
+    async fn corrupt_input_holds_bucket_and_walk_continues() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        let target = VERSION_V7 as u32;
+        seed_at(&store, 0, 100, 1, "alpha", target - 1).await;
+        let held_key = seed_at(&store, 0, 101, 2, "beta", target - 1).await;
+        seed_at(&store, 0, 102, 3, "gamma", target - 1).await;
+        corrupt_rseg_body(&store, &held_key).await;
+
+        let err = run_migrate(&store, 102, target, MigrateBudget::unlimited())
+            .await
+            .expect_err("a held bucket fails the run");
+        let message = err.to_string();
+        let MaintainError::MigrateHeld { held, report } = err else {
+            panic!("expected MigrateHeld, got {message}");
+        };
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!((held[0].shard, held[0].ingest_hour), (0, 101), "{held:?}");
+        assert!(
+            matches!(held[0].reason, MigrateHoldReason::CorruptInput { .. }),
+            "the corrupt body holds the bucket as corrupt_input: {held:?}"
+        );
+        assert!(report.walk_complete, "{report:?}");
+        assert_eq!(
+            report.buckets_migrated, 2,
+            "the readable buckets on either side migrate: {report:?}"
+        );
+        assert_eq!(report.verification, None, "no re-audit ran: {report:?}");
+        assert_eq!(compaction_record_count(&store, 0, 100).await, 1);
+        assert_eq!(compaction_record_count(&store, 0, 101).await, 0);
+        assert_eq!(compaction_record_count(&store, 0, 102).await, 1);
+        assert!(
+            message.contains("corrupt_input") && message.contains("shard 0 hour 101"),
+            "the error names the reason and the bucket: {message}"
+        );
+        let floor = current_floor_from_store(&store, &tenant_hash(), Signal::Metrics, FAMILY)
+            .await
+            .expect("read floor");
+        assert_eq!(floor, None, "a held bucket raises no floor");
+    }
+
     /// A hold refuses the floor on its own, not through the re-audit. The
     /// held bucket's commit record is deleted after the walk, so a re-audit
     /// would come back clean; a hold that only skipped the bucket would then
@@ -5692,6 +5861,206 @@ mod tests {
                 .await
                 .expect("read floor");
         assert_eq!(floor, None, "a held bucket raises no floor");
+    }
+
+    /// Compact `(0, 100)`, then rewrite its one compaction record so the part it
+    /// names is at `target - 1` (a re-encode candidate under the target) and the
+    /// part object stored at its key is mangled by `break_part`. The part's
+    /// `content_hash` is realigned to the mangled bytes so the re-encode's hash
+    /// gate passes and the reader, not the gate, is what refuses the object.
+    /// Returns the compaction record's key.
+    async fn seed_reencode_with_broken_part(
+        store: &dyn ObjectStoreBackend,
+        target: u32,
+        break_part: impl Fn(&mut Vec<u8>),
+    ) -> String {
+        seed_at(store, 0, 100, 1, "alpha", target).await;
+        seed_at(store, 0, 100, 2, "beta", target).await;
+        let bucket = Bucket::new(tenant_hash(), Signal::Metrics, 0, 100);
+        let compacted = crate::compact::compact_bucket(
+            store,
+            &FixedClock::new(sealed_now_ns_for(100)),
+            &CompactorConfig::default(),
+            &bucket,
+        )
+        .await
+        .expect("compact the fixture bucket");
+        assert!(
+            matches!(compacted, crate::CompactionOutcome::Compacted { .. }),
+            "{compacted:?}"
+        );
+
+        let listed = list_bucket(store, &bucket).await.expect("list");
+        let [record_key] = listed.compaction_record_keys.as_slice() else {
+            panic!("one compaction record: {listed:?}");
+        };
+        let record_key = record_key.clone();
+        let mut rec = record::decode_compaction(
+            &store
+                .get(&record_key, GetRange::Full)
+                .await
+                .expect("get record")
+                .data,
+        )
+        .expect("decode record");
+        assert_eq!(rec.parts.len(), 1, "{rec:?}");
+
+        let old_part_key = keys::reconstruct_l1_part_key(&rec, &rec.parts[0]).expect("part key");
+        let mut part_bytes = store
+            .get(&old_part_key, GetRange::Full)
+            .await
+            .expect("get part")
+            .data
+            .to_vec();
+        break_part(&mut part_bytes);
+
+        // Point the record at a below-target part whose content hash matches the
+        // mangled object, and store that object at the key the new hash
+        // reconstructs. The record key itself does not depend on the parts, so
+        // it is re-put in place.
+        rec.parts[0].segment_format_version = target - 1;
+        rec.parts[0].content_hash = blake3::hash(&part_bytes).as_bytes().to_vec();
+        let new_part_key =
+            keys::reconstruct_l1_part_key(&rec, &rec.parts[0]).expect("new part key");
+        store
+            .put(
+                &new_part_key,
+                Bytes::from(part_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put mangled part");
+        store
+            .put(
+                &record_key,
+                record::encode_compaction(&rec),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite record");
+        record_key
+    }
+
+    /// Drive the re-encode walk over a `(0, 100)` whose one part is broken by
+    /// `break_part`, with a readable `(0, 101)` neighbour, and return the walk
+    /// error and the held bucket's one reason. The neighbour always migrates, so
+    /// the walk went on past the hold.
+    async fn run_reencode_broken_part(
+        store: &MemoryStore,
+        target: u32,
+        break_part: impl Fn(&mut Vec<u8>),
+    ) -> (String, MigrateHoldReason) {
+        provision(store, 1).await;
+        assert_eq!(
+            crate::rewrite::current_part_version(Signal::Metrics).expect("current"),
+            target,
+            "the fixture's target is the version re-encode writes"
+        );
+        seed_reencode_with_broken_part(store, target, break_part).await;
+        seed_at(store, 0, 101, 3, "gamma", target - 1).await;
+        let config = CompactorConfig {
+            reencode_writer_enabled: true,
+            ..CompactorConfig::default()
+        };
+        let err = migrate_family(
+            store,
+            &FixedClock::new(sealed_now_ns_for(101)),
+            &config,
+            tenant_hash(),
+            Signal::Metrics,
+            FAMILY,
+            target,
+            1,
+            MigrateBudget::unlimited(),
+            "test",
+        )
+        .await
+        .expect_err("a held bucket fails the run");
+        let message = err.to_string();
+        let MaintainError::MigrateHeld { held, report } = err else {
+            panic!("expected MigrateHeld, got {message}");
+        };
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!((held[0].shard, held[0].ingest_hour), (0, 100), "{held:?}");
+        assert!(report.walk_complete, "{report:?}");
+        assert_eq!(
+            report.buckets_migrated, 1,
+            "the readable neighbour migrates past the hold: {report:?}"
+        );
+        assert_eq!(report.verification, None, "no re-audit ran: {report:?}");
+        assert_eq!(compaction_record_count(store, 0, 101).await, 1);
+        assert_eq!(
+            current_floor_from_store(store, &tenant_hash(), Signal::Metrics, FAMILY)
+                .await
+                .expect("read floor"),
+            None,
+            "a held bucket raises no floor"
+        );
+        (message, held.into_iter().next().unwrap().reason)
+    }
+
+    /// ADR-4233 decision 6 on the re-encode path: a part object whose trailer
+    /// version is outside this build's reader window holds its bucket as
+    /// `input_out_of_window` (not `corrupt_input`: a later build can still read
+    /// it). The refusal happens after the claim, so the claim-release arm routes
+    /// it through `from_refusal` and the walk migrates the next bucket.
+    ///
+    /// Distinguishing: the hold must be `input_out_of_window`, which fails for
+    /// the pre-fix behaviour that read the part through a raw `open_from_full`
+    /// and surfaced `Segment`/`corrupt_input`; and it must be a hold at all,
+    /// which fails if `from_refusal` stops routing the refusal (the run would
+    /// error instead of holding, and the neighbour would never migrate).
+    #[tokio::test]
+    async fn a_reencode_out_of_window_part_holds_bucket_and_walk_continues() {
+        let store = MemoryStore::new();
+        let target = VERSION_V7 as u32;
+        let (message, reason) = run_reencode_broken_part(&store, target, |bytes| {
+            let at = bytes.len() - ravel_segment::TRAILER_LEN as usize + 8;
+            bytes[at..at + 2].copy_from_slice(&out_of_window_rseg_version().to_le_bytes());
+        })
+        .await;
+        assert!(
+            matches!(reason, MigrateHoldReason::InputOutOfWindow { .. }),
+            "an out-of-window part is held out of window, not corrupt: {reason:?}"
+        );
+        assert!(
+            message.contains("input_out_of_window") && message.contains("shard 0 hour 100"),
+            "{message}"
+        );
+    }
+
+    /// ADR-4233 decision 6 on the re-encode path: a part object whose bytes no
+    /// build can decode holds its bucket as `corrupt_input`. Like the
+    /// out-of-window case the refusal is post-claim, so the same claim-release
+    /// arm routes it through `from_refusal` and the walk continues.
+    ///
+    /// Distinguishing: the hold must be `corrupt_input` (the out-of-window
+    /// wrapping must not swallow a genuine decode failure), and it must be a
+    /// hold at all rather than a run-ending error.
+    #[tokio::test]
+    async fn a_reencode_corrupt_part_holds_bucket_and_walk_continues() {
+        let store = MemoryStore::new();
+        let target = VERSION_V7 as u32;
+        let (message, reason) = run_reencode_broken_part(&store, target, |bytes| {
+            let trailer_start = bytes.len() - ravel_segment::TRAILER_LEN as usize;
+            let at = bytes.len() / 2;
+            assert!(
+                at < trailer_start,
+                "corruption must land before the trailer"
+            );
+            for b in &mut bytes[at..at + 8] {
+                *b ^= 0xFF;
+            }
+        })
+        .await;
+        assert!(
+            matches!(reason, MigrateHoldReason::CorruptInput { .. }),
+            "a corrupt part is held as corrupt_input: {reason:?}"
+        );
+        assert!(
+            message.contains("corrupt_input") && message.contains("shard 0 hour 100"),
+            "{message}"
+        );
     }
 
     fn foreign_key_in(shard: u32, hour: u32) -> String {
