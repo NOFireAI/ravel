@@ -1539,10 +1539,18 @@ The detail after the reason is `object_key=` and `version=` for
 `input_out_of_window`, `record_key=` and `version=` for
 `newer_than_writable`, and `detail=` for `corrupt_input`.
 
-Every listing the walk and its re-audit make is strict. A key under a listed
-prefix that the census cannot address fails the run with an
+Every listing the walk and its re-audit plan from is strict, including the
+per-bucket listing each L0 migration and each force 2 re-encode plans from. A
+key under a listed prefix that the census cannot address fails the run with an
 `UnaddressableKey` error naming the prefix, the first such key and how many
-there are. Nothing is certified: the walk stops and no floor is raised.
+there are. Nothing is certified: the walk stops and no floor is raised. The one
+exception is the pre-publish re-list a rewrite makes after its last claim
+checkpoint: that listing is shared with compaction and the erasure rewrite,
+both of which plan from non-strict listings, and it stays non-strict to match
+them. It is not the listing a migration decision rests on, only a last check
+that the record set did not change under the pass, so a short re-list cannot
+certify a floor; the strict planning listing already refused the bucket before
+the claim.
 
 A cursor stored under a tag this build does not know, such as one written by
 a newer build, is left in place. The run walks from the beginning, writes no
