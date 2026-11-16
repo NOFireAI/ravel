@@ -209,4 +209,21 @@ connection, a pushed-but-broken main).
   blast radius of their change; fleet specs gate with `scripts/gates.sh
   --tier executor -p`, which reads its closure from this script's `-n`. Doctests included
   (nextest skips them, the script runs them separately).
+- `scripts/compat/released-binary-drill.sh <phase>`: the released-binary
+  fence drill of ADR-4233 decision 9 (issue #4243). It runs the published
+  v0.33.0 server against isolated buckets on a local RustFS process (never
+  a shared bucket), raises the compat fence with the
+  `compat_fence_bucket` example of ravel-catalog, and lists the bucket
+  before and after to find every key a v0.33.0 process wrote into a
+  fenced prefix after its grace horizon. Phases: `preflight` (asset
+  sha256 and cosign check, stamps), `start`, `warm-start`, `warm-fence`,
+  `warm-finish` (refused until the horizon, which is the fence's hour
+  plus 3 h plus a 60 s request margin, has passed), `cold`, `read`, `all`, `verdict` and
+  `stop`. Every figure is checked present exactly once and inside its
+  band. `verdict` exits 1 on a post-horizon fenced write, a zero
+  positive-control prefix, a read diff between v0.33.0 and main, or a
+  missing phase verdict. State goes to `DRILL_RUN` (default
+  `.dd-tools/drill-run`); the script header lists the other variables.
+  `scripts/compat/released-binary-drill.test.sh` runs the decision logic
+  (`drill-lib.sh`) on recorded listings in CI.
 

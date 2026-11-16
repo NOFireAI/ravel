@@ -49,6 +49,9 @@ toml = "1"
 proptest = { workspace = true }
 async-trait = { workspace = true }
 tracing-subscriber = { workspace = true }
+# examples/compat_fence_bucket.rs parks the alert lease beside the
+# provisioning fence, as `compat activate` does (ADR-4233 decision 4).
+ravel-alerting = { workspace = true }
 
 [lints]
 workspace = true
