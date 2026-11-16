@@ -189,9 +189,14 @@ antithesis/ingest-durability/scripts/import-images.sh s3://<bucket>/<prefix>
 antithesis/ingest-durability/scripts/launch.sh <max-compute-hours> "<description>"
 ```
 
-The images are `819709950457.dkr.ecr.us-east-1.amazonaws.com/ravel-antithesis/ravel-server:ingest-durability`,
-`.../ravel-antithesis/driver:ingest-durability`, and the pinned
-`ghcr.io/rustfs/rustfs:1.0.0` digest.
+The compose file names the workload's images by local-only tags,
+`ravel-antithesis-server:ingest-durability` and
+`ravel-antithesis-driver:ingest-durability`, plus the pinned
+`ghcr.io/rustfs/rustfs:1.0.0` digest. snouty pushes a local-only image into
+the tenant registry, but skips an image it finds served by another registry,
+which Antithesis could not pull. The ECR tags
+(`819709950457.dkr.ecr.us-east-1.amazonaws.com/ravel-antithesis/...`) only
+move the images from the build host to the launching machine.
 
 Instrumentation uses the compile-time coverage flags with codegen-units 1.
 The Antithesis server build turns the release profile's thin LTO off,

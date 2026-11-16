@@ -19,6 +19,13 @@ for name in ravel-server driver; do
     aws s3 cp "$SRC/$name.tar.zst" - --only-show-errors | zstd -q -d | docker load
     docker push -q "$REG/$name:$TAG"
     docker pull -q --platform linux/amd64 "$REG/$name:$TAG"
+    # The compose file names the local-only tag, which snouty pushes into the
+    # tenant registry (config/docker-compose.yaml header).
+    case "$name" in
+        ravel-server) local_name="ravel-antithesis-server" ;;
+        driver) local_name="ravel-antithesis-driver" ;;
+    esac
+    docker tag "$REG/$name:$TAG" "$local_name:$TAG"
 done
 store=$(sed -n 's/^ *image: \(ghcr.io\/rustfs\/[^ ]*\)$/\1/p' "$COMPOSE")
 docker pull -q --platform linux/amd64 "$store"

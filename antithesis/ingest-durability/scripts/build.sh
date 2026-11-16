@@ -9,14 +9,18 @@ ROOT="$(cd "$WL/../.." && pwd)"
 REG="${REGISTRY:-819709950457.dkr.ecr.us-east-1.amazonaws.com/ravel-antithesis}"
 TAG="${TAG:-ingest-durability}"
 WHAT="${1:-all}"
-SERVER="$REG/ravel-server:$TAG"
-DRIVER="$REG/driver:$TAG"
+# The compose file names the local-only tags (see its header); the registry
+# tags are only for moving the images between machines (export-images.sh).
+SERVER="ravel-antithesis-server:$TAG"
+DRIVER="ravel-antithesis-driver:$TAG"
 
 if [ "$WHAT" = all ] || [ "$WHAT" = server ]; then
-    docker build --progress=plain -f "$WL/ravel/Dockerfile" -t "$SERVER" "$ROOT"
+    docker build --progress=plain -f "$WL/ravel/Dockerfile" \
+        -t "$SERVER" -t "$REG/ravel-server:$TAG" "$ROOT"
 fi
 if [ "$WHAT" = all ] || [ "$WHAT" = driver ]; then
-    docker build --progress=plain -f "$WL/driver/Dockerfile" -t "$DRIVER" "$WL"
+    docker build --progress=plain -f "$WL/driver/Dockerfile" \
+        -t "$DRIVER" -t "$REG/driver:$TAG" "$WL"
 fi
 
 # Instrumentation checks (snouty docs: /docs/reference/sdk/rust/instrumentation/):

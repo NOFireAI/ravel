@@ -16,8 +16,12 @@ x-ravel-store: &ravel-store
   RAVEL_S3_ACCESS_KEY: ravel
   RAVEL_S3_SECRET_KEY: ravel-dev-secret
 
+# The workload's own images are named without a registry: snouty pushes a
+# local-only image into the tenant registry, but skips one it finds served by
+# another registry (such as the ECR it was moved through), which Antithesis
+# then cannot pull. scripts/build.sh and scripts/import-images.sh tag them.
 x-ravel-server: &ravel-server
-  image: 819709950457.dkr.ecr.us-east-1.amazonaws.com/ravel-antithesis/ravel-server:ingest-durability
+  image: ravel-antithesis-server:ingest-durability
   platform: linux/amd64
   # ravel-server exits within seconds when the store does not answer its
   # startup read of sys/qualification, and nothing would start it again. A
@@ -86,7 +90,7 @@ services:
   init:
     container_name: init
     hostname: init
-    image: 819709950457.dkr.ecr.us-east-1.amazonaws.com/ravel-antithesis/ravel-server:ingest-durability
+    image: ravel-antithesis-server:ingest-durability
     platform: linux/amd64
     entrypoint: ["/usr/local/bin/ravel-antithesis-init"]
     environment:
@@ -106,7 +110,7 @@ services:
   driver:
     container_name: driver
     hostname: driver
-    image: 819709950457.dkr.ecr.us-east-1.amazonaws.com/ravel-antithesis/driver:ingest-durability
+    image: ravel-antithesis-driver:ingest-durability
     platform: linux/amd64
     environment:
       RAVEL_NODES: http://ravel1:4318,http://ravel2:4318
