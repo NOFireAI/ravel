@@ -185,3 +185,6 @@ The harness expects these fault flags (`scripts/launch.sh`):
 Driver environment for the local loop: `WORKLOAD_EVENTUALLY=off` turns the
 eventually off, `WORKLOAD_EVENTUALLY_AFTER_SECS=N` runs it after N seconds,
 and `WORKLOAD_MAX_WRITES` caps the writes per timeline (default 5000).
+`WORKLOAD_INJECT_MISSING_RECORD=1` is a self-check: the model then expects one
+record more than is sent for every 50th log write, so the presence assertions
+must fail.

@@ -91,6 +91,8 @@ struct Shared {
     eventually_lock: Mutex<()>,
     eventually_on: bool,
     max_writes: usize,
+    /// `WORKLOAD_INJECT_MISSING_RECORD=1`: the local loop's self-check.
+    inject_missing: bool,
 }
 
 struct Workload(Arc<Shared>);
@@ -142,8 +144,8 @@ fn metrics_query(value_range: Option<(u64, u64)>) -> String {
         None => String::new(),
     };
     format!(
-        "SELECT ts, value, labels['wl_series'] AS s FROM samples \
-         WHERE labels['wl_series'] IS NOT NULL{filter}"
+        "SELECT ts, value, label(labels, 'wl_series') AS s FROM samples \
+         WHERE label(labels, '__name__') = 'wl_gauge'{filter}"
     )
 }
 
@@ -585,6 +587,14 @@ impl Workload {
         let Some(w) = s.register(Signal::Logs, mode, records, 0, 0, keyed) else {
             return;
         };
+        // The local loop's self-check: the model expects one record more than
+        // is sent, so the presence assertions must fail.
+        if s.inject_missing
+            && w.id % 50 == 3
+            && let Some(m) = lock(&s.model).writes.get_mut(&w.id)
+        {
+            m.records += 1;
+        }
         let body = otlp::logs_request(w.id, records, streams, w.ts_ns);
         s.send(&tc, &w, &body, gzip);
     }
@@ -918,6 +928,8 @@ fn main(tc: TestCase) {
         eventually_lock: Mutex::new(()),
         eventually_on: cfg.eventually_on,
         max_writes: cfg.max_writes,
+        inject_missing: std::env::var("WORKLOAD_INJECT_MISSING_RECORD")
+            .is_ok_and(|v| v == "1"),
     });
 
     for node in 0..shared.ravel.nodes.len() {

@@ -47,7 +47,7 @@ fi
 # Debug tools in each image.
 {
     docker compose exec -T driver sh -c 'curl --version | head -1; jq --version'
-    docker compose exec -T ravel1 sh -c 'curl --version | head -1; jq --version; ravel-cli --version'
+    docker compose exec -T ravel1 sh -c 'curl --version | head -1; jq --version; ravel-cli --help | head -1'
 } > "$OUT/debug-tools.txt" 2>&1
 
 # Graceful shutdown: a clean stop exits 0, a kill after the timeout 137.
