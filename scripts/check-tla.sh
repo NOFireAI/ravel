@@ -755,8 +755,9 @@ strip_code_span() {
 # occurrence does not count. A comment is a line starting with //, the text
 # after a /* on a line, and every line up to the matching */. A #[cfg(test)]
 # item is the item after the attribute (and any further attributes): through
-# the first line ending in ; when no brace opened before it, else through the
-# line where its braces balance. The scan is textual: a /* or a brace inside a
+# its first line when that line ends in , (a field), else through the first
+# line ending in ; when no brace opened before it, else through the line where
+# its braces balance, and never past a closing brace of the enclosing scope. The scan is textual: a /* or a brace inside a
 # string or char literal is taken at face value. The literal is passed
 # through the environment, never as awk program text or -v, so backslashes
 # stay literal.
@@ -765,14 +766,15 @@ rust_literal_live() {
         function braces(s,   o, c) { o = gsub(/\{/, "{", s); c = gsub(/\}/, "}", s); return o - c }
         function skip_line(s) {
             depth += braces(s)
-            if (depth > 0) opened = 1
-            if ((opened && depth <= 0) || (!opened && s ~ /;[[:space:]]*$/)) skipping = 0
+            if (index(s, "{")) opened = 1
+            if (depth < 0 || (opened && depth <= 0) || (!opened && (s ~ /;[[:space:]]*$/ || (head && s ~ /,[[:space:]]*$/)))) skipping = 0
+            head = 0
         }
         in_block { if (index($0, "*/")) in_block = 0; next }
         skipping { skip_line($0); next }
         /^[[:space:]]*#\[cfg\(test\)\]/ { pending = 1; next }
         pending && /^[[:space:]]*(#\[|$)/ { next }
-        pending { pending = 0; depth = 0; opened = 0; skipping = 1; skip_line($0); next }
+        pending { pending = 0; depth = 0; opened = 0; head = 1; skipping = 1; skip_line($0); next }
         /^[[:space:]]*\/\// { next }
         {
             line = $0

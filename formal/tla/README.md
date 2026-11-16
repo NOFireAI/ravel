@@ -240,9 +240,10 @@ The message must be the whole double-quoted literal: a substring of a longer
 literal or an unquoted occurrence does not count. A literal counts only on a
 line that is outside comments (a line starting with `//`, the text after a
 `/*`, and every line up to the matching `*/`) and outside `#[cfg(test)]`
-items (the item after the attribute: through its first line ending in `;`
-when no brace opened before it, else through the line where its braces
-balance). The scan is textual, so a `/*` or a brace inside a string is taken
+items (the item after the attribute: its first line when that line ends in
+`,`, as a field does; else through the first line ending in `;` when no brace
+opened before it; else through the line where its braces balance; never past
+a closing brace of the enclosing scope). The scan is textual, so a `/*` or a brace inside a string is taken
 at face value. Files under a `tests/` directory are skipped, and a
 `sut:` path under one fails. The path and the
 message may each be wrapped in one backtick code span. The

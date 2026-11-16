@@ -1528,11 +1528,26 @@ fn wide(
 const WIDE: &[&str] = &[
     "x",
 ];
+#[cfg(test)]
+fn one_line() { let _ = 1; }
+fn after_one_line() { if inv_mutant!("enr/after-one-line") {} }
 fn live() {
     let x = 1; /* if inv_mutant!("enr/midline-block") {}
        if inv_mutant!("enr/midline-block-body") {} */
     if inv_mutant!("enr/after-cfg-use") {}
     *slot_ref() = 1; if inv_mutant!("enr/after-deref") {}
+}
+EOF
+cat > "$airepo/crates/m/field.rs" <<'EOF'
+struct Cfg {
+    a: u8,
+    #[cfg(test)]
+    host: Option<String>,
+}
+impl Cfg {
+    fn name(&self) {
+        if inv_mutant!("enr/after-field") {}
+    }
 }
 EOF
 cat > "$airepo/crates/m/tests/it.rs" <<'EOF'
@@ -1561,7 +1576,7 @@ for m in line-comment block-comment block-body block-bare midline-block midline-
 done
 
 echo "--- (ay2) traceability: a #[cfg(test)] item hides only itself, not the code after it"
-for m in after-test-mod after-cfg-use after-deref; do
+for m in after-test-mod after-cfg-use after-deref after-one-line after-field; do
     tsv_mutant "$m"
     expect_trace "ay2-$m" enr pass 'PASS (1 rows resolve)'
 done
