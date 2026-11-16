@@ -49,6 +49,7 @@ use ravel_commit::rng::RngSource;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::traces_normalize::NormalizedSpan;
 use ravel_proto::commit::v1::CommitRecord;
+use ravel_rspan::footer::WriteVersion;
 use ravel_rspan::{ObjectIdentity, RspanConfig, RspanWriter, SpanRecord};
 use ravel_types::{CommitToken, Signal, TenantHash, TenantId};
 use tokio::sync::{Semaphore, mpsc, oneshot};
@@ -58,6 +59,7 @@ use uuid::Uuid;
 
 use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
+use crate::compat::{CompatPublishRefusal, PublishGrant, PutAbort, warn_publish_refused};
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LagCheck, MAX_FLUSH_ALL_PASSES,
     MAX_FLUSH_CLOCK_HOLD_NS, SPAN_SEGMENT_FORMAT_VERSION, StoreClockLag,
@@ -66,7 +68,9 @@ use crate::config::{
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::flush_share::TenantFlushShares;
-use crate::format_floor::{FormatFamily, warn_flush_refused, warn_flush_written_below};
+use crate::format_floor::{
+    BelowFormatFloor, FormatFamily, warn_flush_refused, warn_flush_written_below,
+};
 use crate::generation::{
     FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, ScanCheck,
     mismatch_retry_spent, reread_and_check, send_hand_back,
@@ -332,7 +336,7 @@ impl SpanFlushCtx {
     /// verbatim by every retry (docs/catalog-and-mvcc.md "Pinned flush
     /// identity"). Nothing below may re-serialize, accrete new spans, or re-read
     /// the clock for identity purposes.
-    async fn run_flush(&self, pinned: SpanPinnedFlush) {
+    async fn run_flush(&self, pinned: SpanPinnedFlush, grant: PublishGrant) {
         let SpanPinnedFlush {
             tenant_hash,
             seq,
@@ -347,6 +351,14 @@ impl SpanFlushCtx {
             waiters,
             charges,
         } = pinned;
+
+        // The version was chosen at permit grant (ADR-4233 decision 2); with
+        // no activation policy it is `WriteVersion::CURRENT`.
+        let Ok(write_version) = WriteVersion::new(grant.version()) else {
+            self.refuse_compat(tenant_hash, waiters, grant.unencodable());
+            drop(charges);
+            return;
+        };
 
         // One pass computes the commit-record fields RspanWriter does not
         // surface after `finish()`: the distinct trace count (the span analogue
@@ -372,7 +384,8 @@ impl SpanFlushCtx {
         let encode = self
             .write_gate
             .encode(WriteSite::SpanFlush, input_bytes, move || {
-                let mut writer = RspanWriter::new(RspanConfig::default(), identity);
+                let mut writer = RspanWriter::new(RspanConfig::default(), identity)
+                    .with_write_version(write_version);
                 for span in spans {
                     writer.push(to_rspan_record(span));
                 }
@@ -438,18 +451,42 @@ impl SpanFlushCtx {
             }
         };
 
-        if !self
-            .put_data_object_with_retry(&data_key, data.clone(), deadline_ns)
+        // ADR-4233 decision 4: the bucket is fenced before the first PUT of
+        // an object above the family's baseline.
+        if let Err(refused) = grant
+            .ensure_fenced(
+                self.store.as_ref(),
+                tenant_hash,
+                Signal::Spans,
+                self.clock.as_ref(),
+                deadline_ns,
+            )
             .await
         {
-            self.metrics.record_abandoned_retry_exhausted();
-            self.ack_waiters(
-                waiters,
-                Err(SpanWriteError::Abandoned(
-                    "data object put exhausted retry budget or exceeded max_flush_lifetime".into(),
-                )),
-            );
+            self.refuse_compat(tenant_hash, waiters, refused);
             return;
+        }
+
+        match self
+            .put_data_object_with_retry(&data_key, data.clone(), deadline_ns, &grant)
+            .await
+        {
+            Ok(()) => {}
+            Err(PutAbort::Refused(refused)) => {
+                self.refuse_compat(tenant_hash, waiters, refused);
+                return;
+            }
+            Err(PutAbort::Exhausted) => {
+                self.metrics.record_abandoned_retry_exhausted();
+                self.ack_waiters(
+                    waiters,
+                    Err(SpanWriteError::Abandoned(
+                        "data object put exhausted retry budget or exceeded max_flush_lifetime"
+                            .into(),
+                    )),
+                );
+                return;
+            }
         }
 
         let record = match record::build(NewCommitRecord {
@@ -467,7 +504,7 @@ impl SpanFlushCtx {
             max_event_ts_ns,
             min_ingest_ts_ns,
             max_ingest_ts_ns,
-            segment_format_version: u32::from(SPAN_SEGMENT_FORMAT_VERSION),
+            segment_format_version: u32::from(write_version.number()),
             created_unix_ns: flush_open_ns,
             ingest_hour_bucket,
         }) {
@@ -479,15 +516,18 @@ impl SpanFlushCtx {
             }
         };
 
-        match self.publish_with_retry(&record, deadline_ns).await {
-            Some(token) => {
+        match self.publish_with_retry(&record, deadline_ns, &grant).await {
+            Ok(token) => {
                 // Both PUTs landed: attribute this flush's PUT cost to the
                 // tenant (ADR-0076 decision 2, success-time). `tenant_hash` is
                 // `Copy` and untouched by the commit-record build above.
                 self.metrics.record_flush_puts(tenant_hash);
                 self.ack_waiters(waiters, Ok(token));
             }
-            None => {
+            Err(PutAbort::Refused(refused)) => {
+                self.refuse_compat(tenant_hash, waiters, refused);
+            }
+            Err(PutAbort::Exhausted) => {
                 self.metrics.record_abandoned_retry_exhausted();
                 self.ack_waiters(
                     waiters,
@@ -547,6 +587,47 @@ impl SpanFlushCtx {
         drop(charges);
     }
 
+    /// Fails a flush the activation policy refused (ADR-4233), with nothing
+    /// of it stored: counted under its reason, and its waiters acked with the
+    /// refusal. The caller drops the flush's byte charges.
+    fn refuse_compat(
+        &self,
+        tenant_hash: TenantHash,
+        waiters: Vec<SpanAck>,
+        refused: CompatPublishRefusal,
+    ) {
+        self.metrics.record_compat_refused(refused.reason());
+        warn_publish_refused(Signal::Spans, Some(self.shard), tenant_hash, &refused);
+        self.ack_waiters(waiters, Err(SpanWriteError::CompatRefused(refused)));
+    }
+
+    /// Abandons a flush the activation policy refused at permit grant, before
+    /// any store call, dropping its byte charges.
+    fn abandon_compat(&self, pinned: SpanPinnedFlush, refused: CompatPublishRefusal) {
+        let SpanPinnedFlush {
+            tenant_hash,
+            waiters,
+            charges,
+            ..
+        } = pinned;
+        self.refuse_compat(tenant_hash, waiters, refused);
+        drop(charges);
+    }
+
+    /// Abandons a flush whose version chosen at permit grant sits below the
+    /// tenant's format floor (ADR-1746 decision 4), before any store call.
+    fn abandon_below_floor(&self, pinned: SpanPinnedFlush, refused: BelowFormatFloor) {
+        let SpanPinnedFlush {
+            tenant_hash,
+            waiters,
+            charges,
+            ..
+        } = pinned;
+        warn_flush_refused(Signal::Spans, self.shard, tenant_hash, &refused);
+        self.ack_waiters(waiters, Err(SpanWriteError::BelowFormatFloor(refused)));
+        drop(charges);
+    }
+
     /// Races `fut` against the remaining budget to `deadline_ns` on the injected
     /// `Clock`, returning `None` if the deadline is already past or elapses
     /// while `fut` is still in flight. Built on `tokio::select!` racing
@@ -571,12 +652,21 @@ impl SpanFlushCtx {
     /// pinned `key`/`bytes` on every attempt. Each attempt is bounded to
     /// `deadline_ns` via [`Self::bound_to_deadline`], so a timeout never retries
     /// past the deadline and is treated exactly like the abandonment path.
-    async fn put_data_object_with_retry(&self, key: &str, bytes: Bytes, deadline_ns: i64) -> bool {
+    /// The activation policy is asked before every attempt (ADR-4233
+    /// decision 3).
+    async fn put_data_object_with_retry(
+        &self,
+        key: &str,
+        bytes: Bytes,
+        deadline_ns: i64,
+        grant: &PublishGrant,
+    ) -> Result<(), PutAbort> {
         let mut attempt: u32 = 0;
         loop {
+            grant.check_attempt().map_err(PutAbort::Refused)?;
             let call = publish::put_data_object(self.store.as_ref(), key, bytes.clone());
             match self.bound_to_deadline(deadline_ns, call).await {
-                Some(Ok(())) => return true,
+                Some(Ok(())) => return Ok(()),
                 Some(Err(PublishError::Store { source, .. })) if source.is_retryable() => {
                     // `put_retry_max_attempts` is the number of retries after
                     // the first attempt (total attempts = this + 1), matching
@@ -586,13 +676,13 @@ impl SpanFlushCtx {
                     if attempt >= self.config.put_retry_max_attempts
                         || self.clock.now_ns() >= deadline_ns
                     {
-                        return false;
+                        return Err(PutAbort::Exhausted);
                     }
                     self.metrics.record_put_retry();
                     self.backoff_sleep(attempt).await;
                     attempt += 1;
                 }
-                Some(Err(_)) | None => return false,
+                Some(Err(_)) | None => return Err(PutAbort::Exhausted),
             }
         }
     }
@@ -602,12 +692,13 @@ impl SpanFlushCtx {
     /// checks `deadline_ns` between attempts. Includes the pinned-identity
     /// split-brain panic: identity is fixed at flush open, so a split-brain
     /// cannot fire on a benign retry and means the pinning invariant was broken
-    /// upstream.
+    /// upstream. The activation policy is asked before every attempt.
     async fn publish_with_retry(
         &self,
         record: &CommitRecord,
         deadline_ns: i64,
-    ) -> Option<CommitToken> {
+        grant: &PublishGrant,
+    ) -> Result<CommitToken, PutAbort> {
         let single_attempt = RetryPolicy {
             max_attempts: 0,
             base_delay: self.config.put_retry_base_delay,
@@ -615,9 +706,10 @@ impl SpanFlushCtx {
         };
         let mut attempt: u32 = 0;
         loop {
+            grant.check_attempt().map_err(PutAbort::Refused)?;
             let call = publish::publish(self.store.as_ref(), record, &single_attempt);
             match self.bound_to_deadline(deadline_ns, call).await {
-                Some(Ok(token)) => return Some(token),
+                Some(Ok(token)) => return Ok(token),
                 Some(Err(PublishError::SplitBrain { this, stored })) => {
                     panic!(
                         "ravel-ingest: fatal split-brain on pinned span flush identity: this={this} stored={stored}"
@@ -629,13 +721,13 @@ impl SpanFlushCtx {
                     if attempt >= self.config.put_retry_max_attempts
                         || self.clock.now_ns() >= deadline_ns
                     {
-                        return None;
+                        return Err(PutAbort::Exhausted);
                     }
                     self.metrics.record_put_retry();
                     self.backoff_sleep(attempt).await;
                     attempt += 1;
                 }
-                Some(Err(_)) | None => return None,
+                Some(Err(_)) | None => return Err(PutAbort::Exhausted),
             }
         }
     }
@@ -2027,6 +2119,7 @@ impl SpanShardActor {
         let shard = self.shard;
         let ctx = Arc::clone(&self.ctx);
         let metrics = Arc::clone(&self.metrics);
+        let scope = Arc::clone(&self.scope);
         self.flushes.spawn(async move {
             let _guard = guard;
             let slot = slot;
@@ -2088,10 +2181,35 @@ impl SpanShardActor {
                     return;
                 }
             };
+            // ADR-4233 decision 2: the version is chosen here, at grant, as in
+            // the metrics shard.
+            let grant = match scope.compat_grant(pinned.tenant_hash, FormatFamily::Rspan) {
+                Ok(grant) => grant,
+                Err(refused) => {
+                    ctx.abandon_compat(pinned, refused);
+                    return;
+                }
+            };
+            if grant.version() != SPAN_SEGMENT_FORMAT_VERSION {
+                match scope.floor_check(
+                    pinned.tenant_hash,
+                    FormatFamily::Rspan,
+                    u32::from(grant.version()),
+                ) {
+                    FloorCheck::Write | FloorCheck::NoView => {}
+                    FloorCheck::WriteBelow(below) => {
+                        warn_flush_written_below(Signal::Spans, shard, pinned.tenant_hash, &below);
+                    }
+                    FloorCheck::Refuse(refused) => {
+                        ctx.abandon_below_floor(pinned, refused);
+                        return;
+                    }
+                }
+            }
             // Per-shard skew (issue #865, ADR-1692): time the whole flush,
             // matching `crate::shard`'s own off-actor span.
             let started_ns = ctx.clock.now_ns();
-            ctx.run_flush(pinned).await;
+            ctx.run_flush(pinned, grant).await;
             let off_actor_ns = ctx.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
             metrics.record_shard_off_actor_ns(shard, off_actor_ns);
         });

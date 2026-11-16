@@ -22,8 +22,10 @@
 //! crc32c over `magic || version || payload`, so a bit flip in the header is
 //! caught exactly like one in the payload); a corrupt or truncated marker
 //! decodes to a typed [`MarkerError`], never a panic, and callers treat that
-//! as a miss (fail-open to at-least-once, ADR-0051 section 5). A version above
-//! the one this build reads is not corruption: [`read_marker`] refuses the
+//! as a miss (fail-open to at-least-once, ADR-0051 section 5). The checksum is
+//! verified before the version is interpreted, so a flipped version byte is
+//! corruption; a checksum-valid version above the one this build reads is
+//! not corruption: [`read_marker`] refuses the
 //! lookup with [`MarkerLookupFailure::NewerMarker`] so the request is not
 //! ingested a second time (ADR-4233 decision 4, H10). Byte layout
 //! and checksum coverage are documented in docs/catalog-and-mvcc.md.
@@ -317,8 +319,11 @@ fn encode_marker(receipt: &IdempotencyReceipt) -> Result<Vec<u8>, MarkerError> {
 }
 
 /// Decode and verify a marker body. Every failure mode (truncation, bad
-/// magic, unsupported version, checksum mismatch, malformed payload) is a
-/// typed [`MarkerError`], never a panic.
+/// magic, checksum mismatch, unsupported version, malformed payload) is a
+/// typed [`MarkerError`], never a panic. The checksum is verified before the
+/// version is read, so only a checksum-valid marker above [`VERSION`] is
+/// [`MarkerError::NewerVersion`]; a bit flip in the version byte is
+/// [`MarkerError::ChecksumMismatch`].
 ///
 /// Public so `ravel-cli`'s `idem inspect` can report the specific
 /// failure reason [`read_marker`]'s [`LookupOutcome::Corrupt`] collapses:
@@ -334,25 +339,26 @@ pub fn decode_marker(bytes: &[u8]) -> Result<IdempotencyReceipt, MarkerError> {
         got.copy_from_slice(magic);
         return Err(MarkerError::BadMagic(got));
     }
-    let version = u16::from_le_bytes([header[4], header[5]]);
-    // Before the checksum and payload: a newer build may lay both out
-    // differently, so neither is meaningful to this build.
-    if version > VERSION {
-        return Err(MarkerError::NewerVersion { found: version });
-    }
-    if version != VERSION {
-        return Err(MarkerError::UnsupportedVersion(version));
-    }
     let stored_crc = u32::from_le_bytes(header[6..10].try_into().unwrap_or([0; 4]));
     // Coverage is magic || version || payload, matching encode_marker: the
     // crc field itself (header[6..10]) is excluded, same as any self-
-    // describing checksum has to exclude its own bytes.
+    // describing checksum has to exclude its own bytes. The header and its
+    // coverage are frozen across marker versions, so the checksum is checked
+    // before the version: a flipped version byte is corruption, not a newer
+    // marker.
     let computed_crc = crc32c::crc32c_append(crc32c::crc32c(&header[0..6]), payload);
     if stored_crc != computed_crc {
         return Err(MarkerError::ChecksumMismatch {
             stored: stored_crc,
             computed: computed_crc,
         });
+    }
+    let version = u16::from_le_bytes([header[4], header[5]]);
+    if version > VERSION {
+        return Err(MarkerError::NewerVersion { found: version });
+    }
+    if version != VERSION {
+        return Err(MarkerError::UnsupportedVersion(version));
     }
     decode_receipt(payload)
 }
@@ -1382,18 +1388,30 @@ mod tests {
         let good = encode_marker(&receipt(1, "tok")).expect("encode");
         let mut v2 = good.clone();
         v2[4..6].copy_from_slice(&2u16.to_le_bytes());
-        // Stale checksum and payload: the version alone decides.
-        assert_eq!(
+        // A flipped version byte leaves the stored checksum stale: corruption,
+        // not a marker a newer build wrote.
+        assert!(matches!(
             decode_marker(&v2),
+            Err(MarkerError::ChecksumMismatch { .. })
+        ));
+        assert_eq!(
+            decode_marker(&marker_at_version(2, &receipt(1, "tok"))),
             Err(MarkerError::NewerVersion { found: 2 })
         );
         assert_eq!(
             decode_marker(&marker_at_version(9, &receipt(1, "tok"))),
             Err(MarkerError::NewerVersion { found: 9 })
         );
+        assert_eq!(
+            decode_marker(&marker_at_version(0, &receipt(1, "tok"))),
+            Err(MarkerError::UnsupportedVersion(0))
+        );
         let mut v0 = good.clone();
         v0[4..6].copy_from_slice(&0u16.to_le_bytes());
-        assert_eq!(decode_marker(&v0), Err(MarkerError::UnsupportedVersion(0)));
+        assert!(matches!(
+            decode_marker(&v0),
+            Err(MarkerError::ChecksumMismatch { .. })
+        ));
         let mut bad_magic = v2.clone();
         bad_magic[0] = b'X';
         assert!(matches!(
@@ -1475,10 +1493,15 @@ mod tests {
         bad_magic[0] = b'X';
         let mut version_zero = marker_at_version(0, &receipt);
         version_zero[9] ^= 1;
+        // A version-1 marker whose version byte flipped to 2: the stored
+        // checksum no longer matches, so this is corruption, not a refusal.
+        let mut flipped_version = marker_at_version(1, &receipt);
+        flipped_version[4] = 2;
         for body in [
             bad_crc,
             bad_magic,
             version_zero,
+            flipped_version,
             b"RI".to_vec(),
             marker_at_version(1, &receipt)[..HEADER_LEN + 3].to_vec(),
         ] {

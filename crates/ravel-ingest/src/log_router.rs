@@ -22,6 +22,7 @@ use crate::budget::{
     BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit, IngestByteCharge,
 };
 use crate::clock::Clock;
+use crate::compat::{CompatSlot, IngestCompatPolicy, PublishLifetimeAboveCompat};
 use crate::config::{IngestConfig, LOG_SEGMENT_FORMAT_VERSION};
 use crate::deferral::DeferralCapFlag;
 use crate::format_floor::{FormatFamily, FormatFloorPolicy};
@@ -275,8 +276,10 @@ impl LogIngestRouter {
         let write_gate = WriteGateSlot::default();
         #[cfg(feature = "stage-timing")]
         let stage_timings = Arc::new(LogStageTimings::new());
+        let compat = CompatSlot::default();
         let switch = Arc::new_cyclic(|weak: &Weak<GenerationSwitch<LogShardHandle>>| {
             let weak = weak.clone();
+            let scope_compat = compat.clone();
             let store = Arc::clone(&store);
             let refresh_store = Arc::clone(&store);
             let clock = Arc::clone(&clock);
@@ -289,8 +292,11 @@ impl LogIngestRouter {
             #[cfg(feature = "stage-timing")]
             let stage_timings = Arc::clone(&stage_timings);
             let factory = move |shard_count: u32| -> Vec<LogShardHandle> {
-                let scope: Arc<dyn FlushScope<LogShardMsg>> =
-                    Arc::new(SwitchScope::new(weak.clone(), shard_count));
+                let scope: Arc<dyn FlushScope<LogShardMsg>> = Arc::new(SwitchScope::new(
+                    weak.clone(),
+                    shard_count,
+                    scope_compat.clone(),
+                ));
                 let writer_id = rng.new_uuid();
                 let epoch =
                     u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
@@ -328,6 +334,7 @@ impl LogIngestRouter {
             GenerationSwitch::new(config.shard_count, DEFAULT_REFRESH_INTERVAL_NS, factory)
                 .with_refresh_source(refresh_store, ravel_types::Signal::Logs, refresh_clock)
                 .with_read_failures(read_failures)
+                .with_compat_slot(compat.clone())
         });
 
         LogIngestRouter {
@@ -383,6 +390,40 @@ impl LogIngestRouter {
     pub fn with_format_floor_policy(self, policy: FormatFloorPolicy) -> Self {
         self.switch.set_floor_policy(policy);
         self
+    }
+
+    /// Installs the `sys/compat` activation policy every flush of this
+    /// router applies (ADR-4233), reaching every actor as
+    /// [`Self::with_format_floor_policy`] does: the RLOG version is chosen at
+    /// permit grant, every PUT attempt is refused once the policy's view is
+    /// stale, the bucket is fenced before the first object above the
+    /// baseline, and admission refuses what the cached view already refuses.
+    /// `None` installs nothing: every flush writes `WriteVersion::CURRENT` with
+    /// none of these checks, exactly as a router never given a policy.
+    ///
+    /// Refuses a `max_flush_lifetime` above the `max_publish_lifetime_ns` of
+    /// the record the policy's view holds (ADR-4233 decision 7).
+    pub fn with_compat_policy(
+        self,
+        policy: Option<Arc<IngestCompatPolicy>>,
+    ) -> Result<Self, PublishLifetimeAboveCompat> {
+        if let Some(policy) = &policy {
+            policy.check_publish_lifetime(self.config.max_flush_lifetime)?;
+        }
+        self.switch.set_compat_policy(policy);
+        Ok(self)
+    }
+
+    /// The admission-time activation-policy check (ADR-4233 decision 2), on
+    /// the view just routed with: counted, and refused before any shard
+    /// buffers the write.
+    fn admit_compat(&self, tenant: ravel_types::TenantHash) -> Result<(), LogWriteError> {
+        self.switch
+            .admit_compat(tenant, FormatFamily::Rlog)
+            .map_err(|refused| {
+                self.metrics.record_compat_refused(refused.reason());
+                LogWriteError::CompatRefused(refused)
+            })
     }
 
     /// The admission-time format-floor check both submit paths make on the
@@ -622,6 +663,7 @@ impl LogIngestRouter {
         // ADR-1746 decision 4, as in `IngestRouter`: refused against the RLOG
         // floor of the view just routed with, before any shard buffers it.
         self.admit_floor(tenant.hash())?;
+        self.admit_compat(tenant.hash())?;
         let shard_count = set.len() as u32;
         let mut by_shard: HashMap<u32, ShardRecords> = HashMap::new();
         for (record, bytes) in records.into_iter().zip(record_bytes) {
@@ -979,6 +1021,7 @@ impl LogIngestRouter {
         // format floor, exactly as `submit`.
         let set = self.active_set(tenant.hash(), self.clock.now_ns()).await?;
         self.admit_floor(tenant.hash())?;
+        self.admit_compat(tenant.hash())?;
         let shard_count = set.len() as u32;
 
         // Partition into per-shard column selections. `partition_columnar`

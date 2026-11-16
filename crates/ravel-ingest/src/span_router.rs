@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::budget::{BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit};
 use crate::clock::Clock;
+use crate::compat::{CompatSlot, IngestCompatPolicy, PublishLifetimeAboveCompat};
 use crate::config::{IngestConfig, SPAN_SEGMENT_FORMAT_VERSION};
 use crate::deferral::DeferralCapFlag;
 use crate::format_floor::{FormatFamily, FormatFloorPolicy};
@@ -287,8 +288,10 @@ impl SpanIngestRouter {
         let read_failures = metrics.provisioning_read_failures();
         let backstop_ceiling = BufferBudgetCeiling::unlimited();
         let write_gate = WriteGateSlot::default();
+        let compat = CompatSlot::default();
         let switch = Arc::new_cyclic(|weak: &Weak<GenerationSwitch<SpanShardHandle>>| {
             let weak = weak.clone();
+            let scope_compat = compat.clone();
             let store = Arc::clone(&store);
             let refresh_store = Arc::clone(&store);
             let clock = Arc::clone(&clock);
@@ -298,8 +301,11 @@ impl SpanIngestRouter {
             let backstop_ceiling = backstop_ceiling.clone();
             let write_gate = write_gate.clone();
             let factory = move |shard_count: u32| -> Vec<SpanShardHandle> {
-                let scope: Arc<dyn FlushScope<SpanShardMsg>> =
-                    Arc::new(SwitchScope::new(weak.clone(), shard_count));
+                let scope: Arc<dyn FlushScope<SpanShardMsg>> = Arc::new(SwitchScope::new(
+                    weak.clone(),
+                    shard_count,
+                    scope_compat.clone(),
+                ));
                 let writer_id = rng.new_uuid();
                 let epoch =
                     u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
@@ -334,6 +340,7 @@ impl SpanIngestRouter {
             GenerationSwitch::new(config.shard_count, DEFAULT_REFRESH_INTERVAL_NS, factory)
                 .with_refresh_source(refresh_store, ravel_types::Signal::Spans, refresh_clock)
                 .with_read_failures(read_failures)
+                .with_compat_slot(compat.clone())
         });
 
         SpanIngestRouter {
@@ -367,6 +374,40 @@ impl SpanIngestRouter {
     pub fn with_format_floor_policy(self, policy: FormatFloorPolicy) -> Self {
         self.switch.set_floor_policy(policy);
         self
+    }
+
+    /// Installs the `sys/compat` activation policy every flush of this
+    /// router applies (ADR-4233), reaching every actor as
+    /// [`Self::with_format_floor_policy`] does: the RSPAN version is chosen at
+    /// permit grant, every PUT attempt is refused once the policy's view is
+    /// stale, the bucket is fenced before the first object above the
+    /// baseline, and admission refuses what the cached view already refuses.
+    /// `None` installs nothing: every flush writes `WriteVersion::CURRENT` with
+    /// none of these checks, exactly as a router never given a policy.
+    ///
+    /// Refuses a `max_flush_lifetime` above the `max_publish_lifetime_ns` of
+    /// the record the policy's view holds (ADR-4233 decision 7).
+    pub fn with_compat_policy(
+        self,
+        policy: Option<Arc<IngestCompatPolicy>>,
+    ) -> Result<Self, PublishLifetimeAboveCompat> {
+        if let Some(policy) = &policy {
+            policy.check_publish_lifetime(self.config.max_flush_lifetime)?;
+        }
+        self.switch.set_compat_policy(policy);
+        Ok(self)
+    }
+
+    /// The admission-time activation-policy check (ADR-4233 decision 2), on
+    /// the view just routed with: counted, and refused before any shard
+    /// buffers the write.
+    fn admit_compat(&self, tenant: ravel_types::TenantHash) -> Result<(), SpanWriteError> {
+        self.switch
+            .admit_compat(tenant, FormatFamily::Rspan)
+            .map_err(|refused| {
+                self.metrics.record_compat_refused(refused.reason());
+                SpanWriteError::CompatRefused(refused)
+            })
     }
 
     /// Installs the shared process-wide ingest buffer byte budget (ADR-0069),
@@ -591,6 +632,7 @@ impl SpanIngestRouter {
             FormatFamily::Rspan,
             u32::from(SPAN_SEGMENT_FORMAT_VERSION),
         )?;
+        self.admit_compat(tenant.hash())?;
         let shard_count = set.len() as u32;
         let mut by_shard: HashMap<u32, Vec<NormalizedSpan>> = HashMap::new();
         for span in spans {
