@@ -66,10 +66,12 @@ pub use footer::{
     open_from_suffix,
 };
 pub use ranged::{RlogRangeReader, StreamBlockLoc, StreamBlockRows, StreamBlockSpan};
+#[cfg(feature = "test-support")]
+pub use reader::records_rebuilt_on_this_thread;
 pub use reader::{
-    BlockScan, FilterSectionReads, RlogReader, ScanStats, SegmentDirectories, decode_section,
-    decode_section_accounted, read_section, read_section_accounted, read_section_accounted_from,
-    read_section_from, stream_attr_pairs,
+    BlockScan, FilterSectionReads, RlogReader, RowBlock, ScanStats, SegmentDirectories,
+    decode_section, decode_section_accounted, read_section, read_section_accounted,
+    read_section_accounted_from, read_section_from, stream_attr_pairs,
 };
 pub use record::{
     FieldSel, FieldType, LogRecord, MAX_ATTR_DEPTH, MAX_ATTR_ENTRIES, Predicate,

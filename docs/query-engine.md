@@ -4304,10 +4304,17 @@ and block-level reported independently:
   validates only the dictionary entries the arm read as text or a kept row
   references, and the build never validates a row the arm dropped, so a
   pushed arm can lower this count.
+- `rowpathBatches`: batches a logs scan built on the row path, straight from
+  a decoded block's columns and its streams' resource and scope attributes
+  with no per-row record (ADR-2773 decision D4): every batch of a statement
+  projecting `attrs` or under a pending erasure, and the batches of a block
+  carrying an `attrs_raw` overflow page.
+- `columnarBatches`: batches a logs scan built on the columnar fast path
+  (ADR-0099 decision 2).
 
 The two key-index counts are 0 for a statement with no spans
 `trace_id =` lookup and are sums over every spans scan in the plan. The
-other ten counts after `segments` are 0 for a statement with no logs scan.
+other twelve counts after `segments` are 0 for a statement with no logs scan.
 They are sums over every logs scan in the plan (`stats.timings.scans`),
 while `segments` counts every segment of every resolved snapshot. With one
 scan, `segmentsPrunedByStats` is a subset of `segments`; with two, each scan

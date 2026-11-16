@@ -655,7 +655,7 @@ async fn drain_logs(
 /// This is the return-to-zero property for what the fast path holds: the decoded
 /// block plus its pre-built `RecordBatch`es
 /// (`hold_batches`/`emit_next_columnar_batch`), charged once together and
-/// relabelled from `held` to `emitted` batch by batch, not a `Vec<LogRecord>`.
+/// relabelled from `held` to `emitted` batch by batch.
 /// The metrics-scan tests above never touch the logs scan, so before this case
 /// that release path was unexercised here. The magnitude of that charge is the
 /// next test's job.
@@ -731,18 +731,14 @@ async fn repeated_logs_columnar_queries_return_every_reserved_byte() {
 /// The band, in tenths, that the row path's peak divided by the columnar
 /// path's peak must fall in for the same data.
 ///
-/// The two paths hold different things, so their peaks are not equal: the row
-/// path holds a `Vec<LogRecord>` (a per-record struct, a cloned STREAM_DIR blob
-/// and an owned `String` per record), the columnar path holds the decoded block
-/// plus the Arrow batches built from it. Measured with every decoded column
-/// form behind an `Arc` (ADR-3326 decision 1) over the plain string layout
-/// (decision 2), the columnar peak on this fixture is 697,342 bytes against the
-/// row path's 2,104,634, a ratio of 3.02. The band is 2.6 to 3.5, about 15%
-/// either side. Its upper edge fails the defect the test exists to catch:
-/// charging the batches alone put the columnar peak at 24% of the row path's,
-/// a ratio of about 4.2. Its lower edge fails a columnar charge grown by more
-/// than about a sixth, such as the decoded block charged twice.
-const COLUMNAR_RATIO_BAND_TENTHS: (usize, usize) = (26, 35);
+/// Both paths hold the decoded block plus the Arrow batches built from it (the
+/// row path builds from the block with no `LogRecord`, ADR-2773 decision D4),
+/// so on this fixture both peaks measure 697,342 bytes, a ratio of 1.0. The
+/// band is 0.9 to 1.1. Its upper edge fails the defect the test exists to
+/// catch: charging the batches alone put the columnar peak near 505,000 bytes,
+/// a ratio of about 1.38. Its lower edge fails a columnar charge grown by more
+/// than about a tenth, such as the decoded block charged twice.
+const COLUMNAR_RATIO_BAND_TENTHS: (usize, usize) = (9, 11);
 
 /// The columnar path's pool charge must be the same order of magnitude as the
 /// row path's for the same data, because it holds the same data.
