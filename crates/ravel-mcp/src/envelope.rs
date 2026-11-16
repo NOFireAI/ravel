@@ -3593,4 +3593,91 @@ mod tests {
         assert!(serialized_len(&finished) <= MAX_RESPONSE_BYTES_FLOOR as usize);
         assert_eq!(finished.presentation.scalars_truncated, 0);
     }
+
+    #[derive(Clone)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Everything `run` logs at warn or above on this thread, as text.
+    fn capture_warn<T>(run: impl FnOnce() -> T) -> (T, String) {
+        // The warn callsite in `redacted_internal` is reached by tool tests on
+        // other threads too; while one dispatcher is registered tracing caches
+        // a callsite's interest from the first thread to touch it, so a second
+        // dispatcher kept alive for the process forces interest to be computed
+        // per dispatch and this thread's subscriber to see the event.
+        static KEEP_TWO_DISPATCHERS: std::sync::OnceLock<tracing::Dispatch> =
+            std::sync::OnceLock::new();
+        KEEP_TWO_DISPATCHERS
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CapturedLog(buffer.clone()))
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let out = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            run()
+        };
+        let log = String::from_utf8(buffer.lock().expect("log buffer lock").clone())
+            .expect("log bytes are utf-8");
+        (out, log)
+    }
+
+    /// The cause's `Display` reaches the warn log exactly once, under the
+    /// `error` field, beside the tenant hash under the `tenant` field, while
+    /// the caller gets only the fixed message under `Internal`.
+    ///
+    /// FLIP (the `tracing::warn!` in `redacted_internal` removed): the log is
+    /// empty and the exactly-once count is 0.
+    #[test]
+    fn redacted_internal_logs_the_cause_once_with_the_tenant_hash() {
+        const CAUSE: &str = "corrupt sample at key s3://tenant-7/seg-0001";
+        const CLIENT_MESSAGE: &str = "the call could not be completed";
+        let tenant = TenantHash([0xAB; 16]);
+
+        let (failure, log) = capture_warn(|| redacted_internal(CLIENT_MESSAGE, &CAUSE, tenant));
+
+        assert_eq!(
+            log.matches(CAUSE).count(),
+            1,
+            "the cause must reach the server log exactly once: {log}"
+        );
+        assert_eq!(
+            log.matches(&format!("error={CAUSE}")).count(),
+            1,
+            "the cause must sit under the error field: {log}"
+        );
+        assert_eq!(
+            log.matches(&format!("tenant={}", tenant.to_hex())).count(),
+            1,
+            "the log must name the tenant: {log}"
+        );
+        assert!(log.contains(" WARN "), "logged at warn: {log}");
+        assert_eq!(failure.class, FailureClass::Internal);
+        assert_eq!(failure.message, CLIENT_MESSAGE);
+        assert!(failure.counter.is_none());
+    }
 }

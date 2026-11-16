@@ -33,3 +33,5 @@ tracing = { workspace = true }
 # and they build tokens with every field non-default.
 uuid = { workspace = true }
 proptest = { workspace = true }
+# The redaction test captures the warn event `redacted_internal` logs.
+tracing-subscriber = { workspace = true }
