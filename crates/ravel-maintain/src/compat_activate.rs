@@ -620,15 +620,31 @@ mod tests {
         family_entry(&record, family).expect("entry").clone()
     }
 
-    async fn prov_epoch(store: &dyn ObjectStoreBackend, t: TenantHash, signal: Signal) -> u64 {
+    /// Advances one nanosecond per reading, so a test can order the walk's
+    /// writes by the times they stamped.
+    struct StepClock(std::sync::atomic::AtomicI64);
+
+    impl CompatClock for StepClock {
+        fn now_unix_ns(&self) -> i64 {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    async fn prov_record(
+        store: &dyn ObjectStoreBackend,
+        t: TenantHash,
+        signal: Signal,
+    ) -> sysproto::ProvisioningRecord {
         use prost::Message;
         let got = store
             .get(&ravel_catalog::provisioning_key(&t, signal), GetRange::Full)
             .await
             .expect("prov");
-        sysproto::ProvisioningRecord::decode(got.data.as_ref())
-            .expect("decode prov")
-            .compat_epoch
+        sysproto::ProvisioningRecord::decode(got.data.as_ref()).expect("decode prov")
+    }
+
+    async fn prov_epoch(store: &dyn ObjectStoreBackend, t: TenantHash, signal: Signal) -> u64 {
+        prov_record(store, t, signal).await.compat_epoch
     }
 
     async fn lease(store: &dyn ObjectStoreBackend, t: TenantHash) -> Option<AlertLease> {
@@ -657,7 +673,7 @@ mod tests {
         let report = activate(
             mem.as_ref(),
             Some(&test_keys()),
-            &TestClock(now),
+            &StepClock(now.into()),
             &writable_next(FAMILY_RLOG),
             &request(FAMILY_RLOG),
         )
@@ -685,17 +701,26 @@ mod tests {
         assert_eq!(walk.leases_replaced, 1);
         assert_eq!(walk.leases_created, 2);
         assert_eq!(walk.leases_already_parked, 0);
-        assert_eq!(walk.fence_complete_unix_ns, Some(now));
         assert_eq!(walk.resume_from, None);
+        let fence_complete = walk.fence_complete_unix_ns.expect("fence complete");
 
+        // fence_complete is stamped after the last bucket fence.
+        let mut last_fenced = 0;
         for (t, signal) in [
             (tenant(1), Signal::Metrics),
             (tenant(1), Signal::Logs),
             (tenant(2), Signal::Metrics),
             (tenant(3), Signal::Logs),
         ] {
-            assert_eq!(prov_epoch(mem.as_ref(), t, signal).await, 1, "{t:?} {signal:?}");
+            let prov = prov_record(mem.as_ref(), t, signal).await;
+            assert_eq!(prov.compat_epoch, 1, "{t:?} {signal:?}");
+            assert!(prov.compat_fenced_unix_ns > now, "{t:?} {signal:?}");
+            last_fenced = last_fenced.max(prov.compat_fenced_unix_ns);
         }
+        assert!(
+            fence_complete > last_fenced,
+            "fence_complete {fence_complete} not after the last fence {last_fenced}"
+        );
         for t in [tenant(1), tenant(3), tenant(4)] {
             let parked = lease(mem.as_ref(), t).await.expect("lease present");
             assert!(parked.is_parked(), "{t:?}");
@@ -708,7 +733,7 @@ mod tests {
         assert_eq!(rlog.activated_epoch, 1);
         assert_eq!(rlog.activated_unix_ns, now);
         assert_eq!(rlog.activated_by, "test");
-        assert_eq!(rlog.fence_complete_unix_ns, now);
+        assert_eq!(rlog.fence_complete_unix_ns, fence_complete);
     }
 
     #[tokio::test]
