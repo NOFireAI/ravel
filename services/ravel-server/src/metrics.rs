@@ -5635,7 +5635,7 @@ pub(crate) fn render_compat_family(out: &mut String, mode: Mode, snapshot: &Comp
     write_header(
         out,
         "ravel_compat_publish_refused_total",
-        "Publishes a writer refused under the sys/compat write policy, by format family and reason (ADR-4233 decision 3). Every writer: view_stale (a view older than the 10 minute horizon, or one that never read sys/compat, unless every failed read was refused as access denied, no sys/compat object was seen and the bucket has compat_epoch 0), active_version_not_writable (an active version this build does not write), compat_record_missing (a missing record after an activation). Maintenance only: publish_lifetime_above_compat, target_not_active, compaction_record_not_active, fence_failed, publish_lifetime_expired, and other for a reason this build does not name.",
+        "Publishes a writer refused under the sys/compat write policy, by format family and reason (ADR-4233 decision 3). Every writer: view_stale (a view older than the 10 minute horizon, or one that never read sys/compat, unless the latest failed read, if any, was refused as access denied, no sys/compat object was seen and the bucket has compat_epoch 0), active_version_not_writable (an active version this build does not write), compat_record_missing (a missing record after an activation), fence_failed (a lost bucket-fence CAS race). Ingest only: active_version_moved (the active version moved off the granted one mid-flush), no_bucket_view (the flush's router was dropped with no cached bucket record). Maintenance only: publish_lifetime_above_compat, target_not_active, compaction_record_not_active, publish_lifetime_expired, and other for a reason this build does not name.",
         "counter",
     );
     for (family, reason, count) in &snapshot.refusals {
@@ -5667,7 +5667,7 @@ pub(crate) fn render_compat_family(out: &mut String, mode: Mode, snapshot: &Comp
     write_header(
         out,
         "ravel_compat_view_age_seconds",
-        "Seconds since this process's last successful read of sys/compat started; +Inf before the first. Writers refuse at 600 and at +Inf, except that at +Inf, while every failed read was refused as access denied and no sys/compat object was seen, they still write to a bucket whose compat_epoch is 0 (ADR-4233 decision 3).",
+        "Seconds since this process's last successful read of sys/compat started; +Inf before the first. Writers refuse at 600 and at +Inf, except that at +Inf, while the latest failed read, if any, was refused as access denied and no sys/compat object was seen, they still write to a bucket whose compat_epoch is 0.",
         "gauge",
     );
     match snapshot.view_age_seconds {
@@ -10721,11 +10721,43 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
     render_heartbeat_age_family(&mut body, state.mode, state.heartbeat.age());
     if let Some(view) = state.catalog.compat_policy() {
         use ravel_catalog::compat::CompatClock as _;
-        render_compat_family(
-            &mut body,
-            state.mode,
-            &CompatSnapshot::of(view, crate::compat::SystemCompatClock.now_unix_ns()),
-        );
+        use ravel_catalog::compat::{FAMILY_RLOG, FAMILY_RSEG, FAMILY_RSPAN};
+        let mut snapshot = CompatSnapshot::of(view, crate::compat::SystemCompatClock.now_unix_ns());
+        // The ingest routers count their refusals in their own IngestMetrics,
+        // apart from the server static and ravel-maintain, so sum them into the
+        // rendered series here (ADR-4233, #4301).
+        for (router_family, refused) in [
+            (
+                FAMILY_RSEG,
+                state
+                    .ingest_router
+                    .as_ref()
+                    .map(|r| r.metrics().snapshot().compat_publish_refused),
+            ),
+            (
+                FAMILY_RLOG,
+                state
+                    .log_ingest_router
+                    .as_ref()
+                    .map(|r| r.metrics().snapshot().compat_publish_refused),
+            ),
+            (
+                FAMILY_RSPAN,
+                state
+                    .span_ingest_router
+                    .as_ref()
+                    .map(|r| r.metrics().snapshot().compat_publish_refused),
+            ),
+        ] {
+            if let Some(refused) = refused {
+                crate::compat::CompatRefusalReason::merge_ingest_refusals(
+                    &mut snapshot.refusals,
+                    router_family,
+                    &refused,
+                );
+            }
+        }
+        render_compat_family(&mut body, state.mode, &snapshot);
     }
     if let Some(cache) = &state.decoded_cache {
         render_decoded_cache_family(&mut body, state.mode, &DecodedCacheMetrics::of(cache));
