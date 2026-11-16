@@ -4674,3 +4674,176 @@ mod read_gate_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod row_path_row_ref_tests {
+    //! The row path's emitted row refs under a pending erasure that empties
+    //! a whole `BATCH_ROWS` chunk of a block.
+
+    use super::*;
+    use crate::late_materialization::RowRef;
+    use datafusion::arrow::array::TimestampNanosecondArray;
+    use datafusion::physical_plan::ExecutionPlan;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::record::stream_attrs_bytes;
+    use ravel_logseg::{ObjectIdentity, RlogConfig, RlogWriter};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([8u8; 16]);
+    const KEY: &str = "t/rowref0.rlog";
+    /// Three chunks: a full one, a full one every row of which is erased,
+    /// and a short one.
+    const ROWS: usize = 2 * BATCH_ROWS + 4;
+
+    fn erased(row: usize) -> bool {
+        row == 1 || (BATCH_ROWS..2 * BATCH_ROWS).contains(&row)
+    }
+
+    /// One single-block object of [`ROWS`] records at `ts` 1..=ROWS, the
+    /// rows [`erased`] names carrying `user=gone` and the rest `user=kept`.
+    async fn fixture() -> (Arc<dyn ObjectStoreBackend>, Vec<SegmentRef>) {
+        let cfg = RlogConfig {
+            block_target_records: ROWS,
+            block_max_bytes: 64 << 20,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: [6u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        let mut writer = RlogWriter::new(cfg, identity);
+        for row in 0..ROWS {
+            let user = if erased(row) { "gone" } else { "kept" };
+            writer
+                .push(ravel_logseg::LogRecord {
+                    stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                    stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                    ts_ns: row as i64 + 1,
+                    observed_ts_ns: row as i64 + 1,
+                    severity_num: 9,
+                    severity_text: "INFO".into(),
+                    body: String::new(),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs: vec![("user".to_string(), AttrValue::Str(user.into()))],
+                })
+                .expect("push");
+        }
+        let obj = writer.finish().expect("finish");
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        store
+            .put(KEY, bytes::Bytes::from(obj.clone()), PutOptions::default())
+            .await
+            .expect("put");
+        let segment = SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: obj.len() as u64,
+            min_event_ts_ns: 1,
+            max_event_ts_ns: ROWS as i64,
+            ingest_hour_bucket: 0,
+            sample_count: ROWS as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: [4u8; 32],
+            writer_id: Uuid::from_u128(6),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        };
+        (store, vec![segment])
+    }
+
+    fn metric_total(plan: &dyn ExecutionPlan, name: &str) -> usize {
+        plan.metrics()
+            .expect("metrics")
+            .iter()
+            .filter(|m| m.value().name() == name && m.labels().is_empty())
+            .map(|m| m.value().as_usize())
+            .sum()
+    }
+
+    /// Under `user=gone` erasure the scan emits the kept rows' `ts` with row
+    /// refs numbering them 0, 1, 2, ... in the one block: the erased chunk
+    /// emits no batch and takes no row-ref position, and the chunk after it
+    /// continues the numbering where the first chunk left off.
+    #[tokio::test]
+    async fn an_erased_chunk_emits_no_batch_and_takes_no_row_ref() {
+        let (store, segments) = fixture().await;
+        let erasure = ErasurePredicate::windowless(vec![("user".into(), "gone".into())]);
+        let ts = vec![crate::logs_schema::LOG_COL_TS];
+        let plan = LogsScanExec::new(
+            TENANT,
+            LogSegmentFetcher::new(store),
+            &segments,
+            1,
+            0,
+            ROWS as i64 + 1,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(vec![erasure]),
+            Some(&ts),
+            PhaseAccounting::new(),
+            crate::logs_schema::logs_schema_with_declared(&[]),
+            Arc::new(Vec::new()),
+        )
+        .expect("scan")
+        .reproject(ts, true)
+        .expect("row refs");
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute")
+            .map(|b| b.expect("batch"))
+            .collect()
+            .await;
+
+        let kept: Vec<usize> = (0..ROWS).filter(|&row| !erased(row)).collect();
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![BATCH_ROWS - 1, ROWS - 2 * BATCH_ROWS],
+            "the first chunk less its erased row, then the last chunk"
+        );
+        assert_eq!(metric_total(&plan, "rowpath_batches"), 2);
+        let mut got_ts = Vec::new();
+        let mut got_refs = Vec::new();
+        for batch in &batches {
+            let ts = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("ts");
+            got_ts.extend(ts.values().iter().copied());
+            let refs = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("row refs");
+            got_refs.extend(refs.values().iter().map(|&p| {
+                let r = RowRef::unpack(p);
+                (r.segment, r.block, r.row)
+            }));
+        }
+        assert_eq!(
+            got_ts,
+            kept.iter().map(|&row| row as i64 + 1).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            got_refs,
+            (0..kept.len()).map(|n| (0, 0, n)).collect::<Vec<_>>()
+        );
+    }
+}

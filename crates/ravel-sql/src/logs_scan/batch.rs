@@ -7690,8 +7690,9 @@ mod row_path_tests {
     /// `attrs_raw`; a row without one reads the resource's value.
     #[test]
     fn a_record_value_overrides_the_resource_value() {
+        // The stream's resource entries are stored in key order.
         let stream = Stream {
-            resource: str_attrs(&[("shared", "res"), ("k0", "r0")]),
+            resource: str_attrs(&[("k0", "r0"), ("shared", "res")]),
             scope: str_attrs(&[("shared", "scope")]),
         };
         let records = vec![
@@ -7714,9 +7715,9 @@ mod row_path_tests {
         assert_eq!(
             map_rows(&got, X_ATTRS),
             vec![
-                pairs(&[("shared", "rec"), ("k0", "r0"), ("shared", "scope")]),
-                pairs(&[("shared", "res"), ("k0", "r0"), ("shared", "scope")]),
-                pairs(&[("shared", "rec-raw"), ("k0", "r0"), ("shared", "scope")]),
+                pairs(&[("k0", "r0"), ("shared", "rec"), ("shared", "scope")]),
+                pairs(&[("k0", "r0"), ("shared", "res"), ("shared", "scope")]),
+                pairs(&[("k0", "r0"), ("shared", "rec-raw"), ("shared", "scope")]),
             ]
         );
         assert_same_columns(&got, &want);
