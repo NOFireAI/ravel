@@ -208,7 +208,9 @@ separately-sound prune primitives.
      literal to fit; decline instead. `<>` on a declared `Str` column
      against a string literal still produces no prune arm, but is
      evaluated exactly in the scan (see the exact not-equal amendment
-     below).
+     below). `=` on a declared `I64` column against a non-NULL integer
+     literal keeps its `NumRange` arm and is also evaluated exactly in the
+     scan (see the I64 equality amendment below).
 3. **Wire the produced predicate into the existing `prune: Vec<Predicate>`
    field** on whatever pushdown-result struct `logs_pushdown.rs` already
    builds (no struct change: it is already typed to hold arbitrary
@@ -599,6 +601,8 @@ Nothing in ADR-3326 changes:
   prune channel as decision 2 of this ADR describes. `prune_channel_filters_stay_inexact` pins
   them (`logs_provider.rs:2600-2617`). The profile's shares for q37 to q40 rest on 11, 2, 0 and
   50 samples, which is noise. The mechanism extends to them, but that needs a measured reason.
+  The I64 equality amendment below supplies that reason for `=` on a declared I64 column against
+  an integer literal; the other I64 operators and Bool stay here.
 - **`LIKE` and `NOT LIKE`** (ADR-2773, contains-arm amendment). Unchanged.
 - **`attrs['k'] <> 'v'`, `NOT (c = v)`, `c <> NULL`, a `Cast`-wrapped column, a column inside an
   expression, `c <> other_column`, and any `OR`.** They are not the shape in decision 1.
@@ -821,3 +825,122 @@ TopK compaction on q25 to q27 (`interleave_record_batch` merges dictionaries too
   saving. This is the retained fraction in the saving band.
 - The page shapes (plain or dictionary) of MobilePhoneModel, URL, Referer and Title in the
   ClickBench tenant.
+
+## Amendment (2026-11-16): a declared I64 column's `=` against an integer literal is evaluated exactly in the scan, and the row path filters before it builds
+
+<!-- amendment-applies: sections="Decision|Amendment (2026-11-05): a declared Str column's `<>` against a literal is evaluated exactly in the scan" pointer="I64 equality amendment" -->
+
+Status: Accepted (2026-11-16). Issue #4309.
+
+### Evidence
+
+Issue #4232 comment 6920855702: a c6a.4xlarge, the ClickBench tenant, 222 objects, hot runs.
+
+- Q48, `SELECT ts, attrs FROM logs WHERE "UserID" = 435090932899640449`, returns 4 rows in
+  26.3 s.
+- Q47, the same filter projecting every column but `attrs`, returns the same 4 rows in 4.93 s.
+- Both emit 3,894 scan batches. The `UserID` conjunct is on the prune channel only (the exact
+  not-equal amendment, "What stays Inexact, and why"), so `FilterExec` evaluates it above the
+  scan after every row of the tenant has been built.
+- Q48's hot profile: `build_row_batch` 23.8%, string append 10.1%, `DeclaredCursor::cell_at`
+  8.2%, integer-to-text formatting about 17%. All of it builds values for rows that are then
+  dropped. The Q48/Q47 hot ratio is 5.3.
+
+### What changes
+
+1. **Scope.** A top-level conjunct `c = v` is evaluated exactly inside the logs scan, and the
+   provider reports it `Exact`, when all of these hold:
+   - `c` is a bare `Expr::Column` that resolves to a declared column of type `I64` (decision 1,
+     fixed names excluded), on either side of the `=`;
+   - `v` is a non-NULL integer literal of any width (`Int8` to `Int64`, `UInt8` to `UInt64`)
+     whose value fits an `i64`. The row filter carries `c = v` with `v` as an `Int64` literal,
+     the type `c` has, so it does not depend on which width coercion left the literal at
+     (`i64_equality_is_a_row_filter_and_exact`);
+   - row-filter pushdown is on (`LogsTableProvider::with_row_filter_pushdown`) and the provider
+     is not a distributed coordinator, exactly as for the declared Str `<>`
+     (`prune_channel_filters_stay_inexact`,
+     `a_distributed_coordinator_reports_the_str_not_equal_inexact`).
+2. **Both channels.** The conjunct still emits what decision 2 and ADR-2707 decision 5 give it:
+   a point `NumRange` prune arm and, for a key-index column, a KEY_IDX key, both when the literal
+   is `Int64`. They narrow which blocks are read. It also goes to `row_filters`, which decides
+   the rows. `leaf_is_exact` no longer lets the shape's own prune arm or key veto it; any other
+   leaf that populates either channel still answers `false`.
+3. **Row path order.** When a row-path chunk carries row filters, the scan:
+   1. applies pending erasure, before any column is built, as today;
+   2. builds only the columns the row filters read (`BoundRowFilters::reads`), for the chunk's
+      unerased rows;
+   3. evaluates the row filters on that batch;
+   4. builds the whole build projection (the `attrs` map, every `attrs['k']` column, every other
+      declared and fixed column) for the surviving rows only, with their row refs at their
+      unerased positions;
+   5. builds nothing more for a chunk with no survivor, and emits nothing for it.
+
+   The emitted batch equals what building the chunk whole and then filtering it gives
+   (`filter_first_equals_build_then_filter`,
+   `row_path_builds_attrs_only_for_rows_the_row_filter_keeps`). The memory charge covers the
+   first build's batch while the second build runs, and each build charges its own working
+   memory. Without row filters the build is unchanged. The columnar path keeps building and
+   then filtering: its build reads cursors over decoded pages, with no `attrs` map or merged
+   view to skip.
+4. **Counter.** `attrs_rows_built` counts the rows whose `attrs` map the row path built
+   (`the_scan_builds_attrs_only_for_the_rows_uid_keeps`).
+
+### The exactness argument
+
+The exact not-equal amendment's argument carries over. What it needs for this shape:
+
+1. **Same expression.** The scan evaluates the physical expression the session builds for
+   `c = v` against the full `logs` schema, the expression `FilterExec` would run. Comparison and
+   NULL semantics are DataFusion's.
+2. **Same values.** The column the filter reads is built by the code that builds `c` for
+   `FilterExec`'s input: the row path's merged view and `declared_cells_array`, the columnar
+   path's cursors. So the ADR-0090 resolution holds unchanged: the winning occurrence's `I64`
+   cell, NULL when the winner has another type, else the stream's resource or scope value, else
+   NULL. A row's value depends only on its own cells and its stream's attributes, not on which
+   other rows or columns the build holds, so building the filter column alone for the chunk and
+   rebuilding every column for the survivors give each row the value the whole-chunk build gives
+   it. `i64_equality_row_filter_matches_filter_exec` compares the rows against a provider with
+   the row filter off, over values from the record cell, a wrong-variant cell, the resource, the
+   scope and nowhere, with pending erasure and `attrs_raw` blocks.
+3. **NULL drops.** `NULL = v` is NULL, and the filter drops a NULL verdict, as
+   `filter_record_batch` does in `FilterExec`. That covers a wrong-variant cell and a row with no
+   value anywhere.
+4. **Every row passes through it.** Both emission paths and every rebuilt scan apply the filter,
+   as for the Str `<>`. Late materialization's phase 2 fetches rows phase 1 already filtered and
+   carries no row filter.
+5. **Nothing downstream assumes the scan is unfiltered.** The statistics, metadata rewrite and
+   fetch-count gates key on `row_filters` being non-empty, not on the conjunct's shape.
+
+### What stays Inexact under the I64 equality rule
+
+- **I64 `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN` and `IN`.** No measured statement needs them; they
+  stay on the prune channel. An `OR` of I64 equalities stays a prune envelope and a KEY_IDX key
+  set.
+- **Bool `=`.** Same reason.
+- **`=` on a declared Str or Bytes column.** Same reason. The mechanism extends to them.
+- **A NULL literal, a float, decimal or string literal, an unsigned literal past `i64::MAX`, a
+  `Cast`-wrapped column, a column inside an expression, `c = other_column`, a `NOT`, and any
+  `OR`.** They are not the shape in item 1.
+- **A provider with row-filter pushdown off, and a distributed coordinator.** Their scans or
+  workers receive no row filter, so `FilterExec` must stay.
+
+### Bands
+
+Q48 and Q47 are the two statements of #4232 comment 6920855702, on the same tenant and box
+class. A ratio from 2 to 3 is neither inside the band nor a miss; it is recorded and explained.
+
+| Figure | Band | Miss | Basis |
+|---|---|---|---|
+| Q48 / Q47 hot wall ratio after this change | at most 2 | above 3 | predicted; the measured ratio before it is 5.3 (26.3 s / 4.93 s), #4232 comment 6920855702 |
+| Q48 rows returned | 4 | any other count | measured 4 before the change, #4232 comment 6920855702 |
+| `FilterExec` in Q48's and Q47's plans | absent | present | predicted |
+| Q48 `attrs_rows_built` summed over the scan | equal to Q48's rows returned | any other value | predicted |
+
+### Not established
+
+- Neither ratio has been measured after the change. The band rests on the profile's share of
+  work done for dropped rows, not on a run.
+- How much of Q47's 4.93 s the change removes too. Q47 builds no `attrs` map. Its blocks take
+  the columnar path, whose build this change leaves as it is, unless an `attrs_raw` page or a
+  pending erasure puts a block on the row path; how many of the tenant's blocks carry an
+  `attrs_raw` page was not captured.

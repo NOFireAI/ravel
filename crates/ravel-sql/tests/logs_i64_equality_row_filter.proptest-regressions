@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 75fae1a28fd26e29dd900ce13f952d04701bcf9843fa09f9ac3bf3a10c4dd976 # shrinks to corpus = Corpus { streams: [Resource(1)], objects: [[Row { stream: 0, uid: None, erased: false }]], erasure: false, max_dynamic_columns: 0, value: 1 }
+cc 95f9c6d034ad1c354c82821316fa39b0dc91cad4d98108a1c19fd937d4edae20 # shrinks to corpus = Corpus { streams: [None], objects: [[Row { stream: 0, uid: None, erased: false }, Row { stream: 0, uid: None, erased: false }]], erasure: false, max_dynamic_columns: 0, value: 0 }
