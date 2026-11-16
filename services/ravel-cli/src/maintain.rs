@@ -4488,6 +4488,30 @@ mod tests {
         );
     }
 
+    /// A version-protected claim skip (ADR-4233 decision 4, H8) renders under
+    /// its own reason name, with both its retry and recheck points at
+    /// `i64::MAX`, in the same field layout as every other reason.
+    #[test]
+    fn a_version_protected_claim_skip_renders_its_own_reason() {
+        let skip = ClaimSkip {
+            reason: ravel_maintain::ClaimSkipReason::VersionProtectedClaim,
+            work_id_hex: "ab".repeat(32),
+            holder_process_id: None,
+            expiry_unix_ms: i64::MAX,
+            reschedule_after_unix_ms: i64::MAX,
+            recheck_after_unix_ms: i64::MAX,
+        };
+        assert_eq!(
+            claim_skip_fields(&skip),
+            format!(
+                "reason=version_protected_claim work_id={} holder=unknown \
+                 claim_expiry_unix_ms={max} retry_after_unix_ms={max} recheck_after_unix_ms={max}",
+                "ab".repeat(32),
+                max = i64::MAX
+            )
+        );
+    }
+
     /// A bucket the walk skipped for an unwritable log object (issue #2580)
     /// prints its `unwritable_skipped` line with the object's key escaped, and
     /// fails the run however it ended: on a budget stop, on stragglers, and

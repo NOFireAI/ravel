@@ -253,7 +253,8 @@ pub struct ClaimSkip {
     /// The holding process, when the claim payload was readable.
     pub holder_process_id: Option<Uuid>,
     /// `last_modified + lease`, from the store's own timestamp. `0` when there
-    /// was no observation to date (a vanished claim).
+    /// was no observation to date (a vanished claim). [`i64::MAX`], as are
+    /// both points below, for [`ClaimSkipReason::VersionProtectedClaim`].
     pub expiry_unix_ms: i64,
     /// The earliest this bucket should be retried: one millisecond past the
     /// holder's expiry (past the observation instant for a vanished claim).
@@ -1801,6 +1802,7 @@ mod tests {
         let young = guard_at(written_ms + 1_000);
         let skip = skipped(young.acquire(&store).await.expect("young"), "young");
         assert_eq!(skip.reason, ClaimSkipReason::VersionProtectedClaim);
+        assert_eq!(skip.reason.name(), "version_protected_claim");
         assert_eq!(skip.expiry_unix_ms, i64::MAX);
         assert_eq!(skip.reschedule_after_unix_ms, i64::MAX);
         assert_eq!(skip.recheck_after_unix_ms, i64::MAX);

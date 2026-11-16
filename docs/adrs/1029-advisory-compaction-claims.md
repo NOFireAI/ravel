@@ -987,10 +987,16 @@ races one it cannot understand.
 
 Tests, each shown failing against the code before this amendment:
 `claim_above_known_version_or_zero_is_never_stolen` in
-`crates/ravel-fleet/src/claim.rs`; the new `ClaimSkipReason` variant's
-rendering and warn-once behavior in `crates/ravel-maintain/src/claim_guard.rs`;
-and `a_future_format_claim_is_never_stolen_at_any_age` in
-`services/ravel-server/src/maintain.rs`, which replaces
+`crates/ravel-fleet/src/claim.rs`; `a_version_protected_claim_is_never_stolen`
+and `version_protected_warn_fires_once_per_work_id` in
+`crates/ravel-maintain/src/claim_guard.rs`;
+`claims_skipped_help_text_names_the_version_protected_reason` in
+`services/ravel-server/src/metrics.rs`;
+`a_version_protected_claim_skip_renders_its_own_reason` in
+`services/ravel-cli/src/maintain.rs`; and
+`a_future_format_claim_is_never_stolen_at_any_age` in
+`services/ravel-server/src/maintain.rs`, which asserts the rendered
+`/metrics` skip count and replaces
 `a_future_format_claim_stalls_an_erasure_for_at_most_the_lease_ceiling` named
 by the 2026-11-09 amendment: that test is no longer accurate, since a
 future-format claim is no longer stolen at any age.

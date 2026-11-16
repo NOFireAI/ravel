@@ -8448,15 +8448,16 @@ mod tests {
     /// lease it cannot compute; the operator remedy is a build that knows the
     /// version, or a by-hand delete of the claim object.
     ///
-    /// Two passes, run far apart, rule out two plausible wrong fixes rather
-    /// than one: a pass at the OLD 24 h-plus-jitter steal threshold rules out
-    /// a fix that left the pre-ADR-4233 ceiling in place (that exact instant
-    /// used to steal); a second pass ten times further out rules out a fix
-    /// that merely raised the ceiling to some longer-but-still-finite bound
-    /// instead of removing it. Both passes assert the claim's stored bytes
-    /// and CAS version are byte-identical to the planted claim, not only that
-    /// the counters read zero, so a steal that succeeds but is miscounted
-    /// cannot pass either.
+    /// Two passes, run far apart: one a millisecond past the 24 h ceiling,
+    /// and one at ten times the ceiling, past the old ceiling plus any jitter
+    /// (the jitter is drawn below one lease). The second rules out a fix that
+    /// left the pre-ADR-4233 ceiling in place, and one that widened it to any
+    /// bound under ten ceilings instead of removing it. Both passes assert the
+    /// claim's stored bytes and CAS version are byte-identical to the planted
+    /// claim, not only the counters, so a steal that succeeds but is
+    /// miscounted cannot pass either. The rendered `/metrics` body counts both
+    /// passes on `ravel_maintain_claims_skipped_total` and its HELP names the
+    /// `version_protected_claim` reason.
     #[tokio::test]
     async fn a_future_format_claim_is_never_stolen_at_any_age() {
         use prost::Message as _;
@@ -8567,9 +8568,7 @@ mod tests {
             );
         }
 
-        // At the instant that used to be the steal threshold (ADR-1029's
-        // 2026-11-09 amendment, superseded by ADR-4233): a fix that left the
-        // old ceiling in place for a future-format claim would steal here.
+        // One millisecond past the 24 h ceiling.
         let clock = FixedClock::new((plant_ms + MAX_OBSERVED_LEASE_MS + 1) * 1_000_000);
         run_erasure_pass(
             &store,
@@ -8596,8 +8595,8 @@ mod tests {
         )
         .await;
 
-        // Ten times further out: a fix that merely widened the ceiling to a
-        // longer, still-finite bound instead of removing it would steal here.
+        // Ten ceilings out, past the old ceiling plus any jitter: a fix that
+        // kept the ceiling, or widened it to under ten ceilings, steals here.
         clock.set((plant_ms + 10 * MAX_OBSERVED_LEASE_MS) * 1_000_000);
         run_erasure_pass(
             &store,
@@ -8623,6 +8622,28 @@ mod tests {
             &planted_bytes,
         )
         .await;
+
+        let body = rendered_metrics(&safety);
+        assert!(
+            body.contains(
+                "ravel_maintain_claims_skipped_total{mode=\"maintain\",signal=\"metrics\"} 2"
+            ),
+            "both held passes count on the rendered skip counter:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_claims_stolen_total{mode=\"maintain\",signal=\"metrics\"} 0"
+            ),
+            "the rendered steal counter stays at zero:\n{body}"
+        );
+        let help = body
+            .lines()
+            .find(|line| line.starts_with("# HELP ravel_maintain_claims_skipped_total "))
+            .expect("claims_skipped HELP header rendered");
+        assert!(
+            help.contains(ravel_maintain::ClaimSkipReason::VersionProtectedClaim.name()),
+            "the rendered HELP names the version_protected_claim reason:\n{help}"
+        );
     }
 
     /// The `.done` predicate hash is what makes a permanent completion record
