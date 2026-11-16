@@ -125,6 +125,27 @@ pub(crate) async fn list_bucket_strict(
     partition_bucket_listing(metas)
 }
 
+/// [`list_bucket_strict`], counting each listing page into `ledger` like
+/// [`list_bucket_with_ledger`]. The migrate walk's rewrite primitives plan from
+/// this so a bucket holding a key the census cannot address fails the run
+/// (ADR-4233 decision 6) rather than planning over a short listing, while still
+/// charging the LIST under the request ledger's [`RequestPhase::List`].
+pub(crate) async fn list_bucket_strict_with_ledger(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    ledger: Option<&RequestLedger>,
+) -> Result<BucketListing> {
+    let prefix = keys::commit_shard_hour_prefix(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )?;
+    let (metas, unaddressable) = list_all_counted(store, &prefix, ledger).await?;
+    refuse_unaddressable(&prefix, &unaddressable)?;
+    partition_bucket_listing(metas)
+}
+
 /// [`MaintainError::UnaddressableKey`] naming the first of `unaddressable`'s
 /// keys, when the listing of `prefix` skipped any.
 pub(crate) fn refuse_unaddressable(prefix: &str, unaddressable: &Unaddressable) -> Result<()> {

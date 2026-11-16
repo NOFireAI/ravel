@@ -690,12 +690,22 @@ impl PartIndexRefusalKind {
 }
 
 impl MaintainError {
-    /// The trailer version an RSEG, RLOG or RSPAN reader refused, when this
-    /// error is that refusal.
+    /// The trailer (or RLOG section) version an RSEG, RLOG or RSPAN reader
+    /// refused, when this error is that refusal.
+    ///
+    /// `LogSegError::UnsupportedSectionVersion` (ADR-4233 hazard H5) counts
+    /// here too: a readable RLOG trailer whose directory names a section
+    /// version this build cannot read is "cannot read this object", the same
+    /// class as an out-of-window trailer, so it maps to out of window and not
+    /// to a corrupt input. Its `version` is the section version the reader
+    /// refused.
     pub(crate) fn unsupported_version(&self) -> Option<u16> {
         match self {
             MaintainError::Segment(SegmentError::UnsupportedVersion(v))
             | MaintainError::LogSeg(LogSegError::UnsupportedVersion(v))
+            | MaintainError::LogSeg(LogSegError::UnsupportedSectionVersion {
+                version: v, ..
+            })
             | MaintainError::SpanSeg(SpanSegError::UnsupportedVersion(v)) => Some(*v),
             _ => None,
         }
@@ -746,3 +756,39 @@ impl From<ravel_segment::WriteError> for MaintainError {
 }
 
 pub type Result<T> = std::result::Result<T, MaintainError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR-4233 hazard H5: a LogSeg `UnsupportedSectionVersion` is "cannot read
+    /// this object", the same class as an out-of-window trailer. It reports its
+    /// section version here, so the loader wraps it as
+    /// [`MaintainError::InputOutOfWindow`] and the migrate walk holds the bucket
+    /// as out of window, not as corrupt input. Before the H5 fix this returned
+    /// `None` and the refusal fell through to the `corrupt_input` hold.
+    #[test]
+    fn logseg_unsupported_section_version_reports_its_version() {
+        let err = MaintainError::LogSeg(LogSegError::UnsupportedSectionVersion {
+            section: "POSTINGS",
+            version: 9,
+        });
+        assert_eq!(err.unsupported_version(), Some(9));
+    }
+
+    /// The companion: a LogSeg trailer-version refusal already reported here,
+    /// and a plain corruption still does not. Pins that the H5 change did not
+    /// reclassify a corrupt object (no build reads it, so holding it protects
+    /// nothing).
+    #[test]
+    fn logseg_trailer_version_reports_but_corruption_does_not() {
+        assert_eq!(
+            MaintainError::LogSeg(LogSegError::UnsupportedVersion(7)).unsupported_version(),
+            Some(7)
+        );
+        assert_eq!(
+            MaintainError::LogSeg(LogSegError::Corrupted("bad".into())).unsupported_version(),
+            None
+        );
+    }
+}

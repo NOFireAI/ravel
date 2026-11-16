@@ -917,9 +917,9 @@ async fn physical_sweep(
 /// one with another's gate would call every object corrupt, which is the exact
 /// collapse this function exists to prevent. Any other signal is swept
 /// unprobed. Audit and alerts also write RLOG, but neither reaches this sweep:
-/// audit objects age out through `sweep_audit_retention`, which applies the
-/// same RLOG gate through [`held_out_of_window_rlog`], and alerts is not a
-/// maintained signal.
+/// audit objects age out through `sweep_audit_retention`, and alert objects
+/// through `sweep_alert_retention`, each applying the same RLOG gate through
+/// [`held_out_of_window_rlog`].
 ///
 /// The version comes from the trailer, not from the commit record's
 /// `segment_format_version`: that field is a writer's stamp no reader checks

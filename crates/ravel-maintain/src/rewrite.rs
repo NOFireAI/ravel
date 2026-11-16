@@ -96,7 +96,8 @@ use crate::publish::{
     publish_superseding_record,
 };
 use crate::read::{
-    BucketListing, input_set_hash, list_bucket_with_ledger, load_inputs_with_ledger,
+    BucketListing, input_set_hash, list_bucket_strict_with_ledger, list_bucket_with_ledger,
+    load_inputs_with_ledger,
 };
 use crate::request_ledger::{RequestLedger, RequestPhase, note_get};
 use crate::rlog::RlogCodec;
@@ -857,7 +858,8 @@ async fn migrate_bucket_format_scoped(
         return Ok(MigrateOutcome::NotSealed);
     }
 
-    let listing = list_bucket_with_ledger(store, bucket, config.request_ledger.as_ref()).await?;
+    let listing =
+        list_bucket_strict_with_ledger(store, bucket, config.request_ledger.as_ref()).await?;
     if let Some(refused) = migrate_listing_gate(&listing) {
         return Ok(refused);
     }
@@ -1327,7 +1329,7 @@ async fn reencode_compaction_parts_scoped(
     let start_ns = clock.now_ns();
     let ledger = config.request_ledger.as_ref();
 
-    let listing = list_bucket_with_ledger(store, bucket, ledger).await?;
+    let listing = list_bucket_strict_with_ledger(store, bucket, ledger).await?;
     if let Some(refused) = reencode_listing_gate(&listing) {
         return Ok(refused);
     }
@@ -1715,7 +1717,27 @@ fn reencode_rseg_part(
     input_set_hash: &[u8; 32],
 ) -> Result<BuiltPart> {
     let limits = ReaderLimits::default();
-    let loc = open_from_full(object, limits)?;
+    // A part whose trailer version this build cannot read is out of window, not
+    // corrupt (ADR-4233 decision 6, H5), exactly as an L0 input is on the
+    // migrate walk ([`load_input_catalog_noting_version`]). Wrapping it here
+    // routes it through [`crate::migrate::MigrateHoldReason::from_refusal`] as
+    // `input_out_of_window` rather than `corrupt_input`, so a re-encode holds
+    // such a part for a later build instead of calling it damaged.
+    let loc = match open_from_full(object, limits) {
+        Ok(loc) => loc,
+        Err(err) => {
+            let err = MaintainError::from(err);
+            return Err(match err.unsupported_version() {
+                Some(version) => MaintainError::InputOutOfWindow {
+                    object_key: object_key.to_string(),
+                    version,
+                    content_hash: part.content_hash.clone(),
+                    source: Box::new(err),
+                },
+                None => err,
+            });
+        }
+    };
     crate::compat_policy::refuse_unknown_sections(
         object_key,
         &loc.unknown_section_kinds,
