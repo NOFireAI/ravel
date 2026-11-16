@@ -40,9 +40,12 @@ The frozen contracts:
    job; B = derived catalog objects, rebuilt by the fold; C = immutable
    metadata records, additive-only; D = identity/domain-hash encodings,
    contained per bucket, never generically migrated.
-2. Version explicitly. Every versioned binary format bumps its version:
-   RSEG, RLOG and RSPAN trailers and section versions (POSTINGS, KEY_IDX)
-   and the catalog's `.csnap`, `.npost`, `.cstat` and `.kidx` objects.
+2. Version explicitly. A change to a versioned binary layout bumps that
+   layout's version: RSEG, RLOG and RSPAN trailers and section versions
+   (POSTINGS, KEY_IDX) and the envelopes of the catalog's `.csnap`,
+   `.npost`, `.cstat` and `.kidx` objects. A proto record carried inside
+   one of them (a `.csnap` entry or part header) follows the record rule
+   below instead, as ADR-0873's `SnapshotEntry` field 15 did.
    Identity encodings get a new domain string (ravel-series-v2, not an
    edit to v1); key layouts add new prefixes. Protos add fields with new
    numbers and never renumber or reuse one. A catalog HEAD change always
