@@ -453,6 +453,38 @@ mod tests {
         }
     }
 
+    /// The `/metrics` HELP of `ravel_compat_publish_refused_total` names every
+    /// reason label the family can carry and marks `no_bucket_view` reserved.
+    #[test]
+    fn the_refusal_help_names_every_reason_label() {
+        let mut body = String::new();
+        crate::metrics::render_compat_family(
+            &mut body,
+            crate::config::Mode::All,
+            &crate::metrics::CompatSnapshot {
+                view_age_seconds: None,
+                epoch: 0,
+                active_write_versions: Vec::new(),
+                refusals: Vec::new(),
+                refresh_failures: 0,
+            },
+        );
+        let help = body
+            .lines()
+            .find(|line| line.starts_with("# HELP ravel_compat_publish_refused_total "))
+            .expect("HELP line");
+        let words: Vec<&str> = help
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .collect();
+        for reason in CompatRefusalReason::NAMED
+            .into_iter()
+            .chain([CompatRefusalReason::Other])
+        {
+            assert!(words.contains(&reason.name()), "{reason:?}: {help}");
+        }
+        assert!(help.contains("no_bucket_view (reserved"), "{help}");
+    }
+
     /// An ingest refusal under a reason the series did not hold yet lands in
     /// `(family, reason)` order, not at the end.
     #[test]
