@@ -1632,6 +1632,7 @@ impl LogScanStream {
             erasure: &self.erasure,
             key,
             attrs_built: &self.blocks.attrs_rows_built,
+            attrs_merged: &self.blocks.attrs_rows_merged,
         };
         let batch = loop {
             if *pos >= block.len() {
