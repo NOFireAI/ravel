@@ -36,10 +36,13 @@
 //!    held and version-held therefore counts on the legal-hold counter.
 //! 4. **Version hold** (ADR-0066 decisions 1 and 2) runs next, still before
 //!    any delete. Each data object the sweep is about to delete is
-//!    probed for its trailer version through a 16-byte suffix GET, through
-//!    the gate of the bucket's own format (RSEG for metrics, RLOG for logs,
-//!    RSPAN for spans), and the answer is a typed classification, never a
-//!    string: readable here, outside this build's reader window, or corrupt. An object outside the window is
+//!    probed through the gate of the bucket's own format (RSEG for metrics,
+//!    RLOG for logs, RSPAN for spans): RSEG through a 16-byte suffix GET of
+//!    its trailer, RLOG and RSPAN through a 64 KiB footer suffix GET plus
+//!    ranged GETs of their nested section versions (up to four GETs for RLOG,
+//!    three for RSPAN). The answer is a typed classification, never a
+//!    string: readable here, outside this build's reader window (trailer or
+//!    nested section), or corrupt. An object outside the window is
 //!    not garbage -- a peer running the other side of a rolling upgrade, or the
 //!    build a rollback returns to, reads it normally -- so the sweep declines to
 //!    delete anything in that bucket this pass, leaves the tombstone in place,
@@ -907,10 +910,11 @@ async fn physical_sweep(
 /// The distinction this draws is the whole point (ADR-0066 decision 2): a
 /// version this build does not admit and bytes no build can read are both
 /// "cannot read this", and collapsing them turns a rolling upgrade into data
-/// loss. It is drawn from each format's own trailer gate, the same one a full
-/// read applies, so this cannot disagree with the reader about which versions
-/// are admitted. A corrupt object is deliberately NOT held: no build reads it,
-/// so holding it keeps nothing alive and would only stall the bucket forever.
+/// loss. It is drawn from each format's own trailer and section gates, the same
+/// ones a full read applies, so this cannot disagree with the reader about which
+/// versions are admitted. A corrupt object is deliberately NOT held: no build
+/// reads it, so holding it keeps nothing alive and would only stall the bucket
+/// forever.
 ///
 /// The bucket's signal picks the gate: RSEG for metrics, RLOG for logs, RSPAN
 /// for spans. Each format keeps its own trailer and its own window, and probing
@@ -921,15 +925,19 @@ async fn physical_sweep(
 /// through `sweep_alert_retention`, each applying the same RLOG gate through
 /// [`held_out_of_window_rlog`].
 ///
-/// The version comes from the trailer, not from the commit record's
+/// The version comes from the object's bytes (its trailer, or a nested
+/// section's header), not from the commit record's
 /// `segment_format_version`: that field is a writer's stamp no reader checks
 /// against the bytes, and the L1 parts are found by LIST, not through a record.
 ///
-/// Cost: one 16-byte suffix GET per data object (L0 and L1), charged to the
-/// sweep phase, and only in the pass that would delete (after the tombstone's
-/// protection horizon has elapsed and the HEAD-reachability and legal-hold
-/// gates are clear). The GET also returns the object's total size, so no
-/// separate HEAD is needed, and the gate never asks for the footer.
+/// Cost per data object (L0 and L1), charged to the sweep phase, and only in
+/// the pass that would delete (after the tombstone's protection horizon has
+/// elapsed and the HEAD-reachability and legal-hold gates are clear): RSEG one
+/// 16-byte suffix GET of the trailer; RLOG one 64 KiB suffix GET of the footer
+/// plus up to three ranged GETs (a footer that did not fit, the POSTINGS
+/// version byte, the KEY_IDX prefix); RSPAN the same suffix GET plus up to two
+/// (a footer that did not fit, the KEY_IDX version byte). Each GET returns the
+/// object's total size, so no separate HEAD is needed.
 async fn held_out_of_window(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
@@ -948,8 +956,9 @@ async fn held_out_of_window(
     Ok(held)
 }
 
-/// The RLOG data objects among `keys` whose trailer version is outside this
-/// build's reader window, each counted into
+/// The RLOG data objects among `keys` whose trailer version, or a nested
+/// POSTINGS or KEY_IDX section's grammar version, is outside this build's read
+/// set, each counted into
 /// [`held_out_of_window_objects_total`]. The audit retention sweep's version
 /// hold (ADR-4233 decision 4, H7): audit objects are RLOG whatever the signal
 /// says, so the gate is chosen here rather than from the signal.
@@ -967,21 +976,13 @@ pub(crate) async fn held_out_of_window_rlog(
     Ok(held)
 }
 
-/// The data-object format whose trailer gate the version hold applies.
-///
-/// One suffix GET of RSEG's [`TRAILER_LEN`] serves all three: the assertion
-/// below fails the build if RLOG's or RSPAN's trailer ever differs in length.
+/// The data-object format whose gate the version hold applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbedFormat {
     Rseg,
     Rlog,
     Rspan,
 }
-
-const _: () = assert!(
-    ravel_logseg::footer::TRAILER_LEN as u64 == TRAILER_LEN
-        && ravel_rspan::footer::TRAILER_LEN as u64 == TRAILER_LEN
-);
 
 impl ProbedFormat {
     fn for_signal(signal: Signal) -> Option<Self> {
@@ -992,40 +993,13 @@ impl ProbedFormat {
             _ => None,
         }
     }
-
-    /// The trailer version when `tail` (a suffix of an object of `total_size`
-    /// bytes covering its trailer) is outside this build's window for this
-    /// format, `None` when it is readable here or corrupt.
-    ///
-    /// RLOG and RSPAN have no trailer-only classifier, so this runs their
-    /// suffix open over the trailer alone: it checks magic and then the
-    /// version window before any footer byte, and an in-window trailer comes
-    /// back as `NeedRange` (or a footer-bounds error), never as
-    /// `UnsupportedVersion`.
-    fn out_of_window(self, total_size: u64, tail: &[u8]) -> Option<u16> {
-        match self {
-            Self::Rseg => match classify_trailer(total_size, tail) {
-                TrailerClass::OutsideVersionWindow(version) => Some(version),
-                TrailerClass::Readable(_) | TrailerClass::Corrupt(_) => None,
-            },
-            Self::Rlog => match ravel_logseg::open_from_suffix(tail, total_size) {
-                Err(ravel_logseg::LogSegError::UnsupportedVersion(version)) => Some(version),
-                _ => None,
-            },
-            Self::Rspan => match ravel_rspan::open_from_suffix(tail, total_size) {
-                Err(ravel_rspan::SpanSegError::UnsupportedVersion(version)) => Some(version),
-                _ => None,
-            },
-        }
-    }
 }
 
-/// The trailer version of one data object when it is outside this build's
+/// The trailer version of one RSEG object when it is outside this build's
 /// reader window, `None` when the object is readable here, is corrupt, or is
 /// already gone (a delete that a previous pass completed is not a hold).
-async fn out_of_window_version(
+async fn rseg_out_of_window_version(
     store: &dyn ObjectStoreBackend,
-    format: ProbedFormat,
     key: &str,
 ) -> Result<Option<u16>> {
     let got = match store.get(key, GetRange::Suffix(TRAILER_LEN)).await {
@@ -1033,26 +1007,30 @@ async fn out_of_window_version(
         Err(StoreError::NotFound) => return Ok(None),
         Err(e) => return Err(MaintainError::Store(e)),
     };
-    Ok(format.out_of_window(got.total_size, got.data.as_ref()))
+    Ok(match classify_trailer(got.total_size, got.data.as_ref()) {
+        TrailerClass::OutsideVersionWindow(version) => Some(version),
+        TrailerClass::Readable(_) | TrailerClass::Corrupt(_) => None,
+    })
 }
 
 /// The version one data object is held on: its trailer version when outside
-/// this build's reader window, and for RLOG also the grammar version of a
-/// nested POSTINGS or KEY_IDX section outside this build's read set, which the
-/// trailer-only probe never sees (ADR-4233 decision 4, hazard H5). `None` when
-/// the object is readable here, is corrupt, or is already gone. RSEG and RSPAN
-/// have no version-gated nested sections, so their hold is the trailer alone.
+/// this build's reader window, and for RLOG and RSPAN also the grammar version
+/// of a nested section outside this build's read set (RLOG's POSTINGS and
+/// KEY_IDX, RSPAN's KEY_IDX), which a trailer-only probe never sees (ADR-4233
+/// decision 4, hazard H5). `None` when the object is readable here, is corrupt,
+/// or is already gone. RSEG has no version-gated nested section, so its hold is
+/// the trailer alone: one 16-byte suffix GET. RLOG costs a 64 KiB footer suffix
+/// GET plus up to three ranged GETs, RSPAN the same suffix GET plus up to two
+/// (see `compat_certify`'s module doc).
 async fn held_version(
     store: &dyn ObjectStoreBackend,
     format: ProbedFormat,
     key: &str,
 ) -> Result<Option<u16>> {
     match format {
-        // One footer-suffix GET serves both the trailer version and the nested
-        // section probe, so the RLOG hold costs the same one request per object
-        // as the trailer-only gate did.
+        ProbedFormat::Rseg => rseg_out_of_window_version(store, key).await,
         ProbedFormat::Rlog => crate::compat_certify::rlog_held_version(store, key).await,
-        ProbedFormat::Rseg | ProbedFormat::Rspan => out_of_window_version(store, format, key).await,
+        ProbedFormat::Rspan => crate::compat_certify::rspan_held_version(store, key).await,
     }
 }
 
@@ -1458,6 +1436,37 @@ mod tests {
                 .is_empty(),
             "a readable RLOG object with a POSTINGS section is not held"
         );
+    }
+
+    /// The spans retention gate holds a `.rspan` object whose trailer version
+    /// is in window but whose KEY_IDX section is at a version outside the read
+    /// set; the readable control is not held.
+    #[tokio::test]
+    async fn held_out_of_window_holds_an_unreadable_rspan_key_idx() {
+        let store = MemoryStore::new();
+        let bucket = Bucket::new(tenant(), Signal::Spans, 0, 1);
+        for (key, bump) in [("t/held/obj", true), ("t/readable/obj", false)] {
+            store
+                .put(
+                    key,
+                    bytes::Bytes::from(crate::compat_certify::rspan_object_with_key_idx(bump)),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put object");
+        }
+        let keys = ["t/held/obj".to_string(), "t/readable/obj".to_string()];
+        let held = held_out_of_window(&store, &bucket, &keys, &[])
+            .await
+            .expect("held");
+        let above = ravel_logseg::key_index::KEY_IDX_VERSIONS
+            .iter()
+            .max()
+            .copied()
+            .map(u16::from)
+            .expect("read set")
+            + 1;
+        assert_eq!(held, vec![("t/held/obj".to_string(), above)]);
     }
 
     /// The retention read of a compaction record refuses a future
