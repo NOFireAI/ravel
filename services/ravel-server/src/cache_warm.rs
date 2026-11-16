@@ -3610,7 +3610,15 @@ mod tests {
             most_recent_parts(&catalog_for(store.clone()), tenant, Signal::Logs, now).await;
         assert_eq!(parts.len(), 4);
         let sizes: Vec<u64> = parts.iter().map(|part| part.object_size).collect();
-        let budget = sizes[0] + sizes[1] - 1;
+        // Fixture sizes vary by a byte with the encoded timestamps, so the
+        // share is one byte short of the smallest consecutive pair, not of
+        // the first pair.
+        let budget = sizes
+            .windows(2)
+            .map(|pair| pair[0] + pair[1])
+            .min()
+            .expect("four parts")
+            - 1;
         assert!(
             sizes.iter().all(|size| *size <= budget)
                 && sizes.windows(2).all(|pair| pair[0] + pair[1] > budget),
