@@ -203,9 +203,10 @@ The Antithesis server build turns the release profile's thin LTO off,
 because compile-time instrumentation does not survive LTO. The published
 image keeps LTO. Unstripped binaries are in `/symbols` of each image.
 
-The workload also runs weekly from `.github/workflows/antithesis-weekly.yml`
-(Tuesday 03:00 UTC, at most 240 compute hours), which calls `scripts/build.sh
-all` and `scripts/launch.sh` as they are.
+Once #4308 lands, the workload also runs weekly from
+`.github/workflows/antithesis-weekly.yml` (Tuesday 03:07 UTC, at most 240
+compute hours), which calls `scripts/build.sh all` and `scripts/launch.sh` as
+they are.
 
 The harness expects these fault flags (`scripts/launch.sh`):
 
@@ -217,5 +218,6 @@ Driver environment for the local loop: `WORKLOAD_EVENTUALLY=off` turns the
 eventually off, `WORKLOAD_EVENTUALLY_AFTER_SECS=N` runs it after N seconds,
 and `WORKLOAD_MAX_WRITES` caps the writes per timeline (the compose file sets 2500; the eventually is proven at about 2400 writes).
 `WORKLOAD_INJECT_MISSING_RECORD=1` is a self-check: the model then expects one
-record more than is sent for every 50th log write, so the presence assertions
-must fail.
+record more than is sent for each write whose id is 3 modulo 50 and that is a
+log write (ids are shared with metrics writes, so this is about one log write
+in 80 at the default rule weights), and the presence assertions must fail.
