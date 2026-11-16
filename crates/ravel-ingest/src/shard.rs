@@ -34,8 +34,8 @@ use ravel_commit::rng::RngSource;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_proto::commit::v1::CommitRecord;
 use ravel_segment::{
-    ExemplarInput, HistogramSample, IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3,
-    SeriesValues,
+    ExemplarInput, HistogramSample, IngestBounds, SegmentIdentity, SegmentVersion, SegmentWriter,
+    SeriesInputV3, SeriesValues,
 };
 use ravel_types::{
     CommitToken, ExemplarCap, Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId,
@@ -48,6 +48,7 @@ use uuid::Uuid;
 
 use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
+use crate::compat::{CompatPublishRefusal, PublishGrant, PutAbort, warn_publish_refused};
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LagCheck, MAX_FLUSH_ALL_PASSES,
     MAX_FLUSH_CLOCK_HOLD_NS, SEGMENT_FORMAT_VERSION, StoreClockLag, checked_ingest_hour_bucket,
@@ -57,7 +58,9 @@ use crate::config::{
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::error::WriteError;
 use crate::flush_share::TenantFlushShares;
-use crate::format_floor::{FormatFamily, warn_flush_refused, warn_flush_written_below};
+use crate::format_floor::{
+    BelowFormatFloor, FormatFamily, warn_flush_refused, warn_flush_written_below,
+};
 use crate::generation::{
     FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, ScanCheck,
     mismatch_retry_spent, reread_and_check, send_hand_back,
@@ -578,7 +581,7 @@ impl FlushCtx {
     /// re-serialize, accrete new samples, or re-read the clock for identity
     /// purposes (RTT sampling inside the retry helpers is the one clock read
     /// that is not identity-affecting).
-    async fn run_flush(&self, pinned: PinnedFlush) {
+    async fn run_flush(&self, pinned: PinnedFlush, grant: PublishGrant) {
         let PinnedFlush {
             tenant_hash,
             seq,
@@ -598,13 +601,16 @@ impl FlushCtx {
 
         let exemplar_inputs = self.admit_exemplars(exemplars, &series);
 
-        // ADR-0027: every flush emits v5, scalar and histogram batches alike.
-        // The raw-sample adapter frames each series into a single run, so the
-        // writer choice is no longer version- or content-driven; the buffer's
+        // The version was chosen at permit grant (ADR-4233 decision 2); with
+        // no activation policy it is `SegmentVersion::CURRENT`. The buffer's
         // per-series value kind (scalar or histogram) is carried through
         // `into_series_values` and the writer picks the VAL/HIST page per
         // series.
-        let segment_version = SEGMENT_FORMAT_VERSION;
+        let Some(segment_version) = SegmentVersion::from_number(grant.version()) else {
+            self.refuse_compat(tenant_hash, waiters, grant.unencodable());
+            drop(charges);
+            return;
+        };
         // The encode runs on the write gate when one is attached (ADR-1702).
         // The job takes the byte charges with the buffer and returns them with
         // the segment, so they stay held through the permit wait and the encode
@@ -634,7 +640,8 @@ impl FlushCtx {
                         values: accum.values.into_series_values(),
                     })
                     .collect();
-                let written = SegmentWriter::write_histograms_with_exemplars(
+                let written = SegmentWriter::write_histograms_with_exemplars_at(
+                    segment_version,
                     series_inputs,
                     identity,
                     ingest_bounds,
@@ -703,18 +710,42 @@ impl FlushCtx {
             }
         };
 
-        if !self
-            .put_data_object_with_retry(&data_key, written.bytes.clone(), deadline_ns)
+        // ADR-4233 decision 4: the bucket is fenced before the first PUT of
+        // an object above the family's baseline.
+        if let Err(refused) = grant
+            .ensure_fenced(
+                self.store.as_ref(),
+                tenant_hash,
+                self.signal,
+                self.clock.as_ref(),
+                deadline_ns,
+            )
             .await
         {
-            self.metrics.record_abandoned_retry_exhausted();
-            self.ack_waiters(
-                waiters,
-                Err(WriteError::Abandoned(
-                    "data object put exhausted retry budget or exceeded max_flush_lifetime".into(),
-                )),
-            );
+            self.refuse_compat(tenant_hash, waiters, refused);
             return;
+        }
+
+        match self
+            .put_data_object_with_retry(&data_key, written.bytes.clone(), deadline_ns, &grant)
+            .await
+        {
+            Ok(()) => {}
+            Err(PutAbort::Refused(refused)) => {
+                self.refuse_compat(tenant_hash, waiters, refused);
+                return;
+            }
+            Err(PutAbort::Exhausted) => {
+                self.metrics.record_abandoned_retry_exhausted();
+                self.ack_waiters(
+                    waiters,
+                    Err(WriteError::Abandoned(
+                        "data object put exhausted retry budget or exceeded max_flush_lifetime"
+                            .into(),
+                    )),
+                );
+                return;
+            }
         }
 
         let record = match record::build(NewCommitRecord {
@@ -732,7 +763,7 @@ impl FlushCtx {
             max_event_ts_ns: written.summary.max_event_ts_ns,
             min_ingest_ts_ns,
             max_ingest_ts_ns,
-            segment_format_version: u32::from(segment_version),
+            segment_format_version: u32::from(segment_version.number()),
             created_unix_ns: flush_open_ns,
             ingest_hour_bucket,
         }) {
@@ -744,15 +775,18 @@ impl FlushCtx {
             }
         };
 
-        match self.publish_with_retry(&record, deadline_ns).await {
-            Some(token) => {
+        match self.publish_with_retry(&record, deadline_ns, &grant).await {
+            Ok(token) => {
                 // Both PUTs landed: attribute this flush's PUT cost to the
                 // tenant (ADR-0076 decision 2, success-time). `tenant_hash` is
                 // `Copy` and untouched by the commit-record build above.
                 self.metrics.record_flush_puts(tenant_hash);
                 self.ack_waiters(waiters, Ok(token));
             }
-            None => {
+            Err(PutAbort::Refused(refused)) => {
+                self.refuse_compat(tenant_hash, waiters, refused);
+            }
+            Err(PutAbort::Exhausted) => {
                 self.metrics.record_abandoned_retry_exhausted();
                 self.ack_waiters(
                     waiters,
@@ -866,6 +900,55 @@ impl FlushCtx {
         drop(charges);
     }
 
+    /// Fails a flush the activation policy refused (ADR-4233), with nothing
+    /// of it stored: counted under its reason, and its waiters acked with the
+    /// refusal. The caller drops the flush's byte charges.
+    fn refuse_compat(
+        &self,
+        tenant_hash: TenantHash,
+        waiters: Vec<Ack>,
+        refused: CompatPublishRefusal,
+    ) {
+        self.metrics.record_compat_refused(refused.reason());
+        warn_publish_refused(self.signal, Some(self.shard), tenant_hash, &refused);
+        self.ack_waiters(waiters, Err(WriteError::CompatRefused(refused)));
+    }
+
+    /// Abandons a flush the activation policy refused at permit grant, before
+    /// any store call, dropping its byte charges.
+    fn abandon_compat(&self, pinned: PinnedFlush, refused: CompatPublishRefusal) {
+        let PinnedFlush {
+            tenant_hash,
+            exemplars,
+            waiters,
+            charges,
+            ..
+        } = pinned;
+        if !exemplars.is_empty() {
+            self.metrics.record_exemplars(0, exemplars.len() as u64);
+        }
+        self.refuse_compat(tenant_hash, waiters, refused);
+        drop(charges);
+    }
+
+    /// Abandons a flush whose version chosen at permit grant sits below the
+    /// tenant's format floor (ADR-1746 decision 4), before any store call.
+    fn abandon_below_floor(&self, pinned: PinnedFlush, refused: BelowFormatFloor) {
+        let PinnedFlush {
+            tenant_hash,
+            exemplars,
+            waiters,
+            charges,
+            ..
+        } = pinned;
+        warn_flush_refused(self.signal, self.shard, tenant_hash, &refused);
+        if !exemplars.is_empty() {
+            self.metrics.record_exemplars(0, exemplars.len() as u64);
+        }
+        self.ack_waiters(waiters, Err(WriteError::BelowFormatFloor(refused)));
+        drop(charges);
+    }
+
     /// Races `fut` against the remaining budget to `deadline_ns` on the
     /// injected `Clock`, returning `None` if the deadline is already past or
     /// elapses while `fut` is still in flight. This is what stops a store
@@ -909,9 +992,18 @@ impl FlushCtx {
     /// adaptive-delay ceiling (ADR-0067 decision 3); an attempt that never
     /// completes before `deadline_ns` teaches nothing about RTT and is not
     /// recorded.
-    async fn put_data_object_with_retry(&self, key: &str, bytes: Bytes, deadline_ns: i64) -> bool {
+    /// The activation policy is asked before every attempt (ADR-4233
+    /// decision 3).
+    async fn put_data_object_with_retry(
+        &self,
+        key: &str,
+        bytes: Bytes,
+        deadline_ns: i64,
+        grant: &PublishGrant,
+    ) -> Result<(), PutAbort> {
         let mut attempt: u32 = 0;
         loop {
+            grant.check_attempt().map_err(PutAbort::Refused)?;
             let call = publish::put_data_object(self.store.as_ref(), key, bytes.clone());
             let started_ns = self.clock.now_ns();
             let outcome = self.bound_to_deadline(deadline_ns, call).await;
@@ -920,7 +1012,7 @@ impl FlushCtx {
                     .record(self.clock.now_ns().saturating_sub(started_ns));
             }
             match outcome {
-                Some(Ok(())) => return true,
+                Some(Ok(())) => return Ok(()),
                 Some(Err(PublishError::Store { source, .. })) if source.is_retryable() => {
                     // `put_retry_max_attempts` is the number of retries after
                     // the first attempt (total attempts = this + 1), matching
@@ -930,13 +1022,13 @@ impl FlushCtx {
                     if attempt >= self.config.put_retry_max_attempts
                         || self.clock.now_ns() >= deadline_ns
                     {
-                        return false;
+                        return Err(PutAbort::Exhausted);
                     }
                     self.metrics.record_put_retry();
                     self.backoff_sleep(attempt).await;
                     attempt += 1;
                 }
-                Some(Err(_)) | None => return false,
+                Some(Err(_)) | None => return Err(PutAbort::Exhausted),
             }
         }
     }
@@ -947,12 +1039,13 @@ impl FlushCtx {
     /// attempts (the crate's own internal retry loop has no such hook). Each
     /// attempt itself is bounded to `deadline_ns` via `bound_to_deadline`,
     /// same as `put_data_object_with_retry`, and feeds `self.rtt` the same
-    /// way.
+    /// way, and asks the activation policy before every attempt the same way.
     async fn publish_with_retry(
         &self,
         record: &CommitRecord,
         deadline_ns: i64,
-    ) -> Option<CommitToken> {
+        grant: &PublishGrant,
+    ) -> Result<CommitToken, PutAbort> {
         let single_attempt = RetryPolicy {
             max_attempts: 0,
             base_delay: self.config.put_retry_base_delay,
@@ -960,6 +1053,7 @@ impl FlushCtx {
         };
         let mut attempt: u32 = 0;
         loop {
+            grant.check_attempt().map_err(PutAbort::Refused)?;
             let call = publish::publish(self.store.as_ref(), record, &single_attempt);
             let started_ns = self.clock.now_ns();
             let outcome = self.bound_to_deadline(deadline_ns, call).await;
@@ -968,7 +1062,7 @@ impl FlushCtx {
                     .record(self.clock.now_ns().saturating_sub(started_ns));
             }
             match outcome {
-                Some(Ok(token)) => return Some(token),
+                Some(Ok(token)) => return Ok(token),
                 Some(Err(PublishError::SplitBrain { this, stored })) => {
                     // Identity is pinned at flush open, so this cannot fire
                     // on a benign retry (docs/catalog-and-mvcc.md "Commit
@@ -984,13 +1078,13 @@ impl FlushCtx {
                     if attempt >= self.config.put_retry_max_attempts
                         || self.clock.now_ns() >= deadline_ns
                     {
-                        return None;
+                        return Err(PutAbort::Exhausted);
                     }
                     self.metrics.record_put_retry();
                     self.backoff_sleep(attempt).await;
                     attempt += 1;
                 }
-                Some(Err(_)) | None => return None,
+                Some(Err(_)) | None => return Err(PutAbort::Exhausted),
             }
         }
     }
@@ -2739,6 +2833,7 @@ impl ShardActor {
         // the two never overlap.
         let clock = Arc::clone(&self.clock);
         let metrics = Arc::clone(&self.metrics);
+        let scope = Arc::clone(&self.scope);
         let shard = self.shard;
         self.flushes.spawn(async move {
             let _guard = guard;
@@ -2801,8 +2896,35 @@ impl ShardActor {
                     return;
                 }
             };
+            // ADR-4233 decision 2: the version is chosen here, at grant, from
+            // the activation policy's view as it stands now. A version other
+            // than the one checked against the floor at flush open is checked
+            // again.
+            let grant = match scope.compat_grant(pinned.tenant_hash, FormatFamily::Rseg) {
+                Ok(grant) => grant,
+                Err(refused) => {
+                    ctx.abandon_compat(pinned, refused);
+                    return;
+                }
+            };
+            if grant.version() != SEGMENT_FORMAT_VERSION {
+                match scope.floor_check(
+                    pinned.tenant_hash,
+                    FormatFamily::Rseg,
+                    u32::from(grant.version()),
+                ) {
+                    FloorCheck::Write | FloorCheck::NoView => {}
+                    FloorCheck::WriteBelow(below) => {
+                        warn_flush_written_below(ctx.signal, shard, pinned.tenant_hash, &below);
+                    }
+                    FloorCheck::Refuse(refused) => {
+                        ctx.abandon_below_floor(pinned, refused);
+                        return;
+                    }
+                }
+            }
             let started_ns = clock.now_ns();
-            ctx.run_flush(pinned).await;
+            ctx.run_flush(pinned, grant).await;
             let off_actor_ns = clock.now_ns().saturating_sub(started_ns).max(0) as u64;
             metrics.record_shard_off_actor_ns(shard, off_actor_ns);
         });

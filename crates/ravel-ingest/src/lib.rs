@@ -9,6 +9,7 @@ mod admission;
 mod attribution;
 mod budget;
 mod clock;
+mod compat;
 mod config;
 mod deferral;
 mod error;
@@ -49,6 +50,10 @@ pub use attribution::{
 };
 pub use budget::{IngestByteBudget, IngestByteBudgetLimit, IngestByteCharge, IngestByteShed};
 pub use clock::{Clock, SystemClock};
+pub use compat::{
+    CompatPublishRefusal, CompatRefusalCounters, CompatRefusalReason, CompatRefusalSnapshot,
+    IngestCompatPolicy, PublishLifetimeAboveCompat,
+};
 pub use config::{
     FLUSH_TICK_FLOOR, IngestConfig, IngestConfigError, LOG_SEGMENT_FORMAT_VERSION,
     MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS, MIN_PLAUSIBLE_INGEST_CLOCK_NS, RlogChunkOrder,

@@ -94,6 +94,10 @@ pub enum SpanWriteError {
     /// admission or at flush open the same way. Retryable.
     #[error(transparent)]
     BelowFormatFloor(#[from] crate::format_floor::BelowFormatFloor),
+    /// The `sys/compat` activation policy refused the span write's publish
+    /// (ADR-4233); the counterpart of [`crate::WriteError::CompatRefused`].
+    #[error(transparent)]
+    CompatRefused(#[from] crate::compat::CompatPublishRefusal),
     /// A multi-shard Strict write in which at least one shard failed *after*
     /// one or more sibling shards had already acked their commit durably in
     /// the same [`SpanIngestRouter::write`](crate::SpanIngestRouter::write)
@@ -137,6 +141,7 @@ impl SpanWriteError {
             | SpanWriteError::PendingAckLimitReached
             | SpanWriteError::DeferralCapReached
             | SpanWriteError::BelowFormatFloor(_) => true,
+            SpanWriteError::CompatRefused(refusal) => refusal.is_retryable(),
             SpanWriteError::SegmentBuild(_) => false,
             SpanWriteError::PartialWrite { inner, .. } => inner.is_retryable(),
         }

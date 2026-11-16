@@ -71,6 +71,7 @@ use ravel_types::{Signal, TenantHash};
 use tokio::sync::{mpsc, watch};
 
 use crate::clock::Clock;
+use crate::compat::{BucketCompat, CompatPublishRefusal, CompatSlot, PublishGrant};
 use crate::format_floor::{BelowFormatFloor, FloorAdmission, FormatFamily, FormatFloorPolicy};
 use crate::read_backoff::{ProvisioningReadCause, ProvisioningReadFailures, ReadBackoff};
 
@@ -132,17 +133,20 @@ fn min_lead_hours(refresh_interval_ns: i64) -> u32 {
 struct TenantView {
     generations: Vec<ShardGeneration>,
     format_floor: Option<u32>,
+    compat_epoch: Option<u64>,
     refreshed_at_ns: i64,
     last_touched_ns: i64,
 }
 
 /// What one read of a tenant's provisioning record gives the switch: the
-/// generation history routing uses and the format floor for the router's
-/// family (`None`: no floor recorded).
+/// generation history routing uses, the format floor for the router's
+/// family (`None`: no floor recorded), and the record's `compat_epoch`
+/// (`None`: no record).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProvisioningView {
     pub(crate) generations: Vec<ShardGeneration>,
     pub(crate) format_floor: Option<u32>,
+    pub(crate) compat_epoch: Option<u64>,
 }
 
 /// The format-floor check a flush makes at flush open (ADR-1746 decision 4),
@@ -343,6 +347,14 @@ pub(crate) trait FlushScope<M>: Send + Sync {
     /// version `writing` for `tenant`, against the floor of the cached view
     /// (ADR-1746 decision 4). Counts a refusal or an overridden write.
     fn floor_check(&self, tenant: TenantHash, family: FormatFamily, writing: u32) -> FloorCheck;
+    /// The version a flush of `tenant` granted its permit now publishes
+    /// `family` at, or the activation policy's refusal (ADR-4233 decision 2).
+    /// With no policy installed, the family's `CURRENT` version.
+    fn compat_grant(
+        &self,
+        tenant: TenantHash,
+        family: FormatFamily,
+    ) -> Result<PublishGrant, CompatPublishRefusal>;
 }
 
 /// A hand-back send that did not deliver, with the message it returns.
@@ -455,15 +467,21 @@ pub(crate) async fn reread_and_check<M>(
 /// the router's switch, so an actor never keeps its router's shard sets (and
 /// with them every actor's mailbox) alive after the router is dropped, and the
 /// shard count of the set, which is what identifies the generation that routed
-/// its rows.
+/// its rows. `compat` is the switch's own activation-policy slot, held here
+/// too so a flush still applies the policy after its router is dropped.
 pub(crate) struct SwitchScope<H> {
     switch: Weak<GenerationSwitch<H>>,
     count: u32,
+    compat: CompatSlot,
 }
 
 impl<H> SwitchScope<H> {
-    pub(crate) fn new(switch: Weak<GenerationSwitch<H>>, count: u32) -> Self {
-        SwitchScope { switch, count }
+    pub(crate) fn new(switch: Weak<GenerationSwitch<H>>, count: u32, compat: CompatSlot) -> Self {
+        SwitchScope {
+            switch,
+            count,
+            compat,
+        }
     }
 }
 
@@ -502,6 +520,18 @@ where
             None => FloorCheck::NoView,
         }
     }
+
+    fn compat_grant(
+        &self,
+        tenant: TenantHash,
+        family: FormatFamily,
+    ) -> Result<PublishGrant, CompatPublishRefusal> {
+        let bucket = self
+            .switch
+            .upgrade()
+            .map(|switch| switch as Arc<dyn BucketCompat>);
+        PublishGrant::at_grant(self.compat.get(), family, tenant, bucket)
+    }
 }
 
 /// A [`FlushScope`] that finds every flush inside the scan set, for unit tests
@@ -529,6 +559,14 @@ impl<M> FlushScope<M> for AlwaysInScope {
 
     fn floor_check(&self, _tenant: TenantHash, _family: FormatFamily, _writing: u32) -> FloorCheck {
         FloorCheck::Write
+    }
+
+    fn compat_grant(
+        &self,
+        _tenant: TenantHash,
+        family: FormatFamily,
+    ) -> Result<PublishGrant, CompatPublishRefusal> {
+        Ok(PublishGrant::unmanaged(family))
     }
 }
 
@@ -720,6 +758,14 @@ impl<M: Send + 'static> FlushScope<M> for ScriptedScope<M> {
     fn floor_check(&self, _tenant: TenantHash, _family: FormatFamily, _writing: u32) -> FloorCheck {
         FloorCheck::Write
     }
+
+    fn compat_grant(
+        &self,
+        _tenant: TenantHash,
+        family: FormatFamily,
+    ) -> Result<PublishGrant, CompatPublishRefusal> {
+        Ok(PublishGrant::unmanaged(family))
+    }
 }
 
 /// Where the switch re-reads a tenant's provisioning record when a flush finds
@@ -781,6 +827,10 @@ pub struct GenerationSwitch<H> {
     /// What a flush below a tenant's format floor does (ADR-1746 decisions 4
     /// and 5). Set once at startup by the router's `with_format_floor_policy`.
     floor_policy: RwLock<FormatFloorPolicy>,
+    /// The `sys/compat` activation policy every flush of this router's shards
+    /// applies (ADR-4233), shared with each shard's [`SwitchScope`]. Empty
+    /// unless the router's `with_compat_policy` installed one.
+    compat: CompatSlot,
     /// Failed provisioning reads by cause, shared with the router's metrics.
     read_failures: Arc<ProvisioningReadFailures>,
 }
@@ -808,6 +858,7 @@ impl<H> GenerationSwitch<H> {
             refresh_interval_ns,
             refresh_source: None,
             floor_policy: RwLock::new(FormatFloorPolicy::default()),
+            compat: CompatSlot::default(),
             read_failures: Arc::new(ProvisioningReadFailures::default()),
         }
     }
@@ -888,6 +939,44 @@ impl<H> GenerationSwitch<H> {
         tenant: TenantHash,
     ) -> Option<crate::read_backoff::ReadBackoffEntry> {
         self.lock().read_backoff.entry(&tenant)
+    }
+
+    /// Share `slot` as this switch's activation-policy slot: the router hands
+    /// the same slot to every [`SwitchScope`] it builds.
+    #[must_use]
+    pub(crate) fn with_compat_slot(mut self, slot: CompatSlot) -> Self {
+        self.compat = slot;
+        self
+    }
+
+    /// Install (or with `None` remove) the activation policy every flush of
+    /// this router's shards applies, existing actors included.
+    pub(crate) fn set_compat_policy(&self, policy: Option<Arc<crate::compat::IngestCompatPolicy>>) {
+        self.compat.set(policy);
+    }
+
+    /// The activation-policy check of a write at admission, before anything
+    /// is buffered (ADR-4233 decision 2): refuses a write whose flush the
+    /// policy would refuse for a reason a refresh before grant cannot clear
+    /// on its own. A stale view admits; the flush decides at grant. Passes
+    /// with no policy installed.
+    pub(crate) fn admit_compat(
+        &self,
+        tenant: TenantHash,
+        family: FormatFamily,
+    ) -> Result<(), CompatPublishRefusal> {
+        let Some(policy) = self.compat.get() else {
+            return Ok(());
+        };
+        policy
+            .admit(family, self.cached_compat_epoch(tenant))
+            .map_err(|refusal| CompatPublishRefusal::Policy { family, refusal })
+    }
+
+    /// The `compat_epoch` of `tenant`'s cached provisioning record, whatever
+    /// its age; `None` when no view, or a view of no record, is cached.
+    fn cached_compat_epoch(&self, tenant: TenantHash) -> Option<u64> {
+        self.lock().views.get(&tenant).and_then(|v| v.compat_epoch)
     }
 
     /// Replace the format-floor policy every flush of this router's shards
@@ -1098,6 +1187,7 @@ impl<H> GenerationSwitch<H> {
             ProvisioningView {
                 generations,
                 format_floor: None,
+                compat_epoch: None,
             },
             now_ns,
         )
@@ -1114,12 +1204,19 @@ impl<H> GenerationSwitch<H> {
         let ProvisioningView {
             generations,
             format_floor,
+            compat_epoch,
         } = view;
         let mut inner = self.lock();
-        let format_floor = inner
-            .views
-            .get(&tenant)
-            .map_or(format_floor, |cached| cached.format_floor.max(format_floor));
+        let (format_floor, compat_epoch) =
+            inner
+                .views
+                .get(&tenant)
+                .map_or((format_floor, compat_epoch), |cached| {
+                    (
+                        cached.format_floor.max(format_floor),
+                        cached.compat_epoch.max(compat_epoch),
+                    )
+                });
         let generations = if generations.is_empty() {
             vec![ShardGeneration {
                 generation: 0,
@@ -1137,6 +1234,7 @@ impl<H> GenerationSwitch<H> {
             TenantView {
                 generations,
                 format_floor,
+                compat_epoch,
                 refreshed_at_ns: now_ns,
                 last_touched_ns: now_ns,
             },
@@ -1213,6 +1311,18 @@ impl<H> GenerationSwitch<H> {
         let set = Arc::new((self.factory)(count));
         inner.sets.insert(count, Arc::clone(&set));
         set
+    }
+}
+
+impl<H: Send + Sync> BucketCompat for GenerationSwitch<H> {
+    fn bucket_compat_epoch(&self, tenant: TenantHash) -> Option<u64> {
+        self.cached_compat_epoch(tenant)
+    }
+
+    fn note_compat_fence(&self, tenant: TenantHash, compat_epoch: u64) {
+        if let Some(view) = self.lock().views.get_mut(&tenant) {
+            view.compat_epoch = view.compat_epoch.max(Some(compat_epoch));
+        }
     }
 }
 
@@ -1388,8 +1498,9 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
 /// after `refreshed_at_ns`: a router write may have refreshed the tenant while
 /// the background read was in flight.
 ///
-/// The view's format floor is merged in either way: floors are only raised,
-/// so the higher floor is the current one whichever read saw it.
+/// The view's format floor and `compat_epoch` are merged in either way: both
+/// are only raised, so the higher value is the current one whichever read
+/// saw it.
 fn install_if_newer(
     views: &mut HashMap<TenantHash, TenantView>,
     tenant: TenantHash,
@@ -1399,6 +1510,7 @@ fn install_if_newer(
     let ProvisioningView {
         generations,
         format_floor,
+        compat_epoch,
     } = read;
     if generations.is_empty() {
         return;
@@ -1406,10 +1518,12 @@ fn install_if_newer(
     match views.get_mut(&tenant) {
         Some(view) if view.refreshed_at_ns >= refreshed_at_ns => {
             view.format_floor = view.format_floor.max(format_floor);
+            view.compat_epoch = view.compat_epoch.max(compat_epoch);
         }
         Some(view) => {
             view.generations = generations;
             view.format_floor = view.format_floor.max(format_floor);
+            view.compat_epoch = view.compat_epoch.max(compat_epoch);
             view.refreshed_at_ns = refreshed_at_ns;
         }
         None => {
@@ -1418,6 +1532,7 @@ fn install_if_newer(
                 TenantView {
                     generations,
                     format_floor,
+                    compat_epoch,
                     refreshed_at_ns,
                     last_touched_ns: refreshed_at_ns,
                 },
@@ -1478,6 +1593,7 @@ pub(crate) async fn load_view(
             Ok(ProvisioningView {
                 generations,
                 format_floor,
+                compat_epoch: Some(record.compat_epoch),
             })
         }
         Err(StoreError::NotFound) => Ok(ProvisioningView {
@@ -1488,6 +1604,7 @@ pub(crate) async fn load_view(
                 appended_unix_ns: 0,
             }],
             format_floor: None,
+            compat_epoch: None,
         }),
         Err(err) => Err(GenerationLoadError::Store(StoreErrorClass::of(&err))),
     }
