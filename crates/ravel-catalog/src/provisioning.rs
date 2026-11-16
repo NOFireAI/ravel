@@ -6334,6 +6334,44 @@ pub(crate) mod tests {
         );
     }
 
+    /// A record already stamped 4 keeps 4 through both rewrite paths even when
+    /// both compat fields read zero, so no rewrite restamps it 3.
+    #[tokio::test]
+    async fn a_version_4_record_without_fields_is_never_restamped_3() {
+        let store = mem();
+        seed_exact(store.as_ref(), &record_with_floor_at_version(4)).await;
+        append_generation(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            8,
+            12,
+            10 * NS_PER_HOUR,
+        )
+        .await
+        .expect("reshard");
+        assert_eq!(
+            fence_fields(&stored_record(store.as_ref(), Signal::Metrics).await.0),
+            (4, 0, 0)
+        );
+        raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            "rseg",
+            9,
+            BASIS,
+            "job",
+            11 * NS_PER_HOUR,
+        )
+        .await
+        .expect("floor raise");
+        assert_eq!(
+            fence_fields(&stored_record(store.as_ref(), Signal::Metrics).await.0),
+            (4, 0, 0)
+        );
+    }
+
     /// A fence raise writes only the bucket it names: the same tenant's other
     /// signal keeps its version-3 record byte for byte.
     #[tokio::test]
