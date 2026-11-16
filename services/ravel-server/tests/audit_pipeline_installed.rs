@@ -875,8 +875,9 @@ async fn required_mode_fails_closed_on_audit_write_fault() {
 /// so `start` installs the `sys/compat` policy on it (ADR-4233, #4301). On a
 /// keyed bucket whose `sys/compat` names an `rlog` version this build cannot
 /// write, the audit flush is refused before its data PUT, and under
-/// `audit_mode=required` the query fails closed with no audit object stored.
-/// A pipeline spawned without the policy writes the record at the built-in
+/// `audit_mode=required` the query fails closed with no audit object stored,
+/// and `/metrics` counts the refusal under `family="rlog"`. A pipeline
+/// spawned without the policy writes the record at the built-in
 /// version and answers 200.
 #[tokio::test]
 async fn an_activated_store_refuses_the_query_audit_write() {
@@ -949,6 +950,26 @@ async fn an_activated_store_refuses_the_query_audit_write() {
         .filter(|key| key.contains("/u/"))
         .collect();
     assert_eq!(audit_objects, Vec::<String>::new());
+    let metrics = reqwest::Client::new()
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("metrics scrape completes")
+        .text()
+        .await
+        .expect("metrics body is text");
+    let refused = metrics
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(
+                r#"ravel_compat_publish_refused_total{mode="all",family="rlog",reason="active_version_not_writable"} "#,
+            )
+        })
+        .and_then(|value| value.parse::<u64>().ok());
+    assert!(
+        refused.is_some_and(|count| count >= 1),
+        "the audit refusal is counted under rlog:\n{metrics}"
+    );
 
     running.shutdown().await.expect("graceful shutdown");
 }
