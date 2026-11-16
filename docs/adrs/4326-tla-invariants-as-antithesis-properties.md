@@ -1,15 +1,17 @@
 # ADR-4326: TLA+ invariants as Antithesis properties
 
-- Status: Proposed
+- Status: Accepted (2026-11-16)
 - Date: 2026-11-16
 - Refs: #4326, #4325, #4308, ADR-1113 (D8, edited by this epic's checker
-  task; 1113 is still Proposed), ADR-0002, ADR-0020, ADR-0052, ADR-0064,
-  ADR-0065
+  task; 1113's own status line reads Accepted, while its index row in
+  `docs/adrs/README.md` still says Proposed), ADR-0002, ADR-0020, ADR-0052,
+  ADR-0064, ADR-0065
 
 ## Context
 
-`formal/tla` proves seven protocol designs in small models. Its 199
-traceability rows name the Rust symbol behind each action and invariant, and
+`formal/tla` proves seven protocol designs in small models. Its 202
+traceability rows (as `scripts/check-tla.sh traceability` counts them;
+`formal/tla/TRACEABILITY.md` still says 199) name the Rust symbol behind each action and invariant, and
 each area's `negative/` configs show that a broken switch violates the
 invariant it names. Nothing checks the real binaries against those invariants
 under crashes, pauses and partitions.
@@ -77,12 +79,13 @@ site holding and each mutant breaking it.
 | lifecycle (29) | SUT and audit: the delete gates, hold, refresh-failure, rewrite and completion rows, including `CompletionImpliesNoPreRewriteExposure`. Driver: `ErasedSubjectNeverServedAfterRequest` | Flight ticket and cached-HEAD pin rows (the driver holds no long-pinned query); the horizon `ASSUME` (startup validation) |
 | resharding (19) | SUT: `OneCasWinner`, `CasAppendNeverDiscards`, the reader fence. With clock control (decision 5): `StaleWriterFailsClosed`, `EveryAdmittedWriteInScanSet`, `TokenResolvesAcrossReshards` | constants and CLI lead enforcement (unit tested) |
 | maintenance (45) | SUT, ownership model: `MergeAttemptsConverge`, `DivergentInputSetNeverMutates`, `OwnershipIsNotPublicationAuthority`, the heartbeat and memo rows | The compaction-claim rows (no shipped caller; ADR-1029 is a proposal); type invariants |
-| agents (51) | none | the runtime does not exist yet |
+| agents (54) | none | the runtime does not exist yet |
 
 ### 3. Mutant controls
 
-A broken-switch negative config becomes a test-only mutant at the same Rust
-site: `if inv_mutant!("commit/commit-before-data") { ... }`, named
+A broken-switch negative config whose invariant decision 2 puts in scope
+becomes a test-only mutant at the same Rust site; one outside that scope is
+recorded `none: <reason>` in the area's `.tsv` (decision 6). The mutant form: `if inv_mutant!("commit/commit-before-data") { ... }`, named
 `<area>/<negative cfg stem>`. One cargo feature, `antithesis-mutants`,
 compiles every mutant in; `RAVEL_ANTITHESIS_MUTANT` selects at most one at
 start, and an unknown name refuses to start. Without the feature the macro is
@@ -123,8 +126,15 @@ a marker file there.
 
 ### 5. Whole hours inside a short run
 
-Sealed hours come from `ravel-cli load --ingest-hour-start`, which writes
-backdated ingest hours the driver's model knows. Rows that need the clock to
+Sealed hours come from `ravel-cli load --ingest-hour-stride <HOURS>
+--ingest-hour-start <unix hour>`, which writes backdated ingest hours the
+driver's model knows. That lane refuses a tenant whose signal catalog HEAD
+already exists, and nothing may fold or maintain the tenant while it runs
+(`services/ravel-cli/src/load/hour_stride.rs`, the HEAD refusal and the
+no-fold precondition). So each profile seeds a fresh tenant during setup,
+before setup complete: the maintain workers and the driver's fold and compact
+actions start only once the load has finished, which the driver signals by
+writing a marker the workers' entrypoints wait for. Rows that need the clock to
 move (a live hour sealing, reshard activation, erasure completion) get one
 spike in the local loop: libfaketime with one offset in every container. If
 it fails, those rows are recorded `none: needs clock control`. This ADR adds
@@ -136,9 +146,15 @@ Each area table gains a sixth column, "Antithesis property". An area is
 enrolled when its directory holds `antithesis-mutants.tsv`. For an enrolled
 area, `check-tla.sh traceability` fails unless each data row's cell is one of:
 
-- `sut: <path.rs>: <message>`: the file exists and holds the literal message;
-- `driver: <workload>: <message>`: the literal occurs under
+- `sut: <path.rs> -- <message>`: the file exists and holds the literal
+  message;
+- `driver: <workload> -- <message>`: the literal occurs under
   `antithesis/<workload>/`;
+
+The ` -- ` separator keeps the path a whole token: the checker's sweep
+already resolves every `crates/...` token in a row
+(`scripts/check-tla.sh`, `check_traceability`'s trailing loop), and a
+`<path>:` form would leave a trailing colon that the resolver rejects.
 - `none: <reason>`, with a non-empty reason.
 
 A five-column table in an enrolled area fails, and so does a six-column table
@@ -151,13 +167,18 @@ occurs as a literal in Rust and a property the table carries, or `none:
 
 | Run class | Cap, compute hours | Band | Basis |
 |---|---|---|---|
-| Clean smoke, per area | 12 | completes; every guarantee passes; every new SUT assertion reached | predicted; run 4d85276e32085a10291c9eddd59d34b3-67-0 completed in 22 minutes under a cap of 12, measured 2026-11-16 |
+| Clean smoke, per workload config (5) | 12 | completes; every guarantee passes; every new SUT assertion reached | predicted; run 4d85276e32085a10291c9eddd59d34b3-67-0 billed 13.0 compute hours over 16 minutes of billable time (`snouty runs usage`), 48 cores, 22 minutes of wall clock with setup, measured 2026-11-16 |
 | Mutant control in Antithesis, every mutant (19) | 12 each | named property fails with a counterexample | predicted |
 | Mutant control, local loop, every mutant | 0 | named property false in the SDK's local output | predicted |
-| Long run, per area | 24 | no new guarantee failure, or one issue per failure | predicted |
-| Whole epic | 432 of about 453 remaining | 5 smokes (60), 19 mutant runs (228), 5 long runs (120), 24 for reruns | predicted; budget raised by the owner 2026-11-16 from 200 to about 490; caps of 36 launched before this epic, measured 2026-11-16 (runs.md) |
+| Long run, per workload config (5) | 24 | no new guarantee failure, or one issue per failure | predicted |
+| Whole epic | 432 of about 453 remaining | 5 smokes (60), 19 mutant runs (228), 5 long runs (120), 24 for reruns; one smoke and one long run per workload config, not per area | predicted; budget raised by the owner 2026-11-16 from 200 to about 490; caps of 36 launched before this epic, measured 2026-11-16 (runs.md) |
 
-Each area's long run is inside the task's budget. Once enrolled, a clean
+Runs are priced per workload config, of which decision 4 defines five
+(ingest-durability; catalog-maintenance and its lifecycle and reshard
+profiles; store-contract), not per area: the maintenance-ownership rows ride
+on the reshard profile, which runs the third maintain worker, so maintenance
+has no smoke or long run of its own. Each config's long run is inside the
+task's budget. Once enrolled, a clean
 workload also joins the weekly workflow, whose 240-hour cap is split across
 workloads, not multiplied.
 
