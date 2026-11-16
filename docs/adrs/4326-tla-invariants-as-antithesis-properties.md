@@ -4,14 +4,16 @@
 - Date: 2026-11-16
 - Refs: #4326, #4325, #4308, ADR-1113 (D8, edited by this epic's checker
   task; 1113's own status line reads Accepted, while its index row in
-  `docs/adrs/README.md` still says Proposed), ADR-0002, ADR-0020, ADR-0052,
+  `docs/adrs/README.md` still says Proposed, corrected by #4330: see the
+  #4330 amendment below), ADR-0002, ADR-0020, ADR-0052,
   ADR-0064, ADR-0065
 
 ## Context
 
 `formal/tla` proves seven protocol designs in small models. Its 202
 traceability rows (as `scripts/check-tla.sh traceability` counts them;
-`formal/tla/TRACEABILITY.md` still says 199) name the Rust symbol behind each action and invariant, and
+`formal/tla/TRACEABILITY.md` still says 199, corrected by #4330: see the
+#4330 amendment below) name the Rust symbol behind each action and invariant, and
 each area's `negative/` configs show that a broken switch violates the
 invariant it names. Nothing checks the real binaries against those invariants
 under crashes, pauses and partitions.
@@ -152,6 +154,9 @@ area, `check-tla.sh traceability` fails unless each data row's cell is one of:
   `antithesis/<workload>/`;
 - `none: <reason>`, with a non-empty reason.
 
+The #4330 amendment below narrows what counts as the literal, where a mutant
+may occur, and which table rows are separators.
+
 The ` -- ` separator keeps the path a whole token: the checker's sweep
 already resolves every `crates/...` token in a row
 (`scripts/check-tla.sh`, `check_traceability`'s trailing loop), and a
@@ -233,3 +238,30 @@ wave; any other exit does. The fix for #4325 removes both.
   liveness beyond "eventually after faults stop"; hour-bound rows if the clock
   spike fails; and anything RustFS gets wrong beyond the nine contract rows.
   A held property is evidence over the explored timelines, not a proof.
+
+## Amendment (2026-11-16): #4330 corrections to Context and decision 6
+
+<!-- amendment-applies: sections="Context|6. The traceability column" pointer="#4330 amendment" -->
+
+Two facts the Context states were corrected by #4330, the checker task: the
+ADR-1113 row in `docs/adrs/README.md` now says Accepted, as ADR-1113's own
+status line does, and `formal/tla/TRACEABILITY.md` now gives 202 rows, the
+count `scripts/check-tla.sh traceability` resolves.
+
+Decision 6 is narrowed as #4330 implements it:
+
+- A message counts only as a double-quoted string literal: the `sut:` file,
+  or a `.rs` file under `antithesis/<workload>/` for `driver:`, holds
+  `"<message>"`. A substring of a longer literal, an unquoted occurrence and
+  markdown under the workload do not count.
+- A mutant from decision 3 occurs as `inv_mutant!("<area>/<stem>")` in a
+  `.rs` file under `crates/`, `services/` or `antithesis/*/driver/`, the last
+  for the common area's driver-side broken store.
+- For a message and a mutant alike, a literal on a comment line (`//`, `/*`
+  or `*` after leading whitespace) or after the file's first `#[cfg(test)]`
+  line does not count; for `driver:` and mutants, neither does one in a file
+  under a `tests/` directory.
+- `none:` is followed by a space and a non-empty reason, in the cell and in
+  the `.tsv`.
+- Only the row directly under a table's header may be its separator; any
+  later row of pipes, spaces, dashes and colons is a data row and fails.
