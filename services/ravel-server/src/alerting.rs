@@ -9717,4 +9717,311 @@ mod tick_tests {
             "each rule's slice carries its own entry plus the query deadline"
         );
     }
+
+    // --- sys/compat write policy (ADR-4233 decisions 3 and 4) ---------------
+
+    impl ravel_catalog::compat::CompatClock for TestClock {
+        fn now_unix_ns(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn compat_keys() -> ravel_catalog::compat::CompatKeys {
+        ravel_catalog::compat::CompatKeys::from_file_keys(&[[0x33; 32]]).expect("one key")
+    }
+
+    /// A `sys/compat` record naming `rlog` at `rlog_version`, activated at
+    /// `rlog_epoch` (0: never activated), under store-wide `epoch`.
+    fn compat_record(
+        rlog_version: u32,
+        rlog_epoch: u64,
+        epoch: u64,
+    ) -> ravel_proto::sys::v1::CompatRecord {
+        ravel_proto::sys::v1::CompatRecord {
+            compat_epoch: epoch,
+            families: vec![ravel_proto::sys::v1::CompatFamily {
+                family: FAMILY_RLOG.to_string(),
+                active_write_version: rlog_version,
+                activated_epoch: rlog_epoch,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Replace `sys/compat` with `record` through the monotone CAS update.
+    async fn update_compat_to(
+        store: &dyn ObjectStoreBackend,
+        record: ravel_proto::sys::v1::CompatRecord,
+    ) {
+        ravel_catalog::compat::update_compat(store, &compat_keys(), |current| {
+            current.compat_epoch = record.compat_epoch;
+            current.families = record.families;
+            Ok(())
+        })
+        .await
+        .expect("update sys/compat");
+    }
+
+    /// A view over `store` stamped by `clock`, refreshed once.
+    async fn refreshed_view(
+        store: &Arc<dyn ObjectStoreBackend>,
+        clock: &Arc<TestClock>,
+    ) -> CompatView {
+        let view = CompatView::new(Arc::clone(store), compat_keys(), clock.clone());
+        view.refresh().await.expect("refresh");
+        view
+    }
+
+    async fn read_lease(store: &dyn ObjectStoreBackend) -> Option<AlertLease> {
+        match store
+            .get(
+                &alert_lease_key(&TenantId::new(TENANT).hash()),
+                GetRange::Full,
+            )
+            .await
+        {
+            Ok(got) => Some(AlertLease::from_slice(&got.data).expect("lease parses")),
+            Err(StoreError::NotFound) => None,
+            Err(err) => panic!("lease read: {err}"),
+        }
+    }
+
+    fn live_ttl_ns() -> i64 {
+        i64::from(LEASE_TTL_TICKS) * DEFAULT_ALERT_EVAL_INTERVAL.as_nanos() as i64
+    }
+
+    /// Rule 1: an evaluator whose view predates an activation meets the lease
+    /// the activation parked. It refreshes before acting, sees `rlog` active,
+    /// and takes the (expired-for-capable-builds) parked lease over in the
+    /// parked form: the lease is never unparked.
+    ///
+    /// Without the refresh the evaluator still thinks `rlog` is at the
+    /// baseline and writes an unparked lease, which a pre-baseline evaluator
+    /// would read as expiring and take; the `expiry_ns` assertion fails.
+    #[tokio::test]
+    async fn a_stale_view_meeting_a_parked_lease_refreshes_and_keeps_it_parked() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        ravel_catalog::compat::create_compat(
+            store.as_ref(),
+            &compat_keys(),
+            compat_record(5, 0, 0),
+        )
+        .await
+        .expect("create sys/compat");
+        let view = refreshed_view(&store, &clock).await;
+        assert_eq!(view.seen_epoch(), 0);
+
+        // The activation and its lease walk happen after the view's read.
+        update_compat_to(store.as_ref(), compat_record(5, 1, 1)).await;
+        let tenant = TenantId::new(TENANT).hash();
+        assert_eq!(
+            ravel_alerting::park_lease(store.as_ref(), &tenant, 1)
+                .await
+                .expect("park"),
+            ravel_alerting::ParkOutcome::Created
+        );
+
+        let ev = evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view.clone()));
+        assert_eq!(
+            ev.lease_step(NOW_NS).await.expect("lease step"),
+            LeaseStep::Held
+        );
+        assert_eq!(
+            view.seen_epoch(),
+            1,
+            "the evaluator refreshed its view first"
+        );
+        let lease = read_lease(store.as_ref()).await.expect("lease present");
+        assert_eq!(
+            lease,
+            AlertLease {
+                holder: ev.writer_id.to_string(),
+                expiry_ns: i64::MAX,
+                compat_expiry_ns: NOW_NS + live_ttl_ns(),
+                compat_epoch: 1,
+            },
+            "taken over in the parked form, real expiry in compat_expiry_ns"
+        );
+
+        // A second capable evaluator honours the real expiry, not i64::MAX:
+        // blocked while it is live, takes over once it passes, still parked.
+        let other =
+            evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view.clone()));
+        assert_eq!(
+            other.lease_step(NOW_NS).await.expect("lease step"),
+            LeaseStep::NotHeld
+        );
+        let later = NOW_NS + live_ttl_ns() + NS_PER_SEC;
+        clock.set(later);
+        assert_eq!(
+            other.lease_step(later).await.expect("lease step"),
+            LeaseStep::Held
+        );
+        let lease = read_lease(store.as_ref()).await.expect("lease present");
+        assert_eq!(lease.expiry_ns, i64::MAX);
+        assert_eq!(lease.holder, other.writer_id.to_string());
+    }
+
+    /// Rule 3: a holder whose build cannot write the active `rlog` version
+    /// hands its lease back parked with `compat_expiry_ns = 0` and takes no
+    /// new one; a tick under that policy writes no record and counts the
+    /// refusal.
+    #[tokio::test]
+    async fn an_incapable_holder_reparks_its_lease_and_writes_nothing() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        ravel_catalog::compat::create_compat(
+            store.as_ref(),
+            &compat_keys(),
+            compat_record(5, 0, 0),
+        )
+        .await
+        .expect("create sys/compat");
+        let view = refreshed_view(&store, &clock).await;
+        let ev = evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view.clone()));
+        assert_eq!(
+            ev.lease_step(NOW_NS).await.expect("lease step"),
+            LeaseStep::Held
+        );
+        assert!(!read_lease(store.as_ref()).await.expect("lease").is_parked());
+
+        // `rlog` is activated at a version this build does not write.
+        update_compat_to(store.as_ref(), compat_record(6, 1, 1)).await;
+        view.refresh().await.expect("refresh");
+        let refused_before = rlog_refusals("active_version_not_writable");
+        let step = ev.lease_step(NOW_NS).await.expect("lease step");
+        assert!(
+            matches!(
+                step,
+                LeaseStep::Refused(CompatRefusal::ActiveVersionNotWritable { active: 6, .. })
+            ),
+            "{step:?}"
+        );
+        assert_eq!(
+            read_lease(store.as_ref()).await.expect("lease present"),
+            AlertLease {
+                holder: ev.writer_id.to_string(),
+                expiry_ns: i64::MAX,
+                compat_expiry_ns: 0,
+                compat_epoch: 1,
+            },
+            "handed back parked and already expired for a capable evaluator"
+        );
+        assert!(rlog_refusals("active_version_not_writable") > refused_before);
+
+        // A whole tick writes no record and reports the lease unavailable.
+        let mut ev = ev;
+        let report = ev.run_tick().await;
+        assert!(report.lease_unavailable, "{report:?}");
+        assert_eq!(report.records_written, 0);
+        assert!(
+            read_alert_records(store.as_ref(), TenantId::new(TENANT).hash())
+                .await
+                .is_empty()
+        );
+    }
+
+    /// Rule 3 with no lease present: an incapable evaluator creates none.
+    #[tokio::test]
+    async fn an_incapable_evaluator_takes_no_lease() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        ravel_catalog::compat::create_compat(
+            store.as_ref(),
+            &compat_keys(),
+            compat_record(6, 1, 1),
+        )
+        .await
+        .expect("create sys/compat");
+        let view = refreshed_view(&store, &clock).await;
+        let ev = evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view));
+        assert!(matches!(
+            ev.lease_step(NOW_NS).await.expect("lease step"),
+            LeaseStep::Refused(CompatRefusal::ActiveVersionNotWritable { .. })
+        ));
+        assert_eq!(read_lease(store.as_ref()).await, None);
+    }
+
+    /// A view that never read `sys/compat` refuses before the lease is
+    /// touched.
+    #[tokio::test]
+    async fn a_stale_view_touches_no_lease() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let view = CompatView::new(Arc::clone(&store), compat_keys(), clock.clone());
+        let ev = evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view));
+        assert!(matches!(
+            ev.lease_step(NOW_NS).await.expect("lease step"),
+            LeaseStep::Refused(CompatRefusal::ViewStale { .. })
+        ));
+        assert_eq!(read_lease(store.as_ref()).await, None);
+    }
+
+    /// A tick under a policy naming `rlog` at the version this build writes
+    /// writes its transition at that version: the RLOG trailer and the commit
+    /// record's `segment_format_version` both carry it.
+    #[tokio::test]
+    async fn a_tick_writes_alert_history_at_the_policy_version() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let policy_version = WriteVersion::CURRENT.number();
+        ravel_catalog::compat::create_compat(
+            store.as_ref(),
+            &compat_keys(),
+            compat_record(u32::from(policy_version), 0, 0),
+        )
+        .await
+        .expect("create sys/compat");
+        let view = refreshed_view(&store, &clock).await;
+        let mut ev =
+            evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view.clone()));
+        let report = ev.run_tick().await;
+        assert_eq!(report.records_written, 1, "{report:?}");
+        let versions = alert_object_versions(store.as_ref()).await;
+        assert_eq!(versions, vec![(policy_version, u32::from(policy_version))]);
+        let lease = read_lease(store.as_ref()).await.expect("lease");
+        assert!(
+            !lease.is_parked(),
+            "rlog is not activated, so the lease is unparked"
+        );
+    }
+
+    /// `(trailer version, commit segment_format_version)` of every alert
+    /// history object.
+    async fn alert_object_versions(store: &dyn ObjectStoreBackend) -> Vec<(u16, u32)> {
+        let tenant = TenantId::new(TENANT).hash();
+        let prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let mut out = Vec::new();
+        for meta in list_all_after(store, &prefix, None).await.expect("list") {
+            let commit = record::decode(
+                &store
+                    .get(&meta.key, GetRange::Full)
+                    .await
+                    .expect("get commit")
+                    .data,
+            )
+            .expect("decode commit");
+            let data_key = keys::verify_object_key(&commit).expect("object key");
+            let bytes = store
+                .get(&data_key, GetRange::Full)
+                .await
+                .expect("get data")
+                .data;
+            let at = bytes.len() - ravel_logseg::footer::TRAILER_LEN + 8;
+            let trailer = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+            out.push((trailer, commit.segment_format_version));
+        }
+        out
+    }
+
+    /// The process-global `rlog` refusal count under `reason`.
+    fn rlog_refusals(reason: &str) -> u64 {
+        crate::compat::publish_refusals_snapshot()
+            .into_iter()
+            .find(|(family, r, _)| family.as_str() == FAMILY_RLOG && r.name() == reason)
+            .map_or(0, |(_, _, count)| count)
+    }
 }
