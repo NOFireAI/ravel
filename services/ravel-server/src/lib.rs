@@ -2,8 +2,10 @@
 //! (`--mode all|gateway|query`). Crate boundaries keep the split honest.
 
 // Antithesis SDK assertions through ravel-invariant (ADR-4326), compiled only
-// with the off-by-default `antithesis` feature (antithesis/README.md). Without
-// it each macro expands to nothing and its arguments are never evaluated.
+// with the off-by-default `antithesis` feature (antithesis/README.md), or with
+// `ravel-invariant/capture`, which records each evaluation in-process for
+// tests. Without either, each macro expands to nothing and its arguments are
+// never evaluated.
 // Defined before every module so all of them are in textual scope.
 macro_rules! antithesis_reachable {
     ($message:literal, $details:expr) => {

@@ -1,4 +1,5 @@
-# Ravel ingest-durability workload for Antithesis (antithesis/README.md).
+# Ravel ingest-durability workload for Antithesis
+# (antithesis/ingest-durability/README.md).
 #
 # rustfs is the one durable component. init creates the bucket and qualifies
 # it, then exits. ravel1 and ravel2 are two `--mode all` processes over that
