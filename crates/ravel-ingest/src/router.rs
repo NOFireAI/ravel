@@ -20,8 +20,8 @@ use crate::deferral::DeferralCapFlag;
 use crate::error::WriteError;
 use crate::format_floor::{FormatFamily, FormatFloorPolicy};
 use crate::generation::{
-    DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender, Routed, SwitchScope,
-    ViewRead,
+    BucketCompatCache, DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender,
+    Routed, SwitchScope, ViewRead,
 };
 use crate::metrics::{IngestMetrics, IngestMetricsSnapshot};
 use crate::pending_ack::{PendingAckBudget, PendingAckPermit};
@@ -419,9 +419,11 @@ impl IngestRouter {
         // Each generation's shard-actor set gets a fresh writer identity, so
         // two sets never collide on a commit key for the same shard index.
         let compat = CompatSlot::default();
+        let bucket_compat = BucketCompatCache::default();
         let switch = Arc::new_cyclic(|weak: &Weak<GenerationSwitch<ShardHandle>>| {
             let weak = weak.clone();
             let scope_compat = compat.clone();
+            let scope_bucket = bucket_compat.clone();
             let store = Arc::clone(&store);
             let refresh_store = Arc::clone(&store);
             let clock = Arc::clone(&clock);
@@ -437,6 +439,7 @@ impl IngestRouter {
                     weak.clone(),
                     shard_count,
                     scope_compat.clone(),
+                    scope_bucket.clone(),
                 ));
                 let writer_id = rng.new_uuid();
                 let epoch =
@@ -476,6 +479,7 @@ impl IngestRouter {
                 .with_refresh_source(refresh_store, signal, refresh_clock)
                 .with_read_failures(read_failures)
                 .with_compat_slot(compat.clone())
+                .with_bucket_cache(bucket_compat.clone())
         });
 
         IngestRouter {

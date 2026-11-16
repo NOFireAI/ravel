@@ -6429,6 +6429,204 @@ mod tests {
         assert_eq!(refused.total(), 1);
     }
 
+    /// ADR-4233 decision 4: the bucket fence is a CAS on the provisioning
+    /// record, so a concurrent writer can win the race. Two lost races (the
+    /// `/prov` CAS put refused `PreconditionFailed`) are retried after the
+    /// jittered backoff; the third attempt wins, the data and commit PUTs go
+    /// out, and the write succeeds. `fence_failed` stays zero.
+    #[tokio::test]
+    async fn a_lost_fence_cas_race_is_retried_twice_then_wins() {
+        use ravel_object_store::fault::{ScriptedFault, Sequence};
+        // Provision before arming the fault: the record's own create PUT is a
+        // `/prov` PUT too, and the fault plan would otherwise fail it.
+        let inner = MemoryStore::new();
+        let acme = TenantId::new("acme");
+        provision(&inner, &acme).await;
+        let plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Put)
+                .with_key_contains("/prov")
+                .then_fault(ScriptedFault::FailedConditionalWrite)
+                .then_fault(ScriptedFault::FailedConditionalWrite),
+        );
+        let fault_store = Arc::new(FaultStore::new(inner, plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let clock = TestClock::new(BASE_NS);
+        let compat_clock = CompatTestClock::at(BASE_NS);
+        let view = compat_view(&store, &compat_clock, Some(compat_record(1, 7, 0))).await;
+        let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone())
+            .with_family_versions(FormatFamily::Rseg, vec![7], 6);
+        let router = compat_router(
+            one_permit_one_queue(Duration::from_secs(3600)),
+            &store,
+            &clock,
+            policy,
+        );
+
+        let write = spawn_write(&router, &acme, "h0", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        // The fence retries park in the jittered backoff (up to 50 ms); advance
+        // the clock past it each turn so the two retries proceed.
+        while !write.is_finished() {
+            clock.advance_ns(100_000_000);
+            tokio::task::yield_now().await;
+        }
+        write
+            .await
+            .expect("write task")
+            .expect("fenced after two lost races and written");
+        assert_eq!(
+            fault_store.fault_count(
+                Op::Put,
+                ravel_object_store::fault::FaultKind::FailedConditionalWrite
+            ),
+            2,
+            "two CAS races were lost before the win"
+        );
+        assert_eq!(bucket_compat_epoch(store.as_ref(), &acme).await, 1);
+        assert_eq!(refused(&router).fence_failed, 0);
+        assert_eq!(refused(&router).total(), 0);
+        router.flush_all().await;
+    }
+
+    /// ADR-4233 decision 4: a fence that loses every CAS race up to
+    /// `FENCE_ATTEMPTS` abandons the flush, refused `FenceFailed` and counted
+    /// under `fence_failed`, with no data or commit object stored and the
+    /// bucket left unfenced.
+    #[tokio::test]
+    async fn an_exhausted_fence_cas_race_is_refused_fence_failed() {
+        use ravel_object_store::fault::{Rule, ScriptedFault};
+        // Provision before arming the fault, which fails every `/prov` PUT
+        // including the record's own create.
+        let inner = MemoryStore::new();
+        let acme = TenantId::new("acme");
+        provision(&inner, &acme).await;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite).with_key_contains("/prov"),
+        );
+        let fault_store = Arc::new(FaultStore::new(inner, plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let clock = TestClock::new(BASE_NS);
+        let compat_clock = CompatTestClock::at(BASE_NS);
+        let view = compat_view(&store, &compat_clock, Some(compat_record(1, 7, 0))).await;
+        let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone())
+            .with_family_versions(FormatFamily::Rseg, vec![7], 6);
+        let router = compat_router(
+            one_permit_one_queue(Duration::from_secs(3600)),
+            &store,
+            &clock,
+            policy,
+        );
+
+        let write = spawn_write(&router, &acme, "h0", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        while !write.is_finished() {
+            clock.advance_ns(100_000_000);
+            tokio::task::yield_now().await;
+        }
+        let err = write
+            .await
+            .expect("write task")
+            .expect_err("every fence CAS race was lost");
+        assert!(
+            matches!(
+                err,
+                WriteError::CompatRefused(crate::compat::CompatPublishRefusal::FenceFailed {
+                    compat_epoch: 1,
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            fault_store.fault_count(
+                Op::Put,
+                ravel_object_store::fault::FaultKind::FailedConditionalWrite
+            ),
+            u64::from(crate::compat::FENCE_ATTEMPTS),
+            "the fence tried FENCE_ATTEMPTS times before giving up"
+        );
+        assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 0);
+        assert_eq!(bucket_compat_epoch(store.as_ref(), &acme).await, 0);
+        assert_eq!(refused(&router).fence_failed, 1);
+        assert_eq!(refused(&router).total(), 1);
+        router.flush_all().await;
+    }
+
+    /// A router dropped without `shutdown()` while a row sits buffered under a
+    /// compat policy still publishes it: the per-tenant compat-epoch cache the
+    /// scope holds by `Arc` survives the switch, so the teardown flush grants
+    /// and fences from it instead of being refused `no_bucket_view` and
+    /// dropping acknowledged rows (docs/consistency-model.md: only a crash may
+    /// lose acknowledged rows). Before the scope held the cache, the grant
+    /// upgraded the dropped switch to `None` and was refused `no_bucket_view`;
+    /// a grant that instead fell back to an unmanaged write would publish at
+    /// `CURRENT` and leave the bucket unfenced, which the version and epoch
+    /// assertions below also rule out.
+    #[tokio::test]
+    async fn a_dropped_router_flushes_buffered_rows_under_a_policy() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let clock = TestClock::new(BASE_NS);
+        let compat_clock = CompatTestClock::at(BASE_NS);
+        let acme = TenantId::new("acme");
+        provision(store.as_ref(), &acme).await;
+        let view = compat_view(&store, &compat_clock, Some(compat_record(1, 7, 0))).await;
+        let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone())
+            .with_family_versions(FormatFamily::Rseg, vec![7], 6);
+        let router = compat_router(
+            one_permit_one_queue(Duration::from_secs(3600)),
+            &store,
+            &clock,
+            policy,
+        );
+        let metrics = router.metrics_handle();
+
+        // Buffer one row and let it reach the shard. No clock tick fires, so no
+        // normal flush runs: the row is live buffered state at the drop.
+        spawn_write(&router, &acme, "h0", WriteMode::Buffered)
+            .await
+            .expect("write task")
+            .expect("buffered");
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+
+        // Drop the router without shutdown(): the switch drops, every actor's
+        // mailbox closes, and each runs its teardown flush.
+        drop(router);
+
+        // The teardown flush publishes: a data object and a commit record
+        // appear, and the fence raised the bucket from the cached epoch.
+        let mut published = false;
+        for _ in 0..20_000 {
+            if objects(&tenant_keys(store.as_ref(), &acme).await) >= 2 {
+                published = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            published,
+            "the teardown flush never published: {:?}",
+            tenant_keys(store.as_ref(), &acme).await
+        );
+        let snapshot = metrics.snapshot().compat_publish_refused;
+        assert_eq!(
+            snapshot.no_bucket_view, 0,
+            "no teardown flush was refused no_bucket_view"
+        );
+        assert_eq!(snapshot.total(), 0, "no teardown flush was refused at all");
+        assert_eq!(
+            committed_rseg_versions(store.as_ref(), &acme).await,
+            vec![7],
+            "the teardown flush wrote the active version, not CURRENT"
+        );
+        assert_eq!(
+            bucket_compat_epoch(store.as_ref(), &acme).await,
+            1,
+            "the teardown fence raised the bucket from the cached epoch"
+        );
+    }
+
     /// The view names an RSEG version this build cannot write: a strict and
     /// a buffered write are both refused at admission, retryably, counted,
     /// and nothing is buffered, charged or stored.

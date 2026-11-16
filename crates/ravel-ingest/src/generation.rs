@@ -467,24 +467,83 @@ pub(crate) async fn reread_and_check<M>(
     verdict
 }
 
+/// The per-tenant `compat_epoch` a switch caches from provisioning records,
+/// in its own `Arc` so a shard's [`SwitchScope`] keeps reading it after the
+/// router's switch is dropped. A teardown flush (ADR-1685 teardown bypass)
+/// then still fences its bucket from the cached epoch instead of being refused
+/// `no_bucket_view` and dropping acknowledged rows, which only a crash may
+/// lose (docs/consistency-model.md). The switch mirrors every `compat_epoch`
+/// it caches into this map, so it holds the same epochs the switch's own
+/// [`BucketCompat`] answers from while the switch is alive.
+#[derive(Clone, Default)]
+pub(crate) struct BucketCompatCache(Arc<RwLock<HashMap<TenantHash, u64>>>);
+
+impl BucketCompatCache {
+    /// Raise `tenant`'s cached epoch to `compat_epoch` (monotone). `None` is a
+    /// read that carried no record; it caches nothing, so a never-cached
+    /// tenant stays absent, as the switch's own view does.
+    fn raise(&self, tenant: TenantHash, compat_epoch: Option<u64>) {
+        let Some(epoch) = compat_epoch else {
+            return;
+        };
+        let mut map = self.0.write().unwrap_or_else(|p| p.into_inner());
+        let slot = map.entry(tenant).or_insert(0);
+        *slot = (*slot).max(epoch);
+    }
+
+    /// Drop `tenant`'s cached epoch when its switch view is evicted as idle, so
+    /// the cache tracks the switch's own per-tenant memory.
+    fn forget(&self, tenant: &TenantHash) {
+        self.0
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(tenant);
+    }
+}
+
+impl BucketCompat for BucketCompatCache {
+    fn bucket_compat_epoch(&self, tenant: TenantHash) -> Option<u64> {
+        self.0
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&tenant)
+            .copied()
+    }
+
+    fn note_compat_fence(&self, tenant: TenantHash, compat_epoch: u64) {
+        self.raise(tenant, Some(compat_epoch));
+    }
+}
+
 /// The production [`FlushScope`] of one shard-actor set: a weak reference to
 /// the router's switch, so an actor never keeps its router's shard sets (and
 /// with them every actor's mailbox) alive after the router is dropped, and the
 /// shard count of the set, which is what identifies the generation that routed
 /// its rows. `compat` is the switch's own activation-policy slot, held here
 /// too so a flush still applies the policy after its router is dropped.
+/// `bucket` is the switch's per-tenant compat-epoch cache, held by `Arc` for
+/// the same reason: a teardown flush after the switch is dropped still finds
+/// its bucket's epoch here and fences, rather than being refused
+/// `no_bucket_view`.
 pub(crate) struct SwitchScope<H> {
     switch: Weak<GenerationSwitch<H>>,
     count: u32,
     compat: CompatSlot,
+    bucket: BucketCompatCache,
 }
 
 impl<H> SwitchScope<H> {
-    pub(crate) fn new(switch: Weak<GenerationSwitch<H>>, count: u32, compat: CompatSlot) -> Self {
+    pub(crate) fn new(
+        switch: Weak<GenerationSwitch<H>>,
+        count: u32,
+        compat: CompatSlot,
+        bucket: BucketCompatCache,
+    ) -> Self {
         SwitchScope {
             switch,
             count,
             compat,
+            bucket,
         }
     }
 }
@@ -534,11 +593,16 @@ where
         tenant: TenantHash,
         family: FormatFamily,
     ) -> Result<PublishGrant, CompatPublishRefusal> {
-        let bucket = self
-            .switch
-            .upgrade()
-            .map(|switch| switch as Arc<dyn BucketCompat>);
-        PublishGrant::at_grant(self.compat.get(), family, tenant, bucket)
+        // The live switch is the bucket view while it exists, so a fence
+        // updates its routing cache too; once it is dropped (a teardown flush),
+        // the switch's own compat-epoch cache, cloned into this scope, answers
+        // and takes the fence, so the flush still publishes instead of being
+        // refused `no_bucket_view` and losing acknowledged rows.
+        let bucket: Arc<dyn BucketCompat> = match self.switch.upgrade() {
+            Some(switch) => switch,
+            None => Arc::new(self.bucket.clone()),
+        };
+        PublishGrant::at_grant(self.compat.get(), family, tenant, Some(bucket))
     }
 }
 
@@ -847,6 +911,11 @@ pub struct GenerationSwitch<H> {
     /// applies (ADR-4233), shared with each shard's [`SwitchScope`]. Empty
     /// unless the router's `with_compat_policy` installed one.
     compat: CompatSlot,
+    /// The per-tenant compat-epoch cache (ADR-4233 decision 4), shared by `Arc`
+    /// with each shard's [`SwitchScope`]. The switch mirrors every
+    /// `compat_epoch` it caches into it, so a teardown flush after the switch
+    /// is dropped still fences from the cached epoch.
+    bucket_cache: BucketCompatCache,
     /// Failed provisioning reads by cause, shared with the router's metrics.
     read_failures: Arc<ProvisioningReadFailures>,
 }
@@ -875,6 +944,7 @@ impl<H> GenerationSwitch<H> {
             refresh_source: None,
             floor_policy: RwLock::new(FormatFloorPolicy::default()),
             compat: CompatSlot::default(),
+            bucket_cache: BucketCompatCache::default(),
             read_failures: Arc::new(ProvisioningReadFailures::default()),
         }
     }
@@ -962,6 +1032,15 @@ impl<H> GenerationSwitch<H> {
     #[must_use]
     pub(crate) fn with_compat_slot(mut self, slot: CompatSlot) -> Self {
         self.compat = slot;
+        self
+    }
+
+    /// Share `cache` as this switch's per-tenant compat-epoch cache: the
+    /// router hands the same cache to every [`SwitchScope`] it builds, so a
+    /// teardown flush reaches the cached epoch after the switch is dropped.
+    #[must_use]
+    pub(crate) fn with_bucket_cache(mut self, cache: BucketCompatCache) -> Self {
+        self.bucket_cache = cache;
         self
     }
 
@@ -1262,6 +1341,7 @@ impl<H> GenerationSwitch<H> {
                 last_touched_ns: now_ns,
             },
         );
+        self.bucket_cache.raise(tenant, compat_epoch);
         set
     }
 
@@ -1286,12 +1366,20 @@ impl<H> GenerationSwitch<H> {
     /// both), so eviction is deterministic under test.
     pub fn evict_idle(&self, now_ns: i64, ttl_ns: i64) -> usize {
         let mut inner = self.lock();
-        let before = inner.views.len();
-        inner
-            .views
-            .retain(|_, view| now_ns.saturating_sub(view.last_touched_ns) <= ttl_ns);
+        let mut evicted = Vec::new();
+        inner.views.retain(|tenant, view| {
+            let keep = now_ns.saturating_sub(view.last_touched_ns) <= ttl_ns;
+            if !keep {
+                evicted.push(*tenant);
+            }
+            keep
+        });
         inner.read_backoff.evict_idle(now_ns, ttl_ns);
-        before - inner.views.len()
+        drop(inner);
+        for tenant in &evicted {
+            self.bucket_cache.forget(tenant);
+        }
+        evicted.len()
     }
 
     /// Every live shard-actor set, for the router's `flush_all`/`shutdown`
@@ -1346,6 +1434,7 @@ impl<H: Send + Sync> BucketCompat for GenerationSwitch<H> {
         if let Some(view) = self.lock().views.get_mut(&tenant) {
             view.compat_epoch = view.compat_epoch.max(Some(compat_epoch));
         }
+        self.bucket_cache.raise(tenant, Some(compat_epoch));
     }
 }
 
@@ -1504,7 +1593,13 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
                 match loaded {
                     Ok(view) => {
                         inner.read_backoff.clear(&tenant);
-                        install_if_newer(&mut inner.views, tenant, view, issued_ns);
+                        install_if_newer(
+                            &mut inner.views,
+                            &switch.bucket_cache,
+                            tenant,
+                            view,
+                            issued_ns,
+                        );
                     }
                     Err(err) => {
                         switch.note_read_failure(&mut inner, signal, tenant, err, issued_ns)
@@ -1526,6 +1621,7 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
 /// saw it.
 fn install_if_newer(
     views: &mut HashMap<TenantHash, TenantView>,
+    bucket_cache: &BucketCompatCache,
     tenant: TenantHash,
     read: ProvisioningView,
     refreshed_at_ns: i64,
@@ -1562,6 +1658,7 @@ fn install_if_newer(
             );
         }
     }
+    bucket_cache.raise(tenant, compat_epoch);
 }
 
 /// Read and decode the current shard-generation history for one (tenant,
@@ -2115,7 +2212,12 @@ mod tests {
                 None
             }
         }
-        let scope = SwitchScope::<NoSender>::new(Weak::new(), 4, CompatSlot::default());
+        let scope = SwitchScope::<NoSender>::new(
+            Weak::new(),
+            4,
+            CompatSlot::default(),
+            BucketCompatCache::default(),
+        );
         assert!(FlushScope::<()>::may_wait_on(&scope, 3));
         assert!(!FlushScope::<()>::may_wait_on(&scope, 4));
         assert!(!FlushScope::<()>::may_wait_on(&scope, 5));

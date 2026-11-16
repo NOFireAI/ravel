@@ -16,13 +16,14 @@
 //! `ravel_compat_refresh_failures_total`, never fatal: the view keeps its last
 //! successful read. Writers refuse when the last successful read is
 //! `COMPAT_VIEW_HORIZON` old or older, or there has been none, with one
-//! exception: a blind view, one no read has succeeded for and whose every
-//! refresh error is an `AccessDenied`, answers each family's built-in version
-//! on a bucket whose provisioning record carries no `compat_epoch`, so a
-//! credential without the grant on a store that was never activated stops no
-//! writer. A single 5xx, timeout or throttle before the first successful read
-//! ends that exception for the rest of the run, and so does a read that
-//! returned an object. A record from a newer release is logged at error with
+//! exception: a blind view, one no read has succeeded for and whose latest
+//! failed read, if any, was refused as an `AccessDenied`, answers each
+//! family's built-in version on a bucket whose provisioning record carries no
+//! `compat_epoch`, so a credential without the grant on a store that was never
+//! activated stops no writer. A 5xx, timeout or throttle before the first
+//! successful read suspends that exception until the latest failed read is an
+//! `AccessDenied` again, and a read that returned an object ends it for the
+//! rest of the run. A record from a newer release is logged at error with
 //! both versions.
 
 use std::collections::BTreeMap;
@@ -55,18 +56,21 @@ impl CompatClock for SystemCompatClock {
 
 /// Why a writer refused a publish, the `reason` label of
 /// `ravel_compat_publish_refused_total`: one value per [`CompatRefusal`]
-/// variant, then one per maintenance-only
-/// [`ravel_maintain::CompatRunRefusal`] reason, and `other` for a maintenance
-/// reason this enum does not name, so the label set stays closed.
+/// variant, then one per ingest-only ([`ravel_ingest::CompatRefusalReason`])
+/// reason, then one per maintenance-only
+/// [`ravel_maintain::CompatRunRefusal`] reason, and `other` for a reason this
+/// enum does not name, so the label set stays closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CompatRefusalReason {
     ViewStale,
     ActiveVersionNotWritable,
     CompatRecordMissing,
+    FenceFailed,
+    ActiveVersionMoved,
+    NoBucketView,
     PublishLifetimeAboveCompat,
     TargetNotActive,
     CompactionRecordNotActive,
-    FenceFailed,
     PublishLifetimeExpired,
     Other,
 }
@@ -81,25 +85,33 @@ impl CompatRefusalReason {
     ];
 
     /// Every named reason, in label order.
-    const NAMED: [CompatRefusalReason; 8] = [
+    const NAMED: [CompatRefusalReason; 10] = [
         CompatRefusalReason::ViewStale,
         CompatRefusalReason::ActiveVersionNotWritable,
         CompatRefusalReason::CompatRecordMissing,
+        CompatRefusalReason::FenceFailed,
+        CompatRefusalReason::ActiveVersionMoved,
+        CompatRefusalReason::NoBucketView,
         CompatRefusalReason::PublishLifetimeAboveCompat,
         CompatRefusalReason::TargetNotActive,
         CompatRefusalReason::CompactionRecordNotActive,
-        CompatRefusalReason::FenceFailed,
         CompatRefusalReason::PublishLifetimeExpired,
     ];
 
     /// The reason of a maintenance refusal counted under `reason`
-    /// ([`ravel_maintain::CompatRunRefusal::reason`]), `Other` for one this
-    /// enum does not name.
-    pub fn of_maintain(reason: &str) -> CompatRefusalReason {
+    /// ([`ravel_maintain::CompatRunRefusal::reason`]), or of an ingest refusal
+    /// counted under `reason` ([`ravel_ingest::CompatRefusalReason::as_str`]);
+    /// `Other` for one this enum does not name.
+    pub fn of_label(reason: &str) -> CompatRefusalReason {
         CompatRefusalReason::NAMED
             .into_iter()
             .find(|named| named.name() == reason)
             .unwrap_or(CompatRefusalReason::Other)
+    }
+
+    /// Alias of [`Self::of_label`] for a maintenance refusal reason.
+    pub fn of_maintain(reason: &str) -> CompatRefusalReason {
+        CompatRefusalReason::of_label(reason)
     }
 
     /// The reason of `refusal`.
@@ -119,12 +131,41 @@ impl CompatRefusalReason {
             CompatRefusalReason::ViewStale => "view_stale",
             CompatRefusalReason::ActiveVersionNotWritable => "active_version_not_writable",
             CompatRefusalReason::CompatRecordMissing => "compat_record_missing",
+            CompatRefusalReason::FenceFailed => "fence_failed",
+            CompatRefusalReason::ActiveVersionMoved => "active_version_moved",
+            CompatRefusalReason::NoBucketView => "no_bucket_view",
             CompatRefusalReason::PublishLifetimeAboveCompat => "publish_lifetime_above_compat",
             CompatRefusalReason::TargetNotActive => "target_not_active",
             CompatRefusalReason::CompactionRecordNotActive => "compaction_record_not_active",
-            CompatRefusalReason::FenceFailed => "fence_failed",
             CompatRefusalReason::PublishLifetimeExpired => "publish_lifetime_expired",
             CompatRefusalReason::Other => "other",
+        }
+    }
+
+    /// Add one ingest router's per-signal refusals ([`ravel_ingest`]) to
+    /// `series`, keyed by `family` (the signal's format family), summing into
+    /// an existing `(family, reason)` entry or appending a new one. The ingest
+    /// routers count these in their own `IngestMetrics`, apart from the server
+    /// static and `ravel-maintain`, so `/metrics` sums them in here (#4301).
+    pub fn merge_ingest_refusals(
+        series: &mut Vec<(CompatFamilyLabel, CompatRefusalReason, u64)>,
+        family: &str,
+        snapshot: &ravel_ingest::CompatRefusalSnapshot,
+    ) {
+        let label = CompatFamilyLabel::of(family);
+        for ingest_reason in ravel_ingest::CompatRefusalReason::ALL {
+            let count = snapshot.get(ingest_reason);
+            if count == 0 {
+                continue;
+            }
+            let reason = CompatRefusalReason::of_label(ingest_reason.as_str());
+            match series
+                .iter_mut()
+                .find(|(f, r, _)| *f == label && *r == reason)
+            {
+                Some((_, _, existing)) => *existing += count,
+                None => series.push((label, reason, count)),
+            }
         }
     }
 }

@@ -92,9 +92,11 @@ pub struct LogIngestMetrics {
     abandoned_hour_bound: AtomicU64,
     /// Writes and flushes the `sys/compat` activation policy refused, by
     /// reason (ADR-4233): at admission, at permit grant, before a PUT
-    /// attempt, or at the bucket fence. A refused flush stores no commit
-    /// record. Read through the snapshot's `compat_publish_refused` field,
-    /// which `ravel-server` does not yet render on `/metrics` (#4287).
+    /// attempt, or at the bucket fence. A refused attempt publishes no commit
+    /// record; a data object already stored before the refusal is left for
+    /// orphan GC. Read through the snapshot's `compat_publish_refused` field,
+    /// which `ravel-server` renders on `/metrics` as
+    /// `ravel_compat_publish_refused_total` (#4301).
     compat_publish_refused: CompatRefusalCounters,
     /// Flushes abandoned because the input could not be turned into a durable
     /// object at all: the RLOG build, data-key derivation, or commit-record
