@@ -1035,9 +1035,13 @@ pub struct SqlStats {
     /// Batches the successful attempt's logs scans built on the row path,
     /// from a decoded block's rows ([`crate::logs_scan`]'s
     /// `build_row_batch`): every batch of a query projecting `attrs` or under
-    /// a pending erasure, and of a block carrying an `attrs_raw` page. Read
-    /// off the scans' `rowpath_batches` counter and summed over every logs
-    /// scan in the plan. Zero for a metrics query.
+    /// a pending erasure, of a block carrying an `attrs_raw` page, of the rest
+    /// of a segment once `MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS` consecutive
+    /// overflow blocks commit it to the row path, and of a block the columnar
+    /// exit refused for an unexpected pending erasure. Only non-empty batches
+    /// handed downstream count; an all-erased or filtered-empty chunk does
+    /// not. Read off the scans' `rowpath_batches` counter and summed over
+    /// every logs scan in the plan. Zero for a metrics query.
     pub rowpath_batches: u64,
     /// Batches the successful attempt's logs scans built on the columnar
     /// fast path (ADR-0099 decision 2), read off the scans'
