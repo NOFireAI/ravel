@@ -1007,14 +1007,14 @@ family only a newer release knows.
 
 | Metric | Meaning |
 |---|---|
-| `ravel_compat_publish_refused_total` | Counter, by `family` and `reason`. Publishes a writer refused under the write policy. `reason` is `view_stale` (the last successful read of `sys/compat` is 10 minutes old, or there has been none), `active_version_not_writable` (the record names a version this build does not write), or `compat_record_missing` (the record is absent although this process has seen an activation). Every known family renders all three reasons at 0 before the first refusal. In this release the alert evaluator and the catalog fold count here. Alert on any increase. |
-| `ravel_compat_refresh_failures_total` | Counter. Reads of `sys/compat` that failed. The view keeps its last successful read, so writers keep going until that read is 10 minutes old. A record written by a newer release fails every read and is logged at error with both format versions. |
-| `ravel_compat_view_age_seconds` | Gauge. Seconds since the last successful read started; `+Inf` before the first one. Writers refuse at 600. |
+| `ravel_compat_publish_refused_total` | Counter, by `family` and `reason`. Publishes a writer refused under the write policy. `reason` is `view_stale` (a GET of `sys/compat` has returned an object, and the last successful read is 10 minutes old or none has succeeded), `active_version_not_writable` (the record names a version this build does not write), or `compat_record_missing` (the record is absent although this process has seen an activation). Every known family renders all three reasons at 0 before the first refusal. In this release the alert evaluator and the catalog fold count here. Alert on any increase. |
+| `ravel_compat_refresh_failures_total` | Counter. Reads of `sys/compat` that failed. The view keeps its last successful read, so writers keep going until that read is 10 minutes old. Until a GET returns an object (a store that was never activated, or a role refused with `AccessDenied`), failures stop no writer: each keeps its built-in version. A record written by a newer release fails every read and is logged at error with both format versions. |
+| `ravel_compat_view_age_seconds` | Gauge. Seconds since the last successful read started; `+Inf` before the first one. Once a `sys/compat` object has been read, writers refuse at 600. |
 | `ravel_compat_epoch` | Gauge. The highest store-wide `compat_epoch` this process has seen; 0 before any activation. |
 | `ravel_compat_active_write_version` | Gauge, by `family`. The active write version this process has seen for each family the record names. |
 
 A `ravel_compat_view_age_seconds` above 120 means no refresh has succeeded
-for two intervals; at 600 every writer that follows the policy refuses.
+for two intervals; at 600 every writer that follows the policy refuses, unless no `sys/compat` object has ever been read.
 
 ### Store reachability
 

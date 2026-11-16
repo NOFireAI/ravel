@@ -447,6 +447,7 @@ grant names the one key or prefix the calls use:
 | `sys/qualify/*` | | | | put, delete |
 | `sys/pq-probe/*` | | | | put, delete |
 | `sys/gc` | get | get | get, put | put |
+| `sys/compat` | get | get | get | |
 | `sys/auth` | get | get | | put |
 | `sys/ipcrypt/policy` | get, put (create-only) | | | put |
 | `sys/t/*` | put | | | |
@@ -896,6 +897,7 @@ would admit nothing.
 | `sys/qualification` | yes | yes | yes | `qualification::enforce` at startup; absent refuses startup with the error naming `ravel-cli store qualify` |
 | `sys/tenancy` | yes | yes | yes | `resolve_and_pin` at startup; absent means no process has pinned the scheme yet, and this one writes the marker |
 | `sys/gc` | yes | yes | yes | `bootstrap_gc_config` at startup; absent means a fresh bucket, and the process tries to create it |
+| `sys/compat` | yes | yes | yes | `CompatView::refresh` on a keyed bucket, at startup and every 60 s; absent means no format has been activated, and every writer keeps its built-in version (ADR-4233 decision 1). A read refused with `AccessDenied` before any record was read is treated the same way, so a missing grant cannot stop writers on a store that was never activated |
 | `sys/auth` | yes | yes | | `DurableAuthState::refresh` on a keyed bucket; absent is an empty token map |
 | `sys/ipcrypt/policy` | yes | | | `check_startup_marker` at startup in `all` and `gateway` mode; absent means no IPCrypt policy has been recorded, and the process creates the marker when its own policy is not empty |
 | `t/<tenant_hash>/config` | yes | yes | yes | `read_config`; absent means the tenant runs on the deployment defaults |
