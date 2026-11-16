@@ -815,7 +815,9 @@ a hold with no bound is a liveness failure of it.
 
 **Decision.** An unreadable claim (bytes that do not decode, a
 `format_version` above this build's, an unspecified state, or an id that is
-not 16 bytes) is given `MAX_OBSERVED_LEASE_MS` (24 h,
+not 16 bytes -- narrowed by the 2026-11-15 amendment, which carves the
+version cases out into their own never-stolen class) is given
+`MAX_OBSERVED_LEASE_MS` (24 h,
 `crates/ravel-fleet/src/claim.rs`) as its lease. Its expiry is the store's
 `last_modified` plus 24 h, and past that it is stolen under
 `PutMode::CasVersion` on the version the contender observed, exactly as any
@@ -878,15 +880,18 @@ caution the operations guide gives. It is no longer the only way out.
 
 Tests, each shown failing against the code before this amendment:
 `an_unreadable_claim_is_stolen_once_older_than_the_lease_ceiling` in
-`crates/ravel-fleet/src/claim.rs` (garbage and future-format payloads, the
-CAS steal, and a rewrite between observation and steal reporting `Lost`);
+`crates/ravel-fleet/src/claim.rs` (garbage and future-format payloads --
+the future-format case is carved out by the 2026-11-15 amendment and no
+longer stolen -- the CAS steal, and a rewrite between observation and steal
+reporting `Lost`);
 `an_unreadable_claim_defers_until_the_lease_ceiling_plus_jitter_then_steals`
 in `crates/ravel-maintain/src/claim_guard.rs`;
 `a_stale_unreadable_claim_holds_both_passes_until_the_lease_ceiling` in
 `crates/ravel-maintain/tests/erasure_compaction_fence.rs` and
 `a_stale_unreadable_claim_holds_the_bucket_until_the_lease_ceiling` in
 `crates/ravel-maintain/tests/compaction_claims.rs`, which replace the two
-tests of the same prefix the 2026-10-03 amendment names; and
+tests of the same prefix the 2026-10-03 amendment names; and (superseded by
+the 2026-11-15 amendment)
 `a_future_format_claim_stalls_an_erasure_for_at_most_the_lease_ceiling` in
 `services/ravel-server/src/maintain.rs`. The recheck point is pinned by
 `an_unreadable_claim_is_rechecked_once_per_lease_before_its_steal` in
@@ -925,3 +930,73 @@ Tests, each shown failing against the code before this amendment:
 `a_lease_above_the_ceiling_prices_the_jitter_from_the_clamped_lease` and
 `a_lost_steal_reschedules_within_the_lease_ceiling` in
 `crates/ravel-maintain/src/claim_guard.rs`.
+
+## Amendment (2026-11-15): a claim at an unknown format version is never stolen (ADR-4233 decision 4, H8)
+
+<!-- amendment-applies: sections="Amendment (2026-11-09): an unreadable claim is stolen once older than the lease ceiling (issue #3209)" pointer="2026-11-15 amendment" -->
+<!-- amendment-supersedes: phrase="a `format_version` above this build's, an unspecified state, or an id that is" pointer="2026-11-15 amendment" -->
+<!-- amendment-supersedes: phrase="garbage and future-format payloads" pointer="2026-11-15 amendment" -->
+<!-- amendment-supersedes: phrase="a_future_format_claim_stalls_an_erasure_for_at_most_the_lease_ceiling" pointer="2026-11-15 amendment" -->
+
+**The problem.** The 2026-11-09 amendment gave every unreadable claim,
+including one whose `format_version` is 0 (never written by any build) or
+above this build's `CLAIM_FORMAT_VERSION` (written by a newer build), the
+same 24 h-plus-jitter steal. A build that does not know a stored claim's
+version cannot know what invariant that version's writer relied on; stealing
+it under CAS and letting an older build's compactor or erasure pass run
+unfenced past it risks exactly the correctness failure claims exist to
+prevent, for a case the ceiling was never meant to cover (a format bump
+followed by a rollback, not a crashed writer).
+
+**Decision.** A claim is now classified before the 24 h ceiling applies at
+all, not folded into one unreadable case. A claim whose `format_version` is 0
+or above `CLAIM_FORMAT_VERSION` is version-protected: it is never stolen and
+never overwritten, at any age, and judged by no lease at all. A claim whose
+`format_version` is a version this build knows, but whose payload otherwise
+does not decode (bytes that do not parse, an unspecified state, or an id that
+is not 16 bytes), is unchanged: it is still given `MAX_OBSERVED_LEASE_MS` as
+its lease and stolen past that ceiling exactly as the 2026-11-09 amendment
+decided.
+
+**The invariant, restated.** No claim object at a known `format_version`
+holds its bucket past its `last_modified` plus 24 h plus one contender's
+jitter without a write to the object. A claim at an unknown `format_version`
+holds its bucket until an operator deletes the object by hand or a build
+that knows the version restarts and reclaims it; no ceiling bounds it.
+
+**The claim guard.** `ClaimGuard::acquire` reports the new
+`ClaimSkipReason::VersionProtectedClaim`, distinct from
+`ClaimSkipReason::UnreadableClaim`, on the existing
+`ravel_maintain_claims_skipped_total` skip counter, not a new metric family.
+Both `reschedule_after_unix_ms` and `recheck_after_unix_ms` are pinned to
+`i64::MAX` for this reason, since there is no threshold to recheck against
+short of the two remedies above; the in-memory deferral this pins
+(`MaintainMemo::claim_deferred_until_ns`) is process-local and resets on
+restart, so pinning it costs nothing durable. This process logs the hazard
+once per claim at `warn`, not on every tick, naming the claim object's key
+and the operator remedy (`docs/guides/operations/maintenance.md`).
+
+**Why not fold this into the ceiling.** Judging an unknown version by a
+lease computed for known ones assumes the unknown version's writer obeys the
+same renewal and CAS discipline this build's does; a newer build's claim
+format might not. Holding forever is the conservative failure mode a bounded
+steal cannot offer a version it cannot read, and it is a hazard the operator
+can see (the warn log, the skip reason, the operations-guide remedy) and
+resolve directly, rather than a silent window where a stale build's compactor
+races one it cannot understand.
+
+Tests, each shown failing against the code before this amendment:
+`claim_above_known_version_or_zero_is_never_stolen` in
+`crates/ravel-fleet/src/claim.rs`; `a_version_protected_claim_is_never_stolen`
+and `version_protected_warn_fires_once_per_work_id` in
+`crates/ravel-maintain/src/claim_guard.rs`;
+`claims_skipped_help_text_names_the_version_protected_reason` in
+`services/ravel-server/src/metrics.rs`;
+`a_version_protected_claim_skip_renders_its_own_reason` in
+`services/ravel-cli/src/maintain.rs`; and
+`a_future_format_claim_is_never_stolen_at_any_age` in
+`services/ravel-server/src/maintain.rs`, which asserts the rendered
+`/metrics` skip count and replaces
+`a_future_format_claim_stalls_an_erasure_for_at_most_the_lease_ceiling` named
+by the 2026-11-09 amendment: that test is no longer accurate, since a
+future-format claim is no longer stolen at any age.

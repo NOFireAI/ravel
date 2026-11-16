@@ -78,6 +78,18 @@
 //! and a claim deleted by hand releases the bucket within that, not at the
 //! steal threshold.
 //!
+//! # A version-protected claim is never stolen
+//!
+//! A claim whose `format_version` is 0 (never written by any build) or above
+//! [`ravel_fleet::claim::CLAIM_FORMAT_VERSION`] (written by a newer build) is
+//! not merely unreadable, it is version-protected (ADR-4233 decision 4, H8):
+//! [`ClaimGuard::acquire`] never attempts a steal, at any age, and reports
+//! [`ClaimSkipReason::VersionProtectedClaim`] instead of
+//! [`ClaimSkipReason::UnreadableClaim`]. The bucket stays held until an
+//! operator deletes the claim object by hand or a build that knows the
+//! version restarts and reclaims it; this process logs the hazard once per
+//! claim at `warn`, not on every tick.
+//!
 //! # The claim fences compaction against the erasure rewrite
 //!
 //! Since the 2026-10-03 amendment a claim is not only a cost measure. The
@@ -127,7 +139,8 @@
 //! still waits out the lease as before (ADR-1029, 2026-09-30 amendment; issue
 //! #2156).
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -194,13 +207,21 @@ pub enum ClaimSkipReason {
     /// owner was not dead and renewed, which moves the version and defeats the
     /// steal), or the claim object was gone by the steal's CAS.
     StealLost,
-    /// The claim's payload does not decode, or declares a format floor this
-    /// build does not understand, and the claim is not yet older than
-    /// [`ravel_fleet::claim::MAX_OBSERVED_LEASE_MS`] plus this contender's
-    /// jitter by the store's `last_modified`. Past that age the guard steals
-    /// it, so without a write to the object the bucket is held for at most
-    /// that long.
+    /// The claim's payload does not decode, carries the never-written
+    /// `UNSPECIFIED` state, or carries owner ids that do not parse, at a
+    /// `format_version` this build understands, and the claim is not yet
+    /// older than [`ravel_fleet::claim::MAX_OBSERVED_LEASE_MS`] plus this
+    /// contender's jitter by the store's `last_modified`. Past that age the
+    /// guard steals it, so without a write to the object the bucket is held
+    /// for at most that long.
     UnreadableClaim,
+    /// The claim's `format_version` is 0 (never written by any build) or
+    /// above [`ravel_fleet::claim::CLAIM_FORMAT_VERSION`] (written by a newer
+    /// build this one does not understand): ADR-4233 decision 4 (H8). Never
+    /// stolen or overwritten at any age, unlike [`Self::UnreadableClaim`];
+    /// the bucket is held until an operator deletes the claim object by hand
+    /// or a build that knows the version reclaims it.
+    VersionProtectedClaim,
     /// The claim existed at the `CreateIfAbsent` and was gone by the read that
     /// followed, twice in a row. One retry is free; a second vanishing means
     /// something outside this protocol is deleting claims, so the bucket is
@@ -215,6 +236,7 @@ impl ClaimSkipReason {
             ClaimSkipReason::HeldByAnother => "held_by_another",
             ClaimSkipReason::StealLost => "steal_lost",
             ClaimSkipReason::UnreadableClaim => "unreadable_claim",
+            ClaimSkipReason::VersionProtectedClaim => "version_protected_claim",
             ClaimSkipReason::VanishedTwice => "vanished_twice",
         }
     }
@@ -231,7 +253,8 @@ pub struct ClaimSkip {
     /// The holding process, when the claim payload was readable.
     pub holder_process_id: Option<Uuid>,
     /// `last_modified + lease`, from the store's own timestamp. `0` when there
-    /// was no observation to date (a vanished claim).
+    /// was no observation to date (a vanished claim). [`i64::MAX`], as are
+    /// both points below, for [`ClaimSkipReason::VersionProtectedClaim`].
     pub expiry_unix_ms: i64,
     /// The earliest this bucket should be retried: one millisecond past the
     /// holder's expiry (past the observation instant for a vanished claim).
@@ -343,6 +366,22 @@ impl std::fmt::Debug for ClaimGuard {
             .field("owner_process_id", &self.inner.owner.process_id)
             .finish_non_exhaustive()
     }
+}
+
+/// Process-wide dedup for the version-protected warn log: `true` the first
+/// time `work_id` is seen, `false` on every later observation by this
+/// process, across however many [`ClaimGuard`] instances contend for the same
+/// bucket over the process's life. Process-global rather than per-guard
+/// because a wedged bucket is re-contended by a fresh `ClaimGuard` on every
+/// maintenance tick, and the hazard is worth one line per process, not one
+/// per tick.
+fn warn_version_protected_once(work_id: WorkId) -> bool {
+    static WARNED: OnceLock<Mutex<HashSet<WorkId>>> = OnceLock::new();
+    WARNED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(work_id)
 }
 
 impl ClaimGuard {
@@ -581,6 +620,22 @@ impl ClaimGuard {
                 recheck_after_unix_ms,
             })
         };
+        if observed.version_protected {
+            // Never stolen at any age (ADR-4233 decision 4, H8): logged once
+            // per claim per process, not on every tick this bucket is
+            // reconsidered, so a wedged claim does not spam the log.
+            if warn_version_protected_once(observed.work_id) {
+                tracing::warn!(
+                    key = %observed.key,
+                    work_id = %observed.work_id.hex(),
+                    "compaction claim is version-protected (format_version 0 or above this \
+                     build's known version) and is held forever; an operator must delete the \
+                     claim object by hand or run a build that knows the version (ADR-4233 \
+                     decision 4, H8)"
+                );
+            }
+            return Ok(skip(ClaimSkipReason::VersionProtectedClaim));
+        }
         if unreadable && now_ms < observed.reschedule_after_unix_ms {
             return Ok(skip(ClaimSkipReason::UnreadableClaim));
         }
@@ -1690,6 +1745,137 @@ mod tests {
             stored.lease_duration_ns,
             cfg().lease_duration.as_nanos() as i64,
             "this guard's payload, on its own lease"
+        );
+    }
+
+    /// A claim at a future `format_version` is version-protected (ADR-4233
+    /// decision 4, H8): the guard reports
+    /// [`ClaimSkipReason::VersionProtectedClaim`], not
+    /// [`ClaimSkipReason::UnreadableClaim`], with both the reschedule and
+    /// recheck points pinned at [`i64::MAX`], and it is never stolen however
+    /// far the clock runs past the ordinary ceiling.
+    ///
+    /// Shown failing against a guard that folds every unreadable payload into
+    /// one reason (the reason reads `UnreadableClaim`) and against one that
+    /// still bounds the hold at the ceiling (the pass at the ceiling plus
+    /// jitter, which used to be exactly when an ordinary unreadable claim is
+    /// stolen, steals here too).
+    #[tokio::test]
+    async fn a_version_protected_claim_is_never_stolen() {
+        let store = MemoryStore::new();
+        let written_ms: i64 = 1_700_000_000_000;
+        store.set_clock_ms(written_ms as u64);
+        let key = claim::compaction_claim_key(&bucket_identity().work_id());
+        let future = CompactionClaim {
+            format_version: ravel_fleet::claim::CLAIM_FORMAT_VERSION + 1,
+            owner_process_id: Uuid::from_u128(0xA1).as_bytes().to_vec(),
+            attempt_id: Uuid::from_u128(0xA2).as_bytes().to_vec(),
+            input_set_hash: Vec::new(),
+            state: ravel_proto::sys::v1::ClaimState::Running as i32,
+            renewed_count: 0,
+            lease_duration_ns: 1_000_000_000,
+            owner_clock_ns: written_ms * 1_000_000,
+        };
+        let planted = store
+            .put(
+                &key,
+                future.encode_to_vec().into(),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("seed a future-format claim");
+        let lease_ms = cfg().lease_duration.as_millis() as i64;
+        let jitter = contender_jitter().as_millis() as i64;
+        let ceiling = written_ms + MAX_OBSERVED_LEASE_MS;
+        let clock = FixedClock::new(0);
+        let (contender, sleeper) = recording_participant(2, &clock);
+        let guard_at = |now_ms: i64| {
+            clock.set(now_ms * 1_000_000);
+            ClaimGuard::new(&bucket(), &contender, cfg(), None)
+        };
+        let skipped = |outcome: Acquire, what: &str| match outcome {
+            Acquire::Skipped(skip) => skip,
+            other => panic!("{what}: expected a skip, got {other:?}"),
+        };
+
+        // Younger than any ordinary claim's lease: a version-protected skip.
+        let young = guard_at(written_ms + 1_000);
+        let skip = skipped(young.acquire(&store).await.expect("young"), "young");
+        assert_eq!(skip.reason, ClaimSkipReason::VersionProtectedClaim);
+        assert_eq!(skip.reason.name(), "version_protected_claim");
+        assert_eq!(skip.expiry_unix_ms, i64::MAX);
+        assert_eq!(skip.reschedule_after_unix_ms, i64::MAX);
+        assert_eq!(skip.recheck_after_unix_ms, i64::MAX);
+
+        // Exactly the ordinary ceiling plus jitter, and the configured lease
+        // past it besides: still never stolen.
+        for now_ms in [
+            ceiling + jitter,
+            ceiling + jitter + 1,
+            ceiling + lease_ms + jitter + 1,
+        ] {
+            let later = guard_at(now_ms);
+            let skip = skipped(
+                later.acquire(&store).await.expect("later"),
+                "past the ordinary ceiling",
+            );
+            assert_eq!(skip.reason, ClaimSkipReason::VersionProtectedClaim);
+        }
+        assert_eq!(
+            sleeper.waits(),
+            Vec::<Duration>::new(),
+            "a version-protected claim is never stolen, so it is never waited for"
+        );
+        let after = store.get(&key, GetRange::Full).await.expect("claim read");
+        assert_eq!(
+            after.version, planted.version,
+            "the claim object is never written to"
+        );
+        assert_eq!(
+            after.data,
+            future.encode_to_vec(),
+            "the claim's stored bytes are untouched"
+        );
+    }
+
+    /// The dedup gate behind the version-protected warn log fires exactly
+    /// once per work id, and independently per work id: a second call for
+    /// the same claim returns `false` (already warned, so `contend` logs
+    /// nothing further), and a first call for a *different* claim still
+    /// returns `true`, so one wedged claim never silences the warning for
+    /// another.
+    ///
+    /// This is tested directly against the gate rather than by capturing
+    /// `tracing` output: `tracing`'s per-callsite interest cache is a single
+    /// global (not thread-local) structure, and this crate's test binary
+    /// runs every test in one process across many threads, so a capturing
+    /// test at this callsite races any other test that reaches the same
+    /// callsite on another thread without installing a subscriber --
+    /// `a_version_protected_claim_is_never_stolen` above is exactly such a
+    /// test, and does so from four acquisitions. Asserting on the gate's
+    /// return value is equivalent and immune to that race.
+    #[test]
+    fn version_protected_warn_fires_once_per_work_id() {
+        let a =
+            WorkIdentity::new(TenantId::new("acme").hash(), Signal::Logs, 7_001, HOUR).work_id();
+        let b =
+            WorkIdentity::new(TenantId::new("acme").hash(), Signal::Logs, 7_002, HOUR).work_id();
+
+        assert!(
+            warn_version_protected_once(a),
+            "the first observation of a's claim warns"
+        );
+        assert!(
+            !warn_version_protected_once(a),
+            "a second observation of the same claim does not warn again"
+        );
+        assert!(
+            warn_version_protected_once(b),
+            "a different claim's first observation still warns"
+        );
+        assert!(
+            !warn_version_protected_once(b),
+            "and is itself deduplicated thereafter"
         );
     }
 

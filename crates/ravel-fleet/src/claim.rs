@@ -156,9 +156,10 @@ use uuid::Uuid;
 pub const WORK_ID_DOMAIN_TAG: &str = "ravel-compaction-claim-v1";
 
 /// Format floor for [`CompactionClaim`] (the guard every `sys/` message uses).
-/// A stored claim advertising a higher floor is one this reader does not
-/// understand: it is judged by [`MAX_OBSERVED_LEASE_MS`] rather than by any
-/// lease it declares, and stolen only once older than that ceiling.
+/// A stored claim advertising a higher floor, or a floor of 0, is one this
+/// reader does not understand and never steals or overwrites, at any age
+/// (ADR-4233 decision 4, H8): it is not judged by [`MAX_OBSERVED_LEASE_MS`] at
+/// all, unlike an ordinary unreadable claim at a known version.
 pub const CLAIM_FORMAT_VERSION: u32 = 1;
 
 /// Ceiling on EVERY lease an observer honors when computing expiry: the
@@ -171,11 +172,14 @@ pub const CLAIM_FORMAT_VERSION: u32 = 1;
 /// indefinitely; the clamp bounds the outage to one day per incident on the
 /// advisory layer.
 ///
-/// No claim object holds its work past its store `last_modified` plus this
-/// ceiling plus one contender's jitter without a write to the object: a claim
-/// whose payload cannot be read is given exactly this lease, since its own is
-/// unknown and a live owner renews well inside any lease up to it, and is then
-/// stolen under CAS like any expired claim.
+/// No ordinary claim object holds its work past its store `last_modified`
+/// plus this ceiling plus one contender's jitter without a write to the
+/// object: a claim whose payload cannot be read, but whose `format_version`
+/// is a known one, is given exactly this lease, since its own is unknown and
+/// a live owner renews well inside any lease up to it, and is then stolen
+/// under CAS like any expired claim. This ceiling does not apply at all to a
+/// claim whose `format_version` is 0 or above [`CLAIM_FORMAT_VERSION`]: that
+/// one is version-protected and held forever (ADR-4233 decision 4, H8).
 pub const MAX_OBSERVED_LEASE_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// The prefix every compaction claim lives under: a new additive advisory

@@ -6659,11 +6659,15 @@ fn render_maintain_safety_family(
         "ravel_maintain_claims_skipped_total",
         "Bucket evaluations in which this process did not compact, or did not publish an \
          erasure rewrite, because it could not take the bucket's claim, by signal, since process \
-         start: an unexpired claim held the bucket, another contender won the steal, the claim \
-         could not be read, or it vanished twice. A claim lost mid-run counts on \
-         ravel_maintain_claims_lost_total instead, and an erasure rewrite stopped by its \
-         pre-publish re-list or its deadline counts on neither. A held bucket adds one per \
-         maintenance pass until its claim expires. Counted from shard passes that complete.",
+         start. The skip log line names the reason: held_by_another (an unexpired claim held \
+         the bucket), steal_lost (another contender won the steal), unreadable_claim (the claim \
+         could not be read), version_protected_claim (its format_version is 0 or above this \
+         build's known version, so it is never stolen at any age, ADR-4233 decision 4, H8), or \
+         vanished_twice. A claim lost mid-run counts on ravel_maintain_claims_lost_total \
+         instead, and an erasure rewrite stopped by its pre-publish re-list or its deadline \
+         counts on neither. A held bucket adds one per maintenance pass until its claim \
+         expires; a version_protected_claim bucket adds one per pass with no expiry. Counted \
+         from shard passes that complete.",
         "counter",
     );
     for signal in &snapshot.signals {
@@ -17835,6 +17839,41 @@ mod tests {
                 (Signal::Logs, "0"),
                 (Signal::Spans, "0"),
             ],
+        );
+    }
+
+    /// `ravel_maintain_claims_skipped_total`'s HELP text names every claim
+    /// skip reason by the name its skip log line prints, version_protected_claim
+    /// (ADR-4233 decision 4, H8) with the others. The family carries no
+    /// per-reason label, so this text is where `/metrics` says which reasons
+    /// it counts and that a version-protected claim is never stolen.
+    #[test]
+    fn claims_skipped_help_text_names_the_version_protected_reason() {
+        use ravel_maintain::ClaimSkipReason;
+
+        let snapshot = safety_snapshot_with(|_| {});
+        let mut body = String::new();
+        render_maintain_safety_family(&mut body, Mode::All, &snapshot);
+        let help_line = body
+            .lines()
+            .find(|line| line.starts_with("# HELP ravel_maintain_claims_skipped_total "))
+            .expect("claims_skipped HELP header present");
+        for reason in [
+            ClaimSkipReason::HeldByAnother,
+            ClaimSkipReason::StealLost,
+            ClaimSkipReason::UnreadableClaim,
+            ClaimSkipReason::VersionProtectedClaim,
+            ClaimSkipReason::VanishedTwice,
+        ] {
+            assert!(
+                help_line.contains(reason.name()),
+                "HELP text must name the {} reason:\n{help_line}",
+                reason.name()
+            );
+        }
+        assert!(
+            help_line.contains("never stolen at any age"),
+            "HELP text must say a version-protected claim is never stolen:\n{help_line}"
         );
     }
 
