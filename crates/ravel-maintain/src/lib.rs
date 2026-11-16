@@ -120,7 +120,7 @@ pub use gc_config::{
     validate_query_deadline, validate_query_head_cache_ttl,
 };
 pub use legal_hold::{
-    AUDIT_HOLD_SHARD, LegalHoldCheck, shard_hold_scopes, write_hold_clear, write_hold_set,
+    AUDIT_HOLD_SHARD, LegalHoldCheck, shard_hold_scopes, write_hold_clear, write_hold_clear_with_compat, write_hold_set, write_hold_set_with_compat,
 };
 pub use memo_snapshot::{
     MEMO_PREFIX, MEMO_SNAPSHOT_MTIME_SKIP_NS, MemoSnapshotRead, memo_key, read_all_memo_snapshots,

@@ -15,9 +15,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use ravel_catalog::compat::{FAMILY_COMMIT_RECORD, FAMILY_RLOG};
 use ravel_commit::keys;
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_commit::{RngSource, SystemRng};
+use ravel_logseg::footer::WriteVersion;
 use ravel_logseg::{AttrValue, LogRecord, LogStreamId, ObjectIdentity, RlogConfig, RlogWriter};
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError, UploadChecksum};
 use ravel_types::{Signal, TenantHash};
@@ -25,7 +27,7 @@ use uuid::Uuid;
 
 use crate::config::NS_PER_HOUR;
 use crate::error::{MaintainError, Result};
-use crate::rlog::OUTPUT_FORMAT_VERSION;
+use crate::compat_policy::MaintainCompatPolicy;
 
 /// Attempts per PUT before a transient error fails the batch closed (ADR-0062
 /// amendment, 2026-09-27): one attempt plus up to two retries, so a single
@@ -57,6 +59,14 @@ const RETRY_BACKOFF_BASE_MS: [u64; 2] = [50, 200];
 /// on both PUTs, and still comes in under the 40 s the batch could already
 /// take before this retry ladder existed.
 const AUDIT_WRITE_BUDGET: Duration = Duration::from_secs(30);
+
+/// [`AUDIT_WRITE_BUDGET`] in nanoseconds: the audit writer's publish lifetime
+/// under a compat policy, refused when the recorded `P` is shorter.
+const AUDIT_WRITE_BUDGET_NS: i64 = AUDIT_WRITE_BUDGET.as_secs() as i64 * 1_000_000_000;
+
+// ADR-4233 decision 7: the audit writer's whole budget sits inside the default
+// publish lifetime `P`, so a write that outlives `P` has already failed closed.
+const _: () = assert!(AUDIT_WRITE_BUDGET_NS < crate::compat_policy::DEFAULT_PUBLISH_LIFETIME_NS);
 
 /// Which of a batch's two PUTs an attempt or retry belongs to, for logging.
 #[derive(Clone, Copy, Debug)]
@@ -227,17 +237,7 @@ pub(crate) async fn write_audit_object(
 ) -> Result<()> {
     let shard = write.shard;
     let record_id = write.record_id;
-    let record = AuditRecord {
-        tenant: *tenant,
-        now_ns: write.now_ns,
-        stream_id: write.stream_id,
-        stream_attrs: write.stream_attrs,
-        severity_num: write.severity_num,
-        severity_text: write.severity_text,
-        body: write.body,
-        attrs: write.attrs,
-    };
-    write_audit_batch(store, shard, record_id, vec![record], None).await
+    write_audit_batch(store, shard, record_id, vec![audit_record(tenant, write)], None).await
 }
 
 /// Encode a whole batch of audit records as **one** L0 [`Signal::Audit`] object
@@ -296,7 +296,8 @@ pub(crate) async fn write_audit_batch(
     records: Vec<AuditRecord>,
     put_retries: Option<&AtomicU64>,
 ) -> Result<()> {
-    write_audit_batch_with_rng(store, shard, record_id, records, put_retries, &SystemRng).await
+    write_audit_batch_with_compat(store, shard, record_id, records, put_retries, &SystemRng, None)
+        .await
 }
 
 /// [`write_audit_batch`] with the backoff-jitter source injected (ADR-0068
@@ -308,6 +309,7 @@ pub(crate) async fn write_audit_batch(
 /// simulation harness can inject a seeded source and replay retry timing
 /// deterministically. Behavior with the default source is identical to the
 /// pre-seam code.
+#[cfg(test)]
 pub(crate) async fn write_audit_batch_with_rng(
     store: &dyn ObjectStoreBackend,
     shard: u32,
@@ -315,6 +317,61 @@ pub(crate) async fn write_audit_batch_with_rng(
     records: Vec<AuditRecord>,
     put_retries: Option<&AtomicU64>,
     rng: &dyn RngSource,
+) -> Result<()> {
+    write_audit_batch_with_compat(store, shard, record_id, records, put_retries, rng, None).await
+}
+
+/// [`write_audit_object`] under a `sys/compat` write policy, as
+/// [`write_audit_batch_with_compat`] writes a batch; `run` names the writer in
+/// the refusal log.
+pub(crate) async fn write_audit_object_with_compat(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    write: AuditWrite,
+    policy: Option<(&MaintainCompatPolicy, &'static str)>,
+) -> Result<()> {
+    let shard = write.shard;
+    let record_id = write.record_id;
+    write_audit_batch_with_compat(
+        store,
+        shard,
+        record_id,
+        vec![audit_record(tenant, write)],
+        None,
+        &SystemRng,
+        policy,
+    )
+    .await
+}
+
+fn audit_record(tenant: &TenantHash, write: AuditWrite) -> AuditRecord {
+    AuditRecord {
+        tenant: *tenant,
+        now_ns: write.now_ns,
+        stream_id: write.stream_id,
+        stream_attrs: write.stream_attrs,
+        severity_num: write.severity_num,
+        severity_text: write.severity_text,
+        body: write.body,
+        attrs: write.attrs,
+    }
+}
+
+/// [`write_audit_batch_with_rng`] under a `sys/compat` write policy (ADR-4233),
+/// `policy` paired with the writer's name for the refusal log.
+/// With `policy` set, the RLOG and commit-record versions are fixed before the
+/// data PUT, every PUT attempt (retries included) re-checks the view's age, and
+/// the commit record is abandoned without its PUT once the recorded `P` has
+/// passed since the start. The audit signal has no provisioning record, so no
+/// fence is raised. A refusal writes nothing further.
+pub(crate) async fn write_audit_batch_with_compat(
+    store: &dyn ObjectStoreBackend,
+    shard: u32,
+    record_id: Uuid,
+    records: Vec<AuditRecord>,
+    put_retries: Option<&AtomicU64>,
+    rng: &dyn RngSource,
+    policy: Option<(&MaintainCompatPolicy, &'static str)>,
 ) -> Result<()> {
     let Some(first) = records.first() else {
         return Err(MaintainError::Invariant(
@@ -346,6 +403,21 @@ pub(crate) async fn write_audit_batch_with_rng(
     }
     let series_count = streams.len() as u64;
 
+    let compat = match policy {
+        Some((policy, run)) => Some(policy.begin_unprovisioned(
+            run,
+            &[FAMILY_RLOG, FAMILY_COMMIT_RECORD],
+            AUDIT_WRITE_BUDGET_NS,
+        )?),
+        None => None,
+    };
+    let write_version = match compat.as_ref().and_then(|run| run.version(FAMILY_RLOG)) {
+        Some(v) => WriteVersion::new(v).map_err(|err| {
+            MaintainError::Invariant(format!("the compat run chose RLOG version {v}: {err}"))
+        })?,
+        None => WriteVersion::CURRENT,
+    };
+
     let identity = ObjectIdentity {
         tenant_hash: tenant.0,
         shard,
@@ -353,7 +425,8 @@ pub(crate) async fn write_audit_batch_with_rng(
         writer_epoch: 0,
         writer_seq: 0,
     };
-    let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+    let mut writer =
+        RlogWriter::new(RlogConfig::default(), identity).with_write_version(write_version);
     for record in records {
         writer.push(record.into_log_record())?;
     }
@@ -384,7 +457,7 @@ pub(crate) async fn write_audit_batch_with_rng(
         max_event_ts_ns: max_ts_ns,
         min_ingest_ts_ns: min_ts_ns,
         max_ingest_ts_ns: max_ts_ns,
-        segment_format_version: OUTPUT_FORMAT_VERSION,
+        segment_format_version: u32::from(write_version.number()),
         created_unix_ns: max_ts_ns,
         ingest_hour_bucket,
     })?;
@@ -408,6 +481,7 @@ pub(crate) async fn write_audit_batch_with_rng(
     let mut attempt = 1u32;
     let mut last_error: Option<StoreError> = None;
     loop {
+        crate::compat_policy::before_put(compat.as_ref(), store).await?;
         let outcome = bound_to_deadline(
             deadline,
             store.put(
@@ -457,6 +531,10 @@ pub(crate) async fn write_audit_batch_with_rng(
     let mut attempt = 1u32;
     let mut last_error: Option<StoreError> = None;
     loop {
+        crate::compat_policy::before_put(compat.as_ref(), store).await?;
+        if let Some(run) = compat.as_ref() {
+            run.before_record_put()?;
+        }
         let outcome = bound_to_deadline(
             deadline,
             store.put(

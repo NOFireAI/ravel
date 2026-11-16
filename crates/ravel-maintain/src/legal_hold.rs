@@ -71,7 +71,8 @@ use ravel_types::logstream::log_stream_id;
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
-use crate::audit_write::{AuditWrite, write_audit_object};
+use crate::audit_write::{AuditWrite, write_audit_object_with_compat};
+use crate::compat_policy::MaintainCompatPolicy;
 use crate::error::{MaintainError, Result};
 use crate::sweep::LeaseCheck;
 
@@ -367,6 +368,22 @@ pub async fn write_hold_set(
     scope: &str,
     reason: &str,
 ) -> Result<()> {
+    write_hold_set_with_compat(store, tenant, record_id, now_ns, scope, reason, None).await
+}
+
+/// [`write_hold_set`] under a `sys/compat` write policy (ADR-4233): the RLOG
+/// version is fixed before the data PUT, every PUT attempt re-checks the
+/// view's age, and the commit record is abandoned without its PUT once `P`
+/// has passed since the start. `None` writes exactly as [`write_hold_set`].
+pub async fn write_hold_set_with_compat(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    record_id: Uuid,
+    now_ns: i64,
+    scope: &str,
+    reason: &str,
+    compat: Option<&MaintainCompatPolicy>,
+) -> Result<()> {
     // An empty scope is a prefix of every key (every match here is
     // `key.starts_with(scope)`), so it would silently hold the entire tenant.
     // Reject before writing anything.
@@ -387,7 +404,7 @@ pub async fn write_hold_set(
         attrs.push((ATTR_REASON.to_string(), AttrValue::Str(reason.into())));
     }
     let body = format!("legal hold set scope={scope}");
-    write_hold_object(store, tenant, record_id, now_ns, body, attrs).await
+    write_hold_object(store, tenant, record_id, now_ns, body, attrs, compat).await
 }
 
 /// Write a new immutable `clear` record releasing the legal hold on `scope` at
@@ -399,6 +416,19 @@ pub async fn write_hold_clear(
     record_id: Uuid,
     now_ns: i64,
     scope: &str,
+) -> Result<()> {
+    write_hold_clear_with_compat(store, tenant, record_id, now_ns, scope, None).await
+}
+
+/// [`write_hold_clear`] under a `sys/compat` write policy, as
+/// [`write_hold_set_with_compat`] writes a set.
+pub async fn write_hold_clear_with_compat(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    record_id: Uuid,
+    now_ns: i64,
+    scope: &str,
+    compat: Option<&MaintainCompatPolicy>,
 ) -> Result<()> {
     // Empty scope would match every key; reject before writing anything (see
     // `write_hold_set`).
@@ -416,7 +446,7 @@ pub async fn write_hold_clear(
         (ATTR_SCOPE.to_string(), AttrValue::Str(scope.into())),
     ];
     let body = format!("legal hold clear scope={scope}");
-    write_hold_object(store, tenant, record_id, now_ns, body, attrs).await
+    write_hold_object(store, tenant, record_id, now_ns, body, attrs, compat).await
 }
 
 /// Encode one legal-hold RLOG record as an L0 [`Signal::Audit`] object and its
@@ -431,9 +461,10 @@ async fn write_hold_object(
     now_ns: i64,
     body: String,
     attrs: Vec<(String, AttrValue)>,
+    compat: Option<&MaintainCompatPolicy>,
 ) -> Result<()> {
     let (stream_id, stream_attrs) = hold_stream();
-    write_audit_object(
+    write_audit_object_with_compat(
         store,
         tenant,
         AuditWrite {
@@ -447,6 +478,7 @@ async fn write_hold_object(
             body,
             attrs,
         },
+        compat.map(|policy| (policy, "legal hold")),
     )
     .await
 }

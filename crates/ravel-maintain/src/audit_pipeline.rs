@@ -77,7 +77,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 use uuid::Uuid;
 
-use crate::audit_write::{AuditRecord, write_audit_batch_with_rng};
+use crate::audit_write::{AuditRecord, write_audit_batch_with_compat};
+use crate::compat_policy::MaintainCompatPolicy;
 use crate::config::{AuditMode, AuditPipelineConfig};
 use crate::error::{MaintainError, Result};
 
@@ -191,6 +192,19 @@ impl AuditPipeline {
         config: AuditPipelineConfig,
         rng: Arc<dyn RngSource>,
     ) -> Self {
+        Self::spawn_with_compat(store, config, rng, None)
+    }
+
+    /// [`Self::spawn_with_rng`] with every flush written under a `sys/compat`
+    /// write policy (ADR-4233): each tenant group's write fixes its RLOG
+    /// version from `compat` before its data PUT and abandons its commit
+    /// record past `P`. `None` writes exactly as [`Self::spawn_with_rng`].
+    pub fn spawn_with_compat(
+        store: Arc<dyn ObjectStoreBackend>,
+        config: AuditPipelineConfig,
+        rng: Arc<dyn RngSource>,
+        compat: Option<MaintainCompatPolicy>,
+    ) -> Self {
         let audit_mode = config.audit_mode;
         let (tx, rx) = mpsc::channel(config.channel_capacity.max(1));
         let shutdown = Arc::new(Notify::new());
@@ -205,6 +219,7 @@ impl AuditPipeline {
             flush_failures.clone(),
             put_retries.clone(),
             rng,
+            compat,
         ));
         AuditPipeline {
             tx,
@@ -358,6 +373,7 @@ async fn run_flush_loop(
     flush_failures: Arc<AtomicU64>,
     put_retries: Arc<AtomicU64>,
     rng: Arc<dyn RngSource>,
+    compat: Option<MaintainCompatPolicy>,
 ) {
     let mut last_received: Option<Instant> = None;
     // Every flush is awaited inline, so a submission stamped before this
@@ -375,7 +391,7 @@ async fn run_flush_loop(
                     batch.push(submission);
                 }
                 if !batch.is_empty() {
-                    flush_batch(store.as_ref(), &config, &flush_failures, &put_retries, rng.as_ref(), batch).await;
+                    flush_batch(store.as_ref(), &config, &flush_failures, &put_retries, rng.as_ref(), compat.as_ref(), batch).await;
                 }
                 return;
             }
@@ -430,6 +446,7 @@ async fn run_flush_loop(
             &flush_failures,
             &put_retries,
             rng.as_ref(),
+            compat.as_ref(),
             batch,
         )
         .await;
@@ -454,6 +471,7 @@ async fn flush_batch(
     flush_failures: &AtomicU64,
     put_retries: &AtomicU64,
     rng: &dyn RngSource,
+    compat: Option<&MaintainCompatPolicy>,
     batch: Vec<Submission>,
 ) {
     // `BTreeMap` rather than a hash map so a multi-tenant batch flushes in a
@@ -468,13 +486,14 @@ async fn flush_batch(
 
     for (tenant, (records, dones)) in groups {
         let record_id = Uuid::new_v4();
-        let outcome = write_audit_batch_with_rng(
+        let outcome = write_audit_batch_with_compat(
             store,
             config.shard,
             record_id,
             records,
             Some(put_retries),
             rng,
+            compat.map(|policy| (policy, "audit")),
         )
         .await;
 
