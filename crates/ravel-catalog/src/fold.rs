@@ -514,12 +514,19 @@ pub(crate) struct RequestCounters {
     pub(crate) put_requests: u64,
     pub(crate) key_index_ranged_gets: u64,
     pub(crate) key_index_bytes_read: u64,
+    /// `key_index_ranged_gets` and `key_index_bytes_read` by phase: the footer
+    /// suffix and any extra footer range, then the section. Each pair sums to
+    /// its total.
+    pub(crate) key_index_footer_gets: u64,
+    pub(crate) key_index_footer_bytes_read: u64,
+    pub(crate) key_index_section_gets: u64,
+    pub(crate) key_index_section_bytes_read: u64,
     /// Bytes of the leaves [`build_part_key_index`] PUT, counted when the
     /// PUT is issued, like `put_requests`.
     pub(crate) key_index_leaf_bytes_put: u64,
-    key_index_sections_read: u64,
+    pub(crate) key_index_sections_read: u64,
     key_index_entries_carried: u64,
-    key_index_build_passes: u64,
+    pub(crate) key_index_build_passes: u64,
     key_index_leaf_gets: u64,
     /// A maximum over the fold's part builds, not a sum.
     key_index_carry_peak_held_bytes: u64,
@@ -2029,8 +2036,7 @@ async fn read_metrics_label_value_counted(
     tenant: &TenantHash,
     key: &str,
     object_size: u64,
-    gets: &mut u64,
-    bytes: &mut u64,
+    cost: &mut KeyIdxReadCost,
 ) -> Result<Vec<KeyIdxFieldEntries>, KeyIdxReadError> {
     use ravel_segment::FooterOutcome;
     if object_size == 0 {
@@ -2038,12 +2044,12 @@ async fn read_metrics_label_value_counted(
     }
     let limits = ReaderLimits::default();
     let suffix_len = object_size.min(KEY_INDEX_FOOTER_SUFFIX_LEN);
-    *gets += 1;
+    cost.footer_gets += 1;
     let tail = store
         .get(key, GetRange::Suffix(suffix_len))
         .await
         .map_err(|e| KeyIdxReadError::Get(format!("footer suffix GET: {e}")))?;
-    *bytes += tail.data.len() as u64;
+    cost.footer_bytes += tail.data.len() as u64;
     let total_size = tail.total_size;
     let location = match ravel_segment::open_from_suffix(&tail.data, total_size, limits)
         .map_err(|e| format!("RSEG footer: {e}"))?
@@ -2053,12 +2059,12 @@ async fn read_metrics_label_value_counted(
             let end = offset
                 .checked_add(len)
                 .ok_or_else(|| "footer range overflows".to_string())?;
-            *gets += 1;
+            cost.footer_gets += 1;
             let got = store
                 .get(key, GetRange::Range(offset, end))
                 .await
                 .map_err(|e| KeyIdxReadError::Get(format!("footer range GET: {e}")))?;
-            *bytes += got.data.len() as u64;
+            cost.footer_bytes += got.data.len() as u64;
             match ravel_segment::open_from_suffix(&got.data, total_size, limits)
                 .map_err(|e| format!("RSEG footer: {e}"))?
             {
@@ -2086,12 +2092,12 @@ async fn read_metrics_label_value_counted(
         .offset
         .checked_add(section.len)
         .ok_or_else(|| "LABEL_DICT range overflows".to_string())?;
-    *gets += 1;
+    cost.section_gets += 1;
     let stored = store
         .get(key, GetRange::Range(section.offset, end))
         .await
         .map_err(|e| KeyIdxReadError::Get(format!("LABEL_DICT section GET: {e}")))?;
-    *bytes += stored.data.len() as u64;
+    cost.section_bytes += stored.data.len() as u64;
     Ok(metrics_label_value_entries(&location.footer, &stored.data)?)
 }
 
@@ -2142,8 +2148,33 @@ pub(crate) struct EntryKeyIndexRead {
     /// Whether a GET failed, as opposed to the object's bytes not yielding a
     /// section.
     pub(crate) get_failed: bool,
+    /// `cost.gets()`.
     pub(crate) gets: u64,
+    /// `cost.bytes()`.
     pub(crate) bytes: u64,
+    /// The same GETs and bytes split by phase.
+    pub(crate) cost: KeyIdxReadCost,
+}
+
+/// One entry's ranged-read GETs and bytes (as transferred; a failed GET adds
+/// no bytes) by phase: the footer suffix and any extra footer range, then the
+/// KEY_IDX section (LABEL_DICT for metrics).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct KeyIdxReadCost {
+    pub(crate) footer_gets: u64,
+    pub(crate) footer_bytes: u64,
+    pub(crate) section_gets: u64,
+    pub(crate) section_bytes: u64,
+}
+
+impl KeyIdxReadCost {
+    pub(crate) fn gets(&self) -> u64 {
+        self.footer_gets + self.section_gets
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.footer_bytes + self.section_bytes
+    }
 }
 
 /// Why an object's KEY_IDX read leaves its entry uncovered.
@@ -2225,18 +2256,9 @@ pub(crate) async fn read_entry_key_index(
     key: &str,
     object_size: u64,
 ) -> EntryKeyIndexRead {
-    let mut gets = 0u64;
-    let mut bytes = 0u64;
-    let read = read_entry_key_index_counted(
-        store,
-        tenant,
-        signal,
-        key,
-        object_size,
-        &mut gets,
-        &mut bytes,
-    )
-    .await;
+    let mut cost = KeyIdxReadCost::default();
+    let read =
+        read_entry_key_index_counted(store, tenant, signal, key, object_size, &mut cost).await;
     let (fields, get_failed) = match read {
         Ok(fields) => (Ok(fields), false),
         Err(KeyIdxReadError::Get(reason)) => (Err(reason), true),
@@ -2245,8 +2267,9 @@ pub(crate) async fn read_entry_key_index(
     EntryKeyIndexRead {
         fields,
         get_failed,
-        gets,
-        bytes,
+        gets: cost.gets(),
+        bytes: cost.bytes(),
+        cost,
     }
 }
 
@@ -2256,23 +2279,21 @@ async fn read_entry_key_index_counted(
     signal: Signal,
     key: &str,
     object_size: u64,
-    gets: &mut u64,
-    bytes: &mut u64,
+    cost: &mut KeyIdxReadCost,
 ) -> Result<Vec<KeyIdxFieldEntries>, KeyIdxReadError> {
     if signal == Signal::Metrics {
-        return read_metrics_label_value_counted(store, tenant, key, object_size, gets, bytes)
-            .await;
+        return read_metrics_label_value_counted(store, tenant, key, object_size, cost).await;
     }
     if object_size == 0 {
         return Err("entry names a zero-byte object".to_string().into());
     }
     let suffix_len = object_size.min(KEY_INDEX_FOOTER_SUFFIX_LEN);
-    *gets += 1;
+    cost.footer_gets += 1;
     let tail = store
         .get(key, GetRange::Suffix(suffix_len))
         .await
         .map_err(|e| KeyIdxReadError::Get(format!("footer suffix GET: {e}")))?;
-    *bytes += tail.data.len() as u64;
+    cost.footer_bytes += tail.data.len() as u64;
     let total_size = tail.total_size;
     let footer = match open_key_idx_footer(signal, &tail.data, total_size)? {
         KeyIdxFooterOpen::Ready(footer) => footer,
@@ -2280,12 +2301,12 @@ async fn read_entry_key_index_counted(
             let end = offset
                 .checked_add(len)
                 .ok_or_else(|| "footer range overflows".to_string())?;
-            *gets += 1;
+            cost.footer_gets += 1;
             let got = store
                 .get(key, GetRange::Range(offset, end))
                 .await
                 .map_err(|e| KeyIdxReadError::Get(format!("footer range GET: {e}")))?;
-            *bytes += got.data.len() as u64;
+            cost.footer_bytes += got.data.len() as u64;
             match open_key_idx_footer(signal, &got.data, total_size)? {
                 KeyIdxFooterOpen::Ready(footer) => footer,
                 KeyIdxFooterOpen::NeedRange { .. } => {
@@ -2305,12 +2326,12 @@ async fn read_entry_key_index_counted(
     let end = offset
         .checked_add(len)
         .ok_or_else(|| "KEY_IDX range overflows".to_string())?;
-    *gets += 1;
+    cost.section_gets += 1;
     let section = store
         .get(key, GetRange::Range(offset, end))
         .await
         .map_err(|e| KeyIdxReadError::Get(format!("KEY_IDX section GET: {e}")))?;
-    *bytes += section.data.len() as u64;
+    cost.section_bytes += section.data.len() as u64;
     if section.data.len() as u64 != len || crc32c::crc32c(&section.data) != crc {
         return Err("KEY_IDX section crc mismatch".to_string().into());
     }
@@ -3511,6 +3532,11 @@ pub(crate) struct BuiltPartKeyIndex {
     /// Each field the build indexed, declared or named by a section, and
     /// its pairs ([`FoldReport::key_index_field_pairs`]).
     pub(crate) field_pairs: BTreeMap<String, u64>,
+    /// For each field, the build passes that started with it still building.
+    /// A pass serves every building field at once, so for the repair, whose
+    /// fields all start building at the first pass, the part's passes are the
+    /// largest of these. Filled on `stopped_on_failed_get` too.
+    pub(crate) field_passes: BTreeMap<String, u64>,
     /// [`KeyIndexBuildCaller::Repair`] only: a ranged GET failed and the
     /// build stopped before that pass's PUTs. `refs` is empty; leaves an
     /// earlier pass PUT are referenced by nothing.
@@ -3711,6 +3737,7 @@ pub(crate) async fn build_part_key_index(
         }
     }
 
+    let mut field_passes: BTreeMap<String, u64> = BTreeMap::new();
     'build: loop {
         let mut over_cap = false;
         let mut carried = carry.take();
@@ -3752,6 +3779,11 @@ pub(crate) async fn build_part_key_index(
 
         loop {
             counters.key_index_build_passes += 1;
+            for (name, field) in &fields {
+                if field.state == FieldBuildState::Building {
+                    *field_passes.entry(name.clone()).or_insert(0) += 1;
+                }
+            }
             let mut share = key_index_field_share(max_pairs, fields.len());
             if let Some(carried) = &mut carried {
                 // Every drop before any fetch, so the carry holds the most
@@ -3833,6 +3865,7 @@ pub(crate) async fn build_part_key_index(
                                     get_failed: false,
                                     gets: 0,
                                     bytes: 0,
+                                    cost: KeyIdxReadCost::default(),
                                 },
                                 None => {
                                     read_entry_key_index(store, tenant, signal, key, *object_size)
@@ -3850,6 +3883,10 @@ pub(crate) async fn build_part_key_index(
                     counters.get_requests += read.gets;
                     counters.key_index_ranged_gets += read.gets;
                     counters.key_index_bytes_read += read.bytes;
+                    counters.key_index_footer_gets += read.cost.footer_gets;
+                    counters.key_index_footer_bytes_read += read.cost.footer_bytes;
+                    counters.key_index_section_gets += read.cost.section_gets;
+                    counters.key_index_section_bytes_read += read.cost.section_bytes;
                     counters.key_index_sections_read += 1;
                     if previously_covered[ordinal as usize] {
                         counters.key_index_unchanged_section_gets += read.gets;
@@ -3955,6 +3992,7 @@ pub(crate) async fn build_part_key_index(
                     uncovered_entries: 0,
                     over_cap: false,
                     field_pairs: BTreeMap::new(),
+                    field_passes,
                     stopped_on_failed_get: true,
                 });
             }
@@ -4041,6 +4079,7 @@ pub(crate) async fn build_part_key_index(
             uncovered_entries: 0,
             over_cap,
             field_pairs: BTreeMap::new(),
+            field_passes,
             stopped_on_failed_get: false,
         };
         for (name, field) in fields {
@@ -23000,14 +23039,13 @@ pub(crate) mod tests {
         let (offset, len) = label_dict_range(&object);
         assert!(record.object_size > KEY_INDEX_FOOTER_SUFFIX_LEN);
         store.gets.lock().expect("lock").clear();
-        let (mut gets, mut bytes) = (0u64, 0u64);
+        let mut cost = KeyIdxReadCost::default();
         let Ok(fields) = read_metrics_label_value_counted(
             store.as_ref(),
             &tenant(),
             &key,
             record.object_size,
-            &mut gets,
-            &mut bytes,
+            &mut cost,
         )
         .await
         else {
@@ -23020,8 +23058,8 @@ pub(crate) mod tests {
                 (key.clone(), GetRange::Range(offset, offset + len)),
             ]
         );
-        assert_eq!(gets, 2);
-        assert_eq!(bytes, KEY_INDEX_FOOTER_SUFFIX_LEN + len);
+        assert_eq!(cost.gets(), 2);
+        assert_eq!(cost.bytes(), KEY_INDEX_FOOTER_SUFFIX_LEN + len);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].name, METRICS_LABEL_VALUE_FIELD);
         assert!(fields[0].entries.contains(&(key8_str("east"), 0)));

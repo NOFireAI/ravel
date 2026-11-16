@@ -215,6 +215,8 @@ async fn rebuild_attaches_a_leaf_and_prints_every_report_field() {
         "{} > {object_size}",
         report.section_bytes_read
     );
+    // The suffix GET returns the whole object: the footer phase's bytes.
+    assert_eq!(report.footer_phase_bytes_read, object_size);
     let expected = format!(
         "store: memory\n\
          signal: spans\n\
@@ -228,6 +230,15 @@ async fn rebuild_attaches_a_leaf_and_prints_every_report_field() {
          leaf_bytes_written: {}\n\
          section_bytes_read: {}\n\
          ranged_gets: 2\n\
+         footer_phase_ranged_gets: 1\n\
+         footer_phase_bytes_read: {object_size}\n\
+         section_phase_ranged_gets: 1\n\
+         section_phase_bytes_read: {}\n\
+         key_index_build_max_pairs: {}\n\
+         passes: 1\n\
+         passes_per_field: trace_id=1\n\
+         sections_read: 1\n\
+         field_pairs: trace_id=3\n\
          leaf_prefix_gets: 0\n\
          leaf_prefix_bytes_read: 0\n\
          uncovered_entries: 0\n\
@@ -236,9 +247,13 @@ async fn rebuild_attaches_a_leaf_and_prints_every_report_field() {
          erasure_list_requests: 0\n\
          erasure_get_requests: 0\n\
          attempt_count: 1\n\
-         attempt 1: parts=1 part_gets=1 ranged_gets=2 leaf_puts=1 head_cas_tries=1 \
-         parts_published=1\n",
-        leaf.size, report.section_bytes_read
+         attempt 1: parts=1 part_gets=1 ranged_gets=2 footer_phase_ranged_gets=1 \
+         section_phase_ranged_gets=1 passes=1 sections_read=1 leaf_puts=1 \
+         head_cas_tries=1 parts_published=1\n",
+        leaf.size,
+        report.section_bytes_read,
+        report.section_bytes_read - object_size,
+        ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS
     );
     assert_eq!(printed, expected);
 
@@ -320,8 +335,51 @@ async fn rebuild_that_exhausts_its_cas_tries_prints_the_report_so_far() {
     assert!(printed.contains("leaves_written: 1\n"), "{printed}");
     assert!(
         printed.contains(
-            "attempt 1: parts=1 part_gets=1 ranged_gets=2 leaf_puts=1 head_cas_tries=8 \
-             parts_published=0\n"
+            "attempt 1: parts=1 part_gets=1 ranged_gets=2 footer_phase_ranged_gets=1 \
+             section_phase_ranged_gets=1 passes=1 sections_read=1 leaf_puts=1 \
+             head_cas_tries=8 parts_published=0\n"
+        ),
+        "{printed}"
+    );
+    assert!(read_head(&store).await.parts[0].key_index.is_empty());
+}
+
+/// A leaf PUT that fails stops the run inside its one batch, before the
+/// publish step: the text report lists that batch under `attempt_count: 0`,
+/// marked as stopped before publish, with the GETs, pass and PUT it issued.
+#[tokio::test]
+async fn rebuild_stopped_before_publish_marks_its_attempt() {
+    let (store, _, _) = folded_without_leaves().await;
+    let faulty = Arc::new(FaultStore::new(
+        Arc::clone(&store),
+        FaultPlan::empty()
+            .with_rule(Rule::new(Op::Put, ScriptedFault::Timeout).with_key_contains(".kidx")),
+    ));
+    let (result, printed) = catalog::rebuild_key_index_outcome(
+        Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
+        TENANT,
+        1,
+        SignalArg::Spans,
+        None,
+        ravel_catalog::DEFAULT_KEY_INDEX_REBUILD_BATCH_ENTRIES,
+        false,
+        false,
+    )
+    .await
+    .expect("the rebuild runs");
+    assert_eq!(faulty.fault_count(Op::Put, FaultKind::Timeout), 1);
+    let err = result.expect_err("the leaf PUT fails");
+    assert!(
+        matches!(err, ravel_catalog::KeyIndexRebuildError::Interrupted { .. }),
+        "{err:?}"
+    );
+    assert!(
+        printed.ends_with(
+            "attempt_count: 0\n\
+             attempt 1 (stopped before publish): parts=1 part_gets=1 ranged_gets=2 \
+             footer_phase_ranged_gets=1 section_phase_ranged_gets=1 passes=1 \
+             sections_read=1 leaf_puts=1 head_cas_tries=0 parts_published=0\n"
         ),
         "{printed}"
     );

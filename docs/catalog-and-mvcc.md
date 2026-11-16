@@ -2185,17 +2185,36 @@ unindexed part's entries, parts rebuilt, parts deferred, leaf PUTs
 issued and their bytes (counted when issued, a failed PUT included),
 section bytes read, ranged GETs issued (footer suffixes,
 any extra footer ranges and sections together, a failed GET included),
+the same GETs and bytes split by phase (`footer_phase_ranged_gets` and
+`footer_phase_bytes_read` for each read's footer suffix and any extra
+footer range, `section_phase_ranged_gets` and `section_phase_bytes_read`
+for its KEY_IDX section, LABEL_DICT on metrics; bytes as transferred,
+retries excluded; `ranged_gets` and `section_bytes_read` are the sums of
+the two phases), the pair budget it built under
+(`key_index_build_max_pairs`), build passes summed over the parts read
+(`passes`; one pass serves every field of a part, so with two fields a
+part's passes are the larger field's count, not the sum), the passes each
+field was building for (`passes_per_field`), section reads, one per entry
+and pass (`sections_read`), pairs built per field (`field_pairs`),
 uncovered entries, the attempt count, and per attempt the part
-GETs, ranged GETs, leaf PUTs, HEAD CAS tries and parts published (an
+GETs, ranged GETs and their footer and section phases, passes, section
+reads, leaf PUTs, HEAD CAS tries and parts published (an
 attempt is one batch's publish including its retries, at most
 `MAX_HEAD_CAS_ATTEMPTS` tries, so a lost CAS adds a try, not an attempt).
+Tests `the_repair_holds_at_most_the_pair_budget_and_matches_the_fold_at_that_budget`
+(40 pairs at a budget of 8: 5 passes, 20 section reads, 20 footer and 20
+section GETs), `the_repair_reports_the_parts_passes_and_each_fields_own`
+(two fields at the same budget: 10 passes, `user_id` 10 and `trace_id` 1)
+and `the_json_report_carries_the_passes_and_phase_costs` pin these.
 A run that stops or exhausts the CAS retries on one batch has therefore
 published every earlier batch (the error says how many parts, and the
 CLI prints the report so far, whose ranged GETs, section bytes and leaf
 PUTs include those the stopped batch issued, a build stopped by a failed
 leaf PUT included; a batch stopped before its publish step is listed last
 in the attempts, with its part GETs, ranged GETs and leaf PUTs and no HEAD
-CAS try, and is not counted in the attempt count: tests
+CAS try, and is not counted in the attempt count; the text report marks
+its line `attempt N (stopped before publish):`, test
+`rebuild_stopped_before_publish_marks_its_attempt`; tests
 `a_failed_leaf_put_is_counted_as_issued_in_the_interrupted_report` and
 `a_failed_build_reports_its_gets_bytes_and_leaf_puts`), loses at most the ranged GETs of that
 batch's entries in every pass, and leaves that batch's leaves unreferenced for this
