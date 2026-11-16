@@ -143,6 +143,17 @@ pub enum CertifyRefusal {
     TenantSetChanged,
     /// A listing was incomplete: an unaddressable key under a census prefix.
     IncompleteListing { prefix: String, unaddressable: u64 },
+    /// An entry directly under a bucket's `l0/`, `l1/` or `c/` prefix is not a
+    /// shard directory, so no shard census would cover what it holds.
+    UnexpectedShardEntry { key: String },
+    /// The family carries a certificate above the target version. A
+    /// certificate is replaced only by one of a higher version, or of the
+    /// same version after a late write (ADR-4233 decision 7).
+    TargetBelowCertificate { target: u32, certified: u32 },
+    /// The family carries an uncontradicted certificate at the target
+    /// version. A same-version certificate replaces it only once a late write
+    /// set `contradicted` and was remedied (ADR-4233 decision 7).
+    AlreadyCertified { version: u32 },
     /// A record names a member object that is absent, or a listed object was
     /// gone by the time its trailer was read.
     MemberAbsent { member_key: String },
@@ -158,6 +169,11 @@ pub enum CertifyRefusal {
     /// census read `sys/compat` (a late-write pass or another certification
     /// ran meanwhile). Nothing was written; a later run starts a fresh census.
     CompatChangedDuringCensus,
+    /// `sys/compat` was replaced between the read and the write of the
+    /// certificate CAS, without changing this family's certificate or
+    /// `contradicted` flag. Nothing was written; the census cursor is kept,
+    /// so a later run resumes it and retries the CAS.
+    CompatRecordRaced,
     /// Another certify run created or replaced the cursor first.
     ConcurrentCertify,
 }
@@ -196,8 +212,9 @@ pub enum CertifyReport {
 const CERTIFY_CURSOR_TAG: u8 = 2;
 /// tag(1) + target u32(4) + activated_epoch u64(8) + S i64(8) +
 /// has_cert u8(1) + cert version u32(4) + certified_unix_ns i64(8) +
-/// contradicted u8(1) + bucket count u32(4).
-const CURSOR_HEADER_LEN: usize = 39;
+/// contradicted u8(1) + finalizing u8(1) + finalizing_unix_ns i64(8) +
+/// bucket count u32(4).
+const CURSOR_HEADER_LEN: usize = 48;
 /// tenant(16) + signal index u8(1) + shards_done u32(4) + entries u64(8) +
 /// newest_created i64(8).
 const CURSOR_BUCKET_LEN: usize = 37;
@@ -249,6 +266,11 @@ struct CertifyCursor {
     activated_epoch: u64,
     start_unix_ns: i64,
     prior: PriorState,
+    /// Set just before the certificate CAS to the `certified_unix_ns` that
+    /// CAS writes. A cursor whose marker matches the family's certificate
+    /// belongs to a certification whose CAS succeeded and whose floor raises
+    /// may not have finished; the next run completes them.
+    finalizing_unix_ns: Option<i64>,
     buckets: BTreeMap<(TenantHash, u8), BucketProgress>,
 }
 
@@ -266,6 +288,8 @@ fn encode_cursor(cursor: &CertifyCursor) -> Vec<u8> {
     out.extend_from_slice(&cert_version.to_le_bytes());
     out.extend_from_slice(&cert_ns.to_le_bytes());
     out.push(u8::from(cursor.prior.contradicted));
+    out.push(u8::from(cursor.finalizing_unix_ns.is_some()));
+    out.extend_from_slice(&cursor.finalizing_unix_ns.unwrap_or(0).to_le_bytes());
     out.extend_from_slice(&(cursor.buckets.len() as u32).to_le_bytes());
     for ((tenant, signal_index), progress) in &cursor.buckets {
         out.extend_from_slice(&tenant.0);
@@ -325,6 +349,13 @@ fn decode_cursor(data: &[u8], signal_count: usize) -> Option<CertifyCursor> {
         1 => true,
         _ => return None,
     };
+    let has_finalizing = r.u8()?;
+    let finalizing_ns = r.i64()?;
+    let finalizing_unix_ns = match has_finalizing {
+        1 => Some(finalizing_ns),
+        0 if finalizing_ns == 0 => None,
+        _ => return None,
+    };
     let count = r.u32()? as usize;
     if r.data.len() != count.checked_mul(CURSOR_BUCKET_LEN)? {
         return None;
@@ -353,6 +384,7 @@ fn decode_cursor(data: &[u8], signal_count: usize) -> Option<CertifyCursor> {
             certificate,
             contradicted,
         },
+        finalizing_unix_ns,
         buckets,
     })
 }
@@ -420,19 +452,65 @@ fn prov_err(err: ProvisioningError) -> MaintainError {
 }
 
 /// The shard count to scan for a `(tenant, signal)`: the widest the generation
-/// history ever used, floored at the signal's pinned read shards and at one.
+/// history ever used, widened to cover every shard directory present under
+/// `l0/`, `l1/` and `c/`, and floored at the signal's pinned read shards and at
+/// one. The directories count because a bucket can hold data with no
+/// provisioning record (adopted data, alerts, audit), and its generation
+/// history then says nothing about how many shards it spans. Each listing is
+/// strict: an unaddressable entry, or an entry that is not a shard directory,
+/// refuses rather than narrowing the range.
 pub(crate) async fn scan_shards_for(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     signal: Signal,
-) -> Result<u32> {
+) -> std::result::Result<u32, CensusStop> {
     let generations = read_generations_from_store(store, tenant, signal)
         .await
-        .map_err(prov_err)?;
+        .map_err(|e| CensusStop::Fatal(prov_err(e)))?;
     let widest = generations
         .map(|gens| gens.iter().map(|g| g.shard_count).max().unwrap_or(0))
         .unwrap_or(0);
-    Ok(widest.max(signal.fixed_read_shards()).max(1))
+    let mut shards = widest.max(signal.fixed_read_shards()).max(1);
+    for dir in ["l0", keys::L1_DIR, "c"] {
+        let prefix = format!("t/{}/{}/{dir}/", tenant.to_hex(), signal.key_prefix());
+        let listing = store
+            .list_delimited(&prefix)
+            .await
+            .map_err(|e| CensusStop::Fatal(MaintainError::Store(e)))?;
+        let unaddressable = listing.unaddressable.len() + listing.unaddressable_prefixes.len();
+        if unaddressable != 0 {
+            return Err(CensusStop::Refused(CertifyRefusal::IncompleteListing {
+                prefix,
+                unaddressable: unaddressable as u64,
+            }));
+        }
+        if let Some(object) = listing.objects.first() {
+            return Err(CensusStop::Refused(CertifyRefusal::UnexpectedShardEntry {
+                key: object.key.clone(),
+            }));
+        }
+        for common in &listing.common_prefixes {
+            let Some(index) = shard_index_of(common, &prefix) else {
+                return Err(CensusStop::Refused(CertifyRefusal::UnexpectedShardEntry {
+                    key: common.clone(),
+                }));
+            };
+            shards = shards.max(index.saturating_add(1));
+        }
+    }
+    Ok(shards)
+}
+
+/// The shard index of a common prefix `<listed>/<digits>/`, or `None` when the
+/// segment is not a plain decimal shard number.
+fn shard_index_of(common_prefix: &str, listed_prefix: &str) -> Option<u32> {
+    let segment = common_prefix
+        .strip_prefix(listed_prefix)?
+        .strip_suffix('/')?;
+    if segment.is_empty() || !segment.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    segment.parse().ok()
 }
 
 /// One data or part object the census checks. `stamp` is the version its
@@ -551,7 +629,7 @@ fn sysproto_rewrite_decode(
 }
 
 /// A reason the census stopped before covering a shard.
-enum CensusStop {
+pub(crate) enum CensusStop {
     Fatal(MaintainError),
     Refused(CertifyRefusal),
 }
@@ -689,11 +767,45 @@ pub async fn certify(
             family: family.to_string(),
         }));
     };
+
+    // A certification whose CAS succeeded but whose floor raises did not all
+    // finish left its cursor marked with the certificate it wrote: finish
+    // the raises first. A contradicted certificate gets none, so `migrate`
+    // still rewrites the bucket holding the late write.
+    let cursor_key = certify_cursor_key(family);
+    let mut stored = read_certify_cursor(store, &cursor_key, signals.len()).await?;
+    if let StoredCursor::Present(pending, _) = &stored
+        && let Some(certificate) = entry.certificate.as_ref()
+        && pending.finalizing_unix_ns == Some(certificate.certified_unix_ns)
+        && pending.target_version == certificate.version
+    {
+        if !entry.contradicted {
+            let bases = match floor_bases(store, signals, pending).await? {
+                Ok(bases) => bases,
+                Err(refusal) => return Ok(CertifyReport::Refused(refusal)),
+            };
+            raise_floors(store, family, certificate.version, &bases, now_ns).await?;
+        }
+        delete_cursor(store, &cursor_key).await;
+        if !entry.contradicted && certificate.version == target_version {
+            return Ok(CertifyReport::Certified {
+                version: certificate.version,
+                member_count: certificate.member_count,
+                buckets_scanned: certificate.buckets_scanned,
+                newest_created_unix_ns: certificate.newest_created_unix_ns,
+            });
+        }
+        stored = read_certify_cursor(store, &cursor_key, signals.len()).await?;
+    }
+
     if target_version > entry.active_write_version {
         return Ok(CertifyReport::Refused(CertifyRefusal::TargetAboveActive {
             target: target_version,
             active: entry.active_write_version,
         }));
+    }
+    if let Some(refusal) = replacement_refusal(entry, target_version) {
+        return Ok(CertifyReport::Refused(refusal));
     }
     if entry.fence_complete_unix_ns < entry.activated_unix_ns {
         return Ok(CertifyReport::Refused(CertifyRefusal::FenceWalkIncomplete));
@@ -748,15 +860,14 @@ pub async fn certify(
 
     // `S` and the progress: kept from a cursor taken for this target, epoch and
     // certificate state; a fresh census, with `S` now, otherwise.
-    let cursor_key = certify_cursor_key(family);
     let fresh = CertifyCursor {
         target_version,
         activated_epoch,
         start_unix_ns: now_ns,
         prior,
+        finalizing_unix_ns: None,
         buckets: BTreeMap::new(),
     };
-    let stored = read_certify_cursor(store, &cursor_key, signals.len()).await?;
     let (mut cursor, prev) = match stored {
         StoredCursor::Present(cursor, version)
             if cursor.target_version == target_version
@@ -786,7 +897,13 @@ pub async fn certify(
     for tenant in &tenants {
         for (signal_index, signal) in signals.iter().enumerate() {
             let bucket_key = (*tenant, signal_index as u8);
-            let shards = scan_shards_for(store, tenant, *signal).await?;
+            let shards = match scan_shards_for(store, tenant, *signal).await {
+                Ok(shards) => shards,
+                Err(CensusStop::Fatal(err)) => return Err(err),
+                Err(CensusStop::Refused(refusal)) => {
+                    return Ok(CertifyReport::Refused(refusal));
+                }
+            };
             let done = cursor
                 .buckets
                 .get(&bucket_key)
@@ -887,45 +1004,23 @@ pub async fn certify(
         }
     }
 
-    // The basis over every bucket the census covered, in this run or earlier
+    // The totals over every bucket the census covered, in this run or earlier
     // ones, restricted to the tenant set the digest names.
+    cursor
+        .buckets
+        .retain(|(tenant, _), _| tenants.binary_search(tenant).is_ok());
     let mut member_count = 0u64;
     let mut buckets_scanned = 0u64;
     let mut newest_created = 0i64;
-    for ((tenant, signal_index), progress) in &cursor.buckets {
-        if tenants.binary_search(tenant).is_err() {
-            continue;
-        }
-        let Some(signal) = signals.get(usize::from(*signal_index)).copied() else {
-            continue;
-        };
+    for progress in cursor.buckets.values() {
         member_count = member_count.saturating_add(progress.entries);
         buckets_scanned = buckets_scanned.saturating_add(u64::from(progress.shards_done));
         newest_created = newest_created.max(progress.newest_created_unix_ns);
-        match raise_format_floor(
-            store,
-            tenant,
-            signal,
-            family,
-            target_version,
-            FloorBasis {
-                observed_entries: progress.entries,
-                observed_newest_created_unix_ns: progress.newest_created_unix_ns,
-                observed_shards: scan_shards_for(store, tenant, signal).await?,
-            },
-            "compat-certify",
-            now_ns,
-        )
-        .await
-        {
-            Ok(_) => {}
-            // Already at or above the target, or no record to floor: neither
-            // blocks a certificate whose census the bucket passed.
-            Err(ProvisioningError::FloorNotAboveCurrent { .. })
-            | Err(ProvisioningError::NoRecordForFloor { .. }) => {}
-            Err(err) => return Err(prov_err(err)),
-        }
     }
+    let bases = match floor_bases(store, signals, &cursor).await? {
+        Ok(bases) => bases,
+        Err(refusal) => return Ok(CertifyReport::Refused(refusal)),
+    };
 
     // The tenant-set digest: blake3 over the sorted tenant hashes.
     let mut hasher = blake3::Hasher::new();
@@ -947,6 +1042,19 @@ pub async fn certify(
         tenant_set_digest: digest,
     };
     let start_unix_ns = cursor.start_unix_ns;
+
+    // Mark the cursor with the certificate the CAS is about to write, so a
+    // run that stops between the CAS and the last floor raise is completed by
+    // the next one.
+    cursor.finalizing_unix_ns = Some(now_ns);
+    if put_certify_cursor(store, &cursor_key, &cursor, cursor_version.as_ref())
+        .await?
+        .is_none()
+    {
+        return Ok(CertifyReport::Refused(CertifyRefusal::ConcurrentCertify));
+    }
+
+    let mut refusal = None;
     let written = update_compat(store, keys_compat, |record| {
         let entry = record
             .families
@@ -955,10 +1063,16 @@ pub async fn certify(
             .ok_or_else(|| CompatError::FamilyNotInRecord {
                 family: family.to_string(),
             })?;
+        let conflict = || CompatError::CasConflict {
+            key: COMPAT_KEY.to_string(),
+        };
+        if let Some(found) = replacement_refusal(entry, target_version) {
+            refusal = Some(found);
+            return Err(conflict());
+        }
         if PriorState::of(entry) != prior {
-            return Err(CompatError::CasConflict {
-                key: COMPAT_KEY.to_string(),
-            });
+            refusal = Some(CertifyRefusal::CompatChangedDuringCensus);
+            return Err(conflict());
         }
         entry.certificate = Some(certificate);
         entry.contradicted = false;
@@ -968,27 +1082,23 @@ pub async fn certify(
     .await;
     match written {
         Ok(_) => {}
-        // A lost race on the record and a changed certificate state both mean
-        // the census no longer describes what the CAS would certify.
         Err(CompatError::CasConflict { .. }) => {
             return Ok(CertifyReport::Refused(
-                CertifyRefusal::CompatChangedDuringCensus,
+                refusal.unwrap_or(CertifyRefusal::CompatRecordRaced),
             ));
         }
         Err(err) => return Err(compat_err(err)),
     }
 
-    // The cursor's certificate identity no longer matches, so a cursor this
-    // delete leaves behind is stale and never resumed; the failure is logged,
-    // not returned, because the certificate is already written.
-    match store.delete(&cursor_key).await {
-        Ok(()) | Err(StoreError::NotFound) => {}
-        Err(err) => tracing::warn!(
-            key = %cursor_key,
-            error = %err,
-            "compat certify: could not delete the completed cursor"
-        ),
-    }
+    // Only now that the certificate is written: a floor raised for a census
+    // the CAS then refused would make `migrate` skip a bucket that may hold
+    // the late write the refusal is about.
+    raise_floors(store, family, target_version, &bases, now_ns).await?;
+
+    // A cursor this delete leaves behind is never resumed as a census: its
+    // marker matches the certificate, so the next run repeats the floor
+    // raises (each already at the target is a no-op) and deletes it.
+    delete_cursor(store, &cursor_key).await;
 
     Ok(CertifyReport::Certified {
         version: target_version,
@@ -996,6 +1106,97 @@ pub async fn certify(
         buckets_scanned,
         newest_created_unix_ns: newest_created,
     })
+}
+
+/// Why the family's existing certificate may not be replaced by one at
+/// `target`: one above the target is never replaced by a lower one, and one
+/// at the target only once a late write set `contradicted` (ADR-4233
+/// decision 7). `None` when the replacement is allowed.
+fn replacement_refusal(entry: &sysproto::CompatFamily, target: u32) -> Option<CertifyRefusal> {
+    let certified = entry.certificate.as_ref()?.version;
+    if certified > target {
+        Some(CertifyRefusal::TargetBelowCertificate { target, certified })
+    } else if certified == target && !entry.contradicted {
+        Some(CertifyRefusal::AlreadyCertified { version: target })
+    } else {
+        None
+    }
+}
+
+/// The floor basis of every bucket in `cursor`, with the shard range each
+/// covers now.
+async fn floor_bases(
+    store: &dyn ObjectStoreBackend,
+    signals: &[Signal],
+    cursor: &CertifyCursor,
+) -> Result<std::result::Result<Vec<(TenantHash, Signal, FloorBasis)>, CertifyRefusal>> {
+    let mut bases = Vec::with_capacity(cursor.buckets.len());
+    for ((tenant, signal_index), progress) in &cursor.buckets {
+        let Some(signal) = signals.get(usize::from(*signal_index)).copied() else {
+            continue;
+        };
+        let observed_shards = match scan_shards_for(store, tenant, signal).await {
+            Ok(shards) => shards,
+            Err(CensusStop::Fatal(err)) => return Err(err),
+            Err(CensusStop::Refused(refusal)) => return Ok(Err(refusal)),
+        };
+        bases.push((
+            *tenant,
+            signal,
+            FloorBasis {
+                observed_entries: progress.entries,
+                observed_newest_created_unix_ns: progress.newest_created_unix_ns,
+                observed_shards,
+            },
+        ));
+    }
+    Ok(Ok(bases))
+}
+
+/// Raise each bucket's `family` floor to `version` with its basis.
+async fn raise_floors(
+    store: &dyn ObjectStoreBackend,
+    family: &str,
+    version: u32,
+    bases: &[(TenantHash, Signal, FloorBasis)],
+    now_ns: i64,
+) -> Result<()> {
+    for (tenant, signal, basis) in bases {
+        match raise_format_floor(
+            store,
+            tenant,
+            *signal,
+            family,
+            version,
+            *basis,
+            "compat-certify",
+            now_ns,
+        )
+        .await
+        {
+            Ok(_) => {}
+            // Already at or above the version, or no record to floor: neither
+            // blocks a certificate whose census the bucket passed.
+            Err(ProvisioningError::FloorNotAboveCurrent { .. })
+            | Err(ProvisioningError::NoRecordForFloor { .. }) => {}
+            Err(err) => return Err(prov_err(err)),
+        }
+    }
+    Ok(())
+}
+
+/// Delete the certify cursor. A failure is logged, not returned: every caller
+/// has already written what the cursor tracked, and a cursor left behind is
+/// either completed or found stale by the next run.
+async fn delete_cursor(store: &dyn ObjectStoreBackend, cursor_key: &str) {
+    match store.delete(cursor_key).await {
+        Ok(()) | Err(StoreError::NotFound) => {}
+        Err(err) => tracing::warn!(
+            key = %cursor_key,
+            error = %err,
+            "compat certify: could not delete the completed cursor"
+        ),
+    }
 }
 
 /// The fence state of one provisioned bucket.
@@ -1716,6 +1917,17 @@ mod tests {
         family_entry(store, FAMILY_RLOG).await
     }
 
+    /// The `rlog` floor of `(tenant, signal)`.
+    async fn rlog_floor(
+        store: &dyn ObjectStoreBackend,
+        tenant: TenantHash,
+        signal: Signal,
+    ) -> Option<u32> {
+        ravel_catalog::current_floor_from_store(store, &tenant, signal, FAMILY_RLOG)
+            .await
+            .expect("floor")
+    }
+
     fn rlog_object() -> Vec<u8> {
         rlog_object_with_sections(false)
     }
@@ -2050,10 +2262,16 @@ mod tests {
                 certificate: Some((4, 99)),
                 contradicted: true,
             },
+            finalizing_unix_ns: Some(4321),
             buckets,
         };
         let bytes = encode_cursor(&cursor);
         assert_eq!(decode_cursor(&bytes, 3), Some(cursor.clone()));
+        let unmarked = CertifyCursor {
+            finalizing_unix_ns: None,
+            ..cursor.clone()
+        };
+        assert_eq!(decode_cursor(&encode_cursor(&unmarked), 3), Some(unmarked));
         // A signal index outside the family, a trailing byte, a truncation, and
         // the index-based tag-1 layout are all unrecognized.
         assert_eq!(decode_cursor(&bytes, 2), None);
@@ -2323,6 +2541,110 @@ mod tests {
                     found_version: 4
                 },
                 "{signal:?}"
+            );
+        }
+    }
+
+    /// DISTINGUISHING (rules out a shard range taken from the provisioning
+    /// record alone, and one widened by the `l0/` and `c/` directories but not
+    /// `l1/`): an unprovisioned logs bucket spans two shards, as adopted data
+    /// with no record can, and shard 1 holds a below-target member reachable
+    /// only through its commit record, only under `l0/`, or only under `l1/`.
+    /// Each is found; none certifies.
+    #[tokio::test]
+    async fn an_unprovisioned_bucket_is_censused_over_every_present_shard() {
+        let unrecorded = |dir: &str| format!("t/{}/l/{dir}", tenant().to_hex());
+        for case in ["c", "l0", "l1"] {
+            let store = new_store();
+            seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+            seed_log(&store, tenant(), 0, 1, 1_000).await;
+            let expected = match case {
+                "c" => {
+                    let (_, data_key) =
+                        seed_member(&store, tenant(), Signal::Logs, 1, 2, 4, 1_000, None).await;
+                    CertifyReport::Contradicted {
+                        member_key: data_key,
+                        found_version: 4,
+                    }
+                }
+                _ => {
+                    let key = unrecorded(if case == "l0" {
+                        "l0/0001/stray.rlog"
+                    } else {
+                        "l1/0001/000123/stray.rlog"
+                    });
+                    put(&*store, &key, with_trailer_version(rlog_object(), 4)).await;
+                    CertifyReport::HeldMember {
+                        member_key: key,
+                        version: 4,
+                    }
+                }
+            };
+            assert!(
+                read_generations_from_store(&*store, &tenant(), Signal::Logs)
+                    .await
+                    .expect("generations")
+                    .is_none(),
+                "the bucket has no provisioning record"
+            );
+            assert_eq!(
+                certify_rlog(&*store, NOW1, V_LOG, None).await,
+                expected,
+                "{case}"
+            );
+            assert!(rlog_entry(&*store).await.certificate.is_none(), "{case}");
+        }
+    }
+
+    /// An unrecorded object has no stamp, so its trailer alone decides: with
+    /// `V_LOG + 1` active and certified, an in-window `V_LOG` `.rlog` under
+    /// `l0/` that no record names contradicts the certificate.
+    #[tokio::test]
+    async fn an_unrecorded_in_window_object_below_the_target_contradicts() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG + 1).await;
+        let key = format!("t/{}/l/l0/0000/stray.rlog", tenant().to_hex());
+        put(&*store, &key, rlog_object()).await;
+        assert!(
+            matches!(
+                probe_member(&*store, FAMILY_RLOG, &key)
+                    .await
+                    .expect("probe"),
+                MemberProbe::Readable {
+                    trailer,
+                    section_hold: None
+                } if u32::from(trailer) == V_LOG
+            ),
+            "the object must be readable and in window for the trailer check to decide"
+        );
+        assert_eq!(
+            certify_rlog(&*store, NOW1, V_LOG + 1, None).await,
+            CertifyReport::Contradicted {
+                member_key: key,
+                found_version: V_LOG
+            }
+        );
+        assert!(rlog_entry(&*store).await.certificate.is_none());
+    }
+
+    /// An entry under a bucket's `l0/`, `l1/` or `c/` that is not a shard
+    /// directory refuses: no shard census would cover it.
+    #[tokio::test]
+    async fn a_non_shard_entry_refuses() {
+        for stray in ["l0/stray.rlog", "l1/abc/stray.rlog", "c/0x01/stray.cmt"] {
+            let store = new_store();
+            seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+            seed_log(&store, tenant(), 0, 1, 1_000).await;
+            let key = format!("t/{}/l/{stray}", tenant().to_hex());
+            put(&*store, &key, rlog_object()).await;
+            let expected = match stray.matches('/').count() {
+                1 => key,
+                _ => key[..=key.rfind('/').expect("dir")].to_string(),
+            };
+            assert_eq!(
+                certify_rlog(&*store, NOW1, V_LOG, None).await,
+                CertifyReport::Refused(CertifyRefusal::UnexpectedShardEntry { key: expected }),
+                "{stray}"
             );
         }
     }
@@ -2658,7 +2980,8 @@ mod tests {
 
     /// A completed certification whose cursor delete failed leaves a cursor
     /// naming the pre-certificate state, so the next certification does not
-    /// resume it: a below-target member planted in its done shard is found.
+    /// resume it as a census: a below-target member planted in its done shard
+    /// is found.
     #[tokio::test]
     async fn a_cursor_left_by_a_failed_delete_is_not_resumed() {
         let inner = new_store();
@@ -2691,9 +3014,25 @@ mod tests {
         assert_eq!(faulted.fault_count(Op::Delete, FaultKind::Permanent), 1);
         assert!(cursor_present(&*inner).await, "the delete failed");
 
-        let (_, data_key) = seed_member(&inner, tenant(), Signal::Logs, 0, 2, 4, 1_000, None).await;
+        // A late write contradicts the certificate, which is what lets a
+        // same-version certification run at all.
+        let (_, data_key) = seed_member(
+            &inner,
+            tenant(),
+            Signal::Logs,
+            0,
+            2,
+            4,
+            ms(NOW1 + HOUR),
+            None,
+        )
+        .await;
+        let pass = late_write_pass(&*inner, &ckeys(), NOW1 + 2 * HOUR, FAMILY_RLOG, skew())
+            .await
+            .expect("pass");
+        assert_eq!(pass.late_writes.len(), 1, "{pass:?}");
         assert_eq!(
-            certify_rlog(&*inner, NOW1 + HOUR, V_LOG, None).await,
+            certify_rlog(&*inner, NOW1 + 3 * HOUR, V_LOG, None).await,
             CertifyReport::Contradicted {
                 member_key: data_key,
                 found_version: 4
@@ -2704,16 +3043,21 @@ mod tests {
     // ---- the certificate CAS and the late-write pass ----
 
     /// DISTINGUISHING (rules out a CAS that ignores what changed under the
-    /// census): a re-certification is in flight when a late write lands in a
-    /// shard it already censused and a late-write pass contradicts the
-    /// current certificate. The re-certification's CAS must refuse; clearing
-    /// `contradicted` would lose the late write.
+    /// census, and floors raised before the CAS): a certification at
+    /// `V_LOG` over a certificate at `V_LOG - 1` is in flight when a late
+    /// write lands in a shard it already censused and a late-write pass
+    /// contradicts the current certificate. The CAS must refuse, since
+    /// clearing `contradicted` would lose the late write, and the refusal
+    /// leaves every floor where the first certificate put it: a floor at
+    /// `V_LOG` would make `migrate` skip the bucket holding the late write.
     #[tokio::test]
     async fn a_late_write_pass_during_the_census_refuses_the_cas() {
         let inner = new_store();
         seed_compat(&*inner, FAMILY_RLOG, V_LOG).await;
         provision_fenced(&*inner, tenant(), Signal::Logs, 1).await;
+        provision_fenced(&*inner, TenantHash([6; 16]), Signal::Logs, 1).await;
         seed_log(&inner, tenant(), 0, 1, 1_000).await;
+        seed_log(&inner, TenantHash([6; 16]), 0, 3, 1_000).await;
         seed_member(
             &inner,
             tenant(),
@@ -2725,11 +3069,14 @@ mod tests {
             Some(rlog_object()),
         )
         .await;
-        let first = certify_rlog(&*inner, NOW1, V_LOG, None).await;
+        let first = certify_rlog(&*inner, NOW1, V_LOG - 1, None).await;
         assert!(
             matches!(first, CertifyReport::Certified { .. }),
             "{first:?}"
         );
+        for t in [tenant(), TenantHash([6; 16])] {
+            assert_eq!(rlog_floor(&*inner, t, Signal::Logs).await, Some(V_LOG - 1));
+        }
 
         let now2 = NOW1 + 10 * HOUR;
         let hook_store = inner.clone();
@@ -2741,7 +3088,7 @@ mod tests {
                     Signal::Logs,
                     0,
                     9,
-                    4,
+                    V_LOG - 2,
                     ms(NOW1 + HOUR),
                     None,
                 )
@@ -2763,12 +3110,21 @@ mod tests {
         );
         let entry = rlog_entry(&*inner).await;
         assert!(entry.contradicted, "the late write's verdict stands");
-        assert_eq!(entry.certificate.expect("cert").certified_unix_ns, NOW1);
+        let cert = entry.certificate.expect("cert");
+        assert_eq!((cert.version, cert.certified_unix_ns), (V_LOG - 1, NOW1));
+        for t in [tenant(), TenantHash([6; 16])] {
+            assert_eq!(
+                rlog_floor(&*inner, t, Signal::Logs).await,
+                Some(V_LOG - 1),
+                "a refused CAS raises no floor"
+            );
+        }
     }
 
     /// DISTINGUISHING (rules out a monotone watermark across certificates): a
-    /// late-write pass between two runs of a re-certification advances the
-    /// old certificate's watermark past the new census's `S`. The new
+    /// late-write pass between two runs of a certification at a higher
+    /// version advances the old certificate's watermark past the new census's
+    /// `S`. The new
     /// certificate sets it back to `S`, so its first pass re-examines what
     /// landed after its census began.
     #[tokio::test]
@@ -2777,7 +3133,11 @@ mod tests {
         seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
         provision_fenced(&*store, tenant(), Signal::Logs, 1).await;
         seed_log(&store, tenant(), 0, 1, 1_000).await;
-        certify_rlog(&*store, NOW1, V_LOG, None).await;
+        let first = certify_rlog(&*store, NOW1, V_LOG - 1, None).await;
+        assert!(
+            matches!(first, CertifyReport::Certified { .. }),
+            "{first:?}"
+        );
 
         let now2 = NOW1 + 10 * HOUR;
         let run1 = certify_rlog(&*store, now2, V_LOG, Some(1)).await;
@@ -2796,6 +3156,176 @@ mod tests {
                 .late_writes_verified_through_unix_ns,
             now2
         );
+    }
+
+    /// DISTINGUISHING (rules out a certify that ignores the existing
+    /// certificate, and one that admits any same-version replacement): over a
+    /// certificate at `V_LOG`, a lower target and an uncontradicted same
+    /// target both refuse before any census, leaving the certificate, its
+    /// watermark and the cursor untouched. Once a late write contradicts it
+    /// and is remedied, a same-version certification replaces it.
+    #[tokio::test]
+    async fn a_certificate_is_replaced_only_upward_or_after_a_late_write() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*store, tenant(), Signal::Logs, 1).await;
+        seed_log(&store, tenant(), 0, 1, 1_000).await;
+        let first = certify_rlog(&*store, NOW1, V_LOG, None).await;
+        assert!(
+            matches!(first, CertifyReport::Certified { .. }),
+            "{first:?}"
+        );
+
+        let now2 = NOW1 + 10 * HOUR;
+        assert_eq!(
+            certify_rlog(&*store, now2, V_LOG - 1, None).await,
+            CertifyReport::Refused(CertifyRefusal::TargetBelowCertificate {
+                target: V_LOG - 1,
+                certified: V_LOG
+            })
+        );
+        assert_eq!(
+            certify_rlog(&*store, now2, V_LOG, None).await,
+            CertifyReport::Refused(CertifyRefusal::AlreadyCertified { version: V_LOG })
+        );
+        let entry = rlog_entry(&*store).await;
+        let cert = entry.certificate.expect("cert");
+        assert_eq!((cert.version, cert.certified_unix_ns), (V_LOG, NOW1));
+        assert_eq!(entry.late_writes_verified_through_unix_ns, NOW1);
+        assert!(!cursor_present(&*store).await, "no census started");
+
+        // A late write contradicts the certificate; `migrate` (here, removing
+        // the late record) remedies it, and the same version re-certifies.
+        let (late_key, _) =
+            seed_member(&store, tenant(), Signal::Logs, 0, 9, 4, ms(now2), None).await;
+        let pass = late_write_pass(&*store, &ckeys(), now2 + HOUR, FAMILY_RLOG, skew())
+            .await
+            .expect("pass");
+        assert_eq!(pass.late_writes.len(), 1, "{pass:?}");
+        store.delete(&late_key).await.expect("remedy");
+        let now3 = now2 + 2 * HOUR;
+        let again = certify_rlog(&*store, now3, V_LOG, None).await;
+        assert!(
+            matches!(again, CertifyReport::Certified { .. }),
+            "{again:?}"
+        );
+        let entry = rlog_entry(&*store).await;
+        assert!(!entry.contradicted);
+        assert_eq!(entry.certificate.expect("cert").certified_unix_ns, now3);
+        assert_eq!(entry.late_writes_verified_through_unix_ns, now3);
+    }
+
+    /// A certificate above the target written while the census runs refuses
+    /// inside the CAS with the typed refusal, not as a generic change.
+    #[tokio::test]
+    async fn a_higher_certificate_written_during_the_census_refuses_the_cas() {
+        let inner = new_store();
+        seed_compat(&*inner, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*inner, tenant(), Signal::Logs, 1).await;
+        seed_log(&inner, tenant(), 0, 1, 1_000).await;
+        seed_member(
+            &inner,
+            tenant(),
+            Signal::Audit,
+            0,
+            2,
+            V_LOG,
+            1_000,
+            Some(rlog_object()),
+        )
+        .await;
+        let hook_store = inner.clone();
+        let hook: Hook = Box::new(move || {
+            Box::pin(async move {
+                update_compat(&*hook_store, &ckeys(), |record| {
+                    let entry = record
+                        .families
+                        .iter_mut()
+                        .find(|f| f.family == FAMILY_RLOG)
+                        .expect("rlog");
+                    entry.certificate = Some(sysproto::Certificate {
+                        version: V_LOG,
+                        certified_unix_ns: NOW1,
+                        member_count: 2,
+                        newest_created_unix_ns: 1,
+                        buckets_scanned: 4,
+                        tenant_set_digest: vec![0; 32],
+                    });
+                    Ok(())
+                })
+                .await
+                .expect("write certificate");
+            })
+        });
+        let audit_prefix =
+            ravel_commit::keys::commit_shard_prefix(&tenant(), Signal::Audit, 0).expect("prefix");
+        let store = HookStore::new(inner.clone(), &audit_prefix, Some(hook));
+        let report = certify_rlog(&store, NOW1 + HOUR, V_LOG - 1, None).await;
+        assert!(store.hook_fired());
+        assert_eq!(
+            report,
+            CertifyReport::Refused(CertifyRefusal::TargetBelowCertificate {
+                target: V_LOG - 1,
+                certified: V_LOG
+            })
+        );
+        let cert = rlog_entry(&*inner).await.certificate.expect("cert");
+        assert_eq!((cert.version, cert.certified_unix_ns), (V_LOG, NOW1));
+        assert_eq!(rlog_floor(&*inner, tenant(), Signal::Logs).await, None);
+    }
+
+    /// A run that stops after the certificate CAS and before its floor raises
+    /// finish is completed by the next run: the floor is raised and the
+    /// cursor removed, and the same-version run reports the certificate the
+    /// first run wrote rather than refusing it as already certified.
+    #[tokio::test]
+    async fn floor_raises_interrupted_after_the_cas_are_completed() {
+        let inner = new_store();
+        seed_compat(&*inner, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*inner, tenant(), Signal::Logs, 1).await;
+        seed_log(&inner, tenant(), 0, 1, 1_000).await;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("put down".to_string()))
+                .with_key_contains(provisioning_key(&tenant(), Signal::Logs)),
+        );
+        let faulted = FaultStore::new(inner.clone(), plan);
+        let result = certify(
+            &faulted,
+            &ckeys(),
+            NOW1,
+            FAMILY_RLOG,
+            V_LOG,
+            timings(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(faulted.fault_count(Op::Put, FaultKind::Permanent), 1);
+        let cert = rlog_entry(&*inner)
+            .await
+            .certificate
+            .expect("CAS succeeded");
+        assert_eq!(cert.certified_unix_ns, NOW1);
+        assert_eq!(rlog_floor(&*inner, tenant(), Signal::Logs).await, None);
+        assert!(cursor_present(&*inner).await);
+
+        let report = certify_rlog(&*inner, NOW1 + HOUR, V_LOG, None).await;
+        assert_eq!(
+            report,
+            CertifyReport::Certified {
+                version: V_LOG,
+                member_count: cert.member_count,
+                buckets_scanned: cert.buckets_scanned,
+                newest_created_unix_ns: cert.newest_created_unix_ns,
+            }
+        );
+        assert_eq!(
+            rlog_floor(&*inner, tenant(), Signal::Logs).await,
+            Some(V_LOG)
+        );
+        assert!(!cursor_present(&*inner).await);
+        let entry = rlog_entry(&*inner).await;
+        assert_eq!(entry.certificate.expect("cert").certified_unix_ns, NOW1);
     }
 
     /// A late-write pass whose certificate is replaced while it runs writes
@@ -2897,6 +3427,50 @@ mod tests {
                 .iter()
                 .any(|lw| lw.record_key == late_key),
             "the late write was found: {report:?}"
+        );
+        assert!(rlog_entry(&*store).await.contradicted);
+    }
+
+    /// The late-write pass covers every shard directory present, not only the
+    /// shards a provisioning record names: a late write in shard 1 of an
+    /// unprovisioned two-shard logs bucket is found.
+    #[tokio::test]
+    async fn the_late_write_pass_covers_an_unprovisioned_buckets_shards() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        seed_log(&store, tenant(), 0, 1, 1_000).await;
+        seed_log(&store, tenant(), 1, 2, 1_000).await;
+        let first = certify_rlog(&*store, NOW1, V_LOG, None).await;
+        assert!(
+            matches!(
+                first,
+                CertifyReport::Certified {
+                    member_count: 2,
+                    ..
+                }
+            ),
+            "{first:?}"
+        );
+        let (late_key, _) = seed_member(
+            &store,
+            tenant(),
+            Signal::Logs,
+            1,
+            9,
+            4,
+            ms(NOW1 + HOUR),
+            None,
+        )
+        .await;
+        let report = late_write_pass(&*store, &ckeys(), NOW1 + 2 * HOUR, FAMILY_RLOG, skew())
+            .await
+            .expect("pass");
+        assert_eq!(
+            report.late_writes,
+            vec![crate::late_writes::LateWrite {
+                record_key: late_key,
+                version: 4
+            }]
         );
         assert!(rlog_entry(&*store).await.contradicted);
     }
