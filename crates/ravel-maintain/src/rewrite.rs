@@ -148,12 +148,19 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
         .as_ref()
         .and_then(|l| l.reset_for_run_unless_open().then(|| l.run_scope_guard()));
     // ADR-1746 decision 4: checked before the inputs are read and every PUT.
-    let checked = crate::format_floor::check_output_floor(store, config, bucket, "rewrite").await;
+    let checked =
+        match crate::format_floor::check_output_floor(store, config, bucket, "rewrite").await {
+            Ok(()) => crate::compat_policy::begin_part_run(store, config, bucket, "rewrite").await,
+            Err(err) => Err(err),
+        };
     let outcome = match checked {
-        Ok(()) => load_then_rewrite::<C>(
+        Ok(compat_run) => load_then_rewrite::<C>(
             store,
             clock,
-            config,
+            &CompactorConfig {
+                compat_run: compat_run.or_else(|| config.compat_run.clone()),
+                ..config.clone()
+            },
             bucket,
             commit_keys,
             conservation,
@@ -790,6 +797,34 @@ pub async fn migrate_bucket_format(
     outcome
 }
 
+/// Start a migration's compat run (ADR-4233 decision 3): the bucket's part
+/// version is fixed before the claim, and a `target_version` other than the
+/// family's active write version is refused, counted like every refusal. With
+/// no policy installed the target is taken as given, as before.
+async fn migrate_compat_run(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    target_version: u32,
+) -> Result<Option<crate::compat_policy::CompatRun>> {
+    let compat_run =
+        crate::compat_policy::begin_part_run(store, config, bucket, "migration").await?;
+    if let Some(run) = compat_run.as_ref()
+        && let Some(family) = crate::compat_policy::part_family(bucket.signal)
+        && let Some(active) = run.version(family)
+        && u32::from(active) != target_version
+    {
+        return Err(run.refuse_with(
+            family,
+            crate::compat_policy::CompatRunRefusal::TargetNotActive {
+                target: target_version,
+                active,
+            },
+        ));
+    }
+    Ok(compat_run)
+}
+
 /// [`migrate_bucket_format`]'s body, with the request ledger's run scope
 /// already opened and guaranteed to be closed by its caller.
 async fn migrate_bucket_format_scoped(
@@ -834,6 +869,7 @@ async fn migrate_bucket_format_scoped(
     }
     // ADR-1746 decision 4: checked before the claim and every PUT.
     crate::format_floor::check_output_floor(store, config, bucket, "migration").await?;
+    let compat_run = migrate_compat_run(store, config, bucket, target_version).await?;
 
     // The bucket claim, the same one a compaction or an erasure rewrite of this
     // bucket takes, held from here through the record PUT. A pass refused it
@@ -847,12 +883,10 @@ async fn migrate_bucket_format_scoped(
             });
         }
     };
-    let run_config = match guard.as_ref() {
-        Some(guard) => CompactorConfig {
-            claim_guard: Some(guard.clone()),
-            ..config.clone()
-        },
-        None => config.clone(),
+    let run_config = CompactorConfig {
+        claim_guard: guard.clone().or_else(|| config.claim_guard.clone()),
+        compat_run: compat_run.or_else(|| config.compat_run.clone()),
+        ..config.clone()
     };
 
     let fenced = match dispatch_rewrite(
@@ -871,7 +905,8 @@ async fn migrate_bucket_format_scoped(
         Err(
             err @ (MaintainError::UnwritableInput { .. }
             | MaintainError::InputOutOfWindow { .. }
-            | MaintainError::NewerThanWritable { .. }),
+            | MaintainError::NewerThanWritable { .. }
+            | MaintainError::UnknownSectionKinds { .. }),
         ) => {
             if let Some(guard) = guard
                 && guard.cancelled_at().await.is_none()
@@ -1169,6 +1204,40 @@ pub async fn reencode_compaction_parts(
     outcome
 }
 
+/// Start a force 2 re-encode's compat run (ADR-4233 decision 3) over the
+/// bucket's part family and `compaction-record`. The run writes a version 2
+/// compaction record, so it is refused unless `compaction-record` is active at
+/// 2. With no policy installed nothing is checked, as before.
+async fn reencode_compat_run(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+) -> Result<Option<crate::compat_policy::CompatRun>> {
+    let Some(part) = crate::compat_policy::part_family(bucket.signal) else {
+        return Ok(None);
+    };
+    let record_family = ravel_catalog::compat::FAMILY_COMPACTION_RECORD;
+    let run = crate::compat_policy::begin_bucket_run(
+        store,
+        config,
+        bucket,
+        "re-encode",
+        &[part, record_family],
+    )
+    .await?;
+    if let Some(run) = run.as_ref() {
+        let active = run.version(record_family).unwrap_or_default();
+        let superseding = ravel_commit::record::COMPACTION_SUPERSEDING_FORMAT_VERSION;
+        if u32::from(active) != superseding {
+            return Err(run.refuse_with(
+                record_family,
+                crate::compat_policy::CompatRunRefusal::CompactionRecordNotActive { active },
+            ));
+        }
+    }
+    Ok(run)
+}
+
 /// [`reencode_compaction_parts`]'s body, with the request ledger's run scope
 /// already opened and guaranteed to be closed by its caller.
 async fn reencode_compaction_parts_scoped(
@@ -1178,7 +1247,13 @@ async fn reencode_compaction_parts_scoped(
     bucket: &Bucket,
 ) -> Result<ReencodeOutcome> {
     crate::rlog::check_rlog_writer_config(config, bucket)?;
-    let target_version = current_part_version(bucket.signal)?;
+    let compat_run = reencode_compat_run(store, config, bucket).await?;
+    let target_version = match compat_run.as_ref().and_then(|run| {
+        crate::compat_policy::part_family(bucket.signal).and_then(|family| run.version(family))
+    }) {
+        Some(active) => u32::from(active),
+        None => current_part_version(bucket.signal)?,
+    };
     let start_ns = clock.now_ns();
     let ledger = config.request_ledger.as_ref();
 
@@ -1244,12 +1319,10 @@ async fn reencode_compaction_parts_scoped(
             });
         }
     };
-    let run_config = match guard.as_ref() {
-        Some(guard) => CompactorConfig {
-            claim_guard: Some(guard.clone()),
-            ..config.clone()
-        },
-        None => config.clone(),
+    let run_config = CompactorConfig {
+        claim_guard: guard.clone().or_else(|| config.claim_guard.clone()),
+        compat_run: compat_run.or_else(|| config.compat_run.clone()),
+        ..config.clone()
     };
 
     let fenced = match reencode_and_publish(
@@ -1488,13 +1561,15 @@ async fn reencode_rseg_parts(
         let mut new_part = reencode_rseg_part(
             bucket,
             config,
+            key,
             &object,
             part,
             predecessor.level,
             input_set_hash,
         )?;
         if !config.dry_run
-            && put_part_with_ledger(store, &new_part, ledger).await? == PartPut::AlreadyExisted
+            && put_part_with_ledger(store, &new_part, ledger, config.compat_run.as_ref()).await?
+                == PartPut::AlreadyExisted
         {
             new_part.put_already_existed = true;
         }
@@ -1529,6 +1604,7 @@ fn object_range(object: &[u8], (offset, len): (u64, u64)) -> Result<&[u8]> {
 fn reencode_rseg_part(
     bucket: &Bucket,
     config: &CompactorConfig,
+    object_key: &str,
     object: &[u8],
     part: &CompactionPart,
     level: u32,
@@ -1536,6 +1612,11 @@ fn reencode_rseg_part(
 ) -> Result<BuiltPart> {
     let limits = ReaderLimits::default();
     let loc = open_from_full(object, limits)?;
+    crate::compat_policy::refuse_unknown_sections(
+        object_key,
+        &loc.unknown_section_kinds,
+        Some(u32::from(loc.version)),
+    )?;
     let footer = &loc.footer;
     let entries = decode_catalog_v5(footer, object, limits)?;
     let refs: Vec<&SeriesEntryV4> = entries.iter().collect();
@@ -1626,8 +1707,10 @@ fn reencode_rseg_part(
         part_index: part.part_index,
         level,
     };
-    let written =
-        SegmentWriter::write_v7_with_provenance(series, identity, ingest, meta, exemplars)?;
+    let version = crate::compat_policy::rseg_write_version(config)?;
+    let written = SegmentWriter::write_v7_with_provenance_at(
+        version, series, identity, ingest, meta, exemplars,
+    )?;
     let content_hash = written.summary.blake3;
     let key = keys::l1_part_key(
         &bucket.tenant_hash,
@@ -1649,7 +1732,7 @@ fn reencode_rseg_part(
         run_count,
         min_event_ts_ns: written.summary.min_event_ts_ns,
         max_event_ts_ns: written.summary.max_event_ts_ns,
-        segment_format_version: crate::build::OUTPUT_FORMAT_VERSION,
+        segment_format_version: u32::from(version.number()),
         declared_column_stats: Vec::new(),
     };
     // Metrics carry no declared columns; stamped the one way `build.rs` does.
