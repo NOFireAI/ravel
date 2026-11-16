@@ -1217,10 +1217,11 @@ mod tests {
         }
     }
 
-    /// A view that has never seen a record keeps an unfenced bucket writing
-    /// past the horizon: a store that was never activated keeps its baseline.
+    /// A view whose read found no record writes an unfenced bucket inside
+    /// the horizon and refuses it past the horizon: only a view that never
+    /// read `sys/compat` is exempt.
     #[tokio::test]
-    async fn a_never_seen_view_keeps_an_unfenced_bucket_writing_past_the_horizon() {
+    async fn a_view_that_read_no_record_refuses_an_unfenced_bucket_past_the_horizon() {
         let store = Arc::new(MemoryStore::new());
         let clock = ManualClock::at(T0);
         let policy = policy(store.clone(), clock.clone()).await;
@@ -1234,10 +1235,16 @@ mod tests {
             )
             .expect("begin");
 
-        clock.advance(COMPAT_VIEW_HORIZON_NS + HOUR_NS);
+        clock.advance(COMPAT_VIEW_HORIZON_NS - 1);
         run.before_put(store.as_ref())
             .await
-            .expect("unfenced, never seen");
+            .expect("unfenced, inside the horizon");
+        clock.advance(1);
+        let err = run
+            .before_put(store.as_ref())
+            .await
+            .expect_err("unfenced, past the horizon");
+        assert_view_stale(&err);
     }
 
     /// A view that has seen a record refuses past the horizon on a fenced

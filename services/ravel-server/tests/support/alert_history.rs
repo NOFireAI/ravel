@@ -23,8 +23,8 @@ use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_types::{Signal, TenantId};
 use uuid::Uuid;
 
-const TOKEN: &str = "testtoken";
-const TENANT: &str = "acme";
+pub const TOKEN: &str = "testtoken";
+pub const TENANT: &str = "acme";
 const NS_PER_HOUR: i64 = 3_600 * 1_000_000_000;
 
 const ALERT_RULES_JSON: &str = r#"{
@@ -123,6 +123,14 @@ pub async fn start_server(store: Arc<MemoryStore>) -> ravel_server::Running {
 /// keys its `sys/compat` view with.
 pub async fn start_server_with_key(
     store: Arc<MemoryStore>,
+    deployment_key: Option<[u8; 32]>,
+) -> ravel_server::Running {
+    start_server_on(store, deployment_key).await
+}
+
+/// [`start_server_with_key`] over any backend, such as a `FaultStore`.
+pub async fn start_server_on(
+    store: Arc<dyn ObjectStoreBackend>,
     deployment_key: Option<[u8; 32]>,
 ) -> ravel_server::Running {
     let mut tokens = HashMap::new();

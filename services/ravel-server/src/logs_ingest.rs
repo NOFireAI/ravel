@@ -102,10 +102,23 @@ pub enum LogIngestRequestError {
     /// durable provisioning record (ADR-0050 section 5). Operator
     /// misconfiguration, not client fault; the request fails.
     Provisioning(String),
+    /// A first touch refused under a stale `sys/compat` view, as
+    /// [`crate::ingest::IngestRequestError::CompatRefused`].
+    CompatRefused(String),
     /// The tenant's IPCrypt rule set could not be resolved, as
     /// [`crate::ingest::IngestRequestError::IpcryptRules`].
     IpcryptRules,
     Write(LogWriteError),
+}
+
+impl From<crate::provisioning::FirstTouchError> for LogIngestRequestError {
+    fn from(err: crate::provisioning::FirstTouchError) -> Self {
+        if err.is_retryable() {
+            LogIngestRequestError::CompatRefused(err.to_string())
+        } else {
+            LogIngestRequestError::Provisioning(err.to_string())
+        }
+    }
 }
 
 impl std::fmt::Display for LogIngestRequestError {
@@ -118,6 +131,7 @@ impl std::fmt::Display for LogIngestRequestError {
                 "idempotency key is {len} bytes, exceeds the {MAX_IDEMPOTENCY_KEY_BYTES}-byte limit"
             ),
             LogIngestRequestError::Provisioning(msg) => write!(f, "{msg}"),
+            LogIngestRequestError::CompatRefused(msg) => write!(f, "{msg}"),
             LogIngestRequestError::IpcryptRules => {
                 f.write_str(crate::ipcrypt::TENANT_RULES_UNAVAILABLE)
             }
@@ -141,6 +155,7 @@ impl LogIngestRequestError {
             LogIngestRequestError::InvalidIdempotencyKey { .. } => false,
             // An operator misconfiguration, not transient.
             LogIngestRequestError::Provisioning(_) => false,
+            LogIngestRequestError::CompatRefused(_) => true,
             LogIngestRequestError::IpcryptRules => false,
             LogIngestRequestError::Write(err) => err.is_retryable(),
         }
@@ -356,8 +371,7 @@ pub async fn handle_export_logs_releasing(
         ravel_types::Signal::Logs,
         ingest_ts_ns,
     )
-    .await
-    .map_err(|e| LogIngestRequestError::Provisioning(e.to_string()))?;
+    .await?;
     // One hour-bucket computation, shared by the lookup and the marker write
     // so they cannot drift within a request (see `request_ingest_hour_bucket`).
     let hour_bucket = request_ingest_hour_bucket(ingest_ts_ns);
