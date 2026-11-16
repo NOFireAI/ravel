@@ -2,8 +2,9 @@
 //! wrote before the policy existed. Each test compacts a fixed bucket per
 //! signal and pins a blake3 digest over every object the store then holds,
 //! keys and bytes, so any change to a part, a record or a key under a `None`
-//! policy fails here. The digests were taken on the commit before the policy
-//! was added and match it unchanged.
+//! policy fails here. The digests are what this file computes when run
+//! unchanged against `de80c4016`, the `main` commit the policy was built on,
+//! which has no policy.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;

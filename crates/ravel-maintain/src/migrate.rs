@@ -359,6 +359,14 @@ pub enum MigrateHoldReason {
     NewerThanWritable { commit_key: String, version: u32 },
     /// The input object failed to decode.
     CorruptInput { detail: String },
+    /// The input's directory names section kinds this build does not know, so
+    /// a re-encode would drop them (ADR-4233 hazard H6). `version` is the
+    /// input's trailer version.
+    UnknownSection {
+        object_key: String,
+        version: u16,
+        kinds: Vec<u32>,
+    },
 }
 
 impl MigrateHoldReason {
@@ -368,6 +376,7 @@ impl MigrateHoldReason {
             MigrateHoldReason::InputOutOfWindow { .. } => "input_out_of_window",
             MigrateHoldReason::NewerThanWritable { .. } => "newer_than_writable",
             MigrateHoldReason::CorruptInput { .. } => "corrupt_input",
+            MigrateHoldReason::UnknownSection { .. } => "unknown_section",
         }
     }
 
@@ -391,19 +400,14 @@ impl MigrateHoldReason {
                 commit_key: commit_key.clone(),
                 version: *version,
             }),
-            // ADR-4233 hazard H6: an input with section kinds this build does
-            // not know, which a re-encode would drop. Held under the
-            // out-of-window reason, the closest one `ravel-cli` renders:
-            // another build can carry the object, this one cannot.
             MaintainError::UnknownSectionKinds {
                 object_key,
+                kinds,
                 recorded_version,
-                ..
-            } => Some(MigrateHoldReason::InputOutOfWindow {
+            } => Some(MigrateHoldReason::UnknownSection {
                 object_key: object_key.clone(),
-                version: recorded_version
-                    .and_then(|v| u16::try_from(v).ok())
-                    .unwrap_or(0),
+                version: *recorded_version,
+                kinds: kinds.clone(),
             }),
             MaintainError::Segment(_) | MaintainError::LogSeg(_) | MaintainError::SpanSeg(_) => {
                 Some(MigrateHoldReason::CorruptInput {
@@ -435,6 +439,16 @@ impl std::fmt::Display for MigrateHoldReason {
                 self.name()
             ),
             MigrateHoldReason::CorruptInput { detail } => write!(f, "{}: {detail}", self.name()),
+            MigrateHoldReason::UnknownSection {
+                object_key,
+                version,
+                kinds,
+            } => write!(
+                f,
+                "{}: {object_key:?} at format version {version} carries section kinds {kinds:?} \
+                 this build does not know; a re-encode would drop them",
+                self.name()
+            ),
         }
     }
 }
@@ -1637,18 +1651,15 @@ enum Force2 {
 /// below the target: a bucket whose overlap losers alone are below it is the
 /// re-audit's [`BlockedReason::LosingRecordParts`].
 ///
-/// A part counts as below the target only when it is also below the version
-/// the current writer emits for the signal, since a re-encode can carry it no
-/// further.
+/// A part counts as below the target only when it is also below `writable`,
+/// the version the run's writer emits for the signal, since a re-encode can
+/// carry it no further.
 fn force2_case(
-    signal: Signal,
     records: &[(String, CompactionRecord)],
     target_version: u32,
+    writable: u32,
 ) -> Result<Option<Force2>> {
-    let Ok(current) = current_part_version(signal) else {
-        return Ok(None);
-    };
-    let threshold = target_version.min(current);
+    let threshold = target_version.min(writable);
     let below = |rec: &CompactionRecord| {
         rec.parts
             .iter()
@@ -1689,6 +1700,20 @@ fn force2_case(
         below_target: below(only),
         inputs: only.inputs.len() as u64,
     }))
+}
+
+/// The part version a force 2 re-encode of a `signal` bucket writes: the
+/// family's active version under a compat policy, which
+/// [`crate::compat_policy::require_active_target`] has already matched to the
+/// target, or the build's current one without. `None` for a signal no
+/// re-encode covers.
+fn force2_writable(config: &CompactorConfig, signal: Signal) -> Option<u32> {
+    match config.compat_policy.as_ref() {
+        Some(policy) => crate::compat_policy::part_family(signal)
+            .and_then(|family| policy.active_version(family))
+            .map(u32::from),
+        None => current_part_version(signal).ok(),
+    }
 }
 
 /// Record what [`reencode_compaction_parts`] did to the bucket at
@@ -2098,7 +2123,13 @@ pub async fn migrate_family(
                     // target raw, so what can hold it there is the parts of
                     // its compaction records. A bucket with a rewrite record
                     // is the re-audit's `RewriteParts` (ADR-1331).
-                    match force2_case(bucket.signal, &served.compaction_records, target_version)? {
+                    let case = match force2_writable(config, bucket.signal) {
+                        Some(writable) => {
+                            force2_case(&served.compaction_records, target_version, writable)?
+                        }
+                        None => None,
+                    };
+                    match case {
                         None => {}
                         Some(Force2::Blocked(reason)) => {
                             report.reencode_blocked.push(ReencodeBlockedBucket {
@@ -2122,17 +2153,15 @@ pub async fn migrate_family(
                                         outcome,
                                     );
                                 }
-                                // A part above the version this build writes
-                                // holds the bucket, as it does on the L0 path
-                                // (ADR-4233 decision 6).
-                                Err(MaintainError::NewerThanWritable {
-                                    commit_key,
-                                    version,
-                                    ..
-                                }) => {
-                                    let reason = MigrateHoldReason::NewerThanWritable {
-                                        commit_key,
-                                        version,
+                                // A part the re-encode cannot carry forward
+                                // (newer than the run writes, outside the
+                                // reader window, undecodable, or with section
+                                // kinds this build does not know) holds the
+                                // bucket, as it does on the L0 path (ADR-4233
+                                // decision 6).
+                                Err(err) => {
+                                    let Some(reason) = MigrateHoldReason::from_refusal(&err) else {
+                                        return Err(err);
                                     };
                                     tracing::warn!(
                                         tenant = %tenant_hash.to_hex(),
@@ -2140,10 +2169,10 @@ pub async fn migrate_family(
                                         shard,
                                         ingest_hour = hour,
                                         reason = reason.name(),
-                                        detail = %reason,
-                                        "migrate held a bucket whose compaction record names a \
-                                         part newer than this build writes; the walk goes on \
-                                         and the floor stays unraised"
+                                        error = %err,
+                                        "migrate held a bucket whose compaction parts it cannot \
+                                         re-encode; the walk goes on and the floor stays \
+                                         unraised"
                                     );
                                     held.push(MigrateHeldBucket {
                                         shard,
@@ -2151,7 +2180,6 @@ pub async fn migrate_family(
                                         reason,
                                     });
                                 }
-                                Err(err) => return Err(err),
                             }
                         }
                     }
@@ -6074,7 +6102,8 @@ mod tests {
         use ravel_catalog::compat::{CompatRefusal, FAMILY_RSEG};
 
         let store = Arc::new(MemoryStore::new());
-        write_compat(store.as_ref(), vec![family(FAMILY_RSEG, 8)], NS_PER_HOUR).await;
+        // 9: above the window with or without `format-drill`.
+        write_compat(store.as_ref(), vec![family(FAMILY_RSEG, 9)], NS_PER_HOUR).await;
         provision(store.as_ref(), 1).await;
         seed_at(store.as_ref(), 0, 100, 1, "alpha", 6).await;
         let config = CompactorConfig {
@@ -6103,7 +6132,7 @@ mod tests {
                 outcome,
                 BackgroundMigrateOutcome::Refused {
                     refusal: CompatRunRefusal::Compat(CompatRefusal::ActiveVersionNotWritable {
-                        active: 8,
+                        active: 9,
                         ..
                     })
                 }
@@ -6114,6 +6143,44 @@ mod tests {
         assert_eq!(
             crate::compat_publish_refused_total(FAMILY_RSEG, "active_version_not_writable"),
             refused + 1
+        );
+    }
+
+    /// Force 2 counts a part as below the target only when it is also below
+    /// the version the run writes, named explicitly. A threshold of the
+    /// build's current version (7) finds nothing to lift for a run writing 8;
+    /// one of the target alone re-encodes for a run writing 7 parts it cannot
+    /// carry past 7.
+    #[test]
+    fn force2_counts_parts_below_the_runs_version() {
+        use ravel_proto::commit::v1::CompactionPart;
+        let record = CompactionRecord {
+            format_version: 1,
+            input_set_hash: vec![1; 32],
+            parts: [7, 7]
+                .into_iter()
+                .map(|segment_format_version| CompactionPart {
+                    segment_format_version,
+                    ..CompactionPart::default()
+                })
+                .collect(),
+            ..CompactionRecord::default()
+        };
+        let records = vec![("record".to_string(), record)];
+
+        assert!(
+            matches!(
+                force2_case(&records, 8, 8).expect("case"),
+                Some(Force2::Reencode {
+                    below_target: 2,
+                    inputs: 0
+                })
+            ),
+            "a run writing 8 lifts both parts"
+        );
+        assert!(
+            force2_case(&records, 8, 7).expect("case").is_none(),
+            "a run writing 7 lifts nothing"
         );
     }
 }

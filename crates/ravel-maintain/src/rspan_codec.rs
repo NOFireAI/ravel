@@ -163,6 +163,20 @@ use ravel_cpu_gate::ReadSite;
 /// so this is not "the version this build writes" in general.
 pub const OUTPUT_FORMAT_VERSION: u32 = ravel_rspan::footer::WriteVersion::CURRENT.number() as u32;
 
+/// The format version in the trailer `suffix` ends with: the little-endian
+/// `u16` at bytes 8..10 of the last [`footer::TRAILER_LEN`]. Only those two
+/// bytes are read; the caller has already opened the footer from the same
+/// suffix.
+fn rspan_trailer_version(suffix: &[u8]) -> Result<u16> {
+    suffix
+        .len()
+        .checked_sub(footer::TRAILER_LEN)
+        .and_then(|at| suffix.get(at + 8..at + 10))
+        .and_then(|b| <[u8; 2]>::try_from(b).ok())
+        .map(u16::from_le_bytes)
+        .ok_or_else(|| MaintainError::Invariant("rspan suffix shorter than its trailer".into()))
+}
+
 /// One RSPAN input's retained catalog metadata: the data-object key, its
 /// decoded footer, and an [`RspanRangeReader`] over its SKIP_IDX. Block bytes
 /// are never retained here; the merge fetches them by range one block at a
@@ -263,7 +277,13 @@ pub(crate) async fn load_catalog_from_object(
             }
         }
     };
-    crate::compat_policy::refuse_unknown_sections(&object_key, &ftr.unknown_section_kinds, None)?;
+    // The probe ends at the object's end and covers the trailer whenever the
+    // footer opened, on both routes above.
+    crate::compat_policy::refuse_unknown_sections(
+        &object_key,
+        &ftr.unknown_section_kinds,
+        rspan_trailer_version(&probe.data)?,
+    )?;
     // Fetch and decode the SKIP_IDX section by range. BLOCKS is never
     // fetched here; the merge streams blocks by range one at a time.
     let skip_desc = ftr
