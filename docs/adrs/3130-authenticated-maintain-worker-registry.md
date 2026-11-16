@@ -301,8 +301,9 @@ hour old, so it defers a bucket's re-evaluation by at most that hour.
   cap, then a fetched length over the cap (range GET of the cap plus one
   byte), is `oversize`; an empty object or one shorter than 41 bytes is
   `malformed`; a tag other than 2 is `unknown_tag`; a MAC that verifies
-  under none of the reader's keys is `bad_mac`. Seeding and decoding accept
-  only a snapshot that passed all six, so a forged object costs one GET and
+  under none of the reader's keys is `bad_mac`. A seventh reason,
+  `over_budget`, comes from the reseed budget amendment below. Seeding and
+  decoding accept only a snapshot that passed all of them, so a forged object costs one GET and
   one MAC computation per configured key and is never decoded, whatever
   counts its body claims. The seed-time staleness gate reads the verified
   timestamp and runs before the body is decoded.
@@ -315,7 +316,7 @@ hour old, so it defers a bucket's re-evaluation by at most that hour.
   modification time (`<= 0`) goes on to the checks after it.
 - **Logging.** Each reseed counts rejects per reason and logs one warning
   carrying every count when any `oversize`, `unknown_tag` or `bad_mac` reject
-  occurred; `non_uuid_key`, `stale` and `malformed` alone log at debug, so
+  occurred (or an `over_budget` one, per the reseed budget amendment below); `non_uuid_key`, `stale` and `malformed` alone log at debug, so
   leftovers older than the 2-hour bound do not raise the warning. No metric
   is added.
 - **Rollout.** Tag 1, the unauthenticated frame earlier releases write, now
@@ -324,3 +325,31 @@ hour old, so it defers a bucket's re-evaluation by at most that hour.
   therefore seed nothing from each other's snapshots, so each unit starts
   cold once: a rescan of its buckets, never a correctness issue, because the
   memo is advisory (ADR-0065 decision 3).
+
+## Amendment (2026-11-16): the reseed budget amendment (issue #3211)
+
+<!-- amendment-applies: sections="Amendment (2026-10-22): memo snapshot amendment (issue #3155)" pointer="reseed budget amendment" -->
+
+The check order above still left one reseed's work unbounded: every object
+that passed the unread checks was fetched and MAC'd, so a principal holding
+the `sys/maintain/*` PutObject grant could plant thousands of fresh,
+canonically keyed objects at the byte cap and make each reseed fetch them all.
+
+A reseed now fetches at most 256 objects and 1 GiB of listed size
+(`MemoReseedBudget::DEFAULT` in `crates/ravel-maintain/src/memo_snapshot.rs`;
+256 is 64 processes times 4 incarnations inside the 2-hour window, and 1 GiB
+is 32 snapshots at the 32 MiB cap). Objects that pass the unread checks are
+admitted in this order: writers in the reader's live set first (the live set
+comes from MAC-verified registry heartbeats, so a forged object cannot take a
+live writer's place), then newest LIST modification time, then listing order.
+An object too large for the bytes left is skipped and smaller ones after it
+are still admitted. Every admitted object goes through the existing checks;
+every object left unread is a seventh reject reason, `over_budget`, and an
+`over_budget` reject raises the reseed's single warning like `oversize`,
+`unknown_tag` and `bad_mac` do.
+
+Accepted cost: enough fresh forged objects can push a recently departed
+writer's snapshot, which is not in the live set, past the budget. Its units
+then start cold, a rescan of their buckets and never wrong maintenance,
+because the memo is advisory. Reading only live and recently departed writers
+was considered and not done: the worker registry keeps no departed set.

@@ -141,8 +141,10 @@ object stays KBs even at large retention -- **debounced**, so a tick that
 verified nothing new writes nothing (the debounce compares the timestamp-free
 body, so it rides the existing tick and needs no separate timer). On startup,
 and whenever a membership change moves ownership of a unit to this process, the
-worker lists this prefix and GETs every sibling's snapshot (its own previous one
-included), seeding its in-memory memo from the freshest non-stale entries for
+worker lists this prefix and GETs the siblings' snapshots (its own previous one
+included) up to a fixed per-reseed budget of 256 objects and 1 GiB of listed
+size, live-set writers first and then newest modification time first; a listed
+snapshot the budget leaves unread is counted as an `over_budget` reject. It seeds its in-memory memo from the freshest non-stale entries for
 the units it now owns, so a restart or ownership handoff warm-starts instead of
 rescanning the retention window cold. A snapshot is trusted only while it is
 within one memo re-verify interval (default 1h) of the reader's clock: past that

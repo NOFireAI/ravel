@@ -228,7 +228,8 @@ reader seeds only from snapshots whose MAC verifies.
 
 **Warm start and handoff.** On startup — and whenever ownership of a unit
 arrives via a membership change — a worker reads all non-stale memo
-snapshots (its own previous one and siblings'), and seeds its in-memory
+snapshots (its own previous one and siblings'; the reseed budget amendment
+below caps how many one reseed fetches), and seeds its in-memory
 `MaintainMemo` from the freshest entries for the units it now owns. The memo
 stays exactly as advisory as today: entries only suppress re-reads inside the
 freshness rules below, are re-verified on schedule, and a lost, stale, or
@@ -651,3 +652,16 @@ and the compaction record is still written once, by the unit, under
 `CreateIfAbsent`. The range cut and the windows do not depend on `W2`, so
 every worker count cuts and numbers the same parts, and publishes the same
 keys and bytes outside the batch-major exception above.
+
+## Amendment (2026-11-16): the reseed budget amendment (issue #3211)
+
+<!-- amendment-applies: sections="3. Durable incremental cursor: per-worker maintain-state snapshot" pointer="reseed budget amendment" -->
+
+Decision 3's warm start no longer reads every non-stale memo snapshot. One
+reseed fetches at most 256 objects and 1 GiB of listed size, live-set writers
+first and then newest modification time first, and counts every listed
+snapshot it leaves unread as an `over_budget` reject. ADR-3130's reseed budget
+amendment has the order, the derivation of both limits and the accepted cost:
+a recently departed writer's snapshot can be crowded out by forged objects,
+and its units then start cold, which the memo's advisory status already
+allows.
