@@ -15,21 +15,27 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/check-mcp-error-display-test.XXXXXX")"
 trap 'rm -rf "${TMP}"' EXIT
 
 SRC="services/ravel-server/src/mcp"
+TOOLS="crates/ravel-mcp/src"
 
 fails=0
 passes=0
 
 # new_repo <name>: a scratch repo with the guard installed and one clean
-# source file holding a fixed-message site, so the anchor count is never what
-# a case measures unless it says so. Prints its path.
+# source file in each default root holding a fixed-message site, so the anchor
+# count is never what a case measures unless it says so. Prints its path.
 new_repo() {
   local dir="${TMP}/$1"
-  mkdir -p "${dir}/scripts/guards" "${dir}/${SRC}"
+  mkdir -p "${dir}/scripts/guards" "${dir}/${SRC}" "${dir}/${TOOLS}/tools"
   cp "${GUARD}" "${dir}/scripts/guards/check-mcp-error-display.sh"
   cat >"${dir}/${SRC}/clean.rs" <<'RS'
 //! A clean module. Its prose names d4::internal(format!("{error}")) freely.
 fn tenant() -> Result<TenantHash, McpError> {
     Err(McpError::internal_error("the request carries no authenticated tenant", None))
+}
+RS
+  cat >"${dir}/${TOOLS}/tools/clean.rs" <<'RS'
+fn fixed() -> Failure {
+    internal("a fixed message".to_string())
 }
 RS
   printf '%s\n' "${dir}"
@@ -49,6 +55,23 @@ check() {
   fi
   if [[ -n "${want_sub}" && "${out}" != *"${want_sub}"* ]]; then
     printf 'FAIL  %s: output missing %s\n' "${name}" "${want_sub}"
+    printf '%s\n' "${out}" | sed 's/^/      /'
+    fails=$((fails + 1))
+    return
+  fi
+  printf 'ok    %s\n' "${name}"
+  passes=$((passes + 1))
+}
+
+# check_findings <name> <repo> <want-count>: the guard prints exactly that
+# many findings.
+check_findings() {
+  local name="$1" dir="$2" want="$3"
+  local out count
+  out="$(cd "${dir}" && bash scripts/guards/check-mcp-error-display.sh 2>&1)"
+  count="$(printf '%s\n' "${out}" | grep -c ': error-display: ')"
+  if [[ "${count}" != "${want}" ]]; then
+    printf 'FAIL  %s: %s findings, wanted %s\n' "${name}" "${count}" "${want}"
     printf '%s\n' "${out}" | sed 's/^/      /'
     fails=$((fails + 1))
     return
@@ -106,7 +129,7 @@ fn wrap(error: StoreError) -> Failure {
     super::envelope::internal(format!("{error:?}"))
 }
 RS
-check "flags the envelope:: spelling of the same call" "${d}" 1 "leak.rs:2: error-display: the arguments of envelope::internal("
+check "flags the envelope:: spelling of the same call" "${d}" 1 "leak.rs:2: error-display: the arguments of super::envelope::internal("
 
 d="$(new_repo mcp_error_new)"
 cat >"${d}/${SRC}/leak.rs" <<'RS'
@@ -147,6 +170,94 @@ fn tool_result(envelope: &Envelope) -> Result<Value, McpError> {
 RS
 check "follows a call's arguments across lines to the anchor line" "${d}" 1 "leak.rs:3: error-display: the arguments of McpError::internal_error("
 check "reports the nested json! at its own line" "${d}" 1 "leak.rs:5: error-display: the arguments of json!("
+
+# --- every spelling of the failure constructors ----------------------------
+
+d="$(new_repo redacted_qualified)"
+cat >"${d}/${SRC}/leak.rs" <<'RS'
+fn wrap(error: StoreError, tenant_hash: TenantHash) -> Failure {
+    d4::redacted_internal(&format!("the read failed: {error}"), &error, tenant_hash)
+}
+RS
+check "flags d4::redacted_internal built with format!" "${d}" 1 "leak.rs:2: error-display: the arguments of d4::redacted_internal("
+
+d="$(new_repo redacted_qualified_allowed)"
+cat >"${d}/${SRC}/fixed.rs" <<'RS'
+fn wrap(error: StoreError, tenant_hash: TenantHash) -> Failure {
+    d4::redacted_internal(READ_FAILED, &error, tenant_hash)
+}
+fn shape(cell: &Cell, tenant_hash: TenantHash) -> Failure {
+    // mcp-error-display-allow: names the cell's variant only.
+    d4::redacted_internal(&format!("a {} cell", cell.kind()), &format_args!("{cell:?}"), tenant_hash)
+}
+RS
+check "passes d4::redacted_internal with a fixed message or a marker" "${d}" 0 ""
+
+d="$(new_repo redacted_bare)"
+cat >"${d}/${TOOLS}/tools/leak.rs" <<'RS'
+fn sample(err: serde_json::Error, tenant_hash: TenantHash) -> Failure {
+    redacted_internal(&format!("a sample did not serialize: {err}"), &err, tenant_hash)
+}
+RS
+check "flags an unqualified redacted_internal built with format!" "${d}" 1 "tools/leak.rs:2: error-display: the arguments of redacted_internal("
+
+d="$(new_repo redacted_bare_allowed)"
+cat >"${d}/${TOOLS}/tools/fixed.rs" <<'RS'
+fn sample(err: serde_json::Error, tenant_hash: TenantHash) -> Failure {
+    redacted_internal(SAMPLE_NOT_SERIALIZED, &err, tenant_hash)
+}
+RS
+check "passes an unqualified redacted_internal with a fixed message" "${d}" 0 ""
+
+d="$(new_repo internal_bare)"
+cat >"${d}/${TOOLS}/tools/leak.rs" <<'RS'
+fn sample(err: serde_json::Error) -> Failure {
+    internal(format!("a PromQL sample did not serialize: {err}"))
+}
+RS
+check "flags an unqualified internal built with format!" "${d}" 1 "tools/leak.rs:2: error-display: the arguments of internal("
+
+d="$(new_repo internal_bare_allowed)"
+cat >"${d}/${TOOLS}/tools/fixed.rs" <<'RS'
+fn column_index(name: &str) -> Failure {
+    // mcp-error-display-allow: every caller passes a compiled-in column name.
+    internal(format!("{name} is not an analytics column"))
+}
+RS
+check "passes an unqualified internal under a reasoned marker" "${d}" 0 ""
+
+d="$(new_repo failure_bare)"
+cat >"${d}/${TOOLS}/tools/leak.rs" <<'RS'
+fn refuse(error: StoreError) -> Refusal {
+    (failure(FailureClass::Internal, error.to_string()), Vec::new())
+}
+RS
+check "flags an unqualified failure built with to_string" "${d}" 1 "tools/leak.rs:2: error-display: the arguments of failure("
+
+d="$(new_repo failure_bare_allowed)"
+cat >"${d}/${TOOLS}/tools/fixed.rs" <<'RS'
+fn refuse(error: &ValidationError) -> Refusal {
+    // mcp-error-display-allow: the refusal of the caller's own statement.
+    (failure(FailureClass::Validation, error.to_string()), Vec::new())
+}
+RS
+check "passes an unqualified failure under a reasoned marker" "${d}" 0 ""
+
+d="$(new_repo method_and_longer_name)"
+cat >"${d}/${TOOLS}/tools/data.rs" <<'RS'
+fn refuse(error: CursorError, sql: SqlError) -> (Failure, Failure) {
+    (error.failure(), sql_failure(&sql.to_string()))
+}
+RS
+check "a .failure() method and a longer name ending in failure are not anchors" "${d}" 0 ""
+
+d="$(new_repo qualified_once)"
+cat >"${d}/${SRC}/leak.rs" <<'RS'
+fn summary_row(error: AnalyticsError) -> Failure {
+    d4::internal(format!("summary: {error}"))
+}
+RS
+check_findings "a qualified call is one finding, not one per path segment" "${d}" 1
 
 # --- what is not a leak ----------------------------------------------------
 
@@ -338,10 +449,46 @@ check "refuses when the source directory holds no Rust sources" "${d}" 2 "no Rus
 d="$(new_repo no_anchors)"
 cat >"${d}/${SRC}/clean.rs" <<'RS'
 fn renamed(error: E) -> Fault {
-    faults::internal(format!("{error}"))
+    faults::raise(format!("{error}"))
 }
 RS
 check "refuses when the sources hold none of its anchors" "${d}" 2 "cannot refuse anything"
+
+d="$(new_repo tools_moved)"
+rm -rf "${d:?}/${TOOLS}"
+cat >"${d}/${SRC}/leak.rs" <<'RS'
+fn summary_row(error: AnalyticsError) -> Failure {
+    d4::internal(format!("summary: {error}"))
+}
+RS
+check "refuses when the ravel-mcp source directory has moved" "${d}" 2 "crates/ravel-mcp/src is gone"
+check "and still scans and reports the root that is there" "${d}" 2 "mcp/leak.rs:2: error-display:"
+
+d="$(new_repo tools_empty)"
+rm -f "${d}/${TOOLS}/tools"/*.rs
+check "refuses when the ravel-mcp root holds no Rust sources" "${d}" 2 "no Rust sources under crates/ravel-mcp/src"
+
+d="$(new_repo tools_no_anchors)"
+cat >"${d}/${TOOLS}/tools/clean.rs" <<'RS'
+fn renamed(error: E) -> Fault {
+    faults::raise(format!("{error}"))
+}
+RS
+check "refuses when the ravel-mcp root holds none of its anchors" "${d}" 2 "under crates/ravel-mcp/src, so this scan cannot refuse anything"
+
+d="$(new_repo one_root_blind)"
+cat >"${d}/${SRC}/clean.rs" <<'RS'
+fn renamed(error: E) -> Fault {
+    faults::raise(format!("{error}"))
+}
+RS
+cat >"${d}/${TOOLS}/tools/leak.rs" <<'RS'
+fn sample(err: serde_json::Error) -> Failure {
+    internal(format!("{err}"))
+}
+RS
+check "a blind root exits 2 even when the other root has anchors" "${d}" 2 "under services/ravel-server/src/mcp, so this scan cannot refuse anything"
+check "and the other root's findings are still printed" "${d}" 2 "tools/leak.rs:2: error-display:"
 
 # --- usage -----------------------------------------------------------------
 

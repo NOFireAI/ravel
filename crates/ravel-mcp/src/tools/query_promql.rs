@@ -36,13 +36,14 @@
 use ravel_query::RequestBudgets;
 use ravel_query::http::service::{PARTIAL_REFUSAL_PREFIX, PARTIAL_REFUSAL_REMEDY};
 use ravel_query::http::{InstantRequest, RangeRequest};
+use ravel_types::TenantHash;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::catalog::QueryPromqlInput;
 use crate::envelope::{
     CapAdvice, Cell, Column, Data, Envelope, Failure, FailureClass, NextStep, Row, TimeRange,
-    fit_cap, serialized_len,
+    fit_cap, redacted_internal, serialized_len,
 };
 use crate::service::QueryBackend;
 
@@ -51,6 +52,10 @@ use super::capabilities::refused_with;
 use super::promql_range::{EvalRange, NS_PER_MS, Refusal, eval_range, whole_ms};
 
 const TOOL: &str = "ravel_query_promql";
+
+const SAMPLE_NOT_SERIALIZED: &str = "a PromQL sample could not be serialized";
+
+const TS_NOT_TIMESTAMP: &str = "the PromQL port returned a ts_ns cell that is not a timestamp";
 
 /// The PromQL lookback: an instant selector evaluated at `t` reads the
 /// latest sample in `(t - LOOKBACK_NS, t]`. The server's evaluator owns the
@@ -220,7 +225,7 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Result<
         .collect();
     let grouped = names == SAMPLE_COLUMNS;
     if grouped {
-        envelope.data = series_data(std::mem::take(&mut envelope.data.rows))?;
+        envelope.data = series_data(std::mem::take(&mut envelope.data.rows), ctx.tenant_hash)?;
     }
 
     let produced = envelope.data.rows.len();
@@ -232,7 +237,11 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Result<
 
     let fit = |mut envelope: Envelope| -> Result<Envelope, Failure> {
         let cut = if grouped {
-            fit_series(&mut envelope, ctx.budgets.max_response_bytes)?
+            fit_series(
+                &mut envelope,
+                ctx.budgets.max_response_bytes,
+                ctx.tenant_hash,
+            )?
         } else {
             SeriesCut::default()
         };
@@ -295,29 +304,34 @@ fn lookback_predicate() -> String {
 /// One row per series from the port's one row per `(series, step)`. The
 /// port emits each series' steps consecutively, so a series boundary is a
 /// change in the series cell.
-fn series_data(rows: Vec<Row>) -> Result<Data, Failure> {
+fn series_data(rows: Vec<Row>, tenant_hash: TenantHash) -> Result<Data, Failure> {
     let mut grouped: Vec<(Cell, Series)> = Vec::new();
     let mut current: Option<(Cell, Series)> = None;
     for row in rows {
         let [series, ts, value, histogram]: [Cell; 4] = row.try_into().map_err(|row: Row| {
+            // mcp-error-display-allow: formats a cell count only.
             internal(format!(
                 "the PromQL port returned a row of {} cells, not 4",
                 row.len()
             ))
         })?;
         let Cell::Timestamp(ts_ns) = ts else {
-            return Err(internal(format!(
-                "the PromQL port returned a ts_ns cell that is not a timestamp: {ts:?}"
-            )));
+            // mcp-error-display-allow: the message names the cell's variant
+            // only; the cell itself goes to the log.
+            return Err(redacted_internal(
+                &format!("{TS_NOT_TIMESTAMP} ({})", ts.kind()),
+                &format_args!("{ts:?}"),
+                tenant_hash,
+            ));
         };
         if current.as_ref().is_some_and(|(last, _)| *last != series) {
             grouped.extend(current.take());
         }
         let (_, samples) = current.get_or_insert_with(|| (series, Series::default()));
         samples.ts_ns.push(Value::String(ts_ns.to_string()));
-        samples.values.push(cell_json(&value)?);
+        samples.values.push(cell_json(&value, tenant_hash)?);
         samples.any_histogram |= histogram != Cell::Null;
-        samples.histograms.push(cell_json(&histogram)?);
+        samples.histograms.push(cell_json(&histogram, tenant_hash)?);
     }
     grouped.extend(current);
     let rows = grouped
@@ -374,6 +388,7 @@ struct SeriesCut {
 fn fit_series(
     envelope: &mut Envelope,
     requested_max_response_bytes: u64,
+    tenant_hash: TenantHash,
 ) -> Result<SeriesCut, Failure> {
     let cap = fit_cap(requested_max_response_bytes).saturating_sub(COUNTER_SLACK);
     if serialized_len(envelope) <= cap {
@@ -391,7 +406,7 @@ fn fit_series(
             envelope.data.rows.push(row);
             continue;
         }
-        let (prefix, kept) = samples_prefix(row, room)?;
+        let (prefix, kept) = samples_prefix(row, room, tenant_hash)?;
         if kept > 0 || envelope.data.rows.is_empty() {
             envelope.data.rows.push(prefix);
             cut.samples_cut = 1;
@@ -439,7 +454,7 @@ fn row_len(row: &Row) -> usize {
 /// string like every other D4 integer. A row's length only grows with the
 /// prefix (each sample adds a `ts_ns` string of at least 3 bytes, and the
 /// count loses at most one digit), so a binary search finds it.
-fn samples_prefix(row: Row, room: usize) -> Result<(Row, usize), Failure> {
+fn samples_prefix(row: Row, room: usize, tenant_hash: TenantHash) -> Result<(Row, usize), Failure> {
     let [series, samples]: [Cell; 2] = row
         .try_into()
         .map_err(|_| internal("a series row is not a label set and samples".to_string()))?;
@@ -450,9 +465,13 @@ fn samples_prefix(row: Row, room: usize) -> Result<(Row, usize), Failure> {
         .into_iter()
         .map(|(name, value)| match value {
             Value::Array(items) => Ok((name, items)),
-            other => Err(internal(format!(
-                "a series' {name} is not an array: {other}"
-            ))),
+            // mcp-error-display-allow: names the sample array this tool
+            // built and the JSON kind it found; the value goes to the log.
+            other => Err(redacted_internal(
+                &format!("a series' {name} is not an array ({})", json_kind(&other)),
+                &other,
+                tenant_hash,
+            )),
         })
         .collect::<Result<_, _>>()?;
     let total = arrays
@@ -489,9 +508,29 @@ fn samples_prefix(row: Row, room: usize) -> Result<(Row, usize), Failure> {
 
 /// A cell as the envelope serializes it, so a sample value follows the D4
 /// precision rule (`NaN`, `+Inf`, `-Inf` as strings, the sign of zero kept).
-fn cell_json(cell: &Cell) -> Result<Value, Failure> {
-    serde_json::to_value(cell)
-        .map_err(|err| internal(format!("a PromQL sample did not serialize: {err}")))
+fn cell_json(cell: &Cell, tenant_hash: TenantHash) -> Result<Value, Failure> {
+    sample_json(serde_json::to_value(cell), tenant_hash)
+}
+
+/// A serialized sample, or a fixed `internal` failure with the serializer's
+/// error logged.
+fn sample_json(
+    serialized: Result<Value, serde_json::Error>,
+    tenant_hash: TenantHash,
+) -> Result<Value, Failure> {
+    serialized.map_err(|err| redacted_internal(SAMPLE_NOT_SERIALIZED, &err, tenant_hash))
+}
+
+/// The JSON kind of a value, never the value.
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 fn column(name: &str) -> Column {
@@ -1480,5 +1519,61 @@ mod tests {
         assert_eq!(envelope.status, Status::Ok, "{envelope:?}");
         assert_eq!(envelope.data.rows, vec![vec![Cell::Float(2.0)]]);
         assert_eq!(envelope.data.row_count, 1);
+    }
+
+    /// A ts_ns cell that is not a timestamp is an internal failure whose
+    /// message names the cell's variant, never the stored value.
+    ///
+    /// FLIP: formatting the cell with `{ts:?}` into the message, as before,
+    /// puts the planted value in front of the caller.
+    #[test]
+    fn a_ts_cell_of_another_variant_names_the_variant_not_the_value() {
+        const PLANTED: &str = "planted-stored-value-c04b";
+        let key = key();
+        let ctx = test_context(&key);
+        let mut port = sample_rows(&[("a", START_NS, 1.0)]);
+        port.data.rows[0][1] = Cell::Str(PLANTED.to_string());
+        let stub = answering(vec![Ok(port)]);
+        let envelope = block_on(run(range_args(START_NS, END_NS, "30s"), &ctx, &stub));
+        let failure = failure_of(&envelope);
+        assert_eq!(failure.class, FailureClass::Internal);
+        assert_eq!(
+            failure.message,
+            "the PromQL port returned a ts_ns cell that is not a timestamp (str)"
+        );
+        assert!(!failure.message.contains(PLANTED), "{}", failure.message);
+    }
+
+    /// A sample that does not serialize is an internal failure with a fixed
+    /// message; the serializer's error, which can quote a value, stays out.
+    ///
+    /// FLIP: formatting `{err}` into the message, as before, puts the planted
+    /// value in front of the caller.
+    #[test]
+    fn a_sample_that_does_not_serialize_carries_a_fixed_message() {
+        const PLANTED: &str = "planted-serde-detail-e81c";
+        let planted = serde_json::from_value::<u8>(json!(PLANTED)).expect_err("not a u8");
+        assert!(planted.to_string().contains(PLANTED), "{planted}");
+        let failure = sample_json(Err(planted), TenantHash([0x6e; 16])).expect_err("refused");
+        assert_eq!(failure.class, FailureClass::Internal);
+        assert_eq!(failure.message, "a PromQL sample could not be serialized");
+        assert!(!failure.message.contains(PLANTED), "{}", failure.message);
+    }
+
+    /// A samples member that is not an array is an internal failure whose
+    /// message names the member and the JSON kind, never the value.
+    ///
+    /// FLIP: formatting the value with `{other}` into the message, as
+    /// before, puts the planted value in front of the caller.
+    #[test]
+    fn a_samples_member_that_is_not_an_array_names_its_kind_not_its_value() {
+        const PLANTED: &str = "planted-stored-value-2a97";
+        let mut samples = Map::new();
+        samples.insert("ts_ns".to_string(), Value::String(PLANTED.to_string()));
+        let row = vec![labels("a"), Cell::Map(samples)];
+        let failure = samples_prefix(row, 1024, TenantHash([0x2a; 16])).expect_err("refused");
+        assert_eq!(failure.class, FailureClass::Internal);
+        assert_eq!(failure.message, "a series' ts_ns is not an array (string)");
+        assert!(!failure.message.contains(PLANTED), "{}", failure.message);
     }
 }

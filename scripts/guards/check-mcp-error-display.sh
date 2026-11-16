@@ -5,22 +5,27 @@
 # Display text: it can name an object key, a corrupt value or another detail
 # the operator's log is for. The fixed sites return a fixed message and log
 # the cause at warn with the tenant hash (services/ravel-server/src/mcp/
-# envelope.rs, `log_redacted` and `redacted_internal`). This guard refuses a
-# new site that formats text into a caller-facing failure, so the rule does
-# not rest on its author knowing it.
+# envelope.rs `log_redacted` and `redacted_internal`, and crates/ravel-mcp/
+# src/envelope.rs `redacted_internal`). This guard refuses a new site that
+# formats text into a caller-facing failure, so the rule does not rest on its
+# author knowing it.
 #
 # What it refuses, outside comments and outside #[cfg(test)] test modules:
-# the argument text of a call to `d4::internal(`, `d4::failure(` (also
-# spelled `envelope::`), any `McpError::<constructor>(`, and a `json!(` that
-# has a "reason" key, when that text holds `format!`, `format_args!`,
-# `to_string` (except on a string literal, `"fixed".to_string()`), or an
-# interpolated `{error}`, `{err}` or `{e}`. The argument text runs from the
-# call's opening parenthesis to its matching close, across lines; parentheses
-# inside string and char literals do not count.
+# the argument text of a call to `internal(`, `redacted_internal(` or
+# `failure(`, unqualified or behind any path (`d4::`, `envelope::`, `self::`),
+# but not as a method (`.failure()`) and not as the tail of a longer name
+# (`sql_failure(`); any `McpError::<constructor>(`; and a `json!(` that has a
+# "reason" key; when that text holds `format!`, `format_args!`, `to_string`
+# (except on a string literal, `"fixed".to_string()`), or an interpolated
+# `{error}`, `{err}` or `{e}`. The argument text runs from the call's opening
+# parenthesis to its matching close, across lines; parentheses inside string
+# and char literals do not count.
 #
 # What it does not see: text formatted into a variable on an earlier line and
-# passed in by name, and constructors it does not list (`d4::invalid_argument`
-# carries caller-input errors by design, and a `Failure { .. }` literal).
+# passed in by name (variable indirection), a stored value passed in without
+# formatting, and constructors it does not list (`invalid_argument` and the
+# tools' `invalid(` carry caller-input errors by design, and a
+# `Failure { .. }` literal).
 #
 # Test code is out of scope: a line holding only `#[cfg(test)]`, followed
 # (past blank, comment and attribute lines) by `mod tests`, optionally with a
@@ -29,14 +34,15 @@
 #
 # Usage:
 #   scripts/guards/check-mcp-error-display.sh [--list-allowed] [path ...]
-#     default: services/ravel-server/src/mcp
+#     default: services/ravel-server/src/mcp and crates/ravel-mcp/src
 #     --list-allowed: also print each call a marker suppressed, as
 #     `file:line: allowed: ...`, for a class-closure audit.
 #
-# Exit 0 clean, 1 on findings, 2 when the scan cannot mean anything: the
-# default directory is gone, it holds no Rust sources, or the sources hold
-# none of the calls above (a move or a rename would otherwise turn this into
-# a check that passes everything). 64 on bad usage, including a named path
+# Exit 0 clean, 1 on findings, 2 when the scan cannot mean anything for any
+# one root: a default root is gone, a root holds no Rust sources, or a root's
+# sources hold none of the calls above (a move or a rename would otherwise
+# turn this into a check that passes everything). Every other root is still
+# scanned and its findings printed. 64 on bad usage, including a named path
 # that does not exist. Findings print as `file:line: error-display: ...`.
 #
 # Escape hatch, per call, on the call's first line or anywhere in the
@@ -52,14 +58,14 @@ set -uo pipefail
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "${repo_root}" || exit 1
 
-default_root="services/ravel-server/src/mcp"
+default_roots=("services/ravel-server/src/mcp" "crates/ravel-mcp/src")
 
 roots=()
 list_allowed=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h | --help)
-      sed -n '2,49p' "$0"
+      sed -n '2,55p' "$0"
       exit 0
       ;;
     --list-allowed)
@@ -76,12 +82,18 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+# worst is the exit code: 2 from any root that cannot mean anything, else 1
+# from any finding. A gone default root sets it and the rest are still scanned.
+worst=0
 if [[ ${#roots[@]} -eq 0 ]]; then
-  if [[ ! -d "${default_root}" ]]; then
-    echo "check-mcp-error-display.sh: ${default_root} is gone; point this guard at the MCP sources again (issue #4292)" >&2
-    exit 2
-  fi
-  roots=("${default_root}")
+  for root in "${default_roots[@]}"; do
+    if [[ -d "${root}" ]]; then
+      roots+=("${root}")
+    else
+      echo "check-mcp-error-display.sh: ${root} is gone; point this guard at the MCP sources again (issue #4292)" >&2
+      worst=2
+    fi
+  done
 fi
 
 for root in "${roots[@]}"; do
@@ -90,16 +102,6 @@ for root in "${roots[@]}"; do
     exit 64
   fi
 done
-
-sources=()
-while IFS= read -r -d '' file; do
-  sources+=("${file}")
-done < <(find "${roots[@]}" -type f -name '*.rs' -not -path '*/target/*' -print0 | sort -z)
-
-if [[ ${#sources[@]} -eq 0 ]]; then
-  echo "check-mcp-error-display.sh: no Rust sources under ${roots[*]}; a scan of nothing passes everything (issue #4292)" >&2
-  exit 2
-fi
 
 # The stripper turns each line into two strings of the same length, so a
 # position in one is the same position in the other (LC_ALL=C makes awk count
@@ -220,7 +222,7 @@ function close_span(   code, leak) {
   if (leak && !sp_allowed[sp]) {
     printf "%s:%d: error-display: the arguments of %s( are formatted text, which can" \
            " carry an internal error'"'"'s Display to the MCP caller; return a fixed" \
-           " message and log the cause with d4::log_redacted (issue #4292), or mark" \
+           " message and log the cause with redacted_internal (issue #4292), or mark" \
            " the call with `// %s <reason>`\n", \
            sp_file[sp], sp_line[sp], sp_name[sp], MARKER
     findings++
@@ -265,15 +267,22 @@ in_tests { next }
 
   line_allowed = has_marker(cmt) || block_marker
   n = length(CODE)
+  skip_to = 0
   for (i = 1; i <= n; i++) {
     c = substr(CODE, i, 1)
-    if ((c == "d" || c == "e" || c == "M" || c == "j") && !is_ident(substr(CODE, i - 1, 1))) {
+    # A name starts after a non-identifier character other than `.`, so a
+    # method call (`.failure()`) and a longer name (`sql_failure(`) are not
+    # anchors. The segments of a matched path are skipped, so
+    # `d4::internal(` opens one span, not a second one at `internal(`.
+    prev = substr(CODE, i - 1, 1)
+    if (i > skip_to && c ~ /^[A-Za-z]$/ && !is_ident(prev) && prev != ".") {
       rest = substr(CODE, i)
       name = ""
-      if (match(rest, /^(d4|envelope)::(internal|failure)[ \t]*\(/)) name = substr(rest, 1, RLENGTH - 1)
-      else if (match(rest, /^McpError::[a-z_]+[ \t]*\(/)) name = substr(rest, 1, RLENGTH - 1)
+      if (match(rest, /^McpError::[a-z_]+[ \t]*\(/)) name = substr(rest, 1, RLENGTH - 1)
       else if (match(rest, /^json![ \t]*\(/)) name = "json!"
+      else if (match(rest, /^([A-Za-z_][A-Za-z0-9_]*::)*(redacted_internal|internal|failure)[ \t]*\(/)) name = substr(rest, 1, RLENGTH - 1)
       if (name != "") {
+        skip_to = i + RLENGTH - 2
         sub(/[ \t]+$/, "", name)
         open_span(name, line_allowed)
       }
@@ -301,10 +310,10 @@ in_tests { next }
 END {
   close_all()
   if (anchors == 0) {
-    printf "check-mcp-error-display.sh: none of d4::internal(, d4::failure(," \
-           " McpError::<constructor>( or json!( appears in the scanned sources," \
-           " so this scan cannot refuse anything; point it at the MCP failure" \
-           " sites again (issue #4292)\n" > "/dev/stderr"
+    printf "check-mcp-error-display.sh: none of internal(, redacted_internal(," \
+           " failure(, McpError::<constructor>( or json!( appears in the sources" \
+           " under %s, so this scan cannot refuse anything there; point it at" \
+           " the MCP failure sites again (issue #4292)\n", ROOT > "/dev/stderr"
     exit 2
   }
   if (findings > 0) exit 1
@@ -312,9 +321,31 @@ END {
 }
 '
 
-LC_ALL=C awk -v LIST_ALLOWED="${list_allowed}" "${awk_prog}" "${sources[@]}"
-rc=$?
-if [[ ${rc} -eq 0 ]]; then
+# Each root is scanned on its own, so a root that has moved or lost its
+# anchors exits 2 even when another root still holds plenty.
+for root in "${roots[@]}"; do
+  sources=()
+  while IFS= read -r -d '' file; do
+    sources+=("${file}")
+  done < <(find "${root}" -type f -name '*.rs' -not -path '*/target/*' -print0 | sort -z)
+
+  rc=0
+  if [[ ${#sources[@]} -eq 0 ]]; then
+    echo "check-mcp-error-display.sh: no Rust sources under ${root}; a scan of nothing passes everything (issue #4292)" >&2
+    rc=2
+  else
+    LC_ALL=C awk -v LIST_ALLOWED="${list_allowed}" -v ROOT="${root}" "${awk_prog}" "${sources[@]}" || rc=$?
+  fi
+  if [[ ${rc} -ne 0 && ${rc} -ne 1 && ${rc} -ne 2 ]]; then
+    echo "check-mcp-error-display.sh: the scan of ${root} failed with exit ${rc}" >&2
+    rc=2
+  fi
+  if [[ ${rc} -eq 2 || (${rc} -eq 1 && ${worst} -eq 0) ]]; then
+    worst=${rc}
+  fi
+done
+
+if [[ ${worst} -eq 0 ]]; then
   echo "check-mcp-error-display.sh: no MCP failure is built from formatted error text"
 fi
-exit ${rc}
+exit ${worst}

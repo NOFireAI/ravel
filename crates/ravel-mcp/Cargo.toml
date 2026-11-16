@@ -26,6 +26,7 @@ thiserror = { workspace = true }
 blake3 = { workspace = true }
 base64 = { workspace = true }
 humantime = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 # Only the cursor tests name this: a `CommitToken`'s `writer_id` is a `Uuid`,

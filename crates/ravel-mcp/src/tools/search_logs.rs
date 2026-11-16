@@ -336,6 +336,8 @@ impl Keys {
             None if key == TRACE_ID && self.trace_id_indexed => KeyKind::TraceId,
             None => {
                 return Err((
+                    // mcp-error-display-allow: echoes the predicate key the
+                    // caller sent.
                     failure(
                         FailureClass::InvalidArgument,
                         format!(

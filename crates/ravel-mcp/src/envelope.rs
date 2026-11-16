@@ -30,6 +30,7 @@
 
 use std::borrow::Cow;
 
+use ravel_types::TenantHash;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
@@ -298,6 +299,21 @@ impl Cell {
     /// This is the only way to construct the variant.
     pub fn hex_id(id: impl Into<String>) -> Result<Cell, HexIdError> {
         Ok(Cell::HexId(HexId::new(id)?))
+    }
+
+    /// The variant's name, never its payload: what a message about a cell's
+    /// unexpected shape may tell the caller.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Cell::Null => "null",
+            Cell::Bool(_) => "bool",
+            Cell::Int(_) => "int",
+            Cell::Timestamp(_) => "timestamp",
+            Cell::Float(_) => "float",
+            Cell::HexId(_) => "hex_id",
+            Cell::Str(_) => "str",
+            Cell::Map(_) => "map",
+        }
     }
 
     fn to_value(&self) -> Value {
@@ -792,6 +808,28 @@ pub struct Failure {
     /// enforces: its error carries a message naming the counter, not the
     /// counter.
     pub counter: Option<String>,
+}
+
+/// An internal fault whose cause must not reach the caller: `client_message`
+/// under [`FailureClass::Internal`], with the cause logged once at warn beside
+/// the tenant hash. The cause can be an error or a stored value; the message
+/// names neither.
+pub fn redacted_internal(
+    client_message: &str,
+    cause: &dyn std::fmt::Display,
+    tenant_hash: TenantHash,
+) -> Failure {
+    tracing::warn!(
+        tenant = %tenant_hash.to_hex(),
+        error = %cause,
+        client_message = %client_message,
+        "mcp internal error redacted from client response",
+    );
+    Failure {
+        class: FailureClass::Internal,
+        message: client_message.to_owned(),
+        counter: None,
+    }
 }
 
 /// How `ravel_get_trace`'s logs leg ended.
