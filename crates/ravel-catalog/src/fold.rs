@@ -978,12 +978,12 @@ pub const FOLD_CATALOG_FAMILIES: [&str; 5] = [
     compat::FAMILY_KIDX,
 ];
 
-/// The highest version of `family` a fold of `signal` emits. HEAD and the
-/// metrics key-index leaf carry a version that follows their content (HEAD 2
-/// only when a part ref carries a retired hour, a metrics leaf 3 only for a
-/// posting leaf), so the highest one is what an active version has to admit;
-/// every other catalog family has one write version. `None` for a family the
-/// fold does not write.
+/// The highest version of `family` a fold of `signal` can emit. HEAD and the
+/// key-index leaf carry a version that follows their content (HEAD 2 only
+/// when a part ref carries a retired hour; a metrics leaf may carry 3, the
+/// posting leaf of ADR-4146, which no fold writes yet), so the highest one is
+/// what an active version has to be at or above; every other catalog family
+/// has one write version. `None` for a family the fold does not write.
 pub fn fold_write_version(family: &str, signal: Signal) -> Option<u16> {
     let version = match family {
         compat::FAMILY_CATALOG_HEAD => {
@@ -1004,6 +1004,30 @@ pub fn fold_write_version(family: &str, signal: Signal) -> Option<u16> {
         _ => return None,
     };
     u16::try_from(version).ok()
+}
+
+/// Every version of `family` this build reads, whichever signal wrote it.
+/// An active version outside this set is one the fold cannot honour as a
+/// ceiling. Empty for a family the fold does not write.
+pub fn fold_read_versions(family: &str) -> Vec<u16> {
+    let versions: Vec<u64> = match family {
+        compat::FAMILY_CATALOG_HEAD => HEAD_FORMAT_VERSIONS.iter().map(|v| u64::from(*v)).collect(),
+        compat::FAMILY_CSNAP => vec![u64::from(snapshot_format::VERSION)],
+        compat::FAMILY_NPOST => vec![u64::from(snapshot_format::POSTINGS_VERSION)],
+        compat::FAMILY_CSTAT => snapshot_format::COLUMN_STATS_ACCEPTED_READ_VERSIONS
+            .iter()
+            .map(|v| u64::from(*v))
+            .collect(),
+        compat::FAMILY_KIDX => snapshot_format::KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN
+            .iter()
+            .map(|v| u64::from(*v))
+            .collect(),
+        _ => Vec::new(),
+    };
+    versions
+        .into_iter()
+        .filter_map(|v| u16::try_from(v).ok())
+        .collect()
 }
 
 /// Why a fold refused its cycle under the installed `sys/compat` write
@@ -1032,15 +1056,17 @@ impl Catalog {
         self.compat_policy.as_ref()
     }
 
-    /// The version each catalog family is written at by a fold of `signal` at
-    /// `now_ns`, or the first family the installed policy refuses. With no
-    /// policy installed every family is at [`fold_write_version`].
+    /// The highest version of each catalog family a fold of `signal` emits,
+    /// [`fold_write_version`], once the installed policy admits it, or the
+    /// first family the policy refuses.
     ///
-    /// The fold writes one version per family (the highest its content can
-    /// need, for HEAD and the metrics key-index leaf), so the policy has to
-    /// name exactly that version: an active version this build does not
-    /// write, a stale view, or a missing record refuses the whole cycle before
-    /// anything is written.
+    /// The active version is a ceiling: the fold writes what its content
+    /// needs, at or below it. The check is made before the fold reads
+    /// anything, so it is against the highest version the signal's fold can
+    /// emit, not the one this cycle's content needs. It refuses the whole
+    /// cycle, writing nothing, when that version is above the active one,
+    /// when the active version is not one this build reads
+    /// ([`fold_read_versions`]), on a stale view or on a missing record.
     pub fn fold_compat_versions(
         &self,
         signal: Signal,
@@ -1051,17 +1077,19 @@ impl Catalog {
             let Some(written) = fold_write_version(family, signal) else {
                 continue;
             };
-            let version = match &self.compat_policy {
-                None => written,
-                Some(view) => view
-                    .write_policy(now_ns, family, &[written], written, None)
+            if let Some(view) = &self.compat_policy {
+                let ceilings: Vec<u16> = fold_read_versions(family)
+                    .into_iter()
+                    .filter(|v| *v >= written)
+                    .collect();
+                view.write_policy(now_ns, family, &ceilings, written, None)
                     .map_err(|refusal| FoldCompatRefusal {
                         family,
                         signal,
                         refusal,
-                    })?,
-            };
-            versions.push((family, version));
+                    })?;
+            }
+            versions.push((family, written));
         }
         Ok(versions)
     }
@@ -11183,6 +11211,216 @@ pub(crate) mod tests {
         assert!(second.no_op);
         assert_eq!(second.watermark_hour, Some(10));
         assert_eq!(second.put_requests, 0);
+    }
+
+    /// The catalog families as a baseline `sys/compat` names them: HEAD 2,
+    /// the key-index leaf 3, every other family at its one write version.
+    const BASELINE_CATALOG_VERSIONS: [(&str, u32); 5] = [
+        (compat::FAMILY_CATALOG_HEAD, 2),
+        (compat::FAMILY_CSNAP, 1),
+        (compat::FAMILY_NPOST, 1),
+        (compat::FAMILY_CSTAT, 3),
+        (compat::FAMILY_KIDX, 3),
+    ];
+
+    /// A refreshed view over `store`, after creating a `sys/compat` naming
+    /// each `(family, version)` when `families` is `Some`.
+    async fn refreshed_compat_view(
+        store: Arc<MemoryStore>,
+        now: i64,
+        families: Option<&[(&str, u32)]>,
+    ) -> compat::CompatView {
+        let keys = compat::CompatKeys::from_file_keys(&[[9; 32]]).expect("one key");
+        if let Some(families) = families {
+            compat::create_compat(
+                store.as_ref(),
+                &keys,
+                ravel_proto::sys::v1::CompatRecord {
+                    families: families
+                        .iter()
+                        .map(|(family, version)| ravel_proto::sys::v1::CompatFamily {
+                            family: (*family).to_string(),
+                            active_write_version: *version,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create sys/compat");
+        }
+        let view = compat::CompatView::new(store, keys, Arc::new(FixedCompatClock(now)));
+        view.refresh().await.expect("refresh");
+        view
+    }
+
+    /// The policy each ceiling case folds under: none, a view over an absent
+    /// record, or a view over a record naming these versions.
+    #[derive(Clone, Copy)]
+    enum FoldPolicy<'a> {
+        NotInstalled,
+        AbsentRecord,
+        Record(&'a [(&'a str, u32)]),
+    }
+
+    /// Fold one key-index fixture of `signal` into a fresh store under
+    /// `policy`, with a fixed folder id, and return the fold's outcome and
+    /// every `(key, bytes)` under the tenant afterwards. The fixture builds
+    /// one version-2 leaf: a metrics label leaf, a logs `user_id` leaf or a
+    /// spans `trace_id` leaf.
+    async fn fold_kidx_fixture(
+        signal: Signal,
+        policy: FoldPolicy<'_>,
+    ) -> (
+        Result<(), FoldCompatRefusal>,
+        Result<FoldReport, CatalogError>,
+        Vec<(String, Bytes)>,
+    ) {
+        let store = Arc::new(MemoryStore::new());
+        let config = match signal {
+            Signal::Metrics => {
+                publish_label_fixture(store.as_ref()).await;
+                metrics_kidx_config()
+            }
+            Signal::Logs => {
+                declare_user_id_key_index(store.as_ref()).await;
+                publish_user_id_logs(store.as_ref(), 1, KIDX_HOUR, &[10, 10, 20], 2, 0, true).await;
+                publish_user_id_logs(store.as_ref(), 2, KIDX_HOUR, &[50, 10], 2, 0, true).await;
+                kidx_config()
+            }
+            _ => {
+                publish_trace_spans(store.as_ref(), 1, &[[0x11; 16], [0x22; 16]]).await;
+                publish_trace_spans(store.as_ref(), 2, &[[0x11; 16]]).await;
+                kidx_config()
+            }
+        };
+        let now = now_at_seal(KIDX_HOUR);
+        let view = match policy {
+            FoldPolicy::NotInstalled => None,
+            FoldPolicy::AbsentRecord => Some(refreshed_compat_view(store.clone(), now, None).await),
+            FoldPolicy::Record(families) => {
+                Some(refreshed_compat_view(store.clone(), now, Some(families)).await)
+            }
+        };
+        let catalog = Catalog::new(store.clone(), config)
+            .expect("catalog")
+            .with_compat_policy(view);
+        let gate = catalog.fold_compat_versions(signal, now).map(|_| ());
+        let report = catalog
+            .fold(&tenant(), signal, Uuid::from_u128(0xf01d), now, &[], None)
+            .await;
+        let mut objects = Vec::new();
+        for key in list_all_keys(store.as_ref(), &format!("t/{}/", tenant().to_hex())).await {
+            let data = store.get(&key, GetRange::Full).await.expect("get").data;
+            objects.push((key, data));
+        }
+        (gate, report, objects)
+    }
+
+    /// The header version of every `.kidx` leaf in `objects`.
+    fn leaf_versions(objects: &[(String, Bytes)]) -> Vec<u32> {
+        objects
+            .iter()
+            .filter(|(key, _)| key.ends_with(".kidx"))
+            .map(|(_, data)| {
+                snapshot_format::key_index_leaf_format_version(data).expect("leaf version")
+            })
+            .collect()
+    }
+
+    /// The active version is a ceiling (ADR-4233 decision 3). Under a
+    /// baseline record (HEAD 2, kidx 3), and under a view over an absent
+    /// record, a fold of each signal writes byte-for-byte what it writes with
+    /// no policy installed, its version-2 leaf included, below the kidx
+    /// ceiling of 3. A gate that required kidx at exactly the highest version
+    /// the signal can emit refuses logs and spans here.
+    #[tokio::test]
+    async fn a_baseline_record_and_an_absent_one_fold_every_signal_unchanged() {
+        for signal in [Signal::Metrics, Signal::Logs, Signal::Spans] {
+            let (gate, report, unpoliced) =
+                fold_kidx_fixture(signal, FoldPolicy::NotInstalled).await;
+            gate.expect("no policy never refuses");
+            let report = report.expect("fold with no policy");
+            assert_eq!(report.key_index_leaves_written, 1, "{signal:?}: {report:?}");
+            assert_eq!(leaf_versions(&unpoliced), vec![2], "{signal:?}");
+            for policy in [
+                FoldPolicy::Record(&BASELINE_CATALOG_VERSIONS),
+                FoldPolicy::AbsentRecord,
+            ] {
+                let (gate, report, objects) = fold_kidx_fixture(signal, policy).await;
+                gate.unwrap_or_else(|refusal| panic!("{signal:?}: {refusal}"));
+                report.unwrap_or_else(|err| panic!("{signal:?}: {err}"));
+                assert_eq!(
+                    objects, unpoliced,
+                    "{signal:?}: the policy changed the bytes"
+                );
+            }
+        }
+    }
+
+    /// kidx active at 2 is below 3, the highest leaf version a metrics fold
+    /// can emit ([`fold_write_version`]): the gate runs before the fold reads
+    /// its content, so the metrics cycle is refused, typed and writing
+    /// nothing. Logs and spans, whose leaves go no higher than 2, fold exactly
+    /// as with no policy. kidx active at a version this build does not read
+    /// refuses every signal.
+    #[tokio::test]
+    async fn kidx_active_at_2_refuses_a_metrics_fold_and_folds_logs_and_spans() {
+        let mut at_two = BASELINE_CATALOG_VERSIONS;
+        at_two[4] = (compat::FAMILY_KIDX, 2);
+        let (gate, report, objects) =
+            fold_kidx_fixture(Signal::Metrics, FoldPolicy::Record(&at_two)).await;
+        let refusal = gate.expect_err("metrics needs leaf 3");
+        assert_eq!(refusal.family, compat::FAMILY_KIDX);
+        assert_eq!(
+            refusal.refusal,
+            compat::CompatRefusal::ActiveVersionNotWritable {
+                family: compat::FAMILY_KIDX.to_string(),
+                active: 2,
+                writable: vec![3],
+            }
+        );
+        assert!(
+            matches!(report, Err(CatalogError::InvalidConfig(_))),
+            "{report:?}"
+        );
+        let (_, _, unfolded) = fold_kidx_fixture(Signal::Metrics, FoldPolicy::NotInstalled).await;
+        let published: Vec<&String> = unfolded
+            .iter()
+            .map(|(key, _)| key)
+            .filter(|key| !key.contains("/catalog/"))
+            .collect();
+        assert_eq!(
+            objects.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            published,
+            "a refused fold writes no catalog object"
+        );
+
+        for signal in [Signal::Logs, Signal::Spans] {
+            let (_, _, unpoliced) = fold_kidx_fixture(signal, FoldPolicy::NotInstalled).await;
+            let (gate, report, objects) =
+                fold_kidx_fixture(signal, FoldPolicy::Record(&at_two)).await;
+            gate.unwrap_or_else(|refusal| panic!("{signal:?}: {refusal}"));
+            report.unwrap_or_else(|err| panic!("{signal:?}: {err}"));
+            assert_eq!(objects, unpoliced, "{signal:?}");
+            assert_eq!(leaf_versions(&objects), vec![2], "{signal:?}");
+        }
+
+        let mut unknown = BASELINE_CATALOG_VERSIONS;
+        unknown[4] = (compat::FAMILY_KIDX, 4);
+        for signal in [Signal::Metrics, Signal::Logs, Signal::Spans] {
+            let (gate, report, _) = fold_kidx_fixture(signal, FoldPolicy::Record(&unknown)).await;
+            let refusal = gate.expect_err("kidx 4 is not read");
+            assert!(
+                matches!(
+                    refusal.refusal,
+                    compat::CompatRefusal::ActiveVersionNotWritable { active: 4, .. }
+                ),
+                "{signal:?}: {refusal}"
+            );
+            assert!(report.is_err(), "{signal:?}");
+        }
     }
 
     struct FixedCompatClock(i64);

@@ -1836,7 +1836,8 @@ impl AlertEvaluator {
             crate::compat::refresh_once(view).await;
             if existing.compat_epoch > view.seen_epoch() {
                 anyhow::bail!(
-                    "the alert lease carries compat_epoch {}, above this process's sys/compat                      view at {} after a refresh; not acting on the lease this tick",
+                    "the alert lease carries compat_epoch {}, above this process's sys/compat \
+                     view at {} after a refresh; not acting on the lease this tick",
                     existing.compat_epoch,
                     view.seen_epoch()
                 );
@@ -1871,7 +1872,8 @@ impl AlertEvaluator {
                         Ok(_) => tracing::warn!(
                             tenant = %self.tenant.to_hex(),
                             %refusal,
-                            "alert evaluation: this build cannot write the active rlog version;                              handed the alert lease back parked so a capable evaluator takes over"
+                            "alert evaluation: this build cannot write the active rlog version; \
+                             handed the alert lease back parked so a capable evaluator takes over"
                         ),
                         Err(StoreError::PreconditionFailed) => {}
                         Err(err) => return Err(err.into()),

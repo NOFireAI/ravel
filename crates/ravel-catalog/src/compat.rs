@@ -609,7 +609,10 @@ pub trait CompatClock: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CompatRefusal {
     /// The last successful read of `sys/compat` is at least
-    /// [`COMPAT_VIEW_HORIZON`] old, or there has been none.
+    /// [`COMPAT_VIEW_HORIZON`] old, or there has been none, and an activation
+    /// is in evidence: this view has seen a record, or the bucket being
+    /// written carries a `compat_epoch`. Without that evidence a view that
+    /// cannot read the record answers the baseline (ADR-4233 decision 1).
     #[error(
         "{COMPAT_KEY} view is stale: last successful read {last_read_unix_ns:?}, now {now_unix_ns}"
     )]
@@ -685,6 +688,9 @@ struct ViewState {
     /// A read that started earlier never replaces them.
     merged_ticket: Option<u64>,
     present: bool,
+    /// Whether any GET of `sys/compat` in this run returned an object, read
+    /// or not: a decoded record, or one this build refused to decode.
+    record_seen: bool,
     last_record: Option<sysproto::CompatRecord>,
     seen_epoch: u64,
     families: BTreeMap<String, SeenFamily>,
@@ -700,6 +706,7 @@ impl ViewState {
         let mut rolled_back = Vec::new();
         let read_epoch = record.as_ref().map(|r| r.compat_epoch);
         if let Some(record) = &record {
+            self.record_seen = true;
             self.seen_epoch = self.seen_epoch.max(record.compat_epoch);
             for f in &record.families {
                 let read_cert = f.certificate.clone();
@@ -791,8 +798,11 @@ impl std::fmt::Debug for CompatView {
 }
 
 impl CompatView {
-    /// A view that has read nothing yet; every `write_policy` answer is
-    /// [`CompatRefusal::ViewStale`] until the first successful refresh.
+    /// A view that has read nothing yet. Until a refresh finds a record,
+    /// `write_policy` answers as for an absent one: the baseline, or, on a
+    /// bucket whose provisioning record carries a `compat_epoch`,
+    /// [`CompatRefusal::ViewStale`] before the first successful read and
+    /// [`CompatRefusal::CompatRecordMissing`] after it.
     pub fn new(
         store: Arc<dyn ObjectStoreBackend>,
         keys: CompatKeys,
@@ -811,13 +821,23 @@ impl CompatView {
 
     /// Read `sys/compat` and merge it in. The read is stamped with the clock
     /// before the GET, so staleness is never understated. A failed read
-    /// changes nothing: the view keeps its last successful read and its age.
+    /// keeps the last successful read and its age. One that failed after the
+    /// GET returned an object (a newer, unauthenticated or corrupt record)
+    /// still marks a record as seen, so the view refuses once it goes stale.
     /// Overlapping refreshes merge every monotone value they read, but the
     /// record and its presence come from the read that started last.
     pub async fn refresh(&self) -> Result<CompatRefresh, CompatError> {
         let ticket = self.inner.next_ticket.fetch_add(1, AtomicOrdering::SeqCst);
         let started = self.inner.clock.now_unix_ns();
-        let read = read_compat(self.inner.store.as_ref(), &self.inner.keys).await?;
+        let read = match read_compat(self.inner.store.as_ref(), &self.inner.keys).await {
+            Ok(read) => read,
+            Err(err) => {
+                if !matches!(err, CompatError::Store { .. }) {
+                    self.inner.state.write().record_seen = true;
+                }
+                return Err(err);
+            }
+        };
         let mut state = self.inner.state.write();
         Ok(state.merge(read.map(|(record, _)| record), ticket, started))
     }
@@ -827,6 +847,12 @@ impl CompatView {
     /// used when the record is absent or has no entry for the family;
     /// `bucket` is the provisioning record of the bucket being written, if
     /// any, whose `compat_epoch` is evidence that an activation happened.
+    ///
+    /// A view past [`COMPAT_VIEW_HORIZON`] refuses with
+    /// [`CompatRefusal::ViewStale`] only once it has seen a record or the
+    /// bucket carries a `compat_epoch`. Before that, a read that keeps
+    /// failing (an `AccessDenied` from a credential without the grant
+    /// included) leaves a never-activated store at its baseline.
     pub fn write_policy(
         &self,
         now_unix_ns: i64,
@@ -839,13 +865,13 @@ impl CompatView {
         let fresh = state
             .last_read_unix_ns
             .is_some_and(|last| now_unix_ns.saturating_sub(last) < COMPAT_VIEW_HORIZON_NS);
-        if !fresh {
+        let bucket_compat_epoch = bucket.map_or(0, |b| b.compat_epoch);
+        if !fresh && (state.record_seen || bucket_compat_epoch > 0) {
             return Err(CompatRefusal::ViewStale {
                 last_read_unix_ns: state.last_read_unix_ns,
                 now_unix_ns,
             });
         }
-        let bucket_compat_epoch = bucket.map_or(0, |b| b.compat_epoch);
         if !state.present && (bucket_compat_epoch > 0 || state.seen_epoch > 0) {
             return Err(CompatRefusal::CompatRecordMissing {
                 bucket_compat_epoch,
@@ -879,6 +905,11 @@ impl CompatView {
     /// The record as last read, `None` if it was absent or never read.
     pub fn last_record(&self) -> Option<sysproto::CompatRecord> {
         self.inner.state.read().last_record.clone()
+    }
+
+    /// Whether any refresh in this run found an object at `sys/compat`.
+    pub fn record_seen(&self) -> bool {
+        self.inner.state.read().record_seen
     }
 
     /// When the last successful read started.
@@ -1009,9 +1040,15 @@ mod tests {
         let clock = ManualClock::at(T0);
         let view = view(store.clone(), clock.clone());
 
-        // Never read: stale.
+        // Never read and no record seen: the baseline, unless the bucket
+        // carries a compat_epoch.
+        assert_eq!(view.write_policy(T0, FAMILY_RSEG, &[5, 6], 5, None), Ok(5));
+        let fenced = sysproto::ProvisioningRecord {
+            compat_epoch: 1,
+            ..Default::default()
+        };
         assert!(matches!(
-            view.write_policy(T0, FAMILY_RSEG, &[5, 6], 5, None),
+            view.write_policy(T0, FAMILY_RSEG, &[5, 6], 5, Some(&fenced)),
             Err(CompatRefusal::ViewStale {
                 last_read_unix_ns: None,
                 ..
@@ -1095,6 +1132,155 @@ mod tests {
             view.write_policy(T0 + COMPAT_VIEW_HORIZON_NS, FAMILY_RSEG, &[7], 7, None),
             Err(CompatRefusal::ViewStale { .. })
         ));
+    }
+
+    /// Answers every `get` of `sys/compat` with `AccessDenied` while `deny`
+    /// is set, as AWS S3 does for a credential without the GET grant or, on an
+    /// absent key, without a list grant covering it.
+    struct DeniedCompatGet {
+        inner: MemoryStore,
+        deny: std::sync::atomic::AtomicBool,
+        denied: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DeniedCompatGet {
+        fn new(deny: bool) -> Arc<Self> {
+            Arc::new(DeniedCompatGet {
+                inner: MemoryStore::new(),
+                deny: std::sync::atomic::AtomicBool::new(deny),
+                denied: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for DeniedCompatGet {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            if key == COMPAT_KEY && self.deny.load(Ordering::SeqCst) {
+                self.denied.fetch_add(1, Ordering::SeqCst);
+                return Err(StoreError::AccessDenied("no s3:GetObject".to_string()));
+            }
+            self.inner.get(key, range).await
+        }
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A never-activated store whose `sys/compat` reads are refused with
+    /// `AccessDenied` from the start: no record is ever seen, so the view
+    /// answers the baseline at and past the horizon, and refuses only a bucket
+    /// whose provisioning record carries a `compat_epoch`.
+    #[tokio::test]
+    async fn access_denied_on_a_never_activated_store_answers_the_baseline() {
+        let denied = DeniedCompatGet::new(true);
+        let store: Arc<dyn ObjectStoreBackend> = denied.clone();
+        let clock = ManualClock::at(T0);
+        let view = view(store, clock.clone());
+        for at in [
+            T0,
+            T0 + COMPAT_VIEW_HORIZON_NS,
+            T0 + 3 * COMPAT_VIEW_HORIZON_NS,
+        ] {
+            clock.set(at);
+            let err = view.refresh().await.expect_err("denied");
+            assert!(
+                matches!(
+                    err,
+                    CompatError::Store {
+                        source: StoreError::AccessDenied(_),
+                        ..
+                    }
+                ),
+                "got: {err}"
+            );
+            assert_eq!(view.write_policy(at, FAMILY_RSEG, &[7], 7, None), Ok(7));
+        }
+        assert_eq!(denied.denied.load(Ordering::SeqCst), 3);
+        assert!(!view.record_seen());
+        assert_eq!(view.last_read_unix_ns(), None);
+        let fenced = sysproto::ProvisioningRecord {
+            compat_epoch: 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            view.write_policy(T0, FAMILY_RSEG, &[7], 7, Some(&fenced)),
+            Err(CompatRefusal::ViewStale {
+                last_read_unix_ns: None,
+                ..
+            })
+        ));
+    }
+
+    /// Once a record has been read, the same `AccessDenied` refusals leave
+    /// the view at its last read until the horizon, and refuse from there.
+    #[tokio::test]
+    async fn access_denied_after_a_seen_record_refuses_past_the_horizon() {
+        let denied = DeniedCompatGet::new(false);
+        let store: Arc<dyn ObjectStoreBackend> = denied.clone();
+        create_compat(store.as_ref(), &keys(), baseline_record())
+            .await
+            .expect("create");
+        let clock = ManualClock::at(T0);
+        let view = view(store, clock.clone());
+        view.refresh().await.expect("first refresh");
+        assert!(view.record_seen());
+        denied.deny.store(true, Ordering::SeqCst);
+        clock.set(T0 + COMPAT_VIEW_HORIZON_NS - 1);
+        view.refresh().await.expect_err("denied");
+        assert_eq!(
+            view.write_policy(T0 + COMPAT_VIEW_HORIZON_NS - 1, FAMILY_RSEG, &[7], 7, None),
+            Ok(7)
+        );
+        clock.set(T0 + COMPAT_VIEW_HORIZON_NS);
+        view.refresh().await.expect_err("denied");
+        assert_eq!(denied.denied.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            view.write_policy(T0 + COMPAT_VIEW_HORIZON_NS, FAMILY_RSEG, &[7], 7, None),
+            Err(CompatRefusal::ViewStale {
+                last_read_unix_ns: Some(T0),
+                now_unix_ns: T0 + COMPAT_VIEW_HORIZON_NS,
+            })
+        );
     }
 
     /// Holds the first `get` of `sys/compat` after the wrapped read returned,
@@ -1277,6 +1463,7 @@ mod tests {
         let view = view(store.clone(), ManualClock::at(T0));
         let err = view.refresh().await.expect_err("refresh refuses");
         assert!(newer_err(&err), "got: {err}");
+        assert!(view.record_seen(), "a newer record is a record seen");
         assert!(matches!(
             view.write_policy(T0, FAMILY_RSEG, &[7], 7, None),
             Err(CompatRefusal::ViewStale { .. })

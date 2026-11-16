@@ -5570,13 +5570,6 @@ fn render_auth_subject_family(
     }
 }
 
-/// The durable-auth refresh-loop counter family (ADR-0066 decision 6). Every
-/// sample carries only `{mode}` (the ADR-0044 allowlist): the loop is
-/// process-wide, one cached `sys/auth` map per deployment key, with no
-/// per-tenant or per-signal breakdown to render. The same mode-only shape as
-/// [`render_catalog_family`] and [`render_store_probe_family`] above. Rendered
-/// only when a `DurableAuthState` exists, so a process with no keyed deployment
-/// omits the whole family rather than exporting three permanent zeros.
 /// What `/metrics` renders of this process's `sys/compat` view (ADR-4233
 /// decision 3), read at scrape time.
 #[derive(Debug, Clone, PartialEq)]
@@ -5720,6 +5713,13 @@ pub(crate) fn render_compat_family(out: &mut String, mode: Mode, snapshot: &Comp
     }
 }
 
+/// The durable-auth refresh-loop counter family (ADR-0066 decision 6). Every
+/// sample carries only `{mode}` (the ADR-0044 allowlist): the loop is
+/// process-wide, one cached `sys/auth` map per deployment key, with no
+/// per-tenant or per-signal breakdown to render. The same mode-only shape as
+/// [`render_catalog_family`] and [`render_store_probe_family`] above. Rendered
+/// only when a `DurableAuthState` exists, so a process with no keyed deployment
+/// omits the whole family rather than exporting three permanent zeros.
 fn render_durable_auth_family(
     out: &mut String,
     mode: Mode,
