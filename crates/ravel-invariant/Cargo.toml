@@ -1,0 +1,36 @@
+[package]
+name = "ravel-invariant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Assertion and mutant macros that carry the TLA+ invariants into the binaries as Antithesis properties (ADR-4326)."
+
+[dependencies]
+# The Antithesis SDK, linked only by the off-by-default `antithesis` feature,
+# which no published build enables (scripts/guards/check-release-profile.sh).
+# The workspace's one pin of it: ravel-server reaches it through this crate.
+antithesis_sdk = { version = "0.4", optional = true }
+
+[features]
+# Each assertion macro calls the Antithesis SDK at its site, and `init`
+# registers the assertion catalog. Only the Antithesis workload images build it.
+antithesis = ["dep:antithesis_sdk"]
+
+# Each assertion macro records its evaluation in this process (`capture`
+# module), so crate tests can show a site holding and a mutant breaking it. No
+# SDK. The `invariants` lane in scripts/gates.sh turns it on.
+capture = []
+
+# Compiles every `inv_mutant!` switch in. `init` reads RAVEL_ANTITHESIS_MUTANT
+# and refuses a name the `mutant::MUTANTS` list does not hold. Only the
+# `<workload>-mutants` images and the `invariants` lane build it.
+antithesis-mutants = []
+
+[dev-dependencies]
+# The details argument the SDK takes is a `serde_json::Value`; the tests pass
+# one so they also compile with every feature on.
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
