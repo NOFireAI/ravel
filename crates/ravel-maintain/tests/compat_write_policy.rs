@@ -38,6 +38,7 @@ use ravel_maintain::{
     compat_publish_refused_total, erasure_rewrite_bucket, maintain_bucket,
     pending_erasure_requests, read,
 };
+use ravel_maintain::{MigrateBudget, MigrateHeldBucket, MigrateHoldReason, migrate_family};
 use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
@@ -625,8 +626,12 @@ fn with_unknown_section(obj: &[u8]) -> Vec<u8> {
 }
 
 /// Seed the bucket's second input with an unknown section kind spliced in,
-/// its commit record naming the spliced bytes. Returns the data key.
-async fn seed_input_with_unknown_section(store: &dyn ObjectStoreBackend) -> String {
+/// its commit record naming the spliced bytes and stamped at
+/// `recorded_version`. Returns the data key.
+async fn seed_input_with_unknown_section(
+    store: &dyn ObjectStoreBackend,
+    recorded_version: u32,
+) -> String {
     let spec = InputSpec::new(
         Uuid::from_u128(2),
         10,
@@ -671,7 +676,7 @@ async fn seed_input_with_unknown_section(store: &dyn ObjectStoreBackend) -> Stri
         max_event_ts_ns: written.summary.max_event_ts_ns,
         min_ingest_ts_ns: spec.created_unix_ns,
         max_ingest_ts_ns: spec.created_unix_ns,
-        segment_format_version: u32::from(VERSION_V7),
+        segment_format_version: recorded_version,
         created_unix_ns: spec.created_unix_ns,
         ingest_hour_bucket: spec.hour,
     })
@@ -709,7 +714,7 @@ async fn an_unknown_section_kind_holds_the_bucket_in_compaction() {
         ),
     )
     .await;
-    seed_input_with_unknown_section(&store).await;
+    seed_input_with_unknown_section(&store, u32::from(VERSION_V7)).await;
     let before = snapshot(&store).await;
     let held = buckets_held_unknown_section_total();
 
@@ -732,6 +737,63 @@ async fn an_unknown_section_kind_holds_the_bucket_in_compaction() {
     let after = snapshot(&store).await;
     assert_eq!(l1_keys(&after), Vec::<&str>::new(), "no part is written");
     assert_eq!(after, before, "nothing is written");
+}
+
+/// H6 in `migrate`: the walk holds a bucket whose below-target input carries
+/// an unknown section kind, writes nothing for it, and raises no floor.
+#[tokio::test]
+async fn an_unknown_section_kind_holds_the_bucket_in_migrate() {
+    let store = MemoryStore::new();
+    provision(&store).await;
+    let data_key = seed_input_with_unknown_section(&store, u32::from(VERSION_V7) - 1).await;
+    let before = snapshot(&store).await;
+
+    let err = migrate_family(
+        &store,
+        &FixedClock::new(sealed_now_ns()),
+        &CompactorConfig::default(),
+        tenant_hash(),
+        ravel_types::Signal::Metrics,
+        FAMILY_RSEG,
+        u32::from(VERSION_V7),
+        8,
+        MigrateBudget::unlimited(),
+        "test",
+    )
+    .await
+    .expect_err("held");
+
+    let MaintainError::MigrateHeld { held, report } = err else {
+        panic!("expected MigrateHeld, got {err:?}");
+    };
+    assert_eq!(
+        held,
+        vec![MigrateHeldBucket {
+            shard: SHARD,
+            ingest_hour: HOUR,
+            reason: MigrateHoldReason::InputOutOfWindow {
+                object_key: data_key,
+                version: VERSION_V7,
+            },
+        }]
+    );
+    assert_eq!(report.buckets_migrated, 0, "{report:?}");
+    let after = snapshot(&store).await;
+    assert_eq!(l1_keys(&after), Vec::<&str>::new(), "no part is written");
+    let floor = ravel_catalog::current_floor_from_store(
+        &store,
+        &tenant_hash(),
+        ravel_types::Signal::Metrics,
+        FAMILY_RSEG,
+    )
+    .await
+    .expect("floor");
+    assert_eq!(floor, None, "a held walk raises no floor");
+    let written: Vec<_> = after.iter().filter(|o| !before.contains(o)).collect();
+    assert!(
+        written.iter().all(|(k, _)| k.contains("/sys/")),
+        "only the walk's own cursor state may be written: {written:?}"
+    );
 }
 
 /// A bucket compacted without a policy whose one record is then stamped one
