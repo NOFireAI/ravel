@@ -1518,7 +1518,19 @@ use std::fmt;
 fn helper() {
     let _ = inv_mutant!("enr/cfg-test-fn");
 }
+#[cfg(test)]
+fn wide(
+    a: u8,
+) {
+    let _ = inv_mutant!("enr/cfg-test-multiline");
+}
+#[cfg(test)]
+const WIDE: &[&str] = &[
+    "x",
+];
 fn live() {
+    let x = 1; /* if inv_mutant!("enr/midline-block") {}
+       if inv_mutant!("enr/midline-block-body") {} */
     if inv_mutant!("enr/after-cfg-use") {}
     *slot_ref() = 1; if inv_mutant!("enr/after-deref") {}
 }
@@ -1543,7 +1555,7 @@ tsv_mutant not-driver
 expect_trace ax2 enr fail "mutant 'enr/not-driver' not found as inv_mutant!(\"enr/not-driver\") in Rust"
 
 echo "--- (ay) traceability: a commented-out, cfg(test) or tests/ mutant literal does not count"
-for m in line-comment block-comment block-body block-bare cfg-test cfg-test-fn tests-dir; do
+for m in line-comment block-comment block-body block-bare midline-block midline-block-body cfg-test cfg-test-fn cfg-test-multiline tests-dir; do
     tsv_mutant "$m"
     expect_trace "ay-$m" enr fail "mutant 'enr/$m' not found as inv_mutant!(\"enr/$m\") in Rust"
 done
