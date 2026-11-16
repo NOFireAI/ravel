@@ -3306,9 +3306,9 @@ pub(crate) mod tests {
         let store = mem();
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let mut record = build_record(&tenant(), Signal::Metrics, 4, 1_000, None);
-        // A version past the supported read set (4, above PROVISIONING_MAX_READ_VERSION
-        // = 3). Versions 2 and 3 are inside the read set and are accepted on the
-        // read path (see reader_accepts_versions_one_to_three_and_refuses_zero_and_four).
+        // A version past the supported read set (5, above PROVISIONING_MAX_READ_VERSION
+        // = 4). Versions 1 to 4 are inside the read set and are accepted on the
+        // read path (see reader_accepts_versions_one_to_four_and_refuses_zero_and_five).
         record.format_version = PROVISIONING_MAX_READ_VERSION + 1;
         store
             .put(&key, record.encode_to_vec().into(), PutOptions::default())
@@ -4264,10 +4264,10 @@ pub(crate) mod tests {
     }
 
     /// [`read_generations_checked`] refuses a record past the supported read set
-    /// (version 4, above PROVISIONING_MAX_READ_VERSION) before ever trusting its
-    /// generation history, matching the guard [`validate_record`] applies on the
-    /// [`validate_or_adopt`] path. Versions 2 and 3 are inside the set and are
-    /// accepted (see reader_accepts_versions_one_to_three_and_refuses_zero_and_four).
+    /// (version 5, above PROVISIONING_MAX_READ_VERSION = 4) before ever trusting
+    /// its generation history, matching the guard [`validate_record`] applies on
+    /// the [`validate_or_adopt`] path. Versions 1 to 4 are inside the set and are
+    /// accepted (see reader_accepts_versions_one_to_four_and_refuses_zero_and_five).
     #[test]
     fn read_generations_checked_rejects_future_format_version() {
         let record = sysproto::ProvisioningRecord {
