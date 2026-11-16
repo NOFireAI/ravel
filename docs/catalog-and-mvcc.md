@@ -2515,10 +2515,14 @@ payload` (bytes 0..6 followed by everything from byte 10 onward): the crc
 field itself is excluded, same as any self-describing checksum has to
 exclude its own bytes. Folding the header into the checksum means a
 corrupted `magic` or `version` byte is caught here rather than surfacing
-later as a misdecode under a future version's body layout. A checksum
-mismatch, truncation, bad magic, or malformed payload are all typed decode
-errors; the caller treats every one of them as a marker miss (fail-open to
-at-least-once, ADR-0051 §5), never a panic.
+later as a misdecode under a future version's body layout. Bytes 0..10 and
+the checksum coverage are the same at every marker version, so the decoder
+verifies the checksum before it reads the version: a flipped version byte is a
+checksum mismatch, and only a checksum-valid marker whose version is above the
+one the build reads refuses the lookup as a newer marker (ADR-4233 decision
+4). A checksum mismatch, truncation, bad magic, or malformed payload are all
+typed decode errors; the caller treats every one of them as a marker miss
+(fail-open to at-least-once, ADR-0051 §5), never a panic.
 
 ## Pinned flush identity
 

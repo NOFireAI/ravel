@@ -34,8 +34,8 @@ use ravel_commit::rng::RngSource;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_proto::commit::v1::CommitRecord;
 use ravel_segment::{
-    ExemplarInput, HistogramSample, IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3,
-    SeriesValues,
+    ExemplarInput, HistogramSample, IngestBounds, SegmentIdentity, SegmentVersion, SegmentWriter,
+    SeriesInputV3, SeriesValues,
 };
 use ravel_types::{
     CommitToken, ExemplarCap, Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId,
@@ -48,6 +48,7 @@ use uuid::Uuid;
 
 use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
+use crate::compat::{CompatPublishRefusal, PublishGrant, PutAbort, warn_publish_refused};
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LagCheck, MAX_FLUSH_ALL_PASSES,
     MAX_FLUSH_CLOCK_HOLD_NS, SEGMENT_FORMAT_VERSION, StoreClockLag, checked_ingest_hour_bucket,
@@ -57,7 +58,9 @@ use crate::config::{
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::error::WriteError;
 use crate::flush_share::TenantFlushShares;
-use crate::format_floor::{FormatFamily, warn_flush_refused, warn_flush_written_below};
+use crate::format_floor::{
+    BelowFormatFloor, FormatFamily, warn_flush_refused, warn_flush_written_below,
+};
 use crate::generation::{
     FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, ScanCheck,
     mismatch_retry_spent, reread_and_check, send_hand_back,
@@ -578,7 +581,7 @@ impl FlushCtx {
     /// re-serialize, accrete new samples, or re-read the clock for identity
     /// purposes (RTT sampling inside the retry helpers is the one clock read
     /// that is not identity-affecting).
-    async fn run_flush(&self, pinned: PinnedFlush) {
+    async fn run_flush(&self, pinned: PinnedFlush, grant: PublishGrant) {
         let PinnedFlush {
             tenant_hash,
             seq,
@@ -598,13 +601,16 @@ impl FlushCtx {
 
         let exemplar_inputs = self.admit_exemplars(exemplars, &series);
 
-        // ADR-0027: every flush emits v5, scalar and histogram batches alike.
-        // The raw-sample adapter frames each series into a single run, so the
-        // writer choice is no longer version- or content-driven; the buffer's
+        // The version was chosen at permit grant (ADR-4233 decision 2); with
+        // no activation policy it is `SegmentVersion::CURRENT`. The buffer's
         // per-series value kind (scalar or histogram) is carried through
         // `into_series_values` and the writer picks the VAL/HIST page per
         // series.
-        let segment_version = SEGMENT_FORMAT_VERSION;
+        let Some(segment_version) = SegmentVersion::from_number(grant.version()) else {
+            self.refuse_compat(tenant_hash, waiters, grant.unencodable());
+            drop(charges);
+            return;
+        };
         // The encode runs on the write gate when one is attached (ADR-1702).
         // The job takes the byte charges with the buffer and returns them with
         // the segment, so they stay held through the permit wait and the encode
@@ -634,7 +640,8 @@ impl FlushCtx {
                         values: accum.values.into_series_values(),
                     })
                     .collect();
-                let written = SegmentWriter::write_histograms_with_exemplars(
+                let written = SegmentWriter::write_histograms_with_exemplars_at(
+                    segment_version,
                     series_inputs,
                     identity,
                     ingest_bounds,
@@ -703,18 +710,42 @@ impl FlushCtx {
             }
         };
 
-        if !self
-            .put_data_object_with_retry(&data_key, written.bytes.clone(), deadline_ns)
+        // ADR-4233 decision 4: the bucket is fenced before the first PUT of
+        // an object above the family's baseline.
+        if let Err(refused) = grant
+            .ensure_fenced(
+                self.store.as_ref(),
+                tenant_hash,
+                self.signal,
+                self.clock.as_ref(),
+                deadline_ns,
+            )
             .await
         {
-            self.metrics.record_abandoned_retry_exhausted();
-            self.ack_waiters(
-                waiters,
-                Err(WriteError::Abandoned(
-                    "data object put exhausted retry budget or exceeded max_flush_lifetime".into(),
-                )),
-            );
+            self.refuse_compat(tenant_hash, waiters, refused);
             return;
+        }
+
+        match self
+            .put_data_object_with_retry(&data_key, written.bytes.clone(), deadline_ns, &grant)
+            .await
+        {
+            Ok(()) => {}
+            Err(PutAbort::Refused(refused)) => {
+                self.refuse_compat(tenant_hash, waiters, refused);
+                return;
+            }
+            Err(PutAbort::Exhausted) => {
+                self.metrics.record_abandoned_retry_exhausted();
+                self.ack_waiters(
+                    waiters,
+                    Err(WriteError::Abandoned(
+                        "data object put exhausted retry budget or exceeded max_flush_lifetime"
+                            .into(),
+                    )),
+                );
+                return;
+            }
         }
 
         let record = match record::build(NewCommitRecord {
@@ -732,7 +763,7 @@ impl FlushCtx {
             max_event_ts_ns: written.summary.max_event_ts_ns,
             min_ingest_ts_ns,
             max_ingest_ts_ns,
-            segment_format_version: u32::from(segment_version),
+            segment_format_version: u32::from(segment_version.number()),
             created_unix_ns: flush_open_ns,
             ingest_hour_bucket,
         }) {
@@ -744,15 +775,18 @@ impl FlushCtx {
             }
         };
 
-        match self.publish_with_retry(&record, deadline_ns).await {
-            Some(token) => {
+        match self.publish_with_retry(&record, deadline_ns, &grant).await {
+            Ok(token) => {
                 // Both PUTs landed: attribute this flush's PUT cost to the
                 // tenant (ADR-0076 decision 2, success-time). `tenant_hash` is
                 // `Copy` and untouched by the commit-record build above.
                 self.metrics.record_flush_puts(tenant_hash);
                 self.ack_waiters(waiters, Ok(token));
             }
-            None => {
+            Err(PutAbort::Refused(refused)) => {
+                self.refuse_compat(tenant_hash, waiters, refused);
+            }
+            Err(PutAbort::Exhausted) => {
                 self.metrics.record_abandoned_retry_exhausted();
                 self.ack_waiters(
                     waiters,
@@ -866,6 +900,55 @@ impl FlushCtx {
         drop(charges);
     }
 
+    /// Fails a flush the activation policy refused (ADR-4233), with nothing
+    /// of it stored: counted under its reason, and its waiters acked with the
+    /// refusal. The caller drops the flush's byte charges.
+    fn refuse_compat(
+        &self,
+        tenant_hash: TenantHash,
+        waiters: Vec<Ack>,
+        refused: CompatPublishRefusal,
+    ) {
+        self.metrics.record_compat_refused(refused.reason());
+        warn_publish_refused(self.signal, Some(self.shard), tenant_hash, &refused);
+        self.ack_waiters(waiters, Err(WriteError::CompatRefused(refused)));
+    }
+
+    /// Abandons a flush the activation policy refused at permit grant, before
+    /// any store call, dropping its byte charges.
+    fn abandon_compat(&self, pinned: PinnedFlush, refused: CompatPublishRefusal) {
+        let PinnedFlush {
+            tenant_hash,
+            exemplars,
+            waiters,
+            charges,
+            ..
+        } = pinned;
+        if !exemplars.is_empty() {
+            self.metrics.record_exemplars(0, exemplars.len() as u64);
+        }
+        self.refuse_compat(tenant_hash, waiters, refused);
+        drop(charges);
+    }
+
+    /// Abandons a flush whose version chosen at permit grant sits below the
+    /// tenant's format floor (ADR-1746 decision 4), before any store call.
+    fn abandon_below_floor(&self, pinned: PinnedFlush, refused: BelowFormatFloor) {
+        let PinnedFlush {
+            tenant_hash,
+            exemplars,
+            waiters,
+            charges,
+            ..
+        } = pinned;
+        warn_flush_refused(self.signal, self.shard, tenant_hash, &refused);
+        if !exemplars.is_empty() {
+            self.metrics.record_exemplars(0, exemplars.len() as u64);
+        }
+        self.ack_waiters(waiters, Err(WriteError::BelowFormatFloor(refused)));
+        drop(charges);
+    }
+
     /// Races `fut` against the remaining budget to `deadline_ns` on the
     /// injected `Clock`, returning `None` if the deadline is already past or
     /// elapses while `fut` is still in flight. This is what stops a store
@@ -909,9 +992,18 @@ impl FlushCtx {
     /// adaptive-delay ceiling (ADR-0067 decision 3); an attempt that never
     /// completes before `deadline_ns` teaches nothing about RTT and is not
     /// recorded.
-    async fn put_data_object_with_retry(&self, key: &str, bytes: Bytes, deadline_ns: i64) -> bool {
+    /// The activation policy is asked before every attempt (ADR-4233
+    /// decision 3).
+    async fn put_data_object_with_retry(
+        &self,
+        key: &str,
+        bytes: Bytes,
+        deadline_ns: i64,
+        grant: &PublishGrant,
+    ) -> Result<(), PutAbort> {
         let mut attempt: u32 = 0;
         loop {
+            grant.check_attempt().map_err(PutAbort::Refused)?;
             let call = publish::put_data_object(self.store.as_ref(), key, bytes.clone());
             let started_ns = self.clock.now_ns();
             let outcome = self.bound_to_deadline(deadline_ns, call).await;
@@ -920,7 +1012,7 @@ impl FlushCtx {
                     .record(self.clock.now_ns().saturating_sub(started_ns));
             }
             match outcome {
-                Some(Ok(())) => return true,
+                Some(Ok(())) => return Ok(()),
                 Some(Err(PublishError::Store { source, .. })) if source.is_retryable() => {
                     // `put_retry_max_attempts` is the number of retries after
                     // the first attempt (total attempts = this + 1), matching
@@ -930,13 +1022,13 @@ impl FlushCtx {
                     if attempt >= self.config.put_retry_max_attempts
                         || self.clock.now_ns() >= deadline_ns
                     {
-                        return false;
+                        return Err(PutAbort::Exhausted);
                     }
                     self.metrics.record_put_retry();
                     self.backoff_sleep(attempt).await;
                     attempt += 1;
                 }
-                Some(Err(_)) | None => return false,
+                Some(Err(_)) | None => return Err(PutAbort::Exhausted),
             }
         }
     }
@@ -947,12 +1039,13 @@ impl FlushCtx {
     /// attempts (the crate's own internal retry loop has no such hook). Each
     /// attempt itself is bounded to `deadline_ns` via `bound_to_deadline`,
     /// same as `put_data_object_with_retry`, and feeds `self.rtt` the same
-    /// way.
+    /// way, and asks the activation policy before every attempt the same way.
     async fn publish_with_retry(
         &self,
         record: &CommitRecord,
         deadline_ns: i64,
-    ) -> Option<CommitToken> {
+        grant: &PublishGrant,
+    ) -> Result<CommitToken, PutAbort> {
         let single_attempt = RetryPolicy {
             max_attempts: 0,
             base_delay: self.config.put_retry_base_delay,
@@ -960,6 +1053,7 @@ impl FlushCtx {
         };
         let mut attempt: u32 = 0;
         loop {
+            grant.check_attempt().map_err(PutAbort::Refused)?;
             let call = publish::publish(self.store.as_ref(), record, &single_attempt);
             let started_ns = self.clock.now_ns();
             let outcome = self.bound_to_deadline(deadline_ns, call).await;
@@ -968,7 +1062,7 @@ impl FlushCtx {
                     .record(self.clock.now_ns().saturating_sub(started_ns));
             }
             match outcome {
-                Some(Ok(token)) => return Some(token),
+                Some(Ok(token)) => return Ok(token),
                 Some(Err(PublishError::SplitBrain { this, stored })) => {
                     // Identity is pinned at flush open, so this cannot fire
                     // on a benign retry (docs/catalog-and-mvcc.md "Commit
@@ -984,13 +1078,13 @@ impl FlushCtx {
                     if attempt >= self.config.put_retry_max_attempts
                         || self.clock.now_ns() >= deadline_ns
                     {
-                        return None;
+                        return Err(PutAbort::Exhausted);
                     }
                     self.metrics.record_put_retry();
                     self.backoff_sleep(attempt).await;
                     attempt += 1;
                 }
-                Some(Err(_)) | None => return None,
+                Some(Err(_)) | None => return Err(PutAbort::Exhausted),
             }
         }
     }
@@ -2739,6 +2833,7 @@ impl ShardActor {
         // the two never overlap.
         let clock = Arc::clone(&self.clock);
         let metrics = Arc::clone(&self.metrics);
+        let scope = Arc::clone(&self.scope);
         let shard = self.shard;
         self.flushes.spawn(async move {
             let _guard = guard;
@@ -2801,8 +2896,35 @@ impl ShardActor {
                     return;
                 }
             };
+            // ADR-4233 decision 2: the version is chosen here, at grant, from
+            // the activation policy's view as it stands now. A version other
+            // than the one checked against the floor at flush open is checked
+            // again.
+            let grant = match scope.compat_grant(pinned.tenant_hash, FormatFamily::Rseg) {
+                Ok(grant) => grant,
+                Err(refused) => {
+                    ctx.abandon_compat(pinned, refused);
+                    return;
+                }
+            };
+            if grant.version() != SEGMENT_FORMAT_VERSION {
+                match scope.floor_check(
+                    pinned.tenant_hash,
+                    FormatFamily::Rseg,
+                    u32::from(grant.version()),
+                ) {
+                    FloorCheck::Write | FloorCheck::NoView => {}
+                    FloorCheck::WriteBelow(below) => {
+                        warn_flush_written_below(ctx.signal, shard, pinned.tenant_hash, &below);
+                    }
+                    FloorCheck::Refuse(refused) => {
+                        ctx.abandon_below_floor(pinned, refused);
+                        return;
+                    }
+                }
+            }
             let started_ns = clock.now_ns();
-            ctx.run_flush(pinned).await;
+            ctx.run_flush(pinned, grant).await;
             let off_actor_ns = clock.now_ns().saturating_sub(started_ns).max(0) as u64;
             metrics.record_shard_off_actor_ns(shard, off_actor_ns);
         });
@@ -5828,6 +5950,633 @@ mod tests {
             for _ in 0..20 {
                 tokio::task::yield_now().await;
             }
+        }
+    }
+
+    /// The activation policy's clock, set by the test apart from the ingest
+    /// clock so a view can age without moving any flush deadline.
+    struct CompatTestClock(AtomicI64);
+
+    impl CompatTestClock {
+        fn at(ns: i64) -> Arc<Self> {
+            Arc::new(CompatTestClock(AtomicI64::new(ns)))
+        }
+
+        fn advance_ns(&self, delta_ns: i64) {
+            self.0.fetch_add(delta_ns, Ordering::SeqCst);
+        }
+    }
+
+    impl ravel_catalog::CompatClock for CompatTestClock {
+        fn now_unix_ns(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn compat_keys() -> ravel_catalog::CompatKeys {
+        ravel_catalog::CompatKeys::from_file_keys(&[[9; 32]]).expect("one key")
+    }
+
+    /// A `sys/compat` record at `compat_epoch` naming `rseg` the active RSEG
+    /// version, the other families at their writers' versions.
+    fn compat_record(
+        compat_epoch: u64,
+        rseg: u32,
+        max_publish_lifetime_ns: i64,
+    ) -> ravel_proto::sys::v1::CompatRecord {
+        use ravel_catalog::compat::{FAMILY_RLOG, FAMILY_RSEG, FAMILY_RSPAN};
+        let family = |name: &str, version: u32| ravel_proto::sys::v1::CompatFamily {
+            family: name.to_string(),
+            active_write_version: version,
+            ..Default::default()
+        };
+        ravel_proto::sys::v1::CompatRecord {
+            compat_epoch,
+            families: vec![
+                family(FAMILY_RSEG, rseg),
+                family(FAMILY_RLOG, FormatFamily::Rlog.writable_version_under(None)),
+                family(
+                    FAMILY_RSPAN,
+                    FormatFamily::Rspan.writable_version_under(None),
+                ),
+            ],
+            max_publish_lifetime_ns,
+            ..Default::default()
+        }
+    }
+
+    async fn provision(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
+        ravel_catalog::validate_or_adopt(
+            store,
+            &tenant.hash(),
+            Signal::Metrics,
+            1,
+            BASE_NS,
+            ravel_catalog::AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("provision");
+    }
+
+    /// The `compat_epoch` of `tenant`'s metrics provisioning record in the
+    /// store.
+    async fn bucket_compat_epoch(store: &dyn ObjectStoreBackend, tenant: &TenantId) -> u64 {
+        use prost::Message;
+        let key = ravel_catalog::provisioning_key(&tenant.hash(), Signal::Metrics);
+        let bytes = store
+            .get(&key, GetRange::Full)
+            .await
+            .expect("provisioning record")
+            .data;
+        ravel_proto::sys::v1::ProvisioningRecord::decode(bytes.as_ref())
+            .expect("decode provisioning record")
+            .compat_epoch
+    }
+
+    /// Every key under `tenant`'s metrics prefix.
+    async fn tenant_keys(store: &dyn ObjectStoreBackend, tenant: &TenantId) -> Vec<String> {
+        let prefix = format!(
+            "t/{}/{}/",
+            tenant.hash().to_hex(),
+            Signal::Metrics.key_prefix()
+        );
+        list_all(store, &prefix)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|meta| meta.key)
+            .collect()
+    }
+
+    fn objects(keys: &[String]) -> usize {
+        keys.iter()
+            .filter(|k| k.contains("/l0/") || k.contains("/c/"))
+            .count()
+    }
+
+    fn refused(router: &IngestRouter) -> crate::compat::CompatRefusalSnapshot {
+        router.metrics().snapshot().compat_publish_refused
+    }
+
+    /// A one-shard router over `store` with `policy` installed.
+    fn compat_router(
+        config: IngestConfig,
+        store: &Arc<dyn ObjectStoreBackend>,
+        clock: &Arc<TestClock>,
+        policy: crate::compat::IngestCompatPolicy,
+    ) -> Arc<IngestRouter> {
+        Arc::new(
+            IngestRouter::new(
+                config,
+                Arc::clone(store),
+                Signal::Metrics,
+                clock.clone(),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+            )
+            .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(
+                1 << 30,
+            )))
+            .with_compat_policy(Some(Arc::new(policy)))
+            .expect("max_flush_lifetime within the record's bound"),
+        )
+    }
+
+    /// `sys/compat` written as `record` and a view that has read it.
+    async fn compat_view(
+        store: &Arc<dyn ObjectStoreBackend>,
+        compat_clock: &Arc<CompatTestClock>,
+        record: Option<ravel_proto::sys::v1::CompatRecord>,
+    ) -> ravel_catalog::CompatView {
+        if let Some(record) = record {
+            ravel_catalog::compat::create_compat(store.as_ref(), &compat_keys(), record)
+                .await
+                .expect("create sys/compat");
+        }
+        let view =
+            ravel_catalog::CompatView::new(Arc::clone(store), compat_keys(), compat_clock.clone());
+        view.refresh().await.expect("read sys/compat");
+        view
+    }
+
+    fn spawn_write(
+        router: &Arc<IngestRouter>,
+        tenant: &TenantId,
+        host: &'static str,
+        mode: WriteMode,
+    ) -> tokio::task::JoinHandle<Result<crate::router::WriteReceipt, WriteError>> {
+        let router = Arc::clone(router);
+        let tenant = tenant.clone();
+        tokio::spawn(async move {
+            let points = vec![point(&tenant, host)];
+            router
+                .write(tenant, points, mode, Duration::from_secs(60))
+                .await
+        })
+    }
+
+    fn assert_policy_refusal(
+        err: &WriteError,
+        want: impl Fn(&ravel_catalog::CompatRefusal) -> bool,
+    ) {
+        assert!(
+            matches!(
+                err,
+                WriteError::CompatRefused(crate::compat::CompatPublishRefusal::Policy {
+                    family: FormatFamily::Rseg,
+                    refusal,
+                }) if want(refusal)
+            ),
+            "{err:?}"
+        );
+        assert!(err.is_retryable(), "{err:?}");
+    }
+
+    /// ADR-4233 decisions 2 and 4. The test seam lowers the RSEG baseline to
+    /// 6, so the build's v7 is a version above the baseline and needs the
+    /// bucket fence, without a second encodable version.
+    ///
+    /// `other`'s flush is granted the only permit and is held at its data
+    /// PUT, by which point its bucket already carries the view's epoch: a
+    /// fence raised after the first PUT leaves it at 0 there. `acme`'s flush
+    /// opens behind it while the view names v7, and the view then moves RSEG
+    /// to v8, which this build cannot write. Granted after that, the flush is
+    /// refused with no object stored; a version chosen when the flush opened
+    /// would have published v7.
+    #[tokio::test]
+    async fn version_chosen_at_permit_grant_and_first_activated_publish_fences_the_bucket() {
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let clock = TestClock::new(BASE_NS);
+        let compat_clock = CompatTestClock::at(BASE_NS);
+        let (other, acme) = (TenantId::new("other"), TenantId::new("acme"));
+        provision(store.as_ref(), &other).await;
+        provision(store.as_ref(), &acme).await;
+        let view = compat_view(&store, &compat_clock, Some(compat_record(1, 7, 0))).await;
+        let policy = crate::compat::IngestCompatPolicy::new(view.clone(), compat_clock.clone())
+            .with_family_versions(FormatFamily::Rseg, vec![7], 6);
+        let router = compat_router(
+            one_permit_one_queue(Duration::from_secs(3600)),
+            &store,
+            &clock,
+            policy,
+        );
+        let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+
+        let first = spawn_write(&router, &other, "h0", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        gate.wait_until_held(1).await;
+        assert_eq!(
+            bucket_compat_epoch(store.as_ref(), &other).await,
+            1,
+            "the bucket is fenced to the view's epoch before the data PUT"
+        );
+        assert_eq!(bucket_compat_epoch(store.as_ref(), &acme).await, 0);
+
+        let second = spawn_write(&router, &acme, "h1", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 2).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        until(|| in_flight(&router) == 2).await;
+        ravel_catalog::compat::activate_family(
+            store.as_ref(),
+            &compat_keys(),
+            ravel_catalog::compat::FAMILY_RSEG,
+            8,
+            "test",
+            BASE_NS,
+        )
+        .await
+        .expect("activate v8");
+        view.refresh().await.expect("read sys/compat");
+
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        let receipt = first
+            .await
+            .expect("first write task")
+            .expect("granted under v7");
+        let commit_key =
+            keys::commit_key_for_token(&other.hash(), Signal::Metrics, &receipt.tokens[0])
+                .expect("commit key");
+        let committed = record::decode(
+            &store
+                .get(&commit_key, GetRange::Full)
+                .await
+                .expect("commit record")
+                .data,
+        )
+        .expect("decode commit record");
+        assert_eq!(committed.segment_format_version, 7);
+
+        let err = second
+            .await
+            .expect("second write task")
+            .expect_err("granted under v8, which this build cannot write");
+        assert_policy_refusal(&err, |r| {
+            matches!(
+                r,
+                ravel_catalog::CompatRefusal::ActiveVersionNotWritable { active: 8, .. }
+            )
+        });
+        assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 0);
+        assert_eq!(bucket_compat_epoch(store.as_ref(), &acme).await, 0);
+        assert_eq!(refused(&router).active_version_not_writable, 1);
+        assert_eq!(refused(&router).total(), 1);
+        router.flush_all().await;
+    }
+
+    /// The fence's result refreshes the switch's cached record: the second
+    /// flush above the baseline into the same bucket neither reads nor
+    /// raises the provisioning record again. Its read is held, so a second
+    /// fence attempt would leave the write parked.
+    #[tokio::test]
+    async fn a_fenced_bucket_is_not_fenced_again_by_the_next_flush() {
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let clock = TestClock::new(BASE_NS);
+        let compat_clock = CompatTestClock::at(BASE_NS);
+        let acme = TenantId::new("acme");
+        provision(store.as_ref(), &acme).await;
+        let view = compat_view(&store, &compat_clock, Some(compat_record(1, 7, 0))).await;
+        let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone())
+            .with_family_versions(FormatFamily::Rseg, vec![7], 6);
+        let router = compat_router(
+            one_permit_one_queue(Duration::from_secs(3600)),
+            &store,
+            &clock,
+            policy,
+        );
+
+        let first = spawn_write(&router, &acme, "h0", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        first
+            .await
+            .expect("write task")
+            .expect("fenced and written");
+        assert_eq!(bucket_compat_epoch(store.as_ref(), &acme).await, 1);
+
+        let gate = fault_store.hold(Op::Get, Some("/prov".to_string()), Occurrence::Nth(1));
+        let second = spawn_write(&router, &acme, "h1", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 2).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        assert!(
+            settles(|| second.is_finished()).await,
+            "the second flush waited on a provisioning read: {:?}",
+            gate.held_details()
+        );
+        second.await.expect("write task").expect("written");
+        assert_eq!(gate.held_count(), 0);
+        assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 4);
+        router.flush_all().await;
+    }
+
+    /// A view that ages to the horizon after the flush's grant, here while
+    /// the bucket fence is in flight, abandons the flush before its data PUT.
+    /// A check made only at grant (or at flush open) lets the PUT through.
+    #[tokio::test]
+    async fn a_view_stale_between_grant_and_put_abandons_the_flush_without_a_put() {
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let clock = TestClock::new(BASE_NS);
+        let compat_clock = CompatTestClock::at(BASE_NS);
+        let acme = TenantId::new("acme");
+        provision(store.as_ref(), &acme).await;
+        let view = compat_view(&store, &compat_clock, Some(compat_record(1, 7, 0))).await;
+        let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone())
+            .with_family_versions(FormatFamily::Rseg, vec![7], 6);
+        let router = compat_router(
+            one_permit_one_queue(Duration::from_secs(3600)),
+            &store,
+            &clock,
+            policy,
+        );
+        let gate = fault_store.hold(Op::Put, Some("/prov".to_string()), Occurrence::Nth(1));
+
+        let write = spawn_write(&router, &acme, "h0", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        gate.wait_until_held(1).await;
+        let before = tenant_keys(store.as_ref(), &acme).await;
+        compat_clock.advance_ns(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS);
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+
+        let err = write
+            .await
+            .expect("write task")
+            .expect_err("the view went stale before the data PUT");
+        assert_policy_refusal(&err, |r| {
+            matches!(r, ravel_catalog::CompatRefusal::ViewStale { .. })
+        });
+        let after = tenant_keys(store.as_ref(), &acme).await;
+        assert_eq!(before, after, "no object was stored");
+        assert_eq!(objects(&after), 0);
+        assert_eq!(refused(&router).view_stale, 1);
+        assert_eq!(refused(&router).total(), 1);
+        router.flush_all().await;
+    }
+
+    struct FullJitter;
+
+    impl ravel_commit::rng::RngSource for FullJitter {
+        fn jitter_ms(&self, max_ms: u64) -> u64 {
+            max_ms
+        }
+
+        fn new_uuid(&self) -> Uuid {
+            Uuid::from_u128(0x4244)
+        }
+    }
+
+    /// The view is asked before every PUT attempt, retries included: the
+    /// first attempt of `key_fragment`'s PUT is throttled, the view ages to
+    /// the horizon during the backoff, and the retry is never sent. A check
+    /// made only before the first attempt (or at grant) sends it.
+    async fn stale_at_retry(
+        key_fragment: &str,
+    ) -> (Vec<String>, crate::compat::CompatRefusalSnapshot) {
+        use ravel_object_store::fault::{Rule, ScriptedFault};
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Throttled { retry_after_ms: 0 })
+                .with_key_contains(key_fragment)
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let clock = TestClock::new(BASE_NS);
+        let compat_clock = CompatTestClock::at(BASE_NS);
+        let acme = TenantId::new("acme");
+        provision(store.as_ref(), &acme).await;
+        let view = compat_view(&store, &compat_clock, Some(compat_record(1, 7, 0))).await;
+        let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone());
+        // The full backoff, never a zero-jitter one, so the flush parks in it
+        // until the clock moves.
+        let router = Arc::new(
+            IngestRouter::with_rng(
+                one_permit_one_queue(Duration::from_secs(3600)),
+                Arc::clone(&store),
+                Signal::Metrics,
+                clock.clone(),
+                Arc::new(FullJitter),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+            )
+            .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited))
+            .with_compat_policy(Some(Arc::new(policy)))
+            .expect("no publish bound"),
+        );
+
+        let write = spawn_write(&router, &acme, "h0", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        until(|| router.metrics().snapshot().put_retries >= 1).await;
+        compat_clock.advance_ns(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS);
+        while !write.is_finished() {
+            clock.advance_ns(10_000_000);
+            tokio::task::yield_now().await;
+        }
+
+        let err = write
+            .await
+            .expect("write task")
+            .expect_err("the view went stale before the retry");
+        assert_policy_refusal(&err, |r| {
+            matches!(r, ravel_catalog::CompatRefusal::ViewStale { .. })
+        });
+        assert_eq!(router.metrics().snapshot().put_retries, 1);
+        let keys = tenant_keys(store.as_ref(), &acme).await;
+        let snapshot = refused(&router);
+        router.flush_all().await;
+        (keys, snapshot)
+    }
+
+    #[tokio::test]
+    async fn a_view_stale_at_a_data_put_retry_abandons_before_the_retry() {
+        let (keys, refused) = stale_at_retry("/l0/").await;
+        assert_eq!(objects(&keys), 0, "{keys:?}");
+        assert_eq!(refused.view_stale, 1);
+        assert_eq!(refused.total(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_view_stale_at_a_commit_put_retry_abandons_before_the_retry() {
+        let (keys, refused) = stale_at_retry("/c/").await;
+        assert_eq!(
+            keys.iter().filter(|k| k.contains("/c/")).count(),
+            0,
+            "no commit record: {keys:?}"
+        );
+        assert_eq!(
+            keys.iter().filter(|k| k.contains("/l0/")).count(),
+            1,
+            "the data object went out before the view aged: {keys:?}"
+        );
+        assert_eq!(refused.view_stale, 1);
+        assert_eq!(refused.total(), 1);
+    }
+
+    /// The view names an RSEG version this build cannot write: a strict and
+    /// a buffered write are both refused at admission, retryably, counted,
+    /// and nothing is buffered, charged or stored.
+    #[tokio::test]
+    async fn an_active_version_this_build_cannot_write_is_refused_at_admission() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let clock = TestClock::new(BASE_NS);
+        let compat_clock = CompatTestClock::at(BASE_NS);
+        let acme = TenantId::new("acme");
+        provision(store.as_ref(), &acme).await;
+        let view = compat_view(&store, &compat_clock, Some(compat_record(1, 8, 0))).await;
+        let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone());
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1 << 30));
+        let router = Arc::new(
+            IngestRouter::new(
+                one_permit_one_queue(Duration::from_secs(3600)),
+                Arc::clone(&store),
+                Signal::Metrics,
+                clock.clone(),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+            )
+            .with_budget(Arc::clone(&budget))
+            .with_compat_policy(Some(Arc::new(policy)))
+            .expect("no publish bound"),
+        );
+
+        for mode in [WriteMode::Strict, WriteMode::Buffered] {
+            let err = spawn_write(&router, &acme, "h0", mode)
+                .await
+                .expect("write task")
+                .expect_err("v8 is not writable");
+            assert_policy_refusal(&err, |r| {
+                matches!(
+                    r,
+                    ravel_catalog::CompatRefusal::ActiveVersionNotWritable { active: 8, .. }
+                )
+            });
+        }
+        let snapshot = router.metrics().snapshot();
+        assert_eq!(snapshot.buffered_points_total, 0);
+        assert_eq!(
+            snapshot.compat_publish_refused.active_version_not_writable,
+            2
+        );
+        assert_eq!(snapshot.compat_publish_refused.total(), 2);
+        assert_eq!(budget.in_flight_bytes(), 0);
+        router.flush_all().await;
+        assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 0);
+    }
+
+    /// A bucket fenced at a nonzero `compat_epoch` with no `sys/compat` in
+    /// the store is refused as `CompatRecordMissing` (the record was deleted
+    /// or lost); a bucket at epoch 0 in the same store writes at the
+    /// baseline.
+    #[tokio::test]
+    async fn a_fenced_bucket_with_sys_compat_absent_is_refused_as_record_missing() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let clock = TestClock::new(BASE_NS);
+        let compat_clock = CompatTestClock::at(BASE_NS);
+        let (acme, other) = (TenantId::new("acme"), TenantId::new("other"));
+        provision(store.as_ref(), &acme).await;
+        provision(store.as_ref(), &other).await;
+        ravel_catalog::raise_compat_fence(
+            store.as_ref(),
+            &acme.hash(),
+            Signal::Metrics,
+            1,
+            BASE_NS,
+        )
+        .await
+        .expect("fence acme");
+        let view = compat_view(&store, &compat_clock, None).await;
+        let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone());
+        let router = compat_router(
+            one_permit_one_queue(Duration::from_secs(3600)),
+            &store,
+            &clock,
+            policy,
+        );
+
+        let err = spawn_write(&router, &acme, "h0", WriteMode::Buffered)
+            .await
+            .expect("write task")
+            .expect_err("acme's bucket names an epoch sys/compat does not hold");
+        assert_policy_refusal(&err, |r| {
+            matches!(
+                r,
+                ravel_catalog::CompatRefusal::CompatRecordMissing {
+                    bucket_compat_epoch: 1,
+                    seen_compat_epoch: 0,
+                }
+            )
+        });
+        assert_eq!(refused(&router).compat_record_missing, 1);
+
+        let written = spawn_write(&router, &other, "h0", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        written
+            .await
+            .expect("write task")
+            .expect("an unfenced bucket writes at the baseline");
+        assert_eq!(refused(&router).total(), 1);
+        router.flush_all().await;
+    }
+
+    /// ADR-4233 decision 7: a router refuses to start under a policy whose
+    /// record bounds publication below its `max_flush_lifetime`; a record
+    /// bound of zero, an equal bound and no policy all start.
+    #[tokio::test]
+    async fn a_max_flush_lifetime_above_the_records_publish_bound_is_refused_at_construction() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let clock = TestClock::new(BASE_NS);
+        let compat_clock = CompatTestClock::at(BASE_NS);
+        let lifetime = Duration::from_secs(3600);
+        let lifetime_ns = i64::try_from(lifetime.as_nanos()).expect("fits");
+        let router = || {
+            IngestRouter::new(
+                one_permit_one_queue(lifetime),
+                Arc::clone(&store),
+                Signal::Metrics,
+                clock.clone(),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+            )
+        };
+        let view = compat_view(
+            &store,
+            &compat_clock,
+            Some(compat_record(1, 7, lifetime_ns - 1)),
+        )
+        .await;
+        let policy = Arc::new(crate::compat::IngestCompatPolicy::new(
+            view.clone(),
+            compat_clock.clone(),
+        ));
+
+        let err = router()
+            .with_compat_policy(Some(Arc::clone(&policy)))
+            .err()
+            .expect("the record bounds publication below max_flush_lifetime");
+        assert_eq!(
+            err,
+            crate::compat::PublishLifetimeAboveCompat {
+                max_flush_lifetime_ns: lifetime_ns,
+                max_publish_lifetime_ns: lifetime_ns - 1,
+            }
+        );
+        assert!(router().with_compat_policy(None).is_ok());
+
+        for bound in [lifetime_ns, 0] {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let view = compat_view(&store, &compat_clock, Some(compat_record(1, 7, bound))).await;
+            let policy = Arc::new(crate::compat::IngestCompatPolicy::new(
+                view,
+                compat_clock.clone(),
+            ));
+            assert!(
+                router().with_compat_policy(Some(policy)).is_ok(),
+                "bound {bound}"
+            );
         }
     }
 }
