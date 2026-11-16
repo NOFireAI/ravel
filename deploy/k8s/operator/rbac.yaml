@@ -35,8 +35,11 @@
 #     is immutable). Not watched by an informer, so no list/watch.
 #   - HorizontalPodAutoscalers (autoscaling): create/patch (apply) and delete,
 #     for the per-tier HPA rendered under spec.<tier>.autoscaling mode Managed
-#     (ADR-4314 decision 4). get/list/watch are granted ahead of the HPA status
-#     reporting (ADR-4314 decision 5); the reconcile loop does not read HPAs yet.
+#     (ADR-4314 decision 4). list: every pass lists the namespace's HPAs to
+#     decide which ones the operator owns before it applies or deletes one
+#     (controller::reconcile_inner, ADR-4314's "refuse to take over a user
+#     HPA" amendment). get/watch are granted ahead of the HPA status
+#     reporting (ADR-4314 decision 5); nothing gets or watches HPAs yet.
 #   - RavelCluster: list/watch only (the primary `Controller` informer; the
 #     reconcile object comes from the informer cache, never a `.get()`, and the
 #     spec is never patched). Its status subresource: patch only (patch_status
