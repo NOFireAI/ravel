@@ -1035,11 +1035,14 @@ before they write anything for its bucket:
   the object's version and the unknown kinds, and writes no part and no
   compaction record. The version is the one in the object's trailer, the
   version it was written at, not the one its commit record names.
-  `ravel_maintain_buckets_held_unknown_section_total` moves by one per held
-  bucket per pass, and one `WARN` line per held bucket names the object and
-  the unknown kinds. The bucket is retried on every pass, as an
-  out-of-window input is, and compacts once a build that knows the section
-  kinds runs here.
+  The library counter behind
+  `ravel_maintain_buckets_held_unknown_section_total`, read with
+  `ravel_maintain::buckets_held_unknown_section_total()`, moves by one per
+  held bucket per pass. `ravel-server` does not render it on its metrics
+  endpoint yet; that comes in a later change. One `WARN` line per held
+  bucket names the object and the unknown kinds. The bucket is retried on
+  every pass, as an out-of-window input is, and compacts once a build that
+  knows the section kinds runs here.
 - `migrate` holds the bucket under the `unknown_section` reason, with the
   object's key, its trailer version and the unknown kinds, and raises no
   floor while it holds it. A `--reencode-compaction-parts` run holds such a
