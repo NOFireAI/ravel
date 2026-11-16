@@ -59,6 +59,7 @@ mod condition;
 mod error;
 mod generation;
 mod instance;
+pub mod lease;
 mod record;
 mod rule;
 mod state;
@@ -67,10 +68,12 @@ pub use condition::{QueryResultSummary, matching_series};
 pub use error::AlertError;
 pub use generation::{DEFAULT_MAX_ALERT_GENERATION, compute_generation, guard_generation};
 pub use instance::{AlertInstance, MAX_ALERTS_PER_RULE, alert_instances, merged_alert_labels};
+pub use lease::{AlertLease, LeaseError, ParkOutcome, alert_lease_key, park_lease};
 pub use record::{
     ANNOTATION_PREFIX, ATTR_ALERT_ID, ATTR_GENERATION, ATTR_RULE_ID, ATTR_STATE, AlertId,
     AlertRecord, LABEL_PREFIX, build_instance_transition_record, build_transition_record,
-    compute_alert_id, encode_record_object, write_alert_record,
+    compute_alert_id, encode_record_object, encode_record_object_at, write_alert_record,
+    write_alert_record_at,
 };
 pub use rule::{DEFAULT_REPEAT_INTERVAL, Rule, RuleCondition, RuleQuery, ThresholdOp};
 pub use state::{AlertState, StateTransition, evaluate_suppression, evaluate_transition};

@@ -4551,11 +4551,16 @@ name = "ravel-alerting"
 version = "0.33.0"
 dependencies = [
  "blake3",
+ "bytes",
  "hex",
  "proptest",
  "ravel-logseg",
+ "ravel-object-store",
  "ravel-types",
+ "serde",
+ "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
