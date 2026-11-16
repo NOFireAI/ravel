@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Minimal SigV4 S3 client for the released-binary fence drill, standard
-library only: create a bucket, and list every key of a bucket with its
-LastModified.
+library only: create a bucket, list every key of a bucket with its
+LastModified, and read the 16-byte trailer of a data object.
 
 usage:
   drill_s3.py mb BUCKET
   drill_s3.py ls BUCKET [PREFIX]    # one line per key: "<key>\t<LastModified>\t<size>"
+  drill_s3.py trailer BUCKET KEY    # "<key>\t<magic>\t<version>\t<signal>"
+  drill_s3.py trailer-file PATH     # the same, for a local file
 
 Reads S3_ENDPOINT (http://host:port), AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 and AWS_REGION (default us-east-1). Path-style requests only. A listing that
@@ -30,7 +32,7 @@ def sign(key, msg):
     return hmac.new(key, msg.encode(), hashlib.sha256).digest()
 
 
-def request(method, bucket, query, body=b""):
+def request(method, bucket, query, body=b"", key="", extra_headers=None):
     endpoint = os.environ["S3_ENDPOINT"].rstrip("/")
     access = os.environ["AWS_ACCESS_KEY_ID"]
     secret = os.environ["AWS_SECRET_ACCESS_KEY"]
@@ -39,7 +41,7 @@ def request(method, bucket, query, body=b""):
     now = datetime.datetime.now(datetime.timezone.utc)
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     day = now.strftime("%Y%m%d")
-    path = "/" + bucket
+    path = "/" + bucket + ("/" + urllib.parse.quote(key, safe="/-_.~") if key else "")
     canonical_query = "&".join(
         "%s=%s"
         % (urllib.parse.quote(k, safe="-_.~"), urllib.parse.quote(v, safe="-_.~"))
@@ -79,6 +81,8 @@ def request(method, bucket, query, body=b""):
         if name != "host":
             req.add_header(name, value)
     req.add_header("Authorization", auth)
+    for name, value in (extra_headers or {}).items():
+        req.add_header(name, value)
     with urllib.request.urlopen(req, timeout=30) as resp:
         return resp.read()
 
@@ -112,6 +116,23 @@ def list_bucket(bucket, prefix):
             raise SystemExit("listing truncated without a continuation token")
 
 
+def trailer_line(key, tail):
+    """The last 16 bytes of an RSEG/RLOG/RSPAN object: footer_len u32,
+    footer_crc32c u32, version u16 LE, signal u8, reserved u8, magic [u8; 4]
+    (docs/segment-format.md, docs/log-segment-format.md,
+    docs/span-segment-format.md)."""
+    if len(tail) != 16:
+        raise SystemExit("trailer of %s: %d bytes, want 16" % (key, len(tail)))
+    magic = tail[12:16].decode("ascii", "replace")
+    version = int.from_bytes(tail[8:10], "little")
+    return "%s\t%s\t%d\t%d" % (key, magic, version, tail[10])
+
+
+def trailer(bucket, key):
+    tail = request("GET", bucket, {}, key=key, extra_headers={"Range": "bytes=-16"})
+    print(trailer_line(key, tail))
+
+
 def main(argv):
     try:
         if len(argv) == 3 and argv[1] == "mb":
@@ -119,6 +140,13 @@ def main(argv):
             return 0
         if len(argv) in (3, 4) and argv[1] == "ls":
             list_bucket(argv[2], argv[3] if len(argv) == 4 else "")
+            return 0
+        if len(argv) == 4 and argv[1] == "trailer":
+            trailer(argv[2], argv[3])
+            return 0
+        if len(argv) == 3 and argv[1] == "trailer-file":
+            with open(argv[2], "rb") as f:
+                print(trailer_line(argv[2], f.read()[-16:]))
             return 0
     except urllib.error.HTTPError as e:
         sys.stderr.write("drill_s3: %s %s\n" % (e.code, e.read()[:300]))
