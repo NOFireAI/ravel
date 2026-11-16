@@ -46,6 +46,7 @@ fn request(args: Value, ctx: &ToolContext<'_>) -> Result<SqlRequest, Refusal> {
     for name in ["query", "time_range"] {
         if args.get(name).is_none_or(Value::is_null) {
             return Err((
+                // mcp-error-display-allow: names a compiled-in argument name.
                 failure(
                     FailureClass::MissingArgument,
                     format!("ravel_explain_query requires {name}"),
@@ -56,6 +57,8 @@ fn request(args: Value, ctx: &ToolContext<'_>) -> Result<SqlRequest, Refusal> {
     }
     let input = ExplainQueryInput::deserialize(args).map_err(|err| {
         (
+            // mcp-error-display-allow: the error describes the caller's own
+            // arguments, a caller-input refusal.
             failure(
                 FailureClass::InvalidArgument,
                 format!("ravel_explain_query arguments: {err}"),
@@ -96,6 +99,8 @@ fn validate(sql: &str) -> Result<(), Refusal> {
         Err(
             error @ (ValidationError::NotReadOnly { .. } | ValidationError::WriteInQuery { .. }),
         ) => Err((
+            // mcp-error-display-allow: the validator's refusal of the caller's
+            // own statement, a caller-input refusal.
             failure(
                 FailureClass::Unsupported,
                 format!("ravel_explain_query explains a read-only SELECT only: {error}"),
@@ -103,6 +108,8 @@ fn validate(sql: &str) -> Result<(), Refusal> {
             Vec::new(),
         )),
         Err(error) => Err((
+            // mcp-error-display-allow: the validator's refusal of the caller's
+            // own statement, a caller-input refusal.
             failure(FailureClass::Validation, error.to_string()),
             vec![step(
                 "ravel_query_promql",
@@ -327,6 +334,8 @@ fn over_budget(
     };
     let envelope = Envelope {
         status: Status::Error,
+        // mcp-error-display-allow: the estimate figures and ceilings this
+        // envelope also reports under budget, never an error or a stored value.
         failure: Some(failure(
             FailureClass::BudgetEstimateExceedsCeiling,
             format!(

@@ -67,13 +67,15 @@
 use std::collections::HashMap;
 
 use ravel_query::{ByteLimit, EffectiveBudgets, RequestLimit};
+use ravel_types::TenantHash;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::catalog::GetTraceInput;
 use crate::envelope::{
     AnyJson, Budget, CapAdvice, CapCut, Cell, Column, Envelope, Failure, FailureClass, LegSpend,
-    LegStatus, LogsLeg, NextStep, Row, Status, bound_scalar, fit_cap, serialized_len,
+    LegStatus, LogsLeg, NextStep, Row, Status, bound_scalar, fit_cap, redacted_internal,
+    serialized_len,
 };
 use crate::service::{QueryBackend, TraceLookupRequest};
 
@@ -469,21 +471,24 @@ fn span_tree(
     span_at: usize,
     parent_at: usize,
     complete: bool,
+    tenant_hash: TenantHash,
 ) -> Result<Vec<Placement>, Failure> {
     let mut first: HashMap<&str, usize> = HashMap::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
-        if let Some(id) = id_at(row, span_at, "span_id")? {
+        if let Some(id) = id_at(row, span_at, "span_id", tenant_hash)? {
             first.entry(id).or_insert(index);
         }
     }
     let links = rows
         .iter()
         .map(|row| {
-            Ok(match id_at(row, parent_at, "parent_span_id")? {
-                None => Link::Root,
-                Some(id) if is_zero_id(id) => Link::Root,
-                Some(id) => first.get(id).map_or(Link::Absent, |&at| Link::To(at)),
-            })
+            Ok(
+                match id_at(row, parent_at, "parent_span_id", tenant_hash)? {
+                    None => Link::Root,
+                    Some(id) if is_zero_id(id) => Link::Root,
+                    Some(id) => first.get(id).map_or(Link::Absent, |&at| Link::To(at)),
+                },
+            )
         })
         .collect::<Result<Vec<Link>, Failure>>()?;
     let absent = if complete {
@@ -550,12 +555,24 @@ fn is_zero_id(id: &str) -> bool {
 }
 
 /// The id a cell holds: `None` for null, the text for a string or hex id.
-fn id_at<'a>(row: &'a Row, at: usize, name: &str) -> Result<Option<&'a str>, Failure> {
+fn id_at<'a>(
+    row: &'a Row,
+    at: usize,
+    name: &str,
+    tenant_hash: TenantHash,
+) -> Result<Option<&'a str>, Failure> {
     match row.get(at) {
         Some(Cell::Null) => Ok(None),
         Some(Cell::Str(id)) => Ok(Some(id)),
         Some(Cell::HexId(id)) => Ok(Some(id.as_str())),
-        Some(other) => Err(internal(format!("{name} holds {other:?}, not a span id"))),
+        // mcp-error-display-allow: names the compiled-in column and the
+        // cell's variant only; the cell itself goes to the log.
+        Some(other) => Err(redacted_internal(
+            &format!("{name} holds a {} cell, not a span id", other.kind()),
+            &format_args!("{other:?}"),
+            tenant_hash,
+        )),
+        // mcp-error-display-allow: every caller passes a compiled-in column name.
         None => Err(internal(format!("a row has no {name} cell"))),
     }
 }
@@ -668,7 +685,13 @@ fn finish(
         && !shown.bytes_cap_hit
         && shown.rows_omitted == 0
         && fitted.coverage.complete;
-    let tree = span_tree(&fitted.data.rows, span_at + 2, parent_at + 2, complete)?;
+    let tree = span_tree(
+        &fitted.data.rows,
+        span_at + 2,
+        parent_at + 2,
+        complete,
+        ctx.tenant_hash,
+    )?;
     for (row, placement) in fitted.data.rows.iter_mut().zip(&tree) {
         row[0] = placement
             .depth
@@ -699,6 +722,7 @@ fn column_at(envelope: &Envelope, name: &str) -> Result<usize, Failure> {
         .columns
         .iter()
         .position(|column| column.name == name)
+        // mcp-error-display-allow: every caller passes a compiled-in column name.
         .ok_or_else(|| internal(format!("the trace lookup returned no {name} column")))
 }
 
@@ -1202,7 +1226,7 @@ mod tests {
         .rows;
         let (send, receive) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = send.send(span_tree(&rows, 1, 2, true));
+            let _ = send.send(span_tree(&rows, 1, 2, true, TenantHash([0x3c; 16])));
         });
         let placed = receive
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -1323,6 +1347,34 @@ mod tests {
             let failure = envelope.failure.expect("a failure");
             assert_eq!(failure.class, FailureClass::Internal, "{name}");
             assert!(failure.message.contains(name), "{}", failure.message);
+        }
+    }
+
+    /// A span id cell of an unexpected variant is an internal failure whose
+    /// message names the column and the variant, never the stored value.
+    ///
+    /// FLIP: formatting the cell with `{other:?}` into the message, as before,
+    /// puts the planted value in front of the caller.
+    #[test]
+    fn a_span_id_of_another_variant_names_the_variant_not_the_value() {
+        const PLANTED: &str = "planted-stored-value-7f3e";
+        let key = key();
+        let ctx = test_context(&key);
+        for (name, at) in [("span_id", 1), ("parent_span_id", 2)] {
+            let mut port = spans(&[("r", None, "root")]);
+            let mut stored = Map::new();
+            stored.insert("secret".to_string(), Value::String(PLANTED.to_string()));
+            port.data.rows[0][at] = Cell::Map(stored);
+            let envelope = call(port, untimed(), &ctx);
+            assert_eq!(envelope.status, Status::Error, "{name}");
+            let failure = envelope.failure.expect("a failure");
+            assert_eq!(failure.class, FailureClass::Internal, "{name}");
+            assert_eq!(
+                failure.message,
+                format!("{name} holds a map cell, not a span id")
+            );
+            assert!(!failure.message.contains(PLANTED), "{}", failure.message);
+            assert!(!failure.message.contains("secret"), "{}", failure.message);
         }
     }
 

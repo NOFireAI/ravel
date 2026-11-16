@@ -31,7 +31,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::catalog::{AnalyzeOp, AnalyzeTimeseriesInput};
-use crate::envelope::{AnyJson, Cell, Envelope, Failure, FailureClass, NextStep};
+use ravel_types::TenantHash;
+
+use crate::envelope::{
+    AnyJson, Cell, Envelope, Failure, FailureClass, NextStep, redacted_internal,
+};
 use crate::service::QueryBackend;
 
 use super::ToolContext;
@@ -40,6 +44,11 @@ use super::promql_range::{EvalRange, Refusal, eval_range};
 use super::query_promql::{report_range_scope, rewrite_partial_refusal};
 
 const TOOL: &str = "ravel_analyze_timeseries";
+
+const CALL_NOT_SERIALIZED: &str = "the ravel_analyze_timeseries call could not be serialized";
+
+const DOWNSAMPLED_NOT_BOOL: &str =
+    "the analytics port returned a downsampled cell that is not a bool";
 
 /// The fewest non-NaN points `change_point` classifies; a series with fewer
 /// is `indeterminable` (ravel-analytics `MIN_POINTS`, ADR-0028 decision 3).
@@ -152,10 +161,8 @@ impl AnalyticsCall {
         }
     }
 
-    pub fn to_json(&self) -> Result<AnyJson, Failure> {
-        serde_json::to_value(self)
-            .map(AnyJson)
-            .map_err(|err| internal(format!("{TOOL} call did not serialize: {err}")))
+    pub fn to_json(&self, tenant_hash: TenantHash) -> Result<AnyJson, Failure> {
+        call_json(serde_json::to_value(self), tenant_hash)
     }
 
     /// The call a port implementation received. A shape it cannot read is
@@ -164,6 +171,17 @@ impl AnalyticsCall {
         serde_json::from_value(request.0.clone())
             .map_err(|err| invalid(format!("{TOOL} arguments: {err}")))
     }
+}
+
+/// The serialized call, or a fixed `internal` failure with the serializer's
+/// error logged.
+fn call_json(
+    serialized: Result<Value, serde_json::Error>,
+    tenant_hash: TenantHash,
+) -> Result<AnyJson, Failure> {
+    serialized
+        .map(AnyJson)
+        .map_err(|err| redacted_internal(CALL_NOT_SERIALIZED, &err, tenant_hash))
 }
 
 #[derive(Debug, Clone)]
@@ -185,7 +203,7 @@ pub async fn run<B: QueryBackend>(args: Value, ctx: &ToolContext<'_>, backend: &
         plan.op,
         ctx.budgets.deadline,
     );
-    let answered = match call.to_json() {
+    let answered = match call.to_json(ctx.tenant_hash) {
         Ok(request) => backend.analytics(ctx.tenant_hash, &request).await,
         Err(failure) => Err(failure),
     };
@@ -256,6 +274,8 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Result<
         .map(|column| column.name.as_str())
         .collect();
     if names != columns {
+        // mcp-error-display-allow: names the result schema's column names
+        // and the op's compiled-in ones, never an error or a stored value.
         return Err(internal(format!(
             "the analytics port returned columns {names:?} for {}, not {columns:?}",
             plan.op.name()
@@ -270,9 +290,14 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Result<
             Some(Cell::Bool(true)) => downsampled += 1,
             Some(Cell::Bool(false)) => {}
             other => {
-                return Err(internal(format!(
-                    "the analytics port returned a downsampled cell that is not a bool: {other:?}"
-                )));
+                let shape = other.map_or("no cell", Cell::kind);
+                // mcp-error-display-allow: the message names the cell's
+                // variant only; the cell itself goes to the log.
+                return Err(redacted_internal(
+                    &format!("{DOWNSAMPLED_NOT_BOOL} ({shape})"),
+                    &format_args!("{other:?}"),
+                    ctx.tenant_hash,
+                ));
             }
         }
     }
@@ -314,6 +339,7 @@ fn column_index(columns: &[&str], name: &str) -> Result<usize, Failure> {
     columns
         .iter()
         .position(|column| *column == name)
+        // mcp-error-display-allow: every caller passes a compiled-in column name.
         .ok_or_else(|| internal(format!("{name} is not an analytics column")))
 }
 
@@ -975,5 +1001,52 @@ mod tests {
         let stub = answering(vec![Ok(change_point_rows(&[("m", 60, false)]))]);
         let envelope = block_on(run(args(START_NS, END_NS, "15s", "summary"), &ctx, &stub));
         assert_eq!(failure_of(&envelope).class, FailureClass::Internal);
+    }
+
+    /// A downsampled cell that is not a bool is an internal failure whose
+    /// message names the cell's variant, never the stored value.
+    ///
+    /// FLIP: formatting the cell with `{other:?}` into the message, as before,
+    /// puts the planted value in front of the caller.
+    #[test]
+    fn a_downsampled_cell_of_another_variant_names_the_variant_not_the_value() {
+        const PLANTED: &str = "planted-stored-value-91ad";
+        let key = key();
+        let ctx = test_context(&key);
+        let mut port = change_point_rows(&[("m", 60, false)]);
+        let at = column_index(&CHANGE_POINT_COLUMNS, "downsampled").expect("a column");
+        port.data.rows[0][at] = Cell::Str(PLANTED.to_string());
+        let stub = answering(vec![Ok(port)]);
+        let envelope = block_on(run(
+            args(START_NS, END_NS, "15s", "change_point"),
+            &ctx,
+            &stub,
+        ));
+        let failure = failure_of(&envelope);
+        assert_eq!(failure.class, FailureClass::Internal);
+        assert_eq!(
+            failure.message,
+            "the analytics port returned a downsampled cell that is not a bool (str)"
+        );
+        assert!(!failure.message.contains(PLANTED), "{}", failure.message);
+    }
+
+    /// A call that does not serialize is an internal failure with a fixed
+    /// message; the serializer's error, which can quote a value, stays out.
+    ///
+    /// FLIP: formatting `{err}` into the message, as before, puts the planted
+    /// value in front of the caller.
+    #[test]
+    fn a_call_that_does_not_serialize_carries_a_fixed_message() {
+        const PLANTED: &str = "planted-serde-detail-5b20";
+        let planted = serde_json::from_value::<u8>(json!(PLANTED)).expect_err("not a u8");
+        assert!(planted.to_string().contains(PLANTED), "{planted}");
+        let failure = call_json(Err(planted), TenantHash([0x4d; 16])).expect_err("refused");
+        assert_eq!(failure.class, FailureClass::Internal);
+        assert_eq!(
+            failure.message,
+            "the ravel_analyze_timeseries call could not be serialized"
+        );
+        assert!(!failure.message.contains(PLANTED), "{}", failure.message);
     }
 }

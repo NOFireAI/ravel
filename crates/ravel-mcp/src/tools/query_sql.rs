@@ -174,6 +174,7 @@ impl Call {
         for name in ["query", "time_range"] {
             if args.get(name).is_none_or(Value::is_null) {
                 return Err((
+                    // mcp-error-display-allow: names a compiled-in argument name.
                     failure(
                         FailureClass::MissingArgument,
                         format!("{TOOL} requires {name}"),
@@ -184,6 +185,8 @@ impl Call {
         }
         let input = QuerySqlInput::deserialize(args).map_err(|err| {
             (
+                // mcp-error-display-allow: the error describes the caller's
+                // own arguments, a caller-input refusal.
                 failure(
                     FailureClass::InvalidArgument,
                     format!("{TOOL} arguments: {err}"),
@@ -193,6 +196,7 @@ impl Call {
         })?;
         if input.evidence_ref.is_some() {
             return Err((
+                // mcp-error-display-allow: formats the compiled-in tool name.
                 failure(
                     FailureClass::Unsupported,
                     format!("evidence_ref is not served by {TOOL} in this build"),
@@ -536,6 +540,8 @@ fn validate(sql: &str) -> Result<(), Refusal> {
 fn validation_refusal(error: &ValidationError) -> Refusal {
     match error {
         ValidationError::NotReadOnly { .. } | ValidationError::WriteInQuery { .. } => (
+            // mcp-error-display-allow: the validator's refusal of the caller's
+            // own statement, a caller-input refusal.
             failure(
                 FailureClass::Unsupported,
                 format!("{TOOL} runs a read-only SELECT only: {error}"),
@@ -543,6 +549,8 @@ fn validation_refusal(error: &ValidationError) -> Refusal {
             Vec::new(),
         ),
         _ => (
+            // mcp-error-display-allow: the validator's refusal of the caller's
+            // own statement, a caller-input refusal.
             failure(FailureClass::Validation, error.to_string()),
             vec![step(
                 "ravel_query_promql",
@@ -560,6 +568,8 @@ fn plan_refusal(error: &PagePlanError) -> Refusal {
         return validation_refusal(error);
     }
     (
+        // mcp-error-display-allow: the page planner's refusal of the caller's
+        // own statement, naming only that statement's tables, terms and columns.
         failure(
             FailureClass::InvalidArgument,
             format!("{TOOL} cannot page this statement: {error}"),

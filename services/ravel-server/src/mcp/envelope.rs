@@ -267,6 +267,8 @@ pub(crate) fn redacted_internal(
     tenant_hash: TenantHash,
 ) -> Failure {
     log_redacted(client_message, cause, tenant_hash);
+    // mcp-error-display-allow: the caller's fixed message; the cause is logged,
+    // never formatted.
     internal(client_message.to_string())
 }
 
