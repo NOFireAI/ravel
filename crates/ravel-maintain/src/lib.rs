@@ -44,6 +44,7 @@ pub mod clock;
 pub mod codec;
 pub mod compact;
 pub mod compat_activate;
+pub mod compat_certify;
 pub mod compat_init;
 pub mod compat_policy;
 pub mod config;
@@ -52,6 +53,7 @@ pub mod erasure_rewrite;
 pub mod error;
 mod format_floor;
 pub mod gc_config;
+pub mod late_writes;
 pub mod legal_hold;
 pub mod memo_snapshot;
 pub mod migrate;
@@ -92,6 +94,7 @@ pub use compat_activate::{
     ActivateError, ActivateOutcome, ActivateReport, ActivateRequest, FenceCursor, FenceFailure,
     FencePosition, FenceWalkReport, WritableVersions, activate,
 };
+pub use compat_certify::{CertifyRefusal, CertifyReport, CertifyTimings, certify};
 pub use compat_init::{
     CensusSummary, CompatInitError, InitConfig, InitOutcome, InitReport, OutsideReadSet,
     StrictListError, init_compat,
@@ -129,6 +132,7 @@ pub use gc_config::{
     validate_maintain, validate_maintain_compaction_lifetime, validate_maintain_skew,
     validate_query_deadline, validate_query_head_cache_ttl,
 };
+pub use late_writes::{LateWrite, LateWriteReport, late_write_pass};
 pub use legal_hold::{
     AUDIT_HOLD_SHARD, LegalHoldCheck, shard_hold_scopes, write_hold_clear,
     write_hold_clear_with_compat, write_hold_set, write_hold_set_with_compat,
