@@ -183,6 +183,7 @@ async fn publish_object(
 fn build_router(
     store: Arc<dyn ObjectStoreBackend>,
     tokens: HashMap<String, TenantId>,
+    config: SqlConfig,
 ) -> (Router, Arc<SqlExecutor>) {
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
@@ -191,7 +192,7 @@ fn build_router(
         SegmentFetcher::new(store.clone()),
         LogSegmentFetcher::new(store.clone()),
         ravel_sql::SpanSegmentFetcher::new(store.clone()),
-        SqlConfig::default(),
+        config,
         1 << 30,
     ));
     let app = router(SqlState {
@@ -343,6 +344,7 @@ async fn order_by_ts_limit_reads_the_must_read_set_and_arms_the_threshold() {
     let (app, executor) = build_router(
         store,
         HashMap::from([("acme-token".to_string(), tenant.clone())]),
+        SqlConfig::default(),
     );
 
     // The unskipped answer: led by `observed_ts`, which equals `ts` on every
@@ -468,9 +470,16 @@ async fn select_star_topk_reports_a_nonzero_fetch_phase_that_sums_to_accounting(
     for index in 0..OBJECTS {
         publish_object(store.as_ref(), &tenant, index).await;
     }
+    // This fixture's `logs` has only the nine fixed columns, so a `ts` TopK
+    // leaves eight beyond the sort key: exactly the default threshold, which
+    // the rule needs exceeded. Lower it so the rule fires here.
     let (app, executor) = build_router(
         store,
         HashMap::from([("acme-token".to_string(), tenant.clone())]),
+        SqlConfig {
+            late_materialization_extra_columns: Some(0),
+            ..SqlConfig::default()
+        },
     );
 
     let sql = "SELECT * FROM logs ORDER BY ts LIMIT 10";
