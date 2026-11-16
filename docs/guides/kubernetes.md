@@ -243,6 +243,9 @@ Services in the namespace of each `RavelCluster`. Its ClusterRole grants:
   Roles, and RoleBindings it renders for the `ravelNative` ingest router, and
   the ServiceAccounts it renders under `storage.s3.auth: podIdentity` or
   `storage.azure`,
+- `get`/`list`/`watch`/`create`/`patch`/`delete` on `autoscaling`
+  HorizontalPodAutoscalers, for the per-tier HPA under
+  [autoscaling](#autoscaling) mode `Managed`,
 - `RavelCluster` and its status subresource,
 - `get` on Secrets,
 - `get`/`list`/`watch` on `endpointslices` (needed to create the router's own
@@ -842,6 +845,7 @@ For a `RavelCluster` named `dev`:
 | `dev-query` | Service | Port 4318. The fragment port is not on the Service: coordinators dial each query pod's own IP. |
 | `dev-query-fragment` | NetworkPolicy | Admits port 4319 on the query pods only from the query pods. Only under `query.distributedQuery` enabled with every Secret reference set. |
 | `dev-maintain` | Deployment | `--mode maintain`, `spec.maintain.replicas` replicas (default 1), `RollingUpdate` strategy, mounting `maintain.keySecretRef` for `--maintain-key-file`. Absent when `maintain.enabled` is `false`. Without `maintain.keySecretRef`, or while its Secret does not exist, not created, and an existing one is left unchanged; see "Maintain key file" above. |
+| `dev-gateway`, `dev-query`, `dev-maintain` | HorizontalPodAutoscaler | Only under the tier's `autoscaling` mode `Managed`. Removed when the block is removed, withheld, or switched to `External`, or when maintain is disabled. The operator treats an HPA as its own only when it carries both the `app.kubernetes.io/managed-by=ravel-operator` and `app.kubernetes.io/instance` labels for this cluster and an ownerReference to this RavelCluster's uid, and deletes only an HPA it finds to be its own. If it finds an HPA you created at the same name (for example with `kubectl autoscale deployment dev-gateway`), `Managed` mode is withheld for that tier rather than taking the HPA over. See [Autoscaling](#autoscaling). |
 | `dev-gateway-ingest` | Ingress | OTLP/HTTP ingest under the tenant-affinity hash. Only under `ingestAffinity` enabled on `backend: ingressNginx`. |
 | `dev-gateway-ingest-grpc` | Ingress | The same for OTLP/gRPC. Additionally absent when `ingestAffinity.grpc` is `false`. |
 | `dev-ingest-router` | Deployment, Service, ServiceAccount, Role, RoleBinding | The `ravel-ingest-router` and its least-privilege RBAC. Only under `ingestAffinity` enabled on `backend: ravelNative`. See [ingest-affinity.md](ingest-affinity.md). |
@@ -972,7 +976,8 @@ kubectl get -n ravel-system ravelcluster dev -o jsonpath='{.status}'
 `status` carries `observedGeneration`, `gatewayReadyReplicas`,
 `queryReadyReplicas`, `maintainReadyReplicas`, `storeQualifiedHash`,
 `qualifyFailureCount`, `qualifyNextRetryTime`, `qualifyRetryHash`,
-`gcBootstrapWaitingSince`, `podIdentityServiceAccounts`, and conditions.
+`gcBootstrapWaitingSince`, `podIdentityServiceAccounts`, `autoscaledTiers`,
+`replicaAdoptions` (see [Autoscaling](#autoscaling)), and conditions.
 `qualifyFailureCount` and `qualifyNextRetryTime` are the machine-readable
 form of the retry-budget state that the `StoreQualified` message describes in
 prose. `podIdentityServiceAccounts` is `true` from the first
@@ -998,6 +1003,9 @@ The conditions are:
 - `IngestAffinityBackendDeprecated`. Present with status `True` while
   `spec.gateway.ingestAffinity` is enabled with `backend: ingressNginx`; see
   [Ingest affinity](ingest-affinity.md).
+- `AutoscalingWithheld`. Present with status `True` while any tier's
+  `autoscaling` block is withheld, naming each such tier and its reason; see
+  [When autoscaling is withheld](#when-autoscaling-is-withheld).
 - `HealthProbeOnMainHttpPort`. Present with status `True` only while the
   resolved `spec.probes.dedicatedHealthPort` is `false`, most commonly a
   cluster still holding the `false` that the CRDs from v0.19.0 stored on
@@ -1135,6 +1143,166 @@ spec:
 An edit to `memoryBudgetBytes` changes the query Deployment's arguments and
 rolls the query pods. An edit to `memoryHeadroomBytes` changes only the
 condition.
+
+### Autoscaling
+
+By default the operator applies each tier's `replicas` on every pass and
+reverts any other change to the Deployment's replica count. An `autoscaling`
+block on `spec.gateway`, `spec.query` or `spec.maintain` hands that count to
+a horizontal scaler instead:
+
+```yaml
+spec:
+  gateway:
+    replicas: 3
+    resources:
+      requests: { cpu: "1", memory: 2Gi }
+    autoscaling:
+      mode: Managed                       # or External
+      minReplicas: 2
+      maxReplicas: 12
+      targetCPUUtilizationPercentage: 70  # required when mode is Managed
+      scaleDownStabilizationSeconds: 300  # optional, the Kubernetes default
+```
+
+The two modes:
+
+- `Managed`: the operator renders an `autoscaling/v2`
+  HorizontalPodAutoscaler named after the tier's Deployment (`dev-gateway`
+  for a cluster named `dev`). It scales on average CPU utilization at
+  `targetCPUUtilizationPercentage` of the pods' CPU request, between
+  `minReplicas` and `maxReplicas`. The HPA reads CPU from the resource
+  metrics API, so the cluster needs
+  [metrics-server](https://github.com/kubernetes-sigs/metrics-server) or
+  another provider of `metrics.k8s.io`. If the operator finds an HPA it does
+  not own at that name, it withholds the tier instead of taking that HPA
+  over (see [When autoscaling is withheld](#when-autoscaling-is-withheld)).
+- `External`: the operator renders no scaler and only stops applying the
+  replica count. Point your own HPA, KEDA `ScaledObject` or other scaler at
+  the tier's Deployment. The operator deletes an HPA only when it is the
+  operator's own, so you can scale `External` with an HPA you created
+  yourself, including one at the tier's own `dev-gateway` name.
+
+The operator counts an HPA as its own only when the HPA carries the
+`app.kubernetes.io/managed-by=ravel-operator` label, the
+`app.kubernetes.io/instance` label naming this cluster, and an
+ownerReference whose uid is this RavelCluster's uid. Copying the labels onto
+your own HPA does not make it the operator's. The operator reads the
+namespace's HPAs once at the start of each pass to decide this, so an HPA
+created at a `Managed` tier's name after that read and before the
+operator's HPA apply in the same pass is not seen, and is overwritten. If
+the read fails, every tier whose pass might apply or delete an HPA fails
+for that pass before anything is written to it, and is reported through
+`Degraded` with reason `AutoscalingHpaListFailed`; the next pass tries
+again.
+
+The admission rules are `minReplicas` at least 1, `maxReplicas` at least
+`minReplicas`, `targetCPUUtilizationPercentage` from 1 to 100, and
+`scaleDownStabilizationSeconds` from 0 to 3600.
+
+While the block is set, the tier's `replicas` is ignored. On the first pass
+after you add the block, the operator hands the Deployment's live replica
+count to a second field manager, `ravel-operator-handover`, applies the
+Deployment without `replicas`, and records the tier in
+`status.autoscaledTiers` for the turn-off below. The tier keeps the count it
+is running at until the scaler changes it. The live count is handed over as
+it is, even outside `minReplicas`..`maxReplicas`; the HPA brings it into
+range. When the operator creates a tier's Deployment with the block already
+set, it creates it at `minReplicas` and records nothing yet; the handover,
+the HPA, and the `autoscaledTiers` entry follow on the next pass.
+
+#### When autoscaling is withheld
+
+The operator manages the replica count itself, renders no HPA, and sets the
+`AutoscalingWithheld` condition naming the tier and the reason when the
+conditions below hold. For a tier that was never autoscaled it keeps applying
+`replicas`; for one that was autoscaled before the block became withheld it
+keeps the adopted count, exactly as [Turning autoscaling
+off](#turning-autoscaling-off) describes. The conditions:
+
+- the mode is `Managed` and the tier's pods have no CPU request. An omitted
+  `resources` block renders the default request, which has one. A CPU limit
+  without a request also counts, because Kubernetes then sets the request to
+  the limit. `External` mode needs no CPU request.
+- the tier is the gateway and `ingestAffinity` is enabled with `backend:
+  ingressNginx`. That backend regroups the whole subset partition whenever
+  the endpoint count changes and asks for steps of `subsetSize`, which an
+  HPA cannot take. Switch to `backend: ravelNative` (see
+  [Ingest affinity](ingest-affinity.md)) to autoscale the gateway.
+- the mode is `Managed` and the operator finds an HPA it does not own at the
+  tier's Deployment name, such as one created with `kubectl autoscale`. The
+  operator leaves that HPA as it is. Delete it to use `Managed`, or switch
+  to `External` to keep scaling with it.
+
+The condition is removed once no tier is withheld.
+
+#### Turning autoscaling off
+
+Removing the block, or a tier becoming withheld, does not snap the tier back
+to `replicas`. The tier keeps the count the scaler left it at until you
+change `replicas`:
+
+- If `replicas` is unchanged from the value recorded while the tier was
+  autoscaled, the operator first records the live count in
+  `status.replicaAdoptions`, then deletes the tier's HPA if it is the
+  operator's own, then applies that count. Deleting before the apply keeps
+  the HPA from rescaling between the recorded count and the apply. An HPA
+  that is not the operator's is left in place, and can go on scaling the
+  Deployment against the applied count until you remove it. Each later pass
+  applies the recorded count while `replicas` still equals the recorded
+  value. If the status write fails, the pass fails and nothing is applied to
+  the tier. If the HPA delete fails, the tier fails before the apply and
+  stays in `status.autoscaledTiers`, so the next pass turns it off again: it
+  reads the live count anew and records that count in place of the earlier
+  one.
+- If you change `replicas` in the same edit that removes the block, the new
+  value applies at once and nothing is recorded.
+
+A worked example: `replicas: 3`, and the scaler has grown the gateway to 12.
+You remove the `autoscaling` block and the gateway stays at 12. Re-applying
+the same manifest, for instance from Git with `replicas: 3`, leaves it at 12,
+because `replicas` has not changed. Changing `3` to `5` in the same edit
+that removes the block gives 5 at once. To return to 3 after the block is
+gone, change `replicas` to another value and back, or set it straight to the
+count you want.
+
+#### Status
+
+```sh
+kubectl get -n ravel-system ravelcluster dev \
+  -o jsonpath='{.status.autoscaledTiers}{"\n"}{.status.replicaAdoptions}{"\n"}'
+```
+
+- `autoscaledTiers`: one `{tier, declaredReplicas}` entry per tier whose
+  replica count is handed over, refreshed on every pass with the tier's
+  current `replicas`.
+- `replicaAdoptions`: one `{tier, adoptedReplicas, declaredReplicas}` record
+  per tier that kept its live count at turn-off. The operator applies
+  `adoptedReplicas` while the tier's `replicas` equals `declaredReplicas`,
+  and removes the record once it differs.
+
+Both are absent when empty.
+
+#### Scale-down pacing
+
+A `Managed` HPA scales down by at most one pod per period and scales up at
+the HPA defaults:
+
+| Tier | Period | Why |
+|---|---|---|
+| gateway, query | 60 s | longer than the termination grace period the operator sets (45 s, or 51 s with `spec.probes.dedicatedHealthPort: true`), so one pod finishes draining before the next one is removed ([Shutdown](../architecture.md#shutdown)) |
+| maintain | 600 s | longer than the 570 s handover bound (180 s + 60 s + 330 s) within which a surviving maintain replica takes up a departed replica's pairs ([Maintenance](operations/maintenance.md)) |
+
+In `External` mode the operator sets no pacing. Configure the same periods
+on your own scaler (for an HPA, a `behavior.scaleDown` policy of type
+`Pods`, value 1, at the period above).
+
+Every scale-in of the gateway runs the ingest drain path, so on an
+autoscaled gateway alert on increases in
+`ravel_ingest_flush_all_residue_tenants_total` (tenants a drain left with
+rows unflushed)
+and `ravel_shutdown_drain_overrun_total` (shutdowns that ran past
+`--shutdown-timeout`); see [Observability](observability.md).
 
 ### Serving MCP from the query pods
 

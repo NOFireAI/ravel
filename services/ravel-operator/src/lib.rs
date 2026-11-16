@@ -18,6 +18,7 @@
 //! `sys/auth` and the reshard records, and under `podIdentity` to the node's
 //! Pod Identity agent for its own credentials.
 
+pub mod autoscaling;
 pub mod controller;
 pub mod crd;
 pub mod health;
