@@ -570,7 +570,7 @@ host resolves to.
 |---|---|---|---|
 | `--fetch-concurrency <N>` | legacy: sets the three rows below together (source `legacy-flag`) | derived: `max(8, 2 x cores)` | 32 |
 | `--store-get-concurrency <N>` | the process-wide object-store GET ceiling, one `GetLimiter` that every fetcher and engine in the process shares | derived: `max(8, 2 x cores)`, capped at 64 on a loopback store endpoint | 32 |
-| `--sql-partition-count <N>` | the SQL scan partition count, DataFusion `target_partitions` | derived: `max(8, 2 x cores)` | 32 |
+| `--sql-partition-count <N>` | the SQL scan partition count, DataFusion `target_partitions` | derived: `max(8, 2 x cores)`, capped at 32 on a loopback store endpoint | 32 |
 | `--promql-fetch-fanout <N>` | the PromQL/analytics per-query segment fetch fan-out, per selector | derived: `max(8, 2 x cores)` | 32 |
 | `--max-segments <N>` | segments one query fans out over | fixed: 1,000,000 (host-independent) | 1,000,000 |
 | `--max-series <N>` | distinct series per query | fixed: 10,000 (host-independent) | 10,000 |

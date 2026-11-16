@@ -2434,9 +2434,10 @@ method:
 
 `ravel-server` exposes these as `--store-get-concurrency`,
 `--sql-partition-count`, and `--promql-fetch-fanout` (each unset derives from
-host cores like `--fetch-concurrency` always has, except that
-`--store-get-concurrency` is capped at 64 on a loopback store endpoint,
-ADR-4203 decision 3). `--fetch-concurrency`
+host cores like `--fetch-concurrency` always has, except that on a loopback
+store endpoint `--store-get-concurrency` is capped at 64, ADR-4203 decision
+3, and `--sql-partition-count` at 32, ADR-4203 amendment 2026-11-16;
+`--promql-fetch-fanout` is not capped). `--fetch-concurrency`
 still sets all three together (source `legacy-flag` in the startup log);
 combining it with any of the three, or passing `0` to any of the four, is a
 startup error naming the offending flag(s), raised before any fetcher,

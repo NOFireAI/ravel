@@ -2631,6 +2631,11 @@ pub struct QueryArgs {
     /// when unset: derived, `max(MIN_DERIVED_FETCH_CONCURRENCY,
     /// FETCH_CONCURRENCY_PER_CORE * cores)`.
     ///
+    /// On a loopback store endpoint the derived default is capped at
+    /// `LOOPBACK_SQL_PARTITION_COUNT_CAP` (32), logged at source
+    /// `derived-loopback-cap` when the cap lowers it (ADR-4203, amendment
+    /// 2026-11-16). This flag and `--fetch-concurrency` are not capped.
+    ///
     /// Legacy precedence: `--fetch-concurrency` still sets this (and the two
     /// flags above/below) when neither is given explicitly. Setting both
     /// `--fetch-concurrency` and this flag is a startup error.
@@ -5623,11 +5628,14 @@ pub const PERF_SOURCE_DERIVED_AVAILABLE: &str = "derived-available";
 /// `MemAvailable` ignored: the limit is already this process's share of the
 /// host (ADR-1170, amended 2026-10-03 by issue #2367).
 pub const PERF_SOURCE_DERIVED_CGROUP: &str = "derived-cgroup";
-/// [`ResolvedPerformanceDefaults`] source: neither `--store-get-concurrency`
-/// nor `--fetch-concurrency` was set, the store is a loopback endpoint
-/// (`PerformanceFlags::store_is_loopback`), and the derived
-/// `store_get_concurrency` was above [`LOOPBACK_STORE_GET_CONCURRENCY_CAP`], so
-/// the cap is the value in force (ADR-4203 decision 3).
+/// [`ResolvedPerformanceDefaults`] source: a derived knob was lowered because
+/// the store is a loopback endpoint (`PerformanceFlags::store_is_loopback`) and
+/// neither its own flag nor `--fetch-concurrency` was set. Two knobs carry it:
+/// `store_get_concurrency` when the derived value was above
+/// [`LOOPBACK_STORE_GET_CONCURRENCY_CAP`] (ADR-4203 decision 3), and
+/// `sql_partition_count` when it was above [`LOOPBACK_SQL_PARTITION_COUNT_CAP`]
+/// (ADR-4203, amendment 2026-11-16). A value already at or under its cap keeps
+/// source `derived`.
 pub const PERF_SOURCE_DERIVED_LOOPBACK_CAP: &str = "derived-loopback-cap";
 
 /// Ceiling on the derived `store_get_concurrency` when the store is a loopback
@@ -5637,6 +5645,18 @@ pub const PERF_SOURCE_DERIVED_LOOPBACK_CAP: &str = "derived-loopback-cap";
 /// value only; an explicit `--store-get-concurrency` or the legacy
 /// `--fetch-concurrency` is used as given.
 pub const LOOPBACK_STORE_GET_CONCURRENCY_CAP: usize = 64;
+
+/// Ceiling on the derived `sql_partition_count` when the store is a loopback
+/// endpoint (ADR-4203, amendment 2026-11-16). On the M3 readout (one
+/// c6a.metal, 192 vCPU, loopback store; issue #4203 comment 6902318979),
+/// 32 partitions against the stock 384 cut cold total from 150.5 s to 137.2 s
+/// and hot from 24.4 s to 16.5 s, and 32 was the measured cold trough (131.7,
+/// 129.4, 131.6 s at 19, 32, 96 partitions, three statements excluded).
+/// Applies to the derived value only; an explicit `--sql-partition-count` or
+/// the legacy `--fetch-concurrency` is used as given. Loopback-only: 32 over 96
+/// rests on cold reads from one local volume, and on a real store partitions
+/// also bound GETs in flight, which nothing measured (issue #3714).
+pub const LOOPBACK_SQL_PARTITION_COUNT_CAP: usize = 32;
 
 /// The operator's explicit performance flags: `None` per field means "derive".
 /// One field is not a flag: `store_is_loopback`, a fact about the store the
@@ -5682,11 +5702,13 @@ pub struct PerformanceFlags {
     pub column_stats_cache_max_bytes: Option<u64>,
     /// Whether this deployment's `--store s3`, `gcs` or `azure` points at a
     /// loopback endpoint, computed by [`Cli::store_is_loopback`]: the
-    /// same predicate [`Cli::resolve_logs_fetch_policy`] uses. Two derivations
-    /// read this: the fetcher cache's share (ADR-2023) and the
+    /// same predicate [`Cli::resolve_logs_fetch_policy`] uses. Three derivations
+    /// read this: the fetcher cache's share (ADR-2023), the
     /// [`LOOPBACK_STORE_GET_CONCURRENCY_CAP`] on the derived
-    /// `store_get_concurrency` (ADR-4203 decision 3). The catalog byte cache,
-    /// `sql_partition_count` and `promql_fetch_fanout` do not.
+    /// `store_get_concurrency` (ADR-4203 decision 3) and the
+    /// [`LOOPBACK_SQL_PARTITION_COUNT_CAP`] on the derived
+    /// `sql_partition_count` (ADR-4203, amendment 2026-11-16). The catalog
+    /// byte cache and `promql_fetch_fanout` do not.
     pub store_is_loopback: bool,
     /// `--sql-max-query-bytes`.
     pub sql_max_query_bytes: Option<usize>,
@@ -6004,10 +6026,13 @@ fn resolve_knob(
 ///   FETCH_CONCURRENCY_PER_CORE * cores)`.
 /// - `store_get_concurrency`, `sql_partition_count`, `promql_fetch_fanout`
 ///   (ADR-1195): the same derived value, through [`resolve_knob`]. When
-///   `flags.store_is_loopback` and neither `--store-get-concurrency` nor
-///   `--fetch-concurrency` was set, `store_get_concurrency` alone is then
-///   capped at [`LOOPBACK_STORE_GET_CONCURRENCY_CAP`] (ADR-4203 decision 3),
-///   sourced [`PERF_SOURCE_DERIVED_LOOPBACK_CAP`] when the cap lowered it.
+///   `flags.store_is_loopback` and neither the knob's own flag nor
+///   `--fetch-concurrency` was set, two of them are then capped:
+///   `store_get_concurrency` at [`LOOPBACK_STORE_GET_CONCURRENCY_CAP`]
+///   (ADR-4203 decision 3) and `sql_partition_count` at
+///   [`LOOPBACK_SQL_PARTITION_COUNT_CAP`] (ADR-4203, amendment 2026-11-16),
+///   each sourced [`PERF_SOURCE_DERIVED_LOOPBACK_CAP`] when the cap lowered it.
+///   `promql_fetch_fanout` is never capped.
 /// - `catalog_resolve_concurrency` (ADR-1733 decision 2):
 ///   `clamp(Q * RESOLVE_CONCURRENCY_PER_QUERY, RESOLVE_CONCURRENCY_PER_QUERY,
 ///   ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY)`, then held at
@@ -6124,11 +6149,21 @@ pub fn resolve_performance_defaults(
         }
         resolved => resolved,
     };
-    let (sql_partition_count, sql_partition_count_source) = resolve_knob(
+    let (sql_partition_count, sql_partition_count_source) = match resolve_knob(
         flags.sql_partition_count,
         flags.fetch_concurrency,
         derived_fetch_concurrency,
-    );
+    ) {
+        (derived, PERF_SOURCE_DERIVED)
+            if flags.store_is_loopback && derived > LOOPBACK_SQL_PARTITION_COUNT_CAP =>
+        {
+            (
+                LOOPBACK_SQL_PARTITION_COUNT_CAP,
+                PERF_SOURCE_DERIVED_LOOPBACK_CAP,
+            )
+        }
+        resolved => resolved,
+    };
     let (promql_fetch_fanout, promql_fetch_fanout_source) = resolve_knob(
         flags.promql_fetch_fanout,
         flags.fetch_concurrency,
@@ -8531,8 +8566,9 @@ impl Cli {
     /// `--gcs-endpoint`, or a `--store azure` one against a loopback
     /// `--azure-endpoint`: the single place this predicate is computed
     /// (ADR-2023 decision 3), read by [`Self::performance_flags`] to size the
-    /// fetcher cache's loopback share and cap the derived store GET
-    /// concurrency (ADR-4203 decision 3), and by [`Self::resolve_logs_fetch_policy`]
+    /// fetcher cache's loopback share, cap the derived store GET
+    /// concurrency (ADR-4203 decision 3) and cap the derived SQL partition
+    /// count (ADR-4203, amendment 2026-11-16), and by [`Self::resolve_logs_fetch_policy`]
     /// for the loopback policy default (ADR-2677 decision 7). Each endpoint is
     /// read only under its own store, so a stray exported `RAVEL_S3_ENDPOINT`
     /// cannot change behaviour for a `--store memory` start.
@@ -13370,16 +13406,17 @@ mod tests {
     /// GET concurrency is `min(derived, 64)`, sourced `derived-loopback-cap`
     /// when the cap lowered it, and that value is what the engine's GET
     /// permit pool is built from. A non-loopback store, an explicit flag and
-    /// the legacy flag are not capped; `sql_partition_count` and
-    /// `promql_fetch_fanout` keep the uncapped derivation; a host whose
-    /// derived value is at or under 64 keeps it, sourced `derived`.
+    /// the legacy flag are not capped; `promql_fetch_fanout` keeps the
+    /// uncapped derivation; a host whose derived value is at or under 64 keeps
+    /// it, sourced `derived`. `sql_partition_count` carries its own,
+    /// lower loopback cap (32), proven in
+    /// [`derived_sql_partition_count_on_loopback_is_capped_and_reaches_the_engine`].
     ///
-    /// Prove-the-test: remove the cap arm in `resolve_performance_defaults`
-    /// and the 192-core loopback case reads 384/`derived`. Cap regardless of
-    /// source, cap regardless of `store_is_loopback`, cap
-    /// `sql_partition_count` too, or set 64 instead of `min(derived, 64)`, and
-    /// the explicit-flag, remote, partition-count or 16-core assertion fails
-    /// in turn.
+    /// Prove-the-test: remove the GET cap arm in
+    /// `resolve_performance_defaults` and the 192-core loopback case reads
+    /// 384/`derived`. Cap regardless of source, cap regardless of
+    /// `store_is_loopback`, or set 64 instead of `min(derived, 64)`, and the
+    /// explicit-flag, remote or 16-core assertion fails in turn.
     #[test]
     fn derived_store_get_concurrency_on_loopback_is_capped_and_reaches_the_engine() {
         let big = host_with_cores(192);
@@ -13406,15 +13443,17 @@ mod tests {
                 capped.sql_partition_count,
                 capped.sources.sql_partition_count
             ),
-            (384, PERF_SOURCE_DERIVED),
-            "the cap is on GET permits only, not on SQL partitions"
+            (32, PERF_SOURCE_DERIVED_LOOPBACK_CAP),
+            "the SQL partition count has its own loopback cap (32), separate \
+             from the 64 GET cap"
         );
         assert_eq!(
             (
                 capped.promql_fetch_fanout,
                 capped.sources.promql_fetch_fanout
             ),
-            (384, PERF_SOURCE_DERIVED)
+            (384, PERF_SOURCE_DERIVED),
+            "promql_fetch_fanout is never capped"
         );
         assert_eq!(capped.fetch_concurrency, 384);
 
@@ -13428,7 +13467,7 @@ mod tests {
             capped.store_get_concurrency,
             "the engine's GET permits must be the resolved, capped value"
         );
-        assert_eq!(engine.sql_partition_count(), 384);
+        assert_eq!(engine.sql_partition_count(), 32);
 
         let remote = resolve(
             &[
@@ -13530,6 +13569,44 @@ mod tests {
         );
     }
 
+    /// The real startup stamp names the partition cap: `emit` writes the
+    /// capped `sql_partition_count` line with the `derived-loopback-cap`
+    /// source, exactly once (ADR-4203 amendment 2026-11-16).
+    ///
+    /// Prove-the-test: remove the SQL partition cap arm in
+    /// `resolve_performance_defaults` and the line reads
+    /// `value=384 source="derived"`.
+    #[test]
+    fn loopback_sql_partition_cap_is_named_on_the_startup_stamp() {
+        let big = host_with_cores(192);
+        let capped = cli(&LOOPBACK_S3)
+            .resolve_performance(big)
+            .expect("performance defaults resolve");
+
+        let (captured, _guard) = capture_events(tracing::Level::INFO);
+        capped.emit(big);
+        let lines = captured.lock();
+        let expected = format!(
+            " setting=\"sql_partition_count\" value=32 \
+             source=\"{PERF_SOURCE_DERIVED_LOOPBACK_CAP}\""
+        );
+        let matching = lines
+            .iter()
+            .filter(|l| l.contains("message=performance default resolved"))
+            .filter(|l| l.contains("setting=\"sql_partition_count\""))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "exactly one sql_partition_count stamp line, lines: {lines:?}"
+        );
+        assert!(
+            matching[0].contains(&expected),
+            "the stamp must carry the capped value and its source, got {:?}",
+            matching[0]
+        );
+    }
+
     /// ADR-4203 decision 3 against ADR-2677 decision 7: the cap holds the
     /// derived GET permits under `LATENCY_FIRST_MEASURED_CONCURRENCY` (256),
     /// so on a loopback host large enough to derive 256 or more, the
@@ -13565,7 +13642,7 @@ mod tests {
             Some(ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY)
         );
         assert_eq!(derived.store_get_concurrency, 64);
-        assert_eq!(derived.sql_partition_count, 384);
+        assert_eq!(derived.sql_partition_count, 32);
         assert_eq!(derived.latency_first_precondition_met(), Some(false));
 
         let (captured, guard) = capture_events(tracing::Level::INFO);
@@ -13583,7 +13660,7 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("store_get_concurrency=64"), "{line}");
-        assert!(line.contains("sql_partition_count=384"), "{line}");
+        assert!(line.contains("sql_partition_count=32"), "{line}");
         assert!(
             line.contains("latency_first_measured_concurrency=256"),
             "{line}"
@@ -13599,6 +13676,146 @@ mod tests {
         ]);
         let raised = stamp_on(&raised_args);
         assert_eq!(raised.latency_first_precondition_met(), Some(true));
+    }
+
+    /// ADR-4203 amendment 2026-11-16: on a loopback store with neither
+    /// `--sql-partition-count` nor `--fetch-concurrency`, the derived SQL
+    /// partition count is `max(8, min(2 * cores, 32))`, sourced
+    /// `derived-loopback-cap` when the cap lowered it, and that value is what
+    /// the engine's `target_partitions` is built from. A non-loopback store,
+    /// an explicit flag and the legacy flag are not capped. The store GET
+    /// concurrency keeps its own, higher loopback cap (64), and the
+    /// core-derived CPU-gate read permits are untouched.
+    ///
+    /// Prove-the-test: remove the SQL partition cap arm in
+    /// `resolve_performance_defaults` and the 192-core loopback case reads
+    /// 384/`derived`, failing the `capped`, `engine` and `at_cap` assertions.
+    /// Apply the cap regardless of `store_is_loopback` and the `remote`
+    /// assertion fails; apply it after the explicit value and `explicit`
+    /// fails; use `min(cores, 32)` or a hardcoded 32 and the 8-core, 2-core
+    /// or `at_cap` assertion fails.
+    #[test]
+    fn derived_sql_partition_count_on_loopback_is_capped_and_reaches_the_engine() {
+        let big = host_with_cores(192);
+        let resolve = |args: &[&str], host: HostProfile| {
+            cli(args)
+                .resolve_performance(host)
+                .expect("performance defaults resolve")
+        };
+
+        let loopback = cli(&LOOPBACK_S3);
+        let capped = loopback
+            .resolve_performance(big)
+            .expect("performance defaults resolve");
+        assert_eq!(
+            (
+                capped.sql_partition_count,
+                capped.sources.sql_partition_count
+            ),
+            (32, PERF_SOURCE_DERIVED_LOOPBACK_CAP),
+            "a derived 384 on a loopback store must be capped at 32"
+        );
+        assert_eq!(
+            (
+                capped.store_get_concurrency,
+                capped.sources.store_get_concurrency
+            ),
+            (64, PERF_SOURCE_DERIVED_LOOPBACK_CAP),
+            "the GET concurrency keeps its own, higher loopback cap of 64"
+        );
+        // The CPU-gate read permits are core-derived (191 on 192 cores: the
+        // M3 p32 stamp's RP=191) and no loopback cap touches them.
+        assert_eq!(loopback.resolve_cpu_gate_permits(big).read, 191);
+
+        let engine = loopback
+            .query_budgets(&capped)
+            .expect("budgets resolve")
+            .apply_to_engine(ravel_query::EngineConfig::default())
+            .expect("engine config resolves");
+        assert_eq!(
+            engine.sql_partition_count(),
+            capped.sql_partition_count,
+            "the engine's target_partitions must be the resolved, capped value"
+        );
+        assert_eq!(engine.sql_partition_count(), 32);
+
+        let remote = resolve(
+            &[
+                "--store",
+                "s3",
+                "--s3-endpoint",
+                "https://s3.us-east-1.amazonaws.com",
+            ],
+            big,
+        );
+        assert_eq!(
+            (
+                remote.sql_partition_count,
+                remote.sources.sql_partition_count
+            ),
+            (384, PERF_SOURCE_DERIVED),
+            "a non-loopback store is not capped"
+        );
+
+        let mut explicit_args = LOOPBACK_S3.to_vec();
+        explicit_args.extend(["--sql-partition-count", "384"]);
+        let explicit = resolve(&explicit_args, big);
+        assert_eq!(
+            (
+                explicit.sql_partition_count,
+                explicit.sources.sql_partition_count
+            ),
+            (384, PERF_SOURCE_FLAG),
+            "an explicit --sql-partition-count is used as given"
+        );
+
+        let mut legacy_args = LOOPBACK_S3.to_vec();
+        legacy_args.extend(["--fetch-concurrency", "384"]);
+        let legacy = resolve(&legacy_args, big);
+        assert_eq!(
+            (
+                legacy.sql_partition_count,
+                legacy.sources.sql_partition_count
+            ),
+            (384, PERF_SOURCE_LEGACY_FLAG),
+            "the legacy --fetch-concurrency is used as given"
+        );
+
+        let eight = resolve(&LOOPBACK_S3, host_with_cores(8));
+        assert_eq!(
+            (eight.sql_partition_count, eight.sources.sql_partition_count),
+            (16, PERF_SOURCE_DERIVED),
+            "a derived value under the cap is kept, not raised to it"
+        );
+
+        let two = resolve(&LOOPBACK_S3, host_with_cores(2));
+        assert_eq!(
+            (two.sql_partition_count, two.sources.sql_partition_count),
+            (MIN_DERIVED_FETCH_CONCURRENCY, PERF_SOURCE_DERIVED),
+            "a tiny host floors at the minimum, below the cap"
+        );
+        assert_eq!(MIN_DERIVED_FETCH_CONCURRENCY, 8);
+
+        // At 32 cores the derived value (64) is above the partition cap (32)
+        // but at the GET cap (64): partitions are lowered and GET permits are
+        // not, so the two caps are proven to be distinct values.
+        let at_cap = resolve(&LOOPBACK_S3, host_with_cores(32));
+        assert_eq!(
+            (
+                at_cap.sql_partition_count,
+                at_cap.sources.sql_partition_count
+            ),
+            (32, PERF_SOURCE_DERIVED_LOOPBACK_CAP),
+            "a 32-core loopback host caps partitions at 32"
+        );
+        assert_eq!(
+            (
+                at_cap.store_get_concurrency,
+                at_cap.sources.store_get_concurrency
+            ),
+            (64, PERF_SOURCE_DERIVED),
+            "the same host leaves GET permits at the uncapped derived 64"
+        );
     }
 
     /// ADR-1195 reachability: `--sql-partition-count` must reach the

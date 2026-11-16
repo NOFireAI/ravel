@@ -429,9 +429,12 @@ endpoint (`--store s3`, `gcs` or `azure` against a loopback endpoint), the
 derived value is capped at 64 (ADR-4203 decision 3). The startup line
 `performance default resolved setting="store_get_concurrency"` then carries
 `source="derived-loopback-cap"` when the cap lowered the value, and
-`source="derived"` when the derived value was already 64 or less. Only the GET
-permits are capped: `--sql-partition-count` and `--promql-fetch-fanout` keep
-the uncapped derivation, and a flag value is used as given.
+`source="derived"` when the derived value was already 64 or less. On the same
+loopback store, with neither `--sql-partition-count` nor `--fetch-concurrency`
+set, the derived SQL partition count is capped at 32 instead (ADR-4203,
+amendment 2026-11-16), with the same two sources on its
+`setting="sql_partition_count"` line. `--promql-fetch-fanout` keeps the
+uncapped derivation, and a flag value is used as given.
 
 ## Where the trust and failure boundaries are
 

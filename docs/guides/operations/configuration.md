@@ -2331,7 +2331,7 @@ published ClickBench run used.
 |---|---|---|---|
 | `--fetch-concurrency` | derived: `max(8, 2 x cores)` | 32 | Legacy combined knob: sets `--store-get-concurrency`, `--sql-partition-count`, and `--promql-fetch-fanout` together (source `legacy-flag`). Combining it with any of the three is a startup error naming both flags. |
 | `--store-get-concurrency` | derived: `max(8, 2 x cores)`, capped at 64 on a loopback store endpoint (source `derived-loopback-cap` when the cap lowers it) | 32 | Permit count for the one process-wide `GetLimiter` every fetcher (RSEG, RLOG, RSPAN) shares. Host cores and the store's request budget. |
-| `--sql-partition-count` | derived: `max(8, 2 x cores)` | 32 | DataFusion `target_partitions` for every SQL session the server builds. While it is derived, the hash exchange under a final grouped aggregate has at least 16 partitions (see below). Host cores and query parallelism vs. per-partition overhead. |
+| `--sql-partition-count` | derived: `max(8, 2 x cores)`, capped at 32 on a loopback store endpoint (source `derived-loopback-cap` when the cap lowers it) | 32 | DataFusion `target_partitions` for every SQL session the server builds. While it is derived, the hash exchange under a final grouped aggregate has at least 16 partitions (see below). Host cores and query parallelism vs. per-partition overhead. |
 | `--promql-fetch-fanout` | derived: `max(8, 2 x cores)` | 32 | PromQL/analytics per-query segment fetch fan-out. Host cores and the store's request budget. |
 | `--max-segments` | fixed: 1,000,000 (host-independent) | 1,000,000 | How many sealed objects a wide scan touches. Only the recent set, roughly the last two hours, is exempt, so a tenant with a lot of sealed history hits this before you expect. Lower it to bound plan width on a host you share with something else. |
 | `--max-series` | fixed: 10,000 (host-independent) | 10,000 | Distinct series one PromQL query may materialize. A count that bounds plan width; the bytes behind it are bounded by the memory budget. Process-wide, with no limits-file key. |
@@ -2629,7 +2629,7 @@ from:
 | `flag` | The operator set it, and it is used verbatim. On `memory_budget_bytes`, it means that `--memory-budget-bytes` won over every derivation branch. A `flag` or `fallback` budget subtracts no overhead reserve, so the `memory_overhead_reserve_bytes` line is printed only on a derived source. |
 | `legacy-flag` | No flag for this setting, but the legacy `--fetch-concurrency` was set and its value is used. |
 | `derived` | Computed from the host profile, or from a host-independent rule. |
-| `derived-loopback-cap` | `store_get_concurrency` only: the store is a loopback endpoint, neither `--store-get-concurrency` nor `--fetch-concurrency` was set, and the derived `max(8, 2 x cores)` was above 64, so 64 is used. |
+| `derived-loopback-cap` | The store is a loopback endpoint and neither the knob's own flag nor `--fetch-concurrency` was set, so a derived `max(8, 2 x cores)` above the cap is lowered to it. On `store_get_concurrency` the cap is 64; on `sql_partition_count` it is 32. |
 | `derived-available` | `memory_budget_bytes` only: no cgroup limit, derived from `MemAvailable`. |
 | `derived-cgroup` | `memory_budget_bytes` only: a cgroup memory limit is present, so the budget is that limit minus the reserve, ignoring `MemAvailable`. |
 | `budget-carve` | A fixed share of `memory_budget_bytes` and not of raw `MemTotal`. The three cache ceilings resolve to this on a host whose memory could be read or whose budget was set with `--memory-budget-bytes`. |
