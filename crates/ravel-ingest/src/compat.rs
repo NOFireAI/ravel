@@ -31,8 +31,9 @@
 //! A router given `None`, or none at all, writes each family's `CURRENT`
 //! version with none of these checks, exactly as before the policy existed.
 //! Every refusal counts once under its [`CompatRefusalReason`] in the
-//! signal's ingest metrics snapshot (`compat_publish_refused`), a field
-//! `ravel-server` does not yet render on `/metrics` (#4287).
+//! signal's ingest metrics snapshot (`compat_publish_refused`), which
+//! `ravel-server` renders on `/metrics` as
+//! `ravel_compat_publish_refused_total` (#4301).
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,7 +51,7 @@ use crate::clock::Clock;
 use crate::format_floor::FormatFamily;
 
 /// Attempts at the bucket fence before a lost CAS race fails the flush.
-const FENCE_ATTEMPTS: u32 = 3;
+pub(crate) const FENCE_ATTEMPTS: u32 = 3;
 
 /// The longest jittered wait between two fence attempts.
 const FENCE_BACKOFF_MAX: Duration = Duration::from_millis(50);
@@ -209,8 +210,18 @@ impl IngestCompatPolicy {
     }
 
     /// The version the view names for `family`: its active version when this
-    /// build writes it, else the family's baseline. Unlike
-    /// [`Self::write_version`] it does not refuse on a stale or missing view.
+    /// build writes it, else the family's baseline. An active version this
+    /// build does not write falls to the baseline here too, because this is a
+    /// version-selection helper, not the publish gate: the compat write policy
+    /// refuses such a write outright as
+    /// [`CompatRefusal::ActiveVersionNotWritable`]
+    /// ([`Self::write_version`]), so the baseline this names is never actually
+    /// published. A format-floor check reading this version
+    /// ([`FormatFamily::writable_version_under`]) therefore compares the floor
+    /// against the baseline, which can surface as `BelowFormatFloor` even
+    /// though the operative refusal on the write path is
+    /// `ActiveVersionNotWritable`. Unlike [`Self::write_version`] it does not
+    /// refuse on a stale or missing view.
     pub fn named_version(&self, family: FormatFamily) -> u16 {
         let versions = &self.families[family_index(family)];
         self.view
@@ -326,8 +337,9 @@ impl CompatRefusalReason {
     }
 }
 
-/// A write or flush the activation policy refused. Nothing of it was
-/// published.
+/// A write or flush the activation policy refused. No commit record is
+/// published by the refused attempt; a data object already stored before the
+/// refusal is left for orphan GC.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CompatPublishRefusal {
     /// The view refused (ADR-4233 decision 2).
@@ -659,7 +671,8 @@ pub(crate) fn warn_publish_refused(
         reason = refusal.reason().as_str(),
         error = %refusal,
         "refusing to publish: the sys/compat activation policy does not allow it; no commit \
-         record was stored"
+         record is published by the refused attempt, and a data object already stored before \
+         the refusal is left for orphan GC"
     );
 }
 

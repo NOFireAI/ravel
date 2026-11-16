@@ -27,8 +27,8 @@ use crate::config::IngestConfig;
 use crate::deferral::DeferralCapFlag;
 use crate::format_floor::{FormatFamily, FormatFloorPolicy};
 use crate::generation::{
-    DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender, Routed, SwitchScope,
-    ViewRead,
+    BucketCompatCache, DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender,
+    Routed, SwitchScope, ViewRead,
 };
 use crate::indexed_fields::IndexedFieldsOverlay;
 use crate::log_error::LogWriteError;
@@ -277,9 +277,11 @@ impl LogIngestRouter {
         #[cfg(feature = "stage-timing")]
         let stage_timings = Arc::new(LogStageTimings::new());
         let compat = CompatSlot::default();
+        let bucket_compat = BucketCompatCache::default();
         let switch = Arc::new_cyclic(|weak: &Weak<GenerationSwitch<LogShardHandle>>| {
             let weak = weak.clone();
             let scope_compat = compat.clone();
+            let scope_bucket = bucket_compat.clone();
             let store = Arc::clone(&store);
             let refresh_store = Arc::clone(&store);
             let clock = Arc::clone(&clock);
@@ -296,6 +298,7 @@ impl LogIngestRouter {
                     weak.clone(),
                     shard_count,
                     scope_compat.clone(),
+                    scope_bucket.clone(),
                 ));
                 let writer_id = rng.new_uuid();
                 let epoch =
@@ -335,6 +338,7 @@ impl LogIngestRouter {
                 .with_refresh_source(refresh_store, ravel_types::Signal::Logs, refresh_clock)
                 .with_read_failures(read_failures)
                 .with_compat_slot(compat.clone())
+                .with_bucket_cache(bucket_compat.clone())
         });
 
         LogIngestRouter {

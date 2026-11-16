@@ -2677,14 +2677,17 @@ pub async fn start_with_heartbeat_and_ipcrypt(
 
     // The one `sys/compat` view this process holds (ADR-4233 decision 3), in
     // every mode, read once here before any writer starts and then every
-    // `DEFAULT_COMPAT_REFRESH_INTERVAL` by one task. Three consumers read it:
-    // first-touch provisioning, the catalog fold (through the catalog) and
-    // the alert evaluator. Ingest and maintenance do not read it yet
-    // (#4244, #4245). `None` on an unkeyed bucket.
+    // `DEFAULT_COMPAT_REFRESH_INTERVAL` by one task. Every writer reads it:
+    // first-touch provisioning, the catalog fold (through the catalog), the
+    // alert evaluator, the ingest routers (#4244) and the maintenance
+    // compactor (#4245) below. One clock stamps the view's reads and judges
+    // staleness for every policy built over it. `None` on an unkeyed bucket.
+    let compat_clock: Arc<dyn ravel_catalog::compat::CompatClock> =
+        Arc::new(compat::SystemCompatClock);
     let compat_view = compat::build_compat_view(
         store_background.clone(),
         config.deployment_key.as_deref(),
-        Arc::new(compat::SystemCompatClock),
+        compat_clock.clone(),
     )?;
     if let Some(view) = &compat_view {
         compat::refresh_once(view).await;
@@ -2729,6 +2732,21 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         .clone()
         .unwrap_or_default();
 
+    // The `sys/compat` write policy every ingest router of this process applies
+    // (ADR-4233 decisions 2 to 4, #4244): one policy over the process's view,
+    // shared by `Arc` across the metrics, log and span routers so one
+    // activation governs all three. `None` on an unkeyed bucket, where the
+    // view is `None`: every writer keeps its build's current version, as
+    // before the policy existed. Installed below with `with_compat_policy`,
+    // which refuses to start a router whose `max_flush_lifetime` exceeds the
+    // record's `max_publish_lifetime_ns` (decision 7).
+    let ingest_compat_policy = compat_view.clone().map(|view| {
+        Arc::new(ravel_ingest::IngestCompatPolicy::new(
+            view,
+            compat_clock.clone(),
+        ))
+    });
+
     let ingest_router = if config.mode.holds_ingest_buffer() {
         let ingest_config = validated_ingest_config(
             IngestConfig {
@@ -2767,7 +2785,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             )
             .with_budget(ingest_buffer_budget.clone())
             .with_write_gate(cpu_gates.write.clone())
-            .with_format_floor_policy(format_floor_policy.clone()),
+            .with_format_floor_policy(format_floor_policy.clone())
+            .with_compat_policy(ingest_compat_policy.clone())?,
         ))
     } else {
         None
@@ -2852,7 +2871,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             )
             .with_budget(ingest_buffer_budget.clone())
             .with_write_gate(cpu_gates.write.clone())
-            .with_format_floor_policy(format_floor_policy.clone()),
+            .with_format_floor_policy(format_floor_policy.clone())
+            .with_compat_policy(ingest_compat_policy.clone())?,
         ))
     } else {
         None
@@ -2888,7 +2908,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             )
             .with_budget(ingest_buffer_budget.clone())
             .with_write_gate(cpu_gates.write.clone())
-            .with_format_floor_policy(format_floor_policy.clone()),
+            .with_format_floor_policy(format_floor_policy.clone())
+            .with_compat_policy(ingest_compat_policy.clone())?,
         ))
     } else {
         None
@@ -3379,6 +3400,25 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         config.maintain.compactor.merge_memory_tracker = Some(tracker.clone());
         tracker
     });
+    // The `sys/compat` write policy every maintenance writer of this process
+    // obeys (ADR-4233 decisions 3, 4 and 7, #4245): compaction, migrate, the
+    // force-2 re-encode and the erasure rewrite fix each family's version from
+    // the view at run start, re-check its age before every PUT, fence the
+    // bucket before the first object above a family baseline, and refuse a run
+    // whose publish lifetime exceeds the recorded P. Assigned in place for the
+    // same reason as the tracker above: every compactor config the maintenance
+    // supervisor derives is a clone of this one. `Some` only in Mode::Maintain,
+    // the one mode that runs those writers, and only on a keyed bucket where
+    // the view is `Some`; elsewhere `None`, writing the build's current
+    // versions with no checks, as before the policy existed.
+    if matches!(config.mode, Mode::Maintain)
+        && let Some(view) = compat_view.clone()
+    {
+        config.maintain.compactor.compat_policy = Some(ravel_maintain::MaintainCompatPolicy::new(
+            view,
+            compat_clock.clone(),
+        ));
+    }
     // ADR-1702 task 10: compaction's decode and re-encode, and the snapshot
     // reachability reads of retention and the sweep, run on the read gate.
     // Assigned in place for the same reason as the tracker above; every

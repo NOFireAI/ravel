@@ -122,8 +122,9 @@ pub enum WriteError {
     /// The `sys/compat` activation policy refused the write's publish
     /// (ADR-4233): at admission when the cached view already refuses, or at
     /// permit grant and before every PUT attempt of its flush, whose rows are
-    /// then dropped with nothing stored. Always retryable
-    /// ([`crate::CompatPublishRefusal::is_retryable`]).
+    /// then dropped. No commit record is published by the refused attempt; a
+    /// data object already stored before the refusal is left for orphan GC.
+    /// Always retryable ([`crate::CompatPublishRefusal::is_retryable`]).
     #[error(transparent)]
     CompatRefused(#[from] crate::compat::CompatPublishRefusal),
     /// A multi-shard Strict write in which at least one shard failed *after*
