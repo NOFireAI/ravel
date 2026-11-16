@@ -705,17 +705,40 @@ struct ViewState {
     /// Whether any GET of `sys/compat` in this run returned an object, read
     /// or not: a decoded record, or one this build refused to decode.
     record_seen: bool,
-    /// Whether the refresh that finished last failed with a store error other
-    /// than `AccessDenied`. Such a failure says nothing about the grant, so
-    /// while no read has succeeded the view cannot tell whether an activation
-    /// happened and is not blind. The next refresh to finish overwrites it.
+    /// Whether the refresh that started last and has finished failed with a
+    /// store error other than `AccessDenied`. Such a failure says nothing
+    /// about the grant, so while no read has succeeded the view cannot tell
+    /// whether an activation happened and is not blind. Ordered by
+    /// [`Self::latest_outcome_ticket`], not by finish time: a slow error that
+    /// finishes after a later refresh never overwrites the later refresh's
+    /// outcome.
     latest_failed_not_denied: bool,
+    /// The start ticket of the refresh [`Self::latest_failed_not_denied`]
+    /// reflects. A refresh that started earlier never overwrites it, the same
+    /// ordering [`Self::merged_ticket`] gives the record.
+    latest_outcome_ticket: Option<u64>,
     last_record: Option<sysproto::CompatRecord>,
     seen_epoch: u64,
     families: BTreeMap<String, SeenFamily>,
 }
 
 impl ViewState {
+    /// Record whether the refresh of start-order `ticket` failed with a
+    /// non-denied store error, but only when it started later than the one
+    /// already recorded. Two overlapping refreshes finish in either order, so
+    /// the finish order cannot decide the latest outcome: a slow non-denied
+    /// error completing after a later success must not revive the blind-view
+    /// suspension the success cleared, and vice versa.
+    fn note_latest_outcome(&mut self, ticket: u64, failed_not_denied: bool) {
+        if self
+            .latest_outcome_ticket
+            .is_none_or(|merged| ticket > merged)
+        {
+            self.latest_outcome_ticket = Some(ticket);
+            self.latest_failed_not_denied = failed_not_denied;
+        }
+    }
+
     fn merge(
         &mut self,
         record: Option<sysproto::CompatRecord>,
@@ -859,7 +882,7 @@ impl CompatView {
             Err(err) => {
                 let mut state = self.inner.state.write();
                 if matches!(err, CompatError::Store { .. }) {
-                    state.latest_failed_not_denied = !err.is_access_denied();
+                    state.note_latest_outcome(ticket, !err.is_access_denied());
                 } else {
                     state.record_seen = true;
                 }
@@ -867,7 +890,7 @@ impl CompatView {
             }
         };
         let mut state = self.inner.state.write();
-        state.latest_failed_not_denied = false;
+        state.note_latest_outcome(ticket, false);
         Ok(state.merge(read.map(|(record, _)| record), ticket, started))
     }
 
@@ -1704,6 +1727,175 @@ mod tests {
             view.write_policy(T0 + 2_000, FAMILY_RLOG, &[5, 6], 5, None),
             Ok(6)
         );
+    }
+
+    /// A `NotFound` read is a successful read: it stamps `last_read_unix_ns`,
+    /// so the view is no longer blind, and losing the grant afterwards does
+    /// not revive the blind exemption. A role that reads an empty store and
+    /// then loses its grant must go stale past the horizon, not keep writing
+    /// the baseline through an activation it can no longer see. This pins the
+    /// `last_read_unix_ns.is_none()` term of the blind rule: without it,
+    /// `blind = !latest_failed_not_denied && !record_seen` would answer the
+    /// baseline here forever.
+    #[tokio::test]
+    async fn a_not_found_read_then_access_denied_refuses_past_the_horizon() {
+        let denied = DeniedCompatGet::new(false);
+        let store: Arc<dyn ObjectStoreBackend> = denied.clone();
+        let clock = ManualClock::at(T0);
+        let view = view(store, clock.clone());
+
+        // deny=false on an empty store: a NotFound read, a success at T0.
+        let read = view.refresh().await.expect("absent record reads");
+        assert!(!read.present);
+        assert!(!view.record_seen());
+        assert_eq!(view.last_read_unix_ns(), Some(T0));
+
+        // The grant is lost; refreshes now fail AccessDenied.
+        denied.deny.store(true, Ordering::SeqCst);
+        clock.set(T0 + COMPAT_VIEW_HORIZON_NS);
+        let err = view.refresh().await.expect_err("denied");
+        assert!(err.is_access_denied(), "{err}");
+
+        // The NotFound stamped a read, so the view is not blind: it goes
+        // stale at the horizon on a bucket with no compat_epoch too.
+        let stale = CompatRefusal::ViewStale {
+            last_read_unix_ns: Some(T0),
+            now_unix_ns: T0 + COMPAT_VIEW_HORIZON_NS,
+        };
+        assert_eq!(
+            view.check_fresh(T0 + COMPAT_VIEW_HORIZON_NS, 0),
+            Err(stale.clone())
+        );
+        assert_eq!(
+            view.write_policy(T0 + COMPAT_VIEW_HORIZON_NS, FAMILY_RSEG, &[7], 7, None),
+            Err(stale)
+        );
+    }
+
+    /// The first `get` of `sys/compat` fails with a non-denied 5xx, but only
+    /// after a later get has returned; every later get fails `AccessDenied`.
+    struct SlowFirst5xxThenDenied {
+        gets: std::sync::atomic::AtomicUsize,
+        first_entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for SlowFirst5xxThenDenied {
+        async fn put(
+            &self,
+            _key: &str,
+            _data: Bytes,
+            _opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            Err(StoreError::Unsupported {
+                operation: "put".to_string(),
+            })
+        }
+        async fn get(
+            &self,
+            _key: &str,
+            _range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            if self.gets.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_entered.notify_one();
+                self.release.notified().await;
+                Err(StoreError::Permanent("500 Internal Error".to_string()))
+            } else {
+                Err(StoreError::AccessDenied("no s3:GetObject".to_string()))
+            }
+        }
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            let _ = key;
+            Err(StoreError::NotFound)
+        }
+        async fn list(
+            &self,
+            _prefix: &str,
+            _page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            Err(StoreError::Unsupported {
+                operation: "list".to_string(),
+            })
+        }
+        async fn list_after(
+            &self,
+            _prefix: &str,
+            _start_after: Option<&str>,
+            _page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            Err(StoreError::Unsupported {
+                operation: "list_after".to_string(),
+            })
+        }
+        async fn list_delimited(
+            &self,
+            _prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            Err(StoreError::Unsupported {
+                operation: "list_delimited".to_string(),
+            })
+        }
+        async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+            Err(StoreError::Unsupported {
+                operation: "delete".to_string(),
+            })
+        }
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            ravel_object_store::Capabilities::mandatory()
+        }
+    }
+
+    /// Two overlapping refreshes decide the latest outcome by start order, not
+    /// by finish order. The refresh that started first fails with a 5xx and
+    /// finishes last; the one that started last fails with `AccessDenied` and
+    /// finishes first. Neither read succeeds, so the view stays never-read.
+    /// The blind exemption must hold: the later-started refusal is the
+    /// `AccessDenied` that says the grant is missing, and the earlier 5xx
+    /// finishing after it must not revive the suspension. Ordering the outcome
+    /// flag by finish time would let the slow 5xx refuse the baseline.
+    #[tokio::test]
+    async fn the_latest_refresh_outcome_is_the_latest_started_not_the_latest_finished() {
+        let store = Arc::new(SlowFirst5xxThenDenied {
+            gets: std::sync::atomic::AtomicUsize::new(0),
+            first_entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let view = view(store.clone(), ManualClock::at(T0));
+
+        // The slow refresh takes ticket 0 and parks in its get.
+        let slow = {
+            let view = view.clone();
+            tokio::spawn(async move { view.refresh().await })
+        };
+        store.first_entered.notified().await;
+
+        // The fast refresh takes ticket 1, fails AccessDenied, and merges.
+        let fast = view.refresh().await.expect_err("denied");
+        assert!(fast.is_access_denied(), "{fast}");
+
+        // Release the slow refresh: it fails with a 5xx, started earlier.
+        store.release.notify_one();
+        let slow = slow.await.expect("join").expect_err("5xx");
+        assert!(!slow.is_access_denied(), "{slow}");
+
+        // The later-started AccessDenied is the latest outcome, so the
+        // never-read view stays blind and answers the baseline on a bucket
+        // with no compat_epoch, however far past the horizon.
+        for at in [
+            T0,
+            T0 + COMPAT_VIEW_HORIZON_NS,
+            T0 + 100 * COMPAT_VIEW_HORIZON_NS,
+        ] {
+            assert_eq!(view.check_fresh(at, 0), Ok(()), "at {at}");
+            assert_eq!(
+                view.write_policy(at, FAMILY_RSEG, &[7], 7, None),
+                Ok(7),
+                "at {at}"
+            );
+        }
+        assert!(!view.record_seen());
+        assert_eq!(view.last_read_unix_ns(), None);
     }
 
     #[tokio::test]

@@ -161,7 +161,25 @@ Buffered mode (opt-in per request, named "buffered"):
   `ravel_format_floor_refused_total{family}` counts it. Writes that arrive
   after the router has seen the raised floor are refused at admission with
   the same error and are never acknowledged. `--write-below-format-floor`
-  turns both refusals into a counted write. The
+  turns both refusals into a counted write. Eight: the `sys/compat`
+  activation policy (ADR-4233 decision 3) refuses the flush at permit grant,
+  or before any PUT attempt of its retry loop -- the process's view of
+  `sys/compat` is stale past its horizon, the active write version for the
+  family is one this build does not write, or the record is missing under a
+  bucket that carries an activation. The flush is dropped, any strict waiter
+  is acked with the retryable `CompatRefused` (503), and
+  `ravel_compat_publish_refused_total{family,reason}` counts it; no commit
+  record is published by the refused attempt, and a data object already
+  stored before a later-attempt refusal is left for orphan GC. Like case
+  seven this drops acknowledged buffered rows, and for the same reason it is
+  deliberate: a build that cannot write the family's active format version
+  must not publish rows a reader at that activation would reject (ADR-4233
+  decision 1). The one exception is a router dropped without `shutdown()`:
+  its teardown flush reads the per-tenant compat-epoch cache its shards hold
+  by `Arc` even after the router's switch is gone, so it grants and fences
+  from the cached epoch instead of being refused `no_bucket_view`, and those
+  acknowledged rows publish rather than being lost (the loss this list is
+  about). The
   ADR-1685 store-clock lag check is not a case of its own: a teardown drain's
   bypass passes disable that check precisely so it cannot drop acknowledged
   rows, and what it costs instead is visibility until a HEAD rebuild (see

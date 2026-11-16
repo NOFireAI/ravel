@@ -25,8 +25,8 @@ use crate::config::IngestConfig;
 use crate::deferral::DeferralCapFlag;
 use crate::format_floor::{FormatFamily, FormatFloorPolicy};
 use crate::generation::{
-    DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender, Routed, SwitchScope,
-    ViewRead,
+    BucketCompatCache, DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender,
+    Routed, SwitchScope, ViewRead,
 };
 use crate::pending_ack::{PendingAckBudget, PendingAckPermit};
 use crate::router::WriteMode;
@@ -289,9 +289,11 @@ impl SpanIngestRouter {
         let backstop_ceiling = BufferBudgetCeiling::unlimited();
         let write_gate = WriteGateSlot::default();
         let compat = CompatSlot::default();
+        let bucket_compat = BucketCompatCache::default();
         let switch = Arc::new_cyclic(|weak: &Weak<GenerationSwitch<SpanShardHandle>>| {
             let weak = weak.clone();
             let scope_compat = compat.clone();
+            let scope_bucket = bucket_compat.clone();
             let store = Arc::clone(&store);
             let refresh_store = Arc::clone(&store);
             let clock = Arc::clone(&clock);
@@ -305,6 +307,7 @@ impl SpanIngestRouter {
                     weak.clone(),
                     shard_count,
                     scope_compat.clone(),
+                    scope_bucket.clone(),
                 ));
                 let writer_id = rng.new_uuid();
                 let epoch =
@@ -341,6 +344,7 @@ impl SpanIngestRouter {
                 .with_refresh_source(refresh_store, ravel_types::Signal::Spans, refresh_clock)
                 .with_read_failures(read_failures)
                 .with_compat_slot(compat.clone())
+                .with_bucket_cache(bucket_compat.clone())
         });
 
         SpanIngestRouter {
