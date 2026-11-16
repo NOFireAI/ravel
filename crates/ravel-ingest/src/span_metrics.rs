@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use ravel_types::TenantHash;
 
 use crate::attribution::TenantPutAttribution;
+use crate::compat::{CompatRefusalCounters, CompatRefusalReason, CompatRefusalSnapshot};
 use crate::generation::HandBackReason;
 use crate::metrics::{FlushTrigger, ShardSkew, ShardSkewStats};
 
@@ -79,6 +80,11 @@ pub struct SpanIngestMetrics {
     /// plus `max_flush_lifetime` ([`crate::SpanWriteError::Abandoned`],
     /// ADR-2708 D3), where publishing could land spans in a sealed hour.
     abandoned_hour_bound: AtomicU64,
+    /// Writes and flushes the `sys/compat` activation policy refused, by
+    /// reason (`ravel_compat_publish_refused_total{family,reason}`, ADR-4233):
+    /// at admission, at permit grant, before a PUT attempt, or at the bucket
+    /// fence. Nothing of a refused flush is stored.
+    compat_publish_refused: CompatRefusalCounters,
     /// Flushes abandoned because the input could not be turned into a durable
     /// object at all: the RSPAN build, data-key derivation, or commit-record
     /// build failed ([`crate::SpanWriteError::SegmentBuild`]). A client
@@ -268,6 +274,8 @@ pub struct SpanIngestMetricsSnapshot {
     /// Flushes abandoned without a PUT because their permit was granted past
     /// their pinned hour's end plus `max_flush_lifetime` (ADR-2708 D3).
     pub abandoned_hour_bound: u64,
+    /// Publishes the `sys/compat` activation policy refused, by reason.
+    pub compat_publish_refused: CompatRefusalSnapshot,
     pub abandoned_input_rejected: u64,
     /// Flushes whose write gate encode returned no result (the job panicked
     /// or was cancelled). Not an `abandoned_*` cause.
@@ -547,6 +555,13 @@ impl SpanIngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A write refused at admission, or a flush refused at permit grant,
+    /// before a PUT attempt, or at the bucket fence, by the `sys/compat`
+    /// activation policy (ADR-4233).
+    pub(crate) fn record_compat_refused(&self, reason: CompatRefusalReason) {
+        self.compat_publish_refused.record(reason);
+    }
+
     /// A flush abandoned without a PUT because its permit was granted past its
     /// pinned hour's end plus `max_flush_lifetime`
     /// ([`crate::SpanWriteError::Abandoned`], ADR-2708 D3): retryable.
@@ -765,6 +780,7 @@ impl SpanIngestMetrics {
             abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
             abandoned_queue_deadline: self.abandoned_queue_deadline.load(Ordering::Relaxed),
             abandoned_hour_bound: self.abandoned_hour_bound.load(Ordering::Relaxed),
+            compat_publish_refused: self.compat_publish_refused.snapshot(),
             abandoned_input_rejected: self.abandoned_input_rejected.load(Ordering::Relaxed),
             flush_gate_faults: self.flush_gate_faults.load(Ordering::Relaxed),
             buffered_bytes_total: self.buffered_bytes_total.load(Ordering::Relaxed),

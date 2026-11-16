@@ -8,14 +8,16 @@ use ravel_logseg::PageChoice;
 use crate::budget::IngestByteBudgetLimit;
 use crate::metrics::FlushTrigger;
 
-/// RSEG trailer version every flush emits. ADR-0027 leaves v7 the only
+/// RSEG trailer version a flush emits when no activation policy is installed
+/// (ADR-4233 decision 2), and the RSEG baseline. ADR-0027 leaves v7 the only
 /// writable version (ADR-0092 bumped it from v6), so this is no longer a
 /// configurable knob; it mirrors `ravel_segment`'s `VERSION_V7` constant, and
 /// is stamped verbatim into the commit record's `segment_format_version`.
 /// Changing it is a format-level ADR, not a routine edit.
 pub const SEGMENT_FORMAT_VERSION: u16 = ravel_segment::VERSION_V7;
 
-/// RLOG trailer version every log flush emits. Tied to `ravel_logseg`'s own
+/// RLOG trailer version a log flush emits when no activation policy is
+/// installed, and the RLOG baseline. Tied to `ravel_logseg`'s own
 /// object trailer version (`docs/log-segment-format.md`, ADR-0029) at compile
 /// time rather than hand-mirrored; like [`SEGMENT_FORMAT_VERSION`] it is not a
 /// configurable knob, and is stamped verbatim into the commit record's
@@ -30,8 +32,9 @@ pub const SEGMENT_FORMAT_VERSION: u16 = ravel_segment::VERSION_V7;
 /// bump (ADR-0095) is what surfaced it.
 pub const LOG_SEGMENT_FORMAT_VERSION: u16 = ravel_logseg::footer::VERSION;
 
-/// RSPAN trailer version every span flush emits. Stamped verbatim into the
-/// commit record's `segment_format_version`. Changing it is a format-level
+/// RSPAN trailer version a span flush emits when no activation policy is
+/// installed, and the RSPAN baseline. Stamped verbatim into the commit
+/// record's `segment_format_version`. Changing it is a format-level
 /// ADR, not a routine edit.
 ///
 /// Tied to `ravel_rspan`'s own trailer version at compile time rather than

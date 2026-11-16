@@ -24,6 +24,8 @@ use futures::stream::{self, StreamExt};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{Signal, TenantHash};
 
+use crate::compat::IngestCompatPolicy;
+
 /// A format family a floor can be recorded for, one per signal whose objects
 /// this repository writes. The lowercase name is the `family` string
 /// `raise_format_floor` records and `ravel-cli maintain migrate` defaults to.
@@ -62,14 +64,25 @@ impl FormatFamily {
         }
     }
 
-    /// The newest version of this family the build can write: its format
-    /// crate's `SUPPORTED_VERSIONS.newest()`.
+    /// The version this build writes for this family with no activation
+    /// policy installed: its writer's `CURRENT`. A format crate's
+    /// `SUPPORTED_VERSIONS.newest()` is what it reads, which can be newer.
     pub fn writable_version(self) -> u32 {
         match self {
-            FormatFamily::Rseg => u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
-            FormatFamily::Rlog => u32::from(ravel_logseg::footer::SUPPORTED_VERSIONS.newest()),
-            FormatFamily::Rspan => u32::from(ravel_rspan::footer::SUPPORTED_VERSIONS.newest()),
+            FormatFamily::Rseg => u32::from(ravel_segment::SegmentVersion::CURRENT.number()),
+            FormatFamily::Rlog => u32::from(ravel_logseg::footer::WriteVersion::CURRENT.number()),
+            FormatFamily::Rspan => u32::from(ravel_rspan::footer::WriteVersion::CURRENT.number()),
         }
+    }
+
+    /// The version this build writes for this family under `policy`: the
+    /// version the policy names when one is installed
+    /// ([`IngestCompatPolicy::named_version`]), else
+    /// [`Self::writable_version`].
+    pub fn writable_version_under(self, policy: Option<&IngestCompatPolicy>) -> u32 {
+        policy.map_or(self.writable_version(), |policy| {
+            u32::from(policy.named_version(self))
+        })
     }
 
     fn index(self) -> usize {
@@ -311,6 +324,19 @@ pub async fn warn_floors_above_writer(
     write_below_floor: bool,
     metrics: &FormatFloorMetrics,
 ) -> Vec<FloorAboveWriter> {
+    warn_floors_above_writer_under(store, tenants, role, write_below_floor, metrics, None).await
+}
+
+/// [`warn_floors_above_writer`] against the version `policy` names for each
+/// family ([`FormatFamily::writable_version_under`]).
+pub async fn warn_floors_above_writer_under(
+    store: &dyn ObjectStoreBackend,
+    tenants: &[TenantHash],
+    role: &'static str,
+    write_below_floor: bool,
+    metrics: &FormatFloorMetrics,
+    policy: Option<&IngestCompatPolicy>,
+) -> Vec<FloorAboveWriter> {
     let pairs = tenants
         .iter()
         .flat_map(|tenant| FLOORED_SIGNALS.map(|signal| (*tenant, signal)));
@@ -321,13 +347,13 @@ pub async fn warn_floors_above_writer(
                 .await
             {
                 Ok(floor) => floor
-                    .filter(|floor| *floor > family.writable_version())
+                    .filter(|floor| *floor > family.writable_version_under(policy))
                     .map(|floor| FloorAboveWriter {
                         tenant,
                         signal,
                         family,
                         floor,
-                        writable: family.writable_version(),
+                        writable: family.writable_version_under(policy),
                     }),
                 Err(err) => {
                     tracing::warn!(
@@ -395,11 +421,11 @@ mod tests {
     }
 
     /// The comparison is against the version of the object being written. A
-    /// writer whose newest version meets the floor still refuses an object it
-    /// writes at an older version: with the floor at the build's newest RSEG
+    /// writer whose written version meets the floor still refuses an object it
+    /// writes at an older version: with the floor at the build's RSEG
     /// version, an object one below it is refused. A check comparing
-    /// `SUPPORTED_VERSIONS.newest()` instead admits it, so the `Err` assertion
-    /// below is the line that flips.
+    /// [`FormatFamily::writable_version`] instead admits it, so the `Err`
+    /// assertion below is the line that flips.
     #[test]
     fn a_writer_below_its_newest_version_is_refused_by_a_floor_at_its_newest() {
         let p = policy(false);
@@ -530,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn families_map_from_their_signals_and_write_their_crates_newest_version() {
+    fn families_map_from_their_signals_and_write_their_writers_current_version() {
         assert_eq!(
             FormatFamily::for_signal(Signal::Metrics),
             Some(FormatFamily::Rseg)

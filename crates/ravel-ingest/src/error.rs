@@ -119,6 +119,13 @@ pub enum WriteError {
     /// at the floor does not refuse the retry.
     #[error(transparent)]
     BelowFormatFloor(#[from] crate::format_floor::BelowFormatFloor),
+    /// The `sys/compat` activation policy refused the write's publish
+    /// (ADR-4233): at admission when the cached view already refuses, or at
+    /// permit grant and before every PUT attempt of its flush, whose rows are
+    /// then dropped with nothing stored. Always retryable
+    /// ([`crate::CompatPublishRefusal::is_retryable`]).
+    #[error(transparent)]
+    CompatRefused(#[from] crate::compat::CompatPublishRefusal),
     /// A multi-shard Strict write in which at least one shard failed *after*
     /// one or more sibling shards had already acked their commit durably in
     /// the same [`IngestRouter::write`](crate::IngestRouter::write) call
@@ -163,6 +170,7 @@ impl WriteError {
             | WriteError::PendingAckLimitReached
             | WriteError::DeferralCapReached
             | WriteError::BelowFormatFloor(_) => true,
+            WriteError::CompatRefused(refusal) => refusal.is_retryable(),
             WriteError::SegmentBuild(_)
             | WriteError::SeriesIdCollision(_)
             | WriteError::SeriesValueKindMismatch(_) => false,

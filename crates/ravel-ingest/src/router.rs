@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::budget::{BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit};
 use crate::clock::Clock;
+use crate::compat::{CompatSlot, IngestCompatPolicy, PublishLifetimeAboveCompat};
 use crate::config::{IngestConfig, SEGMENT_FORMAT_VERSION};
 use crate::deferral::DeferralCapFlag;
 use crate::error::WriteError;
@@ -417,8 +418,10 @@ impl IngestRouter {
         let stage_timings = Arc::new(MetricStageTimings::new());
         // Each generation's shard-actor set gets a fresh writer identity, so
         // two sets never collide on a commit key for the same shard index.
+        let compat = CompatSlot::default();
         let switch = Arc::new_cyclic(|weak: &Weak<GenerationSwitch<ShardHandle>>| {
             let weak = weak.clone();
+            let scope_compat = compat.clone();
             let store = Arc::clone(&store);
             let refresh_store = Arc::clone(&store);
             let clock = Arc::clone(&clock);
@@ -430,8 +433,11 @@ impl IngestRouter {
             #[cfg(feature = "stage-timing")]
             let stage_timings = Arc::clone(&stage_timings);
             let factory = move |shard_count: u32| -> Vec<ShardHandle> {
-                let scope: Arc<dyn FlushScope<ShardMsg>> =
-                    Arc::new(SwitchScope::new(weak.clone(), shard_count));
+                let scope: Arc<dyn FlushScope<ShardMsg>> = Arc::new(SwitchScope::new(
+                    weak.clone(),
+                    shard_count,
+                    scope_compat.clone(),
+                ));
                 let writer_id = rng.new_uuid();
                 let epoch =
                     u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
@@ -469,6 +475,7 @@ impl IngestRouter {
             GenerationSwitch::new(config.shard_count, DEFAULT_REFRESH_INTERVAL_NS, factory)
                 .with_refresh_source(refresh_store, signal, refresh_clock)
                 .with_read_failures(read_failures)
+                .with_compat_slot(compat.clone())
         });
 
         IngestRouter {
@@ -543,6 +550,40 @@ impl IngestRouter {
     pub fn with_format_floor_policy(self, policy: FormatFloorPolicy) -> Self {
         self.switch.set_floor_policy(policy);
         self
+    }
+
+    /// Installs the `sys/compat` activation policy every flush of this
+    /// router applies (ADR-4233), reaching every actor as
+    /// [`Self::with_format_floor_policy`] does: the RSEG version is chosen at
+    /// permit grant, every PUT attempt is refused once the policy's view is
+    /// stale, the bucket is fenced before the first object above the
+    /// baseline, and admission refuses what the cached view already refuses.
+    /// `None` installs nothing: every flush writes `SegmentVersion::CURRENT` with
+    /// none of these checks, exactly as a router never given a policy.
+    ///
+    /// Refuses a `max_flush_lifetime` above the `max_publish_lifetime_ns` of
+    /// the record the policy's view holds (ADR-4233 decision 7).
+    pub fn with_compat_policy(
+        self,
+        policy: Option<Arc<IngestCompatPolicy>>,
+    ) -> Result<Self, PublishLifetimeAboveCompat> {
+        if let Some(policy) = &policy {
+            policy.check_publish_lifetime(self.config.max_flush_lifetime)?;
+        }
+        self.switch.set_compat_policy(policy);
+        Ok(self)
+    }
+
+    /// The admission-time activation-policy check (ADR-4233 decision 2), on
+    /// the view just routed with: counted, and refused before any shard
+    /// buffers the write.
+    fn admit_compat(&self, tenant: ravel_types::TenantHash) -> Result<(), WriteError> {
+        self.switch
+            .admit_compat(tenant, FormatFamily::Rseg)
+            .map_err(|refused| {
+                self.metrics.record_compat_refused(refused.reason());
+                WriteError::CompatRefused(refused)
+            })
     }
 
     pub fn metrics(&self) -> &IngestMetrics {
@@ -869,6 +910,7 @@ impl IngestRouter {
             FormatFamily::Rseg,
             u32::from(SEGMENT_FORMAT_VERSION),
         )?;
+        self.admit_compat(tenant.hash())?;
         let shard_count = set.len() as u32;
         let mut by_shard: HashMap<u32, Vec<IngestPoint>> = HashMap::new();
         for point in points {
