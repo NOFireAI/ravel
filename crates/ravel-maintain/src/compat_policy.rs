@@ -545,9 +545,12 @@ impl CompatRun {
         )
     }
 
-    /// Refuse, counted, when the view is at or past the horizon and has seen
-    /// a record or the bucket is fenced (its recorded epoch, or the fence this
-    /// run owes). Returns the instant checked.
+    /// Refuse, counted, when the view is at or past the horizon (a view no
+    /// read has succeeded for always is) unless it is blind and the bucket is
+    /// unfenced. Blind: no refresh has succeeded, no object was seen at
+    /// `sys/compat`, and the refresh that finished last, if any, failed with
+    /// `AccessDenied`. Unfenced: neither the recorded epoch nor the fence this
+    /// run owes is above 0. Returns the instant checked.
     pub(crate) fn check_fresh(&self) -> Result<i64> {
         let policy = &self.inner.policy;
         let now = policy.now_unix_ns();
@@ -566,10 +569,9 @@ impl CompatRun {
     }
 
     /// Run before every PUT attempt of a data object or record, retries
-    /// included: refuse when the view is at or past the horizon and the view
-    /// has seen a record or the bucket is fenced (its recorded epoch, or the
-    /// fence this run owes), then raise the bucket's fence if this run owes
-    /// one and has not raised it yet.
+    /// included: refuse as [`Self::check_fresh`] does, at or past the horizon
+    /// unless the view is blind and the bucket unfenced, then raise the
+    /// bucket's fence if this run owes one and has not raised it yet.
     pub(crate) async fn before_put(&self, store: &dyn ObjectStoreBackend) -> Result<()> {
         let now = self.check_fresh()?;
         let Some(fence) = self.inner.fence.as_ref() else {
