@@ -1247,7 +1247,8 @@ pub(super) mod tests {
 
     /// Everything `run` logs at warn or above on this thread, as text.
     pub(in crate::mcp) fn capture_warn<T>(run: impl FnOnce() -> T) -> (T, String) {
-        // The warn callsite in `d4::log_redacted` is reached by tests on other
+        // The warn callsites in `d4::log_redacted` and
+        // `ravel_mcp::envelope::redacted_internal` are reached by tests on other
         // threads too; while one dispatcher is registered tracing caches a
         // callsite's interest from the first thread to touch it, so a second
         // dispatcher kept alive for the process forces interest to be computed
