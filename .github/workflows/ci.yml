@@ -499,6 +499,12 @@ jobs:
         run: bash scripts/guards/check-guarded-sql-parse.test.sh
       - name: Guarded-SQL-parse guard (issue #1760)
         run: bash scripts/guards/check-guarded-sql-parse.sh
+      # No MCP failure is built from formatted error text (issue #4292). Cases
+      # first, same reason as the SQL pair above.
+      - name: MCP error-display guard cases (issue #4292)
+        run: bash scripts/guards/check-mcp-error-display.test.sh
+      - name: MCP error-display guard (issue #4292)
+        run: bash scripts/guards/check-mcp-error-display.sh
       # The same rule for PromQL, whose funnel is called from a second crate,
       # so the guard scans two roots and rests on two anchors (issue #1817).
       # Cases first, same reason as the SQL pair above.

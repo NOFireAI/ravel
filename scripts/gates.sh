@@ -827,6 +827,16 @@ python3 "$(dirname "$0")/check-doc-claims.py"
 echo "==> scripts/guards/check-guarded-sql-parse.sh"
 "$(dirname "$0")/guards/check-guarded-sql-parse.sh"
 
+# No MCP failure may carry an internal error's Display text to the caller
+# (issue #4292): the MCP sources build no caller-facing failure from formatted
+# text unless a reasoned marker says it only echoes caller input or fixed
+# values. Cases first, so a guard broken into always-passing fails here. A
+# source scan, no build.
+echo "==> scripts/guards/check-mcp-error-display.test.sh"
+bash "$(dirname "$0")/guards/check-mcp-error-display.test.sh"
+echo "==> scripts/guards/check-mcp-error-display.sh"
+"$(dirname "$0")/guards/check-mcp-error-display.sh"
+
 # The same rule on the PromQL side, where an over-bound query aborts the
 # process inside the parser itself (issue #529). Its funnel has a caller in
 # another crate, so this one scans both crates/ravel-promql/src and

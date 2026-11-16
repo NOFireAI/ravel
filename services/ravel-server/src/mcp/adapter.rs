@@ -255,7 +255,7 @@ impl ServerHandler for RavelMcp {
             Err(message) => {
                 let default =
                     McpRequestBudgets::default().clamp(&self.engine_config, &self.budget_config);
-                return tool_result(&stamp(invalid_budget(message, &default)));
+                return tool_result(&stamp(invalid_budget(message, &default)), tenant_hash);
             }
         };
         let ctx = build_tool_context(
@@ -307,12 +307,15 @@ impl ServerHandler for RavelMcp {
         };
 
         match dispatched {
-            Ok(envelope) => tool_result(&stamp(envelope)),
+            Ok(envelope) => tool_result(&stamp(envelope), tenant_hash),
             // D4 reserves protocol errors for malformed JSON-RPC and for a
             // tool that cannot be routed. Both of these are the latter: a
             // name outside the catalog, and a catalog name whose body this
             // build does not carry. Neither ran, so neither has an envelope.
             Err(error @ (ToolError::UnknownTool(_) | ToolError::NotShipped(_))) => Err(
+                // mcp-error-display-allow: both variants' `Display` is a fixed
+                // sentence around the requested tool name, which the caller
+                // sent (and for `NotShipped` is also a published catalog name).
                 McpError::new(ErrorCode::METHOD_NOT_FOUND, error.to_string(), None),
             ),
         }
@@ -564,19 +567,26 @@ fn build_tool_context<'a>(
 /// reads fields, and the compact text rendering for a model that reads the
 /// result as text. An error envelope sets `isError`, so a client does not
 /// have to inspect the envelope's own `status` to know the call failed.
-fn tool_result(envelope: &Envelope) -> Result<CallToolResponse, McpError> {
-    let structured = serde_json::to_value(envelope).map_err(|error| {
-        McpError::internal_error(
-            "the result envelope could not be serialized",
-            Some(serde_json::json!({ "reason": error.to_string() })),
-        )
-    })?;
+fn tool_result(envelope: &Envelope, tenant_hash: TenantHash) -> Result<CallToolResponse, McpError> {
+    let structured = serde_json::to_value(envelope)
+        .map_err(|error| envelope_serialization_failure(&error, tenant_hash))?;
     let mut result = match envelope.status {
         Status::Error => CallToolResult::structured_error(structured),
         Status::Ok | Status::OkBounded | Status::OkPage => CallToolResult::structured(structured),
     };
     result.content = vec![ContentBlock::text(compact::render(envelope))];
     Ok(result.into())
+}
+
+/// The caller's message when a finished envelope cannot be serialized.
+const ENVELOPE_NOT_SERIALIZED: &str = "the result envelope could not be serialized";
+
+/// An envelope this adapter could not serialize, as a protocol-level internal
+/// error. The caller receives only the fixed message and no `data`; the
+/// serializer's error goes to the log through [`d4::log_redacted`].
+fn envelope_serialization_failure(error: &serde_json::Error, tenant_hash: TenantHash) -> McpError {
+    d4::log_redacted(ENVELOPE_NOT_SERIALIZED, error, tenant_hash);
+    McpError::internal_error(ENVELOPE_NOT_SERIALIZED, None)
 }
 
 #[cfg(test)]
@@ -684,5 +694,30 @@ mod tests {
             HeaderValue::from_static("2025-06-18"),
         );
         assert!(auth::check_standard_headers(&headers, &body).is_err());
+    }
+
+    /// An envelope the serializer refuses becomes an `INTERNAL_ERROR` with the
+    /// fixed message and no `data`: nothing of the serializer's error reaches
+    /// the caller, in any field of the serialized error. The error goes to the
+    /// log once, with the tenant hash.
+    ///
+    /// FLIP (the pre-fix closure, which put `error.to_string()` into `data` as
+    /// `reason`): the `data` and fragment assertions fail.
+    /// FLIP (the fixed message with `: {error}` appended): the exact-message
+    /// and fragment assertions fail.
+    #[test]
+    fn an_unserializable_envelope_reaches_the_caller_as_the_fixed_message() {
+        const DETAIL: &str = "planted envelope fault at key s3://tenant-9/obj-0042";
+        let planted = <serde_json::Error as serde::ser::Error>::custom(DETAIL);
+        let tenant = TenantHash([0x6E; 16]);
+        let (error, log) = super::super::service_impl::tests::capture_warn(|| {
+            envelope_serialization_failure(&planted, tenant)
+        });
+        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(error.message, ENVELOPE_NOT_SERIALIZED);
+        assert_eq!(error.data, None);
+        let wire = serde_json::to_string(&error).expect("an error serializes");
+        super::super::service_impl::tests::assert_no_fragment(&wire, DETAIL);
+        super::super::service_impl::tests::assert_logged_once(&log, DETAIL, tenant);
     }
 }

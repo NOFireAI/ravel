@@ -348,8 +348,14 @@ fn deadline(requested_ms: Option<u64>, ceiling: Duration) -> Duration {
 /// long series is a row rather than a refusal. A series below the op's
 /// minimum point count is a row with `too_few_points: true` and null
 /// figures, not a failed call. The op reads each sample's `ts_ns`, which the
-/// evaluator already emits in nanoseconds.
-fn analysis_data(op: AnalyzeOp, matrix: RangeMatrix) -> Result<Data, Failure> {
+/// evaluator already emits in nanoseconds. An op error other than an empty
+/// series fails the call with a fixed `internal` message; see
+/// [`d4::redacted_internal`].
+fn analysis_data(
+    op: AnalyzeOp,
+    matrix: RangeMatrix,
+    tenant_hash: TenantHash,
+) -> Result<Data, Failure> {
     let rows = matrix
         .into_iter()
         .map(|(labels, samples)| {
@@ -359,8 +365,8 @@ fn analysis_data(op: AnalyzeOp, matrix: RangeMatrix) -> Result<Data, Failure> {
                 .collect();
             let series = d4::labels_cell(&labels);
             match op {
-                AnalyzeOp::ChangePoint => change_point_row(series, &points),
-                AnalyzeOp::Summary => summary_row(series, &points),
+                AnalyzeOp::ChangePoint => change_point_row(series, &points, tenant_hash),
+                AnalyzeOp::Summary => summary_row(series, &points, tenant_hash),
             }
         })
         .collect::<Result<Vec<Row>, Failure>>()?;
@@ -396,26 +402,52 @@ fn analysis_data(op: AnalyzeOp, matrix: RangeMatrix) -> Result<Data, Failure> {
     })
 }
 
-fn change_point_row(series: Cell, points: &[(i64, f64)]) -> Result<Row, Failure> {
+/// The caller's message when `change_point` fails for any reason but an empty
+/// series.
+const CHANGE_POINT_FAILED: &str = "the change_point analysis failed on the server";
+
+/// The caller's message when `summary` fails for any reason but an empty
+/// series.
+const SUMMARY_FAILED: &str = "the summary analysis failed on the server";
+
+fn change_point_row(
+    series: Cell,
+    points: &[(i64, f64)],
+    tenant_hash: TenantHash,
+) -> Result<Row, Failure> {
+    let outcome = ravel_analytics::change_point(points, &ChangePointParams { downsample: true });
+    change_point_cells(series, outcome, tenant_hash)
+}
+
+fn change_point_cells(
+    series: Cell,
+    outcome: Result<ravel_analytics::ChangePointResult, AnalyticsError>,
+    tenant_hash: TenantHash,
+) -> Result<Row, Failure> {
     let min_points = Cell::Int(i128::from(CHANGE_POINT_MIN_POINTS));
-    let result =
-        match ravel_analytics::change_point(points, &ChangePointParams { downsample: true }) {
-            Ok(result) => result,
-            Err(AnalyticsError::EmptySeries) => {
-                return Ok(vec![
-                    series,
-                    Cell::Str(change_kind(ChangeKind::Indeterminable).to_string()),
-                    Cell::Null,
-                    Cell::Null,
-                    Cell::Int(0),
-                    Cell::Int(0),
-                    Cell::Bool(false),
-                    min_points,
-                    Cell::Bool(true),
-                ]);
-            }
-            Err(error) => return Err(d4::internal(format!("change_point: {error}"))),
-        };
+    let result = match outcome {
+        Ok(result) => result,
+        Err(AnalyticsError::EmptySeries) => {
+            return Ok(vec![
+                series,
+                Cell::Str(change_kind(ChangeKind::Indeterminable).to_string()),
+                Cell::Null,
+                Cell::Null,
+                Cell::Int(0),
+                Cell::Int(0),
+                Cell::Bool(false),
+                min_points,
+                Cell::Bool(true),
+            ]);
+        }
+        Err(error) => {
+            return Err(d4::redacted_internal(
+                CHANGE_POINT_FAILED,
+                &error,
+                tenant_hash,
+            ));
+        }
+    };
     let too_few = (result.original_points as u64) < CHANGE_POINT_MIN_POINTS;
     Ok(vec![
         series,
@@ -434,21 +466,35 @@ fn change_point_row(series: Cell, points: &[(i64, f64)]) -> Result<Row, Failure>
     ])
 }
 
-fn summary_row(series: Cell, points: &[(i64, f64)]) -> Result<Row, Failure> {
-    let min_points = Cell::Int(i128::from(SUMMARY_MIN_POINTS));
-    let (figures, counted, nan_excluded) = match ravel_analytics::summary(
+fn summary_row(
+    series: Cell,
+    points: &[(i64, f64)],
+    tenant_hash: TenantHash,
+) -> Result<Row, Failure> {
+    let outcome = ravel_analytics::summary(
         points,
         &SummaryParams {
             percentiles: Vec::new(),
         },
-    ) {
+    );
+    summary_cells(series, points.len(), outcome, tenant_hash)
+}
+
+fn summary_cells(
+    series: Cell,
+    points: usize,
+    outcome: Result<ravel_analytics::SummaryResult, AnalyticsError>,
+    tenant_hash: TenantHash,
+) -> Result<Row, Failure> {
+    let min_points = Cell::Int(i128::from(SUMMARY_MIN_POINTS));
+    let (figures, counted, nan_excluded) = match outcome {
         Ok(result) => {
-            let counted = points.len().saturating_sub(result.nan_excluded);
+            let counted = points.saturating_sub(result.nan_excluded);
             let figures = [result.median, result.mad, result.stddev, result.variance];
             (Some(figures), counted, result.nan_excluded)
         }
         Err(AnalyticsError::EmptySeries) => (None, 0, 0),
-        Err(error) => return Err(d4::internal(format!("summary: {error}"))),
+        Err(error) => return Err(d4::redacted_internal(SUMMARY_FAILED, &error, tenant_hash)),
     };
     let too_few = (counted as u64) < SUMMARY_MIN_POINTS;
     let mut row = vec![series];
@@ -654,7 +700,7 @@ impl QueryBackend for ServiceBackend {
             }
         };
         analytics_series_cap(matrix.len())?;
-        envelope.data = analysis_data(args.op, matrix)?;
+        envelope.data = analysis_data(args.op, matrix, tenant_hash)?;
         let warnings = outcome.stats.warnings.clone();
         Ok(self.uncapped_stats_envelope(envelope, &outcome.stats, outcome.partial, warnings))
     }
@@ -935,13 +981,17 @@ fn stats_unbounded_components(stats: &QueryStats) -> &'static [EstimateComponent
 /// map the list ravel-sql computed over their own resolve with one rule, so
 /// explain and execute name the same components for one statement.
 fn estimate_components(
-    operation: &str,
+    operation: &'static str,
     names: &[&'static str],
 ) -> Result<Vec<EstimateComponent>, Failure> {
     names
         .iter()
         .map(|name| {
             EstimateComponent::from_field_name(name).ok_or_else(|| {
+                // mcp-error-display-allow: no error value; `operation` is a
+                // literal at both call sites and `name` is a `&'static str`
+                // from ravel-sql's compiled-in component list, so no runtime
+                // or tenant data can reach the caller through this message.
                 d4::internal(format!("{operation}: unknown estimate component {name}"))
             })
         })
@@ -1047,21 +1097,12 @@ fn sql_encoding_failure(error: ravel_sql::SqlError, tenant_hash: TenantHash) -> 
             data_type,
             reason,
         } => d4::unencodable_sql_result(&column, &data_type, reason),
-        error => {
-            let client_message = error.client_message();
-            tracing::warn!(
-                tenant = %tenant_hash.to_hex(),
-                error = %error,
-                client_message = %client_message,
-                "mcp sql result encoding error redacted from client response",
-            );
-            d4::internal(client_message)
-        }
+        error => d4::redacted_internal(&error.client_message(), &error, tenant_hash),
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
@@ -1204,21 +1245,13 @@ mod tests {
         }
     }
 
-    /// The full internal error reaches the server log once, with the tenant
-    /// hash, even though the caller is told only the fixed message. The detail
-    /// the caller never sees must be present for the operator.
-    ///
-    /// FLIP (a fix that redacts without logging): the buffer holds neither the
-    /// detail nor the tenant hash and the assertions below fail.
-    #[test]
-    fn the_full_internal_error_is_logged_with_the_tenant_hash() {
-        const DETAIL: &str = "corrupt result column at key s3://tenant-7/seg-0001";
-        // The warn callsite in `sql_encoding_failure` is also reached by the
-        // redaction test above on another thread; while one dispatcher is
-        // registered tracing caches a callsite's interest from the first
-        // thread to touch it, so a second dispatcher kept alive for the
-        // process forces interest to be computed per dispatch and this
-        // thread's subscriber to see the event.
+    /// Everything `run` logs at warn or above on this thread, as text.
+    pub(in crate::mcp) fn capture_warn<T>(run: impl FnOnce() -> T) -> (T, String) {
+        // The warn callsite in `d4::log_redacted` is reached by tests on other
+        // threads too; while one dispatcher is registered tracing caches a
+        // callsite's interest from the first thread to touch it, so a second
+        // dispatcher kept alive for the process forces interest to be computed
+        // per dispatch and this thread's subscriber to see the event.
         static KEEP_TWO_DISPATCHERS: std::sync::OnceLock<tracing::Dispatch> =
             std::sync::OnceLock::new();
         KEEP_TWO_DISPATCHERS
@@ -1230,17 +1263,36 @@ mod tests {
             .with_max_level(tracing::Level::WARN)
             .with_ansi(false)
             .finish();
-        let tenant = TenantHash([0xAB; 16]);
-        {
+        let out = {
             let _guard = tracing::subscriber::set_default(subscriber);
-            let _failure =
-                sql_encoding_failure(ravel_sql::SqlError::Internal(DETAIL.to_string()), tenant);
-        }
-
+            run()
+        };
         let log = String::from_utf8(buffer.lock().expect("log buffer lock").clone())
             .expect("log bytes are utf-8");
+        (out, log)
+    }
+
+    /// `text` holds no 16-byte run of `planted`, so not even a fragment of a
+    /// planted error's `Display` reached it.
+    pub(in crate::mcp) fn assert_no_fragment(text: &str, planted: &str) {
+        const RUN: usize = 16;
+        assert!(planted.len() > RUN, "plant a longer error text");
+        for start in 0..=planted.len() - RUN {
+            let Some(run) = planted.get(start..start + RUN) else {
+                continue;
+            };
+            assert!(
+                !text.contains(run),
+                "the caller-facing text carries {run:?} of the planted error: {text}"
+            );
+        }
+    }
+
+    /// The planted error's `Display` reached the log exactly once, with the
+    /// tenant hash beside it.
+    pub(in crate::mcp) fn assert_logged_once(log: &str, planted: &str, tenant: TenantHash) {
         assert_eq!(
-            log.matches(DETAIL).count(),
+            log.matches(planted).count(),
             1,
             "the full error must reach the server log exactly once: {log}"
         );
@@ -1248,5 +1300,67 @@ mod tests {
             log.contains(&tenant.to_hex()),
             "the log must name the tenant: {log}"
         );
+    }
+
+    /// The full internal error reaches the server log once, with the tenant
+    /// hash, even though the caller is told only the fixed message. The detail
+    /// the caller never sees must be present for the operator.
+    ///
+    /// FLIP (a fix that redacts without logging): the buffer holds neither the
+    /// detail nor the tenant hash and the assertions below fail.
+    #[test]
+    fn the_full_internal_error_is_logged_with_the_tenant_hash() {
+        const DETAIL: &str = "corrupt result column at key s3://tenant-7/seg-0001";
+        let tenant = TenantHash([0xAB; 16]);
+        let (_failure, log) = capture_warn(|| {
+            sql_encoding_failure(ravel_sql::SqlError::Internal(DETAIL.to_string()), tenant)
+        });
+        assert_logged_once(&log, DETAIL, tenant);
+    }
+
+    /// A `change_point` error other than an empty series fails the call with
+    /// the fixed message under `Internal`, carrying no fragment of the error's
+    /// `Display`, which goes to the log once with the tenant hash.
+    ///
+    /// FLIP (the pre-fix arm, `d4::internal(format!("change_point: {error}"))`):
+    /// the exact-message and fragment assertions fail.
+    /// FLIP (the fixed message with `: {error}` appended): the same two fail.
+    #[test]
+    fn a_change_point_error_reaches_the_caller_as_the_fixed_message() {
+        let planted = AnalyticsError::SeriesTooLong {
+            max: 2000,
+            got: 987_654_321,
+        };
+        let planted_text = planted.to_string();
+        let tenant = TenantHash([0x5C; 16]);
+        let (outcome, log) = capture_warn(|| change_point_cells(Cell::Null, Err(planted), tenant));
+        let Err(failure) = outcome else {
+            panic!("a change_point error produced a row");
+        };
+        assert_eq!(failure.class, FailureClass::Internal);
+        assert_eq!(failure.message, CHANGE_POINT_FAILED);
+        assert_no_fragment(&failure.message, &planted_text);
+        assert_logged_once(&log, &planted_text, tenant);
+    }
+
+    /// The same for `summary`, whose errors also stay off the caller's
+    /// message.
+    ///
+    /// FLIP (the pre-fix arm, `d4::internal(format!("summary: {error}"))`): the
+    /// exact-message and fragment assertions fail.
+    /// FLIP (the fixed message with `: {error}` appended): the same two fail.
+    #[test]
+    fn a_summary_error_reaches_the_caller_as_the_fixed_message() {
+        let planted = AnalyticsError::InvalidPercentile { got: 0.987_654_321 };
+        let planted_text = planted.to_string();
+        let tenant = TenantHash([0x3D; 16]);
+        let (outcome, log) = capture_warn(|| summary_cells(Cell::Null, 7, Err(planted), tenant));
+        let Err(failure) = outcome else {
+            panic!("a summary error produced a row");
+        };
+        assert_eq!(failure.class, FailureClass::Internal);
+        assert_eq!(failure.message, SUMMARY_FAILED);
+        assert_no_fragment(&failure.message, &planted_text);
+        assert_logged_once(&log, &planted_text, tenant);
     }
 }
