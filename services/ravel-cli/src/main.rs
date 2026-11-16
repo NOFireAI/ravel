@@ -23,6 +23,11 @@ use ravel_types::{Signal, TenantId, TimeRange};
 // jemalloc is compiled into this binary so the allocator is part of the
 // binary's identity rather than an environment accident (#972); library crates
 // must never do this (their test binaries install their own global allocator).
+// The coverage runtime shim the instrumentation flags in the Antithesis
+// workload image need at link time (antithesis/ingest-durability/ravel/Dockerfile).
+#[cfg(feature = "antithesis")]
+use antithesis_instrumentation as _;
+
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -2935,6 +2940,10 @@ fn init_tracing() {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Registers the Antithesis assertion catalog and refuses an unknown
+    // RAVEL_ANTITHESIS_MUTANT; does nothing without the off-by-default
+    // `antithesis` and `antithesis-mutants` features.
+    ravel_invariant::init()?;
     init_tracing();
     run(parse_cli(std::env::args_os()).unwrap_or_else(|err| err.exit())).await
 }

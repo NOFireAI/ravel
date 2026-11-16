@@ -40,9 +40,10 @@ fn now_unix_ns() -> i64 {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Registers the assertion catalog with Antithesis, so an assertion that is
-    // never reached still reports (the off-by-default `antithesis` feature).
-    #[cfg(feature = "antithesis")]
-    antithesis_sdk::antithesis_init();
+    // never reached still reports, and refuses an unknown
+    // RAVEL_ANTITHESIS_MUTANT (the off-by-default `antithesis` and
+    // `antithesis-mutants` features; without them this does nothing).
+    ravel_invariant::init()?;
 
     // Not `Cli::parse()`: this also refuses the fold flags in the modes that
     // never schedule a fold (ADR-1693), which needs the `ArgMatches` to tell a
@@ -772,10 +773,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     wait_for_shutdown_signal().await;
-    #[cfg(feature = "antithesis")]
-    antithesis_sdk::assert_reachable!(
+    ravel_invariant::inv_reachable!(
         "server: a shutdown signal started a graceful drain",
-        &serde_json::json!({})
+        serde_json::json!({})
     );
     tracing::info!("shutdown signal received, draining");
     // A drain that overran `--shutdown-timeout`, a listener error, or a failed
@@ -783,10 +783,9 @@ async fn main() -> anyhow::Result<()> {
     // so the process exits non-zero, rather than falling through to the
     // "shutdown complete" line and a clean exit it did not earn.
     if let Err(err) = running.shutdown().await {
-        #[cfg(feature = "antithesis")]
-        antithesis_sdk::assert_reachable!(
+        ravel_invariant::inv_reachable!(
             "server: a graceful drain did not complete cleanly",
-            &serde_json::json!({ "error": err.to_string() })
+            serde_json::json!({ "error": err.to_string() })
         );
         tracing::error!(error = %err, "graceful shutdown did not complete cleanly");
         return Err(err);

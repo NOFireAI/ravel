@@ -4748,6 +4748,7 @@ dependencies = [
  "ravel-codec",
  "ravel-commit",
  "ravel-cpu-gate",
+ "ravel-invariant",
  "ravel-logseg",
  "ravel-memory",
  "ravel-object-store",
@@ -4769,6 +4770,7 @@ dependencies = [
 name = "ravel-cli"
 version = "0.33.0"
 dependencies = [
+ "antithesis-instrumentation",
  "anyhow",
  "arrow",
  "async-trait",
@@ -4794,6 +4796,7 @@ dependencies = [
  "ravel-commit",
  "ravel-fleet",
  "ravel-ingest",
+ "ravel-invariant",
  "ravel-ipcrypt",
  "ravel-logseg",
  "ravel-maintain",
@@ -4847,6 +4850,7 @@ dependencies = [
  "rand 0.10.2",
  "ravel-agents-core",
  "ravel-fleet",
+ "ravel-invariant",
  "ravel-object-store",
  "ravel-proto",
  "ravel-types",
@@ -4910,6 +4914,7 @@ dependencies = [
  "hex",
  "proptest",
  "prost",
+ "ravel-invariant",
  "ravel-object-store",
  "ravel-proto",
  "ravel-types",
@@ -4937,6 +4942,7 @@ dependencies = [
  "ravel-catalog",
  "ravel-commit",
  "ravel-cpu-gate",
+ "ravel-invariant",
  "ravel-logseg",
  "ravel-object-store",
  "ravel-otlp",
@@ -4979,6 +4985,14 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ravel-invariant"
+version = "0.33.0"
+dependencies = [
+ "antithesis_sdk",
+ "serde_json",
 ]
 
 [[package]]
@@ -5044,6 +5058,7 @@ dependencies = [
  "ravel-cpu-gate",
  "ravel-fleet",
  "ravel-ingest",
+ "ravel-invariant",
  "ravel-logseg",
  "ravel-object-store",
  "ravel-otlp",
@@ -5404,7 +5419,6 @@ name = "ravel-server"
 version = "0.33.0"
 dependencies = [
  "antithesis-instrumentation",
- "antithesis_sdk",
  "anyhow",
  "arrow",
  "arrow-flight",
@@ -5439,6 +5453,7 @@ dependencies = [
  "ravel-esql",
  "ravel-fleet",
  "ravel-ingest",
+ "ravel-invariant",
  "ravel-ipcrypt",
  "ravel-logseg",
  "ravel-maintain",

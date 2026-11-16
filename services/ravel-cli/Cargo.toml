@@ -35,6 +35,30 @@ sql-explain = ["dep:ravel-sql"]
 # build neither reads the variable nor links the fake.
 test-support = ["ravel-object-store/test-support"]
 
+# Antithesis assertions (ADR-4326) and the coverage runtime shim, for the
+# workloads under antithesis/ (antithesis/README.md). Off by default and in no
+# published build (scripts/guards/check-release-profile.sh): only the
+# Antithesis workload images build it, with the instrumentation flags.
+antithesis = [
+    "dep:antithesis-instrumentation",
+    "ravel-invariant/antithesis",
+    "ravel-catalog/antithesis",
+    "ravel-commit/antithesis",
+    "ravel-ingest/antithesis",
+    "ravel-maintain/antithesis",
+]
+
+# Compiles the ADR-4326 mutant switches in; `ravel_invariant::init` refuses an
+# unknown RAVEL_ANTITHESIS_MUTANT before any subcommand runs. Only the
+# `<workload>-mutants` Antithesis images build it.
+antithesis-mutants = [
+    "ravel-invariant/antithesis-mutants",
+    "ravel-catalog/antithesis-mutants",
+    "ravel-commit/antithesis-mutants",
+    "ravel-ingest/antithesis-mutants",
+    "ravel-maintain/antithesis-mutants",
+]
+
 [dependencies]
 # Optional: see the `profiling` feature above. Same version/feature set as
 # crates/ravel-bench's pin so the two crates' flamegraphs are comparable.
@@ -58,6 +82,13 @@ ravel-commit = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-maintain = { workspace = true }
 ravel-ingest = { workspace = true }
+# ADR-4326 assertion and mutant macros and the `init` main() calls; with no
+# feature on they compile to nothing.
+ravel-invariant = { path = "../../crates/ravel-invariant", version = "0.33.0" }
+# The coverage-instrumentation runtime shim an instrumented build links
+# against, as in ravel-server; only the off-by-default `antithesis` feature
+# links it. Already in the lock through ravel-server.
+antithesis-instrumentation = { version = "0.1", optional = true }
 # `cache reclaim-legacy` calls `ravel_cache::reclaim_legacy` (issue #826).
 # Already a workspace pin; adds no new external crate.
 ravel-cache = { workspace = true }

@@ -152,6 +152,10 @@ second lane exists because the first cannot replace it: it enables
 stage-timing in both crates transitively, but a `-p ravel-bench` selection
 builds them as dependencies and cargo never compiles a dependency's
 `#[cfg(test)]` module, so their own gated tests run in neither.
+An `invariants` lane (clippy and tests of ravel-invariant, ravel-commit,
+ravel-ingest, ravel-catalog, ravel-maintain and ravel-fleet with
+`--features ravel-invariant/capture,ravel-invariant/antithesis-mutants`) runs
+whenever one of those six is in scope, matching CI's `invariants` job.
 gates.sh also runs a `-p ravel-cli --features sql-explain` clippy and test
 lane whenever ravel-cli is in scope, matching CI's `features` job. And
 it runs `cargo clippy -p ravel-ingest --all-targets` on its own whenever
