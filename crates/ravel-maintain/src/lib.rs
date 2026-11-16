@@ -43,6 +43,8 @@ pub mod claim_guard;
 pub mod clock;
 pub mod codec;
 pub mod compact;
+pub mod compat_activate;
+pub mod compat_init;
 pub mod compat_policy;
 pub mod config;
 pub mod discover;
@@ -85,6 +87,14 @@ pub use compact::{
     CompactionOutcome, CompactionRefusedReason, buckets_held_out_of_window_total,
     buckets_held_unknown_section_total, compact_bucket, compact_bucket_claimed,
     compaction_inputs_skipped_total, compaction_refused_total, compactions_in_flight,
+};
+pub use compat_activate::{
+    ActivateError, ActivateOutcome, ActivateReport, ActivateRequest, FenceCursor, FenceFailure,
+    FencePosition, FenceWalkReport, WritableVersions, activate,
+};
+pub use compat_init::{
+    CensusSummary, CompatInitError, InitConfig, InitOutcome, InitReport, OutsideReadSet,
+    StrictListError, init_compat,
 };
 pub use compat_policy::{
     CompatRun, CompatRunRefusal, DEFAULT_PUBLISH_LIFETIME_NS, FamilyVersions, MaintainCompatPolicy,
