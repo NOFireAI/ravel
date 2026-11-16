@@ -65,7 +65,7 @@ pub use error::WriteError;
 pub use format_floor::{
     BelowFormatFloor, FloorAboveWriter, FloorAdmission, FormatFamily, FormatFloorFamilySnapshot,
     FormatFloorMetrics, FormatFloorPolicy, global_metrics as format_floor_metrics,
-    warn_floors_above_writer,
+    warn_floors_above_writer, warn_floors_above_writer_under,
 };
 pub use generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, HandBackReason, Routed};
 pub use idempotency::{

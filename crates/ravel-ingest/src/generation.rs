@@ -2092,7 +2092,7 @@ mod tests {
                 None
             }
         }
-        let scope = SwitchScope::<NoSender>::new(Weak::new(), 4);
+        let scope = SwitchScope::<NoSender>::new(Weak::new(), 4, CompatSlot::default());
         assert!(FlushScope::<()>::may_wait_on(&scope, 3));
         assert!(!FlushScope::<()>::may_wait_on(&scope, 4));
         assert!(!FlushScope::<()>::may_wait_on(&scope, 5));

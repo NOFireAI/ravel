@@ -195,6 +195,18 @@ impl IngestCompatPolicy {
         )
     }
 
+    /// The version the view names for `family`: its active version when this
+    /// build writes it, else the family's baseline. Unlike
+    /// [`Self::write_version`] it does not refuse on a stale or missing view.
+    pub fn named_version(&self, family: FormatFamily) -> u16 {
+        let versions = &self.families[family_index(family)];
+        self.view
+            .seen_family(compat_family(family))
+            .and_then(|seen| u16::try_from(seen.active_write_version).ok())
+            .filter(|active| versions.writable.contains(active))
+            .unwrap_or(versions.baseline)
+    }
+
     /// [`CompatRefusal::ViewStale`] when the last successful read of
     /// `sys/compat` is [`COMPAT_VIEW_HORIZON_NS`] old or older, or there has
     /// been none.
@@ -351,13 +363,12 @@ impl CompatPublishRefusal {
         }
     }
 
-    /// Everything but a missing `sys/compat` clears without an operator: a
-    /// refresh, a rollout, or a retried fence.
+    /// Always true: the refused rows are valid, and a later write succeeds
+    /// once a refresh, a rollout, a retried fence or a restored `sys/compat`
+    /// clears the refusal. [`CompatRefusal::is_retryable`] answers a
+    /// different question, whether it clears without an operator.
     pub fn is_retryable(&self) -> bool {
-        match self {
-            CompatPublishRefusal::Policy { refusal, .. } => refusal.is_retryable(),
-            CompatPublishRefusal::FenceFailed { .. } => true,
-        }
+        true
     }
 }
 
