@@ -11,6 +11,8 @@ mod budget;
 mod clock;
 mod compat;
 #[cfg(test)]
+mod compat_get_store;
+#[cfg(test)]
 mod compat_signal_tests;
 mod config;
 mod deferral;

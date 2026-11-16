@@ -2,8 +2,10 @@
 //! (ADR-4233 decisions 2 to 4), driven through each router's write API with
 //! the policy's family-version seam: no policy publishes byte for byte what
 //! the parent of the policy work published, the bucket is fenced before the
-//! first PUT of a version above the baseline, and a view that ages past the
-//! horizon after grant stops the flush before its next attempt.
+//! first PUT of a version above the baseline, a view that ages past the
+//! horizon after grant stops the flush before its next attempt, and a view
+//! no read has succeeded for publishes only while its latest refresh was
+//! refused with `AccessDenied`.
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;
@@ -29,6 +31,7 @@ use ravel_types::{Signal, TenantId};
 
 use crate::clock::Clock;
 use crate::compat::{CompatPublishRefusal, IngestCompatPolicy};
+use crate::compat_get_store::{CompatGet, CompatGetStore};
 use crate::config::IngestConfig;
 use crate::format_floor::FormatFamily;
 use crate::indexed_fields::IndexedFieldsOverlay;
@@ -281,6 +284,80 @@ async fn above_baseline(
         ),
     );
     (fault_store, clock, policy)
+}
+
+/// ADR-4233 decision 3 on the log path: a view that no refresh has
+/// succeeded for is blind only while its latest refresh was refused with
+/// `AccessDenied`, a credential without the `sys/compat` grant. Blind, a log
+/// write to a bucket at `compat_epoch` 0 publishes at the baseline. Behind a
+/// 503 the view cannot tell whether an activation happened, and the same
+/// write is refused under `view_stale` at once, inside the horizon, and
+/// stores nothing.
+#[tokio::test]
+async fn a_never_read_log_view_publishes_only_behind_access_denied() {
+    let acme = TenantId::new("acme");
+    for get in [CompatGet::AccessDenied, CompatGet::ServerError] {
+        let compat_store = Arc::new(CompatGetStore::new(get));
+        let store: Arc<dyn ObjectStoreBackend> = compat_store.clone();
+        ravel_catalog::validate_or_adopt(
+            store.as_ref(),
+            &acme.hash(),
+            Signal::Logs,
+            1,
+            BASE_NS,
+            AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("provision");
+        let compat_keys = CompatKeys::from_file_keys(&[[4; 32]]).expect("one key");
+        let clock = Arc::new(CompatTestClock(AtomicI64::new(BASE_NS)));
+        let view = CompatView::new(Arc::clone(&store), compat_keys, clock.clone());
+        let err = view.refresh().await.expect_err("the sys/compat GET fails");
+        assert_eq!(
+            err.is_access_denied(),
+            get == CompatGet::AccessDenied,
+            "{get:?}"
+        );
+        assert_eq!(compat_store.failed(), 1, "{get:?}");
+        let router = seeded_log_router(Arc::clone(&store))
+            .with_compat_policy(Some(Arc::new(IngestCompatPolicy::new(view, clock))))
+            .expect("no publish bound");
+
+        let written = router
+            .write(
+                acme.clone(),
+                vec![log_record()],
+                WriteMode::StrictArrival,
+                ACK_DEADLINE,
+            )
+            .await;
+        let stored = objects(&keys(store.as_ref(), &acme, Signal::Logs).await);
+        let refused = router.metrics_snapshot().compat_publish_refused;
+        match get {
+            CompatGet::AccessDenied => {
+                written.expect("a blind view publishes at the baseline");
+                assert_eq!(stored, 2);
+                assert_eq!(refused.total(), 0);
+            }
+            CompatGet::ServerError | CompatGet::Passthrough => {
+                let err = written.expect_err("a never-read view behind a 5xx is not blind");
+                assert!(
+                    matches!(&err, LogWriteError::CompatRefused(r)
+                    if policy_refusal(r, FormatFamily::Rlog, |r| matches!(
+                        r,
+                        CompatRefusal::ViewStale {
+                            last_read_unix_ns: None,
+                            now_unix_ns: BASE_NS,
+                        }
+                    ))),
+                    "{err:?}"
+                );
+                assert_eq!(stored, 0);
+                assert_eq!(refused.view_stale, 1);
+                assert_eq!(refused.total(), 1);
+            }
+        }
+    }
 }
 
 /// The `compat_epoch` of `tenant`'s `signal` provisioning record.
