@@ -8519,6 +8519,7 @@ mod tests {
         let safety = MaintenanceSafetyMetrics::default();
         let mut memo = MaintainMemo::with_default_interval();
 
+        #[allow(clippy::too_many_arguments)]
         async fn assert_still_held(
             pass: u64,
             store: &MemoryStore,
