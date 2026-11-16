@@ -6660,10 +6660,13 @@ fn render_maintain_safety_family(
         "Bucket evaluations in which this process did not compact, or did not publish an \
          erasure rewrite, because it could not take the bucket's claim, by signal, since process \
          start: an unexpired claim held the bucket, another contender won the steal, the claim \
-         could not be read, or it vanished twice. A claim lost mid-run counts on \
-         ravel_maintain_claims_lost_total instead, and an erasure rewrite stopped by its \
-         pre-publish re-list or its deadline counts on neither. A held bucket adds one per \
-         maintenance pass until its claim expires. Counted from shard passes that complete.",
+         could not be read, it vanished twice, or its format_version is one this build cannot \
+         read (0, or above this build's known version), which is never stolen at any age \
+         (ADR-4233 decision 4, H8) and adds one per pass for as long as it is held, with no \
+         expiry. A claim lost mid-run counts on ravel_maintain_claims_lost_total instead, and an \
+         erasure rewrite stopped by its pre-publish re-list or its deadline counts on neither. A \
+         held bucket adds one per maintenance pass until its claim expires. Counted from shard \
+         passes that complete.",
         "counter",
     );
     for signal in &snapshot.signals {
@@ -17835,6 +17838,27 @@ mod tests {
                 (Signal::Logs, "0"),
                 (Signal::Spans, "0"),
             ],
+        );
+    }
+
+    /// `ravel_maintain_claims_skipped_total`'s HELP text must name the
+    /// version-protected skip reason (ADR-4233 decision 4, H8), the same
+    /// counter a plain unreadable claim's skip already increments: the
+    /// family carries no per-reason label, so this prose is the only place
+    /// `/metrics` says a version-protected claim is never stolen, at any
+    /// age, rather than merely held past a lease.
+    #[test]
+    fn claims_skipped_help_text_names_the_version_protected_reason() {
+        let snapshot = safety_snapshot_with(|_| {});
+        let mut body = String::new();
+        render_maintain_safety_family(&mut body, Mode::All, &snapshot);
+        let help_line = body
+            .lines()
+            .find(|line| line.starts_with("# HELP ravel_maintain_claims_skipped_total "))
+            .expect("claims_skipped HELP header present");
+        assert!(
+            help_line.contains("format_version") && help_line.contains("never stolen"),
+            "HELP text must say a claim at an unknown format_version is never stolen:\n{help_line}"
         );
     }
 

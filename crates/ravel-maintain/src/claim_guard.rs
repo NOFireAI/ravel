@@ -1747,6 +1747,136 @@ mod tests {
         );
     }
 
+    /// A claim at a future `format_version` is version-protected (ADR-4233
+    /// decision 4, H8): the guard reports
+    /// [`ClaimSkipReason::VersionProtectedClaim`], not
+    /// [`ClaimSkipReason::UnreadableClaim`], with both the reschedule and
+    /// recheck points pinned at [`i64::MAX`], and it is never stolen however
+    /// far the clock runs past the ordinary ceiling.
+    ///
+    /// Shown failing against a guard that folds every unreadable payload into
+    /// one reason (the reason reads `UnreadableClaim`) and against one that
+    /// still bounds the hold at the ceiling (the pass at the ceiling plus
+    /// jitter, which used to be exactly when an ordinary unreadable claim is
+    /// stolen, steals here too).
+    #[tokio::test]
+    async fn a_version_protected_claim_is_never_stolen() {
+        let store = MemoryStore::new();
+        let written_ms: i64 = 1_700_000_000_000;
+        store.set_clock_ms(written_ms as u64);
+        let key = claim::compaction_claim_key(&bucket_identity().work_id());
+        let future = CompactionClaim {
+            format_version: ravel_fleet::claim::CLAIM_FORMAT_VERSION + 1,
+            owner_process_id: Uuid::from_u128(0xA1).as_bytes().to_vec(),
+            attempt_id: Uuid::from_u128(0xA2).as_bytes().to_vec(),
+            input_set_hash: Vec::new(),
+            state: ravel_proto::sys::v1::ClaimState::Running as i32,
+            renewed_count: 0,
+            lease_duration_ns: 1_000_000_000,
+            owner_clock_ns: written_ms * 1_000_000,
+        };
+        let planted = store
+            .put(
+                &key,
+                future.encode_to_vec().into(),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("seed a future-format claim");
+        let lease_ms = cfg().lease_duration.as_millis() as i64;
+        let jitter = contender_jitter().as_millis() as i64;
+        let ceiling = written_ms + MAX_OBSERVED_LEASE_MS;
+        let clock = FixedClock::new(0);
+        let (contender, sleeper) = recording_participant(2, &clock);
+        let guard_at = |now_ms: i64| {
+            clock.set(now_ms * 1_000_000);
+            ClaimGuard::new(&bucket(), &contender, cfg(), None)
+        };
+        let skipped = |outcome: Acquire, what: &str| match outcome {
+            Acquire::Skipped(skip) => skip,
+            other => panic!("{what}: expected a skip, got {other:?}"),
+        };
+
+        // Younger than any ordinary claim's lease: a version-protected skip.
+        let young = guard_at(written_ms + 1_000);
+        let skip = skipped(young.acquire(&store).await.expect("young"), "young");
+        assert_eq!(skip.reason, ClaimSkipReason::VersionProtectedClaim);
+        assert_eq!(skip.expiry_unix_ms, i64::MAX);
+        assert_eq!(skip.reschedule_after_unix_ms, i64::MAX);
+        assert_eq!(skip.recheck_after_unix_ms, i64::MAX);
+
+        // Exactly the ordinary ceiling plus jitter, and the configured lease
+        // past it besides: still never stolen.
+        for now_ms in [
+            ceiling + jitter,
+            ceiling + jitter + 1,
+            ceiling + lease_ms + jitter + 1,
+        ] {
+            let later = guard_at(now_ms);
+            let skip = skipped(
+                later.acquire(&store).await.expect("later"),
+                "past the ordinary ceiling",
+            );
+            assert_eq!(skip.reason, ClaimSkipReason::VersionProtectedClaim);
+        }
+        assert_eq!(
+            sleeper.waits(),
+            Vec::<Duration>::new(),
+            "a version-protected claim is never stolen, so it is never waited for"
+        );
+        let after = store.get(&key, GetRange::Full).await.expect("claim read");
+        assert_eq!(
+            after.version, planted.version,
+            "the claim object is never written to"
+        );
+        assert_eq!(
+            after.data,
+            future.encode_to_vec(),
+            "the claim's stored bytes are untouched"
+        );
+    }
+
+    /// The dedup gate behind the version-protected warn log fires exactly
+    /// once per work id, and independently per work id: a second call for
+    /// the same claim returns `false` (already warned, so `contend` logs
+    /// nothing further), and a first call for a *different* claim still
+    /// returns `true`, so one wedged claim never silences the warning for
+    /// another.
+    ///
+    /// This is tested directly against the gate rather than by capturing
+    /// `tracing` output: `tracing`'s per-callsite interest cache is a single
+    /// global (not thread-local) structure, and this crate's test binary
+    /// runs every test in one process across many threads, so a capturing
+    /// test at this callsite races any other test that reaches the same
+    /// callsite on another thread without installing a subscriber --
+    /// `a_version_protected_claim_is_never_stolen` above is exactly such a
+    /// test, and does so from four acquisitions. Asserting on the gate's
+    /// return value is equivalent and immune to that race.
+    #[test]
+    fn version_protected_warn_fires_once_per_work_id() {
+        let a =
+            WorkIdentity::new(TenantId::new("acme").hash(), Signal::Logs, 7_001, HOUR).work_id();
+        let b =
+            WorkIdentity::new(TenantId::new("acme").hash(), Signal::Logs, 7_002, HOUR).work_id();
+
+        assert!(
+            warn_version_protected_once(a),
+            "the first observation of a's claim warns"
+        );
+        assert!(
+            !warn_version_protected_once(a),
+            "a second observation of the same claim does not warn again"
+        );
+        assert!(
+            warn_version_protected_once(b),
+            "a different claim's first observation still warns"
+        );
+        assert!(
+            !warn_version_protected_once(b),
+            "and is itself deduplicated thereafter"
+        );
+    }
+
     /// An unreadable claim's skip is rechecked one configured lease plus this
     /// contender's jitter plus one millisecond after the observation, never
     /// later than its steal threshold, while the steal threshold itself stays
