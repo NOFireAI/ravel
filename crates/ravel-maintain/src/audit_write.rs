@@ -1082,7 +1082,7 @@ mod tests {
     #[test]
     fn the_audit_write_budget_sits_inside_the_default_publish_lifetime() {
         assert_eq!(AUDIT_WRITE_BUDGET_NS, 30 * SECOND_NS);
-        assert!(AUDIT_WRITE_BUDGET_NS < crate::compat_policy::DEFAULT_PUBLISH_LIFETIME_NS);
+        const { assert!(AUDIT_WRITE_BUDGET_NS < crate::compat_policy::DEFAULT_PUBLISH_LIFETIME_NS) };
     }
 
     /// ADR-4233 decision 3: an active RLOG version this build cannot write

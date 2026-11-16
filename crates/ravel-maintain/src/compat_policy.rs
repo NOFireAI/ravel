@@ -237,10 +237,10 @@ impl MaintainCompatPolicy {
                         CompatRunRefusal::Compat(refusal),
                     )
                 })?;
-            if version > baseline {
-                if let Some(seen) = self.view.seen_family(family) {
-                    fence_epoch = fence_epoch.max(seen.activated_epoch);
-                }
+            if version > baseline
+                && let Some(seen) = self.view.seen_family(family)
+            {
+                fence_epoch = fence_epoch.max(seen.activated_epoch);
             }
             versions.push((*family, version));
         }
@@ -249,19 +249,19 @@ impl MaintainCompatPolicy {
             .last_record()
             .map(|r| r.max_publish_lifetime_ns)
             .filter(|p| *p > 0);
-        if let Some(record_ns) = recorded {
-            if lifetime_ns > record_ns {
-                let family = families.first().copied().unwrap_or_default();
-                return Err(refuse(
-                    run,
-                    family,
-                    bucket.as_ref(),
-                    CompatRunRefusal::PublishLifetimeAboveCompat {
-                        process_ns: lifetime_ns,
-                        record_ns,
-                    },
-                ));
-            }
+        if let Some(record_ns) = recorded
+            && lifetime_ns > record_ns
+        {
+            let family = families.first().copied().unwrap_or_default();
+            return Err(refuse(
+                run,
+                family,
+                bucket.as_ref(),
+                CompatRunRefusal::PublishLifetimeAboveCompat {
+                    process_ns: lifetime_ns,
+                    record_ns,
+                },
+            ));
         }
         let fence = match (bucket, record) {
             (Some((tenant_hash, signal)), Some(record)) if record.compat_epoch < fence_epoch => {
