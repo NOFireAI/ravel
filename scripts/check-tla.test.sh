@@ -1499,11 +1499,28 @@ fn live() {
     /* if inv_mutant!("enr/block-comment") {} */
     /*
      * if inv_mutant!("enr/block-body") {}
+       if inv_mutant!("enr/block-bare") {}
      */
 }
 #[cfg(test)]
 mod tests {
     fn t() { if inv_mutant!("enr/cfg-test") {} }
+}
+fn after_tests() {
+    if inv_mutant!("enr/after-test-mod") {}
+}
+EOF
+cat > "$airepo/crates/m/early.rs" <<'EOF'
+#[cfg(test)]
+use std::fmt;
+#[cfg(test)]
+#[allow(dead_code)]
+fn helper() {
+    let _ = inv_mutant!("enr/cfg-test-fn");
+}
+fn live() {
+    if inv_mutant!("enr/after-cfg-use") {}
+    *slot_ref() = 1; if inv_mutant!("enr/after-deref") {}
 }
 EOF
 cat > "$airepo/crates/m/tests/it.rs" <<'EOF'
@@ -1526,10 +1543,27 @@ tsv_mutant not-driver
 expect_trace ax2 enr fail "mutant 'enr/not-driver' not found as inv_mutant!(\"enr/not-driver\") in Rust"
 
 echo "--- (ay) traceability: a commented-out, cfg(test) or tests/ mutant literal does not count"
-for m in line-comment block-comment block-body cfg-test tests-dir; do
+for m in line-comment block-comment block-body block-bare cfg-test cfg-test-fn tests-dir; do
     tsv_mutant "$m"
     expect_trace "ay-$m" enr fail "mutant 'enr/$m' not found as inv_mutant!(\"enr/$m\") in Rust"
 done
+
+echo "--- (ay2) traceability: a #[cfg(test)] item hides only itself, not the code after it"
+for m in after-test-mod after-cfg-use after-deref; do
+    tsv_mutant "$m"
+    expect_trace "ay2-$m" enr pass 'PASS (1 rows resolve)'
+done
+
+echo "--- (ay3) traceability: a sut: path under tests/ fails"
+make_area enr 1 "$HDR6
+| Test | test | \`crates/a.rs::publish\` | none | none | sut: \`crates/m/tests/it.rs\` -- commit never precedes data |"
+expect_trace ay3 enr fail "sut: path 'crates/m/tests/it.rs' is a test file, not code under test"
+
+echo "--- (ay4) traceability: a separator row with the wrong cell count fails"
+make_area unenr 0 "${HDR5%%$'\n'*}
+| --- | --- | --- | --- |
+$ROW5"
+expect_trace ay4 unenr fail "separator has 4 cells, the table 5"
 
 echo "--- (az) traceability: each remaining cell, header and .tsv rule fails on its own"
 make_area enr 1 "$HDR6
