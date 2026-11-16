@@ -507,10 +507,21 @@ from their directories). The two bounded the part by different fetchers, so a
 logs part above the plan bound was read both ways: the whole-part warm fetched
 and decoded its blocks, and the metadata pass read its directories. The query
 path never reads such a part's blocks at plan time, so the whole read warmed
-cache entries no statement looks up and spent the deadline decoding them. On
-the ClickBench tenant (222 RLOG objects, all above the bound) every start hit
-the deadline in the whole-part step, decoding blocks no plan needs, while the
-disk sat idle (issue #4203, M4 and M5).
+cache entries no first statement is known to look up and spent the deadline
+decoding them.
+
+On the ClickBench M5 tenant the warm-up hit its deadline in the whole-part
+step while the disk sat idle (issue #4203, M4 and M5). Two candidate causes fit
+that symptom and this change does not decide between them: the whole reads of
+logs parts above the plan bound (removed here), and whole reads still in flight
+at the deadline (the deadline test warms 38 of 40 parts, so some whole reads
+were outstanding when the deadline fired). An earlier draft of this amendment
+stated "222 RLOG objects, all above the bound" as the cause; that was an
+unverified claim and it does not reconcile with the 220-of-222 split the
+instrumentation showed (two parts at or under the bound). Which cause dominates
+is decided by the next box run, reading the new `parts_above_plan_bound` and
+`parts_beyond_cap` counts (below) against each tenant's object count, not
+asserted here.
 
 The whole-part warm now reads a logs part the way the query path does: whole
 only at or under the plan bound, and not at all above it. A part above the
@@ -518,29 +529,45 @@ bound is dropped from the whole-part set, before the per-(tenant, signal)
 cap, and left to the metadata pass, which warms its footer and four
 directories. The whole-part warm's fetcher is built with the same block-range
 threshold, request cost and projection break-even the metadata pass uses, so
-the two steps agree on the bound and partition the warm set: a logs part is
-warmed whole or has its metadata warmed, never both. A part skipped for being
-above the bound is counted separately, in a new `parts_above_plan_bound` field
-on the per-(tenant, signal) warm line and the pass-complete line; it counts
-neither as warmed nor as over budget. The whole-part cap
-(`MAX_PARTS_PER_TENANT_PER_SIGNAL`), the parts-in-flight and whole-part byte
-budgets, the metadata share of the cache, the warm deadline and `/readyz`
-behaviour are all unchanged. The metric side is unchanged too: a metric part
-above `DEFAULT_WHOLE_OBJECT_THRESHOLD` is still warmed, on its footer tail.
+the two steps agree on the bound: a logs part is warmed whole or has its
+metadata warmed, never both. The two do not cover every part, so this is not a
+strict partition. A part above the bound is counted in a new
+`parts_above_plan_bound` field; a part at or under the bound that the
+per-(tenant, signal) cap drops is warmed by neither step (the metadata pass
+reads only parts above the bound) and counted in a new `parts_beyond_cap`
+field. Both fields appear on the per-(tenant, signal) warm line and the
+pass-complete line, so `parts_warmed`, `parts_over_budget`, `parts_beyond_cap`
+and `parts_above_plan_bound` sum to a tenant's logs objects in the warm set.
+The whole-part cap (`MAX_PARTS_PER_TENANT_PER_SIGNAL`), the parts-in-flight and
+whole-part byte budgets, the metadata share of the cache, the warm deadline and
+`/readyz` behaviour are all unchanged. The metric side is unchanged too: a
+metric part above `DEFAULT_WHOLE_OBJECT_THRESHOLD` is still warmed, on its
+footer tail.
 
-Why: the whole read of an above-bound logs part is pure cost. The query path
-plans such a part from its directories, which the metadata pass already warms,
-and reads its blocks only for the surviving rows of a specific statement,
-under keys this pass cannot predict. Warming the blocks whole fills the cache
-with pages no first statement is known to read and spends the warm deadline
-decoding them, the exact cost #4203 set out to remove.
+Why: the whole read of an above-bound logs part warms blocks the query path
+does not read at plan time. The query path plans such a part from its
+directories, which the metadata pass already warms, and reads its blocks only
+for the surviving rows of a specific statement, under keys this pass cannot
+predict. Warming the blocks whole fills the cache with pages no first statement
+is known to read and spends the warm deadline decoding them, the cost #4203 set
+out to remove.
 
 The production case this leaves exposed: a tenant whose logs parts are all
 above the plan bound (a large-object workload such as ClickBench) now has only
-its metadata warmed. Its first query still plans from warmed directories with
-no GET, but the column-page reads that follow are paid cold, where before the
-whole read had warmed some of them. This is the deliberate trade: the warm-up
+its metadata warmed. Its first query plans from the warmed directories without
+a GET only when the plan is unkeyed and only for the objects the metadata pass
+reached before its ceiling or the deadline; the column-page reads that follow
+are paid cold, where before the whole read had warmed some of them. A keyed
+plan (key-equality arms) still reads KEY_IDX and the BLOOM and POSTINGS
+sections the pass does not warm. This is the deliberate trade: the warm-up
 takes the edge off plan-phase reads for every tenant within the deadline,
 rather than paying to warm one large tenant's blocks and timing out before it
 reaches the rest (ADR-0046 consequences: a cold cache answers every query
 correctly, only more slowly).
+
+When the metadata pass itself does not run — an invalid logs fetch bound makes
+`LogsMetadataPass::new` return `None` — a logs part above the bound is warmed
+by neither step, so such a tenant starts fully cold on logs. The warm-up logs
+that at `warn!` once per pass when any above-bound part was seen; the
+per-(tenant, signal) line alone logs the skip at `info!`, because an above-bound
+part is normally warmed by the pass.

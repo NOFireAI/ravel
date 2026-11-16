@@ -7432,10 +7432,13 @@ needs. A logs part above the bound is dropped from the whole-part set, before
 the 4-part cap, and counted in `parts_above_plan_bound`; the cap then takes the
 most recent parts at or under the bound. The whole-part warm's logs fetcher is
 built with the same block-range threshold, request cost and projection
-break-even as the metadata pass, so the two steps agree on the bound and split
-a tenant's logs set between them: a logs part is warmed whole here or has its
-metadata warmed below, never both. The metric side is unchanged: a metric part
-above `DEFAULT_WHOLE_OBJECT_THRESHOLD` is still warmed, on its footer tail.
+break-even as the metadata pass, so the two steps agree on the bound: a logs
+part is warmed whole here or has its metadata warmed below, never both. The two
+do not cover every part, so this is not a strict partition: a part at or under
+the bound beyond the 4-part cap is warmed by neither (the metadata pass reads
+only parts above the bound), counted in `parts_beyond_cap`. The metric side is
+unchanged: a metric part above `DEFAULT_WHOLE_OBJECT_THRESHOLD` is still warmed,
+on its footer tail.
 
 The whole-part warm holds to the cache budget minus the pass's ceiling
 (below), or to the whole budget when the pass does not run. Each part
@@ -7529,9 +7532,13 @@ deadline fires first, the deadline warning reports `parts_warmed`,
 `step`, the comma-separated steps still running. Both lines also report
 `metadata_get_permits`, the pass's concurrency, and
 `whole_part_bytes_reserved`, the bytes the whole-part warm holds against its
-share. Each per-(tenant, signal) `cache warmup: warmed tenant signal` line
-reports `parts_over_budget`, the parts skipped because they did not fit that
-share. When the pass runs, a
+share, and `parts_above_plan_bound` and `parts_beyond_cap`, the logs parts
+dropped for being above the bound and dropped at the 4-part cap. Each
+per-(tenant, signal) `cache warmup: warmed tenant signal` line reports
+`parts_over_budget`, the parts skipped because they did not fit that share, and
+those same two counts, so for logs `parts_warmed + parts_over_budget +
+parts_beyond_cap + parts_above_plan_bound` equals the warm set. When the pass
+runs, a
 `cache warmup: warmed tenant logs metadata` line reports the first two for
 each tenant that has an object above the bound.
 

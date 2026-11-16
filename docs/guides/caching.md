@@ -463,11 +463,18 @@ old data, such as a benchmark set whose event times are years in the past, is
 warmed the same way as one ingesting live data.
 
 A tenant whose log segments are all above the plan bound (a large-object
-workload) has only their metadata warmed. Its first query still plans from the
-warmed directories with no GET, but the column-page reads that follow are paid
-cold. This is deliberate: warmup takes the edge off plan-phase reads for every
-tenant within the time budget, rather than spending it decoding one large
-tenant's blocks.
+workload) has only their metadata warmed. Its first query plans from the warmed
+directories without a GET only when the plan is unkeyed and only for the
+segments the metadata pass reached before its ceiling or the time budget; the
+column-page reads that follow are paid cold. A keyed plan (a statement with
+key-equality arms) still reads the segment's key index, bloom and postings,
+which the pass does not warm. This is deliberate: warmup takes the edge off
+plan-phase reads for every tenant within the time budget, rather than spending
+it decoding one large tenant's blocks.
+
+If the logs metadata pass cannot run (an invalid logs fetch bound, logged at
+`warn!`), a log segment above the plan bound is warmed by neither step, and
+such a tenant starts fully cold on logs.
 
 Warmup is best-effort:
 
@@ -490,13 +497,18 @@ The per-(tenant, signal) line carries `tenant_hash`, `signal`, `parts_warmed`,
 `parts_over_budget` (segments skipped because they did not fit the whole
 segments' share of the cache once no read of theirs was in flight),
 `parts_above_plan_bound` (log segments the whole-segment warm skipped for being
-above the plan bound, left to the metadata pass) and `latest_ingest_hour`. Its
-level is:
+above the plan bound, left to the metadata pass), `parts_beyond_cap` (segments
+at or under the bound that the per-(tenant, signal) cap dropped, warmed by
+neither step) and `latest_ingest_hour`. For logs, `parts_warmed +
+parts_over_budget + parts_beyond_cap + parts_above_plan_bound` equals the
+segments in the warm set. Its level is:
 
 - `info!` normally.
-- `warn!` if the tenant has a live part for that signal but none of them
-  warmed, none was skipped for the cache share, and none was above the plan
-  bound, which means that a resolve or fetch failure lost the whole signal.
+- `warn!` if the tenant has a live part for that signal, its at-or-under-bound
+  candidate set is non-empty, and none of those candidates warmed for a reason
+  other than the cache share or the cap, which means a resolve or fetch failure
+  lost them. A segment above the bound does not raise or mask this: an
+  all-above-bound signal warms nothing whole by design and stays at `info!`.
 
 `latest_ingest_hour` takes one of three values:
 

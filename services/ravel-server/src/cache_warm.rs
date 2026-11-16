@@ -51,11 +51,16 @@
 //! and counted in `parts_above_plan_bound`, so the cap takes the most recent
 //! parts at or under the bound. The whole-part fetcher is built with the same
 //! block-range threshold, request cost and projection break-even the metadata
-//! pass uses, so the two steps agree on the bound and partition the warm set:
-//! a logs part is warmed whole here or has its metadata warmed below, never
-//! both and (budget permitting) never neither. (The metric side is unchanged:
-//! a metric part above [`DEFAULT_WHOLE_OBJECT_THRESHOLD`] is still warmed, on
-//! its footer tail, never skipped.)
+//! pass uses, so the two steps agree on the bound: a logs part is warmed whole
+//! here or has its metadata warmed below, never both. The two do not cover
+//! every part, so this is not a strict partition: a part at or under the bound
+//! beyond the whole-part cap ([`MAX_PARTS_PER_TENANT_PER_SIGNAL`]) is warmed by
+//! neither (the metadata pass reads only parts above the bound), counted in
+//! `parts_beyond_cap`; and when the metadata pass is absent (an invalid fetch
+//! bound, see [`LogsMetadataPass::new`]) a part above the bound is warmed by
+//! neither either. (The metric side is unchanged: a metric part above
+//! [`DEFAULT_WHOLE_OBJECT_THRESHOLD`] is still warmed, on its footer tail,
+//! never skipped.)
 //!
 //! The whole-part warm holds to the cache budget minus the metadata pass's
 //! ceiling (below), or to the whole budget when the pass does not run. Each
@@ -114,11 +119,15 @@
 //! each fetch updates as it completes, and the steps still running (`step`).
 //! Both lines carry the metadata pass's concurrency
 //! (`metadata_get_permits`), the bytes the whole-part warm holds against
-//! its share (`whole_part_bytes_reserved`), and the count of logs parts the
+//! its share (`whole_part_bytes_reserved`), the count of logs parts the
 //! whole-part step skipped for being above the plan bound
-//! (`parts_above_plan_bound`); the per-(tenant, signal) line carries that
-//! count too, so whole-part plus metadata objects can be read against a
-//! tenant's object count (#4307).
+//! (`parts_above_plan_bound`), and the count it dropped at the per-(tenant,
+//! signal) cap (`parts_beyond_cap`); the per-(tenant, signal) line carries
+//! both counts too. With both, whole-part plus metadata objects reconcile
+//! against a tenant's logs object count: a part is warmed whole
+//! (`parts_warmed`), left over budget (`parts_over_budget`), dropped at the cap
+//! (`parts_beyond_cap`), or warmed by the metadata pass for being above the
+//! bound (`parts_above_plan_bound`) (#4307).
 //!
 //! Every failure degrades to "warm less than planned," never to a startup
 //! failure: tenant discovery erroring, a resolve erroring, a fetch erroring,
@@ -264,6 +273,13 @@ struct WarmProgress {
     /// directories, which the metadata pass warms, so a whole read here would
     /// fetch and decode blocks no plan needs. Not a warm and not over budget.
     parts_above_plan_bound: AtomicU64,
+    /// Parts at or under the plan bound dropped by the per-(tenant, signal)
+    /// cap (#4307): the cap takes only [`MAX_PARTS_PER_TENANT_PER_SIGNAL`] of
+    /// the most recent candidates, and a logs candidate beyond it is warmed by
+    /// neither step (the metadata pass reads only parts above the bound). Not a
+    /// warm, not over budget, not above the bound; counted here so whole-part
+    /// plus metadata objects reconcile against a tenant's object count.
+    parts_beyond_cap: AtomicU64,
     metadata_objects_warmed: AtomicU64,
     metadata_bytes_warmed: AtomicU64,
     /// The bytes the whole-part warm holds against its share of the cache:
@@ -291,6 +307,10 @@ impl WarmProgress {
 
     fn part_above_plan_bound(&self) {
         self.parts_above_plan_bound.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn parts_beyond_cap_add(&self, n: u64) {
+        self.parts_beyond_cap.fetch_add(n, Ordering::Relaxed);
     }
 
     fn metadata_object_warmed(&self, bytes: u64) {
@@ -407,6 +427,7 @@ async fn warm_cache_within(
             deadline_secs = deadline.as_secs(),
             parts_warmed = progress.parts_warmed.load(Ordering::Relaxed),
             parts_above_plan_bound = progress.parts_above_plan_bound.load(Ordering::Relaxed),
+            parts_beyond_cap = progress.parts_beyond_cap.load(Ordering::Relaxed),
             metadata_objects_warmed = progress.metadata_objects_warmed.load(Ordering::Relaxed),
             metadata_bytes_warmed = progress.metadata_bytes_warmed.load(Ordering::Relaxed),
             metadata_get_permits = progress.metadata_get_permits.load(Ordering::Relaxed),
@@ -595,6 +616,7 @@ async fn warm_cache_inner(
     tracing::info!(
         parts_warmed = total_parts_warmed,
         parts_above_plan_bound = progress.parts_above_plan_bound.load(Ordering::Relaxed),
+        parts_beyond_cap = progress.parts_beyond_cap.load(Ordering::Relaxed),
         metadata_objects_warmed = metadata.objects,
         metadata_bytes_warmed = metadata.bytes,
         metadata_budget_reached = metadata_pass
@@ -609,6 +631,23 @@ async fn warm_cache_inner(
         elapsed_ms = elapsed_ms(started),
         "cache warmup: pass complete"
     );
+
+    // #4307: when the metadata pass is absent (an invalid fetch bound made
+    // `LogsMetadataPass::new` return `None`), a logs part above the plan bound
+    // is warmed by neither step: the whole-part warm skips it and no pass warms
+    // its directories. Those tenants start fully cold on logs. Warn once per
+    // pass so the gap is visible, since each per-(tenant, signal) line logs the
+    // skip at `info!` (an above-bound part is normally warmed by the pass).
+    if metadata_pass.is_none() {
+        let above = progress.parts_above_plan_bound.load(Ordering::Relaxed);
+        if above > 0 {
+            tracing::warn!(
+                parts_above_plan_bound = above,
+                "cache warmup: logs metadata pass absent (invalid fetch bound); logs parts above \
+                 the plan bound were left unwarmed, so those tenants start cold on logs"
+            );
+        }
+    }
 }
 
 /// What the logs metadata pass warmed: objects whose footer and four
@@ -636,7 +675,11 @@ struct LogsMetadataPass {
 
 impl LogsMetadataPass {
     /// `None`, with a warning, when the query path's fetch bound is one the
-    /// fetcher refuses: the pass is skipped, never startup.
+    /// fetcher refuses: the pass is skipped, never startup. With the pass
+    /// absent, a logs part above the plan bound is warmed by neither step (the
+    /// whole-part warm still skips it), so those tenants start cold on logs;
+    /// `warm_cache_inner` logs that at `warn!` once per pass when any
+    /// above-bound part was seen (#4307).
     fn new(
         store: Arc<dyn ObjectStoreBackend>,
         cache: ReadCache,
@@ -650,8 +693,8 @@ impl LogsMetadataPass {
         let concurrency = get_limiter.permits().saturating_sub(1).max(1);
         // Built like the query path's logs fetchers (`QueryEngine::new` and
         // `build_sql_state`): the request cost sets the coalescing gap and the
-        // two thresholds set the plan bound, so any other value here would
-        // read the directories under keys no statement looks up.
+        // two thresholds set the plan bound, so any other value here would read
+        // the directories under keys the query path does not look up.
         let mut fetcher = LogSegmentFetcher::new(store)
             .with_block_range_threshold(shape.block_range_threshold)
             .with_request_cost_bytes(shape.request_cost_bytes)
@@ -867,18 +910,20 @@ async fn most_recent_parts(
 }
 
 /// One `info!` per (tenant, signal) after warming, or a `warn!` instead when
-/// the tenant is known to have an ingest part for this signal at its latest
-/// hour but none were warmed: that combination means a resolve or fetch
-/// failure ate the whole signal, not that there was nothing to warm. When
-/// the latest hour is anchored by a tombstone- or rewrite-only bucket with
-/// no ingest part of its own (`has_ingest_part = false`), an empty warm is
-/// the expected outcome (the catalog drops a tombstoned bucket outright),
-/// so this logs at `info!` instead of `warn!` for that case. A signal whose
-/// parts were skipped because they did not fit the whole-part warm's cache
-/// share (`parts_over_budget` above zero) logs at `info!` too: nothing failed.
-/// A logs signal whose parts were all above the plan bound
-/// (`parts_above_plan_bound` above zero) logs at `info!` too: those parts are
-/// warmed by the metadata pass, not here, so none warming whole is expected
+/// the signal's at-or-under-bound candidate set is non-empty, none of its parts
+/// warmed, and the reason is not an expected skip: that combination means a
+/// resolve or fetch failure ate the candidates, not that there was nothing to
+/// warm. When the latest hour is anchored by a tombstone- or rewrite-only
+/// bucket with no ingest part of its own (`has_ingest_part = false`), an empty
+/// warm is the expected outcome (the catalog drops a tombstoned bucket
+/// outright), so this logs at `info!` instead of `warn!` for that case. A
+/// signal whose parts were skipped because they did not fit the whole-part
+/// warm's cache share (`parts_over_budget` above zero) or because the
+/// per-(tenant, signal) cap dropped them (`parts_beyond_cap` above zero) logs
+/// at `info!` too: nothing failed. A logs signal whose parts were all above the
+/// plan bound (`whole_candidates == 0`) logs at `info!` too: those parts are
+/// warmed by the metadata pass, not here, so none warming whole is expected,
+/// and an above-bound part never masks a genuine all-candidates-failed warning
 /// (#4307).
 fn log_warm_result(
     tenant: TenantHash,
@@ -889,14 +934,25 @@ fn log_warm_result(
     let latest_ingest_hour =
         latest_hour.map_or_else(|| "none".to_string(), |(hour, _)| hour.to_string());
     let has_ingest_part = latest_hour.is_some_and(|(_, has_ingest_part)| has_ingest_part);
-    if parts.warmed == 0 && parts.over_budget == 0 && parts.above_plan_bound == 0 && has_ingest_part
-    {
+    // The `warn!` keys on the at-or-under-bound candidate set, not on the whole
+    // signal (#4307): candidates existed, none warmed, and the reason was not
+    // an expected skip (budget or cap). An above-bound part must not mask this
+    // -- one above the bound with every at-or-under fetch failed is still a
+    // failure that ate the candidates. A signal whose parts are all above the
+    // bound (`whole_candidates == 0`) warms whole nothing by design and stays
+    // at `info!`.
+    let candidates_existed_but_none_warmed = parts.whole_candidates > 0
+        && parts.warmed == 0
+        && parts.over_budget == 0
+        && parts.beyond_cap == 0;
+    if candidates_existed_but_none_warmed && has_ingest_part {
         tracing::warn!(
             tenant_hash = %tenant.to_hex(),
             signal = ?signal,
             parts_warmed = parts.warmed,
             parts_over_budget = parts.over_budget,
             parts_above_plan_bound = parts.above_plan_bound,
+            parts_beyond_cap = parts.beyond_cap,
             latest_ingest_hour,
             "cache warmup: tenant has parts for this signal but none were warmed"
         );
@@ -907,6 +963,7 @@ fn log_warm_result(
             parts_warmed = parts.warmed,
             parts_over_budget = parts.over_budget,
             parts_above_plan_bound = parts.above_plan_bound,
+            parts_beyond_cap = parts.beyond_cap,
             latest_ingest_hour,
             "cache warmup: warmed tenant signal"
         );
@@ -981,6 +1038,18 @@ struct WholePartsWarmed {
     /// 0 for metrics, whose large parts read only a footer tail rather than
     /// being skipped.
     above_plan_bound: usize,
+    /// Candidate parts (at or under the bound, for logs) dropped by the
+    /// [`MAX_PARTS_PER_TENANT_PER_SIGNAL`] cap (#4307): the cap keeps only the
+    /// most recent candidates, and a logs candidate beyond it is warmed by
+    /// neither step. Counted so the object count reconciles.
+    beyond_cap: usize,
+    /// The candidates that entered the whole-part warm: for logs the parts at
+    /// or under the bound, for metrics every resolved part. `warmed +
+    /// over_budget + beyond_cap` plus fetch failures. Used to tell "candidates
+    /// existed but none warmed" (a fetch failure, worth a `warn!`) from "no
+    /// candidates at all" (every part was above the bound, an expected
+    /// `info!`).
+    whole_candidates: usize,
 }
 
 /// The fetcher one signal's whole-part warm reads through.
@@ -1060,7 +1129,13 @@ async fn warm_whole_parts(
     budget: u64,
     progress: &WarmProgress,
 ) -> WholePartsWarmed {
-    let mut outcome = WholePartsWarmed::default();
+    let beyond_cap = parts.len().saturating_sub(MAX_PARTS_PER_TENANT_PER_SIGNAL);
+    progress.parts_beyond_cap_add(beyond_cap as u64);
+    let mut outcome = WholePartsWarmed {
+        whole_candidates: parts.len(),
+        beyond_cap,
+        ..WholePartsWarmed::default()
+    };
     let mut pending = parts
         .iter()
         .take(MAX_PARTS_PER_TENANT_PER_SIGNAL)
@@ -2941,6 +3016,12 @@ mod tests {
     const SPLIT_PLAN_BOUND: u64 = 100_000;
     const LARGE_FILLER_BYTES: usize = 400_000;
 
+    /// Filler for a logs object above both the plan bound and the 512 KiB
+    /// `DEFAULT_WHOLE_OBJECT_THRESHOLD`, so a whole read of it goes out as block
+    /// ranges rather than one `GetRange::Full`
+    /// (`the_whole_part_warm_issues_no_block_get_for_a_part_above_the_bound`).
+    const ABOVE_WHOLE_OBJECT_FILLER_BYTES: usize = 700 * 1024;
+
     /// An [`EngineConfig`] whose logs plan bound is [`SPLIT_PLAN_BOUND`].
     fn split_engine() -> EngineConfig {
         EngineConfig {
@@ -3805,35 +3886,54 @@ mod tests {
         );
     }
 
-    /// Delegates to a `MemoryStore`, recording the key of every whole-object
-    /// (`GetRange::Full`) GET and delaying the one whose key is `slow_key` by
-    /// `delay` on the paused clock. A whole read of a logs object is the only
-    /// read that fetches its blocks; the metadata pass reads a suffix and the
-    /// directory ranges, never `Full`.
-    struct RecordsFullGets {
+    /// A GET that fetches an object's block/data region, as opposed to the
+    /// metadata pass's footer and directory reads. The logs funnel reads a part
+    /// whole: either one `GetRange::Full`, or -- for an object above the
+    /// fetcher's block-range threshold -- block ranges, the first of which
+    /// starts at offset 0 (the data section is at the front of the object). The
+    /// metadata pass reads only the tail: a `GetRange::Suffix` footer probe and
+    /// `GetRange::Range` directory extents at offsets above 0. So "touches
+    /// offset 0" distinguishes a whole/block read from any metadata read,
+    /// whether the whole read is `Full` or ranged.
+    fn is_block_read(range: GetRange) -> bool {
+        matches!(range, GetRange::Full | GetRange::Range(0, _))
+    }
+
+    /// Delegates to a `MemoryStore`, recording the `(key, range)` of every GET
+    /// (ranged reads included, not only `GetRange::Full`), and delaying any
+    /// block read ([`is_block_read`]) whose key is `slow_key` by `delay` on the
+    /// paused clock. Recording ranged reads is what lets the test below catch a
+    /// whole-part warm that reads an above-bound object by block ranges rather
+    /// than one `Full` GET, which a `Full`-only counter would miss.
+    struct RecordsGets {
         inner: MemoryStore,
         slow_key: parking_lot::Mutex<String>,
         delay: Duration,
-        full_gets: parking_lot::Mutex<Vec<String>>,
+        gets: parking_lot::Mutex<Vec<(String, GetRange)>>,
     }
 
-    impl RecordsFullGets {
+    impl RecordsGets {
         async fn observe(&self, key: &str, range: GetRange) {
-            if matches!(range, GetRange::Full) {
-                self.full_gets.lock().push(key.to_string());
-                if *self.slow_key.lock() == key {
-                    tokio::time::sleep(self.delay).await;
-                }
+            self.gets.lock().push((key.to_string(), range));
+            if is_block_read(range) && *self.slow_key.lock() == key {
+                tokio::time::sleep(self.delay).await;
             }
         }
 
-        fn full_count(&self, key: &str) -> usize {
-            self.full_gets.lock().iter().filter(|k| *k == key).count()
+        /// GETs of `key` that fetched its block/data region (`Full` or a range
+        /// from offset 0), whatever their count.
+        fn block_reads(&self, key: &str) -> Vec<GetRange> {
+            self.gets
+                .lock()
+                .iter()
+                .filter(|(k, range)| k == key && is_block_read(*range))
+                .map(|(_, range)| *range)
+                .collect()
         }
     }
 
     #[async_trait]
-    impl ObjectStoreBackend for RecordsFullGets {
+    impl ObjectStoreBackend for RecordsGets {
         async fn put(
             &self,
             key: &str,
@@ -3893,16 +3993,23 @@ mod tests {
     }
 
     /// Issue #4307, the distinguishing test: a tenant with one small logs part
-    /// (at or under the plan bound) and one large one (above it). The large
-    /// object's whole read is delayed 5 s, longer than the 1 s deadline. After
-    /// the pass the whole-part step has issued no whole-object (block) GET of
+    /// (at or under the plan bound) and one large one above it, sized above the
+    /// 512 KiB whole-object threshold so a whole read of it goes out as block
+    /// ranges, not one `GetRange::Full`. Any block read of the large object
+    /// (whole or ranged, [`is_block_read`]) is delayed 5 s, longer than the 1 s
+    /// deadline. After the pass the whole-part step has issued no block GET of
     /// the large object: it read only the small one whole, and the pass
-    /// completed inside the deadline because it never waited on the large whole
-    /// read. The large object's metadata is warmed by the metadata pass. Seen
-    /// failing on current main, which warms the large object whole: its whole
-    /// read is delayed past the deadline, so the deadline warning fires instead
-    /// of the pass-complete line and `full_count(&large_key)` is 1, not 0 (the
-    /// `full_count(&large_key)` assertion below is the one that fails).
+    /// completed inside the deadline because it never waited on a large block
+    /// read. The large object's metadata is warmed by the metadata pass, whose
+    /// footer-probe and directory reads touch the tail, never offset 0, so they
+    /// are not block reads and are not delayed.
+    ///
+    /// Shown failing against a whole-part warm that reads above-bound parts
+    /// (the pre-#4307 behaviour, reproduced by not partitioning the warm set):
+    /// the large object's whole read goes out as block ranges, which
+    /// `block_reads(&large_key)` now records (a `GetRange::Full`-only counter
+    /// would miss them), and that read is delayed past the deadline, so the
+    /// `block_reads(&large_key)` assertion fails and the deadline warning fires.
     #[tokio::test(start_paused = true)]
     async fn the_whole_part_warm_issues_no_block_get_for_a_part_above_the_bound() {
         use tracing_subscriber::layer::SubscriberExt as _;
@@ -3911,7 +4018,8 @@ mod tests {
         let tenant = TenantId::new("acme").hash();
         let now = now_ns();
         // One small part (recent, at or under the bound) and one large part
-        // (older, above it).
+        // (older, above it and above the 512 KiB whole-object threshold, so a
+        // whole read of it is ranged).
         publish_log_segment_hashed(&memory, tenant, now - NS_PER_MIN, [1; 32]).await;
         let at = now - 2 * NS_PER_MIN;
         publish_log_segment_sized(
@@ -3920,15 +4028,15 @@ mod tests {
             at,
             at / NS_PER_HOUR,
             [2; 32],
-            LARGE_FILLER_BYTES,
+            ABOVE_WHOLE_OBJECT_FILLER_BYTES,
         )
         .await;
 
-        let store = Arc::new(RecordsFullGets {
+        let store = Arc::new(RecordsGets {
             inner: memory,
             slow_key: parking_lot::Mutex::new(String::new()),
             delay: Duration::from_secs(5),
-            full_gets: parking_lot::Mutex::new(Vec::new()),
+            gets: parking_lot::Mutex::new(Vec::new()),
         });
         let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
         let (parts, _) =
@@ -3942,6 +4050,12 @@ mod tests {
             .iter()
             .find(|part| part.object_size > SPLIT_PLAN_BOUND)
             .expect("one large part");
+        assert!(
+            large.object_size > DEFAULT_WHOLE_OBJECT_THRESHOLD,
+            "the large part must be above the 512 KiB whole-object threshold so a whole read of it \
+             is ranged, not one Full GET: {} vs {DEFAULT_WHOLE_OBJECT_THRESHOLD}",
+            large.object_size
+        );
         let small_key = small.data_object_key.clone();
         let large_key = large.data_object_key.clone();
         *store.slow_key.lock() = large_key.clone();
@@ -3968,19 +4082,20 @@ mod tests {
         .await;
 
         assert_eq!(
-            store.full_count(&large_key),
-            0,
-            "the whole-part step issued no whole-object (block) GET for the part above the bound"
+            store.block_reads(&large_key),
+            Vec::<GetRange>::new(),
+            "the whole-part step issued no block GET (Full or a range from offset 0) for the part \
+             above the bound; only the metadata pass's tail reads are allowed"
         );
         assert_eq!(
-            store.full_count(&small_key),
+            store.block_reads(&small_key).len(),
             1,
-            "the part at or under the bound was read whole"
+            "the part at or under the bound was read whole, in one block GET"
         );
         assert_eq!(
             capture.events(DEADLINE_WARNING),
             Vec::<String>::new(),
-            "no deadline warning: the pass never waited on the large object's whole read"
+            "no deadline warning: the pass never waited on a block read of the large object"
         );
         let complete = capture.events(PASS_COMPLETE);
         assert_eq!(complete.len(), 1, "one pass-complete line: {complete:?}");
@@ -4004,8 +4119,9 @@ mod tests {
     /// it (its skip is `object_size > bound`, false at the bound) and the
     /// metadata pass leaves it alone (same test). Seen failing against an
     /// off-by-one that skips at the bound (`object_size >= bound`): the object
-    /// is counted above the bound and warmed by neither step.
-    #[tokio::test]
+    /// is counted above the bound and warmed by neither step, so
+    /// `parts_above_plan_bound` is 1 and `cache.len()` 0.
+    #[tokio::test(start_paused = true)]
     async fn a_logs_part_exactly_at_the_plan_bound_is_warmed_whole() {
         use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -4062,6 +4178,149 @@ mod tests {
                 [value],
                 "{field}: {}",
                 complete[0]
+            );
+        }
+    }
+
+    const NONE_WARMED_WARNING: &str =
+        "cache warmup: tenant has parts for this signal but none were warmed";
+
+    /// Issue #4307 item 3: the "has parts but none warmed" `warn!` keys on the
+    /// at-or-under-bound candidate set, not on the whole signal. An above-bound
+    /// part must not suppress it when every at-or-under fetch failed, and a
+    /// signal whose parts are all above the bound (no whole candidates) must not
+    /// raise it. Driven through `log_warm_result` directly so the condition is
+    /// the only thing under test.
+    ///
+    /// Shown failing against the pre-fix condition (`warmed == 0 && over_budget
+    /// == 0 && above_plan_bound == 0 && has_ingest_part`): the first call's
+    /// `above_plan_bound = 1` makes that condition false, so the all-candidates-
+    /// failed case logs at `info!` and the warning never fires, leaving
+    /// `events(NONE_WARMED_WARNING).len()` at 0, not 1.
+    #[test]
+    fn an_above_bound_part_does_not_mask_the_none_warmed_warning() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let tenant = TenantId::new("acme").hash();
+
+        // Two at-or-under-bound candidates, both fetches failed (none warmed,
+        // none over budget, none dropped at the cap), with one part above the
+        // bound. The above-bound part must not mask the failure.
+        let masked = WholePartsWarmed {
+            warmed: 0,
+            over_budget: 0,
+            above_plan_bound: 1,
+            beyond_cap: 0,
+            whole_candidates: 2,
+        };
+        log_warm_result(tenant, Signal::Logs, masked, Some((7, true)));
+
+        // A signal whose parts are all above the bound: no whole candidates, so
+        // warming nothing whole is expected and must stay at `info!`.
+        let all_above = WholePartsWarmed {
+            warmed: 0,
+            over_budget: 0,
+            above_plan_bound: 3,
+            beyond_cap: 0,
+            whole_candidates: 0,
+        };
+        log_warm_result(tenant, Signal::Logs, all_above, Some((7, true)));
+
+        assert_eq!(
+            capture.events(NONE_WARMED_WARNING).len(),
+            1,
+            "an above-bound part must not mask the none-warmed warning, and an all-above-bound \
+             signal must not raise it: {:?}",
+            capture.events(NONE_WARMED_WARNING)
+        );
+    }
+
+    /// Issue #4307 item 2: a logs candidate at or under the plan bound that the
+    /// per-(tenant, signal) cap drops is warmed by neither step, so it is
+    /// counted in `parts_beyond_cap` on the per-signal and pass-complete lines.
+    /// With five small parts and a four-part cap, one is dropped. The counts
+    /// then reconcile against the five objects: 4 warmed + 1 beyond the cap + 0
+    /// over budget + 0 above the bound.
+    ///
+    /// Shown failing against an implementation that does not count the dropped
+    /// candidate (the field stays 0): `parts_beyond_cap` reads 0, not 1, on both
+    /// lines, and the five objects no longer reconcile.
+    #[tokio::test(start_paused = true)]
+    async fn a_candidate_dropped_at_the_cap_is_counted_in_parts_beyond_cap() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let memory = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let now = now_ns();
+        // Five small logs parts, all at or under the plan bound, all in the
+        // warm window. The four-part cap warms four and drops the fifth.
+        for k in 1..=5u8 {
+            publish_log_segment_hashed(&memory, tenant, now - i64::from(k) * NS_PER_MIN, [k; 32])
+                .await;
+        }
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(memory);
+
+        let cache = Arc::new(Cache::new(CacheLimits::new(
+            16 * 1024 * 1024,
+            1024,
+            1024 * 1024,
+        )));
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        warm_cache_within(
+            Duration::from_secs(30),
+            store.clone(),
+            catalog_for(store),
+            ReadCache::Ram(cache),
+            &FixedClock(now),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            crate::cpu_gates::CpuGates::new(Default::default()).read,
+            LogsMetadataWarm::new(&split_engine(), 16 * 1024 * 1024),
+        )
+        .await;
+
+        let complete = capture.events(PASS_COMPLETE);
+        assert_eq!(complete.len(), 1, "one pass-complete line: {complete:?}");
+        for (field, value) in [
+            ("parts_warmed", "4"),
+            ("parts_beyond_cap", "1"),
+            ("parts_above_plan_bound", "0"),
+            ("metadata_objects_warmed", "0"),
+        ] {
+            assert_eq!(
+                field_values(&complete[0], field),
+                [value],
+                "{field}: {}",
+                complete[0]
+            );
+        }
+
+        let logs_line: Vec<String> = capture
+            .events("cache warmup: warmed tenant signal")
+            .into_iter()
+            .filter(|event| event.contains(" signal=Logs "))
+            .collect();
+        assert_eq!(
+            logs_line.len(),
+            1,
+            "one logs per-signal line: {logs_line:?}"
+        );
+        for (field, value) in [
+            ("parts_warmed", "4"),
+            ("parts_beyond_cap", "1"),
+            ("parts_over_budget", "0"),
+            ("parts_above_plan_bound", "0"),
+        ] {
+            assert_eq!(
+                field_values(&logs_line[0], field),
+                [value],
+                "{field}: {}",
+                logs_line[0]
             );
         }
     }
