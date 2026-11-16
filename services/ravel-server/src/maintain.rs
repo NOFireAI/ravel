@@ -2120,6 +2120,7 @@ pub async fn run_discovery_cycle<C: Clock + Clone + 'static>(
         total.already_done += report.already_done;
         total.not_sealed += report.not_sealed;
         total.held_out_of_window += report.held_out_of_window;
+        total.held_unknown_section += report.held_unknown_section;
         total.geometry_unsupported += report.geometry_unsupported;
         total.skipped_terminal += report.skipped_terminal;
         total.claim_skipped += report.claim_skipped;
@@ -2766,6 +2767,9 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                         // Buckets held for an input outside this build's
                         // reader window (ADR-2708 D5b); retried every tick.
                         held_out_of_window = report.held_out_of_window,
+                        // Buckets held for an input section kind this build
+                        // does not know (ADR-4233 H6); retried every tick.
+                        held_unknown_section = report.held_unknown_section,
                         // Buckets refused for their cursor merge geometry
                         // (ADR-3853 D0); the memo skips them until restart.
                         geometry_unsupported = report.geometry_unsupported,
@@ -2792,6 +2796,7 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                     total.already_done += report.already_done;
                     total.not_sealed += report.not_sealed;
                     total.held_out_of_window += report.held_out_of_window;
+                    total.held_unknown_section += report.held_unknown_section;
                     total.geometry_unsupported += report.geometry_unsupported;
                     total.skipped_terminal += report.skipped_terminal;
                     total.claim_skipped += report.claim_skipped;
@@ -3052,6 +3057,7 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                 compacted = report.compacted,
                 already_done = report.already_done,
                 held_out_of_window = report.held_out_of_window,
+                held_unknown_section = report.held_unknown_section,
                 geometry_unsupported = report.geometry_unsupported,
                 "maintenance: query-audit compaction pass complete"
             ),

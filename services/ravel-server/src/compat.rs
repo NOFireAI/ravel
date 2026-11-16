@@ -55,21 +55,52 @@ impl CompatClock for SystemCompatClock {
 
 /// Why a writer refused a publish, the `reason` label of
 /// `ravel_compat_publish_refused_total`: one value per [`CompatRefusal`]
-/// variant.
+/// variant, then one per maintenance-only
+/// [`ravel_maintain::CompatRunRefusal`] reason, and `other` for a maintenance
+/// reason this enum does not name, so the label set stays closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CompatRefusalReason {
     ViewStale,
     ActiveVersionNotWritable,
     CompatRecordMissing,
+    PublishLifetimeAboveCompat,
+    TargetNotActive,
+    CompactionRecordNotActive,
+    FenceFailed,
+    PublishLifetimeExpired,
+    Other,
 }
 
 impl CompatRefusalReason {
-    /// Every reason, so each series renders from the first scrape.
+    /// The view-policy reasons every writer can raise, so each series renders
+    /// from the first scrape. A maintenance-only reason renders once counted.
     pub const ALL: [CompatRefusalReason; 3] = [
         CompatRefusalReason::ViewStale,
         CompatRefusalReason::ActiveVersionNotWritable,
         CompatRefusalReason::CompatRecordMissing,
     ];
+
+    /// Every named reason, in label order.
+    const NAMED: [CompatRefusalReason; 8] = [
+        CompatRefusalReason::ViewStale,
+        CompatRefusalReason::ActiveVersionNotWritable,
+        CompatRefusalReason::CompatRecordMissing,
+        CompatRefusalReason::PublishLifetimeAboveCompat,
+        CompatRefusalReason::TargetNotActive,
+        CompatRefusalReason::CompactionRecordNotActive,
+        CompatRefusalReason::FenceFailed,
+        CompatRefusalReason::PublishLifetimeExpired,
+    ];
+
+    /// The reason of a maintenance refusal counted under `reason`
+    /// ([`ravel_maintain::CompatRunRefusal::reason`]), `Other` for one this
+    /// enum does not name.
+    pub fn of_maintain(reason: &str) -> CompatRefusalReason {
+        CompatRefusalReason::NAMED
+            .into_iter()
+            .find(|named| named.name() == reason)
+            .unwrap_or(CompatRefusalReason::Other)
+    }
 
     /// The reason of `refusal`.
     pub fn of(refusal: &CompatRefusal) -> CompatRefusalReason {
@@ -88,6 +119,12 @@ impl CompatRefusalReason {
             CompatRefusalReason::ViewStale => "view_stale",
             CompatRefusalReason::ActiveVersionNotWritable => "active_version_not_writable",
             CompatRefusalReason::CompatRecordMissing => "compat_record_missing",
+            CompatRefusalReason::PublishLifetimeAboveCompat => "publish_lifetime_above_compat",
+            CompatRefusalReason::TargetNotActive => "target_not_active",
+            CompatRefusalReason::CompactionRecordNotActive => "compaction_record_not_active",
+            CompatRefusalReason::FenceFailed => "fence_failed",
+            CompatRefusalReason::PublishLifetimeExpired => "publish_lifetime_expired",
+            CompatRefusalReason::Other => "other",
         }
     }
 }
@@ -139,10 +176,20 @@ pub fn record_publish_refusal(family: &str, refusal: &CompatRefusal) {
 }
 
 /// Every `(family, reason)` series of `ravel_compat_publish_refused_total`:
-/// each known family under each reason, zero until a refusal, plus `other`
-/// once a refusal named a family this build does not know.
+/// each known family under each [`CompatRefusalReason::ALL`] reason, zero
+/// until a refusal, plus every series a refusal counted, including a family
+/// this build does not know as `other`. The server's writers and
+/// `ravel-maintain`'s runs ([`ravel_maintain::compat_publish_refused_snapshot`])
+/// count apart; a series is their sum.
 pub fn publish_refusals_snapshot() -> Vec<(CompatFamilyLabel, CompatRefusalReason, u64)> {
-    let counts = publish_refusals().lock().clone();
+    let server = publish_refusals().lock().clone();
+    merge_refusals(server, ravel_maintain::compat_publish_refused_snapshot())
+}
+
+fn merge_refusals(
+    server: RefusalCounts,
+    maintain: Vec<(String, &'static str, u64)>,
+) -> Vec<(CompatFamilyLabel, CompatRefusalReason, u64)> {
     let mut series: RefusalCounts = KNOWN_FAMILIES
         .iter()
         .flat_map(|family| {
@@ -151,7 +198,17 @@ pub fn publish_refusals_snapshot() -> Vec<(CompatFamilyLabel, CompatRefusalReaso
                 .map(move |reason| ((CompatFamilyLabel::of(family), *reason), 0))
         })
         .collect();
-    series.extend(counts);
+    for (key, count) in server {
+        *series.entry(key).or_insert(0) += count;
+    }
+    for (family, reason, count) in maintain {
+        *series
+            .entry((
+                CompatFamilyLabel::of(&family),
+                CompatRefusalReason::of_maintain(reason),
+            ))
+            .or_insert(0) += count;
+    }
     series
         .into_iter()
         .map(|((family, reason), count)| (family, reason, count))
@@ -260,4 +317,101 @@ pub fn fold_compat_gate(
                 "catalog fold refused by the sys/compat write policy; nothing written this cycle"
             );
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ravel_maintain::CompatRunRefusal;
+
+    fn every_maintain_refusal() -> Vec<CompatRunRefusal> {
+        vec![
+            CompatRunRefusal::Compat(CompatRefusal::ViewStale {
+                last_read_unix_ns: None,
+                now_unix_ns: 1,
+            }),
+            CompatRunRefusal::Compat(CompatRefusal::ActiveVersionNotWritable {
+                family: "rseg".to_string(),
+                active: 9,
+                writable: vec![1],
+            }),
+            CompatRunRefusal::Compat(CompatRefusal::CompatRecordMissing {
+                bucket_compat_epoch: 1,
+                seen_compat_epoch: 0,
+            }),
+            CompatRunRefusal::PublishLifetimeAboveCompat {
+                process_ns: 2,
+                record_ns: 1,
+            },
+            CompatRunRefusal::TargetNotActive {
+                target: 3,
+                active: 2,
+            },
+            CompatRunRefusal::CompactionRecordNotActive { active: 1 },
+            CompatRunRefusal::FenceFailed {
+                compat_epoch: 4,
+                detail: "x".to_string(),
+            },
+            CompatRunRefusal::PublishLifetimeExpired {
+                elapsed_ns: 2,
+                lifetime_ns: 1,
+            },
+        ]
+    }
+
+    #[test]
+    fn every_maintain_refusal_reason_renders_under_its_own_label() {
+        let refusals = every_maintain_refusal();
+        for refusal in &refusals {
+            let label = CompatRefusalReason::of_maintain(refusal.reason());
+            assert_ne!(label, CompatRefusalReason::Other, "{refusal:?}");
+            assert_eq!(label.name(), refusal.reason());
+        }
+        let mut labels: Vec<_> = refusals
+            .iter()
+            .map(|r| CompatRefusalReason::of_maintain(r.reason()))
+            .collect();
+        labels.dedup();
+        assert_eq!(labels.len(), refusals.len());
+        assert_eq!(
+            CompatRefusalReason::of_maintain("a_reason_from_a_newer_build"),
+            CompatRefusalReason::Other
+        );
+    }
+
+    #[test]
+    fn the_refusal_series_sum_server_and_maintenance_counts() {
+        let mut server = RefusalCounts::new();
+        server.insert(
+            (
+                CompatFamilyLabel::of("rseg"),
+                CompatRefusalReason::ViewStale,
+            ),
+            2,
+        );
+        let maintain = vec![
+            ("rseg".to_string(), "view_stale", 3),
+            ("rlog".to_string(), "fence_failed", 5),
+            ("a-newer-family".to_string(), "a_newer_reason", 7),
+        ];
+        let series = merge_refusals(server, maintain);
+        let count = |family: &str, reason: CompatRefusalReason| {
+            let label = CompatFamilyLabel::of(family);
+            let found: Vec<u64> = series
+                .iter()
+                .filter(|(f, r, _)| *f == label && *r == reason)
+                .map(|(_, _, c)| *c)
+                .collect();
+            assert_eq!(found.len(), 1, "{family} {reason:?}: {series:?}");
+            found[0]
+        };
+        assert_eq!(count("rseg", CompatRefusalReason::ViewStale), 5);
+        assert_eq!(count("rlog", CompatRefusalReason::FenceFailed), 5);
+        assert_eq!(count("other", CompatRefusalReason::Other), 7);
+        assert_eq!(count("rlog", CompatRefusalReason::ViewStale), 0);
+        assert_eq!(
+            series.len(),
+            KNOWN_FAMILIES.len() * CompatRefusalReason::ALL.len() + 2
+        );
+    }
 }

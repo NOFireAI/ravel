@@ -48,11 +48,13 @@ pub struct ScanReport {
     /// Buckets skipped because they are not yet sealed (scan stops there).
     pub not_sealed: usize,
     /// Buckets held because an input's format version is outside this
-    /// build's reader window ([`CompactionOutcome::HeldOutOfWindow`]), or
-    /// because it carries section kinds this build does not know
-    /// ([`CompactionOutcome::HeldUnknownSection`]). Later hours still
-    /// compact; the cursor stops before the first held hour.
+    /// build's reader window ([`CompactionOutcome::HeldOutOfWindow`]). Later
+    /// hours still compact; the cursor stops before the first held hour.
     pub held_out_of_window: usize,
+    /// Buckets held because an input carries section kinds this build does
+    /// not know ([`CompactionOutcome::HeldUnknownSection`]), held like
+    /// [`Self::held_out_of_window`].
+    pub held_unknown_section: usize,
     /// Buckets compaction refused for their merge geometry
     /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), including a
     /// two-level merge's refusal ([`CompactionOutcome::TwoLevelUnsupported`],
@@ -102,6 +104,7 @@ pub async fn scan_and_compact(
         already_done: 0,
         not_sealed: 0,
         held_out_of_window: 0,
+        held_unknown_section: 0,
         geometry_unsupported: 0,
         cursor_advanced_to: None,
     };
@@ -138,9 +141,12 @@ pub async fn scan_and_compact(
                 report.not_sealed += 1;
                 break;
             }
-            CompactionOutcome::HeldOutOfWindow { .. }
-            | CompactionOutcome::HeldUnknownSection { .. } => {
+            CompactionOutcome::HeldOutOfWindow { .. } => {
                 report.held_out_of_window += 1;
+                first_held.get_or_insert(hour);
+            }
+            CompactionOutcome::HeldUnknownSection { .. } => {
+                report.held_unknown_section += 1;
                 first_held.get_or_insert(hour);
             }
             CompactionOutcome::GeometryUnsupported { .. }
@@ -195,11 +201,14 @@ pub struct MaintainReport {
     pub not_sealed: usize,
     /// Buckets whose compaction was held because an input's format version is
     /// outside this build's reader window
-    /// ([`CompactionOutcome::HeldOutOfWindow`]), or because it carries section
-    /// kinds this build does not know
-    /// ([`CompactionOutcome::HeldUnknownSection`]). Retried every pass; the
+    /// ([`CompactionOutcome::HeldOutOfWindow`]). Retried every pass; the
     /// scan continues to later hours.
     pub held_out_of_window: usize,
+    /// Buckets whose compaction was held because an input carries section
+    /// kinds this build does not know
+    /// ([`CompactionOutcome::HeldUnknownSection`]), retried like
+    /// [`Self::held_out_of_window`].
+    pub held_unknown_section: usize,
     /// Buckets whose compaction this pass refused for their merge geometry
     /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), including a
     /// two-level merge's refusal ([`CompactionOutcome::TwoLevelUnsupported`],
@@ -2175,10 +2184,12 @@ pub async fn scan_and_maintain_with_memo(
                 Some(ClaimedCompaction::Ran(CompactionOutcome::Compacted { .. })) => {
                     report.compacted += 1
                 }
-                Some(ClaimedCompaction::Ran(
-                    CompactionOutcome::HeldOutOfWindow { .. }
-                    | CompactionOutcome::HeldUnknownSection { .. },
-                )) => report.held_out_of_window += 1,
+                Some(ClaimedCompaction::Ran(CompactionOutcome::HeldOutOfWindow { .. })) => {
+                    report.held_out_of_window += 1
+                }
+                Some(ClaimedCompaction::Ran(CompactionOutcome::HeldUnknownSection { .. })) => {
+                    report.held_unknown_section += 1
+                }
                 Some(ClaimedCompaction::Ran(
                     CompactionOutcome::GeometryUnsupported { .. }
                     | CompactionOutcome::TwoLevelUnsupported { .. }

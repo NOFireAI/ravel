@@ -1537,6 +1537,7 @@ async fn an_out_of_window_input_is_held_and_later_hours_still_compact(format: Fo
             already_done: 0,
             not_sealed: 0,
             held_out_of_window: 1,
+            held_unknown_section: 0,
             geometry_unsupported: 0,
             cursor_advanced_to: Some(HOUR - 1),
         },
@@ -1583,6 +1584,7 @@ async fn a_held_bucket_is_retried_on_the_next_pass() {
             already_done: 0,
             not_sealed: 0,
             held_out_of_window: 1,
+            held_unknown_section: 0,
             geometry_unsupported: 0,
             cursor_advanced_to: None,
         }
@@ -1594,6 +1596,7 @@ async fn a_held_bucket_is_retried_on_the_next_pass() {
             already_done: 1,
             not_sealed: 0,
             held_out_of_window: 1,
+            held_unknown_section: 0,
             geometry_unsupported: 0,
             cursor_advanced_to: None,
         },
