@@ -5,15 +5,21 @@
 //! keyed by the deployment key (`--tenant-hash-key-file`), the one key every
 //! mode accepts. [`start`](crate::start) reads the record once before any
 //! writer starts and then spawns one [`spawn_refresh_loop`] task that re-reads
-//! it every [`DEFAULT_COMPAT_REFRESH_INTERVAL`]; one loop per process means two
-//! refreshes never overlap. An unkeyed bucket has no deployment key, so its
-//! process builds no view and every writer keeps its built-in version.
+//! it every [`DEFAULT_COMPAT_REFRESH_INTERVAL`]. The alert evaluator also calls
+//! [`refresh_once`] when it meets a lease from an epoch its view has not seen,
+//! so two refreshes can overlap; [`CompatView`] keeps every monotone value
+//! either read saw and the record from the read that started last. An unkeyed
+//! bucket has no deployment key, so its process builds no view and every
+//! writer keeps its built-in version.
 //!
 //! A refresh failure is logged and counted in
 //! `ravel_compat_refresh_failures_total`, never fatal: the view keeps its last
-//! successful read, and writers refuse once that read is older than
-//! `COMPAT_VIEW_HORIZON`. A record from a newer release is logged at error
-//! with both versions.
+//! successful read. Once a GET of `sys/compat` has returned an object, writers
+//! refuse when the last successful read is older than `COMPAT_VIEW_HORIZON`.
+//! Before that the view answers each family's built-in version, so a read
+//! refused with `AccessDenied` on a store that was never activated stops no
+//! writer. A record from a newer release is logged at error with both
+//! versions.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -225,10 +231,12 @@ pub fn spawn_refresh_loop(view: CompatView, interval: Duration) -> JoinHandle<()
     })
 }
 
-/// The fold's write-policy gate (ADR-4233 decision 3): every catalog family a
-/// fold of `signal` writes must be at a version the policy names. A refusal is
-/// logged, counted under `ravel_compat_publish_refused_total`, and returned
-/// before the fold reads or writes anything.
+/// The fold's write-policy gate (ADR-4233 decision 3): each family's active
+/// version is a ceiling, so a fold of `signal` is refused only when a catalog
+/// family it writes would emit a version above the active one, or the active
+/// version is not one this build reads. A refusal is logged, counted under
+/// `ravel_compat_publish_refused_total`, and returned before the fold reads or
+/// writes anything.
 pub fn fold_compat_gate(
     catalog: &ravel_catalog::Catalog,
     tenant: &ravel_types::TenantHash,
