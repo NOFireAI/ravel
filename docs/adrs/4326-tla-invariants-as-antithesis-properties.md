@@ -257,10 +257,10 @@ Decision 6 is narrowed as #4330 implements it:
 - A mutant from decision 3 occurs as `inv_mutant!("<area>/<stem>")` in a
   `.rs` file under `crates/`, `services/` or `antithesis/*/driver/`, the last
   for the common area's driver-side broken store.
-- For a message and a mutant alike, a literal on a comment line (`//`, `/*`
-  or `*` after leading whitespace) or after the file's first `#[cfg(test)]`
-  line does not count; for `driver:` and mutants, neither does one in a file
-  under a `tests/` directory.
+- For a message and a mutant alike, a literal in a comment (a line starting
+  with `//`, or inside a `/* ... */` block) or inside a `#[cfg(test)]` item
+  does not count, and neither does one in a file under a `tests/`
+  directory; a `sut:` path under `tests/` fails.
 - `none:` is followed by a space and a non-empty reason, in the cell and in
   the `.tsv`.
 - Only the row directly under a table's header may be its separator; any

@@ -750,32 +750,39 @@ strip_code_span() {
     printf '%s' "$s"
 }
 
-# rust_literal_live <literal> <file.rs>: the literal occurs in the file on a
-# line that is neither a comment nor part of a #[cfg(test)] item, so a
-# commented-out or test-only occurrence does not count. A comment is a line
-# starting with // after leading whitespace, or any line of a /* ... */ block
-# that starts a line. A #[cfg(test)] item is the item after the attribute
-# (and any further attributes): one line when it ends at that line, else
-# every line until its braces balance. Brace counting is textual, so a brace
-# inside a string or char literal in a test item can end the skip early or
-# late. The literal is passed through the environment, never as awk program
-# text or -v, so backslashes stay literal.
+# rust_literal_live <literal> <file.rs>: the literal occurs in the file
+# outside comments and #[cfg(test)] items, so a commented-out or test-only
+# occurrence does not count. A comment is a line starting with //, the text
+# after a /* on a line, and every line up to the matching */. A #[cfg(test)]
+# item is the item after the attribute (and any further attributes): through
+# the first line ending in ; when no brace opened before it, else through the
+# line where its braces balance. The scan is textual: a /* or a brace inside a
+# string or char literal is taken at face value. The literal is passed
+# through the environment, never as awk program text or -v, so backslashes
+# stay literal.
 rust_literal_live() {
     RUST_LITERAL="$1" awk '
         function braces(s,   o, c) { o = gsub(/\{/, "{", s); c = gsub(/\}/, "}", s); return o - c }
+        function skip_line(s) {
+            depth += braces(s)
+            if (depth > 0) opened = 1
+            if ((opened && depth <= 0) || (!opened && s ~ /;[[:space:]]*$/)) skipping = 0
+        }
         in_block { if (index($0, "*/")) in_block = 0; next }
-        skipping { depth += braces($0); if (depth <= 0) skipping = 0; next }
+        skipping { skip_line($0); next }
         /^[[:space:]]*#\[cfg\(test\)\]/ { pending = 1; next }
         pending && /^[[:space:]]*(#\[|$)/ { next }
-        pending {
-            pending = 0
-            depth = braces($0)
-            if (depth > 0 || ($0 !~ /[;}][[:space:]]*$/)) skipping = 1
-            next
-        }
+        pending { pending = 0; depth = 0; opened = 0; skipping = 1; skip_line($0); next }
         /^[[:space:]]*\/\// { next }
-        /^[[:space:]]*\/\*/ { if (!index(substr($0, index($0, "/*") + 2), "*/")) in_block = 1; next }
-        index($0, ENVIRON["RUST_LITERAL"]) { found = 1; exit }
+        {
+            line = $0
+            p = index(line, "/*")
+            if (p) {
+                if (!index(substr(line, p + 2), "*/")) in_block = 1
+                line = substr(line, 1, p - 1)
+            }
+            if (index(line, ENVIRON["RUST_LITERAL"])) { found = 1; exit }
+        }
         END { exit !found }' "$2"
 }
 
