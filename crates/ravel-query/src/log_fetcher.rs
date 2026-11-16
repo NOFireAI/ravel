@@ -760,6 +760,13 @@ impl LogSegmentScan {
         &self.erasure
     }
 
+    /// The object key, for attributing a fault a caller finds in a
+    /// [`RowBlock`] it reads further (a corrupt `attrs_raw` cell) as
+    /// [`LogFetchError::Corrupt`].
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
     /// Whether a pending erasure predicate applies to this scan, which is what
     /// makes [`next_block_columnar`](Self::next_block_columnar) refuse.
     pub fn erasure_pending(&self) -> bool {

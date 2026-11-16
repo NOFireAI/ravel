@@ -376,6 +376,342 @@ fn projected_key<'k>(
 }
 
 // ---------------------------------------------------------------------------
+// Row path from the decoded block (ADR-2773 decision D4)
+// ---------------------------------------------------------------------------
+
+/// Each stream's resource and scope attributes, by `stream_ref`, decoded once
+/// for a row-path block ([`decode_stream_attrs`]).
+pub(super) type StreamAttrsCache = HashMap<u32, Vec<(String, AttrValue)>>;
+
+/// The output shape of a row-path batch and the pending erasure it applies.
+pub(super) struct RowBatchShape<'s> {
+    pub(super) schema: &'s SchemaRef,
+    pub(super) projection: &'s [usize],
+    pub(super) declared: &'s [DeclaredColumn],
+    pub(super) attr_keys: &'s [String],
+    pub(super) full_len: usize,
+    pub(super) erasure: &'s [ErasurePredicate],
+    /// The object key, for attributing a corrupt `attrs_raw` cell.
+    pub(super) key: &'s str,
+}
+
+/// Build the batch for surviving rows `start..end` of a row-path block
+/// straight from its decoded columns (ADR-2773 decision D4): the batch
+/// [`build_batch`] builds over the same rows' records after
+/// [`crate::rlog_attrs::retain_unerased`], with no [`LogRecord`] and no
+/// per-row attribute `Vec`.
+///
+/// Each row's merged view is the one [`merged_attrs`] gives: its stream's
+/// resource then scope entries (`streams`, decoded once per stream), then each
+/// record attribute, in FIELD_DIR order and then `attrs_raw` order,
+/// overwriting the first entry with its key or appended. A row erased by
+/// `shape.erasure` against its record attributes or that view
+/// ([`is_erased_log_row`]) is dropped before any column is built. The
+/// `row_refs` positions count the rows kept.
+pub(super) fn build_row_batch(
+    block: &RowBlock,
+    start: usize,
+    end: usize,
+    streams: &mut StreamAttrsCache,
+    shape: &RowBatchShape<'_>,
+    row_refs: Option<RowRefRange>,
+) -> DFResult<RecordBatch> {
+    let view = block.view();
+    let end = end.min(view.surviving_count());
+    let start = start.min(end);
+    let attrs_projected = shape.projection.contains(&LOG_COL_ATTRS);
+    let needs_attrs = !shape.erasure.is_empty()
+        || attrs_projected
+        || shape.projection.iter().any(|&i| i >= FIRST_DECLARED_COL);
+    if !needs_attrs {
+        let mut columns = Vec::with_capacity(shape.projection.len());
+        for &idx in shape.projection {
+            columns.push(fixed_column_array(&view, idx, start, end)?.ok_or_else(|| {
+                DataFusionError::Internal(format!("logs scan projection index {idx} out of range"))
+            })?);
+        }
+        return finish_row_batch(shape.schema, columns, row_refs, end - start);
+    }
+
+    for i in start..end {
+        let stream_ref = row_stream_ref(&view, i)?;
+        if let std::collections::hash_map::Entry::Vacant(e) = streams.entry(stream_ref) {
+            let blob = view.stream_attrs_of(stream_ref).ok_or_else(|| {
+                DataFusionError::Internal(format!("stream_ref {stream_ref} not in STREAM_DIR"))
+            })?;
+            e.insert(decode_stream_attrs(blob)?);
+        }
+    }
+    let streams: &StreamAttrsCache = streams;
+
+    // `overflow_ends[n]` is where row `start + n`'s `attrs_raw` entries end.
+    let mut overflow: Vec<(String, AttrValue)> = Vec::new();
+    let mut overflow_ends: Vec<usize> = Vec::new();
+    if view.has_attrs_raw_page() {
+        overflow_ends.reserve(end - start);
+        for i in start..end {
+            view.decode_attrs_raw_into(i, &mut overflow)
+                .map_err(|source| {
+                    SqlError::from(LogFetchError::Corrupt {
+                        key: shape.key.to_string(),
+                        source,
+                    })
+                })?;
+            overflow_ends.push(overflow.len());
+        }
+    }
+
+    // Every attribute name the rows can hold, numbered, so the merge finds a
+    // key's first entry in a row by index instead of by search.
+    let mut ids: HashMap<&str, usize> = HashMap::new();
+    let mut intern = |name| {
+        let next = ids.len();
+        *ids.entry(name).or_insert(next)
+    };
+    let field_cols: Vec<(&str, usize, DeclaredCursor<'_>)> = view
+        .attr_columns()
+        .map(|(name, col)| (name, intern(name), DeclaredCursor::resolve(&view, col)))
+        .collect();
+    let stream_ids: HashMap<u32, Vec<usize>> = streams
+        .iter()
+        .map(|(&sref, attrs)| (sref, attrs.iter().map(|(k, _)| intern(k)).collect()))
+        .collect();
+    let overflow_ids: Vec<usize> = overflow.iter().map(|(k, _)| intern(k)).collect();
+
+    // Each projected key column's slot in `key_cells`; a declared column and
+    // an `attrs['k']` column of one key share a slot.
+    let mut slot_of_index: HashMap<usize, usize> = HashMap::new();
+    let mut slot_keys: Vec<&str> = Vec::new();
+    for &idx in shape.projection {
+        let Some(key) = projected_key(idx, shape.declared, shape.attr_keys, shape.full_len) else {
+            continue;
+        };
+        let slot = match slot_keys.iter().position(|k| *k == key) {
+            Some(slot) => slot,
+            None => {
+                slot_keys.push(key);
+                slot_keys.len() - 1
+            }
+        };
+        slot_of_index.insert(idx, slot);
+    }
+    let slot_ids: Vec<Option<usize>> = slot_keys.iter().map(|k| ids.get(k).copied()).collect();
+
+    let rows = end - start;
+    // `stamp_of[id] == stamp` when the current row holds name `id`, its
+    // first entry at `entries[slot_of[id]]`.
+    let mut stamp_of = vec![0usize; ids.len()];
+    let mut slot_of = vec![0usize; ids.len()];
+    let mut entries: Vec<(&str, Cell<'_>)> = Vec::new();
+    let mut row_ends: Vec<usize> = Vec::with_capacity(rows);
+    let mut record: Vec<(usize, &str, Cell<'_>)> = Vec::new();
+    let mut kept: Vec<usize> = Vec::with_capacity(rows);
+    let mut key_cells: Vec<Vec<Option<Cell<'_>>>> = vec![Vec::with_capacity(rows); slot_ids.len()];
+    let mut overflow_from = 0;
+    for (n, i) in (start..end).enumerate() {
+        let stamp = n + 1;
+        let base = entries.len();
+        let stream_ref = row_stream_ref(&view, i)?;
+        let (Some(stream), Some(sids)) = (streams.get(&stream_ref), stream_ids.get(&stream_ref))
+        else {
+            return Err(DataFusionError::Internal(format!(
+                "stream_ref {stream_ref} attributes not decoded"
+            )));
+        };
+        for ((name, value), &id) in stream.iter().zip(sids) {
+            if stamp_of[id] != stamp {
+                stamp_of[id] = stamp;
+                slot_of[id] = entries.len();
+            }
+            entries.push((name.as_str(), Cell::of(value)));
+        }
+        record.clear();
+        for (name, id, cursor) in &field_cols {
+            if let Some(cell) = cursor.cell_at(i) {
+                record.push((*id, name, cell));
+            }
+        }
+        if let Some(&overflow_to) = overflow_ends.get(n) {
+            let attrs = overflow.get(overflow_from..overflow_to).unwrap_or_default();
+            let attr_ids = overflow_ids
+                .get(overflow_from..overflow_to)
+                .unwrap_or_default();
+            for ((name, value), &id) in attrs.iter().zip(attr_ids) {
+                record.push((id, name.as_str(), Cell::of(value)));
+            }
+            overflow_from = overflow_to;
+        }
+        for &(id, name, cell) in &record {
+            if stamp_of[id] == stamp {
+                entries[slot_of[id]].1 = cell;
+            } else {
+                stamp_of[id] = stamp;
+                slot_of[id] = entries.len();
+                entries.push((name, cell));
+            }
+        }
+        if !shape.erasure.is_empty() {
+            let ts = view
+                .ts(i)
+                .ok_or_else(|| DataFusionError::Internal("row-path row has no ts".into()))?;
+            let merged = entries.get(base..).unwrap_or_default();
+            let erased = is_erased_log_row(
+                shape.erasure,
+                ts,
+                |k| {
+                    record
+                        .iter()
+                        .find_map(|&(_, name, cell)| if name == k { cell.as_str() } else { None })
+                },
+                |k| {
+                    merged
+                        .iter()
+                        .find_map(|&(name, cell)| if name == k { cell.as_str() } else { None })
+                },
+            );
+            if erased {
+                entries.truncate(base);
+                continue;
+            }
+        }
+        kept.push(i);
+        for (cells, id) in key_cells.iter_mut().zip(&slot_ids) {
+            cells.push(
+                id.filter(|&id| stamp_of[id] == stamp)
+                    .map(|id| entries[slot_of[id]].1),
+            );
+        }
+        if attrs_projected {
+            row_ends.push(entries.len());
+        } else {
+            entries.truncate(base);
+        }
+    }
+
+    let kept_rows: Vec<usize>;
+    let (fixed_view, fixed_start, fixed_end) = if kept.len() == rows {
+        (view, start, end)
+    } else {
+        kept_rows = kept
+            .iter()
+            .map(|&i| block.rows().get(i).copied().unwrap_or(usize::MAX))
+            .collect();
+        (block.view_over(&kept_rows), 0, kept_rows.len())
+    };
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(shape.projection.len());
+    for &idx in shape.projection {
+        if let Some(array) = fixed_column_array(&fixed_view, idx, fixed_start, fixed_end)? {
+            columns.push(array);
+            continue;
+        }
+        let array: ArrayRef = if idx == LOG_COL_ATTRS {
+            let mut map = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+            let mut from = 0;
+            for &to in &row_ends {
+                for &(name, cell) in entries.get(from..to).unwrap_or_default() {
+                    map.keys().append_value(name);
+                    append_rendered(map.values(), Some(cell))?;
+                }
+                map.append(true)
+                    .map_err(|e| SqlError::Internal(format!("attrs map build: {e}")))?;
+                from = to;
+            }
+            Arc::new(map.finish())
+        } else {
+            let cells = slot_of_index
+                .get(&idx)
+                .and_then(|&slot| key_cells.get(slot));
+            let declared = idx
+                .checked_sub(FIRST_DECLARED_COL)
+                .and_then(|k| shape.declared.get(k));
+            match (cells, declared) {
+                (Some(cells), _) if idx >= shape.full_len => {
+                    let mut b = StringBuilder::new();
+                    for &cell in cells {
+                        append_rendered(&mut b, cell)?;
+                    }
+                    Arc::new(b.finish())
+                }
+                (Some(cells), Some(dc)) => declared_cells_array(dc, cells),
+                _ => {
+                    return Err(DataFusionError::Internal(format!(
+                        "logs scan projection index {idx} out of range"
+                    )));
+                }
+            }
+        };
+        columns.push(array);
+    }
+    finish_row_batch(shape.schema, columns, row_refs, kept.len())
+}
+
+fn row_stream_ref(view: &ColumnarBlockView<'_>, i: usize) -> DFResult<u32> {
+    view.stream_ref(i)
+        .ok_or_else(|| DataFusionError::Internal("row-path row has no stream_ref".into()))
+}
+
+/// [`declared_values_array`] over each row's cell for the column's key.
+fn declared_cells_array(dc: &DeclaredColumn, cells: &[Option<Cell<'_>>]) -> ArrayRef {
+    match dc.ty {
+        DeclaredType::Str => {
+            let mut b = StringDictionaryBuilder::<Int32Type>::new();
+            for cell in cells {
+                match cell.and_then(Cell::as_str) {
+                    Some(s) => b.append_value(s),
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DeclaredType::I64 => {
+            let mut b = Int64Builder::new();
+            for cell in cells {
+                match cell {
+                    Some(Cell::I64(v)) => b.append_value(*v),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DeclaredType::Bool => {
+            let mut b = BooleanBuilder::new();
+            for cell in cells {
+                match cell {
+                    Some(Cell::Bool(v)) => b.append_value(*v),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DeclaredType::Bytes => {
+            let mut b = BinaryBuilder::new();
+            for cell in cells {
+                match cell {
+                    Some(Cell::Bytes(bytes)) => b.append_value(bytes),
+                    Some(Cell::Nested(v)) => b.append_value(canonical_value_bytes(v)),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+    }
+}
+
+fn finish_row_batch(
+    schema: &SchemaRef,
+    mut columns: Vec<ArrayRef>,
+    row_refs: Option<RowRefRange>,
+    rows: usize,
+) -> DFResult<RecordBatch> {
+    if let Some(range) = row_refs {
+        columns.push(row_ref_array(range, rows)?);
+    }
+    let options = RecordBatchOptions::new().with_row_count(Some(rows));
+    RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options)
+        .map_err(DataFusionError::from)
+}
+
+// ---------------------------------------------------------------------------
 // Columnar fast path (ADR-0099 decision 2)
 // ---------------------------------------------------------------------------
 
@@ -1343,6 +1679,82 @@ impl<'a> DeclaredCursor<'a> {
             DeclaredCursor::Bool(c) => c.at(i).map(AttrValue::Bool),
         }
     }
+
+    /// [`Self::value_at`] read in place: the cell at surviving row `i`, or
+    /// `None` when NULL (or, for `Str`, not UTF-8).
+    fn cell_at(&self, i: usize) -> Option<Cell<'a>> {
+        match self {
+            DeclaredCursor::Str(c) => c.text_at(i).map(Cell::Str),
+            DeclaredCursor::Bytes(c) => c.at(i).map(Cell::Bytes),
+            DeclaredCursor::I64(c) => c.at(i).map(Cell::I64),
+            DeclaredCursor::F64(c) => c.at(i).map(Cell::F64),
+            DeclaredCursor::Bool(c) => c.at(i).map(Cell::Bool),
+        }
+    }
+}
+
+/// One attribute value as the row-path batch build reads it: a scalar read in
+/// place from a decoded block column, or a decoded stream or `attrs_raw`
+/// entry's value. A `List`/`Map` value is the only one kept as an
+/// [`AttrValue`]; [`Cell::of`] maps every scalar variant to its own arm, so
+/// two equal values read from either source are one `Cell`.
+#[derive(Clone, Copy)]
+enum Cell<'a> {
+    Str(&'a str),
+    Bytes(&'a [u8]),
+    I64(i64),
+    /// The value's bit pattern, as the F64 column stores it.
+    F64(u64),
+    Bool(bool),
+    /// A `List` or `Map` value.
+    Nested(&'a AttrValue),
+}
+
+impl<'a> Cell<'a> {
+    fn of(v: &'a AttrValue) -> Self {
+        match v {
+            AttrValue::Str(s) => Cell::Str(s),
+            AttrValue::Bytes(b) => Cell::Bytes(b),
+            AttrValue::I64(n) => Cell::I64(*n),
+            AttrValue::F64(f) => Cell::F64(f.to_bits()),
+            AttrValue::Bool(b) => Cell::Bool(*b),
+            AttrValue::List(_) | AttrValue::Map(_) => Cell::Nested(v),
+        }
+    }
+
+    fn as_str(self) -> Option<&'a str> {
+        match self {
+            Cell::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Write the value as [`attr_value_to_string`] renders it, with no
+    /// `String` for a scalar.
+    fn render(self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+        match self {
+            Cell::Str(s) => out.write_str(s),
+            Cell::Bytes(b) => b.iter().try_for_each(|byte| write!(out, "{byte:02x}")),
+            Cell::I64(n) => write!(out, "{n}"),
+            Cell::F64(bits) => write!(out, "{}", f64::from_bits(bits)),
+            Cell::Bool(b) => write!(out, "{b}"),
+            Cell::Nested(v) => out.write_str(&attr_value_to_string(v)),
+        }
+    }
+}
+
+/// Append `cell` rendered to text ([`Cell::render`]) as the builder's next
+/// value, or NULL for `None`.
+fn append_rendered(out: &mut StringBuilder, cell: Option<Cell<'_>>) -> DFResult<()> {
+    match cell {
+        Some(cell) => {
+            cell.render(out)
+                .map_err(|e| DataFusionError::Internal(format!("attribute render: {e}")))?;
+            out.append_value("");
+        }
+        None => out.append_null(),
+    }
+    Ok(())
 }
 
 /// The index into `cols`/`cursors` of the record's WINNING occurrence of a key
@@ -2089,19 +2501,6 @@ impl<'a> AttrKeyPlan<'a> {
             cursors,
         }
     }
-
-    /// The index of the record's WINNING occurrence of the key at surviving row
-    /// `i`, or `None` when the record sets the key in no FIELD_DIR column.
-    /// Identical rule to [`DeclaredPlan::winning_idx`]: the highest FIELD_DIR
-    /// type byte wins (the record layer's last-occurrence-wins order,
-    /// docs/log-segment-format.md), and a `Str` cell that is not valid UTF-8 is
-    /// not "present", so it does not shadow the resource/scope fallback. The
-    /// `attrs_raw` overflow tier cannot appear here: a block carrying an
-    /// `attrs_raw` page falls the whole segment back to the row path before this
-    /// builds a column.
-    fn winning_idx(&self, i: usize) -> Option<usize> {
-        winner_at(&self.cols, &self.cursors, i).map(|(k, _)| k)
-    }
 }
 
 /// Per-key, per-block resolver for a synthetic attribute column's merged value
@@ -2124,35 +2523,44 @@ impl<'p, 'a> AttrKeyResolver<'p, 'a> {
         }
     }
 
-    /// The merged value of the key at surviving row `i`, rendered to text, or
-    /// `None` (NULL) when the key is absent. The record's own winning
-    /// occurrence wins over the resource/scope value; only a record that sets
-    /// the key in no FIELD_DIR column consults the fallback.
-    fn text_at(
+    /// Append the merged value of the key at surviving row `i` to `out`,
+    /// rendered to text, or NULL when the key is absent. The record's own
+    /// winning occurrence ([`winner_at`], the [`DeclaredPlan::winning_idx`]
+    /// rule) wins over the resource/scope value; only a record that sets the
+    /// key in no FIELD_DIR column consults the fallback. The `attrs_raw`
+    /// overflow tier cannot appear here: a block carrying an `attrs_raw` page
+    /// takes the row path instead. A record value is rendered straight from
+    /// its cell ([`Cell::render`]), with no [`AttrValue`] and no `String` per
+    /// cell (ADR-2773 decision 4).
+    fn append_at(
         &mut self,
         view: &ColumnarBlockView<'_>,
         i: usize,
         cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
-    ) -> DFResult<Option<String>> {
-        if let Some(win) = self.plan.winning_idx(i) {
-            // A winning occurrence is present by construction, so `value_at` is
-            // `Some`; render it to text like the `attrs` map column does.
-            return Ok(self.plan.cursors[win]
-                .value_at(i)
-                .as_ref()
-                .map(attr_value_to_string));
+        out: &mut StringBuilder,
+    ) -> DFResult<()> {
+        if let Some((win, text)) = winner_at(&self.plan.cols, &self.plan.cursors, i) {
+            // A winning occurrence is present by construction; a `Str`
+            // winner's text was validated by the presence test.
+            let cell = match text {
+                Some(s) => Some(Cell::Str(s)),
+                None => self.plan.cursors.get(win).and_then(|c| c.cell_at(i)),
+            };
+            return append_rendered(out, cell);
         }
         let Some(stream_ref) = view.stream_ref(i) else {
-            return Ok(None);
+            out.append_null();
+            return Ok(());
         };
-        match self.fallback.entry(stream_ref) {
-            std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut().clone()),
+        let value = match self.fallback.entry(stream_ref) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
                 let resource = resource_attrs(view, cache, stream_ref)?;
-                let value = find_attr(resource, &self.plan.key).map(attr_value_to_string);
-                Ok(e.insert(value).clone())
+                e.insert(find_attr(resource, &self.plan.key).map(attr_value_to_string))
             }
-        }
+        };
+        out.append_option(value.as_deref());
+        Ok(())
     }
 }
 
@@ -2168,10 +2576,7 @@ fn build_attr_key_columnar_array(
 ) -> DFResult<ArrayRef> {
     let mut b = StringBuilder::new();
     for i in start..end {
-        match resolver.text_at(view, i, cache)? {
-            Some(s) => b.append_value(s),
-            None => b.append_null(),
-        }
+        resolver.append_at(view, i, cache, &mut b)?;
     }
     Ok(Arc::new(b.finish()))
 }
@@ -2346,6 +2751,98 @@ where
     Ok(taken.as_primitive::<T>().clone())
 }
 
+/// Surviving rows `start..end` of the view's fixed column `idx` as an Arrow
+/// array, or `None` when `idx` is not a fixed column. Shared by the columnar
+/// path and the row path ([`build_row_batch`]), which build every fixed column
+/// the same way from a block's decoded columns.
+fn fixed_column_array(
+    view: &ColumnarBlockView<'_>,
+    idx: usize,
+    start: usize,
+    end: usize,
+) -> DFResult<Option<ArrayRef>> {
+    let array: ArrayRef = match idx {
+        LOG_COL_TS => Arc::new(int_column_array::<
+            datafusion::arrow::datatypes::TimestampNanosecondType,
+        >(&view.ts_values(), start, end, false)?),
+        LOG_COL_OBSERVED_TS => Arc::new(int_column_array::<
+            datafusion::arrow::datatypes::TimestampNanosecondType,
+        >(&view.observed_ts_values(), start, end, false)?),
+        LOG_COL_SEVERITY_NUM => {
+            let raw = int_column_array::<datafusion::arrow::datatypes::Int64Type>(
+                &view.severity_num_values(),
+                start,
+                end,
+                false,
+            )?;
+            Arc::new(UInt8Array::from_iter_values(
+                raw.values().iter().map(|&v| v as u8),
+            ))
+        }
+        LOG_COL_SEVERITY_TEXT => {
+            let cur = view.severity_text_cursor();
+            let mut b = StringBuilder::new();
+            for i in start..end {
+                match cur.at(i) {
+                    Some(bytes) => b.append_value(view_str(bytes)?),
+                    None => b.append_value(""),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        LOG_COL_BODY => {
+            let cur = view.body_cursor();
+            let mut b = StringBuilder::new();
+            for i in start..end {
+                match cur.at(i) {
+                    Some(bytes) => b.append_value(view_str(bytes)?),
+                    None => b.append_value(""),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        LOG_COL_TRACE_ID => {
+            let cur = view.trace_id_cursor();
+            let mut b = FixedSizeBinaryBuilder::with_capacity(end - start, TRACE_ID_WIDTH);
+            for i in start..end {
+                match cur.at(i) {
+                    Some(id) => b
+                        .append_value(id)
+                        .map_err(|e| SqlError::Internal(format!("trace_id array build: {e}")))?,
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        LOG_COL_SPAN_ID => {
+            let cur = view.span_id_cursor();
+            let mut b = FixedSizeBinaryBuilder::with_capacity(end - start, SPAN_ID_WIDTH);
+            for i in start..end {
+                match cur.at(i) {
+                    Some(id) => b
+                        .append_value(id)
+                        .map_err(|e| SqlError::Internal(format!("span_id array build: {e}")))?,
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        LOG_COL_FLAGS => {
+            let raw = int_column_array::<datafusion::arrow::datatypes::Int64Type>(
+                &view.flags_values(),
+                start,
+                end,
+                false,
+            )?;
+            Arc::new(UInt32Array::from_iter_values(
+                raw.values().iter().map(|&v| v as u32),
+            ))
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(array))
+}
+
 /// Build one output batch for surviving rows `start..end` from the view, one
 /// array per projected column. The column set is the same eligible set
 /// [`columnar_static_eligible`] admits: fixed columns and declared typed
@@ -2364,85 +2861,11 @@ fn build_columnar_batch(
 ) -> DFResult<RecordBatch> {
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection.len());
     for &idx in projection {
+        if let Some(array) = fixed_column_array(view, idx, start, end)? {
+            columns.push(array);
+            continue;
+        }
         let array: ArrayRef = match idx {
-            LOG_COL_TS => Arc::new(int_column_array::<
-                datafusion::arrow::datatypes::TimestampNanosecondType,
-            >(&view.ts_values(), start, end, false)?),
-            LOG_COL_OBSERVED_TS => Arc::new(int_column_array::<
-                datafusion::arrow::datatypes::TimestampNanosecondType,
-            >(
-                &view.observed_ts_values(), start, end, false
-            )?),
-            LOG_COL_SEVERITY_NUM => {
-                let raw = int_column_array::<datafusion::arrow::datatypes::Int64Type>(
-                    &view.severity_num_values(),
-                    start,
-                    end,
-                    false,
-                )?;
-                Arc::new(UInt8Array::from_iter_values(
-                    raw.values().iter().map(|&v| v as u8),
-                ))
-            }
-            LOG_COL_SEVERITY_TEXT => {
-                let cur = view.severity_text_cursor();
-                let mut b = StringBuilder::new();
-                for i in start..end {
-                    match cur.at(i) {
-                        Some(bytes) => b.append_value(view_str(bytes)?),
-                        None => b.append_value(""),
-                    }
-                }
-                Arc::new(b.finish())
-            }
-            LOG_COL_BODY => {
-                let cur = view.body_cursor();
-                let mut b = StringBuilder::new();
-                for i in start..end {
-                    match cur.at(i) {
-                        Some(bytes) => b.append_value(view_str(bytes)?),
-                        None => b.append_value(""),
-                    }
-                }
-                Arc::new(b.finish())
-            }
-            LOG_COL_TRACE_ID => {
-                let cur = view.trace_id_cursor();
-                let mut b = FixedSizeBinaryBuilder::with_capacity(end - start, TRACE_ID_WIDTH);
-                for i in start..end {
-                    match cur.at(i) {
-                        Some(id) => b.append_value(id).map_err(|e| {
-                            SqlError::Internal(format!("trace_id array build: {e}"))
-                        })?,
-                        None => b.append_null(),
-                    }
-                }
-                Arc::new(b.finish())
-            }
-            LOG_COL_SPAN_ID => {
-                let cur = view.span_id_cursor();
-                let mut b = FixedSizeBinaryBuilder::with_capacity(end - start, SPAN_ID_WIDTH);
-                for i in start..end {
-                    match cur.at(i) {
-                        Some(id) => b
-                            .append_value(id)
-                            .map_err(|e| SqlError::Internal(format!("span_id array build: {e}")))?,
-                        None => b.append_null(),
-                    }
-                }
-                Arc::new(b.finish())
-            }
-            LOG_COL_FLAGS => {
-                let raw = int_column_array::<datafusion::arrow::datatypes::Int64Type>(
-                    &view.flags_values(),
-                    start,
-                    end,
-                    false,
-                )?;
-                Arc::new(UInt32Array::from_iter_values(
-                    raw.values().iter().map(|&v| v as u32),
-                ))
-            }
             // Ruled out by `columnar_static_eligible`; a projection reaching the
             // fast path never carries the `attrs` map.
             LOG_COL_ATTRS => {

@@ -1877,7 +1877,10 @@ fn check_row(
                 .map_err(|_| LogSegError::Corrupted("value not utf-8".into()))?;
         }
     }
-    for (col, width, what) in [(COL_TRACE_ID, 16, "trace_id width"), (COL_SPAN_ID, 8, "span_id width")] {
+    for (col, width, what) in [
+        (COL_TRACE_ID, 16, "trace_id width"),
+        (COL_SPAN_ID, 8, "span_id width"),
+    ] {
         if let Some(Some(id)) = block.fixed_col(col).and_then(|c| c.get(row))
             && id.len() != width
         {
