@@ -28,7 +28,7 @@ attempts that could have written it.
   Each one ingests, serves queries and folds the catalog. Two `all` processes
   over one bucket are supported: the fold's HEAD compare-and-swap serializes
   them (docs/catalog-and-mvcc.md). There is no `maintain` process, so nothing
-  compacts or deletes. Strict flush delay is 500 ms.
+  compacts or deletes. The flush delays are 500 ms (strict) and 5 s (idle).
 - `driver`: the workload, excluded from faults.
 
 ### Driver and model

@@ -33,8 +33,15 @@ x-ravel-server: &ravel-server
     - "--tenant-token"
     - "wl-token=wl-tenant"
     - "--tenant-hash-unkeyed"
+    # The three flush knobs move as a set (ADR-0076 decision 4). A shorter
+    # cadence than the defaults (2 s, 40 s, 256 KiB) puts more flushes, and so
+    # more commit races, into each timeline.
     - "--max-flush-delay"
     - "500ms"
+    - "--max-flush-delay-idle"
+    - "5s"
+    - "--min-flush-bytes"
+    - "262144"
   environment:
     <<: *ravel-store
     RUST_LOG: info
