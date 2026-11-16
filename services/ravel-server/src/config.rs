@@ -13614,9 +13614,11 @@ mod tests {
     /// is no longer met by the derived defaults. Smaller hosts never met it.
     /// Raising both knobs explicitly still meets it.
     ///
-    /// Prove-the-test: remove the cap arm in `resolve_performance_defaults`
-    /// and the 192-core stamp reads `store_get_concurrency` 384 with the
-    /// precondition met.
+    /// Prove-the-test: remove both loopback cap arms in
+    /// `resolve_performance_defaults` (GET concurrency and SQL partitions)
+    /// and the 192-core stamp reads `store_get_concurrency` 384 and
+    /// `sql_partition_count` 384 with the precondition met; removing only
+    /// one leaves the other knob below 256.
     #[test]
     fn loopback_store_get_cap_leaves_latency_first_precondition_to_explicit_flags() {
         let big = host_with_cores(192);
