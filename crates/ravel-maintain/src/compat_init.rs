@@ -899,6 +899,10 @@ fn trailer_version(suffix: &[u8]) -> Option<u16> {
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
+mod census_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
 pub(crate) mod tests {
     use super::*;
     use bytes::Bytes;
@@ -1010,7 +1014,7 @@ pub(crate) mod tests {
     }
 
     /// Rewrite the trailer version of the object at `key`.
-    async fn restamp_trailer(store: &dyn ObjectStoreBackend, key: &str, version: u16) {
+    pub(crate) async fn restamp_trailer(store: &dyn ObjectStoreBackend, key: &str, version: u16) {
         let got = store.get(key, GetRange::Full).await.expect("get");
         let mut bytes = got.data.to_vec();
         let at = bytes.len() - TRAILER_LEN as usize + TRAILER_VERSION_OFFSET;
