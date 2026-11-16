@@ -5667,7 +5667,7 @@ pub(crate) fn render_compat_family(out: &mut String, mode: Mode, snapshot: &Comp
     write_header(
         out,
         "ravel_compat_view_age_seconds",
-        "Seconds since this process's last successful read of sys/compat started; +Inf before the first. Writers refuse at 600 (ADR-4233 decision 3).",
+        "Seconds since this process's last successful read of sys/compat started; +Inf before the first. Once a sys/compat object has been read, writers refuse at 600 (ADR-4233 decision 3).",
         "gauge",
     );
     match snapshot.view_age_seconds {

@@ -259,13 +259,18 @@ The flag takes a humantime duration and refuses `0`.
 On a keyed bucket (`--tenant-hash-key-file`), the server's scheduled and
 on-demand folds follow the `sys/compat` write policy. Before a fold cycle
 starts, it checks every catalog family it writes: `catalog-head`, `csnap`,
-`npost`, `cstat` and `kidx`. Each must be active at the highest version this
-build writes for it. A HEAD or a
-metrics key-index leaf whose content needs less still carries the lower
-version. The cycle is refused and writes nothing when one of these holds:
+`npost`, `cstat` and `kidx`. A family's active version is a ceiling. The
+check is made against the highest version this build's fold of the signal can
+write for the family (for `kidx` that is 3 on metrics and 2 on logs and
+spans), and a HEAD or a key-index leaf whose content needs less still carries
+the lower version. A store with no record folds as it did before the policy.
+The cycle is refused and writes nothing when one of these holds:
 
-- the record names a version this build does not write
-- the process last read `sys/compat` 10 minutes ago or more
+- a family it writes is active below that highest version, so `kidx` active
+  at 2 refuses a metrics fold and lets logs and spans fold
+- the record names a version this build does not read
+- a GET of `sys/compat` has returned an object and the process's last
+  successful read is 10 minutes old or more
 - the record is missing after an activation
 
 The refusal is logged with the family and counted in

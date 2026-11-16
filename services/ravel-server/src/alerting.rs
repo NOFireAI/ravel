@@ -1883,8 +1883,26 @@ impl AlertEvaluator {
             }
         };
 
+        // Without a view this evaluator reads the lease as a build before
+        // ADR-4233 does: a parked lease's `expiry_ns` never passes.
+        let expiry_ns = if self.compat.is_some() {
+            existing.effective_expiry_ns()
+        } else {
+            existing.expiry_ns
+        };
         let held_by_other = existing.holder != identity;
-        if held_by_other && existing.effective_expiry_ns() > now_ns {
+        if held_by_other && expiry_ns > now_ns {
+            return Ok(LeaseStep::NotHeld);
+        }
+        // An unparked lease from a process with no view would overwrite one
+        // written under an activation, so it is never written there.
+        if self.compat.is_none() && existing.compat_epoch > 0 {
+            tracing::warn!(
+                tenant = %self.tenant.to_hex(),
+                compat_epoch = existing.compat_epoch,
+                "alert evaluation: the alert lease was written under a sys/compat activation and \
+                 this process has no compat view (no deployment key); not taking it"
+            );
             return Ok(LeaseStep::NotHeld);
         }
 
@@ -9946,24 +9964,246 @@ mod tick_tests {
         assert_eq!(read_lease(store.as_ref()).await, None);
     }
 
-    /// A view that never read `sys/compat` refuses before the lease is
+    /// Answers every `get` of `sys/compat` with `AccessDenied` while `deny` is
+    /// set, as AWS S3 does for a role without the GET grant.
+    struct DeniedCompatGet {
+        inner: Arc<dyn ObjectStoreBackend>,
+        deny: std::sync::atomic::AtomicBool,
+        denied: AtomicUsize,
+    }
+
+    impl DeniedCompatGet {
+        fn over(inner: Arc<dyn ObjectStoreBackend>, deny: bool) -> Arc<DeniedCompatGet> {
+            Arc::new(DeniedCompatGet {
+                inner,
+                deny: std::sync::atomic::AtomicBool::new(deny),
+                denied: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for DeniedCompatGet {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            if key == ravel_catalog::compat::COMPAT_KEY && self.deny.load(Ordering::SeqCst) {
+                self.denied.fetch_add(1, Ordering::SeqCst);
+                return Err(StoreError::AccessDenied("no s3:GetObject".to_string()));
+            }
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A view that read a record and then lost access to `sys/compat` refuses
+    /// once its last read is `COMPAT_VIEW_HORIZON` old, before the lease is
     /// touched.
     #[tokio::test]
-    async fn a_stale_view_touches_no_lease() {
-        let store = seeded_store().await;
+    async fn access_denied_after_a_seen_record_refuses_past_the_horizon_and_touches_no_lease() {
+        let denied = DeniedCompatGet::over(seeded_store().await, false);
+        let store: Arc<dyn ObjectStoreBackend> = denied.clone();
         let clock = TestClock::at(NOW_NS);
-        let view = CompatView::new(Arc::clone(&store), compat_keys(), clock.clone());
+        ravel_catalog::compat::create_compat(
+            store.as_ref(),
+            &compat_keys(),
+            compat_record(5, 0, 0),
+        )
+        .await
+        .expect("create sys/compat");
+        let view = refreshed_view(&store, &clock).await;
+        denied.deny.store(true, Ordering::SeqCst);
+
+        let horizon = NOW_NS + ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS;
+        clock.set(horizon);
+        crate::compat::refresh_once(&view).await;
+        assert_eq!(
+            denied.denied.load(Ordering::SeqCst),
+            1,
+            "the GET was refused"
+        );
         let ev = evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view));
-        assert!(matches!(
-            ev.lease_step(NOW_NS).await.expect("lease step"),
-            LeaseStep::Refused(CompatRefusal::ViewStale { .. })
-        ));
+        let step = ev.lease_step(horizon).await.expect("lease step");
+        assert!(
+            matches!(
+                step,
+                LeaseStep::Refused(CompatRefusal::ViewStale {
+                    last_read_unix_ns: Some(NOW_NS),
+                    ..
+                })
+            ),
+            "{step:?}"
+        );
         assert_eq!(read_lease(store.as_ref()).await, None);
     }
 
+    /// A store that was never activated, under a role whose `sys/compat`
+    /// reads are refused with `AccessDenied`: the view never reads a record,
+    /// so the evaluator alerts as a build without the policy does, at the
+    /// built-in version with an unparked lease, and still holds the lease three
+    /// horizons later.
+    #[tokio::test]
+    async fn access_denied_on_a_never_activated_store_still_alerts() {
+        let denied = DeniedCompatGet::over(seeded_store().await, true);
+        let store: Arc<dyn ObjectStoreBackend> = denied.clone();
+        let clock = TestClock::at(NOW_NS);
+        let view = CompatView::new(Arc::clone(&store), compat_keys(), clock.clone());
+        crate::compat::refresh_once(&view).await;
+        assert_eq!(
+            denied.denied.load(Ordering::SeqCst),
+            1,
+            "the GET was refused"
+        );
+        assert!(!view.record_seen());
+
+        let mut ev =
+            evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view.clone()));
+        let report = ev.run_tick().await;
+        assert_eq!(report.records_written, 1, "{report:?}");
+        assert_eq!(
+            alert_object_versions(store.as_ref()).await,
+            vec![(
+                WriteVersion::CURRENT.number(),
+                u32::from(WriteVersion::CURRENT.number())
+            )]
+        );
+        let lease = read_lease(store.as_ref()).await.expect("lease");
+        assert_eq!(lease.holder, ev.writer_id.to_string());
+        assert!(!lease.is_parked(), "{lease:?}");
+        assert_eq!(lease.compat_epoch, 0);
+
+        let later = NOW_NS + 3 * ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS;
+        clock.set(later);
+        crate::compat::refresh_once(&view).await;
+        assert_eq!(denied.denied.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            ev.lease_step(later).await.expect("lease step"),
+            LeaseStep::Held
+        );
+    }
+
+    /// Put `lease` as the tenant's alert lease.
+    async fn put_lease(store: &dyn ObjectStoreBackend, lease: &AlertLease) {
+        store
+            .put(
+                &alert_lease_key(&TenantId::new(TENANT).hash()),
+                lease.to_bytes().expect("encode lease"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put lease");
+    }
+
+    /// Without a view the evaluator reads a lease as a build before ADR-4233
+    /// does: a parked lease's `expiry_ns` is `i64::MAX`, so it is held by its
+    /// holder whatever `compat_expiry_ns` says. The lease here carries epoch 0
+    /// so only the expiry rule can keep it; reading `effective_expiry_ns`
+    /// (already past) takes it over.
+    #[tokio::test]
+    async fn without_a_view_a_parked_lease_is_held_by_its_holder() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let parked = AlertLease::parked("other".to_string(), NOW_NS - NS_PER_SEC, 0);
+        put_lease(store.as_ref(), &parked).await;
+        let ev = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        assert_eq!(
+            ev.lease_step(NOW_NS).await.expect("lease step"),
+            LeaseStep::NotHeld
+        );
+        assert_eq!(read_lease(store.as_ref()).await, Some(parked));
+
+        // The lease `compat activate` parks is held the same way.
+        let fence = AlertLease::fence(1);
+        put_lease(store.as_ref(), &fence).await;
+        assert_eq!(
+            ev.lease_step(NOW_NS).await.expect("lease step"),
+            LeaseStep::NotHeld
+        );
+        assert_eq!(read_lease(store.as_ref()).await, Some(fence));
+    }
+
+    /// Without a view the evaluator never writes its unparked lease over one
+    /// written under an activation (`compat_epoch > 0`), even one that has
+    /// expired; an expired lease with epoch 0 it takes over as before.
+    #[tokio::test]
+    async fn without_a_view_an_activated_lease_is_never_overwritten() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let activated = AlertLease::unparked("other".to_string(), NOW_NS - NS_PER_SEC, 1);
+        put_lease(store.as_ref(), &activated).await;
+        let ev = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        assert_eq!(
+            ev.lease_step(NOW_NS).await.expect("lease step"),
+            LeaseStep::NotHeld
+        );
+        assert_eq!(read_lease(store.as_ref()).await, Some(activated));
+
+        put_lease(
+            store.as_ref(),
+            &AlertLease::unparked("other".to_string(), NOW_NS - NS_PER_SEC, 0),
+        )
+        .await;
+        assert_eq!(
+            ev.lease_step(NOW_NS).await.expect("lease step"),
+            LeaseStep::Held
+        );
+        assert_eq!(
+            read_lease(store.as_ref()).await,
+            Some(AlertLease::unparked(
+                ev.writer_id.to_string(),
+                NOW_NS + live_ttl_ns(),
+                0
+            ))
+        );
+    }
+
     /// A tick under a policy naming `rlog` at the version this build writes
-    /// writes its transition at that version: the RLOG trailer and the commit
-    /// record's `segment_format_version` both carry it.
+    /// takes an unparked lease and writes its transition with that version in
+    /// the RLOG trailer and the commit record's `segment_format_version`.
+    /// This build's window is one version wide, so the policy's version and
+    /// the built-in one coincide and this pins the wiring, not the choice;
+    /// `write_alert_record_at_emits_the_given_version_in_the_trailer` in
+    /// ravel-alerting pins that the version given reaches the trailer, and the
+    /// two-version drill case lands with #4249.
     #[tokio::test]
     async fn a_tick_writes_alert_history_at_the_policy_version() {
         let store = seeded_store().await;
