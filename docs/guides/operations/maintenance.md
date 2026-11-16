@@ -2211,17 +2211,17 @@ sweep.
 The count is `ravel_maintain_retention_held_by_lease_buckets_total` on
 `/metrics`, one per bucket per declining pass, summed over every signal.
 
-A bucket whose verifying listing finds a key the store cannot address under
-its commit or `l1/` prefix also keeps its tombstone, and is counted in
-`ravel_maintain_retention_unaddressable_held_buckets_total` once per pass.
-That count must not stay nonzero: inspect the keys under the bucket's
-prefixes, which the sweep's warning names.
-
 A held bucket is a bucket kept past its retention window, so the count rises
 for as long as the hold stands. That is expected. The count goes flat again
 once the hold is cleared and the next pass retires the bucket. A total that
 keeps rising after every hold is cleared means that some scope still matches,
 and `hold list` shows which.
+
+A bucket whose verifying listing finds a key the store cannot address under
+its commit or `l1/` prefix also keeps its tombstone, and is counted in
+`ravel_maintain_retention_unaddressable_held_buckets_total` once per pass.
+Unlike the hold count, this one must not stay nonzero: inspect the keys under
+the bucket's prefixes, which the sweep's warning names.
 
 ## Reclaiming a pre-namespacing cache directory
 
