@@ -172,6 +172,10 @@ The Antithesis server build turns the release profile's thin LTO off,
 because compile-time instrumentation does not survive LTO. The published
 image keeps LTO. Unstripped binaries are in `/symbols` of each image.
 
+The workload also runs weekly from `.github/workflows/antithesis-weekly.yml`
+(Tuesday 03:00 UTC, at most 240 compute hours), which calls `scripts/build.sh
+all` and `scripts/launch.sh` as they are.
+
 The harness expects these fault flags (`scripts/launch.sh`):
 
 ```sh
