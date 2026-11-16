@@ -16,6 +16,7 @@
 #   warm-finish  (d) after the horizon: listings, graceful stop, verdict
 #   cold         (a)+(b)+(c) a second bucket, fenced, then a cold restart
 #   read         (e) v0.33.0 and main read the unfenced v0.33.0 copy
+#   all          every phase above in order, waiting out the warm horizon
 #   verdict      fold every phase's verdict into the report; exit non-zero on
 #                a post-horizon fenced publish, a zero positive control or a
 #                read diff
@@ -28,6 +29,7 @@
 #   DRILL_RUSTFS    RustFS binary [.dd-tools/rustfs/rustfs]
 #   DRILL_FENCE     compat_fence_bucket example binary
 #   DRILL_MAIN      main ravel-server binary (cargo build --release -p ravel-server --features sql)
+#   DRILL_MAIN_SHA  the commit DRILL_MAIN was built from [HEAD]
 #   DRILL_PORT      first of the local ports the drill binds [39410]
 #   DRILL_COLD_SECS how long the cold restart is driven [240]
 #   DRILL_COLD_BUCKET, DRILL_READ_BUCKET  fresh bucket names [drill-cold, drill-read]
@@ -58,7 +60,10 @@ LIFE=4h
 # v0.33.0 grace horizon inputs, from the v0.33.0 source (.dd-tools/src033):
 # the provisioning refresh interval (60 s, fixed), max_flush_lifetime (3600 s,
 # compiled in) and the alert lease TTL (LEASE_TTL_TICKS = 3 evaluation
-# intervals). T_REQ bounds one in-flight store request past its deadline.
+# intervals). A flush's deadline is at most its ingest hour's end plus
+# max_flush_lifetime (ravel-ingest config.rs grant_deadline_ns). T_REQ bounds
+# one store request already sent when that deadline drops it: three times
+# v0.33.0's S3 DEFAULT_REQUEST_TIMEOUT of 20 s.
 REFRESH_S=60
 MAX_FLUSH_LIFETIME_S=3600
 ALERT_INTERVAL_S=1
@@ -240,11 +245,19 @@ phase_preflight() {
     sha256sum "$V033_SERVER" "$V033_CLI" | sed 's/^/stamp asset_sha256 /'
     echo "stamp rustfs_version $("$RUSTFS" --version 2>&1 | head -n 1)"
     sha256sum "$RUSTFS" | sed 's/^/stamp rustfs_sha256 /'
-    echo "stamp main_sha $(git -C "$ROOT" rev-parse HEAD)"
-    if [ -x "$ROOT/.dd-tools/bin/cosign" ]; then
+    # The commit the main binary was built from: DRILL_MAIN_SHA when the
+    # binary predates this checkout's HEAD.
+    echo "stamp main_sha ${DRILL_MAIN_SHA:-$(git -C "$ROOT" rev-parse HEAD)}"
+    if [ -x "$MAIN" ]; then
+      sha256sum "$MAIN" | sed 's/^/stamp main_binary_sha256 /'
+    else
+      echo "stamp main_binary_sha256 not-built"
+    fi
+    [ -x "$ROOT/.dd-tools/bin/cosign" ] || die "no cosign at .dd-tools/bin/cosign: the signature is a stamp"
+    if :; then
       "$ROOT/.dd-tools/bin/cosign" verify-blob --signature "$V033/SHA256SUMS.sig" \
         --certificate "$V033/SHA256SUMS.pem" \
-        --certificate-identity-regexp '^https://github.com/NOFireAI/ravel/' \
+        --certificate-identity 'https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml@refs/tags/v0.33.0' \
         --certificate-oidc-issuer https://token.actions.githubusercontent.com \
         "$V033/SHA256SUMS" 2>&1 | sed 's/^/stamp cosign /'
     fi
@@ -543,6 +556,21 @@ phase_verdict() {
 case "${1:-}" in
   preflight) phase_preflight ;;
   read) phase_read ;;
+  all)
+    phase_preflight
+    phase_start
+    phase_warm_start
+    phase_warm_fence
+    phase_cold
+    phase_read
+    if [ "$(cat "$RUN/warm/status")" = RUNNING ]; then
+      while [ "$(date -u +%s)" -le "$(cat "$RUN/warm/horizon.ingest")" ]; do
+        sleep 60
+      done
+      phase_warm_finish
+    fi
+    phase_verdict
+    ;;
   verdict) phase_verdict ;;
   start) phase_start ;;
   warm-start) phase_warm_start ;;
