@@ -124,3 +124,150 @@ async fn read_floor(
         Err(err) => Err(MaintainError::Store(err)),
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use ravel_catalog::{AbsentPolicy, FloorBasis, raise_format_floor, validate_or_adopt};
+    use ravel_ingest::{BelowFormatFloor, FormatFloorMetrics};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::{Signal, TenantHash};
+
+    use super::*;
+    use crate::compat_policy::FamilyVersions;
+    use crate::compat_policy::test_support::{ManualClock, T0, family, policy, write_compat};
+    use ravel_catalog::compat::FAMILY_RSEG;
+
+    fn current() -> u32 {
+        u32::from(ravel_segment::SegmentVersion::CURRENT.number())
+    }
+
+    fn bucket() -> Bucket {
+        Bucket::new(TenantHash([5; 16]), Signal::Metrics, 0, 1)
+    }
+
+    /// A metrics bucket whose RSEG floor is one above the build's current
+    /// version.
+    async fn floored_store() -> Arc<MemoryStore> {
+        let store = Arc::new(MemoryStore::new());
+        let bucket = bucket();
+        validate_or_adopt(
+            store.as_ref(),
+            &bucket.tenant_hash,
+            bucket.signal,
+            1,
+            1,
+            AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("provision");
+        raise_format_floor(
+            store.as_ref(),
+            &bucket.tenant_hash,
+            bucket.signal,
+            FormatFamily::Rseg.as_str(),
+            current() + 1,
+            FloorBasis {
+                observed_entries: 0,
+                observed_newest_created_unix_ns: 0,
+                observed_shards: 1,
+            },
+            "test",
+            2,
+        )
+        .await
+        .expect("raise floor");
+        store
+    }
+
+    fn refusing() -> FormatFloorPolicy {
+        FormatFloorPolicy::new(false, Arc::new(FormatFloorMetrics::default()))
+    }
+
+    fn assert_below(err: &MaintainError, writing: u32) {
+        assert!(
+            matches!(
+                err,
+                MaintainError::BelowFormatFloor(BelowFormatFloor {
+                    family: FormatFamily::Rseg,
+                    floor,
+                    writing: w,
+                }) if *floor == current() + 1 && *w == writing
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The floor is compared with the version the caller writes, not the
+    /// build's current one: one above current passes a floor that refuses
+    /// current.
+    #[tokio::test]
+    async fn the_floor_is_checked_against_the_given_version() {
+        let store = floored_store().await;
+        let policy = refusing();
+
+        let err = check_with_policy(store.as_ref(), None, &policy, &bucket(), "test", current())
+            .await
+            .expect_err("current is below the floor");
+        assert_below(&err, current());
+        check_with_policy(
+            store.as_ref(),
+            None,
+            &policy,
+            &bucket(),
+            "test",
+            current() + 1,
+        )
+        .await
+        .expect("the run's version is at the floor");
+    }
+
+    /// `check_output_floor` checks the part version the compat run chose,
+    /// and the build's current one with no run.
+    #[tokio::test]
+    async fn the_output_floor_uses_the_runs_version() {
+        let store = floored_store().await;
+        let next = current() + 1;
+        let next_u16 = u16::try_from(next).expect("u16");
+        write_compat(
+            store.as_ref(),
+            vec![family(FAMILY_RSEG, next)],
+            3_600_000_000_000,
+        )
+        .await;
+        let compat = policy(store.clone(), ManualClock::at(T0))
+            .await
+            .with_family(
+                FAMILY_RSEG,
+                FamilyVersions {
+                    writable: vec![ravel_segment::SegmentVersion::CURRENT.number(), next_u16],
+                    baseline: ravel_segment::SegmentVersion::CURRENT.number(),
+                },
+            );
+        let bucket = bucket();
+        let run = compat
+            .begin(
+                "test",
+                &[FAMILY_RSEG],
+                Some((bucket.tenant_hash, bucket.signal)),
+                None,
+                0,
+            )
+            .expect("begin");
+        assert_eq!(run.version(FAMILY_RSEG), Some(next_u16));
+        let config = CompactorConfig {
+            format_floor: Some(refusing()),
+            ..CompactorConfig::default()
+        };
+
+        check_output_floor(store.as_ref(), &config, &bucket, "test", Some(&run))
+            .await
+            .expect("the run writes at the floor");
+        let err = check_output_floor(store.as_ref(), &config, &bucket, "test", None)
+            .await
+            .expect_err("no run writes current, below the floor");
+        assert_below(&err, current());
+    }
+}

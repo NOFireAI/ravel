@@ -95,9 +95,11 @@ use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::publish::PublishOutcome;
 use crate::read::{BucketListing, list_bucket_strict, load_inputs, refuse_unaddressable};
+#[cfg(doc)]
+use crate::rewrite::reencode_compaction_parts;
 use crate::rewrite::{
     MigrateOutcome, ReencodeOutcome, current_part_version, migrate_bucket_format,
-    reencode_compaction_parts,
+    reencode_compaction_parts_toward,
 };
 use crate::sweep::superseded_input_commit_keys;
 
@@ -1703,10 +1705,11 @@ fn force2_case(
 }
 
 /// The part version a force 2 re-encode of a `signal` bucket writes: the
-/// family's active version under a compat policy, which
-/// [`crate::compat_policy::require_active_target`] has already matched to the
-/// target, or the build's current one without. `None` for a signal no
-/// re-encode covers.
+/// family's active version under a compat policy as the view last saw it, or
+/// the build's current one without. `None` for a signal no re-encode covers.
+/// For selecting the bucket only: the bucket's run checks the view's freshness
+/// and that the target is still the active, writable version before its
+/// claim.
 fn force2_writable(config: &CompactorConfig, signal: Signal) -> Option<u32> {
     match config.compat_policy.as_ref() {
         Some(policy) => crate::compat_policy::part_family(signal)
@@ -2142,7 +2145,15 @@ pub async fn migrate_family(
                             below_target,
                             inputs,
                         }) => {
-                            match reencode_compaction_parts(store, clock, config, &bucket).await {
+                            match reencode_compaction_parts_toward(
+                                store,
+                                clock,
+                                config,
+                                &bucket,
+                                Some(target_version),
+                            )
+                            .await
+                            {
                                 Ok(outcome) => {
                                     spent += record_reencode(
                                         &mut report,

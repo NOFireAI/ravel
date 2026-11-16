@@ -30,15 +30,19 @@ use ravel_catalog::compat::{
 };
 use ravel_catalog::{AbsentPolicy, provisioning_key, raise_compat_fence, validate_or_adopt};
 use ravel_commit::{erasure, keys, record, signal};
+use ravel_fleet::claim::COMPACTION_CLAIMS_PREFIX;
+use ravel_maintain::claim_guard::ClaimSleeper;
 use ravel_maintain::rewrite::{ReencodeOutcome, reencode_compaction_parts};
 use ravel_maintain::{
-    CompactionOutcome, CompactorConfig, CompatRunRefusal, FamilyVersions, FixedClock,
-    MaintainCompatPolicy, MaintainError, MaintainMemo, NoLeases, RequestLedger, RetentionConfig,
-    RetentionOutcome, buckets_held_unknown_section_total, compact_bucket,
-    compat_publish_refused_total, erasure_rewrite_bucket, maintain_bucket,
+    ClaimParticipant, Clock, CompactionOutcome, CompactorConfig, CompatRunRefusal, Coordination,
+    FamilyVersions, FixedClock, MaintainCompatPolicy, MaintainError, MaintainMemo, NoLeases,
+    RequestLedger, RetentionConfig, RetentionOutcome, buckets_held_unknown_section_total,
+    compact_bucket, compat_publish_refused_total, erasure_rewrite_bucket, maintain_bucket,
     pending_erasure_requests, read,
 };
-use ravel_maintain::{MigrateBudget, MigrateHeldBucket, MigrateHoldReason, migrate_family};
+use ravel_maintain::{
+    MigrateBudget, MigrateHeldBucket, MigrateHoldReason, migrate_bucket_format, migrate_family,
+};
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
 };
@@ -612,6 +616,27 @@ async fn seed_input_with_unknown_section(
     store: &dyn ObjectStoreBackend,
     recorded_version: u32,
 ) -> String {
+    seed_second_input_as(store, recorded_version, |bytes| {
+        let spliced = with_unknown_section(bytes);
+        assert_eq!(
+            open_from_full(&spliced, ReaderLimits::default())
+                .expect("open spliced")
+                .unknown_section_kinds,
+            vec![UNKNOWN_KIND]
+        );
+        spliced
+    })
+    .await
+}
+
+/// Seed the bucket's second input as `transform` of its real bytes, its
+/// commit record naming the transformed bytes and stamped at
+/// `recorded_version`. Returns the data key.
+async fn seed_second_input_as(
+    store: &dyn ObjectStoreBackend,
+    recorded_version: u32,
+    transform: impl FnOnce(&[u8]) -> Vec<u8>,
+) -> String {
     let spec = InputSpec::new(
         Uuid::from_u128(2),
         10,
@@ -623,13 +648,7 @@ async fn seed_input_with_unknown_section(
         spec.hour,
         (spec.created_unix_ns, spec.epoch, spec.seq),
     );
-    let bytes = with_unknown_section(&written.bytes);
-    assert_eq!(
-        open_from_full(&bytes, ReaderLimits::default())
-            .expect("open spliced")
-            .unknown_section_kinds,
-        vec![UNKNOWN_KIND]
-    );
+    let bytes = transform(&written.bytes);
     let content_hash = *blake3::hash(&bytes).as_bytes();
     let data_key = keys::data_key(
         &tenant_hash(),
@@ -780,6 +799,82 @@ async fn an_unknown_section_kind_holds_the_bucket_in_migrate() {
     );
 }
 
+/// A [`ClaimSleeper`] that returns at once, so no jitter wait touches the real
+/// timer.
+struct NoWait;
+
+impl ClaimSleeper for NoWait {
+    fn sleep(&self, _duration: Duration) -> futures::future::BoxFuture<'static, ()> {
+        Box::pin(std::future::ready(()))
+    }
+}
+
+/// The state of every compaction claim in the store.
+async fn claim_states(store: &dyn ObjectStoreBackend) -> Vec<sysproto::ClaimState> {
+    let mut states = Vec::new();
+    for meta in list_all(store, COMPACTION_CLAIMS_PREFIX)
+        .await
+        .expect("list claims")
+    {
+        let got = get_full(store, &meta.key).await;
+        let claim = sysproto::CompactionClaim::decode(got.as_ref()).expect("claim decodes");
+        states.push(sysproto::ClaimState::try_from(claim.state).expect("known state"));
+    }
+    states
+}
+
+/// An L0 migration that fails to decode an input publishes nothing and
+/// releases its claim at once, as it does for a refused input, rather than
+/// hold the bucket's compaction off for the lease. The second input's bytes
+/// are cut in half under a commit record that names them, one version below
+/// the target.
+#[tokio::test]
+async fn an_undecodable_input_releases_the_l0_migration_claim() {
+    let store = MemoryStore::new();
+    store.set_clock_ms(u64::try_from(sealed_now_ns() / 1_000_000).expect("positive"));
+    let clock = FixedClock::new(sealed_now_ns());
+    seed_input(
+        &store,
+        &InputSpec::new(
+            Uuid::from_u128(1),
+            10,
+            1,
+            vec![raw_series("keep", &[("k", "a")], &[(1_000, 1.0)])],
+        ),
+    )
+    .await;
+    seed_second_input_as(&store, u32::from(VERSION_V7) - 1, |bytes| {
+        bytes[..bytes.len() / 2].to_vec()
+    })
+    .await;
+    let config = CompactorConfig {
+        coordination: Coordination::On,
+        claim_participant: Some(
+            ClaimParticipant::new(
+                Uuid::from_u128(2),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            )
+            .with_sleeper(Arc::new(NoWait)),
+        ),
+        ..CompactorConfig::default()
+    };
+
+    let err = migrate_bucket_format(&store, &clock, &config, &bucket(), u32::from(VERSION_V7))
+        .await
+        .expect_err("undecodable");
+
+    assert!(matches!(err, MaintainError::Segment(_)), "{err:?}");
+    assert_eq!(
+        l1_keys(&snapshot(&store).await),
+        Vec::<&str>::new(),
+        "no part is written"
+    );
+    assert_eq!(
+        claim_states(&store).await,
+        vec![sysproto::ClaimState::Completed]
+    );
+}
+
 /// A bucket compacted without a policy whose one record is then stamped one
 /// version below the current part version, so a force 2 re-encode has work.
 async fn reencodable_bucket(store: &dyn ObjectStoreBackend) {
@@ -869,6 +964,97 @@ async fn force2_needs_compaction_record_active_at_2() {
     assert_eq!(
         new_record.format_version,
         record::COMPACTION_SUPERSEDING_FORMAT_VERSION
+    );
+}
+
+/// A force 2 bucket run checks, before its claim, that the walk's target is
+/// still the part family's active version. The walk selects the bucket
+/// toward 7 and is held on its compaction-record read; RSEG is activated to 8
+/// and the view refreshed while it waits. The bucket's run is refused under
+/// `rseg` with the target and the active version, counted, with no claim and
+/// nothing written. Without the check the run takes its claim and goes on
+/// toward 8, which this build's RSEG writer cannot emit.
+#[tokio::test]
+async fn force2_refuses_a_target_activated_past_before_its_claim() {
+    let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    reencodable_bucket(store.inner()).await;
+    write_compat(
+        store.inner(),
+        vec![
+            family(FAMILY_RSEG, u32::from(VERSION_V7)),
+            family(FAMILY_COMPACTION_RECORD, 1),
+        ],
+    )
+    .await;
+    provision(store.inner()).await;
+    activate(store.inner(), FAMILY_COMPACTION_RECORD, 2).await;
+    let clock = ManualClock::at(T0);
+    let view = view_of(store.clone(), clock.clone()).await;
+    let target = u32::from(VERSION_V7);
+    let policy = MaintainCompatPolicy::new(view.clone(), clock).with_family(
+        FAMILY_RSEG,
+        FamilyVersions {
+            writable: vec![VERSION_V7, VERSION_V7 + 1],
+            baseline: VERSION_V7,
+        },
+    );
+    let maintain_clock = FixedClock::new(sealed_now_ns());
+    let config = CompactorConfig {
+        coordination: Coordination::On,
+        claim_participant: Some(ClaimParticipant::new(
+            Uuid::from_u128(2),
+            Arc::new(maintain_clock.clone()) as Arc<dyn Clock>,
+        )),
+        reencode_writer_enabled: true,
+        ..config_with(policy)
+    };
+    let gate = store.hold(Op::Get, Some("/l1.".to_string()), Occurrence::Nth(1));
+    let before = snapshot(store.inner()).await;
+    let refused = compat_publish_refused_total(FAMILY_RSEG, "target_not_active");
+
+    let (outcome, ()) = tokio::join!(
+        migrate_family(
+            store.as_ref(),
+            &maintain_clock,
+            &config,
+            tenant_hash(),
+            ravel_types::Signal::Metrics,
+            FAMILY_RSEG,
+            target,
+            8,
+            MigrateBudget::unlimited(),
+            "test",
+        ),
+        async {
+            tokio::time::timeout(HOLD_WAIT, gate.wait_until_held(1))
+                .await
+                .expect("the walk reads the compaction record");
+            activate(store.inner(), FAMILY_RSEG, target + 1).await;
+            view.refresh().await.expect("refresh the view");
+            for id in gate.held() {
+                gate.release(id);
+            }
+        }
+    );
+
+    let err = outcome.expect_err("refused");
+    assert_eq!(
+        refused_under(&err, FAMILY_RSEG),
+        CompatRunRefusal::TargetNotActive {
+            target,
+            active: VERSION_V7 + 1,
+        }
+    );
+    let after = snapshot(store.inner()).await;
+    let written: Vec<_> = after.iter().filter(|o| !before.contains(o)).collect();
+    assert!(
+        written.iter().all(|(k, _)| k.starts_with("sys/compat")),
+        "only the activation is written, no claim and no part: {written:?}"
+    );
+    assert_eq!(l1_keys(&after), l1_keys(&before));
+    assert_eq!(
+        compat_publish_refused_total(FAMILY_RSEG, "target_not_active"),
+        refused + 1
     );
 }
 
