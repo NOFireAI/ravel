@@ -22,7 +22,7 @@ use ravel_mcp::envelope::{
 use ravel_promql::{FloatHistogram, HistogramAwareMatrix, InstantVector, RangeMatrix};
 use ravel_query::{PhaseAccountingSnapshot, QueryPhase};
 use ravel_types::accounting::{CostEstimate, QueryAccountingSnapshot};
-use ravel_types::{CommitToken, LabelSet, SeriesId};
+use ravel_types::{CommitToken, LabelSet, SeriesId, TenantHash};
 use serde_json::{Map, Value, json};
 
 use crate::service::{ServiceError, ServiceErrorKind};
@@ -239,6 +239,35 @@ pub(crate) fn internal(message: String) -> Failure {
         message,
         counter: None,
     }
+}
+
+/// Log the cause of an internal fault once at warn, with the tenant hash and
+/// the fixed `client_message` the caller receives in its place. The cause's
+/// `Display` can carry internal detail (an object key, a corrupt value), so it
+/// goes to the operator's log and never into a caller-facing failure.
+pub(crate) fn log_redacted(
+    client_message: &str,
+    cause: &dyn std::fmt::Display,
+    tenant_hash: TenantHash,
+) {
+    tracing::warn!(
+        tenant = %tenant_hash.to_hex(),
+        error = %cause,
+        client_message = %client_message,
+        "mcp internal error redacted from client response",
+    );
+}
+
+/// An internal fault whose cause must not reach the caller: the fixed
+/// `client_message` under [`FailureClass::Internal`], with the cause logged by
+/// [`log_redacted`].
+pub(crate) fn redacted_internal(
+    client_message: &str,
+    cause: &dyn std::fmt::Display,
+    tenant_hash: TenantHash,
+) -> Failure {
+    log_redacted(client_message, cause, tenant_hash);
+    internal(client_message.to_string())
 }
 
 /// An SQL result cell the JSON encoding cannot hold. The message names the
