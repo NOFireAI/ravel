@@ -941,7 +941,7 @@ async fn held_out_of_window(
     };
     let mut held = Vec::new();
     for key in l0_data_keys.iter().chain(l1_part_keys.iter()) {
-        if let Some(version) = out_of_window_version(store, format, key).await? {
+        if let Some(version) = held_version(store, format, key).await? {
             held.push((key.clone(), version));
         }
     }
@@ -959,7 +959,7 @@ pub(crate) async fn held_out_of_window_rlog(
 ) -> Result<Vec<(String, u16)>> {
     let mut held = Vec::new();
     for key in keys {
-        if let Some(version) = out_of_window_version(store, ProbedFormat::Rlog, key).await? {
+        if let Some(version) = held_version(store, ProbedFormat::Rlog, key).await? {
             held.push((key.clone(), version));
         }
     }
@@ -1034,6 +1034,26 @@ async fn out_of_window_version(
         Err(e) => return Err(MaintainError::Store(e)),
     };
     Ok(format.out_of_window(got.total_size, got.data.as_ref()))
+}
+
+/// The version one data object is held on: its trailer version when outside
+/// this build's reader window, and for RLOG also the grammar version of a
+/// nested POSTINGS or KEY_IDX section outside this build's read set, which the
+/// trailer-only probe never sees (ADR-4233 decision 4, hazard H5). `None` when
+/// the object is readable here, is corrupt, or is already gone. RSEG and RSPAN
+/// have no version-gated nested sections, so their hold is the trailer alone.
+async fn held_version(
+    store: &dyn ObjectStoreBackend,
+    format: ProbedFormat,
+    key: &str,
+) -> Result<Option<u16>> {
+    match format {
+        // One footer-suffix GET serves both the trailer version and the nested
+        // section probe, so the RLOG hold costs the same one request per object
+        // as the trailer-only gate did.
+        ProbedFormat::Rlog => crate::compat_certify::rlog_held_version(store, key).await,
+        ProbedFormat::Rseg | ProbedFormat::Rspan => out_of_window_version(store, format, key).await,
+    }
 }
 
 /// Every key one physical sweep pass would delete, in delete order, tombstone
@@ -1392,6 +1412,52 @@ mod tests {
                 "every key is offered even once {held} has already matched"
             );
         }
+    }
+
+    /// ADR-4233 decision 4, hazard H5: the logs retention gate holds a `.rlog`
+    /// object whose trailer version is in window but whose nested POSTINGS
+    /// section is at a grammar version this build cannot read. A trailer-only
+    /// gate would classify it readable and delete it; the readable control
+    /// proves the gate is not simply holding every RLOG object.
+    #[tokio::test]
+    async fn held_out_of_window_holds_an_unreadable_rlog_section() {
+        let store = MemoryStore::new();
+        let bucket = Bucket::new(tenant(), Signal::Logs, 0, 1);
+
+        let held_key = "t/held/obj".to_string();
+        store
+            .put(
+                &held_key,
+                bytes::Bytes::from(crate::compat_certify::rlog_object_with_sections(true)),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put held object");
+        let held = held_out_of_window(&store, &bucket, std::slice::from_ref(&held_key), &[])
+            .await
+            .expect("held");
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(
+            held[0].1,
+            u16::from(ravel_logseg::postings::POSTINGS_VERSION + 1)
+        );
+
+        let readable_key = "t/readable/obj".to_string();
+        store
+            .put(
+                &readable_key,
+                bytes::Bytes::from(crate::compat_certify::rlog_object_with_sections(false)),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put readable object");
+        assert!(
+            held_out_of_window(&store, &bucket, std::slice::from_ref(&readable_key), &[])
+                .await
+                .expect("not held")
+                .is_empty(),
+            "a readable RLOG object with a POSTINGS section is not held"
+        );
     }
 
     /// The retention read of a compaction record refuses a future

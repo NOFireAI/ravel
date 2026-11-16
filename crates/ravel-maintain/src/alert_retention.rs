@@ -98,6 +98,7 @@ use crate::clock::Clock;
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::read::verify_commit_key;
+use crate::retention::held_out_of_window_rlog;
 use crate::sweep::LeaseCheck;
 
 /// What the alert state memo tells the sweep: the hour the memo is complete
@@ -184,6 +185,12 @@ pub struct AlertRetentionOutcome {
     /// `ingest_hour_bucket` alone proved the record cannot be expired. A subset
     /// of `kept`.
     pub gets_skipped_by_hour_prefilter: usize,
+    /// Expired, past-horizon records kept because their RLOG data object is at a
+    /// version this build cannot read: the trailer version is outside the reader
+    /// window, or a nested POSTINGS or KEY_IDX section is outside the read set
+    /// (ADR-4233 decision 4, hazards H7 and H5). A subset of `kept`. Deleting
+    /// such an object would discard data no current build can re-ingest.
+    pub held_out_of_window: usize,
 }
 
 /// Sweep expired alert transition records from a tenant's alert shard,
@@ -299,6 +306,21 @@ pub async fn sweep_alert_retention(
                 // commit record pointing at a deleted data object, or vice versa.
                 if lease.is_protected(&meta.key) || lease.is_protected(&data_key) {
                     outcome.kept += 1;
+                    continue;
+                }
+                // The data object is RLOG. Hold it, never delete it, when its
+                // trailer version is outside this build's reader window or a
+                // nested POSTINGS or KEY_IDX section is at a version outside the
+                // read set (ADR-4233 decision 4, hazards H7 and H5): deleting an
+                // object no current build can read loses data no build can
+                // re-ingest, and the retention version hold keeps it readable
+                // once the reader returns.
+                if !held_out_of_window_rlog(store, std::slice::from_ref(&data_key))
+                    .await?
+                    .is_empty()
+                {
+                    outcome.kept += 1;
+                    outcome.held_out_of_window += 1;
                     continue;
                 }
                 if !config.dry_run {
@@ -508,6 +530,106 @@ mod tests {
         out
     }
 
+    /// As [`seed_alert_created`], but the data object is a real `.rlog` object
+    /// carrying a POSTINGS section, bumped above the read set when `bump` is
+    /// set. The sweep's version hold reads the object; the evaluator's opaque
+    /// body in the other seeders would carry no section to bump.
+    async fn seed_alert_rlog(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        seq: u64,
+        ts_ns: i64,
+        bump: bool,
+    ) -> Seeded {
+        let body = Bytes::from(crate::compat_certify::rlog_object_with_sections(bump));
+        let content_hash: [u8; 32] = *blake3::hash(&body).as_bytes();
+        let commit = record::build(NewCommitRecord {
+            tenant_hash: *tenant,
+            signal: Signal::Alerts,
+            shard: ALERT_SHARD,
+            writer_id: Uuid::from_u128(u128::from(seq)),
+            writer_epoch: ALERT_WRITER_EPOCH,
+            writer_seq: seq,
+            object_size: body.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: ts_ns,
+            max_event_ts_ns: ts_ns,
+            min_ingest_ts_ns: ts_ns,
+            max_ingest_ts_ns: ts_ns,
+            segment_format_version: u32::from(ravel_logseg::footer::WriteVersion::CURRENT.number()),
+            created_unix_ns: ts_ns,
+            ingest_hour_bucket: hour_of(ts_ns),
+        })
+        .expect("build alert commit record");
+        let data_key = keys::reconstruct_data_key(&commit).expect("data key");
+        store
+            .put(&data_key, body, PutOptions::create_if_absent())
+            .await
+            .expect("put alert data object");
+        let commit_key = keys::commit_key_for_record(&commit).expect("commit key");
+        store
+            .put(
+                &commit_key,
+                record::encode(&commit),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put alert commit record");
+        Seeded {
+            commit_key,
+            data_key,
+            ts_ns,
+        }
+    }
+
+    /// ADR-4233 decision 4, hazard H5: an expired alert data object whose
+    /// trailer version is in window but whose nested POSTINGS section is at a
+    /// grammar version this build cannot read is held, not deleted. Alerts had
+    /// no retention version hold before this change, so without it the object
+    /// would be deleted. The readable control is swept, proving the hold is
+    /// section-specific rather than a blanket refusal.
+    #[tokio::test]
+    async fn unreadable_section_version_alert_object_is_held() {
+        let store = MemoryStore::new();
+        let tenant = tenant();
+        let now = 400 * NS_PER_DAY;
+        let clock = FixedClock::new(now);
+        let config = CompactorConfig::default();
+        let keep = keep_none_below(now);
+
+        let held = seed_alert_rlog(&store, &tenant, 1, now - 100 * NS_PER_DAY, true).await;
+        let swept = seed_alert_rlog(&store, &tenant, 2, now - 99 * NS_PER_DAY, false).await;
+
+        let outcome = sweep_alert_retention(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant,
+            ALERT_SHARD,
+            &keep,
+        )
+        .await
+        .expect("sweep");
+
+        assert_eq!(outcome.held_out_of_window, 1, "{outcome:?}");
+        assert_eq!(outcome.records_deleted, 1, "the readable record is swept");
+        assert!(
+            exists(&store, &held.data_key).await,
+            "the held object stays"
+        );
+        assert!(
+            exists(&store, &held.commit_key).await,
+            "its record stays too"
+        );
+        assert!(
+            !exists(&store, &swept.data_key).await,
+            "the readable object goes"
+        );
+    }
+
     /// The acceptance test (ADR-1688 follow-up task 1). An alert history
     /// spanning several expired hours plus one live hour is swept: every
     /// expired record and its data object are gone by exact key, except the one
@@ -574,6 +696,7 @@ mod tests {
                 // watermark is consulted, and everything seeded is below it.
                 kept_at_or_above_watermark: 0,
                 gets_skipped_by_hour_prefilter: 2,
+                held_out_of_window: 0,
             },
             "exact counts, not just nonzero"
         );
@@ -777,6 +900,7 @@ mod tests {
                 kept_current_state: 0,
                 kept_at_or_above_watermark: 1,
                 gets_skipped_by_hour_prefilter: 0,
+                held_out_of_window: 0,
             },
             "a record in the watermark hour must not be deleted"
         );
@@ -805,6 +929,7 @@ mod tests {
                 kept_current_state: 0,
                 kept_at_or_above_watermark: 0,
                 gets_skipped_by_hour_prefilter: 0,
+                held_out_of_window: 0,
             },
             "one hour below the watermark the same record is deleted"
         );
@@ -866,6 +991,7 @@ mod tests {
                 kept_current_state: 1,
                 kept_at_or_above_watermark: 0,
                 gets_skipped_by_hour_prefilter: 0,
+                held_out_of_window: 0,
             },
             "exactly one of the two records is kept, and by the keep set"
         );
@@ -924,6 +1050,7 @@ mod tests {
                 kept_current_state: 0,
                 kept_at_or_above_watermark: 2,
                 gets_skipped_by_hour_prefilter: 1,
+                held_out_of_window: 0,
             },
             "an empty set still sweeps, but only strictly below the watermark"
         );
@@ -1007,6 +1134,7 @@ mod tests {
                 kept_current_state: 0,
                 kept_at_or_above_watermark: 0,
                 gets_skipped_by_hour_prefilter: 0,
+                held_out_of_window: 0,
             },
             "a keep-set record that was never at risk is counted under kept alone"
         );
@@ -1058,6 +1186,7 @@ mod tests {
                 // cannot clear it: the horizon is what saves the record, and it
                 // is read from the record body.
                 gets_skipped_by_hour_prefilter: 0,
+                held_out_of_window: 0,
             },
             "the horizon gate alone must keep this record"
         );
@@ -1215,6 +1344,7 @@ mod tests {
                     kept_current_state: 0,
                     kept_at_or_above_watermark: 0,
                     gets_skipped_by_hour_prefilter: 0,
+                    held_out_of_window: 0,
                 },
                 "a held record is kept, and not counted as a keep-set record"
             );

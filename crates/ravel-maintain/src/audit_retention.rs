@@ -917,6 +917,101 @@ mod tests {
         );
     }
 
+    /// Seed one expired audit transition whose data object is a real `.rlog`
+    /// object carrying a POSTINGS section, bumped above the read set when
+    /// `bump` is set. Unlike [`seed_audit`] this writes the commit record by
+    /// hand so the data object can be an arbitrary RLOG body, which the
+    /// query-audit writer never emits with nested sections.
+    async fn seed_audit_rlog(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        seq: u64,
+        ts_ns: i64,
+        bump: bool,
+    ) -> String {
+        use ravel_commit::record::NewCommitRecord;
+
+        let bytes = bytes::Bytes::from(crate::compat_certify::rlog_object_with_sections(bump));
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let hour = u32::try_from(ts_ns.div_euclid(NS_PER_HOUR)).expect("hour");
+        let commit = record::build(NewCommitRecord {
+            tenant_hash: *tenant,
+            signal: Signal::Audit,
+            shard: QUERY_AUDIT_SHARD,
+            writer_id: Uuid::from_u128(u128::from(seq)),
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: ts_ns,
+            max_event_ts_ns: ts_ns,
+            min_ingest_ts_ns: ts_ns,
+            max_ingest_ts_ns: ts_ns,
+            segment_format_version: u32::from(ravel_logseg::footer::WriteVersion::CURRENT.number()),
+            created_unix_ns: ts_ns,
+            ingest_hour_bucket: hour,
+        })
+        .expect("build audit commit record");
+        let data_key = keys::reconstruct_data_key(&commit).expect("data key");
+        store
+            .put(&data_key, bytes, Default::default())
+            .await
+            .expect("put audit data object");
+        let commit_key = keys::commit_key_for_record(&commit).expect("commit key");
+        store
+            .put(&commit_key, record::encode(&commit), Default::default())
+            .await
+            .expect("put audit commit record");
+        data_key
+    }
+
+    /// Whether `key` is present; any store error other than `NotFound` is a
+    /// harness failure, not absence.
+    async fn exists(store: &dyn ObjectStoreBackend, key: &str) -> bool {
+        match store.head(key).await {
+            Ok(_) => true,
+            Err(ravel_object_store::StoreError::NotFound) => false,
+            Err(e) => panic!("head({key}) failed: {e}"),
+        }
+    }
+
+    /// ADR-4233 decision 4, hazard H5: an expired audit object whose trailer
+    /// version is in window but whose nested POSTINGS section is at a grammar
+    /// version this build cannot read is held, not deleted. A build that read
+    /// only the trailer would delete it. The readable control in the hour after
+    /// it is swept normally, proving the hold is section-specific.
+    #[tokio::test]
+    async fn unreadable_section_version_audit_object_is_held() {
+        let store = MemoryStore::new();
+        let tenant = tenant();
+        let now = 400 * NS_PER_DAY;
+        let clock = FixedClock::new(now);
+        let config = CompactorConfig::default();
+        let held_key = seed_audit_rlog(&store, &tenant, 1, now - 100 * NS_PER_DAY, true).await;
+        let swept_key = seed_audit_rlog(
+            &store,
+            &tenant,
+            2,
+            now - 100 * NS_PER_DAY + 5 * NS_PER_HOUR,
+            false,
+        )
+        .await;
+
+        let outcome = sweep_audit_retention(&store, &clock, &config, &NoLeases, &tenant)
+            .await
+            .expect("sweep");
+
+        assert_eq!(outcome.held_out_of_window, 1, "{outcome:?}");
+        assert_eq!(outcome.records_deleted, 1, "the readable hour is swept");
+        assert!(exists(&store, &held_key).await, "the held object stays");
+        assert!(
+            !exists(&store, &swept_key).await,
+            "the readable object goes"
+        );
+    }
+
     /// A corrupt expired audit object is not a version hold: it is deleted as
     /// before.
     #[tokio::test]
