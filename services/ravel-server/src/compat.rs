@@ -224,3 +224,28 @@ pub fn spawn_refresh_loop(view: CompatView, interval: Duration) -> JoinHandle<()
         }
     })
 }
+
+/// The fold's write-policy gate (ADR-4233 decision 3): every catalog family a
+/// fold of `signal` writes must be at a version the policy names. A refusal is
+/// logged, counted under `ravel_compat_publish_refused_total`, and returned
+/// before the fold reads or writes anything.
+pub fn fold_compat_gate(
+    catalog: &ravel_catalog::Catalog,
+    tenant: &ravel_types::TenantHash,
+    signal: ravel_types::Signal,
+    now_ns: i64,
+) -> Result<(), ravel_catalog::FoldCompatRefusal> {
+    catalog
+        .fold_compat_versions(signal, now_ns)
+        .map(|_| ())
+        .inspect_err(|refusal| {
+            record_publish_refusal(refusal.family, &refusal.refusal);
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                family = refusal.family,
+                %refusal,
+                "catalog fold refused by the sys/compat write policy; nothing written this cycle"
+            );
+        })
+}

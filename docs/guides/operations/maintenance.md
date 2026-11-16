@@ -254,6 +254,25 @@ HEAD. The report's `frontier_hours_reconciled` line counts those hours.
 Without a window, a tenant whose record sets none gets no frontier reconcile.
 The flag takes a humantime duration and refuses `0`.
 
+### The fold under the format write policy
+
+On a keyed bucket (`--tenant-hash-key-file`), the server's scheduled and
+on-demand folds follow the `sys/compat` write policy. Before a fold reads or writes anything, it checks every catalog
+family it writes: `catalog-head`, `csnap`, `npost`, `cstat` and `kidx`. Each
+must be active at the highest version this build writes for it. A HEAD or a
+metrics key-index leaf whose content needs less still carries the lower
+version. The cycle is refused and writes nothing when one of these holds:
+
+- the record names a version this build does not write
+- the process last read `sys/compat` 10 minutes ago or more
+- the record is missing after an activation
+
+The refusal is logged with the family and counted in
+`ravel_compat_publish_refused_total{family}`. Queries keep resolving through
+the commit-record listing until a build that writes the active version folds.
+`ravel-cli catalog fold` installs no policy and writes what this build
+writes.
+
 ### Routine verification
 
 ```sh
