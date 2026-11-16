@@ -28,10 +28,14 @@ check() {
     cid=$(docker create "$image")
     docker cp "$cid:/symbols/$bin" "$dir/$bin" > /dev/null
     docker rm "$cid" > /dev/null
-    if ! nm "$dir/$bin" | grep -q ' T antithesis_load_libvoidstar$'; then
+    # Written to files first: `grep -q` closing a pipe early would make nm or
+    # readelf die of SIGPIPE, which pipefail reports as a failed check.
+    nm "$dir/$bin" > "$dir/nm.txt" || { echo "FAIL $image: nm failed"; return 1; }
+    readelf -S "$dir/$bin" > "$dir/sections.txt" || { echo "FAIL $image: readelf failed"; return 1; }
+    if ! grep -q ' T antithesis_load_libvoidstar$' "$dir/nm.txt"; then
         echo "FAIL $image: antithesis_load_libvoidstar is not a text symbol of /symbols/$bin"; return 1
     fi
-    if ! readelf -S "$dir/$bin" | grep -q __sancov_guards; then
+    if ! grep -q __sancov_guards "$dir/sections.txt"; then
         echo "FAIL $image: /symbols/$bin has no __sancov_guards section"; return 1
     fi
     echo "ok $image: /symbols/$bin links the shim and carries sancov sections"
