@@ -545,12 +545,10 @@ impl CompatRun {
         )
     }
 
-    /// Run before every PUT attempt of a data object or record, retries
-    /// included: refuse when the view is at or past the horizon and the view
-    /// has seen a record or the bucket is fenced (its recorded epoch, or the
-    /// fence this run owes), then raise the bucket's fence if this run owes
-    /// one and has not raised it yet.
-    pub(crate) async fn before_put(&self, store: &dyn ObjectStoreBackend) -> Result<()> {
+    /// Refuse, counted, when the view is at or past the horizon and has seen
+    /// a record or the bucket is fenced (its recorded epoch, or the fence this
+    /// run owes). Returns the instant checked.
+    pub(crate) fn check_fresh(&self) -> Result<i64> {
         let policy = &self.inner.policy;
         let now = policy.now_unix_ns();
         let bucket_compat_epoch = self
@@ -564,6 +562,16 @@ impl CompatRun {
             .view
             .check_fresh(now, bucket_compat_epoch)
             .map_err(|refusal| self.refuse(CompatRunRefusal::Compat(refusal)))?;
+        Ok(now)
+    }
+
+    /// Run before every PUT attempt of a data object or record, retries
+    /// included: refuse when the view is at or past the horizon and the view
+    /// has seen a record or the bucket is fenced (its recorded epoch, or the
+    /// fence this run owes), then raise the bucket's fence if this run owes
+    /// one and has not raised it yet.
+    pub(crate) async fn before_put(&self, store: &dyn ObjectStoreBackend) -> Result<()> {
+        let now = self.check_fresh()?;
         let Some(fence) = self.inner.fence.as_ref() else {
             return Ok(());
         };
@@ -710,23 +718,11 @@ pub(crate) async fn begin_bucket_run_with_ceilings(
         .map(Some)
 }
 
-/// [`begin_bucket_run`] for a writer of `bucket`'s part family alone.
-pub(crate) async fn begin_part_run(
-    store: &dyn ObjectStoreBackend,
-    config: &CompactorConfig,
-    bucket: &Bucket,
-    run: &'static str,
-) -> Result<Option<CompatRun>> {
-    match part_family(bucket.signal) {
-        Some(family) => begin_bucket_run(store, config, bucket, run, &[family]).await,
-        None => Ok(None),
-    }
-}
-
-/// [`begin_part_run`] for a run that also publishes a compaction record, the
-/// shape compaction and migrate use: `compaction-record` is a ceiling, since
-/// the record is written at the version its content needs (version 1 for
-/// these runs), never above the active one.
+/// [`begin_bucket_run`] for a run that writes the bucket's part family and
+/// publishes a compaction record, the shape compaction, migrate and
+/// `rewrite_and_publish` use: `compaction-record` is a ceiling, since the
+/// record is written at the version its content needs (version 1 for these
+/// runs), never above the active one.
 pub(crate) async fn begin_compaction_run(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
@@ -1343,11 +1339,12 @@ mod tests {
         };
         let (tenant_hash, signal) = bucket_id();
 
-        let same = begin_part_run(
+        let same = begin_bucket_run(
             store.as_ref(),
             &config,
             &Bucket::new(tenant_hash, signal, 0, 1),
             "compaction",
+            &[FAMILY_RSEG],
         )
         .await
         .expect("same bucket");
@@ -1355,11 +1352,12 @@ mod tests {
             same.and_then(|run| run.version(FAMILY_RSEG)),
             Some(u16::try_from(rseg).expect("u16"))
         );
-        let err = begin_part_run(
+        let err = begin_bucket_run(
             store.as_ref(),
             &config,
             &Bucket::new(TenantHash([4; 16]), signal, 0, 1),
             "compaction",
+            &[FAMILY_RSEG],
         )
         .await
         .expect_err("another bucket");

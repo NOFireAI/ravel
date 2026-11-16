@@ -147,22 +147,22 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
         .request_ledger
         .as_ref()
         .and_then(|l| l.reset_for_run_unless_open().then(|| l.run_scope_guard()));
-    // ADR-4233 decision 3 fixes the part version, then ADR-1746 decision 4
-    // checks it against the floor, both before the inputs are read and every
-    // PUT.
-    let checked = match crate::compat_policy::begin_part_run(store, config, bucket, "rewrite").await
-    {
-        Ok(compat_run) => crate::format_floor::check_output_floor(
-            store,
-            config,
-            bucket,
-            "rewrite",
-            compat_run.as_ref().or(config.compat_run.as_ref()),
-        )
-        .await
-        .map(|()| compat_run),
-        Err(err) => Err(err),
-    };
+    // ADR-4233 decision 3 fixes the part version and bounds the compaction
+    // record's, then ADR-1746 decision 4 checks the part version against the
+    // floor, both before the inputs are read and every PUT.
+    let checked =
+        match crate::compat_policy::begin_compaction_run(store, config, bucket, "rewrite").await {
+            Ok(compat_run) => crate::format_floor::check_output_floor(
+                store,
+                config,
+                bucket,
+                "rewrite",
+                compat_run.as_ref().or(config.compat_run.as_ref()),
+            )
+            .await
+            .map(|()| compat_run),
+            Err(err) => Err(err),
+        };
     let outcome = match checked {
         Ok(compat_run) => load_then_rewrite::<C>(
             store,
@@ -925,13 +925,17 @@ async fn migrate_bucket_format_scoped(
     )
     .await
     {
-        // Refused before the merge, so nothing was built: release the claim
-        // now rather than hold the bucket's compaction off for the lease.
+        // Refused an input, or failed to decode one, so no record was
+        // published: release the claim now rather than hold the bucket's
+        // compaction off for the lease.
         Err(
             err @ (MaintainError::UnwritableInput { .. }
             | MaintainError::InputOutOfWindow { .. }
             | MaintainError::NewerThanWritable { .. }
-            | MaintainError::UnknownSectionKinds { .. }),
+            | MaintainError::UnknownSectionKinds { .. }
+            | MaintainError::Segment(_)
+            | MaintainError::LogSeg(_)
+            | MaintainError::SpanSeg(_)),
         ) => {
             if let Some(guard) = guard
                 && guard.cancelled_at().await.is_none()
@@ -943,7 +947,7 @@ async fn migrate_bucket_format_scoped(
                     ingest_hour_bucket = bucket.ingest_hour_bucket,
                     work_id = %guard.work_id_hex(),
                     error = %claim_err,
-                    "migration refused an input before the merge, and marking its claim \
+                    "migration refused or failed to decode an input, and marking its claim \
                      completed failed; the claim ages out under its lease (ADR-1029)"
                 );
             }
@@ -1214,6 +1218,19 @@ pub async fn reencode_compaction_parts(
     config: &CompactorConfig,
     bucket: &Bucket,
 ) -> Result<ReencodeOutcome> {
+    reencode_compaction_parts_toward(store, clock, config, bucket, None).await
+}
+
+/// [`reencode_compaction_parts`] for a `migrate` walk raising the family to
+/// `target_version`: under a policy, the bucket's run is refused before its
+/// claim unless `target_version` is still the family's active write version.
+pub(crate) async fn reencode_compaction_parts_toward(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    target_version: Option<u32>,
+) -> Result<ReencodeOutcome> {
     if !config.reencode_writer_enabled {
         return Ok(ReencodeOutcome::WriterDisabled);
     }
@@ -1221,7 +1238,8 @@ pub async fn reencode_compaction_parts(
         l.reset_for_run();
         l.run_scope_guard()
     });
-    let outcome = reencode_compaction_parts_scoped(store, clock, config, bucket).await;
+    let outcome =
+        reencode_compaction_parts_scoped(store, clock, config, bucket, target_version).await;
     emit_request_report(config, bucket, outcome.is_ok());
     if let Some(scope) = scope {
         scope.close();
@@ -1232,11 +1250,15 @@ pub async fn reencode_compaction_parts(
 /// Start a force 2 re-encode's compat run (ADR-4233 decision 3) over the
 /// bucket's part family and `compaction-record`. The run writes a version 2
 /// compaction record, so it is refused unless `compaction-record` is active at
-/// 2. With no policy installed nothing is checked, as before.
+/// 2. An outer run that took `compaction-record` as a ceiling answers with its
+/// ceiling. The view must be fresh, and a `target_version` other than the part
+/// family's active write version is refused. With no policy installed nothing
+/// is checked, as before.
 async fn reencode_compat_run(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
     bucket: &Bucket,
+    target_version: Option<u32>,
 ) -> Result<Option<crate::compat_policy::CompatRun>> {
     let Some(part) = crate::compat_policy::part_family(bucket.signal) else {
         return Ok(None);
@@ -1251,7 +1273,29 @@ async fn reencode_compat_run(
     )
     .await?;
     if let Some(run) = run.as_ref() {
-        let active = run.version(record_family).unwrap_or_default();
+        run.check_fresh()?;
+        let active = run
+            .version(record_family)
+            .or_else(|| run.ceiling(record_family))
+            .ok_or_else(|| {
+                MaintainError::Invariant(format!(
+                    "the re-encode's compat run did not check {record_family}"
+                ))
+            })?;
+        if let Some(target) = target_version {
+            let part_active = run.version(part).ok_or_else(|| {
+                MaintainError::Invariant(format!("the re-encode's compat run did not check {part}"))
+            })?;
+            if u32::from(part_active) != target {
+                return Err(run.refuse_with(
+                    part,
+                    crate::compat_policy::CompatRunRefusal::TargetNotActive {
+                        target,
+                        active: part_active,
+                    },
+                ));
+            }
+        }
         let superseding = ravel_commit::record::COMPACTION_SUPERSEDING_FORMAT_VERSION;
         if u32::from(active) != superseding {
             return Err(run.refuse_with(
@@ -1270,9 +1314,10 @@ async fn reencode_compaction_parts_scoped(
     clock: &dyn Clock,
     config: &CompactorConfig,
     bucket: &Bucket,
+    target: Option<u32>,
 ) -> Result<ReencodeOutcome> {
     crate::rlog::check_rlog_writer_config(config, bucket)?;
-    let compat_run = reencode_compat_run(store, config, bucket).await?;
+    let compat_run = reencode_compat_run(store, config, bucket, target).await?;
     let target_version = match compat_run.as_ref().and_then(|run| {
         crate::compat_policy::part_family(bucket.signal).and_then(|family| run.version(family))
     }) {
@@ -1859,6 +1904,8 @@ mod tests {
     //! nothing), the crash-and-rerun convergence at the content-addressed key,
     //! and proof the conservation predicate is genuinely pluggable rather than
     //! silently exact.
+
+    use std::sync::Arc;
 
     use bytes::Bytes;
     use ravel_commit::record::{self, NewCommitRecord};
@@ -2656,5 +2703,249 @@ mod tests {
         .await
         .expect("drop-aware predicate must accept the reduced count");
         assert_eq!(outcome, PublishOutcome::Published);
+    }
+
+    /// Every object in the store with its bytes' hash, for before/after
+    /// comparisons around a refused run.
+    async fn store_snapshot(store: &dyn ObjectStoreBackend) -> Vec<(String, [u8; 32])> {
+        let mut out = Vec::new();
+        for meta in list_all(store, "").await.expect("list") {
+            let got = store.get(&meta.key, GetRange::Full).await.expect("get");
+            out.push((meta.key, *blake3::hash(&got.data).as_bytes()));
+        }
+        out
+    }
+
+    async fn provisioned_compat_epoch(store: &dyn ObjectStoreBackend) -> u64 {
+        use prost::Message;
+        let key = ravel_catalog::provisioning_key(&tenant_hash(), Signal::Metrics);
+        let got = store.get(&key, GetRange::Full).await.expect("provisioning");
+        ravel_proto::sys::v1::ProvisioningRecord::decode(got.data.as_ref())
+            .expect("decode provisioning")
+            .compat_epoch
+    }
+
+    fn compat_refused(err: &MaintainError) -> (&str, &crate::compat_policy::CompatRunRefusal) {
+        match err {
+            MaintainError::CompatRefused {
+                family, refusal, ..
+            } => (family.as_str(), refusal),
+            other => panic!("expected a compat refusal, got {other:?}"),
+        }
+    }
+
+    /// A rewrite driven directly through `rewrite_and_publish` bounds its
+    /// compaction record by `compaction-record`: an active version this build
+    /// cannot write refuses it before its inputs are read and every PUT,
+    /// counted under `compaction-record`.
+    #[tokio::test]
+    async fn a_direct_rewrite_refuses_an_unwritable_compaction_record_version() {
+        use crate::compat_policy::CompatRunRefusal;
+        use crate::compat_policy::test_support::{ManualClock, T0, family, policy, write_compat};
+        use ravel_catalog::compat::{CompatRefusal, FAMILY_COMPACTION_RECORD, FAMILY_RSEG};
+
+        let store = Arc::new(MemoryStore::new());
+        seed(store.as_ref(), 1, vec![series("alpha", &[(10, 1.0)])]).await;
+        seed(store.as_ref(), 2, vec![series("beta", &[(20, 2.0)])]).await;
+        write_compat(
+            store.as_ref(),
+            vec![
+                family(FAMILY_RSEG, u32::from(VERSION_V7)),
+                family(FAMILY_COMPACTION_RECORD, 9),
+            ],
+            NS_PER_HOUR,
+        )
+        .await;
+        let config = CompactorConfig {
+            compat_policy: Some(policy(store.clone(), ManualClock::at(T0)).await),
+            ..CompactorConfig::default()
+        };
+        let listing = list_bucket(store.as_ref(), &bucket()).await.expect("list");
+        let before = store_snapshot(store.as_ref()).await;
+        let refused = || {
+            crate::compat_publish_refused_total(
+                FAMILY_COMPACTION_RECORD,
+                "active_version_not_writable",
+            )
+        };
+        let before_count = refused();
+
+        let err = rewrite_and_publish::<RsegCodec>(
+            store.as_ref(),
+            &FixedClock::new(sealed_now_ns()),
+            &config,
+            &bucket(),
+            &listing.commit_keys,
+            conserve_exact(),
+            sealed_now_ns(),
+        )
+        .await
+        .expect_err("refused");
+
+        let (got_family, refusal) = compat_refused(&err);
+        assert_eq!(got_family, FAMILY_COMPACTION_RECORD);
+        assert!(
+            matches!(
+                refusal,
+                CompatRunRefusal::Compat(CompatRefusal::ActiveVersionNotWritable { active: 9, .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            store_snapshot(store.as_ref()).await,
+            before,
+            "nothing is written"
+        );
+        assert_eq!(refused(), before_count + 1);
+    }
+
+    /// `compaction-record` is a ceiling on a direct rewrite, not a family it
+    /// writes: under an activation to 2 the rewrite still publishes a version
+    /// 1 record and owes the bucket no fence.
+    #[tokio::test]
+    async fn a_direct_rewrite_under_compaction_record_2_writes_version_1_unfenced() {
+        use crate::compat_policy::test_support::{
+            ManualClock, T0, activate, family, policy, write_compat,
+        };
+        use ravel_catalog::compat::{FAMILY_COMPACTION_RECORD, FAMILY_RSEG};
+
+        let store = Arc::new(MemoryStore::new());
+        seed(store.as_ref(), 1, vec![series("alpha", &[(10, 1.0)])]).await;
+        seed(store.as_ref(), 2, vec![series("beta", &[(20, 2.0)])]).await;
+        write_compat(
+            store.as_ref(),
+            vec![
+                family(FAMILY_RSEG, u32::from(VERSION_V7)),
+                family(FAMILY_COMPACTION_RECORD, 1),
+            ],
+            NS_PER_HOUR,
+        )
+        .await;
+        ravel_catalog::validate_or_adopt(
+            store.as_ref(),
+            &tenant_hash(),
+            Signal::Metrics,
+            8,
+            0,
+            ravel_catalog::AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("provision");
+        activate(store.as_ref(), FAMILY_COMPACTION_RECORD, 2).await;
+        let config = CompactorConfig {
+            compat_policy: Some(policy(store.clone(), ManualClock::at(T0)).await),
+            ..CompactorConfig::default()
+        };
+        let listing = list_bucket(store.as_ref(), &bucket()).await.expect("list");
+
+        let outcome = rewrite_and_publish::<RsegCodec>(
+            store.as_ref(),
+            &FixedClock::new(sealed_now_ns()),
+            &config,
+            &bucket(),
+            &listing.commit_keys,
+            conserve_exact(),
+            sealed_now_ns(),
+        )
+        .await
+        .expect("rewrites");
+
+        assert_eq!(outcome.publish, PublishOutcome::Published);
+        let written = read_record(store.as_ref()).await.expect("a record");
+        assert_eq!(written.format_version, record::COMPACTION_FORMAT_VERSION);
+        assert_eq!(
+            provisioned_compat_epoch(store.as_ref()).await,
+            0,
+            "no fence"
+        );
+    }
+
+    /// An outer run of `rseg` with `compaction-record` as a ceiling, started
+    /// for [`bucket`] under `compaction-record` active at 2.
+    async fn ceiling_outer_run(
+        store: Arc<MemoryStore>,
+        clock: Arc<crate::compat_policy::test_support::ManualClock>,
+    ) -> CompactorConfig {
+        use crate::compat_policy::test_support::{family, policy, write_compat};
+        use ravel_catalog::compat::{FAMILY_COMPACTION_RECORD, FAMILY_RSEG};
+
+        write_compat(
+            store.as_ref(),
+            vec![
+                family(FAMILY_RSEG, u32::from(VERSION_V7)),
+                family(FAMILY_COMPACTION_RECORD, 2),
+            ],
+            NS_PER_HOUR,
+        )
+        .await;
+        let policy = policy(store, clock).await;
+        let outer = policy
+            .begin_with_ceilings(
+                "maintain",
+                &[FAMILY_RSEG],
+                &[FAMILY_COMPACTION_RECORD],
+                Some((tenant_hash(), Signal::Metrics)),
+                None,
+                NS_PER_HOUR,
+            )
+            .expect("outer run");
+        assert_eq!(outer.version(FAMILY_COMPACTION_RECORD), None);
+        assert_eq!(outer.ceiling(FAMILY_COMPACTION_RECORD), Some(2));
+        CompactorConfig {
+            compat_policy: Some(policy),
+            compat_run: Some(outer),
+            reencode_writer_enabled: true,
+            ..CompactorConfig::default()
+        }
+    }
+
+    /// A re-encode under an outer run that took `compaction-record` as a
+    /// ceiling answers with the ceiling: active at 2, the run proceeds.
+    #[tokio::test]
+    async fn a_reencode_under_a_ceiling_only_outer_run_reads_the_ceiling() {
+        use crate::compat_policy::test_support::{ManualClock, T0};
+        use ravel_catalog::compat::FAMILY_RSEG;
+
+        let store = Arc::new(MemoryStore::new());
+        let config = ceiling_outer_run(store.clone(), ManualClock::at(T0)).await;
+
+        let run = reencode_compat_run(store.as_ref(), &config, &bucket(), None)
+            .await
+            .expect("the ceiling is active at 2")
+            .expect("a run");
+
+        assert_eq!(run.version(FAMILY_RSEG), Some(VERSION_V7));
+    }
+
+    /// A re-encode reusing an outer run checks the view's freshness before
+    /// its listing and claim: with the compat clock at the horizon it is
+    /// refused, counted, under the part family.
+    #[tokio::test]
+    async fn a_reencode_under_an_outer_run_refuses_a_stale_view() {
+        use crate::compat_policy::CompatRunRefusal;
+        use crate::compat_policy::test_support::{ManualClock, T0};
+        use ravel_catalog::compat::{COMPAT_VIEW_HORIZON_NS, CompatRefusal, FAMILY_RSEG};
+
+        let store = Arc::new(MemoryStore::new());
+        let clock = ManualClock::at(T0);
+        let config = ceiling_outer_run(store.clone(), clock.clone()).await;
+        clock.advance(COMPAT_VIEW_HORIZON_NS);
+        let refused = || crate::compat_publish_refused_total(FAMILY_RSEG, "view_stale");
+        let before_count = refused();
+
+        let err = reencode_compat_run(store.as_ref(), &config, &bucket(), None)
+            .await
+            .expect_err("stale");
+
+        let (got_family, refusal) = compat_refused(&err);
+        assert_eq!(got_family, FAMILY_RSEG);
+        assert_eq!(
+            refusal,
+            &CompatRunRefusal::Compat(CompatRefusal::ViewStale {
+                last_read_unix_ns: Some(T0),
+                now_unix_ns: T0 + COMPAT_VIEW_HORIZON_NS,
+            })
+        );
+        assert_eq!(refused(), before_count + 1);
     }
 }
