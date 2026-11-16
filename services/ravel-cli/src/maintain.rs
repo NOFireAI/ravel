@@ -748,11 +748,19 @@ pub async fn compact_to(
             out,
             "outcome: BelowMinInputs (only {count} L0 record(s); nothing to do)"
         )?,
-        CompactionOutcome::HeldOutOfWindow { version } => writeln!(
-            out,
-            "outcome: HeldOutOfWindow (an input is format version {version}, outside \
-             this build's reader window; held until a build that reads it runs)"
-        )?,
+        CompactionOutcome::HeldOutOfWindow { version, section } => match section {
+            Some(section) => writeln!(
+                out,
+                "outcome: HeldOutOfWindow (an input's {section} section is version \
+                 {version}, outside this build's reader window; held until a build \
+                 that reads it runs)"
+            )?,
+            None => writeln!(
+                out,
+                "outcome: HeldOutOfWindow (an input is format version {version}, outside \
+                 this build's reader window; held until a build that reads it runs)"
+            )?,
+        },
         CompactionOutcome::HeldUnknownSection { version, kinds } => writeln!(
             out,
             "outcome: HeldUnknownSection (an input at format version {version} carries \
@@ -1463,12 +1471,19 @@ fn emit_bucket_outcome(
             report.rewrite_present += 1;
             writeln!(out, "shard={shard} hour={hour} outcome=RewritePresent")?;
         }
-        Ok(CompactionOutcome::HeldOutOfWindow { version }) => {
+        Ok(CompactionOutcome::HeldOutOfWindow { version, section }) => {
             report.held_out_of_window += 1;
-            writeln!(
-                out,
-                "shard={shard} hour={hour} outcome=HeldOutOfWindow version={version}"
-            )?;
+            match section {
+                Some(section) => writeln!(
+                    out,
+                    "shard={shard} hour={hour} outcome=HeldOutOfWindow \
+                     section={section} section_version={version}"
+                )?,
+                None => writeln!(
+                    out,
+                    "shard={shard} hour={hour} outcome=HeldOutOfWindow version={version}"
+                )?,
+            }
         }
         Ok(CompactionOutcome::HeldUnknownSection { version, kinds }) => {
             report.held_out_of_window += 1;
@@ -2893,6 +2908,12 @@ fn held_bucket_report(held: &[MigrateHeldBucket]) -> String {
             MigrateHoldReason::InputOutOfWindow {
                 object_key,
                 version,
+                section: Some(section),
+            } => format!("object_key={object_key:?} section={section} section_version={version}"),
+            MigrateHoldReason::InputOutOfWindow {
+                object_key,
+                version,
+                section: None,
             } => format!("object_key={object_key:?} version={version}"),
             MigrateHoldReason::NewerThanWritable {
                 commit_key,
@@ -3780,6 +3801,7 @@ mod tests {
                 reason: MigrateHoldReason::InputOutOfWindow {
                     object_key: "t/a/d/0.rseg".to_string(),
                     version: 3,
+                    section: None,
                 },
             },
             MigrateHeldBucket {
@@ -3806,6 +3828,18 @@ mod tests {
                     kinds: vec![0x7f, 0x80],
                 },
             },
+            // ADR-4233 hazard H5: an unreadable RLOG section version prints the
+            // section name and its version, not a bare trailer version (#4304
+            // item 4).
+            MigrateHeldBucket {
+                shard: 4,
+                ingest_hour: 104,
+                reason: MigrateHoldReason::InputOutOfWindow {
+                    object_key: "t/a/d/4.rlog".to_string(),
+                    version: 2,
+                    section: Some("POSTINGS"),
+                },
+            },
         ];
         assert_eq!(
             held_bucket_report(&held),
@@ -3815,7 +3849,9 @@ mod tests {
              version=9\n\
              held: shard 2 hour 102 reason=corrupt_input detail=\"bad magic\"\n\
              held: shard 3 hour 103 reason=unknown_section object_key=\"t/a/d/3.rseg\" \
-             version=7 unknown_section_kinds=[127, 128]\n"
+             version=7 unknown_section_kinds=[127, 128]\n\
+             held: shard 4 hour 104 reason=input_out_of_window object_key=\"t/a/d/4.rlog\" \
+             section=POSTINGS section_version=2\n"
         );
         assert_eq!(held_bucket_report(&[]), "");
     }

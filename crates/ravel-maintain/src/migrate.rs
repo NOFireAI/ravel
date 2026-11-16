@@ -353,8 +353,16 @@ pub struct MigrateHeldBucket {
 /// Why the walk held a [`MigrateHeldBucket`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrateHoldReason {
-    /// The input's trailer version is outside this build's reader window.
-    InputOutOfWindow { object_key: String, version: u16 },
+    /// The input's trailer version is outside this build's reader window, or an
+    /// RLOG section version this build cannot read (ADR-4233 hazard H5). For
+    /// the section case `section` is the section name and `version` is that
+    /// section's version; otherwise `section` is `None` and `version` is the
+    /// trailer format version.
+    InputOutOfWindow {
+        object_key: String,
+        version: u16,
+        section: Option<&'static str>,
+    },
     /// The input's commit record is stamped at a format version above the one
     /// this build writes, or, on the re-encode path, the bucket's compaction
     /// record (named by `commit_key`) names a part stamped above it.
@@ -389,10 +397,12 @@ impl MigrateHoldReason {
             MaintainError::InputOutOfWindow {
                 object_key,
                 version,
+                section,
                 ..
             } => Some(MigrateHoldReason::InputOutOfWindow {
                 object_key: object_key.clone(),
                 version: *version,
+                section: *section,
             }),
             MaintainError::NewerThanWritable {
                 commit_key,
@@ -411,7 +421,10 @@ impl MigrateHoldReason {
                 version: *recorded_version,
                 kinds: kinds.clone(),
             }),
-            MaintainError::Segment(_) | MaintainError::LogSeg(_) | MaintainError::SpanSeg(_) => {
+            MaintainError::Segment(_)
+            | MaintainError::LogSeg(_)
+            | MaintainError::SpanSeg(_)
+            | MaintainError::PartContentHashMismatch { .. } => {
                 Some(MigrateHoldReason::CorruptInput {
                     detail: err.to_string(),
                 })
@@ -427,6 +440,16 @@ impl std::fmt::Display for MigrateHoldReason {
             MigrateHoldReason::InputOutOfWindow {
                 object_key,
                 version,
+                section: Some(section),
+            } => write!(
+                f,
+                "{}: {object_key:?} has a {section} section at version {version}, outside this build's reader window",
+                self.name()
+            ),
+            MigrateHoldReason::InputOutOfWindow {
+                object_key,
+                version,
+                section: None,
             } => write!(
                 f,
                 "{}: {object_key:?} is at format version {version}, outside this build's reader window",
@@ -2047,7 +2070,15 @@ pub async fn migrate_family(
                                     ingest_hour: hour,
                                     reason,
                                 });
-                                spent += l0_below;
+                                // A held bucket does not charge the budget. The
+                                // cursor caps just before it, so charging its
+                                // records would let one held bucket with at
+                                // least `max_records` below-target records
+                                // exhaust the budget on its own, persist the
+                                // capped cursor, and make the next run resume at
+                                // the same hold: later buckets would never
+                                // migrate under that budget. Nothing was
+                                // rewritten here, so there is no work to charge.
                                 None
                             }
                         };
@@ -5556,6 +5587,7 @@ mod tests {
                 reason: MigrateHoldReason::InputOutOfWindow {
                     object_key: held_key.clone(),
                     version,
+                    section: None,
                 },
             }]
         );
@@ -5583,10 +5615,10 @@ mod tests {
     /// (ADR-4233 decision 6): the hold must still be reported by the next run,
     /// which only happens if the cursor resumes at or before the held bucket.
     /// Four single-record buckets, the second (hour 101) out of window, walked
-    /// with a three-record budget so the walk holds 101, migrates 102, and the
-    /// budget then stops it past the hold. The persisted cursor is capped at
-    /// hour 100, just before the hold, so the resume re-examines 101 and reports
-    /// it again.
+    /// with a three-record budget. The hold does not charge the budget, so the
+    /// walk migrates the three readable buckets (100, 102, 103) and the budget
+    /// stops it after hour 103. The persisted cursor is capped at hour 100, just
+    /// before the hold, so the resume re-examines 101 and reports it again.
     ///
     /// Against the old cursor (persist the last examined bucket, hour 102) this
     /// fails at the `(0, 100)` assertion: hour 102 is past the held hour 101, so
@@ -5648,6 +5680,62 @@ mod tests {
             held.iter().map(|h| h.ingest_hour).collect::<Vec<_>>(),
             vec![101],
             "the resume re-examines and re-reports the held bucket: {held:?}"
+        );
+    }
+
+    /// A held bucket does not charge the budget, so a held bucket with at least
+    /// `max_records` below-target records does not stall the walk (ADR-4233
+    /// decision 6, #4304 item 1). Hour 100 is out of window and holds; hour 101
+    /// is migratable. Both carry one below-target record, walked with a
+    /// one-record budget: the held hour 100 alone would exhaust it if it charged.
+    /// The walk holds 100, goes on, and migrates 101 under the same budget.
+    ///
+    /// Two wrong implementations fail the `migrated 101` assertion:
+    /// - the status-quo bug, `spent += l0_below` in the held arm: hour 100's one
+    ///   record exhausts the budget, the walk breaks before hour 101, and hour
+    ///   101 never migrates;
+    /// - treating a hold as terminal (breaking the walk on a hold) stops at hour
+    ///   100 the same way, so hour 101 never migrates.
+    /// Both leave `compaction_record_count(101) == 0`.
+    #[tokio::test]
+    async fn a_held_bucket_that_exhausts_the_budget_does_not_stall_the_walk() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        let target = VERSION_V7 as u32;
+        let held_key = seed_at(&store, 0, 100, 1, "alpha", target - 1).await;
+        seed_at(&store, 0, 101, 2, "beta", target - 1).await;
+        stamp_rseg_version(&store, &held_key, out_of_window_rseg_version()).await;
+
+        // Budget 1: the held hour 100's single record alone would exhaust it if
+        // a hold charged the budget. now_hour 102 seals both 100 and 101.
+        let err = run_migrate(&store, 102, target, MigrateBudget::records(1))
+            .await
+            .expect_err("the held bucket fails the run");
+        let MaintainError::MigrateHeld { held, report } = err else {
+            panic!("expected MigrateHeld");
+        };
+        assert_eq!(
+            held.iter().map(|h| h.ingest_hour).collect::<Vec<_>>(),
+            vec![100],
+            "hour 100 is held: {held:?}"
+        );
+        assert!(
+            report.budget_exhausted && !report.walk_complete,
+            "the budget stops the walk after migrating hour 101: {report:?}"
+        );
+        assert_eq!(
+            report.buckets_migrated, 1,
+            "the walk reached and migrated hour 101 past the hold: {report:?}"
+        );
+        assert_eq!(
+            compaction_record_count(&store, 0, 101).await,
+            1,
+            "the bucket after the held one migrated under the same budget"
+        );
+        assert_eq!(
+            compaction_record_count(&store, 0, 100).await,
+            0,
+            "the held bucket itself is not migrated"
         );
     }
 

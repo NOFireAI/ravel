@@ -1021,6 +1021,38 @@ pub(crate) async fn load_catalogs_by_key(
         .await
 }
 
+/// [`load_catalogs_by_key`] with each part's reader-window refusal wrapped as
+/// [`MaintainError::InputOutOfWindow`] carrying the part's content hash. A
+/// re-encode holds an out-of-window RLOG part (an unreadable trailer version or
+/// an unreadable POSTINGS/KEY_IDX section version, ADR-4233 hazard H5) for a
+/// later build instead of treating it as corrupt, as RSEG re-encode does
+/// ([`crate::rewrite::reencode_rseg_part`]) and the L0 path does
+/// ([`load_catalog_from_object`] through
+/// `crate::rewrite::load_input_catalog_noting_version`). `parts` pairs each
+/// object key with the content hash its compaction record holds.
+pub(crate) async fn load_catalogs_by_key_noting_version(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    parts: &[(String, Vec<u8>)],
+    recover_indexed_fields: bool,
+) -> Result<Vec<RlogInputCatalog>> {
+    let mut pending = Vec::with_capacity(parts.len());
+    for (object_key, content_hash) in parts {
+        pending.push(async move {
+            crate::rewrite::note_input_window(
+                load_catalog_from_object(store, config, object_key.clone(), recover_indexed_fields)
+                    .await,
+                object_key,
+                content_hash,
+            )
+        });
+    }
+    stream_iter(pending)
+        .buffered(config.input_read_concurrency.max(1))
+        .try_collect()
+        .await
+}
+
 /// The clustering one merge writes its output with and merges its inputs under
 /// (ADR-2135 decision 2), derived from the inputs' footers alone: compaction and
 /// the erasure rewrite read no tenant config.

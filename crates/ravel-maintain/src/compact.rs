@@ -54,11 +54,17 @@ pub enum CompactionOutcome {
     /// `count` is then the number of writable inputs left, 0 when none is.
     BelowMinInputs { count: usize },
     /// An input object carries a format version outside this build's reader
-    /// window, and its bytes match its commit record's content hash, so it is
-    /// intact data another build can read (ADR-2708 D5b). The bucket is left
+    /// window (or an RLOG section version this build cannot read, ADR-4233
+    /// hazard H5), and its bytes match its commit record's content hash, so it
+    /// is intact data another build can read (ADR-2708 D5b). The bucket is left
     /// as it is and retried on every pass; it is not done, so a cursored scan
-    /// does not advance past it.
-    HeldOutOfWindow { version: u16 },
+    /// does not advance past it. `version` is a section version when `section`
+    /// is `Some` (an RLOG section name), otherwise the object's trailer format
+    /// version.
+    HeldOutOfWindow {
+        version: u16,
+        section: Option<&'static str>,
+    },
     /// An input's directory names section kinds this build does not know, so
     /// re-encoding it would drop them (ADR-4233 hazard H6). `version` is the
     /// input's trailer version and `kinds` the unknown kinds. Nothing was
@@ -451,6 +457,7 @@ async fn hold_out_of_window_input(
     bucket: &Bucket,
     object_key: &str,
     version: u16,
+    section: Option<&'static str>,
     content_hash: &[u8],
     reader_error: MaintainError,
 ) -> Result<CompactionOutcome> {
@@ -478,10 +485,12 @@ async fn hold_out_of_window_input(
         ingest_hour_bucket = bucket.ingest_hour_bucket,
         object_key,
         version,
-        "compaction held a bucket: an input's format version is outside this build's reader \
-         window and its bytes match its content hash; later hours still compact (ADR-2708 D5b)"
+        section,
+        "compaction held a bucket: an input's format (or RLOG section) version is outside this \
+         build's reader window and its bytes match its content hash; later hours still compact \
+         (ADR-2708 D5b)"
     );
-    Ok(CompactionOutcome::HeldOutOfWindow { version })
+    Ok(CompactionOutcome::HeldOutOfWindow { version, section })
 }
 
 /// Hold a bucket whose input carries section kinds this build does not know
@@ -816,6 +825,7 @@ async fn compact_bucket_scoped(
         Err(MaintainError::InputOutOfWindow {
             object_key,
             version,
+            section,
             content_hash,
             source,
         }) => {
@@ -825,6 +835,7 @@ async fn compact_bucket_scoped(
                 bucket,
                 &object_key,
                 version,
+                section,
                 &content_hash,
                 *source,
             )

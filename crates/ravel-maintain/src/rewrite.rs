@@ -310,6 +310,31 @@ async fn load_then_rewrite<C: SegmentCodec>(
     .await
 }
 
+/// Wrap a loader result's reader-window refusal (an RSEG/RLOG/RSPAN trailer
+/// version, or an RLOG section version, ADR-4233 hazard H5) as
+/// [`MaintainError::InputOutOfWindow`], carrying `object_key` and
+/// `content_hash` so compaction can tell which object it was and check that
+/// object's content hash. Every other result is returned unchanged.
+pub(crate) fn note_input_window<T>(
+    result: Result<T>,
+    object_key: &str,
+    content_hash: &[u8],
+) -> Result<T> {
+    match result {
+        Err(err) => match err.unsupported_version() {
+            Some(window) => Err(MaintainError::InputOutOfWindow {
+                object_key: object_key.to_string(),
+                version: window.version,
+                section: window.section,
+                content_hash: content_hash.to_vec(),
+                source: Box::new(err),
+            }),
+            None => Err(err),
+        },
+        ok => ok,
+    }
+}
+
 /// [`SegmentCodec::load_input_catalog`], with a reader's refusal of the input's
 /// format version wrapped as [`MaintainError::InputOutOfWindow`] so compaction
 /// can tell which object it was and check that object's content hash.
@@ -318,18 +343,12 @@ async fn load_input_catalog_noting_version<C: SegmentCodec>(
     config: &CompactorConfig,
     input: &crate::read::InputRecord,
 ) -> Result<C::Catalog> {
-    match C::load_input_catalog(store, config, input).await {
-        Err(err) => match err.unsupported_version() {
-            Some(version) => Err(MaintainError::InputOutOfWindow {
-                object_key: keys::reconstruct_data_key(&input.record)?,
-                version,
-                content_hash: input.record.content_hash.clone(),
-                source: Box::new(err),
-            }),
-            None => Err(err),
-        },
-        ok => ok,
-    }
+    let object_key = keys::reconstruct_data_key(&input.record)?;
+    note_input_window(
+        C::load_input_catalog(store, config, input).await,
+        &object_key,
+        &input.record.content_hash,
+    )
 }
 
 /// A [`SegmentCodec::validate_rewrite_inputs`] refusal, checked against the
@@ -356,11 +375,13 @@ async fn refusal_noting_version<C: SegmentCodec>(
         Err(MaintainError::InputOutOfWindow {
             object_key,
             version,
+            section,
             content_hash,
             source: _,
         }) => MaintainError::InputOutOfWindow {
             object_key,
             version,
+            section,
             content_hash,
             source: Box::new(refusal),
         },
@@ -1424,6 +1445,7 @@ async fn reencode_compaction_parts_scoped(
             err @ (MaintainError::UnknownSectionKinds { .. }
             | MaintainError::InputOutOfWindow { .. }
             | MaintainError::NewerThanWritable { .. }
+            | MaintainError::PartContentHashMismatch { .. }
             | MaintainError::Segment(_)
             | MaintainError::LogSeg(_)
             | MaintainError::SpanSeg(_)),
@@ -1547,13 +1569,26 @@ async fn reencode_and_publish(
         .iter()
         .map(|p| keys::reconstruct_l1_part_key(predecessor, p))
         .collect::<std::result::Result<Vec<String>, _>>()?;
+    // Each part's key paired with the content hash its record holds, so the
+    // RLOG/RSPAN loaders below can wrap a reader-window refusal as
+    // `InputOutOfWindow` carrying both, as the RSEG path and the L0 path do.
+    let part_windows: Vec<(String, Vec<u8>)> = part_keys
+        .iter()
+        .cloned()
+        .zip(predecessor.parts.iter().map(|p| p.content_hash.clone()))
+        .collect();
     let parts = match bucket.signal {
         Signal::Metrics => {
             reencode_rseg_parts(store, config, bucket, predecessor, &part_keys, &hash).await?
         }
         Signal::Logs => {
-            let catalogs =
-                crate::rlog::load_catalogs_by_key(store, config, &part_keys, true).await?;
+            let catalogs = crate::rlog::load_catalogs_by_key_noting_version(
+                store,
+                config,
+                &part_windows,
+                true,
+            )
+            .await?;
             let mut indexed_fields: Vec<String> = catalogs
                 .iter()
                 .flat_map(|c| c.indexed_fields.iter().cloned())
@@ -1577,8 +1612,12 @@ async fn reencode_and_publish(
             .parts
         }
         Signal::Spans => {
-            let catalogs =
-                crate::rspan_codec::load_catalogs_by_key(store, config, &part_keys).await?;
+            let catalogs = crate::rspan_codec::load_catalogs_by_key_noting_version(
+                store,
+                config,
+                &part_windows,
+            )
+            .await?;
             crate::rspan_codec::merge(
                 store,
                 config,
@@ -1660,9 +1699,16 @@ async fn reencode_rseg_parts(
         note_get(ledger, RequestPhase::BlockRead, &got);
         let object = got?.data;
         if blake3::hash(&object).as_bytes().as_slice() != part.content_hash.as_slice() {
-            return Err(MaintainError::Invariant(format!(
-                "part {key} does not match its record's content hash"
-            )));
+            // The record names this part by a content-addressed key, so a
+            // hash mismatch is a corrupted or substituted object, not an
+            // invariant breach in this process. A typed corrupt-input error
+            // routes through [`crate::migrate::MigrateHoldReason::from_refusal`]
+            // to `corrupt_input` so the migrate walk holds this one bucket
+            // instead of aborting; `MaintainError::Invariant` mapped to `None`
+            // and failed the whole walk (ADR-4233 decision 6, #4304 item 3).
+            return Err(MaintainError::PartContentHashMismatch {
+                object_key: key.clone(),
+            });
         }
         let mut new_part = reencode_rseg_part(
             bucket,
@@ -1726,16 +1772,11 @@ fn reencode_rseg_part(
     let loc = match open_from_full(object, limits) {
         Ok(loc) => loc,
         Err(err) => {
-            let err = MaintainError::from(err);
-            return Err(match err.unsupported_version() {
-                Some(version) => MaintainError::InputOutOfWindow {
-                    object_key: object_key.to_string(),
-                    version,
-                    content_hash: part.content_hash.clone(),
-                    source: Box::new(err),
-                },
-                None => err,
-            });
+            return note_input_window::<BuiltPart>(
+                Err(MaintainError::from(err)),
+                object_key,
+                &part.content_hash,
+            );
         }
     };
     crate::compat_policy::refuse_unknown_sections(

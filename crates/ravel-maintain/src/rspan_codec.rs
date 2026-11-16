@@ -331,6 +331,33 @@ pub(crate) async fn load_catalogs_by_key(
         .await
 }
 
+/// [`load_catalogs_by_key`] with each part's reader-window refusal wrapped as
+/// [`MaintainError::InputOutOfWindow`] carrying the part's content hash, so a
+/// re-encode holds an out-of-window RSPAN part for a later build instead of
+/// treating it as corrupt, as the RSEG path and the L0 path do (ADR-4233
+/// decision 6, hazard H5). `parts` pairs each object key with the content hash
+/// its compaction record holds.
+pub(crate) async fn load_catalogs_by_key_noting_version(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    parts: &[(String, Vec<u8>)],
+) -> Result<Vec<SpanInputCatalog>> {
+    let mut pending = Vec::with_capacity(parts.len());
+    for (object_key, content_hash) in parts {
+        pending.push(async move {
+            crate::rewrite::note_input_window(
+                load_catalog_from_object(store, config, object_key.clone()).await,
+                object_key,
+                content_hash,
+            )
+        });
+    }
+    stream_iter(pending)
+        .buffered(config.input_read_concurrency.max(1))
+        .try_collect()
+        .await
+}
+
 /// What one run of [`merge`] produced: the parts, and the record counts the
 /// caller's conservation gates need.
 pub(crate) struct SpanMergeOutput {
