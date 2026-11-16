@@ -261,16 +261,17 @@ on-demand folds follow the `sys/compat` write policy. Before a fold cycle
 starts, it checks every catalog family it writes: `catalog-head`, `csnap`,
 `npost`, `cstat` and `kidx`. A family's active version is a ceiling. The
 check is made against the highest version this build's fold of the signal can
-write for the family (for `kidx` that is 3 on metrics and 2 on logs and
-spans), and a HEAD or a key-index leaf whose content needs less still carries
-the lower version. A store with no record folds as it did before the policy.
+write for the family (for `kidx` that is 2 on every signal), and a HEAD
+whose content needs less still carries the lower version. A store with no
+record folds as it did before the policy.
 The cycle is refused and writes nothing when one of these holds:
 
-- a family it writes is active below that highest version, so `kidx` active
-  at 2 refuses a metrics fold and lets logs and spans fold
+- a family it writes is active below that highest version
 - the record names a version this build does not read
-- a GET of `sys/compat` has returned an object and the process's last
-  successful read is 10 minutes old or more
+- the process's last successful read of `sys/compat` is 10 minutes old or
+  more, or no read has succeeded and the view is not blind: a GET of
+  `sys/compat` has returned an object, or the latest failed read was not an
+  `AccessDenied`
 - the record is missing after an activation
 
 The refusal is logged with the family and counted in
@@ -1424,8 +1425,11 @@ legal-hold writers. The run keeps those versions to its end, even if the family 
 activated again while it runs. A run is refused at its start when:
 
 - the process's last successful read of `sys/compat` is 10 minutes old or
-  older, and either a GET of `sys/compat` has returned an object or the
-  bucket's provisioning record carries a `compat_epoch` (`view_stale`);
+  older, or no read has succeeded, unless the view is blind and the
+  bucket's provisioning record carries no `compat_epoch` (`view_stale`).
+  The view is blind while no read has succeeded, no GET of `sys/compat` has
+  returned an object, and the latest failed read, if any, was an
+  `AccessDenied`;
 - `sys/compat` is missing while the bucket's provisioning record carries a
   fence (`compat_record_missing`);
 - a family's active version is one this build cannot write

@@ -163,8 +163,8 @@ pub enum FirstTouchError {
     Provisioning(#[from] ProvisioningError),
     /// The process's `sys/compat` view is stale, so the epoch a record
     /// created now must be born fenced at is unknown (ADR-4233 decision 4).
-    /// Nothing is read or written. Retryable: it clears on the next
-    /// successful refresh.
+    /// Raised only when the record is absent; nothing is written. Retryable:
+    /// it clears on the next successful refresh.
     #[error("first touch of {signal:?} refused, retry later: {refusal}")]
     CompatViewStale {
         signal: Signal,
@@ -246,8 +246,9 @@ impl ProvisioningRecordWriter {
     /// record at version 4 with the view's `compat_epoch` and
     /// `compat_fenced_unix_ns` 0 (ADR-4233 decision 4, conditional
     /// publication). Before any activation, and with `None`, a first touch
-    /// creates the version-3 record it always has. A first touch under a
-    /// stale view is refused, [`FirstTouchError::CompatViewStale`].
+    /// creates the version-3 record it always has. Under a stale view a
+    /// first touch that would create the record is refused,
+    /// [`FirstTouchError::CompatViewStale`]; one that finds it present is not.
     pub fn with_compat_view(mut self, view: Option<CompatView>) -> Self {
         self.compat = view;
         self
@@ -289,11 +290,12 @@ impl ProvisioningRecordWriter {
     /// once per failed check. A genuine success (created, adopted, or matched)
     /// is cached in `seen` and clears the backoff.
     ///
-    /// Before the record is read, a stale `sys/compat` view refuses the touch
-    /// with [`FirstTouchError::CompatViewStale`], counted in
-    /// `ravel_compat_publish_refused_total` under the signal's data family.
-    /// Nothing is cached and no backoff starts, so the next request checks
-    /// again.
+    /// Under a stale `sys/compat` view the record is read but never created:
+    /// a present record is validated and adopted as on a fresh view, and an
+    /// absent one is refused with [`FirstTouchError::CompatViewStale`],
+    /// counted in `ravel_compat_publish_refused_total` under the signal's data
+    /// family. The refusal caches nothing and starts no backoff, so the next
+    /// request checks again.
     pub async fn ensure(
         &self,
         tenant_hash: &TenantHash,
@@ -321,31 +323,41 @@ impl ProvisioningRecordWriter {
                 None => return Ok(()),
             }
         }
-        let born_fenced = self.born_fenced_epoch(now_ns).map_err(|refusal| {
-            if let Some(family) = first_touch_family(signal) {
-                crate::compat::record_publish_refusal(family, &refusal);
-            }
-            tracing::warn!(
-                %refusal,
-                tenant_hash = %tenant_hash.to_hex(),
-                signal = signal.key_prefix(),
-                "provisioning record first touch refused: the sys/compat view is stale, so \
-                 the epoch a new record is born fenced at is unknown; retried on the next request"
-            );
-            FirstTouchError::CompatViewStale { signal, refusal }
-        })?;
+        // A stale view leaves only the epoch of a record created now unknown,
+        // so it reads without creating: a present record is validated and
+        // adopted as on a fresh view, and an absent one is refused.
+        let (absent_policy, born_fenced, stale) = match self.born_fenced_epoch(now_ns) {
+            Ok(epoch) => (AbsentPolicy::CreateFromConfig, epoch, None),
+            Err(refusal) => (AbsentPolicy::CheckOnly, None, Some(refusal)),
+        };
         match validate_or_adopt_fenced(
             self.store.as_ref(),
             tenant_hash,
             signal,
             self.shard_count,
             now_ns,
-            AbsentPolicy::CreateFromConfig,
+            absent_policy,
             born_fenced,
         )
         .await
         {
-            Ok(_) => {
+            Ok(check) => {
+                if let Some(refusal) = stale
+                    && !matches!(check, ProvisioningCheck::RecordPresent { .. })
+                {
+                    if let Some(family) = first_touch_family(signal) {
+                        crate::compat::record_publish_refusal(family, &refusal);
+                    }
+                    tracing::warn!(
+                        %refusal,
+                        tenant_hash = %tenant_hash.to_hex(),
+                        signal = signal.key_prefix(),
+                        "provisioning record creation refused: the sys/compat view is stale, \
+                         so the epoch a new record is born fenced at is unknown; retried on \
+                         the next request"
+                    );
+                    return Err(FirstTouchError::CompatViewStale { signal, refusal });
+                }
                 self.seen.lock().insert(key);
                 self.read_backoff.lock().clear(&key);
                 self.hard_failures.lock().remove(&key);
@@ -391,8 +403,9 @@ impl ProvisioningRecordWriter {
 /// A no-op when `writer` is `None`. Returns the typed error on a hard
 /// provisioning failure (a `shard_count` mismatch or an unreadable record), so
 /// the handler fails that one request, and the retryable
-/// [`FirstTouchError::CompatViewStale`] when a stale `sys/compat` view leaves
-/// the fence epoch unknown; a store error is logged inside
+/// [`FirstTouchError::CompatViewStale`] when the record is absent and a stale
+/// `sys/compat` view leaves the epoch it would be born fenced at unknown; a
+/// store error is logged inside
 /// [`ProvisioningRecordWriter::ensure`] and reported as success here.
 pub async fn ensure_provisioning_record(
     writer: &Option<Arc<ProvisioningRecordWriter>>,
@@ -1423,5 +1436,91 @@ mod tests {
             spans_record(faulted.as_ref(), &th).await,
             Err(StoreError::NotFound)
         ));
+    }
+
+    /// A view that read an activation and then went a horizon without a read
+    /// leaves unknown only the epoch a record created now is born fenced at.
+    /// The first touch of a bucket whose record exists reads it, validates
+    /// it and caches it, as on a fresh view. The touch that would create a
+    /// record, for a fresh bucket or one holding pre-ADR data, is refused and
+    /// writes nothing.
+    #[tokio::test]
+    async fn a_stale_view_accepts_an_existing_record_and_refuses_a_new_one() {
+        use ravel_catalog::compat::{COMPAT_VIEW_HORIZON_NS, CompatKeys};
+        const T0: i64 = 1_700_000_000_000_000_000;
+        let store = store();
+        let keys = CompatKeys::from_file_keys(&[[0x21; 32]]).expect("key");
+        ravel_catalog::compat::create_compat(
+            store.as_ref(),
+            &keys,
+            sysproto::CompatRecord {
+                compat_epoch: 3,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create sys/compat");
+        let clock = Arc::new(SteppedCompatClock(std::sync::atomic::AtomicI64::new(T0)));
+        let view = CompatView::new(Arc::clone(&store), keys, clock);
+        view.refresh().await.expect("refresh at T0");
+        let stale_at = T0 + COMPAT_VIEW_HORIZON_NS;
+        assert!(view.check_fresh(stale_at, 0).is_err(), "the view is stale");
+
+        let existing = TenantId::new("stale-existing").hash();
+        seed_record(store.as_ref(), &existing, Signal::Spans, 4).await;
+        let fresh = TenantId::new("stale-fresh").hash();
+        let pre_adr = TenantId::new("stale-pre-adr").hash();
+        let hex = pre_adr.to_hex();
+        for key in [
+            format!("t/{hex}/m/l0/0000/100/seg"),
+            format!("t/{hex}/m/c/0000/100/rec.cmt"),
+        ] {
+            store
+                .put(&key, vec![1].into(), PutOptions::default())
+                .await
+                .expect("seed shard data");
+        }
+
+        let writer = ProvisioningRecordWriter::new(store.clone(), 4).with_compat_view(Some(view));
+        writer
+            .ensure(&existing, Signal::Spans, stale_at)
+            .await
+            .expect("an existing record is adopted under a stale view");
+        assert!(writer.seen.lock().contains(&(existing, Signal::Spans)));
+        let record = spans_record(store.as_ref(), &existing)
+            .await
+            .expect("record kept");
+        assert_eq!((record.format_version, record.compat_epoch), (1, 0));
+
+        for (th, signal) in [(fresh, Signal::Spans), (pre_adr, Signal::Metrics)] {
+            let err = writer
+                .ensure(&th, signal, stale_at)
+                .await
+                .expect_err("creating a record under a stale view is refused");
+            assert!(
+                matches!(
+                    &err,
+                    FirstTouchError::CompatViewStale {
+                        refusal: CompatRefusal::ViewStale {
+                            last_read_unix_ns: Some(T0),
+                            ..
+                        },
+                        ..
+                    }
+                ),
+                "{signal:?}: {err:?}"
+            );
+            assert!(
+                matches!(
+                    store
+                        .get(&provisioning_key(&th, signal), GetRange::Full)
+                        .await,
+                    Err(StoreError::NotFound)
+                ),
+                "{signal:?}: a refused creation writes no record"
+            );
+            assert!(!writer.seen.lock().contains(&(th, signal)));
+        }
+        assert!(writer.read_backoff.lock().is_empty());
     }
 }

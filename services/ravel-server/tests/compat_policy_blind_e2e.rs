@@ -84,7 +84,7 @@ async fn alert_commit_count(store: &dyn ObjectStoreBackend) -> usize {
 }
 
 /// Watch it fail: give `CompatView::check_fresh`'s blind exemption back to
-/// a view whose refresh failed with a 5xx (drop `!refresh_failed_not_denied`
+/// a view whose latest refresh failed with a 5xx (drop `!latest_failed_not_denied`
 /// from `blind`), and the remote write is accepted with a 204, a provisioning
 /// record is written, and the evaluator takes the lease; or drop
 /// `born_fenced_epoch`'s `check_fresh` call, and the write is accepted under
