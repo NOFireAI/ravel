@@ -90,10 +90,23 @@ pub enum SpanIngestRequestError {
     /// durable provisioning record (ADR-0050 section 5). Operator
     /// misconfiguration, not client fault; the request fails.
     Provisioning(String),
+    /// A first touch refused under a stale `sys/compat` view, as
+    /// [`crate::ingest::IngestRequestError::CompatRefused`].
+    CompatRefused(String),
     /// The tenant's IPCrypt rule set could not be resolved, as
     /// [`crate::ingest::IngestRequestError::IpcryptRules`].
     IpcryptRules,
     Write(SpanWriteError),
+}
+
+impl From<crate::provisioning::FirstTouchError> for SpanIngestRequestError {
+    fn from(err: crate::provisioning::FirstTouchError) -> Self {
+        if err.is_retryable() {
+            SpanIngestRequestError::CompatRefused(err.to_string())
+        } else {
+            SpanIngestRequestError::Provisioning(err.to_string())
+        }
+    }
 }
 
 impl std::fmt::Display for SpanIngestRequestError {
@@ -105,6 +118,7 @@ impl std::fmt::Display for SpanIngestRequestError {
                 "idempotency key is {len} bytes, exceeds the {MAX_IDEMPOTENCY_KEY_BYTES}-byte limit"
             ),
             SpanIngestRequestError::Provisioning(msg) => write!(f, "{msg}"),
+            SpanIngestRequestError::CompatRefused(msg) => write!(f, "{msg}"),
             SpanIngestRequestError::IpcryptRules => {
                 f.write_str(crate::ipcrypt::TENANT_RULES_UNAVAILABLE)
             }
@@ -126,6 +140,7 @@ impl SpanIngestRequestError {
             SpanIngestRequestError::ClockImplausible(_) => true,
             SpanIngestRequestError::InvalidIdempotencyKey { .. } => false,
             SpanIngestRequestError::Provisioning(_) => false,
+            SpanIngestRequestError::CompatRefused(_) => true,
             SpanIngestRequestError::IpcryptRules => false,
             SpanIngestRequestError::Write(err) => err.is_retryable(),
         }
@@ -205,8 +220,7 @@ pub async fn handle_export_traces_releasing(
         ravel_types::Signal::Spans,
         ingest_ts_ns,
     )
-    .await
-    .map_err(|e| SpanIngestRequestError::Provisioning(e.to_string()))?;
+    .await?;
     // One hour-bucket computation shared by the lookup and the marker write.
     let hour_bucket = request_ingest_hour_bucket(ingest_ts_ns);
     // One `ack_deadline` budget per keyed request, started before the lookup:
