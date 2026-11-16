@@ -34,6 +34,29 @@ class DecodeConcat(unittest.TestCase):
         self.assertIsNone(cli.decode_concat("  \n"))
 
 
+class ReadBodyArg(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.file = os.path.join(self.dir, "r.md")
+        pathlib.Path(self.file).write_text("Fixed in `abc`.\n")
+
+    def test_at_file_reads_the_file(self):
+        self.assertEqual(cli.read_body_arg("@" + self.file), "Fixed in `abc`.\n")
+
+    def test_a_bare_path_to_an_existing_file_is_refused(self):
+        for value in (self.file, self.file + "\n", "  " + self.file):
+            with self.assertRaises(cli.CliError, msg=value) as ctx:
+                cli.read_body_arg(value)
+            self.assertEqual(ctx.exception.code, 64)
+            self.assertIn("@" + self.file, str(ctx.exception))
+
+    def test_text_is_returned_unchanged(self):
+        missing = os.path.join(self.dir, "absent.md")
+        for value in ("Fixed.", missing, f"see {self.file}", f"{self.file}\nmore"):
+            self.assertEqual(cli.read_body_arg(value), value, msg=value)
+
+
 class CiCounts(unittest.TestCase):
     def test_each_bucket_and_the_failing_names(self):
         rollup = [
