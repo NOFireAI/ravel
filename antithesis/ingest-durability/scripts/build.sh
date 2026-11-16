@@ -14,12 +14,23 @@ WHAT="${1:-all}"
 SERVER="ravel-antithesis-server:$TAG"
 DRIVER="ravel-antithesis-driver:$TAG"
 
+# The commit the images are built from, stamped into each as a label that
+# launch.sh reads back, so a run records the source that is in its images.
+# A tree with modified tracked files is refused: its images would match no
+# commit. Untracked files (a CI job's downloaded tools) do not count.
+if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ]; then
+    echo "refused: the checkout at $ROOT has uncommitted changes to tracked files" >&2
+    exit 1
+fi
+REF=$(git -C "$ROOT" rev-parse HEAD)
+LABEL="org.ravel.antithesis.ref=$REF"
+
 if [ "$WHAT" = all ] || [ "$WHAT" = server ]; then
-    docker build --progress=plain -f "$WL/ravel/Dockerfile" \
+    docker build --progress=plain -f "$WL/ravel/Dockerfile" --label "$LABEL" \
         -t "$SERVER" -t "$REG/ravel-server:$TAG" "$ROOT"
 fi
 if [ "$WHAT" = all ] || [ "$WHAT" = driver ]; then
-    docker build --progress=plain -f "$WL/driver/Dockerfile" \
+    docker build --progress=plain -f "$WL/driver/Dockerfile" --label "$LABEL" \
         -t "$DRIVER" -t "$REG/driver:$TAG" "$WL"
 fi
 
