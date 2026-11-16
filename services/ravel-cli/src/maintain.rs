@@ -753,6 +753,12 @@ pub async fn compact_to(
             "outcome: HeldOutOfWindow (an input is format version {version}, outside \
              this build's reader window; held until a build that reads it runs)"
         )?,
+        CompactionOutcome::HeldUnknownSection { version, kinds } => writeln!(
+            out,
+            "outcome: HeldUnknownSection (an input at format version {version} carries \
+             section kinds {kinds:?} this build does not know; re-encoding it would drop \
+             them, so the bucket is held until a build that knows them runs)"
+        )?,
         CompactionOutcome::GeometryUnsupported {
             inputs,
             streams,
@@ -1462,6 +1468,14 @@ fn emit_bucket_outcome(
             writeln!(
                 out,
                 "shard={shard} hour={hour} outcome=HeldOutOfWindow version={version}"
+            )?;
+        }
+        Ok(CompactionOutcome::HeldUnknownSection { version, kinds }) => {
+            report.held_out_of_window += 1;
+            writeln!(
+                out,
+                "shard={shard} hour={hour} outcome=HeldUnknownSection version={version} \
+                 unknown_section_kinds={kinds:?}"
             )?;
         }
         Ok(CompactionOutcome::GeometryUnsupported {
@@ -2885,6 +2899,13 @@ fn held_bucket_report(held: &[MigrateHeldBucket]) -> String {
                 version,
             } => format!("record_key={commit_key:?} version={version}"),
             MigrateHoldReason::CorruptInput { detail } => format!("detail={detail:?}"),
+            MigrateHoldReason::UnknownSection {
+                object_key,
+                version,
+                kinds,
+            } => format!(
+                "object_key={object_key:?} version={version} unknown_section_kinds={kinds:?}"
+            ),
         };
         out.push_str(&format!(
             "held: shard {} hour {} reason={} {detail}\n",
@@ -3776,6 +3797,15 @@ mod tests {
                     detail: "bad magic".to_string(),
                 },
             },
+            MigrateHeldBucket {
+                shard: 3,
+                ingest_hour: 103,
+                reason: MigrateHoldReason::UnknownSection {
+                    object_key: "t/a/d/3.rseg".to_string(),
+                    version: 7,
+                    kinds: vec![0x7f, 0x80],
+                },
+            },
         ];
         assert_eq!(
             held_bucket_report(&held),
@@ -3783,7 +3813,9 @@ mod tests {
              version=3\n\
              held: shard 1 hour 101 reason=newer_than_writable record_key=\"t/a/c/1.cmt\" \
              version=9\n\
-             held: shard 2 hour 102 reason=corrupt_input detail=\"bad magic\"\n"
+             held: shard 2 hour 102 reason=corrupt_input detail=\"bad magic\"\n\
+             held: shard 3 hour 103 reason=unknown_section object_key=\"t/a/d/3.rseg\" \
+             version=7 unknown_section_kinds=[127, 128]\n"
         );
         assert_eq!(held_bucket_report(&[]), "");
     }

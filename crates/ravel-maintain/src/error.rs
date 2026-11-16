@@ -621,13 +621,24 @@ pub enum MaintainError {
     /// re-encoding it would drop them (ADR-4233 hazard H6). The bucket is
     /// held; nothing was written.
     #[error(
-        "input {object_key} (format version {recorded_version:?}) carries section kinds this \
+        "input {object_key} (format version {recorded_version}) carries section kinds this \
          build does not know ({kinds:?}); re-encoding it would drop them, so the bucket is held"
     )]
     UnknownSectionKinds {
         object_key: String,
         kinds: Vec<u32>,
-        recorded_version: Option<u32>,
+        /// The input's format version, from its trailer.
+        recorded_version: u16,
+    },
+    /// A compat run started for one bucket was offered to a run in another;
+    /// nothing was written under it.
+    #[error(
+        "maintenance {run} in bucket {bucket} was handed a compat run started for {run_bucket}"
+    )]
+    CompatRunBucketMismatch {
+        run: &'static str,
+        bucket: String,
+        run_bucket: String,
     },
     #[error(
         "tenant discovery found a prefix under t/ that is not a valid 32-hex-character tenant hash: {0:?} (ADR-0048 decision 3; storage's key-shape discipline never permits a silent skip here)"
@@ -695,15 +706,17 @@ impl MaintainError {
     /// ADR-3853). The same build refuses the unit again, and nothing was
     /// published for it, so a pass holds the bucket as refused and goes on to
     /// its other buckets instead of failing.
-    pub fn is_compat_refusal(&self) -> bool {
-        matches!(self, MaintainError::CompatRefused { .. })
-    }
-
     pub fn is_part_index_refusal(&self) -> bool {
         matches!(
             self,
             MaintainError::PartRangeWindow { .. } | MaintainError::PartKeySpace { .. }
         )
+    }
+
+    /// Whether the `sys/compat` write policy refused this run
+    /// ([`MaintainError::CompatRefused`]).
+    pub fn is_compat_refusal(&self) -> bool {
+        matches!(self, MaintainError::CompatRefused { .. })
     }
 
     /// Which part-index refusal this is, when [`Self::is_part_index_refusal`]

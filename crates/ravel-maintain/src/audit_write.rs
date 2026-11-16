@@ -151,7 +151,7 @@ fn note_put_retry(
 }
 
 /// One [`Signal::Audit`] record to encode and publish. The caller supplies the
-/// record-specific parts; [`write_audit_object`] owns the object/commit
+/// record-specific parts; [`write_audit_object_with_compat`] owns the object/commit
 /// mechanics common to every audit kind.
 pub(crate) struct AuditWrite {
     /// The [`Signal::Audit`] shard this record is written to. All audit kinds
@@ -220,37 +220,11 @@ impl AuditRecord {
     }
 }
 
-/// Encode one audit RLOG record as an L0 [`Signal::Audit`] object and its
-/// commit record, and PUT both (data object first, commit record last, the
-/// ingest durability order). This is the minimal write path for a
-/// `Signal::Audit` record: one record, one object, one commit record, exactly
-/// as `ravel-ingest` writes an L0 log object.
-///
-/// This is the degenerate one-record case of [`write_audit_batch`]; it exists
-/// unchanged for the per-record callers ([`crate::legal_hold`],
-/// [`crate::provision_audit`], [`crate::query_audit`]) that mint one object per
-/// record.
-pub(crate) async fn write_audit_object(
-    store: &dyn ObjectStoreBackend,
-    tenant: &TenantHash,
-    write: AuditWrite,
-) -> Result<()> {
-    let shard = write.shard;
-    let record_id = write.record_id;
-    write_audit_batch(
-        store,
-        shard,
-        record_id,
-        vec![audit_record(tenant, write)],
-        None,
-    )
-    .await
-}
-
 /// Encode a whole batch of audit records as **one** L0 [`Signal::Audit`] object
 /// and **one** commit record, and PUT both in the same data-object-first,
-/// commit-record-last durability order [`write_audit_object`] uses for a single
-/// record. Every record in `records` is pushed into one [`RlogWriter`] under
+/// commit-record-last durability order [`write_audit_object_with_compat`] uses
+/// for a single record. Every record in `records` is pushed into one
+/// [`RlogWriter`] under
 /// the shared `record_id`, so the batch is one immutable object; its commit
 /// record's aggregate fields (`sample_count`, `series_count`, and the
 /// event/ingest-time bounds) span the whole batch rather than being hardcoded
@@ -296,6 +270,7 @@ pub(crate) async fn write_audit_object(
 /// disclose it to that other tenant, since the `audit` SQL table resolves per
 /// tenant hash, so the mixed-tenant case fails the whole batch rather than
 /// choosing a tenant for it.
+#[cfg(test)]
 pub(crate) async fn write_audit_batch(
     store: &dyn ObjectStoreBackend,
     shard: u32,
@@ -336,9 +311,18 @@ pub(crate) async fn write_audit_batch_with_rng(
     write_audit_batch_with_compat(store, shard, record_id, records, put_retries, rng, None).await
 }
 
-/// [`write_audit_object`] under a `sys/compat` write policy, as
-/// [`write_audit_batch_with_compat`] writes a batch; `run` names the writer in
-/// the refusal log.
+/// Encode one audit RLOG record as an L0 [`Signal::Audit`] object and its
+/// commit record, and PUT both (data object first, commit record last, the
+/// ingest durability order). This is the minimal write path for a
+/// `Signal::Audit` record: one record, one object, one commit record, exactly
+/// as `ravel-ingest` writes an L0 log object.
+///
+/// This is the degenerate one-record case of [`write_audit_batch`], for the
+/// per-record callers ([`crate::legal_hold`],
+/// [`crate::provision_audit`], [`crate::query_audit`]) that mint one object per
+/// record. `policy` runs the write under a `sys/compat` write policy, as
+/// [`write_audit_batch_with_compat`] writes a batch, with `run` naming the
+/// writer in the refusal log; `None` writes with no policy.
 pub(crate) async fn write_audit_object_with_compat(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -1090,7 +1074,8 @@ mod tests {
     #[tokio::test]
     async fn an_audit_batch_refuses_an_unwritable_rlog_version_before_any_put() {
         let store = Arc::new(MemoryStore::new());
-        write_compat(store.as_ref(), vec![family(FAMILY_RLOG, 6)], NS_PER_HOUR).await;
+        // 7: above the window with or without `format-drill`.
+        write_compat(store.as_ref(), vec![family(FAMILY_RLOG, 7)], NS_PER_HOUR).await;
         let policy = policy(store.clone(), ManualClock::at(T0)).await;
         let before = list_all(store.as_ref(), "").await.expect("list");
         let refused =
@@ -1111,7 +1096,7 @@ mod tests {
         assert!(
             matches!(
                 compat_refusal(&err, FAMILY_RLOG),
-                CompatRunRefusal::Compat(CompatRefusal::ActiveVersionNotWritable { active: 6, .. })
+                CompatRunRefusal::Compat(CompatRefusal::ActiveVersionNotWritable { active: 7, .. })
             ),
             "{err:?}"
         );

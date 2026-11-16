@@ -861,17 +861,9 @@ impl CompatView {
         baseline: u16,
         bucket: Option<&sysproto::ProvisioningRecord>,
     ) -> Result<u16, CompatRefusal> {
-        let state = self.inner.state.read();
-        let fresh = state
-            .last_read_unix_ns
-            .is_some_and(|last| now_unix_ns.saturating_sub(last) < COMPAT_VIEW_HORIZON_NS);
         let bucket_compat_epoch = bucket.map_or(0, |b| b.compat_epoch);
-        if !fresh && (state.record_seen || bucket_compat_epoch > 0) {
-            return Err(CompatRefusal::ViewStale {
-                last_read_unix_ns: state.last_read_unix_ns,
-                now_unix_ns,
-            });
-        }
+        self.check_fresh(now_unix_ns, bucket_compat_epoch)?;
+        let state = self.inner.state.read();
         if !state.present && (bucket_compat_epoch > 0 || state.seen_epoch > 0) {
             return Err(CompatRefusal::CompatRecordMissing {
                 bucket_compat_epoch,
@@ -890,6 +882,30 @@ impl CompatView {
                 writable: writable.to_vec(),
             }),
         }
+    }
+
+    /// Whether the view is fresh enough to publish under at `now_unix_ns`,
+    /// the freshness rule [`Self::write_policy`] applies, for writers that
+    /// recheck it before every PUT. [`CompatRefusal::ViewStale`] when the
+    /// last successful read is at least [`COMPAT_VIEW_HORIZON_NS`] old, or
+    /// there has been none, and the view has seen a record or
+    /// `bucket_compat_epoch` is above 0.
+    pub fn check_fresh(
+        &self,
+        now_unix_ns: i64,
+        bucket_compat_epoch: u64,
+    ) -> Result<(), CompatRefusal> {
+        let state = self.inner.state.read();
+        let fresh = state
+            .last_read_unix_ns
+            .is_some_and(|last| now_unix_ns.saturating_sub(last) < COMPAT_VIEW_HORIZON_NS);
+        if !fresh && (state.record_seen || bucket_compat_epoch > 0) {
+            return Err(CompatRefusal::ViewStale {
+                last_read_unix_ns: state.last_read_unix_ns,
+                now_unix_ns,
+            });
+        }
+        Ok(())
     }
 
     /// The highest values seen for `family`, if any read carried it.
@@ -1249,6 +1265,14 @@ mod tests {
                 ..
             })
         ));
+        assert_eq!(view.check_fresh(T0 + 3 * COMPAT_VIEW_HORIZON_NS, 0), Ok(()));
+        assert!(matches!(
+            view.check_fresh(T0, 1),
+            Err(CompatRefusal::ViewStale {
+                last_read_unix_ns: None,
+                ..
+            })
+        ));
     }
 
     /// Once a record has been read, the same `AccessDenied` refusals leave
@@ -1281,6 +1305,19 @@ mod tests {
                 now_unix_ns: T0 + COMPAT_VIEW_HORIZON_NS,
             })
         );
+        for bucket_compat_epoch in [0, 1] {
+            assert_eq!(
+                view.check_fresh(T0 + COMPAT_VIEW_HORIZON_NS - 1, bucket_compat_epoch),
+                Ok(())
+            );
+            assert_eq!(
+                view.check_fresh(T0 + COMPAT_VIEW_HORIZON_NS, bucket_compat_epoch),
+                Err(CompatRefusal::ViewStale {
+                    last_read_unix_ns: Some(T0),
+                    now_unix_ns: T0 + COMPAT_VIEW_HORIZON_NS,
+                })
+            );
+        }
     }
 
     /// Holds the first `get` of `sys/compat` after the wrapped read returned,

@@ -2,10 +2,11 @@
 //! decision 4).
 //!
 //! Compaction, the erasure rewrite, a format migration and a re-encode each
-//! write parts at [`crate::rewrite::current_part_version`] for the bucket's
-//! signal. Before any of them takes the bucket's claim, builds a part or PUTs
-//! anything, it reads the bucket's provisioning record once and compares that
-//! version with the recorded floor for the signal's family, through the same
+//! write parts at their compat run's version for the bucket's signal, or at
+//! [`crate::rewrite::current_part_version`] with no run. Before any of them
+//! takes the bucket's claim, builds a part or PUTs anything, it reads the
+//! bucket's provisioning record once and compares that version with the
+//! recorded floor for the signal's family, through the same
 //! [`FormatFloorPolicy`] ingest uses: below the floor the run refuses with
 //! [`MaintainError::BelowFormatFloor`], or, under `--write-below-format-floor`,
 //! writes and the policy counts it. The read is fresh, not cached, and is
@@ -18,38 +19,50 @@ use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_proto::sys::v1 as sysproto;
 
 use crate::bucket::Bucket;
+use crate::compat_policy::{CompatRun, part_write_version};
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::request_ledger::{RequestLedger, RequestPhase, note_get};
 
 /// Check the floor before a `run` (named in the log line) writes into
-/// `bucket`, with `config`'s policy; a no-op when none is installed.
+/// `bucket`, with `config`'s policy; a no-op when none is installed. `compat`
+/// is the run's compat run, whose part version is the one written.
 pub(crate) async fn check_output_floor(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
     bucket: &Bucket,
     run: &'static str,
+    compat: Option<&CompatRun>,
 ) -> Result<()> {
     match config.format_floor.as_ref() {
         Some(policy) => {
-            check_with_policy(store, config.request_ledger.as_ref(), policy, bucket, run).await
+            let writing = part_write_version(compat, bucket.signal)?;
+            check_with_policy(
+                store,
+                config.request_ledger.as_ref(),
+                policy,
+                bucket,
+                run,
+                writing,
+            )
+            .await
         }
         None => Ok(()),
     }
 }
 
-/// [`check_output_floor`] with an explicit policy.
+/// [`check_output_floor`] with an explicit policy and part version.
 pub(crate) async fn check_with_policy(
     store: &dyn ObjectStoreBackend,
     ledger: Option<&RequestLedger>,
     policy: &FormatFloorPolicy,
     bucket: &Bucket,
     run: &'static str,
+    writing: u32,
 ) -> Result<()> {
     let Some(family) = FormatFamily::for_signal(bucket.signal) else {
         return Ok(());
     };
-    let writing = crate::rewrite::current_part_version(bucket.signal)?;
     let floor = read_floor(store, ledger, bucket, family).await?;
     match policy.admit(family, floor, writing) {
         Ok(FloorAdmission::AtOrAboveFloor) => Ok(()),

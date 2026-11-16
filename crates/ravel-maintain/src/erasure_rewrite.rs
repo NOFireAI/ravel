@@ -2438,11 +2438,8 @@ pub async fn erasure_rewrite_bucket(
         return Ok(ErasureRewriteOutcome::AlreadyApplied);
     }
 
-    // ADR-1746 decision 4: checked before the claim, the build and every PUT.
-    // A refusal leaves the request pending, as any failed pass does.
-    crate::format_floor::check_output_floor(store, config, bucket, "erasure rewrite").await?;
     // ADR-4233 decision 3: the part and record versions are fixed here, before
-    // the claim. A refusal leaves the request pending, like the floor's.
+    // the claim. A refusal leaves the request pending, as any failed pass does.
     let compat_run = match crate::compat_policy::part_family(bucket.signal) {
         Some(part) => {
             crate::compat_policy::begin_bucket_run(
@@ -2456,6 +2453,16 @@ pub async fn erasure_rewrite_bucket(
         }
         None => None,
     };
+    // ADR-1746 decision 4: the run's part version, checked before the claim,
+    // the build and every PUT. A refusal leaves the request pending too.
+    crate::format_floor::check_output_floor(
+        store,
+        config,
+        bucket,
+        "erasure rewrite",
+        compat_run.as_ref().or(config.compat_run.as_ref()),
+    )
+    .await?;
 
     // The bucket claim (ADR-1029, the 2026-10-03 amendment), the same one a
     // compaction of this bucket takes, held from before the build through the

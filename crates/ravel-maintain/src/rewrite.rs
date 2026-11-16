@@ -147,12 +147,22 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
         .request_ledger
         .as_ref()
         .and_then(|l| l.reset_for_run_unless_open().then(|| l.run_scope_guard()));
-    // ADR-1746 decision 4: checked before the inputs are read and every PUT.
-    let checked =
-        match crate::format_floor::check_output_floor(store, config, bucket, "rewrite").await {
-            Ok(()) => crate::compat_policy::begin_part_run(store, config, bucket, "rewrite").await,
-            Err(err) => Err(err),
-        };
+    // ADR-4233 decision 3 fixes the part version, then ADR-1746 decision 4
+    // checks it against the floor, both before the inputs are read and every
+    // PUT.
+    let checked = match crate::compat_policy::begin_part_run(store, config, bucket, "rewrite").await
+    {
+        Ok(compat_run) => crate::format_floor::check_output_floor(
+            store,
+            config,
+            bucket,
+            "rewrite",
+            compat_run.as_ref().or(config.compat_run.as_ref()),
+        )
+        .await
+        .map(|()| compat_run),
+        Err(err) => Err(err),
+    };
     let outcome = match checked {
         Ok(compat_run) => load_then_rewrite::<C>(
             store,
@@ -332,9 +342,13 @@ async fn refusal_noting_version<C: SegmentCodec>(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
     inputs: &[crate::read::InputRecord],
+    writable: u32,
     refusal: MaintainError,
 ) -> MaintainError {
-    let Some(input) = inputs.iter().find(|i| C::recorded_newer_than_writable(i)) else {
+    let Some(input) = inputs
+        .iter()
+        .find(|i| C::recorded_newer_than_writable(i, writable))
+    else {
         return refusal;
     };
     match load_input_catalog_noting_version::<C>(store, config, input).await {
@@ -524,8 +538,11 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
     if let Some(t) = config.merge_memory_tracker.as_ref() {
         t.reset_for_run();
     }
-    if let Err(refusal) = C::validate_rewrite_inputs(&inputs) {
-        return Err(refusal_noting_version::<C>(store, config, &inputs, refusal).await);
+    // The run's output version, fixed when its compat run began.
+    let writable =
+        crate::compat_policy::part_write_version(config.compat_run.as_ref(), bucket.signal)?;
+    if let Err(refusal) = C::validate_rewrite_inputs(&inputs, writable) {
+        return Err(refusal_noting_version::<C>(store, config, &inputs, writable, refusal).await);
     }
     let mut inputs = inputs;
     let mut hash = input_set_hash(&inputs);
@@ -808,7 +825,7 @@ async fn migrate_compat_run(
     target_version: u32,
 ) -> Result<Option<crate::compat_policy::CompatRun>> {
     let compat_run =
-        crate::compat_policy::begin_part_run(store, config, bucket, "migration").await?;
+        crate::compat_policy::begin_compaction_run(store, config, bucket, "migration").await?;
     if let Some(run) = compat_run.as_ref()
         && let Some(family) = crate::compat_policy::part_family(bucket.signal)
         && let Some(active) = run.version(family)
@@ -867,9 +884,17 @@ async fn migrate_bucket_format_scoped(
     if !needs_migration {
         return Ok(MigrateOutcome::UpToDate);
     }
-    // ADR-1746 decision 4: checked before the claim and every PUT.
-    crate::format_floor::check_output_floor(store, config, bucket, "migration").await?;
     let compat_run = migrate_compat_run(store, config, bucket, target_version).await?;
+    // ADR-1746 decision 4: the run's version, checked before the claim and
+    // every PUT.
+    crate::format_floor::check_output_floor(
+        store,
+        config,
+        bucket,
+        "migration",
+        compat_run.as_ref().or(config.compat_run.as_ref()),
+    )
+    .await?;
 
     // The bucket claim, the same one a compaction or an erasure rewrite of this
     // bucket takes, held from here through the record PUT. A pass refused it
@@ -1305,8 +1330,16 @@ async fn reencode_compaction_parts_scoped(
     {
         return Ok(ReencodeOutcome::UpToDate);
     }
-    // ADR-1746 decision 4: checked before the claim and every PUT.
-    crate::format_floor::check_output_floor(store, config, bucket, "re-encode").await?;
+    // ADR-1746 decision 4: the run's version, checked before the claim and
+    // every PUT.
+    crate::format_floor::check_output_floor(
+        store,
+        config,
+        bucket,
+        "re-encode",
+        compat_run.as_ref().or(config.compat_run.as_ref()),
+    )
+    .await?;
 
     // The bucket claim, the one compaction, the erasure rewrite and `migrate`
     // take, held from here through the record PUT.
@@ -1338,6 +1371,32 @@ async fn reencode_compaction_parts_scoped(
     .await
     {
         Err(MaintainError::ClaimLost { .. }) if guard.is_some() => None,
+        // A part `migrate` holds the bucket for: no record was published, so
+        // release the claim now rather than hold the bucket off for the lease.
+        Err(
+            err @ (MaintainError::UnknownSectionKinds { .. }
+            | MaintainError::InputOutOfWindow { .. }
+            | MaintainError::NewerThanWritable { .. }
+            | MaintainError::Segment(_)
+            | MaintainError::LogSeg(_)
+            | MaintainError::SpanSeg(_)),
+        ) => {
+            if let Some(guard) = guard
+                && guard.cancelled_at().await.is_none()
+                && let Err(claim_err) = guard.complete(store).await
+            {
+                tracing::warn!(
+                    signal = ?bucket.signal,
+                    shard = bucket.shard,
+                    ingest_hour_bucket = bucket.ingest_hour_bucket,
+                    work_id = %guard.work_id_hex(),
+                    error = %claim_err,
+                    "re-encode refused a part, and marking its claim completed failed; \
+                     the claim ages out under its lease (ADR-1029)"
+                );
+            }
+            return Err(err);
+        }
         other => Some(other?),
     };
 
@@ -1615,7 +1674,7 @@ fn reencode_rseg_part(
     crate::compat_policy::refuse_unknown_sections(
         object_key,
         &loc.unknown_section_kinds,
-        Some(u32::from(loc.version)),
+        loc.version,
     )?;
     let footer = &loc.footer;
     let entries = decode_catalog_v5(footer, object, limits)?;

@@ -1232,20 +1232,25 @@ impl Format {
         }
     }
 
-    /// The newest version this build reads and writes, which its own writer
-    /// stamps on the commit record.
+    /// The version this build's writer emits with no policy, which it stamps
+    /// on the commit record.
     fn current_version(self) -> u16 {
         match self {
-            Format::Rseg => ravel_segment::SUPPORTED_VERSIONS.newest(),
-            Format::Rlog => ravel_logseg::footer::SUPPORTED_VERSIONS.newest(),
-            Format::Rspan => ravel_rspan::footer::SUPPORTED_VERSIONS.newest(),
+            Format::Rseg => ravel_segment::SegmentVersion::CURRENT.number(),
+            Format::Rlog => ravel_logseg::footer::WriteVersion::CURRENT.number(),
+            Format::Rspan => ravel_rspan::footer::WriteVersion::CURRENT.number(),
         }
     }
 
     /// The version after this build's reader window, which a newer writer
-    /// stamps on both the object's trailer and its commit record.
+    /// stamps on both the object's trailer and its commit record. One above
+    /// [`Self::current_version`] without `format-drill`, two above with it.
     fn next_version(self) -> u16 {
-        self.current_version() + 1
+        match self {
+            Format::Rseg => ravel_segment::SUPPORTED_VERSIONS.newest() + 1,
+            Format::Rlog => ravel_logseg::footer::SUPPORTED_VERSIONS.newest() + 1,
+            Format::Rspan => ravel_rspan::footer::SUPPORTED_VERSIONS.newest() + 1,
+        }
     }
 
     /// Whether `err` is this format's reader refusing trailer version `v`.

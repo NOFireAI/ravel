@@ -1019,7 +1019,9 @@ here, or when the query-audit age sweep deletes the held record.
 version=<n>` for a held bucket, counts it on the summary's
 `held_out_of_window` line, and treats it as a success, not a failure.
 `compact-bucket` prints `outcome: HeldOutOfWindow`. Neither moves a server
-counter.
+counter. A bucket held for unknown section kinds (below) prints
+`outcome=HeldUnknownSection version=<n> unknown_section_kinds=[..]` and is
+counted on the same `held_out_of_window` line.
 
 ### An input with section kinds this build does not know
 
@@ -1029,15 +1031,19 @@ decodes, but a rewrite of it would drop that section.
 Compaction, the erasure rewrite and `migrate` therefore refuse such an input
 before they write anything for its bucket:
 
-- Compaction holds the bucket with outcome `HeldOutOfWindow`, carrying the
-  object's version, and writes no part and no compaction record.
+- Compaction holds the bucket with outcome `HeldUnknownSection`, carrying
+  the object's version and the unknown kinds, and writes no part and no
+  compaction record. The version is the one in the object's trailer, the
+  version it was written at, not the one its commit record names.
   `ravel_maintain_buckets_held_unknown_section_total` moves by one per held
   bucket per pass, and one `WARN` line per held bucket names the object and
   the unknown kinds. The bucket is retried on every pass, as an
   out-of-window input is, and compacts once a build that knows the section
   kinds runs here.
-- `migrate` holds the bucket under the `input_out_of_window` reason, with the
-  object's version, and raises no floor while it holds it.
+- `migrate` holds the bucket under the `unknown_section` reason, with the
+  object's key, its trailer version and the unknown kinds, and raises no
+  floor while it holds it. A `--reencode-compaction-parts` run holds such a
+  bucket the same way and goes on with the rest of its walk.
 - The erasure rewrite fails with an `UnknownSectionKinds` error when it
   reads the input's catalog, before it builds or writes anything.
 
@@ -1409,18 +1415,20 @@ existed, except that an input with unknown section kinds is held (see
 
 Under a policy, each maintenance run takes its write versions once, at its
 start, before its claim and before any PUT: compaction, the erasure rewrite,
-`migrate` and its re-encode, the query-audit writer and the legal-hold
-writer. The run keeps those versions to its end, even if the family is
+`migrate` and its re-encode, and the query-audit, reshard-audit and
+legal-hold writers. The run keeps those versions to its end, even if the family is
 activated again while it runs. A run is refused at its start when:
 
-- the view of `sys/compat` is 10 minutes old or older (`view_stale`);
+- the process's last successful read of `sys/compat` is 10 minutes old or
+  older, and either a GET of `sys/compat` has returned an object or the
+  bucket's provisioning record carries a `compat_epoch` (`view_stale`);
 - `sys/compat` is missing while the bucket's provisioning record carries a
   fence (`compat_record_missing`);
 - a family's active version is one this build cannot write
   (`active_version_not_writable`);
 - the run's publish lifetime is longer than the `max_publish_lifetime`
   recorded in `sys/compat` (`publish_lifetime_above_compat`). The
-  query-audit and legal-hold writers' lifetime is their 30 s write budget,
+  audit and legal-hold writers' lifetime is their 30 s write budget,
   and the build refuses to compile if that budget is not inside the default
   1 h.
 
@@ -1432,17 +1440,31 @@ as no run and goes on with the rest of the pass. A refused erasure leaves
 its request pending, so a later pass tries it again.
 
 During the run, every PUT attempt, retries included, checks the view's age
-first. A view that reaches 10 minutes refuses the PUT and abandons the run
-(`view_stale`). A record PUT is also abandoned once the recorded
+first, under the same rule. A view that reaches 10 minutes refuses the PUT
+and abandons the run (`view_stale`) once it has seen a record, or when the
+bucket's provisioning record carried a `compat_epoch` at the run's start or
+the run owes the bucket a fence. A store that was never activated keeps
+writing at its baseline. A record PUT is also abandoned once the recorded
 `max_publish_lifetime` has passed since the run started
 (`publish_lifetime_expired`). Data objects already written by an abandoned
 run are unreferenced, and garbage collection removes them as orphans.
 
 When a run writes a version above the family's baseline and the bucket's
-provisioning record has not yet been fenced at the current `sys/compat`
-epoch, the run raises that fence before its first PUT. The fence is one
-conditional write, not retried. If it fails, the run is refused
-(`fence_failed`) and nothing is written.
+provisioning record is fenced below the epoch at which that family was
+activated (its `activated_epoch` in `sys/compat`), the run raises the
+bucket's fence to that epoch before its first PUT. When a run writes more
+than one such family, the fence goes to the highest of their activation
+epochs. The fence is one conditional write, not retried. If it fails, the
+run is refused (`fence_failed`) and nothing is written.
+
+The `compaction-record` family is a ceiling for compaction and `migrate`,
+not a version they write. A compaction record is written at the version
+its content needs: version 1 for a plain compaction, version 2 only for a
+`--reencode-compaction-parts` run. Compaction and `migrate` are refused
+(`active_version_not_writable`) when `compaction-record` is active at a
+version this build cannot write. Activating `compaction-record` at 2 does
+not make a plain compaction write version 2 records, and it owes the
+bucket no fence.
 
 Two more refusals apply to migration:
 

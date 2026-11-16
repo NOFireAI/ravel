@@ -23,8 +23,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
+use prost::Message;
 use ravel_commit::{erasure, keys, record, signal};
-use ravel_fleet::claim::ClaimConfig;
+use ravel_fleet::claim::{COMPACTION_CLAIMS_PREFIX, ClaimConfig};
 use ravel_maintain::claim_guard::{Acquire, ClaimGuard, ClaimSleeper};
 use ravel_maintain::migrate::{
     MigrationPath, NotMigratedBucket, NotMigratedReason, ReencodeBlockedBucket,
@@ -33,9 +34,10 @@ use ravel_maintain::migrate::{
 use ravel_maintain::rewrite::{ReencodeOutcome, reencode_compaction_parts};
 use ravel_maintain::{
     ClaimParticipant, ClaimSkipReason, Clock, CompactionOutcome, CompactorConfig, Coordination,
-    ErasureRewriteOutcome, FamilyMigrateReport, FixedClock, MaintainMemo, MigrateBudget, NoLeases,
-    PendingErasureRequest, PinnedQueryWindow, PublishOutcome, SupersededSweepOutcome, Verification,
-    compact_bucket, erasure_rewrite_bucket, migrate_family, read, sweep_superseded,
+    ErasureRewriteOutcome, FamilyMigrateReport, FixedClock, MaintainError, MaintainMemo,
+    MigrateBudget, MigrateHeldBucket, MigrateHoldReason, NoLeases, PendingErasureRequest,
+    PinnedQueryWindow, PublishOutcome, SupersededSweepOutcome, Verification, compact_bucket,
+    erasure_rewrite_bucket, migrate_family, read, sweep_superseded,
 };
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, GateHandle, Occurrence, Op, Rule, ScriptedFault,
@@ -43,6 +45,7 @@ use ravel_object_store::fault::{
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
 use ravel_proto::commit::v1::{CompactionRecord, ErasurePredicateMatcher, ErasureRequest};
+use ravel_proto::sys::v1::{ClaimState, CompactionClaim};
 use ravel_types::Signal;
 use uuid::Uuid;
 
@@ -1024,4 +1027,90 @@ async fn a_budget_stop_resumes_past_a_not_migrated_bucket() {
     assert_eq!(third.not_migrated, Vec::new());
     assert_eq!(third.buckets_migrated, 1, "the held bucket, now free");
     assert_eq!(third.records_migrated, 1);
+}
+
+/// A compacted bucket whose part carries a section kind this build does not
+/// know is held by force 2, as the L0 path holds it (ADR-4233 decision 4,
+/// H6): the walk finishes, names the part, its trailer version and the kinds,
+/// publishes nothing, raises no floor, and marks the bucket's claim completed
+/// rather than leaving it running for its lease.
+///
+/// Returning the re-encode's error from the walk's `Force2::Reencode` arm
+/// instead of mapping it through `MigrateHoldReason::from_refusal` ends the
+/// walk with `UnknownSectionKinds`; dropping the re-encode's refusal arm that
+/// completes the claim leaves it `Running`.
+#[tokio::test]
+async fn an_unknown_section_in_a_compacted_part_holds_the_bucket() {
+    let store = MemoryStore::new();
+    store.set_clock_ms(u64::try_from(sealed_now_ns() / 1_000_000).expect("positive"));
+    let clock = FixedClock::new(sealed_now_ns());
+    provision(&store).await;
+    seed_compacted(&store).await;
+    let (record_key, mut rec) = stamp_parts_below_target(&store).await;
+    let old_key = keys::reconstruct_l1_part_key(&rec, &rec.parts[0]).expect("part key");
+    let spliced = with_unknown_section(&get_full(&store, &old_key).await);
+    rec.parts[0].content_hash = blake3::hash(&spliced).as_bytes().to_vec();
+    rec.parts[0].object_size = spliced.len() as u64;
+    let part_key = keys::reconstruct_l1_part_key(&rec, &rec.parts[0]).expect("part key");
+    store
+        .put(&part_key, spliced.into(), PutOptions::default())
+        .await
+        .expect("put the spliced part");
+    store
+        .put(
+            &record_key,
+            record::encode_compaction(&rec),
+            PutOptions::default(),
+        )
+        .await
+        .expect("point the record at the spliced part");
+
+    let err = migrate_family(
+        &store,
+        &clock,
+        &claiming_cfg(2, &clock),
+        tenant_hash(),
+        Signal::Metrics,
+        FAMILY,
+        target(),
+        SHARDS,
+        MigrateBudget::unlimited(),
+        "migrate_force2 test",
+    )
+    .await
+    .expect_err("held");
+
+    let MaintainError::MigrateHeld { held, report } = err else {
+        panic!("expected MigrateHeld, got {err:?}");
+    };
+    assert_eq!(
+        held,
+        vec![MigrateHeldBucket {
+            shard: SHARD,
+            ingest_hour: HOUR,
+            reason: MigrateHoldReason::UnknownSection {
+                object_key: part_key,
+                version: u16::try_from(target()).expect("fits"),
+                kinds: vec![UNKNOWN_KIND],
+            },
+        }]
+    );
+    assert!(report.walk_complete, "{report:?}");
+    assert_eq!(report.buckets_migrated, 0, "{report:?}");
+    assert_eq!(floor(&store).await, None);
+    assert_eq!(
+        compaction_records(&store).await,
+        vec![(record_key, rec)],
+        "nothing published"
+    );
+    let mut states = Vec::new();
+    for meta in list_all(&store, COMPACTION_CLAIMS_PREFIX)
+        .await
+        .expect("list claims")
+    {
+        let got = get_full(&store, &meta.key).await;
+        let claim = CompactionClaim::decode(got.as_ref()).expect("claim decodes");
+        states.push(ClaimState::try_from(claim.state).expect("known state"));
+    }
+    assert_eq!(states, vec![ClaimState::Completed]);
 }

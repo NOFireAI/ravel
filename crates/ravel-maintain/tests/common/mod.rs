@@ -822,3 +822,136 @@ pub async fn read_record_samples(
     }
     out
 }
+
+/// A section kind no `section_kind` constant names.
+pub const UNKNOWN_KIND: u32 = 0xFEED_0001;
+
+/// `obj` with one extra section of [`UNKNOWN_KIND`] spliced in past the last
+/// real one and the footer and trailer crcs re-sealed: a well-formed object a
+/// newer writer could have produced.
+pub fn with_unknown_section(obj: &[u8]) -> Vec<u8> {
+    use prost::Message;
+    let payload = b"opaque future-section bytes";
+    let loc = open_from_full(obj, ReaderLimits::default()).expect("open original");
+    let mut footer = loc.footer.clone();
+    let mut out = obj[..loc.footer_offset as usize].to_vec();
+    out.extend_from_slice(payload);
+    footer.sections.push(ravel_proto::segment::v1::Section {
+        kind: UNKNOWN_KIND,
+        offset: loc.footer_offset,
+        len: payload.len() as u64,
+        crc32c: crc32c::crc32c(payload),
+        comp: 0,
+        uncompressed_len: payload.len() as u64,
+    });
+    let footer_bytes = footer.encode_to_vec();
+    let footer_len = footer_bytes.len() as u32;
+    out.extend_from_slice(&footer_bytes);
+    let trailer = &obj[loc.trailer_offset as usize..];
+    let (version, tail) = (&trailer[8..10], &trailer[10..16]);
+    let mut crc = crc32c::crc32c(&footer_bytes);
+    crc = crc32c::crc32c_append(crc, &footer_len.to_le_bytes());
+    crc = crc32c::crc32c_append(crc, version);
+    crc = crc32c::crc32c_append(crc, tail);
+    out.extend_from_slice(&footer_len.to_le_bytes());
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(version);
+    out.extend_from_slice(tail);
+    out
+}
+
+/// The offset of the footer in an object whose trailer is `trailer_len` bytes
+/// and starts with the footer's little-endian `u32` length.
+fn footer_offset(obj: &[u8], trailer_len: usize) -> usize {
+    let at = obj.len() - trailer_len;
+    let footer_len = u32::from_le_bytes(obj[at..at + 4].try_into().expect("4 bytes"));
+    at - footer_len as usize
+}
+
+const UNKNOWN_PAYLOAD: &[u8] = b"opaque future-section bytes";
+
+/// [`with_unknown_section`] for an `.rlog` object, re-sealed at its own
+/// trailer version.
+pub fn rlog_with_unknown_section(obj: &[u8]) -> Vec<u8> {
+    use ravel_logseg::footer;
+    let mut ftr = footer::open(obj).expect("open rlog");
+    let version = footer::trailer_version(obj).expect("rlog trailer version");
+    let at = footer_offset(obj, footer::TRAILER_LEN);
+    let mut out = obj[..at].to_vec();
+    out.extend_from_slice(UNKNOWN_PAYLOAD);
+    ftr.sections.push(footer::SectionDesc {
+        kind: UNKNOWN_KIND,
+        offset: at as u64,
+        len: UNKNOWN_PAYLOAD.len() as u64,
+        crc32c: crc32c::crc32c(UNKNOWN_PAYLOAD),
+        comp: footer::COMP_NONE,
+        uncomp_len: UNKNOWN_PAYLOAD.len() as u64,
+        prefix_len: 0,
+    });
+    footer::write_footer_and_trailer_versioned(&mut out, &ftr, version);
+    out
+}
+
+/// [`with_unknown_section`] for an `.rspan` object, re-sealed at its own
+/// trailer version.
+pub fn rspan_with_unknown_section(obj: &[u8]) -> Vec<u8> {
+    use ravel_rspan::footer;
+    let mut ftr = footer::open(obj).expect("open rspan");
+    let trailer = &obj[obj.len() - footer::TRAILER_LEN..];
+    let version = footer::WriteVersion::new(u16::from_le_bytes([trailer[8], trailer[9]]))
+        .expect("rspan trailer version in the window");
+    let at = footer_offset(obj, footer::TRAILER_LEN);
+    let mut out = obj[..at].to_vec();
+    out.extend_from_slice(UNKNOWN_PAYLOAD);
+    ftr.sections.push(footer::SectionDesc {
+        kind: UNKNOWN_KIND,
+        offset: at as u64,
+        len: UNKNOWN_PAYLOAD.len() as u64,
+        crc32c: crc32c::crc32c(UNKNOWN_PAYLOAD),
+        comp: footer::COMP_NONE,
+        uncomp_len: UNKNOWN_PAYLOAD.len() as u64,
+        prefix_len: 0,
+    });
+    footer::write_footer_and_trailer_versioned(&mut out, &ftr, version);
+    out
+}
+
+/// Replace the L0 object the commit record at `commit_key` names with
+/// `splice` of it, PUT at its own content-addressed key, and repoint the
+/// record at it. Returns the new data key.
+pub async fn splice_input(
+    store: &dyn ObjectStoreBackend,
+    commit_key: &str,
+    splice: fn(&[u8]) -> Vec<u8>,
+) -> String {
+    let mut rec = record::decode(&get_full(store, commit_key).await).expect("decode record");
+    let signal = ravel_commit::signal::from_proto(rec.signal).expect("signal");
+    let writer_id = Uuid::parse_str(&rec.writer_id).expect("writer id");
+    let key_for = |hash: &[u8; 32]| {
+        keys::data_key(
+            &tenant_hash(),
+            signal,
+            rec.shard,
+            writer_id,
+            rec.writer_epoch,
+            rec.writer_seq,
+            hash,
+        )
+        .expect("data key")
+    };
+    let old: [u8; 32] = rec.content_hash.as_slice().try_into().expect("32 bytes");
+    let bytes = splice(&get_full(store, &key_for(&old)).await);
+    let hash = *blake3::hash(&bytes).as_bytes();
+    let data_key = key_for(&hash);
+    rec.content_hash = hash.to_vec();
+    rec.object_size = bytes.len() as u64;
+    store
+        .put(&data_key, Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put spliced object");
+    store
+        .put(commit_key, record::encode(&rec), PutOptions::default())
+        .await
+        .expect("repoint the commit record");
+    data_key
+}
