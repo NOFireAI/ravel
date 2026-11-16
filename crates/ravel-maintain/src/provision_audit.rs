@@ -14,7 +14,8 @@ use ravel_types::TenantHash;
 use ravel_types::logstream::log_stream_id;
 use uuid::Uuid;
 
-use crate::audit_write::{AuditWrite, write_audit_object};
+use crate::audit_write::{AuditWrite, write_audit_object_with_compat};
+use crate::compat_policy::MaintainCompatPolicy;
 use crate::error::Result;
 use crate::legal_hold::AUDIT_HOLD_SHARD;
 
@@ -50,6 +51,37 @@ pub async fn write_reshard_audit(
     generation: u32,
     activation_hour: u32,
 ) -> Result<()> {
+    write_reshard_audit_with_compat(
+        store,
+        tenant,
+        record_id,
+        now_ns,
+        signal,
+        from_shard_count,
+        to_shard_count,
+        generation,
+        activation_hour,
+        None,
+    )
+    .await
+}
+
+/// [`write_reshard_audit`] under a `sys/compat` write policy (ADR-4233), as
+/// [`crate::write_hold_set_with_compat`] writes a hold. `None` writes exactly
+/// as [`write_reshard_audit`].
+#[allow(clippy::too_many_arguments)]
+pub async fn write_reshard_audit_with_compat(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    record_id: Uuid,
+    now_ns: i64,
+    signal: &str,
+    from_shard_count: u32,
+    to_shard_count: u32,
+    generation: u32,
+    activation_hour: u32,
+    compat: Option<&MaintainCompatPolicy>,
+) -> Result<()> {
     let attrs = vec![
         (ATTR_KIND.to_string(), AttrValue::Str(KIND_RESHARD.into())),
         (ATTR_SIGNAL.to_string(), AttrValue::Str(signal.into())),
@@ -75,7 +107,7 @@ pub async fn write_reshard_audit(
          (generation {generation}, activation_hour {activation_hour})"
     );
     let (stream_id, stream_attrs) = reshard_stream();
-    write_audit_object(
+    write_audit_object_with_compat(
         store,
         tenant,
         AuditWrite {
@@ -89,6 +121,7 @@ pub async fn write_reshard_audit(
             body,
             attrs,
         },
+        compat.map(|policy| (policy, "reshard audit")),
     )
     .await
 }
@@ -143,5 +176,59 @@ mod tests {
         let commits = format!("t/{}/{}/c/", tenant.to_hex(), sig);
         let commit_objs = list_all(store.as_ref(), &commits).await.expect("list c");
         assert_eq!(commit_objs.len(), 1, "one commit record was written");
+    }
+
+    /// The policy reaches the audit write: an RLOG version this build cannot
+    /// write refuses the reshard audit before its data PUT. The counter for
+    /// this refusal is asserted by `audit_write`'s own test.
+    #[tokio::test]
+    async fn a_reshard_audit_refuses_an_unwritable_rlog_version_before_any_put() {
+        use crate::compat_policy::CompatRunRefusal;
+        use crate::compat_policy::test_support::{ManualClock, T0, family, policy, write_compat};
+        use crate::error::MaintainError;
+        use ravel_catalog::compat::{CompatRefusal, FAMILY_RLOG};
+
+        let store = Arc::new(MemoryStore::new());
+        // 7: above the RLOG window with or without `format-drill`.
+        write_compat(
+            store.as_ref(),
+            vec![family(FAMILY_RLOG, 7)],
+            3_600_000_000_000,
+        )
+        .await;
+        let policy = policy(store.clone(), ManualClock::at(T0)).await;
+        let before = list_all(store.as_ref(), "").await.expect("list");
+
+        let err = write_reshard_audit_with_compat(
+            store.as_ref(),
+            &TenantHash([0x11u8; 16]),
+            Uuid::from_u128(1),
+            T0,
+            "m",
+            4,
+            8,
+            1,
+            100,
+            Some(&policy),
+        )
+        .await
+        .expect_err("refused");
+
+        match err {
+            MaintainError::CompatRefused {
+                family,
+                refusal:
+                    CompatRunRefusal::Compat(CompatRefusal::ActiveVersionNotWritable {
+                        active: 7, ..
+                    }),
+                ..
+            } => assert_eq!(family, FAMILY_RLOG),
+            other => panic!("expected an RLOG refusal, got {other:?}"),
+        }
+        assert_eq!(
+            list_all(store.as_ref(), "").await.expect("list"),
+            before,
+            "nothing is written"
+        );
     }
 }

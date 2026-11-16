@@ -5,6 +5,17 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Test-only (ADR-4233 decision 9): turns on the segment crates' drill
+# versions so maintenance runs at an active version other than the build's
+# current one. Off by default; scripts/guards/check-release-profile.sh refuses
+# it in the published-image build and in any default or non-dev feature set.
+format-drill = [
+  "ravel-segment/format-drill",
+  "ravel-logseg/format-drill",
+  "ravel-rspan/format-drill",
+]
+
 [dependencies]
 ravel-types = { workspace = true }
 ravel-proto = { workspace = true }

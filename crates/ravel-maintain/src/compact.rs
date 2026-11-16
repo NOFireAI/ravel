@@ -28,8 +28,9 @@ use crate::rspan_codec::SpanCodec;
 
 /// The result of a `compact_bucket` call. Every variant except
 /// [`CompactionOutcome::Compacted`] means the bucket was left untouched, with
-/// the reason; the scan driver treats all of them except `NotSealed` and
-/// `HeldOutOfWindow` as "this hour is done" for cursor advancement.
+/// the reason; the scan driver treats all of them except `NotSealed`,
+/// `HeldOutOfWindow` and `HeldUnknownSection` as "this hour is done" for
+/// cursor advancement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactionOutcome {
     /// Not yet sealed: the writer interlock does not yet guarantee a complete
@@ -58,6 +59,12 @@ pub enum CompactionOutcome {
     /// as it is and retried on every pass; it is not done, so a cursored scan
     /// does not advance past it.
     HeldOutOfWindow { version: u16 },
+    /// An input's directory names section kinds this build does not know, so
+    /// re-encoding it would drop them (ADR-4233 hazard H6). `version` is the
+    /// input's trailer version and `kinds` the unknown kinds. Nothing was
+    /// written; like [`Self::HeldOutOfWindow`] the bucket is retried every pass
+    /// and is not done.
+    HeldUnknownSection { version: u16, kinds: Vec<u32> },
     /// The RLOG merge plan is cursor mode and would decode more than
     /// [`crate::rlog::MAX_CURSOR_DECODE_AMPLIFICATION`] times the bucket's
     /// record count and more than
@@ -228,9 +235,8 @@ pub fn buckets_held_out_of_window_total() -> u64 {
 
 /// Counter seam for `ravel_maintain_buckets_held_unknown_section_total`
 /// (ADR-4233 hazard H6): compactions held because an input carries section
-/// kinds this build does not know. They end in
-/// [`CompactionOutcome::HeldOutOfWindow`] and count here, not under
-/// [`buckets_held_out_of_window_total`]. Process-wide and monotonic.
+/// kinds this build does not know, ending in
+/// [`CompactionOutcome::HeldUnknownSection`]. Process-wide and monotonic.
 static BUCKETS_HELD_UNKNOWN_SECTION: AtomicU64 = AtomicU64::new(0);
 
 /// Read [`BUCKETS_HELD_UNKNOWN_SECTION`]. Zero on a healthy deployment.
@@ -485,7 +491,7 @@ fn hold_unknown_sections(
     bucket: &Bucket,
     object_key: &str,
     kinds: &[u32],
-    recorded_version: Option<u32>,
+    recorded_version: u16,
 ) -> CompactionOutcome {
     BUCKETS_HELD_UNKNOWN_SECTION.fetch_add(1, Ordering::Relaxed);
     tracing::warn!(
@@ -498,10 +504,10 @@ fn hold_unknown_sections(
         "compaction held a bucket: an input carries section kinds this build does not \
          know, which a re-encode would drop; nothing written (ADR-4233 H6)"
     );
-    let version = recorded_version
-        .and_then(|v| u16::try_from(v).ok())
-        .unwrap_or(0);
-    CompactionOutcome::HeldOutOfWindow { version }
+    CompactionOutcome::HeldUnknownSection {
+        version: recorded_version,
+        kinds: kinds.to_vec(),
+    }
 }
 
 /// What a coordinated compaction run did (ADR-1029 decisions 3 and 5).
@@ -713,13 +719,22 @@ async fn compact_bucket_scoped(
         ));
     }
 
-    // ADR-1746 decision 4: the parts this run would write are checked against
-    // the bucket's format floor before the claim, the first catalog read, and
-    // every PUT.
-    crate::format_floor::check_output_floor(store, config, bucket, "compaction").await?;
-    // ADR-4233 decision 3: the part version is fixed here, before the claim.
+    // ADR-4233 decision 3: the part version is fixed here, before the claim,
+    // with `compaction-record` as a ceiling on the version 1 record this run
+    // writes.
     let compat_run =
-        crate::compat_policy::begin_part_run(store, config, bucket, "compaction").await?;
+        crate::compat_policy::begin_compaction_run(store, config, bucket, "compaction").await?;
+    // ADR-1746 decision 4: the parts this run would write, at the run's
+    // version, are checked against the bucket's format floor before the claim,
+    // the first catalog read, and every PUT.
+    crate::format_floor::check_output_floor(
+        store,
+        config,
+        bucket,
+        "compaction",
+        compat_run.as_ref().or(config.compat_run.as_ref()),
+    )
+    .await?;
 
     // Cancellation checkpoint 1 (ADR-1029 decision 3), which is also where the
     // claim is acquired. A participating run claims every bucket whatever its

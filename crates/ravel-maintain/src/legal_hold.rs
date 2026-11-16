@@ -451,7 +451,7 @@ pub async fn write_hold_clear_with_compat(
 
 /// Encode one legal-hold RLOG record as an L0 [`Signal::Audit`] object and its
 /// commit record, and PUT both. The object/commit mechanics are shared with
-/// every other audit kind through [`crate::audit_write::write_audit_object`];
+/// every other audit kind through [`crate::audit_write::write_audit_object_with_compat`];
 /// this function supplies only the legal-hold-specific stream, severity, body,
 /// and attrs.
 async fn write_hold_object(
