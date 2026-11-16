@@ -20,7 +20,10 @@
 #                            inside its required bands.tsv row, keyed
 #                            positive/<name>.cfg; a cfg with no row fails
 #   negative     [-a AREA]   run negative/*.cfg, assert the expected violation
-#   traceability [-a AREA]   check every traceability.md source ref resolves
+#   traceability [-a AREA]   check every traceability.md source ref resolves;
+#                            an area holding antithesis-mutants.tsv also
+#                            needs the sixth "Antithesis property" column
+#                            and a .tsv line per negative/*.cfg
 #   ci           [-a AREA]   smoke + live + positive + negative + traceability
 #                            under one run id
 #   all          [-a AREA]   ci, then exhaustive, under one run id
@@ -723,38 +726,249 @@ resolve_rust_ref() {
     return 0
 }
 
+TRACE_HEADER_FIRST_CELL="TLA+ action or property"
+ANTITHESIS_COLUMN="Antithesis property"
+ANTITHESIS_TSV="antithesis-mutants.tsv"
+TRACE_DELIMITER_ROW='^[|:[:space:]-]+$'
+
+# Split one markdown table row into TRACE_CELLS, each cell trimmed.
+trace_cells() {
+    local l="${1#|}" i c
+    l="${l%"${l##*[![:space:]]}"}"
+    IFS='|' read -r -a TRACE_CELLS <<< "$l"
+    for i in "${!TRACE_CELLS[@]}"; do
+        c="${TRACE_CELLS[$i]}"
+        c="${c#"${c%%[![:space:]]*}"}"
+        c="${c%"${c##*[![:space:]]}"}"
+        TRACE_CELLS[$i]="$c"
+    done
+}
+
+strip_code_span() {
+    local s="$1"
+    case "$s" in \`*\`) s="${s#\`}"; s="${s%\`}" ;; esac
+    printf '%s' "$s"
+}
+
+# rust_literal_live <literal> <file.rs>: the literal occurs in the file on a
+# line that is not a comment (after leading whitespace, //, /* or *) and comes
+# before the file's first #[cfg(test)] line, so a commented-out or test-only
+# occurrence does not count. The literal is passed through the environment,
+# never as awk program text or -v, so backslashes stay literal.
+rust_literal_live() {
+    RUST_LITERAL="$1" awk '
+        /^[[:space:]]*#\[cfg\(test\)\]/ { exit }
+        /^[[:space:]]*(\/\/|\/\*|\*)/ { next }
+        index($0, ENVIRON["RUST_LITERAL"]) { found = 1; exit }
+        END { exit !found }' "$2"
+}
+
+# rust_literal_live_under <literal> <dir>...: rust_literal_live holds for some
+# .rs file under the directories, not counting files under a tests/ directory.
+rust_literal_live_under() {
+    local lit="$1" f rel
+    shift
+    while IFS= read -r f; do
+        rel="${f#"$REPO_ROOT"/}"
+        case "$rel" in tests/*|*/tests/*) continue ;; esac
+        rust_literal_live "$lit" "$f" && return 0
+    done < <(grep -rlF --include='*.rs' -- "$lit" "$@" 2>/dev/null)
+    return 1
+}
+
+# Check one "Antithesis property" cell (ADR-4326 decision 6):
+#   sut: <path.rs> -- <message>      the file holds "<message>" as a string literal
+#   driver: <workload> -- <message>  a .rs file under antithesis/<workload>/ does
+#   none: <reason>                   the reason is non-empty
+# A literal counts only as rust_literal_live sees it. The path and the message
+# may each be one backtick code span. Sets ANTITHESIS_MSG to the message for
+# sut: and driver:, empty for none:.
+check_antithesis_cell() {
+    local area="$1" lineno="$2" cell="$3" kind rest target msg
+    local where="$area traceability: line $lineno: $ANTITHESIS_COLUMN"
+    ANTITHESIS_MSG=""
+    case "$cell" in
+        "sut: "*) kind=sut; rest="${cell#sut: }" ;;
+        "driver: "*) kind=driver; rest="${cell#driver: }" ;;
+        none:) note "$where: none: needs a reason"; return 1 ;;
+        "none: "*)
+            rest="${cell#none: }"
+            rest="${rest#"${rest%%[![:space:]]*}"}"
+            [ -n "$rest" ] || { note "$where: none: needs a reason"; return 1; }
+            return 0 ;;
+        none:*) note "$where: none: needs a space before its reason: '$cell'"; return 1 ;;
+        *) note "$where: '$cell' is not sut: <path.rs> -- <message>, driver: <workload> -- <message> or none: <reason>"; return 1 ;;
+    esac
+    case "$rest" in
+        *" -- "*) : ;;
+        *) note "$where: $kind: needs ' -- ' between the target and the message: '$cell'"; return 1 ;;
+    esac
+    target="$(strip_code_span "${rest%% -- *}")"
+    msg="${rest#* -- }"
+    msg="${msg#"${msg%%[![:space:]]*}"}"
+    msg="$(strip_code_span "$msg")"
+    [ -n "$msg" ] || { note "$where: $kind: empty message: '$cell'"; return 1; }
+    if [ "$kind" = sut ]; then
+        case "$target" in
+            /*|*..*) note "$where: sut: path '$target' must be repository-relative"; return 1 ;;
+            *.rs) : ;;
+            *) note "$where: sut: path '$target' is not a Rust (.rs) path"; return 1 ;;
+        esac
+        [ -f "$REPO_ROOT/$target" ] || { note "$where: sut: no such file '$target'"; return 1; }
+        rust_literal_live "\"$msg\"" "$REPO_ROOT/$target" \
+            || { note "$where: message '$msg' not found as the string literal \"$msg\" in '$target'"; return 1; }
+    else
+        case "$target" in
+            ''|*/*|.*|*[!A-Za-z0-9._-]*) note "$where: driver: '$target' is not a workload name"; return 1 ;;
+        esac
+        [ -d "$REPO_ROOT/antithesis/$target" ] \
+            || { note "$where: driver: no workload directory 'antithesis/$target/'"; return 1; }
+        rust_literal_live_under "\"$msg\"" "$REPO_ROOT/antithesis/$target" \
+            || { note "$where: message '$msg' not found as the string literal \"$msg\" in a .rs file under 'antithesis/$target/'"; return 1; }
+    fi
+    ANTITHESIS_MSG="$msg"
+    return 0
+}
+
+# Check an enrolled area's antithesis-mutants.tsv. Each non-comment line is
+#   <negative cfg stem> TAB <area>/<stem> TAB <property message>
+# or
+#   <negative cfg stem> TAB none: <reason>
+# where the mutant occurs as the literal inv_mutant!("<area>/<stem>") in a .rs
+# file under crates/, services/ or antithesis/*/driver/ (the driver-side
+# broken store of ADR-4326 decision 3), as rust_literal_live sees it, and the
+# property is the message of a sut: or driver: cell in the area's tables.
+# Every negative/*.cfg has exactly one line.
+check_antithesis_tsv() {
+    local area="$1" carried="$2"
+    local area_dir="$FORMAL_DIR/$area" tsv="$FORMAL_DIR/$area/$ANTITHESIS_TSV"
+    local rc=0 n=0 tline stem f2 f3 extra seen="" reason cfg roots=() d where
+    for d in "$REPO_ROOT/crates" "$REPO_ROOT/services" "$REPO_ROOT"/antithesis/*/driver; do
+        [ -d "$d" ] && roots+=("$d")
+    done
+    while IFS= read -r tline || [ -n "$tline" ]; do
+        n=$((n + 1))
+        case "$tline" in ''|'#'*) continue ;; esac
+        IFS=$'\t' read -r stem f2 f3 extra <<< "$tline"
+        where="$area $ANTITHESIS_TSV:$n"
+        if [ ! -f "$area_dir/negative/$stem.cfg" ]; then
+            note "$where: '$stem' names no negative/$stem.cfg"; rc=1; continue
+        fi
+        if printf '%s\n' "$seen" | grep -qxF -- "$stem"; then
+            note "$where: second line for negative/$stem.cfg"; rc=1; continue
+        fi
+        seen="$seen$stem"$'\n'
+        if [ -n "$extra" ]; then
+            note "$where: more than three tab-separated fields"; rc=1; continue
+        fi
+        case "$f2" in
+            none:*)
+                reason="${f2#none:}"
+                reason="${reason#"${reason%%[![:space:]]*}"}"
+                if [ -z "$reason" ]; then
+                    note "$where: none: needs a reason"; rc=1
+                else
+                    case "$f2" in
+                        "none: "*) : ;;
+                        *) note "$where: none: needs a space before its reason: '$f2'"; rc=1 ;;
+                    esac
+                fi
+                [ -z "$f3" ] || { note "$where: a none: line names no property"; rc=1; }
+                continue ;;
+        esac
+        if [ "$f2" != "$area/$stem" ]; then
+            note "$where: mutant '$f2' must be named '$area/$stem'"; rc=1; continue
+        fi
+        if [ "${#roots[@]}" -eq 0 ] \
+            || ! rust_literal_live_under "inv_mutant!(\"$f2\")" "${roots[@]}"; then
+            note "$where: mutant '$f2' not found as inv_mutant!(\"$f2\") in Rust"; rc=1
+        fi
+        if [ -z "$f3" ]; then
+            note "$where: mutant '$f2' names no property"; rc=1
+        elif ! printf '%s' "$carried" | grep -qxF -- "$f3"; then
+            note "$where: property '$f3' is not carried by any sut: or driver: cell"; rc=1
+        fi
+    done < "$tsv"
+    for cfg in "$area_dir"/negative/*.cfg; do
+        [ -e "$cfg" ] || continue
+        stem="$(basename "$cfg" .cfg)"
+        if ! printf '%s\n' "$seen" | grep -qxF -- "$stem"; then
+            note "$area: negative/$stem.cfg has no line in $ANTITHESIS_TSV"; rc=1
+        fi
+    done
+    return $rc
+}
+
 check_traceability() {
     local area="$1"
     local area_dir="$FORMAL_DIR/$area"
     local tfile="$area_dir/traceability.md"
-    [ -f "$tfile" ] || { note "$area: no traceability.md, skipping"; return 0; }
-    local rc=0 count=0
+    local enrolled=0 want=5
+    if [ -f "$area_dir/$ANTITHESIS_TSV" ]; then enrolled=1; want=6; fi
+    if [ ! -f "$tfile" ]; then
+        if [ "$enrolled" -eq 1 ]; then
+            note "$area traceability: enrolled ($ANTITHESIS_TSV) but no traceability.md"; return 1
+        fi
+        note "$area: no traceability.md, skipping"; return 0
+    fi
+    local rc=0 count=0 lineno=0 in_table=0 table_ok=0 after_header=0 carried=""
 
-    # Five D8 columns:
+    # D8 columns, the sixth only in an area enrolled by antithesis-mutants.tsv:
     #   | TLA+ action or property | meaning | Rust path and symbol
-    #   | existing test | new test needed |
+    #   | existing test | new test needed | Antithesis property |
+    # A table's first row is its header, recognised by its exact first cell.
     # The "Rust path and symbol" column is required and resolved. The other
     # columns may also carry Rust references (an existing test, or a symbol
     # named in the "new test needed" note); any token that looks like a
     # crates/... reference is resolved too, so a stale test path is caught.
     local line
     while IFS= read -r line; do
+        lineno=$((lineno + 1))
         case "$line" in
             \|*) : ;;            # a table row
-            *) continue ;;
+            *) in_table=0; continue ;;
         esac
-        case "$line" in
-            *---*) continue ;;
-            *[Aa]ction*[Pp]roperty*) continue ;;   # header row
-        esac
-        # The required source ref is column 3 (awk field 4 after the leading |).
-        # It may hold more than one whitespace-separated reference, for a
-        # property whose transition spans two symbols in two crates; each is
-        # resolved independently against its own file, never pooled into a
-        # single resolve_rust_ref call, so a row still rejects a reference
-        # whose own ::-segments don't resolve in its own file.
+        trace_cells "$line"
+        if [ "$in_table" -eq 0 ]; then
+            in_table=1; table_ok=0; after_header=1
+            if [ "${TRACE_CELLS[0]:-}" != "$TRACE_HEADER_FIRST_CELL" ]; then
+                note "$area traceability: line $lineno: table header's first cell is '${TRACE_CELLS[0]:-}', not '$TRACE_HEADER_FIRST_CELL'"
+                rc=1; continue
+            fi
+            if [ "${#TRACE_CELLS[@]}" -ne "$want" ]; then
+                if [ "$enrolled" -eq 1 ]; then
+                    note "$area traceability: line $lineno: table has ${#TRACE_CELLS[@]} columns; an enrolled area needs 6, the last '$ANTITHESIS_COLUMN'"
+                else
+                    note "$area traceability: line $lineno: table has ${#TRACE_CELLS[@]} columns; an area with no $ANTITHESIS_TSV needs 5"
+                fi
+                rc=1; continue
+            fi
+            if [ "$enrolled" -eq 1 ] && [ "${TRACE_CELLS[5]}" != "$ANTITHESIS_COLUMN" ]; then
+                note "$area traceability: line $lineno: sixth column is '${TRACE_CELLS[5]}', not '$ANTITHESIS_COLUMN'"
+                rc=1; continue
+            fi
+            table_ok=1; continue
+        fi
+        # Rows under a rejected header were already failed with it.
+        [ "$table_ok" -eq 1 ] || continue
+        # Only the row directly under the header may be its delimiter; a
+        # later row of pipes and dashes is a data row and is checked as one.
+        if [ "$after_header" -eq 1 ]; then
+            after_header=0
+            [[ "$line" =~ $TRACE_DELIMITER_ROW ]] && continue
+        fi
+        if [ "${#TRACE_CELLS[@]}" -ne "$want" ]; then
+            note "$area traceability: line $lineno: row has ${#TRACE_CELLS[@]} cells, the table $want: $line"
+            rc=1; continue
+        fi
+        # The required source ref is column 3. It may hold more than one
+        # whitespace-separated reference, for a property whose transition
+        # spans two symbols in two crates; each is resolved independently
+        # against its own file, never pooled into a single resolve_rust_ref
+        # call, so a row still rejects a reference whose own ::-segments
+        # don't resolve in its own file.
         local src
-        src="$(echo "$line" | awk -F'|' '{print $4}' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr -d '`')"
+        src="$(printf '%s' "${TRACE_CELLS[2]}" | tr -d '`')"
         if [ -z "$src" ]; then
             note "$area traceability: row has no Rust source ref: $line"; rc=1; continue
         fi
@@ -763,14 +977,26 @@ check_traceability() {
             resolve_rust_ref "$area" "$one" || row_failed=1
         done
         [ "$row_failed" -eq 0 ] || { rc=1; continue; }
-        count=$((count + 1))
+        if [ "$enrolled" -eq 0 ]; then
+            count=$((count + 1))
+        elif check_antithesis_cell "$area" "$lineno" "${TRACE_CELLS[5]}"; then
+            count=$((count + 1))
+            [ -z "$ANTITHESIS_MSG" ] || carried="$carried$ANTITHESIS_MSG"$'\n'
+        else
+            rc=1
+        fi
 
         # Resolve any further crates/... references in the remaining columns.
+        # A sut: cell's path is followed by " -- ", so it is a whole token here.
         local extra
         for extra in $(echo "$line" | tr '`|' '  ' | tr ' ' '\n' | grep '^crates/' || true); do
             resolve_rust_ref "$area" "$extra" || rc=1
         done
     done < "$tfile"
+
+    if [ "$enrolled" -eq 1 ]; then
+        check_antithesis_tsv "$area" "$carried" || rc=1
+    fi
 
     if [ "$rc" -eq 0 ] && [ "$count" -eq 0 ]; then
         note "$area traceability: FAIL (zero rows resolved)"

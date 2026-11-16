@@ -5,6 +5,12 @@ counts are exact data-row counts (header and separator excluded).
 `scripts/check-tla.sh traceability` resolves every Rust path and symbol
 named in every area table and fails when one no longer exists.
 
+An area whose directory holds `antithesis-mutants.tsv` is enrolled in
+Antithesis: its tables carry a sixth column, `Antithesis property`, and the
+`.tsv` maps each `negative/*.cfg` to a Rust mutant and a property the table
+carries (ADR-4326 decision 6; grammar in [README.md](README.md#the-antithesis-property-column)).
+No area is enrolled yet, so every area table is five-column.
+
 | Area | Specification | Rows | Rust crates covered | Table |
 |---|---|---|---|---|
 | common | `common/RavelObjectStore.tla` | 9 | ravel-object-store, ravel-commit, ravel-ingest | [common/traceability.md](common/traceability.md) |
@@ -13,9 +19,9 @@ named in every area table and fails when one no longer exists.
 | lifecycle | `lifecycle/LifecycleGC.tla` | 29 | ravel-maintain, ravel-commit, ravel-query, ravel-catalog | [lifecycle/traceability.md](lifecycle/traceability.md) |
 | resharding | `resharding/OnlineResharding.tla` | 19 | ravel-ingest, ravel-catalog, ravel-commit, ravel-types, services/ravel-cli | [resharding/traceability.md](resharding/traceability.md) |
 | maintenance | `maintenance/MaintenanceOwnership.tla`, `maintenance/CompactionClaims.tla` | 45 | ravel-fleet, ravel-maintain, services/ravel-cli, services/ravel-server | [maintenance/traceability.md](maintenance/traceability.md) |
-| agents | `agents/AgentProtocol.tla`, `agents/AgentEffects.tla`, `agents/AgentIntegrated.tla` | 51 | ravel-agents-core, ravel-agents-store | [agents/traceability.md](agents/traceability.md) |
+| agents | `agents/AgentProtocol.tla`, `agents/AgentEffects.tla`, `agents/AgentIntegrated.tla` | 54 | ravel-agents-core, ravel-agents-store | [agents/traceability.md](agents/traceability.md) |
 
-Total: 199 traceability rows across the suite.
+Total: 202 traceability rows across the suite.
 
 ## Test debt
 
