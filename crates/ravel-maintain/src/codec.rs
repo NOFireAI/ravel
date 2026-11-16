@@ -143,14 +143,17 @@ pub trait SegmentCodec {
     /// on a version it cannot handle -- notably one recorded *newer* than the
     /// current output version (ADR-0066 decision 2: newer-than-known is a typed
     /// refusal, never a silent downgrade), which [`RsegCodec`] does.
-    fn validate_rewrite_inputs(_inputs: &[InputRecord]) -> Result<()> {
+    /// `writable` is the version the run writes: its compat run's, or the
+    /// build's current one with no policy.
+    fn validate_rewrite_inputs(_inputs: &[InputRecord], _writable: u32) -> Result<()> {
         Ok(())
     }
 
-    /// Whether `input` is recorded at a format version newer than this
-    /// codec's output version, which is what [`Self::validate_rewrite_inputs`]
-    /// refuses. The default refuses nothing, so it names nothing.
-    fn recorded_newer_than_writable(_input: &InputRecord) -> bool {
+    /// Whether `input` is recorded at a format version newer than `writable`,
+    /// the run's output version, which is what
+    /// [`Self::validate_rewrite_inputs`] refuses. The default refuses nothing,
+    /// so it names nothing.
+    fn recorded_newer_than_writable(_input: &InputRecord, _writable: u32) -> bool {
         false
     }
 
@@ -193,10 +196,9 @@ impl SegmentCodec for RsegCodec {
         crate::read::intern_catalog_labels(state, catalog);
     }
 
-    fn validate_rewrite_inputs(inputs: &[InputRecord]) -> Result<()> {
-        use crate::build::OUTPUT_FORMAT_VERSION;
+    fn validate_rewrite_inputs(inputs: &[InputRecord], writable: u32) -> Result<()> {
         // Fail closed on newer-than-writable (ADR-0066 decision 2): an input
-        // recorded ABOVE the current output version is a format this build
+        // recorded ABOVE the run's output version is a format this build
         // cannot write, so a rewrite would have to mislabel it downward. Refuse
         // it before any decode or PUT. An input recorded at or below the output
         // version is migratable forward -- `build_parts` copies a current-version
@@ -208,19 +210,19 @@ impl SegmentCodec for RsegCodec {
         // (older included), because RSEG could only copy pages verbatim.
         for input in inputs {
             let version = input.record.segment_format_version;
-            if Self::recorded_newer_than_writable(input) {
+            if Self::recorded_newer_than_writable(input, writable) {
                 return Err(crate::error::MaintainError::NewerThanWritable {
                     commit_key: input.commit_key.clone(),
                     version,
-                    writable: OUTPUT_FORMAT_VERSION,
+                    writable,
                 });
             }
         }
         Ok(())
     }
 
-    fn recorded_newer_than_writable(input: &InputRecord) -> bool {
-        input.record.segment_format_version > crate::build::OUTPUT_FORMAT_VERSION
+    fn recorded_newer_than_writable(input: &InputRecord, writable: u32) -> bool {
+        input.record.segment_format_version > writable
     }
 
     async fn load_input_catalog(
@@ -268,5 +270,48 @@ impl SegmentCodec for RsegCodec {
             input_set_hash,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::error::MaintainError;
+    use ravel_proto::commit::v1::CommitRecord;
+
+    fn input_at(version: u32) -> InputRecord {
+        InputRecord {
+            commit_key: format!("c/{version}"),
+            record: CommitRecord {
+                segment_format_version: version,
+                ..CommitRecord::default()
+            },
+        }
+    }
+
+    /// The newer-than-writable check compares against the version the run
+    /// writes, named explicitly, in either build. Comparing against
+    /// `SegmentVersion::CURRENT` (7) refuses the input at 8 that a run
+    /// writing 8 carries forward; comparing against the reader window's
+    /// newest admits it into a run writing 7 under `format-drill`.
+    #[test]
+    fn rseg_inputs_are_checked_against_the_runs_version() {
+        let inputs = [input_at(7), input_at(8)];
+
+        RsegCodec::validate_rewrite_inputs(&inputs, 8).expect("a run writing 8 carries 8");
+        assert!(!RsegCodec::recorded_newer_than_writable(&inputs[1], 8));
+
+        let err = RsegCodec::validate_rewrite_inputs(&inputs, 7).expect_err("8 above 7");
+        assert!(
+            matches!(
+                &err,
+                MaintainError::NewerThanWritable { commit_key, version: 8, writable: 7 }
+                    if commit_key == "c/8"
+            ),
+            "{err:?}"
+        );
+        assert!(RsegCodec::recorded_newer_than_writable(&inputs[1], 7));
+        assert!(!RsegCodec::recorded_newer_than_writable(&inputs[0], 7));
     }
 }

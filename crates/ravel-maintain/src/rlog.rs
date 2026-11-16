@@ -628,7 +628,13 @@ async fn load_catalog_noted(
             }
         }
     };
-    crate::compat_policy::refuse_unknown_sections(&object_key, &ftr.unknown_section_kinds, None)?;
+    // The probe ends at the object's end and covers the trailer whenever the
+    // footer opened, on both routes above.
+    crate::compat_policy::refuse_unknown_sections(
+        &object_key,
+        &ftr.unknown_section_kinds,
+        footer::trailer_version(&probe.bytes)?,
+    )?;
 
     // Decode the three whole-read directory sections, each sliced from the
     // probe when it lies inside it and fetched by range otherwise. BLOCKS and

@@ -39,17 +39,20 @@ use uuid::Uuid;
 /// Shard count of the provisioning record: wide enough for [`SHARD`].
 const SHARDS: u32 = 8;
 
+/// The newest RSEG version this build reads, so a floor one above it refuses
+/// every writer. Under `format-drill` that is the drill version, one above
+/// the version written with no policy.
 fn rseg_writing() -> u32 {
     FormatFamily::Rseg.writable_version()
 }
 
-/// The refusal a run writing RSEG at the build's version gets from a floor
-/// one above it.
+/// The refusal a run writing RSEG at the build's current version gets from a
+/// floor one above [`rseg_writing`].
 fn refused() -> BelowFormatFloor {
     BelowFormatFloor {
         family: FormatFamily::Rseg,
         floor: rseg_writing() + 1,
-        writing: rseg_writing(),
+        writing: ravel_maintain::build::OUTPUT_FORMAT_VERSION,
     }
 }
 

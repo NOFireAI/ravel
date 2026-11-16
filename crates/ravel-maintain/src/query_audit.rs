@@ -84,7 +84,8 @@ use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
 use crate::audit_pipeline::{AuditEvent, QueryAuditSink};
-use crate::audit_write::{AuditWrite, write_audit_object};
+use crate::audit_write::{AuditWrite, write_audit_object_with_compat};
+use crate::compat_policy::MaintainCompatPolicy;
 use crate::error::Result;
 
 /// The [`Signal::Audit`] shard query-audit records are written to. Deliberately
@@ -475,6 +476,35 @@ pub async fn write_query_audit(
     window_start_ns: i64,
     window_end_ns: i64,
 ) -> Result<()> {
+    write_query_audit_with_compat(
+        store,
+        tenant,
+        now_ns,
+        query_text,
+        language,
+        status,
+        window_start_ns,
+        window_end_ns,
+        None,
+    )
+    .await
+}
+
+/// [`write_query_audit`] under a `sys/compat` write policy (ADR-4233), as
+/// [`crate::write_hold_set_with_compat`] writes a hold. `None` writes exactly
+/// as [`write_query_audit`].
+#[allow(clippy::too_many_arguments)]
+pub async fn write_query_audit_with_compat(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    now_ns: i64,
+    query_text: &str,
+    language: &str,
+    status: QueryStatus,
+    window_start_ns: i64,
+    window_end_ns: i64,
+    compat: Option<&MaintainCompatPolicy>,
+) -> Result<()> {
     let event = query_audit_event(
         tenant,
         now_ns,
@@ -485,7 +515,7 @@ pub async fn write_query_audit(
         window_start_ns,
         window_end_ns,
     );
-    write_audit_object(
+    write_audit_object_with_compat(
         store,
         tenant,
         AuditWrite {
@@ -499,6 +529,7 @@ pub async fn write_query_audit(
             body: event.body,
             attrs: event.attrs,
         },
+        compat.map(|policy| (policy, "query audit")),
     )
     .await
 }
@@ -990,5 +1021,59 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    /// The policy reaches the audit write: a commit-record version this build
+    /// cannot write refuses the query audit before its data PUT. The counter
+    /// for this refusal is asserted by `legal_hold`'s own test.
+    #[tokio::test]
+    async fn a_query_audit_refuses_an_unwritable_commit_record_version_before_any_put() {
+        use std::sync::Arc;
+
+        use crate::compat_policy::CompatRunRefusal;
+        use crate::compat_policy::test_support::{ManualClock, T0, family, policy, write_compat};
+        use crate::error::MaintainError;
+        use ravel_catalog::compat::{CompatRefusal, FAMILY_COMMIT_RECORD};
+
+        let store = Arc::new(MemoryStore::new());
+        write_compat(
+            store.as_ref(),
+            vec![family(FAMILY_COMMIT_RECORD, 2)],
+            3_600_000_000_000,
+        )
+        .await;
+        let policy = policy(store.clone(), ManualClock::at(T0)).await;
+        let before = list_all(store.as_ref(), "").await.expect("list");
+
+        let err = write_query_audit_with_compat(
+            store.as_ref(),
+            &TenantHash([5; 16]),
+            T0,
+            "SELECT 1",
+            "sql",
+            QueryStatus::Ok,
+            0,
+            0,
+            Some(&policy),
+        )
+        .await
+        .expect_err("refused");
+
+        match err {
+            MaintainError::CompatRefused {
+                family,
+                refusal:
+                    CompatRunRefusal::Compat(CompatRefusal::ActiveVersionNotWritable {
+                        active: 2, ..
+                    }),
+                ..
+            } => assert_eq!(family, FAMILY_COMMIT_RECORD),
+            other => panic!("expected a commit-record refusal, got {other:?}"),
+        }
+        assert_eq!(
+            list_all(store.as_ref(), "").await.expect("list"),
+            before,
+            "nothing is written"
+        );
     }
 }

@@ -45,7 +45,6 @@ use ravel_object_store::fault::{
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
 use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
-use ravel_proto::segment::v1::Section;
 use ravel_proto::sys::v1 as sysproto;
 use ravel_segment::{ReaderLimits, VERSION_V7, open_from_full};
 use uuid::Uuid;
@@ -225,7 +224,8 @@ fn refused_under(err: &MaintainError, family: &str) -> CompatRunRefusal {
 async fn compaction_refuses_an_unwritable_active_version_before_any_claim_or_put() {
     let store = Arc::new(MemoryStore::new());
     seed_two_inputs(store.as_ref()).await;
-    write_compat(store.as_ref(), vec![family(FAMILY_RSEG, 8)]).await;
+    // 9: above the window with or without `format-drill`.
+    write_compat(store.as_ref(), vec![family(FAMILY_RSEG, 9)]).await;
     let policy = policy_over(store.clone(), ManualClock::at(T0)).await;
     let ledger = RequestLedger::new();
     let config = CompactorConfig {
@@ -247,7 +247,7 @@ async fn compaction_refuses_an_unwritable_active_version_before_any_claim_or_put
     assert!(
         matches!(
             refused_under(&err, FAMILY_RSEG),
-            CompatRunRefusal::Compat(CompatRefusal::ActiveVersionNotWritable { active: 8, .. })
+            CompatRunRefusal::Compat(CompatRefusal::ActiveVersionNotWritable { active: 9, .. })
         ),
         "{err:?}"
     );
@@ -605,42 +605,6 @@ async fn the_version_is_chosen_once_per_run_not_per_put() {
     }
 }
 
-/// A section kind no `section_kind` constant names.
-const UNKNOWN_KIND: u32 = 0xFEED_0001;
-
-/// `obj` with one extra section of [`UNKNOWN_KIND`] spliced in past the last
-/// real one and the footer and trailer crcs re-sealed: a well-formed object a
-/// newer writer could have produced.
-fn with_unknown_section(obj: &[u8]) -> Vec<u8> {
-    let payload = b"opaque future-section bytes";
-    let loc = open_from_full(obj, ReaderLimits::default()).expect("open original");
-    let mut footer = loc.footer.clone();
-    let mut out = obj[..loc.footer_offset as usize].to_vec();
-    out.extend_from_slice(payload);
-    footer.sections.push(Section {
-        kind: UNKNOWN_KIND,
-        offset: loc.footer_offset,
-        len: payload.len() as u64,
-        crc32c: crc32c::crc32c(payload),
-        comp: 0,
-        uncompressed_len: payload.len() as u64,
-    });
-    let footer_bytes = footer.encode_to_vec();
-    let footer_len = footer_bytes.len() as u32;
-    out.extend_from_slice(&footer_bytes);
-    let trailer = &obj[loc.trailer_offset as usize..];
-    let (version, tail) = (&trailer[8..10], &trailer[10..16]);
-    let mut crc = crc32c::crc32c(&footer_bytes);
-    crc = crc32c::crc32c_append(crc, &footer_len.to_le_bytes());
-    crc = crc32c::crc32c_append(crc, version);
-    crc = crc32c::crc32c_append(crc, tail);
-    out.extend_from_slice(&footer_len.to_le_bytes());
-    out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(version);
-    out.extend_from_slice(tail);
-    out
-}
-
 /// Seed the bucket's second input with an unknown section kind spliced in,
 /// its commit record naming the spliced bytes and stamped at
 /// `recorded_version`. Returns the data key.
@@ -745,8 +709,9 @@ async fn an_unknown_section_kind_holds_the_bucket_in_compaction() {
 
     assert_eq!(
         outcome,
-        CompactionOutcome::HeldOutOfWindow {
-            version: VERSION_V7
+        CompactionOutcome::HeldUnknownSection {
+            version: VERSION_V7,
+            kinds: vec![UNKNOWN_KIND],
         }
     );
     assert_eq!(buckets_held_unknown_section_total(), held + 1);
@@ -756,7 +721,9 @@ async fn an_unknown_section_kind_holds_the_bucket_in_compaction() {
 }
 
 /// H6 in `migrate`: the walk holds a bucket whose below-target input carries
-/// an unknown section kind, writes nothing for it, and raises no floor.
+/// an unknown section kind, writes nothing for it, and raises no floor. The
+/// commit record says one version below the object's trailer, and the hold
+/// names the trailer's version, the one the object was written at.
 #[tokio::test]
 async fn an_unknown_section_kind_holds_the_bucket_in_migrate() {
     let store = MemoryStore::new();
@@ -787,9 +754,10 @@ async fn an_unknown_section_kind_holds_the_bucket_in_migrate() {
         vec![MigrateHeldBucket {
             shard: SHARD,
             ingest_hour: HOUR,
-            reason: MigrateHoldReason::InputOutOfWindow {
+            reason: MigrateHoldReason::UnknownSection {
                 object_key: data_key,
                 version: VERSION_V7,
+                kinds: vec![UNKNOWN_KIND],
             },
         }]
     );
@@ -901,5 +869,95 @@ async fn force2_needs_compaction_record_active_at_2() {
     assert_eq!(
         new_record.format_version,
         record::COMPACTION_SUPERSEDING_FORMAT_VERSION
+    );
+}
+
+/// `compaction-record` is a ceiling on a plain compaction: an active version
+/// this build cannot write refuses the run before its claim and every PUT,
+/// counted under `compaction-record`, even though the run would write
+/// version 1.
+#[tokio::test]
+async fn compaction_refuses_an_unwritable_compaction_record_version_before_any_claim() {
+    let store = Arc::new(MemoryStore::new());
+    seed_two_inputs(store.as_ref()).await;
+    write_compat(
+        store.as_ref(),
+        vec![
+            family(FAMILY_RSEG, u32::from(VERSION_V7)),
+            family(FAMILY_COMPACTION_RECORD, 9),
+        ],
+    )
+    .await;
+    let ledger = RequestLedger::new();
+    let config = CompactorConfig {
+        request_ledger: Some(ledger.clone()),
+        ..config_with(policy_over(store.clone(), ManualClock::at(T0)).await)
+    };
+    let before = snapshot(store.as_ref()).await;
+    let refused =
+        compat_publish_refused_total(FAMILY_COMPACTION_RECORD, "active_version_not_writable");
+
+    let err = compact_bucket(
+        store.as_ref(),
+        &FixedClock::new(sealed_now_ns()),
+        &config,
+        &bucket(),
+    )
+    .await
+    .expect_err("refused");
+
+    assert!(
+        matches!(
+            refused_under(&err, FAMILY_COMPACTION_RECORD),
+            CompatRunRefusal::Compat(CompatRefusal::ActiveVersionNotWritable { active: 9, .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(snapshot(store.as_ref()).await, before, "nothing is written");
+    assert_eq!(
+        compat_publish_refused_total(FAMILY_COMPACTION_RECORD, "active_version_not_writable"),
+        refused + 1
+    );
+    assert_eq!(ledger.report().coordinate.requests, 0, "no claim was taken");
+}
+
+/// A plain compaction under `compaction-record` active at 2 still writes a
+/// version 1 record, whose content needs nothing newer, and so owes the
+/// bucket no fence: the activation of a ceiling family raises none.
+#[tokio::test]
+async fn compaction_record_active_at_2_still_writes_version_1_and_owes_no_fence() {
+    let store = Arc::new(MemoryStore::new());
+    seed_two_inputs(store.as_ref()).await;
+    write_compat(
+        store.as_ref(),
+        vec![
+            family(FAMILY_RSEG, u32::from(VERSION_V7)),
+            family(FAMILY_COMPACTION_RECORD, 1),
+        ],
+    )
+    .await;
+    provision(store.as_ref()).await;
+    activate(store.as_ref(), FAMILY_COMPACTION_RECORD, 2).await;
+    let config = config_with(policy_over(store.clone(), ManualClock::at(T0)).await);
+
+    let outcome = compact_bucket(
+        store.as_ref(),
+        &FixedClock::new(sealed_now_ns()),
+        &config,
+        &bucket(),
+    )
+    .await
+    .expect("compacts");
+
+    assert!(
+        matches!(outcome, CompactionOutcome::Compacted { .. }),
+        "{outcome:?}"
+    );
+    let written = fetch_compaction_record(store.as_ref(), &bucket()).await;
+    assert_eq!(written.format_version, record::COMPACTION_FORMAT_VERSION);
+    assert_eq!(
+        provisioned_compat_epoch(store.as_ref()).await,
+        0,
+        "no fence"
     );
 }

@@ -134,7 +134,7 @@ pub use migrate::{
     ReencodeBlockedReason, UnwritableBucket, Verification, background_migrate_unit, census_family,
     count_below_target, migrate_family,
 };
-pub use provision_audit::write_reshard_audit;
+pub use provision_audit::{write_reshard_audit, write_reshard_audit_with_compat};
 pub use publish::{
     ConservationPredicate, PublishOutcome, conserve_exact, publish_record,
     publish_record_with_conservation,
@@ -143,6 +143,7 @@ pub use query_audit::{
     ATTR_ENGINE_LANGUAGE, ATTR_PRINCIPAL_SUBJECT, ATTR_PRINCIPAL_SUBJECT_SOURCE, ATTR_QUERY_ID,
     AuditCall, AuditCallSink, AuditSubject, AuditTextPolicy, QUERY_AUDIT_SHARD, QueryStatus,
     QueryTextRedactor, RedactingAuditSink, query_audit_event, write_query_audit,
+    write_query_audit_with_compat,
 };
 pub use ravel_fleet::worker_set::{WorkerSet, owner, owns, run_bounded, unit_key};
 pub use reachability::MarkerStats;

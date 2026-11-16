@@ -8,7 +8,7 @@
 //!
 //! - fix the version it writes for each family it touches once, at the run
 //!   start, before any claim, build or PUT ([`CompatRun`]); a view older than
-//!   [`COMPAT_VIEW_HORIZON_NS`], an active version this build cannot write, or
+//!   [`ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS`], an active version this build cannot write, or
 //!   an absent `sys/compat` with an activation on record refuses the run;
 //! - re-check the view's age before every PUT attempt of a data object or a
 //!   record, retries included ([`CompatRun::before_put`]);
@@ -29,8 +29,8 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use futures::lock::Mutex as AsyncMutex;
 use prost::Message;
 use ravel_catalog::compat::{
-    COMPAT_VIEW_HORIZON_NS, CompatClock, CompatRefusal, CompatView, FAMILY_COMMIT_RECORD,
-    FAMILY_COMPACTION_RECORD, FAMILY_REWRITE_RECORD, FAMILY_RLOG, FAMILY_RSEG, FAMILY_RSPAN,
+    CompatClock, CompatRefusal, CompatView, FAMILY_COMMIT_RECORD, FAMILY_COMPACTION_RECORD,
+    FAMILY_REWRITE_RECORD, FAMILY_RLOG, FAMILY_RSEG, FAMILY_RSPAN,
 };
 use ravel_catalog::{CompatFenceOutcome, provisioning_key, raise_compat_fence};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
@@ -218,8 +218,27 @@ impl MaintainCompatPolicy {
         record: Option<&sysproto::ProvisioningRecord>,
         lifetime_ns: i64,
     ) -> Result<CompatRun> {
+        self.begin_with_ceilings(run, families, &[], bucket, record, lifetime_ns)
+    }
+
+    /// [`Self::begin`] that also checks `ceilings`: families whose active
+    /// version bounds what the run emits rather than naming it, because the
+    /// run writes the version its content needs, at or below the active one.
+    /// A ceiling whose active version is not writable refuses the run like a
+    /// written family; a ceiling owes no fence, since nothing above its
+    /// baseline is written under it.
+    pub(crate) fn begin_with_ceilings(
+        &self,
+        run: &'static str,
+        families: &[&'static str],
+        ceilings: &[&'static str],
+        bucket: Option<(TenantHash, Signal)>,
+        record: Option<&sysproto::ProvisioningRecord>,
+        lifetime_ns: i64,
+    ) -> Result<CompatRun> {
         let now = self.now_unix_ns();
         let mut versions = Vec::with_capacity(families.len());
+        let mut ceiling_versions = Vec::with_capacity(ceilings.len());
         let mut fence_epoch = 0u64;
         for family in families {
             let (writable, baseline) = self
@@ -243,6 +262,26 @@ impl MaintainCompatPolicy {
                 fence_epoch = fence_epoch.max(seen.activated_epoch);
             }
             versions.push((*family, version));
+        }
+        // After the written families, so a refusal of the whole record (absent,
+        // stale) is counted under the family the run writes.
+        for family in ceilings {
+            let (writable, baseline) = self
+                .families
+                .get(*family)
+                .map_or((&[][..], 0), |v| (v.writable.as_slice(), v.baseline));
+            let version = self
+                .view
+                .write_policy(now, family, writable, baseline, record)
+                .map_err(|refusal| {
+                    refuse(
+                        run,
+                        family,
+                        bucket.as_ref(),
+                        CompatRunRefusal::Compat(refusal),
+                    )
+                })?;
+            ceiling_versions.push((*family, version));
         }
         let recorded = self
             .view
@@ -280,6 +319,7 @@ impl MaintainCompatPolicy {
                 run,
                 started_unix_ns: now,
                 versions,
+                ceilings: ceiling_versions,
                 bucket,
                 fence,
             }),
@@ -413,6 +453,7 @@ struct RunInner {
     run: &'static str,
     started_unix_ns: i64,
     versions: Vec<(&'static str, u16)>,
+    ceilings: Vec<(&'static str, u16)>,
     bucket: Option<(TenantHash, Signal)>,
     fence: Option<PendingFence>,
 }
@@ -430,6 +471,7 @@ impl std::fmt::Debug for CompatRun {
             .field("run", &self.inner.run)
             .field("started_unix_ns", &self.inner.started_unix_ns)
             .field("versions", &self.inner.versions)
+            .field("ceilings", &self.inner.ceilings)
             .field(
                 "fence_epoch",
                 &self.inner.fence.as_ref().map(|f| f.compat_epoch),
@@ -446,6 +488,26 @@ impl CompatRun {
             .iter()
             .find(|(f, _)| *f == family)
             .map(|(_, v)| *v)
+    }
+
+    /// The active version that bounds what this run emits for `family`, if
+    /// the run took the family as a ceiling.
+    pub fn ceiling(&self, family: &str) -> Option<u16> {
+        self.inner
+            .ceilings
+            .iter()
+            .find(|(f, _)| *f == family)
+            .map(|(_, v)| *v)
+    }
+
+    /// Whether this run checked `family`, as a written family or a ceiling.
+    fn covers(&self, family: &str) -> bool {
+        self.version(family).is_some() || self.ceiling(family).is_some()
+    }
+
+    /// The bucket this run writes into, if it was started for one.
+    pub fn bucket(&self) -> Option<(TenantHash, Signal)> {
+        self.inner.bucket
     }
 
     pub fn started_unix_ns(&self) -> i64 {
@@ -485,16 +547,10 @@ impl CompatRun {
     pub(crate) async fn before_put(&self, store: &dyn ObjectStoreBackend) -> Result<()> {
         let policy = &self.inner.policy;
         let now = policy.now_unix_ns();
-        let last = policy.view.last_read_unix_ns();
-        let fresh = last.is_some_and(|last| now.saturating_sub(last) < COMPAT_VIEW_HORIZON_NS);
-        if !fresh {
-            return Err(
-                self.refuse(CompatRunRefusal::Compat(CompatRefusal::ViewStale {
-                    last_read_unix_ns: last,
-                    now_unix_ns: now,
-                })),
-            );
-        }
+        policy
+            .view
+            .check_fresh(now)
+            .map_err(|refusal| self.refuse(CompatRunRefusal::Compat(refusal)))?;
         let Some(fence) = self.inner.fence.as_ref() else {
             return Ok(());
         };
@@ -578,14 +634,40 @@ pub(crate) async fn begin_bucket_run(
     run: &'static str,
     families: &[&'static str],
 ) -> Result<Option<CompatRun>> {
+    begin_bucket_run_with_ceilings(store, config, bucket, run, families, &[]).await
+}
+
+/// [`begin_bucket_run`] that also checks `ceilings`
+/// ([`MaintainCompatPolicy::begin_with_ceilings`]). An outer run already in
+/// `config` is reused when it covers every family and ceiling, and refused
+/// with [`MaintainError::CompatRunBucketMismatch`] when it was started for
+/// another bucket.
+pub(crate) async fn begin_bucket_run_with_ceilings(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    run: &'static str,
+    families: &[&'static str],
+    ceilings: &[&'static str],
+) -> Result<Option<CompatRun>> {
     let Some(policy) = config.compat_policy.as_ref() else {
         return Ok(None);
     };
     if let Some(outer) = config.compat_run.as_ref()
         && families
             .iter()
-            .all(|family| outer.version(family).is_some())
+            .chain(ceilings)
+            .all(|family| outer.covers(family))
     {
+        if let Some((tenant_hash, signal)) = outer.bucket()
+            && (tenant_hash != bucket.tenant_hash || signal != bucket.signal)
+        {
+            return Err(MaintainError::CompatRunBucketMismatch {
+                run,
+                bucket: format!("{}/{:?}", bucket.tenant_hash.to_hex(), bucket.signal),
+                run_bucket: format!("{}/{signal:?}", tenant_hash.to_hex()),
+            });
+        }
         return Ok(Some(outer.clone()));
     }
     let key = provisioning_key(&bucket.tenant_hash, bucket.signal);
@@ -604,9 +686,10 @@ pub(crate) async fn begin_bucket_run(
         Err(err) => return Err(MaintainError::Store(err)),
     };
     policy
-        .begin(
+        .begin_with_ceilings(
             run,
             families,
+            ceilings,
             Some((bucket.tenant_hash, bucket.signal)),
             record.as_ref(),
             config.max_compaction_lifetime_ns,
@@ -614,8 +697,7 @@ pub(crate) async fn begin_bucket_run(
         .map(Some)
 }
 
-/// [`begin_bucket_run`] for a writer of `bucket`'s part family alone, the
-/// shape compaction uses.
+/// [`begin_bucket_run`] for a writer of `bucket`'s part family alone.
 pub(crate) async fn begin_part_run(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
@@ -624,6 +706,32 @@ pub(crate) async fn begin_part_run(
 ) -> Result<Option<CompatRun>> {
     match part_family(bucket.signal) {
         Some(family) => begin_bucket_run(store, config, bucket, run, &[family]).await,
+        None => Ok(None),
+    }
+}
+
+/// [`begin_part_run`] for a run that also publishes a compaction record, the
+/// shape compaction and migrate use: `compaction-record` is a ceiling, since
+/// the record is written at the version its content needs (version 1 for
+/// these runs), never above the active one.
+pub(crate) async fn begin_compaction_run(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    run: &'static str,
+) -> Result<Option<CompatRun>> {
+    match part_family(bucket.signal) {
+        Some(family) => {
+            begin_bucket_run_with_ceilings(
+                store,
+                config,
+                bucket,
+                run,
+                &[family],
+                &[FAMILY_COMPACTION_RECORD],
+            )
+            .await
+        }
         None => Ok(None),
     }
 }
@@ -664,6 +772,20 @@ pub(crate) fn run_version(config: &CompactorConfig, family: &str) -> Option<u16>
         .compat_run
         .as_ref()
         .and_then(|run| run.version(family))
+}
+
+/// The part version `compat` writes for `signal`'s family, or the build's
+/// current one with no run.
+pub(crate) fn part_write_version(compat: Option<&CompatRun>, signal: Signal) -> Result<u32> {
+    match part_family(signal).and_then(|family| compat?.version(family)) {
+        Some(version) => Ok(u32::from(version)),
+        // Alert and audit buckets compact as RLOG, though force 2 does not
+        // re-encode them.
+        None => match signal {
+            Signal::Alerts | Signal::Audit => Ok(crate::rlog::OUTPUT_FORMAT_VERSION),
+            other => crate::rewrite::current_part_version(other),
+        },
+    }
 }
 
 /// The RSEG version a compaction part is written at: the run's, or the
@@ -713,7 +835,7 @@ pub(crate) fn rspan_write_version(
 pub(crate) fn refuse_unknown_sections(
     object_key: &str,
     unknown_section_kinds: &[u32],
-    recorded_version: Option<u32>,
+    recorded_version: u16,
 ) -> Result<()> {
     if unknown_section_kinds.is_empty() {
         return Ok(());
@@ -825,6 +947,7 @@ mod tests {
 
     use super::test_support::{ManualClock, T0, activate, family, policy, write_compat};
     use super::*;
+    use ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS;
 
     const HOUR_NS: i64 = 3_600_000_000_000;
 
@@ -1039,6 +1162,72 @@ mod tests {
                 }
             ),
             "{err:?}"
+        );
+    }
+
+    /// An outer run handed down for one bucket is reused there without a
+    /// provisioning read, and refused with a typed error for any other bucket.
+    #[tokio::test]
+    async fn an_outer_run_is_refused_for_another_bucket() {
+        let store = Arc::new(MemoryStore::new());
+        let rseg = u32::from(ravel_segment::SegmentVersion::CURRENT.number());
+        write_compat(store.as_ref(), vec![family(FAMILY_RSEG, rseg)], HOUR_NS).await;
+        let policy = policy(store.clone(), ManualClock::at(T0)).await;
+        let outer = policy
+            .begin(
+                "migration",
+                &[FAMILY_RSEG],
+                Some(bucket_id()),
+                Some(&record_at(0)),
+                0,
+            )
+            .expect("begin");
+        let ledger = crate::request_ledger::RequestLedger::new();
+        let config = CompactorConfig {
+            compat_policy: Some(policy),
+            compat_run: Some(outer),
+            request_ledger: Some(ledger.clone()),
+            ..CompactorConfig::default()
+        };
+        let (tenant_hash, signal) = bucket_id();
+
+        let same = begin_part_run(
+            store.as_ref(),
+            &config,
+            &Bucket::new(tenant_hash, signal, 0, 1),
+            "compaction",
+        )
+        .await
+        .expect("same bucket");
+        assert_eq!(
+            same.and_then(|run| run.version(FAMILY_RSEG)),
+            Some(u16::try_from(rseg).expect("u16"))
+        );
+        let err = begin_part_run(
+            store.as_ref(),
+            &config,
+            &Bucket::new(TenantHash([4; 16]), signal, 0, 1),
+            "compaction",
+        )
+        .await
+        .expect_err("another bucket");
+
+        assert!(
+            matches!(
+                &err,
+                MaintainError::CompatRunBucketMismatch {
+                    run: "compaction",
+                    bucket,
+                    run_bucket,
+                } if bucket.starts_with(&TenantHash([4; 16]).to_hex())
+                    && run_bucket.starts_with(&tenant_hash.to_hex())
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            ledger.report().floor_read.requests,
+            0,
+            "no provisioning read"
         );
     }
 }

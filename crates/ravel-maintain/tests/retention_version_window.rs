@@ -218,7 +218,8 @@ async fn an_out_of_window_object_holds_the_bucket() {
     let retention = retention_at_floor(&config);
     let (bucket, commit_keys) = seed_two_metrics(&store).await;
     let data = data_keys(&store, &commit_keys).await;
-    stamp_version(&store, &data[0], 8).await;
+    // 9: above the window with or without `format-drill`.
+    stamp_version(&store, &data[0], 9).await;
 
     let (clock, armed) = tombstone_and_arm(&store, &bucket, &config, &retention).await;
     let before = held_out_of_window_objects_total();
@@ -253,8 +254,8 @@ async fn the_counter_counts_every_held_object() {
     let retention = retention_at_floor(&config);
     let (bucket, commit_keys) = seed_two_metrics(&store).await;
     let data = data_keys(&store, &commit_keys).await;
-    stamp_version(&store, &data[0], 8).await;
-    stamp_version(&store, &data[1], 9).await;
+    stamp_version(&store, &data[0], 9).await;
+    stamp_version(&store, &data[1], 10).await;
 
     let (clock, armed) = tombstone_and_arm(&store, &bucket, &config, &retention).await;
     let before = held_out_of_window_objects_total();

@@ -833,16 +833,8 @@ impl CompatView {
         baseline: u16,
         bucket: Option<&sysproto::ProvisioningRecord>,
     ) -> Result<u16, CompatRefusal> {
+        self.check_fresh(now_unix_ns)?;
         let state = self.inner.state.read();
-        let fresh = state
-            .last_read_unix_ns
-            .is_some_and(|last| now_unix_ns.saturating_sub(last) < COMPAT_VIEW_HORIZON_NS);
-        if !fresh {
-            return Err(CompatRefusal::ViewStale {
-                last_read_unix_ns: state.last_read_unix_ns,
-                now_unix_ns,
-            });
-        }
         let bucket_compat_epoch = bucket.map_or(0, |b| b.compat_epoch);
         if !state.present && (bucket_compat_epoch > 0 || state.seen_epoch > 0) {
             return Err(CompatRefusal::CompatRecordMissing {
@@ -862,6 +854,24 @@ impl CompatView {
                 writable: writable.to_vec(),
             }),
         }
+    }
+
+    /// Whether the view is fresh enough to publish under at `now_unix_ns`:
+    /// [`CompatRefusal::ViewStale`] when the last successful read is at least
+    /// [`COMPAT_VIEW_HORIZON_NS`] old, or there has been none. The freshness
+    /// rule [`Self::write_policy`] applies, for writers that recheck it before
+    /// every PUT.
+    pub fn check_fresh(&self, now_unix_ns: i64) -> Result<(), CompatRefusal> {
+        let last_read_unix_ns = self.inner.state.read().last_read_unix_ns;
+        let fresh = last_read_unix_ns
+            .is_some_and(|last| now_unix_ns.saturating_sub(last) < COMPAT_VIEW_HORIZON_NS);
+        if !fresh {
+            return Err(CompatRefusal::ViewStale {
+                last_read_unix_ns,
+                now_unix_ns,
+            });
+        }
+        Ok(())
     }
 
     /// The highest values seen for `family`, if any read carried it.
