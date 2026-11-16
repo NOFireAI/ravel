@@ -365,6 +365,10 @@ jobs:
       # itself runs only in k8s-nightly.yml's agents-chaos job.
       - name: Agents chaos assertion cases (issue #3363)
         run: bash scripts/chaos/agents-replace-worker.test.sh
+      # The released-binary fence drill's decision logic on recorded key
+      # lists; the drill itself needs the v0.33.0 assets and runs by hand.
+      - name: Released-binary fence drill decision cases (issue #4243)
+        run: bash scripts/compat/released-binary-drill.test.sh
       # Documentation gate (ADR-1040 D3). Run UNPIPED: a pipeline's exit code is
       # the last stage's, so a real failure piped through tail/grep would report
       # as a pass. No cargo toolchain, matching this job.
