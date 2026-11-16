@@ -19,11 +19,17 @@
 //! tombstone-only or rewrite-only hour can anchor the window exactly as a
 //! fresh commit record would.
 //!
-//! The pass runs in this order (issue #4257): tenant discovery; part
-//! resolution, which resolves every tenant's warm set for both signals;
-//! then the whole-part warm and the logs metadata pass, run concurrently.
-//! The whole-part warm takes tenants in discovery order and, within a
-//! tenant, fetches its metric and logs parts concurrently, at most
+//! The pass runs in this order (issue #4257): tenant discovery, then part
+//! resolution, the whole-part warm and the logs metadata pass, all three
+//! concurrently. Part resolution resolves each tenant's warm set for both
+//! signals, at most [`PART_RESOLUTIONS_IN_FLIGHT`] tenants at once, each
+//! resolution holding one permit of the shared store GET limiter while it
+//! runs, and hands the sets on in discovery order as they complete: a tenant
+//! is warmed while later tenants are still resolving, so a slow listing
+//! store spends the deadline on warming the first tenants, not on resolving
+//! every tenant before any warm starts. The whole-part warm takes tenants in
+//! discovery order as their sets arrive and, within a tenant, fetches its
+//! metric and logs parts concurrently, at most
 //! [`WHOLE_PARTS_IN_FLIGHT_PER_SIGNAL`] parts of each signal at once, each
 //! GET through the shared store GET limiter. The metadata pass takes tenants
 //! in the same order on its own future and reads at most one object fewer at
@@ -31,17 +37,25 @@
 //! permits, one permit stays free of the pass, so neither step waits for the
 //! other to finish and a pass hung on one tenant does not hold back a later
 //! tenant's whole-part warm. With 1 permit the pass reads on the only permit,
-//! and a hung probe holds it until the deadline.
+//! and a hung probe holds it, and with it every later resolution and
+//! whole-part GET, until the deadline.
 //!
 //! The whole-part warm holds to the cache budget minus the metadata pass's
-//! ceiling (below). Each part reserves its object size before its fetch
-//! starts and is skipped, counted in `parts_over_budget`, when it does not
-//! fit; once the fetch completes, its reservation becomes the bytes the fetch
-//! read from the store. Together the two steps insert no more than the cache
-//! holds, so neither evicts what the other counted, as long as the metadata
-//! pass stays inside its ceiling: its admission check counts an in-flight
-//! object's probe length, not the directory reads after it, so directory
-//! reads past a probe can carry it over.
+//! ceiling (below), or to the whole budget when the pass does not run. Each
+//! part reserves what its fetch reads before the fetch starts: a logs part
+//! its object size (the logs funnel reads the object whole), a metric part
+//! what the metrics funnel's first GET reads (the whole object at or below
+//! [`DEFAULT_WHOLE_OBJECT_THRESHOLD`], else a [`DEFAULT_SUFFIX_LEN`] footer
+//! tail). A part that does not fit waits for its signal's fetches in flight,
+//! which settle to the bytes they read and can free room; one that does not
+//! fit with none in flight is skipped, counted in `parts_over_budget`. Once a
+//! fetch completes, its reservation becomes the bytes it read from the store.
+//! Together the two steps insert no more than the cache holds, so neither
+//! evicts what the other counted, as long as each stays inside its share: a
+//! metric part whose catalog sections reach past its footer tail reads more
+//! than it reserved, and the metadata pass's admission check counts an
+//! in-flight object's probe length, not the directory reads after it, so
+//! reads past a reservation can carry either step over.
 //!
 //! Bounded on two axes. Per (tenant, signal), at most
 //! [`MAX_PARTS_PER_TENANT_PER_SIGNAL`] of the most recent parts are warmed
@@ -111,11 +125,19 @@ use futures::stream::{FuturesUnordered, StreamExt as _};
 use ravel_catalog::{Catalog, SegmentRef};
 use ravel_ingest::Clock;
 use ravel_object_store::ObjectStoreBackend;
-use ravel_query::{EngineConfig, LogQuery, LogSegmentFetcher, ReadCache, SegmentFetcher};
+use ravel_query::{
+    DEFAULT_SUFFIX_LEN, DEFAULT_WHOLE_OBJECT_THRESHOLD, EngineConfig, LogQuery, LogSegmentFetcher,
+    ReadCache, SegmentFetcher,
+};
 use ravel_types::{Signal, TenantHash};
 
 /// Per (tenant, signal), the number of most-recent parts warmed whole.
 const MAX_PARTS_PER_TENANT_PER_SIGNAL: usize = 4;
+
+/// The tenants whose warm sets resolve at once, each resolution holding one
+/// GET limiter permit, so resolution never takes every permit from the warms
+/// running beside it on a limiter with more permits than this.
+const PART_RESOLUTIONS_IN_FLIGHT: usize = 4;
 
 /// Per (tenant, signal), the whole-part fetches in flight at once. Each one
 /// decodes the part it reads, and the memory budget it reserves against covers
@@ -161,8 +183,8 @@ impl LogsMetadataWarm {
 /// Overall wall-clock budget for the whole pass, across every tenant and
 /// signal and every step. A single deadline over the whole pass, not a
 /// per-fetch one: a store with many tenants must not warm zero of them just
-/// because the first several were slow. The whole-part warm and the logs
-/// metadata pass run concurrently, both under this one deadline.
+/// because the first several were slow. Part resolution, the whole-part warm
+/// and the logs metadata pass run concurrently, all under this one deadline.
 pub(crate) const WARM_DEADLINE: Duration = Duration::from_secs(10);
 
 /// How many ingest hours before the tenant's own latest ingest hour the warm
@@ -219,8 +241,8 @@ struct WarmProgress {
     metadata_objects_warmed: AtomicU64,
     metadata_bytes_warmed: AtomicU64,
     /// The bytes the whole-part warm holds against its share of the cache:
-    /// each in-flight fetch's object size, then each completed fetch's bytes
-    /// read from the store.
+    /// each in-flight fetch's reservation ([`whole_part_reservation`]), then
+    /// each completed fetch's bytes read from the store.
     whole_part_bytes_reserved: AtomicU64,
     /// The objects the metadata pass reads at once, each holding one GET
     /// permit; 0 when the pass does not run.
@@ -414,62 +436,61 @@ async fn warm_cache_inner(
         .with_get_limiter(get_limiter.clone())
         .with_memory_budget(memory_budget.clone())
         .with_read_gate(read_gate.clone());
-    let metadata_ceiling = logs_metadata.cache_max_bytes / METADATA_CACHE_SHARE_DIVISOR;
+    let mut metadata_pass = LogsMetadataPass::new(
+        store,
+        cache,
+        get_limiter.clone(),
+        memory_budget,
+        read_gate,
+        logs_metadata,
+    );
     // The whole-part warm and the metadata pass insert beside each other, so
     // each holds to its own share and together they never pass the cache's
     // budget: an eviction would drop entries the pass has already counted.
     let whole_part_budget = logs_metadata
         .cache_max_bytes
-        .saturating_sub(metadata_ceiling);
-    let mut metadata_pass = LogsMetadataPass::new(
-        store,
-        cache,
-        get_limiter,
-        memory_budget,
-        read_gate,
-        logs_metadata,
-    );
+        .saturating_sub(metadata_pass.as_ref().map_or(0, |pass| pass.ceiling));
     if let Some(pass) = metadata_pass.as_ref() {
         progress
             .metadata_get_permits
             .store(pass.concurrency as u64, Ordering::Relaxed);
     }
 
-    let resolution_started = tokio::time::Instant::now();
-    progress.begin(WarmStep::PartResolution);
-    let mut warm_sets = Vec::with_capacity(tenants.len());
-    for tenant in tenants {
-        warm_sets.push(TenantWarmSet {
-            tenant,
-            metrics: most_recent_parts(&catalog, tenant, Signal::Metrics, now_ns).await,
-            logs: most_recent_parts(&catalog, tenant, Signal::Logs, now_ns).await,
-        });
-    }
-    progress.end(WarmStep::PartResolution);
-    let part_resolution_elapsed_ms = elapsed_ms(resolution_started);
-
-    let planned_windows: Vec<(TenantHash, Vec<SegmentRef>)> = match metadata_pass.as_ref() {
-        Some(pass) => warm_sets
-            .iter()
-            .filter_map(|set| {
-                let planned: Vec<SegmentRef> = set
-                    .logs
-                    .0
-                    .iter()
-                    .filter(|part| pass.fetcher.plans_segment(part))
-                    .cloned()
-                    .collect();
-                (!planned.is_empty()).then_some((set.tenant, planned))
+    let (whole_part_tx, mut whole_part_rx) = futures::channel::mpsc::unbounded();
+    let (metadata_tx, mut metadata_rx) = futures::channel::mpsc::unbounded();
+    let metadata_tx = metadata_pass.is_some().then_some(metadata_tx);
+    let resolution = async move {
+        let step_started = tokio::time::Instant::now();
+        progress.begin(WarmStep::PartResolution);
+        let catalog = &catalog;
+        let get_limiter = &get_limiter;
+        let mut resolved = futures::stream::iter(tenants)
+            .map(|tenant| async move {
+                // The limiter is never closed (see `GetLimiterClosed`); were
+                // it, resolution would run unthrottled rather than not at all.
+                let _permit = get_limiter.acquire().await.ok();
+                Arc::new(TenantWarmSet {
+                    tenant,
+                    metrics: most_recent_parts(catalog, tenant, Signal::Metrics, now_ns).await,
+                    logs: most_recent_parts(catalog, tenant, Signal::Logs, now_ns).await,
+                })
             })
-            .collect(),
-        None => Vec::new(),
+            .buffered(PART_RESOLUTIONS_IN_FLIGHT);
+        while let Some(set) = resolved.next().await {
+            if let Some(tx) = metadata_tx.as_ref() {
+                let _ = tx.unbounded_send(set.clone());
+            }
+            let _ = whole_part_tx.unbounded_send(set);
+        }
+        progress.end(WarmStep::PartResolution);
+        elapsed_ms(step_started)
     };
 
     let whole_part_warm = async {
         let step_started = tokio::time::Instant::now();
         progress.begin(WarmStep::WholePartWarm);
         let mut warmed = 0usize;
-        for set in &warm_sets {
+        while let Some(set) = whole_part_rx.next().await {
             let (metrics, logs) = futures::join!(
                 warm_metric_parts(
                     &metrics_fetcher,
@@ -499,10 +520,20 @@ async fn warm_cache_inner(
             return 0;
         };
         progress.begin(WarmStep::MetadataPass);
-        for (tenant, planned) in &planned_windows {
-            let warmed = pass.warm(*tenant, planned, progress).await;
+        while let Some(set) = metadata_rx.next().await {
+            let planned: Vec<SegmentRef> = set
+                .logs
+                .0
+                .iter()
+                .filter(|part| pass.fetcher.plans_segment(part))
+                .cloned()
+                .collect();
+            if planned.is_empty() {
+                continue;
+            }
+            let warmed = pass.warm(set.tenant, &planned, progress).await;
             tracing::info!(
-                tenant_hash = %tenant.to_hex(),
+                tenant_hash = %set.tenant.to_hex(),
                 signal = ?Signal::Logs,
                 metadata_objects_warmed = warmed.objects as u64,
                 metadata_bytes_warmed = warmed.bytes,
@@ -512,8 +543,11 @@ async fn warm_cache_inner(
         progress.end(WarmStep::MetadataPass);
         elapsed_ms(step_started)
     };
-    let ((total_parts_warmed, whole_part_warm_elapsed_ms), metadata_pass_elapsed_ms) =
-        futures::join!(whole_part_warm, metadata);
+    let (
+        part_resolution_elapsed_ms,
+        (total_parts_warmed, whole_part_warm_elapsed_ms),
+        metadata_pass_elapsed_ms,
+    ) = futures::join!(resolution, whole_part_warm, metadata);
 
     let metadata = metadata_pass
         .as_ref()
@@ -841,8 +875,7 @@ fn warm_accounting() -> ravel_types::accounting::QueryAccounting {
 }
 
 /// Resolves and warms one tenant's metric parts: [`most_recent_parts`] then
-/// [`warm_metric_parts`]. The pass itself resolves every tenant before it
-/// warms any.
+/// [`warm_metric_parts`], unbudgeted.
 #[cfg(test)]
 async fn warm_metrics(
     catalog: &Catalog,
@@ -890,8 +923,9 @@ async fn warm_logs(
 struct WholePartsWarmed {
     /// Parts whose fetch succeeded.
     warmed: usize,
-    /// Parts skipped because their object size did not fit what was left of
-    /// the whole-part warm's cache share.
+    /// Parts skipped because their reservation did not fit what was left of
+    /// the whole-part warm's cache share with none of the signal's fetches in
+    /// flight.
     over_budget: usize,
 }
 
@@ -940,11 +974,31 @@ impl WholePartFetcher<'_> {
     }
 }
 
+/// The bytes `fetcher`'s read of `part` takes from the store on a cache miss,
+/// reserved against the whole-part warm's share before the fetch starts. The
+/// logs funnel reads the object whole. The metrics funnel, called with no
+/// matchers, reads the footer and catalog sections: its first GET is the
+/// whole object at or below [`DEFAULT_WHOLE_OBJECT_THRESHOLD`] and otherwise
+/// a [`DEFAULT_SUFFIX_LEN`] footer tail, and a catalog section outside that
+/// tail is read after it, past the reservation.
+fn whole_part_reservation(fetcher: WholePartFetcher<'_>, part: &SegmentRef) -> u64 {
+    match fetcher {
+        WholePartFetcher::Logs(_) => part.object_size,
+        WholePartFetcher::Metrics(_) if part.object_size == 0 => DEFAULT_SUFFIX_LEN,
+        WholePartFetcher::Metrics(_) if part.object_size <= DEFAULT_WHOLE_OBJECT_THRESHOLD => {
+            part.object_size
+        }
+        WholePartFetcher::Metrics(_) => DEFAULT_SUFFIX_LEN.min(part.object_size),
+    }
+}
+
 /// Warms the [`MAX_PARTS_PER_TENANT_PER_SIGNAL`] most recent of `parts`, at
-/// most [`WHOLE_PARTS_IN_FLIGHT_PER_SIGNAL`] at once. Each part reserves its
-/// object size against `budget` before its fetch starts and is skipped when
-/// the reservation does not fit; once the fetch completes, the reservation is
-/// replaced by the bytes it read from the store.
+/// most [`WHOLE_PARTS_IN_FLIGHT_PER_SIGNAL`] at once. Each part reserves what
+/// its fetch reads ([`whole_part_reservation`]) against `budget` before the
+/// fetch starts. A part that does not fit waits for the next fetch in flight
+/// to complete, whose reservation is then replaced by the bytes it read from
+/// the store (none on a cache hit), and is tested again; one that does not
+/// fit with no fetch of its own in flight is skipped.
 async fn warm_whole_parts(
     fetcher: WholePartFetcher<'_>,
     tenant: TenantHash,
@@ -953,26 +1007,35 @@ async fn warm_whole_parts(
     progress: &WarmProgress,
 ) -> WholePartsWarmed {
     let mut outcome = WholePartsWarmed::default();
-    let mut pending = parts.iter().take(MAX_PARTS_PER_TENANT_PER_SIGNAL);
+    let mut pending = parts
+        .iter()
+        .take(MAX_PARTS_PER_TENANT_PER_SIGNAL)
+        .peekable();
     let mut in_flight = FuturesUnordered::new();
     loop {
         while in_flight.len() < WHOLE_PARTS_IN_FLIGHT_PER_SIGNAL {
-            let Some(part) = pending.next() else {
+            let Some(&part) = pending.peek() else {
                 break;
             };
-            if !progress.reserve_whole_part(budget, part.object_size) {
+            let reservation = whole_part_reservation(fetcher, part);
+            if !progress.reserve_whole_part(budget, reservation) {
+                if !in_flight.is_empty() {
+                    break;
+                }
                 tracing::debug!(
                     tenant_hash = %tenant.to_hex(),
                     key = %part.data_object_key,
-                    object_size = part.object_size,
+                    reservation,
                     "cache warmup: whole part does not fit the whole-part cache share; skipping"
                 );
                 outcome.over_budget += 1;
+                pending.next();
                 continue;
             }
+            pending.next();
             in_flight.push(async move {
                 let (ok, fetched) = fetcher.fetch(tenant, part).await;
-                (part.object_size, ok, fetched)
+                (reservation, ok, fetched)
             });
         }
         let Some((reserved, ok, fetched)) = in_flight.next().await else {
@@ -1123,7 +1186,33 @@ mod tests {
         event_ts_ns: i64,
         ingest_hour: i64,
     ) {
+        publish_metric_segment_sized(store, tenant_hash, event_ts_ns, ingest_hour, 1).await;
+    }
+
+    /// [`publish_metric_segment_filed`] with `samples` samples 10 ms apart,
+    /// ending at `event_ts_ns`, whose pseudo-random values compress poorly:
+    /// a large object whose page data dwarfs its footer and catalog.
+    async fn publish_metric_segment_sized(
+        store: &MemoryStore,
+        tenant_hash: TenantHash,
+        event_ts_ns: i64,
+        ingest_hour: i64,
+        samples: usize,
+    ) {
         let created_unix_ns = event_ts_ns.max(ingest_hour * NS_PER_HOUR);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let samples: Vec<Sample> = (0..samples)
+            .rev()
+            .map(|back| {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                Sample {
+                    ts_ns: event_ts_ns - i64::try_from(back).expect("small") * 10_000_000,
+                    value: f64::from_bits((seed >> 12) | 0x4000_0000_0000_0000),
+                }
+            })
+            .collect();
         let label_set = LabelSet::new(vec![Label {
             name: "__name__".to_string(),
             value: "http_requests_total".to_string(),
@@ -1133,10 +1222,7 @@ mod tests {
             series_id: SeriesId::compute(&TenantId::new("acme"), "http_requests_total", &label_set)
                 .expect("series id"),
             labels: label_set,
-            samples: vec![Sample {
-                ts_ns: event_ts_ns,
-                value: 42.0,
-            }],
+            samples,
         }];
 
         let writer_id = Uuid::new_v4();
@@ -2305,13 +2391,14 @@ mod tests {
     }
 
     /// Delegates to a `MemoryStore`, except that a suffix GET of a data object
-    /// under `hang_prefix` never completes, and records every whole-object GET
-    /// and every suffix GET. The whole-part warm reads small logs objects with
-    /// [`GetRange::Full`]; the metadata pass opens each object with a suffix
-    /// probe.
+    /// under `hang_prefix` and not in `spared` never completes, and records
+    /// every whole-object GET and every suffix GET. The whole-part warm reads
+    /// small logs objects with [`GetRange::Full`]; the metadata pass opens each
+    /// object with a suffix probe.
     struct HangsOnTenantProbe {
         inner: MemoryStore,
         hang_prefix: String,
+        spared: parking_lot::Mutex<Vec<String>>,
         full_gets: parking_lot::Mutex<Vec<String>>,
         suffix_gets: parking_lot::Mutex<Vec<String>>,
         hung_probes: std::sync::atomic::AtomicUsize,
@@ -2322,6 +2409,7 @@ mod tests {
             Self {
                 inner,
                 hang_prefix,
+                spared: parking_lot::Mutex::new(Vec::new()),
                 full_gets: parking_lot::Mutex::new(Vec::new()),
                 suffix_gets: parking_lot::Mutex::new(Vec::new()),
                 hung_probes: std::sync::atomic::AtomicUsize::new(0),
@@ -2332,7 +2420,10 @@ mod tests {
             if matches!(range, GetRange::Suffix(_)) {
                 self.suffix_gets.lock().push(key.to_string());
             }
-            if key.starts_with(&self.hang_prefix) && matches!(range, GetRange::Suffix(_)) {
+            if key.starts_with(&self.hang_prefix)
+                && matches!(range, GetRange::Suffix(_))
+                && !self.spared.lock().iter().any(|spared| spared == key)
+            {
                 self.hung_probes
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 std::future::pending::<()>().await;
@@ -2404,15 +2495,19 @@ mod tests {
     }
 
     /// The tenant discovered first has 40 logs parts and the second one.
-    /// Every suffix probe of the first tenant's objects hangs, so its
-    /// metadata pass never finishes: it hangs on 7 probes at once, one fewer
-    /// than the 8 GET permits. The whole-part warm runs beside it and still reads
-    /// the first tenant's 4 most recent parts and the second tenant's part
-    /// whole through the permit left free. Seen failing against a metadata
-    /// pass that runs to completion before any whole part (`(0, 0)` whole
-    /// reads), against a pass that runs as many objects at once as there
-    /// are permits (8 hung probes), and against a whole-part warm that reads
-    /// only the first tenant's parts (`(4, 0)`).
+    /// Every suffix probe of the first tenant's 36 objects outside its
+    /// whole-part window hangs, so its metadata pass never finishes: it hangs
+    /// on 7 probes at once, one fewer than the 8 GET permits. The whole-part
+    /// warm runs beside it and still warms the first tenant's 4 most recent
+    /// parts and reads the second tenant's part whole through the permit left
+    /// free. The 4 most recent objects' probes do not hang: a fixture object
+    /// is no bigger than its probe, so a whole read shares the probe's cache
+    /// key and would wait on a hung probe of the same object, which is not the
+    /// permit starvation this test measures. Seen failing against a metadata
+    /// pass that runs to completion before any whole part (no whole read of
+    /// the second tenant), against a pass that runs as many objects at once
+    /// as there are permits (8 hung probes), and against a whole-part warm
+    /// that reads only the first tenant's parts.
     #[tokio::test(start_paused = true)]
     async fn a_metadata_pass_that_spends_the_deadline_leaves_later_whole_part_warms_intact() {
         let memory = MemoryStore::new();
@@ -2435,6 +2530,13 @@ mod tests {
         let store = Arc::new(HangsOnTenantProbe::new(memory, logs_prefix(first)));
         let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
         let catalog = catalog_for(dyn_store.clone());
+        let (first_parts, _) =
+            most_recent_parts(&catalog_for(dyn_store.clone()), first, Signal::Logs, now).await;
+        assert_eq!(first_parts.len(), 40);
+        *store.spared.lock() = first_parts[..MAX_PARTS_PER_TENANT_PER_SIGNAL]
+            .iter()
+            .map(|part| part.data_object_key.clone())
+            .collect();
         let cache = Arc::new(Cache::new(CacheLimits::new(
             16 * 1024 * 1024,
             1024,
@@ -2479,20 +2581,28 @@ mod tests {
                 .count()
         };
         assert_eq!(
-            (read_whole(first), read_whole(second)),
-            (4, 1),
-            "each tenant's most recent logs parts were read whole, the second tenant's one \
-             part included: {full_gets:?}"
+            read_whole(second),
+            1,
+            "the second tenant's one logs part was read whole: {full_gets:?}"
         );
         assert_eq!(
             cache.len(),
             5,
-            "the 5 whole parts are resident, and the hung pass inserted nothing"
+            "the first tenant's 4 most recent objects and the second tenant's part are \
+             resident, and the hung probes inserted nothing"
         );
+        let hung_keys: Vec<String> = first_parts[MAX_PARTS_PER_TENANT_PER_SIGNAL..]
+            .iter()
+            .map(|part| part.data_object_key.clone())
+            .collect();
+        let suffix_gets = store.suffix_gets.lock().clone();
         assert_eq!(
-            store.suffix_gets.lock().len(),
+            suffix_gets
+                .iter()
+                .filter(|key| hung_keys.contains(key))
+                .count(),
             7,
-            "the pass issued no suffix probe beyond the 7 hung ones"
+            "the pass issued no probe of an older object beyond the 7 hung ones: {suffix_gets:?}"
         );
     }
 
@@ -3247,6 +3357,302 @@ mod tests {
                 ("1".to_string(), "1".to_string())
             ],
             "each tenant's logs line: (parts_warmed, parts_over_budget)"
+        );
+    }
+
+    /// Delegates to a `MemoryStore`, holding every listing of a commit-shard
+    /// prefix (`.../c/...`) for `delay` on the paused tokio clock and counting
+    /// them. Tenant discovery's `t/` listing is not delayed.
+    struct DelaysCommitListings {
+        inner: MemoryStore,
+        delay: Duration,
+        listings: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DelaysCommitListings {
+        async fn delay(&self, prefix: &str) {
+            if prefix.contains("/c/") {
+                self.listings
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(self.delay).await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for DelaysCommitListings {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.delay(prefix).await;
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.delay(prefix).await;
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.delay(prefix).await;
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The tenants in the streamed-resolution test below.
+    const SLOW_LISTING_TENANTS: usize = 32;
+
+    /// Issue #4257 review: [`SLOW_LISTING_TENANTS`] tenants with one metric
+    /// part each, every commit-shard listing held 100 ms, under a 1 s
+    /// deadline. Resolving one tenant takes more than one listing, so
+    /// resolving all of them one after another takes several times the
+    /// deadline. Resolution streams into the warms, so the tenants resolved
+    /// first are warmed while later ones still resolve: the deadline warning
+    /// reports parts warmed and every resolved tenant's part is resident.
+    /// Seen failing against the loop that resolves every tenant, one at a
+    /// time, before any warm starts: the deadline fires during resolution
+    /// with `parts_warmed=0`.
+    #[tokio::test(start_paused = true)]
+    async fn tenants_resolved_before_the_deadline_are_warmed_while_later_ones_resolve() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let memory = MemoryStore::new();
+        let now = now_ns();
+        for i in 0..SLOW_LISTING_TENANTS {
+            publish_metric_segment(&memory, TenantId::new(format!("tenant-{i}")).hash(), now).await;
+        }
+        let store = Arc::new(DelaysCommitListings {
+            inner: memory,
+            delay: Duration::from_millis(100),
+            listings: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
+
+        // One tenant's resolution on its own issues its listings one after
+        // another, so it takes that many listing delays.
+        let one = TenantId::new("tenant-0").hash();
+        let catalog = catalog_for(dyn_store.clone());
+        let _ = most_recent_parts(&catalog, one, Signal::Metrics, now).await;
+        let _ = most_recent_parts(&catalog, one, Signal::Logs, now).await;
+        let listings = store.listings.swap(0, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            listings >= 2,
+            "one tenant's resolution lists {listings} times"
+        );
+        let per_tenant = store.delay * u32::try_from(listings).expect("few listings");
+        let deadline = Duration::from_secs(1);
+        assert!(
+            per_tenant < deadline && per_tenant * SLOW_LISTING_TENANTS as u32 > deadline * 4,
+            "one tenant resolves within the deadline, all of them one after another take \
+             several deadlines: {per_tenant:?}"
+        );
+
+        let cache = Arc::new(Cache::new(CacheLimits::new(
+            16 * 1024 * 1024,
+            1024,
+            1024 * 1024,
+        )));
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        warm_cache_within(
+            deadline,
+            dyn_store.clone(),
+            catalog_for(dyn_store),
+            ReadCache::Ram(cache.clone()),
+            &FixedClock(now),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            crate::cpu_gates::CpuGates::new(Default::default()).read,
+            metadata_warm(),
+        )
+        .await;
+
+        assert_eq!(capture.events(PASS_COMPLETE), Vec::<String>::new());
+        let warning = capture.events(DEADLINE_WARNING);
+        assert_eq!(warning.len(), 1, "one deadline warning: {warning:?}");
+        let warmed: usize = field_values(&warning[0], "parts_warmed")
+            .concat()
+            .parse()
+            .expect("a part count");
+        // Resolutions run PART_RESOLUTIONS_IN_FLIGHT at a time and take the
+        // same time each, so they complete in batches of that many, one batch
+        // per `per_tenant`.
+        let batches = (deadline.as_nanos() / per_tenant.as_nanos()) as usize;
+        assert_eq!(
+            warmed,
+            batches * PART_RESOLUTIONS_IN_FLIGHT,
+            "every tenant resolved before the deadline is warmed: {}",
+            warning[0]
+        );
+        assert!(warmed > 0 && warmed < SLOW_LISTING_TENANTS);
+        assert_eq!(
+            cache.len(),
+            warmed,
+            "each warmed tenant's one part is resident"
+        );
+        assert_eq!(
+            field_values(&warning[0], "step"),
+            ["\"part_resolution,whole_part_warm,metadata_pass\""],
+            "{}",
+            warning[0]
+        );
+    }
+
+    /// Issue #4257 review: a metric part's warm reads its footer and catalog,
+    /// not the object, so it reserves the metrics funnel's footer tail. Four
+    /// metric parts, each larger than [`DEFAULT_WHOLE_OBJECT_THRESHOLD`] and
+    /// than the whole-part share, all warm, and the share then holds at least
+    /// their 4 footer tails and no more than the budget. Seen failing against a reservation of the object
+    /// size: every part is skipped over budget, `(0, 4)`.
+    #[tokio::test]
+    async fn metric_parts_larger_than_the_share_warm_on_their_footer_reservation() {
+        let memory = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let now = now_ns();
+        for k in 1..=4i64 {
+            let at = now - k * NS_PER_MIN;
+            publish_metric_segment_sized(&memory, tenant, at, at / NS_PER_HOUR, 100_000).await;
+        }
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(memory);
+        let (parts, _) =
+            most_recent_parts(&catalog_for(store.clone()), tenant, Signal::Metrics, now).await;
+        assert_eq!(parts.len(), 4);
+        let smallest = parts
+            .iter()
+            .map(|part| part.object_size)
+            .min()
+            .expect("parts");
+        let budget = smallest - 1;
+        assert!(
+            smallest > DEFAULT_WHOLE_OBJECT_THRESHOLD && budget >= 4 * DEFAULT_SUFFIX_LEN,
+            "each part is above the whole-object threshold and the share, and the share \
+             holds 4 footer tails: {smallest} vs {budget}"
+        );
+
+        let cache = Arc::new(Cache::new(CacheLimits::new(
+            64 * 1024 * 1024,
+            1024,
+            64 * 1024 * 1024,
+        )));
+        let fetcher = SegmentFetcher::new(store).with_cache(ReadCache::Ram(cache));
+        let progress = WarmProgress::default();
+        let warmed = warm_whole_parts(
+            WholePartFetcher::Metrics(&fetcher),
+            tenant,
+            &parts,
+            budget,
+            &progress,
+        )
+        .await;
+        assert_eq!(
+            (warmed.warmed, warmed.over_budget),
+            (4, 0),
+            "(warmed, over_budget) for 4 metric parts each above a {budget}-byte share"
+        );
+        let held = progress.whole_part_bytes_reserved.load(Ordering::Relaxed);
+        assert!(
+            held >= 4 * DEFAULT_SUFFIX_LEN && held <= budget,
+            "the share holds the 4 footer reads, inside the budget: {held} of {budget}"
+        );
+    }
+
+    /// Issue #4257 review: a part that does not fit beside the fetches in
+    /// flight waits for them instead of being skipped. Four logs parts are
+    /// already cached, so each fetch reads no byte from the store and its
+    /// reservation settles to 0. The share is one byte short of two parts:
+    /// the second part does not fit while the first is in flight, then fits
+    /// once the first settles, and so on for the rest, so all 4 warm. Seen
+    /// failing against skipping a part that does not fit at once: `(1, 3)`.
+    #[tokio::test]
+    async fn a_part_that_does_not_fit_waits_for_the_fetches_in_flight_to_settle() {
+        let memory = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let now = now_ns();
+        for k in 1..=4u8 {
+            publish_log_segment_hashed(&memory, tenant, now - i64::from(k) * NS_PER_MIN, [k; 32])
+                .await;
+        }
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(memory);
+        let (parts, _) =
+            most_recent_parts(&catalog_for(store.clone()), tenant, Signal::Logs, now).await;
+        assert_eq!(parts.len(), 4);
+        let sizes: Vec<u64> = parts.iter().map(|part| part.object_size).collect();
+        let budget = sizes[0] + sizes[1] - 1;
+        assert!(
+            sizes.iter().all(|size| *size <= budget)
+                && sizes.windows(2).all(|pair| pair[0] + pair[1] > budget),
+            "each part fits alone and no two consecutive parts fit together: {sizes:?} vs \
+             {budget}"
+        );
+
+        let cache = Arc::new(Cache::new(CacheLimits::new(
+            16 * 1024 * 1024,
+            1024,
+            1024 * 1024,
+        )));
+        let fetcher = LogSegmentFetcher::new(store).with_cache(ReadCache::Ram(cache.clone()));
+        let prewarmed = warm_whole_parts(
+            WholePartFetcher::Logs(&fetcher),
+            tenant,
+            &parts,
+            u64::MAX,
+            &WarmProgress::default(),
+        )
+        .await;
+        assert_eq!(prewarmed.warmed, 4);
+        assert_eq!(cache.len(), 4);
+
+        let progress = WarmProgress::default();
+        let warmed = warm_whole_parts(
+            WholePartFetcher::Logs(&fetcher),
+            tenant,
+            &parts,
+            budget,
+            &progress,
+        )
+        .await;
+        assert_eq!(
+            (warmed.warmed, warmed.over_budget),
+            (4, 0),
+            "(warmed, over_budget) when every in-flight fetch settles to 0 bytes"
+        );
+        assert_eq!(
+            progress.whole_part_bytes_reserved.load(Ordering::Relaxed),
+            0,
+            "cache hits hold nothing against the share"
         );
     }
 }
