@@ -19,7 +19,7 @@ use ravel_types::Signal;
 const BASE_NS: i64 = 1_700_000_000_000_000_000;
 
 /// blake3 over every key and object under the tenant's metrics prefix, in
-/// key order, as the parent commit (707b861) wrote them.
+/// key order, as the parent commit (de80c40) wrote them.
 const PINNED_DIGEST: &str = "54c6374659568d3431485f2749ae515880ed3fabcff7a6d9f30ebb24f8165b9c";
 
 fn router(store: &Arc<MemoryStore>) -> IngestRouter {
