@@ -1000,7 +1000,7 @@ counter.
 
 A newer writer can add a section kind to an object whose version this build
 still reads. The reader skips a section kind it does not know, so the object
-decodes, but a rewrite of it would drop that section (ADR-4233 hazard H6).
+decodes, but a rewrite of it would drop that section.
 Compaction, the erasure rewrite and `migrate` therefore refuse such an input
 before they write anything for its bucket:
 
@@ -1374,15 +1374,13 @@ Enabling the scrubber requires no storage-policy change:
 
 ## Writer versions under `sys/compat`
 
-`sys/compat` records which format version each family is written at
-(ADR-4233). `ravel-maintain` reads it through a compat policy,
-`CompactorConfig::compat_policy`. No shipping binary installs one yet: with
-no policy, every maintenance writer writes exactly the bytes it wrote before
-the policy existed, except that an input with unknown section kinds is held
-(see
+`sys/compat` records which format version each family is written at.
+`ravel-maintain` reads it through a compat policy,
+`CompactorConfig::compat_policy`. No shipping binary installs one yet, and
+`ravel-server` does not yet export the counters below. With no policy, every
+maintenance writer writes exactly the bytes it wrote before the policy
+existed, except that an input with unknown section kinds is held (see
 [An input with section kinds this build does not know](#an-input-with-section-kinds-this-build-does-not-know)).
-The server wiring that installs the policy and exports
-its counters is #4246.
 
 Under a policy, each maintenance run takes its write versions once, at its
 start, before its claim and before any PUT: compaction, the erasure rewrite,
