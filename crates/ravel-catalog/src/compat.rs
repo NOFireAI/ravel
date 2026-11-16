@@ -49,7 +49,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -599,22 +600,9 @@ pub async fn activate_family(
 }
 
 /// The wall clock a [`CompatView`] stamps its reads with. Injected so tests
-/// control time.
+/// control time; the wall-clock implementation lives in the service layer.
 pub trait CompatClock: Send + Sync {
     fn now_unix_ns(&self) -> i64;
-}
-
-/// [`CompatClock`] over the system clock.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SystemCompatClock;
-
-impl CompatClock for SystemCompatClock {
-    fn now_unix_ns(&self) -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
-            .unwrap_or(0)
-    }
 }
 
 /// Why a [`CompatView`] refuses a publish.
@@ -693,6 +681,9 @@ pub struct CompatRefresh {
 #[derive(Debug, Default)]
 struct ViewState {
     last_read_unix_ns: Option<i64>,
+    /// The start ticket of the read `present` and `last_record` come from.
+    /// A read that started earlier never replaces them.
+    merged_ticket: Option<u64>,
     present: bool,
     last_record: Option<sysproto::CompatRecord>,
     seen_epoch: u64,
@@ -703,6 +694,7 @@ impl ViewState {
     fn merge(
         &mut self,
         record: Option<sysproto::CompatRecord>,
+        ticket: u64,
         read_unix_ns: i64,
     ) -> CompatRefresh {
         let mut rolled_back = Vec::new();
@@ -746,8 +738,11 @@ impl ViewState {
                 }
             }
         }
-        self.present = record.is_some();
-        self.last_record = record;
+        if self.merged_ticket.is_none_or(|merged| ticket > merged) {
+            self.merged_ticket = Some(ticket);
+            self.present = record.is_some();
+            self.last_record = record;
+        }
         self.last_read_unix_ns = Some(
             self.last_read_unix_ns
                 .map_or(read_unix_ns, |last| last.max(read_unix_ns)),
@@ -765,6 +760,9 @@ struct ViewInner {
     store: Arc<dyn ObjectStoreBackend>,
     keys: CompatKeys,
     clock: Arc<dyn CompatClock>,
+    /// Orders reads by when they started, so a slow read that finishes after
+    /// a later one does not replace the later one's record.
+    next_ticket: AtomicU64,
     state: RwLock<ViewState>,
 }
 
@@ -805,6 +803,7 @@ impl CompatView {
                 store,
                 keys,
                 clock,
+                next_ticket: AtomicU64::new(0),
                 state: RwLock::new(ViewState::default()),
             }),
         }
@@ -813,11 +812,14 @@ impl CompatView {
     /// Read `sys/compat` and merge it in. The read is stamped with the clock
     /// before the GET, so staleness is never understated. A failed read
     /// changes nothing: the view keeps its last successful read and its age.
+    /// Overlapping refreshes merge every monotone value they read, but the
+    /// record and its presence come from the read that started last.
     pub async fn refresh(&self) -> Result<CompatRefresh, CompatError> {
+        let ticket = self.inner.next_ticket.fetch_add(1, AtomicOrdering::SeqCst);
         let started = self.inner.clock.now_unix_ns();
         let read = read_compat(self.inner.store.as_ref(), &self.inner.keys).await?;
         let mut state = self.inner.state.write();
-        Ok(state.merge(read.map(|(record, _)| record), started))
+        Ok(state.merge(read.map(|(record, _)| record), ticket, started))
     }
 
     /// The version a writer of `family` emits at `now_unix_ns`, given the
@@ -1093,6 +1095,115 @@ mod tests {
             view.write_policy(T0 + COMPAT_VIEW_HORIZON_NS, FAMILY_RSEG, &[7], 7, None),
             Err(CompatRefusal::ViewStale { .. })
         ));
+    }
+
+    /// Holds the first `get` of `sys/compat` after the wrapped read returned,
+    /// until released: a slow read that finishes after a later one.
+    struct HeldFirstGet {
+        inner: MemoryStore,
+        gets: std::sync::atomic::AtomicUsize,
+        read_done: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for HeldFirstGet {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            let out = self.inner.get(key, range).await;
+            if self.gets.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.read_done.notify_one();
+                self.release.notified().await;
+            }
+            out
+        }
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Two overlapping refreshes: the one that started first read the record
+    /// before an activation and finishes last. The record and its presence
+    /// stay those of the later-started read; the monotone values never drop.
+    #[tokio::test]
+    async fn an_earlier_started_read_never_replaces_a_later_one() {
+        let held = Arc::new(HeldFirstGet {
+            inner: MemoryStore::new(),
+            gets: std::sync::atomic::AtomicUsize::new(0),
+            read_done: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let store: Arc<dyn ObjectStoreBackend> = held.clone();
+        // The slow read sees no record at all.
+        let clock = ManualClock::at(T0);
+        let view = view(store.clone(), clock.clone());
+        let slow = {
+            let view = view.clone();
+            tokio::spawn(async move { view.refresh().await })
+        };
+        held.read_done.notified().await;
+
+        create_compat(store.as_ref(), &keys(), baseline_record())
+            .await
+            .expect("create");
+        activate_family(store.as_ref(), &keys(), FAMILY_RLOG, 6, "test", T0)
+            .await
+            .expect("activate");
+        clock.set(T0 + 1_000);
+        let fast = view.refresh().await.expect("later read");
+        assert!(fast.present);
+        assert_eq!(fast.seen_epoch, 1);
+
+        held.release.notify_one();
+        let slow = slow.await.expect("join").expect("earlier read");
+        assert_eq!(slow.read_epoch, None, "the slow read saw no record");
+        assert!(slow.present, "presence is the later read's");
+        let record = view.last_record().expect("the later read's record");
+        assert_eq!(record.compat_epoch, 1);
+        assert_eq!(view.seen_epoch(), 1);
+        assert_eq!(view.last_read_unix_ns(), Some(T0 + 1_000));
+        assert_eq!(
+            view.write_policy(T0 + 2_000, FAMILY_RLOG, &[5, 6], 5, None),
+            Ok(6)
+        );
     }
 
     #[tokio::test]

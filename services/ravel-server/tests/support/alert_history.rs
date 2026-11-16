@@ -116,6 +116,15 @@ pub async fn seed_alert_object_at_version(store: &dyn ObjectStoreBackend, versio
 /// The shape of `shipped_rules_name_emitted_metrics.rs`'s server, with alert
 /// rules on and a short evaluation interval so the first tick comes quickly.
 pub async fn start_server(store: Arc<MemoryStore>) -> ravel_server::Running {
+    start_server_with_key(store, None).await
+}
+
+/// [`start_server`] on a keyed bucket: `deployment_key` is what the process
+/// keys its `sys/compat` view with.
+pub async fn start_server_with_key(
+    store: Arc<MemoryStore>,
+    deployment_key: Option<[u8; 32]>,
+) -> ravel_server::Running {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
@@ -158,7 +167,7 @@ pub async fn start_server(store: Arc<MemoryStore>) -> ravel_server::Running {
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
         max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
-        deployment_key: None,
+        deployment_key: deployment_key.map(Box::new),
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
         store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
@@ -215,7 +224,7 @@ pub async fn scrape_until_positive(running: &ravel_server::Running, series: &str
     body
 }
 
-async fn scrape(running: &ravel_server::Running) -> String {
+pub async fn scrape(running: &ravel_server::Running) -> String {
     reqwest::Client::new()
         .get(format!("http://{}/metrics", running.http_addr))
         .send()

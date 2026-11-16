@@ -535,6 +535,11 @@ pub async fn fold_once_on_gate(
         });
     }
 
+    if crate::compat::fold_compat_gate(catalog, tenant, signal, now_ns).is_err() {
+        return Err(CatalogError::InvalidConfig(
+            "the sys/compat write policy refuses a catalog family this fold writes",
+        ));
+    }
     match catalog
         .fold(tenant, signal, folder_id, now_ns, &[], default_retention_ns)
         .await
