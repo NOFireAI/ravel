@@ -28,7 +28,7 @@ Two facts bound the design. Fold seal, compaction and retention work on whole
 ingest hours and a reshard needs a two-hour lead, while a run lasts minutes: a
 run uses 48 cores, so a cap of 12 compute hours is 15 minutes. And the task's
 budget, raised by the owner for this epic from 200 to about 490 compute hours,
-has about 453 left.
+has about 452 left (38 billed before this epic).
 
 ## Decision
 
@@ -150,12 +150,12 @@ area, `check-tla.sh traceability` fails unless each data row's cell is one of:
   message;
 - `driver: <workload> -- <message>`: the literal occurs under
   `antithesis/<workload>/`;
+- `none: <reason>`, with a non-empty reason.
 
 The ` -- ` separator keeps the path a whole token: the checker's sweep
 already resolves every `crates/...` token in a row
 (`scripts/check-tla.sh`, `check_traceability`'s trailing loop), and a
 `<path>:` form would leave a trailing colon that the resolver rejects.
-- `none: <reason>`, with a non-empty reason.
 
 A five-column table in an enrolled area fails, and so does a six-column table
 with no `.tsv`. A header is recognised by its exact first cell, not by a
@@ -167,11 +167,18 @@ occurs as a literal in Rust and a property the table carries, or `none:
 
 | Run class | Cap, compute hours | Band | Basis |
 |---|---|---|---|
-| Clean smoke, per workload config (5) | 12 | completes; every guarantee passes; every new SUT assertion reached | predicted; run 4d85276e32085a10291c9eddd59d34b3-67-0 billed 13.0 compute hours over 16 minutes of billable time (`snouty runs usage`), 48 cores, 22 minutes of wall clock with setup, measured 2026-11-16 |
+| Clean smoke, per workload config (5) | 12 | completes; every guarantee passes; every new SUT assertion reached | predicted; the 12-hour smoke run 4d85276e32085a10291c9eddd59d34b3-67-0 billed 13.0 compute hours over 16 minutes of billable time (`snouty runs usage`), measured 2026-11-16 |
+| Overshoot above the cap, per run | about 1 | billed hours within cap + 1 | measured 2026-11-16: run 4d85276e32085a10291c9eddd59d34b3-67-0 billed 13.0 under a cap of 12, run 5bafcae0c50b1efc354cb19c89294955-67-0 billed 25.0 under a cap of 24 (`snouty runs usage`) |
 | Mutant control in Antithesis, every mutant (19) | 12 each | named property fails with a counterexample | predicted |
 | Mutant control, local loop, every mutant | 0 | named property false in the SDK's local output | predicted |
 | Long run, per workload config (5) | 24 | no new guarantee failure, or one issue per failure | predicted |
-| Whole epic | 432 of about 453 remaining | 5 smokes (60), 19 mutant runs (228), 5 long runs (120), 24 for reruns; one smoke and one long run per workload config, not per area | predicted; budget raised by the owner 2026-11-16 from 200 to about 490; caps of 36 launched before this epic, measured 2026-11-16 (runs.md) |
+| Whole epic | caps of 423, plus about 29 overshoot, about 452 of about 452 remaining | 5 smokes (60), 19 mutant runs (228), 5 long runs (120), 15 for reruns; 29 runs at about 1 hour of overshoot each; one smoke and one long run per workload config, not per area | predicted; budget raised by the owner 2026-11-16 from 200 to about 490; 38 compute hours billed before this epic (13.0 and 25.0), measured 2026-11-16 (`snouty runs usage`, runs.md) |
+
+A cap is not a hard ceiling: the billed hours of both runs so far came in about
+one hour above it. Twenty-nine runs at that rate cost about 29 hours beyond
+their caps, so the rerun reserve is 15 hours, not 24, and the epic plans to the
+whole of the raised budget. A further rerun beyond that reserve needs the
+owner's go.
 
 Runs are priced per workload config, of which decision 4 defines five
 (ingest-durability; catalog-maintenance and its lifecycle and reshard
