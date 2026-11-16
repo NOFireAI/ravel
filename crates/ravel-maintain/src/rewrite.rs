@@ -2004,6 +2004,74 @@ mod tests {
         TenantId::new(TENANT).hash()
     }
 
+    /// #4304 items 2 and 4: `note_input_window` wraps a reader-window refusal as
+    /// `InputOutOfWindow`, carrying the object key and content hash, and carries
+    /// the section name on an ADR-4233 H5 `UnsupportedSectionVersion` so a hold
+    /// can say "POSTINGS section version" rather than "format version". A
+    /// non-window error (a decode failure) passes through unchanged, so a
+    /// corrupt object is never reclassified as out of window.
+    #[test]
+    fn note_input_window_wraps_trailer_and_section_refusals() {
+        use ravel_logseg::LogSegError;
+        use ravel_segment::SegmentError;
+
+        let hash = vec![1u8, 2, 3];
+        // Trailer version: section is None.
+        let wrapped = note_input_window::<()>(
+            Err(MaintainError::Segment(SegmentError::UnsupportedVersion(99))),
+            "l0/part.rseg",
+            &hash,
+        )
+        .expect_err("a window refusal stays an error");
+        match wrapped {
+            MaintainError::InputOutOfWindow {
+                object_key,
+                version,
+                section,
+                content_hash,
+                ..
+            } => {
+                assert_eq!(object_key, "l0/part.rseg");
+                assert_eq!(version, 99);
+                assert_eq!(section, None);
+                assert_eq!(content_hash, hash);
+            }
+            other => panic!("expected InputOutOfWindow, got {other:?}"),
+        }
+
+        // RLOG section version (H5): the section name rides along.
+        let wrapped = note_input_window::<()>(
+            Err(MaintainError::LogSeg(LogSegError::UnsupportedSectionVersion {
+                section: "POSTINGS",
+                version: 7,
+            })),
+            "l0/part.rlog",
+            &hash,
+        )
+        .expect_err("a section-version refusal stays an error");
+        match wrapped {
+            MaintainError::InputOutOfWindow {
+                version, section, ..
+            } => {
+                assert_eq!(version, 7);
+                assert_eq!(section, Some("POSTINGS"));
+            }
+            other => panic!("expected InputOutOfWindow, got {other:?}"),
+        }
+
+        // A genuine decode failure is not a window refusal: passed through.
+        let passthrough = note_input_window::<()>(
+            Err(MaintainError::LogSeg(LogSegError::Corrupted("bad".into()))),
+            "l0/part.rlog",
+            &hash,
+        )
+        .expect_err("a decode failure stays an error");
+        assert!(
+            matches!(passthrough, MaintainError::LogSeg(LogSegError::Corrupted(_))),
+            "a corrupt object must not be reclassified as out of window: {passthrough:?}"
+        );
+    }
+
     fn bucket() -> Bucket {
         Bucket::new(tenant_hash(), Signal::Metrics, SHARD, HOUR)
     }
@@ -3010,5 +3078,83 @@ mod tests {
             })
         );
         assert_eq!(refused(), before_count + 1);
+    }
+
+    /// The bucket's commit prefix with a key the store lists but cannot address
+    /// (ADR-4233 decision 6), for the strict-listing tests below.
+    fn unaddressable_key() -> String {
+        let b = bucket();
+        let prefix =
+            keys::commit_shard_hour_prefix(&b.tenant_hash, b.signal, b.shard, b.ingest_hour_bucket)
+                .expect("bucket prefix");
+        format!("{prefix}bad%key.cmt")
+    }
+
+    /// ADR-4233 decision 6, #4304 item 5: the strict per-bucket listing inside
+    /// `migrate_bucket_format_scoped` fails the migration with
+    /// `UnaddressableKey` when the bucket holds a key the census cannot address,
+    /// rather than planning over a short listing that drops it. A real
+    /// below-target input makes the bucket a migration candidate, and the
+    /// foreign key is what the strict listing refuses.
+    ///
+    /// Distinguishing: with a non-strict `list_bucket` the foreign key is
+    /// silently dropped and the migration runs to `Rewritten` over the short
+    /// listing; a run that errored for the wrong reason (a store error, say)
+    /// fails the `UnaddressableKey` match.
+    #[tokio::test]
+    async fn migrate_bucket_format_fails_on_an_unaddressable_key() {
+        let store = MemoryStore::new();
+        seed_with_version(&store, 1, vec![series("alpha", &[(10, 1.0)])], FUTURE_VERSION - 1).await;
+        let foreign = unaddressable_key();
+        store.insert_foreign(&foreign, Bytes::from_static(b"foreign"));
+
+        let err = migrate_bucket_format(
+            &store,
+            &FixedClock::new(sealed_now_ns()),
+            &CompactorConfig::default(),
+            &bucket(),
+            FUTURE_VERSION,
+        )
+        .await
+        .expect_err("an unaddressable key fails the migration");
+        match err {
+            MaintainError::UnaddressableKey { key, count, .. } => {
+                assert_eq!(key, foreign, "the error names the key");
+                assert_eq!(count, 1, "the error counts the key");
+            }
+            other => panic!("expected UnaddressableKey, got {other:?}"),
+        }
+    }
+
+    /// ADR-4233 decision 6, #4304 item 5: the strict per-bucket listing inside
+    /// `reencode_compaction_parts_scoped` fails the re-encode with
+    /// `UnaddressableKey` for the same reason. Called directly on
+    /// `reencode_compaction_parts` with the writer enabled, before any record is
+    /// read, so the foreign key alone trips it.
+    #[tokio::test]
+    async fn reencode_compaction_parts_fails_on_an_unaddressable_key() {
+        let store = MemoryStore::new();
+        let foreign = unaddressable_key();
+        store.insert_foreign(&foreign, Bytes::from_static(b"foreign"));
+        let config = CompactorConfig {
+            reencode_writer_enabled: true,
+            ..CompactorConfig::default()
+        };
+
+        let err = reencode_compaction_parts(
+            &store,
+            &FixedClock::new(sealed_now_ns()),
+            &config,
+            &bucket(),
+        )
+        .await
+        .expect_err("an unaddressable key fails the re-encode");
+        match err {
+            MaintainError::UnaddressableKey { key, count, .. } => {
+                assert_eq!(key, foreign, "the error names the key");
+                assert_eq!(count, 1, "the error counts the key");
+            }
+            other => panic!("expected UnaddressableKey, got {other:?}"),
+        }
     }
 }

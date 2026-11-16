@@ -2517,9 +2517,11 @@ enum NotMigratedRetry {
     /// The walk drained and cleared its cursor, and the fresh re-audit refused
     /// the floor: the next run starts over and reaches every one of them.
     NextRun,
-    /// The run stopped on its budget with the cursor persisted past them: the
-    /// next run resumes after them, and only a walk that starts over reaches
-    /// them again.
+    /// The run stopped on its budget. The persisted cursor is the last bucket
+    /// examined, unless the run also held a bucket, in which case it is capped
+    /// just before the first held one. A not_migrated bucket the cursor
+    /// advanced past is reached again only by a walk that starts over; one after
+    /// that cap is re-examined on the next resume.
     AfterTheWalkDrains,
     /// The walk drained and the fresh re-audit raised the floor: another writer
     /// carried each of them to the target after this run passed it.
@@ -2575,9 +2577,11 @@ fn not_migrated_report(buckets: &[NotMigratedBucket], retry: NotMigratedRetry) -
         }
         NotMigratedRetry::AfterTheWalkDrains => {
             "# Each not_migrated bucket published nothing this run. This run stopped on its \
-             budget with the cursor past them, so the next run resumes after them: they are \
-             retried by the first run after the walk drains, which starts over from the \
-             beginning.\n"
+             budget. The persisted cursor is the last bucket it examined, unless the run also \
+             held a bucket, in which case it is capped just before the first held one. A \
+             not_migrated bucket the cursor advanced past is retried by the first run after the \
+             walk drains, which starts over from the beginning; one after that cap is \
+             re-examined on the next resume.\n"
         }
         NotMigratedRetry::Resolved => {
             "# Each not_migrated bucket published nothing this run, and the fresh re-audit found \
@@ -2742,9 +2746,11 @@ fn migrate_report_text(
 ///
 /// "Until a later run migrates it" below is the next run when this one drained
 /// the walk, since a drained walk clears its cursor. After a budget stop the
-/// cursor is persisted past every bucket this run examined, so the next run
-/// resumes after them, and a bucket this run skipped is reached again only by
-/// the first run after the walk drains.
+/// cursor is persisted at the last bucket this run examined, except that a run
+/// which held a bucket caps it just before the first held one; the next run
+/// resumes after the persisted cursor, so a bucket this run advanced past is
+/// reached again only by the first run after the walk drains, while one at or
+/// after the cap is re-examined on the next resume.
 ///
 /// `target_version` defaults to the signal's current supported version
 /// ([`signal_current_version`]); `family` defaults to the signal's canonical
@@ -4445,8 +4451,8 @@ mod tests {
             if !report.not_migrated.is_empty() {
                 assert!(
                     text.contains(
-                        "they are retried by the first run after the walk drains, which starts \
-                         over from the beginning."
+                        "retried by the first run after the walk drains, which starts \
+                         over from the beginning"
                     ),
                     "{text}"
                 );

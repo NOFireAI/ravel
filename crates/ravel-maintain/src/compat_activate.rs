@@ -208,6 +208,15 @@ pub struct ActivateReport {
     pub family: String,
     /// The family's active write version after the call.
     pub active_write_version: u32,
+    /// How far the activation's `activated_unix_ns` stamp ran ahead of the wall
+    /// clock, in nanoseconds, when that gap exceeds
+    /// [`ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS`]; `None` within the
+    /// allowance or when nothing was activated ([`ActivateOutcome::ResumedPendingWalk`]).
+    /// A reported gap means the stamp was pushed past `now` to stay strictly
+    /// after the family's previous `fence_complete_unix_ns`: a clock that ran
+    /// behind the prior walk, or a `fence_complete_unix_ns` written far in the
+    /// future.
+    pub stamp_ahead_of_now_ns: Option<i64>,
     pub walk: FenceWalkReport,
 }
 
@@ -267,20 +276,14 @@ fn family_entry<'a>(
 ///
 /// `sys/compat` carries no fenced epoch, and ravel-catalog defines a walk as
 /// finished once `fence_complete_unix_ns` is at or after `activated_unix_ns`.
-/// [`activation_stamp`] stamps every activation strictly after the family's
-/// previous `fence_complete_unix_ns`, so that rule holds for the current
-/// `activated_epoch` only, whatever the clocks of the processes involved.
+/// [`ravel_catalog::compat::activate_family`] stamps every activation strictly
+/// after the family's previous `fence_complete_unix_ns`, inside its CAS, so
+/// that rule holds for the current `activated_epoch` only, whatever the clocks
+/// of the processes involved.
 fn fence_pending(entry: &sysproto::CompatFamily) -> bool {
     entry.activated_epoch > 0
         && (entry.fence_complete_unix_ns == 0
             || entry.fence_complete_unix_ns < entry.activated_unix_ns)
-}
-
-/// The `activated_unix_ns` for a new activation of `entry`'s family: `now`,
-/// or one past the previous walk's `fence_complete_unix_ns` when a clock
-/// behind that walk's would otherwise read the new walk as already finished.
-fn activation_stamp(now: i64, entry: &sysproto::CompatFamily) -> i64 {
-    now.max(entry.fence_complete_unix_ns.saturating_add(1))
 }
 
 /// Activate `request.version` for `request.family`, or resume the family's
@@ -298,13 +301,13 @@ pub async fn activate(
     }
     let family = request.family.as_str();
     let mut attempts = 0;
-    let (outcome, entry) = loop {
+    let (outcome, entry, stamp_ahead_of_now_ns) = loop {
         let Some((record, _)) = read_compat(store, keys).await? else {
             return Err(ActivateError::RecordAbsent);
         };
         let entry = family_entry(&record, family)?;
         if fence_pending(entry) {
-            break (ActivateOutcome::ResumedPendingWalk, entry.clone());
+            break (ActivateOutcome::ResumedPendingWalk, entry.clone(), None);
         }
         let allowed = writable.versions(family);
         if !allowed.contains(&request.version) {
@@ -330,24 +333,34 @@ pub async fn activate(
             });
         }
         attempts += 1;
+        // The stamp is computed inside `activate_family`'s CAS from the entry it
+        // writes, not here from `entry` (read before the CAS), so a concurrent
+        // walk's `fence_complete_unix_ns` write cannot leave this activation
+        // reading as already fenced (ADR-4233 decision 7). `now` is kept to
+        // report how far the stamp the CAS chose ran ahead of it.
+        let now = clock.now_unix_ns();
         match activate_family(
             store,
             keys,
             family,
             request.version,
             &request.activated_by,
-            activation_stamp(clock.now_unix_ns(), entry),
+            now,
         )
         .await
         {
             Ok((record, _)) => {
                 let entry = family_entry(&record, family)?.clone();
+                let ahead = entry.activated_unix_ns.saturating_sub(now);
+                let stamp_ahead =
+                    (ahead > ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS).then_some(ahead);
                 break (
                     ActivateOutcome::Activated {
                         previous_version: active,
                         version: request.version,
                     },
                     entry,
+                    stamp_ahead,
                 );
             }
             Err(err) if err.is_retryable() && attempts < ACTIVATE_MAX_ATTEMPTS => {
@@ -365,6 +378,7 @@ pub async fn activate(
         outcome,
         family: family.to_string(),
         active_write_version: entry.active_write_version,
+        stamp_ahead_of_now_ns,
         walk,
     })
 }
@@ -482,8 +496,12 @@ async fn fence_walk(
             report.fence_complete_unix_ns = written;
         }
         Err(err) => {
-            // Every item is fenced; a resumed walk re-reads them all and
-            // retries only this write.
+            // Every item is fenced; a resumed activation re-reads them all and
+            // retries only this write. The pending epoch stays visible as
+            // pending on resume because its stamp is strictly above the
+            // previous fence_complete_unix_ns (set inside activate_family's
+            // CAS), so a later activation never reads it as already fenced
+            // (ADR-4233 decision 7).
             fail(&mut report, None, FenceFailure::FenceComplete(err));
         }
     }
@@ -554,13 +572,30 @@ async fn record_fence_complete(
                 .iter_mut()
                 .find(|f| f.family == family && f.activated_epoch == epoch)
             {
-                entry.fence_complete_unix_ns = entry.fence_complete_unix_ns.max(complete_ns);
+                // Only the still-pending walk writes the stamp. If another
+                // resuming walker completed this fence between the read above
+                // and this CAS, leave `fence_complete_unix_ns` as it stands:
+                // re-raising it could push it past a concurrent activation's
+                // stamp and read that activation as fenced before its own walk
+                // ran (ADR-4233 decision 7).
+                if fence_pending(entry) {
+                    entry.fence_complete_unix_ns = entry.fence_complete_unix_ns.max(complete_ns);
+                }
             }
             Ok(())
         })
         .await;
         match result {
-            Ok(_) => return Ok(Some(complete_ns)),
+            // Report the value the record actually carries now: what this CAS
+            // wrote, what another walker already wrote in the race window, or
+            // `None` when a later activation superseded this epoch.
+            Ok((record, _)) => {
+                return Ok(record
+                    .families
+                    .iter()
+                    .find(|f| f.family == family && f.activated_epoch == epoch)
+                    .map(|f| f.fence_complete_unix_ns));
+            }
             Err(err) if err.is_retryable() && attempts < ACTIVATE_MAX_ATTEMPTS => {}
             Err(err) => return Err(err),
         }
@@ -1320,5 +1355,177 @@ mod tests {
         .expect_err("absent refuses");
         assert!(matches!(err, ActivateError::RecordAbsent), "{err:?}");
         assert!(mem.get(COMPAT_KEY, GetRange::Full).await.is_err());
+    }
+
+    /// #4304 item 7: when the previous fence's stamp forces this activation's
+    /// `activated_unix_ns` more than the clock-skew allowance past `now`, the
+    /// gap is reported in `ActivateReport.stamp_ahead_of_now_ns`. The first
+    /// walk completes on a far-future clock, so the next activation on a normal
+    /// clock is stamped one past that far-future fence.
+    #[tokio::test]
+    async fn an_activation_stamped_far_past_now_is_reported() {
+        let mem = initialized().await;
+        let base = baseline(FAMILY_RSEG);
+        let writable =
+            WritableVersions::current().with_family(FAMILY_RSEG, vec![base, base + 1, base + 2]);
+        // Ten hours ahead of T0, well past the clock-skew allowance.
+        let far = T0 + 10 * 3_600 * 1_000_000_000;
+        let first = activate(
+            mem.as_ref(),
+            Some(&test_keys()),
+            &TestClock(far),
+            &writable,
+            &request(FAMILY_RSEG),
+        )
+        .await
+        .expect("first activation");
+        assert!(first.walk.complete);
+        assert_eq!(
+            first.stamp_ahead_of_now_ns, None,
+            "the first activation set the fence from its own clock; no gap"
+        );
+
+        let now = T0 + 20;
+        let second = activate(
+            mem.as_ref(),
+            Some(&test_keys()),
+            &TestClock(now),
+            &writable,
+            &ActivateRequest {
+                version: base + 2,
+                ..request(FAMILY_RSEG)
+            },
+        )
+        .await
+        .expect("second activation");
+        assert_eq!(
+            second.outcome,
+            ActivateOutcome::Activated {
+                previous_version: base + 1,
+                version: base + 2,
+            }
+        );
+        let ahead = second
+            .stamp_ahead_of_now_ns
+            .expect("the stamp ran far past now and is reported");
+        assert!(
+            ahead > ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+            "the reported gap {ahead} must exceed the clock-skew allowance"
+        );
+        assert!(
+            ahead >= far - now,
+            "the gap {ahead} is about far ({far}) minus now ({now})"
+        );
+    }
+
+    /// #4304 item 7, held-PUT interleaving: two walkers resume the same pending
+    /// epoch, one on a far-future clock whose `record_fence_complete` compat PUT
+    /// is held until the other has completed the fence on a normal clock. The
+    /// far-future walker must not re-raise the already-complete fence, so the
+    /// next activation's stamp stays near the wall clock rather than being
+    /// pushed into the far future.
+    #[tokio::test]
+    async fn a_held_second_walker_does_not_inflate_a_completed_fence() {
+        let mem = initialized().await;
+        // Epoch 1 pending: its first walk fails on a listing.
+        let fail = FaultStore::new(
+            mem.clone(),
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::List, ScriptedFault::Transient("list down".into()))
+                    .with_occurrence(Occurrence::Nth(1)),
+            ),
+        );
+        let first = activate(
+            &fail,
+            Some(&test_keys()),
+            &TestClock(T0 + 10),
+            &writable_next(FAMILY_RSEG),
+            &request(FAMILY_RSEG),
+        )
+        .await
+        .expect("first activation");
+        assert!(
+            first.walk.failure.is_some(),
+            "the first walk fails, leaving epoch 1 pending"
+        );
+        assert_eq!(
+            entry(mem.as_ref(), FAMILY_RSEG)
+                .await
+                .fence_complete_unix_ns,
+            0
+        );
+
+        // Walker A2 resumes on a far-future clock; its fence_complete compat PUT
+        // is held. The references the future holds must outlive the join below.
+        let store = FaultStore::new(mem.clone(), FaultPlan::empty());
+        let gate = store.hold(Op::Put, Some(COMPAT_KEY.to_string()), Occurrence::Nth(1));
+        let far = T0 + 10 * 3_600 * 1_000_000_000;
+        let keys = test_keys();
+        let a2_clock = TestClock(far);
+        let a2_writable = writable_next(FAMILY_RSEG);
+        let a2_request = request(FAMILY_RSEG);
+        let a2 = activate(&store, Some(&keys), &a2_clock, &a2_writable, &a2_request);
+        let a = async {
+            gate.wait_until_held(1).await;
+            // Walker A completes the fence on a normal clock, directly on mem.
+            let a = activate(
+                mem.as_ref(),
+                Some(&test_keys()),
+                &TestClock(T0 + 20),
+                &writable_next(FAMILY_RSEG),
+                &request(FAMILY_RSEG),
+            )
+            .await
+            .expect("walker A resume");
+            assert!(a.walk.complete);
+            let fc = entry(mem.as_ref(), FAMILY_RSEG)
+                .await
+                .fence_complete_unix_ns;
+            for id in gate.held() {
+                assert!(gate.release(id));
+            }
+            fc
+        };
+        let (a2, fc_after_a) = tokio::join!(a2, a);
+        a2.expect("walker A2 resume");
+        assert!(fc_after_a > 0 && fc_after_a < far, "A set a normal fence");
+
+        let fence = entry(mem.as_ref(), FAMILY_RSEG)
+            .await
+            .fence_complete_unix_ns;
+        assert_eq!(
+            fence, fc_after_a,
+            "the far-future walker must not re-raise the completed fence"
+        );
+        assert!(fence < far, "the fence was not inflated to the far-future clock");
+
+        // The next activation stays near the wall clock: its stamp clears the
+        // un-inflated fence without a far-future jump.
+        let base = baseline(FAMILY_RSEG);
+        let writable =
+            WritableVersions::current().with_family(FAMILY_RSEG, vec![base, base + 1, base + 2]);
+        let second = activate(
+            mem.as_ref(),
+            Some(&test_keys()),
+            &TestClock(T0 + 30),
+            &writable,
+            &ActivateRequest {
+                version: base + 2,
+                ..request(FAMILY_RSEG)
+            },
+        )
+        .await
+        .expect("second activation");
+        assert_eq!(
+            second.outcome,
+            ActivateOutcome::Activated {
+                previous_version: base + 1,
+                version: base + 2,
+            }
+        );
+        assert_eq!(
+            second.stamp_ahead_of_now_ns, None,
+            "the un-inflated fence needs no far-future stamp"
+        );
     }
 }

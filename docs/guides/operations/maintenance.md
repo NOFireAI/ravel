@@ -1554,8 +1554,9 @@ checkpoint: that listing is shared with compaction and the erasure rewrite,
 both of which plan from non-strict listings, and it stays non-strict to match
 them. It is not the listing a migration decision rests on, only a last check
 that the record set did not change under the pass, so a short re-list cannot
-certify a floor; the strict planning listing already refused the bucket before
-the claim.
+certify a floor: the strict planning listing already refused a key present when
+the bucket was planned, and the strict re-audit refuses one that lands after
+planning, before any floor is raised.
 
 A cursor stored under a tag this build does not know, such as one written by
 a newer build, is left in place. The run walks from the beginning, writes no
@@ -1860,7 +1861,7 @@ line under the list says which case applies:
 | How the run ended | When the bucket is retried |
 |---|---|
 | The walk drained and the re-audit found stragglers | The run cleared its cursor, so the next `migrate` run starts over and retries every one. |
-| The run stopped on its budget | Its cursor is saved past every bucket that it examined, so the next run resumes after them. The first run after the walk drains starts over from the beginning and retries the bucket. |
+| The run stopped on its budget | Its cursor is saved at the last bucket it examined, unless the run also held a bucket, in which case it is capped just before the first held one. A bucket the cursor advanced past is retried only by the first run after the walk drains, which starts over from the beginning; one at or after that cap is re-examined on the next resume. |
 | The walk drained and the re-audit raised the floor | Another writer carried the bucket to the target after the walk passed it. Nothing is left to retry. |
 
 The cursor is not held back for a `not_migrated` bucket. If it were, a bucket

@@ -554,11 +554,20 @@ where
 
 /// Activate `version` for `family`: raise its `active_write_version` by
 /// exactly one and the store-wide `compat_epoch` by one, recording the new
-/// epoch, `now_ns` and `activated_by` in the family entry. Refuses an absent
-/// record, a family without an entry, an equal or lower version, and a jump
-/// of more than one. The certificate and fence fields are kept: the fence of
-/// this activation is complete once `fence_complete_unix_ns` is at or after
-/// `activated_unix_ns`.
+/// epoch, `activated_by` and an `activated_unix_ns` stamp in the family entry.
+/// Refuses an absent record, a family without an entry, an equal or lower
+/// version, and a jump of more than one. The certificate and fence fields are
+/// kept: the fence of this activation is complete once `fence_complete_unix_ns`
+/// is at or after `activated_unix_ns`.
+///
+/// The stamp is `max(now_ns, previous fence_complete_unix_ns + 1)`, computed
+/// inside the CAS from the entry this call writes rather than from a read taken
+/// before the CAS: a stamp computed from a stale read could land at or below a
+/// `fence_complete_unix_ns` a concurrent walk wrote in the meantime, so the new
+/// activation would read as already fenced before its own walk ran (ADR-4233
+/// decision 7). When the previous fence's stamp pushes the new stamp past
+/// `now_ns`, the caller reports the gap (a clock that ran behind the prior
+/// walk, or a stamp written far in the future).
 pub async fn activate_family(
     store: &dyn ObjectStoreBackend,
     keys: &CompatKeys,
@@ -604,7 +613,7 @@ pub async fn activate_family(
         }
         entry.active_write_version = version;
         entry.activated_epoch = epoch;
-        entry.activated_unix_ns = now_ns;
+        entry.activated_unix_ns = now_ns.max(entry.fence_complete_unix_ns.saturating_add(1));
         entry.activated_by = activated_by.to_string();
         record.compat_epoch = epoch;
         Ok(())
@@ -1876,6 +1885,52 @@ mod tests {
         assert_eq!(record.families[1].activated_epoch, 2);
         assert_eq!(record.families[0].activated_epoch, 1);
         assert_eq!(record.families[0].active_write_version, 8);
+    }
+
+    /// #4304 item 7: `activate_family` stamps `activated_unix_ns` strictly after
+    /// the family's previous `fence_complete_unix_ns`, computed inside the CAS
+    /// from the entry it writes. A `now_ns` at or below that fence is lifted to
+    /// `fence_complete + 1`, so the new epoch is never read as already fenced.
+    ///
+    /// Distinguishing: the old code wrote `activated_unix_ns = now_ns` verbatim,
+    /// which for a `now_ns` below the previous fence would leave the new epoch
+    /// with `activated_unix_ns <= fence_complete_unix_ns`, reading as already
+    /// fenced before its walk ran. A stamp that ignored the fence entirely would
+    /// fail the `fence + 1` assertion.
+    #[tokio::test]
+    async fn activate_family_stamps_past_the_previous_fence() {
+        let store = MemoryStore::new();
+        let fence = T0 + 1_000;
+        let mut record = baseline_record();
+        record.compat_epoch = 1;
+        record.families[0] = sysproto::CompatFamily {
+            family: FAMILY_RSEG.to_string(),
+            active_write_version: 7,
+            activated_epoch: 1,
+            activated_unix_ns: T0,
+            fence_complete_unix_ns: fence,
+            ..Default::default()
+        };
+        put_raw(&store, record).await;
+
+        // Activate version 8 on a clock well behind the previous fence.
+        let now = T0 + 10;
+        assert!(now < fence, "the clock must be behind the previous fence");
+        let (rec, _) = activate_family(&store, &keys(), FAMILY_RSEG, 8, "op", now)
+            .await
+            .expect("activate 8");
+        let rseg = &rec.families[0];
+        assert_eq!(rseg.active_write_version, 8);
+        assert_eq!(rseg.activated_epoch, 2);
+        assert_eq!(
+            rseg.activated_unix_ns,
+            fence + 1,
+            "the stamp is lifted one past the previous fence, not left at now_ns"
+        );
+        assert!(
+            rseg.activated_unix_ns > rseg.fence_complete_unix_ns,
+            "the new epoch must not read as already fenced"
+        );
     }
 
     #[tokio::test]

@@ -6151,6 +6151,150 @@ mod tests {
         );
     }
 
+    /// Compact `(0, 100)`, mark its one part below the target, and overwrite the
+    /// part object with bytes that do not hash to the record's `content_hash`
+    /// WITHOUT realigning the hash. Returns the record key. The stored bytes stay
+    /// a valid RSEG object (only the hash gate is tripped), so the re-encode's
+    /// content-hash check is what refuses, not the reader.
+    async fn seed_reencode_with_hash_mismatch(store: &dyn ObjectStoreBackend, target: u32) {
+        seed_at(store, 0, 100, 1, "alpha", target).await;
+        seed_at(store, 0, 100, 2, "beta", target).await;
+        let bucket = Bucket::new(tenant_hash(), Signal::Metrics, 0, 100);
+        let compacted = crate::compact::compact_bucket(
+            store,
+            &FixedClock::new(sealed_now_ns_for(100)),
+            &CompactorConfig::default(),
+            &bucket,
+        )
+        .await
+        .expect("compact the fixture bucket");
+        assert!(
+            matches!(compacted, crate::CompactionOutcome::Compacted { .. }),
+            "{compacted:?}"
+        );
+
+        let listed = list_bucket(store, &bucket).await.expect("list");
+        let [record_key] = listed.compaction_record_keys.as_slice() else {
+            panic!("one compaction record: {listed:?}");
+        };
+        let record_key = record_key.clone();
+        let mut rec = record::decode_compaction(
+            &store
+                .get(&record_key, GetRange::Full)
+                .await
+                .expect("get record")
+                .data,
+        )
+        .expect("decode record");
+        assert_eq!(rec.parts.len(), 1, "{rec:?}");
+
+        // Mark the part below target so it is a re-encode candidate; keep its
+        // recorded content_hash untouched. The part key is content-addressed by
+        // that unchanged hash, so the object the re-encode reads is the one we
+        // overwrite here.
+        rec.parts[0].segment_format_version = target - 1;
+        let part_key = keys::reconstruct_l1_part_key(&rec, &rec.parts[0]).expect("part key");
+        let mut part_bytes = store
+            .get(&part_key, GetRange::Full)
+            .await
+            .expect("get part")
+            .data
+            .to_vec();
+        // Flip one body byte, well clear of the trailer, so the object still
+        // decodes but its hash no longer matches the record's content_hash.
+        let trailer_start = part_bytes.len() - ravel_segment::TRAILER_LEN as usize;
+        let at = part_bytes.len() / 2;
+        assert!(at < trailer_start, "mutation must land before the trailer");
+        part_bytes[at] ^= 0x01;
+        assert_ne!(
+            blake3::hash(&part_bytes).as_bytes().as_slice(),
+            rec.parts[0].content_hash.as_slice(),
+            "the mutated bytes must no longer match the recorded hash"
+        );
+        store
+            .put(&part_key, Bytes::from(part_bytes), PutOptions::default())
+            .await
+            .expect("overwrite part with hash-mismatching bytes");
+        store
+            .put(
+                &record_key,
+                record::encode_compaction(&rec),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite record");
+    }
+
+    /// #4304 item 3: a re-encode part whose stored bytes do not match its
+    /// record's content hash is held as `corrupt_input`, and the walk migrates
+    /// the readable neighbour. Before the fix the hash gate returned
+    /// `MaintainError::Invariant`, which `from_refusal` maps to `None`, so the
+    /// whole walk aborted with that error (hour 101 never migrated and the run
+    /// did not even produce a `MigrateHeld`).
+    ///
+    /// Distinguishing: a wrong fix that reused the out-of-window wrapping would
+    /// hold `input_out_of_window` (wrong: a hash mismatch is not a readable
+    /// out-of-window object); keeping `MaintainError::Invariant` aborts the run
+    /// so no `MigrateHeld` is produced and the neighbour stays unmigrated.
+    #[tokio::test]
+    async fn a_reencode_hash_mismatch_part_holds_bucket_as_corrupt() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        let target = VERSION_V7 as u32;
+        assert_eq!(
+            crate::rewrite::current_part_version(Signal::Metrics).expect("current"),
+            target,
+            "the fixture's target is the version re-encode writes"
+        );
+        seed_reencode_with_hash_mismatch(&store, target).await;
+        seed_at(&store, 0, 101, 3, "gamma", target - 1).await;
+        let config = CompactorConfig {
+            reencode_writer_enabled: true,
+            ..CompactorConfig::default()
+        };
+        let err = migrate_family(
+            &store,
+            &FixedClock::new(sealed_now_ns_for(101)),
+            &config,
+            tenant_hash(),
+            Signal::Metrics,
+            FAMILY,
+            target,
+            1,
+            MigrateBudget::unlimited(),
+            "test",
+        )
+        .await
+        .expect_err("a held bucket fails the run");
+        let message = err.to_string();
+        let MaintainError::MigrateHeld { held, report } = err else {
+            panic!("expected MigrateHeld, got {message}");
+        };
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!((held[0].shard, held[0].ingest_hour), (0, 100), "{held:?}");
+        assert!(
+            matches!(held[0].reason, MigrateHoldReason::CorruptInput { .. }),
+            "a hash mismatch is held as corrupt_input: {held:?}"
+        );
+        assert!(report.walk_complete, "{report:?}");
+        assert_eq!(
+            report.buckets_migrated, 1,
+            "the readable neighbour migrates past the hold: {report:?}"
+        );
+        assert_eq!(compaction_record_count(&store, 0, 101).await, 1);
+        assert!(
+            message.contains("corrupt_input") && message.contains("shard 0 hour 100"),
+            "{message}"
+        );
+        assert_eq!(
+            current_floor_from_store(&store, &tenant_hash(), Signal::Metrics, FAMILY)
+                .await
+                .expect("read floor"),
+            None,
+            "a held bucket raises no floor"
+        );
+    }
+
     fn foreign_key_in(shard: u32, hour: u32) -> String {
         let prefix = keys::commit_shard_hour_prefix(&tenant_hash(), Signal::Metrics, shard, hour)
             .expect("bucket prefix");

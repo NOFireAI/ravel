@@ -15848,6 +15848,72 @@ mod tests {
         }
     }
 
+    /// #4304 item 2: the RLOG re-encode loader wraps an out-of-window part's
+    /// trailer refusal as `InputOutOfWindow` (section `None`, a trailer format
+    /// version), carrying the part's content hash, so a re-encode holds it for a
+    /// later build instead of treating it as corrupt. Before the fix the
+    /// loader's `LogSegError` propagated and `from_refusal` mapped it to
+    /// `corrupt_input`.
+    ///
+    /// Distinguishing: the error must be `InputOutOfWindow`, which fails for the
+    /// pre-fix loader that returned the raw `LogSegError`; and `section` must be
+    /// `None`, which fails for a version wrongly tagged with a section name.
+    #[tokio::test]
+    async fn reencode_loader_wraps_out_of_window_rlog_part() {
+        let store = MemoryStore::new();
+        let identity = ObjectIdentity {
+            tenant_hash: tenant_hash().0,
+            shard: SHARD,
+            writer_id: Uuid::from_u128(1).into_bytes(),
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+        };
+        let mut w = RlogWriter::new(RlogConfig::default(), identity);
+        for i in 0..6u32 {
+            w.push(record(i, i64::from(i), "line", Vec::new()))
+                .expect("push");
+        }
+        let mut bytes = w.finish().expect("finish");
+        // Stamp the trailer format version out of window. The trailer is
+        // footer_len(4) footer_crc(4) version(2) signal(1) reserved(1) magic(4)
+        // = 16 bytes, so the version is the two little-endian bytes at
+        // `len - 8`. The reader checks the version before the footer CRC, so no
+        // CRC recompute is needed (as `stamp_rseg_version` does for RSEG).
+        let out_of_window = OUTPUT_FORMAT_VERSION as u16 + 7;
+        let at = bytes.len() - 8;
+        bytes[at..at + 2].copy_from_slice(&out_of_window.to_le_bytes());
+        let key = "l0/out-of-window.rlog".to_string();
+        store
+            .put(&key, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+
+        let content_hash = vec![9u8; 32];
+        let err = load_catalogs_by_key_noting_version(
+            &store,
+            &CompactorConfig::default(),
+            &[(key.clone(), content_hash.clone())],
+            true,
+        )
+        .await
+        .expect_err("an out-of-window part must be refused");
+        match err {
+            MaintainError::InputOutOfWindow {
+                object_key,
+                version,
+                section,
+                content_hash: ch,
+                ..
+            } => {
+                assert_eq!(object_key, key);
+                assert_eq!(version, out_of_window);
+                assert_eq!(section, None, "a trailer refusal carries no section");
+                assert_eq!(ch, content_hash);
+            }
+            other => panic!("expected InputOutOfWindow, got {other:?}"),
+        }
+    }
+
     /// Issue #3855: a catalog load slices every section its footer probe holds
     /// from the probe and fetches by range only the ones it does not.
     mod catalog_probe {
