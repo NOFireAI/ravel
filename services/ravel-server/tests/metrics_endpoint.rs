@@ -548,6 +548,44 @@ async fn metrics_store_probe_last_run_gauge_on_rendered_metrics() {
     }
 }
 
+/// ADR-4233 hazard H6: the unknown-section hold reaches a maintain process's
+/// scrape as its own counter, apart from the out-of-window hold, each with
+/// one `mode="maintain"` series that reads its own library counter.
+#[tokio::test]
+async fn metrics_render_the_unknown_section_hold_apart_from_out_of_window() {
+    let running = start_test_server(Mode::Maintain, u64::MAX, false).await;
+    let body = scrape(&running).await;
+    for (family, value) in [
+        (
+            "ravel_maintain_buckets_held_unknown_section_total",
+            ravel_maintain::buckets_held_unknown_section_total(),
+        ),
+        (
+            "ravel_maintain_buckets_held_out_of_window_total",
+            ravel_maintain::buckets_held_out_of_window_total(),
+        ),
+    ] {
+        assert_eq!(
+            body.matches(&format!("# HELP {family} ")).count(),
+            1,
+            "{family} HELP once:\n{body}"
+        );
+        assert_eq!(
+            body.matches(&format!("# TYPE {family} counter\n")).count(),
+            1,
+            "{family} TYPE once:\n{body}"
+        );
+        let series = format!("{family}{{mode=\"maintain\"}} {value}\n");
+        assert_eq!(body.matches(&series).count(), 1, "{series}:\n{body}");
+        assert_eq!(
+            body.matches(&format!("\n{family}{{")).count(),
+            1,
+            "{family} renders one series:\n{body}"
+        );
+    }
+    running.shutdown().await.expect("graceful shutdown");
+}
+
 /// Bodies a versioned, locked, compliant bucket answers the control plane's
 /// three server-side GETs with.
 fn fake_bucket_body(subresource: &str) -> &'static str {

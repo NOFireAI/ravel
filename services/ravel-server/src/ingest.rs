@@ -83,6 +83,11 @@ pub enum IngestRequestError {
     /// rather than writing into a shard topology that hides the tenant's
     /// existing data; an operator must reconcile config with the record.
     Provisioning(String),
+    /// The tenant's first touch was refused because the process's
+    /// `sys/compat` view is stale (ADR-4233 decision 4): a record created now
+    /// could miss an activation's fence. Whole-request HTTP 503 / gRPC
+    /// `UNAVAILABLE`; retryable once the view refreshes.
+    CompatRefused(String),
     /// The tenant's IPCrypt rule set could not be resolved from the policy
     /// (ADR-2993). Nothing is stored: writing the configured values in the
     /// clear is the one outcome the policy exists to prevent. The detail
@@ -91,12 +96,23 @@ pub enum IngestRequestError {
     Write(WriteError),
 }
 
+impl From<crate::provisioning::FirstTouchError> for IngestRequestError {
+    fn from(err: crate::provisioning::FirstTouchError) -> Self {
+        if err.is_retryable() {
+            IngestRequestError::CompatRefused(err.to_string())
+        } else {
+            IngestRequestError::Provisioning(err.to_string())
+        }
+    }
+}
+
 impl std::fmt::Display for IngestRequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             IngestRequestError::Admission(rejection) => write!(f, "{}", rejection.reason),
             IngestRequestError::ClockImplausible(msg) => write!(f, "{msg}"),
             IngestRequestError::Provisioning(msg) => write!(f, "{msg}"),
+            IngestRequestError::CompatRefused(msg) => write!(f, "{msg}"),
             IngestRequestError::IpcryptRules => {
                 f.write_str(crate::ipcrypt::TENANT_RULES_UNAVAILABLE)
             }
@@ -119,6 +135,7 @@ impl IngestRequestError {
             // The bad clock is the replica's; a retry against a healthy one works.
             IngestRequestError::ClockImplausible(_) => true,
             IngestRequestError::Provisioning(_) => false,
+            IngestRequestError::CompatRefused(_) => true,
             // A policy the operator must fix; the cache retries each write,
             // but a client retry against the same policy fails the same way.
             IngestRequestError::IpcryptRules => false,
@@ -225,8 +242,7 @@ pub async fn handle_export_releasing(
         ravel_types::Signal::Metrics,
         ingest_ts_ns,
     )
-    .await
-    .map_err(|e| IngestRequestError::Provisioning(e.to_string()))?;
+    .await?;
 
     // Admit points AND exemplars through a per-request cap, rather than the
     // `normalize_metrics` wrapper that builds the same throwaway cap and then
