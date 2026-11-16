@@ -1,36 +1,59 @@
-//! `compat certify` for a class-A family, and the nested-section-version probe
-//! the certificate census and the RLOG retention holds share (ADR-4233
-//! decision 7 and hazard H5).
+//! `compat certify` for a class-A family, and the member probe the certificate
+//! census and the retention version holds share (ADR-4233 decision 7 and hazard
+//! H5).
 //!
-//! # The H5 section-version probe
+//! # The member probe
 //!
-//! A `.rlog` object's trailer version can be inside this build's reader window
-//! while a nested POSTINGS or KEY_IDX section carries a grammar version this
-//! build cannot read (ADR-4233 inventory: POSTINGS and KEY_IDX read sets are
-//! `{1,2}`). The trailer-only version gate the retention holds and the census
-//! trailer check use never sees that, because it reads only the 16-byte
-//! trailer suffix. [`rlog_held_version`] closes it: it reads the
-//! footer through the suffix-probe-then-range-chase protocol, then reads each
-//! nested section's version through a ranged GET of its header and classifies
-//! it against this build's read set, exactly as the reader does when it opens
-//! the section for a query (`ravel_logseg::postings::PostingsSection::parse`
-//! and `ravel_logseg::key_index`, both of which return
-//! `LogSegError::UnsupportedSectionVersion` for a version outside their set).
+//! [`probe_member`] classifies one data or part object by its own bytes:
+//! absent, structurally corrupt, trailer version outside this build's reader
+//! window, or readable, in which case it returns the trailer version and the
+//! grammar version of any nested section this build cannot read. A `.rlog`
+//! object's trailer can be in window while a nested POSTINGS or KEY_IDX section
+//! carries a grammar version outside this build's read set (ADR-4233
+//! inventory: both read sets are `{1,2}`), and a `.rspan` object's trailer can
+//! be in window over a KEY_IDX section outside `{1,2}`. A trailer-only gate
+//! never sees either. The probe reads each section's version through a ranged
+//! GET and classifies it against the same read set the reader applies when it
+//! opens the section (`ravel_logseg::postings::PostingsSection::parse`,
+//! `ravel_logseg::key_index` and `ravel_codec::key_idx::KeyIdxPrefix::parse`,
+//! each of which refuses a version outside its set with
+//! `UnsupportedSectionVersion`).
 //!
-//! Cost per RLOG member: one suffix GET of the footer (a second ranged GET
-//! only when the footer did not fit the suffix), plus one 1-byte ranged GET of
-//! the POSTINGS header when the object carries a POSTINGS section, plus one
-//! ranged GET of the KEY_IDX prefix when it carries a KEY_IDX section. An
-//! object with neither section costs only the footer read; an object with both
-//! costs at most four small GETs. An absent object, a structurally corrupt
-//! object, and a section whose version is readable all return `None`: corrupt
-//! is never a version hold, the same rule the trailer gate applies.
+//! Cost per object:
+//!
+//! - RSEG: one 16-byte suffix GET of the trailer.
+//! - RLOG: one 64 KiB suffix GET of the footer (a second ranged GET only when
+//!   the footer did not fit), plus one 1-byte ranged GET of the POSTINGS header
+//!   when the object carries a POSTINGS section, plus one ranged GET of the
+//!   KEY_IDX prefix when it carries a KEY_IDX section: at most four GETs.
+//! - RSPAN: the same footer read (one or two GETs), plus one 1-byte ranged GET
+//!   of the mandatory KEY_IDX section's version byte: at most three GETs.
+//!
+//! The retention holds treat an absent or structurally corrupt object as not
+//! held (corrupt is never a version hold). The certificate census refuses on
+//! either: it cannot confirm such a member is at or above the target.
+//!
+//! # The certify cursor
+//!
+//! `sys/maintain/certify/<family>/cursor` persists `S`, the target version and
+//! activation epoch it was taken for, the family's certificate identity and
+//! `contradicted` flag as the first run read them, and per `(tenant, signal)`
+//! how many shards the census finished with their entry counts and newest
+//! creation time. A resumed run keeps `S` and skips only the shards a key in
+//! the cursor names, so a tenant or shard that appears between runs is still
+//! censused. A cursor whose target, epoch, certificate identity or
+//! `contradicted` flag no longer matches `sys/compat` is stale and starts a
+//! fresh census with a new `S`; the certificate CAS changes the identity, so a
+//! cursor left behind by a completed certification (a failed delete) is never
+//! resumed.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use bytes::Bytes;
 use ravel_catalog::compat::{
-    CompatError, CompatKeys, FAMILY_RLOG, FAMILY_RSEG, FAMILY_RSPAN, read_compat, update_compat,
+    COMPAT_KEY, CompatError, CompatKeys, FAMILY_RLOG, FAMILY_RSEG, FAMILY_RSPAN, read_compat,
+    update_compat,
 };
 use ravel_catalog::{
     CompatFenceOutcome, FloorBasis, ProvisioningError, provisioning_key, raise_compat_fence,
@@ -39,11 +62,14 @@ use ravel_catalog::{
 use ravel_commit::keys;
 use ravel_commit::record;
 use ravel_logseg::LogSegError;
-use ravel_logseg::footer::{LogFooter, SuffixOutcome, kind};
+use ravel_logseg::footer::{LogFooter, kind};
 use ravel_logseg::key_index;
 use ravel_logseg::postings::{POSTINGS_VERSION, POSTINGS_VERSION_V1};
-use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all_reporting};
+use ravel_object_store::{
+    GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, Version, list_all_reporting,
+};
 use ravel_proto::sys::v1 as sysproto;
+use ravel_rspan::footer::SpanFooter;
 use ravel_types::{Signal, TenantHash};
 
 use crate::discover::discover_tenants;
@@ -58,7 +84,8 @@ const G_PRE_BASE_NS: i64 = 3 * 3_600 * 1_000_000_000;
 /// The timing terms the certificate preconditions need that are not on
 /// `sys/compat`: the store request timeout `T_req`, the writers'
 /// `max_flush_lifetime` (the `2 x` term of `G_pre`), and the clock-skew
-/// allowance. `P` is read from the record, `H` is [`H_NS`].
+/// allowance. `P` is read from the record, `H` is [`H_NS`]. `certify` raises
+/// `max_flush_lifetime_ns` to the value `sys/gc` records when that is larger.
 #[derive(Debug, Clone, Copy)]
 pub struct CertifyTimings {
     pub t_req_ns: i64,
@@ -86,6 +113,9 @@ pub enum CertifyRefusal {
     CompatRecordAbsent,
     /// The family has no entry in `sys/compat`.
     FamilyNotInRecord { family: String },
+    /// `sys/compat` records no `max_publish_lifetime_ns` (`P`). The time
+    /// precondition depends on it, and no default stands in for it.
+    PublishLifetimeAbsent,
     /// The target version is above the family's active write version.
     TargetAboveActive { target: u32, active: u32 },
     /// The activation's eager fence walk has not finished.
@@ -99,14 +129,44 @@ pub enum CertifyRefusal {
         signal: Signal,
         not_before_ns: i64,
     },
+    /// A provisioned bucket is fenced below the family's activation epoch at
+    /// the recheck before the CAS: a writer that never saw the activation can
+    /// still publish into it.
+    BucketUnfenced {
+        tenant_hash: String,
+        signal: Signal,
+        compat_epoch: u64,
+        activated_epoch: u64,
+    },
+    /// The tenant set at the recheck before the CAS differs from the set the
+    /// census covered.
+    TenantSetChanged,
     /// A listing was incomplete: an unaddressable key under a census prefix.
     IncompleteListing { prefix: String, unaddressable: u64 },
+    /// A record names a member object that is absent, or a listed object was
+    /// gone by the time its trailer was read.
+    MemberAbsent { member_key: String },
+    /// A member's trailer is structurally corrupt.
+    MemberCorrupt { member_key: String },
+    /// A member's trailer version differs from the version its record stamps.
+    StampTrailerMismatch {
+        member_key: String,
+        stamp: u32,
+        trailer: u16,
+    },
+    /// The family's certificate or `contradicted` flag changed after the
+    /// census read `sys/compat` (a late-write pass or another certification
+    /// ran meanwhile). Nothing was written; a later run starts a fresh census.
+    CompatChangedDuringCensus,
+    /// Another certify run created or replaced the cursor first.
+    ConcurrentCertify,
 }
 
 /// What one `certify` run concluded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CertifyReport {
-    /// The census passed and a certificate was written under CAS.
+    /// The census passed and a certificate was written under CAS. The counts
+    /// cover every run of a resumed census, not only the last.
     Certified {
         version: u32,
         member_count: u64,
@@ -119,8 +179,9 @@ pub enum CertifyReport {
         member_key: String,
         found_version: u32,
     },
-    /// A member object this build cannot read blocks certification (its trailer
-    /// version is outside the window, or a nested section is unreadable).
+    /// A member object this build cannot read blocks certification: its
+    /// trailer version (reported here) is outside the window, or a nested
+    /// section's grammar version (reported here) is outside the read set.
     HeldMember { member_key: String, version: u16 },
     /// The budget stopped the census before it covered every bucket. The
     /// cursor keeps `S`; a later run resumes from it.
@@ -130,10 +191,16 @@ pub enum CertifyReport {
 }
 
 /// The certify cursor payload tag. Distinct from the compaction and migrate
-/// cursor tags so a foreign payload is a rescan, never a misread.
-const CERTIFY_CURSOR_TAG: u8 = 1;
-/// tag(1) + S: i64 LE(8) + units_done: u32 LE(4).
-const CERTIFY_CURSOR_LEN: usize = 13;
+/// cursor tags, and from this cursor's earlier index-based layout (tag 1), so
+/// any other payload is a fresh census, never a misread.
+const CERTIFY_CURSOR_TAG: u8 = 2;
+/// tag(1) + target u32(4) + activated_epoch u64(8) + S i64(8) +
+/// has_cert u8(1) + cert version u32(4) + certified_unix_ns i64(8) +
+/// contradicted u8(1) + bucket count u32(4).
+const CURSOR_HEADER_LEN: usize = 39;
+/// tenant(16) + signal index u8(1) + shards_done u32(4) + entries u64(8) +
+/// newest_created i64(8).
+const CURSOR_BUCKET_LEN: usize = 37;
 
 /// The store-wide certify cursor key for one family. Disjoint from the
 /// per-tenant compaction and migrate cursors: it lives under `sys/maintain`,
@@ -142,67 +209,198 @@ fn certify_cursor_key(family: &str) -> String {
     format!("sys/maintain/certify/{family}/cursor")
 }
 
-/// What the certify cursor held: `S` and how many census units a prior run
-/// finished. An absent or unrecognized cursor is a fresh census.
-#[derive(Debug, Clone, Copy)]
+/// The family's certificate identity and `contradicted` flag, as one census
+/// read them. The certificate CAS refuses when the record no longer matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PriorState {
+    /// `(version, certified_unix_ns)` of the certificate, if any.
+    certificate: Option<(u32, i64)>,
+    contradicted: bool,
+}
+
+impl PriorState {
+    fn of(entry: &sysproto::CompatFamily) -> Self {
+        PriorState {
+            certificate: entry
+                .certificate
+                .as_ref()
+                .map(|c| (c.version, c.certified_unix_ns)),
+            contradicted: entry.contradicted,
+        }
+    }
+}
+
+/// The census progress of one `(tenant, signal)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BucketProgress {
+    /// Shards `0..shards_done` are censused.
+    shards_done: u32,
+    /// Recorded members (commit-family entries) in those shards.
+    entries: u64,
+    /// Newest member creation time in those shards.
+    newest_created_unix_ns: i64,
+}
+
+/// The certify cursor. Buckets are keyed by tenant and the signal's index in
+/// [`family_signals`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CertifyCursor {
+    target_version: u32,
+    activated_epoch: u64,
     start_unix_ns: i64,
-    units_done: u32,
+    prior: PriorState,
+    buckets: BTreeMap<(TenantHash, u8), BucketProgress>,
+}
+
+fn encode_cursor(cursor: &CertifyCursor) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CURSOR_HEADER_LEN + cursor.buckets.len() * CURSOR_BUCKET_LEN);
+    out.push(CERTIFY_CURSOR_TAG);
+    out.extend_from_slice(&cursor.target_version.to_le_bytes());
+    out.extend_from_slice(&cursor.activated_epoch.to_le_bytes());
+    out.extend_from_slice(&cursor.start_unix_ns.to_le_bytes());
+    let (has_cert, cert_version, cert_ns) = match cursor.prior.certificate {
+        Some((version, ns)) => (1u8, version, ns),
+        None => (0u8, 0u32, 0i64),
+    };
+    out.push(has_cert);
+    out.extend_from_slice(&cert_version.to_le_bytes());
+    out.extend_from_slice(&cert_ns.to_le_bytes());
+    out.push(u8::from(cursor.prior.contradicted));
+    out.extend_from_slice(&(cursor.buckets.len() as u32).to_le_bytes());
+    for ((tenant, signal_index), progress) in &cursor.buckets {
+        out.extend_from_slice(&tenant.0);
+        out.push(*signal_index);
+        out.extend_from_slice(&progress.shards_done.to_le_bytes());
+        out.extend_from_slice(&progress.entries.to_le_bytes());
+        out.extend_from_slice(&progress.newest_created_unix_ns.to_le_bytes());
+    }
+    out
+}
+
+/// A little-endian reader over a cursor payload; every read is bounds-checked.
+struct CursorReader<'a> {
+    data: &'a [u8],
+}
+
+impl CursorReader<'_> {
+    fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let (head, rest) = self.data.split_at_checked(N)?;
+        self.data = rest;
+        head.try_into().ok()
+    }
+    fn u8(&mut self) -> Option<u8> {
+        self.take::<1>().map(|b| b[0])
+    }
+    fn u32(&mut self) -> Option<u32> {
+        self.take().map(u32::from_le_bytes)
+    }
+    fn u64(&mut self) -> Option<u64> {
+        self.take().map(u64::from_le_bytes)
+    }
+    fn i64(&mut self) -> Option<i64> {
+        self.take().map(i64::from_le_bytes)
+    }
+}
+
+/// Decode a cursor payload, or `None` for anything that is not exactly a
+/// well-formed tag-2 cursor for a family with `signal_count` signals.
+fn decode_cursor(data: &[u8], signal_count: usize) -> Option<CertifyCursor> {
+    let mut r = CursorReader { data };
+    if r.u8()? != CERTIFY_CURSOR_TAG {
+        return None;
+    }
+    let target_version = r.u32()?;
+    let activated_epoch = r.u64()?;
+    let start_unix_ns = r.i64()?;
+    let has_cert = r.u8()?;
+    let cert_version = r.u32()?;
+    let cert_ns = r.i64()?;
+    let certificate = match has_cert {
+        1 => Some((cert_version, cert_ns)),
+        0 if cert_version == 0 && cert_ns == 0 => None,
+        _ => return None,
+    };
+    let contradicted = match r.u8()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let count = r.u32()? as usize;
+    if r.data.len() != count.checked_mul(CURSOR_BUCKET_LEN)? {
+        return None;
+    }
+    let mut buckets = BTreeMap::new();
+    for _ in 0..count {
+        let tenant = TenantHash(r.take::<16>()?);
+        let signal_index = r.u8()?;
+        if usize::from(signal_index) >= signal_count {
+            return None;
+        }
+        let progress = BucketProgress {
+            shards_done: r.u32()?,
+            entries: r.u64()?,
+            newest_created_unix_ns: r.i64()?,
+        };
+        if buckets.insert((tenant, signal_index), progress).is_some() {
+            return None;
+        }
+    }
+    Some(CertifyCursor {
+        target_version,
+        activated_epoch,
+        start_unix_ns,
+        prior: PriorState {
+            certificate,
+            contradicted,
+        },
+        buckets,
+    })
+}
+
+/// What the cursor key held.
+enum StoredCursor {
+    Absent,
+    /// A payload this build does not read as a cursor; overwritten by CAS.
+    Unrecognized(Version),
+    Present(CertifyCursor, Version),
 }
 
 async fn read_certify_cursor(
     store: &dyn ObjectStoreBackend,
     key: &str,
-) -> Result<Option<(CertifyCursor, ravel_object_store::Version)>> {
+    signal_count: usize,
+) -> Result<StoredCursor> {
     match store.get(key, GetRange::Full).await {
-        Ok(got) => {
-            let data = got.data;
-            if data.len() == CERTIFY_CURSOR_LEN && data[0] == CERTIFY_CURSOR_TAG {
-                let mut start_bytes = [0u8; 8];
-                start_bytes.copy_from_slice(&data[1..9]);
-                let mut units_bytes = [0u8; 4];
-                units_bytes.copy_from_slice(&data[9..13]);
-                let start = i64::from_le_bytes(start_bytes);
-                let units = u32::from_le_bytes(units_bytes);
-                Ok(Some((
-                    CertifyCursor {
-                        start_unix_ns: start,
-                        units_done: units,
-                    },
-                    got.version,
-                )))
-            } else {
-                // A foreign or truncated payload: rescan from the start, leaving
-                // the stored cursor in place (ADR-4233 decision 4, H9).
-                Ok(None)
-            }
-        }
-        Err(StoreError::NotFound) => Ok(None),
+        Ok(got) => Ok(match decode_cursor(got.data.as_ref(), signal_count) {
+            Some(cursor) => StoredCursor::Present(cursor, got.version),
+            None => StoredCursor::Unrecognized(got.version),
+        }),
+        Err(StoreError::NotFound) => Ok(StoredCursor::Absent),
         Err(err) => Err(MaintainError::Store(err)),
     }
 }
 
-async fn write_certify_cursor(
+/// Write the cursor: create it when `prev` is `None`, else CAS on `prev`.
+/// `None` when another run created or replaced it first.
+async fn put_certify_cursor(
     store: &dyn ObjectStoreBackend,
     key: &str,
-    cursor: CertifyCursor,
-    prev: Option<ravel_object_store::Version>,
-) -> Result<()> {
-    let mut payload = Vec::with_capacity(CERTIFY_CURSOR_LEN);
-    payload.push(CERTIFY_CURSOR_TAG);
-    payload.extend_from_slice(&cursor.start_unix_ns.to_le_bytes());
-    payload.extend_from_slice(&cursor.units_done.to_le_bytes());
+    cursor: &CertifyCursor,
+    prev: Option<&Version>,
+) -> Result<Option<Version>> {
     let opts = match prev {
-        None => ravel_object_store::PutOptions::create_if_absent(),
-        Some(version) => ravel_object_store::PutOptions {
-            mode: ravel_object_store::PutMode::CasVersion(version),
+        None => PutOptions::create_if_absent(),
+        Some(version) => PutOptions {
+            mode: PutMode::CasVersion(version.clone()),
             checksum: None,
         },
     };
-    match store.put(key, Bytes::from(payload), opts).await {
-        Ok(_) => Ok(()),
-        // Advisory: a lost race means another pass advanced it; converge.
-        Err(StoreError::AlreadyExists) | Err(StoreError::PreconditionFailed) => Ok(()),
+    match store
+        .put(key, Bytes::from(encode_cursor(cursor)), opts)
+        .await
+    {
+        Ok(outcome) => Ok(Some(outcome.version)),
+        Err(StoreError::AlreadyExists) | Err(StoreError::PreconditionFailed) => Ok(None),
         Err(err) => Err(MaintainError::Store(err)),
     }
 }
@@ -237,26 +435,24 @@ pub(crate) async fn scan_shards_for(
     Ok(widest.max(signal.fixed_read_shards()).max(1))
 }
 
-/// One data or part object the census checks, and the version its record
-/// stamps for it.
+/// One data or part object the census checks. `stamp` is the version its
+/// record stamps; `None` for an object found under `l0/` or `l1/` that no
+/// record names (a held or tombstoned bucket's object, or a superseded input
+/// whose record is gone), which is checked by its trailer alone and counts in
+/// neither the member count nor the newest creation time: those are the floor
+/// basis, which counts commit-family entries.
 struct Member {
     key: String,
-    stamp: u32,
+    stamp: Option<u32>,
     created_unix_ns: i64,
 }
 
-/// Enumerate the member objects of one `(tenant, signal, shard)` by STRICT
-/// listing of its commit prefix: every L0 commit record's data object, and
-/// every compaction and rewrite record's parts. An unaddressable key under the
-/// prefix refuses the run rather than shortening the population (ADR-4233
-/// decision 6).
-async fn census_shard(
+/// Every key under `prefix`, by STRICT listing: an unaddressable key refuses
+/// the run rather than shortening the population (ADR-4233 decision 6).
+async fn strict_list(
     store: &dyn ObjectStoreBackend,
-    tenant: &TenantHash,
-    signal: Signal,
-    shard: u32,
-) -> std::result::Result<Vec<Member>, CensusStop> {
-    let prefix = keys::commit_shard_prefix(tenant, signal, shard).map_err(CensusStop::fatal)?;
+    prefix: String,
+) -> std::result::Result<Vec<String>, CensusStop> {
     let listing = list_all_reporting(store, &prefix)
         .await
         .map_err(|e| CensusStop::Fatal(MaintainError::Store(e)))?;
@@ -266,11 +462,28 @@ async fn census_shard(
             unaddressable: listing.unaddressable.count,
         }));
     }
+    Ok(listing.objects.into_iter().map(|meta| meta.key).collect())
+}
+
+/// Enumerate the member objects of one `(tenant, signal, shard)`: every L0
+/// commit record's data object and every compaction and rewrite record's
+/// parts, by strict listing of the shard's commit prefix, then every object
+/// under the shard's `l0/` and `l1/` prefixes that no record names.
+async fn census_shard(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> std::result::Result<Vec<Member>, CensusStop> {
+    let prefix = keys::commit_shard_prefix(tenant, signal, shard).map_err(CensusStop::fatal)?;
     let mut members = Vec::new();
-    for meta in listing.objects {
-        let entry = keys::partition_bucket_entry(&meta.key).map_err(CensusStop::fatal)?;
+    for key in strict_list(store, prefix).await? {
+        let entry = keys::partition_bucket_entry(&key).map_err(CensusStop::fatal)?;
+        if matches!(entry, keys::BucketEntry::Tombstone(_)) {
+            continue;
+        }
         let got = store
-            .get(&meta.key, GetRange::Full)
+            .get(&key, GetRange::Full)
             .await
             .map_err(|e| CensusStop::Fatal(MaintainError::Store(e)))?;
         match entry {
@@ -278,7 +491,7 @@ async fn census_shard(
                 let rec = record::decode(&got.data).map_err(CensusStop::fatal)?;
                 members.push(Member {
                     key: keys::reconstruct_data_key(&rec).map_err(CensusStop::fatal)?,
-                    stamp: rec.segment_format_version,
+                    stamp: Some(rec.segment_format_version),
                     created_unix_ns: rec.created_unix_ns,
                 });
             }
@@ -288,7 +501,7 @@ async fn census_shard(
                     members.push(Member {
                         key: keys::reconstruct_l1_part_key(&rec, part)
                             .map_err(CensusStop::fatal)?,
-                        stamp: part.segment_format_version,
+                        stamp: Some(part.segment_format_version),
                         created_unix_ns: rec.created_unix_ns,
                     });
                 }
@@ -299,12 +512,31 @@ async fn census_shard(
                     members.push(Member {
                         key: keys::reconstruct_rewrite_part_key(&rec, part)
                             .map_err(CensusStop::fatal)?,
-                        stamp: part.segment_format_version,
+                        stamp: Some(part.segment_format_version),
                         created_unix_ns: rec.created_unix_ns,
                     });
                 }
             }
             keys::BucketEntry::Tombstone(_) => {}
+        }
+    }
+
+    let recorded: std::collections::HashSet<String> =
+        members.iter().map(|m| m.key.clone()).collect();
+    for dir in ["l0", keys::L1_DIR] {
+        let prefix = format!(
+            "t/{}/{}/{dir}/{shard:04}/",
+            tenant.to_hex(),
+            signal.key_prefix()
+        );
+        for key in strict_list(store, prefix).await? {
+            if !recorded.contains(&key) {
+                members.push(Member {
+                    key,
+                    stamp: None,
+                    created_unix_ns: 0,
+                });
+            }
         }
     }
     Ok(members)
@@ -330,73 +562,105 @@ impl CensusStop {
     }
 }
 
-/// The trailer version of a member when it is outside this build's reader
-/// window, or, for RLOG, the grammar version of an unreadable nested section:
-/// such a member cannot be confirmed at or above the target, so it holds the
-/// certificate (ADR-4233 decision 7). `None` when the object is readable here.
-async fn member_held_version(
+/// Check one member against `target`: its stamp, then its bytes through
+/// [`probe_member`]. `None` when it passes.
+async fn check_member(
     store: &dyn ObjectStoreBackend,
-    signal: Signal,
-    key: &str,
-) -> Result<Option<u16>> {
-    // RLOG also probes its nested section versions; one footer-suffix GET
-    // serves both the trailer and the sections.
-    if part_family_for(signal) == Some(FAMILY_RLOG) {
-        return rlog_held_version(store, key).await;
+    family: &str,
+    member: Member,
+    target: u32,
+) -> Result<Option<CertifyReport>> {
+    if let Some(stamp) = member.stamp
+        && stamp < target
+    {
+        return Ok(Some(CertifyReport::Contradicted {
+            member_key: member.key,
+            found_version: stamp,
+        }));
     }
-    // RSEG and RSPAN have no version-gated nested sections: a 16-byte trailer
-    // suffix GET confirms the member is readable here.
-    let got = match store.get(key, GetRange::Suffix(16)).await {
-        Ok(got) => got,
-        Err(StoreError::NotFound) => return Ok(None),
-        Err(err) => return Err(MaintainError::Store(err)),
-    };
-    let tail = got.data;
-    let total = got.total_size;
-    let held = match part_family_for(signal) {
-        Some(FAMILY_RSEG) => matches!(
-            ravel_segment::open_from_suffix(
-                tail.as_ref(),
-                total,
-                ravel_segment::ReaderLimits::default()
-            ),
-            Err(ravel_segment::SegmentError::UnsupportedVersion { .. })
-        )
-        .then_some(0u16),
-        Some(FAMILY_RSPAN) => match ravel_rspan::open_from_suffix(tail.as_ref(), total) {
-            Err(ravel_rspan::SpanSegError::UnsupportedVersion(v)) => Some(v),
-            _ => None,
+    let report = match probe_member(store, family, &member.key).await? {
+        MemberProbe::Absent => CertifyReport::Refused(CertifyRefusal::MemberAbsent {
+            member_key: member.key,
+        }),
+        MemberProbe::Corrupt => CertifyReport::Refused(CertifyRefusal::MemberCorrupt {
+            member_key: member.key,
+        }),
+        MemberProbe::OutOfWindow(version) => CertifyReport::HeldMember {
+            member_key: member.key,
+            version,
         },
-        _ => None,
+        MemberProbe::Readable {
+            trailer,
+            section_hold,
+        } => {
+            if let Some(stamp) = member.stamp
+                && stamp != u32::from(trailer)
+            {
+                CertifyReport::Refused(CertifyRefusal::StampTrailerMismatch {
+                    member_key: member.key,
+                    stamp,
+                    trailer,
+                })
+            } else if u32::from(trailer) < target {
+                CertifyReport::Contradicted {
+                    member_key: member.key,
+                    found_version: u32::from(trailer),
+                }
+            } else if let Some(version) = section_hold {
+                CertifyReport::HeldMember {
+                    member_key: member.key,
+                    version,
+                }
+            } else {
+                return Ok(None);
+            }
+        }
     };
-    Ok(held)
-}
-
-/// The class-A family a signal's parts belong to.
-pub(crate) fn part_family_for(signal: Signal) -> Option<&'static str> {
-    match signal {
-        Signal::Metrics => Some(FAMILY_RSEG),
-        Signal::Logs | Signal::Alerts | Signal::Audit => Some(FAMILY_RLOG),
-        Signal::Spans => Some(FAMILY_RSPAN),
-        Signal::Profiles => None,
-    }
+    Ok(Some(report))
 }
 
 fn compat_err(err: CompatError) -> MaintainError {
     MaintainError::Invariant(format!("sys/compat: {err}"))
 }
 
+/// `timings` with `max_flush_lifetime_ns` raised to the value `sys/gc`
+/// records, when that is larger: `G_pre` must cover the longest flush any
+/// writer was configured for, not only this process's configuration.
+async fn effective_timings(
+    store: &dyn ObjectStoreBackend,
+    timings: CertifyTimings,
+) -> Result<CertifyTimings> {
+    let recorded = crate::gc_config::read_gc_config(store)
+        .await
+        .map_err(|e| MaintainError::Invariant(format!("sys/gc: {e}")))?;
+    let mut effective = timings;
+    if let Some((values, _version)) = recorded {
+        effective.max_flush_lifetime_ns = effective
+            .max_flush_lifetime_ns
+            .max(values.max_flush_lifetime_ns);
+    }
+    Ok(effective)
+}
+
 /// Certify `target_version` for class-A `family` (ADR-4233 decision 7).
 ///
-/// Refuses before the family's activation fence walk is complete and before
-/// the time precondition `S` is gated on has passed. On the first run it
-/// records `S` (now) in the resumable cursor; a resumed run keeps the stored
-/// `S`, so the late-write pass examines records that landed after it. The
-/// census is a strict listing of every member object of the family, each
-/// member's stamp compared with the target and a 16-byte trailer suffix GET
-/// confirming it is readable here; a member below the target makes the result
-/// contradicted, an unreadable member holds it. On success the certificate is
-/// written under CAS and the format floors are raised with their basis.
+/// Refuses before the family's activation fence walk is complete, when
+/// `sys/compat` records no `P`, and before the time precondition `S` is gated
+/// on has passed. The first run records `S` (now) in the cursor; a resumed run
+/// keeps it, so the late-write pass examines records that landed after it. The
+/// census is a strict listing of every member object of the family: each
+/// recorded member's stamp is compared with the target and its trailer version
+/// is read and required to equal the stamp, and each unrecorded object under
+/// `l0/` or `l1/` is checked by its trailer. A member below the target makes
+/// the result contradicted, an unreadable member holds it, and an absent
+/// member, a corrupt trailer or a stamp the trailer disagrees with refuses it.
+///
+/// Before the CAS every provisioned bucket of every tenant is rechecked: its
+/// `compat_epoch` must be at or above the family's `activated_epoch` and its
+/// own `G_pre` must have passed. The certificate CAS sets the watermark to `S`
+/// and clears `contradicted`, and refuses when the certificate or
+/// `contradicted` changed since the census read them. The format floors are
+/// raised with the basis of every bucket the census covered, across runs.
 ///
 /// `budget` caps the `(tenant, signal, shard)` units one run covers; `None` is
 /// no cap. A run stopped by its budget returns [`CertifyReport::Incomplete`]
@@ -434,12 +698,16 @@ pub async fn certify(
     if entry.fence_complete_unix_ns < entry.activated_unix_ns {
         return Ok(CertifyReport::Refused(CertifyRefusal::FenceWalkIncomplete));
     }
+    let p_ns = record.max_publish_lifetime_ns;
+    if p_ns <= 0 {
+        return Ok(CertifyReport::Refused(
+            CertifyRefusal::PublishLifetimeAbsent,
+        ));
+    }
+    let activated_epoch = entry.activated_epoch;
+    let prior = PriorState::of(entry);
 
-    let p_ns = if record.max_publish_lifetime_ns > 0 {
-        record.max_publish_lifetime_ns
-    } else {
-        crate::compat_policy::DEFAULT_PUBLISH_LIFETIME_NS
-    };
+    let timings = effective_timings(store, timings).await?;
     let activation_term = entry
         .activated_unix_ns
         .saturating_add(H_NS)
@@ -447,8 +715,8 @@ pub async fn certify(
         .saturating_add(timings.t_req_ns);
     let g_pre = timings.g_pre_ns(p_ns);
 
-    // The tenant set, fixed before the census so the digest and the per-bucket
-    // fence reads use the same population.
+    // The tenant set, fixed before the census so the digest, the census and
+    // the recheck use the same population.
     let mut tenants = discover_tenants(store).await?;
     tenants.sort();
 
@@ -457,10 +725,10 @@ pub async fn certify(
     let mut newest_fence = 0i64;
     for tenant in &tenants {
         for signal in signals {
-            if let Some(fenced) = provisioning_fence(store, tenant, *signal).await?
-                && fenced != 0
+            if let Some(fence) = provisioning_fence(store, tenant, *signal).await?
+                && fence.fenced_unix_ns != 0
             {
-                newest_fence = newest_fence.max(fenced);
+                newest_fence = newest_fence.max(fence.fenced_unix_ns);
             }
         }
     }
@@ -478,149 +746,172 @@ pub async fn certify(
         }));
     }
 
-    // `S`: kept from the cursor on resume, recorded now on the first run.
+    // `S` and the progress: kept from a cursor taken for this target, epoch and
+    // certificate state; a fresh census, with `S` now, otherwise.
     let cursor_key = certify_cursor_key(family);
-    let (start_unix_ns, mut units_done) = match read_certify_cursor(store, &cursor_key).await? {
-        Some((cursor, _version)) => (cursor.start_unix_ns, cursor.units_done),
-        None => {
-            write_certify_cursor(
-                store,
-                &cursor_key,
-                CertifyCursor {
-                    start_unix_ns: now_ns,
-                    units_done: 0,
-                },
-                None,
-            )
-            .await?;
-            (now_ns, 0u32)
+    let fresh = CertifyCursor {
+        target_version,
+        activated_epoch,
+        start_unix_ns: now_ns,
+        prior,
+        buckets: BTreeMap::new(),
+    };
+    let stored = read_certify_cursor(store, &cursor_key, signals.len()).await?;
+    let (mut cursor, prev) = match stored {
+        StoredCursor::Present(cursor, version)
+            if cursor.target_version == target_version
+                && cursor.activated_epoch == activated_epoch
+                && cursor.prior == prior =>
+        {
+            (cursor, Some(version))
+        }
+        StoredCursor::Present(_, version) | StoredCursor::Unrecognized(version) => {
+            let Some(version) =
+                put_certify_cursor(store, &cursor_key, &fresh, Some(&version)).await?
+            else {
+                return Ok(CertifyReport::Refused(CertifyRefusal::ConcurrentCertify));
+            };
+            (fresh, Some(version))
+        }
+        StoredCursor::Absent => {
+            let Some(version) = put_certify_cursor(store, &cursor_key, &fresh, None).await? else {
+                return Ok(CertifyReport::Refused(CertifyRefusal::ConcurrentCertify));
+            };
+            (fresh, Some(version))
         }
     };
+    let mut cursor_version = prev;
 
-    // The ordered census units: (tenant, signal, shard), skipping what a prior
-    // run finished.
-    let mut units: Vec<(TenantHash, Signal, u32)> = Vec::new();
-    for tenant in &tenants {
-        for signal in signals {
-            let shards = scan_shards_for(store, tenant, *signal).await?;
-            for shard in 0..shards {
-                units.push((*tenant, *signal, shard));
-            }
-        }
-    }
-
-    let mut member_count = 0u64;
-    let mut newest_created = 0i64;
-    let mut buckets_scanned = 0u64;
-    // Per (tenant, signal) floor basis, accumulated over the census. The key
-    // holds the signal's prefix because `Signal` is not `Ord`; the value keeps
-    // the signal itself for the floor raise.
-    let mut basis: std::collections::BTreeMap<(TenantHash, String), (Signal, u64, i64)> =
-        std::collections::BTreeMap::new();
     let mut processed_this_run = 0usize;
+    for tenant in &tenants {
+        for (signal_index, signal) in signals.iter().enumerate() {
+            let bucket_key = (*tenant, signal_index as u8);
+            let shards = scan_shards_for(store, tenant, *signal).await?;
+            let done = cursor
+                .buckets
+                .get(&bucket_key)
+                .map_or(0, |progress| progress.shards_done);
+            for shard in done..shards {
+                if let Some(cap) = budget
+                    && processed_this_run >= cap
+                {
+                    if put_certify_cursor(store, &cursor_key, &cursor, cursor_version.as_ref())
+                        .await?
+                        .is_none()
+                    {
+                        return Ok(CertifyReport::Refused(CertifyRefusal::ConcurrentCertify));
+                    }
+                    return Ok(CertifyReport::Incomplete {
+                        units_examined: processed_this_run,
+                    });
+                }
 
-    for (idx, (tenant, signal, shard)) in units.iter().enumerate() {
-        if (idx as u32) < units_done {
-            continue;
-        }
-        if let Some(cap) = budget
-            && processed_this_run >= cap
-        {
-            // Persist progress and stop; the cursor keeps `S`. Re-read the
-            // cursor version so the CAS overwrites the record created at the
-            // run start (a stale `CreateIfAbsent` would silently keep
-            // `units_done` at 0 and make the next run rescan from the start).
-            let version = read_certify_cursor(store, &cursor_key)
-                .await?
-                .map(|(_, v)| v);
-            write_certify_cursor(
-                store,
-                &cursor_key,
-                CertifyCursor {
-                    start_unix_ns,
-                    units_done,
-                },
-                version,
-            )
-            .await?;
-            return Ok(CertifyReport::Incomplete {
-                units_examined: processed_this_run,
-            });
-        }
+                // Fence the provisioned bucket to the family's activation
+                // epoch, as the writers do, so a bucket provisioned at v3 after
+                // the eager walk is caught by the recheck below.
+                fence_bucket(store, tenant, *signal, activated_epoch, now_ns).await?;
 
-        // Fence the provisioned bucket to the family's activation epoch, as the
-        // writers do, so a bucket provisioned at v3 after the eager walk is
-        // caught by the per-bucket G_pre recheck below.
-        fence_bucket(store, tenant, *signal, entry.activated_epoch, now_ns).await?;
-
-        let members = match census_shard(store, tenant, *signal, *shard).await {
-            Ok(members) => members,
-            Err(CensusStop::Fatal(err)) => return Err(err),
-            Err(CensusStop::Refused(refusal)) => return Ok(CertifyReport::Refused(refusal)),
-        };
-        buckets_scanned += 1;
-        let bucket_basis = basis
-            .entry((*tenant, signal.key_prefix().to_string()))
-            .or_insert((*signal, 0, 0));
-        for member in members {
-            member_count += 1;
-            bucket_basis.1 += 1;
-            bucket_basis.2 = bucket_basis.2.max(member.created_unix_ns);
-            newest_created = newest_created.max(member.created_unix_ns);
-            if member.stamp < target_version {
-                return Ok(CertifyReport::Contradicted {
-                    member_key: member.key,
-                    found_version: member.stamp,
-                });
-            }
-            if let Some(version) = member_held_version(store, *signal, &member.key).await? {
-                return Ok(CertifyReport::HeldMember {
-                    member_key: member.key,
-                    version,
-                });
+                let members = match census_shard(store, tenant, *signal, shard).await {
+                    Ok(members) => members,
+                    Err(CensusStop::Fatal(err)) => return Err(err),
+                    Err(CensusStop::Refused(refusal)) => {
+                        return Ok(CertifyReport::Refused(refusal));
+                    }
+                };
+                let mut entries = 0u64;
+                let mut newest = 0i64;
+                for member in members {
+                    if member.stamp.is_some() {
+                        entries += 1;
+                        newest = newest.max(member.created_unix_ns);
+                    }
+                    if let Some(report) =
+                        check_member(store, family, member, target_version).await?
+                    {
+                        return Ok(report);
+                    }
+                }
+                let progress = cursor.buckets.entry(bucket_key).or_default();
+                progress.shards_done = shard.saturating_add(1);
+                progress.entries = progress.entries.saturating_add(entries);
+                progress.newest_created_unix_ns = progress.newest_created_unix_ns.max(newest);
+                processed_this_run += 1;
             }
         }
-        units_done = (idx as u32).saturating_add(1);
-        processed_this_run += 1;
+    }
+    if processed_this_run > 0 {
+        // Keep the finished census, so a recheck refusal below does not cost
+        // the next run a rescan.
+        cursor_version =
+            put_certify_cursor(store, &cursor_key, &cursor, cursor_version.as_ref()).await?;
+        if cursor_version.is_none() {
+            return Ok(CertifyReport::Refused(CertifyRefusal::ConcurrentCertify));
+        }
     }
 
-    // Per-bucket G_pre recheck immediately before the CAS: a bucket fenced too
-    // recently (including one this run just fenced) holds the certificate.
+    // The recheck immediately before the CAS, over every provisioned bucket of
+    // every tenant whichever run censused it: the tenant set is the one the
+    // census covered, every bucket is fenced at or above the activation epoch,
+    // and every bucket's own G_pre has passed.
+    let mut tenants_now = discover_tenants(store).await?;
+    tenants_now.sort();
+    if tenants_now != tenants {
+        return Ok(CertifyReport::Refused(CertifyRefusal::TenantSetChanged));
+    }
     for tenant in &tenants {
         for signal in signals {
-            if let Some(fenced) = provisioning_fence(store, tenant, *signal).await?
-                && fenced != 0
-                && now_ns
-                    <= fenced
-                        .saturating_add(g_pre)
-                        .saturating_add(timings.clock_skew_allowance_ns)
-            {
+            let Some(fence) = provisioning_fence(store, tenant, *signal).await? else {
+                continue;
+            };
+            if fence.compat_epoch < activated_epoch {
+                return Ok(CertifyReport::Refused(CertifyRefusal::BucketUnfenced {
+                    tenant_hash: tenant.to_hex(),
+                    signal: *signal,
+                    compat_epoch: fence.compat_epoch,
+                    activated_epoch,
+                }));
+            }
+            let not_before_ns = fence
+                .fenced_unix_ns
+                .saturating_add(g_pre)
+                .saturating_add(timings.clock_skew_allowance_ns);
+            if fence.fenced_unix_ns != 0 && now_ns <= not_before_ns {
                 return Ok(CertifyReport::Refused(
                     CertifyRefusal::BucketRecentlyFenced {
                         tenant_hash: tenant.to_hex(),
                         signal: *signal,
-                        not_before_ns: fenced
-                            .saturating_add(g_pre)
-                            .saturating_add(timings.clock_skew_allowance_ns),
+                        not_before_ns,
                     },
                 ));
             }
         }
     }
 
-    // Raise the format floors with their basis, as `migrate` does.
-    for ((tenant, _sig_key), (signal, entries, newest)) in &basis {
-        let family_str = part_family_for(*signal).unwrap_or(family);
+    // The basis over every bucket the census covered, in this run or earlier
+    // ones, restricted to the tenant set the digest names.
+    let mut member_count = 0u64;
+    let mut buckets_scanned = 0u64;
+    let mut newest_created = 0i64;
+    for ((tenant, signal_index), progress) in &cursor.buckets {
+        if tenants.binary_search(tenant).is_err() {
+            continue;
+        }
+        let Some(signal) = signals.get(usize::from(*signal_index)).copied() else {
+            continue;
+        };
+        member_count = member_count.saturating_add(progress.entries);
+        buckets_scanned = buckets_scanned.saturating_add(u64::from(progress.shards_done));
+        newest_created = newest_created.max(progress.newest_created_unix_ns);
         match raise_format_floor(
             store,
             tenant,
-            *signal,
-            family_str,
+            signal,
+            family,
             target_version,
             FloorBasis {
-                observed_entries: *entries,
-                observed_newest_created_unix_ns: *newest,
-                observed_shards: scan_shards_for(store, tenant, *signal).await?,
+                observed_entries: progress.entries,
+                observed_newest_created_unix_ns: progress.newest_created_unix_ns,
+                observed_shards: scan_shards_for(store, tenant, signal).await?,
             },
             "compat-certify",
             now_ns,
@@ -643,7 +934,10 @@ pub async fn certify(
     }
     let digest = hasher.finalize().as_bytes().to_vec();
 
-    // Write the certificate and the watermark `S` under CAS.
+    // The certificate, with the watermark reset to `S` and `contradicted`
+    // cleared in the same CAS. A late-write pass that advanced the watermark
+    // past `S` checked records against the previous certificate, so the new
+    // certificate's pass starts again at `S`.
     let certificate = sysproto::Certificate {
         version: target_version,
         certified_unix_ns: now_ns,
@@ -652,28 +946,49 @@ pub async fn certify(
         buckets_scanned,
         tenant_set_digest: digest,
     };
-    let family_owned = family.to_string();
-    update_compat(store, keys_compat, |record| {
+    let start_unix_ns = cursor.start_unix_ns;
+    let written = update_compat(store, keys_compat, |record| {
         let entry = record
             .families
             .iter_mut()
-            .find(|f| f.family == family_owned)
+            .find(|f| f.family == family)
             .ok_or_else(|| CompatError::FamilyNotInRecord {
-                family: family_owned.clone(),
+                family: family.to_string(),
             })?;
-        entry.certificate = Some(certificate.clone());
-        entry.contradicted = false;
-        if start_unix_ns > entry.late_writes_verified_through_unix_ns {
-            entry.late_writes_verified_through_unix_ns = start_unix_ns;
+        if PriorState::of(entry) != prior {
+            return Err(CompatError::CasConflict {
+                key: COMPAT_KEY.to_string(),
+            });
         }
+        entry.certificate = Some(certificate);
+        entry.contradicted = false;
+        entry.late_writes_verified_through_unix_ns = start_unix_ns;
         Ok(())
     })
-    .await
-    .map_err(compat_err)?;
+    .await;
+    match written {
+        Ok(_) => {}
+        // A lost race on the record and a changed certificate state both mean
+        // the census no longer describes what the CAS would certify.
+        Err(CompatError::CasConflict { .. }) => {
+            return Ok(CertifyReport::Refused(
+                CertifyRefusal::CompatChangedDuringCensus,
+            ));
+        }
+        Err(err) => return Err(compat_err(err)),
+    }
 
-    // The certification completed: clear the cursor so a later re-certify of
-    // this or a higher version starts from a fresh `S`.
-    let _ = store.delete(&cursor_key).await;
+    // The cursor's certificate identity no longer matches, so a cursor this
+    // delete leaves behind is stale and never resumed; the failure is logged,
+    // not returned, because the certificate is already written.
+    match store.delete(&cursor_key).await {
+        Ok(()) | Err(StoreError::NotFound) => {}
+        Err(err) => tracing::warn!(
+            key = %cursor_key,
+            error = %err,
+            "compat certify: could not delete the completed cursor"
+        ),
+    }
 
     Ok(CertifyReport::Certified {
         version: target_version,
@@ -683,20 +998,30 @@ pub async fn certify(
     })
 }
 
-/// The `compat_fenced_unix_ns` of a `(tenant, signal)` provisioning record, or
-/// `None` when the record is absent.
+/// The fence state of one provisioned bucket.
+#[derive(Debug, Clone, Copy)]
+struct BucketFence {
+    compat_epoch: u64,
+    fenced_unix_ns: i64,
+}
+
+/// The fence state of a `(tenant, signal)` provisioning record, or `None`
+/// when the record is absent.
 async fn provisioning_fence(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     signal: Signal,
-) -> Result<Option<i64>> {
+) -> Result<Option<BucketFence>> {
     use prost::Message;
     let key = provisioning_key(tenant, signal);
     match store.get(&key, GetRange::Full).await {
         Ok(got) => {
             let record = sysproto::ProvisioningRecord::decode(got.data.as_ref())
                 .map_err(|e| MaintainError::Invariant(format!("{key}: {e}")))?;
-            Ok(Some(record.compat_fenced_unix_ns))
+            Ok(Some(BucketFence {
+                compat_epoch: record.compat_epoch,
+                fenced_unix_ns: record.compat_fenced_unix_ns,
+            }))
         }
         Err(StoreError::NotFound) => Ok(None),
         Err(err) => Err(MaintainError::Store(err)),
@@ -725,9 +1050,84 @@ async fn fence_bucket(
 /// readers' first GET. A footer larger than this falls back to a second ranged
 /// GET.
 const FOOTER_PROBE_BYTES: u64 = 64 * 1024;
+/// The RLOG and RSPAN trailer length; the version sits at bytes 8..10 of it.
+const TRAILER_BYTES: usize = 16;
 
-/// A ranged GET, with an absent object reported as `None` (a delete another
-/// pass completed between the footer read and this read is not a hold).
+const _: () = assert!(
+    ravel_logseg::footer::TRAILER_LEN == TRAILER_BYTES
+        && ravel_rspan::footer::TRAILER_LEN == TRAILER_BYTES
+);
+
+/// What probing one member object's bytes found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemberProbe {
+    /// The object is absent.
+    Absent,
+    /// The trailer or footer is structurally corrupt.
+    Corrupt,
+    /// The trailer version is outside this build's reader window.
+    OutOfWindow(u16),
+    /// The trailer version is in window. `section_hold` is the grammar version
+    /// of a nested section outside this build's read set, if any.
+    Readable {
+        trailer: u16,
+        section_hold: Option<u16>,
+    },
+}
+
+impl MemberProbe {
+    /// The version a retention hold keeps the object on: an out-of-window
+    /// trailer or an unreadable section. Absent and corrupt are not holds.
+    pub(crate) fn held_version(self) -> Option<u16> {
+        match self {
+            MemberProbe::OutOfWindow(version) => Some(version),
+            MemberProbe::Readable { section_hold, .. } => section_hold,
+            MemberProbe::Absent | MemberProbe::Corrupt => None,
+        }
+    }
+}
+
+/// Probe one object of class-A `family` (RSEG, RLOG or RSPAN); see the module
+/// doc for the requests each family costs.
+pub(crate) async fn probe_member(
+    store: &dyn ObjectStoreBackend,
+    family: &str,
+    key: &str,
+) -> Result<MemberProbe> {
+    match family {
+        FAMILY_RSEG => probe_rseg(store, key).await,
+        FAMILY_RLOG => probe_rlog(store, key).await,
+        FAMILY_RSPAN => probe_rspan(store, key).await,
+        other => Err(MaintainError::Invariant(format!(
+            "member probe: {other} is not a class-A family"
+        ))),
+    }
+}
+
+async fn probe_rseg(store: &dyn ObjectStoreBackend, key: &str) -> Result<MemberProbe> {
+    let got = match store
+        .get(key, GetRange::Suffix(ravel_segment::TRAILER_LEN))
+        .await
+    {
+        Ok(got) => got,
+        Err(StoreError::NotFound) => return Ok(MemberProbe::Absent),
+        Err(err) => return Err(MaintainError::Store(err)),
+    };
+    Ok(
+        match ravel_segment::classify_trailer(got.total_size, got.data.as_ref()) {
+            ravel_segment::TrailerClass::Readable(version) => MemberProbe::Readable {
+                trailer: version.number(),
+                section_hold: None,
+            },
+            ravel_segment::TrailerClass::OutsideVersionWindow(version) => {
+                MemberProbe::OutOfWindow(version)
+            }
+            ravel_segment::TrailerClass::Corrupt(_) => MemberProbe::Corrupt,
+        },
+    )
+}
+
+/// A ranged GET, with an absent object reported as `None`.
 async fn get_range(
     store: &dyn ObjectStoreBackend,
     key: &str,
@@ -741,95 +1141,209 @@ async fn get_range(
     }
 }
 
-/// Open a `.rlog` object's footer through the suffix-probe-then-range-chase
-/// protocol. `None` when the object is absent or structurally corrupt; neither
-/// is a version hold.
-/// What a footer probe found: an out-of-window trailer (a version hold on its
-/// own), a decoded footer to probe sections against, or nothing holdable (the
-/// object is absent or structurally corrupt).
-enum FooterProbe {
+/// One step of a format's suffix open.
+enum SuffixStep<F> {
+    Ready(F),
+    NeedRange { offset: u64, len: u64 },
     OutOfWindow(u16),
-    Footer(Box<LogFooter>),
-    Unreadable,
+    Corrupt,
 }
 
-/// Open a `.rlog` object's footer with ONE suffix GET (a second ranged GET only
-/// when the footer did not fit), classifying the trailer version in the same
-/// read. `open_from_suffix` checks the trailer version before the footer
-/// bounds, so an out-of-window trailer comes back as
-/// [`FooterProbe::OutOfWindow`] from the first read.
-async fn open_rlog_footer(store: &dyn ObjectStoreBackend, key: &str) -> Result<FooterProbe> {
+fn rlog_step(suffix: &[u8], total: u64) -> SuffixStep<LogFooter> {
+    match ravel_logseg::open_from_suffix(suffix, total) {
+        Ok(ravel_logseg::footer::SuffixOutcome::Ready(footer)) => SuffixStep::Ready(footer),
+        Ok(ravel_logseg::footer::SuffixOutcome::NeedRange { offset, len }) => {
+            SuffixStep::NeedRange { offset, len }
+        }
+        Err(LogSegError::UnsupportedVersion(version)) => SuffixStep::OutOfWindow(version),
+        Err(_) => SuffixStep::Corrupt,
+    }
+}
+
+fn rspan_step(suffix: &[u8], total: u64) -> SuffixStep<SpanFooter> {
+    match ravel_rspan::open_from_suffix(suffix, total) {
+        Ok(ravel_rspan::footer::SuffixOutcome::Ready(footer)) => SuffixStep::Ready(footer),
+        Ok(ravel_rspan::footer::SuffixOutcome::NeedRange { offset, len }) => {
+            SuffixStep::NeedRange { offset, len }
+        }
+        Err(ravel_rspan::SpanSegError::UnsupportedVersion(version)) => {
+            SuffixStep::OutOfWindow(version)
+        }
+        Err(_) => SuffixStep::Corrupt,
+    }
+}
+
+/// What a footer read found.
+enum FooterRead<F> {
+    Absent,
+    Corrupt,
+    OutOfWindow(u16),
+    Ready { footer: Box<F>, trailer: u16 },
+}
+
+/// The trailer version of a suffix that covers the trailer.
+fn trailer_version_of(tail: &[u8]) -> Option<u16> {
+    let at = tail.len().checked_sub(TRAILER_BYTES)?;
+    let bytes = tail.get(at + 8..at + 10)?;
+    Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+/// Read a footer through the suffix-probe-then-range-chase protocol: ONE
+/// suffix GET, and a second ranged GET only when the footer did not fit. The
+/// suffix open checks the trailer version before the footer bounds, so an
+/// out-of-window trailer comes back from the first read.
+async fn read_footer<F>(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+    step: fn(&[u8], u64) -> SuffixStep<F>,
+) -> Result<FooterRead<F>> {
     let probe = match store.get(key, GetRange::Suffix(FOOTER_PROBE_BYTES)).await {
         Ok(got) => got,
-        Err(StoreError::NotFound) => return Ok(FooterProbe::Unreadable),
+        Err(StoreError::NotFound) => return Ok(FooterRead::Absent),
         Err(err) => return Err(MaintainError::Store(err)),
     };
     let total = probe.total_size;
-    match ravel_logseg::open_from_suffix(probe.data.as_ref(), total) {
-        Ok(SuffixOutcome::Ready(footer)) => Ok(FooterProbe::Footer(Box::new(footer))),
-        Ok(SuffixOutcome::NeedRange { offset, len }) => {
-            let Some(tail) = get_range(store, key, offset, offset + len).await? else {
-                return Ok(FooterProbe::Unreadable);
+    let (footer, tail) = match step(probe.data.as_ref(), total) {
+        SuffixStep::Ready(footer) => (footer, probe.data),
+        SuffixStep::NeedRange { offset, len } => {
+            let Some(tail) = get_range(store, key, offset, offset.saturating_add(len)).await?
+            else {
+                return Ok(FooterRead::Absent);
             };
-            match ravel_logseg::open_from_suffix(tail.as_ref(), total) {
-                Ok(SuffixOutcome::Ready(footer)) => Ok(FooterProbe::Footer(Box::new(footer))),
-                Err(LogSegError::UnsupportedVersion(version)) => {
-                    Ok(FooterProbe::OutOfWindow(version))
+            match step(tail.as_ref(), total) {
+                SuffixStep::Ready(footer) => (footer, tail),
+                SuffixStep::OutOfWindow(version) => return Ok(FooterRead::OutOfWindow(version)),
+                SuffixStep::NeedRange { .. } | SuffixStep::Corrupt => {
+                    return Ok(FooterRead::Corrupt);
                 }
-                _ => Ok(FooterProbe::Unreadable),
             }
         }
-        Err(LogSegError::UnsupportedVersion(version)) => Ok(FooterProbe::OutOfWindow(version)),
-        Err(_) => Ok(FooterProbe::Unreadable),
+        SuffixStep::OutOfWindow(version) => return Ok(FooterRead::OutOfWindow(version)),
+        SuffixStep::Corrupt => return Ok(FooterRead::Corrupt),
+    };
+    Ok(match trailer_version_of(tail.as_ref()) {
+        Some(trailer) => FooterRead::Ready {
+            footer: Box::new(footer),
+            trailer,
+        },
+        None => FooterRead::Corrupt,
+    })
+}
+
+/// What a nested-section probe found.
+enum SectionProbe {
+    Clear,
+    Held(u16),
+    /// The object was deleted between the footer read and the section read.
+    Absent,
+}
+
+async fn probe_rlog(store: &dyn ObjectStoreBackend, key: &str) -> Result<MemberProbe> {
+    let (footer, trailer) = match read_footer(store, key, rlog_step).await? {
+        FooterRead::Absent => return Ok(MemberProbe::Absent),
+        FooterRead::Corrupt => return Ok(MemberProbe::Corrupt),
+        FooterRead::OutOfWindow(version) => return Ok(MemberProbe::OutOfWindow(version)),
+        FooterRead::Ready { footer, trailer } => (footer, trailer),
+    };
+    Ok(match rlog_sections(store, key, &footer).await? {
+        SectionProbe::Clear => MemberProbe::Readable {
+            trailer,
+            section_hold: None,
+        },
+        SectionProbe::Held(version) => MemberProbe::Readable {
+            trailer,
+            section_hold: Some(version),
+        },
+        SectionProbe::Absent => MemberProbe::Absent,
+    })
+}
+
+/// The POSTINGS and KEY_IDX grammar versions of a `.rlog` object.
+async fn rlog_sections(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+    footer: &LogFooter,
+) -> Result<SectionProbe> {
+    // POSTINGS: the section is stored raw at the section-comp level, so its
+    // first byte is the grammar version the reader gates on.
+    if let Some(desc) = footer.section(kind::POSTINGS) {
+        let Some(head) = get_range(store, key, desc.offset, desc.offset + 1).await? else {
+            return Ok(SectionProbe::Absent);
+        };
+        if let Some(&version) = head.first()
+            && version != POSTINGS_VERSION
+            && version != POSTINGS_VERSION_V1
+        {
+            return Ok(SectionProbe::Held(u16::from(version)));
+        }
     }
+
+    // KEY_IDX: read the section prefix, then its header version through the
+    // same path the reader uses. A version outside the set is a typed
+    // `UnsupportedSectionVersion`; a corrupt prefix is not a hold.
+    if let Ok(Some(range)) = key_index::key_probe_prefix_range(footer) {
+        let Some(prefix) = get_range(store, key, range.start, range.end).await? else {
+            return Ok(SectionProbe::Absent);
+        };
+        if let Err(LogSegError::UnsupportedSectionVersion { version, .. }) =
+            key_index::key_index_version(footer, |_requested: Range<u64>| {
+                Ok::<Bytes, LogSegError>(prefix.clone())
+            })
+        {
+            return Ok(SectionProbe::Held(version));
+        }
+    }
+    Ok(SectionProbe::Clear)
+}
+
+async fn probe_rspan(store: &dyn ObjectStoreBackend, key: &str) -> Result<MemberProbe> {
+    let (footer, trailer) = match read_footer(store, key, rspan_step).await? {
+        FooterRead::Absent => return Ok(MemberProbe::Absent),
+        FooterRead::Corrupt => return Ok(MemberProbe::Corrupt),
+        FooterRead::OutOfWindow(version) => return Ok(MemberProbe::OutOfWindow(version)),
+        FooterRead::Ready { footer, trailer } => (footer, trailer),
+    };
+    // KEY_IDX is stored raw and its first byte is the grammar version the
+    // reader checks against the codec's read set when it opens the section
+    // (`KeyIdxPrefix::parse`), the same set RLOG's KEY_IDX uses.
+    let mut section_hold = None;
+    if let Some(desc) = footer.section(ravel_rspan::footer::kind::KEY_IDX) {
+        let Some(head) = get_range(store, key, desc.offset, desc.offset + 1).await? else {
+            return Ok(MemberProbe::Absent);
+        };
+        if let Some(&version) = head.first()
+            && !key_index::KEY_IDX_VERSIONS.contains(&version)
+        {
+            section_hold = Some(u16::from(version));
+        }
+    }
+    Ok(MemberProbe::Readable {
+        trailer,
+        section_hold,
+    })
 }
 
 /// The version an RLOG object is held on: its trailer version when outside this
 /// build's reader window, else the grammar version of a nested POSTINGS or
 /// KEY_IDX section outside this build's read set (ADR-4233 H5). `None` when the
 /// object is readable here, absent, or structurally corrupt (corrupt is never a
-/// version hold). One suffix GET serves both the trailer and the footer, so the
-/// section probe adds no request for an object whose footer fits the suffix and
-/// carries no nested section; the per-member cost in the module doc counts from
-/// there.
+/// version hold). Up to four GETs; see the module doc.
 pub(crate) async fn rlog_held_version(
     store: &dyn ObjectStoreBackend,
     key: &str,
 ) -> Result<Option<u16>> {
-    let footer = match open_rlog_footer(store, key).await? {
-        FooterProbe::OutOfWindow(version) => return Ok(Some(version)),
-        FooterProbe::Footer(footer) => footer,
-        FooterProbe::Unreadable => return Ok(None),
-    };
+    Ok(probe_member(store, FAMILY_RLOG, key).await?.held_version())
+}
 
-    // POSTINGS: the section is stored raw at the section-comp level, so its
-    // first byte is the grammar version the reader gates on.
-    if let Some(desc) = footer.section(kind::POSTINGS)
-        && let Some(head) = get_range(store, key, desc.offset, desc.offset + 1).await?
-        && let Some(&version) = head.first()
-        && version != POSTINGS_VERSION
-        && version != POSTINGS_VERSION_V1
-    {
-        return Ok(Some(u16::from(version)));
-    }
-
-    // KEY_IDX: read the section prefix, then read its header version through
-    // the same path the reader uses. A version outside the set is a typed
-    // `UnsupportedSectionVersion`; a corrupt prefix is not a hold.
-    if let Ok(Some(range)) = key_index::key_probe_prefix_range(&footer) {
-        let Some(prefix) = get_range(store, key, range.start, range.end).await? else {
-            return Ok(None);
-        };
-        if let Err(LogSegError::UnsupportedSectionVersion { version, .. }) =
-            key_index::key_index_version(&footer, |_requested: Range<u64>| {
-                Ok::<Bytes, LogSegError>(prefix.clone())
-            })
-        {
-            return Ok(Some(version));
-        }
-    }
-
-    Ok(None)
+/// The version an RSPAN object is held on: its trailer version when outside
+/// this build's reader window, else the grammar version of its KEY_IDX section
+/// when outside the read set (ADR-4233 H5). `None` when the object is readable
+/// here, absent, or structurally corrupt. Up to three GETs; see the module doc.
+pub(crate) async fn rspan_held_version(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+) -> Result<Option<u16>> {
+    Ok(probe_member(store, FAMILY_RSPAN, key).await?.held_version())
 }
 
 /// A one-record `.rlog` object with a POSTINGS section (an indexed field) and
@@ -888,15 +1402,105 @@ pub(crate) fn rlog_object_with_sections(bump: bool) -> Vec<u8> {
     bytes
 }
 
+/// A one-span `.rspan` object. When `bump` is set, its KEY_IDX section's
+/// version byte is raised one above the read set while the trailer version
+/// stays in window: an H5 object.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) fn rspan_object_with_key_idx(bump: bool) -> Vec<u8> {
+    use ravel_rspan::{ObjectIdentity, RspanConfig, RspanWriter, SpanRecord, StatusCode};
+
+    let mut writer = RspanWriter::new(
+        RspanConfig::default(),
+        ObjectIdentity {
+            tenant_hash: [7; 16],
+            shard: 0,
+            writer_id: [1; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        },
+    );
+    writer.push(SpanRecord {
+        trace_id: [1; 16],
+        span_id: [1; 8],
+        parent_span_id: None,
+        name: "op".into(),
+        start_ts_ns: 1,
+        end_ts_ns: 2,
+        status_code: StatusCode::Ok,
+        status_message: None,
+        attrs: vec![("service".to_string(), "checkout".to_string())],
+    });
+    let mut bytes = writer.finish().expect("finish rspan");
+    if bump {
+        let at = ravel_rspan::footer::open(&bytes)
+            .expect("open")
+            .section(ravel_rspan::footer::kind::KEY_IDX)
+            .expect("key_idx section")
+            .offset as usize;
+        let above = key_index::KEY_IDX_VERSIONS
+            .iter()
+            .max()
+            .copied()
+            .expect("non-empty read set");
+        bytes[at] = above + 1;
+    }
+    bytes
+}
+
+/// A one-series `.rseg` object at the current write version.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) fn rseg_object() -> Vec<u8> {
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId};
+
+    let tenant = TenantId::new("acme");
+    let labels = LabelSet::new(vec![Label {
+        name: METRIC_NAME_LABEL.to_string(),
+        value: "m".to_string(),
+    }])
+    .expect("labels");
+    let series = vec![SeriesInput {
+        series_id: SeriesId::compute(&tenant, "m", &labels).expect("series id"),
+        labels,
+        samples: vec![Sample {
+            ts_ns: 1,
+            value: 1.0,
+        }],
+    }];
+    SegmentWriter::write(
+        series,
+        SegmentIdentity {
+            tenant_hash: tenant.hash().0,
+            shard: 0,
+            writer_id: uuid::Uuid::from_u128(1).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        },
+        IngestBounds {
+            min_ingest_ts_ns: 1,
+            max_ingest_ts_ns: 1,
+        },
+    )
+    .expect("write rseg")
+    .bytes
+    .to_vec()
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use ravel_catalog::compat::{COMPAT_FORMAT_VERSION, FAMILY_RLOG, create_compat, read_compat};
-    use ravel_catalog::{AbsentPolicy, raise_compat_fence, validate_or_adopt};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
+    use ravel_catalog::compat::{COMPAT_FORMAT_VERSION, create_compat};
+    use ravel_catalog::{AbsentPolicy, validate_or_adopt};
     use ravel_commit::record::NewCommitRecord;
-    use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
-    use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
+    use ravel_object_store::{GetOutcome, ObjectMeta, PutOptions, PutOutcome};
     use uuid::Uuid;
 
     use super::*;
@@ -906,6 +1510,9 @@ mod tests {
     const ACTIVATED: i64 = 1_000;
     /// Far enough past `ACTIVATED` to clear the activation and `G_pre` terms.
     const NOW1: i64 = 400_000 * HOUR;
+    /// The RLOG and RSPAN writers' trailer version, and the RSEG writer's.
+    const V_LOG: u32 = 5;
+    const V_SEG: u32 = 7;
 
     fn ckeys() -> CompatKeys {
         CompatKeys::from_file_keys(&[[7; 32]]).expect("one key")
@@ -919,13 +1526,33 @@ mod tests {
         }
     }
 
+    fn skew() -> i64 {
+        timings().clock_skew_allowance_ns
+    }
+
     fn tenant() -> TenantHash {
         TenantHash([5; 16])
     }
 
-    /// Create `sys/compat` with `rlog` active at `active`, activated at
-    /// `ACTIVATED`, and `fence_complete` for the fence-walk precondition.
-    async fn seed_compat(store: &dyn ObjectStoreBackend, active: u32, fence_complete: i64) {
+    /// Every census listing in these tests pages at two keys.
+    fn new_store() -> Arc<MemoryStore> {
+        Arc::new(MemoryStore::with_page_size(2))
+    }
+
+    fn ms(ns: i64) -> u64 {
+        (ns / 1_000_000) as u64
+    }
+
+    /// Create `sys/compat` with `family` active at `active`, activated at
+    /// `ACTIVATED` in epoch 1, `fence_complete` for the fence-walk
+    /// precondition, and `P = p_ns`.
+    async fn seed_compat_with(
+        store: &dyn ObjectStoreBackend,
+        family: &str,
+        active: u32,
+        fence_complete: i64,
+        p_ns: i64,
+    ) {
         create_compat(
             store,
             &ckeys(),
@@ -934,7 +1561,7 @@ mod tests {
                 baseline_release_major: 0,
                 baseline_release_minor: 34,
                 families: vec![sysproto::CompatFamily {
-                    family: FAMILY_RLOG.to_string(),
+                    family: family.to_string(),
                     active_write_version: active,
                     activated_epoch: 1,
                     activated_unix_ns: ACTIVATED,
@@ -945,7 +1572,7 @@ mod tests {
                     contradicted: false,
                 }],
                 compat_epoch: 1,
-                max_publish_lifetime_ns: HOUR,
+                max_publish_lifetime_ns: p_ns,
                 adopted: Vec::new(),
                 mac: Vec::new(),
             },
@@ -954,44 +1581,79 @@ mod tests {
         .expect("create sys/compat");
     }
 
-    /// Provision the logs bucket at `shards` and fence it at `ACTIVATED`, an old
-    /// time, so its `G_pre` has long passed and the time gate and recheck admit
-    /// it.
-    async fn provision_logs_fenced(store: &dyn ObjectStoreBackend, shards: u32) {
+    async fn seed_compat(store: &dyn ObjectStoreBackend, family: &str, active: u32) {
+        seed_compat_with(store, family, active, ACTIVATED, HOUR).await;
+    }
+
+    /// Provision `(tenant, signal)` at `shards`, unfenced (a v3 record).
+    async fn provision_unfenced(
+        store: &dyn ObjectStoreBackend,
+        tenant: TenantHash,
+        signal: Signal,
+        shards: u32,
+    ) {
         validate_or_adopt(
             store,
-            &tenant(),
-            Signal::Logs,
+            &tenant,
+            signal,
             shards,
             ACTIVATED,
             AbsentPolicy::CreateFromConfig,
         )
         .await
-        .expect("provision logs");
-        raise_compat_fence(store, &tenant(), Signal::Logs, 1, ACTIVATED)
-            .await
-            .expect("fence logs");
+        .expect("provision");
     }
 
-    /// Seed one logs commit record (no data object) at `shard`, stamped
-    /// `stamp`, with store `LastModified` set to `modified_ms`.
-    async fn seed_commit(
+    /// Provision `(tenant, signal)` at `shards` and fence it to epoch 1 at
+    /// `fenced_at`.
+    async fn provision_fenced_at(
+        store: &dyn ObjectStoreBackend,
+        tenant: TenantHash,
+        signal: Signal,
+        shards: u32,
+        fenced_at: i64,
+    ) {
+        provision_unfenced(store, tenant, signal, shards).await;
+        raise_compat_fence(store, &tenant, signal, 1, fenced_at)
+            .await
+            .expect("fence");
+    }
+
+    /// Provision and fence at `ACTIVATED`, an old time, so the bucket's `G_pre`
+    /// has long passed and the time gate and recheck admit it.
+    async fn provision_fenced(
+        store: &dyn ObjectStoreBackend,
+        tenant: TenantHash,
+        signal: Signal,
+        shards: u32,
+    ) {
+        provision_fenced_at(store, tenant, signal, shards, ACTIVATED).await;
+    }
+
+    /// One commit record of `(tenant, signal, shard)` stamped `stamp`, with
+    /// store `LastModified` `modified_ms`, and `data` (when given) put at the
+    /// data key the record names. Returns `(commit_key, data_key)`.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_member(
         store: &MemoryStore,
+        tenant: TenantHash,
+        signal: Signal,
         shard: u32,
         seq: u64,
         stamp: u32,
         modified_ms: u64,
-    ) -> String {
+        data: Option<Vec<u8>>,
+    ) -> (String, String) {
         store.set_clock_ms(modified_ms);
         let ts_ns = i64::from(shard) * HOUR + (seq as i64) * 1_000_000;
         let commit = record::build(NewCommitRecord {
-            tenant_hash: tenant(),
-            signal: Signal::Logs,
+            tenant_hash: tenant,
+            signal,
             shard,
             writer_id: Uuid::from_u128(u128::from(seq) + 1),
             writer_epoch: 1,
             writer_seq: seq,
-            object_size: 1,
+            object_size: data.as_ref().map_or(1, |d| d.len() as u64),
             content_hash: [seq as u8; 32],
             sample_count: 1,
             series_count: 1,
@@ -1009,11 +1671,36 @@ mod tests {
             .put(&key, record::encode(&commit), PutOptions::default())
             .await
             .expect("put commit");
-        key
+        let data_key = ravel_commit::keys::reconstruct_data_key(&commit).expect("data key");
+        if let Some(bytes) = data {
+            put(store, &data_key, bytes).await;
+        }
+        (key, data_key)
     }
 
-    /// The `rlog` family entry of `sys/compat`.
-    async fn rlog_entry(store: &dyn ObjectStoreBackend) -> sysproto::CompatFamily {
+    /// A stamp-5 logs commit with a readable `.rlog` data object.
+    async fn seed_log(
+        store: &MemoryStore,
+        tenant: TenantHash,
+        shard: u32,
+        seq: u64,
+        modified_ms: u64,
+    ) -> (String, String) {
+        seed_member(
+            store,
+            tenant,
+            Signal::Logs,
+            shard,
+            seq,
+            V_LOG,
+            modified_ms,
+            Some(rlog_object()),
+        )
+        .await
+    }
+
+    /// The `family` entry of `sys/compat`.
+    async fn family_entry(store: &dyn ObjectStoreBackend, family: &str) -> sysproto::CompatFamily {
         read_compat(store, &ckeys())
             .await
             .expect("read")
@@ -1021,12 +1708,31 @@ mod tests {
             .0
             .families
             .into_iter()
-            .find(|f| f.family == FAMILY_RLOG)
-            .expect("rlog entry")
+            .find(|f| f.family == family)
+            .expect("family entry")
     }
 
-    fn rlog_object_bytes() -> Vec<u8> {
+    async fn rlog_entry(store: &dyn ObjectStoreBackend) -> sysproto::CompatFamily {
+        family_entry(store, FAMILY_RLOG).await
+    }
+
+    fn rlog_object() -> Vec<u8> {
         rlog_object_with_sections(false)
+    }
+
+    /// `bytes` with its trailer's version field (bytes 8..10 of the last 16, in
+    /// all three formats) set to `version`.
+    fn with_trailer_version(mut bytes: Vec<u8>, version: u16) -> Vec<u8> {
+        let at = bytes.len() - TRAILER_BYTES + 8;
+        bytes[at..at + 2].copy_from_slice(&version.to_le_bytes());
+        bytes
+    }
+
+    /// `bytes` with the last trailer magic byte flipped.
+    fn with_corrupt_trailer(mut bytes: Vec<u8>) -> Vec<u8> {
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        bytes
     }
 
     async fn put(store: &dyn ObjectStoreBackend, key: &str, bytes: Vec<u8>) {
@@ -1036,11 +1742,137 @@ mod tests {
             .expect("put object");
     }
 
+    async fn cursor_present(store: &dyn ObjectStoreBackend) -> bool {
+        store
+            .get(&certify_cursor_key(FAMILY_RLOG), GetRange::Full)
+            .await
+            .is_ok()
+    }
+
+    async fn certify_rlog(
+        store: &dyn ObjectStoreBackend,
+        now_ns: i64,
+        target: u32,
+        budget: Option<usize>,
+    ) -> CertifyReport {
+        certify(
+            store,
+            &ckeys(),
+            now_ns,
+            FAMILY_RLOG,
+            target,
+            timings(),
+            budget,
+        )
+        .await
+        .expect("certify")
+    }
+
+    type Hook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
+    /// A store that records every GET key and runs `hook` once, before the
+    /// first GET whose key contains `trigger`.
+    struct HookStore {
+        inner: Arc<MemoryStore>,
+        trigger: String,
+        hook: Mutex<Option<Hook>>,
+        gets: Mutex<Vec<String>>,
+    }
+
+    impl HookStore {
+        fn new(inner: Arc<MemoryStore>, trigger: &str, hook: Option<Hook>) -> Self {
+            HookStore {
+                inner,
+                trigger: trigger.to_string(),
+                hook: Mutex::new(hook),
+                gets: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn gets_of(&self, key: &str) -> usize {
+            self.gets
+                .lock()
+                .expect("gets")
+                .iter()
+                .filter(|k| *k == key)
+                .count()
+        }
+
+        fn hook_fired(&self) -> bool {
+            self.hook.lock().expect("hook").is_none()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for HookStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> std::result::Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> std::result::Result<GetOutcome, StoreError> {
+            self.gets.lock().expect("gets").push(key.to_string());
+            if key.contains(&self.trigger) {
+                let hook = self.hook.lock().expect("hook").take();
+                if let Some(hook) = hook {
+                    hook().await;
+                }
+            }
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> std::result::Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> std::result::Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    // ---- the member probe ----
+
     #[tokio::test]
     async fn a_readable_object_is_not_held() {
         let store = MemoryStore::new();
-        put(&store, "obj", rlog_object_bytes()).await;
+        put(&store, "obj", rlog_object()).await;
         assert_eq!(rlog_held_version(&store, "obj").await.expect("probe"), None);
+        assert_eq!(
+            probe_member(&store, FAMILY_RLOG, "obj")
+                .await
+                .expect("probe"),
+            MemberProbe::Readable {
+                trailer: V_LOG as u16,
+                section_hold: None
+            }
+        );
     }
 
     #[tokio::test]
@@ -1062,6 +1894,15 @@ mod tests {
             rlog_held_version(&store, "missing").await.expect("probe"),
             None
         );
+        for family in [FAMILY_RSEG, FAMILY_RLOG, FAMILY_RSPAN] {
+            assert_eq!(
+                probe_member(&store, family, "missing")
+                    .await
+                    .expect("probe"),
+                MemberProbe::Absent,
+                "{family}"
+            );
+        }
     }
 
     /// The trailer version is untouched; the hold is on the section version
@@ -1071,6 +1912,7 @@ mod tests {
     async fn the_trailer_stays_in_window() {
         let store = MemoryStore::new();
         put(&store, "obj", rlog_object_with_sections(true)).await;
+        put(&store, "span", rspan_object_with_key_idx(true)).await;
         let tail = store
             .get(
                 "obj",
@@ -1085,18 +1927,153 @@ mod tests {
             ),
             "trailer version must stay in window for this to be an H5 case"
         );
+        let tail = store
+            .get(
+                "span",
+                GetRange::Suffix(ravel_rspan::footer::TRAILER_LEN as u64),
+            )
+            .await
+            .expect("suffix");
+        assert!(
+            !matches!(
+                ravel_rspan::open_from_suffix(tail.data.as_ref(), tail.total_size),
+                Err(ravel_rspan::SpanSegError::UnsupportedVersion(_))
+            ),
+            "trailer version must stay in window for this to be an H5 case"
+        );
     }
 
-    /// certify refuses before the activation's fence walk is recorded complete.
+    /// ADR-4233 H5 for RSPAN: a `.rspan` object whose trailer is in window but
+    /// whose KEY_IDX section is at a version outside the read set is held on
+    /// that version; the readable control is not.
+    #[tokio::test]
+    async fn an_unreadable_rspan_key_idx_version_is_held() {
+        let store = MemoryStore::new();
+        put(&store, "held", rspan_object_with_key_idx(true)).await;
+        put(&store, "readable", rspan_object_with_key_idx(false)).await;
+        let above = u16::from(*key_index::KEY_IDX_VERSIONS.iter().max().expect("set")) + 1;
+        assert_eq!(
+            rspan_held_version(&store, "held").await.expect("probe"),
+            Some(above)
+        );
+        assert_eq!(
+            probe_member(&store, FAMILY_RSPAN, "readable")
+                .await
+                .expect("probe"),
+            MemberProbe::Readable {
+                trailer: V_LOG as u16,
+                section_hold: None
+            }
+        );
+    }
+
+    /// The probe decodes each family's trailer: the real version when in
+    /// window, the real version when out of it (RSEG included), and Corrupt
+    /// for a bad trailer.
+    #[tokio::test]
+    async fn the_probe_reports_each_familys_trailer() {
+        let store = MemoryStore::new();
+        put(&store, "seg", rseg_object()).await;
+        put(&store, "seg6", with_trailer_version(rseg_object(), 6)).await;
+        put(&store, "seg-bad", with_corrupt_trailer(rseg_object())).await;
+        put(&store, "log4", with_trailer_version(rlog_object(), 4)).await;
+        put(&store, "log-bad", with_corrupt_trailer(rlog_object())).await;
+        put(
+            &store,
+            "span-bad",
+            with_corrupt_trailer(rspan_object_with_key_idx(false)),
+        )
+        .await;
+        let probe = |family, key| {
+            let store = &store;
+            async move { probe_member(store, family, key).await.expect("probe") }
+        };
+        assert_eq!(
+            probe(FAMILY_RSEG, "seg").await,
+            MemberProbe::Readable {
+                trailer: V_SEG as u16,
+                section_hold: None
+            }
+        );
+        assert_eq!(
+            probe(FAMILY_RSEG, "seg6").await,
+            MemberProbe::OutOfWindow(6)
+        );
+        assert_eq!(probe(FAMILY_RSEG, "seg-bad").await, MemberProbe::Corrupt);
+        assert_eq!(
+            probe(FAMILY_RLOG, "log4").await,
+            MemberProbe::OutOfWindow(4)
+        );
+        assert_eq!(probe(FAMILY_RLOG, "log-bad").await, MemberProbe::Corrupt);
+        assert_eq!(probe(FAMILY_RSPAN, "span-bad").await, MemberProbe::Corrupt);
+    }
+
+    /// The per-object request cost the module doc states: RSEG one GET; an
+    /// RLOG object with POSTINGS and KEY_IDX sections and a footer under 64 KiB
+    /// three (footer suffix, POSTINGS byte, KEY_IDX prefix); an RSPAN object
+    /// two (footer suffix, KEY_IDX byte).
+    #[tokio::test]
+    async fn the_probe_costs_the_documented_gets() {
+        let inner = new_store();
+        put(&*inner, "seg", rseg_object()).await;
+        put(&*inner, "log", rlog_object()).await;
+        put(&*inner, "span", rspan_object_with_key_idx(false)).await;
+        let store = HookStore::new(inner, "\u{0}", None);
+        probe_member(&store, FAMILY_RSEG, "seg").await.expect("seg");
+        probe_member(&store, FAMILY_RLOG, "log").await.expect("log");
+        probe_member(&store, FAMILY_RSPAN, "span")
+            .await
+            .expect("span");
+        assert_eq!(store.gets_of("seg"), 1);
+        assert_eq!(store.gets_of("log"), 3);
+        assert_eq!(store.gets_of("span"), 2);
+    }
+
+    // ---- the cursor ----
+
+    #[test]
+    fn the_cursor_round_trips_and_refuses_other_payloads() {
+        let mut buckets = BTreeMap::new();
+        buckets.insert(
+            (TenantHash([3; 16]), 2),
+            BucketProgress {
+                shards_done: 2,
+                entries: 9,
+                newest_created_unix_ns: 77,
+            },
+        );
+        let cursor = CertifyCursor {
+            target_version: 5,
+            activated_epoch: 3,
+            start_unix_ns: 1234,
+            prior: PriorState {
+                certificate: Some((4, 99)),
+                contradicted: true,
+            },
+            buckets,
+        };
+        let bytes = encode_cursor(&cursor);
+        assert_eq!(decode_cursor(&bytes, 3), Some(cursor.clone()));
+        // A signal index outside the family, a trailing byte, a truncation, and
+        // the index-based tag-1 layout are all unrecognized.
+        assert_eq!(decode_cursor(&bytes, 2), None);
+        let mut long = bytes.clone();
+        long.push(0);
+        assert_eq!(decode_cursor(&long, 3), None);
+        assert_eq!(decode_cursor(&bytes[..bytes.len() - 1], 3), None);
+        let mut tag1 = bytes;
+        tag1[0] = 1;
+        assert_eq!(decode_cursor(&tag1, 3), None);
+    }
+
+    // ---- certify preconditions ----
+
     #[tokio::test]
     async fn certify_refuses_before_fence_complete() {
-        let store = MemoryStore::new();
-        seed_compat(&store, 6, 0).await;
-        let report = certify(&store, &ckeys(), NOW1, FAMILY_RLOG, 6, timings(), None)
-            .await
-            .expect("certify");
+        let store = new_store();
+        seed_compat_with(&*store, FAMILY_RLOG, V_LOG, 0, HOUR).await;
         assert_eq!(
-            report,
+            certify_rlog(&*store, NOW1, V_LOG, None).await,
             CertifyReport::Refused(CertifyRefusal::FenceWalkIncomplete)
         );
     }
@@ -1104,112 +2081,291 @@ mod tests {
     /// certify refuses, and records no `S`, before the time precondition passes.
     #[tokio::test]
     async fn certify_refuses_before_the_time_gate() {
-        let store = MemoryStore::new();
-        seed_compat(&store, 6, ACTIVATED).await;
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
         // `now` just above activation but below activation + H + P + T_req.
-        let report = certify(
-            &store,
-            &ckeys(),
-            ACTIVATED + 1,
-            FAMILY_RLOG,
-            6,
-            timings(),
-            None,
-        )
-        .await
-        .expect("certify");
-        assert!(matches!(
-            report,
-            CertifyReport::Refused(CertifyRefusal::TimeGate { .. })
-        ));
-        // No cursor was written: `S` is gated on the time precondition.
-        assert!(
-            store
-                .get(&certify_cursor_key(FAMILY_RLOG), GetRange::Full)
-                .await
-                .is_err()
-        );
-    }
-
-    /// A member object below the target makes the result contradicted.
-    #[tokio::test]
-    async fn a_lower_version_object_yields_contradicted() {
-        let store = MemoryStore::new();
-        seed_compat(&store, 6, ACTIVATED).await;
-        provision_logs_fenced(&store, 1).await;
-        seed_commit(&store, 0, 1, 5, 1_000).await; // stamp 5, below target 6
-        let report = certify(&store, &ckeys(), NOW1, FAMILY_RLOG, 6, timings(), None)
-            .await
-            .expect("certify");
+        let report = certify_rlog(&*store, ACTIVATED + 1, V_LOG, None).await;
         assert!(
             matches!(
                 report,
-                CertifyReport::Contradicted {
-                    found_version: 5,
-                    ..
-                }
+                CertifyReport::Refused(CertifyRefusal::TimeGate { .. })
+            ),
+            "{report:?}"
+        );
+        assert!(
+            !cursor_present(&*store).await,
+            "S is gated on the time gate"
+        );
+    }
+
+    /// With no `P` on `sys/compat` the time precondition has no publish term,
+    /// so certify refuses rather than treating it as zero.
+    #[tokio::test]
+    async fn certify_refuses_without_a_publish_lifetime() {
+        let store = new_store();
+        seed_compat_with(&*store, FAMILY_RLOG, V_LOG, ACTIVATED, 0).await;
+        provision_fenced(&*store, tenant(), Signal::Logs, 1).await;
+        seed_log(&store, tenant(), 0, 1, 1_000).await;
+        assert_eq!(
+            certify_rlog(&*store, NOW1, V_LOG, None).await,
+            CertifyReport::Refused(CertifyRefusal::PublishLifetimeAbsent)
+        );
+    }
+
+    /// `G_pre` takes the larger of the configured and the `sys/gc`
+    /// `max_flush_lifetime`: a bucket fenced 10 h ago clears `G_pre` at the
+    /// configured 1 h (3 + 2 + 1 h plus `T_req`) but not at the recorded 10 h
+    /// (3 + 20 + 1 h).
+    #[tokio::test]
+    async fn the_recorded_max_flush_lifetime_widens_g_pre() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        provision_fenced_at(&*store, tenant(), Signal::Logs, 1, NOW1 - 10 * HOUR).await;
+        seed_log(&store, tenant(), 0, 1, 1_000).await;
+        crate::gc_config::bootstrap_gc_config(
+            &*store,
+            crate::gc_config::GcConfigValues {
+                max_flush_lifetime_ns: 10 * HOUR,
+                ..crate::gc_config::GcConfigValues::maintain_defaults()
+            },
+            ACTIVATED,
+        )
+        .await
+        .expect("sys/gc");
+        let report = certify_rlog(&*store, NOW1, V_LOG, None).await;
+        assert!(
+            matches!(
+                report,
+                CertifyReport::Refused(CertifyRefusal::TimeGate { .. })
             ),
             "{report:?}"
         );
     }
 
-    /// A member whose nested section is unreadable holds the certificate.
+    // ---- member verdicts ----
+
+    /// A member stamped below the target makes the result contradicted.
     #[tokio::test]
-    async fn a_held_member_is_counted() {
-        let store = MemoryStore::new();
-        seed_compat(&store, 6, ACTIVATED).await;
-        provision_logs_fenced(&store, 1).await;
-        let commit_key = seed_commit(&store, 0, 1, 6, 1_000).await;
-        // Place the stamped-6 commit's data object with a bumped POSTINGS
-        // section, so its stamp is in range but the object is unreadable.
-        let commit = record::decode(
-            store
-                .get(&commit_key, GetRange::Full)
-                .await
-                .expect("get commit")
-                .data
-                .as_ref(),
-        )
-        .expect("decode");
-        let data_key = ravel_commit::keys::reconstruct_data_key(&commit).expect("data key");
-        store
-            .put(
-                &data_key,
-                Bytes::from(rlog_object_with_sections(true)),
-                PutOptions::default(),
-            )
-            .await
-            .expect("put data");
-        let report = certify(&store, &ckeys(), NOW1, FAMILY_RLOG, 6, timings(), None)
-            .await
-            .expect("certify");
-        assert!(
-            matches!(report, CertifyReport::HeldMember { .. }),
-            "{report:?}"
+    async fn a_lower_version_stamp_yields_contradicted() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*store, tenant(), Signal::Logs, 1).await;
+        let (_, data_key) = seed_member(&store, tenant(), Signal::Logs, 0, 1, 4, 1_000, None).await;
+        assert_eq!(
+            certify_rlog(&*store, NOW1, V_LOG, None).await,
+            CertifyReport::Contradicted {
+                member_key: data_key,
+                found_version: 4
+            }
         );
     }
 
+    /// A member whose nested section is unreadable holds the certificate,
+    /// reported with its key and the section's version.
+    #[tokio::test]
+    async fn a_held_member_holds_the_certificate() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*store, tenant(), Signal::Logs, 1).await;
+        let (_, data_key) = seed_member(
+            &store,
+            tenant(),
+            Signal::Logs,
+            0,
+            1,
+            V_LOG,
+            1_000,
+            Some(rlog_object_with_sections(true)),
+        )
+        .await;
+        assert_eq!(
+            certify_rlog(&*store, NOW1, V_LOG, None).await,
+            CertifyReport::HeldMember {
+                member_key: data_key,
+                version: u16::from(POSTINGS_VERSION + 1)
+            }
+        );
+        assert!(rlog_entry(&*store).await.certificate.is_none());
+    }
+
+    /// A held RSEG member is reported on its real trailer version.
+    #[tokio::test]
+    async fn a_held_rseg_member_reports_its_trailer_version() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RSEG, V_SEG).await;
+        provision_fenced(&*store, tenant(), Signal::Metrics, 1).await;
+        let (_, data_key) = seed_member(
+            &store,
+            tenant(),
+            Signal::Metrics,
+            0,
+            1,
+            V_SEG,
+            1_000,
+            Some(with_trailer_version(rseg_object(), 6)),
+        )
+        .await;
+        let report = certify(&*store, &ckeys(), NOW1, FAMILY_RSEG, V_SEG, timings(), None)
+            .await
+            .expect("certify");
+        assert_eq!(
+            report,
+            CertifyReport::HeldMember {
+                member_key: data_key,
+                version: 6
+            }
+        );
+    }
+
+    /// A member whose stamp is one above its trailer version refuses: the
+    /// stamp is a claim the bytes contradict.
+    #[tokio::test]
+    async fn a_stamp_above_the_trailer_refuses() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*store, tenant(), Signal::Logs, 1).await;
+        let (_, data_key) = seed_member(
+            &store,
+            tenant(),
+            Signal::Logs,
+            0,
+            1,
+            V_LOG + 1,
+            1_000,
+            Some(rlog_object()),
+        )
+        .await;
+        assert_eq!(
+            certify_rlog(&*store, NOW1, V_LOG, None).await,
+            CertifyReport::Refused(CertifyRefusal::StampTrailerMismatch {
+                member_key: data_key,
+                stamp: V_LOG + 1,
+                trailer: V_LOG as u16
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absent_member_refuses() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*store, tenant(), Signal::Logs, 1).await;
+        let (_, data_key) =
+            seed_member(&store, tenant(), Signal::Logs, 0, 1, V_LOG, 1_000, None).await;
+        assert_eq!(
+            certify_rlog(&*store, NOW1, V_LOG, None).await,
+            CertifyReport::Refused(CertifyRefusal::MemberAbsent {
+                member_key: data_key
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_member_trailer_refuses() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*store, tenant(), Signal::Logs, 1).await;
+        let (_, data_key) = seed_member(
+            &store,
+            tenant(),
+            Signal::Logs,
+            0,
+            1,
+            V_LOG,
+            1_000,
+            Some(with_corrupt_trailer(rlog_object())),
+        )
+        .await;
+        assert_eq!(
+            certify_rlog(&*store, NOW1, V_LOG, None).await,
+            CertifyReport::Refused(CertifyRefusal::MemberCorrupt {
+                member_key: data_key
+            })
+        );
+    }
+
+    /// Objects under `l0/` and `l1/` that no record names are census members:
+    /// an out-of-window one in each holds the certificate.
+    #[tokio::test]
+    async fn unrecorded_l0_and_l1_objects_are_censused() {
+        for dir in ["l0/0000/stray.rseg", "l1/0000/000123/stray.rseg"] {
+            let store = new_store();
+            seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+            provision_fenced(&*store, tenant(), Signal::Logs, 1).await;
+            seed_log(&store, tenant(), 0, 1, 1_000).await;
+            let stray = format!("t/{}/l/{dir}", tenant().to_hex());
+            put(&*store, &stray, with_trailer_version(rlog_object(), 4)).await;
+            assert_eq!(
+                certify_rlog(&*store, NOW1, V_LOG, None).await,
+                CertifyReport::HeldMember {
+                    member_key: stray,
+                    version: 4
+                }
+            );
+        }
+    }
+
+    /// Alerts (fixed shard 0) and audit (fixed shards 0 and 1) are rlog
+    /// members though never provisioned.
+    #[tokio::test]
+    async fn alerts_and_audit_members_are_censused() {
+        for (signal, shard) in [(Signal::Alerts, 0), (Signal::Audit, 1)] {
+            let store = new_store();
+            seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+            provision_fenced(&*store, tenant(), Signal::Logs, 1).await;
+            seed_log(&store, tenant(), 0, 1, 1_000).await;
+            let (_, data_key) =
+                seed_member(&store, tenant(), signal, shard, 2, 4, 1_000, None).await;
+            assert_eq!(
+                certify_rlog(&*store, NOW1, V_LOG, None).await,
+                CertifyReport::Contradicted {
+                    member_key: data_key,
+                    found_version: 4
+                },
+                "{signal:?}"
+            );
+        }
+    }
+
     /// An incomplete listing (an unaddressable key under a census prefix)
-    /// refuses the run: a strict census never shortens its population.
+    /// refuses with the typed refusal naming the prefix.
     #[tokio::test]
     async fn an_incomplete_listing_blocks() {
-        let store = MemoryStore::new();
-        seed_compat(&store, 6, ACTIVATED).await;
-        provision_logs_fenced(&store, 1).await;
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*store, tenant(), Signal::Logs, 1).await;
         let prefix =
             ravel_commit::keys::commit_shard_prefix(&tenant(), Signal::Logs, 0).expect("prefix");
-        // A key under the census prefix the census cannot address: a strict
-        // census blocks on it rather than certifying over a shortened
-        // population. A non-strict census would skip it and certify.
         store.insert_foreign(
-            &format!("{prefix}!!unaddressable"),
+            &format!("{prefix}a#unaddressable"),
             Bytes::from_static(b"x"),
         );
-        let result = certify(&store, &ckeys(), NOW1, FAMILY_RLOG, 6, timings(), None).await;
-        assert!(
-            !matches!(result, Ok(CertifyReport::Certified { .. })),
-            "a strict census must block an unaddressable census key: {result:?}"
+        assert_eq!(
+            certify_rlog(&*store, NOW1, V_LOG, None).await,
+            CertifyReport::Refused(CertifyRefusal::IncompleteListing {
+                prefix,
+                unaddressable: 1
+            })
         );
+    }
+
+    /// A faulted LIST page blocks certification, and the fault is shown to
+    /// have fired.
+    #[tokio::test]
+    async fn a_faulted_listing_blocks_certification() {
+        let inner = new_store();
+        seed_compat(&*inner, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*inner, tenant(), Signal::Logs, 1).await;
+        seed_log(&inner, tenant(), 0, 1, 1_000).await;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::List, ScriptedFault::Permanent("list down".to_string()))
+                .with_key_contains("/c/"),
+        );
+        let store = FaultStore::new(inner.clone(), plan);
+        let result = certify(&store, &ckeys(), NOW1, FAMILY_RLOG, V_LOG, timings(), None).await;
+        assert!(result.is_err(), "a faulted listing must block: {result:?}");
+        assert_eq!(store.fault_count(Op::List, FaultKind::Permanent), 1);
+        assert!(rlog_entry(&*inner).await.certificate.is_none());
     }
 
     /// certify fences a bucket provisioned at version 3 after the eager walk,
@@ -1217,23 +2373,10 @@ mod tests {
     /// fresh fence's own `G_pre` has passed.
     #[tokio::test]
     async fn the_per_bucket_g_pre_recheck_refuses_a_recently_fenced_bucket() {
-        let store = MemoryStore::new();
-        seed_compat(&store, 6, ACTIVATED).await;
-        // Provisioned at version 3, unfenced: the initial time gate sees no
-        // fence, but certify fences it at `now`, and the recheck refuses.
-        validate_or_adopt(
-            &store,
-            &tenant(),
-            Signal::Logs,
-            1,
-            ACTIVATED,
-            AbsentPolicy::CreateFromConfig,
-        )
-        .await
-        .expect("provision");
-        let report = certify(&store, &ckeys(), NOW1, FAMILY_RLOG, 6, timings(), None)
-            .await
-            .expect("certify");
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        provision_unfenced(&*store, tenant(), Signal::Logs, 1).await;
+        let report = certify_rlog(&*store, NOW1, V_LOG, None).await;
         assert!(
             matches!(
                 report,
@@ -1243,107 +2386,511 @@ mod tests {
         );
     }
 
-    /// A clean census certifies, writing the certificate and seeding the
-    /// late-write watermark with `S`.
+    // ---- certified censuses ----
+
+    /// A clean census certifies over real data objects, writing the
+    /// certificate, the watermark `S`, the floor, and clearing the cursor.
     #[tokio::test]
     async fn a_clean_census_certifies() {
-        let store = MemoryStore::new();
-        seed_compat(&store, 6, ACTIVATED).await;
-        provision_logs_fenced(&store, 1).await;
-        seed_commit(&store, 0, 1, 6, 1_000).await;
-        let report = certify(&store, &ckeys(), NOW1, FAMILY_RLOG, 6, timings(), None)
-            .await
-            .expect("certify");
-        assert!(
-            matches!(report, CertifyReport::Certified { version: 6, .. }),
-            "{report:?}"
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*store, tenant(), Signal::Logs, 1).await;
+        seed_log(&store, tenant(), 0, 1, 1_000).await;
+        let report = certify_rlog(&*store, NOW1, V_LOG, None).await;
+        // logs 1 shard + alerts 1 + audit 2.
+        assert_eq!(
+            report,
+            CertifyReport::Certified {
+                version: V_LOG,
+                member_count: 1,
+                buckets_scanned: 4,
+                newest_created_unix_ns: 1_000_000,
+            }
         );
-        let entry = rlog_entry(&store).await;
-        assert_eq!(entry.certificate.expect("cert").version, 6);
+        let entry = rlog_entry(&*store).await;
+        assert_eq!(entry.certificate.expect("cert").version, V_LOG);
         assert_eq!(
             entry.late_writes_verified_through_unix_ns, NOW1,
             "watermark is S"
         );
-        // The format floor was raised to the certified version.
         assert_eq!(
-            ravel_catalog::current_floor_from_store(&store, &tenant(), Signal::Logs, FAMILY_RLOG)
+            ravel_catalog::current_floor_from_store(&*store, &tenant(), Signal::Logs, FAMILY_RLOG)
                 .await
                 .expect("floor read"),
-            Some(6),
-            "certify raised the rlog floor to the certified version"
+            Some(V_LOG),
         );
-        // The completed certification cleared its cursor.
-        assert!(
-            store
-                .get(&certify_cursor_key(FAMILY_RLOG), GetRange::Full)
+        assert!(!cursor_present(&*store).await);
+    }
+
+    /// RSEG and RSPAN censuses certify over real objects, three per shard so
+    /// every listing pages.
+    #[tokio::test]
+    async fn rseg_and_rspan_censuses_certify() {
+        for (family, signal, version) in [
+            (FAMILY_RSEG, Signal::Metrics, V_SEG),
+            (FAMILY_RSPAN, Signal::Spans, V_LOG),
+        ] {
+            let store = new_store();
+            seed_compat(&*store, family, version).await;
+            provision_fenced(&*store, tenant(), signal, 1).await;
+            for seq in 1..=3 {
+                let bytes = if signal == Signal::Metrics {
+                    rseg_object()
+                } else {
+                    rspan_object_with_key_idx(false)
+                };
+                seed_member(
+                    &store,
+                    tenant(),
+                    signal,
+                    0,
+                    seq,
+                    version,
+                    1_000,
+                    Some(bytes),
+                )
+                .await;
+            }
+            let report = certify(&*store, &ckeys(), NOW1, family, version, timings(), None)
                 .await
-                .is_err()
+                .expect("certify");
+            assert_eq!(
+                report,
+                CertifyReport::Certified {
+                    version,
+                    member_count: 3,
+                    buckets_scanned: 1,
+                    newest_created_unix_ns: 3_000_000,
+                },
+                "{family}"
+            );
+        }
+    }
+
+    /// A held RSPAN member (KEY_IDX outside the read set) holds certify.
+    #[tokio::test]
+    async fn a_held_rspan_member_holds_the_certificate() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RSPAN, V_LOG).await;
+        provision_fenced(&*store, tenant(), Signal::Spans, 1).await;
+        let (_, data_key) = seed_member(
+            &store,
+            tenant(),
+            Signal::Spans,
+            0,
+            1,
+            V_LOG,
+            1_000,
+            Some(rspan_object_with_key_idx(true)),
+        )
+        .await;
+        let report = certify(
+            &*store,
+            &ckeys(),
+            NOW1,
+            FAMILY_RSPAN,
+            V_LOG,
+            timings(),
+            None,
+        )
+        .await
+        .expect("certify");
+        let above = u16::from(*key_index::KEY_IDX_VERSIONS.iter().max().expect("set")) + 1;
+        assert_eq!(
+            report,
+            CertifyReport::HeldMember {
+                member_key: data_key,
+                version: above
+            }
         );
     }
 
-    /// DISTINGUISHING (rules out S recomputed on resume, and a watermark that
-    /// moves backward): a late lower-version record lands in a shard-hour the
-    /// first certify run already read, between two resumed runs. The resumed
-    /// run keeps the first run's `S`, so the certificate's watermark is `S`
-    /// (the earlier time), and the late-write pass examines the record by its
-    /// `LastModified` and finds it. Had the resumed run recomputed `S` to its
-    /// own later start, the watermark would be past the late write's
-    /// `LastModified` and the pass would miss it.
+    /// The certificate's totals and the floors cover every run of a resumed
+    /// census, not only the last.
     #[tokio::test]
-    async fn late_write_between_resumed_runs_is_found_by_the_late_write_pass() {
-        let store = MemoryStore::new();
-        seed_compat(&store, 6, ACTIVATED).await;
-        provision_logs_fenced(&store, 2).await;
+    async fn totals_cover_every_run() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*store, tenant(), Signal::Logs, 2).await;
+        seed_log(&store, tenant(), 0, 1, 1_000).await;
+        seed_log(&store, tenant(), 1, 2, 1_000).await;
+        let run1 = certify_rlog(&*store, NOW1, V_LOG, Some(1)).await;
+        assert_eq!(run1, CertifyReport::Incomplete { units_examined: 1 });
+        let run2 = certify_rlog(&*store, NOW1 + HOUR, V_LOG, None).await;
+        // logs 2 shards + alerts 1 + audit 2.
+        assert_eq!(
+            run2,
+            CertifyReport::Certified {
+                version: V_LOG,
+                member_count: 2,
+                buckets_scanned: 5,
+                newest_created_unix_ns: HOUR + 2_000_000,
+            }
+        );
+    }
 
-        // The census-time population: one stamp-6 record in each of the two
-        // logs shards. Shard 0 is census unit 0, shard 1 is unit 1.
-        let old_ms = (NOW1 / 1_000_000) as u64 - 10_000;
-        seed_commit(&store, 0, 1, 6, old_ms).await;
-        seed_commit(&store, 1, 2, 6, old_ms).await;
+    // ---- resume ----
 
-        // Run 1 covers only unit 0 (shard 0), records S = NOW1, and stops.
-        let run1 = certify(&store, &ckeys(), NOW1, FAMILY_RLOG, 6, timings(), Some(1))
-            .await
-            .expect("run 1");
+    /// DISTINGUISHING (rules out an index-based resume): a tenant that sorts
+    /// before every tenant the first run covered appears between runs with a
+    /// below-target member. An index cursor would count it as done; the
+    /// key-based cursor has no progress for it and censuses it.
+    #[tokio::test]
+    async fn a_tenant_appearing_in_the_done_range_is_censused() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        for t in [tenant(), TenantHash([9; 16])] {
+            provision_fenced(&*store, t, Signal::Logs, 1).await;
+            seed_log(&store, t, 0, 1, 1_000).await;
+        }
+        // Tenant 5's four units (logs, alerts, audit x2), then the budget.
+        let run1 = certify_rlog(&*store, NOW1, V_LOG, Some(4)).await;
+        assert_eq!(run1, CertifyReport::Incomplete { units_examined: 4 });
+
+        let early = TenantHash([1; 16]);
+        provision_fenced(&*store, early, Signal::Logs, 1).await;
+        let (_, data_key) = seed_member(&store, early, Signal::Logs, 0, 3, 4, 1_000, None).await;
+        assert_eq!(
+            certify_rlog(&*store, NOW1 + HOUR, V_LOG, None).await,
+            CertifyReport::Contradicted {
+                member_key: data_key,
+                found_version: 4
+            }
+        );
+    }
+
+    /// DISTINGUISHING (rules out a recheck limited to buckets the last run
+    /// fenced): a bucket provisioned unfenced between runs, under a shard the
+    /// first run already censused, with a below-target member there. The
+    /// resumed run never revisits the shard, so only the every-bucket
+    /// `compat_epoch` recheck stands between it and a certificate.
+    #[tokio::test]
+    async fn a_bucket_provisioned_unfenced_between_runs_refuses() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        seed_log(&store, tenant(), 0, 1, 1_000).await;
+        let run1 = certify_rlog(&*store, NOW1, V_LOG, Some(1)).await;
+        assert_eq!(run1, CertifyReport::Incomplete { units_examined: 1 });
+
+        provision_unfenced(&*store, tenant(), Signal::Logs, 1).await;
+        seed_member(&store, tenant(), Signal::Logs, 0, 2, 4, 1_000, None).await;
+        assert_eq!(
+            certify_rlog(&*store, NOW1 + HOUR, V_LOG, None).await,
+            CertifyReport::Refused(CertifyRefusal::BucketUnfenced {
+                tenant_hash: tenant().to_hex(),
+                signal: Signal::Logs,
+                compat_epoch: 0,
+                activated_epoch: 1,
+            })
+        );
+    }
+
+    /// A cursor taken for another target is stale: the run starts a fresh
+    /// census with its own `S`.
+    #[tokio::test]
+    async fn a_cursor_for_another_target_starts_a_fresh_census() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*store, tenant(), Signal::Logs, 1).await;
+        seed_log(&store, tenant(), 0, 1, 1_000).await;
+        let run1 = certify_rlog(&*store, NOW1, V_LOG, Some(1)).await;
         assert!(matches!(run1, CertifyReport::Incomplete { .. }), "{run1:?}");
 
-        // A late write lands in shard 0 (already read by run 1) below the
-        // target, with a LastModified after S.
-        let late_ms = (NOW1 / 1_000_000) as u64 + 3_600_000; // S + 1h
-        let late_key = seed_commit(&store, 0, 9, 5, late_ms).await;
-
-        // Run 2 resumes from unit 1 (shard 1), skips shard 0, and certifies.
-        // It keeps run 1's S as the watermark.
-        let now2 = NOW1 + 10 * HOUR;
-        let run2 = certify(&store, &ckeys(), now2, FAMILY_RLOG, 6, timings(), None)
-            .await
-            .expect("run 2");
-        assert!(matches!(run2, CertifyReport::Certified { .. }), "{run2:?}");
-        let entry = rlog_entry(&store).await;
+        let now2 = NOW1 + HOUR;
+        let run2 = certify_rlog(&*store, now2, V_LOG - 1, None).await;
+        assert!(
+            matches!(
+                run2,
+                CertifyReport::Certified {
+                    buckets_scanned: 4,
+                    ..
+                }
+            ),
+            "{run2:?}"
+        );
         assert_eq!(
-            entry.late_writes_verified_through_unix_ns, NOW1,
-            "the resumed run kept the first run's S"
+            rlog_entry(&*store)
+                .await
+                .late_writes_verified_through_unix_ns,
+            now2,
+            "the target-4 census took its own S"
+        );
+    }
+
+    /// A cursor taken under another activation epoch is stale.
+    #[tokio::test]
+    async fn a_cursor_from_another_epoch_starts_a_fresh_census() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*store, tenant(), Signal::Logs, 1).await;
+        seed_log(&store, tenant(), 0, 1, 1_000).await;
+        let run1 = certify_rlog(&*store, NOW1, V_LOG, Some(1)).await;
+        assert!(matches!(run1, CertifyReport::Incomplete { .. }), "{run1:?}");
+
+        update_compat(&*store, &ckeys(), |record| {
+            record.compat_epoch = 2;
+            let entry = record
+                .families
+                .iter_mut()
+                .find(|f| f.family == FAMILY_RLOG)
+                .expect("rlog");
+            entry.activated_epoch = 2;
+            Ok(())
+        })
+        .await
+        .expect("bump epoch");
+        // Fenced to epoch 2 at the old time, so the recheck admits it.
+        raise_compat_fence(&*store, &tenant(), Signal::Logs, 2, ACTIVATED)
+            .await
+            .expect("fence 2");
+
+        let now2 = NOW1 + HOUR;
+        let run2 = certify_rlog(&*store, now2, V_LOG, None).await;
+        assert!(matches!(run2, CertifyReport::Certified { .. }), "{run2:?}");
+        assert_eq!(
+            rlog_entry(&*store)
+                .await
+                .late_writes_verified_through_unix_ns,
+            now2,
+            "the epoch-2 census took its own S"
+        );
+    }
+
+    /// A completed certification whose cursor delete failed leaves a cursor
+    /// naming the pre-certificate state, so the next certification does not
+    /// resume it: a below-target member planted in its done shard is found.
+    #[tokio::test]
+    async fn a_cursor_left_by_a_failed_delete_is_not_resumed() {
+        let inner = new_store();
+        seed_compat(&*inner, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*inner, tenant(), Signal::Logs, 1).await;
+        seed_log(&inner, tenant(), 0, 1, 1_000).await;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Delete,
+                ScriptedFault::Permanent("delete down".to_string()),
+            )
+            .with_key_contains("sys/maintain/certify/"),
+        );
+        let faulted = FaultStore::new(inner.clone(), plan);
+        let report = certify(
+            &faulted,
+            &ckeys(),
+            NOW1,
+            FAMILY_RLOG,
+            V_LOG,
+            timings(),
+            None,
+        )
+        .await
+        .expect("certify");
+        assert!(
+            matches!(report, CertifyReport::Certified { .. }),
+            "{report:?}"
+        );
+        assert_eq!(faulted.fault_count(Op::Delete, FaultKind::Permanent), 1);
+        assert!(cursor_present(&*inner).await, "the delete failed");
+
+        let (_, data_key) = seed_member(&inner, tenant(), Signal::Logs, 0, 2, 4, 1_000, None).await;
+        assert_eq!(
+            certify_rlog(&*inner, NOW1 + HOUR, V_LOG, None).await,
+            CertifyReport::Contradicted {
+                member_key: data_key,
+                found_version: 4
+            }
+        );
+    }
+
+    // ---- the certificate CAS and the late-write pass ----
+
+    /// DISTINGUISHING (rules out a CAS that ignores what changed under the
+    /// census): a re-certification is in flight when a late write lands in a
+    /// shard it already censused and a late-write pass contradicts the
+    /// current certificate. The re-certification's CAS must refuse; clearing
+    /// `contradicted` would lose the late write.
+    #[tokio::test]
+    async fn a_late_write_pass_during_the_census_refuses_the_cas() {
+        let inner = new_store();
+        seed_compat(&*inner, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*inner, tenant(), Signal::Logs, 1).await;
+        seed_log(&inner, tenant(), 0, 1, 1_000).await;
+        seed_member(
+            &inner,
+            tenant(),
+            Signal::Audit,
+            0,
+            2,
+            V_LOG,
+            1_000,
+            Some(rlog_object()),
+        )
+        .await;
+        let first = certify_rlog(&*inner, NOW1, V_LOG, None).await;
+        assert!(
+            matches!(first, CertifyReport::Certified { .. }),
+            "{first:?}"
         );
 
-        // Had S been recomputed to run 2's start, the watermark would be past
-        // the late write's LastModified, and the pass below would skip it.
-        let late_modified_ns = (late_ms as i64) * 1_000_000;
+        let now2 = NOW1 + 10 * HOUR;
+        let hook_store = inner.clone();
+        let hook: Hook = Box::new(move || {
+            Box::pin(async move {
+                seed_member(
+                    &hook_store,
+                    tenant(),
+                    Signal::Logs,
+                    0,
+                    9,
+                    4,
+                    ms(NOW1 + HOUR),
+                    None,
+                )
+                .await;
+                let pass = late_write_pass(&*hook_store, &ckeys(), now2, FAMILY_RLOG, skew())
+                    .await
+                    .expect("late-write pass");
+                assert_eq!(pass.late_writes.len(), 1, "{pass:?}");
+            })
+        });
+        let audit_prefix =
+            ravel_commit::keys::commit_shard_prefix(&tenant(), Signal::Audit, 0).expect("prefix");
+        let store = HookStore::new(inner.clone(), &audit_prefix, Some(hook));
+        let report = certify_rlog(&store, now2 + HOUR, V_LOG, None).await;
+        assert!(store.hook_fired());
+        assert_eq!(
+            report,
+            CertifyReport::Refused(CertifyRefusal::CompatChangedDuringCensus)
+        );
+        let entry = rlog_entry(&*inner).await;
+        assert!(entry.contradicted, "the late write's verdict stands");
+        assert_eq!(entry.certificate.expect("cert").certified_unix_ns, NOW1);
+    }
+
+    /// DISTINGUISHING (rules out a monotone watermark across certificates): a
+    /// late-write pass between two runs of a re-certification advances the
+    /// old certificate's watermark past the new census's `S`. The new
+    /// certificate sets it back to `S`, so its first pass re-examines what
+    /// landed after its census began.
+    #[tokio::test]
+    async fn a_new_certificate_sets_the_watermark_to_its_s() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*store, tenant(), Signal::Logs, 1).await;
+        seed_log(&store, tenant(), 0, 1, 1_000).await;
+        certify_rlog(&*store, NOW1, V_LOG, None).await;
+
+        let now2 = NOW1 + 10 * HOUR;
+        let run1 = certify_rlog(&*store, now2, V_LOG, Some(1)).await;
+        assert!(matches!(run1, CertifyReport::Incomplete { .. }), "{run1:?}");
+        let now3 = now2 + 10 * HOUR;
+        let pass = late_write_pass(&*store, &ckeys(), now3, FAMILY_RLOG, skew())
+            .await
+            .expect("pass");
+        assert_eq!(pass.watermark_unix_ns, now3);
+
+        let run2 = certify_rlog(&*store, now3 + HOUR, V_LOG, None).await;
+        assert!(matches!(run2, CertifyReport::Certified { .. }), "{run2:?}");
+        assert_eq!(
+            rlog_entry(&*store)
+                .await
+                .late_writes_verified_through_unix_ns,
+            now2
+        );
+    }
+
+    /// A late-write pass whose certificate is replaced while it runs writes
+    /// nothing: its finding was judged against a certificate that is gone.
+    #[tokio::test]
+    async fn a_late_write_pass_aborts_when_the_certificate_is_replaced() {
+        let inner = new_store();
+        seed_compat(&*inner, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*inner, tenant(), Signal::Logs, 1).await;
+        seed_log(&inner, tenant(), 0, 1, 1_000).await;
+        certify_rlog(&*inner, NOW1, V_LOG, None).await;
+        let (late_key, _) = seed_member(
+            &inner,
+            tenant(),
+            Signal::Logs,
+            0,
+            9,
+            4,
+            ms(NOW1 + HOUR),
+            None,
+        )
+        .await;
+
+        let hook_store = inner.clone();
+        let hook: Hook = Box::new(move || {
+            Box::pin(async move {
+                update_compat(&*hook_store, &ckeys(), |record| {
+                    let entry = record
+                        .families
+                        .iter_mut()
+                        .find(|f| f.family == FAMILY_RLOG)
+                        .expect("rlog");
+                    if let Some(cert) = entry.certificate.as_mut() {
+                        cert.certified_unix_ns += 1;
+                    }
+                    Ok(())
+                })
+                .await
+                .expect("replace certificate");
+            })
+        });
+        let store = HookStore::new(inner.clone(), &late_key, Some(hook));
+        let report = late_write_pass(&store, &ckeys(), NOW1 + 10 * HOUR, FAMILY_RLOG, skew())
+            .await
+            .expect("pass");
+        assert!(store.hook_fired());
+        assert!(report.certificate_replaced, "{report:?}");
+        assert_eq!(report.late_writes.len(), 1);
+        assert_eq!(report.watermark_unix_ns, NOW1);
+        let entry = rlog_entry(&*inner).await;
         assert!(
-            late_modified_ns < now2 - timings().clock_skew_allowance_ns,
+            !entry.contradicted,
+            "no verdict against the new certificate"
+        );
+        assert_eq!(entry.late_writes_verified_through_unix_ns, NOW1);
+    }
+
+    /// DISTINGUISHING (rules out S recomputed on resume): a late lower-version
+    /// record lands in a shard the first run already read, between two
+    /// resumed runs. The resumed run keeps the first run's `S`, so the
+    /// late-write pass examines the record by its `LastModified` and finds it.
+    #[tokio::test]
+    async fn late_write_between_resumed_runs_is_found_by_the_late_write_pass() {
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*store, tenant(), Signal::Logs, 2).await;
+        let old_ms = ms(NOW1) - 10_000;
+        seed_log(&store, tenant(), 0, 1, old_ms).await;
+        seed_log(&store, tenant(), 1, 2, old_ms).await;
+
+        let run1 = certify_rlog(&*store, NOW1, V_LOG, Some(1)).await;
+        assert!(matches!(run1, CertifyReport::Incomplete { .. }), "{run1:?}");
+
+        let late_ms = ms(NOW1) + 3_600_000; // S + 1h
+        let (late_key, _) =
+            seed_member(&store, tenant(), Signal::Logs, 0, 9, 4, late_ms, None).await;
+
+        let now2 = NOW1 + 10 * HOUR;
+        let run2 = certify_rlog(&*store, now2, V_LOG, None).await;
+        assert!(matches!(run2, CertifyReport::Certified { .. }), "{run2:?}");
+        assert_eq!(
+            rlog_entry(&*store)
+                .await
+                .late_writes_verified_through_unix_ns,
+            NOW1,
+            "the resumed run kept the first run's S"
+        );
+        assert!(
+            (late_ms as i64) * 1_000_000 < now2 - skew(),
             "the late write predates a recomputed-S watermark, so only keeping S finds it"
         );
 
-        // The late-write pass, at the kept watermark S, examines the late write
-        // and contradicts the certificate.
-        let report = late_write_pass(
-            &store,
-            &ckeys(),
-            now2 + HOUR,
-            FAMILY_RLOG,
-            timings().clock_skew_allowance_ns,
-        )
-        .await
-        .expect("late-write pass");
+        let report = late_write_pass(&*store, &ckeys(), now2 + HOUR, FAMILY_RLOG, skew())
+            .await
+            .expect("late-write pass");
         assert!(
             report
                 .late_writes
@@ -1351,83 +2898,43 @@ mod tests {
                 .any(|lw| lw.record_key == late_key),
             "the late write was found: {report:?}"
         );
-        assert!(
-            rlog_entry(&store).await.contradicted,
-            "certificate contradicted"
-        );
+        assert!(rlog_entry(&*store).await.contradicted);
     }
 
-    /// DISTINGUISHING (rules out a watermark that moves backward): a later pass
-    /// that starts earlier than a prior pass's start never lowers the
-    /// watermark.
+    /// A later pass that starts earlier than a prior pass's start never lowers
+    /// the watermark.
     #[tokio::test]
     async fn the_watermark_never_moves_backward() {
-        let store = MemoryStore::new();
-        seed_compat(&store, 6, ACTIVATED).await;
-        provision_logs_fenced(&store, 1).await;
-        seed_commit(&store, 0, 1, 6, 1_000).await;
-        certify(&store, &ckeys(), NOW1, FAMILY_RLOG, 6, timings(), None)
-            .await
-            .expect("certify");
+        let store = new_store();
+        seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*store, tenant(), Signal::Logs, 1).await;
+        seed_log(&store, tenant(), 0, 1, 1_000).await;
+        certify_rlog(&*store, NOW1, V_LOG, None).await;
 
-        // A pass at a later now advances the watermark.
         let later = NOW1 + 100 * HOUR;
-        late_write_pass(
-            &store,
-            &ckeys(),
-            later,
-            FAMILY_RLOG,
-            timings().clock_skew_allowance_ns,
-        )
-        .await
-        .expect("later pass");
+        late_write_pass(&*store, &ckeys(), later, FAMILY_RLOG, skew())
+            .await
+            .expect("later pass");
         assert_eq!(
-            rlog_entry(&store)
+            rlog_entry(&*store)
                 .await
                 .late_writes_verified_through_unix_ns,
             later
         );
 
-        // A pass at an earlier now (out of order) must not lower it.
         let earlier = NOW1 + 10 * HOUR;
-        let report = late_write_pass(
-            &store,
-            &ckeys(),
-            earlier,
-            FAMILY_RLOG,
-            timings().clock_skew_allowance_ns,
-        )
-        .await
-        .expect("earlier pass");
+        let report = late_write_pass(&*store, &ckeys(), earlier, FAMILY_RLOG, skew())
+            .await
+            .expect("earlier pass");
         assert_eq!(
             report.watermark_unix_ns, later,
             "watermark did not move back"
         );
         assert_eq!(
-            rlog_entry(&store)
+            rlog_entry(&*store)
                 .await
                 .late_writes_verified_through_unix_ns,
             later
-        );
-    }
-
-    /// A truncated listing (a faulted LIST page) blocks certification rather
-    /// than certifying over a shortened population.
-    #[tokio::test]
-    async fn a_faulted_listing_blocks_certification() {
-        let inner = MemoryStore::new();
-        seed_compat(&inner, 6, ACTIVATED).await;
-        provision_logs_fenced(&inner, 1).await;
-        seed_commit(&inner, 0, 1, 6, 1_000).await;
-        let plan = FaultPlan::empty().with_rule(
-            Rule::new(Op::List, ScriptedFault::Permanent("list down".to_string()))
-                .with_key_contains("/c/"),
-        );
-        let store = FaultStore::new(inner, plan);
-        let result = certify(&store, &ckeys(), NOW1, FAMILY_RLOG, 6, timings(), None).await;
-        assert!(
-            result.is_err(),
-            "a faulted listing must block, got {result:?}"
         );
     }
 }
