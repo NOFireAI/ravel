@@ -51,9 +51,9 @@ use crate::clock::Clock;
 use crate::compat::{CompatPublishRefusal, PublishGrant, PutAbort, warn_publish_refused};
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LagCheck, MAX_FLUSH_ALL_PASSES,
-    MAX_FLUSH_CLOCK_HOLD_NS, SEGMENT_FORMAT_VERSION, StoreClockLag, checked_ingest_hour_bucket,
-    duration_nanos_saturating, grant_deadline_ns, idle_age_threshold, memory_backstop_crossed,
-    object_backstop_crossed, size_trigger_fires, store_clock_lag,
+    MAX_FLUSH_CLOCK_HOLD_NS, StoreClockLag, checked_ingest_hour_bucket, duration_nanos_saturating,
+    grant_deadline_ns, idle_age_threshold, memory_backstop_crossed, object_backstop_crossed,
+    size_trigger_fires, store_clock_lag,
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::error::WriteError;
@@ -715,9 +715,9 @@ impl FlushCtx {
         if let Err(refused) = grant
             .ensure_fenced(
                 self.store.as_ref(),
-                tenant_hash,
                 self.signal,
                 self.clock.as_ref(),
+                self.rng.as_ref(),
                 deadline_ns,
             )
             .await
@@ -2714,11 +2714,11 @@ impl ShardActor {
         // tenant's recorded RSEG floor is refused here, on the cached record,
         // before a `seq` is pinned, the flush is counted, or the task that
         // takes a permit and PUTs is spawned.
-        let buf = match self.scope.floor_check(
-            tenant_hash,
-            FormatFamily::Rseg,
-            u32::from(SEGMENT_FORMAT_VERSION),
-        ) {
+        let open_version = self.scope.writing_version(FormatFamily::Rseg);
+        let buf = match self
+            .scope
+            .floor_check(tenant_hash, FormatFamily::Rseg, open_version)
+        {
             FloorCheck::Write => buf,
             FloorCheck::WriteBelow(below) => {
                 warn_flush_written_below(self.ctx.signal, self.shard, tenant_hash, &below);
@@ -2907,7 +2907,7 @@ impl ShardActor {
                     return;
                 }
             };
-            if grant.version() != SEGMENT_FORMAT_VERSION {
+            if u32::from(grant.version()) != open_version {
                 match scope.floor_check(
                     pinned.tenant_hash,
                     FormatFamily::Rseg,
@@ -6131,17 +6131,19 @@ mod tests {
         assert!(err.is_retryable(), "{err:?}");
     }
 
-    /// ADR-4233 decisions 2 and 4. The test seam lowers the RSEG baseline to
-    /// 6, so the build's v7 is a version above the baseline and needs the
-    /// bucket fence, without a second encodable version.
+    /// ADR-4233 decisions 2 to 4. The test seam lowers the RSEG baseline to
+    /// 6 and lets the policy name v8, so the build's v7 is a version above
+    /// the baseline and needs the bucket fence, and v8 is a version the
+    /// policy allows that this writer cannot encode.
     ///
-    /// `other`'s flush is granted the only permit and is held at its data
-    /// PUT, by which point its bucket already carries the view's epoch: a
-    /// fence raised after the first PUT leaves it at 0 there. `acme`'s flush
-    /// opens behind it while the view names v7, and the view then moves RSEG
-    /// to v8, which this build cannot write. Granted after that, the flush is
-    /// refused with no object stored; a version chosen when the flush opened
-    /// would have published v7.
+    /// `other`'s flush is granted v7 and the only permit, and is held at its
+    /// data PUT, by which point its bucket already carries the view's epoch:
+    /// a fence raised after the first PUT leaves it at 0 there. `acme`'s
+    /// flush opens behind it while the view names v7, and the view then moves
+    /// RSEG to v8. `other`'s commit PUT is refused as moved off its granted
+    /// v7. `acme`'s flush, granted after the move, gets v8 and is refused as
+    /// unencodable with no object stored; a version chosen when the flush
+    /// opened would have been refused as moved instead.
     #[tokio::test]
     async fn version_chosen_at_permit_grant_and_first_activated_publish_fences_the_bucket() {
         let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
@@ -6153,7 +6155,7 @@ mod tests {
         provision(store.as_ref(), &acme).await;
         let view = compat_view(&store, &compat_clock, Some(compat_record(1, 7, 0))).await;
         let policy = crate::compat::IngestCompatPolicy::new(view.clone(), compat_clock.clone())
-            .with_family_versions(FormatFamily::Rseg, vec![7], 6);
+            .with_family_versions(FormatFamily::Rseg, vec![7, 8], 6);
         let router = compat_router(
             one_permit_one_queue(Duration::from_secs(3600)),
             &store,
@@ -6192,22 +6194,29 @@ mod tests {
         for id in gate.held() {
             assert!(gate.release(id));
         }
-        let receipt = first
+        let err = first
             .await
             .expect("first write task")
-            .expect("granted under v7");
-        let commit_key =
-            keys::commit_key_for_token(&other.hash(), Signal::Metrics, &receipt.tokens[0])
-                .expect("commit key");
-        let committed = record::decode(
-            &store
-                .get(&commit_key, GetRange::Full)
-                .await
-                .expect("commit record")
-                .data,
-        )
-        .expect("decode commit record");
-        assert_eq!(committed.segment_format_version, 7);
+            .expect_err("the view moved off v7 before the commit PUT");
+        assert!(
+            matches!(
+                err,
+                WriteError::CompatRefused(
+                    crate::compat::CompatPublishRefusal::ActiveVersionMoved {
+                        family: FormatFamily::Rseg,
+                        granted: 7,
+                        active: 8,
+                    }
+                )
+            ),
+            "{err:?}"
+        );
+        let other_keys = tenant_keys(store.as_ref(), &other).await;
+        assert_eq!(
+            other_keys.iter().filter(|k| k.contains("/c/")).count(),
+            0,
+            "{other_keys:?}"
+        );
 
         let err = second
             .await
@@ -6222,7 +6231,8 @@ mod tests {
         assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 0);
         assert_eq!(bucket_compat_epoch(store.as_ref(), &acme).await, 0);
         assert_eq!(refused(&router).active_version_not_writable, 1);
-        assert_eq!(refused(&router).total(), 1);
+        assert_eq!(refused(&router).active_version_moved, 1);
+        assert_eq!(refused(&router).total(), 2);
         router.flush_all().await;
     }
 
@@ -6521,6 +6531,296 @@ mod tests {
             .expect("an unfenced bucket writes at the baseline");
         assert_eq!(refused(&router).total(), 1);
         router.flush_all().await;
+    }
+
+    /// The `segment_format_version` of every commit record under `tenant`'s
+    /// metrics prefix.
+    async fn committed_rseg_versions(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+    ) -> Vec<u32> {
+        let mut versions = Vec::new();
+        for key in tenant_keys(store, tenant).await {
+            if key.contains("/c/") {
+                let bytes = store
+                    .get(&key, GetRange::Full)
+                    .await
+                    .expect("commit record")
+                    .data;
+                versions.push(
+                    record::decode(&bytes)
+                        .expect("decode commit record")
+                        .segment_format_version,
+                );
+            }
+        }
+        versions
+    }
+
+    /// A store whose `sys/compat` GET fails with a permanent error (as an
+    /// `AccessDenied` from a credential without the grant does), when
+    /// `denied`, and `acme` provisioned in it; a view that tried to read it,
+    /// aged past the horizon.
+    async fn unread_view(
+        denied: bool,
+    ) -> (
+        Arc<FaultStore<MemoryStore>>,
+        Arc<CompatTestClock>,
+        ravel_catalog::CompatView,
+    ) {
+        use ravel_object_store::fault::{FaultKind, Rule, ScriptedFault};
+        let plan = if denied {
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Get, ScriptedFault::Permanent("access denied".into()))
+                    .with_key_contains(ravel_catalog::compat::COMPAT_KEY),
+            )
+        } else {
+            FaultPlan::empty()
+        };
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let compat_clock = CompatTestClock::at(BASE_NS);
+        provision(store.as_ref(), &TenantId::new("acme")).await;
+        let view =
+            ravel_catalog::CompatView::new(Arc::clone(&store), compat_keys(), compat_clock.clone());
+        assert_eq!(view.refresh().await.is_err(), denied);
+        assert_eq!(
+            fault_store.fault_count(Op::Get, FaultKind::Permanent) > 0,
+            denied
+        );
+        assert!(!view.record_seen());
+        compat_clock.advance_ns(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS);
+        (fault_store, compat_clock, view)
+    }
+
+    /// One strict write of `acme` through `router`, flushed by one tick.
+    async fn strict_write(
+        router: &Arc<IngestRouter>,
+        clock: &TestClock,
+        host: &'static str,
+    ) -> Result<crate::router::WriteReceipt, WriteError> {
+        let before = router.metrics().snapshot().buffered_points_total;
+        let write = spawn_write(router, &TenantId::new("acme"), host, WriteMode::Strict);
+        until(|| write.is_finished() || router.metrics().snapshot().buffered_points_total > before)
+            .await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        write.await.expect("write task")
+    }
+
+    /// ADR-4233 decision 3: a `sys/compat` that was never read (its GET
+    /// fails) or was read absent, on a bucket at `compat_epoch` 0, keeps
+    /// publishing at the baseline past the horizon, because each attempt asks
+    /// the view with the bucket's record. A bare freshness check before each
+    /// PUT refuses the first one.
+    #[tokio::test]
+    async fn an_unread_or_absent_sys_compat_on_an_unfenced_bucket_publishes_at_the_baseline() {
+        for denied in [true, false] {
+            let (fault_store, compat_clock, view) = unread_view(denied).await;
+            let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+            let clock = TestClock::new(BASE_NS);
+            let acme = TenantId::new("acme");
+            let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone());
+            let router = compat_router(
+                one_permit_one_queue(Duration::from_secs(3600)),
+                &store,
+                &clock,
+                policy,
+            );
+
+            strict_write(&router, &clock, "h0")
+                .await
+                .expect("written at the baseline");
+            assert_eq!(
+                committed_rseg_versions(store.as_ref(), &acme).await,
+                vec![u32::from(crate::SEGMENT_FORMAT_VERSION)],
+                "denied {denied}"
+            );
+            assert_eq!(bucket_compat_epoch(store.as_ref(), &acme).await, 0);
+            assert_eq!(refused(&router).total(), 0, "denied {denied}");
+            router.flush_all().await;
+        }
+    }
+
+    /// ADR-4233 decision 3: past the horizon, a view whose `sys/compat` GET
+    /// fails refuses a bucket that carries a fence, and a view that has read
+    /// a record refuses an unfenced bucket. Both are counted under
+    /// `view_stale` and store nothing.
+    #[tokio::test]
+    async fn past_the_horizon_a_fenced_bucket_or_a_seen_record_is_refused_view_stale() {
+        let acme = TenantId::new("acme");
+        let (fault_store, compat_clock, view) = unread_view(true).await;
+        let denied: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        ravel_catalog::raise_compat_fence(
+            denied.as_ref(),
+            &acme.hash(),
+            Signal::Metrics,
+            1,
+            BASE_NS,
+        )
+        .await
+        .expect("fence acme");
+
+        let seen: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        provision(seen.as_ref(), &acme).await;
+        let seen_clock = CompatTestClock::at(BASE_NS);
+        let seen_view = compat_view(&seen, &seen_clock, Some(compat_record(1, 7, 0))).await;
+        seen_clock.advance_ns(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS);
+
+        for (store, view, compat_clock) in
+            [(denied, view, compat_clock), (seen, seen_view, seen_clock)]
+        {
+            let clock = TestClock::new(BASE_NS);
+            let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock);
+            let router = compat_router(
+                one_permit_one_queue(Duration::from_secs(3600)),
+                &store,
+                &clock,
+                policy,
+            );
+            let err = strict_write(&router, &clock, "h0")
+                .await
+                .expect_err("the view is past the horizon");
+            assert_policy_refusal(&err, |r| {
+                matches!(r, ravel_catalog::CompatRefusal::ViewStale { .. })
+            });
+            assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 0);
+            assert_eq!(refused(&router).view_stale, 1);
+            assert_eq!(refused(&router).total(), 1);
+            router.flush_all().await;
+        }
+    }
+
+    /// ADR-4233 decision 3: the view moves RSEG from the granted v7 to v8
+    /// while the data PUT is in flight. The commit PUT's check gets v8 back
+    /// and abandons the flush under `active_version_moved`; a check that
+    /// asks only whether the view refuses publishes the v7 commit record.
+    #[tokio::test]
+    async fn an_active_version_moved_after_grant_abandons_the_flush_before_its_commit_put() {
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let clock = TestClock::new(BASE_NS);
+        let compat_clock = CompatTestClock::at(BASE_NS);
+        let acme = TenantId::new("acme");
+        provision(store.as_ref(), &acme).await;
+        let view = compat_view(&store, &compat_clock, Some(compat_record(1, 7, 0))).await;
+        let policy = crate::compat::IngestCompatPolicy::new(view.clone(), compat_clock.clone())
+            .with_family_versions(FormatFamily::Rseg, vec![7, 8], 7);
+        let router = compat_router(
+            one_permit_one_queue(Duration::from_secs(3600)),
+            &store,
+            &clock,
+            policy,
+        );
+        let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+
+        let write = spawn_write(&router, &acme, "h0", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        gate.wait_until_held(1).await;
+        ravel_catalog::compat::activate_family(
+            store.as_ref(),
+            &compat_keys(),
+            ravel_catalog::compat::FAMILY_RSEG,
+            8,
+            "test",
+            BASE_NS,
+        )
+        .await
+        .expect("activate v8");
+        view.refresh().await.expect("read sys/compat");
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+
+        let err = write
+            .await
+            .expect("write task")
+            .expect_err("the view moved off the granted version");
+        assert!(
+            matches!(
+                err,
+                WriteError::CompatRefused(
+                    crate::compat::CompatPublishRefusal::ActiveVersionMoved {
+                        family: FormatFamily::Rseg,
+                        granted: 7,
+                        active: 8,
+                    }
+                )
+            ),
+            "{err:?}"
+        );
+        assert!(err.is_retryable());
+        let keys = tenant_keys(store.as_ref(), &acme).await;
+        assert_eq!(
+            keys.iter().filter(|k| k.contains("/c/")).count(),
+            0,
+            "{keys:?}"
+        );
+        assert_eq!(
+            keys.iter().filter(|k| k.contains("/l0/")).count(),
+            1,
+            "{keys:?}"
+        );
+        assert_eq!(refused(&router).active_version_moved, 1);
+        assert_eq!(refused(&router).total(), 1);
+        router.flush_all().await;
+    }
+
+    /// The floor checks at admission and at flush open compare the tenant's
+    /// RSEG floor with the version the policy names, not the build's
+    /// `CURRENT`. The view names v8 over a floor of 8, so each write passes
+    /// the floor and reaches the grant, which refuses v8 as a version this
+    /// writer cannot encode. Compared with `CURRENT` (v7) at either check,
+    /// the write is refused there as below the floor.
+    #[tokio::test]
+    async fn the_floor_is_checked_against_the_version_the_policy_names() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let clock = TestClock::new(BASE_NS);
+        let compat_clock = CompatTestClock::at(BASE_NS);
+        let acme = TenantId::new("acme");
+        provision(store.as_ref(), &acme).await;
+        ravel_catalog::raise_format_floor(
+            store.as_ref(),
+            &acme.hash(),
+            Signal::Metrics,
+            FormatFamily::Rseg.as_str(),
+            8,
+            ravel_catalog::FloorBasis {
+                observed_entries: 0,
+                observed_newest_created_unix_ns: 0,
+                observed_shards: 1,
+            },
+            "test",
+            BASE_NS,
+        )
+        .await
+        .expect("raise the RSEG floor to 8");
+        let view = compat_view(&store, &compat_clock, Some(compat_record(1, 8, 0))).await;
+        let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone())
+            .with_family_versions(FormatFamily::Rseg, vec![7, 8], 7);
+        assert_eq!(FormatFamily::Rseg.writable_version_under(Some(&policy)), 8);
+        let router = compat_router(
+            one_permit_one_queue(Duration::from_secs(3600)),
+            &store,
+            &clock,
+            policy,
+        );
+
+        for host in ["h0", "h1"] {
+            let err = strict_write(&router, &clock, host)
+                .await
+                .expect_err("v8 is not encodable");
+            assert_policy_refusal(&err, |r| {
+                matches!(
+                    r,
+                    ravel_catalog::CompatRefusal::ActiveVersionNotWritable { active: 8, .. }
+                )
+            });
+        }
+        assert_eq!(refused(&router).active_version_not_writable, 2);
+        assert_eq!(refused(&router).total(), 2);
+        router.flush_all().await;
+        assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 0);
     }
 
     /// ADR-4233 decision 7: a router refuses to start under a policy whose

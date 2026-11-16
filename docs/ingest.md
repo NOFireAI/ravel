@@ -1085,32 +1085,51 @@ RSPAN for spans) and refuses to publish what this build may not. All three
 pipelines apply it the same way (crates/ravel-ingest/src/compat.rs):
 
 - Admission refuses a write the cached view already rejects (active version
-  not in this build's writable set, or `CompatRecordMissing`) before
-  anything is buffered or charged to a budget. A stale view is not refused
-  at admission.
+  not in this build's writable set, or `CompatRecordMissing`) before any
+  shard buffers it. Its byte-budget charge, taken earlier in admission, is
+  refunded when the refused write returns. A stale view is not refused at
+  admission.
 - The flush picks its version at permit grant, not at flush open, from the
   view as it stands then. A stale view, an active version this build cannot
   write, or a missing record refuses the flush with no PUT: its rows are
   dropped, its byte charges released, and its strict waiters get a
-  retryable `CompatRefused` error. A version other than the writer's
-  `CURRENT` is checked against the tenant's format floor again.
+  retryable `CompatRefused` error. A flush whose router has been dropped
+  has no cached provisioning record to ask with and is refused the same way
+  (`no_bucket_view`).
+- The format-floor checks at admission and at flush open compare the
+  tenant's floor with the version the policy names for the family
+  (`FormatFamily::writable_version_under`), not the writer's `CURRENT`; a
+  flush granted a different version is checked against the floor again at
+  grant.
 - Before the first PUT of an object above the family's baseline, the
   tenant's provisioning record is fenced to the view's `compat_epoch`
   (`raise_compat_fence`), unless the router's cached provisioning view
-  already carries that epoch. A fence that cannot be raised refuses the
+  already carries that epoch. A lost compare-and-swap is retried after a
+  jittered wait of up to 50 ms, at most three attempts in all, inside the
+  flush's `max_flush_lifetime`. A fence that cannot be raised refuses the
   flush (`fence_failed`).
 - Every data-object and commit-record PUT attempt, retries included, and
-  every fence attempt is refused once the view is `COMPAT_VIEW_HORIZON_NS`
-  old.
+  every fence attempt asks the view again, through the same
+  `CompatView::write_policy` call as the grant, with the bucket's cached
+  provisioning record. The attempt is refused when that call refuses, or
+  when it answers a version other than the granted one
+  (`active_version_moved`). For staleness the call refuses once
+  `COMPAT_VIEW_HORIZON_NS` has passed since the view's last successful read
+  only if the view has seen a record or the bucket carries a
+  `compat_epoch`: a view that has never seen a record, on a bucket at epoch
+  0, keeps publishing at the baseline, including while its `sys/compat`
+  read fails. A data object already stored when its commit-record attempt
+  is refused is never committed.
 - Construction refuses a `max_flush_lifetime` above the record's
   `max_publish_lifetime_ns` (`PublishLifetimeAboveCompat`).
 
 Every refusal counts once under its reason (`view_stale`,
-`active_version_not_writable`, `compat_record_missing`, `fence_failed`) in
-the signal's metrics snapshot, `compat_publish_refused`. With no policy
-installed, the default and every shipping path until ravel-server installs
-one, each pipeline writes its writer's `CURRENT` version with none of these
-checks, byte for byte as before.
+`active_version_not_writable`, `compat_record_missing`, `fence_failed`,
+`active_version_moved`, `no_bucket_view`) in the signal's metrics snapshot,
+`compat_publish_refused`, which ravel-server does not yet render on
+`/metrics`. With no policy installed, the default and every shipping
+path until ravel-server installs one, each pipeline writes its writer's
+`CURRENT` version with none of these checks, byte for byte as before.
 
 ## Log pipeline
 

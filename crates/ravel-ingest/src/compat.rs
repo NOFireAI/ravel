@@ -11,27 +11,37 @@
 //!   stale view is not refused here: the flush decides at permit grant.
 //! - Permit grant picks the version a flush encodes at
 //!   ([`CompatView::write_policy`]) and refuses the flush closed when the view
-//!   is stale or the version is not writable: no PUT, its rows dropped, its
-//!   byte charges released, its strict waiters acked with a retryable
-//!   [`CompatPublishRefusal`].
-//! - Every data-object and commit-record PUT attempt, retries included, is
-//!   refused when the view is [`COMPAT_VIEW_HORIZON_NS`] old or older. Before
-//!   the first PUT of an object above the family's baseline, the bucket's
-//!   provisioning record is fenced at the view's epoch
+//!   is stale, the version is not writable, or the router is gone and no
+//!   cached provisioning record is left to ask with: no PUT, its rows
+//!   dropped, its byte charges released, its strict waiters acked with a
+//!   retryable [`CompatPublishRefusal`].
+//! - Every data-object, commit-record and fence attempt, retries included,
+//!   asks [`CompatView::write_policy`] again with the bucket's cached
+//!   provisioning record, and is refused when it refuses (a stale view, under
+//!   the rule the view applies) or answers a version other than the granted
+//!   one. Before the first PUT of an object above the family's baseline, the
+//!   bucket's provisioning record is fenced at the view's epoch
 //!   ([`ravel_catalog::raise_compat_fence`]).
+//!
+//! The format-floor checks at admission and at flush open compare the floor
+//! with the version the policy names for the family
+//! ([`FormatFamily::writable_version_under`]); a grant at another version is
+//! checked against the floor again.
 //!
 //! A router given `None`, or none at all, writes each family's `CURRENT`
 //! version with none of these checks, exactly as before the policy existed.
 //! Every refusal counts once under its [`CompatRefusalReason`] in the
-//! signal's ingest metrics (`ravel_compat_publish_refused_total`).
+//! signal's ingest metrics snapshot (`compat_publish_refused`), a field
+//! `ravel-server` does not yet render on `/metrics` (#4287).
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use ravel_catalog::compat::{COMPAT_VIEW_HORIZON_NS, CompatClock, CompatRefusal, CompatView};
+use ravel_catalog::compat::{CompatClock, CompatRefusal, CompatView};
 use ravel_catalog::{CompatFenceOutcome, ProvisioningError, raise_compat_fence};
+use ravel_commit::rng::RngSource;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_proto::sys::v1 as sysproto;
 use ravel_types::{Signal, TenantHash};
@@ -41,6 +51,9 @@ use crate::format_floor::FormatFamily;
 
 /// Attempts at the bucket fence before a lost CAS race fails the flush.
 const FENCE_ATTEMPTS: u32 = 3;
+
+/// The longest jittered wait between two fence attempts.
+const FENCE_BACKOFF_MAX: Duration = Duration::from_millis(50);
 
 /// The versions a build writes for one family and the family's baseline.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,24 +220,6 @@ impl IngestCompatPolicy {
             .unwrap_or(versions.baseline)
     }
 
-    /// [`CompatRefusal::ViewStale`] when the last successful read of
-    /// `sys/compat` is [`COMPAT_VIEW_HORIZON_NS`] old or older, or there has
-    /// been none.
-    pub fn check_fresh(&self) -> Result<(), CompatRefusal> {
-        let now_unix_ns = self.now_unix_ns();
-        let last_read_unix_ns = self.view.last_read_unix_ns();
-        let fresh = last_read_unix_ns
-            .is_some_and(|last| now_unix_ns.saturating_sub(last) < COMPAT_VIEW_HORIZON_NS);
-        if fresh {
-            Ok(())
-        } else {
-            Err(CompatRefusal::ViewStale {
-                last_read_unix_ns,
-                now_unix_ns,
-            })
-        }
-    }
-
     /// The admission check: [`Self::write_version`], except that a stale
     /// view admits, because the flush re-asks at permit grant.
     pub fn admit(
@@ -286,22 +281,26 @@ pub(crate) trait BucketCompat: Send + Sync {
     fn note_compat_fence(&self, tenant: TenantHash, compat_epoch: u64);
 }
 
-/// Why a publish was refused, the `reason` label of
-/// `ravel_compat_publish_refused_total`.
+/// Why a publish was refused: the field of [`CompatRefusalSnapshot`] that
+/// counts it, and the name logged with the refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompatRefusalReason {
     ViewStale,
     ActiveVersionNotWritable,
     CompatRecordMissing,
     FenceFailed,
+    ActiveVersionMoved,
+    NoBucketView,
 }
 
 impl CompatRefusalReason {
-    pub const ALL: [CompatRefusalReason; 4] = [
+    pub const ALL: [CompatRefusalReason; 6] = [
         CompatRefusalReason::ViewStale,
         CompatRefusalReason::ActiveVersionNotWritable,
         CompatRefusalReason::CompatRecordMissing,
         CompatRefusalReason::FenceFailed,
+        CompatRefusalReason::ActiveVersionMoved,
+        CompatRefusalReason::NoBucketView,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -310,6 +309,8 @@ impl CompatRefusalReason {
             CompatRefusalReason::ActiveVersionNotWritable => "active_version_not_writable",
             CompatRefusalReason::CompatRecordMissing => "compat_record_missing",
             CompatRefusalReason::FenceFailed => "fence_failed",
+            CompatRefusalReason::ActiveVersionMoved => "active_version_moved",
+            CompatRefusalReason::NoBucketView => "no_bucket_view",
         }
     }
 
@@ -319,6 +320,8 @@ impl CompatRefusalReason {
             CompatRefusalReason::ActiveVersionNotWritable => 1,
             CompatRefusalReason::CompatRecordMissing => 2,
             CompatRefusalReason::FenceFailed => 3,
+            CompatRefusalReason::ActiveVersionMoved => 4,
+            CompatRefusalReason::NoBucketView => 5,
         }
     }
 }
@@ -345,6 +348,24 @@ pub enum CompatPublishRefusal {
         compat_epoch: u64,
         cause: String,
     },
+    /// The view's answer moved off the version the flush was granted while
+    /// the flush was publishing (ADR-4233 decision 3).
+    #[error(
+        "refusing to publish a {family} object at version {granted}: the activation policy now \
+         answers version {active} (ADR-4233 decision 3)"
+    )]
+    ActiveVersionMoved {
+        family: FormatFamily,
+        granted: u16,
+        active: u16,
+    },
+    /// The flush's router is gone, so no cached provisioning record of its
+    /// bucket is left to ask the policy with.
+    #[error(
+        "refusing to publish a {family} object: the router that held the bucket's provisioning \
+         record is gone (ADR-4233)"
+    )]
+    NoBucketView { family: FormatFamily },
 }
 
 impl CompatPublishRefusal {
@@ -360,12 +381,16 @@ impl CompatPublishRefusal {
                 }
             },
             CompatPublishRefusal::FenceFailed { .. } => CompatRefusalReason::FenceFailed,
+            CompatPublishRefusal::ActiveVersionMoved { .. } => {
+                CompatRefusalReason::ActiveVersionMoved
+            }
+            CompatPublishRefusal::NoBucketView { .. } => CompatRefusalReason::NoBucketView,
         }
     }
 
     /// Always true: the refused rows are valid, and a later write succeeds
-    /// once a refresh, a rollout, a retried fence or a restored `sys/compat`
-    /// clears the refusal. [`CompatRefusal::is_retryable`] answers a
+    /// once a refresh, a rollout, a retried fence, a new grant or a restored
+    /// `sys/compat` clears the refusal. [`CompatRefusal::is_retryable`] answers a
     /// different question, whether it clears without an operator.
     pub fn is_retryable(&self) -> bool {
         true
@@ -375,7 +400,7 @@ impl CompatPublishRefusal {
 /// Refusals by reason, one set per signal's ingest metrics.
 #[derive(Debug, Default)]
 pub struct CompatRefusalCounters {
-    by_reason: [AtomicU64; 4],
+    by_reason: [AtomicU64; 6],
 }
 
 /// Point-in-time copy of [`CompatRefusalCounters`].
@@ -385,6 +410,8 @@ pub struct CompatRefusalSnapshot {
     pub active_version_not_writable: u64,
     pub compat_record_missing: u64,
     pub fence_failed: u64,
+    pub active_version_moved: u64,
+    pub no_bucket_view: u64,
 }
 
 impl CompatRefusalSnapshot {
@@ -394,6 +421,8 @@ impl CompatRefusalSnapshot {
             CompatRefusalReason::ActiveVersionNotWritable => self.active_version_not_writable,
             CompatRefusalReason::CompatRecordMissing => self.compat_record_missing,
             CompatRefusalReason::FenceFailed => self.fence_failed,
+            CompatRefusalReason::ActiveVersionMoved => self.active_version_moved,
+            CompatRefusalReason::NoBucketView => self.no_bucket_view,
         }
     }
 
@@ -414,6 +443,8 @@ impl CompatRefusalCounters {
             active_version_not_writable: load(CompatRefusalReason::ActiveVersionNotWritable),
             compat_record_missing: load(CompatRefusalReason::CompatRecordMissing),
             fence_failed: load(CompatRefusalReason::FenceFailed),
+            active_version_moved: load(CompatRefusalReason::ActiveVersionMoved),
+            no_bucket_view: load(CompatRefusalReason::NoBucketView),
         }
     }
 }
@@ -427,9 +458,13 @@ pub(crate) struct PublishGrant {
 
 struct Managed {
     policy: Arc<IngestCompatPolicy>,
-    /// Present when the version is above the family's baseline, so the bucket
-    /// must be fenced before the first PUT.
-    fence: Option<Arc<dyn BucketCompat>>,
+    tenant: TenantHash,
+    /// The router's cache of the bucket's provisioning record, asked again
+    /// before every attempt.
+    bucket: Arc<dyn BucketCompat>,
+    /// The version is above the family's baseline, so the bucket must be
+    /// fenced before the first PUT.
+    fence: bool,
 }
 
 impl PublishGrant {
@@ -442,7 +477,9 @@ impl PublishGrant {
         }
     }
 
-    /// Ask `policy` at permit grant. `None` is [`Self::unmanaged`].
+    /// Ask `policy` at permit grant. `None` is [`Self::unmanaged`]. With a
+    /// policy and no `bucket` (the router is gone), refused
+    /// [`CompatPublishRefusal::NoBucketView`].
     pub(crate) fn at_grant(
         policy: Option<Arc<IngestCompatPolicy>>,
         family: FormatFamily,
@@ -452,19 +489,22 @@ impl PublishGrant {
         let Some(policy) = policy else {
             return Ok(PublishGrant::unmanaged(family));
         };
-        let bucket_epoch = bucket.as_ref().and_then(|b| b.bucket_compat_epoch(tenant));
-        let version = policy
-            .write_version(family, bucket_epoch)
-            .map_err(|refusal| CompatPublishRefusal::Policy { family, refusal })?;
-        let fence = if version > policy.baseline(family) {
-            Some(bucket.unwrap_or_else(|| Arc::new(NoBucketCache)))
-        } else {
-            None
+        let Some(bucket) = bucket else {
+            return Err(CompatPublishRefusal::NoBucketView { family });
         };
+        let version = policy
+            .write_version(family, bucket.bucket_compat_epoch(tenant))
+            .map_err(|refusal| CompatPublishRefusal::Policy { family, refusal })?;
+        let fence = version > policy.baseline(family);
         Ok(PublishGrant {
             family,
             version,
-            managed: Some(Managed { policy, fence }),
+            managed: Some(Managed {
+                policy,
+                tenant,
+                bucket,
+                fence,
+            }),
         })
     }
 
@@ -489,42 +529,57 @@ impl PublishGrant {
         }
     }
 
-    /// The check before every PUT attempt: refuses once the view has aged to
-    /// the horizon.
+    /// The check before every PUT and fence attempt (ADR-4233 decision 3):
+    /// the view is asked again, with the bucket's cached provisioning record,
+    /// and the attempt is refused when it refuses or names a version other
+    /// than the granted one.
     pub(crate) fn check_attempt(&self) -> Result<(), CompatPublishRefusal> {
-        match &self.managed {
-            None => Ok(()),
-            Some(managed) => {
-                managed
-                    .policy
-                    .check_fresh()
-                    .map_err(|refusal| CompatPublishRefusal::Policy {
-                        family: self.family,
-                        refusal,
-                    })
-            }
+        let Some(managed) = &self.managed else {
+            return Ok(());
+        };
+        let active = managed
+            .policy
+            .write_version(
+                self.family,
+                managed.bucket.bucket_compat_epoch(managed.tenant),
+            )
+            .map_err(|refusal| CompatPublishRefusal::Policy {
+                family: self.family,
+                refusal,
+            })?;
+        if active != self.version {
+            return Err(CompatPublishRefusal::ActiveVersionMoved {
+                family: self.family,
+                granted: self.version,
+                active,
+            });
         }
+        Ok(())
     }
 
     /// Before the first PUT of an object above the baseline: raise the
     /// bucket's provisioning record to the view's epoch unless the cached
     /// record already carries it. Each fence attempt is refused like a PUT
-    /// attempt on a stale view, and bounded by `deadline_ns` on `clock`.
+    /// attempt, and bounded by `deadline_ns` on `clock`; a lost CAS race is
+    /// retried after a wait `rng` jitters up to [`FENCE_BACKOFF_MAX`].
     pub(crate) async fn ensure_fenced(
         &self,
         store: &dyn ObjectStoreBackend,
-        tenant: TenantHash,
         signal: Signal,
         clock: &dyn Clock,
+        rng: &dyn RngSource,
         deadline_ns: i64,
     ) -> Result<(), CompatPublishRefusal> {
         let Some(Managed {
             policy,
-            fence: Some(bucket),
+            tenant,
+            bucket,
+            fence: true,
         }) = &self.managed
         else {
             return Ok(());
         };
+        let tenant = *tenant;
         let compat_epoch = policy.view().seen_epoch();
         if bucket.bucket_compat_epoch(tenant).unwrap_or(0) >= compat_epoch {
             return Ok(());
@@ -535,6 +590,7 @@ impl PublishGrant {
             compat_epoch,
             cause,
         };
+        let elapsed = || failed("max_flush_lifetime elapsed".into());
         let mut attempt = 0;
         loop {
             attempt += 1;
@@ -551,9 +607,16 @@ impl PublishGrant {
                     return Ok(());
                 }
                 Some(Err(ProvisioningError::FenceCasConflict { .. }))
-                    if attempt < FENCE_ATTEMPTS => {}
+                    if attempt < FENCE_ATTEMPTS =>
+                {
+                    let max_ms = u64::try_from(FENCE_BACKOFF_MAX.as_millis()).unwrap_or(u64::MAX);
+                    let wait = Duration::from_millis(rng.jitter_ms(max_ms));
+                    bounded(clock, deadline_ns, clock.sleep(wait))
+                        .await
+                        .ok_or_else(elapsed)?;
+                }
                 Some(Err(err)) => return Err(failed(err.to_string())),
-                None => return Err(failed("max_flush_lifetime elapsed".into())),
+                None => return Err(elapsed()),
             }
         }
     }
@@ -566,18 +629,6 @@ pub(crate) enum PutAbort {
     Exhausted,
     /// The activation policy refused the next attempt.
     Refused(CompatPublishRefusal),
-}
-
-/// The bucket cache of a flush whose router's switch is gone: nothing cached,
-/// so the fence is always attempted.
-struct NoBucketCache;
-
-impl BucketCompat for NoBucketCache {
-    fn bucket_compat_epoch(&self, _tenant: TenantHash) -> Option<u64> {
-        None
-    }
-
-    fn note_compat_fence(&self, _tenant: TenantHash, _compat_epoch: u64) {}
 }
 
 /// `fut` raced against `deadline_ns` on `clock`, as the shards bound their
@@ -607,8 +658,8 @@ pub(crate) fn warn_publish_refused(
         tenant_hash = %tenant.to_hex(),
         reason = refusal.reason().as_str(),
         error = %refusal,
-        "refusing to publish: the sys/compat activation policy does not allow it; nothing was \
-         stored"
+        "refusing to publish: the sys/compat activation policy does not allow it; no commit \
+         record was stored"
     );
 }
 
@@ -687,6 +738,38 @@ mod tests {
         );
     }
 
+    /// A grant asked with a policy installed and no bucket view (its router
+    /// was dropped) is refused under `no_bucket_view`, never granted the
+    /// unmanaged `CURRENT`; with no policy it is unmanaged.
+    #[tokio::test]
+    async fn a_grant_with_no_bucket_view_is_refused_typed() {
+        let tenant = ravel_types::TenantId::new("acme").hash();
+        let err = PublishGrant::at_grant(
+            Some(Arc::new(policy(7).await)),
+            FormatFamily::Rseg,
+            tenant,
+            None,
+        )
+        .err()
+        .expect("no bucket view");
+        assert!(
+            matches!(
+                err,
+                CompatPublishRefusal::NoBucketView {
+                    family: FormatFamily::Rseg
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.reason(), CompatRefusalReason::NoBucketView);
+        assert!(err.is_retryable());
+
+        let grant =
+            PublishGrant::at_grant(None, FormatFamily::Rseg, tenant, None).expect("unmanaged");
+        assert!(grant.managed.is_none());
+        assert_eq!(grant.check_attempt().ok(), Some(()));
+    }
+
     #[test]
     fn each_refusal_reason_counts_under_its_own_label() {
         let labels: Vec<&str> = CompatRefusalReason::ALL
@@ -700,6 +783,8 @@ mod tests {
                 "active_version_not_writable",
                 "compat_record_missing",
                 "fence_failed",
+                "active_version_moved",
+                "no_bucket_view",
             ]
         );
 
@@ -717,8 +802,10 @@ mod tests {
                 active_version_not_writable: 2,
                 compat_record_missing: 3,
                 fence_failed: 4,
+                active_version_moved: 5,
+                no_bucket_view: 6,
             }
         );
-        assert_eq!(snapshot.total(), 10);
+        assert_eq!(snapshot.total(), 21);
     }
 }
