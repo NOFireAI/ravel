@@ -1260,6 +1260,181 @@ TLA_JAR_SHA256="$orig_sha_af"
 PATH="$orig_path_af"
 rm -rf "$afdir"
 
+# --- (ai)-(at) traceability: the Antithesis property column (issue #4330) ----
+# ADR-4326 decision 6, ADR-1113 D8 amendment. An area holding
+# antithesis-mutants.tsv is enrolled: every row of every traceability table
+# then carries a sixth "Antithesis property" cell (sut:, driver: or none:),
+# and the .tsv maps every negative/*.cfg to a Rust mutant and a carried
+# property, or to none: <reason>. An area without the .tsv stays five-column.
+orig_repo_root_ai="$REPO_ROOT"
+orig_formal_dir_ai="$FORMAL_DIR"
+airepo="$(mktemp -d)"
+REPO_ROOT="$airepo"
+FORMAL_DIR="$airepo/formal/tla"
+mkdir -p "$airepo/crates" "$airepo/antithesis/ingest-durability"
+cat > "$airepo/crates/a.rs" <<'EOF'
+fn publish() {
+    inv_always!(ok, "commit never precedes data");
+    if inv_mutant!("enr/commit-before-data") {}
+}
+EOF
+cat > "$airepo/antithesis/ingest-durability/driver.py" <<'EOF'
+always(acked, "acked write is durable")
+EOF
+
+TAB="$(printf '\t')"
+HDR5='| TLA+ action or property | meaning | Rust path and symbol | existing test | new test needed |
+|---|---|---|---|---|'
+HDR6='| TLA+ action or property | meaning | Rust path and symbol | existing test | new test needed | Antithesis property |
+|---|---|---|---|---|---|'
+ROW5='| PutData | data first | `crates/a.rs::publish` | none | none |'
+ROW6_SUT='| PutData | data first | `crates/a.rs::publish` | none | none | sut: `crates/a.rs` -- commit never precedes data |'
+ROW6_DRV='| Ack | acked is durable | `crates/a.rs::publish` | none | none | driver: ingest-durability -- acked write is durable |'
+ROW6_NONE='| TypeOK | well-formedness | `crates/a.rs::publish` | none | none | none: type invariant, unit tested |'
+
+# make_area <area> <enrolled 0|1> <traceability body>: a fresh area with the
+# given table text; when enrolled, a .tsv covering one negative config.
+make_area() {
+    local area="$1" enrolled="$2" body="$3" d="$FORMAL_DIR/$1"
+    rm -rf "$d"
+    mkdir -p "$d/negative"
+    printf '# %s traceability\n\n%s\n' "$area" "$body" > "$d/traceability.md"
+    if [ "$enrolled" = 1 ]; then
+        : > "$d/negative/commit-before-data.cfg"
+        printf '# negative cfg stem\tmutant\tproperty\ncommit-before-data\t%s/commit-before-data\tcommit never precedes data\n' \
+            "$area" > "$d/antithesis-mutants.tsv"
+    fi
+}
+
+# expect_trace <label> <area> <want: pass|fail> <needle>
+expect_trace() {
+    local label="$1" area="$2" want="$3" needle="$4" out code
+    out="$(check_traceability "$area" 2>&1)"; code=$?
+    if [ "$want" = pass ] && [ "$code" -ne 0 ]; then
+        bad "$label: expected exit 0, got $code; output: $out"; return
+    fi
+    if [ "$want" = fail ] && [ "$code" -eq 0 ]; then
+        bad "$label: expected nonzero exit, got 0; output: $out"; return
+    fi
+    if printf '%s' "$out" | grep -qF -- "$needle"; then
+        ok
+    else
+        bad "$label: expected output to contain '$needle'; output: $out"
+    fi
+}
+
+echo "--- (ai) traceability: an enrolled area valid on every carrier passes, and the sweep still resolves the sut: path"
+make_area enr 1 "$HDR6
+$ROW6_SUT
+$ROW6_DRV
+$ROW6_NONE"
+expect_trace ai enr pass 'PASS (3 rows resolve)'
+# The sut: path is a whole token for the crates/... sweep: a missing one is
+# reported by the sweep too, under its own diagnostic.
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| Gone | gone | \`crates/a.rs::publish\` | none | none | sut: \`crates/gone.rs\` -- commit never precedes data |"
+expect_trace ai2 enr fail "missing source 'crates/gone.rs'"
+
+echo "--- (aj) traceability: an enrolled area with a five-column table fails"
+make_area enr 1 "$HDR5
+$ROW5"
+expect_trace aj enr fail 'has 5 columns; an enrolled area needs 6'
+
+echo "--- (ak) traceability: a six-column table with no antithesis-mutants.tsv fails"
+make_area unenr 0 "$HDR6
+$ROW6_SUT"
+expect_trace ak unenr fail 'has 6 columns; an area with no antithesis-mutants.tsv needs 5'
+
+echo "--- (al) traceability: sut: with a missing path, or a message absent from it, fails"
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| Gone | gone | \`crates/a.rs::publish\` | none | none | sut: services/gone.rs -- commit never precedes data |"
+expect_trace al1 enr fail "Antithesis property: sut: no such file 'services/gone.rs'"
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| Absent | absent | \`crates/a.rs::publish\` | none | none | sut: \`crates/a.rs\` -- data never precedes commit |"
+expect_trace al2 enr fail "Antithesis property: message 'data never precedes commit' not found in 'crates/a.rs'"
+
+echo "--- (am) traceability: driver: with a message absent under the workload fails"
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| Ack | acked | \`crates/a.rs::publish\` | none | none | driver: ingest-durability -- acked write is lost |"
+expect_trace am1 enr fail "Antithesis property: message 'acked write is lost' not found under 'antithesis/ingest-durability/'"
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| Ack | acked | \`crates/a.rs::publish\` | none | none | driver: no-such-workload -- acked write is durable |"
+expect_trace am2 enr fail "Antithesis property: driver: no workload directory 'antithesis/no-such-workload/'"
+
+echo "--- (an) traceability: none: with an empty reason fails"
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| TypeOK | shape | \`crates/a.rs::publish\` | none | none | none:   |"
+expect_trace an enr fail 'Antithesis property: none: needs a reason'
+
+echo "--- (ao) traceability: a data row containing 'action ... property' text is still checked"
+make_area unenr 0 "$HDR5
+$ROW5
+| Retry | an action that keeps the property | \`crates/a.rs::Missing\` | none | none |"
+expect_trace ao unenr fail "symbol 'Missing' not found in 'crates/a.rs'"
+# And a header is its exact first cell: a near miss is not a header.
+make_area unenr 0 "| TLA+ Action or Property | meaning | Rust path and symbol | existing test | new test needed |
+|---|---|---|---|---|
+$ROW5"
+expect_trace ao2 unenr fail "table header's first cell is 'TLA+ Action or Property', not 'TLA+ action or property'"
+
+echo "--- (ap) traceability: a .tsv line naming a mutant absent from Rust fails"
+make_area enr 1 "$HDR6
+$ROW6_SUT"
+: > "$FORMAL_DIR/enr/negative/ack-before-commit.cfg"
+printf 'ack-before-commit\tenr/ack-before-commit\tcommit never precedes data\n' >> "$FORMAL_DIR/enr/antithesis-mutants.tsv"
+expect_trace ap enr fail "mutant 'enr/ack-before-commit' not found as inv_mutant!(\"enr/ack-before-commit\") in Rust"
+
+echo "--- (aq) traceability: a negative/*.cfg with no .tsv line fails"
+make_area enr 1 "$HDR6
+$ROW6_SUT"
+: > "$FORMAL_DIR/enr/negative/ack-before-commit.cfg"
+expect_trace aq enr fail 'negative/ack-before-commit.cfg has no line in antithesis-mutants.tsv'
+# A none: line covers it; a property no row carries does not.
+printf 'ack-before-commit%snone: outside decision 2 scope\n' "$TAB" >> "$FORMAL_DIR/enr/antithesis-mutants.tsv"
+expect_trace aq2 enr pass 'PASS (1 rows resolve)'
+make_area enr 1 "$HDR6
+$ROW6_NONE"
+expect_trace aq3 enr fail "property 'commit never precedes data' is not carried by any sut: or driver: cell"
+
+echo "--- (ar) traceability: a five-column area with no .tsv passes unchanged"
+make_area unenr 0 "$HDR5
+$ROW5"
+expect_trace ar unenr pass 'PASS (1 rows resolve)'
+
+echo "--- (as) traceability: two tables in one file are both checked"
+make_area enr 1 "$HDR6
+$ROW6_SUT
+
+$HDR5
+$ROW5"
+expect_trace as1 enr fail 'has 5 columns; an enrolled area needs 6'
+make_area enr 1 "$HDR6
+$ROW6_SUT
+
+$HDR6
+| TypeOK | shape | \`crates/a.rs::publish\` | none | none | none: |"
+expect_trace as2 enr fail 'Antithesis property: none: needs a reason'
+make_area enr 1 "$HDR6
+$ROW6_SUT
+
+$HDR6
+$ROW6_DRV
+$ROW6_NONE"
+expect_trace as3 enr pass 'PASS (3 rows resolve)'
+
+echo "--- (at) traceability: the real tree has no enrolled area and passes five-column"
+REPO_ROOT="$orig_repo_root_ai"
+FORMAL_DIR="$orig_formal_dir_ai"
+atout="$(check_traceability commit 2>&1)"; atcode=$?
+if [ "$atcode" -eq 0 ]; then ok; else bad "at: expected the real commit area to pass, got $atcode; output: $atout"; fi
+rm -rf "$airepo"
+
 rm -f "$LIB_SRC"
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
