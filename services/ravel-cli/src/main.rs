@@ -2828,8 +2828,8 @@ enum CatalogCommand {
         /// by key8_str at block 0, so a probe names the objects holding a
         /// string. Each entry read by range costs a footer suffix GET (a
         /// second footer GET when the footer is larger than the 8 KiB suffix)
-        /// and one LABEL_DICT range GET, in every pass of the fold's build and
-        /// once in a rebuild. A fold reads none for an entry whose object its
+        /// and one LABEL_DICT range GET, in every pass of a fold's or a
+        /// rebuild's build. A fold reads none for an entry whose object its
         /// name postings fetched whole and it holds within the
         /// `--key-index-build-max-pairs` allowance, and none for an entry a
         /// re-encoded part carries from the leaves of an overlapping previous
@@ -2849,8 +2849,10 @@ enum CatalogCommand {
         /// "Lifecycle"; docs/catalog-and-mvcc.md "Rollout"). Each such part is
         /// read once and each of its entries costs the fold's ranged KEY_IDX
         /// reads (two GETs, three when the footer is larger than the 8 KiB
-        /// suffix); no part is re-encoded and no part, `.csnap` or `.cstat` is
-        /// written. Publishes HEAD once per batch (`--batch-entries`), so an
+        /// suffix) in every pass of the part's build: one pass unless a
+        /// field's pairs pass its share of `--key-index-build-max-pairs`,
+        /// as in a fold's build. No part is re-encoded and no part, `.csnap`
+        /// or `.cstat` is written. Publishes HEAD once per batch (`--batch-entries`), so an
         /// interrupted run keeps every earlier batch and a rerun skips the
         /// parts they indexed; a part with an entry whose ranged GET failed
         /// gains no ref and is read again by a rerun (`parts_deferred`).
@@ -8856,5 +8858,183 @@ mod parquet_repair_dispatch_tests {
             .expect("the reserved-name key is deleted");
         assert_eq!(fake.deletes(), vec![key.clone()]);
         assert!(!fake.has_object(&key));
+    }
+}
+
+/// `catalog fold --rebuild-key-index` driven through [`run_logged`], the
+/// dispatch `main` runs, so the handling of `--key-index-build-max-pairs` is
+/// what is pinned, not only the parsed flag and the catalog function.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod rebuild_key_index_dispatch_tests {
+    use bytes::Bytes;
+    use clap::Parser;
+    use ravel_commit::keys;
+    use ravel_commit::publish::{self, RetryPolicy};
+    use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_rspan::{ObjectIdentity, RspanConfig, RspanWriter, SpanRecord, StatusCode};
+    use ravel_types::{Signal, TenantId};
+    use uuid::Uuid;
+
+    use super::fake_s3::seed::NS_PER_HOUR;
+    use super::fake_s3::{Echo, FakeS3, spawn};
+    use super::{Cli, run_logged, store};
+
+    const TENANT: &str = "acme";
+    const TRACES: u8 = 3;
+
+    fn argv(endpoint: &str, command: &[&str]) -> Vec<String> {
+        [
+            "ravel-cli",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            endpoint,
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+            "--tenant-hash-unkeyed",
+        ]
+        .iter()
+        .chain(command)
+        .map(|arg| arg.to_string())
+        .collect()
+    }
+
+    async fn run_command(endpoint: &str, command: &[&str]) {
+        let cli = Cli::try_parse_from(argv(endpoint, command)).expect("command parses");
+        run_logged(cli, &mut Vec::new())
+            .await
+            .expect("command runs");
+    }
+
+    /// One sealed spans part holding one RSPAN object with `TRACES` distinct
+    /// trace ids, folded with the leaf build off.
+    async fn folded_without_leaves() -> (String, std::sync::Arc<FakeS3>) {
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        let args = store::StoreArgs::try_parse_from(&argv(&endpoint, &[])[..11])
+            .expect("store flags parse");
+        let plain = store::build_store(&args).expect("store");
+        let tenant_hash = TenantId::new(TENANT).hash();
+        let writer_id = Uuid::from_u128(1);
+        let mut writer = RspanWriter::new(
+            RspanConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: *writer_id.as_bytes(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        let base_ts = ravel_cli::now_ns().expect("wall clock") - 3 * NS_PER_HOUR;
+        for i in 0..TRACES {
+            writer.push(SpanRecord {
+                trace_id: [i + 1; 16],
+                span_id: [i + 1; 8],
+                parent_span_id: None,
+                name: "op".to_string(),
+                start_ts_ns: base_ts + i64::from(i),
+                end_ts_ns: base_ts + i64::from(i) + 10,
+                status_code: StatusCode::Unset,
+                status_message: None,
+                attrs: Vec::new(),
+            });
+        }
+        let bytes = Bytes::from(writer.finish().expect("finish"));
+        let commit = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Spans,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: bytes.len() as u64,
+            content_hash: *blake3::hash(&bytes).as_bytes(),
+            sample_count: u64::from(TRACES),
+            series_count: 1,
+            min_event_ts_ns: base_ts,
+            max_event_ts_ns: base_ts + 100,
+            min_ingest_ts_ns: base_ts,
+            max_ingest_ts_ns: base_ts + 100,
+            segment_format_version: 1,
+            created_unix_ns: base_ts,
+            ingest_hour_bucket: u32::try_from(base_ts.div_euclid(NS_PER_HOUR)).expect("fits u32"),
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&commit).expect("data key");
+        publish::put_data_object(plain.as_ref(), &data_key, bytes)
+            .await
+            .expect("put data object");
+        publish::publish(plain.as_ref(), &commit, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        run_command(
+            &endpoint,
+            &[
+                "catalog",
+                "fold",
+                "--tenant",
+                TENANT,
+                "--shards",
+                "1",
+                "--signal",
+                "spans",
+                "--no-key-index-leaves",
+            ],
+        )
+        .await;
+        assert_eq!(kidx_puts(&fake), 0, "folded with leaves off");
+        (endpoint, fake)
+    }
+
+    fn kidx_puts(fake: &FakeS3) -> usize {
+        fake.puts()
+            .iter()
+            .filter(|put| put.key.ends_with(".kidx"))
+            .count()
+    }
+
+    /// Leaf PUTs of a rebuild run with `budget` passed as
+    /// `--key-index-build-max-pairs`.
+    async fn rebuild_leaf_puts(budget: &str) -> usize {
+        let (endpoint, fake) = folded_without_leaves().await;
+        run_command(
+            &endpoint,
+            &[
+                "catalog",
+                "fold",
+                "--tenant",
+                TENANT,
+                "--shards",
+                "1",
+                "--signal",
+                "spans",
+                "--rebuild-key-index",
+                "--key-index-build-max-pairs",
+                budget,
+            ],
+        )
+        .await;
+        kidx_puts(&fake)
+    }
+
+    /// At a budget of one pair each pass holds one of the part's three trace
+    /// ids, so the rebuild PUTs three leaves; at the default it PUTs one.
+    ///
+    /// Non-vacuity: swap `batch_entries` and `key_index_build_max_pairs` at
+    /// the `rebuild_key_index_at_budget` call in `run_logged` and the budget
+    /// of 1 becomes the batch size, the pair budget the 250,000 default
+    /// batch size, and the run PUTs one leaf.
+    #[tokio::test]
+    async fn the_pair_budget_reaches_the_rebuild_dispatch() {
+        assert_eq!(rebuild_leaf_puts("1").await, usize::from(TRACES));
+        assert_eq!(
+            rebuild_leaf_puts(&ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS.to_string()).await,
+            1
+        );
     }
 }
