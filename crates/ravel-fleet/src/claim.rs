@@ -120,11 +120,20 @@
 //! amendment). `CompactionClaim::owner_clock_ns`
 //! exists for operator forensics and is never read here.
 //!
-//! A claim whose payload this reader cannot read (it does not decode,
-//! advertises a newer format, carries the `UNSPECIFIED` state, or has
-//! malformed owner ids) declares no lease it can honor, so its lease is
-//! [`MAX_OBSERVED_LEASE_MS`]. Past that expiry it is stolen under CAS exactly
-//! like a readable claim (ADR-1029, the 2026-11-09 amendment).
+//! A claim whose payload this reader cannot read because it does not decode,
+//! carries the `UNSPECIFIED` state, or has malformed owner ids declares no
+//! lease it can honor, so its lease is [`MAX_OBSERVED_LEASE_MS`]. Past that
+//! expiry it is stolen under CAS exactly like a readable claim (ADR-1029, the
+//! 2026-11-09 amendment).
+//!
+//! A claim whose `format_version` is 0 (never written by any build) or above
+//! [`CLAIM_FORMAT_VERSION`] (written by a newer build) is different: it is
+//! **never** stolen or overwritten, at any age (ADR-4233 decision 4, H8). A
+//! newer build may be relying on a lease this reader cannot compute, and a
+//! version-0 claim is corruption or a bug in some other writer, never a lease
+//! this reader may contest. Both are judged unexpired forever, not merely
+//! past the lease ceiling: the claimant observes it, treats the unit as held
+//! by another, and moves on without ever attempting the CAS.
 //!
 //! # Time and randomness are injected
 //!
@@ -366,18 +375,26 @@ pub struct ClaimObservation {
     pub last_modified_unix_ms: i64,
     /// `last_modified_unix_ms + lease_duration`, where the lease is the one the
     /// holder declared when readable (or this reader's configured default when
-    /// it declared none), and [`MAX_OBSERVED_LEASE_MS`] when the payload is
-    /// unreadable.
+    /// it declared none), [`MAX_OBSERVED_LEASE_MS`] when the payload is
+    /// unreadable, and [`i64::MAX`] when `version_protected` is `true` (so it
+    /// never expires).
     pub expiry_unix_ms: i64,
     /// When to retry this unit: strictly after `expiry_unix_ms`, offset by this
     /// contender's deterministic [`jitter_ms`] so N contenders do not stampede
     /// the instant a claim expires.
     pub reschedule_after_unix_ms: i64,
-    /// `None` when the stored payload does not decode, or advertises a format
-    /// floor above [`CLAIM_FORMAT_VERSION`]. Such a claim's expiry is judged by
-    /// [`MAX_OBSERVED_LEASE_MS`], since the lease its writer declared cannot be
-    /// read, and past it the claim is stolen like any other.
+    /// `None` when the stored payload does not decode, carries the
+    /// `UNSPECIFIED` state, has malformed owner ids, or advertises a
+    /// `format_version` of 0 or above [`CLAIM_FORMAT_VERSION`].
     pub holder: Option<ClaimHolder>,
+    /// `true` when `format_version` is 0 or above [`CLAIM_FORMAT_VERSION`]:
+    /// this claim is never stolen or overwritten, at any age (ADR-4233
+    /// decision 4, H8). `expiry_unix_ms` is [`i64::MAX`] in that case, so
+    /// [`is_expired`](Self::is_expired) is always `false` and [`steal`]
+    /// always refuses it locally. Distinct from the ordinary
+    /// unreadable-payload case (`holder.is_none()` with this `false`), which
+    /// is still judged by the lease ceiling and stolen past it.
+    pub version_protected: bool,
 }
 
 impl ClaimObservation {
@@ -683,7 +700,18 @@ async fn observe(
         Err(err) => return Err(err),
     };
 
-    let holder = decode_holder(got.data.as_ref());
+    let (holder, version_protected) = match classify(got.data.as_ref()) {
+        Ok(h) => (Some(h), false),
+        Err(Unreadable::Opaque) => (None, false),
+        Err(Unreadable::VersionProtected { format_version }) => {
+            tracing::debug!(
+                version = format_version,
+                "claim: observing a version-protected claim (0 or above the known \
+                 version); it is never stolen"
+            );
+            (None, true)
+        }
+    };
     // Expiry uses the lease the OWNER declared when it is readable and sane, so
     // an observer configured with a shorter lease does not steal out from under
     // a longer-leased owner. The base is always the store's timestamp.
@@ -707,7 +735,15 @@ async fn observe(
         // to the ceiling renews inside it, so the ceiling is the expiry.
         None => MAX_OBSERVED_LEASE_MS,
     };
-    let expiry_unix_ms = meta.last_modified_unix_ms.saturating_add(lease_ms);
+    // A version-protected claim never expires (ADR-4233 decision 4, H8): unlike
+    // an opaque-unreadable claim, it is not merely held to the lease ceiling,
+    // it is never stolen at all, so its expiry is pinned past any real clock
+    // value rather than computed from a lease.
+    let expiry_unix_ms = if version_protected {
+        i64::MAX
+    } else {
+        meta.last_modified_unix_ms.saturating_add(lease_ms)
+    };
     // An unreadable claim's jitter is drawn from this observer's own lease,
     // not the ceiling, so the hold past the ceiling stays under one lease.
     let jitter_lease_ms = if holder.is_some() {
@@ -718,6 +754,8 @@ async fn observe(
     let jitter = jitter_ms(&work_id, observer_process_id, jitter_lease_ms, cfg);
     // Strictly after expiry even when the jitter draw is 0: retrying in the
     // same millisecond expiry lands on would race the boundary for nothing.
+    // Saturating: expiry_unix_ms is i64::MAX for a version-protected claim, so
+    // this stays i64::MAX rather than wrapping.
     let reschedule_after_unix_ms = expiry_unix_ms.saturating_add(jitter).saturating_add(1);
 
     Ok(Some(ClaimObservation {
@@ -728,34 +766,49 @@ async fn observe(
         expiry_unix_ms,
         reschedule_after_unix_ms,
         holder,
+        version_protected,
     }))
 }
 
-/// Decode an observed claim's forensic fields, or `None` when the bytes are not
-/// a `CompactionClaim`, advertise a format floor above
-/// [`CLAIM_FORMAT_VERSION`], or carry the never-written `UNSPECIFIED` state.
-/// All three are treated identically by the protocol: expiry is judged by
-/// [`MAX_OBSERVED_LEASE_MS`], and past it the claim is stolen under CAS.
-fn decode_holder(bytes: &[u8]) -> Option<ClaimHolder> {
-    let claim = CompactionClaim::decode(bytes).ok()?;
-    if claim.format_version > CLAIM_FORMAT_VERSION {
-        tracing::debug!(
-            version = claim.format_version,
-            "claim: observing a future-version claim; it expires at the lease ceiling"
-        );
-        return None;
+/// Why an observed claim's ownership could not be attributed to any holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unreadable {
+    /// The bytes do not decode as a `CompactionClaim`, carry the
+    /// never-written `UNSPECIFIED` state, or carry owner ids that do not
+    /// parse as UUIDs. Judged by [`MAX_OBSERVED_LEASE_MS`], and past it the
+    /// claim is stolen under CAS like any other expired claim.
+    Opaque,
+    /// `format_version` is 0 (never written by any build) or above
+    /// [`CLAIM_FORMAT_VERSION`] (written by a newer build this reader does
+    /// not understand). Never stolen or overwritten, at any age (ADR-4233
+    /// decision 4, H8).
+    VersionProtected { format_version: u32 },
+}
+
+/// Classify an observed claim's payload: either a readable [`ClaimHolder`], or
+/// why it is not one.
+fn classify(bytes: &[u8]) -> Result<ClaimHolder, Unreadable> {
+    let claim = CompactionClaim::decode(bytes).map_err(|_| Unreadable::Opaque)?;
+    // Checked before anything else in the payload: a claim at version 0 or
+    // above this build's known version carries no attributable ownership this
+    // reader will act on, whatever its other fields contain (ADR-4233
+    // decision 4, H8).
+    if claim.format_version == 0 || claim.format_version > CLAIM_FORMAT_VERSION {
+        return Err(Unreadable::VersionProtected {
+            format_version: claim.format_version,
+        });
     }
-    let state = ClaimState::try_from(claim.state).ok()?;
+    let state = ClaimState::try_from(claim.state).map_err(|_| Unreadable::Opaque)?;
     if state == ClaimState::Unspecified {
-        return None;
+        return Err(Unreadable::Opaque);
     }
     // A claim whose ownership identifiers do not parse is unreadable as a
     // whole: treating it as held-with-unknown-owner would trust a lease from a
     // writer it cannot attribute. Unreadable means the observer judges expiry
     // by MAX_OBSERVED_LEASE_MS instead.
-    let process_id = uuid_from(&claim.owner_process_id)?;
-    let attempt_id = uuid_from(&claim.attempt_id)?;
-    Some(ClaimHolder {
+    let process_id = uuid_from(&claim.owner_process_id).ok_or(Unreadable::Opaque)?;
+    let attempt_id = uuid_from(&claim.attempt_id).ok_or(Unreadable::Opaque)?;
+    Ok(ClaimHolder {
         process_id: Some(process_id),
         attempt_id: Some(attempt_id),
         state,
@@ -1745,9 +1798,9 @@ mod tests {
         );
     }
 
-    /// A claim this reader cannot understand is observed and rescheduled
-    /// around, and is not stolen while younger than the lease ceiling: its
-    /// writer may be a live newer build on any lease up to it.
+    /// A future-version claim is version-protected (ADR-4233 decision 4, H8):
+    /// it is observed with no holder and an expiry pinned at [`i64::MAX`], and
+    /// is refused locally well before any lease ceiling would otherwise apply.
     #[tokio::test]
     async fn a_future_version_claim_is_not_stolen_before_the_lease_ceiling() {
         let store = MemoryStore::new();
@@ -1773,10 +1826,11 @@ mod tests {
                 .expect("acquire"),
         );
         assert!(observed.holder.is_none(), "the payload is not understood");
+        assert!(observed.version_protected, "above the known version");
         assert_eq!(
             observed.expiry_unix_ms,
-            observed.last_modified_unix_ms + MAX_OBSERVED_LEASE_MS,
-            "expiry is the lease ceiling, not the lease the payload declares"
+            i64::MAX,
+            "a version-protected claim never expires"
         );
 
         // Long past this reader's own lease, the steal is still refused locally.
@@ -1802,11 +1856,14 @@ mod tests {
         );
     }
 
-    /// An unreadable claim, garbage bytes or a future format version, holds
-    /// its work until its store `last_modified` plus [`MAX_OBSERVED_LEASE_MS`]
-    /// and no longer: before that a steal is refused with no store request, at
-    /// it the steal lands under CAS, and a write to the object after the
-    /// observation defeats the steal and is left as written.
+    /// An unreadable claim, i.e. one holding garbage bytes, holds its work
+    /// until its store `last_modified` plus [`MAX_OBSERVED_LEASE_MS`] and no
+    /// longer: before that a steal is refused with no store request, at it the
+    /// steal lands under CAS, and a write to the object after the observation
+    /// defeats the steal and is left as written. A version-protected claim
+    /// (future format, or version 0) is a different case covered by
+    /// [`claim_above_known_version_or_zero_is_never_stolen`]: it is never
+    /// stolen at all, at any age.
     ///
     /// Shown failing against an unreadable claim given the configured lease or
     /// a zero lease (the expiry reads one lease, or `last_modified`), and
@@ -1817,14 +1874,7 @@ mod tests {
         let cfg = ClaimConfig::default();
         let written_ms: i64 = 1_700_000_000_000;
         let key = compaction_claim_key(&identity().work_id());
-        let future = CompactionClaim {
-            format_version: CLAIM_FORMAT_VERSION + 1,
-            ..owner_at(0).payload(&cfg)
-        };
-        let cases: [(&str, Vec<u8>); 2] = [
-            ("garbage", b"\xff\xfenot a protobuf".to_vec()),
-            ("future format", future.encode_to_vec()),
-        ];
+        let cases: [(&str, Vec<u8>); 1] = [("garbage", b"\xff\xfenot a protobuf".to_vec())];
         for (case, bytes) in cases {
             let store = instrumented();
             store.inner().set_clock_ms(written_ms as u64);
@@ -1904,6 +1954,66 @@ mod tests {
             let after = store.get(&key, GetRange::Full).await.expect("claim read");
             assert_eq!(after.data.as_ref(), bytes.as_slice(), "{case}: untouched");
             assert_eq!(after.version, rewritten.version, "{case}: version kept");
+        }
+    }
+
+    /// A claim above the known version, or at version 0, is never stolen or
+    /// overwritten, at any age (ADR-4233 decision 4, H8). This is distinct
+    /// from `an_unreadable_claim_is_stolen_once_older_than_the_lease_ceiling`:
+    /// both cases here sit far past where that test's lease ceiling would
+    /// have admitted a steal, and are refused anyway because the version gate
+    /// is checked before, and independently of, the ceiling. A fix that only
+    /// refuses versions strictly above the known one (and still admits 0), or
+    /// one that refuses before the ceiling but steals after it, fails this.
+    #[tokio::test]
+    async fn claim_above_known_version_or_zero_is_never_stolen() {
+        let cfg = ClaimConfig::default();
+        let written_ms: i64 = 1_700_000_000_000;
+        let key = compaction_claim_key(&identity().work_id());
+        let far_past_ceiling = written_ms + MAX_OBSERVED_LEASE_MS * 1000;
+
+        let newer = CompactionClaim {
+            format_version: CLAIM_FORMAT_VERSION + 1,
+            ..owner_at(0).payload(&cfg)
+        };
+        let zero = CompactionClaim {
+            format_version: 0,
+            ..owner_at(0).payload(&cfg)
+        };
+        let cases: [(&str, CompactionClaim); 2] =
+            [("newer version", newer), ("version zero", zero)];
+
+        for (case, claim) in cases {
+            let store = instrumented();
+            store.inner().set_clock_ms(written_ms as u64);
+            let bytes = claim.encode_to_vec();
+            store
+                .put(&key, bytes.clone().into(), PutOptions::create_if_absent())
+                .await
+                .expect("seed the version-protected claim");
+
+            let thief = owner_at(1);
+            let observed = held(
+                acquire(&store, &identity(), &thief, &cfg)
+                    .await
+                    .expect("acquire"),
+            );
+            assert!(observed.holder.is_none(), "{case}: no attributable holder");
+            assert!(observed.version_protected, "{case}: version-protected");
+            assert_eq!(observed.expiry_unix_ms, i64::MAX, "{case}: never expires");
+
+            let refused = steal(&store, &observed, &thief, &cfg, far_past_ceiling)
+                .await
+                .expect("steal");
+            assert_eq!(
+                refused_reason(refused),
+                StealRefused::NotExpired {
+                    expiry_unix_ms: i64::MAX
+                },
+                "{case}: refused far past the lease ceiling"
+            );
+            let stored = store.get(&key, GetRange::Full).await.expect("claim read");
+            assert_eq!(stored.data.as_ref(), bytes.as_slice(), "{case}: untouched");
         }
     }
 
