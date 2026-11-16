@@ -1,6 +1,31 @@
 //! ravel-server: gateway + ingest + query in one binary for development
 //! (`--mode all|gateway|query`). Crate boundaries keep the split honest.
 
+// Antithesis SDK assertions, compiled only with the off-by-default
+// `antithesis` feature (antithesis/README.md). Without it each macro expands
+// to nothing and its arguments are never evaluated. Defined before every
+// module so all of them are in textual scope.
+#[cfg(feature = "antithesis")]
+macro_rules! antithesis_reachable {
+    ($message:literal, $details:expr) => {
+        antithesis_sdk::assert_reachable!($message, &$details)
+    };
+}
+#[cfg(not(feature = "antithesis"))]
+macro_rules! antithesis_reachable {
+    ($message:literal, $details:expr) => {};
+}
+#[cfg(feature = "antithesis")]
+macro_rules! antithesis_unreachable {
+    ($message:literal, $details:expr) => {
+        antithesis_sdk::assert_unreachable!($message, &$details)
+    };
+}
+#[cfg(not(feature = "antithesis"))]
+macro_rules! antithesis_unreachable {
+    ($message:literal, $details:expr) => {};
+}
+
 pub mod admission_reconcile;
 #[cfg(feature = "agents")]
 pub mod agents;
