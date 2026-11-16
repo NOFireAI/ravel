@@ -63,9 +63,10 @@
 //!
 //! # An unreadable claim holds its bucket up to the lease ceiling
 //!
-//! A claim whose payload does not decode (corruption, a forged object, or a
-//! newer format written before a rollback) declares no lease this build can
-//! read, so it is judged by [`ravel_fleet::claim::MAX_OBSERVED_LEASE_MS`].
+//! A claim whose payload does not decode (corruption or a forged object; a
+//! claim at a newer or zero `format_version` is version-protected instead,
+//! below) declares no lease this build can read, so it is judged by
+//! [`ravel_fleet::claim::MAX_OBSERVED_LEASE_MS`].
 //! Until its age by the store's `last_modified` exceeds that ceiling plus this
 //! contender's jitter, the bucket is deferred with
 //! [`ClaimSkipReason::UnreadableClaim`]. Past it, [`ClaimGuard::acquire`]
@@ -87,8 +88,10 @@
 //! [`ClaimSkipReason::VersionProtectedClaim`] instead of
 //! [`ClaimSkipReason::UnreadableClaim`]. The bucket stays held until an
 //! operator deletes the claim object by hand or a build that knows the
-//! version restarts and reclaims it; this process logs the hazard once per
-//! claim at `warn`, not on every tick.
+//! version reclaims it; the skip's recheck point is one lease plus jitter
+//! away, as for an unreadable claim, so a running process notices a hand
+//! delete without a restart. This process logs the hazard once per claim at
+//! `warn`, not on every tick.
 //!
 //! # The claim fences compaction against the erasure rewrite
 //!
@@ -253,8 +256,10 @@ pub struct ClaimSkip {
     /// The holding process, when the claim payload was readable.
     pub holder_process_id: Option<Uuid>,
     /// `last_modified + lease`, from the store's own timestamp. `0` when there
-    /// was no observation to date (a vanished claim). [`i64::MAX`], as are
-    /// both points below, for [`ClaimSkipReason::VersionProtectedClaim`].
+    /// was no observation to date (a vanished claim). [`i64::MAX`], as is the
+    /// reschedule point below, for [`ClaimSkipReason::VersionProtectedClaim`];
+    /// its recheck point is one lease plus jitter from now, so a claim removed
+    /// by hand releases the bucket without a restart.
     pub expiry_unix_ms: i64,
     /// The earliest this bucket should be retried: one millisecond past the
     /// holder's expiry (past the observation instant for a vanished claim).
@@ -599,16 +604,20 @@ impl ClaimGuard {
                 ClaimSkipReason::StealLost => now_ms.saturating_add(self.lease_ms()),
                 _ => observed.expiry_unix_ms.saturating_add(1),
             };
-            // An unreadable claim is looked at again about once per lease, so
-            // a claim deleted by hand releases the bucket long before the
-            // ceiling-based steal threshold above.
+            // An unreadable or version-protected claim is looked at again about
+            // once per lease, so a claim deleted by hand releases the bucket
+            // long before the ceiling-based steal threshold above (for a
+            // version-protected claim, which is never stolen, the recheck is
+            // the only way the bucket is released without a restart).
             let recheck_after_unix_ms = match reason {
-                ClaimSkipReason::UnreadableClaim => reschedule_after_unix_ms.min(
-                    now_ms
-                        .saturating_add(self.lease_ms())
-                        .saturating_add(self.jitter_ms())
-                        .saturating_add(1),
-                ),
+                ClaimSkipReason::UnreadableClaim | ClaimSkipReason::VersionProtectedClaim => {
+                    reschedule_after_unix_ms.min(
+                        now_ms
+                            .saturating_add(self.lease_ms())
+                            .saturating_add(self.jitter_ms())
+                            .saturating_add(1),
+                    )
+                }
                 _ => reschedule_after_unix_ms,
             };
             Acquire::Skipped(ClaimSkip {
@@ -1751,9 +1760,10 @@ mod tests {
     /// A claim at a future `format_version` is version-protected (ADR-4233
     /// decision 4, H8): the guard reports
     /// [`ClaimSkipReason::VersionProtectedClaim`], not
-    /// [`ClaimSkipReason::UnreadableClaim`], with both the reschedule and
-    /// recheck points pinned at [`i64::MAX`], and it is never stolen however
-    /// far the clock runs past the ordinary ceiling.
+    /// [`ClaimSkipReason::UnreadableClaim`], with the reschedule point pinned
+    /// at [`i64::MAX`] and the recheck point one lease plus jitter from now
+    /// (so a claim deleted by hand is noticed without a restart), and it is
+    /// never stolen however far the clock runs past the ordinary ceiling.
     ///
     /// Shown failing against a guard that folds every unreadable payload into
     /// one reason (the reason reads `UnreadableClaim`) and against one that
@@ -1805,7 +1815,12 @@ mod tests {
         assert_eq!(skip.reason.name(), "version_protected_claim");
         assert_eq!(skip.expiry_unix_ms, i64::MAX);
         assert_eq!(skip.reschedule_after_unix_ms, i64::MAX);
-        assert_eq!(skip.recheck_after_unix_ms, i64::MAX);
+        assert_eq!(
+            skip.recheck_after_unix_ms,
+            written_ms + 1_000 + lease_ms + jitter + 1,
+            "a version-protected claim is rechecked once per lease, so a hand \
+             delete releases the bucket without a restart"
+        );
 
         // Exactly the ordinary ceiling plus jitter, and the configured lease
         // past it besides: still never stolen.
