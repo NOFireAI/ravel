@@ -33,6 +33,10 @@
 #     terminal state, controller::observe_qualify_job), delete (recreate it with
 #     foreground propagation when the qualified inputs change; its pod template
 #     is immutable). Not watched by an informer, so no list/watch.
+#   - HorizontalPodAutoscalers (autoscaling): create/patch (apply) and delete,
+#     for the per-tier HPA rendered under spec.<tier>.autoscaling mode Managed
+#     (ADR-4314 decision 4). get/list/watch are granted ahead of the HPA status
+#     reporting (ADR-4314 decision 5); the reconcile loop does not read HPAs yet.
 #   - RavelCluster: list/watch only (the primary `Controller` informer; the
 #     reconcile object comes from the informer cache, never a `.get()`, and the
 #     spec is never patched). Its status subresource: patch only (patch_status
@@ -151,6 +155,11 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["create", "patch", "get", "delete"]
+  # apply and sweep; get/list/watch for the HPA status reporting
+  # (ADR-4314 decision 5).
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
   # non-resource: reads the apiserver's /version once at startup to detect
   # whether the cluster is below the Kubernetes floor the rendered preStop
   # SleepAction needs (issue #1714, docs/guides/kubernetes.md "Status").

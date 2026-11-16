@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Secret, Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::{Ingress, NetworkPolicy};
@@ -22,7 +23,7 @@ use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::apimachinery::pkg::version::Info;
-use kube::api::{DeleteParams, Patch, PatchParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams};
 use kube::core::DynamicObject;
 use kube::{Api, Client, Resource, ResourceExt};
 use kube_runtime::controller::{Action, Controller};
@@ -36,6 +37,10 @@ use serde::de::DeserializeOwned;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
+use crate::autoscaling::{
+    AutoscalingState, HANDOVER_FIELD_MANAGER, HpaAtName, HpaListing, LiveTier, PlanError, Replicas,
+    TIERS, desired_hpa, handover_patch, hpa_name, needs_live, plan_tier, withheld_message,
+};
 use crate::health::{self, HealthState};
 use crate::metrics::{ReconcileMetrics, ReconcileResult};
 
@@ -196,6 +201,34 @@ pub enum Error {
     /// the controller starts.
     #[error(transparent)]
     HealthListenerBind(#[from] health::BindError),
+
+    /// A tier's autoscaling handover found the operator owning `spec.replicas`
+    /// on a live Deployment that carries no count, so there is nothing to hand
+    /// to the scaler (ADR-4314 decision 2 step 1). The operator always applies
+    /// the field, so this is a corrupt live object; the tier fails rather than
+    /// hand over an invented count and drop the tier to one replica. Surfaced
+    /// as `Degraded` with reason `AutoscalingHandoverReplicasMissing`.
+    #[error("tier {tier} live Deployment owns spec.replicas but carries no count to hand over")]
+    AutoscalingHandoverReplicasMissing {
+        /// The tier whose live Deployment is missing the count.
+        tier: &'static str,
+    },
+
+    /// The pass could not list the namespace's HorizontalPodAutoscalers, and
+    /// the tier's plan renders or deletes its HPA. Without the list the
+    /// operator cannot tell its own HPA from a user's at the same name, so
+    /// the tier fails before any write for it, keeping its `autoscaledTiers`
+    /// entry. Surfaced as `Degraded` with reason `AutoscalingHpaListFailed`.
+    #[error(
+        "tier {tier} renders or deletes its HorizontalPodAutoscaler, and listing \
+         HorizontalPodAutoscalers failed: {message}"
+    )]
+    AutoscalingHpaListFailed {
+        /// The tier that was not applied.
+        tier: &'static str,
+        /// The list error.
+        message: String,
+    },
 }
 
 /// Shared reconcile context.
@@ -1658,6 +1691,9 @@ async fn reconcile_timed(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Ac
     // instead of reconstructing only the True case (finding 1). A pass that fails
     // before the gate builds its condition leaves this None.
     let mut store_qualified_condition: Option<Condition> = None;
+    // The autoscaling bookkeeping as far as this pass has taken it, so the
+    // degraded path below keeps a handover or an adoption already applied.
+    let mut autoscaling = AutoscalingState::from_status(obj.status.as_ref());
     match reconcile_inner(
         &obj,
         &ctx,
@@ -1666,6 +1702,7 @@ async fn reconcile_timed(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Ac
         extra_conditions.clone(),
         &mut proceed_hash,
         &mut store_qualified_condition,
+        &mut autoscaling,
     )
     .await
     {
@@ -1687,8 +1724,14 @@ async fn reconcile_timed(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Ac
             // pass's proof and re-run qualification once the Job's TTL collected
             // it; using it when the pass never qualified is correct.
             let qualification_passed = proceed_hash.is_some();
-            let degraded_conditions =
+            let mut degraded_conditions =
                 degraded_extra_conditions(extra_conditions, store_qualified_condition);
+            apply_pass_autoscaling_withheld(
+                &mut degraded_conditions,
+                &obj.spec,
+                &autoscaling,
+                obj.metadata.generation,
+            );
             let store_qualified_hash = degraded_store_qualified_hash(
                 proceed_hash,
                 obj.status
@@ -1736,6 +1779,7 @@ async fn reconcile_timed(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Ac
                     // applied; a missed set only orphans them.
                     pod_identity_service_accounts: pod_identity_service_accounts_recorded(&obj)
                         .then_some(true),
+                    autoscaling,
                 },
                 degraded_conditions,
                 obj.status
@@ -1755,6 +1799,7 @@ async fn reconcile_timed(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Ac
 /// The reconcile body proper. Every fallible step here runs before the
 /// success-path [`write_status`]; a failure returns `Err` to [`reconcile`],
 /// which records a `Degraded` status first.
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_inner(
     obj: &RavelCluster,
     ctx: &Context,
@@ -1763,6 +1808,7 @@ async fn reconcile_inner(
     mut extra_conditions: Vec<Condition>,
     proceed_hash: &mut Option<String>,
     store_qualified_condition: &mut Option<Condition>,
+    autoscaling: &mut AutoscalingState,
 ) -> Result<Action, Error> {
     // Refuse a plaintext non-loopback `spec.storage.s3.endpoint` that
     // `allowHttp` does not accept before this pass creates ANYTHING (issue
@@ -1978,6 +2024,7 @@ async fn reconcile_inner(
                         pod_identity_service_accounts_recorded(obj),
                         false,
                     ),
+                    autoscaling: autoscaling.clone(),
                 },
                 extra_conditions,
                 prior.map(|s| s.conditions.as_slice()).unwrap_or_default(),
@@ -2306,9 +2353,53 @@ async fn reconcile_inner(
 
     // Maintain disabled: converge its Deployment away. A withheld maintain
     // tier (no key Secret) is not disabled: its live Deployment is left alone.
+    let hpas: Api<HorizontalPodAutoscaler> = Api::namespaced(client.clone(), namespace);
     if tiers.maintain_disabled {
         delete_if_present(&deployments, &maintain_name).await?;
+        // A Deployment created again later starts from its declared replicas,
+        // so nothing autoscaled carries over. The maintain HPA, if the operator
+        // rendered one, is removed by the sweep below with every other HPA the
+        // operator owns but no longer renders.
+        autoscaling.set(DeploymentTier::Maintain, None, None);
     }
+
+    // Every HPA in the namespace, read once, so each HPA write below acts on
+    // ownership (ADR-4314 amendment 2026-11-16) rather than the fixed
+    // `<instance>-<tier>` name a user's `kubectl autoscale` also writes.
+    //
+    // A failed list fails each tier whose plan renders or deletes its HPA
+    // (`apply_tier`), before any write for it; the other tiers and the orphan
+    // sweep below do not need it.
+    let hpa_listing: Result<HpaListing, String> = match hpas.list(&ListParams::default()).await {
+        Ok(list) => Ok(HpaListing::new(
+            list.iter().map(|hpa| &hpa.metadata),
+            instance,
+            obj.metadata.uid.as_deref(),
+        )),
+        Err(err) => {
+            warn!(%err, "failed to list HorizontalPodAutoscalers");
+            Err(err.to_string())
+        }
+    };
+    // A `Managed` tier whose HPA name an HPA this RavelCluster does not own
+    // holds is withheld (`HpaNameTaken`): rendering its HPA would take that
+    // one over.
+    autoscaling.set_hpa_name_taken(match &hpa_listing {
+        Ok(listing) => TIERS
+            .into_iter()
+            .filter(|&tier| listing.at(&hpa_name(instance, tier)) == HpaAtName::Foreign)
+            .collect(),
+        Err(_) => Vec::new(),
+    });
+    // The HPAs the operator renders this pass (Managed, active tiers),
+    // independent of whether a bootstrap hold skips applying a tier: a held
+    // Managed tier is still desired and must not be swept. A disabled maintain
+    // tier desires none, so its HPA is swept.
+    let desired_hpas: BTreeSet<String> = TIERS
+        .into_iter()
+        .filter(|&tier| desired_hpa(&obj.spec, instance, tier).is_some())
+        .map(|tier| hpa_name(instance, tier))
+        .collect();
     // The fragment-port NetworkPolicy (ADR-1689 decision 4) converges around
     // the Deployment applies: see `converge_query_network_policy` for the order.
     let network_policies: Api<NetworkPolicy> = Api::namespaced(client.clone(), namespace);
@@ -2340,6 +2431,18 @@ async fn reconcile_inner(
         ),
     };
     let network_policies = &network_policies;
+    let clusters: Api<RavelCluster> = Api::namespaced(client.clone(), namespace);
+    let tier_apply = TierApply {
+        spec: &obj.spec,
+        deployments: &deployments,
+        hpas: &hpas,
+        clusters: &clusters,
+        namespace,
+        instance,
+        owner: owner.as_ref(),
+        live_query: live_query.as_ref(),
+        hpa_listing: &hpa_listing,
+    };
     converge_query_network_policy(
         query_policy,
         held_policy,
@@ -2351,14 +2454,28 @@ async fn reconcile_inner(
         |name| async move { delete_if_present(network_policies, &name).await },
         async {
             for tier in plan.apply_sequence(maintain_ready_before, request_serving_exists) {
-                tiers
-                    .apply_tier(&deployments, namespace, instance, owner.as_ref(), tier)
-                    .await?;
+                tiers.apply_tier(&tier_apply, autoscaling, tier).await?;
             }
             Ok(tiers.applied(DeploymentTier::Query).cloned())
         },
     )
     .await?;
+
+    // Sweep the HPAs the operator owns but no longer renders: a tier switched
+    // to External or turned off (the per-tier apply already deleted those it
+    // reached, before its forced apply), the maintain HPA when maintain is
+    // disabled, and the orphan a failed status write leaves behind -- a Managed
+    // HPA applied on a pass whose `autoscaledTiers` write failed, so no status
+    // entry points the per-tier path at it, then the block is removed. Only an
+    // HPA this RavelCluster owns is a candidate, never one picked by name alone.
+    // Skipped when the list failed; the next pass whose list succeeds sweeps.
+    if let Ok(listing) = &hpa_listing {
+        for name in listing.owned() {
+            if !desired_hpas.contains(name) && !tiers.deleted_hpas.contains(name) {
+                delete_if_present(&hpas, name).await?;
+            }
+        }
+    }
 
     // Report the readiness the maintain apply just observed, but decide the
     // `Available` condition from the count the ORDERING used: that is the one
@@ -2457,6 +2574,13 @@ async fn reconcile_inner(
         extra_conditions.push(c);
     }
 
+    apply_pass_autoscaling_withheld(
+        &mut extra_conditions,
+        &obj.spec,
+        autoscaling,
+        obj.metadata.generation,
+    );
+
     let gc_bootstrap_waiting_since = wait_status.as_ref().map(|w| w.waiting_since.clone());
 
     write_status(
@@ -2483,6 +2607,7 @@ async fn reconcile_inner(
                 pod_identity_service_accounts_recorded(obj),
                 true,
             ),
+            autoscaling: autoscaling.clone(),
         },
         extra_conditions,
         obj.status
@@ -2580,6 +2705,21 @@ fn plan_render(
     })
 }
 
+/// What [`TierDeployments::apply_tier`] needs from the pass.
+struct TierApply<'a> {
+    spec: &'a RavelClusterSpec,
+    deployments: &'a Api<Deployment>,
+    hpas: &'a Api<HorizontalPodAutoscaler>,
+    clusters: &'a Api<RavelCluster>,
+    namespace: &'a str,
+    instance: &'a str,
+    owner: Option<&'a Vec<OwnerReference>>,
+    /// The live query Deployment, already read this pass (`None` when absent).
+    live_query: Option<&'a Deployment>,
+    /// The namespace's HPAs as this pass listed them, or the list error.
+    hpa_listing: &'a Result<HpaListing, String>,
+}
+
 /// The rendered Deployment for each tier and the applied result for each tier
 /// that this pass got to, so [`reconcile_inner`] applies them strictly in
 /// [`crate::reconcile::GcBootstrapPlan::apply_sequence`]'s order without three
@@ -2602,6 +2742,10 @@ struct TierDeployments {
     query_withheld: bool,
     /// The live object each applied tier came back as.
     applied: BTreeMap<&'static str, Deployment>,
+    /// HPA names the per-tier apply deleted this pass (turn-off and external
+    /// switches, before their forced apply). The post-loop sweep skips
+    /// these so it does not issue a second delete.
+    deleted_hpas: BTreeSet<String>,
 }
 
 impl TierDeployments {
@@ -2637,18 +2781,23 @@ impl TierDeployments {
             ),
             maintain: maintain.into_deployment(),
             applied: BTreeMap::new(),
+            deleted_hpas: BTreeSet::new(),
         }
     }
 
-    /// Apply one tier's Deployment, stamping namespace and owner references.
-    /// A tier the render withheld (or one already applied this pass) is a
-    /// no-op.
+    /// Apply one tier's Deployment, stamping namespace and owner references,
+    /// with the replica handling [`plan_tier`] decides (ADR-4314): the adoption
+    /// record first when the tier's autoscaling was just turned off, then the
+    /// delete of the operator's own HPA for a turn-off or External switch, then
+    /// either the handover patch before a replica-less apply or the forced
+    /// count, then the `Managed` HPA. `autoscaling` is updated as each step
+    /// lands. A tier whose plan renders or deletes its HPA fails before any
+    /// write when the pass's HPA list failed. A tier the render withheld (or
+    /// one already applied this pass) is a no-op.
     async fn apply_tier(
         &mut self,
-        deployments: &Api<Deployment>,
-        namespace: &str,
-        instance: &str,
-        owner: Option<&Vec<OwnerReference>>,
+        ctx: &TierApply<'_>,
+        autoscaling: &mut AutoscalingState,
         tier: DeploymentTier,
     ) -> Result<(), Error> {
         let rendered = match tier {
@@ -2659,11 +2808,111 @@ impl TierDeployments {
         let Some(mut deployment) = rendered else {
             return Ok(());
         };
-        deployment.metadata.namespace = Some(namespace.to_string());
-        deployment.metadata.owner_references = owner.cloned();
-        let name = child(instance, tier.component());
-        let applied = apply(deployments, &name, &deployment).await?;
+        deployment.metadata.namespace = Some(ctx.namespace.to_string());
+        deployment.metadata.owner_references = ctx.owner.cloned();
+        let name = child(ctx.instance, tier.component());
+
+        let entry = autoscaling.entry(tier).cloned();
+        let adoption = autoscaling.adoption(tier).cloned();
+        let live = if !needs_live(ctx.spec, tier, entry.as_ref()) {
+            None
+        } else if tier == DeploymentTier::Query {
+            ctx.live_query.map(LiveTier::of)
+        } else {
+            live_deployment(ctx.deployments, &name)
+                .await?
+                .as_ref()
+                .map(LiveTier::of)
+        };
+        let plan = plan_tier(
+            ctx.spec,
+            tier,
+            entry.as_ref(),
+            adoption.as_ref(),
+            live,
+            autoscaling.hpa_name_taken(tier),
+        )
+        .map_err(|PlanError::HandoverReplicasMissing| {
+            Error::AutoscalingHandoverReplicasMissing {
+                tier: tier.component(),
+            }
+        })?;
+
+        // Every HPA write below is decided from the listing. Without it the
+        // tier fails here, before its first write, and keeps its
+        // `autoscaledTiers` entry so a later pass still turns it off.
+        let hpa = hpa_name(ctx.instance, tier);
+        let hpa_at_name = if plan.render_hpa || plan.delete_hpa {
+            match ctx.hpa_listing {
+                Ok(listing) => listing.at(&hpa),
+                Err(message) => {
+                    return Err(Error::AutoscalingHpaListFailed {
+                        tier: tier.component(),
+                        message: message.clone(),
+                    });
+                }
+            }
+        } else {
+            HpaAtName::Absent
+        };
+
+        if plan.record_first {
+            let mut recorded = autoscaling.clone();
+            recorded.set(tier, entry, plan.adoption.clone());
+            ctx.clusters
+                .patch_status(
+                    ctx.instance,
+                    &PatchParams::default(),
+                    &Patch::Merge(&recorded.adoptions_patch()),
+                )
+                .await?;
+            *autoscaling = recorded;
+        }
+
+        // Delete the tier's HPA before the Deployment apply, so a turn-off
+        // forces the adopted count without the HPA rescaling between the
+        // adoption read and the apply (ADR-4314 decision 2 step 2). Only an HPA
+        // this RavelCluster owns is deleted. If the delete fails the tier fails
+        // here, before the apply, with its `autoscaledTiers` entry kept, so the
+        // next pass takes the turn-off again: it reads the live count anew and
+        // records that, which is still the scaler's count because the HPA
+        // survived.
+        if plan.delete_hpa && hpa_at_name == HpaAtName::Owned {
+            delete_if_present(ctx.hpas, &hpa).await?;
+            self.deleted_hpas.insert(hpa.clone());
+        }
+
+        let spec = deployment.spec.get_or_insert_with(Default::default);
+        match plan.replicas {
+            Replicas::Fixed(replicas) => spec.replicas = Some(replicas),
+            Replicas::Released { handover } => {
+                if let Some(replicas) = handover {
+                    let patch = handover_patch(&name, ctx.namespace, replicas);
+                    ctx.deployments
+                        .patch(
+                            &name,
+                            &PatchParams::apply(HANDOVER_FIELD_MANAGER),
+                            &Patch::Apply(&patch),
+                        )
+                        .await?;
+                }
+                spec.replicas = None;
+            }
+        }
+        let applied = apply(ctx.deployments, &name, &deployment).await?;
         self.applied.insert(tier.component(), applied);
+
+        // `plan_tier` withholds a tier whose HPA name is `Foreign`, so this
+        // applies only over an absent HPA or one this RavelCluster owns.
+        if plan.render_hpa
+            && hpa_at_name != HpaAtName::Foreign
+            && let Some(mut desired) = desired_hpa(ctx.spec, ctx.instance, tier)
+        {
+            desired.metadata.namespace = Some(ctx.namespace.to_string());
+            desired.metadata.owner_references = ctx.owner.cloned();
+            apply(ctx.hpas, &hpa, &desired).await?;
+        }
+        autoscaling.set(tier, plan.autoscaled, plan.adoption);
         Ok(())
     }
 
@@ -2789,6 +3038,13 @@ pub(crate) const CONDITION_TYPE_INGEST_AFFINITY_BACKEND_DEPRECATED: &str =
 /// main HTTP port instead of the dedicated health listener (issue #3112).
 pub(crate) const CONDITION_TYPE_HEALTH_PROBE_ON_MAIN_HTTP_PORT: &str = "HealthProbeOnMainHttpPort";
 
+/// `status.conditions[].type` value naming every tier whose `autoscaling`
+/// block is withheld, with the reason (ADR-4314 decision 3).
+pub(crate) const CONDITION_TYPE_AUTOSCALING_WITHHELD: &str = "AutoscalingWithheld";
+
+/// The `AutoscalingWithheld=True` reason.
+pub(crate) const AUTOSCALING_WITHHELD_REASON: &str = "AutoscalingPrerequisiteMissing";
+
 /// `status.conditions[].type` value saying whether the container's
 /// protection (blob versioning paired with a lifecycle rule that deletes
 /// previous versions; soft delete with a bounded retention; an immutability
@@ -2821,6 +3077,7 @@ pub(crate) const CONDITION_TYPES: &[&str] = &[
     CONDITION_TYPE_KUBERNETES_VERSION_UNSUPPORTED,
     CONDITION_TYPE_INGEST_AFFINITY_BACKEND_DEPRECATED,
     CONDITION_TYPE_HEALTH_PROBE_ON_MAIN_HTTP_PORT,
+    CONDITION_TYPE_AUTOSCALING_WITHHELD,
     CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED,
 ];
 
@@ -2895,6 +3152,10 @@ fn preserve_transition_times(
 /// opted out) still probes the main HTTP port instead of the dedicated
 /// health listener. See [`health_probe_on_main_http_port_condition`].
 ///
+/// `AutoscalingWithheld` (ADR-4314 decision 3) is set while any tier's
+/// `autoscaling` block is withheld, naming each such tier and its reason.
+/// See [`withheld_message`].
+///
 /// `BucketProtectionVerified=False` with reason `NotImplementedForAzure` is
 /// set on every `storage.azure` cluster: the operator renders
 /// `--require-bucket-protection` for S3 (ADR-0072) and has no Azure probes,
@@ -2925,6 +3186,16 @@ fn spec_conditions(spec: &RavelClusterSpec, observed_generation: Option<i64>) ->
 
     if let Some(cond) = health_probe_on_main_http_port_condition(spec, observed_generation) {
         conditions.push(cond);
+    }
+
+    if let Some(message) = withheld_message(spec, &[]) {
+        conditions.push(condition(
+            CONDITION_TYPE_AUTOSCALING_WITHHELD,
+            true,
+            observed_generation,
+            AUTOSCALING_WITHHELD_REASON,
+            &message,
+        ));
     }
 
     if spec.storage.azure.is_some() {
@@ -3057,6 +3328,36 @@ fn kubernetes_version_condition(
     ))
 }
 
+/// Rewrites the `AutoscalingWithheld` entry of `conditions` from what the pass
+/// found: [`spec_conditions`] sees only the spec, and a Managed tier whose HPA
+/// name is taken by an HPA this RavelCluster does not own is withheld too. An
+/// existing entry keeps its position.
+fn apply_pass_autoscaling_withheld(
+    conditions: &mut Vec<Condition>,
+    spec: &RavelClusterSpec,
+    autoscaling: &AutoscalingState,
+    observed_generation: Option<i64>,
+) {
+    let fresh = autoscaling.withheld_message(spec).map(|message| {
+        condition(
+            CONDITION_TYPE_AUTOSCALING_WITHHELD,
+            true,
+            observed_generation,
+            AUTOSCALING_WITHHELD_REASON,
+            &message,
+        )
+    });
+    let existing = conditions
+        .iter_mut()
+        .find(|c| c.r#type == CONDITION_TYPE_AUTOSCALING_WITHHELD);
+    match (fresh, existing) {
+        (Some(fresh), Some(slot)) => *slot = fresh,
+        (Some(fresh), None) => conditions.push(fresh),
+        (None, Some(_)) => conditions.retain(|c| c.r#type != CONDITION_TYPE_AUTOSCALING_WITHHELD),
+        (None, None) => {}
+    }
+}
+
 /// Every condition [`reconcile`] owns beyond `Available`/`Degraded` (issue
 /// #1714): the spec-derived conditions plus, when the operator was able to
 /// read the cluster's Kubernetes version at startup, the
@@ -3104,6 +3405,8 @@ struct PersistedStatus {
     /// `status.podIdentityServiceAccounts`: `Some(true)` while the operator
     /// may have podIdentity ServiceAccounts to sweep, `None` otherwise.
     pod_identity_service_accounts: Option<bool>,
+    /// `status.autoscaledTiers` and `status.replicaAdoptions` (ADR-4314).
+    autoscaling: AutoscalingState,
 }
 
 /// Whether `status.podIdentityServiceAccounts` records that the operator
@@ -3172,6 +3475,8 @@ fn build_status(
         qualify_next_retry_time: persisted.qualify_next_retry_time,
         qualify_retry_hash: persisted.qualify_retry_hash,
         pod_identity_service_accounts: persisted.pod_identity_service_accounts,
+        autoscaled_tiers: persisted.autoscaling.autoscaled_tiers(),
+        replica_adoptions: persisted.autoscaling.replica_adoptions(),
         conditions,
     }
 }
@@ -3217,6 +3522,8 @@ fn build_degraded_status(
         qualify_next_retry_time: persisted.qualify_next_retry_time,
         qualify_retry_hash: persisted.qualify_retry_hash,
         pod_identity_service_accounts: persisted.pod_identity_service_accounts,
+        autoscaled_tiers: persisted.autoscaling.autoscaled_tiers(),
+        replica_adoptions: persisted.autoscaling.replica_adoptions(),
         conditions,
     }
 }
@@ -3397,6 +3704,13 @@ fn degraded_reason(err: &Error) -> (String, String) {
             "PodIdentityCredentialsUnavailable".to_string(),
             err.to_string(),
         ),
+        Error::AutoscalingHandoverReplicasMissing { .. } => (
+            "AutoscalingHandoverReplicasMissing".to_string(),
+            err.to_string(),
+        ),
+        Error::AutoscalingHpaListFailed { .. } => {
+            ("AutoscalingHpaListFailed".to_string(), err.to_string())
+        }
         other => ("ReconcileError".to_string(), other.to_string()),
     }
 }
@@ -3864,8 +4178,9 @@ pub async fn run_on(
 mod tests {
     use super::*;
     use crate::crd::{
-        AzureSpec, DistributedQuerySpec, GatewaySpec, IngestAffinitySpec, MaintainSpec, ProbesSpec,
-        QuerySpec, S3Spec, StorageSpec,
+        AutoscalingMode, AutoscalingSpec, AzureSpec, DistributedQuerySpec, GatewaySpec,
+        IngestAffinitySpec, MaintainSpec, ProbesSpec, QuerySpec, ResourceRequirementsSpec, S3Spec,
+        StorageSpec,
     };
     use kube::Config;
 
@@ -4451,6 +4766,24 @@ mod tests {
             vec![CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED]
         );
         produced.push(CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED);
+
+        // AutoscalingWithheld: spec_conditions on a Managed gateway whose
+        // pods carry no CPU request.
+        let mut withheld_spec = spec_with_affinity(None);
+        withheld_spec.gateway.resources = Some(ResourceRequirementsSpec::default());
+        withheld_spec.gateway.autoscaling = Some(AutoscalingSpec {
+            mode: AutoscalingMode::Managed,
+            min_replicas: 2,
+            max_replicas: 4,
+            target_cpu_utilization_percentage: Some(70),
+            scale_down_stabilization_seconds: None,
+        });
+        let withheld_extra = spec_conditions(&withheld_spec, Some(1));
+        assert_eq!(
+            condition_types(&withheld_extra),
+            vec![CONDITION_TYPE_AUTOSCALING_WITHHELD]
+        );
+        produced.push(CONDITION_TYPE_AUTOSCALING_WITHHELD);
 
         let mut produced_sorted = produced.clone();
         produced_sorted.sort_unstable();

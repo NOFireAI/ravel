@@ -252,3 +252,26 @@ before any scaler should remove its pods; that is a separate issue.
   proves the outcome: on a real apiserver, enabling autoscaling on a
   three-replica gateway leaves three replicas, and an external `kubectl
   scale` survives a reconcile.
+
+## Amendment (2026-11-16): refuse to take over a user HPA
+
+<!-- amendment-applies: none reason="adds a third refusal and states how HPA ownership is decided; no earlier wording is retired" -->
+
+A `Managed` HPA is named after the tier Deployment, so a user's own HPA at
+that name (what `kubectl autoscale deployment <instance>-<tier>` creates)
+would be force-applied over and taken over by the operator. Section 3 gains
+a third refusal: in `Managed` mode, when an HPA the operator does not own
+already exists at `<instance>-<tier>`, the tier is withheld like the other
+two, with forced replicas, no handover and no HPA, and the
+`AutoscalingWithheld` condition names it. The operator sends that HPA no
+patch and no delete.
+
+How ownership is decided: an HPA is the operator's when it carries the
+labels `app.kubernetes.io/managed-by=ravel-operator` and
+`app.kubernetes.io/instance=<instance>`, and an ownerReference whose uid is
+this RavelCluster's uid. Labels alone are not enough, since a user can copy
+them. The operator reads the namespace's HPAs once per pass and decides the
+refusal, the turn-off delete of section 2 and the orphan sweep from that
+read. When the read fails, nothing is withheld on its account: every tier
+whose pass might apply or delete an HPA fails for that pass before any
+write, keeping its `autoscaledTiers` entry, and the orphan sweep is skipped.
