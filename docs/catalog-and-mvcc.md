@@ -2193,7 +2193,9 @@ A run that stops or exhausts the CAS retries on one batch has therefore
 published every earlier batch (the error says how many parts, and the
 CLI prints the report so far, whose ranged GETs, section bytes and leaf
 PUTs include those the stopped batch issued, a build stopped by a failed
-leaf PUT included: tests
+leaf PUT included; a batch stopped before its publish step is listed last
+in the attempts, with its part GETs, ranged GETs and leaf PUTs and no HEAD
+CAS try, and is not counted in the attempt count: tests
 `a_failed_leaf_put_is_counted_as_issued_in_the_interrupted_report` and
 `a_failed_build_reports_its_gets_bytes_and_leaf_puts`), loses at most the ranged GETs of that
 batch's entries in every pass, and leaves that batch's leaves unreferenced for this
