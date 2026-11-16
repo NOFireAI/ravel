@@ -41,6 +41,7 @@ sys/pq-probe/<random>                                                   Ravel-bu
 sys/tenancy                                                             tenant-hash scheme marker (write-once, additive; ADR-0050 §3)
 sys/ipcrypt/policy                                                      IPCrypt policy fingerprint marker (CreateIfAbsent, then CAS whole-record replace on set-policy, additive; ADR-2993 §9)
 sys/auth                                                                deployment-wide keyed-token-hash -> tenant map (CAS whole-record replace, additive; ADR-0066 §6)
+sys/compat                                                              store-wide format activation record (CreateIfAbsent, then CAS whole-record replace, monotone, MACed, format_version 1; ADR-4233 decision 3)
 sys/t/<tenant_hash>                                                     per-tenant recovery manifest (keyed buckets only, write-once; ADR-0050 §3)
 admission/query/<process_id>.snapshot                                   fleet-global query concurrency snapshot (root-level, per-process, Overwrite; ADR-0061 §2)
 sys/maintain/workers/<process_id>                                       maintain-worker liveness heartbeat (root-level, per-process, Overwrite, MACed; ADR-0065 §1, ADR-3130)
@@ -283,6 +284,40 @@ listing consistency under a fresh `run-id` each run; these objects are
 transient probe fixtures, not durable state, and carry no lifecycle
 guarantee beyond the run that created them.
 
+`sys/compat` (ADR-4233 decision 3, proto/ravel/sys.proto `CompatRecord`) is
+the store-wide format activation record, outside any tenant's space. It
+holds a baseline release, one store-wide `compat_epoch`, the maximum publish
+lifetime, the adopted versions, and one entry per format family (`rseg`,
+`rlog`, `rspan`, the catalog families and the record families) carrying that
+family's `active_write_version`, the epoch and time it was activated, an
+optional census certificate, and its fence and late-write progress. It is
+created with `CreateIfAbsent` and then changed only by a `CasVersion`
+whole-record replace (`ravel_catalog::compat::create_compat`,
+`update_compat`), and every change is monotone: `compat_epoch`, each
+family's `active_write_version` and `activated_epoch`, and its certificate
+version never go down, and no family entry is removed; an update that would
+lower one is refused with `WouldLower`. `activate_family` raises one
+family's `active_write_version` by exactly one and `compat_epoch` by one,
+and refuses an absent record, a family without an entry, an equal or lower
+version, and a jump of more than one. The record carries a `mac` (field 8):
+a BLAKE3 keyed hash over its field values under a key derived from a
+deployment file key with the context `ravel compat record v1`; the first
+key signs and any configured key verifies, as for the maintain-worker
+heartbeat (ADR-3130). Readers accept `format_version` 1 only. A reader
+checks the version before the MAC, so a record from a newer writer is the
+typed `CompatRecordNewer` and never reads as absent, and an absent object is
+the only case that reads as no record. `CompatView` is a process's monotone
+view of the record: a refresh never lowers a version, epoch or certificate
+it has already seen, and a failed refresh leaves the view and the time of
+its last successful read unchanged. `CompatView::write_policy` refuses a
+write with `ViewStale` once the last successful read is 10 minutes old or
+there has been none (`COMPAT_VIEW_HORIZON`; the default refresh interval is
+60 s), with `CompatRecordMissing` when the record is absent but the target
+bucket is fenced or this process has already seen an epoch, and with
+`ActiveVersionNotWritable` when the family's active version, or the
+baseline for a family the record does not name, is not one the writer can
+produce. A refusal is retryable except `CompatRecordMissing`.
+
 `t/<tenant_hash>/<signal>/prov` (ADR-0050 §5) is the durable
 `shard_count` provisioning record: a per-(tenant, signal) object holding
 `tenant_hash`, `signal`, `shard_count`, a `format_version` floor,
@@ -298,9 +333,22 @@ among those commit records and every compaction and rewrite record, and
 `observed_shards` (the shard range scanned, never 0 on a written basis). A
 floor whose three basis fields are all zero has no basis; a raise carries
 every earlier entry through unchanged, so such a floor stays basis-less.
-Every writer stamps `format_version` 3; readers accept 1, 2 and 3, and the
-two CAS rewrite paths (`append_generation`, `raise_format_floor`) refuse a
-record above 3 rather than re-encode it without fields they do not model. The
+Readers accept `format_version` 1 through 4. Version 4 adds the compat fence
+(ADR-4233 decision 4): `compat_epoch` (field 8), the newest `sys/compat`
+epoch this (tenant, signal) has been fenced at, and `compat_fenced_unix_ns`
+(field 9), when a record written before the fence was first raised to it. A
+writer stamps 4 on a record that carries either field or was already stamped
+4, and 3 otherwise, so an unfenced bucket stays readable by a version-3
+reader and no rewrite un-fences a fenced one. The two CAS rewrite paths
+(`append_generation`, `raise_format_floor`) carry both fields through and
+refuse a record above 4 rather than re-encode it without fields they do not
+model. `ravel_catalog::raise_compat_fence` CAS-raises `compat_epoch`, never
+lowers it, and leaves a record already at or above the requested epoch
+untouched; only a raise from a record below version 4 sets
+`compat_fenced_unix_ns`, to the raise time, and a later raise keeps the
+stored value. A record created by `ravel_catalog::validate_or_adopt_fenced`
+with a compat epoch is born fenced: version 4, that epoch, and
+`compat_fenced_unix_ns` 0, because it holds no pre-fence data. The
 record is written with `CreateIfAbsent` at the tenant's first write for that signal
 (`ravel_catalog::validate_or_adopt`), so a racing loser re-reads and
 validates against the winner rather than erroring. It lives under the
