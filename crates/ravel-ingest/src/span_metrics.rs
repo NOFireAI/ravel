@@ -81,9 +81,10 @@ pub struct SpanIngestMetrics {
     /// ADR-2708 D3), where publishing could land spans in a sealed hour.
     abandoned_hour_bound: AtomicU64,
     /// Writes and flushes the `sys/compat` activation policy refused, by
-    /// reason (`ravel_compat_publish_refused_total{family,reason}`, ADR-4233):
-    /// at admission, at permit grant, before a PUT attempt, or at the bucket
-    /// fence. Nothing of a refused flush is stored.
+    /// reason (ADR-4233): at admission, at permit grant, before a PUT
+    /// attempt, or at the bucket fence. A refused flush stores no commit
+    /// record. Read through the snapshot's `compat_publish_refused` field,
+    /// which `ravel-server` does not yet render on `/metrics` (#4287).
     compat_publish_refused: CompatRefusalCounters,
     /// Flushes abandoned because the input could not be turned into a durable
     /// object at all: the RSPAN build, data-key derivation, or commit-record

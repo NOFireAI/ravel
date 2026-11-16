@@ -347,6 +347,10 @@ pub(crate) trait FlushScope<M>: Send + Sync {
     /// version `writing` for `tenant`, against the floor of the cached view
     /// (ADR-1746 decision 4). Counts a refusal or an overridden write.
     fn floor_check(&self, tenant: TenantHash, family: FormatFamily, writing: u32) -> FloorCheck;
+    /// The version a `family` flush opened now is checked against the floor
+    /// at: [`FormatFamily::writable_version_under`] the installed activation
+    /// policy. The version is chosen again at permit grant.
+    fn writing_version(&self, family: FormatFamily) -> u32;
     /// The version a flush of `tenant` granted its permit now publishes
     /// `family` at, or the activation policy's refusal (ADR-4233 decision 2).
     /// With no policy installed, the family's `CURRENT` version.
@@ -521,6 +525,10 @@ where
         }
     }
 
+    fn writing_version(&self, family: FormatFamily) -> u32 {
+        family.writable_version_under(self.compat.get().as_deref())
+    }
+
     fn compat_grant(
         &self,
         tenant: TenantHash,
@@ -559,6 +567,10 @@ impl<M> FlushScope<M> for AlwaysInScope {
 
     fn floor_check(&self, _tenant: TenantHash, _family: FormatFamily, _writing: u32) -> FloorCheck {
         FloorCheck::Write
+    }
+
+    fn writing_version(&self, family: FormatFamily) -> u32 {
+        family.writable_version()
     }
 
     fn compat_grant(
@@ -757,6 +769,10 @@ impl<M: Send + 'static> FlushScope<M> for ScriptedScope<M> {
 
     fn floor_check(&self, _tenant: TenantHash, _family: FormatFamily, _writing: u32) -> FloorCheck {
         FloorCheck::Write
+    }
+
+    fn writing_version(&self, family: FormatFamily) -> u32 {
+        family.writable_version()
     }
 
     fn compat_grant(
@@ -971,6 +987,13 @@ impl<H> GenerationSwitch<H> {
         policy
             .admit(family, self.cached_compat_epoch(tenant))
             .map_err(|refusal| CompatPublishRefusal::Policy { family, refusal })
+    }
+
+    /// The version a `family` write admitted now is checked against the
+    /// floor at: [`FormatFamily::writable_version_under`] the installed
+    /// activation policy, the writer's `CURRENT` with none.
+    pub(crate) fn writing_version(&self, family: FormatFamily) -> u32 {
+        family.writable_version_under(self.compat.get().as_deref())
     }
 
     /// The `compat_epoch` of `tenant`'s cached provisioning record, whatever

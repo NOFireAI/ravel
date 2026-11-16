@@ -23,7 +23,7 @@ use crate::budget::{
 };
 use crate::clock::Clock;
 use crate::compat::{CompatSlot, IngestCompatPolicy, PublishLifetimeAboveCompat};
-use crate::config::{IngestConfig, LOG_SEGMENT_FORMAT_VERSION};
+use crate::config::IngestConfig;
 use crate::deferral::DeferralCapFlag;
 use crate::format_floor::{FormatFamily, FormatFloorPolicy};
 use crate::generation::{
@@ -432,7 +432,7 @@ impl LogIngestRouter {
         self.switch.admit_floor(
             tenant,
             FormatFamily::Rlog,
-            u32::from(LOG_SEGMENT_FORMAT_VERSION),
+            self.switch.writing_version(FormatFamily::Rlog),
         )?;
         Ok(())
     }

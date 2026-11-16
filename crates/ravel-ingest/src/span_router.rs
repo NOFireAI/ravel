@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::budget::{BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit};
 use crate::clock::Clock;
 use crate::compat::{CompatSlot, IngestCompatPolicy, PublishLifetimeAboveCompat};
-use crate::config::{IngestConfig, SPAN_SEGMENT_FORMAT_VERSION};
+use crate::config::IngestConfig;
 use crate::deferral::DeferralCapFlag;
 use crate::format_floor::{FormatFamily, FormatFloorPolicy};
 use crate::generation::{
@@ -630,7 +630,7 @@ impl SpanIngestRouter {
         self.switch.admit_floor(
             tenant.hash(),
             FormatFamily::Rspan,
-            u32::from(SPAN_SEGMENT_FORMAT_VERSION),
+            self.switch.writing_version(FormatFamily::Rspan),
         )?;
         self.admit_compat(tenant.hash())?;
         let shard_count = set.len() as u32;
