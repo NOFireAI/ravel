@@ -74,7 +74,8 @@ use ravel_commit::erasure;
 use ravel_commit::keys;
 use ravel_commit::record;
 use ravel_object_store::{
-    GetRange, ObjectStoreBackend, PutOptions, StoreError, UploadChecksum, list_all,
+    GetRange, ObjectStoreBackend, PutOptions, StoreError, Unaddressable, UploadChecksum, list_all,
+    list_all_reporting,
 };
 use ravel_proto::commit::v1::{CommitRecord, CompactionRecord, RetentionTombstone, RewriteRecord};
 use ravel_segment::{TRAILER_LEN, TrailerClass, classify_trailer};
@@ -142,6 +143,29 @@ static HELD_BY_LEASE_BUCKETS: AtomicU64 = AtomicU64::new(0);
 /// physical sweep is otherwise due.
 pub fn held_by_lease_buckets_total() -> u64 {
     HELD_BY_LEASE_BUCKETS.load(Ordering::Relaxed)
+}
+
+/// Counter seam for `ravel_maintain_retention_unaddressable_held_buckets_total`
+/// (issue #4260): tombstoned buckets whose verifying LIST
+/// ([`bucket_is_empty_but_tombstone`]) found a key under the bucket's commit
+/// prefix or its `l1/` prefix that the store cannot address (ADR-2637). The
+/// listing skips such a key, so it cannot be deleted, and a bucket holding one
+/// is not empty: the sweep keeps the tombstone and revisits the bucket on a
+/// later pass instead of retiring it over a surviving object.
+///
+/// Process-wide and monotonic, incremented once per bucket per pass that the
+/// check held for this reason, so a held bucket raises it on every pass until
+/// the key is gone. This must not stay nonzero: every key operation in
+/// ravel-object-store refuses an unaddressable key, so one was written from
+/// outside Ravel. The remedy is to inspect the keys under the bucket's
+/// prefixes, which the pass's warning names, and remove or rename the foreign
+/// object out of band; the next pass then retires the bucket normally.
+static UNADDRESSABLE_HELD_BUCKETS: AtomicU64 = AtomicU64::new(0);
+
+/// Read [`UNADDRESSABLE_HELD_BUCKETS`]. Zero when no tombstoned bucket holds a
+/// key the store cannot address.
+pub fn unaddressable_held_buckets_total() -> u64 {
+    UNADDRESSABLE_HELD_BUCKETS.load(Ordering::Relaxed)
 }
 
 /// The outcome of one retention pass over a bucket.
@@ -1092,6 +1116,12 @@ async fn delete_all(
 /// silence about which shape the sweeper forgot to delete -- a rewrite record
 /// held this check false on every pass forever until the delete list above
 /// learned about it (issue #1321).
+///
+/// Both listings report the keys they skip because the store cannot address
+/// them, and any such key under either prefix answers "not empty": this check
+/// concludes from absence, so a key the listing could not see is residue, not
+/// nothing. Such a bucket is counted into
+/// [`unaddressable_held_buckets_total`] once per call.
 async fn bucket_is_empty_but_tombstone(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
@@ -1102,7 +1132,8 @@ async fn bucket_is_empty_but_tombstone(
         bucket.shard,
         bucket.ingest_hour_bucket,
     )?;
-    for meta in list_all(store, &commit_prefix).await? {
+    let commit_listing = list_all_reporting(store, &commit_prefix).await?;
+    for meta in &commit_listing.objects {
         match keys::partition_bucket_entry(&meta.key) {
             Ok(keys::BucketEntry::Tombstone(_)) => {}
             Ok(_) => return Ok(false),
@@ -1112,8 +1143,36 @@ async fn bucket_is_empty_but_tombstone(
             Err(e) => return Err(MaintainError::Key(e)),
         }
     }
+    if hold_unaddressable(bucket, &commit_prefix, &commit_listing.unaddressable) {
+        return Ok(false);
+    }
     let l1_prefix = l1_bucket_prefix(bucket);
-    Ok(list_all(store, &l1_prefix).await?.is_empty())
+    let l1_listing = list_all_reporting(store, &l1_prefix).await?;
+    if hold_unaddressable(bucket, &l1_prefix, &l1_listing.unaddressable) {
+        return Ok(false);
+    }
+    Ok(l1_listing.objects.is_empty())
+}
+
+/// True when the listing of `prefix` skipped an unaddressable key, after
+/// counting the bucket into [`UNADDRESSABLE_HELD_BUCKETS`] and warning with the
+/// first skipped key.
+fn hold_unaddressable(bucket: &Bucket, prefix: &str, unaddressable: &Unaddressable) -> bool {
+    if unaddressable.count == 0 {
+        return false;
+    }
+    UNADDRESSABLE_HELD_BUCKETS.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        tenant = %bucket.tenant_hash.to_hex(),
+        signal = ?bucket.signal,
+        shard = bucket.shard,
+        ingest_hour_bucket = bucket.ingest_hour_bucket,
+        prefix,
+        unaddressable_keys = unaddressable.count,
+        first_unaddressable_key = unaddressable.sample.first().map(|k| k.key.as_str()),
+        "retention sweep kept a tombstone: the bucket holds a key the store cannot address"
+    );
+    true
 }
 
 /// `t/<tenant_hash_hex>/<signal>/l1/<shard>/<ingest_hour>/` -- the prefix
