@@ -798,7 +798,8 @@ pub struct ResolvedFirstAttemptPartitions {
 }
 
 /// Resolve the in-memory attempt's floor from the resolved
-/// `sql_partition_count` and its `PERF_SOURCE_*` source. A derived count keeps
+/// `sql_partition_count` and its `PERF_SOURCE_*` source. A derived count,
+/// including one the loopback cap lowered (`derived-loopback-cap`), keeps
 /// `SqlConfig`'s default floor; a count the operator set, through
 /// `--sql-partition-count` or `--fetch-concurrency`, is planned as given. A
 /// sort-merge spill retry has no hash exchange to widen, so it plans
@@ -809,7 +810,9 @@ pub fn resolve_sql_first_attempt_partitions(
     sql_partition_count: usize,
     sql_partition_count_source: &str,
 ) -> ResolvedFirstAttemptPartitions {
-    if sql_partition_count_source != crate::config::PERF_SOURCE_DERIVED {
+    let derived = sql_partition_count_source == crate::config::PERF_SOURCE_DERIVED
+        || sql_partition_count_source == crate::config::PERF_SOURCE_DERIVED_LOOPBACK_CAP;
+    if !derived {
         return ResolvedFirstAttemptPartitions {
             min_partitions: 0,
             value: sql_partition_count,
@@ -4145,11 +4148,15 @@ mod tests {
     /// in-memory attempt's partition count and why. The derived count is
     /// `max(8, 2 x cores)`: its 8 on 2 or 4 cores is floored to 16,
     /// `derived-floor`; its 16 on 8 cores or 32 on 16 cores stands, `derived`;
+    /// on a loopback store the 384 of 192 cores is capped at 32 (source
+    /// `derived-loopback-cap`) and still counts as derived, floor 16, value
+    /// 32, `derived`;
     /// `--sql-partition-count 8` or the legacy `--fetch-concurrency 8` turns
     /// the floor off, 8 with source `flag`.
     ///
     /// FLIP: resolving an explicit count like a derived one reads the two
-    /// flag cases as 16 with source `derived-floor`.
+    /// flag cases as 16 with source `derived-floor`; treating only
+    /// `derived` as derived reads the loopback case as floor 0, `flag`.
     #[test]
     fn the_first_attempt_partition_line_names_each_source() {
         for (label, argv, cores, min_partitions, value, source, line) in [
@@ -4184,6 +4191,21 @@ mod tests {
                 "derived 32 on 16 cores",
                 &["ravel-server"][..],
                 16,
+                16,
+                32,
+                FIRST_ATTEMPT_SOURCE_DERIVED,
+                " setting=\"sql_first_attempt_partitions\" value=32 source=\"derived\"",
+            ),
+            (
+                "loopback derived 384 capped at 32 on 192 cores",
+                &[
+                    "ravel-server",
+                    "--store",
+                    "s3",
+                    "--s3-endpoint",
+                    "http://127.0.0.1:9000",
+                ][..],
+                192,
                 16,
                 32,
                 FIRST_ATTEMPT_SOURCE_DERIVED,

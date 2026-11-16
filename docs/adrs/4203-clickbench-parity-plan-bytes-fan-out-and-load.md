@@ -249,7 +249,10 @@ flowchart LR
   objects with nothing finer to stripe.
 - **Change the derived partition count (cores instead of 2 x cores, or a
   fixed ceiling).** It moves the cliff to a different object count. A
-  tenant with 100 objects would meet it on a 64 vCPU box.
+  tenant with 100 objects would meet it on a 64 vCPU box. (Adopted in a
+  narrowed, loopback-only form by the partition-count cap amendment below:
+  the ceiling applies only to a loopback store, where the trade was
+  measured, not to every deployment.)
 - **Cap GET concurrency everywhere.** No measurement on a real object store
   at 384 permits exists. A cap without one trades a local-store problem for
   a possible regression on the stores customers run. #3714 owns that.
@@ -441,3 +444,94 @@ before answering does not describe this run: the catalog is already warm.
 Where the 0.1 s goes is not measured; it is handed to #3231 with this
 figure, and the "not reachable" bullet for Q1 and Q2 stands only as a
 statement that nothing measured so far reaches it.
+
+## Amendment (2026-11-16): the derived SQL partition count is capped at 32 on a loopback store (M3)
+
+<!-- amendment-applies: sections="Rejected alternatives" pointer="partition-count cap amendment" -->
+
+**Decision.** On a loopback store only, the derived SQL partition count
+becomes `max(8, min(2 x cores, 32))`: the pre-amendment `max(8, 2 x cores)`
+with a ceiling of 32. An explicit `--sql-partition-count` is used as given,
+and so is the legacy `--fetch-concurrency`. A non-loopback store keeps
+`max(8, 2 x cores)`. Every other derived value is unchanged. Three values
+still start from the uncapped `max(8, 2 x cores)` figure: the store GET
+concurrency, before its own loopback cap of 64 (decision 3); the
+`promql_fetch_fanout`; and the catalog resolve ceiling's query estimate `Q`
+when `--max-concurrent-queries` is unset (ADR-1733 decision 2). The CPU-gate
+read permits and the concurrent-query ceiling were never derived from that
+figure: the read permits are `max(1, cores - 1)` (ADR-1702 decision 3), and
+the query ceiling defaults to unlimited (ADR-0061 decision 2). The capped
+value is what the SQL
+engine's `target_partitions` is built from and what the startup
+`performance default resolved` line reports, at source
+`derived-loopback-cap` when the cap lowered it.
+
+This narrows the rejected "Change the derived partition count" alternative
+to a loopback-only ceiling, applied on the one deployment where the trade
+was measured rather than on every deployment, so the object-count cliff that
+rejection warned of is not moved on a real store.
+
+**Evidence (M3 readout, issue #4203 comment 6902318979).** One c6a.metal,
+192 vCPU, loopback store, same-box arm differences; drift control passed at
++0.1% cold. At 32 partitions against the stock 384, the cold total is lower
+and the hot total is lower, per-statement geomean below 1.0 on both:
+
+| Arm | Cold total (s) | Hot total (s) | Cold geomean | Hot geomean | Source |
+|---|---|---|---|---|---|
+| 32 partitions | 137.2 | 16.5 | 0.861 | 0.580 | comment 6902318979 |
+| 384 partitions (stock, basis) | 150.5 | 24.4 | 1.000 (basis, by definition) | 1.000 (basis, by definition) | comment 6902318979 |
+
+32 is the measured cold trough. Over a sweep that excludes three
+statements, cold is flat from 19 to 96 partitions and lowest at 32:
+
+| Partitions | Cold total, three statements excluded (s) | Source |
+|---|---|---|
+| 19 | 131.7 | comment 6902318979 |
+| 32 | 129.4 | comment 6902318979 |
+| 96 | 131.6 | comment 6902318979 |
+
+Hot continues to fall above 32 but by little: at 96 and 222 partitions it is
+15.9 s, 0.6 s better than the 16.5 s at 32. The cold trough is chosen over
+that small hot gain.
+
+| Partitions | Hot total (s) | Source |
+|---|---|---|
+| 32 | 16.5 | comment 6902318979 |
+| 96 | 15.9 | comment 6902318979 |
+| 222 | 15.9 | comment 6902318979 |
+
+**Why the cap is loopback-only.** 32 beating 96 rests on cold reads from
+one local volume. On a real object store, partitions also bound the GETs a
+scan keeps in flight, which nothing here measured; issue #3714 keeps that
+question, exactly as decision 3 keeps it for the GET cap. A real store is
+not capped.
+
+**The per-statement partition rule (drafted as decision 9) is not
+adopted.** Decision 9 would plan each statement at the smaller of the
+derived count and the number of relevant objects. Emulated on the same run
+it measured worse than the flat cap on the cold total (139.7 s against
+137.2 s) and on both geomeans (0.878 and 0.596 against 0.861 and 0.580),
+and better only on the hot total, by 0.8 s (15.7 s against 16.5 s). The
+cold total and both geomeans decide, so the flat loopback cap is taken
+instead:
+
+| Shape | Cold total (s) | Hot total (s) | Cold geomean | Hot geomean | Source |
+|---|---|---|---|---|---|
+| flat cap at 32 | 137.2 | 16.5 | 0.861 | 0.580 | comment 6902318979 |
+| per-statement min(derived, objects) | 139.7 | 15.7 | 0.878 | 0.596 | comment 6902318979 |
+
+**The TopK first-wave gate (drafted as decision 10) is held.** It waits on
+a later run that measures the objects opened in the first wave at 8
+partitions: under 30 opens selects the gate, 45 or more cancels it. No arm
+here measured that, so decision 10 is neither adopted nor rejected yet.
+
+**The publication run gate (predicted).** The publication run on c6a.metal
+must show the stock (no explicit flags) cold total at or under 0.93x, and
+the hot total at or under 0.75x, a same-run 384-partition arm. Both are
+predictions from the M3 ratios above, not yet confirmed on the published
+entry's binary:
+
+| Figure | Threshold vs a same-run 384-partition arm | Source |
+|---|---|---|
+| stock cold total | at or under 0.93x | predicted |
+| stock hot total | at or under 0.75x | predicted |
