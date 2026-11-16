@@ -67,7 +67,9 @@ impl Default for KeyIndexRebuildOptions {
     }
 }
 
-/// One batch's publish, its HEAD CAS retries included.
+/// One batch's publish, its HEAD CAS retries included. A batch that stopped
+/// the run before its publish step is listed last, with `head_cas_tries` 0,
+/// so the attempts' GETs and PUTs sum to the report's totals.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct KeyIndexRebuildAttempt {
     /// Parts the batch read.
@@ -114,6 +116,9 @@ pub struct KeyIndexRebuildReport {
     /// Leaf PUTs issued, including any a lost CAS, a deferred part or a field
     /// over the byte cap left unreferenced. Counted when issued by the fold's
     /// build, so a run interrupted by a failed leaf PUT counts that PUT too.
+    /// A different basis from the fold's
+    /// [`FoldReport::key_index_leaves_written`](crate::FoldReport::key_index_leaves_written),
+    /// which counts the leaves the published HEAD names.
     pub leaves_written: u64,
     /// Total bytes of the leaves those PUTs sent, the failed PUT's included.
     pub leaf_bytes_written: u64,
@@ -144,6 +149,8 @@ pub struct KeyIndexRebuildReport {
     pub erasure_get_requests: u64,
     /// Batches that reached their publish step.
     pub attempt_count: u64,
+    /// Every batch that read a part: the `attempt_count` batches that reached
+    /// their publish step, then the batch that stopped the run, if any.
     pub attempts: Vec<KeyIndexRebuildAttempt>,
 }
 
@@ -620,6 +627,41 @@ impl Catalog {
         report: &mut KeyIndexRebuildReport,
     ) -> Result<(), BatchError> {
         let mut attempt = KeyIndexRebuildAttempt::default();
+        let built = match self
+            .build_batch(tenant, signal, batch, head, &mut attempt, report)
+            .await
+        {
+            Ok(built) => built,
+            Err(e) => {
+                // The stopped batch is listed with what it issued, so the
+                // attempts sum to the totals, but it never reached its
+                // publish step and is not counted in `attempt_count`.
+                if attempt.parts > 0 {
+                    report.attempts.push(attempt);
+                }
+                return Err(e);
+            }
+        };
+        if attempt.parts == 0 {
+            return Ok(());
+        }
+        report.attempt_count += 1;
+        report.attempts.push(attempt);
+        self.publish_batch(head_key, &built, head, version, report)
+            .await
+    }
+
+    /// Reads and builds one batch's parts, counting what it issues into
+    /// `attempt` and `report` as it goes, a failed build's requests included.
+    async fn build_batch(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        batch: Vec<Target>,
+        head: &SnapshotHead,
+        attempt: &mut KeyIndexRebuildAttempt,
+        report: &mut KeyIndexRebuildReport,
+    ) -> Result<Vec<BuiltPart>, BatchError> {
         let mut counters = RequestCounters::default();
         let mut built: Vec<BuiltPart> = Vec::new();
         // A part the rebuild visits has no leaf for these fields, or only a
@@ -720,13 +762,7 @@ impl Catalog {
                 });
             }
         }
-        if attempt.parts == 0 {
-            return Ok(());
-        }
-        report.attempt_count += 1;
-        report.attempts.push(attempt);
-        self.publish_batch(head_key, &built, head, version, report)
-            .await
+        Ok(built)
     }
 
     /// The batch's HEAD publish: attach, CAS, and on a lost CAS re-read HEAD
@@ -2114,11 +2150,15 @@ mod tests {
     /// its leaf PUTs. The fourth of five leaf PUTs times out, after the
     /// fourth pass's reads: the report counts 4 passes x 2 ranged GETs x 4
     /// entries, exactly the bytes the store served for them, 4 leaf PUTs and
-    /// the bytes of the first four leaves a clean run PUTs.
+    /// the bytes of the first four leaves a clean run PUTs. The stopped batch
+    /// is listed as the one attempt, with its one part GET, those ranged GETs
+    /// and those leaf PUTs, while `attempt_count`, the batches that reached
+    /// their publish step, stays 0.
     ///
     /// Against the code before #4297 every one of these is 0. A fix that
     /// folded the GET counts on the error path but not the PUT counts reports
-    /// 0 leaves and 0 leaf bytes.
+    /// 0 leaves and 0 leaf bytes. One that folded the totals but not the
+    /// attempt lists no attempt, so its part GET reaches no field.
     #[tokio::test]
     async fn a_failed_build_reports_its_gets_bytes_and_leaf_puts() {
         let clean = forty_pair_leaves_in_put_order().await;
@@ -2142,6 +2182,26 @@ mod tests {
             "{report:?}"
         );
         assert_eq!(kidx_objects(inner.as_ref(), Signal::Logs).await.len(), 3);
+        // The stopped batch read the one part with one whole-object GET.
+        let part_gets = inner
+            .gets()
+            .into_iter()
+            .filter(|(key, range, _)| key.ends_with(".csnap") && matches!(range, GetRange::Full))
+            .count() as u64;
+        assert_eq!(part_gets, 1);
+        assert_eq!(report.attempt_count, 0, "{report:?}");
+        assert_eq!(
+            report.attempts,
+            vec![KeyIndexRebuildAttempt {
+                parts: 1,
+                part_gets,
+                ranged_gets: report.ranged_gets,
+                leaf_puts: report.leaves_written,
+                head_cas_tries: 0,
+                parts_published: 0,
+            }],
+            "the stopped batch is listed, its GETs and PUTs summing to the totals"
+        );
     }
 
     /// A ranged GET that fails with a store error for one entry defers its
