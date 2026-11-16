@@ -765,10 +765,11 @@ pub(super) enum LogScanState {
     /// taken the one block that carried an `attrs_raw` overflow page, so only
     /// that block runs the row path instead of the rest of the segment.
     Columnar(Box<LogSegmentScan>),
-    /// Draining one segment's surviving blocks through the row path
-    /// ([`LogSegmentScan::next_block`]), rebuilding a [`LogRecord`] per row: the
-    /// unchanged pre-ADR-0099 path, taken by a scan that is statically
-    /// ineligible for the columnar fast path, OR handed the
+    /// Draining one segment's surviving blocks through the row path: each
+    /// block comes out of [`LogSegmentScan::next_row_block`] owned and
+    /// [`build_row_batch`] builds its batches from the decoded columns with
+    /// no per-row record (ADR-2773 decision 4). Taken by a scan that is
+    /// statically ineligible for the columnar fast path, OR handed the
     /// still-open scan by [`LogScanState::RowFallbackBlock`] once a segment
     /// has hit [`MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS`] consecutive `attrs_raw`
     /// fallbacks, committing the rest of this partition's block list to the
@@ -827,7 +828,7 @@ pub(super) enum LogScanState {
         started: Instant,
     },
     /// One row-path block decoding on the read gate through
-    /// [`LogSegmentScan::next_block_on_gate`]. Resolved, the scan goes back
+    /// [`LogSegmentScan::next_row_block_on_gate`]. Resolved, the scan goes back
     /// to the state `resume` names with the block in
     /// [`LogScanStream::decoded`].
     DecodingRows {
@@ -855,7 +856,7 @@ type RowJobFuture = Pin<
                 Output = (
                     Box<LogSegmentScan>,
                     Option<usize>,
-                    Result<Option<RowBlock>, LogFetchError>,
+                    DFResult<Option<RowBlock>>,
                 ),
             > + Send,
     >,
@@ -875,14 +876,14 @@ pub(super) enum Decoded {
     Rows {
         /// The block's whole-object index, read before the decode.
         block: Option<usize>,
-        next: Result<Option<RowBlock>, LogFetchError>,
+        next: DFResult<Option<RowBlock>>,
     },
 }
 
 /// What [`LogScanStream::next_row_block`] did.
 enum RowNext {
     /// The block's whole-object index, read before the decode, and the block.
-    Ready(Option<usize>, Box<Result<Option<RowBlock>, LogFetchError>>),
+    Ready(Option<usize>, Box<DFResult<Option<RowBlock>>>),
     /// The decode went to the read gate; the state is now
     /// [`LogScanState::DecodingRows`].
     Submitted,
@@ -1050,12 +1051,29 @@ fn take_columnar_job_panic(key: &str) -> bool {
 }
 
 /// The row path's next block on the read gate, the scan returned with it.
-fn row_block_on_gate(mut scan: Box<LogSegmentScan>) -> RowJobFuture {
+/// `erasure` is the pending set [`build_row_batch`] applies to its rows.
+fn row_block_on_gate(
+    mut scan: Box<LogSegmentScan>,
+    erasure: Arc<Vec<ErasurePredicate>>,
+) -> RowJobFuture {
     Box::pin(async move {
         let block = scan.next_block_index();
-        let next = scan.next_row_block_on_gate().await;
+        let next = row_block(scan.next_row_block_on_gate(&erasure).await);
         (scan, block, next)
     })
+}
+
+/// The row-block exit's outcome as the row path consumes it. A refusal for
+/// an unapplied erasure is an internal error: the scan passes the same set it
+/// built its fetch query from.
+fn row_block(outcome: Result<RowBlockOutcome, LogFetchError>) -> DFResult<Option<RowBlock>> {
+    match outcome.map_err(SqlError::from)? {
+        RowBlockOutcome::Block(block) => Ok(Some(block)),
+        RowBlockOutcome::Exhausted => Ok(None),
+        RowBlockOutcome::ErasureUnapplied => Err(DataFusionError::Internal(
+            "the row-block exit refused the scan's erasure predicate set".into(),
+        )),
+    }
 }
 
 /// A columnar block job that failed on the gate, classified the way the
@@ -1102,6 +1120,8 @@ pub(super) struct RowsPending {
     /// Rows already emitted, after erasure: the row-ref position of the next
     /// kept row.
     kept: usize,
+    /// The block's decoded stream attributes, charged into `held` as each is
+    /// decoded and released with the block.
     streams: StreamAttrsCache,
     /// The object key, for attributing a corrupt `attrs_raw` cell.
     key: String,
@@ -1570,7 +1590,10 @@ impl LogScanStream {
 
     /// Emit the next row-path batch out of `pending`, moving the reservation
     /// with it: the previous batch's charge is released (it is downstream's
-    /// now), the new batch's charge is taken before it is handed over.
+    /// now), the new batch's charge is taken before it is handed over. The
+    /// block's decoded stream attributes join its charge in `held`; each
+    /// chunk's decoded `attrs_raw` entries and merge scratch are charged by
+    /// [`build_row_batch`] for the length of the build.
     ///
     /// With a row filter, each chunk is filtered as soon as it is built, and a
     /// chunk the filter empties is skipped; `None` means the block's remaining
@@ -1604,17 +1627,23 @@ impl LogScanStream {
                 return Ok(None);
             }
             let end = (*pos + BATCH_ROWS).min(block.len());
+            let streams_before = streams.charged();
             let built = build_row_batch(
                 block,
                 *pos,
                 end,
                 streams,
                 &shape,
+                &self.reservation,
                 pending_range.map(|r| RowRefRange {
                     first_row: r.first_row + *kept,
                     ..r
                 }),
-            )?;
+            );
+            // Decoded stream attributes stay charged with the block, even
+            // when the build fails after decoding them.
+            self.held += streams.charged() - streams_before;
+            let built = built?;
             *pos = end;
             *kept += built.num_rows();
             if built.num_rows() == 0 {
@@ -1778,7 +1807,7 @@ impl LogScanStream {
                 ));
             };
             self.state = LogScanState::DecodingRows {
-                job: row_block_on_gate(scan),
+                job: row_block_on_gate(scan, Arc::clone(&self.erasure)),
                 resume,
                 started: Instant::now(),
             };
@@ -1786,7 +1815,7 @@ impl LogScanStream {
         }
         let decode_started = Instant::now();
         let block = scan.next_block_index();
-        let next = scan.next_row_block();
+        let next = row_block(scan.next_row_block(&self.erasure));
         self.blocks.decode_build_elapsed.add_elapsed(decode_started);
         RowNext::Ready(block, Box::new(next))
     }
@@ -1885,7 +1914,11 @@ impl LogScanStream {
             LogScanState::Rows(scan)
             | LogScanState::RowFallbackBlock { scan, .. }
             | LogScanState::Columnar(scan) => scan.key().to_string(),
-            _ => String::new(),
+            _ => {
+                return Err(DataFusionError::Internal(
+                    "row block taken off a scan-holding state".into(),
+                ));
+            }
         };
         self.hold_block(block, key)
     }
@@ -2562,7 +2595,7 @@ impl LogScanStream {
                         // Only `None` ends the segment. Its counters are final
                         // now, so publish them before moving on.
                         Ok(None) => this.end_scanned_segment(),
-                        Err(e) => return this.fail(SqlError::from(e).into()),
+                        Err(e) => return this.fail(e),
                     }
                 }
                 LogScanState::RowFallbackBlock { skip, .. } => {
@@ -2587,7 +2620,7 @@ impl LogScanStream {
                                 }
                             }
                             Ok(None) => this.end_scanned_segment(),
-                            Err(e) => return this.fail(SqlError::from(e).into()),
+                            Err(e) => return this.fail(e),
                         }
                         continue;
                     }
@@ -2645,7 +2678,7 @@ impl LogScanStream {
                         // as end-of-segment rather than panicking, matching
                         // `ReopenRows`'s own `Ok(None)` handling above.
                         Ok(None) => this.end_scanned_segment(),
-                        Err(e) => return this.fail(SqlError::from(e).into()),
+                        Err(e) => return this.fail(e),
                     }
                 }
                 LogScanState::DecodingColumnar { job, started } => {
@@ -4639,5 +4672,178 @@ mod read_gate_tests {
                 other => panic!("expected a transient store error, got {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod row_path_row_ref_tests {
+    //! The row path's emitted row refs under a pending erasure that empties
+    //! a whole `BATCH_ROWS` chunk of a block.
+
+    use super::*;
+    use crate::late_materialization::RowRef;
+    use datafusion::arrow::array::TimestampNanosecondArray;
+    use datafusion::physical_plan::ExecutionPlan;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::record::stream_attrs_bytes;
+    use ravel_logseg::{ObjectIdentity, RlogConfig, RlogWriter};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([8u8; 16]);
+    const KEY: &str = "t/rowref0.rlog";
+    /// Three chunks: a full one, a full one every row of which is erased,
+    /// and a short one.
+    const ROWS: usize = 2 * BATCH_ROWS + 4;
+
+    fn erased(row: usize) -> bool {
+        row == 1 || (BATCH_ROWS..2 * BATCH_ROWS).contains(&row)
+    }
+
+    /// One single-block object of [`ROWS`] records at `ts` 1..=ROWS, the
+    /// rows [`erased`] names carrying `user=gone` and the rest `user=kept`.
+    async fn fixture() -> (Arc<dyn ObjectStoreBackend>, Vec<SegmentRef>) {
+        let cfg = RlogConfig {
+            block_target_records: ROWS,
+            block_max_bytes: 64 << 20,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: [6u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        let mut writer = RlogWriter::new(cfg, identity);
+        for row in 0..ROWS {
+            let user = if erased(row) { "gone" } else { "kept" };
+            writer
+                .push(ravel_logseg::LogRecord {
+                    stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                    stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                    ts_ns: row as i64 + 1,
+                    observed_ts_ns: row as i64 + 1,
+                    severity_num: 9,
+                    severity_text: "INFO".into(),
+                    body: String::new(),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs: vec![("user".to_string(), AttrValue::Str(user.into()))],
+                })
+                .expect("push");
+        }
+        let obj = writer.finish().expect("finish");
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        store
+            .put(KEY, bytes::Bytes::from(obj.clone()), PutOptions::default())
+            .await
+            .expect("put");
+        let segment = SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: obj.len() as u64,
+            min_event_ts_ns: 1,
+            max_event_ts_ns: ROWS as i64,
+            ingest_hour_bucket: 0,
+            sample_count: ROWS as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: [4u8; 32],
+            writer_id: Uuid::from_u128(6),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        };
+        (store, vec![segment])
+    }
+
+    fn metric_total(plan: &dyn ExecutionPlan, name: &str) -> usize {
+        plan.metrics()
+            .expect("metrics")
+            .iter()
+            .filter(|m| m.value().name() == name && m.labels().is_empty())
+            .map(|m| m.value().as_usize())
+            .sum()
+    }
+
+    /// Under `user=gone` erasure the scan emits the kept rows' `ts` with row
+    /// refs numbering them 0, 1, 2, ... in the one block: the erased chunk
+    /// emits no batch and takes no row-ref position, and the chunk after it
+    /// continues the numbering where the first chunk left off.
+    #[tokio::test]
+    async fn an_erased_chunk_emits_no_batch_and_takes_no_row_ref() {
+        let (store, segments) = fixture().await;
+        let erasure = ErasurePredicate::windowless(vec![("user".into(), "gone".into())]);
+        let ts = vec![crate::logs_schema::LOG_COL_TS];
+        let plan = LogsScanExec::new(
+            TENANT,
+            LogSegmentFetcher::new(store),
+            &segments,
+            1,
+            0,
+            ROWS as i64 + 1,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(vec![erasure]),
+            Some(&ts),
+            PhaseAccounting::new(),
+            crate::logs_schema::logs_schema_with_declared(&[]),
+            Arc::new(Vec::new()),
+        )
+        .expect("scan")
+        .reproject(ts, true)
+        .expect("row refs");
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute")
+            .map(|b| b.expect("batch"))
+            .collect()
+            .await;
+
+        let kept: Vec<usize> = (0..ROWS).filter(|&row| !erased(row)).collect();
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![BATCH_ROWS - 1, ROWS - 2 * BATCH_ROWS],
+            "the first chunk less its erased row, then the last chunk"
+        );
+        assert_eq!(metric_total(&plan, "rowpath_batches"), 2);
+        let mut got_ts = Vec::new();
+        let mut got_refs = Vec::new();
+        for batch in &batches {
+            let ts = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("ts");
+            got_ts.extend(ts.values().iter().copied());
+            let refs = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("row refs");
+            got_refs.extend(refs.values().iter().map(|&p| {
+                let r = RowRef::unpack(p);
+                (r.segment, r.block, r.row)
+            }));
+        }
+        assert_eq!(
+            got_ts,
+            kept.iter().map(|&row| row as i64 + 1).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            got_refs,
+            (0..kept.len()).map(|n| (0, 0, n)).collect::<Vec<_>>()
+        );
     }
 }
