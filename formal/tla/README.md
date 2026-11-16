@@ -203,7 +203,8 @@ line may be omitted and the harness uses it.
 
 ## Traceability
 
-`traceability.md` is a five-column table (ADR-1113 D8): the TLA+ action or
+`traceability.md` is a five-column table (ADR-1113 D8; six columns in an area
+enrolled in Antithesis, below): the TLA+ action or
 property, its meaning, the Rust path and symbol it pins, an existing test, and
 any new test still needed. The third column is required and resolved: it is a
 repo-relative `crates/<...>.rs::Symbol::...` reference, and `check-tla.sh
@@ -213,6 +214,43 @@ a row must cite the Rust implementation, not the model. Any further
 `crates/...` reference in the other columns (an existing test, a symbol named
 in the new-test note) is resolved the same way, so a renamed operator or moved
 test breaks the check instead of drifting silently.
+
+A table's first row is its header, recognised by its exact first cell,
+`TLA+ action or property`; a table whose first cell differs fails, and every
+data row must have as many cells as the header.
+
+### The Antithesis property column
+
+An area whose directory holds `antithesis-mutants.tsv` is enrolled in
+Antithesis (ADR-4326 decision 6, ADR-1113's Antithesis property column
+amendment). Every table in an enrolled area's `traceability.md` carries a
+sixth column, `Antithesis property`, and every data row's cell takes one of
+three forms:
+
+- `sut: <path.rs> -- <message>`: the repo-relative `.rs` file exists and holds
+  the literal message, the one its `inv_*!` assertion reports;
+- `driver: <workload> -- <message>`: the literal occurs in a file under
+  `antithesis/<workload>/`;
+- `none: <reason>`, with a non-empty reason.
+
+The path and the message may each be wrapped in one backtick code span. The
+` -- ` separator keeps the path a whole token, so the `crates/...` sweep above
+resolves it too. A five-column table in an enrolled area fails, and so does a
+six-column table in an area with no `.tsv`; no area is enrolled yet.
+
+`antithesis-mutants.tsv` has one tab-separated line per `negative/*.cfg` of
+the area; blank lines and `#` comments are skipped:
+
+```text
+<negative cfg stem>	<area>/<stem>	<message of a sut: or driver: cell>
+<negative cfg stem>	none: <reason>
+```
+
+The mutant `<area>/<stem>` must occur in a `.rs` file under `crates/` or
+`services/` as the literal `inv_mutant!("<area>/<stem>")`, and the message
+must be one a `sut:` or `driver:` cell in the area's tables carries. A
+`negative/*.cfg` with no line, a second line for one, or a line naming no
+config fails.
 
 ### Mutants
 

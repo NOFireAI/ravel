@@ -146,7 +146,7 @@ the reservation commit that used to work around it.
 | [1040](1040-documentation-architecture.md) | Documentation architecture, canonical vocabulary, and a docs gate | Proposed |
 | [1101](1101-alerts-and-audit-sql-tables.md) | Register the `alerts` and `audit` SQL tables | Accepted (2026-09-03), amended by 2904 |
 | [1103](1103-promql-over-logs.md) | PromQL over logs: `ravel_log_lines` and `ravel_log_bytes` | Accepted |
-| [1113](1113-tla-verification-suite.md) | TLA+ verification suite for the commit, catalog, lifecycle, resharding, and maintenance protocols | Proposed |
+| [1113](1113-tla-verification-suite.md) | TLA+ verification suite for the commit, catalog, lifecycle, resharding, and maintenance protocols | Accepted |
 | [1133](1133-pinned-query-delete-marker.md) | An unnamed-since marker gates retention and superseded-input deletes on the pinned-query window | Accepted (2026-10-01; revised 2026-10-02; amended 2026-10-02, three times) |
 | [1170](1170-process-memory-budget.md) | One process-wide memory budget: a `MemoryBudget` accountant the tenant accountants adapt to, byte reservations at the fetch layer where the unit is known, a static carve under one number, and the aggregate logged and gauged; the operator can pin the query budget, refusing a pod limit below budget plus held memory and reporting one below the provisional headroom (issue #3200 amendment) | Accepted (2026-10-14; partly implemented); amended by 2633 (2026-10-11) and for issue #3200 (2026-10-22) |
 | [1195](1195-unbundle-fetch-concurrency.md) | Unbundle `--fetch-concurrency`, and make GET concurrency a process-wide limit | Accepted (2026-10-14) |
