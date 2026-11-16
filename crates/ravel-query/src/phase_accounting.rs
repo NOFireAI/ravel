@@ -3,7 +3,7 @@
 //! against a 3,469-object tenant and the pooled counter could not say which
 //! phase issued them).
 //!
-//! [`PhaseAccounting`] wraps five independent, unmodified
+//! [`PhaseAccounting`] wraps six independent, unmodified
 //! [`QueryAccounting`] handles, one per [`QueryPhase`], rather than adding
 //! per-phase fields to `QueryAccounting` itself: that type lives in
 //! `ravel-types`, outside this crate's assigned scope for issue #796, and its
@@ -28,6 +28,12 @@
 //!   `LogSegmentFetcher::scan_accounted_with_tenant`).
 //! - [`QueryPhase::KeyIndex`]: the KEY_IDX prefix and bucket reads of a
 //!   trace_id lookup (`SpanSegmentFetcher`'s ranged trace path).
+//! - [`QueryPhase::Fetch`]: TopK late materialization's phase-2 row fetch of
+//!   the winners (ADR-0774, issue #797) -- every probe, footer, section and
+//!   page read the winners' row fetch issues, through
+//!   `LogSegmentFetcher::scan_accounted_with_tenant_subset` on
+//!   [`ProbePhase::Fetch`](crate::log_fetcher::ProbePhase::Fetch). Phase 1 (the
+//!   ordinary scan) keeps charging [`QueryPhase::Scan`].
 //!
 //! Decode (turning fetched bytes into typed samples/rows) is deliberately not
 //! a phase here: it issues no store request, so it has no request or
@@ -62,17 +68,25 @@ pub enum QueryPhase {
     /// The per-object KEY_IDX reads of a key lookup (ADR-2707 decision 5,
     /// tier 1): the section's `[0, prefix_len)` and at most one bucket.
     KeyIndex,
+    /// TopK late materialization's phase 2 (ADR-0774, issue #797): the row
+    /// fetch of the winners. Every probe, footer, section and page read the
+    /// row fetch issues over the winners' blocks lands here, apart from the
+    /// ordinary scan (phase 1), so fetch amplification is attributable from one
+    /// statement rather than by subtracting a second proxy statement. A
+    /// statement with no late materialization never writes it.
+    Fetch,
 }
 
 impl QueryPhase {
     /// Every phase, in the fixed order [`PhaseAccountingSnapshot`]'s fields
     /// and [`PhaseAccounting::snapshot`] agree on.
-    pub const ALL: [QueryPhase; 5] = [
+    pub const ALL: [QueryPhase; 6] = [
         QueryPhase::Resolve,
         QueryPhase::Plan,
         QueryPhase::Probe,
         QueryPhase::Scan,
         QueryPhase::KeyIndex,
+        QueryPhase::Fetch,
     ];
 
     /// Stable name for a report table column or a JSON key, exactly the
@@ -85,6 +99,7 @@ impl QueryPhase {
             QueryPhase::Probe => "probe",
             QueryPhase::Scan => "scan",
             QueryPhase::KeyIndex => "keyIndex",
+            QueryPhase::Fetch => "fetch",
         }
     }
 
@@ -98,6 +113,7 @@ impl QueryPhase {
             QueryPhase::Probe => 2,
             QueryPhase::Scan => 3,
             QueryPhase::KeyIndex => 4,
+            QueryPhase::Fetch => 5,
         }
     }
 }
@@ -114,7 +130,10 @@ impl From<QueryPhase> for GetPhase {
             QueryPhase::Resolve => GetPhase::Resolve,
             QueryPhase::Plan => GetPhase::Plan,
             QueryPhase::Probe | QueryPhase::KeyIndex => GetPhase::Probe,
-            QueryPhase::Scan => GetPhase::Scan,
+            // Phase 2 is a data read: its GETs time under the scan latency
+            // bucket, since the store's histogram has no fetch slot (the same
+            // reason KEY_IDX reads time under `probe`).
+            QueryPhase::Scan | QueryPhase::Fetch => GetPhase::Scan,
         }
     }
 }
@@ -264,10 +283,10 @@ impl PhaseWireByteCounts {
     }
 }
 
-/// Five independent [`QueryAccounting`] handles, one per [`QueryPhase`]
+/// Six independent [`QueryAccounting`] handles, one per [`QueryPhase`]
 /// (issue #796). Cheap to clone: each phase handle is itself an `Arc`-backed
 /// clone, exactly like `QueryAccounting`, so cloning the whole struct clones
-/// five `Arc`s and nothing else. Created once per query attempt, alongside
+/// six `Arc`s and nothing else. Created once per query attempt, alongside
 /// the query's other fresh per-attempt state (see `engine.rs`'s
 /// `resolve_snapshot_with_retry`), and passed explicitly into every component
 /// that touches the object store on that phase's behalf -- never held in a
@@ -280,9 +299,10 @@ pub struct PhaseAccounting {
     probe: QueryAccounting,
     scan: QueryAccounting,
     key_index: QueryAccounting,
+    fetch: QueryAccounting,
     /// True when the phases above are clones of one shared
     /// `QueryAccounting` (built by [`pooled_over`](Self::pooled_over)),
-    /// rather than five independent handles. Set once at construction, so
+    /// rather than six independent handles. Set once at construction, so
     /// [`pooled_snapshot`](Self::pooled_snapshot) can tell which reduction is
     /// correct without the caller having to remember which constructor built
     /// this handle.
@@ -304,14 +324,14 @@ impl PhaseAccounting {
         PhaseAccounting::default()
     }
 
-    /// A handle whose five phases are all clones of `accounting`, so every
+    /// A handle whose six phases are all clones of `accounting`, so every
     /// store call the fetch pipeline charges to any phase lands directly on
     /// that one shared handle -- live, at the instant it is recorded, not in a
     /// per-phase buffer folded in only once the fetch returns.
     ///
     /// The pooled read entry points (`SegmentFetcher::fetch_*_accounted`) use
     /// this. They discard the per-phase split anyway -- they immediately
-    /// [`pooled`](Self::pooled) the five handles back into one -- so sharing
+    /// [`pooled`](Self::pooled) the six handles back into one -- so sharing
     /// loses nothing, and it lets a query that is timed out or dropped
     /// mid-fetch still show the requests and bytes the in-flight fetch had
     /// already issued, instead of recording that cost only if the fetch runs to
@@ -321,8 +341,8 @@ impl PhaseAccounting {
     ///
     /// Never fold a handle built this way back through
     /// [`snapshot`](Self::snapshot) and [`pooled`](PhaseAccountingSnapshot::pooled):
-    /// its five phases are one counter, so pooling its snapshot would count
-    /// every request and byte five times. Read `accounting.snapshot()` instead.
+    /// its six phases are one counter, so pooling its snapshot would count
+    /// every request and byte six times. Read `accounting.snapshot()` instead.
     #[must_use]
     pub fn pooled_over(accounting: &QueryAccounting) -> Self {
         PhaseAccounting {
@@ -331,6 +351,7 @@ impl PhaseAccounting {
             probe: accounting.clone(),
             scan: accounting.clone(),
             key_index: accounting.clone(),
+            fetch: accounting.clone(),
             shared: true,
             decoded_cache: Arc::default(),
             dictionary_probe: Arc::default(),
@@ -347,7 +368,7 @@ impl PhaseAccounting {
         &self.dictionary_probe
     }
 
-    /// Set the [`AccessIntent`] on all five phase handles, so every cache read
+    /// Set the [`AccessIntent`] on all six phase handles, so every cache read
     /// the query makes in any phase carries it.
     pub fn set_access_intent(&self, intent: AccessIntent) {
         for phase in [
@@ -356,6 +377,7 @@ impl PhaseAccounting {
             &self.probe,
             &self.scan,
             &self.key_index,
+            &self.fetch,
         ] {
             phase.set_access_intent(intent);
         }
@@ -400,6 +422,14 @@ impl PhaseAccounting {
         &self.key_index
     }
 
+    /// The fetch phase's handle: TopK late materialization's phase-2 row fetch
+    /// (issue #797). Decode call sites downstream of a phase-2 block read are
+    /// passed this handle too, for their decode-only byte counters.
+    #[must_use]
+    pub fn fetch(&self) -> &QueryAccounting {
+        &self.fetch
+    }
+
     /// The handle for a given phase. Used where a call site's phase is
     /// chosen dynamically rather than named directly.
     #[must_use]
@@ -410,6 +440,7 @@ impl PhaseAccounting {
             QueryPhase::Probe => &self.probe,
             QueryPhase::Scan => &self.scan,
             QueryPhase::KeyIndex => &self.key_index,
+            QueryPhase::Fetch => &self.fetch,
         }
     }
 
@@ -422,6 +453,7 @@ impl PhaseAccounting {
             probe: self.probe.snapshot(),
             scan: self.scan.snapshot(),
             key_index: self.key_index.snapshot(),
+            fetch: self.fetch.snapshot(),
         }
     }
 
@@ -430,10 +462,10 @@ impl PhaseAccounting {
     /// cost so far" (a running budget check, for instance) should call this
     /// instead of `snapshot().pooled()`.
     ///
-    /// [`pooled_over`](Self::pooled_over)'s five phases are clones of one
+    /// [`pooled_over`](Self::pooled_over)'s six phases are clones of one
     /// shared `QueryAccounting`, so `snapshot().pooled()` would read that same
-    /// underlying counter five times and sum it, reporting 5x the real total;
-    /// this reads it once instead. A [`new`](Self::new) handle's five phases
+    /// underlying counter six times and sum it, reporting 6x the real total;
+    /// this reads it once instead. A [`new`](Self::new) handle's six phases
     /// are genuinely independent, so its pooled total is the real sum of the
     /// five, exactly what `snapshot().pooled()` already computes.
     #[must_use]
@@ -446,7 +478,7 @@ impl PhaseAccounting {
     }
 }
 
-/// Point-in-time copy of a [`PhaseAccounting`]'s five phase snapshots (issue
+/// Point-in-time copy of a [`PhaseAccounting`]'s six phase snapshots (issue
 /// #796). Plain `QueryAccountingSnapshot` fields, so this is `Copy` and needs
 /// no allocation, mirroring `QueryAccountingSnapshot` itself.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -456,6 +488,7 @@ pub struct PhaseAccountingSnapshot {
     pub probe: QueryAccountingSnapshot,
     pub scan: QueryAccountingSnapshot,
     pub key_index: QueryAccountingSnapshot,
+    pub fetch: QueryAccountingSnapshot,
 }
 
 impl PhaseAccountingSnapshot {
@@ -469,6 +502,7 @@ impl PhaseAccountingSnapshot {
             QueryPhase::Probe => &self.probe,
             QueryPhase::Scan => &self.scan,
             QueryPhase::KeyIndex => &self.key_index,
+            QueryPhase::Fetch => &self.fetch,
         }
     }
 
@@ -485,6 +519,7 @@ impl PhaseAccountingSnapshot {
             .saturating_add(&self.probe)
             .saturating_add(&self.scan)
             .saturating_add(&self.key_index)
+            .saturating_add(&self.fetch)
     }
 }
 
@@ -591,7 +626,7 @@ mod tests {
         for (i, phase) in QueryPhase::ALL.iter().enumerate() {
             assert_eq!(snap.phase(*phase), 1 << i, "{} slot", phase.name());
         }
-        assert_eq!(snap.total(), 31);
+        assert_eq!(snap.total(), 63);
     }
 
     #[test]
@@ -608,6 +643,7 @@ mod tests {
                     QueryPhase::Probe => &snap.probe,
                     QueryPhase::Scan => &snap.scan,
                     QueryPhase::KeyIndex => &snap.key_index,
+                    QueryPhase::Fetch => &snap.fetch,
                 }
             );
         }
