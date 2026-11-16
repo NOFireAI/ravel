@@ -27,6 +27,9 @@ ravel-rspan = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-ingest = { workspace = true }
+# `park_lease`: `compat activate` parks every tenant's alert lease when rlog is
+# activated (ADR-4233 decision 4).
+ravel-alerting = { workspace = true }
 # The ADR-1702 read gate maintenance decodes and encodes run on.
 ravel-cpu-gate = { workspace = true }
 prost = { workspace = true }
