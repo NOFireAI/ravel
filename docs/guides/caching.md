@@ -421,7 +421,8 @@ read can take it somewhat above.
 
 The segments read whole hold to the other half of `--cache-max-bytes`. A
 segment that does not fit what is left of that half is skipped, so the two
-together do not fill the cache past its size and evict what the other warmed.
+together do not fill the cache past its size and evict what the other warmed,
+unless directory reads take the metadata pass above its half.
 Warmup reads at most 2 segments of each signal of a tenant whole at once.
 
 The metadata pass reads at most one segment fewer at once than the store's
