@@ -406,10 +406,12 @@ first real query after a restart then does not pay the full cold cost.
 
 For logs it also reads the footer and directories of every log segment in the
 same warm set that a query plans from its directories, without the segment's
-column pages. Warmup first finds every tenant's warm set, then reads the
-most recent segments whole and runs this metadata pass at the same time, so a
-tenant with many log segments gets its metadata read even while its whole
-segments are still loading. A first log query that plans from those directories, or
+column pages. Warmup finds each tenant's warm set, reads the most recent
+segments whole and runs this metadata pass, all at the same time: tenants are
+warmed in order as their warm sets are found, while later tenants' sets are
+still being found, and a tenant with many log segments gets its metadata read even
+while its whole segments are still loading. Warmup finds at most 4 tenants'
+warm sets at once, each using one of the store's GET requests while it runs. A first log query that plans from those directories, or
 opens such a segment by range, then reads its footer from the cache instead
 of storage; a query that reads a whole segment in one request, or that also
 needs the segment's key index, bloom or postings, gains less or nothing. The
@@ -419,18 +421,27 @@ stops when the next segment's footer read would not fit beside what it has
 fetched and the footer reads still in flight; directory reads past a footer
 read can take it somewhat above.
 
-The segments read whole hold to the other half of `--cache-max-bytes`. A
-segment that does not fit what is left of that half is skipped, so the two
-together do not fill the cache past its size and evict what the other warmed,
-unless directory reads take the metadata pass above its half.
+The segments read whole hold to the other half of `--cache-max-bytes` (all of
+it when the metadata pass does not run). Each read sets aside what it will
+fetch before it starts: a whole log segment, or, for a metric segment, the
+whole segment at or below 512 KiB and otherwise only its 64 KiB footer tail,
+since warming a metric segment reads its footer and catalog, not its samples.
+Once a read finishes it holds what it actually fetched, nothing if the
+segment was already cached. A segment that does not fit what is left waits
+for the reads of its tenant and signal still in flight, and is skipped only if
+it still does not fit once none are left. So the two together do not fill the
+cache past its size and evict what the other warmed, unless a metric
+segment's catalog lies outside its footer tail or directory reads take the
+metadata pass above its half.
 Warmup reads at most 2 segments of each signal of a tenant whole at once.
 
 The metadata pass reads at most one segment fewer at once than the store's
 GET concurrency (at least one). With a GET concurrency of 2 or more, one
 request stays free for the whole-segment reads, so a tenant whose metadata
 reads hang does not hold back a later tenant's whole segments. With a GET
-concurrency of 1 the pass uses the only request, and one hung read holds it
-until the time budget runs out.
+concurrency of 1 the pass uses the only request, and one hung read holds it,
+and with it every later warm set and whole-segment read, until the time
+budget runs out.
 docs/query-engine.md, "Startup warm-up of logs metadata", has the details.
 
 "Most recent" means most recently ingested, measured from the latest ingest
@@ -460,7 +471,7 @@ tenant does not use never produces a `warn!` by itself.
 
 The per-(tenant, signal) line carries `tenant_hash`, `signal`, `parts_warmed`,
 `parts_over_budget` (segments skipped because they did not fit the whole
-segments' half of the cache) and `latest_ingest_hour`. Its level is:
+segments' share of the cache once no read of theirs was in flight) and `latest_ingest_hour`. Its level is:
 
 - `info!` normally.
 - `warn!` if the tenant has a live part for that signal but none of them
@@ -527,7 +538,7 @@ went, in milliseconds:
 - `whole_part_warm_elapsed_ms`: reading the most recent segments whole.
 - `metadata_pass_elapsed_ms`: the logs metadata pass.
 
-The last two run at the same time, so they overlap and do not add up to
+The last three run at the same time, so they overlap and do not add up to
 `elapsed_ms`.
 
 - A restart whose log shows this final line warmed the cache.

@@ -7401,27 +7401,43 @@ flighted and corruption-gated per ADR-0046 decisions 3-5.
 
 ### Startup warm-up of logs metadata
 
-Before `/readyz` latches, `cache_warm::warm_cache` discovers the tenants,
-resolves every tenant's warm set for both signals, and then runs two steps
-concurrently: the whole-part warm, which reads the 4 most
-recent parts of each (tenant, signal) whole, and a logs metadata pass
-(ADR-4203 decision 8). The whole-part warm takes tenants in discovery order
-and fetches one tenant's metric and logs parts concurrently, at most 2 parts
-of each signal at once (`WHOLE_PARTS_IN_FLIGHT_PER_SIGNAL`), each GET through
-the shared store GET limiter. The metadata pass runs on its own future and
-reads at most one object fewer than the limiter's permit count at once (at
-least one). With at least 2 permits one permit stays free of the pass, so
-one tenant's pass does not hold back a later tenant's whole-part warm; with
-1 permit the pass reads on the only permit, and a hung probe holds it until
-the deadline.
+Before `/readyz` latches, `cache_warm::warm_cache` discovers the tenants and
+then runs three steps concurrently: part resolution, which resolves each
+tenant's warm set for both signals; the whole-part warm, which reads the 4
+most recent parts of each (tenant, signal) whole; and a logs metadata pass
+(ADR-4203 decision 8). Resolution runs at most 4 tenants at once
+(`PART_RESOLUTIONS_IN_FLIGHT`), each holding one permit of the shared store
+GET limiter while it runs, and hands each tenant's set on in discovery order
+as it completes, so the first tenants are warmed while later ones still
+resolve and a store with slow listings spends the deadline warming tenants
+rather than resolving all of them first. The whole-part warm takes tenants
+in discovery order as their sets arrive and fetches one tenant's metric and
+logs parts concurrently, at most 2 parts of each signal at once
+(`WHOLE_PARTS_IN_FLIGHT_PER_SIGNAL`), each GET through the shared store GET
+limiter. The metadata pass runs on its own future, takes tenants in the same
+order, and reads at most one object fewer than the limiter's permit count at
+once (at least one). With at least 2 permits one permit stays free of the
+pass, so one tenant's pass does not hold back a later tenant's whole-part
+warm; with 1 permit the pass reads on the only permit, and a hung probe holds
+it, and with it every later resolution and whole-part GET, until the
+deadline.
 
 The whole-part warm holds to the cache budget minus the pass's ceiling
-(below). Each part reserves its object size before its fetch starts and is
-skipped when it does not fit what is left; once the fetch completes, the
-reservation becomes the bytes the fetch read from the store. Together the two
-steps insert no more than `--cache-max-bytes`, so neither evicts entries the
-other counted, as long as the pass stays inside its ceiling (see Bounds for
-when it can end above it). The whole-part warm's reads are unchanged: it still reads an
+(below), or to the whole budget when the pass does not run. Each part
+reserves what its fetch reads before the fetch starts: a logs part its object
+size, since the logs funnel reads the object whole; a metric part what the
+metrics funnel's first GET reads, the whole object at or below 512 KiB
+(`DEFAULT_WHOLE_OBJECT_THRESHOLD`) and otherwise a 64 KiB footer tail
+(`DEFAULT_SUFFIX_LEN`), since a warm with no matchers reads only the footer
+and catalog sections. A part that does not fit what is left waits for its
+signal's fetches in flight and is tested again after each completes; one that
+does not fit with none in flight is skipped and counted. Once a fetch
+completes, its reservation becomes the bytes the fetch read from the store,
+none on a cache hit. Together the two steps insert no more than
+`--cache-max-bytes`, so neither evicts entries the other counted, as long as
+each stays inside its share: a metric part whose catalog sections lie
+outside its footer tail reads more than it reserved, and the pass can end
+above its ceiling (see Bounds). The whole-part warm's reads are unchanged: it still reads an
 object at or under 512 KiB in one whole-object GET keyed `(0, object_size)`,
 and at the default thresholds (`logs_block_range_threshold` 512 KiB, so
 `plan_whole_object_bound` is at least 512 KiB) that is the key the query
@@ -7530,6 +7546,15 @@ in-flight bound, and
 `the_whole_part_warm_leaves_every_counted_metadata_entry_resident` pins the
 share: on a cache smaller than two tenants' whole parts, every probe the pass
 counted is still cached after the warm.
+`tenants_resolved_before_the_deadline_are_warmed_while_later_ones_resolve`
+pins the streamed resolution: with every commit listing held 100 ms, 32
+tenants take several deadlines to resolve, and the tenants resolved before
+the deadline are warmed.
+`metric_parts_larger_than_the_share_warm_on_their_footer_reservation` pins
+the metric reservation, and
+`a_part_that_does_not_fit_waits_for_the_fetches_in_flight_to_settle` pins
+the wait: parts whose in-flight fetches settle to cache hits all warm on a
+share one byte short of two parts.
 
 See docs/guides/caching.md for CLI flags, metrics, and known gaps, and
 docs/adrs/0046-read-cache-tier.md for the funnel/keying/eviction design
