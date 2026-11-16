@@ -310,12 +310,15 @@ pub(crate) struct InstalledPolicy {
 }
 
 impl CompatSlot {
-    pub(crate) fn set(&self, policy: Option<Arc<IngestCompatPolicy>>, max_flush_lifetime: Duration) {
-        *self.0.write().unwrap_or_else(|p| p.into_inner()) =
-            policy.map(|policy| InstalledPolicy {
-                policy,
-                max_flush_lifetime,
-            });
+    pub(crate) fn set(
+        &self,
+        policy: Option<Arc<IngestCompatPolicy>>,
+        max_flush_lifetime: Duration,
+    ) {
+        *self.0.write().unwrap_or_else(|p| p.into_inner()) = policy.map(|policy| InstalledPolicy {
+            policy,
+            max_flush_lifetime,
+        });
     }
 
     pub(crate) fn get(&self) -> Option<Arc<IngestCompatPolicy>> {

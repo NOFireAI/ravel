@@ -558,11 +558,10 @@ async fn stale_after_grant<T: std::fmt::Debug, E: std::fmt::Debug>(
         Arc<ManualClock>,
         Arc<IngestCompatPolicy>,
         TenantId,
-    )
-        -> (
-            tokio::task::JoinHandle<Result<T, E>>,
-            Box<dyn Fn() -> crate::compat::CompatRefusalSnapshot>,
-        ),
+    ) -> (
+        tokio::task::JoinHandle<Result<T, E>>,
+        Box<dyn Fn() -> crate::compat::CompatRefusalSnapshot>,
+    ),
     refused_view_stale: impl Fn(&E) -> bool,
 ) {
     let acme = TenantId::new("acme");
@@ -581,7 +580,10 @@ async fn stale_after_grant<T: std::fmt::Debug, E: std::fmt::Debug>(
     }
 
     clock.step(15).await;
-    assert!(!written.is_finished(), "inside the lifetime the flush waits");
+    assert!(
+        !written.is_finished(),
+        "inside the lifetime the flush waits"
+    );
     assert_eq!(
         objects(&keys(store.as_ref(), &acme, signal).await),
         0,
@@ -590,14 +592,19 @@ async fn stale_after_grant<T: std::fmt::Debug, E: std::fmt::Debug>(
     assert_eq!(refused().total(), 0, "the flush is not dropped");
 
     if recover {
-        view.refresh().await.expect("the view reads sys/compat again");
+        view.refresh()
+            .await
+            .expect("the view reads sys/compat again");
         for _ in 0..5 {
             if written.is_finished() {
                 break;
             }
             clock.step(1).await;
         }
-        assert!(written.is_finished(), "published within a retry of the refresh");
+        assert!(
+            written.is_finished(),
+            "published within a retry of the refresh"
+        );
         written
             .await
             .expect("write task")

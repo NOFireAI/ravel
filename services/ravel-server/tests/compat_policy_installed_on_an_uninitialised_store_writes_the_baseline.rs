@@ -50,8 +50,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
-use ravel_catalog::compat::COMPAT_KEY;
 use ravel_catalog::PROVISIONING_FENCED_FORMAT_VERSION;
+use ravel_catalog::compat::COMPAT_KEY;
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
@@ -426,16 +426,11 @@ fn assert_v0_33_readable(written: &Written) {
         ("commit record segment_format_version", &written.commits),
     ] {
         for (signal, versions) in by_signal {
-            let current = [
-                Signal::Metrics,
-                Signal::Logs,
-                Signal::Spans,
-                Signal::Audit,
-            ]
-            .into_iter()
-            .find(|s| format!("{s:?}") == *signal)
-            .map(current_version)
-            .unwrap_or_else(|| panic!("unexpected signal {signal}"));
+            let current = [Signal::Metrics, Signal::Logs, Signal::Spans, Signal::Audit]
+                .into_iter()
+                .find(|s| format!("{s:?}") == *signal)
+                .map(current_version)
+                .unwrap_or_else(|| panic!("unexpected signal {signal}"));
             assert!(
                 versions.iter().all(|v| *v == current),
                 "every {signal} {what} is at CURRENT {current}: {versions:?}"

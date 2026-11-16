@@ -6368,14 +6368,19 @@ mod tests {
         assert_eq!(held.len(), before.len());
         assert_eq!(refused(&router).total(), 0);
 
-        view.refresh().await.expect("the view reads sys/compat again");
+        view.refresh()
+            .await
+            .expect("the view reads sys/compat again");
         stale_retries(&clock, 2).await;
         write
             .await
             .expect("write task")
             .expect("published once the view is fresh");
         assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 2);
-        assert_eq!(committed_rseg_versions(store.as_ref(), &acme).await, vec![7]);
+        assert_eq!(
+            committed_rseg_versions(store.as_ref(), &acme).await,
+            vec![7]
+        );
         assert_eq!(refused(&router).total(), 0);
         router.flush_all().await;
     }
@@ -6497,7 +6502,9 @@ mod tests {
         assert_eq!(router.metrics().snapshot().put_retries, 1);
         assert_eq!(refused(&router).total(), 0);
         if recover {
-            view.refresh().await.expect("the view reads sys/compat again");
+            view.refresh()
+                .await
+                .expect("the view reads sys/compat again");
         }
         while !write.is_finished() {
             stale_retries(&clock, 1).await;
@@ -7107,7 +7114,11 @@ mod tests {
             assert_eq!(refused(&router).total(), 1);
         } else {
             stale_retries(&clock, 31).await;
-            assert_eq!(refused(&router).view_stale, 2, "abandoned past the lifetime");
+            assert_eq!(
+                refused(&router).view_stale,
+                2,
+                "abandoned past the lifetime"
+            );
             assert_eq!(refused(&router).total(), 2);
             assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 0);
         }
