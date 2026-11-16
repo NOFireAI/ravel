@@ -397,7 +397,8 @@ async fn remote_write(
 
     // Pin/validate the (tenant, Metrics) shard_count provisioning record on
     // first write (ADR-0050 section 5). A hard mismatch fails this request with
-    // a 500; a store blip or corrupt record is logged and ingest proceeds.
+    // a 500 and a first touch under a stale sys/compat view with a 503; a store
+    // blip or corrupt record is logged and ingest proceeds.
     if let Err(err) = crate::provisioning::ensure_provisioning_record(
         &state.provisioning,
         &tenant,
@@ -407,7 +408,12 @@ async fn remote_write(
     .await
     {
         state.metrics.record_request_rejected();
-        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+        let code = if err.is_retryable() {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return (code, err.to_string()).into_response();
     }
 
     // Layer 2 (ADR-0051 section 2): byte rate on the compressed wire body,

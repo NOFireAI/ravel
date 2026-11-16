@@ -739,6 +739,71 @@ async fn an_unknown_section_kind_holds_the_bucket_in_compaction() {
     assert_eq!(after, before, "nothing is written");
 }
 
+/// The scan reports count an unknown-section hold as `held_unknown_section`,
+/// never as `held_out_of_window`: an operator reading the pass summary is
+/// told which of the two holds a bucket is in, since an out-of-window input
+/// clears with a newer reader and an unknown section kind only with a build
+/// that knows the kind.
+#[tokio::test]
+async fn the_scan_reports_count_an_unknown_section_hold_apart_from_out_of_window() {
+    let store = MemoryStore::new();
+    seed_input(
+        &store,
+        &InputSpec::new(
+            Uuid::from_u128(1),
+            10,
+            1,
+            vec![raw_series("keep", &[("k", "a")], &[(1_000, 1.0)])],
+        ),
+    )
+    .await;
+    seed_input_with_unknown_section(&store, u32::from(VERSION_V7)).await;
+    let clock = FixedClock::new(sealed_now_ns());
+    let b = bucket();
+
+    let scan = ravel_maintain::scan::scan_and_compact(
+        &store,
+        &clock,
+        &CompactorConfig::default(),
+        b.tenant_hash,
+        b.signal,
+        b.shard,
+    )
+    .await
+    .expect("a hold is not an error");
+    assert_eq!(
+        (
+            scan.held_unknown_section,
+            scan.held_out_of_window,
+            scan.compacted
+        ),
+        (1, 0, 0),
+        "{scan:?}"
+    );
+
+    let maintain = ravel_maintain::scan::scan_and_maintain(
+        &store,
+        &clock,
+        &CompactorConfig::default(),
+        &RetentionConfig::default(),
+        &NoLeases,
+        b.tenant_hash,
+        b.signal,
+        b.shard,
+    )
+    .await
+    .expect("a hold is not an error");
+    assert_eq!(
+        (
+            maintain.held_unknown_section,
+            maintain.held_out_of_window,
+            maintain.compacted
+        ),
+        (1, 0, 0),
+        "{maintain:?}"
+    );
+}
+
 /// H6 in `migrate`: the walk holds a bucket whose below-target input carries
 /// an unknown section kind, writes nothing for it, and raises no floor. The
 /// commit record says one version below the object's trailer, and the hold

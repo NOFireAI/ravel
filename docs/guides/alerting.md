@@ -328,14 +328,19 @@ On a keyed bucket (`--tenant-hash-key-file`), every process reads
   encoding.
 - Before the PUT of a history object, and before every attempt to publish
   its commit record, it checks that `sys/compat` was read less than 10
-  minutes ago and is still present after an activation. A refused PUT fails the rule for
-  this tick, as any failed record write does.
+  minutes ago and is still present after an activation. A process that has
+  never read `sys/compat` passes this check only while every failed read
+  was refused as `AccessDenied` and no record was seen; one whose reads
+  failed any other way (a 5xx, a timeout, throttling) refuses from the
+  first tick and takes no lease. A refused PUT fails the rule
+  for this tick, as any failed record write does.
 - A tick that runs longer than the publish lifetime the record states
   (`max_publish_lifetime_ns`) stops: the rules it has not reached fail with
   `alert tick abandoned past the publish lifetime` and are retried next
-  tick.
+  tick. When no record has been read, or it states no lifetime, the bound
+  is the default publish lifetime, one hour.
 - When the record names an `rlog` version this build does not write, or the
-  view is stale, the tick evaluates no rule and reports
+  view is stale by the rule above, the tick evaluates no rule and reports
   `outcome="lease_unavailable"`, and
   `ravel_compat_publish_refused_total{family="rlog"}` counts the refusal.
 

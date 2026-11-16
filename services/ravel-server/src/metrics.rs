@@ -5635,7 +5635,7 @@ pub(crate) fn render_compat_family(out: &mut String, mode: Mode, snapshot: &Comp
     write_header(
         out,
         "ravel_compat_publish_refused_total",
-        "Publishes a writer refused under the sys/compat write policy, by format family and reason: a view older than the 10 minute horizon, an active version this build does not write, or a missing record after an activation (ADR-4233 decision 3).",
+        "Publishes a writer refused under the sys/compat write policy, by format family and reason (ADR-4233 decision 3). Every writer: view_stale (a view older than the 10 minute horizon, or one that never read sys/compat, unless every failed read was refused as access denied, no sys/compat object was seen and the bucket has compat_epoch 0), active_version_not_writable (an active version this build does not write), compat_record_missing (a missing record after an activation). Maintenance only: publish_lifetime_above_compat, target_not_active, compaction_record_not_active, fence_failed, publish_lifetime_expired, and other for a reason this build does not name.",
         "counter",
     );
     for (family, reason, count) in &snapshot.refusals {
@@ -5667,7 +5667,7 @@ pub(crate) fn render_compat_family(out: &mut String, mode: Mode, snapshot: &Comp
     write_header(
         out,
         "ravel_compat_view_age_seconds",
-        "Seconds since this process's last successful read of sys/compat started; +Inf before the first. Once a sys/compat object has been read, writers refuse at 600 (ADR-4233 decision 3).",
+        "Seconds since this process's last successful read of sys/compat started; +Inf before the first. Writers refuse at 600 and at +Inf, except that at +Inf, while every failed read was refused as access denied and no sys/compat object was seen, they still write to a bucket whose compat_epoch is 0 (ADR-4233 decision 3).",
         "gauge",
     );
     match snapshot.view_age_seconds {
@@ -6036,6 +6036,9 @@ pub struct MaintenanceSafetySnapshot {
     /// [`ravel_maintain::buckets_held_out_of_window_total`], read at scrape
     /// time. Not signal-scoped: ravel-maintain keeps one total.
     pub compaction_held_out_of_window_buckets: u64,
+    /// [`ravel_maintain::buckets_held_unknown_section_total`], read at scrape
+    /// time. Not signal-scoped: ravel-maintain keeps one total.
+    pub compaction_held_unknown_section_buckets: u64,
     /// [`ravel_maintain::compaction_refused_total`] for every
     /// [`ravel_maintain::CompactionRefusedReason::ALL`] reason, read at scrape
     /// time. Not signal-scoped: ravel-maintain keeps one total per reason.
@@ -6086,6 +6089,8 @@ impl MaintenanceSafetySnapshot {
                 ravel_maintain::retention::unaddressable_held_buckets_total(),
             compaction_held_out_of_window_buckets: ravel_maintain::buckets_held_out_of_window_total(
             ),
+            compaction_held_unknown_section_buckets:
+                ravel_maintain::buckets_held_unknown_section_total(),
             compaction_refused: ravel_maintain::CompactionRefusedReason::ALL
                 .iter()
                 .map(|&reason| (reason, ravel_maintain::compaction_refused_total(reason)))
@@ -6262,6 +6267,25 @@ fn render_maintain_safety_family(
         "ravel_maintain_buckets_held_out_of_window_total",
         &[Label::Mode(mode)],
         snapshot.compaction_held_out_of_window_buckets,
+    );
+
+    write_header(
+        out,
+        "ravel_maintain_buckets_held_unknown_section_total",
+        "Buckets compaction left uncompacted because an input object carries a section kind this \
+         build does not know, which a re-encode would drop, counted once per bucket per pass, \
+         summed over every signal since process start (ADR-4233 hazard H6). Nothing is written \
+         for the bucket; later hours still compact and the bucket is retried every pass. A \
+         rising total means a newer release wrote the object: the bucket compacts once a build \
+         that knows the section kind runs here, or stops being retried once retention \
+         tombstones it.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_buckets_held_unknown_section_total",
+        &[Label::Mode(mode)],
+        snapshot.compaction_held_unknown_section_buckets,
     );
 
     write_header(
@@ -15843,6 +15867,7 @@ mod tests {
             retention_held_by_lease_buckets: 16,
             retention_unaddressable_held_buckets: 36,
             compaction_held_out_of_window_buckets: 31,
+            compaction_held_unknown_section_buckets: 37,
             compaction_refused: vec![
                 (ravel_maintain::CompactionRefusedReason::Geometry, 32),
                 (ravel_maintain::CompactionRefusedReason::TwoLevel, 33),
@@ -15970,6 +15995,21 @@ mod tests {
                 "ravel_maintain_buckets_held_out_of_window_total{mode=\"maintain\"} 31\n"
             ),
             "missing compaction_held_out_of_window_buckets sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "# HELP ravel_maintain_buckets_held_unknown_section_total Buckets compaction left \
+                 uncompacted because an input object carries a section kind this build does not \
+                 know, which a re-encode would drop, counted once per bucket per pass, summed over \
+                 every signal since process start (ADR-4233 hazard H6). Nothing is written for \
+                 the bucket; later hours still compact and the bucket is retried every pass. A \
+                 rising total means a newer release wrote the object: the bucket compacts once a \
+                 build that knows the section kind runs here, or stops being retried once \
+                 retention tombstones it.\n\
+                 # TYPE ravel_maintain_buckets_held_unknown_section_total counter\n\
+                 ravel_maintain_buckets_held_unknown_section_total{mode=\"maintain\"} 37\n"
+            ),
+            "missing compaction_held_unknown_section_buckets family:\n{body}"
         );
         for (reason, value) in [
             ("geometry", 32),
@@ -17563,6 +17603,7 @@ mod tests {
             retention_held_by_lease_buckets: 1,
             retention_unaddressable_held_buckets: 1,
             compaction_held_out_of_window_buckets: 1,
+            compaction_held_unknown_section_buckets: 1,
             compaction_refused: ravel_maintain::CompactionRefusedReason::ALL
                 .iter()
                 .map(|&reason| (reason, 1))
