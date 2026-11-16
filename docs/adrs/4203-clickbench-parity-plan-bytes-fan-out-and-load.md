@@ -142,7 +142,9 @@ per-statement promise:
    reads it, is updated with the change. The cap applies only to the
    derived value; an explicit `--store-get-concurrency` or
    `--fetch-concurrency` is used as given. SQL partitions keep their own
-   derivation and `promql_fetch_fanout` is unchanged. The value 64 is not
+   derivation (since capped at 32 on a loopback store; see the
+   partition-count cap amendment below) and `promql_fetch_fanout` is
+   unchanged. The value 64 is not
    yet measured at 384 partitions: the #3714 reading at 64 permits also cut
    partitions to 64, which restored the fast path, and Stage 0 runs 32 and
    384 permits only. The metal confirmation run is the first measurement of
