@@ -1959,9 +1959,9 @@ Limits:
   `ravel-cli catalog fold --signal` cover those three. No component folds
   alerts or audit, so those two signals have no catalog HEAD and the check
   reports nothing for them. An alert object at a version this build cannot
-  read is skipped and counted by the alert evaluator itself
-  (`ravel_alert_history_records_skipped_total`); no startup check covers
-  audit objects.
+  read refuses the evaluator's tick, which is counted by the alert evaluator
+  itself (`ravel_alert_history_records_skipped_total`); no startup check
+  covers audit objects.
 - The version checked is the one the writer recorded in the catalog entry.
   The reader still checks each object's own trailer when it opens it.
 

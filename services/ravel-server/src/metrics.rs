@@ -7008,9 +7008,12 @@ pub struct AlertSnapshot {
     pub ticks_lease_unavailable: u64,
     /// Ticks that evaluated nothing because the alert history was unreadable.
     pub ticks_history_unavailable: u64,
-    /// Alert history objects the fold skipped because their RLOG version is
-    /// unreadable by this build. Rendered as
-    /// `ravel_alert_history_records_skipped_total{reason="unsupported_version"}`.
+    /// Ticks the alert evaluator refused because an alert history object's RLOG
+    /// version is unreadable by this build (ADR-4233 decision 4, hazard H3).
+    /// Rendered as
+    /// `ravel_alert_history_records_skipped_total{reason="unsupported_version"}`,
+    /// the family name kept from when the object was skipped rather than the
+    /// tick refused.
     pub history_skipped_unsupported_version: u64,
     /// Unix nanoseconds the alert loop last completed a tick, `0` if none has
     /// completed yet. Rendered as
@@ -7042,7 +7045,7 @@ impl AlertSnapshot {
 /// ([`crate::alerting::active_alert_metrics`]). A deployment that configured no
 /// alert rules therefore carries none of these series at all, rather than a row
 /// of permanent zeros an alert rule would have to special-case.
-fn render_alert_family(out: &mut String, mode: Mode, snapshot: &AlertSnapshot) {
+pub(crate) fn render_alert_family(out: &mut String, mode: Mode, snapshot: &AlertSnapshot) {
     write_header(
         out,
         "ravel_alert_rules_evaluated_total",
@@ -7171,7 +7174,7 @@ fn render_alert_family(out: &mut String, mode: Mode, snapshot: &AlertSnapshot) {
     write_header(
         out,
         "ravel_alert_history_records_skipped_total",
-        "Alert history objects (one transition record each) the alert evaluator's history fold skipped instead of aborting, by reason, counted once per fold that read one, so an object still in the fold's tail is counted again on each tick until the state memo's watermark passes its hour. reason=\"unsupported_version\": an RLOG object whose format version this build cannot read. A skipped record's alert keeps its state memo copy, or on a full fold is treated as absent, so a still-live condition can notify once more. A warn log line names the tenant and object key.",
+        "Alert evaluation ticks the history fold refused because an alert history object carries an RLOG format version this build cannot read (ADR-4233 decision 4, hazard H3), by reason, counted once per fold that read such an object. The family name is kept from when such an object was skipped rather than the tick refused (ADR-2708 decision D6). reason=\"unsupported_version\": an RLOG object whose format version this build cannot read and whose bytes match its commit record's content hash. The tick keeps the previous durable state and writes no transition, so the object stays in every later fold and this rises every tick until the object is retired or the build is upgraded. An object that reads as an unsupported version but does not match that hash is corrupt and fails the tick as history_unavailable without moving this counter. A warn log line names the tenant and object key.",
         "counter",
     );
     for reason in crate::alerting::AlertHistorySkipReason::ALL {
