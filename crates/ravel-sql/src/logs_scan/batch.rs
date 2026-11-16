@@ -466,6 +466,15 @@ pub(super) struct RowBatchShape<'s> {
     pub(super) attrs_built: &'s Count,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Rows [`build_row_columns`] ran the attrs merge for on this thread, so a
+    /// test can pin that a row filter's first pass merges no row.
+    static ROW_MERGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Rows whose `attrs_raw` cell a row-path build decoded on this thread.
+    static ATTRS_RAW_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The view rows a row-path build reads: a chunk `start..end`, or a row
 /// filter's survivors, ascending.
 #[derive(Clone, Copy)]
@@ -529,6 +538,7 @@ pub(super) fn build_row_batch(
         streams,
         shape,
         reservation,
+        None,
     )?;
     let rows = kept.map_or(end - start, |kept| kept.len());
     let columns = with_row_refs(columns, row_refs, 0..rows)?;
@@ -547,18 +557,23 @@ pub(super) struct FilteredRows {
 
 /// [`build_row_batch`] followed by `filters`, building the columns the
 /// filter does not read only for the rows it keeps (ADR-0093, I64 equality
-/// amendment). The first build covers the columns `filters` reads
-/// ([`BoundRowFilters::reads`]) over the chunk's unerased rows; the filter
-/// runs on that batch, every row it removes is added to `dropped`, and the
-/// second build covers the whole build projection over the survivors only,
-/// so an `attrs` map, an `attrs['k']` column or another declared column is
-/// never built for a dropped row. The emitted batch holds the rows, values
-/// and row refs [`build_row_batch`] then [`BoundRowFilters::apply`] would
-/// give (`filter_first_equals_build_then_filter`).
+/// amendment). The first pass ([`build_filter_columns`]) resolves the
+/// columns `filters` reads ([`BoundRowFilters::reads`]) over the chunk's
+/// unerased rows and runs no attrs merge; the filter runs on that batch,
+/// every row it removes is added to `dropped`, and the second pass builds
+/// the whole build projection over the survivors only, reusing the first
+/// pass's decoded `attrs_raw` cells, so an `attrs` map, an `attrs['k']`
+/// column or another declared column is never built for a dropped row and
+/// no row is merged or decoded twice
+/// (`the_row_filters_first_pass_runs_no_attrs_merge`). The emitted batch
+/// holds the rows, values and row refs [`build_row_batch`] then
+/// [`BoundRowFilters::apply`] would give
+/// (`filter_first_equals_build_then_filter`). A filter that reads the
+/// `attrs` map takes a full build as its first pass.
 ///
-/// The first build's batch stays charged to `reservation` while the second
-/// runs; each build charges its own working memory as [`build_row_batch`]
-/// does.
+/// The first pass's batch and decoded cells stay charged to `reservation`
+/// while the second runs; each pass charges its own working memory as
+/// [`build_row_batch`] does.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_row_batch_filtered(
     block: &RowBlock,
@@ -586,14 +601,25 @@ pub(super) fn build_row_batch_filtered(
         projection: &reads,
         ..*shape
     };
-    let (columns, kept) = build_row_columns(
-        block,
-        RowSet::Range(start, end),
-        streams,
-        &first,
-        reservation,
-    )?;
-    let kept: Vec<usize> = kept.unwrap_or_else(|| (start..end).collect());
+    let mut charge = ChunkCharge::new(reservation);
+    let pass = if reads.contains(&LOG_COL_ATTRS) {
+        let (columns, kept) = build_row_columns(
+            block,
+            RowSet::Range(start, end),
+            streams,
+            &first,
+            reservation,
+            None,
+        )?;
+        FilterPass {
+            columns,
+            kept: kept.unwrap_or_else(|| (start..end).collect()),
+            raw: None,
+        }
+    } else {
+        build_filter_columns(block, start, end, streams, &first, reservation, &mut charge)?
+    };
+    let FilterPass { columns, kept, raw } = pass;
     if kept.is_empty() {
         return Ok(FilteredRows {
             batch: None,
@@ -601,7 +627,6 @@ pub(super) fn build_row_batch_filtered(
         });
     }
     let narrow = finish_row_batch(filters.read_schema(), columns, kept.len())?;
-    let mut charge = ChunkCharge::new(reservation);
     charge.grow(narrow.get_array_memory_size() + kept.capacity() * std::mem::size_of::<usize>())?;
     let passed = filters.survivors(narrow)?;
     dropped.add(kept.len() - passed.len());
@@ -616,6 +641,28 @@ pub(super) fn build_row_batch_filtered(
         .iter()
         .filter_map(|&p| kept.get(p).copied())
         .collect();
+    let survivor_spans: Option<Vec<(usize, usize)>> = match &raw {
+        Some(RawAttrs { spans, .. }) => {
+            charge.grow(survivors.len() * std::mem::size_of::<(usize, usize)>())?;
+            Some(
+                survivors
+                    .iter()
+                    .map(|&i| {
+                        spans.get(i - start).copied().ok_or_else(|| {
+                            DataFusionError::Internal(
+                                "logs scan row filter survivor has no attrs_raw span".into(),
+                            )
+                        })
+                    })
+                    .collect::<DFResult<_>>()?,
+            )
+        }
+        None => None,
+    };
+    let decoded = match (&raw, &survivor_spans) {
+        (Some(RawAttrs { entries, .. }), Some(spans)) => Some(DecodedRaw { entries, spans }),
+        _ => None,
+    };
     // Erasure already kept every survivor.
     let second = RowBatchShape {
         erasure: &[],
@@ -627,6 +674,7 @@ pub(super) fn build_row_batch_filtered(
         streams,
         &second,
         reservation,
+        decoded,
     )?;
     if rebuilt.is_some_and(|r| r.len() != survivors.len()) {
         return Err(DataFusionError::Internal(
@@ -641,15 +689,326 @@ pub(super) fn build_row_batch_filtered(
     })
 }
 
+/// Decoded `attrs_raw` entries and, per row of a build's [`RowSet`], the
+/// span of `entries` that row holds.
+#[derive(Clone, Copy)]
+struct DecodedRaw<'o> {
+    entries: &'o [(String, AttrValue)],
+    spans: &'o [(usize, usize)],
+}
+
+/// Decoded `attrs_raw` entries and, per row of the decoded [`RowSet`], the
+/// span of `entries` that row holds.
+struct RawAttrs {
+    entries: Vec<(String, AttrValue)>,
+    spans: Vec<(usize, usize)>,
+}
+
+/// What [`build_filter_columns`] resolved: the filter's columns over the
+/// unerased rows `kept` (view indices), and the `attrs_raw` entries it
+/// decoded with each chunk row's span, `None` when it decoded none.
+struct FilterPass {
+    columns: Vec<ArrayRef>,
+    kept: Vec<usize>,
+    raw: Option<RawAttrs>,
+}
+
+/// The first pass of [`build_row_batch_filtered`]: the columns of
+/// `shape.projection` (the filter's reads, no `attrs` map) over the unerased
+/// rows of `start..end`, with no attrs merge. A key column's cell is the
+/// value [`build_row_columns`]'s merge leaves under the key: the row's last
+/// record cell with that name (FIELD_DIR columns in order, then `attrs_raw`
+/// entries), else its stream's first entry with that name. Erasure reads
+/// each predicate key's first string value in the record and in that merged
+/// view, as [`build_row_columns`] does.
+fn build_filter_columns(
+    block: &RowBlock,
+    start: usize,
+    end: usize,
+    streams: &mut StreamAttrsCache,
+    shape: &RowBatchShape<'_>,
+    reservation: &MemoryReservation,
+    charge: &mut ChunkCharge<'_>,
+) -> DFResult<FilterPass> {
+    use std::mem::size_of;
+    let view = block.view();
+    let rows_len = end - start;
+    let mut keys: Vec<&str> = Vec::new();
+    let mut slot_of_index: HashMap<usize, usize> = HashMap::new();
+    for &idx in shape.projection {
+        let Some(key) = projected_key(idx, shape.declared, shape.attr_keys, shape.full_len) else {
+            continue;
+        };
+        let slot = match keys.iter().position(|k| *k == key) {
+            Some(slot) => slot,
+            None => {
+                keys.push(key);
+                keys.len() - 1
+            }
+        };
+        slot_of_index.insert(idx, slot);
+    }
+    let erasure = !shape.erasure.is_empty();
+    if keys.is_empty() && !erasure {
+        let mut columns = Vec::with_capacity(shape.projection.len());
+        for &idx in shape.projection {
+            columns.push(fixed_column_array(&view, idx, start, end)?.ok_or_else(|| {
+                DataFusionError::Internal(format!("logs scan projection index {idx} out of range"))
+            })?);
+        }
+        return Ok(FilterPass {
+            columns,
+            kept: (start..end).collect(),
+            raw: None,
+        });
+    }
+
+    let mut last_ref = None;
+    for i in start..end {
+        let stream_ref = row_stream_ref(&view, i)?;
+        if last_ref == Some(stream_ref) || streams.attrs.contains_key(&stream_ref) {
+            last_ref = Some(stream_ref);
+            continue;
+        }
+        last_ref = Some(stream_ref);
+        let blob = view.stream_attrs_of(stream_ref).ok_or_else(|| {
+            DataFusionError::Internal(format!("stream_ref {stream_ref} not in STREAM_DIR"))
+        })?;
+        let decoded = decode_stream_attrs(blob)?;
+        let bytes = attrs_memory(&decoded, decoded.capacity());
+        reservation.try_grow(bytes)?;
+        streams.charged += bytes;
+        streams.attrs.insert(stream_ref, decoded);
+    }
+    let streams = &streams.attrs;
+
+    let raw = if view.has_attrs_raw_page() {
+        Some(decode_raw(
+            &view,
+            RowSet::Range(start, end),
+            shape.key,
+            charge,
+        )?)
+    } else {
+        None
+    };
+    let (raw_entries, spans) = match &raw {
+        Some(raw) => (raw.entries.as_slice(), raw.spans.as_slice()),
+        None => (&[][..], &[][..]),
+    };
+
+    // Each key's FIELD_DIR columns, and every column when erasure needs the
+    // whole record; each stream's first entry under each key.
+    let mut key_cols: Vec<Vec<DeclaredCursor<'_>>> = keys.iter().map(|_| Vec::new()).collect();
+    let mut all_cols: Vec<(&str, DeclaredCursor<'_>)> = Vec::new();
+    for (name, col) in view.attr_columns() {
+        if let Some(slot) = keys.iter().position(|k| *k == name)
+            && let Some(cols) = key_cols.get_mut(slot)
+        {
+            cols.push(DeclaredCursor::resolve(&view, col));
+        }
+        if erasure {
+            all_cols.push((name, DeclaredCursor::resolve(&view, col)));
+        }
+    }
+    let stream_firsts: HashMap<u32, Vec<Option<Cell<'_>>>> = streams
+        .iter()
+        .map(|(&sref, attrs)| (sref, keys.iter().map(|k| first_cell(attrs, k)).collect()))
+        .collect();
+    let word = size_of::<usize>();
+    charge.grow(
+        (key_cols.iter().map(Vec::len).sum::<usize>() + all_cols.len())
+            * size_of::<(&str, DeclaredCursor<'_>)>()
+            + hash_table_bytes(streams.len(), size_of::<(u32, Vec<Option<Cell<'_>>>)>())
+            + streams.len() * keys.len() * size_of::<Option<Cell<'_>>>()
+            + rows_len * (word + keys.len() * size_of::<Option<Cell<'_>>>()),
+    )?;
+
+    let mut kept: Vec<usize> = Vec::with_capacity(rows_len);
+    let mut key_cells: Vec<Vec<Option<Cell<'_>>>> = vec![Vec::with_capacity(rows_len); keys.len()];
+    for (n, i) in (start..end).enumerate() {
+        let stream_ref = row_stream_ref(&view, i)?;
+        let (Some(stream), Some(firsts)) =
+            (streams.get(&stream_ref), stream_firsts.get(&stream_ref))
+        else {
+            return Err(DataFusionError::Internal(format!(
+                "stream_ref {stream_ref} attributes not decoded"
+            )));
+        };
+        let row_raw = spans
+            .get(n)
+            .and_then(|&(from, to)| raw_entries.get(from..to))
+            .unwrap_or_default();
+        if erasure {
+            let ts = view
+                .ts(i)
+                .ok_or_else(|| DataFusionError::Internal("row-path row has no ts".into()))?;
+            let erased = is_erased_log_row(
+                shape.erasure,
+                ts,
+                |k| {
+                    all_cols
+                        .iter()
+                        .filter(|(name, _)| *name == k)
+                        .find_map(|(_, cursor)| cursor.cell_at(i).and_then(Cell::as_str))
+                        .or_else(|| {
+                            row_raw.iter().find_map(|(name, value)| {
+                                if name == k {
+                                    Cell::of(value).as_str()
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                },
+                |k| {
+                    let named = all_cols
+                        .iter()
+                        .filter(|(name, _)| *name == k)
+                        .map(|(_, cursor)| cursor);
+                    let record = last_record_cell(named, row_raw, k, i);
+                    let mut in_stream = stream.iter().filter(|(name, _)| name == k);
+                    match in_stream.next() {
+                        None => record.and_then(Cell::as_str),
+                        Some((_, value)) => record
+                            .unwrap_or(Cell::of(value))
+                            .as_str()
+                            .or_else(|| in_stream.find_map(|(_, value)| Cell::of(value).as_str())),
+                    }
+                },
+            );
+            if erased {
+                continue;
+            }
+        }
+        kept.push(i);
+        for (slot, cells) in key_cells.iter_mut().enumerate() {
+            let (Some(key), Some(cols)) = (keys.get(slot), key_cols.get(slot)) else {
+                continue;
+            };
+            let record = last_record_cell(cols.iter(), row_raw, key, i);
+            cells.push(record.or(firsts.get(slot).copied().flatten()));
+        }
+    }
+
+    let kept_rows: Vec<usize>;
+    let first = kept.first().copied().unwrap_or(0);
+    let contiguous = kept.iter().enumerate().all(|(n, &i)| i == first + n);
+    let (fixed_view, fixed_start, fixed_end) = if contiguous {
+        (view, first, first + kept.len())
+    } else {
+        kept_rows = block_rows(block, &kept);
+        (block.view_over(&kept_rows), 0, kept_rows.len())
+    };
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(shape.projection.len());
+    for &idx in shape.projection {
+        if let Some(array) = fixed_column_array(&fixed_view, idx, fixed_start, fixed_end)? {
+            columns.push(array);
+            continue;
+        }
+        let cells = slot_of_index
+            .get(&idx)
+            .and_then(|&slot| key_cells.get(slot));
+        columns.push(keyed_column_array(idx, cells, shape)?);
+    }
+    Ok(FilterPass { columns, kept, raw })
+}
+
+/// The first entry of `attrs` under `key`, the one the attrs merge keeps.
+fn first_cell<'a>(attrs: &'a [(String, AttrValue)], key: &str) -> Option<Cell<'a>> {
+    attrs
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| Cell::of(value))
+}
+
+/// The record cell the attrs merge leaves under `key` at view row `i`: the
+/// last of `cursors` (the key's FIELD_DIR columns, in order) holding a cell,
+/// overridden by the last of the row's `attrs_raw` entries under `key`.
+fn last_record_cell<'a, 'c>(
+    cursors: impl Iterator<Item = &'c DeclaredCursor<'a>>,
+    raw: &'a [(String, AttrValue)],
+    key: &str,
+    i: usize,
+) -> Option<Cell<'a>>
+where
+    'a: 'c,
+{
+    raw.iter()
+        .rev()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| Cell::of(value))
+        .or_else(|| cursors.filter_map(|cursor| cursor.cell_at(i)).last())
+}
+
+/// Each row of `rows`'s `attrs_raw` entries, decoded into one vector, and
+/// the span each row holds; every decoded row is charged to `charge` before
+/// the next is decoded.
+fn decode_raw(
+    view: &ColumnarBlockView<'_>,
+    rows: RowSet<'_>,
+    key: &str,
+    charge: &mut ChunkCharge<'_>,
+) -> DFResult<RawAttrs> {
+    let mut entries: Vec<(String, AttrValue)> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    charge.grow(rows.len() * std::mem::size_of::<(usize, usize)>())?;
+    spans.reserve_exact(rows.len());
+    for i in rows.iter() {
+        #[cfg(test)]
+        ATTRS_RAW_DECODES.with(|c| c.set(c.get() + 1));
+        let (len, capacity) = (entries.len(), entries.capacity());
+        view.decode_attrs_raw_into(i, &mut entries)
+            .map_err(|source| {
+                SqlError::from(LogFetchError::Corrupt {
+                    key: key.to_string(),
+                    source,
+                })
+            })?;
+        let added = entries.get(len..).unwrap_or_default();
+        charge.grow(attrs_memory(added, entries.capacity() - capacity))?;
+        spans.push((len, entries.len()));
+    }
+    Ok(RawAttrs { entries, spans })
+}
+
+/// The column at projection index `idx` of a declared or `attrs['k']` key
+/// over `cells`, one per built row.
+fn keyed_column_array(
+    idx: usize,
+    cells: Option<&Vec<Option<Cell<'_>>>>,
+    shape: &RowBatchShape<'_>,
+) -> DFResult<ArrayRef> {
+    let declared = idx
+        .checked_sub(FIRST_DECLARED_COL)
+        .and_then(|k| shape.declared.get(k));
+    match (cells, declared) {
+        (Some(cells), _) if idx >= shape.full_len => {
+            let mut b = StringBuilder::new();
+            for &cell in cells {
+                append_rendered(&mut b, cell)?;
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        (Some(cells), Some(dc)) => Ok(declared_cells_array(dc, cells)),
+        _ => Err(DataFusionError::Internal(format!(
+            "logs scan projection index {idx} out of range"
+        ))),
+    }
+}
+
 /// The columns of `shape.projection` over the unerased rows of `rows`, and
 /// those rows' view indices, `None` when every row of `rows` was kept
 /// without consulting erasure. The work [`build_row_batch`] documents.
+/// `decoded`, when given, holds each row of `rows`'s `attrs_raw` entries,
+/// which the build then does not decode again.
 fn build_row_columns(
     block: &RowBlock,
     rows: RowSet<'_>,
     streams: &mut StreamAttrsCache,
     shape: &RowBatchShape<'_>,
     reservation: &MemoryReservation,
+    decoded: Option<DecodedRaw<'_>>,
 ) -> DFResult<(Vec<ArrayRef>, Option<Vec<usize>>)> {
     use std::mem::size_of;
     let view = block.view();
@@ -704,28 +1063,25 @@ fn build_row_columns(
     }
     let streams = &streams.attrs;
 
-    // `overflow_ends[n]` is where the `n`th row's `attrs_raw` entries end.
-    let mut overflow: Vec<(String, AttrValue)> = Vec::new();
-    let mut overflow_ends: Vec<usize> = Vec::new();
-    let mut max_overflow = 0;
-    if view.has_attrs_raw_page() {
-        charge.grow(rows_len * size_of::<usize>())?;
-        overflow_ends.reserve_exact(rows_len);
-        for i in rows.iter() {
-            let (len, capacity) = (overflow.len(), overflow.capacity());
-            view.decode_attrs_raw_into(i, &mut overflow)
-                .map_err(|source| {
-                    SqlError::from(LogFetchError::Corrupt {
-                        key: shape.key.to_string(),
-                        source,
-                    })
-                })?;
-            let added = overflow.get(len..).unwrap_or_default();
-            charge.grow(attrs_memory(added, overflow.capacity() - capacity))?;
-            max_overflow = max_overflow.max(added.len());
-            overflow_ends.push(overflow.len());
+    // `spans[n]` is the `n`th row's `attrs_raw` entries in `overflow`.
+    let owned: RawAttrs;
+    let decoded = match decoded {
+        Some(raw) => raw,
+        None if view.has_attrs_raw_page() => {
+            owned = decode_raw(&view, rows, shape.key, &mut charge)?;
+            DecodedRaw {
+                entries: &owned.entries,
+                spans: &owned.spans,
+            }
         }
-    }
+        None => DecodedRaw {
+            entries: &[],
+            spans: &[],
+        },
+    };
+    let (overflow, spans) = (decoded.entries, decoded.spans);
+    let overflow_len: usize = spans.iter().map(|&(from, to)| to - from).sum();
+    let max_overflow = spans.iter().map(|&(from, to)| to - from).max().unwrap_or(0);
 
     // Each projected key column's slot in `key_cells`; a declared column and
     // an `attrs['k']` column of one key share a slot.
@@ -745,9 +1101,9 @@ fn build_row_columns(
     // `attrs` map is built, else one row's at a time.
     let field_count = view.attr_columns().count();
     let cached_entries: usize = streams.values().map(Vec::len).sum();
-    let name_bound = field_count + cached_entries + overflow.len();
+    let name_bound = field_count + cached_entries + overflow_len;
     let entry_bound = if attrs_projected {
-        stream_entries + rows_len * field_count + overflow.len()
+        stream_entries + rows_len * field_count + overflow_len
     } else {
         max_stream + field_count + max_overflow
     };
@@ -757,7 +1113,7 @@ fn build_row_columns(
         + hash_table_bytes(name_bound, size_of::<(&str, usize)>())
         + name_bound * 2 * word
         + hash_table_bytes(streams.len(), size_of::<(u32, Vec<usize>)>())
-        + (cached_entries + overflow.len()) * word
+        + (cached_entries + overflow_len) * word
         + entry_bound * size_of::<(&str, Cell<'_>)>()
         + record_bound * size_of::<(usize, &str, Cell<'_>)>()
         + rows_len * (3 * word + slot_of_key.len() * size_of::<Option<Cell<'_>>>());
@@ -779,7 +1135,11 @@ fn build_row_columns(
         .iter()
         .map(|(&sref, attrs)| (sref, attrs.iter().map(|(k, _)| intern(k)).collect()))
         .collect();
-    let overflow_ids: Vec<usize> = overflow.iter().map(|(k, _)| intern(k)).collect();
+    let overflow_ids: Vec<usize> = spans
+        .iter()
+        .flat_map(|&(from, to)| overflow.get(from..to).unwrap_or_default())
+        .map(|(k, _)| intern(k))
+        .collect();
     let mut slot_ids: Vec<Option<usize>> = vec![None; slot_of_key.len()];
     for (key, &slot) in &slot_of_key {
         if let Some(id) = slot_ids.get_mut(slot) {
@@ -797,8 +1157,10 @@ fn build_row_columns(
     let mut kept: Vec<usize> = Vec::with_capacity(rows_len);
     let mut key_cells: Vec<Vec<Option<Cell<'_>>>> =
         vec![Vec::with_capacity(rows_len); slot_ids.len()];
-    let mut overflow_from = 0;
+    let mut ids_from = 0;
     for (n, i) in rows.iter().enumerate() {
+        #[cfg(test)]
+        ROW_MERGES.with(|c| c.set(c.get() + 1));
         let stamp = n + 1;
         let base = entries.len();
         let stream_ref = row_stream_ref(&view, i)?;
@@ -821,15 +1183,15 @@ fn build_row_columns(
                 record.push((*id, name, cell));
             }
         }
-        if let Some(&overflow_to) = overflow_ends.get(n) {
-            let attrs = overflow.get(overflow_from..overflow_to).unwrap_or_default();
+        if let Some(&(from, to)) = spans.get(n) {
+            let attrs = overflow.get(from..to).unwrap_or_default();
             let attr_ids = overflow_ids
-                .get(overflow_from..overflow_to)
+                .get(ids_from..ids_from + attrs.len())
                 .unwrap_or_default();
             for ((name, value), &id) in attrs.iter().zip(attr_ids) {
                 record.push((id, name.as_str(), Cell::of(value)));
             }
-            overflow_from = overflow_to;
+            ids_from += attrs.len();
         }
         for &(id, name, cell) in &record {
             if stamp_of[id] == stamp {
@@ -911,24 +1273,7 @@ fn build_row_columns(
             let cells = slot_of_index
                 .get(&idx)
                 .and_then(|&slot| key_cells.get(slot));
-            let declared = idx
-                .checked_sub(FIRST_DECLARED_COL)
-                .and_then(|k| shape.declared.get(k));
-            match (cells, declared) {
-                (Some(cells), _) if idx >= shape.full_len => {
-                    let mut b = StringBuilder::new();
-                    for &cell in cells {
-                        append_rendered(&mut b, cell)?;
-                    }
-                    Arc::new(b.finish())
-                }
-                (Some(cells), Some(dc)) => declared_cells_array(dc, cells),
-                _ => {
-                    return Err(DataFusionError::Internal(format!(
-                        "logs scan projection index {idx} out of range"
-                    )));
-                }
-            }
+            keyed_column_array(idx, cells, shape)?
         };
         columns.push(array);
     }
@@ -8720,6 +9065,121 @@ mod row_path_tests {
         assert!(first.batch.is_none(), "no survivor, no batch");
         assert_eq!((first_attrs, dropped, first.unerased), (0, 4, 4));
         assert_eq!(then.num_rows(), 0);
+    }
+
+    /// ADR-0093, I64 equality amendment: the filter-first build's first pass
+    /// resolves only the cells of the column the filter reads, so a chunk of
+    /// `N` rows the filter cuts to `S` runs the attrs merge for the `S`
+    /// survivors only, and decodes each row's `attrs_raw` cell once, `N` in
+    /// all, as build-then-filter does. Run with `k1` in a FIELD_DIR column
+    /// (64 dynamic columns) and in `attrs_raw` (none), each against
+    /// build-then-filter, over every column and over `ts` alone.
+    ///
+    /// Flipped: a first pass that runs the merge over the chunk counts
+    /// `N + S` merges and fails "the first pass merges no row".
+    #[test]
+    fn the_row_filters_first_pass_runs_no_attrs_merge() {
+        const N: usize = 10;
+        const KEPT: [i64; 6] = [1, 2, 5, 6, 9, 10];
+        let stream = Stream {
+            resource: vec![("k1".into(), AttrValue::I64(7))],
+            scope: Vec::new(),
+        };
+        let records: Vec<LogRecord> = (0..N)
+            .map(|i| {
+                let mut attrs = vec![("k0".to_string(), AttrValue::Str(format!("v{i}")))];
+                match i % 4 {
+                    0 => {}
+                    1 => attrs.push(("k1".into(), AttrValue::I64(7))),
+                    2 => attrs.push(("k1".into(), AttrValue::Str("7".into()))),
+                    _ => attrs.push(("k1".into(), AttrValue::I64(i as i64 + 100))),
+                }
+                record(0, &stream, i as i64 + 1, attrs)
+            })
+            .collect();
+        let declared = declared();
+        let attr_keys = attr_keys();
+        let (extended, full_len) = extended_schema(&declared, &attr_keys);
+        for max_dynamic_columns in [64, 0] {
+            let cfg = RlogConfig {
+                block_target_records: 64,
+                max_dynamic_columns,
+                ..RlogConfig::default()
+            };
+            let obj = write(&records, &cfg);
+            let reader = RlogReader::new(&obj, &cfg).expect("open");
+            let block = scan(&reader)
+                .next_row_block(&obj)
+                .expect("row exit")
+                .expect("block");
+            assert_eq!(block.len(), N, "one block");
+            assert_eq!(
+                block.view().has_attrs_raw_page(),
+                max_dynamic_columns == 0,
+                "k1 sits in attrs_raw only without dynamic columns"
+            );
+            let all: Vec<usize> = (0..extended.fields().len()).collect();
+            for projection in [all, vec![LOG_COL_TS]] {
+                let (build_projection, build_schema, filters) =
+                    k1_filter(&extended, &projection, 7);
+                let shape = shape(
+                    &build_schema,
+                    &build_projection,
+                    &declared,
+                    &attr_keys,
+                    full_len,
+                    &[],
+                );
+                let reservation = unbounded();
+                let mut streams = StreamAttrsCache::new();
+                let row_refs = Some(RowRefRange {
+                    segment: 0,
+                    block: 0,
+                    first_row: 0,
+                });
+                ROW_MERGES.with(|c| c.set(0));
+                ATTRS_RAW_DECODES.with(|c| c.set(0));
+                let first = build_row_batch_filtered(
+                    &block,
+                    0,
+                    N,
+                    &mut streams,
+                    &shape,
+                    &reservation,
+                    row_refs,
+                    &filters,
+                    &Count::new(),
+                )
+                .expect("filter first");
+                assert_eq!(
+                    ROW_MERGES.with(std::cell::Cell::get),
+                    KEPT.len(),
+                    "the first pass merges no row"
+                );
+                assert_eq!(
+                    ATTRS_RAW_DECODES.with(std::cell::Cell::get),
+                    if max_dynamic_columns == 0 { N } else { 0 },
+                    "each row's attrs_raw cell is decoded once"
+                );
+                let whole =
+                    build_row_batch(&block, 0, N, &mut streams, &shape, &reservation, row_refs)
+                        .expect("build whole");
+                let then = filters.apply(whole, &Count::new()).expect("apply");
+                let got = first.batch.expect("kept rows");
+                assert_same_columns(&got, &then);
+                let ts_at = projection
+                    .iter()
+                    .position(|&i| i == LOG_COL_TS)
+                    .expect("ts projected");
+                let ts = got
+                    .column(ts_at)
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .expect("ts");
+                assert_eq!(ts.values().to_vec(), KEPT.to_vec(), "the kept rows");
+                assert_eq!(reservation.size(), streams.charged());
+            }
+        }
     }
 
     /// [`check_case`]'s blocks with the row filter `k1 = v`: per chunk, the
