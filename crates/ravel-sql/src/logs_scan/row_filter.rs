@@ -17,9 +17,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::arrow::array::AsArray;
-use datafusion::arrow::compute::filter_record_batch;
-use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::array::{AsArray, UInt32Array};
+use datafusion::arrow::compute::{filter, filter_record_batch};
+use datafusion::arrow::datatypes::{DataType, SchemaRef, UInt32Type};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -92,10 +92,39 @@ impl RowFilters {
                     .data()
             })
             .collect::<DFResult<Vec<_>>>()?;
+        let mut reads: Vec<usize> = Vec::new();
+        for e in &exprs {
+            for c in collect_columns(e) {
+                if !reads.contains(&c.index()) {
+                    reads.push(c.index());
+                }
+            }
+        }
+        reads.sort_unstable();
+        let read_schema = Arc::new(build_schema.project(&reads)?);
+        let read_exprs = exprs
+            .iter()
+            .map(|e| {
+                Arc::clone(e)
+                    .transform(|node| {
+                        let Some(column) = node.downcast_ref::<Column>() else {
+                            return Ok(Transformed::no(node));
+                        };
+                        let index = read_schema.index_of(column.name())?;
+                        Ok(Transformed::yes(
+                            Arc::new(Column::new(column.name(), index)) as Arc<dyn PhysicalExpr>,
+                        ))
+                    })
+                    .data()
+            })
+            .collect::<DFResult<Vec<_>>>()?;
         Ok(Some(Arc::new(BoundRowFilters {
             exprs,
             keep,
             output,
+            reads,
+            read_schema,
+            read_exprs,
         })))
     }
 }
@@ -120,6 +149,12 @@ pub(crate) struct BoundRowFilters {
     exprs: Vec<Arc<dyn PhysicalExpr>>,
     keep: Option<Vec<usize>>,
     output: SchemaRef,
+    /// The build-schema positions of the columns `exprs` read, ascending.
+    reads: Vec<usize>,
+    /// The build schema projected to `reads`.
+    read_schema: SchemaRef,
+    /// `exprs` rebound to `read_schema`.
+    read_exprs: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl BoundRowFilters {
@@ -140,6 +175,48 @@ impl BoundRowFilters {
             batch = filter_record_batch(&batch, verdict.as_boolean())?;
         }
         dropped.add(built - batch.num_rows());
+        self.narrow(batch)
+    }
+
+    /// The build-schema positions of the columns the conjuncts read,
+    /// ascending: the columns of [`Self::read_schema`].
+    pub(super) fn reads(&self) -> &[usize] {
+        &self.reads
+    }
+
+    /// The build schema projected to [`Self::reads`].
+    pub(super) fn read_schema(&self) -> &SchemaRef {
+        &self.read_schema
+    }
+
+    /// The positions of `batch`'s rows that every conjunct holds true for,
+    /// ascending. `batch` holds the [`Self::read_schema`] columns only. The
+    /// conjuncts run one after another over the rows the previous ones kept,
+    /// as in [`Self::apply`], so a NULL verdict drops the row.
+    pub(super) fn survivors(&self, batch: RecordBatch) -> DFResult<Vec<usize>> {
+        let rows = u32::try_from(batch.num_rows()).map_err(|_| {
+            DataFusionError::Internal("logs scan row filter chunk exceeds u32 rows".into())
+        })?;
+        let mut positions = UInt32Array::from_iter_values(0..rows);
+        let mut batch = batch;
+        for e in &self.read_exprs {
+            let verdict = e.evaluate(&batch)?.into_array(batch.num_rows())?;
+            if verdict.data_type() != &DataType::Boolean {
+                return Err(DataFusionError::Internal(format!(
+                    "logs scan row filter {e} evaluated to {}",
+                    verdict.data_type()
+                )));
+            }
+            batch = filter_record_batch(&batch, verdict.as_boolean())?;
+            positions = filter(&positions, verdict.as_boolean())?
+                .as_primitive::<UInt32Type>()
+                .clone();
+        }
+        Ok(positions.values().iter().map(|&p| p as usize).collect())
+    }
+
+    /// `batch`, in the build schema, narrowed to the output columns.
+    pub(super) fn narrow(&self, batch: RecordBatch) -> DFResult<RecordBatch> {
         let Some(keep) = &self.keep else {
             return Ok(batch);
         };

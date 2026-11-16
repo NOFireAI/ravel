@@ -1210,8 +1210,16 @@ fn block_index(
 
 /// The row-ref column for `rows` consecutive rows starting at `range`.
 pub(super) fn row_ref_array(range: RowRefRange, rows: usize) -> DFResult<ArrayRef> {
-    let mut packed = Vec::with_capacity(rows);
-    for i in 0..rows {
+    row_ref_array_at(range, 0..rows)
+}
+
+/// [`row_ref_array`] for the rows at `positions` past `range.first_row`.
+pub(super) fn row_ref_array_at(
+    range: RowRefRange,
+    positions: impl ExactSizeIterator<Item = usize>,
+) -> DFResult<ArrayRef> {
+    let mut packed = Vec::with_capacity(positions.len());
+    for i in positions {
         packed.push(
             RowRef {
                 segment: range.segment,
@@ -1595,9 +1603,11 @@ impl LogScanStream {
     /// chunk's decoded `attrs_raw` entries and merge scratch are charged by
     /// [`build_row_batch`] for the length of the build.
     ///
-    /// With a row filter, each chunk is filtered as soon as it is built, and a
-    /// chunk the filter empties is skipped; `None` means the block's remaining
-    /// rows all failed the filter and nothing was charged.
+    /// With a row filter, each chunk's filter columns are built and filtered
+    /// first, and its other columns are built for the surviving rows only
+    /// ([`build_row_batch_filtered`]); a chunk the filter empties builds
+    /// nothing further and is skipped. `None` means the block's remaining rows
+    /// all failed the filter and nothing was charged.
     fn emit_next_row_batch(&mut self) -> DFResult<Option<RecordBatch>> {
         self.reservation.shrink(std::mem::take(&mut self.emitted));
         let pending_range = self.pending_range;
@@ -1621,6 +1631,7 @@ impl LogScanStream {
             full_len: self.full_len,
             erasure: &self.erasure,
             key,
+            attrs_built: &self.blocks.attrs_rows_built,
         };
         let batch = loop {
             if *pos >= block.len() {
@@ -1628,34 +1639,47 @@ impl LogScanStream {
             }
             let end = (*pos + BATCH_ROWS).min(block.len());
             let streams_before = streams.charged();
-            let built = build_row_batch(
-                block,
-                *pos,
-                end,
-                streams,
-                &shape,
-                &self.reservation,
-                pending_range.map(|r| RowRefRange {
-                    first_row: r.first_row + *kept,
-                    ..r
+            let row_refs = pending_range.map(|r| RowRefRange {
+                first_row: r.first_row + *kept,
+                ..r
+            });
+            // With a row filter, the columns it reads are built and filtered
+            // first, and the rest only for the rows it keeps.
+            let built = match &self.row_filters {
+                None => build_row_batch(
+                    block,
+                    *pos,
+                    end,
+                    streams,
+                    &shape,
+                    &self.reservation,
+                    row_refs,
+                )
+                .map(|batch| FilteredRows {
+                    unerased: batch.num_rows(),
+                    batch: Some(batch),
                 }),
-            );
+                Some(filters) => build_row_batch_filtered(
+                    block,
+                    *pos,
+                    end,
+                    streams,
+                    &shape,
+                    &self.reservation,
+                    row_refs,
+                    filters,
+                    &self.blocks.rows_dropped_by_row_filter,
+                ),
+            };
             // Decoded stream attributes stay charged with the block, even
             // when the build fails after decoding them.
             self.held += streams.charged() - streams_before;
-            let built = built?;
+            let FilteredRows { batch, unerased } = built?;
             *pos = end;
-            *kept += built.num_rows();
-            if built.num_rows() == 0 {
-                // Every row of the chunk was erased.
-                continue;
-            }
-            self.blocks.rows_consumed.add(built.num_rows());
-            let Some(filters) = &self.row_filters else {
-                break built;
-            };
-            let batch = filters.apply(built, &self.blocks.rows_dropped_by_row_filter)?;
-            if batch.num_rows() > 0 {
+            *kept += unerased;
+            // `unerased` is 0 when every row of the chunk was erased.
+            self.blocks.rows_consumed.add(unerased);
+            if let Some(batch) = batch.filter(|b| b.num_rows() > 0) {
                 break batch;
             }
         };

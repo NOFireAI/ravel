@@ -405,7 +405,13 @@ pub fn filter_has_row_filter(filter: &Expr, declared: &[DeclaredColumn]) -> bool
 fn leaf_is_exact(expr: &Expr, declared: &[DeclaredColumn]) -> bool {
     let mut out = LogsPushdown::default();
     handle_leaf(expr, &mut out, declared);
-    if !out.prune.is_empty() || !out.key_equals.is_empty() || out.key_in.is_some() {
+    // The I64 equality's own prune arm and key only narrow which blocks are
+    // read; its row filter evaluates the whole leaf.
+    let i64_equality =
+        matches!(expr, Expr::BinaryExpr(be) if i64_equality_row_filter(be, declared).is_some());
+    if !i64_equality
+        && (!out.prune.is_empty() || !out.key_equals.is_empty() || out.key_in.is_some())
+    {
         return false;
     }
     match expr {
@@ -417,7 +423,9 @@ fn leaf_is_exact(expr: &Expr, declared: &[DeclaredColumn]) -> bool {
             Some((Operator::Lt | Operator::LtEq, _)) => out.ts_hi.is_some(),
             Some(_) => false,
             // The scan evaluates the whole leaf as its row filter.
-            None => is_str_not_equal(be, declared) && out.row_filters.len() == 1,
+            None => {
+                (is_str_not_equal(be, declared) || i64_equality) && out.row_filters.len() == 1
+            }
         },
         Expr::Between(bt) if !bt.negated && is_ts_col(&bt.expr) => {
             out.ts_lo.is_some() && out.ts_hi.is_some()
@@ -639,6 +647,11 @@ fn handle_binary(be: &BinaryExpr, out: &mut LogsPushdown, declared: &[DeclaredCo
     if let Some(p) = attr_equality_predicate(be) {
         out.prune.push(p);
         return;
+    }
+    // A declared I64 column's `=` against an integer literal is also a row
+    // filter, beside the prune arm and key it builds below.
+    if let Some(filter) = i64_equality_row_filter(be, declared) {
+        out.row_filters.push(filter);
     }
     // A declared Str column's `<>` against a string literal goes to the
     // scan's own row filter channel, not to the reader.
@@ -973,6 +986,54 @@ fn is_str_not_equal(be: &BinaryExpr, declared: &[DeclaredColumn]) -> bool {
         },
     };
     column.ty == DeclaredType::Str && matches!(value, Expr::Literal(sv, _) if is_str_literal(sv))
+}
+
+/// `c = v` or `v = c`, with `c` a bare column resolving to a declared `I64`
+/// column (fixed names excluded, [`resolve_declared`]) and `v` a non-NULL
+/// integer literal of any width whose value fits an `i64`, as the row filter
+/// `c = v` with `v` an `Int64` literal (ADR-0093, I64 equality amendment).
+/// `None` for every other shape: another operator, a `Cast`-wrapped or
+/// computed column, a NULL, float, decimal or string literal, and an unsigned
+/// value past `i64::MAX`.
+fn i64_equality_row_filter(be: &BinaryExpr, declared: &[DeclaredColumn]) -> Option<Expr> {
+    if be.op != Operator::Eq {
+        return None;
+    }
+    let (column, dc, value) = match resolve_declared(&be.left, declared) {
+        Some(dc) => (be.left.as_ref(), dc, be.right.as_ref()),
+        None => {
+            let dc = resolve_declared(&be.right, declared)?;
+            (be.right.as_ref(), dc, be.left.as_ref())
+        }
+    };
+    if dc.ty != DeclaredType::I64 {
+        return None;
+    }
+    let v = lit_any_int(value)?;
+    Some(Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(column.clone()),
+        Operator::Eq,
+        Box::new(Expr::Literal(ScalarValue::Int64(Some(v)), None)),
+    )))
+}
+
+/// A non-NULL integer literal of any width, as an `i64`, or `None` when it
+/// does not fit one.
+fn lit_any_int(e: &Expr) -> Option<i64> {
+    let Expr::Literal(sv, _) = e else {
+        return None;
+    };
+    match sv {
+        ScalarValue::Int8(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::Int16(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::Int32(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::Int64(Some(v)) => Some(*v),
+        ScalarValue::UInt8(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::UInt64(Some(v)) => i64::try_from(*v).ok(),
+        _ => None,
+    }
 }
 
 /// A non-NULL `Utf8` or `Utf8View` scalar, bare or inside the

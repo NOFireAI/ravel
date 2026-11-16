@@ -451,6 +451,7 @@ impl Drop for ChunkCharge<'_> {
 }
 
 /// The output shape of a row-path batch and the pending erasure it applies.
+#[derive(Clone, Copy)]
 pub(super) struct RowBatchShape<'s> {
     pub(super) schema: &'s SchemaRef,
     pub(super) projection: &'s [usize],
@@ -460,6 +461,33 @@ pub(super) struct RowBatchShape<'s> {
     pub(super) erasure: &'s [ErasurePredicate],
     /// The object key, for attributing a corrupt `attrs_raw` cell.
     pub(super) key: &'s str,
+    /// Counts the rows whose `attrs` map the build materialized
+    /// ([`BlockMetrics::attrs_rows_built`]).
+    pub(super) attrs_built: &'s Count,
+}
+
+/// The view rows a row-path build reads: a chunk `start..end`, or a row
+/// filter's survivors, ascending.
+#[derive(Clone, Copy)]
+enum RowSet<'r> {
+    Range(usize, usize),
+    List(&'r [usize]),
+}
+
+impl RowSet<'_> {
+    fn len(&self) -> usize {
+        match self {
+            RowSet::Range(start, end) => end - start,
+            RowSet::List(rows) => rows.len(),
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len()).map(move |n| match self {
+            RowSet::Range(start, _) => start + n,
+            RowSet::List(rows) => rows.get(n).copied().unwrap_or(usize::MAX),
+        })
+    }
 }
 
 /// Build the batch for surviving rows `start..end` of a row-path block
@@ -493,30 +521,159 @@ pub(super) fn build_row_batch(
     reservation: &MemoryReservation,
     row_refs: Option<RowRefRange>,
 ) -> DFResult<RecordBatch> {
+    let end = end.min(block.view().surviving_count());
+    let start = start.min(end);
+    let (columns, kept) = build_row_columns(
+        block,
+        RowSet::Range(start, end),
+        streams,
+        shape,
+        reservation,
+    )?;
+    let rows = kept.map_or(end - start, |kept| kept.len());
+    let columns = with_row_refs(columns, row_refs, 0..rows)?;
+    finish_row_batch(shape.schema, columns, rows)
+}
+
+/// What [`build_row_batch_filtered`] built for one chunk.
+pub(super) struct FilteredRows {
+    /// The chunk's surviving rows in the scan's output schema, or `None` when
+    /// erasure and the row filter left none.
+    pub(super) batch: Option<RecordBatch>,
+    /// The chunk's rows erasure kept, which the row filter then saw; the
+    /// chunk's row-ref positions count these.
+    pub(super) unerased: usize,
+}
+
+/// [`build_row_batch`] followed by `filters`, building the columns the
+/// filter does not read only for the rows it keeps (ADR-0093, I64 equality
+/// amendment). The first build covers the columns `filters` reads
+/// ([`BoundRowFilters::reads`]) over the chunk's unerased rows; the filter
+/// runs on that batch, every row it removes is added to `dropped`, and the
+/// second build covers the whole build projection over the survivors only,
+/// so an `attrs` map, an `attrs['k']` column or another declared column is
+/// never built for a dropped row. The emitted batch holds the rows, values
+/// and row refs [`build_row_batch`] then [`BoundRowFilters::apply`] would
+/// give (`filter_first_equals_build_then_filter`).
+///
+/// The first build's batch stays charged to `reservation` while the second
+/// runs; each build charges its own working memory as [`build_row_batch`]
+/// does.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_row_batch_filtered(
+    block: &RowBlock,
+    start: usize,
+    end: usize,
+    streams: &mut StreamAttrsCache,
+    shape: &RowBatchShape<'_>,
+    reservation: &MemoryReservation,
+    row_refs: Option<RowRefRange>,
+    filters: &BoundRowFilters,
+    dropped: &Count,
+) -> DFResult<FilteredRows> {
+    let end = end.min(block.view().surviving_count());
+    let start = start.min(end);
+    let reads = filters
+        .reads()
+        .iter()
+        .map(|&i| {
+            shape.projection.get(i).copied().ok_or_else(|| {
+                DataFusionError::Internal(format!("logs scan row filter column {i} not built"))
+            })
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+    let first = RowBatchShape {
+        projection: &reads,
+        ..*shape
+    };
+    let (columns, kept) =
+        build_row_columns(block, RowSet::Range(start, end), streams, &first, reservation)?;
+    let kept: Vec<usize> = kept.unwrap_or_else(|| (start..end).collect());
+    if kept.is_empty() {
+        return Ok(FilteredRows {
+            batch: None,
+            unerased: 0,
+        });
+    }
+    let narrow = finish_row_batch(filters.read_schema(), columns, kept.len())?;
+    let mut charge = ChunkCharge::new(reservation);
+    charge.grow(narrow.get_array_memory_size() + kept.capacity() * std::mem::size_of::<usize>())?;
+    let passed = filters.survivors(narrow)?;
+    dropped.add(kept.len() - passed.len());
+    if passed.is_empty() {
+        return Ok(FilteredRows {
+            batch: None,
+            unerased: kept.len(),
+        });
+    }
+    charge.grow(passed.capacity() * std::mem::size_of::<usize>() * 2)?;
+    let survivors: Vec<usize> = passed.iter().filter_map(|&p| kept.get(p).copied()).collect();
+    // Erasure already kept every survivor.
+    let second = RowBatchShape {
+        erasure: &[],
+        ..*shape
+    };
+    let (columns, rebuilt) =
+        build_row_columns(block, RowSet::List(&survivors), streams, &second, reservation)?;
+    if rebuilt.is_some_and(|r| r.len() != survivors.len()) {
+        return Err(DataFusionError::Internal(
+            "logs scan row filter survivor dropped by its rebuild".into(),
+        ));
+    }
+    let columns = with_row_refs(columns, row_refs, passed.iter().copied())?;
+    let built = finish_row_batch(shape.schema, columns, survivors.len())?;
+    Ok(FilteredRows {
+        batch: Some(filters.narrow(built)?),
+        unerased: kept.len(),
+    })
+}
+
+/// The columns of `shape.projection` over the unerased rows of `rows`, and
+/// those rows' view indices, `None` when every row of `rows` was kept
+/// without consulting erasure. The work [`build_row_batch`] documents.
+fn build_row_columns(
+    block: &RowBlock,
+    rows: RowSet<'_>,
+    streams: &mut StreamAttrsCache,
+    shape: &RowBatchShape<'_>,
+    reservation: &MemoryReservation,
+) -> DFResult<(Vec<ArrayRef>, Option<Vec<usize>>)> {
     use std::mem::size_of;
     let view = block.view();
-    let end = end.min(view.surviving_count());
-    let start = start.min(end);
     let attrs_projected = shape.projection.contains(&LOG_COL_ATTRS);
     let needs_attrs = !shape.erasure.is_empty()
         || attrs_projected
         || shape.projection.iter().any(|&i| i >= FIRST_DECLARED_COL);
     if !needs_attrs {
+        let mapped: Vec<usize>;
+        let (fixed_view, fixed_start, fixed_end) = match rows {
+            RowSet::Range(start, end) => (view, start, end),
+            RowSet::List(list) => {
+                mapped = block_rows(block, list);
+                (block.view_over(&mapped), 0, mapped.len())
+            }
+        };
         let mut columns = Vec::with_capacity(shape.projection.len());
         for &idx in shape.projection {
-            columns.push(fixed_column_array(&view, idx, start, end)?.ok_or_else(|| {
-                DataFusionError::Internal(format!("logs scan projection index {idx} out of range"))
-            })?);
+            columns.push(
+                fixed_column_array(&fixed_view, idx, fixed_start, fixed_end)?.ok_or_else(
+                    || {
+                        DataFusionError::Internal(format!(
+                            "logs scan projection index {idx} out of range"
+                        ))
+                    },
+                )?,
+            );
         }
-        return finish_row_batch(shape.schema, columns, row_refs, end - start);
+        return Ok((columns, None));
     }
 
-    let rows = end - start;
+    let rows_len = rows.len();
     let mut charge = ChunkCharge::new(reservation);
     // Stream entries over the chunk's rows, and the most one row has.
     let mut stream_entries = 0;
     let mut max_stream = 0;
-    for i in start..end {
+    for i in rows.iter() {
         let stream_ref = row_stream_ref(&view, i)?;
         let attrs = match streams.attrs.entry(stream_ref) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -536,14 +693,14 @@ pub(super) fn build_row_batch(
     }
     let streams = &streams.attrs;
 
-    // `overflow_ends[n]` is where row `start + n`'s `attrs_raw` entries end.
+    // `overflow_ends[n]` is where the `n`th row's `attrs_raw` entries end.
     let mut overflow: Vec<(String, AttrValue)> = Vec::new();
     let mut overflow_ends: Vec<usize> = Vec::new();
     let mut max_overflow = 0;
     if view.has_attrs_raw_page() {
-        charge.grow(rows * size_of::<usize>())?;
-        overflow_ends.reserve_exact(rows);
-        for i in start..end {
+        charge.grow(rows_len * size_of::<usize>())?;
+        overflow_ends.reserve_exact(rows_len);
+        for i in rows.iter() {
             let (len, capacity) = (overflow.len(), overflow.capacity());
             view.decode_attrs_raw_into(i, &mut overflow)
                 .map_err(|source| {
@@ -579,7 +736,7 @@ pub(super) fn build_row_batch(
     let cached_entries: usize = streams.values().map(Vec::len).sum();
     let name_bound = field_count + cached_entries + overflow.len();
     let entry_bound = if attrs_projected {
-        stream_entries + rows * field_count + overflow.len()
+        stream_entries + rows_len * field_count + overflow.len()
     } else {
         max_stream + field_count + max_overflow
     };
@@ -592,7 +749,7 @@ pub(super) fn build_row_batch(
         + (cached_entries + overflow.len()) * word
         + entry_bound * size_of::<(&str, Cell<'_>)>()
         + record_bound * size_of::<(usize, &str, Cell<'_>)>()
-        + rows * (3 * word + slot_of_key.len() * size_of::<Option<Cell<'_>>>());
+        + rows_len * (3 * word + slot_of_key.len() * size_of::<Option<Cell<'_>>>());
     charge.grow(chunk_bytes)?;
 
     // Every attribute name the rows can hold, numbered, so the merge finds a
@@ -624,12 +781,12 @@ pub(super) fn build_row_batch(
     let mut stamp_of = vec![0usize; ids.len()];
     let mut slot_of = vec![0usize; ids.len()];
     let mut entries: Vec<(&str, Cell<'_>)> = Vec::with_capacity(entry_bound);
-    let mut row_ends: Vec<usize> = Vec::with_capacity(if attrs_projected { rows } else { 0 });
+    let mut row_ends: Vec<usize> = Vec::with_capacity(if attrs_projected { rows_len } else { 0 });
     let mut record: Vec<(usize, &str, Cell<'_>)> = Vec::with_capacity(record_bound);
-    let mut kept: Vec<usize> = Vec::with_capacity(rows);
-    let mut key_cells: Vec<Vec<Option<Cell<'_>>>> = vec![Vec::with_capacity(rows); slot_ids.len()];
+    let mut kept: Vec<usize> = Vec::with_capacity(rows_len);
+    let mut key_cells: Vec<Vec<Option<Cell<'_>>>> = vec![Vec::with_capacity(rows_len); slot_ids.len()];
     let mut overflow_from = 0;
-    for (n, i) in (start..end).enumerate() {
+    for (n, i) in rows.iter().enumerate() {
         let stamp = n + 1;
         let base = entries.len();
         let stream_ref = row_stream_ref(&view, i)?;
@@ -710,13 +867,12 @@ pub(super) fn build_row_batch(
     }
 
     let kept_rows: Vec<usize>;
-    let (fixed_view, fixed_start, fixed_end) = if kept.len() == rows {
-        (view, start, end)
+    let first = kept.first().copied().unwrap_or(0);
+    let contiguous = kept.iter().enumerate().all(|(n, &i)| i == first + n);
+    let (fixed_view, fixed_start, fixed_end) = if contiguous {
+        (view, first, first + kept.len())
     } else {
-        kept_rows = kept
-            .iter()
-            .map(|&i| block.rows().get(i).copied().unwrap_or(usize::MAX))
-            .collect();
+        kept_rows = block_rows(block, &kept);
         (block.view_over(&kept_rows), 0, kept_rows.len())
     };
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(shape.projection.len());
@@ -737,6 +893,7 @@ pub(super) fn build_row_batch(
                     .map_err(|e| SqlError::Internal(format!("attrs map build: {e}")))?;
                 from = to;
             }
+            shape.attrs_built.add(row_ends.len());
             Arc::new(map.finish())
         } else {
             let cells = slot_of_index
@@ -763,7 +920,14 @@ pub(super) fn build_row_batch(
         };
         columns.push(array);
     }
-    finish_row_batch(shape.schema, columns, row_refs, kept.len())
+    Ok((columns, Some(kept)))
+}
+
+/// The block row positions of view rows `rows`, for [`RowBlock::view_over`].
+fn block_rows(block: &RowBlock, rows: &[usize]) -> Vec<usize> {
+    rows.iter()
+        .map(|&i| block.rows().get(i).copied().unwrap_or(usize::MAX))
+        .collect()
 }
 
 fn row_stream_ref(view: &ColumnarBlockView<'_>, i: usize) -> DFResult<u32> {
@@ -818,15 +982,24 @@ fn declared_cells_array(dc: &DeclaredColumn, cells: &[Option<Cell<'_>>]) -> Arra
     }
 }
 
-fn finish_row_batch(
-    schema: &SchemaRef,
+/// `columns` with the row-ref column appended when the scan carries one, at
+/// row positions `positions` of `range`.
+fn with_row_refs(
     mut columns: Vec<ArrayRef>,
     row_refs: Option<RowRefRange>,
+    positions: impl ExactSizeIterator<Item = usize>,
+) -> DFResult<Vec<ArrayRef>> {
+    if let Some(range) = row_refs {
+        columns.push(row_ref_array_at(range, positions)?);
+    }
+    Ok(columns)
+}
+
+fn finish_row_batch(
+    schema: &SchemaRef,
+    columns: Vec<ArrayRef>,
     rows: usize,
 ) -> DFResult<RecordBatch> {
-    if let Some(range) = row_refs {
-        columns.push(row_ref_array(range, rows)?);
-    }
     let options = RecordBatchOptions::new().with_row_count(Some(rows));
     RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options)
         .map_err(DataFusionError::from)
@@ -7388,6 +7561,7 @@ mod row_path_tests {
             full_len,
             erasure,
             key: "test.rlog",
+            attrs_built: Box::leak(Box::new(Count::new())),
         }
     }
 
