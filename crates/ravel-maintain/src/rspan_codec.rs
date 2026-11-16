@@ -161,8 +161,7 @@ use ravel_cpu_gate::ReadSite;
 /// `CompactionPart.segment_format_version`. Under a policy the run takes the
 /// family's active version once at its start instead (ADR-4233 decision 3),
 /// so this is not "the version this build writes" in general.
-pub const OUTPUT_FORMAT_VERSION: u32 =
-    ravel_rspan::footer::WriteVersion::CURRENT.number() as u32;
+pub const OUTPUT_FORMAT_VERSION: u32 = ravel_rspan::footer::WriteVersion::CURRENT.number() as u32;
 
 /// One RSPAN input's retained catalog metadata: the data-object key, its
 /// decoded footer, and an [`RspanRangeReader`] over its SKIP_IDX. Block bytes

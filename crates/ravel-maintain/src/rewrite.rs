@@ -148,12 +148,11 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
         .as_ref()
         .and_then(|l| l.reset_for_run_unless_open().then(|| l.run_scope_guard()));
     // ADR-1746 decision 4: checked before the inputs are read and every PUT.
-    let checked = match crate::format_floor::check_output_floor(store, config, bucket, "rewrite")
-        .await
-    {
-        Ok(()) => crate::compat_policy::begin_part_run(store, config, bucket, "rewrite").await,
-        Err(err) => Err(err),
-    };
+    let checked =
+        match crate::format_floor::check_output_floor(store, config, bucket, "rewrite").await {
+            Ok(()) => crate::compat_policy::begin_part_run(store, config, bucket, "rewrite").await,
+            Err(err) => Err(err),
+        };
     let outcome = match checked {
         Ok(compat_run) => load_then_rewrite::<C>(
             store,
@@ -815,12 +814,13 @@ async fn migrate_compat_run(
         && let Some(active) = run.version(family)
         && u32::from(active) != target_version
     {
-        return Err(
-            run.refuse_with(family, crate::compat_policy::CompatRunRefusal::TargetNotActive {
+        return Err(run.refuse_with(
+            family,
+            crate::compat_policy::CompatRunRefusal::TargetNotActive {
                 target: target_version,
                 active,
-            }),
-        );
+            },
+        ));
     }
     Ok(compat_run)
 }

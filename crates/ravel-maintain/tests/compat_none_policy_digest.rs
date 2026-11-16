@@ -68,7 +68,10 @@ async fn metrics_compaction_without_a_policy_matches_the_pinned_digest() {
         seed_input(&store, &spec).await;
     }
     compact(&store, &bucket()).await;
-    assert_eq!(store_digest(&store).await, "15b363bd2f07841b1797386b77084906dc2de9edf3fe927ef7b553f9e59c6945");
+    assert_eq!(
+        store_digest(&store).await,
+        "15b363bd2f07841b1797386b77084906dc2de9edf3fe927ef7b553f9e59c6945"
+    );
 }
 
 #[tokio::test]
@@ -76,7 +79,10 @@ async fn logs_compaction_without_a_policy_matches_the_pinned_digest() {
     let store = MemoryStore::new();
     let target = seed_rlog_two_inputs(&store).await;
     compact(&store, &target).await;
-    assert_eq!(store_digest(&store).await, "597076e7830eb61b4357738723c4211fad714ccd3fcb6e61ae948b0c61330b65");
+    assert_eq!(
+        store_digest(&store).await,
+        "597076e7830eb61b4357738723c4211fad714ccd3fcb6e61ae948b0c61330b65"
+    );
 }
 
 #[tokio::test]
@@ -84,5 +90,8 @@ async fn spans_compaction_without_a_policy_matches_the_pinned_digest() {
     let store = MemoryStore::new();
     let target = seed_rspan_two_inputs(&store).await;
     compact(&store, &target).await;
-    assert_eq!(store_digest(&store).await, "68f97d7569aee22b65b65322cd88930fb4f7a84c489802bc83698c286ebf794a");
+    assert_eq!(
+        store_digest(&store).await,
+        "68f97d7569aee22b65b65322cd88930fb4f7a84c489802bc83698c286ebf794a"
+    );
 }

@@ -39,7 +39,9 @@ use ravel_maintain::{
     pending_erasure_requests, read,
 };
 use ravel_maintain::{MigrateBudget, MigrateHeldBucket, MigrateHoldReason, migrate_family};
-use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
 use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
@@ -336,15 +338,17 @@ async fn erasure_refuses_an_unwritable_active_version_and_leaves_the_request_pen
         )
         .await
         .expect("put the request");
-    let pending = pending_erasure_requests(store.as_ref(), &tenant_hash(), ravel_types::Signal::Metrics)
-        .await
-        .expect("list pending");
+    let pending =
+        pending_erasure_requests(store.as_ref(), &tenant_hash(), ravel_types::Signal::Metrics)
+            .await
+            .expect("list pending");
     assert_eq!(pending.len(), 1);
     let policy = policy_over(store.clone(), ManualClock::at(T0)).await;
     let config = config_with(policy);
     let mut memo = MaintainMemo::with_default_interval();
     let before = snapshot(store.as_ref()).await;
-    let refused = compat_publish_refused_total(FAMILY_REWRITE_RECORD, "active_version_not_writable");
+    let refused =
+        compat_publish_refused_total(FAMILY_REWRITE_RECORD, "active_version_not_writable");
 
     let err = erasure_rewrite_bucket(
         store.as_ref(),
@@ -370,9 +374,10 @@ async fn erasure_refuses_an_unwritable_active_version_and_leaves_the_request_pen
         compat_publish_refused_total(FAMILY_REWRITE_RECORD, "active_version_not_writable"),
         refused + 1
     );
-    let still = pending_erasure_requests(store.as_ref(), &tenant_hash(), ravel_types::Signal::Metrics)
-        .await
-        .expect("list pending");
+    let still =
+        pending_erasure_requests(store.as_ref(), &tenant_hash(), ravel_types::Signal::Metrics)
+            .await
+            .expect("list pending");
     assert_eq!(still.len(), 1, "the request is still pending");
     let done_key =
         keys::erasure_completion_key(&tenant_hash(), ravel_types::Signal::Metrics, request_id)
@@ -441,7 +446,11 @@ async fn a_view_going_stale_mid_run_abandons_the_compaction_before_its_put() {
 /// that writes {6, 7}: the bucket's first compaction at 7 owes the fence.
 async fn activated_bucket(
     plan: FaultPlan,
-) -> (Arc<FaultStore<MemoryStore>>, Arc<ManualClock>, CompactorConfig) {
+) -> (
+    Arc<FaultStore<MemoryStore>>,
+    Arc<ManualClock>,
+    CompactorConfig,
+) {
     let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
     seed_two_inputs(store.inner()).await;
     write_compat(store.inner(), vec![family(FAMILY_RSEG, 6)]).await;
@@ -491,7 +500,10 @@ async fn the_first_activated_publish_raises_the_fence_before_the_part_put() {
     for part in &record.parts {
         assert_eq!(part.segment_format_version, u32::from(VERSION_V7));
         let key = keys::reconstruct_l1_part_key(&record, part).expect("part key");
-        assert_eq!(trailer_version(&get_full(store.inner(), &key).await), VERSION_V7);
+        assert_eq!(
+            trailer_version(&get_full(store.inner(), &key).await),
+            VERSION_V7
+        );
     }
 }
 
@@ -519,7 +531,10 @@ async fn a_failed_fence_cas_leaves_nothing_written() {
     assert!(
         matches!(
             refused_under(&err, FAMILY_RSEG),
-            CompatRunRefusal::FenceFailed { compat_epoch: 1, .. }
+            CompatRunRefusal::FenceFailed {
+                compat_epoch: 1,
+                ..
+            }
         ),
         "{err:?}"
     );
@@ -572,7 +587,8 @@ async fn the_version_is_chosen_once_per_run_not_per_put() {
     );
 
     assert_eq!(
-        view.seen_family(FAMILY_RSEG).map(|f| f.active_write_version),
+        view.seen_family(FAMILY_RSEG)
+            .map(|f| f.active_write_version),
         Some(8),
         "the view saw the activation mid-run"
     );

@@ -324,8 +324,7 @@ use ravel_cpu_gate::ReadSite;
 /// each part's `CompactionPart.segment_format_version`. Under a policy the
 /// run takes the family's active version once at its start instead (ADR-4233
 /// decision 3), so this is not "the version this build writes" in general.
-pub const OUTPUT_FORMAT_VERSION: u32 =
-    ravel_logseg::footer::WriteVersion::CURRENT.number() as u32;
+pub const OUTPUT_FORMAT_VERSION: u32 = ravel_logseg::footer::WriteVersion::CURRENT.number() as u32;
 
 /// Untrusted-input cap on an input's FIELD_DIR entry count for the compactor's
 /// own decode of that section (the indexed-field recovery below needs the

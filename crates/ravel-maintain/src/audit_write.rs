@@ -25,9 +25,9 @@ use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError, U
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
+use crate::compat_policy::MaintainCompatPolicy;
 use crate::config::NS_PER_HOUR;
 use crate::error::{MaintainError, Result};
-use crate::compat_policy::MaintainCompatPolicy;
 
 /// Attempts per PUT before a transient error fails the batch closed (ADR-0062
 /// amendment, 2026-09-27): one attempt plus up to two retries, so a single
@@ -237,7 +237,14 @@ pub(crate) async fn write_audit_object(
 ) -> Result<()> {
     let shard = write.shard;
     let record_id = write.record_id;
-    write_audit_batch(store, shard, record_id, vec![audit_record(tenant, write)], None).await
+    write_audit_batch(
+        store,
+        shard,
+        record_id,
+        vec![audit_record(tenant, write)],
+        None,
+    )
+    .await
 }
 
 /// Encode a whole batch of audit records as **one** L0 [`Signal::Audit`] object
@@ -296,8 +303,16 @@ pub(crate) async fn write_audit_batch(
     records: Vec<AuditRecord>,
     put_retries: Option<&AtomicU64>,
 ) -> Result<()> {
-    write_audit_batch_with_compat(store, shard, record_id, records, put_retries, &SystemRng, None)
-        .await
+    write_audit_batch_with_compat(
+        store,
+        shard,
+        record_id,
+        records,
+        put_retries,
+        &SystemRng,
+        None,
+    )
+    .await
 }
 
 /// [`write_audit_batch`] with the backoff-jitter source injected (ADR-0068
@@ -1033,5 +1048,229 @@ mod tests {
             }
             other => panic!("expected Invariant, got {other:?}"),
         }
+    }
+
+    use crate::compat_policy::CompatRunRefusal;
+    use crate::compat_policy::test_support::{ManualClock, T0, family, policy, write_compat};
+    use ravel_catalog::compat::{COMPAT_VIEW_HORIZON_NS, CompatRefusal};
+
+    const SECOND_NS: i64 = 1_000_000_000;
+    /// How long a test waits for a held call before failing instead of hanging.
+    const HOLD_WAIT: Duration = Duration::from_secs(30);
+
+    async fn audit_keys(store: &MemoryStore) -> Vec<String> {
+        list_all(store, "")
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|meta| meta.key)
+            .filter(|key| key.contains("/u/"))
+            .collect()
+    }
+
+    fn compat_refusal(err: &MaintainError, want_family: &str) -> CompatRunRefusal {
+        match err {
+            MaintainError::CompatRefused {
+                family, refusal, ..
+            } if family == want_family => refusal.clone(),
+            other => panic!("expected a {want_family} compat refusal, got {other:?}"),
+        }
+    }
+
+    /// ADR-4233 decision 7: the audit writer's 30 s budget is its publish
+    /// lifetime and sits inside the default `P`.
+    #[test]
+    fn the_audit_write_budget_sits_inside_the_default_publish_lifetime() {
+        assert_eq!(AUDIT_WRITE_BUDGET_NS, 30 * SECOND_NS);
+        assert!(AUDIT_WRITE_BUDGET_NS < crate::compat_policy::DEFAULT_PUBLISH_LIFETIME_NS);
+    }
+
+    /// ADR-4233 decision 3: an active RLOG version this build cannot write
+    /// refuses the audit batch before either PUT, counted.
+    #[tokio::test]
+    async fn an_audit_batch_refuses_an_unwritable_rlog_version_before_any_put() {
+        let store = Arc::new(MemoryStore::new());
+        write_compat(store.as_ref(), vec![family(FAMILY_RLOG, 6)], NS_PER_HOUR).await;
+        let policy = policy(store.clone(), ManualClock::at(T0)).await;
+        let before = list_all(store.as_ref(), "").await.expect("list");
+        let refused =
+            crate::compat_publish_refused_total(FAMILY_RLOG, "active_version_not_writable");
+
+        let err = write_audit_batch_with_compat(
+            store.as_ref(),
+            AUDIT_SHARD,
+            Uuid::from_u128(1),
+            vec![test_record(TenantHash([71; 16]), 9 * NS_PER_HOUR, 1)],
+            None,
+            &FixedRng(0),
+            Some((&policy, "audit")),
+        )
+        .await
+        .expect_err("refused");
+
+        assert!(
+            matches!(
+                compat_refusal(&err, FAMILY_RLOG),
+                CompatRunRefusal::Compat(CompatRefusal::ActiveVersionNotWritable { active: 6, .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(list_all(store.as_ref(), "").await.expect("list"), before);
+        assert_eq!(
+            crate::compat_publish_refused_total(FAMILY_RLOG, "active_version_not_writable"),
+            refused + 1
+        );
+    }
+
+    /// The staleness check runs on every PUT attempt, retries included. The
+    /// first data PUT is held and then fails transiently; while it is held
+    /// the compat clock reaches the horizon, so the retry is refused and
+    /// nothing is written. A check made only before the first attempt lets
+    /// the retry through.
+    #[tokio::test]
+    async fn a_view_going_stale_before_an_audit_retry_refuses_the_retry() {
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Transient("dropped".into()))
+                .with_key_contains("/u/l0/")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        write_compat(store.inner(), vec![family(FAMILY_RLOG, 5)], NS_PER_HOUR).await;
+        let clock = ManualClock::at(T0);
+        let policy = policy(store.clone(), clock.clone()).await;
+        let gate = store.hold(Op::Put, Some("/u/l0/".to_string()), Occurrence::Nth(1));
+        let refused = crate::compat_publish_refused_total(FAMILY_RLOG, "view_stale");
+
+        let (outcome, ()) = tokio::join!(
+            write_audit_batch_with_compat(
+                store.as_ref(),
+                AUDIT_SHARD,
+                Uuid::from_u128(2),
+                vec![test_record(TenantHash([72; 16]), 9 * NS_PER_HOUR, 1)],
+                None,
+                &FixedRng(0),
+                Some((&policy, "audit")),
+            ),
+            async {
+                tokio::time::timeout(HOLD_WAIT, gate.wait_until_held(1))
+                    .await
+                    .expect("the first data PUT is attempted");
+                clock.advance(COMPAT_VIEW_HORIZON_NS);
+                for id in gate.held() {
+                    gate.release(id);
+                }
+            }
+        );
+
+        let err = outcome.expect_err("the retry is refused");
+        assert!(
+            matches!(
+                compat_refusal(&err, FAMILY_RLOG),
+                CompatRunRefusal::Compat(CompatRefusal::ViewStale { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Transient),
+            1,
+            "the first attempt failed and was retried"
+        );
+        assert_eq!(audit_keys(store.inner()).await, Vec::<String>::new());
+        assert_eq!(
+            crate::compat_publish_refused_total(FAMILY_RLOG, "view_stale"),
+            refused + 1
+        );
+    }
+
+    /// ADR-4233 decision 7: once the recorded `P` has passed since the
+    /// batch started, its commit record is abandoned without the PUT. The
+    /// first commit PUT is held and fails transiently while the compat clock
+    /// moves past `P` (60 s here, inside the view horizon), so the retry is
+    /// abandoned: the data object stays, unreferenced, and no commit lands.
+    #[tokio::test]
+    async fn an_audit_commit_past_the_publish_lifetime_is_abandoned_without_its_put() {
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Transient("dropped".into()))
+                .with_key_contains("/u/c/")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        write_compat(store.inner(), vec![family(FAMILY_RLOG, 5)], 60 * SECOND_NS).await;
+        let clock = ManualClock::at(T0);
+        let policy = policy(store.clone(), clock.clone()).await;
+        let gate = store.hold(Op::Put, Some("/u/c/".to_string()), Occurrence::Nth(1));
+        let refused = crate::compat_publish_refused_total(FAMILY_RLOG, "publish_lifetime_expired");
+
+        let (outcome, ()) = tokio::join!(
+            write_audit_batch_with_compat(
+                store.as_ref(),
+                AUDIT_SHARD,
+                Uuid::from_u128(3),
+                vec![test_record(TenantHash([73; 16]), 9 * NS_PER_HOUR, 1)],
+                None,
+                &FixedRng(0),
+                Some((&policy, "audit")),
+            ),
+            async {
+                tokio::time::timeout(HOLD_WAIT, gate.wait_until_held(1))
+                    .await
+                    .expect("the first commit PUT is attempted");
+                clock.advance(61 * SECOND_NS);
+                for id in gate.held() {
+                    gate.release(id);
+                }
+            }
+        );
+
+        let err = outcome.expect_err("abandoned");
+        assert_eq!(
+            compat_refusal(&err, FAMILY_RLOG),
+            CompatRunRefusal::PublishLifetimeExpired {
+                elapsed_ns: 61 * SECOND_NS,
+                lifetime_ns: 60 * SECOND_NS,
+            }
+        );
+        assert_eq!(store.fault_count(Op::Put, FaultKind::Transient), 1);
+        let written = audit_keys(store.inner()).await;
+        assert_eq!(written.len(), 1, "{written:?}");
+        assert!(
+            written[0].contains("/u/l0/"),
+            "only the data object: {written:?}"
+        );
+        assert_eq!(
+            crate::compat_publish_refused_total(FAMILY_RLOG, "publish_lifetime_expired"),
+            refused + 1
+        );
+    }
+
+    /// A recorded `P` shorter than the audit writer's 30 s budget refuses
+    /// the writer at its start: its own lifetime would outlive `P`.
+    #[tokio::test]
+    async fn a_recorded_p_below_the_audit_budget_refuses_the_audit_writer() {
+        let store = Arc::new(MemoryStore::new());
+        write_compat(store.as_ref(), vec![family(FAMILY_RLOG, 5)], 20 * SECOND_NS).await;
+        let policy = policy(store.clone(), ManualClock::at(T0)).await;
+        let before = list_all(store.as_ref(), "").await.expect("list");
+
+        let err = write_audit_batch_with_compat(
+            store.as_ref(),
+            AUDIT_SHARD,
+            Uuid::from_u128(4),
+            vec![test_record(TenantHash([74; 16]), 9 * NS_PER_HOUR, 1)],
+            None,
+            &FixedRng(0),
+            Some((&policy, "audit")),
+        )
+        .await
+        .expect_err("refused");
+
+        assert_eq!(
+            compat_refusal(&err, FAMILY_RLOG),
+            CompatRunRefusal::PublishLifetimeAboveCompat {
+                process_ns: AUDIT_WRITE_BUDGET_NS,
+                record_ns: 20 * SECOND_NS,
+            }
+        );
+        assert_eq!(list_all(store.as_ref(), "").await.expect("list"), before);
     }
 }

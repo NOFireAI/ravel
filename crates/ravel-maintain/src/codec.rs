@@ -242,8 +242,7 @@ impl SegmentCodec for RsegCodec {
         use std::collections::HashSet;
 
         // The version this run writes: the compat run's, else the build's.
-        let output_version =
-            u32::from(crate::compat_policy::rseg_write_version(config)?.number());
+        let output_version = u32::from(crate::compat_policy::rseg_write_version(config)?.number());
 
         // The object keys of any input recorded below the current output version
         // (ADR-0066 decision 5). `catalogs` is aligned one-to-one with `inputs`

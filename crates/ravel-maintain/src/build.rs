@@ -415,8 +415,14 @@ pub async fn build_parts(
                 )
                 .await?;
                 note_encoded_part(&mut charges, &part);
-                put_and_release_part(store, &mut part, config.dry_run, ledger, config.compat_run.as_ref())
-                    .await?;
+                put_and_release_part(
+                    store,
+                    &mut part,
+                    config.dry_run,
+                    ledger,
+                    config.compat_run.as_ref(),
+                )
+                .await?;
                 charges.set_writer(0);
                 // Cancellation checkpoint 4: a part boundary, after the PUT
                 // returned.
@@ -452,8 +458,14 @@ pub async fn build_parts(
         )
         .await?;
         note_encoded_part(&mut charges, &part);
-        put_and_release_part(store, &mut part, config.dry_run, ledger, config.compat_run.as_ref())
-                    .await?;
+        put_and_release_part(
+            store,
+            &mut part,
+            config.dry_run,
+            ledger,
+            config.compat_run.as_ref(),
+        )
+        .await?;
         charges.set_writer(0);
         // Cancellation checkpoint 4 for the tail part.
         crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::PartBoundary)

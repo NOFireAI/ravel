@@ -230,7 +230,12 @@ impl MaintainCompatPolicy {
                 .view
                 .write_policy(now, family, writable, baseline, record)
                 .map_err(|refusal| {
-                    refuse(run, family, bucket.as_ref(), CompatRunRefusal::Compat(refusal))
+                    refuse(
+                        run,
+                        family,
+                        bucket.as_ref(),
+                        CompatRunRefusal::Compat(refusal),
+                    )
                 })?;
             if version > baseline {
                 if let Some(seen) = self.view.seen_family(family) {
@@ -483,10 +488,12 @@ impl CompatRun {
         let last = policy.view.last_read_unix_ns();
         let fresh = last.is_some_and(|last| now.saturating_sub(last) < COMPAT_VIEW_HORIZON_NS);
         if !fresh {
-            return Err(self.refuse(CompatRunRefusal::Compat(CompatRefusal::ViewStale {
-                last_read_unix_ns: last,
-                now_unix_ns: now,
-            })));
+            return Err(
+                self.refuse(CompatRunRefusal::Compat(CompatRefusal::ViewStale {
+                    last_read_unix_ns: last,
+                    now_unix_ns: now,
+                })),
+            );
         }
         let Some(fence) = self.inner.fence.as_ref() else {
             return Ok(());
@@ -575,13 +582,19 @@ pub(crate) async fn begin_bucket_run(
         return Ok(None);
     };
     if let Some(outer) = config.compat_run.as_ref()
-        && families.iter().all(|family| outer.version(family).is_some())
+        && families
+            .iter()
+            .all(|family| outer.version(family).is_some())
     {
         return Ok(Some(outer.clone()));
     }
     let key = provisioning_key(&bucket.tenant_hash, bucket.signal);
     let got = store.get(&key, GetRange::Full).await;
-    note_get(config.request_ledger.as_ref(), RequestPhase::FloorRead, &got);
+    note_get(
+        config.request_ledger.as_ref(),
+        RequestPhase::FloorRead,
+        &got,
+    );
     let record = match got {
         Ok(outcome) => Some(
             sysproto::ProvisioningRecord::decode(outcome.data.as_ref())
@@ -647,16 +660,23 @@ pub(crate) fn require_active_target(
 /// The version `config`'s run in flight writes for `family`; `None` when no
 /// run was started under a policy.
 pub(crate) fn run_version(config: &CompactorConfig, family: &str) -> Option<u16> {
-    config.compat_run.as_ref().and_then(|run| run.version(family))
+    config
+        .compat_run
+        .as_ref()
+        .and_then(|run| run.version(family))
 }
 
 /// The RSEG version a compaction part is written at: the run's, or the
 /// build's current one with no policy.
-pub(crate) fn rseg_write_version(config: &CompactorConfig) -> Result<ravel_segment::SegmentVersion> {
+pub(crate) fn rseg_write_version(
+    config: &CompactorConfig,
+) -> Result<ravel_segment::SegmentVersion> {
     match run_version(config, FAMILY_RSEG) {
         None => Ok(ravel_segment::SegmentVersion::CURRENT),
         Some(v) => ravel_segment::SegmentVersion::from_number(v).ok_or_else(|| {
-            MaintainError::Invariant(format!("the compat run chose RSEG version {v}, outside the window"))
+            MaintainError::Invariant(format!(
+                "the compat run chose RSEG version {v}, outside the window"
+            ))
         }),
     }
 }
@@ -714,8 +734,7 @@ pub(crate) mod test_support {
     use std::sync::atomic::{AtomicI64, Ordering};
 
     use ravel_catalog::compat::{
-        COMPAT_FORMAT_VERSION, CompatClock, CompatKeys, CompatView, activate_family,
-        create_compat,
+        COMPAT_FORMAT_VERSION, CompatClock, CompatKeys, CompatView, activate_family, create_compat,
     };
     use ravel_object_store::ObjectStoreBackend;
     use ravel_proto::sys::v1 as sysproto;
@@ -826,16 +845,25 @@ mod tests {
     #[test]
     fn the_family_table_comes_from_the_format_crates() {
         let rseg = FamilyVersions::for_family(FAMILY_RSEG).expect("rseg");
-        assert_eq!(rseg.baseline, ravel_segment::SegmentVersion::CURRENT.number());
+        assert_eq!(
+            rseg.baseline,
+            ravel_segment::SegmentVersion::CURRENT.number()
+        );
         assert!(
             rseg.writable
                 .iter()
                 .all(|v| ravel_segment::SUPPORTED_VERSIONS.contains(*v))
         );
         let rlog = FamilyVersions::for_family(FAMILY_RLOG).expect("rlog");
-        assert_eq!(rlog.baseline, ravel_logseg::footer::WriteVersion::CURRENT.number());
+        assert_eq!(
+            rlog.baseline,
+            ravel_logseg::footer::WriteVersion::CURRENT.number()
+        );
         let rspan = FamilyVersions::for_family(FAMILY_RSPAN).expect("rspan");
-        assert_eq!(rspan.baseline, ravel_rspan::footer::WriteVersion::CURRENT.number());
+        assert_eq!(
+            rspan.baseline,
+            ravel_rspan::footer::WriteVersion::CURRENT.number()
+        );
         let compaction = FamilyVersions::for_family(FAMILY_COMPACTION_RECORD).expect("record");
         assert_eq!(compaction.baseline, 1);
         assert_eq!(compaction.writable, vec![1, 2]);
@@ -862,7 +890,13 @@ mod tests {
             .await
             .with_family(FAMILY_RSEG, two.clone());
         let run = at_baseline
-            .begin("test", &[FAMILY_RSEG], Some(bucket_id()), Some(&record_at(0)), 0)
+            .begin(
+                "test",
+                &[FAMILY_RSEG],
+                Some(bucket_id()),
+                Some(&record_at(0)),
+                0,
+            )
             .expect("begin");
         assert_eq!(run.version(FAMILY_RSEG), Some(6));
         assert_eq!(run.fence_epoch(), None);
@@ -872,12 +906,24 @@ mod tests {
             .await
             .with_family(FAMILY_RSEG, two);
         let run = activated
-            .begin("test", &[FAMILY_RSEG], Some(bucket_id()), Some(&record_at(0)), 0)
+            .begin(
+                "test",
+                &[FAMILY_RSEG],
+                Some(bucket_id()),
+                Some(&record_at(0)),
+                0,
+            )
             .expect("begin");
         assert_eq!(run.version(FAMILY_RSEG), Some(7));
         assert_eq!(run.fence_epoch(), Some(1));
         let fenced = activated
-            .begin("test", &[FAMILY_RSEG], Some(bucket_id()), Some(&record_at(1)), 0)
+            .begin(
+                "test",
+                &[FAMILY_RSEG],
+                Some(bucket_id()),
+                Some(&record_at(1)),
+                0,
+            )
             .expect("begin");
         assert_eq!(fenced.fence_epoch(), None);
         let unprovisioned = activated
@@ -892,7 +938,12 @@ mod tests {
     async fn a_lifetime_above_the_recorded_p_is_refused() {
         let store = Arc::new(MemoryStore::new());
         let clock = ManualClock::at(T0);
-        write_compat(store.as_ref(), vec![family(FAMILY_RSPAN, 5)], 60_000_000_000).await;
+        write_compat(
+            store.as_ref(),
+            vec![family(FAMILY_RSPAN, 5)],
+            60_000_000_000,
+        )
+        .await;
         let policy = policy(store, clock).await;
         let before = compat_publish_refused_total(FAMILY_RSPAN, "publish_lifetime_above_compat");
 
@@ -936,7 +987,9 @@ mod tests {
             .expect("begin");
 
         clock.advance(COMPAT_VIEW_HORIZON_NS - 1);
-        run.before_put(store.as_ref()).await.expect("inside the horizon");
+        run.before_put(store.as_ref())
+            .await
+            .expect("inside the horizon");
         clock.advance(1);
         let err = run
             .before_put(store.as_ref())
@@ -959,7 +1012,12 @@ mod tests {
     async fn before_record_put_abandons_once_p_has_passed() {
         let store = Arc::new(MemoryStore::new());
         let clock = ManualClock::at(T0);
-        write_compat(store.as_ref(), vec![family(FAMILY_RSPAN, 5)], 60_000_000_000).await;
+        write_compat(
+            store.as_ref(),
+            vec![family(FAMILY_RSPAN, 5)],
+            60_000_000_000,
+        )
+        .await;
         let policy = policy(store, clock.clone()).await;
         let run = policy
             .begin_unprovisioned("test", &[FAMILY_RSPAN], 0)

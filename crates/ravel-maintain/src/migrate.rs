@@ -5814,10 +5814,7 @@ mod tests {
     /// comparisons around a refused run.
     async fn store_snapshot(store: &dyn ObjectStoreBackend) -> Vec<(String, [u8; 32])> {
         let mut out = Vec::new();
-        for meta in ravel_object_store::list_all(store, "")
-            .await
-            .expect("list")
-        {
+        for meta in ravel_object_store::list_all(store, "").await.expect("list") {
             let got = store.get(&meta.key, GetRange::Full).await.expect("get");
             out.push((meta.key, *blake3::hash(&got.data).as_bytes()));
         }
@@ -5936,7 +5933,11 @@ mod tests {
                 active: 6
             }
         );
-        assert_eq!(store_snapshot(store.as_ref()).await, before, "nothing is written");
+        assert_eq!(
+            store_snapshot(store.as_ref()).await,
+            before,
+            "nothing is written"
+        );
         assert_eq!(refused(), before_count + 1);
 
         activate(store.as_ref(), FAMILY_RSEG, 7).await;
@@ -5951,7 +5952,10 @@ mod tests {
             report.verification,
             Some(Verification::FloorRaised { floor_version: 7 })
         );
-        assert_eq!(compacted_versions(store.as_ref(), 0, 100).await, vec![(7, 7)]);
+        assert_eq!(
+            compacted_versions(store.as_ref(), 0, 100).await,
+            vec![(7, 7)]
+        );
         assert_eq!(
             provisioned_compat_epoch(store.as_ref()).await,
             1,
@@ -5967,7 +5971,11 @@ mod tests {
                 active: 7
             }
         );
-        assert_eq!(store_snapshot(store.as_ref()).await, before, "nothing is written");
+        assert_eq!(
+            store_snapshot(store.as_ref()).await,
+            before,
+            "nothing is written"
+        );
         assert_eq!(refused(), before_count + 2);
     }
 
@@ -6036,7 +6044,10 @@ mod tests {
             report.verification,
             Some(Verification::FloorRaised { floor_version: 7 })
         );
-        assert_eq!(compacted_versions(store.as_ref(), 0, 100).await, vec![(7, 7)]);
+        assert_eq!(
+            compacted_versions(store.as_ref(), 0, 100).await,
+            vec![(7, 7)]
+        );
         let floor =
             current_floor_from_store(store.as_ref(), &tenant_hash(), Signal::Metrics, FAMILY)
                 .await
@@ -6091,9 +6102,10 @@ mod tests {
             matches!(
                 outcome,
                 BackgroundMigrateOutcome::Refused {
-                    refusal: CompatRunRefusal::Compat(
-                        CompatRefusal::ActiveVersionNotWritable { active: 8, .. }
-                    )
+                    refusal: CompatRunRefusal::Compat(CompatRefusal::ActiveVersionNotWritable {
+                        active: 8,
+                        ..
+                    })
                 }
             ),
             "{outcome:?}"
