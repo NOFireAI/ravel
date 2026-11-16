@@ -226,6 +226,18 @@ pub fn buckets_held_out_of_window_total() -> u64 {
     BUCKETS_HELD_OUT_OF_WINDOW.load(Ordering::Relaxed)
 }
 
+/// Counter seam for `ravel_maintain_buckets_held_unknown_section_total`
+/// (ADR-4233 hazard H6): compactions held because an input carries section
+/// kinds this build does not know. They end in
+/// [`CompactionOutcome::HeldOutOfWindow`] and count here, not under
+/// [`buckets_held_out_of_window_total`]. Process-wide and monotonic.
+static BUCKETS_HELD_UNKNOWN_SECTION: AtomicU64 = AtomicU64::new(0);
+
+/// Read [`BUCKETS_HELD_UNKNOWN_SECTION`]. Zero on a healthy deployment.
+pub fn buckets_held_unknown_section_total() -> u64 {
+    BUCKETS_HELD_UNKNOWN_SECTION.load(Ordering::Relaxed)
+}
+
 /// Why compaction refused a bucket outright: the `reason` label of
 /// `ravel_maintain_compaction_refused_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -397,7 +409,9 @@ fn merge_end_outcome(
     dry_run: bool,
 ) -> &'static str {
     match result {
-        Err(MaintainError::InputOutOfWindow { .. }) => "held",
+        Err(MaintainError::InputOutOfWindow { .. } | MaintainError::UnknownSectionKinds { .. }) => {
+            "held"
+        }
         Err(
             MaintainError::MergeGeometryUnsupported { .. }
             | MaintainError::MergeTwoLevelUnsupported { .. }
@@ -462,6 +476,32 @@ async fn hold_out_of_window_input(
          window and its bytes match its content hash; later hours still compact (ADR-2708 D5b)"
     );
     Ok(CompactionOutcome::HeldOutOfWindow { version })
+}
+
+/// Hold a bucket whose input carries section kinds this build does not know
+/// (ADR-4233 hazard H6): re-encoding it would drop them. Nothing was written;
+/// the bucket is retried every pass, like an out-of-window input.
+fn hold_unknown_sections(
+    bucket: &Bucket,
+    object_key: &str,
+    kinds: &[u32],
+    recorded_version: Option<u32>,
+) -> CompactionOutcome {
+    BUCKETS_HELD_UNKNOWN_SECTION.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        signal = ?bucket.signal,
+        shard = bucket.shard,
+        ingest_hour_bucket = bucket.ingest_hour_bucket,
+        object_key,
+        ?kinds,
+        recorded_version,
+        "compaction held a bucket: an input carries section kinds this build does not \
+         know, which a re-encode would drop; nothing written (ADR-4233 H6)"
+    );
+    let version = recorded_version
+        .and_then(|v| u16::try_from(v).ok())
+        .unwrap_or(0);
+    CompactionOutcome::HeldOutOfWindow { version }
 }
 
 /// What a coordinated compaction run did (ADR-1029 decisions 3 and 5).
@@ -677,6 +717,9 @@ async fn compact_bucket_scoped(
     // the bucket's format floor before the claim, the first catalog read, and
     // every PUT.
     crate::format_floor::check_output_floor(store, config, bucket, "compaction").await?;
+    // ADR-4233 decision 3: the part version is fixed here, before the claim.
+    let compat_run =
+        crate::compat_policy::begin_part_run(store, config, bucket, "compaction").await?;
 
     // Cancellation checkpoint 1 (ADR-1029 decision 3), which is also where the
     // claim is acquired. A participating run claims every bucket whatever its
@@ -702,6 +745,7 @@ async fn compact_bucket_scoped(
     let run_config = CompactorConfig {
         claim_guard: guard.clone().or_else(|| config.claim_guard.clone()),
         request_ledger: Some(ledger.clone()),
+        compat_run: compat_run.or_else(|| config.compat_run.clone()),
         ..config.clone()
     };
 
@@ -771,6 +815,11 @@ async fn compact_bucket_scoped(
             )
             .await?
         }
+        Err(MaintainError::UnknownSectionKinds {
+            object_key,
+            kinds,
+            recorded_version,
+        }) => hold_unknown_sections(bucket, &object_key, &kinds, recorded_version),
         Err(MaintainError::MergeGeometryUnsupported {
             inputs,
             streams,

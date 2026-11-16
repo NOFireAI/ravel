@@ -543,6 +543,11 @@ pub async fn load_catalog_from_object(
             }
         }
     };
+    crate::compat_policy::refuse_unknown_sections(
+        &object_key,
+        &loc.unknown_section_kinds,
+        Some(u32::from(loc.version)),
+    )?;
     let sparse = catalog_is_sparse(&loc)?;
     let footer = loc.footer;
     let sections = if sparse {
