@@ -35,11 +35,11 @@ use ravel_catalog::compat::{
 };
 use ravel_catalog::{
     COMPAT_KEY, CompatClock, CompatError, CompatKeys, HEAD_FORMAT_VERSIONS,
-    KEY_INDEX_LEAF_FORMAT_VERSION, KeyIndexLeafRejection, PROVISIONING_MAX_READ_VERSION,
-    PROVISIONING_MIN_READ_VERSION, PartLimits, PostingsLimits, SnapshotFormatError,
-    TENANT_CONFIG_MAX_READ_VERSION, TENANT_CONFIG_MIN_READ_VERSION, decode_column_stats_header,
-    decode_head, decode_part, decode_postings, fold_write_version, key_index_leaf_format_version,
-    key_index_leaf_version_accepted,
+    KEY_INDEX_LEAF_FORMAT_VERSION, KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN, KeyIndexLeafRejection,
+    PROVISIONING_MAX_READ_VERSION, PROVISIONING_MIN_READ_VERSION, PartLimits, PostingsLimits,
+    SnapshotFormatError, TENANT_CONFIG_MAX_READ_VERSION, TENANT_CONFIG_MIN_READ_VERSION,
+    decode_column_stats_header, decode_head, decode_part, decode_postings, fold_write_version,
+    key_index_leaf_format_version, key_index_leaf_versions_for_signal,
 };
 use ravel_commit::erasure;
 use ravel_commit::keys::{BucketEntry, partition_bucket_entry};
@@ -675,8 +675,16 @@ async fn check_object(
             Ok(peek) => tally.adopt(FAMILY_CSTAT, u32::from(peek.envelope_version)),
             Err(e) => catalog_refusal(tenant, None, FAMILY_CSTAT, key, &e, tally)?,
         },
+        // The read set is every version the decoder parses for the signal,
+        // not the narrower set a lookup accepts: a logs version-1 leaf is
+        // decoded and its part treated as uncovered, which is a safe read.
         Class::CatalogKeyIndex(signal) => match key_index_leaf_format_version(bytes) {
-            Ok(v) if key_index_leaf_version_accepted(signal, v) => tally.adopt(FAMILY_KIDX, v),
+            Ok(v)
+                if KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN.contains(&v)
+                    && key_index_leaf_versions_for_signal(signal).contains(&v) =>
+            {
+                tally.adopt(FAMILY_KIDX, v)
+            }
             Ok(v) | Err(KeyIndexLeafRejection::UnsupportedVersion(v)) => {
                 tally.outside(tenant, Some(signal), FAMILY_KIDX, v, key);
             }
