@@ -1698,8 +1698,9 @@ changes no code and no decision.
 The gate was pre-registered before the build existed, in #4154 comment
 6899799509. That registration has 18 band rows, the file and field each
 one reads, and the script that judges it: `m9-judge.py` and
-`m9-retry-judge.py`, whose own test suites hold 35 and 109 cases. Run against the M8 logs, both
-scripts exit 1 on the rows the M8 binary misses. The owner set the
+`m9-retry-judge.py`, whose own test suites hold 35 and 109 cases. Run
+against the M8 logs, both scripts exit 1 on the rows the M8 binary
+misses. The owner set the
 concurrent QPS row to be reported against 0.95, not gated, and the upper
 edge of the string-byte row to 1.25 times the predicted cell in
 `benchmarks/clickbench/bucket-bytes/results.txt`. The registration also
@@ -1723,11 +1724,16 @@ left without a figure.
 
 Statements 19, 34 and 35 have 49 retry lines across the serial passes
 and the three new-arm windows: 11 on c6a.large, 17 on c6a.xlarge and 21
-on c6a.2xlarge. The registration banded the serial counts, from M8's
-logs: 3 each on c6a.large and c6a.xlarge, none on c6a.2xlarge. The run
-matched them, 9, 9 and 0. It recorded M8's window counts as reference
-only, since they depend on the scheduler: 3, 8 and 28 lines including
-failures, against M9's 2, 8 and 21.
+on c6a.2xlarge. The registration banded the serial counts from M8's
+logs: 3 retries per statement on c6a.large and c6a.xlarge, so 9 per box,
+and none on c6a.2xlarge. The run measured 9, 9 and 0. It recorded M8's
+window counts as reference only, since they depend on the scheduler.
+Those counts cover the same three new-arm windows M9 reads (the entry's
+own window, w2 and w3) and include failed lines: 3, 8 and 28 for these
+three statements, against M9's 2, 8 and 21. On c6a.2xlarge the 28 is 9
+in the entry's window, 10 in w2 and 9 in w3. The 23 retries the M8
+results amendment gives for that box count every statement, but in w2
+and w3 only.
 
 47 of the 49 lines answered. The other 2 are c6a.large window lines, for
 statements 19 and 35, that ran the bucketed route and then failed. Their
