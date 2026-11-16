@@ -217,6 +217,9 @@ flight-sql = [
 [dev-dependencies]
 # `MemoryStore::insert_foreign`, to seed keys no store operation can write.
 ravel-object-store = { workspace = true, features = ["test-support"] }
+# `records_rebuilt_on_this_thread`, so a test can show the logs row path
+# rebuilds no `LogRecord` (ADR-2773 decision 4).
+ravel-logseg = { workspace = true, features = ["test-support"] }
 # test-util for `#[tokio::test(start_paused = true)]`: the explain deadline
 # test holds a commit-record GET open and asserts the typed
 # `DeadlineExceeded`, which needs the runtime's injected clock rather than a

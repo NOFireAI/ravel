@@ -70,6 +70,8 @@ pub use reader::{
     decode_section, decode_section_accounted, read_section, read_section_accounted,
     read_section_accounted_from, read_section_from, stream_attr_pairs,
 };
+#[cfg(feature = "test-support")]
+pub use reader::records_rebuilt_on_this_thread;
 pub use record::{
     FieldSel, FieldType, LogRecord, MAX_ATTR_DEPTH, MAX_ATTR_ENTRIES, Predicate,
     attr_value_fits_storage, stream_attrs_bytes,

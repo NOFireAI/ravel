@@ -3520,6 +3520,18 @@ pub(crate) fn rebuild_record(
     rebuild_record_projected(stream_dir, field_dir, block, row, true)
 }
 
+#[cfg(feature = "test-support")]
+thread_local! {
+    static RECORDS_REBUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Records this thread has rebuilt from a decoded block row, so a test in a
+/// dependent crate can show that a read path builds none.
+#[cfg(feature = "test-support")]
+pub fn records_rebuilt_on_this_thread() -> u64 {
+    RECORDS_REBUILT.with(std::cell::Cell::get)
+}
+
 /// [`rebuild_record`] over a possibly column-projected block.
 ///
 /// `strict` is the all-columns contract: every fixed numeric column must be
@@ -3541,6 +3553,8 @@ pub(crate) fn rebuild_record_projected(
     row: usize,
     strict: bool,
 ) -> Result<LogRecord, LogSegError> {
+    #[cfg(feature = "test-support")]
+    RECORDS_REBUILT.with(|n| n.set(n.get() + 1));
     let sref = u32::try_from(i64_at(block, COL_STREAM_REF, row)?)
         .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
     // The STREAM_DIR entry carries both the stream id and the canonical

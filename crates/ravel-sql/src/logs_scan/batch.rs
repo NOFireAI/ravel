@@ -7150,3 +7150,416 @@ mod key_cells_tests {
         assert_eq!(keys.column(LOG_COL_TS), None, "a fixed column has no slot");
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod row_path_tests {
+    use super::*;
+    use crate::logs_schema::logs_schema_with_declared;
+    use crate::rlog_attrs::retain_unerased;
+    use datafusion::arrow::array::{Array, MapArray};
+    use proptest::prelude::*;
+    use ravel_logseg::record::stream_attrs_bytes;
+    use ravel_logseg::{
+        ColumnSelection, ObjectIdentity, Predicate, RlogConfig, RlogReader, RlogWriter,
+        records_rebuilt_on_this_thread,
+    };
+    use ravel_query::erasure::retain_log_records;
+    use ravel_types::logstream::LogStreamId;
+
+    const KEYS: [&str; 6] = ["k0", "k1", "k2", "k3", "shared", "user"];
+
+    fn declared() -> Vec<DeclaredColumn> {
+        vec![
+            DeclaredColumn::new("k0", DeclaredType::Str),
+            DeclaredColumn::new("k1", DeclaredType::I64),
+            DeclaredColumn::new("k2", DeclaredType::Bool),
+            DeclaredColumn::new("k3", DeclaredType::Bytes),
+            DeclaredColumn::new("shared", DeclaredType::Str),
+            DeclaredColumn::new("user", DeclaredType::Str),
+        ]
+    }
+
+    fn attr_keys() -> Vec<String> {
+        KEYS.iter()
+            .map(|k| (*k).to_string())
+            .chain(std::iter::once("absent".to_string()))
+            .collect()
+    }
+
+    /// The scan's extended schema: the full schema with `declared`, then one
+    /// `Utf8` field per `attr_keys` entry.
+    fn extended_schema(declared: &[DeclaredColumn], attr_keys: &[String]) -> (Schema, usize) {
+        let full = logs_schema_with_declared(declared);
+        let full_len = full.fields().len();
+        let mut fields: Vec<Field> = full.fields().iter().map(|f| f.as_ref().clone()).collect();
+        for key in attr_keys {
+            fields.push(Field::new(attr_key_field_name(key), DataType::Utf8, true));
+        }
+        (Schema::new(fields), full_len)
+    }
+
+    struct Stream {
+        resource: Vec<(String, AttrValue)>,
+        scope: Vec<(String, AttrValue)>,
+    }
+
+    fn record(n: usize, stream: &Stream, ts: i64, attrs: Vec<(String, AttrValue)>) -> LogRecord {
+        let mut id = [0u8; 16];
+        id[0] = n as u8;
+        LogRecord {
+            stream_id: LogStreamId(id),
+            stream_attrs: stream_attrs_bytes(&stream.resource, "scope", "1", &stream.scope),
+            ts_ns: ts,
+            observed_ts_ns: ts + 1,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: format!("b{ts}"),
+            trace_id: Some([ts as u8; 16]),
+            span_id: None,
+            flags: 1,
+            attrs,
+        }
+    }
+
+    fn write(records: &[LogRecord], cfg: &RlogConfig) -> Vec<u8> {
+        let mut w = RlogWriter::new(
+            *cfg,
+            ObjectIdentity {
+                tenant_hash: [0; 16],
+                shard: 0,
+                writer_id: [0; 16],
+                writer_epoch: 0,
+                writer_seq: 0,
+            },
+        );
+        for r in records {
+            w.push(r.clone()).expect("push");
+        }
+        w.finish().expect("finish")
+    }
+
+    fn scan<'o>(reader: &RlogReader<'o>) -> ravel_logseg::BlockScan {
+        reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan")
+    }
+
+    fn shape<'s>(
+        schema: &'s SchemaRef,
+        projection: &'s [usize],
+        declared: &'s [DeclaredColumn],
+        attr_keys: &'s [String],
+        full_len: usize,
+        erasure: &'s [ErasurePredicate],
+    ) -> RowBatchShape<'s> {
+        RowBatchShape {
+            schema,
+            projection,
+            declared,
+            attr_keys,
+            full_len,
+            erasure,
+            key: "test.rlog",
+        }
+    }
+
+    /// A row-path batch over a block of N rows, projecting the `attrs` map,
+    /// every declared column and every `attrs['k']` column under a pending
+    /// erasure, rebuilds no `LogRecord`; the record exit over the same block
+    /// rebuilds exactly N, so the counter is live on this thread.
+    #[test]
+    fn row_path_builds_the_attrs_map_without_a_log_record_per_row() {
+        const N: usize = 12;
+        let cfg = RlogConfig {
+            block_target_records: 64,
+            max_dynamic_columns: 2,
+            ..RlogConfig::default()
+        };
+        let stream = Stream {
+            resource: vec![("shared".into(), AttrValue::Str("res".into()))],
+            scope: vec![("user".into(), AttrValue::Str("u0".into()))],
+        };
+        let records: Vec<LogRecord> = (0..N)
+            .map(|i| {
+                let attrs = KEYS
+                    .iter()
+                    .map(|k| ((*k).to_string(), AttrValue::Str(format!("{k}-{i}"))))
+                    .collect();
+                record(0, &stream, i as i64 + 1, attrs)
+            })
+            .collect();
+        let obj = write(&records, &cfg);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let declared = declared();
+        let attr_keys = attr_keys();
+        let (schema, full_len) = extended_schema(&declared, &attr_keys);
+        let projection: Vec<usize> = (0..schema.fields().len()).collect();
+        let schema = Arc::new(schema);
+        let erasure = vec![ErasurePredicate::new(
+            vec![("k0".into(), "k0-3".into())],
+            0,
+            0,
+        )];
+        let shape = shape(
+            &schema,
+            &projection,
+            &declared,
+            &attr_keys,
+            full_len,
+            &erasure,
+        );
+
+        let mut rows = scan(&reader);
+        let before = records_rebuilt_on_this_thread();
+        let block = rows.next_row_block(&obj).expect("row exit").expect("block");
+        assert!(block.view().has_attrs_raw_page(), "the block overflows");
+        let batch = build_row_batch(&block, 0, block.len(), &mut StreamAttrsCache::new(), &shape, None)
+            .expect("row batch");
+        assert_eq!(
+            records_rebuilt_on_this_thread() - before,
+            0,
+            "the row path rebuilds no record"
+        );
+        assert_eq!(batch.num_rows(), N - 1, "one row erased");
+        let attrs = batch
+            .column(LOG_COL_ATTRS)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("attrs map");
+        assert_eq!(
+            attrs.value(0).len(),
+            1 + 1 + KEYS.len() - 1,
+            "resource shared and scope user, overridden in place, plus four record keys"
+        );
+
+        let mut records_exit = scan(&reader);
+        let before = records_rebuilt_on_this_thread();
+        let rebuilt = records_exit
+            .next_block(&obj)
+            .expect("record exit")
+            .expect("block");
+        assert_eq!(rebuilt.len(), N);
+        assert_eq!(records_rebuilt_on_this_thread() - before, N as u64);
+    }
+
+    fn value() -> BoxedStrategy<AttrValue> {
+        prop_oneof![
+            3 => prop::sample::select(vec!["a", "b", "res", "scope"])
+                .prop_map(|s| AttrValue::Str(s.into())),
+            1 => (-2i64..3).prop_map(AttrValue::I64),
+            1 => prop::sample::select(vec![0.5f64, -0.0, f64::NAN]).prop_map(AttrValue::F64),
+            1 => any::<bool>().prop_map(AttrValue::Bool),
+            1 => prop::collection::vec(any::<u8>(), 0..3).prop_map(AttrValue::Bytes),
+            1 => Just(AttrValue::List(vec![AttrValue::I64(1), AttrValue::Str("x".into())])),
+            1 => Just(AttrValue::Map(vec![("m".into(), AttrValue::Bool(true))])),
+        ]
+        .boxed()
+    }
+
+    fn entries(max: usize) -> BoxedStrategy<Vec<(String, AttrValue)>> {
+        prop::collection::vec((prop::sample::select(KEYS.to_vec()), value()), 0..max)
+            .prop_map(|v| v.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+            .boxed()
+    }
+
+    #[derive(Debug, Clone)]
+    struct Case {
+        max_dynamic_columns: usize,
+        block_target_records: usize,
+        /// Per stream: resource and scope entries. Stream 0 always carries
+        /// `shared` in both, resource first.
+        streams: Vec<(Vec<(String, AttrValue)>, Vec<(String, AttrValue)>)>,
+        records: Vec<(usize, i64, Vec<(String, AttrValue)>)>,
+        erasure: Vec<(Vec<(String, String)>, Option<(i64, i64)>)>,
+        mask: Vec<bool>,
+        chunk: usize,
+    }
+
+    fn case() -> impl Strategy<Value = Case> {
+        let (schema, _) = extended_schema(&declared(), &attr_keys());
+        let width = schema.fields().len();
+        let matcher = (
+            prop::sample::select(KEYS.to_vec()),
+            prop::sample::select(vec!["a", "b", "res", "scope"]),
+        )
+            .prop_map(|(k, v)| (k.to_string(), v.to_string()));
+        (
+            0usize..5,
+            1usize..8,
+            prop::collection::vec((entries(4), entries(3)), 1..4),
+            prop::collection::vec((0usize..3, 1i64..40, entries(6)), 1..24),
+            prop::collection::vec(
+                (
+                    prop::collection::vec(matcher, 1..3),
+                    prop::option::of((1i64..40, 1i64..40)),
+                ),
+                0..3,
+            ),
+            prop::collection::vec(any::<bool>(), width),
+            1usize..6,
+        )
+            .prop_map(
+                |(max_dynamic_columns, block_target_records, mut streams, records, erasure, mask, chunk)| {
+                    if let Some((resource, scope)) = streams.first_mut() {
+                        resource.push(("shared".into(), AttrValue::Str("res".into())));
+                        scope.push(("shared".into(), AttrValue::Str("scope".into())));
+                    }
+                    Case {
+                        max_dynamic_columns,
+                        block_target_records,
+                        streams,
+                        records,
+                        erasure,
+                        mask,
+                        chunk,
+                    }
+                },
+            )
+    }
+
+    /// What one [`check_case`] run exercised, for the generator-reach test.
+    #[derive(Default)]
+    struct Reached {
+        attrs_raw: bool,
+        erased: bool,
+        kept: bool,
+    }
+
+    /// Every batch [`build_row_batch`] builds over `case`'s blocks equals the
+    /// batch [`build_batch`] builds over the same rows' records after the
+    /// fetcher's record-level erasure filter and [`retain_unerased`].
+    fn check_case(case: &Case) -> Result<Reached, TestCaseError> {
+        let cfg = RlogConfig {
+            block_target_records: case.block_target_records,
+            max_dynamic_columns: case.max_dynamic_columns,
+            ..RlogConfig::default()
+        };
+        let streams: Vec<Stream> = case
+            .streams
+            .iter()
+            .map(|(resource, scope)| Stream {
+                resource: resource.clone(),
+                scope: scope.clone(),
+            })
+            .collect();
+        let records: Vec<LogRecord> = case
+            .records
+            .iter()
+            .map(|(s, ts, attrs)| {
+                let n = s % streams.len();
+                record(n, &streams[n], *ts, attrs.clone())
+            })
+            .collect();
+        let erasure: Vec<ErasurePredicate> = case
+            .erasure
+            .iter()
+            .map(|(m, w)| {
+                let (lo, hi) = w.map_or((0, 0), |(lo, len)| (lo, lo + len));
+                ErasurePredicate::new(m.clone(), lo, hi)
+            })
+            .collect();
+        let declared = declared();
+        let attr_keys = attr_keys();
+        let (extended, full_len) = extended_schema(&declared, &attr_keys);
+        let projection: Vec<usize> = (0..extended.fields().len())
+            .filter(|&i| case.mask.get(i).copied().unwrap_or(false))
+            .collect();
+        let schema = Arc::new(extended.project(&projection).expect("project"));
+        let shape = shape(
+            &schema,
+            &projection,
+            &declared,
+            &attr_keys,
+            full_len,
+            &erasure,
+        );
+
+        let obj = write(&records, &cfg);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let mut rows = scan(&reader);
+        let mut records_exit = scan(&reader);
+        let mut reached = Reached::default();
+        loop {
+            let block = rows.next_row_block(&obj).expect("row exit");
+            let recs = records_exit.next_block(&obj).expect("record exit");
+            let (Some(block), Some(recs)) = (block, recs) else {
+                break;
+            };
+            prop_assert_eq!(block.len(), recs.len());
+            reached.attrs_raw |= block.view().has_attrs_raw_page();
+            let mut streams = StreamAttrsCache::new();
+            let mut start = 0;
+            while start < block.len() {
+                let end = (start + case.chunk).min(block.len());
+                let got = build_row_batch(&block, start, end, &mut streams, &shape, None)
+                    .expect("row batch");
+                let mut want_recs = recs[start..end].to_vec();
+                retain_log_records(&mut want_recs, &erasure);
+                retain_unerased(&mut want_recs, &erasure).expect("erasure");
+                reached.erased |= want_recs.len() < end - start;
+                reached.kept |= !want_recs.is_empty();
+                let want = build_batch(
+                    &want_recs,
+                    Arc::clone(&schema),
+                    &projection,
+                    &declared,
+                    &attr_keys,
+                    full_len,
+                    None,
+                )
+                .expect("record batch");
+                prop_assert_eq!(got.num_rows(), want.num_rows());
+                for (n, field) in schema.fields().iter().enumerate() {
+                    prop_assert_eq!(
+                        got.column(n).to_data(),
+                        want.column(n).to_data(),
+                        "column {}",
+                        field.name()
+                    );
+                }
+                start = end;
+            }
+        }
+        Ok(reached)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// ADR-2773 decision 4: the row path's columns, built from the decoded
+        /// block, equal the record-based build over generated blocks with
+        /// `attrs_raw` overflow, resource and scope overlays sharing a key,
+        /// record overrides, wrong-variant values under declared columns,
+        /// `List`/`Map` values under a `Bytes` declaration, and erased rows.
+        #[test]
+        fn row_path_attrs_map_equals_the_record_based_build(case in case()) {
+            check_case(&case)?;
+        }
+    }
+
+    /// The generator reaches the cases the property names: a block with an
+    /// `attrs_raw` page, a chunk with an erased row, and a chunk with a kept
+    /// row.
+    #[test]
+    fn the_row_path_case_generator_reaches_every_case_the_property_names() {
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+        let mut runner = TestRunner::deterministic();
+        let mut all = Reached::default();
+        for _ in 0..64 {
+            let case = case()
+                .new_tree(&mut runner)
+                .expect("case")
+                .current();
+            let r = check_case(&case).expect("property holds");
+            all.attrs_raw |= r.attrs_raw;
+            all.erased |= r.erased;
+            all.kept |= r.kept;
+        }
+        assert!(all.attrs_raw, "an attrs_raw page");
+        assert!(all.erased, "an erased row");
+        assert!(all.kept, "a kept row");
+    }
+}

@@ -165,14 +165,6 @@ impl ErasurePredicate {
         })
     }
 
-    /// [`Self::matches_log_attrs`] over an attribute view read through
-    /// `lookup`, which returns the first string value the view holds under a
-    /// key, the value `matches_log_attrs` finds in a list. For a reader that
-    /// holds a row's attributes in another shape than a list of owned pairs.
-    pub fn matches_log_lookup<'a>(&self, lookup: impl FnMut(&str) -> Option<&'a str>) -> bool {
-        self.matchers_satisfied(lookup)
-    }
-
     /// Whether this predicate's conjunction matches a set of decoded
     /// string-valued attributes (the shape a span's merged attributes take).
     /// The span query surface lives in `ravel-sql`; this method plus
