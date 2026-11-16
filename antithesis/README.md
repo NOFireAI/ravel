@@ -51,8 +51,10 @@ OTLP/HTTP and the SQL endpoint itself. Each rule picks a node at random:
 - `read_with_tokens` reads one acknowledged write back through
   `POST /api/v1/sql` with its `min_commit_token`s.
 - `scan_without_token` reads every workload row in the window, with no token.
-- `eventually` is a rare draw. It stops faults, waits for both nodes to serve,
-  checks every acknowledged write and then ends the timeline.
+- `eventually` is a rare draw. It stops faults (through the
+  `ANTITHESIS_STOP_FAULTS` command the platform sets in every container; unset
+  in the local loop, which injects none), waits for both nodes to serve, checks
+  every acknowledged write and then ends the timeline.
 
 Every record carries its write id and its index within the write: the
 `wl.write` and `wl.rec` attributes on logs, and the value
@@ -218,6 +220,7 @@ Driver environment for the local loop: `WORKLOAD_EVENTUALLY=off` turns the
 eventually off, `WORKLOAD_EVENTUALLY_AFTER_SECS=N` runs it after N seconds,
 and `WORKLOAD_MAX_WRITES` caps the writes per timeline (the compose file sets 2500; the eventually is proven at about 2400 writes).
 `WORKLOAD_INJECT_MISSING_RECORD=1` is a self-check: the model then expects one
-record more than is sent for each write whose id is 3 modulo 50 and that is a
-log write (ids are shared with metrics writes, so this is about one log write
-in 80 at the default rule weights), and the presence assertions must fail.
+record more than is sent for each log write whose id is 3 modulo 50 (about one
+log write in 50; ids are shared with metrics writes, so about one write of any
+signal in 75 at the default rule weights), and the presence assertions must
+fail.

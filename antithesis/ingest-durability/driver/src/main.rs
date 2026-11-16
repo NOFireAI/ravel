@@ -751,6 +751,10 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
     let _only = lock(&s.eventually_lock);
     let _quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
     println!("eventually ({reason}): stopping faults");
+    // The Antithesis platform sets ANTITHESIS_STOP_FAULTS in every container
+    // of a test run (snouty docs:
+    // /docs/product/writing_tests/controlling_faults/pause_faults/). The local
+    // loop injects no faults and leaves it unset, so this is a no-op there.
     if let Ok(cmd) = std::env::var("ANTITHESIS_STOP_FAULTS") {
         match std::process::Command::new(&cmd).arg("3600").status() {
             Ok(st) => println!("eventually: {cmd} 3600 exited {st}"),
