@@ -1,0 +1,5 @@
+# The driver image's build context is this directory, so the repository-root
+# .dockerignore does not apply. Its Dockerfile copies only the driver's
+# manifest, lock file, sources and first_start_workload.
+driver/target/
+out/

@@ -716,7 +716,16 @@ impl Workload {
             }
         } else {
             match s.scan_metrics(node, &[]) {
-                Ok(j) => Shared::check_metric_rows(&j, node, "scan"),
+                Ok(j) => {
+                    Shared::check_metric_rows(&j, node, "scan");
+                    // An empty result set satisfies check_metric_rows, so a
+                    // scan that never sees an acked sample has to show up.
+                    assert_sometimes!(
+                        j.saw_acked,
+                        "a metrics read without a token saw an acked write",
+                        &json!({ "node": node })
+                    );
+                }
                 Err(e) => println!("metrics scan on node {node}: {e}"),
             }
         }
