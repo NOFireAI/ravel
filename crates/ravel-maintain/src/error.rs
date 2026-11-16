@@ -609,6 +609,26 @@ pub enum MaintainError {
     FormatFloorRead(String),
     #[error("audit batch flush failed: {0}")]
     AuditFlush(String),
+    /// The `sys/compat` write policy refused the run's publish before the
+    /// PUT it guards; nothing at a refused version was written (ADR-4233).
+    #[error("maintenance {run} refused to publish family {family}: {refusal}")]
+    CompatRefused {
+        run: &'static str,
+        family: String,
+        refusal: crate::compat_policy::CompatRunRefusal,
+    },
+    /// An input's directory names section kinds this build does not know, so
+    /// re-encoding it would drop them (ADR-4233 hazard H6). The bucket is
+    /// held; nothing was written.
+    #[error(
+        "input {object_key} (format version {recorded_version:?}) carries section kinds this \
+         build does not know ({kinds:?}); re-encoding it would drop them, so the bucket is held"
+    )]
+    UnknownSectionKinds {
+        object_key: String,
+        kinds: Vec<u32>,
+        recorded_version: Option<u32>,
+    },
     #[error(
         "tenant discovery found a prefix under t/ that is not a valid 32-hex-character tenant hash: {0:?} (ADR-0048 decision 3; storage's key-shape discipline never permits a silent skip here)"
     )]
@@ -675,6 +695,10 @@ impl MaintainError {
     /// ADR-3853). The same build refuses the unit again, and nothing was
     /// published for it, so a pass holds the bucket as refused and goes on to
     /// its other buckets instead of failing.
+    pub fn is_compat_refusal(&self) -> bool {
+        matches!(self, MaintainError::CompatRefused { .. })
+    }
+
     pub fn is_part_index_refusal(&self) -> bool {
         matches!(
             self,

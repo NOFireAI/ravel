@@ -2617,6 +2617,16 @@ pub struct CompactorConfig {
     /// node and the release before the running one read version 2. Turning it
     /// off stops new version 2 records and leaves existing ones in place.
     pub reencode_writer_enabled: bool,
+    /// The `sys/compat` write policy (ADR-4233 decisions 3, 4 and 7). When
+    /// set, compaction, migrate, the force 2 re-encode and the erasure rewrite
+    /// take each family's version from it once at the run start, refuse a
+    /// stale view before every PUT attempt, and raise the bucket's compat
+    /// fence before the first PUT above a family baseline. `None` (the
+    /// default) writes the build's current versions and checks nothing.
+    pub compat_policy: Option<crate::compat_policy::MaintainCompatPolicy>,
+    /// The versions fixed for the run in flight; set per run on a clone, like
+    /// [`Self::claim_guard`]. Callers leave it `None`.
+    pub compat_run: Option<crate::compat_policy::CompatRun>,
 }
 
 impl Default for CompactorConfig {
@@ -2670,6 +2680,8 @@ impl Default for CompactorConfig {
             claim_participant: None,
             claim_guard: None,
             reencode_writer_enabled: false,
+            compat_policy: None,
+            compat_run: None,
         }
     }
 }

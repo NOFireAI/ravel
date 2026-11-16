@@ -316,6 +316,7 @@ async fn publish_compaction_record(
     // outcome is inspected, so the `AlreadyExists` convergence arm below counts
     // the request it spent exactly like the winning arm.
     let payload_len = payload.len() as u64;
+    crate::compat_policy::before_put(config.compat_run.as_ref(), store).await?;
     let put = store.put(&record_key, payload.into(), opts).await;
     note_put(ledger, RequestPhase::Publish, payload_len);
     match put {
@@ -332,7 +333,15 @@ async fn publish_compaction_record(
             Ok(PublishOutcome::Published)
         }
         Err(StoreError::AlreadyExists) => {
-            resolve_already_exists(store, &record_key, input_set_hash, parts, ledger).await
+            resolve_already_exists(
+                store,
+                &record_key,
+                input_set_hash,
+                parts,
+                ledger,
+                config.compat_run.as_ref(),
+            )
+            .await
         }
         Err(e) => Err(MaintainError::Store(e)),
     }
@@ -396,6 +405,7 @@ async fn resolve_already_exists(
     our_hash: &[u8; 32],
     our_parts: &[BuiltPart],
     ledger: Option<&RequestLedger>,
+    compat: Option<&crate::compat_policy::CompatRun>,
 ) -> Result<PublishOutcome> {
     let existing = store.get(record_key, GetRange::Full).await;
     note_get(ledger, RequestPhase::Publish, &existing);
@@ -436,7 +446,7 @@ async fn resolve_already_exists(
                         // `PartPut` by what the request writes, beside every
                         // other L1 part write, not to the phase that noticed
                         // the hole.
-                        crate::build::put_part_with_ledger(store, ours, ledger).await?;
+                        crate::build::put_part_with_ledger(store, ours, ledger, compat).await?;
                         repaired += 1;
                     }
                     // Cannot repair (bytes released at PUT, or a part this run

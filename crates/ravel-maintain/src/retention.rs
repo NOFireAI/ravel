@@ -582,6 +582,10 @@ pub(crate) async fn maintain_bucket_observed(
                 // must not stop the pass: retention of the shard's other
                 // buckets runs as normal (ADR-1746 decision 4).
                 Err(MaintainError::BelowFormatFloor(_)) => (None, None, None),
+                // Refused under the sys/compat write policy, likewise before
+                // the claim and already counted: no run, and the pass goes on
+                // (ADR-4233).
+                Err(err) if err.is_compat_refusal() => (None, None, None),
                 // Refused for its part-index windows (ADR-3853): nothing
                 // published, the same build refuses it again, and the pass
                 // goes on.

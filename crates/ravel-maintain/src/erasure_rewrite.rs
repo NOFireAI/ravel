@@ -99,7 +99,7 @@ use ravel_segment::{
 use ravel_types::{LabelSet, Sample, Signal, TenantHash};
 
 use crate::bucket::Bucket;
-use crate::build::{BuiltPart, OUTPUT_FORMAT_VERSION};
+use crate::build::BuiltPart;
 use crate::claim_guard::{BucketClaim, Checkpoint, ClaimSkipReason, claim_bucket};
 use crate::clock::Clock;
 use crate::compact::{ClaimAcquisition, CompactionInputSkipReason};
@@ -1469,8 +1469,10 @@ fn build_rewrite_part(
         min_ingest_ts_ns: 0,
         max_ingest_ts_ns: 0,
     };
-    let written =
-        SegmentWriter::write_v7_with_provenance(batch, identity, ingest, meta, exemplars)?;
+    let version = crate::compat_policy::rseg_write_version(config)?;
+    let written = SegmentWriter::write_v7_with_provenance_at(
+        version, batch, identity, ingest, meta, exemplars,
+    )?;
     let content_hash = written.summary.blake3;
     let hash16 = hex::encode(&content_hash[..8]);
     let input_set_hash16 = hex::encode(&input_set_hash[..8]);
@@ -1495,7 +1497,7 @@ fn build_rewrite_part(
         run_count,
         min_event_ts_ns: written.summary.min_event_ts_ns,
         max_event_ts_ns: written.summary.max_event_ts_ns,
-        segment_format_version: OUTPUT_FORMAT_VERSION,
+        segment_format_version: u32::from(version.number()),
         declared_column_stats: Vec::new(),
     };
     // Rewrite parts stamp nothing (the readers force rewrite-part stamps
@@ -2047,9 +2049,10 @@ pub async fn publish_rewrite_record(
     // not exist. `put_part` is idempotent (`AlreadyExists` is success), so
     // re-running this on a retry is safe.
     for part in &build.parts {
-        crate::build::put_part(store, part).await?;
+        crate::build::put_part(store, part, config.compat_run.as_ref()).await?;
     }
 
+    crate::compat_policy::before_put(config.compat_run.as_ref(), store).await?;
     match store.put(&record_key, payload.into(), opts).await {
         Ok(_) => {
             tracing::info!(
@@ -2061,7 +2064,14 @@ pub async fn publish_rewrite_record(
             Ok(PublishOutcome::Published)
         }
         Err(StoreError::AlreadyExists) => {
-            resolve_already_exists_rewrite(store, &record_key, &input_set_hash, &build.parts).await
+            resolve_already_exists_rewrite(
+                store,
+                &record_key,
+                &input_set_hash,
+                &build.parts,
+                config.compat_run.as_ref(),
+            )
+            .await
         }
         Err(e) => Err(MaintainError::Store(e)),
     }
@@ -2080,6 +2090,7 @@ async fn resolve_already_exists_rewrite(
     record_key: &str,
     our_hash: &[u8; 32],
     our_parts: &[BuiltPart],
+    compat: Option<&crate::compat_policy::CompatRun>,
 ) -> Result<PublishOutcome> {
     let winner = get_rewrite_record(store, record_key).await?;
 
@@ -2098,7 +2109,7 @@ async fn resolve_already_exists_rewrite(
             Ok(_) => {}
             Err(StoreError::NotFound) => {
                 if let Some(ours) = our_parts.iter().find(|p| p.key == part_key) {
-                    crate::build::put_part(store, ours).await?;
+                    crate::build::put_part(store, ours, compat).await?;
                     repaired += 1;
                 } else {
                     tracing::warn!(
@@ -2430,6 +2441,21 @@ pub async fn erasure_rewrite_bucket(
     // ADR-1746 decision 4: checked before the claim, the build and every PUT.
     // A refusal leaves the request pending, as any failed pass does.
     crate::format_floor::check_output_floor(store, config, bucket, "erasure rewrite").await?;
+    // ADR-4233 decision 3: the part and record versions are fixed here, before
+    // the claim. A refusal leaves the request pending, like the floor's.
+    let compat_run = match crate::compat_policy::part_family(bucket.signal) {
+        Some(part) => {
+            crate::compat_policy::begin_bucket_run(
+                store,
+                config,
+                bucket,
+                "erasure rewrite",
+                &[part, ravel_catalog::compat::FAMILY_REWRITE_RECORD],
+            )
+            .await?
+        }
+        None => None,
+    };
 
     // The bucket claim (ADR-1029, the 2026-10-03 amendment), the same one a
     // compaction of this bucket takes, held from before the build through the
@@ -2455,12 +2481,10 @@ pub async fn erasure_rewrite_bucket(
     };
     // The guard rides on this run's own config clone, as compaction's does, so
     // the merge checkpoints inside the logs and spans builds renew it.
-    let run_config = match guard.as_ref() {
-        Some(guard) => CompactorConfig {
-            claim_guard: Some(guard.clone()),
-            ..config.clone()
-        },
-        None => config.clone(),
+    let run_config = CompactorConfig {
+        claim_guard: guard.clone().or_else(|| config.claim_guard.clone()),
+        compat_run: compat_run.or_else(|| config.compat_run.clone()),
+        ..config.clone()
     };
     let built = build_and_publish_rewrite(
         store,
@@ -3147,6 +3171,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::build::OUTPUT_FORMAT_VERSION;
     use crate::clock::FixedClock;
     use crate::config::MergeMemoryTracker;
     use crate::read::SeriesPlan;
