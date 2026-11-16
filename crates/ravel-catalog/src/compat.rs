@@ -1373,7 +1373,7 @@ mod tests {
     /// activated record the view never got to read: answering the baseline
     /// would publish version 7 under an activation of 8.
     #[tokio::test]
-    async fn a_never_read_view_with_a_non_access_denied_error_goes_stale_after_the_horizon() {
+    async fn a_never_read_view_with_a_non_access_denied_error_refuses_at_once() {
         let faults = [
             ScriptedFault::Transient("503 Service Unavailable".to_string()),
             ScriptedFault::Permanent("500 Internal Error".to_string()),
@@ -1473,7 +1473,7 @@ mod tests {
     /// is past the horizon and refuses, and a later `AccessDenied` does not
     /// restore the exemption.
     #[tokio::test]
-    async fn access_denied_then_a_5xx_goes_stale_after_the_horizon() {
+    async fn access_denied_then_a_5xx_refuses_at_once() {
         let plan = FaultPlan::empty().with_sequence(
             Sequence::new(Op::Get)
                 .with_key_contains(COMPAT_KEY)
