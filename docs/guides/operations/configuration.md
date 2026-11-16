@@ -2195,8 +2195,8 @@ of objects its postings build fetched whole, only for the parts it builds a
 leaf for, each part's pairs released once its leaf is built. Every field the
 build indexes gets a fixed share, `max(1, N / fields)`. Each flag is
 refused beside its leaf build opt-out (`--no-fold-key-index-leaves`,
-`--no-key-index-leaves`) and at 0, and the CLI flag beside
-`--rebuild-key-index`; the default is 8,000,000. A part over the
+`--no-key-index-leaves`) and at 0; the CLI flag also sets the budget a
+`--rebuild-key-index` repair builds under. The default is 8,000,000. A part over the
 budget is built in passes over disjoint key8 ranges, each pass reading the
 sections it needs again and closing its leaf slices before the next, so a
 smaller budget trades memory for section reads and leaves. One key8's

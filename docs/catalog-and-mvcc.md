@@ -1789,9 +1789,14 @@ that budget (test
 budgets 1, 2, 3, 5, 6, 7, 15 and `u64::MAX`). They equal a one-pass build only
 when every field's pairs fit its share. The `--rebuild-key-index` repair
 runs the same build in the same passes, so at the same budget its leaves
-match a fold's byte for byte, for a part whose sections name no field the
-tenant does not declare (the repair builds the declared fields alone, so
-an undeclared one would change the fold's share).
+match a fold's byte for byte only when it builds the same fields the fold
+built. The share divides the budget by the fields built, so a larger share
+can end a pass at another key8, and every pass end is a slice end. The
+match therefore fails for a part whose sections name a field the tenant
+does not declare (the fold indexes it, the repair builds the declared
+fields alone), and for a repair that builds fewer fields than the tenant
+declares: one run with `--field`, or a part that already holds refs for
+some declared fields and gains only the rest.
 Lookups stay correct wherever the slices fall: the router reads the leaf
 whose `[key8_lo, key8_hi]` holds the key8, and ADR-2707's slice rule needs
 only that the slices tile the key space. Their cost does depend on it. A
@@ -1910,8 +1915,10 @@ without the leaf build flag and at 0.
 The `--rebuild-key-index` repair (`Catalog::rebuild_key_index`, under
 "Rollout") builds each part it visits with the same build under the same
 budget, `key_index_build_max_pairs` from its catalog config, which
-`ravel-cli catalog fold --rebuild-key-index` leaves at the default
-8,000,000. A part it visits has no previous leaf to carry and holds no
+`ravel-cli catalog fold --rebuild-key-index` sets from
+`--key-index-build-max-pairs`, default 8,000,000 (test
+`the_pair_budget_reaches_the_rebuild`: three trace ids build in one pass at
+the default and in three at a budget of 1). A part it visits has no previous leaf to carry and holds no
 LABEL_DICT pairs from a postings build, so the per-field bound above is
 the whole of what it holds in pairs: at most `max(share, R) + 1` per field,
 at most `budget + F` for the part when no key8 run exceeds a share, read
@@ -2108,9 +2115,12 @@ build under the pair budget, see "Pair budget", and a third when the
 footer is larger than the 8 KiB suffix), writes the leaves for the
 declared fields under the fold's key layout (at the same budget, for a
 declared field the leaf is byte-identical to the one a fold with
-`build_key_index_leaves` on writes for the same part, when the part's
-sections name no undeclared field; a field a KEY_IDX section names that
-the tenant does not declare gets none), and publishes a HEAD whose part refs are the current
+`build_key_index_leaves` on writes for the same part only when the repair
+builds the same fields the fold built: not when the part's sections name
+an undeclared field, and not when the repair builds fewer fields than the
+tenant declares, under `--field` or for a part that gains only some of
+them, see "Pair budget"; a field a KEY_IDX section names that the tenant
+does not declare gets none), and publishes a HEAD whose part refs are the current
 ones with `key_index` attached (`SnapshotHead.parts` carries the refs
 inline, so the publish is the HEAD CAS alone). A part that already holds
 a ref for every requested field costs no GET; one that holds refs for
@@ -2120,7 +2130,8 @@ machinery runs: no content-hash carry-forward, no dirty-hour reconcile,
 no column-stats baseline, no part, `.csnap` or `.cstat` PUT, no window
 LIST. It runs regardless of `build_key_index_leaves`, and the CLI refuses
 it beside `--key-index-leaves`, `--no-key-index-leaves` and
-`--max-flush-lifetime`. A logs tenant
+`--max-flush-lifetime`; it accepts `--key-index-build-max-pairs` as its
+pair budget. A logs tenant
 that declares no key-index field, or has no tenant config, is refused
 before HEAD is read, with a typed error naming the tenant
 (`KeyIndexRebuildError::NoFieldDeclared`). It publishes
@@ -2144,8 +2155,9 @@ part GET. Each batch is one HEAD CAS, bounded like the fold's at
 the refs for the batch parts whose blake3 the new HEAD still names (a
 leaf is keyed by `part_blake3`) and drops the rest, whose leaves this
 sweep deletes; it reads no section again. The report carries the largest
-unindexed part's entries, parts rebuilt, parts deferred, leaves written
-and their bytes, section bytes read, ranged GETs issued (footer suffixes,
+unindexed part's entries, parts rebuilt, parts deferred, leaf PUTs
+issued and their bytes (counted when issued, a failed PUT included),
+section bytes read, ranged GETs issued (footer suffixes,
 any extra footer ranges and sections together, a failed GET included),
 uncovered entries, the attempt count, and per attempt the part
 GETs, ranged GETs, leaf PUTs, HEAD CAS tries and parts published (an
@@ -2153,7 +2165,11 @@ attempt is one batch's publish including its retries, at most
 `MAX_HEAD_CAS_ATTEMPTS` tries, so a lost CAS adds a try, not an attempt).
 A run that stops or exhausts the CAS retries on one batch has therefore
 published every earlier batch (the error says how many parts, and the
-CLI prints the report so far), loses at most the ranged GETs of that
+CLI prints the report so far, whose ranged GETs, section bytes and leaf
+PUTs include those the stopped batch issued, a build stopped by a failed
+leaf PUT included: tests
+`a_failed_leaf_put_is_counted_as_issued_in_the_interrupted_report` and
+`a_failed_build_reports_its_gets_bytes_and_leaf_puts`), loses at most the ranged GETs of that
 batch's entries in every pass, and leaves that batch's leaves unreferenced for this
 sweep; the rerun skips every part whose ref an earlier batch published. A
 one-part tenant is a single batch, and an interruption there loses the

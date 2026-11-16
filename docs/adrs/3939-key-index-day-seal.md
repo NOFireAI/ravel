@@ -458,7 +458,8 @@ would re-read the day's sections on every fold, about 28,704 ranged GETs
 and 31.4 GB for a logs day, which A3 forbids. Declaring a key-index field
 for a tenant with the switch on is therefore followed by the repair over
 its sealed days. The repair builds in one pass today, about 6.8 GB of
-pairs for a logs day, over the 2 GB band; #4018 gives it the pair budget.
+pairs for a logs day, over the 2 GB band; #4018 gives it the pair budget
+(done: see the repair pair-budget amendment at the end).
 
 ### Acceptance (added rows; predicted, a figure outside its band is a miss)
 
@@ -754,3 +755,37 @@ In production a fold advances at least once an hour, so decision 6's
 "first fold that observes the tombstone" can come up to an hour after the
 tombstone. The harness waits for the next ingest hour before its retention
 fold for this reason (#4139).
+
+## Amendment (issues #4018 and #4297): the repair builds under the pair budget
+
+<!-- amendment-applies: sections="Amendment (issue #3939, multi-day lookups): the carry source, retention under leaf-bearing parts, and the week merge gate" pointer="repair pair-budget amendment" -->
+
+Date: 2026-11-16. "Decision 2, clarified", in the multi-day lookups
+amendment, says the `--rebuild-key-index`
+repair that follows a new key-index field's declaration builds a sealed
+day in one pass, about 6.8 GB of pairs for a logs day, over the 2 GB RSS
+band. That is retired. The repair (`Catalog::rebuild_key_index`) runs the
+fold's leaf build under `key_index_build_max_pairs`, in the same passes,
+one part at a time, and `ravel-cli catalog fold --rebuild-key-index` takes
+that budget from `--key-index-build-max-pairs` (default 8,000,000).
+
+For a logs day at the default budget, two fields at a share of 4,000,000,
+the repair holds at most `budget + F` = 8,000,002 pairs when no key8 run
+exceeds a share: 8,000,002 x 88 B = 704,000,176 B, about 0.70 GB at
+ADR-3692's 88 B upper-bound estimate, under the 2 GB band with about
+1.3 GB left for what the budget does not bound (the sections in flight,
+the encoded leaves of one pass, per-entry bookkeeping). The pairs are
+released before the next part, so a multi-day repair holds no more than
+one day's bound. Peak RSS is predicted, not measured.
+
+The pass count moves the cost to reads. A logs day's 100,000,000
+`request_id` pairs take at least 25 passes, the count the D3' results
+amendment gives a refold's logs build, and every pass reads every section
+again: at least 2 x 552 x 25 = 27,600 ranged GETs and 25 x 552 x 2.19 MB,
+about 30.2 GB of section bytes per logs day ("Two costs the decision did
+not count" gives the 552 entries and the 2.19 MB a read). The repair is
+explicit and operator-driven, not a fold, so A3, which bounds the fold,
+does not apply to it. ADR-3692's pair-budget repair amendment states
+the same bound.
+
+Refs: #4018, #4297

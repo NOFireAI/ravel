@@ -965,7 +965,8 @@ incremental tail build amendment records the mechanism. What changes:
     part's entries, not its pairs;
   - a single key8 over its share, held whole, as decision 5 already says;
   - the `--rebuild-key-index` repair, which builds in one pass with no
-    budget.
+    budget (no longer so: the repair builds under the pair budget, see the
+    pair-budget repair amendment below).
 
 The figures below are pinned in process against `MemoryStore`; the real-S3
 and RSS figures stay predicted until the harness measures them.
@@ -1645,3 +1646,44 @@ leaf GETs and `SlowDown` responses), and A1, W1 and A2, which read one
 build pass over their band on a fold that also sealed a day.
 
 Refs: #3927, #3939
+
+## Amendment (issues #4018 and #4297): the key-index repair builds under the pair budget
+
+<!-- amendment-applies: sections="Amendment (issue #3704): the pass rule, what the pair budget bounds, and uncovered entries" pointer="pair-budget repair amendment" -->
+
+Date: 2026-11-16. The #3704 amendment lists the `--rebuild-key-index`
+repair among what the pair budget does not bound, as a build in one pass
+with no budget. That is retired. `Catalog::rebuild_key_index` builds each
+part it visits with the fold's own build, in the same passes, under
+`key_index_build_max_pairs` from its catalog config, and `ravel-cli catalog
+fold --rebuild-key-index` sets that from `--key-index-build-max-pairs`
+(default 8,000,000; the flag no longer conflicts with the repair).
+
+The bound is the #3704 amendment's pass rule. A repaired part has no
+previous leaf to carry and holds no LABEL_DICT pairs, so the pairs it holds
+are at most `max(share, R) + 1` per field, `share = max(1, budget / F)` and
+`F` the fields the repair builds for that part, and at most `budget + F`
+for the part when no key8 run exceeds a share. For a logs day at the
+default budget, two fields at a share of 4,000,000, that is at most
+8,000,002 pairs, 8,000,002 x 88 B = 704,000,176 B, about 0.70 GB at the
+88 B upper-bound estimate, where the one-pass build held about 6.8 GB
+(ADR-3939, "Decision 2, clarified"). The rest of the list above still adds
+to it: sections in flight, the encoded leaves of one pass, per-entry
+bookkeeping, and a key8 run over its share. Parts are built one at a time,
+so a batch of parts holds no more than its largest part.
+
+The price is reads. Every pass reads every section of the part again: two
+ranged GETs per entry per pass while the footer fits the 8 KiB suffix.
+100,000,000 `request_id` pairs at a share of 4,000,000 take at least
+`ceil(100,000,000 / 4,000,000) = 25` passes, so a logs day of 552 entries
+costs at least 2 x 552 x 25 = 27,600 ranged GETs and 25 x 552 x 2.19 MB,
+about 30.2 GB of section bytes (ADR-3939, "Two costs the decision did not
+count", for the entry count and the per-read size). A lower
+`--key-index-build-max-pairs` lowers the held pairs and raises the passes
+in proportion. These figures are predicted from the pass rule and pinned
+in process (`the_repair_holds_at_most_the_pair_budget_and_matches_the_fold_at_that_budget`
+in crates/ravel-catalog/src/key_index_rebuild.rs and
+`the_pair_budget_reaches_the_rebuild` in services/ravel-cli/src/catalog.rs);
+no repair over a real logs day has measured them.
+
+Refs: #4018, #4297
