@@ -633,7 +633,7 @@ fn tier_secrets_checksum(
 }
 
 /// Standard object labels for a component of a named `RavelCluster`.
-fn labels(instance: &str, component: &str) -> BTreeMap<String, String> {
+pub(crate) fn labels(instance: &str, component: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
         ("app.kubernetes.io/name".to_string(), "ravel".to_string()),
         (
@@ -652,7 +652,7 @@ fn labels(instance: &str, component: &str) -> BTreeMap<String, String> {
 }
 
 /// Name of a component's child object: `<cluster>-<component>`.
-fn child_name(instance: &str, component: &str) -> String {
+pub(crate) fn child_name(instance: &str, component: &str) -> String {
     format!("{instance}-{component}")
 }
 
@@ -4987,6 +4987,7 @@ mod tests {
                 exposure: None,
                 max_inflight_flushes: None,
                 max_inflight_flushes_per_tenant: None,
+                autoscaling: None,
             },
             query: QuerySpec {
                 replicas: 2,
@@ -4996,6 +4997,7 @@ mod tests {
                 memory_budget_bytes: None,
                 memory_headroom_bytes: None,
                 mcp: None,
+                autoscaling: None,
             },
             maintain: MaintainSpec {
                 enabled: true,
@@ -5008,6 +5010,7 @@ mod tests {
                     name: "maintain-keys".to_string(),
                 }),
                 scratch: None,
+                autoscaling: None,
             },
             // Explicit false: the pre-ADR-1702-task-12 default, kept as the
             // fixture every unrelated render test here builds on. The
@@ -9414,6 +9417,11 @@ mod tests {
                 Some("- apiGroups: [\"batch\"]"),
                 "resources: [\"jobs\"]",
                 "verbs: [\"create\", \"patch\", \"get\", \"delete\"]",
+            ),
+            (
+                Some("- apiGroups: [\"autoscaling\"]"),
+                "resources: [\"horizontalpodautoscalers\"]",
+                "verbs: [\"get\", \"list\", \"watch\", \"create\", \"patch\", \"delete\"]",
             ),
             (
                 // /version detection (issue #1714): a non-resource rule, so it

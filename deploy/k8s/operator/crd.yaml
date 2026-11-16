@@ -59,6 +59,70 @@
                     },
                     "description": "Gateway (ingest + query API) tier.",
                     "properties": {
+                      "autoscaling": {
+                        "description": "Hands the gateway Deployment's replica count to a horizontal scaler\n(ADR-4314). See [`AutoscalingSpec`]. Omit to keep the operator\napplying `replicas`. Withheld, with the `AutoscalingWithheld`\ncondition, while `ingestAffinity` is enabled on `backend:\ningressNginx`.",
+                        "nullable": true,
+                        "properties": {
+                          "maxReplicas": {
+                            "description": "Upper replica bound, at least `minReplicas`.",
+                            "format": "int32",
+                            "type": "integer"
+                          },
+                          "minReplicas": {
+                            "description": "Lower replica bound, at least 1. A Deployment the operator creates\nwhile this block is set starts at this count.",
+                            "format": "int32",
+                            "type": "integer"
+                          },
+                          "mode": {
+                            "description": "`Managed` (the operator renders a CPU HPA) or `External` (it renders\nnone and only releases `spec.replicas`).",
+                            "enum": [
+                              "Managed",
+                              "External"
+                            ],
+                            "type": "string"
+                          },
+                          "scaleDownStabilizationSeconds": {
+                            "description": "The HPA's scale-down stabilization window in seconds, 0 to 3600.\nOmit to keep the Kubernetes default of 300.",
+                            "format": "int32",
+                            "nullable": true,
+                            "type": "integer"
+                          },
+                          "targetCPUUtilizationPercentage": {
+                            "description": "Average CPU utilization, 1 to 100 percent of the pods' CPU request,\nthe HPA targets. Required when `mode` is `Managed`.",
+                            "format": "int32",
+                            "nullable": true,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "maxReplicas",
+                          "minReplicas",
+                          "mode"
+                        ],
+                        "type": "object",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "autoscaling.minReplicas must be at least 1",
+                            "rule": "self.minReplicas >= 1"
+                          },
+                          {
+                            "message": "autoscaling.maxReplicas must be at least autoscaling.minReplicas",
+                            "rule": "self.maxReplicas >= self.minReplicas"
+                          },
+                          {
+                            "message": "autoscaling.targetCPUUtilizationPercentage must be between 1 and 100",
+                            "rule": "!has(self.targetCPUUtilizationPercentage) || (self.targetCPUUtilizationPercentage >= 1 && self.targetCPUUtilizationPercentage <= 100)"
+                          },
+                          {
+                            "message": "autoscaling.targetCPUUtilizationPercentage is required when autoscaling.mode is Managed",
+                            "rule": "self.mode != 'Managed' || has(self.targetCPUUtilizationPercentage)"
+                          },
+                          {
+                            "message": "autoscaling.scaleDownStabilizationSeconds must be between 0 and 3600, the HorizontalPodAutoscaler's own bounds",
+                            "rule": "!has(self.scaleDownStabilizationSeconds) || (self.scaleDownStabilizationSeconds >= 0 && self.scaleDownStabilizationSeconds <= 3600)"
+                          }
+                        ]
+                      },
                       "credentialsSecretRef": {
                         "description": "Per-role S3 credential override for the gateway tier (ADR-0055 section 5).\nWhen set, the gateway Deployment sources `RAVEL_S3_ACCESS_KEY` /\n`RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /\n`secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`,\nso an operator can scope the gateway to a narrower IAM credential. Falls\nback to the shared credential when unset, so existing single-credential\nclusters are unaffected.\nRefused under `storage.s3.auth: podIdentity`, where the tier's role\ncomes from its ServiceAccount's Pod Identity association.",
                         "nullable": true,
@@ -328,6 +392,70 @@
                     },
                     "description": "Background maintenance tier (compaction, retention, GC). Defaults to a\nsingle replica; the bounded multi-worker ownership protocol (ADR-0065)\nmakes `replicas > 1` safe, superseding ADR-0034's single-replica\nguidance.",
                     "properties": {
+                      "autoscaling": {
+                        "description": "Hands the maintain Deployment's replica count to a horizontal scaler\n(ADR-4314). See [`AutoscalingSpec`]. Omit to keep the operator\napplying `replicas`.",
+                        "nullable": true,
+                        "properties": {
+                          "maxReplicas": {
+                            "description": "Upper replica bound, at least `minReplicas`.",
+                            "format": "int32",
+                            "type": "integer"
+                          },
+                          "minReplicas": {
+                            "description": "Lower replica bound, at least 1. A Deployment the operator creates\nwhile this block is set starts at this count.",
+                            "format": "int32",
+                            "type": "integer"
+                          },
+                          "mode": {
+                            "description": "`Managed` (the operator renders a CPU HPA) or `External` (it renders\nnone and only releases `spec.replicas`).",
+                            "enum": [
+                              "Managed",
+                              "External"
+                            ],
+                            "type": "string"
+                          },
+                          "scaleDownStabilizationSeconds": {
+                            "description": "The HPA's scale-down stabilization window in seconds, 0 to 3600.\nOmit to keep the Kubernetes default of 300.",
+                            "format": "int32",
+                            "nullable": true,
+                            "type": "integer"
+                          },
+                          "targetCPUUtilizationPercentage": {
+                            "description": "Average CPU utilization, 1 to 100 percent of the pods' CPU request,\nthe HPA targets. Required when `mode` is `Managed`.",
+                            "format": "int32",
+                            "nullable": true,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "maxReplicas",
+                          "minReplicas",
+                          "mode"
+                        ],
+                        "type": "object",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "autoscaling.minReplicas must be at least 1",
+                            "rule": "self.minReplicas >= 1"
+                          },
+                          {
+                            "message": "autoscaling.maxReplicas must be at least autoscaling.minReplicas",
+                            "rule": "self.maxReplicas >= self.minReplicas"
+                          },
+                          {
+                            "message": "autoscaling.targetCPUUtilizationPercentage must be between 1 and 100",
+                            "rule": "!has(self.targetCPUUtilizationPercentage) || (self.targetCPUUtilizationPercentage >= 1 && self.targetCPUUtilizationPercentage <= 100)"
+                          },
+                          {
+                            "message": "autoscaling.targetCPUUtilizationPercentage is required when autoscaling.mode is Managed",
+                            "rule": "self.mode != 'Managed' || has(self.targetCPUUtilizationPercentage)"
+                          },
+                          {
+                            "message": "autoscaling.scaleDownStabilizationSeconds must be between 0 and 3600, the HorizontalPodAutoscaler's own bounds",
+                            "rule": "!has(self.scaleDownStabilizationSeconds) || (self.scaleDownStabilizationSeconds >= 0 && self.scaleDownStabilizationSeconds <= 3600)"
+                          }
+                        ]
+                      },
                       "credentialsSecretRef": {
                         "description": "Per-role S3 credential override for the maintain tier (ADR-0055 section 5).\nWhen set, the maintain Deployment sources `RAVEL_S3_ACCESS_KEY` /\n`RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /\n`secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`.\nMaintain is the only role ADR-0055 grants delete, so this is where an\noperator points the delete-capable credential. Falls back to the shared\ncredential when unset, so existing single-credential clusters are\nunaffected.\nRefused under `storage.s3.auth: podIdentity`, where the tier's role\ncomes from its ServiceAccount's Pod Identity association.",
                         "nullable": true,
@@ -462,6 +590,70 @@
                     },
                     "description": "Query tier.",
                     "properties": {
+                      "autoscaling": {
+                        "description": "Hands the query Deployment's replica count to a horizontal scaler\n(ADR-4314). See [`AutoscalingSpec`]. Omit to keep the operator\napplying `replicas`.",
+                        "nullable": true,
+                        "properties": {
+                          "maxReplicas": {
+                            "description": "Upper replica bound, at least `minReplicas`.",
+                            "format": "int32",
+                            "type": "integer"
+                          },
+                          "minReplicas": {
+                            "description": "Lower replica bound, at least 1. A Deployment the operator creates\nwhile this block is set starts at this count.",
+                            "format": "int32",
+                            "type": "integer"
+                          },
+                          "mode": {
+                            "description": "`Managed` (the operator renders a CPU HPA) or `External` (it renders\nnone and only releases `spec.replicas`).",
+                            "enum": [
+                              "Managed",
+                              "External"
+                            ],
+                            "type": "string"
+                          },
+                          "scaleDownStabilizationSeconds": {
+                            "description": "The HPA's scale-down stabilization window in seconds, 0 to 3600.\nOmit to keep the Kubernetes default of 300.",
+                            "format": "int32",
+                            "nullable": true,
+                            "type": "integer"
+                          },
+                          "targetCPUUtilizationPercentage": {
+                            "description": "Average CPU utilization, 1 to 100 percent of the pods' CPU request,\nthe HPA targets. Required when `mode` is `Managed`.",
+                            "format": "int32",
+                            "nullable": true,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "maxReplicas",
+                          "minReplicas",
+                          "mode"
+                        ],
+                        "type": "object",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "autoscaling.minReplicas must be at least 1",
+                            "rule": "self.minReplicas >= 1"
+                          },
+                          {
+                            "message": "autoscaling.maxReplicas must be at least autoscaling.minReplicas",
+                            "rule": "self.maxReplicas >= self.minReplicas"
+                          },
+                          {
+                            "message": "autoscaling.targetCPUUtilizationPercentage must be between 1 and 100",
+                            "rule": "!has(self.targetCPUUtilizationPercentage) || (self.targetCPUUtilizationPercentage >= 1 && self.targetCPUUtilizationPercentage <= 100)"
+                          },
+                          {
+                            "message": "autoscaling.targetCPUUtilizationPercentage is required when autoscaling.mode is Managed",
+                            "rule": "self.mode != 'Managed' || has(self.targetCPUUtilizationPercentage)"
+                          },
+                          {
+                            "message": "autoscaling.scaleDownStabilizationSeconds must be between 0 and 3600, the HorizontalPodAutoscaler's own bounds",
+                            "rule": "!has(self.scaleDownStabilizationSeconds) || (self.scaleDownStabilizationSeconds >= 0 && self.scaleDownStabilizationSeconds <= 3600)"
+                          }
+                        ]
+                      },
                       "credentialsSecretRef": {
                         "description": "Per-role S3 credential override for the query tier (ADR-0055 section 5).\nWhen set, the query Deployment sources `RAVEL_S3_ACCESS_KEY` /\n`RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /\n`secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`,\nso an operator can scope the query tier to a narrower IAM credential. Falls\nback to the shared credential when unset, so existing single-credential\nclusters are unaffected.\nRefused under `storage.s3.auth: podIdentity`, where the tier's role\ncomes from its ServiceAccount's Pod Identity association.",
                         "nullable": true,
@@ -877,8 +1069,37 @@
                 "description": "Observed status (ADR-0034 decision 2). Written by the operator on the status\nsubresource.",
                 "nullable": true,
                 "properties": {
+                  "autoscaledTiers": {
+                    "description": "Tiers whose `spec.replicas` the operator has handed to a horizontal\nscaler (ADR-4314), each with the `replicas` it declared on the last\nautoscaled pass. Serialized even when absent (as explicit `null`) so\nthe status merge patch clears it.",
+                    "items": {
+                      "description": "A tier whose `spec.replicas` the operator has released to a scaler.",
+                      "properties": {
+                        "declaredReplicas": {
+                          "description": "The tier's `replicas` on the last pass that autoscaled it.",
+                          "format": "int32",
+                          "type": "integer"
+                        },
+                        "tier": {
+                          "description": "The tier.",
+                          "enum": [
+                            "gateway",
+                            "query",
+                            "maintain"
+                          ],
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "declaredReplicas",
+                        "tier"
+                      ],
+                      "type": "object"
+                    },
+                    "nullable": true,
+                    "type": "array"
+                  },
                   "conditions": {
-                    "description": "Status conditions the operator actually sets: `Available`, `Degraded`,\n`StoreQualified`, `KubernetesVersionUnsupported`,\n`IngestAffinityBackendDeprecated`, `HealthProbeOnMainHttpPort`,\n`BucketProtectionVerified` (on a `storage.azure` cluster only, False\nwith reason NotImplementedForAzure: no bucket-protection check runs\nthere). The operator emits no `Progressing` condition.",
+                    "description": "Status conditions the operator actually sets: `Available`, `Degraded`,\n`StoreQualified`, `KubernetesVersionUnsupported`,\n`IngestAffinityBackendDeprecated`, `HealthProbeOnMainHttpPort`,\n`AutoscalingWithheld`,\n`BucketProtectionVerified` (on a `storage.azure` cluster only, False\nwith reason NotImplementedForAzure: no bucket-protection check runs\nthere). The operator emits no `Progressing` condition.",
                     "items": {
                       "description": "A standard Kubernetes status condition (the `metav1.Condition` shape). Kept\nas a local type rather than `k8s-openapi`'s `Condition` so the status schema\nderives from `schemars` without the `k8s-openapi` schemars coupling.",
                       "properties": {
@@ -969,6 +1190,41 @@
                     "format": "int32",
                     "nullable": true,
                     "type": "integer"
+                  },
+                  "replicaAdoptions": {
+                    "description": "Live replica counts kept after a tier's autoscaling was turned off\n(ADR-4314 decision 2). The operator applies `adoptedReplicas` while the\ntier's `replicas` equals `declaredReplicas`, then drops the entry.\nSerialized even when absent (as explicit `null`) so the status merge\npatch clears it.",
+                    "items": {
+                      "description": "The live replica count a tier kept when its autoscaling was turned off,\napplied until the tier's `replicas` differs from `declaredReplicas`.",
+                      "properties": {
+                        "adoptedReplicas": {
+                          "description": "The live count at turn-off, which the operator applies.",
+                          "format": "int32",
+                          "type": "integer"
+                        },
+                        "declaredReplicas": {
+                          "description": "The tier's `replicas` while it was autoscaled.",
+                          "format": "int32",
+                          "type": "integer"
+                        },
+                        "tier": {
+                          "description": "The tier.",
+                          "enum": [
+                            "gateway",
+                            "query",
+                            "maintain"
+                          ],
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "adoptedReplicas",
+                        "declaredReplicas",
+                        "tier"
+                      ],
+                      "type": "object"
+                    },
+                    "nullable": true,
+                    "type": "array"
                   },
                   "storeQualifiedHash": {
                     "description": "The qualify-Job input hash (bucket, region, endpoint, `allowHttp`,\n`uploadIntegrity`, `requestStoredChecksum`, image, credentials Secret\nname and that Secret's `resourceVersion`; on Azure the account,\ncontainer, image and `qualify` client ID) that store qualification last\nsucceeded against (issue #36).\nThe operator gates serving on `ravel-cli store qualify` before it creates any\nDeployment; recording the qualified inputs here makes that gate durable:\na later pass whose inputs still hash to this value proceeds without\nre-running qualification even after the one-shot Job has been\nTTL-garbage-collected, and a pass whose inputs no longer match re-runs it\n(the `StoreQualified` condition flips back to `Pending`) without tearing\ndown the running Deployments. Absent until the first qualification\nsucceeds. Qualification is never re-run on a schedule; only an input\nchange re-triggers it.",

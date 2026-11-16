@@ -520,6 +520,14 @@ pub struct GatewaySpec {
     /// `ravel-server` would otherwise reject at startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_inflight_flushes_per_tenant: Option<u32>,
+
+    /// Hands the gateway Deployment's replica count to a horizontal scaler
+    /// (ADR-4314). See [`AutoscalingSpec`]. Omit to keep the operator
+    /// applying `replicas`. Withheld, with the `AutoscalingWithheld`
+    /// condition, while `ingestAffinity` is enabled on `backend:
+    /// ingressNginx`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoscaling: Option<AutoscalingSpec>,
 }
 
 impl Default for GatewaySpec {
@@ -533,6 +541,7 @@ impl Default for GatewaySpec {
             exposure: None,
             max_inflight_flushes: None,
             max_inflight_flushes_per_tenant: None,
+            autoscaling: None,
         }
     }
 }
@@ -944,6 +953,12 @@ pub struct QuerySpec {
     /// roll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<McpSpec>,
+
+    /// Hands the query Deployment's replica count to a horizontal scaler
+    /// (ADR-4314). See [`AutoscalingSpec`]. Omit to keep the operator
+    /// applying `replicas`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoscaling: Option<AutoscalingSpec>,
 }
 
 impl Default for QuerySpec {
@@ -956,6 +971,7 @@ impl Default for QuerySpec {
             memory_budget_bytes: None,
             memory_headroom_bytes: None,
             mcp: None,
+            autoscaling: None,
         }
     }
 }
@@ -1132,6 +1148,12 @@ pub struct MaintainSpec {
     /// merge unit's input bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scratch: Option<MaintainScratchSpec>,
+
+    /// Hands the maintain Deployment's replica count to a horizontal scaler
+    /// (ADR-4314). See [`AutoscalingSpec`]. Omit to keep the operator
+    /// applying `replicas`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoscaling: Option<AutoscalingSpec>,
 }
 
 /// Scratch volume for the maintain tier (ADR-3853 D2).
@@ -1177,6 +1199,7 @@ impl Default for MaintainSpec {
             credentials_secret_ref: None,
             key_secret_ref: None,
             scratch: None,
+            autoscaling: None,
         }
     }
 }
@@ -1272,6 +1295,90 @@ pub struct ResourceRequirementsSpec {
     /// Resource ceilings (`resources.limits`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<BTreeMap<String, String>>,
+}
+
+/// Who scales a tier whose replica count the operator has handed over
+/// (ADR-4314 decision 3).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
+pub enum AutoscalingMode {
+    /// The operator renders a CPU `HorizontalPodAutoscaler` (autoscaling/v2)
+    /// named after the tier's Deployment. Needs metrics-server and a CPU
+    /// request on the tier.
+    Managed,
+    /// The operator renders no scaler: bring your own (KEDA, a custom HPA).
+    External,
+}
+
+/// A tier's horizontal autoscaling block (ADR-4314).
+///
+/// While set, the operator stops applying the tier's `replicas` and hands
+/// the Deployment's `spec.replicas` to the scaler at the live count. When
+/// the block is removed, the tier keeps the live count until `replicas` is
+/// changed (recorded in `status.replicaAdoptions`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoscalingSpec {
+    /// `Managed` (the operator renders a CPU HPA) or `External` (it renders
+    /// none and only releases `spec.replicas`).
+    pub mode: AutoscalingMode,
+
+    /// Lower replica bound, at least 1. A Deployment the operator creates
+    /// while this block is set starts at this count.
+    pub min_replicas: i32,
+
+    /// Upper replica bound, at least `minReplicas`.
+    pub max_replicas: i32,
+
+    /// Average CPU utilization, 1 to 100 percent of the pods' CPU request,
+    /// the HPA targets. Required when `mode` is `Managed`.
+    #[serde(
+        default,
+        rename = "targetCPUUtilizationPercentage",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub target_cpu_utilization_percentage: Option<i32>,
+
+    /// The HPA's scale-down stabilization window in seconds, 0 to 3600.
+    /// Omit to keep the Kubernetes default of 300.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_down_stabilization_seconds: Option<i32>,
+}
+
+/// A tier the operator can hand to a horizontal scaler.
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, JsonSchema,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum ScalableTier {
+    /// `spec.gateway`.
+    Gateway,
+    /// `spec.query`.
+    Query,
+    /// `spec.maintain`.
+    Maintain,
+}
+
+/// A tier whose `spec.replicas` the operator has released to a scaler.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoscaledTier {
+    /// The tier.
+    pub tier: ScalableTier,
+    /// The tier's `replicas` on the last pass that autoscaled it.
+    pub declared_replicas: i32,
+}
+
+/// The live replica count a tier kept when its autoscaling was turned off,
+/// applied until the tier's `replicas` differs from `declaredReplicas`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicaAdoption {
+    /// The tier.
+    pub tier: ScalableTier,
+    /// The live count at turn-off, which the operator applies.
+    pub adopted_replicas: i32,
+    /// The tier's `replicas` while it was autoscaled.
+    pub declared_replicas: i32,
 }
 
 /// Default gateway request when `spec.gateway.resources` is omitted (#1726).
@@ -1399,9 +1506,25 @@ pub struct RavelClusterStatus {
     #[serde(default)]
     pub pod_identity_service_accounts: Option<bool>,
 
+    /// Tiers whose `spec.replicas` the operator has handed to a horizontal
+    /// scaler (ADR-4314), each with the `replicas` it declared on the last
+    /// autoscaled pass. Serialized even when absent (as explicit `null`) so
+    /// the status merge patch clears it.
+    #[serde(default)]
+    pub autoscaled_tiers: Option<Vec<AutoscaledTier>>,
+
+    /// Live replica counts kept after a tier's autoscaling was turned off
+    /// (ADR-4314 decision 2). The operator applies `adoptedReplicas` while the
+    /// tier's `replicas` equals `declaredReplicas`, then drops the entry.
+    /// Serialized even when absent (as explicit `null`) so the status merge
+    /// patch clears it.
+    #[serde(default)]
+    pub replica_adoptions: Option<Vec<ReplicaAdoption>>,
+
     /// Status conditions the operator actually sets: `Available`, `Degraded`,
     /// `StoreQualified`, `KubernetesVersionUnsupported`,
     /// `IngestAffinityBackendDeprecated`, `HealthProbeOnMainHttpPort`,
+    /// `AutoscalingWithheld`,
     /// `BucketProtectionVerified` (on a `storage.azure` cluster only, False
     /// with reason NotImplementedForAzure: no bucket-protection check runs
     /// there). The operator emits no `Progressing` condition.
@@ -1478,6 +1601,7 @@ pub fn ravel_cluster_crd() -> CustomResourceDefinition {
     inject_storage_auth_guards(&mut crd);
     inject_query_headroom_needs_budget(&mut crd);
     inject_query_mcp_guards(&mut crd);
+    inject_autoscaling_guards(&mut crd);
     crd
 }
 
@@ -1946,6 +2070,73 @@ fn inject_query_headroom_needs_budget(crd: &mut CustomResourceDefinition) {
         let mut rules = query.x_kubernetes_validations.take().unwrap_or_default();
         rules.push(rule.clone());
         query.x_kubernetes_validations = Some(rules);
+    }
+}
+
+/// The CEL rules on every tier's `autoscaling` block (ADR-4314), each with
+/// its message. `minReplicas`, `maxReplicas` and `mode` are required by the
+/// schema, so only the optional fields are `has()`-guarded.
+const AUTOSCALING_RULES: [(&str, &str); 5] = [
+    (
+        "self.minReplicas >= 1",
+        "autoscaling.minReplicas must be at least 1",
+    ),
+    (
+        "self.maxReplicas >= self.minReplicas",
+        "autoscaling.maxReplicas must be at least autoscaling.minReplicas",
+    ),
+    (
+        "!has(self.targetCPUUtilizationPercentage) || \
+         (self.targetCPUUtilizationPercentage >= 1 && self.targetCPUUtilizationPercentage <= 100)",
+        "autoscaling.targetCPUUtilizationPercentage must be between 1 and 100",
+    ),
+    (
+        "self.mode != 'Managed' || has(self.targetCPUUtilizationPercentage)",
+        "autoscaling.targetCPUUtilizationPercentage is required when autoscaling.mode is Managed",
+    ),
+    (
+        "!has(self.scaleDownStabilizationSeconds) || \
+         (self.scaleDownStabilizationSeconds >= 0 && self.scaleDownStabilizationSeconds <= 3600)",
+        "autoscaling.scaleDownStabilizationSeconds must be between 0 and 3600, the \
+         HorizontalPodAutoscaler's own bounds",
+    ),
+];
+
+/// Attach [`AUTOSCALING_RULES`] to the `autoscaling` property of the gateway,
+/// query and maintain tiers, so a cluster that omits the block has nothing
+/// to evaluate.
+fn inject_autoscaling_guards(crd: &mut CustomResourceDefinition) {
+    let rules = AUTOSCALING_RULES.map(|(rule, message)| ValidationRule {
+        rule: rule.to_string(),
+        message: Some(message.to_string()),
+        ..Default::default()
+    });
+    for version in &mut crd.spec.versions {
+        let Some(spec_props) = version
+            .schema
+            .as_mut()
+            .and_then(|s| s.open_api_v3_schema.as_mut())
+            .and_then(|root| root.properties.as_mut())
+            .and_then(|p| p.get_mut("spec"))
+            .and_then(|spec| spec.properties.as_mut())
+        else {
+            continue;
+        };
+        for tier in ["gateway", "query", "maintain"] {
+            let Some(autoscaling) = spec_props
+                .get_mut(tier)
+                .and_then(|t| t.properties.as_mut())
+                .and_then(|p| p.get_mut("autoscaling"))
+            else {
+                continue;
+            };
+            let mut existing = autoscaling
+                .x_kubernetes_validations
+                .take()
+                .unwrap_or_default();
+            existing.extend(rules.iter().cloned());
+            autoscaling.x_kubernetes_validations = Some(existing);
+        }
     }
 }
 
@@ -3404,6 +3595,154 @@ mod tests {
         assert!(
             !query_mcp_origin_shape_cel_admits(Some(&["https://a.example", ""])),
             "empty entry refused"
+        );
+    }
+
+    /// Rust mirror of [`AUTOSCALING_RULES`], with `None` for an absent field.
+    /// No CEL evaluator runs here, so the schema test below pins the exact
+    /// expressions this mirrors.
+    fn autoscaling_cel_admits(
+        managed: bool,
+        min: i32,
+        max: i32,
+        target: Option<i32>,
+        stabilization: Option<i32>,
+    ) -> bool {
+        min >= 1
+            && max >= min
+            && target.is_none_or(|t| (1..=100).contains(&t))
+            && (!managed || target.is_some())
+            && stabilization.is_none_or(|s| (0..=3600).contains(&s))
+    }
+
+    /// Issue #4322: the five autoscaling rules sit on the `autoscaling`
+    /// property of gateway, query and maintain with their exact text and
+    /// messages, in [`ravel_cluster_crd`] and in the checked-in `crd.yaml`.
+    /// The mirror is then evaluated over the admission cases.
+    #[test]
+    fn autoscaling_rules_sit_on_every_tier_block() {
+        let crd = serde_json::to_value(ravel_cluster_crd()).expect("serialize CRD");
+        let checked_in: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/k8s/operator/crd.yaml"
+        )))
+        .expect("crd.yaml is JSON");
+        let expected = serde_json::json!([
+            {
+                "rule": "self.minReplicas >= 1",
+                "message": "autoscaling.minReplicas must be at least 1",
+            },
+            {
+                "rule": "self.maxReplicas >= self.minReplicas",
+                "message": "autoscaling.maxReplicas must be at least autoscaling.minReplicas",
+            },
+            {
+                "rule": "!has(self.targetCPUUtilizationPercentage) || \
+                    (self.targetCPUUtilizationPercentage >= 1 && \
+                    self.targetCPUUtilizationPercentage <= 100)",
+                "message": "autoscaling.targetCPUUtilizationPercentage must be between 1 and 100",
+            },
+            {
+                "rule": "self.mode != 'Managed' || has(self.targetCPUUtilizationPercentage)",
+                "message": "autoscaling.targetCPUUtilizationPercentage is required when \
+                    autoscaling.mode is Managed",
+            },
+            {
+                "rule": "!has(self.scaleDownStabilizationSeconds) || \
+                    (self.scaleDownStabilizationSeconds >= 0 && \
+                    self.scaleDownStabilizationSeconds <= 3600)",
+                "message": "autoscaling.scaleDownStabilizationSeconds must be between 0 and \
+                    3600, the HorizontalPodAutoscaler's own bounds",
+            },
+        ]);
+        for (source, crd) in [("ravel_cluster_crd", &crd), ("crd.yaml", &checked_in)] {
+            for tier in ["gateway", "query", "maintain"] {
+                let block = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+                    ["spec"]["properties"][tier]["properties"]["autoscaling"];
+                assert_eq!(
+                    block["x-kubernetes-validations"], expected,
+                    "{source} {tier}"
+                );
+                assert_eq!(
+                    block["required"],
+                    serde_json::json!(["maxReplicas", "minReplicas", "mode"]),
+                    "{source} {tier}"
+                );
+                assert_eq!(
+                    block["properties"]["mode"]["enum"],
+                    serde_json::json!(["Managed", "External"]),
+                    "{source} {tier}"
+                );
+            }
+        }
+
+        assert!(autoscaling_cel_admits(true, 2, 4, Some(70), None));
+        assert!(autoscaling_cel_admits(false, 1, 1, None, Some(0)));
+        assert!(!autoscaling_cel_admits(false, 0, 4, None, None), "min 0");
+        assert!(
+            !autoscaling_cel_admits(false, 3, 2, None, None),
+            "max < min"
+        );
+        assert!(
+            !autoscaling_cel_admits(true, 2, 4, None, None),
+            "Managed, no target"
+        );
+        assert!(
+            !autoscaling_cel_admits(false, 2, 4, Some(0), None),
+            "target 0"
+        );
+        assert!(
+            !autoscaling_cel_admits(false, 2, 4, Some(101), None),
+            "target 101"
+        );
+        assert!(autoscaling_cel_admits(false, 2, 4, Some(100), Some(3600)));
+        assert!(
+            !autoscaling_cel_admits(false, 2, 4, None, Some(3601)),
+            "window 3601"
+        );
+        assert!(
+            !autoscaling_cel_admits(false, 2, 4, None, Some(-1)),
+            "window -1"
+        );
+    }
+
+    /// Issue #4322: the autoscaling block and the two status lists read from
+    /// their camelCase wire form; an omitted block stays `None` and is not
+    /// serialized back, and empty status lists serialize as null so a merge
+    /// patch clears them.
+    #[test]
+    fn autoscaling_wire_form() {
+        let gateway: GatewaySpec = serde_json::from_value(serde_json::json!({
+            "autoscaling": {
+                "mode": "Managed", "minReplicas": 2, "maxReplicas": 6,
+                "targetCPUUtilizationPercentage": 70, "scaleDownStabilizationSeconds": 120,
+            },
+        }))
+        .expect("gateway parses");
+        assert_eq!(
+            gateway.autoscaling,
+            Some(AutoscalingSpec {
+                mode: AutoscalingMode::Managed,
+                min_replicas: 2,
+                max_replicas: 6,
+                target_cpu_utilization_percentage: Some(70),
+                scale_down_stabilization_seconds: Some(120),
+            })
+        );
+        let omitted = serde_json::to_value(GatewaySpec::default()).expect("serialize");
+        assert!(omitted.get("autoscaling").is_none(), "{omitted}");
+
+        let status = serde_json::to_value(RavelClusterStatus::default()).expect("serialize");
+        assert_eq!(status["autoscaledTiers"], serde_json::Value::Null);
+        assert!(
+            status
+                .as_object()
+                .is_some_and(|s| s.contains_key("autoscaledTiers"))
+        );
+        assert!(
+            status
+                .as_object()
+                .is_some_and(|s| s.contains_key("replicaAdoptions"))
         );
     }
 
