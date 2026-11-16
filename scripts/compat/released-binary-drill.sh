@@ -4,22 +4,29 @@
 # Runs the published v0.33.0 ravel-server against isolated buckets on a local
 # RustFS process, fences each tenant/signal bucket the way `compat activate`
 # does (crates/ravel-catalog/examples/compat_fence_bucket.rs), and checks that
-# no v0.33.0 write path publishes into a fenced bucket after its grace
-# horizon. Never point it at a shared or production bucket: it creates its
-# own RustFS data directory and buckets under $DRILL_RUN.
+# no v0.33.0 process writes a key outside EXEMPT_PATTERNS into a fenced bucket
+# after its grace horizon while it runs, or after the fence once restarted.
+# Exempt keys are recorded with their LastModified. Writes at process stop
+# (teardown) are recorded and each data object is checked at the trailer
+# version v0.33.0 writes (RSEG 7, RLOG 5, RSPAN 5). Never point it at a
+# shared or production bucket: it creates its own RustFS data directory and
+# buckets under $DRILL_RUN.
 #
 # usage: released-binary-drill.sh PHASE
 #   preflight    verify the assets (sha256, cosign) and print the stamps
 #   start        start RustFS and create the buckets
 #   warm-start   (a) for the warm bucket: v0.33.0 all + maintain, the driver
 #   warm-fence   (b)+(d) fence the warm bucket while the driver runs
-#   warm-finish  (d) after the horizon: listings, graceful stop, verdict
+#   warm-finish  (d) after the horizon plus one scrub rotation: listings,
+#                graceful stop, verdict
 #   cold         (a)+(b)+(c) a second bucket, fenced, then a cold restart
 #   read         (e) v0.33.0 and main read the unfenced v0.33.0 copy
 #   all          every phase above in order, waiting out the warm horizon
 #   verdict      fold every phase's verdict into the report; exit non-zero on
-#                a post-horizon fenced publish, a zero positive control or a
-#                read diff
+#                a non-exempt post-horizon fenced write, a teardown write at
+#                another version or with no version rule, no scrub cursor
+#                write after the horizon, a zero positive control or a read
+#                diff
 #   stop         stop every process this drill started
 #   drive DIR PORT   (internal) the request loop the warm and cold phases run
 #
@@ -34,6 +41,23 @@
 #   DRILL_COLD_SECS how long the cold restart is driven [240]
 #   DRILL_COLD_BUCKET, DRILL_READ_BUCKET  fresh bucket names [drill-cold, drill-read]
 set -euo pipefail
+
+# Keys a v0.33.0 process may still write into a fenced bucket without failing
+# the drill: globs relative to t/<h>/, one path segment per "*". Only keys a
+# newer build ignores or overwrites safely belong here; anything carrying
+# data, commit, visibility, dedup or deletion semantics does not (the
+# enumeration on issue #4243). Each one written is recorded with its
+# LastModified.
+#   <sig>/admission/<pid>.snapshot  admission reconciler, every 10 s, no
+#       provisioning read (v0.33.0 ravel-ingest reconcile.rs snapshot_key).
+#       A newer build counts it as a live sibling until it is 2 reconcile
+#       intervals old and reaps it past its reap horizon (ravel-ingest
+#       reconcile.rs); no data.
+#   <sig>/maint/scrub/<shard>.cursor  scrub cursor, once per scrub tick; its
+#       provisioning read fails open to the static shard range (v0.33.0
+#       ravel-server scrub.rs cursor_key). A newer build resumes from or
+#       overwrites it; no data.
+EXEMPT_PATTERNS="m/admission/*.snapshot l/admission/*.snapshot s/admission/*.snapshot m/maint/scrub/*.cursor l/maint/scrub/*.cursor s/maint/scrub/*.cursor"
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 HERE="$ROOT/scripts/compat"
@@ -69,7 +93,14 @@ MAX_FLUSH_LIFETIME_S=3600
 ALERT_INTERVAL_S=1
 LEASE_TTL_TICKS=3
 T_REQ_S=60
-# The spec's budget: a horizon plus setup beyond 3 h 15 min is NOT RUN.
+# The warm path runs on past the horizon for one full scrub rotation, so the
+# scrub cursor's writes after the horizon are observed. The maintain process
+# runs with --scrub-period $SCRUB_PERIOD, whose rotation is that period in a
+# single tick (v0.33.0 ravel-server scrub.rs, tick = min(period, 1 h)).
+SCRUB_PERIOD=1h
+WARM_TAIL_S=3660
+# The spec's budget: a horizon plus WARM_TAIL_S beyond 3 h 15 min from the
+# fence is NOT RUN.
 BUDGET_S=11700
 
 V033_SERVER="$V033/ravel-server-linux-amd64"
@@ -154,7 +185,7 @@ start_v033() {
     --cache-dir "$dir/cache"
   RAVEL_S3_BUCKET=$bucket NO_COLOR=1 spawn "$dir/maintain" "$V033_SERVER" --mode maintain --store s3 \
     --tenant-hash-key-file "$RUN/tenant.key" --maintain-key-file "$RUN/maintain.key" \
-    --maintain-interval-secs 1 --listen-http "127.0.0.1:$mhttp" --listen-grpc "127.0.0.1:$mgrpc" \
+    --maintain-interval-secs 1 --scrub-period "$SCRUB_PERIOD" --listen-http "127.0.0.1:$mhttp" --listen-grpc "127.0.0.1:$mgrpc" \
     --cache-dir "$dir/mcache"
   wait_ready "http://127.0.0.1:$http" || {
     say "v0.33.0 server on $bucket never became ready (see $dir/server.log)"
@@ -223,16 +254,51 @@ fence_bucket() {
 }
 
 # Late-write check over a before/after listing pair. Records every key the
-# pair shows written, with LastModified, and the late subset.
+# pair shows written, with LastModified, the exempt subset and the late
+# subset (non-exempt fenced or alerts keys past the horizon).
 judge() {
-  local dir=$1 before=$2 after=$3 fenced_after=$4 alerts_after=$5 tag=$6 h
+  local dir=$1 before=$2 after=$3 fenced_after=$4 alerts_after=$5 tag=$6 h code=0
   h=$(cat "$RUN/tenant.hash")
   drill_written_keys "$before" "$after" > "$dir/written.$tag"
   drill_removed_keys "$before" "$after" > "$dir/removed.$tag"
-  if drill_late_writes "$dir/written.$tag" "$h" "$fenced_after" "$alerts_after" > "$dir/late.$tag"; then
-    echo "verdict $tag pass late=0 written=$(grep -c . "$dir/written.$tag" || true)"
+  drill_late_writes "$dir/written.$tag" "$h" "$fenced_after" "$alerts_after" "$EXEMPT_PATTERNS" \
+    > "$dir/events.$tag" || code=$?
+  grep '^late ' "$dir/events.$tag" > "$dir/late.$tag" || true
+  grep '^exempt ' "$dir/events.$tag" > "$dir/exempt.$tag" || true
+  sed 's/^/  /' "$dir/exempt.$tag" "$dir/late.$tag"
+  if [ "$code" -eq 0 ]; then
+    echo "verdict $tag pass late=0 exempt=$(grep -c . "$dir/exempt.$tag" || true) written=$(grep -c . "$dir/written.$tag" || true)"
   else
-    echo "verdict $tag FAIL late=$(grep -c . "$dir/late.$tag") written=$(grep -c . "$dir/written.$tag" || true)"
+    echo "verdict $tag FAIL late=$(grep -c . "$dir/late.$tag" || true) exempt=$(grep -c . "$dir/exempt.$tag" || true) written=$(grep -c . "$dir/written.$tag" || true)"
+  fi
+}
+
+# Teardown writes between a running listing and the post-stop listing: each
+# recorded, each data object (and each commit record's data object) checked
+# at the release's trailer version.
+judge_teardown() {
+  local dir=$1 bucket=$2 running=$3 stopped=$4 tag=$5 h key lm size data code=0
+  h=$(cat "$RUN/tenant.hash")
+  drill_written_keys "$running" "$stopped" > "$dir/written.$tag"
+  drill_removed_keys "$running" "$stopped" > "$dir/removed.$tag"
+  : > "$dir/trailers.$tag"
+  while IFS=$'\t' read -r key lm size; do
+    case "$key" in
+      "t/$h/"*/l0/*.rseg) data=$key ;;
+      "t/$h/"*/c/*.cmt) data=$(drill_commit_data_key "$key" "$stopped") || continue ;;
+      *) continue ;;
+    esac
+    grep -qF "$data"$'\t' "$dir/trailers.$tag" \
+      || python3 "$HERE/drill_s3.py" trailer "$bucket" "$data" >> "$dir/trailers.$tag" \
+      || say "trailer of $data not read"
+  done < "$dir/written.$tag"
+  drill_teardown_check "$dir/written.$tag" "$h" "$stopped" "$dir/trailers.$tag" "$EXEMPT_PATTERNS" \
+    > "$dir/teardown.$tag" || code=$?
+  sed 's/^/  /' "$dir/teardown.$tag"
+  if [ "$code" -eq 0 ]; then
+    echo "verdict $tag pass bad=0 checked=$(grep -c '^teardown-ok' "$dir/teardown.$tag" || true) exempt=$(grep -c '^teardown-exempt' "$dir/teardown.$tag" || true)"
+  else
+    echo "verdict $tag FAIL bad=$(grep -c '^teardown-bad' "$dir/teardown.$tag" || true) checked=$(grep -c '^teardown-ok' "$dir/teardown.$tag" || true)"
   fi
 }
 
@@ -326,10 +392,12 @@ phase_warm_fence() {
     echo "horizon ingest_unix=$horizon ingest_utc=$(date -u -d "@$horizon" +%FT%TZ) after_fence_s=$((horizon - w))"
     echo "horizon alerts_unix=$alerts_h after_fence_s=$((alerts_h - w))"
   } | tee "$d/horizon"
+  echo "horizon finish_unix=$((horizon + WARM_TAIL_S)) finish_utc=$(date -u -d "@$((horizon + WARM_TAIL_S))" +%FT%TZ) scrub_tail_s=$WARM_TAIL_S" | tee -a "$d/horizon"
   echo "$horizon" > "$d/horizon.ingest"
   echo "$alerts_h" > "$d/horizon.alerts"
-  if [ $((horizon - now)) -gt "$BUDGET_S" ]; then
-    say "warm: horizon $((horizon - now)) s away exceeds the $BUDGET_S s budget: (d) NOT RUN"
+  echo "$((horizon + WARM_TAIL_S))" > "$d/horizon.finish"
+  if [ $((horizon + WARM_TAIL_S - now)) -gt "$BUDGET_S" ]; then
+    say "warm: horizon plus the scrub tail is $((horizon + WARM_TAIL_S - now)) s away, over the $BUDGET_S s budget: (d) NOT RUN"
     echo "NOT RUN" > "$d/status"
   else
     echo "RUNNING" > "$d/status"
@@ -338,20 +406,33 @@ phase_warm_fence() {
 
 phase_warm_finish() {
   load_creds
-  local d=$RUN/warm horizon alerts_h now
+  local d=$RUN/warm horizon alerts_h finish now n
   horizon=$(cat "$d/horizon.ingest")
   alerts_h=$(cat "$d/horizon.alerts")
+  finish=$(cat "$d/horizon.finish")
   now=$(date -u +%s)
-  [ "$now" -gt "$horizon" ] || die "warm: horizon $(date -u -d "@$horizon" +%T) not passed yet ($((horizon - now)) s left)"
+  [ "$now" -gt "$finish" ] || die "warm: horizon plus the scrub tail $(date -u -d "@$finish" +%T) not passed yet ($((finish - now)) s left)"
   ls_bucket drill-warm "$d/after.list"
+  # The driver stops first; the servers' own listing after that is the
+  # running state their teardown is measured from.
   stop_pid "$d/drive.pid"
+  ls_bucket drill-warm "$d/running.list"
   stop_pid "$d/server.pid"
   stop_pid "$d/maintain.pid"
   sleep 5
   ls_bucket drill-warm "$d/teardown.list"
   {
-    judge "$d" "$d/fenced.list" "$d/after.list" "$horizon" "$alerts_h" warm
-    judge "$d" "$d/after.list" "$d/teardown.list" "$horizon" "$alerts_h" teardown
+    judge "$d" "$d/fenced.list" "$d/running.list" "$horizon" "$alerts_h" warm
+    # One full scrub rotation after the horizon must be observed, or the run
+    # did not exercise the exempt cursor path it claims to.
+    n=$(grep -c '^exempt fenced t/[^ ]*/maint/scrub/[^ ]* [^ ]* after$' "$d/exempt.warm" || true)
+    echo "figure warm_scrub_cursor_after_horizon $n" >> "$d/report"
+    if drill_check_figure "$d/report" warm_scrub_cursor_after_horizon 1 1000000; then
+      echo "verdict warm-scrub-rotation pass observed=$n"
+    else
+      echo "verdict warm-scrub-rotation FAIL observed=$n"
+    fi
+    judge_teardown "$d" drill-warm "$d/running.list" "$d/teardown.list" teardown
   } | tee "$d/verdict"
   echo "DONE" > "$d/status"
 }
@@ -564,7 +645,7 @@ case "${1:-}" in
     phase_cold
     phase_read
     if [ "$(cat "$RUN/warm/status")" = RUNNING ]; then
-      while [ "$(date -u +%s)" -le "$(cat "$RUN/warm/horizon.ingest")" ]; do
+      while [ "$(date -u +%s)" -le "$(cat "$RUN/warm/horizon.finish")" ]; do
         sleep 60
       done
       phase_warm_finish
