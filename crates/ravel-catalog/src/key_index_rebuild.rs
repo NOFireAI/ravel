@@ -10,12 +10,16 @@
 //! `share = max(1, key_index_build_max_pairs / fields)` and `R` is the
 //! field's largest key8 run, so with no run over the share the part holds at
 //! most `key_index_build_max_pairs + fields` pairs, whatever its size. Each
-//! pass reads every entry's section again. With the same budget, a rebuilt
-//! leaf of a declared field is byte-identical to the one a fold with
-//! `build_key_index_leaves` on writes for the same part. The fold also
-//! indexes fields a KEY_IDX section names that the tenant does not declare;
-//! the rebuild does not, and since the share divides the budget by the
-//! fields built, its leaves match only where the fold built the same fields.
+//! pass reads every entry's section again. The share divides the budget by
+//! the fields built, so a rebuilt leaf is byte-identical to the one a fold
+//! with `build_key_index_leaves` on writes for the same part at the same
+//! budget only when the rebuild builds the same fields the fold built. It
+//! does not when a KEY_IDX section names a field the tenant does not declare
+//! (the fold indexes it, the rebuild does not), and it does not when the
+//! rebuild builds fewer fields than the tenant declares: `options.field`, or
+//! a part that already holds refs for some declared fields and gains only the
+//! rest. A larger share can then end a pass at another key8, and every pass
+//! end is a slice end.
 
 use std::collections::HashSet;
 
@@ -107,10 +111,11 @@ pub struct KeyIndexRebuildReport {
     /// entries, or for one of their leaves' prefixes, failed with a store
     /// error; a rerun reads them again.
     pub parts_deferred: u64,
-    /// Leaves PUT, including any a lost CAS, a deferred part or a field over
-    /// the byte cap left unreferenced.
+    /// Leaf PUTs issued, including any a lost CAS, a deferred part or a field
+    /// over the byte cap left unreferenced. Counted when issued by the fold's
+    /// build, so a run interrupted by a failed leaf PUT counts that PUT too.
     pub leaves_written: u64,
-    /// Total bytes of those leaves, as uploaded.
+    /// Total bytes of the leaves those PUTs sent, the failed PUT's included.
     pub leaf_bytes_written: u64,
     /// Bytes the ranged GETs returned: footer suffixes, any extra footer
     /// ranges, and KEY_IDX sections, as transferred, retries excluded.
@@ -661,7 +666,7 @@ impl Catalog {
             // The fold's own passes under the pair budget: each field holds at
             // most its share of `key_index_build_max_pairs` at a time.
             let before = counters;
-            let leaves = build_part_key_index(
+            let built_part = build_part_key_index(
                 self.store(),
                 tenant,
                 signal,
@@ -680,7 +685,9 @@ impl Catalog {
                 KeyIndexBuildCaller::Repair,
                 &mut counters,
             )
-            .await?;
+            .await;
+            // A build that fails has still issued its reads and PUTs, so the
+            // report counts them before the error interrupts the run.
             let ranged_gets = counters.key_index_ranged_gets - before.key_index_ranged_gets;
             let leaf_puts = counters.put_requests - before.put_requests;
             attempt.ranged_gets += ranged_gets;
@@ -691,6 +698,7 @@ impl Catalog {
             report.leaves_written += leaf_puts;
             report.leaf_bytes_written +=
                 counters.key_index_leaf_bytes_put - before.key_index_leaf_bytes_put;
+            let leaves = built_part?;
             if leaves.stopped_on_failed_get {
                 report.parts_deferred += 1;
                 tracing::warn!(
@@ -1978,6 +1986,162 @@ mod tests {
                 .expect("rebuilt leaf");
             assert_eq!(a.data, b.data, "{}", leaf.key);
         }
+    }
+
+    /// The 40-pair part at a budget of 8, rebuilt clean: the leaf keys in PUT
+    /// order with their sizes. Pins the five passes of one leaf each that the
+    /// interrupted-run tests count on.
+    async fn forty_pair_leaves_in_put_order() -> Vec<(String, u64)> {
+        let store = recording_store();
+        forty_pair_part(&store).await;
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                key_index_build_max_pairs: 8,
+                ..config(1)
+            },
+        )
+        .expect("catalog");
+        fold_through(&catalog, Signal::Logs, KIDX_HOUR).await;
+        store.clear();
+        let report = rebuild(&catalog, Signal::Logs).await;
+        assert_eq!(
+            (report.ranged_gets, report.leaves_written),
+            (5 * 2 * 4, 5),
+            "{report:?}"
+        );
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let sizes: std::collections::BTreeMap<String, u64> = head.parts[0]
+            .key_index
+            .iter()
+            .map(|r| (r.key.clone(), r.size))
+            .collect();
+        let leaves: Vec<(String, u64)> = store
+            .puts()
+            .into_iter()
+            .filter(|key| key.ends_with(".kidx"))
+            .map(|key| {
+                let size = sizes[&key];
+                (key, size)
+            })
+            .collect();
+        assert_eq!(leaves.len(), 5, "{leaves:?}");
+        assert_eq!(
+            report.leaf_bytes_written,
+            leaves.iter().map(|(_, size)| size).sum::<u64>()
+        );
+        leaves
+    }
+
+    /// The same part and budget rebuilt over a store whose `nth` leaf PUT (1
+    /// based) times out before it reaches the store. Returns the run's
+    /// report, the recording store under the faults and the fault count.
+    async fn forty_pair_rebuild_failing_leaf_put(
+        nth: usize,
+    ) -> (KeyIndexRebuildReport, Arc<RecordingStore>, u64) {
+        let inner = recording_store();
+        forty_pair_part(&inner).await;
+        let cfg = CatalogConfig {
+            key_index_build_max_pairs: 8,
+            ..config(1)
+        };
+        let clean = Catalog::new(inner.clone(), cfg).expect("catalog");
+        fold_through(&clean, Signal::Logs, KIDX_HOUR).await;
+        let plan = FaultPlan::empty().with_sequence(
+            (1..nth)
+                .fold(
+                    Sequence::new(Op::Put).with_key_contains(".kidx"),
+                    |seq, _| seq.then_passthrough(),
+                )
+                .then_fault(ScriptedFault::Timeout),
+        );
+        let faulty = Arc::new(FaultStore::new(Arc::clone(&inner), plan));
+        let catalog = Catalog::new(faulty.clone(), cfg).expect("catalog");
+        inner.clear();
+        let err = catalog
+            .rebuild_key_index(&tenant(), Signal::Logs, &KeyIndexRebuildOptions::default())
+            .await
+            .expect_err("the failed leaf PUT interrupts the run");
+        let KeyIndexRebuildError::Interrupted { source, report } = err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            matches!(source, CatalogError::Store(StoreError::Timeout)),
+            "{source:?}"
+        );
+        assert_eq!(
+            (report.parts_rebuilt, report.attempt_count),
+            (0, 0),
+            "{report:?}"
+        );
+        assert!(
+            !inner.puts().iter().any(|key| key.ends_with("/HEAD")),
+            "no HEAD CAS"
+        );
+        (
+            *report,
+            inner,
+            faulty.fault_count(Op::Put, FaultKind::Timeout),
+        )
+    }
+
+    /// Issue #4297, item 3: the report counts leaf PUTs when issued, the
+    /// failed one included. The second of five leaf PUTs times out: the
+    /// report counts 2 leaves and the bytes of the first two leaves a clean
+    /// run PUTs, while the store holds the first leaf alone.
+    ///
+    /// Against the code before #4297 the report counts 0 leaves and 0 bytes
+    /// (a failed build's PUTs were dropped). A fix that counted only the PUTs
+    /// that succeeded by dropping the last one on the error path counts 1.
+    #[tokio::test]
+    async fn a_failed_leaf_put_is_counted_as_issued_in_the_interrupted_report() {
+        let clean = forty_pair_leaves_in_put_order().await;
+        let (report, inner, faults) = forty_pair_rebuild_failing_leaf_put(2).await;
+        assert_eq!(faults, 1);
+        assert_eq!(
+            (report.leaves_written, report.leaf_bytes_written),
+            (2, clean[0].1 + clean[1].1),
+            "{report:?}"
+        );
+        assert_eq!(
+            kidx_objects(inner.as_ref(), Signal::Logs).await,
+            vec![clean[0].0.clone()],
+            "only the first leaf reached the store"
+        );
+    }
+
+    /// Issue #4297, item 4: a build that fails still reports its reads and
+    /// its leaf PUTs. The fourth of five leaf PUTs times out, after the
+    /// fourth pass's reads: the report counts 4 passes x 2 ranged GETs x 4
+    /// entries, exactly the bytes the store served for them, 4 leaf PUTs and
+    /// the bytes of the first four leaves a clean run PUTs.
+    ///
+    /// Against the code before #4297 every one of these is 0. A fix that
+    /// folded the GET counts on the error path but not the PUT counts reports
+    /// 0 leaves and 0 leaf bytes.
+    #[tokio::test]
+    async fn a_failed_build_reports_its_gets_bytes_and_leaf_puts() {
+        let clean = forty_pair_leaves_in_put_order().await;
+        let (report, inner, faults) = forty_pair_rebuild_failing_leaf_put(4).await;
+        assert_eq!(faults, 1);
+        let served = inner.data_ranged_gets();
+        assert_eq!(served.len(), 4 * 2 * 4);
+        assert_eq!(
+            (
+                report.ranged_gets,
+                report.section_bytes_read,
+                report.leaves_written,
+                report.leaf_bytes_written,
+            ),
+            (
+                4 * 2 * 4,
+                served.iter().map(|(_, _, bytes)| bytes).sum::<u64>(),
+                4,
+                clean[..4].iter().map(|(_, size)| size).sum::<u64>(),
+            ),
+            "{report:?}"
+        );
+        assert_eq!(kidx_objects(inner.as_ref(), Signal::Logs).await.len(), 3);
     }
 
     /// A ranged GET that fails with a store error for one entry defers its

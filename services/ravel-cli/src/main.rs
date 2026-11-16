@@ -2812,10 +2812,11 @@ enum CatalogCommand {
         /// every_pass_holds_at_most_its_share_open_slice_included; about 88 B
         /// a one-block pair is an upper-bound estimate. The leaves equal a
         /// build from scratch at the same budget. At least 1. Refused with
-        /// `--no-key-index-leaves`, which turns off the build it bounds, and
-        /// with `--rebuild-key-index`.
+        /// `--no-key-index-leaves`, which turns off the build it bounds. With
+        /// `--rebuild-key-index` it is the repair's budget, which builds in
+        /// the same passes.
         #[arg(long, value_name = "N",
-              conflicts_with_all = ["key_index_leaves", "rebuild_key_index"],
+              conflicts_with = "key_index_leaves",
               default_value_t = ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
               value_parser = clap::value_parser!(u64).range(1..))]
         key_index_build_max_pairs: u64,
@@ -3357,12 +3358,13 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     rebuild_key_index: true,
                     field,
                     batch_entries,
+                    key_index_build_max_pairs,
                     no_metrics_label_index,
                     json,
                     tenant_kms,
                     ..
                 },
-        } => catalog::rebuild_key_index(
+        } => catalog::rebuild_key_index_at_budget(
             store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?, log)
                 .await?,
             cli.store.selection(),
@@ -3371,6 +3373,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             signal,
             field,
             batch_entries,
+            key_index_build_max_pairs,
             !no_metrics_label_index,
             json,
         )
@@ -5717,9 +5720,9 @@ mod tests {
 
     /// `catalog fold --key-index-build-max-pairs` (ADR-3692 decision 5)
     /// defaults to 8,000,000, refuses 0 at parse time, is accepted with no
-    /// leaf flag (the build is on by default) and beside
-    /// `--key-index-leaves`, and is refused with `--no-key-index-leaves`,
-    /// which turns off the build it bounds, and with `--rebuild-key-index`.
+    /// leaf flag (the build is on by default), beside `--key-index-leaves`
+    /// and beside `--rebuild-key-index` (issue #4297), and is refused with
+    /// `--no-key-index-leaves`, which turns off the build it bounds.
     #[test]
     fn catalog_fold_key_index_build_max_pairs_flag() {
         let try_parse = |extra: &[&str]| {
@@ -5754,25 +5757,22 @@ mod tests {
                 .expect("a budget beside the leaf build parses"),
             1000
         );
+        assert_eq!(
+            try_parse(&["--rebuild-key-index", "--key-index-build-max-pairs", "1000"])
+                .expect("a budget beside the repair parses"),
+            1000
+        );
         assert!(
             try_parse(&["--key-index-build-max-pairs", "0"]).is_err(),
             "a budget of 0 is refused"
         );
-        for extra in [
-            &[
-                "--no-key-index-leaves",
-                "--key-index-build-max-pairs",
-                "1000",
-            ][..],
-            &["--rebuild-key-index", "--key-index-build-max-pairs", "1000"][..],
-        ] {
-            let err = try_parse(extra).expect_err("the budget is refused here");
-            assert_eq!(
-                err.kind(),
-                clap::error::ErrorKind::ArgumentConflict,
-                "{extra:?}"
-            );
-        }
+        let err = try_parse(&[
+            "--no-key-index-leaves",
+            "--key-index-build-max-pairs",
+            "1000",
+        ])
+        .expect_err("the budget is refused without the build");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     /// `catalog fold --retention-default` is unset by default, parses a

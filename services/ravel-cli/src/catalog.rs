@@ -708,7 +708,7 @@ pub async fn rebuild_key_index(
     metrics_label_index: bool,
     json: bool,
 ) -> anyhow::Result<(KeyIndexRebuildReport, String)> {
-    let (result, out) = rebuild_key_index_outcome(
+    rebuild_key_index_at_budget(
         store,
         selection,
         tenant,
@@ -716,6 +716,38 @@ pub async fn rebuild_key_index(
         signal,
         field,
         batch_entries,
+        ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+        metrics_label_index,
+        json,
+    )
+    .await
+}
+
+/// [`rebuild_key_index`], plus `--key-index-build-max-pairs`: sets
+/// [`CatalogConfig::key_index_build_max_pairs`], the pair budget the repair
+/// builds each part under.
+#[allow(clippy::too_many_arguments)]
+pub async fn rebuild_key_index_at_budget(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    shard_count: u32,
+    signal: SignalArg,
+    field: Option<String>,
+    batch_entries: u64,
+    key_index_build_max_pairs: u64,
+    metrics_label_index: bool,
+    json: bool,
+) -> anyhow::Result<(KeyIndexRebuildReport, String)> {
+    let (result, out) = rebuild_key_index_outcome_at_budget(
+        store,
+        selection,
+        tenant,
+        shard_count,
+        signal,
+        field,
+        batch_entries,
+        key_index_build_max_pairs,
         metrics_label_index,
         json,
     )
@@ -730,7 +762,7 @@ pub async fn rebuild_key_index(
 /// the text the command prints for it, which is empty for an error that
 /// carries no report (one raised before any batch ran).
 /// `metrics_label_index` sets [`CatalogConfig::metrics_label_index`], without
-/// which a metrics rebuild is refused.
+/// which a metrics rebuild is refused. Builds at the default pair budget.
 #[allow(clippy::too_many_arguments)]
 pub async fn rebuild_key_index_outcome(
     store: Arc<dyn ObjectStoreBackend>,
@@ -740,6 +772,37 @@ pub async fn rebuild_key_index_outcome(
     signal: SignalArg,
     field: Option<String>,
     batch_entries: u64,
+    metrics_label_index: bool,
+    json: bool,
+) -> anyhow::Result<(Result<KeyIndexRebuildReport, KeyIndexRebuildError>, String)> {
+    rebuild_key_index_outcome_at_budget(
+        store,
+        selection,
+        tenant,
+        shard_count,
+        signal,
+        field,
+        batch_entries,
+        ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+        metrics_label_index,
+        json,
+    )
+    .await
+}
+
+/// [`rebuild_key_index_outcome`] at the pair budget
+/// `key_index_build_max_pairs`, which sets
+/// [`CatalogConfig::key_index_build_max_pairs`].
+#[allow(clippy::too_many_arguments)]
+pub async fn rebuild_key_index_outcome_at_budget(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    shard_count: u32,
+    signal: SignalArg,
+    field: Option<String>,
+    batch_entries: u64,
+    key_index_build_max_pairs: u64,
     metrics_label_index: bool,
     json: bool,
 ) -> anyhow::Result<(Result<KeyIndexRebuildReport, KeyIndexRebuildError>, String)> {
@@ -756,6 +819,7 @@ pub async fn rebuild_key_index_outcome(
         store,
         CatalogConfig {
             shard_count,
+            key_index_build_max_pairs,
             metrics_label_index,
             ..CatalogConfig::default()
         },
@@ -1839,6 +1903,145 @@ mod tests {
                 text.lines().filter(|got| *got == line).count(),
                 1,
                 "{line}\n{text}"
+            );
+        }
+    }
+
+    mod rebuild_budget {
+        use super::*;
+        use crate::store::StoreKind;
+        use bytes::Bytes;
+        use ravel_commit::keys;
+        use ravel_commit::publish::{self, RetryPolicy};
+        use ravel_commit::record::{self, NewCommitRecord};
+        use ravel_rspan::{ObjectIdentity, RspanConfig, RspanWriter, SpanRecord, StatusCode};
+
+        const TENANT: &str = "cli-rebuild-key-index-budget";
+        const MEMORY: StoreSelection = StoreSelection::explicit(StoreKind::Memory);
+        const NOW_NS: i64 = 500_000 * NS_PER_HOUR;
+        const TRACES: u8 = 3;
+
+        /// A spans tenant whose one part, folded with the leaf build off,
+        /// holds one RSPAN object with `TRACES` distinct trace ids.
+        async fn folded_without_leaves() -> Arc<MemoryStore> {
+            let store = Arc::new(MemoryStore::new());
+            let tenant_hash = TenantId::new(TENANT).hash();
+            let writer_id = Uuid::from_u128(1);
+            let mut writer = RspanWriter::new(
+                RspanConfig::default(),
+                ObjectIdentity {
+                    tenant_hash: tenant_hash.0,
+                    shard: 0,
+                    writer_id: *writer_id.as_bytes(),
+                    writer_epoch: 1,
+                    writer_seq: 1,
+                },
+            );
+            let base_ts = NOW_NS - 3 * NS_PER_HOUR;
+            for i in 0..TRACES {
+                writer.push(SpanRecord {
+                    trace_id: [i + 1; 16],
+                    span_id: [i + 1; 8],
+                    parent_span_id: None,
+                    name: "op".to_string(),
+                    start_ts_ns: base_ts + i64::from(i),
+                    end_ts_ns: base_ts + i64::from(i) + 10,
+                    status_code: StatusCode::Unset,
+                    status_message: None,
+                    attrs: Vec::new(),
+                });
+            }
+            let bytes = Bytes::from(writer.finish().expect("finish"));
+            let commit = record::build(NewCommitRecord {
+                tenant_hash,
+                signal: Signal::Spans,
+                shard: 0,
+                writer_id,
+                writer_epoch: 1,
+                writer_seq: 1,
+                object_size: bytes.len() as u64,
+                content_hash: *blake3::hash(&bytes).as_bytes(),
+                sample_count: u64::from(TRACES),
+                series_count: 1,
+                min_event_ts_ns: base_ts,
+                max_event_ts_ns: base_ts + 100,
+                min_ingest_ts_ns: base_ts,
+                max_ingest_ts_ns: base_ts + 100,
+                segment_format_version: 1,
+                created_unix_ns: base_ts,
+                ingest_hour_bucket: u32::try_from(base_ts.div_euclid(NS_PER_HOUR))
+                    .expect("fits u32"),
+            })
+            .expect("valid record");
+            let data_key = keys::reconstruct_data_key(&commit).expect("data key");
+            publish::put_data_object(store.as_ref(), &data_key, bytes)
+                .await
+                .expect("put data object");
+            publish::publish(store.as_ref(), &commit, &RetryPolicy::default())
+                .await
+                .expect("publish");
+            let (report, _) = fold_with_writers_stopped(
+                Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+                MEMORY,
+                TENANT,
+                1,
+                SignalArg::Spans,
+                None,
+                false,
+                false,
+                NOW_NS,
+                true,
+            )
+            .await
+            .expect("fold succeeds");
+            assert_eq!(report.entry_count, 1);
+            assert_eq!(report.key_index_leaves_written, 0, "folded with leaves off");
+            store
+        }
+
+        async fn rebuild_at(budget: u64) -> KeyIndexRebuildReport {
+            let store = folded_without_leaves().await;
+            let (report, _) = rebuild_key_index_at_budget(
+                store as Arc<dyn ObjectStoreBackend>,
+                MEMORY,
+                TENANT,
+                1,
+                SignalArg::Spans,
+                None,
+                ravel_catalog::DEFAULT_KEY_INDEX_REBUILD_BATCH_ENTRIES,
+                budget,
+                false,
+                true,
+            )
+            .await
+            .expect("rebuild");
+            report
+        }
+
+        /// `--key-index-build-max-pairs` reaches `Catalog::rebuild_key_index`
+        /// (issue #4297): at the default budget the part's three trace ids
+        /// build in one pass, a suffix GET and a section GET, and one leaf; at
+        /// a budget of one pair each pass holds one trace id, so the build
+        /// takes three passes, each with its own two GETs and its own leaf.
+        #[tokio::test]
+        async fn the_pair_budget_reaches_the_rebuild() {
+            let default = rebuild_at(ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS).await;
+            let narrow = rebuild_at(1).await;
+            assert_eq!(
+                (
+                    default.parts_rebuilt,
+                    default.ranged_gets,
+                    default.leaves_written
+                ),
+                (1, 2, 1)
+            );
+            assert_eq!(
+                (
+                    narrow.parts_rebuilt,
+                    narrow.ranged_gets,
+                    narrow.leaves_written
+                ),
+                (1, 6, 3)
             );
         }
     }
