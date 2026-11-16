@@ -908,7 +908,11 @@ pub enum ColumnarBlockOutcome<'a> {
 }
 
 /// What [`LogSegmentScan::next_row_block`] produced.
+///
+/// Returned by value once per block and consumed at once, so boxing the block
+/// would add an allocation per block to save a move.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum RowBlockOutcome {
     /// The next surviving block, its rows not yet filtered by erasure.
     Block(RowBlock),

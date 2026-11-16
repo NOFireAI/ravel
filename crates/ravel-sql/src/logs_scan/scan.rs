@@ -1916,7 +1916,7 @@ impl LogScanStream {
             | LogScanState::Columnar(scan) => scan.key().to_string(),
             _ => {
                 return Err(DataFusionError::Internal(
-                    "row block taken off a scan-holding state".into(),
+                    "row block taken with no scan-holding state".into(),
                 ));
             }
         };
