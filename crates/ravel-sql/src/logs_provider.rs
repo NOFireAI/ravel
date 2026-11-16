@@ -1511,9 +1511,9 @@ mod tests {
     /// (`stream_attrs`) attribute must also be excluded. The `attrs` column
     /// materializes the merged resource + scope + record view, so `user_id` is
     /// queryable, yet the fetcher-level filter (`retain_log_records`) matches
-    /// per-record attributes alone and never sees it. Before the scan-layer
-    /// `retain_unerased` in `logs_scan.rs::prepare_partition`, the erased row
-    /// leaked through this `SELECT`; removing that call reintroduces the leak.
+    /// per-record attributes alone and never sees it. Without the scan-layer
+    /// merged-view match (`build_row_batch` in `logs_scan/batch.rs`), the
+    /// erased row leaks through this `SELECT`.
     #[tokio::test]
     async fn pending_erasure_excludes_resource_attribute_rows_on_the_sql_path() {
         let store = MemoryStore::new();

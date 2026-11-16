@@ -168,6 +168,8 @@ mod pipeline;
 mod pushdown_memory;
 #[path = "query_accounting.rs"]
 mod query_accounting;
+#[path = "rowpath_stats.rs"]
+mod rowpath_stats;
 #[path = "scan_budgets.rs"]
 mod scan_budgets;
 #[path = "scan_soa_adoption.rs"]

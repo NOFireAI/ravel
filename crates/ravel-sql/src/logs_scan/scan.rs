@@ -855,7 +855,7 @@ type RowJobFuture = Pin<
                 Output = (
                     Box<LogSegmentScan>,
                     Option<usize>,
-                    Result<Option<Vec<LogRecord>>, LogFetchError>,
+                    Result<Option<RowBlock>, LogFetchError>,
                 ),
             > + Send,
     >,
@@ -875,14 +875,14 @@ pub(super) enum Decoded {
     Rows {
         /// The block's whole-object index, read before the decode.
         block: Option<usize>,
-        next: Result<Option<Vec<LogRecord>>, LogFetchError>,
+        next: Result<Option<RowBlock>, LogFetchError>,
     },
 }
 
 /// What [`LogScanStream::next_row_block`] did.
 enum RowNext {
     /// The block's whole-object index, read before the decode, and the block.
-    Ready(Option<usize>, Result<Option<Vec<LogRecord>>, LogFetchError>),
+    Ready(Option<usize>, Box<Result<Option<RowBlock>, LogFetchError>>),
     /// The decode went to the read gate; the state is now
     /// [`LogScanState::DecodingRows`].
     Submitted,
@@ -1053,7 +1053,7 @@ fn take_columnar_job_panic(key: &str) -> bool {
 fn row_block_on_gate(mut scan: Box<LogSegmentScan>) -> RowJobFuture {
     Box::pin(async move {
         let block = scan.next_block_index();
-        let next = scan.next_block_on_gate().await;
+        let next = scan.next_row_block_on_gate().await;
         (scan, block, next)
     })
 }
@@ -1082,9 +1082,9 @@ fn log_block_gate_failed(key: &str, err: CpuGateError) -> DataFusionError {
 pub(super) enum Pending {
     /// Nothing held.
     None,
-    /// Row path: the block's surviving records, drained `BATCH_ROWS` at a time
-    /// from `pos`.
-    Rows { records: Vec<LogRecord>, pos: usize },
+    /// Row path: the decoded block, its surviving rows drained `BATCH_ROWS` at
+    /// a time from `pos` ([`build_row_batch`]).
+    Rows(Box<RowsPending>),
     /// Columnar fast path: the block's already-built output batches, emitted one
     /// per poll. Built whole from the [`ColumnarBlockView`] so the view (which
     /// borrows the scan) is dropped before the next block is decoded. The
@@ -1092,6 +1092,19 @@ pub(super) enum Pending {
     /// is charged in `LogScanStream::resident`, not in the charge for these
     /// batches. Each batch carries its own charge ([`columnar_charges`]).
     Batches(VecDeque<(RecordBatch, usize)>),
+}
+
+/// A row-path block being drained ([`Pending::Rows`]).
+pub(super) struct RowsPending {
+    block: RowBlock,
+    /// The next surviving row to build.
+    pos: usize,
+    /// Rows already emitted, after erasure: the row-ref position of the next
+    /// kept row.
+    kept: usize,
+    streams: StreamAttrsCache,
+    /// The object key, for attributing a corrupt `attrs_raw` cell.
+    key: String,
 }
 
 /// The address a run of consecutive output rows carries in the synthetic
@@ -1565,29 +1578,49 @@ impl LogScanStream {
     fn emit_next_row_batch(&mut self) -> DFResult<Option<RecordBatch>> {
         self.reservation.shrink(std::mem::take(&mut self.emitted));
         let pending_range = self.pending_range;
-        let Pending::Rows { records, pos } = &mut self.pending else {
+        let Pending::Rows(rows) = &mut self.pending else {
             return Err(DataFusionError::Internal(
                 "emit_next_row_batch called without a row block held".into(),
             ));
         };
+        let RowsPending {
+            block,
+            pos,
+            kept,
+            streams,
+            key,
+        } = &mut **rows;
+        let shape = RowBatchShape {
+            schema: &self.build_schema,
+            projection: &self.build_projection,
+            declared: &self.declared,
+            attr_keys: &self.attr_keys,
+            full_len: self.full_len,
+            erasure: &self.erasure,
+            key,
+        };
         let batch = loop {
-            if *pos >= records.len() {
+            if *pos >= block.len() {
                 return Ok(None);
             }
-            let end = (*pos + BATCH_ROWS).min(records.len());
-            let built = build_batch(
-                &records[*pos..end],
-                Arc::clone(&self.build_schema),
-                &self.build_projection,
-                &self.declared,
-                &self.attr_keys,
-                self.full_len,
+            let end = (*pos + BATCH_ROWS).min(block.len());
+            let built = build_row_batch(
+                block,
+                *pos,
+                end,
+                streams,
+                &shape,
                 pending_range.map(|r| RowRefRange {
-                    first_row: r.first_row + *pos,
+                    first_row: r.first_row + *kept,
                     ..r
                 }),
             )?;
             *pos = end;
+            *kept += built.num_rows();
+            if built.num_rows() == 0 {
+                // Every row of the chunk was erased.
+                continue;
+            }
             self.blocks.rows_consumed.add(built.num_rows());
             let Some(filters) = &self.row_filters else {
                 break built;
@@ -1629,14 +1662,20 @@ impl LogScanStream {
         Ok(batch)
     }
 
-    /// Take ownership of one decoded block's records (row path), charging the
-    /// pool for `records_memory` before it is held. An empty block (every row
-    /// filtered out) charges nothing and leaves the stream to ask for the next.
-    fn hold_block(&mut self, records: Vec<LogRecord>) -> DFResult<()> {
-        let bytes = records_memory(&records);
+    /// Take ownership of one decoded block (row path), charging the pool for
+    /// its decoded columns before it is held. A block with no surviving row
+    /// leaves the stream to ask for the next once its charge is released.
+    fn hold_block(&mut self, block: RowBlock, key: String) -> DFResult<()> {
+        let bytes = block.decoded_bytes();
         self.reservation.try_grow(bytes)?;
         self.held = bytes;
-        self.pending = Pending::Rows { records, pos: 0 };
+        self.pending = Pending::Rows(Box::new(RowsPending {
+            block,
+            pos: 0,
+            kept: 0,
+            streams: StreamAttrsCache::new(),
+            key,
+        }));
         Ok(())
     }
 
@@ -1670,7 +1709,7 @@ impl LogScanStream {
     fn has_pending(&self) -> bool {
         match &self.pending {
             Pending::None => false,
-            Pending::Rows { records, pos } => *pos < records.len(),
+            Pending::Rows(rows) => rows.pos < rows.block.len(),
             Pending::Batches(queue) => !queue.is_empty(),
         }
     }
@@ -1710,7 +1749,7 @@ impl LogScanStream {
     /// otherwise. Exhaustion decodes nothing and always runs inline.
     fn next_row_block(&mut self, resume: RowResume) -> RowNext {
         match self.decoded.take() {
-            Some(Decoded::Rows { block, next }) => return RowNext::Ready(block, next),
+            Some(Decoded::Rows { block, next }) => return RowNext::Ready(block, Box::new(next)),
             Some(Decoded::Columnar(_)) => {
                 return RowNext::Failed(DataFusionError::Internal(
                     "a columnar block resumed on the row path".into(),
@@ -1725,10 +1764,11 @@ impl LogScanStream {
                 "row block requested off a row-path state".into(),
             ));
         };
-        // Unlike the columnar exit, the row exit frees its decoded block before
-        // returning the records (`BlockScan::next_block`), so no previous
-        // block is resident behind the reader while this job waits for a
-        // permit, and there is no block charge to carry into it.
+        // Unlike the columnar exit, the row exit hands its decoded block out
+        // (`BlockScan::next_row_block`), and the previous one was released
+        // when it drained, so no previous block is resident behind the reader
+        // while this job waits for a permit, and there is no block charge to
+        // carry into it.
         if scan.remaining_blocks() > 0 && scan.block_gate().is_some() {
             let (LogScanState::Rows(scan) | LogScanState::RowFallbackBlock { scan, .. }) =
                 std::mem::replace(&mut self.state, LogScanState::Done)
@@ -1746,9 +1786,9 @@ impl LogScanStream {
         }
         let decode_started = Instant::now();
         let block = scan.next_block_index();
-        let next = scan.next_block();
+        let next = scan.next_row_block();
         self.blocks.decode_build_elapsed.add_elapsed(decode_started);
-        RowNext::Ready(block, next)
+        RowNext::Ready(block, Box::new(next))
     }
 
     /// This partition is done with the current segment: drop its handle on the
@@ -1830,18 +1870,24 @@ impl LogScanStream {
         Poll::Ready(Some(Err(e)))
     }
 
-    /// Take one decoded block's surviving records through the row path: apply
-    /// scan-layer selective-erasure exclusion (ADR-0064) and hold the records.
+    /// Take one decoded block through the row path: hold it for
+    /// [`build_row_batch`], which applies the selective-erasure exclusion
+    /// (ADR-0064) to each chunk's rows before building any column.
     ///
-    /// The exclusion here is authoritative because it sees the same merged
-    /// `attrs` view the surface returns (resource + scope + record), so a
-    /// subject named only in a resource/scope attribute is dropped; the
-    /// fetcher-level filter matches per-record attributes alone and cannot see
-    /// it. An empty `records` is normal, not end-of-segment: a block can survive
-    /// pruning and hold no matching row, or have every matching row erased.
-    fn take_row_block(&mut self, mut records: Vec<LogRecord>) -> DFResult<()> {
-        retain_unerased(&mut records, &self.erasure)?;
-        self.hold_block(records)
+    /// That exclusion matches each row's per-record attributes and the same
+    /// merged `attrs` view the surface returns (resource + scope + record), so
+    /// a subject named only in a resource/scope attribute is dropped. A block
+    /// with no surviving row is normal, not end-of-segment: a block can
+    /// survive pruning and hold no matching row, or have every matching row
+    /// erased.
+    fn take_row_block(&mut self, block: RowBlock) -> DFResult<()> {
+        let key = match &self.state {
+            LogScanState::Rows(scan)
+            | LogScanState::RowFallbackBlock { scan, .. }
+            | LogScanState::Columnar(scan) => scan.key().to_string(),
+            _ => String::new(),
+        };
+        self.hold_block(block, key)
     }
 }
 
@@ -1900,13 +1946,13 @@ impl LogScanStream {
             if this.has_pending() {
                 let emit_started = Instant::now();
                 let emitted = match &this.pending {
-                    Pending::Rows { .. } => this.emit_next_row_batch(),
+                    Pending::Rows(_) => this.emit_next_row_batch(),
                     Pending::Batches(_) => this.emit_next_columnar_batch().map(Some),
                     Pending::None => unreachable!("has_pending() ruled this out"),
                 };
                 this.blocks.emit_elapsed.add_elapsed(emit_started);
                 return match emitted {
-                    // The row filter dropped the rest of the block.
+                    // The row filter or erasure dropped the rest of the block.
                     Ok(None) => continue,
                     Ok(Some(batch)) => {
                         // DataFusion drops the limit above a scan that
@@ -2493,15 +2539,15 @@ impl LogScanStream {
                         this.skip_threshold_blocks();
                     }
                     let (decoded_block, next) = match this.next_row_block(RowResume::Rows) {
-                        RowNext::Ready(block, next) => (block, next),
+                        RowNext::Ready(block, next) => (block, *next),
                         RowNext::Submitted => continue,
                         RowNext::Failed(e) => return this.fail(e),
                     };
                     match next {
-                        Ok(Some(records)) => {
+                        Ok(Some(rows)) => {
                             // Stamp the block's row-ref address before the
-                            // records are held: the batch builder reads it out
-                            // of `pending_range` as it chunks them. Resolved
+                            // block is held: the batch builder reads it out
+                            // of `pending_range` as it chunks the block. Resolved
                             // from the block the scan itself yielded (issue
                             // #2417), not from the cursor's position in
                             // `current_indices`.
@@ -2509,7 +2555,7 @@ impl LogScanStream {
                                 Ok(range) => this.pending_range = range,
                                 Err(e) => return this.fail(e),
                             }
-                            if let Err(e) = this.take_row_block(records) {
+                            if let Err(e) = this.take_row_block(rows) {
                                 return this.fail(e);
                             }
                         }
@@ -2528,7 +2574,7 @@ impl LogScanStream {
                     let skip = *skip;
                     let (decoded_block, next) =
                         match this.next_row_block(RowResume::FallbackBlock { skip }) {
-                            RowNext::Ready(block, next) => (block, next),
+                            RowNext::Ready(block, next) => (block, *next),
                             RowNext::Submitted => continue,
                             RowNext::Failed(e) => return this.fail(e),
                         };
@@ -2546,10 +2592,10 @@ impl LogScanStream {
                         continue;
                     }
                     match next {
-                        Ok(Some(records)) => {
+                        Ok(Some(rows)) => {
                             // Stamp the block's row-ref address before the
-                            // records are held: the batch builder reads it out
-                            // of `pending_range` as it chunks them. Resolved
+                            // block is held: the batch builder reads it out
+                            // of `pending_range` as it chunks the block. Resolved
                             // from the block the scan itself yielded (issue
                             // #2417), not from the cursor's position in
                             // `current_indices`.
@@ -2557,7 +2603,7 @@ impl LogScanStream {
                                 Ok(range) => this.pending_range = range,
                                 Err(e) => return this.fail(e),
                             }
-                            if let Err(e) = this.take_row_block(records) {
+                            if let Err(e) = this.take_row_block(rows) {
                                 return this.fail(e);
                             }
                             // Exactly one block goes through the row path per

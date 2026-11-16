@@ -236,10 +236,10 @@
 //! concurrently-held scan memory rather than cumulative bytes emitted.
 //!
 //! The two batch-building paths hold different things, and each charges what it
-//! actually holds. The row path's [`ravel_logseg::BlockScan::next_block`] drops
-//! the decoded block before it returns, so what remains resident is the
-//! `Vec<LogRecord>` it built ([`records_memory`]) plus the batch handed
-//! downstream. The columnar path's `next_block_columnar` hands out a view
+//! actually holds. The row path's [`ravel_logseg::BlockScan::next_row_block`]
+//! hands the decoded block out owned ([`ravel_logseg::RowBlock`]), so what
+//! remains resident is that block (its decoded bytes, charged when it is held)
+//! plus the batch handed downstream. The columnar path's `next_block_columnar` hands out a view
 //! *borrowing* the decoded block, which the reader releases only when the next
 //! block is decoded, so the block stays resident alongside the Arrow batches
 //! built from it. The two are charged separately: the batches when they are
@@ -325,8 +325,8 @@
 //! the emitted batch. The declared `Str` `<>` has no residual: this scan
 //! evaluates DataFusion's own expression for it on every batch it builds, on
 //! the merged value the column holds (`row_filter`;
-//! `answers_match_the_residual_on_every_value_shape`). [`build_batch`] populates the `attrs`
-//! column from the fully merged view (ADR-0033 amendment), so the
+//! `answers_match_the_residual_on_every_value_shape`). [`build_row_batch`]
+//! populates the `attrs` column from the fully merged view (ADR-0033 amendment), so the
 //! residual evaluates `attrs['k'] = 'v'` against exactly the data a row's SQL
 //! semantics demand: a resource-only match survives (the residual sees it in the
 //! merged column), and a record-attribute override survives (the merge resolves
@@ -398,13 +398,13 @@ use ravel_logseg::footer::LogFooter;
 use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::{
     AttrColumn, BoolCursor, BytesCursor, ColumnSelection, ColumnarBlockView, DictValues,
-    F64BitsCursor, FieldSel, FieldType, I64Cursor, LogRecord, LogSegError, Predicate, ScanStats,
-    SegmentDirectories, StrDictColumn,
+    F64BitsCursor, FieldSel, FieldType, I64Cursor, LogRecord, LogSegError, Predicate, RowBlock,
+    ScanStats, SegmentDirectories, StrDictColumn,
 };
 use ravel_object_store::StoreError;
 use ravel_proto::catalog::v1::column_value::Kind as ColumnValueKind;
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue};
-use ravel_query::erasure::ErasurePredicate;
+use ravel_query::erasure::{ErasurePredicate, is_erased_log_row};
 use ravel_query::key_index_route::{
     BudgetRefused, LeafDecodeBudget, LeafDecodeGuard, RouteFigures, RouteInput, SegmentRoute,
     route, route_with_max_parts,
@@ -429,9 +429,7 @@ use crate::logs_schema::{
     LOG_COL_SEVERITY_NUM, LOG_COL_SEVERITY_TEXT, LOG_COL_SPAN_ID, LOG_COL_TRACE_ID, LOG_COL_TS,
     SPAN_ID_WIDTH, TRACE_ID_WIDTH, attr_key_field_name,
 };
-use crate::rlog_attrs::{
-    attr_value_to_string, decode_stream_attrs, find_attr, merged_attrs, retain_unerased,
-};
+use crate::rlog_attrs::{attr_value_to_string, decode_stream_attrs, find_attr, merged_attrs};
 use crate::scan_budget::ScanBudget;
 use ravel_logseg::record::canonical_value_bytes;
 
@@ -592,8 +590,8 @@ impl ResolvedColumns {
 ///   `RlogReader` evaluates those exactly per row and a column it cannot see
 ///   reads as absent, i.e. as not matching, i.e. as dropped rows;
 /// - every attribute key a **pending erasure predicate** names, at record level
-///   for the fetcher's own filter and at merged resource/scope/record level for
-///   [`retain_unerased`] here (ADR-0064). A key the selection omits makes an
+///   and at merged resource/scope/record level, both matched by
+///   [`build_row_batch`] here (ADR-0064). A key the selection omits makes an
 ///   erased row reappear.
 /// - every **declared typed attribute column** the projection names (ADR-0090
 ///   decision 4). A declared column occupies a schema index at or above
@@ -1559,9 +1557,11 @@ struct BlockMetrics {
     /// identical by construction, so this and [`Self::rowpath_batches`] are the
     /// only externally visible proof of which path a query took.
     columnar_batches: Count,
-    /// Output batches this partition built through the row path: an ineligible
-    /// query (an `attrs` projection, a pending erasure predicate) or an
-    /// eligible one that hit a block carrying an `attrs_raw` overflow page.
+    /// Output batches this partition built through the row path
+    /// ([`build_row_batch`], from the decoded block with no `LogRecord`): an
+    /// ineligible query (an `attrs` projection, a pending erasure predicate)
+    /// or an eligible one that hit a block carrying an `attrs_raw` overflow
+    /// page.
     rowpath_batches: Count,
     /// Relevant segments whose plan phase had to read the whole object rather
     /// than counting survivors from the skip index (#761). Two causes: a
@@ -1629,7 +1629,7 @@ struct BlockMetrics {
     fan_out_narrowings: Count,
     /// Wall time in the synchronous decode and Arrow build sites inside
     /// `poll_next`: `next_block_columnar` plus `build_columnar_batches` on the
-    /// columnar path, `next_block` on the row path. A decode on the read gate
+    /// columnar path, `next_row_block` on the row path. A decode on the read gate
     /// is timed from the job's submission to its return, so this includes the
     /// wait for a permit. Nothing nested is timed twice, and the
     /// buffered-output drain is under [`Self::emit_elapsed`].
@@ -2999,7 +2999,7 @@ impl LogsScanExec {
     ///
     /// The one refusal is a pending selective erasure. A row-ref addresses a
     /// row by its position in the block's surviving-row list, and the scan
-    /// layer's erasure exclusion ([`retain_unerased`]) removes rows from that
+    /// layer's erasure exclusion ([`build_row_batch`]) removes rows from that
     /// list after the reader produced it, so the position a phase-1 row
     /// carries would not be the position phase 2 reads. Refusing is also the
     /// fail-closed direction: the failure mode of getting erasure wrong is an
