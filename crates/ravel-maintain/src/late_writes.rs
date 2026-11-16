@@ -25,7 +25,7 @@ use ravel_catalog::compat::{COMPAT_KEY, CompatError, CompatKeys, read_compat, up
 use ravel_commit::record;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all_reporting};
 
-use crate::compat_certify::{family_signals, scan_shards_for};
+use crate::compat_certify::{CensusStop, family_signals, scan_shards_for};
 use crate::discover::discover_tenants;
 use crate::error::{MaintainError, Result};
 
@@ -143,7 +143,17 @@ pub async fn late_write_pass(
     let mut late_writes = Vec::new();
     for tenant in &tenants {
         for signal in signals {
-            let shards = scan_shards_for(store, tenant, *signal).await?;
+            let shards = match scan_shards_for(store, tenant, *signal).await {
+                Ok(shards) => shards,
+                Err(CensusStop::Fatal(err)) => return Err(err),
+                Err(CensusStop::Refused(refusal)) => {
+                    return Err(MaintainError::Invariant(format!(
+                        "late-write pass: shard range of {} {}: {refusal:?}",
+                        tenant.to_hex(),
+                        signal.key_prefix()
+                    )));
+                }
+            };
             for shard in 0..shards {
                 let prefix = ravel_commit::keys::commit_shard_prefix(tenant, *signal, shard)?;
                 let listing = list_all_reporting(store, &prefix).await?;

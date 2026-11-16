@@ -599,10 +599,11 @@ mod tests {
 
     /// ADR-4233 decision 4, hazard H5: an expired alert data object whose
     /// trailer version is in window but whose nested POSTINGS section is at a
-    /// grammar version this build cannot read is held, not deleted. Alerts had
-    /// no retention version hold before this change, so without it the object
-    /// would be deleted. The readable control is swept, proving the hold is
-    /// section-specific rather than a blanket refusal.
+    /// grammar version this build cannot read is held, not deleted. A
+    /// trailer-only hold passes it (the trailer is in window), so without the
+    /// section-version check the object would be deleted. The readable
+    /// control is swept, proving the hold is section-specific rather than a
+    /// blanket refusal.
     #[tokio::test]
     async fn unreadable_section_version_alert_object_is_held() {
         let store = MemoryStore::new();
