@@ -72,8 +72,7 @@ impl Ravel {
             req = req.header(IDEMPOTENCY_KEY_HEADER, key);
         }
         let payload = if gzip {
-            let mut enc =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
             if enc.write_all(body).is_err() {
                 return Reply::NoResponse("gzip encode failed".to_string());
             }
@@ -152,12 +151,7 @@ impl Ravel {
     /// Whether `node` reports ready on `/readyz`.
     pub fn ready(&self, node: usize) -> Result<(), String> {
         let url = format!("{}/readyz", self.nodes[node]);
-        match self
-            .client
-            .get(url)
-            .timeout(Duration::from_secs(2))
-            .send()
-        {
+        match self.client.get(url).timeout(Duration::from_secs(2)).send() {
             Ok(resp) if resp.status().is_success() => Ok(()),
             Ok(resp) => Err(format!("readyz answered {}", resp.status())),
             Err(e) => Err(e.to_string()),

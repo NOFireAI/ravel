@@ -160,9 +160,9 @@ fn classify(signal: Signal, mode: Mode, reply: &Reply) -> Attempt {
             match (mode, partial, commit_token) {
                 (Mode::Buffered, PartialSuccess::None, _) => Attempt::BufferedAck,
                 (Mode::Buffered, _, _) => Attempt::Partial,
-                (_, PartialSuccess::None, Some(h)) if !h.is_empty() => Attempt::Acked {
-                    header: h.clone(),
-                },
+                (_, PartialSuccess::None, Some(h)) if !h.is_empty() => {
+                    Attempt::Acked { header: h.clone() }
+                }
                 _ => Attempt::Partial,
             }
         }
@@ -253,9 +253,15 @@ impl Shared {
         match reply {
             Reply::NoResponse(err) => {
                 if logs {
-                    assert_reachable!("a log write got no response", &json!({ "write": w.id, "node": node, "error": err }));
+                    assert_reachable!(
+                        "a log write got no response",
+                        &json!({ "write": w.id, "node": node, "error": err })
+                    );
                 } else {
-                    assert_reachable!("a metrics write got no response", &json!({ "write": w.id, "node": node, "error": err }));
+                    assert_reachable!(
+                        "a metrics write got no response",
+                        &json!({ "write": w.id, "node": node, "error": err })
+                    );
                 }
             }
             Reply::Status {
@@ -281,7 +287,10 @@ impl Shared {
                             &details
                         );
                     } else {
-                        assert_reachable!("a strict write was answered with a partial success", &details);
+                        assert_reachable!(
+                            "a strict write was answered with a partial success",
+                            &details
+                        );
                     }
                 }
                 if ok && w.mode == Mode::Buffered {
@@ -292,7 +301,10 @@ impl Shared {
                     );
                 }
                 if *status == 400 {
-                    assert_unreachable!("a well-formed write was refused as non-retryable (HTTP 400)", &details);
+                    assert_unreachable!(
+                        "a well-formed write was refused as non-retryable (HTTP 400)",
+                        &details
+                    );
                 }
                 match (logs, *status) {
                     (true, 503) => assert_reachable!("a log write was answered 503", &details),
@@ -304,15 +316,24 @@ impl Shared {
                     _ => {}
                 }
                 if !ok && *status != 503 && *status != 429 {
-                    println!("write {} node {node}: unexpected status {status}: {details}", w.id);
+                    println!(
+                        "write {} node {node}: unexpected status {status}: {details}",
+                        w.id
+                    );
                 }
             }
         }
         if let Attempt::Acked { header } = attempt {
             if logs {
-                assert_reachable!("a strict log write was acknowledged with commit tokens", &json!({ "write": w.id }));
+                assert_reachable!(
+                    "a strict log write was acknowledged with commit tokens",
+                    &json!({ "write": w.id })
+                );
             } else {
-                assert_reachable!("a strict metrics write was acknowledged with commit tokens", &json!({ "write": w.id }));
+                assert_reachable!(
+                    "a strict metrics write was acknowledged with commit tokens",
+                    &json!({ "write": w.id })
+                );
             }
             assert_sometimes!(
                 header.contains(','),
@@ -422,9 +443,14 @@ impl Shared {
         let min = writes.iter().map(|w| w.ts_ns).min().unwrap_or(0);
         let max = writes.iter().map(|w| w.ts_ns).max().unwrap_or(0);
         let (start, end) = window_s(min, max);
-        let value =
-            self.ravel
-                .sql(node, &logs_query(Some(&ids)), start, end, &tokens, READ_TIMEOUT)?;
+        let value = self.ravel.sql(
+            node,
+            &logs_query(Some(&ids)),
+            start,
+            end,
+            &tokens,
+            READ_TIMEOUT,
+        )?;
         let counts = model::log_counts(ravel::rows(&value)).map_err(SqlFailure::BadBody)?;
         let m = lock(&self.model);
         Ok(model::judge_logs(&m, &counts, &ids))
@@ -525,7 +551,14 @@ impl Shared {
                 .ready(node)
                 .map_err(|e| format!("node {node} not ready: {e}"))?;
             self.ravel
-                .sql(node, "SELECT count(*) FROM logs", start, end, &[], READ_TIMEOUT)
+                .sql(
+                    node,
+                    "SELECT count(*) FROM logs",
+                    start,
+                    end,
+                    &[],
+                    READ_TIMEOUT,
+                )
                 .map_err(|e| format!("node {node} does not answer SQL: {e}"))?;
         }
         Ok(())
@@ -563,7 +596,11 @@ impl Workload {
             return;
         };
         let samples = tc.draw(gs::integers::<u32>().min_value(1).max_value(6));
-        let offset = tc.draw(gs::integers::<u64>().min_value(0).max_value(METRIC_SERIES - 1));
+        let offset = tc.draw(
+            gs::integers::<u64>()
+                .min_value(0)
+                .max_value(METRIC_SERIES - 1),
+        );
         let mode = draw_mode(&tc);
         let gzip = tc.draw(gs::weighted_booleans(0.3));
         let Some(w) = s.register(Signal::Metrics, mode, 0, samples, offset, false) else {
@@ -582,7 +619,11 @@ impl Workload {
         let logs = tc.draw(gs::weighted_booleans(0.6));
         let w = {
             let m = lock(&s.model);
-            let list = if logs { &m.acked_logs } else { &m.acked_metrics };
+            let list = if logs {
+                &m.acked_logs
+            } else {
+                &m.acked_metrics
+            };
             if list.is_empty() {
                 return;
             }
@@ -606,7 +647,10 @@ impl Workload {
                     Shared::check_log_rows(&j, node, "token");
                 }
                 Err(SqlFailure::Status(503, e)) => {
-                    assert_reachable!("a read with commit tokens was refused as unavailable", &details(&e));
+                    assert_reachable!(
+                        "a read with commit tokens was refused as unavailable",
+                        &details(&e)
+                    );
                 }
                 Err(e) => println!("token read of log write {} on node {node}: {e}", w.id),
             }
@@ -621,7 +665,10 @@ impl Workload {
                     Shared::check_metric_rows(&j, node, "token");
                 }
                 Err(SqlFailure::Status(503, e)) => {
-                    assert_reachable!("a read with commit tokens was refused as unavailable", &details(&e));
+                    assert_reachable!(
+                        "a read with commit tokens was refused as unavailable",
+                        &details(&e)
+                    );
                 }
                 Err(e) => println!("token read of metrics write {} on node {node}: {e}", w.id),
             }
@@ -639,8 +686,16 @@ impl Workload {
             match s.scan_logs(node, &[]) {
                 Ok(j) => {
                     Shared::check_log_rows(&j, node, "scan");
-                    assert_sometimes!(j.saw_acked, "a read without a token saw an acked write", &json!({ "node": node }));
-                    assert_sometimes!(j.saw_duplicate, "a stored log record was found more than once", &json!({ "node": node, "over": j.over.len() }));
+                    assert_sometimes!(
+                        j.saw_acked,
+                        "a read without a token saw an acked write",
+                        &json!({ "node": node })
+                    );
+                    assert_sometimes!(
+                        j.saw_duplicate,
+                        "a stored log record was found more than once",
+                        &json!({ "node": node, "over": j.over.len() })
+                    );
                     assert_sometimes!(
                         j.saw_unknown_stored,
                         "a write with no definite outcome was later found stored",
@@ -702,7 +757,11 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
             }
         }
     }
-    assert_always!(recovered, "the system recovers once faults stop", &json!({ "last_error": last }));
+    assert_always!(
+        recovered,
+        "the system recovers once faults stop",
+        &json!({ "last_error": last })
+    );
     if !recovered {
         println!("eventually: not recovered, ending the timeline");
         std::process::exit(0);
@@ -711,9 +770,16 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
 
     let (acked_logs, acked_metrics) = {
         let m = lock(&s.model);
-        let logs: Vec<Write> = m.acked_logs.iter().filter_map(|id| m.writes.get(id).cloned()).collect();
-        let metrics: Vec<Write> =
-            m.acked_metrics.iter().filter_map(|id| m.writes.get(id).cloned()).collect();
+        let logs: Vec<Write> = m
+            .acked_logs
+            .iter()
+            .filter_map(|id| m.writes.get(id).cloned())
+            .collect();
+        let metrics: Vec<Write> = m
+            .acked_metrics
+            .iter()
+            .filter_map(|id| m.writes.get(id).cloned())
+            .collect();
         println!(
             "eventually: assertions start; {} writes, {} acked log writes, {} acked metrics writes",
             m.writes.len(),
@@ -734,7 +800,10 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
                 missing.extend(j.missing.iter().cloned());
                 Shared::check_log_rows(&j, i % n, "eventually-token");
             }
-            Err(e) => unreadable.push(format!("log writes {:?}: {e}", chunk.iter().map(|w| w.id).collect::<Vec<_>>())),
+            Err(e) => unreadable.push(format!(
+                "log writes {:?}: {e}",
+                chunk.iter().map(|w| w.id).collect::<Vec<_>>()
+            )),
         }
     }
     for (i, chunk) in acked_metrics.chunks(TOKEN_BATCH).enumerate() {
@@ -744,7 +813,10 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
                 missing.extend(j.missing.iter().cloned());
                 Shared::check_metric_rows(&j, i % n, "eventually-token");
             }
-            Err(e) => unreadable.push(format!("metrics writes {:?}: {e}", chunk.iter().map(|w| w.id).collect::<Vec<_>>())),
+            Err(e) => unreadable.push(format!(
+                "metrics writes {:?}: {e}",
+                chunk.iter().map(|w| w.id).collect::<Vec<_>>()
+            )),
         }
     }
     assert_always!(
@@ -849,7 +921,9 @@ fn main(tc: TestCase) {
     });
 
     for node in 0..shared.ravel.nodes.len() {
-        wait_for(&format!("node {node} is ready"), || shared.ravel.ready(node));
+        wait_for(&format!("node {node} is ready"), || {
+            shared.ravel.ready(node)
+        });
     }
     wait_for("every node answers SQL", || shared.all_nodes_serve());
     antithesis_sdk::lifecycle::setup_complete(&json!({ "nodes": cfg.nodes }));
@@ -872,4 +946,3 @@ fn main(tc: TestCase) {
         .max_concurrency(4)
         .run_concurrent(tc);
 }
-

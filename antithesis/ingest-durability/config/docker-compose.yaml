@@ -55,6 +55,11 @@ services:
     environment:
       RUSTFS_ACCESS_KEY: ravel
       RUSTFS_SECRET_KEY: ravel-dev-secret
+      # Fsync every acknowledged write before its 200 (RustFS's default,
+      # stated here so a killed rustfs container never loses an acked PUT;
+      # Ravel only promises the store's own durability floor).
+      RUSTFS_DURABILITY_MODE: strict
+      RUSTFS_DRIVE_SYNC_ENABLE: "true"
 
   init:
     container_name: init

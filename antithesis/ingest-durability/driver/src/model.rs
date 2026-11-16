@@ -195,15 +195,23 @@ pub struct LogJudgement {
 
 /// Judge log rows `(write, record) -> count` against the model. `expect`
 /// lists the writes every record of which must be present.
-pub fn judge_logs(model: &Model, counts: &HashMap<(u64, u32), u64>, expect: &[u64]) -> LogJudgement {
+pub fn judge_logs(
+    model: &Model,
+    counts: &HashMap<(u64, u32), u64>,
+    expect: &[u64],
+) -> LogJudgement {
     let mut j = LogJudgement::default();
     for (&(wid, rec), &n) in counts {
         let Some(w) = model.writes.get(&wid).filter(|w| w.signal == Signal::Logs) else {
-            j.phantoms.push(format!("write {wid} rec {rec} x{n}: no such log write"));
+            j.phantoms
+                .push(format!("write {wid} rec {rec} x{n}: no such log write"));
             continue;
         };
         if rec >= w.records {
-            j.phantoms.push(format!("write {wid} rec {rec} x{n}: write has {} records", w.records));
+            j.phantoms.push(format!(
+                "write {wid} rec {rec} x{n}: write has {} records",
+                w.records
+            ));
             continue;
         }
         let max = w.max_copies();
@@ -250,7 +258,9 @@ pub fn judge_logs(model: &Model, counts: &HashMap<(u64, u32), u64>, expect: &[u6
 pub fn log_counts(rows: &[serde_json::Value]) -> Result<HashMap<(u64, u32), u64>, String> {
     let mut out = HashMap::new();
     for row in rows {
-        let cells = row.as_array().ok_or_else(|| format!("row is not an array: {row}"))?;
+        let cells = row
+            .as_array()
+            .ok_or_else(|| format!("row is not an array: {row}"))?;
         let (Some(w), Some(r), Some(n)) = (
             cells.first().and_then(crate::ravel::cell_u64),
             cells.get(1).and_then(crate::ravel::cell_u64),
@@ -280,7 +290,9 @@ pub type MetricRow = (i64, f64, String);
 pub fn metric_rows(rows: &[serde_json::Value]) -> Result<Vec<MetricRow>, String> {
     rows.iter()
         .map(|row| {
-            let cells = row.as_array().ok_or_else(|| format!("row is not an array: {row}"))?;
+            let cells = row
+                .as_array()
+                .ok_or_else(|| format!("row is not an array: {row}"))?;
             let ts = cells.first().and_then(crate::ravel::cell_i64);
             let v = cells.get(1).and_then(crate::ravel::cell_f64);
             let s = cells.get(2).and_then(|c| c.as_str()).map(str::to_string);
@@ -342,5 +354,9 @@ fn attribute_sample(model: &Model, v: f64) -> Option<(&Write, usize)> {
         return None;
     }
     let i = usize::try_from(n % VALUE_STRIDE).ok()?;
-    if i < w.samples.len() { Some((w, i)) } else { None }
+    if i < w.samples.len() {
+        Some((w, i))
+    } else {
+        None
+    }
 }
