@@ -882,7 +882,7 @@ pub(super) enum Decoded {
 /// What [`LogScanStream::next_row_block`] did.
 enum RowNext {
     /// The block's whole-object index, read before the decode, and the block.
-    Ready(Option<usize>, Result<Option<RowBlock>, LogFetchError>),
+    Ready(Option<usize>, Box<Result<Option<RowBlock>, LogFetchError>>),
     /// The decode went to the read gate; the state is now
     /// [`LogScanState::DecodingRows`].
     Submitted,
@@ -1749,7 +1749,7 @@ impl LogScanStream {
     /// otherwise. Exhaustion decodes nothing and always runs inline.
     fn next_row_block(&mut self, resume: RowResume) -> RowNext {
         match self.decoded.take() {
-            Some(Decoded::Rows { block, next }) => return RowNext::Ready(block, next),
+            Some(Decoded::Rows { block, next }) => return RowNext::Ready(block, Box::new(next)),
             Some(Decoded::Columnar(_)) => {
                 return RowNext::Failed(DataFusionError::Internal(
                     "a columnar block resumed on the row path".into(),
@@ -1788,7 +1788,7 @@ impl LogScanStream {
         let block = scan.next_block_index();
         let next = scan.next_row_block();
         self.blocks.decode_build_elapsed.add_elapsed(decode_started);
-        RowNext::Ready(block, next)
+        RowNext::Ready(block, Box::new(next))
     }
 
     /// This partition is done with the current segment: drop its handle on the
@@ -2539,15 +2539,15 @@ impl LogScanStream {
                         this.skip_threshold_blocks();
                     }
                     let (decoded_block, next) = match this.next_row_block(RowResume::Rows) {
-                        RowNext::Ready(block, next) => (block, next),
+                        RowNext::Ready(block, next) => (block, *next),
                         RowNext::Submitted => continue,
                         RowNext::Failed(e) => return this.fail(e),
                     };
                     match next {
-                        Ok(Some(records)) => {
+                        Ok(Some(rows)) => {
                             // Stamp the block's row-ref address before the
-                            // records are held: the batch builder reads it out
-                            // of `pending_range` as it chunks them. Resolved
+                            // block is held: the batch builder reads it out
+                            // of `pending_range` as it chunks the block. Resolved
                             // from the block the scan itself yielded (issue
                             // #2417), not from the cursor's position in
                             // `current_indices`.
@@ -2555,7 +2555,7 @@ impl LogScanStream {
                                 Ok(range) => this.pending_range = range,
                                 Err(e) => return this.fail(e),
                             }
-                            if let Err(e) = this.take_row_block(records) {
+                            if let Err(e) = this.take_row_block(rows) {
                                 return this.fail(e);
                             }
                         }
@@ -2574,7 +2574,7 @@ impl LogScanStream {
                     let skip = *skip;
                     let (decoded_block, next) =
                         match this.next_row_block(RowResume::FallbackBlock { skip }) {
-                            RowNext::Ready(block, next) => (block, next),
+                            RowNext::Ready(block, next) => (block, *next),
                             RowNext::Submitted => continue,
                             RowNext::Failed(e) => return this.fail(e),
                         };
@@ -2592,10 +2592,10 @@ impl LogScanStream {
                         continue;
                     }
                     match next {
-                        Ok(Some(records)) => {
+                        Ok(Some(rows)) => {
                             // Stamp the block's row-ref address before the
-                            // records are held: the batch builder reads it out
-                            // of `pending_range` as it chunks them. Resolved
+                            // block is held: the batch builder reads it out
+                            // of `pending_range` as it chunks the block. Resolved
                             // from the block the scan itself yielded (issue
                             // #2417), not from the cursor's position in
                             // `current_indices`.
@@ -2603,7 +2603,7 @@ impl LogScanStream {
                                 Ok(range) => this.pending_range = range,
                                 Err(e) => return this.fail(e),
                             }
-                            if let Err(e) = this.take_row_block(records) {
+                            if let Err(e) = this.take_row_block(rows) {
                                 return this.fail(e);
                             }
                             // Exactly one block goes through the row path per

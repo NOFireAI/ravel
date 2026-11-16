@@ -7365,7 +7365,10 @@ mod row_path_tests {
         .boxed()
     }
 
-    fn entries(max: usize) -> BoxedStrategy<Vec<(String, AttrValue)>> {
+    type Attrs = Vec<(String, AttrValue)>;
+    type Matchers = Vec<(String, String)>;
+
+    fn entries(max: usize) -> BoxedStrategy<Attrs> {
         prop::collection::vec((prop::sample::select(KEYS.to_vec()), value()), 0..max)
             .prop_map(|v| v.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
             .boxed()
@@ -7377,9 +7380,10 @@ mod row_path_tests {
         block_target_records: usize,
         /// Per stream: resource and scope entries. Stream 0 always carries
         /// `shared` in both, resource first.
-        streams: Vec<(Vec<(String, AttrValue)>, Vec<(String, AttrValue)>)>,
-        records: Vec<(usize, i64, Vec<(String, AttrValue)>)>,
-        erasure: Vec<(Vec<(String, String)>, Option<(i64, i64)>)>,
+        streams: Vec<(Attrs, Attrs)>,
+        records: Vec<(usize, i64, Attrs)>,
+        /// Per predicate: its matchers and its window as `(start, length)`.
+        erasure: Vec<(Matchers, Option<(i64, i64)>)>,
         mask: Vec<bool>,
         chunk: usize,
     }
