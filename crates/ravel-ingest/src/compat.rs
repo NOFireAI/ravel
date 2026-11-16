@@ -611,3 +611,114 @@ pub(crate) fn warn_publish_refused(
          stored"
     );
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::atomic::AtomicI64;
+
+    use ravel_catalog::CompatKeys;
+    use ravel_catalog::compat::{FAMILY_RLOG, FAMILY_RSEG, FAMILY_RSPAN, create_compat};
+    use ravel_object_store::memory::MemoryStore;
+
+    use super::*;
+
+    const BASE_NS: i64 = 1_700_000_000_000_000_000;
+
+    struct FixedClock(AtomicI64);
+
+    impl CompatClock for FixedClock {
+        fn now_unix_ns(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A policy whose view read a `sys/compat` naming `rseg` the active RSEG
+    /// version, with RSEG's writable set lowered to `[7]` over baseline 6.
+    async fn policy(rseg: u32) -> IngestCompatPolicy {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let keys = || CompatKeys::from_file_keys(&[[5; 32]]).expect("one key");
+        let family = |name: &str, version: u32| sysproto::CompatFamily {
+            family: name.to_string(),
+            active_write_version: version,
+            ..Default::default()
+        };
+        create_compat(
+            store.as_ref(),
+            &keys(),
+            sysproto::CompatRecord {
+                compat_epoch: 1,
+                families: vec![
+                    family(FAMILY_RSEG, rseg),
+                    family(FAMILY_RLOG, FormatFamily::Rlog.writable_version()),
+                    family(FAMILY_RSPAN, FormatFamily::Rspan.writable_version()),
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create sys/compat");
+        let clock = Arc::new(FixedClock(AtomicI64::new(BASE_NS)));
+        let view = CompatView::new(store, keys(), clock.clone());
+        view.refresh().await.expect("read sys/compat");
+        IngestCompatPolicy::new(view, clock).with_family_versions(FormatFamily::Rseg, vec![7], 6)
+    }
+
+    #[tokio::test]
+    async fn the_writable_version_is_the_view_named_version_when_this_build_writes_it() {
+        assert_eq!(
+            FormatFamily::Rseg.writable_version_under(None),
+            u32::from(ravel_segment::SegmentVersion::CURRENT.number())
+        );
+
+        let active = policy(7).await;
+        assert_eq!(active.named_version(FormatFamily::Rseg), 7);
+        assert_eq!(FormatFamily::Rseg.writable_version_under(Some(&active)), 7);
+
+        let unwritable = policy(8).await;
+        assert_eq!(unwritable.named_version(FormatFamily::Rseg), 6);
+        assert_eq!(
+            FormatFamily::Rseg.writable_version_under(Some(&unwritable)),
+            6
+        );
+        assert_eq!(
+            FormatFamily::Rlog.writable_version_under(Some(&unwritable)),
+            FormatFamily::Rlog.writable_version()
+        );
+    }
+
+    #[test]
+    fn each_refusal_reason_counts_under_its_own_label() {
+        let labels: Vec<&str> = CompatRefusalReason::ALL
+            .iter()
+            .map(|reason| reason.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "view_stale",
+                "active_version_not_writable",
+                "compat_record_missing",
+                "fence_failed",
+            ]
+        );
+
+        let counters = CompatRefusalCounters::default();
+        for (n, reason) in CompatRefusalReason::ALL.into_iter().enumerate() {
+            for _ in 0..=n {
+                counters.record(reason);
+            }
+        }
+        let snapshot = counters.snapshot();
+        assert_eq!(
+            snapshot,
+            CompatRefusalSnapshot {
+                view_stale: 1,
+                active_version_not_writable: 2,
+                compat_record_missing: 3,
+                fence_failed: 4,
+            }
+        );
+        assert_eq!(snapshot.total(), 10);
+    }
+}
