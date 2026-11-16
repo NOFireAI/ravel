@@ -734,6 +734,11 @@ impl ExecutionPlan for LogsRowFetchExec {
 /// phase holds (the fetched records first, then the batches built from them,
 /// with the record term released as the records are dropped) and returned so
 /// the stream can release each batch's share as it hands it downstream.
+/// One segment's winning blocks for a phase-2 fetch: each a surviving-block
+/// position paired with the `(surviving-row, output position)` pairs to read
+/// from it, in ascending block order.
+type SegmentBlocks = Vec<(usize, Vec<(usize, usize)>)>;
+
 async fn fetch_rows(
     input: SendableRecordBatchStream,
     source: RowFetchSource,
@@ -791,7 +796,7 @@ async fn fetch_rows(
     // a `Vec` of not-yet-polled futures for the same reason
     // `compute_plan_counts` is: a closure returning a future that borrows its
     // argument cannot satisfy the higher-ranked bound `buffered` needs here.
-    let mut by_segment: BTreeMap<usize, Vec<(usize, Vec<(usize, usize)>)>> = BTreeMap::new();
+    let mut by_segment: BTreeMap<usize, SegmentBlocks> = BTreeMap::new();
     for ((segment, block), rows) in groups {
         by_segment.entry(segment).or_default().push((block, rows));
     }
