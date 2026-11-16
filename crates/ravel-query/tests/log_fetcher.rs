@@ -1389,7 +1389,7 @@ async fn row_block_exit_refuses_an_unapplied_erasure() {
 
     let before = scan.remaining_blocks();
     assert!(before > 0);
-    let other = vec![erase("user_id", "u2")];
+    let other = [erase("user_id", "u2")];
     for applies in [&[][..], &other[..]] {
         let outcome = scan.next_row_block(applies).expect("row-block exit");
         assert!(
