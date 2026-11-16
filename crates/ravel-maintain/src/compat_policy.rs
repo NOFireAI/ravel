@@ -704,3 +704,283 @@ pub(crate) fn refuse_unknown_sections(
         recorded_version,
     })
 }
+
+/// Fixtures for tests that run maintenance under a compat policy: a manual
+/// clock, the catalog's own `sys/compat` writers, and a refreshed view.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) mod test_support {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use ravel_catalog::compat::{
+        COMPAT_FORMAT_VERSION, CompatClock, CompatKeys, CompatView, activate_family,
+        create_compat,
+    };
+    use ravel_object_store::ObjectStoreBackend;
+    use ravel_proto::sys::v1 as sysproto;
+
+    use super::MaintainCompatPolicy;
+
+    /// A wall-clock instant for the compat clock, independent of the
+    /// maintenance clock a test drives sealing with.
+    pub(crate) const T0: i64 = 1_800_000_000_000_000_000;
+
+    #[derive(Debug)]
+    pub(crate) struct ManualClock(AtomicI64);
+
+    impl ManualClock {
+        pub(crate) fn at(ns: i64) -> Arc<Self> {
+            Arc::new(ManualClock(AtomicI64::new(ns)))
+        }
+
+        pub(crate) fn advance(&self, ns: i64) {
+            self.0.fetch_add(ns, Ordering::SeqCst);
+        }
+    }
+
+    impl CompatClock for ManualClock {
+        fn now_unix_ns(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    pub(crate) fn keys() -> CompatKeys {
+        CompatKeys::from_file_keys(&[[7; 32]]).expect("one key")
+    }
+
+    pub(crate) fn family(name: &str, version: u32) -> sysproto::CompatFamily {
+        sysproto::CompatFamily {
+            family: name.to_string(),
+            active_write_version: version,
+            ..Default::default()
+        }
+    }
+
+    /// Create `sys/compat` naming `families`, with `P` = `publish_lifetime_ns`.
+    pub(crate) async fn write_compat(
+        store: &dyn ObjectStoreBackend,
+        families: Vec<sysproto::CompatFamily>,
+        publish_lifetime_ns: i64,
+    ) {
+        create_compat(
+            store,
+            &keys(),
+            sysproto::CompatRecord {
+                format_version: COMPAT_FORMAT_VERSION,
+                baseline_release_major: 0,
+                baseline_release_minor: 34,
+                families,
+                max_publish_lifetime_ns: publish_lifetime_ns,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create sys/compat");
+    }
+
+    /// Activate `version` of `family` with the catalog's own writer.
+    pub(crate) async fn activate(store: &dyn ObjectStoreBackend, family: &str, version: u32) {
+        activate_family(store, &keys(), family, version, "test", T0)
+            .await
+            .expect("activate");
+    }
+
+    /// A policy over a view of `store` read once at `clock`'s now.
+    pub(crate) async fn policy(
+        store: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<ManualClock>,
+    ) -> MaintainCompatPolicy {
+        let view = CompatView::new(store, keys(), clock.clone());
+        view.refresh().await.expect("refresh the view");
+        MaintainCompatPolicy::new(view, clock)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use ravel_object_store::memory::MemoryStore;
+
+    use super::test_support::{ManualClock, T0, activate, family, policy, write_compat};
+    use super::*;
+
+    const HOUR_NS: i64 = 3_600_000_000_000;
+
+    fn record_at(compat_epoch: u64) -> sysproto::ProvisioningRecord {
+        sysproto::ProvisioningRecord {
+            compat_epoch,
+            ..Default::default()
+        }
+    }
+
+    fn bucket_id() -> (TenantHash, Signal) {
+        (TenantHash([3; 16]), Signal::Metrics)
+    }
+
+    /// The family table is the format crates' own: every baseline is the
+    /// version the crate's writer emits by default, and every writable set
+    /// holds it.
+    #[test]
+    fn the_family_table_comes_from_the_format_crates() {
+        let rseg = FamilyVersions::for_family(FAMILY_RSEG).expect("rseg");
+        assert_eq!(rseg.baseline, ravel_segment::SegmentVersion::CURRENT.number());
+        assert!(
+            rseg.writable
+                .iter()
+                .all(|v| ravel_segment::SUPPORTED_VERSIONS.contains(*v))
+        );
+        let rlog = FamilyVersions::for_family(FAMILY_RLOG).expect("rlog");
+        assert_eq!(rlog.baseline, ravel_logseg::footer::WriteVersion::CURRENT.number());
+        let rspan = FamilyVersions::for_family(FAMILY_RSPAN).expect("rspan");
+        assert_eq!(rspan.baseline, ravel_rspan::footer::WriteVersion::CURRENT.number());
+        let compaction = FamilyVersions::for_family(FAMILY_COMPACTION_RECORD).expect("record");
+        assert_eq!(compaction.baseline, 1);
+        assert_eq!(compaction.writable, vec![1, 2]);
+        for family in MAINTAIN_FAMILIES {
+            let versions = FamilyVersions::for_family(family).expect("known family");
+            assert!(versions.writable.contains(&versions.baseline), "{family}");
+        }
+        assert_eq!(FamilyVersions::for_family("profiles"), None);
+    }
+
+    /// A run at the baseline owes no fence; once the family is activated one
+    /// above it, a run into a bucket fenced below the activation owes the
+    /// activation's epoch, and a bucket already at it owes nothing.
+    #[tokio::test]
+    async fn a_run_above_the_baseline_owes_the_activation_fence() {
+        let store = Arc::new(MemoryStore::new());
+        let clock = ManualClock::at(T0);
+        write_compat(store.as_ref(), vec![family(FAMILY_RSEG, 6)], HOUR_NS).await;
+        let two = FamilyVersions {
+            writable: vec![6, 7],
+            baseline: 6,
+        };
+        let at_baseline = policy(store.clone(), clock.clone())
+            .await
+            .with_family(FAMILY_RSEG, two.clone());
+        let run = at_baseline
+            .begin("test", &[FAMILY_RSEG], Some(bucket_id()), Some(&record_at(0)), 0)
+            .expect("begin");
+        assert_eq!(run.version(FAMILY_RSEG), Some(6));
+        assert_eq!(run.fence_epoch(), None);
+
+        activate(store.as_ref(), FAMILY_RSEG, 7).await;
+        let activated = policy(store.clone(), clock.clone())
+            .await
+            .with_family(FAMILY_RSEG, two);
+        let run = activated
+            .begin("test", &[FAMILY_RSEG], Some(bucket_id()), Some(&record_at(0)), 0)
+            .expect("begin");
+        assert_eq!(run.version(FAMILY_RSEG), Some(7));
+        assert_eq!(run.fence_epoch(), Some(1));
+        let fenced = activated
+            .begin("test", &[FAMILY_RSEG], Some(bucket_id()), Some(&record_at(1)), 0)
+            .expect("begin");
+        assert_eq!(fenced.fence_epoch(), None);
+        let unprovisioned = activated
+            .begin_unprovisioned("test", &[FAMILY_RSEG], 0)
+            .expect("begin");
+        assert_eq!(unprovisioned.fence_epoch(), None);
+    }
+
+    /// A run whose publish lifetime is above the recorded `P` is refused and
+    /// counted; one at `P` starts.
+    #[tokio::test]
+    async fn a_lifetime_above_the_recorded_p_is_refused() {
+        let store = Arc::new(MemoryStore::new());
+        let clock = ManualClock::at(T0);
+        write_compat(store.as_ref(), vec![family(FAMILY_RSPAN, 5)], 60_000_000_000).await;
+        let policy = policy(store, clock).await;
+        let before = compat_publish_refused_total(FAMILY_RSPAN, "publish_lifetime_above_compat");
+
+        let err = policy
+            .begin_unprovisioned("test", &[FAMILY_RSPAN], 60_000_000_001)
+            .expect_err("above P");
+
+        assert!(
+            matches!(
+                err,
+                MaintainError::CompatRefused {
+                    refusal: CompatRunRefusal::PublishLifetimeAboveCompat {
+                        process_ns: 60_000_000_001,
+                        record_ns: 60_000_000_000,
+                    },
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            compat_publish_refused_total(FAMILY_RSPAN, "publish_lifetime_above_compat"),
+            before + 1
+        );
+        policy
+            .begin_unprovisioned("test", &[FAMILY_RSPAN], 60_000_000_000)
+            .expect("at P");
+        assert_eq!(policy.publish_lifetime_ns(), 60_000_000_000);
+    }
+
+    /// `before_put` passes while the view is younger than the horizon and
+    /// refuses from the horizon on, whatever the run start saw.
+    #[tokio::test]
+    async fn before_put_refuses_from_the_horizon_on() {
+        let store = Arc::new(MemoryStore::new());
+        let clock = ManualClock::at(T0);
+        write_compat(store.as_ref(), vec![family(FAMILY_RSPAN, 5)], HOUR_NS).await;
+        let policy = policy(store.clone(), clock.clone()).await;
+        let run = policy
+            .begin_unprovisioned("test", &[FAMILY_RSPAN], 0)
+            .expect("begin");
+
+        clock.advance(COMPAT_VIEW_HORIZON_NS - 1);
+        run.before_put(store.as_ref()).await.expect("inside the horizon");
+        clock.advance(1);
+        let err = run
+            .before_put(store.as_ref())
+            .await
+            .expect_err("at the horizon");
+        assert!(
+            matches!(
+                err,
+                MaintainError::CompatRefused {
+                    refusal: CompatRunRefusal::Compat(CompatRefusal::ViewStale { .. }),
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// `before_record_put` abandons once `P` has passed since the run start.
+    #[tokio::test]
+    async fn before_record_put_abandons_once_p_has_passed() {
+        let store = Arc::new(MemoryStore::new());
+        let clock = ManualClock::at(T0);
+        write_compat(store.as_ref(), vec![family(FAMILY_RSPAN, 5)], 60_000_000_000).await;
+        let policy = policy(store, clock.clone()).await;
+        let run = policy
+            .begin_unprovisioned("test", &[FAMILY_RSPAN], 0)
+            .expect("begin");
+
+        clock.advance(59_999_999_999);
+        run.before_record_put().expect("inside P");
+        clock.advance(1);
+        let err = run.before_record_put().expect_err("at P");
+        assert!(
+            matches!(
+                err,
+                MaintainError::CompatRefused {
+                    refusal: CompatRunRefusal::PublishLifetimeExpired {
+                        elapsed_ns: 60_000_000_000,
+                        lifetime_ns: 60_000_000_000,
+                    },
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+}
