@@ -70,15 +70,23 @@ executors.
   key layout (docs/catalog-and-mvcc.md). Changing any of them requires an
   ADR, never an in-place edit. How the change is versioned depends on what
   changes:
-  - The RSEG layout and the catalog HEAD bump their version. A HEAD change
-    always bumps the HEAD version (ADR-4233, H2): a rebuild by an older
-    build would otherwise strip the new field.
+  - Every versioned binary format bumps its version: the RSEG, RLOG and
+    RSPAN layouts (their trailers and their section versions, such as
+    POSTINGS and KEY_IDX) and the catalog's binary objects (`.csnap`,
+    `.npost`, `.cstat` and the `.kidx` leaf).
+  - The catalog HEAD bumps its version on any change (ADR-4233, H2): an
+    older build's HEAD rebuild would otherwise strip the new field.
   - Series identity and commit tokens get a new domain string.
   - The object key layout gets a new prefix.
   - Any other proto record may add a field with a new field number and no
-    version bump, but only when a reader that ignores the field still gets
-    the same query answer, durability, retention and fencing. Otherwise it
-    bumps the record's version.
+    version bump only when both of these leave query answers, durability,
+    retention and fencing unchanged: an older reader that ignores the
+    field, and an older writer that rewrites the record without it (a CAS
+    replace or a rebuild, as for `ProvisioningRecord`, `sys/compat`, tenant
+    config, the alert lease, an agent's HEAD or the Parquet grants).
+    Otherwise the record stamps a higher version exactly when it carries
+    the field (the `ProvisioningRecord` format_version 4 pattern), or
+    bumps.
   - Field numbers are never renumbered or reused.
 - `unsafe` is denied workspace-wide. No unwrap/expect in production code
   paths; test modules carry `#[allow(clippy::expect_used)]`.

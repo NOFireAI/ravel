@@ -1135,8 +1135,10 @@ the exact-key index over exactly this part's segments. Each points at a
 the KEY_IDX section inside every data object (docs/log-segment-format.md
 "KEY_IDX", docs/span-segment-format.md "KEY_IDX"). Field 8 is absent (proto3
 default) for a part with no leaves; absence means uncovered and is never an
-error, and the field does not bump the HEAD `format_version`, by the field
-6 and field 7 precedent: an older reader ignores the field and scans. The
+error. Fields 6, 7 and 8 were added without bumping the HEAD
+`format_version`, before ADR-4233. From ADR-4233 on, a HEAD change always
+bumps the HEAD version (its H2): an older reader ignores a new field and
+scans, but an older build's HEAD rebuild strips it. The
 ref carries `key` (the object key), `blake3` (32, of the leaf's full
 bytes), `size`, `field`, `key_type`, `key8_lo` and `key8_hi` (the
 inclusive key slice this leaf covers), `prefix_len` (the bytes through the

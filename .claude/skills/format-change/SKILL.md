@@ -40,15 +40,20 @@ The frozen contracts:
    job; B = derived catalog objects, rebuilt by the fold; C = immutable
    metadata records, additive-only; D = identity/domain-hash encodings,
    contained per bucket, never generically migrated.
-2. Version explicitly. RSEG bumps the trailer version; identity encodings
-   get a new domain string (ravel-series-v2, not an edit to v1); key
-   layouts add new prefixes. Protos add fields with new numbers and never
-   renumber or reuse one. A catalog HEAD change always bumps the HEAD
-   version (ADR-4233, H2), because an older build's HEAD rebuild strips a
-   field it does not know. Any other record may add a field with no bump
-   only when a reader that ignores the field still gets the same query
-   answer, durability, retention and fencing. Otherwise it bumps that
-   record's version. The ADR states which case applies and why.
+2. Version explicitly. Every versioned binary format bumps its version:
+   RSEG, RLOG and RSPAN trailers and section versions (POSTINGS, KEY_IDX)
+   and the catalog's `.csnap`, `.npost`, `.cstat` and `.kidx` objects.
+   Identity encodings get a new domain string (ravel-series-v2, not an
+   edit to v1); key layouts add new prefixes. Protos add fields with new
+   numbers and never renumber or reuse one. A catalog HEAD change always
+   bumps the HEAD version (ADR-4233, H2), because an older build's HEAD
+   rebuild strips a field it does not know. Any other record may add a
+   field with no bump only when an older reader that ignores the field and
+   an older writer that rewrites the record without it (a CAS replace or a
+   rebuild) both leave query answers, durability, retention and fencing
+   unchanged. Otherwise the record stamps a higher version exactly when it
+   carries the field (the `ProvisioningRecord` format_version 4 pattern),
+   or bumps. The ADR states which case applies and why.
    Version constants stay single-sourced in each format crate
    (`SUPPORTED_VERSIONS`, `SegmentVersion::WINDOW`, `footer::VERSION`); the
    writer, the reader gate, `audit-versions`, `migrate`, and the compactor's
