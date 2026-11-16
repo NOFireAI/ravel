@@ -621,6 +621,10 @@ pub enum MemoSnapshotReject {
     Oversize,
     /// Empty, or shorter than [`MIN_MEMO_SNAPSHOT_FRAME_BYTES`].
     Malformed,
+    /// Passed every check above but not read, because the reseed's object or
+    /// byte budget ([`crate::memo_snapshot::MemoReseedBudget`]) went to
+    /// candidates ahead of it in read priority.
+    OverBudget,
     /// A tag other than the one this build writes, tag 1 included.
     UnknownTag,
     /// The MAC verifies under none of the reader's maintain keys for the
@@ -630,11 +634,12 @@ pub enum MemoSnapshotReject {
 
 impl MemoSnapshotReject {
     /// Every reason, in check order.
-    pub const ALL: [MemoSnapshotReject; 6] = [
+    pub const ALL: [MemoSnapshotReject; 7] = [
         MemoSnapshotReject::NonUuidKey,
         MemoSnapshotReject::Stale,
         MemoSnapshotReject::Oversize,
         MemoSnapshotReject::Malformed,
+        MemoSnapshotReject::OverBudget,
         MemoSnapshotReject::UnknownTag,
         MemoSnapshotReject::BadMac,
     ];
@@ -646,6 +651,7 @@ impl MemoSnapshotReject {
             MemoSnapshotReject::Stale => "stale",
             MemoSnapshotReject::Oversize => "oversize",
             MemoSnapshotReject::Malformed => "malformed",
+            MemoSnapshotReject::OverBudget => "over_budget",
             MemoSnapshotReject::UnknownTag => "unknown_tag",
             MemoSnapshotReject::BadMac => "bad_mac",
         }
@@ -657,8 +663,9 @@ impl MemoSnapshotReject {
             MemoSnapshotReject::Stale => 1,
             MemoSnapshotReject::Oversize => 2,
             MemoSnapshotReject::Malformed => 3,
-            MemoSnapshotReject::UnknownTag => 4,
-            MemoSnapshotReject::BadMac => 5,
+            MemoSnapshotReject::OverBudget => 4,
+            MemoSnapshotReject::UnknownTag => 5,
+            MemoSnapshotReject::BadMac => 6,
         }
     }
 }

@@ -89,6 +89,7 @@ use ravel_fleet::query_workers::{
     QUERY_WORKERS_PREFIX, ReapPass, default_liveness_window_ns, reap_dead_query_workers,
 };
 use ravel_ingest::{Clock as _, SystemClock};
+use ravel_maintain::memo_snapshot::MemoReseedBudget;
 use ravel_maintain::scan::{
     MaintainMemo, MaintainReport, Zone, classify_zone, scan_and_maintain_with_memo,
 };
@@ -1870,6 +1871,7 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
                             store.as_ref(),
                             membership.keys(),
                             MemoSnapshotLimits::DEFAULT,
+                            MemoReseedBudget::DEFAULT,
                             &mut memo,
                             || clock.now_ns(),
                             &worker,
@@ -4079,29 +4081,39 @@ struct ReseedOutcome {
     rejects: MemoSnapshotRejects,
 }
 
-/// Read every memo snapshot under `keys` and seed `memo` from the verified ones
+/// Read the memo snapshots under `keys` and seed `memo` from the verified ones
 /// ([`read_all_memo_snapshots`], then [`seed_memo_from_snapshots`]), with
 /// `now_ns` read once before the store reads, for the modification time skip,
-/// and once after, for the seed-time staleness gate. Rejected objects are
-/// logged once per call with their per-reason counts: at warn when any was
-/// oversize, an unknown tag or a bad MAC (each means a writer this process
-/// does not recognise, or one past the cap), at debug when the only rejects
-/// are stale, non-UUID keys or malformed objects. A stale object is one whose
-/// modification time is past [`ravel_maintain::MEMO_SNAPSHOT_MTIME_SKIP_NS`],
-/// which a process gone since before an upgrade or a key rotation leaves
-/// behind. Only a failed LIST or GET is an `Err`.
+/// and once after, for the seed-time staleness gate. The read GETs at most
+/// `budget.max_objects` objects and `budget.max_bytes` listed bytes however
+/// many objects sit under the prefix (issue #3211), reading the snapshots of
+/// `live_set` first; production passes [`MemoReseedBudget::DEFAULT`]. A flood
+/// of forged objects can push a recently departed process's snapshot past
+/// that budget, which costs its units a cold rescan, never wrong maintenance.
+///
+/// Rejected objects are logged once per call with their per-reason counts: at
+/// warn when any was oversize, over the read budget, an unknown tag or a bad
+/// MAC (each means a writer this process does not recognise, one past the
+/// cap, or more snapshot objects or bytes than the budget is sized for), at
+/// debug when the only rejects are stale, non-UUID keys or malformed objects.
+/// A stale object is one whose modification time is past
+/// [`ravel_maintain::MEMO_SNAPSHOT_MTIME_SKIP_NS`], which a process gone since
+/// before an upgrade or a key rotation leaves behind. Only a failed LIST or
+/// GET is an `Err`.
+#[allow(clippy::too_many_arguments)]
 async fn reseed_memo(
     store: &dyn ObjectStoreBackend,
     keys: &MaintainRecordKeys,
     limits: MemoSnapshotLimits,
+    budget: MemoReseedBudget,
     memo: &mut MaintainMemo,
     now_ns: impl Fn() -> i64,
     worker: &WorkerSet,
     live_set: &[Uuid],
 ) -> Result<ReseedOutcome, StoreError> {
-    let read = read_all_memo_snapshots(store, keys, limits, now_ns()).await?;
+    let read = read_all_memo_snapshots(store, keys, limits, budget, live_set, now_ns()).await?;
     let rejects = read.rejects;
-    log_memo_snapshot_rejects(&rejects, limits);
+    log_memo_snapshot_rejects(&rejects, limits, budget);
     let (units, buckets) =
         seed_memo_from_snapshots(memo, &read.snapshots, limits, now_ns(), worker, live_set);
     Ok(ReseedOutcome {
@@ -4112,25 +4124,34 @@ async fn reseed_memo(
 }
 
 /// The one log line [`reseed_memo`] emits for its rejected snapshot objects.
-fn log_memo_snapshot_rejects(rejects: &MemoSnapshotRejects, limits: MemoSnapshotLimits) {
+fn log_memo_snapshot_rejects(
+    rejects: &MemoSnapshotRejects,
+    limits: MemoSnapshotLimits,
+    budget: MemoReseedBudget,
+) {
     if rejects.total() == 0 {
         return;
     }
     let count = |reason| rejects.get(reason);
     let suspicious = count(MemoSnapshotReject::Oversize)
+        + count(MemoSnapshotReject::OverBudget)
         + count(MemoSnapshotReject::UnknownTag)
         + count(MemoSnapshotReject::BadMac);
     if suspicious > 0 {
         tracing::warn!(
             bad_mac = count(MemoSnapshotReject::BadMac),
             unknown_tag = count(MemoSnapshotReject::UnknownTag),
+            over_budget = count(MemoSnapshotReject::OverBudget),
             oversize = count(MemoSnapshotReject::Oversize),
             malformed = count(MemoSnapshotReject::Malformed),
             non_uuid_key = count(MemoSnapshotReject::NonUuidKey),
             stale = count(MemoSnapshotReject::Stale),
             cap_bytes = limits.max_bytes,
+            budget_objects = budget.max_objects,
+            budget_bytes = budget.max_bytes,
             "maintenance: rejected memo snapshots that did not verify under the maintain \
-             key file or exceed the size cap; cold start for their units (ADR-3130)"
+             key file, exceed the size cap or exceed the reseed's read budget; cold start \
+             for their units (ADR-3130)"
         );
     } else {
         tracing::debug!(
@@ -9605,6 +9626,8 @@ mod tests {
             &store,
             test_membership().keys(),
             MemoSnapshotLimits::DEFAULT,
+            MemoReseedBudget::DEFAULT,
+            &live_b,
             now,
         )
         .await
@@ -9817,6 +9840,8 @@ mod tests {
             &store,
             test_membership().keys(),
             MemoSnapshotLimits::DEFAULT,
+            MemoReseedBudget::DEFAULT,
+            &live_b,
             snap_now,
         )
         .await
@@ -14537,9 +14562,16 @@ mod memo_snapshot_cap_tests {
         );
         assert_eq!(store.metrics().snapshot().put.calls, 1);
 
-        let read = read_all_memo_snapshots(&store, &keys, SMALL, NOW_NS)
-            .await
-            .expect("read");
+        let read = read_all_memo_snapshots(
+            &store,
+            &keys,
+            SMALL,
+            MemoReseedBudget::DEFAULT,
+            &worker.solo_live_set(),
+            NOW_NS,
+        )
+        .await
+        .expect("read");
         assert_eq!(read.rejects.total(), 0);
         assert_eq!(read.snapshots.len(), 1);
         let mut successor = MaintainMemo::with_default_interval();
@@ -14698,12 +14730,22 @@ mod memo_snapshot_auth_tests {
         store: &MemoryStore,
         limits: MemoSnapshotLimits,
     ) -> (MaintainMemo, ReseedOutcome) {
+        reseed_budgeted(store, limits, MemoReseedBudget::DEFAULT).await
+    }
+
+    /// [`reseed`] under `budget`.
+    async fn reseed_budgeted(
+        store: &MemoryStore,
+        limits: MemoSnapshotLimits,
+        budget: MemoReseedBudget,
+    ) -> (MaintainMemo, ReseedOutcome) {
         let worker = WorkerSet::with_defaults(0);
         let mut memo = MaintainMemo::with_default_interval();
         let outcome = reseed_memo(
             store,
             test_membership().keys(),
             limits,
+            budget,
             &mut memo,
             || NOW_NS,
             &worker,
@@ -14843,6 +14885,7 @@ mod memo_snapshot_auth_tests {
             &store,
             &other_keys(),
             MemoSnapshotLimits::DEFAULT,
+            MemoReseedBudget::DEFAULT,
             &mut other,
             || NOW_NS,
             &successor,
@@ -14887,11 +14930,12 @@ mod memo_snapshot_auth_tests {
     async fn reseed_logging(
         store: &MemoryStore,
         limits: MemoSnapshotLimits,
+        budget: MemoReseedBudget,
     ) -> (ReseedOutcome, Vec<(tracing::Level, String)>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(RejectEvents(events.clone()));
         let _guard = tracing::subscriber::set_default(subscriber);
-        let (_, outcome) = reseed(store, limits).await;
+        let (_, outcome) = reseed_budgeted(store, limits, budget).await;
         let events = events.lock().clone();
         (outcome, events)
     }
@@ -14932,7 +14976,12 @@ mod memo_snapshot_auth_tests {
             let store = MemoryStore::new();
             write_at(&store, mtime_ms, old, tag_one_frame()).await;
             write_at(&store, mtime_ms, rotated, rotated_out_frame(rotated)).await;
-            let (outcome, events) = reseed_logging(&store, MemoSnapshotLimits::DEFAULT).await;
+            let (outcome, events) = reseed_logging(
+                &store,
+                MemoSnapshotLimits::DEFAULT,
+                MemoReseedBudget::DEFAULT,
+            )
+            .await;
             let warns = events
                 .iter()
                 .filter(|(level, _)| *level == tracing::Level::WARN)
@@ -14951,14 +15000,20 @@ mod memo_snapshot_auth_tests {
     }
 
     /// One reseed over a stale, a bad-MAC, an unknown-tag, an oversize, a
-    /// malformed and a non-UUID-key object logs exactly one WARN carrying
-    /// every per-reason count. A reseed whose only rejects are stale,
-    /// malformed or non-UUID keys logs no WARN.
+    /// malformed, a non-UUID-key and an over-budget object logs exactly one
+    /// WARN carrying every per-reason count. A reseed whose only rejects are
+    /// stale, malformed or non-UUID keys logs no WARN.
     #[tokio::test]
     async fn reseed_warns_once_with_per_reason_counts() {
         let limits = MemoSnapshotLimits {
             max_bytes: 256,
             ..MemoSnapshotLimits::DEFAULT
+        };
+        // Objects 1, 2 and 4 are the three GETs; object 6, after them in
+        // listing order at the same (absent) modification time, is over it.
+        let budget = MemoReseedBudget {
+            max_objects: 3,
+            ..MemoReseedBudget::DEFAULT
         };
         let store = MemoryStore::new();
         let gone = Uuid::from_u128(5);
@@ -14976,6 +15031,10 @@ mod memo_snapshot_auth_tests {
         write_memo_snapshot(&store, &Uuid::from_u128(4), vec![2u8; 10])
             .await
             .expect("write");
+        let unread = Uuid::from_u128(6);
+        write_memo_snapshot(&store, &unread, rotated_out_frame(unread))
+            .await
+            .expect("write");
         put_raw(
             &store,
             &format!("{}stray", ravel_maintain::MEMO_PREFIX),
@@ -14983,8 +15042,9 @@ mod memo_snapshot_auth_tests {
         )
         .await;
 
-        let (outcome, events) = reseed_logging(&store, limits).await;
-        assert_eq!(outcome.rejects.total(), 6);
+        let (outcome, events) = reseed_logging(&store, limits, budget).await;
+        assert_eq!(MemoSnapshotReject::ALL.len(), 7);
+        assert_eq!(outcome.rejects.total(), 7);
         for reason in MemoSnapshotReject::ALL {
             assert_eq!(outcome.rejects.get(reason), 1, "{}", reason.reason());
         }
@@ -15001,6 +15061,8 @@ mod memo_snapshot_auth_tests {
             "malformed=1",
             "non_uuid_key=1",
             "stale=1",
+            "over_budget=1",
+            "budget_objects=3",
         ] {
             assert!(warns[0].contains(field), "{field} in {}", warns[0]);
         }
@@ -15016,7 +15078,7 @@ mod memo_snapshot_auth_tests {
             vec![2u8; 50],
         )
         .await;
-        let (outcome, events) = reseed_logging(&quiet, limits).await;
+        let (outcome, events) = reseed_logging(&quiet, limits, budget).await;
         assert_eq!(outcome.rejects.total(), 3);
         assert_eq!(outcome.rejects.get(MemoSnapshotReject::Stale), 1);
         assert!(
@@ -15025,5 +15087,37 @@ mod memo_snapshot_auth_tests {
                 .all(|(level, _)| *level != tracing::Level::WARN),
             "stale, malformed and non-UUID keys log below warn: {events:?}"
         );
+
+        // Over-budget objects alone warn: three honest snapshots under a
+        // budget of one object read one and skip two.
+        let crowded = MemoryStore::new();
+        for writer in [Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)] {
+            let bytes = MaintainMemo::snapshot_bytes_from_body(
+                &suppressing_body(),
+                NOW_NS,
+                &writer,
+                test_membership().keys(),
+            );
+            write_memo_snapshot(&crowded, &writer, bytes)
+                .await
+                .expect("write");
+        }
+        let one = MemoReseedBudget {
+            max_objects: 1,
+            ..MemoReseedBudget::DEFAULT
+        };
+        let (outcome, events) = reseed_logging(&crowded, MemoSnapshotLimits::DEFAULT, one).await;
+        let mut expected = MemoSnapshotRejects::default();
+        expected.record(MemoSnapshotReject::OverBudget);
+        expected.record(MemoSnapshotReject::OverBudget);
+        assert_eq!(outcome.rejects, expected);
+        assert_eq!((outcome.units, outcome.buckets), (1, 3));
+        let warns: Vec<&String> = events
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .map(|(_, fields)| fields)
+            .collect();
+        assert_eq!(warns.len(), 1, "{events:?}");
+        assert!(warns[0].contains("over_budget=2"), "{}", warns[0]);
     }
 }
