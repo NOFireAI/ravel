@@ -55,7 +55,11 @@ UNSUPPORTED = "unsupported-on-this-build"
 # A server refusal of a statement statements.toml marks
 # expect_refusal_on_main: the SQL complexity guard working as designed.
 GUARD = "refused-by-guard"
-PHASES = ("resolve", "plan", "probe", "scan", "keyIndex")
+PHASES = ("resolve", "plan", "probe", "scan", "keyIndex", "fetch")
+# A build before #797 has no fetch phase: it charged late materialization's
+# phase 2 to scan, so its totals are complete without one, and an absent fetch
+# phase reads as zeros. A present one must carry every field.
+OPTIONAL_PHASES = ("fetch",)
 PHASE_FIELDS = ("s3GetRequests", "s3GetWireBytes", "s3ListRequests", "segmentsOpened",
                 "decompressedOutputBytes", "cacheServedBytes")
 # States whose oracle is the unfolded state's own answer to the same
@@ -408,7 +412,8 @@ def validate_call(c, problems):
             by = {p.get("phase"): p for p in phases if isinstance(p, dict)}
             for p in PHASES:
                 if p not in by:
-                    lacking.append(f"stats.phases.{p}")
+                    if p not in OPTIONAL_PHASES:
+                        lacking.append(f"stats.phases.{p}")
                     continue
                 lacking += [f"stats.phases.{p}.{f}" for f in PHASE_FIELDS if f not in by[p]]
         for member, field in (("pruning", "blocksScanned"), ("pruning", "segments"), ("io", "dependencyDepth")):
@@ -426,7 +431,10 @@ def validate_call(c, problems):
 
 
 def phase_map(stats):
-    return {p["phase"]: p for p in stats["phases"]}
+    by = {p["phase"]: p for p in stats["phases"]}
+    for p in OPTIONAL_PHASES:
+        by.setdefault(p, {"phase": p, **{f: 0 for f in PHASE_FIELDS}})
+    return by
 
 
 def call_metrics(c):
@@ -443,7 +451,8 @@ def call_metrics(c):
         # 512 KiB is not probed and can still be opened by the scan.
         v[f"{p.lower()}_segments_opened"] = ph[p]["segmentsOpened"]
     v["total_gets"] = sum(ph[p]["s3GetRequests"] for p in PHASES)
-    v["data_gets"] = ph["probe"]["s3GetRequests"] + ph["scan"]["s3GetRequests"]
+    v["data_gets"] = (ph["probe"]["s3GetRequests"] + ph["scan"]["s3GetRequests"]
+                      + ph["fetch"]["s3GetRequests"])
     v["list_requests"] = sum(ph[p]["s3ListRequests"] for p in PHASES)
     v["wire_bytes"] = sum(ph[p]["s3GetWireBytes"] for p in PHASES)
     v["decompressed_bytes"] = sum(ph[p]["decompressedOutputBytes"] for p in PHASES)

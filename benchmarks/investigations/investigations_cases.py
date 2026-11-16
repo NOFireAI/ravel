@@ -2051,6 +2051,34 @@ class Evaluate(Workdir):
     def test_row_6_objects_past_probe(self):
         self.assertEqual(self.check_row_6_objects_past_probe(), [])
 
+    def test_fetch_phase_counts_in_the_totals_and_is_optional(self):
+        """A fetch phase (late materialization's phase 2, #797) adds to every summed figure and to data_gets;
+        a build without one validates and reads it as zeros; one with a field missing does not validate; and
+        a missing core phase still fails."""
+        mod = load_module(EVALUATE, "evaluate_fetch_phase")
+        c = self.box_c_q20_call()
+        self.assertTrue(mod.validate_call(c, mod.Problems()))
+        base = mod.call_metrics(c)
+        self.assertEqual((base["total_gets"], base["data_gets"], base["wire_bytes"], base["fetch_gets"]),
+                         (1_470, 6, 33 + 121_939_878 + 989_537 + 1_322_842, 0))
+        c["stats"]["phases"].append({"phase": "fetch", "s3GetRequests": 3, "s3GetWireBytes": 9_704,
+                                     "s3ListRequests": 0, "segmentsOpened": 1, "decompressedOutputBytes": 0,
+                                     "cacheServedBytes": 0})
+        self.assertTrue(mod.validate_call(c, mod.Problems()))
+        got = mod.call_metrics(c)
+        self.assertEqual((got["total_gets"], got["data_gets"], got["wire_bytes"], got["segments_opened"],
+                          got["fetch_gets"]),
+                         (1_473, 9, base["wire_bytes"] + 9_704, base["segments_opened"] + 1, 3))
+        del c["stats"]["phases"][-1]["segmentsOpened"]
+        problems = mod.Problems()
+        self.assertFalse(mod.validate_call(c, problems))
+        self.assertIn("stats.phases.fetch.segmentsOpened", " ".join(problems.lines))
+        c = self.box_c_q20_call()
+        c["stats"]["phases"] = [p for p in c["stats"]["phases"] if p["phase"] != "scan"]
+        problems = mod.Problems()
+        self.assertFalse(mod.validate_call(c, problems))
+        self.assertIn("stats.phases.scan", " ".join(problems.lines))
+
     def needle_stamp(self, **fields):
         path = self.stamp_path("needle_blocks.json")
         with open(path) as f:

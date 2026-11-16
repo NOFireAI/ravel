@@ -4710,9 +4710,10 @@ pub struct BlockRangeStats {
 
 /// The query phase a tail-section probe miss is charged to (#883).
 ///
-/// Only three of [`QueryPhase`]'s phases can issue a suffix probe here:
-/// `Resolve` reads commit records and `Probe` is the RSEG segment-catalog
-/// fetch, neither of which touches an RLOG object's tail. Naming the ones that
+/// Three of [`QueryPhase`]'s six phases can issue a suffix probe here: `Plan`,
+/// `Scan` and `Fetch`. `Resolve` reads commit records, `Probe` is the RSEG
+/// segment-catalog fetch and `KeyIndex` reads KEY_IDX, none of which touches an
+/// RLOG object's tail. Naming the ones that
 /// can, rather than taking a `QueryPhase` with impossible arms, keeps the charge
 /// total: every value here maps to a real phase, so a miss can never be recorded
 /// against a phase that issued no request.
