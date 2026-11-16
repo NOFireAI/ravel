@@ -8449,4 +8449,366 @@ mod row_path_tests {
         assert!(all.erased, "an erased row");
         assert!(all.kept, "a kept row");
     }
+
+    // --- ADR-0093, I64 equality amendment: filter first on the row path ---
+
+    /// The scan's build for the row filter `k1 = v` over `projection` of
+    /// `extended` with a row-ref column, as `LogsScanExec::build` lays it
+    /// out: `k1` appended when the projection leaves it out, the row-ref
+    /// column last. Returns the build projection, the build schema and the
+    /// bound filter.
+    fn k1_filter(
+        extended: &Schema,
+        projection: &[usize],
+        v: i64,
+    ) -> (Vec<usize>, SchemaRef, Arc<BoundRowFilters>) {
+        use crate::late_materialization::row_ref_field;
+        let k1 = extended.index_of("k1").expect("k1");
+        let mut build_projection = projection.to_vec();
+        if !build_projection.contains(&k1) {
+            build_projection.push(k1);
+        }
+        let with_ref = |s: Schema| -> SchemaRef {
+            let mut fields = s.fields().to_vec();
+            fields.push(Arc::new(row_ref_field()));
+            Arc::new(Schema::new(fields))
+        };
+        let output = with_ref(extended.project(projection).expect("project"));
+        let build = with_ref(extended.project(&build_projection).expect("project"));
+        let keep = (build_projection.len() != projection.len()).then(|| {
+            (0..projection.len())
+                .chain(std::iter::once(build_projection.len()))
+                .collect()
+        });
+        let expr = datafusion::physical_expr::expressions::binary(
+            datafusion::physical_expr::expressions::col("k1", extended).expect("k1"),
+            Operator::Eq,
+            datafusion::physical_expr::expressions::lit(ScalarValue::Int64(Some(v))),
+            extended,
+        )
+        .expect("k1 = v");
+        let bound = RowFilters::new(vec![expr])
+            .bind(&build, keep, output)
+            .expect("bind")
+            .expect("one conjunct");
+        (build_projection, build, bound)
+    }
+
+    /// The rows the filter-first build emits for `start..end`, and the same
+    /// chunk built whole and then filtered, as [`build_row_batch`] then
+    /// [`BoundRowFilters::apply`]; each with the rows its `attrs` counter
+    /// counted and the rows the filter dropped.
+    #[allow(clippy::too_many_arguments)]
+    fn both_orders(
+        block: &RowBlock,
+        start: usize,
+        end: usize,
+        streams: &mut StreamAttrsCache,
+        shape: &RowBatchShape<'_>,
+        reservation: &MemoryReservation,
+        row_refs: Option<RowRefRange>,
+        filters: &BoundRowFilters,
+    ) -> ((FilteredRows, usize, usize), (RecordBatch, usize, usize)) {
+        let (first_built, first_dropped) = (Count::new(), Count::new());
+        let first = build_row_batch_filtered(
+            block,
+            start,
+            end,
+            streams,
+            &RowBatchShape {
+                attrs_built: &first_built,
+                ..*shape
+            },
+            reservation,
+            row_refs,
+            filters,
+            &first_dropped,
+        )
+        .expect("filter first");
+        let (then_built, then_dropped) = (Count::new(), Count::new());
+        let whole = build_row_batch(
+            block,
+            start,
+            end,
+            streams,
+            &RowBatchShape {
+                attrs_built: &then_built,
+                ..*shape
+            },
+            reservation,
+            row_refs,
+        )
+        .expect("build whole");
+        let then = filters.apply(whole, &then_dropped).expect("apply");
+        (
+            (first, first_built.value(), first_dropped.value()),
+            (then, then_built.value(), then_dropped.value()),
+        )
+    }
+
+    /// ADR-0093, I64 equality amendment, deliverable 3: a 10-row block on a
+    /// stream whose resource says `k1 = 7`, filtered by `k1 = 7`. Rows 0, 4
+    /// and 8 have no `k1` cell and read the resource's 7, rows 1, 5 and 9
+    /// hold 7, row 2 holds the string `"7"` (NULL under the I64
+    /// declaration), the rest hold another integer. The filter keeps the 6
+    /// rows 0, 1, 4, 5, 8 and 9. The `attrs` map is built for exactly those
+    /// 6 rows, against 10 for build-then-filter, and the batch, row refs
+    /// included, equals the build-then-filter batch.
+    ///
+    /// Flipped: building every column before filtering counts 10 and fails
+    /// "the attrs map is built for the kept rows only".
+    #[test]
+    fn row_path_builds_attrs_only_for_rows_the_row_filter_keeps() {
+        const N: usize = 10;
+        const KEPT: [i64; 6] = [1, 2, 5, 6, 9, 10];
+        let stream = Stream {
+            resource: vec![("k1".into(), AttrValue::I64(7))],
+            scope: Vec::new(),
+        };
+        let records: Vec<LogRecord> = (0..N)
+            .map(|i| {
+                let mut attrs = vec![("k0".to_string(), AttrValue::Str(format!("v{i}")))];
+                match i % 4 {
+                    0 => {}
+                    1 => attrs.push(("k1".into(), AttrValue::I64(7))),
+                    2 => attrs.push(("k1".into(), AttrValue::Str("7".into()))),
+                    _ => attrs.push(("k1".into(), AttrValue::I64(i as i64 + 100))),
+                }
+                record(0, &stream, i as i64 + 1, attrs)
+            })
+            .collect();
+        let cfg = RlogConfig {
+            block_target_records: 64,
+            ..RlogConfig::default()
+        };
+        let obj = write(&records, &cfg);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let block = scan(&reader)
+            .next_row_block(&obj)
+            .expect("row exit")
+            .expect("block");
+        assert_eq!(block.len(), N, "one block");
+
+        let declared = declared();
+        let attr_keys = attr_keys();
+        let (extended, full_len) = extended_schema(&declared, &attr_keys);
+        let projection: Vec<usize> = (0..extended.fields().len()).collect();
+        let (build_projection, build_schema, filters) = k1_filter(&extended, &projection, 7);
+        let shape = shape(
+            &build_schema,
+            &build_projection,
+            &declared,
+            &attr_keys,
+            full_len,
+            &[],
+        );
+        let reservation = unbounded();
+        let mut streams = StreamAttrsCache::new();
+        let row_refs = Some(RowRefRange {
+            segment: 3,
+            block: 2,
+            first_row: 100,
+        });
+        let ((first, first_attrs, first_dropped), (then, then_attrs, then_dropped)) = both_orders(
+            &block,
+            0,
+            N,
+            &mut streams,
+            &shape,
+            &reservation,
+            row_refs,
+            &filters,
+        );
+        assert_eq!(first_attrs, KEPT.len(), "the attrs map is built for the kept rows only");
+        assert_eq!(then_attrs, N, "build-then-filter builds every row's map");
+        assert_eq!((first_dropped, then_dropped), (N - KEPT.len(), N - KEPT.len()));
+        assert_eq!(first.unerased, N);
+        let got = first.batch.expect("kept rows");
+        assert_same_columns(&got, &then);
+        let ts = got
+            .column(LOG_COL_TS)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("ts");
+        assert_eq!(ts.values().to_vec(), KEPT.to_vec(), "the kept rows");
+        let refs = got
+            .column(got.num_columns() - 1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("row refs");
+        let rows: Vec<usize> = refs
+            .values()
+            .iter()
+            .map(|&r| RowRef::unpack(r).row)
+            .collect();
+        assert_eq!(rows, vec![100, 101, 104, 105, 108, 109], "row refs by block position");
+        assert_eq!(
+            reservation.size(),
+            streams.charged(),
+            "both builds release their charge"
+        );
+    }
+
+    /// A chunk the row filter empties builds nothing past the filter column:
+    /// no `attrs` map row and no batch.
+    #[test]
+    fn a_chunk_the_row_filter_empties_builds_no_attrs_map() {
+        let stream = Stream {
+            resource: Vec::new(),
+            scope: Vec::new(),
+        };
+        let records: Vec<LogRecord> = (0..4)
+            .map(|i| record(0, &stream, i + 1, vec![("k1".into(), AttrValue::I64(i))]))
+            .collect();
+        let cfg = RlogConfig::default();
+        let obj = write(&records, &cfg);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let block = scan(&reader)
+            .next_row_block(&obj)
+            .expect("row exit")
+            .expect("block");
+        let declared = declared();
+        let attr_keys = attr_keys();
+        let (extended, full_len) = extended_schema(&declared, &attr_keys);
+        let projection = vec![LOG_COL_TS, LOG_COL_ATTRS];
+        let (build_projection, build_schema, filters) = k1_filter(&extended, &projection, 9);
+        let shape = shape(
+            &build_schema,
+            &build_projection,
+            &declared,
+            &attr_keys,
+            full_len,
+            &[],
+        );
+        let ((first, first_attrs, dropped), (then, _, _)) = both_orders(
+            &block,
+            0,
+            block.len(),
+            &mut StreamAttrsCache::new(),
+            &shape,
+            &unbounded(),
+            Some(RowRefRange {
+                segment: 0,
+                block: 0,
+                first_row: 0,
+            }),
+            &filters,
+        );
+        assert!(first.batch.is_none(), "no survivor, no batch");
+        assert_eq!((first_attrs, dropped, first.unerased), (0, 4, 4));
+        assert_eq!(then.num_rows(), 0);
+    }
+
+    /// [`check_case`]'s blocks with the row filter `k1 = v`: per chunk, the
+    /// filter-first build equals build-then-filter (rows, values, row refs),
+    /// both drop the same rows, the filter-first `attrs` counter counts only
+    /// the emitted rows, and every chunk's charge is released.
+    fn check_filter_first(case: &Case, v: i64) -> Result<(), TestCaseError> {
+        let cfg = RlogConfig {
+            block_target_records: case.block_target_records,
+            max_dynamic_columns: case.max_dynamic_columns,
+            ..RlogConfig::default()
+        };
+        let streams: Vec<Stream> = case
+            .streams
+            .iter()
+            .map(|(resource, scope)| Stream {
+                resource: resource.clone(),
+                scope: scope.clone(),
+            })
+            .collect();
+        let records: Vec<LogRecord> = case
+            .records
+            .iter()
+            .map(|(s, ts, attrs)| {
+                let n = s % streams.len();
+                record(n, &streams[n], *ts, attrs.clone())
+            })
+            .collect();
+        let erasure: Vec<ErasurePredicate> = case
+            .erasure
+            .iter()
+            .map(|(m, w)| {
+                let (lo, hi) = w.map_or((0, 0), |(lo, len)| (lo, lo + len));
+                ErasurePredicate::new(m.clone(), lo, hi)
+            })
+            .collect();
+        let declared = declared();
+        let attr_keys = attr_keys();
+        let (extended, full_len) = extended_schema(&declared, &attr_keys);
+        let projection: Vec<usize> = (0..extended.fields().len())
+            .filter(|&i| case.mask.get(i).copied().unwrap_or(false))
+            .collect();
+        let attrs_projected = projection.contains(&LOG_COL_ATTRS);
+        let (build_projection, build_schema, filters) = k1_filter(&extended, &projection, v);
+        let shape = shape(
+            &build_schema,
+            &build_projection,
+            &declared,
+            &attr_keys,
+            full_len,
+            &erasure,
+        );
+        let obj = write(&records, &cfg);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let mut rows = scan(&reader);
+        let mut block_no = 0;
+        while let Some(block) = rows.next_row_block(&obj).expect("row exit") {
+            let mut streams = StreamAttrsCache::new();
+            let reservation = unbounded();
+            let mut start = 0;
+            while start < block.len() {
+                let end = (start + case.chunk).min(block.len());
+                let row_refs = Some(RowRefRange {
+                    segment: 1,
+                    block: block_no,
+                    first_row: start,
+                });
+                let ((first, first_attrs, first_dropped), (then, _, then_dropped)) = both_orders(
+                    &block,
+                    start,
+                    end,
+                    &mut streams,
+                    &shape,
+                    &reservation,
+                    row_refs,
+                    &filters,
+                );
+                prop_assert_eq!(first_dropped, then_dropped);
+                let emitted = first.batch.as_ref().map_or(0, RecordBatch::num_rows);
+                prop_assert_eq!(emitted, then.num_rows());
+                prop_assert_eq!(first.unerased, emitted + first_dropped);
+                prop_assert_eq!(first_attrs, if attrs_projected { emitted } else { 0 });
+                if let Some(got) = &first.batch {
+                    prop_assert_eq!(got.schema(), then.schema());
+                    for (n, field) in got.schema().fields().iter().enumerate() {
+                        prop_assert_eq!(
+                            got.column(n).to_data(),
+                            then.column(n).to_data(),
+                            "column {}",
+                            field.name()
+                        );
+                    }
+                }
+                prop_assert_eq!(reservation.size(), streams.charged());
+                start = end;
+            }
+            block_no += 1;
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// ADR-0093, I64 equality amendment, deliverable 3: the filter-first
+        /// row path emits the batch build-then-filter emits, over blocks with
+        /// `k1` from the record (as I64 or another variant), the resource,
+        /// the scope or nowhere, erased rows, `attrs_raw` overflow and random
+        /// projections.
+        #[test]
+        fn filter_first_equals_build_then_filter(case in case(), v in -2i64..3) {
+            check_filter_first(&case, v)?;
+        }
+    }
 }
