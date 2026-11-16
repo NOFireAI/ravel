@@ -478,16 +478,16 @@ async fn max_s3_requests_rejects_before_every_segment_is_fetched() {
     );
 }
 
-/// A `PhaseAccounting` built by `pooled_over` has five phases that are clones
+/// A `PhaseAccounting` built by `pooled_over` has six phases that are clones
 /// of one shared `QueryAccounting`, so reducing its snapshot with
-/// `.pooled()` reads that one counter five times and reports 5x the real
+/// `.pooled()` reads that one counter six times and reports 6x the real
 /// total. `RsegScanExec`'s S3-request budget check must cost an aliased
 /// handle exactly like an independent one: the real GET count cannot depend
 /// on which `PhaseAccounting` constructor built the handle it was given.
 /// This fixture issues exactly one GET per segment (confirmed by
 /// `max_s3_requests_rejects_before_every_segment_is_fetched` above), so a
 /// budget of 6 comfortably fits the 5 real GETs both handles must issue;
-/// pre-fix, the aliased handle's 5x-inflated reduction reports 10 after only
+/// pre-fix, the aliased handle's 6x-inflated reduction reports 12 after only
 /// 2 real GETs and trips early.
 #[tokio::test]
 async fn pooled_over_handle_does_not_quadruple_count_the_request_budget() {
