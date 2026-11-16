@@ -137,6 +137,21 @@ The scope is ingest durability only:
   retention and GC (no `maintain` process), resharding, and multi-tenant
   admission limits are out.
 
+### Known findings the harness works around
+
+- ravel-server exits about 3 s after start when the store does not answer
+  its startup read of `sys/qualification`, even on a transient connect error
+  ("store backend is not qualified; refusing to start"). On Kubernetes the pod
+  restarts. Here nothing would restart it, so a node that Antithesis restarted
+  during a store outage would stay down for the rest of the timeline. Each node's
+  entrypoint therefore waits until the bucket answers a signed list, then
+  `exec`s ravel-server. The window between that check and the server's own
+  read remains.
+- `snouty validate` on an Apple Silicon Mac needs Docker Desktop's Rosetta
+  emulation. Under its QEMU fallback, the amd64 `ravel-cli` in `init` crashes
+  with a segmentation fault, and setup never completes. Validate on an amd64 host,
+  or turn Rosetta on.
+
 ### New external dependencies
 
 `antithesis_sdk` 0.4 and `antithesis-instrumentation` 0.1, in ravel-server,
