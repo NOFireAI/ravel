@@ -163,8 +163,9 @@ rule end to end when no `FilterExec` survives above the scan to intercept
 it, because a `FilterExec` reports its own (non-exact) statistics rather
 than passing the leaf's `Exact` count through. So
 `LogsTableProvider::supports_filters_pushdown` reports `Exact` for a filter
-that resolves purely to `ts` bounds, `has_word` content predicates and
-declared `str` `<>` comparisons (below), which deletes it from the plan. A
+that resolves purely to `ts` bounds, `has_word` content predicates,
+declared `str` `<>` comparisons and declared `i64` `=` comparisons
+(below), which deletes it from the plan. A
 `ts` bound and a `has_word` call land in the channel the RLOG reader
 re-verifies exactly against each decoded block (`ravel_logseg`'s
 `block_survivors`, over its `Predicate::TsRange` and `Predicate::HasWord`
@@ -177,20 +178,38 @@ zero-GET path the genuinely predicate-free query does.
 
 A declared `str` column compared with `<>` against a non-NULL string literal
 (`"SearchPhrase" <> ''`, either operand order) is evaluated inside the scan
-instead (ADR-0093, exact not-equal amendment). The scan builds DataFusion's
-own expression for the comparison and applies it to every batch it builds,
-after the column build, on both of its emission paths and on every scan the
-optimizer rebuilds from it, so it reads the same merged value a filter above
-the scan would read, resource or scope fallback included, and a NULL value
-drops the row. The comparison is reported `Exact` and no `FilterExec` is
-left for it. The scan builds the compared column even when the statement
-does not select it, counts the rows it drops in `rows_dropped_by_row_filter`,
-and shows the comparisons on its EXPLAIN line as `row_filters=[...]`, by
-column name. A scan carrying such a comparison claims no exact row count or
-extrema, and the column-statistics rewrite below refuses it, so `COUNT(*)`,
-`MIN`, `MAX` and `SUM` under it are computed from the rows the scan emits.
-The same comparison AND-ed with a shape the scan does not evaluate, in one
-unsplit expression, stays `Inexact`.
+instead (ADR-0093, exact not-equal amendment). So is a declared `i64`
+column compared with `=` against a non-NULL integer literal of any width
+whose value fits an `i64` (`"UserID" = 435090932899640449`, either operand
+order; ADR-0093, I64 equality amendment), which also keeps its point
+`NumRange` prune arm and KEY_IDX key for block pruning. These row filters
+are DataFusion's own expressions for the comparisons (the `=` with its
+literal rewritten to `Int64`, value-equal to the one a filter above the scan
+would run), applied on both of the scan's emission paths and on every scan
+the optimizer rebuilds from it, so they read the same merged value a filter
+above the scan would read, resource or scope fallback included, and a NULL
+value drops the row. Such a comparison is reported `Exact` and no
+`FilterExec` is left for it. The scan builds the compared column even when
+the statement does not select it, counts the rows it drops in
+`rows_dropped_by_row_filter`, and shows the comparisons on its EXPLAIN line
+as `row_filters=[...]`, by column name. A scan carrying such a comparison
+claims no exact row count or extrema, and the column-statistics rewrite
+below refuses it, so `COUNT(*)`, `MIN`, `MAX` and `SUM` under it are
+computed from the rows the scan emits. The same comparison AND-ed with a
+shape the scan does not evaluate, in one unsplit expression, stays
+`Inexact`, and so does either comparison on a provider built with row-filter
+pushdown off.
+
+The columnar path applies the row filters to each batch after building it.
+The row path, for a chunk with no pending erasure, builds only the columns
+the filters read, resolving each row's value for the compared key without
+merging the row's attributes, evaluates the filters, and builds every other
+column (the `attrs` map, `attrs['k']` columns, other declared and fixed
+columns) for the surviving rows only, so no row is merged twice and a
+dropped row gets no `attrs` map. A chunk with pending erasure is built whole
+and then filtered. The `attrs_rows_built` and `attrs_rows_merged` scan
+metrics count the rows whose `attrs` map the row path built and the rows it
+merged attributes for.
 
 A scan carrying such a comparison under an `ORDER BY ... LIMIT k` whose
 global sort reads it through a partition concatenation
@@ -201,9 +220,10 @@ when `k` is at most `partition_topk_max_limit` (default 1024; `None` turns
 it off), since each partition holds its own `k`-row heap.
 
 Every other filter stays `Inexact`. An `attrs['k'] = 'v'` equality and
-every declared typed column predicate (ADR-0093) go to the prune-only
-channel, which the reader uses for block pruning ONLY and never evaluates
-per row, so DataFusion's residual remains the sole exact evaluator; a
+every other declared typed column predicate (ADR-0093) go only to the
+prune-only channel, which the reader uses for block pruning ONLY and
+never evaluates per row, so DataFusion's residual remains the sole exact
+evaluator for them; a
 filter recognized only in part (a `ts` bound AND-ed with an unrecognized
 sub-expression in one unsplit expression) is `Inexact` too, never
 partially credited. A distributed coordinator (ADR-0071) also reports
@@ -5645,14 +5665,15 @@ an `i64`/`bool` comparison or `BETWEEN` and an `i64` `IN` drive the skip index,
 and a `str`/`bytes` equality drives POSTINGS, exactly as the "Supported
 predicates" list above describes. That pushdown is always `Inexact`, so the typed
 comparison is still re-evaluated exactly as a residual filter above the scan; the
-prune only changes which blocks the fetch decodes. The one exception is a
-`str` column's `<>` against a string literal, which no prune arm carries: the
-scan itself evaluates it and it leaves no residual filter (see "Logs
+prune only changes which blocks the fetch decodes. The two exceptions are a
+`str` column's `<>` against a string literal, which no prune arm carries, and
+an `i64` column's `=` against an integer literal, which keeps its prune arm:
+the scan itself evaluates each and it leaves no residual filter (see "Logs
 `COUNT(*)` from catalog row counts" above). A typed attribute column
 referenced by the query's projection -- which DataFusion also folds
 residual-filter columns
 into -- is decoded by the scan's column selection, and so is the column of a
-`<>` the scan evaluates, so `WHERE` on a typed attribute column decodes only the
+comparison the scan evaluates, so `WHERE` on a typed attribute column decodes only the
 pages it needs. Moving an equality predicate from
 `attrs['k'] = 'v'` to a declared `k = 'v'` now prunes through the same POSTINGS
 index (subject to the section-version caveat above). Declare for typed
