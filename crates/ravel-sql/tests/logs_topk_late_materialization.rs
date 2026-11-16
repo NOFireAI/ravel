@@ -1749,15 +1749,20 @@ async fn phase_two_at_production_gap_coalesces_the_winners_blocks() {
         "the coalesced range is the whole BLOCKS section"
     );
     assert_eq!(fetch_wire, prod.wire.phase(QueryPhase::Fetch));
-    // The one coalesced range is [blocks_start, blocks_end): the whole section.
+    // The winners' three non-adjacent blocks coalesced into ONE range (not the
+    // three runs a zero gap would issue), reaching the end of the BLOCKS
+    // section: it carries blocks 2 and 4's pages as the holes between winners.
+    let block_ranges: Vec<_> = phase_two.iter().filter(|(r, _)| in_blocks(r)).collect();
     assert_eq!(
-        phase_two
-            .iter()
-            .filter(|(r, _)| in_blocks(r))
-            .collect::<Vec<_>>(),
-        vec![&(GetRange::Range(blocks_start, blocks_end), 5_544u64)],
-        "one coalesced range spans the whole BLOCKS section"
+        block_ranges.len(),
+        1,
+        "the winners' blocks coalesced into one range: {block_ranges:?}"
     );
+    assert_eq!(block_ranges[0].1, 5_544, "the coalesced range's wire bytes");
+    match block_ranges[0].0 {
+        GetRange::Range(_, end) => assert_eq!(end, blocks_end, "reaches the section end"),
+        other => panic!("expected a byte range, got {other:?}"),
+    }
     // Ratio of fetch-phase BLOCKS bytes to the winners' own pages, in basis
     // points to pin it without a float compare: 5544 / 2820 = 1.966, below 2.
     let ratio_bp = fetch_block_bytes * 10_000 / pages;
