@@ -642,7 +642,7 @@ pub(super) fn build_row_batch_filtered(
         .filter_map(|&p| kept.get(p).copied())
         .collect();
     let survivor_spans: Option<Vec<(usize, usize)>> = match &raw {
-        Some((_, spans)) => {
+        Some(RawAttrs { spans, .. }) => {
             charge.grow(survivors.len() * std::mem::size_of::<(usize, usize)>())?;
             Some(
                 survivors
@@ -660,7 +660,7 @@ pub(super) fn build_row_batch_filtered(
         None => None,
     };
     let decoded = match (&raw, &survivor_spans) {
-        (Some((entries, _)), Some(spans)) => Some(DecodedRaw { entries, spans }),
+        (Some(RawAttrs { entries, .. }), Some(spans)) => Some(DecodedRaw { entries, spans }),
         _ => None,
     };
     // Erasure already kept every survivor.
@@ -697,13 +697,20 @@ struct DecodedRaw<'o> {
     spans: &'o [(usize, usize)],
 }
 
+/// Decoded `attrs_raw` entries and, per row of the decoded [`RowSet`], the
+/// span of `entries` that row holds.
+struct RawAttrs {
+    entries: Vec<(String, AttrValue)>,
+    spans: Vec<(usize, usize)>,
+}
+
 /// What [`build_filter_columns`] resolved: the filter's columns over the
 /// unerased rows `kept` (view indices), and the `attrs_raw` entries it
 /// decoded with each chunk row's span, `None` when it decoded none.
 struct FilterPass {
     columns: Vec<ArrayRef>,
     kept: Vec<usize>,
-    raw: Option<(Vec<(String, AttrValue)>, Vec<(usize, usize)>)>,
+    raw: Option<RawAttrs>,
 }
 
 /// The first pass of [`build_row_batch_filtered`]: the columns of
@@ -786,7 +793,7 @@ fn build_filter_columns(
         None
     };
     let (raw_entries, spans) = match &raw {
-        Some((entries, spans)) => (entries.as_slice(), spans.as_slice()),
+        Some(raw) => (raw.entries.as_slice(), raw.spans.as_slice()),
         None => (&[][..], &[][..]),
     };
 
@@ -942,7 +949,7 @@ fn decode_raw(
     rows: RowSet<'_>,
     key: &str,
     charge: &mut ChunkCharge<'_>,
-) -> DFResult<(Vec<(String, AttrValue)>, Vec<(usize, usize)>)> {
+) -> DFResult<RawAttrs> {
     let mut entries: Vec<(String, AttrValue)> = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
     charge.grow(rows.len() * std::mem::size_of::<(usize, usize)>())?;
@@ -962,7 +969,7 @@ fn decode_raw(
         charge.grow(attrs_memory(added, entries.capacity() - capacity))?;
         spans.push((len, entries.len()));
     }
-    Ok((entries, spans))
+    Ok(RawAttrs { entries, spans })
 }
 
 /// The column at projection index `idx` of a declared or `attrs['k']` key
@@ -1057,15 +1064,22 @@ fn build_row_columns(
     let streams = &streams.attrs;
 
     // `spans[n]` is the `n`th row's `attrs_raw` entries in `overflow`.
-    let owned: (Vec<(String, AttrValue)>, Vec<(usize, usize)>);
-    let (overflow, spans): (&[(String, AttrValue)], &[(usize, usize)]) = match decoded {
-        Some(raw) => (raw.entries, raw.spans),
+    let owned: RawAttrs;
+    let decoded = match decoded {
+        Some(raw) => raw,
         None if view.has_attrs_raw_page() => {
             owned = decode_raw(&view, rows, shape.key, &mut charge)?;
-            (&owned.0, &owned.1)
+            DecodedRaw {
+                entries: &owned.entries,
+                spans: &owned.spans,
+            }
         }
-        None => (&[], &[]),
+        None => DecodedRaw {
+            entries: &[],
+            spans: &[],
+        },
     };
+    let (overflow, spans) = (decoded.entries, decoded.spans);
     let overflow_len: usize = spans.iter().map(|&(from, to)| to - from).sum();
     let max_overflow = spans.iter().map(|&(from, to)| to - from).max().unwrap_or(0);
 

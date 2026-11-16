@@ -599,7 +599,7 @@ Nothing in ADR-3326 changes:
 - **`<>` on a declared Bytes column.** Same reason: no profiled statement has it.
 - **I64 and Bool comparisons** (`"CounterID" = 62` and the rest of q37 to q43). They stay on the
   prune channel as decision 2 of this ADR describes. `prune_channel_filters_stay_inexact` pins
-  them (`logs_provider.rs:2600-2617`). The profile's shares for q37 to q40 rest on 11, 2, 0 and
+  them (`logs_provider.rs:2751`). The profile's shares for q37 to q40 rest on 11, 2, 0 and
   50 samples, which is noise. The mechanism extends to them, but that needs a measured reason.
   The I64 equality amendment below supplies that reason for `=` on a declared I64 column against
   an integer literal; the other I64 operators and Bool stay here.
@@ -868,16 +868,21 @@ Issue #4232 comment 6920855702: a c6a.4xlarge, the ClickBench tenant, 222 object
 3. **Row path order.** When a row-path chunk carries row filters, the scan:
    1. applies pending erasure, before any column is built, as today;
    2. builds only the columns the row filters read (`BoundRowFilters::reads`), for the chunk's
-      unerased rows;
+      unerased rows, with no per-row `attrs` merge: each filter column takes its value from the
+      row's last record cell of that name, else its stream's first entry, which is the cell the
+      merge would leave in the slot. Pending erasure reads the same per-key cells;
    3. evaluates the row filters on that batch;
    4. builds the whole build projection (the `attrs` map, every `attrs['k']` column, every other
       declared and fixed column) for the surviving rows only, with their row refs at their
-      unerased positions;
+      unerased positions, reusing the `attrs_raw` entries step 2 decoded, so each row's
+      `attrs_raw` cell is decoded once;
    5. builds nothing more for a chunk with no survivor, and emits nothing for it.
 
-   The emitted batch equals what building the chunk whole and then filtering it gives
+   A filter that reads the `attrs` map itself takes the whole build as its first pass. The
+   emitted batch equals what building the chunk whole and then filtering it gives
    (`filter_first_equals_build_then_filter`,
-   `row_path_builds_attrs_only_for_rows_the_row_filter_keeps`). The memory charge covers the
+   `row_path_builds_attrs_only_for_rows_the_row_filter_keeps`), and the merge runs only for the
+   survivors (`the_row_filters_first_pass_runs_no_attrs_merge`). The memory charge covers the
    first build's batch while the second build runs, and each build charges its own working
    memory. Without row filters the build is unchanged. The columnar path keeps building and
    then filtering: its build reads cursors over decoded pages, with no `attrs` map or merged
@@ -890,11 +895,14 @@ Issue #4232 comment 6920855702: a c6a.4xlarge, the ClickBench tenant, 222 object
 The exact not-equal amendment's argument carries over. What it needs for this shape:
 
 1. **Same expression.** The scan evaluates the physical expression the session builds for
-   `c = v` against the full `logs` schema, the expression `FilterExec` would run. Comparison and
-   NULL semantics are DataFusion's.
-2. **Same values.** The column the filter reads is built by the code that builds `c` for
-   `FilterExec`'s input: the row path's merged view and `declared_cells_array`, the columnar
-   path's cursors. So the ADR-0090 resolution holds unchanged: the winning occurrence's `I64`
+   `c = Int64(v)` against the full `logs` schema. That is value-equal to the expression
+   `FilterExec` would run, which compares `c` with `v` at the width coercion left it at: both
+   sides widen losslessly to `Int64`. Comparison and NULL semantics are DataFusion's
+   (`extreme_values_and_narrow_literals_match_filter_exec`).
+2. **Same values.** The column the filter reads is built from the cell the build of `c` for
+   `FilterExec`'s input picks: on the row path, the cell the merged view would leave in the slot
+   (row path order, step 2), rendered by `declared_cells_array`; on the columnar path, its
+   cursors. So the ADR-0090 resolution holds unchanged: the winning occurrence's `I64`
    cell, NULL when the winner has another type, else the stream's resource or scope value, else
    NULL. A row's value depends only on its own cells and its stream's attributes, not on which
    other rows or columns the build holds, so building the filter column alone for the chunk and
@@ -935,6 +943,9 @@ class. A ratio from 2 to 3 is neither inside the band nor a miss; it is recorded
 | Q48 rows returned | 4 | any other count | measured 4 before the change, #4232 comment 6920855702 |
 | `FilterExec` in Q48's and Q47's plans | absent | present | predicted |
 | Q48 `attrs_rows_built` summed over the scan | equal to Q48's rows returned | any other value | predicted |
+| q11-q15, q25-q29 hot wall ratio after this change (the Str `<>` moved into the scan, FilterExec gone) | 0.98 to 1.02, unchanged | outside 0.98 to 1.02 | predicted; their row filter now runs filter-first on the row path (row path order) and their columnar path is unchanged; existing band from the exact not-equal amendment's Bands table |
+| q31, q32 hot wall ratio after this change | at most 1.02, unchanged | above 1.02 | predicted; same mechanism; existing band from the exact not-equal amendment's Bands table |
+| q22, q23, q37, q38 hot wall ratio after this change (the Str `<>` in the scan, FilterExec stays) | 0.98 to 1.02, unchanged | outside 0.98 to 1.02 | predicted; same mechanism; existing band from the exact not-equal amendment's Bands table |
 
 ### Not established
 

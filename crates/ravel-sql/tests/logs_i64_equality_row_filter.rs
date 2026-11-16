@@ -555,7 +555,10 @@ async fn limit_and_top_k_statements_match_filter_exec() {
                 let (_, want) = run(&off, &sql).await;
                 assert_eq!(pretty(&got), pretty(&want), "the reference answer: {sql}");
                 assert_eq!(row_count(&got), 3, "{sql}");
-                assert!(nodes(&plan, "FilterExec").is_empty(), "{sql}: no FilterExec");
+                assert!(
+                    nodes(&plan, "FilterExec").is_empty(),
+                    "{sql}: no FilterExec"
+                );
                 if sql.starts_with("SELECT *") {
                     let shown = format!("{}", displayable(plan.as_ref()).indent(true));
                     assert!(
@@ -568,7 +571,10 @@ async fn limit_and_top_k_statements_match_filter_exec() {
             for projection in ["*", "ts, uid, attrs"] {
                 let sql = format!("SELECT {projection} FROM logs WHERE uid = {lit} LIMIT 3");
                 let (plan, got) = run(&on, &sql).await;
-                assert!(nodes(&plan, "FilterExec").is_empty(), "{sql}: no FilterExec");
+                assert!(
+                    nodes(&plan, "FilterExec").is_empty(),
+                    "{sql}: no FilterExec"
+                );
                 let scans = nodes(&plan, "LogsScanExec");
                 assert!(
                     scans.iter().any(|scan| scan.fetch().is_some()),
@@ -627,7 +633,9 @@ async fn key_index_and_decoded_cache_runs_match_filter_exec() {
                 };
                 [
                     format!("SELECT ts, uid FROM logs WHERE uid = {lit} ORDER BY ts"),
-                    format!("SELECT ts, uid, region, attrs FROM logs WHERE uid = {lit} ORDER BY ts"),
+                    format!(
+                        "SELECT ts, uid, region, attrs FROM logs WHERE uid = {lit} ORDER BY ts"
+                    ),
                     format!("SELECT count(*) AS c FROM logs WHERE uid = {lit}"),
                 ]
             })
@@ -644,7 +652,10 @@ async fn key_index_and_decoded_cache_runs_match_filter_exec() {
                     pretty(&want),
                     "the reference answer ({pass}, {max_dynamic_columns}): {sql}"
                 );
-                assert!(nodes(&plan, "FilterExec").is_empty(), "{sql}: no FilterExec");
+                assert!(
+                    nodes(&plan, "FilterExec").is_empty(),
+                    "{sql}: no FilterExec"
+                );
                 key_pruned += scan_metric(&plan, "segments_pruned_by_key_index")
                     + scan_metric(&plan, "blocks_pruned_by_key_index");
             }
@@ -754,7 +765,10 @@ async fn a_block_whose_uid_comes_only_from_the_resource_is_not_lost() {
                 "SELECT ts, uid, attrs FROM logs WHERE uid = 7 ORDER BY ts",
             ] {
                 let (plan, got) = run(&on, sql).await;
-                assert!(nodes(&plan, "FilterExec").is_empty(), "{sql}: no FilterExec");
+                assert!(
+                    nodes(&plan, "FilterExec").is_empty(),
+                    "{sql}: no FilterExec"
+                );
                 assert_eq!(
                     timestamps(&got),
                     [2, 3, 4, 5],
