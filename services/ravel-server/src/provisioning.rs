@@ -40,7 +40,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
-use ravel_catalog::{AbsentPolicy, ProvisioningCheck, ProvisioningError, validate_or_adopt};
+use ravel_catalog::compat::CompatView;
+use ravel_catalog::{
+    AbsentPolicy, ProvisioningCheck, ProvisioningError, validate_or_adopt, validate_or_adopt_fenced,
+};
 use ravel_ingest::ReadBackoff;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{Signal, TenantHash, TenantId};
@@ -184,6 +187,10 @@ pub struct ProvisioningRecordWriter {
     read_backoff: Mutex<ReadBackoff<(TenantHash, Signal)>>,
     /// The hard failure of each backed-off key whose last check failed hard.
     hard_failures: Mutex<HashMap<(TenantHash, Signal), ProvisioningError>>,
+    /// The process's `sys/compat` view. Once it has seen an activation
+    /// (`compat_epoch > 0`), a record this writer creates is born fenced at
+    /// that epoch (ADR-4233 decision 4).
+    compat: Option<CompatView>,
 }
 
 impl ProvisioningRecordWriter {
@@ -194,7 +201,27 @@ impl ProvisioningRecordWriter {
             seen: Mutex::new(HashSet::new()),
             read_backoff: Mutex::new(ReadBackoff::new()),
             hard_failures: Mutex::new(HashMap::new()),
+            compat: None,
         }
+    }
+
+    /// Create records born fenced once `view` has seen an activation: the
+    /// first touch of a new (tenant, signal) after an activation writes its
+    /// record at version 4 with the view's `compat_epoch` and
+    /// `compat_fenced_unix_ns` 0 (ADR-4233 decision 4, conditional
+    /// publication). Before any activation, and with `None`, a first touch
+    /// creates the version-3 record it always has.
+    pub fn with_compat_view(mut self, view: Option<CompatView>) -> Self {
+        self.compat = view;
+        self
+    }
+
+    /// The epoch a record created now is born fenced at: the view's seen
+    /// `compat_epoch`, `None` before any activation.
+    fn born_fenced_epoch(&self) -> Option<std::num::NonZeroU64> {
+        self.compat
+            .as_ref()
+            .and_then(|view| std::num::NonZeroU64::new(view.seen_epoch()))
     }
 
     /// Ensure the (tenant, signal) provisioning record on a first write.
@@ -242,13 +269,14 @@ impl ProvisioningRecordWriter {
                 None => return Ok(()),
             }
         }
-        match validate_or_adopt(
+        match validate_or_adopt_fenced(
             self.store.as_ref(),
             tenant_hash,
             signal,
             self.shard_count,
             now_ns,
             AbsentPolicy::CreateFromConfig,
+            self.born_fenced_epoch(),
         )
         .await
         {
