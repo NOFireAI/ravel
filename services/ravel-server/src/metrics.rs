@@ -5877,6 +5877,9 @@ pub struct MaintenanceSafetySnapshot {
     /// [`ravel_maintain::retention::held_by_lease_buckets_total`], read at
     /// scrape time. Not signal-scoped: ravel-maintain keeps one total.
     pub retention_held_by_lease_buckets: u64,
+    /// [`ravel_maintain::retention::unaddressable_held_buckets_total`], read at
+    /// scrape time. Not signal-scoped: ravel-maintain keeps one total.
+    pub retention_unaddressable_held_buckets: u64,
     /// [`ravel_maintain::buckets_held_out_of_window_total`], read at scrape
     /// time. Not signal-scoped: ravel-maintain keeps one total.
     pub compaction_held_out_of_window_buckets: u64,
@@ -5926,6 +5929,8 @@ impl MaintenanceSafetySnapshot {
                 ravel_maintain::retention::held_out_of_window_objects_total(),
             retention_held_by_lease_buckets: ravel_maintain::retention::held_by_lease_buckets_total(
             ),
+            retention_unaddressable_held_buckets:
+                ravel_maintain::retention::unaddressable_held_buckets_total(),
             compaction_held_out_of_window_buckets: ravel_maintain::buckets_held_out_of_window_total(
             ),
             compaction_refused: ravel_maintain::CompactionRefusedReason::ALL
@@ -6068,6 +6073,23 @@ fn render_maintain_safety_family(
         "ravel_maintain_retention_held_by_lease_buckets_total",
         &[Label::Mode(mode)],
         snapshot.retention_held_by_lease_buckets,
+    );
+
+    write_header(
+        out,
+        "ravel_maintain_retention_unaddressable_held_buckets_total",
+        "Tombstoned buckets the retention sweep kept because its verifying listing found a key \
+         under the bucket's commit or l1 prefix that the store cannot address, counted once per \
+         bucket per pass, summed over every signal since process start (issue #4260). The \
+         tombstone stays and the bucket is revisited next pass. Must not stay nonzero: inspect \
+         the keys under the bucket's prefixes, which the sweep's warning names.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_retention_unaddressable_held_buckets_total",
+        &[Label::Mode(mode)],
+        snapshot.retention_unaddressable_held_buckets,
     );
 
     write_header(
@@ -15650,6 +15672,7 @@ mod tests {
             erasure_unwritable_objects: Vec::new(),
             retention_held_out_of_window_objects: 15,
             retention_held_by_lease_buckets: 16,
+            retention_unaddressable_held_buckets: 36,
             compaction_held_out_of_window_buckets: 31,
             compaction_refused: vec![
                 (ravel_maintain::CompactionRefusedReason::Geometry, 32),
@@ -15760,6 +15783,18 @@ mod tests {
                 "ravel_maintain_retention_held_by_lease_buckets_total{mode=\"maintain\"} 16\n"
             ),
             "missing retention_held_by_lease_buckets sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_retention_unaddressable_held_buckets_total{mode=\"maintain\"} 36\n"
+            ),
+            "missing retention_unaddressable_held_buckets sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "# TYPE ravel_maintain_retention_unaddressable_held_buckets_total counter\n"
+            ),
+            "missing retention_unaddressable_held_buckets TYPE line:\n{body}"
         );
         assert!(
             body.contains(
@@ -17357,6 +17392,7 @@ mod tests {
             )],
             retention_held_out_of_window_objects: 1,
             retention_held_by_lease_buckets: 1,
+            retention_unaddressable_held_buckets: 1,
             compaction_held_out_of_window_buckets: 1,
             compaction_refused: ravel_maintain::CompactionRefusedReason::ALL
                 .iter()

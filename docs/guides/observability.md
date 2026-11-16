@@ -1293,7 +1293,7 @@ Labels: `mode`.
 
 ### Maintenance safety
 
-Labels: `mode` and `signal`, with nine exceptions. No series carries a
+Labels: `mode` and `signal`, with ten exceptions. No series carries a
 `tenant_hash` label.
 
 | Series | Labels |
@@ -1301,6 +1301,7 @@ Labels: `mode` and `signal`, with nine exceptions. No series carries a
 | `ravel_maintain_legal_hold_refresh_failures_total` | `mode` only. |
 | `ravel_maintain_retention_held_out_of_window_objects_total` | `mode` only. |
 | `ravel_maintain_retention_held_by_lease_buckets_total` | `mode` only. |
+| `ravel_maintain_retention_unaddressable_held_buckets_total` | `mode` only. |
 | `ravel_maintain_buckets_held_out_of_window_total` | `mode` only. |
 | `ravel_maintain_objects_deleted_total` | `mode` and `kind`, no `signal`. |
 | `ravel_maintain_catalog_objects_deleted_total` | `mode` and `kind`, no `signal`. |
@@ -1313,6 +1314,7 @@ Labels: `mode` and `signal`, with nine exceptions. No series carries a
 | `ravel_maintain_legal_hold_refresh_failures_total` | Legal-hold refresh failures. Each one skips that tenant's whole maintenance tick. |
 | `ravel_maintain_retention_held_out_of_window_objects_total` | Data objects the retention sweep declined to delete because their format version is outside this build's reader window, counted once per object per pass and summed over every signal. The whole bucket keeps its tombstone and nothing in it is deleted that pass. The query-audit age sweep adds to it too: an expired audit object outside the window holds its whole ingest hour, and each held object is counted. A rising total means retention is holding data past its window: finish the upgrade, complete `maintain migrate`, or roll back. See [maintenance](operations/maintenance.md#the-format-version-hold). |
 | `ravel_maintain_retention_held_by_lease_buckets_total` | Tombstoned buckets the retention sweep declined to touch because a lease or legal hold protects a key it would delete, counted once per bucket per pass and summed over every signal. It rises for as long as a hold stands, so a rise is not by itself a fault. See [maintenance](operations/maintenance.md#retention-under-a-hold). |
+| `ravel_maintain_retention_unaddressable_held_buckets_total` | Tombstoned buckets the retention sweep kept because its verifying listing found a key under the bucket's commit or `l1/` prefix that the store cannot address, counted once per bucket per pass and summed over every signal. It must not stay nonzero: inspect the keys under the bucket's prefixes, which the sweep's warning names. |
 | `ravel_maintain_buckets_held_out_of_window_total` | Buckets compaction left uncompacted because an input object's format version is outside this build's reader window and its bytes match its commit record's content hash, counted once per bucket per pass and summed over every signal. Later hours still compact, the bucket is retried every pass, and the unit is not counted as stalled. An input whose bytes do not match its content hash is corruption and fails the scan instead. The counter resets on restart, so alert on an increase, not on a level: a rising total means an upgrade is unfinished, and rolling back does not clear it. See [maintenance](operations/maintenance.md#an-input-outside-this-builds-reader-window). |
 | `ravel_maintain_l0_records_pending` | Gauge. L0 commit records sitting below `min_compaction_inputs` in a sealed bucket, by signal, summed over every tenant and shard this process maintains. |
 | `ravel_maintain_objects_deleted_total` | Objects the sweep physically deleted, by `kind`: `superseded_records_deleted`, `superseded_data_deleted`, `unreferenced_parts_deleted`, `quarantine_reaped`. |
