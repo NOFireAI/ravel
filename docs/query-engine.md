@@ -7386,11 +7386,27 @@ flighted and corruption-gated per ADR-0046 decisions 3-5.
 
 ### Startup warm-up of logs metadata
 
-Before `/readyz` latches, `cache_warm::warm_cache` reads the 4 most recent
-parts of each (tenant, signal) whole, then, once every tenant's whole-part
-warm has finished, runs a logs metadata pass (ADR-4203 decision 8). The
-order keeps one tenant's pass from spending the deadline a later tenant's
-whole-part warm needs. The whole-part warm is unchanged: it still reads an
+Before `/readyz` latches, `cache_warm::warm_cache` discovers the tenants,
+resolves every tenant's warm set for both signals, and then runs two steps
+concurrently: the whole-part warm, which reads the 4 most
+recent parts of each (tenant, signal) whole, and a logs metadata pass
+(ADR-4203 decision 8). The whole-part warm takes tenants in discovery order
+and fetches one tenant's metric and logs parts concurrently, at most 2 parts
+of each signal at once (`WHOLE_PARTS_IN_FLIGHT_PER_SIGNAL`), each GET through
+the shared store GET limiter. The metadata pass runs on its own future and
+reads at most one object fewer than the limiter's permit count at once (at
+least one). With at least 2 permits one permit stays free of the pass, so
+one tenant's pass does not hold back a later tenant's whole-part warm; with
+1 permit the pass reads on the only permit, and a hung probe holds it until
+the deadline.
+
+The whole-part warm holds to the cache budget minus the pass's ceiling
+(below). Each part reserves its object size before its fetch starts and is
+skipped when it does not fit what is left; once the fetch completes, the
+reservation becomes the bytes the fetch read from the store. Together the two
+steps insert no more than `--cache-max-bytes`, so neither evicts entries the
+other counted, as long as the pass stays inside its ceiling (see Bounds for
+when it can end above it). The whole-part warm's reads are unchanged: it still reads an
 object at or under 512 KiB in one whole-object GET keyed `(0, object_size)`,
 and at the default thresholds (`logs_block_range_threshold` 512 KiB, so
 `plan_whole_object_bound` is at least 512 KiB) that is the key the query
@@ -7439,12 +7455,13 @@ Which first statements hit those entries:
   missing SKIP_IDX and PAGE_DIR, it is coalesced into the same read, and that
   read's extent differs from the pass's and misses the cache.
 
-Bounds. The pass runs inside the warm-up's 10-second deadline, in whatever
-time the whole-part warm leaves. Its ceiling is half of `--cache-max-bytes`,
+Bounds. The pass runs inside the warm-up's 10-second deadline, beside the
+whole-part warm; one deadline bounds discovery, resolution and both steps.
+Its ceiling is half of `--cache-max-bytes`,
 charged only with the bytes the pass's own reads fetch from the store,
 including the reads of an object whose read then fails. The whole-part
-warm's residents do not count against it, so a whole-part warm that alone
-fills more than half the cache does not stop the pass, and an object whose
+warm's residents do not count against it, so a whole-part warm that fills
+its own share does not stop the pass, and an object whose
 probe and directories are already cached charges nothing. It admits an
 object only while the charged bytes, plus the probe lengths of the objects
 in flight, plus its own probe length stay within the ceiling. An object that
@@ -7452,13 +7469,23 @@ does not fit waits for the reads in flight; one that does not fit beside the
 completed reads alone ends the pass for every later tenant too, and startup
 continues. The admission check counts an in-flight object's probe length,
 not the directory reads after it, so the bytes the pass fetches can end
-above the ceiling when directories reach past the probe. At most the store
-GET concurrency's permit count of objects is read at once. A failed read
-skips that object.
+above the ceiling when directories reach past the probe. At most one object
+fewer than the store GET concurrency's permit count (at least one) is read
+at once. A failed read skips that object.
 
 The `cache warmup: pass complete` log line reports `metadata_objects_warmed`,
 `metadata_bytes_warmed` (bytes fetched from the store) and
-`metadata_budget_reached` beside `parts_warmed`. When the pass runs, a
+`metadata_budget_reached` beside `parts_warmed`, and the milliseconds each
+step took: `tenant_discovery_elapsed_ms`, `part_resolution_elapsed_ms`,
+`whole_part_warm_elapsed_ms` and `metadata_pass_elapsed_ms`. When the
+deadline fires first, the deadline warning reports `parts_warmed`,
+`metadata_objects_warmed` and `metadata_bytes_warmed` as warmed so far, and
+`step`, the comma-separated steps still running. Both lines also report
+`metadata_get_permits`, the pass's concurrency, and
+`whole_part_bytes_reserved`, the bytes the whole-part warm holds against its
+share. Each per-(tenant, signal) `cache warmup: warmed tenant signal` line
+reports `parts_over_budget`, the parts skipped because they did not fit that
+share. When the pass runs, a
 `cache warmup: warmed tenant logs metadata` line reports the first two for
 each tenant that has an object above the bound.
 
@@ -7475,14 +7502,19 @@ STREAM_DIR and FIELD_DIR start before the probe
 first statement issues no footer GET and no directory GET, where an unwarmed
 run issues one probe and two directory reads per object. Two more tests pin
 the bounds: `the_metadata_warm_stops_at_the_cache_budget` (footer GETs equal
-the objects the pass did not reach, under a ceiling the whole-part warm's
-residents alone exceed) and
+the objects the pass did not reach, and the cache holds exactly the whole
+parts that fit their share plus the admitted probes) and
 `a_failed_metadata_read_skips_only_that_object`. In `cache_warm.rs`,
 `a_metadata_pass_that_spends_the_deadline_leaves_later_whole_part_warms_intact`
 pins the order, and `the_metadata_ceiling_counts_only_the_pass_s_own_bytes`
 pins the ceiling to the byte: with the whole-part warm's residents above
 the ceiling, a ceiling equal to the sizes of the two objects the pass
 fetches admits both, and one byte less admits one.
+`the_whole_part_warm_reads_at_most_two_parts_per_signal_at_once` pins the
+in-flight bound, and
+`the_whole_part_warm_leaves_every_counted_metadata_entry_resident` pins the
+share: on a cache smaller than two tenants' whole parts, every probe the pass
+counted is still cached after the warm.
 
 See docs/guides/caching.md for CLI flags, metrics, and known gaps, and
 docs/adrs/0046-read-cache-tier.md for the funnel/keying/eviction design

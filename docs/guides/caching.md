@@ -406,15 +406,30 @@ first real query after a restart then does not pay the full cold cost.
 
 For logs it also reads the footer and directories of every log segment in the
 same warm set that a query plans from its directories, without the segment's
-column pages. This metadata pass runs after every tenant's most recent
-segments are warmed. A first log query that plans from those directories, or
+column pages. Warmup first finds every tenant's warm set, then reads the
+most recent segments whole and runs this metadata pass at the same time, so a
+tenant with many log segments gets its metadata read even while its whole
+segments are still loading. A first log query that plans from those directories, or
 opens such a segment by range, then reads its footer from the cache instead
 of storage; a query that reads a whole segment in one request, or that also
 needs the segment's key index, bloom or postings, gains less or nothing. The
 pass's ceiling is half of `--cache-max-bytes`, counting only the bytes the
-pass itself fetches from storage, not the segments warmed whole before it. It
+pass itself fetches from storage, not the segments warmed whole. It
 stops when the next segment's footer read would not fit beside what it has
-fetched; directory reads past that footer read can take it somewhat above.
+fetched and the footer reads still in flight; directory reads past a footer
+read can take it somewhat above.
+
+The segments read whole hold to the other half of `--cache-max-bytes`. A
+segment that does not fit what is left of that half is skipped, so the two
+together do not fill the cache past its size and evict what the other warmed.
+Warmup reads at most 2 segments of each signal of a tenant whole at once.
+
+The metadata pass reads at most one segment fewer at once than the store's
+GET concurrency (at least one). With a GET concurrency of 2 or more, one
+request stays free for the whole-segment reads, so a tenant whose metadata
+reads hang does not hold back a later tenant's whole segments. With a GET
+concurrency of 1 the pass uses the only request, and one hung read holds it
+until the time budget runs out.
 docs/query-engine.md, "Startup warm-up of logs metadata", has the details.
 
 "Most recent" means most recently ingested, measured from the latest ingest
@@ -427,9 +442,9 @@ warmed the same way as one ingesting live data.
 
 Warmup is best-effort:
 
-- It has an overall time budget. If storage is slow or a tenant list is large,
-  warmup stops early and the process still becomes ready. It starts with a
-  smaller warm set.
+- It has an overall time budget of 10 seconds, covering every step. If
+  storage is slow or a tenant list is large, warmup stops early and the
+  process still becomes ready. It starts with a smaller warm set.
 - A failure to warm one tenant or one segment is logged and skipped. It never
   fails startup.
 
@@ -443,11 +458,13 @@ the log lines of the `cache_warm` module. Do not guess from query latency.
 tenant does not use never produces a `warn!` by itself.
 
 The per-(tenant, signal) line carries `tenant_hash`, `signal`, `parts_warmed`,
-and `latest_ingest_hour`. Its level is:
+`parts_over_budget` (segments skipped because they did not fit the whole
+segments' half of the cache) and `latest_ingest_hour`. Its level is:
 
 - `info!` normally.
 - `warn!` if the tenant has a live part for that signal but none of them
-  warmed, which means that a resolve or fetch failure lost the whole signal.
+  warmed and none was skipped for the cache share, which means that a resolve
+  or fetch failure lost the whole signal.
 
 `latest_ingest_hour` takes one of three values:
 
@@ -494,16 +511,33 @@ carries `metadata_objects_warmed` and `metadata_bytes_warmed`: the log
 segments whose footer and directories the pass read for that tenant, and the
 bytes it fetched from storage for them.
 
-One final `info!` at the end of the pass carries the total `parts_warmed`
-across every tenant and signal and the `elapsed_ms` of the pass. It also
-carries the totals `metadata_objects_warmed` and `metadata_bytes_warmed`, and
-`metadata_budget_reached`, which is `true` when the metadata pass stopped at
-its share of the cache rather than at the end of the window.
+One final `info!`, `cache warmup: pass complete`, carries the total
+`parts_warmed` across every tenant and signal and the `elapsed_ms` of the
+pass. It also carries the totals `metadata_objects_warmed` and
+`metadata_bytes_warmed`, and `metadata_budget_reached`, which is `true` when
+the metadata pass stopped at its share of the cache rather than at the end of
+the window, `metadata_get_permits`, the number of reads the metadata pass
+runs at once, and `whole_part_bytes_reserved`, the bytes the whole segments
+hold against their half of the cache. Four more fields say where the time
+went, in milliseconds:
+
+- `tenant_discovery_elapsed_ms`: listing the tenants.
+- `part_resolution_elapsed_ms`: finding every tenant's warm set.
+- `whole_part_warm_elapsed_ms`: reading the most recent segments whole.
+- `metadata_pass_elapsed_ms`: the logs metadata pass.
+
+The last two run at the same time, so they overlap and do not add up to
+`elapsed_ms`.
 
 - A restart whose log shows this final line warmed the cache.
 - A restart that hit the time budget never reaches it. It logs the `warn!`
-  that names the deadline instead. The per-(tenant, signal) lines up to that
-  point are whatever the pass warmed before it ran out of time.
+  that names the deadline instead. That warning carries `parts_warmed`,
+  `metadata_objects_warmed` and `metadata_bytes_warmed` as warmed when the
+  deadline hit, `metadata_get_permits` and `whole_part_bytes_reserved` as on
+  the final line, and `step`, the steps still running, comma-separated:
+  `tenant_discovery`, `part_resolution`, `whole_part_warm`, `metadata_pass`.
+  The per-(tenant, signal) lines up to that point are whatever the pass
+  warmed before it ran out of time.
 
 ## Metrics
 
