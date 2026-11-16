@@ -428,3 +428,111 @@ async fn order_by_ts_limit_reads_the_must_read_set_and_arms_the_threshold() {
         );
     }
 }
+
+/// The phase a `/api/v1/sql` response reports a figure under, summed over
+/// every `stats.phases` entry.
+fn phases_sum(value: &Value, field: &str) -> u64 {
+    value["stats"]["phases"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no phases in {value}"))
+        .iter()
+        .map(|p| {
+            p[field]
+                .as_u64()
+                .unwrap_or_else(|| panic!("phase.{field} is a u64 in {p}"))
+        })
+        .sum()
+}
+
+/// One `stats.phases` entry's figure, by phase name.
+fn phase_field(value: &Value, phase: &str, field: &str) -> u64 {
+    value["stats"]["phases"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no phases in {value}"))
+        .iter()
+        .find(|p| p["phase"] == phase)
+        .unwrap_or_else(|| panic!("no {phase} phase in {value}"))[field]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{phase}.{field} is a u64 in {value}"))
+}
+
+/// OBSERVABILITY (issue #797): a `SELECT *` TopK over `logs` runs late
+/// materialization, so phase 2's row fetch of the winners appears on the real
+/// `POST /api/v1/sql` surface as the `fetch` phase, with nonzero GETs, and
+/// every phase figure still sums to `stats.accounting`. This is the test that
+/// asserts the new report field reaches a client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn select_star_topk_reports_a_nonzero_fetch_phase_that_sums_to_accounting() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    for index in 0..OBJECTS {
+        publish_object(store.as_ref(), &tenant, index).await;
+    }
+    let (app, executor) = build_router(
+        store,
+        HashMap::from([("acme-token".to_string(), tenant.clone())]),
+    );
+
+    let sql = "SELECT * FROM logs ORDER BY ts LIMIT 10";
+    // The plan runs the phase-2 row fetch: without it there is no fetch phase
+    // to report. Checked through the executor because EXPLAIN is refused on the
+    // read-only endpoint.
+    let req = SqlRequest {
+        sql: sql.to_string(),
+        window: TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        },
+        min_tokens: Vec::new(),
+        now_ns: NOW_NS,
+        deadline: Duration::from_secs(60),
+        row_window: false,
+        max_rows: None,
+        budgets: None,
+    };
+    let plan = executor
+        .explain(tenant.hash(), &req)
+        .await
+        .unwrap_or_else(|e| panic!("explain failed: {e}"))
+        .plan_text;
+    assert!(
+        plan.contains("LogsRowFetchExec"),
+        "SELECT * TopK must run late materialization:\n{plan}"
+    );
+
+    let value = post_json(&app, sql).await;
+
+    let names: Vec<&str> = value["stats"]["phases"]
+        .as_array()
+        .expect("phases array")
+        .iter()
+        .map(|p| p["phase"].as_str().expect("phase name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["resolve", "plan", "probe", "scan", "keyIndex", "fetch"],
+        "{value}"
+    );
+
+    assert!(
+        phase_field(&value, "fetch", "s3GetRequests") > 0,
+        "the fetch phase carries phase 2's GETs: {value}"
+    );
+
+    // Every phase figure still sums to the pooled `stats.accounting` block:
+    // moving phase 2 onto its own phase moved no byte or request out of the
+    // total. (phase field name -> accounting field name.)
+    for (phase_key, acc_key) in [
+        ("s3GetRequests", "s3GetRequests"),
+        ("s3GetWireBytes", "s3GetBytes"),
+        ("segmentsOpened", "segmentsOpened"),
+    ] {
+        assert_eq!(
+            phases_sum(&value, phase_key),
+            value["stats"]["accounting"][acc_key]
+                .as_u64()
+                .unwrap_or_else(|| panic!("accounting.{acc_key} is a u64 in {value}")),
+            "phases sum to accounting.{acc_key}: {value}"
+        );
+    }
+}

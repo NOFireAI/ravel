@@ -889,7 +889,8 @@ async fn log_selector_on_api_v1_query_counts_each_footer_once_under_plan() {
             ("plan", 2),
             ("probe", 0),
             ("scan", 0),
-            ("keyIndex", 0)
+            ("keyIndex", 0),
+            ("fetch", 0)
         ],
         "body: {body}"
     );
@@ -930,7 +931,8 @@ async fn two_log_selectors_on_api_v1_query_count_each_footer_once_per_selector()
             ("plan", 4),
             ("probe", 0),
             ("scan", 0),
-            ("keyIndex", 0)
+            ("keyIndex", 0),
+            ("fetch", 0)
         ],
         "body: {body}"
     );
@@ -950,7 +952,7 @@ fn phase_field(body: &JsonValue, name: &str, key: &str) -> u64 {
 
 /// `segmentsOpened` of every phase of a `/api/v1/query` response.
 fn segments_opened_by_phase(body: &JsonValue) -> Vec<(&'static str, u64)> {
-    ["resolve", "plan", "probe", "scan", "keyIndex"]
+    ["resolve", "plan", "probe", "scan", "keyIndex", "fetch"]
         .into_iter()
         .map(|name| (name, phase_field(body, name, "segmentsOpened")))
         .collect()

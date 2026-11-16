@@ -265,9 +265,9 @@ mod tests {
     use super::*;
 
     /// Every phase renders exactly once, in
-    /// `resolve`/`plan`/`probe`/`scan`/`keyIndex` order, with no phase missing
-    /// and none duplicated: a phase emitted twice or missing here fails a
-    /// client's per-phase sum the same way a wrong number does.
+    /// `resolve`/`plan`/`probe`/`scan`/`keyIndex`/`fetch` order, with no phase
+    /// missing and none duplicated: a phase emitted twice or missing here fails
+    /// a client's per-phase sum the same way a wrong number does.
     #[test]
     fn phase_costs_json_names_every_phase_exactly_once() {
         let phases = PhaseAccounting::new();
@@ -277,7 +277,10 @@ mod tests {
             .iter()
             .map(|e| e["phase"].as_str().expect("phase is a string"))
             .collect();
-        assert_eq!(names, vec!["resolve", "plan", "probe", "scan", "keyIndex"]);
+        assert_eq!(
+            names,
+            vec!["resolve", "plan", "probe", "scan", "keyIndex", "fetch"]
+        );
     }
 
     /// A query's per-phase requests and bytes sum back to the pooled total

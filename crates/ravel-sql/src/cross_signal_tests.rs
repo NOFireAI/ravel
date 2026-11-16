@@ -1421,17 +1421,18 @@ async fn stats_signals_sum_to_totals_per_phase() {
             )
         })
     };
-    // (GET, LIST) per phase, resolve/plan/probe/scan/keyIndex. Resolve: the
-    // catalog HEAD, the commit listing, the commit records and the deletion
+    // (GET, LIST) per phase, resolve/plan/probe/scan/keyIndex/fetch. Resolve:
+    // the catalog HEAD, the commit listing, the commit records and the deletion
     // listing; the metrics data objects are read while planning, the logs one
-    // while scanning.
+    // while scanning. Neither statement uses late materialization, so the fetch
+    // phase is zero.
     assert_eq!(
         per_phase(&samples_entry.phases),
-        [(3, 2), (2, 0), (0, 0), (0, 0), (0, 0)]
+        [(3, 2), (2, 0), (0, 0), (0, 0), (0, 0), (0, 0)]
     );
     assert_eq!(
         per_phase(&logs_entry.phases),
-        [(2, 2), (0, 0), (0, 0), (1, 0), (0, 0)]
+        [(2, 2), (0, 0), (0, 0), (1, 0), (0, 0), (0, 0)]
     );
 
     // (iv) Each entry's segments are its own lane's, and they sum to the

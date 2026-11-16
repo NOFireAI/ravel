@@ -1038,9 +1038,10 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
         "  Not the same quantity as page_bytes_fetched / page_bytes_decoded, which is stored over stored."
     );
     eprintln!(
-        "  {:<32} | {:>16} | {:>16} | {:>20} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13}",
+        "  {:<32} | {:>16} | {:>16} | {:>16} | {:>20} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13}",
         "id",
         "wire_bytes_scan",
+        "wire_bytes_fetch",
         "wire_bytes_probe",
         "wire_bytes_key_index",
         "wire_bytes_plan",
@@ -1051,8 +1052,8 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
         "amplification",
     );
     eprintln!(
-        "  {:-<32}-+-{:-<16}-+-{:-<16}-+-{:-<20}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<25}-+-{:-<13}",
-        "", "", "", "", "", "", "", "", "", ""
+        "  {:-<32}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<20}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<25}-+-{:-<13}",
+        "", "", "", "", "", "", "", "", "", "", ""
     );
     let phase = |acc: &RunAccounting, name: &str| {
         acc.wire_bytes_by_phase
@@ -1062,9 +1063,10 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
     };
     for (id, acc) in rows {
         eprintln!(
-            "  {:<32} | {:>16} | {:>16} | {:>20} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13.3}",
+            "  {:<32} | {:>16} | {:>16} | {:>16} | {:>20} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13.3}",
             id,
             phase(acc, "scan"),
+            phase(acc, "fetch"),
             phase(acc, "probe"),
             phase(acc, "keyIndex"),
             phase(acc, "plan"),
