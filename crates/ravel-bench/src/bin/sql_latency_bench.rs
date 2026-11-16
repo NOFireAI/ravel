@@ -999,7 +999,8 @@ fn print_open_shapes(report: &SqlLatencyReport) {
 }
 
 /// The cold run's fetch amplification and the per-phase wire bytes behind it
-/// (issue #913).
+/// (issue #913): `amp_scan` is [`RunAccounting::fetch_amplification`] and
+/// `amp_phase2` is [`RunAccounting::fetch_amplification_phase2`] (issue #797).
 ///
 /// Every label spells out which of the two byte kinds it is, because the block
 /// carries both and they cannot be summed or compared: `wire_bytes_*` is what
@@ -1014,7 +1015,7 @@ fn print_open_shapes(report: &SqlLatencyReport) {
 /// the split per run rather than aggregated over runs (issue #857).
 ///
 /// `get_pooled` is [`RunAccounting::object_store_get_bytes`], the pooled GET
-/// figure the five phase columns reconcile against, printed so the residual can
+/// figure the six phase columns reconcile against, printed so the residual can
 /// be read against the right denominator: `unattr` is defined against the
 /// all-kinds total, which also holds LIST bytes no phase can claim.
 /// [`ravel_bench::sql_latency::reconcile_run_accounting`] has already checked
@@ -1032,16 +1033,27 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
         return;
     }
     eprintln!(
-        "\n  fetch amplification, cold run: scan-phase WIRE bytes per STORED page byte decoded."
+        "\n  fetch amplification, cold run, one ratio per pass, each over the pages that pass decoded."
     );
     eprintln!(
-        "  Probe, PAGE_DIR, SKIP_IDX, KEY_IDX and directory bytes are the plan/probe/keyIndex phases, not the numerator."
+        "  amp_scan: scan-phase WIRE bytes (BLOCKS ranges only) per STORED page byte the scan decoded,"
     );
     eprintln!(
-        "  Not the same quantity as page_bytes_fetched / page_bytes_decoded, which is stored over stored."
+        "  page_stored_bytes_decoded minus decoded_fetch. Probe, PAGE_DIR, SKIP_IDX, KEY_IDX and directory"
+    );
+    eprintln!("  bytes are the plan/probe/keyIndex phases, not the numerator.");
+    eprintln!(
+        "  amp_phase2: fetch-phase WIRE bytes per STORED page byte late materialization's phase 2 decoded"
     );
     eprintln!(
-        "  {:<32} | {:>16} | {:>16} | {:>16} | {:>20} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13}",
+        "  (decoded_fetch). Its numerator includes phase 2's probe and section metadata reads, so it is not"
+    );
+    eprintln!("  comparable with amp_scan. 0 when phase 2 did not run.");
+    eprintln!(
+        "  Neither is the same quantity as page_bytes_fetched / page_bytes_decoded, which is stored over stored."
+    );
+    eprintln!(
+        "  {:<32} | {:>16} | {:>16} | {:>16} | {:>20} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>16} | {:>13} | {:>13}",
         "id",
         "wire_bytes_scan",
         "wire_bytes_fetch",
@@ -1052,11 +1064,13 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
         "wire_bytes_unattr",
         "wire_bytes_get_pooled",
         "page_stored_bytes_decoded",
-        "amplification",
+        "decoded_fetch",
+        "amp_scan",
+        "amp_phase2",
     );
     eprintln!(
-        "  {:-<32}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<20}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<25}-+-{:-<13}",
-        "", "", "", "", "", "", "", "", "", "", ""
+        "  {:-<32}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<20}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<25}-+-{:-<16}-+-{:-<13}-+-{:-<13}",
+        "", "", "", "", "", "", "", "", "", "", "", "", ""
     );
     let phase = |acc: &RunAccounting, name: &str| {
         acc.wire_bytes_by_phase
@@ -1066,7 +1080,7 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
     };
     for (id, acc) in rows {
         eprintln!(
-            "  {:<32} | {:>16} | {:>16} | {:>16} | {:>20} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13.3}",
+            "  {:<32} | {:>16} | {:>16} | {:>16} | {:>20} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>16} | {:>13.3} | {:>13.3}",
             id,
             phase(acc, "scan"),
             phase(acc, "fetch"),
@@ -1077,7 +1091,9 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
             acc.wire_bytes_unattributed,
             acc.object_store_get_bytes,
             acc.page_stored_bytes_decoded,
+            acc.page_stored_bytes_decoded_fetch,
             acc.fetch_amplification,
+            acc.fetch_amplification_phase2,
         );
     }
 }

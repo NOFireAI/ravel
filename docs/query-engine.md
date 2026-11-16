@@ -3625,7 +3625,7 @@ figure alone cannot say which stage is responsible for a runaway
 request count.
 
 `crates/ravel-query/src/phase_accounting.rs`'s `PhaseAccounting` wraps
-five independent `QueryAccounting` handles, one per phase, using this
+six independent `QueryAccounting` handles, one per phase, using this
 doc's own vocabulary:
 
 - **resolve** -- the catalog snapshot resolve's commit-record GETs
@@ -3657,16 +3657,24 @@ doc's own vocabulary:
   and each probe decodes them again. On a small bucket this figure can be
   below the wire bytes: the frame's 8-byte header and zstd framing outweigh
   a few entries.
+- **fetch** -- TopK late materialization's phase-2 row fetch of the winners
+  (ADR-0774, "TopK late materialization" below): every probe, footer, section
+  and page GET the winners' row fetch issues
+  (`LogSegmentFetcher::scan_accounted_with_tenant_subset` on
+  `ProbePhase::Fetch`), metadata and BLOCKS reads alike. Phase 1, the ordinary
+  scan that picks the winners, keeps charging `scan` and `probe`. The store's
+  GET latency histogram has no fetch slot, so these reads are timed there
+  under `scan`.
 
 Decode (turning fetched bytes into typed samples/rows) is deliberately
-not a sixth phase: it issues no store request, so it has nothing to
+not a seventh phase: it issues no store request, so it has nothing to
 attribute a request or wire-byte counter to. Its own byte figures
 (`decompressed_bytes`, `page_bytes_fetched`/`page_bytes_decoded`) stay on
-whichever handle its call site is passed -- by convention the `scan`
-handle, since decode always follows a scan in this crate's fetch
-pipelines.
+whichever handle its call site is passed -- by convention the handle of the
+read it follows: `scan` for an ordinary scan, `fetch` for the late
+materialization row fetch.
 
-`PhaseAccountingSnapshot::pooled()` sums all five phases back to one
+`PhaseAccountingSnapshot::pooled()` sums all six phases back to one
 pooled number: `QueryStats::accounting` is computed as
 `phase_accounting.pooled()`. `QueryStats` additionally carries the
 full `phase_accounting: PhaseAccountingSnapshot` for callers that want
@@ -4129,10 +4137,10 @@ Each entry has exactly four fields, rendered by `stats_json::signals_json`:
   (`Snapshot.segments_pruned`). It is reported per table only; `stats` has
   no statement total of it.
 - `phases`: the table's own cost in the same per-phase shape as
-  `stats.phases`: the same five phases in the same order, the same fields,
+  `stats.phases`: the same six phases in the same order, the same fields,
   rendered by the same `phase_costs_json`. ADR-2904 decision 7 lists four
-  phases; the entry carries `keyIndex` too because the same decision asks
-  for the same per-phase shape.
+  phases; the entry carries `keyIndex` and `fetch` too because the same
+  decision asks for the same per-phase shape.
 
 Every table's reads record into an accounting handle of its own, Parquet
 tables share one more, and a statement handle takes the charge that belongs
