@@ -23,7 +23,9 @@
 //!   for RLOG and RSPAN, the footer the trailer names).
 //!
 //! Every other key under the tenant is outside the census and counted as
-//! ignored.
+//! ignored. Keys outside `t/<h>/` are not listed at all: an object under
+//! `quarantine/` is never checked, so one restored from quarantine after
+//! init has not been checked against the read set.
 
 use std::collections::BTreeMap;
 
@@ -286,7 +288,9 @@ pub enum CompatInitError {
 
 /// Adopt the store: refuse an unkeyed store, return the existing record when
 /// it is the one `init` would write (and refuse when it differs), otherwise
-/// run the census and create `sys/compat` from it.
+/// run the census and create `sys/compat` from it. The census lists only
+/// `t/<h>/`; `quarantine/` is skipped, so an object restored from quarantine
+/// after init was never checked.
 pub async fn init_compat(
     store: &dyn ObjectStoreBackend,
     keys: Option<&CompatKeys>,
@@ -394,8 +398,9 @@ pub fn baseline_version(family: &str) -> Result<u32, CompatInitError> {
         family: family.to_string(),
     };
     match family {
-        // ADR-4233's inventory records kidx at the leaf format constant even
-        // though the fold writes a higher version for metrics.
+        // The leaf version the fold writes for every signal. Not
+        // `fold_write_version`, which names a higher metrics version than
+        // the fold emits.
         FAMILY_KIDX => Ok(KEY_INDEX_LEAF_FORMAT_VERSION),
         FAMILY_CATALOG_HEAD | FAMILY_CSNAP | FAMILY_NPOST | FAMILY_CSTAT => {
             let mut versions = SIGNALS

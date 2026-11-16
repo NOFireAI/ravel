@@ -246,7 +246,12 @@ async fn put_bucket_records(store: &dyn ObjectStoreBackend) -> [String; 3] {
         ..Default::default()
     };
     let compaction_key = keys::compaction_record_key_for(&compaction).expect("key");
-    put(store, &compaction_key, record::encode_compaction(&compaction)).await;
+    put(
+        store,
+        &compaction_key,
+        record::encode_compaction(&compaction),
+    )
+    .await;
 
     let inputs = vec![commitproto::CompactionInputIdentity {
         writer_id: Uuid::from_u128(9).to_string(),
@@ -397,7 +402,9 @@ async fn every_census_kind_adopts_in_window_and_refuses_out_of_window() {
     let (mem, [compaction_key, rewrite_key, tombstone_key]) = folded_store().await;
     let store = mem.as_ref();
 
-    let census = run_census(store).await.expect("the folded store is in window");
+    let census = run_census(store)
+        .await
+        .expect("the folded store is in window");
     let rseg = u32::from(ravel_segment::SegmentVersion::CURRENT.number());
     let rlog = u32::from(ravel_logseg::footer::WriteVersion::CURRENT.number());
     let rspan = u32::from(ravel_rspan::WriteVersion::CURRENT.number());
@@ -405,16 +412,25 @@ async fn every_census_kind_adopts_in_window_and_refuses_out_of_window() {
         ((FAMILY_RSEG, rseg), 1),
         ((FAMILY_RLOG, rlog), 1),
         ((FAMILY_RSPAN, rspan), 1),
-        ((FAMILY_CATALOG_HEAD, ravel_catalog::HEAD_FORMAT_VERSION_1), 3),
+        (
+            (FAMILY_CATALOG_HEAD, ravel_catalog::HEAD_FORMAT_VERSION_1),
+            3,
+        ),
         ((FAMILY_CSNAP, u32::from(ravel_catalog::VERSION)), 3),
         // Postings are built for metrics only.
         ((FAMILY_NPOST, 1), 1),
         ((FAMILY_CSTAT, 3), 3),
         ((FAMILY_KIDX, KEY_INDEX_LEAF_FORMAT_VERSION), 3),
         ((FAMILY_COMMIT_RECORD, record::FORMAT_VERSION), 3),
-        ((FAMILY_COMPACTION_RECORD, record::COMPACTION_FORMAT_VERSION), 1),
+        (
+            (FAMILY_COMPACTION_RECORD, record::COMPACTION_FORMAT_VERSION),
+            1,
+        ),
         ((FAMILY_REWRITE_RECORD, erasure::FORMAT_VERSION), 1),
-        ((FAMILY_RETENTION_TOMBSTONE, record::TOMBSTONE_FORMAT_VERSION), 1),
+        (
+            (FAMILY_RETENTION_TOMBSTONE, record::TOMBSTONE_FORMAT_VERSION),
+            1,
+        ),
     ]
     .into_iter()
     .map(|((family, version), count)| ((family.to_string(), version), count))
@@ -426,8 +442,8 @@ async fn every_census_kind_adopts_in_window_and_refuses_out_of_window() {
         let key = data_key(store, signal).await;
         restamp_trailer(store, &key, u16::MAX).await;
         assert_single_finding(store, Some(signal), family, u32::from(u16::MAX), &key).await;
-        let current = u16::try_from(if signal == Signal::Logs { rlog } else { rspan })
-            .expect("u16 version");
+        let current =
+            u16::try_from(if signal == Signal::Logs { rlog } else { rspan }).expect("u16 version");
         restamp_trailer(store, &key, current).await;
     }
 
@@ -492,9 +508,17 @@ async fn every_census_kind_adopts_in_window_and_refuses_out_of_window() {
         .expect("compaction");
     rec.format_version = 99;
     let bytes = rec.encode_to_vec();
-    refuses_alone(store, &compaction_key, bytes, m, FAMILY_COMPACTION_RECORD, 99).await;
-    let mut rec = commitproto::RewriteRecord::decode(get_bytes(store, &rewrite_key).await)
-        .expect("rewrite");
+    refuses_alone(
+        store,
+        &compaction_key,
+        bytes,
+        m,
+        FAMILY_COMPACTION_RECORD,
+        99,
+    )
+    .await;
+    let mut rec =
+        commitproto::RewriteRecord::decode(get_bytes(store, &rewrite_key).await).expect("rewrite");
     rec.format_version = 99;
     let bytes = rec.encode_to_vec();
     refuses_alone(store, &rewrite_key, bytes, m, FAMILY_REWRITE_RECORD, 99).await;
@@ -502,7 +526,15 @@ async fn every_census_kind_adopts_in_window_and_refuses_out_of_window() {
         .expect("tombstone");
     rec.format_version = 99;
     let bytes = rec.encode_to_vec();
-    refuses_alone(store, &tombstone_key, bytes, m, FAMILY_RETENTION_TOMBSTONE, 99).await;
+    refuses_alone(
+        store,
+        &tombstone_key,
+        bytes,
+        m,
+        FAMILY_RETENTION_TOMBSTONE,
+        99,
+    )
+    .await;
 
     // Every object is back in window.
     assert_eq!(run_census(store).await.expect("restored").adopted, adopted);
@@ -548,7 +580,9 @@ async fn kidx_census_reads_every_version_the_signal_decodes() {
     };
     restamp(catalog_key(store, Signal::Logs, ".kidx").await, 1).await;
     restamp(catalog_key(store, Signal::Metrics, ".kidx").await, 3).await;
-    let census = run_census(store).await.expect("logs v1 and metrics v3 pass");
+    let census = run_census(store)
+        .await
+        .expect("logs v1 and metrics v3 pass");
     let kidx: Vec<(u32, u64)> = census
         .adopted
         .iter()
