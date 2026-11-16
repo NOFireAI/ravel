@@ -92,8 +92,154 @@ fi
 grep -qF "late fenced t/$H/s/c/0000/20261116T21/x.cmt 2026-11-16T22:01:01.000Z" "$TMP/late-fail" \
   && ok "late commit record named with its LastModified" || bad "late commit record missing: $(cat "$TMP/late-fail")"
 grep -qF "late fenced t/$H/l/admission/p.snapshot 2026-11-16T22:05:00.000Z" "$TMP/late-fail" \
-  && ok "overwrite past the horizon is a late write" || bad "overwrite missing: $(cat "$TMP/late-fail")"
+  && ok "overwrite past the horizon is a late write with no exempt list" || bad "overwrite missing: $(cat "$TMP/late-fail")"
 [ "$(grep -c . "$TMP/late-fail")" -eq 2 ] && ok "exactly two late writes" || bad "late count $(grep -c . "$TMP/late-fail")"
+
+# The shipped exempt list, read from the drill itself.
+eval "$(grep '^EXEMPT_PATTERNS=' "$HERE/released-binary-drill.sh")"
+[ -n "${EXEMPT_PATTERNS:-}" ] && ok "drill defines EXEMPT_PATTERNS" || bad "no EXEMPT_PATTERNS in the drill"
+for case in \
+  "t/$H/m/admission/0f3c.snapshot yes" \
+  "t/$H/l/admission/0f3c.snapshot yes" \
+  "t/$H/s/admission/0f3c.snapshot yes" \
+  "t/$H/m/maint/scrub/0000.cursor yes" \
+  "t/$H/l/maint/scrub/0003.cursor yes" \
+  "t/$H/s/maint/scrub/0001.cursor yes" \
+  "t/$H/m/admission/x/0f3c.snapshot no" \
+  "t/$H/m/maint/scrub/x/0000.cursor no" \
+  "t/$H/m/maint/0001/cursor no" \
+  "t/$H/m/meta no" \
+  "t/$H/m/prov no" \
+  "t/$H/m/l0/0000/w.1.00000000000000000001.0011223344556677.rseg no" \
+  "t/$H/m/c/0000/20261116T22/w.1.00000000000000000001.cmt no" \
+  "t/$H/l/idem/k.20261116T22.idm no" \
+  "t/$H/catalog/m/HEAD no" \
+  "t/$H/a/alert-lease no" \
+  "t/$H/a/state/latest no" \
+  "t/$H/u/maint/0001/cursor no" \
+  "t/$OTHER/m/admission/0f3c.snapshot no"; do
+  set -- $case
+  if drill_exempt "$1" "$H" "$EXEMPT_PATTERNS"; then got=yes; else got=no; fi
+  [ "$got" = "$2" ] && ok "exempt $1 = $2" || bad "exempt $1 = $got, want $2"
+done
+
+# Narrowed rule: with the shipped list, the late admission overwrite is an
+# exempt write recorded with its LastModified, and the late commit record
+# still fails.
+if drill_late_writes "$TMP/w-fail" "$H" "$HORIZON" "$ALERTS" "$EXEMPT_PATTERNS" > "$TMP/ev-fail"; then
+  bad "non-exempt post-horizon commit record passed under the exempt list"
+else
+  ok "non-exempt post-horizon commit record fails under the exempt list"
+fi
+[ "$(grep -c '^late ' "$TMP/ev-fail")" -eq 1 ] && grep -qF "late fenced t/$H/s/c/0000/20261116T21/x.cmt 2026-11-16T22:01:01.000Z" "$TMP/ev-fail" \
+  && ok "exactly the commit record is late" || bad "late lines: $(grep '^late ' "$TMP/ev-fail")"
+grep -qxF "exempt fenced t/$H/l/admission/p.snapshot 2026-11-16T22:05:00.000Z after" "$TMP/ev-fail" \
+  && ok "exempt write recorded with LastModified, after the horizon" || bad "exempt line: $(cat "$TMP/ev-fail")"
+
+# An exempt key alone, past the horizon, passes; an exempt key inside the
+# horizon is recorded as within.
+printf '%s\t%s\t%s\n' \
+  "t/$H/m/maint/scrub/0000.cursor" 2026-11-16T22:40:00.000Z 200 \
+  "t/$H/s/admission/q.snapshot" 2026-11-16T20:00:00.000Z 80 > "$TMP/w-exempt"
+if drill_late_writes "$TMP/w-exempt" "$H" "$HORIZON" "$ALERTS" "$EXEMPT_PATTERNS" > "$TMP/ev-exempt"; then
+  ok "exempt keys past the horizon pass"
+else
+  bad "exempt keys failed: $(cat "$TMP/ev-exempt")"
+fi
+grep -qxF "exempt fenced t/$H/m/maint/scrub/0000.cursor 2026-11-16T22:40:00.000Z after" "$TMP/ev-exempt" \
+  && grep -qxF "exempt fenced t/$H/s/admission/q.snapshot 2026-11-16T20:00:00.000Z within" "$TMP/ev-exempt" \
+  && ok "exempt keys recorded after and within" || bad "exempt records: $(cat "$TMP/ev-exempt")"
+
+# A non-exempt advisory-looking key past the horizon fails: m/meta and an
+# extra-segment admission key are not on the list.
+printf '%s\t%s\t%s\n' \
+  "t/$H/m/meta" 2026-11-16T22:40:00.000Z 300 \
+  "t/$H/m/admission/x/q.snapshot" 2026-11-16T22:40:00.000Z 80 > "$TMP/w-nonexempt"
+if drill_late_writes "$TMP/w-nonexempt" "$H" "$HORIZON" "$ALERTS" "$EXEMPT_PATTERNS" > "$TMP/ev-nonexempt"; then
+  bad "non-exempt keys passed: $(cat "$TMP/ev-nonexempt")"
+else
+  ok "non-exempt keys past the horizon fail"
+fi
+[ "$(grep -c '^late ' "$TMP/ev-nonexempt")" -eq 2 ] && ok "both non-exempt keys late" || bad "late lines: $(cat "$TMP/ev-nonexempt")"
+
+# The parked lease is not exempt: a rewrite after the alert horizon fails
+# with the shipped list too.
+printf '%s\t%s\t%s\n' "t/$H/a/alert-lease" 2026-11-16T19:45:00.000Z 100 > "$TMP/w-alert2"
+drill_late_writes "$TMP/w-alert2" "$H" "$HORIZON" "$ALERTS" "$EXEMPT_PATTERNS" > /dev/null \
+  && bad "lease rewrite passed under the exempt list" || ok "lease rewrite fails under the exempt list"
+
+# Trailer parsing: version is the u16 LE at bytes 8..10, magic the last 4.
+printf 'payload\x05\x00\x00\x00\xaa\xbb\xcc\xdd\x07\x00\x01\x00RSG1' > "$TMP/obj"
+tl=$(python3 -I "$HERE/drill_s3.py" trailer-file "$TMP/obj" | cut -f2-)
+[ "$tl" = "RSG1	7	1" ] && ok "trailer-file reads RSG1 version 7 signal 1" || bad "trailer-file gave '$tl'"
+printf '\x05\x00\x00\x00\xaa\xbb\xcc\xdd\x05\x01\x02\x00RLG1' > "$TMP/obj2"
+tl=$(python3 -I "$HERE/drill_s3.py" trailer-file "$TMP/obj2" | cut -f2-)
+[ "$tl" = "RLG1	261	2" ] && ok "trailer version is little-endian u16" || bad "trailer-file gave '$tl'"
+printf 'short' > "$TMP/obj3"
+python3 -I "$HERE/drill_s3.py" trailer-file "$TMP/obj3" > /dev/null 2>&1 && bad "short object read as a trailer" || ok "short object refused"
+
+# Teardown: the writes between the running and the post-stop listing.
+DM="t/$H/m/l0/0000/w.1.00000000000000000007.0011223344556677.rseg"
+CM="t/$H/m/c/0000/20261116T22/w.1.00000000000000000007.cmt"
+DL="t/$H/l/l0/0001/w.1.00000000000000000003.8899aabbccddeeff.rseg"
+CL="t/$H/l/c/0001/20261116T22/w.1.00000000000000000003.cmt"
+DS="t/$H/s/l0/0000/w.1.00000000000000000002.0102030405060708.rseg"
+AD="t/$H/m/admission/0f3c.snapshot"
+printf '%s\t%s\t%s\n' \
+  "$DM" 2026-11-16T23:02:39.000Z 900 \
+  "$CM" 2026-11-16T23:02:39.500Z 300 \
+  "$DL" 2026-11-16T23:02:40.000Z 900 \
+  "$CL" 2026-11-16T23:02:40.500Z 300 \
+  "$DS" 2026-11-16T23:02:41.000Z 900 \
+  "$AD" 2026-11-16T23:02:38.000Z 80 \
+  "t/$H/u/l0/0001/audit.rseg" 2026-11-16T23:02:41.000Z 400 > "$TMP/td-written"
+cp "$TMP/td-written" "$TMP/td-listing"
+printf '%s\t%s\t%s\n' "$DM" RSG1 7 "$DL" RLG1 5 "$DS" RSP1 5 > "$TMP/td-trailers"
+if drill_teardown_check "$TMP/td-written" "$H" "$TMP/td-listing" "$TMP/td-trailers" "$EXEMPT_PATTERNS" > "$TMP/td-ok"; then
+  ok "teardown writes at the release versions pass"
+else
+  bad "teardown at release versions failed: $(cat "$TMP/td-ok")"
+fi
+[ "$(grep -c '^teardown-ok ' "$TMP/td-ok")" -eq 5 ] && ok "five teardown keys checked" || bad "teardown-ok count: $(cat "$TMP/td-ok")"
+grep -qxF "teardown-ok commit $CM 2026-11-16T23:02:39.500Z data=$DM RSG1 7" "$TMP/td-ok" \
+  && ok "commit record checked through its data object" || bad "commit line: $(cat "$TMP/td-ok")"
+grep -qxF "teardown-exempt fenced $AD 2026-11-16T23:02:38.000Z" "$TMP/td-ok" \
+  && ok "exempt teardown write recorded" || bad "exempt teardown line: $(cat "$TMP/td-ok")"
+grep -q "u/l0" "$TMP/td-ok" && bad "audit key judged at teardown" || ok "audit key not judged at teardown"
+
+# Wrong version: metrics at RSEG 8, spans at RSPAN 4, logs with RSEG's magic.
+for wrong in "$DM RSG1 8" "$DS RSP1 4" "$DL RSG1 5"; do
+  set -- $wrong
+  awk -F'\t' -v k="$1" -v m="$2" -v v="$3" 'BEGIN { OFS = "\t" } $1 == k { $2 = m; $3 = v } { print }' \
+    "$TMP/td-trailers" > "$TMP/td-wrong"
+  if drill_teardown_check "$TMP/td-written" "$H" "$TMP/td-listing" "$TMP/td-wrong" "$EXEMPT_PATTERNS" > "$TMP/td-bad"; then
+    bad "teardown write at $2 $3 passed"
+  else
+    ok "teardown write at $2 $3 fails"
+  fi
+done
+# The commit record inherits its data object's failure.
+awk -F'\t' -v k="$DM" 'BEGIN { OFS = "\t" } $1 == k { $3 = 8 } { print }' "$TMP/td-trailers" > "$TMP/td-wrong"
+drill_teardown_check "$TMP/td-written" "$H" "$TMP/td-listing" "$TMP/td-wrong" "$EXEMPT_PATTERNS" > "$TMP/td-bad" || true
+[ "$(grep -c '^teardown-bad version ' "$TMP/td-bad")" -eq 2 ] && ok "data object and its commit record both fail at RSEG 8" \
+  || bad "wrong-version lines: $(cat "$TMP/td-bad")"
+
+# A missing trailer, a commit record with no data object, and a teardown key
+# no version rule covers each fail.
+grep -v "^$DS" "$TMP/td-trailers" > "$TMP/td-missing"
+drill_teardown_check "$TMP/td-written" "$H" "$TMP/td-listing" "$TMP/td-missing" "$EXEMPT_PATTERNS" > /dev/null \
+  && bad "teardown data object with no trailer passed" || ok "teardown data object with no trailer fails"
+grep -v "^$DL" "$TMP/td-listing" > "$TMP/td-nodata"
+printf '%s\t%s\t%s\n' "$CL" 2026-11-16T23:02:40.500Z 300 > "$TMP/td-w-commit"
+drill_teardown_check "$TMP/td-w-commit" "$H" "$TMP/td-nodata" "$TMP/td-trailers" "$EXEMPT_PATTERNS" > "$TMP/td-c" \
+  && bad "unpaired teardown commit record passed" || ok "unpaired teardown commit record fails"
+grep -qxF "teardown-bad commit $CL 2026-11-16T23:02:40.500Z no single paired data object" "$TMP/td-c" \
+  && ok "commit record with no data object fails" || bad "unpaired commit: $(cat "$TMP/td-c")"
+printf '%s\t%s\t%s\n' "t/$H/m/meta" 2026-11-16T23:02:41.000Z 300 > "$TMP/td-w-meta"
+drill_teardown_check "$TMP/td-w-meta" "$H" "$TMP/td-listing" "$TMP/td-trailers" "$EXEMPT_PATTERNS" > "$TMP/td-m" \
+  && bad "teardown m/meta passed" || ok "teardown key with no version rule fails"
+grep -qxF "teardown-bad other t/$H/m/meta 2026-11-16T23:02:41.000Z no version rule covers this key" "$TMP/td-m" \
+  && ok "unversioned teardown key named" || bad "meta line: $(cat "$TMP/td-m")"
 
 # Exactly at the horizon second is still inside it.
 printf '%s\t%s\t%s\n' "t/$H/m/l0/0000/edge.rseg" 2026-11-16T22:01:00.999Z 1 > "$TMP/w-edge"

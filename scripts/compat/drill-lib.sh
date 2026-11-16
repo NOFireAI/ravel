@@ -86,12 +86,33 @@ drill_check_figure() {
   echo "band-ok $name=$v in [$lo, $hi]"
 }
 
+# Whether key $1 of tenant hash $2 matches one of the exempt patterns $3
+# (whitespace-separated globs relative to t/<h>/). A glob matches only a key
+# with the same number of path segments, so "*" never spans a "/".
+drill_exempt() {
+  local key=$1 h=$2 patterns=$3 rel p
+  case "$key" in
+    "t/$h/"*) rel=${key#"t/$h/"} ;;
+    *) return 1 ;;
+  esac
+  for p in $patterns; do
+    # shellcheck disable=SC2053
+    if [[ $rel == $p ]] && [ "${rel//[!\/]/}" = "${p//[!\/]/}" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Late writes: from the written-keys file $1 (drill_written_keys output),
 # every key of class fenced or alerts for tenant hash $2 whose LastModified is
-# strictly after Unix second $3 (fenced) or $4 (alerts). Prints
-# "late <class> <key> <LastModified>" per write; returns 1 when any exists.
+# strictly after Unix second $3 (fenced) or $4 (alerts), unless it matches an
+# exempt pattern of $5. Prints "late <class> <key> <LastModified>" per late
+# write and "exempt <class> <key> <LastModified> after|within" per exempt
+# write of either class (recorded, never a failure); returns 1 when any late
+# write exists.
 drill_late_writes() {
-  local written=$1 h=$2 fenced_after=$3 alerts_after=$4 key lm size class t limit found=0
+  local written=$1 h=$2 fenced_after=$3 alerts_after=$4 exempt=${5:-} key lm size class t limit found=0
   while IFS=$'\t' read -r key lm size; do
     [ -n "$key" ] || continue
     class=$(drill_classify "$key" "$h")
@@ -101,8 +122,113 @@ drill_late_writes() {
       *) continue ;;
     esac
     t=$(drill_epoch "$lm")
-    if [ "$t" -gt "$limit" ]; then
+    if drill_exempt "$key" "$h" "$exempt"; then
+      if [ "$t" -gt "$limit" ]; then
+        echo "exempt $class $key $lm after"
+      else
+        echo "exempt $class $key $lm within"
+      fi
+    elif [ "$t" -gt "$limit" ]; then
       echo "late $class $key $lm"
+      found=1
+    fi
+  done < "$written"
+  return "$found"
+}
+
+# Trailer the release writes for a data object under signal prefix $1:
+# "<magic> <version>". RSEG 7 for metrics, RLOG 5 for logs and alerts,
+# RSPAN 5 for spans (v0.33.0 ravel-ingest config.rs).
+drill_release_trailer() {
+  case "$1" in
+    m) echo "RSG1 7" ;;
+    l | a) echo "RLG1 5" ;;
+    s) echo "RSP1 5" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Data-object key a commit record key $1 pairs with in listing $2: same
+# tenant, signal, shard and <writer>.<epoch>.<seq>. Prints the one match;
+# returns 1 when there is none or more than one.
+drill_commit_data_key() {
+  local key=$1 listing=$2 base sig shard stem
+  base=${key%/*}
+  stem=${key##*/}
+  stem=${stem%.cmt}
+  # base is t/<h>/<sig>/c/<shard>/<hour>
+  sig=$(echo "$base" | cut -d/ -f3)
+  shard=$(echo "$base" | cut -d/ -f5)
+  awk -F'\t' -v p="$(echo "$base" | cut -d/ -f1-2)/$sig/l0/$shard/$stem." \
+    'index($1, p) == 1 && $1 ~ /\.rseg$/ && substr($1, length(p) + 1) !~ /\// { print $1; n++ }
+     END { exit n == 1 ? 0 : 1 }' "$listing"
+}
+
+# Teardown writes: the keys of written-keys file $1 (drill_written_keys
+# between the last running listing and the one after the processes stopped)
+# for tenant hash $2. $3 is the post-stop listing, $4 a trailer file of
+# "<key>\t<magic>\t<version>" lines, $5 the exempt patterns. Every fenced or
+# alerts key must be one of:
+#   exempt          an exempt pattern: recorded
+#   data object     <sig>/l0/.../*.rseg whose trailer is the release's
+#   commit record   <sig>/c/.../*.cmt whose paired data object (in $3) has
+#                   the release's trailer
+# Anything else fails, since no version rule covers it. Prints one
+# "teardown-ok|teardown-exempt|teardown-bad <what> <key> <LastModified> ..."
+# line per key; returns 1 when any line is teardown-bad.
+drill_teardown_check() {
+  local written=$1 h=$2 listing=$3 trailers=$4 exempt=${5:-} key lm size class rel sig want got data found=0
+  while IFS=$'\t' read -r key lm size; do
+    [ -n "$key" ] || continue
+    class=$(drill_classify "$key" "$h")
+    case "$class" in
+      fenced | alerts) ;;
+      *) continue ;;
+    esac
+    if drill_exempt "$key" "$h" "$exempt"; then
+      echo "teardown-exempt $class $key $lm"
+      continue
+    fi
+    rel=${key#"t/$h/"}
+    case "$rel" in
+      catalog/*) sig="" ;;
+      *) sig=${rel%%/*} ;;
+    esac
+    case "$rel" in
+      */l0/*.rseg)
+        data=$key
+        ;;
+      */c/*.cmt)
+        if ! data=$(drill_commit_data_key "$key" "$listing"); then
+          echo "teardown-bad commit $key $lm no single paired data object"
+          found=1
+          continue
+        fi
+        ;;
+      *)
+        echo "teardown-bad other $key $lm no version rule covers this key"
+        found=1
+        continue
+        ;;
+    esac
+    want=$(drill_release_trailer "$sig") || {
+      echo "teardown-bad other $key $lm no release trailer for signal '$sig'"
+      found=1
+      continue
+    }
+    got=$(awk -F'\t' -v k="$data" '$1 == k { print $2 " " $3; n++ } END { exit n == 1 ? 0 : 1 }' "$trailers") || {
+      echo "teardown-bad data $key $lm trailer of $data not read"
+      found=1
+      continue
+    }
+    if [ "$got" = "$want" ]; then
+      if [ "$data" = "$key" ]; then
+        echo "teardown-ok data $key $lm $got"
+      else
+        echo "teardown-ok commit $key $lm data=$data $got"
+      fi
+    else
+      echo "teardown-bad version $key $lm data=$data trailer '$got' want '$want'"
       found=1
     fi
   done < "$written"

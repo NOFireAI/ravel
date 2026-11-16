@@ -218,11 +218,20 @@ connection, a pushed-but-broken main).
   fenced prefix after its grace horizon. Phases: `preflight` (asset
   sha256 and cosign check, stamps), `start`, `warm-start`, `warm-fence`,
   `warm-finish` (refused until the horizon, which is the fence's hour
-  plus 3 h plus a 60 s request margin, has passed), `cold`, `read`, `all`, `verdict` and
+  plus 3 h plus a 60 s request margin, and then one 61 min scrub rotation
+  have passed), `cold`, `read`, `all`, `verdict` and
   `stop`. Every figure is checked present exactly once and inside its
-  band. `verdict` exits 1 on a post-horizon fenced write, a zero
-  positive-control prefix, a read diff between v0.33.0 and main, or a
-  missing phase verdict. State goes to `DRILL_RUN` (default
+  band. Keys matching `EXEMPT_PATTERNS` at the top of the script
+  (admission snapshots and scrub cursors, which a newer build ignores or
+  overwrites) are recorded with their LastModified and never fail the
+  drill. Writes at process stop are recorded, and each data object, and
+  each commit record's data object, must carry the trailer v0.33.0 writes
+  (RSEG 7, RLOG 5, RSPAN 5). `verdict` exits 1 on a post-horizon fenced
+  write outside `EXEMPT_PATTERNS` by a running process, any such write
+  after the fence by a restarted process, a teardown write at another
+  version or with no version rule, no scrub cursor write after the
+  horizon, a zero positive-control prefix, a read diff between v0.33.0
+  and main, or a missing phase verdict. State goes to `DRILL_RUN` (default
   `.dd-tools/drill-run`); the script header lists the other variables.
   `scripts/compat/released-binary-drill.test.sh` runs the decision logic
   (`drill-lib.sh`) on recorded listings in CI.
