@@ -3306,7 +3306,7 @@ impl SqlExecutor {
         // Kept on the pooled `&QueryAccounting` signature (the public Flight
         // SQL `GetFlightInfo`-side resolve, whose caller has no phase-split
         // handle to hand in): `pooled_over` shares this same handle's counters
-        // across all five phases and every lane.
+        // across all six phases and every lane.
         let resolved = self
             .resolve(
                 tenant_hash,

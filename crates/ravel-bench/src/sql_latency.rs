@@ -734,18 +734,31 @@ pub struct RunAccounting {
     /// the pages the projection kept. Post-compression bytes as they sit in the
     /// object, NOT bytes transferred and NOT decompressed bytes.
     ///
-    /// This is the denominator of [`Self::fetch_amplification`].
+    /// Both phases of a late-materialized statement: the phase-1 scan's pages
+    /// and the phase-2 row fetch's pages, which
+    /// [`Self::page_stored_bytes_decoded_fetch`] carries on its own.
     #[serde(default)]
     pub page_stored_bytes_decoded: u64,
-    /// Fetch amplification: scan-phase WIRE bytes divided by
-    /// [`Self::page_stored_bytes_decoded`] STORED bytes. How many bytes the
-    /// store actually moved for each byte of page the statement went on to
-    /// decode.
+    /// The part of [`Self::page_stored_bytes_decoded`] that late
+    /// materialization's phase-2 row fetch decoded: the `fetch` phase handle's
+    /// `page_bytes_decoded`. Zero for a statement that did not late
+    /// materialize, and in a report written before this field existed.
+    #[serde(default)]
+    pub page_stored_bytes_decoded_fetch: u64,
+    /// Fetch amplification of the phase-1 scan: scan-phase WIRE bytes divided
+    /// by the STORED page bytes the scan decoded, which is
+    /// [`Self::page_stored_bytes_decoded`] minus
+    /// [`Self::page_stored_bytes_decoded_fetch`]. How many bytes the store
+    /// actually moved for each byte of page the scan went on to decode.
     ///
     /// The numerator is the `scan` entry of [`Self::wire_bytes_by_phase`]: the
     /// BLOCKS-section data ranges, with a coalesced run's unwanted bytes
     /// included because they crossed the wire. Probe, PAGE_DIR, SKIP_IDX and
     /// directory bytes are NOT in it; they are the `probe`/`plan` entries.
+    /// Late materialization's phase-2 bytes are in neither the numerator nor
+    /// the denominator: they are [`Self::fetch_amplification_phase2`]'s, so a
+    /// statement reads the same figure here whether or not it late
+    /// materializes.
     ///
     /// Not the same quantity as `page_bytes_fetched / page_bytes_decoded`,
     /// which compares two STORED page-byte figures and describes a pre-version-4
@@ -756,6 +769,20 @@ pub struct RunAccounting {
     /// `0.0` when the run decoded no page.
     #[serde(default)]
     pub fetch_amplification: f64,
+    /// Fetch amplification of late materialization's phase-2 row fetch:
+    /// fetch-phase WIRE bytes divided by
+    /// [`Self::page_stored_bytes_decoded_fetch`].
+    ///
+    /// The numerator is the `fetch` entry of [`Self::wire_bytes_by_phase`],
+    /// which holds every GET the row fetch issued, its metadata reads (suffix
+    /// probe, footer chase, directories) as well as its BLOCKS ranges: the
+    /// read path charges both to the one phase and cannot split them. On a
+    /// cold run this therefore reads higher than a BLOCKS-only figure would.
+    ///
+    /// `0.0` when the row fetch decoded no page, including every statement
+    /// that did not late materialize.
+    #[serde(default)]
+    pub fetch_amplification_phase2: f64,
     /// Logs-scan fast-path segment opens this run resolved to the WHOLE-OBJECT
     /// read: `QueryAccountingSnapshot::logs_whole_object_opens` (ADR-0904).
     ///
@@ -942,14 +969,14 @@ fn phase_wire_bytes(counts: &PhaseWireByteCounts) -> Vec<PhaseWireBytes> {
         .collect()
 }
 
-/// Scan-phase WIRE bytes over STORED decoded page bytes. `0.0` when nothing was
-/// decoded, so a statement that read no page reports no ratio rather than an
+/// One phase's WIRE bytes over the STORED page bytes it decoded. `0.0` when
+/// nothing was decoded, so a statement that read no page reports no ratio rather than an
 /// infinity that would poison any aggregate over the report.
-fn amplification(scan_wire_bytes: u64, page_stored_bytes_decoded: u64) -> f64 {
+fn amplification(wire_bytes: u64, page_stored_bytes_decoded: u64) -> f64 {
     if page_stored_bytes_decoded == 0 {
         return 0.0;
     }
-    scan_wire_bytes as f64 / page_stored_bytes_decoded as f64
+    wire_bytes as f64 / page_stored_bytes_decoded as f64
 }
 
 /// Check one run's per-phase split against the pooled figures beside it, and
@@ -976,9 +1003,14 @@ fn amplification(scan_wire_bytes: u64, page_stored_bytes_decoded: u64) -> f64 {
 /// 3. The attributed sum plus [`RunAccounting::wire_bytes_unattributed`] is
 ///    exactly [`RunAccounting::object_store_bytes`], which is what makes the
 ///    residual auditable rather than a number derived and then forgotten.
-/// 4. [`RunAccounting::fetch_amplification`] is exactly the ratio of the two
-///    fields printed beside it, compared on bit patterns, so the table cannot
-///    show a ratio that its own numerator and denominator do not produce.
+/// 4. [`RunAccounting::fetch_amplification`] is exactly the scan-phase wire
+///    bytes over [`RunAccounting::page_stored_bytes_decoded`] minus
+///    [`RunAccounting::page_stored_bytes_decoded_fetch`], and
+///    [`RunAccounting::fetch_amplification_phase2`] exactly the fetch-phase
+///    wire bytes over [`RunAccounting::page_stored_bytes_decoded_fetch`], both
+///    compared on bit patterns, so the table cannot show a ratio that its own
+///    numerator and denominator do not produce. The phase-2 decoded bytes
+///    must not exceed the statement's.
 ///
 /// # Why this is NOT an exact equality
 ///
@@ -1071,13 +1103,34 @@ pub fn reconcile_run_accounting(id: &str, run: usize, acc: &RunAccounting) -> Re
         }
     }
 
+    if acc.page_stored_bytes_decoded_fetch > acc.page_stored_bytes_decoded {
+        return Err(format!(
+            "entry `{id}` run {run}: phase-2 stored decoded page bytes {} exceed the \
+             statement's {}",
+            acc.page_stored_bytes_decoded_fetch, acc.page_stored_bytes_decoded
+        ));
+    }
     let scan_wire_bytes = acc.wire_bytes_by_phase[QueryPhase::Scan.index()].wire_bytes;
-    let expected_amplification = amplification(scan_wire_bytes, acc.page_stored_bytes_decoded);
+    let scan_decoded = acc
+        .page_stored_bytes_decoded
+        .saturating_sub(acc.page_stored_bytes_decoded_fetch);
+    let expected_amplification = amplification(scan_wire_bytes, scan_decoded);
     if acc.fetch_amplification.to_bits() != expected_amplification.to_bits() {
         return Err(format!(
             "entry `{id}` run {run}: fetch_amplification {} is not scan wire bytes \
-             {scan_wire_bytes} over stored decoded page bytes {} ({expected_amplification})",
-            acc.fetch_amplification, acc.page_stored_bytes_decoded
+             {scan_wire_bytes} over the scan's stored decoded page bytes {scan_decoded} \
+             ({expected_amplification})",
+            acc.fetch_amplification
+        ));
+    }
+    let fetch_wire_bytes = acc.wire_bytes_by_phase[QueryPhase::Fetch.index()].wire_bytes;
+    let expected_phase2 = amplification(fetch_wire_bytes, acc.page_stored_bytes_decoded_fetch);
+    if acc.fetch_amplification_phase2.to_bits() != expected_phase2.to_bits() {
+        return Err(format!(
+            "entry `{id}` run {run}: fetch_amplification_phase2 {} is not fetch wire bytes \
+             {fetch_wire_bytes} over the row fetch's stored decoded page bytes {} \
+             ({expected_phase2})",
+            acc.fetch_amplification_phase2, acc.page_stored_bytes_decoded_fetch
         ));
     }
     Ok(())
@@ -2120,6 +2173,7 @@ pub async fn measure_corpus(
             // #913: this run's WIRE bytes per phase, and the amplification they
             // and the run's STORED decoded page bytes form.
             let run_wire = wire_bytes.snapshot().saturating_sub(&wire_bytes_before);
+            let fetch_decoded = outcome.phase_accounting.fetch.page_bytes_decoded;
             per_run_accounting.push(RunAccounting {
                 object_store_get_requests: acc.s3_requests(AccountedOp::Get),
                 object_store_list_requests: acc.s3_requests(AccountedOp::List),
@@ -2140,9 +2194,14 @@ pub async fn measure_corpus(
                         .saturating_sub(run_wire.total_requests()),
                 ),
                 page_stored_bytes_decoded: acc.page_bytes_decoded,
+                page_stored_bytes_decoded_fetch: fetch_decoded,
                 fetch_amplification: amplification(
                     run_wire.phase(QueryPhase::Scan),
-                    acc.page_bytes_decoded,
+                    acc.page_bytes_decoded.saturating_sub(fetch_decoded),
+                ),
+                fetch_amplification_phase2: amplification(
+                    run_wire.phase(QueryPhase::Fetch),
+                    fetch_decoded,
                 ),
                 // #904: which read shape the logs-scan router chose for this
                 // run's fast-path segments. Read directly off the per-query
@@ -5395,7 +5454,8 @@ mod tests {
     ///   pooled total and clamp the unattributed residual to zero, which the
     ///   second assertion catches.
     /// - `fetch_amplification` is exactly the scan-phase wire bytes over the
-    ///   stored decoded page bytes, from the two fields beside it.
+    ///   stored decoded page bytes, from the two fields beside it; with no
+    ///   late materialization the phase-2 share of the decode is zero.
     ///
     /// The byte totals themselves are not pinned to literals here: they are a
     /// property of the generated corpus, not of this plumbing, and
@@ -5468,6 +5528,10 @@ mod tests {
                 "run {run}: the phases plus the residual are the pooled total"
             );
             assert_eq!(
+                entry.page_stored_bytes_decoded_fetch, 0,
+                "run {run}: a one-column projection does not late materialize"
+            );
+            assert_eq!(
                 entry.fetch_amplification,
                 amplification(
                     entry.wire_bytes_by_phase[QueryPhase::Scan.index()].wire_bytes,
@@ -5526,6 +5590,120 @@ mod tests {
                 "run {run}: the denominator is in the JSON"
             );
         }
+    }
+
+    /// A late-materialized statement's `fetch_amplification` is its phase-1
+    /// scan's figure alone, bit for bit the figure of the same scan run without
+    /// late materialization, and phase 2's bytes are reported as
+    /// `fetch_amplification_phase2` over their own denominator.
+    ///
+    /// Six one-record objects carry twelve declared `Str` attributes, so
+    /// `SELECT *` projects 20 columns and `ORDER BY ts LIMIT 2` installs
+    /// late materialization (more than 8 columns beyond the sort's `ts`).
+    /// Phase 1 decodes `ts` from all six objects; phase 2 fetches the two
+    /// winners' rows. `SELECT ts ... ORDER BY ts LIMIT 2` is the same scan with
+    /// nothing to fetch, so its ratio is the LM-off figure over the pages both
+    /// statements decode. The ranged read path is forced
+    /// (`logs_block_range_threshold: 0`) so the scan's wire bytes are its `ts`
+    /// ranges, not whole objects.
+    ///
+    /// Fails against the formula that divided scan wire bytes by every page
+    /// both phases decoded: phase 2's pages then dilute the ratio below the
+    /// narrow statement's.
+    #[tokio::test]
+    async fn late_materialized_fetch_amplification_is_the_scan_figure() {
+        let store = empty_store();
+        let tenant = TenantId::new("late-materialized-amplification");
+        let records = build_records(6, 12);
+        let objects = write_records_as_objects(&store, &tenant, 0, &records).await;
+        let declared: Vec<DeclaredColumn> = (0..12)
+            .map(|k| DeclaredColumn::new(format!("attr_{k}"), DeclaredType::Str))
+            .collect();
+        let (measured, skipped, failed) = measure_corpus(
+            &store,
+            tenant.hash(),
+            &[
+                entry("lm", "SELECT * FROM logs ORDER BY ts LIMIT 2"),
+                entry("narrow", "SELECT ts FROM logs ORDER BY ts LIMIT 2"),
+            ],
+            &declared,
+            1,
+            TimeRange {
+                start_ns: 0,
+                end_ns: NOW_NS,
+            },
+            NOW_NS,
+            0,
+            Duration::from_secs(30),
+            false,
+            None,
+            ExecutorSettings {
+                logs_block_range_threshold: 0,
+                logs_projection_break_even_bytes: None,
+                logs_suffix_len: Some(suffix_just_past_skip_idx(&objects[0])),
+                fetch_concurrency: 1,
+                ..ExecutorSettings::default()
+            },
+            false,
+            None,
+        )
+        .await
+        .expect("run");
+        assert!(skipped.is_empty() && failed.is_empty());
+        let cold = |i: usize| {
+            measured[i]
+                .per_run_accounting
+                .as_ref()
+                .expect("in-process accounting")[0]
+                .clone()
+        };
+        let (lm, narrow) = (cold(0), cold(1));
+        let wire = |acc: &RunAccounting, phase: QueryPhase| {
+            acc.wire_bytes_by_phase[phase.index()].wire_bytes
+        };
+
+        // The fixture is what the doc says: phase 2 ran and decoded pages, the
+        // narrow statement fetched nothing, and both scans moved the same
+        // nonzero scan-phase bytes for the same decoded `ts` pages.
+        assert!(wire(&lm, QueryPhase::Fetch) > 0, "phase 2 issued GETs");
+        assert!(
+            lm.page_stored_bytes_decoded_fetch > 0,
+            "phase 2 decoded pages"
+        );
+        assert_eq!(wire(&narrow, QueryPhase::Fetch), 0);
+        assert_eq!(narrow.page_stored_bytes_decoded_fetch, 0);
+        assert!(
+            wire(&lm, QueryPhase::Scan) > 0,
+            "the scan moved BLOCKS bytes"
+        );
+        assert_eq!(wire(&lm, QueryPhase::Scan), wire(&narrow, QueryPhase::Scan));
+        assert_eq!(
+            lm.page_stored_bytes_decoded - lm.page_stored_bytes_decoded_fetch,
+            narrow.page_stored_bytes_decoded,
+            "phase 1 decodes exactly the narrow statement's pages"
+        );
+
+        assert_eq!(
+            lm.fetch_amplification.to_bits(),
+            narrow.fetch_amplification.to_bits(),
+            "late materialization does not move the scan's ratio: lm {} narrow {}",
+            lm.fetch_amplification,
+            narrow.fetch_amplification
+        );
+        assert_ne!(
+            lm.fetch_amplification.to_bits(),
+            amplification(wire(&lm, QueryPhase::Scan), lm.page_stored_bytes_decoded).to_bits(),
+            "phase 2's pages are not in the scan ratio's denominator"
+        );
+        assert_eq!(
+            lm.fetch_amplification_phase2.to_bits(),
+            amplification(
+                wire(&lm, QueryPhase::Fetch),
+                lm.page_stored_bytes_decoded_fetch
+            )
+            .to_bits()
+        );
+        assert_eq!(narrow.fetch_amplification_phase2, 0.0);
     }
 
     /// An older report, written before #913 added these fields, still
@@ -5986,7 +6164,7 @@ mod tests {
         assert_eq!(
             attributed + cold.wire_bytes_unattributed,
             cold.object_store_bytes,
-            "the five phases plus the catalog residual are the pooled total"
+            "the six phases plus the catalog residual are the pooled total"
         );
         assert_eq!(
             cold.object_store_get_bytes, cold.object_store_bytes,
@@ -6040,7 +6218,7 @@ mod tests {
         );
     }
 
-    /// The same flip in the other direction: keep all five phases but charge a
+    /// The same flip in the other direction: keep all six phases but charge a
     /// phase's GET bytes to a second phase as well, which is what a call site
     /// that recorded into the wrong handle alongside the right one would
     /// produce. The pooled GET total does not move, so the attributed sum rises
@@ -6093,6 +6271,31 @@ mod tests {
         assert!(
             err.contains("fetch_amplification"),
             "the failure names the ratio, got: {err}"
+        );
+    }
+
+    /// The phase-2 ratio is held to its own two fields the same way, and a
+    /// phase-2 decoded figure above the statement's is refused rather than
+    /// saturated into a scan denominator of zero.
+    #[test]
+    fn reconcile_rejects_a_phase2_ratio_its_own_fields_do_not_produce() {
+        let mut acc = synthetic_run_accounting();
+        acc.fetch_amplification_phase2 = 1.0;
+        let err = reconcile_run_accounting("q", 0, &acc).expect_err(
+            "a phase-2 ratio that is not fetch over phase-2 decoded must not reconcile",
+        );
+        assert!(
+            err.contains("fetch_amplification_phase2"),
+            "the failure names the phase-2 ratio, got: {err}"
+        );
+
+        let mut acc = synthetic_run_accounting();
+        acc.page_stored_bytes_decoded_fetch = acc.page_stored_bytes_decoded + 1;
+        let err = reconcile_run_accounting("q", 0, &acc)
+            .expect_err("phase-2 decoded bytes above the statement's must not reconcile");
+        assert!(
+            err.contains("exceed the statement's"),
+            "the failure names the overshoot, got: {err}"
         );
     }
 
@@ -6181,7 +6384,7 @@ mod tests {
     /// against a 400-byte all-kinds total whose GET share is 360, and the ratio
     /// its own scan and decode figures produce.
     fn synthetic_run_accounting() -> RunAccounting {
-        let by_phase = [0u64, 100, 50, 150, 0];
+        let by_phase = [0u64, 100, 50, 150, 0, 0];
         RunAccounting {
             object_store_get_requests: 4,
             object_store_list_requests: 1,
@@ -6208,7 +6411,9 @@ mod tests {
             // residual the exact-sum reconciliation audits.
             get_requests_unattributed: Some(4 - by_phase.iter().map(|b| b / 100).sum::<u64>()),
             page_stored_bytes_decoded: 75,
+            page_stored_bytes_decoded_fetch: 0,
             fetch_amplification: amplification(by_phase[QueryPhase::Scan.index()], 75),
+            fetch_amplification_phase2: 0.0,
             logs_whole_object_opens: 0,
             logs_ranged_opens: 1,
             scan_timing: None,
