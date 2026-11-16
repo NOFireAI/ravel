@@ -599,7 +599,7 @@ Nothing in ADR-3326 changes:
 - **`<>` on a declared Bytes column.** Same reason: no profiled statement has it.
 - **I64 and Bool comparisons** (`"CounterID" = 62` and the rest of q37 to q43). They stay on the
   prune channel as decision 2 of this ADR describes. `prune_channel_filters_stay_inexact` pins
-  them (`logs_provider.rs:2600-2617`). The profile's shares for q37 to q40 rest on 11, 2, 0 and
+  them (`logs_provider.rs:2751-2808`). The profile's shares for q37 to q40 rest on 11, 2, 0 and
   50 samples, which is noise. The mechanism extends to them, but that needs a measured reason.
   The I64 equality amendment below supplies that reason for `=` on a declared I64 column against
   an integer literal; the other I64 operators and Bool stay here.
@@ -865,41 +865,54 @@ Issue #4232 comment 6920855702: a c6a.4xlarge, the ClickBench tenant, 222 object
    is `Int64`. They narrow which blocks are read. It also goes to `row_filters`, which decides
    the rows. `leaf_is_exact` no longer lets the shape's own prune arm or key veto it; any other
    leaf that populates either channel still answers `false`.
-3. **Row path order.** When a row-path chunk carries row filters, the scan:
-   1. applies pending erasure, before any column is built, as today;
-   2. builds only the columns the row filters read (`BoundRowFilters::reads`), for the chunk's
-      unerased rows;
-   3. evaluates the row filters on that batch;
-   4. builds the whole build projection (the `attrs` map, every `attrs['k']` column, every other
-      declared and fixed column) for the surviving rows only, with their row refs at their
-      unerased positions;
-   5. builds nothing more for a chunk with no survivor, and emits nothing for it.
+3. **Row path order.** When a row-path chunk carries row filters and no pending erasure, the
+   scan:
+   1. builds only the columns the row filters read (`BoundRowFilters::reads`), for every row of
+      the chunk. A key column's cell is resolved directly: the row's last record cell for the
+      key, in FIELD_DIR order and then `attrs_raw` order, else the first entry for the key in
+      its stream's attributes. That is the cell the merged view gives the key. No row's
+      attributes are merged, and only the record columns of the filter's keys are read
+      (`build_read_columns`);
+   2. evaluates the row filters on those columns;
+   3. builds the other columns of the build projection (the `attrs` map, every `attrs['k']`
+      column, every other declared and fixed column) for the surviving rows only, reusing the
+      `attrs_raw` entries step 1 decoded, with their row refs at their chunk positions. The
+      filter's own columns are step 1's, taken at the survivors;
+   4. builds nothing more for a chunk with no survivor, and emits nothing for it.
+
+   A row is therefore merged at most once: a chunk of N rows with S survivors merges S rows, or
+   none when no column outside the filter reads attributes, where building whole merges N
+   (`row_filter_first_pass_merges_no_row`). A chunk with pending erasure, or a filter that reads
+   the `attrs` map, is built whole and then filtered, as before this amendment, because erasure
+   reads each row's merged view and merging first would merge the survivors twice.
 
    The emitted batch equals what building the chunk whole and then filtering it gives
    (`filter_first_equals_build_then_filter`,
-   `row_path_builds_attrs_only_for_rows_the_row_filter_keeps`). The memory charge covers the
-   first build's batch while the second build runs, and each build charges its own working
-   memory. Without row filters the build is unchanged. The columnar path keeps building and
-   then filtering: its build reads cursors over decoded pages, with no `attrs` map or merged
-   view to skip.
-4. **Counter.** `attrs_rows_built` counts the rows whose `attrs` map the row path built
-   (`the_scan_builds_attrs_only_for_the_rows_uid_keeps`).
+   `row_path_builds_attrs_only_for_rows_the_row_filter_keeps`). The memory charge covers step
+   1's columns and decoded `attrs_raw` entries while step 3 runs, and step 3 charges its own
+   working memory. Without row filters the build is unchanged. The columnar path keeps
+   building and then filtering: its build reads cursors over decoded pages, with no `attrs` map
+   or merged view to skip.
+4. **Counters.** `attrs_rows_built` counts the rows whose `attrs` map the row path built
+   (`the_scan_builds_attrs_only_for_the_rows_uid_keeps`). `attrs_rows_merged` counts the rows
+   the row path merged attributes for (`row_filter_first_pass_merges_no_row`).
 
 ### The exactness argument
 
 The exact not-equal amendment's argument carries over. What it needs for this shape:
 
-1. **Same expression.** The scan evaluates the physical expression the session builds for
-   `c = v` against the full `logs` schema, the expression `FilterExec` would run. Comparison and
+1. **Value-equal expression.** The scan evaluates `c = Int64(v)`, which the session builds
+   against the full `logs` schema with the literal rewritten to `Int64`, the type `c` has. It is
+   value-equal to the expression `FilterExec` would run on the coerced literal. Comparison and
    NULL semantics are DataFusion's.
-2. **Same values.** The column the filter reads is built by the code that builds `c` for
-   `FilterExec`'s input: the row path's merged view and `declared_cells_array`, the columnar
-   path's cursors. So the ADR-0090 resolution holds unchanged: the winning occurrence's `I64`
-   cell, NULL when the winner has another type, else the stream's resource or scope value, else
-   NULL. A row's value depends only on its own cells and its stream's attributes, not on which
-   other rows or columns the build holds, so building the filter column alone for the chunk and
-   rebuilding every column for the survivors give each row the value the whole-chunk build gives
-   it. `i64_equality_row_filter_matches_filter_exec` compares the rows against a provider with
+2. **Same values.** On the columnar path the column the filter reads is built by the cursors
+   that build `c` for `FilterExec`'s input. On the row path, step 1 of item 3 resolves the cell
+   the merged view gives the key and passes it to the same `declared_cells_array`. So the
+   ADR-0090 resolution holds unchanged: the winning occurrence's `I64` cell, NULL when the
+   winner has another type, else the stream's resource or scope value, else NULL. A row's value
+   depends only on its own cells and its stream's attributes, not on which other rows or columns
+   the build holds, so building the filter column alone for the chunk and the other columns for
+   the survivors give each row the value the whole-chunk build gives it. `i64_equality_row_filter_matches_filter_exec` compares the rows against a provider with
    the row filter off, over values from the record cell, a wrong-variant cell, the resource, the
    scope and nowhere, with pending erasure and `attrs_raw` blocks.
 3. **NULL drops.** `NULL = v` is NULL, and the filter drops a NULL verdict, as

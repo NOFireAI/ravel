@@ -8749,8 +8749,9 @@ mod row_path_tests {
     /// The rows the filter-first build emits for `start..end`, and the same
     /// chunk built whole and then filtered, as [`build_row_batch`] then
     /// [`BoundRowFilters::apply`]; each with the rows its `attrs` counter
-    /// counted and the rows the filter dropped.
-    #[allow(clippy::too_many_arguments)]
+    /// counted, the rows the filter dropped and the rows its merge counter
+    /// counted.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn both_orders(
         block: &RowBlock,
         start: usize,
@@ -8760,8 +8761,11 @@ mod row_path_tests {
         reservation: &MemoryReservation,
         row_refs: Option<RowRefRange>,
         filters: &BoundRowFilters,
-    ) -> ((FilteredRows, usize, usize), (RecordBatch, usize, usize)) {
-        let (first_built, first_dropped) = (Count::new(), Count::new());
+    ) -> (
+        (FilteredRows, usize, usize, usize),
+        (RecordBatch, usize, usize, usize),
+    ) {
+        let (first_built, first_dropped, first_merged) = (Count::new(), Count::new(), Count::new());
         let first = build_row_batch_filtered(
             block,
             start,
@@ -8769,6 +8773,7 @@ mod row_path_tests {
             streams,
             &RowBatchShape {
                 attrs_built: &first_built,
+                attrs_merged: &first_merged,
                 ..*shape
             },
             reservation,
@@ -8777,7 +8782,7 @@ mod row_path_tests {
             &first_dropped,
         )
         .expect("filter first");
-        let (then_built, then_dropped) = (Count::new(), Count::new());
+        let (then_built, then_dropped, then_merged) = (Count::new(), Count::new(), Count::new());
         let whole = build_row_batch(
             block,
             start,
@@ -8785,6 +8790,7 @@ mod row_path_tests {
             streams,
             &RowBatchShape {
                 attrs_built: &then_built,
+                attrs_merged: &then_merged,
                 ..*shape
             },
             reservation,
@@ -8793,8 +8799,18 @@ mod row_path_tests {
         .expect("build whole");
         let then = filters.apply(whole, &then_dropped).expect("apply");
         (
-            (first, first_built.value(), first_dropped.value()),
-            (then, then_built.value(), then_dropped.value()),
+            (
+                first,
+                first_built.value(),
+                first_dropped.value(),
+                first_merged.value(),
+            ),
+            (
+                then,
+                then_built.value(),
+                then_dropped.value(),
+                then_merged.value(),
+            ),
         )
     }
 
@@ -8861,7 +8877,10 @@ mod row_path_tests {
             block: 2,
             first_row: 100,
         });
-        let ((first, first_attrs, first_dropped), (then, then_attrs, then_dropped)) = both_orders(
+        let (
+            (first, first_attrs, first_dropped, first_merged),
+            (then, then_attrs, then_dropped, then_merged),
+        ) = both_orders(
             &block,
             0,
             N,
@@ -8877,6 +8896,12 @@ mod row_path_tests {
             "the attrs map is built for the kept rows only"
         );
         assert_eq!(then_attrs, N, "build-then-filter builds every row's map");
+        assert_eq!(
+            first_merged,
+            KEPT.len(),
+            "only the kept rows are merged, once each"
+        );
+        assert_eq!(then_merged, N, "build-then-filter merges every row");
         assert_eq!(
             (first_dropped, then_dropped),
             (N - KEPT.len(), N - KEPT.len())
@@ -8943,7 +8968,7 @@ mod row_path_tests {
             full_len,
             &[],
         );
-        let ((first, first_attrs, dropped), (then, _, _)) = both_orders(
+        let ((first, first_attrs, dropped, merged), (then, _, _, _)) = both_orders(
             &block,
             0,
             block.len(),
@@ -8959,7 +8984,95 @@ mod row_path_tests {
         );
         assert!(first.batch.is_none(), "no survivor, no batch");
         assert_eq!((first_attrs, dropped, first.unerased), (0, 4, 4));
+        assert_eq!(merged, 0, "no row is merged");
         assert_eq!(then.num_rows(), 0);
+    }
+
+    /// The filter-first pass resolves `k1` without merging any row: an
+    /// 8-row block whose attributes all sit in `attrs_raw`, `k1 = 7` on rows
+    /// 1, 4 and 7. Projecting `ts` only, no row is merged (build-then-filter
+    /// merges all 8); projecting `attrs` too, only the 3 kept rows are, once
+    /// each. Both batches equal build-then-filter's.
+    ///
+    /// Flipped: building the filter's column with the full merge over the
+    /// chunk counts 8 and 11 and fails "the first pass merges no row".
+    #[test]
+    fn row_filter_first_pass_merges_no_row() {
+        const N: usize = 8;
+        let stream = Stream {
+            resource: vec![("r".into(), AttrValue::Str("res".into()))],
+            scope: Vec::new(),
+        };
+        let records: Vec<LogRecord> = (0..N)
+            .map(|i| {
+                let v = if i % 3 == 1 { 7 } else { i as i64 };
+                let attrs = vec![
+                    ("k0".to_string(), AttrValue::Str(format!("v{i}"))),
+                    ("k1".to_string(), AttrValue::I64(v)),
+                ];
+                record(0, &stream, i as i64 + 1, attrs)
+            })
+            .collect();
+        let cfg = RlogConfig {
+            max_dynamic_columns: 0,
+            ..RlogConfig::default()
+        };
+        let obj = write(&records, &cfg);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let block = scan(&reader)
+            .next_row_block(&obj)
+            .expect("row exit")
+            .expect("block");
+        assert_eq!(block.len(), N, "one block");
+        assert!(block.view().has_attrs_raw_page(), "k1 sits in attrs_raw");
+        let declared = declared();
+        let attr_keys = attr_keys();
+        let (extended, full_len) = extended_schema(&declared, &attr_keys);
+        for (projection, merged_kept) in [
+            (vec![LOG_COL_TS], 0),
+            (vec![LOG_COL_TS, LOG_COL_ATTRS], 3),
+        ] {
+            let (build_projection, build_schema, filters) = k1_filter(&extended, &projection, 7);
+            let shape = shape(
+                &build_schema,
+                &build_projection,
+                &declared,
+                &attr_keys,
+                full_len,
+                &[],
+            );
+            let reservation = unbounded();
+            let mut streams = StreamAttrsCache::new();
+            let ((first, _, dropped, merged), (then, _, _, then_merged)) = both_orders(
+                &block,
+                0,
+                N,
+                &mut streams,
+                &shape,
+                &reservation,
+                Some(RowRefRange {
+                    segment: 0,
+                    block: 0,
+                    first_row: 0,
+                }),
+                &filters,
+            );
+            assert_eq!(
+                merged, merged_kept,
+                "the first pass merges no row ({projection:?})"
+            );
+            assert_eq!(then_merged, N, "build-then-filter merges every row");
+            assert_eq!(dropped, N - 3);
+            let got = first.batch.expect("kept rows");
+            assert_same_columns(&got, &then);
+            let ts = got
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("ts");
+            assert_eq!(ts.values().to_vec(), vec![2, 5, 8], "the kept rows");
+            assert_eq!(reservation.size(), streams.charged());
+        }
     }
 
     /// [`check_case`]'s blocks with the row filter `k1 = v`: per chunk, the
@@ -9003,6 +9116,11 @@ mod row_path_tests {
             .filter(|&i| case.mask.get(i).copied().unwrap_or(false))
             .collect();
         let attrs_projected = projection.contains(&LOG_COL_ATTRS);
+        let k1 = extended.index_of("k1").expect("k1");
+        // The columns built for the survivors read merged attributes.
+        let rest_merges = projection
+            .iter()
+            .any(|&i| i != k1 && (i == LOG_COL_ATTRS || i >= FIRST_DECLARED_COL));
         let (build_projection, build_schema, filters) = k1_filter(&extended, &projection, v);
         let shape = shape(
             &build_schema,
@@ -9027,7 +9145,10 @@ mod row_path_tests {
                     block: block_no,
                     first_row: start,
                 });
-                let ((first, first_attrs, first_dropped), (then, _, then_dropped)) = both_orders(
+                let (
+                    (first, first_attrs, first_dropped, first_merged),
+                    (then, then_attrs, then_dropped, then_merged),
+                ) = both_orders(
                     &block,
                     start,
                     end,
@@ -9041,7 +9162,14 @@ mod row_path_tests {
                 let emitted = first.batch.as_ref().map_or(0, RecordBatch::num_rows);
                 prop_assert_eq!(emitted, then.num_rows());
                 prop_assert_eq!(first.unerased, emitted + first_dropped);
-                prop_assert_eq!(first_attrs, if attrs_projected { emitted } else { 0 });
+                if erasure.is_empty() {
+                    prop_assert_eq!(first_attrs, if attrs_projected { emitted } else { 0 });
+                    prop_assert_eq!(first_merged, if rest_merges { emitted } else { 0 });
+                } else {
+                    // Pending erasure builds the chunk whole, then filters.
+                    prop_assert_eq!((first_attrs, first_merged), (then_attrs, then_merged));
+                }
+                prop_assert!(first_merged <= then_merged, "no row merged twice");
                 if let Some(got) = &first.batch {
                     prop_assert_eq!(got.schema(), then.schema());
                     for (n, field) in got.schema().fields().iter().enumerate() {
