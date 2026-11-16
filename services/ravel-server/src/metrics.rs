@@ -87,7 +87,7 @@
 //! not take and are appended by the `/metrics` handler after it, so
 //! [`render`] alone does not produce the whole scrape body.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::Router;
@@ -521,6 +521,12 @@ pub enum Label {
     /// `ravel_query`, which also owns the spelling. Shares the `outcome` key
     /// with `AlertOutcome`.
     KeyIndexOutcome(ravel_query::key_index_route::KeyIndexPartOutcome),
+    /// A `sys/compat` format family (ADR-4233 decision 3): one of the known
+    /// families, or `other`. Shares the `family` key with `FormatFamily`.
+    CompatFamily(crate::compat::CompatFamilyLabel),
+    /// Why a writer refused a publish under the `sys/compat` write policy.
+    /// Shares the `reason` key.
+    CompatRefusalReason(crate::compat::CompatRefusalReason),
 }
 
 /// The closed `phase` set of `ravel_agents_sweep_list_pages_total`.
@@ -802,6 +808,8 @@ impl Label {
             Label::ProvisioningReadCause(_) => "cause",
             Label::HeadHoldOutcome(_) => "outcome",
             Label::KeyIndexOutcome(_) => "outcome",
+            Label::CompatFamily(_) => "family",
+            Label::CompatRefusalReason(_) => "reason",
         }
     }
 
@@ -875,6 +883,8 @@ impl Label {
             Label::ProvisioningReadCause(cause) => cause.label().to_string(),
             Label::HeadHoldOutcome(outcome) => outcome.name().to_string(),
             Label::KeyIndexOutcome(outcome) => outcome.as_str().to_string(),
+            Label::CompatFamily(family) => family.as_str().to_string(),
+            Label::CompatRefusalReason(reason) => reason.name().to_string(),
         }
     }
 
@@ -5567,6 +5577,149 @@ fn render_auth_subject_family(
 /// [`render_catalog_family`] and [`render_store_probe_family`] above. Rendered
 /// only when a `DurableAuthState` exists, so a process with no keyed deployment
 /// omits the whole family rather than exporting three permanent zeros.
+/// What `/metrics` renders of this process's `sys/compat` view (ADR-4233
+/// decision 3), read at scrape time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompatSnapshot {
+    /// Seconds since the last successful read started; `None` before one.
+    pub view_age_seconds: Option<f64>,
+    /// The highest `compat_epoch` the view has seen.
+    pub epoch: u64,
+    /// Each family the view has seen, with the highest active write version
+    /// seen for it, in [`ravel_catalog::compat::KNOWN_FAMILIES`] order and then
+    /// `other`.
+    pub active_write_versions: Vec<(crate::compat::CompatFamilyLabel, u32)>,
+    pub refusals: Vec<(
+        crate::compat::CompatFamilyLabel,
+        crate::compat::CompatRefusalReason,
+        u64,
+    )>,
+    pub refresh_failures: u64,
+}
+
+impl CompatSnapshot {
+    /// Read `view` and the process-global compat counters at `now_unix_ns`.
+    pub fn of(view: &ravel_catalog::compat::CompatView, now_unix_ns: i64) -> CompatSnapshot {
+        let view_age_seconds = view
+            .last_read_unix_ns()
+            .map(|last| now_unix_ns.saturating_sub(last).max(0) as f64 / 1e9);
+        let mut active: BTreeMap<crate::compat::CompatFamilyLabel, u32> = BTreeMap::new();
+        let mut seen_names: Vec<String> = ravel_catalog::compat::KNOWN_FAMILIES
+            .iter()
+            .map(|f| (*f).to_string())
+            .collect();
+        if let Some(record) = view.last_record() {
+            seen_names.extend(record.families.into_iter().map(|f| f.family));
+        }
+        for name in seen_names {
+            if let Some(seen) = view.seen_family(&name) {
+                let label = crate::compat::CompatFamilyLabel::of(&name);
+                let slot = active.entry(label).or_insert(0);
+                *slot = (*slot).max(seen.active_write_version);
+            }
+        }
+        let order = |label: &crate::compat::CompatFamilyLabel| {
+            ravel_catalog::compat::KNOWN_FAMILIES
+                .iter()
+                .position(|known| *known == label.as_str())
+                .unwrap_or(usize::MAX)
+        };
+        let mut active_write_versions: Vec<_> = active.into_iter().collect();
+        active_write_versions.sort_by_key(|(label, _)| order(label));
+        CompatSnapshot {
+            view_age_seconds,
+            epoch: view.seen_epoch(),
+            active_write_versions,
+            refusals: crate::compat::publish_refusals_snapshot(),
+            refresh_failures: crate::compat::refresh_failures_total(),
+        }
+    }
+}
+
+/// The `sys/compat` families (ADR-4233 decision 3). Rendered only by a process
+/// that installed a write policy, which needs a deployment key.
+pub(crate) fn render_compat_family(out: &mut String, mode: Mode, snapshot: &CompatSnapshot) {
+    write_header(
+        out,
+        "ravel_compat_publish_refused_total",
+        "Publishes a writer refused under the sys/compat write policy, by format family and reason: a view older than the 10 minute horizon, an active version this build does not write, or a missing record after an activation (ADR-4233 decision 3).",
+        "counter",
+    );
+    for (family, reason, count) in &snapshot.refusals {
+        write_sample(
+            out,
+            "ravel_compat_publish_refused_total",
+            &[
+                Label::Mode(mode),
+                Label::CompatFamily(*family),
+                Label::CompatRefusalReason(*reason),
+            ],
+            *count,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_compat_refresh_failures_total",
+        "Reads of sys/compat that failed; the view keeps its last successful read (ADR-4233 decision 3).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_compat_refresh_failures_total",
+        &[Label::Mode(mode)],
+        snapshot.refresh_failures,
+    );
+
+    write_header(
+        out,
+        "ravel_compat_view_age_seconds",
+        "Seconds since this process's last successful read of sys/compat started; +Inf before the first. Writers refuse at 600 (ADR-4233 decision 3).",
+        "gauge",
+    );
+    match snapshot.view_age_seconds {
+        Some(age) => write_sample_f64(
+            out,
+            "ravel_compat_view_age_seconds",
+            &[Label::Mode(mode)],
+            age,
+        ),
+        None => {
+            out.push_str("ravel_compat_view_age_seconds");
+            write_labels(out, &[Label::Mode(mode)], None);
+            out.push_str(" +Inf\n");
+        }
+    }
+
+    write_header(
+        out,
+        "ravel_compat_epoch",
+        "The highest sys/compat compat_epoch this process has seen; 0 before any activation (ADR-4233 decision 3).",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_compat_epoch",
+        &[Label::Mode(mode)],
+        snapshot.epoch,
+    );
+
+    write_header(
+        out,
+        "ravel_compat_active_write_version",
+        "The highest active write version this process has seen in sys/compat, per format family the record names (ADR-4233 decision 3).",
+        "gauge",
+    );
+    for (family, version) in &snapshot.active_write_versions {
+        write_sample(
+            out,
+            "ravel_compat_active_write_version",
+            &[Label::Mode(mode), Label::CompatFamily(*family)],
+            u64::from(*version),
+        );
+    }
+}
+
 fn render_durable_auth_family(
     out: &mut String,
     mode: Mode,
@@ -10520,6 +10673,14 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
             .as_ref(),
     );
     render_heartbeat_age_family(&mut body, state.mode, state.heartbeat.age());
+    if let Some(view) = state.catalog.compat_policy() {
+        use ravel_catalog::compat::CompatClock as _;
+        render_compat_family(
+            &mut body,
+            state.mode,
+            &CompatSnapshot::of(view, crate::compat::SystemCompatClock.now_unix_ns()),
+        );
+    }
     if let Some(cache) = &state.decoded_cache {
         render_decoded_cache_family(&mut body, state.mode, &DecodedCacheMetrics::of(cache));
     }
@@ -11062,6 +11223,8 @@ mod tests {
             Label::ProvisioningReadCause(ProvisioningReadCause::Store),
             Label::HeadHoldOutcome(crate::ingest_hold::HoldOutcome::Refused),
             Label::KeyIndexOutcome(ravel_query::key_index_route::KeyIndexPartOutcome::Covered),
+            Label::CompatFamily(crate::compat::CompatFamilyLabel::of("rlog")),
+            Label::CompatRefusalReason(crate::compat::CompatRefusalReason::ViewStale),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -11136,6 +11299,8 @@ mod tests {
                 Label::ProvisioningReadCause(_) => "cause",
                 Label::HeadHoldOutcome(_) => "outcome",
                 Label::KeyIndexOutcome(_) => "outcome",
+                Label::CompatFamily(_) => "family",
+                Label::CompatRefusalReason(_) => "reason",
             })
             .collect();
         assert_eq!(
@@ -11244,6 +11409,10 @@ mod tests {
                 // KeyIndexOutcome (ADR-3692 decision 7) reuses the `outcome`
                 // key.
                 "outcome",
+                // CompatFamily (ADR-4233 decision 3) reuses the `family` key.
+                "family",
+                // CompatRefusalReason reuses the `reason` key.
+                "reason",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), ADR-1692 decision 2's `shard` \
@@ -11258,8 +11427,8 @@ mod tests {
         );
         assert_eq!(
             one_of_each.len(),
-            50,
-            "exactly 50 label variants every build has, 27 distinct keys (sql adds DdlKind, \
+            52,
+            "exactly 52 label variants every build has, 27 distinct keys (sql adds DdlKind, \
              DdlOutcome and DdlPhase; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(

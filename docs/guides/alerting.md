@@ -316,6 +316,57 @@ and stops once the memo's watermark passes the object's hour. A tick with no
 usable memo (missing, corrupt, or at a version this build cannot read) folds
 the whole history and counts the object again whatever its hour.
 
+### The format write policy and the alert lease
+
+On a keyed bucket (`--tenant-hash-key-file`), every process reads
+`sys/compat`, the store-wide format activation record, at startup and every
+60 seconds. The evaluator follows it:
+
+- It writes each transition at the RLOG version the record names for `rlog`,
+  in the object's trailer and in its commit record's
+  `segment_format_version`. The version is chosen when the record starts
+  encoding.
+- Before the PUT of a history object, and before every attempt to publish
+  its commit record, it checks that `sys/compat` was read less than 10
+  minutes ago and is still present after an activation. A refused PUT fails the rule for
+  this tick, as any failed record write does.
+- A tick that runs longer than the publish lifetime the record states
+  (`max_publish_lifetime_ns`) stops: the rules it has not reached fail with
+  `alert tick abandoned past the publish lifetime` and are retried next
+  tick.
+- When the record names an `rlog` version this build does not write, or the
+  view is stale, the tick evaluates no rule and reports
+  `outcome="lease_unavailable"`, and
+  `ravel_compat_publish_refused_total{family="rlog"}` counts the refusal.
+
+The alert lease (`t/<tenant_hash>/a/alert-lease`) is the fence against an
+evaluator older than the contract. It is JSON with `holder` and `expiry_ns`,
+and two fields that default to 0 when absent: `compat_expiry_ns` and
+`compat_epoch`. A *parked* lease has `expiry_ns = i64::MAX`. An older
+evaluator reads it as held by someone else and never writes, and this
+evaluator reads `compat_expiry_ns` as the real expiry instead. Three rules
+keep a parked lease parked:
+
+- A lease whose `compat_epoch` is above the epoch this process has seen,
+  whoever holds it, makes the evaluator re-read `sys/compat` before it acts
+  on the lease. If the epoch is still above after the read, the tick reports
+  `outcome="lease_unavailable"`.
+- Once `rlog` has been activated, every lease the evaluator writes is in the
+  parked form, with its own expiry in `compat_expiry_ns`.
+- An evaluator whose build cannot write the active `rlog` version takes no
+  lease. If it holds one, it writes it back parked with
+  `compat_expiry_ns = 0`, so an evaluator that can write takes over on its
+  next tick.
+
+`ravel_alerting::park_lease` is the function an activation uses to park a
+tenant's lease: it creates an absent lease, or replaces an existing one
+whoever holds it, with holder `compat-fence/<epoch>`, and leaves alone a lease
+already parked at that epoch or later.
+
+On an unkeyed bucket the process cannot authenticate `sys/compat`. It
+installs no policy, writes the version this build writes by default, and
+writes unparked leases.
+
 ### Upgrade from per-rule alerts
 
 Releases before per-series evaluation raised one alert per rule, with the
@@ -452,8 +503,11 @@ How to read the response:
   answers the same failure. A PromQL parse error keeps its own text, and a
   storage fault reads as a fixed message such as `upstream storage
   temporarily unavailable`. A history read failure reads `alert history
-  unreadable`, a lease failure `alert lease unavailable`, and a failed record
-  write `alert record write failed`. `lastError` never carries an object
+  unreadable`, a lease failure `alert lease unavailable`, a tick the format
+  write policy refused `alert writes refused by the format write policy`, a
+  rule a tick skipped after running past the policy's publish lifetime `alert
+  tick abandoned past the publish lifetime`, and a failed record write `alert
+  record write failed`. `lastError` never carries an object
   key, the tenant hash or the storage backend's own error text; the server
   log has the full error.
 - `state` is `firing` when any alert of the rule is firing, else `pending`

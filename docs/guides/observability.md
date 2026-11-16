@@ -994,6 +994,28 @@ says what to do when they move.
 | `ravel_format_floor_refused_total` | Publishes refused because the object would be written below the bucket's recorded floor for its family. An ingest write, strict or buffered, is refused at admission, before it is buffered, with a retryable error (HTTP 503). Rows buffered before a refresh raised the floor are refused when their flush opens: they are dropped, and a strict write waiting on them gets the same error. A refused compaction or erasure rewrite builds and publishes nothing. Alert on any increase. |
 | `ravel_format_floor_writes_below_total` | Ingest flushes opened, and compactions and erasure rewrites started, below the bucket's recorded floor under `--write-below-format-floor`. Counted when the flush opens or the run passes its floor check, so one that then fails before its PUT still counts. Each one that publishes contradicts the floor, and `ravel-cli maintain audit-versions` reports it `contradicted`. |
 
+### Format write policy (`ravel_compat_*`)
+
+Labels: `mode`, plus `family` and `reason` where shown. Every process reads
+`sys/compat`, the store-wide format activation record, once at startup and then every 60 seconds, keyed by the deployment key. The
+family renders only in a process started with `--tenant-hash-key-file`: an
+unkeyed process cannot authenticate the record, installs no write policy, and
+omits the whole family. `family` is one of `rseg`, `rlog`, `rspan`,
+`catalog-head`, `csnap`, `npost`, `cstat`, `kidx`, `commit-record`,
+`compaction-record`, `rewrite-record`, `retention-tombstone`, or `other` for a
+family only a newer release knows.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_compat_publish_refused_total` | Counter, by `family` and `reason`. Publishes a writer refused under the write policy. `reason` is `view_stale` (the last successful read of `sys/compat` is 10 minutes old, or there has been none), `active_version_not_writable` (the record names a version this build does not write), or `compat_record_missing` (the record is absent although this process has seen an activation). Every known family renders all three reasons at 0 before the first refusal. In this release the alert evaluator and the catalog fold count here. Alert on any increase. |
+| `ravel_compat_refresh_failures_total` | Counter. Reads of `sys/compat` that failed. The view keeps its last successful read, so writers keep going until that read is 10 minutes old. A record written by a newer release fails every read and is logged at error with both format versions. |
+| `ravel_compat_view_age_seconds` | Gauge. Seconds since the last successful read started; `+Inf` before the first one. Writers refuse at 600. |
+| `ravel_compat_epoch` | Gauge. The highest store-wide `compat_epoch` this process has seen; 0 before any activation. |
+| `ravel_compat_active_write_version` | Gauge, by `family`. The active write version this process has seen for each family the record names. |
+
+A `ravel_compat_view_age_seconds` above 120 means no refresh has succeeded
+for two intervals; at 600 every writer that follows the policy refuses.
+
 ### Store reachability
 
 Labels: `mode`. All three samples come from the background store-reachability
@@ -1844,7 +1866,7 @@ The `outcome` label carries one of four values, one per tick:
 |---|---|
 | `evaluated` | This replica held the tenant's alert lease and evaluated every rule. |
 | `lease_not_held` | A peer replica held the lease, so this one skipped evaluation. Healthy, and the steady state of every replica that is not the holder. |
-| `lease_unavailable` | The lease read or write failed against object storage. Evaluation was skipped and is retried next tick. |
+| `lease_unavailable` | The lease read or write failed against object storage, or the `sys/compat` write policy refused alert history writes (counted in `ravel_compat_publish_refused_total{family="rlog"}`). Evaluation was skipped and is retried next tick. |
 | `history_unavailable` | The tenant's alert history could not be read, so nothing was evaluated. The evaluator never acts on a partial history, because a partial history re-fires an alert that is already firing. An object whose bytes match its commit record's content hash but whose RLOG version is newer than this build reads refuses the tick the same way and is additionally counted on `ravel_alert_history_newer_version_refusals_total`. One whose version is older than this build reads is skipped and counted on `ravel_alert_history_records_skipped_total`, and the tick evaluates unless another object in the same fold is corrupt, unreachable or newer, in which case the tick counts here and the skip stays counted. An object that reads as an out-of-window version but does not match that hash is corrupt and counts here only. |
 
 Do not sum `lease_not_held` with the two failure outcomes. In a multi-replica

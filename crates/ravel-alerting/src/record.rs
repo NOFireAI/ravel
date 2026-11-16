@@ -7,7 +7,7 @@
 //! [`RlogReader`]. This crate builds no segment bytes of its own; see the crate
 //! doc comment for the attrs-key convention.
 
-use ravel_logseg::{LogRecord, ObjectIdentity, RlogConfig, RlogWriter};
+use ravel_logseg::{LogRecord, ObjectIdentity, RlogConfig, RlogWriter, WriteVersion};
 use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
 
 use crate::error::AlertError;
@@ -306,7 +306,19 @@ pub fn encode_record_object(
     cfg: RlogConfig,
     identity: ObjectIdentity,
 ) -> Result<Vec<u8>, AlertError> {
-    let mut writer = RlogWriter::new(cfg, identity);
+    encode_record_object_at(record, cfg, identity, WriteVersion::CURRENT)
+}
+
+/// [`encode_record_object`] emitting `version` in the RLOG trailer: the
+/// version the `sys/compat` write policy names for `rlog` (ADR-4233
+/// decision 2).
+pub fn encode_record_object_at(
+    record: &AlertRecord,
+    cfg: RlogConfig,
+    identity: ObjectIdentity,
+    version: WriteVersion,
+) -> Result<Vec<u8>, AlertError> {
+    let mut writer = RlogWriter::new(cfg, identity).with_write_version(version);
     writer.push(record.to_log_record())?;
     Ok(writer.finish()?)
 }
@@ -340,6 +352,32 @@ pub fn write_alert_record(
     cfg: RlogConfig,
     identity: ObjectIdentity,
 ) -> Result<Option<Vec<u8>>, AlertError> {
+    write_alert_record_at(
+        rule,
+        instance,
+        transition,
+        prior,
+        input_alert_generations,
+        now_ns,
+        cfg,
+        identity,
+        WriteVersion::CURRENT,
+    )
+}
+
+/// [`write_alert_record`] emitting `version` in the RLOG trailer.
+#[allow(clippy::too_many_arguments)]
+pub fn write_alert_record_at(
+    rule: &Rule,
+    instance: &AlertInstance,
+    transition: &StateTransition,
+    prior: Option<&AlertRecord>,
+    input_alert_generations: &[u32],
+    now_ns: i64,
+    cfg: RlogConfig,
+    identity: ObjectIdentity,
+    version: WriteVersion,
+) -> Result<Option<Vec<u8>>, AlertError> {
     if !transition.write_record {
         return Ok(None);
     }
@@ -351,7 +389,9 @@ pub fn write_alert_record(
     guard_generation(generation, rule.max_alert_generation)?;
     let record =
         build_instance_transition_record(rule, instance, transition.next_state, generation, now_ns);
-    Ok(Some(encode_record_object(&record, cfg, identity)?))
+    Ok(Some(encode_record_object_at(
+        &record, cfg, identity, version,
+    )?))
 }
 
 #[cfg(test)]

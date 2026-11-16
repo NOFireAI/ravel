@@ -75,17 +75,20 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
+use ravel_alerting::lease::{AlertLease, alert_lease_key};
 use ravel_alerting::{
     AlertError, AlertId, AlertInstance, AlertRecord, AlertState, DEFAULT_REPEAT_INTERVAL,
     QueryResultSummary, Rule, RuleCondition, RuleQuery, StateTransition, ThresholdOp,
-    alert_instances, evaluate_transition, matching_series, merged_alert_labels, write_alert_record,
+    alert_instances, evaluate_transition, matching_series, merged_alert_labels,
+    write_alert_record_at,
 };
+use ravel_catalog::compat::{CompatRefusal, CompatView, FAMILY_RLOG};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_commit::{keys, publish, record};
-use ravel_ingest::{Clock, LOG_SEGMENT_FORMAT_VERSION};
-use ravel_logseg::{LogSegError, ObjectIdentity, Predicate, RlogConfig, RlogReader};
+use ravel_ingest::Clock;
+use ravel_logseg::{LogSegError, ObjectIdentity, Predicate, RlogConfig, RlogReader, WriteVersion};
 use ravel_object_store::{
     GetRange, ObjectMeta, ObjectStoreBackend, PageToken, PutMode, PutOptions, StoreError,
 };
@@ -93,7 +96,7 @@ use ravel_promql::Value as PromqlValue;
 use ravel_query::http::QueryErrorResponse;
 use ravel_query::{Coverage, QueryEngine};
 use ravel_types::{Signal, TenantHash, TenantId};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -224,7 +227,7 @@ pub const STALE_AFTER_INTERVALS: u32 = 3;
 /// `write_alert_state_memo` PUT; on a tick whose history read failed it is
 /// after the memo read and the failed fold, with no rule evaluation; on a tick
 /// where another replica holds the lease, or the lease acquire failed, it is
-/// after `acquire_lease`, again with no rule evaluation.
+/// after `lease_step`, again with no rule evaluation.
 ///
 /// The deadline is checked before each attempt rather than during one, and the
 /// first attempt of a tick is unconditional, so the pass can overshoot by one
@@ -239,31 +242,6 @@ pub const STALE_AFTER_INTERVALS: u32 = 3;
 /// returns, so an overrunning tick delays the next tick rather than
 /// overlapping it.
 const SINK_DELIVERY_DEADLINE_FRACTION: (u32, u32) = (1, 2);
-
-/// The per-tenant alert lease object body: who holds it and until when.
-/// Small JSON, mirroring how the rules file is already JSON; the value is
-/// advisory coordination state, not a frozen persistent format.
-#[derive(Debug, Serialize, Deserialize)]
-struct AlertLease {
-    /// The holding evaluator's `writer_id`, hex-encoded. Minted fresh per task,
-    /// so a replica can distinguish its own lease from a peer's.
-    holder: String,
-    /// Wall-clock nanosecond at or after which any replica may take the lease
-    /// over, even one held by a different `holder`.
-    expiry_ns: i64,
-}
-
-/// The lease object key for a tenant's alert evaluation.
-///
-/// Lives under the tenant's alert keyspace (`Signal::Alerts` prefix `a`) but
-/// deliberately outside the `c/<shard>/` commit prefix that
-/// [`AlertEvaluator::load_latest_records`] folds, so the fold never lists it and
-/// never mistakes it for a commit record. It is mutable coordination state, not
-/// an immutable data/commit object, so the object-key immutability rule does not
-/// apply to it.
-fn alert_lease_key(tenant: &TenantHash) -> String {
-    format!("t/{}/a/alert-lease", tenant.to_hex())
-}
 
 /// The query engines an evaluator runs rules against: the very instances the
 /// query endpoints serve from, not a second construction of them.
@@ -667,6 +645,7 @@ pub fn spawn(
     clock: Arc<dyn Clock>,
     config: AlertEvalConfig,
     published: PublishedAlerts,
+    compat: Option<CompatView>,
 ) -> anyhow::Result<AlertEvalTasks> {
     config.check_spawnable()?;
     if !config.enabled || config.rules.is_empty() {
@@ -692,7 +671,8 @@ pub fn spawn(
             rules.clone(),
             &config,
         )?
-        .with_published(published.clone());
+        .with_published(published.clone())
+        .with_compat(compat.clone());
         // Warn once per rule whose repeat cadence is finer than the tick can
         // deliver: the effective cadence is `repeat_interval` rounded up to the
         // next tick, so a sub-tick interval is silently coarsened to the tick
@@ -1190,7 +1170,45 @@ pub struct AlertEvaluator {
     /// [`PublishedAlerts::none`] unless [`AlertEvaluator::with_published`]
     /// set it.
     published: PublishedAlerts,
+    /// The process's `sys/compat` view (ADR-4233 decisions 3 and 4): the
+    /// version alert history is written at, and the lease rules. `None`
+    /// writes [`WriteVersion::CURRENT`] and an unparked lease, as before.
+    compat: Option<CompatView>,
 }
+
+/// What the `sys/compat` write policy says about this evaluator's alert
+/// history writes at one instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RlogPolicy {
+    /// The RLOG version a record encoded now is written at.
+    version: WriteVersion,
+    /// Whether `rlog` has been activated above the baseline, so every lease
+    /// this evaluator writes is in the parked form (ADR-4233 decision 4).
+    parked: bool,
+    /// The view's `compat_epoch`, stamped on every lease written.
+    epoch: u64,
+}
+
+/// What [`AlertEvaluator::lease_step`] decided for one tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LeaseStep {
+    /// This evaluator holds the lease and may write.
+    Held,
+    /// Another evaluator holds a live lease, or a takeover race was lost.
+    NotHeld,
+    /// The write policy refuses `rlog` publishes: the view is stale, the
+    /// record is missing after an activation, or this build cannot write the
+    /// active version. No rule is evaluated.
+    Refused(CompatRefusal),
+}
+
+/// The `lastError` of every rule on a tick the `sys/compat` write policy
+/// refused.
+const MSG_COMPAT_REFUSED: &str = "alert writes refused by the format write policy";
+
+/// The `lastError` of a rule a tick skipped because the tick ran past the
+/// publish lifetime `sys/compat` records.
+const MSG_TICK_ABANDONED: &str = "alert tick abandoned past the publish lifetime";
 
 impl AlertEvaluator {
     /// Build an evaluator for one tenant. `rules` are that tenant's rules only.
@@ -1230,7 +1248,75 @@ impl AlertEvaluator {
             // family at all.
             metrics: global_alert_metrics(),
             published: PublishedAlerts::none(),
+            compat: None,
         })
+    }
+
+    /// Follow `compat`'s write policy for alert history and the lease
+    /// (ADR-4233 decisions 3 and 4). [`spawn`] sets the process's view on
+    /// every evaluator it starts.
+    pub fn with_compat(mut self, compat: Option<CompatView>) -> AlertEvaluator {
+        self.compat = compat;
+        self
+    }
+
+    /// The write policy for `rlog` at `now_ns`. Without a view it is the
+    /// built-in version and an unparked lease.
+    fn rlog_policy(&self, now_ns: i64) -> Result<RlogPolicy, CompatRefusal> {
+        let Some(view) = &self.compat else {
+            return Ok(RlogPolicy {
+                version: WriteVersion::CURRENT,
+                parked: false,
+                epoch: 0,
+            });
+        };
+        let window = ravel_logseg::footer::SUPPORTED_VERSIONS;
+        let writable: Vec<u16> = (window.oldest()..=window.newest()).collect();
+        let active = view.write_policy(
+            now_ns,
+            FAMILY_RLOG,
+            &writable,
+            WriteVersion::CURRENT.number(),
+            None,
+        )?;
+        let version =
+            WriteVersion::new(active).map_err(|_| CompatRefusal::ActiveVersionNotWritable {
+                family: FAMILY_RLOG.to_string(),
+                active: u32::from(active),
+                writable: writable.clone(),
+            })?;
+        Ok(RlogPolicy {
+            version,
+            parked: view
+                .seen_family(FAMILY_RLOG)
+                .is_some_and(|seen| seen.activated_epoch > 0),
+            epoch: view.seen_epoch(),
+        })
+    }
+
+    /// [`Self::rlog_policy`], counting a refusal under
+    /// `ravel_compat_publish_refused_total{family="rlog"}`.
+    fn rlog_policy_counted(&self, now_ns: i64) -> Result<RlogPolicy, CompatRefusal> {
+        self.rlog_policy(now_ns).inspect_err(|refusal| {
+            crate::compat::record_publish_refusal(FAMILY_RLOG, refusal);
+        })
+    }
+
+    /// Whether the tick that started at `tick_ns` has run past the
+    /// `max_publish_lifetime_ns` (`P`) `sys/compat` records, after which it
+    /// writes nothing more (ADR-4233 decision 3: an alert publish ends within
+    /// one evaluation tick, and every writer is held to `P`).
+    fn tick_past_publish_lifetime(&self, tick_ns: i64) -> bool {
+        let Some(lifetime_ns) = self
+            .compat
+            .as_ref()
+            .and_then(CompatView::last_record)
+            .map(|record| record.max_publish_lifetime_ns)
+            .filter(|p| *p > 0)
+        else {
+            return false;
+        };
+        self.clock.now_ns().saturating_sub(tick_ns) > lifetime_ns
     }
 
     /// Publish every tick's snapshot of this tenant into `published`, which
@@ -1459,8 +1545,20 @@ impl AlertEvaluator {
         // only the write path is gated. `flush_sinks` below always runs, so a
         // notification already queued at this replica is still retried even on a
         // tick where a peer holds the lease.
-        let hold_lease = match self.acquire_lease(now_ns).await {
-            Ok(held) => held,
+        let hold_lease = match self.lease_step(now_ns).await {
+            Ok(LeaseStep::Held) => true,
+            Ok(LeaseStep::NotHeld) => false,
+            Ok(LeaseStep::Refused(refusal)) => {
+                tracing::warn!(
+                    tenant = %self.tenant.to_hex(),
+                    %refusal,
+                    "alert evaluation: the sys/compat write policy refuses alert history writes; \
+                     skipping rule evaluation this tick"
+                );
+                report.lease_unavailable = true;
+                observed.tick_error = Some(MSG_COMPAT_REFUSED.to_string());
+                false
+            }
             Err(err) => {
                 tracing::warn!(
                     tenant = %self.tenant.to_hex(),
@@ -1479,6 +1577,19 @@ impl AlertEvaluator {
             // borrowable for the write path; it is put back before returning.
             let rules = std::mem::take(&mut self.rules);
             for rule in &rules {
+                if self.tick_past_publish_lifetime(now_ns) {
+                    tracing::warn!(
+                        tenant = %self.tenant.to_hex(),
+                        rule_id = %rule.rule_id,
+                        "alert evaluation: tick ran past the sys/compat publish lifetime; \
+                         abandoning the rest of it, retried next tick"
+                    );
+                    report.rules_failed += 1;
+                    observed
+                        .rule_errors
+                        .insert(rule.rule_id.clone(), MSG_TICK_ABANDONED.to_string());
+                    continue;
+                }
                 let mut written = 0;
                 let result = self
                     .evaluate_rule(
@@ -1544,7 +1655,7 @@ impl AlertEvaluator {
             // tick a full fold, never correctness.
             //
             // The watermark is the seal bound, not `hour_bucket(now_ns)`. The
-            // alert lease permits a two-holder overlap (see `acquire_lease`): a
+            // alert lease permits a two-holder overlap (see `lease_step`): a
             // prior holder can still publish one in-flight transition after this
             // holder's tail LIST, stamped at that holder's clock reading at its
             // own publish (`evaluate_rule`). If that stamp lands in an hour below
@@ -1593,7 +1704,7 @@ impl AlertEvaluator {
     /// this hour re-reads every transition an in-flight prior holder might
     /// publish after this tick's own tail LIST.
     ///
-    /// The alert lease documents a two-holder overlap (see [`Self::acquire_lease`]):
+    /// The alert lease documents a two-holder overlap (see [`Self::lease_step`]):
     /// a prior holder whose lease has expired can still finish an in-flight tick
     /// and publish one transition. [`Self::evaluate_rule`] reads the clock
     /// immediately before that write, so the margin has to bound the prior
@@ -1641,35 +1752,138 @@ impl AlertEvaluator {
     /// tolerates and ADR-0043 decision 6 already permits. What it removes is the
     /// steady-state case of two healthy replicas both firing every rule every
     /// tick.
+    #[cfg(test)]
     async fn acquire_lease(&self, now_ns: i64) -> anyhow::Result<bool> {
+        Ok(matches!(self.lease_step(now_ns).await?, LeaseStep::Held))
+    }
+
+    /// The lease step of a tick under the `sys/compat` write policy (ADR-4233
+    /// decision 4), the three rules in order:
+    ///
+    /// - a lease whose `compat_epoch` is above the view's epoch, whoever holds
+    ///   it, makes this evaluator refresh `sys/compat` before acting on it, so
+    ///   a view that predates a parking never reads a parked lease as expired;
+    /// - while `rlog` is active above the baseline every lease this evaluator
+    ///   writes is parked (`expiry_ns = i64::MAX`, the real expiry in
+    ///   `compat_expiry_ns`), so a pre-baseline evaluator stays off it;
+    /// - an evaluator whose build cannot write the active `rlog` version takes
+    ///   no lease, and CAS-writes one it holds back to the parked form with
+    ///   `compat_expiry_ns = 0`, so a capable evaluator takes over at once.
+    ///
+    /// A stale view or a missing record refuses the step without touching the
+    /// lease. Without a view this is the plain lease: create, renew, or take
+    /// over an expired one.
+    async fn lease_step(&self, now_ns: i64) -> anyhow::Result<LeaseStep> {
         let key = alert_lease_key(&self.tenant);
         let identity = self.writer_id.to_string();
         let ttl_ns = i64::try_from(self.lease_ttl.as_nanos()).unwrap_or(i64::MAX);
-        let lease = AlertLease {
-            holder: identity.clone(),
-            expiry_ns: now_ns.saturating_add(ttl_ns),
+        let lease_for = |policy: &RlogPolicy| {
+            let expiry_ns = now_ns.saturating_add(ttl_ns);
+            if policy.parked {
+                AlertLease::parked(identity.clone(), expiry_ns, policy.epoch)
+            } else {
+                AlertLease::unparked(identity.clone(), expiry_ns, policy.epoch)
+            }
         };
-        let body = Bytes::from(serde_json::to_vec(&lease)?);
 
-        // Fast path: no lease object yet. `CreateIfAbsent` is atomic (ADR-0002),
-        // so at most one racing replica wins the create.
-        match self
-            .store
-            .put(&key, body.clone(), PutOptions::create_if_absent())
-            .await
+        let mut policy = self.rlog_policy(now_ns);
+        if let Ok(capable) = &policy {
+            // Fast path: no lease object yet. `CreateIfAbsent` is atomic
+            // (ADR-0002), so at most one racing replica wins the create.
+            match self
+                .store
+                .put(
+                    &key,
+                    lease_for(capable).to_bytes()?,
+                    PutOptions::create_if_absent(),
+                )
+                .await
+            {
+                Ok(_) => return Ok(LeaseStep::Held),
+                Err(StoreError::AlreadyExists) => {}
+                Err(err) => return Err(err.into()),
+            }
+        } else if let Err(refusal @ CompatRefusal::ViewStale { .. })
+        | Err(refusal @ CompatRefusal::CompatRecordMissing { .. }) = &policy
         {
-            Ok(_) => return Ok(true),
-            Err(StoreError::AlreadyExists) => {}
-            Err(err) => return Err(err.into()),
+            crate::compat::record_publish_refusal(FAMILY_RLOG, refusal);
+            return Ok(LeaseStep::Refused(refusal.clone()));
         }
 
-        // A lease already exists. Read it: we may renew our own or take over one
-        // that has expired, but never displace a live lease held by a peer.
-        let current = self.store.get(&key, GetRange::Full).await?;
-        let existing: AlertLease = serde_json::from_slice(&current.data)?;
+        // A lease already exists (or this build cannot write and only needs to
+        // know whether it holds one). Read it: we may renew our own or take
+        // over one that has expired, but never displace a live lease held by a
+        // peer.
+        let current = match self.store.get(&key, GetRange::Full).await {
+            Ok(current) => current,
+            Err(StoreError::NotFound) => match policy {
+                // The create above raced a delete; the next tick retries.
+                Ok(_) => return Ok(LeaseStep::NotHeld),
+                Err(refusal) => {
+                    crate::compat::record_publish_refusal(FAMILY_RLOG, &refusal);
+                    return Ok(LeaseStep::Refused(refusal));
+                }
+            },
+            Err(err) => return Err(err.into()),
+        };
+        let existing = AlertLease::from_slice(&current.data)?;
+
+        // Rule 1: a lease parked (or written) at an epoch this view has not
+        // seen is acted on only after a refresh.
+        if let Some(view) = &self.compat
+            && existing.compat_epoch > view.seen_epoch()
+        {
+            crate::compat::refresh_once(view).await;
+            if existing.compat_epoch > view.seen_epoch() {
+                anyhow::bail!(
+                    "the alert lease carries compat_epoch {}, above this process's sys/compat                      view at {} after a refresh; not acting on the lease this tick",
+                    existing.compat_epoch,
+                    view.seen_epoch()
+                );
+            }
+            policy = self.rlog_policy(now_ns);
+        }
+
+        let policy = match policy {
+            Ok(policy) => policy,
+            Err(refusal) => {
+                crate::compat::record_publish_refusal(FAMILY_RLOG, &refusal);
+                // Rule 3: hand a held lease back in the parked form, expired
+                // for every capable evaluator.
+                if matches!(refusal, CompatRefusal::ActiveVersionNotWritable { .. })
+                    && existing.holder == identity
+                    && !(existing.is_parked() && existing.compat_expiry_ns == 0)
+                {
+                    let epoch = self.compat.as_ref().map_or(0, CompatView::seen_epoch);
+                    let parked = AlertLease::parked(identity.clone(), 0, epoch);
+                    match self
+                        .store
+                        .put(
+                            &key,
+                            parked.to_bytes()?,
+                            PutOptions {
+                                mode: PutMode::CasVersion(current.version),
+                                checksum: None,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_) => tracing::warn!(
+                            tenant = %self.tenant.to_hex(),
+                            %refusal,
+                            "alert evaluation: this build cannot write the active rlog version;                              handed the alert lease back parked so a capable evaluator takes over"
+                        ),
+                        Err(StoreError::PreconditionFailed) => {}
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+                return Ok(LeaseStep::Refused(refusal));
+            }
+        };
+
         let held_by_other = existing.holder != identity;
-        if held_by_other && existing.expiry_ns > now_ns {
-            return Ok(false);
+        if held_by_other && existing.effective_expiry_ns() > now_ns {
+            return Ok(LeaseStep::NotHeld);
         }
 
         // Ours to renew, or expired and up for grabs. Version-guard the write so
@@ -1679,7 +1893,7 @@ impl AlertEvaluator {
             .store
             .put(
                 &key,
-                body,
+                lease_for(&policy).to_bytes()?,
                 PutOptions {
                     mode: PutMode::CasVersion(current.version),
                     checksum: None,
@@ -1687,8 +1901,8 @@ impl AlertEvaluator {
             )
             .await
         {
-            Ok(_) => Ok(true),
-            Err(StoreError::PreconditionFailed) => Ok(false),
+            Ok(_) => Ok(LeaseStep::Held),
+            Err(StoreError::PreconditionFailed) => Ok(LeaseStep::NotHeld),
             Err(err) => Err(err.into()),
         }
     }
@@ -1904,7 +2118,7 @@ impl AlertEvaluator {
             let prior = latest.get(&instance.alert_id).cloned();
             let transition = evaluate_transition(rule, prior.as_ref(), met, now_ns);
             if self
-                .write_transition(rule, instance, &transition, prior, latest)
+                .write_transition(rule, instance, &transition, prior, latest, now_ns)
                 .await
                 .map_err(|err| err.context(RecordWriteFailed))?
             {
@@ -1924,6 +2138,7 @@ impl AlertEvaluator {
         transition: &StateTransition,
         prior: Option<AlertRecord>,
         latest: &mut HashMap<AlertId, AlertRecord>,
+        tick_ns: i64,
     ) -> anyhow::Result<bool> {
         if !transition.write_record {
             return Ok(false);
@@ -1953,6 +2168,12 @@ impl AlertEvaluator {
         // pending-duration elapse is a property of when the rule was evaluated,
         // not of when its record reached the store.
         let publish_ns = self.clock.now_ns();
+        // The RLOG version is chosen as the record starts encoding, and every
+        // PUT below re-checks the view (ADR-4233 decision 3).
+        if self.tick_past_publish_lifetime(tick_ns) {
+            return Err(RuleRefusal(MSG_TICK_ABANDONED.to_string()).into());
+        }
+        let rlog_version = self.rlog_policy_counted(publish_ns)?.version;
         let stamp_ns = match prior.as_ref() {
             Some(p) => publish_ns.max(p.ts_ns.saturating_add(1)),
             None => publish_ns,
@@ -1974,7 +2195,7 @@ impl AlertEvaluator {
         // structural hop depth, rather than being mistaken for an ordinary
         // metric rule. Once the table lands, the generations of the rows a
         // tick actually consumed pass through here.
-        let Some(bytes) = write_alert_record(
+        let Some(bytes) = write_alert_record_at(
             rule,
             instance,
             transition,
@@ -1983,6 +2204,7 @@ impl AlertEvaluator {
             stamp_ns,
             RlogConfig::default(),
             identity,
+            rlog_version,
         )?
         else {
             return Ok(false);
@@ -1994,7 +2216,7 @@ impl AlertEvaluator {
         let written = decode_single_record(&bytes)?;
         // Publish with the same corrected stamp so the commit record's event
         // time matches the record's `ts_ns`.
-        self.publish(bytes, seq, stamp_ns).await?;
+        self.publish(bytes, seq, stamp_ns, rlog_version).await?;
 
         tracing::info!(
             tenant = %self.tenant.to_hex(),
@@ -2149,16 +2371,37 @@ impl AlertEvaluator {
     /// exactly as it was, and the next tick re-evaluates and rewrites the
     /// transition under a fresh stamp. What it leaves behind is one orphan data
     /// object, which is precisely what orphan GC reclaims.
-    async fn publish(&self, bytes: Vec<u8>, seq: u64, now_ns: i64) -> anyhow::Result<()> {
+    async fn publish(
+        &self,
+        bytes: Vec<u8>,
+        seq: u64,
+        now_ns: i64,
+        version: WriteVersion,
+    ) -> anyhow::Result<()> {
         let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
         self.publish_as(
             bytes,
             seq,
             now_ns,
             content_hash,
-            u32::from(LOG_SEGMENT_FORMAT_VERSION),
+            u32::from(version.number()),
         )
         .await
+    }
+
+    /// Refuse a PUT of alert history once the `sys/compat` view is past its
+    /// horizon or the record went missing (ADR-4233 decision 3: every PUT
+    /// attempt, retries included). The version itself was fixed when the
+    /// record started encoding.
+    fn check_compat_before_put(&self) -> anyhow::Result<()> {
+        if self.compat.is_none() {
+            return Ok(());
+        }
+        match self.rlog_policy_counted(self.clock.now_ns()) {
+            Ok(_) => Ok(()),
+            Err(refusal) => Err(anyhow::Error::new(refusal)
+                .context("alert history PUT refused by the sys/compat write policy")),
+        }
     }
 
     /// [`Self::publish`] with the commit record's content hash and segment
@@ -2194,6 +2437,7 @@ impl AlertEvaluator {
             ingest_hour_bucket: hour_bucket(now_ns),
         })?;
         let data_key = keys::reconstruct_data_key(&commit)?;
+        self.check_compat_before_put()?;
         let put_started_ns = self.clock.now_ns();
         publish::put_data_object(self.store.as_ref(), &data_key, data).await?;
         self.publish_commit_within_lifetime(&commit, &data_key, put_started_ns)
@@ -2228,6 +2472,7 @@ impl AlertEvaluator {
                      commit record is not written and the transition is rewritten next tick"
                 );
             }
+            self.check_compat_before_put()?;
             let remaining = Duration::from_nanos(
                 u64::try_from(lifetime_ns.saturating_sub(elapsed_ns)).unwrap_or(0),
             );
@@ -3377,6 +3622,7 @@ mod tests {
 mod tick_tests {
     use super::*;
     use ravel_alerting::compute_alert_id;
+    use ravel_ingest::LOG_SEGMENT_FORMAT_VERSION;
 
     use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
@@ -4941,7 +5187,7 @@ mod tick_tests {
                 ravel_alerting::encode_record_object(record, RlogConfig::default(), identity)
                     .expect("encode alert record");
             evaluator
-                .publish(bytes, seq, record.ts_ns)
+                .publish(bytes, seq, record.ts_ns, WriteVersion::CURRENT)
                 .await
                 .expect("publish alert record");
         }
@@ -8578,6 +8824,7 @@ mod tick_tests {
             TestClock::at(NOW_NS),
             config,
             PublishedAlerts::none(),
+            None,
         )
         .err()
         .expect("a zero eval interval must be refused at spawn");
@@ -9336,6 +9583,7 @@ mod tick_tests {
             TestClock::at(NOW_NS),
             config,
             published.clone(),
+            None,
         )
         .expect("spawn");
         assert!(matches!(
@@ -9468,5 +9716,339 @@ mod tick_tests {
             vec![NOW_NS + deadline_ns, NOW_NS + TAKES_NS + deadline_ns],
             "each rule's slice carries its own entry plus the query deadline"
         );
+    }
+
+    // --- sys/compat write policy (ADR-4233 decisions 3 and 4) ---------------
+
+    impl ravel_catalog::compat::CompatClock for TestClock {
+        fn now_unix_ns(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn compat_keys() -> ravel_catalog::compat::CompatKeys {
+        ravel_catalog::compat::CompatKeys::from_file_keys(&[[0x33; 32]]).expect("one key")
+    }
+
+    /// A `sys/compat` record naming `rlog` at `rlog_version`, activated at
+    /// `rlog_epoch` (0: never activated), under store-wide `epoch`.
+    fn compat_record(
+        rlog_version: u32,
+        rlog_epoch: u64,
+        epoch: u64,
+    ) -> ravel_proto::sys::v1::CompatRecord {
+        ravel_proto::sys::v1::CompatRecord {
+            compat_epoch: epoch,
+            families: vec![ravel_proto::sys::v1::CompatFamily {
+                family: FAMILY_RLOG.to_string(),
+                active_write_version: rlog_version,
+                activated_epoch: rlog_epoch,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Replace `sys/compat` with `record` through the monotone CAS update.
+    async fn update_compat_to(
+        store: &dyn ObjectStoreBackend,
+        record: ravel_proto::sys::v1::CompatRecord,
+    ) {
+        ravel_catalog::compat::update_compat(store, &compat_keys(), |current| {
+            current.compat_epoch = record.compat_epoch;
+            current.families = record.families;
+            Ok(())
+        })
+        .await
+        .expect("update sys/compat");
+    }
+
+    /// A view over `store` stamped by `clock`, refreshed once.
+    async fn refreshed_view(
+        store: &Arc<dyn ObjectStoreBackend>,
+        clock: &Arc<TestClock>,
+    ) -> CompatView {
+        let view = CompatView::new(Arc::clone(store), compat_keys(), clock.clone());
+        view.refresh().await.expect("refresh");
+        view
+    }
+
+    async fn read_lease(store: &dyn ObjectStoreBackend) -> Option<AlertLease> {
+        match store
+            .get(
+                &alert_lease_key(&TenantId::new(TENANT).hash()),
+                GetRange::Full,
+            )
+            .await
+        {
+            Ok(got) => Some(AlertLease::from_slice(&got.data).expect("lease parses")),
+            Err(StoreError::NotFound) => None,
+            Err(err) => panic!("lease read: {err}"),
+        }
+    }
+
+    fn live_ttl_ns() -> i64 {
+        i64::from(LEASE_TTL_TICKS) * DEFAULT_ALERT_EVAL_INTERVAL.as_nanos() as i64
+    }
+
+    /// Rule 1: an evaluator whose view predates an activation meets the lease
+    /// the activation parked. It refreshes before acting, sees `rlog` active,
+    /// and takes the (expired-for-capable-builds) parked lease over in the
+    /// parked form: the lease is never unparked.
+    ///
+    /// Without the refresh the evaluator still thinks `rlog` is at the
+    /// baseline and writes an unparked lease, which a pre-baseline evaluator
+    /// would read as expiring and take; the `expiry_ns` assertion fails.
+    #[tokio::test]
+    async fn a_stale_view_meeting_a_parked_lease_refreshes_and_keeps_it_parked() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        ravel_catalog::compat::create_compat(
+            store.as_ref(),
+            &compat_keys(),
+            compat_record(5, 0, 0),
+        )
+        .await
+        .expect("create sys/compat");
+        let view = refreshed_view(&store, &clock).await;
+        assert_eq!(view.seen_epoch(), 0);
+
+        // The activation and its lease walk happen after the view's read.
+        update_compat_to(store.as_ref(), compat_record(5, 1, 1)).await;
+        let tenant = TenantId::new(TENANT).hash();
+        assert_eq!(
+            ravel_alerting::park_lease(store.as_ref(), &tenant, 1)
+                .await
+                .expect("park"),
+            ravel_alerting::ParkOutcome::Created
+        );
+
+        let ev = evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view.clone()));
+        assert_eq!(
+            ev.lease_step(NOW_NS).await.expect("lease step"),
+            LeaseStep::Held
+        );
+        assert_eq!(
+            view.seen_epoch(),
+            1,
+            "the evaluator refreshed its view first"
+        );
+        let lease = read_lease(store.as_ref()).await.expect("lease present");
+        assert_eq!(
+            lease,
+            AlertLease {
+                holder: ev.writer_id.to_string(),
+                expiry_ns: i64::MAX,
+                compat_expiry_ns: NOW_NS + live_ttl_ns(),
+                compat_epoch: 1,
+            },
+            "taken over in the parked form, real expiry in compat_expiry_ns"
+        );
+
+        // A second capable evaluator honours the real expiry, not i64::MAX:
+        // blocked while it is live, takes over once it passes, still parked.
+        let other =
+            evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view.clone()));
+        assert_eq!(
+            other.lease_step(NOW_NS).await.expect("lease step"),
+            LeaseStep::NotHeld
+        );
+        let later = NOW_NS + live_ttl_ns() + NS_PER_SEC;
+        clock.set(later);
+        assert_eq!(
+            other.lease_step(later).await.expect("lease step"),
+            LeaseStep::Held
+        );
+        let lease = read_lease(store.as_ref()).await.expect("lease present");
+        assert_eq!(lease.expiry_ns, i64::MAX);
+        assert_eq!(lease.holder, other.writer_id.to_string());
+    }
+
+    /// Rule 3: a holder whose build cannot write the active `rlog` version
+    /// hands its lease back parked with `compat_expiry_ns = 0` and takes no
+    /// new one; a tick under that policy writes no record and counts the
+    /// refusal.
+    #[tokio::test]
+    async fn an_incapable_holder_reparks_its_lease_and_writes_nothing() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        ravel_catalog::compat::create_compat(
+            store.as_ref(),
+            &compat_keys(),
+            compat_record(5, 0, 0),
+        )
+        .await
+        .expect("create sys/compat");
+        let view = refreshed_view(&store, &clock).await;
+        let ev = evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view.clone()));
+        assert_eq!(
+            ev.lease_step(NOW_NS).await.expect("lease step"),
+            LeaseStep::Held
+        );
+        assert!(!read_lease(store.as_ref()).await.expect("lease").is_parked());
+
+        // `rlog` is activated at a version this build does not write.
+        update_compat_to(store.as_ref(), compat_record(6, 1, 1)).await;
+        view.refresh().await.expect("refresh");
+        let refused_before = rlog_refusals("active_version_not_writable");
+        let step = ev.lease_step(NOW_NS).await.expect("lease step");
+        assert!(
+            matches!(
+                step,
+                LeaseStep::Refused(CompatRefusal::ActiveVersionNotWritable { active: 6, .. })
+            ),
+            "{step:?}"
+        );
+        assert_eq!(
+            read_lease(store.as_ref()).await.expect("lease present"),
+            AlertLease {
+                holder: ev.writer_id.to_string(),
+                expiry_ns: i64::MAX,
+                compat_expiry_ns: 0,
+                compat_epoch: 1,
+            },
+            "handed back parked and already expired for a capable evaluator"
+        );
+        assert!(rlog_refusals("active_version_not_writable") > refused_before);
+
+        // A whole tick writes no record and reports the lease unavailable.
+        let mut ev = ev;
+        let report = ev.run_tick().await;
+        assert!(report.lease_unavailable, "{report:?}");
+        assert_eq!(report.records_written, 0);
+        assert!(
+            read_alert_records(store.as_ref(), TenantId::new(TENANT).hash())
+                .await
+                .is_empty()
+        );
+    }
+
+    /// Rule 3 with no lease present: an incapable evaluator creates none.
+    #[tokio::test]
+    async fn an_incapable_evaluator_takes_no_lease() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        ravel_catalog::compat::create_compat(
+            store.as_ref(),
+            &compat_keys(),
+            compat_record(6, 1, 1),
+        )
+        .await
+        .expect("create sys/compat");
+        let view = refreshed_view(&store, &clock).await;
+        let ev = evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view));
+        assert!(matches!(
+            ev.lease_step(NOW_NS).await.expect("lease step"),
+            LeaseStep::Refused(CompatRefusal::ActiveVersionNotWritable { .. })
+        ));
+        assert_eq!(read_lease(store.as_ref()).await, None);
+    }
+
+    /// A view that never read `sys/compat` refuses before the lease is
+    /// touched.
+    #[tokio::test]
+    async fn a_stale_view_touches_no_lease() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let view = CompatView::new(Arc::clone(&store), compat_keys(), clock.clone());
+        let ev = evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view));
+        assert!(matches!(
+            ev.lease_step(NOW_NS).await.expect("lease step"),
+            LeaseStep::Refused(CompatRefusal::ViewStale { .. })
+        ));
+        assert_eq!(read_lease(store.as_ref()).await, None);
+    }
+
+    /// A tick under a policy naming `rlog` at the version this build writes
+    /// writes its transition at that version: the RLOG trailer and the commit
+    /// record's `segment_format_version` both carry it.
+    #[tokio::test]
+    async fn a_tick_writes_alert_history_at_the_policy_version() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let policy_version = WriteVersion::CURRENT.number();
+        ravel_catalog::compat::create_compat(
+            store.as_ref(),
+            &compat_keys(),
+            compat_record(u32::from(policy_version), 0, 0),
+        )
+        .await
+        .expect("create sys/compat");
+        let view = refreshed_view(&store, &clock).await;
+        let mut ev =
+            evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view.clone()));
+        let report = ev.run_tick().await;
+        assert_eq!(report.records_written, 1, "{report:?}");
+        let versions = alert_object_versions(store.as_ref()).await;
+        assert_eq!(versions, vec![(policy_version, u32::from(policy_version))]);
+        let lease = read_lease(store.as_ref()).await.expect("lease");
+        assert!(
+            !lease.is_parked(),
+            "rlog is not activated, so the lease is unparked"
+        );
+    }
+
+    /// A tick is abandoned once it has run longer than the
+    /// `max_publish_lifetime_ns` the record states; without a view, or with
+    /// no lifetime recorded, it never is.
+    #[tokio::test]
+    async fn a_tick_past_the_recorded_publish_lifetime_is_abandoned() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let lifetime_ns = 10 * NS_PER_SEC;
+        let mut record = compat_record(5, 0, 0);
+        record.max_publish_lifetime_ns = lifetime_ns;
+        ravel_catalog::compat::create_compat(store.as_ref(), &compat_keys(), record)
+            .await
+            .expect("create sys/compat");
+        let view = refreshed_view(&store, &clock).await;
+        let with_view = evaluator(Arc::clone(&store), Arc::clone(&clock)).with_compat(Some(view));
+        let without_view = evaluator(Arc::clone(&store), Arc::clone(&clock));
+
+        clock.set(NOW_NS + lifetime_ns);
+        assert!(
+            !with_view.tick_past_publish_lifetime(NOW_NS),
+            "at P exactly"
+        );
+        clock.set(NOW_NS + lifetime_ns + 1);
+        assert!(with_view.tick_past_publish_lifetime(NOW_NS), "past P");
+        assert!(!without_view.tick_past_publish_lifetime(NOW_NS));
+    }
+
+    /// `(trailer version, commit segment_format_version)` of every alert
+    /// history object.
+    async fn alert_object_versions(store: &dyn ObjectStoreBackend) -> Vec<(u16, u32)> {
+        let tenant = TenantId::new(TENANT).hash();
+        let prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let mut out = Vec::new();
+        for meta in list_all_after(store, &prefix, None).await.expect("list") {
+            let commit = record::decode(
+                &store
+                    .get(&meta.key, GetRange::Full)
+                    .await
+                    .expect("get commit")
+                    .data,
+            )
+            .expect("decode commit");
+            let data_key = keys::verify_object_key(&commit).expect("object key");
+            let bytes = store
+                .get(&data_key, GetRange::Full)
+                .await
+                .expect("get data")
+                .data;
+            let at = bytes.len() - ravel_logseg::footer::TRAILER_LEN + 8;
+            let trailer = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+            out.push((trailer, commit.segment_format_version));
+        }
+        out
+    }
+
+    /// The process-global `rlog` refusal count under `reason`.
+    fn rlog_refusals(reason: &str) -> u64 {
+        crate::compat::publish_refusals_snapshot()
+            .into_iter()
+            .find(|(family, r, _)| family.as_str() == FAMILY_RLOG && r.name() == reason)
+            .map_or(0, |(_, _, count)| count)
     }
 }

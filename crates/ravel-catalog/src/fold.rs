@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use crate::catalog::Catalog;
 use crate::column_stats_build;
+use crate::compat;
 use crate::config::CatalogConfig;
 use crate::declared_stats;
 use crate::error::CatalogError;
@@ -965,6 +966,105 @@ fn varint_len(v: u64) -> u64 {
         rest >>= 7;
     }
     len
+}
+
+/// The catalog families a fold writes (ADR-4233 decision 8), in the order the
+/// write-policy gate checks them.
+pub const FOLD_CATALOG_FAMILIES: [&str; 5] = [
+    compat::FAMILY_CATALOG_HEAD,
+    compat::FAMILY_CSNAP,
+    compat::FAMILY_NPOST,
+    compat::FAMILY_CSTAT,
+    compat::FAMILY_KIDX,
+];
+
+/// The highest version of `family` a fold of `signal` emits. HEAD and the
+/// metrics key-index leaf carry a version that follows their content (HEAD 2
+/// only when a part ref carries a retired hour, a metrics leaf 3 only for a
+/// posting leaf), so the highest one is what an active version has to admit;
+/// every other catalog family has one write version. `None` for a family the
+/// fold does not write.
+pub fn fold_write_version(family: &str, signal: Signal) -> Option<u16> {
+    let version = match family {
+        compat::FAMILY_CATALOG_HEAD => {
+            HEAD_FORMAT_VERSIONS.iter().copied().max().unwrap_or(0) as u64
+        }
+        compat::FAMILY_CSNAP => u64::from(snapshot_format::VERSION),
+        compat::FAMILY_NPOST => u64::from(snapshot_format::POSTINGS_VERSION),
+        compat::FAMILY_CSTAT => snapshot_format::COLUMN_STATS_ACCEPTED_READ_VERSIONS
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, u64::from),
+        compat::FAMILY_KIDX => snapshot_format::key_index_leaf_versions_for_signal(signal)
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, u64::from),
+        _ => return None,
+    };
+    u16::try_from(version).ok()
+}
+
+/// Why a fold refused its cycle under the installed `sys/compat` write
+/// policy: the policy refused one catalog family. Nothing was written.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "catalog fold of {signal:?} refused by the sys/compat write policy for family {family}: {refusal}"
+)]
+pub struct FoldCompatRefusal {
+    pub family: &'static str,
+    pub signal: Signal,
+    pub refusal: compat::CompatRefusal,
+}
+
+impl Catalog {
+    /// Install the `sys/compat` write policy the fold follows for the catalog
+    /// families (ADR-4233 decisions 2 and 3). `None`, the default, keeps
+    /// today's bytes and never refuses.
+    pub fn with_compat_policy(mut self, policy: Option<compat::CompatView>) -> Self {
+        self.compat_policy = policy;
+        self
+    }
+
+    /// The installed write policy, if any.
+    pub fn compat_policy(&self) -> Option<&compat::CompatView> {
+        self.compat_policy.as_ref()
+    }
+
+    /// The version each catalog family is written at by a fold of `signal` at
+    /// `now_ns`, or the first family the installed policy refuses. With no
+    /// policy installed every family is at [`fold_write_version`].
+    ///
+    /// The fold writes one version per family (the highest its content can
+    /// need, for HEAD and the metrics key-index leaf), so the policy has to
+    /// name exactly that version: an active version this build does not
+    /// write, a stale view, or a missing record refuses the whole cycle before
+    /// anything is written.
+    pub fn fold_compat_versions(
+        &self,
+        signal: Signal,
+        now_ns: i64,
+    ) -> Result<Vec<(&'static str, u16)>, FoldCompatRefusal> {
+        let mut versions = Vec::with_capacity(FOLD_CATALOG_FAMILIES.len());
+        for family in FOLD_CATALOG_FAMILIES {
+            let Some(written) = fold_write_version(family, signal) else {
+                continue;
+            };
+            let version = match &self.compat_policy {
+                None => written,
+                Some(view) => view
+                    .write_policy(now_ns, family, &[written], written, None)
+                    .map_err(|refusal| FoldCompatRefusal {
+                        family,
+                        signal,
+                        refusal,
+                    })?,
+            };
+            versions.push((family, version));
+        }
+        Ok(versions)
+    }
 }
 
 // Test-only instrumentation for #1482: counts calls to
@@ -4175,6 +4275,18 @@ impl Catalog {
         {
             return Err(CatalogError::InvalidConfig(
                 "seal_through_hour is later than the hour bucket of now_ns",
+            ));
+        }
+        // Backstop for a caller that did not ask `fold_compat_versions` first:
+        // a refused family fails the cycle before anything is read or written.
+        if let Err(refusal) = self.fold_compat_versions(signal, now_ns) {
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                %refusal,
+                "catalog fold refused by the sys/compat write policy; nothing written"
+            );
+            return Err(CatalogError::InvalidConfig(
+                "the sys/compat write policy refuses a catalog family this fold writes",
             ));
         }
         let result = self
@@ -11071,6 +11183,138 @@ pub(crate) mod tests {
         assert!(second.no_op);
         assert_eq!(second.watermark_hour, Some(10));
         assert_eq!(second.put_requests, 0);
+    }
+
+    struct FixedCompatClock(i64);
+
+    impl compat::CompatClock for FixedCompatClock {
+        fn now_unix_ns(&self) -> i64 {
+            self.0
+        }
+    }
+
+    /// A refreshed view over a `sys/compat` naming every catalog family at
+    /// the version a metrics fold writes, except `csnap` at the given version.
+    async fn compat_view_with_csnap(
+        store: Arc<MemoryStore>,
+        now: i64,
+        csnap: u32,
+    ) -> compat::CompatView {
+        let keys = compat::CompatKeys::from_file_keys(&[[9; 32]]).expect("one key");
+        let families = FOLD_CATALOG_FAMILIES
+            .iter()
+            .map(|family| ravel_proto::sys::v1::CompatFamily {
+                family: (*family).to_string(),
+                active_write_version: if *family == compat::FAMILY_CSNAP {
+                    csnap
+                } else {
+                    u32::from(fold_write_version(family, Signal::Metrics).expect("written"))
+                },
+                ..Default::default()
+            })
+            .collect();
+        compat::create_compat(
+            store.as_ref(),
+            &keys,
+            ravel_proto::sys::v1::CompatRecord {
+                families,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create sys/compat");
+        let view = compat::CompatView::new(store, keys, Arc::new(FixedCompatClock(now)));
+        view.refresh().await.expect("refresh");
+        view
+    }
+
+    /// A policy naming a `csnap` version this build does not write fails the
+    /// fold before anything is written: no HEAD, no part, no postings. The
+    /// same data under a policy at the written version folds, so the refusal
+    /// is the policy's and not the fixture's.
+    #[tokio::test]
+    async fn fold_under_a_policy_with_an_unwritable_catalog_family_writes_nothing() {
+        let store = Arc::new(MemoryStore::new());
+        let now = now_at_seal(10);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now - NS_PER_HOUR).await;
+        let unwritable = u32::from(snapshot_format::VERSION) + 1;
+        let view = compat_view_with_csnap(store.clone(), now, unwritable).await;
+        let tenant_prefix = format!("t/{}/", tenant().to_hex());
+        let before = list_all_keys(store.as_ref(), &tenant_prefix).await;
+
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_compat_policy(Some(view.clone()));
+        let refusal = catalog
+            .fold_compat_versions(Signal::Metrics, now)
+            .expect_err("csnap is not writable");
+        assert_eq!(refusal.family, compat::FAMILY_CSNAP);
+        assert_eq!(
+            refusal.refusal,
+            compat::CompatRefusal::ActiveVersionNotWritable {
+                family: compat::FAMILY_CSNAP.to_string(),
+                active: unwritable,
+                writable: vec![u16::from(snapshot_format::VERSION)],
+            }
+        );
+        let err = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect_err("the cycle is refused");
+        assert!(matches!(err, CatalogError::InvalidConfig(_)), "{err}");
+        assert_eq!(
+            list_all_keys(store.as_ref(), &tenant_prefix).await,
+            before,
+            "a refused fold writes nothing"
+        );
+
+        // A view past its horizon refuses too, on the first family checked.
+        let stale = catalog
+            .fold_compat_versions(Signal::Metrics, now + compat::COMPAT_VIEW_HORIZON_NS)
+            .expect_err("stale view");
+        assert_eq!(stale.family, compat::FAMILY_CATALOG_HEAD);
+        assert!(matches!(
+            stale.refusal,
+            compat::CompatRefusal::ViewStale { .. }
+        ));
+
+        // The same tenant under a writable policy folds and writes HEAD.
+        let writable_store = Arc::new(MemoryStore::new());
+        publish_segment(&writable_store, 0, Uuid::new_v4(), 1, 10, now - NS_PER_HOUR).await;
+        let view = compat_view_with_csnap(
+            writable_store.clone(),
+            now,
+            u32::from(snapshot_format::VERSION),
+        )
+        .await;
+        let catalog = Catalog::new(writable_store.clone(), config(1))
+            .expect("catalog")
+            .with_compat_policy(Some(view));
+        let versions = catalog
+            .fold_compat_versions(Signal::Metrics, now)
+            .expect("every family writable");
+        assert_eq!(
+            versions,
+            vec![
+                (compat::FAMILY_CATALOG_HEAD, 2),
+                (compat::FAMILY_CSNAP, 1),
+                (compat::FAMILY_NPOST, 1),
+                (compat::FAMILY_CSTAT, 3),
+                (compat::FAMILY_KIDX, 3),
+            ]
+        );
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("fold under a writable policy");
+        assert_eq!(report.entry_count, 1);
+        assert!(
+            list_all_keys(writable_store.as_ref(), &tenant_prefix)
+                .await
+                .iter()
+                .any(|key| key.ends_with("/HEAD")),
+            "the writable fold published HEAD"
+        );
     }
 
     #[tokio::test]

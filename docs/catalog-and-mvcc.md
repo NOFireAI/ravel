@@ -316,7 +316,25 @@ there has been none (`COMPAT_VIEW_HORIZON`; the default refresh interval is
 bucket is fenced or this process has already seen an epoch, and with
 `ActiveVersionNotWritable` when the family's active version, or the
 baseline for a family the record does not name, is not one the writer can
-produce. A refusal is retryable except `CompatRecordMissing`.
+produce. A refusal is retryable except `CompatRecordMissing`. When two
+refreshes overlap, each merges the monotone values it read, but the record
+and its presence are those of the read that started last, so a slow read
+that finishes after a later one never brings back an older record or an
+absence. The library takes its clock as a `CompatClock`; the server supplies
+the wall clock.
+
+`ravel-server` builds one `CompatView` per process in every mode, keyed by
+the deployment key (`--tenant-hash-key-file`), reads the record before any
+writer starts, and re-reads it every 60 s from one task. On an unkeyed bucket
+it builds none and installs no policy. The catalog fold follows the view for
+the catalog families (`catalog-head`, `csnap`, `npost`, `cstat`, `kidx`;
+`Catalog::with_compat_policy`, `Catalog::fold_compat_versions`): each must be
+active at the highest version the fold writes for it
+(`ravel_catalog::fold_write_version`), and otherwise the cycle is refused
+before anything is read or written. With no policy the fold writes what it
+always has. After an activation (the view has seen a `compat_epoch` above 0)
+a server first touch creates a new bucket's provisioning record born fenced
+at that epoch.
 
 `t/<tenant_hash>/<signal>/prov` (ADR-0050 §5) is the durable
 `shard_count` provisioning record: a per-(tenant, signal) object holding

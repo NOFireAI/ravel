@@ -12,6 +12,7 @@ pub mod analytics;
 pub mod bucket_protection;
 pub mod cache_warm;
 pub mod cli_reference;
+pub mod compat;
 pub mod config;
 pub mod cpu_gates;
 #[cfg(feature = "sql")]
@@ -1259,6 +1260,11 @@ pub struct Running {
     /// to the end of [`Running::shutdown`], so the heartbeat keeps beating
     /// through the drain.
     runtime_heartbeat_task: Option<AbortOnDrop>,
+    /// The `sys/compat` refresh loop (ADR-4233 decision 3), `Some` when this
+    /// process holds a compat view.
+    compat_refresh_task: Option<AbortOnDrop>,
+    /// This process's `sys/compat` view, `None` on an unkeyed bucket.
+    compat_view: Option<ravel_catalog::compat::CompatView>,
     /// The ADR-1170 process memory budget, whose host-memory gate the memory
     /// gate sampler (ADR-2633, as amended for issue #2806) writes.
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
@@ -1539,6 +1545,12 @@ async fn drain_router<R: DrainRouter>(router: Option<Arc<R>>, label: &str) -> bo
 }
 
 impl Running {
+    /// This process's `sys/compat` view (ADR-4233 decision 3), the handle every
+    /// writer's write policy comes from; `None` on an unkeyed bucket.
+    pub fn compat_view(&self) -> Option<&ravel_catalog::compat::CompatView> {
+        self.compat_view.as_ref()
+    }
+
     /// Whether `start` spawned a query-audit pipeline for this process:
     /// `true` in [`Mode::All`]/[`Mode::Query`] when
     /// [`ServerConfig::audit_pipeline`] is `Some`, `false` under
@@ -1621,6 +1633,7 @@ impl Running {
             drain_settle_interval,
             query_worker_heartbeat,
             runtime_heartbeat_task: _runtime_heartbeat_task,
+            compat_refresh_task: _compat_refresh_task,
             ingest_hold_detector_task,
             shard_actors_joined,
             #[cfg(feature = "sql")]
@@ -2636,6 +2649,27 @@ pub async fn start_with_heartbeat_and_ipcrypt(
 
     ipcrypt::check_startup_marker(store.as_ref(), config.mode, &ipcrypt).await?;
 
+    // The one `sys/compat` view this process holds (ADR-4233 decision 3), in
+    // every mode, read once here before any writer starts and then every
+    // `DEFAULT_COMPAT_REFRESH_INTERVAL` by one task. This is the handle every
+    // writer's write policy comes from: the fold (through the catalog), the
+    // alert evaluator, first-touch provisioning, and the ingest and
+    // maintenance configs built below. `None` on an unkeyed bucket.
+    let compat_view = compat::build_compat_view(
+        store_background.clone(),
+        config.deployment_key.as_deref(),
+        Arc::new(compat::SystemCompatClock),
+    )?;
+    if let Some(view) = &compat_view {
+        compat::refresh_once(view).await;
+    }
+    let compat_refresh_task = compat_view.clone().map(|view| {
+        AbortOnDrop(compat::spawn_refresh_loop(
+            view,
+            compat::DEFAULT_COMPAT_REFRESH_INTERVAL,
+        ))
+    });
+
     // The process-wide ingest buffer byte budget (ADR-0069 decision 1). One
     // gauge shared by `Arc` across the metrics, log, and span routers so a
     // single `--max-ingest-buffer-bytes` ceiling bounds the sum of buffered
@@ -2873,10 +2907,10 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // once regardless of transport. Its shard_count is `config.shard_count`, the
     // same value the ingest routers and catalog above are built with.
     let provisioning_writer = if matches!(config.mode, Mode::All | Mode::Gateway) {
-        Some(Arc::new(provisioning::ProvisioningRecordWriter::new(
-            store.clone(),
-            config.shard_count,
-        )))
+        Some(Arc::new(
+            provisioning::ProvisioningRecordWriter::new(store.clone(), config.shard_count)
+                .with_compat_view(compat_view.clone()),
+        ))
     } else {
         None
     };
@@ -3238,7 +3272,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     let catalog = Arc::into_inner(catalog)
         .ok_or_else(|| anyhow::anyhow!("the freshly built catalog is already shared"))?
         .with_read_gate(cpu_gates.read.clone())
-        .with_memory_budget(process_memory_budget.clone());
+        .with_memory_budget(process_memory_budget.clone())
+        .with_compat_policy(compat_view.clone());
     let unlimited =
         process_memory_budget.limit() == u64::MAX || config.process_memory_budget_is_fallback;
     let catalog = Arc::new(if unlimited {
@@ -4248,6 +4283,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             Arc::new(SystemClock),
             config.alerting.clone(),
             published_alerts.clone(),
+            compat_view.clone(),
         )?;
 
         if let Some(mtls) = &config.mtls_listener {
@@ -5087,6 +5123,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         drain_settle_interval: config.drain_settle_interval,
         query_worker_heartbeat,
         runtime_heartbeat_task: None,
+        compat_refresh_task,
+        compat_view,
         ingest_hold_detector_task,
         shard_actors_joined: Arc::new(AtomicBool::new(false)),
         process_memory_budget,

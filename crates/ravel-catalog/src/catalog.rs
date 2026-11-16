@@ -575,6 +575,10 @@ pub struct Catalog {
     /// whose record disagrees fails with a typed error instead of silently
     /// resolving over `0..shard_count` and dropping the missing shards.
     enforce_provisioning: bool,
+    /// The `sys/compat` write policy the fold's part and HEAD writers follow
+    /// for the catalog families (ADR-4233 decisions 2 and 3); `None` keeps
+    /// today's bytes. Set by [`Catalog::with_compat_policy`].
+    pub(crate) compat_policy: Option<crate::compat::CompatView>,
     /// The (tenant, signal) pairs already validated against their provisioning
     /// record this process, so the read-path check is one store GET per pair,
     /// not one per resolve. Read-only enforcement: a record disagreement fails
@@ -861,6 +865,7 @@ impl Catalog {
             )),
             prefix_semaphores: Mutex::new(HashMap::new()),
             enforce_provisioning: false,
+            compat_policy: None,
             provisioning_checked: Mutex::new(HashSet::new()),
             tenant_activity: Mutex::new(HashMap::new()),
             column_stats_cache,

@@ -40,7 +40,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
-use ravel_catalog::{AbsentPolicy, ProvisioningCheck, ProvisioningError, validate_or_adopt};
+use ravel_catalog::compat::CompatView;
+use ravel_catalog::{
+    AbsentPolicy, ProvisioningCheck, ProvisioningError, validate_or_adopt, validate_or_adopt_fenced,
+};
 use ravel_ingest::ReadBackoff;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{Signal, TenantHash, TenantId};
@@ -184,6 +187,10 @@ pub struct ProvisioningRecordWriter {
     read_backoff: Mutex<ReadBackoff<(TenantHash, Signal)>>,
     /// The hard failure of each backed-off key whose last check failed hard.
     hard_failures: Mutex<HashMap<(TenantHash, Signal), ProvisioningError>>,
+    /// The process's `sys/compat` view. Once it has seen an activation
+    /// (`compat_epoch > 0`), a record this writer creates is born fenced at
+    /// that epoch (ADR-4233 decision 4).
+    compat: Option<CompatView>,
 }
 
 impl ProvisioningRecordWriter {
@@ -194,7 +201,27 @@ impl ProvisioningRecordWriter {
             seen: Mutex::new(HashSet::new()),
             read_backoff: Mutex::new(ReadBackoff::new()),
             hard_failures: Mutex::new(HashMap::new()),
+            compat: None,
         }
+    }
+
+    /// Create records born fenced once `view` has seen an activation: the
+    /// first touch of a new (tenant, signal) after an activation writes its
+    /// record at version 4 with the view's `compat_epoch` and
+    /// `compat_fenced_unix_ns` 0 (ADR-4233 decision 4, conditional
+    /// publication). Before any activation, and with `None`, a first touch
+    /// creates the version-3 record it always has.
+    pub fn with_compat_view(mut self, view: Option<CompatView>) -> Self {
+        self.compat = view;
+        self
+    }
+
+    /// The epoch a record created now is born fenced at: the view's seen
+    /// `compat_epoch`, `None` before any activation.
+    fn born_fenced_epoch(&self) -> Option<std::num::NonZeroU64> {
+        self.compat
+            .as_ref()
+            .and_then(|view| std::num::NonZeroU64::new(view.seen_epoch()))
     }
 
     /// Ensure the (tenant, signal) provisioning record on a first write.
@@ -242,13 +269,14 @@ impl ProvisioningRecordWriter {
                 None => return Ok(()),
             }
         }
-        match validate_or_adopt(
+        match validate_or_adopt_fenced(
             self.store.as_ref(),
             tenant_hash,
             signal,
             self.shard_count,
             now_ns,
             AbsentPolicy::CreateFromConfig,
+            self.born_fenced_epoch(),
         )
         .await
         {
@@ -1046,5 +1074,109 @@ mod tests {
         assert!(writer.hard_failures.lock().is_empty());
         writer.ensure(&th, Signal::Metrics, t2).await.expect("seen");
         assert_eq!(store.sequence_progress(0), 3, "a seen tenant reads nothing");
+    }
+
+    struct FixedCompatClock(i64);
+
+    impl ravel_catalog::compat::CompatClock for FixedCompatClock {
+        fn now_unix_ns(&self) -> i64 {
+            self.0
+        }
+    }
+
+    /// A view over `store`, refreshed once, after `sys/compat` was created at
+    /// store-wide epoch `epoch` (`None`: no record at all).
+    async fn compat_view_at(
+        store: &Arc<dyn ObjectStoreBackend>,
+        epoch: Option<u64>,
+    ) -> ravel_catalog::compat::CompatView {
+        let keys = ravel_catalog::compat::CompatKeys::from_file_keys(&[[0x21; 32]]).expect("key");
+        if let Some(epoch) = epoch {
+            ravel_catalog::compat::create_compat(
+                store.as_ref(),
+                &keys,
+                sysproto::CompatRecord {
+                    compat_epoch: epoch,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create sys/compat");
+        }
+        let view = ravel_catalog::compat::CompatView::new(
+            Arc::clone(store),
+            keys,
+            Arc::new(FixedCompatClock(1_000)),
+        );
+        view.refresh().await.expect("refresh");
+        view
+    }
+
+    async fn stored_record(
+        store: &dyn ObjectStoreBackend,
+        th: &TenantHash,
+    ) -> sysproto::ProvisioningRecord {
+        let got = store
+            .get(&provisioning_key(th, Signal::Logs), GetRange::Full)
+            .await
+            .expect("record written");
+        sysproto::ProvisioningRecord::decode(got.data.as_ref()).expect("decodes")
+    }
+
+    /// After an activation (the view has seen `compat_epoch` 3), a first touch
+    /// creates the record born fenced: version 4, `compat_epoch` 3,
+    /// `compat_fenced_unix_ns` 0 (ADR-4233 decision 4).
+    #[tokio::test]
+    async fn first_touch_after_an_activation_is_born_fenced() {
+        let store = store();
+        let view = compat_view_at(&store, Some(3)).await;
+        let th = TenantId::new("born-fenced").hash();
+        let writer = ProvisioningRecordWriter::new(store.clone(), 4).with_compat_view(Some(view));
+        writer
+            .ensure(&th, Signal::Logs, 1_000)
+            .await
+            .expect("first touch");
+        let record = stored_record(store.as_ref(), &th).await;
+        assert_eq!(
+            (
+                record.format_version,
+                record.compat_epoch,
+                record.compat_fenced_unix_ns,
+                record.shard_count,
+            ),
+            (ravel_catalog::PROVISIONING_FENCED_FORMAT_VERSION, 3, 0, 4)
+        );
+    }
+
+    /// Before any activation, with a record at epoch 0, no record at all, or
+    /// no view, a first touch creates the version-3 record it always has.
+    #[tokio::test]
+    async fn first_touch_before_an_activation_is_unfenced() {
+        for epoch in [Some(0), None] {
+            let store = store();
+            let view = compat_view_at(&store, epoch).await;
+            let th = TenantId::new("unfenced").hash();
+            let writer =
+                ProvisioningRecordWriter::new(store.clone(), 4).with_compat_view(Some(view));
+            writer
+                .ensure(&th, Signal::Logs, 1_000)
+                .await
+                .expect("first touch");
+            let record = stored_record(store.as_ref(), &th).await;
+            assert_eq!(
+                (record.format_version, record.compat_epoch),
+                (3, 0),
+                "sys/compat epoch {epoch:?}"
+            );
+        }
+        let store = store();
+        let th = TenantId::new("no-view").hash();
+        let writer = ProvisioningRecordWriter::new(store.clone(), 4).with_compat_view(None);
+        writer
+            .ensure(&th, Signal::Logs, 1_000)
+            .await
+            .expect("first touch");
+        let record = stored_record(store.as_ref(), &th).await;
+        assert_eq!((record.format_version, record.compat_epoch), (3, 0));
     }
 }
