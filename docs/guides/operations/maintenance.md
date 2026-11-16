@@ -996,6 +996,28 @@ version=<n>` for a held bucket, counts it on the summary's
 `compact-bucket` prints `outcome: HeldOutOfWindow`. Neither moves a server
 counter.
 
+### An input with section kinds this build does not know
+
+A newer writer can add a section kind to an object whose version this build
+still reads. The reader skips a section kind it does not know, so the object
+decodes, but a rewrite of it would drop that section.
+Compaction, the erasure rewrite and `migrate` therefore refuse such an input
+before they write anything for its bucket:
+
+- Compaction holds the bucket with outcome `HeldOutOfWindow`, carrying the
+  object's version, and writes no part and no compaction record.
+  `ravel_maintain_buckets_held_unknown_section_total` moves by one per held
+  bucket per pass, and one `WARN` line per held bucket names the object and
+  the unknown kinds. The bucket is retried on every pass, as an
+  out-of-window input is, and compacts once a build that knows the section
+  kinds runs here.
+- `migrate` holds the bucket under the `input_out_of_window` reason, with the
+  object's version, and raises no floor while it holds it.
+- The erasure rewrite fails with an `UnknownSectionKinds` error when it
+  reads the input's catalog, before it builds or writes anything.
+
+The check runs with or without a compat policy.
+
 ## Garbage collection and retention
 
 Ravel deletes data through two independent triggers. The maintenance loop or
@@ -1349,6 +1371,67 @@ Enabling the scrubber requires no storage-policy change:
   role's existing read and list grants.
 - Its one write, the per-shard cursor, is under the existing `maint/` control
   prefix, which the Maintain role's write grant already names.
+
+## Writer versions under `sys/compat`
+
+`sys/compat` records which format version each family is written at.
+`ravel-maintain` reads it through a compat policy,
+`CompactorConfig::compat_policy`. No shipping binary installs one yet, and
+`ravel-server` does not yet export the counters below. With no policy, every
+maintenance writer writes exactly the bytes it wrote before the policy
+existed, except that an input with unknown section kinds is held (see
+[An input with section kinds this build does not know](#an-input-with-section-kinds-this-build-does-not-know)).
+
+Under a policy, each maintenance run takes its write versions once, at its
+start, before its claim and before any PUT: compaction, the erasure rewrite,
+`migrate` and its re-encode, the query-audit writer and the legal-hold
+writer. The run keeps those versions to its end, even if the family is
+activated again while it runs. A run is refused at its start when:
+
+- the view of `sys/compat` is 10 minutes old or older (`view_stale`);
+- `sys/compat` is missing while the bucket's provisioning record carries a
+  fence (`compat_record_missing`);
+- a family's active version is one this build cannot write
+  (`active_version_not_writable`);
+- the run's publish lifetime is longer than the `max_publish_lifetime`
+  recorded in `sys/compat` (`publish_lifetime_above_compat`). The
+  query-audit and legal-hold writers' lifetime is their 30 s write budget,
+  and the build refuses to compile if that budget is not inside the default
+  1 h.
+
+A refused run writes nothing. It counts once under
+`ravel_compat_publish_refused_total{family,reason}`, with the reason in
+parentheses above, and logs one `WARN` line, `refusing to publish under the
+sys/compat write policy`. The maintenance loop counts a refused compaction
+as no run and goes on with the rest of the pass. A refused erasure leaves
+its request pending, so a later pass tries it again.
+
+During the run, every PUT attempt, retries included, checks the view's age
+first. A view that reaches 10 minutes refuses the PUT and abandons the run
+(`view_stale`). A record PUT is also abandoned once the recorded
+`max_publish_lifetime` has passed since the run started
+(`publish_lifetime_expired`). Data objects already written by an abandoned
+run are unreferenced, and garbage collection removes them as orphans.
+
+When a run writes a version above the family's baseline and the bucket's
+provisioning record has not yet been fenced at the current `sys/compat`
+epoch, the run raises that fence before its first PUT. The fence is one
+conditional write, not retried. If it fails, the run is refused
+(`fence_failed`) and nothing is written.
+
+Two more refusals apply to migration:
+
+- `migrate --target-version` refuses a target that is not the family's
+  active version (`target_not_active`), before it lists anything.
+- `migrate --reencode-compaction-parts` writes version 2 compaction
+  records, so it is refused unless the `compaction-record` family is active
+  at 2 (`compaction_record_not_active`).
+
+`ravel_maintain::background_migrate_unit` is the background form of
+`migrate`: one budgeted walk toward the family's active version, for one
+tenant, signal and family. It does nothing without a policy, reads only the
+provisioning record once the family's floor has reached the active version,
+and reports a refused run as an outcome rather than an error.
 
 ## Format migration
 

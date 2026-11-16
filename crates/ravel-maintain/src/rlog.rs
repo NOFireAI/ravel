@@ -318,19 +318,13 @@ use crate::read_gate::MaintainReadGate;
 use crate::request_ledger::{RequestLedger, RequestPhase, note_get};
 use ravel_cpu_gate::ReadSite;
 
-/// The RLOG output trailer version every L1 part carries (currently 3:
-/// ADR-0032 introduced v2, ADR-0095 moved it to v3). Recorded in each part's
-/// `CompactionPart.segment_format_version`,
-/// the log analogue of RSEG's [`crate::build::OUTPUT_FORMAT_VERSION`].
-///
-/// Read from `ravel_logseg`'s single-sourced supported-version window
-/// (`SUPPORTED_VERSIONS.newest()`, ADR-0066 decision 1, slice A), the same
-/// single source the reader gate and the CLI `audit-versions`/`migrate` paths
-/// use. As a mirrored literal this would go stale silently on the next bump --
-/// the writer stamps the trailer from the window while a stale literal kept
-/// reporting the old number, so the compactor would write parts claiming a
-/// version they are not; routing through the window moves both together.
-pub const OUTPUT_FORMAT_VERSION: u32 = ravel_logseg::footer::SUPPORTED_VERSIONS.newest() as u32;
+/// The RLOG trailer version an L1 part is written at when no `sys/compat`
+/// policy is installed: the writer's default, `WriteVersion::CURRENT`, the log
+/// analogue of RSEG's [`crate::build::OUTPUT_FORMAT_VERSION`]. Recorded in
+/// each part's `CompactionPart.segment_format_version`. Under a policy the
+/// run takes the family's active version once at its start instead (ADR-4233
+/// decision 3), so this is not "the version this build writes" in general.
+pub const OUTPUT_FORMAT_VERSION: u32 = ravel_logseg::footer::WriteVersion::CURRENT.number() as u32;
 
 /// Untrusted-input cap on an input's FIELD_DIR entry count for the compactor's
 /// own decode of that section (the indexed-field recovery below needs the
@@ -634,6 +628,7 @@ async fn load_catalog_noted(
             }
         }
     };
+    crate::compat_policy::refuse_unknown_sections(&object_key, &ftr.unknown_section_kinds, None)?;
 
     // Decode the three whole-read directory sections, each sliced from the
     // probe when it lies inside it and fetched by range otherwise. BLOCKS and
@@ -1085,6 +1080,8 @@ struct PartWriterSettings {
     bloom_scope: BloomScope,
     group_target_blocks: usize,
     block_target_records: usize,
+    /// The trailer version, fixed for the run (ADR-4233 decision 3).
+    write_version: ravel_logseg::footer::WriteVersion,
 }
 
 /// The zstd level a two-level merge's scratch runs are written with
@@ -1421,6 +1418,7 @@ async fn merge_catalogs_with_geometry(
         bloom_scope,
         group_target_blocks: RlogConfig::default().group_target_blocks,
         block_target_records: RlogConfig::default().block_target_records,
+        write_version: crate::compat_policy::rlog_write_version(config)?,
     });
     let output = OutputSpec {
         identity: compactor_identity(bucket, config),
@@ -4142,6 +4140,7 @@ async fn merge_in_unit(
         bloom_scope: output.writer.bloom_scope.clone(),
         group_target_blocks: RUN_GROUP_TARGET_BLOCKS,
         block_target_records: config.rlog_run_block_target_records,
+        write_version: output.writer.write_version,
     });
     let run_declared = Arc::new(DeclaredSchema::build(&[], &BTreeMap::new()));
     let group_len = usize::try_from(layout.group_size).unwrap_or(usize::MAX);
@@ -6029,6 +6028,7 @@ impl PartSink<'_> {
                 self.retain_bytes,
                 &declared_accum,
                 self.config.request_ledger.as_ref(),
+                self.config.compat_run.as_ref(),
                 self.stop,
             )
             .await?;
@@ -6206,6 +6206,7 @@ impl PartSink<'_> {
             self.retain_bytes,
             &part.declared_accum,
             self.config.request_ledger.as_ref(),
+            self.config.compat_run.as_ref(),
             self.stop,
         )
         .await
@@ -6834,6 +6835,7 @@ impl PartBuilder {
             ..RlogConfig::default()
         };
         let mut w = RlogWriter::new(cfg, *identity)
+            .with_write_version(writer.write_version)
             .with_indexed_fields(indexed_fields.to_vec())
             .with_key_index_fields(key_index_fields.to_vec())
             .with_sort_descriptor(writer.sort_descriptor.clone(), writer.clustering_generation)
@@ -8209,6 +8211,7 @@ async fn finalize_part(
     retain_bytes: bool,
     declared_accum: &DeclaredStatAccum,
     ledger: Option<&RequestLedger>,
+    compat: Option<&crate::compat_policy::CompatRun>,
     stop: Option<&LevelStop>,
 ) -> Result<BuiltPart> {
     if stats.postings_capped_fields > 0 {
@@ -8257,7 +8260,9 @@ async fn finalize_part(
         run_count: 0,
         min_event_ts_ns: ftr.min_ts_ns,
         max_event_ts_ns: ftr.max_ts_ns,
-        segment_format_version: OUTPUT_FORMAT_VERSION,
+        segment_format_version: compat
+            .and_then(|run| run.version(ravel_catalog::compat::FAMILY_RLOG))
+            .map_or(OUTPUT_FORMAT_VERSION, u32::from),
         declared_column_stats: Vec::new(),
     };
     // Stamp the declared-column extrema recomputed over exactly this part's rows
@@ -8283,7 +8288,7 @@ async fn finalize_part(
         return Err(stop.halted());
     }
     if !dry_run {
-        match put_part_with_ledger(store, &built, ledger).await? {
+        match put_part_with_ledger(store, &built, ledger, compat).await? {
             crate::build::PartPut::Created => {}
             crate::build::PartPut::AlreadyExisted => built.put_already_existed = true,
         }

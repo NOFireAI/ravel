@@ -121,6 +121,13 @@ pub async fn scan_and_compact(
                 first_held.get_or_insert(hour);
                 continue;
             }
+            // Refused under the sys/compat write policy before the claim
+            // (ADR-4233): no run happened, already counted and logged. The
+            // hour is not done, so the cursor stays below it.
+            Err(err) if err.is_compat_refusal() => {
+                first_held.get_or_insert(hour);
+                continue;
+            }
             Err(err) => return Err(err),
         };
         match outcome {

@@ -71,7 +71,8 @@ use ravel_types::logstream::log_stream_id;
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
-use crate::audit_write::{AuditWrite, write_audit_object};
+use crate::audit_write::{AuditWrite, write_audit_object_with_compat};
+use crate::compat_policy::MaintainCompatPolicy;
 use crate::error::{MaintainError, Result};
 use crate::sweep::LeaseCheck;
 
@@ -367,6 +368,22 @@ pub async fn write_hold_set(
     scope: &str,
     reason: &str,
 ) -> Result<()> {
+    write_hold_set_with_compat(store, tenant, record_id, now_ns, scope, reason, None).await
+}
+
+/// [`write_hold_set`] under a `sys/compat` write policy (ADR-4233): the RLOG
+/// version is fixed before the data PUT, every PUT attempt re-checks the
+/// view's age, and the commit record is abandoned without its PUT once `P`
+/// has passed since the start. `None` writes exactly as [`write_hold_set`].
+pub async fn write_hold_set_with_compat(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    record_id: Uuid,
+    now_ns: i64,
+    scope: &str,
+    reason: &str,
+    compat: Option<&MaintainCompatPolicy>,
+) -> Result<()> {
     // An empty scope is a prefix of every key (every match here is
     // `key.starts_with(scope)`), so it would silently hold the entire tenant.
     // Reject before writing anything.
@@ -387,7 +404,7 @@ pub async fn write_hold_set(
         attrs.push((ATTR_REASON.to_string(), AttrValue::Str(reason.into())));
     }
     let body = format!("legal hold set scope={scope}");
-    write_hold_object(store, tenant, record_id, now_ns, body, attrs).await
+    write_hold_object(store, tenant, record_id, now_ns, body, attrs, compat).await
 }
 
 /// Write a new immutable `clear` record releasing the legal hold on `scope` at
@@ -399,6 +416,19 @@ pub async fn write_hold_clear(
     record_id: Uuid,
     now_ns: i64,
     scope: &str,
+) -> Result<()> {
+    write_hold_clear_with_compat(store, tenant, record_id, now_ns, scope, None).await
+}
+
+/// [`write_hold_clear`] under a `sys/compat` write policy, as
+/// [`write_hold_set_with_compat`] writes a set.
+pub async fn write_hold_clear_with_compat(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    record_id: Uuid,
+    now_ns: i64,
+    scope: &str,
+    compat: Option<&MaintainCompatPolicy>,
 ) -> Result<()> {
     // Empty scope would match every key; reject before writing anything (see
     // `write_hold_set`).
@@ -416,7 +446,7 @@ pub async fn write_hold_clear(
         (ATTR_SCOPE.to_string(), AttrValue::Str(scope.into())),
     ];
     let body = format!("legal hold clear scope={scope}");
-    write_hold_object(store, tenant, record_id, now_ns, body, attrs).await
+    write_hold_object(store, tenant, record_id, now_ns, body, attrs, compat).await
 }
 
 /// Encode one legal-hold RLOG record as an L0 [`Signal::Audit`] object and its
@@ -431,9 +461,10 @@ async fn write_hold_object(
     now_ns: i64,
     body: String,
     attrs: Vec<(String, AttrValue)>,
+    compat: Option<&MaintainCompatPolicy>,
 ) -> Result<()> {
     let (stream_id, stream_attrs) = hold_stream();
-    write_audit_object(
+    write_audit_object_with_compat(
         store,
         tenant,
         AuditWrite {
@@ -447,6 +478,7 @@ async fn write_hold_object(
             body,
             attrs,
         },
+        compat.map(|policy| (policy, "legal hold")),
     )
     .await
 }
@@ -569,5 +601,69 @@ mod tests {
         assert!(snapshot.is_protected("t/acme/m/l0/0007/w.10.0000000000000000001.h"));
         assert!(!snapshot.is_protected("t/acme/m/l0/0008/other"));
         assert!(!snapshot.is_protected("t/acme/l/l0/0007/other"));
+    }
+
+    /// ADR-4233 decision 3: a hold write whose commit-record version this
+    /// build cannot write is refused before its data PUT, counted.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn a_hold_write_refuses_an_unwritable_commit_record_version_before_any_put() {
+        use std::sync::Arc;
+
+        use crate::compat_policy::CompatRunRefusal;
+        use crate::compat_policy::test_support::{ManualClock, T0, family, policy, write_compat};
+        use ravel_catalog::compat::{CompatRefusal, FAMILY_COMMIT_RECORD};
+        use ravel_object_store::list_all;
+        use ravel_object_store::memory::MemoryStore;
+
+        let store = Arc::new(MemoryStore::new());
+        write_compat(
+            store.as_ref(),
+            vec![family(FAMILY_COMMIT_RECORD, 2)],
+            3_600_000_000_000,
+        )
+        .await;
+        let policy = policy(store.clone(), ManualClock::at(T0)).await;
+        let before = list_all(store.as_ref(), "").await.expect("list");
+        let refused = crate::compat_publish_refused_total(
+            FAMILY_COMMIT_RECORD,
+            "active_version_not_writable",
+        );
+
+        let err = write_hold_set_with_compat(
+            store.as_ref(),
+            &TenantHash([5; 16]),
+            Uuid::from_u128(1),
+            T0,
+            "t/acme/m/l0/0007/",
+            "litigation",
+            Some(&policy),
+        )
+        .await
+        .expect_err("refused");
+
+        match err {
+            MaintainError::CompatRefused {
+                family,
+                refusal:
+                    CompatRunRefusal::Compat(CompatRefusal::ActiveVersionNotWritable {
+                        active: 2, ..
+                    }),
+                ..
+            } => assert_eq!(family, FAMILY_COMMIT_RECORD),
+            other => panic!("expected a commit-record refusal, got {other:?}"),
+        }
+        assert_eq!(
+            list_all(store.as_ref(), "").await.expect("list"),
+            before,
+            "nothing is written"
+        );
+        assert_eq!(
+            crate::compat_publish_refused_total(
+                FAMILY_COMMIT_RECORD,
+                "active_version_not_writable"
+            ),
+            refused + 1
+        );
     }
 }
