@@ -44,12 +44,12 @@ use crate::error::CatalogError;
 use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
 use crate::snapshot_format::{
     self, CatalogPartKind, EncodedKeyIndexLeaf, HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSIONS,
-    KeyIndexLeafEncodeError, KeyIndexLeafEntry, KeyIndexLeafInput, KeyIndexLeafLimits,
-    KeyIndexLeafSummary, KeyIndexSlice, NamePostings, NewerPartVersion, PartLimits,
-    SnapshotFormatError, column_stats_segments_concat, encode_key_index_leaf, encoded_entry_len,
-    key_index_leaf_format_version, key_index_leaf_prefix_range, key_index_leaf_version_accepted,
-    key_index_leaf_version_is_newer, select_key_index_slice, split_key_index_entries,
-    verify_key_index_leaf_frames,
+    KEY_INDEX_LEAF_FORMAT_VERSION, KeyIndexLeafEncodeError, KeyIndexLeafEntry, KeyIndexLeafInput,
+    KeyIndexLeafLimits, KeyIndexLeafSummary, KeyIndexSlice, NamePostings, NewerPartVersion,
+    PartLimits, SnapshotFormatError, column_stats_segments_concat, encode_key_index_leaf,
+    encoded_entry_len, key_index_leaf_format_version, key_index_leaf_prefix_range,
+    key_index_leaf_version_accepted, key_index_leaf_version_is_newer, select_key_index_slice,
+    split_key_index_entries, verify_key_index_leaf_frames,
 };
 use crate::tenant_config::DeclaredTypedColumn;
 
@@ -981,13 +981,15 @@ pub const FOLD_CATALOG_FAMILIES: [&str; 5] = [
     compat::FAMILY_KIDX,
 ];
 
-/// The highest version of `family` a fold of `signal` can emit. HEAD and the
-/// key-index leaf carry a version that follows their content (HEAD 2 only
-/// when a part ref carries a retired hour; a metrics leaf may carry 3, the
-/// posting leaf of ADR-4146, which no fold writes yet), so the highest one is
-/// what an active version has to be at or above; every other catalog family
-/// has one write version. `None` for a family the fold does not write.
-pub fn fold_write_version(family: &str, signal: Signal) -> Option<u16> {
+/// The highest version of `family` a fold of `signal` can emit. HEAD carries
+/// a version that follows its content (2 only when a part ref carries a
+/// retired hour), so the highest one is what an active version has to be at
+/// or above. Every other catalog family has one write version: the fold
+/// stamps every key-index leaf [`KEY_INDEX_LEAF_FORMAT_VERSION`], whatever
+/// the signal; a metrics leaf may be read at 3 (the posting leaf of
+/// ADR-4146), but no fold writes one. `None` for a family the fold does not
+/// write.
+pub fn fold_write_version(family: &str, _signal: Signal) -> Option<u16> {
     let version = match family {
         compat::FAMILY_CATALOG_HEAD => {
             HEAD_FORMAT_VERSIONS.iter().copied().max().unwrap_or(0) as u64
@@ -999,11 +1001,7 @@ pub fn fold_write_version(family: &str, signal: Signal) -> Option<u16> {
             .copied()
             .max()
             .map_or(0, u64::from),
-        compat::FAMILY_KIDX => snapshot_format::key_index_leaf_versions_for_signal(signal)
-            .iter()
-            .copied()
-            .max()
-            .map_or(0, u64::from),
+        compat::FAMILY_KIDX => u64::from(KEY_INDEX_LEAF_FORMAT_VERSION),
         _ => return None,
     };
     u16::try_from(version).ok()
@@ -11413,52 +11411,71 @@ pub(crate) mod tests {
         }
     }
 
-    /// kidx active at 2 is below 3, the highest leaf version a metrics fold
-    /// can emit ([`fold_write_version`]): the gate runs before the fold reads
-    /// its content, so the metrics cycle is refused, typed and writing
-    /// nothing. Logs and spans, whose leaves go no higher than 2, fold exactly
-    /// as with no policy. kidx active at a version this build does not read
-    /// refuses every signal.
+    /// Every signal's fold stamps its key-index leaf 2, the version
+    /// [`fold_write_version`] names, so kidx active at 2 folds metrics, logs
+    /// and spans exactly as with no policy. kidx active at 1, below what the
+    /// fold writes, refuses every signal before anything is written, and so
+    /// does kidx active at a version this build does not read.
     #[tokio::test]
-    async fn kidx_active_at_2_refuses_a_metrics_fold_and_folds_logs_and_spans() {
+    async fn kidx_active_at_2_folds_metrics_logs_and_spans_unchanged() {
+        for signal in [
+            Signal::Metrics,
+            Signal::Logs,
+            Signal::Spans,
+            Signal::Profiles,
+            Signal::Alerts,
+            Signal::Audit,
+        ] {
+            assert_eq!(
+                fold_write_version(compat::FAMILY_KIDX, signal),
+                Some(2),
+                "{signal:?}"
+            );
+        }
         let mut at_two = BASELINE_CATALOG_VERSIONS;
         at_two[4] = (compat::FAMILY_KIDX, 2);
-        let (gate, report, objects) =
-            fold_kidx_fixture(Signal::Metrics, FoldPolicy::Record(&at_two)).await;
-        let refusal = gate.expect_err("metrics needs leaf 3");
-        assert_eq!(refusal.family, compat::FAMILY_KIDX);
-        assert_eq!(
-            refusal.refusal,
-            compat::CompatRefusal::ActiveVersionNotWritable {
-                family: compat::FAMILY_KIDX.to_string(),
-                active: 2,
-                writable: vec![3],
-            }
-        );
-        assert!(
-            matches!(report, Err(CatalogError::InvalidConfig(_))),
-            "{report:?}"
-        );
-        let (_, _, unfolded) = fold_kidx_fixture(Signal::Metrics, FoldPolicy::NotInstalled).await;
-        let published: Vec<&String> = unfolded
-            .iter()
-            .map(|(key, _)| key)
-            .filter(|key| !key.contains("/catalog/"))
-            .collect();
-        assert_eq!(
-            objects.iter().map(|(key, _)| key).collect::<Vec<_>>(),
-            published,
-            "a refused fold writes no catalog object"
-        );
-
-        for signal in [Signal::Logs, Signal::Spans] {
+        for signal in [Signal::Metrics, Signal::Logs, Signal::Spans] {
             let (_, _, unpoliced) = fold_kidx_fixture(signal, FoldPolicy::NotInstalled).await;
             let (gate, report, objects) =
                 fold_kidx_fixture(signal, FoldPolicy::Record(&at_two)).await;
             gate.unwrap_or_else(|refusal| panic!("{signal:?}: {refusal}"));
-            report.unwrap_or_else(|err| panic!("{signal:?}: {err}"));
+            let report = report.unwrap_or_else(|err| panic!("{signal:?}: {err}"));
+            assert_eq!(report.key_index_leaves_written, 1, "{signal:?}: {report:?}");
             assert_eq!(objects, unpoliced, "{signal:?}");
             assert_eq!(leaf_versions(&objects), vec![2], "{signal:?}");
+        }
+
+        let mut at_one = BASELINE_CATALOG_VERSIONS;
+        at_one[4] = (compat::FAMILY_KIDX, 1);
+        for signal in [Signal::Metrics, Signal::Logs, Signal::Spans] {
+            let (gate, report, objects) =
+                fold_kidx_fixture(signal, FoldPolicy::Record(&at_one)).await;
+            let refusal = gate.expect_err("kidx 1 is below the written 2");
+            assert_eq!(refusal.family, compat::FAMILY_KIDX, "{signal:?}");
+            assert_eq!(
+                refusal.refusal,
+                compat::CompatRefusal::ActiveVersionNotWritable {
+                    family: compat::FAMILY_KIDX.to_string(),
+                    active: 1,
+                    writable: vec![2, 3],
+                },
+                "{signal:?}"
+            );
+            assert!(
+                matches!(report, Err(CatalogError::InvalidConfig(_))),
+                "{signal:?}: {report:?}"
+            );
+            let (_, _, unfolded) = fold_kidx_fixture(signal, FoldPolicy::NotInstalled).await;
+            let published: Vec<&String> = unfolded
+                .iter()
+                .map(|(key, _)| key)
+                .filter(|key| !key.contains("/catalog/"))
+                .collect();
+            assert_eq!(
+                objects.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+                published,
+                "{signal:?}: a refused fold writes no catalog object"
+            );
         }
 
         let mut unknown = BASELINE_CATALOG_VERSIONS;
@@ -11592,7 +11609,7 @@ pub(crate) mod tests {
                 (compat::FAMILY_CSNAP, 1),
                 (compat::FAMILY_NPOST, 1),
                 (compat::FAMILY_CSTAT, 3),
-                (compat::FAMILY_KIDX, 3),
+                (compat::FAMILY_KIDX, 2),
             ]
         );
         let report = catalog

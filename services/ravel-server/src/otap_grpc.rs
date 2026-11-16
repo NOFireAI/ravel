@@ -312,9 +312,10 @@ fn write_reply(
             ),
             false,
         ),
-        // Receiver-clock floor (ADR-0051 amendment): UNAVAILABLE, the
+        // Receiver-clock floor (ADR-0051 amendment) and a first touch under a
+        // stale sys/compat view (ADR-4233 decision 4): UNAVAILABLE, the
         // replica's fault.
-        Err(IngestRequestError::ClockImplausible(msg)) => {
+        Err(IngestRequestError::ClockImplausible(msg) | IngestRequestError::CompatRefused(msg)) => {
             (nack(batch_id, StatusCode::Unavailable, msg), false)
         }
         // A hard shard_count provisioning failure (ADR-0050 section 5): the
@@ -450,8 +451,7 @@ async fn submit_batch<'a>(
         ravel_types::Signal::Metrics,
         ingest_ts_ns,
     )
-    .await
-    .map_err(|e| IngestRequestError::Provisioning(e.to_string()))?;
+    .await?;
 
     // OTAP mirrors OTLP's normalize point-for-point, metadata included: the same
     // `(family, type, help, unit)` tuple, from the METRICS table's
