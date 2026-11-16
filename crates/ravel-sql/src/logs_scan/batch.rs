@@ -5309,11 +5309,11 @@ mod tests {
             (4, 4),
             "one count per surviving present cell"
         );
-        // The per-key column validates a UTF-8 winner twice, in its presence
-        // test and again in `value_at`, and the non-UTF-8 cell once: 3 * 2 + 1.
+        // The per-key column reads each present cell once, the non-UTF-8 one
+        // included (ADR-2773 decision D4).
         assert_eq!(
             count_batch_build(&plain, true),
-            (7, 7),
+            (4, 4),
             "one count per validation the per-key build ran"
         );
 
