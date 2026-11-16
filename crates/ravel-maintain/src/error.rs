@@ -695,6 +695,10 @@ impl MaintainError {
     /// ADR-3853). The same build refuses the unit again, and nothing was
     /// published for it, so a pass holds the bucket as refused and goes on to
     /// its other buckets instead of failing.
+    pub fn is_compat_refusal(&self) -> bool {
+        matches!(self, MaintainError::CompatRefused { .. })
+    }
+
     pub fn is_part_index_refusal(&self) -> bool {
         matches!(
             self,

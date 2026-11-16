@@ -82,7 +82,7 @@ pub use clock::{Clock, FixedClock};
 pub use codec::{RsegCodec, SegmentCodec};
 pub use compact::{
     COMPACTION_INPUT_SKIP_SIGNALS, ClaimAcquisition, ClaimedCompaction, CompactionInputSkipReason,
-    CompactionOutcome, CompactionRefusedReason, buckets_held_out_of_window_total, compact_bucket,
+    CompactionOutcome, CompactionRefusedReason, buckets_held_out_of_window_total, buckets_held_unknown_section_total, compact_bucket,
     compact_bucket_claimed, compaction_inputs_skipped_total, compaction_refused_total,
     compactions_in_flight,
 };
@@ -128,7 +128,7 @@ pub use memo_snapshot::{
 };
 pub use migrate::{
     BelowTargetReport, BlockedBucket, BlockedReason, FamilyCensus, FamilyMigrateReport,
-    MigrateBudget, MigrateHeldBucket, MigrateHoldReason, MigrationPath, NotMigratedBucket,
+    BACKGROUND_MIGRATE_RAISED_BY, BackgroundMigrateOutcome, MigrateBudget, MigrateHeldBucket, MigrateHoldReason, background_migrate_unit, MigrationPath, NotMigratedBucket,
     NotMigratedReason, ReencodeBlockedBucket, ReencodeBlockedReason, UnwritableBucket,
     Verification, census_family, count_below_target, migrate_family,
 };

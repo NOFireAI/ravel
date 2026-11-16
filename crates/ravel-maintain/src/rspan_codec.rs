@@ -264,6 +264,7 @@ pub(crate) async fn load_catalog_from_object(
             }
         }
     };
+    crate::compat_policy::refuse_unknown_sections(&object_key, &ftr.unknown_section_kinds, None)?;
     // Fetch and decode the SKIP_IDX section by range. BLOCKS is never
     // fetched here; the merge streams blocks by range one at a time.
     let skip_desc = ftr

@@ -545,8 +545,8 @@ impl CompatRun {
 
     /// Refuse a run whose version choice is incompatible with what it was
     /// asked to write: counted and logged like every other refusal.
-    pub(crate) fn refuse_with(&self, refusal: CompatRunRefusal) -> MaintainError {
-        self.refuse(refusal)
+    pub(crate) fn refuse_with(&self, family: &str, refusal: CompatRunRefusal) -> MaintainError {
+        refuse(self.inner.run, family, self.inner.bucket.as_ref(), refusal)
     }
 }
 
@@ -574,6 +574,11 @@ pub(crate) async fn begin_bucket_run(
     let Some(policy) = config.compat_policy.as_ref() else {
         return Ok(None);
     };
+    if let Some(outer) = config.compat_run.as_ref()
+        && families.iter().all(|family| outer.version(family).is_some())
+    {
+        return Ok(Some(outer.clone()));
+    }
     let key = provisioning_key(&bucket.tenant_hash, bucket.signal);
     let got = store.get(&key, GetRange::Full).await;
     note_get(config.request_ledger.as_ref(), RequestPhase::FloorRead, &got);
@@ -608,6 +613,35 @@ pub(crate) async fn begin_part_run(
         Some(family) => begin_bucket_run(store, config, bucket, run, &[family]).await,
         None => Ok(None),
     }
+}
+
+/// Refuse a `migrate` of `family` toward `target` before its walk when a policy
+/// is installed and `target` is not the family's active write version (ADR-4233
+/// decision 6). Each bucket's run checks again before its claim.
+pub(crate) fn require_active_target(
+    config: &CompactorConfig,
+    family: &str,
+    target: u32,
+) -> Result<()> {
+    let Some(policy) = config.compat_policy.as_ref() else {
+        return Ok(());
+    };
+    let (writable, baseline) = policy
+        .versions(family)
+        .map_or((&[][..], 0), |v| (v.writable.as_slice(), v.baseline));
+    let active = policy
+        .view
+        .write_policy(policy.now_unix_ns(), family, writable, baseline, None)
+        .map_err(|refusal| refuse("migration", family, None, CompatRunRefusal::Compat(refusal)))?;
+    if u32::from(active) != target {
+        return Err(refuse(
+            "migration",
+            family,
+            None,
+            CompatRunRefusal::TargetNotActive { target, active },
+        ));
+    }
+    Ok(())
 }
 
 /// The version `config`'s run in flight writes for `family`; `None` when no

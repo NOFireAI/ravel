@@ -391,6 +391,20 @@ impl MigrateHoldReason {
                 commit_key: commit_key.clone(),
                 version: *version,
             }),
+            // ADR-4233 hazard H6: an input with section kinds this build does
+            // not know, which a re-encode would drop. Held under the
+            // out-of-window reason, the closest one `ravel-cli` renders:
+            // another build can carry the object, this one cannot.
+            MaintainError::UnknownSectionKinds {
+                object_key,
+                recorded_version,
+                ..
+            } => Some(MigrateHoldReason::InputOutOfWindow {
+                object_key: object_key.clone(),
+                version: recorded_version
+                    .and_then(|v| u16::try_from(v).ok())
+                    .unwrap_or(0),
+            }),
             MaintainError::Segment(_) | MaintainError::LogSeg(_) | MaintainError::SpanSeg(_) => {
                 Some(MigrateHoldReason::CorruptInput {
                     detail: err.to_string(),
@@ -1826,6 +1840,7 @@ pub async fn migrate_family(
     budget: MigrateBudget,
     raised_by: &str,
 ) -> Result<FamilyMigrateReport> {
+    crate::compat_policy::require_active_target(config, family, target_version)?;
     // ADR-1746 decision 4: every bucket this walk rewrites is checked against
     // the format floor before its claim, with the refusing default when the
     // caller installed no policy.
@@ -2272,6 +2287,102 @@ pub async fn migrate_family(
 
     Ok(report)
 }
+
+/// What one [`background_migrate_unit`] call did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackgroundMigrateOutcome {
+    /// No compat policy is installed, so there is no active version to
+    /// migrate toward; nothing read or written.
+    NoPolicy,
+    /// The family's format floor is already at or above its active version,
+    /// so no live object is below it; nothing listed or written.
+    UpToDate { active_version: u16, floor: u32 },
+    /// The compat policy refused a run before its claim (already counted
+    /// under `ravel_compat_publish_refused_total`): no run, and the cursor
+    /// resumes from where the walk stopped next time.
+    Refused {
+        refusal: crate::compat_policy::CompatRunRefusal,
+    },
+    /// The walk ran toward `active_version` under the budget. A held bucket
+    /// does not end the unit: its holds are in `held` and the floor is left
+    /// unraised, exactly as [`MaintainError::MigrateHeld`] reports them.
+    Walked {
+        active_version: u16,
+        report: Box<FamilyMigrateReport>,
+        held: Vec<MigrateHeldBucket>,
+    },
+}
+
+/// One background `migrate` maintenance unit for one `(tenant, signal,
+/// family)` (ADR-4233 decision 6, `--background-migrate`): [`migrate_family`]'s
+/// walk toward the family's active write version, resumed from the advisory
+/// cursor and bounded by `budget`. It runs only when the family's format floor
+/// is below the active version, the one case in which a live object can be
+/// below it; the walk itself rewrites only buckets that serve such an object,
+/// and raises the floor once it drains clean, after which the unit is a single
+/// provisioning-record GET. It spawns nothing; the caller schedules it.
+#[allow(clippy::too_many_arguments)]
+pub async fn background_migrate_unit(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    tenant_hash: TenantHash,
+    signal: Signal,
+    family: &str,
+    configured_shards: u32,
+    budget: MigrateBudget,
+) -> Result<BackgroundMigrateOutcome> {
+    let Some(active_version) = config
+        .compat_policy
+        .as_ref()
+        .and_then(|policy| policy.active_version(family))
+    else {
+        return Ok(BackgroundMigrateOutcome::NoPolicy);
+    };
+    let floor = current_floor_from_store(store, &tenant_hash, signal, family)
+        .await
+        .map_err(|err| MaintainError::Provisioning(err.to_string()))?;
+    if let Some(floor) = floor
+        && floor >= u32::from(active_version)
+    {
+        return Ok(BackgroundMigrateOutcome::UpToDate {
+            active_version,
+            floor,
+        });
+    }
+    let walked = migrate_family(
+        store,
+        clock,
+        config,
+        tenant_hash,
+        signal,
+        family,
+        u32::from(active_version),
+        configured_shards,
+        budget,
+        BACKGROUND_MIGRATE_RAISED_BY,
+    )
+    .await;
+    match walked {
+        Ok(report) => Ok(BackgroundMigrateOutcome::Walked {
+            active_version,
+            report: Box::new(report),
+            held: Vec::new(),
+        }),
+        Err(MaintainError::MigrateHeld { held, report }) => Ok(BackgroundMigrateOutcome::Walked {
+            active_version,
+            report,
+            held,
+        }),
+        Err(MaintainError::CompatRefused { refusal, .. }) => {
+            Ok(BackgroundMigrateOutcome::Refused { refusal })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// The `raised_by` a floor raised by [`background_migrate_unit`] records.
+pub const BACKGROUND_MIGRATE_RAISED_BY: &str = "ravel-server background-migrate";
 
 /// `report`, or [`MaintainError::MigrateHeld`] carrying it when the walk held
 /// any bucket.
