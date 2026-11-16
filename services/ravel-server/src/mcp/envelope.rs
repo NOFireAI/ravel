@@ -259,18 +259,10 @@ pub(crate) fn log_redacted(
 }
 
 /// An internal fault whose cause must not reach the caller: the fixed
-/// `client_message` under [`FailureClass::Internal`], with the cause logged by
-/// [`log_redacted`].
-pub(crate) fn redacted_internal(
-    client_message: &str,
-    cause: &dyn std::fmt::Display,
-    tenant_hash: TenantHash,
-) -> Failure {
-    log_redacted(client_message, cause, tenant_hash);
-    // mcp-error-display-allow: the caller's fixed message; the cause is logged,
-    // never formatted.
-    internal(client_message.to_string())
-}
+/// `client_message` under [`FailureClass::Internal`], with the cause logged
+/// once at warn by the tool layer's own function, so both layers emit one log
+/// shape.
+pub(crate) use ravel_mcp::envelope::redacted_internal;
 
 /// An SQL result cell the JSON encoding cannot hold. The message names the
 /// column, its Arrow type and the fixed reason, never the value. It names the
