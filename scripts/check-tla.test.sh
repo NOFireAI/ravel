@@ -1468,6 +1468,16 @@ make_area enr 1 "$HDR6
 $ROW6_SUT
 | Replay | replay | \`crates/a.rs::publish\` | none | none | driver: ingest-durability -- acked write is replayed |"
 expect_trace aw enr fail "message 'acked write is replayed' not found as the string literal \"acked write is replayed\" in a .rs file under 'antithesis/ingest-durability/'"
+# acked occurs in the driver's main.rs only as an identifier.
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| Bare | bare | \`crates/a.rs::publish\` | none | none | driver: ingest-durability -- acked |"
+expect_trace aw2 enr fail "message 'acked' not found as the string literal \"acked\" in a .rs file under 'antithesis/ingest-durability/'"
+# "write is durable" is only part of the longer literal "acked write is durable".
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| Part | part | \`crates/a.rs::publish\` | none | none | driver: ingest-durability -- write is durable |"
+expect_trace aw3 enr fail "message 'write is durable' not found as the string literal \"write is durable\" in a .rs file under 'antithesis/ingest-durability/'"
 
 # Mutant fixtures for (ax)-(ay): a live one in a driver-side store, one
 # outside any driver/ directory, and ones that are commented out, test-only

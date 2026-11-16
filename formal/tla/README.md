@@ -219,7 +219,8 @@ A table's first row is its header, recognised by its exact first cell,
 `TLA+ action or property`; a table whose first cell differs fails, and every
 data row must have as many cells as the header. Only the row directly under
 the header may be its separator: a later row of pipes, spaces, dashes and
-colons is a data row, and fails for want of a Rust source ref.
+colons is a data row, and fails like any other row whose cells are not a
+valid entry (a `-` in the symbol column is not a Rust path, for example).
 
 ### The Antithesis property column
 
