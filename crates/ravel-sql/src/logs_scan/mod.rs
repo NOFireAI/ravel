@@ -1528,6 +1528,10 @@ struct BlockMetrics {
     /// either path, before any of them was emitted or charged
     /// (`answers_match_the_residual_on_every_value_shape`).
     rows_dropped_by_row_filter: Count,
+    /// Rows this partition's row path built an `attrs` map for. With a row
+    /// filter, only the rows it keeps (ADR-0093, I64 equality amendment;
+    /// `row_path_builds_attrs_only_for_rows_the_row_filter_keeps`).
+    attrs_rows_built: Count,
     /// The scan's input rows this partition consumed ([`METRIC_ROWS_CONSUMED`]).
     rows_consumed: Count,
     /// String cells this partition UTF-8 validated: the reader's dictionary
@@ -1757,6 +1761,7 @@ impl BlockMetrics {
                 .counter("contains_cells_tested", partition),
             rows_dropped_by_row_filter: MetricBuilder::new(metrics)
                 .counter("rows_dropped_by_row_filter", partition),
+            attrs_rows_built: MetricBuilder::new(metrics).counter("attrs_rows_built", partition),
             rows_consumed: MetricBuilder::new(metrics).counter(METRIC_ROWS_CONSUMED, partition),
             str_cells_validated: MetricBuilder::new(metrics)
                 .counter("str_cells_validated", partition),

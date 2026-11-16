@@ -5,7 +5,8 @@
 //! every filter except one it can prove the scan evaluates per row
 //! ([`filter_is_exact`]: a pure `ts` bound and/or `has_word` call, which the
 //! reader re-verifies, and a declared `Str` column's `<>` against a string
-//! literal, which the scan's row filter evaluates), so DataFusion re-applies
+//! literal or a declared `I64` column's `=` against an integer literal, which
+//! the scan's row filter evaluates), so DataFusion re-applies
 //! every other original above the scan; exactness comes from that residual
 //! plus the scan re-applying nothing destructive.
 //!
@@ -128,6 +129,10 @@
 //! - `Str` + `<>` (either operand order), against a non-NULL `Utf8`,
 //!   `Utf8View` or `Dictionary(Int32, Utf8)` literal -> the expression itself,
 //!   in [`LogsPushdown::row_filters`]; see the next section.
+//! - `I64` + `=` (either operand order), against a non-NULL integer literal
+//!   of any width whose value fits an `i64` -> `c = v` with an `Int64`
+//!   literal in [`LogsPushdown::row_filters`] too, beside the `NumRange` arm
+//!   and key above; see the section after next.
 //! - Anything else -- `!=` on a `Bool` or `Bytes` column, `NOT`, a negated `BETWEEN`, `IS [NOT] NULL`, a
 //!   general `OR` (anything but the same-column I64 equality union above), a
 //!   range operator on a `Str`/`Bytes` column, or a literal whose type does not
@@ -160,6 +165,21 @@
 //! not; `answers_match_the_residual_on_every_value_shape`
 //! (`tests/logs_str_not_equal_row_filter.rs`) pins that the scan drops exactly
 //! the rows the `FilterExec` of a provider with the row filter off drops.
+//!
+//! # A declared `I64` column's `=` (ADR-0093, I64 equality amendment)
+//!
+//! `c = v`, with `c` a bare declared `I64` column and `v` a non-NULL integer
+//! literal of any width whose value fits an `i64`, either operand order, goes
+//! to [`LogsPushdown::row_filters`] as `c = v` with an `Int64` literal. The
+//! same leaf still builds its `NumRange` prune arm and, for a key-index
+//! column, its KEY_IDX key (both only when the literal is already `Int64`),
+//! and those only narrow which blocks are read. [`filter_is_exact`] answers
+//! `true` for the shape: the scan evaluates the row filter on the column it
+//! builds, resource and scope fallback included, exactly as for the `Str`
+//! `<>` above. `i64_equality_is_a_row_filter_and_exact` pins what is accepted
+//! and what is not; `i64_equality_row_filter_matches_filter_exec`
+//! (`tests/logs_i64_equality_row_filter.rs`) pins the rows against the
+//! `FilterExec` of a provider with the row filter off.
 //!
 //! # Exact-key equalities (tier-1 KEY_IDX probe, ADR-2707 decision 5)
 //!
@@ -270,9 +290,12 @@ pub struct LogsPushdown {
     pub key_in: Option<KeyIn>,
     /// Top-level conjuncts `c <> v` (either operand order) with `c` a bare
     /// declared `Str` column and `v` a non-NULL string literal, kept as the
-    /// logical expression DataFusion handed the provider. The scan evaluates
-    /// them on each batch it builds, after the column build (ADR-0093, exact
-    /// not-equal amendment); the reader never sees them. See the module doc.
+    /// logical expression DataFusion handed the provider (ADR-0093, exact
+    /// not-equal amendment), and `c = v` with `c` a bare declared `I64`
+    /// column and `v` a non-NULL integer literal that fits an `i64`, as `c =
+    /// v` with an `Int64` literal (ADR-0093, I64 equality amendment). The
+    /// scan evaluates them on the columns it builds; the reader never sees
+    /// them. See the module doc.
     pub row_filters: Vec<Expr>,
 }
 
@@ -361,20 +384,24 @@ pub fn extract_logs_keyed(
 /// every conjunct of `filter` must be a shape whose pushed predicate is
 /// *equivalent* to it, not merely implied by it.
 ///
-/// Three shapes qualify. Two because the reader re-verifies them per row
+/// Four shapes qualify. Two because the reader re-verifies them per row
 /// (`ravel_logseg::reader`'s `eval`, its `Predicate::TsRange` and
 /// `Predicate::HasWord` arms both read the row's own value): a `ts` bound and a
-/// `has_word(col, 'literal')` call. The third is a declared `Str` column's
-/// `<>` against a non-NULL string literal ([`LogsPushdown::row_filters`]),
-/// because the scan evaluates DataFusion's own expression for it on every
-/// batch it builds (ADR-0093, exact not-equal amendment). Everything routed to
-/// the prune-only [`LogsPushdown::prune`] channel or to
-/// [`LogsPushdown::key_equals`], and everything not recognized at all, answers
-/// `false` (`str_not_equal_is_exact_and_nothing_near_it_is`).
+/// `has_word(col, 'literal')` call. The other two go to
+/// [`LogsPushdown::row_filters`], whose expressions the scan evaluates on the
+/// columns it builds: a declared `Str` column's `<>` against a non-NULL
+/// string literal (ADR-0093, exact not-equal amendment), and a declared `I64`
+/// column's `=` against a non-NULL integer literal that fits an `i64`
+/// (ADR-0093, I64 equality amendment), whose own prune arm and key do not
+/// count against it. Everything else routed to the prune-only
+/// [`LogsPushdown::prune`] channel or to [`LogsPushdown::key_equals`], and
+/// everything not recognized at all, answers `false`
+/// (`str_not_equal_is_exact_and_nothing_near_it_is`,
+/// `i64_equality_is_a_row_filter_and_exact`).
 ///
 /// A caller that does not hand the scan its row filters (a provider with
-/// them off, the distributed coordinator) must not report the third shape
-/// `Exact`; [`filter_has_row_filter`] tells it apart.
+/// them off, the distributed coordinator) must not report the row filter
+/// shapes `Exact`; [`filter_has_row_filter`] tells them apart.
 pub fn filter_is_exact(filter: &Expr, declared: &[DeclaredColumn]) -> bool {
     if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = filter
         && *op == Operator::And
@@ -405,7 +432,13 @@ pub fn filter_has_row_filter(filter: &Expr, declared: &[DeclaredColumn]) -> bool
 fn leaf_is_exact(expr: &Expr, declared: &[DeclaredColumn]) -> bool {
     let mut out = LogsPushdown::default();
     handle_leaf(expr, &mut out, declared);
-    if !out.prune.is_empty() || !out.key_equals.is_empty() || out.key_in.is_some() {
+    // The I64 equality's own prune arm and key only narrow which blocks are
+    // read; its row filter evaluates the whole leaf.
+    let i64_equality =
+        matches!(expr, Expr::BinaryExpr(be) if i64_equality_row_filter(be, declared).is_some());
+    if !i64_equality
+        && (!out.prune.is_empty() || !out.key_equals.is_empty() || out.key_in.is_some())
+    {
         return false;
     }
     match expr {
@@ -417,7 +450,7 @@ fn leaf_is_exact(expr: &Expr, declared: &[DeclaredColumn]) -> bool {
             Some((Operator::Lt | Operator::LtEq, _)) => out.ts_hi.is_some(),
             Some(_) => false,
             // The scan evaluates the whole leaf as its row filter.
-            None => is_str_not_equal(be, declared) && out.row_filters.len() == 1,
+            None => (is_str_not_equal(be, declared) || i64_equality) && out.row_filters.len() == 1,
         },
         Expr::Between(bt) if !bt.negated && is_ts_col(&bt.expr) => {
             out.ts_lo.is_some() && out.ts_hi.is_some()
@@ -639,6 +672,11 @@ fn handle_binary(be: &BinaryExpr, out: &mut LogsPushdown, declared: &[DeclaredCo
     if let Some(p) = attr_equality_predicate(be) {
         out.prune.push(p);
         return;
+    }
+    // A declared I64 column's `=` against an integer literal is also a row
+    // filter, beside the prune arm and key it builds below.
+    if let Some(filter) = i64_equality_row_filter(be, declared) {
+        out.row_filters.push(filter);
     }
     // A declared Str column's `<>` against a string literal goes to the
     // scan's own row filter channel, not to the reader.
@@ -973,6 +1011,54 @@ fn is_str_not_equal(be: &BinaryExpr, declared: &[DeclaredColumn]) -> bool {
         },
     };
     column.ty == DeclaredType::Str && matches!(value, Expr::Literal(sv, _) if is_str_literal(sv))
+}
+
+/// `c = v` or `v = c`, with `c` a bare column resolving to a declared `I64`
+/// column (fixed names excluded, [`resolve_declared`]) and `v` a non-NULL
+/// integer literal of any width whose value fits an `i64`, as the row filter
+/// `c = v` with `v` an `Int64` literal (ADR-0093, I64 equality amendment).
+/// `None` for every other shape: another operator, a `Cast`-wrapped or
+/// computed column, a NULL, float, decimal or string literal, and an unsigned
+/// value past `i64::MAX`.
+fn i64_equality_row_filter(be: &BinaryExpr, declared: &[DeclaredColumn]) -> Option<Expr> {
+    if be.op != Operator::Eq {
+        return None;
+    }
+    let (column, dc, value) = match resolve_declared(&be.left, declared) {
+        Some(dc) => (be.left.as_ref(), dc, be.right.as_ref()),
+        None => {
+            let dc = resolve_declared(&be.right, declared)?;
+            (be.right.as_ref(), dc, be.left.as_ref())
+        }
+    };
+    if dc.ty != DeclaredType::I64 {
+        return None;
+    }
+    let v = lit_any_int(value)?;
+    Some(Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(column.clone()),
+        Operator::Eq,
+        Box::new(Expr::Literal(ScalarValue::Int64(Some(v)), None)),
+    )))
+}
+
+/// A non-NULL integer literal of any width, as an `i64`, or `None` when it
+/// does not fit one.
+fn lit_any_int(e: &Expr) -> Option<i64> {
+    let Expr::Literal(sv, _) = e else {
+        return None;
+    };
+    match sv {
+        ScalarValue::Int8(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::Int16(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::Int32(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::Int64(Some(v)) => Some(*v),
+        ScalarValue::UInt8(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::UInt64(Some(v)) => i64::try_from(*v).ok(),
+        _ => None,
+    }
 }
 
 /// A non-NULL `Utf8` or `Utf8View` scalar, bare or inside the
@@ -1956,7 +2042,134 @@ mod tests {
             let p = keyed(std::slice::from_ref(&expr), &d);
             assert_eq!(p.key_equals, vec![want], "unexpected key for {expr:?}");
             assert_eq!(p.prune.len(), 1, "the prune arm must survive for {expr:?}");
-            assert!(!filter_is_exact(&expr, &d), "{expr:?} must stay Inexact");
+            // The I64 equality is also a row filter (ADR-0093, I64 equality
+            // amendment), so it alone is Exact.
+            let i64_column = p.key_equals[0].field == "status_code";
+            assert_eq!(filter_is_exact(&expr, &d), i64_column, "{expr:?}");
+            assert_eq!(p.row_filters.len(), usize::from(i64_column), "{expr:?}");
+        }
+    }
+
+    /// ADR-0093, I64 equality amendment: `c = v`, with `c` a bare declared
+    /// I64 column and `v` a non-NULL integer literal of any width that fits
+    /// an `i64`, in either operand order, goes to `row_filters` as `c = v`
+    /// with an `Int64` literal, keeps its prune arm and KEY_IDX key, and is
+    /// `Exact` alone and AND-ed with a `ts` bound. Nothing near it is.
+    ///
+    /// Flipped: letting the prune and key arms veto the shape in
+    /// `leaf_is_exact` fails "is Exact"; accepting any `=` on a declared
+    /// column fails "these stay Inexact" with the Bool, Str and Bytes shapes;
+    /// accepting a NULL literal fails it with "n = NULL".
+    #[test]
+    fn i64_equality_is_a_row_filter_and_exact() {
+        let d = vec![
+            DeclaredColumn::new("n", DeclaredType::I64),
+            DeclaredColumn::new("m", DeclaredType::I64),
+            DeclaredColumn::new("s", DeclaredType::Str),
+            DeclaredColumn::new("b", DeclaredType::Bool),
+            DeclaredColumn::new("blob", DeclaredType::Bytes),
+            DeclaredColumn::new("severity_num", DeclaredType::I64),
+        ];
+        let key_index = KeyIndexDeclaration {
+            columns: vec!["n".into()],
+            trace_id: false,
+        };
+        let want = col("n").eq(lit(435_090_932_899_640_449i64));
+        let int64 = lit(435_090_932_899_640_449i64);
+        let uint64 = lit(ScalarValue::UInt64(Some(435_090_932_899_640_449)));
+        for e in [
+            col("n").eq(int64.clone()),
+            int64.clone().eq(col("n")),
+            col("n").eq(uint64.clone()),
+            uint64.eq(col("n")),
+        ] {
+            let p = extract_logs_keyed(std::slice::from_ref(&e), &d, &key_index);
+            assert_eq!(p.row_filters, vec![want.clone()], "{e}");
+            assert!(filter_is_exact(&e, &d), "{e} is Exact");
+            assert!(filter_has_row_filter(&e, &d), "{e} holds a row filter");
+            let bounded = e.clone().and(col("ts").gt_eq(ts_lit(5)));
+            assert!(filter_is_exact(&bounded, &d), "{bounded} is Exact");
+        }
+        let p = extract_logs_keyed(&[col("n").eq(int64)], &d, &key_index);
+        assert_eq!(p.prune.len(), 1, "the NumRange prune arm stays");
+        assert_eq!(p.key_equals.len(), 1, "the KEY_IDX key stays");
+        for (literal, v) in [
+            (lit(ScalarValue::Int8(Some(-3))), -3i64),
+            (lit(ScalarValue::Int16(Some(300))), 300),
+            (lit(ScalarValue::Int32(Some(-70_000))), -70_000),
+            (lit(ScalarValue::UInt8(Some(200))), 200),
+            (lit(ScalarValue::UInt16(Some(60_000))), 60_000),
+            (lit(ScalarValue::UInt32(Some(4_000_000_000))), 4_000_000_000),
+        ] {
+            let e = col("n").eq(literal);
+            let p = extract_logs(std::slice::from_ref(&e), &d);
+            assert_eq!(p.row_filters, vec![col("n").eq(lit(v))], "{e}");
+            assert!(filter_is_exact(&e, &d), "{e} is Exact");
+        }
+
+        let rejected = [
+            ("n <> 5", col("n").not_eq(lit(5i64))),
+            ("n < 5", col("n").lt(lit(5i64))),
+            ("n > 5", col("n").gt(lit(5i64))),
+            ("n >= 5", col("n").gt_eq(lit(5i64))),
+            ("n <= 5", col("n").lt_eq(lit(5i64))),
+            (
+                "n BETWEEN 5 AND 5",
+                Expr::Between(Between::new(
+                    Box::new(col("n")),
+                    false,
+                    Box::new(lit(5i64)),
+                    Box::new(lit(5i64)),
+                )),
+            ),
+            ("n = NULL", col("n").eq(lit(ScalarValue::Int64(None)))),
+            (
+                "n = u64 past i64::MAX",
+                col("n").eq(lit(ScalarValue::UInt64(Some(u64::MAX)))),
+            ),
+            ("n = 2.0", col("n").eq(lit(2.0f64))),
+            ("n = '5'", col("n").eq(lit("5"))),
+            ("n = m", col("n").eq(col("m"))),
+            (
+                "CAST(n) = 5",
+                Expr::Cast(datafusion::logical_expr::Cast::new(
+                    Box::new(col("n")),
+                    DataType::Int64,
+                ))
+                .eq(lit(5i64)),
+            ),
+            (
+                "NOT (n <> 5)",
+                Expr::Not(Box::new(col("n").not_eq(lit(5i64)))),
+            ),
+            ("b = true", col("b").eq(lit(true))),
+            ("s = 'x'", col("s").eq(lit("x"))),
+            ("blob = x'01'", col("blob").eq(lit(vec![1u8]))),
+            ("fixed severity_num = 5", col("severity_num").eq(lit(5i64))),
+            ("undeclared = 5", col("other").eq(lit(5i64))),
+            ("OR", or(col("n").eq(lit(5i64)), col("n").eq(lit(6i64)))),
+            ("IN", col("n").in_list(vec![lit(5i64), lit(6i64)], false)),
+            (
+                "n = 5 AND n > 1",
+                col("n").eq(lit(5i64)).and(col("n").gt(lit(1i64))),
+            ),
+        ];
+        let accepted_wrongly: Vec<&str> = rejected
+            .iter()
+            .filter(|(_, e)| filter_is_exact(e, &d))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            accepted_wrongly.is_empty(),
+            "these stay Inexact: {accepted_wrongly:?}"
+        );
+        for (name, e) in &rejected[..rejected.len() - 1] {
+            assert!(
+                extract_logs(std::slice::from_ref(e), &d)
+                    .row_filters
+                    .is_empty(),
+                "{name} is not a row filter"
+            );
         }
     }
 

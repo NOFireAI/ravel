@@ -552,8 +552,13 @@ impl TableProvider for LogsTableProvider {
     ///   (`exact_not_equal_conjunct_is_exact_and_leaves_no_filter`). With the
     ///   row filter turned off ([`Self::with_row_filter_pushdown`]) the scan
     ///   receives none, and the filter stays `Inexact`.
-    /// - Everything else -- an `attrs['k'] = 'v'` equality, every declared typed
-    ///   column predicate (ADR-0093) -- goes to the prune-only
+    /// - A declared `I64` column's `=` against a non-NULL integer literal goes
+    ///   to [`LogsPushdown::row_filters`] the same way, and is `Exact` under
+    ///   the same conditions (ADR-0093, I64 equality amendment); its prune arm
+    ///   and key still narrow the blocks read
+    ///   (`prune_channel_filters_stay_inexact`).
+    /// - Everything else -- an `attrs['k'] = 'v'` equality, every other
+    ///   declared typed column predicate (ADR-0093) -- goes to the prune-only
     ///   [`LogsPushdown::prune`] channel. `open_scan` passes that channel
     ///   separately from the exact predicate and the reader uses it for block
     ///   pruning ONLY, never per row, so DataFusion's residual stays the sole
@@ -2735,18 +2740,63 @@ mod tests {
     /// `Inexact`: the reader uses a prune arm for block pruning only and never
     /// evaluates it per row, so DataFusion's residual is the sole exact
     /// evaluator. An `attrs['k'] = 'v'` map equality and a declared typed column
-    /// predicate (ADR-0093) are both in that channel.
+    /// predicate (ADR-0093) are both in that channel. The one exception is a
+    /// declared I64 column's `=` against a non-NULL integer literal, which is
+    /// also a row filter and so `Exact`, but only where the scan receives its
+    /// row filters (ADR-0093, I64 equality amendment).
+    ///
+    /// Flipped: dropping the `row_filter_pushdown` check in
+    /// `supports_filters_pushdown` fails "Inexact with the row filter off".
     #[test]
     fn prune_channel_filters_stay_inexact() {
         use datafusion::functions::core::expr_fn::get_field;
+        use datafusion::logical_expr::or;
         use datafusion::prelude::{col, lit};
 
-        let p = pushdown_provider(i64_status_code());
+        let mut declared = i64_status_code();
+        declared.extend([
+            DeclaredColumn::new("ok", DeclaredType::Bool),
+            DeclaredColumn::new("region", DeclaredType::Str),
+        ]);
+        let p = pushdown_provider(declared.clone());
+        let off = pushdown_provider(declared).with_row_filter_pushdown(false);
+        for filter in [
+            col("status_code").eq(lit(500i64)),
+            lit(500i64).eq(col("status_code")),
+            col("status_code").eq(lit(datafusion::scalar::ScalarValue::Int32(Some(500)))),
+            col("ts")
+                .gt_eq(ts_lit(100))
+                .and(col("status_code").eq(lit(500i64))),
+        ] {
+            assert_eq!(
+                pushdown_for(&p, &filter),
+                TableProviderFilterPushDown::Exact,
+                "the I64 equality is Exact: {filter}"
+            );
+            assert_eq!(
+                pushdown_for(&off, &filter),
+                TableProviderFilterPushDown::Inexact,
+                "Inexact with the row filter off: {filter}"
+            );
+        }
         let cases = [
             get_field(col("attrs"), "service.name").eq(lit("api")),
-            col("status_code").eq(lit(500i64)),
+            col("status_code").not_eq(lit(500i64)),
+            col("status_code").lt(lit(500i64)),
             col("status_code").gt(lit(500i64)),
             col("status_code").in_list(vec![lit(200i64), lit(404i64)], false),
+            col("status_code").eq(lit(datafusion::scalar::ScalarValue::Int64(None))),
+            Expr::Cast(datafusion::logical_expr::Cast::new(
+                Box::new(col("status_code")),
+                datafusion::arrow::datatypes::DataType::Int64,
+            ))
+            .eq(lit(500i64)),
+            or(
+                col("status_code").eq(lit(500i64)),
+                col("status_code").eq(lit(404i64)),
+            ),
+            col("ok").eq(lit(true)),
+            col("region").eq(lit("eu")),
         ];
         for filter in cases {
             assert_eq!(
@@ -2786,7 +2836,7 @@ mod tests {
             // A ts bound AND a declared-column predicate: likewise prune-only.
             col("ts")
                 .gt_eq(ts_lit(100))
-                .and(col("status_code").eq(lit(500i64))),
+                .and(col("status_code").gt(lit(500i64))),
             // A ts bound AND a shape the extractor recognizes in NEITHER
             // channel: `LIKE` on `body` is not pushed (only a declared `Str`
             // column's is, see crate::logs_pushdown), so the residual must
@@ -2931,7 +2981,10 @@ mod tests {
             }
         }
 
-        let declared = vec![DeclaredColumn::new("s", DeclaredType::Str)];
+        let declared = vec![
+            DeclaredColumn::new("s", DeclaredType::Str),
+            DeclaredColumn::new("n", DeclaredType::I64),
+        ];
         let local = pushdown_provider(declared.clone());
         let coordinator = pushdown_provider(declared.clone())
             .with_distributed_scan(Vec::new(), Arc::new(NoWorker));
@@ -2939,6 +2992,7 @@ mod tests {
             col("s").not_eq(lit("")),
             col("ts").gt_eq(ts_lit(100)),
             col("ts").gt_eq(ts_lit(100)).and(col("s").not_eq(lit(""))),
+            col("n").eq(lit(5i64)),
         ];
         for filter in &filters {
             assert_eq!(
@@ -2953,7 +3007,7 @@ mod tests {
             );
         }
         let pushdown = extract_logs_keyed(&filters, &declared, &KeyIndexDeclaration::default());
-        assert_eq!(pushdown.row_filters.len(), 2);
+        assert_eq!(pushdown.row_filters.len(), 3);
         let sliced = SlicePushdown::logs(&pushdown);
         assert!(
             sliced.as_logs().expect("logs").row_filters.is_empty(),
