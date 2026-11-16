@@ -30,11 +30,22 @@
 #      dev-dependencies table or in the value of a feature itself named
 #      `format-drill`: never in `default`, a forward under another name (which
 #      the Dockerfile could enable without naming it), or a non-dev dependency.
+#   6. The test-only `antithesis`, `antithesis-mutants` and `capture` features
+#      of ravel-invariant (ADR-4326) cannot reach a published image. Neither
+#      the Dockerfile nor publish-images.yml names `antithesis`,
+#      `antithesis-mutants` or `ravel-invariant/capture` outside a comment, or
+#      `capture` in a features argument. In the workspace manifests a value
+#      naming `antithesis` or `antithesis-mutants`, in any quoting, is allowed
+#      only in a feature of the same name; a value naming
+#      `ravel-invariant/capture`, or `capture` in ravel-invariant's own
+#      features or on a ravel-invariant dependency edge, is allowed nowhere.
+#      Dev-dependencies get no exemption: test builds unify features.
 #
 # Exit 0 clean, 1 on a finding, 2 when an anchor is missing (no
 # `[profile.release]` table, no `cargo build` line, a file that is not there,
-# a drill crate that no longer declares the feature): a scan that found
-# nothing to check is not a pass.
+# a drill crate that no longer declares the feature, a ravel-invariant
+# manifest that is missing or no longer declares one of its three test-only
+# features): a scan that found nothing to check is not a pass.
 #
 # Run: scripts/guards/check-release-profile.sh
 # Cases: scripts/guards/check-release-profile.test.sh
@@ -253,22 +264,26 @@ for f in "${manifests[@]}"; do
   ' "${f}")
 done
 
-# --- 6. antithesis and antithesis-mutants stay out of release builds ----------
+# --- 6. ravel-invariant's test-only features stay out of release builds -------
 
-# ADR-4326: the Antithesis SDK and the mutant switches are for the workload
-# images under antithesis/ only. A whole-word match, so the
-# antithesis-instrumentation crate name is not one.
+# ADR-4326: the Antithesis SDK, the mutant switches and the in-process capture
+# are for the workload images under antithesis/ and the invariants test lane
+# only. Whole-word matches, so the antithesis-instrumentation crate name is
+# not one. `capture` is a common word, so outside a manifest only the
+# qualified `ravel-invariant/capture` or a features argument naming it counts.
 for f in "${dockerfile}" "${publish}"; do
   while IFS= read -r hit; do
     [[ -n "${hit}" ]] || continue
-    finding "${f}:${hit%%:*}: release build enables antithesis or antithesis-mutants: ${hit#*:}"
+    finding "${f}:${hit%%:*}: release build enables antithesis, antithesis-mutants or ravel-invariant/capture: ${hit#*:}"
   done < <(awk '
     { line = $0; sub(/(^|[[:space:]])#.*$/, "", line) }
-    line ~ /(^|[^A-Za-z0-9_-])antithesis(-mutants)?($|[^A-Za-z0-9_-])/ { print NR ":" $0 }
+    line ~ /(^|[^A-Za-z0-9_-])antithesis(-mutants)?($|[^A-Za-z0-9_-])/ { print NR ":" $0; next }
+    line ~ /ravel-invariant\??\/capture($|[^A-Za-z0-9_-])/ { print NR ":" $0; next }
+    line ~ /(-F|--features|FEATURES)/ && line ~ /(^|[^A-Za-z0-9_-])capture($|[^A-Za-z0-9_-])/ { print NR ":" $0 }
   ' "${f}")
 done
 
-for want in antithesis antithesis-mutants; do
+for want in antithesis antithesis-mutants capture; do
   awk -v want="${want}" '
     /^[[:space:]]*\[/ { in_features = ($0 == "[features]"); next }
     in_features && $0 ~ ("^[[:space:]]*" want "[[:space:]]*=") { found = 1 }
@@ -277,25 +292,38 @@ for want in antithesis antithesis-mutants; do
     || missing "${invariant_crate}/Cargo.toml declares no ${want} feature"
 done
 
-# Each manifest line naming either feature as a value, with the table and key
-# it belongs to (as for format-drill above). Allowed: the value of a feature of
-# the same name, which only forwards a feature something else must turn on.
-# A default list, a feature of another name, and any dependency edge are
-# findings, dev-dependencies included: the workspace's test builds would unify
-# it into every crate they compile.
+# Each manifest line naming one of the features in a value (after the key's
+# `=`, or on a continuation line of a multi-line array), quoted, single-quoted
+# or bare, with the table and key it belongs to (as for format-drill above).
+# Allowed: antithesis or antithesis-mutants in the value of a feature of the
+# same name, which only forwards a feature something else must turn on.
+# Everything else is a finding, dev-dependencies included: the workspace's
+# test builds would unify it into every crate they compile. capture has no
+# allowed forward at all: the invariants lane turns it on from the command
+# line. A bare `capture` counts in ravel-invariant's own [features] and on a
+# ravel-invariant dependency edge, where it can only mean that feature.
 for f in "${manifests[@]}"; do
   while IFS= read -r hit; do
     [[ -n "${hit}" ]] || continue
-    finding "${f}:${hit%%:*}: enables antithesis outside its own same-name feature: ${hit#*:}"
-  done < <(awk '
+    finding "${f}:${hit}"
+  done < <(awk -v self="${invariant_crate}/Cargo.toml" '
+    function has(s, w) { return s ~ ("(^|[^A-Za-z0-9_-])" w "($|[^A-Za-z0-9_-])") }
     /^[[:space:]]*\[/ { table = $0; gsub(/[[:space:]]/, "", table); key = ""; next }
-    { line = $0; sub(/(^|[[:space:]])#.*$/, "", line) }
+    { line = $0; sub(/(^|[[:space:]])#.*$/, "", line); value = line }
     match(line, /^[[:space:]]*[A-Za-z0-9_.-]+[[:space:]]*=/) {
       key = substr(line, RSTART, RLENGTH); sub(/=$/, "", key); gsub(/[[:space:]]/, "", key)
+      value = substr(line, RSTART + RLENGTH)
     }
-    line !~ /["\/]antithesis(-mutants)?"/ { next }
-    table == "[features]" && (key == "antithesis" || key == "antithesis-mutants") { next }
-    { print FNR ":" $0 }
+    {
+      own = (FILENAME == self && table == "[features]")
+      edge = (table ~ /dependencies/ && (key == "ravel-invariant" || table ~ /dependencies\.ravel-invariant\]$/))
+      if (has(value, "ravel-invariant\\??/capture") || ((own || edge) && has(value, "capture"))) {
+        print FNR ": enables ravel-invariant/capture, which no manifest may turn on: " $0
+      } else if (has(value, "antithesis(-mutants)?") \
+          && !(table == "[features]" && (key == "antithesis" || key == "antithesis-mutants"))) {
+        print FNR ": enables antithesis outside its own same-name feature: " $0
+      }
+    }
   ' "${f}")
 done
 

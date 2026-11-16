@@ -35,7 +35,9 @@ if [ "$WHAT" = all ] || [ "$WHAT" = driver ]; then
 fi
 
 # Instrumentation checks (snouty docs: /docs/reference/sdk/rust/instrumentation/):
-# the runtime shim is linked in, and the sancov sections exist.
+# the runtime shim is linked in, and the sancov sections exist, in each
+# instrumented binary: ravel-server and ravel-cli in the server image, and the
+# driver.
 check() {
     local image="$1" bin="$2" dir
     dir=$(mktemp -d)
@@ -57,6 +59,9 @@ check() {
     rm -rf "$dir"
 }
 rc=0
-if [ "$WHAT" = all ] || [ "$WHAT" = server ]; then check "$SERVER" ravel-server || rc=1; fi
+if [ "$WHAT" = all ] || [ "$WHAT" = server ]; then
+    check "$SERVER" ravel-server || rc=1
+    check "$SERVER" ravel-cli || rc=1
+fi
 if [ "$WHAT" = all ] || [ "$WHAT" = driver ]; then check "$DRIVER" driver || rc=1; fi
 exit $rc

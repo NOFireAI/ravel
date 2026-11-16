@@ -20,14 +20,14 @@ use ravel_logseg::{RlogConfig, read_section};
 use ravel_proto::segment::v1::Footer;
 use ravel_types::{Signal, TenantId, TimeRange};
 
-// jemalloc is compiled into this binary so the allocator is part of the
-// binary's identity rather than an environment accident (#972); library crates
-// must never do this (their test binaries install their own global allocator).
 // The coverage runtime shim the instrumentation flags in the Antithesis
 // workload image need at link time (antithesis/ingest-durability/ravel/Dockerfile).
 #[cfg(feature = "antithesis")]
 use antithesis_instrumentation as _;
 
+// jemalloc is compiled into this binary so the allocator is part of the
+// binary's identity rather than an environment accident (#972); library crates
+// must never do this (their test binaries install their own global allocator).
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
