@@ -72,3 +72,30 @@ jq -rs '[.[].antithesis_assert // empty] | group_by(.message)[]
     | "\(.[0].display_type)\t\(.[0].message)"' "$OUT"/sdk-*.jsonl | sort > "$OUT/would-fail.tsv"
 echo "assertions: $(wc -l < "$OUT/assertions.tsv"), would fail: $(wc -l < "$OUT/would-fail.tsv")"
 cat "$OUT/would-fail.tsv"
+
+# The gate. A fault-free local run cannot reach the assertions that need
+# faults, so an unreached or never-true assertion is reported above and not
+# gated. What is gated: no SDK output at all, and any always-type assertion
+# that was hit with its condition false.
+jq -rs '[.[].antithesis_assert // empty] | group_by(.message)[]
+    | select(.[0].assert_type != "sometimes" and any(.hit and (.condition | not)))
+    | .[0].message' "$OUT"/sdk-*.jsonl | sort > "$OUT/violated.tsv"
+if [ ! -s "$OUT/assertions.tsv" ]; then
+    echo "FAIL: no assertions collected (see $OUT/missing-sdk.txt)"
+    exit 1
+fi
+if [ "${WORKLOAD_INJECT_MISSING_RECORD:-}" = 1 ]; then
+    # The self-check: the injected record must make the presence assertion fail.
+    if grep -q "returns every record of that write" "$OUT/violated.tsv"; then
+        echo "self-check OK: the presence assertion failed as injected"
+        exit 0
+    fi
+    echo "FAIL: self-check run, but the presence assertion did not fail"
+    exit 1
+fi
+if [ -s "$OUT/violated.tsv" ]; then
+    echo "FAIL: always-type assertions violated:"
+    cat "$OUT/violated.tsv"
+    exit 1
+fi
+echo "OK: no always-type assertion violated"

@@ -5,8 +5,9 @@
 Tests Ravel's ingest acknowledgement and visibility contract
 (docs/consistency-model.md) under faults: a strictly acknowledged write is
 never lost, is readable with its commit tokens, and is visible to queries once
-faults stop; no stored record is a phantom or stored more often than the
-attempts that could have written it.
+faults stop; no stored record or sample is a phantom, and no stored log record
+is stored more often than the attempts that could have written it (sample-level
+duplication is not asserted for metrics).
 
 ### Deployment
 

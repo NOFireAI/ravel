@@ -9,7 +9,28 @@ HOURS="${1:?max compute hours}"
 DESC="${2:-ravel ingest durability}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CONFIG="$HERE/../config"
-REF=$(git -C "$HERE" rev-parse HEAD)
+CHECKOUT=$(git -C "$HERE" rev-parse HEAD)
+
+# The run records the commit the images were built from (build.sh stamps it
+# as a label), and the config comes from this checkout, so the two must agree.
+image_ref() {
+    docker image inspect -f '{{ index .Config.Labels "org.ravel.antithesis.ref" }}' "$1" 2>/dev/null
+}
+SERVER_REF=$(image_ref ravel-antithesis-server:ingest-durability) || SERVER_REF=""
+DRIVER_REF=$(image_ref ravel-antithesis-driver:ingest-durability) || DRIVER_REF=""
+if [ -z "$SERVER_REF" ] || [ -z "$DRIVER_REF" ] || [ "$SERVER_REF" = "<no value>" ] || [ "$DRIVER_REF" = "<no value>" ]; then
+    echo "refused: an image has no org.ravel.antithesis.ref label; rebuild it with scripts/build.sh" >&2
+    exit 1
+fi
+if [ "$SERVER_REF" != "$DRIVER_REF" ]; then
+    echo "refused: the server image is from $SERVER_REF and the driver image from $DRIVER_REF" >&2
+    exit 1
+fi
+if [ "$SERVER_REF" != "$CHECKOUT" ]; then
+    echo "refused: the images are from $SERVER_REF but this checkout is at $CHECKOUT" >&2
+    exit 1
+fi
+REF="$SERVER_REF"
 
 # SKIP_VALIDATE=1 skips the local validation on a host that cannot run the
 # amd64 images (an Apple Silicon Mac without Rosetta emulation), once the same
