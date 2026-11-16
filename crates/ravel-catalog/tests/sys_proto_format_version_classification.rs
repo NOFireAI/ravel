@@ -76,11 +76,15 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         // index_trace_id, stamped 4 behind the same opt-in). MetricMetadataRecord accepts {1, 2} after ADR-0066 R1;
         // AuthTokenMap accepts {1, 2} (managed_by, ADR-0072 #897) and
         // KeyEpochRecord {1}, both as a floor-and-ceiling set since ADR-0066 R2.
-        // GcConfig and CompactionClaim still carry ceiling-only gates in their
-        // own crates (ravel-maintain, ravel-fleet), outside this change's scope:
-        // reported, not fixed. Every slice belonging to a ravel-catalog reader is
-        // checked against that reader's own constants by
-        // `catalog_read_sets_match_their_readers_constants`.
+        // GcConfig still carries a ceiling-only gate in its own crate
+        // (ravel-maintain), outside this change's scope: reported, not fixed.
+        // CompactionClaim's reader (ravel-fleet) now refuses to steal or
+        // overwrite a claim whose format_version is 0 or above its own known
+        // version at any age, not only past the 24 h ceiling (ADR-4233
+        // decision 4, H8); an ordinary unreadable claim at a known version is
+        // still judged by the ceiling. Every slice belonging to a
+        // ravel-catalog reader is checked against that reader's own constants
+        // by `catalog_read_sets_match_their_readers_constants`.
         ("ProvisioningRecord", CasMutable(&[1, 2, 3])),
         ("TenantConfigRecord", CasMutable(&[1, 2, 3, 4])),
         ("MetricMetadataRecord", CasMutable(&[1, 2])),

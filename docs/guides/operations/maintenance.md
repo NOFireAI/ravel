@@ -581,7 +581,9 @@ can differ: `recheck_after_unix_ms` is at most one claim lease plus the jitter
 past the observation, and `retry_after_unix_ms` is the 24 h steal threshold.
 For every other reason they are equal. A one-off rerun by hand should use
 `retry_after_unix_ms`, since a rerun at `recheck_after_unix_ms` against a
-still-present unreadable claim skips the bucket again. The four reasons are:
+still-present unreadable claim skips the bucket again. `version_protected_claim`
+is the one exception: it has no retry point at all (see below). The five
+reasons are:
 
 - `held_by_another`: a live claim, held by the process id printed. The retry
   point is one millisecond past the printed expiry.
@@ -589,8 +591,12 @@ still-present unreadable claim skips the bucket again. The four reasons are:
   another contender's steal won the compare-and-swap first. The printed expiry
   is the one already in the past. The winner has just written a fresh lease,
   so the retry point is a full lease from the moment of the loss.
-- `unreadable_claim`: the claim object does not decode, and it is not yet
-  older than the 24 h lease ceiling plus this process's jitter. See below.
+- `unreadable_claim`: the claim object does not decode as a claim of a
+  `format_version` this build knows, and it is not yet older than the 24 h
+  lease ceiling plus this process's jitter. See below.
+- `version_protected_claim`: the claim's `format_version` is 0 (never written
+  by any build) or above `CLAIM_FORMAT_VERSION` (written by a newer build).
+  Unlike `unreadable_claim` this is never stolen, at any age. See below.
 - `vanished_twice`: the claim key disappeared between the create and the read
   that followed it, twice in a row. Nothing is held, so the printed expiry is
   `0` and the retry point is immediate.
@@ -622,13 +628,35 @@ above.
 
 A run never continues without the claim. Such a run could publish a compaction
 built from data that an erasure of the same bucket already removed. A claim
-written by a newer release in a format that this release cannot read looks the
-same, so a rollback across such a release holds every bucket that the newer
-release claimed for up to 24 hours.
+written by a newer release, in a `format_version` this release does not know,
+is version-protected rather than unreadable (see `version_protected_claim`
+above): a rollback across such a release holds every bucket that the newer
+release claimed until a build that knows the version runs again, not for a
+bounded 24 hours.
 
 A claim object that something rewrites more often than once every 24 hours
 holds its bucket for as long as the rewrites continue. Find and stop the
 writer: only principals with write access to `sys/maintain/` can do this.
+
+A `version_protected_claim` is a different hazard and has no 24 h ceiling, no
+retry point, and no automatic end (see Background, retained-data
+compatibility). Its
+`format_version` is either 0, meaning no build ever wrote this claim in a
+format any reader of this protocol recognizes, or above `CLAIM_FORMAT_VERSION`,
+meaning a newer build claimed the bucket and this build cannot read enough of
+the claim to judge its age or steal it safely. This process logs the hazard
+once per claim, at `warn`, naming the claim object's key
+(`sys/maintain/claims/compaction/<work_id>`), the first time it observes the
+claim; later passes over the same held bucket count in
+`ravel_maintain_claims_skipped_total` without repeating the log line. The
+bucket's compaction or erasure stays pending until one of:
+
+1. A build that knows the claimed `format_version` runs and reclaims it, or
+2. An operator deletes the claim object by hand, the same removal described
+   below for `unreadable_claim`, after confirming with
+   `ravel-cli maintain` or a direct `GET` on the claim key that its
+   `format_version` is genuinely out of this build's known range and not a
+   decode failure that `unreadable_claim` would otherwise cover.
 
 To end a hold sooner than 24 hours:
 
@@ -698,11 +726,15 @@ outcomes in its walk summary and never moves these counters.
 - `ravel_maintain_claims_skipped_total`: bucket evaluations that did not
   compact, or erasure rewrites that published nothing, because they could not
   take the bucket's claim. Most often an unexpired claim held the bucket. The
-  other causes are a lost steal race, a claim that could not be read, or one
-  that vanished twice (something outside the protocol is deleting claims). A
-  held bucket adds one per maintenance pass until the claim expires. The pass
-  that observed the claim logs a skip line with the reason. The later passes
-  of the same hold count without logging.
+  other causes are a lost steal race, a claim that could not be read, a claim
+  at a `format_version` this build does not know (never stolen, at any age;
+  see `version_protected_claim` above), or one that vanished twice (something
+  outside the protocol is deleting claims). A held bucket adds one per
+  maintenance pass for as long as it is held; for every reason but
+  `version_protected_claim` that ends when the claim expires, and for
+  `version_protected_claim` it does not end on its own at all. The pass that
+  observed the claim logs a skip line with the reason. The later passes of the
+  same hold count without logging.
 
 Read the acquired, stolen, lost and skipped counts as lower bounds. They are
 gathered per shard pass and added when the pass completes, and a pass that
@@ -2260,4 +2292,5 @@ Decision records behind this page:
 [format migration machinery](../../adrs/0066-format-migration-machinery.md),
 [bounded-memory log compaction merge](../../adrs/0979-bounded-memory-rlog-compaction-merge.md),
 [advisory compaction claims](../../adrs/1029-advisory-compaction-claims.md),
+[retained-data compatibility](../../adrs/4233-retained-data-compatibility-contract.md),
 and [alerts and audit signals](../../adrs/0040-alerts-and-audit-signals.md).
