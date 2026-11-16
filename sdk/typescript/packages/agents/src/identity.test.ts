@@ -1,0 +1,148 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+import { InvalidStepInput } from "./errors.js";
+import {
+  agentId,
+  blake3,
+  canonicalJson,
+  effectId,
+  jsonForm,
+  stepId,
+  stepInputHash,
+  toHex,
+  turnId,
+  turnRandomSeed,
+} from "./identity.js";
+
+const fixtures = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../fixtures");
+
+// Written by the blake3 crate 1.8.5 (the version in Cargo.lock) over input
+// byte i = i % 251, the official test-vector input; the lengths cross the
+// block, chunk and tree boundaries.
+const VECTORS: [number, string][] = [
+  [0, "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"],
+  [1, "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"],
+  [63, "e9bc37a594daad83be9470df7f7b3798297c3d834ce80ba85d6e207627b7db7b"],
+  [64, "4eed7141ea4a5cd4b788606bd23f46e212af9cacebacdc7d1f4c6dc7f2511b98"],
+  [65, "de1e5fa0be70df6d2be8fffd0e99ceaa8eb6e8c93a63f2d8d1c30ecb6b263dee"],
+  [1023, "10108970eeda3eb932baac1428c7a2163b0e924c9a9e25b35bba72b28f70bd11"],
+  [1024, "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7"],
+  [1025, "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444"],
+  [2048, "e776b6028c7cd22a4d0ba182a8bf62205d2ef576467e838ed6f2529b85fba24a"],
+  [2049, "5f4d72f40d7a5f82b15ca2b2e44b1de3c2ef86c426c95c1af0b6879522563030"],
+  [3072, "b98cb0ff3623be03326b373de6b9095218513e64f1ee2edd2525c7ad1e5cffd2"],
+  [3073, "7124b49501012f81cc7f11ca069ec9226cecb8a2c850cfe644e327d22d3e1cd3"],
+  [4096, "015094013f57a5277b59d8475c0501042c0b642e531b0a1c8f58d2163229e969"],
+  [4097, "9b4052b38f1c5fc8b1f9ff7ac7b27cd242487b3d890d15c96a1c25b8aa0fb995"],
+  [5120, "9cadc15fed8b5d854562b26a9536d9707cadeda9b143978f319ab34230535833"],
+  [8192, "aae792484c8efe4f19e2ca7d371d8c467ffb10748d8a5a1ae579948f718a2a63"],
+  [31744, "62b6960e1a44bcc1eb1a611a8d6235b6b4b78f32e7abc4fb4c6cdcce94895c47"],
+  [102400, "bc3e3d41a1146b069abffad3c0d44860cf664390afce4d9661f7902e7943e085"],
+];
+
+describe("identity", () => {
+  it.each(VECTORS)("blake3 of %i bytes matches the Rust crate", (len, hex) => {
+    const input = Uint8Array.from({ length: len }, (_, i) => i % 251);
+    expect(toHex(blake3(input))).toBe(hex);
+  });
+
+  it("step id and step input hash match the worker_poll_response fixture", () => {
+    // The Rust fixture writer derives these as step_id(1, 1, "price") and
+    // step_input_hash("catalog.price", "1", b"A-1").
+    const poll = JSON.parse(readFileSync(resolve(fixtures, "worker_poll_response.json"), "utf8")) as {
+      assignment: { steps: { step_id: string; input_hash: string }[] };
+    };
+    const step = poll.assignment.steps[0];
+    expect(stepId(1, 1, "price")).toBe(step?.step_id);
+    expect(stepInputHash("catalog.price", "1", new TextEncoder().encode("A-1"))).toBe(
+      step?.input_hash,
+    );
+  });
+
+  it("canonical step input and its hash match the identity/step_input_hash fixture", () => {
+    // Written by wire::fixtures::step_input_hash_fixture_matches_the_canonical_encoding.
+    const fixture = JSON.parse(
+      readFileSync(resolve(fixtures, "identity/step_input_hash.json"), "utf8"),
+    ) as { tool_name: string; tool_version: string; input: unknown; canonical: string; input_hash: string };
+    expect(canonicalJson(jsonForm(fixture.input))).toBe(fixture.canonical);
+    expect(
+      stepInputHash(fixture.tool_name, fixture.tool_version, new TextEncoder().encode(fixture.canonical)),
+    ).toBe(fixture.input_hash);
+  });
+
+  it("turn random seed matches the worker_poll_response fixture's lease", () => {
+    // The Rust fixture writer fills the lease's random_seed with
+    // wire::turn_random_seed(agent_id, incarnation, accept_seq).
+    const poll = JSON.parse(readFileSync(resolve(fixtures, "worker_poll_response.json"), "utf8")) as {
+      assignment: {
+        accept_seq: number;
+        lease: { agent_id: string; incarnation: number; random_seed: string };
+      };
+    };
+    const { lease, accept_seq } = poll.assignment;
+    expect(lease.random_seed).toBe("8f8d1b06b1618bd08db0300dbba36423");
+    expect(turnRandomSeed(lease.agent_id, lease.incarnation, accept_seq)).toBe(lease.random_seed);
+    expect(turnRandomSeed(lease.agent_id, lease.incarnation, accept_seq + 1)).not.toBe(lease.random_seed);
+  });
+
+  it("agent id matches the create_agent_response fixture", () => {
+    const created = JSON.parse(readFileSync(resolve(fixtures, "create_agent_response.json"), "utf8")) as {
+      agent_id: string;
+    };
+    expect(agentId("order", "o-1")).toBe(created.agent_id);
+    expect(agentId("ab", "c")).not.toBe(agentId("a", "bc"));
+  });
+
+  it("effect id and turn id match identity.rs's derivations", () => {
+    // Reference values from the Rust derive() of identity.rs: effect_id(3, 7,
+    // "charge") and turn_id(3, 7, 11, 2).
+    expect(effectId(3, 7, "charge")).toBe("9783259fa007c3c5b7335f6a12380c98");
+    expect(turnId(3, 7, 11, 2)).toBe("156eebeadce74319b27ad6ad03a54816");
+  });
+
+  it("canonical JSON sorts keys at every depth", () => {
+    expect(canonicalJson({ b: [{ d: 1, c: 2 }], a: null })).toBe('{"a":null,"b":[{"c":2,"d":1}]}');
+  });
+
+  it("canonical JSON refuses a Date with InvalidStepInput", () => {
+    expect(() => canonicalJson({ at: new Date(0) })).toThrow(InvalidStepInput);
+    expect(() => canonicalJson({ at: new Date(0) })).toThrow("value.at is a Date, not plain JSON");
+  });
+
+  it.each([
+    ["a Map", { m: new Map() }],
+    ["a Set", [new Set()]],
+    ["a bigint", { n: 1n }],
+    ["undefined inside an object that did not go through the JSON form", { u: undefined }],
+    ["a function", { f: () => 1 }],
+    ["a non-finite number", { n: Number.NaN }],
+    ["a class instance", { c: new (class Point { readonly x = 1; })() }],
+  ])("canonical JSON refuses %s", (_what, value) => {
+    expect(() => canonicalJson(value)).toThrow(InvalidStepInput);
+  });
+
+  it("the JSON form applies toJSON as JSON.stringify does", () => {
+    const at = new Date(Date.UTC(2026, 0, 1));
+    expect(canonicalJson(jsonForm({ at, list: [at] }))).toBe(
+      '{"at":"2026-01-01T00:00:00.000Z","list":["2026-01-01T00:00:00.000Z"]}',
+    );
+  });
+
+  it("the JSON form drops undefined members and writes undefined items as null, as JSON.stringify does", () => {
+    const value = { cursor: undefined, keep: 1, nested: { gone: undefined }, list: [undefined, 2] };
+    expect(canonicalJson(jsonForm(value))).toBe(JSON.stringify({ keep: 1, list: [null, 2], nested: {} }));
+    expect(canonicalJson(jsonForm({ cursor: undefined }))).toBe(canonicalJson(jsonForm({})));
+    expect(() => canonicalJson(jsonForm(undefined))).toThrow(InvalidStepInput);
+    // eslint-disable-next-line no-sparse-arrays -- a hole is the case under test
+    expect(canonicalJson(jsonForm([, 1]))).toBe(JSON.stringify([, 1]));
+  });
+
+  it("agentId refuses a kind or key over the kernel's 256-byte cap instead of wrapping the length", () => {
+    const long = "k".repeat(257);
+    expect(() => agentId(long, "key")).toThrow(RangeError);
+    expect(() => agentId("kind", long)).toThrow(RangeError);
+    expect(() => agentId("k".repeat(256), "v".repeat(256))).not.toThrow();
+  });
+});

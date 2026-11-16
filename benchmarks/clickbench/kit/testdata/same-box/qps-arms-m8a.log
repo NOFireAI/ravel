@@ -1,0 +1,10 @@
+# Synthetic, in qps-arms.log's form: arm old is v0.28.0, stock the new build
+# at stock flags, off the new build with the bucketed retry off. Judged with
+# off as the new arm: mean 0.4575 over 0.4450 is 1.0281, and mean error ratio
+# 0.1515 over 0.1395 is higher.
+window=1 arm=old qps=0.450 err_ratio=0.1400 calls=270 errors=37 connections=10 duration_s=600
+window=2 arm=stock qps=0.455 err_ratio=0.1450 calls=273 errors=39 connections=10 duration_s=600
+window=3 arm=off qps=0.462 err_ratio=0.1500 calls=277 errors=41 connections=10 duration_s=600
+window=4 arm=off qps=0.453 err_ratio=0.1530 calls=272 errors=41 connections=10 duration_s=600
+window=5 arm=stock qps=0.448 err_ratio=0.1420 calls=269 errors=38 connections=10 duration_s=600
+window=6 arm=old qps=0.440 err_ratio=0.1390 calls=264 errors=36 connections=10 duration_s=600

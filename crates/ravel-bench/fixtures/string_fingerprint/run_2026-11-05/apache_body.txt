@@ -1,0 +1,38 @@
+string_fingerprint stamp git=93ab7d8d1677345958ea1a8e72f577ff5e1c1708 arch=x86_64 nproc=16 mem_total_kib=32132612 corpus_file=Apache.log corpus_sha256=23e616a1ed529bab9b20b9bc345d37035061eee971d246102bcc4937e51a039b corpus_bytes=5135876 zstd_level=3 cpu_clock=CLOCK_THREAD_CPUTIME_ID
+string_fingerprint params column=value gram_len=3 budget_share=0.01 fallback_min_bits=256 zstd_level=3 block_records=8192 object_records=262144 max_lines=56482 seed=3710 literals_per_kind=40 eq_max_len=64 like_min_len=5 like_max_len=12
+string_fingerprint workload training present equals=20 like=20 absent equals=20 like=20; evaluation present equals=20 like=20 absent equals=20 like=20
+string_fingerprint figure apache_body/lines = 56482 predict 56482 band [56482, 56482] ok
+string_fingerprint figure apache_body/blocks = 7 predict 7 band [7, 7] ok
+string_fingerprint figure apache_body/column_bytes = 5079395 predict 5079395 band [5079395, 5079395] ok
+string_fingerprint figure apache_body/compressed_bytes = 270382 predict 270382 band [190000, 352000] ok
+string_fingerprint figure apache_body/zstd_cpu_s = 0.006279802999999997 predict 0.006 band [0.002, 0.02] ok
+string_fingerprint figure apache_body/build_cpu_over_zstd = 7.522484065184852 predict 2.5 band [1, 6] MISS
+string_fingerprint figure apache_body/candidate_grams = 498 predict 400 band [100, 1500] ok
+string_fingerprint figure apache_body/learned_bits = 164 predict 150 band [20, 1000] ok
+string_fingerprint figure apache_body/fallback_bits = 2356 predict 2450 band [500, 3800] ok
+string_fingerprint figure apache_body/bits_per_block = 2520 predict 2600 band [1500, 4000] ok
+string_fingerprint figure apache_body/summary_bytes_share = 0.009974776427424902 predict 0.0099 band [0.0095, 0.01] ok
+string_fingerprint figure apache_body/fallback_density = 0.6255760368663594 predict 0.8 band [0.5, 0.97] ok
+string_fingerprint figure apache_body/eval_equals_bloom_testable = 40 predict 40 band [40, 40] ok
+string_fingerprint figure apache_body/seen/equals/false_positive_share = 0.03543307086614173 predict 0.4 band [0.1, 0.9] MISS
+string_fingerprint figure apache_body/seen/like/false_positive_share = 0.2552083333333333 predict 0.4 band [0.1, 0.9] ok
+string_fingerprint figure apache_body/unseen/equals/false_positive_share = 0.1423076923076923 predict 0.7 band [0.3, 1] MISS
+string_fingerprint figure apache_body/unseen/like/false_positive_share = 0.5692307692307692 predict 0.8 band [0.4, 1] ok
+string_fingerprint figure apache_body/unseen/equals_absent/false_positive_share = 0.2 predict 0.8 band [0.4, 1] MISS
+string_fingerprint figure apache_body/unseen/like_absent/false_positive_share = 0.5857142857142857 predict 0.85 band [0.4, 1] ok
+string_fingerprint figure apache_body/production/equals/false_positive_share = 0.011538461538461539 predict 0.02 band [0, 0.1] ok
+string_fingerprint figure apache_body/bloom/equals/false_positive_share = 0.011538461538461539 predict 0.02 band [0, 0.1] ok
+string_fingerprint figure apache_body/summary/equals_bloom_testable/false_positive_share = 0.1423076923076923 predict 0.7 band [0.3, 1] MISS
+string_fingerprint figure apache_body/contains/like/cells_tested_per_row = 0.7179809496830849 predict 0.6 band [0.2, 1.2] ok
+string_fingerprint figure apache_body/summary/like/cells_tested_share = 0.7207173328730303 predict 0.95 band [0.6, 1] ok
+string_fingerprint figure apache_body/saturation/long_values = 0 predict 0 band [0, 0] ok
+string_fingerprint figure apache_body/saturation/blocks absent as pre-registered (no value over 1024 bytes (describe over_1024_bytes=0))
+string_fingerprint figure apache_body/saturation/fallback_density absent as pre-registered (no value over 1024 bytes (describe over_1024_bytes=0))
+string_fingerprint figure apache_body/saturation/unseen/like/false_positive_share absent as pre-registered (no value over 1024 bytes (describe over_1024_bytes=0))
+string_fingerprint decision apache_body: NO-GO; unseen_equals_fp=0.1423 unseen_like_fp=0.5692 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=7.5225 (bar 2); fails: unseen_equals, unseen_like, cpu; saturation untested (no value over 1024 bytes) (saturation_fp=missing, bar 0.3)
+string_fingerprint objects=1 object_bytes=305224
+string_fingerprint miss apache_body/build_cpu_over_zstd: 7.522484065184852 outside band [1.0, 6.0]
+string_fingerprint miss apache_body/seen/equals/false_positive_share: 0.03543307086614173 outside band [0.1, 0.9]
+string_fingerprint miss apache_body/summary/equals_bloom_testable/false_positive_share: 0.1423076923076923 outside band [0.3, 1.0]
+string_fingerprint miss apache_body/unseen/equals/false_positive_share: 0.1423076923076923 outside band [0.3, 1.0]
+string_fingerprint miss apache_body/unseen/equals_absent/false_positive_share: 0.2 outside band [0.4, 1.0]

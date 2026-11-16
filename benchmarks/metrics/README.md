@@ -1,0 +1,1312 @@
+# MetricsBench artifacts
+
+The versioned inputs to MetricsBench (ADR-0927). Two files, both loaded and
+gated by code rather than read by hand:
+
+| File | What it is | Loader and gate |
+|---|---|---|
+| `workload.json` | The workload manifest (format version 2): seed, generator configuration, metric families, label distributions, and the four profiles with their range-evaluation grids | `ravel_bench::metrics_workload::load_workload` |
+| `metrics.corpus.json` | The PromQL query corpus (format version 4): 24 queries, each with stable id, typed cost class, the registry constructs it exercises, whether its answer is intended to be empty, and any ULP tolerance its comparison allows | `ravel_bench::promql_corpus::load_corpus`, then `ravel_bench::promql_corpus::gate_corpus_against_workload` |
+
+Both gates run before the first sample is generated:
+
+```sh
+cargo run -p ravel-bench --bin metricsbench_gen -- --profile ci --steps 20
+```
+
+That command loads and gates both artifacts, checks the bands they imply
+(every cost class populated, every entry classed, every metric a query selects
+actually emitted by the manifest), generates the profile, and prints one JSON
+document with the workload summary, the corpus summary, and the generation
+report. It exits non-zero on any gate or band failure, so exit 0 means the work
+happened.
+
+`metricsbench_gen` runs the two loaders, not `gate_corpus_against_workload`:
+that gate (see "Query corpus" below) runs in
+`crates/ravel-bench/tests/metricsbench_artifacts.rs` against the checked-in
+pair.
+
+## Versions
+
+Both files moved to format version 2 together (ADR-0927, 2026-10-26
+amendment, decisions B and E). A version-2 loader refuses a version-1 file:
+the manifest by the `range_eval` block it lacks, the corpus by its version
+number. There is no compatibility path. The stream changed with the
+out-of-order shift (see "Determinism"), so a version-1 stream is reproduced
+from the version-1 files in git history, not by this build.
+
+Since then the two version independently. The corpus is at version 4 (see
+"Corpus version 4" below) and the workload manifest stays at version 2; a
+corpus change does not alter the stream.
+
+`--profile` has no default. The profile selects which data the run touches and
+every alternative is plausible on any target, so a silent default is refused.
+
+## Profiles
+
+ADR-0927 decision 11. Cardinality, history and churn vary one axis each and pin
+the others; collapsing them into a single scale factor would make a regression
+unattributable.
+
+| profile | active series | samples/series | scrape | duration | churn | total samples |
+|---|---|---|---|---|---|---|
+| `cardinality` | 1,000,000 | 360 | 15 s | 90 m | none | 360,000,000 |
+| `history` | 10,000 | 172,800 | 15 s | 30 d | none | 1,728,000,000 |
+| `churn` | 50,000 concurrent | 8,640 | 15 s | 36 h | 20%/h | 432,000,000 |
+| `ci` | 1,000 | 120 | 15 s | 30 m | none | 120,000 |
+
+The `ci` profile is marked non-comparable **in the artifact**, as a typed
+`comparability` field carrying the reason:
+
+```json
+"comparability": {"non_comparable": {"reason": "..."}}
+```
+
+A reader that loads the manifest can therefore refuse to publish a `ci` figure
+without knowing the rule. `metricsbench_gen --require-comparable` is that
+refusal: it exits non-zero for a non-comparable profile, and also for a run
+that covers only part of a comparable profile, because a truncated run is not
+that profile. The gate refuses a manifest that marks `ci` comparable at all.
+
+### Range-evaluation grid (`range_eval`)
+
+Every profile declares the grid its `eval: range` corpus entries run on, as
+offsets in seconds back from the stream's newest sample: `end_offset_secs: 0`
+is the newest sample and `start_offset_secs` counts backwards from it.
+
+| profile | start offset | end offset | step | window | points |
+|---|---|---|---|---|---|
+| `cardinality` | 1,800 s | 0 | 15 s | 30 m | 121 |
+| `history` | 86,400 s | 0 | 300 s | 24 h | 289 |
+| `churn` | 21,600 s | 0 | 60 s | 6 h | 361 |
+| `ci` | 1,485 s | 0 | 15 s | 24 m 45 s | 100 |
+
+The manifest gate refuses a grid whose start is not after its end, whose step
+is zero, does not divide the window, or is not a multiple of the scrape
+interval, or whose start reaches past the profile's stream span, the time from
+its first sample to its newest: `(samples_per_series - 1) *
+scrape_interval_secs`, one scrape interval less than `duration_secs`. The
+corpus gate adds the lookback: every range entry's window plus its longest
+range-selector lookback must fit inside the stream span of each profile it
+runs under, so every grid point's lookback starts at or after the first
+sample. That is why `ci`'s window is 1,485 s: its stream spans 1,785 s and
+every range entry it runs reads 5 minutes before each grid point.
+
+## Ingest artifact (`metricsbench_ingest`, ADR-0927 decision 11)
+
+The bin's JSON report carries a `profile` and a `substrate` block so a reader
+never mistakes a non-comparable or unbilled run for a publishable result.
+
+`profile`:
+- `name`: the `--profile` name.
+- `comparable`: whether these figures may be published. True only when the
+  profile itself is publishable, `steps_run` equals `steps_declared`, and the
+  recorded `stream_digest` equals the digest the bin regenerates from the
+  manifest and the anchor; any one failing forces `false`.
+- `comparability_reason`: why not, present only when `comparable` is `false`.
+- `active_series`: series alive at any one instant, as declared.
+- `steps_run`: steps this run actually generated.
+- `steps_declared`: the profile's full declared step count
+  (`samples_per_series`).
+- `samples_per_series`, `scrape_interval_secs`, `duration_secs`,
+  `total_samples`, `churn_basis_points_per_hour`: as declared.
+- `label_cardinalities`: distinct values per FIXED label dimension, the
+  scaling label not included: it is not a dimension (the manifest gate
+  refuses to let it be declared as one), and its cardinality depends on the
+  run's churn epochs rather than being a fixed, manifest-only count.
+- `scaling_label`: the scaling label's `name` and its `cardinality_declared`,
+  the distinct scaling-label values the profile's full declared run would
+  emit, the generator's exact count.
+- `families`: one entry per metric family, each with `name`, `instances`,
+  `series_per_instance`.
+- `run`: figures scoped to `steps_run`, never the declared full profile:
+  `steps`, `total_series_created`, `logical_input_bytes`,
+  `total_samples_generated`, `scaling_label_cardinality` (distinct
+  scaling-label values this run actually emitted), all the generator's exact
+  counts for this run; plus `anchor_ms`, the first step's timestamp (see
+  below), and the provenance fields `workload_version`, `workload_digest`,
+  `seed` and `stream_digest` described under "Stream accounting".
+
+### Anchor (`--anchor-ms`)
+
+`--anchor-ms <i64>` is required. It sets the timestamp, in milliseconds since
+the epoch, of the first generated step, for example `--anchor-ms
+1700000010000`. There is no default: the stream digest covers every sample's
+timestamp, so an anchor read from the clock would make every run replay a
+different stream. No clock is read to generate the stream, and two runs with
+the same anchor replay the same bytes. The bin exits 64, naming the problem,
+when the flag is missing, when the anchor is negative, when it is not a
+multiple of the profile's scrape interval in milliseconds (the message shows
+the remainder), or when the last step, `anchor_ms + (steps - 1) * interval_ms`,
+lands past `9223372036854`, the largest millisecond whose nanosecond form fits
+an `i64`. The nightly lane passes a fixed on-grid anchor and replays the same
+frozen window every night.
+
+The report's `profile.run` block records the run's provenance, so a reader can
+regenerate the stream from it:
+- `workload_version`: the manifest's format version.
+- `workload_digest`: BLAKE3 (hex) over the manifest file's bytes.
+- `seed`: the manifest's generator seed.
+- `anchor_ms`: the `--anchor-ms` value.
+- `stream_digest`: the generator's digest over the stream the run replayed.
+
+Each row's `ingest` block adds `offered_digest`, BLAKE3 over every point that
+row offered, in order: a sample's canonical `(series, ts_ms, value_bits)`
+tuple (a staleness marker by its bit pattern), and a native histogram's
+series, timestamp and every field it is encoded with. `comparable` is `true`
+only when the profile is publishable, `steps_run` equals `steps_declared`,
+and `stream_digest` equals the digest
+recomputed from the manifest and the anchor; `comparability_reason` names each
+cause that failed. All five provenance fields and `offered_digest` are absent
+from a report written before they existed and read back as unset.
+
+### Stream accounting
+
+The bin streams the generator: it generates one scrape step at a time and
+replays it in `--batch-size` batches, so memory is bounded by the batch size
+and one step's width, not by the number of steps. Each comparator gets the
+same stream regenerated from the same anchor, and the bin fails if its digest
+differs from the in-process row's, or, without one, from the first portable
+row's.
+
+Every line of the stream is classified as a scalar (float) sample, a native
+histogram, a staleness marker, or malformed, and every row's `ingest` block
+carries `stream_counts` with `generated_lines`, `scalar`, `native_histogram`,
+`stale_marker` and `malformed`. Every payload type is on the wire, to every
+row:
+
+- A scalar is a Remote Write 1.0 `Sample`.
+- A staleness marker is a `Sample` whose value is the Prometheus stale NaN,
+  bit pattern `0x7ff0000000000002`
+  (`ravel_promql_difftest::generator::STALE_MARKER_BITS`). It is the one
+  non-finite value the lane admits: any other NaN or infinity is refused
+  before sending as `non_finite_value`
+  (`metrics_ingest::tests::validate_exempts_exactly_the_stale_marker_bits`).
+- A native histogram is a `Histogram` with integer counts: the line's
+  schema, count, sum and positive deltas, one positive span `{offset: 0,
+  length: <number of deltas>}`, zero threshold 0, zero count 0, no negative
+  buckets, and reset hint `UNKNOWN`, because the generator's line carries no
+  counter-reset flag; a receiver detects the reset from the counts
+  (`metrics_ingest::tests::a_native_histogram_decodes_back_with_the_promised_wire_shape`).
+  A histogram whose deltas decode to a negative bucket, or whose buckets do
+  not sum to its count, is refused before sending as `invalid_histogram`.
+
+Each row reports two offered classes, never folded into one. Scalars and
+staleness markers are samples: `offered_samples`, `accepted_samples`,
+`rejected_samples`, `dropped_samples`. Native histograms are their own class:
+`offered_histograms`, `accepted_histograms`, `rejected_histograms`,
+`dropped_histograms`
+(`metrics_ingest::tests::native_histograms_are_their_own_offered_class`).
+`excluded_native_histogram` and `excluded_stale_marker` stay in the report
+and are zero on every row the bin writes
+(`metrics_ingest::tests::the_ci_stream_replays_every_payload_type_with_zero_exclusions`);
+a report written before the lane sent every type carries them non-zero.
+Band 4 is two equations, and the bin fails, naming every figure, unless both
+close:
+
+- Classification identity: `scalar + native_histogram + stale_marker +
+  malformed == generated_lines == emitted_samples`, with `malformed` zero and
+  each of `scalar`, `native_histogram` and `stale_marker` equal to the
+  generator's own `float_samples`, `native_histogram_samples` and
+  `stale_markers`, so a classifier that swaps two kinds fails even though the
+  sum still closes.
+- Offering identity: `offered_samples + offered_histograms +
+  excluded_native_histogram + excluded_stale_marker == generated_lines`, read
+  from the row's own fields, with `offered_samples + excluded_stale_marker ==
+  scalar + stale_marker`, `offered_histograms + excluded_native_histogram ==
+  native_histogram`, `offered_samples == accepted_samples + rejected_samples +
+  dropped_samples + unsupported_samples`, and the same split for histograms
+  (`offered == accepted + rejected + dropped + unsupported` per class). A row
+  that counts its histograms under `offered_samples` fails the second
+  equality even when the total closes
+  (`metrics_ingest::tests::a_row_that_folds_histograms_into_offered_samples_fails`).
+  Each class's drop must also be bucketed: `dropped_samples` equals
+  `rejected_by_status` summed plus `retry_exhausted_samples`, and
+  `dropped_histograms` equals `histograms_rejected_by_status` summed plus
+  `retry_exhausted_histograms`, on every row, the in-process one included
+  (`metrics_ingest::tests::dropped_points_must_be_bucketed_by_status_or_retry_exhaustion`).
+
+`dropped_samples` counts samples sent and not accepted by the receiver. An
+HTTP row splits them: `rejected_by_status` maps each non-retryable non-2xx
+HTTP status to the samples it rejected (for example `{"400": 500}`), and
+`retry_exhausted_samples` counts samples in batches that ended on a
+retryable status after the retry budget, which may be zero
+(`--http-max-retries`), or on a transport error. `retry_exhausted_by_status`
+keys the first kind by that last status (for example `{"503": 500}`); a
+transport error has no status and is counted only in the total
+(`metrics_ingest::tests::comparator_drops_are_bucketed_by_status_and_by_retry_exhaustion`).
+`histograms_rejected_by_status`, `retry_exhausted_histograms` and
+`histograms_retry_exhausted_by_status` split `dropped_histograms` the same
+way. The in-process Ravel row has no HTTP status and no retry loop, so all
+six are empty there, and a strict write that did not ack fails the bucketing
+identity: the drop budget is zero. `rejected_samples` and
+`rejected_histograms` are the points the lane refused before sending.
+`--batch-size` and `--http-batch-size` count points: samples and histograms
+together.
+
+#### Rows and receivers
+
+The in-process row is `system: ravel-in-process`, `endpoint: in-process`:
+the diagnostic lane's replay through `IngestRouter`, which skips the
+event-time admission `ravel-server` applies (ADR-0927, 2026-10-26 amendment,
+section A). Its name differs from the portable row's `ravel`, so a lookup by
+`system` returns one row or the other, never the wrong one. It carries every
+commit token its strict writes minted under `commit_tokens`.
+
+Each HTTP receiver gets a row only when its endpoint is passed, and its
+`system` value is the name the query runner joins on. Every HTTP endpoint
+needs its query URL, the base its `/api/v1/query` and `/api/v1/series` are
+appended to; the bin exits 64 without it
+(`metricsbench_ingest::tests::every_endpoint_needs_its_query_url`), and
+exits 64 on a query URL given without its endpoint
+(`metricsbench_ingest::tests::a_query_url_without_its_endpoint_is_refused`):
+
+| Flag | Query URL flag | `system` | Ack | `acceptance_basis` |
+|---|---|---|---|---|
+| `--ravel-endpoint <url>` | `--ravel-query-url` | `ravel` | `durable_on_ack`, refused when no response carries `x-ravel-commit-token` | `read_back` |
+| `--prometheus-endpoint <url>` | `--prometheus-query-url` | `prometheus` | `buffered` | `acknowledged` |
+| `--victoriametrics-endpoint <url>` | `--victoriametrics-query-url` | `victoriametrics` | `buffered` | `acknowledged` |
+| `--mimir-endpoint <url>` | `--mimir-query-url` | `mimir` | `buffered` | `acknowledged` |
+
+Every row sends Remote Write 1.0, the portable Ravel row included. Each
+receiver's response is read by its own rule, and every HTTP row records the
+rule's basis as `acceptance_basis`:
+
+- Prometheus: a 400 rejects the whole request, every point of it under
+  `rejected_by_status`.
+- Mimir: a 400 is a per-sample soft rejection. Only the points the body names
+  are rejected, matched on Mimir's rendering of a sample ("The affected sample
+  has timestamp `<RFC3339Nano UTC>` and is from series `<name{labels}>`",
+  taken from Mimir's main branch, not a pinned release); the rest of the
+  request is accepted. A 400 whose body names no point of the request
+  rejects it whole
+  (`metrics_ingest::tests::prometheus_rejects_a_400_request_whole_and_mimir_only_the_named_sample`,
+  `metrics_ingest::tests::a_mimir_400_naming_no_point_of_the_batch_rejects_it_whole`).
+- VictoriaMetrics: a 2xx accepts every point except native histograms, which
+  it acknowledges without storing (see the unsupported-class table below)
+  (`metrics_ingest::tests::victoriametrics_acknowledges_histograms_it_cannot_store`).
+- Ravel: a 2xx is a durable acknowledgement and a 400 rejects the request;
+  ravel-server answers 204 after admission or normalization drops too, so its
+  accepted set is checked by the read-back below.
+
+`accepted_samples` and `accepted_histograms` count the points a row's rule
+accepted. A Remote Write 1.0 response carries no written count, so on an
+`acknowledged` row they are what the receiver acknowledged. The read-back
+checks them only in part: it counts series and reads one probe series per
+class, so it catches a dropped series, or a dropped point in a probe series,
+not every dropped point.
+
+`endpoint` on an HTTP row is the URL passed. The portable Ravel row writes to
+`ravel-server`'s `/api/v1/write`. With `--ravel-bearer-token-env <VAR>` it
+sends `Authorization: Bearer <token>`, the token read from the environment
+variable `VAR` names, never from the command line. The bin exits 64 when that
+variable is unset or empty, or when the flag is given without
+`--ravel-endpoint` (`metricsbench_ingest_smoke::a_bearer_token_env_that_cannot_be_read_exits_64`).
+The token is not written into the report: neither `endpoint` nor
+`client_behavior` carries it
+(`metrics_ingest::tests::the_portable_ravel_row_sends_the_bearer_and_keeps_the_latest_token_of_every_shard`).
+
+Every row records its `tenant`. The in-process row writes under
+`--tenant` (default `metricsbench`). The portable Ravel row records
+`--ravel-tenant`, the tenant the operator declares ravel-server resolves its
+requests to. It is declared, not observed: nothing on the wire carries it and
+a `CommitToken` holds no tenant (its fields, `crates/ravel-types/src/lib.rs`,
+are shard, writer, epoch, sequence and ingest hour). `--ravel-endpoint` requires it and, unless
+`--no-in-process-row` is given, it must equal `--tenant`, so both Ravel rows
+describe one tenant's data; the bin
+exits 64 otherwise
+(`metricsbench_ingest_smoke::a_missing_or_mismatched_ravel_tenant_exits_64`),
+and exits 64 on `--ravel-tenant` given without `--ravel-endpoint`
+(`metricsbench_ingest::tests::a_ravel_tenant_without_the_ravel_endpoint_is_refused`).
+A comparator is sent no tenant and records none.
+
+The portable Ravel row records `commit_tokens_by_shard`, the newest
+`x-ravel-commit-token` value per shard over every acknowledged request (the
+server joins one token per shard a request touched with commas). Newest is the
+highest `(epoch, seq)`, not the last to arrive: with requests in flight on
+several series shards, responses come back in any order, so a token for seq 5
+arriving after one for seq 7 leaves seq 7 in place
+(`metrics_ingest::tests::commit_tokens_keep_the_newest_epoch_and_seq_per_shard`).
+Two tokens for one Ravel shard from different writer ids fail the replay with
+an error naming the system, the shard and both writers, since neither can be
+called the newer
+(`metrics_ingest::tests::a_second_writer_on_one_shard_is_refused`). The row
+also records
+`last_commit_token`, those tokens joined with commas in shard order: a
+read-your-write fence over every shard the replay wrote, not only the shards
+the last request touched. The query API decodes each `min_commit_token`
+parameter as one token (`decode_commit_tokens` in
+`crates/ravel-query/src/http/params.rs`), so a consumer splits
+`last_commit_token` on commas and passes one parameter per token, or passes
+the values of `commit_tokens_by_shard`, as the read-back does
+(`ApiReader::get` in `crates/ravel-bench/src/metrics_ingest.rs`). A header entry that does not decode as a commit
+token fails the replay
+(`metrics_ingest::tests::an_undecodable_commit_token_is_refused`). The row
+stays `durable_on_ack` only when some response carried a token; otherwise the
+bin refuses it as unbacked durability
+(`metrics_ingest::tests::a_durable_row_without_any_commit_token_is_refused`).
+`commit_tokens` is absent on this row. A comparator row records none of them.
+
+#### HTTP sender
+
+Every HTTP row is sent the way Prometheus' remote-write queue sends it
+(ADR-0927, 2026-10-28 amendment):
+
+- `--http-shards` (default 50, Prometheus' `max_shards`) fixes the number of
+  shards for the whole replay; there is no resharding. Each series goes to
+  shard `h % shards`, `h` the first eight bytes, little-endian, of the BLAKE3
+  hash of its sorted labels, so every point of one series goes to one shard
+  on every run.
+- `--http-batch-size` (default 2000, Prometheus' `max_samples_per_send`) is
+  the points a shard sends per request. A shard sends when it holds that many,
+  and sends what it holds at stream end
+  (`metrics_ingest::tests::a_partial_batch_is_flushed_at_stream_end`).
+- Each shard keeps one request in flight and sends its next only once the
+  last has answered, so each series reaches the receiver in offered order
+  (`metrics_ingest::tests::sharded_replay_keeps_every_series_in_offered_order`)
+  and at most `min(shards, requests)` requests are in flight
+  (`metrics_ingest::tests::requests_in_flight_peak_at_min_of_shards_and_batches`).
+- One producer generates the stream, counts every point in offered order, and
+  routes it. A shard's queue holds one batch (`SHARD_QUEUE_BATCHES`); the
+  producer waits on a full queue, so a shard holds at most three batches at
+  once: one in flight, one queued and one filling. At the defaults that is
+  at most 50 x 3 x 2000 = 300,000 points buffered in the bench.
+- A 429, a 5xx or a transport error is retried after 30 ms, doubling per
+  retry up to 5 s (`retry_delay`,
+  `metrics_ingest::tests::retry_delay_doubles_from_30ms_and_caps_at_5s`), up
+  to `--http-max-retries` times, then the batch is dropped. 429 is retried
+  although Prometheus' default (`retry_on_http_429: false`) drops it, because
+  any dropped point fails the zero drop budget.
+- Both flags exit 64 on zero
+  (`metricsbench_ingest::tests::zero_shards_or_batch_size_exits_64`). Each
+  row's `client_behavior` states the shard count, batch size, routing and
+  backoff it ran with.
+
+An HTTP row's `elapsed_secs` is wall time, `elapsed_basis:
+"wall_in_flight"`: from the first request sent to the last response
+received, with requests overlapping on every shard and the stream generated
+between them. `generation_secs` is the part of the replay the producer spent
+generating and classifying the stream and routing each point to its shard
+(the read-back plan, the series hash and the buffer push), not counting time
+waiting on a full shard queue
+(`metrics_ingest::tests::a_producer_round_counts_routing_as_generation`). `sender_bound` is true when
+`generation_secs` is at least 90% of `elapsed_secs` (`is_sender_bound`,
+`metrics_ingest::tests::sender_bound_needs_wall_basis_and_ninety_percent_generation`):
+the row measured the bench's generator, not the receiver, and its
+throughput is a floor on the receiver's. Every per-second figure divides by
+`elapsed_secs`. `ack_latency_ms` is per request, from its first send to its
+2xx, retries included, so it includes queueing inside the receiver.
+
+The in-process row keeps `elapsed_basis: "timed_segments"`: it is a
+sequential loop with no request in flight, so its `elapsed_secs` is the sum
+of the timed write segments (the `write_values` calls and the final flush),
+and generation, which runs between segments, is outside it. It records
+`generation_secs` too, and its `sender_bound` is always false, since the
+wall-time comparison does not apply to a sum that excludes generation.
+Reports written before these fields existed read them back as 0 and false.
+
+`--max-ingest-secs N` stops an HTTP row that would take longer than `N`
+seconds. Once the row has sent for 60 s, and then at most every 10 s, the bin
+projects its total wall time as elapsed x (stream points / points offered so
+far) (`project_ingest_secs`,
+`metrics_ingest::tests::stall_projection_scales_elapsed_by_the_stream_left`,
+`metrics_ingest::tests::stall_checks_wait_60s_then_recur_every_10s`). The
+check keeps running after the whole stream is offered, while the last
+responses drain, so it also covers a stream small enough to fit in the shard
+buffers
+(`metrics_ingest::tests::the_drain_stops_a_row_whose_whole_stream_is_already_offered`). A
+projection over `N` fails the row with an error naming the system, the
+projection, the ceiling and the points offered. That row alone stops: it is
+listed under the report's `stalled` (`system`, `endpoint`, `projected_secs`,
+`ceiling_secs`, `offered_points`, `stream_points`, `error`;
+`metrics_ingest::StalledRow`), the rows after it are still replayed, and the
+bin prints the report and exits 1 after the last row, as it does for a band
+violation (`metricsbench_ingest::tests::a_stalled_row_exits_like_a_band_violation`;
+the `LaneError::IngestStalled` arm of the bin's row loop, which no test
+drives through the bin since the first check waits 60 s).
+The stream's point total is the generator report of the first row replayed
+when one exists (exact), else `active_series x steps` for the first row (one
+line per series per step; anomalies make the real count differ). Omitted, a
+row runs to its end. The ceiling applies to HTTP rows only; the in-process
+row has none.
+
+#### Read-back
+
+After each HTTP replay the bin reads the row back over the receiver's
+Prometheus query API and records `readback`: `series_count` (distinct series
+`/api/v1/series` returns over the replay window for the metric names the
+replay sent, so a receiver's own series, such as a self-scrape, are not
+counted), `sample_count`
+(`count_over_time` over one probe series per float class, summed over
+consecutive windows of at most one day, `READBACK_COUNT_WINDOW`, newest
+first: the first ends at the newest timestamp sent, each next one ends where
+the previous began, and the oldest reaches just past the oldest timestamp
+sent, so each sample falls in exactly one window
+(`metrics_ingest::tests::count_windows_partition_the_replay_window`); a
+receiver that refuses a range over one day, as Prometheus's
+`--query.max-samples` does on a 30-day replay, still reads back
+(`metrics_ingest::tests::a_two_day_readback_counts_by_day_windows_under_a_one_day_limit`),
+and the `ci` profile's replay is one window), `histogram_series_count` (the
+native-histogram metrics' series, absent on a receiver that does not store
+them), `histogram_sample_count`, `stale_marker_honored` (an instant query at
+the marker's timestamp returns no sample for its series), `expected` (the
+same figures from what was sent, for the classes the receiver stores),
+`mismatches` naming each figure that differs, and `matches_expected`. The
+Ravel row passes every token in `commit_tokens_by_shard` as
+`min_commit_token` on every query. A read whose figures do not match what
+was sent is repeated every 500 ms until one matches or
+`--readback-settle-secs` (default 60, the same for every system) has passed
+since the first read began, since a receiver can acknowledge a write before
+it is queryable; `attempts` counts the reads, the reported one included, and
+`settled_after_ms` is the time from the start of the first read to the end
+of the reported one
+(`metrics_ingest::tests::readback_settles_on_a_lagging_receiver_within_the_window_only`).
+A query that fails, rather than reading short, is not repeated; its error
+names the query and how long it ran. Each query, body read included, has
+`--readback-timeout-secs` (default 30), separate from the write timeout
+`--http-timeout-secs`. `query_ms` records each query's wall time in
+milliseconds, keyed `series`, `samples.0` and on per probe,
+`histogram_series`, `histogram_samples` and `stale_marker` (the last read's;
+`metrics_ingest::tests::readback_matches_what_was_stored_and_fails_one_series_off`);
+a count query's entry is its total over every window, and `query_windows`
+records how many windows each count query (`samples.0` on, and
+`histogram_samples`) ran
+(`metrics_ingest::tests::a_two_day_readback_counts_by_day_windows_under_a_one_day_limit`).
+The `/api/v1/series` answer is counted as it streams, so a 1,000,000-series
+answer is never held whole in memory
+(`metrics_ingest::tests::series_count_streams_a_200000_series_answer`); an
+answer whose `status` is not `success`, or a body cut short, is refused
+(`metrics_ingest::tests::series_count_refuses_an_error_answer_and_a_truncated_body`).
+The bin fails when `matches_expected` is false
+(`metrics_ingest::tests::readback_matches_what_was_stored_and_fails_one_series_off`,
+`metrics_ingest::tests::readback_expectations_follow_what_was_sent_and_what_the_receiver_stores`)
+or a read-back query fails, but does not stop at that row: the row is
+recorded with its mismatching `readback` or, when a query failed, its error
+in `readback_error`, and every later row is still replayed and read back.
+After the last row the bin prints the report of every row and exits with the
+code the first failing row gives, 1
+(`metricsbench_ingest_smoke::a_failed_readback_still_prints_the_report`,
+`metricsbench_ingest_smoke::a_failed_readback_does_not_stop_the_later_rows`).
+Once a row has failed, a later row's own failure is recorded too rather than
+discarding the report: a row that fails band 4 or 6 or its stream check after
+its replay carries `row_failure` (`band`, `error`) and is not read back, and a
+row whose replay fails outright is listed under `failed_replays`; the exit
+code stays the first failure's
+(`metricsbench_ingest_smoke::a_later_hard_failure_after_a_failed_readback_keeps_the_report`).
+Band 6 across rows then runs over the rows without a `row_failure`, and its
+failure is recorded as `row_failure` on the row it names
+(`metricsbench_ingest::tests::band6_across_rows_after_a_failure_is_recorded_on_the_named_row`).
+`metricsbench_query` refuses such a report as a run result
+(`metricsbench_query::a_report_whose_readback_failed_does_not_bind`); with
+`--diagnostic-after-failed-ingest` it queries it as a diagnostic (see
+"Portable query run").
+
+#### Band 6: accepted digests per class
+
+Every row carries `expected_digests` and `accepted_digests`, one digest per
+class (`scalar`, `stale_marker`, `native_histogram`) over the points sent and
+the points accepted. Each class digest is a multiset digest: the sum, modulo
+2^256, of every point's BLAKE3 hash (the point encoded as `offered_digest`
+encodes it), written as the 32 little-endian bytes of the sum in hex. It does
+not depend on the order points were offered or acknowledged in, which a
+sharded sender does not preserve across series, and a point counted twice
+changes it (`metrics_ingest::tests::class_digests_ignore_order_and_count_duplicates`).
+No points give 64 zeros, and one point gives that point's own BLAKE3 hash.
+The in-process row uses the same scheme. `offered_digest` and the stream
+digest are unchanged: they are ordered hashes over the stream. The bin fails a row
+whose accepted digest differs from its expected digest for any class it
+stores; digests are compared, not counts, so a row that accepted as many
+points as it was sent, but not the same ones, fails
+(`metrics_ingest::tests::band6_compares_digests_not_counts`,
+`metrics_ingest::tests::band6_fails_when_a_supporting_receiver_drops_one_point_of_any_class`).
+Across rows, every portable row must carry the same expected digest for every
+class, and each portable row's expected scalar digest must equal the
+in-process row's
+(`metrics_ingest::tests::portable_rows_with_different_expected_digests_fail`,
+`metricsbench_ingest::tests::a_portable_scalar_digest_must_equal_the_in_process_one`,
+`metrics_ingest::tests::the_in_process_and_portable_rows_carry_equal_expected_digests`).
+
+#### Without the in-process row (`--no-in-process-row`)
+
+`--no-in-process-row` replays into the portable rows only. The bin builds no
+`ravel-in-process` row, opens no store, and runs no post-ingest query, so
+`--store` and `--tenant` are unused and `--ravel-tenant` is not compared with
+`--tenant`
+(`metricsbench_ingest::tests::without_the_in_process_row_the_ravel_tenant_stands_alone`).
+The report says so at the top level, `in_process_row: "skipped"` beside
+`profile`, and carries no `substrate` and no `queries`; every other run
+writes `in_process_row: "present"`, and a report written before the field
+existed reads as `present` (`MetricsIngestReport::new` derives it from the
+rows; `metrics_ingest::tests::the_in_process_row_disclosure_follows_the_rows`).
+The profile record and the stream-digest check take the first portable row's
+regeneration as the reference, and that row must accept a non-zero sample
+count. Given with no portable endpoint, the flag exits 64: a run with no rows
+measures nothing
+(`metricsbench_ingest_smoke::skipping_the_in_process_row_with_no_endpoint_exits_64`).
+
+Every check on a portable row still runs: band 4 and band 6 on each row, the
+read-back, and the cross-row check that every portable row carries the same
+expected digest for every class. Only the comparison of each portable row's
+expected scalar digest with the in-process row's is skipped, because there is
+none (`check_band6_across_rows` in `src/bin/metricsbench_ingest.rs`;
+`metricsbench_ingest::tests::portable_rows_still_cross_check_without_the_in_process_row`,
+`metricsbench_ingest_smoke::without_the_in_process_row_the_portable_rows_still_close_band_6`).
+
+The large profiles run with it. On `cardinality` (360,000,000 samples) and
+`history` (1,728,000,000 samples) a memory store does not fit beside four
+4 GB engine containers on a 32 GB host, and the stack's s3s-fs is the
+engines' own store, not a neutral place for a diagnostic row.
+
+A class a receiver acknowledges without storing is excluded from its band 6
+comparison and its read-back, and counted under `unsupported_samples` or
+`unsupported_histograms` instead of accepted; it is not a drop, so the drop
+budget stays zero. Every row records the classes excluded for it, each with
+its citation, as `unsupported_classes`. The table has one entry
+(`metrics_ingest::tests::the_unsupported_class_table_names_only_victoriametrics_histograms`):
+
+| Receiver | Class | Source |
+|---|---|---|
+| VictoriaMetrics | native histogram | `lib/prompb/prompb.go` at v1.115.0: `TimeSeries.unmarshalProtobuf` reads only labels (field 1) and samples (field 2), so histograms (field 4) are skipped while the request is answered 2xx |
+
+Every `ingest` block carries `elapsed_basis`, so rows timed differently are
+never compared as if they were not (see "HTTP sender" above). The in-process
+row's is `timed_segments`, the sum of its write segments, while `cpu_secs`
+covers the whole replay, generation included. An HTTP row's is
+`wall_in_flight`. Before the 2026-10-28 amendment an HTTP row was also
+`timed_segments`, the sum of each sequential encode-and-POST, so its
+throughput is not comparable with a `wall_in_flight` row's. A report with no
+`elapsed_basis` predates both: its `elapsed_secs` was one wall-clock span over
+the write loop of a stream generated up front.
+
+`substrate`, absent with `--no-in-process-row`:
+- `store_backend`: the `--store` kind (`memory` or `s3`).
+- `endpoint_host`: the configured S3 endpoint's host, when `--store s3` and
+  `RAVEL_S3_ENDPOINT` is set; absent for `memory` regardless of the env var.
+- `backend_bills_requests`: true only for real S3 with no endpoint override
+  (decision 10); false on `memory` and on any store behind a configured
+  endpoint, such as the nightly lane's local s3s-fs.
+
+#### Read-back only (`--readback-only`)
+
+`--readback-only` replays nothing: it reads one system back from an
+`ingest.json` the bin wrote earlier, for instance after the catalog has been
+folded and the server restarted. It takes `--ingest-report PATH`,
+`--readback-system NAME` (`ravel`, `prometheus`, `victoriametrics` or
+`mimir`), `--workload`, `--profile`, `--anchor-ms`, that system's
+`--<system>-query-url`, `--ravel-bearer-token-env` for the `ravel` row only,
+`--readback-timeout-secs` and `--readback-settle-secs`. The step count is
+the report's `profile.run.steps`.
+
+It rebuilds the row's read-back plan by walking the same generator stream
+through the same producer rounds the replay records its plan in, dropping
+each batch instead of sending it, so the rebuilt plan equals the replay's
+field for field, for a receiver that stores every class and for
+VictoriaMetrics, which does not store native histograms
+(`metrics_ingest::tests::a_plan_rebuilt_without_sending_equals_the_replayed_plan`).
+It then reads the report's row back with `readback_over_http`, its commit
+tokens included, so every query of the `ravel` row carries
+`min_commit_token` as in the replay, and it sends no write request
+(`metricsbench_ingest_smoke::readback_only_reads_a_kept_report_back_without_writing`).
+
+It prints one JSON object: `system`, `plan_series_count` (every series the
+plan holds, of every class) and either `readback`, the same object the
+replay records on the row, or `readback_error`. It exits 0 when
+`readback.matches_expected` is true and 1 on a mismatch or a read-back
+error, which stay in the JSON
+(`metricsbench_ingest_smoke::readback_only_reads_a_kept_report_back_without_writing`).
+
+It exits 64, with no JSON and before any query, when a write endpoint flag
+is given, `--ingest-report`, `--readback-system` or `--anchor-ms` is
+missing, the system is not one of the four or its query URL is missing,
+`--ravel-bearer-token-env` is given for another system or names a variable
+that is unset or empty, the report has no row or more than one row for the
+system, the row recorded no successful ingest (it carries `row_failure`, or
+the system is listed under `stalled` or `failed_replays`), the `ravel` row
+has no non-empty commit token in `commit_tokens_by_shard` to pass as
+`min_commit_token`, the report's profile name, step count,
+`run.workload_digest` or `run.anchor_ms` differs from the arguments, or the
+regenerated stream's digest differs from the report's `run.stream_digest`
+(`metricsbench_ingest_smoke::readback_only_refusals_exit_64`,
+`metricsbench_ingest::tests::the_readback_row_is_one_successfully_ingested_row`).
+`--ingest-report` and `--readback-system` without `--readback-only` exit 64
+too (`metricsbench_ingest::tests::readback_flags_need_readback_only`).
+
+With `--ravel-metrics-url URL` (ravel-server's `/metrics`), the Ravel row's
+read-back, in a replay or `--readback-only`, also records
+`readback.query_cost`, keyed as `query_ms` (`series`, `samples.N`): `stats`,
+the `data.stats` of each answer in query order (`null` for an answer with
+none; empty for the series read, whose answer has no stats); `phases`, per
+phase (`resolve`, `plan`, `probe`, `scan`, `keyIndex`) the sum over those
+answers of the phase's `s3_get_requests`, `s3_get_wire_bytes` and
+`s3_list_requests`, `null` for the series read and whenever an answer lacks
+a phase list or a figure, never a partial sum; and the receiver's
+process-wide counters across the query, which count every request the
+process served in that interval, not only this one:
+`process_store_get_delta` (`ravel_store_calls_total{op="get"}`),
+`process_fetch_miss_delta` (`ravel_cache_misses_total{cache="fetch"}`) and
+`process_catalog_get_delta` (the first less the second), each summed over
+every series of its family. Those three are `null`, with `process_error`
+saying why, when a scrape failed or lacked a family or a counter went down
+across the query (a restart reset it), which is an error rather than zero.
+Without the flag the key is left out
+(`metrics_ingest::tests::readback_records_query_cost_when_given_a_metrics_url`,
+`metrics_ingest::tests::get_counters_refuse_a_missing_family`,
+`metrics_ingest::tests::a_counter_reset_nulls_the_process_figures`,
+`metrics_ingest::tests::phase_totals_sum_answers_and_refuse_a_partial_sum`).
+
+#### Holder counts (`metricsbench_holders`)
+
+`metricsbench_holders --corpus PATH --ingest-report PATH --workload PATH
+--objects-list PATH --objects-dir DIR --out PATH` reads the data objects
+the list names (one `ravel-cli catalog list --json` line each, the L0 and
+L1 objects the folded snapshot resolves) from `DIR/<key>`. For each corpus
+statement under the ingest report's profile with a `label="value"` matcher
+(non-empty value), it computes the statement's fetch window on the run's
+query grid as Ravel's engine resolves it, counts the listed objects whose
+event time range overlaps that window whatever metrics they hold
+(`segments_in_window`), the ones among them holding a series of one of the
+statement's metric names (`named_in_window`), and the ones among those
+holding at least one series that matches a qualifying selector in full,
+metric name and every matcher (`holders`). `holders` is the bound a
+series-level index would reach, not the label-value router's. The resolved
+set is the `named_in_window` objects when every selector names the same
+metric (`name_pruned`, the resolve prunes by that name's postings) and the
+`segments_in_window` objects when they name different metrics. The resolve
+also adds the L0 object each `min_commit_token` names (the query lane
+passes the ingest report's ravel row's commit tokens, one per shard) when
+it is not already in the set, whatever its metrics and event time;
+`token_only_fetched` counts those, matched to listed keys by shard, writer,
+epoch and seq. `unrouted_fetched_expected`, what Ravel's unrouted resolve
+fetches, is the resolved set plus `token_only_fetched`, null when a token
+names no listed object. For a statement whose every selector qualifies
+(`route_bound`), `value_holders`, the label-value router's bound, counts
+the resolved set's objects whose LABEL_DICT strings hold, for at least one
+selector, its metric name and every value of its `label="value"` matchers
+(the router reads one key8 leaf per LABEL_DICT string, so it can prune only
+an object lacking one of those strings), and `expected_routed_prunes` is the
+resolved set less `value_holders`; both are null otherwise. `route_bound`
+is false, with `route_bound_reason`, when a selector has no qualifying
+matcher: the router then probes only that selector's metric name and keeps
+every object holding it. It decodes each object's series catalog and
+LABEL_DICT with ravel-segment's public reader, with no router or key index;
+the file's `method` states the window and counting rules
+(`metrics_holders::HOLDERS_METHOD`). `holders.json` holds `method`,
+`profile`, `objects_l0`, `objects_l1`, `series_total`,
+`min_commit_tokens`, `token_objects`, `tokens_unmatched`, `statements`
+(`id`, `promql`, `eval`, `selectors`, `positive_equalities`, `metrics`,
+`name_pruned`, `fetch_window`, `segments_in_window`, `named_in_window`,
+`token_only_fetched`, `unrouted_fetched_expected`, `holders`,
+`value_holders`, `expected_routed_prunes`, `route_bound` and
+`route_bound_reason` per qualifying entry) and `skipped` (`id` and `reason`
+for each entry with no qualifying selector, whose selectors the corpus
+reader refuses, or whose fetch window cannot be planned). It exits 65 when
+the list names no object, the ingest report does not bind to the workload,
+or the report has no ravel row or no commit token on it, 66 when an input
+cannot be read, a list line or a commit token does not parse, or a listed
+object is missing or does not decode (no file is written), and 74 when the
+file cannot be written
+(`metrics_holders::tests::the_fetch_window_follows_the_engine_resolve`,
+`metrics_holders::tests::holders_count_objects_in_the_window_with_a_fully_matching_series`,
+`metrics_holders::tests::named_in_window_counts_the_objects_holding_the_statements_metrics`,
+`metrics_holders::tests::unrouted_fetched_expected_is_what_the_engine_fetches`,
+`metrics_holders::tests::the_min_commit_token_objects_are_fetched_whatever_their_metric`,
+`metrics_holders::tests::an_unmatched_token_leaves_the_unrouted_expectation_unknown`,
+`metrics_holders::tests::expected_routed_prunes_is_what_the_router_prunes`,
+`metrics_holders::tests::an_unreadable_object_is_an_error`).
+`deploy/metricsbench/run.sh`'s `stage1-holders` step runs it.
+
+## Determinism
+
+One seed (`927000933`) drives everything. Every value and every injected
+anomaly is a pure function of `(seed, family, instance, step)`, so the same seed
+and manifest write byte-identical output; float payloads are encoded as
+`f64::to_bits` hex so a `-0.0` or a NaN survives the stream. `--out <path>`
+writes the stream; without it the stream is still encoded, counted and hashed.
+
+The generator emits gauges, monotonic counters, classic histograms, native
+histograms, staleness markers, counter resets, missing samples, out-of-order
+samples, and hour-boundary churn. Anomaly precedence is fixed (missing beats
+staleness beats the timestamp shift; a counter reset is independent) and
+documented on `ravel_bench::metrics_gen`.
+
+An out-of-order sample is stamped one and a half scrape intervals early
+(`3 * interval_ms / 2`, exact because the manifest gate requires a whole
+scrape interval of at least one second). It lands halfway between two scrape
+points of its series, so it is out of order and never repeats a timestamp the
+series already carries. Only unshifted samples sit on the scrape grid. A
+shifted sample is not always a regression on its series: after two
+consecutive shifted steps the second is a full interval ahead of the first.
+
+Every generation run reports exact figures, and `emitted_samples +
+omitted_missing_samples` must equal `steps * active_series` or the run fails
+rather than reporting a silent drop (ADR-0927's band 4).
+
+## Query corpus
+
+24 queries, three in each of the eight cost classes ADR-0927 decision 5 fixes:
+`metadata_only`, `single_series`, `selective_multi_series`, `high_fan_out`,
+`full_range`, `join`, `histogram`, `long_range`. The class is a typed enum on
+the entry, not a comment.
+
+Each entry names the constructs it exercises exactly as
+`ravel_promql_difftest::scoring::REGISTRY` names them. The gate checks
+membership in the registry, not membership in its supported subset: ADR-0927
+decision 6 keeps queries Ravel refuses or does not implement in the corpus,
+reported with their status and still counted in the corpus denominator, so a
+supported-only gate would delete exactly those entries.
+
+Three `long_range` entries restrict themselves to the profiles that generate
+enough data for their window (`profiles: ["history"]`, and `["history",
+"churn"]` for the 6-hour one), and the `full_range` range entry
+`mb_full_range_avg_over_time` leaves out `ci`, whose 30 minutes cannot hold
+its 30-minute lookback beside any evaluation window. An entry with no
+`profiles` list runs under every profile.
+
+Corpus version 2 repairs two join entries, each carrying its reason in
+`modified`:
+
+- `mb_join_cpu_on_build_version` selects `metricsbench_build_info{version="1.25.0"}`
+  on its right side. The generator cycles both versions under one `(job,
+  instance)`, so the unqualified right side holds two series per key, the
+  `group_left` match is many-to-many, and every engine answers with an error.
+- `mb_join_saturated_and_busy` thresholds the request rate at `> 0.5`, not
+  `> 10`. The counter advances by 0 to 15 per 15-second scrape, so the
+  per-second rate is at most 1.0 and a threshold of 10 is never met.
+
+Corpus version 3 rewrites `mb_full_range_avg_over_time` from
+`avg_over_time(metricsbench_gauge_cpu_percent[30m])` to
+`avg(avg_over_time(metricsbench_gauge_cpu_percent[30m]))`, with the reason in
+`modified`. The scan is unchanged: every gauge series is still read over its
+30-minute window. Only the output collapses, from one series per input series
+to one series. On cardinality the old answer was 400,000 series x 121 grid
+points = 48,400,000 points, roughly 1.3 GB of JSON, above the harness's
+256 MiB response-body cap (`DEFAULT_MAX_BODY_BYTES` in
+`crates/ravel-promql-difftest/src/prometheus_client.rs`), so the oracle answer
+was unavailable and no engine's answer could be compared. The new answer is
+one series of 121 points. The entry keeps its id, its `full_range` class
+(decision 5 classifies by physical work), range evaluation and profiles
+(`promql_corpus::tests::the_full_range_entry_collapses_its_answer_and_says_why`).
+The version-4 loader refuses a version-2 corpus
+(`promql_corpus::tests::a_version_2_corpus_is_refused_after_the_full_range_rewrite`)
+and a version-3 one
+(`promql_corpus::tests::a_version_3_corpus_is_refused_after_the_summation_tolerances`).
+
+An entry may carry `tolerance_ulps`, the ULP tolerance the difftest comparator
+applies to its sample values. Absent means bit-exact, as before; the runner
+passes the field to the comparator unchanged
+(`metricsbench_query::an_entry_tolerance_reaches_the_comparator`). The gate
+refuses `tolerance_ulps: 0`, since bit-exact is spelled by leaving the field
+out (`promql_corpus::tests::gate_rejects_a_zero_ulp_tolerance`), and refuses a
+tolerance on an entry that is not flagged modified with a reason
+(`promql_corpus::tests::gate_rejects_a_tolerance_without_a_modified_reason`).
+The gate does not check that the reason explains the tolerance; the entry's
+own reason has to.
+
+`mb_full_range_avg_over_time` was the first entry with a tolerance, and until
+corpus version 4 the only one:
+`1048576`, 2^20. After the collapse each step's answer is one mean over every
+selected gauge series, and an engine that sums them in another order, or with
+compensated summation, differs in the last bits while every per-series answer
+is exact. The basis, also stated in the entry's `modified` reason: naive
+summation of n non-negative values (cpu percent) errs by at most n-1 ULPs of
+the sum. n is the gauge family's series count, `active_series x 400/1000`:
+400,000 on cardinality, 4,000 on history, 20,000 active on churn. The inner
+`avg_over_time` adds at most 119 ULPs over the 120 samples a left-open 30-minute
+window holds at a 15-second scrape, and the two divisions add one more. One
+engine's answer on cardinality is within 399,999 + 119 + 1 = 400,119 ULPs of
+the exact mean. The comparator compares two engines, either of which may err
+in the opposite direction, so the difference it sees is bounded by 800,238
+ULPs, under 2^20 by a factor of about 1.31. A profile with roughly 1.3 times
+cardinality's gauge series would exceed it. The gap is predicted, not
+measured: ADR-0025 pairs every tolerance with a measured gap, and the first
+comparable run under #2821 is pre-registered to measure this one and record
+the figure in the entry's reason.
+
+Corpus version 4 gives a tolerance to every other entry whose answer sums
+floats across series. The nightly ci run measured Ravel and Mimir 1 to 4 ULPs
+off the Prometheus oracle on these entries (#2821 comment 6459784933), and
+under bit-exact comparison each such answer read as `incorrect`. No query
+changes; each entry is flagged modified because the gate requires a tolerance
+to be disclosed there, and its reason carries the derivation. The bound, per
+engine: a sum of n non-negative values errs by at most n-1 ULPs of the sum.
+Every summed value here is non-negative: gauges are drawn from [0, 100)
+(`unit_scaled(h, 100, 10)`, `crates/ravel-bench/src/metrics_gen.rs:799`) and
+counters only grow (`crates/ravel-bench/src/metrics_gen.rs:815`), so their
+rates and increases are non-negative too. n is the largest series count the
+entry's selector matches on any profile it runs under, which is cardinality in
+every case. An inner `rate` adds at most 30 roundings, each at most one ULP of
+the result: 20 in the delta over the at most 20 samples a left-open 5-minute
+window holds at a 15-second scrape (one subtraction and up to 19 counter-reset
+corrections) and 10 in extrapolation (three timestamp-to-seconds conversions,
+a multiplication and a division for the zero-point clamp, two additions for
+the extrapolated interval, the factor division, the multiplication by the
+factor, and the division by the range). An inner 30-minute `increase` adds 129
+the same way: 120 in the delta and 9 in extrapolation, with no division by the
+range. Each division adds one. The comparator sees two engines that may err in
+opposite directions, so the bound is doubled, then rounded up to a power of
+two. `promql_corpus::tests::every_summation_tolerance_equals_the_bound_its_reason_derives`
+recomputes every figure below from the generator's own series counts and
+fails when a tolerance, a series count, or the arithmetic in a reason
+disagrees with the others.
+
+| Entry | Tolerance (per engine x 2) | Series summed on cardinality | ci gap: ravel | ci gap: mimir | ci gap: victoriametrics |
+|---|---|---|---|---|---|
+| `mb_selective_job_rate_sum` | 2^18 (75,029 x 2 = 150,058) | 75,000 counter series with `job="metricsbench-api"` | 1 | 1 | 2,339,342,372,231,417 |
+| `mb_selective_region_avg` | 2^19 (133,336 x 2 = 266,672) | 133,336 gauge series with `region="eu-west-1"` | 4 | none listed | none listed |
+| `mb_selective_error_ratio` | 2^20 (300,059 x 2 = 600,118) | 74,992 with `status="500"` over 225,008 without | 2 | 2 | 1,877,575,138,056,483 |
+| `mb_fanout_total_rate` | 2^20 (300,029 x 2 = 600,058) | 300,000 counter series | 1 | 1 | 1,395,624,456,039,935 |
+| `mb_full_range_avg_over_time` | 2^20 (400,119 x 2 = 800,238) | 400,000 gauge series | not run on ci | not run on ci | not run on ci |
+| `mb_full_range_counter_increase` | 2^20 (300,128 x 2 = 600,256) | 300,000 counter series | none listed | none listed | 484,832,405,549,241 |
+
+Sources: each bound and series count is the entry's own `modified` reason; each
+gap is the largest ULP gap to the oracle in nightly run 40623286253 on the ci
+profile, from that run's `diagnostics.json` `ulp_gaps` as posted on #2821
+comment 6459784933, where "none listed" means the comment names no gap for that
+engine and entry. The checked-in set of tolerances is pinned by
+`metricsbench_artifacts::the_modified_entries_say_why_and_no_entry_is_intended_empty`.
+The runner applies them: Ravel one ULP off on `mb_fanout_total_rate`
+classifies `ok`, and 2^40 ULPs off still classifies `incorrect`
+(`metricsbench_query::a_summation_tolerance_admits_last_bit_residue_and_not_a_semantic_gap`).
+The largest tolerance, 2^20 ULPs, is a relative difference of about 2.3e-10;
+the smallest VictoriaMetrics gap above, about 4.8e14 ULPs (2^48.8), is more
+than 2^28 times wider, so its different `rate` and `increase` algorithms still
+read as `incorrect`. Each gap is checked again by the next cardinality run.
+
+Every other entry stays bit-exact. `mb_single_counter_rate` (one series; the
+ADR-0025 `rate` residue, Ravel 1 ULP where Mimir is exact) and
+`mb_histogram_native_p95` (`histogram_quantile` over native buckets, Ravel 3
+ULPs) sum nothing across series. `mb_histogram_classic_p99` sums bucket rates
+across series, but `histogram_quantile` then interpolates on differences of
+those sums and picks its bucket by comparing them, so a last-bit change in a
+sum is not bounded relative to the answer. `mb_long_range_subquery_max` takes
+the maximum of cross-series sums, but runs only under history and has no
+measured gap yet, and ADR-0025 pairs each tolerance with one.
+
+An entry may carry `expected: {"intended_empty": true, "reason": "..."}`; the
+gate refuses the flag without a non-blank reason. An empty oracle answer on an
+entry without it is an invalid fixture, not an engine result (ADR-0927,
+2026-10-26 amendment, decision E). No entry carries it
+(`metricsbench_artifacts::the_modified_entries_say_why_and_no_entry_is_intended_empty`):
+`mb_histogram_native_p95` and `mb_histogram_native_fraction` carried it until
+the ingest lane put native histograms on the wire (task T1c of #2821). The
+three `absent*` entries are not marked:
+`absent()` and `absent_over_time()` answer with one sample of value 1 when
+their argument is empty, and the manifest guarantees the absent metric is
+never emitted.
+
+`gate_corpus_against_workload` checks the corpus against the manifest, for
+every profile each entry runs under:
+
+- every profile an entry names is declared;
+- every range entry's window plus its longest lookback (`[5m]`, `[6h]`,
+  `[7d]`, and a subquery's `[1d:5m]` range plus the lookback inside it) fits
+  inside the profile's stream span, `(samples_per_series - 1) *
+  scrape_interval_secs`, not inside its `duration_secs`;
+- unless the entry is intended-empty, every selector matches at least one
+  series the generator writes, so a label value no family emits fails (a
+  selector written directly inside `absent(` or `absent_over_time(` is
+  exempt);
+- the one side of a `group_left`/`group_right` match (the right side for
+  `group_left`) holds at most one series per `on (...)` key.
+
+Series identity comes from the generator's own label assignment. The query is
+read as text, not parsed; a query outside what the reader handles (a selector
+with no metric name, `offset`, `@`, `ignoring` on a join, a one side that is
+not a bare selector, a regex other than literal alternatives with an optional
+trailing `.*`) is refused rather than passed. The selector check proves each
+selector reaches data, not that the whole expression's answer is non-empty.
+
+Adding a query means adding an entry here; nothing about the corpus lives in
+code. `crates/ravel-bench/tests/metricsbench_artifacts.rs` pins the counts, so
+an addition that skews the class balance or names an unknown construct fails
+there.
+
+## Report schema version 3
+
+The run's result is a `MetricsBenchReport`
+(`crates/ravel-bench/src/report_schema.rs`). Version 3 is what the writer
+stamps; versions 1 and 2 still read and validate under their own rules, and a
+version-3 field set on one of them is refused
+(`a_geomean_on_a_v3_report_and_a_v3_field_on_a_v2_report_fail`). Check a file
+with:
+
+```sh
+cargo run -p ravel-bench --bin metricsbench_report -- validate report.json
+```
+
+It exits 0 only when the report stands, and otherwise exits non-zero with the
+failing rule on stderr (`tests/metricsbench_report.rs`,
+`the_validate_subcommand_exits_non_zero_naming_the_failing_rule`). `render
+--report` validates first and then prints, per engine, the denominators and
+the count of each status before any latency, then a latency table over `ok`
+rows only (`the_v3_render_prints_denominators_before_latency_over_ok_rows`).
+
+**Row identity.** A version-3 row is keyed by (engine, id, query kind), and
+the report lists every case the corpus defines in `cases_expected`. The rows
+must cover exactly that set, compared as sets, so a duplicated row cannot
+stand in for a missing one (ADR-0927 "Bands pre-registered" item 1;
+`band_1_a_duplicated_row_cannot_hide_a_missing_case`). A range entry is one
+case, not one per grid point (2026-10-26 amendment, section E). Every row
+names its endpoint, and `in-process` is refused: that value marks a
+diagnostic-lane row, never the portable one (amendment section A;
+`an_in_process_endpoint_fails`). `oracle` is true on exactly the Prometheus
+rows (decision 4; `the_oracle_flag_is_true_exactly_on_prometheus_rows`).
+
+**Status across passes.** Each row carries its status per pass in
+`pass_statuses`, and its `status` is `row_status` of them: the first non-`ok`
+pass in pass order, else `ok`, so passes `[ok, timeout, error]` give `timeout`
+(`row_status_is_the_first_non_ok_pass`). Only `ok` rows carry latency: the
+`min_ms`/`median_ms`/`max_ms` figures, `reps_per_pass`, and one
+`pass_medians_ms` entry per pass (decision 6; band 2,
+`band_2_latency_on_an_incorrect_row_fails`). Each figure appears once per row
+(band 5, `band_5_a_duplicated_figure_fails`). A `refused` row carries a
+`refusal_reason` and no other status does, including a budget refusal
+(decision 6 and amendment section F; `a_refused_row_without_a_reason_fails`,
+`a_refusal_reason_on_an_error_row_fails`).
+
+**Denominators.** `denominators` holds one entry per engine with the three
+decision-6 denominators: `corpus` counts every case, `correctness` counts
+`ok`, `incorrect` and `partial`, and `timing` and `coverage_success` count
+`ok`. The validator recomputes them from the rows with
+`metrics_correctness::Denominators::of` and requires an exact match; the
+reported numbers are never trusted
+(`denominators_are_recomputed_from_the_rows`).
+
+**Variance.** With five or more passes, every `ok` row carries `rel_mad_pct`,
+`median(|m_i - median(m)|) / median(m) * 100` over its pass medians, with no
+pass dropped as an outlier ("Bands pre-registered" item 3; `rel_mad_pct`,
+`rel_mad_pct_matches_hand_computed_five_pass_fixtures`). The validator
+recomputes it and refuses a value that disagrees
+(`a_rel_mad_disagreeing_with_the_pass_medians_fails`). With fewer than five
+passes no row carries one and the provenance config carries
+`variance=insufficient_passes`
+(`fewer_than_five_passes_carry_no_rel_mad_and_record_insufficient_passes`). A
+pass excluded for a recorded external cause is listed in `exclusions` with
+that cause (`a_pass_exclusion_needs_a_cause`). Version 3 drops the
+report-level `geomean_ms`: decision 6 rules out one figure across engines.
+
+**Failed run verdict.** A report `metricsbench_query` writes with
+`--diagnostic-after-failed-ingest` carries `run_verdict: "failed"` and a
+non-empty `failed_bands`, one entry per failed ingest row: `check`, `band`,
+`system` and `reason` (`report_schema::FailedBand`). `check` is `readback`
+(the row's read-back failed, was refused or did not match; `band` 6, the
+accepted-set check), `stall` (the stall ceiling stopped the row), `ingest`
+(a check the row failed after its replay closed, once an earlier row had
+failed; `band` 4 or 6, or `null` for a diverged stream or nothing accepted)
+or `replay` (the row's replay failed other than by a stall, once an earlier
+row had failed). A stall and a failed replay carry `band: null`, since
+neither is a numbered band. Any of these on the Prometheus row refuses the
+diagnostic too, because every other engine is classified against it. Such a report is a diagnostic of a failed
+run and never a result: `validate` refuses it with "report is a diagnostic
+of a failed run, never a result", followed by the verdict and every failed
+band, and `render` refuses it the same way, so the verdict and the failed
+bands are printed and no table is
+(`validate_refuses_a_report_with_a_failed_run_verdict`). A report that
+carries only one of the two fields is refused as inconsistent
+(`ValidationError::VerdictInconsistent`,
+`validate_refuses_a_report_with_a_failed_run_verdict`). Both are absent from every other
+report.
+
+## Portable query run (`metricsbench_query`)
+
+`metricsbench_query` runs the query corpus over HTTP against every engine one
+ingest run loaded and writes a version-3 report
+(`crates/ravel-bench/src/metrics_query.rs`,
+`crates/ravel-bench/src/bin/metricsbench_query.rs`):
+
+```sh
+cargo run --release -p ravel-bench --bin metricsbench_report -- provenance \
+  --workload benchmarks/metrics/workload.json \
+  --corpus benchmarks/metrics/metrics.corpus.json > provenance.json
+RAVEL_TOKEN=... cargo run --release -p ravel-bench --bin metricsbench_query -- \
+  --ingest-report ingest.json \
+  --workload benchmarks/metrics/workload.json \
+  --corpus benchmarks/metrics/metrics.corpus.json \
+  --provenance provenance.json \
+  --engine name=prometheus,url=http://127.0.0.1:9090 \
+  --engine name=ravel,url=http://127.0.0.1:9201,bearer_env=RAVEL_TOKEN \
+  --engine name=victoriametrics,url=http://127.0.0.1:8428 \
+  --engine name=mimir,url=http://127.0.0.1:9009/prometheus \
+  --warmup-passes 1 --passes 5 --reps-per-pass 3 --out report.json
+```
+
+`--engine` takes `name=` (`prometheus`, `ravel`, `victoriametrics` or
+`mimir`), an optional `url=` query base, and an optional `bearer_env=` naming
+the environment variable that holds a bearer token. The token is read from
+the environment only; it is not an argument, and the report records neither
+it nor the variable's value (`the_corpus_runs_against_every_engine_and_validates`
+asserts the header arrived and that the token text is absent from the report,
+stdout and stderr). `ravel-in-process` is not a valid name: that row has no
+HTTP endpoint (amendment section A; `engine_specs_parse_and_refuse`). The
+Mimir tenant header is not sent; run Mimir with multi-tenancy off.
+
+**Ingest binding.** Every query time comes from the ingest report, not from
+the clock. `bind` reads `profile.name` and `profile.run.steps`, `anchor_ms`,
+`workload_version`, `workload_digest`, `seed` and `stream_digest`, and exits
+65 when any is missing. It exits 65 when the workload file's digest, version
+or seed differ from the run's (`a_workload_digest_mismatch_refuses_the_run`),
+when the corpus file's digest differs from the provenance's `corpus_digest`
+or the provenance's `generator_digest` is not the run's workload digest, and
+when any portable ingest row (every row but `ravel-in-process`) fails
+`check_row_band6` or `check_row_accounting`, before any query is sent (the
+digest checks are in `bind` and in the binary's `run_main`;
+`a_band6_failure_refuses_the_run`). `bind` reads no `ravel-in-process` row, so
+a report from a `--no-in-process-row` run binds
+(`an_ingest_report_without_the_in_process_row_binds`). An engine's query URL is its ingest
+row's `readback.query_url` when the row records one, else `url=`; an engine
+with neither, or with no ingest row, exits 65. An empty recorded URL counts
+as none. Ravel is queried with one `min_commit_token` per token, since the
+query API decodes each parameter as one token. The tokens come from its row's
+`commit_tokens_by_shard`, or from `last_commit_token` split on commas when the
+row has no map (`ravel_receives_the_full_multi_shard_commit_token`,
+`ravel_tokens_come_from_the_per_shard_map`). A Ravel row with no token exits
+65 rather than query without the fence
+(`a_ravel_row_with_no_commit_token_refuses_the_run`). The anchor, step count,
+stream digest, pass counts and query URLs are recorded in the provenance
+config.
+
+**Regime.** The provenance config key `regime` names the regime the run's
+timed passes represent, and every report carries it once
+(`metrics_query::REGIME_STEADY_STATE`;
+`the_provenance_config_records_the_steady_state_regime_once`). Its one value
+today is `steady-state`: `--warmup-passes` untimed passes (default 1), then
+`--passes` timed passes (default 5), each pass sending every corpus entry to
+every engine in turn before the next entry (`metrics_query::run`). The
+harness only sends queries: it restarts no engine and drops no cache before
+or between passes. It is neither cold nor warm in band 3's sense (ADR-0927
+2026-11-04 amendment, decision 1). The cold and warm regimes are milestone
+M9 (#3794). A report written before the key existed carries no `regime` and
+is not compared with one that does.
+
+An instant entry is evaluated at the newest generated sample, `anchor_ms +
+(steps - 1) * scrape_interval_secs * 1000`. A range entry is one
+`/api/v1/query_range` request per repetition over the profile's `range_eval`
+grid, as offsets back from that sample, and no instant query per grid point
+(amendment section E; `a_range_entry_is_one_range_request_per_repetition`).
+A grid reaching before the run's first step exits 65 (`QueryGrid::from_run`).
+
+**The oracle row.** Prometheus is required (`BindError::NoOracle`). In every
+pass, for every entry, Prometheus is queried first, and its first answer in
+that pass is the oracle every other engine's repetitions are compared against
+with `metrics_correctness::classify` (decision 4). Its own rows carry
+`oracle: true` and are classified and timed under the same rules as every
+other row. A classification error, such as an oracle that fails or answers
+empty on an entry not marked intended-empty, voids the run with exit 65
+naming the entry and the engine, and no report is written
+(`a_classify_error_voids_the_run`).
+
+**Oracle retries.** An oracle answer lost to a timeout or a transport failure
+before a complete body arrived (`TransportErrorKind` `Connect`, `Request` or
+`Body`) is re-sent up to `--oracle-retries` more times (default 2), with a
+fixed `ORACLE_RETRY_BACKOFF` of one second before each retry
+(`metrics_query::oracle_answer`). A 502, 503 or 504 is retried the same way,
+with a JSON body or without, since a gateway or an overloaded server is saying
+"not now", not answering. Any other answer that arrived is not retried: any
+other HTTP status, 4xx and 500 included, a body over the cap, or a complete
+body that is not JSON (`oracle_retryable`;
+`only_lost_oracle_requests_are_retryable`, `an_oracle_4xx_is_not_retried`). A retry is a separate request that answers
+the oracle only: the Prometheus repetition that asked is classified from its
+first attempt, so a timed-out repetition stays a timeout on Prometheus' row
+and a retry cannot make that row faster
+(`an_oracle_timeout_is_retried_and_prometheus_keeps_its_first_attempt`).
+Each retry prints one stderr line naming the entry, the pass, the
+repetition and the attempt. The provenance config records the budget as
+`oracle_retries`, the number used as `oracle_retries_used`, and the retried
+entries, comma-joined, as `oracle_retry_entries` (`none` when there were
+none). When the budget is spent the run is void as above, exit 65 and no
+report (`an_oracle_timeout_past_the_retry_budget_voids_the_run`).
+
+**Unsupported classes.** An entry whose query names a workload family of kind
+`native_histogram` is `unsupported_construct` on every engine whose ingest
+row lists `native_histogram` in `unsupported_classes`, today VictoriaMetrics.
+The status is set before any comparison, the query is still sent, and the
+row's citation and a summary of the answer go to stderr, since a report row
+has no message field. The entry stays in that engine's `corpus` denominator
+(`an_unsupported_class_entry_is_unsupported_not_incorrect`). The family is
+found from the query text (`needs_native_histograms`), because no corpus
+construct name says "native histogram".
+
+**Passes and timing.** `--warmup-passes` (default 1) passes run first and are
+discarded. Then each of `--passes` (default 5) passes runs every entry
+`--reps-per-pass` (default 3) times per engine; the pass's status is its first
+non-`ok` repetition and its figure the median repetition latency. Only `ok`
+rows carry `min_ms`/`median_ms`/`max_ms`, `reps_per_pass`, `pass_medians_ms`
+and, with five or more passes, `rel_mad_pct` (`only_ok_rows_carry_latency`).
+`cases_expected` is written from the corpus before any query. The assembled
+report goes through `report_schema::validate` before it is written; a report
+that fails is not written and the exit is 70.
+
+**Diagnostic after a failed ingest.** `--diagnostic-after-failed-ingest`,
+which `deploy/metricsbench/run.sh` passes only after an ingest whose
+read-back failed or that stalled, binds such an ingest report instead of
+refusing it (`metrics_query::bind_diagnostic`). A comparator row whose
+read-back failed is queried, and so is one carrying a `row_failure`; a
+comparator whose row stalled or is listed under `failed_replays` is left out
+(`metricsbench_query::a_row_failure_or_failed_replay_does_not_bind`). Any of
+these four on the Prometheus row refuses the diagnostic, since every other
+engine is classified against it, and no report is written. Otherwise every failure is
+recorded in the report's `failed_bands` with `run_verdict: "failed"` (see
+"Failed run verdict" under "Report schema version 3"). The report is checked
+by `report_schema::validate_diagnostic`, which applies every rule `validate`
+does except the verdict. With the flag, an ingest report with no failed row
+is refused (`metrics_query::BindError::NoFailedRow`); without it, a failed
+row is refused with exit 65 and nothing written
+(`metricsbench_query::a_failed_readback_is_queried_as_a_diagnostic_only_with_the_flag`).
+
+**Diagnostics sidecar.** `--diagnostics <path>` writes a second JSON file
+after the report, holding figures pre-registered checks need that the
+version-3 report does not carry. It is diagnostic, not part of the report:
+`report_schema::validate` never reads it, and without the flag no file is
+written and the run is unchanged
+(`the_corpus_runs_against_every_engine_and_validates`). An unwritable path
+exits 74 after the report is already written (the sidecar write is the last
+step of `metrics_query::finish_run`, which the bin calls once the run
+returns). Its fields
+(`metrics_query::Diagnostics`):
+
+- `profile`, `corpus_digest` and `oracle` name the run it describes
+  (`the_diagnostics_sidecar_records_the_largest_ulp_gap`).
+- `oracle_retries`: every oracle retry in the order sent, each with `entry`,
+  `pass`, `repetition` and `attempt`, the same four values the stderr line
+  names (`an_oracle_timeout_is_retried_and_prometheus_keeps_its_first_attempt`).
+- `ulp_gaps`: one object per entry and engine other than the oracle, for
+  every entry, tolerance or not (`metrics_query::UlpGap`). `max_ulps` is the
+  largest `comparator::ulp_distance` between a value of the oracle's answer
+  for the pass and the paired value of the engine's answer, over every step,
+  repetition sent and timed pass; an exact entry shows 0. A repetition
+  skipped after a timeout (`skipped_reps` below) is not an answer and counts
+  nowhere here
+  (`metricsbench_query::a_timed_out_repetition_ends_its_pass_for_that_engine`).
+  Only answers classified against the oracle are measured, so warmup passes
+  and an entry unsupported on the engine by declaration are not. An answer
+  is aligned when it is a 2xx `success` envelope of the oracle's result type with the same label
+  sets and, series by series, the same number of steps at the same
+  timestamps; series pair by label set, steps by position, and a native
+  histogram contributes its `count` and `sum`
+  (`ulp_gaps_pair_series_by_labels_and_steps_by_position`). Every other
+  answer (a refusal, an error, a timeout, a shape mismatch) counts in
+  `unaligned_answers`, and `max_ulps` is null when no aligned answer had a
+  finite value pair
+  (`the_diagnostics_sidecar_records_the_largest_ulp_gap`). `aligned_answers`
+  and `value_pairs` count what was measured. A NaN or an infinity paired with
+  anything but itself has no distance; it counts in `non_finite_mismatches`
+  and leaves `max_ulps` to the other pairs
+  (`a_non_finite_mismatch_is_counted_not_measured`). The distance counts
+  representable steps on the ordered bit line, `-0.0` and `0.0` being one
+  point, and two NaNs are 0 apart (`ulp_distance_*` tests in
+  `crates/ravel-promql-difftest/src/comparator.rs`).
+- `ravel_cost`: Ravel's own per-query object-store cost, read from each
+  Ravel answer's `data.stats` (ADR-0927's 2026-11-04 amendment, decision 4;
+  `metrics_query::RavelCost`). It is recorded here and never in
+  `report.json`. Each object carries `entry`, `pass`, `rep`, `status`,
+  `latency_ms`, `accounting` and `phases`. There is one object per timed
+  repetition sent, never summed or pooled across repetitions
+  (`ravel_cost_records_every_repetitions_accounting_and_phases`); a
+  repetition skipped after a timeout has none
+  (`ravel_cost_records_null_on_an_answer_with_no_stats`); `pass` and
+  `rep` count from 1 and warm-up passes add nothing
+  (`ravel_cost_skips_warmup_passes_and_counts_from_one`). `latency_ms` is
+  that repetition's own elapsed time, the figure its pass median in
+  `report.json` is computed from
+  (`ravel_cost_latency_is_the_repetitions_own`). `accounting` and `phases`
+  are `data.stats.accounting` and `data.stats.phases` copied as returned.
+  A `phases[]` entry carries Ravel's per-phase field names
+  (`s3GetRequests`, `s3GetWireBytes`, `s3ListRequests`, `cacheHits`,
+  `cacheMisses`, `cacheServedBytes` and more, `PhaseCostJson` in
+  `crates/ravel-query/src/http/json.rs`), not the pooled ones. A phase's
+  `s3GetWireBytes` is that phase's share of the pooled
+  `accounting.s3GetBytes`: both count GET wire bytes, never cache-served
+  bytes, and the phases' figures sum to the pooled one
+  (`phase_figures_sum_back_to_the_pooled_accounting_block` in the same
+  file). Comparator engines (Prometheus, VictoriaMetrics, Mimir) add nothing here
+  (`ravel_cost_excludes_comparator_answers`). An answer with no
+  `data.stats`, such as a timeout, still records its object, with
+  `accounting` and `phases` both `null`
+  (`ravel_cost_records_null_on_an_answer_with_no_stats`). The figures are
+  descriptive: no band or exit status reads them.
+  Each object also carries `segmentsFetched`, `segmentsPruned`,
+  `segmentsPrunedByDictionary`, `segmentsPrunedByLabelIndex`, `estimate`
+  and `io`, the same-named members of `data.stats`, each copied on its own
+  and `null` (never 0) when the stats lack it; `pass_label` and
+  `fold_state`, the values of `--pass-label` and `--fold-state` (`null`
+  without them; ADR-3694 Stage 1 labels its passes `unfolded`,
+  `background-folded`, `folded-unrouted` and `folded-routed`, and its arms
+  `folded-control`, `folded-l1`, `folded-erasure-reference` and
+  `folded-erasure-pending`, while `pass`
+  stays the timed pass number); and `result_hash`, `blake3:<hex>` over the
+  answer's `resultType` and `result`, with each series' labels sorted by
+  name, every timestamp and float hashed by its `f64::to_bits`, and the
+  series sorted, so equal answers hash equal whatever their series or key
+  order, while a sample order change or a one-bit value change does not
+  (`metrics_query::result_hash`; `null` for an outcome that is not a
+  successful envelope)
+  (`ravel_cost_copies_every_stats_field_and_nulls_the_absent_ones`,
+  `equal_answers_hash_equal_whatever_their_key_order`,
+  `reordered_series_hash_equal_and_reordered_samples_do_not`,
+  `a_one_bit_change_hashes_differently`).
+- `skipped_reps`: every timed repetition not sent because an earlier
+  repetition of the same entry, on the same engine and in the same pass,
+  timed out (ADR-0927's 2026-11-06 amendment; `metrics_query::SkippedRep`).
+  Once a repetition classifies as `timeout`, that engine is sent no more
+  repetitions of that entry in that pass; the next pass starts again at
+  repetition 1, and the untimed warm-up passes send every repetition
+  (`a_timed_out_repetition_ends_its_pass_for_that_engine`,
+  `a_timeout_mid_pass_skips_the_rest_and_the_next_pass_restarts`). Every
+  engine is treated alike, the oracle included, and only `timeout` triggers
+  it: an `incorrect`, `error`, `partial` or `refused` repetition, and any
+  repetition of an entry unsupported by declaration, never does
+  (`an_incorrect_repetition_does_not_end_its_pass`). Each object carries
+  `engine` (the system name), `entry`, `pass`, `rep` (the repetition left
+  out, from 1) and `timed_out_rep` (the repetition that timed out). For
+  every engine and entry, the timed repetitions sent plus the records here
+  equal `passes` times `reps_per_pass`; when they do not, the run exits 65
+  and writes no report (`metrics_query::RunError::RepsUnaccounted`,
+  `unaccounted_repetitions_refuse_the_run`). The sidecar is still written on
+  that failure when `--diagnostics` is given, since its records are what
+  explain the mismatch; a file already at `--out` is left untouched, and a
+  sidecar that cannot be written there still exits 65, with both failures
+  in the message
+  (`an_accounting_failure_keeps_the_sidecar_and_writes_no_report`,
+  `an_accounting_failure_leaves_an_existing_report_path_alone`,
+  `an_accounting_failure_with_an_unwritable_sidecar_names_both`).
+  `report.json` is unchanged by
+  the skip: a pass's status is its first non-`ok` repetition and a row
+  carries latency only when every pass is `ok`, so the repetitions after a
+  timeout could not change a row
+  (`a_pass_cut_after_its_timeout_writes_the_same_row`). `ravel_cost` and
+  `ulp_gaps` cover only the repetitions sent.
+- `ravel_cost_note`: a fixed string stating that the `ravel_cost` figures
+  are logical object-store call counts as the query engine counted them,
+  not billed provider requests (ADR-0927 decision 8).
+
+```json
+{
+  "profile": "ci",
+  "corpus_digest": "blake3:...",
+  "oracle": "prometheus",
+  "ulp_gaps": [
+    {"entry": "mb_single_counter_rate", "engine": "ravel", "max_ulps": 3,
+     "aligned_answers": 10, "unaligned_answers": 0, "value_pairs": 20,
+     "non_finite_mismatches": 0},
+    {"entry": "mb_selective_job_rate_sum", "engine": "mimir", "max_ulps": null,
+     "aligned_answers": 0, "unaligned_answers": 10, "value_pairs": 0,
+     "non_finite_mismatches": 0}
+  ],
+  "oracle_retries": [
+    {"entry": "mb_single_gauge_instant", "pass": 1, "repetition": 1, "attempt": 2}
+  ],
+  "ravel_cost": [
+    {"entry": "mb_single_counter_rate", "pass": 1, "rep": 1, "status": "ok",
+     "latency_ms": 12.4,
+     "accounting": {"s3GetRequests": 7, "s3GetBytes": 4096, "s3ListRequests": 1},
+     "phases": [{"phase": "scan", "s3GetRequests": 7, "s3GetWireBytes": 4096}]},
+    {"entry": "mb_single_counter_rate", "pass": 1, "rep": 2, "status": "timeout",
+     "latency_ms": 1000.9, "accounting": null, "phases": null}
+  ],
+  "skipped_reps": [
+    {"engine": "ravel", "entry": "mb_single_counter_rate", "pass": 1, "rep": 3,
+     "timed_out_rep": 2}
+  ],
+  "ravel_cost_note": "ravel_cost figures are logical object-store call counts as the query engine counted them, not billed provider requests (ADR-0927 decision 8), one record per timed repetition sent, never summed or pooled across repetitions"
+}
+```

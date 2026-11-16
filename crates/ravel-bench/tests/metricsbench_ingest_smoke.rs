@@ -1,0 +1,1931 @@
+//! Reachability smoke test for the Remote Write 1.0 ingest lane (ADR-0927,
+//! issue #937, M5): the shipping `metricsbench_ingest` binary replays the
+//! MetricsBench stream into the in-process Ravel path and prints a valid report
+//! whose Ravel row is durable-on-ack with the sample accounting closed. Drives
+//! the real binary as a subprocess, so it proves the lane is reachable from the
+//! bin a caller runs, not only from the lib unit tests.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::alloc::System;
+use std::process::Command;
+use std::sync::Mutex;
+
+use ravel_bench::metrics_gen::Generator;
+use ravel_bench::metrics_ingest::{
+    GeneratedStream, LogicalSample, SampleBatches, StreamRecord, classify_line,
+};
+use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
+
+#[global_allocator]
+static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
+
+/// The allocator counts every thread, so each test holds this for its whole
+/// body and a measurement never sees another test's allocations.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn ci_workload() -> ravel_bench::metrics_workload::WorkloadFile {
+    ravel_bench::metrics_workload::load_workload(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmarks/metrics/workload.json"
+    )))
+    .expect("load the same workload manifest the binary loads")
+}
+
+/// The `ci` profile's scrape interval in milliseconds, the grid every anchor
+/// sits on.
+fn ci_interval_ms() -> i64 {
+    let secs = ci_workload()
+        .profile("ci")
+        .expect("manifest declares a `ci` profile")
+        .scrape_interval_secs;
+    secs as i64 * 1_000
+}
+
+/// The fixed anchor every smoke run replays from (2025-10-09T08:53:30Z), so a
+/// run does not depend on the wall clock.
+const ANCHOR_MS: i64 = 1_760_000_010_000;
+
+/// [`ANCHOR_MS`], checked to sit on the `ci` profile's scrape grid.
+fn on_grid_anchor() -> i64 {
+    assert_eq!(ANCHOR_MS.rem_euclid(ci_interval_ms()), 0, "anchor off grid");
+    ANCHOR_MS
+}
+
+/// Run the bin over the `ci` profile against an in-process `MemoryStore`, a few
+/// steps, no comparator endpoints, and return the JSON report it prints.
+fn run_lane() -> serde_json::Value {
+    // One step, and a batch large enough to flush the whole step in a couple
+    // of strict writes: strict mode flushes durably per batch, so a small batch
+    // over the `ci` profile's series count is many sequential flushes. This
+    // keeps the reachability smoke fast.
+    run_lane_with_steps(1, on_grid_anchor())
+}
+
+/// Run the bin over the `ci` profile, one step, with `extra` arguments in
+/// place of the anchor, and return its exit code and stderr.
+fn run_refused(extra: &[&str]) -> (Option<i32>, String) {
+    let bin = env!("CARGO_BIN_EXE_metricsbench_ingest");
+    let output = Command::new(bin)
+        .args(["--profile", "ci", "--store", "memory", "--steps", "1"])
+        .args(extra)
+        .output()
+        .expect("spawn metricsbench_ingest");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Run the bin over the `ci` profile for exactly `steps` scrapes (no
+/// assumption that `steps` covers the profile's full declared step count),
+/// with the first step at `anchor_ms`.
+fn run_lane_with_steps(steps: u64, anchor_ms: i64) -> serde_json::Value {
+    let bin = env!("CARGO_BIN_EXE_metricsbench_ingest");
+    let output = Command::new(bin)
+        .args([
+            "--profile",
+            "ci",
+            "--store",
+            "memory",
+            "--steps",
+            &steps.to_string(),
+            "--anchor-ms",
+            &anchor_ms.to_string(),
+            "--shards",
+            "2",
+            "--batch-size",
+            "4096",
+        ])
+        .output()
+        .expect("spawn metricsbench_ingest");
+    assert!(
+        output.status.success(),
+        "metricsbench_ingest exited non-zero: status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("stdout is a JSON report")
+}
+
+#[test]
+fn the_ingest_lane_is_reachable_from_the_bin_and_ravel_is_durable_on_ack() {
+    let _serial = serial();
+    let report = run_lane();
+    assert!(
+        report["profile"]["run"].get("anchor_source").is_none(),
+        "the anchor is always the flag's, so there is no source to record"
+    );
+    let systems = report["systems"].as_array().expect("systems array");
+
+    // With no comparator endpoints supplied, exactly the Ravel row is present.
+    assert_eq!(
+        systems.len(),
+        1,
+        "only the in-process Ravel row without endpoints"
+    );
+    let ravel = &systems[0];
+    assert_eq!(ravel["system"], "ravel-in-process");
+    assert_eq!(
+        ravel["endpoint"], "in-process",
+        "the in-process row is never read as the portable Ravel row"
+    );
+    assert!(
+        ravel.get("last_commit_token").is_none(),
+        "only the portable Ravel row records a last commit token"
+    );
+    assert_eq!(
+        ravel["ack_semantics"], "durable_on_ack",
+        "Ravel's strict Remote Write surface is durable-on-ack"
+    );
+
+    // The Ravel row carries its commit tokens (a strict ack mints them) and the
+    // diagnostic storage accounting the in-process path can see.
+    assert!(
+        ravel["commit_tokens"]
+            .as_array()
+            .is_some_and(|t| !t.is_empty()),
+        "the durable-on-ack row records at least one commit token"
+    );
+    assert!(
+        ravel["storage"].is_object(),
+        "the Ravel row carries storage accounting"
+    );
+
+    // The accounting closes and something was actually ingested.
+    let ing = &ravel["ingest"];
+    let accepted = ing["accepted_samples"].as_u64().expect("accepted");
+    let rejected = ing["rejected_samples"].as_u64().expect("rejected");
+    let dropped = ing["dropped_samples"].as_u64().expect("dropped");
+    let offered = ing["offered_samples"].as_u64().expect("offered");
+    assert!(accepted > 0, "the run ingested a non-zero sample count");
+    assert_eq!(
+        accepted + rejected + dropped,
+        offered,
+        "the sample accounting must close (ADR-0927 band 4)"
+    );
+
+    // FIX 1 (issue #937 review finding 1): the binary runs the post-ingest
+    // read-your-write query phase and records it as its own row, separate from
+    // ingest (ADR-0927 decision 9). The row is token-bound: it carries the
+    // min_commit_token set it read against, and matches the series just written
+    // without sleeping past the flush delay (decision 3).
+    //
+    // TO SEE THIS FAIL against the pre-fix binary: drop the `.with_query(query)`
+    // in `metricsbench_ingest`'s `run`; `queries` is then absent and the
+    // assertions below fail.
+    let queries = report["queries"].as_array().expect("queries array present");
+    let ravel_query = queries
+        .iter()
+        .find(|q| q["system"] == "ravel-in-process")
+        .expect("a ravel query-phase row exists");
+    assert!(
+        ravel_query["min_commit_tokens"]
+            .as_array()
+            .is_some_and(|t| !t.is_empty()),
+        "the query phase is token-bound: it carries the min_commit_token set"
+    );
+    assert!(
+        ravel_query["matched_series"]
+            .as_u64()
+            .is_some_and(|m| m > 0),
+        "the token-bound read-your-write query matched the just-written series"
+    );
+    assert!(
+        ravel_query["eval_ts_ms"].as_i64().is_some(),
+        "the query records the instant it evaluated at (the replay's newest sample)"
+    );
+}
+
+/// ADR-0927 decision 11: the artifact carries a top-level `profile` block
+/// naming the `ci` profile as non-comparable, with its reason, the
+/// pre-registered declared figures, and (under `run`) the generator-exact
+/// figures for the steps this run actually generated -- not a set of numbers
+/// a reader could mistake for a comparable result.
+///
+/// The `ci` profile's full declared run (120 steps, `samples_per_series`)
+/// measures ~64s unoptimized on this host, over the 60s this test must stay
+/// under, so this drives the bin over a short, deliberately truncated
+/// `--steps` count instead and asserts `run`'s figures against the
+/// generator's own [`ravel_bench::metrics_gen::Generator::total_series_created`]
+/// for that exact step count -- never a re-typed formula -- while the
+/// declared figures are still asserted against the manifest.
+///
+/// TO SEE THIS FAIL against the pre-fix binary: drop `.with_profile(profile_record)`
+/// in `metricsbench_ingest`'s `run`; the top-level `profile` key is then absent
+/// and the first assertion below fails.
+#[test]
+fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures() {
+    let _serial = serial();
+    let workload = ci_workload();
+    let expected = workload
+        .profile("ci")
+        .expect("manifest declares a `ci` profile");
+    let expected_label_cardinalities = workload.label_cardinalities();
+
+    // A deliberate truncation: far under the profile's declared
+    // `samples_per_series` (120), so the run finishes fast regardless of host
+    // load.
+    const STEPS: u64 = 5;
+    let generator = ravel_bench::metrics_gen::Generator::new(&workload, "ci", 0)
+        .expect("generator builds for the ci profile");
+    let expected_total_series_created = generator.total_series_created(STEPS);
+
+    // A fixed on-grid anchor, so every run replays the same stream and the
+    // test can regenerate it.
+    let anchor_ms = on_grid_anchor();
+    let (_, gen_report) = Generator::new(&workload, "ci", anchor_ms)
+        .expect("generator builds")
+        .generate_bytes(STEPS)
+        .expect("generates");
+
+    let report = run_lane_with_steps(STEPS, anchor_ms);
+    let profile = &report["profile"];
+
+    assert_eq!(profile["run"]["anchor_ms"].as_i64(), Some(anchor_ms));
+    assert_eq!(
+        profile["run"]["stream_digest"].as_str(),
+        Some(gen_report.digest.as_str()),
+        "the recorded stream digest is the regenerated stream's"
+    );
+    assert_eq!(
+        profile["run"]["workload_version"].as_u64(),
+        Some(u64::from(workload.version))
+    );
+    assert_eq!(profile["run"]["seed"].as_u64(), Some(workload.seed));
+    let manifest_bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmarks/metrics/workload.json"
+    ))
+    .expect("read the manifest");
+    assert_eq!(
+        profile["run"]["workload_digest"].as_str(),
+        Some(blake3::hash(&manifest_bytes).to_hex().as_str()),
+        "workload_digest is BLAKE3 over the manifest file's bytes"
+    );
+    assert_eq!(
+        report["systems"][0]["ingest"]["elapsed_basis"], "timed_segments",
+        "the artifact says what elapsed_secs measures, so a reader can tell it from a \
+         wall-time report written before the streaming replay"
+    );
+    assert_eq!(
+        profile["run"]["total_samples_generated"].as_u64(),
+        Some(gen_report.emitted_samples),
+        "the bin generated the stream this test regenerated from the same anchor"
+    );
+
+    // Every row's stream counts are the generator's per-type figures, and
+    // every type is offered: stale markers as samples, native histograms as
+    // their own class, both accepted through the in-process `IngestPoint`.
+    let ravel = &report["systems"][0];
+    let counts = &ravel["ingest"]["stream_counts"];
+    assert_eq!(
+        counts["generated_lines"].as_u64(),
+        Some(gen_report.emitted_samples)
+    );
+    assert_eq!(counts["scalar"].as_u64(), Some(gen_report.float_samples));
+    assert_eq!(
+        counts["native_histogram"].as_u64(),
+        Some(gen_report.native_histogram_samples)
+    );
+    assert_eq!(
+        counts["stale_marker"].as_u64(),
+        Some(gen_report.stale_markers)
+    );
+    assert_eq!(counts["malformed"].as_u64(), Some(0));
+    let ingest = &ravel["ingest"];
+    assert_eq!(
+        ingest["offered_samples"].as_u64(),
+        Some(gen_report.float_samples + gen_report.stale_markers),
+        "the replay offers every scalar and every stale marker as a sample"
+    );
+    assert_eq!(
+        ingest["accepted_samples"].as_u64(),
+        ingest["offered_samples"].as_u64()
+    );
+    assert_eq!(
+        ingest["offered_histograms"].as_u64(),
+        Some(gen_report.native_histogram_samples),
+        "native histograms are their own offered class"
+    );
+    assert_eq!(
+        ingest["accepted_histograms"].as_u64(),
+        Some(gen_report.native_histogram_samples),
+        "the in-process path accepts every native histogram"
+    );
+    assert_eq!(ingest["excluded_native_histogram"].as_u64(), Some(0));
+    assert_eq!(ingest["excluded_stale_marker"].as_u64(), Some(0));
+    assert!(
+        gen_report.native_histogram_samples > 0 && gen_report.stale_markers > 0,
+        "the ci stream carries both kinds at {STEPS} steps"
+    );
+
+    // This run truncates the profile (STEPS < samples_per_series, asserted
+    // below), so this only exercises the truncation branch of
+    // `build_profile_record`, not the `ci` profile's own non-comparable
+    // verdict -- a full, untruncated `ci` run is covered separately by
+    // `metrics_ingest::tests::profile_record_is_non_comparable_for_the_profiles_own_reason_when_not_truncated`.
+    assert_eq!(
+        profile["comparable"].as_bool(),
+        Some(false),
+        "a truncated run is never comparable, regardless of the profile's own verdict"
+    );
+    let reason = profile["comparability_reason"]
+        .as_str()
+        .expect("comparability_reason is a string");
+    assert!(
+        !reason.is_empty(),
+        "a non-comparable profile must state why, not leave the reason blank"
+    );
+    assert!(
+        reason.contains("steps"),
+        "a truncated run's reason must state the truncation, not the profile's own verdict: {reason}"
+    );
+    assert_eq!(profile["name"].as_str(), Some("ci"));
+    assert_eq!(
+        profile["active_series"].as_u64(),
+        Some(expected.active_series)
+    );
+    assert_eq!(
+        profile["samples_per_series"].as_u64(),
+        Some(expected.samples_per_series)
+    );
+    assert_eq!(
+        profile["scrape_interval_secs"].as_u64(),
+        Some(expected.scrape_interval_secs)
+    );
+    assert_eq!(
+        profile["duration_secs"].as_u64(),
+        Some(expected.duration_secs)
+    );
+    assert_eq!(
+        profile["total_samples"].as_u64(),
+        Some(expected.total_samples)
+    );
+    assert_eq!(
+        profile["churn_basis_points_per_hour"].as_u64(),
+        Some(expected.churn_basis_points_per_hour)
+    );
+    // A deliberately truncated run: steps_run is this test's short STEPS, not
+    // the profile's full declared step count.
+    assert_eq!(
+        profile["steps_declared"].as_u64(),
+        Some(expected.samples_per_series)
+    );
+    assert_eq!(profile["steps_run"].as_u64(), Some(STEPS));
+    assert!(
+        STEPS < expected.samples_per_series,
+        "STEPS must actually truncate the profile for this test to exercise that path"
+    );
+    let run = &profile["run"];
+    assert_eq!(
+        run["steps"].as_u64(),
+        profile["steps_run"].as_u64(),
+        "run.steps must name the same basis as steps_run"
+    );
+    assert_eq!(
+        run["total_series_created"].as_u64(),
+        Some(expected_total_series_created),
+        "total series created must match the generator's own count for this run's steps"
+    );
+    assert!(
+        run["logical_input_bytes"].as_u64().is_some_and(|b| b > 0),
+        "the generator produced a non-empty logical input stream"
+    );
+    assert!(
+        run["total_samples_generated"]
+            .as_u64()
+            .is_some_and(|s| s > 0),
+        "the generator emitted a non-empty sample count"
+    );
+    let label_cardinalities = profile["label_cardinalities"]
+        .as_object()
+        .expect("label_cardinalities is present");
+    assert_eq!(
+        label_cardinalities.len(),
+        expected_label_cardinalities.len(),
+        "every label dimension the manifest declares must be reported"
+    );
+    for (name, count) in &expected_label_cardinalities {
+        assert_eq!(
+            label_cardinalities.get(name).and_then(|v| v.as_u64()),
+            Some(*count),
+            "label dimension `{name}`'s distinct-value count must match the manifest"
+        );
+    }
+    assert!(
+        !label_cardinalities.contains_key(&workload.generator.scaling_label),
+        "the scaling label is not a fixed dimension and must not appear in label_cardinalities"
+    );
+
+    let scaling_label = &profile["scaling_label"];
+    assert_eq!(
+        scaling_label["name"].as_str(),
+        Some(workload.generator.scaling_label.as_str())
+    );
+    assert_eq!(
+        scaling_label["cardinality_declared"].as_u64(),
+        Some(generator.scaling_label_cardinality(expected.samples_per_series)),
+        "cardinality_declared must match the generator's own figure at the declared step count"
+    );
+    assert_eq!(
+        run["scaling_label_cardinality"].as_u64(),
+        Some(generator.scaling_label_cardinality(STEPS)),
+        "run.scaling_label_cardinality must match the generator's own figure at steps_run"
+    );
+
+    // The substrate block: an in-process MemoryStore never bills.
+    let substrate = &report["substrate"];
+    assert_eq!(substrate["store_backend"].as_str(), Some("memory"));
+    assert_eq!(substrate["backend_bills_requests"].as_bool(), Some(false));
+}
+
+/// The anchor is a run parameter: omitted, the bin exits 64 naming the flag
+/// and why no clock default exists; off the scrape grid, it exits 64 showing
+/// the remainder. Both refuse before anything is generated.
+#[test]
+fn a_missing_or_off_grid_anchor_exits_64() {
+    let _serial = serial();
+    let (code, stderr) = run_refused(&[]);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(stderr.contains("--anchor-ms is required"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "an anchor read from the clock would make each run replay a different stream"
+        ),
+        "{stderr}"
+    );
+
+    let off_grid = (on_grid_anchor() + 1).to_string();
+    let (code, stderr) = run_refused(&["--anchor-ms", &off_grid]);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{off_grid} mod {} = 1", ci_interval_ms())),
+        "{stderr}"
+    );
+
+    let (code, stderr) = run_refused(&["--anchor-ms", &(i64::MAX - 1).to_string()]);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(stderr.contains("9223372036854 ms"), "{stderr}");
+}
+
+/// The portable Ravel row's token comes from the environment variable the
+/// flag names: an unset variable, or the flag without `--ravel-endpoint`,
+/// exits 64 before anything is generated.
+#[test]
+fn a_bearer_token_env_that_cannot_be_read_exits_64() {
+    let _serial = serial();
+    let anchor = on_grid_anchor().to_string();
+    let var = "METRICSBENCH_SMOKE_TOKEN_NEVER_SET";
+    let (code, stderr) = run_refused(&[
+        "--anchor-ms",
+        &anchor,
+        "--ravel-endpoint",
+        "http://127.0.0.1:9/api/v1/write",
+        "--ravel-bearer-token-env",
+        var,
+    ]);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(stderr.contains(var), "{stderr}");
+
+    let (code, stderr) = run_refused(&["--anchor-ms", &anchor, "--ravel-bearer-token-env", var]);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(stderr.contains("needs --ravel-endpoint"), "{stderr}");
+}
+
+/// The portable Ravel row records its tenant: `--ravel-endpoint` without
+/// `--ravel-tenant`, or a `--ravel-tenant` other than `--tenant`, exits 64
+/// before anything is generated.
+#[test]
+fn a_missing_or_mismatched_ravel_tenant_exits_64() {
+    let _serial = serial();
+    let anchor = on_grid_anchor().to_string();
+    let endpoint = ["--ravel-endpoint", "http://127.0.0.1:9/api/v1/write"];
+    let query = ["--ravel-query-url", "http://127.0.0.1:9"];
+
+    let mut missing = vec!["--anchor-ms", anchor.as_str()];
+    missing.extend_from_slice(&endpoint);
+    missing.extend_from_slice(&query);
+    let (code, stderr) = run_refused(&missing);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(stderr.contains("needs --ravel-tenant"), "{stderr}");
+
+    let mut differs = missing.clone();
+    differs.extend_from_slice(&["--tenant", "a", "--ravel-tenant", "b"]);
+    let (code, stderr) = run_refused(&differs);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(
+        stderr.contains("--ravel-tenant `b` differs from --tenant `a`"),
+        "{stderr}"
+    );
+}
+
+/// The same anchor replays the same stream and offers the same tuples; a
+/// different anchor changes both digests.
+#[test]
+fn the_anchor_alone_determines_the_stream_and_offered_digests() {
+    let _serial = serial();
+    let anchor = on_grid_anchor();
+    let digests = |report: &serde_json::Value| {
+        (
+            report["profile"]["run"]["stream_digest"]
+                .as_str()
+                .expect("stream_digest")
+                .to_string(),
+            report["systems"][0]["ingest"]["offered_digest"]
+                .as_str()
+                .expect("offered_digest")
+                .to_string(),
+        )
+    };
+    let first = digests(&run_lane_with_steps(1, anchor));
+    let second = digests(&run_lane_with_steps(1, anchor));
+    assert_eq!(first, second, "same anchor, same stream and offered tuples");
+    assert!(!first.1.is_empty());
+
+    let other = digests(&run_lane_with_steps(1, anchor - ci_interval_ms()));
+    assert_ne!(other.0, first.0, "a different anchor is a different stream");
+    assert_ne!(other.1, first.1, "and offers different tuples");
+}
+
+/// The replay batch size these tests pass explicitly (`run_lane` and
+/// `run_lane_with_steps` hand it to `--batch-size`). The bin's own default
+/// is 500; a larger batch is a looser bound, so the ratio assertions below
+/// hold at the default too.
+const MEMORY_BATCH: usize = 4096;
+
+/// Bytes the global allocator holds now that it did not hold when `region`
+/// was opened. `stats_alloc` already books a realloc's growth or shrink under
+/// `bytes_allocated` or `bytes_deallocated`, so `bytes_reallocated` is not
+/// added again.
+fn live_bytes(region: &Region<'_, System>) -> i64 {
+    let change = region.change();
+    change.bytes_allocated as i64 - change.bytes_deallocated as i64
+}
+
+/// Peak live bytes while draining a `ci` stream of `steps` scrapes batch by
+/// batch, sampled with each batch held, the way a replay holds it.
+fn streaming_peak(steps: u64) -> i64 {
+    let workload = ci_workload();
+    let region = Region::new(GLOBAL);
+    let mut stream = GeneratedStream::new(
+        Generator::new(&workload, "ci", 1_700_000_000_000).expect("generator builds"),
+        steps,
+    );
+    let mut peak = live_bytes(&region);
+    let mut offered = 0u64;
+    while let Some(batch) = stream.next_batch(MEMORY_BATCH).expect("generates") {
+        peak = peak.max(live_bytes(&region));
+        offered += batch.len() as u64;
+    }
+    let (_, counts) = stream.finish().expect("drained stream closes");
+    assert_eq!(
+        offered,
+        counts.scalar + counts.stale_marker + counts.native_histogram
+    );
+    peak
+}
+
+/// The negative control: the whole stream materialised, bytes then every
+/// scalar sample, as the pre-streaming lane held it. Scalars alone already
+/// grow with history, which is all the control has to show.
+fn materialised_live(steps: u64) -> i64 {
+    let workload = ci_workload();
+    let region = Region::new(GLOBAL);
+    let (bytes, _) = Generator::new(&workload, "ci", 1_700_000_000_000)
+        .expect("generator builds")
+        .generate_bytes(steps)
+        .expect("generates");
+    let samples: Vec<LogicalSample> = std::str::from_utf8(&bytes)
+        .expect("utf8")
+        .lines()
+        .enumerate()
+        .filter_map(|(i, line)| match classify_line(i as u64 + 1, line) {
+            StreamRecord::Scalar(sample) => Some(sample),
+            _ => None,
+        })
+        .collect();
+    let live = live_bytes(&region);
+    drop((bytes, samples));
+    live
+}
+
+/// Required test (iii): streaming replay memory is bounded by batch size and
+/// step width, not by history length. Four times the steps leaves the
+/// streaming peak within 1.5x, while the materialised stream grows past 3x,
+/// which shows the measurement can see history-proportional growth.
+#[test]
+fn streaming_replay_memory_does_not_grow_with_history_length() {
+    let _serial = serial();
+    let (short, long) = (120, 480);
+    let stream_short = streaming_peak(short);
+    let stream_long = streaming_peak(long);
+    let held_short = materialised_live(short);
+    let held_long = materialised_live(long);
+    let streaming_ratio = stream_long as f64 / stream_short as f64;
+    let materialised_ratio = held_long as f64 / held_short as f64;
+    eprintln!(
+        "streaming peak {stream_short} B at {short} steps, {stream_long} B at {long} \
+         (ratio {streaming_ratio:.3}); materialised {held_short} B, {held_long} B \
+         (ratio {materialised_ratio:.3})"
+    );
+    assert!(stream_short > 0 && held_short > 0);
+    assert!(
+        streaming_ratio <= 1.5,
+        "streaming peak grew {streaming_ratio:.3}x for 4x the steps"
+    );
+    assert!(
+        materialised_ratio > 3.0,
+        "the materialised control grew only {materialised_ratio:.3}x for 4x the steps"
+    );
+}
+
+/// One point a [`StubTsdb`] stored: a float's bits, or a native histogram.
+#[derive(Clone, Copy)]
+enum StubPoint {
+    Float(u64),
+    Histogram,
+}
+
+/// Every series a stub receiver stored, keyed by its sorted label pairs
+/// (`__name__` included), each holding `(ts_ms, point)`.
+type StubTsdb =
+    std::sync::Arc<Mutex<std::collections::BTreeMap<Vec<(String, String)>, Vec<(i64, StubPoint)>>>>;
+
+/// A stub Remote Write 1.0 receiver with just enough of the Prometheus query
+/// API for the lane's read-back: it stores what it is sent and answers
+/// `/api/v1/series` over a `__name__=~` alternation, `count_over_time` over an
+/// exact selector, and an instant exact selector honouring stale markers.
+fn stub_receiver(db: StubTsdb) -> axum::Router {
+    stub_receiver_storing(db, true)
+}
+
+/// [`stub_receiver`], storing native histograms only when `histograms` is
+/// set: VictoriaMetrics acknowledges them without storing them.
+fn stub_receiver_storing(db: StubTsdb, histograms: bool) -> axum::Router {
+    stub_receiver_with(db, histograms, StubObserver::default())
+}
+
+/// What a stub receiver reports to its test: the write requests it was
+/// sent, the `min_commit_token` values its queries carried, and the
+/// `x-ravel-commit-token` it answers each write with, if any.
+#[derive(Clone, Default)]
+struct StubObserver {
+    writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fences: std::sync::Arc<Mutex<Vec<String>>>,
+    token: Option<String>,
+}
+
+impl StubObserver {
+    fn writes(&self) -> usize {
+        self.writes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn record_fences(&self, params: &[(String, String)]) {
+        self.fences.lock().unwrap().extend(
+            params
+                .iter()
+                .filter(|(name, _)| name == "min_commit_token")
+                .map(|(_, value)| value.clone()),
+        );
+    }
+}
+
+/// [`stub_receiver_storing`], reporting to `observer`.
+fn stub_receiver_with(db: StubTsdb, histograms: bool, observer: StubObserver) -> axum::Router {
+    use ravel_remote_write::proto::prometheus::WriteRequest;
+
+    let write_db = db.clone();
+    let series_db = db.clone();
+    let write_observer = observer.clone();
+    let series_observer = observer.clone();
+    axum::Router::new()
+        .route(
+            "/api/v1/write",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let db = write_db.clone();
+                let observer = write_observer.clone();
+                async move {
+                    observer
+                        .writes
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let raw = snap::raw::Decoder::new()
+                        .decompress_vec(&body)
+                        .expect("snappy body");
+                    let request = <WriteRequest as prost::Message>::decode(raw.as_slice())
+                        .expect("WriteRequest");
+                    let mut db = db.lock().unwrap();
+                    for ts in request.timeseries {
+                        let mut labels: Vec<(String, String)> =
+                            ts.labels.into_iter().map(|l| (l.name, l.value)).collect();
+                        labels.sort();
+                        let points = db.entry(labels).or_default();
+                        for s in ts.samples {
+                            points.push((s.timestamp, StubPoint::Float(s.value.to_bits())));
+                        }
+                        for h in ts.histograms.iter().filter(|_| histograms) {
+                            points.push((h.timestamp, StubPoint::Histogram));
+                        }
+                    }
+                    let mut response = axum::response::Response::new(axum::body::Body::empty());
+                    *response.status_mut() = axum::http::StatusCode::NO_CONTENT;
+                    if let Some(token) = &observer.token {
+                        response.headers_mut().insert(
+                            "x-ravel-commit-token",
+                            axum::http::HeaderValue::from_str(token).expect("header value"),
+                        );
+                    }
+                    response
+                }
+            }),
+        )
+        .route(
+            "/api/v1/series",
+            axum::routing::get(
+                move |axum::extract::Query(params): axum::extract::Query<Vec<(String, String)>>| {
+                    let db = series_db.clone();
+                    series_observer.record_fences(&params);
+                    async move {
+                        let param = |k: &str| {
+                            params
+                                .iter()
+                                .find(|(name, _)| name == k)
+                                .map(|(_, v)| v.clone())
+                                .expect("series parameter")
+                        };
+                        let names = name_alternation(&param("match[]"));
+                        let start = seconds_to_ms(&param("start"));
+                        let end = seconds_to_ms(&param("end"));
+                        let db = db.lock().unwrap();
+                        let data: Vec<serde_json::Value> = db
+                            .iter()
+                            .filter(|(labels, points)| {
+                                labels
+                                    .iter()
+                                    .any(|(k, v)| k == "__name__" && names.contains(v))
+                                    && points.iter().any(|(ts, _)| (start..=end).contains(ts))
+                            })
+                            .map(|(labels, _)| {
+                                serde_json::Value::Object(
+                                    labels
+                                        .iter()
+                                        .map(|(k, v)| (k.clone(), v.clone().into()))
+                                        .collect(),
+                                )
+                            })
+                            .collect();
+                        axum::Json(serde_json::json!({"status": "success", "data": data}))
+                    }
+                },
+            ),
+        )
+        .route(
+            "/api/v1/query",
+            axum::routing::get(
+                move |axum::extract::Query(params): axum::extract::Query<Vec<(String, String)>>| {
+                    let db = db.clone();
+                    observer.record_fences(&params);
+                    async move {
+                        let param = |k: &str| {
+                            params
+                                .iter()
+                                .find(|(name, _)| name == k)
+                                .map(|(_, v)| v.clone())
+                                .expect("query parameter")
+                        };
+                        let query = param("query");
+                        let time = param("time");
+                        let at = seconds_to_ms(&time);
+                        let db = db.lock().unwrap();
+                        let result = if let Some(inner) = query
+                            .strip_prefix("count_over_time(")
+                            .and_then(|q| q.strip_suffix("ms])"))
+                        {
+                            let (selector, range) = inner.rsplit_once('[').expect("range");
+                            let range: i64 = range.parse().expect("range ms");
+                            let count = db.get(&exact_selector(selector)).map_or(0, |points| {
+                                points
+                                    .iter()
+                                    .filter(|(ts, p)| {
+                                        *ts > at - range
+                                            && *ts <= at
+                                            && !matches!(p, StubPoint::Float(b) if *b == STALE_MARKER_BITS)
+                                    })
+                                    .count()
+                            });
+                            if count == 0 {
+                                Vec::new()
+                            } else {
+                                vec![serde_json::json!({"metric": {}, "value": [time, count.to_string()]})]
+                            }
+                        } else {
+                            let latest = db.get(&exact_selector(&query)).and_then(|points| {
+                                points
+                                    .iter()
+                                    .filter(|(ts, _)| *ts <= at && *ts > at - 300_000)
+                                    .max_by_key(|(ts, _)| *ts)
+                                    .copied()
+                            });
+                            match latest {
+                                Some((_, StubPoint::Float(b))) if b != STALE_MARKER_BITS => {
+                                    vec![serde_json::json!({"metric": {}, "value": [time, "1"]})]
+                                }
+                                Some((_, StubPoint::Histogram)) => {
+                                    vec![serde_json::json!({"metric": {}, "value": [time, "1"]})]
+                                }
+                                _ => Vec::new(),
+                            }
+                        };
+                        axum::Json(serde_json::json!({
+                            "status": "success",
+                            "data": {"resultType": "vector", "result": result},
+                        }))
+                    }
+                },
+            ),
+        )
+}
+
+use ravel_promql_difftest::generator::STALE_MARKER_BITS;
+
+/// The API's decimal seconds as milliseconds.
+fn seconds_to_ms(text: &str) -> i64 {
+    let (whole, frac) = text.split_once('.').unwrap_or((text, "0"));
+    let ms: i64 = format!("{frac:0<3}")[..3].parse().expect("fraction");
+    let whole: i64 = whole.parse().expect("seconds");
+    if text.starts_with('-') {
+        whole * 1_000 - ms
+    } else {
+        whole * 1_000 + ms
+    }
+}
+
+/// Undo PromQL string escaping.
+fn unescape_promql(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some(other) => out.push(other),
+                None => {}
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The metric names of a `{__name__=~"a|b"}` matcher of escaped literals.
+fn name_alternation(matcher: &str) -> Vec<String> {
+    let regex = matcher
+        .strip_prefix("{__name__=~\"")
+        .and_then(|m| m.strip_suffix("\"}"))
+        .expect("a __name__ alternation");
+    let regex = unescape_promql(regex);
+    let mut names = vec![String::new()];
+    let mut chars = regex.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => names.last_mut().expect("name").extend(chars.next()),
+            '|' => names.push(String::new()),
+            other => names.last_mut().expect("name").push(other),
+        }
+    }
+    names
+}
+
+/// The sorted label pairs of an exact `{k="v",...}` selector.
+fn exact_selector(selector: &str) -> Vec<(String, String)> {
+    let body = selector
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .expect("a braced selector");
+    let mut labels = Vec::new();
+    let mut rest = body;
+    while !rest.is_empty() {
+        let (name, after) = rest.split_once("=\"").expect("an exact matcher");
+        let mut value = String::new();
+        let mut chars = after.char_indices();
+        let mut end = after.len();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '\\' => value.extend(chars.next().map(|(_, c)| c)),
+                '"' => {
+                    end = i + 1;
+                    break;
+                }
+                other => value.push(other),
+            }
+        }
+        labels.push((name.to_string(), value));
+        rest = after[end..].strip_prefix(',').unwrap_or(&after[end..]);
+    }
+    labels.sort();
+    labels
+}
+
+/// `--no-in-process-row` with two stub portable receivers: the run opens no
+/// store, the report carries no `ravel-in-process` row, no query phase and no
+/// substrate, says `in_process_row: "skipped"`, and still closes band 6 on
+/// each portable row, whose expected digests agree. The in-process run's
+/// expected digests equal theirs, so the portable rows replayed the stream
+/// the in-process row would have.
+#[test]
+fn without_the_in_process_row_the_portable_rows_still_close_band_6() {
+    let _serial = serial();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut urls = Vec::new();
+    for _ in 0..2 {
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("addr");
+        let app = stub_receiver(StubTsdb::default());
+        runtime.spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        urls.push(format!("http://{addr}"));
+    }
+    let anchor = on_grid_anchor().to_string();
+    let prometheus_write = format!("{}/api/v1/write", urls[0]);
+    let mimir_write = format!("{}/api/v1/write", urls[1]);
+    let bin = env!("CARGO_BIN_EXE_metricsbench_ingest");
+    let output = Command::new(bin)
+        .args([
+            "--profile",
+            "ci",
+            "--steps",
+            "2",
+            "--anchor-ms",
+            &anchor,
+            "--no-in-process-row",
+            "--store",
+            "s3",
+            "--http-batch-size",
+            "4096",
+            "--readback-timeout-secs",
+            "45",
+            "--prometheus-endpoint",
+            &prometheus_write,
+            "--prometheus-query-url",
+            &urls[0],
+            "--mimir-endpoint",
+            &mimir_write,
+            "--mimir-query-url",
+            &urls[1],
+        ])
+        // An S3 store on a port nothing listens on: a run that opened and
+        // wrote to it would fail.
+        .env("RAVEL_S3_ENDPOINT", "http://127.0.0.1:9")
+        .env("RAVEL_S3_ALLOW_HTTP", "true")
+        .env("RAVEL_S3_BUCKET", "unreachable")
+        .env("RAVEL_S3_REGION", "us-east-1")
+        .env("RAVEL_S3_ACCESS_KEY_ID", "unused")
+        .env("RAVEL_S3_SECRET_ACCESS_KEY", "unused")
+        .output()
+        .expect("spawn metricsbench_ingest");
+    assert!(
+        output.status.success(),
+        "status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is a JSON report");
+    assert_eq!(report["in_process_row"], "skipped");
+    assert!(report.get("substrate").is_none(), "no store was opened");
+    assert!(report.get("queries").is_none(), "no in-process query phase");
+    let systems = report["systems"].as_array().expect("systems");
+    let names: Vec<&str> = systems
+        .iter()
+        .map(|r| r["system"].as_str().expect("system"))
+        .collect();
+    assert_eq!(names, ["prometheus", "mimir"]);
+    for row in systems {
+        assert_eq!(
+            row["ingest"]["expected_digests"], row["ingest"]["accepted_digests"],
+            "band 6 on {}",
+            row["system"]
+        );
+        assert_eq!(row["readback"]["matches_expected"], true, "{row}");
+        assert_eq!(row["readback"]["attempts"], 1, "{row}");
+        assert!(row["readback"]["settled_after_ms"].is_u64(), "{row}");
+        // Each read-back query's wall time, the series read first among them.
+        let query_ms = row["readback"]["query_ms"]
+            .as_object()
+            .expect("readback.query_ms is an object");
+        assert!(query_ms["series"].is_u64(), "{row}");
+        assert!(query_ms.len() >= 2, "{row}");
+        assert!(query_ms.values().all(serde_json::Value::is_u64), "{row}");
+    }
+    assert_eq!(
+        systems[0]["ingest"]["expected_digests"],
+        systems[1]["ingest"]["expected_digests"]
+    );
+    assert!(
+        report["profile"]["run"]["stream_digest"].is_string(),
+        "the profile record is built from the first portable row's stream"
+    );
+
+    let in_process = run_lane_with_steps(2, on_grid_anchor());
+    assert_eq!(in_process["in_process_row"], "present");
+    assert_eq!(
+        in_process["systems"][0]["ingest"]["expected_digests"],
+        systems[0]["ingest"]["expected_digests"]
+    );
+    assert_eq!(
+        in_process["profile"]["run"]["stream_digest"],
+        report["profile"]["run"]["stream_digest"]
+    );
+}
+
+/// `--no-in-process-row` with no portable endpoint would measure nothing, so
+/// it exits 64 before anything is generated.
+#[test]
+fn skipping_the_in_process_row_with_no_endpoint_exits_64() {
+    let _serial = serial();
+    let anchor = on_grid_anchor().to_string();
+    let (code, stderr) = run_refused(&["--anchor-ms", &anchor, "--no-in-process-row"]);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(
+        stderr.contains("--no-in-process-row needs at least one portable endpoint"),
+        "{stderr}"
+    );
+}
+
+/// A read-back that fails still leaves the report: with a receiver that
+/// stores every write and answers 500 to every query, the bin exits 1 as
+/// before, and `ingest.json`, written from its stdout as
+/// `deploy/metricsbench/run.sh` writes it, holds the row's ingest figures
+/// with `readback_error` set and no `readback`.
+///
+/// TO SEE THIS FAIL: in `run`, return `RunFailure::from(error)` (no report)
+/// for a failed read-back, as the bin did before it printed one: the exit
+/// code still matches, and `ingest.json` is empty.
+#[test]
+fn a_failed_readback_still_prints_the_report() {
+    let _serial = serial();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .expect("bind stub");
+    let addr = listener.local_addr().expect("addr");
+    let refuse = || async {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "query refused",
+        )
+    };
+    let app = axum::Router::new()
+        .route(
+            "/api/v1/write",
+            axum::routing::post(|| async { axum::http::StatusCode::NO_CONTENT }),
+        )
+        .route("/api/v1/series", axum::routing::get(refuse))
+        .route("/api/v1/query", axum::routing::get(refuse));
+    runtime.spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let url = format!("http://{addr}");
+    let write = format!("{url}/api/v1/write");
+    let out_dir = tempfile::tempdir().expect("temp dir");
+    let ingest_json = out_dir.path().join("ingest.json");
+    let stdout = std::fs::File::create(&ingest_json).expect("create ingest.json");
+    let anchor = on_grid_anchor().to_string();
+    let bin = env!("CARGO_BIN_EXE_metricsbench_ingest");
+    let output = Command::new(bin)
+        .args([
+            "--profile",
+            "ci",
+            "--steps",
+            "1",
+            "--anchor-ms",
+            &anchor,
+            "--no-in-process-row",
+            "--http-batch-size",
+            "4096",
+            "--readback-timeout-secs",
+            "5",
+            "--prometheus-endpoint",
+            &write,
+            "--prometheus-query-url",
+            &url,
+        ])
+        .stdout(stdout)
+        .output()
+        .expect("spawn metricsbench_ingest");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("reading prometheus back failed"),
+        "{stderr}"
+    );
+
+    let text = std::fs::read_to_string(&ingest_json).expect("read ingest.json");
+    let report: serde_json::Value =
+        serde_json::from_str(&text).expect("ingest.json is a JSON report");
+    let systems = report["systems"].as_array().expect("systems");
+    assert_eq!(systems.len(), 1, "{report}");
+    let row = &systems[0];
+    assert_eq!(row["system"], "prometheus");
+    let offered = row["ingest"]["offered_samples"].as_u64().expect("offered");
+    assert!(offered > 0, "{row}");
+    assert_eq!(row["ingest"]["accepted_samples"], offered, "{row}");
+    assert!(row.get("readback").is_none(), "{row}");
+    let error = row["readback_error"].as_str().expect("readback_error");
+    assert!(error.contains("500"), "{error}");
+    assert!(
+        report["profile"]["run"]["stream_digest"].is_string(),
+        "{report}"
+    );
+}
+
+/// One row's failed read-back does not stop the rows after it: three stub
+/// receivers in row order, Prometheus first answering 422 to every
+/// read-back query, then VictoriaMetrics and Mimir storing and reading back
+/// what they are sent. `ingest.json` holds all three rows with their ingest
+/// figures, the first carrying `readback_error` and the other two matching
+/// read-backs, and the bin still exits 1, its code for a read-back failure.
+///
+/// TO SEE THIS FAIL: in `run`, return the failure as soon as a row's
+/// read-back fails, as the bin did before: `ingest.json` then holds only the
+/// Prometheus row.
+#[test]
+fn a_failed_readback_does_not_stop_the_later_rows() {
+    let _serial = serial();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let refuse = || async {
+        (
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "query refused",
+        )
+    };
+    let refusing = axum::Router::new()
+        .route(
+            "/api/v1/write",
+            axum::routing::post(|| async { axum::http::StatusCode::NO_CONTENT }),
+        )
+        .route("/api/v1/series", axum::routing::get(refuse))
+        .route("/api/v1/query", axum::routing::get(refuse));
+    let mut urls = Vec::new();
+    for app in [
+        refusing,
+        stub_receiver_storing(StubTsdb::default(), false),
+        stub_receiver(StubTsdb::default()),
+    ] {
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("addr");
+        runtime.spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        urls.push(format!("http://{addr}"));
+    }
+    let writes: Vec<String> = urls.iter().map(|u| format!("{u}/api/v1/write")).collect();
+    let out_dir = tempfile::tempdir().expect("temp dir");
+    let ingest_json = out_dir.path().join("ingest.json");
+    let stdout = std::fs::File::create(&ingest_json).expect("create ingest.json");
+    let anchor = on_grid_anchor().to_string();
+    let bin = env!("CARGO_BIN_EXE_metricsbench_ingest");
+    let output = Command::new(bin)
+        .args([
+            "--profile",
+            "ci",
+            "--steps",
+            "2",
+            "--anchor-ms",
+            &anchor,
+            "--no-in-process-row",
+            "--http-batch-size",
+            "4096",
+            "--readback-timeout-secs",
+            "5",
+            "--prometheus-endpoint",
+            &writes[0],
+            "--prometheus-query-url",
+            &urls[0],
+            "--victoriametrics-endpoint",
+            &writes[1],
+            "--victoriametrics-query-url",
+            &urls[1],
+            "--mimir-endpoint",
+            &writes[2],
+            "--mimir-query-url",
+            &urls[2],
+        ])
+        .stdout(stdout)
+        .output()
+        .expect("spawn metricsbench_ingest");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("reading prometheus back failed"),
+        "{stderr}"
+    );
+
+    let text = std::fs::read_to_string(&ingest_json).expect("read ingest.json");
+    let report: serde_json::Value =
+        serde_json::from_str(&text).expect("ingest.json is a JSON report");
+    let systems = report["systems"].as_array().expect("systems");
+    let names: Vec<&str> = systems
+        .iter()
+        .map(|r| r["system"].as_str().expect("system"))
+        .collect();
+    assert_eq!(
+        names,
+        ["prometheus", "victoriametrics", "mimir"],
+        "{report}"
+    );
+    for row in systems {
+        let offered = row["ingest"]["offered_samples"].as_u64().expect("offered");
+        assert!(offered > 0, "{row}");
+        assert_eq!(row["ingest"]["accepted_samples"], offered, "{row}");
+    }
+    let error = systems[0]["readback_error"]
+        .as_str()
+        .expect("readback_error");
+    assert!(error.contains("422"), "{error}");
+    assert!(systems[0].get("readback").is_none(), "{}", systems[0]);
+    for row in &systems[1..] {
+        assert!(row.get("readback_error").is_none(), "{row}");
+        assert_eq!(row["readback"]["matches_expected"], true, "{row}");
+    }
+    assert!(report.get("stalled").is_none(), "{report}");
+}
+
+/// A row that fails a hard check after an earlier row's read-back failed
+/// does not discard the report: three stub receivers in row order,
+/// Prometheus answering 422 to every read-back query, VictoriaMetrics
+/// answering 400 to every write (its accepted set is then empty, so
+/// `close_row`'s band 6 check fails: an error, not a counted drop), and Mimir
+/// storing and reading back what it is sent. `ingest.json` holds all three
+/// rows with their ingest figures, Prometheus carrying `readback_error`,
+/// VictoriaMetrics carrying `row_failure` for band 6, and Mimir a matching
+/// read-back; the bin exits 1, the read-back failure's code.
+///
+/// TO SEE THIS FAIL: in `run`, return `close_row`'s error with no report
+/// once `first_failure` is set: `ingest.json` is then empty.
+#[test]
+fn a_later_hard_failure_after_a_failed_readback_keeps_the_report() {
+    let _serial = serial();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let refuse = || async {
+        (
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "query refused",
+        )
+    };
+    let refusing_reads = axum::Router::new()
+        .route(
+            "/api/v1/write",
+            axum::routing::post(|| async { axum::http::StatusCode::NO_CONTENT }),
+        )
+        .route("/api/v1/series", axum::routing::get(refuse))
+        .route("/api/v1/query", axum::routing::get(refuse));
+    let refusing_writes = axum::Router::new().route(
+        "/api/v1/write",
+        axum::routing::post(|| async { (axum::http::StatusCode::BAD_REQUEST, "bad write") }),
+    );
+    let mut urls = Vec::new();
+    for app in [
+        refusing_reads,
+        refusing_writes,
+        stub_receiver(StubTsdb::default()),
+    ] {
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("addr");
+        runtime.spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        urls.push(format!("http://{addr}"));
+    }
+    let writes: Vec<String> = urls.iter().map(|u| format!("{u}/api/v1/write")).collect();
+    let out_dir = tempfile::tempdir().expect("temp dir");
+    let ingest_json = out_dir.path().join("ingest.json");
+    let stdout = std::fs::File::create(&ingest_json).expect("create ingest.json");
+    let anchor = on_grid_anchor().to_string();
+    let bin = env!("CARGO_BIN_EXE_metricsbench_ingest");
+    let output = Command::new(bin)
+        .args([
+            "--profile",
+            "ci",
+            "--steps",
+            "2",
+            "--anchor-ms",
+            &anchor,
+            "--no-in-process-row",
+            "--http-batch-size",
+            "4096",
+            "--readback-timeout-secs",
+            "5",
+            "--prometheus-endpoint",
+            &writes[0],
+            "--prometheus-query-url",
+            &urls[0],
+            "--victoriametrics-endpoint",
+            &writes[1],
+            "--victoriametrics-query-url",
+            &urls[1],
+            "--mimir-endpoint",
+            &writes[2],
+            "--mimir-query-url",
+            &urls[2],
+        ])
+        .stdout(stdout)
+        .output()
+        .expect("spawn metricsbench_ingest");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("metricsbench_ingest: reading prometheus back failed"),
+        "the run exits with the first failure: {stderr}"
+    );
+
+    let text = std::fs::read_to_string(&ingest_json).expect("read ingest.json");
+    let report: serde_json::Value =
+        serde_json::from_str(&text).expect("ingest.json is a JSON report");
+    let systems = report["systems"].as_array().expect("systems");
+    let names: Vec<&str> = systems
+        .iter()
+        .map(|r| r["system"].as_str().expect("system"))
+        .collect();
+    assert_eq!(
+        names,
+        ["prometheus", "victoriametrics", "mimir"],
+        "{report}"
+    );
+    for row in systems {
+        let offered = row["ingest"]["offered_samples"].as_u64().expect("offered");
+        assert!(offered > 0, "{row}");
+    }
+    let error = systems[0]["readback_error"]
+        .as_str()
+        .expect("readback_error");
+    assert!(error.contains("422"), "{error}");
+
+    let vm = &systems[1];
+    assert_eq!(vm["ingest"]["accepted_samples"], 0, "{vm}");
+    assert_eq!(vm["row_failure"]["band"], 6, "{vm}");
+    let failure = vm["row_failure"]["error"].as_str().expect("row_failure");
+    assert!(failure.contains("victoriametrics"), "{failure}");
+    assert!(vm.get("readback").is_none(), "{vm}");
+    assert!(vm.get("readback_error").is_none(), "{vm}");
+
+    let mimir = &systems[2];
+    assert_eq!(
+        mimir["ingest"]["accepted_samples"], mimir["ingest"]["offered_samples"],
+        "{mimir}"
+    );
+    assert!(mimir.get("row_failure").is_none(), "{mimir}");
+    assert!(mimir.get("readback_error").is_none(), "{mimir}");
+    assert_eq!(mimir["readback"]["matches_expected"], true, "{mimir}");
+    assert!(report.get("stalled").is_none(), "{report}");
+    assert!(report.get("failed_replays").is_none(), "{report}");
+}
+
+/// Serve `app` on `runtime` and return its base URL.
+fn spawn_stub(runtime: &tokio::runtime::Runtime, app: axum::Router) -> String {
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .expect("bind stub");
+    let addr = listener.local_addr().expect("addr");
+    runtime.spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// The commit token the Ravel-like stub answers every write with.
+fn stub_commit_token() -> String {
+    ravel_types::CommitToken {
+        shard: 0,
+        writer_id: uuid::Uuid::from_u128(0x5eed),
+        epoch: 1,
+        seq: 1,
+        ingest_hour_bucket: 488_888,
+    }
+    .encode()
+}
+
+/// Replay `steps` scrapes of `ci` into the Ravel-like stub at `url` as the
+/// portable Ravel row only, writing the report to `ingest_json` as
+/// `deploy/metricsbench/run.sh` writes it.
+fn replay_ravel_row(url: &str, steps: u64, ingest_json: &std::path::Path) {
+    let stdout = std::fs::File::create(ingest_json).expect("create ingest.json");
+    let anchor = on_grid_anchor().to_string();
+    let write = format!("{url}/api/v1/write");
+    let output = Command::new(env!("CARGO_BIN_EXE_metricsbench_ingest"))
+        .args([
+            "--profile",
+            "ci",
+            "--steps",
+            &steps.to_string(),
+            "--anchor-ms",
+            &anchor,
+            "--no-in-process-row",
+            "--http-batch-size",
+            "4096",
+            "--readback-timeout-secs",
+            "10",
+            "--ravel-endpoint",
+            &write,
+            "--ravel-tenant",
+            "metricsbench",
+            "--ravel-query-url",
+            url,
+        ])
+        .stdout(stdout)
+        .output()
+        .expect("spawn metricsbench_ingest");
+    assert!(
+        output.status.success(),
+        "status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Run `--readback-only` over the `ci` profile with `extra` arguments and
+/// return its exit code, stdout and stderr.
+fn run_readback_only(extra: &[&str]) -> (Option<i32>, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_metricsbench_ingest"))
+        .args([
+            "--readback-only",
+            "--profile",
+            "ci",
+            "--readback-timeout-secs",
+            "10",
+            "--readback-settle-secs",
+            "0",
+        ])
+        .args(extra)
+        .output()
+        .expect("spawn metricsbench_ingest");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// `--readback-only` reads the portable Ravel row of a kept `ingest.json`
+/// back without sending a write: against the stub the replay wrote to it
+/// exits 0 with `readback.matches_expected` true, the same expected figures
+/// the replay's own read-back recorded, every query fenced by the row's
+/// commit token, and no write request; against a stub holding one series
+/// fewer it exits 1 with the mismatch in the JSON.
+///
+/// TO SEE THIS FAIL: in `run_readback_only`, pass a row with
+/// `commit_tokens_by_shard` cleared to `readback_over_http` (the fence
+/// assertion fails), or rebuild the plan for `Receiver::VictoriaMetrics`
+/// (the read then expects 900 series, reads 1000, and exits 1).
+#[test]
+fn readback_only_reads_a_kept_report_back_without_writing() {
+    let _serial = serial();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let db = StubTsdb::default();
+    let observer = StubObserver {
+        token: Some(stub_commit_token()),
+        ..StubObserver::default()
+    };
+    let url = spawn_stub(
+        &runtime,
+        stub_receiver_with(db.clone(), true, observer.clone()),
+    );
+    let out_dir = tempfile::tempdir().expect("temp dir");
+    let ingest_json = out_dir.path().join("ingest.json");
+    replay_ravel_row(&url, 2, &ingest_json);
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ingest_json).expect("read ingest.json"))
+            .expect("ingest.json is a JSON report");
+    let replayed = &report["systems"][0];
+    assert_eq!(replayed["system"], "ravel");
+    assert_eq!(replayed["readback"]["matches_expected"], true, "{replayed}");
+    let writes_after_replay = observer.writes();
+    assert!(writes_after_replay > 0);
+    observer.fences.lock().unwrap().clear();
+
+    let report_path = ingest_json.to_str().expect("utf-8 path").to_string();
+    let anchor = on_grid_anchor().to_string();
+    let read = |query_url: &str| {
+        run_readback_only(&[
+            "--ingest-report",
+            &report_path,
+            "--readback-system",
+            "ravel",
+            "--anchor-ms",
+            &anchor,
+            "--ravel-query-url",
+            query_url,
+        ])
+    };
+
+    let (code, stdout, stderr) = read(&url);
+    assert_eq!(code, Some(0), "{stderr}");
+    let output: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
+    assert_eq!(output["system"], "ravel");
+    assert!(output.get("readback_error").is_none(), "{output}");
+    let readback = &output["readback"];
+    assert_eq!(readback["matches_expected"], true, "{output}");
+    assert_eq!(readback["expected"], replayed["readback"]["expected"]);
+    let series = readback["expected"]["series_count"]
+        .as_u64()
+        .expect("series_count");
+    assert!(series > 0, "{output}");
+    assert_eq!(output["plan_series_count"], series, "{output}");
+    assert_eq!(observer.writes(), writes_after_replay, "no write was sent");
+    let fences = observer.fences.lock().unwrap().clone();
+    assert!(!fences.is_empty(), "every query carries the fence");
+    assert!(
+        fences.iter().all(|f| *f == stub_commit_token()),
+        "{fences:?}"
+    );
+
+    let mut short_db = db.lock().unwrap().clone();
+    let dropped = short_db.keys().next().cloned().expect("a stored series");
+    short_db.remove(&dropped);
+    let short_observer = StubObserver::default();
+    let short_url = spawn_stub(
+        &runtime,
+        stub_receiver_with(
+            std::sync::Arc::new(Mutex::new(short_db)),
+            true,
+            short_observer.clone(),
+        ),
+    );
+    let (code, stdout, stderr) = read(&short_url);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("does not match"), "{stderr}");
+    let output: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
+    let readback = &output["readback"];
+    assert_eq!(readback["matches_expected"], false, "{output}");
+    assert_eq!(readback["series_count"], series - 1, "{output}");
+    let mismatches = readback["mismatches"].as_array().expect("mismatches");
+    assert!(
+        mismatches
+            .iter()
+            .any(|m| m.as_str().is_some_and(|m| m.contains("series_count"))),
+        "{output}"
+    );
+    assert_eq!(short_observer.writes(), 0, "no write was sent");
+}
+
+/// Each `--readback-only` refusal exits 64 with a message naming the
+/// problem, prints no JSON and sends no write: a write endpoint flag, a
+/// missing flag, a system that is not portable or has no query URL, a
+/// bearer token for a row other than ravel, a bearer token variable that is
+/// unset or empty, no row or two rows for the system, a row that recorded no
+/// successful ingest (`row_failure`, or listed under `stalled`), a ravel row
+/// with no non-empty commit token, a profile, step count, workload digest or
+/// anchor that differs from the report's, and a regenerated stream whose
+/// digest differs from the report's `run.stream_digest`.
+#[test]
+fn readback_only_refusals_exit_64() {
+    let _serial = serial();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let observer = StubObserver {
+        token: Some(stub_commit_token()),
+        ..StubObserver::default()
+    };
+    let url = spawn_stub(
+        &runtime,
+        stub_receiver_with(StubTsdb::default(), true, observer.clone()),
+    );
+    let out_dir = tempfile::tempdir().expect("temp dir");
+    let ingest_json = out_dir.path().join("ingest.json");
+    replay_ravel_row(&url, 1, &ingest_json);
+    let writes_after_replay = observer.writes();
+    observer.fences.lock().unwrap().clear();
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ingest_json).expect("read ingest.json"))
+            .expect("ingest.json is a JSON report");
+    let variant = |name: &str, edit: &dyn Fn(&mut serde_json::Value)| -> String {
+        let mut edited = report.clone();
+        edit(&mut edited);
+        let path = out_dir.path().join(name);
+        std::fs::write(&path, serde_json::to_string(&edited).expect("serialize")).expect("write");
+        path.to_str().expect("utf-8 path").to_string()
+    };
+    let kept = ingest_json.to_str().expect("utf-8 path").to_string();
+    let twice = variant("twice.json", &|r| {
+        let row = r["systems"][0].clone();
+        r["systems"].as_array_mut().expect("systems").push(row);
+    });
+    let row_failure = variant("row_failure.json", &|r| {
+        r["systems"][0]["row_failure"] = serde_json::json!({"band": 6, "error": "band 6"});
+    });
+    let stalled = variant("stalled.json", &|r| {
+        r["systems"] = serde_json::json!([]);
+        r["stalled"] = serde_json::json!([{
+            "system": "ravel",
+            "endpoint": "http://r/api/v1/write",
+            "projected_secs": 1200.0,
+            "ceiling_secs": 600,
+            "offered_points": 50,
+            "stream_points": 1000,
+            "error": "projected past the ceiling",
+        }]);
+    });
+    let other_digest = variant("digest.json", &|r| {
+        r["profile"]["run"]["workload_digest"] = serde_json::json!("00");
+    });
+    let other_stream = variant("stream.json", &|r| {
+        r["profile"]["run"]["stream_digest"] = serde_json::json!("00");
+    });
+    let no_token = variant("no_token.json", &|r| {
+        r["systems"][0]["commit_tokens_by_shard"] = serde_json::Value::Null;
+    });
+    let empty_tokens = variant("empty_tokens.json", &|r| {
+        r["systems"][0]["commit_tokens_by_shard"] = serde_json::json!({});
+    });
+    let blank_token = variant("blank_token.json", &|r| {
+        r["systems"][0]["commit_tokens_by_shard"] = serde_json::json!({"0": " "});
+    });
+    let unset_var = "METRICSBENCH_SMOKE_TOKEN_NEVER_SET";
+    let anchor = on_grid_anchor().to_string();
+    let other_anchor = (on_grid_anchor() + ci_interval_ms()).to_string();
+    let write = format!("{url}/api/v1/write");
+
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (
+            vec![
+                "--ingest-report",
+                &kept,
+                "--readback-system",
+                "ravel",
+                "--ravel-endpoint",
+                &write,
+            ],
+            "--ravel-endpoint replays into a system, and --readback-only sends no write",
+        ),
+        (
+            vec!["--readback-system", "ravel"],
+            "--readback-only needs --ingest-report",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &kept,
+                "--readback-system",
+                "mimir",
+                "--mimir-query-url",
+                &url,
+            ],
+            "the ingest report has no row for mimir",
+        ),
+        (
+            vec!["--ingest-report", &twice, "--readback-system", "ravel"],
+            "the ingest report has 2 rows for ravel",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &row_failure,
+                "--readback-system",
+                "ravel",
+            ],
+            "row recorded no successful ingest: it carries row_failure",
+        ),
+        (
+            vec!["--ingest-report", &stalled, "--readback-system", "ravel"],
+            "row recorded no successful ingest: it stalled",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &other_digest,
+                "--readback-system",
+                "ravel",
+            ],
+            "the ingest report's workload digest is 00",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &kept,
+                "--readback-system",
+                "ravel",
+                "--steps",
+                "3",
+            ],
+            "the ingest report's step count is 1, but the arguments give 3",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &kept,
+                "--readback-system",
+                "ravel-in-process",
+            ],
+            "--readback-system `ravel-in-process` is not a portable system",
+        ),
+        (
+            vec!["--ingest-report", &kept, "--readback-system", "prometheus"],
+            "--readback-only for prometheus needs --prometheus-query-url",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &kept,
+                "--readback-system",
+                "mimir",
+                "--mimir-query-url",
+                &url,
+                "--ravel-bearer-token-env",
+                "RAVEL_TOKEN",
+            ],
+            "--ravel-bearer-token-env applies to the ravel row only, not to mimir",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &kept,
+                "--readback-system",
+                "ravel",
+                "--ravel-bearer-token-env",
+                unset_var,
+            ],
+            "--ravel-bearer-token-env names `METRICSBENCH_SMOKE_TOKEN_NEVER_SET`, which is unset",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &other_stream,
+                "--readback-system",
+                "ravel",
+            ],
+            "differs from the ingest report's 00, so the rebuilt plan is not the one the replay \
+             recorded",
+        ),
+        (
+            vec!["--ingest-report", &no_token, "--readback-system", "ravel"],
+            "the ingest report's ravel row has no commit token (`commit_tokens_by_shard`)",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &empty_tokens,
+                "--readback-system",
+                "ravel",
+            ],
+            "the ingest report's ravel row has no commit token (`commit_tokens_by_shard`)",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &blank_token,
+                "--readback-system",
+                "ravel",
+            ],
+            "the ingest report's ravel row has no commit token (`commit_tokens_by_shard`)",
+        ),
+    ];
+    for (extra, message) in cases {
+        let mut argv = vec!["--anchor-ms", anchor.as_str(), "--ravel-query-url", &url];
+        argv.extend(extra);
+        let (code, stdout, stderr) = run_readback_only(&argv);
+        assert_eq!(code, Some(64), "{argv:?}: {stderr}");
+        assert!(stderr.contains(message), "{argv:?}: {stderr}");
+        assert!(stdout.is_empty(), "{argv:?}: {stdout}");
+    }
+
+    for (argv, message) in [
+        (
+            vec![
+                "--ingest-report",
+                &kept,
+                "--readback-system",
+                "ravel",
+                "--ravel-query-url",
+                &url,
+            ],
+            "--anchor-ms is required",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &kept,
+                "--anchor-ms",
+                &anchor,
+                "--ravel-query-url",
+                &url,
+            ],
+            "--readback-only needs --readback-system",
+        ),
+    ] {
+        let (code, stdout, stderr) = run_readback_only(&argv);
+        assert_eq!(code, Some(64), "{argv:?}: {stderr}");
+        assert!(stderr.contains(message), "{argv:?}: {stderr}");
+        assert!(stdout.is_empty(), "{argv:?}: {stdout}");
+    }
+
+    let (code, _, stderr) = run_readback_only(&[
+        "--ingest-report",
+        &kept,
+        "--readback-system",
+        "ravel",
+        "--anchor-ms",
+        &other_anchor,
+        "--ravel-query-url",
+        &url,
+    ]);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "the ingest report's anchor is {anchor}, but the arguments give {other_anchor}"
+        )),
+        "{stderr}"
+    );
+
+    let empty_var = "METRICSBENCH_SMOKE_TOKEN_EMPTY";
+    let output = Command::new(env!("CARGO_BIN_EXE_metricsbench_ingest"))
+        .args([
+            "--readback-only",
+            "--profile",
+            "ci",
+            "--anchor-ms",
+            &anchor,
+            "--ingest-report",
+            &kept,
+            "--readback-system",
+            "ravel",
+            "--ravel-query-url",
+            &url,
+            "--ravel-bearer-token-env",
+            empty_var,
+        ])
+        .env(empty_var, "")
+        .output()
+        .expect("spawn metricsbench_ingest");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(64), "{stderr}");
+    assert!(
+        stderr.contains("names `METRICSBENCH_SMOKE_TOKEN_EMPTY`, which is unset, empty"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "{stderr}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_metricsbench_ingest"))
+        .args([
+            "--readback-only",
+            "--profile",
+            "cardinality",
+            "--anchor-ms",
+            &anchor,
+            "--ingest-report",
+            &kept,
+            "--readback-system",
+            "ravel",
+            "--ravel-query-url",
+            &url,
+        ])
+        .output()
+        .expect("spawn metricsbench_ingest");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(64), "{stderr}");
+    assert!(
+        stderr
+            .contains("the ingest report's profile name is ci, but the arguments give cardinality"),
+        "{stderr}"
+    );
+    assert_eq!(observer.writes(), writes_after_replay, "no refusal wrote");
+    assert!(
+        observer.fences.lock().unwrap().is_empty(),
+        "no refusal queried"
+    );
+}

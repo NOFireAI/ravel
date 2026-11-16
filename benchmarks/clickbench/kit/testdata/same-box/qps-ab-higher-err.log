@@ -1,0 +1,5 @@
+# Synthetic: QPS level (ratio 1.0), mean new error ratio 0.0410 over old 0.0400.
+window=1 arm=old qps=0.500 err_ratio=0.0390 connections=10 duration_s=600 seed=clickbench
+window=2 arm=new qps=0.505 err_ratio=0.0400 connections=10 duration_s=600 seed=clickbench
+window=3 arm=new qps=0.495 err_ratio=0.0420 connections=10 duration_s=600 seed=clickbench
+window=4 arm=old qps=0.500 err_ratio=0.0410 connections=10 duration_s=600 seed=clickbench

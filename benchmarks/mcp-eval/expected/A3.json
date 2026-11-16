@@ -1,0 +1,13 @@
+{
+  "id": "A3",
+  "answer_facts": [
+    {"fact": "service.name is indexed", "pattern": "service\\.name"},
+    {"fact": "http.status_code is indexed", "pattern": "http\\.status_code"},
+    {"fact": "user.id is indexed", "pattern": "user\\.id"},
+    {"fact": "session.id is present and not indexed", "pattern": "session\\.id"}
+  ],
+  "evidence": [],
+  "tools_expected": ["ravel_describe_data"],
+  "call_bound": 3,
+  "fixture_refs": ["entities.security.user_key_is_indexed", "entities.security.session_key_is_indexed"]
+}

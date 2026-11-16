@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3115a30c6a69aecaadfa188ae02d15fea1ff13dc03cbcaeda8ac30303c88cb07 # shrinks to specs = [PartSpec { entries: [{24: {0}}], uncovered: [true], present: [true], watermark_hour: 0, bucket_bits: 1, leaf: Good, leaf_rows: None }], recents = [], id16 = false, present_keys = {24}, extra_keys = 0, ceiling_gets = 2048, ceiling_parts = 1, budget_max = None
+cc 426e0a4e6c614bb6bf5be57b8b0112d0cb4fc55159781c0e8fef1a9b535ae980 # shrinks to specs = [PartSpec { entries: [{0: {0}}], uncovered: [false], present: [true], watermark_hour: 0, bucket_bits: 1, leaf: Good, leaf_rows: None }, PartSpec { entries: [{}], uncovered: [false], present: [true], watermark_hour: 0, bucket_bits: 1, leaf: Flip(0), leaf_rows: None }], recents = [], id16 = false, present_keys = {7}, extra_keys = 0, ceiling_gets = 1, ceiling_parts = 1, budget_max = None
+cc cb15936fe8f7c80a3acfe49baf755838ed191130ce25da7b9de172a732f1f232 # shrinks to specs = [PartSpec { entries: [{}], uncovered: [false], present: [true], watermark_hour: 0, bucket_bits: 1, leaf: StalePart, leaf_rows: None }], recents = [], id16 = false, present_keys = {0}, extra_keys = 0, ceiling_gets = 2048, ceiling_parts = 1, budget_max = None

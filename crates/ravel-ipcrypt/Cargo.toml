@@ -1,0 +1,42 @@
+[package]
+name = "ravel-ipcrypt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# The durable `sys/ipcrypt/policy` marker (ADR-2993 decision 9). Off by
+# default: it is the only part of this crate that needs an object-store
+# client, so a caller that only needs policy parsing, key derivation or
+# value rendering (ravel-otlp, for one) does not carry that dependency.
+marker = ["dep:ravel-proto", "dep:ravel-object-store", "dep:prost"]
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-proto = { workspace = true, optional = true }
+ravel-object-store = { workspace = true, optional = true }
+ipcrypt-rs = { workspace = true }
+blake3 = { workspace = true }
+prost = { workspace = true, optional = true }
+toml = "1"
+serde = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+# Turns the `marker` feature on for test builds only (dev-dependencies never
+# apply to a normal `cargo build`), so `cargo test -p ravel-ipcrypt` with no
+# `--features` flag still compiles and runs the marker unit tests and
+# tests/marker.rs under the required gates and CI jobs that invoke it without
+# selecting features (issue #3046).
+ravel-ipcrypt = { path = ".", features = ["marker"] }
+
+[[test]]
+name = "marker"
+path = "tests/marker.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,39 @@
+structural_fetch stamp git=8a4ee913823a1ca8ab82ec41b0f8d680b7f9bfcd arch=x86_64 nproc=16 mem_total_kib=32132612 corpus=HDFS.log sha256=0783096174d7832c618337f9609e06e04abd86ddd7089b3c12b407e63bfebc52 bytes=1577982906 profile=release
+structural_fetch cpu_clock CLOCK_THREAD_CPUTIME_ID of the report thread; the measurement runs on a current-thread tokio runtime, so every decode the production fetcher does lands on that thread
+structural_fetch params block_records=8192 coalesce_gap=1887437 group_blocks=32 latency_ms=30 matched_rows=10 max_concurrent_gets=16 max_lines=2000000 mini_block_bytes=8192 mini_block_meta_bytes=4 object_max_bytes=11534336 object_min_bytes=10485760 runs=5 seed=13 trace_run_rows=4 zstd_level=3
+structural_fetch hdfs_structural blocks=66 predict=65 band=[52, 80] IN
+structural_fetch hdfs_structural floor_gap/bytes=480525 predict=450000 band=[250000, 900000] IN
+structural_fetch hdfs_structural floor_gap/data_ranges=22 predict=23 band=[12, 40] IN
+structural_fetch hdfs_structural object_bytes=11101600 unpredicted (fixed by construction: the sizing search places it inside the registered object_min_bytes..object_max_bytes window)
+structural_fetch hdfs_structural ratio/bytes=1.0683579228700912 predict=1.07 band=[0.9, 1.2] IN
+structural_fetch hdfs_structural ratio/gets=0.6666666666666666 predict=1 band=[0.66, 1.5] IN
+structural_fetch hdfs_structural ratio/wall=0.5316970205284051 predict=0.5 band=[0.3, 0.8] IN
+structural_fetch hdfs_structural rows=540672 predict=532480 band=[425984, 655360] IN
+structural_fetch hdfs_structural structural/bytes=11374888 predict=12100000 band=[10700000, 14700000] IN
+structural_fetch hdfs_structural structural/data_ranges=1 predict=1 band=[1, 2] IN
+structural_fetch hdfs_structural structural/decode_cpu_ms=2.1494193714515157 predict=5 band=[1.5, 15] IN
+structural_fetch hdfs_structural structural/gets=2 predict=2 band=[2, 3] IN
+structural_fetch hdfs_structural structural/layout_bytes=11545750 predict=11900000 band=[10485760, 14417920] IN
+structural_fetch hdfs_structural structural/meta_bytes=7144 predict=5000 band=[2500, 9000] IN
+structural_fetch hdfs_structural structural/raw_ranges=72 predict=72 band=[60, 90] IN
+structural_fetch hdfs_structural structural/uncomp_bytes=928318 predict=900000 band=[450000, 1600000] IN
+structural_fetch hdfs_structural structural/wall_ms=64.43359337145152 predict=66 band=[60, 110] IN
+structural_fetch hdfs_structural target_blocks=10 unpredicted (fixed by construction: 10 evenly spaced rows land in 10 distinct blocks whenever the object has at least 10 blocks)
+structural_fetch hdfs_structural today/bytes=10647076 predict=11272192 band=[10747904, 12582912] MISS
+structural_fetch hdfs_structural today/decode_cpu_ms=27.875970000000194 predict=70 band=[30, 150] MISS
+structural_fetch hdfs_structural today/gets=3 predict=2 band=[2, 3] IN
+structural_fetch hdfs_structural today/plan_bytes=262144 predict=262144 band=[262144, 1048576] IN
+structural_fetch hdfs_structural today/plan_gets=1 predict=1 band=[1, 2] IN
+structural_fetch hdfs_structural today/uncomp_bytes=12039421 predict=11960000 band=[10525000, 13395000] IN
+structural_fetch hdfs_structural today/wall_ms=121.184793 predict=130 band=[90, 220] IN
+structural_fetch note object: 540672 rows from the first lines of the corpus, 66 blocks, 11101600 bytes, sized in 2 writes; whole-object bound 9437185 bytes, so the routed plan restricts reads to the known blocks
+structural_fetch note matched rows (block, row of block): [(3, 2457), (9, 7372), (16, 4095), (23, 818), (29, 5733), (36, 2457), (42, 7372), (49, 4095), (56, 818), (62, 5733)]
+structural_fetch note today: production plan_segment_routed + scan_accounted_with_tenant_subset_raw over every column, real GETs through InstrumentedStore behind a per-GET delay; decode CPU is the thread CPU of the scan open and drain
+structural_fetch note structural: a faithful simulation, not a real decode. Byte and GET counts come from the object's real pages, re-cut into independently compressed mini-blocks and fetched as real ranged GETs; the plan is the production plan run for real plus the mini-block index; decode CPU is modelled as today's CPU times structural/uncomp_bytes over today/uncomp_bytes; wall is measured plan and data GET time plus that modelled CPU
+structural_fetch note coalescing: the structural ranges are coalesced at coalesce_gap = 1887437 bytes; the production fetcher's default effective gap is its request cost, 1887437 bytes, so today's ranges coalesce at that gap too. floor_gap/* is the structural plan at the 65536-byte floor instead, planned only (no GETs issued): its byte figure includes the plan and mini-block index bytes
+structural_fetch note medians of 5 interleaved runs; every GET and byte count was identical across runs
+structural_fetch decision hdfs_structural: NO-GO (ratio/bytes=1.0684<=0.25 FAIL, ratio/gets=0.6667<=1.5 ok, ratio/wall=0.5317<=1 ok)
+structural_fetch miss today/bytes: 10647076 outside band [10747904.0, 12582912.0]
+structural_fetch miss today/decode_cpu_ms: 27.875970000000194 outside band [30.0, 150.0]
+
+EXIT=2

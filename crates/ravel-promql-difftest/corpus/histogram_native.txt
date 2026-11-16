@@ -1,0 +1,402 @@
+# Native-histogram function forms (docs/promql-evaluator-plan.md P11, #218).
+#
+# End to end since #218 stage 2: native histograms now flow ingest -> storage
+# -> query -> evaluator on the Ravel side. `ravel_stack` ingests
+# `dataset.histogram_series` through `IngestRouter::write_values`
+# (`IngestValue::Histogram`), the RSEG v5 writer stores them, and ravel-query's
+# histogram read path (#218 stage 1) serves them, so each query below produces
+# a real Ravel result to diff against the pinned Prometheus binary. Confirmed
+# by the first real `RAVEL_DIFFTEST=1` run (2026-07-30): histogram_count/_sum/
+# _avg, the out-of-range quantile clamp, rate/increase over histograms, and
+# sum/avg aggregation all match Prometheus bit-for-bit.
+#
+# Every query below reduces native histograms to float results so the existing
+# bit-exact float comparator applies; raw histogram-valued results (a bare
+# `diff_native_hist` selector, or `sum(diff_native_hist_agg)` without a
+# `histogram_count`/`histogram_sum` wrapper) need a histogram-aware comparator,
+# still deferred. Entries that would make Prometheus emit a warning/info
+# annotation Ravel does NOT also emit (mixed classic+native, float+histogram
+# aggregation) are deliberately excluded: the comparator matches annotation
+# presence, so such entries would mismatch on the annotation rather than the
+# value. Those behaviors are pinned by ravel-promql unit tests instead
+# (tests/histogram_native.rs) and listed in the P11 report. An entry whose
+# warning Ravel now DOES emit is includable (the presence matches on both
+# sides); the idelta-over-a-counter entry below is the first such case (#650).
+#
+# NOT float-precision residue after all. The P11 report flagged two suspected
+# residues (bucket_bound arithmetic vs Prometheus' exponentialBounds tables for
+# scale>0; add/sub without reconcileZeroBuckets). Neither surfaces in the real
+# run: this dataset is schema 0 (so the scale>0 exponentialBounds table path is
+# never taken) and the two aggregation series carry a uniform zero bucket (so
+# reconcileZeroBuckets is a no-op). No ULP gap exists to measure, so ADR-0025's
+# "no allowlist entry without numeric evidence" rule means no tolerance entry
+# is added for either.
+#
+# FIXED (#252): histogram_quantile (interior phi) and histogram_fraction. The
+# real run had shown a genuine evaluator semantic gap, not a float residue:
+# Prometheus 3.13.1 interpolates within a native-histogram bucket
+# exponentially, while Ravel interpolated linearly. ravel-promql now matches:
+# it places the interpolated point on a log scale within the bucket
+# (lower*(upper/lower)^within for the quantile, the log-ratio inverse for the
+# fraction), and applies the same one-sided zero-bucket bound (lower/upper -> 0)
+# to histogram_fraction that histogram_quantile already used. For the median of
+# diff_native_hist at +0s (bucket (2,4], rank fraction 1/6) both now return
+# 2*2^(1/6)=2.244924096618746; histogram_fraction(0,4,...) returns
+# 6/7=0.8571428571428571 (rank_at(0)=0 via the zero-bucket bound, rank_at(4)=6).
+# Those two queries are re-added below. The out-of-range-phi clamp stays too
+# because it returns +Inf without exercising interpolation.
+#
+# Dataset: diff_native_hist{kind="counter"} is a monotonic counter native
+# histogram (schema 0, three positive buckets, populated zero bucket).
+# diff_native_hist_agg{i="1"|"2"} are two constant native histograms for
+# aggregation. diff_native_hist_schema{kind="counter"} is a monotonic counter
+# that changes schema up at sample 13 and back down at sample 27, for the
+# directional counter-reset entries near the end of this file.
+
+name: native_histogram_count
+query: histogram_count(diff_native_hist)
+kind: instant
+time: +0s
+mode: unordered
+
+name: native_histogram_sum
+query: histogram_sum(diff_native_hist)
+kind: instant
+time: +0s
+mode: unordered
+
+name: native_histogram_avg
+query: histogram_avg(diff_native_hist)
+kind: instant
+time: +0s
+mode: unordered
+
+name: native_histogram_quantile_phi_out_of_range
+query: histogram_quantile(1.5, diff_native_hist)
+kind: instant
+time: +0s
+mode: unordered
+
+name: native_histogram_quantile_median
+query: histogram_quantile(0.5, diff_native_hist)
+kind: instant
+time: +0s
+mode: unordered
+
+name: native_histogram_fraction
+query: histogram_fraction(0, 4, diff_native_hist)
+kind: instant
+time: +0s
+mode: unordered
+
+name: native_histogram_rate_count
+query: histogram_count(rate(diff_native_hist[5m]))
+kind: instant
+time: +600s
+mode: unordered
+
+name: native_histogram_increase_sum
+query: histogram_sum(increase(diff_native_hist[5m]))
+kind: instant
+time: +600s
+mode: unordered
+
+name: native_histogram_sum_aggregation_count
+query: histogram_count(sum(diff_native_hist_agg))
+kind: instant
+time: +0s
+mode: unordered
+
+name: native_histogram_avg_aggregation_sum
+query: histogram_sum(avg(diff_native_hist_agg))
+kind: instant
+time: +0s
+mode: unordered
+
+# FIXED (#1081): histogram_quantile/histogram_fraction now evaluate at a
+# range-query top level (previously a typed rejection there). This is the
+# literal canonical Grafana p99 latency panel shape --
+# `histogram_quantile(0.99, <native-histogram-selector>)` with no wrapping
+# arithmetic -- which was the first thing that errored against Ravel. The
+# same expression nested in an arithmetic identity (`... * 1`) already
+# evaluated; these entries pin the un-nested range form bit-exact against the
+# pinned Prometheus binary, evaluated over a stepped grid (the whole call is
+# recomputed fresh at each grid point and stitched into a matrix, exactly the
+# generalization VectorMap/Instant already use). The step (60s) is a multiple
+# of the 30s dataset step, so every grid point lands on a real sample, and
+# 0.99 exercises the interior-bucket exponential interpolation the #252 median
+# entry above already pins.
+#
+# ADR-0025 allowlist (backend libm residue, not a Ravel bug): the interior
+# of a native-histogram bucket is interpolated exponentially,
+# `lower * (upper/lower).powf(within)` (histogram.rs interpolate_value).
+# Rust's libm `powf` and Go's `math.Pow` round this last-place differently,
+# so two of the six grid points drift from the pinned Prometheus v3.13.1
+# binary while the other four stay bit-exact. This is purely a range-mode
+# artifact of which p99 values 0.99 lands on, NOT a range-vs-instant
+# divergence: the range path (functions/mod.rs HistogramQuantile arm) runs
+# the identical scalar_arg/vector_arg/interpolate_value computation the
+# instant path runs at the same timestamp, verified bit-exact by the
+# range_and_instant_histogram_quantile_agree_bit_exact unit test in
+# ravel-promql. Measured worst case 2 ULP (ts 1700000360:
+# 7.670022283899527 vs 7.670022283899526; ts 1700000420 is 1 ULP), computed
+# with f64::to_bits from this branch's promql-difftest CI run
+# (actions/runs/31840882889). tolerance: 4 is the next power of two above
+# the 2-ULP worst case, matching the exponential-interpolation drift bound.
+name: native_histogram_quantile_p99_range_grafana
+query: histogram_quantile(0.99, diff_native_hist)
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+tolerance: 4
+
+name: native_histogram_fraction_range
+query: histogram_fraction(0, 4, diff_native_hist)
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+
+# Range evaluation over native histograms (ADR-0108, #580). Before #577/#578/
+# #579 the range path silently destroyed histogram data three ways: the grid
+# collapse dropped a histogram element to a placeholder float 0.0 (silent
+# zeros); the range selector and the range arms of rate/*_over_time fetched
+# floats only, so bare histogram selectors and their reductions vanished
+# (silent empties); and absent_over_time built its answer from the float-only
+# fetch and returned 1 while histogram data flowed (false absence). Each shape
+# below carries a histogram result end to end and is paired with an
+# instant-kind counterpart, proving both endpoints return the same class of
+# answer (the ADR-0108 asymmetry requirement). These entries also depend on
+# the histogram-aware comparator: they compare histogram-valued elements, which
+# the old float-only comparator could not read.
+#
+# No tolerance on the rate/increase entries: the existing instant entries
+# native_histogram_rate_count and native_histogram_increase_sum already match
+# Prometheus bit-for-bit on this schema-0 dataset (the extrapolated-rate math
+# takes no libm powf on schema 0), so the histogram these produce should match
+# bit-for-bit too. If a first real RAVEL_DIFFTEST run measures a per-bucket or
+# count/sum ULP gap, a measured tolerance is added per ADR-0025, never guessed.
+
+# Silent-zeros shape: a top-level aggregate over a histogram element. The grid
+# collapse used to emit an all-zero float series here.
+name: native_histogram_sum_rate_range
+query: sum(rate(diff_native_hist[5m]))
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+
+name: native_histogram_sum_rate_instant
+query: sum(rate(diff_native_hist[5m]))
+kind: instant
+time: +600s
+mode: unordered
+
+# Silent-empties shape: the range arm of rate over a histogram counter. Its
+# window reducer (histogram_extrapolated_rate) was ported but unwired on the
+# range arm, so this used to vanish.
+name: native_histogram_rate_range
+query: rate(diff_native_hist[5m])
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+
+name: native_histogram_rate_instant
+query: rate(diff_native_hist[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+# Silent-empties shape: a bare native-histogram selector as a range query. The
+# range selector fetched floats only, so the whole series used to disappear.
+name: native_histogram_bare_selector_range
+query: diff_native_hist
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+
+name: native_histogram_bare_selector_instant
+query: diff_native_hist
+kind: instant
+time: +600s
+mode: unordered
+
+# Silent-empties shape in the *_over_time family: count_over_time reduces
+# histogram samples to a float count of how many landed in the window. The
+# family reduced floats only, so this used to answer empty over histogram data.
+name: native_histogram_count_over_time_range
+query: count_over_time(diff_native_hist[5m])
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+
+name: native_histogram_count_over_time_instant
+query: count_over_time(diff_native_hist[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+# False-absence shape: absent_over_time over a window that has histogram data
+# must answer empty (the data is present). The float-only fetch used to see no
+# samples and return 1, a permanently inverted liveness signal. The 15m window
+# spans the whole 30s-step dataset, so every grid point sees data.
+name: native_histogram_absent_over_time_range
+query: absent_over_time(diff_native_hist[15m])
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+expect: empty
+
+name: native_histogram_absent_over_time_instant
+query: absent_over_time(diff_native_hist[15m])
+kind: instant
+time: +600s
+mode: unordered
+expect: empty
+
+# Counter-family functions over native histograms (ADR-0108 decision 5, #650).
+# Before #650 irate/idelta/resets/changes routed a pure-histogram window to a
+# silent Drop (empty, no annotation), diverging from Prometheus v3.13.1, which
+# defines all four over histograms. resets/changes reduce a histogram window to
+# a FLOAT (a reset/change count), so the existing float comparator applies and
+# both endpoints are pinned here. Over the monotonic counter dataset resets is
+# 0 (no downward step) and changes counts every adjacent differing pair; each
+# used to answer empty over histogram data.
+#
+# irate/idelta over histograms (#650). Ravel now raises the same counter/gauge
+# type-mismatch warnings Prometheus does (NativeHistogramNotCounter for irate
+# over a gauge, NativeHistogramNotGauge for idelta over a counter), so the two
+# counter-dataset directions can be pinned here: the comparator matches
+# annotation presence, and idelta over this counter histogram warns on both
+# sides while irate over it (a type-matched counter operation) warns on neither.
+# The two gauge-histogram directions (irate over a gauge -> NativeHistogramNot
+# Counter; idelta over a gauge -> no warning) need a GAUGE-hinted native
+# histogram series, which this dataset does not carry (generator.rs is out of
+# this task's scope); all four directions, including both gauge ones, are pinned
+# by ravel-promql unit tests (tests/histogram_native.rs).
+name: native_histogram_idelta_instant
+query: idelta(diff_native_hist[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+name: native_histogram_irate_instant
+query: irate(diff_native_hist[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+name: native_histogram_resets_range
+query: resets(diff_native_hist[5m])
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+
+name: native_histogram_resets_instant
+query: resets(diff_native_hist[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+# Schema transitions (#679). Prometheus' counter-reset detection is
+# DIRECTIONAL about the schema term: a schema INCREASE is a reset whatever the
+# buckets did (a decrease can hide in the newly visible finer resolution),
+# while a schema DECREASE is not, and the subtraction still runs after the
+# finer side is down-converted. Ravel's `FloatHistogram::detect_reset` used a
+# symmetric `self.scale != prev.scale`, so it called every decrease a reset
+# too; nothing here could catch it, because until this ticket the generator
+# emitted schema 0 for every sample of every series.
+#
+# `diff_native_hist_schema{kind="counter"}` (generator.rs
+# `schema_transition_counter`) is a monotonic counter with one positive bucket
+# at index 1, a constant zero bucket, and two schema changes: up at sample 13
+# (+390s) and back down at sample 27 (+810s). Every other reset input grows or
+# stays put, so the schema term is the only thing either side can be reacting
+# to at those two samples. The two windows below are each 5m wide and contain
+# exactly one transition: +600s covers (300s, 600s] and so sample 13, +990s
+# covers (690s, 990s] and so sample 27.
+#
+# Expected on both sides: 1 reset over the increase window, 0 over the
+# decrease window, and a rate whose count is the plain difference across the
+# decrease rather than the compensated later-sample-alone.
+#
+# NOT yet confirmed against the pinned binary: the change that added these was
+# executed on a host with no Prometheus binary and no network egress to fetch
+# one, so this is their first real oracle exposure. The Ravel side is pinned
+# independently by ravel-promql unit tests (histogram.rs
+# `no_reset_on_a_schema_decrease_whose_buckets_grew_once_aligned`,
+# `rate_subtracts_across_a_schema_decrease_instead_of_compensating`;
+# tests/histogram_native.rs
+# `resets_counts_a_schema_increase_but_not_a_schema_decrease`). One thing only
+# a real run can settle: Prometheus serves the counter-reset hint its chunk
+# layer derived, not the one remote write carried, and a schema change ends a
+# chunk. These entries assume the transition sample reads back as
+# UnknownCounterReset (so detection runs). If the oracle instead reports a
+# reset over the decrease window, the chunk header is what to look at first,
+# not the histogram.rs direction.
+name: native_histogram_resets_over_a_schema_increase
+query: resets(diff_native_hist_schema[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+name: native_histogram_resets_over_a_schema_decrease
+query: resets(diff_native_hist_schema[5m])
+kind: instant
+time: +990s
+mode: unordered
+
+name: native_histogram_rate_count_over_a_schema_increase
+query: histogram_count(rate(diff_native_hist_schema[5m]))
+kind: instant
+time: +600s
+mode: unordered
+
+name: native_histogram_rate_count_over_a_schema_decrease
+query: histogram_count(rate(diff_native_hist_schema[5m]))
+kind: instant
+time: +990s
+mode: unordered
+
+name: native_histogram_changes_range
+query: changes(diff_native_hist[5m])
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+
+name: native_histogram_changes_instant
+query: changes(diff_native_hist[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+# Instant query whose top-level result is a range vector carrying native
+# histograms (#643). Prometheus answers with a matrix carrying the histogram
+# steps; Ravel's instant Value::Matrix is float-only, so rather than drop the
+# histograms at HTTP 200 it refuses with a typed 422 Unsupported (ADR-0108
+# decision 8). This is a one-sided divergence, registered with the ADR-0030
+# comparator mode (comparator.rs compare_ravel_error_prom_success): it asserts
+# exactly that Ravel errors by design while Prometheus succeeds. The refusal is
+# also covered by a ravel-promql unit test
+# (instant_matrix_selector_over_native_histograms_refuses_rather_than_dropping).
+name: native_histogram_instant_matrix_selector_refused
+query: diff_native_hist[5m]
+kind: instant
+time: +600s
+mode: ravel_error_prom_success

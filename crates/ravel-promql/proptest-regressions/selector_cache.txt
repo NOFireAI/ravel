@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f5345430bb35e2497f1a8f7167cd483df315d10af032fe4cc6330eb1fa70c04f # shrinks to series = [SeriesData { labels: LabelSet([]), samples: [Sample { ts_ns: -11, value: 0.0 }] }], first_start = 0, requests = [(-13, 2, 1, 1), (0, 0, 1, 1)]

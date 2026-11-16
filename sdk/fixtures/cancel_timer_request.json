@@ -1,0 +1,7 @@
+{
+  "agent": {
+    "kind": "order",
+    "key": "o-1"
+  },
+  "timer_key": "payment-reminder"
+}

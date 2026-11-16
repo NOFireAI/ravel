@@ -1,0 +1,427 @@
+//! Enumeration guard for ADR-0066 decision 4 (the format-migration classes).
+//!
+//! Every message in `proto/ravel/sys.proto` that carries a `format_version`
+//! field must be classified in the table below as either rewritten-under-CAS
+//! (a lagging writer could strip an additive field, so every additive change
+//! MUST bump `format_version`, sequenced readers-before-writers) or
+//! never-rewritten (written once and immutable, or overwritten wholesale from a
+//! sole writer's live state, so no peer ever reads-and-rewrites its bytes and a
+//! strip cannot happen). A new versioned message that lands without a table
+//! entry fails this test, so a message cannot be added to the frozen sys schema
+//! without a deliberate classification.
+//!
+//! Why this lives in `crates/ravel-catalog/tests/` rather than a unit module:
+//! the invariant spans every message in the shared sys proto, whose readers and
+//! writers are owned by four crates (ravel-catalog, ravel-ingest, ravel-maintain,
+//! ravel-server), so it belongs to no single module. An integration test parses
+//! the checked-in proto TEXT (via `CARGO_MANIFEST_DIR`), which is exactly the
+//! artifact a new message is added to, rather than the generated Rust types --
+//! so a message that never got a Rust reader is still caught. It is scoped to
+//! ravel-catalog because that crate owns three of the versioned records and its
+//! test gate (`cargo test -p ravel-catalog`) always runs it.
+//!
+//! The same guard covers `proto/ravel/agents.proto` (ADR-3331 decision 3)
+//! through its own table, `agents_classification_table()`: `AgentHead` is
+//! the one CAS-mutable root, and every other versioned agents message is an
+//! immutable object written under `o/` with `CreateIfAbsent`.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+/// How a versioned sys/* record is mutated, and the read-version set its readers
+/// accept today. The vocabulary of ADR-0066 decision 4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// Read-modify-write under CAS (or a sole-record CAS-replace that rebuilds
+    /// the body from a decoded view): a lagging writer that re-encodes through an
+    /// older field set silently strips any additive field a newer writer added.
+    /// Every additive change to such a record MUST bump `format_version`,
+    /// sequenced readers-before-writers, and its rewrite paths refuse a record
+    /// newer than the writer can reproduce (ADR-0066 decision 5). The slice is
+    /// the supported read-version set its readers accept today.
+    CasMutable(&'static [u32]),
+    /// Never rewritten by a peer: either written once with `CreateIfAbsent` and
+    /// immutable, or overwritten wholesale by its single owning writer from that
+    /// writer's own live state (`PutMode::Overwrite`, no prior bytes read). A
+    /// strip cannot happen because nothing reads-and-rewrites the object. The
+    /// slice is the supported read-version set its readers accept today.
+    Immutable(&'static [u32]),
+}
+
+/// The checked-in classification of every `format_version`-carrying message in
+/// `proto/ravel/sys.proto`. Adding a versioned message without adding it here
+/// fails `classification_is_complete`.
+fn classification_table() -> BTreeMap<&'static str, Class> {
+    use Class::{CasMutable, Immutable};
+    BTreeMap::from([
+        // Written once with CreateIfAbsent, then immutable.
+        ("TenancyMarker", Immutable(&[1])),
+        ("TenantRecoveryManifest", Immutable(&[1])),
+        // Created with CreateIfAbsent; `set-policy` replaces it under CAS with a
+        // body built from the operator's local policy file, never from a
+        // decoded view of the stored bytes, so no writer can strip a field.
+        ("IpcryptPolicyMarker", Immutable(&[1])),
+        // Sole-writer PutMode::Overwrite snapshots: each write is a fresh dump of
+        // the owning process's live state, never a read-modify-write of prior
+        // bytes, so a lagging binary cannot strip a sibling's additive field.
+        ("AdmissionUsageSnapshot", Immutable(&[1])),
+        // ADR-3130 decision 2: version 2 carries the MAC, and a reader refuses
+        // a version-1 record as missing_mac, so {1} is no longer read.
+        ("WorkerHeartbeat", Immutable(&[2])),
+        // Read-modify-write under CAS. ProvisioningRecord accepts {1, 2, 3}
+        // after ADR-1746 Release A (the FormatFloor basis fields), and its
+        // writer stamps 3 since Release B; {1, 2, 3, 4} after ADR-4233
+        // decision 4 (compat_epoch and compat_fenced_unix_ns, stamped 4 only on
+        // a fenced record). CompatRecord (`sys/compat`, ADR-4233 decision 3)
+        // starts at {1}. TenantConfigRecord accepts {1, 2, 3}
+        // after ADR-2135's reader-first step (clustering_key and bloom_scope;
+        // the writer stamps 2 by default and 3 behind the storage-layout
+        // opt-in), and {1, 2, 3, 4} after ADR-2707's (key_index and
+        // index_trace_id, stamped 4 behind the same opt-in). MetricMetadataRecord accepts {1, 2} after ADR-0066 R1;
+        // AuthTokenMap accepts {1, 2} (managed_by, ADR-0072 #897) and
+        // KeyEpochRecord {1}, both as a floor-and-ceiling set since ADR-0066 R2.
+        // GcConfig still carries a ceiling-only gate in its own crate
+        // (ravel-maintain), outside this change's scope: reported, not fixed.
+        // CompactionClaim's reader (ravel-fleet) now refuses to steal or
+        // overwrite a claim whose format_version is 0 or above its own known
+        // version at any age, not only past the 24 h ceiling (ADR-4233
+        // decision 4, H8); an ordinary unreadable claim at a known version is
+        // still judged by the ceiling. Every slice belonging to a
+        // ravel-catalog reader is checked against that reader's own constants
+        // by `catalog_read_sets_match_their_readers_constants`.
+        ("ProvisioningRecord", CasMutable(&[1, 2, 3, 4])),
+        ("CompatRecord", CasMutable(&[1])),
+        ("TenantConfigRecord", CasMutable(&[1, 2, 3, 4])),
+        ("MetricMetadataRecord", CasMutable(&[1, 2])),
+        ("AuthTokenMap", CasMutable(&[1, 2])),
+        ("GcConfig", CasMutable(&[1])),
+        ("CompactionClaim", CasMutable(&[1])),
+        ("KeyEpochRecord", CasMutable(&[1])),
+    ])
+}
+
+/// The checked-in classification of every `format_version`-carrying message in
+/// `proto/ravel/agents.proto` (ADR-3331 decision 3). Adding a versioned agents
+/// message without adding it here fails `agents_classification_is_complete`.
+fn agents_classification_table() -> BTreeMap<&'static str, Class> {
+    use Class::{CasMutable, Immutable};
+    BTreeMap::from([
+        // The per-agent root at `ag/<agent_id>/head`: read, modified and
+        // written back under CAS, so every additive change bumps the version.
+        // Version 2 carries the paged index of the ADR-3331 index-page
+        // amendment; readers accept both versions.
+        ("AgentHead", CasMutable(&[1, 2])),
+        // Content-addressed objects under `ag/<agent_id>/o/`, written once
+        // with CreateIfAbsent and never rewritten.
+        ("InboxPage", Immutable(&[1])),
+        ("ReceiptPage", Immutable(&[1])),
+        ("ResultPage", Immutable(&[1])),
+        ("EventPage", Immutable(&[1])),
+        ("StepTranscript", Immutable(&[1])),
+        ("EffectJournal", Immutable(&[1])),
+        ("TimerTable", Immutable(&[1])),
+        ("StateSnapshot", Immutable(&[1])),
+    ])
+}
+
+/// The checked-in proto text this guard classifies.
+fn sys_proto_text() -> String {
+    proto_text("sys.proto")
+}
+
+fn agents_proto_text() -> String {
+    proto_text("agents.proto")
+}
+
+fn proto_text(file: &str) -> String {
+    let path = format!("{}/../../proto/ravel/{file}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {file} at {path}: {e}"))
+}
+
+/// Every message `proto` versions is in `table` and the reverse, with a floor
+/// so a parser that enumerates nothing cannot pass against an empty table.
+fn assert_complete(file: &str, proto: &str, table: &BTreeMap<&'static str, Class>) {
+    let in_proto = messages_with_format_version(proto);
+    let classified: BTreeSet<String> = table.keys().map(|s| s.to_string()).collect();
+    let unclassified: Vec<&String> = in_proto.difference(&classified).collect();
+    assert!(
+        unclassified.is_empty(),
+        "{file} messages carrying format_version with no classification: {unclassified:?}"
+    );
+    let stale: Vec<&String> = classified.difference(&in_proto).collect();
+    assert!(
+        stale.is_empty(),
+        "the {file} table names messages not in {file} (renamed or removed?): {stale:?}"
+    );
+    assert!(
+        !in_proto.is_empty(),
+        "the parser enumerated no versioned messages in {file}"
+    );
+}
+
+/// The set of top-level `message` names in `proto` that declare a `format_version`
+/// field. Parses the proto text (not generated types) so a message that was never
+/// given a Rust reader is still enumerated. Messages here are flat (no nested
+/// messages), so a brace-depth scan that resets the current message at depth 0 is
+/// sufficient; a `format_version` field is recognized by the field declaration
+/// `uint32 format_version = <n>;`, distinct from the many doc comments that
+/// mention the word.
+fn messages_with_format_version(proto: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut current: Option<String> = None;
+    let mut depth: i32 = 0;
+
+    for raw in proto.lines() {
+        // Drop any trailing `// ...` comment so a commented mention of
+        // `format_version` or a stray brace inside a comment is ignored.
+        let line = match raw.find("//") {
+            Some(idx) => &raw[..idx],
+            None => raw,
+        };
+        let trimmed = line.trim();
+
+        if depth == 0
+            && let Some(rest) = trimmed.strip_prefix("message ")
+        {
+            let name = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_end_matches('{')
+                .to_string();
+            if !name.is_empty() {
+                current = Some(name);
+            }
+        }
+
+        if let Some(name) = &current
+            && trimmed.starts_with("uint32 format_version")
+        {
+            out.insert(name.clone());
+        }
+
+        depth += trimmed.matches('{').count() as i32;
+        depth -= trimmed.matches('}').count() as i32;
+        if depth <= 0 {
+            depth = 0;
+            current = None;
+        }
+    }
+
+    out
+}
+
+/// Every `format_version`-carrying message in the proto is classified, and the
+/// table lists no message the proto does not have. This is the enumeration guard:
+/// a new versioned message added to the frozen sys schema without a table entry
+/// fails here.
+#[test]
+fn classification_is_complete() {
+    let proto = sys_proto_text();
+    let in_proto = messages_with_format_version(&proto);
+    let classified: BTreeSet<String> = classification_table()
+        .keys()
+        .map(|s| s.to_string())
+        .collect();
+
+    let unclassified: Vec<&String> = in_proto.difference(&classified).collect();
+    assert!(
+        unclassified.is_empty(),
+        "sys.proto messages carrying format_version with no ADR-0066 classification: {unclassified:?}. \
+         Classify each in classification_table() as CasMutable (a lagging writer could strip an \
+         additive field, so bump format_version on every additive change) or Immutable (never \
+         rewritten by a peer)."
+    );
+
+    let stale: Vec<&String> = classified.difference(&in_proto).collect();
+    assert!(
+        stale.is_empty(),
+        "classification_table() names messages not in sys.proto (renamed or removed?): {stale:?}"
+    );
+
+    // Sanity: the proto and the table enumerate the same number of messages, so a
+    // parser regression that silently found none (or found a subset) is itself
+    // caught. The count comes from the table rather than a literal so that adding
+    // a message and classifying it in the same commit does not have to edit a
+    // number in a third place -- but the floor below still catches a parser that
+    // returns nothing, which the equality alone would not if the table were also
+    // empty.
+    assert!(
+        !in_proto.is_empty(),
+        "the parser enumerated no versioned messages at all: a parser regression, not an empty schema"
+    );
+    assert!(
+        !classified.is_empty(),
+        "the classification table is empty: it must enumerate every versioned sys.proto message"
+    );
+    assert_eq!(
+        in_proto.len(),
+        classification_table().len(),
+        "the proto and the classification table must enumerate the same messages; found {}: {in_proto:?}",
+        in_proto.len()
+    );
+}
+
+/// The agents proto has exactly the nine versioned messages ADR-3331 decision 3
+/// lists, each classified, with `AgentHead` the only CAS-mutable one.
+#[test]
+fn agents_classification_is_complete() {
+    let proto = agents_proto_text();
+    let table = agents_classification_table();
+    assert_complete("agents.proto", &proto, &table);
+    assert_eq!(messages_with_format_version(&proto).len(), 9);
+    let cas: Vec<&str> = table
+        .iter()
+        .filter(|(_, class)| matches!(class, Class::CasMutable(_)))
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(cas, ["AgentHead"]);
+}
+
+/// No message name is classified in both tables, so a message moved between
+/// the two protos cannot keep a stale class in the other.
+#[test]
+fn the_sys_and_agents_tables_are_disjoint() {
+    let sys = classification_table();
+    let shared: Vec<&str> = agents_classification_table()
+        .into_keys()
+        .filter(|name| sys.contains_key(name))
+        .collect();
+    assert!(shared.is_empty(), "classified in both tables: {shared:?}");
+}
+
+/// The agents guard bites the same way the sys guard does.
+#[test]
+fn a_new_versioned_agents_message_is_detected_as_unclassified() {
+    let mut proto = agents_proto_text();
+    proto.push_str("\nmessage FuturePage {\n  uint32 format_version = 1;\n}\n");
+    let in_proto = messages_with_format_version(&proto);
+    let table = agents_classification_table();
+    assert!(in_proto.contains("FuturePage"));
+    assert!(!table.contains_key("FuturePage"));
+    let missed = std::panic::catch_unwind(|| assert_complete("agents.proto", &proto, &table));
+    assert!(missed.is_err(), "an unclassified agents message must fail");
+}
+
+/// Every read-version slice in the table that belongs to a reader THIS crate owns
+/// is the closed set that reader's own `MIN_READ_VERSION..=MAX_READ_VERSION`
+/// constants define. Widening a gate without updating the table therefore fails
+/// here, which is the point: a table that merely restated the constants would
+/// track any change silently and guard nothing.
+///
+/// The six messages absent from this list are read outside ravel-catalog
+/// (ravel-fleet, ravel-maintain, ravel-server, ravel-ingest). Asserting their
+/// slices against their constants would need a dev-dependency on each of those
+/// crates, so their entries stay literal and are maintained by hand.
+#[test]
+fn catalog_read_sets_match_their_readers_constants() {
+    use ravel_catalog as cat;
+
+    let expected: BTreeMap<&'static str, Vec<u32>> = BTreeMap::from([
+        (
+            "ProvisioningRecord",
+            (cat::PROVISIONING_MIN_READ_VERSION..=cat::PROVISIONING_MAX_READ_VERSION).collect(),
+        ),
+        (
+            "CompatRecord",
+            (cat::COMPAT_MIN_READ_VERSION..=cat::COMPAT_MAX_READ_VERSION).collect(),
+        ),
+        (
+            "TenantConfigRecord",
+            (cat::TENANT_CONFIG_MIN_READ_VERSION..=cat::TENANT_CONFIG_MAX_READ_VERSION).collect(),
+        ),
+        (
+            "MetricMetadataRecord",
+            (cat::METRICS_META_MIN_READ_VERSION..=cat::METRICS_META_MAX_READ_VERSION).collect(),
+        ),
+        (
+            "AuthTokenMap",
+            (cat::AUTH_TOKEN_MAP_MIN_READ_VERSION..=cat::AUTH_TOKEN_MAP_MAX_READ_VERSION).collect(),
+        ),
+        (
+            "KeyEpochRecord",
+            (cat::KEY_EPOCH_MIN_READ_VERSION..=cat::KEY_EPOCH_MAX_READ_VERSION).collect(),
+        ),
+    ]);
+
+    let table = classification_table();
+    for (name, versions) in expected {
+        let class = table
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} must be classified"));
+        let listed = match class {
+            Class::CasMutable(v) | Class::Immutable(v) => *v,
+        };
+        assert_eq!(
+            listed,
+            versions.as_slice(),
+            "{name}: the table's read set disagrees with its reader's MIN/MAX constants. \
+             A widened gate must be recorded here too (ADR-0066 decision 4)."
+        );
+    }
+}
+
+/// Every CasMutable supported set is non-empty and includes version 1 (the
+/// original floor); every Immutable record reads exactly {1} today, except
+/// `WorkerHeartbeat`, which reads exactly {2} (ADR-3130 decision 2). Pins the
+/// table's own shape so a typo (an empty set, a missing 1) cannot pass. The
+/// agents table is held to the same shape: every agents record reads {1}.
+#[test]
+fn classification_table_is_well_formed() {
+    for (name, class) in classification_table()
+        .into_iter()
+        .chain(agents_classification_table())
+    {
+        match class {
+            Class::CasMutable(versions) => {
+                assert!(!versions.is_empty(), "{name}: CasMutable set is empty");
+                assert!(
+                    versions.contains(&1),
+                    "{name}: supported set must include 1"
+                );
+            }
+            Class::Immutable(versions) => {
+                let expected: &[u32] = if name == "WorkerHeartbeat" {
+                    &[2]
+                } else {
+                    &[1]
+                };
+                assert_eq!(
+                    versions, expected,
+                    "{name}: an immutable record reads only {expected:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The guard bites: a fake versioned message appended to a COPY of the proto is
+/// enumerated and, because it is absent from the table, would fail
+/// `classification_is_complete`. Proves the enumeration actually detects a new
+/// message rather than trivially passing.
+#[test]
+fn a_new_versioned_message_is_detected_as_unclassified() {
+    let mut proto = sys_proto_text();
+    proto.push_str(
+        "\nmessage FutureThing {\n  uint32 format_version = 1;\n  bytes payload = 2;\n}\n",
+    );
+
+    let in_proto = messages_with_format_version(&proto);
+    assert!(
+        in_proto.contains("FutureThing"),
+        "the parser must enumerate a newly added versioned message"
+    );
+
+    let classified: BTreeSet<String> = classification_table()
+        .keys()
+        .map(|s| s.to_string())
+        .collect();
+    assert!(
+        !classified.contains("FutureThing"),
+        "the fake message must be absent from the table, so the completeness check would fail"
+    );
+    // And the completeness relation the real test asserts would now be violated.
+    assert!(
+        in_proto.difference(&classified).next().is_some(),
+        "an unclassified message must make the completeness difference non-empty"
+    );
+}

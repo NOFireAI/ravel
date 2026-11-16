@@ -1,0 +1,2416 @@
+//! Filter pushdown for the `logs` table, under the same pruning-soundness
+//! invariant the metrics pushdown obeys (crate::pushdown): pruning may only
+//! ever *widen* the read set relative to the query's true need, never narrow
+//! it. `LogsTableProvider::supports_filters_pushdown` returns `Inexact` for
+//! every filter except one it can prove the scan evaluates per row
+//! ([`filter_is_exact`]: a pure `ts` bound and/or `has_word` call, which the
+//! reader re-verifies, and a declared `Str` column's `<>` against a string
+//! literal, which the scan's row filter evaluates), so DataFusion re-applies
+//! every other original above the scan; exactness comes from that residual
+//! plus the scan re-applying nothing destructive.
+//!
+//! Recognized shapes (everything else contributes nothing and widens):
+//!
+//! - **ts range**: top-level AND conjuncts of the bare `ts` column compared to
+//!   a literal timestamp (`>=`, `>`, `<`, `<=`, `=`), and `BETWEEN`. Feeds
+//!   segment-level pruning and the fetch's [`LogQuery`] ts bounds, identical to
+//!   the metrics `ts_lo`/`ts_hi` shape.
+//! - **word/phrase search** `has_word(col, 'literal')` on `body` or
+//!   `severity_text`, pushed as [`Predicate::HasWord`].
+//! - **substring search** `col LIKE '%literal%'` and `col NOT LIKE
+//!   '%literal%'` on a declared `Str` column, pushed as
+//!   [`Predicate::Contains`]: see below.
+//!
+//! # How `LIKE '%literal%'` is pushed (ADR-2773, contains-arm amendment)
+//!
+//! The pushed arm is a byte-substring test, not a token test. ADR-0033 lists
+//! "literal extraction from plain `LIKE '%word%'` patterns... feeding
+//! `Predicate::HasWord`", and that form is **unsound**: `RlogReader::scan`
+//! applies a pushed `HasWord` as an exact per-row filter (reader.rs,
+//! `phrase_match`), and token/phrase matching is not a superset of SQL
+//! substring `LIKE`. The tokenizer lowercases and splits on non-alphanumerics,
+//! so `body LIKE '%time%'` matches `"timeout"` and `"TIME"` while
+//! `HasWord{word:"time"}` matches neither. `has_word`, whose SQL semantics are
+//! defined to equal `HasWord` exactly (crate::logs_udf), stays the token path.
+//!
+//! [`Predicate::Contains`] instead tests a declared `Str` cell's raw bytes for
+//! the literal's bytes, which for a UTF-8 cell and a UTF-8 literal is the
+//! character-wise substring match. The reader drops a row only when every
+//! reading of its value fails the pattern (the cell as UTF-8 text, and the
+//! stream's resource or scope value for the key, else NULL), and keeps a row
+//! whose value resolves through anything else (a winning occurrence of the
+//! key with another type, an `attrs_raw` cell), so it never drops a row the
+//! SQL `LIKE` keeps.
+//! The filter stays `Inexact` ([`filter_is_exact`] does not recognize `LIKE`):
+//! DataFusion's residual re-evaluates every row the scan returns.
+//!
+//! [`crate::like_udf::pushable_contains`] decides the pattern shape and lists
+//! what declines (`_`, an escape, an `ESCAPE` clause, an inner `%`, an
+//! anchored pattern, `ILIKE`, a non-literal pattern, `'%%'`). This module
+//! adds the column check: only a bare declared `Str` column pushes. `body`,
+//! `attrs['k']`, an undeclared name, and a declared column of another type
+//! contribute nothing, and so does a `LIKE` under `OR` or `NOT`, which is not
+//! a top-level conjunct.
+//!
+//! # How attribute equalities are pushed (prune-only)
+//!
+//! `attrs['k'] = 'v'` (lowered to `get_field(attrs, 'k') = 'v'`, either operand
+//! order) is extracted into the prune-only [`LogsPushdown::prune`] channel, not
+//! into `content`. `attrs` is the merged view: resource + scope + per-record
+//! attributes, the record winning on a key collision ([`crate::rlog_attrs`]).
+//! Two layers of the old gap are now closed:
+//!
+//! - Layer 1, the index. ADR-0049's POSTINGS section gives exact block-level
+//!   pruning on an indexed per-record attribute value.
+//! - Layer 2, the coupling. The prune channel drives that pruning without
+//!   feeding the reader's exact per-row filter. `RlogReader::scan_pruned` treats
+//!   a prune arm as a block prune only and never evaluates it per row. This
+//!   matters because the reader's per-record `Equals` resolves against a
+//!   record's own dynamic column and `attrs_raw` overflow only, never the
+//!   resource/scope blob, so it is a strict subset of the merged equality.
+//!   Pushing it as an exact filter drops a record whose match lives only in its
+//!   resource/scope attributes (resource `service.name = worker`, record
+//!   attribute `service.name = api`, query `= 'api'`); a prune cannot, because a
+//!   field the POSTINGS index does not cover prunes nothing (widen-only,
+//!   ADR-0013).
+//!
+//! The equality is therefore pruned but still evaluated exactly by DataFusion's
+//! `Inexact` residual over the merged `attrs` column ([`crate::logs_scan`]),
+//! which stays the sole exact evaluator. Nothing changes about which rows the
+//! query returns; only which blocks the fetch must read.
+//!
+//! `attrs['k'] IN (...)` stays unextracted. An `IN` list is a disjunction, and
+//! the prune channel intersects its arms, so a sound disjunctive prune needs a
+//! different shape. It contributes nothing to either channel.
+//!
+//! The `attrs['k']` subscript *syntax* plans through the hand-written
+//! `crate::map_field_planner` `ExprPlanner`; the older note that it
+//! failed planning under `features = ["sql"]` is closed.
+//!
+//! # How declared typed columns are pushed (prune-only, ADR-0093)
+//!
+//! A tenant may *declare* an attribute key as a native typed column (ADR-0090),
+//! so a query reads `status_code = 500` against a real `Int64`/`Boolean`/
+//! `Binary`/dictionary Arrow column rather than `attrs['status_code'] = '500'`
+//! over the stringified map. A bare `Expr::Column` whose name is not one of the
+//! nine fixed `logs` columns ([`crate::logs_schema`]) is resolved against the
+//! tenant's declared vocabulary ([`crate::declared`]) and, on a match, dispatched
+//! by its [`DeclaredType`] into the same two prune primitives the `attrs`/`ts`
+//! shapes already feed. This is an **allowlist**, not a best-effort translation:
+//! only the shapes below are extracted, and every other shape declines exactly
+//! as an undeclared column would (declining to prune is always widen-safe).
+//!
+//! - `I64`/`Bool` + `<`,`<=`,`>`,`>=`,`=`, or `BETWEEN`, against a literal whose
+//!   `ScalarValue` type exactly matches the declared type -> a
+//!   [`Predicate::NumRange`] with bit-pattern bounds ([`ravel_logseg::block`]'s
+//!   `NumStat` encoding: an `i64` as its two's-complement `u64`, a `bool` as
+//!   `0`/`1`). This drives `SkipIndex::candidate_blocks` (#331); it carries no
+//!   POSTINGS version gate.
+//! - `I64` + `IN (v1, v2, ...)` -> ONE envelope `NumRange` spanning
+//!   `[min(vs), max(vs)]`, never one arm per value. `Predicate` has no
+//!   disjunction and the reader intersects arms, so a per-value arm would prove
+//!   some block disjoint that the full `IN` does not, silently dropping rows. The
+//!   envelope is deliberately coarser (it also spans values between the listed
+//!   ones); the `Inexact` residual excludes those, never the prune. The same
+//!   envelope is recognized in two forms: a literal `Expr::InList` (a large list)
+//!   and a same-column `col = v1 OR col = v2 OR ...` disjunction, which is what
+//!   DataFusion's simplifier rewrites a *small* `IN` into before the scan ever
+//!   sees it. A disjunction across different columns, or of any non-equality
+//!   shape, is not a representable single range and declines (widen-safe).
+//! - `Str`/`Bytes` + `=`, against a matching-type literal ->
+//!   [`Predicate::Equals`] on `FieldSel::Attr`, byte-identical to the
+//!   `attrs['k'] = 'v'` predicate, feeding POSTINGS. `Str`/`Bytes` `IN (...)` is
+//!   not extracted (a disjunction, as above).
+//! - `I64` + `<>` (either operand order), against an `Int64` literal ->
+//!   [`Predicate::NumNotEq`], prune-only like `NumRange`: a block whose stat
+//!   has `min == max == value` holds no row the comparison keeps (ADR-0095,
+//!   prune-only not-equal amendment). The filter stays `Inexact`.
+//! - `Str` + `<>` (either operand order), against a non-NULL `Utf8`,
+//!   `Utf8View` or `Dictionary(Int32, Utf8)` literal -> the expression itself,
+//!   in [`LogsPushdown::row_filters`]; see the next section.
+//! - Anything else -- `!=` on a `Bool` or `Bytes` column, `NOT`, a negated `BETWEEN`, `IS [NOT] NULL`, a
+//!   general `OR` (anything but the same-column I64 equality union above), a
+//!   range operator on a `Str`/`Bytes` column, or a literal whose type does not
+//!   match the declared type (including a `Cast`-wrapped operand DataFusion's own
+//!   coercion may have inserted, which is no longer a bare `Expr::Column` and so
+//!   fails resolution) -- is not extracted. A mismatched literal is never coerced
+//!   to fit.
+//!
+//! Two soundness caveats are inherited unchanged, not introduced here. The
+//! equality half inherits the POSTINGS-section-version decline (a section written
+//! before the #333 fix declines all equality pruning) and the over-conservative
+//! "a name that also carries a non-`Str` column declines entirely" rule from the
+//! existing `attrs['k']='v'` path. The `NumRange` half has neither: under
+//! ADR-0095's single-version RLOG regime every stat is merged-view-correct, and
+//! an absent stat is "no information", never "no match" (ADR-0013), so an object
+//! predating the column's declaration falls through and is scanned, not pruned.
+//!
+//! # A declared `Str` column's `<>` (ADR-0093, exact not-equal amendment)
+//!
+//! `c <> v`, with `c` a bare declared `Str` column and `v` a non-NULL string
+//! literal, goes to [`LogsPushdown::row_filters`] unchanged. No prune arm and
+//! no key comes from it. The scan builds DataFusion's own physical expression
+//! for it and applies it to each batch after the column build, so it sees the
+//! value SQL sees, resource or scope fallback included
+//! (`crate::logs_scan::row_filter`). [`filter_is_exact`] answers `true` for
+//! the shape, so the provider reports it `Exact` and DataFusion keeps no
+//! `FilterExec` for it; a filter that holds it beside an unrecognized
+//! sub-expression in one unsplit `Expr` stays `Inexact`.
+//! `str_not_equal_goes_to_row_filters_only` pins what is accepted and what is
+//! not; `answers_match_the_residual_on_every_value_shape`
+//! (`tests/logs_str_not_equal_row_filter.rs`) pins that the scan drops exactly
+//! the rows the `FilterExec` of a provider with the row filter off drops.
+//!
+//! # Exact-key equalities (tier-1 KEY_IDX probe, ADR-2707 decision 5)
+//!
+//! The same `=` comparisons also feed [`LogsPushdown::key_equals`], beside the
+//! prune arm above: a bare declared `I64` column against an `Int64` literal, a
+//! bare declared `Str` column against a UTF-8 literal (bare or in the
+//! `Dictionary` scalar the column's coercion wraps it in), a bare declared
+//! `Bytes` column against a binary literal, and the fixed `trace_id` column
+//! against a 16-byte binary literal (`FixedSizeBinary(16)` after the column's
+//! coercion). Either operand order is recognized. A negation, a
+//! `Cast`-wrapped column, a `Bool` column, any other operator, and a literal of
+//! another type contribute nothing. A key is kept only for a field the
+//! tenant's [`KeyIndexDeclaration`] names (a declared column in its
+//! `key_index` declaration, or `trace_id` with `index_trace_id` on), so a
+//! column declared without `key_index` yields no key and costs no KEY_IDX
+//! read. The plan probes each candidate object's KEY_IDX section with the
+//! kept keys; an object whose section does not index the field under that
+//! key type declines for that key. An equality under `OR` is no equality
+//! arm; a same-column disjunction of equalities is read as an `IN` list
+//! below.
+//!
+//! # Exact-key `IN` lists (ADR-3692 decision 6)
+//!
+//! A top-level `column IN (v1, ..., vn)` feeds [`LogsPushdown::key_in`]: a
+//! declared key-index I64/Str/Bytes column against literals of exactly its
+//! type, read as the equality arm reads one, or `trace_id` against 16-byte
+//! binary or 32-character hex literals when `index_trace_id` is set. One
+//! field, 1 to 1,024 distinct values. A `NOT IN`, a mixed-type list, a list
+//! holding a NULL or an expression, more than 1,024 distinct values, and a
+//! list nested under `OR` carry no key; a declared I64 list keeps its envelope
+//! `NumRange` arm either way. The first such list of the conjunction is
+//! kept; a second contributes nothing. DataFusion rewrites a list of at most
+//! three values into `=` disjuncts before the scan sees it (one value into a
+//! plain `=`, which is an equality arm). A top-level `OR` whose every arm, at
+//! any nesting, is `=` between one bare column and a literal is read as the
+//! `IN` list of those literals, through the same validation, so it carries
+//! the list's key set (`a_two_value_key_disjunction_is_a_key_set`). An arm on
+//! a second column, a non-equality arm, or a literal the list would refuse
+//! leaves the disjunction without a key
+//! (`a_disjunction_across_two_key_columns_carries_no_key`,
+//! `a_non_equality_arm_carries_no_key`).
+//! The arm is `Inexact`: the residual re-applies the list over full values.
+//!
+//! A row whose attribute is stored under another type than the declared one
+//! is never indexed for the field, and is never matched by the SQL comparison
+//! either: the declared column reads such a row as NULL, with no cast
+//! (ADR-0090 decision 7), so dropping its block cannot drop a matching row.
+//!
+//! F64 is out of scope (no `DeclaredType::F64` exists yet). The dispatch is one
+//! `match` on [`DeclaredType`], so F64 is a one-arm addition once its plumbing
+//! lands -- but that arm MUST honor [`Predicate::NumRange`]'s float contract:
+//! widen a zero-including range across both `0.0`/`-0.0` bit patterns, never
+//! build a bound from a NaN literal, and leave a NaN-polluted block to the
+//! reader rather than trying to prune around it here -- the extractor has no
+//! per-block `has_nan` to consult, only the predicate, so it is
+//! `ravel_logseg::skip_index::stat_disjoint` that must decline to prune a
+//! block whose f64 stat carries `has_nan`, unconditionally, before it ever
+//! applies this arm's bounds. The I64/Bool code here honors none of this,
+//! because neither case is reachable for an integer or boolean literal.
+
+use datafusion::arrow::datatypes::DataType;
+use datafusion::logical_expr::expr::InList;
+use datafusion::logical_expr::{Between, BinaryExpr, Expr, Operator};
+use datafusion::scalar::ScalarValue;
+use ravel_logseg::key_index::{KeyType, TRACE_ID_FIELD, key8_bytes, key8_i64, key8_id16, key8_str};
+use ravel_logseg::{AttrValue, FieldSel, FieldType, Predicate};
+use ravel_query::{KeyEquals, KeyIn};
+
+use crate::declared::{DeclaredColumn, DeclaredType, KeyIndexDeclaration};
+use crate::like_udf::pushable_contains;
+use crate::logs_udf::HAS_WORD_UDF;
+use crate::spans_pushdown::hex_trace_id_literal;
+
+/// The scalar UDF name an `attrs['k']` subscript lowers to
+/// ([`crate::map_field_planner`]).
+const GET_FIELD_UDF: &str = "get_field";
+
+/// Everything the extractor pulled out of a `logs` filter set, all widen-only.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct LogsPushdown {
+    /// Inclusive lower bound on `ts` in nanoseconds, if provably required.
+    pub ts_lo: Option<i64>,
+    /// Inclusive upper bound on `ts` in nanoseconds, if provably required.
+    pub ts_hi: Option<i64>,
+    /// Content predicates handed straight to `RlogReader::scan` as the per-row
+    /// filter: `has_word` as [`Predicate::HasWord`], whose semantics equal the
+    /// SQL call, and `LIKE '%literal%'` on a declared `Str` column as
+    /// [`Predicate::Contains`], which never drops a row the SQL `LIKE` keeps.
+    pub content: Vec<Predicate>,
+    /// Prune-only attribute equalities (`attrs['k'] = 'v'`), each a
+    /// `Predicate::Equals` on `FieldSel::Attr`. These drive POSTINGS block
+    /// pruning in `RlogReader::scan_pruned` and nothing else. They are never fed
+    /// to `content`: the reader's per-record `Equals` is a strict subset of the
+    /// merged-view SQL equality, so evaluating one exactly would drop a
+    /// resource/scope-only match. The merged residual stays the sole exact
+    /// evaluator, so pushdown stays `Inexact`. See the module doc.
+    pub prune: Vec<Predicate>,
+    /// Prune-only exact-key equalities for the tier-1 KEY_IDX probe (ADR-2707
+    /// decision 5): a declared I64/Str/Bytes column `=` a literal of exactly
+    /// its type, and `trace_id` `=` a 16-byte literal. Like `prune`, they only
+    /// narrow which blocks are read; see the module doc.
+    pub key_equals: Vec<KeyEquals>,
+    /// A prune-only exact-key `IN` list for the KEY_IDX probe and the tier-2
+    /// router (ADR-3692 decision 6): a declared I64/Str/Bytes key-index
+    /// column `IN` literals of exactly its type, or `trace_id IN` 16-byte or
+    /// 32-hex literals, 1 to 1,024 distinct values. The first such list of
+    /// the conjunction is kept; see the module doc.
+    pub key_in: Option<KeyIn>,
+    /// Top-level conjuncts `c <> v` (either operand order) with `c` a bare
+    /// declared `Str` column and `v` a non-NULL string literal, kept as the
+    /// logical expression DataFusion handed the provider. The scan evaluates
+    /// them on each batch it builds, after the column build (ADR-0093, exact
+    /// not-equal amendment); the reader never sees them. See the module doc.
+    pub row_filters: Vec<Expr>,
+}
+
+impl LogsPushdown {
+    /// The inclusive lower ts bound for the fetch's [`LogQuery`]: the extracted
+    /// bound, or `i64::MIN` when none was proven (scan everything).
+    pub fn ts_min(&self) -> i64 {
+        self.ts_lo.unwrap_or(i64::MIN)
+    }
+
+    /// The inclusive upper ts bound for the fetch's [`LogQuery`]: the extracted
+    /// bound, or `i64::MAX` when none was proven.
+    pub fn ts_max(&self) -> i64 {
+        self.ts_hi.unwrap_or(i64::MAX)
+    }
+}
+
+/// Whether `prune` holds no arm but [`Predicate::NumNotEq`], so it counts as
+/// empty for the metadata-only aggregate rewrite and the `.cstat` load that
+/// feeds it. That rewrite replaces the whole scan, so what the arm prunes
+/// cannot change its answer. The scan's route choice reads it the same way
+/// (`logs_scan::route_predicate_free`), beside
+/// [`content_is_route_neutral`]. Any other arm answers `false`.
+pub(crate) fn prune_is_rewrite_neutral(prune: &[Predicate]) -> bool {
+    prune
+        .iter()
+        .all(|p| matches!(p, Predicate::NumNotEq { .. }))
+}
+
+/// Whether `content` holds no arm but [`Predicate::Contains`], so the scan's
+/// route choice (`logs_scan::route_predicate_free`) counts it as empty. No
+/// index covers a `Contains` arm, so it excludes no block from a plan phase
+/// or an open: the reader evaluates it per row of every block on every route
+/// (ADR-2773, contains-arm amendment). Any other arm answers `false`; a
+/// `HasWord` or `Equals` arm can exclude a block through bloom or POSTINGS.
+pub(crate) fn content_is_route_neutral(content: &[Predicate]) -> bool {
+    content
+        .iter()
+        .all(|p| matches!(p, Predicate::Contains { .. }))
+}
+
+/// Extract all sound pushdown from a `logs` filter set. Each element of
+/// `filters` is an implicit top-level AND conjunct; nested `AND`s are split too.
+///
+/// `declared` is the tenant's declared typed attribute columns (ADR-0090),
+/// resolved once per plan by `SqlExecutor` and threaded down. An empty slice
+/// reproduces the pre-ADR-0093 behavior exactly: a bare `Expr::Column` resolves
+/// against nothing, so only the `ts`/`attrs`/`has_word` shapes are extracted.
+///
+/// No field is treated as KEY_IDX-indexed, so `key_equals` is always empty;
+/// [`extract_logs_keyed`] is the form that takes the tenant's declaration.
+pub fn extract_logs(filters: &[Expr], declared: &[DeclaredColumn]) -> LogsPushdown {
+    extract_logs_keyed(filters, declared, &KeyIndexDeclaration::default())
+}
+
+/// [`extract_logs`], keeping in `key_equals` only the equalities on a field
+/// `key_index` names: a declared column in its `columns`, or `trace_id` when
+/// its `trace_id` is set. Every other channel is identical to
+/// [`extract_logs`].
+pub fn extract_logs_keyed(
+    filters: &[Expr],
+    declared: &[DeclaredColumn],
+    key_index: &KeyIndexDeclaration,
+) -> LogsPushdown {
+    let mut out = LogsPushdown::default();
+    for f in filters {
+        walk_conjunct(f, &mut out, declared);
+        collect_key_in(f, &mut out, declared, key_index);
+    }
+    out.key_equals.retain(|k| {
+        if k.field == TRACE_ID_FIELD {
+            key_index.trace_id
+        } else {
+            key_index.columns.contains(&k.field)
+        }
+    });
+    out
+}
+
+/// Whether `filter` is captured EXACTLY by the ts and content channels, with
+/// nothing left over for a residual to evaluate.
+///
+/// [`crate::logs_provider::LogsTableProvider::supports_filters_pushdown`]
+/// reports `TableProviderFilterPushDown::Exact` for exactly the filters this
+/// answers `true` for, which deletes them from the plan. So it fails closed:
+/// every conjunct of `filter` must be a shape whose pushed predicate is
+/// *equivalent* to it, not merely implied by it.
+///
+/// Three shapes qualify. Two because the reader re-verifies them per row
+/// (`ravel_logseg::reader`'s `eval`, its `Predicate::TsRange` and
+/// `Predicate::HasWord` arms both read the row's own value): a `ts` bound and a
+/// `has_word(col, 'literal')` call. The third is a declared `Str` column's
+/// `<>` against a non-NULL string literal ([`LogsPushdown::row_filters`]),
+/// because the scan evaluates DataFusion's own expression for it on every
+/// batch it builds (ADR-0093, exact not-equal amendment). Everything routed to
+/// the prune-only [`LogsPushdown::prune`] channel or to
+/// [`LogsPushdown::key_equals`], and everything not recognized at all, answers
+/// `false` (`str_not_equal_is_exact_and_nothing_near_it_is`).
+///
+/// A caller that does not hand the scan its row filters (a provider with
+/// them off, the distributed coordinator) must not report the third shape
+/// `Exact`; [`filter_has_row_filter`] tells it apart.
+pub fn filter_is_exact(filter: &Expr, declared: &[DeclaredColumn]) -> bool {
+    if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = filter
+        && *op == Operator::And
+    {
+        return filter_is_exact(left, declared) && filter_is_exact(right, declared);
+    }
+    leaf_is_exact(filter, declared)
+}
+
+/// Whether some conjunct of `filter` goes to [`LogsPushdown::row_filters`]:
+/// the part of [`filter_is_exact`]'s answer that holds only when the scan
+/// receives and evaluates its row filters.
+pub fn filter_has_row_filter(filter: &Expr, declared: &[DeclaredColumn]) -> bool {
+    !extract_logs(std::slice::from_ref(filter), declared)
+        .row_filters
+        .is_empty()
+}
+
+/// [`filter_is_exact`] for one non-`AND` conjunct. The extraction is
+/// [`handle_leaf`] itself and the shapes are recognized with the same primitives
+/// it dispatches on, so the two cannot disagree about what is recognized. What
+/// is added here is per-shape *completeness*: which channel field the shape must
+/// have populated for the pushed predicate to mean the whole leaf. A bound the
+/// extractor dropped (an overflowing `ts > <max literal>`, a `BETWEEN` with a
+/// non-timestamp edge) leaves its field `None`, so this answers `false` and the
+/// filter stays `Inexact`. A shape `handle_leaf` learns to recognize later also
+/// answers `false` until it is added here.
+fn leaf_is_exact(expr: &Expr, declared: &[DeclaredColumn]) -> bool {
+    let mut out = LogsPushdown::default();
+    handle_leaf(expr, &mut out, declared);
+    if !out.prune.is_empty() || !out.key_equals.is_empty() || out.key_in.is_some() {
+        return false;
+    }
+    match expr {
+        // A `ts` comparison denotes one bound, or two for `=`; all of them must
+        // have survived `apply_ts_bound`.
+        Expr::BinaryExpr(be) => match ts_comparison(be) {
+            Some((Operator::Eq, _)) => out.ts_lo.is_some() && out.ts_hi.is_some(),
+            Some((Operator::Gt | Operator::GtEq, _)) => out.ts_lo.is_some(),
+            Some((Operator::Lt | Operator::LtEq, _)) => out.ts_hi.is_some(),
+            Some(_) => false,
+            // The scan evaluates the whole leaf as its row filter.
+            None => is_str_not_equal(be, declared) && out.row_filters.len() == 1,
+        },
+        Expr::Between(bt) if !bt.negated && is_ts_col(&bt.expr) => {
+            out.ts_lo.is_some() && out.ts_hi.is_some()
+        }
+        Expr::ScalarFunction(sf) if sf.func.name() == HAS_WORD_UDF => !out.content.is_empty(),
+        _ => false,
+    }
+}
+
+/// The first top-level `IN` conjunct of `expr` that [`key_in_list`] reads,
+/// or the first `OR` conjunct [`key_in_disjunction`] reads, into
+/// [`LogsPushdown::key_in`] when it is still empty.
+fn collect_key_in(
+    expr: &Expr,
+    out: &mut LogsPushdown,
+    declared: &[DeclaredColumn],
+    key_index: &KeyIndexDeclaration,
+) {
+    if out.key_in.is_some() {
+        return;
+    }
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::And => {
+            collect_key_in(left, out, declared, key_index);
+            collect_key_in(right, out, declared, key_index);
+        }
+        Expr::InList(il) => out.key_in = key_in_list(il, declared, key_index),
+        Expr::BinaryExpr(be) if be.op == Operator::Or => {
+            out.key_in = key_in_disjunction(be, declared, key_index);
+        }
+        _ => {}
+    }
+}
+
+/// `col = v1 OR col = v2 [OR ...]`, at any nesting of `OR`, read by
+/// [`key_in_list`] as the `IN` list it is equal to: the shape DataFusion
+/// rewrites a list of at most three values into. `None` when an arm is not an
+/// `=` with a bare column on one side, or names another column than the first
+/// arm; [`key_in_list`] refuses every literal it would refuse in a list.
+fn key_in_disjunction(
+    be: &BinaryExpr,
+    declared: &[DeclaredColumn],
+    key_index: &KeyIndexDeclaration,
+) -> Option<KeyIn> {
+    let mut arms = Vec::new();
+    flatten_or(&be.left, &mut arms);
+    flatten_or(&be.right, &mut arms);
+    let mut column: Option<&Expr> = None;
+    let mut list = Vec::with_capacity(arms.len());
+    for arm in arms {
+        let Expr::BinaryExpr(eq) = arm else {
+            return None;
+        };
+        if eq.op != Operator::Eq {
+            return None;
+        }
+        let (c, v) = match (eq.left.as_ref(), eq.right.as_ref()) {
+            (c @ Expr::Column(_), v) | (v, c @ Expr::Column(_)) => (c, v),
+            _ => return None,
+        };
+        match column {
+            Some(first) if first != c => return None,
+            _ => column = Some(c),
+        }
+        list.push(v.clone());
+    }
+    let il = InList::new(Box::new(column?.clone()), list, false);
+    key_in_list(&il, declared, key_index)
+}
+
+/// `column IN (literals)` as a KEY_IDX key set: a declared key-index column
+/// against literals of exactly its declared type, or `trace_id` (when the
+/// declaration indexes it) against 16-byte binary or 32-hex literals. `None`
+/// for a `NOT IN`, an empty list, a list with any other element (a mixed-type
+/// list, a NULL, an expression), a column the declaration does not index,
+/// and a list of more than 1,024 distinct values: such a list carries no key,
+/// and the numeric envelope [`declared_in_list_predicate`] builds still
+/// applies.
+fn key_in_list(
+    il: &InList,
+    declared: &[DeclaredColumn],
+    key_index: &KeyIndexDeclaration,
+) -> Option<KeyIn> {
+    if il.negated || il.list.is_empty() {
+        return None;
+    }
+    let Expr::Column(col) = il.expr.as_ref() else {
+        return None;
+    };
+    if col.name == TRACE_ID_FIELD {
+        if !key_index.trace_id {
+            return None;
+        }
+        let keys = il
+            .list
+            .iter()
+            .map(|e| {
+                lit_id16(e)
+                    .or_else(|| hex_trace_id_literal(e))
+                    .map(|id| key8_id16(&id))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        return KeyIn::new(TRACE_ID_FIELD, KeyType::Id16, keys).ok();
+    }
+    let dc = resolve_declared(&il.expr, declared)?;
+    if !key_index.columns.contains(&dc.key) {
+        return None;
+    }
+    let (key_type, keys) = match dc.ty {
+        DeclaredType::I64 => (
+            KeyType::I64,
+            il.list
+                .iter()
+                .map(|e| lit_i64(e).map(key8_i64))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        DeclaredType::Str => (
+            KeyType::Str,
+            il.list
+                .iter()
+                .map(|e| match e {
+                    Expr::Literal(sv, _) => scalar_utf8(sv).map(|v| key8_str(&v)),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        DeclaredType::Bytes => (
+            KeyType::Bytes,
+            il.list
+                .iter()
+                .map(|e| lit_bytes(e).map(|b| key8_bytes(&b)))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        DeclaredType::Bool => return None,
+    };
+    KeyIn::new(dc.key.clone(), key_type, keys).ok()
+}
+
+fn walk_conjunct(expr: &Expr, out: &mut LogsPushdown, declared: &[DeclaredColumn]) {
+    if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr
+        && *op == Operator::And
+    {
+        walk_conjunct(left, out, declared);
+        walk_conjunct(right, out, declared);
+        return;
+    }
+    handle_leaf(expr, out, declared);
+}
+
+fn handle_leaf(expr: &Expr, out: &mut LogsPushdown, declared: &[DeclaredColumn]) {
+    match expr {
+        Expr::BinaryExpr(be) => handle_binary(be, out, declared),
+        Expr::Between(bt) if !bt.negated => {
+            // BETWEEN low AND high desugars to `ts >= low AND ts <= high`. A
+            // negated BETWEEN is an OR of two ranges: not sound to narrow.
+            if is_ts_col(&bt.expr) {
+                if let Some(lo) = lit_ts_ns(&bt.low) {
+                    tighten_lo(out, lo);
+                }
+                if let Some(hi) = lit_ts_ns(&bt.high) {
+                    tighten_hi(out, hi);
+                }
+            } else if let Some(p) = declared_between_predicate(bt, declared) {
+                out.prune.push(p);
+            }
+        }
+        // `col IN (v1, v2, ...)` is an `Expr::InList`, not a `BinaryExpr`, so it
+        // never flows through `handle_binary`; a declared I64 column's `IN` gets
+        // its own envelope-range arm here. The `attrs['k'] IN (...)` shape has a
+        // `get_field` (not a bare `Expr::Column`) subscript and so declines.
+        Expr::InList(il) if !il.negated => {
+            if let Some(p) = declared_in_list_predicate(il, declared) {
+                out.prune.push(p);
+            }
+        }
+        // A bare `has_word(col, 'literal')` boolean predicate.
+        Expr::ScalarFunction(sf) if sf.func.name() == HAS_WORD_UDF => {
+            if let Some(p) = has_word_predicate(&sf.args) {
+                out.content.push(p);
+            }
+        }
+        _ => {
+            if let Some(p) = contains_predicate(expr, declared) {
+                out.content.push(p);
+            }
+        }
+    }
+}
+
+/// `col [NOT] LIKE '%literal%'` on a declared `Str` column, as the reader's
+/// byte-substring [`Predicate::Contains`] arm (ADR-2773, contains-arm
+/// amendment). Any other column, fixed or undeclared or of another declared
+/// type, yields nothing.
+fn contains_predicate(expr: &Expr, declared: &[DeclaredColumn]) -> Option<Predicate> {
+    let like = pushable_contains(expr)?;
+    let dc = resolve_declared(like.column, declared)?;
+    (dc.ty == DeclaredType::Str).then(|| Predicate::Contains {
+        key: dc.key.clone(),
+        needle: like.needle,
+        negated: like.negated,
+    })
+}
+
+fn handle_binary(be: &BinaryExpr, out: &mut LogsPushdown, declared: &[DeclaredColumn]) {
+    // ts vs literal timestamp comparison (either operand order).
+    if let Some((op, ts_ns)) = ts_comparison(be) {
+        apply_ts_bound(out, op, ts_ns);
+        return;
+    }
+    // An exact-key equality feeds the KEY_IDX probe alongside whatever prune
+    // arm the same comparison builds below.
+    if let Some(k) = key_equality(be, declared) {
+        out.key_equals.push(k);
+    }
+    // A merged-attribute equality `attrs['k'] = 'v'` feeds the prune-only
+    // channel. It never becomes a content predicate: the reader would evaluate
+    // it against per-record attributes only, a strict subset of the merged view,
+    // and drop resource/scope-only matches (see the module doc).
+    if let Some(p) = attr_equality_predicate(be) {
+        out.prune.push(p);
+        return;
+    }
+    // A declared Str column's `<>` against a string literal goes to the
+    // scan's own row filter channel, not to the reader.
+    if is_str_not_equal(be, declared) {
+        out.row_filters.push(Expr::BinaryExpr(be.clone()));
+        return;
+    }
+    // A comparison against a declared typed column (ADR-0093). Resolved only for
+    // a non-fixed column name; dispatched by declared type into the same
+    // prune-only NumRange/Equals primitives.
+    if let Some(p) = declared_comparison_predicate(be, declared) {
+        out.prune.push(p);
+        return;
+    }
+    // A same-column I64 disjunction of equalities: how DataFusion's simplifier
+    // delivers a small `col IN (v1, v2, ...)`, expanded to
+    // `col = v1 OR col = v2 OR ...` before the scan sees it. It reduces to the
+    // same one envelope range the `Expr::InList` arm builds (see the module
+    // doc's IN note). A disjunct on any other column or of any other shape
+    // declines the whole OR (widen-safe).
+    if let Some(p) = declared_i64_or_envelope(be, declared) {
+        out.prune.push(p);
+    }
+}
+
+// --- declared typed column extraction (ADR-0093) ------------------------------
+
+/// The nine fixed `logs` schema columns ([`crate::logs_schema::logs_schema`]).
+/// A bare `Expr::Column` naming one of these is handled by the fixed-column path
+/// (`ts` ranges, `body` and `severity_text` word predicates, and `trace_id`
+/// keys extract today) and is NEVER resolved against declared
+/// columns, even if a tenant also happens to declare a column of the same name:
+/// the fixed schema always wins, per ADR-0093's resolution-order guard.
+const FIXED_LOG_COLUMNS: [&str; 9] = [
+    "ts",
+    "observed_ts",
+    "severity_num",
+    "severity_text",
+    "body",
+    "trace_id",
+    "span_id",
+    "flags",
+    "attrs",
+];
+
+fn is_fixed_log_column(name: &str) -> bool {
+    FIXED_LOG_COLUMNS.contains(&name)
+}
+
+/// The declared column a bare, non-fixed `Expr::Column` resolves to, or `None`
+/// for a fixed name, a non-column expression (including a `Cast`-wrapped
+/// column), or a name outside the tenant's declared vocabulary.
+fn resolve_declared<'a>(e: &Expr, declared: &'a [DeclaredColumn]) -> Option<&'a DeclaredColumn> {
+    let Expr::Column(c) = e else {
+        return None;
+    };
+    if is_fixed_log_column(&c.name) {
+        return None;
+    }
+    declared.iter().find(|d| d.key == c.name)
+}
+
+/// A comparison (`<`, `<=`, `>`, `>=`, `=`, either operand order) against a
+/// declared typed column, resolved to a prune-only [`Predicate`]. Range
+/// operators on `Str`/`Bytes`, any negation, and a type-mismatched literal all
+/// decline (return `None`), per ADR-0093's allowlist. `<>` on a declared I64
+/// column is the one exception: it resolves to [`Predicate::NumNotEq`]
+/// (ADR-0095, prune-only not-equal amendment).
+fn declared_comparison_predicate(
+    be: &BinaryExpr,
+    declared: &[DeclaredColumn],
+) -> Option<Predicate> {
+    // Orient the comparison so `op`/`lit` describe `column op literal`.
+    let (dc, op, lit) = if let Some(dc) = resolve_declared(&be.left, declared) {
+        (dc, be.op, be.right.as_ref())
+    } else {
+        let dc = resolve_declared(&be.right, declared)?;
+        let op = match be.op {
+            Operator::NotEq => Operator::NotEq,
+            op => flip_op(op)?,
+        };
+        (dc, op, be.left.as_ref())
+    };
+    match dc.ty {
+        DeclaredType::I64 => {
+            let v = lit_i64(lit)?;
+            if op == Operator::NotEq {
+                return Some(Predicate::NumNotEq {
+                    field: FieldSel::Attr(dc.key.clone()),
+                    value: v,
+                });
+            }
+            let (min, max) = int_range_bounds(op, v)?;
+            Some(num_range(&dc.key, FieldType::I64, min, max))
+        }
+        DeclaredType::Bool => {
+            let b = lit_bool(lit)?;
+            let (min, max) = int_range_bounds(op, b as i64)?;
+            Some(num_range(&dc.key, FieldType::Bool, min, max))
+        }
+        DeclaredType::Str => {
+            let value = str_eq_value(op, lit)?;
+            Some(Predicate::Equals {
+                field: FieldSel::Attr(dc.key.clone()),
+                value,
+            })
+        }
+        DeclaredType::Bytes => {
+            let value = bytes_eq_value(op, lit)?;
+            Some(Predicate::Equals {
+                field: FieldSel::Attr(dc.key.clone()),
+                value,
+            })
+        }
+    }
+}
+
+/// An `=` (either operand order) the tier-1 KEY_IDX probe can answer: a bare
+/// declared I64/Str/Bytes column against a literal of exactly its type, or the
+/// fixed `trace_id` column against a 16-byte binary literal. Any other operator,
+/// a `Cast`-wrapped column, a declared Bool column, and a literal of another
+/// type all decline. Whether an object actually indexes the field is its
+/// KEY_IDX header's answer, read by the probe.
+fn key_equality(be: &BinaryExpr, declared: &[DeclaredColumn]) -> Option<KeyEquals> {
+    if be.op != Operator::Eq {
+        return None;
+    }
+    let (col, lit) = match (&*be.left, &*be.right) {
+        (Expr::Column(c), lit) | (lit, Expr::Column(c)) => (c, lit),
+        _ => return None,
+    };
+    if col.name == TRACE_ID_FIELD {
+        let id = lit_id16(lit)?;
+        return Some(KeyEquals::new(
+            TRACE_ID_FIELD,
+            KeyType::Id16,
+            key8_id16(&id),
+        ));
+    }
+    let dc = resolve_declared(&Expr::Column(col.clone()), declared)?;
+    let (key_type, key8) = match dc.ty {
+        DeclaredType::I64 => (KeyType::I64, key8_i64(lit_i64(lit)?)),
+        DeclaredType::Str => {
+            let Expr::Literal(sv, _) = lit else {
+                return None;
+            };
+            (KeyType::Str, key8_str(&scalar_utf8(sv)?))
+        }
+        DeclaredType::Bytes => (KeyType::Bytes, key8_bytes(&lit_bytes(lit)?)),
+        DeclaredType::Bool => return None,
+    };
+    Some(KeyEquals::new(dc.key.clone(), key_type, key8))
+}
+
+/// A 16-byte binary literal: the `FixedSizeBinary(16)` the `trace_id` column
+/// coerces to, or a plain binary literal of exactly 16 bytes.
+fn lit_id16(e: &Expr) -> Option<[u8; 16]> {
+    let bytes = match e {
+        Expr::Literal(ScalarValue::FixedSizeBinary(16, Some(b)), _) => b.as_slice(),
+        Expr::Literal(ScalarValue::Binary(Some(b)), _)
+        | Expr::Literal(ScalarValue::LargeBinary(Some(b)), _)
+        | Expr::Literal(ScalarValue::BinaryView(Some(b)), _) => b.as_slice(),
+        _ => return None,
+    };
+    <[u8; 16]>::try_from(bytes).ok()
+}
+
+/// `col BETWEEN low AND high` (non-negated) against a declared I64/Bool column ->
+/// an inclusive [`Predicate::NumRange`]. `Str`/`Bytes` decline (POSTINGS is an
+/// equality index, no ordered range). Both bounds must be matching-type literals,
+/// or the whole shape declines.
+fn declared_between_predicate(bt: &Between, declared: &[DeclaredColumn]) -> Option<Predicate> {
+    let dc = resolve_declared(&bt.expr, declared)?;
+    let (ty, lo, hi) = match dc.ty {
+        DeclaredType::I64 => (FieldType::I64, lit_i64(&bt.low)?, lit_i64(&bt.high)?),
+        DeclaredType::Bool => (
+            FieldType::Bool,
+            lit_bool(&bt.low)? as i64,
+            lit_bool(&bt.high)? as i64,
+        ),
+        DeclaredType::Str | DeclaredType::Bytes => return None,
+    };
+    Some(num_range(&dc.key, ty, Some(lo), Some(hi)))
+}
+
+/// `col IN (v1, v2, ...)` (non-negated) against a declared I64 column -> ONE
+/// envelope [`Predicate::NumRange`] spanning `[min(vs), max(vs)]`. Bool/Str/Bytes
+/// `IN` and an empty list decline; any non-`Int64` member declines the whole
+/// shape (an unreadable member could match a real row, so a partial envelope
+/// would be unsound). See the module doc for why this is one range, not one per
+/// value.
+fn declared_in_list_predicate(il: &InList, declared: &[DeclaredColumn]) -> Option<Predicate> {
+    let dc = resolve_declared(&il.expr, declared)?;
+    if dc.ty != DeclaredType::I64 || il.list.is_empty() {
+        return None;
+    }
+    let mut lo = i64::MAX;
+    let mut hi = i64::MIN;
+    for e in &il.list {
+        let v = lit_i64(e)?;
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    Some(num_range(&dc.key, FieldType::I64, Some(lo), Some(hi)))
+}
+
+/// An `OR`-rooted conjunct recognized as `col = v1 OR col = v2 OR ...` on ONE
+/// declared I64 column -> the same envelope [`Predicate::NumRange`] the
+/// `Expr::InList` arm builds. This is the shape DataFusion's simplifier rewrites
+/// a small `col IN (...)` into before the scan. `None` unless the expr is an
+/// `OR` whose every disjunct is an equality on the *same* declared I64 column
+/// against an exact `Int64` literal: a cross-column or non-equality disjunct
+/// makes the union unrepresentable as one range, so the whole OR declines
+/// (declining to prune is widen-safe).
+fn declared_i64_or_envelope(be: &BinaryExpr, declared: &[DeclaredColumn]) -> Option<Predicate> {
+    if be.op != Operator::Or {
+        return None;
+    }
+    let mut disjuncts = Vec::new();
+    flatten_or(&be.left, &mut disjuncts);
+    flatten_or(&be.right, &mut disjuncts);
+
+    let mut name: Option<&str> = None;
+    let mut lo = i64::MAX;
+    let mut hi = i64::MIN;
+    for d in disjuncts {
+        let (dc, v) = eq_i64_on_declared(d, declared)?;
+        match name {
+            Some(n) if n != dc.key => return None,
+            _ => name = Some(&dc.key),
+        }
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    let name = name?;
+    Some(num_range(name, FieldType::I64, Some(lo), Some(hi)))
+}
+
+/// Collect the leaf disjuncts of a (possibly nested) `OR` tree into `out`.
+fn flatten_or<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let Expr::BinaryExpr(be) = e
+        && be.op == Operator::Or
+    {
+        flatten_or(&be.left, out);
+        flatten_or(&be.right, out);
+    } else {
+        out.push(e);
+    }
+}
+
+/// `col = <Int64 literal>` (either operand order) on a declared I64 column ->
+/// the column and value, or `None` for any other shape.
+fn eq_i64_on_declared<'a>(
+    e: &Expr,
+    declared: &'a [DeclaredColumn],
+) -> Option<(&'a DeclaredColumn, i64)> {
+    let Expr::BinaryExpr(be) = e else {
+        return None;
+    };
+    if be.op != Operator::Eq {
+        return None;
+    }
+    let (dc, v) = if let Some(dc) = resolve_declared(&be.left, declared) {
+        (dc, lit_i64(&be.right)?)
+    } else {
+        let dc = resolve_declared(&be.right, declared)?;
+        (dc, lit_i64(&be.left)?)
+    };
+    if dc.ty != DeclaredType::I64 {
+        return None;
+    }
+    Some((dc, v))
+}
+
+/// The inclusive `[min, max]` bounds an integer comparison denotes, in i64
+/// space, or `None` for an operator outside the allowlist or a bound that would
+/// overflow (declining is widen-safe). Applies to Bool too, via its `0`/`1`
+/// mapping.
+fn int_range_bounds(op: Operator, v: i64) -> Option<(Option<i64>, Option<i64>)> {
+    Some(match op {
+        Operator::Eq => (Some(v), Some(v)),
+        Operator::GtEq => (Some(v), None),
+        Operator::Gt => (Some(v.checked_add(1)?), None),
+        Operator::LtEq => (None, Some(v)),
+        Operator::Lt => (None, Some(v.checked_sub(1)?)),
+        _ => return None,
+    })
+}
+
+/// Build a prune-only [`Predicate::NumRange`] on `name`, encoding the inclusive
+/// i64-space bounds as the two's-complement `u64` bit pattern
+/// [`ravel_logseg::block`]'s `NumStat` stores (for `Bool`, the `0`/`1` mapping is
+/// already the identity under this cast).
+fn num_range(name: &str, ty: FieldType, min: Option<i64>, max: Option<i64>) -> Predicate {
+    Predicate::NumRange {
+        field: FieldSel::Attr(name.to_string()),
+        ty,
+        min: min.map(|v| v as u64),
+        max: max.map(|v| v as u64),
+    }
+}
+
+/// The `AttrValue::Str` value of an `= 'literal'` comparison on a declared Str
+/// column, or `None` for any non-`=` operator or non-string literal. A declared
+/// Str column is Arrow `Dictionary(Int32, Utf8)` (ADR-0099), so DataFusion's
+/// type coercion wraps the compared literal in a `Dictionary` scalar; unwrap it
+/// to the same UTF-8 the POSTINGS `Equals` predicate keys on.
+fn str_eq_value(op: Operator, lit: &Expr) -> Option<AttrValue> {
+    if op != Operator::Eq {
+        return None;
+    }
+    let Expr::Literal(sv, _) = lit else {
+        return None;
+    };
+    Some(AttrValue::Str(scalar_utf8(sv)?))
+}
+
+/// Whether `be` is `c <> v` or `v <> c` with `c` a bare column resolving to a
+/// declared `Str` column (fixed names excluded, [`resolve_declared`]) and `v` a
+/// non-NULL `Utf8`, `Utf8View` or `Dictionary(Int32, Utf8)` literal, the shape
+/// [`LogsPushdown::row_filters`] carries (ADR-0093, exact not-equal
+/// amendment).
+fn is_str_not_equal(be: &BinaryExpr, declared: &[DeclaredColumn]) -> bool {
+    if be.op != Operator::NotEq {
+        return false;
+    }
+    let (column, value) = match resolve_declared(&be.left, declared) {
+        Some(dc) => (dc, be.right.as_ref()),
+        None => match resolve_declared(&be.right, declared) {
+            Some(dc) => (dc, be.left.as_ref()),
+            None => return false,
+        },
+    };
+    column.ty == DeclaredType::Str && matches!(value, Expr::Literal(sv, _) if is_str_literal(sv))
+}
+
+/// A non-NULL `Utf8` or `Utf8View` scalar, bare or inside the
+/// `Dictionary(Int32, Utf8)` scalar a declared `Str` column's coercion wraps a
+/// literal in.
+fn is_str_literal(sv: &ScalarValue) -> bool {
+    match sv {
+        ScalarValue::Utf8(Some(_)) | ScalarValue::Utf8View(Some(_)) => true,
+        ScalarValue::Dictionary(key, inner) => {
+            **key == DataType::Int32 && matches!(**inner, ScalarValue::Utf8(Some(_)))
+        }
+        _ => false,
+    }
+}
+
+/// The UTF-8 string a scalar carries, unwrapping a `Dictionary` scalar to its
+/// value (a declared Str column's coerced literal), or `None` for a non-string
+/// scalar.
+fn scalar_utf8(sv: &ScalarValue) -> Option<String> {
+    match sv {
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => Some(s.clone()),
+        ScalarValue::Dictionary(_, inner) => scalar_utf8(inner),
+        _ => None,
+    }
+}
+
+/// The `AttrValue::Bytes` value of an `= X'..'` comparison on a declared Bytes
+/// column, or `None` for any non-`=` operator or non-binary literal.
+fn bytes_eq_value(op: Operator, lit: &Expr) -> Option<AttrValue> {
+    if op != Operator::Eq {
+        return None;
+    }
+    Some(AttrValue::Bytes(lit_bytes(lit)?))
+}
+
+/// An i64 literal, exactly. Only `ScalarValue::Int64` matches: a narrower or
+/// wider integer type, or a float, is a type mismatch that declines rather than
+/// coerces (ADR-0093).
+fn lit_i64(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Literal(ScalarValue::Int64(Some(v)), _) => Some(*v),
+        _ => None,
+    }
+}
+
+/// A boolean literal, exactly.
+fn lit_bool(e: &Expr) -> Option<bool> {
+    match e {
+        Expr::Literal(ScalarValue::Boolean(Some(b)), _) => Some(*b),
+        _ => None,
+    }
+}
+
+/// A binary literal, in any of DataFusion's binary scalar shapes.
+fn lit_bytes(e: &Expr) -> Option<Vec<u8>> {
+    match e {
+        Expr::Literal(ScalarValue::Binary(Some(b)), _)
+        | Expr::Literal(ScalarValue::LargeBinary(Some(b)), _)
+        | Expr::Literal(ScalarValue::BinaryView(Some(b)), _) => Some(b.clone()),
+        _ => None,
+    }
+}
+
+/// `get_field(attrs, 'k') = 'v'` (either operand order) -> a prune-only
+/// [`Predicate::Equals`] on `FieldSel::Attr("k")` with a string value. Only a
+/// string-literal comparison value is recognized; any other value contributes
+/// nothing. `attrs['k'] IN (...)` is an `Expr::InList`, not a `BinaryExpr`, so
+/// it never reaches here and stays unextracted (a disjunction the intersecting
+/// prune channel cannot soundly represent).
+fn attr_equality_predicate(be: &BinaryExpr) -> Option<Predicate> {
+    if be.op != Operator::Eq {
+        return None;
+    }
+    let (key, value) = match attr_subscript_key(&be.left) {
+        Some(k) => (k, lit_utf8(&be.right)?),
+        None => {
+            let k = attr_subscript_key(&be.right)?;
+            (k, lit_utf8(&be.left)?)
+        }
+    };
+    Some(Predicate::Equals {
+        field: FieldSel::Attr(key),
+        value: AttrValue::Str(value),
+    })
+}
+
+/// The key literal `k` of an `attrs['k']` subscript, planned as
+/// `get_field(attrs, 'k')`. `None` for any other expression, including
+/// `get_field` over a column other than `attrs` or with a non-literal key.
+fn attr_subscript_key(e: &Expr) -> Option<String> {
+    let Expr::ScalarFunction(sf) = e else {
+        return None;
+    };
+    if sf.func.name() != GET_FIELD_UDF || sf.args.len() != 2 {
+        return None;
+    }
+    if !matches!(&sf.args[0], Expr::Column(c) if c.name == "attrs") {
+        return None;
+    }
+    lit_utf8(&sf.args[1])
+}
+
+// --- ts bound extraction (mirrors crate::pushdown's metrics logic) ---
+
+fn ts_comparison(be: &BinaryExpr) -> Option<(Operator, i64)> {
+    let (op, ns) = if is_ts_col(&be.left) {
+        (be.op, lit_ts_ns(&be.right)?)
+    } else if is_ts_col(&be.right) {
+        (flip_op(be.op)?, lit_ts_ns(&be.left)?)
+    } else {
+        return None;
+    };
+    match op {
+        Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq | Operator::Eq => {
+            Some((op, ns))
+        }
+        _ => None,
+    }
+}
+
+fn apply_ts_bound(out: &mut LogsPushdown, op: Operator, ns: i64) {
+    match op {
+        Operator::GtEq => tighten_lo(out, ns),
+        // `ts > L` is `ts >= L+1` in integer ns; on overflow drop the bound.
+        Operator::Gt => {
+            if let Some(lo) = ns.checked_add(1) {
+                tighten_lo(out, lo);
+            }
+        }
+        Operator::LtEq => tighten_hi(out, ns),
+        // `ts < U` is `ts <= U-1`; on underflow drop the bound.
+        Operator::Lt => {
+            if let Some(hi) = ns.checked_sub(1) {
+                tighten_hi(out, hi);
+            }
+        }
+        Operator::Eq => {
+            tighten_lo(out, ns);
+            tighten_hi(out, ns);
+        }
+        _ => {}
+    }
+}
+
+fn tighten_lo(out: &mut LogsPushdown, candidate: i64) {
+    out.ts_lo = Some(match out.ts_lo {
+        Some(cur) => cur.max(candidate),
+        None => candidate,
+    });
+}
+
+fn tighten_hi(out: &mut LogsPushdown, candidate: i64) {
+    out.ts_hi = Some(match out.ts_hi {
+        Some(cur) => cur.min(candidate),
+        None => candidate,
+    });
+}
+
+fn is_ts_col(e: &Expr) -> bool {
+    matches!(e, Expr::Column(c) if c.name == "ts")
+}
+
+/// A literal timestamp in nanoseconds, or `None` for any non-timestamp or
+/// non-literal expression. Integer literals are rejected (ambiguous scale), a
+/// mis-scaled bound would narrow. Scaling is exact; on overflow the literal is
+/// rejected (widen). Identical to the metrics extractor.
+fn lit_ts_ns(e: &Expr) -> Option<i64> {
+    let sv = match e {
+        Expr::Literal(sv, _) => sv,
+        _ => return None,
+    };
+    match sv {
+        ScalarValue::TimestampNanosecond(Some(v), _) => Some(*v),
+        ScalarValue::TimestampMicrosecond(Some(v), _) => v.checked_mul(1_000),
+        ScalarValue::TimestampMillisecond(Some(v), _) => v.checked_mul(1_000_000),
+        ScalarValue::TimestampSecond(Some(v), _) => v.checked_mul(1_000_000_000),
+        _ => None,
+    }
+}
+
+fn flip_op(op: Operator) -> Option<Operator> {
+    Some(match op {
+        Operator::Gt => Operator::Lt,
+        Operator::GtEq => Operator::LtEq,
+        Operator::Lt => Operator::Gt,
+        Operator::LtEq => Operator::GtEq,
+        Operator::Eq => Operator::Eq,
+        _ => return None,
+    })
+}
+
+// --- content predicate extraction ---
+
+/// `has_word(col, 'literal')` -> a [`Predicate::HasWord`] over the recognized
+/// text field. Only `body` and `severity_text` map to a field selector; any
+/// other first argument contributes nothing (widen). The word literal is passed
+/// through verbatim; the reader tokenizes it, exactly as the UDF does.
+fn has_word_predicate(args: &[Expr]) -> Option<Predicate> {
+    if args.len() != 2 {
+        return None;
+    }
+    let field = text_field_sel(&args[0])?;
+    let word = lit_utf8(&args[1])?;
+    Some(Predicate::HasWord { field, word })
+}
+
+fn text_field_sel(e: &Expr) -> Option<FieldSel> {
+    match e {
+        Expr::Column(c) if c.name == "body" => Some(FieldSel::Body),
+        Expr::Column(c) if c.name == "severity_text" => Some(FieldSel::SeverityText),
+        _ => None,
+    }
+}
+
+fn lit_utf8(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Literal(ScalarValue::Utf8(Some(s)), _)
+        | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _)
+        | Expr::Literal(ScalarValue::Utf8View(Some(s)), _) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use datafusion::functions::core::expr_fn::get_field;
+    use datafusion::logical_expr::{BinaryExpr, and, or};
+    use datafusion::prelude::{col, lit};
+
+    use super::*;
+    use crate::logs_udf::has_word_udf;
+
+    fn ts_lit(v: i64) -> Expr {
+        lit(ScalarValue::TimestampNanosecond(Some(v), None))
+    }
+
+    #[test]
+    fn ts_bounds_and_between() {
+        let p = extract_logs(
+            &[col("ts").gt_eq(ts_lit(100)), col("ts").lt(ts_lit(200))],
+            &[],
+        );
+        assert_eq!((p.ts_lo, p.ts_hi), (Some(100), Some(199)));
+        assert_eq!((p.ts_min(), p.ts_max()), (100, 199));
+
+        let e = Expr::Between(datafusion::logical_expr::Between {
+            expr: Box::new(col("ts")),
+            negated: false,
+            low: Box::new(ts_lit(10)),
+            high: Box::new(ts_lit(20)),
+        });
+        let p = extract_logs(&[e], &[]);
+        assert_eq!((p.ts_lo, p.ts_hi), (Some(10), Some(20)));
+    }
+
+    #[test]
+    fn no_ts_bound_widens_to_everything() {
+        let p = LogsPushdown::default();
+        assert_eq!((p.ts_min(), p.ts_max()), (i64::MIN, i64::MAX));
+
+        // An OR anywhere at the top level contributes no bound.
+        let range = and(col("ts").gt_eq(ts_lit(100)), col("ts").lt(ts_lit(200)));
+        let mixed = or(range, col("severity_num").gt(lit(5)));
+        let p = extract_logs(&[mixed], &[]);
+        assert_eq!((p.ts_lo, p.ts_hi), (None, None));
+    }
+
+    #[test]
+    fn has_word_becomes_content_predicate() {
+        let e = has_word_udf().call(vec![col("body"), lit("timeout")]);
+        let p = extract_logs(&[e], &[]);
+        assert_eq!(
+            p.content,
+            vec![Predicate::HasWord {
+                field: FieldSel::Body,
+                word: "timeout".into()
+            }]
+        );
+
+        // has_word over a non-text/unrecognized column contributes nothing.
+        let e = has_word_udf().call(vec![col("attrs"), lit("timeout")]);
+        assert!(extract_logs(&[e], &[]).content.is_empty());
+    }
+
+    fn like(
+        column: Expr,
+        pattern: &str,
+        negated: bool,
+        escape_char: Option<char>,
+        case_insensitive: bool,
+    ) -> Expr {
+        Expr::Like(datafusion::logical_expr::Like {
+            negated,
+            expr: Box::new(column),
+            pattern: Box::new(lit(pattern)),
+            escape_char,
+            case_insensitive,
+        })
+    }
+
+    /// `like` as the raw `Expr::Like`, plus the `like` UDF call `LikeToUdf`
+    /// rewrites it into when it rewrites it at all (it leaves `ILIKE` alone).
+    fn like_shapes(like: Expr) -> Vec<Expr> {
+        use datafusion::common::DFSchema;
+        use datafusion::config::ConfigOptions;
+        use datafusion::logical_expr::expr_rewriter::FunctionRewrite;
+
+        use crate::like_udf::{LikeScope, LikeToUdf};
+
+        let rewritten = LikeToUdf::new(LikeScope::Every)
+            .rewrite(like.clone(), &DFSchema::empty(), &ConfigOptions::default())
+            .expect("rewrite");
+        let mut shapes = vec![like];
+        if rewritten.transformed {
+            shapes.push(rewritten.data);
+        }
+        shapes
+    }
+
+    #[test]
+    fn like_substring_on_declared_str_pushes_contains() {
+        let d = vec![DeclaredColumn::new("region", DeclaredType::Str)];
+        for negated in [false, true] {
+            let shapes = like_shapes(like(col("region"), "%us-east%", negated, None, false));
+            assert_eq!(shapes.len(), 2, "the raw and the UDF shape");
+            assert!(
+                matches!(&shapes[1], Expr::ScalarFunction(sf) if sf.func.name() == crate::like_udf::LIKE_UDF)
+            );
+            for f in shapes {
+                let p = extract_logs(&[f.clone(), col("ts").gt_eq(ts_lit(100))], &d);
+                assert_eq!(
+                    p.content,
+                    vec![Predicate::Contains {
+                        key: "region".into(),
+                        needle: "us-east".into(),
+                        negated,
+                    }],
+                    "{f}"
+                );
+                assert_eq!((p.ts_lo, p.ts_hi), (Some(100), None), "{f}");
+                assert!(p.prune.is_empty() && p.key_equals.is_empty(), "{f}");
+            }
+        }
+    }
+
+    /// The pushed arm never makes the filter `Exact`: `FilterExec` stays the
+    /// exact evaluator (ADR-2773, contains-arm amendment).
+    #[test]
+    fn pushed_like_stays_inexact() {
+        let d = vec![DeclaredColumn::new("region", DeclaredType::Str)];
+        for negated in [false, true] {
+            for f in like_shapes(like(col("region"), "%us-east%", negated, None, false)) {
+                assert!(
+                    !extract_logs(std::slice::from_ref(&f), &d)
+                        .content
+                        .is_empty()
+                );
+                assert!(!filter_is_exact(&f, &d), "{f}");
+                let with_ts = and(col("ts").gt_eq(ts_lit(100)), f.clone());
+                assert!(!filter_is_exact(&with_ts, &d), "{with_ts}");
+            }
+        }
+    }
+
+    #[test]
+    fn like_shapes_outside_the_arm_push_nothing() {
+        let d = vec![
+            DeclaredColumn::new("region", DeclaredType::Str),
+            DeclaredColumn::new("code", DeclaredType::I64),
+        ];
+        let region = || col("region");
+        let plain = |pattern: &str| like(region(), pattern, false, None, false);
+        let cases = [
+            ("underscore", plain("%a_b%")),
+            ("escaped percent", plain("%a\\%b%")),
+            ("prefix", plain("abc%")),
+            ("suffix", plain("%abc")),
+            ("inner percent", plain("a%b")),
+            ("two needles", plain("%a%b%")),
+            ("only percents", plain("%%")),
+            ("empty", plain("")),
+            (
+                "ESCAPE clause",
+                like(region(), "%abc%", false, Some('#'), false),
+            ),
+            ("ILIKE", like(region(), "%abc%", false, None, true)),
+            (
+                "declared I64",
+                like(col("code"), "%abc%", false, None, false),
+            ),
+            ("body", like(col("body"), "%abc%", false, None, false)),
+            ("undeclared", like(col("zone"), "%abc%", false, None, false)),
+            (
+                "attrs subscript",
+                like(get_field(col("attrs"), "k"), "%abc%", false, None, false),
+            ),
+        ];
+        for (label, e) in cases {
+            for f in like_shapes(e) {
+                let p = extract_logs(&[f.clone(), col("ts").gt_eq(ts_lit(100))], &d);
+                assert!(p.content.is_empty(), "{label}: {f} pushed {:?}", p.content);
+                assert_eq!(p.ts_lo, Some(100), "{label}");
+            }
+        }
+
+        // Not a top-level conjunct.
+        for f in like_shapes(plain("%a%")) {
+            let under_or = or(f.clone(), col("ts").gt(ts_lit(100)));
+            assert!(extract_logs(&[under_or], &d).content.is_empty(), "OR: {f}");
+            let under_not = Expr::Not(Box::new(f.clone()));
+            assert!(
+                extract_logs(&[under_not], &d).content.is_empty(),
+                "NOT: {f}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrecognized_shapes_contribute_nothing() {
+        // A binary that is neither a ts comparison nor an attrs equality.
+        let be = BinaryExpr::new(Box::new(col("flags")), Operator::Eq, Box::new(lit(1u32)));
+        let p = extract_logs(&[Expr::BinaryExpr(be)], &[]);
+        assert_eq!(p, LogsPushdown::default());
+    }
+
+    #[test]
+    fn attribute_equality_and_in_are_not_extracted() {
+        // `attrs['service.name'] = 'api'` (lowered to
+        // `get_field(attrs, 'service.name') = 'api'`) now goes to the prune-only
+        // channel, never to content: the reader would evaluate it against
+        // per-record attributes only and drop resource/scope-only matches.
+        let expected = vec![Predicate::Equals {
+            field: FieldSel::Attr("service.name".into()),
+            value: AttrValue::Str("api".into()),
+        }];
+
+        let eq = get_field(col("attrs"), "service.name").eq(lit("api"));
+        let p = extract_logs(&[eq], &[]);
+        assert_eq!(p.prune, expected);
+        assert!(p.content.is_empty(), "the equality must not become content");
+        assert_eq!((p.ts_lo, p.ts_hi), (None, None));
+
+        // The value on the left extracts the identical predicate.
+        let eq_flipped = lit("api").eq(get_field(col("attrs"), "service.name"));
+        let p = extract_logs(&[eq_flipped], &[]);
+        assert_eq!(p.prune, expected);
+        assert!(p.content.is_empty());
+
+        // `attrs['k'] IN (...)` is a disjunction: it contributes nothing to
+        // either channel. The intersecting prune channel cannot represent it
+        // soundly; a disjunctive form is not yet supported.
+        let in_list = get_field(col("attrs"), "k").in_list(vec![lit("a"), lit("b")], false);
+        let p = extract_logs(&[in_list], &[]);
+        assert!(p.content.is_empty());
+        assert!(p.prune.is_empty(), "IN must not populate the prune channel");
+    }
+
+    #[test]
+    fn get_field_over_non_attrs_column_is_not_pushed() {
+        // Only the `attrs` map is prunable; a subscript on any other column
+        // contributes nothing to either channel.
+        let eq = get_field(col("resource"), "service.name").eq(lit("api"));
+        let p = extract_logs(&[eq], &[]);
+        assert!(p.prune.is_empty());
+        assert!(p.content.is_empty());
+    }
+
+    // --- declared typed column extraction (ADR-0093) -------------------------
+
+    fn i64_decl() -> Vec<DeclaredColumn> {
+        vec![DeclaredColumn::new("status_code", DeclaredType::I64)]
+    }
+
+    fn num_range_arm(ty: FieldType, min: Option<u64>, max: Option<u64>) -> Predicate {
+        Predicate::NumRange {
+            field: FieldSel::Attr("status_code".into()),
+            ty,
+            min,
+            max,
+        }
+    }
+
+    /// Every I64 comparison operator, either operand order, maps to the inclusive
+    /// bit-pattern range it denotes. `>`/`<` shift by one in integer space; a
+    /// flipped operand order flips the operator.
+    #[test]
+    fn i64_comparisons_map_to_num_range() {
+        let d = i64_decl();
+        let cases = [
+            (col("status_code").eq(lit(500i64)), Some(500), Some(500)),
+            (col("status_code").gt_eq(lit(500i64)), Some(500), None),
+            (col("status_code").gt(lit(500i64)), Some(501), None),
+            (col("status_code").lt_eq(lit(500i64)), None, Some(500)),
+            (col("status_code").lt(lit(500i64)), None, Some(499)),
+            // Flipped operand order: `500 < status_code` is `status_code > 500`.
+            (lit(500i64).lt(col("status_code")), Some(501), None),
+        ];
+        for (expr, min, max) in cases {
+            let p = extract_logs(std::slice::from_ref(&expr), &d);
+            assert_eq!(
+                p.prune,
+                vec![num_range_arm(FieldType::I64, min, max)],
+                "unexpected range for {expr:?}"
+            );
+            assert!(p.content.is_empty());
+            assert_eq!((p.ts_lo, p.ts_hi), (None, None));
+        }
+    }
+
+    /// A declared Bool column: `= true`/`= false` degenerate to the `1`/`0`
+    /// point range `bool_stat` folds under, sharing the I64 extraction path.
+    #[test]
+    fn bool_equality_maps_to_bit_point_range() {
+        let d = vec![DeclaredColumn::new("is_active", DeclaredType::Bool)];
+        let p = extract_logs(&[col("is_active").eq(lit(true))], &d);
+        assert_eq!(
+            p.prune,
+            vec![Predicate::NumRange {
+                field: FieldSel::Attr("is_active".into()),
+                ty: FieldType::Bool,
+                min: Some(1),
+                max: Some(1),
+            }]
+        );
+        let p = extract_logs(&[col("is_active").eq(lit(false))], &d);
+        assert_eq!(
+            p.prune,
+            vec![Predicate::NumRange {
+                field: FieldSel::Attr("is_active".into()),
+                ty: FieldType::Bool,
+                min: Some(0),
+                max: Some(0),
+            }]
+        );
+    }
+
+    /// A declared I64 `BETWEEN low AND high` is one inclusive range; a negated
+    /// BETWEEN (an OR of two half-lines) is not extracted.
+    #[test]
+    fn i64_between_maps_to_inclusive_range() {
+        let d = i64_decl();
+        let between = Expr::Between(datafusion::logical_expr::Between {
+            expr: Box::new(col("status_code")),
+            negated: false,
+            low: Box::new(lit(200i64)),
+            high: Box::new(lit(499i64)),
+        });
+        let p = extract_logs(&[between], &d);
+        assert_eq!(
+            p.prune,
+            vec![num_range_arm(FieldType::I64, Some(200), Some(499))]
+        );
+
+        let negated = Expr::Between(datafusion::logical_expr::Between {
+            expr: Box::new(col("status_code")),
+            negated: true,
+            low: Box::new(lit(200i64)),
+            high: Box::new(lit(499i64)),
+        });
+        let p = extract_logs(&[negated], &d);
+        assert!(
+            p.prune.is_empty(),
+            "a negated BETWEEN must not be extracted"
+        );
+    }
+
+    /// A declared I64 `IN (v1, v2, v3)` collapses to ONE envelope range spanning
+    /// the set's min and max, never one arm per value.
+    #[test]
+    fn i64_in_list_maps_to_one_envelope_range() {
+        let d = i64_decl();
+        let in_list =
+            col("status_code").in_list(vec![lit(200i64), lit(404i64), lit(500i64)], false);
+        let p = extract_logs(&[in_list], &d);
+        assert_eq!(
+            p.prune,
+            vec![num_range_arm(FieldType::I64, Some(200), Some(500))],
+            "IN must produce a single [min, max] envelope, not one arm per value"
+        );
+    }
+
+    /// A small `col IN (...)` reaches the scan as `col = v1 OR col = v2 OR ...`
+    /// (DataFusion's simplifier expands it). That same-column I64 disjunction
+    /// collapses to the SAME envelope range the `Expr::InList` arm builds.
+    #[test]
+    fn same_column_i64_or_disjunction_maps_to_envelope() {
+        let d = i64_decl();
+        let or_expr = or(
+            or(
+                col("status_code").eq(lit(200i64)),
+                col("status_code").eq(lit(404i64)),
+            ),
+            col("status_code").eq(lit(500i64)),
+        );
+        let p = extract_logs(&[or_expr], &d);
+        assert_eq!(
+            p.prune,
+            vec![num_range_arm(FieldType::I64, Some(200), Some(500))],
+            "a same-column equality OR is the small-IN envelope"
+        );
+    }
+
+    /// A cross-column OR (or any non-equality disjunct) is not a representable
+    /// single range and must not extract: one disjunct's range would prune a
+    /// block the full disjunction keeps.
+    #[test]
+    fn cross_column_or_is_not_extracted() {
+        let d = vec![
+            DeclaredColumn::new("status_code", DeclaredType::I64),
+            DeclaredColumn::new("shard", DeclaredType::I64),
+        ];
+        // Different declared columns.
+        let mixed = or(
+            col("status_code").eq(lit(200i64)),
+            col("shard").eq(lit(3i64)),
+        );
+        assert!(extract_logs(&[mixed], &d).prune.is_empty());
+
+        // A non-equality disjunct on the same column.
+        let ranged = or(
+            col("status_code").eq(lit(200i64)),
+            col("status_code").gt(lit(400i64)),
+        );
+        assert!(extract_logs(&[ranged], &d).prune.is_empty());
+
+        // A disjunct on an undeclared column.
+        let undeclared = or(
+            col("status_code").eq(lit(200i64)),
+            col("body").eq(lit("zzz")),
+        );
+        assert!(extract_logs(&[undeclared], &d).prune.is_empty());
+    }
+
+    /// A `NOT IN` is an AND of inequalities, a different shape; not extracted.
+    #[test]
+    fn i64_negated_in_list_is_not_extracted() {
+        let d = i64_decl();
+        let in_list = col("status_code").in_list(vec![lit(200i64), lit(404i64)], true);
+        let p = extract_logs(&[in_list], &d);
+        assert!(p.prune.is_empty());
+    }
+
+    /// A declared Str column's `=` maps to the same `Equals` predicate the
+    /// `attrs['k'] = 'v'` shape builds, feeding POSTINGS.
+    #[test]
+    fn str_equality_maps_to_attr_equals() {
+        let d = vec![DeclaredColumn::new("region", DeclaredType::Str)];
+        let p = extract_logs(&[col("region").eq(lit("eu"))], &d);
+        assert_eq!(
+            p.prune,
+            vec![Predicate::Equals {
+                field: FieldSel::Attr("region".into()),
+                value: AttrValue::Str("eu".into()),
+            }]
+        );
+        // A range operator on a Str column has no ordered index; declines.
+        let p = extract_logs(&[col("region").gt(lit("eu"))], &d);
+        assert!(
+            p.prune.is_empty(),
+            "a Str range operator must not be extracted"
+        );
+        // Str IN is a disjunction POSTINGS cannot represent; declines.
+        let p = extract_logs(
+            &[col("region").in_list(vec![lit("eu"), lit("us")], false)],
+            &d,
+        );
+        assert!(p.prune.is_empty(), "a Str IN must not be extracted");
+    }
+
+    /// TEST 6: `<>` on a declared I64 column against an Int64 literal, in either
+    /// operand order, yields exactly one [`Predicate::NumNotEq`] arm and stays
+    /// `Inexact`. A `NOT`-wrapped equality, `<>` on a Bool, Str or Bytes column,
+    /// `<>` against a mismatched literal, and `<>` on an undeclared column
+    /// yield no prune arm (ADR-0095, prune-only not-equal amendment).
+    #[test]
+    fn not_equal_on_declared_i64_is_the_only_negation_prune_arm() {
+        let d = i64_decl();
+        let want = vec![Predicate::NumNotEq {
+            field: FieldSel::Attr("status_code".into()),
+            value: 500,
+        }];
+
+        let ne = extract_logs(&[col("status_code").not_eq(lit(500i64))], &d);
+        assert_eq!(ne.prune, want, "col <> v yields the NumNotEq arm");
+        let flipped = extract_logs(&[lit(500i64).not_eq(col("status_code"))], &d);
+        assert_eq!(flipped.prune, want, "v <> col yields the same arm");
+        assert!(!filter_is_exact(
+            &col("status_code").not_eq(lit(500i64)),
+            &d
+        ));
+
+        let mismatched = extract_logs(&[col("status_code").not_eq(lit(2.5f64))], &d);
+        assert!(mismatched.prune.is_empty(), "a float literal declines");
+        let undeclared = extract_logs(&[col("other").not_eq(lit(500i64))], &d);
+        assert!(undeclared.prune.is_empty(), "an undeclared column declines");
+        let sd = vec![DeclaredColumn::new("svc", DeclaredType::Str)];
+        let sne = extract_logs(&[col("svc").not_eq(lit("api"))], &sd);
+        assert!(sne.prune.is_empty(), "str <> must produce no prune arm");
+        let yd = vec![DeclaredColumn::new("blob", DeclaredType::Bytes)];
+        let yne = extract_logs(&[col("blob").not_eq(lit(vec![1u8, 2]))], &yd);
+        assert!(yne.prune.is_empty(), "bytes <> must produce no prune arm");
+
+        let negated = extract_logs(
+            &[Expr::Not(Box::new(col("status_code").eq(lit(500i64))))],
+            &d,
+        );
+        assert!(
+            negated.prune.is_empty(),
+            "a NOT-wrapped equality must produce no prune arm"
+        );
+
+        // Bool's point-complement coincidence must NOT be special-cased either.
+        let bd = vec![DeclaredColumn::new("is_active", DeclaredType::Bool)];
+        let bne = extract_logs(&[col("is_active").not_eq(lit(true))], &bd);
+        assert!(bne.prune.is_empty(), "bool != must produce no prune arm");
+    }
+
+    /// A declared `Str` column's `<>` against a non-NULL string literal, in
+    /// either operand order and with the literal as `Utf8`, `Utf8View` or the
+    /// `Dictionary(Int32, Utf8)` scalar, lands in `row_filters` as the
+    /// expression itself and nowhere else. Every other shape leaves
+    /// `row_filters` empty.
+    #[test]
+    fn str_not_equal_goes_to_row_filters_only() {
+        let d = vec![
+            DeclaredColumn::new("s", DeclaredType::Str),
+            DeclaredColumn::new("t", DeclaredType::Str),
+            DeclaredColumn::new("body", DeclaredType::Str),
+            DeclaredColumn::new("blob", DeclaredType::Bytes),
+            DeclaredColumn::new("n", DeclaredType::I64),
+        ];
+        let dict = |v: &str| {
+            lit(ScalarValue::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(ScalarValue::Utf8(Some(v.to_string()))),
+            ))
+        };
+        let accepted = [
+            col("s").not_eq(lit("x")),
+            lit("x").not_eq(col("s")),
+            col("s").not_eq(lit(ScalarValue::Utf8View(Some("x".into())))),
+            col("s").not_eq(dict("")),
+            dict("x").not_eq(col("s")),
+        ];
+        for e in accepted {
+            let p = extract_logs(std::slice::from_ref(&e), &d);
+            assert_eq!(p.row_filters, vec![e.clone()], "{e} is a row filter");
+            assert!(p.prune.is_empty() && p.content.is_empty(), "{e}");
+            assert!(p.key_equals.is_empty() && p.ts_lo.is_none(), "{e}");
+        }
+
+        let bounded = extract_logs(
+            &[col("s").not_eq(lit("")).and(col("ts").gt_eq(ts_lit(5)))],
+            &d,
+        );
+        assert_eq!(bounded.row_filters, vec![col("s").not_eq(lit(""))]);
+        assert_eq!(bounded.ts_lo, Some(5));
+
+        let rejected = [
+            col("body").not_eq(lit("x")),
+            get_field(col("attrs"), "k").not_eq(lit("v")),
+            col("other").not_eq(lit("x")),
+            col("blob").not_eq(lit(vec![1u8])),
+            col("n").not_eq(lit(5i64)),
+            Expr::Not(Box::new(col("s").eq(lit("x")))),
+            col("s").not_eq(lit(ScalarValue::Utf8(None))),
+            col("s").not_eq(lit(ScalarValue::LargeUtf8(Some("x".into())))),
+            col("s").not_eq(lit(ScalarValue::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(ScalarValue::Utf8(Some("x".into()))),
+            ))),
+            Expr::Cast(datafusion::logical_expr::Cast::new(
+                Box::new(col("s")),
+                DataType::Utf8,
+            ))
+            .not_eq(lit("x")),
+            datafusion::functions::string::expr_fn::lower(col("s")).not_eq(lit("x")),
+            col("s").not_eq(col("t")),
+            or(col("s").not_eq(lit("x")), col("t").not_eq(lit("y"))),
+            col("s").eq(lit("x")),
+        ];
+        for e in rejected {
+            let p = extract_logs(std::slice::from_ref(&e), &d);
+            assert!(p.row_filters.is_empty(), "{e} is not a row filter");
+        }
+    }
+
+    /// ADR-0093, exact not-equal amendment, T1: [`filter_is_exact`] accepts a
+    /// declared `Str` column's `<>` against a non-NULL string literal, in
+    /// either operand order, with the literal as `Utf8`, `Utf8View` or the
+    /// `Dictionary(Int32, Utf8)` scalar, alone and AND-ed with a `ts` bound,
+    /// and [`filter_has_row_filter`] says each holds a row filter. It rejects
+    /// every shape near it. `body` is declared `Str` too, so a name resolved
+    /// without the fixed-column guard reads it as declared.
+    ///
+    /// Flipped, each fails "these stay Inexact" and names what it accepted:
+    /// matching any `NotEq` with a column on one side accepts `body` and
+    /// `attrs['k']`; resolving the name without the fixed-column guard accepts
+    /// `body`; testing a looser not-equal shape before the `prune`/`key_equals`
+    /// early return accepts the I64 `NumNotEq` (`n <> 5`); crediting either
+    /// side of an `AND` accepts `s <> 'x' AND s LIKE '%y%'`.
+    #[test]
+    fn str_not_equal_is_exact_and_nothing_near_it_is() {
+        let d = vec![
+            DeclaredColumn::new("s", DeclaredType::Str),
+            DeclaredColumn::new("t", DeclaredType::Str),
+            DeclaredColumn::new("body", DeclaredType::Str),
+            DeclaredColumn::new("blob", DeclaredType::Bytes),
+            DeclaredColumn::new("n", DeclaredType::I64),
+        ];
+        let dict = |v: &str| {
+            lit(ScalarValue::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(ScalarValue::Utf8(Some(v.to_string()))),
+            ))
+        };
+        let view = |v: &str| lit(ScalarValue::Utf8View(Some(v.into())));
+        let bound = || col("ts").gt_eq(ts_lit(5));
+        let mut accepted = Vec::new();
+        for value in [lit("x"), view("x"), dict("x")] {
+            for e in [
+                col("s").not_eq(value.clone()),
+                value.clone().not_eq(col("s")),
+            ] {
+                accepted.push(e.clone().and(bound()));
+                accepted.push(bound().and(e.clone()));
+                accepted.push(e);
+            }
+        }
+        for e in &accepted {
+            assert!(filter_is_exact(e, &d), "{e} is Exact");
+            assert!(filter_has_row_filter(e, &d), "{e} holds a row filter");
+        }
+
+        let rejected = [
+            ("body <> 'x'", col("body").not_eq(lit("x"))),
+            (
+                "attrs['k'] <> 'v'",
+                get_field(col("attrs"), "k").not_eq(lit("v")),
+            ),
+            ("undeclared", col("other").not_eq(lit("x"))),
+            ("Bytes", col("blob").not_eq(lit(vec![1u8]))),
+            ("n <> 5", col("n").not_eq(lit(5i64))),
+            ("NOT (s = 'x')", Expr::Not(Box::new(col("s").eq(lit("x"))))),
+            ("s <> NULL", col("s").not_eq(lit(ScalarValue::Utf8(None)))),
+            (
+                "CAST(s) <> 'x'",
+                Expr::Cast(datafusion::logical_expr::Cast::new(
+                    Box::new(col("s")),
+                    DataType::Utf8,
+                ))
+                .not_eq(lit("x")),
+            ),
+            (
+                "lower(s) <> 'x'",
+                datafusion::functions::string::expr_fn::lower(col("s")).not_eq(lit("x")),
+            ),
+            ("s <> t", col("s").not_eq(col("t"))),
+            (
+                "OR",
+                or(col("s").not_eq(lit("x")), col("t").not_eq(lit("y"))),
+            ),
+            (
+                "s <> 'x' AND s LIKE '%y%'",
+                col("s")
+                    .not_eq(lit("x"))
+                    .and(like(col("s"), "%y%", false, None, false)),
+            ),
+            ("s = 'x'", col("s").eq(lit("x"))),
+        ];
+        let accepted_wrongly: Vec<&str> = rejected
+            .iter()
+            .filter(|(_, e)| filter_is_exact(e, &d))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            accepted_wrongly.is_empty(),
+            "these stay Inexact: {accepted_wrongly:?}"
+        );
+    }
+
+    /// TEST 7: a comparison against a type-mismatched literal (a float against a
+    /// declared I64 column) produces no prune arm. A mismatched literal is never
+    /// coerced to fit; extraction declines.
+    #[test]
+    fn type_mismatched_literal_produces_no_prune_arm() {
+        let d = i64_decl();
+        let p = extract_logs(&[col("status_code").gt(lit(2.5f64))], &d);
+        assert!(
+            p.prune.is_empty(),
+            "a float literal against an I64 column must not extract"
+        );
+        // A string literal against an I64 column likewise declines.
+        let p = extract_logs(&[col("status_code").eq(lit("500"))], &d);
+        assert!(p.prune.is_empty());
+    }
+
+    /// The resolution-order guard: a fixed schema name is never resolved against
+    /// declared columns, even when a tenant declares one of the same name. A
+    /// declared `severity_num` must not turn the fixed `severity_num = 5` into a
+    /// prune arm (the fixed-column path owns that name).
+    #[test]
+    fn a_fixed_name_is_never_resolved_as_declared() {
+        let d = vec![DeclaredColumn::new("severity_num", DeclaredType::I64)];
+        let p = extract_logs(&[col("severity_num").eq(lit(5i64))], &d);
+        assert!(
+            p.prune.is_empty(),
+            "a fixed schema name must take the fixed-column path, not declared resolution"
+        );
+    }
+
+    /// A bare column that matches no declared column falls through unchanged:
+    /// scanned, not pruned, exactly as before this ADR.
+    #[test]
+    fn undeclared_column_falls_through() {
+        let p = extract_logs(&[col("status_code").eq(lit(500i64))], &[]);
+        assert_eq!(p, LogsPushdown::default());
+    }
+
+    fn keyed_decl() -> Vec<DeclaredColumn> {
+        vec![
+            DeclaredColumn::new("status_code", DeclaredType::I64),
+            DeclaredColumn::new("region", DeclaredType::Str),
+            DeclaredColumn::new("digest", DeclaredType::Bytes),
+            DeclaredColumn::new("is_active", DeclaredType::Bool),
+        ]
+    }
+
+    /// Every field `keyed_decl` declares, plus `trace_id`, as KEY_IDX-indexed.
+    fn all_indexed() -> KeyIndexDeclaration {
+        KeyIndexDeclaration {
+            columns: keyed_decl().into_iter().map(|d| d.key).collect(),
+            trace_id: true,
+        }
+    }
+
+    fn keyed(filters: &[Expr], declared: &[DeclaredColumn]) -> LogsPushdown {
+        extract_logs_keyed(filters, declared, &all_indexed())
+    }
+
+    /// An equality on a declared I64, Str or Bytes column yields one exact
+    /// key in either operand order, next to the prune arm the same comparison
+    /// already built.
+    #[test]
+    fn declared_equalities_yield_one_exact_key_in_either_order() {
+        let d = keyed_decl();
+        let digest = vec![0xde, 0xad, 0xbe, 0xef];
+        let cases = [
+            (
+                col("status_code").eq(lit(500i64)),
+                KeyEquals::new("status_code", KeyType::I64, key8_i64(500)),
+            ),
+            (
+                lit(500i64).eq(col("status_code")),
+                KeyEquals::new("status_code", KeyType::I64, key8_i64(500)),
+            ),
+            (
+                col("region").eq(lit("eu-west-1")),
+                KeyEquals::new("region", KeyType::Str, key8_str("eu-west-1")),
+            ),
+            (
+                lit("eu-west-1").eq(col("region")),
+                KeyEquals::new("region", KeyType::Str, key8_str("eu-west-1")),
+            ),
+            (
+                col("region").eq(lit(ScalarValue::Dictionary(
+                    Box::new(datafusion::arrow::datatypes::DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some("eu-west-1".into()))),
+                ))),
+                KeyEquals::new("region", KeyType::Str, key8_str("eu-west-1")),
+            ),
+            (
+                col("digest").eq(lit(ScalarValue::Binary(Some(digest.clone())))),
+                KeyEquals::new("digest", KeyType::Bytes, key8_bytes(&digest)),
+            ),
+        ];
+        for (expr, want) in cases {
+            let p = keyed(std::slice::from_ref(&expr), &d);
+            assert_eq!(p.key_equals, vec![want], "unexpected key for {expr:?}");
+            assert_eq!(p.prune.len(), 1, "the prune arm must survive for {expr:?}");
+            assert!(!filter_is_exact(&expr, &d), "{expr:?} must stay Inexact");
+        }
+    }
+
+    /// `trace_id` against a 16-byte literal yields an Id16 key under the
+    /// writer's field name; any other length declines.
+    #[test]
+    fn trace_id_equality_yields_an_id16_key() {
+        let id: [u8; 16] = std::array::from_fn(|i| i as u8 + 1);
+        let want = vec![KeyEquals::new(
+            TRACE_ID_FIELD,
+            KeyType::Id16,
+            key8_id16(&id),
+        )];
+        for l in [
+            lit(ScalarValue::FixedSizeBinary(16, Some(id.to_vec()))),
+            lit(ScalarValue::Binary(Some(id.to_vec()))),
+        ] {
+            let e = col("trace_id").eq(l.clone());
+            let p = keyed(std::slice::from_ref(&e), &[]);
+            assert_eq!(p.key_equals, want, "{e:?}");
+            assert!(!filter_is_exact(&e, &[]));
+            let p = keyed(&[l.eq(col("trace_id"))], &[]);
+            assert_eq!(p.key_equals, want);
+        }
+        let short = col("trace_id").eq(lit(ScalarValue::Binary(Some(id[..8].to_vec()))));
+        assert!(keyed(&[short], &[]).key_equals.is_empty());
+    }
+
+    /// Every shape outside exact equality on the declared type declines the
+    /// key: a mismatched literal type, a cast-wrapped column, `!=`, a range,
+    /// a Bool column, an undeclared or fixed column, and an OR.
+    #[test]
+    fn non_exact_shapes_yield_no_key() {
+        let d = keyed_decl();
+        let declines = [
+            col("status_code").eq(lit(500i32)),
+            col("status_code").eq(lit("500")),
+            col("region").eq(lit(5i64)),
+            col("digest").eq(lit("dead")),
+            datafusion::prelude::cast(
+                col("status_code"),
+                datafusion::arrow::datatypes::DataType::Utf8,
+            )
+            .eq(lit("500")),
+            col("status_code").not_eq(lit(500i64)),
+            col("status_code").gt_eq(lit(500i64)),
+            col("is_active").eq(lit(true)),
+            col("undeclared").eq(lit(500i64)),
+            col("body").eq(lit("x")),
+            or(
+                col("status_code").eq(lit(500i64)),
+                col("status_code").eq(lit(503i64)),
+            ),
+        ];
+        for e in declines {
+            let p = keyed(std::slice::from_ref(&e), &d);
+            assert!(p.key_equals.is_empty(), "{e:?} must not yield a key");
+        }
+    }
+
+    /// An AND of two equalities carries both keys, which the fetcher
+    /// intersects.
+    #[test]
+    fn a_conjunction_carries_every_key() {
+        let d = keyed_decl();
+        let p = keyed(
+            &[and(
+                col("status_code").eq(lit(500i64)),
+                col("region").eq(lit("eu-west-1")),
+            )],
+            &d,
+        );
+        assert_eq!(
+            p.key_equals,
+            vec![
+                KeyEquals::new("status_code", KeyType::I64, key8_i64(500)),
+                KeyEquals::new("region", KeyType::Str, key8_str("eu-west-1")),
+            ]
+        );
+    }
+
+    /// A key survives only for a field the tenant's KEY_IDX declaration names:
+    /// a declared column outside `columns`, and `trace_id` with `trace_id`
+    /// off, yield no key while every other channel stays as `extract_logs`
+    /// builds it.
+    #[test]
+    fn only_a_declared_key_index_field_yields_a_key() {
+        let d = keyed_decl();
+        let id: [u8; 16] = std::array::from_fn(|i| i as u8 + 1);
+        let filters = [
+            col("status_code").eq(lit(500i64)),
+            col("region").eq(lit("eu-west-1")),
+            col("trace_id").eq(lit(ScalarValue::FixedSizeBinary(16, Some(id.to_vec())))),
+        ];
+        let only_region = KeyIndexDeclaration {
+            columns: vec!["region".to_owned()],
+            trace_id: false,
+        };
+        let p = extract_logs_keyed(&filters, &d, &only_region);
+        assert_eq!(
+            p.key_equals,
+            vec![KeyEquals::new(
+                "region",
+                KeyType::Str,
+                key8_str("eu-west-1")
+            )]
+        );
+        let only_trace = KeyIndexDeclaration {
+            columns: Vec::new(),
+            trace_id: true,
+        };
+        let p = extract_logs_keyed(&filters, &d, &only_trace);
+        assert_eq!(
+            p.key_equals,
+            vec![KeyEquals::new(
+                TRACE_ID_FIELD,
+                KeyType::Id16,
+                key8_id16(&id)
+            )]
+        );
+        let plain = extract_logs(&filters, &d);
+        assert!(plain.key_equals.is_empty());
+        assert_eq!(p.prune, plain.prune);
+        assert_eq!(p.prune.len(), 2);
+    }
+
+    /// A declared key-index column `IN` literals of exactly its type, and
+    /// `trace_id IN` 16-byte or 32-hex literals, yield one key set of the
+    /// distinct values; the I64 list keeps its envelope prune arm.
+    #[test]
+    fn an_in_list_yields_one_key_set() {
+        let d = keyed_decl();
+        let p = keyed(
+            &[col("status_code").in_list(
+                vec![lit(500i64), lit(404i64), lit(500i64), lit(200i64)],
+                false,
+            )],
+            &d,
+        );
+        assert_eq!(
+            p.key_in,
+            Some(
+                KeyIn::new(
+                    "status_code",
+                    KeyType::I64,
+                    vec![key8_i64(200), key8_i64(404), key8_i64(500)]
+                )
+                .expect("set")
+            )
+        );
+        assert_eq!(p.prune.len(), 1, "the envelope stays");
+        let p = keyed(
+            &[col("region").in_list(vec![lit("eu"), lit("us"), lit("ap"), lit("sa")], false)],
+            &d,
+        );
+        assert_eq!(p.key_in.as_ref().map(|k| k.keys().len()), Some(4));
+        let hex = "00112233445566778899aabbccddeeff";
+        let bin = ScalarValue::FixedSizeBinary(16, Some(vec![7u8; 16]));
+        let p = keyed(
+            &[col(TRACE_ID_FIELD).in_list(vec![lit(hex), lit(bin.clone())], false)],
+            &d,
+        );
+        let k = p.key_in.expect("trace set");
+        assert_eq!(k.key_type(), KeyType::Id16);
+        assert_eq!(k.keys().len(), 2);
+        // Without the declaration's trace_id switch, no key.
+        let off = extract_logs_keyed(
+            &[col(TRACE_ID_FIELD).in_list(vec![lit(bin)], false)],
+            &d,
+            &KeyIndexDeclaration {
+                columns: Vec::new(),
+                trace_id: false,
+            },
+        );
+        assert!(off.key_in.is_none());
+    }
+
+    /// `NOT IN`, a mixed-type list, more than 1,024 distinct values, a list
+    /// under `OR`, and a column the declaration does not index carry no key.
+    #[test]
+    fn non_key_in_shapes_carry_no_key() {
+        let d = keyed_decl();
+        let shapes = vec![
+            col("status_code").in_list(vec![lit(1i64), lit(2i64), lit(3i64), lit(4i64)], true),
+            col("status_code").in_list(vec![lit(1i64), lit("2"), lit(3i64), lit(4i64)], false),
+            col("status_code").in_list((0..1_025i64).map(lit).collect(), false),
+            or(
+                col("status_code").in_list(vec![lit(1i64), lit(2i64), lit(3i64), lit(4i64)], false),
+                col("region").eq(lit("eu")),
+            ),
+            col("is_active").in_list(vec![lit(true), lit(false)], false),
+            col("undeclared").in_list(vec![lit(1i64), lit(2i64), lit(3i64), lit(4i64)], false),
+        ];
+        for e in shapes {
+            assert!(keyed(std::slice::from_ref(&e), &d).key_in.is_none(), "{e}");
+        }
+        let at_k = keyed(
+            &[col("status_code").in_list((0..1_024i64).map(lit).collect(), false)],
+            &d,
+        );
+        assert_eq!(at_k.key_in.map(|k| k.keys().len()), Some(1_024));
+    }
+
+    /// An `IN` list ANDed with an equality carries both arms.
+    #[test]
+    fn an_in_list_and_an_equality_carry_both_arms() {
+        let d = keyed_decl();
+        let p = keyed(
+            &[and(
+                col("status_code").in_list(vec![lit(1i64), lit(2i64), lit(3i64), lit(4i64)], false),
+                col("region").eq(lit("eu")),
+            )],
+            &d,
+        );
+        assert_eq!(p.key_equals.len(), 1);
+        assert_eq!(p.key_in.map(|k| k.keys().len()), Some(4));
+    }
+
+    /// `keyed_decl` plus `retries`, a second I64 key-index column, and
+    /// `latency_ms`, an I64 column declared outside the key index.
+    fn two_key_decl() -> (Vec<DeclaredColumn>, KeyIndexDeclaration) {
+        let mut d = keyed_decl();
+        d.push(DeclaredColumn::new("retries", DeclaredType::I64));
+        d.push(DeclaredColumn::new("latency_ms", DeclaredType::I64));
+        let mut k = all_indexed();
+        k.columns.push("retries".to_string());
+        (d, k)
+    }
+
+    /// The key set the `IN` list `column IN (values)` carries.
+    fn in_list_key(column: &str, values: Vec<Expr>) -> Option<KeyIn> {
+        keyed(&[col(column).in_list(values, false)], &keyed_decl()).key_in
+    }
+
+    fn trace_hex() -> Expr {
+        lit("00112233445566778899aabbccddeeff")
+    }
+
+    fn trace_bin() -> Expr {
+        lit(ScalarValue::FixedSizeBinary(16, Some(vec![7u8; 16])))
+    }
+
+    /// `col = a OR col = b` carries exactly the key set of `col IN (a, b)`, in
+    /// either operand order, on an I64, Str and Bytes key column and on
+    /// `trace_id` with one hex and one binary id, also under a sibling `AND`.
+    #[test]
+    fn a_two_value_key_disjunction_is_a_key_set() {
+        let d = keyed_decl();
+        let digest_a = lit(ScalarValue::Binary(Some(vec![0xde, 0xad])));
+        let digest_b = lit(ScalarValue::Binary(Some(vec![0xbe, 0xef])));
+        let cases = [
+            (
+                or(
+                    col("status_code").eq(lit(500i64)),
+                    col("status_code").eq(lit(404i64)),
+                ),
+                in_list_key("status_code", vec![lit(500i64), lit(404i64)]),
+            ),
+            (
+                or(
+                    lit(500i64).eq(col("status_code")),
+                    col("status_code").eq(lit(404i64)),
+                ),
+                in_list_key("status_code", vec![lit(500i64), lit(404i64)]),
+            ),
+            (
+                or(col("region").eq(lit("eu")), lit("us").eq(col("region"))),
+                in_list_key("region", vec![lit("eu"), lit("us")]),
+            ),
+            (
+                or(
+                    col("digest").eq(digest_a.clone()),
+                    col("digest").eq(digest_b.clone()),
+                ),
+                in_list_key("digest", vec![digest_a, digest_b]),
+            ),
+            (
+                or(
+                    col(TRACE_ID_FIELD).eq(trace_hex()),
+                    col(TRACE_ID_FIELD).eq(trace_bin()),
+                ),
+                in_list_key(TRACE_ID_FIELD, vec![trace_hex(), trace_bin()]),
+            ),
+        ];
+        for (e, want) in cases {
+            let want = want.expect("the IN list carries a key set");
+            assert_eq!(want.keys().len(), 2, "{e}");
+            let p = keyed(std::slice::from_ref(&e), &d);
+            assert_eq!(p.key_in.as_ref(), Some(&want), "{e}");
+            assert!(p.key_equals.is_empty(), "{e}");
+            let under_and = and(col("ts").gt_eq(ts_lit(1)), e.clone());
+            assert_eq!(keyed(&[under_and], &d).key_in, Some(want), "{e}");
+        }
+        let k = keyed(
+            &[or(
+                col(TRACE_ID_FIELD).eq(trace_hex()),
+                col(TRACE_ID_FIELD).eq(trace_bin()),
+            )],
+            &d,
+        )
+        .key_in
+        .expect("trace set");
+        assert_eq!(k.key_type(), KeyType::Id16);
+    }
+
+    /// Three equalities on one key column, in either nesting of `OR`, carry
+    /// exactly the key set of the three-value `IN` list.
+    #[test]
+    fn a_three_value_key_disjunction_is_a_key_set() {
+        let d = keyed_decl();
+        let eq = |v: i64| col("status_code").eq(lit(v));
+        let want = in_list_key("status_code", vec![lit(1i64), lit(2i64), lit(3i64)])
+            .expect("the IN list carries a key set");
+        assert_eq!(want.keys().len(), 3);
+        for e in [or(or(eq(1), eq(2)), eq(3)), or(eq(1), or(eq(2), eq(3)))] {
+            assert_eq!(
+                keyed(std::slice::from_ref(&e), &d).key_in.as_ref(),
+                Some(&want),
+                "{e}"
+            );
+        }
+        let teq = |l: Expr| col(TRACE_ID_FIELD).eq(l);
+        let third = lit(ScalarValue::Binary(Some(vec![9u8; 16])));
+        let want = in_list_key(
+            TRACE_ID_FIELD,
+            vec![trace_hex(), trace_bin(), third.clone()],
+        )
+        .expect("the trace list carries a key set");
+        assert_eq!(want.keys().len(), 3);
+        let e = or(teq(trace_hex()), or(teq(trace_bin()), teq(third)));
+        assert_eq!(keyed(&[e], &d).key_in, Some(want));
+    }
+
+    /// Equalities on two different key-index columns of one type carry no key.
+    #[test]
+    fn a_disjunction_across_two_key_columns_carries_no_key() {
+        let (d, k) = two_key_decl();
+        for e in [
+            or(
+                col("status_code").eq(lit(1i64)),
+                col("retries").eq(lit(2i64)),
+            ),
+            or(
+                or(
+                    col("status_code").eq(lit(1i64)),
+                    col("status_code").eq(lit(2i64)),
+                ),
+                col("retries").eq(lit(3i64)),
+            ),
+            or(
+                col("status_code").eq(lit(1i64)),
+                col("region").eq(lit("eu")),
+            ),
+        ] {
+            let p = extract_logs_keyed(std::slice::from_ref(&e), &d, &k);
+            assert!(p.key_in.is_none(), "{e}");
+        }
+    }
+
+    /// An arm on a column outside the key index carries no key.
+    #[test]
+    fn a_disjunction_with_a_non_key_arm_carries_no_key() {
+        let (d, k) = two_key_decl();
+        for e in [
+            or(
+                col("status_code").eq(lit(1i64)),
+                col("latency_ms").eq(lit(2i64)),
+            ),
+            or(
+                col("latency_ms").eq(lit(1i64)),
+                col("status_code").eq(lit(2i64)),
+            ),
+            or(col("status_code").eq(lit(1i64)), col("body").eq(lit("x"))),
+        ] {
+            let p = extract_logs_keyed(std::slice::from_ref(&e), &d, &k);
+            assert!(p.key_in.is_none(), "{e}");
+        }
+    }
+
+    /// An arm other than `=` carries no key.
+    #[test]
+    fn a_non_equality_arm_carries_no_key() {
+        let d = keyed_decl();
+        for e in [
+            or(
+                col("status_code").gt(lit(1i64)),
+                col("status_code").eq(lit(2i64)),
+            ),
+            or(
+                col("status_code").eq(lit(1i64)),
+                col("status_code").lt_eq(lit(2i64)),
+            ),
+            or(
+                col("status_code").eq(lit(1i64)),
+                col("status_code").not_eq(lit(2i64)),
+            ),
+            or(
+                col("status_code").eq(lit(1i64)),
+                and(
+                    col("status_code").eq(lit(2i64)),
+                    col("region").eq(lit("eu")),
+                ),
+            ),
+        ] {
+            assert!(keyed(std::slice::from_ref(&e), &d).key_in.is_none(), "{e}");
+        }
+    }
+
+    /// A NULL literal, a mixed-type literal and a wrong-width trace id each
+    /// leave the disjunction without a key.
+    #[test]
+    fn a_refused_literal_leaves_the_disjunction_without_a_key() {
+        let d = keyed_decl();
+        let short = lit(ScalarValue::Binary(Some(vec![7u8; 8])));
+        for e in [
+            or(
+                col("status_code").eq(lit(ScalarValue::Int64(None))),
+                col("status_code").eq(lit(2i64)),
+            ),
+            or(
+                col("status_code").eq(lit(1i64)),
+                col("status_code").eq(lit("2")),
+            ),
+            or(
+                col(TRACE_ID_FIELD).eq(trace_bin()),
+                col(TRACE_ID_FIELD).eq(short),
+            ),
+            or(
+                col(TRACE_ID_FIELD).eq(trace_hex()),
+                col(TRACE_ID_FIELD).eq(lit("0011")),
+            ),
+        ] {
+            assert!(keyed(std::slice::from_ref(&e), &d).key_in.is_none(), "{e}");
+        }
+    }
+
+    /// A disjunction that carries a key set stays `Inexact`: the residual
+    /// re-applies it over full values.
+    #[test]
+    fn a_key_disjunction_residual_stays_inexact() {
+        let d = keyed_decl();
+        for e in [
+            or(
+                col("status_code").eq(lit(1i64)),
+                col("status_code").eq(lit(2i64)),
+            ),
+            or(col("region").eq(lit("eu")), col("region").eq(lit("us"))),
+            or(
+                col(TRACE_ID_FIELD).eq(trace_hex()),
+                col(TRACE_ID_FIELD).eq(trace_bin()),
+            ),
+        ] {
+            assert!(keyed(std::slice::from_ref(&e), &d).key_in.is_some(), "{e}");
+            assert!(!filter_is_exact(&e, &d), "{e} must stay Inexact");
+        }
+    }
+}

@@ -1,0 +1,15 @@
+{
+  "id": "C4",
+  "answer_facts": [
+    {"fact": "no data in scope for u-9999", "pattern": "no (data|rows|matches|events|activity|records)|zero (rows|matches)|0 rows|nothing"},
+    {"fact": "searched on user.id", "pattern": "user\\.id"},
+    {"fact": "metrics not covered", "pattern": "metric"}
+  ],
+  "evidence": [
+    {"item": "the keys searched", "pattern": "user\\.id"},
+    {"item": "the sources not covered", "pattern": "not covered|did not (search|cover)|metrics"}
+  ],
+  "tools_expected": ["ravel_search_logs", "ravel_query_sql"],
+  "call_bound": 8,
+  "fixture_refs": ["entities.security.user_key"]
+}

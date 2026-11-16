@@ -1,0 +1,8 @@
+{
+  "id": "B4",
+  "journey": "B",
+  "question": "Checkout's 5xx count rose this hour. Compare its 5xx rate against the 10 minutes before the rise, find the failed traces, and quote the error logs on those trace ids. Report what the data shows; say so where the data does not establish a cause.",
+  "window": {"from": "T0", "to": "T0+60m"},
+  "budget": {"deadline_ms": 30000, "max_rows": null, "max_bytes_scanned": null, "max_store_requests": null},
+  "tags": []
+}

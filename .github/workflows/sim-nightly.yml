@@ -1,0 +1,122 @@
+# Nightly deterministic-simulation seed batch (ADR-0068 decision 6).
+#
+# The per-PR smoke batch already runs inside the normal ci.yml check job
+# (ravel-sim's seed_batch_runs_clean test, seeds 1..=5). This workflow is the
+# wide nightly sweep: a contiguous seed range through a full cycle each, every
+# failure naming its seed so it can be replayed locally with
+# RAVEL_SIM_SEED=<seed> cargo test -p ravel-sim. Flaky seeds are determinism
+# bugs by definition, so any red run here is a real bug, never a retry.
+#
+# The agents-sim job does the same for ravel-agents-sim (epic #3331). The
+# per-PR check job runs that crate's tests on its default batch, 64 seeds per
+# schedule from 0x5eed_0000 with every schedule's totals pinned. The job runs
+# that batch through crates/ravel-agents-sim/nightly.sh, which also fails when
+# a schedule's batch line is missing or doubled, then the same batch with
+# RAVEL_AGENTS_PAGE_ENTRIES=2, which asserts the size-2 pins
+# (schedules::pinned_by_page), then a fresh 512-seed window
+# per schedule. The window's first seed is the UTC day number times 1,000,000,
+# so consecutive nights never overlap, and the job summary prints the
+# RAVEL_SIM_SEED/RAVEL_SIM_SEEDS pair that replays it. A fresh window has no
+# pinned totals; it fails only on a per-seed invariant, and the failure message
+# names the seed.
+#
+# workflow_dispatch exists both to verify the job on a pushed branch (no local
+# gate can execute a workflow) and to run ad-hoc wider or targeted ranges.
+name: sim-nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "First master seed in the batch"
+        required: false
+        default: "1"
+      count:
+        description: "Number of consecutive seeds to run"
+        required: false
+        default: "200"
+      agents_seed:
+        description: "agents-sim: first seed of the fresh window (decimal); empty for today's"
+        required: false
+        default: ""
+      agents_seeds:
+        description: "agents-sim: seeds per schedule in the fresh window"
+        required: false
+        default: "512"
+
+concurrency:
+  group: sim-nightly
+  cancel-in-progress: false
+
+# Workflow-level permissions floor (issue #1717). Each job here checks out
+# the tree and runs cargo, which runs a dependency build script for each crate
+# in the graph with this token in the environment. It reports through the job
+# result alone, so `contents: read` is all it needs.
+permissions:
+  contents: read
+
+jobs:
+  seed-batch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Nothing after this checkout runs git against the remote, so the
+          # workflow token has no reason to sit in .git/config where a
+          # dependency build script could read it.
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Run seed batch
+        env:
+          RAVEL_SIM_BATCH_START: ${{ github.event.inputs.start || '1' }}
+          RAVEL_SIM_BATCH_COUNT: ${{ github.event.inputs.count || '200' }}
+        run: cargo run --locked --profile ci -p ravel-sim --example nightly_seed_batch
+
+  agents-sim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Default batch (pinned totals)
+        run: crates/ravel-agents-sim/nightly.sh .gate-logs/sim-default.log
+      - name: Default batch at page size 2 (pinned totals)
+        if: ${{ !cancelled() }}
+        env:
+          RAVEL_AGENTS_PAGE_ENTRIES: "2"
+        run: crates/ravel-agents-sim/nightly.sh .gate-logs/sim-default-pages-2.log
+      - name: Fresh window
+        if: ${{ !cancelled() }}
+        env:
+          INPUT_SEED: ${{ github.event.inputs.agents_seed }}
+          INPUT_SEEDS: ${{ github.event.inputs.agents_seeds }}
+        run: |
+          day="$(( $(date -u +%s) / 86400 ))"
+          seed="${INPUT_SEED:-$(( day * 1000000 ))}"
+          seeds="${INPUT_SEEDS:-512}"
+          echo "replay: RAVEL_SIM_SEED=$seed RAVEL_SIM_SEEDS=$seeds crates/ravel-agents-sim/nightly.sh"
+          echo "replay: \`RAVEL_SIM_SEED=$seed RAVEL_SIM_SEEDS=$seeds crates/ravel-agents-sim/nightly.sh\`" >> "$GITHUB_STEP_SUMMARY"
+          RAVEL_SIM_SEED="$seed" RAVEL_SIM_SEEDS="$seeds" \
+            crates/ravel-agents-sim/nightly.sh .gate-logs/sim-window.log
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agents-sim-nightly-logs
+          path: .gate-logs
+          if-no-files-found: ignore

@@ -1,0 +1,40 @@
+string_fingerprint stamp git=529f286d144060e35d0fa06e9fb8ed67d0d8379f arch=x86_64 nproc=16 mem_total_kib=32132612 corpus_file=SSH.log corpus_sha256=89eee9e36c182722f9fadc6e5617a4818ffc66109e7e222b8f9e8b78fc3aa2f3 corpus_bytes=73417506 zstd_level=3 cpu_clock=CLOCK_THREAD_CPUTIME_ID
+string_fingerprint params column=value gram_len=3 budget_share=0.01 fallback_min_bits=256 zstd_level=3 block_records=8192 object_records=262144 max_lines=655147 seed=3710 literals_per_kind=40 eq_max_len=1024 like_min_len=5 like_max_len=12
+string_fingerprint workload training present equals=20 like=20 absent equals=20 like=20; evaluation present equals=20 like=20 absent equals=20 like=20
+string_fingerprint figure openssh_body/lines = 655147 predict 655147 band [655147, 655147] ok
+string_fingerprint figure openssh_body/blocks = 80 predict 80 band [80, 80] ok
+string_fingerprint figure openssh_body/column_bytes = 72107214 predict 72107214 band [72107214, 72107214] ok
+string_fingerprint figure openssh_body/compressed_bytes = 4904644 predict 4904644 band [3430000, 6380000] ok
+string_fingerprint figure openssh_body/zstd_cpu_s = 0.08885817300000004 predict 0.1 band [0.03, 0.3] ok
+string_fingerprint figure openssh_body/build_cpu_over_zstd = 11.011476794599407 predict 2.5 band [1, 6] MISS
+string_fingerprint figure openssh_body/candidate_grams = 1134 predict 1300 band [400, 3000] ok
+string_fingerprint figure openssh_body/learned_bits = 585 predict 500 band [50, 2000] ok
+string_fingerprint figure openssh_body/fallback_bits = 4143 predict 4250 band [1500, 6500] ok
+string_fingerprint figure openssh_body/bits_per_block = 4728 predict 4750 band [3300, 6500] ok
+string_fingerprint figure openssh_body/summary_bytes_share = 0.009997667516745355 predict 0.0099 band [0.0095, 0.01] ok
+string_fingerprint figure openssh_body/fallback_density = 0.4375573256094617 predict 0.8 band [0.5, 0.97] MISS
+string_fingerprint figure openssh_body/eval_equals_bloom_testable = 0 predict 0 band [0, 0] ok
+string_fingerprint figure openssh_body/seen/equals/false_positive_share = 0.007861635220125786 predict 0.5 band [0.1, 0.95] MISS
+string_fingerprint figure openssh_body/seen/like/false_positive_share = 0.12454379562043795 predict 0.5 band [0.1, 0.95] ok
+string_fingerprint figure openssh_body/unseen/equals/false_positive_share = 0.006918238993710692 predict 0.9 band [0.6, 1] MISS
+string_fingerprint figure openssh_body/unseen/like/false_positive_share = 0.2861826697892272 predict 0.85 band [0.5, 1] MISS
+string_fingerprint figure openssh_body/unseen/equals_absent/false_positive_share = 0.005 predict 0.9 band [0.6, 1] MISS
+string_fingerprint figure openssh_body/unseen/like_absent/false_positive_share = 0.27875 predict 0.9 band [0.5, 1] MISS
+string_fingerprint figure openssh_body/production/equals/false_positive_share = 1 predict 1 band [0.95, 1] ok
+string_fingerprint figure openssh_body/contains/like/cells_tested_per_row = 1 predict 1 band [0.8, 1.2] ok
+string_fingerprint figure openssh_body/summary/like/cells_tested_share = 0.5237252097620839 predict 0.9 band [0.5, 1] ok
+string_fingerprint figure openssh_body/saturation/long_values = 0 predict 0 band [0, 0] ok
+string_fingerprint figure openssh_body/bloom/equals/false_positive_share absent as pre-registered (no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0))
+string_fingerprint figure openssh_body/saturation/blocks absent as pre-registered (no value over 1024 bytes (describe over_1024_bytes=0))
+string_fingerprint figure openssh_body/saturation/fallback_density absent as pre-registered (no value over 1024 bytes (describe over_1024_bytes=0))
+string_fingerprint figure openssh_body/saturation/unseen/like/false_positive_share absent as pre-registered (no value over 1024 bytes (describe over_1024_bytes=0))
+string_fingerprint figure openssh_body/summary/equals_bloom_testable/false_positive_share absent as pre-registered (no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0))
+string_fingerprint decision openssh_body: NO-GO; unseen_equals_fp=0.0069 unseen_like_fp=0.2862 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=11.0115 (bar 2); fails: unseen_like, cpu; saturation untested (no value over 1024 bytes) (saturation_fp=missing, bar 0.3)
+string_fingerprint objects=3 object_bytes=5440880
+string_fingerprint miss openssh_body/build_cpu_over_zstd: 11.011476794599407 outside band [1.0, 6.0]
+string_fingerprint miss openssh_body/fallback_density: 0.4375573256094617 outside band [0.5, 0.97]
+string_fingerprint miss openssh_body/seen/equals/false_positive_share: 0.007861635220125786 outside band [0.1, 0.95]
+string_fingerprint miss openssh_body/unseen/equals/false_positive_share: 0.006918238993710692 outside band [0.6, 1.0]
+string_fingerprint miss openssh_body/unseen/equals_absent/false_positive_share: 0.005 outside band [0.6, 1.0]
+string_fingerprint miss openssh_body/unseen/like/false_positive_share: 0.2861826697892272 outside band [0.5, 1.0]
+string_fingerprint miss openssh_body/unseen/like_absent/false_positive_share: 0.27875 outside band [0.5, 1.0]

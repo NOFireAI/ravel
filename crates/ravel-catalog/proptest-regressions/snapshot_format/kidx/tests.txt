@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 56573f44f522de9516419bc6ce549728687e9436b2e8bb5cd2cf495491cc7f40 # shrinks to entries = [KeyIndexLeafEntry { key8: [70, 207, 213, 94, 171, 244, 32, 214], entry_ordinal: 0, blocks: [0] }], uncovered = [], bucket_bits = None, lookup = 0, reversed = false

@@ -1,0 +1,748 @@
+//! Error taxonomy for the compactor. Every stored-byte or protocol
+//! inconsistency is a typed variant; nothing panics on adversarial input
+//! (CLAUDE.md invariants).
+
+use ravel_commit::erasure::ErasureError;
+use ravel_commit::keys::{KeyError, ReconstructionError};
+use ravel_commit::record::RecordError;
+use ravel_logseg::LogSegError;
+use ravel_object_store::StoreError;
+use ravel_rspan::SpanSegError;
+use ravel_segment::SegmentError;
+
+/// Where in a cursor's life the merge cursor budget refused
+/// (ADR-0979 decision 4 as amended). Both sites check the same budget against
+/// the same running charge; they differ in what the refused bytes would have
+/// paid for, and an operator reading the error needs to know which, because
+/// only the admission site is fixed by admitting fewer cursors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeCursorBudgetSite {
+    /// Admitting a new cursor: the reservation of the batch member at
+    /// `batch_position` (0-based) of a batch of `batch_len` crossed the budget.
+    /// The whole batch is what merge order requires before the next emit, so a
+    /// refusal at any position aborts the run.
+    Admission {
+        /// Position, within the admission batch, of the cursor whose
+        /// reservation crossed the budget (0-based).
+        batch_position: usize,
+        /// How many cursors the refused admission batch holds.
+        batch_len: usize,
+    },
+    /// Growing an already-open cursor's charge to cover the block it is about
+    /// to decode. The growth is checked BEFORE the decode starts, so the
+    /// refusal costs nothing but the run: the larger block was never
+    /// materialized.
+    BlockGrow {
+        /// Whole-object index of the block whose decode was refused.
+        block_index: usize,
+        /// How much the cursor's charge had to grow to cover that block's
+        /// pre-decode ceiling on top of the metadata and raw bytes it already
+        /// holds.
+        grow_bytes: u64,
+    },
+    /// Growing an already-open cursor's charge to cover the two-block raw
+    /// prefetch `next_raw_block` is about to issue. The growth is checked
+    /// BEFORE the `try_join!` that fetches, so the refusal costs nothing but
+    /// the run: no byte was moved and nothing was allocated.
+    RawFetch {
+        /// Index, into the stream's candidate loc list, of the first loc the
+        /// refused fetch would have read.
+        first_loc_index: usize,
+        /// How many locs the refused fetch would have read: one, or two when
+        /// `try_join!`'s look-ahead prefetch applies (issue #711).
+        loc_count: usize,
+        /// Combined raw byte count of the locs the refused fetch would have
+        /// landed.
+        fetch_bytes: u64,
+    },
+}
+
+impl std::fmt::Display for MergeCursorBudgetSite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission {
+                batch_position,
+                batch_len,
+            } => write!(
+                f,
+                "admitting the batch merge order requires (position {batch_position} of {batch_len})"
+            ),
+            Self::BlockGrow {
+                block_index,
+                grow_bytes,
+            } => write!(
+                f,
+                "growing an open cursor by {grow_bytes} bytes to decode block {block_index} before that decode starts"
+            ),
+            Self::RawFetch {
+                first_loc_index,
+                loc_count,
+                fetch_bytes,
+            } => write!(
+                f,
+                "growing an open cursor to fetch {fetch_bytes} raw bytes across {loc_count} loc(s) starting at loc {first_loc_index} before that fetch starts"
+            ),
+        }
+    }
+}
+
+/// Which ADR-3853 check refused a two-level RLOG merge, with the figures it
+/// compared. Every check runs before the step it guards does any work, so a
+/// refusal publishes nothing and leaves the L0 inputs live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TwoLevelCheck {
+    /// Constraint (a) at the unit's level-1 worker count admits fewer than two
+    /// inputs per group: `G = floor((ceiling - run_target) / per_input)` is
+    /// below 2, so level 1 would not reduce the input count.
+    GroupSize {
+        /// The largest per-input term, raw candidate row-group bytes plus the
+        /// summed pass price of the input's blocks.
+        per_input_bytes: u64,
+        /// The memory split target a run part closes at.
+        run_target_bytes: u64,
+        /// The per-worker resident ceiling `C = U / W1`: `U` itself unless
+        /// `CompactorConfig::level1_workers` names more than one worker.
+        ceiling_bytes: u64,
+        /// The group size the figures admit.
+        group_size: u64,
+    },
+    /// Constraint (b): two blocks per run, plus the reads in flight, plus the
+    /// final part target, does not fit the resident ceiling at level 2. A run
+    /// is written stream by stream, so a stream smaller than a part sits in
+    /// one of its parts, or in two when a cut falls inside it (ADR-3853,
+    /// #3943 correction). The block term is the larger of
+    /// `runs x blocks_per_run x run_block_bytes` and the largest stream's
+    /// level-2 estimate, which prices a larger stream. With several level-2
+    /// workers the ceiling is one worker's share, `U / W2` (ADR-3853 D5
+    /// amendment).
+    LevelTwoFit {
+        /// Runs merged at level 2, one per level-1 group, however many parts
+        /// each was cut into.
+        runs: u64,
+        /// The level-2 blocks priced per run, 2.
+        blocks_per_run: u64,
+        /// The largest pass price of one run block.
+        run_block_bytes: u64,
+        /// The largest level-2 stream estimate: the summed pass price of every
+        /// run block carrying the stream.
+        stream_estimate_bytes: u64,
+        /// Bytes of the `input_read_concurrency` largest run row groups.
+        in_flight_bytes: u64,
+        /// The final parts' memory split target.
+        part_target_bytes: u64,
+        /// The ceiling one level-2 worker plans under: `U / W2`, `U` itself
+        /// at one worker. At `W2 > 1` the worker's passes are planned under
+        /// this less one final part target, its inline builder's.
+        ceiling_bytes: u64,
+    },
+    /// Constraint (b) priced before level 1 reads a block (ADR-3853 D4, D5):
+    /// at no level-1 worker count up to the unit's core share do the runs
+    /// level 1 would write fit one level-2 worker (or the configured level-2
+    /// worker count), so the unit is refused without running level 1. Shown
+    /// at one worker, the count with the fewest runs.
+    PredictedLevelTwoFit {
+        /// Runs level 1 would write at one worker, `ceil(N / G)`.
+        runs: u64,
+        /// The level-2 blocks priced per run, 2.
+        blocks_per_run: u64,
+        /// The predicted price of one level-2 block: the input blocks' highest
+        /// price per record at the records a run block holds.
+        block_bytes: u64,
+        /// `P`, the largest per-input term of constraint (a).
+        per_input_bytes: u64,
+        /// `G`, the group size constraint (a) gives at one worker.
+        group_size: u64,
+        /// Bytes of the `input_read_concurrency` largest input row groups.
+        in_flight_bytes: u64,
+        /// The final parts' memory split target.
+        part_target_bytes: u64,
+        /// The ceiling one level-2 worker plans under: the resident ceiling
+        /// `U`, or `U / W2` with the level-2 worker count configured.
+        ceiling_bytes: u64,
+    },
+}
+
+impl std::fmt::Display for TwoLevelCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GroupSize {
+                per_input_bytes,
+                run_target_bytes,
+                ceiling_bytes,
+                group_size,
+            } => write!(
+                f,
+                "level-1 group size {group_size} is below 2: per input {per_input_bytes} bytes, run target {run_target_bytes} bytes, ceiling {ceiling_bytes} bytes (constraint a)"
+            ),
+            Self::LevelTwoFit {
+                runs,
+                blocks_per_run,
+                run_block_bytes,
+                stream_estimate_bytes,
+                in_flight_bytes,
+                part_target_bytes,
+                ceiling_bytes,
+            } => write!(
+                f,
+                "level 2 over {runs} runs at {blocks_per_run} blocks per run needs the larger of {runs} x {blocks_per_run} x {run_block_bytes} and the largest stream estimate {stream_estimate_bytes}, + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes (constraint b)"
+            ),
+            Self::PredictedLevelTwoFit {
+                runs,
+                blocks_per_run,
+                block_bytes,
+                per_input_bytes,
+                group_size,
+                in_flight_bytes,
+                part_target_bytes,
+                ceiling_bytes,
+            } => write!(
+                f,
+                "level 2 over a predicted {runs} runs of group size {group_size} at {per_input_bytes} bytes per input needs {runs} x {blocks_per_run} blocks x {block_bytes} + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes at every level-1 worker count (constraint b, refused before level 1)"
+            ),
+        }
+    }
+}
+
+/// A compaction run's failure. Retryable store faults surface as
+/// [`MaintainError::Store`] carrying the underlying [`StoreError`]; the caller
+/// decides whether to re-run the whole bucket (the idempotent recovery path). The `*Divergence` and `*Mismatch` variants are invariant
+/// breaches that must never be silently worked around.
+#[derive(Debug, thiserror::Error)]
+pub enum MaintainError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Key(#[from] KeyError),
+    #[error(transparent)]
+    Reconstruction(#[from] ReconstructionError),
+    #[error(transparent)]
+    Record(#[from] RecordError),
+    #[error(transparent)]
+    Segment(#[from] SegmentError),
+    #[error(transparent)]
+    LogSeg(#[from] LogSegError),
+    #[error(transparent)]
+    SpanSeg(#[from] SpanSegError),
+    #[error(transparent)]
+    Erasure(#[from] ErasureError),
+    #[error("segment write error: {0}")]
+    Write(String),
+    #[error(
+        "two inputs claim log stream {stream_id} with different resource+scope attribute blobs ({a_len} and {b_len} bytes): stream identity is violated upstream or a stream-id hash collided (fatal invariant breach)"
+    )]
+    StreamAttrsConflict {
+        stream_id: String,
+        a_len: usize,
+        b_len: usize,
+    },
+    /// An input object the codec's writer would refuse to rewrite
+    /// ([`crate::codec::SegmentCodec::unwritable_input`]), found before the
+    /// merge by a run that must carry every input: format migration and the
+    /// erasure rewrite. Compaction leaves such an input out instead (issue
+    /// #2554). Nothing was written.
+    #[error(
+        "input object {object_key:?} cannot be rewritten ({}): {detail}; nothing written (issue #2580)",
+        reason.name()
+    )]
+    UnwritableInput {
+        object_key: String,
+        reason: crate::compact::CompactionInputSkipReason,
+        /// The decoder's refusal.
+        detail: String,
+    },
+    /// An RSEG rewrite input recorded at a format version above the one this
+    /// build writes (ADR-0066 decision 2), or a compaction record a re-encode
+    /// would supersede that names a part recorded above it; `commit_key` is
+    /// then the compaction record's key. Refused before any decode or PUT.
+    #[error(
+        "RSEG rewrite input or re-encoded compaction record {commit_key:?} is recorded as format version {version}, newer than the current output version {writable}: a rewrite migrates an older object forward and cannot write a version this build does not know, so a newer-than-writable input is refused fail-closed (ADR-0066 decision 2)"
+    )]
+    NewerThanWritable {
+        commit_key: String,
+        version: u32,
+        writable: u32,
+    },
+    /// A strict listing (ADR-4233 decision 6) found a key under `prefix` that
+    /// the census cannot address. `count` is how many such keys the listing
+    /// reported; `key` is the first of them.
+    #[error(
+        "listing {prefix:?} holds {count} key(s) the census cannot address, first {key:?}; the run fails rather than shorten the population (ADR-4233 decision 6)"
+    )]
+    UnaddressableKey {
+        prefix: String,
+        key: String,
+        count: u64,
+    },
+    /// A migrate walk held one or more buckets (ADR-4233 decision 6): the walk
+    /// went on past each, and the floor was not raised. `report` is the walk's
+    /// report as it stood when the run stopped.
+    #[error(
+        "migrate held {} bucket(s) and did not raise the floor: {}",
+        held.len(),
+        crate::migrate::display_held(held)
+    )]
+    MigrateHeld {
+        held: Vec<crate::migrate::MigrateHeldBucket>,
+        report: Box<crate::migrate::FamilyMigrateReport>,
+    },
+    #[error("unknown object shape in bucket listing: {0:?}")]
+    UnknownBucketEntry(String),
+    #[error("decoded record signal {actual} does not match the queried signal {expected}")]
+    SignalMismatch { expected: String, actual: String },
+    /// The run's advisory compaction claim was lost at a cancellation
+    /// checkpoint (ADR-1029 decision 3). Internal plumbing, not an operator
+    /// failure: it unwinds the merge pipeline to
+    /// [`crate::rewrite::rewrite_and_publish`], which turns it into
+    /// [`crate::publish::PublishOutcome::Abandoned`], so no caller ever
+    /// receives it. Nothing was published.
+    #[error(
+        "compaction claim lost at the {at} checkpoint; the run cancelled and published nothing (ADR-1029 decision 3)"
+    )]
+    ClaimLost { at: &'static str },
+    /// An input object's reader refused its trailer format version
+    /// (`UnsupportedVersion` from RSEG, RLOG or RSPAN), with the object's key
+    /// and the content hash its commit record holds. Compaction checks the
+    /// object's bytes against that hash and holds the bucket
+    /// ([`crate::compact::CompactionOutcome::HeldOutOfWindow`]) on a match, or
+    /// fails with `source` on a mismatch, since the readers check the version
+    /// before the footer CRC and a corrupted version field reads the same.
+    /// `source` is the reader's refusal, or the codec's pre-check refusal of a
+    /// record stamped newer than this build writes when the reader refused
+    /// that record's object too. Every other rewrite gets `source` back
+    /// unchanged. Displays as `source`.
+    #[error("{source}")]
+    InputOutOfWindow {
+        object_key: String,
+        version: u16,
+        content_hash: Vec<u8>,
+        source: Box<MaintainError>,
+    },
+    /// A renewal at a cancellation checkpoint failed with a genuine store
+    /// error (ADR-1029 decision 3): distinct from [`MaintainError::ClaimLost`],
+    /// which means the claim was stolen or is gone. Not internal plumbing
+    /// like `ClaimLost` -- it propagates as a hard error and aborts the run,
+    /// exactly as `Store` did before this variant existed.
+    #[error(
+        "compaction claim renewal at the {at} checkpoint failed with a store error (not a lost claim): {source}"
+    )]
+    ClaimRenewFailed {
+        at: &'static str,
+        #[source]
+        source: StoreError,
+    },
+    #[error(
+        "sealed bucket holds two compaction records with different input_set_hash (fatal invariant breach at {observed_key:?}): ours {ours}, theirs {theirs}"
+    )]
+    InputSetHashDivergence {
+        observed_key: String,
+        ours: String,
+        theirs: String,
+    },
+    #[error(
+        "compaction record-count conservation violated for tenant {tenant_hash} signal {signal} shard {shard} hour {ingest_hour_bucket}: inputs carry {input_sample_count} records, built parts carry {part_sample_count}; the merge dropped or invented records, publish aborted (fatal invariant breach, ADR-0048)"
+    )]
+    ConservationViolation {
+        /// Hex tenant hash of the bucket (the key-prefix form operators see).
+        tenant_hash: String,
+        /// Signal key prefix (`m`, `l`, `s`).
+        signal: String,
+        shard: u32,
+        ingest_hour_bucket: u32,
+        /// Sum of `sample_count` over the compaction input set.
+        input_sample_count: u64,
+        /// Sum of `sample_count` over the built output parts.
+        part_sample_count: u64,
+    },
+    #[error(
+        "rspan compaction input record-count cross-check failed for object {object_key:?}: the streaming k-way merge decoded {decoded_record_count} records from this input but its footer declares {footer_record_count} (a logically inconsistent but CRC-valid input, silent decode-side record loss or gain, fatal invariant breach); publish aborted, nothing written"
+    )]
+    SpanInputRecordCountMismatch {
+        /// Data-object key of the input whose decode diverged from its footer.
+        object_key: String,
+        /// Records the streaming merge actually decoded out of this input.
+        decoded_record_count: u64,
+        /// `record_count` this input's own RSPAN footer declares, the
+        /// independent authority the decode tally is checked against.
+        footer_record_count: u64,
+    },
+    #[error(
+        "compaction part {part_key:?} answered AlreadyExists at PUT (an abandoned run had already uploaded it) but was gone when HEAD-verified after the record PUT: a tenant tombstone or the unreferenced-part sweep deleted it in the window between our existence check and our record PUT, and the bounded compactor released its bytes so it cannot be re-PUT from RAM (ADR-0979 decision 3). The compaction record is already published and now references the absent part. No shipped command repairs that today: compact-bucket, compact-tenant and the ravel-server maintenance loop return AlreadyCompacted as soon as the bucket listing carries a compaction record, so re-running them builds and restores nothing. Hold the bucket's L0 inputs and follow issue #2370, as for ConvergedWinnerPartMissing"
+    )]
+    AlreadyExistsPartVanished {
+        /// Object key of the part that answered `AlreadyExists` at PUT but was
+        /// absent at post-publish HEAD verification.
+        part_key: String,
+    },
+    #[error(
+        "compaction converged on a prior record that references part {part_key:?}, which is absent and cannot be repaired from this run (its bytes were released at PUT under bounded compaction, or this run never built it). Reporting convergence here would leave a published record pointing at a hole that later L0 cleanup turns into data loss. No shipped command repairs this today: compact-bucket, compact-tenant and the ravel-server maintenance loop return AlreadyCompacted as soon as the bucket listing carries a compaction record, so re-running them builds nothing and restores nothing (issue #2370 tracks the repair). Until it lands the record keeps pointing at the absent part, and the superseded-input sweep deletes the bucket's L0 inputs once the record is older than the protection horizon, which makes the loss permanent. Hold those inputs with a legal hold (ravel-cli hold set --tenant <tenant> --signal <signal> --shard <shard>, which a maintenance pass honors from its next tick) and follow issue #2370. A repair has to rebuild the part under the same content-addressed key, and part boundaries depend on the settings the winning run used. An RLOG (logs) winner's parts depend on the RLOG memory split target (--l1-part-memory-target-bytes, ravel-server: --maintain-l1-part-memory-target-bytes; the winner's rlog_l1_part_memory_target_bytes report or log line names the value it resolved, and an unset flag is derived from the memory budget, merge cursor budget and claim lease of whichever process runs), the stored-size cap (--max-l1-part-bytes; the winner's rlog_max_l1_part_bytes report line names the value it ran with, and an unset flag makes it follow the derived memory target) and the compaction zstd level (--compaction-zstd-level, ravel-server: --maintain-compaction-zstd-level). A span winner's parts depend only on the span merge's memory split target, which is 256 MiB unless --l1-part-memory-target-bytes was set explicitly (the winner's rspan_l1_part_memory_target_bytes report line, or the server's startup log field of that name, names it). A metrics (RSEG) winner's parts depend only on --max-l1-part-bytes"
+    )]
+    ConvergedWinnerPartMissing {
+        /// Object key the winner record references that answered NotFound at
+        /// convergence HEAD verification and could not be re-PUT from RAM.
+        part_key: String,
+    },
+    #[error(
+        "bounded RLOG compaction merge for stream {stream_id} would exceed its cursor-memory budget: {open_cursors} cursors already open charging {charged_bytes} bytes, and {site} needs {required_bytes} bytes total against a budget of {budget_bytes} ({inputs_carrying_stream} inputs carry this stream); nothing published, the L0 inputs stay live, any parts already PUT age out under the unreferenced-part sweep (ADR-0979 decision 4). Raise merge_cursor_budget_bytes to at least {required_bytes} to compact this bucket"
+    )]
+    MergeCursorBudgetExceeded {
+        /// Hex canonical id of the stream whose cursor set overran the budget.
+        stream_id: String,
+        /// Cursors already open for this stream when the charge was refused.
+        /// On the admission site, batch members before the refused one are not
+        /// counted here: they were never opened, so they hold nothing. On the
+        /// block-growth site the cursor asking to grow IS open and is counted.
+        open_cursors: usize,
+        /// What the OPEN cursors charge at the point of refusal: their reconciled
+        /// residency, not counting any member of the refused admission batch.
+        charged_bytes: u64,
+        /// The configured [`crate::config::CompactorConfig::merge_cursor_budget_bytes`].
+        budget_bytes: u64,
+        /// Prospective total had the refused charge been taken: `charged_bytes`
+        /// plus the reservations of batch members `0..=batch_position` on the
+        /// admission site, `charged_bytes + grow_bytes` on the block-growth
+        /// site. Either way it is what merge order requires before the next
+        /// record can be emitted, so it is the figure a retry must budget for,
+        /// and a first admission already over budget still names a number.
+        required_bytes: u64,
+        /// How many inputs carry this stream, so the operator can size the fix.
+        inputs_carrying_stream: usize,
+        /// Which point in a cursor's life refused, and its site-specific
+        /// figures.
+        site: MergeCursorBudgetSite,
+    },
+    #[error(
+        "bounded RLOG compaction cannot admission-price input {object_key:?}: it carries no PAGE_DIR section, so a cursor's decode cost is unknowable before the fetch and the pre-decode reservation (ADR-0979 decision 4) cannot be charged. PAGE_DIR is mandatory in RLOG format version {format_version} (ADR-0699 decision 2), so this is a version/corruption gate, not a live path on a current-format fleet; nothing published, the L0 inputs stay live"
+    )]
+    MergeCursorInputMissingPageDir {
+        /// Data-object key of the input that carries no PAGE_DIR section.
+        object_key: String,
+        /// The RLOG output format version PAGE_DIR is mandatory in.
+        format_version: u32,
+    },
+    /// A cursor-mode merge plan would decode more than
+    /// [`crate::rlog::MAX_CURSOR_DECODE_AMPLIFICATION`] times the bucket's
+    /// record count and more than
+    /// [`crate::CompactorConfig::geometry_floor_decoded_rows`] rows in all
+    /// (default [`crate::rlog::MIN_GEOMETRY_PREDICTED_DECODED_ROWS`],
+    /// ADR-3853 D0). Raised after the catalog phase and before
+    /// the first block GET, so nothing was fetched or written.
+    #[error(
+        "RLOG compaction refused: cursor merge over {inputs} inputs, {streams} streams and {blocks} blocks would decode {predicted_decoded_rows} rows for {records} records (ADR-3853 D0); nothing fetched or published, the L0 inputs stay live"
+    )]
+    MergeGeometryUnsupported {
+        /// Input catalogs in the bucket.
+        inputs: usize,
+        /// Distinct streams across those inputs.
+        streams: usize,
+        /// Blocks across those inputs.
+        blocks: usize,
+        /// Records across those inputs.
+        records: u64,
+        /// Rows the cursor plan would decode: for every stream and every input
+        /// carrying it, the `record_count` of each candidate block, summed.
+        predicted_decoded_rows: u64,
+    },
+    /// A two-level RLOG merge (ADR-3853) failed one of its fit checks. Raised
+    /// before the step the check guards, so nothing was published.
+    #[error(
+        "RLOG compaction refused: two-level merge over {inputs} inputs cannot run: {check} (ADR-3853); nothing published, the L0 inputs stay live"
+    )]
+    MergeTwoLevelUnsupported {
+        /// Input catalogs in the bucket.
+        inputs: usize,
+        /// The check that refused, with its figures.
+        check: TwoLevelCheck,
+    },
+    /// A range of an RLOG merge needs a part index outside its window
+    /// (ADR-3853 D5 amendment): the range numbers its parts from `first`, and
+    /// the part it would open next is at `part_index`, at or past `limit`.
+    /// Refused before that part's builder opens, so its records are never
+    /// encoded. A refusal, not a failure: the same build refuses the unit
+    /// again, so a scan or maintain pass holds it as refused and goes on
+    /// ([`MaintainError::is_part_index_refusal`]).
+    #[error(
+        "RLOG compaction refused: range {range} needs part index {part_index}, outside its window [{first}, {limit}) of the part key's indexes (ADR-3853); refused before encoding that part, the L0 inputs stay live"
+    )]
+    PartRangeWindow {
+        /// The range, counted from 0 over the unit's ranges.
+        range: u64,
+        /// The first part index of the range's window.
+        first: u64,
+        /// One past the last part index the range's window held when the
+        /// part was to open: `max(index(before + Q), index(emitted))`, which
+        /// grows as the range emits.
+        limit: u64,
+        /// The part index the range needed.
+        part_index: u64,
+    },
+    /// An RLOG merge's records pass `keys` times its range quantum, so a full
+    /// range's part-index window would hold no index (ADR-3853 D5
+    /// amendment). Refused from the inputs' record counts before a part is
+    /// encoded; a refusal like [`MaintainError::PartRangeWindow`].
+    #[error(
+        "RLOG compaction refused: {records} records cut at a range quantum of {quantum} need more ranges than the part key's {keys} indexes give windows (ADR-3853); nothing published, the L0 inputs stay live"
+    )]
+    PartKeySpace {
+        /// The unit's records, summed from its inputs' footers.
+        records: u64,
+        /// The range quantum, [`crate::CompactorConfig::rlog_range_records`].
+        quantum: u64,
+        /// The part indexes a part key carries.
+        keys: u64,
+    },
+    /// The filesystem holding the scratch directory has less free space than
+    /// the two-level merge's runs need once the units of this process already
+    /// running there have their share set aside (ADR-3853 D2). Raised before
+    /// the first block GET, or when a scratch write fails for want of space
+    /// during either level.
+    #[error(
+        "RLOG compaction refused: two-level merge needs {need} bytes of scratch under {path:?} and that filesystem has {free} free with {reserved} reserved by other merges of this process (ADR-3853 D2); nothing published, the L0 inputs stay live"
+    )]
+    ScratchHeadroom {
+        /// 1.3 times the summed object sizes of the inputs.
+        need: u64,
+        /// Bytes available to an unprivileged writer on that filesystem.
+        free: u64,
+        /// Bytes the other two-level merges of this process running in the
+        /// same scratch directory hold reserved.
+        reserved: u64,
+        /// The configured scratch directory.
+        path: std::path::PathBuf,
+    },
+    /// Another process holds the scratch directory's lock (ADR-3853 D2: two
+    /// processes never share a scratch directory). Raised before the first
+    /// block GET.
+    #[error(
+        "RLOG compaction refused: scratch directory {path:?} is locked by another process (ADR-3853 D2); give each process its own scratch_dir"
+    )]
+    ScratchLocked {
+        /// The lock file inside the configured scratch directory.
+        path: std::path::PathBuf,
+    },
+    /// `statvfs` of the scratch directory failed, or, under a
+    /// `scratch_max_bytes` cap, the walk measuring the bytes under it did, so
+    /// its free bytes are unknown (ADR-3853 D2). Never read as zero free: the
+    /// unit fails with this error and the next tick asks again.
+    #[error(
+        "RLOG compaction failed: could not read the free space of scratch directory {path:?}: {error}"
+    )]
+    ScratchFreeUnreadable {
+        /// The configured scratch directory.
+        path: std::path::PathBuf,
+        /// The failed call and its error: `statvfs: ...` or `walk PATH: ...`.
+        error: String,
+    },
+    #[error("RLOG compaction refused before writing any part: {0}")]
+    InvalidRlogZstdLevel(#[from] crate::config::RlogZstdLevelError),
+    #[error("RLOG compaction refused before writing any part: {0}")]
+    InvalidRlogRunBlockTarget(#[from] crate::config::RlogRunBlockTargetError),
+    #[error("RLOG compaction refused before writing any part: {0}")]
+    InvalidRlogLevel2Setting(#[from] crate::config::RlogLevel2SettingError),
+    #[error("compaction invariant breach: {0}")]
+    Invariant(String),
+    /// The ADR-1702 read gate returned no result for a maintenance decode or
+    /// encode: the job panicked, or the runtime cancelled it while shutting
+    /// down. Nothing was written for that unit.
+    #[error("maintenance job on the CPU read gate failed: {0}")]
+    GateJob(ravel_cpu_gate::CpuGateError),
+    #[error(
+        "erasure rewrite record-count conservation violated for tenant {tenant_hash} signal {signal} shard {shard} hour {ingest_hour_bucket}: live set carries {input_sample_count} records, {output_sample_count} survived plus {dropped_sample_count} were dropped, which do not sum to the input (fatal invariant breach, ADR-0064 decision 3); publish aborted, nothing written"
+    )]
+    ErasureConservationViolation {
+        /// Hex tenant hash of the bucket (the key-prefix form operators see).
+        tenant_hash: String,
+        /// Signal key prefix (`m`, `l`, `s`).
+        signal: String,
+        shard: u32,
+        ingest_hour_bucket: u32,
+        /// Sum of `sample_count` over the live input record set.
+        input_sample_count: u64,
+        /// Sum of `sample_count` over the built surviving-record output parts.
+        output_sample_count: u64,
+        /// Sum of samples dropped by the applied erasure predicates.
+        dropped_sample_count: u64,
+    },
+    #[error(
+        "erasure rewrite input record-count cross-check failed for tenant {tenant_hash} signal {signal} shard {shard} hour {ingest_hour_bucket}: the decode scanned {scanned_record_count} input records but the input objects' footers declare {footer_record_count} (a silent decode-side record loss, fatal invariant breach, ADR-0064 decision 3); publish aborted, nothing written, originals preserved"
+    )]
+    ErasureInputConservationViolation {
+        /// Hex tenant hash of the bucket (the key-prefix form operators see).
+        tenant_hash: String,
+        /// Signal key prefix (`m`, `l`, `s`).
+        signal: String,
+        shard: u32,
+        ingest_hour_bucket: u32,
+        /// Records the decode actually scanned out of the live input objects
+        /// (the tally the conservation gate treats as the input total).
+        scanned_record_count: u64,
+        /// Sum of `record_count` declared by every live input object's footer
+        /// (RLOG/RSPAN), the independent authority the scan is checked against.
+        footer_record_count: u64,
+    },
+    #[error(
+        "erasure rewrite found no live record in a bucket that is not empty (fatal invariant breach at {bucket_prefix:?}): {live_count} compaction/rewrite records present but every one is named by another's superseded_record_key"
+    )]
+    NoLiveRecord {
+        bucket_prefix: String,
+        live_count: usize,
+    },
+    #[error(
+        "erasure rewrite found more than one live record in a bucket (fatal invariant breach at {bucket_prefix:?}): {live_keys:?} are all un-superseded, violating the resolver's at-most-one-live-record-per-generation invariant"
+    )]
+    MultipleLiveRecords {
+        bucket_prefix: String,
+        live_keys: Vec<String>,
+    },
+    #[error(
+        "provisioning-record access failed during a format migration (shard-generation range or \
+         format-floor history): {0}"
+    )]
+    Provisioning(String),
+    /// The run would have published an object below the bucket's recorded
+    /// format floor for its family, so it refused before building or PUTting
+    /// anything (ADR-1746 decision 4).
+    #[error(transparent)]
+    BelowFormatFloor(#[from] ravel_ingest::BelowFormatFloor),
+    /// The bucket's format floor could not be read before a run that checks
+    /// it, so the run built and published nothing.
+    #[error("format-floor read failed before a publish; nothing written: {0}")]
+    FormatFloorRead(String),
+    #[error("audit batch flush failed: {0}")]
+    AuditFlush(String),
+    /// The `sys/compat` write policy refused the run's publish before the
+    /// PUT it guards; nothing at a refused version was written (ADR-4233).
+    #[error("maintenance {run} refused to publish family {family}: {refusal}")]
+    CompatRefused {
+        run: &'static str,
+        family: String,
+        refusal: crate::compat_policy::CompatRunRefusal,
+    },
+    /// An input's directory names section kinds this build does not know, so
+    /// re-encoding it would drop them (ADR-4233 hazard H6). The bucket is
+    /// held; nothing was written.
+    #[error(
+        "input {object_key} (format version {recorded_version}) carries section kinds this \
+         build does not know ({kinds:?}); re-encoding it would drop them, so the bucket is held"
+    )]
+    UnknownSectionKinds {
+        object_key: String,
+        kinds: Vec<u32>,
+        /// The input's format version, from its trailer.
+        recorded_version: u16,
+    },
+    /// A compat run started for one bucket was offered to a run in another;
+    /// nothing was written under it.
+    #[error(
+        "maintenance {run} in bucket {bucket} was handed a compat run started for {run_bucket}"
+    )]
+    CompatRunBucketMismatch {
+        run: &'static str,
+        bucket: String,
+        run_bucket: String,
+    },
+    #[error(
+        "tenant discovery found a prefix under t/ that is not a valid 32-hex-character tenant hash: {0:?} (ADR-0048 decision 3; storage's key-shape discipline never permits a silent skip here)"
+    )]
+    InvalidTenantPrefix(String),
+    #[error(
+        "orphan GC mass-orphan breaker tripped for tenant {tenant_hash} signal {signal} shard {shard}: {candidates} orphan candidates out of {l0_objects_listed} listed L0 objects, at or above the breaker threshold (>= {min_count} candidates and > {max_ratio} of listed objects); halted with zero deletions, sticky until commit records are restored or force_orphan_gc overrides (ADR-0048 decision 4)"
+    )]
+    OrphanBreakerTripped {
+        /// Hex tenant hash of the shard (the key-prefix form operators see).
+        tenant_hash: String,
+        /// Signal key prefix (`m`, `l`, `s`).
+        signal: String,
+        shard: u32,
+        /// Orphan candidates left after the batched re-verify: what this
+        /// pass would have deleted.
+        candidates: usize,
+        /// L0 data objects listed this pass, the breaker ratio's denominator.
+        l0_objects_listed: usize,
+        /// The configured [`crate::config::CompactorConfig::orphan_breaker_min_count`].
+        min_count: usize,
+        /// The configured [`crate::config::CompactorConfig::orphan_breaker_max_ratio`].
+        max_ratio: f64,
+    },
+}
+
+/// Which construction of [`MaintainError::is_part_index_refusal`] fired
+/// (issue #4127): a migrate walk's [`crate::migrate::NotMigratedReason`]
+/// keeps this apart rather than the refusal's full message, since
+/// [`MaintainError`] carries an `f64` field elsewhere and so is not `Eq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartIndexRefusalKind {
+    /// [`MaintainError::PartRangeWindow`]: a range's parts outgrew its
+    /// window.
+    RangeWindow,
+    /// [`MaintainError::PartKeySpace`]: the unit's records pass the part
+    /// key's indexes times the range quantum.
+    KeySpace,
+}
+
+impl PartIndexRefusalKind {
+    /// The `refusal` label value.
+    pub fn name(self) -> &'static str {
+        match self {
+            PartIndexRefusalKind::RangeWindow => "part_range_window",
+            PartIndexRefusalKind::KeySpace => "part_key_space",
+        }
+    }
+}
+
+impl MaintainError {
+    /// The trailer version an RSEG, RLOG or RSPAN reader refused, when this
+    /// error is that refusal.
+    pub(crate) fn unsupported_version(&self) -> Option<u16> {
+        match self {
+            MaintainError::Segment(SegmentError::UnsupportedVersion(v))
+            | MaintainError::LogSeg(LogSegError::UnsupportedVersion(v))
+            | MaintainError::SpanSeg(SpanSegError::UnsupportedVersion(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Whether this error refuses an RLOG merge for its part-index windows
+    /// ([`MaintainError::PartRangeWindow`], [`MaintainError::PartKeySpace`],
+    /// ADR-3853). The same build refuses the unit again, and nothing was
+    /// published for it, so a pass holds the bucket as refused and goes on to
+    /// its other buckets instead of failing.
+    pub fn is_part_index_refusal(&self) -> bool {
+        matches!(
+            self,
+            MaintainError::PartRangeWindow { .. } | MaintainError::PartKeySpace { .. }
+        )
+    }
+
+    /// Whether the `sys/compat` write policy refused this run
+    /// ([`MaintainError::CompatRefused`]).
+    pub fn is_compat_refusal(&self) -> bool {
+        matches!(self, MaintainError::CompatRefused { .. })
+    }
+
+    /// Which part-index refusal this is, when [`Self::is_part_index_refusal`]
+    /// is true; `None` otherwise.
+    pub fn part_index_refusal_kind(&self) -> Option<PartIndexRefusalKind> {
+        match self {
+            MaintainError::PartRangeWindow { .. } => Some(PartIndexRefusalKind::RangeWindow),
+            MaintainError::PartKeySpace { .. } => Some(PartIndexRefusalKind::KeySpace),
+            _ => None,
+        }
+    }
+
+    /// The reader's own error out of [`MaintainError::InputOutOfWindow`]; any
+    /// other error unchanged.
+    pub(crate) fn without_input_context(self) -> Self {
+        match self {
+            MaintainError::InputOutOfWindow { source, .. } => *source,
+            other => other,
+        }
+    }
+}
+
+impl From<ravel_segment::WriteError> for MaintainError {
+    fn from(e: ravel_segment::WriteError) -> Self {
+        MaintainError::Write(e.to_string())
+    }
+}
+
+pub type Result<T> = std::result::Result<T, MaintainError>;

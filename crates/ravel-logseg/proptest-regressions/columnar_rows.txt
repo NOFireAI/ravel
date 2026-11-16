@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5d1011ef07c3be22c65ee0dae0f0c5f3becbac25b14e013a47470c02986874c5 # shrinks to records = [LogRecord { stream_id: LogStreamId([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), stream_attrs: [0, 0], ts_ns: 0, observed_ts_ns: 1, severity_num: 0, severity_text: "", body: "", trace_id: None, span_id: None, flags: 0, attrs: [("late", Str("")), ("late", I64(0))] }]
+cc d331c7b58468c2bc59ebb1ba960396fa9a4ea732f0e0ffaaece38cfd1f815262 # shrinks to records = [LogRecord { stream_id: LogStreamId([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), stream_attrs: [0, 0], ts_ns: 0, observed_ts_ns: 1, severity_num: 0, severity_text: "", body: "", trace_id: None, span_id: None, flags: 0, attrs: [("http.method", F64(0.0)), ("http.method", Str(""))] }], limit = 0

@@ -1,0 +1,553 @@
+// Distributed read fan-out fragment protocol (ADR-0071).
+//
+// This is a TRANSIENT wire contract between query processes, NOT a persistent
+// stored format: no byte defined here is ever written to object storage. It is
+// versioned from day one via FetchRequest.protocol_version (ADR-0071's
+// reject-unknown / silent-fallback-to-local rule for version skew). Field
+// numbers are frozen once this file merges, and every evolution is additive,
+// the same discipline the persistent schemas follow.
+//
+// The coordinator resolves ONE pinned snapshot and dispatches slices; a worker
+// executes the existing fetch path over only the listed segments and streams
+// series runs back with f64 values as raw bit patterns (NaN payloads, -0.0, and
+// the staleness marker all preserved). See docs/adrs/0071-distributed-read-fanout.md.
+syntax = "proto3";
+
+package ravel.queryfrag.v1;
+
+// One dispatched slice of a query (ADR-0071 protocol paragraph). The scope is
+// either pinned segment identities (intra-cluster: the coordinator resolved the
+// snapshot and ships explicit, reconstruct-and-verify segment references) or
+// resolve-mode matchers (cross-cluster federation: the remote resolves its own
+// snapshot). Matchers, window, budgets, deadline, erasure, and trace context
+// are threaded per fragment exactly as the local query threads them.
+message FetchRequest {
+  // The queryfrag protocol version the coordinator speaks. A worker that does
+  // not understand it triggers the coordinator's silent fallback to fully local
+  // execution (ADR-0071 failure semantics), never an error.
+  uint32 protocol_version = 1;
+  bytes query_id = 2;       // 16 bytes; correlates slices of one query
+  bytes tenant_hash = 3;    // 16 bytes
+  uint32 signal = 4;        // ravel_types::Signal discriminant
+
+  // Exactly one scope. Pinned for intra-cluster fan-out; resolve for
+  // cross-cluster federation (no segment references, no S3 credentials cross a
+  // trust boundary).
+  oneof scope {
+    PinnedScope pinned = 5;
+    ResolveScope resolve = 6;
+  }
+
+  repeated LabelMatcher matchers = 7;
+  sint64 window_start_ns = 8;   // padded event-time window, inclusive start
+  sint64 window_end_ns = 9;     // padded event-time window, inclusive end
+  Budgets budgets = 10;         // this slice's budget shares
+  sint64 deadline_unix_ns = 11; // absolute coordinator deadline
+  repeated ErasurePredicate erasure = 12;
+  string trace_context = 13;    // propagated tracing context (e.g. traceparent)
+
+  // The per-tenant, per-query fragment capability for a Pinned fetch (ADR-0071
+  // amendment): a fixed-width canonical claim set (capability version,
+  // tenant_hash, signal, query_id, expires_unix_ns) followed by a keyed-BLAKE3
+  // MAC over it. The coordinator mints one per query and attaches it to every
+  // slice; the worker recomputes the MAC and requires this request's
+  // tenant_hash/signal/query_id to equal the claims, so a capability minted
+  // for one tenant cannot authorize a fetch naming another. Replaces the
+  // shared bearer token that guarded Pinned fetches in protocol version 1.
+  // Empty on a Resolve (federation) request, which authenticates through an
+  // ordinary tenant credential instead. Additive field on this transient wire
+  // contract, exactly the evolution this file's header sanctions.
+  bytes fragment_capability = 14;
+
+  // The aggregation the coordinator wants this slice to compute itself instead
+  // of streaming raw samples (ADR-0103 decision 2). Absent means today's
+  // behavior, unchanged: the worker streams raw `SeriesFrame`s and the
+  // coordinator merges and aggregates them. Present means the worker merges its
+  // own runs locally (its exact per-series answer under decision 1's
+  // eligibility gate) and streams one `PartialAggregate` per series in place of
+  // every series frame -- all partials or all raw frames for one slice, never a
+  // mix. Additive field on this transient wire contract, exactly the evolution
+  // this file's header sanctions, and the same precedent
+  // `fragment_capability` above set.
+  //
+  // A singular message field carries explicit presence in proto3, so no
+  // `optional` keyword is needed for absent to stay distinct from a
+  // default-valued request (an all-false `PartialAggregateRequest` is the
+  // group-only enumeration, NOT "no pushdown").
+  PartialAggregateRequest partial_aggregate = 15;
+}
+
+// Which aggregates a pushdown-eligible slice must compute (ADR-0103 decision
+// 2/3). Each flag selects one field of the `PartialAggregate` frames the worker
+// returns; a flag left false leaves that field absent on the wire.
+//
+// All three false is the group-only request (distinct group enumeration, ADR-0103
+// decision 3's set-union case): the worker still returns one frame per series it
+// holds, carrying identity only. That is why no separate "group only" flag
+// exists -- the absence of all three IS the request.
+message PartialAggregateRequest {
+  bool want_count = 1;  // populate PartialAggregate.count
+  bool want_min = 2;    // populate PartialAggregate.min_bits
+  bool want_max = 3;    // populate PartialAggregate.max_bits
+
+  // The reduction window the worker filters merged samples to before it counts
+  // or folds them (ADR-0103 amendment). Matches `eval_matrix_selector`'s range
+  // convention exactly: `reduce_start_ns` is EXCLUSIVE and `reduce_end_ns` is
+  // INCLUSIVE, so a merged sample survives iff
+  // `ts_ns > reduce_start_ns && ts_ns <= reduce_end_ns`. These carry the
+  // offset/@-resolved `(start, end]` of the `_over_time` selector, NOT the
+  // coordinator's fetch window: the fetch window is deliberately left-padded
+  // for PromQL lookback and is a strict superset of this range, so the worker
+  // must never reduce over it directly.
+  //
+  // A caller MUST send BOTH or NEITHER; these two fields are one window, not two
+  // independent knobs. Both absent is the only shape any caller sends today
+  // (T1-T3, and this task adds no caller): the worker then reduces over every
+  // merged sample with no window restriction, byte-identical to the
+  // pre-amendment behavior. Both present: the worker filters to the range above
+  // before the count/min/max fold. Exactly one present is a caller bug -- a lone
+  // bound cannot define a window -- which the worker rejects with
+  // `Status.Code.INTERNAL`, never a silent one-sided filter.
+  optional sint64 reduce_start_ns = 4;  // exclusive lower bound of the reduction window
+  optional sint64 reduce_end_ns = 5;    // inclusive upper bound of the reduction window
+}
+
+// Intra-cluster scope: the explicit segment set for this slice, reconstructed
+// and verified by the worker per ADR-0071's reconstruct-don't-trust rule.
+message PinnedScope {
+  repeated SegmentIdentity segments = 1;
+}
+
+// The durable identity of one segment the worker must fetch. Every field is
+// reconstructed metadata the worker re-derives and verifies against the fetched
+// object's footer; the coordinator ships identity, never trusted bytes.
+message SegmentIdentity {
+  uint32 level = 1;
+  uint32 shard = 2;
+  uint32 ingest_hour_bucket = 3;
+  string writer_id = 4;
+  uint64 writer_epoch = 5;
+  uint64 writer_seq = 6;
+  bytes input_set_hash = 7;
+  uint32 part_index = 8;
+  bytes content_hash = 9;   // 32 bytes; blake3 of the object
+  uint64 object_size = 10;
+  uint32 segment_format_version = 11;
+}
+
+// Cross-cluster scope: the remote resolves its own snapshot from these commit
+// tokens' floor, enforcing its own admission, limits, tenancy, and erasure.
+message ResolveScope {
+  repeated string min_commit_token = 1;
+}
+
+// One label matcher, mirroring the PromQL matcher operators.
+message LabelMatcher {
+  enum Op {
+    EQ = 0;   // name == value
+    NEQ = 1;  // name != value
+    RE = 2;   // name matches regex value
+    NRE = 3;  // name does not match regex value
+  }
+  string name = 1;
+  Op op = 2;
+  string value = 3;
+}
+
+// Per-slice budget shares (ADR-0044 dimensions), tripped into the same typed
+// errors the local path produces.
+message Budgets {
+  uint64 max_series = 1;
+  uint64 max_samples = 2;
+  uint64 max_bytes_scanned = 3;
+  uint64 max_segments = 4;
+}
+
+// One erasure predicate: series whose labels all match `equals` are erased
+// within the given event-time window (right-to-erasure filtering, applied by
+// the worker before streaming).
+message ErasurePredicate {
+  repeated LabelEquals equals = 1;
+  sint64 window_start_ns = 2;
+  sint64 window_end_ns = 3;
+}
+
+message LabelEquals {
+  string name = 1;
+  string value = 2;
+}
+
+// One streamed frame of a slice's response. A slice streams zero or more
+// series/histogram frames and ends with exactly one summary frame; a slice
+// contributes to the coordinator merge only after its terminal summary arrives
+// (ADR-0071 slice atomicity), so partial frames from a failed attempt are
+// discarded whole. A slice the coordinator opted into aggregation pushdown
+// streams `partial_aggregate` frames in place of its series frames (ADR-0103
+// decision 2), under the same slice atomicity.
+message FetchResponse {
+  oneof frame {
+    SeriesFrame series = 1;
+    HistogramFrame hist = 2;
+    Summary summary = 3;
+    LogRecordFrame log_record = 4;
+    SpanFrame span = 5;
+    PartialAggregate partial_aggregate = 6;
+  }
+}
+
+// One worker-computed partial aggregate for a single group (ADR-0103 decision
+// 2): the group's series identity plus whichever of count/min/max the query
+// actually asked for. A worker sends these instead of raw sample runs when the
+// coordinator opted the query into aggregation pushdown. Decision 1's
+// eligibility gate guarantees every series in scope lives on exactly one worker,
+// so the coordinator COLLECTS one partial per series (one worker contributes
+// each series' whole partial) rather than summing counts across workers. Min/max
+// combine does not ship yet (ADR-0103 amendment: T3's `total_cmp` fold is not
+// the IEEE fold `min_over_time`/`max_over_time` compute), so no caller combines
+// `min_bits`/`max_bits` today; only `count`, from `count_over_time` pushdown, is
+// consumed.
+//
+// No dedup-key metadata rides here. ADR-0103 decision 1's eligibility gate
+// (not federated, every resolved segment inside one shard generation's stable
+// interval) is what makes it unnecessary: each worker's partial already covers
+// a provably complete, provably exclusive share of every series in the group,
+// so no cross-worker duplicate can exist to resolve.
+//
+// A group-only enumeration (distinct groups, no aggregate) carries the identity
+// fields with all three value fields absent, which is why they are proto3
+// `optional`: absent must stay distinct from a present zero count or a present
+// bound whose value happens to be 0.0.
+message PartialAggregate {
+  bytes series_id = 1;          // 16 bytes; canonical series identity
+  repeated Label labels = 2;
+  optional uint64 count = 3;
+  // Raw f64 bit patterns (fixed64), never proto doubles, exactly as
+  // `Run.value_bits` above: NaN payloads and -0.0 survive the wire
+  // byte-for-byte, so the coordinator's `total_cmp` fold sees the same values
+  // the worker's local fold did.
+  optional fixed64 min_bits = 4;   // f64::to_bits when present
+  optional fixed64 max_bits = 5;   // f64::to_bits when present
+}
+
+// One scalar series: its labels once, then its dedup-ordered runs.
+message SeriesFrame {
+  bytes series_id = 1;          // 16 bytes; canonical series identity
+  repeated Label labels = 2;
+  repeated Run runs = 3;
+}
+
+message Label {
+  string name = 1;
+  string value = 2;
+}
+
+// One run of samples from a single writer segment, in the merge total order.
+// Values are raw f64 bit patterns (fixed64), never proto doubles, so NaN
+// payloads, -0.0, and the staleness marker survive the wire byte-for-byte.
+// Timestamps are zig-zag deltas (sint64), so negative deltas encode compactly.
+message Run {
+  sint64 created_unix_ns = 1;
+  uint64 writer_epoch = 2;
+  uint64 writer_seq = 3;
+  repeated sint64 ts_delta = 4 [packed = true];
+  repeated fixed64 value_bits = 5 [packed = true];
+
+  // Per-sample dedup key columns (ADR-0092 decision 1, ADR-0096 decision 1),
+  // parallel to ts_delta. Either all four are present with length == ts_delta
+  // length, or all four are absent. Absent means run-wide provenance: the
+  // dedup key's first three elements are the run-wide created_unix_ns/
+  // writer_epoch/writer_seq fields above and its fourth element is the
+  // sample's array position. Present means a run-merged run whose samples came
+  // from different writes: these columns are then the authoritative dedup key
+  // and the run-wide fields above are not consulted for dedup on such a run.
+  //
+  // Delta-transformed exactly as ts_delta is: the first entry a delta from
+  // zero, each later entry a delta from its predecessor (zig-zag sint64 on the
+  // wire). writer_epoch/writer_seq are u64 in memory; they cross as sint64
+  // deltas via a two's-complement bit reinterpretation that round-trips every
+  // u64 losslessly. prov_in_page_index is not delta-transformed. proto3 omits
+  // empty packed repeated fields, so a run-wide run encodes byte-identical to
+  // one predating these fields.
+  repeated sint64 prov_created_delta = 6 [packed = true];
+  repeated sint64 prov_epoch_delta = 7 [packed = true];
+  repeated sint64 prov_seq_delta = 8 [packed = true];
+  repeated uint32 prov_in_page_index = 9 [packed = true];
+}
+
+// One histogram series. Mirrors SeriesFrame, but each run carries one typed
+// HistogramRecord per sample instead of scalar value bits.
+message HistogramFrame {
+  bytes series_id = 1;
+  repeated Label labels = 2;
+  repeated HistogramRun runs = 3;
+}
+
+message HistogramRun {
+  sint64 created_unix_ns = 1;
+  uint64 writer_epoch = 2;
+  uint64 writer_seq = 3;
+  repeated sint64 ts_delta = 4 [packed = true];
+  reserved 5;  // was `bytes span_payload`, the deferred opaque histogram payload (ADR-0096 decision 2)
+
+  // Per-sample dedup key columns, identical in shape and semantics to
+  // `Run`'s fields 6-9 (ADR-0096 decision 1): either all four present with
+  // length == ts_delta length, or all absent (run-wide provenance). Same
+  // delta transform, same u64->sint64 reinterpretation, same byte-identity
+  // guarantee for a run-wide run. See `Run` above.
+  repeated sint64 prov_created_delta = 6 [packed = true];
+  repeated sint64 prov_epoch_delta = 7 [packed = true];
+  repeated sint64 prov_seq_delta = 8 [packed = true];
+  repeated uint32 prov_in_page_index = 9 [packed = true];
+
+  // One typed HistogramRecord per sample, parallel to ts_delta (ADR-0096
+  // decision 2, retiring the opaque span_payload above). Mirrors
+  // ravel_segment::HistogramValue field for field; every f64 crosses as its
+  // to_bits fixed64, never a proto double, so NaN payloads and -0.0 survive the
+  // wire byte-for-byte, the same discipline Run.value_bits uses for scalars.
+  repeated HistogramRecord records = 10;
+}
+
+// One native-histogram sample value, mirroring ravel_segment::HistogramValue
+// field for field (ADR-0096 decision 2). Every f64 crosses as its to_bits
+// fixed64, never a proto double, so NaN payloads, signalling NaNs, and -0.0
+// survive the round trip exactly, matching the scalar Run.value_bits path.
+message HistogramRecord {
+  sint32 scale = 1;
+  fixed64 zero_threshold_bits = 2;   // f64::to_bits
+  // Absent (None) stays distinct from a present value: proto3 `optional`, not a
+  // bare field, so a histogram with no sum is distinct from one whose sum is a
+  // present zero.
+  optional fixed64 sum_bits = 3;     // f64::to_bits when present
+  // Present iff scale == -53 (custom bucket boundaries), ascending. Empty means
+  // absent (None), non-empty means present, exactly as proto3 handles a
+  // repeated field. Each boundary crosses as its to_bits fixed64.
+  repeated fixed64 custom_values_bits = 4 [packed = true];
+  repeated HistogramSpan positive_spans = 5;
+  repeated HistogramSpan negative_spans = 6;
+  // All-integer or all-float counts, never mixed within one sample, mirroring
+  // ravel_segment::HistogramCounts. Exactly one member is set for a well-formed
+  // record; a record with neither is a typed decode error.
+  oneof counts {
+    HistogramCountsInt int_counts = 7;
+    HistogramCountsFloat float_counts = 8;
+  }
+  // Reset-hint states, mirroring ravel_segment::ResetHint (the default, 0, is
+  // Unknown, matching that enum's own zero value).
+  enum ResetHint {
+    UNKNOWN = 0;
+    YES = 1;
+    NO = 2;
+    GAUGE = 3;
+  }
+  ResetHint reset_hint = 9;
+}
+
+// One populated run on a histogram side, mirroring ravel_segment::HistogramSpan.
+message HistogramSpan {
+  sint32 offset = 1;
+  uint32 length = 2;
+}
+
+// All-integer bucket/zero/total counts (ravel_segment::HistogramCounts::Int).
+message HistogramCountsInt {
+  uint64 zero_count = 1;
+  uint64 count = 2;
+  repeated uint64 positive = 3 [packed = true];
+  repeated uint64 negative = 4 [packed = true];
+}
+
+// All-float bucket/zero/total counts (ravel_segment::HistogramCounts::Float),
+// every f64 as its to_bits fixed64 so NaN payloads and -0.0 survive the wire.
+message HistogramCountsFloat {
+  fixed64 zero_count_bits = 1;       // f64::to_bits
+  fixed64 count_bits = 2;            // f64::to_bits
+  repeated fixed64 positive_bits = 3 [packed = true];
+  repeated fixed64 negative_bits = 4 [packed = true];
+}
+
+// One log-record frame for a slice of the RLOG family (Logs, Alerts, Audit),
+// carrying the worker's per-record merged attribute view so the coordinator
+// orders and dedups records without re-deriving attribute merging (ADR-0071
+// "log and span distributed fan-out" amendment). Additive oneof member: no
+// protocol_version bump, because skew is governed by the signal gate, not the
+// version field (an old worker returns Unsupported for signal=Logs, which the
+// coordinator maps to whole-query local fallback, so this frame can never
+// reach an old coordinator).
+//
+// #284 defines the concrete grammar below. It carries one decoded
+// `ravel_logseg::LogRecord` field-for-field: the stream identity plus its
+// verbatim canonical resource+scope blob (`stream_attrs`, the STREAM_DIR bytes
+// every segment carrying the stream embeds -- this is what makes the
+// per-segment merged attribute view self-contained, so a worker ships exactly
+// what `RlogReader` produces locally and the coordinator never re-derives
+// attribute merging), the record's timestamps and content columns, and its
+// per-record attributes. That whole content is also the record's identity for
+// coordinator-side dedup: two frames are the same logical record iff every
+// field matches. Field 1 was a deferred opaque `bytes record_payload`
+// placeholder in #283; its number is retired (reserved) rather than reused
+// with a new type, per this file's frozen-field-number discipline. Every
+// field below is additive.
+message LogRecordFrame {
+  reserved 1;                   // was the deferred opaque `bytes record_payload`
+
+  bytes stream_id = 2;          // 16 bytes; ravel_types LogStreamId
+  bytes stream_attrs = 3;       // canonical resource+scope blob, verbatim
+  sint64 ts_ns = 4;             // event time
+  sint64 observed_ts_ns = 5;    // observed (ingest) time
+  uint32 severity_num = 6;      // 0..=255 (u8 widened; a larger value is BadData)
+  string severity_text = 7;
+  string body = 8;
+  bytes trace_id = 9;           // 16 bytes when present, empty = absent
+  bytes span_id = 10;           // 8 bytes when present, empty = absent
+  uint32 flags = 11;
+  repeated LogAttr attrs = 12;  // per-record attributes, order preserved
+}
+
+// One per-record attribute: a key and its typed value. Mirrors one entry of
+// `ravel_logseg::LogRecord::attrs` (a `(String, AttrValue)` pair).
+message LogAttr {
+  string key = 1;
+  LogAttrValue value = 2;
+}
+
+// One OTLP attribute value, mirroring `ravel_types::logstream::AttrValue`
+// variant for variant. `f64` crosses as its raw `to_bits` pattern (fixed64),
+// never a proto double, so NaN payloads and -0.0 survive byte-for-byte, the
+// same bit-exactness the scalar `Run.value_bits` path guarantees.
+message LogAttrValue {
+  oneof value {
+    string str = 1;
+    sint64 int = 2;
+    fixed64 double_bits = 3;    // f64::to_bits
+    bool boolean = 4;
+    bytes bytes_val = 5;
+    LogAttrList list = 6;
+    LogAttrMap map = 7;
+  }
+}
+
+// A list attribute value (`AttrValue::List`).
+message LogAttrList {
+  repeated LogAttrValue items = 1;
+}
+
+// A map attribute value (`AttrValue::Map`): an ordered set of nested entries.
+message LogAttrMap {
+  repeated LogAttr entries = 1;
+}
+
+// One span frame for a slice of the Spans signal, carrying the worker's
+// per-span merged view so the coordinator ORDERS (never dedups) spans keyed on
+// the record's full content without re-deriving attribute merging (ADR-0071
+// "log and span distributed fan-out" amendment). Additive oneof member with the
+// same no-version-bump rationale as LogRecordFrame.
+//
+// #285 defines the concrete grammar below. It carries one decoded
+// `ravel_rspan::SpanRecord` field-for-field plus the `service_name` lifted
+// column (ADR-0054): the RSPAN reader rebuilds the whole merged `attrs` map from
+// one segment alone (same self-containment property RLOG has), so a worker ships
+// exactly what a local `SpanSegmentFetcher` read produces and the coordinator
+// never re-derives attribute merging. That whole content is also the span's
+// identity for the coordinator's total order: two frames sort equal iff every
+// field matches, and equal-keyed spans are BOTH kept (no query-time dedup for
+// spans -- docs/consistency-model.md "logs and spans", ADR-0051 section 5).
+// Field 1 was a deferred opaque `bytes span_payload` placeholder in #283; its
+// number is retired (reserved) rather than reused with a new type, per this
+// file's frozen-field-number discipline. Every field below is additive.
+message SpanFrame {
+  reserved 1;                   // was the deferred opaque `bytes span_payload`
+
+  bytes trace_id = 2;           // 16 bytes; RSPAN primary sort/lookup key
+  bytes span_id = 3;            // 8 bytes
+  bytes parent_span_id = 4;     // 8 bytes when present, empty = absent (root)
+  string name = 5;
+  sint64 start_ts_ns = 6;       // span start event time
+  sint64 end_ts_ns = 7;         // span end event time
+  uint32 status_code = 8;       // OTLP StatusCode: 0 Unset, 1 Ok, 2 Error
+  // OTLP status message. proto3 `optional` so absent (None) is distinct from an
+  // explicit empty string, preserving the `SpanRecord::status_message` round
+  // trip exactly.
+  optional string status_message = 9;
+  repeated SpanAttr attrs = 10; // merged resource+scope+span view, order preserved
+  // The `service.name` value lifted into RSPAN's COL_SERVICE_NAME (ADR-0054).
+  // proto3 `optional` so a span carrying no `service.name` (None) is distinct
+  // from one whose value is the empty string.
+  optional string service_name = 11;
+}
+
+// One merged span attribute: a key and its string value. Mirrors one entry of
+// `ravel_rspan::SpanRecord::attrs` (a `(String, String)` pair). Span attribute
+// values are always strings (the RSPAN merged-attrs map is `Map<Utf8, Utf8>`),
+// so unlike `LogAttr` this needs no typed value union.
+message SpanAttr {
+  string key = 1;
+  string value = 2;
+}
+
+// The terminal frame of a slice: the worker's accounting snapshot, the counts
+// it returned, and its typed status.
+message Summary {
+  QueryAccountingSnapshot accounting = 1;
+  uint64 series_returned = 2;
+  uint64 samples_returned = 3;
+  Status status = 4;
+  // The worker's per-slice FetchStats page counters (ravel_query::FetchStats),
+  // so the coordinator can report a distributed query's raw-page cost in its
+  // stats JSON exactly as the local path does, rather than defaulting to zero.
+  // Summed across slices by the coordinator; carried on every terminal summary,
+  // including non-OK ones, so a slice's spend is never lost when it falls back
+  // (ADR-0071). Additive fields, appended after the frozen 1..4.
+  uint64 raw_f64_pages = 5;
+  uint64 raw_f64_bytes = 6;
+}
+
+// Typed per-slice status, mirroring the local query's typed errors so the
+// coordinator maps each to the same outcome (ADR-0071 failure semantics).
+message Status {
+  enum Code {
+    OK = 0;
+    BAD_DATA = 1;
+    UNSUPPORTED = 2;
+    CORRUPT = 3;
+    UNAVAILABLE = 4;
+    TIMEOUT = 5;
+    SNAPSHOT_INVALIDATED = 6;
+    BUDGET_EXCEEDED = 7;
+    INTERNAL = 8;
+  }
+  Code code = 1;
+  string message = 2;
+}
+
+// The worker's per-slice cost accounting, mirroring
+// ravel_types::accounting::QueryAccountingSnapshot's counters as flat u64
+// fields (its fixed-size s3_requests/s3_bytes arrays are flattened per
+// AccountedOp: Get, List, Head, in AccountedOp::index order). Combined across
+// slices by the coordinator to report one query's total cost: every counter
+// sums, but peak_intermediate_bytes is merged via max, never summed. It is a
+// per-worker-process high-water mark, so the query's peak is the largest
+// single slice's peak, not a total that no process ever held at once.
+message QueryAccountingSnapshot {
+  uint64 s3_get_requests = 1;
+  uint64 s3_list_requests = 2;
+  uint64 s3_head_requests = 3;
+  uint64 s3_get_bytes = 4;
+  uint64 s3_list_bytes = 5;
+  uint64 s3_head_bytes = 6;
+  uint64 cache_hits = 7;
+  uint64 cache_misses = 8;
+  uint64 cache_bytes = 9;
+  uint64 decompressed_bytes = 10;
+  uint64 segments_opened = 11;
+  uint64 segments_pruned = 12;
+  uint64 series_matched = 13;
+  uint64 bytes_reused = 14;
+  uint64 peak_intermediate_bytes = 15;
+  // Distinct data objects whose BLOCKS bytes this slice fetched (ADR-0996
+  // decision 3, the range-amplification denominator). Additive field: slices
+  // partition by (tenant, signal, shard), an object belongs to exactly one
+  // shard, so slice object sets are disjoint and summation is exact. An old
+  // peer omits it and it decodes as 0, degrading the merged figure to the
+  // coordinator's own count, never inflating it.
+  uint64 data_objects_touched = 16;
+}

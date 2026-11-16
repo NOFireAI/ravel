@@ -1,0 +1,8 @@
+{
+  "id": "D4",
+  "journey": "D",
+  "question": "Evaluate the per-second rate of checkout 5xx responses over this hour at a 100 ms step. If the server refuses the step, quote its exact message, pick a step it accepts, and report the peak rate.",
+  "window": {"from": "T0", "to": "T0+60m"},
+  "budget": {"deadline_ms": 30000, "max_rows": null, "max_bytes_scanned": null, "max_store_requests": null},
+  "tags": ["induces_failure"]
+}

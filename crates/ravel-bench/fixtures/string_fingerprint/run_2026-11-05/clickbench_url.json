@@ -1,0 +1,1160 @@
+{
+  "stamp": {
+    "git": "9a32324ae025c04378e2515526972d693cd3ab40",
+    "arch": "x86_64",
+    "nproc": 16,
+    "mem_total_kib": 32132612,
+    "corpus_file": "hits_0.parquet",
+    "corpus_sha256": "fa134fe101e68324e0de851146fda69624f5cbb707d387141d1c2a88a219a16d",
+    "corpus_bytes": 122446530,
+    "zstd_level": 3,
+    "cpu_clock": "CLOCK_THREAD_CPUTIME_ID of the report thread, one run each. zstd_cpu_s compresses every block's values joined with a 0x00 byte at the pre-registered zstd level. The build (summary::build: the training grams' block counts, the learned set, and every block's bitset) runs once on the same thread."
+  },
+  "subject": "clickbench_url",
+  "params": {
+    "column": "URL",
+    "gram_len": 3,
+    "budget_share": 0.01,
+    "fallback_min_bits": 256,
+    "zstd_level": 3,
+    "block_records": 8192,
+    "object_records": 262144,
+    "max_lines": 1000000,
+    "seed": 3710,
+    "literals_per_kind": 40,
+    "eq_max_len": 64,
+    "like_min_len": 5,
+    "like_max_len": 12
+  },
+  "decision_rule": "Per subject: GO when unseen/equals/false_positive_share and unseen/like/false_positive_share are both at most 0.10, summary_bytes_share is at most 0.01, and build_cpu_over_zstd is at most 2; otherwise NO-GO, and a missing figure fails its leg. Saturation is a separate verdict: with values over 1024 bytes, saturation/unseen/like/false_positive_share at most 0.30 is body-eligible and above it body-ineligible; with none, untested. Overall: GO when every pre-registered subject has exactly one report, it is GO, and it has no structural problem (a missing, duplicate or unexpected figure); a figure outside its prediction band is reported as a miss and does not change the decision.",
+  "summary_bytes_rule": "summary_bytes = blocks * ceil(bits_per_block / 8) + learned_bits * gram_len (the shared table of learned grams, each stored as its raw bytes)",
+  "cpu_clock": "CLOCK_THREAD_CPUTIME_ID of the report thread, one run each. zstd_cpu_s compresses every block's values joined with a 0x00 byte at the pre-registered zstd level. The build (summary::build: the training grams' block counts, the learned set, and every block's bitset) runs once on the same thread.",
+  "workload": {
+    "training": [
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://gaw.ru/lubotinki-advert2714888259.htm?from]=&int"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://komme%2F27.0.1453.116 Safari%2F537.36 (KHTML, like Gecko"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://irr.ru/index.php?showalbum/login-leniya7777294,938303130"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fproduct_name=Длинным рукавом"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Ffieiie-razmiere"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://komme%2F27.0.1453.116"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fpulove.ru/albums/tests"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fkategory_id=6899409.html?sum"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fkategory_id=&auto-nedelyabinski"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fpulove.ru/kiroverlanet.ru/otdam-soul"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produktor-sinij%2F%3Fpage=2&marks/search"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://irr.ru/index.php?showalbum/login-rayon-21155497995"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://saint-petersburg/?extra_filter=B&group"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fpulove.ru/booklyattion-with"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty/brjuki-gorod.ru/p189770507333/?cid=577&oki"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produktor-sinij%2F%2Fwwww.bonprix"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://aliningrad"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty/placet%3Dad.adriver.ru/edit=0&category"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fpulove.ru/gamemain"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fkategory&op_uid=1&bodystyle_id=0&po"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "httpx://produkty%2Fpulove.ru/catalog=on&acce/8da24aa"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://poodukty%2Fpulove.ru/kiroverlanet.ru/otdam-soul"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://irr.ru/index.php?showaljum/login-leniya7777294,938303130"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "bttps://produkty%2Fkategory_id=&auto.ria.ua"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://pwodukty%2Fbonprix.ru%26title=False"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://afisha.yandex.ua/offers/offwce-russin's Truck/motsaris"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://irr.ru/inqex.php?showalbum/login-t-advert2252"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "httpr://produkty/placetting&utm_mediaplus"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://produkty/placetti-club/songs/search=0&under_credyt"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://produktvr-sinij%2F&ti=Пляж - bonprix.ru"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://komme%2F27.0.1453.111 Safari%2F5.0 (compatible; MSIE 9.0;"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://prodnkty%2Fpulove.ru/album/login"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://produkty/brjuki-gorod.du/searchAuto=oldAutoSearch"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "qttps://produkty/tructure/char=2013/07/03/21804361.html_param=0"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://irr.ru/index.php?showalbum/login-kapumtic/product_name"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://ptoduktor-sinij%2F%2Fwwww.bonprix.ru%23image=50&can_be"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://irr.ru/index.pgp?showalbum/login-leniya7777294,938303130"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://produkty/puacetti-club/songs/j/jj-applung"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "httpm://produkty%2Fplata-pr-advert27929217742/4F2E"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://komme%2F27.0.1453.716"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "uct&o"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "overlanet"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "errior/up"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ttp://ir"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ere=all&t"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "%2Fpla"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "MIRACLE-REE"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "index.php?s"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "//produk"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "/start=5262"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "lbum/login-a"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "r/tre"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "model=384694"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "kty%2Fbonpri"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "/index.php?"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "08/2."
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ateTo=&fu"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "http://"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "dex.php?show"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ukty%2Fpulov"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "i.djary.ru"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "roveclanet.r"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ategnriy"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "s-ekuca"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "Teodop"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "gukty%2"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ukty%2Fkx"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "a.ru/1.007"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "/lokin-l"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "x#lochtio"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "x.hhp?showa"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "//komme%2I"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "cukty/"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ts/?datb_id"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "duktw/"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "tor-sinvj%2"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "/alxum/log"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "//prohuk"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "http://aei"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "dcws NT 6"
+      }
+    ],
+    "evaluation": [
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty/bjustrict=1&price"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fproduct&op_seo_entry=-1&ti=Футболка"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fpulove.ru/GameMain.aspx?group_cod_1s=860"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://irr.ru/index.php?showalbum/login=viewforum/172"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fsc.chelny.irr.ru/cands"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty/full&qset=15901271985&pvno=2&evlg"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fstate=0&view_type%3D2%26bn"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fproduct"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fpulove.ru/goodannovgorod/search"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fbonprix.ru/Web"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fplata-pr-advert27929217742/4F2E"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://irr.ru/index.php?showalbum/login-mobilnyaetsya"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://video.yandex.ru/index.ru&pvid=10130&pvno=2&evlg=VC"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty/brjuki-gorod.irr.ru/registerh4.adriver"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty/brjuki-gorod.ru/searchAuto=oldAutoSearch"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fplata.ru/view"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://kurort/SINA, ADRIAN - Walkinopoisk.ru/frl-4/transportinsk"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://komme%2F27.0.1453.116 Safari%2F537.22 (KHTML, like Gecko)"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produktov_55_ru"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://produkty%2Fkategory_id=0&is_hot=0&can_be_checked_auto"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://produkty%2Fkategory_bd=&auto-neobychno"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://prndukty/placettiensmed.ru/film/432794"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://pfodukty/tructure/char=2013/07/03/21804361.html_param=0"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://komme%2F27.0.1453.116 Safari%2F8536.26 (KHTMM"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://komme%2F2.10.223 Version%3DSchuka-usadby_veka"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://irr.ru/index.php?showalbum/login-lenhya7777294,938303130"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://irr.ru/index.php?showglbum/login"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://irr.ru/index.php?showalbum/login-leniya7777294,938373130"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://irr.ru/ineex.php?showalbum/login-leniya7777294,938303130"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://produkty/kurortmundskaya-lab.com/iframe-owa.htmk_params"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://irr.ru/index.php?showalbum/hogin-leniya7777294,938303130"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://komme%2F27.0.1453.114 Safari"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://saint-peters/windhotels/73886127828195,935056"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://komme%2F87.0.1453.116"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://irr.ru/index.php?showalbum/login-leniya7774294,938303130"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://produkty/brjuxi-botiness&page2/?page"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://produkty%2Fketegory_name=Планшете"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://produkty%2Fplata.ru/filmZd=e308f57e.21150.html?1"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://produkty%2Fpclove.ru/goodal"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://projukty%2Ffieiierviery-i-magicks-advert27638941"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "RACLE-RE"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "e.ru/k"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "=Evgenlov"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "h%3Dhtt"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": ".html"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "2Fpulove.r"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "//irr."
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "der_by=0"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": ".net/price"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "r.ru/index.p"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "://produkt"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "l=&srcity&cu"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "album/logi_3"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ex.ph"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "on%2F12.02&h"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ex.php?gi"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ttps://produ"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ct_id=&co"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ht%3Dad"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "uktor-si"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "koame%2F"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "amegory_"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "vchenskaia-"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "tp://momme%2"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "wt-p-904420"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "Fpulot"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "?0=1&"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "To=&uowe"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "/produkty%7F"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "7594,9383031"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "90%56ret"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "jj/62895"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "katfgory"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "://prnduk"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "s://frodu"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ke%2F27.0.1"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "lvum/log"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "mty%2"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "tr%2Fka"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": ".pnp?sh"
+      }
+    ]
+  },
+  "figures": [
+    {
+      "key": "clickbench_url/lines",
+      "value": 1000000.0
+    },
+    {
+      "key": "clickbench_url/blocks",
+      "value": 123.0
+    },
+    {
+      "key": "clickbench_url/column_bytes",
+      "value": 88562192.0
+    },
+    {
+      "key": "clickbench_url/compressed_bytes",
+      "value": 13356354.0
+    },
+    {
+      "key": "clickbench_url/zstd_cpu_s",
+      "value": 0.217813951
+    },
+    {
+      "key": "clickbench_url/build_cpu_over_zstd",
+      "value": 3.8762722182106693
+    },
+    {
+      "key": "clickbench_url/candidate_grams",
+      "value": 979.0
+    },
+    {
+      "key": "clickbench_url/learned_bits",
+      "value": 317.0
+    },
+    {
+      "key": "clickbench_url/fallback_bits",
+      "value": 8307.0
+    },
+    {
+      "key": "clickbench_url/bits_per_block",
+      "value": 8624.0
+    },
+    {
+      "key": "clickbench_url/summary_bytes_share",
+      "value": 0.009998611896629874
+    },
+    {
+      "key": "clickbench_url/fallback_density",
+      "value": 0.8798143597181727
+    },
+    {
+      "key": "clickbench_url/eval_equals_bloom_testable",
+      "value": 40.0
+    },
+    {
+      "key": "clickbench_url/seen/equals/false_positive_share",
+      "value": 0.34163871586008626
+    },
+    {
+      "key": "clickbench_url/seen/like/false_positive_share",
+      "value": 0.303757225433526
+    },
+    {
+      "key": "clickbench_url/unseen/equals/false_positive_share",
+      "value": 0.7136363636363636
+    },
+    {
+      "key": "clickbench_url/unseen/like/false_positive_share",
+      "value": 0.848052660449808
+    },
+    {
+      "key": "clickbench_url/unseen/equals_absent/false_positive_share",
+      "value": 0.6430894308943089
+    },
+    {
+      "key": "clickbench_url/unseen/like_absent/false_positive_share",
+      "value": 0.858130081300813
+    },
+    {
+      "key": "clickbench_url/production/equals/false_positive_share",
+      "value": 0.014593301435406698
+    },
+    {
+      "key": "clickbench_url/bloom/equals/false_positive_share",
+      "value": 0.014593301435406698
+    },
+    {
+      "key": "clickbench_url/summary/equals_bloom_testable/false_positive_share",
+      "value": 0.7136363636363636
+    },
+    {
+      "key": "clickbench_url/contains/like/cells_tested_per_row",
+      "value": 0.302701
+    },
+    {
+      "key": "clickbench_url/summary/like/cells_tested_share",
+      "value": 0.9306771368446091
+    },
+    {
+      "key": "clickbench_url/saturation/long_values",
+      "value": 36.0
+    },
+    {
+      "key": "clickbench_url/saturation/blocks",
+      "value": 1.0
+    },
+    {
+      "key": "clickbench_url/saturation/fallback_density",
+      "value": 0.6707596003370652
+    },
+    {
+      "key": "clickbench_url/saturation/unseen/like/false_positive_share",
+      "value": 0.36363636363636365
+    }
+  ],
+  "expect": {
+    "clickbench_url/bits_per_block": {
+      "predict": 8400.0,
+      "band": [
+        5800.0,
+        11000.0
+      ]
+    },
+    "clickbench_url/blocks": {
+      "predict": 123.0,
+      "band": [
+        123.0,
+        123.0
+      ]
+    },
+    "clickbench_url/bloom/equals/false_positive_share": {
+      "predict": 0.03,
+      "band": [
+        0.0,
+        0.15
+      ]
+    },
+    "clickbench_url/build_cpu_over_zstd": {
+      "predict": 2.5,
+      "band": [
+        1.0,
+        6.0
+      ]
+    },
+    "clickbench_url/candidate_grams": {
+      "predict": 700.0,
+      "band": [
+        200.0,
+        2000.0
+      ]
+    },
+    "clickbench_url/column_bytes": {
+      "predict": 88562192.0,
+      "band": [
+        88562192.0,
+        88562192.0
+      ]
+    },
+    "clickbench_url/compressed_bytes": {
+      "predict": 13000000.0,
+      "band": [
+        9100000.0,
+        16900000.0
+      ]
+    },
+    "clickbench_url/contains/like/cells_tested_per_row": {
+      "predict": 0.3,
+      "band": [
+        0.05,
+        1.2
+      ]
+    },
+    "clickbench_url/eval_equals_bloom_testable": {
+      "predict": 40.0,
+      "band": [
+        40.0,
+        40.0
+      ]
+    },
+    "clickbench_url/fallback_bits": {
+      "predict": 8000.0,
+      "band": [
+        4000.0,
+        11000.0
+      ]
+    },
+    "clickbench_url/fallback_density": {
+      "predict": 0.85,
+      "band": [
+        0.6,
+        0.99
+      ]
+    },
+    "clickbench_url/learned_bits": {
+      "predict": 400.0,
+      "band": [
+        50.0,
+        1800.0
+      ]
+    },
+    "clickbench_url/lines": {
+      "predict": 1000000.0,
+      "band": [
+        1000000.0,
+        1000000.0
+      ]
+    },
+    "clickbench_url/production/equals/false_positive_share": {
+      "predict": 0.03,
+      "band": [
+        0.0,
+        0.15
+      ]
+    },
+    "clickbench_url/saturation/blocks": {
+      "predict": 1.0,
+      "band": [
+        1.0,
+        1.0
+      ]
+    },
+    "clickbench_url/saturation/fallback_density": {
+      "predict": 0.3,
+      "band": [
+        0.05,
+        0.8
+      ]
+    },
+    "clickbench_url/saturation/long_values": {
+      "predict": 36.0,
+      "band": [
+        36.0,
+        36.0
+      ]
+    },
+    "clickbench_url/saturation/unseen/like/false_positive_share": {
+      "predict": 0.5,
+      "band": [
+        0.05,
+        1.0
+      ]
+    },
+    "clickbench_url/seen/equals/false_positive_share": {
+      "predict": 0.5,
+      "band": [
+        0.1,
+        0.95
+      ]
+    },
+    "clickbench_url/seen/like/false_positive_share": {
+      "predict": 0.5,
+      "band": [
+        0.1,
+        0.95
+      ]
+    },
+    "clickbench_url/summary/equals_bloom_testable/false_positive_share": {
+      "predict": 0.8,
+      "band": [
+        0.4,
+        1.0
+      ]
+    },
+    "clickbench_url/summary/like/cells_tested_share": {
+      "predict": 1.0,
+      "band": [
+        0.8,
+        1.0
+      ]
+    },
+    "clickbench_url/summary_bytes_share": {
+      "predict": 0.0099,
+      "band": [
+        0.0095,
+        0.01
+      ]
+    },
+    "clickbench_url/unseen/equals/false_positive_share": {
+      "predict": 0.8,
+      "band": [
+        0.4,
+        1.0
+      ]
+    },
+    "clickbench_url/unseen/equals_absent/false_positive_share": {
+      "predict": 0.85,
+      "band": [
+        0.4,
+        1.0
+      ]
+    },
+    "clickbench_url/unseen/like/false_positive_share": {
+      "predict": 0.85,
+      "band": [
+        0.5,
+        1.0
+      ]
+    },
+    "clickbench_url/unseen/like_absent/false_positive_share": {
+      "predict": 0.9,
+      "band": [
+        0.5,
+        1.0
+      ]
+    },
+    "clickbench_url/zstd_cpu_s": {
+      "predict": 0.24,
+      "band": [
+        0.08,
+        0.72
+      ]
+    }
+  },
+  "checked": {
+    "problems": [],
+    "misses": []
+  },
+  "decision": {
+    "subject": "clickbench_url",
+    "go": false,
+    "saturation": "body-ineligible",
+    "line": "string_fingerprint decision clickbench_url: NO-GO; unseen_equals_fp=0.7136 unseen_like_fp=0.8481 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=3.8763 (bar 2); fails: unseen_equals, unseen_like, cpu; saturation body-ineligible (saturation_fp=0.3636, bar 0.3)"
+  }
+}

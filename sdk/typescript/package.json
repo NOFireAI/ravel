@@ -1,0 +1,26 @@
+{
+  "name": "ravel-sdk-typescript",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.15.0 <23"
+  },
+  "scripts": {
+    "lint": "eslint --max-warnings 0 .",
+    "typecheck": "npm run typecheck --workspaces && tsc -p examples",
+    "test": "npm test --workspaces",
+    "test:e2e": "npm run test:e2e --workspace @ravel/agents",
+    "example:assistant": "node --experimental-transform-types --disable-warning=ExperimentalWarning --import ./examples/ts-hooks.js examples/assistant/main.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "22.20.5",
+    "eslint": "10.13.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.1",
+    "vitest": "5.0.5"
+  }
+}

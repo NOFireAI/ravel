@@ -1,0 +1,37 @@
+[package]
+name = "ravel-agents-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Dev-only deterministic simulation of Ravel Agents (ADR-3331 decision 13). No crate depends on it."
+
+[dependencies]
+ravel-agents-core = { workspace = true }
+ravel-agents-runtime = { workspace = true }
+ravel-agents-store = { workspace = true }
+ravel-commit = { workspace = true }
+ravel-object-store = { workspace = true }
+ravel-sim = { path = "../ravel-sim", version = "0.33.0" }
+ravel-types = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "macros", "test-util"] }
+
+[dev-dependencies]
+ravel-test-support = { workspace = true }
+proptest = { workspace = true }
+# Peak-heap probe of the agents cost bench, installed as its global
+# allocator without `unsafe` in this crate.
+stats_alloc = "0.1.10"
+
+[[bench]]
+name = "agents_cost"
+harness = false
+
+[lints]
+workspace = true

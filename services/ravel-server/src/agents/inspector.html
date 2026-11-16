@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ravel Agents inspector</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 1.5rem; color: #1b1b1b; }
+  h1 { font-size: 1.3rem; }
+  h2 { font-size: 1.05rem; margin-top: 1.6rem; border-bottom: 1px solid #ccc; }
+  form { display: flex; gap: .5rem; flex-wrap: wrap; align-items: end; }
+  label { display: flex; flex-direction: column; font-size: .85rem; }
+  input { font: inherit; padding: .2rem .4rem; }
+  table { border-collapse: collapse; margin: .4rem 0; }
+  th, td { border: 1px solid #ddd; padding: .2rem .5rem; text-align: left; vertical-align: top; }
+  th { background: #f4f4f4; }
+  code, pre { font-family: ui-monospace, monospace; font-size: .85rem; }
+  pre { white-space: pre-wrap; word-break: break-all; margin: .2rem 0; }
+  .preview-label { font-size: .75rem; color: #666; margin-right: .3rem; }
+  .blocked { background: #fff4e5; border: 1px solid #f0b46c; padding: .5rem; margin: .4rem 0; }
+  .ok { color: #2b6a2b; }
+  .error { color: #a40000; }
+  .empty { color: #777; font-style: italic; }
+</style>
+</head>
+<body>
+<h1>Ravel Agents inspector</h1>
+<p>Reads one agent through the agents routes with the token you enter. The
+token is sent as a bearer header to this server only and is not stored.</p>
+
+<form id="inspector-form">
+  <label>Token <input id="inspector-token" type="password" autocomplete="off" required></label>
+  <label>Kind <input id="inspector-kind" required></label>
+  <label>Key <input id="inspector-key" required></label>
+  <button type="submit">Inspect</button>
+</form>
+<p id="inspector-error" class="error"></p>
+
+<h2>Blocked</h2>
+<div id="inspector-blocked"><p class="empty">Nothing loaded.</p></div>
+
+<h2>State</h2>
+<div id="inspector-state"><p class="empty">Nothing loaded.</p></div>
+
+<h2>Active turn</h2>
+<div id="inspector-active-turn"><p class="empty">Nothing loaded.</p></div>
+
+<h2>Mailbox</h2>
+<div id="inspector-mailbox"><p class="empty">Nothing loaded.</p></div>
+
+<h2>Timers</h2>
+<div id="inspector-timers"><p class="empty">Nothing loaded.</p></div>
+
+<h2>Steps</h2>
+<div id="inspector-steps"><p class="empty">Nothing loaded.</p></div>
+
+<h2>Effects</h2>
+<div id="inspector-effects"><p class="empty">Nothing loaded.</p></div>
+
+<h2>Events</h2>
+<div id="inspector-events"><p class="empty">Nothing loaded.</p></div>
+
+<script>
+"use strict";
+(function () {
+  var BASE = "/api/v1/agents/";
+  var PREVIEW_CHARS = 120;
+  var EFFECTS_INSPECTED = 32;
+  var EVENTS_PAGE = 100;
+  var current = null;
+
+  function el(tag, attrs, children) {
+    var node = document.createElement(tag);
+    Object.keys(attrs || {}).forEach(function (k) { node.setAttribute(k, attrs[k]); });
+    (children || []).forEach(function (c) {
+      node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+    });
+    return node;
+  }
+
+  function fill(id, nodes) {
+    var target = document.getElementById(id);
+    while (target.firstChild) { target.removeChild(target.firstChild); }
+    nodes.forEach(function (n) { target.appendChild(n); });
+  }
+
+  function empty(text) { return el("p", { "class": "empty" }, [text]); }
+
+  // A shortened rendering labelled "preview", with the full JSON behind a
+  // <details> element.
+  function payload(value) {
+    var raw = JSON.stringify(value, null, 2);
+    if (raw === undefined) { raw = "null"; }
+    var flat = JSON.stringify(value) || "null";
+    var short = flat.length > PREVIEW_CHARS ? flat.slice(0, PREVIEW_CHARS) + "..." : flat;
+    return el("div", {}, [
+      el("span", { "class": "preview-label" }, ["preview"]),
+      el("code", {}, [short]),
+      el("details", {}, [el("summary", {}, ["raw payload"]), el("pre", {}, [raw])])
+    ]);
+  }
+
+  function hash(label, value) {
+    return el("details", {}, [el("summary", {}, [label]), el("code", {}, [String(value)])]);
+  }
+
+  function table(headers, rows) {
+    var head = el("tr", {}, headers.map(function (h) { return el("th", {}, [h]); }));
+    var body = rows.map(function (cells) {
+      return el("tr", {}, cells.map(function (c) {
+        return el("td", {}, [typeof c === "string" || typeof c === "number" ? String(c) : c]);
+      }));
+    });
+    return el("table", {}, [head].concat(body));
+  }
+
+  function time(ns) {
+    var ms = Number(BigInt(ns) / 1000000n);
+    return new Date(ms).toISOString();
+  }
+
+  async function call(method, route, body) {
+    var init = {
+      method: method,
+      headers: { "Authorization": "Bearer " + current.token },
+      cache: "no-store"
+    };
+    if (body !== undefined) {
+      init.headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(body);
+    }
+    var response = await fetch(BASE + route, init);
+    var text = await response.text();
+    var parsed = null;
+    try { parsed = text ? JSON.parse(text) : null; } catch (e) { parsed = { message: text }; }
+    if (!response.ok) {
+      var why = parsed && (parsed.message || parsed.error || parsed.code);
+      throw new Error(method + " " + route + ": " + response.status + " " + (why || ""));
+    }
+    return parsed;
+  }
+
+  function agentQuery() {
+    return "kind=" + encodeURIComponent(current.kind) + "&key=" + encodeURIComponent(current.key);
+  }
+
+  function renderState(state) {
+    fill("inspector-state", [
+      table(["incarnation", "state version", "content type"],
+        [[state.incarnation, state.state_version, state.content_type]]),
+      hash("agent id", state.agent_id),
+      payload(state.state)
+    ]);
+  }
+
+  function renderActiveTurn(turn) {
+    if (!turn) { fill("inspector-active-turn", [empty("No turn is open.")]); return; }
+    fill("inspector-active-turn", [
+      table(["accept seq", "handler", "handler version", "base state version", "started", "lease hint",
+             "cancel requested", "non-deterministic replay"],
+        [[turn.accept_seq, turn.handler, turn.handler_version, turn.base_state_version,
+          time(turn.started_unix_ns), time(turn.lease_hint_unix_ns),
+          String(turn.cancel_requested), String(turn.non_deterministic_replay)]]),
+      hash("turn id", turn.turn_id),
+      hash("handler digest", turn.handler_digest)
+    ]);
+  }
+
+  function renderMailbox(mailbox) {
+    if (!mailbox || mailbox.length === 0) { fill("inspector-mailbox", [empty("The mailbox is empty.")]); return; }
+    fill("inspector-mailbox", [table(["accept seq", "handler", "source", "accepted", "failed attempts"],
+      mailbox.map(function (m) {
+        var source = m.source.kind === "timer"
+          ? hash("timer, generation " + m.source.generation, m.source.timer)
+          : "message " + m.source.request_id;
+        return [m.accept_seq, m.handler, source, time(m.accepted_unix_ns), m.failed_attempts];
+      }))]);
+  }
+
+  function renderTimers(timers) {
+    if (timers.length === 0) { fill("inspector-timers", [empty("No timers.")]); return; }
+    fill("inspector-timers", [table(["timer key", "timer id", "generation", "due", "handler", "status"],
+      timers.map(function (t) {
+        return [t.timer_key, hash("id", t.timer), t.generation, time(t.due_unix_ns), t.handler, t.status];
+      }))]);
+  }
+
+  function renderEffects(effects, inspected) {
+    if (effects.length === 0) {
+      fill("inspector-effects", [empty("No effects.")]);
+      fill("inspector-steps", [empty("No effect steps.")]);
+      return;
+    }
+    fill("inspector-effects", [table(["effect", "tool", "policy", "status", "attempt", "attempts", "result"],
+      effects.map(function (e) {
+        var detail = inspected[e.effect];
+        var attempts = detail
+          ? detail.attempts.map(function (a) { return a.attempt + ": " + a.status; }).join(", ")
+          : "not inspected";
+        var result = detail
+          ? (detail.failure ? "failure: " + detail.failure : payload(detail.result))
+          : "";
+        return [hash("handle", e.effect), e.tool_name + " " + e.tool_version, e.policy, e.status,
+                e.attempt, attempts, result];
+      }))]);
+    var rows = effects.filter(function (e) { return inspected[e.effect]; }).map(function (e) {
+      return [inspected[e.effect].step_key, e.tool_name, hash("turn id", e.turn_id), e.status];
+    });
+    fill("inspector-steps", [
+      rows.length ? table(["step key", "tool", "turn", "effect status"], rows) : empty("No effect steps."),
+      el("p", { "class": "empty" }, ["Steps backed by an effect. Journaled steps without an effect are not served by a client route."])
+    ]);
+  }
+
+  // Why the agent is not making progress, and what unblocks it.
+  function renderBlocked(state, effects) {
+    var reasons = [];
+    var turn = state.active_turn;
+    effects.filter(function (e) { return e.status === "in_doubt"; }).forEach(function (e) {
+      var request = { effect: e.effect, attempt: e.attempt, decision: "retry" };
+      var record = { effect: e.effect, attempt: e.attempt, decision: "record_result", result: "<the verified result>" };
+      reasons.push(el("div", { "class": "blocked", "data-reason": "EffectInDoubt" }, [
+        el("strong", {}, ["EffectInDoubt: "]),
+        "effect " + e.tool_name + " attempt " + e.attempt + " may or may not have run. " +
+        "An agents_admin caller sends POST /api/v1/agents/reconcile with one of:",
+        el("pre", {}, [JSON.stringify(request, null, 2)]),
+        el("pre", {}, [JSON.stringify(record, null, 2)])
+      ]));
+    });
+    if (turn && turn.non_deterministic_replay) {
+      reasons.push(el("div", { "class": "blocked", "data-reason": "NonDeterministicReplay" }, [
+        el("strong", {}, ["NonDeterministicReplay: "]),
+        "a replay of turn " + turn.turn_id + " diverged from its journaled steps. Deploy a worker serving handler " +
+        turn.handler + " version " + turn.handler_version + " with digest " + turn.handler_digest +
+        " that replays the journal unchanged."
+      ]));
+    }
+    if (turn && !turn.non_deterministic_replay) {
+      var leaseMs = Number(BigInt(turn.lease_hint_unix_ns) / 1000000n);
+      if (leaseMs < Date.now()) {
+        reasons.push(el("div", { "class": "blocked", "data-reason": "IncompatibleHandler" }, [
+          el("strong", {}, ["IncompatibleHandler (inferred): "]),
+          "the turn's recorded lease ran out and no worker has taken it over. The turn is pinned to handler " +
+          turn.handler + " version " + turn.handler_version + ", digest " + turn.handler_digest +
+          "; deploy a worker serving that version and digest. A heartbeat may have extended the lease since HEAD recorded it."
+        ]));
+      }
+    }
+    if (turn && turn.cancel_requested) {
+      reasons.push(el("div", { "class": "blocked", "data-reason": "CancelPending" }, [
+        el("strong", {}, ["Cancel pending: "]),
+        "a cancel was requested for turn " + turn.turn_id + ". Wait for the owning worker to observe it at its next " +
+        "heartbeat or commit; nothing else is delivered to this agent until it does."
+      ]));
+    }
+    fill("inspector-blocked", reasons.length ? reasons
+      : [el("p", { "class": "ok" }, ["Nothing found blocking this agent."])]);
+  }
+
+  function renderEvents(page, events, more) {
+    var rows = events.map(function (e) {
+      return [e.event_seq, e.accept_seq, e.event_type, hash("turn id", e.turn_id), payload(e.payload)];
+    });
+    var nodes = [rows.length ? table(["event seq", "accept seq", "type", "turn", "payload"], rows)
+                             : empty("No events.")];
+    if (more) {
+      var button = el("button", { type: "button", id: "inspector-events-more" }, ["Next page"]);
+      button.addEventListener("click", function () { loadEvents(page.next_cursor, events).catch(report); });
+      nodes.push(button);
+    }
+    fill("inspector-events", nodes);
+  }
+
+  async function loadEvents(cursor, seen) {
+    var page = await call("POST", "events", {
+      agent: { kind: current.kind, key: current.key },
+      cursor: cursor,
+      limit: EVENTS_PAGE
+    });
+    var events = seen.concat(page.events);
+    renderEvents(page, events, page.events.length === EVENTS_PAGE);
+  }
+
+  function report(error) {
+    document.getElementById("inspector-error").textContent = String(error.message || error);
+  }
+
+  async function inspect() {
+    document.getElementById("inspector-error").textContent = "";
+    var q = agentQuery();
+    var results = await Promise.all([
+      call("GET", "state?" + q),
+      call("GET", "timers?" + q),
+      call("GET", "effects?" + q)
+    ]);
+    var state = results[0], timers = results[1].timers, effects = results[2].effects;
+    var inspected = {};
+    var details = await Promise.all(effects.slice(0, EFFECTS_INSPECTED).map(function (e) {
+      return call("GET", "effects/" + encodeURIComponent(e.effect));
+    }));
+    details.forEach(function (d) { inspected[d.effect] = d; });
+    renderState(state);
+    renderActiveTurn(state.active_turn);
+    renderMailbox(state.mailbox);
+    renderTimers(timers);
+    renderEffects(effects, inspected);
+    renderBlocked(state, effects);
+    await loadEvents(null, []);
+  }
+
+  document.getElementById("inspector-form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    current = {
+      token: document.getElementById("inspector-token").value,
+      kind: document.getElementById("inspector-kind").value,
+      key: document.getElementById("inspector-key").value
+    };
+    inspect().catch(report);
+  });
+})();
+</script>
+</body>
+</html>

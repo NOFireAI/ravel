@@ -1,0 +1,14 @@
+{
+  "id": "F2",
+  "answer_facts": [
+    {"fact": "no rows yet", "pattern": "\\b(0|zero|no)\\b"},
+    {"fact": "classified as window newer than the watermark", "pattern": "watermark|not (yet )?(visible|ingested)|newer than|future|freshness"}
+  ],
+  "evidence": [
+    {"item": "the watermark or freshness bound compared", "pattern": "watermark|freshness|latest"}
+  ],
+  "expected_empty_class": "window_newer_than_watermark",
+  "tools_expected": ["ravel_search_logs", "ravel_describe_data"],
+  "call_bound": 4,
+  "fixture_refs": ["counts.log_rows"]
+}

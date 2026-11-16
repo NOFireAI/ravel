@@ -1,0 +1,42 @@
+# Ravel admission and query limits for the MetricsBench portable lane
+# (ADR-0927 amendment 2026-10-26 F), mounted by ../ravel.yml and passed to
+# ravel-server with --limits-file. Format: docs/guides/admission-limits.md.
+#
+# Every key the corpus can reach is written out, including the ones left at
+# the shipped default, so the effective value is readable here and a change
+# to a shipped default cannot move it silently. Each comment names the
+# default it replaces. The README's "Frozen limits" table repeats the values
+# with their sizing.
+#
+# Only [defaults] is set: the lane writes one tenant (metricsbench, from the
+# bearer token in ../ravel.yml), so a per-tenant table would only repeat it.
+
+[defaults]
+# Active series per tenant: replaces the shipped default 200000. The
+# cardinality profile writes 1,000,000 series (benchmarks/metrics/
+# workload.json), five times the default, so the default would refuse most
+# of the profile at ingest. Unlimited matches the Mimir comparator's
+# max_global_series_per_user: 0.
+max_active_series = "unlimited"
+
+# Active log streams per tenant: the shipped default 200000, stated, not
+# changed. The lane writes no logs; written so the capture shows it.
+max_active_streams = 200000
+
+# Ingest byte rate: replaces the shipped default 33554432 B/s (32 MiB/s)
+# with a 67108864 B (64 MiB) burst. The harness replays a 30-day history
+# profile as fast as the receiver acknowledges, so a byte-rate cap would
+# measure the cap, not the engine. A rate set to "unlimited" carries no
+# burst key; the file is refused at startup if one is set alongside it.
+ingest_bytes_per_sec = "unlimited"
+
+# Series creation rate: replaces the shipped default 10000 series/s with a
+# 100000 burst. The cardinality profile's first timestamp carries all
+# 1,000,000 series (no churn, so every series is new there), ten times the
+# burst, so the default would throttle the replay to 10,000 new series per
+# second, 100 s of refusals for a profile the harness sends in one pass.
+series_creation_rate_per_sec = "unlimited"
+
+# Bytes a single query may scan: the shipped default is unlimited, stated,
+# not changed. Settable only here (no command-line flag).
+max_bytes_scanned = "unlimited"

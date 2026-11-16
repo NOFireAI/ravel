@@ -1,0 +1,5 @@
+# Synthetic: mean new 0.470 over mean old 0.500 is 0.94.
+window=1 arm=old qps=0.488 err_ratio=0.0200 connections=10 duration_s=600 seed=clickbench
+window=2 arm=new qps=0.465 err_ratio=0.0200 connections=10 duration_s=600 seed=clickbench
+window=3 arm=new qps=0.475 err_ratio=0.0200 connections=10 duration_s=600 seed=clickbench
+window=4 arm=old qps=0.512 err_ratio=0.0200 connections=10 duration_s=600 seed=clickbench

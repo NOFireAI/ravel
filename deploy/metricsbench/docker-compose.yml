@@ -1,0 +1,398 @@
+# MetricsBench comparator set (ADR-0927, issue #934).
+#
+# Launches every cross-engine comparator required by the MetricsBench portable
+# lane, each pinned to an immutable image DIGEST and each given identical CPU and
+# memory limits so no comparator wins on hardware. Bring the set up with:
+#
+#   S3S_FS_BIN=/path/to/verified/s3s-fs \
+#     docker compose -f deploy/metricsbench/docker-compose.yml up -d
+#
+# S3S_FS_BIN is the s3s-fs binary run.sh's fetch_s3s_fs step downloads and
+# checks; compose refuses to start without it (the s3s service below).
+#
+# The MetricsBench harness (crates/ravel-bench, sibling task M1) drives every
+# comparator here over Prometheus Remote Write 1.0 for ingest and the Prometheus
+# HTTP query API for reads. ADR-0927 decision 1: the portable lane is the only
+# basis for cross-engine comparison, and every participating system receives the
+# same logical samples and the same queries. Remote Read (/api/v1/read) is NOT
+# used by the harness (ADR-0927 decision 2) and none of these systems is
+# configured to rely on it.
+#
+# PINS. Every `image:` below carries both a human-readable tag AND an
+# `@sha256:` manifest digest. The digest is authoritative; the tag is kept only
+# so a reader sees the version without resolving the hash. A tag alone is a
+# moving reference and would make a run unreproducible, so
+# tests/every_comparator_pins_an_image_digest.sh fails the set if any reference
+# loses its digest. Digest provenance is recorded in README.md.
+#
+# DURABILITY AND STORAGE ARCHITECTURE differ per system and are NOT
+# interchangeable. Prometheus and VictoriaMetrics here persist to a local-disk
+# TSDB. Mimir is object-storage-native and writes its blocks to S3 (backed by
+# s3s-fs in this stack). Per ADR-0927 decision 10 (ADR-0075 decision 3), a
+# local S3-compatible store removes per-request fees and is therefore valid
+# ONLY for correctness and CI, never for a publishable performance or cost
+# claim. A local-disk or s3s-fs result here is never an S3-equivalent result;
+# each service block below states its own durability so the distinction is
+# readable without the ADR open.
+#
+# SECURITY: every credential here is a fixed local-development value and every
+# published port binds loopback (127.0.0.1) only. Nothing here is for a
+# network-reachable deployment.
+
+services:
+  # --- Prometheus --------------------------------------------------------
+  # The reference PromQL engine. ADR-0927 decision 4 pins Prometheus v3.13.1 as
+  # the correctness oracle (crates/ravel-promql-difftest), so the comparator
+  # Prometheus is pinned to the SAME version: a comparator on a different
+  # Prometheus than the oracle would compare two Prometheus builds, not the
+  # engine under test against the oracle.
+  #
+  # DURABILITY: local-disk TSDB at /prometheus. A 2xx on remote write means the
+  # sample is in the in-memory head block and the write-ahead log on local disk.
+  # This is NOT an object-storage durability guarantee and must never be placed
+  # in the same column as Ravel's durable-on-ack S3 result (ADR-0927 decision 3).
+  # Left on Docker Hub deliberately: this is the only registry that
+  # publishes prom/prometheus. The one CI job that runs this compose file is
+  # metricsbench-nightly, once a day and not gating a merge, so it carries
+  # one daily anonymous pull rather than the pressure a per-PR job would; a
+  # rate-limited pull fails that night's run with "pull access denied"
+  # (rationale in deploy/README.md).
+  prometheus:
+    image: prom/prometheus:v3.13.1@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      # Remote Write 1.0 receiver. Without this flag /api/v1/write returns 404
+      # and Prometheus cannot participate in the portable ingest lane.
+      - "--web.enable-remote-write-receiver"
+      - "--storage.tsdb.path=/prometheus"
+      # RETENTION (disclosed transformation): Prometheus deletes blocks older
+      # than 30d. Set generously above every ADR-0927 profile duration (history
+      # is 30d) so retention never silently drops benchmark samples mid-run.
+      - "--storage.tsdb.retention.time=45d"
+      # OUT-OF-ORDER WINDOW (disclosed, frozen): 1h, set in config/prometheus.yml
+      # (storage.tsdb.out_of_order_time_window has no command-line flag). The
+      # comment there carries the default it replaces and why.
+      #
+      # QUERY LIMITS (disclosed, frozen per ADR-0927 amendment 2026-10-26 F).
+      # Each one that fires is a budget refusal, not an engine error; the
+      # README's "Frozen limits" table lists value, sizing and error text.
+      # Max samples: replaces the 3.13.1 default 50000000. The flag bounds the
+      # samples a query holds in memory at its peak, not the samples it reads:
+      # a range function over a matrix selector is evaluated one series at a
+      # time. mb_long_range_7d_avg selects 1,000 series (one job of history's
+      # 4,000 gauge series) with a 7d window of 7 * 86400 / 15 = 40,320
+      # samples each, so it peaks near one window plus its 1,000-point output
+      # (predicted; a falsification run is pre-registered on #2821). The
+      # largest peak in the corpus is a range query's intermediate matrix:
+      # mb_full_range_avg_over_time on cardinality evaluates
+      # avg_over_time over 400,000 series x 121 grid points = 48,400,000
+      # points before avg() collapses them to one series (predicted from the
+      # engine evaluating an aggregation's argument over the whole range
+      # first), 3.2% under the default. The
+      # raised value covers the case where the falsification run refutes the
+      # per-series model and the flag counts samples read instead: the same
+      # statement then reads 400,000 x 240 = 96,000,000, above the default.
+      # Any value above that refuses no corpus statement on this count;
+      # 500000000 is also Mimir's querier.max_samples, so the two share one
+      # frozen value. The 8g envelope is the memory bound.
+      - "--query.max-samples=500000000"
+      # Query timeout: equals the 3.13.1 default 2m, written so the effective
+      # config capture shows it and a default change cannot move it silently.
+      - "--query.timeout=120s"
+      # Lookback delta: the 3.13.1 default 5m, stated, not changed. An instant
+      # or range step sees a series' newest sample at most 5m old.
+      - "--query.lookback-delta=5m"
+      # DELAYED COMPACTION / MATERIALISED STATE (disclosed): Prometheus holds
+      # incoming samples in an in-memory head block and only cuts a persistent,
+      # compacted on-disk block every 2h (fixed head-chunk range, not tunable).
+      # A query issued seconds after ingest reads the head, not a compacted
+      # block; a query issued later reads compacted, deduplicated blocks. The
+      # storage state a query sees therefore depends on wall-clock age of the
+      # data. Tuning here is limited to the flags above; no unpublished tuning.
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    # GO MEMORY LIMIT (disclosed, frozen per ADR-0927 amendment 2026-11-05):
+    # GOMEMLIMIT=7GiB, 87.5% of the 8g envelope below. Replaces the default,
+    # unset, under which the Go runtime collects only when the heap has grown
+    # GOGC percent (default 100, left unset here) over the last live heap,
+    # without knowing the cgroup limit. With it the runtime collects before
+    # the cgroup limit instead of overshooting it. It bounds heap overshoot,
+    # not the live set: a live heap above 7GiB still does not fit. The limit
+    # counts all memory the Go runtime manages, goroutine stacks included;
+    # the 1GiB left covers what the cgroup charges outside it (page cache,
+    # mmap'd files, kernel memory, the binary). README "Frozen limits"
+    # carries the row.
+    environment:
+      GOMEMLIMIT: 7GiB
+    # DESCRIPTOR LIMIT (disclosed, equal on every long-running service):
+    # nofile 524288 soft and hard, the Docker hard default. The Go engines
+    # raise their soft limit to the hard limit themselves; ravel-server and
+    # s3s-fs do not (#3412), so without this they run at the 1,024 soft
+    # default. README "Frozen limits" carries the row.
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
+    deploy:
+      resources:
+        limits:
+          # Identical envelope across all three engines (see victoriametrics and
+          # mimir): equal CPU and memory is a portable-lane fairness precondition.
+          # 8g: Mimir's single process needs more than 4g to ingest the
+          # cardinality profile, and the envelope stays equal across engines.
+          cpus: "2.0"
+          memory: 8g
+
+  # --- VictoriaMetrics ---------------------------------------------------
+  # Single-node VictoriaMetrics. Accepts Prometheus Remote Write 1.0 natively at
+  # /api/v1/write and serves the Prometheus query API under /prometheus.
+  #
+  # DURABILITY: local-disk storage at /victoria-metrics-data. An ack means the
+  # sample is written to VictoriaMetrics' local storage; like Prometheus this is
+  # a local-disk guarantee, not an object-storage one.
+  # Left on Docker Hub deliberately: same reasoning as the prometheus
+  # comparator above.
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.115.0@sha256:d8ac3a1776c8a9beead8bbd42a489c82249b1bfe9071dfd4813f34ebe36354bb
+    command:
+      - "-storageDataPath=/victoria-metrics-data"
+      # RETENTION (disclosed): drop data older than 45d, above the history
+      # profile's 30d, so retention never silently drops benchmark samples.
+      - "-retentionPeriod=45d"
+      # DEDUPLICATION (disclosed, OFF): -dedup.minScrapeInterval defaults to 0
+      # (disabled). Set explicitly to 0 so no sample is silently coalesced; the
+      # portable lane sends each logical sample once and expects each stored once.
+      - "-dedup.minScrapeInterval=0"
+      # OUT-OF-ORDER WINDOW (disclosed, no flag): VictoriaMetrics has no
+      # out-of-order window to set; v1.115.0's docs (docs/victoriametrics/
+      # README.md, "Backfilling") say it "accepts historical data in arbitrary
+      # order of time via any supported ingestion method", bounded only by
+      # -retentionPeriod above. So the out-of-order sample ADR-0927 amendment B
+      # specifies (shifted back 1.5 scrape intervals, 22.5s at 15s, off the
+      # grid) is stored here as it is by the 1h windows on Prometheus and
+      # Mimir; Prometheus without its window rejects the whole Remote Write
+      # 1.0 request with HTTP 400 on such a sample.
+      #
+      # QUERY LIMITS (disclosed, frozen per ADR-0927 amendment 2026-10-26 F).
+      # Each one that fires is a budget refusal, not an engine error; the
+      # README's "Frozen limits" table lists value, sizing and error text.
+      # Latency offset: replaces the v1.115.0 default 30s, which hides points
+      # newer than now-30s, so an instant query at the newest sample would be
+      # evaluated 30s earlier than on the other engines without saying so.
+      - "-search.latencyOffset=0"
+      # Points per series on /api/v1/query_range: replaces the default 30000.
+      # Bounds the declared range grids; the largest, history's 24h at a 5m
+      # step, is 24 * 12 + 1 = 289 points, far inside 20000.
+      - "-search.maxPointsPerTimeseries=20000"
+      # Raw samples per query: equals the default 1000000000, written so the
+      # capture shows it. Unlike Prometheus' flag, this counts every raw
+      # sample the query reads across all its series. The largest in the
+      # corpus is mb_full_range_avg_over_time on cardinality: 400,000 series x
+      # 240 samples (the 30m grid plus the 30m window, 1h at 15s) =
+      # 96,000,000.
+      - "-search.maxSamplesPerQuery=1000000000"
+      # Query duration: replaces the default 30s with 120s, equal to the
+      # Prometheus comparator's --query.timeout, so a history statement the
+      # others finish is not refused here on time alone.
+      - "-search.maxQueryDuration=120s"
+      # Unique series per query: the default (unset) is derived from
+      # -search.maxConcurrentRequests and the memory available to the
+      # process, so it would move with the container's CPU and RAM. Pinned to
+      # the cardinality profile's 1,000,000 active series, the most any
+      # profile holds.
+      - "-search.maxUniqueTimeseries=1000000"
+      # Series per /api/v1/series call: the default 30000 refuses the
+      # harness's cardinality read-back, which lists all 1,000,000 series, with
+      # a 422. Pinned to the same 1,000,000 as -search.maxUniqueTimeseries.
+      - "-search.maxSeries=1000000"
+      # Response cache: off (replaces the default false, cache on). The
+      # benchmark replays historical timestamps, and the same docs section
+      # recommends disabling the cache while "writing historical data with
+      # timestamps from the past". A production_cache regime re-enables it per
+      # run and discloses that it did.
+      - "-search.disableCache=true"
+      # DOWNSAMPLING (disclosed, ABSENT): downsampling is a VictoriaMetrics
+      # Enterprise feature and does not exist in this OSS single-node image, so
+      # no automatic resolution reduction occurs. Stated here so its absence is
+      # a recorded fact, not an assumption.
+      #
+      # BACKGROUND MERGES / MATERIALISED STATE (disclosed): VictoriaMetrics
+      # continuously merges its on-disk parts (LSM-style). Like Prometheus'
+      # block compaction this means recently ingested data and older data may
+      # live in differently-merged parts; the merge cadence is internal and not
+      # tuned here. No unpublished tuning: every flag that changes behaviour is
+      # on this command line.
+    ports:
+      - "127.0.0.1:8428:8428"
+    volumes:
+      - victoriametrics-data:/victoria-metrics-data
+    # GO MEMORY LIMIT: GOMEMLIMIT=7GiB, equal on the three Go comparators;
+    # see prometheus.
+    environment:
+      GOMEMLIMIT: 7GiB
+    # DESCRIPTOR LIMIT: equal on every long-running service; see prometheus.
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 8g
+
+  # --- Object storage for the object-storage-native comparator -----------
+  # s3s-fs backing Mimir's S3 blocks storage (ADR-0927 amendment 2026-10-29).
+  # NOTE (ADR-0927 decision 10): s3s-fs is local-disk-backed and free of
+  # per-request fees, so any Mimir figure taken against it is a
+  # correctness/functional result, NOT a publishable cost or performance
+  # result. A real-S3 substrate is required for that, exactly as Ravel's own
+  # publishable lane requires real S3.
+  #
+  # The binary is not in an image: run.sh's fetch_s3s_fs step downloads the
+  # s3s-fs-0.17.0-ravel.3 release asset for the host arch, refuses it unless
+  # its sha256 equals the constant run.sh carries, and exports its path as
+  # S3S_FS_BIN, which is bind-mounted read-only below. The pin guard
+  # (tests/every_comparator_pins_an_image_digest.sh, category 7) fails if
+  # either constant or the comparison goes. The base image is the same
+  # distroless/cc digest the root Dockerfile builds on; the binary is linked
+  # against glibc and needs nothing else from the image. It runs as root
+  # (user 0:0) so it can write the named volume, which Docker creates
+  # root-owned.
+  s3s:
+    image: gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
+    user: "0:0"
+    entrypoint: ["/usr/local/bin/s3s-fs"]
+    command: ["--host", "0.0.0.0", "--port", "9000", "/data"]
+    environment:
+      S3S_FS_ACCESS_KEY: mimir
+      S3S_FS_SECRET_KEY: mimir-dev-secret
+    volumes:
+      - ${S3S_FS_BIN:?S3S_FS_BIN must name the verified s3s-fs binary; run.sh sets it}:/usr/local/bin/s3s-fs:ro
+      - s3s-data:/data
+    # DESCRIPTOR LIMIT: equal on every long-running service; see prometheus.
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2g
+
+  # Docker Hub, not ECR Public: see README.md, "Pinned image digests".
+  createbuckets:
+    image: amazon/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
+    depends_on: [s3s]
+    environment:
+      AWS_ACCESS_KEY_ID: mimir
+      AWS_SECRET_ACCESS_KEY: mimir-dev-secret
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+    # Mimir's `all` target opens blocks, ruler and alertmanager storage; create
+    # all three buckets so a fresh store does not stall Mimir startup. The
+    # until-loop is the readiness wait: this one-shot exits 0 only once the
+    # buckets exist, which mimir depends_on below. Each bucket is created only
+    # if head-bucket does not find it, so a rerun on the kept s3s-data volume
+    # still exits 0: s3s-fs answers a repeated CreateBucket with
+    # BucketAlreadyExists. ravel-metricsbench is Ravel's bucket, used only
+    # when ravel.yml is layered on this file; it is created here so one
+    # one-shot owns the store's buckets. All four stay plain (no Object
+    # Lock): Ravel's store qualify reports Object Lock but does not require
+    # it unless asked to, and bucket immutability is not what this lane
+    # measures.
+    entrypoint: >
+      /bin/sh -c "
+      until aws --endpoint-url http://s3s:9000 s3api list-buckets >/dev/null 2>&1; do
+        echo 'waiting for s3s'; sleep 1;
+      done &&
+      for b in mimir-blocks mimir-ruler mimir-alertmanager ravel-metricsbench; do
+        aws --endpoint-url http://s3s:9000 s3api head-bucket --bucket $$b ||
+        aws --endpoint-url http://s3s:9000 s3api create-bucket --bucket $$b || exit 1;
+      done"
+
+  # --- Mimir (object-storage-native PromQL system) -----------------------
+  # Grafana Mimir in monolithic mode (-target=all): a single process running the
+  # distributor (Remote Write receiver), ingester, querier, store-gateway and
+  # compactor. Chosen as the ADR-0927 object-storage-native comparator because,
+  # like Ravel, its durable state lives in S3 rather than on local disk.
+  #
+  # DURABILITY AND STORAGE ARCHITECTURE: the distributor accepts Remote Write at
+  # /api/v1/push; the ingester holds recent samples in an in-memory head with a
+  # local write-ahead log, then ships each cut TSDB block to S3 (s3s-fs here;
+  # -blocks-storage.tsdb.ship-interval in Mimir 3.2.3's -help-all), where the
+  # compactor later merges it. So an ack is a local-WAL guarantee and the S3
+  # copy appears LATER, after block upload. This ack-vs-object-storage-visibility
+  # gap is a material difference from Ravel's strict-mode Remote Write, where a
+  # 2xx means the data object and commit record are already durable in object
+  # storage (ADR-0927 decision 3). Do not compare Mimir's ack latency against
+  # Ravel's on the same row without this distinction. Ingest storage stays off:
+  # this config does not set -ingest-storage.enabled, which 3.2.3's -help-all
+  # lists as a boolean with no default printed, so false.
+  #
+  # QUERY ENGINE (disclosed, left at default): in 3.2.3 queriers run the Mimir
+  # query engine (MQE) by default (-querier.query-engine, marked
+  # [experimental] in -help-all, default "mimir") and fall back to the
+  # Prometheus engine for expressions MQE does not support
+  # (-querier.enable-query-engine-fallback, also [experimental], default true;
+  # both from 3.2.3's -help-all). Neither flag is set here: the benchmark
+  # measures the default. The CONFIGURED engine is recorded per run by
+  # deploy/metricsbench/capture-effective-config.sh, which reads it from
+  # Mimir's /config (on main since pull request #3286, which this branch
+  # predates); which engine ANSWERED a given query (MQE, or the fallback)
+  # is not recorded by anything yet and is epic #2821 Wave 3 work.
+  #
+  # OTHER QUERY-PATH DEFAULTS 3.x FLIPPED (disclosed, left at default; from
+  # 3.2.3's -help-all against 2.14.2's): query sharding is on
+  # (-query-frontend.parallelize-shardable-queries, default true, was false),
+  # the querier runs at most 8 concurrent queries (-querier.max-concurrent,
+  # default 8, was 20), and the hedged requests to further ingesters are
+  # off (-querier.minimize-ingester-requests-hedging-delay, default 0s, was
+  # 3s; the flag's help says 0 disables them). The hedging flip changes
+  # nothing on this stack: with replication_factor 1 and one ingester there
+  # is no further ingester to hedge to on either version. Sharding is the
+  # one flip that changes how a query executes here, so a 3.2.3 figure is
+  # not comparable with a 2.14.2 figure for the same statement.
+  # Left on Docker Hub deliberately: same reasoning as the prometheus
+  # comparator above.
+  mimir:
+    image: grafana/mimir:3.2.3@sha256:0ed56db7d7713707eff00224ddd4c3096afa6cf1cbe43a6f9391c537f1416099
+    depends_on:
+      createbuckets:
+        condition: service_completed_successfully
+    command:
+      - "-config.file=/etc/mimir/mimir.yaml"
+      # Monolithic: every Mimir component in one process. The alternative
+      # (microservices) would spread the comparator across many containers with
+      # per-component limits and make the equal-envelope fairness rule above
+      # meaningless.
+      - "-target=all"
+    ports:
+      - "127.0.0.1:9009:9009"
+    volumes:
+      - ./config/mimir.yaml:/etc/mimir/mimir.yaml:ro
+      - mimir-data:/data
+    # GO MEMORY LIMIT: GOMEMLIMIT=7GiB, equal on the three Go comparators;
+    # see prometheus.
+    environment:
+      GOMEMLIMIT: 7GiB
+    # DESCRIPTOR LIMIT: equal on every long-running service; see prometheus.
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 8g
+
+volumes:
+  prometheus-data:
+  victoriametrics-data:
+  s3s-data:
+  mimir-data:

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bbfe9564a474a6f61aa58df81ccce75c22c87e6bea9a564ba7342b0f7f6b9a51 # shrinks to dict = DictionaryArray {keys: PrimitiveArray<Int32> [   0, ] values: StringArray [   null, ]} 
+cc be2bf226bc4458c754ba014b5825d2308f77f4bd40ae173994a1dc9cb3970e20 # shrinks to dict = DictionaryArray {keys: PrimitiveArray<Int32> [   0, ] values: StringArray [   null, ]} 

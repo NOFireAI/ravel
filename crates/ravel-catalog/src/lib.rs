@@ -1,0 +1,176 @@
+//! Catalog: snapshot resolution over commit records (MVCC).
+//!
+//! Implementer contract: docs/catalog-and-mvcc.md and ADR-0003. Phase 1 is
+//! listing-based discovery behind the Catalog API; snapshots come with
+//! compaction.
+
+mod auth_token_map;
+mod cache;
+mod catalog;
+mod charged;
+mod column_stats_build;
+mod column_stats_resolve;
+pub mod compat;
+mod config;
+mod covering_postings;
+mod declared_stats;
+mod error;
+mod fold;
+mod key_epoch;
+mod key_index_rebuild;
+mod metrics_meta;
+mod provisioning;
+mod read_gate;
+mod seal_divergence;
+mod snapshot;
+mod snapshot_format;
+mod snapshot_resolve;
+mod tenant_config;
+pub mod tenant_kms;
+mod tenant_part;
+
+// The five versioned sys/* records this crate owns each export their writer
+// stamp AND the closed read set (MIN..=MAX) their reader accepts. The pair is
+// public because it is the contract, not an implementation detail: the ADR-0066
+// enumeration guard in tests/ asserts the checked-in classification table's
+// read-version slices against these constants, so widening a gate without
+// updating the table fails rather than passing silently.
+pub use auth_token_map::{
+    AUTH_KEY, AUTH_TOKEN_MAP_FORMAT_VERSION, AUTH_TOKEN_MAP_MAX_READ_VERSION,
+    AUTH_TOKEN_MAP_MIN_READ_VERSION, AuthMapDefect, AuthTokenMap, AuthTokenMapError,
+    KEY_FINGERPRINT_LEN, MANAGED_BY_CLI, MANAGED_BY_OPERATOR, SetOutcome as AuthSetOutcome,
+    TOKEN_HASH_LEN, TokenEntry, key_fingerprint, read_auth_map, remove_token,
+    remove_tokens_by_tenant, remove_tokens_by_tenant_owned_by, replace_tenant_tokens,
+    tenant_for_token, token_hash, upsert_token, upsert_token_owned,
+};
+pub use cache::RecordCacheTotals;
+pub use catalog::Catalog;
+pub use catalog::resolve_rewrite_supersession;
+pub use catalog::{
+    AuthoritativeSelection, erasure_dominated_compaction_records,
+    select_authoritative_compaction_records,
+};
+pub use charged::BudgetCatalogCharge;
+pub use column_stats_resolve::{
+    ColumnStatsRequest, LoadColumnStatsError, LoadedColumnStats, unique_column_stat,
+};
+pub use compat::{
+    COMPAT_FORMAT_VERSION, COMPAT_KEY, COMPAT_MAX_READ_VERSION, COMPAT_MIN_READ_VERSION,
+    COMPAT_VIEW_HORIZON, CompatClock, CompatError, CompatKeys, CompatRefusal, CompatView,
+    DEFAULT_COMPAT_REFRESH_INTERVAL,
+};
+pub use config::{
+    CatalogConfig, DEFAULT_BYTE_CACHE_MAX_BYTES, DEFAULT_BYTE_CACHE_MAX_ENTRIES,
+    DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES, DEFAULT_CACHE_CAPACITY_PER_TENANT,
+    DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES,
+    DEFAULT_FOLD_RECONCILE_WINDOW_HOURS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
+    DEFAULT_FRONTIER_RECONCILE_MAX_HOURS, DEFAULT_HEAD_CACHE_CAPACITY, DEFAULT_HEAD_CACHE_TTL_NS,
+    DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS, DEFAULT_MAX_CATALOG_LIST_REQUESTS,
+    DEFAULT_MAX_FLUSH_LIFETIME_NS, DEFAULT_MAX_INGEST_LAG_NS,
+    DEFAULT_METRICS_LABEL_INDEX_MAX_RATIO_PPM, DEFAULT_POSTINGS_CACHE_ENTRIES,
+    DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS, DEFAULT_PROTECTION_HORIZON_NS,
+    DEFAULT_RESOLVE_PREFIX_CONCURRENCY, DEFAULT_SNAPSHOT_CACHE_PARTS,
+    MAX_CACHE_CAPACITY_PER_TENANT, MAX_RECORD_CACHE_BYTES_PER_TENANT, MAX_RESOLVE_GET_CONCURRENCY,
+    RECORD_CACHE_ENTRY_BYTES, RECORD_CACHES_PER_TENANT, derive_cache_capacity_per_tenant,
+    derive_cache_capacity_per_tenant_within,
+};
+pub use covering_postings::{LoadPostingsError, LoadedCoveringPostings, load_covering_postings};
+pub use declared_stats::{
+    DeclaredColumnStats, fold_stamped_entries_total, fold_stamped_records_total,
+    read_snapshot_entry,
+};
+pub use error::CatalogError;
+pub use fold::{
+    FOLD_CATALOG_FAMILIES, FoldCompatRefusal, FoldKeyIndexTotals, FoldReport,
+    METRICS_LABEL_VALUE_FIELD, PostingsBuildError, RefoldRequest, Transaction, fetch_segment_names,
+    fold_key_index_totals, fold_read_versions, fold_write_version,
+};
+pub use key_epoch::{
+    EpochDefect, KEY_EPOCH_FORMAT_VERSION, KEY_EPOCH_MAX_READ_VERSION, KEY_EPOCH_MIN_READ_VERSION,
+    KeyEpoch, KeyEpochError, KeyEpochOutcome, enc_key, epoch_for_write, read_epochs,
+    read_epochs_checked, read_epochs_from_store, record_key_epoch,
+};
+pub use key_index_rebuild::{
+    DEFAULT_KEY_INDEX_REBUILD_BATCH_ENTRIES, KeyIndexRebuildAttempt, KeyIndexRebuildError,
+    KeyIndexRebuildOptions, KeyIndexRebuildReport,
+};
+pub use metrics_meta::{
+    DEFAULT_METRICS_META_ENTRY_CAP, MAX_METRICS_META_DECOMPRESSED_BYTES,
+    METRICS_META_FORMAT_VERSION, METRICS_META_MAX_READ_VERSION, METRICS_META_MIN_READ_VERSION,
+    MergeOutcome, MetricKind, MetricMetadataEntry, MetricsMetaDefect, MetricsMetaError,
+    merge_entries, metrics_meta_key, read_metrics_meta, read_metrics_meta_for_serve,
+    read_metrics_meta_for_serve_on_gate, read_metrics_meta_on_gate, write_metrics_meta,
+};
+pub use provisioning::{
+    AbsentPolicy, CompatFenceOutcome, DEFAULT_SCAN_SLACK_HOURS, FLUSH_BOUND_SLACK_HOURS,
+    FloorBasis, FloorDefect, FloorEvidence, FloorObservation, FloorRaiseOutcome, FormatFloor,
+    GenerationDefect, MAX_SHARD_COUNT, PROVISIONING_FENCED_FORMAT_VERSION,
+    PROVISIONING_FORMAT_VERSION, PROVISIONING_MAX_READ_VERSION, PROVISIONING_MIN_READ_VERSION,
+    PROVISIONING_REWRITE_CEILING, ProvisioningCheck, ProvisioningError, ReshardOutcome,
+    ShardGeneration, active_shard_count, append_generation, classify_floor, current_floor,
+    current_floor_from_store, max_scan_count_over_range, provisioning_key, raise_compat_fence,
+    raise_format_floor, read_floors, read_floors_checked, read_floors_from_store, read_generations,
+    read_generations_checked, read_generations_from_store, scan_count, scan_shards_for_hour,
+    scan_shards_over_range, shard_ceiling, shard_count_drift_count, stable_generation_for_hour,
+    validate_or_adopt, validate_or_adopt_fenced,
+};
+pub use seal_divergence::{
+    EntryIdentity, SealDivergenceError, SealDivergenceReport, SnapshotCoverage, snapshot_coverage,
+    verify_seal_divergence,
+};
+pub use snapshot::{
+    SegmentLevel, SegmentOrigin, SegmentOrigins, SegmentPartOrigin, SegmentRef, Snapshot,
+    SnapshotPartHandle, SnapshotParts,
+};
+pub use snapshot_format::{
+    CatalogPartKind, ColumnStatsHeaderPeek, ColumnStatsLimits,
+    DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES, DEFAULT_MAX_COLUMN_STATS_BYTES,
+    DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES, DecodedColumnStats, DecodedPart,
+    DecodedPostings, HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSION_2, HEAD_FORMAT_VERSIONS, MAGIC,
+    NamePostings, NewerPartVersion, PartLimits, PostingsLimits, SnapshotFormatError, VERSION,
+    column_stats_segments_concat, decode_column_stats, decode_column_stats_filtered,
+    decode_column_stats_header, decode_head, decode_part, decode_postings, encode_column_stats_v3,
+    encode_head, encode_part, encode_postings, head_format_version_for,
+    head_format_version_is_newer, validate_min_max_presence,
+};
+pub use snapshot_format::{
+    DEFAULT_MAX_KEY_INDEX_LEAF_BODY_BYTES, EncodedKeyIndexLeaf, KEY_INDEX_LEAF_FORMAT_VERSION,
+    KEY_INDEX_LEAF_FORMAT_VERSION_1, KEY_INDEX_LEAF_FORMAT_VERSION_3,
+    KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN, KEY_INDEX_LEAF_GET_CEILING, KEY_INDEX_LEAF_MAGIC,
+    KEY_INDEX_LEAF_MIN_BUCKET_BITS, KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS,
+    KEY_INDEX_LEAF_WRITER_MAX_BUCKET_BITS, KEY_INDEX_MAX_PROBED_PARTS,
+    KEY_INDEX_SET_PROBE_MAX_RUNS, KEY_INDEX_T1_BYTES, KeyIndexBucketRange, KeyIndexEntryKind,
+    KeyIndexKeyAnswer, KeyIndexLeafBreach, KeyIndexLeafEncodeError, KeyIndexLeafEntry,
+    KeyIndexLeafError, KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexLeafPrefix,
+    KeyIndexLeafProbe, KeyIndexLeafRejection, KeyIndexLeafRequest, KeyIndexLeafSummary,
+    KeyIndexMatch, KeyIndexPostingEntry, KeyIndexPostingLeafInput, KeyIndexPostingSetAnswer,
+    KeyIndexPostingSetDecoder, KeyIndexSetAnswer, KeyIndexSetDecline, KeyIndexSetDecoder,
+    KeyIndexSetPlan, KeyIndexSetPolicy, KeyIndexSetProbe, KeyIndexSetRunError, KeyIndexSetRuns,
+    KeyIndexSlice, LEAF_READ_CONCURRENCY, METRICS_CLASS_OBJECTS_FIELD, METRICS_SERIES_CLASS_FIELD,
+    METRICS_SERIES_LABEL_FIELD, SERIES_LABEL_METRIC_NAME, check_key_index_leaf_set,
+    choose_key_index_bucket_bits, decoded_bound, encode_key_index_leaf,
+    encode_key_index_leaf_with_bucket_bits, encode_key_index_posting_leaf,
+    encode_key_index_posting_leaf_with_bucket_bits, encoded_entry_len, encoded_posting_len,
+    key_index_field_entry_kind, key_index_leaf_format_version, key_index_leaf_prefix_range,
+    key_index_leaf_version_accepted, key_index_leaf_versions_for_signal, key_index_root_shape,
+    plan_key_index_leaf_set, posting_decoded_bound, probe_key_index_leaf_ranged,
+    probe_key_index_leaf_set_ranged, read_key_index_set_runs, restamp_key_index_leaf_version,
+    select_key_index_slice, series_label_pair_bytes, series_label_pair_key8,
+    split_key_index_entries, split_key_index_postings, verify_key_index_leaf,
+    verify_key_index_posting_leaf_frames,
+};
+pub use tenant_config::{
+    BloomScope, ClusteringBucketWidth, ClusteringKey, ClusteringKeyState, DeclaredColumnType,
+    DeclaredTypedColumn, FIXED_LOGS_SQL_COLUMNS, MAX_CLUSTERING_KEY_COLUMNS,
+    MAX_KEY_INDEX_COLUMN_KEY_LEN, MAX_KEY_INDEX_COLUMNS, RESERVED_COLUMN_PREFIX,
+    SetOutcome as TenantConfigSetOutcome, StorageLayoutConfigError, StorageLayoutWrite,
+    StoredBloomScope, StoredClusteringKey, StoredKeyIndex, TENANT_CONFIG_FORMAT_VERSION,
+    TENANT_CONFIG_KEY_INDEX_WRITER_VERSION, TENANT_CONFIG_MAX_READ_VERSION,
+    TENANT_CONFIG_MIN_READ_VERSION, TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION, TenantConfig,
+    TenantConfigError, TenantLifecycleState, TypedAttrColumnError, config_key, read_config,
+    read_config_values, resolve_declared_columns, resolve_retention_window, set_tenant_config,
+    validate_stored_typed_attr_columns, validate_typed_attr_columns,
+};
+pub use tenant_part::{
+    PartTenantError, TenantPartError, check_part_tenant, decode_part_for_tenant,
+};

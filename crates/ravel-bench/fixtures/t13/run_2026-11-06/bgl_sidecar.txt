@@ -1,0 +1,64 @@
+fulltext_sidecar stamp git=4c67f4f8abad0a07f084c4246842c386adcd38b3 arch=x86_64 nproc=16 mem_total_kib=32132612 corpus=BGL.log sha256=666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2 bytes=743185031 profile=release
+fulltext_sidecar cpu_clock CLOCK_THREAD_CPUTIME_ID of the report thread; the measurement runs on a current-thread tokio runtime, so every decode the production fetcher does lands on that thread
+fulltext_sidecar params block_records=8192 group_blocks=32 max_lines=4718592 object_rows=524288 rare_max_rows=3 rare_sample=30 scale_raw_bytes=100000000000 seed=13 sidecar_stride=64 sidecar_suffix_bytes=65536 zstd_level=3
+fulltext_sidecar bgl_sidecar blocks=576 unpredicted (fixed by construction: objects * object_rows / block_records)
+fulltext_sidecar bgl_sidecar bloom/section_bytes=8677394 predict=5700000 band=[2800000, 11300000] IN
+fulltext_sidecar bgl_sidecar build/compaction_cpu_ms=17378.867317999997 predict=20000 band=[9000, 45000] IN
+fulltext_sidecar bgl_sidecar build/cpu_ratio=1.8843691877480047 predict=1.45 band=[0.8, 2.5] IN
+fulltext_sidecar bgl_sidecar build/rewrite_amplification=1.5803038062966972 predict=1.87 band=[1.3, 2.8] IN
+fulltext_sidecar bgl_sidecar build/sidecar_cpu_ms=32748.202092 predict=29000 band=[13000, 65000] IN
+fulltext_sidecar bgl_sidecar delete/bytes_over_object=0.5963637199326726 predict=0.87 band=[0.35, 1.8] IN
+fulltext_sidecar bgl_sidecar delete/erased_only_terms=1 predict=2 band=[0, 6] IN
+fulltext_sidecar bgl_sidecar delete/rebuild_cpu_ms=3075.062658000007 predict=3300 band=[1500, 7000] IN
+fulltext_sidecar bgl_sidecar delete/rebuild_cpu_over_compaction=1.8437682672865368 predict=1.48 band=[0.9, 2.5] IN
+fulltext_sidecar bgl_sidecar delete/residual_terms=0 predict=0 band=[0, 0] IN
+fulltext_sidecar bgl_sidecar lines=4718592 unpredicted (fixed by construction: objects * object_rows)
+fulltext_sidecar bgl_sidecar object_bytes=76898472 predict=76000000 band=[61000000, 98000000] IN
+fulltext_sidecar bgl_sidecar objects=9 unpredicted (fixed by construction: max_lines / object_rows whole objects)
+fulltext_sidecar bgl_sidecar postings/bytes=20391383 predict=26000000 band=[8000000, 60000000] IN
+fulltext_sidecar bgl_sidecar postings/capped_objects=9 predict=9 band=[9, 9] IN
+fulltext_sidecar bgl_sidecar postings/terms=4632997 predict=4000000 band=[1500000, 8000000] IN
+fulltext_sidecar bgl_sidecar postings/verdict_mismatches=0 predict=0 band=[0, 0] IN
+fulltext_sidecar bgl_sidecar rare/bloom_blocks_kept=269 predict=226 band=[90, 700] IN
+fulltext_sidecar bgl_sidecar rare/bloom_bytes=548689582 predict=323000000 band=[150000000, 700000000] IN
+fulltext_sidecar bgl_sidecar rare/bloom_bytes_100gb=2343501109.1365914 predict=1320000000 band=[650000000, 2700000000] IN
+fulltext_sidecar bgl_sidecar rare/bloom_gets=900 predict=918 band=[720, 1170] IN
+fulltext_sidecar bgl_sidecar rare/bytes_ratio_100gb=0.04588868993090552 predict=0.07 band=[0.025, 0.2] IN
+fulltext_sidecar bgl_sidecar rare/bytes_ratio_100gb_default_path=0.010365812277948762 predict=0.0089 band=[0.004, 0.02] IN
+fulltext_sidecar bgl_sidecar rare/bytes_ratio_measured=0.5780840686710906 predict=0.145 band=[0.04, 0.45] MISS
+fulltext_sidecar bgl_sidecar rare/candidates=712956 predict=500000 band=[100000, 2000000] IN
+fulltext_sidecar bgl_sidecar rare/default_path_bytes=2314818480 predict=2280000000 band=[1800000000, 2950000000] IN
+fulltext_sidecar bgl_sidecar rare/default_path_bytes_100gb=10374507358.06522 predict=10300000000 band=[8000000000, 13500000000] IN
+fulltext_sidecar bgl_sidecar rare/default_path_gets=300 predict=270 band=[270, 270] MISS
+fulltext_sidecar bgl_sidecar rare/false_positive_blocks=220 predict=190 band=[55, 650] IN
+fulltext_sidecar bgl_sidecar rare/gets_ratio_100gb=0.6985034230431469 predict=0.654 band=[0.4, 1.05] IN
+fulltext_sidecar bgl_sidecar rare/no_crossover_bytes=2314733670 predict=2280000000 band=[1800000000, 2950000000] IN
+fulltext_sidecar bgl_sidecar rare/no_crossover_gets=330 predict=270 band=[270, 270] MISS
+fulltext_sidecar bgl_sidecar rare/plan_route_bytes_per_object=8573401.777777778 predict=8440000 band=[6800000, 9437185] IN
+fulltext_sidecar bgl_sidecar rare/rows=51 predict=36 band=[30, 50] MISS
+fulltext_sidecar bgl_sidecar rare/scale_objects=1218.497122626679 predict=1218.6 band=[1160, 1284] IN
+fulltext_sidecar bgl_sidecar rare/sidecar_bytes=317188706 predict=47000000 band=[20000000, 110000000] MISS
+fulltext_sidecar bgl_sidecar rare/sidecar_bytes_100gb=107540195.74990223 predict=92000000 band=[55000000, 200000000] IN
+fulltext_sidecar bgl_sidecar rare/sidecar_gets=685 predict=770 band=[540, 1080] IN
+fulltext_sidecar bgl_sidecar rare/tokens=30 unpredicted (fixed by construction: min(rare_sample, rare/candidates))
+fulltext_sidecar bgl_sidecar raw_bytes=738614793 predict=738500000 band=[701000000, 776000000] IN
+fulltext_sidecar bgl_sidecar sidecar/bytes=44624476 predict=66000000 band=[30000000, 130000000] IN
+fulltext_sidecar bgl_sidecar sidecar/entries=109681304 predict=94000000 band=[60000000, 130000000] IN
+fulltext_sidecar bgl_sidecar sidecar/over_bloom_section=5.1426126323179515 predict=11.6 band=[3, 40] IN
+fulltext_sidecar bgl_sidecar sidecar/over_postings=2.1883986976263454 predict=2.5 band=[1, 8] IN
+fulltext_sidecar bgl_sidecar sidecar/terms=4632997 predict=4000000 band=[1500000, 8000000] IN
+fulltext_sidecar note objects: 9 of 524288 rows from the first 4718592 corpus lines, written by the production RlogWriter (bloom over every field); keys t13/sidecar/0000.rlog..t13/sidecar/0008.rlog
+fulltext_sidecar note sidecar: row-granular inverted index of the production body tokens, term blocks of sidecar_stride prefix-shared terms with delta-coded row ordinals, each zstd-compressed, then a zstd index (first term, offset, length per block; rows per RLOG block) and an 8-byte trailer. A real build and a real probe through ranged GETs, not a simulation
+fulltext_sidecar note baselines: the BLOOM section the production writer wrote, its verdict through the production scan funnel scan_accounted_with_tenant with HasWord(body) over the object's full time window, every returned row checked against the corpus. rare/default_path_* is that scan with the production defaults: every block is a time candidate, the 0.75 coverage crossover fires before the bloom is consulted, and the whole object is read. rare/no_crossover_* is the same scan with the crossover off (BlockRangeFetcher coverage threshold 2.0): the ranged read still fetches every time candidate block, because production narrows by BLOOM only at decode over the fetched buffer. rare/bloom_* is the bloom-guided route production does not take, the baseline the decision is taken against: real ranged GETs of the production suffix probe (DEFAULT_LOG_SUFFIX_LEN), PAGE_DIR and BLOOM where the probe missed them, and the pages of the blocks the production bloom kept, each round coalesced at DEFAULT_LOG_REQUEST_COST_BYTES; its block verdict is the production scan's. rare/plan_route_bytes_per_object is what the production plan_segment for the same query moves per object before any scan (the first sampled token, once per object); the POSTINGS section the production encode_postings_section builds over body tokens to block indices (uncapped, so its size is what it would cost; postings/capped_objects counts the objects where the production distinct cap would have dropped it)
+fulltext_sidecar note costs: GETs and the bytes they returned, counted by the production InstrumentedStore, through a fresh LogSegmentFetcher per object and token (no cache); every returned row on both paths equals the corpus rows holding the token
+fulltext_sidecar note 100 GB: scale_objects = scale_raw_bytes / (raw_bytes / objects) = 100000000000 / (738614793 / 9); per token cost = sum(measured costs of its matching objects) + (scale_objects - matching objects) * mean miss cost; mean miss bytes bloom 1922461.3, sidecar 80171.5, default path 8513742.2; mean miss GETs bloom 3.120, sidecar 2.178; ratio = mean sidecar cost / mean bloom cost over 30 tokens
+fulltext_sidecar note build: build/sidecar_cpu_ms is the thread CPU of tokenizing the decoded bodies and encoding the sidecar; build/compaction_cpu_ms is the thread CPU of decoding every block and re-encoding with the production writer; rewrite amplification is (objects + sidecars) / objects in bytes written
+fulltext_sidecar note deletion: erased row 97 of object 0 (1 terms only it held); the object is rewritten without it by the production writer and the sidecar rebuilt from the rewritten rows (a sidecar cannot be edited in place: every later ordinal moves); each erased-only term was probed in the rebuilt sidecar, and the row after the erased one was found at its new place; rebuild CPU is over object 0's compaction CPU
+fulltext_sidecar decision bgl_sidecar: NO-GO (rare/bytes_ratio_100gb=0.0459<=0.1 ok, sidecar/over_postings=2.1884<=1.2 FAIL, build/cpu_ratio=1.8844<=1.5 FAIL, delete/rebuild_cpu_over_compaction=1.8438 ok, delete/bytes_over_object=0.5964 ok, delete/residual_terms=0.0000<=0 ok)
+fulltext_sidecar miss rare/bytes_ratio_measured: 0.5780840686710906 outside band [0.04, 0.45]
+fulltext_sidecar miss rare/default_path_gets: 300 outside band [270.0, 270.0]
+fulltext_sidecar miss rare/no_crossover_gets: 330 outside band [270.0, 270.0]
+fulltext_sidecar miss rare/rows: 51 outside band [30.0, 50.0]
+fulltext_sidecar miss rare/sidecar_bytes: 317188706 outside band [20000000.0, 110000000.0]
+
+EXIT=2

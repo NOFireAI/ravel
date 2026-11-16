@@ -1,0 +1,76 @@
+# The MetricsBench real-S3 lane (ADR-0927 decision 10): Ravel and Mimir on real
+# S3 buckets instead of the stack's s3s-fs. An overlay layered after ravel.yml,
+# chosen by run.sh's --real-s3-bucket-prefix and --real-s3-region:
+#
+#   docker compose -f docker-compose.yml -f ravel.yml -f real-s3.yml up -d
+#
+# Prometheus and VictoriaMetrics stay on local disk, as in the portable lane.
+# Every other setting is the portable lane's, so the store is what changes.
+#
+# BUCKETS. Bucket names are global on real S3, so this file names none: the
+# operator creates <prefix>-ravel, <prefix>-mimir-blocks, <prefix>-mimir-ruler
+# and <prefix>-mimir-alertmanager before the run, in the region given.
+#
+# CREDENTIALS. Both engines take the EC2 instance role from the instance
+# metadata service and no key appears here. The containers sit one hop behind
+# the host, so the instance needs a metadata hop limit of 2.
+
+services:
+  # Nothing in this lane uses s3s-fs, so it does not start. No service below
+  # depends on it, and run.sh does not fetch its binary.
+  s3s:
+    profiles: ["portable-store"]
+
+  # Keeps its place as the one-shot Mimir and ravel-qualify wait on, but creates
+  # nothing: it exits non-zero when a bucket is missing, unreadable or already
+  # holds an object, since an earlier run's data would be measured.
+  createbuckets:
+    depends_on: !reset []
+    environment:
+      AWS_ACCESS_KEY_ID: !reset null
+      AWS_SECRET_ACCESS_KEY: !reset null
+      AWS_EC2_METADATA_DISABLED: !reset null
+      AWS_DEFAULT_REGION: ${METRICSBENCH_S3_REGION:?set METRICSBENCH_S3_REGION to the buckets region}
+    entrypoint: >
+      /bin/sh -c "
+      for b in ravel mimir-blocks mimir-ruler mimir-alertmanager; do
+        n=$$(aws s3api list-objects-v2 --bucket ${METRICSBENCH_S3_BUCKET_PREFIX:?set METRICSBENCH_S3_BUCKET_PREFIX}-$$b --max-keys 1 --no-paginate --query KeyCount --output text) || exit 1;
+        [ $$n = 0 ] || { echo bucket $$b is not empty; exit 1; };
+      done"
+
+  mimir:
+    command:
+      - "-config.file=/etc/mimir/mimir.yaml"
+      - "-target=all"
+      # Replace the s3s-fs connection in mimir.yaml. The two empty keys make
+      # Mimir fall back to its default credential chain, the instance role.
+      - "-common.storage.s3.endpoint=s3.${METRICSBENCH_S3_REGION:?set METRICSBENCH_S3_REGION to the buckets region}.amazonaws.com"
+      - "-common.storage.s3.region=${METRICSBENCH_S3_REGION:?set METRICSBENCH_S3_REGION to the buckets region}"
+      - "-common.storage.s3.insecure=false"
+      - "-common.storage.s3.access-key-id="
+      - "-common.storage.s3.secret-access-key="
+      - "-blocks-storage.s3.bucket-name=${METRICSBENCH_S3_BUCKET_PREFIX:?set METRICSBENCH_S3_BUCKET_PREFIX}-mimir-blocks"
+      - "-ruler-storage.s3.bucket-name=${METRICSBENCH_S3_BUCKET_PREFIX:?set METRICSBENCH_S3_BUCKET_PREFIX}-mimir-ruler"
+      - "-alertmanager-storage.s3.bucket-name=${METRICSBENCH_S3_BUCKET_PREFIX:?set METRICSBENCH_S3_BUCKET_PREFIX}-mimir-alertmanager"
+
+  ravel-qualify:
+    environment:
+      # No endpoint: the client's own regional AWS endpoint, over TLS.
+      RAVEL_S3_ENDPOINT: !reset null
+      RAVEL_S3_ALLOW_HTTP: !reset null
+      RAVEL_S3_ACCESS_KEY: !reset null
+      RAVEL_S3_SECRET_KEY: !reset null
+      RAVEL_S3_AUTH: instance-role
+      RAVEL_S3_BUCKET: ${METRICSBENCH_S3_BUCKET_PREFIX:?set METRICSBENCH_S3_BUCKET_PREFIX}-ravel
+      RAVEL_S3_REGION: ${METRICSBENCH_S3_REGION:?set METRICSBENCH_S3_REGION to the buckets region}
+
+  ravel-server:
+    # Written out again: a YAML alias drops the !reset tags.
+    environment:
+      RAVEL_S3_ENDPOINT: !reset null
+      RAVEL_S3_ALLOW_HTTP: !reset null
+      RAVEL_S3_ACCESS_KEY: !reset null
+      RAVEL_S3_SECRET_KEY: !reset null
+      RAVEL_S3_AUTH: instance-role
+      RAVEL_S3_BUCKET: ${METRICSBENCH_S3_BUCKET_PREFIX:?set METRICSBENCH_S3_BUCKET_PREFIX}-ravel
+      RAVEL_S3_REGION: ${METRICSBENCH_S3_REGION:?set METRICSBENCH_S3_REGION to the buckets region}

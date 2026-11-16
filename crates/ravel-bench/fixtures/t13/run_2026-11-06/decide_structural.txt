@@ -1,0 +1,8 @@
+structural_fetch decide stamp git=ff99909761620a02b617aae2370f9ba82fdda419 reports=hdfs_structural.json:278bc3f7d3586699cd617c4a629836f7dfb0546cd2b862f79571fad8cc445666,bgl_structural.json:a14250741919a6c54c53f7cc77716ff6315e766d53bded9c3c9b234160bca437
+structural_fetch decision hdfs_structural: NO-GO (ratio/bytes=1.0684<=0.25 FAIL, ratio/gets=0.6667<=1.5 ok, ratio/wall=0.5317<=1 ok)
+structural_fetch decide subject=hdfs_structural misses=2 problems=0
+structural_fetch decision bgl_structural: NO-GO (ratio/bytes=0.8879<=0.25 FAIL, ratio/gets=1.0000<=1.5 ok, ratio/wall=0.5041<=1 ok)
+structural_fetch decide subject=bgl_structural misses=3 problems=0
+structural_fetch decision overall: NO-GO (hdfs_structural=NO-GO, bgl_structural=NO-GO)
+
+EXIT=3

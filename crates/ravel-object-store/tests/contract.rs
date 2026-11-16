@@ -1,0 +1,2365 @@
+//! Shared contract test suite (docs/object-store-contract.md), run against
+//! every `ObjectStoreBackend` implementation this crate ships: the memory
+//! oracle at its default page size and at a tiny one to force pagination,
+//! `FaultStore` wrapping the oracle with an empty plan (must be fully
+//! transparent), `ScratchStore` over a temporary directory at both page
+//! sizes, `GcsStore` against the in-process fake GCS endpoint, `AzureStore`
+//! against the in-process fake Azure endpoint, and -- gated on
+//! `RAVEL_RUSTFS_URL` / `RAVEL_FLOCI_URL` / `RAVEL_GCS_TEST_BUCKET` /
+//! `RAVEL_AZURITE_URL` / `RAVEL_AZURE_TEST_ACCOUNT` -- `S3Store` against a
+//! real RustFS and against a real floci, `GcsStore` against a real bucket, and
+//! `AzureStore` against the Azurite emulator and against a real container.
+//!
+//! This is an integration-test binary, a crate in its own right, so it
+//! inherits `[lints] workspace = true` (including `clippy::expect_used`
+//! promoted to a hard error by `-D warnings`); the allow below is
+//! crate-level, not per-function, because every assertion here uses
+//! `expect`/`expect_err` to fail with a readable message.
+#![allow(clippy::expect_used)]
+
+use std::env;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use bytes::Bytes;
+use ravel_object_store::azure::fake::FakeAzure;
+use ravel_object_store::azure::{AzureConfig, AzureStore, TestAccountKey};
+use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+use ravel_object_store::gcs::fake::FakeGcs;
+use ravel_object_store::gcs::{GcsConfig, GcsStore};
+use ravel_object_store::instrument::{StoreErrorClass, StoreOp};
+use ravel_object_store::kms_routing::KmsRoutingStore;
+use ravel_object_store::memory::MemoryStore;
+use ravel_object_store::s3::{
+    MULTIPART_THRESHOLD, S3Config, S3HttpConfig, S3Store, UploadIntegrity,
+};
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, InstrumentedStore, ListPage,
+    MULTIPART_MIN_PART_SIZE, ObjectMeta, ObjectStoreBackend, PageToken, Pin, PutMode, PutOptions,
+    PutOutcome, ScratchStore, StoreError, StoreMetrics, UploadChecksum, is_addressable_key,
+    list_all,
+};
+use std::sync::Arc;
+
+/// Runs every contract assertion against `store`. Each assertion gets its
+/// own key sub-prefix under `root` so they can share one backend instance
+/// (and, for the RustFS case, one long-lived bucket) without colliding.
+async fn run_contract_suite(store: &dyn ObjectStoreBackend, root: &str) {
+    assert_satisfies_mandatory_capabilities(store);
+    assert_create_if_absent_atomicity(store, &format!("{root}/create-if-absent/")).await;
+    assert_cas_version_semantics(store, &format!("{root}/cas/")).await;
+    assert_range_and_suffix_reads(store, &format!("{root}/range/")).await;
+    assert_paginated_listing_completeness(store, &format!("{root}/list/")).await;
+    assert_start_after_listing(store, &format!("{root}/list-after/")).await;
+    assert_delimited_listing(store, &format!("{root}/delim/")).await;
+    assert_idempotent_delete(store, &format!("{root}/delete/")).await;
+    assert_upload_checksum_verification(store, &format!("{root}/checksum/")).await;
+    assert_multipart_upload(store, &format!("{root}/multipart/")).await;
+}
+
+/// Every backend the suite runs must report at least the capability set
+/// ravel-server's startup gate requires (`Capabilities::mandatory`, checked by
+/// `ravel_server::store::check_capabilities` for every non-maintain mode). A
+/// backend may report more than the mandatory set: `MemoryStore` always
+/// supports `upload_checksum`, `S3Store` does only when a non-`Off`
+/// `UploadIntegrity` is configured (#863), and all are
+/// startable. Asserting `satisfies` rather than equality keeps that difference
+/// legal while still failing the moment a backend loses a flag production
+/// needs.
+///
+/// Distinct from [`assert_mandatory_capabilities`] below: this is a cheap,
+/// synchronous check of the backend's static `capabilities()` declaration,
+/// run for every backend the suite exercises. The other function does live
+/// per-flag round trips against a real S3-compatible endpoint and is called
+/// only from the S3/RustFS/floci-specific tests.
+fn assert_satisfies_mandatory_capabilities(store: &dyn ObjectStoreBackend) {
+    let caps = store.capabilities();
+    assert!(
+        caps.satisfies(&Capabilities::mandatory()),
+        "backend must satisfy the mandatory capability set the server gates \
+         startup on, got {caps:?}"
+    );
+}
+
+async fn assert_create_if_absent_atomicity(store: &dyn ObjectStoreBackend, prefix: &str) {
+    let key = format!("{prefix}k");
+    store
+        .put(
+            &key,
+            Bytes::from_static(b"first"),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("first create-if-absent must succeed");
+    let err = store
+        .put(
+            &key,
+            Bytes::from_static(b"second"),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect_err("second create-if-absent on the same key must fail");
+    assert!(matches!(err, StoreError::AlreadyExists), "got {err:?}");
+    let got = store.get(&key, GetRange::Full).await.expect("get");
+    assert_eq!(
+        &got.data[..],
+        b"first",
+        "losing write must not have applied"
+    );
+}
+
+async fn assert_cas_version_semantics(store: &dyn ObjectStoreBackend, prefix: &str) {
+    let key = format!("{prefix}k");
+    let put1 = store
+        .put(&key, Bytes::from_static(b"v1"), PutOptions::default())
+        .await
+        .expect("initial put");
+
+    // A well-formed but wrong version token: a real version issued for a
+    // *different* object, not a hand-rolled string. On S3 a `Version` is an
+    // ETag, and ETags are quoted opaque tokens (`"d41d8cd9..."`); a
+    // synthetic unquoted string is not just stale, it's a malformed
+    // precondition header, so the server would reject it before ever
+    // reaching the mode-aware precondition-failure path this assertion
+    // means to exercise. A real version from elsewhere is guaranteed
+    // well-formed and guaranteed not to match `key`, on every backend.
+    let other = store
+        .put(
+            &format!("{prefix}other"),
+            Bytes::from_static(b"unrelated"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("unrelated put for a well-formed-but-wrong version token");
+
+    let stale_err = store
+        .put(
+            &key,
+            Bytes::from_static(b"stale"),
+            PutOptions {
+                mode: PutMode::CasVersion(other.version),
+                checksum: None,
+            },
+        )
+        .await
+        .expect_err("stale CAS must fail without applying");
+    assert!(
+        matches!(stale_err, StoreError::PreconditionFailed),
+        "got {stale_err:?}"
+    );
+    let got = store.get(&key, GetRange::Full).await.expect("get");
+    assert_eq!(&got.data[..], b"v1", "stale CAS must not have applied");
+
+    store
+        .put(
+            &key,
+            Bytes::from_static(b"v2"),
+            PutOptions {
+                mode: PutMode::CasVersion(put1.version.clone()),
+                checksum: None,
+            },
+        )
+        .await
+        .expect("CAS against the current version must succeed");
+    let got = store.get(&key, GetRange::Full).await.expect("get");
+    assert_eq!(&got.data[..], b"v2");
+
+    // The version moved forward: reusing the now-superseded version fails.
+    let err = store
+        .put(
+            &key,
+            Bytes::from_static(b"v3"),
+            PutOptions {
+                mode: PutMode::CasVersion(put1.version),
+                checksum: None,
+            },
+        )
+        .await
+        .expect_err("reusing a superseded version must fail");
+    assert!(matches!(err, StoreError::PreconditionFailed), "got {err:?}");
+}
+
+async fn assert_range_and_suffix_reads(store: &dyn ObjectStoreBackend, prefix: &str) {
+    let key = format!("{prefix}k");
+    store
+        .put(
+            &key,
+            Bytes::from_static(b"0123456789"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put");
+
+    let suffix = store.get(&key, GetRange::Suffix(4)).await.expect("suffix");
+    assert_eq!(&suffix.data[..], b"6789");
+    assert_eq!(suffix.total_size, 10);
+
+    let clamped = store
+        .get(&key, GetRange::Suffix(1000))
+        .await
+        .expect("suffix larger than the object must clamp, not error");
+    assert_eq!(&clamped.data[..], b"0123456789");
+
+    let err = store
+        .get(&key, GetRange::Suffix(0))
+        .await
+        .expect_err("Suffix(0) must be InvalidRange");
+    assert!(matches!(err, StoreError::InvalidRange(_)), "got {err:?}");
+
+    let range = store.get(&key, GetRange::Range(2, 5)).await.expect("range");
+    assert_eq!(&range.data[..], b"234");
+
+    let clamped_range = store
+        .get(&key, GetRange::Range(2, 1000))
+        .await
+        .expect("range end past the object must clamp, not error");
+    assert_eq!(&clamped_range.data[..], b"23456789");
+
+    let err = store
+        .get(&key, GetRange::Range(5, 5))
+        .await
+        .expect_err("zero-length range must be InvalidRange");
+    assert!(matches!(err, StoreError::InvalidRange(_)), "got {err:?}");
+
+    let full = store
+        .get(&key, GetRange::Range(0, 10))
+        .await
+        .expect("exact full-object range");
+    assert_eq!(&full.data[..], b"0123456789");
+}
+
+async fn assert_paginated_listing_completeness(store: &dyn ObjectStoreBackend, prefix: &str) {
+    let mut keys: Vec<String> = (0..7).map(|i| format!("{prefix}{i}")).collect();
+    keys.sort();
+    for key in &keys {
+        store
+            .put(key, Bytes::from_static(b"x"), PutOptions::default())
+            .await
+            .expect("put");
+    }
+
+    // Manual pagination loop: exercises `PageToken` continuation directly
+    // (as opposed to only the `list_all` convenience helper), so it holds
+    // whether the backend pages at 2 entries or 1000.
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered = Vec::new();
+    let mut token = None;
+    loop {
+        let page = store.list(prefix, token).await.expect("list page");
+        for meta in &page.objects {
+            if seen.insert(meta.key.clone()) {
+                ordered.push(meta.key.clone());
+            }
+        }
+        match page.next {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(
+        ordered, keys,
+        "listing must be complete, deduplicated, and lexicographically ordered"
+    );
+
+    let all = list_all(store, prefix).await.expect("list_all");
+    let all_keys: Vec<_> = all.into_iter().map(|m| m.key).collect();
+    assert_eq!(
+        all_keys, keys,
+        "list_all must agree with the manual pagination loop"
+    );
+}
+
+/// `list_after` contract (docs/object-store-contract.md): every returned key
+/// compares strictly greater than `start_after`, in the same lexicographic
+/// order and with the same pagination as `list`; `None` is identical to
+/// `list`; a `start_after` that sorts below the prefix excludes nothing.
+/// Runs against every backend the suite covers, so it pins the native
+/// start-after of `MemoryStore` (at both page sizes) and `S3Store` (against a
+/// real bucket, when configured) as well as the default filter path any other
+/// backend inherits.
+async fn assert_start_after_listing(store: &dyn ObjectStoreBackend, prefix: &str) {
+    let mut keys: Vec<String> = ["a", "b", "c", "d", "e"]
+        .iter()
+        .map(|s| format!("{prefix}{s}"))
+        .collect();
+    keys.sort();
+    for key in &keys {
+        store
+            .put(key, Bytes::from_static(b"x"), PutOptions::default())
+            .await
+            .expect("put");
+    }
+
+    // Drain a full `list_after` scan through the page-token loop so the
+    // assertion holds at any page size.
+    async fn drain_after(
+        store: &dyn ObjectStoreBackend,
+        prefix: &str,
+        start_after: Option<&str>,
+    ) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut ordered = Vec::new();
+        let mut token = None;
+        loop {
+            let page = store
+                .list_after(prefix, start_after, token)
+                .await
+                .expect("list_after page");
+            for meta in &page.objects {
+                if seen.insert(meta.key.clone()) {
+                    ordered.push(meta.key.clone());
+                }
+            }
+            match page.next {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+        ordered
+    }
+
+    // Strictly greater than an existing key: the key itself is excluded.
+    let after_c = format!("{prefix}c");
+    assert_eq!(
+        drain_after(store, prefix, Some(&after_c)).await,
+        vec![format!("{prefix}d"), format!("{prefix}e")],
+        "list_after returns only keys strictly greater than start_after"
+    );
+
+    // `start_after` need not be an existing key: the shard-hour prefix strings
+    // Ravel passes sort before the first key under them, so nothing is skipped
+    // when the marker sorts below the prefix.
+    assert_eq!(
+        drain_after(store, prefix, Some(prefix)).await,
+        keys,
+        "a start_after at/below the prefix excludes no key under it"
+    );
+
+    // `None` is identical to `list`.
+    assert_eq!(
+        drain_after(store, prefix, None).await,
+        keys,
+        "list_after(None) matches list"
+    );
+
+    // Past the last key: empty.
+    let after_last = format!("{prefix}z");
+    assert!(
+        drain_after(store, prefix, Some(&after_last))
+            .await
+            .is_empty(),
+        "a start_after past the last key returns nothing"
+    );
+}
+
+async fn assert_delimited_listing(store: &dyn ObjectStoreBackend, prefix: &str) {
+    for key in [
+        format!("{prefix}x/1"),
+        format!("{prefix}x/2"),
+        format!("{prefix}y/1"),
+        format!("{prefix}z"),
+    ] {
+        store
+            .put(&key, Bytes::from_static(b"x"), PutOptions::default())
+            .await
+            .expect("put");
+    }
+    let listing = store.list_delimited(prefix).await.expect("list_delimited");
+    let mut common_prefixes = listing.common_prefixes.clone();
+    common_prefixes.sort();
+    assert_eq!(
+        common_prefixes,
+        vec![format!("{prefix}x/"), format!("{prefix}y/")]
+    );
+    let direct: Vec<_> = listing.objects.iter().map(|m| m.key.as_str()).collect();
+    assert_eq!(direct, vec![format!("{prefix}z").as_str()]);
+}
+
+async fn assert_idempotent_delete(store: &dyn ObjectStoreBackend, prefix: &str) {
+    let key = format!("{prefix}k");
+    store
+        .delete(&key)
+        .await
+        .expect("deleting a missing key must succeed");
+    store
+        .put(&key, Bytes::from_static(b"v"), PutOptions::default())
+        .await
+        .expect("put");
+    store.delete(&key).await.expect("delete existing key");
+    assert!(matches!(store.head(&key).await, Err(StoreError::NotFound)));
+    store
+        .delete(&key)
+        .await
+        .expect("deleting an already-deleted key must still succeed");
+}
+
+/// Exercises the client-side CRC32C pre-flight every backend runs against
+/// its own input buffer before writing. This is NOT proof of on-the-wire
+/// integrity: for `S3Store` (see `s3::S3Store::capabilities`) `object_store`
+/// 0.14 gives no way to attach the checksum to the outgoing request, so this
+/// assertion only shows the local mismatch check works, not that corruption
+/// in transit would be caught. `s3_store_reports_upload_checksum_unsupported`
+/// below is what proves that gap is declared honestly via `capabilities()`.
+async fn assert_upload_checksum_verification(store: &dyn ObjectStoreBackend, prefix: &str) {
+    let good_key = format!("{prefix}good");
+    let bad_key = format!("{prefix}bad");
+    let data = Bytes::from_static(b"contract-suite-checksum-payload");
+    let good = crc32c::crc32c(&data);
+
+    store
+        .put(
+            &good_key,
+            data.clone(),
+            PutOptions::default().with_checksum(UploadChecksum::Crc32c(good)),
+        )
+        .await
+        .expect("correct checksum must be accepted");
+    let got = store.get(&good_key, GetRange::Full).await.expect("get");
+    assert_eq!(got.data, data);
+
+    let err = store
+        .put(
+            &bad_key,
+            data.clone(),
+            PutOptions::default().with_checksum(UploadChecksum::Crc32c(good ^ 1)),
+        )
+        .await
+        .expect_err("wrong checksum must be rejected");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+    assert!(
+        matches!(store.head(&bad_key).await, Err(StoreError::NotFound)),
+        "an object failing checksum verification must not have been created"
+    );
+}
+
+/// Probes every flag in [`Capabilities::mandatory()`] against a live
+/// endpoint, one assertion per capability name (ADR-0034 decision 8: a
+/// candidate backend either satisfies the mandatory set or the ADR's named
+/// fallback applies, so a failure here has to say *which* capability failed,
+/// not just which suite step tripped).
+///
+/// Deliberate overlap with [`run_contract_suite`]: `create_if_absent`,
+/// `cas_version`, `suffix_range`, and `prefix_list` are each already proven
+/// by a suite assertion, and this re-runs those assertions under their
+/// capability names on their own key sub-prefixes. The duplicated round
+/// trips are a few dozen requests against a local container, and in exchange
+/// a gate failure names the capability the ADR's decision turns on.
+/// `consistent_read` and `consistent_list` are probed directly here because
+/// no suite assertion isolates them.
+async fn assert_mandatory_capabilities(store: &dyn ObjectStoreBackend, prefix: &str) {
+    // consistent_read: read-after-write and read-after-overwrite, with no
+    // sleep and no retry loop. An eventually-consistent backend fails here.
+    let key = format!("{prefix}consistent-read/k");
+    store
+        .put(&key, Bytes::from_static(b"one"), PutOptions::default())
+        .await
+        .expect("put");
+    let got = store
+        .get(&key, GetRange::Full)
+        .await
+        .expect("consistent_read: read-after-write");
+    assert_eq!(
+        &got.data[..],
+        b"one",
+        "consistent_read: a just-written object must be readable immediately"
+    );
+    store
+        .put(&key, Bytes::from_static(b"three"), PutOptions::default())
+        .await
+        .expect("overwrite");
+    let got = store
+        .get(&key, GetRange::Full)
+        .await
+        .expect("consistent_read: read-after-overwrite");
+    assert_eq!(
+        &got.data[..],
+        b"three",
+        "consistent_read: an overwrite must be visible immediately, never a stale body"
+    );
+    assert_eq!(
+        store.head(&key).await.expect("head").size,
+        5,
+        "consistent_read: head must reflect the overwrite immediately"
+    );
+
+    // consistent_list: the listing reflects a creation and a deletion
+    // immediately, which is what the catalog scan depends on.
+    let list_prefix = format!("{prefix}consistent-list/");
+    let listed = format!("{list_prefix}k");
+    store
+        .put(&listed, Bytes::from_static(b"v"), PutOptions::default())
+        .await
+        .expect("put");
+    let keys: Vec<String> = list_all(store, &list_prefix)
+        .await
+        .expect("consistent_list: list after create")
+        .into_iter()
+        .map(|m| m.key)
+        .collect();
+    assert_eq!(
+        keys,
+        vec![listed.clone()],
+        "consistent_list: a just-written key must appear in the listing immediately"
+    );
+    store.delete(&listed).await.expect("delete");
+    let after_delete: Vec<String> = list_all(store, &list_prefix)
+        .await
+        .expect("consistent_list: list after delete")
+        .into_iter()
+        .map(|m| m.key)
+        .collect();
+    assert!(
+        after_delete.is_empty(),
+        "consistent_list: a just-deleted key must be gone from the listing immediately, got {after_delete:?}"
+    );
+
+    // create_if_absent: the atomicity the commit protocol's single-writer
+    // claim rests on (ADR-0002).
+    assert_create_if_absent_atomicity(store, &format!("{prefix}create-if-absent/")).await;
+    // cas_version: If-Match semantics, mapped to PreconditionFailed.
+    assert_cas_version_semantics(store, &format!("{prefix}cas-version/")).await;
+    // suffix_range: the RSEG footer read (docs/segment-format.md).
+    assert_range_and_suffix_reads(store, &format!("{prefix}suffix-range/")).await;
+    // prefix_list: complete, ordered, paginated recursive listing plus the
+    // one-level delimited form the catalog uses.
+    assert_paginated_listing_completeness(store, &format!("{prefix}prefix-list/")).await;
+    assert_delimited_listing(store, &format!("{prefix}prefix-list-delimited/")).await;
+
+    // Declared capabilities must be exactly the mandatory set plus
+    // `multipart`, which `S3Store` implements and which
+    // `required_capabilities(Mode::Maintain)` demands. `upload_checksum` is not
+    // part of `Capabilities::mandatory()` (a permanent
+    // `object_store` 0.14 client-library limitation, not an endpoint-specific
+    // gap, so requiring it made the S3 backend unstartable
+    // everywhere). `S3Store::capabilities()` is a constant of the adapter, not
+    // a function of the endpoint, so this asserts the same thing for floci as
+    // it would for RustFS or real AWS S3. Written as an exact equality rather
+    // than `satisfies(..)` so movement in either direction -- a backend gaining
+    // a capability or the adapter losing one -- fails here instead of passing
+    // silently.
+    assert_eq!(
+        store.capabilities(),
+        s3_expected_capabilities(),
+        "declared capabilities must be exactly the mandatory set plus multipart"
+    );
+    // The behavior behind the flag still has to hold: the local CRC32C
+    // pre-flight rejects a mismatch without creating the object.
+    assert_upload_checksum_verification(store, &format!("{prefix}upload-checksum/")).await;
+}
+
+/// S3's minimum size for any part but the last, so the probe drives a real
+/// two-part upload instead of a degenerate single-part one.
+const MULTIPART_PART_SIZE: usize = MULTIPART_MIN_PART_SIZE;
+/// Short final part, also the size of the trailing read below.
+const MULTIPART_TAIL_SIZE: usize = 1024;
+
+/// Position-dependent bytes: parts assembled out of order, a dropped part, or
+/// a duplicated one all change the content, which a constant fill would hide.
+fn multipart_payload(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// Multipart probe, run against every backend.
+/// `Mode::Maintain` requires the `multipart` capability on top of
+/// [`Capabilities::mandatory()`] (services/ravel-server `store.rs`
+/// `required_capabilities`), so a backend that cannot serve the
+/// create/upload-part/complete/abort sequence cannot carry compaction.
+///
+/// Written entirely against [`ObjectStoreBackend::put_multipart`], so it holds
+/// for the memory oracle, the wrappers, and `S3Store` against a real endpoint
+/// alike, and the flag and the behavior are checked against each other in both
+/// directions: a backend declaring `multipart: false` must refuse the call.
+/// The S3-only proof that parts really went out separately (the composite
+/// ETag) lives in [`assert_multipart_composite_etag`].
+async fn assert_multipart_upload(store: &dyn ObjectStoreBackend, prefix: &str) {
+    if !store.capabilities().multipart {
+        // `expect_err` is unavailable here: the `Ok` type is a boxed trait
+        // object, which cannot be `Debug`.
+        match store.put_multipart(&format!("{prefix}unsupported")).await {
+            Err(StoreError::Permanent(_)) => {}
+            Err(other) => panic!("multipart: false must refuse with Permanent, got {other:?}"),
+            Ok(_) => panic!("a backend declaring multipart: false must refuse put_multipart"),
+        }
+        return;
+    }
+
+    let key = format!("{prefix}object");
+    let payload = multipart_payload(MULTIPART_PART_SIZE + MULTIPART_TAIL_SIZE);
+
+    let mut upload = store
+        .put_multipart(&key)
+        .await
+        .expect("multipart: starting the upload must succeed");
+    upload
+        .put_part(Bytes::from(payload[..MULTIPART_PART_SIZE].to_vec()), None)
+        .await
+        .expect("multipart: part 1 (5 MiB, the non-final-part minimum) must succeed");
+
+    // Mid-upload the object does not exist: an interrupted compaction upload
+    // must never be readable as a truncated object (ADR-0034 decision 3,
+    // orphaned uploads are wasted work, not corrupt state).
+    assert!(
+        matches!(store.head(&key).await, Err(StoreError::NotFound)),
+        "multipart: an incomplete upload must not be visible"
+    );
+
+    upload
+        .put_part(Bytes::from(payload[MULTIPART_PART_SIZE..].to_vec()), None)
+        .await
+        .expect("multipart: part 2 (short final part) must succeed");
+    upload
+        .complete()
+        .await
+        .expect("multipart: complete must succeed");
+
+    // Byte-for-byte equality, asserted without printing 5 MiB on failure.
+    let got = store
+        .get(&key, GetRange::Full)
+        .await
+        .expect("multipart: full read of the completed object");
+    assert_eq!(
+        got.total_size,
+        payload.len() as u64,
+        "multipart: completed object must report the summed part length"
+    );
+    assert_eq!(
+        got.data.len(),
+        payload.len(),
+        "multipart: full read must return every byte of every part"
+    );
+    assert!(
+        got.data[..] == payload[..],
+        "multipart: parts must reassemble in order, with no gap and no \
+         duplication (crc {:08x}, expected {:08x})",
+        crc32c::crc32c(&got.data),
+        crc32c::crc32c(&payload)
+    );
+    assert_eq!(
+        store.head(&key).await.expect("multipart: head").size,
+        payload.len() as u64,
+        "multipart: head must report the assembled size"
+    );
+
+    // The read shape Ravel actually uses against large segments: a footer
+    // suffix read of a multipart-written object.
+    let suffix = store
+        .get(&key, GetRange::Suffix(MULTIPART_TAIL_SIZE as u64))
+        .await
+        .expect("multipart: suffix read");
+    assert_eq!(
+        &suffix.data[..],
+        &payload[MULTIPART_PART_SIZE..],
+        "multipart: suffix read must return the tail of the assembled object"
+    );
+
+    // A range straddling the part boundary: proves the parts were joined,
+    // not merely stored side by side.
+    let straddle = store
+        .get(
+            &key,
+            GetRange::Range(
+                MULTIPART_PART_SIZE as u64 - 4,
+                MULTIPART_PART_SIZE as u64 + 4,
+            ),
+        )
+        .await
+        .expect("multipart: range read straddling the part boundary");
+    assert_eq!(
+        &straddle.data[..],
+        &payload[MULTIPART_PART_SIZE - 4..MULTIPART_PART_SIZE + 4],
+        "multipart: a range spanning two parts must be contiguous"
+    );
+
+    // A completed upload is spent: no second complete, no late part.
+    let err = upload
+        .complete()
+        .await
+        .expect_err("multipart: completing twice must fail");
+    assert!(matches!(err, StoreError::Permanent(_)), "got {err:?}");
+
+    // Abort must leave nothing readable, and must not resurrect the key
+    // later either: the object is simply never created.
+    let aborted_key = format!("{prefix}aborted");
+    let mut aborted = store
+        .put_multipart(&aborted_key)
+        .await
+        .expect("multipart: starting the abort probe must succeed");
+    aborted
+        .put_part(Bytes::from(multipart_payload(MULTIPART_PART_SIZE)), None)
+        .await
+        .expect("multipart: part 1 of the abort probe must succeed");
+    aborted
+        .abort()
+        .await
+        .expect("multipart: abort must succeed");
+    assert!(
+        matches!(store.head(&aborted_key).await, Err(StoreError::NotFound)),
+        "multipart: an aborted upload must not be visible as an object"
+    );
+    assert!(
+        matches!(
+            store.get(&aborted_key, GetRange::Full).await,
+            Err(StoreError::NotFound)
+        ),
+        "multipart: an aborted upload must not be readable, not even partially"
+    );
+    let err = aborted
+        .put_part(Bytes::from_static(b"late"), None)
+        .await
+        .expect_err("multipart: a part after abort must fail");
+    assert!(matches!(err, StoreError::Permanent(_)), "got {err:?}");
+    let err = aborted
+        .complete()
+        .await
+        .expect_err("multipart: completing an aborted upload must fail");
+    assert!(matches!(err, StoreError::Permanent(_)), "got {err:?}");
+
+    assert_multipart_sequence_rules(store, &format!("{prefix}rules/")).await;
+    assert_multipart_part_checksum(store, &format!("{prefix}part-checksum/")).await;
+}
+
+/// The part-sequence rules every backend enforces locally, so an illegal
+/// sequence fails at the offending call with a typed error rather than at
+/// `complete` with a backend-specific `EntityTooSmall` (or, on the oracle, not
+/// at all). None of these may leave an object behind.
+/// What `S3Store` declares: [`Capabilities::mandatory()`] plus `multipart`
+/// (required by `required_capabilities(Mode::
+/// Maintain)`) and minus `upload_checksum` (unsatisfiable).
+/// `mandatory()` itself keeps `multipart: false`, because multipart is
+/// mode-conditional rather than universally required.
+fn s3_expected_capabilities() -> Capabilities {
+    Capabilities {
+        multipart: true,
+        ..Capabilities::mandatory()
+    }
+}
+
+async fn assert_multipart_sequence_rules(store: &dyn ObjectStoreBackend, prefix: &str) {
+    // No parts at all.
+    let empty_key = format!("{prefix}no-parts");
+    let mut empty = store
+        .put_multipart(&empty_key)
+        .await
+        .expect("start upload with no parts");
+    let err = empty
+        .complete()
+        .await
+        .expect_err("multipart: completing with zero parts must fail");
+    assert!(matches!(err, StoreError::Permanent(_)), "got {err:?}");
+    assert!(
+        matches!(store.head(&empty_key).await, Err(StoreError::NotFound)),
+        "multipart: a rejected complete must not create the object"
+    );
+
+    // A zero-length part.
+    let zero_key = format!("{prefix}zero-length-part");
+    let mut zero = store
+        .put_multipart(&zero_key)
+        .await
+        .expect("start upload for the zero-length part probe");
+    let err = zero
+        .put_part(Bytes::new(), None)
+        .await
+        .expect_err("multipart: an empty part must be rejected");
+    assert!(matches!(err, StoreError::Permanent(_)), "got {err:?}");
+    zero.abort().await.expect("abort after a rejected part");
+
+    // A non-final part below the 5 MiB minimum: legal as the last part, so it
+    // is the *next* part that makes it illegal, and that is the call that
+    // fails. A single short part still completes fine (asserted after).
+    let small_key = format!("{prefix}small-non-final-part");
+    let mut small = store
+        .put_multipart(&small_key)
+        .await
+        .expect("start upload for the short-non-final-part probe");
+    small
+        .put_part(Bytes::from(multipart_payload(MULTIPART_TAIL_SIZE)), None)
+        .await
+        .expect("multipart: a short part is legal until another follows it");
+    let err = small
+        .put_part(Bytes::from(multipart_payload(MULTIPART_TAIL_SIZE)), None)
+        .await
+        .expect_err("multipart: a part following a sub-5-MiB part must be rejected");
+    assert!(matches!(err, StoreError::Permanent(_)), "got {err:?}");
+    small
+        .abort()
+        .await
+        .expect("abort after a rejected sequence");
+    assert!(
+        matches!(store.head(&small_key).await, Err(StoreError::NotFound)),
+        "multipart: a rejected sequence must not create the object"
+    );
+
+    // A rejected part poisons the handle: a `complete` afterward
+    // must error rather than publish the truncated single short part. The
+    // sequence check runs before any backend call, so this covers the memory
+    // oracle and the S3-shaped path alike. `abort` stays callable throughout.
+    let poisoned_key = format!("{prefix}poisoned-then-complete");
+    let mut poisoned = store
+        .put_multipart(&poisoned_key)
+        .await
+        .expect("start upload for the poison-then-complete probe");
+    poisoned
+        .put_part(Bytes::from(multipart_payload(MULTIPART_TAIL_SIZE)), None)
+        .await
+        .expect("multipart: a short part is legal until another follows it");
+    let err = poisoned
+        .put_part(Bytes::from(multipart_payload(MULTIPART_TAIL_SIZE)), None)
+        .await
+        .expect_err("multipart: the part making a short part non-final must be rejected");
+    assert!(matches!(err, StoreError::Permanent(_)), "got {err:?}");
+    // The poisoned handle refuses a further part non-retryably...
+    let err = poisoned
+        .put_part(Bytes::from(multipart_payload(MULTIPART_PART_SIZE)), None)
+        .await
+        .expect_err("multipart: a poisoned handle must refuse further parts");
+    assert!(matches!(err, StoreError::Permanent(_)), "got {err:?}");
+    assert!(
+        !err.is_retryable(),
+        "the poison error must be non-retryable"
+    );
+    // ...and `complete` errors instead of publishing a truncated object.
+    let err = poisoned
+        .complete()
+        .await
+        .expect_err("multipart: completing after a rejected part must fail, not truncate");
+    assert!(matches!(err, StoreError::Permanent(_)), "got {err:?}");
+    assert!(
+        matches!(store.head(&poisoned_key).await, Err(StoreError::NotFound)),
+        "multipart: a poisoned upload must not publish a truncated object"
+    );
+    poisoned
+        .abort()
+        .await
+        .expect("multipart: abort stays callable on a poisoned handle");
+    assert!(
+        matches!(store.head(&poisoned_key).await, Err(StoreError::NotFound)),
+        "multipart: aborting a poisoned upload leaves no object"
+    );
+
+    // The legal degenerate case: one part, smaller than the minimum, is a
+    // complete object. `S3Store::put` never produces this shape (it only goes
+    // multipart above 16 MiB), but a caller streaming parts may.
+    let single_key = format!("{prefix}single-short-part");
+    let single_payload = multipart_payload(MULTIPART_TAIL_SIZE);
+    let mut single = store
+        .put_multipart(&single_key)
+        .await
+        .expect("start single-short-part upload");
+    single
+        .put_part(Bytes::from(single_payload.clone()), None)
+        .await
+        .expect("multipart: a lone short part must be accepted");
+    single
+        .complete()
+        .await
+        .expect("multipart: a single-part upload must complete");
+    let got = store
+        .get(&single_key, GetRange::Full)
+        .await
+        .expect("read the single-part object");
+    assert_eq!(&got.data[..], &single_payload[..]);
+}
+
+/// Per-part checksums behave like `put`'s: a local CRC32C pre-flight that
+/// rejects a caller/payload mismatch before anything is sent, leaves the part
+/// uncounted, and leaves the upload usable. There is no caller-supplied
+/// whole-object checksum for a multipart upload; see
+/// docs/object-store-contract.md.
+async fn assert_multipart_part_checksum(store: &dyn ObjectStoreBackend, prefix: &str) {
+    let key = format!("{prefix}object");
+    let part = multipart_payload(MULTIPART_TAIL_SIZE);
+    let good = crc32c::crc32c(&part);
+
+    let mut upload = store
+        .put_multipart(&key)
+        .await
+        .expect("start upload for the part-checksum probe");
+    let err = upload
+        .put_part(
+            Bytes::from(part.clone()),
+            Some(UploadChecksum::Crc32c(good ^ 1)),
+        )
+        .await
+        .expect_err("multipart: a part whose checksum does not match must be rejected");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+    // The rejected part was never a part, so the upload is still open and the
+    // caller can send the same bytes with the right checksum.
+    upload
+        .put_part(
+            Bytes::from(part.clone()),
+            Some(UploadChecksum::Crc32c(good)),
+        )
+        .await
+        .expect("multipart: a part with a matching checksum must be accepted");
+    upload
+        .complete()
+        .await
+        .expect("multipart: complete after a rejected part");
+    let got = store
+        .get(&key, GetRange::Full)
+        .await
+        .expect("read the object back");
+    assert_eq!(
+        &got.data[..],
+        &part[..],
+        "multipart: the rejected part must not appear in the object"
+    );
+}
+
+/// S3-only proof that the parts really went out as parts: S3 gives a multipart
+/// object the composite `"<digest>-<partcount>"` ETag form, and the count must
+/// be the number of `put_part` calls. Without it, an adapter that quietly
+/// buffered every part and wrote one PUT would satisfy every byte-level
+/// assertion in [`assert_multipart_upload`] while implementing none of the
+/// multipart API compaction needs.
+async fn assert_multipart_composite_etag(store: &dyn ObjectStoreBackend, prefix: &str) {
+    let key = format!("{prefix}object");
+    let mut upload = store
+        .put_multipart(&key)
+        .await
+        .expect("multipart: starting the composite-ETag upload must succeed");
+    upload
+        .put_part(Bytes::from(multipart_payload(MULTIPART_PART_SIZE)), None)
+        .await
+        .expect("multipart: part 1 must succeed");
+    upload
+        .put_part(Bytes::from(multipart_payload(MULTIPART_TAIL_SIZE)), None)
+        .await
+        .expect("multipart: part 2 must succeed");
+    let outcome = upload
+        .complete()
+        .await
+        .expect("multipart: complete must succeed");
+    let etag = outcome.etag.0.trim_matches('"').to_string();
+    assert!(
+        etag.ends_with("-2"),
+        "multipart: completed object must carry the composite 2-part ETag \
+         proving the parts were uploaded separately, got {etag:?}"
+    );
+    assert_eq!(
+        outcome.etag.0, outcome.version.0,
+        "S3Store derives both Etag and Version from the response ETag"
+    );
+}
+
+/// `S3Store::put` itself switches to multipart above
+/// [`ravel_object_store::s3::MULTIPART_THRESHOLD`], and the switch must be
+/// invisible to the caller: same `PutOutcome` shape, same bytes back. The
+/// composite ETag part count proves the threshold path was actually taken
+/// (a 16 MiB + 1 byte payload cut into 8 MiB parts is three parts).
+async fn assert_put_above_threshold_uses_multipart(store: &dyn ObjectStoreBackend, prefix: &str) {
+    let key = format!("{prefix}object");
+    let payload = multipart_payload(MULTIPART_THRESHOLD + 1);
+    let outcome = store
+        .put(&key, Bytes::from(payload.clone()), PutOptions::default())
+        .await
+        .expect("put above the multipart threshold must succeed");
+    let etag = outcome.etag.0.trim_matches('"').to_string();
+    assert!(
+        etag.ends_with("-3"),
+        "put above the threshold must have uploaded 3 parts (8 MiB, 8 MiB, 1 \
+         byte), which the composite ETag records, got {etag:?}"
+    );
+    let got = store
+        .get(&key, GetRange::Full)
+        .await
+        .expect("read back the multipart-written object");
+    assert!(
+        got.data[..] == payload[..],
+        "a multipart-written object must read back byte for byte (crc {:08x}, \
+         expected {:08x})",
+        crc32c::crc32c(&got.data),
+        crc32c::crc32c(&payload)
+    );
+
+    // A conditional put of the same size stays on the single-PUT path,
+    // because multipart completion cannot carry a precondition: it must still
+    // behave exactly like `CreateIfAbsent` at any size.
+    let conditional_key = format!("{prefix}conditional");
+    store
+        .put(
+            &conditional_key,
+            Bytes::from(payload.clone()),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("a large create-if-absent put must succeed on the single-PUT path");
+    let single_etag = store
+        .head(&conditional_key)
+        .await
+        .expect("head the conditionally written object")
+        .etag
+        .0
+        .trim_matches('"')
+        .to_string();
+    assert!(
+        !single_etag.contains('-'),
+        "a create-if-absent put must not go multipart (its precondition would \
+         be lost); expected a non-composite ETag, got {single_etag:?}"
+    );
+    let err = store
+        .put(
+            &conditional_key,
+            Bytes::from(payload),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect_err("the second create-if-absent must still fail at this size");
+    assert!(matches!(err, StoreError::AlreadyExists), "got {err:?}");
+}
+
+/// Wraps the memory oracle but truthfully reports `multipart: false`, so it
+/// inherits the trait's refusing default `put_multipart`. It exists to keep the
+/// `multipart: false` branch of [`assert_multipart_upload`] live:
+/// every other suite backend reports `multipart: true`, so without a registered
+/// refusing backend that branch --- the one asserting the flag and the method
+/// agree in the negative direction --- never executes. Every other method
+/// delegates verbatim, so the rest of the contract suite runs unchanged.
+struct RefusingMultipartStore {
+    inner: MemoryStore,
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for RefusingMultipartStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.inner.get(key, range).await
+    }
+
+    // No `put_multipart`: it must inherit the trait's refusing default, which
+    // is the behavior the `multipart: false` branch of the suite checks.
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        // The one flag that differs from the oracle: this backend does not
+        // implement multipart, and says so.
+        Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
+    }
+}
+
+/// `PutCasVersion / CasOutcomeMatchesEffect` (formal/tla/common/traceability.md):
+/// a `CasVersion` put against a key that has never existed has no current
+/// version to match, so it must fail `PreconditionFailed`, the same outcome
+/// as a stale version against a present key, and apply nothing.
+#[tokio::test]
+async fn cas_version_on_absent_key_is_precondition_failed() {
+    let store = MemoryStore::new();
+    let key = "cas-absent/k";
+
+    // A well-formed but wrong version token: a real version issued for a
+    // different object, not a hand-rolled string (see
+    // `assert_cas_version_semantics` above for why this matters).
+    let other = store
+        .put(
+            "cas-absent/other",
+            Bytes::from_static(b"unrelated"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("unrelated put for a well-formed-but-wrong version token");
+
+    let err = store
+        .put(
+            key,
+            Bytes::from_static(b"v1"),
+            PutOptions {
+                mode: PutMode::CasVersion(other.version),
+                checksum: None,
+            },
+        )
+        .await
+        .expect_err("CasVersion against an absent key must fail without applying");
+    assert!(matches!(err, StoreError::PreconditionFailed), "got {err:?}");
+    assert!(
+        matches!(store.head(key).await, Err(StoreError::NotFound)),
+        "losing CAS must not have created the key"
+    );
+}
+
+/// `Delete / VersionsNeverReused` (formal/tla/common/traceability.md): the
+/// version counter (`MemoryStore::next_id`) is never reset by a delete, so
+/// create/delete/create mints a fresh version and a CAS holding the
+/// pre-delete version fails against the recreated object.
+#[tokio::test]
+async fn cas_with_pre_delete_version_fails_after_recreate() {
+    let store = MemoryStore::new();
+    let key = "cas-pre-delete/k";
+
+    let put1 = store
+        .put(key, Bytes::from_static(b"v1"), PutOptions::default())
+        .await
+        .expect("initial create");
+    store.delete(key).await.expect("delete");
+    store
+        .put(key, Bytes::from_static(b"v2"), PutOptions::default())
+        .await
+        .expect("recreate after delete");
+
+    let err = store
+        .put(
+            key,
+            Bytes::from_static(b"v3"),
+            PutOptions {
+                mode: PutMode::CasVersion(put1.version),
+                checksum: None,
+            },
+        )
+        .await
+        .expect_err("CAS with the pre-delete version must fail after recreate");
+    assert!(matches!(err, StoreError::PreconditionFailed), "got {err:?}");
+}
+
+#[tokio::test]
+async fn memory_store_contract() {
+    let store = MemoryStore::new();
+    run_contract_suite(&store, "memory").await;
+}
+
+/// The whole suite against a backend that declares `multipart: false`, so the
+/// refusal branch of [`assert_multipart_upload`] actually runs: `put_multipart`
+/// must be refused with `Permanent`, proving the flag and the method agree in
+/// the negative direction. Every non-multipart assertion still
+/// holds because the backend delegates to the memory oracle.
+#[tokio::test]
+async fn refusing_multipart_store_contract() {
+    let store = RefusingMultipartStore {
+        inner: MemoryStore::new(),
+    };
+    assert!(
+        !store.capabilities().multipart,
+        "the refusing backend must report multipart: false so the suite exercises the refusal"
+    );
+    run_contract_suite(&store, "refusing-multipart").await;
+}
+
+#[tokio::test]
+async fn memory_store_paged_contract() {
+    let store = MemoryStore::with_page_size(2);
+    run_contract_suite(&store, "memory-paged").await;
+}
+
+#[tokio::test]
+async fn scratch_store_passes_the_contract_suite() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = ScratchStore::open(dir.path().join("scratch"), 1000).expect("open scratch store");
+    assert_eq!(
+        store.capabilities(),
+        MemoryStore::new().capabilities(),
+        "a local directory gives up none of the oracle's capabilities"
+    );
+    run_contract_suite(&store, "scratch").await;
+}
+
+#[tokio::test]
+async fn scratch_store_passes_the_contract_suite_at_page_size_2() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = ScratchStore::open(dir.path().join("scratch"), 2).expect("open scratch store");
+    run_contract_suite(&store, "scratch-paged").await;
+}
+
+#[tokio::test]
+async fn scratch_store_passes_the_conformance_probe() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = ScratchStore::open(dir.path().join("scratch"), 2).expect("open scratch store");
+    let report =
+        ravel_object_store::conformance::run_conformance_suite(&store, "sys/qualify/scratch/", 2)
+            .await;
+    assert!(
+        report.passed(),
+        "{:?}",
+        report.failures().collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn fault_store_empty_plan_contract() {
+    let store = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
+    run_contract_suite(&store, "fault-empty").await;
+}
+
+/// `KmsRoutingStore` must be as transparent as `InstrumentedStore` above when
+/// no tenant key is configured: every operation the suite drives is unrouted
+/// (no `t/`-scoped key in the suite names a configured tenant), so it all
+/// falls through to the default store and every contract assertion --
+/// capability check included -- must hold identically with the decorator in
+/// the path. This does not exercise the per-tenant routing branch itself
+/// (see `kms_routing`'s own unit tests for that); it proves the boundary the
+/// decorator sits on is not silently altered for the common case where no
+/// tenant has opted into per-tenant SSE-KMS.
+#[tokio::test]
+async fn kms_routing_store_contract_with_no_configured_tenants() {
+    let store = KmsRoutingStore::new(
+        Arc::new(MemoryStore::new()),
+        test_s3_config(),
+        S3HttpConfig::default(),
+        Arc::new(StoreMetrics::default()),
+    );
+    run_contract_suite(&store, "kms-routing-unconfigured").await;
+}
+
+/// An `S3Config` shape sufficient to construct a [`KmsRoutingStore`] in tests
+/// that never build a per-tenant store (no tenant key is ever configured, so
+/// the fields here are never dereferenced against a live endpoint).
+fn test_s3_config() -> S3Config {
+    S3Config {
+        bucket: "ravel-test".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint: Some("http://localhost:0".to_string()),
+        access_key_id: "test".to_string(),
+        secret_access_key: "test".to_string(),
+        allow_http: true,
+        force_path_style: true,
+        kms_key_id: None,
+        session_token: None,
+        credentials_file: None,
+        auth: Default::default(),
+        instance_metadata_endpoint: None,
+    }
+}
+
+/// The instrumentation decorator must be transparent: every
+/// contract assertion, capability check included, holds identically with it in
+/// the path, because it forwards each result verbatim and passes
+/// `capabilities()` through. The counter assertions afterward prove the suite
+/// really ran *through* the decorator rather than past it, which is what makes
+/// this a transparency test instead of a second memory-oracle run.
+#[tokio::test]
+async fn instrumented_memory_store_contract() {
+    let store = InstrumentedStore::new(MemoryStore::new());
+    let metrics = store.metrics();
+    run_contract_suite(&store, "instrumented-memory").await;
+
+    let snap = metrics.snapshot();
+    for op in StoreOp::ALL {
+        assert!(
+            snap.op(op).calls > 0,
+            "the suite must have driven {} through the decorator",
+            op.name()
+        );
+    }
+    // The suite writes objects and reads ranges, so both byte counters moved,
+    // and its deliberate failures (AlreadyExists, PreconditionFailed,
+    // InvalidRange, NotFound, Corrupted) are classified rather than lost.
+    assert!(snap.put.bytes > 0, "put bytes must have been counted");
+    assert!(snap.get.bytes > 0, "get bytes must have been counted");
+    for op in StoreOp::ALL {
+        let block = snap.op(op);
+        assert_eq!(
+            block.errors_total(),
+            block.calls - block.ok,
+            "{}: every failed call must land in exactly one error class",
+            op.name()
+        );
+    }
+    assert!(
+        snap.put.error_count(StoreErrorClass::AlreadyExists) > 0
+            && snap.put.error_count(StoreErrorClass::PreconditionFailed) > 0
+            && snap.put.error_count(StoreErrorClass::Corrupted) > 0
+            && snap.get.error_count(StoreErrorClass::InvalidRange) > 0
+            && snap.head.error_count(StoreErrorClass::NotFound) > 0,
+        "the suite's scripted failures must be classified, got {snap:?}"
+    );
+}
+
+/// With the default config (`UploadIntegrity::Off`), `S3Store` attaches no
+/// upload checksum and reports `upload_checksum: false`: `object_store` 0.14's
+/// `AmazonS3` client has no per-request checksum hook and no way to attach a
+/// caller-supplied CRC32C to an outgoing `put`, so with integrity off there is
+/// nothing on the wire for S3 to verify. (#863 makes a non-`Off` mode attach a
+/// whole-client SHA-256/CRC64NVME instead; see
+/// `s3_store_reports_upload_checksum_when_integrity_configured`.)
+///
+/// `upload_checksum` is not startup-gating in either mode: it is not in
+/// `Capabilities::mandatory()` and no mode may require it
+/// (docs/object-store-contract.md, "Upload checksums"). This test therefore
+/// also pins the default `S3Store`'s reported set to the mandatory set plus
+/// `multipart`, so the server's startup gate cannot start rejecting
+/// `--store s3` again.
+/// No `RAVEL_RUSTFS_URL` gate needed: `AmazonS3Builder::build` only
+/// validates configuration, it never talks to the network.
+#[test]
+fn s3_store_reports_upload_checksum_unsupported() {
+    let config = S3Config {
+        bucket: "test-bucket".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint: Some("http://localhost:0".to_string()),
+        access_key_id: "test".to_string(),
+        secret_access_key: "test".to_string(),
+        allow_http: true,
+        force_path_style: true,
+        kms_key_id: None,
+        session_token: None,
+        credentials_file: None,
+        auth: Default::default(),
+        instance_metadata_endpoint: None,
+    };
+    let store = S3Store::new(config).expect("dummy config must build without network access");
+    assert!(
+        !store.capabilities().upload_checksum,
+        "with UploadIntegrity::Off, S3Store must not claim upload_checksum"
+    );
+    assert_eq!(
+        store.capabilities(),
+        s3_expected_capabilities(),
+        "the default (integrity off) S3Store must report exactly the mandatory \
+         set plus multipart, so the server's startup gate accepts --store s3 in \
+         every mode"
+    );
+}
+
+/// #863: an `S3Store` built with a non-`Off` `UploadIntegrity` reports
+/// `upload_checksum: true`, because that mode configured
+/// `AmazonS3Builder::with_checksum_algorithm` so `object_store` attaches a
+/// server-verified `x-amz-checksum-*` on every `put`. This is the flip of the
+/// line `S3Store::capabilities` returns for `upload_checksum` (hardcoded
+/// `false` before #863); reverting that one line to `false` fails this test.
+///
+/// No `RAVEL_RUSTFS_URL` gate: `AmazonS3Builder::build` only validates config.
+/// The on-the-wire proof that the header is actually attached lives in
+/// `tests/s3_http_faults.rs` (`put_attaches_server_verified_checksum_...`),
+/// which puts against a fake endpoint and asserts the recorded request headers.
+#[test]
+fn s3_store_reports_upload_checksum_when_integrity_configured() {
+    let config = S3Config {
+        bucket: "test-bucket".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint: Some("http://localhost:0".to_string()),
+        access_key_id: "test".to_string(),
+        secret_access_key: "test".to_string(),
+        allow_http: true,
+        force_path_style: true,
+        kms_key_id: None,
+        session_token: None,
+        credentials_file: None,
+        auth: Default::default(),
+        instance_metadata_endpoint: None,
+    };
+    for mode in [UploadIntegrity::Crc64Nvme, UploadIntegrity::Sha256] {
+        let http = S3HttpConfig {
+            upload_integrity: mode,
+            ..Default::default()
+        };
+        let store = S3Store::with_http_config(config.clone(), http)
+            .expect("dummy config must build without network access");
+        assert!(
+            store.capabilities().upload_checksum,
+            "UploadIntegrity::{mode:?} must report upload_checksum: true"
+        );
+    }
+}
+
+/// #863 (semantics oracle, deliverable 5): a store that reports
+/// `upload_checksum` must reject a body corrupted between caller and store.
+/// `MemoryStore` is the oracle (it verifies `PutOptions::checksum` against the
+/// received bytes); `FaultStore`'s `CorruptBody` fault flips the payload after
+/// the caller computed its checksum, modeling corruption before the bytes are
+/// signed. The store must fail the write with `Corrupted` and leave no object,
+/// and the fault counter must prove the corruption actually fired.
+///
+/// This pins the promise of the capability flag: a backend may only claim
+/// `upload_checksum` if it demonstrably rejects such a write. Reverting
+/// `MemoryStore::verify_checksum`'s mismatch `return` (memory.rs) makes the
+/// oracle claim the capability while silently storing the flipped bytes, and
+/// this assertion then fails.
+#[tokio::test]
+async fn upload_checksum_store_rejects_corrupt_in_flight() {
+    let inner = MemoryStore::new();
+    assert!(
+        inner.capabilities().upload_checksum,
+        "the oracle must claim upload_checksum for this property to apply"
+    );
+    let plan = FaultPlan::empty().with_rule(Rule::new(Op::Put, ScriptedFault::CorruptBody));
+    let store = FaultStore::new(inner, plan);
+
+    let data = Bytes::from_static(b"contract-suite-corrupt-in-flight");
+    let good = crc32c::crc32c(&data);
+    let err = store
+        .put(
+            "corrupt/k",
+            data,
+            PutOptions::default().with_checksum(UploadChecksum::Crc32c(good)),
+        )
+        .await
+        .expect_err("a store claiming upload_checksum must reject a corrupted body");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+    assert!(
+        matches!(store.head("corrupt/k").await, Err(StoreError::NotFound)),
+        "a write failing checksum verification must leave no object"
+    );
+    assert_eq!(
+        store.fault_count(Op::Put, FaultKind::CorruptBody),
+        1,
+        "the corruption fault must have fired exactly once"
+    );
+}
+
+/// ADR-1696 decision 5, the read-side mirror of
+/// [`upload_checksum_store_rejects_corrupt_in_flight`]: a store that keeps a
+/// checksum beside an object must refuse a full-object get whose stored bytes
+/// no longer match it, rather than handing the caller a record that decodes
+/// cleanly with a wrong field in it.
+///
+/// The corruption is at rest --- `MemoryStore::corrupt_stored_byte` flips one
+/// bit of the stored object and leaves the checksum recorded at write time
+/// alone, which is bit rot, not a rewrite --- and the read goes through a
+/// `FaultStore` scripted to corrupt the *returned* bytes on top. That ordering
+/// is the point: the wrapper calls the backend first, so the backend's own
+/// verification refuses the read before the wrapper's flip can reach the
+/// caller. The fault counter proves the wrapper really was in the path (a plan
+/// that never matched would make this a plain `MemoryStore` test), and the
+/// error is the backend's, not the wrapper's.
+///
+/// Reverting the `GetRange::Full` check in `MemoryStore::get` makes the get
+/// return `Ok` with bit-flipped bytes, failing the first assertion.
+#[tokio::test]
+async fn full_object_get_of_a_corrupted_stored_object_is_refused() {
+    let inner = MemoryStore::new();
+    let key = "corrupt/at-rest";
+    let payload = Bytes::from_static(b"a stored record whose bytes rot in place");
+    inner
+        .put(key, payload.clone(), PutOptions::create_if_absent())
+        .await
+        .expect("seed the object");
+    inner
+        .corrupt_stored_byte(key, 3, 6)
+        .expect("flip one bit of the stored object");
+
+    let plan = FaultPlan::empty().with_rule(Rule::new(Op::Get, ScriptedFault::CorruptRange));
+    let store = FaultStore::new(inner, plan);
+
+    let err = store
+        .get(key, GetRange::Full)
+        .await
+        .expect_err("a full-object get of corrupted stored bytes must be refused");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+    assert_eq!(
+        store.fault_count(Op::Get, FaultKind::CorruptRange),
+        1,
+        "the corruption fault must have fired exactly once"
+    );
+}
+
+/// The other half of ADR-1696 decision 4, stated as its own case so the two
+/// cannot drift: a *ranged* read of the same corrupted object is served. The
+/// stored checksum covers the whole object and a slice cannot be compared
+/// against it, so refusing here would fail every suffix read of every segment;
+/// those keep the format's own crc hierarchy as their check.
+#[tokio::test]
+async fn a_ranged_get_of_a_corrupted_stored_object_is_still_served() {
+    let store = MemoryStore::new();
+    let key = "corrupt/ranged";
+    store
+        .put(
+            key,
+            Bytes::from_static(b"0123456789abcdef"),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("seed the object");
+    store
+        .corrupt_stored_byte(key, 0, 0)
+        .expect("flip one bit of the stored object");
+
+    let got = store
+        .get(key, GetRange::Range(8, 16))
+        .await
+        .expect("a ranged read is outside the whole-object check");
+    assert_eq!(
+        &got.data[..],
+        b"89abcdef",
+        "the ranged bytes must be served unchanged"
+    );
+    let err = store
+        .get(key, GetRange::Full)
+        .await
+        .expect_err("the same object read whole must still be refused");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+}
+
+/// A pin decides which bytes are served, never whether they are checked: the
+/// pinned read paths refuse a corrupted stored object exactly as `get` does.
+/// The pin is taken before the corruption and still matches after it, because
+/// bit rot at rest changes neither the ETag nor the version, so the read gets
+/// past both halves of the pin and only the stored CRC-32C can refuse it.
+///
+/// Removing the `verify_full_read` call from `MemoryStore::get_pinned` makes
+/// the first `expect_err` below fail with the flipped bytes served; removing it
+/// from `MemoryStore::get_with_pin` does the same to the second.
+#[tokio::test]
+async fn pinned_full_reads_of_a_corrupted_stored_object_are_refused() {
+    let store = MemoryStore::new();
+    let key = "corrupt/pinned";
+    store
+        .put(
+            key,
+            Bytes::from_static(b"a pinned record whose bytes rot in place"),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("seed the object");
+    let (_, pin) = store.pin_of(key).await.expect("pin the seeded object");
+    assert!(
+        pin.version.is_some(),
+        "the oracle reports a version selector, so the pin exercises both halves"
+    );
+    store
+        .corrupt_stored_byte(key, 5, 2)
+        .expect("flip one bit of the stored object");
+
+    let err = store
+        .get_pinned(key, GetRange::Full, &pin)
+        .await
+        .expect_err("a pinned full read of corrupted stored bytes must be refused");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+
+    let err = store
+        .get_with_pin(key, GetRange::Full)
+        .await
+        .expect_err("a full read that reports its pin must also refuse corrupted bytes");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+
+    // The pin still matches: a ranged pinned read is served, which is what
+    // shows the refusal above came from the checksum and not from the pin.
+    let got = store
+        .get_pinned(key, GetRange::Range(0, 2), &pin)
+        .await
+        .expect("a ranged pinned read is outside the whole-object check");
+    assert_eq!(&got.outcome.data[..], b"a ");
+}
+
+/// The startup gate `--mode maintain` applies, asserted against the real
+/// `S3Store` without an endpoint: `required_capabilities(Mode::
+/// Maintain)` is `mandatory()` with `multipart: true`, and this is the
+/// predicate `ravel_server::store::check_capabilities` evaluates. Restated here
+/// rather than imported, because ravel-object-store must not depend on
+/// ravel-server; the equality assertion in
+/// `s3_store_reports_upload_checksum_unsupported` above is what keeps the two
+/// from drifting apart silently.
+#[test]
+fn s3_store_satisfies_maintain_mode_capabilities() {
+    let store = S3Store::new(S3Config {
+        bucket: "test-bucket".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint: Some("http://localhost:0".to_string()),
+        access_key_id: "test".to_string(),
+        secret_access_key: "test".to_string(),
+        allow_http: true,
+        force_path_style: true,
+        kms_key_id: None,
+        session_token: None,
+        credentials_file: None,
+        auth: Default::default(),
+        instance_metadata_endpoint: None,
+    })
+    .expect("dummy config must build without network access");
+    let maintain_required = Capabilities {
+        multipart: true,
+        ..Capabilities::mandatory()
+    };
+    assert!(
+        store.capabilities().satisfies(&maintain_required),
+        "S3Store must satisfy maintain mode's capability set so --mode maintain \
+         can start against an S3-compatible backend, got {:?}",
+        store.capabilities()
+    );
+    assert!(
+        MemoryStore::new()
+            .capabilities()
+            .satisfies(&maintain_required),
+        "MemoryStore must satisfy maintain mode's capability set too"
+    );
+}
+
+/// Real S3/RustFS conformance test (ADR-0010 §12: the memory oracle alone
+/// cannot catch a backend's conditional-put mapping). Gated on
+/// `RAVEL_RUSTFS_URL` so the suite skips cleanly wherever no RustFS is
+/// reachable (e.g. this sandbox, most laptops, unconfigured CI runners).
+///
+/// Optional overrides: `RAVEL_RUSTFS_BUCKET` (must already exist -- this
+/// crate does not create buckets), `RAVEL_RUSTFS_ACCESS_KEY`,
+/// `RAVEL_RUSTFS_SECRET_KEY`, `RAVEL_RUSTFS_REGION`.
+#[tokio::test]
+async fn rustfs_contract() {
+    let Ok(url) = env::var("RAVEL_RUSTFS_URL") else {
+        println!("skipping RustFS contract test: RAVEL_RUSTFS_URL not set");
+        return;
+    };
+    let bucket =
+        env::var("RAVEL_RUSTFS_BUCKET").unwrap_or_else(|_| "ravel-object-store-test".to_string());
+    let access_key_id =
+        env::var("RAVEL_RUSTFS_ACCESS_KEY").unwrap_or_else(|_| "rustfsadmin".to_string());
+    let secret_access_key =
+        env::var("RAVEL_RUSTFS_SECRET_KEY").unwrap_or_else(|_| "rustfsadmin".to_string());
+    let region = env::var("RAVEL_RUSTFS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    let allow_http = url.starts_with("http://");
+
+    let config = S3Config {
+        bucket,
+        region,
+        endpoint: Some(url),
+        access_key_id,
+        secret_access_key,
+        allow_http,
+        force_path_style: true,
+        kms_key_id: None,
+        session_token: None,
+        credentials_file: None,
+        auth: Default::default(),
+        instance_metadata_endpoint: None,
+    };
+    let checksum_config = config.clone();
+    // A small page size, like `memory_store_paged_contract`, so the
+    // pagination assertion exercises `start-after` continuation against the
+    // real bucket instead of fitting in a single page.
+    let store = S3Store::with_page_size(config, 2)
+        .expect("S3Store::with_page_size must succeed with a valid config");
+
+    // The bucket persists across runs; root every key under a run-unique
+    // prefix so the pagination/completeness assertions only ever see keys
+    // this run wrote, then best-effort clean them up afterward.
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after the epoch")
+        .as_nanos();
+    let root = format!("contract-{run_id}");
+
+    run_contract_suite(&store, &root).await;
+    // The two S3-shaped multipart proofs the memory oracle cannot give: that
+    // the parts went out as parts (composite ETag) and that `put` itself takes
+    // the multipart path above its threshold.
+    assert_multipart_composite_etag(&store, &format!("{root}/multipart-etag/")).await;
+    assert_put_above_threshold_uses_multipart(&store, &format!("{root}/multipart-threshold/"))
+        .await;
+    assert_full_read_is_verified_on_a_real_endpoint(
+        checksum_config,
+        &format!("{root}/read-checksum/"),
+    )
+    .await;
+
+    let leftovers = list_all(&store, &format!("{root}/"))
+        .await
+        .expect("list_all for cleanup");
+    for meta in leftovers {
+        let _ = store.delete(&meta.key).await;
+    }
+}
+
+/// ADR-1696 read-side verification against a real endpoint, which is the only
+/// place the fake-endpoint tests cannot speak for: whether the endpoint stores
+/// the checksum a `Crc64Nvme` PUT attached and returns it on a full-object GET.
+/// A `get_unverified` delta of exactly 0 means the read took the verified path;
+/// an endpoint that dropped the header, or an adapter that sent the first
+/// request ranged (MinIO-derived endpoints return no checksum then), moves it
+/// to 1. A caller-issued ranged read of the same object is served and does not
+/// count either way.
+async fn assert_full_read_is_verified_on_a_real_endpoint(config: S3Config, prefix: &str) {
+    let http = S3HttpConfig {
+        upload_integrity: UploadIntegrity::Crc64Nvme,
+        ..Default::default()
+    };
+    let store = S3Store::with_http_config(config, http)
+        .expect("an S3Store with Crc64Nvme upload integrity must build");
+    let key = format!("{prefix}record");
+    // Commit-record sized: one request, far below the read chunk bound.
+    let payload = Bytes::from((0..200u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+    store
+        .put(&key, payload.clone(), PutOptions::create_if_absent())
+        .await
+        .expect("a Crc64Nvme put must be accepted by the endpoint");
+
+    let before = store.get_unverified();
+    let got = store
+        .get(&key, GetRange::Full)
+        .await
+        .expect("a full-object read of an intact object must be served");
+    assert_eq!(got.data, payload, "the full read returns the stored bytes");
+    assert_eq!(
+        store.get_unverified() - before,
+        0,
+        "the full read must be verified against the stored crc64nvme, not \
+         counted unverified"
+    );
+
+    let ranged = store
+        .get(&key, GetRange::Range(16, 48))
+        .await
+        .expect("a caller-issued ranged read must be served");
+    assert_eq!(&ranged.data[..], &payload[16..48], "the ranged bytes");
+    assert_eq!(
+        store.get_unverified() - before,
+        0,
+        "a caller-issued ranged read is outside the check and not counted"
+    );
+}
+
+/// Real floci conformance test: the capability gate ADR-0034 decision 8 makes
+/// the first task of the k8s epic. floci is a LocalStack-class S3 emulator
+/// (single native-binary container, S3 on port 4566, path-style addressing),
+/// proposed as the fake backend for the kind development environment and the
+/// k8s CI lane. Whether its S3 implements Ravel's mandatory capability set
+/// and multipart is the open question this test answers; the ADR's fallback
+/// if it does not is the local S3-compatible store already proven in this
+/// repo's CI (MinIO when the ADR was written, RustFS now).
+///
+/// Gated on `RAVEL_FLOCI_URL` exactly like [`rustfs_contract`], so the suite
+/// skips cleanly wherever no floci is reachable. Optional overrides:
+/// `RAVEL_FLOCI_BUCKET` (must already exist -- this crate does not create
+/// buckets), `RAVEL_FLOCI_ACCESS_KEY`, `RAVEL_FLOCI_SECRET_KEY`,
+/// `RAVEL_FLOCI_REGION`. The credential defaults are floci's documented
+/// dummy values; it accepts any credentials.
+///
+/// Beyond the shared suite (which now includes [`assert_multipart_upload`] for
+/// every backend) this runs [`assert_mandatory_capabilities`] and the two
+/// S3-shaped multipart proofs, together deciding the ADR's question: every mode
+/// enforces `Capabilities::mandatory()` at startup and `Mode::Maintain`
+/// additionally enforces `multipart`.
+#[tokio::test]
+async fn floci_contract() {
+    let Ok(url) = env::var("RAVEL_FLOCI_URL") else {
+        println!("skipping floci contract test: RAVEL_FLOCI_URL not set");
+        return;
+    };
+    let bucket =
+        env::var("RAVEL_FLOCI_BUCKET").unwrap_or_else(|_| "ravel-object-store-test".to_string());
+    let access_key_id = env::var("RAVEL_FLOCI_ACCESS_KEY").unwrap_or_else(|_| "test".to_string());
+    let secret_access_key =
+        env::var("RAVEL_FLOCI_SECRET_KEY").unwrap_or_else(|_| "test".to_string());
+    let region = env::var("RAVEL_FLOCI_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    let allow_http = url.starts_with("http://");
+
+    // `force_path_style: true` matches what `ravel-server` hardcodes and what
+    // floci addresses natively; its virtual-hosted form needs a
+    // `localhost.floci.io` DNS name Ravel never configures.
+    let config = S3Config {
+        bucket,
+        region,
+        endpoint: Some(url),
+        access_key_id,
+        secret_access_key,
+        allow_http,
+        force_path_style: true,
+        kms_key_id: None,
+        session_token: None,
+        credentials_file: None,
+        auth: Default::default(),
+        instance_metadata_endpoint: None,
+    };
+    // A small page size, as in `rustfs_contract`, so the pagination assertion
+    // exercises `start-after` continuation against the real bucket.
+    let store = S3Store::with_page_size(config, 2)
+        .expect("S3Store::with_page_size must succeed with a valid config");
+
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after the epoch")
+        .as_nanos();
+    let root = format!("contract-floci-{run_id}");
+
+    run_contract_suite(&store, &root).await;
+    assert_mandatory_capabilities(&store, &format!("{root}/mandatory/")).await;
+    assert_multipart_composite_etag(&store, &format!("{root}/multipart-etag/")).await;
+    assert_put_above_threshold_uses_multipart(&store, &format!("{root}/multipart-threshold/"))
+        .await;
+
+    let leftovers = list_all(&store, &format!("{root}/"))
+        .await
+        .expect("list_all for cleanup");
+    for meta in leftovers {
+        let _ = store.delete(&meta.key).await;
+    }
+}
+
+/// The order a GCS pinned read is judged in (ADR-3456): the generation
+/// selector before the ETag precondition. Run against the fake and against a
+/// real bucket, so the fake's ordering is checked against the service's.
+async fn gcs_pinned_read_ordering(store: &GcsStore, root: &str) {
+    let key = format!("{root}/pinned/k");
+    let bytes = Bytes::from_static(b"pinned");
+    let wrong_etag = "\"0123456789abcdef0123456789abcdef\"";
+
+    let absent = Pin::from_store(wrong_etag, Some("1".to_string()));
+    let read = store
+        .get_pinned(&format!("{root}/pinned/absent"), GetRange::Full, &absent)
+        .await;
+    assert!(
+        matches!(read, Err(StoreError::NotFound)),
+        "absent key with a pin: {read:?}"
+    );
+
+    store
+        .put(&key, bytes.clone(), PutOptions::default())
+        .await
+        .expect("put");
+    let (_, live) = store.pin_of(&key).await.expect("pin_of");
+    let read = store
+        .get_pinned(
+            &key,
+            GetRange::Full,
+            &Pin::from_store(wrong_etag, live.version.clone()),
+        )
+        .await;
+    assert!(
+        matches!(read, Err(StoreError::PreconditionFailed)),
+        "live generation, wrong ETag: {read:?}"
+    );
+
+    let read = store
+        .get_pinned(&key, GetRange::Full, &live)
+        .await
+        .expect("live generation, its own ETag");
+    assert_eq!(read.outcome.data, bytes);
+
+    // Identical bytes keep the ETag, so only the generation is stale.
+    store
+        .put(&key, bytes.clone(), PutOptions::default())
+        .await
+        .expect("identical rewrite");
+    let (_, replaced) = store.pin_of(&key).await.expect("pin_of");
+    assert_eq!(replaced.etag, live.etag);
+    assert_ne!(replaced.version, live.version);
+    let read = store.get_pinned(&key, GetRange::Full, &live).await;
+    assert!(
+        matches!(read, Err(StoreError::NotFound)),
+        "replaced generation, its stale ETag: {read:?}"
+    );
+
+    // Different bytes move the ETag too: the old pin's generation and ETag are
+    // both stale. NotFound, not PreconditionFailed, shows the generation is
+    // judged before If-Match.
+    store
+        .put(
+            &key,
+            Bytes::from_static(b"other bytes"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("rewrite with other bytes");
+    let (_, rewritten) = store.pin_of(&key).await.expect("pin_of");
+    assert_ne!(rewritten.etag, replaced.etag);
+    let read = store.get_pinned(&key, GetRange::Full, &replaced).await;
+    assert!(
+        matches!(read, Err(StoreError::NotFound)),
+        "replaced generation, a different stale ETag: {read:?}"
+    );
+    store.delete(&key).await.expect("delete");
+}
+
+/// A name holding U+0001, written by another client through the JSON API's
+/// media upload, is listed under its exact name: in `objects` when
+/// `is_addressable_key` accepts it, else in `unaddressable`, and never as a
+/// U+FFFD replacement. The object is deleted before the assertions.
+async fn gcs_foreign_control_character_name(store: &GcsStore, root: &str) {
+    let prefix = format!("{root}/foreign-u0001/");
+    let name = format!("{prefix}a\u{1}b");
+    store
+        .upload_foreign(&name, Bytes::from_static(b"foreign"))
+        .await
+        .expect("upload the foreign object");
+
+    let mut objects = Vec::new();
+    let mut unaddressable = Vec::new();
+    let mut page_token = None;
+    let drained = loop {
+        let page = match store.list(&prefix, page_token).await {
+            Ok(page) => page,
+            Err(e) => break Err(e),
+        };
+        objects.extend(page.objects.into_iter().map(|o| o.key));
+        unaddressable.extend(page.unaddressable.into_iter().map(|u| u.key));
+        match page.next {
+            Some(next) => page_token = Some(next),
+            None => break Ok(()),
+        }
+    };
+    let deleted = store.delete_foreign(&name).await;
+
+    drained.expect("list the foreign object's prefix");
+    deleted.expect("delete the foreign object");
+    let all: Vec<&String> = objects.iter().chain(&unaddressable).collect();
+    assert!(
+        all.iter().all(|listed| !listed.contains('\u{fffd}')),
+        "{all:?}"
+    );
+    if is_addressable_key(&name) {
+        assert_eq!(objects, [name]);
+        assert!(unaddressable.is_empty(), "{unaddressable:?}");
+    } else {
+        assert_eq!(unaddressable, [name]);
+        assert!(objects.is_empty(), "{objects:?}");
+    }
+}
+
+/// `GcsStore` against the in-process fake GCS endpoint, in every run. A page
+/// size of 2 so listing crosses continuation tokens.
+#[tokio::test]
+async fn gcs_store_contract_against_the_fake() {
+    let fake = FakeGcs::start("ravel-contract")
+        .await
+        .expect("bind the fake GCS endpoint");
+    let mut config = fake.config();
+    config.list_page_size = 2;
+    let store = GcsStore::new(config).expect("GcsStore against the fake");
+    assert_eq!(store.capabilities(), gcs_expected_capabilities());
+
+    run_contract_suite(&store, "gcs-fake").await;
+    gcs_pinned_read_ordering(&store, "gcs-fake").await;
+    gcs_foreign_control_character_name(&store, "gcs-fake").await;
+    assert_eq!(fake.data_of("gcs-fake/foreign-u0001/a\u{1}b"), None);
+
+    // The multipart cases ran rather than taking the `multipart: false`
+    // refusal branch: the fake saw initiations, and the completed object is
+    // there.
+    let initiations = fake
+        .requests()
+        .iter()
+        .filter(|r| r.method == "POST" && r.query_param("uploads").is_some())
+        .count();
+    assert!(initiations > 0, "no multipart upload reached the fake");
+    assert_eq!(
+        fake.data_of("gcs-fake/multipart/object").map(|d| d.len()),
+        Some(MULTIPART_PART_SIZE + MULTIPART_TAIL_SIZE)
+    );
+}
+
+/// What `GcsStore` declares: the same set as [`s3_expected_capabilities`],
+/// [`Capabilities::mandatory()`] plus `multipart` (ADR-3456, amendment for
+/// #3802) and no upload checksums (ADR-3456 D1).
+fn gcs_expected_capabilities() -> Capabilities {
+    s3_expected_capabilities()
+}
+
+/// The keys, under `{root}/multipart/`, of every object the multipart probes
+/// complete: [`assert_multipart_upload`]'s object, the sequence rules'
+/// single-short-part upload, and the part-checksum probe's object.
+const MULTIPART_COMPLETED_SUFFIXES: [&str; 3] =
+    ["object", "rules/single-short-part", "part-checksum/object"];
+
+/// `GcsStore` against a real bucket, gated on `RAVEL_GCS_TEST_BUCKET`. The
+/// bucket must already exist; credentials come from Application Default
+/// Credentials (`GOOGLE_APPLICATION_CREDENTIALS`, the gcloud well-known file,
+/// or the metadata server). Keys go under a run-unique root and are deleted
+/// afterwards.
+#[tokio::test]
+async fn gcs_contract() {
+    let Ok(bucket) = env::var("RAVEL_GCS_TEST_BUCKET") else {
+        println!("skipping GCS contract test: RAVEL_GCS_TEST_BUCKET not set");
+        return;
+    };
+    let mut config = GcsConfig::new(bucket);
+    config.list_page_size = 2;
+    let store = GcsStore::new(config).expect("GcsStore with Application Default Credentials");
+
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after the epoch")
+        .as_nanos();
+    let root = format!("contract-gcs-{run_id}");
+
+    assert_eq!(store.capabilities(), gcs_expected_capabilities());
+    run_contract_suite(&store, &root).await;
+    gcs_pinned_read_ordering(&store, &root).await;
+    gcs_foreign_control_character_name(&store, &root).await;
+    assert!(
+        store.observed_store_time_ns().is_some(),
+        "every GCS response carries a Date header"
+    );
+
+    // The lister refuses an item with neither md5Hash nor componentCount, which
+    // an XML multipart upload may leave on real GCS (ADR-3456, amendment for
+    // #3802). Delete every object the multipart probes complete by key first,
+    // so the cleanup listing below never meets one. Delete is idempotent, so a
+    // key a probe did not leave is not an error.
+    for suffix in MULTIPART_COMPLETED_SUFFIXES {
+        store
+            .delete(&format!("{root}/multipart/{suffix}"))
+            .await
+            .expect("delete a multipart-completed object before the cleanup listing");
+    }
+    let leftovers = list_all(&store, &format!("{root}/"))
+        .await
+        .expect("list_all for cleanup");
+    for meta in leftovers {
+        let _ = store.delete(&meta.key).await;
+    }
+}
+
+/// What `AzureStore` declares: the mandatory set plus `multipart`, and no
+/// upload checksums (ADR-4158 D1), the same set as [`s3_expected_capabilities`].
+fn azure_expected_capabilities() -> Capabilities {
+    s3_expected_capabilities()
+}
+
+/// `AzureStore` against the in-process fake Azure endpoint, in every run. A
+/// page size of 2 so listing crosses page tokens.
+#[tokio::test]
+async fn azure_store_contract_against_the_fake() {
+    let fake = FakeAzure::start("ravelcontract", "ravel-contract")
+        .await
+        .expect("bind the fake Azure endpoint");
+    let mut config = fake.config();
+    config.list_page_size = 2;
+    let store = AzureStore::new(config)
+        .await
+        .expect("AzureStore against the fake");
+    assert_eq!(store.capabilities(), azure_expected_capabilities());
+
+    run_contract_suite(&store, "azure-fake").await;
+    azure_pinned_read_ordering(&store, "azure-fake").await;
+    azure_suffix_read_races_overwrites(&store, "azure-fake").await;
+
+    let requests = fake.requests();
+    // The multipart cases ran rather than taking the `multipart: false`
+    // refusal branch: the fake saw a Put Block List, and the completed object
+    // is there.
+    let block_lists = requests
+        .iter()
+        .filter(|r| r.method == "PUT" && r.query_param("comp") == Some("blocklist"))
+        .count();
+    assert!(block_lists > 0, "no Put Block List reached the fake");
+    assert_eq!(
+        fake.data_of("azure-fake/multipart/object").map(|d| d.len()),
+        Some(MULTIPART_PART_SIZE + MULTIPART_TAIL_SIZE)
+    );
+    // The suite's suffix reads went out as bounded ranges: the fake answers a
+    // suffix range with the whole blob, as Azure does (ADR-4158 D2).
+    let ranged_gets = requests
+        .iter()
+        .filter(|r| r.method == "GET" && r.header("range").is_some())
+        .count();
+    assert!(ranged_gets > 0, "no ranged GET reached the fake");
+    for request in &requests {
+        for name in ["range", "x-ms-range"] {
+            assert!(
+                request
+                    .header(name)
+                    .is_none_or(|range| !range.starts_with("bytes=-")),
+                "a suffix range reached the fake: {request:?}"
+            );
+        }
+    }
+}
+
+/// Pinned reads on `AzureStore` (docs/object-store-contract.md, "Conditional
+/// reads"). The pin's ETag is the precondition on every request a read sends,
+/// the HEAD of a suffix read included, and the pin carries a version selector
+/// only when the account has blob versioning on. Azure gives every write a new
+/// ETag, so an identical rewrite already makes an ETag-only pin stale.
+async fn azure_pinned_read_ordering(store: &dyn ObjectStoreBackend, root: &str) {
+    let key = format!("{root}/pinned/k");
+    let bytes = Bytes::from_static(b"pinned");
+    let wrong_etag = "\"0x8DE00000000000F\"";
+
+    let absent = Pin::from_store(wrong_etag, None);
+    for range in [GetRange::Full, GetRange::Suffix(3)] {
+        let read = store
+            .get_pinned(&format!("{root}/pinned/absent"), range, &absent)
+            .await;
+        assert!(
+            matches!(read, Err(StoreError::NotFound)),
+            "absent key with a pin, {range:?}: {read:?}"
+        );
+    }
+
+    store
+        .put(&key, bytes.clone(), PutOptions::default())
+        .await
+        .expect("put");
+    let (meta, live) = store.pin_of(&key).await.expect("pin_of");
+    assert_eq!(meta.etag.0, live.etag, "the pin's ETag is the HEAD's");
+    assert_eq!(meta.version.0, live.etag, "the version token is the ETag");
+
+    let wrong = Pin::from_store(wrong_etag, live.version.clone());
+    for range in [GetRange::Full, GetRange::Suffix(3)] {
+        let read = store.get_pinned(&key, range, &wrong).await;
+        assert!(
+            matches!(read, Err(StoreError::PreconditionFailed)),
+            "live blob, wrong ETag, {range:?}: {read:?}"
+        );
+    }
+    let read = store
+        .get_pinned(&key, GetRange::Full, &live)
+        .await
+        .expect("live blob, its own ETag");
+    assert_eq!(read.outcome.data, bytes);
+    assert_eq!(read.outcome.etag.0, live.etag);
+    let read = store
+        .get_pinned(&key, GetRange::Suffix(3), &live)
+        .await
+        .expect("suffix of the live blob, its own ETag");
+    assert_eq!(read.outcome.data, Bytes::from_static(b"ned"));
+    assert_eq!(read.outcome.total_size, 6);
+
+    // An identical rewrite moves the ETag (ADR-4158, Measured P5).
+    store
+        .put(&key, bytes.clone(), PutOptions::default())
+        .await
+        .expect("identical rewrite");
+    let (_, replaced) = store.pin_of(&key).await.expect("pin_of");
+    assert_ne!(
+        replaced.etag, live.etag,
+        "an identical rewrite keeps its ETag"
+    );
+    for range in [GetRange::Full, GetRange::Suffix(3)] {
+        let read = store.get_pinned(&key, range, &live).await;
+        match live.version {
+            // An ETag-only pin of a replaced blob is a failed precondition.
+            None => assert!(
+                matches!(read, Err(StoreError::PreconditionFailed)),
+                "replaced blob, ETag-only pin, {range:?}: {read:?}"
+            ),
+            // With blob versioning on, the pin selects the version it names,
+            // which still holds its own ETag and bytes.
+            Some(_) => {
+                let read = read.expect("the pinned version is still kept");
+                assert_eq!(read.pin.etag, live.etag, "{range:?}");
+            }
+        }
+    }
+    store.delete(&key).await.expect("delete");
+}
+
+/// Suffix reads racing a writer that replaces the blob with contents of other
+/// lengths. Every byte of a version's last `SUFFIX` bytes is that version's
+/// marker, a value no byte before them takes, so a window that mixes two
+/// versions, or reaches before the tail, equals no version's tail. Every read
+/// that succeeds returns exactly the tail of one version and that version's
+/// length; a read the writer outran on every round is `Transient`, never
+/// bytes from two versions or from the wrong offset.
+async fn azure_suffix_read_races_overwrites(store: &dyn ObjectStoreBackend, root: &str) {
+    const VERSIONS: u8 = 20;
+    const SUFFIX: u64 = 16;
+    let key = format!("{root}/suffix-race/k");
+    let version = |i: u8| {
+        let len = 64 + usize::from(i) * 7;
+        let suffix = usize::try_from(SUFFIX).expect("suffix fits usize");
+        let bytes: Vec<u8> = (0..len)
+            .map(|position| {
+                if position >= len - suffix {
+                    0x80 + i
+                } else {
+                    u8::try_from(position % 128).expect("below 128")
+                }
+            })
+            .collect();
+        Bytes::from(bytes)
+    };
+    let tail = |bytes: &Bytes| {
+        bytes.slice(bytes.len() - usize::try_from(SUFFIX).expect("suffix fits usize")..)
+    };
+    store
+        .put(&key, version(0), PutOptions::default())
+        .await
+        .expect("seed the raced blob");
+
+    let writer = async {
+        for i in 1..VERSIONS {
+            store
+                .put(&key, version(i), PutOptions::default())
+                .await
+                .expect("overwrite");
+            tokio::task::yield_now().await;
+        }
+    };
+    let reader = async {
+        let mut served = 0usize;
+        for _ in 0..usize::from(VERSIONS) * 2 {
+            match store.get(&key, GetRange::Suffix(SUFFIX)).await {
+                Ok(read) => {
+                    let matching: Vec<u8> = (0..VERSIONS)
+                        .filter(|i| tail(&version(*i)) == read.data)
+                        .collect();
+                    let [i] = matching[..] else {
+                        panic!(
+                            "a suffix read returned the tail of {} versions: {:?}",
+                            matching.len(),
+                            read.data
+                        );
+                    };
+                    assert_eq!(
+                        read.total_size,
+                        u64::try_from(version(i).len()).expect("length fits u64"),
+                        "the reported length is version {i}'s"
+                    );
+                    served += 1;
+                }
+                Err(StoreError::Transient(_)) => {}
+                Err(other) => panic!("suffix read raced by an overwrite: {other:?}"),
+            }
+            tokio::task::yield_now().await;
+        }
+        served
+    };
+    let ((), served) = futures::join!(writer, reader);
+    assert!(served > 0, "every raced suffix read gave up");
+
+    let last = store
+        .get(&key, GetRange::Suffix(SUFFIX))
+        .await
+        .expect("suffix read once the writer stopped");
+    assert_eq!(last.data, tail(&version(VERSIONS - 1)));
+    store.delete(&key).await.expect("delete");
+}
+
+/// A suffix read's length-probing HEAD (ADR-4158 D2) and its ranged GET are
+/// both billed as `StoreOp::Get` attempts of the one get call, never as
+/// `StoreOp::Head` attempts: `attempts_and_observed_store_time_are_recorded`
+/// pins this against the in-process fake; this is the same assertion against
+/// a live Azurite or Azure connection.
+async fn azure_suffix_read_is_one_get_call_two_get_attempts_zero_head_attempts(
+    store: &dyn ObjectStoreBackend,
+    metrics: &StoreMetrics,
+    root: &str,
+) {
+    let key = format!("{root}/suffix-metrics/k");
+    store
+        .put(&key, Bytes::from_static(b"value"), PutOptions::default())
+        .await
+        .expect("put");
+
+    let before = metrics.snapshot();
+    store
+        .get(&key, GetRange::Suffix(2))
+        .await
+        .expect("suffix get");
+    let after = metrics.snapshot();
+
+    assert_eq!(
+        after.op(StoreOp::Get).calls - before.op(StoreOp::Get).calls,
+        1,
+        "one suffix get is one get call"
+    );
+    assert_eq!(
+        after.op(StoreOp::Get).attempts - before.op(StoreOp::Get).attempts,
+        2,
+        "the length-probing HEAD and the ranged GET are both billed as get attempts"
+    );
+    assert_eq!(
+        after.op(StoreOp::Head).attempts,
+        before.op(StoreOp::Head).attempts,
+        "the suffix read's internal HEAD must not move the Head counters"
+    );
+
+    store.delete(&key).await.expect("delete");
+}
+
+/// Run-unique key root for a test against a long-lived container.
+fn azure_run_root(lane: &str) -> String {
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after the epoch")
+        .as_nanos();
+    format!("contract-{lane}-{run_id}")
+}
+
+async fn azure_contract_cases(store: &dyn ObjectStoreBackend, metrics: &StoreMetrics, root: &str) {
+    assert_eq!(store.capabilities(), azure_expected_capabilities());
+    run_contract_suite(store, root).await;
+    azure_pinned_read_ordering(store, root).await;
+    azure_suffix_read_races_overwrites(store, root).await;
+    assert!(
+        store.observed_store_time_ns().is_some(),
+        "every Azure response carries a Date header"
+    );
+    azure_suffix_read_is_one_get_call_two_get_attempts_zero_head_attempts(store, metrics, root)
+        .await;
+    let leftovers = list_all(store, &format!("{root}/"))
+        .await
+        .expect("list_all for cleanup");
+    for meta in leftovers {
+        let _ = store.delete(&meta.key).await;
+    }
+}
+
+/// `AzureStore` against the Azurite emulator, gated on `RAVEL_AZURITE_URL`,
+/// the emulator's account URL (`http://127.0.0.1:10000/devstoreaccount1`).
+/// `RAVEL_AZURITE_ACCOUNT_KEY` is the account's base64 shared key and is
+/// required once the URL is set. Optional overrides: `RAVEL_AZURITE_ACCOUNT`
+/// (default `devstoreaccount1`) and `RAVEL_AZURITE_CONTAINER` (default
+/// `ravel-object-store-test`, which must already exist: this crate does not
+/// create containers).
+#[tokio::test]
+async fn azurite_contract() {
+    let Ok(url) = env::var("RAVEL_AZURITE_URL") else {
+        println!("skipping Azurite contract test: RAVEL_AZURITE_URL not set");
+        return;
+    };
+    let account =
+        env::var("RAVEL_AZURITE_ACCOUNT").unwrap_or_else(|_| "devstoreaccount1".to_string());
+    let container = env::var("RAVEL_AZURITE_CONTAINER")
+        .unwrap_or_else(|_| "ravel-object-store-test".to_string());
+    let key = env::var("RAVEL_AZURITE_ACCOUNT_KEY")
+        .expect("RAVEL_AZURITE_ACCOUNT_KEY must be set together with RAVEL_AZURITE_URL");
+    let mut config = AzureConfig::new(account, container);
+    config.allow_http = url.starts_with("http://");
+    config.endpoint = Some(url);
+    config.test_account_key = Some(TestAccountKey(key));
+    config.list_page_size = 2;
+    let metrics = Arc::new(StoreMetrics::default());
+    let store = InstrumentedStore::with_metrics(
+        AzureStore::with_metrics(config, Arc::clone(&metrics))
+            .await
+            .expect("AzureStore against Azurite"),
+        Arc::clone(&metrics),
+    );
+
+    let root = azure_run_root("azurite");
+    azure_contract_cases(&store, &metrics, &root).await;
+}
+
+/// `AzureStore` against a real container, gated on `RAVEL_AZURE_TEST_ACCOUNT`
+/// and `RAVEL_AZURE_TEST_CONTAINER`. The container must already exist, on a
+/// flat-namespace account; credentials are the ambient ones `AzureStore`
+/// reads (workload identity, `AZURE_STORAGE_ACCOUNT_KEY`, or the instance
+/// metadata service). Keys go under a run-unique root and are deleted
+/// afterwards.
+#[tokio::test]
+async fn azure_contract() {
+    let (Ok(account), Ok(container)) = (
+        env::var("RAVEL_AZURE_TEST_ACCOUNT"),
+        env::var("RAVEL_AZURE_TEST_CONTAINER"),
+    ) else {
+        println!(
+            "skipping Azure contract test: RAVEL_AZURE_TEST_ACCOUNT and \
+             RAVEL_AZURE_TEST_CONTAINER not both set"
+        );
+        return;
+    };
+    let mut config = AzureConfig::new(account, container);
+    config.list_page_size = 2;
+    let metrics = Arc::new(StoreMetrics::default());
+    let store = InstrumentedStore::with_metrics(
+        AzureStore::with_metrics(config, Arc::clone(&metrics))
+            .await
+            .expect("AzureStore with ambient credentials"),
+        Arc::clone(&metrics),
+    );
+
+    let root = azure_run_root("azure");
+    azure_contract_cases(&store, &metrics, &root).await;
+}

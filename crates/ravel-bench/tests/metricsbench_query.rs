@@ -1,0 +1,2416 @@
+//! End-to-end tests for the portable query run (issue #938, epic #2821 W2b):
+//! the shipping `metricsbench_query` binary against stub engines on loopback
+//! HTTP, bound to an ingest report built from `metrics_ingest`'s own types,
+//! with its output checked by the shipping `metricsbench_report validate`.
+//!
+//! The stubs answer every query with one fixed series unless a test scripts
+//! a different answer for a query text, so an engine is correct on an entry
+//! exactly when it answers like the oracle stub.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::Router;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use ravel_bench::metrics_correctness::{Engine, RefusalReason};
+use ravel_bench::metrics_ingest::{
+    ClassDigests, IN_PROCESS_SYSTEM, InProcessRow, IngestPhase, LatencyReport, MetricsIngestReport,
+    PayloadClass, ProfileRecord, Readback, ReadbackExpected, RunRecord, ScalingLabelRecord,
+    StreamCounts, SystemIngestResult, UNSUPPORTED_CLASSES, UnsupportedClassRecord, workload_digest,
+};
+use ravel_bench::report_schema::{
+    Backend, Comparator, Hardware, Measurement, MetricsBenchReport, Provenance, QueryKind,
+    ResultStatus,
+};
+use serde_json::{Value as Json, json};
+
+const ANCHOR_MS: i64 = 1_700_000_010_000;
+const STEPS: u64 = 120;
+const RAVEL_TOKEN: &str = "s3cret-ravel-bearer-7f2c";
+const RAVEL_TOKEN_ENV: &str = "METRICSBENCH_TEST_RAVEL_TOKEN";
+const RAVEL_COMMIT_TOKEN: &str = "0:17,1:4,2:9";
+
+const GAUGE: &str = "metricsbench_gauge_cpu_percent{job=\"metricsbench-api\",region=\"eu-west-1\",instance=\"metricsbench-instance-0\"}";
+const COUNTER_RATE: &str = "rate(metricsbench_requests_total{job=\"metricsbench-api\",method=\"GET\",status=\"200\",instance=\"metricsbench-instance-0\"}[5m])";
+const JOB_RATE_SUM: &str =
+    "sum by (job) (rate(metricsbench_requests_total{job=\"metricsbench-api\"}[5m]))";
+const NATIVE_P95: &str = "histogram_quantile(0.95, metricsbench_latency_native)";
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn workload_path() -> PathBuf {
+    repo_root().join("benchmarks/metrics/workload.json")
+}
+
+/// A four-entry corpus: one instant, two range, one reading the native
+/// histogram family. Entries copied from the checked-in corpus.
+fn corpus() -> Json {
+    json!({
+        "version": 4,
+        "entries": [
+            {
+                "id": "mb_single_gauge_instant",
+                "class": "single_series",
+                "promql": GAUGE,
+                "eval": "instant",
+                "constructs": ["vector selector", "label matcher ="]
+            },
+            {
+                "id": "mb_single_counter_rate",
+                "class": "single_series",
+                "promql": COUNTER_RATE,
+                "eval": "range",
+                "constructs": ["function call", "rate", "matrix selector", "vector selector", "label matcher ="]
+            },
+            {
+                "id": "mb_selective_job_rate_sum",
+                "class": "selective_multi_series",
+                "promql": JOB_RATE_SUM,
+                "eval": "range",
+                "constructs": ["aggregate expression", "sum", "by", "paren expression", "function call", "rate", "matrix selector", "vector selector", "label matcher ="]
+            },
+            {
+                "id": "mb_histogram_native_p95",
+                "class": "histogram",
+                "promql": NATIVE_P95,
+                "eval": "instant",
+                "constructs": ["function call", "histogram_quantile", "number literal", "vector selector"]
+            }
+        ]
+    })
+}
+
+/// A scripted answer for one query text.
+#[derive(Clone, Debug)]
+enum Answer {
+    /// The fixed series every correct engine returns.
+    Correct,
+    /// The fixed series with a different value.
+    Diverge,
+    /// The fixed series two ULPs above the correct value.
+    TwoUlps,
+    /// The fixed series one ULP above the correct value at the first step
+    /// and three above it at the second; an instant answer is one above.
+    RampUlps,
+    /// The fixed series `n` ULPs above the correct value at every step.
+    UlpsAbove(u64),
+    /// `success` with no series.
+    Empty,
+    /// HTTP 422, Mimir's chunk-limit refusal.
+    RefuseChunks,
+    /// No answer before the runner's deadline.
+    Hang,
+    /// [`Answer::Hang`] on the first `n` requests for the query, then
+    /// [`Answer::Correct`].
+    HangFirst(usize),
+    /// The fixed correct series, with `data.stats` set to this value (a
+    /// Ravel answer's own cost block, for the `ravel_cost` sidecar tests).
+    WithStats(Json),
+    /// The fixed correct series after a delay of `step_ms` times the
+    /// request's 1-based number for this query, with `data.stats` carrying
+    /// that request's 0-based number as `accounting.request`.
+    Numbered { step_ms: u64 },
+    /// The `n`th answer (from 0) to the `n`th request for the query, the
+    /// last one repeated past the end. Warm-up requests count.
+    Sequence(Vec<Answer>),
+}
+
+#[derive(Clone, Debug)]
+struct Recorded {
+    path: &'static str,
+    params: HashMap<String, String>,
+    /// Every `min_commit_token` value, in order; `params` keeps one value
+    /// per name.
+    min_commit_tokens: Vec<String>,
+    authorization: Option<String>,
+}
+
+#[derive(Clone)]
+struct Stub {
+    script: Arc<HashMap<String, Answer>>,
+    bearer: Option<String>,
+    requests: Arc<Mutex<Vec<Recorded>>>,
+}
+
+impl Stub {
+    fn requests(&self) -> Vec<Recorded> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn count(&self, path: &str, promql: &str) -> usize {
+        self.requests()
+            .iter()
+            .filter(|r| r.path == path && r.params.get("query").map(String::as_str) == Some(promql))
+            .count()
+    }
+}
+
+fn series(value: &str, kind: &'static str, params: &HashMap<String, String>) -> Json {
+    let metric = json!({"job": "metricsbench-api"});
+    if kind == "instant" {
+        let t: f64 = params["time"].parse().unwrap();
+        json!({"resultType": "vector", "result": [{"metric": metric, "value": [t, value]}]})
+    } else {
+        let start: f64 = params["start"].parse().unwrap();
+        let end: f64 = params["end"].parse().unwrap();
+        json!({"resultType": "matrix", "result": [{"metric": metric, "values": [[start, value], [end, value]]}]})
+    }
+}
+
+/// The correct value, 1.5, moved `n` representable steps up, as the
+/// shortest string that parses back to it.
+fn ulps_above_correct(n: u64) -> String {
+    f64::from_bits(1.5f64.to_bits() + n).to_string()
+}
+
+async fn answer(
+    stub: Stub,
+    path: &'static str,
+    headers: HeaderMap,
+    pairs: Vec<(String, String)>,
+) -> Response {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let min_commit_tokens = pairs
+        .iter()
+        .filter(|(k, _)| k == "min_commit_token")
+        .map(|(_, v)| v.clone())
+        .collect();
+    let params: HashMap<String, String> = pairs.into_iter().collect();
+    let query = params.get("query").cloned().unwrap_or_default();
+    let earlier = {
+        let mut requests = stub.requests.lock().unwrap();
+        let earlier = requests
+            .iter()
+            .filter(|r| r.params.get("query") == Some(&query))
+            .count();
+        requests.push(Recorded {
+            path,
+            params: params.clone(),
+            min_commit_tokens,
+            authorization: authorization.clone(),
+        });
+        earlier
+    };
+    if let Some(token) = &stub.bearer
+        && authorization.as_deref() != Some(format!("Bearer {token}").as_str())
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(
+                json!({"status": "error", "errorType": "unauthorized", "error": "missing bearer"}),
+            ),
+        )
+            .into_response();
+    }
+    let kind = if path == "/api/v1/query" {
+        "instant"
+    } else {
+        "range"
+    };
+    let scripted = match stub.script.get(&query).cloned().unwrap_or(Answer::Correct) {
+        Answer::HangFirst(n) if earlier < n => Answer::Hang,
+        Answer::HangFirst(_) => Answer::Correct,
+        Answer::Sequence(answers) => answers
+            .get(earlier)
+            .or(answers.last())
+            .cloned()
+            .unwrap_or(Answer::Correct),
+        other => other,
+    };
+    match scripted {
+        Answer::Correct | Answer::Sequence(_) => axum::Json(json!({"status": "success", "data": series("1.5", kind, &params)})).into_response(),
+        Answer::Diverge => axum::Json(json!({"status": "success", "data": series("99", kind, &params)})).into_response(),
+        Answer::TwoUlps => axum::Json(json!({"status": "success", "data": series("1.5000000000000004", kind, &params)})).into_response(),
+        Answer::RampUlps => {
+            let mut data = series(&ulps_above_correct(1), kind, &params);
+            if kind == "range" {
+                data["result"][0]["values"][1][1] = json!(ulps_above_correct(3));
+            }
+            axum::Json(json!({"status": "success", "data": data})).into_response()
+        }
+        Answer::UlpsAbove(n) => axum::Json(json!({"status": "success", "data": series(&ulps_above_correct(n), kind, &params)})).into_response(),
+        Answer::Empty => {
+            let result_type = if kind == "instant" { "vector" } else { "matrix" };
+            axum::Json(json!({"status": "success", "data": {"resultType": result_type, "result": []}})).into_response()
+        }
+        Answer::RefuseChunks => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(json!({
+                "status": "error",
+                "errorType": "execution",
+                "error": "the query exceeded the maximum number of chunks (limit: 2000000 chunks) (err-mimir-max-chunks-per-query)"
+            })),
+        )
+            .into_response(),
+        Answer::Hang | Answer::HangFirst(_) => {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            axum::Json(json!({"status": "success", "data": series("1.5", kind, &params)})).into_response()
+        }
+        Answer::Numbered { step_ms } => {
+            tokio::time::sleep(Duration::from_millis(step_ms * (earlier as u64 + 1))).await;
+            let mut data = series("1.5", kind, &params);
+            data["stats"] = json!({"accounting": {"request": earlier}, "phases": []});
+            axum::Json(json!({"status": "success", "data": data})).into_response()
+        }
+        Answer::WithStats(stats) => {
+            let mut data = series("1.5", kind, &params);
+            data["stats"] = stats;
+            axum::Json(json!({"status": "success", "data": data})).into_response()
+        }
+    }
+}
+
+async fn spawn_stub(script: &[(&str, Answer)], bearer: Option<&str>) -> (Stub, String) {
+    let stub = Stub {
+        script: Arc::new(
+            script
+                .iter()
+                .map(|(q, a)| (q.to_string(), a.clone()))
+                .collect(),
+        ),
+        bearer: bearer.map(str::to_string),
+        requests: Arc::default(),
+    };
+    let app = Router::new()
+        .route(
+            "/api/v1/query",
+            get(
+                |State(s): State<Stub>, h: HeaderMap, Query(p): Query<Vec<(String, String)>>| {
+                    answer(s, "/api/v1/query", h, p)
+                },
+            ),
+        )
+        .route(
+            "/api/v1/query_range",
+            get(
+                |State(s): State<Stub>, h: HeaderMap, Query(p): Query<Vec<(String, String)>>| {
+                    answer(s, "/api/v1/query_range", h, p)
+                },
+            ),
+        )
+        .with_state(stub.clone());
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    (stub, format!("http://{addr}"))
+}
+
+/// An ingest phase whose accounting closes and whose accepted digests equal
+/// the expected ones, so the row passes band 6.
+fn ingest_phase() -> IngestPhase {
+    let digests = ClassDigests {
+        scalar: "d1".to_string(),
+        stale_marker: "d2".to_string(),
+        native_histogram: "d3".to_string(),
+    };
+    IngestPhase {
+        stream_counts: StreamCounts {
+            generated_lines: 10,
+            scalar: 6,
+            native_histogram: 2,
+            stale_marker: 2,
+            malformed: 0,
+        },
+        excluded_native_histogram: 0,
+        excluded_stale_marker: 0,
+        offered_samples: 8,
+        offered_digest: "offered".to_string(),
+        accepted_samples: 8,
+        rejected_samples: 0,
+        offered_histograms: 2,
+        accepted_histograms: 2,
+        rejected_histograms: 0,
+        dropped_histograms: 0,
+        histograms_rejected_by_status: BTreeMap::new(),
+        retry_exhausted_histograms: 0,
+        histograms_retry_exhausted_by_status: BTreeMap::new(),
+        dropped_samples: 0,
+        dropped_batches: 0,
+        rejected_by_status: BTreeMap::new(),
+        retry_exhausted_samples: 0,
+        retry_exhausted_by_status: BTreeMap::new(),
+        unsupported_samples: 0,
+        unsupported_histograms: 0,
+        expected_digests: digests.clone(),
+        accepted_digests: digests,
+        batches: 1,
+        retries: 0,
+        elapsed_secs: 1.0,
+        elapsed_basis: "test fixture".to_string(),
+        generation_secs: 0.0,
+        sender_bound: false,
+        logical_points_per_sec: 10.0,
+        wire_bytes: 100,
+        wire_bytes_per_sec: 100.0,
+        ack_latency_ms: LatencyReport {
+            p50: 1.0,
+            p95: 1.0,
+            p99: 1.0,
+            max: 1.0,
+            count: 1,
+        },
+        peak_rss_bytes: None,
+        cpu_secs: None,
+    }
+}
+
+fn readback(query_url: &str) -> Readback {
+    Readback {
+        query_url: query_url.to_string(),
+        series_count: 1,
+        sample_count: 8,
+        histogram_series_count: None,
+        histogram_sample_count: None,
+        stale_marker_honored: None,
+        expected: ReadbackExpected {
+            series_count: 1,
+            sample_count: 8,
+            histogram_series_count: None,
+            histogram_sample_count: None,
+            stale_marker_honored: None,
+        },
+        mismatches: Vec::new(),
+        matches_expected: true,
+        attempts: 1,
+        settled_after_ms: 0,
+        query_ms: Default::default(),
+        query_windows: Default::default(),
+        query_cost: Default::default(),
+        query_stats: Default::default(),
+    }
+}
+
+struct Urls {
+    prometheus: String,
+    ravel: String,
+    victoriametrics: String,
+    mimir: String,
+}
+
+/// The ingest report the run binds to. Prometheus records its query URL in
+/// its readback; the other engines take theirs from `url=`.
+fn ingest_report(urls: &Urls) -> MetricsIngestReport {
+    let workload_bytes = std::fs::read(workload_path()).expect("workload");
+    let mut prometheus = SystemIngestResult::buffered_http_row(
+        "prometheus",
+        format!("{}/api/v1/write", urls.prometheus),
+        "test",
+        ingest_phase(),
+    );
+    prometheus.readback = Some(readback(&urls.prometheus));
+    let ravel = SystemIngestResult::durable_http_row(
+        "ravel",
+        format!("{}/api/v1/write", urls.ravel),
+        "test",
+        ingest_phase(),
+        BTreeMap::from([
+            (0, "0:17".to_string()),
+            (1, "1:4".to_string()),
+            (2, "2:9".to_string()),
+        ]),
+    );
+    assert_eq!(ravel.last_commit_token.as_deref(), Some(RAVEL_COMMIT_TOKEN));
+    let mut vm_phase = ingest_phase();
+    vm_phase.accepted_histograms = 0;
+    vm_phase.unsupported_histograms = 2;
+    vm_phase.accepted_digests.native_histogram = String::new();
+    let mut victoriametrics = SystemIngestResult::buffered_http_row(
+        "victoriametrics",
+        format!("{}/api/v1/write", urls.victoriametrics),
+        "test",
+        vm_phase,
+    );
+    victoriametrics.unsupported_classes = UNSUPPORTED_CLASSES
+        .iter()
+        .map(|u| UnsupportedClassRecord {
+            class: u.class,
+            source: u.source.to_string(),
+        })
+        .collect();
+    assert_eq!(
+        victoriametrics.unsupported_classes[0].class,
+        PayloadClass::NativeHistogram
+    );
+    let mimir = SystemIngestResult::buffered_http_row(
+        "mimir",
+        format!("{}/api/v1/push", urls.mimir),
+        "test",
+        ingest_phase(),
+    );
+    let mut report = MetricsIngestReport::new(vec![prometheus, ravel, victoriametrics, mimir]);
+    report.profile = Some(ProfileRecord {
+        name: "ci".to_string(),
+        comparable: true,
+        comparability_reason: None,
+        active_series: 1,
+        steps_run: STEPS,
+        steps_declared: STEPS,
+        samples_per_series: STEPS,
+        scrape_interval_secs: 15,
+        duration_secs: STEPS * 15,
+        total_samples: 10,
+        label_cardinalities: BTreeMap::new(),
+        scaling_label: ScalingLabelRecord {
+            name: "instance".to_string(),
+            cardinality_declared: 1,
+        },
+        churn_basis_points_per_hour: 0,
+        families: Vec::new(),
+        run: RunRecord {
+            steps: STEPS,
+            workload_version: Some(2),
+            workload_digest: Some(workload_digest(&workload_bytes)),
+            seed: Some(927_000_933),
+            anchor_ms: Some(ANCHOR_MS),
+            stream_digest: Some("stream-digest-fixture".to_string()),
+            total_series_created: 1,
+            logical_input_bytes: 100,
+            total_samples_generated: 10,
+            scaling_label_cardinality: 1,
+        },
+    });
+    report
+}
+
+fn provenance(corpus_bytes: &[u8]) -> Provenance {
+    let workload_bytes = std::fs::read(workload_path()).expect("workload");
+    let comparator = |name: &str| Comparator {
+        name: name.to_string(),
+        version: "1.0.0".to_string(),
+        image_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .to_string(),
+    };
+    Provenance {
+        schema_version: 3,
+        ravel_git_commit: "9fc85f421590d360e7979ee167eb38e166b45462".to_string(),
+        toolchain: "rustc 1.90.0".to_string(),
+        protocol: "remote_write_1.0".to_string(),
+        hardware: Hardware {
+            os: "Linux 6.8.0 x86_64".to_string(),
+            cpu_model: "test".to_string(),
+            logical_cores: 8,
+            instance_type: None,
+        },
+        backend: Backend {
+            store_backend: "memory".to_string(),
+            region: "n/a".to_string(),
+            endpoint: "n/a".to_string(),
+            backend_bills_requests: false,
+        },
+        comparators: vec![
+            comparator("prometheus"),
+            comparator("victoriametrics"),
+            comparator("mimir"),
+        ],
+        generator_digest: format!("blake3:{}", blake3::hash(&workload_bytes).to_hex()),
+        corpus_digest: format!("blake3:{}", blake3::hash(corpus_bytes).to_hex()),
+        config: Vec::new(),
+        allocator: ravel_bench::allocator::Allocator::System,
+    }
+}
+
+struct Run {
+    output: Output,
+    out: PathBuf,
+    /// Written only by a [`run_bin_corpus`] that asked for it.
+    diagnostics: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+const PASSES: u32 = 5;
+const REPS: u32 = 2;
+const WARMUP: u32 = 1;
+
+/// Writes the fixtures and runs the bin to completion off the runtime, so
+/// the stubs keep serving while it runs.
+async fn run_bin(ingest: MetricsIngestReport, urls: &Urls) -> Run {
+    run_bin_with(ingest, urls, WARMUP, &[]).await
+}
+
+/// [`run_bin`] with `warmup` warmup passes and `extra` arguments appended.
+async fn run_bin_with(
+    ingest: MetricsIngestReport,
+    urls: &Urls,
+    warmup: u32,
+    extra: &[&str],
+) -> Run {
+    run_bin_corpus(ingest, urls, warmup, extra, &corpus(), false).await
+}
+
+/// [`run_bin_with`] over `corpus`, with `--diagnostics` at
+/// [`Run::diagnostics`] when `diagnostics` is set.
+async fn run_bin_corpus(
+    ingest: MetricsIngestReport,
+    urls: &Urls,
+    warmup: u32,
+    extra: &[&str],
+    corpus: &Json,
+    diagnostics: bool,
+) -> Run {
+    run_bin_shape(
+        ingest,
+        urls,
+        warmup,
+        (PASSES, REPS),
+        extra,
+        corpus,
+        diagnostics,
+    )
+    .await
+}
+
+/// [`run_bin_corpus`] with `passes` timed passes of `reps` repetitions.
+async fn run_bin_shape(
+    ingest: MetricsIngestReport,
+    urls: &Urls,
+    warmup: u32,
+    (passes, reps): (u32, u32),
+    extra: &[&str],
+    corpus: &Json,
+    diagnostics: bool,
+) -> Run {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let diagnostics_path = dir.path().join("diagnostics.json");
+    let corpus_bytes = serde_json::to_vec_pretty(corpus).expect("corpus");
+    let corpus_path = dir.path().join("corpus.json");
+    std::fs::write(&corpus_path, &corpus_bytes).expect("write corpus");
+    let ingest_path = dir.path().join("ingest.json");
+    std::fs::write(
+        &ingest_path,
+        serde_json::to_vec_pretty(&ingest).expect("ingest"),
+    )
+    .expect("write ingest");
+    let provenance_path = dir.path().join("provenance.json");
+    std::fs::write(
+        &provenance_path,
+        serde_json::to_vec_pretty(&provenance(&corpus_bytes)).expect("provenance"),
+    )
+    .expect("write provenance");
+    let out = dir.path().join("report.json");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_metricsbench_query"));
+    command
+        .arg("--ingest-report")
+        .arg(&ingest_path)
+        .arg("--workload")
+        .arg(workload_path())
+        .arg("--corpus")
+        .arg(&corpus_path)
+        .arg("--provenance")
+        .arg(&provenance_path)
+        // The prometheus row's readback URL wins over this unreachable one.
+        .args(["--engine", "name=prometheus,url=http://127.0.0.1:9"])
+        .arg("--engine")
+        .arg(format!(
+            "name=ravel,url={},bearer_env={RAVEL_TOKEN_ENV}",
+            urls.ravel
+        ))
+        .arg("--engine")
+        .arg(format!("name=victoriametrics,url={}", urls.victoriametrics))
+        .arg("--engine")
+        .arg(format!("name=mimir,url={}", urls.mimir))
+        .args(["--warmup-passes", &warmup.to_string()])
+        .args(["--passes", &passes.to_string()])
+        .args(["--reps-per-pass", &reps.to_string()])
+        .args(["--query-timeout-ms", "1000"])
+        .args(extra)
+        .arg("--out")
+        .arg(&out)
+        .env(RAVEL_TOKEN_ENV, RAVEL_TOKEN);
+    if diagnostics {
+        command.arg("--diagnostics").arg(&diagnostics_path);
+    }
+    let output =
+        tokio::task::spawn_blocking(move || command.output().expect("run metricsbench_query"))
+            .await
+            .expect("join");
+    Run {
+        output,
+        out,
+        diagnostics: diagnostics_path,
+        _dir: dir,
+    }
+}
+
+struct Stubs {
+    prometheus: Stub,
+    ravel: Stub,
+    victoriametrics: Stub,
+    mimir: Stub,
+    urls: Urls,
+}
+
+async fn stubs() -> Stubs {
+    let (prometheus, p) = spawn_stub(&[], None).await;
+    let (ravel, r) = spawn_stub(&[], Some(RAVEL_TOKEN)).await;
+    let (victoriametrics, v) = spawn_stub(
+        &[(NATIVE_P95, Answer::Empty), (GAUGE, Answer::Diverge)],
+        None,
+    )
+    .await;
+    let (mimir, m) = spawn_stub(
+        &[
+            (JOB_RATE_SUM, Answer::RefuseChunks),
+            (COUNTER_RATE, Answer::Hang),
+        ],
+        None,
+    )
+    .await;
+    Stubs {
+        prometheus,
+        ravel,
+        victoriametrics,
+        mimir,
+        urls: Urls {
+            prometheus: p,
+            ravel: r,
+            victoriametrics: v,
+            mimir: m,
+        },
+    }
+}
+
+fn row<'a>(report: &'a MetricsBenchReport, engine: Engine, id: &str) -> &'a Measurement {
+    report
+        .measurements
+        .iter()
+        .find(|m| m.engine == Some(engine) && m.id == id)
+        .unwrap_or_else(|| panic!("no row for {engine:?}/{id}"))
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_corpus_runs_against_every_engine_and_validates() {
+    let s = stubs().await;
+    let run = run_bin(ingest_report(&s.urls), &s.urls).await;
+    assert!(
+        run.output.status.success(),
+        "metricsbench_query failed: {}",
+        stderr(&run.output)
+    );
+    let text = std::fs::read_to_string(&run.out).expect("report written");
+    let report: MetricsBenchReport = serde_json::from_str(&text).expect("report parses");
+    assert!(!run.diagnostics.exists(), "no --diagnostics, no sidecar");
+
+    let validated = Command::new(env!("CARGO_BIN_EXE_metricsbench_report"))
+        .arg("validate")
+        .arg(&run.out)
+        .output()
+        .expect("run metricsbench_report");
+    assert!(
+        validated.status.success(),
+        "validate refused the output: {}",
+        stderr(&validated)
+    );
+
+    // Every (engine, entry) case is expected, written from the corpus.
+    assert_eq!(report.cases_expected.len(), 16);
+    assert_eq!(config(&report, "oracle_retries_used"), Some("0"));
+    assert_eq!(config(&report, "oracle_retry_entries"), Some("none"));
+
+    use ResultStatus::*;
+    let expected: &[(Engine, &str, ResultStatus)] = &[
+        (Engine::Prometheus, "mb_single_gauge_instant", Ok),
+        (Engine::Prometheus, "mb_single_counter_rate", Ok),
+        (Engine::Prometheus, "mb_selective_job_rate_sum", Ok),
+        (Engine::Prometheus, "mb_histogram_native_p95", Ok),
+        (Engine::Ravel, "mb_single_gauge_instant", Ok),
+        (Engine::Ravel, "mb_single_counter_rate", Ok),
+        (Engine::Ravel, "mb_selective_job_rate_sum", Ok),
+        (Engine::Ravel, "mb_histogram_native_p95", Ok),
+        (
+            Engine::VictoriaMetrics,
+            "mb_single_gauge_instant",
+            Incorrect,
+        ),
+        (Engine::VictoriaMetrics, "mb_single_counter_rate", Ok),
+        (Engine::VictoriaMetrics, "mb_selective_job_rate_sum", Ok),
+        (
+            Engine::VictoriaMetrics,
+            "mb_histogram_native_p95",
+            UnsupportedConstruct,
+        ),
+        (Engine::Mimir, "mb_single_gauge_instant", Ok),
+        (Engine::Mimir, "mb_single_counter_rate", Timeout),
+        (Engine::Mimir, "mb_selective_job_rate_sum", Refused),
+        (Engine::Mimir, "mb_histogram_native_p95", Ok),
+    ];
+    assert_eq!(report.measurements.len(), expected.len());
+    for (engine, id, status) in expected {
+        let m = row(&report, *engine, id);
+        assert_eq!(m.status, *status, "{engine:?}/{id}");
+        assert_eq!(
+            m.pass_statuses,
+            vec![*status; PASSES as usize],
+            "{engine:?}/{id}"
+        );
+        assert_eq!(m.oracle, *engine == Engine::Prometheus, "{engine:?}/{id}");
+    }
+    assert_eq!(
+        row(&report, Engine::Mimir, "mb_selective_job_rate_sum").refusal_reason,
+        Some(RefusalReason::Budget)
+    );
+    assert_eq!(
+        row(&report, Engine::Ravel, "mb_single_counter_rate").query_kind,
+        Some(QueryKind::Range)
+    );
+
+    let denominators: Vec<(Engine, usize, usize, usize, usize)> = report
+        .denominators
+        .iter()
+        .map(|d| {
+            (
+                d.engine,
+                d.corpus,
+                d.correctness,
+                d.timing,
+                d.coverage_success,
+            )
+        })
+        .collect();
+    assert_eq!(
+        denominators,
+        vec![
+            (Engine::Prometheus, 4, 4, 4, 4),
+            (Engine::Ravel, 4, 4, 4, 4),
+            (Engine::VictoriaMetrics, 4, 3, 2, 2),
+            (Engine::Mimir, 4, 2, 2, 2),
+        ]
+    );
+
+    // The bearer header reached Ravel on every query, and the token appears
+    // nowhere in the report or the process output.
+    let ravel_requests = s.ravel.requests();
+    assert!(!ravel_requests.is_empty());
+    for r in &ravel_requests {
+        assert_eq!(
+            r.authorization.as_deref(),
+            Some(format!("Bearer {RAVEL_TOKEN}").as_str())
+        );
+    }
+    assert!(
+        !text.contains(RAVEL_TOKEN),
+        "the bearer token leaked into the report"
+    );
+    assert!(!stderr(&run.output).contains(RAVEL_TOKEN));
+    assert!(!String::from_utf8_lossy(&run.output.stdout).contains(RAVEL_TOKEN));
+    assert!(
+        s.prometheus
+            .requests()
+            .iter()
+            .all(|r| r.authorization.is_none())
+    );
+}
+
+/// Only an `ok` row is timed. Fails against a runner that times every
+/// answered query: the incorrect VictoriaMetrics row and the refused Mimir
+/// row were answered, and carry no latency.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_ok_rows_carry_latency() {
+    let s = stubs().await;
+    let run = run_bin(ingest_report(&s.urls), &s.urls).await;
+    assert!(run.output.status.success(), "{}", stderr(&run.output));
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    for m in &report.measurements {
+        let names: Vec<&str> = m.figures.iter().map(|f| f.name.as_str()).collect();
+        if m.status == ResultStatus::Ok {
+            assert_eq!(names, ["min_ms", "median_ms", "max_ms"], "{}", m.id);
+            assert_eq!(m.pass_medians_ms.len(), PASSES as usize, "{}", m.id);
+            assert_eq!(m.reps_per_pass, Some(REPS), "{}", m.id);
+            assert!(m.rel_mad_pct.is_some(), "{}", m.id);
+        } else {
+            assert!(
+                names.is_empty(),
+                "{:?}/{} carries {names:?}",
+                m.engine,
+                m.id
+            );
+            assert!(m.pass_medians_ms.is_empty(), "{:?}/{}", m.engine, m.id);
+            assert_eq!(m.reps_per_pass, None, "{:?}/{}", m.engine, m.id);
+            assert_eq!(m.rel_mad_pct, None, "{:?}/{}", m.engine, m.id);
+        }
+    }
+    assert!(s.victoriametrics.count("/api/v1/query", GAUGE) > 0);
+}
+
+/// A range entry is one range query per repetition over the whole grid, and
+/// never an instant query per grid point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_range_entry_is_one_range_request_per_repetition() {
+    let s = stubs().await;
+    let run = run_bin(ingest_report(&s.urls), &s.urls).await;
+    assert!(run.output.status.success(), "{}", stderr(&run.output));
+    let per_engine = ((WARMUP + PASSES) * REPS) as usize;
+    // newest = anchor + 119 * 15 s; the ci profile's range_eval is
+    // {start_offset 1485, end_offset 0, step 15}.
+    let newest_s = (ANCHOR_MS + 119 * 15_000) / 1000;
+    // Mimir's counter-rate stub hangs, so each timed pass stops after its
+    // first repetition times out (ADR-0927's 2026-11-06 amendment).
+    let mimir_counter_rate = (WARMUP * REPS + PASSES) as usize;
+    for stub in [&s.prometheus, &s.ravel, &s.victoriametrics, &s.mimir] {
+        for promql in [COUNTER_RATE, JOB_RATE_SUM] {
+            let expected = if std::ptr::eq(stub, &s.mimir) && promql == COUNTER_RATE {
+                mimir_counter_rate
+            } else {
+                per_engine
+            };
+            assert_eq!(stub.count("/api/v1/query_range", promql), expected);
+            assert_eq!(stub.count("/api/v1/query", promql), 0);
+        }
+        for promql in [GAUGE, NATIVE_P95] {
+            assert_eq!(stub.count("/api/v1/query", promql), per_engine);
+            assert_eq!(stub.count("/api/v1/query_range", promql), 0);
+        }
+        for r in stub.requests() {
+            if r.path == "/api/v1/query_range" {
+                assert_eq!(
+                    r.params["start"].parse::<f64>().unwrap(),
+                    (newest_s - 1485) as f64
+                );
+                assert_eq!(r.params["end"].parse::<f64>().unwrap(), newest_s as f64);
+                assert_eq!(r.params["step"], "15000ms");
+            } else {
+                assert_eq!(r.params["time"].parse::<f64>().unwrap(), newest_s as f64);
+            }
+        }
+    }
+}
+
+/// Ravel receives every shard's token from its row's `last_commit_token` on
+/// every query, one `min_commit_token` parameter per token: the query API
+/// decodes each parameter as a single token, so the comma-joined list sent
+/// as one value would be refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ravel_receives_the_full_multi_shard_commit_token() {
+    let s = stubs().await;
+    let run = run_bin(ingest_report(&s.urls), &s.urls).await;
+    assert!(run.output.status.success(), "{}", stderr(&run.output));
+    let requests = s.ravel.requests();
+    assert!(!requests.is_empty());
+    let expected: Vec<String> = RAVEL_COMMIT_TOKEN.split(',').map(str::to_string).collect();
+    assert_eq!(expected.len(), 3);
+    for r in &requests {
+        assert_eq!(r.min_commit_tokens, expected);
+    }
+    for other in [&s.prometheus, &s.victoriametrics, &s.mimir] {
+        assert!(
+            other
+                .requests()
+                .iter()
+                .all(|r| !r.params.contains_key("min_commit_token"))
+        );
+    }
+}
+
+/// An entry reading the native-histogram family is `unsupported_construct`
+/// on VictoriaMetrics, whose ingest row lists the class, before any data
+/// comparison: its empty answer would otherwise classify `incorrect`. The
+/// query is still sent, and the entry stays in the corpus denominator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unsupported_class_entry_is_unsupported_not_incorrect() {
+    let s = stubs().await;
+    let run = run_bin(ingest_report(&s.urls), &s.urls).await;
+    assert!(run.output.status.success(), "{}", stderr(&run.output));
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    let m = row(&report, Engine::VictoriaMetrics, "mb_histogram_native_p95");
+    assert_eq!(m.status, ResultStatus::UnsupportedConstruct);
+    assert!(s.victoriametrics.count("/api/v1/query", NATIVE_P95) > 0);
+    let vm = report
+        .denominators
+        .iter()
+        .find(|d| d.engine == Engine::VictoriaMetrics)
+        .expect("vm denominators");
+    assert_eq!(vm.corpus, 4);
+    // Mimir lists no unsupported class and answers the same entry correctly.
+    assert_eq!(
+        row(&report, Engine::Mimir, "mb_histogram_native_p95").status,
+        ResultStatus::Ok
+    );
+    let err = stderr(&run.output);
+    assert!(
+        err.contains("victoriametrics/mb_histogram_native_p95"),
+        "{err}"
+    );
+    assert!(err.contains("lib/prompb/prompb.go"), "{err}");
+    assert!(err.contains("0 series"), "{err}");
+}
+
+/// A Ravel row whose tokens are all empty refuses to bind rather than
+/// querying Ravel with no read-your-write fence: exit 65, nothing written,
+/// no query sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ravel_row_with_no_commit_token_refuses_the_run() {
+    for joined in [",", ""] {
+        let s = stubs().await;
+        let mut ingest = ingest_report(&s.urls);
+        let ravel = ingest
+            .systems
+            .iter_mut()
+            .find(|r| r.system == "ravel")
+            .expect("ravel row");
+        ravel.commit_tokens_by_shard = None;
+        ravel.last_commit_token = Some(joined.to_string());
+        let run = run_bin(ingest, &s.urls).await;
+        assert_eq!(
+            run.output.status.code(),
+            Some(65),
+            "{joined:?}: {}",
+            stderr(&run.output)
+        );
+        assert!(
+            stderr(&run.output).contains("no commit token"),
+            "{}",
+            stderr(&run.output)
+        );
+        assert!(!run.out.exists());
+        for stub in [&s.prometheus, &s.ravel, &s.victoriametrics, &s.mimir] {
+            assert!(stub.requests().is_empty());
+        }
+    }
+}
+
+/// The per-shard map is the token source when the row carries it: a
+/// `last_commit_token` that disagrees with it is not what Ravel receives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ravel_tokens_come_from_the_per_shard_map() {
+    let s = stubs().await;
+    let mut ingest = ingest_report(&s.urls);
+    let ravel = ingest
+        .systems
+        .iter_mut()
+        .find(|r| r.system == "ravel")
+        .expect("ravel row");
+    ravel.last_commit_token = Some(",".to_string());
+    let run = run_bin(ingest, &s.urls).await;
+    assert!(run.output.status.success(), "{}", stderr(&run.output));
+    let expected: Vec<String> = RAVEL_COMMIT_TOKEN.split(',').map(str::to_string).collect();
+    let requests = s.ravel.requests();
+    assert!(!requests.is_empty());
+    for r in &requests {
+        assert_eq!(r.min_commit_tokens, expected);
+    }
+}
+
+/// A portable ingest row failing band 6 voids the binding: exit 65, the
+/// reason named, nothing written, no query sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_band6_failure_refuses_the_run() {
+    let s = stubs().await;
+    let mut ingest = ingest_report(&s.urls);
+    let mimir = ingest
+        .systems
+        .iter_mut()
+        .find(|r| r.system == "mimir")
+        .expect("mimir row");
+    mimir.ingest.accepted_digests.scalar = "not-the-offered-stream".to_string();
+    let run = run_bin(ingest, &s.urls).await;
+    assert_eq!(
+        run.output.status.code(),
+        Some(65),
+        "{}",
+        stderr(&run.output)
+    );
+    assert!(
+        stderr(&run.output).contains("`mimir` fails band 6"),
+        "{}",
+        stderr(&run.output)
+    );
+    assert!(!run.out.exists());
+    for stub in [&s.prometheus, &s.ravel, &s.victoriametrics, &s.mimir] {
+        assert!(stub.requests().is_empty());
+    }
+}
+
+/// An ingest report from a `--no-in-process-row` run, which holds portable
+/// rows only and says `in_process_row: "skipped"`, binds and runs: `bind`
+/// reads no in-process row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ingest_report_without_the_in_process_row_binds() {
+    let s = stubs().await;
+    let ingest = ingest_report(&s.urls);
+    assert!(ingest.row(IN_PROCESS_SYSTEM).is_none());
+    assert_eq!(ingest.in_process_row, InProcessRow::Skipped);
+    assert_eq!(
+        serde_json::to_value(&ingest).expect("serialize")["in_process_row"],
+        "skipped"
+    );
+    let run = run_bin(ingest, &s.urls).await;
+    assert!(run.output.status.success(), "{}", stderr(&run.output));
+    assert!(run.out.exists());
+}
+
+/// A workload file other than the one the ingest run replayed refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workload_digest_mismatch_refuses_the_run() {
+    let s = stubs().await;
+    let mut ingest = ingest_report(&s.urls);
+    ingest
+        .profile
+        .as_mut()
+        .expect("profile")
+        .run
+        .workload_digest = Some("0".repeat(64));
+    let run = run_bin(ingest, &s.urls).await;
+    assert_eq!(
+        run.output.status.code(),
+        Some(65),
+        "{}",
+        stderr(&run.output)
+    );
+    assert!(
+        stderr(&run.output).contains("run.workload_digest"),
+        "{}",
+        stderr(&run.output)
+    );
+    assert!(!run.out.exists());
+}
+
+/// An oracle that answers empty on an entry not marked intended-empty is a
+/// fixture error and voids the run, naming the entry and the engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_classify_error_voids_the_run() {
+    let mut s = stubs().await;
+    let (prometheus, url) = spawn_stub(&[(GAUGE, Answer::Empty)], None).await;
+    s.prometheus = prometheus;
+    s.urls.prometheus = url;
+    let run = run_bin(ingest_report(&s.urls), &s.urls).await;
+    assert_eq!(
+        run.output.status.code(),
+        Some(65),
+        "{}",
+        stderr(&run.output)
+    );
+    let err = stderr(&run.output);
+    assert!(err.contains("mb_single_gauge_instant"), "{err}");
+    assert!(err.contains("the run is void"), "{err}");
+    assert!(!run.out.exists());
+}
+
+/// The runner hands each entry's `tolerance_ulps` to the comparator. The
+/// checked-in `mb_full_range_avg_over_time` declares one, so Ravel answering
+/// two ULPs off the oracle classifies `ok`; the same entry with its tolerance
+/// removed classifies `incorrect`, because absent means bit-exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_entry_tolerance_reaches_the_comparator() {
+    use ravel_bench::metrics_query::{RunOptions, bind, parse_engine_spec, run};
+
+    let corpus = ravel_bench::promql_corpus::load_corpus(
+        repo_root().join("benchmarks/metrics/metrics.corpus.json"),
+    )
+    .expect("checked-in corpus");
+    let tolerant = corpus
+        .into_iter()
+        .find(|e| e.id == "mb_full_range_avg_over_time")
+        .expect("the full-range entry");
+    assert_eq!(tolerant.tolerance_ulps, Some(1_048_576));
+    let mut exact = tolerant.clone();
+    exact.id = "mb_full_range_avg_over_time_exact".to_string();
+    exact.tolerance_ulps = None;
+
+    let (_prometheus, p) = spawn_stub(&[], None).await;
+    let (_ravel, r) = spawn_stub(&[(&tolerant.promql, Answer::TwoUlps)], Some(RAVEL_TOKEN)).await;
+    let urls = Urls {
+        prometheus: p,
+        ravel: r.clone(),
+        victoriametrics: "http://127.0.0.1:9".to_string(),
+        mimir: "http://127.0.0.1:9".to_string(),
+    };
+    let workload_bytes = std::fs::read(workload_path()).expect("workload");
+    let workload = ravel_bench::metrics_workload::load_workload(workload_path()).expect("workload");
+    let specs = [
+        parse_engine_spec("name=prometheus,url=http://127.0.0.1:9").expect("spec"),
+        parse_engine_spec(&format!("name=ravel,url={r},bearer_env={RAVEL_TOKEN_ENV}"))
+            .expect("spec"),
+    ];
+    let binding = bind(
+        &ingest_report(&urls),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| Some(RAVEL_TOKEN.to_string()),
+    )
+    .expect("bind");
+    let output = run(
+        &binding,
+        &[tolerant, exact],
+        &workload,
+        RunOptions {
+            warmup_passes: 0,
+            passes: 1,
+            reps_per_pass: 1,
+            deadline: Duration::from_secs(5),
+            oracle_retries: 0,
+        },
+    )
+    .await
+    .expect("run");
+    let status = |id: &str| {
+        output
+            .measurements
+            .iter()
+            .find(|m| m.engine == Some(Engine::Ravel) && m.id == id)
+            .unwrap_or_else(|| panic!("no ravel row for {id}"))
+            .status
+    };
+    assert_eq!(status("mb_full_range_avg_over_time"), ResultStatus::Ok);
+    assert_eq!(
+        status("mb_full_range_avg_over_time_exact"),
+        ResultStatus::Incorrect
+    );
+}
+
+/// Runs one checked-in corpus entry with Ravel answering `ravel_answer` and
+/// the Prometheus oracle answering correctly, and returns Ravel's status.
+async fn ravel_status_on_checked_in_entry(id: &str, ravel_answer: Answer) -> ResultStatus {
+    use ravel_bench::metrics_query::{RunOptions, bind, parse_engine_spec, run};
+
+    let entry = ravel_bench::promql_corpus::load_corpus(
+        repo_root().join("benchmarks/metrics/metrics.corpus.json"),
+    )
+    .expect("checked-in corpus")
+    .into_iter()
+    .find(|e| e.id == id)
+    .unwrap_or_else(|| panic!("{id} in the checked-in corpus"));
+    let (_prometheus, p) = spawn_stub(&[], None).await;
+    let (_ravel, r) = spawn_stub(&[(&entry.promql, ravel_answer)], Some(RAVEL_TOKEN)).await;
+    let urls = Urls {
+        prometheus: p,
+        ravel: r.clone(),
+        victoriametrics: "http://127.0.0.1:9".to_string(),
+        mimir: "http://127.0.0.1:9".to_string(),
+    };
+    let workload_bytes = std::fs::read(workload_path()).expect("workload");
+    let workload = ravel_bench::metrics_workload::load_workload(workload_path()).expect("workload");
+    let specs = [
+        parse_engine_spec("name=prometheus,url=http://127.0.0.1:9").expect("spec"),
+        parse_engine_spec(&format!("name=ravel,url={r},bearer_env={RAVEL_TOKEN_ENV}"))
+            .expect("spec"),
+    ];
+    let binding = bind(
+        &ingest_report(&urls),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| Some(RAVEL_TOKEN.to_string()),
+    )
+    .expect("bind");
+    let output = run(
+        &binding,
+        &[entry],
+        &workload,
+        RunOptions {
+            warmup_passes: 0,
+            passes: 1,
+            reps_per_pass: 1,
+            deadline: Duration::from_secs(5),
+            oracle_retries: 0,
+        },
+    )
+    .await
+    .expect("run");
+    output
+        .measurements
+        .iter()
+        .find(|m| m.engine == Some(Engine::Ravel) && m.id == id)
+        .unwrap_or_else(|| panic!("no ravel row for {id}"))
+        .status
+}
+
+/// Corpus version 4 gives `mb_fanout_total_rate` a summation-order tolerance
+/// of 2^20 ULPs, and the runner applies it: a one-ULP gap, the size measured
+/// on ci, classifies `ok`, while a gap of 2^40 ULPs, far below the smallest
+/// VictoriaMetrics gap measured on that entry (about 1.4e15), still
+/// classifies `incorrect`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_summation_tolerance_admits_last_bit_residue_and_not_a_semantic_gap() {
+    assert_eq!(
+        ravel_status_on_checked_in_entry("mb_fanout_total_rate", Answer::UlpsAbove(1)).await,
+        ResultStatus::Ok
+    );
+    assert_eq!(
+        ravel_status_on_checked_in_entry("mb_fanout_total_rate", Answer::UlpsAbove(1 << 40)).await,
+        ResultStatus::Incorrect
+    );
+}
+
+/// ADR-0927's 2026-11-04 amendment, decision 1: the report's provenance
+/// config names the run's one regime, `steady-state`, exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_provenance_config_records_the_steady_state_regime_once() {
+    let s = stubs().await;
+    let run = run_bin(ingest_report(&s.urls), &s.urls).await;
+    assert!(
+        run.output.status.success(),
+        "metricsbench_query failed: {}",
+        stderr(&run.output)
+    );
+    let text = std::fs::read_to_string(&run.out).expect("report written");
+    let report: MetricsBenchReport = serde_json::from_str(&text).expect("report parses");
+    let regimes: Vec<&str> = report
+        .provenance
+        .config
+        .iter()
+        .filter(|c| c.key == "regime")
+        .map(|c| c.value.as_str())
+        .collect();
+    assert_eq!(regimes, vec!["steady-state"]);
+}
+
+fn config<'a>(report: &'a MetricsBenchReport, key: &str) -> Option<&'a str> {
+    report
+        .provenance
+        .config
+        .iter()
+        .find(|c| c.key == key)
+        .map(|c| c.value.as_str())
+}
+
+/// An oracle query that times out once is re-sent, and the run completes:
+/// the other engines are classified against the retried answer, the
+/// provenance config records one retry on the entry, and Prometheus' own row
+/// keeps the first attempt's timeout. The diagnostics sidecar records the
+/// retry's entry, pass, repetition and attempt. Fails against a runner that does not
+/// retry (the run is void) and against one that records the retried
+/// attempt on Prometheus' row (every pass would be `ok`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oracle_timeout_is_retried_and_prometheus_keeps_its_first_attempt() {
+    let mut s = stubs().await;
+    let (prometheus, url) = spawn_stub(&[(GAUGE, Answer::HangFirst(1))], None).await;
+    s.prometheus = prometheus;
+    s.urls.prometheus = url;
+    let run = run_bin_corpus(ingest_report(&s.urls), &s.urls, 0, &[], &corpus(), true).await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    let diagnostics: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    assert_eq!(
+        diagnostics["oracle_retries"],
+        json!([{"entry": "mb_single_gauge_instant", "pass": 1, "repetition": 1, "attempt": 2}])
+    );
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+
+    assert_eq!(config(&report, "oracle_retries"), Some("2"));
+    assert_eq!(config(&report, "oracle_retries_used"), Some("1"));
+    assert_eq!(
+        config(&report, "oracle_retry_entries"),
+        Some("mb_single_gauge_instant")
+    );
+    assert!(
+        err.contains(
+            "oracle retry: entry `mb_single_gauge_instant`, pass 1, repetition 1, attempt 2 of 3"
+        ),
+        "{err}"
+    );
+    // One request per repetition, less pass 1's second (Prometheus' own
+    // first attempt timed out, so its pass stopped there), plus the one
+    // retry, which answers the oracle and is not a repetition.
+    assert_eq!(
+        s.prometheus.count("/api/v1/query", GAUGE),
+        (PASSES * REPS) as usize - 1 + 1
+    );
+    assert_eq!(
+        diagnostics["skipped_reps"],
+        json!([{"engine": "prometheus", "entry": "mb_single_gauge_instant", "pass": 1, "rep": 2, "timed_out_rep": 1},
+               {"engine": "mimir", "entry": "mb_single_counter_rate", "pass": 1, "rep": 2, "timed_out_rep": 1},
+               {"engine": "mimir", "entry": "mb_single_counter_rate", "pass": 2, "rep": 2, "timed_out_rep": 1},
+               {"engine": "mimir", "entry": "mb_single_counter_rate", "pass": 3, "rep": 2, "timed_out_rep": 1},
+               {"engine": "mimir", "entry": "mb_single_counter_rate", "pass": 4, "rep": 2, "timed_out_rep": 1},
+               {"engine": "mimir", "entry": "mb_single_counter_rate", "pass": 5, "rep": 2, "timed_out_rep": 1}])
+    );
+
+    let p = row(&report, Engine::Prometheus, "mb_single_gauge_instant");
+    assert_eq!(p.pass_statuses[0], ResultStatus::Timeout);
+    assert!(
+        p.pass_statuses[1..].iter().all(|s| *s == ResultStatus::Ok),
+        "{:?}",
+        p.pass_statuses
+    );
+    assert_ne!(p.status, ResultStatus::Ok);
+    for (engine, status) in [
+        (Engine::Ravel, ResultStatus::Ok),
+        (Engine::VictoriaMetrics, ResultStatus::Incorrect),
+        (Engine::Mimir, ResultStatus::Ok),
+    ] {
+        let m = row(&report, engine, "mb_single_gauge_instant");
+        assert_eq!(m.pass_statuses, vec![status; PASSES as usize], "{engine:?}");
+    }
+
+    let validated = Command::new(env!("CARGO_BIN_EXE_metricsbench_report"))
+        .arg("validate")
+        .arg(&run.out)
+        .output()
+        .expect("run metricsbench_report");
+    assert!(validated.status.success(), "{}", stderr(&validated));
+}
+
+/// An oracle that times out on every attempt the budget allows voids the
+/// run as an unretried failure does: exit 65, nothing written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oracle_timeout_past_the_retry_budget_voids_the_run() {
+    let mut s = stubs().await;
+    let (prometheus, url) = spawn_stub(&[(GAUGE, Answer::HangFirst(2))], None).await;
+    s.prometheus = prometheus;
+    s.urls.prometheus = url;
+    let run = run_bin_with(
+        ingest_report(&s.urls),
+        &s.urls,
+        0,
+        &["--oracle-retries", "1"],
+    )
+    .await;
+    let err = stderr(&run.output);
+    assert_eq!(run.output.status.code(), Some(65), "{err}");
+    assert!(err.contains("the run is void"), "{err}");
+    assert!(err.contains("mb_single_gauge_instant"), "{err}");
+    assert!(err.contains("oracle timed out"), "{err}");
+    assert!(!run.out.exists());
+    assert_eq!(s.prometheus.count("/api/v1/query", GAUGE), 2);
+}
+
+/// A 4xx from the oracle is an answer, not a lost request: it is not
+/// retried and voids the run. Fails against a runner that retries every
+/// non-`ok` oracle outcome (three requests would reach the stub).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oracle_4xx_is_not_retried() {
+    let mut s = stubs().await;
+    let (prometheus, url) = spawn_stub(&[(GAUGE, Answer::RefuseChunks)], None).await;
+    s.prometheus = prometheus;
+    s.urls.prometheus = url;
+    let run = run_bin_with(ingest_report(&s.urls), &s.urls, 0, &[]).await;
+    let err = stderr(&run.output);
+    assert_eq!(run.output.status.code(), Some(65), "{err}");
+    assert!(err.contains("oracle answered HTTP 422"), "{err}");
+    assert!(!err.contains("oracle retry"), "{err}");
+    assert!(!run.out.exists());
+    assert_eq!(s.prometheus.count("/api/v1/query", GAUGE), 1);
+}
+
+/// The diagnostics sidecar's `ulp_gaps` entry for (`entry`, `engine`).
+fn ulp_gap<'a>(diagnostics: &'a Json, entry: &str, engine: &str) -> &'a Json {
+    diagnostics["ulp_gaps"]
+        .as_array()
+        .expect("ulp_gaps")
+        .iter()
+        .find(|g| g["entry"] == entry && g["engine"] == engine)
+        .unwrap_or_else(|| panic!("no ulp gap for {engine}/{entry}"))
+}
+
+/// `--diagnostics` writes each non-oracle engine's largest ULP gap to the
+/// oracle per entry, over every step, repetition and pass. Ravel answers
+/// the range entry one ULP off at its first step and three at its second,
+/// inside the entry's 16-ULP tolerance, so the row is `ok` and the gap is 3:
+/// fails against a sidecar that keeps the first step's distance (1) and
+/// against one that writes 0 whenever the comparator matched. Ravel's
+/// two-ULP instant answer records 2, an exact answer 0, and a refusal, a
+/// timeout and an unsupported-by-declaration entry null.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_diagnostics_sidecar_records_the_largest_ulp_gap() {
+    let mut s = stubs().await;
+    let (ravel, r) = spawn_stub(
+        &[(COUNTER_RATE, Answer::RampUlps), (GAUGE, Answer::TwoUlps)],
+        Some(RAVEL_TOKEN),
+    )
+    .await;
+    s.ravel = ravel;
+    s.urls.ravel = r;
+    let mut corpus = corpus();
+    let entry = &mut corpus["entries"][1];
+    assert_eq!(entry["id"], "mb_single_counter_rate");
+    entry["tolerance_ulps"] = json!(16);
+    entry["modified"] = json!({"modified": {"reason": "diagnostics test tolerance"}});
+    let run = run_bin_corpus(ingest_report(&s.urls), &s.urls, 0, &[], &corpus, true).await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    assert_eq!(
+        row(&report, Engine::Ravel, "mb_single_counter_rate").status,
+        ResultStatus::Ok
+    );
+    assert_eq!(
+        row(&report, Engine::Ravel, "mb_single_gauge_instant").status,
+        ResultStatus::Incorrect
+    );
+
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    assert_eq!(d["profile"], "ci");
+    assert_eq!(d["oracle"], "prometheus");
+    let corpus_bytes = serde_json::to_vec_pretty(&corpus).expect("corpus");
+    assert_eq!(
+        d["corpus_digest"],
+        format!("blake3:{}", blake3::hash(&corpus_bytes).to_hex())
+    );
+    assert_eq!(d["oracle_retries"], json!([]));
+    // Three non-oracle engines by four entries; the oracle has none.
+    assert_eq!(d["ulp_gaps"].as_array().expect("ulp_gaps").len(), 12);
+
+    let answers = u64::from(PASSES * REPS);
+    let ramp = ulp_gap(&d, "mb_single_counter_rate", "ravel");
+    assert_eq!(ramp["max_ulps"], 3, "{ramp}");
+    assert_eq!(ramp["aligned_answers"], answers);
+    assert_eq!(ramp["unaligned_answers"], 0);
+    assert_eq!(ramp["value_pairs"], 2 * answers);
+    assert_eq!(ramp["non_finite_mismatches"], 0);
+    assert_eq!(
+        ulp_gap(&d, "mb_single_gauge_instant", "ravel")["max_ulps"],
+        2
+    );
+    let exact = ulp_gap(&d, "mb_selective_job_rate_sum", "ravel");
+    assert_eq!(exact["max_ulps"], 0, "{exact}");
+    assert_eq!(exact["aligned_answers"], answers);
+    assert_eq!(
+        ulp_gap(&d, "mb_single_counter_rate", "victoriametrics")["max_ulps"],
+        0
+    );
+
+    // Mimir's counter-rate timeout stops each pass after its first
+    // repetition, so only one answer per pass is sent and counted.
+    for (entry, engine, unaligned) in [
+        ("mb_selective_job_rate_sum", "mimir", answers),
+        ("mb_single_counter_rate", "mimir", u64::from(PASSES)),
+        ("mb_histogram_native_p95", "victoriametrics", 0),
+    ] {
+        let gap = ulp_gap(&d, entry, engine);
+        assert_eq!(gap["max_ulps"], Json::Null, "{engine}/{entry}: {gap}");
+        assert_eq!(gap["aligned_answers"], 0, "{engine}/{entry}: {gap}");
+        assert_eq!(
+            gap["unaligned_answers"], unaligned,
+            "{engine}/{entry}: {gap}"
+        );
+    }
+    let diverged = ulp_gap(&d, "mb_single_gauge_instant", "victoriametrics");
+    assert!(
+        diverged["max_ulps"].as_u64().expect("aligned") > 1 << 40,
+        "{diverged}"
+    );
+}
+
+/// Every `ravel_cost` entry for one corpus entry, in no particular order.
+fn ravel_cost_entries<'a>(diagnostics: &'a Json, entry: &str) -> Vec<&'a Json> {
+    diagnostics["ravel_cost"]
+        .as_array()
+        .expect("ravel_cost")
+        .iter()
+        .filter(|c| c["entry"] == entry)
+        .collect()
+}
+
+/// `--diagnostics` carries Ravel's own per-query object-store cost
+/// (ADR-0927's 2026-11-04 amendment, decision 4), read straight off
+/// `data.stats.accounting` and `data.stats.phases` of each answer, one
+/// `ravel_cost` entry per timed repetition.
+///
+/// TO SEE THIS FAIL: record only the first repetition of each pass instead
+/// of every repetition -- the `entries.len()` assertion drops from
+/// `PASSES * REPS` to `PASSES`, and the pass-set assertion still passes,
+/// so the length check is the one that catches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ravel_cost_records_every_repetitions_accounting_and_phases() {
+    let mut s = stubs().await;
+    let accounting = json!({"s3GetRequests": 7, "s3GetBytes": 4096, "s3ListRequests": 1});
+    let phases = json!([{"phase": "scan", "s3GetRequests": 7, "s3GetWireBytes": 4096}]);
+    let stats = json!({"accounting": accounting, "phases": phases});
+    let (ravel, r) = spawn_stub(
+        &[(GAUGE, Answer::WithStats(stats.clone()))],
+        Some(RAVEL_TOKEN),
+    )
+    .await;
+    s.ravel = ravel;
+    s.urls.ravel = r;
+    let run = run_bin_corpus(ingest_report(&s.urls), &s.urls, 0, &[], &corpus(), true).await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    assert_eq!(
+        row(&report, Engine::Ravel, "mb_single_gauge_instant").status,
+        ResultStatus::Ok
+    );
+
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    assert!(
+        d["ravel_cost_note"]
+            .as_str()
+            .expect("note")
+            .contains("logical"),
+        "{}",
+        d["ravel_cost_note"]
+    );
+    let entries = ravel_cost_entries(&d, "mb_single_gauge_instant");
+    assert_eq!(entries.len(), (PASSES * REPS) as usize, "{entries:?}");
+    let mut passes: Vec<u64> = entries
+        .iter()
+        .map(|c| c["pass"].as_u64().expect("pass"))
+        .collect();
+    passes.sort_unstable();
+    passes.dedup();
+    assert_eq!(passes, (1..=u64::from(PASSES)).collect::<Vec<_>>());
+    for c in &entries {
+        assert_eq!(c["status"], "ok", "{c}");
+        assert_eq!(c["accounting"], stats["accounting"], "{c}");
+        assert_eq!(c["phases"], stats["phases"], "{c}");
+    }
+}
+
+/// `ravel_cost` is Ravel's alone, never a comparator's: the corpus' four
+/// entries by Ravel's one engine, over every timed pass and repetition.
+///
+/// TO SEE THIS FAIL: push a `ravel_cost` entry for every engine instead of
+/// Ravel only -- the length below would be four times the asserted value
+/// (one multiple per comparator engine the corpus runs against).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ravel_cost_excludes_comparator_answers() {
+    let s = stubs().await;
+    let run = run_bin_corpus(ingest_report(&s.urls), &s.urls, 0, &[], &corpus(), true).await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    // `MetricsBenchReport` denies unknown fields, so this parse alone proves
+    // the sidecar's new field never leaked into report.json.
+    let _: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    let cost = d["ravel_cost"].as_array().expect("ravel_cost");
+    assert_eq!(cost.len(), 4 * (PASSES * REPS) as usize, "{cost:?}");
+}
+
+/// A Ravel answer with no `data.stats` at all -- here, a timeout -- still
+/// gets a `ravel_cost` entry, with `accounting` and `phases` null and its
+/// real status, never silently omitted.
+///
+/// TO SEE THIS FAIL: skip the `ravel_cost` push when the answer carries no
+/// `data.stats` instead of recording the nulls -- the `entries.len()`
+/// assertion drops to zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ravel_cost_records_null_on_an_answer_with_no_stats() {
+    let mut s = stubs().await;
+    let (ravel, r) = spawn_stub(&[(COUNTER_RATE, Answer::Hang)], Some(RAVEL_TOKEN)).await;
+    s.ravel = ravel;
+    s.urls.ravel = r;
+    let run = run_bin_corpus(ingest_report(&s.urls), &s.urls, 0, &[], &corpus(), true).await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    assert_eq!(
+        row(&report, Engine::Ravel, "mb_single_counter_rate").status,
+        ResultStatus::Timeout
+    );
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    // One record per pass: each pass stops after its first repetition
+    // times out (ADR-0927's 2026-11-06 amendment).
+    let entries = ravel_cost_entries(&d, "mb_single_counter_rate");
+    assert_eq!(entries.len(), PASSES as usize, "{entries:?}");
+    for c in &entries {
+        assert_eq!(c["rep"], 1, "{c}");
+        assert_eq!(c["status"], "timeout", "{c}");
+        assert_eq!(c["accounting"], Json::Null, "{c}");
+        assert_eq!(c["phases"], Json::Null, "{c}");
+    }
+}
+
+/// A Ravel repetition whose entry is unsupported by declaration (the Ravel
+/// ingest row lists the native-histogram class) still gets a `ravel_cost`
+/// record for every timed pass and repetition, with status
+/// `unsupported_construct` and `accounting` and `phases` null, since the
+/// stub's answer carries no `data.stats`.
+///
+/// TO SEE THIS FAIL: drop the `ravel_cost` push from the unsupported branch
+/// of the repetition loop -- the `entries.len()` assertion drops from
+/// `PASSES * REPS` to zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ravel_cost_records_an_unsupported_entry_for_every_repetition() {
+    let s = stubs().await;
+    let mut ingest = ingest_report(&s.urls);
+    let ravel_row = ingest
+        .systems
+        .iter_mut()
+        .find(|r| r.system == "ravel")
+        .expect("ravel row");
+    ravel_row.unsupported_classes = UNSUPPORTED_CLASSES
+        .iter()
+        .map(|u| UnsupportedClassRecord {
+            class: u.class,
+            source: u.source.to_string(),
+        })
+        .collect();
+    let run = run_bin_corpus(ingest, &s.urls, 0, &[], &corpus(), true).await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    assert_eq!(
+        row(&report, Engine::Ravel, "mb_histogram_native_p95").status,
+        ResultStatus::UnsupportedConstruct
+    );
+    assert!(s.ravel.count("/api/v1/query", NATIVE_P95) > 0);
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    let entries = ravel_cost_entries(&d, "mb_histogram_native_p95");
+    assert_eq!(entries.len(), (PASSES * REPS) as usize, "{entries:?}");
+    let mut seen: Vec<(u64, u64)> = entries
+        .iter()
+        .map(|c| {
+            (
+                c["pass"].as_u64().expect("pass"),
+                c["rep"].as_u64().expect("rep"),
+            )
+        })
+        .collect();
+    seen.sort_unstable();
+    let expected: Vec<(u64, u64)> = (1..=u64::from(PASSES))
+        .flat_map(|pass| (1..=u64::from(REPS)).map(move |rep| (pass, rep)))
+        .collect();
+    assert_eq!(seen, expected);
+    for c in &entries {
+        assert_eq!(c["status"], "unsupported_construct", "{c}");
+        assert_eq!(c["accounting"], Json::Null, "{c}");
+        assert_eq!(c["phases"], Json::Null, "{c}");
+    }
+}
+
+/// The 0-based request number a [`Answer::Numbered`] answer stamped on a
+/// `ravel_cost` record.
+fn request_number(c: &Json) -> u64 {
+    c["accounting"]["request"].as_u64().expect("request")
+}
+
+/// Warm-up passes add nothing to `ravel_cost`, and `pass` and `rep` count
+/// from 1: with one warm-up pass, the records for an entry are exactly the
+/// timed requests, the first timed request is pass 1 rep 1, and every
+/// (pass, rep) in `1..=PASSES` x `1..=REPS` appears once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ravel_cost_skips_warmup_passes_and_counts_from_one() {
+    let mut s = stubs().await;
+    let (ravel, r) = spawn_stub(
+        &[(GAUGE, Answer::Numbered { step_ms: 1 })],
+        Some(RAVEL_TOKEN),
+    )
+    .await;
+    s.ravel = ravel;
+    s.urls.ravel = r;
+    let run = run_bin_corpus(
+        ingest_report(&s.urls),
+        &s.urls,
+        WARMUP,
+        &[],
+        &corpus(),
+        true,
+    )
+    .await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    let entries = ravel_cost_entries(&d, "mb_single_gauge_instant");
+    assert_eq!(entries.len(), (PASSES * REPS) as usize, "{entries:?}");
+    let mut seen: Vec<(u64, u64, u64)> = entries
+        .iter()
+        .map(|c| {
+            (
+                c["pass"].as_u64().expect("pass"),
+                c["rep"].as_u64().expect("rep"),
+                request_number(c),
+            )
+        })
+        .collect();
+    seen.sort_unstable();
+    let expected: Vec<(u64, u64, u64)> = (1..=u64::from(PASSES))
+        .flat_map(|pass| {
+            (1..=u64::from(REPS)).map(move |rep| {
+                let warmup_requests = u64::from(WARMUP * REPS);
+                (
+                    pass,
+                    rep,
+                    warmup_requests + (pass - 1) * u64::from(REPS) + (rep - 1),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(seen, expected);
+}
+
+/// Each `ravel_cost` record's `latency_ms` is that repetition's own elapsed
+/// time: the stub delays request `n` (from 1) by `n * 20` ms, so every record
+/// is at least its own request's delay, and the median of a pass's records
+/// equals the pass median `report.json` carries for that pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ravel_cost_latency_is_the_repetitions_own() {
+    const STEP_MS: u64 = 20;
+    let mut s = stubs().await;
+    let (ravel, r) = spawn_stub(
+        &[(GAUGE, Answer::Numbered { step_ms: STEP_MS })],
+        Some(RAVEL_TOKEN),
+    )
+    .await;
+    s.ravel = ravel;
+    s.urls.ravel = r;
+    let run = run_bin_corpus(ingest_report(&s.urls), &s.urls, 0, &[], &corpus(), true).await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    let ravel_row = row(&report, Engine::Ravel, "mb_single_gauge_instant");
+    assert_eq!(ravel_row.status, ResultStatus::Ok);
+    assert_eq!(ravel_row.pass_medians_ms.len(), PASSES as usize);
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    let entries = ravel_cost_entries(&d, "mb_single_gauge_instant");
+    assert_eq!(entries.len(), (PASSES * REPS) as usize, "{entries:?}");
+    for c in &entries {
+        let latency = c["latency_ms"].as_f64().expect("latency_ms");
+        let floor = (STEP_MS * (request_number(c) + 1)) as f64;
+        assert!(
+            latency >= floor,
+            "{c}: below its own request's {floor} ms delay"
+        );
+    }
+    for pass in 1..=u64::from(PASSES) {
+        let mut latencies: Vec<f64> = entries
+            .iter()
+            .filter(|c| c["pass"] == pass)
+            .map(|c| c["latency_ms"].as_f64().expect("latency_ms"))
+            .collect();
+        latencies.sort_by(f64::total_cmp);
+        assert_eq!(latencies.len(), REPS as usize, "pass {pass}");
+        let mid = latencies.len() / 2;
+        let median = if latencies.len().is_multiple_of(2) {
+            (latencies[mid - 1] + latencies[mid]) / 2.0
+        } else {
+            latencies[mid]
+        };
+        // serde_json's default float parse can land one ULP off the
+        // written value, so this compares to a relative 1e-12, far below the
+        // 20 ms gap between two repetitions.
+        let reported = ravel_row.pass_medians_ms[(pass - 1) as usize];
+        assert!(
+            (median - reported).abs() <= reported.abs() * 1e-12,
+            "pass {pass}: {latencies:?} vs {:?}",
+            ravel_row.pass_medians_ms
+        );
+    }
+}
+
+/// The `skipped_reps` records for (`engine`, `entry`), in the order written.
+fn skipped_reps<'a>(diagnostics: &'a Json, engine: &str, entry: &str) -> Vec<&'a Json> {
+    diagnostics["skipped_reps"]
+        .as_array()
+        .expect("skipped_reps")
+        .iter()
+        .filter(|s| s["engine"] == engine && s["entry"] == entry)
+        .collect()
+}
+
+/// The pass and repetition counts of the skip tests below.
+const SKIP_SHAPE: (u32, u32) = (2, 3);
+
+/// ADR-0927's 2026-11-06 amendment: once an engine's timed repetition of an
+/// entry times out, the rest of that pass is not sent and each repetition
+/// left out is a `skipped_reps` record. Mimir's counter-rate stub always
+/// hangs: with one warm-up pass, two timed passes and three repetitions, it
+/// receives all three warm-up requests and one timed request per pass, the
+/// sidecar lists repetitions 2 and 3 of both passes against timed-out
+/// repetition 1, and both passes are `timeout`. The oracle on the same entry
+/// gets every repetition.
+///
+/// TO SEE THIS FAIL: skip every later pass after a timeout, and the Mimir
+/// count drops to 4 and pass 2's records go; skip warm-up repetitions after
+/// a warm-up timeout, and it drops to 3; skip without recording, and the run
+/// fails its repetition accounting (no report, `success()` flips).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timed_out_repetition_ends_its_pass_for_that_engine() {
+    let s = stubs().await;
+    let (passes, reps) = SKIP_SHAPE;
+    let run = run_bin_shape(
+        ingest_report(&s.urls),
+        &s.urls,
+        1,
+        SKIP_SHAPE,
+        &[],
+        &corpus(),
+        true,
+    )
+    .await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    assert_eq!(
+        s.mimir.count("/api/v1/query_range", COUNTER_RATE),
+        (reps + passes) as usize
+    );
+    assert_eq!(
+        s.prometheus.count("/api/v1/query_range", COUNTER_RATE),
+        (reps + passes * reps) as usize
+    );
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    let expected: Vec<Json> = (1..=passes)
+        .flat_map(|pass| {
+            (2..=reps).map(move |rep| {
+                json!({"engine": "mimir", "entry": "mb_single_counter_rate",
+                       "pass": pass, "rep": rep, "timed_out_rep": 1})
+            })
+        })
+        .collect();
+    assert_eq!(d["skipped_reps"], Json::Array(expected));
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    let m = row(&report, Engine::Mimir, "mb_single_counter_rate");
+    assert_eq!(m.status, ResultStatus::Timeout);
+    assert_eq!(
+        m.pass_statuses,
+        vec![ResultStatus::Timeout; passes as usize]
+    );
+    assert_eq!(
+        ulp_gap(&d, "mb_single_counter_rate", "mimir")["unaligned_answers"],
+        passes
+    );
+}
+
+/// A pass that times out after an `ok` repetition is `timeout` (its first
+/// non-`ok` repetition), leaves out only the repetitions after the timeout,
+/// and the next pass starts again at repetition 1. Ravel answers the gauge
+/// correctly, then hangs, then answers correctly from then on.
+///
+/// TO SEE THIS FAIL: skip every later pass after a timeout, and Ravel
+/// receives 2 requests instead of 5 and pass 2's `ravel_cost` records go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timeout_mid_pass_skips_the_rest_and_the_next_pass_restarts() {
+    let mut s = stubs().await;
+    let (ravel, r) = spawn_stub(
+        &[(
+            GAUGE,
+            Answer::Sequence(vec![Answer::Correct, Answer::Hang, Answer::Correct]),
+        )],
+        Some(RAVEL_TOKEN),
+    )
+    .await;
+    s.ravel = ravel;
+    s.urls.ravel = r;
+    let run = run_bin_shape(
+        ingest_report(&s.urls),
+        &s.urls,
+        0,
+        SKIP_SHAPE,
+        &[],
+        &corpus(),
+        true,
+    )
+    .await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    assert_eq!(s.ravel.count("/api/v1/query", GAUGE), 5);
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    assert_eq!(
+        skipped_reps(&d, "ravel", "mb_single_gauge_instant"),
+        vec![
+            &json!({"engine": "ravel", "entry": "mb_single_gauge_instant",
+                     "pass": 1, "rep": 3, "timed_out_rep": 2})
+        ]
+    );
+    let mut sent: Vec<(u64, u64, String)> = ravel_cost_entries(&d, "mb_single_gauge_instant")
+        .iter()
+        .map(|c| {
+            (
+                c["pass"].as_u64().expect("pass"),
+                c["rep"].as_u64().expect("rep"),
+                c["status"].as_str().expect("status").to_string(),
+            )
+        })
+        .collect();
+    sent.sort();
+    let ok = || "ok".to_string();
+    assert_eq!(
+        sent,
+        vec![
+            (1, 1, ok()),
+            (1, 2, "timeout".to_string()),
+            (2, 1, ok()),
+            (2, 2, ok()),
+            (2, 3, ok()),
+        ]
+    );
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    let m = row(&report, Engine::Ravel, "mb_single_gauge_instant");
+    assert_eq!(
+        m.pass_statuses,
+        vec![ResultStatus::Timeout, ResultStatus::Ok]
+    );
+    assert_eq!(m.status, ResultStatus::Timeout);
+}
+
+/// Only `timeout` ends a pass early: VictoriaMetrics answers the gauge
+/// wrongly on every repetition and still receives every one, warm-up and
+/// timed, and nothing is skipped anywhere (Mimir's hang is replaced by a
+/// correct stub here).
+///
+/// TO SEE THIS FAIL: also skip after an `incorrect` repetition, and the
+/// VictoriaMetrics count drops from 9 to 5 and `skipped_reps` is not empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_incorrect_repetition_does_not_end_its_pass() {
+    let mut s = stubs().await;
+    let (mimir, m) = spawn_stub(&[(JOB_RATE_SUM, Answer::RefuseChunks)], None).await;
+    s.mimir = mimir;
+    s.urls.mimir = m;
+    let (passes, reps) = SKIP_SHAPE;
+    let run = run_bin_shape(
+        ingest_report(&s.urls),
+        &s.urls,
+        1,
+        SKIP_SHAPE,
+        &[],
+        &corpus(),
+        true,
+    )
+    .await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    let all = (reps + passes * reps) as usize;
+    assert_eq!(s.victoriametrics.count("/api/v1/query", GAUGE), all);
+    assert_eq!(s.mimir.count("/api/v1/query_range", JOB_RATE_SUM), all);
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    assert_eq!(d["skipped_reps"], json!([]));
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    assert_eq!(
+        row(&report, Engine::VictoriaMetrics, "mb_single_gauge_instant").status,
+        ResultStatus::Incorrect
+    );
+    assert_eq!(
+        row(&report, Engine::Mimir, "mb_selective_job_rate_sum").status,
+        ResultStatus::Refused
+    );
+}
+
+/// An ingest report whose row failed its read-back binds no query run: the
+/// bin prints such a report for diagnosis, and a `readback_error` or a
+/// `readback` that did not match refuses the bind naming the row.
+///
+/// TO SEE THIS FAIL: drop the read-back check from `bind`'s row loop: both
+/// marked reports then bind.
+#[test]
+fn a_report_whose_readback_failed_does_not_bind() {
+    use ravel_bench::metrics_query::{BindError, bind, parse_engine_spec};
+
+    let urls = Urls {
+        prometheus: "http://127.0.0.1:9".to_string(),
+        ravel: "http://127.0.0.1:9".to_string(),
+        victoriametrics: "http://127.0.0.1:9".to_string(),
+        mimir: "http://127.0.0.1:9".to_string(),
+    };
+    let workload_bytes = std::fs::read(workload_path()).expect("workload");
+    let workload = ravel_bench::metrics_workload::load_workload(workload_path()).expect("workload");
+    let specs = [parse_engine_spec("name=prometheus,url=http://127.0.0.1:9").expect("spec")];
+    let bind_report = |report: &MetricsIngestReport| {
+        bind(report, &workload_bytes, &workload, &specs, |_| None).map(|_| ())
+    };
+    bind_report(&ingest_report(&urls)).expect("a report whose read-backs matched binds");
+
+    let mut errored = ingest_report(&urls);
+    let row = errored
+        .systems
+        .iter_mut()
+        .find(|r| r.system == "mimir")
+        .expect("mimir row");
+    row.readback_error = Some("query samples.0 failed after 3 ms: 422".to_string());
+    let err = bind_report(&errored).expect_err("a readback_error refuses the bind");
+    assert!(
+        matches!(&err, BindError::Readback { system, detail }
+            if system == "mimir" && detail.contains("422")),
+        "{err}"
+    );
+
+    let mut mismatched = ingest_report(&urls);
+    let readback = mismatched.systems[0]
+        .readback
+        .as_mut()
+        .expect("prometheus readback");
+    readback.mismatches = vec!["sample_count: read 7, expected 8".to_string()];
+    readback.matches_expected = false;
+    let err = bind_report(&mismatched).expect_err("a mismatched readback refuses the bind");
+    assert!(
+        matches!(&err, BindError::Readback { system, detail }
+            if system == "prometheus" && detail.contains("sample_count: read 7")),
+        "{err}"
+    );
+}
+
+/// With `--diagnostic-after-failed-ingest`, an ingest report whose mimir row
+/// failed its read-back is queried as a diagnostic: the report says
+/// `run_verdict: "failed"` and names band 6 on mimir in `failed_bands`, every
+/// engine is still measured, and `metricsbench_report validate` refuses it as a
+/// diagnostic of a failed run. Without the flag the same input refuses (65)
+/// and writes nothing.
+///
+/// TO SEE THIS FAIL: drop the `--diagnostic-after-failed-ingest` branch in
+/// `metricsbench_query`'s `run_main` (bind with `bind` always): the flagged run
+/// then exits 65 like the unflagged one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_readback_is_queried_as_a_diagnostic_only_with_the_flag() {
+    let s = stubs().await;
+    let failed = || {
+        let mut ingest = ingest_report(&s.urls);
+        let row = ingest
+            .systems
+            .iter_mut()
+            .find(|r| r.system == "mimir")
+            .expect("mimir row");
+        row.readback_error = Some("query samples.0 failed after 3 ms: 422".to_string());
+        ingest
+    };
+
+    let refused = run_bin(failed(), &s.urls).await;
+    assert_eq!(
+        refused.output.status.code(),
+        Some(65),
+        "{}",
+        stderr(&refused.output)
+    );
+    assert!(!refused.out.exists());
+
+    let run = run_bin_with(
+        failed(),
+        &s.urls,
+        WARMUP,
+        &["--diagnostic-after-failed-ingest"],
+    )
+    .await;
+    assert!(run.output.status.success(), "{}", stderr(&run.output));
+    let text = std::fs::read_to_string(&run.out).expect("report written");
+    let json: Json = serde_json::from_str(&text).expect("report parses");
+    assert_eq!(json["run_verdict"], "failed", "{json}");
+    let bands = json["failed_bands"].as_array().expect("failed_bands");
+    assert_eq!(bands.len(), 1, "{json}");
+    assert_eq!(bands[0]["band"], 6);
+    assert_eq!(bands[0]["check"], "readback");
+    assert_eq!(bands[0]["system"], "mimir");
+    assert!(
+        bands[0]["reason"].as_str().expect("reason").contains("422"),
+        "{json}"
+    );
+    let report: MetricsBenchReport = serde_json::from_str(&text).expect("report parses");
+    for engine in [
+        Engine::Prometheus,
+        Engine::Ravel,
+        Engine::VictoriaMetrics,
+        Engine::Mimir,
+    ] {
+        assert!(
+            report.measurements.iter().any(|m| m.engine == Some(engine)),
+            "no measurement for {engine:?}"
+        );
+    }
+
+    let validated = Command::new(env!("CARGO_BIN_EXE_metricsbench_report"))
+        .arg("validate")
+        .arg(&run.out)
+        .output()
+        .expect("run metricsbench_report");
+    assert!(!validated.status.success());
+    assert!(
+        stderr(&validated).contains("diagnostic of a failed run"),
+        "{}",
+        stderr(&validated)
+    );
+}
+
+/// A stalled row binds only as a diagnostic: `bind` refuses it, and
+/// `bind_diagnostic` leaves the stalled engine out of the binding and names
+/// the stall as a failed check with no band number. A stalled oracle refuses
+/// even as a diagnostic, and a report with no failed row is not one.
+///
+/// TO SEE THIS FAIL: drop the `is_stalled` skip in `bind_rows`' engine loop:
+/// the diagnostic bind then refuses with no ingest row for mimir.
+#[test]
+fn a_stalled_row_binds_only_as_a_diagnostic_and_leaves_its_engine_out() {
+    use ravel_bench::metrics_ingest::StalledRow;
+    use ravel_bench::metrics_query::{
+        BindError, bind, bind_diagnostic, endpoints, parse_engine_spec,
+    };
+    use ravel_bench::report_schema::FailedCheck;
+
+    let urls = Urls {
+        prometheus: "http://127.0.0.1:9".to_string(),
+        ravel: "http://127.0.0.1:9".to_string(),
+        victoriametrics: "http://127.0.0.1:9".to_string(),
+        mimir: "http://127.0.0.1:9".to_string(),
+    };
+    let workload_bytes = std::fs::read(workload_path()).expect("workload");
+    let workload = ravel_bench::metrics_workload::load_workload(workload_path()).expect("workload");
+    let specs = [
+        parse_engine_spec("name=prometheus,url=http://127.0.0.1:9").expect("spec"),
+        parse_engine_spec("name=mimir,url=http://127.0.0.1:9").expect("spec"),
+    ];
+    let stalled = |system: &str| {
+        let mut ingest = ingest_report(&urls);
+        ingest.systems.retain(|r| r.system != system);
+        ingest.stalled = vec![StalledRow {
+            system: system.to_string(),
+            endpoint: "http://127.0.0.1:9/api/v1/push".to_string(),
+            projected_secs: 9_000.0,
+            ceiling_secs: 600,
+            offered_points: 50,
+            stream_points: 1_000,
+            error: "projected 9000 s past the 600 s ceiling".to_string(),
+        }];
+        ingest
+    };
+
+    let err = bind(
+        &stalled("mimir"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .map(|_| ())
+    .expect_err("bind refuses a stalled row");
+    assert!(
+        matches!(&err, BindError::Stalled { system, .. } if system == "mimir"),
+        "{err}"
+    );
+
+    let (binding, failed) = bind_diagnostic(
+        &stalled("mimir"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .expect("a stalled comparator binds as a diagnostic");
+    assert_eq!(
+        endpoints(&binding).keys().copied().collect::<Vec<_>>(),
+        vec!["prometheus"]
+    );
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].band, None);
+    assert_eq!(failed[0].check, FailedCheck::Stall);
+    assert_eq!(failed[0].system, "mimir");
+
+    let err = bind_diagnostic(
+        &stalled("prometheus"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .map(|_| ())
+    .expect_err("a stalled oracle refuses");
+    assert!(
+        matches!(&err, BindError::Stalled { system, .. } if system == "prometheus"),
+        "{err}"
+    );
+
+    let err = bind_diagnostic(
+        &ingest_report(&urls),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .map(|_| ())
+    .expect_err("no failed row, no diagnostic");
+    assert!(matches!(err, BindError::NoFailedRow), "{err}");
+}
+
+/// A row that carries a `row_failure`, and a row whose replay failed, bind
+/// only as a diagnostic. `bind` refuses each naming the row.
+/// `bind_diagnostic` keeps a `row_failure` row's engine in the binding even
+/// though the row's own band 6 check fails, and names the failure with its
+/// band; it leaves a failed replay's engine out and names it with no band. A
+/// failed replay of the oracle refuses even as a diagnostic.
+///
+/// TO SEE THIS FAIL: drop the `row_failure` branch in `bind_rows`' row loop:
+/// both binds then refuse with `BindError::Band6` on mimir.
+#[test]
+fn a_row_failure_or_failed_replay_does_not_bind() {
+    use ravel_bench::metrics_ingest::{FailedReplay, RowFailure};
+    use ravel_bench::metrics_query::{
+        BindError, bind, bind_diagnostic, endpoints, parse_engine_spec,
+    };
+    use ravel_bench::report_schema::FailedCheck;
+
+    let urls = Urls {
+        prometheus: "http://127.0.0.1:9".to_string(),
+        ravel: "http://127.0.0.1:9".to_string(),
+        victoriametrics: "http://127.0.0.1:9".to_string(),
+        mimir: "http://127.0.0.1:9".to_string(),
+    };
+    let workload_bytes = std::fs::read(workload_path()).expect("workload");
+    let workload = ravel_bench::metrics_workload::load_workload(workload_path()).expect("workload");
+    let specs = [
+        parse_engine_spec("name=prometheus,url=http://127.0.0.1:9").expect("spec"),
+        parse_engine_spec("name=mimir,url=http://127.0.0.1:9").expect("spec"),
+    ];
+
+    let mut row_failed = ingest_report(&urls);
+    let row = row_failed
+        .systems
+        .iter_mut()
+        .find(|r| r.system == "mimir")
+        .expect("mimir row");
+    row.ingest.accepted_digests.scalar = "not-the-expected-set".to_string();
+    row.row_failure = Some(RowFailure {
+        band: Some(6),
+        error: "mimir: the accepted scalar set is not the expected set".to_string(),
+    });
+    let err = bind(&row_failed, &workload_bytes, &workload, &specs, |_| None)
+        .map(|_| ())
+        .expect_err("bind refuses a row_failure");
+    assert!(
+        matches!(&err, BindError::RowFailed { system, detail }
+            if system == "mimir" && detail.contains("accepted scalar set")),
+        "{err}"
+    );
+    let (binding, failed) =
+        bind_diagnostic(&row_failed, &workload_bytes, &workload, &specs, |_| None)
+            .expect("a row_failure binds as a diagnostic");
+    assert_eq!(
+        endpoints(&binding).keys().copied().collect::<Vec<_>>(),
+        vec!["mimir", "prometheus"]
+    );
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].band, Some(6));
+    assert_eq!(failed[0].check, FailedCheck::Ingest);
+    assert_eq!(failed[0].system, "mimir");
+
+    // A row_failure on the oracle's row is refused even as a diagnostic:
+    // every other engine would be classified against a receiver that does
+    // not hold the stream.
+    let mut oracle_failed = ingest_report(&urls);
+    let row = oracle_failed
+        .systems
+        .iter_mut()
+        .find(|r| r.system == "prometheus")
+        .expect("prometheus row");
+    row.ingest.accepted_digests.scalar = "not-the-expected-set".to_string();
+    row.row_failure = Some(RowFailure {
+        band: Some(6),
+        error: "prometheus: the accepted scalar set is not the expected set".to_string(),
+    });
+    let err = bind_diagnostic(&oracle_failed, &workload_bytes, &workload, &specs, |_| None)
+        .map(|_| ())
+        .expect_err("a row_failure on the oracle refuses even as a diagnostic");
+    assert!(
+        matches!(&err, BindError::RowFailed { system, .. } if system == "prometheus"),
+        "{err}"
+    );
+
+    // So is a failed read-back on the oracle's row, while the same failure
+    // on a comparator binds as a diagnostic.
+    let readback_failed = |system: &str| {
+        let mut ingest = ingest_report(&urls);
+        ingest
+            .systems
+            .iter_mut()
+            .find(|r| r.system == system)
+            .expect("row")
+            .readback_error = Some("query samples.0 failed after 3 ms: 422".to_string());
+        ingest
+    };
+    let err = bind_diagnostic(
+        &readback_failed("prometheus"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .map(|_| ())
+    .expect_err("a failed read-back on the oracle refuses even as a diagnostic");
+    assert!(
+        matches!(&err, BindError::Readback { system, .. } if system == "prometheus"),
+        "{err}"
+    );
+    let (_, failed) = bind_diagnostic(
+        &readback_failed("mimir"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .expect("a failed comparator read-back binds as a diagnostic");
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].check, FailedCheck::Readback);
+    assert_eq!(failed[0].system, "mimir");
+
+    let replay_failed = |system: &str| {
+        let mut ingest = ingest_report(&urls);
+        ingest.systems.retain(|r| r.system != system);
+        ingest.failed_replays = vec![FailedReplay {
+            system: system.to_string(),
+            endpoint: "http://127.0.0.1:9/api/v1/push".to_string(),
+            error: "sender for shard 0 stopped early".to_string(),
+        }];
+        ingest
+    };
+    let err = bind(
+        &replay_failed("mimir"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .map(|_| ())
+    .expect_err("bind refuses a failed replay");
+    assert!(
+        matches!(&err, BindError::FailedReplay { system, .. } if system == "mimir"),
+        "{err}"
+    );
+    let (binding, failed) = bind_diagnostic(
+        &replay_failed("mimir"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .expect("a failed comparator replay binds as a diagnostic");
+    assert_eq!(
+        endpoints(&binding).keys().copied().collect::<Vec<_>>(),
+        vec!["prometheus"]
+    );
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].band, None);
+    assert_eq!(failed[0].check, FailedCheck::Replay);
+    assert_eq!(
+        failed[0].to_string(),
+        format!("replay on mimir: {}", failed[0].reason)
+    );
+    let err = bind_diagnostic(
+        &replay_failed("prometheus"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .map(|_| ())
+    .expect_err("a failed oracle replay refuses");
+    assert!(
+        matches!(&err, BindError::FailedReplay { system, .. } if system == "prometheus"),
+        "{err}"
+    );
+}

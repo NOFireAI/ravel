@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f153efbb8c2b2818251575da23c7f063b7e5e5402433ae452ea6048845d03b36 # shrinks to agent = [10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], incarnation = 10000000000000000, item = Operation(100000000000000000), upper = Index(1721696113546224818)

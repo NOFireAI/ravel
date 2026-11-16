@@ -1,0 +1,17 @@
+{
+  "id": "D3",
+  "answer_facts": [
+    {"fact": "the refusal is quoted exactly", "pattern": "@first_failure_message"},
+    {"fact": "6 ERROR log rows", "pattern": "\\b(6|six)\\b"},
+    {"fact": "the payments service", "pattern": "payments"},
+    {"fact": "the checkout service", "pattern": "checkout"}
+  ],
+  "evidence": [
+    {"item": "a single-table statement or trace lookup per step", "pattern": "from logs|from spans|ravel_get_trace|ravel_search_logs"}
+  ],
+  "expected_failure_classes": ["validation", "unsupported"],
+  "retry_bound": 1,
+  "tools_expected": ["ravel_explain_query", "ravel_search_logs", "ravel_get_trace", "ravel_query_sql"],
+  "call_bound": 8,
+  "fixture_refs": ["counts.error_log_rows", "counts.error_spans"]
+}

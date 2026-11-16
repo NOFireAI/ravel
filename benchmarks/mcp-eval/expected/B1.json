@@ -1,0 +1,15 @@
+{
+  "id": "B1",
+  "answer_facts": [
+    {"fact": "baseline p99 of 40 to 44 ms", "pattern": "\\b4[0-4](\\.\\d+)?\\s*(ms|milli)"},
+    {"fact": "slow-period p99 of 900 to 904 ms", "pattern": "\\b90[0-4](\\.\\d+)?\\s*(ms|milli)"},
+    {"fact": "the change starts at T0+20m", "pattern": "{hhmm:T0+20m}"},
+    {"fact": "the slow period ends at T0+30m", "pattern": "{hhmm:T0+30m}"}
+  ],
+  "evidence": [
+    {"item": "the PromQL query text", "pattern": "http_server_duration_p99_milliseconds"}
+  ],
+  "tools_expected": ["ravel_query_promql", "ravel_analyze_timeseries"],
+  "call_bound": 8,
+  "fixture_refs": ["entities.incident.p99_ms_baseline", "entities.incident.p99_ms_incident", "entities.incident.window"]
+}

@@ -1,0 +1,317 @@
+//! The per-signal codec seam (ADR-0032).
+//!
+//! Everything the compactor does *around* the bytes -- seal detection
+//! ([`crate::scan`]), the `CreateIfAbsent` + convergence + abandonment publish
+//! protocol ([`crate::publish`]), the advisory cursor, the canonical
+//! `input_set_hash`, the part-size cap ([`crate::config`]), and the whole
+//! crash-recovery/idempotency story -- is signal-agnostic and stays shared.
+//! The only two things that know a signal's on-object format are:
+//!
+//! 1. decoding one input object's footer/identity/catalog metadata far enough
+//!    to plan a merge, without fetching page/block bytes yet; and
+//! 2. streaming a k-way merge of N inputs' catalogs into size-capped output
+//!    parts, fetching page/block bytes lazily during the merge.
+//!
+//! [`SegmentCodec`] is exactly those two operations, one associated
+//! [`SegmentCodec::Catalog`] type carrying whatever metadata (1) retained for
+//! (2) to consume. It deliberately covers nothing else: the record assembly,
+//! key reconstruction, convergence repair, and size cap all live in the shared
+//! modules and take a [`crate::bucket::Bucket`] whose `signal` field already
+//! routes them. The plan's memory bound is on *decoded* data: catalog metadata
+//! plus one in-flight part buffer's decoded records, never the whole bucket's
+//! decoded data at once (`build.rs`/`read.rs` header comments). RSEG and RLOG
+//! hold this as a contract on the impl, not a hint, and additionally bound
+//! *raw* fetched bytes: each has a ranged reader that reads the footer and
+//! directory from a suffix probe and then fetches only the bytes a part
+//! actually needs -- RSEG's `ravel_segment::open_from_suffix` fetching the
+//! page bytes of one series' runs, RLOG's `ravel_logseg::open_from_suffix`
+//! plus `RlogRangeReader` fetching the blocks of one stream. For
+//! those two, the page and block terms -- decoded and raw -- are one part plus
+//! one series/stream, never the whole bucket. The earlier RLOG merge held every
+//! input object whole (RLOG then had no ranged `.rlog` section reader); that
+//! gap is now closed.
+//!
+//! "Catalog metadata" is not a small constant for RSEG. Every input's catalog
+//! is loaded before the merge starts and retained until it ends, with one
+//! series plan and its run plans per (input, series) entry, and `build.rs`
+//! groups those plans into a per-series index that also holds one entry per
+//! (input, series). Both grow with `N * M` (inputs times series per input) and
+//! no configured number sizes them; `tests/rseg_merge_memory.rs` measures each term at two input counts.
+//! The series' label sets are the exception: [`SegmentCodec::admit_catalog`]
+//! interns them by series id as each catalog loads, so they are one copy per
+//! bucket series whatever `N` is (issue #3817).
+//!
+//! [`crate::rspan_codec::SpanCodec`] (RSPAN, spans) is the third
+//! implementation and holds the same shape: `ravel-rspan`'s `RspanRangeReader` fetches SKIP_IDX by
+//! range at catalog load, then the merge streams BLOCKS bytes one block per
+//! input at a time (`rspan_codec.rs`'s own module doc). So "one part plus one
+//! decode unit per input, never the whole bucket at once" is a trait-wide
+//! property across all three codecs, not a two-out-of-three contract.
+//!
+//! What "one part" costs is a separate question, and it is a target rather than
+//! a bound ([`crate::config::CompactorConfig::l1_part_memory_target_bytes`]):
+//! the RLOG merge checks it after every record, the RSPAN merge only at a trace
+//! boundary (so a bucket carrying one large trace really is one part), and the
+//! RSEG builder does not read it: its parts split on the stored-size target
+//! `max_l1_part_bytes` alone. The trait-wide claim is about not holding the
+//! bucket's page and block bytes at once; it is not a ceiling on the output
+//! part, and for RSEG it is not a ceiling on the retained catalogs either.
+//!
+//! [`RsegCodec`] wraps the existing `read.rs`/`build.rs` RSEG logic: since the
+//! run-merged rewrite the verbatim page copy is taken only by a single-run
+//! series at the current output version; a multi-run series is decoded and
+//! re-encoded into one run regardless of version, and ADR-0066 decision 5's
+//! decode-and-re-encode path always runs for an input recorded below the current
+//! output version; [`crate::rlog::RlogCodec`] is the RLOG
+//! implementation; [`crate::rspan_codec::SpanCodec`] is the RSPAN
+//! implementation. [`crate::compact::compact_bucket`] dispatches on
+//! `bucket.signal` to whichever of the three it picked and runs the identical
+//! shared pipeline around it.
+
+use ravel_object_store::ObjectStoreBackend;
+
+use crate::bucket::Bucket;
+use crate::build::BuiltPart;
+use crate::compact::CompactionInputSkipReason;
+use crate::config::CompactorConfig;
+use crate::error::Result;
+use crate::read::InputRecord;
+
+/// The format-specific half of the compactor, implemented once per signal.
+///
+/// The lint allow is intentional: this trait is a crate-internal seam invoked
+/// only through the monomorphized dispatch in [`crate::compact`], never behind
+/// `dyn`, so it needs no `Send`-bounded return future (which is the only thing
+/// `async_fn_in_trait` warns about).
+#[allow(async_fn_in_trait)]
+pub trait SegmentCodec {
+    /// Per-input decoded catalog metadata: enough to plan the merge (identity,
+    /// stream/series directory), never the page/block bytes themselves.
+    type Catalog;
+
+    /// State [`Self::admit_catalog`] keeps across one bucket's catalog loads.
+    type LoadState: Default;
+
+    /// Decode one input object's footer/identity/catalog metadata (read.rs's
+    /// job). MUST NOT retain page/block bytes: what every input's catalog holds
+    /// is its metadata, not the bucket's data. That metadata is still retained
+    /// for every input at once, so it grows with the input count (for RSEG, one
+    /// series plan per (input, series) entry).
+    async fn load_input_catalog(
+        store: &dyn ObjectStoreBackend,
+        config: &CompactorConfig,
+        input: &InputRecord,
+    ) -> Result<Self::Catalog>;
+
+    /// Stream-merge every input into size-capped [`BuiltPart`]s and PUT each
+    /// one `CreateIfAbsent` (build.rs's job). `catalogs` is aligned one-to-one
+    /// with `inputs` in canonical input order and is taken by value: this is
+    /// the catalogs' last use, so a codec may move records out of them rather
+    /// than clone (RSEG moves exemplars). RSEG and RLOG fetch page/block
+    /// bytes lazily by range, bounding peak *decoded* memory to the retained
+    /// catalogs (and, for RSEG, the per-series index built from them, which
+    /// also holds one entry per (input, series)) plus one in-flight part, and
+    /// additionally bound raw fetched bytes via their ranged readers (RSEG's `open_from_suffix`, RLOG's
+    /// `RlogRangeReader`; RSPAN's `RspanRangeReader`)
+    /// to one part plus one series/stream/block-per-input -- see the trait doc
+    /// above, [`crate::rlog::RlogCodec`], and [`crate::rspan_codec::SpanCodec`].
+    async fn build_parts(
+        store: &dyn ObjectStoreBackend,
+        config: &CompactorConfig,
+        bucket: &Bucket,
+        inputs: &[InputRecord],
+        catalogs: Vec<Self::Catalog>,
+        input_set_hash: &[u8; 32],
+    ) -> Result<Vec<BuiltPart>>;
+
+    /// Called once per loaded catalog, in canonical input order, before the
+    /// merge sees it. A codec may share metadata between inputs here; the
+    /// default keeps every catalog as loaded.
+    fn admit_catalog(
+        _config: &CompactorConfig,
+        _state: &mut Self::LoadState,
+        _catalog: &mut Self::Catalog,
+    ) {
+    }
+
+    /// Reject an input set [`crate::rewrite::rewrite_and_publish`] must not
+    /// run over, ahead of any decode or PUT. The default accepts everything:
+    /// every codec's `build_parts` now decodes and re-encodes an input recorded
+    /// below its current output version (RLOG and RSPAN always re-encode; RSEG
+    /// gained the decode-and-re-encode path in ADR-0066 decision 5), so there is
+    /// nothing to reject on the low end. A codec MAY override this to fail closed
+    /// on a version it cannot handle -- notably one recorded *newer* than the
+    /// current output version (ADR-0066 decision 2: newer-than-known is a typed
+    /// refusal, never a silent downgrade), which [`RsegCodec`] does.
+    /// `writable` is the version the run writes: its compat run's, or the
+    /// build's current one with no policy.
+    fn validate_rewrite_inputs(_inputs: &[InputRecord], _writable: u32) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether `input` is recorded at a format version newer than `writable`,
+    /// the run's output version, which is what
+    /// [`Self::validate_rewrite_inputs`] refuses. The default refuses nothing,
+    /// so it names nothing.
+    fn recorded_newer_than_writable(_input: &InputRecord, _writable: u32) -> bool {
+        false
+    }
+
+    /// Why this codec's writer would refuse to rewrite the input `catalog`
+    /// describes, with the decoder's error, or `None` when it can rewrite it.
+    /// Compaction leaves such an input out of its merge instead of failing on
+    /// it (issue #2554). The default rewrites everything.
+    fn unwritable_input(_catalog: &Self::Catalog) -> Option<(CompactionInputSkipReason, String)> {
+        None
+    }
+}
+
+/// The metrics codec: the RSEG half of the seam over `read.rs`/`build.rs`.
+/// Since the run-merged rewrite ([`crate::build`]) the verbatim page copy is
+/// per series, not per input: only a series that contributes exactly one run at
+/// the current output version is copied verbatim (byte-identical, no provenance
+/// column). A multi-run series is decoded and re-encoded into a single run
+/// regardless of its inputs' versions. For an input recorded below the current
+/// output version it drives ADR-0066 decision 5's decode-and-re-encode rewrite:
+/// it marks that input's object key (`migrate_keys`) so
+/// [`crate::build::build_parts`] always decodes and re-encodes that input's runs
+/// at the current version instead of copying them verbatim.
+pub struct RsegCodec;
+
+impl SegmentCodec for RsegCodec {
+    type Catalog = crate::read::InputCatalog;
+    type LoadState = crate::read::LabelInterner;
+
+    /// Shares each series' label set across the inputs that carry it
+    /// ([`crate::read::intern_catalog_labels`]), so the retained labels are
+    /// one copy per distinct series rather than one per (input, series).
+    /// Charges nothing to the merge memory tracker:
+    /// [`crate::build::build_parts`] charges the retained catalogs and
+    /// releases them on every exit.
+    fn admit_catalog(
+        _config: &CompactorConfig,
+        state: &mut Self::LoadState,
+        catalog: &mut Self::Catalog,
+    ) {
+        crate::read::intern_catalog_labels(state, catalog);
+    }
+
+    fn validate_rewrite_inputs(inputs: &[InputRecord], writable: u32) -> Result<()> {
+        // Fail closed on newer-than-writable (ADR-0066 decision 2): an input
+        // recorded ABOVE the run's output version is a format this build
+        // cannot write, so a rewrite would have to mislabel it downward. Refuse
+        // it before any decode or PUT. An input recorded at or below the output
+        // version is migratable forward -- `build_parts` copies a current-version
+        // input verbatim and decodes-and-re-encodes an older one -- so it is
+        // accepted here; whether an older object's BYTES are actually decodable
+        // is the reader's `SUPPORTED_VERSIONS` window to enforce at open time,
+        // not this metadata-only pre-check's. This is the flipped guard: the
+        // pre-slice-B version refused any input recorded `!= OUTPUT_FORMAT_VERSION`
+        // (older included), because RSEG could only copy pages verbatim.
+        for input in inputs {
+            let version = input.record.segment_format_version;
+            if Self::recorded_newer_than_writable(input, writable) {
+                return Err(crate::error::MaintainError::NewerThanWritable {
+                    commit_key: input.commit_key.clone(),
+                    version,
+                    writable,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn recorded_newer_than_writable(input: &InputRecord, writable: u32) -> bool {
+        input.record.segment_format_version > writable
+    }
+
+    async fn load_input_catalog(
+        store: &dyn ObjectStoreBackend,
+        config: &CompactorConfig,
+        input: &InputRecord,
+    ) -> Result<Self::Catalog> {
+        crate::read::load_input_catalog(store, config, input).await
+    }
+
+    async fn build_parts(
+        store: &dyn ObjectStoreBackend,
+        config: &CompactorConfig,
+        bucket: &Bucket,
+        inputs: &[InputRecord],
+        catalogs: Vec<Self::Catalog>,
+        input_set_hash: &[u8; 32],
+    ) -> Result<Vec<BuiltPart>> {
+        use std::collections::HashSet;
+
+        // The version this run writes: the compat run's, else the build's.
+        let output_version = u32::from(crate::compat_policy::rseg_write_version(config)?.number());
+
+        // The object keys of any input recorded below the current output version
+        // (ADR-0066 decision 5). `catalogs` is aligned one-to-one with `inputs`
+        // in canonical input order (rewrite_and_publish builds it that way, and
+        // build_parts re-checks the lengths match), so an input's recorded
+        // version pairs with its catalog's object key. build_parts decodes and
+        // re-encodes exactly these inputs' runs; every other input keeps the
+        // verbatim page-copy path. Normal compaction (every input at the current
+        // version) yields an empty set, so the fast path runs unchanged.
+        let migrate_keys: HashSet<String> = inputs
+            .iter()
+            .zip(&catalogs)
+            .filter(|(input, _)| input.record.segment_format_version < output_version)
+            .map(|(_, catalog)| catalog.object_key.clone())
+            .collect();
+        crate::build::build_parts(
+            store,
+            config,
+            bucket,
+            inputs,
+            catalogs,
+            &migrate_keys,
+            input_set_hash,
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::error::MaintainError;
+    use ravel_proto::commit::v1::CommitRecord;
+
+    fn input_at(version: u32) -> InputRecord {
+        InputRecord {
+            commit_key: format!("c/{version}"),
+            record: CommitRecord {
+                segment_format_version: version,
+                ..CommitRecord::default()
+            },
+        }
+    }
+
+    /// The newer-than-writable check compares against the version the run
+    /// writes, named explicitly, in either build. Comparing against
+    /// `SegmentVersion::CURRENT` (7) refuses the input at 8 that a run
+    /// writing 8 carries forward; comparing against the reader window's
+    /// newest admits it into a run writing 7 under `format-drill`.
+    #[test]
+    fn rseg_inputs_are_checked_against_the_runs_version() {
+        let inputs = [input_at(7), input_at(8)];
+
+        RsegCodec::validate_rewrite_inputs(&inputs, 8).expect("a run writing 8 carries 8");
+        assert!(!RsegCodec::recorded_newer_than_writable(&inputs[1], 8));
+
+        let err = RsegCodec::validate_rewrite_inputs(&inputs, 7).expect_err("8 above 7");
+        assert!(
+            matches!(
+                &err,
+                MaintainError::NewerThanWritable { commit_key, version: 8, writable: 7 }
+                    if commit_key == "c/8"
+            ),
+            "{err:?}"
+        );
+        assert!(RsegCodec::recorded_newer_than_writable(&inputs[1], 7));
+        assert!(!RsegCodec::recorded_newer_than_writable(&inputs[0], 7));
+    }
+}

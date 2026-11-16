@@ -1,0 +1,1921 @@
+# Running Ravel on Kubernetes
+
+Ravel runs on Kubernetes through an operator. You create one `RavelCluster`
+custom resource. The operator reconciles it into the gateway, query, and
+maintain Deployments and their Services. This guide covers the local kind
+development environment, the `RavelCluster` field reference, and the health
+probes.
+
+**The custom resource is `v1alpha1`.** It makes no compatibility promise. The
+schema can change in an incompatible way, with no conversion webhook, until it
+is promoted to a stable version. Do not plan around it as a stable API.
+
+Every mode is stateless, and object storage is the only durable state. There
+are therefore no StatefulSets, no PersistentVolumeClaims, no leader election,
+and nothing to back up besides the bucket. For the flag behind a
+custom-resource field, see the generated
+[server flag reference](../reference/ravel-server-flags.md). To choose a
+value, see [operations.md](operations.md).
+
+**Only the maintain Deployment deletes durable data.** Only a `maintain` mode
+process runs compaction, retention, the garbage-collection sweep and the
+at-rest scrubber. The gateway and query Deployments delete no durable data.
+The one delete that the gateway makes removes the admission snapshots of dead
+ingest processes.
+
+A cluster with `maintain.enabled: false` never compacts and never expires
+data. The same applies to a cluster scaled to zero maintain replicas. Its L0
+segments accumulate unmerged and nothing is reclaimed, whatever the retention
+fields below are set to. The operator does not report this state as degraded.
+If retention seems broken, check this state first.
+
+![Ravel Kubernetes operator reconcile loop](../diagrams/k8s-operator-reconcile.svg)
+
+## The kind development environment
+
+Three scripts bring up a complete cluster on your machine: the operator, a
+fake S3 backend, and one reconciled `RavelCluster`.
+
+```sh
+scripts/kind-up.sh      # cluster, images, fake S3, operator, RavelCluster
+scripts/kind-demo.sh    # OTLP ingest through the gateway, query back through
+                        # the query Deployment, assert the value
+scripts/kind-down.sh    # delete the cluster
+```
+
+You need `docker`, `kind`, `kubectl`, and (for `kind-demo.sh`) a Rust
+toolchain. The first `kind-up.sh` run builds both container images from the
+root `Dockerfile`. This is a full release build of the workspace and takes a
+while. Later runs reuse the docker layer cache.
+
+![kind local development environment](../diagrams/k8s-dev-environment.svg)
+
+`kind-up.sh` does these steps in order:
+
+1. It creates a kind cluster (default name `ravel-dev`) from a node image pinned
+   by tag and digest. It reuses an existing cluster of that name.
+2. It builds the `server` and `operator` targets of the root `Dockerfile`.
+3. It runs `kind load docker-image` on both, so the cluster needs no registry
+   and the `IfNotPresent` pull policy resolves against the node's own image
+   store.
+4. It deploys the fake S3 backend, waits until it serves S3, and creates the
+   `ravel` bucket with the protection settings the operator's startup gate
+   checks.
+5. It installs the CRD, RBAC, and operator Deployment from `deploy/k8s/operator/`.
+6. It applies a `RavelCluster` named `dev`, pointed at that backend and those
+   image tags.
+7. It waits for `condition=Available` on the `RavelCluster`.
+
+The operator sets `Available=True` only after the gateway and query
+Deployments report ready replicas. Step 7 therefore succeeds only if the
+images run and the pods pass `/readyz` against the backend. It is not a check
+that objects were created.
+
+If any step fails, the script dumps the namespace's objects, the
+`RavelCluster`'s status, pod descriptions, and the operator's logs. It then
+leaves the cluster running so you can look at it.
+
+### Environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RAVEL_KIND_CLUSTER` | `ravel-dev` | kind cluster name. All three scripts read it. |
+| `RAVEL_KIND_NODE_IMAGE` | pinned `kindest/node` | Control-plane version to test against. |
+| `RAVEL_SERVER_IMAGE` | `ravel-server:kind-dev` | Server image tag. |
+| `RAVEL_OPERATOR_IMAGE` | `ravel-operator:kind-dev` | Operator image tag. |
+| `RAVEL_SKIP_IMAGE_BUILD` | `0` | `1` skips `docker build` and uses the two tags as-is; they must already exist in the local docker daemon. This is how CI reuses the binaries `scripts/build-prebuilt-binaries.sh` builds. |
+| `RAVEL_FAKE_S3_BACKEND` | `floci` | `floci` or `rustfs`. |
+| `RAVEL_TENANT_NAME` | `demo-tenant` | Tenant to provision. |
+| `RAVEL_TENANT_TOKEN` | `demo-token` | Its bearer token. |
+
+### The fake S3 backend
+
+`deploy/k8s/floci.yaml` and `deploy/k8s/rustfs.yaml` are the same shape: a
+single-replica Deployment, a Service, and a bucket-create Job. The operator
+starts every `ravel-server` pod with `--require-bucket-protection`, so the
+Job creates a protected bucket:
+
+1. It retries until the endpoint serves S3.
+2. It creates the `ravel` bucket with Object Lock enabled, and verifies that
+   the bucket exists.
+3. It turns versioning on.
+4. It installs one enabled lifecycle rule over the whole bucket with
+   `ExpiredObjectDeleteMarker`, `NoncurrentDays` 1 and
+   `AbortIncompleteMultipartUpload` after 7 days.
+5. It reads each configuration back.
+
+`scripts/kind-up.sh` deletes a finished Job before it applies the manifest,
+so the Job runs again on a reused cluster. A backend pod can still hold a
+bucket from an older manifest, created without Object Lock. That bucket fails
+the read-back. Delete the pod to start from an empty store.
+
+floci is the default. The `floci_contract` test in the object-store crate
+gates it. In CI, that test runs the full object-store contract suite plus the
+mandatory capability and multipart probes against a real floci.
+
+RustFS is the named fallback. If a floci release stops satisfying that
+contract, set `RAVEL_FAKE_S3_BACKEND=rustfs` to switch the whole environment
+to RustFS. The object-store-contract CI job runs the full contract suite
+against RustFS on every change. Ravel maintains both manifests.
+
+Use neither backend for anything but development. There is no persistent
+volume, so the bucket lives in the pod's ephemeral filesystem and is gone when
+the pod restarts. floci also accepts any credentials without verifying
+request signatures.
+
+### Secrets
+
+`kind-up.sh` creates the three Secrets that the `RavelCluster` references.
+The repository commits no Secret manifest, because a committed Secret
+manifest puts credentials in git and someone can copy it into a real cluster.
+
+- `ravel-s3-credentials`, keys `accessKeyId` and `secretAccessKey`.
+- `ravel-tenant-tokens`, where each key is a tenant name and its value is that
+  tenant's bearer token.
+- `ravel-audit-token-key`, key `key` holding the query-audit token key.
+
+### The same environment in CI
+
+The `k8s-integration` job in `.github/workflows/ci.yml` runs these same three
+scripts in CI, so the local and CI paths cannot drift.
+
+![k8s-integration CI lane vs local dev](../diagrams/k8s-ci-integration.svg)
+
+The job differs in two ways. Both change the build time. Neither changes what
+is tested.
+
+- `helm/kind-action` (pinned by commit SHA) creates the cluster, and
+  `kind-up.sh` then reuses that cluster. The action reads its node image out
+  of `kind-up.sh`, so there is only one pinned digest. The job fails if the
+  cluster it expects is not there, so a name drift cannot silently create a
+  second cluster.
+- `scripts/build-prebuilt-binaries.sh` builds the release binaries inside
+  the root `Dockerfile`'s builder image, against the target and cargo caches
+  the workflow restores on the runner. `Dockerfile.prebuilt` (the runtime
+  stages only) then assembles the images from them under
+  `RAVEL_SKIP_IMAGE_BUILD=1`.
+  - The root `Dockerfile`'s builder stage recompiles the workspace inside
+    Docker with no cache, which was measured at 57 minutes.
+  - The job smoke-runs `--help` in both assembled images before it creates
+    the cluster. A binary that cannot exec on the runtime base then fails
+    with the dynamic linker's message, and not as a `CrashLoopBackOff`.
+  - Building in the builder image gives the binaries the shipping build's
+    glibc, so the CI images use the same Debian 12 distroless base as the
+    shipping image. Binaries built on the runner itself would link against
+    the runner's newer glibc and fail to exec there; `Dockerfile.prebuilt`
+    records the measured symbols.
+
+`kind-demo.sh` asserts the round-trip value and exits nonzero on any failure,
+so the job needs no extra proof-of-run check over its output.
+
+## Installing the operator yourself
+
+```sh
+kubectl create namespace ravel-system
+kubectl apply -f deploy/k8s/operator/crd.yaml
+kubectl apply -f deploy/k8s/operator/rbac.yaml
+kubectl apply -f deploy/k8s/operator/operator.yaml
+```
+
+Apply the manifests in this order:
+
+- Apply the CRD before the operator Deployment. The operator's watch fails
+  until the cluster serves the `RavelCluster` kind.
+- Apply RBAC before the operator Deployment. Otherwise its API calls get 403.
+
+`operator.yaml` carries a placeholder `ravel-operator:latest` image tag. For
+a real cluster, pin the image to a digest
+(`ghcr.io/nofireai/ravel-operator@sha256:<digest>`), not to a moving tag. A
+tag can point at a different image after you have reviewed the manifest. A
+digest cannot. Pin `RAVEL_CREDENTIALS_SIDECAR_IMAGE` in the same manifest to
+the same reference: it names the image of the credentials sidecar the
+operator renders under `storage.s3.auth: podIdentity`, which is the operator
+image itself (see [Pod Identity](#pod-identity)). A kustomize `images:`
+override rewrites the container's `image:` but not this env value, so
+change the env with its own patch and check that the rendered manifest
+carries the same reference in both places.
+
+The operator pod template in `operator.yaml` has a commented
+`azure.workload.identity/use: "true"` label, and the `ravel-operator`
+ServiceAccount in `rbac.yaml` a commented
+`azure.workload.identity/client-id` annotation. Both are opt-in, and needed
+only when the operator manages a `RavelCluster` on `storage.azure` that sets
+`deploymentKeySecretRef` or names a tenant under `shardOverrides`: those are
+the only paths on which the operator's own store client opens the container,
+and it authenticates through AKS workload identity. Uncomment both, set the
+operator's client ID, and restart the operator pod (see
+[Azure Blob Storage with workload identity](#azure-blob-storage-with-workload-identity)).
+
+`crd.yaml` is generated from the Rust spec types. To regenerate it, run
+`cargo run -p ravel-operator -- --print-crd`.
+
+### Operator replicas and health
+
+The operator runs as one replica with a `Recreate` strategy. Raising the
+replica count is unsupported, because two active instances race the
+`sys/auth` compare-and-swap.
+
+The operator serves `/healthz`, `/readyz`, and `/metrics` on the `health`
+container port (`8080` by default, `--listen-health` to change it). The
+listener binds before the controller starts. If the listener cannot bind its
+address, the operator stops with an error that names the address and the
+flag.
+
+- `/healthz` answers `200` until its controller loop stops. This is the
+  kubelet's liveness signal.
+- `/readyz` answers `200` once its initial `RavelCluster` list has arrived.
+- `/metrics` renders `ravel_operator_reconciles_total`,
+  `ravel_operator_reconcile_duration_seconds`,
+  `ravel_operator_last_successful_reconcile_timestamp_seconds`, and
+  `ravel_operator_watched_clusters` as Prometheus text exposition.
+
+`operator.yaml` wires liveness and readiness probes at those paths. It also
+carries a `prometheus.io/scrape` annotation for a Prometheus that discovers
+targets that way.
+
+### Operator permissions
+
+The operator watches `RavelCluster` cluster-wide. It manages Deployments and
+Services in the namespace of each `RavelCluster`. Its ClusterRole grants:
+
+- the full lifecycle of Deployments, Services, Ingresses,
+  `gateway.networking.k8s.io` HTTPRoutes/GRPCRoutes, the ServiceAccounts,
+  Roles, and RoleBindings it renders for the `ravelNative` ingest router, and
+  the ServiceAccounts it renders under `storage.s3.auth: podIdentity` or
+  `storage.azure`,
+- `RavelCluster` and its status subresource,
+- `get` on Secrets,
+- `get`/`list`/`watch` on `endpointslices` (needed to create the router's own
+  least-privilege Role),
+- `get` on the non-resource URL `/version`.
+
+The operator never lists, writes, or watches Secrets.
+
+On a cluster that uses EKS Pod Identity, these grants reach AWS too.
+Kubernetes needs no permission on a ServiceAccount to name it in a pod, and
+the Pod Identity agent hands a role's credentials to any pod running as an
+associated ServiceAccount. An operator that can create Deployments and Jobs
+in every namespace could therefore run a pod as any associated account in
+the cluster, not only the ones it owns. Restrict where the operator's
+ServiceAccount may create pods, for example with a
+ValidatingAdmissionPolicy that refuses its pod-creating writes outside the
+namespaces that hold `RavelCluster`s.
+
+### Minimum Kubernetes version
+
+**Minimum Kubernetes version: 1.30.** Every rendered ravel-server container
+carries a `preStop` `SleepAction`. Kubernetes' `PodLifecycleSleepAction`
+feature (KEP-3960) gates it:
+
+| Kubernetes version | Gate | The `preStop` field |
+|---|---|---|
+| 1.28 and earlier | None. The apiserver's older type does not recognize the field. | Dropped. With the default `fieldValidation` of `Warn`, the apiserver drops the field and returns a Warning response header, and does not reject the request. Nothing in the operator surfaces that header today. |
+| 1.29 | Alpha, off by default. | Dropped. The field exists in the apiserver's type but the gate is off, so `dropDisabledFields` zeroes it out on admission. The Pod comes up with no error and no preStop sleep at all. |
+| 1.30 to 1.33 | Beta, **on by default**. | Kept. |
+| 1.34 and later | Stable, and no longer gateable. | Kept. |
+
+Below 1.30 the Pod looks healthy in isolation. But every rolling update can
+drop in-flight ingest for that pod across the endpoint-propagation window,
+because nothing holds the container open while its endpoint is withdrawn.
+
+On a cluster below the floor, the operator raises a
+`KubernetesVersionUnsupported` condition on every `RavelCluster`. See
+"Status" below. The check has these limits:
+
+- The operator reads the cluster's version once at process startup, through
+  the `/version` grant above. It does not read the version per reconcile. A
+  control-plane upgrade across the floor therefore does not clear the
+  condition. The condition clears only once the operator pod restarts and
+  re-reads `/version`.
+- If the operator cannot read the version at all, it fails open and raises
+  nothing. An RBAC gap or a `/version` blip therefore never produces a false
+  warning.
+- The floor asserts only the gate's default. A control-plane operator can
+  disable `PodLifecycleSleepAction` manually on a 1.30-1.33 cluster. The
+  check reads only the apiserver version and cannot detect that.
+- The gate also lives in the kubelet. Kubernetes' supported skew policy
+  allows a kubelet up to three minors behind the control plane. A 1.32
+  apiserver with a 1.29 node pool reports 1.32 to this check and passes it.
+  But `PodLifecycleSleepAction` is off by default on those nodes, so the
+  preStop hook is dropped for pods scheduled there.
+
+The floor also covers native sidecars, which a cluster under
+`storage.s3.auth: podIdentity` needs (see [Pod Identity](#pod-identity)).
+The credentials sidecar is an initContainer with `restartPolicy: Always`.
+Kubernetes' `SidecarContainers` feature is on by default since 1.29 and
+stable since 1.33, so every version at or above the 1.30 floor runs it. The
+kubelet skew caveat above applies to it the same way.
+
+## `RavelCluster` reference
+
+Group `ravel.nofire.ai`, version `v1alpha1`, namespaced, short name `rc`.
+
+A minimal example is in
+[`deploy/k8s/examples/ravelcluster-dev.yaml`](../../deploy/k8s/examples/ravelcluster-dev.yaml),
+and an Azure one in
+[`deploy/k8s/examples/ravelcluster-azure.yaml`](../../deploy/k8s/examples/ravelcluster-azure.yaml).
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `spec.image` | string | required | Server image for all three Deployments. |
+| `spec.imagePullPolicy` | string | none | Standard Kubernetes values. |
+| `spec.shards` | integer | required | Feeds `--shards` to the gateway, query, and maintain from one field, so nothing can break the must-match invariant. **Immutable after creation** through a CEL rule; use `spec.shardOverrides` for per-tenant resharding. |
+| `spec.shardOverrides.leadHours` | integer | `2` | Minimum hours of lead time an override needs before its shard count takes effect, matching the resharding mechanism's activation-hour semantics. Rejected below the mechanism's own floor. |
+| `spec.shardOverrides.tenants` | map | none | Per-tenant target shard count, tenant name to integer. A target that differs from the tenant's current active shard count drives a durable `append_generation` reshard; a target equal to the current count is a no-op. Lowering a tenant's shard count is the primary operator-facing cost control, and it has costs of its own (a single-actor throughput ceiling, shard-0 concentration, coarser maintenance units) documented in [shard-overrides.md](shard-overrides.md). |
+| `spec.storage.s3.bucket` | string | required under `storage.s3` | |
+| `spec.storage.s3.region` | string | `us-east-1` | |
+| `spec.storage.s3.endpoint` | string | none | Omit for real AWS S3. Path-style addressing is always used. |
+| `spec.storage.s3.allowHttp` | boolean | `false` | Renders `--s3-allow-http` on every server container, and `RAVEL_S3_ALLOW_HTTP=true` on the store-qualification Job that runs `ravel-cli store qualify` before any server pod exists. Required when `endpoint` is a plaintext `http://` URL whose host is not loopback: no pod reaches its object store over loopback, so without it the operator refuses the cluster at render time (`Degraded`, reason `PlaintextS3Endpoint`, message naming this field) and creates no Deployment, Service, or qualify Job, rather than moving telemetry and S3 credentials across the cluster network in the clear. The same rule governs the operator's own S3 client, the one that reconciles `sys/auth` and applies `shardOverrides`. Editing this field re-runs store qualification, since it changes whether that check can reach the store. Leave unset for an `https://` endpoint and for real AWS S3. |
+| `spec.storage.s3.uploadIntegrity` | string | `crc64nvme` | `crc64nvme`, `sha256`, or `off`: the server-verified checksum every PUT carries. Renders `--s3-upload-integrity` on every server container only when it is not `crc64nvme`, which is the server's own default, and sets the same on the operator's own S3 client. Set `off` only for an endpoint that rejects the checksum header; see [Upload and read checksums](operations/configuration.md#upload-and-read-checksums). The store-qualification Job always carries the value as `RAVEL_S3_UPLOAD_INTEGRITY` and PUTs with it, so an endpoint that rejects the header fails qualification, and editing this field re-runs it. |
+| `spec.storage.s3.requestStoredChecksum` | boolean | `true` | Whether requests ask the endpoint for the checksum it stored, so full-object reads are verified. `false` renders `--s3-request-stored-checksum=false` on every server container and applies to the operator's own S3 client; every full-object read is then counted in `ravel_store_get_unverified_total`. The store-qualification Job always carries the value as `RAVEL_S3_REQUEST_STORED_CHECKSUM`, and editing this field re-runs it. |
+| `spec.storage.s3.auth` | string | `static` | Where the pods and the operator get their storage credentials. `static`: the key pair in `credentialsSecretRef`. `podIdentity`: EKS Pod Identity roles, with no key in any Secret; see [Pod Identity](#pod-identity). IRSA (web identity) is not supported. Switching modes re-runs store qualification. |
+| `spec.storage.s3.credentialsSecretRef.name` | string | required under `auth: static` | Secret with keys `accessKeyId` and `secretAccessKey`. A CEL rule refuses a `static` cluster without it. Not read under `auth: podIdentity`. |
+| `spec.storage.azure.account` | string | required under `storage.azure` | Storage account, 3 to 24 lowercase letters and digits (the CRD refuses any other shape at admission), rendered as `--azure-account` on every server container and `RAVEL_AZURE_ACCOUNT` on the store-qualification Job. The account must have hierarchical namespace disabled. See [Azure Blob Storage with workload identity](#azure-blob-storage-with-workload-identity). |
+| `spec.storage.azure.container` | string | required under `storage.azure` | Container, 3 to 63 lowercase letters, digits and single hyphens, starting and ending with a letter or digit (checked at admission), rendered as `--azure-container` and `RAVEL_AZURE_CONTAINER`. |
+| `spec.storage.azure.clientId` | string | required under `storage.azure` | Client ID (a UUID, checked at admission) of the user-assigned managed identity the pods run as, written as the `azure.workload.identity/client-id` annotation on each of the four operator-owned ServiceAccounts whose role `roleClientIds` leaves unset. Changing it rolls the pods of every tier `roleClientIds` leaves unset. |
+| `spec.storage.azure.roleClientIds.gateway`, `.query`, `.maintain`, `.qualify` | string | `clientId` | Per-role client ID (a UUID), so each role can run as its own managed identity with its own data access. Editing a tier's entry rolls that tier's pods. Editing the `qualify` entry, or `clientId` while `qualify` is unset, re-runs store qualification. |
+| `spec.tenantTokensSecretRef.name` | string | none | Secret whose keys are tenant names and whose values are bearer tokens. |
+| `spec.deploymentKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters or 32 raw bytes): the deployment key. Enables the keyed tenant hash and `sys/auth` bearer-token reconciliation, see "`sys/auth` ownership" below. Omit to leave both off. |
+| `spec.auditTokenKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters): the query-audit token key. Omit on a cluster with `deploymentKeySecretRef` set. See "Query-audit token key" below. |
+| `spec.gateway.replicas` | integer | `1` | |
+| `spec.gateway.resources` | object | `requests: {cpu: 100m, memory: 256Mi}`, no limits | `requests` / `limits` maps, as in a Pod spec. An explicit block replaces the default entirely rather than merging with it. |
+| `spec.gateway.fold` | object | none | Retired, and refused rather than ignored: the scheduled fold runs on the maintain Deployment, and a `ravel-server` in `--mode gateway` refuses both fold flags at startup. Setting this block degrades the cluster with reason `GatewayFoldUnsupported` and renders nothing; move it to `spec.maintain.fold`. |
+| `spec.gateway.maxInflightFlushes` | integer | `8` | `--max-inflight-flushes`. Per-shard cap on concurrent flushes. This is the cross-tenant flush isolation control, not only a throughput knob: one tenant holds at most its per-tenant share of these permits, so a co-resident tenant's flush takes a free one while that tenant's prefix is stalled. At `1` there is no free permit and one stalled flush blocks every co-resident tenant on that shard; the server logs a warning. Gateway-only (ingest runs in no other tier). Omit to keep the server default of `8`; `0` is rejected at admission. |
+| `spec.gateway.maxInflightFlushesPerTenant` | integer | none | `--max-inflight-flushes-per-tenant`. How many of a shard's flush permits one tenant may hold; a trigger past it is deferred, not shed. Omit to keep the server default of `max(1, maxInflightFlushes - 1)`. `0` is rejected at admission, and so is a value above `maxInflightFlushes` (or above 8, the server default, when `maxInflightFlushes` is unset). Gateway-only. |
+| `spec.gateway.ingestAffinity` | object | none | Layer-7 ingest affinity. Omit and nothing is rendered. Present, it pins tenant identity to a stable subset of gateway replicas, cutting flush PUTs by `replicas / subsetSize`, via one of two backends. Full reference, backend comparison, and sizing guidance in [ingest-affinity.md](ingest-affinity.md). |
+| `spec.gateway.ingestAffinity.enabled` | boolean | `true` | `false` deletes the rendered objects and returns to the affinity-absent render. |
+| `spec.gateway.ingestAffinity.backend` | string | `ingressNginx` | `ingressNginx` (deprecated, renders Ingress objects) or `ravelNative` (renders the `ravel-ingest-router` service). Omitting it keeps an existing CR's backend. |
+| `spec.gateway.ingestAffinity.routerImage` | string | none | The `ravel-ingest-router` image. Required under `backend: ravelNative` (a different binary from `spec.image`); unset there degrades the router with reason `RouterImageMissing`. No effect under `ingressNginx`. |
+| `spec.gateway.ingestAffinity.subsetSize` | integer | `2` | Replicas a tenant is pinned to. Two, not one, so a single replica loss does not concentrate a tenant on one process. A subset is a throughput ceiling; raise it for a high-volume tenant. |
+| `spec.gateway.ingestAffinity.key.source` | string | `authorizationHeader` | `authorizationHeader`, `header` (with `key.headerName`), `mtlsSubject`, or `canonicalTenant` (requires `backend: ravelNative`). The key must come from authentication material: Ravel resolves tenancy server-side from the credential, so a URL path carries nothing routable. |
+| `spec.gateway.ingestAffinity.ingressClassName` | string | none | Legacy `ingressNginx` only. |
+| `spec.gateway.ingestAffinity.hosts` | list | `[]` | Legacy `ingressNginx` only. Empty renders one host-less rule. |
+| `spec.gateway.ingestAffinity.tlsSecretName` | string | none | Legacy `ingressNginx` only. Renders `spec.tls`. Effectively required for OTLP/gRPC, which needs HTTP/2. |
+| `spec.gateway.ingestAffinity.grpc` | boolean | `true` | Legacy `ingressNginx` only. Also render the OTLP/gRPC Ingress. |
+| `spec.gateway.ingestAffinity.annotations` | map | `{}` | Legacy `ingressNginx` only. Extra Ingress annotations, merged before the affinity annotations. `nginx.ingress.kubernetes.io/proxy-body-size` belongs here: the ingress-nginx default of `1m` rejects larger OTLP/HTTP exports. |
+| `spec.gateway.exposure.gatewayApi` | object | none | Gateway API exposure, independent of `ingestAffinity`. Renders `HTTPRoute`/`GRPCRoute` onto an existing `Gateway` instead of Ingress objects. Fields `gatewayRef.name`/`gatewayRef.namespace`, `hostnames`, `grpc` (default true). See [ingest-affinity.md](ingest-affinity.md). |
+| `spec.query.replicas` | integer | `1` | |
+| `spec.query.resources` | object | `requests: {cpu: 200m, memory: 512Mi}`, no limits | An explicit block replaces the default entirely rather than merging with it. |
+| `spec.query.distributedQuery` | object | none | Distributed PromQL fan-out across the query replicas, on the dedicated TLS fragment listener. Omit and nothing is rendered. See "Distributed query" below. |
+| `spec.query.distributedQuery.enabled` | boolean | `false` | `true` renders the distributed-query flags, the fragment port, the four Secret mounts, and the fragment NetworkPolicy. `false` renders none of them and deletes the NetworkPolicy once the query Deployment without them has finished rolling out. |
+| `spec.query.distributedQuery.fragmentTlsSecretRef.name` | string | none | Secret with keys `tls.crt` and `tls.key`: the fragment listener's certificate and private key. Required when `enabled`. |
+| `spec.query.distributedQuery.fragmentCaSecretRef.name` | string | none | Secret with key `ca.crt`: the CA that signed every query pod's fragment certificate. May name the same Secret as `fragmentTlsSecretRef`. Required when `enabled`. |
+| `spec.query.distributedQuery.fragmentKeySecretRef.name` | string | none | Secret with key `keys`: the fragment key file. Required when `enabled`. |
+| `spec.query.distributedQuery.sqlTicketKeySecretRef.name` | string | none | Secret with key `keys`: the SQL ticket key file. Required when `enabled`. |
+| `spec.query.memoryBudgetBytes` | integer | none | Pins the memory budget of the query pods: renders `--memory-budget-bytes` with this value on the query pods only. Needs `spec.query.resources.limits.memory` of at least the budget plus 256 MiB; otherwise the operator leaves the query Deployment unchanged and reports `Degraded`. Unset, the budget derives from the memory limit. Minimum `1`. See "Pinning the query memory budget" below. |
+| `spec.query.memoryHeadroomBytes` | integer | provisional default from the budget | Memory to leave in the limit above the budget plus 256 MiB. A smaller gap reports `Degraded` with reason `QueryMemoryHeadroomLow` and still rolls the query pods. Setting it without `memoryBudgetBytes` is refused. See "Pinning the query memory budget" below. |
+| `spec.query.mcp` | object | none | Serves the MCP server at `POST /mcp` on the query pods. Omit and nothing is rendered. See "Serving MCP from the query pods" below. |
+| `spec.query.mcp.enabled` | boolean | `false` | `true` renders `--mcp` and `--mcp-allowed-origins` on the query pods only. `false` renders no MCP flag, whatever the other fields hold. |
+| `spec.query.mcp.allowedOrigins` | list of strings | `[]` | `Origin` header values `POST /mcp` accepts, each compared whole and ignoring ASCII case, rendered comma-joined into `--mcp-allowed-origins`. At least one entry is required when `enabled` is `true`. An empty entry or one containing a comma is refused. At most 64 entries of at most 1024 characters. |
+| `spec.query.mcp.maxBodyBytes` | integer | none | Renders `--mcp-max-body-bytes` when `enabled`. Unset, the server default of 1 MiB applies. Minimum `1`. |
+| `spec.maintain.enabled` | boolean | `true` | `false` deletes the maintain Deployment. `true` renders it only with `keySecretRef` set. |
+| `spec.maintain.keySecretRef.name` | string | none | Secret with key `keys`: the maintain key file, mounted and passed as `--maintain-key-file`. Required when `enabled`. See "Maintain key file" below. |
+| `spec.maintain.replicas` | integer | `1` | |
+| `spec.maintain.intervalSecs` | integer | none | `--maintain-interval-secs`. Minimum `1`: `0` is refused at admission, since the server refuses a zero interval at startup. |
+| `spec.maintain.fold.disabled` | boolean | `false` | `--disable-fold` on the maintain pods, the only Deployment the operator renders that runs the scheduled fold. Fold is a query-cost optimization only; disabling it never changes results. |
+| `spec.maintain.fold.intervalSecs` | integer | none | `--fold-interval-secs` on the maintain pods. While the maintain Deployment renders (`spec.maintain.enabled` true) and its fold runs (`spec.maintain.fold.disabled` false), the operator also passes it to the query pods as `--fold-lag-interval-secs`, so their request-budget refusals classify fold lag against the interval the maintain pods really fold on rather than the 300 s default; otherwise the query pods get no such flag. That flag requires a server image that has `--fold-lag-interval-secs`, and while that fold runs, editing this field rolls the query pods too. See "The fold-lag interval on the query pods" below. Minimum `1`: `0` is refused at admission, since the server refuses a zero interval at startup. |
+| `spec.maintain.resources` | object | `requests: {cpu: 100m, memory: 256Mi}`, no limits | An explicit block replaces the default entirely rather than merging with it. |
+| `spec.maintain.scratch.sizeGi` | integer | none | Size in GiB of the maintain pods' `scratch` `emptyDir` and of their `ephemeral-storage` request. Setting `spec.maintain.scratch` also mounts the volume and passes `--maintain-scratch-dir` and `--maintain-scratch-max-bytes` (`sizeGi` GiB in bytes). Those flags require a `ravel-server` image from a release that includes the two-level merge flags; an older image refuses the unknown flag at startup. Minimum `1`. An `ephemeral-storage` limit in `spec.maintain.resources.limits` below `sizeGi` is refused. About 1.3 times the largest merge unit's input bytes. See "Maintain scratch volume" below. |
+| `spec.maintain.scratch.mountPath` | string | `/var/lib/ravel/scratch` | Where the volume is mounted, and the value of `--maintain-scratch-dir`. |
+| `spec.gc.protectionHorizon` | string | none | `--gc-protection-horizon` on the maintain pods, a duration such as `25h5m`. It must equal the protection horizon stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
+| `spec.gc.grace` | string | none | `--gc-grace` on the maintain pods, a duration such as `24h`. It must equal the grace stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
+| `spec.retention.default` | string | none | Duration string, e.g. `30d`. |
+| `spec.retention.tenants` | map | none | Per-tenant overrides, tenant name to duration. |
+| `spec.probes.dedicatedHealthPort` | boolean | `true` | Probe the dedicated health listener on 4316 instead of the main HTTP port. Requires a server image of v0.19.0 or newer, which has `--listen-health`. Set `false` to keep probes on the main HTTP port. An existing cluster keeps its stored value; see "The dedicated health port" below. |
+
+`spec.storage` sets exactly one of `s3` and `azure`: a CEL rule on
+`storage` refuses a spec with neither or both at admission, and the
+operator refuses one admitted before the rule existed with `Degraded`,
+reason `StorageBackendNotExactlyOne`. No field selects the memory store,
+because a non-durable per-process store is incoherent across multiple pods. No field
+can produce `--dev-insecure-tenant-header`, and the operator never sets it
+under any configuration.
+
+The operator injects tenant tokens as env vars from the Secret. It renders
+them into `--tenant-token $(RAVEL_TENANT_TOKEN_<i>)=<tenant>` with kubelet
+`$(VAR)` expansion, so token values never appear in the API object. The
+values still appear in process argv on the node, because `ravel-server` reads
+tenant tokens from flags and has no env or file token source. A checksum
+annotation on each pod template rolls the pods when either Secret changes.
+
+### `sys/auth` ownership
+
+When `spec.deploymentKeySecretRef` is set, the operator also converges
+`sys/auth` to the current contents of `spec.tenantTokensSecretRef`, on every
+reconcile cycle. `sys/auth` is the durable deployment-wide bearer-token map
+at the bucket root.
+
+`ravel-cli tenant token upsert|revoke` keeps working alongside the operator.
+The two writers share the map, and each entry is tagged with who owns it. The
+operator removes only the entries that it wrote:
+
+| Entry | What the operator does |
+|---|---|
+| A tenant present in the token Secret | Upserts it with `managed_by=operator`. |
+| A tenant present in `sys/auth`, absent from the Secret, and tagged `managed_by=operator` | Revokes it. |
+| A tenant provisioned by `ravel-cli tenant token upsert` (tagged `managed_by=cli` by default, or a value passed via `--managed-by`) | Never touches it. |
+| A v1-shaped entry with no `managed_by` field at all (unmanaged: written before this field existed, or declared unowned) | Never touches it. |
+
+The pass has these properties:
+
+- The operator skips the whole `sys/auth` pass for a cycle in two cases: the
+  CRD sets a deployment key but no `tenantTokensSecretRef`, or the Secret
+  resolves to zero tenants. It makes no upserts and no removals, and logs a
+  warning. An empty read is never treated as "revoke every operator-managed
+  tenant."
+- A reconcile against an unchanged token Secret performs zero `sys/auth`
+  writes. The operator first compares each tenant's entry against its current
+  stored value. It rewrites the entry only on a difference.
+- The operator retries a `sys/auth` write a bounded number of times against
+  a concurrent writer (another operator replica, or a `ravel-cli` call racing
+  it). If the write still fails after that budget, the operator logs the
+  failure and continues to reconcile the Deployments and Services.
+  `sys/auth` reconciliation never blocks or fails the rest of the cycle.
+- The `resourceVersion` of `spec.deploymentKeySecretRef` feeds the same
+  pod-template secrets checksum as the token and credential Secrets. A
+  rotation of the deployment key therefore rolls the pods of all three
+  Deployments, the same as a rotation of a tenant token or a credential.
+
+For the `sys/auth` format itself and `ravel-cli tenant token`'s own
+subcommands, see
+[operations/configuration.md](operations/configuration.md#tenancy-setup) and
+the [CLI flag reference](../reference/ravel-cli-flags.md).
+
+### Query-audit token key
+
+The query Deployment reads `RAVEL_AUDIT_TOKEN_KEY` from a Secret's `key`
+field when audit logging is enabled. Gateway and maintain Deployments never
+read this key.
+
+If `spec.deploymentKeySecretRef` is set, omit `auditTokenKeySecretRef`. The
+server derives the key from the deployment key, and nothing further is
+needed.
+
+Otherwise, set `spec.auditTokenKeySecretRef` to a Secret that the platform
+owner creates, in the same way as the S3 credentials and tenant-tokens
+Secrets:
+
+```sh
+kubectl create secret generic ravel-audit-token-key \
+  --namespace ravel-system \
+  --from-literal="key=$(openssl rand -hex 32)"
+```
+
+Its `key` field must hold 64 hex characters (32 bytes), no more and no fewer.
+
+If you omit both, the query Deployment cannot start with audit tokenization
+enabled. The operator does not generate this Secret: its `secrets` RBAC
+grants `get` only, so it cannot create or patch one. The `RavelCluster`
+reports a `Degraded` condition with reason `AuditTokenKeyMissing`. The
+operator leaves the query Deployment unchanged, and any existing query pods
+keep serving on their current spec, until you set `auditTokenKeySecretRef`
+or `deploymentKeySecretRef`.
+
+### Maintain key file
+
+`ravel-server --mode maintain` refuses to start without
+`--maintain-key-file`. The key authenticates the heartbeat records through
+which the maintain pods divide maintenance work; see
+[the maintain key file](operations/deployment.md#the-maintain-key-file) for
+the file format and why it exists. The operator renders the flag only from
+`spec.maintain.keySecretRef`:
+
+| Reference | Secret key | Mounted at | Flag |
+|---|---|---|---|
+| `maintain.keySecretRef` | `keys` | `/etc/ravel/maintain-key/` | `--maintain-key-file` |
+
+Only the maintain pods mount it. Create the Secret yourself; the operator
+reads only its `resourceVersion`, never its value:
+
+```sh
+kubectl create secret generic ravel-maintain-keys \
+  --namespace ravel-system \
+  --from-literal="keys=$(openssl rand -hex 32)"
+```
+
+```yaml
+spec:
+  maintain:
+    keySecretRef:
+      name: ravel-maintain-keys
+```
+
+The Secret's `resourceVersion` feeds the maintain pod template's secrets
+checksum, so an edit to the Secret rolls the maintain pods, and leaves the
+gateway and query pods alone. As with every other Secret, the operator
+notices the edit at its next reconcile of the `RavelCluster`, up to 5
+minutes later. Rotate the key with the three rolling restarts in
+[the deployment guide](operations/deployment.md#the-maintain-key-file): each
+of the three edits to the Secret is one roll, and each roll must finish
+before the next edit.
+
+#### Running without the reference
+
+With `maintain.enabled` and no `maintain.keySecretRef`, the operator
+withholds the maintain Deployment: it neither applies nor deletes an
+existing one, and on a cluster that has none it creates none, because a
+maintain pod without the flag cannot start. The `RavelCluster` reports
+`Degraded=True` with reason `MaintainKeySecretRefMissing` and a message
+naming `spec.maintain.keySecretRef`. A reference to a Secret that does not
+exist yet does the same with reason `SecretNotFound` and a message naming
+the Secret. The maintain PodDisruptionBudget is still applied; it selects
+no pods until a maintain pod exists. Once the Secret exists and the
+reference is set, the next reconcile applies the maintain Deployment with
+the key file.
+
+What happens to the rest of the cluster depends on whether it already runs:
+
+- **Existing cluster, upgraded to this operator.** The maintain Deployment
+  keeps the pod template an earlier operator applied, and the gateway and
+  query Deployments keep reconciling. The maintain pods keep running only
+  while they keep the image they started on. If `spec.image` uses a mutable
+  tag that now points at this release, a maintain pod that restarts for any
+  reason (a crash, an eviction, a node drain) pulls the new `ravel-server`
+  under `spec.imagePullPolicy: Always`, or on a node that has not cached the
+  old image. That binary refuses `--mode maintain` without
+  `--maintain-key-file`, so the pod does not start. Pin `spec.image` to a
+  digest or an immutable tag, or create the Secret before you upgrade.
+- **Fresh cluster on per-role storage credentials** (a per-mode
+  `credentialsSecretRef`, or `storage.s3.auth: podIdentity`). The gateway
+  and query Deployments wait for maintain to create `sys/gc` (see
+  [the `sys/gc` bootstrap order](#the-sysgc-bootstrap-order)), and maintain
+  is withheld, so the operator creates no `ravel-server` Deployment until
+  the Secret exists. The reason stays `MaintainKeySecretRefMissing` or
+  `SecretNotFound` after five minutes rather than turning into
+  `GcBootstrapStalled`.
+- **Fresh cluster on one shared credential.** The gateway and query
+  Deployments are created and reconcile as usual; only maintain is missing.
+
+Maintain pods from an earlier release and pods on this one do not admit each
+other's heartbeat records, so during the roll onto the key file some
+maintenance work runs twice until it completes.
+
+### Maintain scratch volume
+
+The two-level RLOG merge writes intermediate runs to a local scratch
+directory. `spec.maintain.scratch` gives the maintain pods one:
+
+```yaml
+spec:
+  maintain:
+    keySecretRef:
+      name: ravel-maintain-keys
+    scratch:
+      sizeGi: 90
+      # mountPath: /var/lib/ravel/scratch   (the default)
+```
+
+With the block set, the operator renders five things on the maintain
+Deployment, and without it none of them:
+
+- an `emptyDir` volume named `scratch` with `sizeLimit` `<sizeGi>Gi`;
+- a mount of that volume at `mountPath` in the `ravel-server` container;
+- `--maintain-scratch-dir <mountPath>`;
+- `--maintain-scratch-max-bytes` set to `sizeGi` GiB in bytes
+  (`sizeGi * 2^30`);
+- an `ephemeral-storage` request of `<sizeGi>Gi` on the `ravel-server`
+  container, beside its other requests. It replaces any `ephemeral-storage`
+  request in `spec.maintain.resources`.
+
+The two flags require a `ravel-server` image from a release that includes the
+two-level merge flags. An older image does not know
+`--maintain-scratch-dir` or `--maintain-scratch-max-bytes` and fails at
+startup on the unknown flag, so every maintain pod crash-loops with the cause
+only in its container log.
+
+`sizeGi` must be at least `1`; `0` is refused at admission, and so is a
+relative `mountPath`. An `ephemeral-storage` limit in
+`spec.maintain.resources.limits` below `sizeGi` would put the request above
+the limit, which Kubernetes refuses: the operator renders no maintain
+Deployment change, leaves any running one as it is, and sets the cluster's
+`Degraded` condition with reason `MaintainScratchExceedsEphemeralLimit`,
+naming both values. A limit at or above `sizeGi` is kept.
+
+The directory is a cache only. The server wipes each merge unit's
+subdirectory when the unit ends, never publishes a run from it, and a pod
+that loses it restarts the unit from object storage. Unit subdirectories a
+dead process left are removed when the first two-level merge takes the
+directory's lock; other files there are kept, and they count against the
+`sizeGi` limit the operator passes as `--maintain-scratch-max-bytes`. An `emptyDir` on node disk is
+therefore the whole contract, and no PersistentVolumeClaim is needed. Size
+it to about 1.3 times the input bytes of the largest merge unit: before a
+merge reads its first block it computes that need and refuses the unit,
+naming the need and the free space, when the directory cannot hold it.
+
+The free space the server compares against is the smaller of the filesystem's
+free space and `--maintain-scratch-max-bytes` less what the scratch directory
+already holds. The filesystem figure alone is not enough on Kubernetes: for an
+`emptyDir` it is the node's free disk, while the kubelet enforces `sizeLimit`
+by evicting the pod. With the max-bytes bound, the server refuses a unit whose
+need exceeds the volume size instead of filling the volume and being evicted
+mid-merge.
+
+### Distributed query
+
+`spec.query.distributedQuery` turns on distributed PromQL fan-out across the
+query replicas, over the dedicated TLS fragment listener. What the lanes do,
+and what each flag means, is in the
+[distributed query guide](distributed-query.md) and the
+[deployment guide](operations/deployment.md#the-dedicated-fragment-listener).
+
+SQL fan-out is not reachable through this block yet. It runs only for a
+Flight SQL client, and it needs a Flight SQL client path that the operator
+does not expose yet:
+
+- The operator gives the query Deployment no `--listen-grpc`, so its Flight
+  SQL service listens on loopback only.
+- The HTTP SQL endpoint executes every statement locally.
+
+```yaml
+spec:
+  query:
+    replicas: 3
+    distributedQuery:
+      enabled: true
+      fragmentTlsSecretRef:
+        name: ravel-fragment-tls
+      fragmentCaSecretRef:
+        name: ravel-fragment-tls
+      fragmentKeySecretRef:
+        name: ravel-fragment-keys
+      sqlTicketKeySecretRef:
+        name: ravel-sql-ticket-keys
+```
+
+#### Secrets for the block
+
+The block expects four Secrets in the `RavelCluster`'s namespace. The
+operator mounts them. It reads only their `resourceVersion` (a metadata-only
+read) to detect a rotation. It never loads their values, and never creates
+or rotates them.
+
+If a referenced Secret is missing from the namespace, the operator holds back
+only the query Deployment, and its running pods keep serving on their current
+spec. The operator keeps the fragment NetworkPolicy in place, records a
+`Degraded` condition naming the Secret, and reconciles the gateway and
+maintain Deployments as usual.
+
+| Reference | Secret keys | Mounted at | Flag |
+|---|---|---|---|
+| `fragmentTlsSecretRef` | `tls.crt`, `tls.key` | `/etc/ravel/fragment-tls/` | `--fragment-tls-cert`, `--fragment-tls-key` |
+| `fragmentCaSecretRef` | `ca.crt` | `/etc/ravel/fragment-ca/` | `--fragment-tls-ca` |
+| `fragmentKeySecretRef` | `keys` | `/etc/ravel/fragment-key/` | `--fragment-key-file` |
+| `sqlTicketKeySecretRef` | `keys` | `/etc/ravel/sql-ticket-key/` | `--sql-ticket-key-file` |
+
+The certificate needs a `ravel-fragment` dNSName SAN and both the
+`serverAuth` and `clientAuth` extended key usages, because each query pod
+presents it in both directions of the mutual handshake.
+
+A cert-manager `Certificate` can write `tls.crt`, `tls.key`, and `ca.crt`
+into one Secret, and both TLS references can then name that Secret. Give the
+`Certificate` `dnsNames: [ravel-fragment]` and
+`usages: [server auth, client auth]`, and issue it from a CA issuer.
+cert-manager writes `ca.crt` only when the issuer is a CA it holds, such as a
+`CA` or self-signed issuer.
+
+The two key files hold one 64-hex-character key per line. Give them different
+keys:
+
+```sh
+kubectl create secret generic ravel-fragment-keys \
+  --from-literal="keys=$(openssl rand -hex 32)"
+kubectl create secret generic ravel-sql-ticket-keys \
+  --from-literal="keys=$(openssl rand -hex 32)"
+```
+
+#### What the block renders
+
+With the block enabled and all four references set, the query Deployment
+gains these arguments, the `fragment` container port 4319, the four
+read-only Secret volumes, and a `RAVEL_POD_IP` env var from the downward API
+(`status.podIP`):
+
+```text
+--distributed-query
+--fragment-key-file /etc/ravel/fragment-key/keys
+--sql-ticket-key-file /etc/ravel/sql-ticket-key/keys
+--fragment-listener 0.0.0.0:4319
+--fragment-tls-cert /etc/ravel/fragment-tls/tls.crt
+--fragment-tls-key /etc/ravel/fragment-tls/tls.key
+--fragment-tls-ca /etc/ravel/fragment-ca/ca.crt
+--advertise-fragment-endpoint $(RAVEL_POD_IP)
+```
+
+The fragment listener binds a wildcard address, which `ravel-server` refuses
+to publish to sibling coordinators. Each pod therefore advertises its own pod
+IP.
+
+The operator also applies the NetworkPolicy `<cluster>-query-fragment`,
+owned by the `RavelCluster`. It selects the query pods and has two ingress
+rules:
+
+- Port 4319, from the query pods of the same cluster and namespace only.
+- Every other port the query container declares (4318, and 4316 under
+  `spec.probes.dedicatedHealthPort`), from any source.
+
+A NetworkPolicy that selects a pod isolates every port on it, so the second
+rule keeps client and probe traffic flowing as before. A sidecar or another
+injected container can listen on a port that the `ravel-server` container
+does not declare. That port is not in the second rule, so the policy blocks
+it.
+
+The policy has an effect only on a cluster whose network plugin enforces
+NetworkPolicy. The operator's ClusterRole grants `create`, `patch`, and
+`delete` on `networkpolicies` for it.
+
+#### Incomplete or disabled block
+
+Each of these configurations renders a local-only query Deployment and none
+of the objects above:
+
+- `enabled: true` with any reference unset. The `RavelCluster` also reports
+  `Degraded` with reason `DistributedQuerySecretRefMissing` and a message
+  naming each unset field, such as
+  `spec.query.distributedQuery.fragmentCaSecretRef`.
+- `enabled: false`.
+- The block removed.
+
+In each case, a block that was enabled and complete rolls the query
+Deployment back to local-only arguments.
+
+#### Policy removal
+
+The operator deletes the NetworkPolicy only once the rollout of that query
+Deployment has completed. A complete rollout means that the query Deployment
+has no pod left on an older spec, including terminating pods:
+
+- `status.observedGeneration` equals `metadata.generation`.
+- `status.updatedReplicas` equals `status.replicas`.
+- `status.unavailableReplicas` is zero or absent.
+- `status.terminatingReplicas` is zero, when the cluster reports it.
+
+Until then the old pods, which still listen on port 4319, stay behind the
+policy. Every reconcile that a status change of the Deployment triggers
+checks again.
+
+These cases follow the same rollout condition:
+
+- A pass that holds the query Deployment back, such as one reporting
+  `AuditTokenKeyMissing`, deletes no NetworkPolicy. When you enable the
+  block, the operator applies the policy even in such a pass, before the
+  held-back Deployment.
+- A change that narrows the policy while the block stays enabled waits for
+  the rollout. Turning `spec.probes.dedicatedHealthPort` off is such a
+  change. While query pods of an older spec can still be running, the
+  second rule also admits every port those pods can listen on (4318 and
+  4316). The operator narrows the rule to the new spec's ports once the
+  rollout completes.
+- Disabling the block holds that wider policy too, from the first disabling
+  pass, whenever the live query Deployment's pod template still opens port
+  4319. A port that the new pods open, such as a dedicated health port
+  turned on in the same change, is therefore not blocked under the old
+  policy. The operator deletes the policy only once the rollout completes.
+
+The operator waits for `status.terminatingReplicas` so that it does not
+delete or narrow the policy while an old pod is still shutting down on the
+fragment port. A cluster does not report that field before Kubernetes 1.33,
+or with the feature gate off. The operator then cannot see terminating pods.
+The policy can be removed while one lingers, for up to that pod's termination
+grace period (45s, or 51s with the dedicated health port). In that window,
+the fragment listener's own mutual TLS still refuses any peer that presents
+no certificate from the fragment CA.
+
+#### Upgrading the operator
+
+When you upgrade the operator to a version with this block, apply
+`deploy/k8s/operator/rbac.yaml` before you roll out the new operator image.
+
+- On a cluster without the block, a reconcile whose query rollout is complete
+  issues a delete for any fragment NetworkPolicy. Without the
+  `networkpolicies` grant, that delete fails the reconcile.
+- A cluster with the block already enabled sees one query rollout on the
+  upgrade. The four Secrets' `resourceVersion`s now feed the query pod
+  template's checksum, which moves it once.
+- If one of those four Secrets is missing, that upgrade pass holds the query
+  Deployment back and reports `Degraded` naming the Secret. The gateway and
+  maintain Deployments still reconcile.
+
+#### Rotating a Secret
+
+`ravel-server` reads all four files once at startup. The four Secrets'
+`resourceVersion`s therefore feed the query pod template's secrets checksum,
+the same way the deployment key Secret's does. An edit to any one of them
+rolls the query pods, and leaves the gateway and maintain pods alone.
+
+The operator does not watch Secrets. It notices an edited Secret at its next
+reconcile of the `RavelCluster`, which can be up to 5 minutes (its resync
+interval) after the edit. It picks up a missing Secret that is created later
+within the same interval.
+
+Follow the key rotation order in the deployment guide. Each edit in that
+sequence must be its own roll:
+
+1. Make one edit.
+2. Wait until the query Deployment shows a new rollout. A new rollout shows
+   as a changed `ravel.nofire.ai/secrets-checksum` annotation on its pod
+   template, or as a new ReplicaSet:
+
+   ```sh
+   kubectl get deployment <cluster>-query \
+     -o jsonpath='{.spec.template.metadata.annotations.ravel\.nofire\.ai/secrets-checksum}'
+   kubectl get replicaset -l app.kubernetes.io/instance=<cluster>,app.kubernetes.io/component=query
+   ```
+
+3. Wait for that rollout to finish with
+   `kubectl rollout status deployment/<cluster>-query`.
+4. Make the next edit.
+
+Do not run `kubectl rollout status` right after an edit. It can report the
+previous, finished rollout. An edit made then can coalesce into the same
+roll, which breaks the add, roll, remove order.
+
+### Managed objects
+
+For a `RavelCluster` named `dev`:
+
+| Object | Kind | Notes |
+|---|---|---|
+| `dev-qualify` | Job | One-shot `ravel-cli store qualify` run, before any serving Deployment exists. Recreated when its inputs change; see [store qualification](#store-qualification). |
+| `dev-gateway` | Deployment | `--mode gateway`, RollingUpdate. |
+| `dev-gateway` | Service | Ports 4318 (HTTP/OTLP/query API) and 4317 (OTLP/gRPC). |
+| `dev-query` | Deployment | `--mode query`, RollingUpdate. |
+| `dev-query` | Service | Port 4318. The fragment port is not on the Service: coordinators dial each query pod's own IP. |
+| `dev-query-fragment` | NetworkPolicy | Admits port 4319 on the query pods only from the query pods. Only under `query.distributedQuery` enabled with every Secret reference set. |
+| `dev-maintain` | Deployment | `--mode maintain`, `spec.maintain.replicas` replicas (default 1), `RollingUpdate` strategy, mounting `maintain.keySecretRef` for `--maintain-key-file`. Absent when `maintain.enabled` is `false`. Without `maintain.keySecretRef`, or while its Secret does not exist, not created, and an existing one is left unchanged; see "Maintain key file" above. |
+| `dev-gateway-ingest` | Ingress | OTLP/HTTP ingest under the tenant-affinity hash. Only under `ingestAffinity` enabled on `backend: ingressNginx`. |
+| `dev-gateway-ingest-grpc` | Ingress | The same for OTLP/gRPC. Additionally absent when `ingestAffinity.grpc` is `false`. |
+| `dev-ingest-router` | Deployment, Service, ServiceAccount, Role, RoleBinding | The `ravel-ingest-router` and its least-privilege RBAC. Only under `ingestAffinity` enabled on `backend: ravelNative`. See [ingest-affinity.md](ingest-affinity.md). |
+| `dev-gateway-route` | HTTPRoute | Gateway API exposure. Only under `gateway.exposure.gatewayApi`, independent of the backend. |
+| `dev-gateway-route-grpc` | GRPCRoute | The same for OTLP/gRPC. Absent when `exposure.gatewayApi.grpc` is `false`. |
+| `dev-gateway`, `dev-query`, `dev-maintain`, `dev-qualify` | ServiceAccount | The accounts the three tiers and the qualify Job run as. Only under `storage.s3.auth: podIdentity` or `storage.azure`; see [Pod Identity](#pod-identity) and [Azure Blob Storage with workload identity](#azure-blob-storage-with-workload-identity). After a switch to S3 `static` the operator deletes them by name, so do not create accounts with these names yourself in a cluster that has run under either. A cluster that never ran under either does not touch them. |
+
+You can scale `spec.maintain.replicas` above one safely. Maintain renders
+`RollingUpdate`, the same as gateway and query. It defaults to one replica
+but is not pinned there.
+
+Maintenance ownership is heartbeat membership plus rendezvous hashing. It is
+not a lease:
+
+- Each maintain process overwrites a self-owned heartbeat key under
+  `sys/maintain/workers/<process_id>` in object storage on a heartbeat
+  interval.
+- Every process lists that prefix to compute the live set of workers whose
+  heartbeat is recent enough.
+- All processes partition the `(tenant, signal, shard)` unit space over that
+  live set by rendezvous (highest-random-weight) hashing.
+
+Nothing is renewed and nothing expires. Once a heartbeat falls outside the
+staleness window, its owner is treated as gone and its units are taken over
+on the next interval. A process that comes back rejoins by writing its
+heartbeat again. The keyspace, the heartbeat interval, and the staleness
+window are specified in
+[catalog-and-mvcc.md](../catalog-and-mvcc.md#key-layout-all-under-one-bucket-root).
+
+A rolling restart can leave an old and a new pod briefly claiming overlapping
+units at once. That only duplicates work. It does not corrupt committed
+state.
+
+### Store qualification
+
+Before it creates any serving Deployment, the operator renders a one-shot
+`<cluster>-qualify` Job that runs `ravel-cli store qualify` against the
+cluster's bucket. It holds the gateway, query, and maintain Deployments until
+the Job succeeds. This is the same check that the [deployment
+guide](operations/deployment.md#qualify-the-store) has you run by hand
+against a bucket you manage yourself. The operator runs it for you, so a
+fresh `RavelCluster` never crash-loops on a backend that fails the
+[object-store contract](../object-store-contract.md). On a fresh
+cluster no serving pod is created until the Job passes, so there is no
+crash-loop to observe: the Deployments do not exist yet. On a cluster
+that is already serving, a config edit can start a new qualification. The
+existing Deployments then keep running the previous spec while the new Job
+proves the new inputs.
+
+During that hold, `observedGeneration` advances to the edited generation, and
+`Available` stays `True` on the previous spec's ready replicas. `Available`
+can therefore report ready before any pod has moved to the new spec. After a
+spec edit that changed a qualified input (the server image, for one), also
+wait for `StoreQualified=True` at
+`observedGeneration == .metadata.generation`.
+
+#### When the Job runs
+
+The operator recreates the Job only when its inputs change: the bucket,
+region, endpoint, `allowHttp`, `uploadIntegrity`, `requestStoredChecksum`,
+server image, or the shared credentials Secret's name or `resourceVersion`.
+A switch of `storage.s3.auth` between `static` and `podIdentity` is a change
+of input too. On a `storage.azure` cluster the inputs are the account, the
+container, the server image and the `qualify` client ID, and a switch
+between S3 and Azure always re-qualifies. Upgrading the operator does not
+re-qualify an S3 cluster: its inputs hash exactly as before the `auth` and
+`azure` fields existed.
+
+- A rotation of that Secret in place bumps its `resourceVersion`. A rotation
+  to credentials that no longer pass qualification therefore re-qualifies
+  too, within one resync interval.
+- An unrelated spec edit (a replica count, a fold interval) does not
+  recreate the Job.
+
+A pass durably records `sys/qualification` in the bucket. A qualified bucket
+handed to a new `RavelCluster` with the same inputs still gets its own Job
+run, because the gate reads this `RavelCluster`'s own status, not the bucket
+record.
+
+That run re-runs the full conformance suite and does not stop early on the
+existing record. At its default list page size, the run issues about two
+thousand object operations against the bucket, almost all of them
+sequential. The Job can therefore sit for minutes, even on a bucket you know
+is qualified.
+
+The run passes if the backend still satisfies the contract. The final
+`sys/qualification` write is then a no-op, with one exception. If the stored
+record predates this binary's suite version, the run overwrites the record in
+place and reports that it upgraded the record.
+
+Each run leaves transient scratch under `sys/qualify/<run-id>/`.
+Qualification runs on every input change, so that scratch accumulates. The
+[deployment guide](operations/deployment.md#qualify-the-store) describes that
+scratch and why nothing deletes it.
+
+#### Progress and failure
+
+Progress and failure show on the `StoreQualified` condition:
+
+- `Pending` while the Job is being created or is still running.
+- `Succeeded` once the Job passes.
+- `Failed` once a qualify Job reports failure. The message names the
+  consecutive-attempt count and the next retry time, so `Failed` alone is not
+  terminal.
+
+The operator recreates a failing Job on a capped exponential backoff (30 s
+doubling to 480 s) for the first five consecutive failures. After six, it
+holds for an hour before it tries again. Only a qualified-input change
+clears that hold early. A fix to the backend outside the `RavelCluster` spec
+(a bucket policy, an IAM grant, a network route) does not shorten the hold,
+because no hashed input changed.
+
+`kubectl describe job <cluster>-qualify` and its pod logs give the
+underlying `store qualify` failure, but only for about an hour. The Job and
+its pod are garbage-collected an hour after they finish, on the success and
+failure paths alike. The `StoreQualified` condition message is the durable
+record.
+
+If you run `ravel-server` against a bucket outside a `RavelCluster`, nothing
+qualifies the bucket for you. Use the hand-run path in the deployment guide.
+
+### Status
+
+```sh
+kubectl get -n ravel-system ravelcluster dev -o jsonpath='{.status}'
+```
+
+`status` carries `observedGeneration`, `gatewayReadyReplicas`,
+`queryReadyReplicas`, `maintainReadyReplicas`, `storeQualifiedHash`,
+`qualifyFailureCount`, `qualifyNextRetryTime`, `qualifyRetryHash`,
+`gcBootstrapWaitingSince`, `podIdentityServiceAccounts`, and conditions.
+`qualifyFailureCount` and `qualifyNextRetryTime` are the machine-readable
+form of the retry-budget state that the `StoreQualified` message describes in
+prose. `podIdentityServiceAccounts` is `true` from the first
+`storage.s3.auth: podIdentity` or `storage.azure` pass until the operator
+has deleted those ServiceAccounts after a switch to S3 `static`.
+
+The conditions are:
+
+- `Available`. `True` means that the gateway and query Deployments both
+  report ready replicas.
+- `Degraded`. If a reconcile fails (a missing Secret, an apply error), the
+  operator writes `Degraded=True` with the reason and sets `Available` to
+  `False`.
+- `StoreQualified`. The operator writes it on every pass: `True` with reason
+  `Succeeded` once the store is qualified for the current inputs, `False`
+  with `Pending` or `Failed` while it is not. A steady, healthy cluster
+  therefore always shows `StoreQualified=True`.
+- `KubernetesVersionUnsupported`. On a cluster below the Kubernetes 1.30
+  floor (see "Installing the operator yourself" above), every `RavelCluster`
+  also carries `KubernetesVersionUnsupported=True`. The condition names the
+  floor and the detected version. It appears alongside
+  `Available`/`Degraded` and does not replace them.
+- `IngestAffinityBackendDeprecated`. Present with status `True` while
+  `spec.gateway.ingestAffinity` is enabled with `backend: ingressNginx`; see
+  [Ingest affinity](ingest-affinity.md).
+- `HealthProbeOnMainHttpPort`. Present with status `True` only while the
+  resolved `spec.probes.dedicatedHealthPort` is `false`, most commonly a
+  cluster still holding the `false` that the CRDs from v0.19.0 stored on
+  every write until the default flipped to `true` (see "The
+  dedicated health port" below). Absent once probes resolve to the dedicated
+  listener, whether from an explicit `true` or the current schema default.
+- `BucketProtectionVerified`. Present only on a `storage.azure` cluster,
+  with status `False` and reason `NotImplementedForAzure`: the operator
+  renders no `--require-bucket-protection` there, because no Azure
+  container-protection check exists yet. Configure the protection by hand;
+  see [Azure Blob Storage with workload identity](#azure-blob-storage-with-workload-identity).
+
+The operator emits no `Progressing` condition, so do not wait on one.
+
+You can use `kubectl wait --for=condition=Available` as a readiness gate for
+scripts and CI. After a failed reconcile, the `kubectl wait` fails with an
+explanation and does not time out silently. After a spec edit, also gate on
+`StoreQualified=True` at `observedGeneration == .metadata.generation`, as
+described under [Store qualification](#store-qualification).
+
+The operator refuses a spec whose rendered pods cannot start in the same way,
+before it creates anything. A plaintext `http://` `spec.storage.s3.endpoint`
+whose host is not loopback, with `spec.storage.s3.allowHttp` unset, reports
+`Degraded=True` with reason `PlaintextS3Endpoint` and a message naming the
+field to set. A cluster that pointed at an in-cluster RustFS or floci by
+Service name before the endpoint rule changed is in this state after an
+upgrade. Set `allowHttp: true` to accept plaintext, or move the endpoint to
+`https://`.
+
+### The fold-lag interval on the query pods
+
+The query pods run no scheduled fold, so a request-budget refusal there
+classifies fold lag against the interval the maintain pods fold on. The
+operator renders `--fold-lag-interval-secs` on the query Deployment, set to
+`spec.maintain.fold.intervalSecs`, only when all three of these hold:
+
+- `spec.maintain.enabled` is true, so the maintain Deployment renders.
+- `spec.maintain.fold.disabled` is false, so its fold runs.
+- `spec.maintain.fold.intervalSecs` is set.
+
+In every other case the query pods get no such flag and classify against the
+server's 300 s default.
+
+Two consequences follow when you upgrade the operator or edit those fields:
+
+- The flag requires a `ravel-server` image that has `--fold-lag-interval-secs`,
+  meaning the release that added it or newer. On a cluster that already sets
+  `spec.maintain.fold.intervalSecs`, an operator upgrade adds the flag to the
+  query Deployment and rolls the query pods. `spec.image` is yours to pin.
+  An older server rejects the unknown flag at startup, so those pods
+  restart-loop. Upgrade `spec.image` before or together with the operator.
+- An edit to `spec.maintain.fold.intervalSecs`, `spec.maintain.fold.disabled`
+  or `spec.maintain.enabled` changes the query Deployment's arguments
+  whenever the change adds, removes or changes the flag. It then rolls the
+  query pods as well as the maintain pods.
+
+### Pinning the query memory budget
+
+Without `spec.query.memoryBudgetBytes`, the query pods derive their memory
+budget from the container's memory limit. The budget is the limit minus a
+reserve: a quarter of the limit below 8 GiB, and 2 GiB from 8 GiB up (see
+[Process memory budget](operations/configuration.md#process-memory-budget)).
+Raising the limit without pinning the budget raises the budget with it, by the
+whole increase from 8 GiB up and by three quarters of it below, so it gives no
+headroom beyond that reserve. Under concurrent SQL a
+query process can use more than its budget, because some allocations are not
+charged to it, and that excess grows with the budget.
+
+`spec.query.memoryBudgetBytes` pins the budget. The operator renders
+`--memory-budget-bytes` with that value on the query pods only. It then
+checks `spec.query.resources.limits.memory` against two figures:
+
+- The floor is the budget plus 256 MiB, the memory the server holds outside
+  its budget in `--mode query`. Below the floor, with no memory limit, or with
+  a limit that is not a valid quantity, the operator does not apply the query
+  Deployment. Running query pods are left unchanged and `Available` still
+  reports them; on a new cluster no query pods are created. The cluster
+  reports `Degraded=True` with reason `QueryMemoryBudgetExceedsLimit` (or
+  `QueryMemoryLimitUnparseable`), and the message names the field, the limit,
+  the budget and the 256 MiB. The gateway and maintain Deployments keep
+  reconciling.
+- The headroom is memory above the floor for allocations the budget does not
+  charge. A limit at or above the floor but below the floor plus the headroom
+  still rolls the query pods with the pinned budget. The cluster reports
+  `Degraded=True` with reason `QueryMemoryHeadroomLow`, and the message gives
+  the limit, the floor and the headroom.
+
+`spec.query.memoryHeadroomBytes` sets the headroom. If you do not set it, the
+operator uses a provisional default:
+
+```text
+ceil(0.53 * budget) + ceil(min(budget, 8 GiB) * 6.6 / 8)
+```
+
+- The first term is SQL aggregation and logs-scan state that the budget does
+  not charge. Heap profiles measured up to 12.7 GB of it at a 24 GiB budget
+  with ten concurrent connections.
+- The second term is pages the allocator keeps after they are freed. Up to
+  6.6 GB was measured at an 8 GB budget with ten connections. Retained pages
+  are freed allocations, so they cannot exceed what the process allocated at
+  its peak, and the term gets smaller with the budget. Below 8 GB that scaling
+  is unmeasured. On a small budget, measure the peak memory of the query pods
+  under your own concurrency, and set `memoryHeadroomBytes` from it.
+
+The default compensates for the SQL state the budget does not charge. 0.26
+charges more of that state but leaves the default unchanged, because some
+logs-scan state is still uncharged.
+
+A worked example with a 1.5 GiB budget, a 3.5 Gi limit and a 2 Gi request:
+
+```yaml
+spec:
+  query:
+    memoryBudgetBytes: 1610612736  # 1.5 GiB
+    resources:
+      requests:
+        memory: 2Gi
+      limits:
+        memory: 3.5Gi
+```
+
+- The floor is 1,879,048,192 bytes (1.75 GiB). The limit, 3,758,096,384
+  bytes, clears it, so the query pods roll with
+  `--memory-budget-bytes 1610612736`.
+- The default headroom at a 1.5 GiB budget is 2,182,380,259 bytes, about
+  2.03 GiB. The floor plus the headroom is 4,061,428,451 bytes, above the
+  limit, so the cluster reports `QueryMemoryHeadroomLow`. The pods have
+  1.75 GiB above the floor.
+- To clear the condition, raise the limit to `3874Mi` or more. Or measure the
+  peak memory of the query pods under load and set `memoryHeadroomBytes` to
+  the gap you need.
+- Without `memoryBudgetBytes`, the same 3.5 Gi limit derives a 2.625 GiB
+  budget and leaves 896 MiB, the reserve, between the budget and the limit.
+
+An edit to `memoryBudgetBytes` changes the query Deployment's arguments and
+rolls the query pods. An edit to `memoryHeadroomBytes` changes only the
+condition.
+
+### Serving MCP from the query pods
+
+`spec.query.mcp` mounts the [MCP server](mcp-server.md) at `POST /mcp` on the
+query pods' HTTP port, behind the existing query Service. No new Service port
+is needed.
+
+```yaml
+spec:
+  query:
+    mcp:
+      enabled: true
+      allowedOrigins:
+        - https://agents.example.com
+      maxBodyBytes: 2097152
+```
+
+With that block the query container runs
+`--mcp --mcp-allowed-origins https://agents.example.com --mcp-max-body-bytes 2097152`.
+The gateway, maintain, ingest-router and qualify pods get none of these flags.
+
+- The query pods listen on `0.0.0.0`, and `ravel-server` refuses to start
+  `--mcp` on a non-loopback listener with an empty allowlist. The API server
+  therefore refuses `enabled: true` without an `allowedOrigins` entry.
+- A request with no `Origin` header is accepted. Non-browser MCP clients send
+  none, so the allowlist governs browser clients only. Each request is
+  authenticated by the same tenant resolver as the HTTP query routes.
+- The image built from `main` compiles in the `mcp` cargo feature. In an
+  image built without it, such as a custom `spec.image`, `--mcp` does
+  nothing and `POST /mcp` is not mounted. The README's feature matrix says
+  which release images carry it.
+- Turning `spec.query.mcp` on or off, or editing it while it is enabled,
+  changes the query Deployment's arguments and rolls the query pods. With
+  `enabled: false`, editing the other fields changes nothing.
+
+## Probe semantics
+
+All three modes serve two routes on the HTTP port, and the operator points a
+liveness probe and a readiness probe at them. The gRPC port has no health
+service and gets no probe.
+
+`/healthz` (liveness) answers 200 whenever the HTTP listener is serving. It
+means that the event loop is alive. It never depends on store reachability,
+so a store outage cannot get healthy pods killed.
+
+`/readyz` (readiness) is the AND of four conditions:
+
+| Condition | 200 | 503 |
+|---|---|---|
+| Startup | Once startup completes (config parsed, the store capability gate passed, listeners bound). | Before startup completes. |
+| Store reachability | While the background store-reachability probe is healthy. | After four consecutive failed probes, until the next successful one. |
+| Ingest shards | While no ingest shard has been condemned. | Once any ingest shard actor is condemned. |
+| Drain | Until SIGTERM flips the drain latch. | For the whole drain. |
+
+When a shard actor is condemned depends on the signal
+([observability](observability.md#ingest-pipelines-ravel_ingest_)):
+
+- The metrics pipeline respawns a dead shard actor. It condemns only on the
+  death that exhausts its respawn budget.
+- The logs and spans pipelines never respawn, so their first shard-actor
+  death condemns.
+
+Only the store-probe condition recovers on its own. A condemned shard holds
+the pod out of its Service until someone rolls it, because readiness sheds
+traffic and never restarts or reschedules a pod
+([troubleshooting](operations/troubleshooting.md)).
+
+`/-/healthy` and `/-/ready` are aliases for `/healthz` and `/readyz`, served by
+the same handlers for clients that probe Prometheus' own paths. Either
+spelling works in a probe.
+
+`/readyz` performs **no object-store call per probe**. The kubelet reads an
+in-memory value that one background probe per process maintains on
+`--store-probe-interval`. A single transient blip therefore cannot eject
+every pod from its Service at once: four failures down, one success up. See
+[readiness and the store reachability probe](operations/deployment.md#readiness-and-the-store-reachability-probe)
+for the hysteresis and the two `/metrics` samples that make an outage
+visible.
+
+### The dedicated health port
+
+Both probes above share the main HTTP listener with OTLP ingest, SQL, PromQL
+and `/metrics`. The same runtime workers that decode segments serve them. The
+kubelet kills a node whose workers are all busy in decode for longer than the
+2s probe timeout, three probes running. Its load then moves to its peers,
+and the pattern can repeat.
+
+`spec.probes.dedicatedHealthPort: true` moves the probes off that path. It is
+the default for a cluster created under the current CRD; an existing cluster
+keeps the value it already has stored, as described below. To keep probes on
+the main HTTP port instead, set it to `false`:
+
+```yaml
+spec:
+  probes:
+    dedicatedHealthPort: false
+```
+
+It changes four things in every gateway, query, and maintain pod, and
+nothing anywhere else:
+
+- The container gains `--listen-health 0.0.0.0:4316`. That listener runs on
+  its own OS thread with its own single-threaded runtime. It serves only
+  `/healthz`, `/readyz` and their `/-/` aliases, and is reachable whatever
+  the main runtime is doing.
+- The container gains a port named `health` on 4316, alongside `http` (4318)
+  and, on the gateway, `grpc` (4317).
+- Both probes point at 4316 instead of 4318. The paths, period, timeout, and
+  failure threshold are unchanged. The answers on 4316 also track a heartbeat
+  from the main runtime: `/healthz` there returns 503 once that heartbeat is
+  older than 60s, and `/readyz` once it is older than 30s. A wedged main
+  runtime therefore fails its probes. The same heartbeat age is the gauge
+  `ravel_health_heartbeat_age_seconds` on 4318's `/metrics`, rendered
+  whether or not `--listen-health` is set; 4316 serves no `/metrics`.
+- `terminationGracePeriodSeconds` goes from 45 to 51. On SIGTERM the server
+  also stops the health listener, between the drain and the trace flush. That
+  stop takes up to 6s and raises the shutdown budget from 32.5s to 38.5s. The
+  10s `preStop` sleep plus 38.5s plus 2.5s of headroom is 51s, so SIGKILL
+  cannot land during that stop or the flush.
+
+The same routes stay on 4318 in both cases, so Grafana, a `curl` in a shell,
+and anything else already probing the HTTP port keeps working. The
+`ravel-ingest-router` Deployment is unaffected. It runs a different binary,
+with no health listener, and keeps its probes on 8080.
+
+If a network policy restricts which pod ports are reachable, allow the
+kubelet to reach 4316 before creating a cluster or turning the field on.
+Otherwise both probes fail and the rollout stalls with no pod ever becoming
+Ready.
+
+The field requires a `ravel-server` image that has `--listen-health`,
+v0.19.0 or newer: an older server rejects the unknown flag at startup and the
+pod restart-loops. Check `spec.image` before you create a cluster or turn the
+field on.
+
+The `true` default lives in the CRD's schema, not in the operator image, so
+it reaches new clusters once the new `deploy/k8s/operator/crd.yaml` is
+applied; upgrading the operator image alone changes nothing. Existing
+clusters keep their stored setting. The v0.19.0 CRD defaulted the field to
+`false`, and the API server stores schema defaults on every create and
+update, so a cluster written since then holds `false` and keeps probing 4318
+with a 45s grace period. Re-applying a manifest that omits the field leaves
+that stored `false` in place. To move such a cluster to the health port, set
+`dedicatedHealthPort: true`. Removing the field with a JSON-patch `remove`
+also brings the new default back on that write:
+
+```sh
+kubectl patch ravelcluster <name> --type=json \
+  -p '[{"op": "remove", "path": "/spec/probes/dedicatedHealthPort"}]'
+```
+
+A cluster never written since the v0.19.0 CRD was applied has no stored
+value, and reads as `true` once the new CRD is in place. That is rare: the
+operator updates each cluster's status on every reconcile, and those updates
+are writes too.
+
+The operator reports a `HealthProbeOnMainHttpPort` condition on any
+`RavelCluster` whose resolved `dedicatedHealthPort` is `false`, including one
+still holding the `false` an earlier CRD stored, so the exposure is visible
+on the object instead of only in this doc. Check it with:
+
+```sh
+kubectl get ravelcluster <name> \
+  -o jsonpath='{.status.conditions[?(@.type=="HealthProbeOnMainHttpPort")]}'
+```
+
+or look for it in `kubectl describe ravelcluster <name>`. No condition means
+probes already resolve to the dedicated listener; see the condition list
+under [Status](#status) above for the full set.
+
+Codec work that used to run on the main runtime's workers now runs behind
+two CPU gates on the blocking pool, and each gate's permit count bounds how
+much CPU that work takes from the workers. The operator does not set the
+permit counts, so every pod runs each gate's default, which is derived from
+the cores the pod sees. Each sample on the per-site gate families carries
+both a `gate` label (`read` or `write`) and a `site` label naming the call
+site; see [CPU gates and runtime](observability.md#cpu-gates-and-runtime)
+in the observability guide for the full metric and site list.
+
+## Production notes
+
+The kind environment is a development tool. A real cluster differs in these
+ways:
+
+- Query pods serve `POST /mcp` only when `spec.query.mcp.enabled` is `true`,
+  which needs at least one `allowedOrigins` entry and an image built with the
+  `mcp` feature. See "Serving MCP from the query pods" above and the
+  [MCP guide](mcp-server.md).
+- Point `spec.storage.s3.endpoint` at real S3 (or omit it) and supply real
+  credentials in the Secret.
+- Bucket lifecycle is the platform owner's job. The operator provisions no
+  buckets, and the create-bucket Jobs exist only in the dev manifests. The
+  operator starts every pod with `--require-bucket-protection`. Before you
+  apply a `RavelCluster`, create the bucket with Object Lock, and give it
+  versioning and the sanctioned lifecycle rules. Otherwise the pods refuse to
+  start. With the AWS CLI:
+
+  ```sh
+  aws s3api create-bucket --bucket my-ravel-bucket --object-lock-enabled-for-bucket
+  aws s3api put-bucket-versioning --bucket my-ravel-bucket \
+    --versioning-configuration Status=Enabled
+  aws s3api put-bucket-lifecycle-configuration --bucket my-ravel-bucket \
+    --lifecycle-configuration '{"Rules":[{"ID":"ravel","Filter":{"Prefix":""},"Status":"Enabled","Expiration":{"ExpiredObjectDeleteMarker":true},"NoncurrentVersionExpiration":{"NoncurrentDays":30},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
+  ```
+
+  Replace `30` with your own `E_v` (the
+  [disaster recovery guide](disaster-recovery.md) explains the choice).
+  Outside `us-east-1`, add
+  `--create-bucket-configuration LocationConstraint=<region>`. Unless the
+  pods' identity holds the three read permissions the check uses, it reads
+  every condition as unknown and starts with a warning. See
+  [Deployment](operations/deployment.md#bucket-protection-at-startup).
+
+  A real bucket needs no hand-run qualify step before you apply a
+  `RavelCluster`. The operator runs `ravel-cli store qualify` itself for
+  every `RavelCluster` (see [store qualification](#store-qualification)).
+- The operator does not expose the query Service outside the cluster. It
+  renders ingest exposure only when you ask for it, in one of these forms
+  (all in [ingest-affinity.md](ingest-affinity.md)):
+  - `gateway.ingestAffinity` on `backend: ingressNginx` renders an ingest
+    Ingress.
+  - `backend: ravelNative` renders the subset router.
+  - `gateway.exposure.gatewayApi` renders `HTTPRoute`/`GRPCRoute` onto a
+    `Gateway` you provide.
+
+  Otherwise add an Ingress or a `LoadBalancer` Service yourself. In both
+  cases put TLS in front of it: tenant tokens are bearer tokens.
+- On a multi-replica gateway, consider turning on `gateway.ingestAffinity`.
+  Ingest buffers are per replica, so a tenant spraying across every replica
+  pays one flush stream per replica for the same data. Object-storage request
+  charges, not stored bytes, dominate the bill.
+
+## Storage credential roles
+
+By default a `RavelCluster` points all three Deployments at one Secret
+(`spec.storage.s3.credentialsSecretRef`), so the gateway, query, and maintain
+pods all use one bucket-wide S3 credential. You can hand each Deployment a
+distinct, narrower storage credential role instead. A leak from one
+Deployment can then only do what that mode legitimately does, and only the
+maintain Deployment can delete durable data.
+
+Each of the operator's three Deployments maps to one storage credential role:
+
+| Deployment | `--mode` | Storage credential role | Scope in one line |
+|---|---|---|---|
+| `<name>-gateway` | `gateway` | Gateway | Ingest writes (L0, commit records, idempotency, adopt), plus fleet-admission reconciliation snapshots. Runs no catalog fold. Deletes only dead processes' admission snapshots. |
+| `<name>-query` | `query` | Query | Reads commit and catalog objects, folds only through the on-demand fold route, appends query audit, and creates Parquet table manifest versions for `CREATE EXTERNAL TABLE` and `DROP TABLE` (create only, never an overwrite). Deletes only its own bucket-probe scratch objects under `sys/pq-probe/`: no data, catalog or control-plane object. |
+| `<name>-maintain` | `maintain` | Maintain | Compaction, retention, sweep and the scheduled catalog fold, so it writes catalog snapshot parts, `HEAD` and index objects. The only one granted delete over durable data: `l0/`, `l1/`, `c/`, `idem/`, the query-audit shard `t/*/u/*/0001/*`, `del/*.dreq` erasure requests and superseded Parquet table manifests `t/*/pq/t/*`. It also deletes superseded catalog snapshot parts and index objects, quarantined copies and dead worker records. |
+
+A fourth role, **Admin**, backs `ravel-cli`. Under `storage.s3.auth: static`
+the operator does not manage it: there is no CRD field for it and no pod runs
+it. Only out-of-band operator/CI invocations use it. Under
+`storage.s3.auth: podIdentity` the qualify Job's `<name>-qualify` account and
+the operator's own account get the Admin role through their Pod Identity
+associations until a narrower template exists (see
+[Pod Identity](#pod-identity)). See
+[the Admin credential](operations/deployment.md#the-admin-credential).
+
+The exact per-role AWS IAM policy JSON, the RustFS equivalent for dev/CI, and
+the first-deployment bootstrap notes are in
+[storage credential roles](operations/configuration.md#storage-credential-roles).
+
+### Per-mode credential Secrets
+
+Create one Secret per role you want to scope, each with the same two keys as
+the shared Secret (`accessKeyId`, `secretAccessKey`), holding that role's
+narrower access key:
+
+```sh
+kubectl create secret generic ravel-s3-gateway \
+  --from-literal=accessKeyId=... --from-literal=secretAccessKey=...
+kubectl create secret generic ravel-s3-query \
+  --from-literal=accessKeyId=... --from-literal=secretAccessKey=...
+kubectl create secret generic ravel-s3-maintain \
+  --from-literal=accessKeyId=... --from-literal=secretAccessKey=...
+```
+
+Then reference each from its own Deployment with an additive
+`credentialsSecretRef` field, alongside the existing shared one under
+`spec.storage.s3`:
+
+```yaml
+apiVersion: ravel.nofire.ai/v1alpha1
+kind: RavelCluster
+metadata:
+  name: prod
+  namespace: ravel-system
+spec:
+  image: ravel-server:1.0.0
+  shards: 8
+  storage:
+    s3:
+      bucket: my-ravel-bucket
+      region: us-west-2
+      # Shared fallback. Any Deployment that omits its own credentialsSecretRef
+      # below uses this one, exactly as in the single-credential model.
+      credentialsSecretRef:
+        name: ravel-s3-shared
+  gateway:
+    replicas: 3
+    credentialsSecretRef:
+      name: ravel-s3-gateway
+  query:
+    replicas: 3
+    credentialsSecretRef:
+      name: ravel-s3-query
+  maintain:
+    enabled: true
+    credentialsSecretRef:
+      name: ravel-s3-maintain
+    # Required while maintain is enabled; see "Maintain key file" below.
+    keySecretRef:
+      name: ravel-maintain-keys
+  tenantTokensSecretRef:
+    name: ravel-tenant-tokens
+```
+
+The per-Deployment `spec.<mode>.credentialsSecretRef` fields are additive and
+optional. If you omit one, that Deployment falls back to the shared
+`spec.storage.s3.credentialsSecretRef`. A `RavelCluster` that sets no
+override at all runs one shared credential across all three Deployments. The
+split therefore needs no migration, and you can roll it out one Deployment at
+a time.
+
+`kind-up.sh` does **not** create these Secrets. The local kind environment
+keeps the single shared credential. The per-role split is a production
+hardening, and `kind-up.sh` is not meant to be modified to adopt it. To
+exercise the split in a kind cluster, create the per-mode Secrets yourself
+the same way as above (`kubectl create secret generic ...`) before you apply
+a `RavelCluster` that references them.
+
+### Pod Identity
+
+Under `spec.storage.s3.auth: podIdentity` no AWS key exists anywhere: every
+pod, the qualify Job and the operator itself run on EKS Pod Identity roles.
+Only EKS Pod Identity is supported. IRSA (`AWS_WEB_IDENTITY_TOKEN_FILE` and
+STS `AssumeRoleWithWebIdentity`) is not. The node's instance role
+(`--s3-auth instance-role`) is no substitute: the server reads it from EC2
+IMDSv2, which returns the node role that every pod on the node shares, never
+one role per tier.
+
+```yaml
+spec:
+  storage:
+    s3:
+      bucket: my-ravel-bucket
+      region: us-east-2
+      auth: podIdentity
+```
+
+The operator creates one ServiceAccount per tier and one for the qualify
+Job, and runs each pod as its account:
+
+| ServiceAccount | Pods | Role (template in `deploy/iam/`) |
+|---|---|---|
+| `<name>-gateway` | gateway | Gateway (`gateway.json`) |
+| `<name>-query` | query | Query (`query.json`) |
+| `<name>-maintain` | maintain | Maintain (`maintain.json`) |
+| `<name>-qualify` | the qualify Job | Admin (`admin.json`), or a policy trimmed to the `sys/` keys qualification touches |
+
+Create a Pod Identity association for each of the four, in the
+`RavelCluster`'s namespace, naming that tier's role. The associations can
+exist before the accounts do. The operator applies the accounts before the
+qualify Job, so the first deploy does not wait on them.
+
+The operator also writes `sys/auth` and the `shardOverrides` reshard records
+itself, so its own ServiceAccount needs an association too:
+`ravel-system/ravel-operator` in the shipped manifests, with the Admin role
+until an operator template exists. It fetches its credentials in memory and
+mounts no volume. Without the association the cluster reports `Degraded`
+with reason `PodIdentityCredentialsUnavailable`, naming the two variables
+below, on the first pass that needs the operator's own store (a cluster with
+`deploymentKeySecretRef` or `shardOverrides` set).
+
+How the credentials reach a pod:
+
+- The Pod Identity webhook injects `AWS_CONTAINER_CREDENTIALS_FULL_URI` and
+  `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` into a pod whose ServiceAccount
+  has an association. The token file is a projected ServiceAccount token
+  that the kubelet rotates.
+- Each pod gets a native sidecar, `pod-identity-credentials`: the operator
+  image running `ravel-operator pod-identity-credentials --output
+  /var/run/ravel/aws/credentials.json`. It fetches the role credentials from
+  the node's Pod Identity agent and writes them to a memory-backed volume
+  (`emptyDir`, `medium: Memory`, `sizeLimit: 1Mi`) as a mode-0600 JSON file.
+  It refreshes at the earlier of halfway to the credential's expiry and
+  15 minutes before it, and keeps the old file when a refresh fails.
+- A startup probe on the sidecar holds the server container until the
+  sidecar has written the file. The volume outlives a sidecar restart, so
+  each sidecar process removes the marker the previous one left
+  (`.credentials.json.written`) when it starts and creates it again after its
+  first write. Without that marker the probe passes only while the file's
+  credential has not expired: the sidecar records the credential's expiry in
+  the file as `expiration`, which the server ignores. A restarted sidecar
+  leaves the previous file in place, so the running server keeps using it
+  until the new write replaces it, and an agent outage shorter than that
+  credential's remaining life does not get the restarted sidecar killed by
+  its probe.
+- The server reads the file through `--s3-credentials-file` and picks up
+  each rewrite on its next S3 request; the qualify Job's `ravel-cli` reads it
+  through `RAVEL_S3_CREDENTIALS_FILE`.
+- `RAVEL_S3_ACCESS_KEY` and `RAVEL_S3_SECRET_KEY` are set to the literal
+  `unused-credentials-file-wins`. `ravel-server` and `ravel-cli` still
+  require both under `--s3-auth static` even with a credentials file, and
+  the file overrides them, so the value is never used as a key. There is no
+  fallback to it either: an unreadable or malformed credentials file stops
+  `ravel-server` and `ravel-cli` at startup with an error. The operator sets
+  the placeholder only on a container it also points at the file.
+
+The operator needs to know its own image to render the sidecar. The shipped
+`operator.yaml` sets `RAVEL_CREDENTIALS_SIDECAR_IMAGE`
+(`--credentials-sidecar-image`) to the same image as the operator container.
+Pin both to the same tag and digest. A kustomize `images:` override does not
+reach the env value, so patch it separately. A `podIdentity` cluster
+reconciled by an operator without it reports `Degraded` with reason
+`CredentialsSidecarImageUnset` and renders nothing, the qualify Job
+included.
+
+The sidecar image is part of every tier's pod template. An operator upgrade
+that changes the operator image therefore rolls every gateway, query and
+maintain pod of a `podIdentity` cluster, which a `static` cluster's upgrade
+does not.
+
+The sidecar writes the file as the operator image's user, the distroless
+`nonroot` user (UID 65532), and the operator sets no `runAsUser`. A custom
+`spec.image` must run as that same user, as the shipped server image does,
+or the server cannot read the mode-0600 file.
+
+What else changes under `podIdentity`:
+
+- The per-tier `credentialsSecretRef` overrides are refused at admission:
+  each tier's role comes from its association. `storage.s3.credentialsSecretRef`
+  is not read.
+- The cluster counts as per-role, so the maintain-first `sys/gc` bootstrap
+  order below applies.
+- Every pod needs egress to the Pod Identity agent at `169.254.170.23:80`
+  (`[fd00:ec2::23]:80` on an IPv6 cluster). A NetworkPolicy that denies
+  egress by default must allow it.
+- A running pod keeps the credential its sidecar last wrote until that
+  credential's expiry, which the agent sets. Removing an association alone
+  does not revoke access: deny the role first, then remove the association
+  and roll the pods.
+- The sidecar logs every failed refresh as a warning with the attempt count
+  and the seconds left on the current file, and an error once that file's
+  credential has expired.
+
+### Azure Blob Storage with workload identity
+
+Under `spec.storage.azure` the cluster stores its data in an Azure Blob
+Storage container and every pod, the qualify Job and the operator itself
+authenticate through AKS workload identity. No storage key
+exists in any Secret and the CRD has no field for one. The server image must
+be 0.33.0 or later: earlier images have no `--store azure`.
+
+```yaml
+spec:
+  storage:
+    azure:
+      account: ravelprod
+      container: ravel-data
+      clientId: <managed identity client ID>
+      roleClientIds:          # optional, one identity per role
+        gateway: <client ID>
+        query: <client ID>
+        maintain: <client ID>
+        qualify: <client ID>
+```
+
+[`deploy/k8s/examples/ravelcluster-azure.yaml`](../../deploy/k8s/examples/ravelcluster-azure.yaml)
+is a complete example.
+
+What the operator renders:
+
+- The same four ServiceAccounts as under [Pod Identity](#pod-identity),
+  `<name>-gateway`, `<name>-query`, `<name>-maintain` and
+  `<name>-qualify`, each annotated `azure.workload.identity/client-id`
+  with its role's entry in `roleClientIds`, or `clientId` when that entry
+  is unset. Each pod runs as its account.
+- The label `azure.workload.identity/use: "true"` on each tier's pod
+  template and on the qualify Job's. The AKS webhook then injects
+  `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE` and
+  the projected token. The Deployment selectors do not change.
+- The annotation `ravel.nofire.ai/azure-client-id` on each tier's pod
+  template, holding that tier's client ID. The webhook sets
+  `AZURE_CLIENT_ID` only when it admits a pod, so a running pod keeps the
+  identity it started with; the annotation makes a client ID change roll
+  the tier whose ID changed, and only that tier. The qualify Job carries no
+  such annotation: a change to its client ID re-runs qualification instead.
+- `--store azure --azure-account <account> --azure-container <container>`
+  on every tier, and `ravel-cli --store azure store qualify` with
+  `RAVEL_AZURE_ACCOUNT` and `RAVEL_AZURE_CONTAINER` on the qualify Job. No
+  `--s3-*` flag, no `RAVEL_S3_*` variable, no credentials sidecar and no
+  `aws-credentials` volume.
+
+What you create on the Azure side, outside Ravel:
+
+1. An AKS cluster with the OIDC issuer and workload identity enabled:
+
+   ```sh
+   az aks update -g <rg> -n <aks> --enable-oidc-issuer --enable-workload-identity
+   ISSUER=$(az aks show -g <rg> -n <aks> --query oidcIssuerProfile.issuerUrl -o tsv)
+   ```
+
+2. A storage account with hierarchical namespace disabled, which is the
+   default (`--enable-hierarchical-namespace false`), and the container.
+   Only a flat-namespace account works: the store reads
+   `x-ms-is-hns-enabled` when it starts and refuses an ADLS Gen2 account,
+   whose listing order differs from the one Ravel depends on. The qualify
+   Job then fails and no Deployment is created.
+
+3. A user-assigned managed identity per role (or one shared by all, named
+   in `clientId`), and one for the operator. Each needs a federated
+   credential with the cluster's issuer, audience
+   `api://AzureADTokenExchange`, and one of these five subjects, where
+   `<namespace>` and `<name>` are the `RavelCluster`'s:
+
+   | Subject | Identity |
+   |---|---|
+   | `system:serviceaccount:<namespace>:<name>-gateway` | gateway |
+   | `system:serviceaccount:<namespace>:<name>-query` | query |
+   | `system:serviceaccount:<namespace>:<name>-maintain` | maintain |
+   | `system:serviceaccount:<namespace>:<name>-qualify` | qualify |
+   | `system:serviceaccount:ravel-system:ravel-operator` | the operator, in the shipped manifests |
+
+   One shared identity needs all four `RavelCluster` subjects as separate
+   federated credentials on it.
+
+   ```sh
+   az identity federated-credential create -g <rg> \
+     --identity-name ravel-prod-gateway --name prod-gateway \
+     --issuer "$ISSUER" --audiences api://AzureADTokenExchange \
+     --subject system:serviceaccount:ravel-system:prod-gateway
+   ```
+
+4. Two role assignments for each identity: one for the data, on the
+   container, and one for a single account-level question, on the storage
+   account.
+
+   Every Ravel role reads, writes and deletes blobs, so each needs
+   `Storage Blob Data Contributor`, scoped to the container rather than the
+   account. The operator's identity needs it on every container whose
+   `RavelCluster` sets `deploymentKeySecretRef` or `shardOverrides`, since
+   it writes `sys/auth` and the reshard records there. Narrowing a role to
+   its key prefixes, as the S3 templates in `deploy/iam/` do, takes an
+   attribute-based condition on the assignment; Ravel ships no template for
+   it yet.
+
+   ```sh
+   az role assignment create --assignee-object-id <principal ID> \
+     --assignee-principal-type ServicePrincipal \
+     --role "Storage Blob Data Contributor" \
+     --scope /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<account>/blobServices/default/containers/<container>
+   ```
+
+   When a Ravel process starts, its store asks the account whether it has a
+   hierarchical namespace, and refuses to run if it cannot read the answer.
+   That request is authorised by the action
+   `Microsoft.Storage/storageAccounts/blobServices/getInfo/action`. The
+   Storage Blob Data roles do not hold it, at the container or at the
+   account, so an identity with only the assignment above fails
+   qualification with
+   `access denied: account information ... HTTP 403 AuthorizationPermissionMismatch`.
+   Create a role that holds that one action and assign it to each identity
+   on the storage account. A custom role's name is unique in the
+   directory, and this one can only be assigned on the account it lists,
+   so name it after the account. For a second Ravel storage account,
+   either create a second role named after that account, or add the
+   account to this role's `AssignableScopes` with
+   `az role definition update`:
+
+   ```sh
+   ACCOUNT=<account>
+   ACCOUNT_ID=/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/$ACCOUNT
+   az role definition create --role-definition '{
+     "Name": "ravel-'"$ACCOUNT"'-blob-account-info",
+     "IsCustom": true,
+     "Description": "Read blob account information (SKU, kind, hierarchical namespace flag).",
+     "Actions": ["Microsoft.Storage/storageAccounts/blobServices/getInfo/action"],
+     "NotActions": [], "DataActions": [], "NotDataActions": [],
+     "AssignableScopes": ["'"$ACCOUNT_ID"'"]
+   }'
+   az role assignment create --assignee-object-id <principal ID> \
+     --assignee-principal-type ServicePrincipal \
+     --role "ravel-$ACCOUNT-blob-account-info" --scope "$ACCOUNT_ID"
+   ```
+
+   The action reads the account's SKU, kind and namespace flag and nothing
+   else: it grants no access to any container's data. A new role
+   assignment can take a few minutes to apply; the operator retries
+   qualification by itself.
+
+5. For the operator, only when a `RavelCluster` on `storage.azure` sets
+   `deploymentKeySecretRef` or names a tenant under `shardOverrides`:
+   uncomment the `azure.workload.identity/client-id` annotation on the
+   `ravel-operator` ServiceAccount in `rbac.yaml` and set its client ID,
+   and uncomment the `azure.workload.identity/use: "true"` label on the
+   operator pod template in `operator.yaml`. Both are opt-in and ship
+   commented. Then restart the operator pod
+   (`kubectl -n ravel-system rollout restart deployment/ravel-operator`):
+   the webhook injects the identity only when it admits a pod, so a pod
+   that was running before the label and annotation were applied has no
+   Azure credential.
+
+The federated credentials and role assignments can exist before the
+ServiceAccounts do. The operator applies the accounts before the qualify
+Job, as under Pod Identity, so the first deploy does not wait on them.
+
+Container protection is yours to configure. On S3 the operator renders
+`--require-bucket-protection`, which refuses to start a server on a bucket
+without versioning and Object Lock. No equivalent check exists
+for Azure yet, so the operator renders no such flag and reports the gap
+instead of hiding it: every `storage.azure` cluster carries the condition
+`BucketProtectionVerified=False` with reason `NotImplementedForAzure`.
+Configure, by hand, following
+[`docs/object-store-contract.md`, "Required bucket configuration"](../object-store-contract.md#required-bucket-configuration-adr-0064-7-adr-0072-decision-3):
+
+- blob versioning on the storage account only paired with a lifecycle
+  management rule that deletes previous versions. Versioning without that
+  rule turns every Ravel delete (the retention sweep, selective erasure)
+  into a soft delete that keeps the bytes indefinitely;
+- blob soft delete and container soft delete with a bounded retention,
+  longer than your recovery window and no longer than your erasure
+  obligations allow, since soft-deleted data stays restorable until the
+  retention ends;
+- an immutability policy only where it does not refuse the deletes that
+  retention and erasure need. A container-level time-based policy refuses
+  the delete of every blob in the container younger than its retention
+  interval, tenant data included, so it does not fit.
+
+Store qualification does not check any of this. The qualify Job writes
+and deletes only under `sys/qualify/<run-id>/` and writes the single
+`sys/qualification` key, so a policy that refuses deletes elsewhere in the
+container passes qualification and fails later, when retention or erasure
+first deletes there.
+
+What else changes under `storage.azure`:
+
+- The per-tier `credentialsSecretRef` overrides are refused at admission by
+  a CEL rule, and at render time with `Degraded`, reason
+  `AzureTierOverride`. Each tier's identity is its ServiceAccount's client
+  ID.
+- The operator reads no credential Secret for the store, its own client
+  included. It opens the container at most once per reconcile pass, and
+  only for `sys/auth` convergence or a reshard; a client that takes longer
+  than 30 s to start degrades the cluster with reason `ReconcileError`, as
+  a client that fails to start does.
+- A client ID change rolls the affected tier: editing
+  `roleClientIds.<tier>` rolls that tier's pods, and editing `clientId`
+  rolls every tier whose `roleClientIds` entry is unset.
+- The cluster counts as per-role, so the maintain-first `sys/gc` bootstrap
+  order below applies.
+- A switch between `storage.s3` and `storage.azure` re-runs store
+  qualification. A switch from S3 Pod Identity keeps the four
+  ServiceAccounts, now annotated; a switch to S3 `static` deletes them.
+
+### The `sys/gc` bootstrap order
+
+A per-mode `credentialsSecretRef`, `storage.s3.auth: podIdentity`, or
+`storage.azure` also changes the order in which the operator applies the three Deployments. Every
+`ravel-server` mode creates the durable `sys/gc` object if it is absent and
+then validates itself against it.
+Under the per-role policies, only Maintain and Admin can write it.
+
+- **Fresh cluster.** The operator applies the maintain Deployment first. It
+  holds the gateway and query Deployments until maintain reports a ready
+  replica. While it holds, the cluster carries `Available=False` with reason
+  `WaitingForGcBootstrap` and `Degraded=False`, and the operator requeues.
+  This state is progress, and it needs no manual bootstrap step. The waiting
+  message names the maintain Deployment's observed ready and unavailable
+  replica counts.
+- **Existing cluster.** The hold applies only while neither request-serving
+  Deployment exists yet. Once either does, the operator keeps reconciling
+  both through a maintain rollout or outage and does not stall them.
+- **Maintain withheld.** Without `maintain.keySecretRef`, or with a
+  reference to a Secret that does not exist, the operator applies no
+  maintain Deployment, so on a fresh cluster the hold lasts until the Secret
+  exists and nothing is created. The cluster reports the withheld tier's
+  reason (`MaintainKeySecretRefMissing` or `SecretNotFound`), not
+  `GcBootstrapStalled`; see [Maintain key file](#maintain-key-file).
+- **Stalled hold.** If the hold lasts more than five minutes, the operator
+  keeps `Available=False` with `WaitingForGcBootstrap` and adds
+  `Degraded=True` with reason `GcBootstrapStalled`. The message names the
+  maintain Deployment and its ready and unavailable replica counts. Maintain
+  is then stuck, usually because of a wrong `maintain.credentialsSecretRef`
+  or a bad maintain image. Check those and the maintain pod's logs. Under
+  `storage.s3.auth: podIdentity` also check that `<name>-maintain` has a
+  Pod Identity association and that the pod's `pod-identity-credentials`
+  sidecar can reach the agent: its logs name the missing variables or the
+  failed fetch, and its startup probe holds the server container until it
+  has written the file.
+- **Maintain disabled.** With `maintain.enabled: false` under per-role
+  Secrets, the operator still applies the gateway and query Deployments.
+  Their pods restart until `sys/gc` exists, and the cluster reports
+  `Degraded=True` with reason `GcBootstrapUnavailable` until one of them
+  reports ready. To create `sys/gc`, run `ravel-cli gc-config set` under the
+  Admin credential, or enable `spec.maintain`.
+- **Shared credential only.** A `RavelCluster` with only the shared
+  `spec.storage.s3.credentialsSecretRef` keeps the original order and never
+  waits, because any pod holding that credential can create the object.
+
+During a stalled hold the operator keeps polling. It clears the
+`GcBootstrapStalled` condition on the first pass where maintain reports a
+ready replica, so a fixed maintain Deployment recovers with no further
+action. The operator stamps the first waiting pass into
+`status.gcBootstrapWaitingSince`, so the five-minute threshold survives an
+operator restart.
+
+### Startup before `sys/gc` exists
+
+A gateway or query process can start before `sys/gc` exists under a per-role
+credential: a hand-applied Deployment, or `maintain.enabled: false` above.
+The process is refused and exits at startup. It keeps exiting until `sys/gc`
+exists. The Deployment's restart policy then brings it up on the first
+restart after maintain (or `gc-config set`) has created the object, with no
+other action needed.
+
+The error names the cause and the fix:
+
+- `sys/gc` has not been created yet, and this process's credential was
+  refused its create. Only the Maintain and Admin roles create it.
+- The fix is to start the maintain process first, or to run
+  `ravel-cli gc-config set` under the Admin credential.
+- Run `gc-config set` with the protection horizon and grace the maintain
+  process runs with (`--gc-protection-horizon` and `--gc-grace`, or their
+  defaults). Maintain refuses to start against a `sys/gc` whose horizon or
+  grace differs from its own.
+- Also run it with a max query duration and max flush lifetime matching the
+  `--gc-max-query-duration` and `--gc-max-flush-lifetime` the processes run
+  with.
+- Under a shared credential, this refusal instead means the credential lacks
+  PutObject on `sys/gc` or `kms:GenerateDataKey` on the bucket's default key.
+
+### AWS list grants
+
+On AWS S3, a GET of an absent key is refused, and not reported missing,
+unless the credential holds an `s3:ListBucket` grant covering that key. The
+gateway, query and maintain templates in `deploy/iam/` grant one on the keys
+each process reads where absence is normal, and on nothing else.
+`sys/qualification`, `sys/tenancy` and `sys/gc` are among those keys.
+
+Per-role Secrets built from those templates therefore start a fresh AWS
+bucket in the order above with no manual step:
+
+1. The qualify Job writes `sys/qualification`.
+2. The maintain pod creates `sys/tenancy` and `sys/gc`.
+3. The gateway and query Deployments follow.
+
+The server processes create the per-tenant records (key epochs, provisioning
+records, metric metadata) at startup or on a tenant's first write.
+
+Two cases need action from you:
+
+- **Customer-managed KMS key.** On a bucket whose default encryption is a
+  customer-managed KMS key, creating `sys/tenancy` and `sys/gc` also needs
+  `kms:GenerateDataKey` on that key. The templates leave this grant to you.
+  Add it to the roles that create those objects, or create them once under a
+  credential that holds it.
+- **Older templates.** Policies copied from templates that predate those
+  list grants cover none of these keys. On a fresh AWS bucket, every server
+  process, maintain included, is then refused the read of `sys/tenancy`
+  before it gets to `sys/gc`. No `ravel-cli` command creates `sys/tenancy`.
+  `ravel-cli gc-config set` under the Admin credential still creates `sys/gc`
+  there, but does not get past that refusal. Update the policies from
+  `deploy/iam/`. Alternatively, run the first startup against a fresh AWS
+  bucket under a single credential that can create both objects (the shared
+  `spec.storage.s3.credentialsSecretRef` form above), then move to per-role
+  Secrets.
+
+## Background
+
+- The operator's design, its condition set and its reconcile model are
+  [ADR-0034](../adrs/0034-k8s-operator.md).
+- The per-mode storage credential roles are ADR-0055.
+- The deployment key and `sys/auth` ownership are ADR-0072.
+- Per-tenant resharding is ADR-0052.
+- Ingest affinity and the Gateway API exposure are ADR-0076 decision 1 and
+  ADR-0080.
+- Idempotent maintenance ownership by heartbeat membership and rendezvous
+  hashing, which is why maintain can run more than one replica, is ADR-0065.
+- The operator's own single-replica topology, health listener and metrics are
+  [ADR-1731](../adrs/1731-operator-health-metrics-and-topology.md).
+- The `spec.probes.dedicatedHealthPort` field, its CPU-gate motivation, and
+  why it defaults to `true` are
+  [ADR-1702](../adrs/1702-cpu-gate-and-isolated-liveness.md).

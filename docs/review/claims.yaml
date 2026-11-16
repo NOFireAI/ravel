@@ -1,0 +1,458 @@
+# Documentation claims registry (ADR-1658). Checked by
+# scripts/check-doc-claims.py; the format and the four rules are in that
+# script's docstring.
+#
+# kind: positive | negative | not-a-claim
+# status: verified | contradicted | not-implemented
+# A contradicted entry carries issue. A not-implemented entry may bind the
+# symbol whose arrival would make the sentence false, so the gate fails when it
+# lands; one with binds: [] (no symbol to name yet) never trips STATUS.
+# binds: path.rs::Symbol[::Symbol], resolved against definitions only.
+#
+# Seeded from the ADR-1658 Context contradictions and from every normative-doc
+# line the NEGATIVE marker list matched when the registry landed; the
+# 2026-09-12 review's claim matrix is not in the repository.
+
+# --- The three contradictions ADR-1658's Context names ---------------------
+
+- id: readme-mcp-ships
+  doc: README.md
+  quote: "The MCP server ships behind the `mcp` cargo feature and the runtime `--mcp` flag, both off by default."
+  kind: positive
+  binds:
+    - services/ravel-server/src/mcp/adapter.rs::MCP_PATH
+    - crates/ravel-mcp/src/tools/mod.rs::dispatch
+  status: verified
+  note: "Replaced the sentence saying neither the feature nor the flag exists in a build. The mcp feature is defined in services/ravel-server/Cargo.toml, which a bind cannot name; the adapter's route constant and the tool dispatch are the code it gates."
+
+- id: readme-mcp-one-tool-served
+  doc: README.md
+  quote: "All nine tools are served, `ravel_capabilities`, `ravel_describe_data`"
+  kind: positive
+  binds:
+    - crates/ravel-mcp/src/tools/mod.rs::SERVED_TOOLS
+    - crates/ravel-mcp/src/tools/mod.rs::tests::dispatch_routes_every_catalog_name_and_refuses_unknown_names
+  status: verified
+  note: "SERVED_TOOLS holds all nine catalog names, ravel_search_logs included; the bound test pins the list against dispatch and asserts no catalog name answers ToolError::NotShipped."
+
+- id: agents-mcp-ships
+  doc: docs/guides/mcp-server.md
+  quote: "The tools ship behind the `mcp` cargo feature and the `--mcp` flag, both off by default."
+  kind: positive
+  binds:
+    - services/ravel-server/src/mcp/adapter.rs::MCP_PATH
+    - crates/ravel-mcp/src/tools/mod.rs::dispatch
+  status: verified
+  note: "Replaced the banner saying the POST /mcp route does not exist until the feature ships."
+
+- id: agents-mcp-one-tool-served
+  doc: docs/guides/mcp-server.md
+  quote: "All nine tools are served: `ravel_capabilities`, `ravel_describe_data`, `ravel_find_labels`, `ravel_explain_query`, `ravel_query_sql`, `ravel_query_promql`, `ravel_search_logs`, `ravel_get_trace` and `ravel_analyze_timeseries`."
+  kind: positive
+  binds:
+    - crates/ravel-mcp/src/tools/mod.rs::SERVED_TOOLS
+    - crates/ravel-mcp/src/tools/mod.rs::tests::dispatch_routes_every_catalog_name_and_refuses_unknown_names
+  status: verified
+  note: "SERVED_TOOLS lists the nine names in this order, and the bound test asserts dispatch answers none of them with ToolError::NotShipped."
+
+- id: guide-query-audit-pipeline-installed
+  doc: docs/guides/query.md
+  quote: "writes a query-audit record for each query that it executes"
+  kind: positive
+  binds:
+    - crates/ravel-maintain/src/audit_pipeline.rs::AuditPipeline
+    - services/ravel-server/src/config.rs::Mode::installs_query_audit_pipeline
+    - services/ravel-server/src/config.rs::Cli::query_audit_enabled
+  status: verified
+  note: "services/ravel-server/src/lib.rs start spawns the real pipeline and wires every query surface's audit sink to it when Mode::installs_query_audit_pipeline holds (--mode all and --mode query) and Cli::query_audit_enabled holds (--audit-mode required or best-effort; the default off leaves the NoopQueryAuditSink). The guide sentence is qualified with that condition."
+
+- id: guide-audit-required-fails-closed
+  doc: docs/guides/audit.md
+  quote: "The query fails with a 503 (HTTP) or `Unavailable` (Flight)."
+  kind: positive
+  binds:
+    - crates/ravel-maintain/src/audit_pipeline.rs::tests::every_submit_in_a_failed_batch_errors_in_required_mode
+  status: verified
+  note: "The bound test fails every submit of a batch whose flush failed under AuditMode::Required, the default."
+
+- id: query-engine-stamp-write-side
+  doc: docs/query-engine.md
+  quote: "The logs flush stamps each commit record"
+  kind: positive
+  binds:
+    - crates/ravel-ingest/src/log_shard.rs::run_flush
+    - crates/ravel-ingest/src/log_declared_stats.rs::build_stamps
+    - crates/ravel-maintain/src/rlog.rs::finalize_part
+    - crates/ravel-commit/src/declared_stats.rs::stamp_commit_record
+    - crates/ravel-commit/src/declared_stats.rs::stamp_compaction_part
+  status: verified
+  note: "run_flush calls stamp_commit_record with the stamps build_stamps returns when the tenant declares columns; finalize_part calls stamp_compaction_part with real stamps. The span compaction codec, the RSEG part builder and the logs erasure rewrite (erasure_rewrite.rs) stamp an empty list, compaction stamps only the columns its inputs carry stamps for, and the metrics and span flushes call neither. Corrected by #2082."
+
+# --- NEGATIVE marker lines -------------------------------------------------
+
+- id: architecture-ravelql-sigma-absent
+  doc: docs/architecture.md
+  quote: "Two capabilities that the decision records discuss do not exist in the shipped system: RavelQL, and Sigma or OCSF rule ingestion."
+  kind: negative
+  binds: []
+  status: not-implemented
+  note: "No crate or source file names RavelQL, Sigma rules or OCSF (the only 'sigma' hit is a MAD-to-sigma constant in ravel-analytics). No would-be symbol to bind."
+
+- id: catalog-kidx-rebuild-command-proposed
+  doc: docs/catalog-and-mvcc.md
+  quote: "attaches leaves to parts it leaves unchanged"
+  kind: positive
+  binds:
+    - crates/ravel-catalog/src/key_index_rebuild.rs::KeyIndexRebuildReport
+    - crates/ravel-catalog/src/key_index_rebuild.rs::tests::rebuild_attaches_leaves_to_a_stripped_part_and_the_probe_names_the_blocks
+  status: verified
+  note: "ADR-2707 T9c (#2995) landed the command; the proposed marker this entry used to quote is gone. The bound test asserts HEAD is byte-identical outside key_index and that the only PUTs are the leaf and HEAD."
+
+- id: logseg-gram-idx-reserved
+  doc: docs/log-segment-format.md
+  quote: "reserved (ADR-0105, not implemented)"
+  kind: negative
+  binds:
+    - crates/ravel-logseg/src/footer.rs::kind::GRAM_IDX
+  status: not-implemented
+  note: "footer.rs kind reserves 7 in a comment only; a GRAM_IDX constant arriving there fails this entry."
+
+- id: object-store-multipart-visibility-probe
+  doc: docs/object-store-contract.md
+  quote: "multipart-complete visibility is still not implemented."
+  kind: negative
+  binds: []
+  status: not-implemented
+  note: "conformance.rs Property has no multipart-complete visibility variant. Enum variants are not definitions under the BIND resolver, so there is no symbol this entry could bind to trip STATUS when one lands."
+
+- id: otap-flag-absent-without-feature
+  doc: docs/otap-ingest.md
+  quote: "the flag does not exist in a build without the feature"
+  kind: negative
+  binds:
+    - services/ravel-server/src/config.rs::Cli
+    - services/ravel-server/src/config.rs::otap_flag_defaults_off_and_parses_when_present
+  status: verified
+  note: "Cli's otap field sits under cfg(feature = \"otap\"), as does the bound flag test."
+
+- id: ingest-per-tenant-metrics-future
+  doc: docs/ingest.md
+  quote: "Still tracked future work (not yet implemented): a per-tenant dimensioned model and per-shard latency histograms"
+  kind: negative
+  binds: []
+  status: not-implemented
+  note: "Ingest metrics are flat atomics and per-shard maps; no dimensioned per-tenant model exists to bind."
+
+- id: guide-query-limitk-not-implemented
+  doc: docs/guides/query.md
+  quote: "they are outside the stable language and out of the scored surface, and not implemented"
+  kind: negative
+  binds:
+    - crates/ravel-promql/src/aggregate.rs::limitk_and_limit_ratio_reject_without_panicking
+  status: verified
+  note: "limitk and limit_ratio are rejected with a typed error naming the operator; the bound test pins the rejection."
+
+- id: kubernetes-deployments-not-yet-created
+  doc: docs/guides/kubernetes.md
+  quote: "so there is no crash-loop to observe: the Deployments do not exist yet."
+  kind: not-a-claim
+  binds: []
+  status: verified
+  note: "Describes cluster state while the qualification Job runs, not an absent capability."
+
+- id: kubernetes-pod-identity-irsa-not-supported
+  doc: docs/guides/kubernetes.md
+  quote: "IRSA (web identity) is not supported."
+  kind: negative
+  binds:
+    - services/ravel-operator/src/pod_identity.rs::AgentEndpoint::from_env
+    - services/ravel-operator/src/pod_identity.rs::tests::missing_environment_is_refused_naming_both_variables
+  status: verified
+  note: "from_env reads only the Pod Identity webhook's AWS_CONTAINER_CREDENTIALS_FULL_URI and AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE and refuses to start without them; nothing reads AWS_WEB_IDENTITY_TOKEN_FILE or calls AssumeRoleWithWebIdentity. The bound test pins the refusal."
+
+- id: kubernetes-maintain-withheld-not-created
+  doc: docs/guides/kubernetes.md
+  quote: "Without `maintain.keySecretRef`, or while its Secret does not exist, not created, and an existing one is left unchanged"
+  kind: negative
+  binds:
+    - services/ravel-operator/tests/maintain_key_withheld.rs::no_maintain_deployment_is_created_without_the_key_ref
+    - services/ravel-operator/tests/maintain_key_withheld.rs::existing_maintain_deployment_is_left_alone_without_the_key_ref
+    - services/ravel-operator/tests/maintain_key_withheld.rs::missing_key_secret_leaves_existing_maintain_alone_and_applies_the_rest
+  status: verified
+  note: "Against a fake apiserver, a missing keySecretRef or a missing key Secret sends no PATCH, PUT, POST or DELETE for the maintain Deployment, whether or not one already exists (ADR-3130 decision 5)."
+
+- id: kubernetes-maintain-withheld-fresh-per-role
+  doc: docs/guides/kubernetes.md
+  quote: "reference to a Secret that does not exist, the operator applies no maintain Deployment"
+  kind: negative
+  binds:
+    - services/ravel-operator/tests/maintain_key_withheld.rs::fresh_per_role_cluster_creates_no_deployment_without_the_key_ref
+    - services/ravel-operator/tests/maintain_key_withheld.rs::missing_key_secret_leaves_existing_maintain_alone_and_applies_the_rest
+  status: verified
+  note: "A fresh per-role cluster without the ref applies no Deployment and keeps the withheld reason through a stalled sys/gc wait; a missing Secret behind a set ref withholds the maintain tier the same way."
+
+- id: kubernetes-query-memory-budget-withheld
+  doc: docs/guides/kubernetes.md
+  quote: "Below the floor, with no memory limit, or with a limit that is not a valid quantity, the operator does not apply the query Deployment."
+  kind: negative
+  binds:
+    - services/ravel-operator/tests/query_memory_budget_withheld.rs::refused_budget_leaves_the_running_query_deployment_alone
+    - services/ravel-operator/tests/query_memory_budget_withheld.rs::refused_budget_creates_no_query_deployment_on_a_fresh_cluster
+    - services/ravel-operator/src/controller.rs::tests::plan_render_withholds_only_the_query_deployment_on_a_refused_memory_budget
+  status: verified
+  note: "Against a fake apiserver, a limit below budget plus 256 MiB or no limit sends no PATCH, PUT, POST or DELETE for the query Deployment, applies gateway and maintain, and reports the live query readiness; the plan_render test covers the unparseable limit (ADR-1170, issue #3200 amendment)."
+
+- id: kubernetes-query-memory-limit-alone-no-headroom
+  doc: docs/guides/kubernetes.md
+  quote: "Raising the limit without pinning the budget raises the budget with it, by the whole increase from 8 GiB up and by three quarters of it below, so it gives no headroom beyond that reserve."
+  kind: negative
+  binds:
+    - services/ravel-server/src/config.rs::resolve_performance_defaults
+    - crates/ravel-maintain/src/config.rs::effective_memory_overhead_reserve_bytes
+    - services/ravel-operator/src/reconcile.rs::tests::unset_memory_budget_renders_the_query_deployment_byte_identical
+  status: verified
+  note: "Without the field the operator renders no --memory-budget-bytes (the pinned render test), so the server takes the derived-cgroup branch of resolve_performance_defaults: the cgroup limit minus effective_memory_overhead_reserve_bytes, max(min(2 GiB, limit / 4), 256 MiB) in --mode query."
+
+- id: kubernetes-query-memory-default-headroom-stg1
+  doc: docs/guides/kubernetes.md
+  quote: "The default headroom at a 1.5 GiB budget is 2,182,380,259 bytes, about 2.03 GiB."
+  kind: positive
+  binds:
+    - services/ravel-operator/src/reconcile.rs::default_query_memory_headroom
+    - services/ravel-operator/src/reconcile.rs::tests::default_query_memory_headroom_is_pinned_at_named_budgets
+    - services/ravel-operator/src/reconcile.rs::tests::explicit_memory_headroom_overrides_the_default
+  status: verified
+  note: "The bound unit test pins 2,182,380,259 at 1,610,612,736 bytes and 20,744,692,041 at 24 GiB; the override test pins the 4,061,428,451-byte floor plus headroom against the 3.5Gi limit in the condition message."
+
+- id: kubernetes-query-memory-retention-unmeasured-small-budgets
+  doc: docs/guides/kubernetes.md
+  quote: "Below 8 GB that scaling is unmeasured."
+  kind: not-a-claim
+  binds: []
+  status: verified
+  note: "States where measurements stop, not an absent capability: allocator retention was profiled only at an 8 GB budget (ADR-2633 Context), and the ADR-1170 issue #3200 amendment records the scaling below it as an assumption."
+
+- id: ingest-affinity-mtls-not-available
+  doc: docs/guides/ingest-affinity.md
+  quote: "mTLS resolution is not available at any layer"
+  kind: negative
+  binds:
+    - services/ravel-ingest-router/src/config.rs::into_config
+    - services/ravel-ingest-router/src/config.rs::mtls_enabled_is_refused_on_the_ingest_router
+  status: verified
+  note: "into_config refuses --mtls-enabled outright; the bound test pins the refusal."
+
+- id: caching-root-created-owner-only
+  doc: docs/guides/caching.md
+  quote: "a root that does not exist yet is created owner-only along with any missing ancestor of it."
+  kind: positive
+  binds:
+    - crates/ravel-cache/src/disk.rs::create_entry_dir
+  status: verified
+  note: "The marker phrase is about a directory, but the sentence is a positive claim: create_entry_dir uses a recursive DirBuilder with mode 0o700."
+
+- id: query-engine-limitk-not-implemented
+  doc: docs/query-engine.md
+  quote: "They stay out of the scored surface (they are not part of the stable language), and are not implemented;"
+  kind: negative
+  binds:
+    - crates/ravel-promql/src/aggregate.rs::limitk_and_limit_ratio_reject_without_panicking
+  status: verified
+  note: "Same rejection as guide-query-limitk-not-implemented."
+
+- id: query-engine-histogram-stddev-rejected
+  doc: docs/query-engine.md
+  quote: "`histogram_stddev` | function | intentionally rejected"
+  kind: negative
+  binds: []
+  status: not-implemented
+  note: "No histogram_stddev in ravel-promql's sources; the difftest conformance table declares the typed rejection."
+
+- id: query-engine-histogram-stdvar-rejected
+  doc: docs/query-engine.md
+  quote: "`histogram_stdvar` | function | intentionally rejected"
+  kind: negative
+  binds: []
+  status: not-implemented
+  note: "No histogram_stdvar in ravel-promql's sources."
+
+- id: query-engine-attrs-per-key-projection
+  doc: docs/query-engine.md
+  quote: "when the `AttrsPerKeyProjection` rule applies"
+  kind: positive
+  binds:
+    - crates/ravel-sql/src/attrs_per_key.rs::AttrsPerKeyProjection
+    - crates/ravel-sql/src/logs_scan/mod.rs::reproject_attr_keys
+  status: verified
+  note: "Issue #1768 shipped AttrsPerKeyProjection, a physical optimizer rule session.rs installs on every session: a query that reads attrs only through literal subscripts, in a single-scan plan with no pending erasure, decodes only those keys' FIELD_DIR columns plus attrs_raw via LogsScanExec::reproject_attr_keys. Corrected by #2082."
+
+- id: troubleshooting-breaker-guarantee
+  doc: docs/guides/operations/troubleshooting.md
+  quote: "Relying on the breaker to hold a shard open until every record is back is relying on a guarantee that does not exist."
+  kind: not-a-claim
+  binds: []
+  status: verified
+  note: "Summarises the worked partial-restoration example above it; no capability is claimed absent."
+
+- id: guide-sql-explain-no-parquet
+  doc: docs/guides/inspecting-data.md
+  quote: "Parquet tables are not supported."
+  kind: negative
+  binds: []
+  status: not-implemented
+  note: "services/ravel-cli/src/sql_explain.rs builds its SqlExecutor without with_parquet_sources, and SqlExecutor::resolve_parquet_target returns Ok(None) when no sources are installed. The capability would arrive as a call site, not a new definition, so there is no symbol to bind."
+
+# --- ADR-2904 statements over several tables (issues #2910, #2911, #2914) ---
+
+- id: query-engine-parquet-beside-signal-runs
+  doc: docs/query-engine.md
+  quote: "A statement may name Parquet tables of the caller's tenant beside one or more signal tables, over HTTP and Flight SQL."
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_parquet_table_joined_with_logs_returns_exact_rows
+    - crates/ravel-sql/tests/parquet_tables.rs::samples_joined_with_a_parquet_table_returns_exact_rows
+    - crates/ravel-sql/tests/parquet_tables.rs::flight_sql_joins_a_parquet_table_with_logs
+    - crates/ravel-sql/tests/parquet_tables.rs::a_flight_mixed_statement_pins_the_parquet_table_and_the_signal_lane
+  status: verified
+  note: "Replaces the interim refusal entry: SqlError::SignalBesideParquet is removed (#2914). The HTTP tests join hits with logs and with samples and assert the exact rows; the Flight tests assert the merged Flight rows equal the HTTP rows, and that DoGet reads the pinned Parquet manifest and logs snapshot after both changed between the two calls."
+
+- id: query-engine-parquet-beside-signal-session
+  doc: docs/query-engine.md
+  quote: "Those settings leave the signal scans' physical plans as they are in the same statement without its Parquet tables."
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_signal_scan_plans_the_same_beside_a_parquet_table
+    - crates/ravel-sql/src/session.rs::tests::a_parquet_entry_beside_signal_tables_builds_with_the_parquet_registry
+  status: verified
+  note: "The integration test compares the one-line display and partition count of the LogsScanExec and RsegScanExec nodes of a signal statement alone and beside a Parquet table; the unit test pins that a mixed session takes parquet_session_config and the Parquet store registry (#2914)."
+
+- id: query-engine-parquet-beside-signal-registry
+  doc: docs/query-engine.md
+  quote: "a signal-only session keeps the registry that answers nothing, and a Parquet-only session registers no signal table."
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_signal_only_statement_gets_no_parquet_store_registry
+    - crates/ravel-sql/tests/parquet_tables.rs::a_parquet_only_statement_registers_no_signal_table
+  status: verified
+  note: "Both tests read the planned session's registered tables and whether it resolves the tenant's ravel-pq:// URL, on the pinned single-lane and multi-lane surfaces (#2914)."
+
+- id: query-engine-parquet-beside-signal-no-name-pushdown
+  doc: docs/query-engine.md
+  quote: "so its postings do not prune beside a Parquet table: there a `samples` filter on `__name__` reads every segment in the window"
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::samples_joined_with_a_parquet_table_returns_exact_rows
+  status: verified
+  note: "The test reads two segments for the mixed join and one for the same samples filter alone, where the __name__ postings prune (#2914)."
+
+- id: query-engine-parquet-beside-signal-tokens
+  doc: docs/query-engine.md
+  quote: "one qualified with the Parquet table's name is `SqlError::CommitTokenQualifierNotRead`, refused by token admission before any store request."
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_mixed_statement_takes_a_token_for_its_signal_table_only
+    - crates/ravel-sql/tests/parquet_tables.rs::a_commit_token_on_a_parquet_only_flight_statement_is_refused
+  status: verified
+  note: "The first test runs a mixed statement with an unqualified and a logs-qualified token and refuses a hits-qualified one with both stores' read counts unchanged; the second refuses a token on a Parquet-only Flight statement at GetFlightInfo (#2914)."
+
+- id: query-engine-parquet-beside-signal-row-window
+  doc: docs/query-engine.md
+  quote: "A Parquet table has no event-time column, so beside a signal table (ADR-2904 decision 11) its scans get no filter and contribute every row they read, while the signal scans are filtered as above."
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_row_window_bounds_only_the_signal_scans_beside_a_parquet_table
+  status: verified
+  note: "A LEFT JOIN from hits to logs under a row window returns all six hits rows and joins only the log lines inside the window (#2914)."
+
+- id: query-engine-parquet-read-budget-statement-total
+  doc: docs/query-engine.md
+  quote: "checks each request and its bytes against that view before the request is sent"
+  kind: positive
+  binds:
+    - crates/ravel-parquet/src/limits.rs::tests::a_budget_view_is_compared_while_the_parquet_handle_is_charged
+    - crates/ravel-sql/tests/parquet_tables.rs::a_mixed_statement_is_held_to_one_request_budget
+    - crates/ravel-sql/tests/parquet_tables.rs::a_mixed_statement_is_held_to_one_byte_budget
+  status: verified
+  note: "The unit test pins the view compared and the Parquet handle charged; the integration tests record every request of a logs aggregate joined with a Parquet table and refuse the last lake GET, unsent, under a request budget and under a byte budget each one below the statement's total (#2914)."
+
+- id: query-engine-paging-refuses-signal-beside-other-table
+  doc: docs/query-engine.md
+  quote: "Paging (`page_plan`) refuses such a statement, and one naming a signal table beside any other table, with `PagePlanError::CrossSignal`."
+  kind: positive
+  binds:
+    - crates/ravel-sql/src/page_plan.rs::tests::a_signal_table_beside_a_parquet_table_is_not_paged
+    - crates/ravel-sql/src/page_plan.rs::tests::a_parquet_only_join_still_reports_no_table
+  status: verified
+  note: "Before #2914 a signal table beside a Parquet table paged as the signal table alone; one signal row can join many Parquet rows, so the cursor would skip or repeat rows."
+
+- id: guide-query-token-across-signals-refused
+  doc: docs/guides/query.md
+  quote: "an unqualified one is an HTTP 400 before any catalog listing"
+  kind: positive
+  binds:
+    - services/ravel-server/tests/sql_endpoint.rs::qualified_min_commit_token_over_http
+    - crates/ravel-sql/src/cross_signal_tests.rs::unqualified_token_on_two_signals_is_refused_before_any_listing
+  status: verified
+  note: "The HTTP test pins the 400 naming both tables; the crate test pins that every HTTP entry point refuses with SqlError::CommitTokenNeedsQualifier before any catalog request (#2911)."
+
+- id: guide-query-token-qualified-by-table
+  doc: docs/guides/query.md
+  quote: "Each token then bounds only its own table's snapshot."
+  kind: positive
+  binds:
+    - services/ravel-server/tests/sql_endpoint.rs::qualified_min_commit_token_over_http
+    - crates/ravel-sql/src/cross_signal_tests.rs::qualified_token_bounds_only_its_signal
+    - crates/ravel-sql/src/executor.rs::admit_http_tokens
+  status: verified
+  note: "The HTTP test joins samples and logs with one qualified token each and gets the exact rows, and the crossed pair is the fixed 503; the crate test shows a logs-qualified token never reaches the samples resolve (#2911)."
+
+- id: guide-query-token-on-parquet-refused
+  doc: docs/guides/query.md
+  quote: "so any `min_commit_token` on it, unqualified or qualified with the Parquet table's name, is an HTTP 400."
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_commit_token_on_a_parquet_only_statement_is_refused
+  status: verified
+  note: "The test pins SqlError::CommitTokenOnParquetStatement before either store is read, and that the statement runs without the token (#2911)."
+
+- id: guide-query-signal-beside-parquet-runs
+  doc: docs/guides/query.md
+  quote: "A query can join Parquet tables with each other and with any of the five, over this endpoint and Flight SQL."
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_parquet_table_joined_with_logs_returns_exact_rows
+    - crates/ravel-sql/tests/parquet_tables.rs::samples_joined_with_a_parquet_table_returns_exact_rows
+    - crates/ravel-sql/tests/parquet_tables.rs::flight_sql_joins_a_parquet_table_with_logs
+  status: verified
+  note: "Replaces the entry for the interim 400, which #2914 removed. The tests assert the exact joined rows over HTTP and that Flight returns the same rows."
+
+- id: guide-query-signal-beside-parquet-one-budget
+  doc: docs/guides/query.md
+  quote: "the Parquet reader's `max_s3_requests` and `max_bytes_scanned` check before each Parquet read"
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_mixed_statement_is_held_to_one_request_budget
+    - crates/ravel-sql/tests/parquet_tables.rs::a_mixed_statement_is_held_to_one_byte_budget
+    - crates/ravel-parquet/src/limits.rs::tests::a_budget_view_is_compared_while_the_parquet_handle_is_charged
+  status: verified
+  note: "The integration tests refuse the last Parquet GET of a logs aggregate joined with a Parquet table under a request budget and under a byte budget one below the statement total, logs reads included; the unit test pins that the view's totals are what the Parquet reader compares (#2914)."
+
+- id: guide-query-signal-beside-parquet-resolve-check
+  doc: docs/guides/query.md
+  quote: "the `max_s3_requests` check made as each of the five resolves, which counts the Parquet manifest reads"
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_lanes_resolve_budget_check_counts_the_parquet_resolve_reads
+  status: verified
+  note: "Under a budget one below the Parquet and logs resolve reads together, the logs lane's resolve check refuses with the sum before any lake or logs data GET (#2914)."
+
+- id: query-engine-stats-signals-sum-to-phases
+  doc: docs/query-engine.md
+  quote: "for every phase and every rendered field the entries plus the Parquet share equal `stats.phases`."
+  kind: positive
+  binds:
+    - crates/ravel-sql/src/cross_signal_tests.rs::stats_signals_sum_to_totals_per_phase
+    - crates/ravel-sql/src/statement_accounting.rs::tests::lanes_parquet_and_statement_sum_to_the_total
+    - crates/ravel-sql/tests/parquet_tables.rs::a_mixed_statements_signals_and_parquet_share_sum_to_its_phases
+  status: verified
+  note: "The first test sums the samples and logs entries of a join to stats.phases per phase and per rendered field; the second pins the Parquet share as the total less the entries on the view; the third sums a logs entry and the Parquet table's cost alone to stats.phases per phase and operation on a statement over both (#2914)."

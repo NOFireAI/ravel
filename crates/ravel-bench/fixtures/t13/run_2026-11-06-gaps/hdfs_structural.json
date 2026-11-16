@@ -1,0 +1,978 @@
+{
+  "arm": "structural_fetch",
+  "subject": "hdfs_structural",
+  "stamp": {
+    "git": "b515bb8e1a37b1339b65d6dfc93c39cf025e7d1b",
+    "arch": "arm64",
+    "nproc": 15,
+    "mem_total_kib": 0,
+    "corpus_file": "HDFS.log",
+    "corpus_sha256": "0783096174d7832c618337f9609e06e04abd86ddd7089b3c12b407e63bfebc52",
+    "corpus_bytes": 1577982906,
+    "cpu_clock": "CLOCK_THREAD_CPUTIME_ID of the report thread; the measurement runs on a current-thread tokio runtime, so every decode the production fetcher does lands on that thread",
+    "profile": "release"
+  },
+  "params": {
+    "block_records": 8192.0,
+    "coalesce_gap": 1887437.0,
+    "group_blocks": 32.0,
+    "latency_ms": 30.0,
+    "matched_rows": 10.0,
+    "max_concurrent_gets": 16.0,
+    "max_lines": 2000000.0,
+    "mini_block_bytes": 8192.0,
+    "mini_block_meta_bytes": 4.0,
+    "object_max_bytes": 11534336.0,
+    "object_min_bytes": 10485760.0,
+    "runs": 5.0,
+    "seed": 13.0,
+    "trace_run_rows": 4.0,
+    "zstd_level": 3.0
+  },
+  "decision_rule": "Per subject: GO when gap_64k/ratio/bytes <= 0.25 and gap_64k/ratio/gets <= 1.5 and gap_64k/ratio/wall <= 1, each reported exactly once. Overall: GO when every pre-registered subject of the arm is GO.",
+  "figures": [
+    {
+      "key": "rows",
+      "value": 540672.0
+    },
+    {
+      "key": "blocks",
+      "value": 66.0
+    },
+    {
+      "key": "object_bytes",
+      "value": 11101600.0
+    },
+    {
+      "key": "target_blocks",
+      "value": 10.0
+    },
+    {
+      "key": "today/uncomp_bytes",
+      "value": 12039421.0
+    },
+    {
+      "key": "structural/layout_bytes",
+      "value": 11545750.0
+    },
+    {
+      "key": "structural/raw_ranges",
+      "value": 72.0
+    },
+    {
+      "key": "structural/meta_bytes",
+      "value": 7144.0
+    },
+    {
+      "key": "structural/uncomp_bytes",
+      "value": 928318.0
+    },
+    {
+      "key": "today/plan_gets",
+      "value": 1.0
+    },
+    {
+      "key": "today/plan_bytes",
+      "value": 262144.0
+    },
+    {
+      "key": "today/gets",
+      "value": 3.0
+    },
+    {
+      "key": "today/bytes",
+      "value": 10647076.0
+    },
+    {
+      "key": "today/data_over_object",
+      "value": 0.9354446205952295
+    },
+    {
+      "key": "today/wall_ms",
+      "value": 119.423708
+    },
+    {
+      "key": "today/decode_cpu_ms",
+      "value": 23.254874999999675
+    },
+    {
+      "key": "structural/data_ranges",
+      "value": 1.0
+    },
+    {
+      "key": "structural/gets",
+      "value": 2.0
+    },
+    {
+      "key": "structural/bytes",
+      "value": 11374888.0
+    },
+    {
+      "key": "structural/wall_ms",
+      "value": 65.86435376218846
+    },
+    {
+      "key": "structural/decode_cpu_ms",
+      "value": 1.7931027621884557
+    },
+    {
+      "key": "ratio/bytes",
+      "value": 1.0683579228700912
+    },
+    {
+      "key": "ratio/gets",
+      "value": 0.6666666666666666
+    },
+    {
+      "key": "ratio/wall",
+      "value": 0.5515182442852005
+    },
+    {
+      "key": "gap_64k/today/plan_gets",
+      "value": 1.0
+    },
+    {
+      "key": "gap_64k/today/plan_bytes",
+      "value": 262144.0
+    },
+    {
+      "key": "gap_64k/today/gets",
+      "value": 24.0
+    },
+    {
+      "key": "gap_64k/today/bytes",
+      "value": 1943214.0
+    },
+    {
+      "key": "gap_64k/today/data_over_object",
+      "value": 0.15142592058802334
+    },
+    {
+      "key": "gap_64k/today/wall_ms",
+      "value": 150.109125
+    },
+    {
+      "key": "gap_64k/today/decode_cpu_ms",
+      "value": 22.525874999999917
+    },
+    {
+      "key": "gap_64k/structural/data_ranges",
+      "value": 22.0
+    },
+    {
+      "key": "gap_64k/structural/gets",
+      "value": 23.0
+    },
+    {
+      "key": "gap_64k/structural/bytes",
+      "value": 480525.0
+    },
+    {
+      "key": "gap_64k/structural/wall_ms",
+      "value": 97.32489210039667
+    },
+    {
+      "key": "gap_64k/structural/decode_cpu_ms",
+      "value": 1.736892100396682
+    },
+    {
+      "key": "gap_64k/ratio/bytes",
+      "value": 0.24728362393436853
+    },
+    {
+      "key": "gap_64k/ratio/gets",
+      "value": 0.9583333333333334
+    },
+    {
+      "key": "gap_64k/ratio/wall",
+      "value": 0.6483609314250327
+    },
+    {
+      "key": "gap_256k/today/plan_gets",
+      "value": 1.0
+    },
+    {
+      "key": "gap_256k/today/plan_bytes",
+      "value": 262144.0
+    },
+    {
+      "key": "gap_256k/today/gets",
+      "value": 19.0
+    },
+    {
+      "key": "gap_256k/today/bytes",
+      "value": 2911987.0
+    },
+    {
+      "key": "gap_256k/today/data_over_object",
+      "value": 0.2386901888016142
+    },
+    {
+      "key": "gap_256k/today/wall_ms",
+      "value": 153.084666
+    },
+    {
+      "key": "gap_256k/today/decode_cpu_ms",
+      "value": 24.929542000000193
+    },
+    {
+      "key": "gap_256k/structural/data_ranges",
+      "value": 21.0
+    },
+    {
+      "key": "gap_256k/structural/gets",
+      "value": 22.0
+    },
+    {
+      "key": "gap_256k/structural/bytes",
+      "value": 576111.0
+    },
+    {
+      "key": "gap_256k/structural/wall_ms",
+      "value": 98.14185552673015
+    },
+    {
+      "key": "gap_256k/structural/decode_cpu_ms",
+      "value": 1.9222305267301623
+    },
+    {
+      "key": "gap_256k/ratio/bytes",
+      "value": 0.19784119915370502
+    },
+    {
+      "key": "gap_256k/ratio/gets",
+      "value": 1.1578947368421053
+    },
+    {
+      "key": "gap_256k/ratio/wall",
+      "value": 0.6410952715978108
+    },
+    {
+      "key": "gap_1m/today/plan_gets",
+      "value": 1.0
+    },
+    {
+      "key": "gap_1m/today/plan_bytes",
+      "value": 262144.0
+    },
+    {
+      "key": "gap_1m/today/gets",
+      "value": 3.0
+    },
+    {
+      "key": "gap_1m/today/bytes",
+      "value": 10647076.0
+    },
+    {
+      "key": "gap_1m/today/data_over_object",
+      "value": 0.9354446205952295
+    },
+    {
+      "key": "gap_1m/today/wall_ms",
+      "value": 121.5885
+    },
+    {
+      "key": "gap_1m/today/decode_cpu_ms",
+      "value": 25.409041000000077
+    },
+    {
+      "key": "gap_1m/structural/data_ranges",
+      "value": 1.0
+    },
+    {
+      "key": "gap_1m/structural/gets",
+      "value": 2.0
+    },
+    {
+      "key": "gap_1m/structural/bytes",
+      "value": 11374888.0
+    },
+    {
+      "key": "gap_1m/structural/wall_ms",
+      "value": 65.9435780316938
+    },
+    {
+      "key": "gap_1m/structural/decode_cpu_ms",
+      "value": 1.9592030316938056
+    },
+    {
+      "key": "gap_1m/ratio/bytes",
+      "value": 1.0683579228700912
+    },
+    {
+      "key": "gap_1m/ratio/gets",
+      "value": 0.6666666666666666
+    },
+    {
+      "key": "gap_1m/ratio/wall",
+      "value": 0.5423504528116869
+    },
+    {
+      "key": "l0_64k/today/plan_gets",
+      "value": 1.0
+    },
+    {
+      "key": "l0_64k/today/plan_bytes",
+      "value": 262144.0
+    },
+    {
+      "key": "l0_64k/today/gets",
+      "value": 3.0
+    },
+    {
+      "key": "l0_64k/today/bytes",
+      "value": 10647076.0
+    },
+    {
+      "key": "l0_64k/today/data_over_object",
+      "value": 0.9354446205952295
+    },
+    {
+      "key": "l0_64k/today/wall_ms",
+      "value": 120.30395800000001
+    },
+    {
+      "key": "l0_64k/today/decode_cpu_ms",
+      "value": 23.879790999999706
+    },
+    {
+      "key": "l0_64k/structural/data_ranges",
+      "value": 4.0
+    },
+    {
+      "key": "l0_64k/structural/gets",
+      "value": 5.0
+    },
+    {
+      "key": "l0_64k/structural/bytes",
+      "value": 8707944.0
+    },
+    {
+      "key": "l0_64k/structural/wall_ms",
+      "value": 65.87237086770874
+    },
+    {
+      "key": "l0_64k/structural/decode_cpu_ms",
+      "value": 1.8412878677087319
+    },
+    {
+      "key": "l0_64k/ratio/bytes",
+      "value": 0.8178718739304576
+    },
+    {
+      "key": "l0_64k/ratio/gets",
+      "value": 1.6666666666666667
+    },
+    {
+      "key": "l0_64k/ratio/wall",
+      "value": 0.5475494901648101
+    }
+  ],
+  "expect": {
+    "blocks": {
+      "predict": 65.0,
+      "band": [
+        52.0,
+        80.0
+      ]
+    },
+    "gap_1m/ratio/bytes": {
+      "predict": 0.55,
+      "band": [
+        0.05,
+        1.1
+      ]
+    },
+    "gap_1m/ratio/gets": {
+      "predict": 2.0,
+      "band": [
+        0.5,
+        6.5
+      ]
+    },
+    "gap_1m/ratio/wall": {
+      "predict": 0.53,
+      "band": [
+        0.3,
+        0.9
+      ]
+    },
+    "gap_1m/structural/bytes": {
+      "predict": 6000000.0,
+      "band": [
+        600000.0,
+        11500000.0
+      ]
+    },
+    "gap_1m/structural/data_ranges": {
+      "predict": 5.0,
+      "band": [
+        1.0,
+        12.0
+      ]
+    },
+    "gap_1m/structural/decode_cpu_ms": {
+      "predict": 2.2,
+      "band": [
+        0.7,
+        7.0
+      ]
+    },
+    "gap_1m/structural/gets": {
+      "predict": 6.0,
+      "band": [
+        2.0,
+        13.0
+      ]
+    },
+    "gap_1m/structural/wall_ms": {
+      "predict": 64.0,
+      "band": [
+        55.0,
+        110.0
+      ]
+    },
+    "gap_1m/today/bytes": {
+      "predict": 10647076.0,
+      "band": [
+        10300000.0,
+        11400000.0
+      ]
+    },
+    "gap_1m/today/data_over_object": {
+      "predict": 0.935,
+      "band": [
+        0.9,
+        1.0
+      ]
+    },
+    "gap_1m/today/decode_cpu_ms": {
+      "predict": 28.0,
+      "band": [
+        10.0,
+        90.0
+      ]
+    },
+    "gap_1m/today/gets": {
+      "predict": 3.0,
+      "band": [
+        2.0,
+        4.0
+      ]
+    },
+    "gap_1m/today/plan_bytes": {
+      "predict": 262144.0,
+      "band": [
+        262144.0,
+        1048576.0
+      ]
+    },
+    "gap_1m/today/plan_gets": {
+      "predict": 1.0,
+      "band": [
+        1.0,
+        2.0
+      ]
+    },
+    "gap_1m/today/wall_ms": {
+      "predict": 121.0,
+      "band": [
+        80.0,
+        220.0
+      ]
+    },
+    "gap_256k/ratio/bytes": {
+      "predict": 0.5,
+      "band": [
+        0.25,
+        1.0
+      ]
+    },
+    "gap_256k/ratio/gets": {
+      "predict": 0.92,
+      "band": [
+        0.6,
+        1.6
+      ]
+    },
+    "gap_256k/ratio/wall": {
+      "predict": 0.69,
+      "band": [
+        0.4,
+        1.2
+      ]
+    },
+    "gap_256k/structural/bytes": {
+      "predict": 1000000.0,
+      "band": [
+        500000.0,
+        2000000.0
+      ]
+    },
+    "gap_256k/structural/data_ranges": {
+      "predict": 11.0,
+      "band": [
+        8.0,
+        16.0
+      ]
+    },
+    "gap_256k/structural/decode_cpu_ms": {
+      "predict": 2.2,
+      "band": [
+        0.8,
+        7.0
+      ]
+    },
+    "gap_256k/structural/gets": {
+      "predict": 12.0,
+      "band": [
+        9.0,
+        17.0
+      ]
+    },
+    "gap_256k/structural/wall_ms": {
+      "predict": 64.0,
+      "band": [
+        55.0,
+        110.0
+      ]
+    },
+    "gap_256k/today/bytes": {
+      "predict": 2050000.0,
+      "band": [
+        1600000.0,
+        2900000.0
+      ]
+    },
+    "gap_256k/today/data_over_object": {
+      "predict": 0.16,
+      "band": [
+        0.12,
+        0.26
+      ]
+    },
+    "gap_256k/today/decode_cpu_ms": {
+      "predict": 28.0,
+      "band": [
+        10.0,
+        80.0
+      ]
+    },
+    "gap_256k/today/gets": {
+      "predict": 13.0,
+      "band": [
+        11.0,
+        24.0
+      ]
+    },
+    "gap_256k/today/plan_bytes": {
+      "predict": 262144.0,
+      "band": [
+        262144.0,
+        1048576.0
+      ]
+    },
+    "gap_256k/today/plan_gets": {
+      "predict": 1.0,
+      "band": [
+        1.0,
+        2.0
+      ]
+    },
+    "gap_256k/today/wall_ms": {
+      "predict": 95.0,
+      "band": [
+        60.0,
+        190.0
+      ]
+    },
+    "gap_64k/ratio/bytes": {
+      "predict": 0.237,
+      "band": [
+        0.17,
+        0.3
+      ]
+    },
+    "gap_64k/ratio/gets": {
+      "predict": 1.64,
+      "band": [
+        0.9,
+        2.2
+      ]
+    },
+    "gap_64k/ratio/wall": {
+      "predict": 1.05,
+      "band": [
+        0.6,
+        1.6
+      ]
+    },
+    "gap_64k/structural/bytes": {
+      "predict": 480525.0,
+      "band": [
+        475000.0,
+        486000.0
+      ]
+    },
+    "gap_64k/structural/data_ranges": {
+      "predict": 22.0,
+      "band": [
+        21.0,
+        23.0
+      ]
+    },
+    "gap_64k/structural/decode_cpu_ms": {
+      "predict": 2.2,
+      "band": [
+        0.8,
+        7.0
+      ]
+    },
+    "gap_64k/structural/gets": {
+      "predict": 23.0,
+      "band": [
+        22.0,
+        24.0
+      ]
+    },
+    "gap_64k/structural/wall_ms": {
+      "predict": 95.0,
+      "band": [
+        65.0,
+        150.0
+      ]
+    },
+    "gap_64k/today/bytes": {
+      "predict": 2030000.0,
+      "band": [
+        1600000.0,
+        2800000.0
+      ]
+    },
+    "gap_64k/today/data_over_object": {
+      "predict": 0.16,
+      "band": [
+        0.12,
+        0.25
+      ]
+    },
+    "gap_64k/today/decode_cpu_ms": {
+      "predict": 28.0,
+      "band": [
+        10.0,
+        80.0
+      ]
+    },
+    "gap_64k/today/gets": {
+      "predict": 14.0,
+      "band": [
+        11.0,
+        24.0
+      ]
+    },
+    "gap_64k/today/plan_bytes": {
+      "predict": 262144.0,
+      "band": [
+        262144.0,
+        1048576.0
+      ]
+    },
+    "gap_64k/today/plan_gets": {
+      "predict": 1.0,
+      "band": [
+        1.0,
+        2.0
+      ]
+    },
+    "gap_64k/today/wall_ms": {
+      "predict": 95.0,
+      "band": [
+        60.0,
+        190.0
+      ]
+    },
+    "l0_64k/ratio/bytes": {
+      "predict": 0.69,
+      "band": [
+        0.4,
+        0.95
+      ]
+    },
+    "l0_64k/ratio/gets": {
+      "predict": 1.67,
+      "band": [
+        1.25,
+        2.5
+      ]
+    },
+    "l0_64k/ratio/wall": {
+      "predict": 0.53,
+      "band": [
+        0.3,
+        0.9
+      ]
+    },
+    "l0_64k/structural/bytes": {
+      "predict": 7300000.0,
+      "band": [
+        4500000.0,
+        10000000.0
+      ]
+    },
+    "l0_64k/structural/data_ranges": {
+      "predict": 4.0,
+      "band": [
+        4.0,
+        4.0
+      ]
+    },
+    "l0_64k/structural/decode_cpu_ms": {
+      "predict": 2.2,
+      "band": [
+        0.7,
+        7.0
+      ]
+    },
+    "l0_64k/structural/gets": {
+      "predict": 5.0,
+      "band": [
+        5.0,
+        5.0
+      ]
+    },
+    "l0_64k/structural/wall_ms": {
+      "predict": 64.0,
+      "band": [
+        55.0,
+        110.0
+      ]
+    },
+    "l0_64k/today/bytes": {
+      "predict": 10647076.0,
+      "band": [
+        10300000.0,
+        11400000.0
+      ]
+    },
+    "l0_64k/today/data_over_object": {
+      "predict": 0.935,
+      "band": [
+        0.9,
+        1.0
+      ]
+    },
+    "l0_64k/today/decode_cpu_ms": {
+      "predict": 28.0,
+      "band": [
+        10.0,
+        90.0
+      ]
+    },
+    "l0_64k/today/gets": {
+      "predict": 3.0,
+      "band": [
+        2.0,
+        4.0
+      ]
+    },
+    "l0_64k/today/plan_bytes": {
+      "predict": 262144.0,
+      "band": [
+        262144.0,
+        1048576.0
+      ]
+    },
+    "l0_64k/today/plan_gets": {
+      "predict": 1.0,
+      "band": [
+        1.0,
+        2.0
+      ]
+    },
+    "l0_64k/today/wall_ms": {
+      "predict": 121.0,
+      "band": [
+        80.0,
+        220.0
+      ]
+    },
+    "object_bytes": {
+      "unpredicted": "fixed by construction: the sizing search places it inside the registered object_min_bytes..object_max_bytes window"
+    },
+    "ratio/bytes": {
+      "predict": 1.07,
+      "band": [
+        0.9,
+        1.2
+      ]
+    },
+    "ratio/gets": {
+      "predict": 1.0,
+      "band": [
+        0.66,
+        1.5
+      ]
+    },
+    "ratio/wall": {
+      "predict": 0.5,
+      "band": [
+        0.3,
+        0.8
+      ]
+    },
+    "rows": {
+      "predict": 532480.0,
+      "band": [
+        425984.0,
+        655360.0
+      ]
+    },
+    "structural/bytes": {
+      "predict": 12100000.0,
+      "band": [
+        10700000.0,
+        14700000.0
+      ]
+    },
+    "structural/data_ranges": {
+      "predict": 1.0,
+      "band": [
+        1.0,
+        2.0
+      ]
+    },
+    "structural/decode_cpu_ms": {
+      "predict": 5.0,
+      "band": [
+        1.5,
+        15.0
+      ]
+    },
+    "structural/gets": {
+      "predict": 2.0,
+      "band": [
+        2.0,
+        3.0
+      ]
+    },
+    "structural/layout_bytes": {
+      "predict": 11900000.0,
+      "band": [
+        10485760.0,
+        14417920.0
+      ]
+    },
+    "structural/meta_bytes": {
+      "predict": 5000.0,
+      "band": [
+        2500.0,
+        9000.0
+      ]
+    },
+    "structural/raw_ranges": {
+      "predict": 72.0,
+      "band": [
+        60.0,
+        90.0
+      ]
+    },
+    "structural/uncomp_bytes": {
+      "predict": 900000.0,
+      "band": [
+        450000.0,
+        1600000.0
+      ]
+    },
+    "structural/wall_ms": {
+      "predict": 66.0,
+      "band": [
+        60.0,
+        110.0
+      ]
+    },
+    "target_blocks": {
+      "unpredicted": "fixed by construction: 10 evenly spaced rows land in 10 distinct blocks whenever the object has at least 10 blocks"
+    },
+    "today/bytes": {
+      "predict": 11272192.0,
+      "band": [
+        10747904.0,
+        12582912.0
+      ]
+    },
+    "today/data_over_object": {
+      "predict": 0.935,
+      "band": [
+        0.9,
+        1.0
+      ]
+    },
+    "today/decode_cpu_ms": {
+      "predict": 70.0,
+      "band": [
+        30.0,
+        150.0
+      ]
+    },
+    "today/gets": {
+      "predict": 2.0,
+      "band": [
+        2.0,
+        3.0
+      ]
+    },
+    "today/plan_bytes": {
+      "predict": 262144.0,
+      "band": [
+        262144.0,
+        1048576.0
+      ]
+    },
+    "today/plan_gets": {
+      "predict": 1.0,
+      "band": [
+        1.0,
+        2.0
+      ]
+    },
+    "today/uncomp_bytes": {
+      "predict": 11960000.0,
+      "band": [
+        10525000.0,
+        13395000.0
+      ]
+    },
+    "today/wall_ms": {
+      "predict": 130.0,
+      "band": [
+        90.0,
+        220.0
+      ]
+    }
+  },
+  "checked": {
+    "problems": [],
+    "misses": [
+      "gap_256k/ratio/bytes: 0.19784119915370502 outside band [0.25, 1.0]",
+      "gap_256k/structural/data_ranges: 21 outside band [8.0, 16.0]",
+      "gap_256k/structural/gets: 22 outside band [9.0, 17.0]",
+      "gap_256k/today/bytes: 2911987 outside band [1600000.0, 2900000.0]",
+      "today/bytes: 10647076 outside band [10747904.0, 12582912.0]",
+      "today/decode_cpu_ms: 23.254874999999675 outside band [30.0, 150.0]"
+    ]
+  },
+  "decision": {
+    "subject": "hdfs_structural",
+    "go": true,
+    "line": "structural_fetch decision hdfs_structural: GO (gap_64k/ratio/bytes=0.2473<=0.25 ok, gap_64k/ratio/gets=0.9583<=1.5 ok, gap_64k/ratio/wall=0.6484<=1 ok)"
+  },
+  "notes": [
+    "object: 540672 rows from the first lines of the corpus, 66 blocks, 11101600 bytes, sized in 2 writes; whole-object bound 9437185 bytes, so the plan is the ranged plan restricted to the known blocks. Whether today's scan then reads those blocks ranged or the whole object is the fetcher's coverage crossover, decided per gap: production gap 1887437 on L0: 2 ranged GETs of 10384932 bytes after the plan; gap_64k (65536 bytes on L1): 23 ranged GETs of 1681070 bytes after the plan; gap_256k (262144 bytes on L1): 18 ranged GETs of 2649843 bytes after the plan; gap_1m (1048576 bytes on L1): 2 ranged GETs of 10384932 bytes after the plan; l0_64k (65536 bytes on L0): 2 ranged GETs of 10384932 bytes after the plan",
+    "matched rows (block, row of block): [(3, 2457), (9, 7372), (16, 4095), (23, 818), (29, 5733), (36, 2457), (42, 7372), (49, 4095), (56, 818), (62, 5733)]",
+    "today: production plan_segment_routed + scan_accounted_with_tenant_subset_raw over every column, real GETs through InstrumentedStore behind a per-GET delay; decode CPU is the thread CPU of the scan open and drain",
+    "structural: a faithful simulation, not a real decode. Byte and GET counts come from the object's real pages, re-cut into independently compressed mini-blocks and fetched as real ranged GETs; the plan is the production plan run for real plus the mini-block index; decode CPU is modelled as today's CPU at the same gap times structural/uncomp_bytes over today/uncomp_bytes; wall is measured plan and data GET time plus that modelled CPU",
+    "coalescing: unprefixed figures are both sides at the production default gap, coalesce_gap = DEFAULT_LOG_REQUEST_COST_BYTES = 1887437 bytes (checked), on an L0 segment, the configuration round 0 measured. Targets 6 blocks apart sit closer than that, so both sides there tend to one range and ratio/* is a layout and recompression ratio; it is not counted toward the decision. gap_64k/* (65536 bytes), gap_256k/* (262144 bytes), gap_1m/* (1048576 bytes) are both sides at the named gap on an L1 segment, measured: today's side is the production fetcher with BlockRangeFetcher::with_coalesce_gap and nothing else changed, the structural ranges are coalesced at the same gap, and both sides' plans are made by that fetcher. The decision is taken at gap_64k (65536 bytes, DEFAULT_LOG_COALESCE_GAP). L1 because an L0 read is bridged to at most 4 (MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT) runs before the coverage crossover is checked, which spans the targets whatever the gap; l0_64k/* is that L0 case at 65536 bytes, with the structural ranges bounded to the same 4 runs by the same rule, reported beside the decision and not counted",
+    "latency model: every GET waits latency_ms before it returns, whatever its size; there is no bandwidth term, so wall time counts round trips and decode CPU, not bytes moved",
+    "medians of 5 interleaved runs (each run measures every gap, today then structural); every GET and byte count was identical across runs"
+  ]
+}

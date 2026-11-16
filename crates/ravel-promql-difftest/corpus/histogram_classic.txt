@@ -1,0 +1,89 @@
+# Classic-bucket histogram function corpus (docs/promql-evaluator-plan.md
+# section 8): histogram_quantile and histogram_fraction over `le`-labeled
+# classic bucket series, against the fixed dataset in
+# crates/ravel-promql-difftest/src/generator.rs. Every offset is relative
+# to the dataset's base_ts_ms.
+#
+# generator.rs's classic_histogram_family has no "missing +Inf bucket"
+# variant (adding one is out of scope for this corpus/-only change); that
+# scenario is instead synthesized here with a `le!="+Inf"` matcher against
+# the "wellformed" series.
+#
+# histogram_quantile/histogram_fraction have no matrix-reducing shape, so
+# they are not usable at a range query's top level; the "rate of buckets"
+# composition below is written as an instant query for the same reason.
+# Every entry is `mode: unordered` for the same reason as selectors.txt
+# (ADR-0021 decision 3).
+#
+# `ravel-promql` carries warning/info annotations: the missing-+Inf and
+# non-monotonic entries below are scenarios Prometheus attaches a warning
+# to, and `ravel-promql` raises the matching warning through the same
+# evaluator path, so the differential comparator's presence-equality check
+# on both passes rather than being an expected failure. Verified against
+# the real pinned Prometheus binary (0 mismatches on this file's entries).
+
+name: instant_histogram_quantile_wellformed_buckets
+query: histogram_quantile(0.9, diff_histogram_bucket{variant="wellformed"})
+kind: instant
+time: +600s
+mode: unordered
+
+name: instant_histogram_quantile_median_wellformed_buckets
+query: histogram_quantile(0.5, diff_histogram_bucket{variant="wellformed"})
+kind: instant
+time: +600s
+mode: unordered
+
+name: instant_histogram_fraction_wellformed_buckets
+query: histogram_fraction(0.1, 1, diff_histogram_bucket{variant="wellformed"})
+kind: instant
+time: +600s
+mode: unordered
+
+name: instant_histogram_fraction_full_range_is_one
+query: histogram_fraction(-Inf, +Inf, diff_histogram_bucket{variant="wellformed"})
+kind: instant
+time: +600s
+mode: unordered
+
+name: instant_histogram_quantile_missing_inf_bucket
+query: histogram_quantile(0.9, diff_histogram_bucket{variant="wellformed", le!="+Inf"})
+kind: instant
+time: +600s
+mode: unordered
+
+name: instant_histogram_quantile_nonmonotonic_buckets
+query: histogram_quantile(0.9, diff_histogram_bucket{variant="nonmonotonic"})
+kind: instant
+time: +1170s
+mode: unordered
+
+name: instant_histogram_quantile_over_rate_of_buckets
+query: histogram_quantile(0.9, rate(diff_histogram_bucket{variant="wellformed"}[5m]))
+kind: instant
+time: +600s
+mode: unordered
+
+name: instant_histogram_quantile_phi_below_zero
+query: histogram_quantile(-1, diff_histogram_bucket{variant="wellformed"})
+kind: instant
+time: +600s
+mode: unordered
+
+name: instant_histogram_quantile_phi_above_one
+query: histogram_quantile(2, diff_histogram_bucket{variant="wellformed"})
+kind: instant
+time: +600s
+mode: unordered
+
+name: instant_histogram_quantile_phi_nan
+query: histogram_quantile(nan, diff_histogram_bucket{variant="wellformed"})
+kind: instant
+time: +600s
+mode: unordered
+
+name: instant_histogram_fraction_empty_range_is_zero
+query: histogram_fraction(1, 1, diff_histogram_bucket{variant="wellformed"})
+kind: instant
+time: +600s
+mode: unordered

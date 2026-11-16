@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Refuse a push that would DELETE published history, and print exactly what
+# would be lost before it does.
+#
+# The flag is not visible here. git passes a pre-push hook
+# `<local ref> <local sha> <remote ref> <remote sha>` on stdin and nothing
+# else, so grepping the command line for `--force` finds nothing. The test
+# is structural instead: if the remote commit is not an ancestor of the
+# commit being pushed, this push drops commits. That also catches
+# `--force-with-lease` and a `+refs/heads/x` refspec, which a flag matcher
+# misses.
+#
+# Refused: dropping commits from `main`, from any branch with an open pull
+# request, and deleting either. Dropping commits from your own branch with
+# no open pull request is ordinary fix-round work: it is reported, not
+# blocked.
+#
+# Override with ALLOW_DESTRUCTIVE=1, which still prints the loss.
+#
+# Install with scripts/guards/install-git-hooks.sh (sets core.hooksPath).
+set -uo pipefail
+
+readonly ZERO="0000000000000000000000000000000000000000"
+remote_name="${1:-origin}"
+
+allow_destructive="${ALLOW_DESTRUCTIVE:-0}"
+refused=0
+
+# Open pull request for a branch, as a number, or one of the two failure
+# words. "unknown" (gh could not be asked) is not "none" (asked, nothing
+# open): the first must not read as permission.
+open_pr_for() {
+  local branch="$1"
+  if ! command -v gh >/dev/null 2>&1; then
+    printf 'unknown\n'
+    return
+  fi
+  local out
+  if ! out="$(gh pr list --head "${branch}" --state open --json number --jq '.[0].number // ""' 2>/dev/null)"; then
+    printf 'unknown\n'
+    return
+  fi
+  if [[ -z "${out}" ]]; then
+    printf 'none\n'
+  else
+    printf '%s\n' "${out}"
+  fi
+}
+
+print_loss() {
+  local remote_sha="$1" local_sha="$2" ref="$3"
+  echo "  commits on ${ref} that this push would remove:"
+  if [[ "${local_sha}" == "${ZERO}" ]]; then
+    git log --oneline --no-decorate -20 "${remote_sha}" 2>/dev/null | sed 's/^/    /'
+  else
+    git log --oneline --no-decorate "${local_sha}..${remote_sha}" 2>/dev/null | sed 's/^/    /'
+    echo "  files they changed:"
+    git diff --stat "${local_sha}...${remote_sha}" 2>/dev/null | tail -20 | sed 's/^/    /'
+  fi
+}
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [[ -z "${remote_ref}" ]] && continue
+
+  branch="${remote_ref#refs/heads/}"
+  deleting=0
+  [[ "${local_sha}" == "${ZERO}" ]] && deleting=1
+
+  # A brand-new remote branch removes nothing.
+  [[ "${remote_sha}" == "${ZERO}" ]] && continue
+
+  drops=0
+  if ((deleting == 1)); then
+    drops=1
+  elif ! git merge-base --is-ancestor "${remote_sha}" "${local_sha}" 2>/dev/null; then
+    drops=1
+  fi
+  ((drops == 0)) && continue
+
+  pr="$(open_pr_for "${branch}")"
+
+  protected=0
+  why=""
+  if [[ "${branch}" == "main" ]]; then
+    protected=1
+    why="main"
+  elif [[ "${pr}" == "unknown" ]]; then
+    protected=1
+    why="a branch whose pull-request state could not be read (gh unavailable)"
+  elif [[ "${pr}" != "none" ]]; then
+    protected=1
+    why="a branch with open pull request #${pr}"
+  fi
+
+  if ((deleting == 1)); then
+    echo "pre-push: DELETING ${remote_name}/${branch}" >&2
+  else
+    echo "pre-push: non-fast-forward push to ${remote_name}/${branch}" >&2
+  fi
+  print_loss "${remote_sha}" "${local_sha}" "${remote_name}/${branch}" >&2
+
+  if ((protected == 0)); then
+    echo "  ${branch} has no open pull request; allowing (this is ordinary fix-round work)." >&2
+    continue
+  fi
+
+  if [[ "${allow_destructive}" == "1" ]]; then
+    echo "  ALLOW_DESTRUCTIVE=1: allowing this push to ${why}. The loss above is what you accepted." >&2
+    continue
+  fi
+
+  echo "  REFUSED: this would discard published history on ${why}." >&2
+  echo "  If that is genuinely what you want, re-run the push with ALLOW_DESTRUCTIVE=1." >&2
+  refused=1
+done
+
+exit "${refused}"

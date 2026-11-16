@@ -1,0 +1,1275 @@
+use super::*;
+use crate::load::test_support::*;
+
+/// `bloom` is nested inside `encode`'s timing window, not a disjoint fifth
+/// stage (ADR-0104 decision 1): its printed row must say so, or an
+/// operator summing the `stage timings` table's `total_ms` column
+/// double-counts it against `encode`. This pins the exact rendered name
+/// for every stage, not a substring, so a later rename of the marker text
+/// cannot quietly drop it.
+#[cfg(feature = "stage-timing")]
+#[test]
+fn stage_display_name_marks_bloom_as_nested_in_encode() {
+    assert_eq!(stage_display_name(ravel_ingest::LogStage::Admit), "admit");
+    assert_eq!(stage_display_name(ravel_ingest::LogStage::Route), "route");
+    assert_eq!(stage_display_name(ravel_ingest::LogStage::Merge), "merge");
+    assert_eq!(stage_display_name(ravel_ingest::LogStage::Encode), "encode");
+    assert_eq!(
+        stage_display_name(ravel_ingest::LogStage::Bloom),
+        "bloom (in encode)"
+    );
+}
+
+/// A load whose object crosses the 1000-column dynamic budget produces the
+/// overflow warning, driven from real router metrics rather than a
+/// hand-built snapshot. Flip the `dynamic_columns_overflowed_total > 0`
+/// guard in `dynamic_column_warnings` to `false` and this fails: no warning
+/// is emitted for a load that genuinely overflowed.
+#[tokio::test]
+async fn warns_when_dynamic_columns_overflow() {
+    let report = run_wide_load(1001).await;
+    assert!(
+        report.metrics.dynamic_columns_overflowed_total > 0,
+        "1001 distinct attribute columns overflow the 1000-column per-object budget"
+    );
+    let warnings = dynamic_column_warnings(
+        &report.metrics,
+        ravel_logseg::RlogConfig::default().max_dynamic_columns,
+    );
+    assert_eq!(warnings.len(), 1, "exactly the overflow warning fires");
+    assert!(
+        warnings[0].contains("overflowed the per-object dynamic-column budget")
+            && warnings[0].contains("attrs_raw"),
+        "the overflow warning states the count and the attrs_raw consequence: {}",
+        warnings[0]
+    );
+}
+
+/// The overflow warning reaches a caller of the real entry point, not just
+/// [`dynamic_column_warnings`].
+///
+/// The sibling tests call that helper directly, so all of them stayed green
+/// when the emit loop was deleted from the entry point: they prove the text,
+/// not the wiring. This one drives [`run_warning_to`] end to end -- mapping
+/// file on disk, Parquet fixture, real router, real write -- and asserts the
+/// warning came out of the stream the CLI hands it.
+#[tokio::test]
+async fn the_entry_point_emits_the_overflow_warning() {
+    use parquet::arrow::ArrowWriter;
+    use ravel_object_store::memory::MemoryStore;
+
+    let n_attrs = 1001;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pq = dir.path().join("wide.parquet");
+    let mapping_path = dir.path().join("mapping.toml");
+
+    let mut cols: Vec<(String, ArrayRef)> = vec![
+        ("ts".to_string(), i64_col(vec![NOW_NS])),
+        ("svc".to_string(), str_col(vec!["api"])),
+    ];
+    let mut attr_toml = String::new();
+    for i in 0..n_attrs {
+        let name = format!("a{i}");
+        cols.push((name.clone(), i64_col(vec![i as i64])));
+        attr_toml.push_str(&format!(
+            "\n[[attribute]]\nkey = \"{name}\"\ncolumn = \"{name}\"\ntype = \"i64\"\n"
+        ));
+    }
+    let batch = RecordBatch::try_from_iter(cols).expect("wide batch");
+    let file = std::fs::File::create(&pq).expect("create parquet");
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
+    writer.write(&batch).expect("write batch");
+    writer.close().expect("close writer");
+
+    std::fs::write(
+        &mapping_path,
+        format!(
+            "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+                 [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n{attr_toml}"
+        ),
+    )
+    .expect("write mapping");
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let mut sink: Vec<u8> = Vec::new();
+    run_warning_to(
+        store,
+        &pq,
+        "acme",
+        &mapping_path,
+        SignalArg::Logs,
+        4,
+        10_000,
+        0,
+        None,
+        Some(1),
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        Some(PER_BATCH_TARGET_BYTES),
+        None,
+        RlogZstdLevel::DEFAULT,
+        None,
+        NOW_NS,
+        &mut sink,
+    )
+    .await
+    .expect("the load itself succeeds; overflow is a warning, not a failure");
+
+    let emitted = String::from_utf8(sink).expect("warnings are utf-8");
+    assert!(
+        emitted.contains("overflowed the per-object dynamic-column budget"),
+        "the entry point must emit the overflow warning it computed: {emitted}"
+    );
+    assert!(
+        emitted.contains(ADMISSION_BYPASS_WARNING),
+        "and the pre-existing admission warning still goes to the same stream: {emitted}"
+    );
+}
+
+/// A load that reaches >= 90% of the budget without overflowing produces the
+/// distinct near-cap warning, again from real metrics.
+#[tokio::test]
+async fn warns_near_cap_without_overflow() {
+    let report = run_wide_load(950).await;
+    assert_eq!(
+        report.metrics.dynamic_columns_overflowed_total, 0,
+        "950 distinct columns stay under the 1000 budget, so nothing overflows"
+    );
+    assert!(
+        report.metrics.dynamic_columns_used_max >= 900,
+        "the widest object should sit near the cap: used_max = {}",
+        report.metrics.dynamic_columns_used_max
+    );
+    let warnings = dynamic_column_warnings(&report.metrics, 1000);
+    assert_eq!(warnings.len(), 1, "exactly the near-cap warning fires");
+    assert!(
+        warnings[0].contains("at or above") && warnings[0].contains("attrs_raw"),
+        "the near-cap warning states the pressure and the attrs_raw consequence: {}",
+        warnings[0]
+    );
+}
+
+/// The near-cap boundary is exact: 90% warns, 89% does not, and an overflow
+/// takes precedence over the near-cap message. Flip the `>=` in
+/// `dynamic_column_warnings` to `>` and the exactly-90% case fails.
+#[test]
+fn near_cap_threshold_is_at_ninety_percent() {
+    let snap = |used: u64, overflowed: u64| LogIngestMetricsSnapshot {
+        dynamic_columns_used_max: used,
+        dynamic_columns_overflowed_total: overflowed,
+        ..Default::default()
+    };
+    assert_eq!(
+        dynamic_column_warnings(&snap(900, 0), 1000).len(),
+        1,
+        "900 / 1000 = exactly 90% warns"
+    );
+    assert!(
+        dynamic_column_warnings(&snap(899, 0), 1000).is_empty(),
+        "899 / 1000 is just under 90% and does not warn"
+    );
+    assert!(
+        dynamic_column_warnings(&snap(890, 0), 1000).is_empty(),
+        "890 / 1000 = 89% does not warn"
+    );
+    let overflow = dynamic_column_warnings(&snap(900, 3), 1000);
+    assert_eq!(overflow.len(), 1, "overflow still yields one message");
+    assert!(
+        overflow[0].contains("overflowed the per-object dynamic-column budget"),
+        "overflow takes precedence over the near-cap message: {}",
+        overflow[0]
+    );
+}
+
+/// The no-effect case reaches the operator through the real entry point
+/// (issue #971): a target that reproduced the `1` layout is reported on the
+/// warning stream, and one that changed the layout is not.
+///
+/// Same fixture and geometry as
+/// `target_bytes_regimes_are_set_by_one_batchs_per_shard_slice`, driven
+/// through [`run_warning_to`] so the mapping file, the router, and the
+/// warning stream are the CLI's own.
+///
+/// Prove-the-test: delete the `target_bytes_no_effect_warning` emit block in
+/// `run_warning_to` and the first assertion fails; make the helper return
+/// its message unconditionally and the 1 MiB case fails instead.
+#[tokio::test]
+async fn the_entry_point_reports_a_target_bytes_that_changed_nothing() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let shards = 4u32;
+    let (_dir, pq, mapping_path, _m) = fat_attr_sorted_by_shard_fixture(shards, 16, 4000);
+
+    let run = |target_bytes: usize| {
+        let pq = pq.clone();
+        let mapping_path = mapping_path.clone();
+        async move {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let mut sink: Vec<u8> = Vec::new();
+            run_warning_to(
+                store,
+                &pq,
+                "acme",
+                &mapping_path,
+                SignalArg::Logs,
+                shards,
+                16,
+                0,
+                Some(shards as usize),
+                Some(4),
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                DEFAULT_DECODE_QUEUE_BATCHES,
+                Some(target_bytes),
+                // The 1 MiB case parks on an ack that only the age trigger
+                // answers, on the wall clock; 2 s keeps that wait short.
+                Some(Duration::from_secs(2)),
+                RlogZstdLevel::DEFAULT,
+                None,
+                NOW_NS,
+                &mut sink,
+            )
+            .await
+            .expect("the load itself succeeds; an ineffective target is a warning");
+            String::from_utf8(sink).expect("warnings are utf-8")
+        }
+    };
+
+    let emitted = run(4096).await;
+    assert!(
+        emitted.contains("--target-bytes 4096 did not change this load's object layout"),
+        "the ineffective target is named with its value: {emitted}"
+    );
+    assert!(
+        emitted.contains("estimated UNCOMPRESSED object content")
+            && emitted.contains("about 4 rows here"),
+        "and the message states the unit and the slice it had to clear: {emitted}"
+    );
+
+    let effective = run(1024 * 1024).await;
+    assert!(
+        !effective.contains("did not change this load's object layout"),
+        "a target that collapsed 16 writes into 4 objects must not be reported as inert: \
+             {effective}"
+    );
+}
+
+/// The whole no-effect warning for `--target-bytes 4096` over two writes on
+/// one shard at `--batch-rows 16` and 4 shards.
+const FLAG_4096_NO_EFFECT_WARNING: &str = "warning: --target-bytes 4096 did not change this \
+     load's object layout. All 2 (batch, shard) writes flushed as their own object (2 objects), \
+     which is what --target-bytes 1 produces, and at least one shard took two or more writes \
+     without accumulating them. This is the OBSERVED layout, not proof the target was the lever: \
+     with --pipeline-depth 1, or when the gap between a shard's writes exceeds the \
+     max-flush-delay clock, the age trigger flushes a waiting buffer before the next batch \
+     arrives and no target value can make it accumulate -- check the pipeline depth and write \
+     cadence before changing the target. Separately, the target is compared against the \
+     buffer's estimated UNCOMPRESSED object content, not the stored object size, and the check \
+     runs once per write after a whole batch has merged. So at an even split a target at or \
+     below one batch's per-shard slice (about 4 rows here, at --batch-rows 16 over 4 shards) is \
+     already exceeded by the first write into an empty buffer and flushes it. For objects that \
+     span several batches, raise --target-bytes above that slice's estimated content, or lower \
+     --batch-rows.";
+
+/// Issue #3376: a derived target clamped to `MAX_TARGET_BYTES` is named as
+/// clamped in the no-effect warning, as the geometry line names it, rather
+/// than as `DEFAULT_OBJECT_ROWS` times the per-row estimate, which it is not.
+/// A derived target exactly at the bound and one well under it keep the
+/// per-row wording.
+///
+/// Prove-the-test: drop the `TargetSource::Derived if
+/// geometry.target_clamped` arm in `layout_no_effect_warning` and the
+/// clamped case fails (the warning reads "(250000 rows at the first batch's
+/// estimated bytes per row)"); print the clamp note for every derived target
+/// and the at-bound case fails; drop the per-row explanation from the
+/// unclamped arm and the 1000000 case fails.
+#[test]
+fn the_no_effect_warning_names_a_clamped_derived_target_as_clamped() {
+    let token = |seq: u64| CommitToken {
+        shard: 0,
+        writer_id: uuid::Uuid::nil(),
+        epoch: 1,
+        seq,
+        ingest_hour_bucket: 7,
+    };
+    let inert = [token(1), token(2)];
+    let warning_for = |est_bytes: usize| {
+        let geometry = resolve_geometry(None, Some(1), 4, 16, 1, est_bytes, None);
+        layout_no_effect_warning(&geometry, &inert, 16, 4)
+            .expect("two writes, two objects, one shard: the target did nothing")
+    };
+    let expected =
+        |target: &str| FLAG_4096_NO_EFFECT_WARNING.replacen("--target-bytes 4096", target, 1);
+
+    // 250,000 x 2,000,000 = 500,000,000,000, over the bound.
+    let clamped = warning_for(2_000_000);
+    assert_eq!(
+        clamped,
+        expected(
+            "the derived flush target of 360000000000 bytes (250000 rows at the first batch's \
+             estimated 2000000 bytes per row, clamped to the 360000000000 maximum)"
+        )
+    );
+    assert!(!clamped.contains("500000000000"), "{clamped}");
+
+    // 250,000 x 1,440,000 is the bound itself: nothing was clamped.
+    assert_eq!(
+        warning_for(1_440_000),
+        expected(
+            "the derived flush target of 360000000000 bytes (250000 rows at the first batch's \
+             estimated bytes per row)"
+        )
+    );
+
+    assert_eq!(
+        warning_for(4),
+        expected(
+            "the derived flush target of 1000000 bytes (250000 rows at the first batch's \
+             estimated bytes per row)"
+        )
+    );
+}
+
+/// [`layout_no_effect_warning`]'s three preconditions, each pinned by the
+/// case that would misfire without it. The tokens are one entry per
+/// (batch, shard) ack, so a flush that answered several batches shows up as
+/// a repeated token.
+///
+/// Prove-the-test: delete the `objects < writes` early return and the
+/// accumulating case starts warning (its `is_none` assertion fails at
+/// "a repeated token is a flush that answered two batches"); delete the
+/// `< 2` writes-per-shard guard and the one-write-per-shard case starts
+/// warning; change the `target_bytes <= PER_BATCH_TARGET_BYTES` guard to `<`
+/// and the `--target-bytes 1` case starts warning.
+#[test]
+fn the_no_effect_warning_fires_only_when_the_target_is_what_did_nothing() {
+    let token = |shard: u32, seq: u64| CommitToken {
+        shard,
+        writer_id: uuid::Uuid::nil(),
+        epoch: 1,
+        seq,
+        ingest_hour_bucket: 7,
+    };
+    let warning_for = |target_bytes: usize, tokens: &[CommitToken]| {
+        let geometry = LoadGeometry {
+            target_bytes,
+            target_source: TargetSource::Flag,
+            ..LoadGeometry::default()
+        };
+        layout_no_effect_warning(&geometry, tokens, 16, 4)
+    };
+
+    // Two writes on one shard, two distinct objects: nothing accumulated.
+    let inert = [token(0, 1), token(0, 2)];
+    let warning = warning_for(4096, &inert)
+        .expect("two writes, two objects, one shard: the target did nothing");
+    assert_eq!(warning, FLAG_4096_NO_EFFECT_WARNING);
+
+    assert!(
+        warning_for(PER_BATCH_TARGET_BYTES, &inert).is_none(),
+        "--target-bytes 1 is not a no-op, it is the documented per-batch layout"
+    );
+
+    // Two writes answered by one flush: the same token repeats, so the
+    // target held a buffer open.
+    let accumulating = [token(0, 1), token(0, 1)];
+    assert!(
+        warning_for(4096, &accumulating).is_none(),
+        "a repeated token is a flush that answered two batches: the target worked"
+    );
+
+    // One write per shard: no buffer could have spanned two writes at any
+    // target, so the target is not what to blame.
+    let single = [token(0, 1), token(1, 1), token(2, 1), token(3, 1)];
+    assert!(
+        warning_for(4096, &single).is_none(),
+        "no shard was written twice, so nothing could have accumulated"
+    );
+}
+
+/// A derived budget below one batch is reported even when the load then
+/// fails. The loader admits the batches one at a time and records the
+/// warning on the report, which a failed load drops; the entry point prints
+/// it beside the error from the copy the memory options kept.
+#[tokio::test]
+async fn a_failed_load_still_prints_the_one_batch_warning() {
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
+    use ravel_object_store::memory::MemoryStore;
+
+    let (dir, pq) = write_parquet(&batch(vec![
+        ("ts", i64_col(vec![NOW_NS; 4])),
+        ("idx", i64_col((0..4).collect())),
+    ]));
+    let mapping_path = dir.path().join("mapping.toml");
+    std::fs::write(
+        &mapping_path,
+        "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+             [[attribute]]\nkey = \"idx\"\ncolumn = \"idx\"\ntype = \"i64\"\n",
+    )
+    .expect("write mapping");
+
+    // The second batch's data-object PUT fails, after the first batch has
+    // already been admitted alone and the warning recorded.
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::Put,
+            ScriptedFault::Permanent("simulated permanent data-object PUT failure".into()),
+        )
+        .with_key_contains("/l0/0000/")
+        .with_occurrence(Occurrence::Nth(2)),
+    );
+    let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+
+    let mut sink: Vec<u8> = Vec::new();
+    run_memory_warning_to(
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        &pq,
+        "acme",
+        &mapping_path,
+        SignalArg::Logs,
+        1,
+        2,
+        0,
+        Some(1),
+        Some(1),
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        Some(PER_BATCH_TARGET_BYTES),
+        None,
+        RlogZstdLevel::DEFAULT,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(1024),
+        },
+        NOW_NS,
+        &mut sink,
+    )
+    .await
+    .expect_err("the second batch's PUT fails permanently, so the load fails");
+    assert_eq!(
+        store.fault_count(Op::Put, FaultKind::Permanent),
+        1,
+        "the scripted PUT fault fired"
+    );
+
+    let emitted = String::from_utf8(sink).expect("warnings are utf-8");
+    assert_eq!(
+        emitted
+            .matches("more than the loader's derived memory budget of 0 bytes")
+            .count(),
+        1,
+        "the one-batch warning is printed exactly once on the failure path: {emitted}"
+    );
+    assert!(
+        emitted.contains("host memory 1024 bytes"),
+        "naming the budget's source: {emitted}"
+    );
+}
+
+/// The `--fold-after-load` summary lines for each outcome: a seal, a load that
+/// wrote nothing (no fold ran), a no-op, and either fold beside a
+/// `FoldLeftCommitsUncovered` error, which never reads as a plain seal.
+#[test]
+fn fold_summary_names_the_outcome() {
+    let folded = LoadFold {
+        elapsed: Duration::from_millis(1_250),
+        entry_count: 7,
+        watermark_hour: Some(472_222),
+        seal_through_hour: Some(472_222),
+        no_op: false,
+        parts_read: 2,
+        buckets_listed: 1,
+        records_read: 3,
+    };
+    assert_eq!(
+        fold_summary(&folded, true),
+        "  fold after load  : sealed, seal_through_hour 472222, watermark_hour 472222, \
+         entries 7, parts read 2, buckets listed 1, records read 3, elapsed 1.250s (included \
+         in elapsed)\n"
+    );
+    assert_eq!(
+        fold_summary(&folded, false),
+        "  fold after load  : folded, commits not confirmed in the snapshot (see the error \
+         below), seal_through_hour 472222, watermark_hour 472222, entries 7, parts read 2, \
+         buckets listed 1, records read 3, elapsed 1.250s (included in elapsed)\n"
+    );
+
+    let empty = fold_summary(&LoadFold::default(), true);
+    assert_eq!(empty, "  fold after load  : no fold: nothing was written\n");
+
+    let no_op = LoadFold {
+        elapsed: Duration::ZERO,
+        entry_count: 0,
+        watermark_hour: Some(472_222),
+        seal_through_hour: Some(472_222),
+        no_op: true,
+        parts_read: 1,
+        buckets_listed: 0,
+        records_read: 0,
+    };
+    assert_eq!(
+        fold_summary(&no_op, true),
+        "  fold after load  : no-op, HEAD already sealed, seal_through_hour 472222, \
+         watermark_hour 472222, entries 0, parts read 1, buckets listed 0, records read 0, \
+         elapsed 0.000s (included in elapsed)\n"
+    );
+    assert_eq!(
+        fold_summary(&no_op, false),
+        "  fold after load  : no-op, HEAD already sealed, commits not confirmed in the snapshot \
+         (see the error below), seal_through_hour 472222, watermark_hour 472222, entries 0, \
+         parts read 1, buckets listed 0, records read 0, elapsed 0.000s (included in \
+         elapsed)\n"
+    );
+}
+
+/// A warnings sink the test can read while the load still holds it.
+#[derive(Clone, Default)]
+struct SharedSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl SharedSink {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().expect("sink not poisoned").clone())
+            .expect("warnings are utf-8")
+    }
+}
+
+impl std::io::Write for SharedSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("sink not poisoned")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A one-column logs fixture of `ts` values and its mapping file.
+fn ts_only_fixture(ts: Vec<i64>) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let (dir, pq) = write_parquet(&batch(vec![("ts", i64_col(ts))]));
+    let mapping_path = dir.path().join("mapping.toml");
+    std::fs::write(&mapping_path, "ts_column = \"ts\"\nts_unit = \"nanos\"\n")
+        .expect("write mapping");
+    (dir, pq, mapping_path)
+}
+
+/// Router-quiet periods on the injected clock [`yield_until_geometry_printed`]
+/// sits through before it calls the line missing. Decoding the first batch
+/// runs on a blocking thread that reads no clock, so the router reads as quiet
+/// while it runs; this many quiet periods is far longer than that decode and
+/// still fails a load that never prints in well under a second.
+const GEOMETRY_QUIET_PERIODS: usize = 10_000;
+
+/// Yields until `sink` holds the load's geometry line. The loader prints it
+/// once the first batch is decoded, which happens on a blocking thread this
+/// task cannot otherwise wait on. Panics once the router has been quiet on
+/// `clock` [`GEOMETRY_QUIET_PERIODS`] times with no line, so a load that never
+/// calls the geometry hook fails the test instead of hanging it.
+async fn yield_until_geometry_printed(sink: &SharedSink, clock: &TestClock) {
+    for _ in 0..GEOMETRY_QUIET_PERIODS {
+        if sink.text().contains(GEOMETRY_LINE_PREFIX) {
+            return;
+        }
+        yield_until_router_is_quiet(clock).await;
+    }
+    panic!(
+        "no geometry line after {GEOMETRY_QUIET_PERIODS} quiet periods on the injected clock: {}",
+        sink.text()
+    );
+}
+
+/// A store that records, at its first data-object PUT, whether `sink` already
+/// held the geometry line.
+struct GeometryBeforePutStore {
+    inner: Arc<dyn ObjectStoreBackend>,
+    sink: SharedSink,
+    printed_at_first_put: std::sync::Mutex<Option<bool>>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for GeometryBeforePutStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: ravel_object_store::PutOptions,
+    ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+        if key.contains("/l0/") {
+            let printed = self.sink.text().contains(GEOMETRY_LINE_PREFIX);
+            self.printed_at_first_put
+                .lock()
+                .expect("first-put lock")
+                .get_or_insert(printed);
+        }
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+        range: ravel_object_store::GetRange,
+    ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+        self.inner.get(key, range).await
+    }
+
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+    {
+        self.inner.put_multipart(key).await
+    }
+
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+        page: Option<ravel_object_store::PageToken>,
+    ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(
+        &self,
+        prefix: &str,
+    ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> ravel_object_store::Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// Issue #2753: with `--max-flush-delay` unset the CLI hands the router 60 s,
+/// not the library's 2 s default. One 2-row batch at a 1 GiB target and
+/// `--pipeline-depth 1` parks the loader on that batch's ack, which only the
+/// age trigger can answer once the depth flush, which would close that
+/// buffer at the first submit, is held off (`DEPTH_FLUSH_OFF`). 59 s on the
+/// injected clock leaves the store empty; 2 s more ages the buffer out and
+/// the load finishes with one object.
+///
+/// Prove-the-test: delete the `max_flush_delay.unwrap_or(
+/// DEFAULT_MAX_FLUSH_DELAY)` line in `run_fold_warning_to` and the router
+/// keeps its 2 s default, so the 59 s advance publishes the object and the
+/// load completes into the `panic!` arm.
+#[tokio::test]
+async fn an_unset_max_flush_delay_reaches_the_router_as_sixty_seconds() {
+    use ravel_object_store::memory::MemoryStore;
+
+    const SECOND_NS: i64 = 1_000_000_000;
+    assert_eq!(DEFAULT_MAX_FLUSH_DELAY, Duration::from_secs(60));
+    let (_dir, pq, mapping_path) = ts_only_fixture(vec![NOW_NS; 2]);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(NOW_NS);
+    let sink = SharedSink::default();
+    let mut warnings = sink.clone();
+    let no_policy = IpcryptPolicy::empty();
+    let load = crate::load::geometry::DEPTH_FLUSH_OFF.scope(
+        (),
+        run_fold_warning_to(
+            Arc::clone(&store),
+            &pq,
+            "acme",
+            &mapping_path,
+            SignalArg::Logs,
+            1,
+            2,
+            0,
+            Some(1),
+            Some(1),
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            DEFAULT_DECODE_QUEUE_BATCHES,
+            Some(1 << 30),
+            None,
+            None,
+            RlogZstdLevel::DEFAULT,
+            RlogGroupTargetBlocks::DEFAULT,
+            RlogChunkOrder::DEFAULT,
+            LoadMemoryRequest::Derived {
+                host_total_bytes: Some(64 << 30),
+            },
+            false,
+            &no_policy,
+            NOW_NS,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            &mut warnings,
+        ),
+    );
+    tokio::pin!(load);
+
+    tokio::select! {
+        biased;
+        result = &mut load => panic!(
+            "the load must not finish before 60 s on the injected clock: {result:?}"
+        ),
+        () = async {
+            yield_until_geometry_printed(&sink, &clock).await;
+            yield_until_router_is_quiet(&clock).await;
+            clock.advance_ns(59 * SECOND_NS);
+            yield_until_router_is_quiet(&clock).await;
+        } => {}
+    }
+    assert_eq!(
+        list_data_objects(store.as_ref()).await.len(),
+        0,
+        "a 59 s old buffer is inside the 60 s delay"
+    );
+    let emitted = sink.text();
+    // "depth flush on" although DEPTH_FLUSH_OFF holds the window off: the
+    // scope turns off only the window, never the resolved geometry the line
+    // reports (pinned in geometry.rs). 60 + 60 + 1073741824 / 1e8 s.
+    assert!(
+        emitted.contains(
+            "load geometry: logs: flush target 1073741824 bytes (--target-bytes), pipeline \
+             depth 1 (--pipeline-depth), depth flush on, ack deadline 130.73741824s"
+        ),
+        "{emitted}"
+    );
+
+    clock.advance_ns(2 * SECOND_NS);
+    load.await
+        .expect("the buffer ages out at 60 s and the load finishes");
+    assert_eq!(list_data_objects(store.as_ref()).await.len(), 1);
+}
+
+/// Issue #2753: a load at the default geometry that fails on a later batch
+/// reports at once. The derived target is far above the two buffered
+/// batches and the injected [`TestClock`] never advances, so neither the
+/// size nor the age trigger can answer their acks: only the failure path's
+/// own `flush_all` (`drain_inflight`) can. The load returns the row
+/// rejection with the first two batches durable as one object, and the
+/// geometry line was already in the warnings sink at the first data-object
+/// PUT.
+///
+/// Prove-the-test: delete the `router.flush_all()` in `drain_inflight` and
+/// the buffered acks are answered by nothing, so the load fails only once
+/// the Strict ack deadline (the 60 s default delay plus the 60 s margin and
+/// the small target's encode allowance, just over 120 s of wall time)
+/// expires, with a write error instead of the row rejection. Drop the
+/// `rx.recv()` arm in `printing_geometry` and the line is written only once
+/// the load returns, after that PUT.
+#[tokio::test]
+async fn a_failed_default_load_flushes_before_it_reports() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let limits = LogIngestLimits::default();
+    let mut ts = vec![NOW_NS; 6];
+    // Row 4 is the first row of the third 2-row batch.
+    ts[4] = NOW_NS + limits.max_future_skew_ns + 1;
+    let (_dir, pq, mapping_path) = ts_only_fixture(ts);
+    let clock = TestClock::new(NOW_NS);
+    let sink = SharedSink::default();
+    let probe = Arc::new(GeometryBeforePutStore {
+        inner: Arc::new(MemoryStore::new()),
+        sink: sink.clone(),
+        printed_at_first_put: std::sync::Mutex::new(None),
+    });
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&probe) as Arc<dyn ObjectStoreBackend>;
+    let mut warnings = sink.clone();
+    let err = run_fold_warning_to(
+        Arc::clone(&store),
+        &pq,
+        "acme",
+        &mapping_path,
+        SignalArg::Logs,
+        1,
+        2,
+        0,
+        Some(1),
+        None,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        None,
+        None,
+        None,
+        RlogZstdLevel::DEFAULT,
+        RlogGroupTargetBlocks::DEFAULT,
+        RlogChunkOrder::DEFAULT,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(64 << 30),
+        },
+        false,
+        &IpcryptPolicy::empty(),
+        NOW_NS,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        &mut warnings,
+    )
+    .await
+    .expect_err("row 4 is past the future-skew limit");
+
+    match err.downcast_ref::<LoadError>() {
+        Some(LoadError::RowRejected { row, durable, .. }) => {
+            assert_eq!(*row, 4);
+            assert_eq!(durable.len(), 2, "both earlier batches acked: {durable:?}");
+        }
+        other => panic!("expected the row rejection, got {other:?}: {err:#}"),
+    }
+    assert_eq!(
+        list_data_objects(store.as_ref()).await.len(),
+        1,
+        "the failure flush published the two buffered batches as one object"
+    );
+    let emitted = sink.text();
+    assert!(
+        emitted.contains("load geometry: logs: flush target "),
+        "{emitted}"
+    );
+    assert_eq!(
+        *probe.printed_at_first_put.lock().expect("first-put lock"),
+        Some(true),
+        "the geometry line was in the sink at the first data-object PUT"
+    );
+}
+
+/// Issue #3289: `ravel-cli load --target-bytes N` refuses a target above
+/// `MAX_TARGET_BYTES` on every signal, before any row is read, and accepts
+/// the bound itself. The parquet path does not exist, so an accepted target
+/// gets as far as opening the input and fails there instead.
+///
+/// Prove-the-test: drop the `validate_target_bytes` call from the logs
+/// loader's guards and the logs case reaches the input; drop it from
+/// `GeometryRequest::validate` and the metrics and spans cases do.
+#[tokio::test]
+async fn every_signal_refuses_a_target_bytes_above_the_one_hour_bound() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("missing.parquet");
+    let mappings = [
+        (SignalArg::Logs, "ts_column = \"ts\"\nts_unit = \"nanos\"\n"),
+        (
+            SignalArg::Metrics,
+            "[metrics]\nname = \"probe\"\nvalue_column = \"value\"\nts_column = \"ts\"\n\
+             ts_unit = \"nanos\"\nkind = \"gauge\"\n",
+        ),
+        (
+            SignalArg::Spans,
+            "[spans]\ntrace_id_column = \"trace_id\"\nspan_id_column = \"span_id\"\n\
+             name_column = \"name\"\nstart_ts_column = \"start_ns\"\nstart_ts_unit = \"nanos\"\n\
+             end_ts_column = \"end_ns\"\nend_ts_unit = \"nanos\"\n",
+        ),
+    ];
+    for (signal, mapping) in mappings {
+        let mapping_path = dir.path().join(format!("{signal:?}.toml"));
+        std::fs::write(&mapping_path, mapping).expect("write mapping");
+        let run = |target_bytes: usize| {
+            let missing = missing.clone();
+            let mapping_path = mapping_path.clone();
+            async move {
+                let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+                let mut sink: Vec<u8> = Vec::new();
+                run_warning_to(
+                    store,
+                    &missing,
+                    "acme",
+                    &mapping_path,
+                    signal,
+                    1,
+                    10_000,
+                    0,
+                    None,
+                    Some(1),
+                    DEFAULT_MAX_INFLIGHT_FLUSHES,
+                    DEFAULT_DECODE_QUEUE_BATCHES,
+                    Some(target_bytes),
+                    None,
+                    RlogZstdLevel::DEFAULT,
+                    None,
+                    NOW_NS,
+                    &mut sink,
+                )
+                .await
+                .expect_err("the input does not exist")
+                .to_string()
+            }
+        };
+        let refused = run(360_000_000_001).await;
+        assert!(
+            refused.starts_with("--target-bytes must be at most 360000000000 "),
+            "{signal:?}: {refused}"
+        );
+        assert!(
+            refused.ends_with("; 360000000001 was given"),
+            "{signal:?}: {refused}"
+        );
+        let accepted = run(360_000_000_000).await;
+        assert!(
+            !accepted.contains("--target-bytes"),
+            "{signal:?}: the bound itself is accepted and the load reaches its input: {accepted}"
+        );
+    }
+}
+
+/// A logs mapping with a record attribute `user` and a resource attribute
+/// `service.name`.
+const CHUNK_ORDER_MAPPING: &str = r#"
+ts_column = "ts"
+ts_unit = "nanos"
+
+[[resource_attribute]]
+key = "service.name"
+column = "svc"
+type = "str"
+
+[[attribute]]
+key = "user"
+column = "user"
+type = "str"
+"#;
+
+fn chunk_order(names: &[&str]) -> RlogChunkOrder {
+    RlogChunkOrder::new(names.iter().map(|n| n.to_string()).collect()).expect("valid order")
+}
+
+/// A `--chunk-order` name no mapped key carries gets exactly one warning
+/// naming it; a mapped record key gets none.
+#[test]
+fn chunk_order_warns_once_for_a_name_the_mapping_does_not_carry() {
+    let mapping = parse_mapping(CHUNK_ORDER_MAPPING).expect("mapping parses");
+    assert_eq!(
+        unknown_chunk_order_warnings(chunk_order(&["user", "typo"]), &mapping),
+        vec!["warning: --chunk-order names typo, which no mapped attribute carries".to_string()]
+    );
+}
+
+/// An order naming only mapped keys, record or resource, warns about
+/// nothing, and neither does the default order.
+#[test]
+fn chunk_order_naming_only_mapped_keys_warns_about_nothing() {
+    let mapping = parse_mapping(CHUNK_ORDER_MAPPING).expect("mapping parses");
+    assert_eq!(
+        unknown_chunk_order_warnings(chunk_order(&["user"]), &mapping),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        unknown_chunk_order_warnings(RlogChunkOrder::DEFAULT, &mapping),
+        Vec::<String>::new()
+    );
+}
+
+/// A `[[resource_attribute]]` key counts as carried.
+#[test]
+fn chunk_order_counts_a_resource_attribute_key_as_carried() {
+    let mapping = parse_mapping(CHUNK_ORDER_MAPPING).expect("mapping parses");
+    assert_eq!(
+        unknown_chunk_order_warnings(chunk_order(&["service.name", "user"]), &mapping),
+        Vec::<String>::new()
+    );
+}
+
+/// Several unknown names warn one line each, in the order the flag gives
+/// them, not sorted.
+#[test]
+fn chunk_order_warns_about_unknown_names_in_the_order_given() {
+    let mapping = parse_mapping(CHUNK_ORDER_MAPPING).expect("mapping parses");
+    assert_eq!(
+        unknown_chunk_order_warnings(chunk_order(&["zeta", "user", "alpha"]), &mapping),
+        vec![
+            "warning: --chunk-order names zeta, which no mapped attribute carries".to_string(),
+            "warning: --chunk-order names alpha, which no mapped attribute carries".to_string(),
+        ]
+    );
+}
+
+/// A logs mapping with a string resource key `service.name`, an i64 resource
+/// key `process.pid`, a bytes resource key `trace.blob`, a string record key
+/// `user`, and a string key `cloud.region` mapped as both.
+const STRING_RESOURCE_MAPPING: &str = r#"
+ts_column = "ts"
+ts_unit = "nanos"
+
+[[resource_attribute]]
+key = "service.name"
+column = "svc"
+type = "str"
+
+[[resource_attribute]]
+key = "process.pid"
+column = "pid"
+type = "i64"
+
+[[resource_attribute]]
+key = "trace.blob"
+column = "blob"
+type = "bytes"
+
+[[resource_attribute]]
+key = "cloud.region"
+column = "region"
+type = "str"
+
+[[attribute]]
+key = "user"
+column = "user"
+type = "str"
+
+[[attribute]]
+key = "cloud.region"
+column = "region"
+type = "str"
+"#;
+
+/// Issue #3276: of a string resource key, an i64 resource key and a string
+/// record key, only the string resource key is warned about, since only it
+/// depends on the tenant's indexed fields for a column; a bytes resource key
+/// is warned about the same way, naming its type.
+///
+/// Prove-the-test: before `string_resource_chunk_order_warnings` there is no
+/// such warning and the first assertion fails; warn for every resource key
+/// and it fails on `process.pid`.
+#[test]
+fn chunk_order_warns_only_about_a_string_resource_key() {
+    let mapping = parse_mapping(STRING_RESOURCE_MAPPING).expect("mapping parses");
+    assert_eq!(
+        string_resource_chunk_order_warnings(
+            chunk_order(&["service.name", "process.pid", "user"]),
+            &mapping
+        ),
+        vec![
+            "warning: --chunk-order names service.name, a string resource attribute, which \
+             gets a column only if it is an indexed field"
+                .to_string()
+        ]
+    );
+    assert_eq!(
+        string_resource_chunk_order_warnings(chunk_order(&["user", "trace.blob"]), &mapping),
+        vec![
+            "warning: --chunk-order names trace.blob, a bytes resource attribute, which gets \
+             a column only if it is an indexed field"
+                .to_string()
+        ]
+    );
+    assert_eq!(
+        unknown_chunk_order_warnings(
+            chunk_order(&["service.name", "process.pid", "user", "trace.blob"]),
+            &mapping
+        ),
+        Vec::<String>::new(),
+        "every name is mapped, so the unknown-name warning stays quiet"
+    );
+}
+
+/// A string key mapped as both a `[[resource_attribute]]` and an
+/// `[[attribute]]` is carried per record and gets a column, so it is not
+/// warned about.
+///
+/// Prove-the-test: drop the `record_keys` filter and `cloud.region` is
+/// warned about.
+#[test]
+fn chunk_order_does_not_warn_about_a_key_also_mapped_per_record() {
+    let mapping = parse_mapping(STRING_RESOURCE_MAPPING).expect("mapping parses");
+    assert_eq!(
+        string_resource_chunk_order_warnings(chunk_order(&["cloud.region", "user"]), &mapping),
+        Vec::<String>::new()
+    );
+}
+
+/// Issue #3276 end to end: a logs load whose `--chunk-order` names a string
+/// resource key, an i64 resource key, a string record key and a string key
+/// mapped as both prints the string-resource warning for the first and for
+/// nothing else, and the RLOG object it writes has FIELD_DIR columns for the
+/// other three and none for the first. If the writer ever grants that column
+/// on its own, the last assertion names the warning as stale.
+///
+/// Prove-the-test: before `string_resource_chunk_order_warnings` the sink has
+/// no chunk-order line and the first assertion fails.
+#[tokio::test]
+async fn chunk_order_string_resource_warning_matches_the_written_columns() {
+    use ravel_logseg::{FieldType, RlogConfig, RlogReader};
+    use ravel_object_store::GetRange;
+    use ravel_object_store::memory::MemoryStore;
+
+    const WARNING: &str = "warning: --chunk-order names service.name, a string resource \
+                           attribute, which gets a column only if it is an indexed field";
+
+    let (dir, pq) = write_parquet(&batch(vec![
+        ("ts", i64_col(vec![NOW_NS; 2])),
+        ("svc", str_col(vec!["api", "api"])),
+        ("pid", i64_col(vec![7, 7])),
+        ("blob", str_col(vec!["b", "b"])),
+        ("region", str_col(vec!["eu", "eu"])),
+        ("user", str_col(vec!["ann", "bob"])),
+    ]));
+    let mapping_path = dir.path().join("mapping.toml");
+    // STRING_RESOURCE_MAPPING less its bytes key, which would need a binary
+    // column and is covered by the unit test.
+    std::fs::write(
+        &mapping_path,
+        STRING_RESOURCE_MAPPING.replace(
+            "[[resource_attribute]]\nkey = \"trace.blob\"\ncolumn = \"blob\"\ntype = \"bytes\"\n",
+            "",
+        ),
+    )
+    .expect("write mapping");
+    assert!(
+        !std::fs::read_to_string(&mapping_path)
+            .expect("read mapping")
+            .contains("trace.blob")
+    );
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(NOW_NS);
+    let sink = SharedSink::default();
+    let mut warnings = sink.clone();
+    run_fold_warning_to(
+        Arc::clone(&store),
+        &pq,
+        "acme",
+        &mapping_path,
+        SignalArg::Logs,
+        1,
+        2,
+        0,
+        Some(1),
+        Some(1),
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        Some(1),
+        None,
+        None,
+        RlogZstdLevel::DEFAULT,
+        RlogGroupTargetBlocks::DEFAULT,
+        chunk_order(&["service.name", "process.pid", "user", "cloud.region"]),
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(64 << 30),
+        },
+        false,
+        &IpcryptPolicy::empty(),
+        NOW_NS,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        &mut warnings,
+    )
+    .await
+    .expect("load succeeds");
+
+    let emitted = sink.text();
+    assert_eq!(
+        emitted
+            .lines()
+            .filter(|l| l.starts_with("warning: --chunk-order"))
+            .collect::<Vec<_>>(),
+        vec![WARNING],
+        "{emitted}"
+    );
+
+    let objects = list_data_objects(store.as_ref()).await;
+    assert_eq!(objects.len(), 1, "{objects:?}");
+    let got = store
+        .get(&objects[0].0, GetRange::Full)
+        .await
+        .expect("get object");
+    let directories = RlogReader::new(got.data.as_ref(), &RlogConfig::default())
+        .expect("open rlog")
+        .directories();
+    let columns: Vec<(&str, FieldType)> = directories
+        .field_dir()
+        .entries()
+        .iter()
+        .map(|e| (e.name.as_str(), e.ty))
+        .collect();
+    for want in [
+        ("process.pid", FieldType::I64),
+        ("user", FieldType::Str),
+        ("cloud.region", FieldType::Str),
+    ] {
+        assert!(columns.contains(&want), "no {want:?} column: {columns:?}");
+    }
+    assert!(
+        !columns.iter().any(|(name, _)| *name == "service.name"),
+        "the writer gave service.name a column although no indexed field names it, so the \
+         warning `{WARNING}` is stale: {columns:?}"
+    );
+}
+
+/// `run_load_reporting` writes the `--page-choice exhaustive` warning to the
+/// warning stream of a metrics or spans load, and writes none for the
+/// default. The warning goes out before the mapping is read, so a missing
+/// mapping ends each load right after it.
+///
+/// Prove-the-test: delete the `unused_page_choice_warning` emit block in
+/// `run_load_reporting` and the exhaustive assertion fails.
+#[tokio::test]
+async fn the_entry_point_warns_that_metrics_and_spans_ignore_the_page_choice() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing_mapping = dir.path().join("absent.toml");
+    let missing_parquet = dir.path().join("absent.parquet");
+    for signal in [SignalArg::Metrics, SignalArg::Spans] {
+        let noun = match signal {
+            SignalArg::Metrics => "metrics",
+            SignalArg::Spans => "spans",
+            SignalArg::Logs => unreachable!("only metrics and spans are looped"),
+        };
+        for choice in [LoadPageChoice::Exhaustive, LoadPageChoice::Estimated] {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let mut sink: Vec<u8> = Vec::new();
+            let err = run_load_reporting(
+                store,
+                &missing_parquet,
+                "acme",
+                &missing_mapping,
+                signal,
+                1,
+                2,
+                0,
+                None,
+                None,
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                DEFAULT_DECODE_QUEUE_BATCHES,
+                None,
+                None,
+                None,
+                None,
+                RlogZstdLevel::DEFAULT,
+                RlogGroupTargetBlocks::DEFAULT,
+                RlogChunkOrder::DEFAULT,
+                choice,
+                LoadMemoryRequest::Derived {
+                    host_total_bytes: Some(64 << 30),
+                },
+                false,
+                &IpcryptPolicy::empty(),
+                None,
+                NOW_NS,
+                TestClock::new(NOW_NS) as Arc<dyn Clock>,
+                &mut sink,
+            )
+            .await
+            .expect_err("the mapping does not exist");
+            assert!(
+                format!("{err:#}").starts_with("failed to read --mapping"),
+                "{signal:?} {choice:?}: the load ends at the mapping read: {err:#}"
+            );
+            let emitted = String::from_utf8(sink).expect("warnings are utf-8");
+            let warning = format!(
+                "warning: a {noun} load ignores --page-choice exhaustive. The page choice \
+                 applies only to the RLOG objects a logs load writes.\n"
+            );
+            let want = usize::from(choice == LoadPageChoice::Exhaustive);
+            assert_eq!(
+                emitted.matches(&warning).count(),
+                want,
+                "{signal:?} {choice:?}: the page choice warning {want} time(s) in:\n{emitted}"
+            );
+            assert!(
+                !emitted.contains("--page-choice estimated"),
+                "{signal:?} {choice:?}: the default is not named:\n{emitted}"
+            );
+        }
+    }
+}

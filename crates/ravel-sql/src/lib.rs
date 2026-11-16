@@ -1,0 +1,304 @@
+//! ravel-sql: DataFusion-backed SQL execution over Ravel metric samples.
+//!
+//! This crate is the structural isolation boundary that keeps `datafusion`
+//! (and, transitively, its own `arrow`) out of the PromQL and ingest paths
+//! (ADR-0013). Nothing in the
+//! ingest-critical or PromQL crates links this crate.
+//!
+//! The read pipeline skeleton:
+//!
+//! ```text
+//! RsegScanExec (N partitions, each sorted by (series_id, ts, provenance))
+//!   -> SortPreservingMergeExec on (series_id, ts)
+//!   -> RsegDedupExec (single partition, streaming, full dedup total order)
+//!   -> DataFusion operators
+//! ```
+//!
+//! Arrow types are used exclusively through the `datafusion::arrow`
+//! re-export so this crate is internally version-consistent regardless of
+//! the workspace `arrow` pin.
+
+//! The request-handling half: the read-only
+//! single-statement gate (`validate`), the fresh per-query single-tenant
+//! session (`session`), the resolve/plan/execute driver with the snapshot
+//! retry contract (`executor`), the two wire encodings (`output`), and the
+//! error-to-client redaction boundary (`error`). The HTTP surface itself
+//! lives in services/ravel-server behind its `sql` feature; nothing here
+//! links axum, and nothing there links datafusion.
+
+//! The second transport, behind the `flight-sql`
+//! feature: `flight` is the `FlightSqlService` implementation and
+//! `flight_ticket` its snapshot-pinning ticket codec. It is a transport and
+//! nothing more -- it validates, resolves, plans, and executes through the
+//! same `SqlExecutor` the HTTP path uses, so the two cannot answer the same
+//! query differently. Its own additions are the ones the two-RPC shape forces:
+//! pinning the resolved snapshot into the ticket so `DoGet` never re-resolves
+//! and checking the metadata-resolved tenant against the
+//! ticket's own before redeeming it.
+//!
+//! `flight_ticket` alone is also reachable behind the narrower `pin-codec`
+//! feature, which `flight-sql` enables (ADR-1374 decision 9): it carries no
+//! `arrow-flight` dependency, so a crate that only needs the ticket codec
+//! (`ravel-mcp`'s cursor and evidence-reference tokens) does not have to link
+//! Flight to reuse it.
+
+mod access_intent;
+mod alerts_provider;
+mod alerts_pushdown;
+mod alerts_scan;
+mod alerts_schema;
+mod attrs_per_key;
+mod audit_provider;
+mod audit_pushdown;
+mod audit_scan;
+mod audit_schema;
+mod avg;
+mod bounded_topk;
+mod bucket_spill_tuning;
+mod bucketed_final_aggregate;
+mod clock;
+mod compact_slices;
+pub mod complexity_guard;
+mod config;
+pub mod conformance;
+mod cost;
+#[cfg(test)]
+mod cross_signal_tests;
+mod ddl;
+mod ddl_cost;
+mod declared;
+mod dedup;
+#[cfg(feature = "flight-sql")]
+pub mod distributed;
+#[cfg(feature = "flight-sql")]
+pub mod distributed_rlog;
+mod error;
+pub mod esql;
+mod exchange_floor;
+mod executor;
+mod first_groups;
+#[cfg(feature = "flight-sql")]
+pub mod flight;
+#[cfg(feature = "pin-codec")]
+mod flight_ticket;
+mod group_keys;
+mod ipcrypt_udf;
+mod labels;
+mod late_materialization;
+mod like_udf;
+mod logs_provider;
+mod logs_pushdown;
+mod logs_scan;
+mod logs_schema;
+mod logs_stats_prune;
+mod logs_udf;
+mod map_field_planner;
+mod memory;
+mod metadata_agg;
+mod min_commit_token;
+mod minmax;
+mod output;
+mod page_plan;
+mod parquet;
+mod provider;
+mod pushdown;
+pub mod redact;
+mod regexp_replace_udf;
+mod resume_value;
+mod rlog_attrs;
+mod scan;
+#[cfg(test)]
+mod scan_alternation_tests;
+mod scan_budget;
+mod schema;
+mod session;
+#[cfg(test)]
+mod size_trigger_tests;
+mod spans_fetcher;
+mod spans_provider;
+mod spans_pushdown;
+mod spans_scan;
+mod spans_schema;
+pub mod spill;
+mod statement;
+mod statement_accounting;
+pub mod stats_json;
+mod sum;
+mod sum_plus;
+mod top_keys;
+mod trace_id_planner;
+mod udf;
+mod validate;
+mod value_typed_results;
+
+pub use access_intent::{IntentCacheCounts, StatementCacheStats, effective_bulk_scan_min_bytes};
+pub use alerts_provider::AlertsTableProvider;
+pub use alerts_pushdown::{AlertsPushdown, extract_alerts};
+pub use alerts_schema::{
+    ALERT_COL_ALERT_ID, ALERT_COL_ATTRS, ALERT_COL_GENERATION, ALERT_COL_RULE_ID, ALERT_COL_STATE,
+    ALERT_COL_TS, ALERT_COL_WRITER_EPOCH, ALERT_COL_WRITER_ID, ALERT_COL_WRITER_SEQ, alerts_schema,
+};
+pub use audit_provider::AuditTableProvider;
+pub use audit_pushdown::{AuditPushdown, extract_audit};
+pub use audit_schema::{
+    AUDIT_COL_ATTRS, AUDIT_COL_BODY, AUDIT_COL_SEVERITY_TEXT, AUDIT_COL_TS, audit_schema,
+};
+pub use bounded_topk::{BOUNDED_TOPK_AGGREGATE_RULE, BoundedTopKAggregate};
+pub use bucket_spill_tuning::{
+    BUCKET_SPILL_MAX_CHUNK_ROWS, BUCKET_SPILL_MIN_CHUNK_BYTES, BUCKET_SPILL_MIN_CHUNK_ROWS,
+    BucketRetryFigures, BucketRetryShape, BucketSpillInputs, BucketSpillPlanShape,
+    BucketSpillTuning, DEFAULT_NOFILE_SOFT, NoTuning, RETRY_NOT_ADMITTED,
+    RETRY_ORDER_PRESERVING_EXCHANGE, bucket_retry_derivation, bucket_retry_tuning,
+    bucket_spill_descriptor_budget, bucket_spill_min_descriptor_need, derive_bucket_spill_tuning,
+    routed_chunk_charge, spill_consumers, spill_slots, with_bucket_spill_tuning,
+};
+pub use bucketed_final_aggregate::{
+    BUCKET_SPILL_BATCHES_WRITTEN, BUCKET_SPILL_BYTES_READ, BUCKET_SPILL_ROWS_READ,
+    BUCKET_SPILL_UNDERSHOOT, BUCKETED_FINAL_AGGREGATE_CONSUMER_PREFIX,
+    BUCKETED_FINAL_AGGREGATE_MAX_BITS, BUCKETED_FINAL_AGGREGATE_RULE, BucketedFinalAggregateExec,
+    BucketedFinalAggregateRule,
+};
+pub use compact_slices::{COMPACT_SLICES_RULE, CompactSlices, CompactSlicesExec, TopKPrefilter};
+pub use complexity_guard::{MAX_STATEMENT_COMPLEXITY, StatementTooComplex, structural_count};
+pub use config::{
+    BucketedFinalAggregation, CacheDirSpill, DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
+    DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT, DEFAULT_BOUNDED_TOPK_MAX_LIMIT,
+    DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS, DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS,
+    DEFAULT_MAX_QUERY_BYTES, DEFAULT_PARTITION_TOPK_MAX_LIMIT, DEFAULT_SPILL_MERGE_FAN_IN,
+    DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES, DERIVED_SPILL_MAX_BYTES_MEMORY_MULTIPLE, ENV_SPILL_DIR,
+    ENV_SPILL_MAX_BYTES, GROUP_VALUES_CEILING_COMPENSATION, GROUP_VALUES_RESIZE_TRANSIENT_FACTOR,
+    GROUP_VALUES_UNDERCOUNT_FACTOR, SQL_SPILL_SUBDIR, SpillConfig, SpillConfigError, SqlConfig,
+    cache_spill_dir, compensated_group_values_ceiling, derive_spill_max_bytes, measure_free_bytes,
+};
+pub use ddl::{DEFAULT_MIN_GRACE_MS, DdlErrorClass, DdlExecuteError, DdlOutcome};
+pub use ddl_cost::{
+    DDL_COST_BYTES, DDL_PHASE_COUNT, DdlCost, DdlExecution, DdlPhase, DdlPhaseCost,
+};
+pub use declared::{
+    DeclaredColumn, DeclaredColumnSource, DeclaredType, KeyIndexDeclaration, StaticDeclaredColumns,
+};
+#[cfg(feature = "flight-sql")]
+pub use distributed::{
+    DistributedFlightConfig, DistributedScanExec, FlightWorkerSliceClient, SliceTlsDialCounter,
+    StaticWorkerEndpoints, WorkerEndpoints, WorkerSlice, WorkerSliceClient,
+    distributed_samples_plan, plan_distributed_slices,
+};
+#[cfg(feature = "flight-sql")]
+pub use distributed_rlog::{
+    ALERTS_ORDER_COLS, AUDIT_ORDER_COLS, DistributedSliceScanExec, LOGS_ORDER_COLS,
+    distributed_alerts_plan, distributed_audit_plan, distributed_logs_plan, distributed_slice_plan,
+    sort_slice_fragment,
+};
+pub use error::{
+    ErrorClass, MSG_CORRUPT, MSG_EXECUTION, MSG_INTERNAL, MSG_PLAN, MSG_SPILL_DISABLED_MARKER,
+    MSG_SPILL_QUOTA_MARKER, MSG_SPILL_UNAVAILABLE, MSG_UNAVAILABLE, MSG_UNSATISFIABLE, SqlError,
+};
+pub use executor::{
+    AnalyzedRun, DecodedCacheStats, ExplainReport, HISTOGRAM_EXCLUDED_WARNING, KeyIndexStats,
+    LiveAccounting, ParquetPlan, PhaseWallTiming, PinnedLanes, PinnedPlanInputs, PinnedQuery,
+    PinnedResolve, PinnedStream, ScanTiming, SegmentTiming, SignalStats, SpillRetryReport,
+    SqlExecutor, SqlOutcome, SqlRequest, SqlStats, TargetSignal, refuse_several_tables,
+    segment_set_keys,
+};
+pub use first_groups::{
+    FIRST_GROUPS_CONSUMER_PREFIX, FIRST_GROUPS_RULE, FirstGroupsExec, FirstGroupsLimit,
+};
+#[cfg(feature = "flight-sql")]
+pub use flight::{
+    DEFAULT_GC_PROTECTION_HORIZON, FlightAuth, FlightClock, FlightListenerRole, FlightSqlConfig,
+    RavelFlightSqlService, SliceReject, SliceRejectCounters,
+};
+#[cfg(feature = "pin-codec")]
+pub use flight_ticket::{
+    FlightTicket, FlightTicketError, MAX_STATEMENT_LEN, SegmentPin, SignalGroup, SlicePushdown,
+    SqlTicketKeys, TICKET_KEY_LEN, TicketKey, TicketSurface, derive_surface_key, derive_ticket_key,
+};
+pub use group_keys::{DICTIONARY_GROUP_KEYS_RULE, DictionaryGroupKeysAsViews};
+pub use ipcrypt_udf::{
+    IPCRYPT_ENCRYPT_UDF, IPCRYPT_PREFIX_ENCRYPT_UDF, IpcryptDeployment, SessionPrincipal,
+    SqlCapabilities,
+};
+pub use late_materialization::{
+    LogsRowFetchExec, ROW_REF_COLUMN, TOPK_LATE_MATERIALIZATION_RULE, TopKLateMaterialization,
+};
+pub use logs_provider::LogsTableProvider;
+pub use logs_pushdown::{LogsPushdown, extract_logs};
+#[doc(hidden)]
+pub use logs_scan::values_memo_build;
+pub use logs_scan::{LogsScanExec, METRIC_ROWS_CONSUMED};
+pub use logs_schema::{
+    FIRST_DECLARED_COL, LOG_COL_ATTRS, LOG_COL_BODY, LOG_COL_FLAGS, LOG_COL_OBSERVED_TS,
+    LOG_COL_SEVERITY_NUM, LOG_COL_SEVERITY_TEXT, LOG_COL_SPAN_ID, LOG_COL_TRACE_ID, LOG_COL_TS,
+    logs_schema, logs_schema_with_declared,
+};
+pub use logs_udf::{HAS_WORD_UDF, has_word_udf};
+pub use memory::{
+    AggregateLayout, AggregateProfile, AggregateReserveAhead, AggregateReserveAheadError,
+    CeilingBreach, HASH_AGGREGATE_CONSUMER_PREFIX, PARTIAL_HASH_AGGREGATE_CONSUMER_PREFIX,
+    TenantDelegatingPool, TenantMemoryAccountant, plan_aggregate_profile, process_envelope_width,
+    sql_memory_aggregate_envelope_bytes, sql_memory_held_bytes,
+};
+pub use metadata_agg::{METADATA_ONLY_AGGREGATE_RULE, MetadataOnlyAggregate, MetadataOnlyExec};
+pub use min_commit_token::{MinCommitToken, MinCommitTokenParseError};
+pub use output::QueryOutput;
+pub use page_plan::{
+    NotTotalOrder, OrderTerm, PAGE_ALIAS, PagePlan, PagePlanError, ResumePosition, ResumeValue,
+    plan_page,
+};
+pub use parquet::{
+    DEFAULT_PARQUET_METADATA_CACHE_BYTES, ExternalStoreError, ExternalStoreMap, ExternalStores,
+    MAX_STATEMENT_TABLE_NAMES, ParquetPin, ParquetQueryError, ParquetResolution, ParquetSession,
+    ParquetSources, ProfileStores, RavelBucket,
+};
+pub use provider::RavelTableProvider;
+pub use pushdown::Pushdown;
+/// Re-exported beside [`SegmentPin`], whose `level` field has this type: a
+/// caller of the pin codec would otherwise need its own `ravel-catalog`
+/// dependency to name a value it can already read off the struct.
+#[cfg(feature = "pin-codec")]
+pub use ravel_catalog::SegmentLevel;
+/// Re-exported for [`SqlOutcome::pending_erasure`], which is typed as a
+/// `Vec` of these: a caller reading that field off the outcome would
+/// otherwise need its own `ravel-query` dependency to name what it is holding.
+/// Same reason as the [`SegmentLevel`] re-export above.
+pub use ravel_query::erasure::ErasurePredicate;
+pub use redact::{RedactError, redact};
+pub use resume_value::resume_value;
+pub use scan_budget::EnforcedBudgets;
+pub use schema::{internal_schema, public_schema};
+pub use session::{
+    ADMITTED_SCALARS, ADMITTED_TABLE_FUNCTIONS, ADMITTED_WINDOWS, ALERTS_TABLE, AUDIT_TABLE,
+    EXCLUDED_SCALARS, EXCLUDED_TABLE_FUNCTIONS, EXCLUDED_WINDOWS, EmptyObjectStoreRegistry,
+    LOGS_TABLE, SAMPLES_TABLE, SKIP_PARTIAL_AGGREGATION_PROBE_RATIO,
+    SKIP_PARTIAL_AGGREGATION_PROBE_ROWS, SPANS_TABLE, SessionTable, SpillDecision, build_session,
+    build_session_with_tables, session_config,
+};
+pub use spans_fetcher::{SpanFetchError, SpanFetchOutput, SpanRow, SpanSegmentFetcher};
+pub use spans_provider::SpansTableProvider;
+pub use spans_pushdown::{SpansPushdown, extract_spans};
+pub use spans_scan::SpansScanExec;
+pub use spans_schema::{
+    SPAN_COL_ATTRS, SPAN_COL_DURATION_NS, SPAN_COL_END_TS, SPAN_COL_EVENTS, SPAN_COL_LINKS,
+    SPAN_COL_NAME, SPAN_COL_PARENT_SPAN_ID, SPAN_COL_SERVICE_NAME, SPAN_COL_SPAN_ID,
+    SPAN_COL_START_TS, SPAN_COL_STATUS_CODE, SPAN_COL_STATUS_MESSAGE, SPAN_COL_TRACE_ID,
+    span_event_fields, span_events_item_field, span_events_type, span_link_fields,
+    span_links_item_field, span_links_type, spans_schema,
+};
+pub use spill::{OperatorSpill, SpillCounts, SpillScratch};
+pub use statement::{DialectPolicy, LoweredStatement, LoweringContext, StatementTarget};
+pub use top_keys::{
+    TOP_KEYS_AGGREGATE_RULE, TOP_KEYS_CONSUMER_PREFIX, TopKeysAggregateExec, TopKeysAggregateLimit,
+};
+pub use udf::{label_match_udf, label_udf};
+pub use validate::{
+    DdlIntent, DdlKind, DdlValidationError, StatementKind, ValidationError, ddl_kind,
+    statement_kind, validate_ddl, validate_query,
+};
+
+/// The internal provenance column names, in scan-output order after the
+/// four public columns. Consumed by [`dedup::RsegDedupExec`] and dropped
+/// before any public operator sees them.
+pub use schema::{
+    COL_CREATED_UNIX_NS, COL_IN_PAGE_INDEX, COL_LABELS, COL_SERIES_ID, COL_TS, COL_VALUE,
+    COL_WRITER_EPOCH, COL_WRITER_SEQ,
+};

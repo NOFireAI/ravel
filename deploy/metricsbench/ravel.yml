@@ -1,0 +1,263 @@
+# Ravel in the MetricsBench portable lane (ADR-0927 amendment 2026-10-26 A).
+#
+# An overlay on docker-compose.yml, not run on its own: it reuses that
+# file's s3s object store and createbuckets one-shot, and its network. Bring
+# the whole set up, comparators and Ravel together, with:
+#
+#   S3S_FS_BIN=/path/to/verified/s3s-fs \
+#   RAVEL_IMAGE=ghcr.io/nofireai/ravel-server:<tag>@sha256:<digest> \
+#     docker compose -f deploy/metricsbench/docker-compose.yml \
+#       -f deploy/metricsbench/ravel.yml up -d
+#
+# Ravel is one more comparator here: written through /api/v1/write (Remote
+# Write 1.0) and queried through the Prometheus HTTP API, at the same 2 CPU /
+# 8g envelope as prometheus, victoriametrics and mimir. The in-process replay
+# (crates/ravel-bench, metricsbench_ingest) is the diagnostic lane and its
+# rows say endpoint: in-process; it is not the portable row.
+#
+# IMAGE. RAVEL_IMAGE is REQUIRED and has no default: the image under test is
+# a run parameter, and a default would let a run measure whatever tag the
+# file happened to name. `${RAVEL_IMAGE:?...}` makes compose itself refuse:
+# `docker compose ... config` and `up` exit non-zero with the message below
+# when RAVEL_IMAGE is unset or empty. Pass a digest-pinned reference so the
+# run is reproducible, or, for the nightly's `ci` run only, a local tag that
+# run.sh has checked against --ravel-image-id (an image already on the host is
+# not pulled); capture-effective-config.sh records the resolved image id
+# either way. Both services use the same image: ravel-cli ships in it.
+#
+# DURABILITY: object storage (s3s-fs here, bucket ravel-metricsbench). Remote
+# Write is strict: a 2xx means the data object and the commit record are
+# durable in object storage before the ack (ADR-0927 decision 3), and no
+# state lives on local disk, so this service has no volume. s3s-fs removes
+# per-request fees, so a result here is valid for correctness and CI only,
+# not a publishable performance or cost claim (ADR-0927 decision 10).
+#
+# SECURITY: the bearer token and the S3 credentials are the fixed local
+# development values of docker-compose.yml; the port binds loopback only.
+
+x-ravel-s3-env: &ravel-s3-env
+  # The metricsbench s3s-fs on the compose network. Same credentials as the
+  # createbuckets one-shot in docker-compose.yml.
+  RAVEL_S3_ENDPOINT: http://s3s:9000
+  # Plaintext S3: the endpoint above is http, which ravel refuses unless
+  # allowed. Local network only.
+  RAVEL_S3_ALLOW_HTTP: "true"
+  RAVEL_S3_BUCKET: ravel-metricsbench
+  RAVEL_S3_REGION: us-east-1
+  RAVEL_S3_ACCESS_KEY: mimir
+  RAVEL_S3_SECRET_KEY: mimir-dev-secret
+
+services:
+  # --- Ravel store qualification (one-shot) -------------------------------
+  # ravel-server refuses to start on an S3 store until sys/qualification
+  # exists; `ravel-cli store qualify` probes the bucket and writes it. It is
+  # idempotent, so a rerun on the kept s3s-data volume exits 0. The bucket
+  # is a plain one (createbuckets in docker-compose.yml): Object Lock is
+  # reported by qualify but not required without
+  # --require-bucket-protection, and immutability is not what this lane
+  # measures.
+  ravel-qualify:
+    image: ${RAVEL_IMAGE:?set RAVEL_IMAGE to the ravel-server image under test, digest-pinned}
+    depends_on:
+      createbuckets:
+        condition: service_completed_successfully
+    entrypoint: ["/usr/local/bin/ravel-cli"]
+    command: ["--store", "s3", "store", "qualify"]
+    environment:
+      <<: *ravel-s3-env
+
+  # --- Ravel ---------------------------------------------------------------
+  ravel-server:
+    image: ${RAVEL_IMAGE:?set RAVEL_IMAGE to the ravel-server image under test, digest-pinned}
+    depends_on:
+      ravel-qualify:
+        condition: service_completed_successfully
+    # The image's own ENTRYPOINT, plus RAVEL_SERVER_EXTRA_FLAGS, which is
+    # empty by default and leaves the command line unchanged. run.sh sets it
+    # only under MB_STAGE1=1 (ADR-3694 Stage 1, issue #3968):
+    # --fold-key-index-leaves with the metrics label index off until the
+    # routed pass, and on for it. The label index flag depends on the image
+    # (issue #4145): one built before takes the opt-in
+    # --fold-metrics-label-index, one built after builds the index by
+    # default and takes the opt-out --no-fold-metrics-label-index. run.sh
+    # reads the image's --help and passes whichever flag, if any, reaches the
+    # state it wants. Compose splits the string into words; the
+    # image has no shell. capture-effective-config.sh records the entrypoint
+    # beside the command.
+    entrypoint: /usr/local/bin/ravel-server ${RAVEL_SERVER_EXTRA_FLAGS:-}
+    command:
+      # Gateway, query and maintenance in one process, the counterpart of
+      # Mimir's -target=all: split modes would spread the comparator across
+      # containers and break the equal-envelope rule.
+      - "--mode"
+      - "all"
+      - "--store"
+      - "s3"
+      - "--listen-http"
+      - "0.0.0.0:4318"
+      # Ingest shards: the shipped default 4, stated so the capture shows it
+      # (the derived --max-s3-requests below depends on it and on the flush
+      # delay).
+      - "--shards"
+      - "4"
+      # One tenant, metricsbench, behind a static bearer token. The harness
+      # sends `Authorization: Bearer metricsbench-token` on every request.
+      - "--tenant-token"
+      - "metricsbench-token=metricsbench"
+      # A fresh bucket needs a tenant-hash choice or the server refuses to
+      # start; unkeyed is the local-development choice the quickstart makes.
+      # It changes object key names only, not what is stored or answered.
+      - "--tenant-hash-unkeyed"
+      # INGEST WINDOW (disclosed, ADR-0927 amendment 2026-10-26 A): replaces
+      # the default 2h. The history profile spans 30d of event time and is
+      # replayed in one pass, so at the default nearly every sample is
+      # refused as too old. 45d covers 30d plus the time a replay and its
+      # queries take, and matches the 45d retention set on prometheus and
+      # victoriametrics. One flag drives both the Remote Write and OTLP
+      # admission bound AND the catalog listing window, so the two cannot
+      # disagree. A sample older than the window is dropped per sample, and
+      # the request still answers 2xx: Remote Write 1.0 has no partial-success
+      # field (docs/guides/admission-limits.md), so the drop shows only as a
+      # missing sample. The future-skew bound (10m, compiled in, no flag) is
+      # left as shipped: a replay of past event time does not reach it.
+      - "--max-ingest-lag"
+      - "45d"
+      # FLUSH DELAY (disclosed, ADR-0927 flush-setting amendment 2026-10-29):
+      # replaces the shipped 2s active-tenant flush age with 500ms. A Remote
+      # Write 2xx waits for the flush that stores its points, so at 2s the
+      # replay measures the flush clock, not the ingest path (E2 on #2821:
+      # 42,142 points/s at 2s, 114,356 at 500ms). The three flags move as a
+      # set (ADR-0076 decision 4); the idle delay and the byte threshold
+      # keep their shipped values.
+      - "--max-flush-delay"
+      - "500ms"
+      - "--max-flush-delay-idle"
+      - "40s"
+      - "--min-flush-bytes"
+      - "262144"
+      # QUERY AUDIT (disclosed, OFF): the default off, stated. No query-audit
+      # record is written, so no audit write sits on the query path. A
+      # production deployment that audits queries pays that write; this lane
+      # does not measure it.
+      - "--audit-mode"
+      - "off"
+      # MEMORY (disclosed): the 8g envelope is 8,589,934,592 bytes. The
+      # server reserves max(min(2 GiB, total / 4), 256 MiB baseline + the
+      # 512 MiB ingest buffer) = 2 GiB outside its budget, which leaves a
+      # 6,442,450,944-byte (6 GiB) memory budget. Written explicitly so the
+      # cache shares below do not depend on how the container reports its
+      # memory to the server's own derivation.
+      - "--memory-budget-bytes"
+      - "6442450944"
+      # Fetcher cache: 25% of the budget, 1,610,612,736 bytes (1.5 GiB), the
+      # value the server derives for a non-loopback S3 endpoint.
+      - "--cache-max-bytes"
+      - "1610612736"
+      # Catalog cache: 5% of the budget, 322,122,547 bytes (about 307 MiB),
+      # the derived value.
+      - "--catalog-cache-max-bytes"
+      - "322122547"
+      # Column-statistics cache: 2% of the budget, 128,849,018 bytes (about
+      # 123 MiB), the derived value (ADR-1413 decision 5). The three caches
+      # sum to 2,061,584,301 bytes, inside the 6 GiB budget as startup
+      # requires, which leaves 4,380,866,643 bytes (about 4.1 GiB) of budget
+      # for query working set.
+      - "--column-stats-cache-max-bytes"
+      - "128849018"
+      # Ingest buffer: the default 536870912 (512 MiB), stated. It is the
+      # buffer the 2 GiB reserve above holds outside the budget.
+      - "--max-ingest-buffer-bytes"
+      - "536870912"
+      # QUERY LIMITS (disclosed, frozen per ADR-0927 amendment 2026-10-26 F).
+      # Each one that fires is a budget refusal, not an engine error; the
+      # README's "Frozen limits" table lists value, sizing and error text.
+      # Query deadline: replaces the derived default 11m with 120s, the
+      # deadline prometheus (--query.timeout) and victoriametrics
+      # (-search.maxQueryDuration) run with, so no engine gets longer to
+      # answer. Must stay at or under the durable sys/gc max_query_duration
+      # (default 1h), which it does.
+      - "--gc-max-query-duration"
+      - "120s"
+      # Segments per query: the derived default 1000000, stated, not
+      # raised. Objects are keyed by ingest (wall-clock) hour, so their count
+      # grows with replay duration, not with the 30d event-time span: the
+      # 500ms age trigger on 4 shards writes at most 8 objects per second of
+      # ingest, which reaches 1,000,000 after 125,000 s (34.7 h) before
+      # compaction. A replay that long is not expected; a hit is
+      # refused(budget).
+      - "--max-segments"
+      - "1000000"
+      # S3 requests per query: the derived default 1527800 (4 shards, the
+      # 500ms flush cadence above, 4,800s seal margin), stated, not raised;
+      # services/ravel-server/tests/metricsbench_request_budget.rs fails if
+      # it stops equalling what this command derives. At one GET per object
+      # and the 8 objects per second above, a read over the whole
+      # uncompacted replay needs 190,975 s (53.0 h) of ingest to reach it,
+      # and --max-segments refuses first, at 125,000 s. Range reads raise
+      # the requests per object: above about 1.53 (1,527,800 / 1,000,000)
+      # this cap refuses first instead. A hit is refused(budget).
+      - "--max-s3-requests"
+      - "1527800"
+      # Series per query: replaces the default 10000 (#3306). 1,000,000 is
+      # the cardinality profile's active series and VictoriaMetrics'
+      # -search.maxUniqueTimeseries; the widest corpus union is 700,000
+      # series. A hit is refused(budget).
+      - "--max-series"
+      - "1000000"
+      # Samples per query: replaces the default 10000000 (#3306), the
+      # value Prometheus' --query.max-samples and Mimir's
+      # querier.max_samples carry. Ravel counts total materialized samples
+      # after dedup, Prometheus peak resident ones, so equal numbers are not
+      # equal semantics. Bytes are bounded by the memory budget above: an
+      # oversized materialization is refused "memory exhausted" before this
+      # count is reached. A hit is refused(budget). This flag also sizes the
+      # per-query range selector-cache cap, 2 x max_samples x 16 bytes:
+      # 16,000,000,000 here against 320,000,000 at the default, so the cap is
+      # inert and the 6 GiB memory budget alone bounds a range query's cached
+      # selector copies; an entry the budget cannot hold falls back to
+      # uncached reads.
+      - "--max-samples"
+      - "500000000"
+      # FETCH CONCURRENCY (disclosed, ADR-0927 fetch-concurrency amendment
+      # 2026-11-03): replaces the derived default,
+      # max(MIN_DERIVED_FETCH_CONCURRENCY 8, FETCH_CONCURRENCY_PER_CORE 2 x
+      # cores) (services/ravel-server/src/config.rs,
+      # resolve_performance_defaults), which is 8 in this 2-CPU container,
+      # with 32. The flag sets the shared GET permits, the PromQL per-object
+      # fan-out and the SQL partition count together (ADR-1195); the
+      # MetricsBench corpus issues no SQL. On real S3 the cardinality
+      # read-back is bound by GETs in flight: on the folded 1,000,000-series
+      # tenant its /api/v1/series listing took 264 to 277 s at 8 and 71 to
+      # 74 s at 32, with the same GETs and bytes and no memory refusal
+      # (#2821 comment 6601589888), so at 8 it cannot answer inside the
+      # 120 s deadline above. Not measured at 32: the unfolded catalog, and
+      # the s3s-fs lane, where the store's own CPU bounded the read at 8.
+      # Ravel's shipped derivation is unchanged.
+      - "--fetch-concurrency"
+      - "32"
+      # Points per range series (11,000) and total range evaluation points
+      # (1,000,000) are compiled into the image and have no flag; the
+      # README's "Frozen limits" table lists them.
+      # Admission limits and the per-query scanned-byte budget.
+      - "--limits-file"
+      - "/etc/ravel/limits.toml"
+    environment:
+      <<: *ravel-s3-env
+    ports:
+      - "127.0.0.1:4318:4318"
+    volumes:
+      - ./config/ravel-limits.toml:/etc/ravel/limits.toml:ro
+    # DESCRIPTOR LIMIT (disclosed): the nofile 524288 soft and hard every
+    # long-running service in docker-compose.yml carries. ravel-server does
+    # not raise its own soft limit (#3412).
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
+    deploy:
+      resources:
+        limits:
+          # Identical envelope to prometheus, victoriametrics and mimir in
+          # docker-compose.yml.
+          cpus: "2.0"
+          memory: 8g

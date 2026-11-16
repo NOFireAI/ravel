@@ -1,0 +1,15 @@
+{
+  "id": "F4",
+  "answer_facts": [
+    {"fact": "classified as storage unavailable", "pattern": "unavailable|storage|object store"},
+    {"fact": "not reported as zero rows", "pattern": "not (zero|0|empty)|could not|unable|refused|failed"}
+  ],
+  "evidence": [
+    {"item": "the failure class", "pattern": "unavailable"}
+  ],
+  "expected_empty_class": "storage_unavailable",
+  "expected_failure_classes": ["unavailable"],
+  "tools_expected": ["ravel_search_logs"],
+  "call_bound": 3,
+  "fixture_refs": ["entities.services"]
+}

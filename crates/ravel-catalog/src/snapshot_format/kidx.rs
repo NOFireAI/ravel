@@ -1,0 +1,3032 @@
+//! Codec and two-GET probe for the per-part key-index leaf (`.kidx`,
+//! ADR-2707 decision 4): the second tier of the exact-key index, one object
+//! per (part, field, key slice). docs/catalog-and-mvcc.md "Per-part key-index
+//! leaves" is the normative layout and reader procedure.
+//!
+//! Encode, split, decode and probe. The fold (`fold.rs`) writes the leaves;
+//! `ravel_query::key_index_route` reads them for the logs and spans
+//! fetchers, through [`plan_key_index_leaf_set`] and
+//! [`KeyIndexSetPlan::decoder`], composing the steps itself across a part's
+//! slices. The composed set probe ([`probe_key_index_leaf_set_ranged`],
+//! [`read_key_index_set_runs`] and
+//! [`Catalog::probe_key_index_leaf_set_with`]) has no production caller;
+//! tests use it as the one-slice-at-a-time reference. The object key is the
+//! caller's to fill in on the returned [`SnapshotKeyIndexLeafRef`].
+//!
+//! Version 3 (ADR-4146 decision 5) adds the header `entry_kind` and the
+//! posting (entry kind 1) of the metrics series index. Its encoder
+//! ([`encode_key_index_posting_leaf`], [`split_key_index_postings`]) and
+//! decoders ([`KeyIndexLeafPrefix::probe_posting_bucket`],
+//! [`KeyIndexSetPlan::posting_decoder`],
+//! [`verify_key_index_posting_leaf_frames`]) have no production caller yet:
+//! no fold writes a posting leaf and no router reads one. What production
+//! reaches is the version gate and the `entry_kind` check every prefix
+//! parse runs, and `verify_key_index_leaf` behind `ravel-cli inspect kidx`.
+
+use std::future::Future;
+use std::ops::Range;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use bytes::Bytes;
+use prost::Message;
+use ravel_codec::key_idx::{KEY_IDX_MAX_NAME_LEN, Key8, KeyType, bucket_index, key8_bytes};
+use ravel_object_store::GetRange;
+use ravel_proto::catalog::v1::{KeyIndexLeafHeader, SnapshotKeyIndexLeafRef};
+use ravel_types::{Signal, TenantHash};
+
+use super::{DEFAULT_MAX_COLUMN_STATS_BYTES, ZSTD_LEVEL};
+use crate::{Catalog, CatalogError};
+
+/// First 4 bytes of every key-index leaf.
+pub const KEY_INDEX_LEAF_MAGIC: [u8; 4] = *b"RKI1";
+
+/// The header `format_version` this module writes, for every signal, and
+/// reads for every signal (ADR-3692 amendment "Leaf format version 2").
+pub const KEY_INDEX_LEAF_FORMAT_VERSION: u32 = 2;
+
+/// The header `format_version` written before
+/// [`KEY_INDEX_LEAF_FORMAT_VERSION`]. A logs leaf at this version was built
+/// from version-1 RLOG KEY_IDX sections without marking them uncovered, so
+/// it can miss a key, and the reader rejects it; a spans leaf at this
+/// version is still accepted. See [`key_index_leaf_version_accepted`].
+pub const KEY_INDEX_LEAF_FORMAT_VERSION_1: u32 = 1;
+
+/// The header `format_version` of a metrics leaf that carries a header
+/// `entry_kind` (ADR-4146 decision 5). At entry kind 0 it means exactly what
+/// [`KEY_INDEX_LEAF_FORMAT_VERSION`] means; entry kind 1 exists only here.
+/// [`encode_key_index_posting_leaf`] writes it; the kind-0 encoder does not.
+pub const KEY_INDEX_LEAF_FORMAT_VERSION_3: u32 = 3;
+
+/// Every header `format_version` the decoder parses. Whether a parsed leaf
+/// may answer for its signal is [`key_index_leaf_version_accepted`].
+pub const KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN: [u32; 3] = [
+    KEY_INDEX_LEAF_FORMAT_VERSION_1,
+    KEY_INDEX_LEAF_FORMAT_VERSION,
+    KEY_INDEX_LEAF_FORMAT_VERSION_3,
+];
+
+/// Whether a leaf of `signal` at header `format_version` may answer a
+/// lookup or be carried into a new leaf: [`KEY_INDEX_LEAF_FORMAT_VERSION`]
+/// for every signal, [`KEY_INDEX_LEAF_FORMAT_VERSION_1`] for every signal
+/// except logs, and [`KEY_INDEX_LEAF_FORMAT_VERSION_3`] for metrics only. A
+/// refused leaf leaves its part uncovered for the field.
+pub fn key_index_leaf_version_accepted(signal: Signal, format_version: u32) -> bool {
+    format_version == KEY_INDEX_LEAF_FORMAT_VERSION
+        || (format_version == KEY_INDEX_LEAF_FORMAT_VERSION_1 && signal != Signal::Logs)
+        || (format_version == KEY_INDEX_LEAF_FORMAT_VERSION_3 && signal == Signal::Metrics)
+}
+
+/// The header `format_version`s a leaf of `signal` can carry: every entry
+/// of [`KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN`] except
+/// [`KEY_INDEX_LEAF_FORMAT_VERSION_3`] outside metrics, which no writer
+/// produces.
+pub fn key_index_leaf_versions_for_signal(signal: Signal) -> &'static [u32] {
+    if signal == Signal::Metrics {
+        &KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN
+    } else {
+        &KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN[..2]
+    }
+}
+
+/// Whether a leaf of `signal` at `format_version` is above every version the
+/// signal reads ([`key_index_leaf_versions_for_signal`]): a leaf a newer
+/// build wrote, which a fold must refuse rather than rebuild over (ADR-4233
+/// H1). Distinct from `!key_index_leaf_version_accepted`, which is also true
+/// for a version below the signal's read set (a logs version-1 leaf): that
+/// keeps the rebuild path, this fails the cycle. A version above the
+/// signal's read set is newer even when another signal reads it: the logs read
+/// set is [1, 2], so a v3 leaf met as logs is refused.
+pub fn key_index_leaf_version_is_newer(signal: Signal, format_version: u32) -> bool {
+    key_index_leaf_versions_for_signal(signal)
+        .iter()
+        .all(|&known| format_version > known)
+}
+
+/// The metrics field whose entries are label-pair postings (ADR-4146
+/// decision 1): `key8` is [`series_label_pair_key8`] of one pair, the
+/// posting the series keys carrying it.
+pub const METRICS_SERIES_LABEL_FIELD: &str = "series_label";
+
+/// The metrics field whose entries map a series key to a one-element
+/// posting holding its class ordinal (ADR-4146 decision 1).
+pub const METRICS_SERIES_CLASS_FIELD: &str = "series_class";
+
+/// The metrics field mapping a class ordinal to the part entries holding it,
+/// in kind-0 entries (ADR-4146 decision 1).
+pub const METRICS_CLASS_OBJECTS_FIELD: &str = "class_objects";
+
+/// What one body entry of a leaf is, from the header's `entry_kind`
+/// (ADR-4146 decision 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyIndexEntryKind {
+    /// `(key8, uvarint entry_ordinal, uvarint count, uvarint delta[count])`:
+    /// a [`KeyIndexLeafEntry`].
+    Entry,
+    /// `(key8, uvarint count, uvarint delta[count])`: a
+    /// [`KeyIndexPostingEntry`].
+    Posting,
+}
+
+impl KeyIndexEntryKind {
+    pub const fn as_u32(self) -> u32 {
+        match self {
+            KeyIndexEntryKind::Entry => 0,
+            KeyIndexEntryKind::Posting => 1,
+        }
+    }
+
+    pub const fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(KeyIndexEntryKind::Entry),
+            1 => Some(KeyIndexEntryKind::Posting),
+            _ => None,
+        }
+    }
+}
+
+/// The entry kind a leaf of `field` under `signal` must carry:
+/// [`KeyIndexEntryKind::Posting`] for [`METRICS_SERIES_LABEL_FIELD`] and
+/// [`METRICS_SERIES_CLASS_FIELD`] of metrics, [`KeyIndexEntryKind::Entry`]
+/// for every other field. A reader checks the header's kind against it.
+pub fn key_index_field_entry_kind(signal: Signal, field: &str) -> KeyIndexEntryKind {
+    expected_entry_kind(signal_code(signal), field)
+}
+
+fn expected_entry_kind(signal_code_value: u32, field: &str) -> KeyIndexEntryKind {
+    if signal_code_value == signal_code(Signal::Metrics)
+        && (field == METRICS_SERIES_LABEL_FIELD || field == METRICS_SERIES_CLASS_FIELD)
+    {
+        KeyIndexEntryKind::Posting
+    } else {
+        KeyIndexEntryKind::Entry
+    }
+}
+
+/// The metric-name label of a series, indexed as the pair (`__name__`,
+/// metric name) by [`series_label_pair_bytes`].
+pub const SERIES_LABEL_METRIC_NAME: &str = ravel_types::METRIC_NAME_LABEL;
+
+/// The one byte encoding of a label pair that the series index hashes
+/// (ADR-4146 decision 1): `u16_le(len(name)) name u16_le(len(value))
+/// value`. The metric name is the pair ([`SERIES_LABEL_METRIC_NAME`],
+/// name). A name or value longer than `u16::MAX` bytes is
+/// [`KeyIndexLeafEncodeError::InvalidInput`].
+pub fn series_label_pair_bytes(
+    name: &str,
+    value: &str,
+) -> Result<Vec<u8>, KeyIndexLeafEncodeError> {
+    let name_len = u16::try_from(name.len())
+        .map_err(|_| invalid(format_args!("label name of {} bytes over u16", name.len())))?;
+    let value_len = u16::try_from(value.len()).map_err(|_| {
+        invalid(format_args!(
+            "label value of {} bytes over u16",
+            value.len()
+        ))
+    })?;
+    let mut out = Vec::with_capacity(4 + name.len() + value.len());
+    out.extend_from_slice(&name_len.to_le_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(&value_len.to_le_bytes());
+    out.extend_from_slice(value.as_bytes());
+    Ok(out)
+}
+
+/// The [`METRICS_SERIES_LABEL_FIELD`] key of a label pair:
+/// `key8_bytes` of [`series_label_pair_bytes`].
+pub fn series_label_pair_key8(name: &str, value: &str) -> Result<Key8, KeyIndexLeafEncodeError> {
+    Ok(key8_bytes(&series_label_pair_bytes(name, value)?))
+}
+
+/// Smallest `bucket_bits` either side accepts.
+pub const KEY_INDEX_LEAF_MIN_BUCKET_BITS: u8 = 1;
+
+/// Largest `bucket_bits` the writer chooses: the balance value at the body
+/// ceiling.
+pub const KEY_INDEX_LEAF_WRITER_MAX_BUCKET_BITS: u8 = 13;
+
+/// Largest `bucket_bits` the reader accepts, checked before the directory
+/// is read.
+pub const KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS: u8 = 16;
+
+/// Default cap on decompressed body bytes: the column-statistics ceiling,
+/// in that constant's own meaning.
+pub const DEFAULT_MAX_KEY_INDEX_LEAF_BODY_BYTES: u64 = DEFAULT_MAX_COLUMN_STATS_BYTES;
+
+/// Most parts one statement's tier-2 router probes: ADR-2707 decision 5's
+/// `P_max`, a constant here per ADR-3692 decision 2, and the factor of the
+/// statement's leaf GET ceiling (see [`KEY_INDEX_LEAF_GET_CEILING`]). Parts
+/// past it are uncovered and fall to tier 1, never to a whole scan.
+pub const KEY_INDEX_MAX_PROBED_PARTS: usize = 1_024;
+
+/// Most leaf GETs one routing pass of a one-key set issues in the tier-2
+/// router: two GETs (prefix and one bucket) for each of
+/// [`KEY_INDEX_MAX_PROBED_PARTS`] parts, ADR-2707 decision 5's point-lookup
+/// budget. Under ADR-3692's key-set ceiling amendment the router computes a
+/// set of `k` keys' ceiling as `P_max x (1 + min(k, B_run))`
+/// ([`KEY_INDEX_SET_PROBE_MAX_RUNS`]), which is this value at k = 1 and
+/// 66,560 at k >= 64. It is an absolute cap on one pass, charging each part
+/// as if the set sat in one slice; admission charges each part's real worst
+/// case against it and refunds the GETs a probed part did not issue, so its
+/// worst-case division is the fewest parts it admits. Separately, a part
+/// whose worst case exceeds two GETs for each of its segments in the routed
+/// snapshot, its tier-1 probe's cost, is not probed.
+///
+/// The logs and spans consumers route a key set in one pass. The metrics
+/// label-value route (ADR-3694's per-value routing amendment) routes one
+/// one-key pass per distinct positive equality value, each under this
+/// ceiling, so a statement with `n` values issues at most `n` times it and
+/// at most `2n` GETs per covering part. When the query's read cache serves
+/// a slice's prefix GET to the later passes, a part costs at most its
+/// touched slices plus `n`, which is `1 + n` on a one-slice leaf.
+pub const KEY_INDEX_LEAF_GET_CEILING: u32 = 2_048;
+
+/// Most bucket GETs one set probe issues against one leaf: ADR-3692
+/// decision 2's `B_run`. Predicted; the Stage 1 amendment confirms or
+/// changes it.
+pub const KEY_INDEX_SET_PROBE_MAX_RUNS: usize = 64;
+
+/// Most leaf reads one part's set probe holds in flight: GET 1 of its
+/// slices, then the bucket runs of all of them. The tier-2 router probes up
+/// to 16 parts at once (its `PROBE_CONCURRENCY`), so one statement's route
+/// holds at most 16 x 16 = 256 leaf reads in flight.
+pub const LEAF_READ_CONCURRENCY: usize = 16;
+
+/// Predicted tier-1 cost of one absent object (ADR-3692 decision 2's
+/// `T1_BYTES`: the 8 KiB footer suffix, about 1 KB of prefix and about
+/// 2 KB of bucket). A bridged set probe may read at most `entry_count`
+/// times this from one leaf.
+pub const KEY_INDEX_T1_BYTES: u64 = 11 * 1024;
+
+/// The (`P_max`, `L_max`) pair a part-bound point root is shaped against
+/// (ADR-0849 section 2, ADR-3692 decision 2). No root validation consumes
+/// it yet; it is the one place a future shape lint reads both from.
+pub const fn key_index_root_shape() -> (usize, u32) {
+    (KEY_INDEX_MAX_PROBED_PARTS, KEY_INDEX_LEAF_GET_CEILING)
+}
+
+/// Upper bound on the heap one bucket frame's decode holds, for an
+/// `uncompressed_len`-byte frame body (ADR-3692 decision 2): what a caller
+/// reserves before the decode.
+///
+/// An entry is at least 10 bytes on the wire (an 8-byte key8 and two
+/// one-byte varints) and decodes to a 40-byte [`KeyIndexLeafEntry`] plus a
+/// `Vec<u32>` holding one element per delta varint, so at most 4 bytes of
+/// decoded entry per wire byte. The decompressed buffer itself is 1 byte
+/// per wire byte while it lives, and the matches a probe copies out are at
+/// most the entries they came from, again at most 4 bytes per wire byte
+/// with the raw buffer already dropped. 8 bytes per wire byte covers the
+/// larger of those two peaks; the 64 covers the fixed `Vec` headers.
+/// [`KeyIndexLeafPrefix`]'s decode refuses a frame claiming more than
+/// `uncompressed_len / 10` entries before it allocates, and an entry whose
+/// `block_count` leaves fewer than 10 bytes for each entry still to come,
+/// which is what makes this arithmetic hold for a hostile frame: the entry
+/// capacity and the blocks together stay within 4 bytes per wire byte.
+pub const fn decoded_bound(uncompressed_len: u32) -> u64 {
+    8 * uncompressed_len as u64 + 64
+}
+
+/// [`decoded_bound`] for a frame of postings (entry kind 1, ADR-4146
+/// decision 5): what a caller reserves before decoding one.
+///
+/// A posting is at least 10 bytes on the wire (key8, a one-byte count and
+/// one one-byte delta) and decodes to a 32-byte [`KeyIndexPostingEntry`]
+/// plus 8 bytes per delta, so at most 8 bytes of decoded postings per wire
+/// byte, reached by one posting of one-byte deltas. The decompressed buffer
+/// beside them makes 9 per wire byte, and the values a probe copies out
+/// beside the postings they came from make 16, the larger peak. The
+/// decoder refuses a frame claiming more than `uncompressed_len / 10`
+/// postings, and a count leaving less than one byte per delta or less than
+/// 10 bytes for each posting still to come, before it allocates, and
+/// allocates each list at exactly its count.
+pub const fn posting_decoded_bound(uncompressed_len: u32) -> u64 {
+    16 * uncompressed_len as u64 + 64
+}
+
+/// Fewest wire bytes one frame entry takes, of either kind: key8 plus two
+/// one-byte varints.
+const MIN_FRAME_ENTRY_WIRE_BYTES: u32 = 10;
+
+/// magic, header_len, prefix_len, header_crc32c and dir_crc32c.
+const FIXED_PREFIX_LEN: u64 = 4 + 4 + 4 + 4 + 4;
+/// entry_count, uncompressed_len and frame_crc32c.
+const FRAME_HEADER_LEN: usize = 12;
+const MAX_VARINT_BYTES: usize = 10;
+
+/// The body ceiling. The writer applies it to the whole leaf, a reader to
+/// each frame it decompresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyIndexLeafLimits {
+    pub max_body_bytes: u64,
+}
+
+impl Default for KeyIndexLeafLimits {
+    fn default() -> Self {
+        KeyIndexLeafLimits {
+            max_body_bytes: DEFAULT_MAX_KEY_INDEX_LEAF_BODY_BYTES,
+        }
+    }
+}
+
+/// One index entry: a `key8` present in one part entry, and the ascending
+/// block ordinals of that entry's segment holding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyIndexLeafEntry {
+    pub key8: Key8,
+    pub entry_ordinal: u64,
+    pub blocks: Vec<u32>,
+}
+
+/// One posting (entry kind 1): a `key8` and its strictly ascending values.
+/// A leaf holds at most one posting per `key8`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyIndexPostingEntry {
+    pub key8: Key8,
+    pub values: Vec<u64>,
+}
+
+/// Everything a posting leaf records: the [`KeyIndexLeafInput`] header
+/// fields, and `postings` in any order. No posting may start at
+/// `u64::MAX`, the one first value a delta from -1 cannot encode.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyIndexPostingLeafInput<'a> {
+    pub tenant_hash: TenantHash,
+    pub signal: Signal,
+    pub part_blake3: [u8; 32],
+    pub part_entry_count: u64,
+    pub field: &'a str,
+    pub key_type: KeyType,
+    pub key8_lo: u64,
+    pub key8_hi: u64,
+    pub uncovered_entry_ordinals: &'a [u64],
+    pub postings: &'a [KeyIndexPostingEntry],
+}
+
+/// Everything a leaf records. `entries` may be in any order;
+/// `uncovered_entry_ordinals` may be unsorted and may repeat.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyIndexLeafInput<'a> {
+    pub tenant_hash: TenantHash,
+    pub signal: Signal,
+    pub part_blake3: [u8; 32],
+    pub part_entry_count: u64,
+    pub field: &'a str,
+    pub key_type: KeyType,
+    pub key8_lo: u64,
+    pub key8_hi: u64,
+    pub uncovered_entry_ordinals: &'a [u64],
+    pub entries: &'a [KeyIndexLeafEntry],
+}
+
+/// A leaf's bytes and the ref HEAD carries for it. `leaf_ref.key` is empty:
+/// the object key is the caller's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncodedKeyIndexLeaf {
+    pub bytes: Vec<u8>,
+    pub leaf_ref: SnapshotKeyIndexLeafRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum KeyIndexLeafEncodeError {
+    #[error("invalid key-index leaf input: {0}")]
+    InvalidInput(String),
+    /// The decompressed body would exceed the ceiling; split the entries
+    /// with [`split_key_index_entries`].
+    #[error("key-index leaf body of {body} decompressed bytes exceeds the {ceiling}-byte ceiling")]
+    BodyOverCeiling { body: u64, ceiling: u64 },
+    #[error("bucket_bits {bucket_bits} outside {min}..={max}")]
+    BucketBitsOutOfRange { bucket_bits: u8, min: u8, max: u8 },
+    #[error("zstd compression failed: {0}")]
+    Compress(String),
+}
+
+fn invalid(msg: impl std::fmt::Display) -> KeyIndexLeafEncodeError {
+    KeyIndexLeafEncodeError::InvalidInput(msg.to_string())
+}
+
+fn signal_code(signal: Signal) -> u32 {
+    u32::try_from(ravel_commit::signal::to_proto(signal) as i32).unwrap_or(0)
+}
+
+fn uvarint_len(value: u64) -> u64 {
+    let bits = 64 - u64::from(value.leading_zeros());
+    bits.div_ceil(7).max(1)
+}
+
+fn write_uvarint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn read_uvarint(bytes: &[u8], pos: &mut usize) -> Result<u64, KeyIndexLeafRejection> {
+    let mut result: u64 = 0;
+    let mut shift: u32 = 0;
+    for i in 0..MAX_VARINT_BYTES {
+        let byte = *bytes
+            .get(*pos)
+            .ok_or_else(|| corrupted("entry truncated inside a uvarint"))?;
+        *pos += 1;
+        let low7 = u64::from(byte & 0x7f);
+        if i == MAX_VARINT_BYTES - 1 && low7 > 1 {
+            return Err(corrupted("uvarint overflows u64"));
+        }
+        result |= low7 << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+    }
+    Err(corrupted("uvarint longer than 10 bytes"))
+}
+
+/// Delta from the previous block ordinal, the first taken from -1.
+fn block_deltas(blocks: &[u32]) -> impl Iterator<Item = u64> + '_ {
+    let mut prev = u64::MAX;
+    blocks.iter().map(move |&block| {
+        let delta = u64::from(block).wrapping_sub(prev);
+        prev = u64::from(block);
+        delta
+    })
+}
+
+/// Bytes `entry` occupies in a decompressed bucket.
+pub fn encoded_entry_len(entry: &KeyIndexLeafEntry) -> u64 {
+    8 + uvarint_len(entry.entry_ordinal)
+        + uvarint_len(entry.blocks.len() as u64)
+        + block_deltas(&entry.blocks).map(uvarint_len).sum::<u64>()
+}
+
+fn write_entry(out: &mut Vec<u8>, entry: &KeyIndexLeafEntry) {
+    out.extend_from_slice(&entry.key8);
+    write_uvarint(out, entry.entry_ordinal);
+    write_uvarint(out, entry.blocks.len() as u64);
+    for delta in block_deltas(&entry.blocks) {
+        write_uvarint(out, delta);
+    }
+}
+
+/// The `bucket_bits` in 1..=13 whose balance body `4 x 2^(2b)` is nearest
+/// `body` decompressed bytes (ties go to the smaller value).
+pub fn choose_key_index_bucket_bits(body: u64) -> u8 {
+    let mut best = KEY_INDEX_LEAF_MIN_BUCKET_BITS;
+    let mut best_diff = u64::MAX;
+    for bits in KEY_INDEX_LEAF_MIN_BUCKET_BITS..=KEY_INDEX_LEAF_WRITER_MAX_BUCKET_BITS {
+        let diff = (4u64 << (2 * u32::from(bits))).abs_diff(body);
+        if diff < best_diff {
+            best = bits;
+            best_diff = diff;
+        }
+    }
+    best
+}
+
+struct Prepared<'a> {
+    entries: Vec<&'a KeyIndexLeafEntry>,
+    uncovered: Vec<u64>,
+    body: u64,
+}
+
+/// The header checks both encoders share; returns the uncovered ordinals
+/// sorted and deduplicated.
+fn prepare_header(
+    field: &str,
+    key8_lo: u64,
+    key8_hi: u64,
+    uncovered_entry_ordinals: &[u64],
+    part_entry_count: u64,
+) -> Result<Vec<u64>, KeyIndexLeafEncodeError> {
+    if field.is_empty() || field.len() > KEY_IDX_MAX_NAME_LEN {
+        return Err(invalid(format_args!(
+            "field name must be 1..={KEY_IDX_MAX_NAME_LEN} bytes, got {}",
+            field.len()
+        )));
+    }
+    if key8_lo > key8_hi {
+        return Err(invalid(format_args!(
+            "key8_lo {key8_lo:#018x} above key8_hi {key8_hi:#018x}"
+        )));
+    }
+    let mut uncovered = uncovered_entry_ordinals.to_vec();
+    uncovered.sort_unstable();
+    uncovered.dedup();
+    if let Some(&last) = uncovered.last()
+        && last >= part_entry_count
+    {
+        return Err(invalid(format_args!(
+            "uncovered entry ordinal {last} at or past part_entry_count {part_entry_count}"
+        )));
+    }
+    Ok(uncovered)
+}
+
+fn prepare<'a>(
+    input: &KeyIndexLeafInput<'a>,
+    limits: &KeyIndexLeafLimits,
+) -> Result<Prepared<'a>, KeyIndexLeafEncodeError> {
+    let uncovered = prepare_header(
+        input.field,
+        input.key8_lo,
+        input.key8_hi,
+        input.uncovered_entry_ordinals,
+        input.part_entry_count,
+    )?;
+    if key_index_field_entry_kind(input.signal, input.field) != KeyIndexEntryKind::Entry {
+        return Err(invalid(format_args!(
+            "field {:?} of {:?} is a posting field",
+            input.field, input.signal
+        )));
+    }
+    let mut entries: Vec<&KeyIndexLeafEntry> = input.entries.iter().collect();
+    entries.sort_by_key(|e| (e.key8, e.entry_ordinal));
+    let mut body: u64 = 0;
+    let mut prev: Option<(Key8, u64)> = None;
+    for entry in &entries {
+        let pair = (entry.key8, entry.entry_ordinal);
+        if prev == Some(pair) {
+            return Err(invalid(format_args!(
+                "duplicate entry (key8 {}, entry ordinal {})",
+                hex::encode(entry.key8),
+                entry.entry_ordinal
+            )));
+        }
+        prev = Some(pair);
+        let key = u64::from_be_bytes(entry.key8);
+        if key < input.key8_lo || key > input.key8_hi {
+            return Err(invalid(format_args!(
+                "key8 {key:#018x} outside the slice [{:#018x}, {:#018x}]",
+                input.key8_lo, input.key8_hi
+            )));
+        }
+        if entry.entry_ordinal >= input.part_entry_count {
+            return Err(invalid(format_args!(
+                "entry ordinal {} at or past part_entry_count {}",
+                entry.entry_ordinal, input.part_entry_count
+            )));
+        }
+        if uncovered.binary_search(&entry.entry_ordinal).is_ok() {
+            return Err(invalid(format_args!(
+                "entry ordinal {} is both indexed and uncovered",
+                entry.entry_ordinal
+            )));
+        }
+        if entry.blocks.is_empty() {
+            return Err(invalid(format_args!(
+                "entry ordinal {} has an empty block set",
+                entry.entry_ordinal
+            )));
+        }
+        if entry.blocks.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(invalid(format_args!(
+                "entry ordinal {} has a block set that is not strictly ascending",
+                entry.entry_ordinal
+            )));
+        }
+        body = body.saturating_add(encoded_entry_len(entry));
+    }
+    if body > limits.max_body_bytes {
+        return Err(KeyIndexLeafEncodeError::BodyOverCeiling {
+            body,
+            ceiling: limits.max_body_bytes,
+        });
+    }
+    Ok(Prepared {
+        entries,
+        uncovered,
+        body,
+    })
+}
+
+/// Encodes one leaf, choosing `bucket_bits` with
+/// [`choose_key_index_bucket_bits`]. A body over `limits.max_body_bytes` is
+/// [`KeyIndexLeafEncodeError::BodyOverCeiling`]. A field that carries
+/// postings ([`key_index_field_entry_kind`]) is
+/// [`KeyIndexLeafEncodeError::InvalidInput`]: use
+/// [`encode_key_index_posting_leaf`].
+pub fn encode_key_index_leaf(
+    input: &KeyIndexLeafInput<'_>,
+    limits: &KeyIndexLeafLimits,
+) -> Result<EncodedKeyIndexLeaf, KeyIndexLeafEncodeError> {
+    let prepared = prepare(input, limits)?;
+    let bucket_bits = choose_key_index_bucket_bits(prepared.body);
+    encode_prepared(input, prepared, bucket_bits)
+}
+
+/// [`encode_key_index_leaf`] at a fixed `bucket_bits` within the writer's
+/// bound, 1..=[`KEY_INDEX_LEAF_WRITER_MAX_BUCKET_BITS`]. Any other value is
+/// [`KeyIndexLeafEncodeError::BucketBitsOutOfRange`].
+pub fn encode_key_index_leaf_with_bucket_bits(
+    input: &KeyIndexLeafInput<'_>,
+    bucket_bits: u8,
+    limits: &KeyIndexLeafLimits,
+) -> Result<EncodedKeyIndexLeaf, KeyIndexLeafEncodeError> {
+    encode_with_bucket_bits_up_to(
+        input,
+        bucket_bits,
+        KEY_INDEX_LEAF_WRITER_MAX_BUCKET_BITS,
+        limits,
+    )
+}
+
+/// Builds a leaf at any `bucket_bits` the reader accepts, 1..=16, so tests
+/// reach 14..=16, which neither public encoder produces.
+#[cfg(test)]
+pub(crate) fn encode_key_index_leaf_with_reader_bucket_bits(
+    input: &KeyIndexLeafInput<'_>,
+    bucket_bits: u8,
+    limits: &KeyIndexLeafLimits,
+) -> Result<EncodedKeyIndexLeaf, KeyIndexLeafEncodeError> {
+    encode_with_bucket_bits_up_to(
+        input,
+        bucket_bits,
+        KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS,
+        limits,
+    )
+}
+
+fn encode_with_bucket_bits_up_to(
+    input: &KeyIndexLeafInput<'_>,
+    bucket_bits: u8,
+    max: u8,
+    limits: &KeyIndexLeafLimits,
+) -> Result<EncodedKeyIndexLeaf, KeyIndexLeafEncodeError> {
+    if !(KEY_INDEX_LEAF_MIN_BUCKET_BITS..=max).contains(&bucket_bits) {
+        return Err(KeyIndexLeafEncodeError::BucketBitsOutOfRange {
+            bucket_bits,
+            min: KEY_INDEX_LEAF_MIN_BUCKET_BITS,
+            max,
+        });
+    }
+    let prepared = prepare(input, limits)?;
+    encode_prepared(input, prepared, bucket_bits)
+}
+
+fn to_u32(value: usize, what: &str) -> Result<u32, KeyIndexLeafEncodeError> {
+    u32::try_from(value).map_err(|_| invalid(format_args!("{what} {value} does not fit u32")))
+}
+
+fn encode_prepared(
+    input: &KeyIndexLeafInput<'_>,
+    prepared: Prepared<'_>,
+    bucket_bits: u8,
+) -> Result<EncodedKeyIndexLeaf, KeyIndexLeafEncodeError> {
+    let bucket_count = 1usize << bucket_bits;
+    let mut raw: Vec<Vec<u8>> = vec![Vec::new(); bucket_count];
+    let mut counts = vec![0u32; bucket_count];
+    for entry in &prepared.entries {
+        let bucket = bucket_index(&entry.key8, bucket_bits).map_err(invalid)? as usize;
+        write_entry(&mut raw[bucket], entry);
+        counts[bucket] = counts[bucket]
+            .checked_add(1)
+            .ok_or_else(|| invalid("bucket entry count overflows u32"))?;
+    }
+    let header = KeyIndexLeafHeader {
+        format_version: KEY_INDEX_LEAF_FORMAT_VERSION,
+        tenant_hash: input.tenant_hash.0.to_vec(),
+        signal: signal_code(input.signal),
+        part_blake3: input.part_blake3.to_vec(),
+        field: input.field.to_string(),
+        key_type: u32::from(input.key_type.as_u8()),
+        key8_lo: input.key8_lo,
+        key8_hi: input.key8_hi,
+        bucket_bits: u32::from(bucket_bits),
+        entry_count: prepared.entries.len() as u64,
+        part_entry_count: input.part_entry_count,
+        uncovered_entry_ordinals: prepared.uncovered,
+        body_len: 0,
+        entry_kind: KeyIndexEntryKind::Entry.as_u32(),
+    };
+    assemble_leaf(header, &raw, &counts)
+}
+
+/// Compresses the raw buckets into frames and lays out the leaf around
+/// `header`, whose `body_len` it fills in.
+fn assemble_leaf(
+    mut header: KeyIndexLeafHeader,
+    raw: &[Vec<u8>],
+    counts: &[u32],
+) -> Result<EncodedKeyIndexLeaf, KeyIndexLeafEncodeError> {
+    let bucket_count = raw.len();
+    let mut body = Vec::new();
+    let mut ends = Vec::with_capacity(bucket_count * 4);
+    for (bucket, raw_bucket) in raw.iter().enumerate() {
+        if !raw_bucket.is_empty() {
+            let compressed = zstd::bulk::compress(raw_bucket, ZSTD_LEVEL)
+                .map_err(|e| KeyIndexLeafEncodeError::Compress(e.to_string()))?;
+            body.extend_from_slice(&counts[bucket].to_le_bytes());
+            body.extend_from_slice(&to_u32(raw_bucket.len(), "bucket length")?.to_le_bytes());
+            body.extend_from_slice(&crc32c::crc32c(&compressed).to_le_bytes());
+            body.extend_from_slice(&compressed);
+        }
+        ends.extend_from_slice(&to_u32(body.len(), "body length")?.to_le_bytes());
+    }
+    header.body_len = body.len() as u64;
+    let header_bytes = header.encode_to_vec();
+    let header_len = to_u32(header_bytes.len(), "header length")?;
+    let prefix_len = to_u32(
+        FIXED_PREFIX_LEN as usize + header_bytes.len() + ends.len(),
+        "prefix length",
+    )?;
+    let mut bytes = Vec::with_capacity(prefix_len as usize + body.len());
+    bytes.extend_from_slice(&KEY_INDEX_LEAF_MAGIC);
+    bytes.extend_from_slice(&header_len.to_le_bytes());
+    bytes.extend_from_slice(&prefix_len.to_le_bytes());
+    bytes.extend_from_slice(&header_bytes);
+    let header_crc = crc32c::crc32c(&bytes);
+    bytes.extend_from_slice(&header_crc.to_le_bytes());
+    bytes.extend_from_slice(&ends);
+    bytes.extend_from_slice(&crc32c::crc32c(&ends).to_le_bytes());
+    bytes.extend_from_slice(&body);
+    let leaf_ref = SnapshotKeyIndexLeafRef {
+        key: String::new(),
+        blake3: blake3::hash(&bytes).as_bytes().to_vec(),
+        size: bytes.len() as u64,
+        field: header.field.clone(),
+        key_type: header.key_type,
+        key8_lo: header.key8_lo,
+        key8_hi: header.key8_hi,
+        prefix_len,
+        bucket_bits: header.bucket_bits,
+        entry_count: header.entry_count,
+        uncovered_count: header.uncovered_entry_ordinals.len() as u64,
+        part_blake3: header.part_blake3.clone(),
+    };
+    Ok(EncodedKeyIndexLeaf { bytes, leaf_ref })
+}
+
+/// One leaf's share of a (part, field): its inclusive key slice and the
+/// range of the sorted entry list it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyIndexSlice {
+    pub key8_lo: u64,
+    pub key8_hi: u64,
+    pub entries: Range<usize>,
+}
+
+/// Splits `entries`, sorted ascending by `(key8, entry_ordinal)`, into slices
+/// whose decompressed bodies each stay at or below `max_body_bytes`. Cuts
+/// fall only between distinct `key8` values, and the slices' bounds tile
+/// `[0, u64::MAX]`: the first starts at 0, the last ends at `u64::MAX`, and
+/// each starts one past its predecessor's end. An empty list is one slice.
+/// One `key8` whose entries alone exceed the ceiling is
+/// [`KeyIndexLeafEncodeError::BodyOverCeiling`]; an unsorted list is
+/// [`KeyIndexLeafEncodeError::InvalidInput`].
+pub fn split_key_index_entries(
+    entries: &[KeyIndexLeafEntry],
+    max_body_bytes: u64,
+) -> Result<Vec<KeyIndexSlice>, KeyIndexLeafEncodeError> {
+    if entries
+        .windows(2)
+        .any(|w| (w[0].key8, w[0].entry_ordinal) >= (w[1].key8, w[1].entry_ordinal))
+    {
+        return Err(invalid(
+            "entries are not sorted and unique by (key8, entry_ordinal)",
+        ));
+    }
+    split_sorted(entries, max_body_bytes, |e| e.key8, encoded_entry_len)
+}
+
+/// [`split_key_index_entries`] for postings (entry kind 1): `postings` must
+/// be strictly ascending by `key8`, one posting per key, and each posting is
+/// sized by [`encoded_posting_len`]. The slices tile `[0, u64::MAX]` the
+/// same way. One posting over the ceiling is
+/// [`KeyIndexLeafEncodeError::BodyOverCeiling`]; an unsorted or repeated
+/// `key8` is [`KeyIndexLeafEncodeError::InvalidInput`].
+pub fn split_key_index_postings(
+    postings: &[KeyIndexPostingEntry],
+    max_body_bytes: u64,
+) -> Result<Vec<KeyIndexSlice>, KeyIndexLeafEncodeError> {
+    if postings.windows(2).any(|w| w[0].key8 >= w[1].key8) {
+        return Err(invalid("postings are not sorted and unique by key8"));
+    }
+    split_sorted(postings, max_body_bytes, |p| p.key8, encoded_posting_len)
+}
+
+/// Cuts `items`, sorted by `key8`, between distinct `key8` values into
+/// slices whose summed `len` stays at or below `max_body_bytes`.
+fn split_sorted<T>(
+    items: &[T],
+    max_body_bytes: u64,
+    key8_of: impl Fn(&T) -> Key8,
+    len: impl Fn(&T) -> u64,
+) -> Result<Vec<KeyIndexSlice>, KeyIndexLeafEncodeError> {
+    let mut slices = Vec::new();
+    let mut slice_start = 0usize;
+    let mut slice_lo = 0u64;
+    let mut slice_body = 0u64;
+    let mut run_start = 0usize;
+    while run_start < items.len() {
+        let key8 = key8_of(&items[run_start]);
+        let mut run_end = run_start;
+        let mut run_body = 0u64;
+        while run_end < items.len() && key8_of(&items[run_end]) == key8 {
+            run_body = run_body.saturating_add(len(&items[run_end]));
+            run_end += 1;
+        }
+        if run_body > max_body_bytes {
+            return Err(KeyIndexLeafEncodeError::BodyOverCeiling {
+                body: run_body,
+                ceiling: max_body_bytes,
+            });
+        }
+        if run_start > slice_start && slice_body.saturating_add(run_body) > max_body_bytes {
+            let cut = u64::from_be_bytes(key8);
+            slices.push(KeyIndexSlice {
+                key8_lo: slice_lo,
+                key8_hi: cut - 1,
+                entries: slice_start..run_start,
+            });
+            slice_start = run_start;
+            slice_lo = cut;
+            slice_body = 0;
+        }
+        slice_body += run_body;
+        run_start = run_end;
+    }
+    slices.push(KeyIndexSlice {
+        key8_lo: slice_lo,
+        key8_hi: u64::MAX,
+        entries: slice_start..items.len(),
+    });
+    Ok(slices)
+}
+
+/// Delta from the previous value, the first taken from -1: the kind-1 form
+/// of `block_deltas`.
+fn posting_deltas(values: &[u64]) -> impl Iterator<Item = u64> + '_ {
+    let mut prev = u64::MAX;
+    values.iter().map(move |&value| {
+        let delta = value.wrapping_sub(prev);
+        prev = value;
+        delta
+    })
+}
+
+/// Bytes `posting` occupies in a decompressed bucket.
+pub fn encoded_posting_len(posting: &KeyIndexPostingEntry) -> u64 {
+    8 + uvarint_len(posting.values.len() as u64)
+        + posting_deltas(&posting.values)
+            .map(uvarint_len)
+            .sum::<u64>()
+}
+
+fn write_posting(out: &mut Vec<u8>, posting: &KeyIndexPostingEntry) {
+    out.extend_from_slice(&posting.key8);
+    write_uvarint(out, posting.values.len() as u64);
+    for delta in posting_deltas(&posting.values) {
+        write_uvarint(out, delta);
+    }
+}
+
+struct PreparedPostings<'a> {
+    postings: Vec<&'a KeyIndexPostingEntry>,
+    uncovered: Vec<u64>,
+    body: u64,
+}
+
+fn prepare_postings<'a>(
+    input: &KeyIndexPostingLeafInput<'a>,
+    limits: &KeyIndexLeafLimits,
+) -> Result<PreparedPostings<'a>, KeyIndexLeafEncodeError> {
+    let uncovered = prepare_header(
+        input.field,
+        input.key8_lo,
+        input.key8_hi,
+        input.uncovered_entry_ordinals,
+        input.part_entry_count,
+    )?;
+    if key_index_field_entry_kind(input.signal, input.field) != KeyIndexEntryKind::Posting {
+        return Err(invalid(format_args!(
+            "field {:?} of {:?} is not a posting field",
+            input.field, input.signal
+        )));
+    }
+    let mut postings: Vec<&KeyIndexPostingEntry> = input.postings.iter().collect();
+    postings.sort_by_key(|p| p.key8);
+    let mut body: u64 = 0;
+    let mut prev: Option<Key8> = None;
+    for posting in &postings {
+        if prev == Some(posting.key8) {
+            return Err(invalid(format_args!(
+                "two postings for key8 {}",
+                hex::encode(posting.key8)
+            )));
+        }
+        prev = Some(posting.key8);
+        let key = u64::from_be_bytes(posting.key8);
+        if key < input.key8_lo || key > input.key8_hi {
+            return Err(invalid(format_args!(
+                "key8 {key:#018x} outside the slice [{:#018x}, {:#018x}]",
+                input.key8_lo, input.key8_hi
+            )));
+        }
+        if posting.values.is_empty() {
+            return Err(invalid(format_args!(
+                "key8 {key:#018x} has an empty posting"
+            )));
+        }
+        if posting.values.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(invalid(format_args!(
+                "key8 {key:#018x} has a posting that is not strictly ascending"
+            )));
+        }
+        if posting.values.first() == Some(&u64::MAX) {
+            return Err(invalid(format_args!(
+                "key8 {key:#018x} posting starts at u64::MAX, which a delta from -1 cannot encode"
+            )));
+        }
+        body = body.saturating_add(encoded_posting_len(posting));
+    }
+    if body > limits.max_body_bytes {
+        return Err(KeyIndexLeafEncodeError::BodyOverCeiling {
+            body,
+            ceiling: limits.max_body_bytes,
+        });
+    }
+    Ok(PreparedPostings {
+        postings,
+        uncovered,
+        body,
+    })
+}
+
+/// Encodes one posting leaf (entry kind 1) at
+/// [`KEY_INDEX_LEAF_FORMAT_VERSION_3`], choosing `bucket_bits` with
+/// [`choose_key_index_bucket_bits`]. The field must be one
+/// [`key_index_field_entry_kind`] gives as [`KeyIndexEntryKind::Posting`];
+/// any other is [`KeyIndexLeafEncodeError::InvalidInput`]. A body over
+/// `limits.max_body_bytes` is [`KeyIndexLeafEncodeError::BodyOverCeiling`]:
+/// split the postings with [`split_key_index_postings`]. No fold calls this
+/// yet.
+pub fn encode_key_index_posting_leaf(
+    input: &KeyIndexPostingLeafInput<'_>,
+    limits: &KeyIndexLeafLimits,
+) -> Result<EncodedKeyIndexLeaf, KeyIndexLeafEncodeError> {
+    let prepared = prepare_postings(input, limits)?;
+    let bucket_bits = choose_key_index_bucket_bits(prepared.body);
+    encode_prepared_postings(input, prepared, bucket_bits)
+}
+
+/// [`encode_key_index_posting_leaf`] at a fixed `bucket_bits` within the
+/// writer's bound, 1..=[`KEY_INDEX_LEAF_WRITER_MAX_BUCKET_BITS`]. Any other
+/// value is [`KeyIndexLeafEncodeError::BucketBitsOutOfRange`].
+pub fn encode_key_index_posting_leaf_with_bucket_bits(
+    input: &KeyIndexPostingLeafInput<'_>,
+    bucket_bits: u8,
+    limits: &KeyIndexLeafLimits,
+) -> Result<EncodedKeyIndexLeaf, KeyIndexLeafEncodeError> {
+    if !(KEY_INDEX_LEAF_MIN_BUCKET_BITS..=KEY_INDEX_LEAF_WRITER_MAX_BUCKET_BITS)
+        .contains(&bucket_bits)
+    {
+        return Err(KeyIndexLeafEncodeError::BucketBitsOutOfRange {
+            bucket_bits,
+            min: KEY_INDEX_LEAF_MIN_BUCKET_BITS,
+            max: KEY_INDEX_LEAF_WRITER_MAX_BUCKET_BITS,
+        });
+    }
+    let prepared = prepare_postings(input, limits)?;
+    encode_prepared_postings(input, prepared, bucket_bits)
+}
+
+fn encode_prepared_postings(
+    input: &KeyIndexPostingLeafInput<'_>,
+    prepared: PreparedPostings<'_>,
+    bucket_bits: u8,
+) -> Result<EncodedKeyIndexLeaf, KeyIndexLeafEncodeError> {
+    let bucket_count = 1usize << bucket_bits;
+    let mut raw: Vec<Vec<u8>> = vec![Vec::new(); bucket_count];
+    let mut counts = vec![0u32; bucket_count];
+    for posting in &prepared.postings {
+        let bucket = bucket_index(&posting.key8, bucket_bits).map_err(invalid)? as usize;
+        write_posting(&mut raw[bucket], posting);
+        counts[bucket] = counts[bucket]
+            .checked_add(1)
+            .ok_or_else(|| invalid("bucket posting count overflows u32"))?;
+    }
+    let header = KeyIndexLeafHeader {
+        format_version: KEY_INDEX_LEAF_FORMAT_VERSION_3,
+        tenant_hash: input.tenant_hash.0.to_vec(),
+        signal: signal_code(input.signal),
+        part_blake3: input.part_blake3.to_vec(),
+        field: input.field.to_string(),
+        key_type: u32::from(input.key_type.as_u8()),
+        key8_lo: input.key8_lo,
+        key8_hi: input.key8_hi,
+        bucket_bits: u32::from(bucket_bits),
+        entry_count: prepared.postings.len() as u64,
+        part_entry_count: input.part_entry_count,
+        uncovered_entry_ordinals: prepared.uncovered,
+        body_len: 0,
+        entry_kind: KeyIndexEntryKind::Posting.as_u32(),
+    };
+    assemble_leaf(header, &raw, &counts)
+}
+
+/// Why a leaf does not answer a lookup. Every variant leaves the part
+/// uncovered for the field: the reader scans it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum KeyIndexLeafRejection {
+    #[error("corrupted key-index leaf: {0}")]
+    Corrupted(String),
+    #[error("unsupported key-index leaf format_version {0}")]
+    UnsupportedVersion(u32),
+    /// The leaf indexes another part than the one HEAD resolved.
+    #[error("leaf binds part {actual}, HEAD names part {expected}")]
+    PartBindingMismatch { expected: String, actual: String },
+    /// The leaf is valid but indexes another field or key type, or another
+    /// key slice, than the lookup asked about.
+    #[error("leaf does not answer this lookup: {0}")]
+    RequestMismatch(String),
+    /// The header `entry_kind` is not the kind the leaf's field carries
+    /// ([`key_index_field_entry_kind`]), or not the kind the decoder called
+    /// on it reads. Both are the [`KeyIndexEntryKind::as_u32`] codes.
+    #[error("leaf header entry_kind is {actual}, expected {expected}")]
+    EntryKindMismatch { expected: u32, actual: u32 },
+    #[error("key-index leaf read failed: {0}")]
+    Read(String),
+}
+
+impl KeyIndexLeafRejection {
+    /// The header `format_version` when it is above every version `signal`
+    /// reads ([`key_index_leaf_version_is_newer`]): a leaf a newer build
+    /// wrote, including a version another signal reads (a v3 leaf met as logs,
+    /// whose read set is [1, 2]). A version within or below the signal's read
+    /// set, and every other rejection, is `None`.
+    pub fn newer_version(&self, signal: Signal) -> Option<u32> {
+        match self {
+            KeyIndexLeafRejection::UnsupportedVersion(version)
+                if key_index_leaf_version_is_newer(signal, *version) =>
+            {
+                Some(*version)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn corrupted(msg: impl std::fmt::Display) -> KeyIndexLeafRejection {
+    KeyIndexLeafRejection::Corrupted(msg.to_string())
+}
+
+/// A leaf whose header `tenant_hash` or `signal` differs from the request:
+/// a misplaced object, never an uncovered part.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("key-index leaf header {field} is {actual}, request expects {expected}")]
+pub struct KeyIndexLeafBreach {
+    pub field: &'static str,
+    pub expected: String,
+    pub actual: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum KeyIndexLeafError {
+    #[error(transparent)]
+    Breach(KeyIndexLeafBreach),
+    #[error(transparent)]
+    Rejected(KeyIndexLeafRejection),
+}
+
+impl From<KeyIndexLeafRejection> for KeyIndexLeafError {
+    fn from(rejection: KeyIndexLeafRejection) -> Self {
+        KeyIndexLeafError::Rejected(rejection)
+    }
+}
+
+/// What a lookup expects of the leaf, from the tenant, the signal prefix it
+/// reads under, and the part ref in the HEAD it resolved.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyIndexLeafRequest<'a> {
+    pub tenant_hash: TenantHash,
+    pub signal: Signal,
+    /// The covered part's `blake3` in the resolved HEAD.
+    pub part_blake3: &'a [u8],
+    /// The covered part's `entry_count` in the resolved HEAD.
+    pub part_entry_count: u64,
+    pub field: &'a str,
+    pub key_type: KeyType,
+}
+
+/// GET 1's range, `[0, prefix_len)` from the ref. A `prefix_len` of zero or
+/// greater than the ref's `size` is `Corrupted` before anything is read.
+pub fn key_index_leaf_prefix_range(
+    leaf_ref: &SnapshotKeyIndexLeafRef,
+) -> Result<Range<u64>, KeyIndexLeafRejection> {
+    let prefix_len = u64::from(leaf_ref.prefix_len);
+    if prefix_len == 0 || prefix_len > leaf_ref.size {
+        return Err(corrupted(format_args!(
+            "ref prefix_len {prefix_len} is zero or greater than the ref size {}",
+            leaf_ref.size
+        )));
+    }
+    Ok(0..prefix_len)
+}
+
+/// The header `format_version` of a leaf from its first bytes (GET 1's
+/// range is enough), after the magic and header crc check and nothing else.
+pub fn key_index_leaf_format_version(bytes: &[u8]) -> Result<u32, KeyIndexLeafRejection> {
+    Ok(decode_envelope(bytes)?.header.format_version)
+}
+
+fn le_u32(bytes: &[u8], at: usize) -> Result<u32, KeyIndexLeafRejection> {
+    bytes
+        .get(at..at + 4)
+        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+        .map(u32::from_le_bytes)
+        .ok_or_else(|| corrupted(format_args!("truncated before byte {}", at + 4)))
+}
+
+/// The CRC-verified header and the length fields around it, before any
+/// semantic check.
+struct Envelope {
+    header: KeyIndexLeafHeader,
+    header_len: u64,
+    prefix_len: u64,
+}
+
+fn decode_envelope(bytes: &[u8]) -> Result<Envelope, KeyIndexLeafRejection> {
+    if bytes.get(..4) != Some(&KEY_INDEX_LEAF_MAGIC[..]) {
+        return Err(corrupted("magic is not RKI1"));
+    }
+    let header_len = le_u32(bytes, 4)? as usize;
+    let prefix_len = le_u32(bytes, 8)?;
+    let header_end = 12usize
+        .checked_add(header_len)
+        .ok_or_else(|| corrupted("header_len overflows"))?;
+    let (Some(covered), Ok(stored_crc)) = (bytes.get(..header_end), le_u32(bytes, header_end))
+    else {
+        return Err(corrupted(format_args!(
+            "header_len {header_len} runs past the {} bytes read",
+            bytes.len()
+        )));
+    };
+    if crc32c::crc32c(covered) != stored_crc {
+        return Err(corrupted("header crc32c mismatch"));
+    }
+    let header = KeyIndexLeafHeader::decode(&bytes[12..header_end])
+        .map_err(|e| corrupted(format_args!("header protobuf: {e}")))?;
+    Ok(Envelope {
+        header,
+        header_len: header_len as u64,
+        prefix_len: u64::from(prefix_len),
+    })
+}
+
+/// A leaf's verified header and bucket directory: GET 1's result.
+#[derive(Debug, Clone)]
+pub struct KeyIndexLeafPrefix {
+    header: KeyIndexLeafHeader,
+    key_type: KeyType,
+    entry_kind: KeyIndexEntryKind,
+    bucket_bits: u8,
+    prefix_len: u64,
+    ends: Vec<u32>,
+}
+
+/// The one bucket a `key8` selects, and the absolute byte range of its
+/// frame: GET 2's range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyIndexBucketRange {
+    pub bucket: u32,
+    pub range: Range<u64>,
+}
+
+/// One part entry holding the probed key, and the blocks within it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyIndexMatch {
+    pub entry_ordinal: u64,
+    pub blocks: Vec<u32>,
+}
+
+fn validate_prefix(
+    envelope: Envelope,
+    bytes: &[u8],
+) -> Result<KeyIndexLeafPrefix, KeyIndexLeafRejection> {
+    let Envelope {
+        header,
+        header_len,
+        prefix_len,
+    } = envelope;
+    if !KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN.contains(&header.format_version) {
+        return Err(KeyIndexLeafRejection::UnsupportedVersion(
+            header.format_version,
+        ));
+    }
+    let entry_kind = KeyIndexEntryKind::from_u32(header.entry_kind)
+        .ok_or_else(|| corrupted(format_args!("unknown entry_kind {}", header.entry_kind)))?;
+    if entry_kind != KeyIndexEntryKind::Entry
+        && header.format_version < KEY_INDEX_LEAF_FORMAT_VERSION_3
+    {
+        return Err(corrupted(format_args!(
+            "entry_kind {} at format_version {}, which has only entry kind 0",
+            header.entry_kind, header.format_version
+        )));
+    }
+    let bucket_bits = u8::try_from(header.bucket_bits)
+        .ok()
+        .filter(|b| {
+            (KEY_INDEX_LEAF_MIN_BUCKET_BITS..=KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS).contains(b)
+        })
+        .ok_or_else(|| {
+            corrupted(format_args!(
+                "bucket_bits {} outside {KEY_INDEX_LEAF_MIN_BUCKET_BITS}..={KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS}",
+                header.bucket_bits
+            ))
+        })?;
+    let bucket_count = 1u64 << bucket_bits;
+    let expected_prefix = FIXED_PREFIX_LEN + header_len + 4 * bucket_count;
+    if prefix_len != expected_prefix {
+        return Err(corrupted(format_args!(
+            "header prefix_len {prefix_len} differs from the layout's {expected_prefix}"
+        )));
+    }
+    let Some(prefix) = bytes.get(..prefix_len as usize) else {
+        return Err(corrupted(format_args!(
+            "read {} bytes, shorter than the header prefix_len {prefix_len}",
+            bytes.len()
+        )));
+    };
+    let dir_start = (12 + header_len + 4) as usize;
+    let dir_end = prefix.len() - 4;
+    let dir = &prefix[dir_start..dir_end];
+    if crc32c::crc32c(dir) != le_u32(prefix, dir_end)? {
+        return Err(corrupted("directory crc32c mismatch"));
+    }
+    let ends: Vec<u32> = dir
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    if ends.windows(2).any(|w| w[0] > w[1]) {
+        return Err(corrupted("directory ends decrease"));
+    }
+    if ends.last().map(|&e| u64::from(e)) != Some(header.body_len) {
+        return Err(corrupted(format_args!(
+            "last directory end differs from body_len {}",
+            header.body_len
+        )));
+    }
+    let key_type = u8::try_from(header.key_type)
+        .ok()
+        .and_then(|b| KeyType::from_u8(b).ok())
+        .ok_or_else(|| corrupted(format_args!("unknown key_type {}", header.key_type)))?;
+    if header.tenant_hash.len() != 16 || header.part_blake3.len() != 32 {
+        return Err(corrupted("tenant_hash or part_blake3 has the wrong length"));
+    }
+    if header.field.is_empty() || header.field.len() > KEY_IDX_MAX_NAME_LEN {
+        return Err(corrupted("field name empty or too long"));
+    }
+    if header.key8_lo > header.key8_hi {
+        return Err(corrupted("key8_lo above key8_hi"));
+    }
+    let uncovered = &header.uncovered_entry_ordinals;
+    if uncovered.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(corrupted("uncovered_entry_ordinals not strictly ascending"));
+    }
+    if uncovered
+        .last()
+        .is_some_and(|&last| last >= header.part_entry_count)
+    {
+        return Err(corrupted(
+            "uncovered entry ordinal at or past part_entry_count",
+        ));
+    }
+    Ok(KeyIndexLeafPrefix {
+        header,
+        key_type,
+        entry_kind,
+        bucket_bits,
+        prefix_len,
+        ends,
+    })
+}
+
+fn check_ref_copy<T: PartialEq + std::fmt::Debug>(
+    name: &str,
+    in_ref: T,
+    in_header: T,
+) -> Result<(), KeyIndexLeafRejection> {
+    if in_ref == in_header {
+        Ok(())
+    } else {
+        Err(corrupted(format_args!(
+            "ref {name} {in_ref:?} disagrees with the header's {in_header:?}"
+        )))
+    }
+}
+
+impl KeyIndexLeafPrefix {
+    /// Verifies GET 1's bytes against the ref and the request, in the order
+    /// the reader procedure gives: magic and header crc; then the tenant
+    /// and signal binding ([`KeyIndexLeafError::Breach`]); then version
+    /// ([`key_index_leaf_version_accepted`] for the request's signal),
+    /// `entry_kind` (a known code, non-zero only at
+    /// [`KEY_INDEX_LEAF_FORMAT_VERSION_3`]), `bucket_bits`, the `prefix_len`
+    /// arithmetic, the directory crc and
+    /// ends; then every ref copy, the part binding, and the request's
+    /// field, key type and `part_entry_count`; then the header's
+    /// `entry_kind` against the field's
+    /// ([`KeyIndexLeafRejection::EntryKindMismatch`]).
+    pub fn parse(
+        bytes: &[u8],
+        leaf_ref: &SnapshotKeyIndexLeafRef,
+        request: &KeyIndexLeafRequest<'_>,
+    ) -> Result<Self, KeyIndexLeafError> {
+        let envelope = decode_envelope(bytes)?;
+        let header = &envelope.header;
+        let version_accepted =
+            key_index_leaf_version_accepted(request.signal, header.format_version);
+        if header.tenant_hash.as_slice() != request.tenant_hash.0.as_slice() {
+            return Err(KeyIndexLeafError::Breach(KeyIndexLeafBreach {
+                field: "tenant_hash",
+                expected: request.tenant_hash.to_hex(),
+                actual: hex::encode(&header.tenant_hash),
+            }));
+        }
+        let signal = signal_code(request.signal);
+        if header.signal != signal {
+            return Err(KeyIndexLeafError::Breach(KeyIndexLeafBreach {
+                field: "signal",
+                expected: signal.to_string(),
+                actual: header.signal.to_string(),
+            }));
+        }
+        if !version_accepted {
+            return Err(KeyIndexLeafRejection::UnsupportedVersion(header.format_version).into());
+        }
+        let prefix = validate_prefix(envelope, bytes)?;
+        let header = &prefix.header;
+        check_ref_copy(
+            "prefix_len",
+            u64::from(leaf_ref.prefix_len),
+            prefix.prefix_len,
+        )?;
+        check_ref_copy(
+            "size",
+            leaf_ref.size,
+            prefix.prefix_len.saturating_add(header.body_len),
+        )?;
+        check_ref_copy("field", &leaf_ref.field, &header.field)?;
+        check_ref_copy("key_type", leaf_ref.key_type, header.key_type)?;
+        check_ref_copy("key8_lo", leaf_ref.key8_lo, header.key8_lo)?;
+        check_ref_copy("key8_hi", leaf_ref.key8_hi, header.key8_hi)?;
+        check_ref_copy("bucket_bits", leaf_ref.bucket_bits, header.bucket_bits)?;
+        check_ref_copy("entry_count", leaf_ref.entry_count, header.entry_count)?;
+        check_ref_copy(
+            "uncovered_count",
+            leaf_ref.uncovered_count,
+            header.uncovered_entry_ordinals.len() as u64,
+        )?;
+        check_ref_copy("part_blake3", &leaf_ref.part_blake3, &header.part_blake3)?;
+        if header.part_blake3.as_slice() != request.part_blake3 {
+            return Err(KeyIndexLeafRejection::PartBindingMismatch {
+                expected: hex::encode(request.part_blake3),
+                actual: hex::encode(&header.part_blake3),
+            }
+            .into());
+        }
+        if header.part_entry_count != request.part_entry_count {
+            return Err(corrupted(format_args!(
+                "header part_entry_count {} differs from the part ref's entry_count {}",
+                header.part_entry_count, request.part_entry_count
+            ))
+            .into());
+        }
+        if header.field != request.field || prefix.key_type != request.key_type {
+            return Err(KeyIndexLeafRejection::RequestMismatch(format!(
+                "leaf indexes field {:?} as {:?}, lookup asks for {:?} as {:?}",
+                header.field, prefix.key_type, request.field, request.key_type
+            ))
+            .into());
+        }
+        prefix.check_field_entry_kind()?;
+        Ok(prefix)
+    }
+
+    /// The header's `entry_kind` against the kind its own signal and field
+    /// carry ([`key_index_field_entry_kind`]).
+    fn check_field_entry_kind(&self) -> Result<(), KeyIndexLeafRejection> {
+        let expected = expected_entry_kind(self.header.signal, &self.header.field);
+        if self.entry_kind != expected {
+            return Err(KeyIndexLeafRejection::EntryKindMismatch {
+                expected: expected.as_u32(),
+                actual: self.entry_kind.as_u32(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The decoder for `kind` refuses a leaf of any other kind.
+    fn require_entry_kind(&self, kind: KeyIndexEntryKind) -> Result<(), KeyIndexLeafRejection> {
+        if self.entry_kind != kind {
+            return Err(KeyIndexLeafRejection::EntryKindMismatch {
+                expected: kind.as_u32(),
+                actual: self.entry_kind.as_u32(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn header(&self) -> &KeyIndexLeafHeader {
+        &self.header
+    }
+
+    pub fn key_type(&self) -> KeyType {
+        self.key_type
+    }
+
+    /// The header's `entry_kind`, which [`Self::parse`] has checked against
+    /// the request's field.
+    pub fn entry_kind(&self) -> KeyIndexEntryKind {
+        self.entry_kind
+    }
+
+    /// The header's `bucket_bits`, the only value a bucket is selected by.
+    pub fn bucket_bits(&self) -> u8 {
+        self.bucket_bits
+    }
+
+    pub fn prefix_len(&self) -> u64 {
+        self.prefix_len
+    }
+
+    pub fn uncovered_entry_ordinals(&self) -> &[u64] {
+        &self.header.uncovered_entry_ordinals
+    }
+
+    fn bucket_body_range(&self, bucket: usize) -> Range<u64> {
+        let start = if bucket == 0 {
+            0
+        } else {
+            self.ends[bucket - 1]
+        };
+        u64::from(start)..u64::from(self.ends[bucket])
+    }
+
+    /// The bucket `key8` mixes to under the header's `bucket_bits`, and its
+    /// frame's absolute range; `None` when the bucket is empty, so the key
+    /// is absent without GET 2. A `key8` outside the leaf's slice is
+    /// [`KeyIndexLeafRejection::RequestMismatch`].
+    pub fn locate(
+        &self,
+        key8: &Key8,
+    ) -> Result<Option<KeyIndexBucketRange>, KeyIndexLeafRejection> {
+        let key = u64::from_be_bytes(*key8);
+        if key < self.header.key8_lo || key > self.header.key8_hi {
+            return Err(KeyIndexLeafRejection::RequestMismatch(format!(
+                "key8 {key:#018x} outside the leaf's slice [{:#018x}, {:#018x}]",
+                self.header.key8_lo, self.header.key8_hi
+            )));
+        }
+        let bucket = bucket_index(key8, self.bucket_bits).map_err(corrupted)?;
+        let body = self.bucket_body_range(bucket as usize);
+        if body.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(KeyIndexBucketRange {
+            bucket,
+            range: self.prefix_len + body.start..self.prefix_len + body.end,
+        }))
+    }
+
+    /// Verifies GET 2's frame in full and returns the entries holding
+    /// `key8`, ascending by entry ordinal.
+    pub fn probe_bucket(
+        &self,
+        located: &KeyIndexBucketRange,
+        frame: &[u8],
+        key8: &Key8,
+        limits: &KeyIndexLeafLimits,
+    ) -> Result<Vec<KeyIndexMatch>, KeyIndexLeafRejection> {
+        let expected = located.range.end - located.range.start;
+        if frame.len() as u64 != expected {
+            return Err(corrupted(format_args!(
+                "bucket {} read returned {} bytes, the directory gives {expected}",
+                located.bucket,
+                frame.len()
+            )));
+        }
+        let decoded = self.decode_frame(located.bucket, frame, limits)?;
+        let start = decoded.entries.partition_point(|e| e.key8 < *key8);
+        Ok(decoded.entries[start..]
+            .iter()
+            .take_while(|e| e.key8 == *key8)
+            .map(|e| KeyIndexMatch {
+                entry_ordinal: e.entry_ordinal,
+                blocks: e.blocks.clone(),
+            })
+            .collect())
+    }
+
+    /// A frame's 12-byte header, checked against everything that can be
+    /// checked before anything is allocated: a non-zero entry count, the
+    /// body ceiling, at most `uncompressed_len / 10` entries, and the crc.
+    /// Returns `(entry_count, uncompressed_len)`.
+    fn check_frame_header(
+        bucket: u32,
+        frame: &[u8],
+        limits: &KeyIndexLeafLimits,
+    ) -> Result<(u32, u32), KeyIndexLeafRejection> {
+        let entry_count = le_u32(frame, 0)?;
+        let uncompressed_len = le_u32(frame, 4)?;
+        let stored_crc = le_u32(frame, 8)?;
+        if entry_count == 0 {
+            return Err(corrupted(format_args!(
+                "bucket {bucket} frame declares zero entries"
+            )));
+        }
+        if u64::from(uncompressed_len) > limits.max_body_bytes {
+            return Err(corrupted(format_args!(
+                "bucket {bucket} declares {uncompressed_len} decompressed bytes, over the {}-byte ceiling",
+                limits.max_body_bytes
+            )));
+        }
+        if entry_count > uncompressed_len / MIN_FRAME_ENTRY_WIRE_BYTES {
+            return Err(corrupted(format_args!(
+                "bucket {bucket} declares {entry_count} entries in {uncompressed_len} bytes, \
+                 more than one per {MIN_FRAME_ENTRY_WIRE_BYTES} bytes"
+            )));
+        }
+        #[cfg(test)]
+        tests::FRAME_CRC_CHECKS.with(|n| n.set(n.get() + 1));
+        if crc32c::crc32c(&frame[FRAME_HEADER_LEN..]) != stored_crc {
+            return Err(corrupted(format_args!(
+                "bucket {bucket} frame crc32c mismatch"
+            )));
+        }
+        Ok((entry_count, uncompressed_len))
+    }
+
+    fn decode_frame(
+        &self,
+        bucket: u32,
+        frame: &[u8],
+        limits: &KeyIndexLeafLimits,
+    ) -> Result<DecodedFrame, KeyIndexLeafRejection> {
+        self.require_entry_kind(KeyIndexEntryKind::Entry)?;
+        let (entry_count, uncompressed_len) = Self::check_frame_header(bucket, frame, limits)?;
+        self.decode_checked_frame(bucket, frame, entry_count, uncompressed_len)
+    }
+
+    /// Decompresses a frame whose header passed
+    /// [`check_frame_header`](Self::check_frame_header).
+    fn decompress_frame(
+        bucket: u32,
+        frame: &[u8],
+        uncompressed_len: u32,
+    ) -> Result<Vec<u8>, KeyIndexLeafRejection> {
+        let compressed = &frame[FRAME_HEADER_LEN..];
+        #[cfg(test)]
+        tests::FRAME_DECOMPRESSIONS.with(|n| n.set(n.get() + 1));
+        let raw = zstd::bulk::decompress(compressed, uncompressed_len as usize)
+            .map_err(|e| corrupted(format_args!("bucket {bucket} zstd: {e}")))?;
+        if raw.len() != uncompressed_len as usize {
+            return Err(corrupted(format_args!(
+                "bucket {bucket} decompressed to {} bytes, frame declares {uncompressed_len}",
+                raw.len()
+            )));
+        }
+        Ok(raw)
+    }
+
+    /// Decodes a kind-0 frame [`check_frame_header`](Self::check_frame_header)
+    /// already passed, with the `(entry_count, uncompressed_len)` it
+    /// returned; the crc is not computed again.
+    fn decode_checked_frame(
+        &self,
+        bucket: u32,
+        frame: &[u8],
+        entry_count: u32,
+        uncompressed_len: u32,
+    ) -> Result<DecodedFrame, KeyIndexLeafRejection> {
+        self.require_entry_kind(KeyIndexEntryKind::Entry)?;
+        let raw = Self::decompress_frame(bucket, frame, uncompressed_len)?;
+        let mut entries = Vec::with_capacity(entry_count as usize);
+        let mut pos = 0usize;
+        let mut prev: Option<(Key8, u64)> = None;
+        for index in 0..entry_count {
+            let key8: Key8 = raw
+                .get(pos..pos + 8)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| corrupted(format_args!("bucket {bucket} entry truncated")))?;
+            pos += 8;
+            let entry_ordinal = read_uvarint(&raw, &mut pos)?;
+            let block_count = read_uvarint(&raw, &mut pos)?;
+            if block_count == 0 {
+                return Err(corrupted(format_args!(
+                    "bucket {bucket} entry has an empty block set"
+                )));
+            }
+            // Each later entry keeps its minimum wire bytes, so the blocks
+            // allocated so far stay within `decoded_bound` even when the
+            // claimed count is larger than what the frame really holds.
+            let later = u64::from(entry_count - 1 - index);
+            let room = ((raw.len() - pos) as u64)
+                .saturating_sub(later * u64::from(MIN_FRAME_ENTRY_WIRE_BYTES));
+            if block_count > room {
+                return Err(corrupted(format_args!(
+                    "bucket {bucket} block_count {block_count} exceeds the bytes left \
+                     with {later} entries still to come"
+                )));
+            }
+            let mut blocks = Vec::with_capacity(block_count as usize);
+            let mut last: Option<u32> = None;
+            for _ in 0..block_count {
+                let delta = read_uvarint(&raw, &mut pos)?;
+                let block = match (delta, last) {
+                    (0, _) => None,
+                    (d, None) => Some(d - 1),
+                    (d, Some(prev_block)) => u64::from(prev_block).checked_add(d),
+                }
+                .and_then(|b| u32::try_from(b).ok())
+                .ok_or_else(|| {
+                    corrupted(format_args!(
+                        "bucket {bucket} block delta {delta} is zero or overflows u32"
+                    ))
+                })?;
+                blocks.push(block);
+                last = Some(block);
+            }
+            let key = u64::from_be_bytes(key8);
+            if key < self.header.key8_lo || key > self.header.key8_hi {
+                return Err(corrupted(format_args!(
+                    "bucket {bucket} key8 {key:#018x} outside the leaf's slice"
+                )));
+            }
+            if bucket_index(&key8, self.bucket_bits).map_err(corrupted)? != bucket {
+                return Err(corrupted(format_args!(
+                    "key8 {key:#018x} does not mix to bucket {bucket}"
+                )));
+            }
+            if entry_ordinal >= self.header.part_entry_count {
+                return Err(corrupted(format_args!(
+                    "entry ordinal {entry_ordinal} at or past part_entry_count {}",
+                    self.header.part_entry_count
+                )));
+            }
+            let pair = (key8, entry_ordinal);
+            if prev.is_some_and(|p| p >= pair) {
+                return Err(corrupted(format_args!(
+                    "bucket {bucket} entries unsorted or duplicated"
+                )));
+            }
+            prev = Some(pair);
+            entries.push(KeyIndexLeafEntry {
+                key8,
+                entry_ordinal,
+                blocks,
+            });
+        }
+        if pos != raw.len() {
+            return Err(corrupted(format_args!(
+                "bucket {bucket} holds {} bytes past its {entry_count} entries",
+                raw.len() - pos
+            )));
+        }
+        Ok(DecodedFrame {
+            entries,
+            uncompressed_len,
+        })
+    }
+
+    /// Verifies GET 2's frame of a posting leaf (entry kind 1) in full and
+    /// returns `key8`'s posting, `None` when the bucket has none. A leaf of
+    /// entry kind 0 is [`KeyIndexLeafRejection::EntryKindMismatch`]. The
+    /// caller reserves [`posting_decoded_bound`] of the frame's
+    /// `uncompressed_len` if anything does.
+    pub fn probe_posting_bucket(
+        &self,
+        located: &KeyIndexBucketRange,
+        frame: &[u8],
+        key8: &Key8,
+        limits: &KeyIndexLeafLimits,
+    ) -> Result<Option<Vec<u64>>, KeyIndexLeafRejection> {
+        let expected = located.range.end - located.range.start;
+        if frame.len() as u64 != expected {
+            return Err(corrupted(format_args!(
+                "bucket {} read returned {} bytes, the directory gives {expected}",
+                located.bucket,
+                frame.len()
+            )));
+        }
+        let decoded = self.decode_posting_frame(located.bucket, frame, limits)?;
+        Ok(decoded
+            .postings
+            .binary_search_by(|p| p.key8.cmp(key8))
+            .ok()
+            .map(|i| decoded.postings[i].values.clone()))
+    }
+
+    fn decode_posting_frame(
+        &self,
+        bucket: u32,
+        frame: &[u8],
+        limits: &KeyIndexLeafLimits,
+    ) -> Result<DecodedPostingFrame, KeyIndexLeafRejection> {
+        self.require_entry_kind(KeyIndexEntryKind::Posting)?;
+        let (posting_count, uncompressed_len) = Self::check_frame_header(bucket, frame, limits)?;
+        self.decode_checked_posting_frame(bucket, frame, posting_count, uncompressed_len)
+    }
+
+    /// Decodes a kind-1 frame [`check_frame_header`](Self::check_frame_header)
+    /// already passed. Every count is checked against the bytes left before
+    /// its list is allocated, so the decode stays within
+    /// [`posting_decoded_bound`] whatever the frame claims.
+    fn decode_checked_posting_frame(
+        &self,
+        bucket: u32,
+        frame: &[u8],
+        posting_count: u32,
+        uncompressed_len: u32,
+    ) -> Result<DecodedPostingFrame, KeyIndexLeafRejection> {
+        self.require_entry_kind(KeyIndexEntryKind::Posting)?;
+        let raw = Self::decompress_frame(bucket, frame, uncompressed_len)?;
+        let mut postings = Vec::with_capacity(posting_count as usize);
+        let mut pos = 0usize;
+        let mut prev: Option<Key8> = None;
+        for index in 0..posting_count {
+            let key8: Key8 = raw
+                .get(pos..pos + 8)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| corrupted(format_args!("bucket {bucket} posting truncated")))?;
+            pos += 8;
+            let key = u64::from_be_bytes(key8);
+            let count = read_uvarint(&raw, &mut pos)?;
+            if count == 0 {
+                return Err(corrupted(format_args!(
+                    "bucket {bucket} key8 {key:#018x} has a zero-length posting"
+                )));
+            }
+            // One byte per delta, and the minimum wire bytes of every later
+            // posting, must still be there before the list is allocated.
+            let later = u64::from(posting_count - 1 - index);
+            let room = ((raw.len() - pos) as u64)
+                .saturating_sub(later * u64::from(MIN_FRAME_ENTRY_WIRE_BYTES));
+            if count > room {
+                return Err(corrupted(format_args!(
+                    "bucket {bucket} posting count {count} exceeds the bytes left \
+                     with {later} postings still to come"
+                )));
+            }
+            let mut values = allocate_posting_values(count as usize);
+            let mut last: Option<u64> = None;
+            for _ in 0..count {
+                let delta = read_uvarint(&raw, &mut pos)?;
+                let value = match (delta, last) {
+                    (0, _) => None,
+                    (d, None) => Some(d - 1),
+                    (d, Some(prev_value)) => prev_value.checked_add(d),
+                }
+                .ok_or_else(|| {
+                    corrupted(format_args!(
+                        "bucket {bucket} key8 {key:#018x} posting delta {delta} is zero or overflows u64"
+                    ))
+                })?;
+                values.push(value);
+                last = Some(value);
+            }
+            if key < self.header.key8_lo || key > self.header.key8_hi {
+                return Err(corrupted(format_args!(
+                    "bucket {bucket} key8 {key:#018x} outside the leaf's slice"
+                )));
+            }
+            if bucket_index(&key8, self.bucket_bits).map_err(corrupted)? != bucket {
+                return Err(corrupted(format_args!(
+                    "key8 {key:#018x} does not mix to bucket {bucket}"
+                )));
+            }
+            if prev.is_some_and(|p| p >= key8) {
+                return Err(corrupted(format_args!(
+                    "bucket {bucket} postings unsorted or repeated at key8 {key:#018x}"
+                )));
+            }
+            prev = Some(key8);
+            postings.push(KeyIndexPostingEntry { key8, values });
+        }
+        if pos != raw.len() {
+            return Err(corrupted(format_args!(
+                "bucket {bucket} holds {} bytes past its {posting_count} postings",
+                raw.len() - pos
+            )));
+        }
+        Ok(DecodedPostingFrame {
+            postings,
+            uncompressed_len,
+        })
+    }
+}
+
+/// A posting's value list at exactly `count`, the one allocation the kind-1
+/// decoder makes per posting; tests record each request.
+fn allocate_posting_values(count: usize) -> Vec<u64> {
+    #[cfg(test)]
+    tests::POSTING_ALLOCATIONS.with(|a| a.borrow_mut().push(count));
+    Vec::with_capacity(count)
+}
+
+struct DecodedFrame {
+    entries: Vec<KeyIndexLeafEntry>,
+    uncompressed_len: u32,
+}
+
+struct DecodedPostingFrame {
+    postings: Vec<KeyIndexPostingEntry>,
+    uncompressed_len: u32,
+}
+
+/// The answer one leaf gives for one key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyIndexLeafProbe {
+    /// The key is in these covered entries (ascending by ordinal) and in no
+    /// other covered entry. The uncovered entries are still candidates.
+    Matches {
+        matches: Vec<KeyIndexMatch>,
+        uncovered_entry_ordinals: Vec<u64>,
+    },
+    /// The key is in no covered entry. The uncovered entries are still
+    /// candidates.
+    Absent { uncovered_entry_ordinals: Vec<u64> },
+    /// The leaf does not answer: every entry of the part is a candidate.
+    Rejected(KeyIndexLeafRejection),
+}
+
+impl KeyIndexLeafProbe {
+    /// The entries the probe did not cover; `None` for a rejected leaf, which
+    /// covers no entry of the part.
+    pub fn uncovered_entry_ordinals(&self) -> Option<&[u64]> {
+        match self {
+            KeyIndexLeafProbe::Matches {
+                uncovered_entry_ordinals,
+                ..
+            }
+            | KeyIndexLeafProbe::Absent {
+                uncovered_entry_ordinals,
+            } => Some(uncovered_entry_ordinals),
+            KeyIndexLeafProbe::Rejected(_) => None,
+        }
+    }
+}
+
+/// The two-GET probe of one leaf for one `key8`, over a caller-supplied
+/// ranged byte source (`read(range)` returns those bytes of the leaf).
+/// A ref `prefix_len` of zero or past `size` rejects before any read; GET 1
+/// is `[0, prefix_len)`; GET 2 is the one bucket the header's
+/// `bucket_bits` selects, skipped when that bucket is empty. A tenant or
+/// signal mismatch is the only `Err`; every other failure is
+/// [`KeyIndexLeafProbe::Rejected`].
+pub async fn probe_key_index_leaf_ranged<F, Fut>(
+    leaf_ref: &SnapshotKeyIndexLeafRef,
+    request: &KeyIndexLeafRequest<'_>,
+    key8: &Key8,
+    limits: &KeyIndexLeafLimits,
+    mut read: F,
+) -> Result<KeyIndexLeafProbe, KeyIndexLeafBreach>
+where
+    F: FnMut(Range<u64>) -> Fut,
+    Fut: Future<Output = Result<Bytes, String>>,
+{
+    let get1 = match key_index_leaf_prefix_range(leaf_ref) {
+        Ok(range) => range,
+        Err(rejection) => return Ok(KeyIndexLeafProbe::Rejected(rejection)),
+    };
+    let prefix_bytes = match read(get1).await {
+        Ok(bytes) => bytes,
+        Err(e) => return Ok(KeyIndexLeafProbe::Rejected(KeyIndexLeafRejection::Read(e))),
+    };
+    let prefix = match KeyIndexLeafPrefix::parse(&prefix_bytes, leaf_ref, request) {
+        Ok(prefix) => prefix,
+        Err(KeyIndexLeafError::Breach(breach)) => return Err(breach),
+        Err(KeyIndexLeafError::Rejected(rejection)) => {
+            return Ok(KeyIndexLeafProbe::Rejected(rejection));
+        }
+    };
+    let uncovered_entry_ordinals = prefix.uncovered_entry_ordinals().to_vec();
+    let located = match prefix.locate(key8) {
+        Ok(Some(located)) => located,
+        Ok(None) => {
+            return Ok(KeyIndexLeafProbe::Absent {
+                uncovered_entry_ordinals,
+            });
+        }
+        Err(rejection) => return Ok(KeyIndexLeafProbe::Rejected(rejection)),
+    };
+    let frame = match read(located.range.clone()).await {
+        Ok(bytes) => bytes,
+        Err(e) => return Ok(KeyIndexLeafProbe::Rejected(KeyIndexLeafRejection::Read(e))),
+    };
+    Ok(match prefix.probe_bucket(&located, &frame, key8, limits) {
+        Ok(matches) if matches.is_empty() => KeyIndexLeafProbe::Absent {
+            uncovered_entry_ordinals,
+        },
+        Ok(matches) => KeyIndexLeafProbe::Matches {
+            matches,
+            uncovered_entry_ordinals,
+        },
+        Err(rejection) => KeyIndexLeafProbe::Rejected(rejection),
+    })
+}
+
+/// How a set probe reads a leaf's buckets (ADR-3692 decision 2): one GET per
+/// distinct non-empty bucket up to `b_run` of them, above that at most
+/// `b_run` bridged ranged GETs, taken only when their bytes total at most
+/// `max_bridged_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyIndexSetPolicy {
+    pub b_run: usize,
+    pub max_bridged_bytes: u64,
+}
+
+impl KeyIndexSetPolicy {
+    /// [`KEY_INDEX_SET_PROBE_MAX_RUNS`] runs and `part_entry_count x`
+    /// [`KEY_INDEX_T1_BYTES`] bridged bytes.
+    pub fn for_part(part_entry_count: u64) -> Self {
+        KeyIndexSetPolicy {
+            b_run: KEY_INDEX_SET_PROBE_MAX_RUNS,
+            max_bridged_bytes: part_entry_count.saturating_mul(KEY_INDEX_T1_BYTES),
+        }
+    }
+}
+
+/// One key's answer from a set probe, over the leaf's covered entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyIndexKeyAnswer {
+    /// The key is in these covered entries, ascending by ordinal, and in no
+    /// other covered entry.
+    Matches(Vec<KeyIndexMatch>),
+    /// The key is in no covered entry.
+    Absent,
+}
+
+/// Why a valid leaf was not read past its prefix, or not decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyIndexSetDecline {
+    /// More than `b_run` distinct buckets, and the bridged runs would read
+    /// more than the policy's `max_bridged_bytes`. Nothing past the prefix
+    /// was read.
+    OverBudget {
+        distinct_buckets: usize,
+        bridged_bytes: u64,
+    },
+    /// The memory handle refused a frame's [`decoded_bound`].
+    ReservationRefused { bytes: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyIndexSetAnswer {
+    /// `per_key[i]` answers `keys[i]`. The uncovered entries are still
+    /// candidates for every key.
+    Answered {
+        per_key: Vec<KeyIndexKeyAnswer>,
+        uncovered_entry_ordinals: Vec<u64>,
+    },
+    /// The leaf is valid but this probe does not answer from it: every entry
+    /// of the part is a candidate.
+    Declined(KeyIndexSetDecline),
+    /// The leaf does not answer: every entry of the part is a candidate.
+    Rejected(KeyIndexLeafRejection),
+}
+
+/// A set probe's answer and exactly what it cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyIndexSetProbe {
+    pub answer: KeyIndexSetAnswer,
+    /// `read` calls issued, the prefix included.
+    pub get_requests: u32,
+    /// Bytes those calls returned.
+    pub wire_bytes: u64,
+    /// Sum of the decoded frames' `uncompressed_len`.
+    pub decompressed_bytes: u64,
+    /// Distinct non-empty buckets the keys fall in; 0 when the prefix was
+    /// not parsed.
+    pub distinct_buckets: usize,
+    /// Bytes of the bucket GETs when they were bridged (gaps included), 0
+    /// when each bucket was read on its own.
+    pub bridged_bytes: u64,
+}
+
+/// Bridges the smallest gaps between `runs` (sorted, non-overlapping) until
+/// at most `max_runs` remain; ties bridge the earlier gap first. A copy of
+/// `ravel_query::fetcher::bound_runs`, which this crate cannot depend on.
+fn bound_runs(runs: Vec<(u64, u64)>, max_runs: usize) -> Vec<(u64, u64)> {
+    let max_runs = max_runs.max(1);
+    if runs.len() <= max_runs {
+        return runs;
+    }
+    let mut gaps: Vec<(u64, usize)> = runs
+        .windows(2)
+        .enumerate()
+        .map(|(i, pair)| (pair[1].0.saturating_sub(pair[0].1), i))
+        .collect();
+    gaps.sort_unstable();
+    let mut bridged = vec![false; gaps.len()];
+    for (_, i) in gaps.into_iter().take(runs.len() - max_runs) {
+        bridged[i] = true;
+    }
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(max_runs);
+    let mut bridge_previous = false;
+    for (run, bridge_next) in runs.into_iter().zip(bridged.into_iter().chain([false])) {
+        match out.last_mut() {
+            Some(last) if bridge_previous => last.1 = last.1.max(run.1),
+            _ => out.push(run),
+        }
+        bridge_previous = bridge_next;
+    }
+    out
+}
+
+/// The set probe of one leaf for `keys` (sorted, distinct, all in the leaf's
+/// slice) over a caller-supplied ranged byte source: GET 1 is the prefix,
+/// once; the directory then names each key's bucket, and the distinct
+/// non-empty buckets are read as [`KeyIndexSetPolicy`] says, at most
+/// [`LEAF_READ_CONCURRENCY`] at once. It is [`plan_key_index_leaf_set`],
+/// the allowance check, then [`read_key_index_set_runs`]. Before each
+/// frame is decoded, `reserve` is asked for its [`decoded_bound`]; the guard
+/// it returns is held until the probe returns, and `None` declines the leaf.
+/// A tenant or signal mismatch is the only `Err`. No production path calls
+/// this; the tier-2 router composes the same steps across a part's slices.
+///
+/// Each selected frame passes the whole frame header check, crc included,
+/// before its reservation is asked for, and is then decoded without a second
+/// crc pass: one crc per selected frame
+/// (`the_set_probe_checks_each_frames_crc_once`), a frame that fails its
+/// header or crc check is rejected before its own reservation is asked for or
+/// any of its bytes are decompressed
+/// (`a_corrupt_frame_body_is_rejected_by_the_set_probe`), and each
+/// reservation precedes its frame's decompression
+/// (`the_set_probe_reserves_each_frame_before_decoding_it`). The gap bytes
+/// between bridged buckets are read and discarded unchecked.
+pub async fn probe_key_index_leaf_set_ranged<F, Fut, R, G>(
+    leaf_ref: &SnapshotKeyIndexLeafRef,
+    request: &KeyIndexLeafRequest<'_>,
+    keys: &[Key8],
+    limits: &KeyIndexLeafLimits,
+    policy: &KeyIndexSetPolicy,
+    mut read: F,
+    reserve: R,
+) -> Result<KeyIndexSetProbe, KeyIndexLeafBreach>
+where
+    F: FnMut(Range<u64>) -> Fut,
+    Fut: Future<Output = Result<Bytes, String>>,
+    R: FnMut(u64) -> Option<G>,
+{
+    let mut probe = KeyIndexSetProbe {
+        answer: KeyIndexSetAnswer::Declined(KeyIndexSetDecline::OverBudget {
+            distinct_buckets: 0,
+            bridged_bytes: 0,
+        }),
+        get_requests: 0,
+        wire_bytes: 0,
+        decompressed_bytes: 0,
+        distinct_buckets: 0,
+        bridged_bytes: 0,
+    };
+    let reject = |mut probe: KeyIndexSetProbe, rejection| {
+        probe.answer = KeyIndexSetAnswer::Rejected(rejection);
+        Ok(probe)
+    };
+    if let Err(rejection) = check_set_keys(keys) {
+        return reject(probe, rejection);
+    }
+    let get1 = match key_index_leaf_prefix_range(leaf_ref) {
+        Ok(range) => range,
+        Err(rejection) => return reject(probe, rejection),
+    };
+    probe.get_requests += 1;
+    let prefix_bytes = match read(get1).await {
+        Ok(bytes) => bytes,
+        Err(e) => return reject(probe, KeyIndexLeafRejection::Read(e)),
+    };
+    probe.wire_bytes += prefix_bytes.len() as u64;
+    let plan = match plan_key_index_leaf_set(&prefix_bytes, leaf_ref, request, keys, policy.b_run) {
+        Ok(plan) => plan,
+        Err(KeyIndexLeafError::Breach(breach)) => return Err(breach),
+        Err(KeyIndexLeafError::Rejected(rejection)) => return reject(probe, rejection),
+    };
+    drop(prefix_bytes);
+    probe.distinct_buckets = plan.distinct_buckets();
+    probe.bridged_bytes = plan.bridged_bytes();
+    if plan.bridged_bytes() > policy.max_bridged_bytes {
+        probe.answer = KeyIndexSetAnswer::Declined(KeyIndexSetDecline::OverBudget {
+            distinct_buckets: probe.distinct_buckets,
+            bridged_bytes: probe.bridged_bytes,
+        });
+        return Ok(probe);
+    }
+    let runs = read_key_index_set_runs(&plan, limits, LEAF_READ_CONCURRENCY, read, reserve).await;
+    probe.get_requests += runs.get_requests;
+    probe.wire_bytes += runs.wire_bytes;
+    probe.decompressed_bytes = runs.decompressed_bytes;
+    probe.answer = runs.answer;
+    Ok(probe)
+}
+
+fn check_set_keys(keys: &[Key8]) -> Result<(), KeyIndexLeafRejection> {
+    if keys.is_empty() || keys.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(KeyIndexLeafRejection::RequestMismatch(
+            "set probe keys empty, unsorted or repeated".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The keys of a set probe that fall in one non-empty bucket.
+#[derive(Debug, Clone)]
+struct KeyIndexSetGroup {
+    bucket: u32,
+    range: Range<u64>,
+    /// Indexes into the plan's keys.
+    key_indexes: Vec<usize>,
+}
+
+/// The plan step of a set probe: what GET 1 says the bucket runs are, before
+/// any of them is read. Built by [`plan_key_index_leaf_set`]; read by
+/// [`read_key_index_set_runs`], or run by run through [`Self::decoder`].
+#[derive(Debug, Clone)]
+pub struct KeyIndexSetPlan {
+    prefix: KeyIndexLeafPrefix,
+    keys: Vec<Key8>,
+    /// Ascending by bucket, which is body order.
+    groups: Vec<KeyIndexSetGroup>,
+    /// Ascending and non-overlapping.
+    runs: Vec<Range<u64>>,
+    bridged_bytes: u64,
+}
+
+impl KeyIndexSetPlan {
+    /// The bucket runs to read, in body order: one per distinct non-empty
+    /// bucket up to `b_run` of them, above that at most `b_run` bridged
+    /// runs. Empty when every key falls in an empty bucket.
+    pub fn runs(&self) -> &[Range<u64>] {
+        &self.runs
+    }
+
+    /// Distinct non-empty buckets the keys fall in.
+    pub fn distinct_buckets(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Bytes of the runs when they were bridged (gaps included), 0 when each
+    /// bucket is read on its own. The caller checks it against its
+    /// allowance before reading any run.
+    pub fn bridged_bytes(&self) -> u64 {
+        self.bridged_bytes
+    }
+
+    /// A decoder that takes this plan's runs one at a time, in
+    /// [`runs`](Self::runs) order.
+    pub fn decoder<G>(&self) -> KeyIndexSetDecoder<'_, G> {
+        KeyIndexSetDecoder {
+            plan: self,
+            next_run: 0,
+            next_group: 0,
+            per_key: vec![KeyIndexKeyAnswer::Absent; self.keys.len()],
+            guards: Vec::new(),
+            decompressed_bytes: 0,
+        }
+    }
+
+    /// [`Self::decoder`] for a posting leaf (entry kind 1): a decoder that
+    /// takes this plan's runs one at a time, in [`runs`](Self::runs) order,
+    /// reserving [`posting_decoded_bound`] per frame.
+    pub fn posting_decoder<G>(&self) -> KeyIndexPostingSetDecoder<'_, G> {
+        KeyIndexPostingSetDecoder {
+            plan: self,
+            next_run: 0,
+            next_group: 0,
+            per_key: vec![None; self.keys.len()],
+            guards: Vec::new(),
+            decompressed_bytes: 0,
+        }
+    }
+
+    /// The entry kind of the planned leaf: which of [`Self::decoder`] and
+    /// [`Self::posting_decoder`] reads it.
+    pub fn entry_kind(&self) -> KeyIndexEntryKind {
+        self.prefix.entry_kind
+    }
+
+    /// Takes run `*next_run` from `bytes` and returns each of its groups
+    /// with its frame, advancing both cursors.
+    fn run_frames<'b>(
+        &self,
+        next_run: &mut usize,
+        next_group: &mut usize,
+        bytes: &'b [u8],
+    ) -> Result<Vec<(&KeyIndexSetGroup, &'b [u8])>, KeyIndexSetRunError> {
+        let Some(run) = self.runs.get(*next_run) else {
+            return Err(KeyIndexSetRunError::Rejected(
+                KeyIndexLeafRejection::RequestMismatch(format!(
+                    "set probe given run {} of {}",
+                    *next_run + 1,
+                    self.runs.len()
+                )),
+            ));
+        };
+        *next_run += 1;
+        let (run_start, run_end) = (run.start, run.end);
+        if bytes.len() as u64 != run_end - run_start {
+            return Err(KeyIndexSetRunError::Rejected(corrupted(format_args!(
+                "bucket read [{run_start}, {run_end}) returned {} bytes",
+                bytes.len()
+            ))));
+        }
+        let mut frames = Vec::new();
+        while let Some(group) = self
+            .groups
+            .get(*next_group)
+            .filter(|g| g.range.start < run_end)
+        {
+            *next_group += 1;
+            let start = (group.range.start - run_start) as usize;
+            let end = (group.range.end - run_start) as usize;
+            frames.push((group, &bytes[start..end]));
+        }
+        Ok(frames)
+    }
+}
+
+/// Parses GET 1's bytes (`prefix_bytes`, the leaf's
+/// [`key_index_leaf_prefix_range`]) and plans the bucket runs for `keys`
+/// (sorted, distinct, all in the leaf's slice), bridged down to `b_run`
+/// runs as [`KeyIndexSetPolicy`] says. It reads nothing and checks no
+/// allowance: [`KeyIndexSetPlan::bridged_bytes`] is the caller's to compare.
+pub fn plan_key_index_leaf_set(
+    prefix_bytes: &[u8],
+    leaf_ref: &SnapshotKeyIndexLeafRef,
+    request: &KeyIndexLeafRequest<'_>,
+    keys: &[Key8],
+    b_run: usize,
+) -> Result<KeyIndexSetPlan, KeyIndexLeafError> {
+    check_set_keys(keys)?;
+    let prefix = KeyIndexLeafPrefix::parse(prefix_bytes, leaf_ref, request)?;
+    // Bucket -> the indexes into `keys` that fall in it. A key in an empty
+    // bucket is absent and joins no group.
+    let mut groups: std::collections::BTreeMap<u32, (Range<u64>, Vec<usize>)> =
+        std::collections::BTreeMap::new();
+    for (i, key8) in keys.iter().enumerate() {
+        if let Some(located) = prefix.locate(key8)? {
+            groups
+                .entry(located.bucket)
+                .or_insert_with(|| (located.range, Vec::new()))
+                .1
+                .push(i);
+        }
+    }
+    let groups: Vec<KeyIndexSetGroup> = groups
+        .into_iter()
+        .map(|(bucket, (range, key_indexes))| KeyIndexSetGroup {
+            bucket,
+            range,
+            key_indexes,
+        })
+        .collect();
+    let bucket_ranges: Vec<(u64, u64)> = groups
+        .iter()
+        .map(|g| (g.range.start, g.range.end))
+        .collect();
+    let (runs, bridged_bytes) = if bucket_ranges.len() <= b_run {
+        (bucket_ranges, 0)
+    } else {
+        let runs = bound_runs(bucket_ranges, b_run);
+        let bridged_bytes = runs.iter().map(|(s, e)| e - s).sum();
+        (runs, bridged_bytes)
+    };
+    Ok(KeyIndexSetPlan {
+        prefix,
+        keys: keys.to_vec(),
+        groups,
+        runs: runs.into_iter().map(|(s, e)| s..e).collect(),
+        bridged_bytes,
+    })
+}
+
+/// Why a run did not decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyIndexSetRunError {
+    /// The run's bytes do not answer: wrong length, a bad frame, or a read
+    /// that failed.
+    Rejected(KeyIndexLeafRejection),
+    /// The memory handle refused a frame's [`decoded_bound`].
+    ReservationRefused { bytes: u64 },
+}
+
+impl From<KeyIndexSetRunError> for KeyIndexSetAnswer {
+    fn from(error: KeyIndexSetRunError) -> Self {
+        match error {
+            KeyIndexSetRunError::Rejected(rejection) => KeyIndexSetAnswer::Rejected(rejection),
+            KeyIndexSetRunError::ReservationRefused { bytes } => {
+                KeyIndexSetAnswer::Declined(KeyIndexSetDecline::ReservationRefused { bytes })
+            }
+        }
+    }
+}
+
+/// Decodes a [`KeyIndexSetPlan`]'s runs in body order, one
+/// [`decode_next_run`](Self::decode_next_run) per run. Each frame's
+/// reservation guard is held until the decoder is finished or dropped.
+pub struct KeyIndexSetDecoder<'p, G> {
+    plan: &'p KeyIndexSetPlan,
+    next_run: usize,
+    next_group: usize,
+    per_key: Vec<KeyIndexKeyAnswer>,
+    guards: Vec<G>,
+    decompressed_bytes: u64,
+}
+
+impl<G> KeyIndexSetDecoder<'_, G> {
+    /// Decodes the next run's frames from `bytes`, the read of
+    /// `plan.runs()[n]` for the n-th call. Before each frame is decoded,
+    /// `reserve` is asked for its [`decoded_bound`]; `None` refuses the run.
+    pub fn decode_next_run<R>(
+        &mut self,
+        bytes: &[u8],
+        limits: &KeyIndexLeafLimits,
+        reserve: &mut R,
+    ) -> Result<(), KeyIndexSetRunError>
+    where
+        R: FnMut(u64) -> Option<G>,
+    {
+        let plan = self.plan;
+        plan.prefix
+            .require_entry_kind(KeyIndexEntryKind::Entry)
+            .map_err(KeyIndexSetRunError::Rejected)?;
+        let frames = plan.run_frames(&mut self.next_run, &mut self.next_group, bytes)?;
+        for (group, frame) in frames {
+            let (entry_count, uncompressed_len) =
+                KeyIndexLeafPrefix::check_frame_header(group.bucket, frame, limits)
+                    .map_err(KeyIndexSetRunError::Rejected)?;
+            let declared = decoded_bound(uncompressed_len);
+            let guard = reserve(declared)
+                .ok_or(KeyIndexSetRunError::ReservationRefused { bytes: declared })?;
+            self.guards.push(guard);
+            let decoded = plan
+                .prefix
+                .decode_checked_frame(group.bucket, frame, entry_count, uncompressed_len)
+                .map_err(KeyIndexSetRunError::Rejected)?;
+            self.decompressed_bytes += u64::from(decoded.uncompressed_len);
+            for &i in &group.key_indexes {
+                let key8 = plan.keys[i];
+                let first = decoded.entries.partition_point(|e| e.key8 < key8);
+                let matches: Vec<KeyIndexMatch> = decoded.entries[first..]
+                    .iter()
+                    .take_while(|e| e.key8 == key8)
+                    .map(|e| KeyIndexMatch {
+                        entry_ordinal: e.entry_ordinal,
+                        blocks: e.blocks.clone(),
+                    })
+                    .collect();
+                if !matches.is_empty() {
+                    self.per_key[i] = KeyIndexKeyAnswer::Matches(matches);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Sum of the decoded frames' `uncompressed_len` so far.
+    pub fn decompressed_bytes(&self) -> u64 {
+        self.decompressed_bytes
+    }
+
+    /// Whether every run has been decoded.
+    pub fn is_done(&self) -> bool {
+        self.next_run == self.plan.runs.len()
+    }
+
+    /// The answer, releasing the reservation guards. A decoder with runs
+    /// left does not answer.
+    pub fn finish(self) -> KeyIndexSetAnswer {
+        if !self.is_done() {
+            return KeyIndexSetAnswer::Rejected(KeyIndexLeafRejection::RequestMismatch(format!(
+                "set probe finished after {} of {} runs",
+                self.next_run,
+                self.plan.runs.len()
+            )));
+        }
+        KeyIndexSetAnswer::Answered {
+            per_key: self.per_key,
+            uncovered_entry_ordinals: self.plan.prefix.uncovered_entry_ordinals().to_vec(),
+        }
+    }
+}
+
+/// A posting set probe's answer: [`KeyIndexSetAnswer`] for entry kind 1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyIndexPostingSetAnswer {
+    /// `per_key[i]` is `keys[i]`'s posting, `None` when the leaf has none.
+    /// The uncovered entries are still candidates for every key.
+    Answered {
+        per_key: Vec<Option<Vec<u64>>>,
+        uncovered_entry_ordinals: Vec<u64>,
+    },
+    /// The leaf is valid but this probe does not answer from it.
+    Declined(KeyIndexSetDecline),
+    /// The leaf does not answer.
+    Rejected(KeyIndexLeafRejection),
+}
+
+impl From<KeyIndexSetRunError> for KeyIndexPostingSetAnswer {
+    fn from(error: KeyIndexSetRunError) -> Self {
+        match error {
+            KeyIndexSetRunError::Rejected(rejection) => {
+                KeyIndexPostingSetAnswer::Rejected(rejection)
+            }
+            KeyIndexSetRunError::ReservationRefused { bytes } => {
+                KeyIndexPostingSetAnswer::Declined(KeyIndexSetDecline::ReservationRefused { bytes })
+            }
+        }
+    }
+}
+
+/// [`KeyIndexSetDecoder`] for a posting leaf (entry kind 1), from
+/// [`KeyIndexSetPlan::posting_decoder`]. No production path calls it yet.
+pub struct KeyIndexPostingSetDecoder<'p, G> {
+    plan: &'p KeyIndexSetPlan,
+    next_run: usize,
+    next_group: usize,
+    per_key: Vec<Option<Vec<u64>>>,
+    guards: Vec<G>,
+    decompressed_bytes: u64,
+}
+
+impl<G> KeyIndexPostingSetDecoder<'_, G> {
+    /// Decodes the next run's frames from `bytes`, the read of
+    /// `plan.runs()[n]` for the n-th call. Each frame passes its header and
+    /// crc check, then `reserve` is asked for its [`posting_decoded_bound`]
+    /// (`None` refuses the run), then it is decoded. A plan over a kind-0
+    /// leaf is [`KeyIndexLeafRejection::EntryKindMismatch`].
+    pub fn decode_next_run<R>(
+        &mut self,
+        bytes: &[u8],
+        limits: &KeyIndexLeafLimits,
+        reserve: &mut R,
+    ) -> Result<(), KeyIndexSetRunError>
+    where
+        R: FnMut(u64) -> Option<G>,
+    {
+        let plan = self.plan;
+        plan.prefix
+            .require_entry_kind(KeyIndexEntryKind::Posting)
+            .map_err(KeyIndexSetRunError::Rejected)?;
+        let frames = plan.run_frames(&mut self.next_run, &mut self.next_group, bytes)?;
+        for (group, frame) in frames {
+            let (posting_count, uncompressed_len) =
+                KeyIndexLeafPrefix::check_frame_header(group.bucket, frame, limits)
+                    .map_err(KeyIndexSetRunError::Rejected)?;
+            let declared = posting_decoded_bound(uncompressed_len);
+            let guard = reserve(declared)
+                .ok_or(KeyIndexSetRunError::ReservationRefused { bytes: declared })?;
+            self.guards.push(guard);
+            let decoded = plan
+                .prefix
+                .decode_checked_posting_frame(group.bucket, frame, posting_count, uncompressed_len)
+                .map_err(KeyIndexSetRunError::Rejected)?;
+            self.decompressed_bytes += u64::from(decoded.uncompressed_len);
+            for &i in &group.key_indexes {
+                let key8 = plan.keys[i];
+                if let Ok(at) = decoded.postings.binary_search_by(|p| p.key8.cmp(&key8)) {
+                    self.per_key[i] = Some(decoded.postings[at].values.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Sum of the decoded frames' `uncompressed_len` so far.
+    pub fn decompressed_bytes(&self) -> u64 {
+        self.decompressed_bytes
+    }
+
+    /// Whether every run has been decoded.
+    pub fn is_done(&self) -> bool {
+        self.next_run == self.plan.runs.len()
+    }
+
+    /// The answer, releasing the reservation guards. A decoder with runs
+    /// left does not answer.
+    pub fn finish(self) -> KeyIndexPostingSetAnswer {
+        if !self.is_done() {
+            return KeyIndexPostingSetAnswer::Rejected(KeyIndexLeafRejection::RequestMismatch(
+                format!(
+                    "set probe finished after {} of {} runs",
+                    self.next_run,
+                    self.plan.runs.len()
+                ),
+            ));
+        }
+        KeyIndexPostingSetAnswer::Answered {
+            per_key: self.per_key,
+            uncovered_entry_ordinals: self.plan.prefix.uncovered_entry_ordinals().to_vec(),
+        }
+    }
+}
+
+/// [`read_key_index_set_runs`]'s answer and what its reads cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyIndexSetRuns {
+    pub answer: KeyIndexSetAnswer,
+    /// `read` calls issued.
+    pub get_requests: u32,
+    /// Bytes the completed calls returned.
+    pub wire_bytes: u64,
+    /// Sum of the decoded frames' `uncompressed_len`.
+    pub decompressed_bytes: u64,
+}
+
+/// The runs step of a set probe: reads `plan`'s runs with at most
+/// `max_in_flight` reads in flight (0 counts as 1), calling `read` once per
+/// run in run order, and decodes them in body order as they arrive. The
+/// first run that fails, in run order, decides the answer, whatever order
+/// the reads complete in; runs after it are not decoded.
+///
+/// Memory: at most `max_in_flight` runs' bytes are held at once, in flight
+/// or completed and waiting their turn to decode, plus one
+/// [`decoded_bound`] guard per decoded frame, held until this returns. This
+/// does not reserve the wire bytes; `read` reserves them if anything does.
+/// No production path calls this: the tier-2 router reads and decodes its
+/// runs itself, through [`KeyIndexSetPlan::decoder`].
+pub async fn read_key_index_set_runs<F, Fut, R, G>(
+    plan: &KeyIndexSetPlan,
+    limits: &KeyIndexLeafLimits,
+    max_in_flight: usize,
+    mut read: F,
+    mut reserve: R,
+) -> KeyIndexSetRuns
+where
+    F: FnMut(Range<u64>) -> Fut,
+    Fut: Future<Output = Result<Bytes, String>>,
+    R: FnMut(u64) -> Option<G>,
+{
+    use futures::StreamExt;
+
+    let get_requests = AtomicU32::new(0);
+    let wire_bytes = AtomicU64::new(0);
+    let mut decoder = plan.decoder::<G>();
+    let mut failure = None;
+    {
+        let (issued, returned) = (&get_requests, &wire_bytes);
+        let mut reads = futures::stream::iter(plan.runs.iter().cloned())
+            .map(|range| {
+                issued.fetch_add(1, Ordering::Relaxed);
+                let read = read(range);
+                async move {
+                    let got = read.await;
+                    if let Ok(bytes) = &got {
+                        returned.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    }
+                    got
+                }
+            })
+            .buffered(max_in_flight.max(1));
+        while let Some(got) = reads.next().await {
+            let decoded = match got {
+                Ok(bytes) => decoder.decode_next_run(&bytes, limits, &mut reserve),
+                Err(e) => Err(KeyIndexSetRunError::Rejected(KeyIndexLeafRejection::Read(
+                    e,
+                ))),
+            };
+            if let Err(error) = decoded {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+    let decompressed_bytes = decoder.decompressed_bytes();
+    let answer = match failure {
+        Some(error) => error.into(),
+        None => decoder.finish(),
+    };
+    KeyIndexSetRuns {
+        answer,
+        get_requests: get_requests.into_inner(),
+        wire_bytes: wire_bytes.into_inner(),
+        decompressed_bytes,
+    }
+}
+
+impl Catalog {
+    /// [`probe_key_index_leaf_with`](Self::probe_key_index_leaf_with) over
+    /// this catalog's store, reading `leaf_ref.key`: the inspector's and the
+    /// tests' entry.
+    pub async fn probe_key_index_leaf(
+        &self,
+        leaf_ref: &SnapshotKeyIndexLeafRef,
+        request: &KeyIndexLeafRequest<'_>,
+        key8: &Key8,
+        limits: &KeyIndexLeafLimits,
+    ) -> Result<KeyIndexLeafProbe, CatalogError> {
+        let store = self.store();
+        let key = leaf_ref.key.as_str();
+        self.probe_key_index_leaf_with(leaf_ref, request, key8, limits, |range| async move {
+            store
+                .get(key, GetRange::Range(range.start, range.end))
+                .await
+                .map(|got| got.data)
+                .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    /// [`probe_key_index_leaf_ranged`] over the caller's ranged reader (the
+    /// query path's cached, phase-accounted read). A tenant or signal
+    /// mismatch counts in [`Catalog::isolation_breaches`] and is
+    /// [`CatalogError::FieldMismatch`], with no fallback.
+    pub async fn probe_key_index_leaf_with<F, Fut>(
+        &self,
+        leaf_ref: &SnapshotKeyIndexLeafRef,
+        request: &KeyIndexLeafRequest<'_>,
+        key8: &Key8,
+        limits: &KeyIndexLeafLimits,
+        read: F,
+    ) -> Result<KeyIndexLeafProbe, CatalogError>
+    where
+        F: FnMut(Range<u64>) -> Fut,
+        Fut: Future<Output = Result<Bytes, String>>,
+    {
+        probe_key_index_leaf_ranged(leaf_ref, request, key8, limits, read)
+            .await
+            .map_err(|breach| self.key_index_leaf_breach(leaf_ref, breach))
+    }
+
+    /// [`probe_key_index_leaf_set_ranged`] with
+    /// [`probe_key_index_leaf_with`](Self::probe_key_index_leaf_with)'s
+    /// breach handling. No production path calls this.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn probe_key_index_leaf_set_with<F, Fut, R, G>(
+        &self,
+        leaf_ref: &SnapshotKeyIndexLeafRef,
+        request: &KeyIndexLeafRequest<'_>,
+        keys: &[Key8],
+        limits: &KeyIndexLeafLimits,
+        read: F,
+        policy: &KeyIndexSetPolicy,
+        reserve: R,
+    ) -> Result<KeyIndexSetProbe, CatalogError>
+    where
+        F: FnMut(Range<u64>) -> Fut,
+        Fut: Future<Output = Result<Bytes, String>>,
+        R: FnMut(u64) -> Option<G>,
+    {
+        probe_key_index_leaf_set_ranged(leaf_ref, request, keys, limits, policy, read, reserve)
+            .await
+            .map_err(|breach| self.key_index_leaf_breach(leaf_ref, breach))
+    }
+
+    /// Counts `breach` in [`Catalog::isolation_breaches`] and returns it as
+    /// [`CatalogError::FieldMismatch`]: what a caller that parses a leaf
+    /// through [`plan_key_index_leaf_set`] does with a breach.
+    pub fn key_index_leaf_breach(
+        &self,
+        leaf_ref: &SnapshotKeyIndexLeafRef,
+        breach: KeyIndexLeafBreach,
+    ) -> CatalogError {
+        self.record_isolation_breach();
+        CatalogError::FieldMismatch {
+            key: leaf_ref.key.clone(),
+            field: breach.field,
+            expected: breach.expected,
+            actual: breach.actual,
+        }
+    }
+}
+
+fn check_slice_tiling(
+    mut slices: Vec<(u64, u64)>,
+    field: &str,
+) -> Result<(), KeyIndexLeafRejection> {
+    slices.sort_unstable();
+    let mut next_lo = Some(0u64);
+    for (lo, hi) in slices {
+        if Some(lo) != next_lo || lo > hi {
+            return Err(corrupted(format_args!(
+                "field {field:?} slices do not tile the key8 space at [{lo:#018x}, {hi:#018x}]"
+            )));
+        }
+        next_lo = hi.checked_add(1);
+    }
+    if next_lo.is_some() {
+        return Err(corrupted(format_args!(
+            "field {field:?} slices stop short of u64::MAX"
+        )));
+    }
+    Ok(())
+}
+
+/// Checks one part's refs for `field` (refs for other fields are ignored):
+/// their slices must tile `[0, u64::MAX]` with no gap or overlap, and agree
+/// on `key_type`, `uncovered_count` and `part_blake3`. Returns the ref whose
+/// slice holds `key8`, or `None` when the part has no leaf for the field
+/// (uncovered, not an error).
+pub fn select_key_index_slice<'a>(
+    refs: &'a [SnapshotKeyIndexLeafRef],
+    field: &str,
+    key8: &Key8,
+) -> Result<Option<&'a SnapshotKeyIndexLeafRef>, KeyIndexLeafRejection> {
+    let for_field: Vec<&SnapshotKeyIndexLeafRef> =
+        refs.iter().filter(|r| r.field == field).collect();
+    let Some(first) = for_field.first() else {
+        return Ok(None);
+    };
+    for r in &for_field {
+        if r.key_type != first.key_type
+            || r.uncovered_count != first.uncovered_count
+            || r.part_blake3 != first.part_blake3
+        {
+            return Err(corrupted(format_args!(
+                "field {field:?} slices disagree on key_type, uncovered_count or part_blake3"
+            )));
+        }
+    }
+    check_slice_tiling(
+        for_field.iter().map(|r| (r.key8_lo, r.key8_hi)).collect(),
+        field,
+    )?;
+    let key = u64::from_be_bytes(*key8);
+    Ok(for_field
+        .into_iter()
+        .find(|r| r.key8_lo <= key && key <= r.key8_hi))
+}
+
+/// A whole leaf, every frame verified: what `inspect kidx` reports.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyIndexLeafSummary {
+    pub header: KeyIndexLeafHeader,
+    pub key_type: KeyType,
+    /// The header's `entry_kind`.
+    pub entry_kind: KeyIndexEntryKind,
+    pub prefix_len: u32,
+    pub size: u64,
+    pub blake3: [u8; 32],
+    /// Entries (or postings) per bucket, empty buckets included.
+    pub bucket_entry_counts: Vec<u32>,
+    /// Sum of the frames' declared `uncompressed_len`.
+    pub body_uncompressed_len: u64,
+    /// Every entry of a kind-0 leaf, in bucket order and sorted within each
+    /// bucket; empty for a posting leaf.
+    pub entries: Vec<KeyIndexLeafEntry>,
+    /// Every posting of a kind-1 leaf, in bucket order and sorted within
+    /// each bucket; empty for a kind-0 leaf.
+    pub postings: Vec<KeyIndexPostingEntry>,
+}
+
+impl KeyIndexLeafSummary {
+    /// The ref this leaf's own header implies, with an empty `key`.
+    pub fn leaf_ref(&self) -> SnapshotKeyIndexLeafRef {
+        SnapshotKeyIndexLeafRef {
+            key: String::new(),
+            blake3: self.blake3.to_vec(),
+            size: self.size,
+            field: self.header.field.clone(),
+            key_type: self.header.key_type,
+            key8_lo: self.header.key8_lo,
+            key8_hi: self.header.key8_hi,
+            prefix_len: self.prefix_len,
+            bucket_bits: self.header.bucket_bits,
+            entry_count: self.header.entry_count,
+            uncovered_count: self.header.uncovered_entry_ordinals.len() as u64,
+            part_blake3: self.header.part_blake3.clone(),
+        }
+    }
+}
+
+/// Verifies a whole leaf without a request: every check the probe makes on
+/// its prefix and on a frame, applied to every frame, plus the checks only a
+/// whole-object reader can make: the object is exactly `prefix_len +
+/// body_len` bytes, the frames' entry counts sum to the header's
+/// `entry_count`, and their `uncompressed_len`s sum to at most the ceiling.
+/// The header's `entry_kind` must be the one its signal and field carry
+/// ([`key_index_field_entry_kind`]); the frames are decoded as that kind,
+/// into the summary's `entries` or `postings`.
+pub fn verify_key_index_leaf(
+    bytes: &[u8],
+    limits: &KeyIndexLeafLimits,
+) -> Result<KeyIndexLeafSummary, KeyIndexLeafRejection> {
+    let mut entries = Vec::new();
+    let mut postings = Vec::new();
+    let mut summary = verify_leaf_frames(bytes, limits, None, |frame| match frame {
+        VerifiedFrame::Entries(frame) => entries.extend(frame),
+        VerifiedFrame::Postings(frame) => postings.extend(frame),
+    })?;
+    summary.entries = entries;
+    summary.postings = postings;
+    Ok(summary)
+}
+
+/// [`verify_key_index_leaf`] that hands each frame's entries to `each`, in
+/// bucket order, instead of collecting them: the summary it returns has no
+/// `entries`, and at most one frame is decoded at a time. Every check is the
+/// same, so `each` may have seen frames of a leaf that is then rejected. A
+/// posting leaf (entry kind 1) is
+/// [`KeyIndexLeafRejection::EntryKindMismatch`] before any frame is read.
+pub fn verify_key_index_leaf_frames(
+    bytes: &[u8],
+    limits: &KeyIndexLeafLimits,
+    mut each: impl FnMut(Vec<KeyIndexLeafEntry>),
+) -> Result<KeyIndexLeafSummary, KeyIndexLeafRejection> {
+    verify_leaf_frames(bytes, limits, Some(KeyIndexEntryKind::Entry), |frame| {
+        if let VerifiedFrame::Entries(frame) = frame {
+            each(frame);
+        }
+    })
+}
+
+/// [`verify_key_index_leaf_frames`] for a posting leaf (entry kind 1): each
+/// frame's postings go to `each`, and a kind-0 leaf is
+/// [`KeyIndexLeafRejection::EntryKindMismatch`] before any frame is read.
+pub fn verify_key_index_posting_leaf_frames(
+    bytes: &[u8],
+    limits: &KeyIndexLeafLimits,
+    mut each: impl FnMut(Vec<KeyIndexPostingEntry>),
+) -> Result<KeyIndexLeafSummary, KeyIndexLeafRejection> {
+    verify_leaf_frames(bytes, limits, Some(KeyIndexEntryKind::Posting), |frame| {
+        if let VerifiedFrame::Postings(frame) = frame {
+            each(frame);
+        }
+    })
+}
+
+enum VerifiedFrame {
+    Entries(Vec<KeyIndexLeafEntry>),
+    Postings(Vec<KeyIndexPostingEntry>),
+}
+
+fn verify_leaf_frames(
+    bytes: &[u8],
+    limits: &KeyIndexLeafLimits,
+    kind: Option<KeyIndexEntryKind>,
+    mut each: impl FnMut(VerifiedFrame),
+) -> Result<KeyIndexLeafSummary, KeyIndexLeafRejection> {
+    let prefix = validate_prefix(decode_envelope(bytes)?, bytes)?;
+    prefix.check_field_entry_kind()?;
+    if let Some(kind) = kind {
+        prefix.require_entry_kind(kind)?;
+    }
+    let expected_size = prefix.prefix_len.saturating_add(prefix.header.body_len);
+    if bytes.len() as u64 != expected_size {
+        return Err(corrupted(format_args!(
+            "object is {} bytes, prefix_len + body_len is {expected_size}",
+            bytes.len()
+        )));
+    }
+    let mut bucket_entry_counts = Vec::with_capacity(prefix.ends.len());
+    let mut entry_count = 0u64;
+    let mut body_uncompressed_len = 0u64;
+    for bucket in 0..prefix.ends.len() {
+        let body = prefix.bucket_body_range(bucket);
+        if body.is_empty() {
+            bucket_entry_counts.push(0);
+            continue;
+        }
+        let frame = &bytes
+            [(prefix.prefix_len + body.start) as usize..(prefix.prefix_len + body.end) as usize];
+        let (count, uncompressed_len, verified) = match prefix.entry_kind {
+            KeyIndexEntryKind::Entry => {
+                let decoded = prefix.decode_frame(bucket as u32, frame, limits)?;
+                (
+                    decoded.entries.len(),
+                    decoded.uncompressed_len,
+                    VerifiedFrame::Entries(decoded.entries),
+                )
+            }
+            KeyIndexEntryKind::Posting => {
+                let decoded = prefix.decode_posting_frame(bucket as u32, frame, limits)?;
+                (
+                    decoded.postings.len(),
+                    decoded.uncompressed_len,
+                    VerifiedFrame::Postings(decoded.postings),
+                )
+            }
+        };
+        bucket_entry_counts.push(count as u32);
+        body_uncompressed_len += u64::from(uncompressed_len);
+        entry_count += count as u64;
+        each(verified);
+    }
+    if entry_count != prefix.header.entry_count {
+        return Err(corrupted(format_args!(
+            "frames hold {entry_count} entries, header entry_count is {}",
+            prefix.header.entry_count
+        )));
+    }
+    if body_uncompressed_len > limits.max_body_bytes {
+        return Err(corrupted(format_args!(
+            "frames decompress to {body_uncompressed_len} bytes, over the {}-byte ceiling",
+            limits.max_body_bytes
+        )));
+    }
+    Ok(KeyIndexLeafSummary {
+        key_type: prefix.key_type,
+        entry_kind: prefix.entry_kind,
+        prefix_len: prefix.prefix_len as u32,
+        size: bytes.len() as u64,
+        blake3: *blake3::hash(bytes).as_bytes(),
+        bucket_entry_counts,
+        body_uncompressed_len,
+        entries: Vec::new(),
+        postings: Vec::new(),
+        header: prefix.header,
+    })
+}
+
+/// Rewrites a verified leaf's header `format_version` to `format_version`,
+/// recomputing the header crc, the length fields and the ref; the directory
+/// and frames are kept byte for byte. It is for tests that need a leaf as an
+/// earlier writer left it: nothing in the fold or the rebuild calls it.
+#[doc(hidden)]
+pub fn restamp_key_index_leaf_version(
+    bytes: &[u8],
+    format_version: u32,
+) -> Result<EncodedKeyIndexLeaf, KeyIndexLeafRejection> {
+    let summary = verify_key_index_leaf(bytes, &KeyIndexLeafLimits::default())?;
+    let rest = &bytes[12 + header_len_of(bytes)? + 4..];
+    let mut header = summary.header;
+    header.format_version = format_version;
+    let header_bytes = header.encode_to_vec();
+    let header_len = u32::try_from(header_bytes.len())
+        .map_err(|_| corrupted("restamped header length does not fit u32"))?;
+    let dir_and_crc = &rest[..rest.len() - header.body_len as usize];
+    let prefix_len = u32::try_from(12 + header_bytes.len() + 4 + dir_and_crc.len())
+        .map_err(|_| corrupted("restamped prefix length does not fit u32"))?;
+    let mut out = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(&KEY_INDEX_LEAF_MAGIC);
+    out.extend_from_slice(&header_len.to_le_bytes());
+    out.extend_from_slice(&prefix_len.to_le_bytes());
+    out.extend_from_slice(&header_bytes);
+    let header_crc = crc32c::crc32c(&out);
+    out.extend_from_slice(&header_crc.to_le_bytes());
+    out.extend_from_slice(rest);
+    let leaf_ref = SnapshotKeyIndexLeafRef {
+        key: String::new(),
+        blake3: blake3::hash(&out).as_bytes().to_vec(),
+        size: out.len() as u64,
+        field: header.field.clone(),
+        key_type: header.key_type,
+        key8_lo: header.key8_lo,
+        key8_hi: header.key8_hi,
+        prefix_len,
+        bucket_bits: header.bucket_bits,
+        entry_count: header.entry_count,
+        uncovered_count: header.uncovered_entry_ordinals.len() as u64,
+        part_blake3: header.part_blake3.clone(),
+    };
+    Ok(EncodedKeyIndexLeaf {
+        bytes: out,
+        leaf_ref,
+    })
+}
+
+fn header_len_of(bytes: &[u8]) -> Result<usize, KeyIndexLeafRejection> {
+    Ok(le_u32(bytes, 4)? as usize)
+}
+
+/// Checks verified leaves that claim one (part, field) against each other:
+/// the same tenant, signal, part, field, key type, `part_entry_count` and
+/// `entry_kind`,
+/// the identical `uncovered_entry_ordinals` list, and slices that tile
+/// `[0, u64::MAX]`.
+pub fn check_key_index_leaf_set(
+    leaves: &[KeyIndexLeafSummary],
+) -> Result<(), KeyIndexLeafRejection> {
+    let Some(first) = leaves.first() else {
+        return Ok(());
+    };
+    let identity = |h: &KeyIndexLeafHeader| {
+        (
+            h.tenant_hash.clone(),
+            h.signal,
+            h.part_blake3.clone(),
+            h.field.clone(),
+            h.key_type,
+            h.part_entry_count,
+            h.entry_kind,
+        )
+    };
+    for leaf in leaves {
+        if identity(&leaf.header) != identity(&first.header) {
+            return Err(corrupted(
+                "leaves name different tenants, signals, parts, fields, key types, \
+                 part_entry_counts or entry kinds",
+            ));
+        }
+        if leaf.header.uncovered_entry_ordinals != first.header.uncovered_entry_ordinals {
+            return Err(corrupted(format_args!(
+                "field {:?} slices carry different uncovered_entry_ordinals",
+                first.header.field
+            )));
+        }
+    }
+    check_slice_tiling(
+        leaves
+            .iter()
+            .map(|l| (l.header.key8_lo, l.header.key8_hi))
+            .collect(),
+        &first.header.field,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests;

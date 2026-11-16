@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4f45117be233a64058a5a0f94b599446d6a382ba187da5359277cf9a4e72432d # shrinks to records = [LogRecord { stream_id: LogStreamId([77, 98, 239, 27, 114, 44, 58, 19, 94, 173, 33, 101, 99, 75, 180, 190]), stream_attrs: [1, 4, 104, 111, 115, 116, 1, 2, 112, 51, 5, 115, 99, 111, 112, 101, 0, 0], ts_ns: 0, observed_ts_ns: 0, severity_num: 0, severity_text: "", body: "", trace_id: None, span_id: None, flags: 0, attrs: [] }, LogRecord { stream_id: LogStreamId([77, 98, 239, 27, 114, 44, 58, 19, 94, 173, 33, 101, 99, 75, 180, 190]), stream_attrs: [1, 4, 104, 111, 115, 116, 1, 2, 112, 51, 5, 115, 99, 111, 112, 101, 0, 0], ts_ns: 0, observed_ts_ns: 0, severity_num: 1, severity_text: "", body: "", trace_id: None, span_id: None, flags: 1, attrs: [] }], shard_count = 1, dictionaries = false

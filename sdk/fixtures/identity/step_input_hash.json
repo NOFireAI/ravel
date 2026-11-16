@@ -1,0 +1,30 @@
+{
+  "canonical": "{\"Z\":true,\"a\":false,\"neg\":-3,\"none\":null,\"note\":\"Grüße\\n\\\"quoted\\\"\",\"price\":{\"cents\":649,\"currency\":\"EUR\"},\"qty\":2,\"ratio\":12.5,\"sku\":\"A-1\",\"tags\":[\"gift\",{\"a\":2,\"z\":1}],\"Ä\":1,\"😀\":\"astral\",\"～\":\"fullwidth tilde\"}",
+  "input": {
+    "Z": true,
+    "a": false,
+    "neg": -3,
+    "none": null,
+    "note": "Grüße\n\"quoted\"",
+    "price": {
+      "cents": 649,
+      "currency": "EUR"
+    },
+    "qty": 2,
+    "ratio": 12.5,
+    "sku": "A-1",
+    "tags": [
+      "gift",
+      {
+        "a": 2,
+        "z": 1
+      }
+    ],
+    "Ä": 1,
+    "～": "fullwidth tilde",
+    "😀": "astral"
+  },
+  "input_hash": "2fdf53a177fee7e3b89b0bfaf0b76d763004bb5918f4699d2914c54ce660fb2d",
+  "tool_name": "catalog.price",
+  "tool_version": "1"
+}

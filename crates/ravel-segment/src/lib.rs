@@ -1,0 +1,70 @@
+//! RSEG v5 segment format: writer and reader for metric segments.
+//!
+//! Implementer contract: docs/segment-format.md and ADR-0004. ADR-0027
+//! leaves v5 the only readable and writable version. All offsets, lengths,
+//! and counts from stored bytes are untrusted; bounds-check everything and
+//! verify crc32c on every section/page/footer touched.
+
+mod catalog_charge;
+mod crc;
+mod error;
+mod exemplars;
+mod format;
+mod gorilla;
+mod histogram;
+mod identity;
+mod reader;
+mod sparse;
+mod ts_delta;
+mod ts_gcd;
+mod value_codecs;
+mod varint;
+mod writer;
+
+pub use catalog_charge::{
+    CatalogCharge, PROVENANCE_COLUMN_BYTES_PER_SAMPLE, SAMPLE_PROVENANCE_BYTES, Uncharged,
+};
+pub use error::{SegmentError, WriteError};
+pub use exemplars::{
+    ExemplarInput, ExemplarRecord, decode_exemplars_section, probe_exemplars_by_series,
+};
+#[cfg(feature = "format-drill")]
+pub use format::VERSION_DRILL;
+pub use format::{
+    ReaderLimits, SUPPORTED_VERSIONS, SegmentVersion, SupportedVersions, TRAILER_LEN,
+    V5_SPARSE_THRESHOLD, V5_STRIDE, VERSION_V6, VERSION_V7,
+};
+
+pub use histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
+pub use identity::{ExpectedIdentity, check_identity};
+pub use reader::{
+    FooterLocation, FooterOutcome, PlannedRunRange, RunEntry, SampleProvenance, SeriesEntry,
+    SeriesEntryV4, TrailerClass, ValPageKind, ValueKind, classify_trailer,
+    decode_catalog_matching_v4, decode_catalog_matching_v4_charged, decode_catalog_v4,
+    decode_catalog_v4_charged, decode_run_histogram_pages, decode_run_pages_soa, decode_series_ids,
+    hist_page_heap_bound, open_from_full, open_from_suffix, page_payload_len, parse_footer,
+    plan_ranges_v4, validate_sections,
+};
+/// RSEG v5 catalog (docs/segment-format.md): `decode_catalog_v5` is the
+/// whole-catalog decode over the whole object (folding to the run-major
+/// `decode_catalog_v4` grammar below the sparse threshold).
+/// `decode_catalog_v5_chunked` decodes the chunked catalog from its four
+/// fetched catalog sections, and `decode_catalog_v5_chunked_matching` does the
+/// same for only the series holding every given `(name, value)` pair. The
+/// rest is the point-lookup sparse probe: parse SERIES_IDX, locate a crc-verified
+/// SERIES_IDS window, then a crc-verified meta chunk, then decode that
+/// series' runs.
+pub use sparse::{
+    ChunkLocation, IdWindow, SparseIdIndex, decode_catalog_v5, decode_catalog_v5_charged,
+    decode_catalog_v5_chunked, decode_catalog_v5_chunked_charged,
+    decode_catalog_v5_chunked_matching, decode_catalog_v5_chunked_matching_charged,
+    decode_chunk_runs, find_index_in_window, label_dict_holds_all, label_dict_strings,
+    parse_series_idx, verify_and_decompress_chunk_frame, verify_id_window,
+};
+pub use writer::{
+    CompactionMetaV4, HistogramSample, IngestBounds, RunInputV4, RunInputV7, RunValuePageV4,
+    SegmentIdentity, SegmentSummary, SegmentWriter, SeriesInput, SeriesInputV3, SeriesInputV4,
+    SeriesInputV7, SeriesValues, WrittenSegment, encode_run_v4,
+};
+
+pub use ravel_proto::segment::v1::Footer;

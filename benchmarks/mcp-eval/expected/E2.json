@@ -1,0 +1,16 @@
+{
+  "id": "E2",
+  "evidence_ref_served": false,
+  "answer_facts": [
+    {"fact": "20 checkout spans in the slow period", "pattern": "\\b20\\b"}
+  ],
+  "evidence": [
+    {"item": "the query text", "pattern": "select|spans"},
+    {"item": "the time range", "pattern": "start_ns|end_ns|time.?range|\\d{4}-\\d{2}-\\d{2}t\\d{2}:\\d{2}"},
+    {"item": "the snapshot id", "pattern": "@any_snapshot_id"},
+    {"item": "the cursor followed", "pattern": "cursor"}
+  ],
+  "tools_expected": ["ravel_query_sql"],
+  "call_bound": 4,
+  "fixture_refs": ["counts.slow_traces"]
+}

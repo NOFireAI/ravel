@@ -1,0 +1,683 @@
+#!/usr/bin/env bash
+# Cases for every_comparator_pins_an_image_digest.sh, focused on the fourth
+# category issue #1720 added: deploy/docker-compose/ravel.yml AND
+# deploy/docker-compose/rustfs.yml pin enforcement (rustfs.yml is ravel.yml's
+# standalone RustFS-and-bucket mirror and must stay pinned in lockstep), and
+# on the seventh: the s3s-fs binary's sha256 pin in deploy/metricsbench/run.sh.
+#
+# The script resolves every path it reads (Dockerfile, Dockerfile.prebuilt,
+# .github/workflows, .github/actions, deploy/metricsbench/docker-compose.yml
+# and its ravel.yml overlay, deploy/metricsbench/run.sh,
+# the two quickstart compose files, and deploy/k8s) from its own location, two
+# directories up. To exercise one category with a mutated file while the
+# other categories still see real, passing content, each case runs against a
+# scratch copy of that whole subtree, with only the file(s) under test
+# mutated per case.
+#
+# All four of deploy/k8s's registry images are pinned: three mirror the exact
+# digest ci.yml already pins for the same image, and curlimages/curl was
+# resolved from the registry. The committed tree passes every category, which
+# is what the cases below assert; each seeds its own bad input instead.
+#
+# No `sed -i`: GNU sed requires a bare `-i` (in-place, no backup) while BSD
+# sed (macOS) requires `-i ''` (a mandatory backup-suffix argument), and a
+# script written for one silently misbehaves or errors on the other. Every
+# mutation here instead runs sed without `-i`, writing to a fresh temp file,
+# then renames that file over the original -- POSIX `sed` and `mv` behave
+# identically on both userlands.
+#
+# Run: bash deploy/metricsbench/tests/every_comparator_pins_an_image_digest.test.sh
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+DEPLOY_DIR="$(cd "${HERE}/.." && pwd)"
+REPO_ROOT="$(cd "${DEPLOY_DIR}/../.." && pwd)"
+SCRIPT="${HERE}/every_comparator_pins_an_image_digest.sh"
+REFS="${HERE}/workflow_uses_refs.sh"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/pin-check-test.XXXXXX")"
+trap 'rm -rf "${TMP}"' EXIT
+
+fails=0
+passes=0
+
+# mutate <file> <sed-script>: portable substitute-in-place. Writes sed's
+# output to a fresh temp file and renames it over the original, rather than
+# relying on sed -i, whose flag syntax differs between GNU and BSD sed.
+mutate() {
+  local file="$1" script="$2" tmp
+  tmp="$(mktemp)"
+  sed "${script}" "${file}" >"${tmp}" && mv "${tmp}" "${file}"
+}
+
+# new_tree <name>: a scratch copy of the whole subtree the script reads, with
+# the script itself installed at the same relative path. Prints its root.
+new_tree() {
+  local dir="${TMP}/$1"
+  mkdir -p "${dir}/deploy/metricsbench/tests" "${dir}/deploy/docker-compose" \
+    "${dir}/deploy/k8s" "${dir}/.github/workflows" "${dir}/.github/actions"
+  cp "${REPO_ROOT}/Dockerfile" "${dir}/Dockerfile"
+  cp "${REPO_ROOT}/Dockerfile.prebuilt" "${dir}/Dockerfile.prebuilt"
+  cp -r "${REPO_ROOT}/.github/workflows/." "${dir}/.github/workflows/"
+  cp -r "${REPO_ROOT}/.github/actions/." "${dir}/.github/actions/"
+  cp "${REPO_ROOT}/deploy/metricsbench/docker-compose.yml" \
+    "${dir}/deploy/metricsbench/docker-compose.yml"
+  cp "${REPO_ROOT}/deploy/metricsbench/ravel.yml" \
+    "${dir}/deploy/metricsbench/ravel.yml"
+  cp "${REPO_ROOT}/deploy/metricsbench/run.sh" \
+    "${dir}/deploy/metricsbench/run.sh"
+  cp "${REPO_ROOT}/deploy/docker-compose/ravel.yml" \
+    "${dir}/deploy/docker-compose/ravel.yml"
+  cp "${REPO_ROOT}/deploy/docker-compose/rustfs.yml" \
+    "${dir}/deploy/docker-compose/rustfs.yml"
+  cp -r "${REPO_ROOT}/deploy/k8s/." "${dir}/deploy/k8s/"
+  cp "${SCRIPT}" \
+    "${dir}/deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh"
+  cp "${REFS}" "${dir}/deploy/metricsbench/tests/workflow_uses_refs.sh"
+  chmod +x "${dir}/deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh"
+  printf '%s\n' "${dir}"
+}
+
+# line_of <tree> <relative-compose-path> <fixed-substring>
+#
+# The line number the guard reports, resolved from the fixture rather than
+# hardcoded. These expectations used to carry literal line numbers, and any
+# edit ABOVE a pinned image in deploy/docker-compose/ravel.yml broke this
+# suite even though the guard was working: adding five lines for the S3
+# plaintext flag moved grafana from 159 to 164 and failed two cases here.
+# The line is still asserted, because "names the line" is the behaviour under
+# test; it is just no longer written down in two places that drift apart.
+line_of() {
+  local dir="$1" rel="$2" needle="$3"
+  grep -n -F -- "${needle}" "${dir}/${rel}" | head -1 | cut -d: -f1
+}
+
+# check <name> <tree> <want-exit> <want-substring-or-empty>
+check() {
+  local name="$1" dir="$2" want_rc="$3" want_sub="${4:-}"
+  local out rc=0
+  out="$(sh "${dir}/deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh" 2>&1)" || rc=$?
+  if [[ "${rc}" != "${want_rc}" ]]; then
+    printf 'FAIL  %s: exit %s, wanted %s\n' "${name}" "${rc}" "${want_rc}"
+    printf '%s\n' "${out}" | sed 's/^/      /'
+    fails=$((fails + 1))
+    return
+  fi
+  if [[ -n "${want_sub}" && "${out}" != *"${want_sub}"* ]]; then
+    printf 'FAIL  %s: output missing "%s"\n' "${name}" "${want_sub}"
+    printf '%s\n' "${out}" | sed 's/^/      /'
+    fails=$((fails + 1))
+    return
+  fi
+  printf 'ok    %s\n' "${name}"
+  passes=$((passes + 1))
+}
+
+# --- the committed files pass every category ---------------------------------
+
+# Every category passes on the committed tree. A suite whose baseline expects
+# the repository to be red cannot tell a fixed reference from a broken scan,
+# so each case below seeds its own bad input instead.
+d="$(new_tree committed)"
+check "the committed tree passes with all seven categories pinned" \
+  "${d}" 0 "RESULT: PASS"
+check "the committed tree reports both s3s-fs sha256 constants" \
+  "${d}" 0 "2 s3s-fs binary sha256s, all pinned"
+
+# --- the metricsbench Ravel overlay: exempt by exact match only -------------
+
+# The overlay's `${RAVEL_IMAGE:?...}` references are the only exemption; a
+# default tag in their place is a reference in the file and must be pinned.
+d="$(new_tree metricsbench-ravel-default-tag)"
+mutate "${d}/deploy/metricsbench/ravel.yml" \
+  '0,/image: \${RAVEL_IMAGE:?[^}]*}/s##image: ${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.26.0}#'
+check "a defaulted RAVEL_IMAGE in the metricsbench overlay is not exempt" \
+  "${d}" 1 "[UNPINNED] \${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.26.0}"
+check "a defaulted RAVEL_IMAGE raises the pin-required count" "${d}" 1 \
+  "found 6 pin-required compose image references, expected exactly 5"
+
+d="$(new_tree metricsbench-ravel-literal-tag)"
+mutate "${d}/deploy/metricsbench/ravel.yml" \
+  's#image: \${RAVEL_IMAGE:?[^}]*}#image: ghcr.io/nofireai/ravel-server:0.26.0#'
+check "a bare-tag literal in the metricsbench overlay fails the digest check" \
+  "${d}" 1 "2 compose image reference(s) lack an @sha256: digest"
+
+d="$(new_tree metricsbench-ravel-missing)"
+rm "${d}/deploy/metricsbench/ravel.yml"
+check "a missing metricsbench overlay fails naming the missing path" "${d}" 1 \
+  "compose file not found at ${d}/deploy/metricsbench/ravel.yml"
+
+d="$(new_tree metricsbench-ravel-no-server)"
+mutate "${d}/deploy/metricsbench/ravel.yml" 's#^  ravel-server:#  ravel-renamed:#'
+check "a metricsbench overlay without ravel-server fails the comparator check" \
+  "${d}" 1 "required comparator 'ravel-server' is missing"
+
+# --- a bare tag in ravel.yml fails naming the line --------------------------
+
+d="$(new_tree bare-tag-grafana)"
+mutate "${d}/deploy/docker-compose/ravel.yml" \
+  's#image: grafana/grafana:13\.2\.2@sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0#image: grafana/grafana:latest#'
+check "a bare tag on grafana in ravel.yml fails naming the unpinned reference" \
+  "${d}" 1 "ravel.yml:$(line_of "${d}" deploy/docker-compose/ravel.yml 'image: grafana/grafana:latest'): grafana/grafana:latest"
+
+d="$(new_tree bare-tag-rustfs-ravel)"
+mutate "${d}/deploy/docker-compose/ravel.yml" \
+  's#image: ghcr\.io/rustfs/rustfs:1\.0\.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff#image: ghcr.io/rustfs/rustfs:latest#'
+check "a bare tag on rustfs in ravel.yml fails naming the unpinned reference" \
+  "${d}" 1 "ravel.yml:$(line_of "${d}" deploy/docker-compose/ravel.yml 'image: ghcr.io/rustfs/rustfs:latest'): ghcr.io/rustfs/rustfs:latest"
+
+# --- a bare tag in rustfs.yml fails naming the line (issue #1720 fix round: -
+# --- the mirror previously diverged from ravel.yml's pin with nothing to   --
+# --- notice, because the guard never read it) -------------------------------
+
+d="$(new_tree bare-tag-rustfs-mirror)"
+mutate "${d}/deploy/docker-compose/rustfs.yml" \
+  's#image: ghcr\.io/rustfs/rustfs:1\.0\.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff#image: ghcr.io/rustfs/rustfs:latest#'
+check "a bare tag on rustfs in rustfs.yml fails naming the unpinned reference" \
+  "${d}" 1 "rustfs.yml:$(line_of "${d}" deploy/docker-compose/rustfs.yml 'image: ghcr.io/rustfs/rustfs:latest'): ghcr.io/rustfs/rustfs:latest"
+
+d="$(new_tree bare-tag-aws-cli-mirror)"
+mutate "${d}/deploy/docker-compose/rustfs.yml" \
+  's#image: public\.ecr\.aws/aws-cli/aws-cli:2\.37\.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed#image: public.ecr.aws/aws-cli/aws-cli:latest#'
+check "a bare tag on the AWS CLI in rustfs.yml fails naming the unpinned reference" \
+  "${d}" 1 "rustfs.yml:$(line_of "${d}" deploy/docker-compose/rustfs.yml 'image: public.ecr.aws/aws-cli/aws-cli:latest'): public.ecr.aws/aws-cli/aws-cli:latest"
+
+# A truncated digest must fail too: the regex requires exactly 64 hex chars,
+# not just the @sha256: substring.
+d="$(new_tree truncated-digest)"
+mutate "${d}/deploy/docker-compose/ravel.yml" \
+  's#image: grafana/grafana:13\.2\.2@sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0#image: grafana/grafana:13.2.2@sha256:ac461fb3#'
+check "a truncated digest on grafana in ravel.yml fails naming the unpinned reference" \
+  "${d}" 1 "ravel.yml:$(line_of "${d}" deploy/docker-compose/ravel.yml 'image: grafana/grafana:13.2.2@sha256:ac461fb3'): grafana/grafana:13.2.2@sha256:ac461fb3"
+
+# --- a wrong count fails, across both files ---------------------------------
+
+# Deleting the grafana image line from ravel.yml drops the combined total
+# from 8 to 7, and the pin-required count from 6 to 5: both must be caught.
+d="$(new_tree wrong-total-count)"
+mutate "${d}/deploy/docker-compose/ravel.yml" \
+  '/^    image: grafana\/grafana:13\.2\.2@sha256:/d'
+check "removing an image line fails the total-count assertion" "${d}" 1 \
+  "found 7 quickstart compose image references, expected exactly 8"
+check "removing an image line also fails the pin-required-count assertion" \
+  "${d}" 1 \
+  "found 5 pin-required quickstart compose image references, expected exactly 6"
+
+# Duplicating the grafana image line raises the combined total to 9.
+d="$(new_tree extra-image-line)"
+mutate "${d}/deploy/docker-compose/ravel.yml" \
+  '/^    image: grafana\/grafana:13\.2\.2@sha256:/{p;}'
+check "an extra image line fails the total-count assertion" "${d}" 1 \
+  "found 9 quickstart compose image references, expected exactly 8"
+
+# Removing an image line from rustfs.yml must be caught the same way: the
+# guard has to count across both quickstart files, not just ravel.yml.
+d="$(new_tree wrong-count-rustfs)"
+mutate "${d}/deploy/docker-compose/rustfs.yml" \
+  '/^    image: public\.ecr\.aws\/aws-cli\/aws-cli:/d'
+check "removing an image line from rustfs.yml fails the total-count assertion" \
+  "${d}" 1 "found 7 quickstart compose image references, expected exactly 8"
+
+# A missing rustfs.yml must fail outright (missing file) and also drop the
+# combined count, not silently scan ravel.yml alone.
+d="$(new_tree missing-rustfs-file)"
+rm "${d}/deploy/docker-compose/rustfs.yml"
+check "a missing rustfs.yml fails naming the missing path" "${d}" 1 \
+  "quickstart compose file not found at"
+check "a missing rustfs.yml also fails the total-count assertion" "${d}" 1 \
+  "found 6 quickstart compose image references, expected exactly 8"
+
+# --- fifth category: docker run/pull/create image pins in workflow run: ----
+# --- blocks (issue #1338) ---------------------------------------------------
+
+# A bare-tag image on a docker run fails naming the unpinned reference. This
+# is the acceptance test for issue #1338.
+d="$(new_tree docker-run-image-with-tag-only-fails)"
+mutate "${d}/.github/workflows/ci.yml" \
+  's#ghcr\.io/rustfs/rustfs:1\.0\.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff#ghcr.io/rustfs/rustfs:latest#'
+check "docker_run_image_with_tag_only_fails" "${d}" 1 \
+  "ghcr.io/rustfs/rustfs:latest"
+
+# The three shell-variable image references this static scan cannot resolve
+# ("$RAVEL_SERVER_IMAGE"/"$RAVEL_OPERATOR_IMAGE" in ci.yml and k8s-nightly.yml,
+# "$ref" in publish-images.yml) are exempt by exact string, not flagged
+# unpinned, and carry no digest on any of them without affecting the result:
+# The committed tree passes, so these assert exit 0 and check that the refs
+# appear under the exempt marker rather than as findings.
+d="$(new_tree docker-run-variable-ref-is-exempt)"
+check "docker_run_variable_ref_is_exempt: RAVEL_SERVER_IMAGE ref in ci.yml is not unpinned" \
+  "${d}" 0 '"$RAVEL_SERVER_IMAGE"'
+check "docker_run_variable_ref_is_exempt: exempt marker is used, not [UNPINNED]" \
+  "${d}" 0 '[variable ref, exempt]'
+
+# A docker run whose image argument sits on a backslash-continued line, not
+# the same physical line as "docker run", is still found: the scanner joins
+# continuation lines before matching. Mutating the digest on the
+# continuation line (dr-rehearsal.yml's RustFS start spans lines
+# 142-146, with the image on line 146) must be caught and reported at the
+# invocation's start line, proving the join actually ran rather than the
+# image happening to be on the same line as "docker run".
+d="$(new_tree docker-run-with-line-continuation-is-scanned)"
+mutate "${d}/.github/workflows/dr-rehearsal.yml" \
+  's#ghcr\.io/rustfs/rustfs:1\.0\.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff#ghcr.io/rustfs/rustfs:latest#'
+check "docker_run_with_line_continuation_is_scanned" "${d}" 1 \
+  "dr-rehearsal.yml:142: ghcr.io/rustfs/rustfs:latest"
+
+# Removing one docker-run invocation must fail the exact-count assertion,
+# not silently scan fewer references.
+d="$(new_tree docker-run-wrong-count)"
+mutate "${d}/.github/workflows/dr-rehearsal.yml" \
+  '/^          docker run -d --name rustfs \\$/,/^            ghcr\.io\/rustfs\/rustfs:1\.0\.0@sha256:/d'
+check "removing a docker run line fails the docker-run-image count assertion" \
+  "${d}" 1 "found 12 docker run/pull/create image references, expected exactly 13"
+
+# A second invocation on the same logical line is scanned too. Chaining with
+# && is ordinary shell, and a scanner that stops at the first `docker` on the
+# line lets the second image through with the reference count unchanged, so
+# the count assertion cannot catch it either.
+d="$(new_tree docker-run-second-invocation-on-one-line)"
+mutate "${d}/.github/workflows/k8s-nightly.yml" \
+  's#^      - name: Install sccache#      - name: Chained docker invocations\n        run: docker pull alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000 \&\& docker run busybox:latest echo hi\n      - name: Install sccache#'
+check "docker_run_second_invocation_on_one_line_is_scanned" "${d}" 1 \
+  "busybox:latest"
+
+# A global flag between `docker` and its subcommand must not hide the
+# invocation.
+d="$(new_tree docker-run-global-flag-before-subcommand)"
+mutate "${d}/.github/workflows/k8s-nightly.yml" \
+  's#^      - name: Install sccache#      - name: Global flag before the subcommand\n        run: docker --context ci run nginx:latest\n      - name: Install sccache#'
+check "docker_run_global_flag_before_subcommand_is_scanned" "${d}" 1 \
+  "nginx:latest"
+
+# Docker's management-command spellings are matched: `docker image pull X`
+# and `docker container run X` are the same invocations with a subcommand
+# group in front, and a scanner that misses them extracts nothing, so the
+# count assertion cannot notice either.
+d="$(new_tree docker-management-command-spelling)"
+mutate "${d}/.github/workflows/k8s-nightly.yml" \
+  's#^      - name: Install sccache#      - name: Management command spellings\n        run: docker image pull nginx:latest\n      - name: Install sccache#'
+check "docker_management_command_spelling_is_scanned" "${d}" 1 \
+  "nginx:latest"
+
+# A composite action under .github/actions is scanned too. Category 3 already
+# covers that directory for `uses:` refs, and the actions here do run docker.
+d="$(new_tree docker-run-in-composite-action)"
+mutate "${d}/.github/actions/free-disk-space/action.yml" \
+  's#^      run: |#      run: |\n        docker run redis:latest true#'
+check "docker_run_in_a_composite_action_is_scanned" "${d}" 1 \
+  "redis:latest"
+
+# --- third category: the two uses: extractions must agree (issue #4099) ----
+
+# workflow_uses_refs.sh runs on fixture roots holding only .github, so each
+# case controls exactly which references exist.
+PIN_A="actions/checkout@0123456789abcdef0123456789abcdef01234567"
+PIN_B="actions/cache@89abcdef0123456789abcdef0123456789abcdef"
+
+# fixture <name>: an empty root with the two directories the helper scans.
+fixture() {
+  local dir="${TMP}/refs-$1"
+  mkdir -p "${dir}/.github/workflows" "${dir}/.github/actions"
+  printf '%s\n' "${dir}"
+}
+
+# check_refs <name> <root> <want-exit> <want-substring-or-empty>
+check_refs() {
+  local name="$1" dir="$2" want_rc="$3" want_sub="${4:-}"
+  local out rc=0
+  out="$(sh "${REFS}" "${dir}" "${dir}/refs.out" 2>&1)" || rc=$?
+  if [[ "${rc}" != "${want_rc}" ]]; then
+    printf 'FAIL  %s: exit %s, wanted %s\n' "${name}" "${rc}" "${want_rc}"
+    printf '%s\n' "${out}" | sed 's/^/      /'
+    fails=$((fails + 1))
+    return
+  fi
+  if [[ -n "${want_sub}" && "${out}" != *"${want_sub}"* ]]; then
+    printf 'FAIL  %s: output missing "%s"\n' "${name}" "${want_sub}"
+    printf '%s\n' "${out}" | sed 's/^/      /'
+    fails=$((fails + 1))
+    return
+  fi
+  printf 'ok    %s\n' "${name}"
+  passes=$((passes + 1))
+}
+
+# Matching extractions pass, and the count printed is both readers'. The
+# fixture holds every shape the YAML reader must take: a named step, a
+# no-name `- uses:` step, a job-level reusable workflow, the same reference
+# twice, a local action both readers skip, and a composite action's
+# runs.steps.
+# FLIP: a YAML reader that skips jobs.<job>.uses, or runs.steps in a
+# composite action, or collapses the repeated reference, disagrees with the
+# grep here and fails this case.
+d="$(fixture matching)"
+cat >"${d}/.github/workflows/ci.yml" <<EOF
+name: ci
+on: {push: {branches: [main]}}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: ${PIN_A} # v4
+      - uses: ${PIN_A}
+      - uses: ./.github/actions/local
+      - name: Build
+        run: |
+          echo "uses: is only text here" # not a key
+  call:
+    uses: octo/repo/.github/workflows/w.yml@0123456789abcdef0123456789abcdef01234567
+EOF
+mkdir -p "${d}/.github/actions/cached"
+cat >"${d}/.github/actions/cached/action.yml" <<EOF
+name: cached
+runs:
+  using: composite
+  steps:
+    - uses: '${PIN_B}'
+EOF
+check_refs "matching uses: extractions pass" "${d}" 0 \
+  "external action references: 4 by line grep, 4 by YAML structure"
+
+# A step written as a flow mapping is a real `uses:` the line grep cannot
+# see. FLIP: a cross-check whose second side is derived from the grep's own
+# lines (or the old hand-pinned count, which nothing re-derives) passes this
+# fixture; only an independent structural read names the missed reference.
+d="$(fixture grep-misses-flow-mapping)"
+cat >"${d}/.github/workflows/ci.yml" <<EOF
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ${PIN_A}
+      - {name: Cache, uses: ${PIN_B}}
+EOF
+check_refs "a flow-mapping uses: the grep misses fails" "${d}" 1 \
+  "only the YAML structure found (the line grep missed them):
+    .github/workflows/ci.yml: ${PIN_B}"
+
+# The same miss with a quoted key, at a deeper indentation than any other
+# step. FLIP: a structural reader that matches only the literal text
+# `uses:` at the steps' column passes this fixture, as the grep does.
+d="$(fixture grep-misses-quoted-key)"
+cat >"${d}/.github/workflows/ci.yml" <<EOF
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ${PIN_A}
+      -   name: Cache
+          "uses": ${PIN_B}
+EOF
+check_refs "a quoted uses: key the grep misses fails" "${d}" 1 \
+  ".github/workflows/ci.yml: ${PIN_B}"
+
+# A `uses:` line inside a run: block scalar is text, not a step, so only the
+# grep finds it. It repeats a reference a real step already carries, so the
+# two readers' reference SETS are equal and only the multiset differs.
+# FLIP: a one-directional check (every YAML reference is in the grep's
+# list), or a set comparison, passes this fixture; it must fail.
+d="$(fixture only-grep-finds)"
+cat >"${d}/.github/workflows/ci.yml" <<EOF
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ${PIN_A}
+      - name: Notes
+        run: |
+          uses: ${PIN_A}
+EOF
+check_refs "a uses: line only the grep finds fails" "${d}" 1 \
+  "only the line grep found (not a jobs/steps uses: in the YAML):
+    .github/workflows/ci.yml: ${PIN_A}"
+
+# One reference only the grep finds and a different one only the YAML finds:
+# both readers count two. FLIP: comparing counts instead of references
+# passes this fixture; it must fail, naming both.
+d="$(fixture equal-counts-different-refs)"
+cat >"${d}/.github/workflows/ci.yml" <<EOF
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ${PIN_A}
+      - {uses: ${PIN_B}}
+      - run: |
+          uses: actions/setup-node@0123456789abcdef0123456789abcdef01234567
+EOF
+check_refs "equal counts with different references fail" "${d}" 1 \
+  "    .github/workflows/ci.yml: actions/setup-node@0123456789abcdef0123456789abcdef01234567"
+check_refs "equal counts with different references name the YAML-only one" \
+  "${d}" 1 "    .github/workflows/ci.yml: ${PIN_B}"
+
+# Zero references on both sides: the readers agree, and must still fail.
+# FLIP: treating two empty extractions as agreement (the refusal dropped
+# with the hand-pinned count) passes this fixture.
+d="$(fixture zero-references)"
+cat >"${d}/.github/workflows/ci.yml" <<'EOF'
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/local
+      - run: echo no external action
+EOF
+check_refs "zero uses: references fail" "${d}" 1 \
+  "neither reader found a workflow action reference"
+
+# A construct outside the subset the structural reader takes is refused,
+# not guessed at. FLIP: a reader that skips what it cannot parse would find
+# nothing under the anchor and still agree with the grep on the other file.
+d="$(fixture unreadable-anchor)"
+cat >"${d}/.github/workflows/ci.yml" <<EOF
+name: ci
+on: push
+jobs:
+  build: &base
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ${PIN_A}
+EOF
+check_refs "a YAML anchor is refused, not skipped" "${d}" 2 \
+  "could not read .github/workflows/ci.yml"
+
+# A run: script is block scalar text, so a `---` line (a heredoc writing a
+# second manifest) or a tab-indented line inside it is not structure. FLIP: a
+# reader that refuses those lines before it knows they are scalar content
+# exits 2 here.
+d="$(fixture block-scalar-separator-and-tab)"
+printf '%s\n' \
+  'name: ci' \
+  'on: push' \
+  'jobs:' \
+  '  build:' \
+  '    runs-on: ubuntu-latest' \
+  '    steps:' \
+  "      - uses: ${PIN_A}" \
+  '      - name: Manifests' \
+  '        run: |' \
+  '          cat <<YAML' \
+  '          kind: A' \
+  '          ---' \
+  '          kind: B' \
+  '          YAML' \
+  "          	echo tab-indented" \
+  >"${d}/.github/workflows/ci.yml"
+check_refs "a --- or tab line inside a run: block is read as text" "${d}" 0 \
+  "external action references: 1 by line grep, 1 by YAML structure"
+
+# The same two lines read as structure are still refused. FLIP: a reader
+# that dropped the refusals to fix the case above passes these.
+d="$(fixture second-document)"
+printf '%s\n' 'name: ci' 'on: push' 'jobs:' '  build:' \
+  '    runs-on: ubuntu-latest' '    steps:' "      - uses: ${PIN_A}" '---' \
+  'name: other' >"${d}/.github/workflows/ci.yml"
+check_refs "a second YAML document is refused" "${d}" 2 \
+  "more than one document or a directive"
+d="$(fixture tab-structure)"
+printf '%s\n' 'name: ci' 'on: push' 'jobs:' '  build:' \
+  '    runs-on: ubuntu-latest' '    steps:' "	- uses: ${PIN_A}" \
+  >"${d}/.github/workflows/ci.yml"
+check_refs "a tab-indented structural line is refused" "${d}" 2 \
+  "tab indentation"
+
+# A quoted local action is skipped by both readers. FLIP: a grep side that
+# tests `./` before removing the quotes lists it as external and the counts
+# disagree.
+d="$(fixture quoted-local-action)"
+cat >"${d}/.github/workflows/ci.yml" <<EOF
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ${PIN_A}
+      - uses: './.github/actions/local'
+      - uses: "./.github/actions/other"
+EOF
+check_refs "a quoted local action is skipped by both readers" "${d}" 0 \
+  "external action references: 1 by line grep, 1 by YAML structure"
+
+# replace_first <file> <ere> <text>: replaces the first match of ERE on any
+# line with TEXT (awk -v turns \n into a newline). awk because `0,/re/` is a
+# GNU-only sed address.
+replace_first() {
+  local file="$1" re="$2" text="$3" tmp
+  tmp="$(mktemp)"
+  awk -v re="${re}" -v text="${text}" \
+    '!done && match($0, re) { $0 = substr($0, 1, RSTART - 1) text substr($0, RSTART + RLENGTH); done = 1 } { print }' \
+    "${file}" >"${tmp}" && mv "${tmp}" "${file}"
+}
+
+# Through the full check: a flow-mapping step added to a real workflow fails
+# the run, and an unpinned reference still fails the pin check.
+d="$(new_tree workflow-flow-mapping-step)"
+replace_first "${d}/.github/workflows/k8s-nightly.yml" \
+  '^      - name: Install sccache' \
+  "      - {name: Flow step, uses: ${PIN_B}}\n      - name: Install sccache"
+check "a flow-mapping uses: in a real workflow fails the full check" "${d}" 1 \
+  "references only the YAML structure found"
+
+d="$(new_tree workflow-unpinned-action)"
+hex40="$(printf '[0-9a-f]%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+  21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40)"
+replace_first "${d}/.github/workflows/k8s-nightly.yml" \
+  "actions/checkout@${hex40}" 'actions/checkout@v4'
+check "an action pinned by tag still fails the pin check" "${d}" 1 \
+  "1 workflow action reference(s) lack a full 40-character commit SHA"
+
+# --- sixth category: deploy/k8s manifest image pins (issue #1720 residual) --
+
+# A bare-tag image on a k8s manifest fails naming the unpinned reference.
+# This is the acceptance test for the sixth category: against the scanner as
+# it stood before this round (no k8s category at all), this mutation would
+# have gone entirely unnoticed.
+d="$(new_tree k8s_manifest_image_without_digest_fails)"
+mutate "${d}/deploy/k8s/rustfs.yaml" \
+  's#image: ghcr\.io/rustfs/rustfs:1\.0\.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff#image: ghcr.io/rustfs/rustfs:latest#'
+check "k8s_manifest_image_without_digest_fails" "${d}" 1 \
+  "rustfs.yaml:51: ghcr.io/rustfs/rustfs:latest"
+
+# The two kind-loaded local tags (built and `kind load docker-image`d rather
+# than pulled from a registry) are exempt by exact string, not flagged
+# unpinned, on the unmutated committed tree. Against the scanner as it stood
+# before this round, none of these substrings appeared anywhere in the
+# output, since deploy/k8s was not scanned at all.
+d="$(new_tree kind_local_tag_is_exempt)"
+check "kind_local_tag_is_exempt: ravel-server:latest in ravelcluster-dev.yaml is not unpinned" \
+  "${d}" 0 "examples/ravelcluster-dev.yaml:15: ravel-server:latest"
+check "kind_local_tag_is_exempt: ravel-operator:latest in operator.yaml is not unpinned" \
+  "${d}" 0 "operator/operator.yaml:58: ravel-operator:latest"
+check "kind_local_tag_is_exempt: exempt marker is used, not [UNPINNED]" \
+  "${d}" 0 "[kind-local, exempt]"
+
+# Removing a k8s manifest image line must fail both the total-count and the
+# pin-required-count assertions, not silently scan fewer references. Deleting
+# rustfs.yaml's (pin-required) RustFS image line drops the total from 7 to 6
+# and the pin-required count from 4 to 3.
+d="$(new_tree k8s-wrong-count)"
+mutate "${d}/deploy/k8s/rustfs.yaml" \
+  '/^          image: ghcr\.io\/rustfs\/rustfs:/d'
+check "removing a k8s manifest image line fails the k8s total-count assertion" \
+  "${d}" 1 "found 6 k8s manifest image references, expected exactly 7"
+check "removing a k8s manifest image line also fails the k8s pin-required-count assertion" \
+  "${d}" 1 "found 3 pin-required k8s manifest image references, expected exactly 4"
+
+# --- seventh category: the s3s-fs binary's sha256 pin in run.sh -------------
+
+# The download's comparison removed: fetch_s3s_fs would cache and export
+# whatever the release URL served.
+d="$(new_tree s3s_download_comparison_removed)"
+mutate "${d}/deploy/metricsbench/run.sh" \
+  '/sha256_of "\$tmp"/,$ s/if \[ "\$got" != "\$s3s_fs_sha256" \]; then/if false; then/'
+check "s3s_download_comparison_removed fails the comparison check" "${d}" 1 \
+  "fetch_s3s_fs lacks its two sha256 comparisons, each exiting 65"
+
+# The cached binary's comparison removed: any file in the cache would run.
+d="$(new_tree s3s_cache_comparison_removed)"
+mutate "${d}/deploy/metricsbench/run.sh" \
+  '/sha256_of "\$bin"/,/curl / s/if \[ "\$got" != "\$s3s_fs_sha256" \]; then/if false; then/'
+check "s3s_cache_comparison_removed fails the comparison check" "${d}" 1 \
+  "fetch_s3s_fs lacks its two sha256 comparisons, each exiting 65"
+
+# A mismatch that no longer refuses: the comparison is there but only warns.
+d="$(new_tree s3s_mismatch_not_refused)"
+mutate "${d}/deploy/metricsbench/run.sh" \
+  '/sha256_of "\$tmp"/,$ s/exit "\$EXIT_REFUSED"/true/'
+check "s3s_mismatch_not_refused fails the comparison check" "${d}" 1 \
+  "fetch_s3s_fs lacks its two sha256 comparisons, each exiting 65"
+
+# The verified download exported before its comparison.
+d="$(new_tree s3s_export_before_compare)"
+mutate "${d}/deploy/metricsbench/run.sh" \
+  's/^    got="\$(sha256_of "\$tmp")" || {/    export S3S_FS_BIN="$tmp"; got="$(sha256_of "$tmp")" || {/'
+check "s3s_export_before_compare fails the export check" "${d}" 1 \
+  "run.sh sets S3S_FS_BIN somewhere other than the placeholder"
+
+# A second download path beside the checked one.
+d="$(new_tree s3s_second_download)"
+mutate "${d}/deploy/metricsbench/run.sh" \
+  's/^  export S3S_FS_BIN="\$bin"$/  curl -fsSL -o "$bin" "$url"; export S3S_FS_BIN="$bin"/'
+check "s3s_second_download fails the single-download check" "${d}" 1 \
+  "fetch_s3s_fs downloads other than once"
+
+# A changed constant is not the pinned one. The pattern takes whatever four
+# characters the pin starts with, so re-pinning cannot turn this into a no-op.
+d="$(new_tree s3s_constant_changed)"
+mutate "${d}/deploy/metricsbench/run.sh" \
+  's/^S3S_FS_SHA256_AARCH64="[0-9a-f]\{4\}/S3S_FS_SHA256_AARCH64="zzzz/'
+check "s3s_constant_changed fails naming the pin" "${d}" 1 \
+  "found 1 s3s-fs sha256 constants, expected exactly 2"
+
+# Both arches mapped to one constant.
+d="$(new_tree s3s_arch_mapped_wrong)"
+mutate "${d}/deploy/metricsbench/run.sh" \
+  's/aarch64) s3s_fs_sha256="\$S3S_FS_SHA256_AARCH64" ;;/aarch64) s3s_fs_sha256="$S3S_FS_SHA256_X86_64" ;;/'
+check "s3s_arch_mapped_wrong fails the arch mapping check" "${d}" 1 \
+  "run.sh does not map the arch to its pinned sha256 exactly once"
+
+# A compose default would start some other binary when run.sh is bypassed.
+d="$(new_tree s3s_compose_default)"
+mutate "${d}/deploy/metricsbench/docker-compose.yml" \
+  's/\${S3S_FS_BIN:?[^}]*}/${S3S_FS_BIN:-.\/s3s-fs}/'
+check "s3s_compose_default fails the compose mount check" "${d}" 1 \
+  "docker-compose.yml must take the s3s-fs binary from exactly one"
+
+# run.sh missing entirely.
+d="$(new_tree s3s_run_sh_missing)"
+rm "${d}/deploy/metricsbench/run.sh"
+check "s3s_run_sh_missing fails naming the path" "${d}" 1 "run.sh not found at"
+
+printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
+[[ "${fails}" -eq 0 ]]

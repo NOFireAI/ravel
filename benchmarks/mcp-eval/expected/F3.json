@@ -1,0 +1,16 @@
+{
+  "id": "F3",
+  "answer_facts": [
+    {"fact": "classified as refused by budget", "pattern": "budget"},
+    {"fact": "the typed failure is named", "pattern": "budget_exceeded|budget_estimate_exceeds_ceiling"},
+    {"fact": "not reported as zero spans", "pattern": "not (zero|0|empty)|no count|could not count|refused"}
+  ],
+  "evidence": [
+    {"item": "the store-request ceiling", "pattern": "max_store_requests|store request"}
+  ],
+  "expected_empty_class": "refused_by_budget",
+  "expected_failure_classes": ["budget_exceeded", "budget_estimate_exceeds_ceiling"],
+  "tools_expected": ["ravel_explain_query", "ravel_query_sql"],
+  "call_bound": 3,
+  "fixture_refs": ["counts.spans"]
+}

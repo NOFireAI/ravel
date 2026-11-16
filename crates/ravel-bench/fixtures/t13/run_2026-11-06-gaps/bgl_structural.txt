@@ -1,0 +1,101 @@
+structural_fetch stamp git=b515bb8e1a37b1339b65d6dfc93c39cf025e7d1b arch=arm64 nproc=15 mem_total_kib=0 corpus=BGL.log sha256=666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2 bytes=743185031 profile=release
+structural_fetch cpu_clock CLOCK_THREAD_CPUTIME_ID of the report thread; the measurement runs on a current-thread tokio runtime, so every decode the production fetcher does lands on that thread
+structural_fetch params block_records=8192 coalesce_gap=1887437 group_blocks=32 latency_ms=30 matched_rows=10 max_concurrent_gets=16 max_lines=2000000 mini_block_bytes=8192 mini_block_meta_bytes=4 object_max_bytes=11534336 object_min_bytes=10485760 runs=5 seed=13 trace_run_rows=4 zstd_level=3
+structural_fetch bgl_structural blocks=70 predict=64 band=[52, 80] IN
+structural_fetch bgl_structural gap_1m/ratio/bytes=0.8878631494340903 predict=0.51 band=[0.05, 1] IN
+structural_fetch bgl_structural gap_1m/ratio/gets=1 predict=3 band=[1, 6.5] IN
+structural_fetch bgl_structural gap_1m/ratio/wall=0.5032831437309405 predict=0.5 band=[0.3, 0.9] IN
+structural_fetch bgl_structural gap_1m/structural/bytes=10025669 predict=5800000 band=[550000, 11000000] IN
+structural_fetch bgl_structural gap_1m/structural/data_ranges=1 predict=5 band=[1, 12] IN
+structural_fetch bgl_structural gap_1m/structural/decode_cpu_ms=7.523761267173379 predict=7.3 band=[2.5, 20] IN
+structural_fetch bgl_structural gap_1m/structural/gets=2 predict=6 band=[2, 13] IN
+structural_fetch bgl_structural gap_1m/structural/wall_ms=71.68547026717339 predict=70 band=[58, 120] IN
+structural_fetch bgl_structural gap_1m/today/bytes=11291908 predict=11291908 band=[10900000, 11300000] IN
+structural_fetch bgl_structural gap_1m/today/data_over_object=1 predict=1 band=[0.95, 1] IN
+structural_fetch bgl_structural gap_1m/today/decode_cpu_ms=78.27062500000004 predict=76 band=[30, 200] IN
+structural_fetch bgl_structural gap_1m/today/gets=2 predict=2 band=[2, 3] IN
+structural_fetch bgl_structural gap_1m/today/plan_bytes=262144 predict=262144 band=[262144, 1048576] IN
+structural_fetch bgl_structural gap_1m/today/plan_gets=1 predict=1 band=[1, 2] IN
+structural_fetch bgl_structural gap_1m/today/wall_ms=142.435667 predict=138 band=[90, 260] IN
+structural_fetch bgl_structural gap_256k/ratio/bytes=0.5042645742000127 predict=0.49 band=[0.25, 1] IN
+structural_fetch bgl_structural gap_256k/ratio/gets=0.9523809523809523 predict=0.92 band=[0.6, 1.6] IN
+structural_fetch bgl_structural gap_256k/ratio/wall=0.6446578422776161 predict=0.69 band=[0.4, 1.2] IN
+structural_fetch bgl_structural gap_256k/structural/bytes=1211893 predict=950000 band=[480000, 1900000] IN
+structural_fetch bgl_structural gap_256k/structural/data_ranges=19 predict=11 band=[8, 16] MISS
+structural_fetch bgl_structural gap_256k/structural/decode_cpu_ms=2.408799592338439 predict=2.4 band=[0.8, 8] IN
+structural_fetch bgl_structural gap_256k/structural/gets=20 predict=12 band=[9, 17] MISS
+structural_fetch bgl_structural gap_256k/structural/wall_ms=98.67055059233846 predict=64 band=[55, 110] IN
+structural_fetch bgl_structural gap_256k/today/bytes=2403288 predict=1950000 band=[1500000, 2800000] IN
+structural_fetch bgl_structural gap_256k/today/data_over_object=0.19412418978320842 predict=0.15 band=[0.11, 0.25] IN
+structural_fetch bgl_structural gap_256k/today/decode_cpu_ms=25.05904200000053 predict=25 band=[8, 80] IN
+structural_fetch bgl_structural gap_256k/today/gets=21 predict=13 band=[11, 24] IN
+structural_fetch bgl_structural gap_256k/today/plan_bytes=262144 predict=262144 band=[262144, 1048576] IN
+structural_fetch bgl_structural gap_256k/today/plan_gets=1 predict=1 band=[1, 2] IN
+structural_fetch bgl_structural gap_256k/today/wall_ms=153.058792 predict=95 band=[60, 190] IN
+structural_fetch bgl_structural gap_64k/ratio/bytes=0.2507170195367409 predict=0.228 band=[0.16, 0.3] IN
+structural_fetch bgl_structural gap_64k/ratio/gets=0.96 predict=1.71 band=[0.9, 2.3] IN
+structural_fetch bgl_structural gap_64k/ratio/wall=0.6582074637658188 predict=1.05 band=[0.6, 1.6] IN
+structural_fetch bgl_structural gap_64k/structural/bytes=437519 predict=437519 band=[432000, 443000] IN
+structural_fetch bgl_structural gap_64k/structural/data_ranges=23 predict=23 band=[22, 24] IN
+structural_fetch bgl_structural gap_64k/structural/decode_cpu_ms=1.9634565600500464 predict=2.4 band=[0.8, 8] IN
+structural_fetch bgl_structural gap_64k/structural/gets=24 predict=24 band=[23, 25] IN
+structural_fetch bgl_structural gap_64k/structural/wall_ms=98.21749856005005 predict=95 band=[65, 150] IN
+structural_fetch bgl_structural gap_64k/today/bytes=1745071 predict=1920000 band=[1500000, 2700000] IN
+structural_fetch bgl_structural gap_64k/today/data_over_object=0.13444775427651942 predict=0.15 band=[0.11, 0.24] IN
+structural_fetch bgl_structural gap_64k/today/decode_cpu_ms=20.426082999999817 predict=25 band=[8, 80] IN
+structural_fetch bgl_structural gap_64k/today/gets=25 predict=14 band=[11, 24] MISS
+structural_fetch bgl_structural gap_64k/today/plan_bytes=262144 predict=262144 band=[262144, 1048576] IN
+structural_fetch bgl_structural gap_64k/today/plan_gets=1 predict=1 band=[1, 2] IN
+structural_fetch bgl_structural gap_64k/today/wall_ms=149.219667 predict=95 band=[60, 190] IN
+structural_fetch bgl_structural l0_64k/ratio/bytes=0.6711508807900313 predict=0.62 band=[0.38, 0.9] IN
+structural_fetch bgl_structural l0_64k/ratio/gets=2.5 predict=2.5 band=[1.67, 2.5] IN
+structural_fetch bgl_structural l0_64k/ratio/wall=0.5044806041777591 predict=0.5 band=[0.3, 0.9] IN
+structural_fetch bgl_structural l0_64k/structural/bytes=7578574 predict=7000000 band=[4300000, 9800000] IN
+structural_fetch bgl_structural l0_64k/structural/data_ranges=4 predict=4 band=[4, 4] IN
+structural_fetch bgl_structural l0_64k/structural/decode_cpu_ms=7.4092603782724025 predict=7.3 band=[2.5, 20] IN
+structural_fetch bgl_structural l0_64k/structural/gets=5 predict=5 band=[5, 5] IN
+structural_fetch bgl_structural l0_64k/structural/wall_ms=71.4666353782724 predict=70 band=[58, 120] IN
+structural_fetch bgl_structural l0_64k/today/bytes=11291908 predict=11291908 band=[10900000, 11300000] IN
+structural_fetch bgl_structural l0_64k/today/data_over_object=1 predict=1 band=[0.95, 1] IN
+structural_fetch bgl_structural l0_64k/today/decode_cpu_ms=77.07945800000005 predict=76 band=[30, 200] IN
+structural_fetch bgl_structural l0_64k/today/gets=2 predict=2 band=[2, 3] IN
+structural_fetch bgl_structural l0_64k/today/plan_bytes=262144 predict=262144 band=[262144, 1048576] IN
+structural_fetch bgl_structural l0_64k/today/plan_gets=1 predict=1 band=[1, 2] IN
+structural_fetch bgl_structural l0_64k/today/wall_ms=141.663792 predict=138 band=[90, 260] IN
+structural_fetch bgl_structural object_bytes=11029764 unpredicted (fixed by construction: the sizing search places it inside the registered object_min_bytes..object_max_bytes window)
+structural_fetch bgl_structural ratio/bytes=0.8878631494340903 predict=1.07 band=[0.9, 1.2] MISS
+structural_fetch bgl_structural ratio/gets=1 predict=1 band=[0.66, 1.5] IN
+structural_fetch bgl_structural ratio/wall=0.5058788599843583 predict=0.5 band=[0.3, 0.8] IN
+structural_fetch bgl_structural rows=573440 predict=524288 band=[425984, 655360] IN
+structural_fetch bgl_structural structural/bytes=10025669 predict=12100000 band=[10700000, 14700000] MISS
+structural_fetch bgl_structural structural/data_ranges=1 predict=1 band=[1, 2] IN
+structural_fetch bgl_structural structural/decode_cpu_ms=7.4201025055819745 predict=5 band=[1.5, 15] IN
+structural_fetch bgl_structural structural/gets=2 predict=2 band=[2, 3] IN
+structural_fetch bgl_structural structural/layout_bytes=9756688 predict=11900000 band=[10485760, 14417920] MISS
+structural_fetch bgl_structural structural/meta_bytes=6900 predict=5000 band=[2500, 9000] IN
+structural_fetch bgl_structural structural/raw_ranges=73 predict=72 band=[60, 90] IN
+structural_fetch bgl_structural structural/uncomp_bytes=1129981 predict=900000 band=[450000, 1600000] IN
+structural_fetch bgl_structural structural/wall_ms=71.50431150558198 predict=66 band=[60, 110] IN
+structural_fetch bgl_structural target_blocks=10 unpredicted (fixed by construction: 10 evenly spaced rows land in 10 distinct blocks whenever the object has at least 10 blocks)
+structural_fetch bgl_structural today/bytes=11291908 predict=11272192 band=[10747904, 12582912] IN
+structural_fetch bgl_structural today/data_over_object=1 predict=1 band=[0.95, 1] IN
+structural_fetch bgl_structural today/decode_cpu_ms=77.1922500000004 predict=70 band=[30, 150] IN
+structural_fetch bgl_structural today/gets=2 predict=2 band=[2, 3] IN
+structural_fetch bgl_structural today/plan_bytes=262144 predict=262144 band=[262144, 1048576] IN
+structural_fetch bgl_structural today/plan_gets=1 predict=1 band=[1, 2] IN
+structural_fetch bgl_structural today/uncomp_bytes=11755333 predict=13300000 band=[11700000, 14900000] IN
+structural_fetch bgl_structural today/wall_ms=141.34670799999998 predict=130 band=[90, 220] IN
+structural_fetch note object: 573440 rows from the first lines of the corpus, 70 blocks, 11029764 bytes, sized in 3 writes; whole-object bound 9437185 bytes, so the plan is the ranged plan restricted to the known blocks. Whether today's scan then reads those blocks ranged or the whole object is the fetcher's coverage crossover, decided per gap: production gap 1887437 on L0: the whole object in one GET after the plan (coverage crossover), the plan's 262144 bytes read again; gap_64k (65536 bytes on L1): 24 ranged GETs of 1482927 bytes after the plan; gap_256k (262144 bytes on L1): 20 ranged GETs of 2141144 bytes after the plan; gap_1m (1048576 bytes on L1): the whole object in one GET after the plan (coverage crossover), the plan's 262144 bytes read again; l0_64k (65536 bytes on L0): the whole object in one GET after the plan (coverage crossover), the plan's 262144 bytes read again
+structural_fetch note matched rows (block, row of block): [(3, 4096), (10, 4096), (17, 4096), (24, 4096), (31, 4096), (38, 4096), (45, 4096), (52, 4096), (59, 4096), (66, 4096)]
+structural_fetch note today: production plan_segment_routed + scan_accounted_with_tenant_subset_raw over every column, real GETs through InstrumentedStore behind a per-GET delay; decode CPU is the thread CPU of the scan open and drain
+structural_fetch note structural: a faithful simulation, not a real decode. Byte and GET counts come from the object's real pages, re-cut into independently compressed mini-blocks and fetched as real ranged GETs; the plan is the production plan run for real plus the mini-block index; decode CPU is modelled as today's CPU at the same gap times structural/uncomp_bytes over today/uncomp_bytes; wall is measured plan and data GET time plus that modelled CPU
+structural_fetch note coalescing: unprefixed figures are both sides at the production default gap, coalesce_gap = DEFAULT_LOG_REQUEST_COST_BYTES = 1887437 bytes (checked), on an L0 segment, the configuration round 0 measured. Targets 7 blocks apart sit closer than that, so both sides there tend to one range and ratio/* is a layout and recompression ratio; it is not counted toward the decision. gap_64k/* (65536 bytes), gap_256k/* (262144 bytes), gap_1m/* (1048576 bytes) are both sides at the named gap on an L1 segment, measured: today's side is the production fetcher with BlockRangeFetcher::with_coalesce_gap and nothing else changed, the structural ranges are coalesced at the same gap, and both sides' plans are made by that fetcher. The decision is taken at gap_64k (65536 bytes, DEFAULT_LOG_COALESCE_GAP). L1 because an L0 read is bridged to at most 4 (MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT) runs before the coverage crossover is checked, which spans the targets whatever the gap; l0_64k/* is that L0 case at 65536 bytes, with the structural ranges bounded to the same 4 runs by the same rule, reported beside the decision and not counted
+structural_fetch note latency model: every GET waits latency_ms before it returns, whatever its size; there is no bandwidth term, so wall time counts round trips and decode CPU, not bytes moved
+structural_fetch note medians of 5 interleaved runs (each run measures every gap, today then structural); every GET and byte count was identical across runs
+structural_fetch decision bgl_structural: NO-GO (gap_64k/ratio/bytes=0.2507<=0.25 FAIL, gap_64k/ratio/gets=0.9600<=1.5 ok, gap_64k/ratio/wall=0.6582<=1 ok)
+structural_fetch miss gap_256k/structural/data_ranges: 19 outside band [8.0, 16.0]
+structural_fetch miss gap_256k/structural/gets: 20 outside band [9.0, 17.0]
+structural_fetch miss gap_64k/today/gets: 25 outside band [11.0, 24.0]
+structural_fetch miss ratio/bytes: 0.8878631494340903 outside band [0.9, 1.2]
+structural_fetch miss structural/bytes: 10025669 outside band [10700000.0, 14700000.0]
+structural_fetch miss structural/layout_bytes: 9756688 outside band [10485760.0, 14417920.0]

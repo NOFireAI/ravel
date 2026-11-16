@@ -1,0 +1,5868 @@
+#!/usr/bin/env bash
+# Cases for the ClickBench kit: launch.sh, the user-data it writes, box/run.sh
+# and fetch.sh, and the GCP path (launch-gcp.sh, its startup script, box/run.sh
+# on GCS, fetch-gcp.sh and teardown-gcp.sh). Nothing here reaches AWS or GCP
+# or builds anything. Stubs first on PATH stand in for `aws` (S3 is a local
+# directory, $FAKE_S3), `gcloud` (GCS is $FAKE_GCS), `curl` (the instance
+# metadata services, the GCS and Compute JSON APIs, the release downloads and
+# the SQL endpoint), `cosign`, `systemd-run`, `perf`, `shutdown` and
+# `nohup`; a
+# box is a local directory standing in for /root (KIT_ROOT), with stub
+# ravel-cli and ravel-server binaries. Each case names the mutation it
+# catches.
+#
+# KIT_TEST_DIR points the cases at another copy of the kit, to show a case
+# failing against a broken one.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+KIT_SRC="${KIT_TEST_DIR:-$HERE}"
+REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+fails=0
+pass() { echo "ok   $1"; }
+fail() { echo "FAIL $1: $2"; fails=$((fails + 1)); }
+
+STUBS="$TMP/stubs"
+BINSTUBS="$TMP/binstubs"
+mkdir -p "$STUBS" "$BINSTUBS"
+export FAKE_S3="$TMP/s3"
+export STUB_DIR="$TMP/stubstate"
+export STUB_LOG="$STUB_DIR/calls.log"
+mkdir -p "$FAKE_S3" "$STUB_DIR"
+
+cat >"$STUBS/aws" <<'STUB'
+#!/usr/bin/env bash
+# S3 is $FAKE_S3/<bucket>/<key>. STUB_S3_DOWN=1 fails every s3 call as an
+# unreachable endpoint would (exit 255); STUB_S3_HANG=1 never answers.
+# STUB_DENY_ACTION names an IAM action the simulated role lacks; the role
+# may only get in/* and put out/* under the kit-test-bucket's clickbench-kit/
+# runs. STUB_NO_PROFILE=1 makes the instance profile unreadable.
+# STUB_S3_DENY_KEY makes a download of any key containing it a 403, and
+# STUB_S3_NO_BUCKET=1 makes every download a NoSuchBucket error.
+# STUB_FAIL_ARM names the arm whose run-instances fails.
+echo "aws $*" >>"$STUB_LOG"
+endpoint=""
+pos=()
+userdata=""
+token=""
+resource=""
+action=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --region|--query|--output|--instance-profile-name|--policy-source-arn|--name|--image-ids|--filters|--instance-ids)
+      pos+=("$1=$2"); shift 2; continue ;;
+    --endpoint-url) endpoint="$2"; shift 2; continue ;;
+    --user-data) userdata="$2"; shift 2; continue ;;
+    --client-token) token="$2"; shift 2; continue ;;
+    --action-names) action="$2"; pos+=("action=$2"); shift 2; continue ;;
+    --resource-arns) resource="$2"; shift 2; continue ;;
+    --only-show-errors|--recursive|--summarize) shift; continue ;;
+  esac
+  pos+=("$1")
+  shift
+done
+s3path() { printf '%s\n' "$FAKE_S3/${1#s3://}"; }
+case "${pos[0]:-} ${pos[1]:-}" in
+  "s3 cp"|"s3 ls")
+    if [ -n "$endpoint" ]; then
+      # Ravel's own bucket on the box's RustFS: only the object total.
+      printf 'Total Objects: %s\n   Total Size: 1\n' "$(cat "$STUB_DIR/objects" 2>/dev/null || echo 10)"
+      exit 0
+    fi
+    [ -z "${STUB_S3_HANG:-}" ] || exec sleep 30
+    [ -z "${STUB_S3_DOWN:-}" ] || { echo "Could not connect to the endpoint URL" >&2; exit 255; }
+    ;;
+esac
+case "${pos[0]:-} ${pos[1]:-}" in
+  "s3 cp")
+    src="${pos[@]: -2:1}"
+    dst="${pos[@]: -1}"
+    case "$src" in
+      s3://*) f="$(s3path "$src")"
+        case "$src" in *"${STUB_S3_DENY_KEY:-/none/}"*)
+          echo "fatal error: An error occurred (403) when calling the HeadObject operation: Forbidden" >&2; exit 1 ;;
+        esac
+        [ -z "${STUB_S3_NO_BUCKET:-}" ] || {
+          echo "fatal error: An error occurred (NoSuchBucket) when calling the GetObject operation: The specified bucket does not exist" >&2; exit 1; }
+        [ -f "$f" ] || { echo "fatal error: An error occurred (404) when calling the HeadObject operation: Key \"$src\" does not exist" >&2; exit 1; }
+        mkdir -p "$(dirname "$dst")" && cp "$f" "$dst" ;;
+      *) f="$(s3path "$dst")"
+        mkdir -p "$(dirname "$f")" && cp "$src" "$f" ;;
+    esac
+    ;;
+  "s3 ls")
+    d="$(s3path "${pos[@]: -1}")"
+    [ -d "$d" ] && [ -n "$(ls -A "$d")" ] || exit 1
+    for f in "$d"/*; do printf '2026-10-11 10:00:00 %10s %s\n' "$(wc -c <"$f" | tr -d ' ')" "$(basename "$f")"; done
+    ;;
+  "iam get-instance-profile")
+    [ -z "${STUB_NO_PROFILE:-}" ] || { echo "An error occurred (NoSuchEntity) when calling the GetInstanceProfile operation" >&2; exit 254; }
+    echo "arn:aws:iam::123456789012:role/kit-test-role" ;;
+  "iam simulate-principal-policy")
+    runs="arn:aws:s3:::kit-test-bucket/clickbench-kit/runs/"
+    rest="${resource#"$runs"}"
+    if [ "$action" = "${STUB_DENY_ACTION:-none}" ] || [ "$rest" = "$resource" ]; then
+      echo implicitDeny
+    else
+      case "$action $rest" in
+        "s3:GetObject "*/in/\*|"s3:PutObject "*/out/\*) echo allowed ;;
+        *) echo implicitDeny ;;
+      esac
+    fi
+    ;;
+  "ssm get-parameter") echo ami-0123456789abcdef0 ;;
+  "ec2 describe-images") echo /dev/xvda ;;
+  "ec2 run-instances")
+    arm="${token##*-}"
+    printf '%s' "$userdata" >"$STUB_DIR/userdata-$arm"
+    echo "$token" >>"$STUB_DIR/client-tokens"
+    [ "${STUB_FAIL_ARM:-}" != "$arm" ] || { echo "InsufficientInstanceCapacity" >&2; exit 255; }
+    case "$arm" in A) echo i-0aaaaaaaaaaaaaaaa ;; *) echo i-0bbbbbbbbbbbbbbbb ;; esac
+    ;;
+  "ec2 terminate-instances") echo terminating ;;
+  "ec2 describe-volumes") printf 'vol-0123456789abcdef0\tgp3\n' ;;
+  *) echo "unexpected aws call: ${pos[*]}" >&2; exit 99 ;;
+esac
+STUB
+
+cat >"$STUBS/curl" <<'STUB'
+#!/usr/bin/env bash
+# IMDS answers at once, and a rustfs.invalid download is the rustfs-asset file.
+# Readiness and SQL answer only while the stub server's
+# ready file exists, as a server that is not listening refuses (curl exit 7,
+# printing "000 <seconds>" for a -w format as curl does); the stub server
+# writes it only after logging its argv and settings, and removes it when
+# stopped. A readyz call is logged to readyz-calls. A body named check.json is
+# the concurrent phase's SELECT 1 check: it is logged to check-calls, whether
+# or not the server is ready, and, while
+# the check-refuse file exists, answered 503 (curl exit 22 under
+# --fail-with-body); while the check-hang file exists it is never answered, as
+# a server that accepts the connection and then hangs: curl exits 28 after its
+# --max-time, or never returns without one. STUB_SQL_TIMEOUT_N names a
+# statement whose call times out at once (curl exit 28, status 000).
+# STUB_SQL_DEAD refuses every measured call as a server that is not
+# listening does, while the SELECT 1 check still answers.
+# STUB_SQL_TRUNCATE_N names a statement whose answer
+# prints status 200 and then fails the transfer (curl exit 18). A SQL call
+# logs its request body to
+# sql-bodies, writes an answer to -o and prints "<status> <seconds>":
+# STUB_SQL_TIME seconds (default 0.5), or the try's field of STUB_SQL_TIMES
+# ("cold hot hot"), or for a q29_probe call the try's field of
+# STUB_PROBE_TIMES, and a 422 resource_exhausted refusal for statement
+# STUB_SQL_REFUSE_N. An answer holds the statement's expected row count from
+# the index.tsv beside its body (3 rows where the corpus states none), or
+# STUB_SQL_ROWS rows for statement STUB_SQL_ROWS_N (only on try
+# STUB_SQL_ROWS_TRY when that is set), with status STUB_SQL_STATUS (default
+# 200). The try is read from the -o name,
+# <number>-<try>.json. A body under a verify/ directory is the box's row-count
+# check: it is logged to verify-bodies and answered with one cell,
+# STUB_COUNT_STAR (default the hits row count).
+#
+# The GCP endpoints (kit.test.sh points KIT_GCE_METADATA, KIT_GCS_API and
+# KIT_GCE_API at them): gce-md.invalid is the metadata server; gcs.invalid
+# is the GCS JSON API over $FAKE_GCS/<bucket>/<key> (a media upload, an
+# alt=media download that fails 404 when the object is absent, and
+# objects.list pages of STUB_GCS_PAGE items, default 1000, with numeric page
+# tokens); gce.invalid logs a DELETE of an instance as "gce delete <name>";
+# release.invalid serves $STUB_DIR/release/<file>. A body under sql-smoke/
+# is the box's pre-load SELECT 1, answered 200, or 422 while STUB_SMOKE_FAIL
+# is set.
+out=""
+body=""
+url=""
+wfmt=""
+fwb=""
+maxtime=""
+method=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2; continue ;;
+    --max-time) maxtime="$2"; shift 2; continue ;;
+    --data-binary) body="${2#@}"; shift 2; continue ;;
+    -w) wfmt="$2"; shift 2; continue ;;
+    --fail-with-body) fwb=1 ;;
+    -X) method="$2"; shift 2; continue ;;
+    -H) shift 2; continue ;;
+    http*) url="$1" ;;
+  esac
+  shift
+done
+case "$url" in
+  http://gce-md.invalid/*)
+    case "${url#http://gce-md.invalid/computeMetadata/v1/}" in
+      instance/service-accounts/default/token) echo '{"access_token":"stub-gce-token","expires_in":3599,"token_type":"Bearer"}' ;;
+      instance/name) echo "${STUB_GCE_NAME:-ravel-clickbench-stub}" ;;
+      instance/zone) echo projects/123456/zones/us-central1-a ;;
+      instance/machine-type) echo projects/123456/machineTypes/c2d-highcpu-16 ;;
+      project/project-id) echo kit-test-project ;;
+      *) echo "curl: (22) The requested URL returned error: 404" >&2; exit 22 ;;
+    esac
+    exit 0 ;;
+  https://gcs.invalid/upload/storage/v1/b/*)
+    rest="${url#https://gcs.invalid/upload/storage/v1/b/}"
+    name="${rest#*name=}"
+    f="$FAKE_GCS/${rest%%/*}/${name//%2F//}"
+    mkdir -p "$(dirname "$f")" && cp "$body" "$f"
+    exit $? ;;
+  https://gcs.invalid/storage/v1/b/*/o\?*)
+    rest="${url#https://gcs.invalid/storage/v1/b/}"
+    python3 - "$FAKE_GCS/${rest%%/*}" "$url" "${STUB_GCS_PAGE:-1000}" >"$out" <<'PY'
+import json, os, re, sys
+root, url, size = sys.argv[1], sys.argv[2], int(sys.argv[3])
+names = []
+for d, _, files in os.walk(root):
+    for f in files:
+        p = os.path.join(d, f)
+        names.append((os.path.relpath(p, root), os.path.getsize(p)))
+names.sort()
+m = re.search(r"pageToken=([0-9]+)", url)
+start = int(m.group(1)) if m else 0
+page = {"items": [{"name": n, "size": str(s)} for n, s in names[start:start + size]]}
+if start + size < len(names):
+    page["nextPageToken"] = str(start + size)
+print(json.dumps(page))
+PY
+    exit $? ;;
+  https://gcs.invalid/storage/v1/b/*)
+    rest="${url#https://gcs.invalid/storage/v1/b/}"
+    key="${rest#*/o/}"
+    f="$FAKE_GCS/${rest%%/*}/${key%%\?*}"
+    f="${f//%2F//}"
+    [ -f "$f" ] || { echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; }
+    cp "$f" "$out"
+    exit $? ;;
+  https://gce.invalid/*)
+    [ "$method" = DELETE ] || { echo "curl: (22) unexpected $method $url" >&2; exit 22; }
+    echo "gce delete ${url##*/}" >>"$STUB_LOG"
+    exit 0 ;;
+  https://release.invalid/*)
+    f="$STUB_DIR/release/${url##*/}"
+    [ -f "$f" ] || { echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; }
+    cp "$f" "$out"
+    exit $? ;;
+esac
+case "$body" in
+  */sql-smoke/*)
+    if [ ! -f "$STUB_DIR/server-ready" ]; then printf '000'; exit 7; fi
+    echo smoke >>"$STUB_DIR/smoke-calls"
+    if [ -n "${STUB_SMOKE_FAIL:-}" ]; then
+      printf '{"status":"error","errorType":"unsupported","error":"no SQL surface"}' >"$out"
+      printf '422'
+    else
+      printf '{"status":"success","data":{"columns":["1"],"rows":[[1]]},"stats":{}}' >"$out"
+      printf '200'
+    fi
+    exit 0 ;;
+esac
+case "$url" in
+  */latest/api/token) echo stub-imds-token ;;
+  */meta-data/instance-id) echo i-0b0x00000000000001 ;;
+  */meta-data/instance-type) echo c6a.4xlarge ;;
+  https://rustfs.invalid/*) cp "$STUB_DIR/rustfs-asset" "$out" ;;
+  */readyz)
+    echo readyz >>"$STUB_DIR/readyz-calls"
+    [ -f "$STUB_DIR/server-ready" ] || { echo "curl: (7) Failed to connect" >&2; exit 7; }
+    echo ready ;;
+  */api/v1/sql)
+    case "$body" in */check.json) echo check >>"$STUB_DIR/check-calls" ;; esac
+    if [ ! -f "$STUB_DIR/server-ready" ]; then
+      [ -z "$wfmt" ] || printf '000 0.000412'
+      echo "curl: (7) Failed to connect" >&2
+      exit 7
+    fi
+    case "$body" in
+      */check.json)
+        if [ -f "$STUB_DIR/check-hang" ]; then
+          [ -n "$maxtime" ] || exec sleep 3600
+          sleep "$maxtime"
+          echo "curl: (28) Operation timed out after $maxtime seconds with 0 bytes received" >&2
+          exit 28
+        fi
+        if [ -f "$STUB_DIR/check-refuse" ]; then
+          printf '{"status":"error","errorType":"unavailable","error":"memory pressure"}' >"$out"
+          [ -z "$fwb" ] || exit 22
+          exit 0
+        fi
+        printf '{"status":"success","data":{"columns":["1"],"rows":[[1]]},"stats":{}}' >"$out"
+        exit 0 ;;
+      */verify/*)
+        { cat "$body"; echo; } >>"$STUB_DIR/verify-bodies"
+        printf '{"status":"success","data":{"columns":["count(*)"],"rows":[[%s]]},"stats":{}}' \
+          "${STUB_COUNT_STAR:-99997497}" >"$out"
+        printf '200 0.1'
+        exit 0 ;;
+    esac
+    if [ -n "${STUB_SQL_DEAD:-}" ]; then
+      printf '000 0.000412'
+      echo "curl: (7) Failed to connect to 127.0.0.1 port 4318" >&2
+      exit 7
+    fi
+    echo "sql $(basename "$body")" >>"$STUB_DIR/curl-sql"
+    n="$(basename "$body" .json)"
+    try="${out##*-}"
+    try="${try%.json}"
+    { cat "$body"; echo; } >>"$STUB_DIR/sql-bodies"
+    if [ "$n" = "${STUB_SQL_TIMEOUT_N:-none}" ]; then
+      printf '000 0.3'
+      echo "curl: (28) Operation timed out" >&2
+      exit 28
+    elif [ "$n" = "${STUB_SQL_TRUNCATE_N:-none}" ]; then
+      printf '{"status":"success","data":{"col' >"$out"
+      printf '200 0.2'
+      echo "curl: (18) transfer closed with outstanding read data remaining" >&2
+      exit 18
+    elif [ "$n" = "${STUB_SQL_REFUSE_N:-none}" ]; then
+      printf '{"status":"error","errorType":"resource_exhausted","error":"query pool exhausted"}' >"$out"
+      printf '422 0.1'
+    else
+      rows="$(awk -F'\t' -v n="$n" '$1 == n { print $3 }' "$(dirname "$body")/index.tsv")"
+      case "$rows" in ''|-) rows=3 ;; esac
+      if [ "$n" = "${STUB_SQL_ROWS_N:-none}" ] \
+        && { [ -z "${STUB_SQL_ROWS_TRY:-}" ] || [ "$try" = "$STUB_SQL_ROWS_TRY" ]; }; then
+        rows="$STUB_SQL_ROWS"
+      fi
+      json=""
+      for ((i = 0; i < rows; i++)); do json="${json:+$json,}[$i]"; done
+      json="[$json]"
+      printf '{"status":"success","data":{"columns":["c"],"rows":%s},"stats":{}}' "$json" >"$out"
+      seconds="${STUB_SQL_TIME:-0.5}"
+      [ -z "${STUB_SQL_TIMES:-}" ] || seconds="$(printf '%s\n' $STUB_SQL_TIMES | sed -n "${try}p")"
+      case "$out" in
+        */q29_probe/*) [ -z "${STUB_PROBE_TIMES:-}" ] || seconds="$(printf '%s\n' $STUB_PROBE_TIMES | sed -n "${try}p")" ;;
+      esac
+      printf '%s %s' "${STUB_SQL_STATUS:-200}" "$seconds"
+    fi
+    ;;
+  *) echo "unexpected curl: $url" >&2; exit 7 ;;
+esac
+STUB
+
+cat >"$STUBS/shutdown" <<'STUB'
+#!/usr/bin/env bash
+echo "shutdown $*" >>"$STUB_LOG"
+STUB
+
+cat >"$STUBS/nohup" <<'STUB'
+#!/usr/bin/env bash
+echo "nohup $*" >>"$STUB_LOG"
+STUB
+
+# `perf record` logs its argv, writes its -o file and records until TERM;
+# `perf script -i FILE` prints two samples of one stack from that file, or
+# fails when STUB_PERF_SCRIPT_FAIL is set.
+cat >"$STUBS/perf" <<'STUB'
+#!/usr/bin/env bash
+echo "perf $*" >>"$STUB_DIR/perf-argv"
+case "$1" in
+  record)
+    out=""
+    while [ $# -gt 0 ]; do
+      [ "$1" != -o ] || out="$2"
+      shift
+    done
+    echo stub-perf-data >"$out"
+    sleep 30 &
+    pid=$!
+    trap 'kill "$pid" 2>/dev/null; exit 0' TERM
+    wait "$pid" ;;
+  script)
+    [ "$2" = -i ] && [ -f "$3" ] || { echo "perf script: no $3" >&2; exit 1; }
+    [ -z "${STUB_PERF_SCRIPT_FAIL:-}" ] || { echo "perf script: stub failure" >&2; exit 1; }
+    for t in 1.000000 1.010101; do
+      printf 'ravel-server 4242 [000] %s: 10101010 cpu-clock:\n' "$t"
+      printf '\t    5555aaaa scan_rows+0x10 (/bin/ravel-server)\n'
+      printf '\t    5555bbbb execute (/bin/ravel-server)\n'
+      printf '\t    5555cccc main (/bin/ravel-server)\n\n'
+    done ;;
+esac
+STUB
+
+# The box's binaries. The server logs its argv, the five settings stamps and
+# the store keys and audit key it was given (the evidence must not carry
+# them), removes the check-refuse and check-hang files, then after the seconds in the
+# ready-delay file, else STUB_READY_DELAY (default 0.05), and while the
+# ready-after-checks file exists until that many more SELECT 1 checks have
+# been logged, writes the ready file and sleeps until stopped; the CLI logs
+# its argv, and `load` adds 200 keys
+# to the store (100 data objects and their 100 commit records) and prints
+# ravel-cli's load summary with STUB_LOAD_ROWS rows written (default the hits
+# row count) and STUB_LOAD_OBJECTS objects written (default 100; "none"
+# leaves the line out). STUB_FOLD=unsealed
+# makes the fold seal nothing, STUB_FOLD=twice prints entry_count twice,
+# STUB_FOLD_ENTRIES sets the entry_count it prints (default 100), and
+# STUB_FOLD_LEAVES, when set, the key_index_leaves_written line it prints.
+# STUB_LEAF_HELP=1 makes both binaries' --help list the key-index leaf
+# switch's two spellings, as a binary built after issue #4200 does;
+# STUB_LEAF_HELP=prose names the opt-out only inside another option's text.
+cat >"$BINSTUBS/ravel-server" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --help)
+    echo "Usage: ravel-server [OPTIONS]"
+    [ "${STUB_LEAF_HELP:-}" != 1 ] || printf '      --fold-key-index-leaves\n      --no-fold-key-index-leaves\n'
+    [ "${STUB_LEAF_HELP:-}" != prose ] || printf '      --fold-key-index-leaves  The default; see --no-fold-key-index-leaves.\n'
+    exit 0 ;;
+  --version) echo "error: unexpected argument '--version' found" >&2; exit 2 ;;
+esac
+echo "$*" >>"$STUB_DIR/server-argv"
+for kv in fetch_concurrency=32 store_get_concurrency=32 cache_max_bytes=7689077760 \
+  catalog_cache_max_bytes=1537815552 sql_max_query_bytes=16451897344 sql_tenant_max_bytes=32903794688; do
+  printf '2026-10-11T10:00:00.000000Z  INFO ravel_server::config: performance default resolved setting="%s" value=%s source="derived"\n' "${kv%%=*}" "${kv#*=}"
+done
+case " $* " in
+  *" --store gcs "*) policy='policy="cost-based" policy_source="default"' ;;
+  *) policy='policy="latency-first" policy_source="default-loopback"' ;;
+esac
+printf '2026-10-11T10:00:00.000000Z  INFO ravel_server::config: logs fetch policy resolved %s profile=s3-intra-region-2026 request_cost_bytes=1\n' "$policy"
+echo "stub-server: env RAVEL_S3_ENDPOINT=${RAVEL_S3_ENDPOINT:-unset} RAVEL_S3_BUCKET=${RAVEL_S3_BUCKET:-unset} LD_PRELOAD=${LD_PRELOAD:-unset}"
+echo "stub-server: store access_key=${RAVEL_S3_ACCESS_KEY:-} secret_key=${RAVEL_S3_SECRET_KEY:-} audit_key=${RAVEL_AUDIT_TOKEN_KEY:-none}"
+rm -f "$STUB_DIR/check-refuse" "$STUB_DIR/check-hang"
+sleep "$(cat "$STUB_DIR/ready-delay" 2>/dev/null || echo "${STUB_READY_DELAY:-0.05}")"
+if [ -f "$STUB_DIR/ready-after-checks" ]; then
+  want=$(($(cat "$STUB_DIR/check-calls" 2>/dev/null | wc -l) + $(cat "$STUB_DIR/ready-after-checks")))
+  for ((i = 0; i < 6000; i++)); do
+    [ "$(cat "$STUB_DIR/check-calls" 2>/dev/null | wc -l)" -lt "$want" ] || break
+    sleep 0.01
+  done
+fi
+sleep 120 &
+pid=$!
+trap 'rm -f "$STUB_DIR/server-ready"; kill "$pid" 2>/dev/null; exit 0' TERM
+touch "$STUB_DIR/server-ready"
+wait "$pid"
+STUB
+cat >"$BINSTUBS/ravel-cli" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --help) echo "Usage: ravel-cli [OPTIONS] <COMMAND>"; exit 0 ;;
+  --version) echo "error: unexpected argument '--version' found" >&2; exit 2 ;;
+esac
+echo "cli $*" >>"$STUB_DIR/cli-argv"
+# Under --store gcs the bucket is $FAKE_GCS/<--gcs-bucket>: qualify writes its
+# record and a probe, the load 100 data objects and their commit records under
+# one tenant prefix, and `typed-attr-column show` reports STUB_DECLARED
+# columns (default 104, hits.mapping.toml's entries).
+gcs=""
+prev=""
+for a in "$@"; do
+  [ "$prev" != --gcs-bucket ] || gcs="$FAKE_GCS/$a"
+  prev="$a"
+done
+if [ -n "$gcs" ]; then
+  case " $* " in
+    *" store qualify "*)
+      mkdir -p "$gcs/sys/qualify/p1" && echo record >"$gcs/sys/qualification" && echo probe >"$gcs/sys/qualify/p1/cas"
+      echo "store qualify: gs://${gcs##*/}: 10 of 10 gating checks PASS" ;;
+    *" load "*)
+      mkdir -p "$gcs/t/0123abcd/l/l0" "$gcs/t/0123abcd/l/c"
+      for ((i = 0; i < 100; i++)); do
+        printf 'data-%03d' "$i" >"$gcs/t/0123abcd/l/l0/obj-$i.rlog"
+        printf 'c%d' "$i" >"$gcs/t/0123abcd/l/c/rec-$i"
+      done ;;
+    *" typed-attr-column show "*)
+      echo "tenant clickbench-v4 declares ${STUB_DECLARED:-104} typed attribute column(s), in schema-append order:"
+      exit 0 ;;
+  esac
+fi
+case " $* " in
+  *" load "*)
+    echo 210 >"$STUB_DIR/objects"
+    printf 'bulk load complete\n  rows_skipped     : 0\n  rows_written     : %s\n  rows/sec         : 1000\n' \
+      "${STUB_LOAD_ROWS:-99997497}"
+    [ "${STUB_LOAD_OBJECTS:-100}" = none ] || printf '  objects written  : %s\n' "${STUB_LOAD_OBJECTS:-100}" ;;
+  *" catalog fold --help "*)
+    echo "Usage: ravel-cli catalog fold [OPTIONS] --tenant <TENANT>"
+    [ "${STUB_LEAF_HELP:-}" != 1 ] || printf '      --key-index-leaves\n      --no-key-index-leaves\n'
+    [ "${STUB_LEAF_HELP:-}" != prose ] || printf '      --key-index-leaves  The default; see --no-key-index-leaves.\n' ;;
+  *" catalog fold "*)
+    [ -z "${STUB_FOLD_LEAVES:-}" ] || echo "key_index_leaves_written: $STUB_FOLD_LEAVES"
+    if [ "${STUB_FOLD:-}" = unsealed ]; then echo "seal_through_hour: None"; else echo "seal_through_hour: Some(491234)"; fi
+    printf 'previous_watermark_hour: Some(491200)\nwatermark_hour: Some(491235)\nentry_count: %s\nbuckets_folded: 5\npart_bytes: 12345\n' "${STUB_FOLD_ENTRIES:-100}"
+    [ "${STUB_FOLD:-}" != twice ] || echo "entry_count: 100" ;;
+esac
+exit 0
+STUB
+# The GCP path's laptop side: gcloud over $FAKE_GCS (GCS) and $STUB_DIR/gce/
+# (one file per instance), cosign, and git for launch-gcp.sh's tag and
+# mapping checks. STUB_GCLOUD_FAIL names a step that fails: bucket-create,
+# bucket-iam, create, binding or instance-delete. STUB_NO_SA makes the
+# service account unreadable and STUB_NO_GRANT leaves the results bucket's
+# policy without its objectAdmin binding. STUB_GCS_DOWN fails every storage
+# listing as an unreachable endpoint would. A machine type's architecture is
+# STUB_MACHINE_ARCH (default empty, as GCE answers for x86 types; X86_64,
+# ARM64 or another value to set it), and STUB_GCLOUD_FAIL=machine-type fails the lookup.
+export FAKE_GCS="$TMP/gcs"
+mkdir -p "$FAKE_GCS" "$STUB_DIR/gce"
+cat >"$STUBS/gcloud" <<'STUB'
+#!/usr/bin/env bash
+echo "gcloud $*" >>"$STUB_LOG"
+pos=()
+meta=""
+filter=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --metadata-from-file) meta="${2#startup-script=}"; shift 2; continue ;;
+    --filter) filter="$2"; shift 2; continue ;;
+    --project|--zone|--format|--location|--default-storage-class|--soft-delete-duration|--role|--member|--labels|--machine-type|--image-family|--image-project|--boot-disk-size|--boot-disk-type|--service-account|--scopes|--maintenance-policy|--max-run-duration|--instance-termination-action|--display-name)
+      shift 2; continue ;;
+    --*) shift; continue ;;
+  esac
+  pos+=("$1")
+  shift
+done
+gcs() { printf '%s\n' "$FAKE_GCS/${1#gs://}"; }
+failing() { [ "${STUB_GCLOUD_FAIL:-}" = "$1" ] && { echo "ERROR: (gcloud) stub failure: $1" >&2; exit 1; }; return 0; }
+case "${pos[0]:-} ${pos[1]:-}" in
+  "storage cp")
+    src="${pos[2]}"
+    dst="${pos[3]}"
+    case "$src" in
+      gs://*)
+        [ -f "$(gcs "$src")" ] || { echo "ERROR: (gcloud.storage.cp) The following URLs matched no objects or files: $src" >&2; exit 1; }
+        mkdir -p "$(dirname "$dst")" && cp "$(gcs "$src")" "$dst" ;;
+      *) mkdir -p "$(dirname "$(gcs "$dst")")" && cp "$src" "$(gcs "$dst")" ;;
+    esac
+    exit $? ;;
+  "storage ls")
+    [ -z "${STUB_GCS_DOWN:-}" ] || { echo "ERROR: (gcloud.storage.ls) HTTPSConnectionPool: connection refused" >&2; exit 1; }
+    d="$(gcs "${pos[2]}")"
+    [ -d "$d" ] && [ -n "$(ls -A "$d")" ] || { echo "ERROR: (gcloud.storage.ls) One or more URLs matched no objects." >&2; exit 1; }
+    for f in "$d"/*; do printf '%s%s\n' "${pos[2]}" "$(basename "$f")"; done
+    exit 0 ;;
+  "storage rm") rm -rf "$(gcs "${pos[2]}")"; exit 0 ;;
+esac
+case "${pos[0]:-} ${pos[1]:-} ${pos[2]:-}" in
+  "iam service-accounts describe")
+    [ -z "${STUB_NO_SA:-}" ] || { echo "ERROR: NOT_FOUND" >&2; exit 1; }
+    echo "${pos[3]}" ;;
+  "storage buckets get-iam-policy")
+    if [ -n "${STUB_NO_GRANT:-}" ]; then
+      echo '{"bindings": [{"role": "roles/storage.objectViewer", "members": ["serviceAccount:ravel-clickbench@kit-test-project.iam.gserviceaccount.com"]}]}'
+    else
+      echo '{"bindings": [{"role": "roles/storage.objectAdmin", "members": ["serviceAccount:ravel-clickbench@kit-test-project.iam.gserviceaccount.com"]}]}'
+    fi ;;
+  "storage buckets create") failing bucket-create; mkdir -p "$(gcs "${pos[3]}")" ;;
+  "storage buckets add-iam-policy-binding") failing bucket-iam; echo etag ;;
+  "storage buckets describe") [ -d "$(gcs "${pos[3]}")" ] || { echo "ERROR: NotFound" >&2; exit 1; }; echo "${pos[3]#gs://}" ;;
+  "compute machine-types describe")
+    failing machine-type
+    echo "${STUB_MACHINE_ARCH-}" ;;
+  "compute instances create")
+    failing create
+    cp "$meta" "$STUB_DIR/startup-${pos[3]}" && echo us-central1-a >"$STUB_DIR/gce/${pos[3]}" ;;
+  "compute instances add-iam-policy-binding") failing binding; echo etag ;;
+  "compute instances delete") failing instance-delete; rm -f "$STUB_DIR/gce/${pos[3]}" ;;
+  "compute instances list")
+    n=0
+    for f in "$STUB_DIR"/gce/*; do
+      [ -f "$f" ] || continue
+      printf '%s\t%s\n' "$(basename "$f")" "$(cat "$f")"
+      n=$((n + 1))
+    done
+    # As gcloud does when no resource carries the filtered label.
+    [ "$n" != 0 ] || echo "WARNING: The following filter keys were not present in any resource : ${filter%%=*}" >&2 ;;
+  *) echo "unexpected gcloud call: ${pos[*]}" >&2; exit 99 ;;
+esac
+STUB
+cat >"$STUBS/cosign" <<'STUB'
+#!/usr/bin/env bash
+echo "cosign $*" >>"$STUB_LOG"
+[ -z "${STUB_COSIGN_FAIL:-}" ] || { echo "Error: none of the expected identities matched" >&2; exit 1; }
+echo "Verified OK"
+STUB
+cat >"$STUBS/systemd-run" <<'STUB'
+#!/usr/bin/env bash
+echo "systemd-run $*" >>"$STUB_LOG"
+STUB
+# Only on PATH for launch-gcp.sh: the tag resolves to STUB_TAG_SHA, and the
+# commit's mapping is STUB_TAG_MAPPING (default the checked-in one).
+GITSTUBS="$TMP/gitstubs"
+mkdir -p "$GITSTUBS"
+cat >"$GITSTUBS/git" <<'STUB'
+#!/usr/bin/env bash
+[ "$1" = -C ] && shift 2
+case "$1" in
+  rev-parse) [ -n "${STUB_TAG_SHA:-}" ] || exit 1; echo "$STUB_TAG_SHA" ;;
+  show) cat "${STUB_TAG_MAPPING:-$STUB_REPO/benchmarks/clickbench/hits.mapping.toml}" ;;
+  *) echo "unexpected git call: $*" >&2; exit 99 ;;
+esac
+STUB
+chmod +x "$GITSTUBS/git"
+export STUB_REPO="$REPO_ROOT"
+chmod +x "$STUBS"/* "$BINSTUBS"/*
+export PATH="$STUBS:$PATH"
+# macOS assesses a newly written executable on its first exec, which took
+# about 0.25 s here, longer than the 0.05 s a case gives perf record before
+# it is sent SIGTERM; a stub killed before its first line records nothing.
+# One exec now pays that outside every case.
+perf warm >/dev/null 2>&1
+rm -f "$STUB_DIR/perf-argv"
+
+# The server's two listeners as the healthz sampler sees them: one HTTP server
+# per role (4318 the query listener, 4319 the health listener) on an ephemeral
+# port, exported as KIT_HEALTH_BASE_4318 and KIT_HEALTH_BASE_4319. GET /healthz
+# answers 200 while the stub server's ready file exists and 503 otherwise;
+# while health-hang-<role> exists it answers only after 3 s, past the
+# sampler's 2 s timeout, and while health-500-<role> exists it answers 500.
+# GET /metrics on the 4318 role carries ravel_health_heartbeat_age_seconds
+# (the value in the heartbeat file, default 0.5) unless heartbeat-absent
+# exists, and answers only after 3 s while metrics-hang exists; on the 4319
+# role it is a 404.
+cat >"$TMP/health-stub.py" <<'PY'
+import http.server, os, socketserver, sys, threading, time
+state = sys.argv[1]
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    def handle_error(self, request, client_address):
+        pass  # a hung answer's client has timed out and gone
+
+def handler(role):
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+        def answer(self, code, body):
+            data = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        def do_GET(self):
+            f = lambda name: os.path.join(state, name)
+            if self.path == "/healthz":
+                if os.path.exists(f("health-hang-" + role)):
+                    time.sleep(3)
+                if os.path.exists(f("health-500-" + role)):
+                    return self.answer(500, "stub failure\n")
+                ready = os.path.exists(f("server-ready"))
+                return self.answer(200 if ready else 503, "ok\n" if ready else "starting\n")
+            if self.path == "/metrics" and role == "4318":
+                if os.path.exists(f("metrics-hang")):
+                    time.sleep(3)
+                body = "# TYPE x gauge\n"
+                if not os.path.exists(f("heartbeat-absent")):
+                    try:
+                        age = open(f("heartbeat")).read().strip()
+                    except OSError:
+                        age = "0.5"
+                    body += 'ravel_health_heartbeat_age_seconds{mode="x"} %s\n' % age
+                body += 'ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="allocated"} 1000\n'
+                body += 'ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="resident"} 4000\n'
+                body += 'ravel_cache_resident_bytes{mode="all",cache="fetch"} 100\n'
+                body += 'ravel_cache_resident_bytes{mode="all",cache="catalog"} 50\n'
+                body += 'ravel_memory_reserved_bytes{mode="all",component="sql"} 7\n'
+                body += 'ravel_memory_reserved_bytes{mode="all",component="fetch"} 20\n'
+                body += 'ravel_memory_handoff_overlap_bytes{mode="all"} 5\n'
+                body += 'ravel_memory_budget_refusals_total{mode="x"} 9\n'
+                return self.answer(200, body)
+            return self.answer(404, "no such path\n")
+    return H
+
+ports = []
+for role in ("4318", "4319"):
+    s = Server(("127.0.0.1", 0), handler(role))
+    ports.append(str(s.server_address[1]))
+    threading.Thread(target=s.serve_forever, daemon=True).start()
+with open(sys.argv[2] + ".tmp", "w") as out:
+    out.write(" ".join(ports) + "\n")
+os.replace(sys.argv[2] + ".tmp", sys.argv[2])
+while True:
+    time.sleep(3600)
+PY
+python3 "$TMP/health-stub.py" "$STUB_DIR" "$TMP/health-ports" &
+HEALTH_STUB_PID=$!
+trap 'kill "$HEALTH_STUB_PID" 2>/dev/null; pkill -KILL -f "healthz-sampler $TMP/" 2>/dev/null; rm -rf "$TMP"' EXIT
+for _ in $(seq 1 500); do [ -s "$TMP/health-ports" ] && break; sleep 0.01; done
+read -r hp_4318 hp_4319 <"$TMP/health-ports" || { echo "FAIL health stub: no ports"; exit 1; }
+export KIT_HEALTH_BASE_4318="http://127.0.0.1:$hp_4318" KIT_HEALTH_BASE_4319="http://127.0.0.1:$hp_4319"
+
+# The hardware the box stamps, so no case reads this machine's /proc.
+printf 'processor\t: 0\nmodel name\t: Stub CPU 9000 @ 2.00GHz\n' >"$TMP/cpuinfo"
+printf 'MemTotal:       32000000 kB\nMemFree:        1000 kB\n' >"$TMP/meminfo"
+export KIT_CPUINFO="$TMP/cpuinfo" KIT_MEMINFO="$TMP/meminfo"
+
+SHA_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+SHA_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+# A filled copy of the rlog lane's band file: 43 statements at 0.5 s sum to
+# 21.5 s hot and cold, under 30; at 2.0 s they miss. The [published] rows are
+# left as checked in.
+BANDS="$TMP/rlog.toml"
+sed -e 's/^hot_sum_s_max = .*/hot_sum_s_max = 30/' \
+  -e 's/^cold_sum_s_max = .*/cold_sum_s_max = 30/' \
+  -e 's/^error_pooled_max = .*/error_pooled_max = 0.1/' \
+  -e 's/^concurrent_qps_min = .*/concurrent_qps_min = 1.0/' \
+  -e 's/^concurrent_error_pooled_max = .*/concurrent_error_pooled_max = 0.1/' \
+  -e 's/^q29_probe_s_max = .*/q29_probe_s_max = 1.0/' \
+  -e '/^\[absolute\.hot_s_max\]$/,/^\[/s/^\(q[0-9][0-9]\) = .*/\1 = 1.0/' \
+  "$REPO_ROOT/benchmarks/clickbench/bands/rlog.toml" >"$BANDS"
+DATASET_SHA=1111111111111111111111111111111111111111111111111111111111111111
+
+# write_run_toml FILE BANDS_PATH [BAND_SECTIONS_ARRAY]
+write_run_toml() {
+  local sections='["relative", "absolute"]'
+  [ -z "${3:-}" ] || sections="$3"
+  cat >"$1" <<EOF
+sha_a = "$SHA_A"
+sha_b = "$SHA_B"
+lanes = ["rlog"]
+phases = ["benchmark"]
+band_sections = $sections
+instance_type = "c6a.4xlarge"
+region = "us-east-1"
+bucket = "kit-test-bucket"
+prefix = "clickbench-kit"
+instance_profile = "ravel-clickbench-instance-profile"
+repo_url = "https://example.invalid/ravel.git"
+tenant = "clickbench-v4"
+shards = 8
+corpus = "benchmarks/clickbench/hits.corpus.json"
+dataset_url = "https://example.invalid/hits.parquet"
+dataset_sha256 = "$DATASET_SHA"
+rows_expected = 99997497
+rustfs_url = "https://example.invalid/rustfs.zip"
+rustfs_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+memory_budget_bytes = 25769803776
+audit_mode = "off"
+
+[bands]
+rlog = "$2"
+EOF
+}
+RUN_TOML="$TMP/run.toml"
+write_run_toml "$RUN_TOML" "$BANDS"
+
+reset_log() { : >"$STUB_LOG"; rm -f "$STUB_DIR"/userdata-* "$STUB_DIR/client-tokens"; }
+
+# --- launch.sh --------------------------------------------------------------
+
+# Catches: a launch that starts one instance, gives the arms different run ids,
+# calls aws under --dry-run, or drops any of shutdown -h +600, the terminate
+# behaviour, the instance profile, the 500 GB gp3 volume, the arm name or
+# either sha256 check from the user-data.
+reset_log
+code=0
+bash "$KIT_SRC/launch.sh" --dry-run "$RUN_TOML" >"$TMP/dry.out" 2>"$TMP/dry.err" || code=$?
+run_id="$(sed -n 's/^run id: *//p' "$TMP/dry.out")"
+n_launch="$(grep -c '^DRY-RUN: aws ec2 run-instances' "$TMP/dry.err")"
+tokens="$(grep '^DRY-RUN: aws ec2 run-instances' "$TMP/dry.err" | sed -n 's/.*--client-token \([^ ]*\) .*/\1/p' | tr '\n' ' ')"
+ud_ok=1
+for arm in A B; do
+  ud="$(sed -n "/^DRY-RUN user-data $arm:\$/,/^DRY-RUN end user-data $arm\$/p" "$TMP/dry.err")"
+  for want in 'shutdown -h +600' 'sha256sum -c kit.sha256' 'sha256sum -c SHA256SUMS' \
+    "printf '%s\\n' $arm >\"\$KIT/ARM\"" "printf '%s\\n' $run_id >\"\$KIT/RUN_ID\"" \
+    "OUT=s3://kit-test-bucket/clickbench-kit/runs/$run_id/out/$arm" 'nohup bash "$KIT/kit/box/run.sh"'; do
+    case "$ud" in *"$want"*) ;; *) ud_ok=0; echo "  user-data $arm lacks: $want" ;; esac
+  done
+done
+flags_ok=1
+while IFS= read -r line; do
+  # printf %q escapes the braces and commas of the block device mapping.
+  line="${line//\\/}"
+  for want in '--instance-initiated-shutdown-behavior terminate' '--iam-instance-profile Name=ravel-clickbench-instance-profile' \
+    'VolumeSize=500,VolumeType=gp3' '--metadata-options HttpTokens=required'; do
+    case "$line" in *"$want"*) ;; *) flags_ok=0; echo "  run-instances lacks: $want" ;; esac
+  done
+done < <(grep '^DRY-RUN: aws ec2 run-instances' "$TMP/dry.err")
+if [ "$code" = 0 ] && [ -n "$run_id" ] && [ "$n_launch" = 2 ] \
+  && [ "$tokens" = "$run_id-A $run_id-B " ] && [ "$ud_ok" = 1 ] && [ "$flags_ok" = 1 ] \
+  && [ ! -s "$STUB_LOG" ] && grep -q "^instance A: *i-dryruna" "$TMP/dry.out" \
+  && grep -q "^instance B: *i-dryrunb" "$TMP/dry.out" \
+  && grep -q "^out prefix: *s3://kit-test-bucket/clickbench-kit/runs/$run_id/out/\$" "$TMP/dry.out"; then
+  pass "dry-run launches arm A and arm B under one run id with the full user-data"
+else
+  fail "dry-run" "exit $code, run id '$run_id', $n_launch launches, tokens '$tokens', aws calls $(wc -l <"$STUB_LOG")"
+fi
+DRY_STAGE="$(sed -n 's/^launch: staged in\/ files kept in //p' "$TMP/dry.err")"
+
+# Catches: a user-data that does not carry the staged kit.tgz's and run.toml's
+# own digests, leaving the box to trust a kit.sha256 read from S3.
+kit_sha="$(sha256sum "$DRY_STAGE/in/kit.tgz" 2>/dev/null | cut -d' ' -f1)"
+toml_sha="$(sha256sum "$DRY_STAGE/in/run.toml" 2>/dev/null | cut -d' ' -f1)"
+ud="$(sed -n '/^DRY-RUN user-data B:$/,/^DRY-RUN end user-data B$/p' "$TMP/dry.err")"
+if [ -n "$kit_sha" ] && [ -n "$toml_sha" ] \
+  && [[ "$ud" == *"printf '%s  %s\\n' $kit_sha kit.tgz $toml_sha run.toml >\"\$KIT/in/kit.sha256\""* ]] \
+  && [[ "$ud" == *'for f in kit.tgz run.toml; do'* ]]; then
+  pass "the user-data embeds the staged kit.tgz and run.toml digests and downloads no kit.sha256"
+else
+  fail "embedded digests" "kit.tgz $kit_sha, run.toml $toml_sha not in the user-data"
+fi
+[ -z "$DRY_STAGE" ] || rm -rf "$DRY_STAGE"
+
+# Catches: a band file still holding a FILL-IN placeholder in a section the
+# run selects reaching the launch, or a refusal that does not name the keys.
+# The checked-in rlog.toml's absolute section is not filled in yet.
+reset_log
+write_run_toml "$TMP/run-placeholder.toml" "benchmarks/clickbench/bands/rlog.toml"
+code=0
+bash "$KIT_SRC/launch.sh" --dry-run "$TMP/run-placeholder.toml" >"$TMP/ph.out" 2>"$TMP/ph.err" || code=$?
+if [ "$code" = 64 ] \
+  && grep -q 'placeholder value in absolute.hot_sum_s_max, absolute.cold_sum_s_max, absolute.error_pooled_max, absolute.concurrent_qps_min, absolute.concurrent_error_pooled_max, absolute.q29_probe_s_max, absolute.hot_s_max.q01, ' "$TMP/ph.err" \
+  && grep -q 'absolute.hot_s_max.q43; fill it in' "$TMP/ph.err" && ! grep -q 'DRY-RUN' "$TMP/ph.err"; then
+  pass "a placeholder in a selected band section is refused, naming the keys"
+else
+  fail "placeholder" "exit $code: $(head -c 300 "$TMP/ph.err")"
+fi
+
+# Catches: placeholders refused in a section the run does not select, which
+# would block every run until the absolute bands are measured.
+write_run_toml "$TMP/run-relonly.toml" "benchmarks/clickbench/bands/rlog.toml" '["relative"]'
+code=0
+bash "$KIT_SRC/launch.sh" --dry-run "$TMP/run-relonly.toml" >/dev/null 2>"$TMP/relonly.err" || code=$?
+if [ "$code" = 0 ] && grep -q '^DRY-RUN: aws ec2 run-instances' "$TMP/relonly.err"; then
+  pass "placeholders in an unselected band section are allowed"
+else
+  fail "unselected placeholder" "exit $code: $(head -c 300 "$TMP/relonly.err")"
+fi
+DRY_STAGE="$(sed -n 's/^launch: staged in\/ files kept in //p' "$TMP/relonly.err")"
+[ -z "$DRY_STAGE" ] || rm -rf "$DRY_STAGE"
+
+# Catches: a placeholder in the relative section slipping through when only
+# the absolute section was checked.
+sed 's/^qps_min_ratio = .*/qps_min_ratio = "FILL-IN-LATER"/' "$BANDS" >"$TMP/rlog-relph.toml"
+write_run_toml "$TMP/run-relph.toml" "$TMP/rlog-relph.toml" '["relative"]'
+code=0
+bash "$KIT_SRC/launch.sh" --dry-run "$TMP/run-relph.toml" >/dev/null 2>"$TMP/relph.err" || code=$?
+if [ "$code" = 64 ] && grep -q 'placeholder value in relative.qps_min_ratio;' "$TMP/relph.err"; then
+  pass "a placeholder in the relative section is refused, naming the key"
+else
+  fail "relative placeholder" "exit $code: $(head -c 300 "$TMP/relph.err")"
+fi
+
+# band_case NAME SED WANT: kit.py check-bands on a copy of the filled band file
+# edited by SED must exit 2 with WANT in its message.
+band_case() {
+  local name="$1" edit="$2" want="$3" code=0
+  sed "$edit" "$BANDS" >"$TMP/rlog-$name.toml"
+  python3 "$KIT_SRC/lib/kit.py" check-bands rlog "$TMP/rlog-$name.toml" relative absolute \
+    >/dev/null 2>"$TMP/bands-$name.err" || code=$?
+  if [ "$code" = 2 ] && grep -qF -- "$want" "$TMP/bands-$name.err"; then
+    pass "check-bands refuses a $name key, naming it"
+  else
+    fail "check-bands $name" "exit $code: $(head -c 300 "$TMP/bands-$name.err")"
+  fi
+}
+# Catches: a key the kit no longer reads (the old concurrency ceiling) kept in
+# a band file as if it still bound something.
+band_case removed '/^\[relative\]$/a\
+concurrency_error_ratio_ceiling = 0.01' \
+  'removed key(s) relative.concurrency_error_ratio_ceiling; delete them'
+# Catches: a misspelt key accepted, leaving the band it meant unset.
+band_case unknown 's/^qps_min_ratio = /qps_min_ratoi = /' 'unknown key(s) relative.qps_min_ratoi for lane rlog'
+# Catches: a band file with a required key absent judged anyway.
+band_case missing '/^cold_sum_max_ratio = /d' 'missing required key(s) relative.cold_sum_max_ratio'
+# Catches: a box speed band with one bound silently skipped, or one whose
+# bounds exclude a ratio of 1, so two identical boxes would read INVALID.
+band_case "lone box_speed_min_ratio" '/^box_speed_max_ratio = /d' \
+  'set both of relative.box_speed_min_ratio and relative.box_speed_max_ratio or neither'
+band_case "box_speed_min_ratio above 1" 's/^box_speed_min_ratio = .*/box_speed_min_ratio = 1.1/' \
+  'relative.box_speed_min_ratio must be above 0 and at most 1, and relative.box_speed_max_ratio at least 1, got 1.1 and 1.05'
+# Catches: a published machine table judged with a statement row misspelt,
+# missing, or holding a figure that is neither a number nor "null", or with a
+# source that does not name a file and a commit.
+band_case "published unknown" '/^\[published\.c6a\.large\]$/a\
+q44 = [1.0, 1.0]' 'unknown key(s) published.c6a.large.q44 for lane rlog'
+band_case "published missing" '/^q09 = \[13.433, 14.736\]$/d' \
+  'missing required key(s) published.c6a.large.q09'
+band_case "published malformed" 's/^q09 = \[13.433, 14.736\]$/q09 = [13.433, "none"]/' \
+  "published.c6a.large.q09 must be [hot, cold], each a number of at least 0 or 'null', got [13.433, 'none']"
+band_case "published source" 's/^\(source = ".*c6a.large.json\)@[0-9a-f]*"$/\1"/' \
+  "published.c6a.large.source must be <file>.json@<40-hex commit>"
+band_case "published ratio" '/^concurrent_qps_min_ratio = /d' \
+  'missing required key(s) published.concurrent_qps_min_ratio'
+
+# run_case NAME SED WANT: kit.py check-run on a copy of the run.toml edited by
+# SED must exit 2 with WANT in its message.
+run_case() {
+  local name="$1" edit="$2" want="$3" code=0
+  sed "$edit" "$RUN_TOML" >"$TMP/run-$name.toml"
+  python3 "$KIT_SRC/lib/kit.py" check-run "$TMP/run-$name.toml" >/dev/null 2>"$TMP/run-$name.err" || code=$?
+  if [ "$code" = 2 ] && grep -qF -- "$want" "$TMP/run-$name.err"; then
+    pass "check-run refuses $name, naming it"
+  else
+    fail "check-run $name" "exit $code: $(head -c 300 "$TMP/run-$name.err")"
+  fi
+}
+# Catches: a misspelt optional key accepted, leaving the default it meant to
+# override in force.
+run_case "an unknown top-level key" '/^shards = /i\
+shardz = 9' 'unknown key(s) shardz'
+run_case "an unknown table" '$a\
+[extra]\
+x = 1' 'unknown table(s) [extra]'
+run_case "an unknown [bands] key" '$a\
+parquet = "benchmarks/clickbench/bands/parquet.toml"' 'unknown key(s) bands.parquet'
+
+run_case "a truncated rustfs_sha256" 's/^rustfs_sha256 = .*/rustfs_sha256 = "abc123"/' \
+  'rustfs_sha256 must be 64 lowercase hex digits'
+
+# Catches: a perf phase that runs without the run.toml saying perf_record =
+# true, whether the key is false or left at its default.
+run_case "phase perf with perf_record false" \
+  's/^phases = .*/phases = ["benchmark", "perf"]\nperf_record = false/' 'phase perf needs perf_record = true'
+run_case "phase perf with perf_record left out" \
+  's/^phases = .*/phases = ["benchmark", "perf"]/' 'phase perf needs perf_record = true'
+# Catches: a phase key of the wrong type reaching the box, where bash
+# arithmetic or the seed would take it as something else.
+run_case "a string concurrent_rounds" 's/^shards = /concurrent_rounds = "3"\n&/' \
+  "concurrent_rounds must be a whole number of at least 1, got '3'"
+run_case "a zero concurrent_connections" 's/^shards = /concurrent_connections = 0\n&/' \
+  'concurrent_connections must be a whole number of at least 1, got 0'
+run_case "a boolean concurrent_duration_s" 's/^shards = /concurrent_duration_s = true\n&/' \
+  'concurrent_duration_s must be a whole number of at least 1, got True'
+run_case "a numeric concurrent_seed" 's/^shards = /concurrent_seed = 7\n&/' \
+  'concurrent_seed must be a non-empty string, got 7'
+run_case "a negative q29_probe_warmup" 's/^shards = /q29_probe_warmup = -1\n&/' \
+  'q29_probe_warmup must be a whole number of at least 0, got -1'
+run_case "a zero q29_probe_runs" 's/^shards = /q29_probe_runs = 0\n&/' \
+  'q29_probe_runs must be a whole number of at least 1, got 0'
+run_case "a string perf_record" 's/^shards = /perf_record = "true"\n&/' \
+  "perf_record must be true or false, got 'true'"
+# Catches: box_speed_band read by truthiness, so "no" would leave the band
+# enforced or "false" as a string switch it off.
+run_case "a string box_speed_band" 's/^shards = /box_speed_band = "false"\n&/' \
+  "box_speed_band must be true or false, got 'false'"
+
+# Catches: an arm's extra server flags overriding a flag the kit sets, so the
+# arms differ by a setting nobody declared, in either spelling of the flag.
+run_case "a server_flags_b repeating --shards" 's/^shards = /server_flags_b = ["--fetch-concurrency", "64", "--shards", "4"]\n&/' \
+  'server_flags_b repeats --shards, which the kit sets itself'
+run_case "a server_flags_a repeating --memory-budget-bytes=" 's/^shards = /server_flags_a = ["--memory-budget-bytes=1"]\n&/' \
+  'server_flags_a repeats --memory-budget-bytes, which the kit sets itself'
+run_case "a string server_flags_a" 's/^shards = /server_flags_a = "--fetch-concurrency 64"\n&/' \
+  "server_flags_a must be an array of non-empty strings, got '--fetch-concurrency 64'"
+# Catches: a flag the kit does not set refused, or read back as anything but
+# its entries one per line.
+code=0
+sed 's/^shards = /server_flags_a = []\nserver_flags_b = ["--fetch-concurrency", "64"]\n&/' "$RUN_TOML" >"$TMP/run-newflag.toml"
+python3 "$KIT_SRC/lib/kit.py" check-run "$TMP/run-newflag.toml" >/dev/null 2>"$TMP/run-newflag.err" || code=$?
+got_b="$(python3 "$KIT_SRC/lib/kit.py" get "$TMP/run-newflag.toml" server_flags_b 2>&1 | tr '\n' ' ')"
+got_a="$(python3 "$KIT_SRC/lib/kit.py" get "$TMP/run-newflag.toml" server_flags_a 2>&1)"
+if [ "$code" = 0 ] && [ "$got_b" = "--fetch-concurrency 64 " ] && [ -z "$got_a" ]; then
+  pass "check-run accepts an extra server flag the kit does not set"
+else
+  fail "check-run new flag" "exit $code, b '$got_b', a '$got_a': $(head -c 300 "$TMP/run-newflag.err")"
+fi
+
+# Catches: an absent optional key and an unreadable run.toml giving the same
+# answer from kit.py get, so run.sh would take a failed read for "no extra
+# flags": absent is exit 3, a file that cannot be read is exit 2.
+absent=0 unreadable=0
+python3 "$KIT_SRC/lib/kit.py" get "$RUN_TOML" server_flags_b >/dev/null 2>&1 || absent=$?
+python3 "$KIT_SRC/lib/kit.py" get "$TMP/no-such-run.toml" server_flags_b >/dev/null 2>&1 || unreadable=$?
+if [ "$absent" = 3 ] && [ "$unreadable" = 2 ]; then
+  pass "kit.py get exits 3 for an absent key and 2 for a file it cannot read"
+else
+  fail "get exit codes" "absent $absent, unreadable $unreadable"
+fi
+
+# Catches: healthz_phases naming a phase the sampler does not cover, naming
+# one twice, or not being an array.
+run_case "a healthz_phases naming q29_probe" 's/^shards = /healthz_phases = ["benchmark", "q29_probe"]\n&/' \
+  "healthz_phases must be an array of distinct phases from benchmark, concurrent, got ['benchmark', 'q29_probe']"
+run_case "a healthz_phases naming a phase twice" 's/^shards = /healthz_phases = ["concurrent", "concurrent"]\n&/' \
+  "healthz_phases must be an array of distinct phases from benchmark, concurrent, got ['concurrent', 'concurrent']"
+run_case "a string healthz_phases" 's/^shards = /healthz_phases = "benchmark"\n&/' \
+  "healthz_phases must be an array of distinct phases from benchmark, concurrent, got 'benchmark'"
+
+# Catches: a stamped server setting that a start logged zero times or twice
+# being stamped as a list, which two arms then compare equal on.
+settings_case() {
+  local name="$1" drop="$2" dup="$3" want="$4" code=0 log="$TMP/settings-$1.log"
+  : >"$log"
+  for kv in fetch_concurrency=32 cache_max_bytes=7689077760 catalog_cache_max_bytes=1537815552 \
+    sql_max_query_bytes=16451897344 sql_tenant_max_bytes=32903794688; do
+    [ "${kv%%=*}" = "$drop" ] && continue
+    printf 'INFO ravel_server::config: performance default resolved setting="%s" value=%s source="derived"\n' \
+      "${kv%%=*}" "${kv#*=}" >>"$log"
+    [ "${kv%%=*}" = "$dup" ] && printf 'INFO ravel_server::config: performance default resolved setting="%s" value=%s source="derived"\n' \
+      "${kv%%=*}" "${kv#*=}" >>"$log"
+  done
+  python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import kit
+try:
+    print(kit.server_settings([sys.argv[2]]))
+except kit.Refusal as e:
+    print(e, file=sys.stderr); sys.exit(2)' "$KIT_SRC/lib" "$log" >"$TMP/settings-$name.out" 2>"$TMP/settings-$name.err" || code=$?
+  if [ -z "$want" ]; then
+    if [ "$code" = 0 ] && grep -qF "'fetch_concurrency': 32" "$TMP/settings-$name.out"; then
+      pass "server settings: $name stamps one number per setting"
+    else
+      fail "server settings $name" "exit $code: $(head -c 300 "$TMP/settings-$name.err")"
+    fi
+  elif [ "$code" = 2 ] && grep -qF -- "$want" "$TMP/settings-$name.err"; then
+    pass "server settings: $name is refused, naming the setting"
+  else
+    fail "server settings $name" "exit $code: $(head -c 300 "$TMP/settings-$name.err") $(head -c 200 "$TMP/settings-$name.out")"
+  fi
+}
+settings_case "all five once" "" "" ""
+settings_case "a setting absent" fetch_concurrency "" 'carries fetch_concurrency 0 times, not once'
+settings_case "a setting logged twice" "" cache_max_bytes 'carries cache_max_bytes 2 times, not once'
+
+# Catches: launching (or uploading) when the instance role could not write
+# results, or a refusal that does not name the role.
+reset_log
+code=0
+STUB_DENY_ACTION=s3:PutObject bash "$KIT_SRC/launch.sh" "$RUN_TOML" >/dev/null 2>"$TMP/deny.err" || code=$?
+if [ "$code" = 65 ] && grep -q 'role arn:aws:iam::123456789012:role/kit-test-role (instance profile ravel-clickbench-instance-profile) lacks s3:PutObject' "$TMP/deny.err" \
+  && ! grep -q 'aws s3 cp' "$STUB_LOG" && ! grep -q 'run-instances' "$STUB_LOG"; then
+  pass "a role without s3:PutObject is refused by name before any upload"
+else
+  fail "role check" "exit $code: $(head -c 300 "$TMP/deny.err")"
+fi
+
+# Catches: a role check that asks about some resource other than the run's own
+# in/ and out/ prefixes. The stub role may only use clickbench-kit/runs/, so a
+# run under another prefix must be refused, naming the resource.
+reset_log
+sed 's/^prefix = .*/prefix = "elsewhere"/' "$RUN_TOML" >"$TMP/run-prefix.toml"
+code=0
+bash "$KIT_SRC/launch.sh" "$TMP/run-prefix.toml" >/dev/null 2>"$TMP/prefix.err" || code=$?
+if [ "$code" = 65 ] && grep -q 'lacks s3:GetObject on arn:aws:s3:::kit-test-bucket/elsewhere/runs/.*/in/\*' "$TMP/prefix.err" \
+  && grep -q 'simulate-principal-policy .*--resource-arns arn:aws:s3:::kit-test-bucket/elsewhere/runs/' "$STUB_LOG" \
+  && ! grep -q 'aws s3 cp' "$STUB_LOG" && ! grep -q 'run-instances' "$STUB_LOG"; then
+  pass "the role check asks about the run's own prefix and refuses a role that lacks it"
+else
+  fail "role prefix" "exit $code: $(head -c 300 "$TMP/prefix.err")"
+fi
+
+# Catches: an unreadable instance profile treated as anything but a role
+# refusal (exit 65), or reaching an upload.
+reset_log
+code=0
+STUB_NO_PROFILE=1 bash "$KIT_SRC/launch.sh" "$RUN_TOML" >/dev/null 2>"$TMP/noprofile.err" || code=$?
+if [ "$code" = 65 ] && grep -q 'cannot read instance profile ravel-clickbench-instance-profile' "$TMP/noprofile.err" \
+  && ! grep -q 'aws s3 cp' "$STUB_LOG" && ! grep -q 'run-instances' "$STUB_LOG"; then
+  pass "a missing instance profile exits 65 before any upload"
+else
+  fail "missing profile" "exit $code: $(head -c 300 "$TMP/noprofile.err")"
+fi
+
+# Catches: a failed second launch leaving the first instance running.
+reset_log
+code=0
+STUB_FAIL_ARM=B bash "$KIT_SRC/launch.sh" "$RUN_TOML" >/dev/null 2>"$TMP/failb.err" || code=$?
+if [ "$code" = 1 ] && grep -q 'ec2 terminate-instances .*--instance-ids i-0aaaaaaaaaaaaaaaa' "$STUB_LOG"; then
+  pass "a failed arm B launch terminates arm A"
+else
+  fail "failed launch cleanup" "exit $code: $(tail -n 3 "$TMP/failb.err")"
+fi
+
+# The real launch every box case below boots from. Catches: in/ missing a
+# file, a kit.tgz shipping anything beyond the box script, kit.py, the corpus,
+# the lane band files and SHA256SUMS, or two launches sharing a client token.
+reset_log
+code=0
+bash "$KIT_SRC/launch.sh" "$RUN_TOML" >"$TMP/launch.out" 2>"$TMP/launch.err" || code=$?
+RUN_ID="$(sed -n 's/^run id: *//p' "$TMP/launch.out")"
+RUN_DIR="$FAKE_S3/kit-test-bucket/clickbench-kit/runs/$RUN_ID"
+tar_list="$(tar -tzf "$RUN_DIR/in/kit.tgz" 2>/dev/null | grep -v '/$' | LC_ALL=C sort | tr '\n' ' ')"
+if [ "$code" = 0 ] && [ -f "$RUN_DIR/in/kit.tgz" ] && [ -f "$RUN_DIR/in/kit.sha256" ] && [ -f "$RUN_DIR/in/run.toml" ] \
+  && [ "$tar_list" = "kit/SHA256SUMS kit/bands/rlog.toml kit/box/run.sh kit/corpus.json kit/lib/kit.py " ] \
+  && [ "$(sort -u "$STUB_DIR/client-tokens" | wc -l | tr -d ' ')" = 2 ] \
+  && [ -s "$STUB_DIR/userdata-A" ] && [ -s "$STUB_DIR/userdata-B" ]; then
+  pass "launch uploads kit.tgz, kit.sha256 and run.toml to in/ and launches both arms"
+else
+  fail "launch" "exit $code, run id '$RUN_ID', kit.tgz holds '$tar_list'"
+fi
+cp "$STUB_DIR/userdata-A" "$TMP/userdata-A"
+cp "$STUB_DIR/userdata-B" "$TMP/userdata-B"
+IN_SAVED="$TMP/in-saved"
+cp -R "$RUN_DIR/in" "$IN_SAVED"
+
+# --- user-data --------------------------------------------------------------
+
+# boot_box ARM BOX: run the arm's user-data with /root/kit moved to BOX/kit.
+boot_box() {
+  local arm="$1" box="$2"
+  rm -rf "$box"
+  mkdir -p "$box"
+  grep -q '^KIT=/root/kit$' "$TMP/userdata-$arm" || { echo "  user-data has no KIT=/root/kit line"; return 1; }
+  sed "s#^KIT=/root/kit\$#KIT=$box/kit#" "$TMP/userdata-$arm" >"$box/user-data.sh"
+  bash "$box/user-data.sh"
+  # nohup's stub ran in the background.
+  local i
+  for ((i = 0; i < 50; i++)); do
+    grep -q '^nohup ' "$STUB_LOG" && break
+    grep -q "^aws s3 cp .*out/$arm/FAILED" "$STUB_LOG" && break
+    sleep 0.1
+  done
+}
+
+# Catches: a user-data that starts run.sh without the kit and run.toml in
+# place, or writes the wrong arm or run id.
+reset_log
+BOX_UD="$TMP/box-ud"
+code=0
+boot_box A "$BOX_UD" || code=$?
+if [ "$code" = 0 ] && grep -q "^nohup bash $BOX_UD/kit/kit/box/run.sh\$" "$STUB_LOG" \
+  && grep -q '^shutdown -h +600$' "$STUB_LOG" && ! grep -q '^shutdown -h now' "$STUB_LOG" \
+  && [ "$(cat "$BOX_UD/kit/ARM")" = A ] && [ "$(cat "$BOX_UD/kit/RUN_ID")" = "$RUN_ID" ] \
+  && cmp -s "$BOX_UD/kit/run.toml" "$IN_SAVED/run.toml" && [ -f "$BOX_UD/kit/kit/box/run.sh" ]; then
+  pass "user-data arms shutdown -h +600, verifies the kit and starts run.sh under nohup"
+else
+  fail "user-data" "exit $code; log: $(tr '\n' ';' <"$STUB_LOG" | head -c 400)"
+fi
+
+# Catches: launch uploading the run.toml as given, so the box falls back to
+# defaults the laptop never recorded, or changing a key the file did set.
+added="$(diff "$RUN_TOML" "$IN_SAVED/run.toml" | sed -n 's/^> //p' | grep -v '^#' | grep -v '^$' | tr '\n' ';')"
+removed="$(diff "$RUN_TOML" "$IN_SAVED/run.toml" | grep -c '^<')"
+if [ "$added" = 'concurrent_rounds = 3;concurrent_connections = 10;concurrent_duration_s = 600;concurrent_seed = "clickbench";q29_probe_warmup = 1;q29_probe_runs = 3;perf_record = false;' ] \
+  && [ "$removed" = 0 ] && python3 "$KIT_SRC/lib/kit.py" check-run "$IN_SAVED/run.toml" >/dev/null; then
+  pass "launch uploads run.toml with every phase key it left out written at its default"
+else
+  fail "resolved run.toml" "added '$added', removed $removed line(s)"
+fi
+
+# Catches: dropping or weakening the kit.sha256 check: a tampered kit.tgz
+# must stop the box before anything runs, upload FAILED and shut down.
+reset_log
+printf 'x' >>"$RUN_DIR/in/kit.tgz"
+BOX_T="$TMP/box-tampered"
+boot_box B "$BOX_T"
+if [ -f "$RUN_DIR/out/B/FAILED" ] && grep -q 'FAILED step=user-data sha256 check of kit.tgz and run.toml' "$RUN_DIR/out/B/FAILED" \
+  && ! grep -q '^nohup' "$STUB_LOG" && grep -q '^shutdown -h now' "$STUB_LOG" && [ ! -e "$BOX_T/kit/kit" ]; then
+  pass "a tampered kit.tgz fails the box before any step runs"
+else
+  fail "tampered kit.tgz" "log: $(tr '\n' ';' <"$STUB_LOG" | head -c 400)"
+fi
+rm -rf "$RUN_DIR/out/B"
+cp "$IN_SAVED/kit.tgz" "$RUN_DIR/in/kit.tgz"
+
+# Catches: a box that trusts a kit.sha256 read from S3: whoever can rewrite
+# kit.tgz there can rewrite that file too, so a changed kit.tgz under a
+# recomputed kit.sha256 must still fail against the user-data's own digests.
+reset_log
+mkdir -p "$TMP/retar"
+tar -xzf "$IN_SAVED/kit.tgz" -C "$TMP/retar"
+echo 'echo tampered' >>"$TMP/retar/kit/box/run.sh"
+tar -czf "$RUN_DIR/in/kit.tgz" -C "$TMP/retar" kit
+(cd "$RUN_DIR/in" && sha256sum kit.tgz run.toml >kit.sha256)
+boot_box B "$BOX_T"
+if grep -q 'FAILED step=user-data sha256 check of kit.tgz and run.toml' "$RUN_DIR/out/B/FAILED" 2>/dev/null \
+  && ! grep -q '^nohup' "$STUB_LOG" && grep -q '^shutdown -h now' "$STUB_LOG"; then
+  pass "a tampered kit.tgz under a recomputed kit.sha256 fails on the user-data's digests"
+else
+  fail "recomputed kit.sha256" "log: $(tr '\n' ';' <"$STUB_LOG" | head -c 400)"
+fi
+rm -rf "$RUN_DIR/out/B"
+
+# Catches: dropping the SHA256SUMS check: the same changed kit file, with the
+# user-data's own kit.tgz digest updated to match, must fail on SHA256SUMS.
+reset_log
+cp "$TMP/userdata-B" "$TMP/userdata-B.orig"
+old_sha="$(sha256sum "$IN_SAVED/kit.tgz" | cut -d' ' -f1)"
+new_sha="$(sha256sum "$RUN_DIR/in/kit.tgz" | cut -d' ' -f1)"
+sed "s/$old_sha kit.tgz/$new_sha kit.tgz/" "$TMP/userdata-B.orig" >"$TMP/userdata-B"
+boot_box B "$BOX_T"
+if grep -q "$new_sha kit.tgz" "$TMP/userdata-B" \
+  && grep -q 'FAILED step=user-data sha256 check of the kit files' "$RUN_DIR/out/B/FAILED" 2>/dev/null \
+  && ! grep -q '^nohup' "$STUB_LOG"; then
+  pass "a kit file changed under matching kit.tgz digests fails on SHA256SUMS"
+else
+  fail "SHA256SUMS check" "log: $(tr '\n' ';' <"$STUB_LOG" | head -c 400)"
+fi
+mv "$TMP/userdata-B.orig" "$TMP/userdata-B"
+rm -rf "$RUN_DIR/out/B"
+cp "$IN_SAVED/kit.tgz" "$IN_SAVED/kit.sha256" "$RUN_DIR/in/"
+
+# --- box/run.sh -------------------------------------------------------------
+
+# The box driver: run.sh's own main, with the bootstrap steps that need the
+# network or a compiler replaced, and run_query wrapped by a counter the way
+# a later phase would wrap it.
+cat >"$TMP/box-driver.sh" <<'DRIVER'
+#!/usr/bin/env bash
+export KIT_ROOT="$1"
+export KIT_RUN_SH_LIB=1
+export KIT_IMDS=http://imds.invalid
+export KIT_DROP_CACHES_FILE="$KIT_ROOT/drop_caches"
+export KIT_READY_TRIES=100 KIT_READY_INTERVAL=0.02
+# shellcheck source=/dev/null
+. "$KIT_ROOT/kit/kit/box/run.sh"
+# DRIVER_NO_REDACT=1: redaction replaces nothing, so the leak check must
+# refuse what it is handed, and a key is logged again just before the evidence
+# step so it sits inside FAILED's run.log tail.
+if [ -n "${DRIVER_NO_REDACT:-}" ]; then
+  scrub() { :; }
+  eval "real_write_evidence() $(declare -f write_evidence | tail -n +2)"
+  write_evidence() {
+    echo "rustfs: still running with secret_key=$RUSTFS_SECRET_KEY" >&2
+    real_write_evidence
+  }
+fi
+bootstrap_packages() { :; }
+bootstrap_toolchain() { :; }
+bootstrap_source() {
+  mkdir -p "$RAVEL_DIR/benchmarks/clickbench"
+  echo '# mapping' >"$MAPPING"
+  printf 'rustc 1.90.0 (stub)\ncargo 1.90.0 (stub)\n' >"$STAMPS/toolchain"
+}
+start_dataset_download() { :; }
+bootstrap_build() {
+  mkdir -p "$BIN_DIR"
+  cp "$BINSTUBS/ravel-cli" "$BIN_DIR/ravel-cli-$SHA"
+  cp "$BINSTUBS/ravel-server" "$BIN_DIR/ravel-server-$SHA"
+}
+wait_dataset() { echo 1111111111111111111111111111111111111111111111111111111111111111 >"$KIT/dataset.sha256"; }
+# RustFS logging its own keys, into its log and into run.log, neither of
+# which the evidence or FAILED may carry. DRIVER_REAL_RUSTFS=1 keeps run.sh's
+# own bootstrap_rustfs, for a case that never gets past its version check.
+if [ -z "${DRIVER_REAL_RUSTFS:-}" ]; then
+  bootstrap_rustfs() {
+    make_secrets && echo 'rustfs 1.0.0-stub' >"$KIT/rustfs.version" && . "$SECRETS_ENV" \
+      && echo "rustfs: starting with access_key=$RUSTFS_ACCESS_KEY secret_key=$RUSTFS_SECRET_KEY" >"$KIT/rustfs.log" \
+      && echo "rustfs: starting with access_key=$RUSTFS_ACCESS_KEY secret_key=$RUSTFS_SECRET_KEY" >&2
+  }
+fi
+# DRIVER_HEALTHZ_EDIT=dup repeats healthz.txt's first line after the phases
+# ran, and =drop deletes its HEARTBEAT line.
+if [ -n "${DRIVER_HEALTHZ_EDIT:-}" ]; then
+  eval "real_run_phases() $(declare -f run_phases | tail -n +2)"
+  run_phases() {
+    real_run_phases || return 1
+    case "$DRIVER_HEALTHZ_EDIT" in
+      dup) head -n 1 "$OUT/healthz.txt" >>"$OUT/healthz.txt" ;;
+      drop) grep -v '^HEARTBEAT ' "$OUT/healthz.txt" >"$OUT/healthz.txt.new" \
+        && mv "$OUT/healthz.txt.new" "$OUT/healthz.txt" ;;
+    esac
+  }
+fi
+drop_caches() {
+  echo drop >>"$STUB_DIR/sequence"
+  sync
+  echo 3 >"$DROP_CACHES_FILE"
+}
+# GNU time is not on every CI image; run.sh's own do_load and do_compact run
+# with only the timing wrapper replaced. It writes load.time as GNU time would
+# with run.sh's format, or DRIVER_LOAD_TIME's text in its place; "none" writes
+# no file.
+timed() {
+  local file="$1" code=0
+  shift 2
+  "$@" || code=$?
+  case "${file##*/}:${DRIVER_LOAD_TIME:-}" in
+    load.time:none) ;;
+    load.time:*)
+      printf '%s\n' "${DRIVER_LOAD_TIME:-wall=1500.25 rss_kb=4000000 user=6000.50 sys=120.75}" >"$file" ;;
+  esac
+  return "$code"
+}
+eval "real_run_query() $(declare -f run_query | tail -n +2)"
+run_query() {
+  echo "$*" >>"$STUB_DIR/run_query-calls"
+  echo "try$4" >>"$STUB_DIR/sequence"
+  real_run_query "$@"
+}
+main
+DRIVER
+export BINSTUBS
+
+# run_box ARM NAME [ENV=VALUE...]: boot a box for ARM and run main on it.
+# BOX_TOML_SED, when set, is a sed script applied to the box's run.toml after
+# boot (the user-data has checked its digest by then).
+run_box() {
+  local arm="$1" name="$2" box="$TMP/$2" code=0
+  shift 2
+  reset_log
+  rm -f "$STUB_DIR/server-argv" "$STUB_DIR/cli-argv" "$STUB_DIR/curl-sql" "$STUB_DIR/run_query-calls" \
+    "$STUB_DIR/objects" "$STUB_DIR/sql-bodies" "$STUB_DIR/sequence" "$STUB_DIR/verify-bodies" \
+    "$STUB_DIR/server-ready"
+  boot_box "$arm" "$box" || return 1
+  if [ -n "${BOX_TOML_SED:-}" ]; then
+    sed "$BOX_TOML_SED" "$box/kit/run.toml" >"$box/kit/run.toml.new" && mv "$box/kit/run.toml.new" "$box/kit/run.toml"
+  fi
+  env "$@" bash "$TMP/box-driver.sh" "$box" >"$box/kit/run.log" 2>&1 || code=$?
+  return "$code"
+}
+
+# The happy path: arm A, every statement answered with its expected rows.
+BOX_A="$TMP/box-a"
+code=0
+run_box A box-a STUB_SQL_TIME=0.5 || code=$?
+OUT_A="$RUN_DIR/out/A"
+
+# Catches: a run that does not end in DONE with results.json, evidence.tgz and
+# progress.log uploaded, or that leaves its instance running.
+if [ "$code" = 0 ] && grep -q '^DONE bands=pass ' "$OUT_A/DONE" 2>/dev/null && [ -f "$OUT_A/results.json" ] \
+  && [ -f "$OUT_A/evidence.tgz" ] && [ -f "$OUT_A/progress.log" ] && [ ! -e "$OUT_A/FAILED" ] \
+  && grep -q 'ec2 terminate-instances .*--instance-ids i-0b0x00000000000001' "$STUB_LOG"; then
+  pass "box run uploads results.json, evidence.tgz, progress.log and DONE, then terminates itself"
+else
+  fail "box run" "exit $code; $(cat "$OUT_A/FAILED" 2>/dev/null | head -n 3); run.log: $(tail -n 5 "$BOX_A/kit/run.log")"
+fi
+
+# Catches: a terminate that succeeds through the API taken as the end of the
+# box: `shutdown -h now` must still run, exactly once, after it.
+term_line="$(grep -n 'ec2 terminate-instances' "$STUB_LOG" | head -n 1 | cut -d: -f1)"
+shut_line="$(grep -n '^shutdown -h now$' "$STUB_LOG" | head -n 1 | cut -d: -f1)"
+if [ -n "$term_line" ] && [ -n "$shut_line" ] && [ "$shut_line" -gt "$term_line" ] \
+  && [ "$(grep -c '^shutdown -h now$' "$STUB_LOG")" = 1 ] \
+  && grep -q 'terminate instance=i-0b0x00000000000001' "$BOX_A/kit/progress.log" 2>/dev/null; then
+  pass "a successful terminate is still followed by one shutdown -h now"
+else
+  fail "shutdown after terminate" "terminate at line '$term_line', shutdown at '$shut_line': $(tr '\n' ';' <"$STUB_LOG" | tail -c 300)"
+fi
+
+# Catches: results.json leaving SqlLatencyReport's statement shape (entries of
+# EntryReport, failed of FailedEntry), losing a provenance stamp, the fold,
+# BurstBalance or query window stamps, the per-statement answer check, or the
+# bands block; or a band row carrying a q-prefixed id, which analyse.py would
+# count as a second report row.
+check="$(python3 - "$OUT_A/results.json" "$SHA_A" "$REPO_ROOT/benchmarks/clickbench/hits.corpus.json" "$DATASET_SHA" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+corpus = {e["id"]: e.get("expected_rows") for e in json.load(open(sys.argv[3]))["entries"]}
+p = r["provenance"]
+bad = []
+def want(cond, what):
+    if not cond:
+        bad.append(what)
+for k in ("provenance", "entries", "skipped", "failed", "totals", "error_pooled", "concurrent",
+          "q29_probe", "phases", "bands", "timing_definition"):
+    want(k in r, "field " + k)
+for k in ("git_sha", "binary", "arm", "tenant", "server", "server_logs", "server_settings",
+          "band_sections", "kit_arm", "run_id", "lanes", "toolchain", "hardware", "backend",
+          "corpus_digest", "server_flags", "audit_mode", "burst_balance", "fold", "object_counts",
+          "query_window", "row_count", "box_speed"):
+    want(k in p, "provenance." + k)
+want(p.get("box_speed") == {"basis": "load_user_cpu_s", "load_user_cpu_s": 6000.5,
+                            "load_wall_s": 1500.25, "reason": None},
+     "box_speed stamp %r" % p.get("box_speed"))
+rc = p.get("row_count") or {}
+want(rc.get("rows_expected") == 99997497 and rc.get("load_rows_written") == 99997497
+     and rc.get("count_star") == 99997497 and rc.get("statement") == "q01_count_all", "row_count stamp %r" % rc)
+want(isinstance(r.get("timing_definition"), str) and "tries 2 and 3" in r["timing_definition"]
+     and "try 1" in r["timing_definition"], "timing_definition")
+want(p.get("git_sha") == sys.argv[2], "git_sha")
+want(p.get("arm") == "a" and p.get("kit_arm") == "A", "arm")
+want(p.get("server_settings", {}).get("sql_max_query_bytes") == 16451897344, "sql_max_query_bytes")
+want(len(p.get("server_logs", [])) == 43, "one server log per cold start")
+want(p.get("band_sections") == ["relative", "absolute"], "band_sections")
+w = p.get("query_window", {})
+want(w.get("window_hours") == 200000 and w.get("end", 0) - w.get("start", 0) == 720000000, "query_window")
+want(p.get("corpus_digest", {}).get("dataset_sha256") == sys.argv[4], "dataset_sha256")
+want(p.get("fold", {}).get("precondition") == "met" and p["fold"].get("seal_through_hour") == "Some(491234)"
+     and p["fold"].get("objects_written_by_load") == 100 and p["fold"].get("entry_count") == 100
+     and p["fold"].get("store_keys_added_by_load") == 200, "fold stamp %r" % p.get("fold"))
+want(p.get("object_counts") == {"before_load": 10, "after_load": 210}, "object_counts")
+for side in ("start", "end"):
+    b = (p.get("burst_balance") or {}).get(side) or {}
+    want(b.get("volume_type") == "gp3" and b.get("value") is None and "gp3" in b.get("reason", ""),
+         "burst_balance." + side)
+sf = p.get("server_flags", {})
+want("--memory-budget-bytes 25769803776" in sf.get("flags", "") and sf.get("extra_flags") == []
+     and sf.get("base_flags", [])[-2:] == ["--audit-mode", "off"]
+     and " ".join(sf.get("base_flags", [])) == sf.get("flags"), "server_flags %r" % sf)
+hz = r.get("healthz") or {}
+bench = (hz.get("phases") or {}).get("benchmark") or {}
+want(hz.get("interval_ms") == 250.0 and hz.get("timeout_ms") == 2000.0
+     and list(hz.get("phases", {})) == ["benchmark"] and bench.get("heartbeat_max_s") == 0.5
+     and sorted(bench.get("ports", {})) == ["4318", "4319"]
+     and all(v["n"] >= 43 and v["failures"] == 0 and 0 < v["p99_ms"] < 2000.0
+             for v in bench["ports"].values()), "healthz %r" % hz)
+want(p.get("audit_mode") == "off", "audit_mode")
+want(p.get("hardware", {}).get("instance_type") == "c6a.4xlarge"
+     and p["hardware"].get("cpu") == "Stub CPU 9000 @ 2.00GHz"
+     and p["hardware"].get("mem_total_kb") == 32000000, "hardware %r" % p.get("hardware"))
+want(p.get("backend", {}).get("store") == "rustfs", "backend")
+want(len(p.get("corpus_digest", {}).get("corpus_sha256", "")) == 64, "corpus_digest")
+want(p.get("toolchain", "").startswith("rustc 1.90.0"), "toolchain")
+entries = r.get("entries", [])
+want([e["id"] for e in entries] == list(corpus), "43 entries in corpus order")
+want(r.get("failed") == [] and r.get("skipped") == [], "no failed or skipped statements")
+for e in entries:
+    want(e["min_ms"] == 500.0 and e["median_ms"] == 500.0 and e["max_ms"] == 500.0
+         and e["cold_ms"] == 500.0, e["id"] + " timings")
+    want(e["per_run_accounting"] is None and e["error"] is None, e["id"] + " accounting/error")
+    exp = corpus[e["id"]]
+    want(e["answer"] == {"answered": True, "rows": exp if exp is not None else 3,
+                         "expected_rows": exp, "match": True if exp is not None else None},
+         e["id"] + " answer " + json.dumps(e["answer"]))
+    want(e["rows_returned"] == e["answer"]["rows"], e["id"] + " rows_returned")
+want(r["totals"] == {"answered": 43, "failed": [], "hot_sum_s": 21.5, "cold_sum_s": 21.5}, "totals")
+want(r["error_pooled"] == {"calls": 129, "errors": 0, "ratio": 0.0, "phases": ["benchmark"]},
+     "error_pooled")
+want(r["concurrent"] is None and r["q29_probe"] is None, "no concurrent or q29_probe block")
+want(r["phases"]["benchmark"]["calls"] == 129 and r["phases"]["benchmark"]["errors"] == 0
+     and r["phases"]["benchmark"]["refusal_classes"] == {}, "phases block")
+verdicts = {b["band"]: b["verdict"] for b in r["bands"]}
+want(len(r["bands"]) == 49 and [b["verdict"] for b in r["bands"]].count("pass") == 46,
+     "46 passing absolute bands")
+want([b["band"] for b in r["bands"] if b["verdict"] != "pass"]
+     == ["concurrent qps >= concurrent_qps_min",
+         "concurrent error_ratio_weighted <= concurrent_error_pooled_max",
+         "q29_probe min_s <= q29_probe_s_max"]
+     and all(b["verdict"] == "inconclusive" for b in r["bands"] if b["verdict"] != "pass"),
+     "the three phase bands inconclusive with their phases not run")
+want(verdicts.get("hot_sum_s <= hot_sum_s_max") == "pass", "hot band")
+want(verdicts.get("q01 hot_s <= hot_s_max.q01") == "pass", "q01 band")
+want(all(b.get("lane") == "rlog" and "id" not in b for b in r["bands"]), "band lanes and ids")
+print(",".join(bad))
+PY
+)" || check="python failed"
+if [ -z "$check" ] && python3 "$KIT_SRC/lib/kit.py" validate "$OUT_A/results.json"; then
+  pass "results.json is SqlLatencyReport-shaped with the answer checks, the provenance stamps and the bands"
+else
+  fail "results.json" "missing or wrong: $check"
+fi
+
+# Catches: the healthz sampler counting samples taken while the server was
+# down between statements, its raw samples left out of the evidence, or its
+# lines not printed once each. Each statement's server start opens one gate
+# generation, and a gated sample is one taken with the server up.
+rm -rf "$TMP/evidence-a"
+mkdir -p "$TMP/evidence-a"
+tar -xzf "$OUT_A/evidence.tgz" -C "$TMP/evidence-a" 2>/dev/null
+check="$(python3 - "$TMP/evidence-a/out" <<'PY' 2>&1
+import json, os, sys
+d = sys.argv[1]
+for name in ("4318", "4319", "metrics"):
+    recs = [json.loads(l) for l in open(os.path.join(d, "benchmark", "healthz", name + ".jsonl"))]
+    gated = [r for r in recs if r["gated"]]
+    if sorted(set(r["gen"] for r in gated)) != list(range(1, 44)):
+        print(name, "gated generations", sorted(set(r["gen"] for r in gated))[:5])
+    if any(not r["ok"] or r["status"] != 200 for r in gated):
+        print(name, "a gated sample not a 200", [r for r in gated if not r["ok"]][:1])
+    if name != "metrics" and any(not isinstance(r.get("ms"), float) for r in recs):
+        print(name, "a sample without ms")
+lines = open(os.path.join(d, "healthz.txt")).read().splitlines()
+if [l.split(" n=")[0] for l in lines] != ["HEALTHZ phase=benchmark port=4318", "HEALTHZ phase=benchmark port=4319",
+                                          "HEARTBEAT phase=benchmark"]:
+    print("healthz.txt", lines)
+scrapes = [json.loads(l) for l in open(os.path.join(d, "benchmark", "healthz", "metrics.jsonl"))]
+n_gated = sum(1 for r in scrapes if r["gated"])
+if lines[-1:] != ["HEARTBEAT phase=benchmark n=%d failures=0 bad=0 max_s=0.500" % n_gated] or n_gated < 43:
+    print("HEARTBEAT", lines[-1:], "gated scrapes", n_gated)
+PY
+)"
+if [ -z "$check" ] && [ "$(grep -c '^HEALTHZ phase=benchmark port=4318 ' "$BOX_A/kit/run.log")" = 1 ] \
+  && [ "$(grep -c '^HEARTBEAT phase=benchmark ' "$BOX_A/kit/run.log")" = 1 ]; then
+  pass "the healthz sampler counts only samples with the server up, keeps every raw sample in the evidence and prints each line once"
+else
+  fail "healthz sampler" "$check"
+fi
+
+# Catches: a /healthz timeout or a non-200 dropped from the figures or counted
+# at its own latency: 4319 hangs past the 2 s client timeout and 4318 answers
+# 500, so every sample on both is a failure counted as 2000 ms. /metrics
+# hangs past the timeout too, so every scrape is a stall: HEARTBEAT must count
+# each as a failure and report max_s 2.000 rather than refuse the phase, drop
+# them or call them bad.
+hz="$TMP/healthz-fail"
+rm -rf "$hz"
+mkdir -p "$hz"
+touch "$STUB_DIR/server-ready" "$STUB_DIR/health-hang-4319" "$STUB_DIR/health-500-4318" \
+  "$STUB_DIR/metrics-hang"
+printf 'up 1\n' >"$hz/gate"
+python3 "$KIT_SRC/lib/kit.py" healthz-sampler "$hz" "$hz/gate" "$hz/ack" \
+  "$KIT_HEALTH_BASE_4318" "$KIT_HEALTH_BASE_4319" 2>"$hz/sampler.log" &
+hz_pid=$!
+for _ in $(seq 1 1000); do [ -s "$hz/ack" ] && break; sleep 0.01; done
+sleep 2.5
+printf 'down 1\n' >"$hz/gate"
+kill "$hz_pid" 2>/dev/null
+wait "$hz_pid" 2>/dev/null
+rm -f "$STUB_DIR/server-ready" "$STUB_DIR/health-hang-4319" "$STUB_DIR/health-500-4318" \
+  "$STUB_DIR/metrics-hang"
+code=0
+python3 "$KIT_SRC/lib/kit.py" healthz-summary benchmark "$hz" >"$hz/summary" 2>&1 || code=$?
+n_hb="$(sed -n 's/^HEARTBEAT phase=benchmark n=\([0-9]*\) failures=\([0-9]*\) bad=0 max_s=2.000$/\1 \2/p' "$hz/summary")"
+n_4318="$(sed -n 's/^HEALTHZ phase=benchmark port=4318 n=\([0-9]*\) p50_ms=2000.000 p99_ms=2000.000 max_ms=2000.000 failures=\([0-9]*\)$/\1 \2/p' "$hz/summary")"
+n_4319="$(sed -n 's/^HEALTHZ phase=benchmark port=4319 n=\([0-9]*\) p50_ms=2000.000 p99_ms=2000.000 max_ms=2000.000 failures=\([0-9]*\)$/\1 \2/p' "$hz/summary")"
+raw_4319="$(python3 -c 'import json, sys; r = [json.loads(l) for l in open(sys.argv[1])]; print(min(x["ms"] for x in r) >= 1900, all(x["error"].startswith("timeout") or "timed out" in x["error"] for x in r))' "$hz/4319.jsonl" 2>&1)"
+if [ "$code" = 0 ] && [ -s "$hz/ack" ] && [ -n "$n_4318" ] && [ "${n_4318% *}" = "${n_4318#* }" ] && [ "${n_4318% *}" -ge 4 ] \
+  && [ -n "$n_4319" ] && [ "${n_4319% *}" = "${n_4319#* }" ] && [ "${n_4319% *}" -ge 1 ] \
+  && [ "$raw_4319" = "True True" ] \
+  && [ -n "$n_hb" ] && [ "${n_hb% *}" = "${n_hb#* }" ] && [ "${n_hb% *}" -ge 1 ]; then
+  pass "a /healthz timeout or non-200 counts as a 2000 ms sample and a failure, and an unanswered /metrics scrape as a 2 s heartbeat age and a failure"
+else
+  fail "healthz timeout" "exit $code, 4318 '$n_4318', 4319 '$n_4319', raw '$raw_4319', heartbeat '$n_hb': $(cat "$hz/summary") $(head -c 300 "$hz/sampler.log")"
+fi
+
+# Catches: a /metrics endpoint that answers fast but unusably read as a 2 s
+# stall on every scrape, so a misconfigured endpoint passes every phase with
+# max_s 2.000: /metrics answers 200 without the heartbeat age, and the phase
+# is refused, naming the reason. The same raw scrapes pin the 1 s cadence:
+# consecutive scrapes of one generation sit at least 0.95 s apart on the
+# monotonic clock (load only widens the gap), not at /healthz's 250 ms.
+hz="$TMP/healthz-unusable"
+rm -rf "$hz"
+mkdir -p "$hz"
+touch "$STUB_DIR/server-ready" "$STUB_DIR/heartbeat-absent"
+printf 'up 1\n' >"$hz/gate"
+python3 "$KIT_SRC/lib/kit.py" healthz-sampler "$hz" "$hz/gate" "$hz/ack" \
+  "$KIT_HEALTH_BASE_4318" "$KIT_HEALTH_BASE_4319" 2>"$hz/sampler.log" &
+hz_pid=$!
+for _ in $(seq 1 1000); do [ -s "$hz/ack" ] && break; sleep 0.01; done
+sleep 2.5
+printf 'down 1\n' >"$hz/gate"
+kill "$hz_pid" 2>/dev/null
+wait "$hz_pid" 2>/dev/null
+rm -f "$STUB_DIR/server-ready" "$STUB_DIR/heartbeat-absent"
+code=0
+python3 "$KIT_SRC/lib/kit.py" healthz-summary benchmark "$hz" >"$hz/summary" 2>"$hz/summary.err" || code=$?
+gaps="$(python3 -c 'import json, sys
+t = [r["mono"] for r in map(json.loads, open(sys.argv[1])) if r["gen"] == 1]
+g = [b - a for a, b in zip(t, t[1:])]
+print(len(g) >= 1 and min(g) >= 0.95, [round(x, 3) for x in g])' "$hz/metrics.jsonl" 2>&1)"
+if [ "$code" = 2 ] && [ ! -s "$hz/summary" ] \
+  && grep -qF "every answered /metrics scrape for phase benchmark in $hz was unusable (no ravel_health_heartbeat_age_seconds in /metrics)" "$hz/summary.err" \
+  && [ "${gaps%% *}" = True ]; then
+  pass "a phase whose every answered /metrics scrape lacks the heartbeat age is refused, naming why, and /metrics is scraped every 1 s on the monotonic clock"
+else
+  fail "healthz unusable metrics" "exit $code, metrics gaps '$gaps': $(cat "$hz/summary" "$hz/summary.err") $(head -c 300 "$hz/sampler.log")"
+fi
+
+# Catches: an answered but unusable scrape (a 404, a 401, a 200 without the
+# metric) counted as a stall or left out of the HEARTBEAT line, or a phase
+# whose answered scrapes were all unusable passing beside a stall.
+hz_synthetic() {
+  local d="$TMP/healthz-syn-$1"
+  shift
+  rm -rf "$d"
+  mkdir -p "$d"
+  for port in 4318 4319; do
+    echo '{"gated": true, "ok": true, "ms": 1.0}' >"$d/$port.jsonl"
+  done
+  printf '%s\n' "$@" >"$d/metrics.jsonl"
+  code=0
+  python3 "$KIT_SRC/lib/kit.py" healthz-summary benchmark "$d" >"$d/summary" 2>"$d/summary.err" || code=$?
+}
+s_ok='{"gated": true, "ok": true, "answered": true, "status": 200, "error": "", "heartbeat_s": 0.7}'
+s_ok2='{"gated": true, "ok": true, "answered": true, "status": 200, "error": "", "heartbeat_s": 0.4}'
+s_404='{"gated": true, "ok": false, "answered": true, "status": 404, "error": "HTTP 404"}'
+s_401='{"gated": true, "ok": false, "answered": true, "status": 401, "error": "HTTP 401"}'
+s_stall='{"gated": true, "ok": false, "answered": false, "status": 0, "error": "TimeoutError: timed out"}'
+hz_synthetic mixed "$s_ok" "$s_401" "$s_stall"
+mixed="$code $(grep '^HEARTBEAT' "$TMP/healthz-syn-mixed/summary")"
+hz_synthetic usable "$s_ok" "$s_ok2" "$s_404"
+usable="$code $(grep '^HEARTBEAT' "$TMP/healthz-syn-usable/summary")"
+hz_synthetic allbad "$s_404" "$s_401" "$s_stall"
+allbad="$code $(cat "$TMP/healthz-syn-allbad/summary.err")"
+if [ "$mixed" = "0 HEARTBEAT phase=benchmark n=3 failures=1 bad=1 max_s=2.000" ] \
+  && [ "$usable" = "0 HEARTBEAT phase=benchmark n=3 failures=0 bad=1 max_s=0.700" ] \
+  && [ "$allbad" = "2 kit: healthz-summary: every answered /metrics scrape for phase benchmark in $TMP/healthz-syn-allbad was unusable (HTTP 401; HTTP 404), so the heartbeat age was never read" ]; then
+  pass "an answered but unusable /metrics scrape counts as bad, not as a stall, and a phase with no usable scrape among its answers is refused"
+else
+  fail "healthz bad scrapes" "mixed '$mixed', usable '$usable', allbad '$allbad'"
+fi
+
+# Catches: usable /metrics scrapes that carried none of the memory gauges (a
+# server-side rename, or a gauge moved behind a feature) passing without a
+# word, which leaves a memory death's bundle unreadable; or the warning
+# firing when the gauges are there.
+s_mem='{"gated": true, "ok": true, "answered": true, "status": 200, "error": "", "heartbeat_s": 0.3, "memory": {"ravel_memory_budget_bytes{mode=\"x\"}": 1.0}}'
+hz_synthetic memempty "$s_ok" "$s_mem" "$s_404"
+memempty="$code $(grep '^HEARTBEAT' "$TMP/healthz-syn-memempty/summary") | $(cat "$TMP/healthz-syn-memempty/summary.err")"
+hz_synthetic memfull "$s_mem" "$s_404"
+memfull="$code $(cat "$TMP/healthz-syn-memfull/summary.err")"
+if [ "${memempty%% |*}" = "0 HEARTBEAT phase=benchmark n=3 failures=0 bad=1 max_s=0.700" ] \
+  && case "$memempty" in *"warning: 1 of 2 usable /metrics scrapes for phase benchmark in $TMP/healthz-syn-memempty carried none of ravel_process_allocator_bytes"*) true ;; *) false ;; esac \
+  && [ "$memfull" = "0 " ]; then
+  pass "a phase whose usable /metrics scrapes lack the memory gauges is summarised with a warning naming the count, and one that has them is not"
+else
+  fail "healthz memory gauges" "memempty '$memempty', memfull '$memfull'"
+fi
+
+# Catches: the memory parser keeping a series it should not (a name that only
+# shares a prefix, a comment line) or splitting a label value with a space.
+mem="$(python3 -c 'import sys
+sys.path.insert(0, sys.argv[1])
+import kit
+body = "\n".join([
+    "# HELP ravel_process_allocator_bytes x",
+    "ravel_process_allocator_bytes{mode=\"x\",stat=\"resident\"} 5",
+    "ravel_memory_budget_refusals_total{mode=\"x\"} 3",
+    "ravel_cache_resident_entries{mode=\"x\",cache=\"fetch\"} 2",
+    "ravel_cache_resident_bytes{mode=\"x\",cache=\"a b\"} 4",
+    "ravel_memory_gate_available_floor_bytes{mode=\"x\"} 6",
+    "ravel_memory_reserved_bytes_total{mode=\"x\"} 8",
+])
+print(sorted(kit._memory_gauges(body).items()))' "$KIT_SRC/lib")"
+if [ "$mem" = "[('ravel_cache_resident_bytes{mode=\"x\",cache=\"a b\"}', 4.0), ('ravel_process_allocator_bytes{mode=\"x\",stat=\"resident\"}', 5.0)]" ]; then
+  pass "the memory parser keeps only the named gauge families, with labels intact"
+else
+  fail "memory parser" "$mem"
+fi
+
+# Catches: a request body without an explicit window (the server's default is
+# the last hour, which would hide the load), a window other than 200000 h, a
+# window that differs between statements or from the provenance stamp, or a
+# body sending a statement other than the corpus's. The row-count check's one
+# body must send the corpus's COUNT(*) over the same window.
+window_ok="$(python3 - "$STUB_DIR/sql-bodies" "$OUT_A/results.json" "$REPO_ROOT/benchmarks/clickbench/hits.corpus.json" \
+  "$STUB_DIR/verify-bodies" <<'PY'
+import json, sys
+bodies = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+w = json.load(open(sys.argv[2]))["provenance"]["query_window"]
+sqls = [e["sql"] for e in json.load(open(sys.argv[3]))["entries"]]
+ok = len(bodies) == 129
+ok = ok and all(sorted(b) == ["end", "query", "start"] and b["start"] == w["start"]
+                and b["end"] == w["end"] and b["end"] - b["start"] == 200000 * 3600 for b in bodies)
+ok = ok and [b["query"] for b in bodies[::3]] == sqls
+try:
+    verify = [json.loads(l) for l in open(sys.argv[4]) if l.strip()]
+except OSError:
+    verify = []
+ok = ok and verify == [{"query": "SELECT COUNT(*) FROM logs", "start": w["start"], "end": w["end"]}]
+print("yes" if ok else "no")
+PY
+)"
+if [ "$window_ok" = yes ]; then
+  pass "every request body, the row-count check's included, carries one start and end 200000 hours apart"
+else
+  fail "query window" "$(head -c 300 "$STUB_DIR/sql-bodies"); verify: $(head -c 200 "$STUB_DIR/verify-bodies" 2>/dev/null)"
+fi
+
+# Catches: the kit's results.json no longer reading in the runbook's analyse.py
+# (section 9) unchanged: a duplicate or missing q row, a band row with a q id,
+# or hot and cold figures other than the kit's sums. With no executor
+# accounting over HTTP, its cost-class bands fail and nothing else may.
+sed -n '/^```python$/,/^```$/p' "$REPO_ROOT/docs/internal/clickbench-aws-runbook.md" | sed '1d;$d' >"$TMP/analyse.py"
+code=0
+python3 "$TMP/analyse.py" "$OUT_A/results.json" "$REPO_ROOT/benchmarks/clickbench/hits.corpus.json" \
+  >"$TMP/analyse.out" 2>&1 || code=$?
+other="$(grep '^  - ' "$TMP/analyse.out" | grep -vc ': no per_run_accounting; cold cost not emitted$')"
+if [ "$code" = 3 ] && grep -q '^measured 43  failed 0 \[\]$' "$TMP/analyse.out" \
+  && grep -q '^hot  21.50 s$' "$TMP/analyse.out" && grep -q '^cold 21.50 s$' "$TMP/analyse.out" \
+  && grep -q '^  - q01: no per_run_accounting; cold cost not emitted$' "$TMP/analyse.out" && [ "$other" = 0 ]; then
+  pass "analyse.py reads results.json unchanged: 43 measured, sums match, only the cost bands fail"
+else
+  fail "analyse.py" "exit $code, $other other failures: $(head -c 400 "$TMP/analyse.out")"
+fi
+
+# Catches: a call record losing one of its fields (rows included), or a
+# statement reaching the SQL endpoint without run_query (the curl count would
+# exceed the wrapper's).
+calls="$BOX_A/kit/out/benchmark/calls.jsonl"
+fields_ok="$(python3 - "$calls" <<'PY'
+import json, sys
+need = ("statement", "number", "arm", "phase", "try", "start", "duration_s", "http_status", "rows",
+        "outcome", "refusal_class", "error", "stats")
+rows = [json.loads(l) for l in open(sys.argv[1])]
+ok = len(rows) == 129 and all(all(k in r for k in need) and r["arm"] == "A" and r["phase"] == "benchmark"
+                              and r["outcome"] == "ok" and r["http_status"] == 200 for r in rows)
+ok = ok and [r["rows"] for r in rows if r["number"] == 1] == [1, 1, 1]
+ok = ok and [r["rows"] for r in rows if r["number"] == 8] == [3, 3, 3]
+print("yes" if ok else "no")
+PY
+)"
+if [ -d "$BOX_A/kit/out/benchmark" ] && [ "$fields_ok" = yes ] \
+  && [ "$(wc -l <"$STUB_DIR/run_query-calls" | tr -d ' ')" = 129 ] \
+  && [ "$(wc -l <"$STUB_DIR/curl-sql" | tr -d ' ')" = 129 ]; then
+  pass "the benchmark phase writes out/benchmark/ and every one of its 129 calls goes through run_query"
+else
+  fail "run_query" "fields $fields_ok, run_query $(wc -l <"$STUB_DIR/run_query-calls" 2>/dev/null), curl $(wc -l <"$STUB_DIR/curl-sql" 2>/dev/null)"
+fi
+
+# Catches: a server start that does not take its flags from arm.env (the
+# row-count check's start and all 43 restarts must run the same argv), or cold
+# tries without a cache drop.
+if [ "$(wc -l <"$STUB_DIR/server-argv" | tr -d ' ')" = 44 ] && [ "$(sort -u "$STUB_DIR/server-argv" | wc -l | tr -d ' ')" = 1 ] \
+  && grep -q -- '--memory-budget-bytes 25769803776 --audit-mode off' "$STUB_DIR/server-argv" \
+  && [ "$(cat "$BOX_A/drop_caches")" = 3 ]; then
+  pass "the row-count check's start and each of the 43 cold starts run the same server flags"
+else
+  fail "server starts" "$(sort "$STUB_DIR/server-argv" | uniq -c | head -n 3)"
+fi
+
+# Catches: a hot try run after a cache drop, a cold try without one, or a drop
+# missing or doubled: the run must be exactly one drop then tries 1, 2 and 3,
+# 43 times over.
+want_seq="$(for ((i = 0; i < 43; i++)); do printf 'drop try1 try2 try3 '; done)"
+got_seq="$(tr '\n' ' ' <"$STUB_DIR/sequence")"
+if [ "$got_seq" = "$want_seq" ]; then
+  pass "one cache drop before each cold try and none before a hot try"
+else
+  fail "drop sequence" "$(head -c 200 <<<"$got_seq")"
+fi
+
+# Catches: a step that runs without a UTC stamp, or the phases running before
+# the fold precondition and the row-count check. The uploaded copy ends at
+# evidence: upload is stamped after it is sent.
+order="$(sed -n 's/^[0-9]\{4\}-[0-9][0-9]-[0-9][0-9]T[0-9:]*Z step=\([a-z-]*\) state=done$/\1/p' "$OUT_A/progress.log" | tr '\n' ' ')"
+unstamped="$(grep -vc '^[0-9]\{4\}-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z ' "$OUT_A/progress.log")"
+case "$order" in
+  *"objects-before-load load objects-after-load compact fold declare verify phase-benchmark healthz burst-end results evidence "*)
+    if [ "$unstamped" = 0 ]; then
+      pass "progress.log stamps every step in UTC, fold and the row-count check before the phases"
+    else
+      fail "progress.log" "$unstamped unstamped lines"
+    fi ;;
+  *) fail "progress.log" "step order: $order" ;;
+esac
+
+# Catches: evidence.tgz missing the server log, the samplers or the object
+# counts, or any box secret (RustFS keys, tenant token) leaving the box. The
+# stub RustFS logs both of its keys into rustfs.log and run.log, and the stub
+# server into its own log, so an evidence step that only leaves secrets.env
+# out, or redacts one log, still uploads them. The audit token key, generated
+# into secrets.env on every box, must not reach a server running audit_mode
+# off (box-a's), which would report it at startup.
+mkdir -p "$TMP/evidence-a"
+tar -xzf "$OUT_A/evidence.tgz" -C "$TMP/evidence-a"
+# Every usable /metrics sample keeps exactly the stub's memory gauges, and
+# not the refusals counter that shares their family prefix.
+cat >"$TMP/memory-check.py" <<'PY'
+import json, sys
+want = {'ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="allocated"}': 1000.0,
+        'ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="resident"}': 4000.0,
+        'ravel_cache_resident_bytes{mode="all",cache="fetch"}': 100.0,
+        'ravel_cache_resident_bytes{mode="all",cache="catalog"}': 50.0,
+        'ravel_memory_reserved_bytes{mode="all",component="sql"}': 7.0,
+        'ravel_memory_reserved_bytes{mode="all",component="fetch"}': 20.0,
+        'ravel_memory_handoff_overlap_bytes{mode="all"}': 5.0}
+recs = [r for r in map(json.loads, open(sys.argv[1])) if r.get("ok")]
+print(bool(recs) and all(r.get("memory") == want for r in recs))
+PY
+token="$(sed -n 's/^KIT_TENANT_TOKEN=//p' "$BOX_A/kit/secrets.env")"
+secret="$(sed -n 's/^RUSTFS_SECRET_KEY=//p' "$BOX_A/kit/secrets.env")"
+access="$(sed -n 's/^RUSTFS_ACCESS_KEY=//p' "$BOX_A/kit/secrets.env")"
+audit_off_ok=0
+grep -q '^RAVEL_AUDIT_TOKEN_KEY=[0-9a-f]\{64\}$' "$BOX_A/kit/secrets.env" \
+  && grep -q 'audit_key=none$' "$BOX_A/kit/server-1.log" \
+  && ! grep -q 'audit_key=[0-9a-f]' "$BOX_A/kit/server-"*.log && audit_off_ok=1
+if [ "$audit_off_ok" = 1 ] && [ -f "$TMP/evidence-a/server-1.log" ] && [ -f "$TMP/evidence-a/object-counts/before-load.txt" ] \
+  && [ -f "$TMP/evidence-a/object-counts/after-load.txt" ] && [ -f "$TMP/evidence-a/out/benchmark/samplers/server-rss.log" ] \
+  && [ -f "$TMP/evidence-a/arm.env" ] && [ -n "$token" ] && [ -n "$secret" ] && [ -n "$access" ] \
+  && [ -s "$TMP/evidence-a/out/benchmark/healthz/4318.jsonl" ] && [ -s "$TMP/evidence-a/out/benchmark/healthz/4319.jsonl" ] \
+  && [ -s "$TMP/evidence-a/out/benchmark/healthz/metrics.jsonl" ] && [ -s "$TMP/evidence-a/out/healthz.txt" ] \
+  && grep -qF "$secret" "$BOX_A/kit/rustfs.log" && grep -qF "$secret" "$BOX_A/kit/run.log" \
+  && grep -qF "secret_key=$secret" "$BOX_A/kit/server-1.log" \
+  && grep -qF 'access_key=[redacted] secret_key=[redacted]' "$TMP/evidence-a/rustfs.log" \
+  && grep -qF 'access_key=[redacted] secret_key=[redacted]' "$TMP/evidence-a/run.log" \
+  && grep -qF 'access_key=[redacted] secret_key=[redacted]' "$TMP/evidence-a/server-1.log" \
+  && ! grep -rqF -e "$token" -e "$secret" -e "$access" "$TMP/evidence-a" "$OUT_A" \
+  && [ ! -e "$TMP/evidence-a/secrets.env" ] && [ ! -e "$TMP/evidence-a/auth.header" ] \
+  && [ -s "$TMP/evidence-a/kernel.log" ] \
+  && [ "$(python3 "$TMP/memory-check.py" "$TMP/evidence-a/out/benchmark/healthz/metrics.jsonl")" = True ]; then
+  pass "evidence.tgz holds server logs, samplers, raw healthz samples with the memory gauges, the kernel log and object counts, no box secret is uploaded, and an audit_mode off server gets no audit key"
+else
+  fail "evidence" "audit key kept from an audit_mode off server: $audit_off_ok; kernel.log bytes $(wc -c <"$TMP/evidence-a/kernel.log" 2>&1); memory gauges kept: $(python3 "$TMP/memory-check.py" "$TMP/evidence-a/out/benchmark/healthz/metrics.jsonl" 2>&1); $(tar -tzf "$OUT_A/evidence.tgz" | head -n 20 | tr '\n' ' ')"
+fi
+mv "$OUT_A" "$TMP/fixture-pass"
+
+# Catches: an absolute band miss that the box does not record (kit.py
+# absolute must exit 1 and DONE must say bands=miss), or one turned into a
+# FAILED run.
+code=0
+run_box A box-miss STUB_SQL_TIME=2.0 || code=$?
+abs=0
+python3 "$KIT_SRC/lib/kit.py" absolute A "$OUT_A/results.json" >"$TMP/abs.out" 2>&1 || abs=$?
+if [ "$code" = 0 ] && grep -q '^DONE bands=miss ' "$OUT_A/DONE" 2>/dev/null && [ "$abs" = 1 ] \
+  && grep -q '^MISS  *A  *hot_sum_s <= hot_sum_s_max  *86.000  *30$' "$TMP/abs.out" \
+  && grep -q '^MISS  *A  *q01 hot_s <= hot_s_max.q01  *2.000  *1.000$' "$TMP/abs.out"; then
+  pass "an absolute band miss exits 1 on the box and DONE records bands=miss"
+else
+  fail "absolute miss" "box exit $code, absolute exit $abs, DONE: $(cat "$OUT_A/DONE" 2>/dev/null)"
+fi
+mv "$OUT_A" "$TMP/fixture-miss"
+
+# Catches: a wrong answer read as a pass. Statement 2 (corpus expected_rows 1)
+# answers 5 rows on every try and statement 19 is refused: both must land in
+# `failed` with their class, count as errors in the phases and pooled error
+# figures, and miss their absolute statement band as not answered.
+code=0
+run_box A box-errors STUB_SQL_REFUSE_N=19 STUB_SQL_ROWS_N=02 STUB_SQL_ROWS=5 || code=$?
+check="$(python3 - "$OUT_A/results.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+bad = []
+def want(cond, what):
+    if not cond:
+        bad.append(what)
+failed = {f["id"]: f for f in r["failed"]}
+want(sorted(failed) == ["q02_count_adv_engine", "q19_user_minute_phrase"], "failed ids %s" % sorted(failed))
+q2 = failed.get("q02_count_adv_engine", {})
+want(q2.get("run") == 0 and "wrong_answer" in q2.get("error", "")
+     and "answer has 5 rows, expected 1" in q2.get("error", ""), "q02 error %r" % q2.get("error"))
+want(q2.get("answer") == {"answered": False, "rows": 5, "expected_rows": 1, "match": False},
+     "q02 answer %r" % q2.get("answer"))
+q19 = failed.get("q19_user_minute_phrase", {})
+want(q19.get("run") == 0 and "resource_exhausted" in q19.get("error", ""), "q19 error")
+want(q19.get("answer", {}).get("answered") is False, "q19 answer")
+want(len(r["entries"]) == 41 and r["totals"]["answered"] == 41 and r["totals"]["hot_sum_s"] == 20.5, "totals")
+want(r["phases"]["benchmark"]["errors"] == 6 and r["phases"]["benchmark"]["refusal_classes"]
+     == {"resource_exhausted": 3, "wrong_answer": 3}, "phases %r" % r["phases"]["benchmark"])
+want(r["error_pooled"] == {"calls": 129, "errors": 6, "ratio": 6 / 129, "phases": ["benchmark"]},
+     "error_pooled")
+rows = {b["band"]: b for b in r["bands"]}
+for q in ("q02", "q19"):
+    b = rows.get("%s hot_s <= hot_s_max.%s" % (q, q), {})
+    want(b.get("verdict") == "miss" and b.get("note") == "not answered", q + " band")
+want(rows.get("error_pooled <= error_pooled_max", {}).get("verdict") == "pass", "error band")
+print(",".join(bad))
+PY
+)" || check="python failed"
+if [ "$code" = 0 ] && grep -q '^DONE bands=miss ' "$OUT_A/DONE" 2>/dev/null && [ -z "$check" ]; then
+  pass "a wrong row count and a refusal are errors: failed, counted, and absolute misses"
+else
+  fail "wrong answer" "box exit $code: $check"
+fi
+mv "$OUT_A" "$TMP/fixture-errors"
+
+# Catches: an unchecked fold precondition: a fold that sealed nothing must
+# fail the run at step fold, before any statement runs.
+code=0
+run_box A box-fold STUB_FOLD=unsealed || code=$?
+if [ "$code" = 1 ] && grep -q '^FAILED step=fold ' "$OUT_A/FAILED" 2>/dev/null && [ ! -e "$OUT_A/DONE" ] \
+  && [ ! -e "$TMP/box-fold/kit/out/benchmark/calls.jsonl" ] && [ -f "$OUT_A/progress.log" ] \
+  && grep -q 'ec2 terminate-instances' "$STUB_LOG"; then
+  pass "a fold that sealed nothing fails the run as FAILED step=fold"
+else
+  fail "fold precondition" "exit $code, FAILED: $(head -n 1 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+
+# Catches: FAILED carrying run.log's tail unredacted. The stub RustFS printed
+# its keys into run.log, inside the 20 lines FAILED quotes.
+secret="$(sed -n 's/^RUSTFS_SECRET_KEY=//p' "$TMP/box-fold/kit/secrets.env")"
+access="$(sed -n 's/^RUSTFS_ACCESS_KEY=//p' "$TMP/box-fold/kit/secrets.env")"
+if [ -n "$secret" ] && grep -qF "$secret" "$TMP/box-fold/kit/run.log" \
+  && grep -qF 'access_key=[redacted] secret_key=[redacted]' "$OUT_A/FAILED" 2>/dev/null \
+  && grep -q 'fold sealed nothing' "$OUT_A/FAILED" \
+  && ! grep -rqF -e "$secret" -e "$access" "$OUT_A"; then
+  pass "FAILED quotes run.log's tail with every box secret redacted"
+else
+  fail "FAILED redaction" "$(grep -c "${secret:-none}" "$OUT_A/FAILED" 2>/dev/null) secret line(s) in FAILED: $(head -c 300 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a key that survives redaction uploaded anyway. With redaction
+# replacing nothing, evidence.tgz must not be written and FAILED must withhold
+# run.log's tail rather than quote the keys in it.
+code=0
+run_box A box-noredact DRIVER_NO_REDACT=1 || code=$?
+secret="$(sed -n 's/^RUSTFS_SECRET_KEY=//p' "$TMP/box-noredact/kit/secrets.env")"
+if [ "$code" = 1 ] && grep -q '^FAILED step=evidence ' "$OUT_A/FAILED" 2>/dev/null \
+  && grep -q '^run.log tail withheld: a box secret survived redaction$' "$OUT_A/FAILED" \
+  && [ ! -e "$OUT_A/evidence.tgz" ] && [ ! -e "$TMP/box-noredact/kit/evidence.tgz" ] \
+  && grep -q 'evidence.tgz not written' "$TMP/box-noredact/kit/run.log" \
+  && [ -n "$secret" ] && ! grep -rqF -e "$secret" "$OUT_A"; then
+  pass "a key surviving redaction refuses evidence.tgz and withholds FAILED's run.log tail"
+else
+  fail "redaction refused" "exit $code, evidence $(ls "$OUT_A" 2>/dev/null | tr '\n' ' '), FAILED: $(head -c 300 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: the audit key generated outside secrets.env (so neither redaction
+# nor a restart sees it), or not handed to a server running audit_mode
+# required with redacted text.
+code=0
+BOX_TOML_SED='s/^audit_mode = .*/audit_mode = "required"/' run_box A box-audit || code=$?
+akey="$(sed -n 's/^RAVEL_AUDIT_TOKEN_KEY=//p' "$TMP/box-audit/kit/secrets.env" 2>/dev/null)"
+mkdir -p "$TMP/evidence-audit"
+tar -xzf "$OUT_A/evidence.tgz" -C "$TMP/evidence-audit" 2>/dev/null
+if [ "$code" = 0 ] && [[ "$akey" =~ ^[0-9a-f]{64}$ ]] \
+  && grep -q -- '--audit-mode required --audit-text redacted' "$STUB_DIR/server-argv" \
+  && grep -qF "audit_key=$akey" "$TMP/box-audit/kit/server-1.log" \
+  && [ "$(grep -c "audit_key=$akey" "$TMP/box-audit/kit/server-44.log")" = 1 ] \
+  && grep -qF 'audit_key=[redacted]' "$TMP/evidence-audit/server-1.log" \
+  && ! grep -rqF -e "$akey" "$TMP/evidence-audit" "$OUT_A"; then
+  pass "audit_mode required runs every server with the audit key from secrets.env, redacted from the evidence"
+else
+  fail "audit key" "exit $code, key '$akey': $(grep -h audit_key "$TMP/box-audit/kit/server-1.log" 2>/dev/null | head -c 200)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a fold whose entry_count is far under the objects the load wrote
+# (50 of 100, under the 0.8 ratio) read as met because it sealed an hour.
+code=0
+run_box A box-foldratio STUB_FOLD_ENTRIES=50 || code=$?
+fold_stamp="$(python3 -c 'import json, sys; f = json.load(open(sys.argv[1])); print(f["precondition"], f["entry_count"], f["objects_written_by_load"])' \
+  "$TMP/box-foldratio/kit/stamps/fold" 2>/dev/null)"
+if [ "$code" = 1 ] && grep -q '^FAILED step=fold ' "$OUT_A/FAILED" 2>/dev/null && [ ! -e "$OUT_A/DONE" ] \
+  && grep -q 'fold entry_count 50 is under 0.8 of the 100 objects the load wrote' "$OUT_A/FAILED" \
+  && [ "$fold_stamp" = "failed 50 100" ] && [ ! -e "$TMP/box-foldratio/kit/out/benchmark/calls.jsonl" ]; then
+  pass "a fold with too few entries for the objects written fails as FAILED step=fold"
+else
+  fail "fold entry ratio" "exit $code, stamp '$fold_stamp', FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: the fold judged against the bucket's key delta, which also counts
+# one commit record per data object: arm A's load added 200 keys for its 100
+# objects written, and a fold of 100 entries covers all of them.
+fold_stamp="$(python3 -c 'import json, sys; f = json.load(open(sys.argv[1])); print(f["precondition"], f["entry_count"], f["objects_written_by_load"], f["store_keys_added_by_load"])' \
+  "$BOX_A/kit/stamps/fold" 2>/dev/null)"
+if [ "$fold_stamp" = "met 100 100 200" ]; then
+  pass "a fold covering the load's objects written is met though the bucket gained twice as many keys"
+else
+  fail "fold against objects written" "stamp '$fold_stamp', run.log: $(grep -h 'fold entry_count' "$BOX_A/kit/run.log" | head -n 1)"
+fi
+
+# Catches: a load report without its "objects written" figure passing, so
+# the fold check has no denominator.
+code=0
+run_box A box-noobjects STUB_LOAD_OBJECTS=none || code=$?
+if [ "$code" = 1 ] && grep -q '^FAILED step=load ' "$OUT_A/FAILED" 2>/dev/null && [ ! -e "$OUT_A/DONE" ] \
+  && grep -q 'load.out carries objects written 0 times, not once' "$OUT_A/FAILED" \
+  && [ ! -e "$TMP/box-noobjects/kit/stamps/fold" ]; then
+  pass "a load report without objects written fails as FAILED step=load, before the fold"
+else
+  fail "no objects written" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a load.time without its user= figure stamped as a number (0, or
+# the sys= figure) instead of null with a reason, or failing the box: the
+# stamp only feeds fetch.sh's box speed band, which reads null as
+# inconclusive.
+code=0
+run_box A box-nouser 'DRIVER_LOAD_TIME=wall=1500.25 rss_kb=4000000 sys=120.75' || code=$?
+nouser="$(python3 -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1]))["provenance"]["box_speed"], sort_keys=True))' \
+  "$OUT_A/results.json" 2>&1)"
+if [ "$code" = 0 ] && grep -q '^DONE ' "$OUT_A/DONE" 2>/dev/null \
+  && [ "$nouser" = '{"basis": "load_user_cpu_s", "load_user_cpu_s": null, "load_wall_s": 1500.25, "reason": "load.time carries user= 0 times, not once"}' ]; then
+  pass "box speed: a load.time without user= stamps load_user_cpu_s null with a reason and the box still ends DONE"
+else
+  fail "box speed stamp without user=" "exit $code, stamp $nouser, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: kit.py box-speed inventing a figure from a load.time that is
+# missing, names user= twice (a GNU time line appended to an old file), or
+# holds something that is not a number of seconds.
+bs_bad=""
+printf 'wall=10.5 user=abc sys=1\n' >"$TMP/load-abc.time"
+printf 'wall=10.5 user=9.0 sys=1\nwall=11.5 user=9.5 sys=1\n' >"$TMP/load-twice.time"
+for c in "missing|$TMP/no-such-load.time|null|null|no load.time: " \
+  "abc|$TMP/load-abc.time|null|10.5|load.time user='abc' is not a number of seconds" \
+  "twice|$TMP/load-twice.time|null|null|load.time carries user= 2 times, not once; load.time carries wall= 2 times, not once"; do
+  IFS='|' read -r name file user wall reason <<EOF
+$c
+EOF
+  got="$(python3 "$KIT_SRC/lib/kit.py" box-speed "$file" 2>&1)" || bs_bad="$bs_bad $name:exit"
+  python3 -c 'import json, sys
+s = json.loads(sys.argv[1])
+ok = (s["basis"] == "load_user_cpu_s" and json.dumps(s["load_user_cpu_s"]) == sys.argv[2]
+      and json.dumps(s["load_wall_s"]) == sys.argv[3] and s["reason"].startswith(sys.argv[4]))
+sys.exit(0 if ok else 1)' "$got" "$user" "$wall" "$reason" 2>/dev/null || bs_bad="$bs_bad $name:$got"
+done
+if [ -z "$bs_bad" ]; then
+  pass "box speed: kit.py box-speed records null with a reason for a missing, unparsable or repeated figure"
+else
+  fail "box-speed parse" "$bs_bad"
+fi
+
+# Catches: a RustFS binary that unpacks and installs but cannot run (the gnu
+# build on an older glibc) left to fail later as a store that never answers.
+printf '#!/bin/sh\necho "rustfs: /lib64/libc.so.6: version GLIBC_2.38 not found (required by rustfs)" >&2\nexit 1\n' \
+  >"$STUB_DIR/rustfs-asset"
+asset_sha="$(sha256sum "$STUB_DIR/rustfs-asset" | cut -d' ' -f1)"
+code=0
+BOX_TOML_SED="s|^rustfs_url = .*|rustfs_url = \"https://rustfs.invalid/rustfs\"|;s|^rustfs_sha256 = .*|rustfs_sha256 = \"$asset_sha\"|" \
+  run_box A box-rustfsver DRIVER_REAL_RUSTFS=1 || code=$?
+if [ "$code" = 1 ] && grep -q '^FAILED step=rustfs ' "$OUT_A/FAILED" 2>/dev/null && [ ! -e "$OUT_A/DONE" ] \
+  && grep -qF 'rustfs --version failed: rustfs: /lib64/libc.so.6: version GLIBC_2.38 not found (required by rustfs)' "$OUT_A/FAILED" \
+  && ! grep -q '^nohup .*/rustfs ' "$STUB_LOG"; then
+  pass "a rustfs binary whose --version fails fails as FAILED step=rustfs, quoting its output"
+else
+  fail "rustfs --version" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null); $(grep '^nohup' "$STUB_LOG")"
+fi
+rm -rf "$OUT_A"
+
+# Catches: an arm's server_flags_a not reaching every server start after the
+# kit's own flags, or not stamped apart from them.
+code=0
+BOX_TOML_SED='s/^shards = /server_flags_a = ["--fetch-concurrency", "64"]\n&/' \
+  run_box A box-flags || code=$?
+starts="$(wc -l <"$STUB_DIR/server-argv" | tr -d ' ')"
+tail_ok="$(grep -c -- '--audit-mode off --fetch-concurrency 64$' "$STUB_DIR/server-argv")"
+sf="$(python3 -c 'import json, sys; f = json.load(open(sys.argv[1]))["provenance"]["server_flags"]; print(f["extra_flags"], f["base_flags"][-2:], f["flags"].endswith("--audit-mode off --fetch-concurrency 64"))' \
+  "$OUT_A/results.json" 2>/dev/null)"
+if [ "$code" = 0 ] && [ "$starts" -ge 43 ] && [ "$tail_ok" = "$starts" ] \
+  && [ "$sf" = "['--fetch-concurrency', '64'] ['--audit-mode', 'off'] True" ]; then
+  pass "server_flags_a follows the kit's flags on every server start and is stamped as extra_flags"
+else
+  fail "server_flags_a" "exit $code, $tail_ok of $starts starts, stamp '$sf': $(tail -n 1 "$STUB_DIR/server-argv" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a healthz.txt with a phase's line twice or missing taken as the
+# phase's figures: each must fail the box at step healthz, naming the line.
+for edit in "dup|HEALTHZ phase=benchmark port=4318 2 times" "drop|HEARTBEAT phase=benchmark 0 times"; do
+  code=0
+  run_box A "box-healthz-${edit%%|*}" DRIVER_HEALTHZ_EDIT="${edit%%|*}" || code=$?
+  if [ "$code" = 1 ] && grep -q '^FAILED step=healthz ' "$OUT_A/FAILED" 2>/dev/null && [ ! -e "$OUT_A/DONE" ] \
+    && grep -qF "must hold each line exactly once; it holds ${edit#*|}" "$OUT_A/FAILED"; then
+    pass "healthz.txt edited (${edit%%|*}) fails as FAILED step=healthz, naming the line"
+  else
+    fail "healthz ${edit%%|*}" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+  fi
+  rm -rf "$OUT_A"
+done
+
+# Catches: healthz_phases ignored, so a run that leaves the benchmark phase
+# unsampled still runs the sampler beside its statements. Nothing is sampled,
+# healthz.txt stays empty and results.json's healthz block is null.
+code=0
+BOX_TOML_SED='s/^shards = /healthz_phases = ["concurrent"]\n&/' \
+  run_box A box-healthz-off || code=$?
+hz_off="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["healthz"])' "$OUT_A/results.json" 2>&1)"
+if [ "$code" = 0 ] && grep -q '^DONE ' "$OUT_A/DONE" 2>/dev/null && [ "$hz_off" = None ] \
+  && [ ! -e "$TMP/box-healthz-off/kit/out/benchmark/healthz" ] && [ ! -s "$TMP/box-healthz-off/kit/out/healthz.txt" ] \
+  && ! grep -q '^HEALTHZ ' "$TMP/box-healthz-off/kit/run.log"; then
+  pass "healthz_phases without benchmark leaves the benchmark phase unsampled and the healthz block null"
+else
+  fail "healthz_phases" "exit $code, healthz '$hz_off': $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: healthz-check passing a line for a phase that was not sampled.
+printf '%s\n' \
+  'HEALTHZ phase=benchmark port=4318 n=8 p50_ms=1.0 p99_ms=2.0 max_ms=2.0 failures=0' \
+  'HEALTHZ phase=benchmark port=4319 n=8 p50_ms=1.0 p99_ms=2.0 max_ms=2.0 failures=0' \
+  'HEARTBEAT phase=benchmark n=4 failures=1 bad=2 max_s=2.000' >"$TMP/healthz-extra.txt"
+code=0
+python3 "$KIT_SRC/lib/kit.py" healthz-check "$TMP/healthz-extra.txt" benchmark \
+  >"$TMP/healthz-extra.json" 2>"$TMP/healthz-extra.err" || code=$?
+hb="$(python3 -c 'import json, sys; b = json.load(open(sys.argv[1]))["phases"]["benchmark"]; print(b["heartbeat_n"], b["heartbeat_failures"], b["heartbeat_bad"], b["heartbeat_max_s"])' "$TMP/healthz-extra.json" 2>&1)"
+[ "$code" = 0 ] && [ "$hb" = "4 1 2 2.0" ] \
+  || fail "healthz extra line control" "exit $code, heartbeat '$hb': $(head -c 300 "$TMP/healthz-extra.err")"
+echo 'HEARTBEAT phase=concurrent-1 n=4 failures=0 bad=0 max_s=0.500' >>"$TMP/healthz-extra.txt"
+code=0
+python3 "$KIT_SRC/lib/kit.py" healthz-check "$TMP/healthz-extra.txt" benchmark \
+  >/dev/null 2>"$TMP/healthz-extra.err" || code=$?
+if [ "$code" = 2 ] \
+  && grep -qF "healthz-extra.txt:4 is not an expected line: 'HEARTBEAT phase=concurrent-1 n=4 failures=0 bad=0 max_s=0.500'" "$TMP/healthz-extra.err"; then
+  pass "healthz-check refuses a line for a phase it was not asked for, naming file and line"
+else
+  fail "healthz extra line" "exit $code: $(head -c 300 "$TMP/healthz-extra.err")"
+fi
+
+# Catches: a HEARTBEAT line with no scrape behind it, more failed and bad
+# scrapes than scrapes, no usable scrape beside bad ones, or one in an older
+# form (max only, or without bad=), taken as the phase's heartbeat figure.
+for bad in 'HEARTBEAT phase=benchmark n=0 failures=0 bad=0 max_s=0.000|counts 0 samples and 0 failures' \
+  'HEARTBEAT phase=benchmark n=2 failures=3 bad=0 max_s=2.000|counts 2 samples and 3 failures' \
+  'HEARTBEAT phase=benchmark n=4 failures=2 bad=3 max_s=2.000|counts 4 scrapes, 2 failures and 3 bad' \
+  'HEARTBEAT phase=benchmark n=4 failures=1 bad=3 max_s=2.000|counts 3 bad scrapes and no usable one' \
+  "HEARTBEAT phase=benchmark n=4 failures=1 max_s=2.000|is not an expected line: 'HEARTBEAT phase=benchmark n=4 failures=1 max_s=2.000'" \
+  "HEARTBEAT phase=benchmark max_s=0.500|is not an expected line: 'HEARTBEAT phase=benchmark max_s=0.500'"; do
+  head -n 2 "$TMP/healthz-extra.txt" >"$TMP/healthz-hb.txt"
+  echo "${bad%%|*}" >>"$TMP/healthz-hb.txt"
+  code=0
+  python3 "$KIT_SRC/lib/kit.py" healthz-check "$TMP/healthz-hb.txt" benchmark \
+    >/dev/null 2>"$TMP/healthz-hb.err" || code=$?
+  if [ "$code" = 2 ] && grep -qF -- "${bad#*|}" "$TMP/healthz-hb.err"; then
+    pass "healthz-check refuses '${bad%%|*}'"
+  else
+    fail "healthz heartbeat '${bad%%|*}'" "exit $code: $(head -c 300 "$TMP/healthz-hb.err")"
+  fi
+done
+
+# Catches: a fold field read from the first of several matches: a fold.out
+# carrying entry_count twice is not a figure the kit can stamp.
+code=0
+run_box A box-foldtwice STUB_FOLD=twice || code=$?
+if [ "$code" = 1 ] && grep -q '^FAILED step=fold ' "$OUT_A/FAILED" 2>/dev/null \
+  && grep -q 'fold.out carries entry_count 2 times, not once' "$OUT_A/FAILED" \
+  && [ ! -e "$TMP/box-foldtwice/kit/out/benchmark/calls.jsonl" ]; then
+  pass "a fold.out carrying a field twice fails as FAILED step=fold"
+else
+  fail "fold field twice" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# leaf_stamp BOX: the fold stamp's precondition, key_index_leaves_flag (or
+# <none>) and key_index_leaves_written.
+leaf_stamp() {
+  python3 -c 'import json, sys; f = json.load(open(sys.argv[1])); print(f["precondition"], f["key_index_leaves_flag"] or "<none>", f["key_index_leaves_written"])' \
+    "$1/kit/stamps/fold" 2>/dev/null
+}
+
+# Catches: binaries built after issue #4200, which build key-index leaves
+# unless told not to, run without the opt-out: the fold must pass
+# --no-key-index-leaves and the server --no-fold-key-index-leaves when their
+# --help lists them, and a fold reporting no leaf is not refused for it (the
+# run fails here only on its entry ratio).
+code=0
+run_box A box-leafoff STUB_LEAF_HELP=1 STUB_FOLD_LEAVES=0 STUB_FOLD_ENTRIES=50 || code=$?
+got="$(leaf_stamp "$TMP/box-leafoff")"
+if [ "$code" = 1 ] && grep -q 'fold entry_count 50 is under' "$OUT_A/FAILED" 2>/dev/null \
+  && [ "$got" = "failed --no-key-index-leaves 0" ] \
+  && grep -q -- ' catalog fold .*--writers-stopped --no-key-index-leaves$' "$STUB_DIR/cli-argv" \
+  && grep -q -- '--listen-health 127.0.0.1:4319 --no-fold-key-index-leaves --memory-budget-bytes' "$TMP/box-leafoff/kit/arm.env"; then
+  pass "binaries listing the leaf opt-out get it on the fold and the server, and a leafless fold passes the leaf check"
+else
+  fail "leaf opt-out" "exit $code, stamp '$got', FAILED: $(head -n 2 "$OUT_A/FAILED" 2>/dev/null); fold argv: $(grep ' catalog fold ' "$STUB_DIR/cli-argv" | tail -n 1)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a probe that reads only option lines, so a --help naming the
+# opt-out in another option's text (a layout change) folds and serves with
+# the default. The leaf count cannot catch that on this tenant, which
+# declares no key-index field, so the probe must match any mention.
+code=0
+run_box A box-leafprose STUB_LEAF_HELP=prose STUB_FOLD_LEAVES=0 STUB_FOLD_ENTRIES=50 || code=$?
+got="$(leaf_stamp "$TMP/box-leafprose")"
+if [ "$code" = 1 ] && [ "$got" = "failed --no-key-index-leaves 0" ] \
+  && grep -q -- ' catalog fold .*--writers-stopped --no-key-index-leaves$' "$STUB_DIR/cli-argv" \
+  && grep -q -- '--listen-health 127.0.0.1:4319 --no-fold-key-index-leaves --memory-budget-bytes' "$TMP/box-leafprose/kit/arm.env"; then
+  pass "a --help naming the leaf opt-out only in prose still gets it on the fold and the server"
+else
+  fail "leaf opt-out in prose" "exit $code, stamp '$got'; fold argv: $(grep ' catalog fold ' "$STUB_DIR/cli-argv" | tail -n 1)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: the opt-out passed and its effect never checked: a fold reporting
+# key_index_leaves_written above 0 must fail the run at step fold, before any
+# statement runs.
+code=0
+run_box A box-leafwrote STUB_LEAF_HELP=1 STUB_FOLD_LEAVES=12 || code=$?
+got="$(leaf_stamp "$TMP/box-leafwrote")"
+if [ "$code" = 1 ] && grep -q '^FAILED step=fold ' "$OUT_A/FAILED" 2>/dev/null \
+  && grep -q 'fold wrote key-index leaves: key_index_leaves_written=12, want 0' "$OUT_A/FAILED" \
+  && [ "$got" = "failed --no-key-index-leaves 12" ] \
+  && [ ! -e "$TMP/box-leafwrote/kit/out/benchmark/calls.jsonl" ]; then
+  pass "a fold that wrote key-index leaves fails as FAILED step=fold"
+else
+  fail "leaves written" "exit $code, stamp '$got', FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a fold given the opt-out whose report carries no
+# key_index_leaves_written line passing unchecked.
+code=0
+run_box A box-leafmissing STUB_LEAF_HELP=1 || code=$?
+if [ "$code" = 1 ] && grep -q '^FAILED step=fold ' "$OUT_A/FAILED" 2>/dev/null \
+  && grep -q 'fold.out carries key_index_leaves_written 0 times, not once' "$OUT_A/FAILED"; then
+  pass "a fold given the leaf opt-out must report key_index_leaves_written"
+else
+  fail "leaves line missing" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: the opt-out passed to binaries whose --help does not list it (built
+# before issue #4200, which reject the flag): arm A's happy-path run folded
+# with no leaf flag and stamped none, and its report's missing
+# key_index_leaves_written line is accepted.
+got="$(leaf_stamp "$BOX_A")"
+if [ "$got" = "met <none> None" ] && ! grep -q -- 'key-index-leaves' "$BOX_A/kit/arm.env"; then
+  pass "binaries that do not list the leaf opt-out fold and serve without it"
+else
+  fail "leaf opt-out on an old binary" "stamp '$got'; arm.env: $(grep -c key-index "$BOX_A/kit/arm.env")"
+fi
+
+# Catches: a load whose row count is never checked: a load that wrote one row
+# short of run.toml's rows_expected must fail the run at step load.
+code=0
+run_box A box-loadrows STUB_LOAD_ROWS=99997496 || code=$?
+if [ "$code" = 1 ] && grep -q '^FAILED step=load ' "$OUT_A/FAILED" 2>/dev/null \
+  && grep -q 'load wrote 99997496 rows, run.toml rows_expected is 99997497' "$OUT_A/FAILED" \
+  && [ ! -e "$TMP/box-loadrows/kit/out/benchmark/calls.jsonl" ]; then
+  pass "a load that wrote other than rows_expected rows fails as FAILED step=load"
+else
+  fail "load rows" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: an answer check that never looks at the data the server reads: the
+# corpus COUNT(*), sent before the benchmark, answers one row short of
+# rows_expected, so the run must fail at step verify before any statement runs.
+code=0
+run_box A box-verify STUB_COUNT_STAR=99997496 || code=$?
+if [ "$code" = 1 ] && grep -q '^FAILED step=verify ' "$OUT_A/FAILED" 2>/dev/null \
+  && grep -q 'SELECT COUNT(\*) FROM logs answered 99997496, run.toml rows_expected is 99997497' "$OUT_A/FAILED" \
+  && [ ! -e "$TMP/box-verify/kit/out/benchmark/calls.jsonl" ] && [ ! -s "$STUB_DIR/curl-sql" ]; then
+  pass "a COUNT(*) other than rows_expected fails as FAILED step=verify before the benchmark"
+else
+  fail "verify rows" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: the statement-count check dropped: a run.toml expecting 42
+# statements against the 43-statement corpus must fail before any is sent.
+code=0
+BOX_TOML_SED='1i\
+expected_statements = 42' run_box A box-count || code=$?
+if [ "$code" = 1 ] && grep -q '^FAILED step=phase-benchmark ' "$OUT_A/FAILED" 2>/dev/null \
+  && grep -q 'corpus holds 43 statements, run.toml expects 42' "$OUT_A/FAILED" \
+  && [ ! -s "$STUB_DIR/curl-sql" ]; then
+  pass "a corpus holding other than expected_statements fails as FAILED step=phase-benchmark"
+else
+  fail "statement count" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a hot try checked against nothing when the corpus states no row
+# count (q08 answers 3 rows cold and 4 on try 2, which must be a wrong_answer),
+# and a hot figure taken over all three tries: with tries of 0.1, 0.6 and 0.4 s
+# hot is 0.4 s (the best of tries 2 and 3) and cold 0.1 s.
+code=0
+run_box A box-tries STUB_SQL_ROWS_N=08 STUB_SQL_ROWS=4 STUB_SQL_ROWS_TRY=2 'STUB_SQL_TIMES=0.1 0.6 0.4' || code=$?
+check="$(python3 - "$OUT_A/results.json" "$REPO_ROOT/benchmarks/clickbench/hits.corpus.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+q08 = json.load(open(sys.argv[2]))["entries"][7]["id"]
+bad = []
+def want(cond, what):
+    if not cond:
+        bad.append(what)
+failed = {f["id"]: f for f in r["failed"]}
+want(sorted(failed) == [q08], "failed ids %s" % sorted(failed))
+f = failed.get(q08, {})
+want(f.get("run") == 1 and "wrong_answer" in f.get("error", "")
+     and "answer has 4 rows, expected 3" in f.get("error", ""), "q08 error %r" % f.get("error"))
+want(len(r["entries"]) == 42, "42 entries")
+for e in r["entries"]:
+    want(abs(e["min_ms"] - 400.0) < 1e-6 and abs(e["cold_ms"] - 100.0) < 1e-6
+         and abs(e["median_ms"] - 400.0) < 1e-6 and abs(e["max_ms"] - 600.0) < 1e-6,
+         "%s timings %r" % (e["id"], [e["min_ms"], e["median_ms"], e["max_ms"], e["cold_ms"]]))
+want(abs(r["totals"]["hot_sum_s"] - 16.8) < 1e-6 and abs(r["totals"]["cold_sum_s"] - 4.2) < 1e-6,
+     "totals %r" % r["totals"])
+print(",".join(bad[:4]))
+PY
+)" || check="python failed"
+if [ "$code" = 0 ] && grep -q '^DONE bands=miss ' "$OUT_A/DONE" 2>/dev/null && [ -z "$check" ]; then
+  pass "a hot try with another row count than the cold try is a wrong_answer, and hot is the best of tries 2 and 3"
+else
+  fail "tries" "box exit $code: $check"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a run that dies before load_config set REGION and OUT_URI hanging
+# on an unset variable or an upload to nowhere instead of shutting down.
+BOX_K="$TMP/box-early"
+reset_log
+boot_box A "$BOX_K"
+: >"$STUB_LOG"
+cat >"$TMP/early-driver.sh" <<'DRIVER'
+#!/usr/bin/env bash
+export KIT_ROOT="$1" KIT_RUN_SH_LIB=1 KIT_IMDS=http://imds.invalid
+# shellcheck source=/dev/null
+. "$KIT_ROOT/kit/kit/box/run.sh"
+load_config() { kill -TERM $$; }
+main
+DRIVER
+code=0
+bash "$TMP/early-driver.sh" "$BOX_K" >"$TMP/early.log" 2>&1 || code=$?
+if [ "$code" = 1 ] && grep -q '^shutdown -h now$' "$STUB_LOG" \
+  && grep -q '^FAILED step=config ' "$BOX_K/kit/FAILED" 2>/dev/null \
+  && grep -q 'terminate fallback=shutdown reason=no-region' "$BOX_K/kit/progress.log" \
+  && ! grep -q '^aws ' "$STUB_LOG" && ! grep -q 'unbound variable' "$TMP/early.log"; then
+  pass "a run killed in load_config uploads nothing and still runs shutdown -h now"
+else
+  fail "early kill" "exit $code; log: $(tr '\n' ';' <"$STUB_LOG" | head -c 300); $(tail -n 3 "$TMP/early.log")"
+fi
+
+# Catches: fail_run or finish dropping every trap before its own shutdown, so
+# a signal while it writes evidence or uploads ends run.sh with the box still
+# up. fail_run here runs from the EXIT trap (load_config is killed) and is
+# killed again inside write_evidence; finish is killed inside the DONE upload.
+# Each must still shut down, once.
+cat >"$TMP/late-driver.sh" <<'DRIVER'
+#!/usr/bin/env bash
+export KIT_ROOT="$1" KIT_RUN_SH_LIB=1 KIT_IMDS=http://imds.invalid
+# shellcheck source=/dev/null
+. "$KIT_ROOT/kit/kit/box/run.sh"
+case "$2" in
+  fail_run)
+    load_config() { kill -TERM $$; }
+    write_evidence() { kill -TERM $$; }
+    main ;;
+  finish)
+    REGION=us-east-1 OUT_URI=s3://kit-test-bucket/late
+    mkdir -p "$KIT"
+    aws() { kill -TERM $$; }
+    finish ;;
+esac
+DRIVER
+late_ok=1
+late_msg=""
+for which in fail_run finish; do
+  : >"$STUB_LOG"
+  code=0
+  bash "$TMP/late-driver.sh" "$BOX_K" "$which" >"$TMP/late-$which.log" 2>&1 || code=$?
+  n="$(grep -c '^shutdown -h now$' "$STUB_LOG")"
+  if [ "$code" = 0 ] || [ "$n" != 1 ]; then
+    late_ok=0
+    late_msg="$late_msg $which: exit $code, $n shutdown(s);"
+  fi
+done
+if [ "$late_ok" = 1 ]; then
+  pass "a signal inside fail_run's evidence step or finish's DONE upload still shuts the box down once"
+else
+  fail "late kill" "$late_msg $(tail -n 2 "$TMP/late-fail_run.log")"
+fi
+
+# Catches: resolve_arm_env rewriting arm.env on a restart, or start_server
+# reading live variables instead of arm.env.
+BOX_R="$TMP/box-restart"
+reset_log
+rm -f "$STUB_DIR/server-argv"
+boot_box A "$BOX_R"
+(
+  export KIT_ROOT="$BOX_R" KIT_RUN_SH_LIB=1 KIT_READY_TRIES=100 KIT_READY_INTERVAL=0.02
+  # shellcheck source=/dev/null
+  . "$BOX_R/kit/kit/box/run.sh"
+  mkdir -p "$STAMPS"
+  load_config || exit 1
+  bootstrap_build() { mkdir -p "$BIN_DIR"; cp "$BINSTUBS/ravel-server" "$BIN_DIR/ravel-server-$SHA"; }
+  bootstrap_build
+  resolve_arm_env || exit 1
+  start_server || exit 1
+  stop_server
+  MEMORY_BUDGET=1
+  SHARDS=99
+  resolve_arm_env || exit 1
+  start_server || exit 1
+  stop_server
+) >"$TMP/restart.log" 2>&1
+code=$?
+if [ "$code" = 0 ] && [ "$(wc -l <"$STUB_DIR/server-argv" | tr -d ' ')" = 2 ] \
+  && [ "$(sort -u "$STUB_DIR/server-argv" | wc -l | tr -d ' ')" = 1 ] \
+  && grep -q -- '--shards 8 .*--memory-budget-bytes 25769803776' "$STUB_DIR/server-argv" \
+  && grep -q 'arm.env kept' "$BOX_R/kit/progress.log"; then
+  pass "arm.env survives a restart of the start step: both starts run the first flags"
+else
+  fail "arm.env" "exit $code; $(tail -n 3 "$TMP/restart.log"); argv: $(sort -u "$STUB_DIR/server-argv" 2>/dev/null)"
+fi
+
+# Catches: a phase loop that ignores the phase list, runs phases out of order,
+# or does not give each phase its out/<phase>/ directory.
+BOX_P="$TMP/box-phases"
+boot_box A "$BOX_P"
+(
+  export KIT_ROOT="$BOX_P" KIT_RUN_SH_LIB=1
+  # shellcheck source=/dev/null
+  . "$BOX_P/kit/kit/box/run.sh"
+  ARM=A
+  QUERY_TIMEOUT_S=5
+  echo '{"query": "SELECT 1"}' >"$TMP/q.json"
+  phase_alpha() { [ -d "$OUT/alpha" ] && run_query alpha 01 alpha_q 1 "$TMP/q.json"; }
+  phase_beta() { [ -d "$OUT/beta" ] && run_query beta 01 beta_q 1 "$TMP/q.json"; }
+  PHASES="beta alpha"
+  run_phases
+) >"$TMP/phases.log" 2>&1
+code=$?
+order="$(sed -n 's/.* step=\(phase-[a-z]*\) state=done$/\1/p' "$BOX_P/kit/progress.log" | tr '\n' ' ')"
+if [ "$code" = 0 ] && [ "$order" = "phase-beta phase-alpha " ] \
+  && grep -q '"phase": "alpha"' "$BOX_P/kit/out/alpha/calls.jsonl" \
+  && grep -q '"phase": "beta"' "$BOX_P/kit/out/beta/calls.jsonl"; then
+  pass "the phase loop runs each named phase in order into its own out/<phase>/"
+else
+  fail "phase loop" "exit $code, order '$order'; $(tail -n 3 "$TMP/phases.log")"
+fi
+
+# --- fetch.sh ---------------------------------------------------------------
+
+# fixture RUN A_DIR B_DIR: a finished run with arm A's and arm B's outputs.
+fixture() {
+  local d="$FAKE_S3/kit-test-bucket/clickbench-kit/runs/$1"
+  rm -rf "$d"
+  mkdir -p "$d/out"
+  cp -R "$IN_SAVED" "$d/in"
+  [ -z "$2" ] || cp -R "$2" "$d/out/A"
+  [ -z "$3" ] || cp -R "$3" "$d/out/B"
+}
+
+# edit_arm SRC DST [EDIT]: a copy of SRC's outputs with an optional python edit
+# applied to its report r.
+edit_arm() {
+  local src="$1" dst="$2" edit="${3:-}"
+  rm -rf "$dst"
+  cp -R "$src" "$dst"
+  python3 - "$dst/results.json" "$SHA_B" "$edit" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+sha_b = sys.argv[2]
+exec(sys.argv[3])
+json.dump(r, open(sys.argv[1], "w"))
+PY
+}
+
+# as_arm_b SRC DST [EDIT]: SRC's outputs relabelled as arm B, then edited.
+as_arm_b() {
+  edit_arm "$1" "$2" 'r["provenance"].update(arm="b", kit_arm="B", git_sha=sha_b)
+'"${3:-}"
+}
+
+fetch() {
+  local name="$1" run="$2"
+  shift 2
+  code=0
+  bash "$KIT_SRC/fetch.sh" --run-toml "$RUN_TOML" --out "$TMP/fetch-$name" --interval 1 "$@" "$run" \
+    >"$TMP/fetch-$name.out" 2>"$TMP/fetch-$name.err" || code=$?
+}
+
+# Catches: fetch failing a run whose arms match.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-pass-b"
+fixture run-pass "$TMP/fixture-pass" "$TMP/fixture-pass-b"
+fetch pass run-pass --timeout 30
+if [ "$code" = 0 ] && grep -q '^PASS  *B vs A  *hot_sum_s <= 1.05 x A (43 both answered)' "$TMP/fetch-pass.out" \
+  && grep -q '^PASS  *B vs A  *error_pooled <= A + 0.02' "$TMP/fetch-pass.out" \
+  && grep -q '^INCONCLUSIVE  *B vs A  *qps_pooled >= 0.95 x A  *None  *None  *no concurrent phase ran on A or B$' "$TMP/fetch-pass.out" \
+  && grep -q '^INCONCLUSIVE  *B vs A  *q29_probe min_s <= 1.15 x A  *None  *None  *no q29_probe phase ran on A or B$' "$TMP/fetch-pass.out" \
+  && grep -q '^concurrent B: no concurrent phase ran$' "$TMP/fetch-pass.out" \
+  && grep -q '^PASS  *B vs A  *q01 hot_s <= max(1.15 x A, 0.2 s)' "$TMP/fetch-pass.out" \
+  && grep -q '^PASS  *B vs A  *both answered >= 43  *43  *43$' "$TMP/fetch-pass.out" \
+  && grep -q '^PASS  *B vs A  *rows_returned = A (43 both answered)  *0  *0$' "$TMP/fetch-pass.out" \
+  && [ -f "$TMP/fetch-pass/A/evidence.tgz" ] && [ -f "$TMP/fetch-pass/B/evidence.tgz" ]; then
+  pass "fetch passes two matching arms and downloads both arms' results and evidence"
+else
+  fail "fetch pass" "exit $code: $(tail -n 3 "$TMP/fetch-pass.err")"
+fi
+
+# Catches: a relative per-statement band that is never judged: q01 hot 0.75 s
+# against A's 0.5 s is over max(1.15 x 0.5, 0.2).
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-rel-b" \
+  'r["entries"][0]["min_ms"] = 750.0'
+fixture run-rel "$TMP/fixture-pass" "$TMP/fixture-rel-b"
+fetch rel run-rel --timeout 30
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *q01 hot_s <= max(1.15 x A, 0.2 s)' "$TMP/fetch-rel.out" \
+  && ! grep -q '^MISS  *[AB]  ' "$TMP/fetch-rel.out"; then
+  pass "a relative band miss exits 1 and names the statement"
+else
+  fail "relative miss" "exit $code: $(grep MISS "$TMP/fetch-rel.out" | head -n 3)"
+fi
+
+# Catches: fetch ignoring the absolute bands the boxes recorded: both arms
+# alike (every relative band passes) but over the hot band.
+as_arm_b "$TMP/fixture-miss" "$TMP/fixture-miss-b"
+fixture run-abs "$TMP/fixture-miss" "$TMP/fixture-miss-b"
+fetch abs run-abs --timeout 30
+if [ "$code" = 1 ] && grep -q '^MISS  *A  *hot_sum_s <= hot_sum_s_max' "$TMP/fetch-abs.out" \
+  && ! grep -q '^MISS  *B vs A' "$TMP/fetch-abs.out"; then
+  pass "an absolute band miss on either arm makes fetch exit 1"
+else
+  fail "absolute miss in fetch" "exit $code: $(grep MISS "$TMP/fetch-abs.out" | head -n 3)"
+fi
+
+# published_miss_fails_fetch. Catches: fetch ignoring the published verdict:
+# both arms alike and inside every relative and absolute band, but q01 hot
+# 0.5 s is over 1.1 x c6a.large's published 0.048 s. Also catches the kit
+# format's hot taken as anything but the best of tries 2 and 3: q01's tries
+# 0.4, 0.7, 0.5 s give hot 0.5 (not try 1, try 2, the mean of tries 2 and 3,
+# or the best of all three, 0.4), and q02's 0.9, 0.7, 0.5 s give hot 0.5 (not
+# the median, 0.7); cold is try 1, 0.4 s and 0.9 s.
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-pub-a" 'r["provenance"]["band_sections"].append("published")
+r["provenance"].setdefault("hardware", {})["instance_type"] = "c6a.large"
+rd ={"round": 1, "duration_s": 600, "wall_s": 600.4, "connections": 10, "calls": 100,
+      "ok": 100, "err": 0, "wrong_answer": 0, "qps": 1.0, "error_ratio": 0.0}
+r["concurrent"] = {"rounds": [rd], "pooled": {"rounds": 1, "calls": 100, "ok": 100, "err": 0,
+                   "wrong_answer": 0, "error_ratio_weighted": 0.0,
+                   "error_ratio_mean_of_rounds": 0.0, "qps_pooled": 1.0}}
+for e in r["entries"]:
+    tries = {"q01": [400.0, 700.0, 500.0], "q02": [900.0, 700.0, 500.0]}.get(e["id"][:3])
+    if tries:
+        e.update(tries_ms=tries, min_ms=500.0, cold_ms=tries[0], median_ms=sorted(tries)[1],
+                 max_ms=max(tries))'
+as_arm_b "$TMP/fixture-pub-a" "$TMP/fixture-pub-b"
+fixture run-pub "$TMP/fixture-pub-a" "$TMP/fixture-pub-b"
+PUB_IN="$FAKE_S3/kit-test-bucket/clickbench-kit/runs/run-pub/in"
+sed -e 's/^instance_type = .*/instance_type = "c6a.large"/' \
+  -e 's/^band_sections = .*/band_sections = ["relative", "absolute", "published"]/' \
+  -e 's/^phases = .*/phases = ["benchmark", "concurrent"]\nhealthz_phases = ["benchmark"]/' \
+  "$IN_SAVED/run.toml" >"$PUB_IN/run.toml.new"
+mv "$PUB_IN/run.toml.new" "$PUB_IN/run.toml"
+fetch pub run-pub --timeout 30
+if [ "$code" = 1 ] \
+  && grep -q '^MISS  *A  *q01 hot_s <= 1.1 x published .*statement 1 hot: measured 0.500 s, published 0.048 s, ratio 10.4167$' "$TMP/fetch-pub.out" \
+  && grep -q '^MISS  *B  *q01 hot_s <= 1.1 x published .*statement 1 hot: measured 0.500 s, published 0.048 s, ratio 10.4167$' "$TMP/fetch-pub.out" \
+  && grep -q '^MISS  *A  *q01 cold_s <= 1.1 x published .*statement 1 cold: measured 0.400 s, published 0.113 s, ratio 3.5398$' "$TMP/fetch-pub.out" \
+  && grep -q '^PASS  *A  *q02 hot_s <= 1.1 x published .*statement 2 hot: measured 0.500 s, published 1.004 s, ratio 0.4980$' "$TMP/fetch-pub.out" \
+  && grep -q '^PASS  *A  *q02 cold_s <= 1.1 x published .*statement 2 cold: measured 0.900 s, published 6.705 s, ratio 0.1342$' "$TMP/fetch-pub.out" \
+  && grep -q '^PASS  *A  *concurrent qps >= 0.9 x published .*concurrent qps: measured 1.000, published 0.137, ratio 7.2993$' "$TMP/fetch-pub.out" \
+  && ! grep -q '^MISS  *B vs A' "$TMP/fetch-pub.out" && ! grep -q '^MISS  *[AB]  *[^ ]* <= hot_s_max' "$TMP/fetch-pub.out"; then
+  pass "a published band miss on either arm makes fetch exit 1"
+else
+  fail "published miss in fetch" "exit $code: $(grep MISS "$TMP/fetch-pub.out" | head -n 3) $(tail -n 3 "$TMP/fetch-pub.err")"
+fi
+
+# Catches: wrong answers not counted as errors in the relative error band, or
+# a statement arm A answered and arm B did not dropping out of the comparison
+# instead of missing by id. Arm B is the wrong-answer box run above.
+as_arm_b "$TMP/fixture-errors" "$TMP/fixture-errors-b"
+fixture run-errors "$TMP/fixture-pass" "$TMP/fixture-errors-b"
+fetch errors run-errors --timeout 30
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *error_pooled <= A + 0.02  *0.047  *0.020$' "$TMP/fetch-errors.out" \
+  && grep -q '^MISS  *B vs A  *q02 answered by B .*answered by A, not by B$' "$TMP/fetch-errors.out" \
+  && grep -q '^MISS  *B vs A  *q19 answered by B .*answered by A, not by B$' "$TMP/fetch-errors.out" \
+  && grep -q '^PASS  *B vs A  *hot_sum_s <= 1.05 x A (41 both answered)' "$TMP/fetch-errors.out"; then
+  pass "wrong answers miss the relative error band and each statement B lost is a miss by id"
+else
+  fail "relative errors" "exit $code: $(grep -v '^PASS' "$TMP/fetch-errors.out" | head -n 6)"
+fi
+
+# Catches: hot and cold sums taken over each arm's own answered set instead of
+# the statements both arms answered. Arm A's q05 takes 5 s and arm B failed it;
+# arm B is 10% slower on the other 42. Over both-answered statements both sums
+# miss (23.1 s against 1.05 x 21.0 s); summing each arm's own set would put A's
+# 5 s in and pass.
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-sums-a" '
+for e in r["entries"]:
+    if e["id"].startswith("q05"):
+        e["min_ms"] = e["cold_ms"] = 5000.0'
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-sums-b" '
+q5 = [e for e in r["entries"] if e["id"].startswith("q05")][0]
+r["entries"].remove(q5)
+r["failed"].append({"id": q5["id"], "run": 0, "error": "error HTTP 500 internal: stub",
+                    "answer": dict(q5["answer"], answered=False)})
+for e in r["entries"]:
+    e["min_ms"] = e["cold_ms"] = 550.0'
+fixture run-sums "$TMP/fixture-sums-a" "$TMP/fixture-sums-b"
+fetch sums run-sums --timeout 30
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *hot_sum_s <= 1.05 x A (42 both answered)  *23.100  *22.050$' "$TMP/fetch-sums.out" \
+  && grep -q '^MISS  *B vs A  *cold_sum_s <= 1.05 x A (42 both answered)  *23.100  *22.050$' "$TMP/fetch-sums.out" \
+  && grep -q '^MISS  *B vs A  *q05 answered by B .*answered by A, not by B$' "$TMP/fetch-sums.out" \
+  && ! grep -q '^MISS  *B vs A  *q[0-9]* hot_s' "$TMP/fetch-sums.out"; then
+  pass "relative sums run over the statements both arms answered"
+else
+  fail "relative sums" "exit $code: $(grep -v '^PASS' "$TMP/fetch-sums.out" | head -n 6)"
+fi
+
+# Catches: a cold-sum band that is never judged, or judged on hot figures: arm
+# B's cold tries are 10% slower (23.65 s against 1.05 x 21.5 s) and its hot
+# tries match A's.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-cold-b" '
+for e in r["entries"]:
+    e["cold_ms"] = 550.0'
+fixture run-cold "$TMP/fixture-pass" "$TMP/fixture-cold-b"
+fetch cold run-cold --timeout 30
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *cold_sum_s <= 1.05 x A (43 both answered)  *23.650  *22.575$' "$TMP/fetch-cold.out" \
+  && grep -q '^PASS  *B vs A  *hot_sum_s <= 1.05 x A (43 both answered)' "$TMP/fetch-cold.out" \
+  && [ "$(grep -c '^MISS' "$TMP/fetch-cold.out")" = 1 ]; then
+  pass "a cold sum over the band misses on its own"
+else
+  fail "cold sum" "exit $code: $(grep -v '^PASS' "$TMP/fetch-cold.out" | head -n 4)"
+fi
+
+# gap_arm SRC DST ARM ROUNDS_JSON: a copy of arm SRC labelled ARM whose
+# concurrent block has one round per entry of ROUNDS_JSON and whose
+# evidence.tgz also holds each round's out/concurrent/round-N/healthz/metrics.jsonl
+# for the ADR-1170 gap band. ARM "keep" leaves results.json as SRC has it.
+# A round is a list of scrapes: null is an unanswered line, else [allocated,
+# cache_fetch, cache_catalog, reserved_sql, reserved_fetch, handoff_overlap] in
+# GiB, a null term leaving that gauge out. Each answered scrape also carries
+# stat="resident" 3 GiB above allocated and a budget gauge, which the band
+# must ignore. "bad" is a gated scrape answered with HTTP 503, and
+# {"ungated": [...]} is that list's ok scrape taken with the gate down.
+# {"tiered": [allocated, fetch_ram, fetch_disk, catalog_ram, catalog_disk,
+# reserved_sql, reserved_fetch, handoff_overlap]} is an ok scrape of a server
+# with a disk tier: no untiered cache series, each cache term a tier="ram" or
+# tier="disk" series, a null term leaving that series out.
+cat >"$TMP/gap_arm.py" <<'PY'
+import io, json, os, shutil, sys, tarfile
+src, dst, arm, rounds = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+sha_b = sys.argv[5]
+GIB = 1 << 30
+SERIES = ['ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="allocated"}',
+          'ravel_cache_resident_bytes{mode="all",cache="fetch"}',
+          'ravel_cache_resident_bytes{mode="all",cache="catalog"}',
+          'ravel_memory_reserved_bytes{mode="all",component="sql"}',
+          'ravel_memory_reserved_bytes{mode="all",component="fetch"}',
+          'ravel_memory_handoff_overlap_bytes{mode="all"}']
+RESIDENT = 'ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="resident"}'
+TIERED = ['ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="allocated"}',
+          'ravel_cache_resident_bytes{mode="all",cache="fetch",tier="ram"}',
+          'ravel_cache_resident_bytes{mode="all",cache="fetch",tier="disk"}',
+          'ravel_cache_resident_bytes{mode="all",cache="catalog",tier="ram"}',
+          'ravel_cache_resident_bytes{mode="all",cache="catalog",tier="disk"}'] + SERIES[3:]
+if src != dst:
+    shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst)
+if arm != "keep":
+    r = json.load(open(os.path.join(dst, "results.json")))
+    if arm == "B":
+        r["provenance"].update(arm="b", kit_arm="B", git_sha=sha_b)
+    rds = [{"round": n, "duration_s": 600, "wall_s": 600.4, "connections": 10, "calls": 100,
+            "ok": 100, "err": 0, "wrong_answer": 0, "qps": 1.0, "error_ratio": 0.0}
+           for n in range(1, len(rounds) + 1)]
+    r["concurrent"] = {"rounds": rds, "pooled": {
+        "rounds": len(rds), "calls": 100 * len(rds), "ok": 100 * len(rds), "err": 0,
+        "wrong_answer": 0, "error_ratio_weighted": 0.0, "error_ratio_mean_of_rounds": 0.0,
+        "qps_pooled": 1.0}}
+    json.dump(r, open(os.path.join(dst, "results.json"), "w"))
+tgz = os.path.join(dst, "evidence.tgz")
+kept = []
+if os.path.exists(tgz):
+    with tarfile.open(tgz) as old:
+        kept = [(m, old.extractfile(m).read() if m.isfile() else None) for m in old.getmembers()
+                if not m.name.startswith("out/concurrent/round-")
+                or not m.name.endswith("/healthz/metrics.jsonl")]
+with tarfile.open(tgz, "w:gz") as t:
+    for m, data in kept:
+        t.addfile(m, io.BytesIO(data) if data is not None else None)
+    for n, scrapes in enumerate(rounds, 1):
+        lines = []
+        for i, s in enumerate(scrapes):
+            rec = {"t": 1000.0 + i, "gated": True, "gen": 1}
+            names = SERIES
+            if isinstance(s, dict) and "tiered" in s:
+                names, s = TIERED, s["tiered"]
+            elif isinstance(s, dict):
+                rec.update(gated=False, gen=None)
+                s = s["ungated"]
+            if s is None:
+                rec.update(answered=False, ok=False, status=0, error="URLError: refused")
+            elif s == "bad":
+                rec.update(answered=True, ok=False, status=503, error="HTTP 503")
+            else:
+                mem = dict((k, v * GIB) for k, v in zip(names, s) if v is not None)
+                mem[RESIDENT] = (s[0] + 3) * GIB
+                mem['ravel_memory_budget_bytes{mode="all"}'] = 24.0 * GIB
+                rec.update(answered=True, ok=True, status=200, error="", heartbeat_s=0.2,
+                           memory=mem)
+            lines.append(json.dumps(rec, sort_keys=True))
+        data = ("\n".join(lines) + "\n").encode("utf-8")
+        info = tarfile.TarInfo("out/concurrent/round-%d/healthz/metrics.jsonl" % n)
+        info.size = len(data)
+        t.addfile(info, io.BytesIO(data))
+PY
+gap_arm() {
+  python3 "$TMP/gap_arm.py" "$1" "$2" "$3" "$4" "$SHA_B"
+}
+
+# CONC_PY: a python edit helper for edit_arm. conc(qps) is a one-round
+# concurrent block whose qps_pooled is qps, with no errors.
+CONC_PY='
+def conc(qps):
+    rd = {"round": 1, "duration_s": 600, "wall_s": 600.4, "connections": 10, "calls": 100,
+          "ok": 100, "err": 0, "wrong_answer": 0, "qps": qps, "error_ratio": 0.0}
+    return {"rounds": [rd], "pooled": {"rounds": 1, "calls": 100, "ok": 100, "err": 0,
+            "wrong_answer": 0, "error_ratio_weighted": 0.0, "error_ratio_mean_of_rounds": 0.0,
+            "qps_pooled": qps}}
+'
+# Catches: a QPS band that stays inconclusive when both arms ran the
+# concurrent phase, or compares the wrong way: B's 0.9 against 0.95 x A's 1.0
+# misses. Also catches fetch not printing a round's overran note (B's round
+# ran 700 s of a nominal 600) or printing one for a round that has none.
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-qps-a" "$CONC_PY"'
+r["concurrent"] = conc(1.0)'
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-qps-b" "$CONC_PY"'
+r["concurrent"] = conc(0.9)
+r["concurrent"]["rounds"][0].update(wall_s=700.0, overran={"wall_s": 700.0, "duration_s": 600})'
+gap_arm "$TMP/fixture-qps-b" "$TMP/fixture-qps-b" keep '[[[1,0,0,0,0,0]]]'
+fixture run-qps "$TMP/fixture-qps-a" "$TMP/fixture-qps-b"
+fetch qps run-qps --timeout 30
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *qps_pooled >= 0.95 x A  *0.900  *0.950$' "$TMP/fetch-qps.out" \
+  && grep -q '^PASS  *B vs A  *concurrent error_ratio_weighted <= A + 0.02  *0.000  *0.020$' "$TMP/fetch-qps.out" \
+  && grep -q '^concurrent B round 1: qps 0.900 error_ratio 0.000 ' "$TMP/fetch-qps.out" \
+  && grep -q '^concurrent B pooled: qps_pooled 0.900 error_ratio_weighted 0.000 ' "$TMP/fetch-qps.out" \
+  && grep -q '^concurrent B round 1 overran: wall 700.0 s against a nominal 600 s, more than 10% over; ' "$TMP/fetch-qps.out" \
+  && [ "$(grep -c ' overran: ' "$TMP/fetch-qps.out")" = 1 ] \
+  && [ "$(grep -c '^MISS' "$TMP/fetch-qps.out")" = 1 ]; then
+  pass "a QPS under the ratio misses when both arms measured it"
+else
+  fail "qps" "exit $code: $(grep -v '^PASS' "$TMP/fetch-qps.out" | head -n 4)"
+fi
+
+# DROP_PY: a python edit helper for edit_arm. drop(r, qs) moves every entry
+# whose qNN prefix is in qs to failed and recomputes the totals.
+DROP_PY='
+def drop(r, qs):
+    keep = []
+    for e in r["entries"]:
+        if e["id"].split("_", 1)[0] in qs:
+            r["failed"].append({"id": e["id"], "run": 0, "error": "error HTTP 504 deadline: stub",
+                                "answer": dict(e["answer"], answered=False)})
+        else:
+            keep.append(e)
+    r["entries"] = keep
+    r["totals"].update(answered=len(keep), failed=[f["id"] for f in r["failed"]],
+                       hot_sum_s=sum(e["min_ms"] for e in keep) / 1000.0,
+                       cold_sum_s=sum(e["cold_ms"] for e in keep) / 1000.0)
+ALL = ["q%02d" % n for n in range(1, 44)]
+'
+# relative NAME A_DIR B_DIR [BANDS]: kit.py relative over two arms' reports,
+# output in $TMP/rel-NAME.out and .err, exit code in $code.
+relative() {
+  code=0
+  python3 "$KIT_SRC/lib/kit.py" relative "${4:-$BANDS}" "$2/results.json" "$3/results.json" \
+    >"$TMP/rel-$1.out" 2>"$TMP/rel-$1.err" || code=$?
+}
+
+# Catches: a run where neither arm answered anything judged a pass: every sum
+# over the empty both-answered set is 0 against a bound of 0, so only the
+# answered-count band can miss.
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-none-a" "$DROP_PY"'
+drop(r, ALL)'
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-none-b" "$DROP_PY"'
+drop(r, ALL)'
+relative none "$TMP/fixture-none-a" "$TMP/fixture-none-b"
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *both answered >= 43  *0  *43  *not answered by A: q01 q02 .* q43; not answered by B: q01 .* q43; arm A answered no statement; arm B answered no statement$' "$TMP/rel-none.out" \
+  && grep -q '^PASS  *B vs A  *hot_sum_s <= 1.05 x A (0 both answered)  *0.000  *0.000$' "$TMP/rel-none.out"; then
+  pass "two arms with 0 of 43 statements answered miss, naming the count and the statements"
+else
+  fail "0/43" "exit $code: $(grep -v '^PASS' "$TMP/rel-none.out" | head -c 400) $(head -c 300 "$TMP/rel-none.err")"
+fi
+
+# Catches: an answered-count band read as "anything answered": both arms
+# answered q01 only.
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-one-a" "$DROP_PY"'
+drop(r, ALL[1:])'
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-one-b" "$DROP_PY"'
+drop(r, ALL[1:])'
+relative one "$TMP/fixture-one-a" "$TMP/fixture-one-b"
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *both answered >= 43  *1  *43  *not answered by A: q02 .* q43; not answered by B: q02 .* q43$' "$TMP/rel-one.out"; then
+  pass "two arms with 1 of 43 statements answered miss"
+else
+  fail "1/43" "exit $code: $(grep -v '^PASS' "$TMP/rel-one.out" | head -c 400) $(head -c 300 "$TMP/rel-one.err")"
+fi
+
+# Catches: an arm with zero answered statements passing because the key allows
+# it, or the zero-answered rule applied to one arm only.
+mkdir -p "$TMP/bands-min1"
+sed 's/^min_both_answered = .*/min_both_answered = 1/' "$BANDS" >"$TMP/bands-min1/rlog.toml"
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-zero-b" "$DROP_PY"'
+drop(r, ALL)'
+relative zero-b "$TMP/fixture-pass" "$TMP/fixture-zero-b" "$TMP/bands-min1/rlog.toml"
+zero_b="$code"
+relative zero-a "$TMP/fixture-none-a" "$TMP/fixture-pass-b" "$TMP/bands-min1/rlog.toml"
+zero_a="$code"
+if [ "$zero_b" = 1 ] && grep -q '^MISS  *B vs A  *both answered >= 1  *0  *1  *.*arm B answered no statement' "$TMP/rel-zero-b.out" \
+  && [ "$zero_a" = 1 ] && grep -q '^MISS  *B vs A  *both answered >= 1  *0  *1  *.*arm A answered no statement' "$TMP/rel-zero-a.out"; then
+  pass "an arm that answered no statement misses whatever min_both_answered allows"
+else
+  fail "zero answered" "exits $zero_a/$zero_b:$(grep 'both answered >=' "$TMP/rel-zero-a.out" "$TMP/rel-zero-b.out") $(head -c 300 "$TMP/rel-zero-a.err")"
+fi
+
+# Catches: a statement one arm lost dropping out of the count: A43/B42 and
+# A42/B43 with min_both_answered 43. B's lost statement was already a miss by
+# id; A's lost statement was only ever inconclusive.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-b42" "$DROP_PY"'
+drop(r, ["q07"])'
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-a42" "$DROP_PY"'
+drop(r, ["q07"])'
+relative b42 "$TMP/fixture-pass" "$TMP/fixture-b42"
+b42="$code"
+relative a42 "$TMP/fixture-a42" "$TMP/fixture-pass-b"
+if [ "$b42" = 1 ] && grep -q '^MISS  *B vs A  *both answered >= 43  *42  *43  *not answered by B: q07$' "$TMP/rel-b42.out" \
+  && [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *both answered >= 43  *42  *43  *not answered by A: q07$' "$TMP/rel-a42.out" \
+  && [ "$(grep -c '^MISS' "$TMP/rel-a42.out")" = 1 ]; then
+  pass "A43/B42 and A42/B43 both miss min_both_answered 43, naming the lost statement"
+else
+  fail "A43/B42, A42/B43" "exits $b42/$code: $(grep -v '^PASS' "$TMP/rel-b42.out" "$TMP/rel-a42.out" | head -c 600)"
+fi
+# The same A42/B43 pair passes when the band file names one known deadline miss.
+sed 's/^min_both_answered = .*/min_both_answered = 42/' "$BANDS" >"$TMP/bands-min1/rlog.toml"
+relative a42-42 "$TMP/fixture-a42" "$TMP/fixture-pass-b" "$TMP/bands-min1/rlog.toml"
+if [ "$code" = 0 ] && grep -q '^PASS  *B vs A  *both answered >= 42  *42  *42  *not answered by A: q07$' "$TMP/rel-a42-42.out"; then
+  pass "A42/B43 passes min_both_answered 42"
+else
+  fail "A42/B43 at 42" "exit $code: $(grep -v '^PASS' "$TMP/rel-a42-42.out" | head -c 400) $(head -c 300 "$TMP/rel-a42-42.err")"
+fi
+
+# Catches: answers never compared between the arms: both arms answered q08
+# (no expected row count in the corpus), A with 3 rows and B with 4.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-rows-b" '
+for e in r["entries"]:
+    if e["id"].startswith("q08"):
+        e["rows_returned"] = 4
+        e["answer"]["rows"] = 4'
+relative rows "$TMP/fixture-pass" "$TMP/fixture-rows-b"
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *rows_returned = A (43 both answered)  *1  *0  *q08$' "$TMP/rel-rows.out" \
+  && grep -q '^MISS  *B vs A  *q08 rows_returned = A  *4  *3$' "$TMP/rel-rows.out" \
+  && [ "$(grep -c '^MISS' "$TMP/rel-rows.out")" = 2 ]; then
+  pass "a statement answering another row count on B than on A is a miss naming it"
+else
+  fail "rows_returned" "exit $code: $(grep -v '^PASS' "$TMP/rel-rows.out" | head -c 400) $(head -c 300 "$TMP/rel-rows.err")"
+fi
+
+# Catches: two arms compared when they ran on different data, a different
+# mapping or corpus, a different CPU model, a different RustFS build, a
+# different audit mode, a different query window or under different server
+# settings. Each must exit 2 naming the field. Each entry is the provenance
+# path and the python edit that changes it on arm B.
+for edit in 'corpus_digest.dataset_sha256|p["corpus_digest"]["dataset_sha256"] = "2" * 64' \
+  'corpus_digest.mapping_sha256|p["corpus_digest"]["mapping_sha256"] = "3" * 64' \
+  'corpus_digest.corpus_sha256|p["corpus_digest"]["corpus_sha256"] = "4" * 64' \
+  'hardware.cpu|p["hardware"]["cpu"] = "Some Other CPU"' \
+  'backend.version|p["backend"]["version"] = "rustfs 9.9.9"' \
+  'audit_mode|p["audit_mode"] = "required, audit text redacted"' \
+  'query_window.window_hours|p["query_window"]["window_hours"] = 100000' \
+  'server_settings|p["server_settings"]["fetch_concurrency"] += 1' \
+  'server_flags.base_flags|p["server_flags"]["base_flags"][3] = "4"' \
+  'server_flags.extra_flags|p["server_flags"]["extra_flags"] = ["--fetch-concurrency", "64"]'; do
+  field="${edit%%|*}"
+  as_arm_b "$TMP/fixture-pass" "$TMP/fixture-cmp-b" "p = r[\"provenance\"]
+${edit#*|}"
+  code=0
+  python3 "$KIT_SRC/lib/kit.py" relative "$BANDS" "$TMP/fixture-pass/results.json" "$TMP/fixture-cmp-b/results.json" \
+    >"$TMP/cmp.out" 2>"$TMP/cmp.err" || code=$?
+  if [ "$code" = 2 ] && grep -qF "arms are not comparable: provenance.$field differs" "$TMP/cmp.err" \
+    && ! grep -q 'B vs A' "$TMP/cmp.out"; then
+    pass "arms with a different $field are refused with exit 2, naming it"
+  else
+    fail "comparable $field" "exit $code: $(head -c 300 "$TMP/cmp.err")"
+  fi
+done
+
+# Catches: arms judged by different band sections compared, and a comparable
+# field missing on one arm read as equal to nothing on the other.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-cmp-b" 'r["provenance"]["band_sections"] = ["relative"]'
+relative sections "$TMP/fixture-pass" "$TMP/fixture-cmp-b"
+sections_code="$code"
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-cmp-b" 'del r["provenance"]["hardware"]["cpu"]'
+relative missing "$TMP/fixture-pass" "$TMP/fixture-cmp-b"
+if [ "$sections_code" = 2 ] && grep -qF 'arms are not comparable: provenance.band_sections differs' "$TMP/rel-sections.err" \
+  && [ "$code" = 2 ] && grep -qF 'arms are not comparable: provenance.hardware.cpu is missing on B' "$TMP/rel-missing.err" \
+  && ! grep -q 'B vs A' "$TMP/rel-sections.out" "$TMP/rel-missing.out"; then
+  pass "arms with different band sections, or one missing a comparable field, are refused with exit 2"
+else
+  fail "band_sections / missing field" "exits $sections_code/$code: $(head -c 200 "$TMP/rel-sections.err") $(head -c 200 "$TMP/rel-missing.err")"
+fi
+# The same refusal through fetch, which must not read it as a band miss.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-cmp-b" 'r["provenance"]["hardware"]["cpu"] = "Some Other CPU"'
+fixture run-cmp "$TMP/fixture-pass" "$TMP/fixture-cmp-b"
+fetch cmp run-cmp --timeout 30
+if [ "$code" = 2 ] && grep -q 'provenance.hardware.cpu differs' "$TMP/fetch-cmp.err"; then
+  pass "fetch exits 2 on arms that are not comparable"
+else
+  fail "fetch comparable" "exit $code: $(tail -n 2 "$TMP/fetch-cmp.err")"
+fi
+
+# flags_fixture RUN A_DIR B_DIR SED: fixture, with the run's uploaded
+# in/run.toml edited by SED (fetch reads the declared extra flags from it).
+flags_fixture() {
+  local d="$FAKE_S3/kit-test-bucket/clickbench-kit/runs/$1"
+  fixture "$1" "$2" "$3"
+  sed "$4" "$d/in/run.toml" >"$d/in/run.toml.new" && mv "$d/in/run.toml.new" "$d/in/run.toml"
+}
+declare_b='s/^shards = /server_flags_b = ["--fetch-concurrency", "64"]\n&/'
+# Arm B ran with --fetch-concurrency 64, which moved its resolved setting.
+flags_b_edit='r["provenance"]["server_flags"]["extra_flags"] = ["--fetch-concurrency", "64"]
+r["provenance"]["server_settings"]["fetch_concurrency"] = 64'
+
+# Catches: arms whose only difference is the extra flags run.toml declared for
+# them refused, or the difference not printed, or printed more than once.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-flags-b" "$flags_b_edit"
+flags_fixture run-flags "$TMP/fixture-pass" "$TMP/fixture-flags-b" "$declare_b"
+fetch flags run-flags --timeout 30
+if [ "$code" = 0 ] \
+  && [ "$(grep -c '^comparable: ' "$TMP/fetch-flags.out")" = 2 ] \
+  && [ "$(grep -cF "comparable: arms differ by their declared extra server flags only: A [], B ['--fetch-concurrency', '64']" "$TMP/fetch-flags.out")" = 1 ] \
+  && [ "$(grep -cF "comparable: server_settings differs with them: fetch_concurrency A 32 B 64" "$TMP/fetch-flags.out")" = 1 ] \
+  && grep -q '^PASS  *B vs A  *hot_sum_s <= 1.05 x A (43 both answered)' "$TMP/fetch-flags.out"; then
+  pass "fetch accepts arms that differ by exactly the declared server_flags_a/b, printing the difference once"
+else
+  fail "fetch declared flags" "exit $code: $(grep '^comparable' "$TMP/fetch-flags.out") $(tail -n 2 "$TMP/fetch-flags.err")"
+fi
+
+# Catches: the declared-flags exception widened past the declared lists: B's
+# extra flags other than run.toml declares, extra flags with nothing
+# declared, and a kit-set flag that differs alongside declared extras.
+flags_refusal() {
+  local name="$1" edit="$2" sed_toml="$3" want="$4" id
+  id="$(printf '%s' "$name" | tr ' ' '-')"
+  as_arm_b "$TMP/fixture-pass" "$TMP/fixture-flags-$id-b" "$edit"
+  flags_fixture "run-flags-$id" "$TMP/fixture-pass" "$TMP/fixture-flags-$id-b" "$sed_toml"
+  fetch "flags-$id" "run-flags-$id" --timeout 30
+  if [ "$code" = 2 ] && grep -qF -- "$want" "$TMP/fetch-flags-$id.err" \
+    && ! grep -q 'B vs A' "$TMP/fetch-flags-$id.out" && ! grep -q '^comparable: ' "$TMP/fetch-flags-$id.out"; then
+    pass "fetch refuses $name with exit 2"
+  else
+    fail "fetch flags $name" "exit $code: $(tail -n 2 "$TMP/fetch-flags-$id.err")"
+  fi
+}
+flags_refusal "extra flags other than declared" \
+  'r["provenance"]["server_flags"]["extra_flags"] = ["--fetch-concurrency", "32"]' "$declare_b" \
+  "provenance.server_flags.extra_flags is A [], B ['--fetch-concurrency', '32'], and run.toml's server_flags_a and server_flags_b are A [], B ['--fetch-concurrency', '64']"
+flags_refusal "undeclared extra flags" "$flags_b_edit" 's/^shards = /&/' \
+  "provenance.server_flags.extra_flags is A [], B ['--fetch-concurrency', '64'], and run.toml's server_flags_a and server_flags_b are A [], B []"
+flags_refusal "a kit-set flag differing beside declared extras" "$flags_b_edit
+r[\"provenance\"][\"server_flags\"][\"base_flags\"][3] = \"4\"" "$declare_b" \
+  'arms are not comparable: provenance.server_flags.base_flags differs'
+flags_refusal "another field differing beside declared extras" "$flags_b_edit
+r[\"provenance\"][\"hardware\"][\"cpu\"] = \"Some Other CPU\"" "$declare_b" \
+  'arms are not comparable: provenance.hardware.cpu differs'
+
+# Catches: declared extra flags waving through every resolved server setting
+# that differs. A setting may differ only when a flag that sets it is set
+# differently by the declared lists: #2980's --sql-scan-decode-inline sets
+# none of them, and --fetch-concurrency sets only fetch_concurrency.
+declare_inline='s/^shards = /server_flags_b = ["--sql-scan-decode-inline"]\n&/'
+inline_edit='r["provenance"]["server_flags"]["extra_flags"] = ["--sql-scan-decode-inline"]'
+flags_refusal "an unrelated setting differing beside a declared flag that sets none" "$inline_edit
+r[\"provenance\"][\"server_settings\"][\"cache_max_bytes\"] = 1" "$declare_inline" \
+  "provenance.server_settings.cache_max_bytes differs (A 7689077760, B 1), and the declared extra flags do not set --cache-max-bytes differently"
+flags_refusal "a setting the declared flag does not set differing beside one it does" "$flags_b_edit
+r[\"provenance\"][\"server_settings\"][\"sql_tenant_max_bytes\"] = 1" "$declare_b" \
+  "provenance.server_settings.sql_tenant_max_bytes differs (A 32903794688, B 1), and the declared extra flags do not set --sql-tenant-max-bytes or --sql-max-query-bytes differently"
+flags_refusal "a setting no known flag sets differing beside declared extras" "$flags_b_edit
+r[\"provenance\"][\"server_settings\"][\"unmapped_setting\"] = 1" "$declare_b" \
+  "provenance.server_settings.unmapped_setting differs (A None, B 1), and the kit knows no flag that sets it"
+
+# Catches: the setting check refusing what a declared flag does move, or
+# printing a difference that is not there. B declares --sql-scan-decode-inline
+# with every setting equal (one comparable line), then --sql-tenant-max-bytes,
+# which moves both SQL pools (the per-query pool is clamped to it), then
+# --sql-max-query-bytes above the tenant pool, which raises the tenant pool to
+# it.
+flags_accepted() {
+  local name="$1" edit="$2" sed_toml="$3"
+  shift 3
+  as_arm_b "$TMP/fixture-pass" "$TMP/fixture-flags-$name-b" "$edit"
+  flags_fixture "run-flags-$name" "$TMP/fixture-pass" "$TMP/fixture-flags-$name-b" "$sed_toml"
+  fetch "flags-$name" "run-flags-$name" --timeout 30
+  local want ok=1
+  [ "$code" = 0 ] && [ "$(grep -c '^comparable: ' "$TMP/fetch-flags-$name.out")" = "$#" ] || ok=0
+  for want in "$@"; do
+    [ "$(grep -cxF "comparable: $want" "$TMP/fetch-flags-$name.out")" = 1 ] || ok=0
+  done
+  if [ "$ok" = 1 ]; then
+    pass "fetch accepts declared flags ($name), printing exactly the accepted differences"
+  else
+    fail "fetch flags $name" "exit $code: $(grep '^comparable' "$TMP/fetch-flags-$name.out") $(tail -n 2 "$TMP/fetch-flags-$name.err")"
+  fi
+}
+flags_accepted inline "$inline_edit" "$declare_inline" \
+  "arms differ by their declared extra server flags only: A [], B ['--sql-scan-decode-inline']"
+flags_accepted tenant 'r["provenance"]["server_flags"]["extra_flags"] = ["--sql-tenant-max-bytes", "1000"]
+r["provenance"]["server_settings"].update(sql_tenant_max_bytes=1000, sql_max_query_bytes=1000)' \
+  's/^shards = /server_flags_b = ["--sql-tenant-max-bytes", "1000"]\n&/' \
+  "arms differ by their declared extra server flags only: A [], B ['--sql-tenant-max-bytes', '1000']" \
+  "server_settings differs with them: sql_max_query_bytes A 16451897344 B 1000, sql_tenant_max_bytes A 32903794688 B 1000"
+flags_accepted raise 'r["provenance"]["server_flags"]["extra_flags"] = ["--sql-max-query-bytes", "40000000000"]
+r["provenance"]["server_settings"].update(sql_tenant_max_bytes=40000000000, sql_max_query_bytes=40000000000)' \
+  's/^shards = /server_flags_b = ["--sql-max-query-bytes", "40000000000"]\n&/' \
+  "arms differ by their declared extra server flags only: A [], B ['--sql-max-query-bytes', '40000000000']" \
+  "server_settings differs with them: sql_max_query_bytes A 16451897344 B 40000000000, sql_tenant_max_bytes A 32903794688 B 40000000000"
+
+# Catches: a declared flag on one SQL pool letting either pool, or the key it
+# sets directly, resolve to any value. B's --sql-max-query-bytes 50 can raise
+# the tenant pool only up to 50 and only from below, so 32903794688 moving to
+# 7 is refused; B's --sql-tenant-max-bytes above the per-query pool clamps
+# nothing, so that pool moving to 3 is refused; and --fetch-concurrency 64
+# sets fetch_concurrency to 64, not 17.
+flags_refusal "the tenant pool moved past what --sql-max-query-bytes raises it to" \
+  'r["provenance"]["server_flags"]["extra_flags"] = ["--sql-max-query-bytes", "50"]
+r["provenance"]["server_settings"].update(sql_max_query_bytes=50, sql_tenant_max_bytes=7)' \
+  's/^shards = /server_flags_b = ["--sql-max-query-bytes", "50"]\n&/' \
+  "provenance.server_settings.sql_tenant_max_bytes is A 32903794688, B 7, which the declared extra flags do not resolve it to: A sets no --sql-tenant-max-bytes or --sql-max-query-bytes, so it holds the unflagged value; B's --sql-max-query-bytes 50 raises it to 50 only from an unflagged value below 50"
+flags_refusal "the query pool moved past what --sql-tenant-max-bytes clamps it to" \
+  'r["provenance"]["server_flags"]["extra_flags"] = ["--sql-tenant-max-bytes", "40000000000"]
+r["provenance"]["server_settings"].update(sql_max_query_bytes=3, sql_tenant_max_bytes=40000000000)' \
+  's/^shards = /server_flags_b = ["--sql-tenant-max-bytes", "40000000000"]\n&/' \
+  "provenance.server_settings.sql_max_query_bytes is A 16451897344, B 3, which the declared extra flags do not resolve it to: A sets no --sql-max-query-bytes or --sql-tenant-max-bytes, so it holds the unflagged value; B's --sql-tenant-max-bytes 40000000000 clamps it to 40000000000 only from an unflagged value above 40000000000"
+flags_refusal "fetch_concurrency resolved to other than --fetch-concurrency sets" \
+  'r["provenance"]["server_flags"]["extra_flags"] = ["--fetch-concurrency", "64"]
+r["provenance"]["server_settings"]["fetch_concurrency"] = 17' "$declare_b" \
+  "provenance.server_settings.fetch_concurrency is A 32, B 17, which the declared extra flags do not resolve it to: A sets no --fetch-concurrency, so it holds the unflagged value; B's --fetch-concurrency 64 sets it to 64"
+
+# Catches: the setting check accepting a move resolve_performance_defaults in
+# services/ravel-server/src/config.rs does not make, or refusing one it does.
+# Arm A holds the unflagged pools (query 100, tenant 200) unless a case gives
+# it flags of its own.
+settings="$(python3 - "$KIT_SRC/lib" <<'PY' 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import kit
+Q, T, F = "sql_max_query_bytes", "sql_tenant_max_bytes", "fetch_concurrency"
+base = {Q: 100, T: 200, F: 32}
+def s(**kw):
+    out = dict(base)
+    out.update({{"q": Q, "t": T, "f": F}[k]: v for k, v in kw.items()})
+    return out
+cases = [
+    # name, A settings, B settings, A flags, B flags, accepted
+    ("raise above the tenant pool", base, s(q=500, t=500), [], ["--sql-max-query-bytes", "500"], True),
+    ("query flag below the tenant pool raises nothing", base, s(q=150), [],
+     ["--sql-max-query-bytes", "150"], True),
+    ("tenant pool raised from above", base, s(q=150, t=150), [],
+     ["--sql-max-query-bytes", "150"], False),
+    ("tenant pool left below the query flag", base, s(q=500), [],
+     ["--sql-max-query-bytes", "500"], False),
+    ("clamp below the query pool", base, s(q=60, t=60), [], ["--sql-tenant-max-bytes", "60"], True),
+    ("query pool clamped although below the tenant flag", base, s(q=60, t=150), [],
+     ["--sql-tenant-max-bytes", "150"], False),
+    ("query pool left above the tenant flag", base, s(t=60), [],
+     ["--sql-tenant-max-bytes", "60"], False),
+    ("both pool flags, the query one clamped", base, s(q=80, t=80), [],
+     ["--sql-max-query-bytes", "90", "--sql-tenant-max-bytes", "80"], True),
+    ("both pool flags, the query one not clamped", base, s(q=90, t=80), [],
+     ["--sql-max-query-bytes", "90", "--sql-tenant-max-bytes", "80"], False),
+    ("query flags on both arms, each raise consistent", s(q=50, t=60), s(q=80, t=80),
+     ["--sql-max-query-bytes", "50"], ["--sql-max-query-bytes", "80"], True),
+    ("query flags on both arms, the raise inconsistent", s(q=50, t=70), s(q=80, t=90),
+     ["--sql-max-query-bytes", "50"], ["--sql-max-query-bytes", "80"], False),
+    ("fetch flag honoured", base, s(f=64), [], ["--fetch-concurrency", "64"], True),
+    ("fetch flags on both arms, equal stamps neither sets", base, base,
+     ["--fetch-concurrency", "64"], ["--fetch-concurrency", "17"], False),
+    ("a setting flag given twice", base, s(f=64), [],
+     ["--fetch-concurrency", "64", "--fetch-concurrency=64"], False),
+    ("a setting flag with no number", base, s(f=64), [], ["--fetch-concurrency", "lots"], False),
+]
+bad = []
+for name, va, vb, ea, eb, want in cases:
+    try:
+        kit._setting_differences(va, vb, ea, eb)
+        got = True
+    except kit.Refusal:
+        got = False
+    if got != want:
+        bad.append("%s %s" % (name, "refused" if want else "accepted"))
+print("; ".join(bad))
+PY
+)"
+if [ -z "$settings" ]; then
+  pass "a declared SQL pool or fetch flag accepts exactly the values config.rs resolves the settings to"
+else
+  fail "setting resolution" "$settings"
+fi
+
+# Catches: a stamped setting the comparability check has no flag entry for,
+# which would then refuse every declared flag that moves it.
+unmapped="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import kit
+print(" ".join(sorted(set(kit.STAMPED_SETTINGS) ^ set(kit.SETTING_FLAGS))))' "$KIT_SRC/lib" 2>&1)"
+if [ -z "$unmapped" ]; then
+  pass "every stamped server setting has an entry in SETTING_FLAGS, and nothing else does"
+else
+  fail "setting flags" "$unmapped"
+fi
+
+# Catches: a healthz p99 band set to a number and never judged, or a
+# placeholder one judged: 4318's ratio is set and B's benchmark p99 is three
+# times A's, while 4319's stays a placeholder and yields no row.
+mkdir -p "$TMP/bands-healthz"
+sed 's/^healthz_p99_max_ratio_4318 = .*/healthz_p99_max_ratio_4318 = 1.5/' "$BANDS" >"$TMP/bands-healthz/rlog.toml"
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-hz-b" 'p = r["healthz"]["phases"]["benchmark"]["ports"]["4318"]
+p["p99_ms"] *= 3'
+relative healthz "$TMP/fixture-pass" "$TMP/fixture-hz-b" "$TMP/bands-healthz/rlog.toml"
+abs_hz="$(python3 -c 'import json, sys; sys.path.insert(0, sys.argv[1]); import kit
+r = json.load(open(sys.argv[2]))
+rows = kit.healthz_absolute({"healthz_p99_ms_max_4318": 0.001, "healthz_p99_ms_max_4319": "FILL-IN-ON-REFERENCE-MACHINE"}, r)
+print(" ".join("%s:%s" % (x["band"], x["verdict"]) for x in rows))' "$KIT_SRC/lib" "$TMP/fixture-pass/results.json" 2>&1)"
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *healthz benchmark port 4318 p99_ms <= 1.5 x A ' "$TMP/rel-healthz.out" \
+  && ! grep -q 'port 4319' "$TMP/rel-healthz.out" \
+  && [ "$abs_hz" = "healthz benchmark p99_ms <= healthz_p99_ms_max_4318:miss" ]; then
+  pass "a numeric healthz p99 band is judged per phase and port, and a placeholder one is skipped"
+else
+  fail "healthz bands" "exit $code, absolute '$abs_hz': $(grep healthz "$TMP/rel-healthz.out") $(head -c 200 "$TMP/rel-healthz.err")"
+fi
+
+# Catches: a report with a null sum judged (or crashing into exit 1, which
+# every caller reads as a band miss).
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-null" 'r["totals"]["hot_sum_s"] = None'
+code=0
+python3 "$KIT_SRC/lib/kit.py" relative "$BANDS" "$TMP/fixture-pass/results.json" "$TMP/fixture-null/results.json" \
+  >/dev/null 2>"$TMP/null.err" || code=$?
+if [ "$code" = 2 ] && grep -q 'totals.hot_sum_s is None, not a number' "$TMP/null.err"; then
+  pass "a null totals.hot_sum_s exits 2, naming the field"
+else
+  fail "null sum" "exit $code: $(head -c 300 "$TMP/null.err")"
+fi
+
+# Catches: an unexpected exception exiting 1 (a band miss to every caller) or
+# without its traceback. A phases block that is not an object passes validate
+# and breaks the error ratio.
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-crash" 'r["phases"] = {"benchmark": 5}'
+code=0
+python3 "$KIT_SRC/lib/kit.py" relative "$BANDS" "$TMP/fixture-pass/results.json" "$TMP/fixture-crash/results.json" \
+  >/dev/null 2>"$TMP/crash.err" || code=$?
+if [ "$code" = 2 ] && grep -q '^Traceback ' "$TMP/crash.err" \
+  && grep -q 'kit: unexpected error in relative; see the traceback above' "$TMP/crash.err"; then
+  pass "an unexpected exception exits 2 with its traceback"
+else
+  fail "unexpected exception" "exit $code: $(tail -c 300 "$TMP/crash.err")"
+fi
+
+# Catches: a 403 on a download read as a missing object (exit 2) rather than
+# as an S3 failure (exit 4).
+STUB_S3_DENY_KEY=evidence.tgz fetch deny run-pass --timeout 30
+if [ "$code" = 4 ] && grep -q '(403)' "$TMP/fetch-deny.err" \
+  && grep -q 'download of .*/out/A/evidence.tgz failed (aws exit 1)' "$TMP/fetch-deny.err"; then
+  pass "a 403 on a download exits 4"
+else
+  fail "fetch 403" "exit $code: $(tail -n 2 "$TMP/fetch-deny.err")"
+fi
+
+# Catches: a missing bucket read as a missing key (exit 2, "not there") because
+# its message also says "does not exist", rather than as an S3 failure (exit 4).
+STUB_S3_NO_BUCKET=1 fetch nobucket run-pass --timeout 30
+if [ "$code" = 4 ] && grep -q 'NoSuchBucket' "$TMP/fetch-nobucket.err" \
+  && grep -q 'download of .* failed (aws exit 1)' "$TMP/fetch-nobucket.err"; then
+  pass "a NoSuchBucket on a download exits 4"
+else
+  fail "fetch NoSuchBucket" "exit $code: $(tail -n 2 "$TMP/fetch-nobucket.err")"
+fi
+
+# Catches: a FAILED arm read as a pass, or its reason not shown.
+mkdir -p "$TMP/fixture-failed"
+printf 'FAILED step=build at=2026-10-11T10:00:00Z\n' >"$TMP/fixture-failed/FAILED"
+fixture run-failed "$TMP/fixture-pass" "$TMP/fixture-failed"
+fetch failed run-failed --timeout 30
+if [ "$code" = 2 ] && grep -q 'FAILED step=build' "$TMP/fetch-failed.err"; then
+  pass "a FAILED arm exits 2 and prints the failing step"
+else
+  fail "FAILED" "exit $code: $(tail -n 3 "$TMP/fetch-failed.err")"
+fi
+
+# Catches: a results.json missing a stamp judged anyway.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-bad-b" 'del r["provenance"]["fold"]'
+fixture run-bad "$TMP/fixture-pass" "$TMP/fixture-bad-b"
+fetch bad run-bad --timeout 30
+if [ "$code" = 2 ] && grep -q 'provenance missing fold' "$TMP/fetch-bad.err"; then
+  pass "a malformed results.json exits 2"
+else
+  fail "malformed" "exit $code: $(tail -n 3 "$TMP/fetch-bad.err")"
+fi
+
+# Catches: an unreachable S3 read as "still running" until the timeout.
+fetch down run-pass --timeout 30 --unreachable-tries 2
+down_code="$code"
+STUB_S3_DOWN=1 fetch down run-pass --timeout 30 --unreachable-tries 2
+if [ "$down_code" = 0 ] && [ "$code" = 4 ] && grep -q 'S3 unreachable' "$TMP/fetch-down.err"; then
+  pass "unreachable S3 exits 4"
+else
+  fail "unreachable" "exit $code: $(tail -n 2 "$TMP/fetch-down.err")"
+fi
+
+# Catches: an aws call allowed to hang past the per-call limit.
+KIT_FETCH_CALL_LIMIT=1 STUB_S3_HANG=1 fetch hang run-pass --timeout 30 --unreachable-tries 1
+if [ "$code" = 4 ] && grep -q 'killed an aws call after 1 s' "$TMP/fetch-hang.err"; then
+  pass "an aws call over the per-call limit is killed and counts as unreachable"
+else
+  fail "call limit" "exit $code: $(tail -n 2 "$TMP/fetch-hang.err")"
+fi
+KIT_FETCH_CALL_LIMIT=91 fetch limit run-pass --timeout 30
+if [ "$code" = 64 ]; then
+  pass "a per-call limit over 90 s is refused"
+else
+  fail "call limit cap" "exit $code"
+fi
+
+# Catches: polling forever when no marker ever appears.
+fixture run-pending "" ""
+fetch pending run-pending --timeout 2
+if [ "$code" = 3 ] && grep -q 'no marker from both arms within 2 s' "$TMP/fetch-pending.err"; then
+  pass "no marker within --timeout exits 3"
+else
+  fail "timeout" "exit $code: $(tail -n 2 "$TMP/fetch-pending.err")"
+fi
+
+# --- box speed band -----------------------------------------------------------
+
+# SPEED_PY: a python edit helper for edit_arm. speed(r, user) stamps the arm's
+# load at USER seconds of user CPU; nospeed(r) removes the stamp, as a
+# results.json from before it existed has none.
+SPEED_PY='
+def speed(r, user):
+    r["provenance"]["box_speed"] = {"basis": "load_user_cpu_s", "load_user_cpu_s": user,
+                                    "load_wall_s": 1500.0, "reason": None}
+def nospeed(r):
+    del r["provenance"]["box_speed"]
+'
+SPEED_ROW='box_speed load_user_cpu_s B / A'
+
+# Catches: the box speed band not judged on a normal run, or judged against
+# the wrong bound: both arms loaded with 6000.5 s, ratio 1.000.
+if grep -q "^PASS  *B vs A  *$SPEED_ROW  *1.000  *0.95..1.05  *A 6000.5 s, B 6000.5 s; the loader differs between arms (built from each arm's sha)$" "$TMP/fetch-pass.out" \
+  && [ "$(grep -c 'box_speed' "$TMP/fetch-pass.out")" = 1 ]; then
+  pass "box speed: two arms with the same load CPU pass, printed once at ratio 1.000"
+else
+  fail "box speed pass" "$(grep box_speed "$TMP/fetch-pass.out")"
+fi
+
+# Catches: a band edge read as outside it: 1.049 and 0.951 both pass.
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-speed-a" "$SPEED_PY"'
+speed(r, 6000.0)'
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-speed-hi" "$SPEED_PY"'
+speed(r, 6294.0)'
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-speed-lo" "$SPEED_PY"'
+speed(r, 5706.0)'
+relative speed-hi "$TMP/fixture-speed-a" "$TMP/fixture-speed-hi"
+hi="$code"
+relative speed-lo "$TMP/fixture-speed-a" "$TMP/fixture-speed-lo"
+if [ "$hi" = 0 ] && grep -q "^PASS  *B vs A  *$SPEED_ROW  *1.049  *0.95..1.05  *A 6000.0 s, B 6294.0 s;" "$TMP/rel-speed-hi.out" \
+  && [ "$code" = 0 ] && grep -q "^PASS  *B vs A  *$SPEED_ROW  *0.951  *0.95..1.05  *A 6000.0 s, B 5706.0 s;" "$TMP/rel-speed-lo.out"; then
+  pass "box speed: ratios 1.049 and 0.951 are inside the band and pass"
+else
+  fail "box speed edges" "exits $hi/$code: $(grep box_speed "$TMP/rel-speed-hi.out" "$TMP/rel-speed-lo.out") $(head -c 300 "$TMP/rel-speed-hi.err")"
+fi
+
+# speed_invalid NAME B_USER RATIO: fetch over arm A at 6000.0 s and arm B at
+# B_USER s must print the box speed row INVALID at RATIO, still print every
+# other row the passing run printed, and exit 5 with the invalid summary.
+speed_invalid() {
+  local name="$1" user="$2" ratio="$3"
+  as_arm_b "$TMP/fixture-pass" "$TMP/fixture-$name-b" "$SPEED_PY"'
+speed(r, '"$user"')'
+  fixture "run-$name" "$TMP/fixture-speed-a" "$TMP/fixture-$name-b"
+  fetch "$name" "run-$name" --timeout 30
+  if [ "$code" = 5 ] \
+    && grep -q "^INVALID  *B vs A  *$SPEED_ROW  *$ratio  *0.95..1.05  *A 6000.0 s, B $user s; the loader differs between arms (built from each arm's sha); box speeds differ: re-run, do not read the bands$" "$TMP/fetch-$name.out" \
+    && grep -q '^PASS  *B vs A  *hot_sum_s <= 1.05 x A (43 both answered)' "$TMP/fetch-$name.out" \
+    && [ "$(grep -cE '^(PASS|MISS|INCONCLUSIVE|INVALID|REPORT) ' "$TMP/fetch-$name.out")" \
+      = "$(grep -cE '^(PASS|MISS|INCONCLUSIVE|INVALID|REPORT) ' "$TMP/fetch-pass.out")" ] \
+    && grep -q '^fetch: run INVALID: box speeds differ (the box speed band above); re-run, do not read the bands' "$TMP/fetch-$name.err" \
+    && ! grep -q 'every band passed' "$TMP/fetch-$name.err"; then
+    pass "box speed: ratio $ratio is INVALID, every other row still prints, and fetch exits 5"
+  else
+    fail "box speed $name" "exit $code: $(grep box_speed "$TMP/fetch-$name.out") $(tail -n 2 "$TMP/fetch-$name.err")"
+  fi
+}
+# Catches: arm B on a slow box (the #3486 outlier against the fastest of the
+# same-binary boxes) read as a regression of B's binary (a MISS, exit 1).
+speed_invalid speed-bslow 6396.0 1.066
+# Catches: a one-sided band that only checks B slower than A: arm A on the
+# slow box makes B look fast, which is just as much a box difference.
+speed_invalid speed-aslow 5640.0 0.940
+
+# Catches: a band miss taking precedence over INVALID: q01 misses as well,
+# and the exit is still 5, with the miss row printed.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-speed-both-b" "$SPEED_PY"'
+speed(r, 6396.0)
+r["entries"][0]["min_ms"] = 750.0'
+fixture run-speed-both "$TMP/fixture-speed-a" "$TMP/fixture-speed-both-b"
+fetch speed-both run-speed-both --timeout 30
+if [ "$code" = 5 ] && grep -q "^INVALID  *B vs A  *$SPEED_ROW  *1.066  " "$TMP/fetch-speed-both.out" \
+  && grep -q '^MISS  *B vs A  *q01 hot_s <= max(1.15 x A, 0.2 s)' "$TMP/fetch-speed-both.out" \
+  && ! grep -q 'at least one band MISSED' "$TMP/fetch-speed-both.err"; then
+  pass "box speed: an INVALID run that also misses a band exits 5, printing the miss"
+else
+  fail "box speed invalid and miss" "exit $code: $(grep -v '^PASS' "$TMP/fetch-speed-both.out" | head -n 4)"
+fi
+
+# Catches: an old results.json without the stamp crashing the relative step
+# or invalidating the run: the row is INCONCLUSIVE and the exit is whatever
+# the other bands give, 0 here and 1 with q01 missing.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-speed-old-b" "$SPEED_PY"'
+nospeed(r)'
+fixture run-speed-old "$TMP/fixture-speed-a" "$TMP/fixture-speed-old-b"
+fetch speed-old run-speed-old --timeout 30
+old="$code"
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-speed-old-a" "$SPEED_PY"'
+nospeed(r)'
+relative speed-old-miss "$TMP/fixture-speed-old-a" "$TMP/fixture-rel-b"
+if [ "$old" = 0 ] && grep -q "^INCONCLUSIVE  *B vs A  *$SPEED_ROW  *None  *0.95..1.05  *arm B: no box_speed stamp$" "$TMP/fetch-speed-old.out" \
+  && grep -q 'every band passed or was inconclusive' "$TMP/fetch-speed-old.err" \
+  && [ "$code" = 1 ] && grep -q "^INCONCLUSIVE  *B vs A  *$SPEED_ROW  *None  *0.95..1.05  *arm A: no box_speed stamp$" "$TMP/rel-speed-old-miss.out" \
+  && grep -q '^MISS  *B vs A  *q01 hot_s' "$TMP/rel-speed-old-miss.out"; then
+  pass "box speed: a stamp missing on one arm is INCONCLUSIVE and the other bands decide the exit"
+else
+  fail "box speed missing stamp" "exits $old/$code: $(grep box_speed "$TMP/fetch-speed-old.out" "$TMP/rel-speed-old-miss.out") $(tail -n 3 "$TMP/fetch-speed-old.err")"
+fi
+
+# Catches: a null figure (a load.time without user=) read as 0 and divided
+# by, or as a box difference.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-speed-null-b" "$SPEED_PY"'
+speed(r, None)
+r["provenance"]["box_speed"]["reason"] = "load.time carries user= 0 times, not once"'
+relative speed-null "$TMP/fixture-speed-a" "$TMP/fixture-speed-null-b"
+if [ "$code" = 0 ] && grep -q "^INCONCLUSIVE  *B vs A  *$SPEED_ROW  *None  *0.95..1.05  *arm B: load_user_cpu_s is None (load.time carries user= 0 times, not once)$" "$TMP/rel-speed-null.out"; then
+  pass "box speed: a null load_user_cpu_s is INCONCLUSIVE, quoting its reason"
+else
+  fail "box speed null" "exit $code: $(grep box_speed "$TMP/rel-speed-null.out") $(head -c 300 "$TMP/rel-speed-null.err")"
+fi
+
+# Catches: box_speed_band = false ignored (still INVALID), or turning the row
+# off altogether so the ratio is not printed.
+flags_fixture run-speed-off "$TMP/fixture-speed-a" "$TMP/fixture-speed-bslow-b" \
+  's/^shards = /box_speed_band = false\n&/'
+fetch speed-off run-speed-off --timeout 30
+if [ "$code" = 0 ] \
+  && grep -q "^REPORT  *B vs A  *$SPEED_ROW  *1.066  *0.95..1.05  *A 6000.0 s, B 6396.0 s; the loader differs between arms (built from each arm's sha); outside the band; run.toml box_speed_band = false makes it report-only$" "$TMP/fetch-speed-off.out" \
+  && ! grep -q 'INVALID' "$TMP/fetch-speed-off.out" "$TMP/fetch-speed-off.err"; then
+  pass "box speed: box_speed_band = false prints ratio 1.066 as REPORT and does not invalidate the run"
+else
+  fail "box speed off" "exit $code: $(grep box_speed "$TMP/fetch-speed-off.out") $(tail -n 2 "$TMP/fetch-speed-off.err")"
+fi
+
+# Catches: the loader note printed when both arms ran the same SHA (an A/A
+# run), where the loader is the same binary.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-speed-aa-b" "$SPEED_PY"'
+speed(r, 6396.0)
+r["provenance"]["git_sha"] = "'"$SHA_A"'"'
+relative speed-aa "$TMP/fixture-speed-a" "$TMP/fixture-speed-aa-b"
+if [ "$code" = 5 ] && grep -q "^INVALID  *B vs A  *$SPEED_ROW  *1.066  *0.95..1.05  *A 6000.0 s, B 6396.0 s; box speeds differ: re-run, do not read the bands$" "$TMP/rel-speed-aa.out"; then
+  pass "box speed: an A/A pair at 1.066 is INVALID without the loader note"
+else
+  fail "box speed A/A" "exit $code: $(grep box_speed "$TMP/rel-speed-aa.out") $(head -c 300 "$TMP/rel-speed-aa.err")"
+fi
+
+# --- concurrent, q29_probe and perf phases ----------------------------------
+
+# Catches: a statement order that is not upstream bench_concurrent_qps's
+# (another hash, byte order or shuffle), which would make the two kits' QPS
+# figures incomparable. The indexes are pinned literals, not recomputed.
+perm="$(python3 "$KIT_SRC/lib/kit.py" permutation clickbench 1 43)"
+if [ "$(echo "$perm" | cut -d' ' -f1-5)" = "14 23 41 9 1" ] \
+  && [ "$(echo "$perm" | tr ' ' '\n' | sort -n | tr '\n' ' ')" = "$(seq 0 42 | tr '\n' ' ')" ]; then
+  pass "seed clickbench, connection 1, 43 statements: the order starts 14 23 41 9 1"
+else
+  fail "permutation" "got '$perm'"
+fi
+
+# A concurrent phase directory of three rounds of 2 s nominal, each with a
+# measured wall time over it and a different call count:
+#   round 1: 10 calls, 9 of them 2xx (one a wrong answer), 1 a 500
+#   round 2: 30 calls, all 2xx
+#   round 3:  4 calls, all 503
+CONC_DIR="$TMP/conc-units"
+mkdir -p "$CONC_DIR"
+python3 - "$CONC_DIR" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+with open(os.path.join(d, "rounds.jsonl"), "w") as f:
+    for r, wall in ((1, 2.5), (2, 2.25), (3, 3.0)):
+        f.write(json.dumps({"round": r, "duration_s": 2, "wall_s": wall, "connections": 2,
+                            "statements": 43, "seed": "clickbench"}) + "\n")
+calls = []
+def call(r, status, cls=""):
+    calls.append({"statement": "q01_count_all", "round": r, "connection": 1 + len(calls) % 2,
+                  "http_status": status, "curl_exit": 0, "refusal_class": cls})
+for i in range(8):
+    call(1, 200)
+call(1, 200, "wrong_answer")
+call(1, 500, "internal")
+for i in range(30):
+    call(2, 200)
+for i in range(4):
+    call(3, 503, "unavailable")
+with open(os.path.join(d, "calls.jsonl"), "w") as f:
+    for c in calls:
+        f.write(json.dumps(c) + "\n")
+PY
+code=0
+python3 "$KIT_SRC/lib/kit.py" concurrent-summary "$CONC_DIR" >"$TMP/conc-units.json" 2>"$TMP/conc-units.err" || code=$?
+
+# conc_check NAME PYTHON: PYTHON run against the summary as s, rounds as rd;
+# it prints nothing when the claim holds.
+conc_check() {
+  python3 - "$TMP/conc-units.json" "$2" <<'PY' 2>&1
+import json, sys
+s = json.load(open(sys.argv[1]))
+rd = dict((r["round"], r) for r in s["rounds"])
+p = s["pooled"]
+exec(sys.argv[2])
+PY
+}
+
+# Catches: a round's QPS divided by its measured wall time (2.5 s, 2.25 s)
+# instead of the nominal duration_s (2 s): 9 / 2.5 is 3.6, not 4.5.
+out="$(conc_check qps '
+if (rd[1]["qps"], rd[2]["qps"]) != (4.5, 15.0) or rd[1]["wall_s"] == rd[1]["duration_s"]:
+    print("qps", rd[1]["qps"], rd[2]["qps"])')"
+if [ "$code" = 0 ] && [ -z "$out" ]; then
+  pass "a round's QPS is its 2xx calls over the nominal duration, not the wall time"
+else
+  fail "round qps" "exit $code: $out $(head -c 300 "$TMP/conc-units.err")"
+fi
+
+# Catches: a round that made calls but had no successful one reported as
+# null QPS, which the pooled mean would then leave out, or its errors dropped.
+out="$(conc_check zero '
+if rd[3]["qps"] != 0.0 or rd[3]["error_ratio"] != 1.0 or (rd[3]["ok"], rd[3]["err"]) != (0, 4):
+    print(rd[3])')"
+if [ "$code" = 0 ] && [ -z "$out" ]; then
+  pass "an all-error round has QPS 0 and error ratio 1.0"
+else
+  fail "all-error round" "$out"
+fi
+
+# Catches: qps_pooled leaving the all-error round out ((4.5 + 15) / 2 =
+# 9.75), so arm B with one dead round could pass qps_min_ratio against arm
+# A's three good ones, rather than the mean with it as 0 ((4.5 + 15 + 0) / 3
+# = 6.5), and the mean of the round error ratios ((0.1 + 0 + 1) / 3)
+# reported under error_ratio_weighted, whose value is all errors over all
+# calls (5 / 44).
+out="$(conc_check pooled '
+want = {"rounds": 3, "calls": 44, "ok": 39, "err": 5, "wrong_answer": 1, "qps_pooled": 6.5}
+for k, v in want.items():
+    if p[k] != v:
+        print(k, p[k], "want", v)
+if abs(p["error_ratio_weighted"] - 5 / 44.0) > 1e-12:
+    print("error_ratio_weighted", p["error_ratio_weighted"], "want", 5 / 44.0)
+if abs(p["error_ratio_mean_of_rounds"] - 1.1 / 3) > 1e-12:
+    print("error_ratio_mean_of_rounds", p["error_ratio_mean_of_rounds"], "want", 1.1 / 3)
+if abs(p["error_ratio_weighted"] - p["error_ratio_mean_of_rounds"]) < 0.1:
+    print("the two error forms do not differ")')"
+if [ "$code" = 0 ] && [ -z "$out" ]; then
+  pass "three rounds, one with no success, pool to qps_pooled 6.5 (that round as 0), error_ratio_weighted 5/44 and mean_of_rounds 1.1/3"
+else
+  fail "pooling" "$out"
+fi
+
+# Catches: a round that made no call at all counted as 0 in qps_pooled, when
+# it has nothing to measure: it stays null and out of the mean.
+out="$(python3 - "$KIT_SRC/lib" <<'PY' 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import kit
+meta = lambda r: {"round": r, "duration_s": 2, "wall_s": 2.0, "connections": 1}
+ok = {"http_status": 200, "curl_exit": 0}
+rounds = [kit.concurrent_round(meta(1), [dict(ok)] * 6), kit.concurrent_round(meta(2), [])]
+p = kit.pool_rounds(rounds)
+if rounds[1]["qps"] is not None or p["qps_pooled"] != 3.0:
+    print(rounds[1], p)
+PY
+)"
+if [ -z "$out" ]; then
+  pass "a round with no call has QPS null and stays out of qps_pooled"
+else
+  fail "no-call round" "$out"
+fi
+
+# Catches: a round that ran more than 10% past its nominal duration not
+# marked "overran" with both figures, one within 10% marked, or the overrun
+# changing the QPS formula (successful calls over the nominal duration).
+out="$(python3 - "$KIT_SRC/lib" <<'PY' 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import kit
+ok = [{"http_status": 200, "curl_exit": 0}] * 20
+for wall, want in ((11.5, {"wall_s": 11.5, "duration_s": 10}), (10.9, None), (10.0, None)):
+    rd = kit.concurrent_round({"round": 1, "duration_s": 10, "wall_s": wall, "connections": 1}, ok)
+    if rd["overran"] != want or rd["qps"] != 2.0:
+        print("wall", wall, rd)
+PY
+)"
+if [ -z "$out" ]; then
+  pass "a round more than 10% over its nominal duration is marked overran with both figures, its QPS formula unchanged"
+else
+  fail "overran round" "$out"
+fi
+
+# Catches: a 200 whose transfer then failed counted as a success, where
+# upstream's curl --fail-with-body exits non-zero and the call is an error.
+out="$(python3 - "$KIT_SRC/lib" <<'PY' 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import kit
+meta = {"round": 1, "duration_s": 2, "wall_s": 2.0, "connections": 1}
+rd = kit.concurrent_round(meta, [{"http_status": 200, "curl_exit": 0},
+                                 {"http_status": 200, "curl_exit": 18}])
+if (rd["ok"], rd["err"], rd["qps"]) != (1, 1, 0.5):
+    print(rd)
+PY
+)"
+if [ -z "$out" ]; then
+  pass "a 200 whose transfer failed (curl exit 18) is a concurrent error"
+else
+  fail "transfer failure" "$out"
+fi
+
+# Catches: error_pooled counting any phase but the benchmark's, so its verdict
+# would change with which phases a run names: the same benchmark calls must
+# give the same figure with q29_probe and perf calls beside them.
+out="$(python3 - "$KIT_SRC/lib" <<'PY' 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import kit
+def report(phases):
+    return {"totals": {"hot_sum_s": 1.0, "cold_sum_s": 1.0}, "phases": phases}
+bench = {"benchmark": {"calls": 129, "errors": 6}}
+more = dict(bench, q29_probe={"calls": 4, "errors": 4}, perf={"calls": 86, "errors": 0},
+            concurrent={"calls": 5000, "errors": 900})
+a, b = kit.run_metrics(report(bench)), kit.run_metrics(report(more))
+if a["error_pooled"] != 6 / 129.0 or b["error_pooled"] != a["error_pooled"]:
+    print("error_pooled", a["error_pooled"], b["error_pooled"])
+if kit.pooled_errors(more) != (129, 6):
+    print("pooled_errors", kit.pooled_errors(more))
+PY
+)"
+if [ -z "$out" ]; then
+  pass "error_pooled counts the benchmark phase only, whichever other phases ran"
+else
+  fail "error_pooled phases" "$out"
+fi
+
+# Catches: a 2xx answer with the wrong row count counted as an error in the
+# concurrent phase, where upstream counts any 2xx as a success.
+out="$(conc_check wrong '
+if (rd[1]["ok"], rd[1]["err"], rd[1]["wrong_answer"]) != (9, 1, 1):
+    print(rd[1])')"
+if [ "$code" = 0 ] && [ -z "$out" ]; then
+  pass "a 2xx with the wrong row count counts as ok and in wrong_answer"
+else
+  fail "wrong answer in concurrent" "$out"
+fi
+
+# Each new band key judged pass, miss and inconclusive (its phase absent),
+# against the filled band file: relative qps_min_ratio 0.95,
+# concurrent_error_pooled_max_delta 0.02, q29_probe_max_ratio 1.15; absolute
+# concurrent_qps_min 1.0, concurrent_error_pooled_max 0.1, q29_probe_s_max 1.0.
+python3 - "$KIT_SRC/lib" "$BANDS" "$TMP/fixture-pass/results.json" >"$TMP/bandkeys.out" 2>&1 <<'PY'
+import copy, json, sys
+sys.path.insert(0, sys.argv[1])
+import kit
+bands, base = sys.argv[2], json.load(open(sys.argv[3]))
+
+def conc(qps, weighted, mean=None):
+    return {"rounds": [], "pooled": {
+        "rounds": 1, "calls": 100, "ok": 90, "err": 10, "wrong_answer": 0,
+        "error_ratio_weighted": weighted,
+        "error_ratio_mean_of_rounds": weighted if mean is None else mean, "qps_pooled": qps}}
+
+def probe(min_s):
+    return {"statement": "q29_referer_length_by_host", "warmup": 1, "runs": 3,
+            "runs_s": [min_s] * 3, "errors": 0, "min_s": min_s, "median_s": min_s}
+
+def report(c=None, p=None):
+    r = copy.deepcopy(base)
+    r["concurrent"], r["q29_probe"] = c, p
+    return r
+
+def one(rows, prefix):
+    hits = [x["verdict"] for x in rows if x["band"].startswith(prefix)]
+    return hits[0] if len(hits) == 1 else "%d rows" % len(hits)
+
+def rel(b, prefix, a=None):
+    a = a or report(conc(10.0, 0.01), probe(1.0))
+    return one(kit.relative_bands(bands, a, b), prefix)
+
+def ab(r, prefix):
+    return one(kit.absolute_bands("rlog", bands, ["absolute"], r), prefix)
+
+A = report(conc(10.0, 0.01), probe(1.0))
+cases = {
+    "relative.qps_min_ratio": [
+        (rel(report(conc(9.6, 0.01)), "qps_pooled >="), "pass"),
+        (rel(report(conc(9.4, 0.01)), "qps_pooled >="), "miss"),
+        (rel(report(None, probe(1.0)), "qps_pooled >="), "inconclusive"),
+        (rel(A, "qps_pooled >=", a=report(None, probe(1.0))), "inconclusive")],
+    # The mean-of-rounds figure is set to flip each verdict, so a band that
+    # read it would give the opposite answer.
+    "relative.concurrent_error_pooled_max_delta": [
+        (rel(report(conc(10.0, 0.025, mean=0.5)), "concurrent error_ratio_weighted <= A"), "pass"),
+        (rel(report(conc(10.0, 0.035, mean=0.0)), "concurrent error_ratio_weighted <= A"), "miss"),
+        (rel(report(None, probe(1.0)), "concurrent error_ratio_weighted <= A"), "inconclusive")],
+    "relative.q29_probe_max_ratio": [
+        (rel(report(conc(10.0, 0.01), probe(1.1)), "q29_probe min_s <= 1.15"), "pass"),
+        (rel(report(conc(10.0, 0.01), probe(1.2)), "q29_probe min_s <= 1.15"), "miss"),
+        (rel(report(conc(10.0, 0.01), None), "q29_probe min_s <= 1.15"), "inconclusive")],
+    "absolute.concurrent_qps_min": [
+        (ab(report(conc(2.0, 0.0)), "concurrent qps >="), "pass"),
+        (ab(report(conc(0.5, 0.0)), "concurrent qps >="), "miss"),
+        (ab(report(), "concurrent qps >="), "inconclusive")],
+    "absolute.concurrent_error_pooled_max": [
+        (ab(report(conc(2.0, 0.05, mean=0.5)), "concurrent error_ratio_weighted <= concurrent"), "pass"),
+        (ab(report(conc(2.0, 0.2, mean=0.0)), "concurrent error_ratio_weighted <= concurrent"), "miss"),
+        (ab(report(), "concurrent error_ratio_weighted <= concurrent"), "inconclusive")],
+    "absolute.q29_probe_s_max": [
+        (ab(report(p=probe(0.8)), "q29_probe min_s <= q29_probe_s_max"), "pass"),
+        (ab(report(p=probe(1.5)), "q29_probe min_s <= q29_probe_s_max"), "miss"),
+        (ab(report(), "q29_probe min_s <= q29_probe_s_max"), "inconclusive")],
+}
+for key in sorted(cases):
+    got = [g for g, _ in cases[key]]
+    want = [w for _, w in cases[key]]
+    print("%s\t%s" % (key, "" if got == want else "got %s, want %s" % (got, want)))
+PY
+bandkeys=0
+while IFS=$'\t' read -r key problem; do
+  bandkeys=$((bandkeys + 1))
+  # Catches: a new band key never judged, judged on the wrong figure, or
+  # passing (rather than inconclusive) when its phase did not run.
+  if [ -z "$problem" ]; then
+    pass "band $key: pass, miss, and inconclusive with its phase absent"
+  else
+    fail "band $key" "$problem"
+  fi
+done <"$TMP/bandkeys.out"
+[ "$bandkeys" = 6 ] || fail "band keys" "$(head -c 600 "$TMP/bandkeys.out")"
+
+# The whole box with every phase on stubs: two rounds of two connections for
+# 2 s each. Statement 02 is refused (422) and statement 01 answers 5 rows
+# where the corpus expects 1, on every call; connection 2's order starts with
+# them, so each round has at least one of each. The q29 probe's warmup is the
+# fastest call, so a summary that took it in would report 0.1.
+BOX_C="$TMP/box-conc"
+code=0
+rm -f "$STUB_DIR/perf-argv"
+BOX_TOML_SED='s/^phases = .*/phases = ["benchmark", "concurrent", "q29_probe", "perf"]/
+s/^concurrent_rounds = .*/concurrent_rounds = 2/
+s/^concurrent_connections = .*/concurrent_connections = 2/
+s/^concurrent_duration_s = .*/concurrent_duration_s = 2/
+s/^perf_record = .*/perf_record = true/' \
+  run_box A box-conc STUB_SQL_REFUSE_N=02 STUB_SQL_ROWS_N=01 STUB_SQL_ROWS=5 \
+  'STUB_PROBE_TIMES=0.1 0.3 0.7 0.4' KIT_PERF_SETTLE=0.05 || code=$?
+rm -rf "$TMP/fixture-conc"
+mv "$RUN_DIR/out/A" "$TMP/fixture-conc"
+if [ "$code" = 0 ] && [ -f "$TMP/fixture-conc/DONE" ] && [ -f "$TMP/fixture-conc/results.json" ]; then
+  pass "a box with every phase finishes DONE"
+else
+  fail "box with every phase" "exit $code; $(head -n 3 "$TMP/fixture-conc/FAILED" 2>/dev/null); run.log: $(tail -n 5 "$BOX_C/kit/run.log")"
+fi
+
+# box_check PYTHON: PYTHON run against the box's results.json as r, its
+# concurrent calls as calls, its q29 probe calls as probe; it prints nothing
+# when the claim holds.
+box_check() {
+  python3 - "$TMP/fixture-conc/results.json" "$BOX_C/kit/out" "$1" <<'PY' 2>&1
+import json, os, sys
+r = json.load(open(sys.argv[1]))
+def lines(p):
+    return [json.loads(l) for l in open(os.path.join(sys.argv[2], p))]
+calls = lines("concurrent/calls.jsonl")
+probe = lines("q29_probe/calls.jsonl")
+exec(sys.argv[3])
+PY
+}
+
+# Catches: a concurrent call recorded without its round and connection, a
+# round whose calls are not all in calls.jsonl, or connections that do not
+# follow their seeded order: connection 1 starts q15 q24, connection 2 q02 q01.
+out="$(box_check '
+c = r["concurrent"]
+if [x["round"] for x in c["rounds"]] != [1, 2] or c["connections"] != 2 or c["duration_s"] != 2:
+    print("block", c["rounds"], c["connections"], c["duration_s"])
+for x in calls:
+    if x.get("phase") != "concurrent" or x.get("round") not in (1, 2) or x.get("connection") not in (1, 2):
+        print("call", x)
+for rd in c["rounds"]:
+    n = sum(1 for x in calls if x["round"] == rd["round"])
+    if n != rd["calls"] or n < 4:
+        print("round", rd["round"], "has", n, "lines, reports", rd["calls"])
+    for conn, first in ((1, ["q15", "q24"]), (2, ["q02", "q01"])):
+        got = [x["statement"][:3] for x in calls if x["round"] == rd["round"] and x["connection"] == conn][:2]
+        if got != first:
+            print("round", rd["round"], "connection", conn, "starts", got)
+if r["error_pooled"]["phases"] != ["benchmark"]:
+    print("error_pooled", r["error_pooled"])')"
+if [ -z "$out" ]; then
+  pass "a stub round writes one line per call with its round and connection, in seeded order"
+else
+  fail "concurrent calls" "$out"
+fi
+
+# Catches: a box round's QPS taken from anything but its 2xx calls over the
+# nominal duration_s, or a 2xx wrong answer counted as an error there.
+out="$(box_check '
+for rd in r["concurrent"]["rounds"]:
+    mine = [x for x in calls if x["round"] == rd["round"]]
+    ok = sum(1 for x in mine if 200 <= x["http_status"] <= 299 and x["curl_exit"] == 0)
+    wrong = [x for x in mine if x["refusal_class"] == "wrong_answer"]
+    if rd["ok"] != ok or rd["qps"] != ok / 2.0 or rd["wall_s"] < 1:
+        print("round", rd)
+    if not wrong or rd["wrong_answer"] != len(wrong) or any(x["http_status"] != 200 for x in wrong):
+        print("wrong answers", rd["wrong_answer"], len(wrong))
+    if rd["err"] != sum(1 for x in mine if x["http_status"] == 422) or rd["err"] < 1:
+        print("errors", rd["err"])')"
+if [ -z "$out" ]; then
+  pass "a box round's QPS is its 2xx calls over 2 s, wrong answers among them"
+else
+  fail "box concurrent figures" "$out"
+fi
+
+# Catches: the q29 probe timing its warmup, skipping the stats, or reporting
+# min and median over anything but the timed runs (0.3, 0.7, 0.4).
+out="$(box_check '
+if [x.get("probe") for x in probe] != ["warmup", "run", "run", "run"] or any("stats" not in x for x in probe):
+    print("calls", probe)
+if any(not x["statement"].startswith("q29_") for x in probe):
+    print("statements", [x["statement"] for x in probe])
+q = r["q29_probe"]
+want = {"warmup": 1, "runs": 3, "runs_s": [0.3, 0.7, 0.4], "errors": 0, "min_s": 0.3, "median_s": 0.4}
+for k, v in want.items():
+    if q[k] != v:
+        print(k, q[k], "want", v)')"
+if [ -z "$out" ]; then
+  pass "the q29 probe logs warmup and runs, with min and median from the timed runs only"
+else
+  fail "q29 probe" "$out"
+fi
+
+# Catches: perf recording another process or at another rate, perf.data kept
+# instead of folded stacks, or the stacks left out of the evidence.
+perf_lines="$(grep -c '^perf record -F 99 -g -p [0-9][0-9]* -o .*/out/perf/[0-9][0-9]\.data$' "$STUB_DIR/perf-argv" 2>/dev/null)"
+folded="$(cat "$BOX_C"/kit/out/perf/*.folded 2>/dev/null | sort | uniq -c | sed 's/^ *//')"
+in_tgz="$(tar -tzf "$TMP/fixture-conc/evidence.tgz" | grep -c '^out/perf/[0-9][0-9]\.folded$')"
+profiled="$(grep -c '"profiled": true' "$BOX_C/kit/out/perf/calls.jsonl")"
+if [ "$perf_lines" = 43 ] && [ "$folded" = "43 ravel-server;main;execute;scan_rows 2" ] && [ "$in_tgz" = 43 ] \
+  && [ "$profiled" = 43 ] && ! ls "$BOX_C"/kit/out/perf/*.data >/dev/null 2>&1; then
+  pass "perf records each statement's hot call and keeps folded stacks in the evidence"
+else
+  fail "perf" "record lines $perf_lines, folded '$folded', in evidence $in_tgz, profiled $profiled"
+fi
+
+# Catches: fetch printing no per-round figures, or a share table on a
+# concurrent error miss that does not add up to the arm's concurrent errors.
+# Arm A is the box above with its concurrent errors edited away and the band
+# file's delta set to 0, so arm B, the same box, misses on its 422s.
+edit_arm "$TMP/fixture-conc" "$TMP/fixture-share-a" '
+r["concurrent"]["pooled"].update(err=0, error_ratio_weighted=0.0)
+for b in r["bands"]:
+    if b["band"].startswith("concurrent error"):
+        b["verdict"] = "pass"'
+as_arm_b "$TMP/fixture-conc" "$TMP/fixture-share-b"
+fixture run-share "$TMP/fixture-share-a" "$TMP/fixture-share-b"
+SHARE_RUN="$FAKE_S3/kit-test-bucket/clickbench-kit/runs/run-share"
+rm -rf "$TMP/share-kit"
+mkdir -p "$TMP/share-kit"
+tar -xzf "$SHARE_RUN/in/kit.tgz" -C "$TMP/share-kit"
+sed 's/^concurrent_error_pooled_max_delta = .*/concurrent_error_pooled_max_delta = 0/' \
+  "$TMP/share-kit/kit/bands/rlog.toml" >"$TMP/share-kit/rlog.toml"
+mv "$TMP/share-kit/rlog.toml" "$TMP/share-kit/kit/bands/rlog.toml"
+tar -czf "$SHARE_RUN/in/kit.tgz" -C "$TMP/share-kit" kit
+fetch share run-share --timeout 30
+out="$(python3 - "$TMP/fetch-share.out" "$TMP/fixture-share-b/results.json" <<'PY' 2>&1
+import re, sys
+text = open(sys.argv[1]).read()
+import json
+p = json.load(open(sys.argv[2]))["concurrent"]["pooled"]
+if not re.search(r"^MISS +B vs A +concurrent error_ratio_weighted <= A \+ 0 ", text, re.M):
+    print("no concurrent error miss")
+for arm in "AB":
+    for n in (1, 2):
+        if not re.search(r"^concurrent %s round %d: qps \S+ error_ratio \S+ \(ok \d+" % (arm, n), text, re.M):
+            print("no round %d line for %s" % (n, arm))
+    if not re.search(r"^concurrent %s pooled: qps_pooled \S+ error_ratio_weighted \S+ "
+                     r"error_ratio_mean_of_rounds \S+" % arm, text, re.M):
+        print("no pooled line for", arm)
+m = re.search(r"^concurrent B errors by statement \((\d+) errors of (\d+) calls\):\n((?:  .*\n)*)", text, re.M)
+if not m:
+    print("no share table for B")
+else:
+    rows = re.findall(r"^  (\S+) +(\d+) / (\d+)$", m.group(3), re.M)
+    if int(m.group(1)) != p["err"] or int(m.group(2)) != p["calls"]:
+        print("header", m.group(1), m.group(2), "want", p["err"], p["calls"])
+    if sum(int(n) for _, n, _ in rows) != p["err"] or any(int(t) != p["err"] for _, _, t in rows):
+        print("rows", rows, "do not sum to", p["err"])
+    if [s for s, _, _ in rows] != ["q02_count_adv_engine"]:
+        print("statements", rows)
+if "concurrent A errors by statement" in text:
+    print("a share table for A, which did not miss")
+PY
+)"
+if [ "$code" = 1 ] && [ -z "$out" ]; then
+  pass "fetch prints per-round figures and, on a concurrent error miss, a share table summing to its errors"
+else
+  fail "share table" "exit $code: $out $(tail -n 3 "$TMP/fetch-share.err")"
+fi
+
+# Catches: fetch comparing the arms without the run's own run.toml, whose
+# declared extra flags decide what it accepts.
+fixture run-notoml "$TMP/fixture-share-a" "$TMP/fixture-share-b"
+rm "$FAKE_S3/kit-test-bucket/clickbench-kit/runs/run-notoml/in/run.toml"
+fetch notoml run-notoml --timeout 30
+if [ "$code" = 2 ] && grep -q '^fetch: .*/runs/run-notoml/in/run.toml is not there$' "$TMP/fetch-notoml.err" \
+  && ! grep -q 'B vs A' "$TMP/fetch-notoml.out"; then
+  pass "fetch exits 2 when the run's in/run.toml is missing, before comparing the arms"
+else
+  fail "fetch without in/run.toml" "exit $code: $(tail -n 2 "$TMP/fetch-notoml.err")"
+fi
+
+# trunc_evidence SRC DST EDIT: a copy of arm SRC whose evidence.tgz has
+# out/concurrent/calls.jsonl replaced: EDIT "truncate" cuts its third line
+# short, "drop" leaves the file out.
+trunc_evidence() {
+  local src="$1" dst="$2" edit="$3"
+  rm -rf "$dst" "$TMP/trunc-x"
+  cp -R "$src" "$dst"
+  mkdir -p "$TMP/trunc-x"
+  tar -xzf "$src/evidence.tgz" -C "$TMP/trunc-x"
+  if [ "$edit" = truncate ]; then
+    awk 'NR == 3 { print substr($0, 1, 40); next } { print }' "$TMP/trunc-x/out/concurrent/calls.jsonl" \
+      >"$TMP/trunc-x/calls.jsonl"
+    mv "$TMP/trunc-x/calls.jsonl" "$TMP/trunc-x/out/concurrent/calls.jsonl"
+  else
+    rm "$TMP/trunc-x/out/concurrent/calls.jsonl"
+  fi
+  # shellcheck disable=SC2046
+  tar -czf "$dst/evidence.tgz" -C "$TMP/trunc-x" $(ls "$TMP/trunc-x")
+}
+
+# Catches: a truncated calls.jsonl line read as something other than a
+# refusal naming its file and line, and fetch letting a concurrent-detail
+# failure (the line above, or calls.jsonl missing from the evidence) change
+# its exit code or pass without a warning. The run misses on B's concurrent
+# errors as the share table case does, so fetch must still exit 1.
+for edit in truncate drop; do
+  trunc_evidence "$TMP/fixture-share-b" "$TMP/fixture-$edit-b" "$edit"
+  fixture "run-$edit" "$TMP/fixture-share-a" "$TMP/fixture-$edit-b"
+  cp "$SHARE_RUN/in/kit.tgz" "$FAKE_S3/kit-test-bucket/clickbench-kit/runs/run-$edit/in/kit.tgz"
+  fetch "$edit" "run-$edit" --timeout 30
+  case "$edit" in
+    truncate) want='B/evidence.tgz:out/concurrent/calls.jsonl:3 is not a JSON line: ' ;;
+    drop) want="cannot read out/concurrent/calls.jsonl from $TMP/fetch-drop/B/evidence.tgz: " ;;
+  esac
+  if [ "$code" = 1 ] && grep -qF "$want" "$TMP/fetch-$edit.err" \
+    && [ "$(grep -cxF 'fetch: warning: could not print the concurrent errors by statement (see above); the band verdict stands' "$TMP/fetch-$edit.err")" = 1 ] \
+    && grep -Eq '^MISS +B vs A +concurrent error_ratio_weighted <= A \+ 0 ' "$TMP/fetch-$edit.out" \
+    && grep -q '^fetch: at least one band MISSED' "$TMP/fetch-$edit.err"; then
+    pass "fetch with B's evidence calls.jsonl edited ($edit) warns once, names the cause and keeps exit 1"
+  else
+    fail "fetch $edit calls.jsonl" "exit $code: $(tail -n 4 "$TMP/fetch-$edit.err")"
+  fi
+done
+
+# --- ADR-1170 memory gap band ---------------------------------------------------
+
+# The hand computation for the next case, in GiB. gap = allocated - cache_fetch
+# - cache_catalog - reserved_sql - reserved_fetch + handoff_overlap:
+#   round 1: 10-4-1-2-1+0.5 = 2.5 (above 2); 6-2-0.5-1-1+0.25 = 1.75;
+#            12-3-1-2-1+1 = 6 (above, the max); 5-2-1-0-0.5+0 = 1.5;
+#            plus one unanswered line, skipped: 2 of 4 above, 50.0 %
+#   round 2: 3-0.5-0.25-0-0+0.125 = 2.375 (above); 4-1-1-0.5-0.5+0 = 1.0;
+#            1 of 2 above, 50.0 %, max 2.375 GiB = 2,550,136,832
+#   pooled:  3 of 6 above, 50.0 %, max 6 GiB = 6,442,450,944
+# Without the + handoff_overlap term round 1's first scrape is exactly 2.0, not
+# above, and its max is 5 GiB; with stat="resident" every scrape is 3 GiB
+# higher, so all are above and round 1's max is 9 GiB.
+GAP_ROUNDS='[[[10,4,1,2,1,0.5],[6,2,0.5,1,1,0.25],null,[12,3,1,2,1,1],[5,2,1,0,0.5,0]],
+[[3,0.5,0.25,0,0,0.125],[4,1,1,0.5,0.5,0]]]'
+
+# gap_band_reads_the_same_figure_as_the_hand_computation. Catches: the gap
+# computed without the handoff overlap, or from stat="resident", or an
+# unanswered line counted, or a miss that does not exit 1.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gap-b" B "$GAP_ROUNDS"
+fixture run-gap "$TMP/fixture-pass" "$TMP/fixture-gap-b"
+fetch gap run-gap --timeout 30
+if [ "$code" = 1 ] \
+  && grep -qx 'MISS         B        adr1170 gap round 1 share > 2147483648         0.500          0.000          50.0 % of 4 scrapes > 2147483648 (max 6,442,450,944; 1 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gap.out" \
+  && grep -qx 'MISS         B        adr1170 gap round 2 share > 2147483648         0.500          0.000          50.0 % of 2 scrapes > 2147483648 (max 2,550,136,832; 0 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gap.out" \
+  && grep -qx 'MISS         B        adr1170 gap pooled share > 2147483648          0.500          0.000          50.0 % of 6 scrapes > 2147483648 (max 6,442,450,944; 1 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gap.out" \
+  && grep -qx 'adr1170 gap A (context, not judged): no concurrent phase ran' "$TMP/fetch-gap.out" \
+  && [ "$(grep -c 'adr1170 gap' "$TMP/fetch-gap.out")" = 4 ] \
+  && grep -q '^fetch: at least one band MISSED' "$TMP/fetch-gap.err"; then
+  pass "gap_band_reads_the_same_figure_as_the_hand_computation"
+else
+  fail "gap_band_reads_the_same_figure_as_the_hand_computation" "exit $code: $(grep 'adr1170' "$TMP/fetch-gap.out") $(tail -n 2 "$TMP/fetch-gap.err")"
+fi
+
+# Catches: an ok scrape missing a gauge skipped or read as zero, which
+# shrinks the gap, instead of refusing with exit 2 naming round, line and series.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapmiss-b" B '[[[1,0,0,0,0,0],null,[1,0,0,0,0,null]]]'
+fixture run-gapmiss "$TMP/fixture-pass" "$TMP/fixture-gapmiss-b"
+fetch gapmiss run-gapmiss --timeout 30
+if [ "$code" = 2 ] \
+  && grep -qF 'kit: adr1170 gap: round 1: ' "$TMP/fetch-gapmiss.err" \
+  && grep -qF 'out/concurrent/round-1/healthz/metrics.jsonl:3 is an ok scrape missing ravel_memory_handoff_overlap_bytes{mode="all"}' "$TMP/fetch-gapmiss.err" \
+  && ! grep -q 'adr1170 gap round' "$TMP/fetch-gapmiss.out"; then
+  pass "an ok scrape missing the handoff overlap gauge exits 2 naming round, line and series"
+else
+  fail "gap missing gauge" "exit $code: $(tail -n 2 "$TMP/fetch-gapmiss.err")"
+fi
+
+# A server given --cache-dir exposes each cache family as tier="ram" and
+# tier="disk" series and no untiered one. In GiB, gap = allocated - fetch ram
+# - catalog ram - reserved_sql - reserved_fetch + handoff_overlap:
+#   10-4-1-2-1+0.5 = 2.5 (above 2, the max, 2,684,354,560); 6-2-0.5-1-1+0.25 = 1.75;
+#   1 of 2 above, 50.0 %. With the 50 and 30 GiB fetch disk tiers or the 20
+#   and 10 GiB catalog disk tiers subtracted every gap is negative, 0 above.
+# Catches: a tiered scrape refused as missing its cache series (exit 2), or
+# disk-tier bytes read into the gap.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gaptier-b" B '[[{"tiered":[10,4,50,1,20,2,1,0.5]},{"tiered":[6,2,30,0.5,10,1,1,0.25]}]]'
+fixture run-gaptier "$TMP/fixture-pass" "$TMP/fixture-gaptier-b"
+fetch gaptier run-gaptier --timeout 30
+if [ "$code" = 1 ] \
+  && grep -qx 'MISS         B        adr1170 gap round 1 share > 2147483648         0.500          0.000          50.0 % of 2 scrapes > 2147483648 (max 2,684,354,560; 0 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gaptier.out" \
+  && grep -qx 'MISS         B        adr1170 gap pooled share > 2147483648          0.500          0.000          50.0 % of 2 scrapes > 2147483648 (max 2,684,354,560; 0 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gaptier.out"; then
+  pass "a tiered cache's gap reads the tier=\"ram\" series and ignores tier=\"disk\""
+else
+  fail "gap tiered cache" "exit $code: $(grep 'adr1170' "$TMP/fetch-gaptier.out") $(tail -n 2 "$TMP/fetch-gaptier.err")"
+fi
+
+# A family with only a disk tier holds no RAM bytes: its term is 0. In GiB,
+# 2.5-1-0-0-0+0 = 1.5 = 1,610,612,736, under the bar. Catches: a disk-only
+# family refused as missing, or its 8 GiB disk tier subtracted.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapdisk-b" B '[[{"tiered":[2.5,1,5,null,8,0,0,0]}]]'
+fixture run-gapdisk "$TMP/fixture-pass" "$TMP/fixture-gapdisk-b"
+fetch gapdisk run-gapdisk --timeout 30
+if [ "$code" = 0 ] \
+  && grep -qx 'PASS         B        adr1170 gap round 1 share > 2147483648         0.000          0.000          0.0 % of 1 scrapes > 2147483648 (max 1,610,612,736; 0 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gapdisk.out"; then
+  pass "a cache family with only a disk tier counts 0 in the gap"
+else
+  fail "gap disk-only family" "exit $code: $(grep 'adr1170' "$TMP/fetch-gapdisk.out") $(tail -n 2 "$TMP/fetch-gapdisk.err")"
+fi
+
+# Catches: a family with no cache series in any tier read as 0 instead of
+# refused, which drops a term from the gap without saying so.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapnocache-b" B '[[[1,0,null,0,0,0]]]'
+fixture run-gapnocache "$TMP/fixture-pass" "$TMP/fixture-gapnocache-b"
+fetch gapnocache run-gapnocache --timeout 30
+if [ "$code" = 2 ] \
+  && grep -qF 'out/concurrent/round-1/healthz/metrics.jsonl:1 is an ok scrape missing ravel_cache_resident_bytes{mode="all",cache="catalog"} (no untiered, tier="ram" or tier="disk" series)' "$TMP/fetch-gapnocache.err" \
+  && ! grep -q 'adr1170 gap round' "$TMP/fetch-gapnocache.out"; then
+  pass "a cache family with no series in any tier exits 2 naming it"
+else
+  fail "gap no cache series" "exit $code: $(tail -n 2 "$TMP/fetch-gapnocache.err")"
+fi
+
+# Catches: a round with no ok gated scrape passing as 0 % above.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapnone-b" B '[[[1,0,0,0,0,0]],[null,null]]'
+fixture run-gapnone "$TMP/fixture-pass" "$TMP/fixture-gapnone-b"
+fetch gapnone run-gapnone --timeout 30
+if [ "$code" = 2 ] \
+  && grep -qF 'kit: adr1170 gap: round 2: ' "$TMP/fetch-gapnone.err" \
+  && grep -qF 'out/concurrent/round-2/healthz/metrics.jsonl holds no ok gated scrape (2 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gapnone.err"; then
+  pass "a round with no ok gated scrape exits 2 naming the round"
+else
+  fail "gap empty round" "exit $code: $(tail -n 2 "$TMP/fetch-gapnone.err")"
+fi
+
+# Catches: a scrape taken with the gate down (a just-started server, before
+# the timed window) judged: its 10 GiB gap would set the max and its count the
+# share's denominator. Judged alone, the gated 1 GiB scrape passes.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapungated-b" B '[[[1,0,0,0,0,0],{"ungated":[10,0,0,0,0,0]}]]'
+fixture run-gapungated "$TMP/fixture-pass" "$TMP/fixture-gapungated-b"
+fetch gapungated run-gapungated --timeout 30
+if [ "$code" = 0 ] \
+  && grep -qx 'PASS         B        adr1170 gap round 1 share > 2147483648         0.000          0.000          0.0 % of 1 scrapes > 2147483648 (max 1,073,741,824; 0 unanswered, 1 ungated, 0 bad skipped)' "$TMP/fetch-gapungated.out" \
+  && grep -qx 'PASS         B        adr1170 gap pooled share > 2147483648          0.000          0.000          0.0 % of 1 scrapes > 2147483648 (max 1,073,741,824; 0 unanswered, 1 ungated, 0 bad skipped)' "$TMP/fetch-gapungated.out"; then
+  pass "an ungated scrape is skipped and counted, not judged"
+else
+  fail "gap ungated" "exit $code: $(grep 'adr1170' "$TMP/fetch-gapungated.out") $(tail -n 2 "$TMP/fetch-gapungated.err")"
+fi
+
+# Catches: one gated scrape answered with HTTP 503 read as missing all six
+# gauges, refusing the run, instead of counted as bad beside the ok scrape.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapbad-b" B '[[[1,0,0,0,0,0],"bad"]]'
+fixture run-gapbad "$TMP/fixture-pass" "$TMP/fixture-gapbad-b"
+fetch gapbad run-gapbad --timeout 30
+if [ "$code" = 0 ] \
+  && grep -qx 'PASS         B        adr1170 gap round 1 share > 2147483648         0.000          0.000          0.0 % of 1 scrapes > 2147483648 (max 1,073,741,824; 0 unanswered, 0 ungated, 1 bad skipped)' "$TMP/fetch-gapbad.out" \
+  && grep -qx 'PASS         B        adr1170 gap pooled share > 2147483648          0.000          0.000          0.0 % of 1 scrapes > 2147483648 (max 1,073,741,824; 0 unanswered, 0 ungated, 1 bad skipped)' "$TMP/fetch-gapbad.out"; then
+  pass "a gated scrape answered with a non-200 is counted as bad, not a refusal"
+else
+  fail "gap bad scrape" "exit $code: $(grep 'adr1170' "$TMP/fetch-gapbad.out") $(tail -n 2 "$TMP/fetch-gapbad.err")"
+fi
+
+# Catches: a round whose every answered gated scrape is bad (and whose only ok
+# scrape is ungated) passing as 0 % above instead of refusing.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapallbad-b" B '[["bad",null,"bad",{"ungated":[1,0,0,0,0,0]}]]'
+fixture run-gapallbad "$TMP/fixture-pass" "$TMP/fixture-gapallbad-b"
+fetch gapallbad run-gapallbad --timeout 30
+if [ "$code" = 2 ] \
+  && grep -qF 'kit: adr1170 gap: round 1: ' "$TMP/fetch-gapallbad.err" \
+  && grep -qF 'out/concurrent/round-1/healthz/metrics.jsonl holds no ok gated scrape (1 unanswered, 1 ungated, 2 bad skipped)' "$TMP/fetch-gapallbad.err"; then
+  pass "a round whose answered gated scrapes are all bad exits 2 naming the round"
+else
+  fail "gap all bad" "exit $code: $(tail -n 2 "$TMP/fetch-gapallbad.err")"
+fi
+
+# Catches: a B gap under the bar on every scrape missing, or the bar compared
+# with >= rather than >: round 1's second scrape is exactly 2 GiB.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapok-b" B '[[[3,0.5,0.25,0.25,0.5,0.25],[4,1,0.5,0.25,0.25,0],null],[[2.5,1,0,0,0,0]]]'
+fixture run-gapok "$TMP/fixture-pass" "$TMP/fixture-gapok-b"
+fetch gapok run-gapok --timeout 30
+if [ "$code" = 0 ] \
+  && grep -qx 'PASS         B        adr1170 gap round 1 share > 2147483648         0.000          0.000          0.0 % of 2 scrapes > 2147483648 (max 2,147,483,648; 1 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gapok.out" \
+  && grep -qx 'PASS         B        adr1170 gap round 2 share > 2147483648         0.000          0.000          0.0 % of 1 scrapes > 2147483648 (max 1,610,612,736; 0 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gapok.out" \
+  && grep -qx 'PASS         B        adr1170 gap pooled share > 2147483648          0.000          0.000          0.0 % of 3 scrapes > 2147483648 (max 2,147,483,648; 1 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gapok.out"; then
+  pass "a B gap under the bar on every scrape passes per round and pooled"
+else
+  fail "gap pass" "exit $code: $(grep 'adr1170' "$TMP/fetch-gapok.out") $(tail -n 2 "$TMP/fetch-gapok.err")"
+fi
+
+# Catches: a run without the concurrent phase reading as a pass instead of
+# inconclusive. fetch-pass is two arms with no concurrent phase.
+if grep -qx 'INCONCLUSIVE B        adr1170 gap (no round) share > 2147483648      None           0.000          no concurrent phase ran' "$TMP/fetch-pass.out" \
+  && ! grep -q '^PASS .*adr1170' "$TMP/fetch-pass.out"; then
+  pass "a run without the concurrent phase leaves the gap band inconclusive"
+else
+  fail "gap no concurrent" "$(grep adr1170 "$TMP/fetch-pass.out")"
+fi
+
+# Catches: healthz_phases leaving concurrent out read as a pass, or an
+# arm A refusal (its scrape lacks a gauge) raised instead of printed.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapbad-a" A '[[[1,0,0,0,0,null]]]'
+sed 's/^shards = /healthz_phases = ["benchmark"]\n&/' "$RUN_TOML" >"$TMP/run-nohz.toml"
+code=0
+python3 "$KIT_SRC/lib/kit.py" memory-gap "$BANDS" "$TMP/fixture-gapbad-a/results.json" \
+  "$TMP/fixture-gapbad-a/evidence.tgz" "$TMP/fixture-gapok-b/results.json" \
+  "$TMP/fixture-gapok-b/evidence.tgz" "$TMP/run-nohz.toml" >"$TMP/gap-nohz.out" 2>&1 || code=$?
+code_a=0
+python3 "$KIT_SRC/lib/kit.py" memory-gap "$BANDS" "$TMP/fixture-gapbad-a/results.json" \
+  "$TMP/fixture-gapbad-a/evidence.tgz" "$TMP/fixture-gapok-b/results.json" \
+  "$TMP/fixture-gapok-b/evidence.tgz" "$RUN_TOML" >"$TMP/gap-bada.out" 2>&1 || code_a=$?
+if [ "$code" = 0 ] \
+  && grep -qx "INCONCLUSIVE B        adr1170 gap (no round) share > 2147483648      None           0.000          run.toml's healthz_phases leaves concurrent out" "$TMP/gap-nohz.out" \
+  && [ "$code_a" = 0 ] \
+  && grep -qF 'adr1170 gap A (context, not judged): unreadable: adr1170 gap: round 1: ' "$TMP/gap-bada.out" \
+  && grep -q '^PASS  *B  *adr1170 gap pooled ' "$TMP/gap-bada.out"; then
+  pass "healthz_phases without concurrent leaves the gap band inconclusive, and an arm A refusal is printed, not raised"
+else
+  fail "gap healthz_phases" "exit $code / $code_a: $(cat "$TMP/gap-nohz.out" "$TMP/gap-bada.out")"
+fi
+
+# Catches: arm A judged. A is over the bar on every scrape (5.5, 6 and 4
+# GiB) and B under it: B passes, A's figures print on context lines only.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapover-a" A '[[[8,1,0.5,0.5,0.5,0],[7,0.5,0.25,0.25,0.25,0.25]],[[6,1,1,0,0,0]]]'
+fixture run-gapover "$TMP/fixture-gapover-a" "$TMP/fixture-gapok-b"
+fetch gapover run-gapover --timeout 30
+if [ "$code" = 0 ] \
+  && grep -qx 'adr1170 gap A round 1 (context, not judged): 100.0 % of 2 scrapes > 2147483648 (max 6,442,450,944; 0 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gapover.out" \
+  && grep -qx 'adr1170 gap A round 2 (context, not judged): 100.0 % of 1 scrapes > 2147483648 (max 4,294,967,296; 0 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gapover.out" \
+  && grep -qx 'adr1170 gap A pooled (context, not judged): 100.0 % of 3 scrapes > 2147483648 (max 6,442,450,944; 0 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gapover.out" \
+  && grep -q '^PASS  *B  *adr1170 gap pooled share > 2147483648 ' "$TMP/fetch-gapover.out" \
+  && ! grep -q '^MISS' "$TMP/fetch-gapover.out"; then
+  pass "arm A over the gap bar is printed as context and never judged while B passes"
+else
+  fail "gap arm A context" "exit $code: $(grep -e adr1170 -e '^MISS' "$TMP/fetch-gapover.out")"
+fi
+
+# Catches: the band judged with a key missing or a placeholder instead of
+# skipped with a printed line naming it: the bar is deleted, the share left a
+# placeholder.
+mkdir -p "$TMP/bands-gapoff"
+sed -e '/^adr1170_gap_max_bytes = /d' \
+  -e 's/^adr1170_gap_share_above_max = .*/adr1170_gap_share_above_max = "FILL-IN-ON-REFERENCE-MACHINE"/' \
+  "$BANDS" >"$TMP/bands-gapoff/rlog.toml"
+code=0
+python3 "$KIT_SRC/lib/kit.py" memory-gap "$TMP/bands-gapoff/rlog.toml" "$TMP/fixture-pass/results.json" \
+  "$TMP/fixture-pass/evidence.tgz" "$TMP/fixture-gap-b/results.json" \
+  "$TMP/fixture-gap-b/evidence.tgz" "$RUN_TOML" >"$TMP/gap-off.out" 2>&1 || code=$?
+if [ "$code" = 0 ] \
+  && [ "$(cat "$TMP/gap-off.out")" = "adr1170 gap: skipped, adr1170_gap_max_bytes and adr1170_gap_share_above_max missing or a placeholder in $TMP/bands-gapoff/rlog.toml" ]; then
+  pass "a missing or placeholder gap key skips the band with a printed line"
+else
+  fail "gap placeholder" "exit $code: $(cat "$TMP/gap-off.out")"
+fi
+
+# Catches: the band not reading the sampler's own metrics.jsonl: the share
+# run's boxes scraped the stub server, whose gap is 1000-100-50-7-20+5 = 828.
+if grep -q '^PASS  *B  *adr1170 gap round 1 share > 2147483648  *0.000  *0.000  *0.0 % of [0-9]* scrapes > 2147483648 (max 828; 0 unanswered, [0-9]* ungated, 0 bad skipped)$' "$TMP/fetch-share.out" \
+  && grep -q '^adr1170 gap A round 1 (context, not judged): 0.0 % of [0-9]* scrapes > 2147483648 (max 828; ' "$TMP/fetch-share.out"; then
+  pass "the gap band reads the box sampler's own concurrent scrapes"
+else
+  fail "gap from the box" "$(grep adr1170 "$TMP/fetch-share.out")"
+fi
+
+# lib_box BOX: boot an arm A box in BOX and write BOX/lib-setup.sh, which a
+# case's subshell sources: run.sh in library mode with its config loaded, the
+# stub server installed, arm.env written and the query window set.
+lib_box() {
+  local box="$1"
+  reset_log
+  rm -f "$STUB_DIR/readyz-calls" "$STUB_DIR/check-calls" "$STUB_DIR/ready-delay" \
+    "$STUB_DIR/check-refuse" "$STUB_DIR/check-hang" "$STUB_DIR/server-ready" \
+    "$STUB_DIR/ready-after-checks"
+  boot_box A "$box" || return 1
+  cat >"$box/lib-setup.sh" <<SETUP
+export KIT_ROOT="$box" KIT_RUN_SH_LIB=1 KIT_READY_TRIES=100 KIT_READY_INTERVAL=0.02
+export KIT_DROP_CACHES_FILE="$box/drop_caches"
+. "$box/kit/kit/box/run.sh"
+mkdir -p "\$STAMPS"
+load_config || exit 1
+mkdir -p "\$BIN_DIR"
+cp "$BINSTUBS/ravel-server" "\$BIN_DIR/ravel-server-\$SHA"
+resolve_arm_env || exit 1
+set_query_window
+SETUP
+}
+
+# conc_outage_check BOX DURATION: prints nothing when BOX's one concurrent
+# round parsed, ended at its deadline with exactly one watchdog restart, and
+# never polled readyz.
+conc_outage_check() {
+  python3 - "$1/kit/out/concurrent" "$2" "$STUB_DIR" <<'PY' 2>&1
+import json, os, sys
+d, duration, stub = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+calls = [json.loads(l) for l in open(os.path.join(d, "calls.jsonl"))]
+s = json.load(open(os.path.join(d, "summary.json")))
+rd = s["rounds"][0]
+bad = [c for c in calls if not (200 <= c["http_status"] <= 299 and c["curl_exit"] == 0)]
+if (s["pooled"]["calls"], s["pooled"]["err"]) != (len(calls), len(bad)):
+    print("summary", s["pooled"], "calls", len(calls), "errors", len(bad))
+log = open(os.path.join(d, "round-1", "watchdog.log")).read()
+if log.count("restart n=") != 1 or "restart failed" in log:
+    print("watchdog log", repr(log))
+if not duration - 1 <= rd["wall_s"] < duration + 1.5:
+    print("wall_s", rd["wall_s"], "for a", duration, "s round")
+if os.path.exists(os.path.join(stub, "readyz-calls")):
+    print("readyz polled", open(os.path.join(stub, "readyz-calls")).read().count("readyz"), "times")
+if open(os.path.join(stub, "check-calls")).read().count("check") < 2:
+    print("SELECT 1 check not used")
+PY
+}
+
+# Catches: run_query writing curl's "000" as the status of a call to a
+# server that is down (invalid JSON, so the concurrent summary refuses the
+# file and one outage fails the run), a watchdog that does not restart a dead
+# server exactly once, a round that does not end at its whole-second deadline
+# with the watchdog collected, and readiness read from readyz. The server dies
+# 0.5 s into the round and its restart takes 1 s, so calls in between are
+# errors.
+BOX_O="$TMP/box-outage"
+lib_box "$BOX_O"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_O/lib-setup.sh"
+  CONC_ROUNDS=1 CONC_CONNECTIONS=2 CONC_DURATION=5
+  WATCHDOG_INTERVAL=0.3
+  (
+    until grep -q 'concurrent round=1' "$PROGRESS" 2>/dev/null; do sleep 0.05; done
+    sleep 0.5
+    echo 1.0 >"$STUB_DIR/ready-delay"
+    kill -TERM "$(cat "$KIT/server.pid")"
+  ) &
+  killer=$!
+  phase_concurrent || exit 1
+  wait "$killer"
+  rm -f "$STUB_DIR/ready-delay"
+  stop_server
+) >"$TMP/outage.log" 2>&1
+code=$?
+rm -f "$STUB_DIR/ready-delay"
+out="$(conc_outage_check "$BOX_O" 5)"
+down="$(python3 - "$BOX_O/kit/out/concurrent/calls.jsonl" <<'PY' 2>&1
+import json, sys
+calls = [json.loads(l) for l in open(sys.argv[1])]
+down = [i for i, c in enumerate(calls) if c["http_status"] == 0]
+if not down or any((calls[i]["outcome"], calls[i]["curl_exit"]) != ("unreachable", 7) for i in down):
+    print("calls during the outage", [calls[i] for i in down][:3])
+by_conn = {}
+for c in calls:
+    by_conn.setdefault(c["connection"], []).append(c)
+for conn, mine in by_conn.items():
+    last_down = max([i for i, c in enumerate(mine) if c["http_status"] == 0] or [-1])
+    if not any(c["outcome"] == "ok" for c in mine[last_down + 1:]):
+        print("connection", conn, "has no success after the outage")
+PY
+)"
+if [ "$code" = 0 ] && [ -z "$out" ] && [ -z "$down" ]; then
+  pass "a server dying mid-round: outage calls are errors with status 0, one restart, the round ends at its deadline"
+else
+  fail "concurrent outage" "exit $code: $out $down $(tail -n 3 "$TMP/outage.log")"
+fi
+
+# Catches: a watchdog or pre-round poll that reads readyz instead of
+# upstream's SELECT 1 check: here SELECT 1 is refused (memory pressure) while
+# readyz would answer, and upstream restarts the server.
+BOX_M="$TMP/box-check-refuse"
+lib_box "$BOX_M"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_M/lib-setup.sh"
+  CONC_ROUNDS=1 CONC_CONNECTIONS=1 CONC_DURATION=3
+  WATCHDOG_INTERVAL=0.3
+  (
+    until grep -q 'concurrent round=1' "$PROGRESS" 2>/dev/null; do sleep 0.05; done
+    sleep 0.2
+    touch "$STUB_DIR/check-refuse"
+  ) &
+  killer=$!
+  phase_concurrent || exit 1
+  wait "$killer"
+  stop_server
+) >"$TMP/check-refuse.log" 2>&1
+code=$?
+out="$(conc_outage_check "$BOX_M" 3)"
+if [ "$code" = 0 ] && [ -z "$out" ] && [ ! -e "$STUB_DIR/check-refuse" ]; then
+  pass "a refused SELECT 1 check restarts the server once; readyz is never polled"
+else
+  fail "SELECT 1 check" "exit $code: $out $(tail -n 3 "$TMP/check-refuse.log")"
+fi
+
+# kill_tree PID: SIGKILL PID and every process below it.
+kill_tree() {
+  local child
+  for child in $(pgrep -P "$1"); do kill_tree "$child"; done
+  kill -KILL "$1" 2>/dev/null
+}
+
+# Catches: a SELECT 1 check with no client time limit. A server that accepts
+# the connection and never answers then blocks the watchdog in the check
+# forever, so it never restarts the server or reaches its deadline, and the
+# round never ends. Here the check starts hanging 0.2 s into a 3 s round; the
+# case gives the round 20 s before calling it hung and killing it.
+BOX_H="$TMP/box-check-hang"
+lib_box "$BOX_H"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_H/lib-setup.sh"
+  CONC_ROUNDS=1 CONC_CONNECTIONS=1 CONC_DURATION=3
+  WATCHDOG_INTERVAL=0.3
+  (
+    until grep -q 'concurrent round=1' "$PROGRESS" 2>/dev/null; do sleep 0.05; done
+    sleep 0.2
+    touch "$STUB_DIR/check-hang"
+  ) &
+  killer=$!
+  phase_concurrent || exit 1
+  wait "$killer"
+  stop_server
+) >"$TMP/check-hang.log" 2>&1 &
+hang_pid=$!
+waited=0
+while kill -0 "$hang_pid" 2>/dev/null && [ "$waited" -lt 200 ]; do
+  sleep 0.1
+  waited=$((waited + 1))
+done
+if kill -0 "$hang_pid" 2>/dev/null; then
+  kill_tree "$hang_pid"
+  wait "$hang_pid" 2>/dev/null
+  code="hung for 20 s"
+else
+  code=0
+  wait "$hang_pid" || code=$?
+fi
+out="$(conc_outage_check "$BOX_H" 3)"
+if [ "$code" = 0 ] && [ -z "$out" ] && [ ! -e "$STUB_DIR/check-hang" ]; then
+  pass "a SELECT 1 check that never answers times out, restarts the server once, and the round ends at its deadline"
+else
+  fail "hung SELECT 1 check" "exit $code: $out $(tail -n 3 "$TMP/check-hang.log")"
+fi
+rm -f "$STUB_DIR/check-hang"
+
+# Catches: a watchdog whose restart waits less than the kit's own startup
+# (READY_TRIES): a server that needs more polls than that to come up is given
+# up on, stopped by the next failed check while it is still booting, and
+# restarted again until the round ends, so the whole round reads as an outage.
+# The server dies 0.5 s into the round and its restart answers only after 70
+# checks: more than upstream's 60, fewer than lib_box's KIT_READY_TRIES of 100.
+BOX_S="$TMP/box-slow-restart"
+lib_box "$BOX_S"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_S/lib-setup.sh"
+  CONC_ROUNDS=1 CONC_CONNECTIONS=2 CONC_DURATION=10
+  WATCHDOG_INTERVAL=0.3
+  (
+    until grep -q 'concurrent round=1' "$PROGRESS" 2>/dev/null; do sleep 0.05; done
+    sleep 0.5
+    echo 70 >"$STUB_DIR/ready-after-checks"
+    kill -TERM "$(cat "$KIT/server.pid")"
+  ) &
+  killer=$!
+  phase_concurrent || exit 1
+  wait "$killer"
+  rm -f "$STUB_DIR/ready-after-checks"
+  stop_server
+) >"$TMP/slow-restart.log" 2>&1
+code=$?
+rm -f "$STUB_DIR/ready-after-checks"
+out="$(conc_outage_check "$BOX_S" 10)"
+starts="$(grep -c 'server start' "$BOX_S/kit/progress.log")"
+ok_after="$(python3 - "$BOX_S/kit/out/concurrent/calls.jsonl" <<'PY2' 2>&1
+import json, sys
+calls = [json.loads(l) for l in open(sys.argv[1])]
+for conn in sorted(set(c["connection"] for c in calls)):
+    mine = [c for c in calls if c["connection"] == conn]
+    last_down = max([i for i, c in enumerate(mine) if c["http_status"] == 0] or [-1])
+    if last_down < 0 or not any(c["outcome"] == "ok" for c in mine[last_down + 1:]):
+        print("connection", conn, "saw no outage, or no success after it")
+PY2
+)"
+# The healthz gate stays open across the watchdog's restart, so the outage
+# shows as failed samples on both listeners.
+hz_fail="$(sed -En 's/^HEALTHZ phase=concurrent-1 port=43(18|19) .* failures=([0-9]+)$/\2/p' \
+  "$BOX_S/kit/out/healthz.txt" 2>/dev/null | tr '\n' ' ')"
+if [ "$code" = 0 ] && [ -z "$out" ] && [ "$starts" = 2 ] && [ -z "$ok_after" ] \
+  && [[ "$hz_fail" =~ ^[1-9][0-9]*\ [1-9][0-9]*\ $ ]]; then
+  pass "a restart slower than 60 polls is waited for, not stopped while it boots, calls succeed once it is up, and healthz counts the outage as failures"
+else
+  fail "slow watchdog restart" "exit $code, $starts server starts, healthz failures '$hz_fail': $out $ok_after $(grep -c restart "$BOX_S/kit/out/concurrent/round-1/watchdog.log") restarts; $(tail -n 3 "$TMP/slow-restart.log")"
+fi
+
+# Catches: a failed concurrent call leaving its curl stderr file behind. A
+# connection to a dead endpoint fails fast and loops, so one outage leaves a
+# file per call under out/concurrent, and write_evidence copies and scrubs
+# them one by one, too slowly for evidence.tgz to be written before the box
+# shuts down. Also catches evidence carrying the per-connection response
+# directories at all, and a deferred call's error losing the curl stderr
+# concurrent-answers quotes after the round. Every measured call here is
+# refused at once.
+BOX_D="$TMP/box-dead-endpoint"
+lib_box "$BOX_D"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_D/lib-setup.sh"
+  export STUB_SQL_DEAD=1
+  CONC_ROUNDS=1 CONC_CONNECTIONS=2 CONC_DURATION=2
+  phase_concurrent || exit 1
+  stop_server
+  write_evidence || exit 1
+) >"$TMP/dead-endpoint.log" 2>&1
+code=$?
+dcalls="$(wc -l <"$BOX_D/kit/out/concurrent/calls.jsonl" 2>/dev/null | tr -d ' ')"
+dfailed="$(grep -c '"curl_exit": 7, .*"error": "curl exit 7: curl: (7) Failed to connect to 127.0.0.1 port 4318"' \
+  "$BOX_D/kit/out/concurrent/calls.jsonl" 2>/dev/null)"
+left="$(find "$BOX_D/kit/out/concurrent" -type f \( -name '*.curl' -o -path '*/conn-*/*' \) | head -n 3)"
+tar -tzf "$BOX_D/kit/evidence.tgz" >"$TMP/dead-endpoint.tar" 2>&1 || echo "no evidence.tgz" >>"$TMP/dead-endpoint.tar"
+in_tar="$(grep -E '\.curl$|/conn-[0-9]+/|no evidence' "$TMP/dead-endpoint.tar" | head -n 3)"
+if [ "$code" = 0 ] && [ "${dcalls:-0}" -ge 50 ] && [ "$dfailed" = "$dcalls" ] && [ -z "$left" ] \
+  && grep -q '^out/concurrent/calls.jsonl$' "$TMP/dead-endpoint.tar" && [ -z "$in_tar" ]; then
+  pass "a dead endpoint's failed concurrent calls each quote their curl stderr, leave no per-call file, and evidence.tgz is written without them"
+else
+  fail "dead endpoint cleanup" "exit $code, $dfailed of $dcalls calls failed; left: $left; in evidence: $in_tar; $(tail -n 3 "$TMP/dead-endpoint.log")"
+fi
+
+# Catches: run_query recording an answer whose status line said 200 but whose
+# transfer then failed as a success, or without its curl exit code.
+BOX_T="$TMP/box-transfer"
+lib_box "$BOX_T"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_T/lib-setup.sh"
+  export STUB_SQL_TRUNCATE_N=05
+  phase_requests "$OUT/concurrent" || exit 1
+  start_server || exit 1
+  RQ_MAX_TIME="" RQ_EXTRA='"round": 1, "connection": 1' run_query concurrent 05 q05 1 \
+    "$OUT/concurrent/requests/05.json" || exit 1
+  RQ_MAX_TIME="" RQ_EXTRA='"round": 1, "connection": 1' run_query concurrent 06 q06 2 \
+    "$OUT/concurrent/requests/06.json" || exit 1
+  stop_server
+) >"$TMP/transfer.log" 2>&1
+code=$?
+out="$(python3 - "$KIT_SRC/lib" "$BOX_T/kit/out/concurrent/calls.jsonl" <<'PY' 2>&1
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import kit
+calls = [json.loads(l) for l in open(sys.argv[2])]
+t = calls[0]
+if (t["http_status"], t["curl_exit"], t["outcome"], t["refusal_class"]) != (200, 18, "error", "transfer"):
+    print("truncated call", t)
+if (calls[1]["http_status"], calls[1]["curl_exit"], calls[1]["outcome"]) != (200, 0, "ok"):
+    print("good call", calls[1])
+rd = kit.concurrent_round({"round": 1, "duration_s": 1, "wall_s": 1.0, "connections": 1}, calls)
+if (rd["ok"], rd["err"]) != (1, 1):
+    print("round", rd)
+PY
+)"
+if [ "$code" = 0 ] && [ -z "$out" ]; then
+  pass "run_query records a 200 with a failed transfer as curl_exit 18, an error in the concurrent figures"
+else
+  fail "run_query transfer" "exit $code: $out $(tail -n 3 "$TMP/transfer.log")"
+fi
+
+# Catches: a concurrent connection starting python3 (to count an answer's rows
+# or classify a refusal) inside the round's timed window, where it competes
+# with the server for cores and deflates the QPS, or the deferred reading
+# after the round losing wrong_answer, a refusal's class, or a pending marker.
+# A python3 stub first on PATH logs every invocation made while any
+# connection's loop is running. Statement 01 answers 5 rows where the corpus
+# expects 1 and statement 02 is refused (422). TZ is not UTC, so a call's
+# start stamped in local time is caught too.
+mkdir -p "$TMP/pystub"
+cat >"$TMP/pystub/python3" <<STUB
+#!/usr/bin/env bash
+for f in "\$STUB_DIR"/window-*; do
+  [ ! -e "\$f" ] || { echo "python3 \$*" >>"\$STUB_DIR/py-window"; break; }
+done
+exec "$(command -v python3)" "\$@"
+STUB
+chmod +x "$TMP/pystub/python3"
+BOX_Y="$TMP/box-py-window"
+lib_box "$BOX_Y"
+rm -f "$STUB_DIR"/window-* "$STUB_DIR/py-window"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_Y/lib-setup.sh"
+  export PATH="$TMP/pystub:$PATH" STUB_SQL_ROWS_N=01 STUB_SQL_ROWS=5 STUB_SQL_REFUSE_N=02 STUB_SQL_TIME=0.05 TZ=Asia/Tokyo
+  CONC_ROUNDS=1 CONC_CONNECTIONS=2 CONC_DURATION=2
+  eval "orig_$(declare -f concurrent_worker)"
+  concurrent_worker() {
+    local rc=0
+    touch "$STUB_DIR/window-$2"
+    orig_concurrent_worker "$@" || rc=$?
+    rm -f "$STUB_DIR/window-$2"
+    return "$rc"
+  }
+  phase_concurrent || exit 1
+  stop_server
+) >"$TMP/py-window.log" 2>&1
+code=$?
+in_window=0
+[ ! -f "$STUB_DIR/py-window" ] || in_window="$(wc -l <"$STUB_DIR/py-window" | tr -d ' ')"
+out="$(python3 - "$BOX_Y/kit/out/concurrent" <<'PY' 2>&1
+import json, os, sys
+d = sys.argv[1]
+calls = [json.loads(l) for l in open(os.path.join(d, "calls.jsonl"))]
+s = json.load(open(os.path.join(d, "summary.json")))
+wrong = [c for c in calls if c["refusal_class"] == "wrong_answer"]
+if not wrong or any((c["statement"][:3], c["rows"], c["outcome"], c["error"]) !=
+                    ("q01", 5, "error", "answer has 5 rows, expected 1") for c in wrong):
+    print("wrong answers", wrong[:2])
+if s["rounds"][0]["wrong_answer"] != len(wrong):
+    print("summary wrong_answer", s["rounds"][0]["wrong_answer"], "of", len(wrong))
+refused = [c for c in calls if c["http_status"] == 422]
+if not refused or any((c["refusal_class"], c["error"]) != ("resource_exhausted", "query pool exhausted")
+                      for c in refused):
+    print("refusals", refused[:2])
+import calendar, time
+skew = [c["start"] for c in calls
+        if abs(calendar.timegm(time.strptime(c["start"], "%Y-%m-%dT%H:%M:%SZ")) - time.time()) > 300]
+if skew:
+    print("start not UTC under TZ=Asia/Tokyo", skew[:1])
+if any("pending" in c for c in calls):
+    print("a pending member left in calls.jsonl")
+oks = [c for c in calls if c["outcome"] == "ok"]
+if not oks or any(not isinstance(c["rows"], int) or c["refusal_class"] != "" for c in oks):
+    print("ok calls", oks[:2])
+rdir = os.path.join(d, "round-1")
+for c in calls:
+    f = os.path.join(rdir, "conn-%d" % c["connection"], "%02d-%d.json" % (c["number"], c["try"]))
+    if os.path.exists(f) != (c["outcome"] != "ok" or c["try"] == 1):
+        print("response file", f, "exists" if os.path.exists(f) else "missing", "for", c["outcome"])
+        break
+PY
+)"
+hz_n="$(sed -n 's/^HEALTHZ phase=concurrent-1 port=4319 n=\([0-9]*\) .*/\1/p' "$BOX_Y/kit/out/healthz.txt" 2>/dev/null)"
+if [ "$code" = 0 ] && [ "$in_window" = 0 ] && [ -z "$out" ] && [ "${hz_n:-0}" -ge 4 ] \
+  && grep -Eq '^HEARTBEAT phase=concurrent-1 n=[1-9][0-9]* failures=0 bad=0 max_s=0.500$' "$BOX_Y/kit/out/healthz.txt"; then
+  pass "a concurrent round starts no python3 in its timed window, with the healthz sampler running through it, and still reports wrong answers after it"
+else
+  fail "concurrent harness cost" "exit $code, python3 started $in_window times in the window, healthz n '$hz_n': $(head -n 2 "$STUB_DIR/py-window" 2>/dev/null) $out $(tail -n 3 "$TMP/py-window.log")"
+fi
+
+# Catches: a client timeout's error naming a limit the call never had: the
+# concurrent phase sets none, so its error says so, and a call with a limit
+# names that limit rather than query_timeout_s.
+BOX_X="$TMP/box-timeout-text"
+lib_box "$BOX_X"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_X/lib-setup.sh"
+  export STUB_SQL_TIMEOUT_N=07
+  phase_requests "$OUT/concurrent" || exit 1
+  start_server || exit 1
+  RQ_MAX_TIME="" run_query concurrent 07 q07 1 "$OUT/concurrent/requests/07.json" || exit 1
+  RQ_MAX_TIME=7 run_query concurrent 07 q07 2 "$OUT/concurrent/requests/07.json" || exit 1
+  stop_server
+) >"$TMP/timeout-text.log" 2>&1
+code=$?
+out="$(python3 - "$BOX_X/kit/out/concurrent/calls.jsonl" <<'PY' 2>&1
+import json, sys
+calls = [json.loads(l) for l in open(sys.argv[1])]
+want = [("timeout", 28, "transfer timed out (curl exit 28) with no client time limit set"),
+        ("timeout", 28, "no answer within 7 s")]
+got = [(c["outcome"], c["curl_exit"], c["error"]) for c in calls]
+if got != want:
+    print("got", got)
+PY
+)"
+if [ "$code" = 0 ] && [ -z "$out" ]; then
+  pass "a client timeout names the call's own limit, or says it had none"
+else
+  fail "timeout error text" "exit $code: $out $(tail -n 3 "$TMP/timeout-text.log")"
+fi
+
+# Catches: a deferred call reading a 2xx other than 200 as an error, a
+# deferred timeout forking rm inside the round or quoting its curl stderr
+# when run_query would not, and concurrent-answers leaving a quoted stderr
+# file behind. Statement 06 answers 203, statement 07 times out, both under
+# RQ_DEFER=1, then concurrent-answers settles the connection's file.
+BOX_V="$TMP/box-defer-2xx"
+lib_box "$BOX_V"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_V/lib-setup.sh"
+  export STUB_SQL_TIMEOUT_N=07 STUB_SQL_STATUS=203
+  phase_requests "$OUT/concurrent" || exit 1
+  start_server || exit 1
+  d="$OUT/concurrent/round-1"
+  for n in 06 07; do
+    RQ_DEFER=1 RQ_MAX_TIME="" RQ_CALLS="$d/conn-1.jsonl" RQ_RESP_DIR="$d/conn-1" \
+      run_query concurrent "$n" "q$n" 1 "$OUT/concurrent/requests/$n.json" || exit 1
+  done
+  [ -s "$d/conn-1/07-1.curl" ] || { echo "the deferred timeout's stderr file is gone before the round ends"; exit 1; }
+  kit_py concurrent-answers "$d" || exit 1
+  stop_server
+) >"$TMP/defer-2xx.log" 2>&1
+code=$?
+out="$(python3 - "$BOX_V/kit/out/concurrent/round-1/conn-1.jsonl" <<'PY' 2>&1
+import json, sys
+calls = [json.loads(l) for l in open(sys.argv[1])]
+got = [(c["http_status"], c["curl_exit"], c["outcome"], c["error"], "pending" in c) for c in calls]
+want = [(203, 0, "ok", "", False),
+        (0, 28, "timeout", "transfer timed out (curl exit 28) with no client time limit set", False)]
+if got != want:
+    print("got", got)
+PY
+)"
+left="$(find "$BOX_V/kit/out/concurrent/round-1" -name '*.curl' -size +0 | head -n 2)"
+if [ "$code" = 0 ] && [ -z "$out" ] && [ -z "$left" ]; then
+  pass "a deferred 203 answer is ok, and a deferred timeout keeps run_query's error and leaves no stderr file"
+else
+  fail "deferred 2xx and timeout" "exit $code: $out left: $left $(tail -n 3 "$TMP/defer-2xx.log")"
+fi
+
+# Catches: a perf phase that fails after perf record and leaves the raw
+# perf.data in out/perf/, which evidence.tgz would then carry.
+BOX_F="$TMP/box-perf-fail"
+lib_box "$BOX_F"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_F/lib-setup.sh"
+  PERF_RECORD=true PERF_SETTLE=0.05
+  export STUB_PERF_SCRIPT_FAIL=1
+  mkdir -p "$OUT/perf"
+  phase_perf && exit 1
+  stop_server
+  exit 0
+) >"$TMP/perf-fail.log" 2>&1
+code=$?
+if [ "$code" = 0 ] && [ -f "$BOX_F/kit/out/perf/01.record.log" ] \
+  && ! ls "$BOX_F"/kit/out/perf/*.data >/dev/null 2>&1; then
+  pass "a failed perf script leaves no perf.data behind"
+else
+  fail "perf cleanup" "exit $code; left: $(ls "$BOX_F/kit/out/perf" 2>&1 | tr '\n' ' ')"
+fi
+
+# Catches: a healthz sampler outliving its phase. healthz_stop must stop the
+# python3 process itself, not a subshell wrapping it, so after healthz_finish,
+# and after fail_run with a sampler running, no process whose argv holds that
+# phase's HEALTHZ_DIR may remain. One that ignores SIGTERM is SIGKILLed after
+# the bounded wait, and run.log says so.
+BOX_H="$TMP/box-hz-stop"
+lib_box "$BOX_H"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_H/lib-setup.sh"
+  touch "$STUB_DIR/server-ready"
+  : >"$OUT/healthz.txt"
+  healthz_start benchmark "$OUT/hz-finish" || exit 1
+  healthz_up || exit 1
+  healthz_finish benchmark || exit 1
+  pgrep -f "$OUT/hz-finish" >"$BOX_H/left-finish"
+  exit 0
+) >"$TMP/hz-finish.log" 2>&1
+finish_code=$?
+(
+  # shellcheck source=/dev/null
+  . "$BOX_H/lib-setup.sh"
+  touch "$STUB_DIR/server-ready"
+  healthz_start benchmark "$OUT/hz-failrun" || exit 3
+  healthz_up || exit 3
+  fail_run healthz-unit
+) >"$TMP/hz-failrun.log" 2>&1
+failrun_code=$?
+rm -f "$STUB_DIR/server-ready"
+left_failrun="$(pgrep -f "$BOX_H/kit/out/hz-failrun")"
+cat >"$TMP/stubborn-kit.py" <<'PY'
+import os, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+open(os.path.join(sys.argv[2], "ignoring"), "w").close()
+time.sleep(60)
+PY
+(
+  # shellcheck source=/dev/null
+  . "$BOX_H/lib-setup.sh"
+  # shellcheck disable=SC2034 # read by healthz_start
+  PY_KIT="$TMP/stubborn-kit.py"
+  healthz_start benchmark "$OUT/hz-stubborn" || exit 1
+  for _ in $(seq 1 500); do [ -e "$OUT/hz-stubborn/ignoring" ] && break; sleep 0.01; done
+  [ -e "$OUT/hz-stubborn/ignoring" ] || exit 1
+  healthz_stop
+  pgrep -f "$OUT/hz-stubborn" >"$BOX_H/left-stubborn"
+  exit 0
+) >"$TMP/hz-stubborn.log" 2>&1
+stubborn_code=$?
+if [ "$finish_code" = 0 ] && [ -f "$BOX_H/left-finish" ] && [ ! -s "$BOX_H/left-finish" ] \
+  && grep -q '^HEARTBEAT phase=benchmark n=' "$BOX_H/kit/out/healthz.txt" \
+  && [ "$failrun_code" = 1 ] && grep -q '^FAILED step=healthz-unit ' "$BOX_H/kit/FAILED" 2>/dev/null \
+  && [ -z "$left_failrun" ] \
+  && [ "$stubborn_code" = 0 ] && [ -f "$BOX_H/left-stubborn" ] && [ ! -s "$BOX_H/left-stubborn" ] \
+  && grep -q 'still running 5 s after SIGTERM; sending SIGKILL' "$TMP/hz-stubborn.log"; then
+  pass "no healthz sampler outlives healthz_finish or fail_run, and one ignoring SIGTERM is SIGKILLed and logged"
+else
+  fail "healthz sampler lifetime" "finish exit $finish_code left '$(tr '\n' ' ' <"$BOX_H/left-finish" 2>/dev/null)', fail_run exit $failrun_code left '$left_failrun', stubborn exit $stubborn_code left '$(tr '\n' ' ' <"$BOX_H/left-stubborn" 2>/dev/null)': $(tail -n 3 "$TMP/hz-finish.log") $(tail -n 3 "$TMP/hz-failrun.log") $(tail -n 2 "$TMP/hz-stubborn.log")"
+fi
+pkill -f "$BOX_H/kit/out/hz-" 2>/dev/null
+
+# Catches: a failed read of server_flags_a or server_flags_b taken for "no
+# extra flags", so the arm runs without the flags run.toml declared for it.
+BOX_E="$TMP/box-flags-read"
+lib_box "$BOX_E"
+printf 'this is = = not toml\n' >"$TMP/broken-run.toml"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_E/lib-setup.sh"
+  rm -f "$ARM_ENV"
+  RUN_TOML="$TMP/broken-run.toml"
+  resolve_arm_env && exit 1
+  [ ! -e "$ARM_ENV" ] || exit 1
+  exit 0
+) >"$TMP/flags-read.log" 2>&1
+code=$?
+if [ "$code" = 0 ] && grep -q "cannot read server_flags_a from $TMP/broken-run.toml (kit.py get exit 2)" "$TMP/flags-read.log"; then
+  pass "a run.toml that cannot be read fails resolve_arm_env instead of reading as no extra flags"
+else
+  fail "extra flags read" "exit $code: $(tail -n 3 "$TMP/flags-read.log")"
+fi
+
+# Catches: now_us failing where bash has no EPOCHREALTIME (macOS's bash 3.2),
+# through GNU date or, where date has no %N, python3.
+mkdir -p "$TMP/bsd-date"
+printf '#!/bin/sh\necho 1792174430N\n' >"$TMP/bsd-date/date"
+chmod +x "$TMP/bsd-date/date"
+out="$(
+  KIT_RUN_SH_LIB=1 KIT_ROOT="$TMP/no-box"
+  # shellcheck source=/dev/null
+  . "$KIT_SRC/box/run.sh"
+  unset EPOCHREALTIME
+  ref="$(python3 -c 'import time; print(time.time_ns() // 1000)')"
+  a="$(now_us)" || echo "date path failed"
+  b="$(PATH="$TMP/bsd-date:$PATH" now_us)" || echo "python path failed"
+  for v in "$a" "$b"; do
+    [[ "$v" =~ ^[0-9]{16}$ ]] && [ $((v - ref)) -lt 5000000 ] && [ $((ref - v)) -lt 5000000 ] \
+      || echo "now_us gave '$v' against $ref"
+  done
+)"
+# An array that can be empty must use the expansion bash 3.2 accepts under
+# set -u, which expands to nothing.
+unguarded="$(grep -nE '"\$\{(opts|extra)\[@\]\}"' "$KIT_SRC/box/run.sh" | grep -vE '\$\{(opts|extra)\[@\]\+')"
+if [ -z "$out" ] && [ -z "$unguarded" ]; then
+  pass "now_us works without EPOCHREALTIME and empty arrays expand guarded"
+else
+  fail "bash 3.2" "$out $unguarded"
+fi
+
+# Catches: any case or box run leaving a healthz sampler behind; every one
+# started under this suite's TMP must be gone by now.
+left="$(pgrep -f "healthz-sampler $TMP/" 2>/dev/null | tr '\n' ' ')"
+if [ -z "$left" ]; then
+  pass "the suite leaves no healthz sampler running"
+else
+  fail "leftover samplers" "pids $left"
+fi
+
+# --- published bands --------------------------------------------------------
+
+PUB_FIX="$HERE/testdata/published/v0.31.1"
+PUB_BANDS="$REPO_ROOT/benchmarks/clickbench/bands/rlog.toml"
+
+# published NAME MACHINE FILE [OPTION...]: kit.py's published judgment of FILE
+# against MACHINE's [published] rows; sets $code and writes
+# $TMP/pub-NAME.out/.err.
+published() {
+  code=0
+  python3 "$KIT_SRC/lib/kit.py" published v0.31.1 "$PUB_BANDS" "$2" "$3" "${@:4}" \
+    >"$TMP/pub-$1.out" 2>"$TMP/pub-$1.err" || code=$?
+}
+
+# pub_notes NAME VERDICT: the notes of NAME's VERDICT rows, one per line.
+pub_notes() {
+  sed -n "s/^$2  .*  \(statement [0-9]* [a-z]*: .*\)\$/\1/p; s/^$2  .*  \(concurrent qps: .*\)\$/\1/p" "$TMP/pub-$1.out"
+}
+
+# published_v0311_reproduces_preregistered_misses. Catches: hot taken as the
+# mean of tries 2 and 3 rather than the faster one, and concurrent QPS judged
+# with the statement factor 1.10 rather than 0.90, either of which changes the
+# set of misses pre-registered for v0.31.1 against v0.28.0's published rows.
+pub_ok=1
+pub_why=""
+for m in c6a.large c6a.xlarge c6a.2xlarge; do
+  published "$m" "$m" "$PUB_FIX/$m.json"
+  case "$m" in
+    c6a.large) want='statement 9 hot: measured 29.383 s, published 13.433 s, ratio 2.1874
+statement 31 hot: measured 14.619 s, published 13.052 s, ratio 1.1201
+statement 31 cold: measured 15.444 s, published 13.989 s, ratio 1.1040
+concurrent qps: measured 0.098, published 0.137, ratio 0.7153' ;;
+    c6a.xlarge) want='statement 24 hot: measured 5.401 s, published 3.727 s, ratio 1.4492' ;;
+    c6a.2xlarge) want='concurrent qps: measured 0.362, published 0.478, ratio 0.7573' ;;
+  esac
+  got="$(pub_notes "$m" MISS)"
+  if [ "$code" != 1 ] || [ "$got" != "$want" ] || grep -q '^INCONCLUSIVE' "$TMP/pub-$m.out"; then
+    pub_ok=0
+    pub_why="$pub_why $m exit $code, misses: $(printf '%s' "$got" | tr '\n' ';')"
+  fi
+done
+if [ "$pub_ok" = 1 ] \
+  && [ "$(pub_notes c6a.xlarge PASS | grep '^concurrent qps')" = 'concurrent qps: measured 0.212, published 0.232, ratio 0.9138' ]; then
+  pass "v0.31.1 against v0.28.0's published rows misses exactly the pre-registered statements and QPS"
+else
+  fail "published v0.31.1" "$pub_why $(pub_notes c6a.xlarge PASS | grep '^concurrent' | head -n 1)"
+fi
+
+# published_null_measured_is_a_miss. Catches: a statement the published row
+# answered and the run did not skipped as if neither had answered it.
+python3 - "$PUB_FIX/c6a.large.json" "$TMP/pub-null-measured.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+r["result"][8] = [None, None, None]
+json.dump(r, open(sys.argv[2], "w"))
+PY
+published null-measured c6a.large "$TMP/pub-null-measured.json"
+if [ "$code" = 1 ] \
+  && [ "$(pub_notes null-measured MISS | grep '^statement 9 ')" = 'statement 9 hot: not answered, published 13.433 s
+statement 9 cold: not answered, published 14.736 s' ]; then
+  pass "a statement the published row answered and the run did not is a published miss"
+else
+  fail "published null measured" "exit $code: $(grep ' q09 ' "$TMP/pub-null-measured.out" | head -n 2) $(head -c 300 "$TMP/pub-null-measured.err")"
+fi
+
+# published_null_published_has_no_band. Catches: a figure ClickBench published
+# as null judged anyway, as zero or as unanswered: c6a.large's q14 has no
+# published figure, c6a.xlarge's q17 a hot one and no cold one.
+if [ "$(grep -c '  q14 ' "$TMP/pub-c6a.large.out")" = 0 ] \
+  && [ "$(grep -c '  q17 hot_s ' "$TMP/pub-c6a.xlarge.out")" = 1 ] \
+  && [ "$(grep -c '  q17 cold_s ' "$TMP/pub-c6a.xlarge.out")" = 0 ] \
+  && [ "$(grep -c '  q14 hot_s ' "$TMP/pub-c6a.xlarge.out")" = 1 ]; then
+  pass "a null published figure has no band"
+else
+  fail "published null published" "$(grep -h '  q1[47] ' "$TMP/pub-c6a.large.out" "$TMP/pub-c6a.xlarge.out" | head -n 4)"
+fi
+
+# run_toml_selecting_published_without_section_refused. Catches: a run.toml
+# selecting published for a machine with no [published] table accepted, so
+# the run would be judged against nothing; c6a.large, which has one, passes.
+write_run_toml "$TMP/run-pub-none.toml" "$BANDS" '["relative", "absolute", "published"]'
+sed 's/^phases = .*/phases = ["benchmark", "concurrent"]/' "$TMP/run-pub-none.toml" >"$TMP/run-pub-none.toml.new"
+mv "$TMP/run-pub-none.toml.new" "$TMP/run-pub-none.toml"
+code=0
+python3 "$KIT_SRC/lib/kit.py" check-run "$TMP/run-pub-none.toml" >/dev/null 2>"$TMP/run-pub-none.err" || code=$?
+lcode=0
+bash "$KIT_SRC/launch.sh" --dry-run "$TMP/run-pub-none.toml" >/dev/null 2>"$TMP/run-pub-none-launch.err" || lcode=$?
+sed 's/^instance_type = .*/instance_type = "c6a.large"/' "$TMP/run-pub-none.toml" >"$TMP/run-pub-large.toml"
+ycode=0
+python3 "$KIT_SRC/lib/kit.py" check-run "$TMP/run-pub-large.toml" >/dev/null 2>"$TMP/run-pub-large.err" || ycode=$?
+if [ "$code" = 2 ] && [ "$lcode" = 64 ] && [ "$ycode" = 0 ] \
+  && grep -qF 'band_sections selects published and there is no [published.c6a.4xlarge] table' "$TMP/run-pub-none.err" \
+  && grep -qF 'there is no [published.c6a.4xlarge] table' "$TMP/run-pub-none-launch.err"; then
+  pass "a run.toml selecting published without a [published] table for its machine is refused"
+else
+  fail "run.toml published without section" "check-run $code, launch $lcode, c6a.large $ycode: $(head -c 300 "$TMP/run-pub-none.err") $(head -c 300 "$TMP/run-pub-large.err")"
+fi
+
+# pub_edit SRC NAME EDIT: SRC with a python edit applied to its report r,
+# written to $TMP/pub-NAME.json.
+pub_edit() {
+  python3 - "$1" "$TMP/pub-$2.json" "$3" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+exec(sys.argv[3])
+json.dump(r, open(sys.argv[2], "w"))
+PY
+}
+
+# published_row_count_per_machine. Catches: a statement dropped from the
+# judgment (statement 43, say): each machine's table holds one row per
+# non-null published figure in its band file, plus one for QPS.
+rc_ok=1
+rc_why=""
+for m in c6a.large c6a.xlarge c6a.2xlarge; do
+  want="$(awk -v t="[published.$m]" '
+    $0 == t { on = 1; next }
+    /^\[/ { on = 0 }
+    on && /^q[0-9][0-9] = \[/ { n += 2 - gsub(/"null"/, "") }
+    END { print n + 1 }' "$PUB_BANDS")"
+  got="$(grep -cE '^(PASS|MISS)  ' "$TMP/pub-$m.out")"
+  if [ "$want" != "$got" ] || [ "$want" -lt 60 ] || ! grep -q '  q43 hot_s ' "$TMP/pub-$m.out"; then
+    rc_ok=0
+    rc_why="$rc_why $m: want $want rows, got $got;"
+  fi
+done
+if [ "$rc_ok" = 1 ]; then
+  pass "each machine is judged on every non-null published figure and QPS"
+else
+  fail "published row count" "$rc_why"
+fi
+
+# published_boundary_inclusive. Catches: either bound made exclusive, or
+# compared with any slack: c6a.large statement 7's published hot is 0.05 s,
+# so 0.055 s (exactly 1.10 x) passes and 0.056 s misses; c6a.2xlarge's
+# published QPS is 0.478, so 0.4302 (exactly 0.90 x) passes and 0.4301 misses.
+pub_edit "$PUB_FIX/c6a.large.json" b55 'r["result"][6] = [0.1, 0.055, 0.06]'
+pub_edit "$PUB_FIX/c6a.large.json" b56 'r["result"][6] = [0.1, 0.056, 0.06]'
+pub_edit "$PUB_FIX/c6a.2xlarge.json" q4302 'r["concurrent_qps"] = 0.4302'
+pub_edit "$PUB_FIX/c6a.2xlarge.json" q4301 'r["concurrent_qps"] = 0.4301'
+published b55 c6a.large "$TMP/pub-b55.json"
+b55="$code $(pub_notes b55 PASS | grep '^statement 7 hot')"
+published b56 c6a.large "$TMP/pub-b56.json"
+b56="$code $(pub_notes b56 MISS | grep '^statement 7 hot')"
+published q4302 c6a.2xlarge "$TMP/pub-q4302.json"
+q4302="$code $(pub_notes q4302 PASS | grep '^concurrent qps')"
+published q4301 c6a.2xlarge "$TMP/pub-q4301.json"
+q4301="$code $(pub_notes q4301 MISS | grep '^concurrent qps')"
+if [ "$b55" = '1 statement 7 hot: measured 0.055 s, published 0.050 s, ratio 1.1000' ] \
+  && [ "$b56" = '1 statement 7 hot: measured 0.056 s, published 0.050 s, ratio 1.1200' ] \
+  && [ "$q4302" = '0 concurrent qps: measured 0.430, published 0.478, ratio 0.9000' ] \
+  && [ "$q4301" = '1 concurrent qps: measured 0.430, published 0.478, ratio 0.8998' ]; then
+  pass "a figure at exactly the published factor passes and one step past it misses"
+else
+  fail "published boundary" "b55 [$b55] b56 [$b56] q4302 [$q4302] q4301 [$q4301]"
+fi
+
+# published_partial_null_clickbench_format. Catches: a ClickBench-format
+# statement with one failed try judged as not answered, or hot taken from the
+# failed try: [0.1, null, 0.04] judges hot 0.04 s and cold 0.1 s.
+pub_edit "$PUB_FIX/c6a.large.json" partial-cb 'r["result"][6] = [0.1, None, 0.04]'
+published partial-cb c6a.large "$TMP/pub-partial-cb.json"
+if [ "$code" = 1 ] && [ "$(pub_notes partial-cb PASS | grep '^statement 7 ')" = 'statement 7 hot: measured 0.040 s, published 0.050 s, ratio 0.8000
+statement 7 cold: measured 0.100 s, published 0.106 s, ratio 0.9434' ]; then
+  pass "a ClickBench-format statement with one failed try is judged on the tries that answered"
+else
+  fail "published partial null clickbench" "exit $code: $(grep '  q07 ' "$TMP/pub-partial-cb.out") $(head -c 300 "$TMP/pub-partial-cb.err")"
+fi
+
+# published_partial_null_kit_format. Catches: a kit statement with one failed
+# try judged as not answered, the box writing a failed statement without its
+# answered tries, or hot taken from the failed try: tries 0.1 s, a 503, and
+# 0.04 s judge hot 0.04 s and cold 0.1 s, as in ClickBench's format.
+pub_edit "$TMP/fixture-pass/results.json" partial-kit '
+sys.path.insert(0, "'"$KIT_SRC/lib"'")
+import kit
+calls = [{"try": 1, "outcome": "ok", "duration_s": 0.1, "rows": 1},
+         {"try": 2, "outcome": "http_error", "http_status": 503, "refusal_class": None,
+          "error": "unavailable", "duration_s": 0.02},
+         {"try": 3, "outcome": "ok", "duration_s": 0.04, "rows": 1}]
+sid = [e["id"] for e in r["entries"] if e["id"].startswith("q07")][0]
+entry, failed = kit.statement_report(sid, None, calls)
+assert entry is None and failed["tries_ms"] == [100.0, None, 40.0], failed
+r["entries"] = [e for e in r["entries"] if e["id"] != sid]
+r["failed"].append(failed)
+r["provenance"]["band_sections"].append("published")
+r["provenance"].setdefault("hardware", {})["instance_type"] = "c6a.large"
+rd ={"round": 1, "duration_s": 600, "wall_s": 600.4, "connections": 10, "calls": 100,
+      "ok": 100, "err": 0, "wrong_answer": 0, "qps": 1.0, "error_ratio": 0.0}
+r["concurrent"] = {"rounds": [rd], "pooled": {"rounds": 1, "calls": 100, "ok": 100, "err": 0,
+                   "wrong_answer": 0, "error_ratio_weighted": 0.0,
+                   "error_ratio_mean_of_rounds": 0.0, "qps_pooled": 1.0}}' 2>"$TMP/pub-partial-kit.edit.err"
+published partial-kit c6a.large "$TMP/pub-partial-kit.json"
+if [ "$code" = 1 ] && [ "$(pub_notes partial-kit PASS | grep '^statement 7 ')" = 'statement 7 hot: measured 0.040 s, published 0.050 s, ratio 0.8000
+statement 7 cold: measured 0.100 s, published 0.106 s, ratio 0.9434' ]; then
+  pass "a kit statement with one failed try is judged on the tries that answered"
+else
+  fail "published partial null kit" "exit $code: $(grep '  q07 ' "$TMP/pub-partial-kit.out") $(head -c 300 "$TMP/pub-partial-kit.err") $(tail -n 2 "$TMP/pub-partial-kit.edit.err")"
+fi
+
+# published_missing_qps_refuses. Catches: a ClickBench-format file whose
+# concurrent_qps is absent or not a number reported INCONCLUSIVE with exit 0,
+# when c6a.2xlarge's file really misses on QPS at 0.757.
+pub_edit "$PUB_FIX/c6a.2xlarge.json" noqps 'del r["concurrent_qps"]'
+pub_edit "$PUB_FIX/c6a.2xlarge.json" strqps 'r["concurrent_qps"] = "0.362"'
+published noqps c6a.2xlarge "$TMP/pub-noqps.json"
+ncode="$code"
+published strqps c6a.2xlarge "$TMP/pub-strqps.json"
+if [ "$ncode" = 2 ] && [ "$code" = 2 ] \
+  && grep -qF "pub-noqps.json has no concurrent_qps field; [published.c6a.2xlarge] has concurrent_qps 0.478 to judge it against" "$TMP/pub-noqps.err" \
+  && grep -qF "pub-strqps.json: concurrent_qps must be a number of at least 0, got '0.362'" "$TMP/pub-strqps.err"; then
+  pass "a ClickBench-format file with no readable concurrent_qps is refused"
+else
+  fail "published missing qps" "absent $ncode, string $code: $(head -c 300 "$TMP/pub-noqps.err") $(head -c 300 "$TMP/pub-strqps.err")"
+fi
+
+# published_machine_mismatch_refuses. Catches: a ClickBench-format file judged
+# against another machine's published rows: c6a.2xlarge's file passes 69 of
+# c6a.large's bands.
+published mismatch c6a.large "$PUB_FIX/c6a.2xlarge.json"
+if [ "$code" = 2 ] && [ ! -s "$TMP/pub-mismatch.out" ] \
+  && grep -qF "c6a.2xlarge.json: machine is 'c6a.2xlarge', not c6a.large" "$TMP/pub-mismatch.err"; then
+  pass "a ClickBench-format file for another machine is refused"
+else
+  fail "published machine mismatch" "exit $code: $(head -c 300 "$TMP/pub-mismatch.err")"
+fi
+
+# published_not_selected_refuses. Catches: a kit results.json whose
+# band_sections did not select published judged silently as nothing, exit 0.
+published notsel c6a.large "$TMP/fixture-pass/results.json"
+if [ "$code" = 2 ] && [ ! -s "$TMP/pub-notsel.out" ] \
+  && grep -qF "results.json: published not selected: its band_sections are relative, absolute" "$TMP/pub-notsel.err"; then
+  pass "a kit results.json that did not select published is refused"
+else
+  fail "published not selected" "exit $code: $(head -c 300 "$TMP/pub-notsel.err")"
+fi
+
+# published_kit_machine_mismatch_refuses. Catches: a kit results.json from one
+# machine judged against another machine's published rows; the fixture ran on
+# c6a.4xlarge. A run whose instance type is "unknown" is not refused for it.
+python3 - "$TMP/fixture-pass/results.json" "$TMP/pub-kitmm.json" "$TMP/pub-kitunk.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+r["provenance"]["band_sections"] = list(r["provenance"]["band_sections"]) + ["published"]
+json.dump(r, open(sys.argv[2], "w"))
+r["provenance"].setdefault("hardware", {})["instance_type"] = "unknown"
+json.dump(r, open(sys.argv[3], "w"))
+PY
+published kitmm c6a.large "$TMP/pub-kitmm.json"
+mm_code=$code
+published kitunk c6a.large "$TMP/pub-kitunk.json"
+if [ "$mm_code" = 2 ] && [ ! -s "$TMP/pub-kitmm.out" ] \
+  && grep -qF "pub-kitmm.json: ran on 'c6a.4xlarge', not c6a.large" "$TMP/pub-kitmm.err" \
+  && ! grep -qF "ran on" "$TMP/pub-kitunk.err"; then
+  pass "a kit results.json from another machine is refused, and an unknown one is not"
+else
+  fail "published kit machine mismatch" "exit $mm_code: $(head -c 300 "$TMP/pub-kitmm.err") | unknown: $(head -c 300 "$TMP/pub-kitunk.err")"
+fi
+
+# run_toml_published_without_concurrent_refused. Catches: a run.toml selecting
+# published without the concurrent phase accepted, so its QPS band could
+# never be judged; the same file with concurrent added passes.
+write_run_toml "$TMP/run-pub-noconc.toml" "$BANDS" '["relative", "absolute", "published"]'
+sed 's/^instance_type = .*/instance_type = "c6a.large"/' "$TMP/run-pub-noconc.toml" >"$TMP/run-pub-noconc.toml.new"
+mv "$TMP/run-pub-noconc.toml.new" "$TMP/run-pub-noconc.toml"
+sed 's/^phases = .*/phases = ["benchmark", "concurrent"]/' "$TMP/run-pub-noconc.toml" >"$TMP/run-pub-conc.toml"
+code=0
+python3 "$KIT_SRC/lib/kit.py" check-run "$TMP/run-pub-noconc.toml" >/dev/null 2>"$TMP/run-pub-noconc.err" || code=$?
+ccode=0
+python3 "$KIT_SRC/lib/kit.py" check-run "$TMP/run-pub-conc.toml" >/dev/null 2>"$TMP/run-pub-conc.err" || ccode=$?
+if [ "$code" = 2 ] && [ "$ccode" = 0 ] \
+  && grep -qF 'band_sections selects published, which judges concurrent QPS, and phases does not include concurrent' "$TMP/run-pub-noconc.err"; then
+  pass "a run.toml selecting published without the concurrent phase is refused"
+else
+  fail "run.toml published without concurrent" "check-run $code, with concurrent $ccode: $(head -c 300 "$TMP/run-pub-noconc.err") $(head -c 300 "$TMP/run-pub-conc.err")"
+fi
+
+# published_figures_limits_the_judged_kinds. Catches: --figures ignored (cold
+# misses still judged under hot), a skipped kind dropped silently or reported
+# more than once or with the wrong row count, the exit code still reflecting
+# a figure the option left out, and the default output changing. c6a.xlarge
+# holds 39 hot and 38 cold statement rows (q17 cold is unpublished); its only
+# miss is statement 24 hot. The cold-miss fixture adds statement 3 cold, 20 s
+# against 1.10 x the published 8.073 s, with its hot unchanged, and statement
+# 24's hot is brought under its band so the cold miss is the fixture's only one.
+pub_edit "$PUB_FIX/c6a.xlarge.json" figcold 'r["result"][2] = [20.0, 1.255, 1.239]; r["result"][23] = [7.905, 3.5, 3.5]'
+published fig-default c6a.xlarge "$PUB_FIX/c6a.xlarge.json"
+published fig-both c6a.xlarge "$PUB_FIX/c6a.xlarge.json" --figures hot,cold
+published fig-both-rev c6a.xlarge "$PUB_FIX/c6a.xlarge.json" --figures cold,hot
+published fig-dcold c6a.xlarge "$TMP/pub-figcold.json"
+dcold_code=$code
+published fig-hot-c c6a.xlarge "$TMP/pub-figcold.json" --figures hot
+hotc_code=$code
+published fig-cold-c c6a.xlarge "$TMP/pub-figcold.json" --figures cold
+coldc_code=$code
+published fig-hot-h c6a.xlarge "$PUB_FIX/c6a.xlarge.json" --figures hot
+hoth_code=$code
+published fig-cold-h c6a.xlarge "$PUB_FIX/c6a.xlarge.json" --figures cold
+coldh_code=$code
+if [ "$(wc -l <"$TMP/pub-fig-default.out" | tr -d ' ')" = 78 ] \
+  && ! grep -q '^SKIPPED' "$TMP/pub-fig-default.out" \
+  && cmp -s "$TMP/pub-fig-default.out" "$TMP/pub-fig-both.out" \
+  && cmp -s "$TMP/pub-fig-default.out" "$TMP/pub-fig-both-rev.out" \
+  && [ "$dcold_code" = 1 ] \
+  && [ "$(pub_notes fig-dcold MISS | grep -c '^statement 3 cold')" = 1 ]; then
+  pass "published judges both figure kinds by default, and --figures hot,cold changes nothing"
+else
+  fail "published figures default" "default lines $(wc -l <"$TMP/pub-fig-default.out"), cold-miss exit $dcold_code"
+fi
+if [ "$hotc_code" = 0 ] \
+  && ! grep -q '^MISS' "$TMP/pub-fig-hot-c.out" \
+  && [ "$(grep -c '  q[0-9][0-9] cold_s ' "$TMP/pub-fig-hot-c.out")" = 0 ] \
+  && [ "$(grep -c '  q[0-9][0-9] hot_s ' "$TMP/pub-fig-hot-c.out")" = 39 ] \
+  && [ "$(grep -c '^SKIPPED' "$TMP/pub-fig-hot-c.out")" = 1 ] \
+  && [ "$(grep '^SKIPPED' "$TMP/pub-fig-hot-c.out")" = 'SKIPPED cold: 38 statements not judged (--figures hot)' ] \
+  && [ "$(grep -c '^PASS .*concurrent qps' "$TMP/pub-fig-hot-c.out")" = 1 ] \
+  && [ "$hoth_code" = 1 ] \
+  && [ "$(pub_notes fig-hot-h MISS)" = 'statement 24 hot: measured 5.401 s, published 3.727 s, ratio 1.4492' ]; then
+  pass "--figures hot does not report a cold miss, exits on hot rows only, and says it skipped 38 cold rows"
+else
+  fail "published --figures hot" "exit $hotc_code/$hoth_code: $(grep -h '^MISS\|^SKIPPED' "$TMP/pub-fig-hot-c.out" "$TMP/pub-fig-hot-h.out")"
+fi
+if [ "$coldh_code" = 0 ] \
+  && ! grep -q '^MISS' "$TMP/pub-fig-cold-h.out" \
+  && [ "$(grep -c '  q[0-9][0-9] hot_s ' "$TMP/pub-fig-cold-h.out")" = 0 ] \
+  && [ "$(grep -c '  q[0-9][0-9] cold_s ' "$TMP/pub-fig-cold-h.out")" = 38 ] \
+  && [ "$(grep -c '^SKIPPED' "$TMP/pub-fig-cold-h.out")" = 1 ] \
+  && [ "$(grep '^SKIPPED' "$TMP/pub-fig-cold-h.out")" = 'SKIPPED hot: 39 statements not judged (--figures cold)' ] \
+  && [ "$(grep -c '^PASS .*concurrent qps' "$TMP/pub-fig-cold-h.out")" = 1 ] \
+  && [ "$coldc_code" = 1 ] \
+  && [ "$(pub_notes fig-cold-c MISS)" = 'statement 3 cold: measured 20.000 s, published 8.073 s, ratio 2.4774' ]; then
+  pass "--figures cold does not report a hot miss, exits on cold rows only, and says it skipped 39 hot rows"
+else
+  fail "published --figures cold" "exit $coldh_code/$coldc_code: $(grep -h '^MISS\|^SKIPPED' "$TMP/pub-fig-cold-h.out" "$TMP/pub-fig-cold-c.out")"
+fi
+
+# published_figures_bad_usage_refused. Catches: an empty, unknown, repeated or
+# twice-given --figures value accepted, or refused with an exit code other
+# than the 64 every other bad published usage gets, or after printing a table.
+figs_ok=1
+figs_why=""
+for bad in "" warm hot,hot hot, ,cold hot,cold,hot "hot cold" HOT; do
+  published fig-bad c6a.xlarge "$PUB_FIX/c6a.xlarge.json" --figures "$bad"
+  if [ "$code" != 64 ] || [ -s "$TMP/pub-fig-bad.out" ]; then
+    figs_ok=0
+    figs_why="$figs_why [value '$bad' exit $code]"
+  fi
+done
+published fig-bad c6a.xlarge "$PUB_FIX/c6a.xlarge.json" --figures hot --figures cold
+if [ "$code" != 64 ] || [ -s "$TMP/pub-fig-bad.out" ]; then
+  figs_ok=0
+  figs_why="$figs_why [given twice exit $code]"
+fi
+published fig-bad c6a.xlarge "$PUB_FIX/c6a.xlarge.json" --figures
+if [ "$code" != 64 ] || [ -s "$TMP/pub-fig-bad.out" ]; then
+  figs_ok=0
+  figs_why="$figs_why [no value exit $code]"
+fi
+if [ "$figs_ok" = 1 ]; then
+  pass "a --figures value that is empty, unknown, repeated or given twice is refused with exit 64"
+else
+  fail "published --figures bad usage" "$figs_why"
+fi
+
+# --- same box: arm O and concurrent windows (ADR-0954 M8) -------------------
+
+SB_FIX="$HERE/testdata/same-box"
+PUB_TRIES="$HERE/testdata/published/v0.28.0"
+
+# sb_note NAME VERDICT PREFIX: the notes of NAME's VERDICT rows that start
+# with PREFIX, one per line.
+sb_note() {
+  sed -n "s/^$2  .*  \($3.*\)\$/\1/p" "$TMP/pub-$1.out"
+}
+
+# unstable_reference_judged_against_arm_o. FLIP: statement 24's hot judged
+# against the published 3.727 s although its published tries 2 and 3 (9.644,
+# 3.727) differ by more than 1.10x (a MISS at 1.4492, exit 1), or arm O's hot
+# read as its try 1 or a mean rather than the best of tries 2 and 3 (9.600 s).
+# Its cold is still judged against the published cold.
+published sb-armo c6a.xlarge "$PUB_FIX/c6a.xlarge.json" \
+  --published-tries "$PUB_TRIES/c6a.xlarge.json" --arm-o "$SB_FIX/arm-o-c6a.xlarge.json"
+if [ "$code" = 0 ] \
+  && [ "$(sb_note sb-armo PASS 'statement 24 hot')" = 'statement 24 hot: measured 5.401 s, arm O 9.600 s, ratio 0.5626; published tries 2 and 3 9.644 s and 3.727 s differ by more than 1.1x' ] \
+  && [ "$(grep -c '  q24 hot_s <= 1.1 x published ' "$TMP/pub-sb-armo.out")" = 0 ] \
+  && [ "$(sb_note sb-armo PASS 'statement 24 cold')" = 'statement 24 cold: measured 7.905 s, published 10.474 s, ratio 0.7547' ]; then
+  pass "an unstable published hot is judged against arm O"
+else
+  fail "unstable reference arm O" "exit $code: $(grep '  q24 ' "$TMP/pub-sb-armo.out") $(head -c 300 "$TMP/pub-sb-armo.err")"
+fi
+
+# unstable_reference_without_arm_o_is_incomplete. FLIP: an unstable statement
+# with no arm O skipped or passed (exit 0), or judged against the published
+# hot anyway (exit 1): it is UNJUDGED and the run exits 4, incomplete.
+published sb-noarmo c6a.xlarge "$PUB_FIX/c6a.xlarge.json" \
+  --published-tries "$PUB_TRIES/c6a.xlarge.json"
+if [ "$code" = 4 ] \
+  && [ "$(sb_note sb-noarmo UNJUDGED 'statement 24 hot')" = 'statement 24 hot: unstable published reference, published tries 2 and 3 9.644 s and 3.727 s differ by more than 1.1x; no arm O' ] \
+  && ! grep -q '^MISS' "$TMP/pub-sb-noarmo.out" \
+  && ! grep -q '^PASS .*  q24 hot_s ' "$TMP/pub-sb-noarmo.out" \
+  && grep -qF 'run incomplete: q17, q21, q24, q25, q27, q28, q31, q38, q41, q42, q43 unjudged' "$TMP/pub-sb-noarmo.err"; then
+  pass "an unstable published hot without arm O is unjudged and the run incomplete"
+else
+  fail "unstable reference without arm O" "exit $code: $(grep '  q24 ' "$TMP/pub-sb-noarmo.out") $(head -c 300 "$TMP/pub-sb-noarmo.err")"
+fi
+
+# stable_statement_still_judged_against_published. FLIP: every statement
+# judged against arm O once --arm-o is given: statement 9's published tries
+# (3.52, 3.524) agree, so its 4.0 s hot misses 1.10 x the published 3.52 s
+# even though arm O's 5.0 s would pass it.
+pub_edit "$PUB_FIX/c6a.xlarge.json" sb-stable 'r["result"][8] = [11.0, 4.0, 4.1]'
+published sb-stable c6a.xlarge "$TMP/pub-sb-stable.json" \
+  --published-tries "$PUB_TRIES/c6a.xlarge.json" --arm-o "$SB_FIX/arm-o-c6a.xlarge.json"
+if [ "$code" = 1 ] \
+  && [ "$(sb_note sb-stable MISS 'statement')" = 'statement 9 hot: measured 4.000 s, published 3.520 s, ratio 1.1364' ] \
+  && [ "$(grep -c '  q09 hot_s <= 1.1 x arm O ' "$TMP/pub-sb-stable.out")" = 0 ]; then
+  pass "a stable statement is judged against published even with a slower arm O"
+else
+  fail "stable statement published" "exit $code: $(grep '  q09 ' "$TMP/pub-sb-stable.out") $(head -c 300 "$TMP/pub-sb-stable.err")"
+fi
+
+# same_box_qps_passes_at_095. FLIP: the same-box bar made exclusive, or the
+# published QPS gate still applied beside it (c6a.2xlarge's 0.362 misses 0.90
+# x 0.478): mean new 0.475 over mean old 0.500 is exactly 0.95 and passes,
+# and the published comparison is REPORTED, not gated.
+published sb-095 c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$SB_FIX/qps-ab-095.log"
+if [ "$code" = 0 ] \
+  && [ "$(sb_note sb-095 PASS 'same-box qps')" = 'same-box qps: new (2 windows) over old v0.28.0 (2 windows), mean 0.4750 over 0.5000, ratio 0.9500' ] \
+  && [ "$(sb_note sb-095 PASS 'same-box error ratio')" = 'same-box error ratio: new (2 windows) over old v0.28.0 (2 windows), mean 0.0200 over 0.0200, ratio 1.0000' ] \
+  && [ "$(sb_note sb-095 REPORTED 'concurrent qps')" = 'concurrent qps: mean new 0.475, published 0.478, ratio 0.9937; not gated' ] \
+  && [ "$(grep -c 'concurrent qps: measured' "$TMP/pub-sb-095.out")" = 0 ]; then
+  pass "same-box QPS at exactly 0.95 passes and replaces the published QPS gate"
+else
+  fail "same-box qps 0.95" "exit $code: $(grep -i 'concurrent' "$TMP/pub-sb-095.out") $(head -c 300 "$TMP/pub-sb-095.err")"
+fi
+
+# same_box_qps_fails_at_094. FLIP: the same-box bar taken as the published
+# factor 0.90 rather than 0.95: mean new 0.470 over mean old 0.500 is 0.94.
+published sb-094 c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$SB_FIX/qps-ab-094.log"
+if [ "$code" = 1 ] \
+  && [ "$(sb_note sb-094 MISS 'same-box')" = 'same-box qps: new (2 windows) over old v0.28.0 (2 windows), mean 0.4700 over 0.5000, ratio 0.9400' ]; then
+  pass "same-box QPS at 0.94 misses"
+else
+  fail "same-box qps 0.94" "exit $code: $(grep 'same-box' "$TMP/pub-sb-094.out") $(head -c 300 "$TMP/pub-sb-094.err")"
+fi
+
+# higher_error_ratio_fails. FLIP: the error ratio printed and not gated:
+# QPS is level (ratio 1.0000) and mean new error ratio 0.0410 is above old's
+# 0.0400, so the run misses on that row alone.
+published sb-err c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$SB_FIX/qps-ab-higher-err.log"
+if [ "$code" = 1 ] \
+  && [ "$(sb_note sb-err PASS 'same-box')" = 'same-box qps: new (2 windows) over old v0.28.0 (2 windows), mean 0.5000 over 0.5000, ratio 1.0000' ] \
+  && [ "$(sb_note sb-err MISS '')" = 'same-box error ratio: new (2 windows) over old v0.28.0 (2 windows), mean 0.0410 over 0.0400, ratio 1.0250' ]; then
+  pass "a higher same-box error ratio misses"
+else
+  fail "same-box error ratio" "exit $code: $(grep 'same-box' "$TMP/pub-sb-err.out") $(head -c 300 "$TMP/pub-sb-err.err")"
+fi
+
+# one_window_per_arm_is_refused. FLIP: the minimum window count dropped, so
+# one window per arm (new 0.600 over old 0.500, ratio 1.2) is judged a pass
+# instead of refused with exit 2.
+published sb-one c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$SB_FIX/qps-ab-one-window.log"
+if [ "$code" = 2 ] && [ ! -s "$TMP/pub-sb-one.out" ] \
+  && grep -qF 'qps-ab-one-window.log: arm old has 1 window(s), and the gate needs at least 2' "$TMP/pub-sb-one.err"; then
+  pass "one window per arm is refused"
+else
+  fail "same-box one window" "exit $code: $(head -c 300 "$TMP/pub-sb-one.out") $(head -c 300 "$TMP/pub-sb-one.err")"
+fi
+
+# malformed_windows_are_refused. FLIP: a non-numeric or missing figure read
+# as zero or skipped, or an arm name the log never holds judged as empty;
+# each exits 2 naming the problem.
+mw_ok=1
+mw_why=""
+for c in nonnum missing arm; do
+  case "$c" in
+    nonnum) printf 'window=1 arm=old qps=0.5 err_ratio=0.02\nwindow=2 arm=new qps=fast err_ratio=0.02\nwindow=3 arm=new qps=0.5 err_ratio=0.02\nwindow=4 arm=old qps=0.5 err_ratio=0.02\n' ;;
+    missing) printf 'window=1 arm=old qps=0.5 err_ratio=0.02\nwindow=2 arm=new qps=0.5\nwindow=3 arm=new qps=0.5 err_ratio=0.02\nwindow=4 arm=old qps=0.5 err_ratio=0.02\n' ;;
+    arm) cat "$SB_FIX/qps-ab-095.log" ;;
+  esac >"$TMP/sb-mw-$c.log"
+  case "$c" in
+    nonnum) want='sb-mw-nonnum.log:2: qps=fast is not a number'; extra=() ;;
+    missing) want='sb-mw-missing.log:2: no err_ratio figure'; extra=() ;;
+    arm) want='sb-mw-arm.log: no window of arm stock (arms: new, old)'; extra=(--new-arm stock) ;;
+  esac
+  published "sb-mw-$c" c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$TMP/sb-mw-$c.log" ${extra[@]+"${extra[@]}"}
+  if [ "$code" != 2 ] || [ -s "$TMP/pub-sb-mw-$c.out" ] || ! grep -qF "$want" "$TMP/pub-sb-mw-$c.err"; then
+    mw_ok=0
+    mw_why="$mw_why $c: exit $code $(head -c 200 "$TMP/pub-sb-mw-$c.err");"
+  fi
+done
+if [ "$mw_ok" = 1 ]; then
+  pass "a windows log with a non-numeric or missing figure or an unseen arm is refused"
+else
+  fail "same-box malformed windows" "$mw_why"
+fi
+
+# new_arm_old_is_refused. FLIP: without the refusal, --new-arm old compares
+# the v0.28.0 windows with themselves, ratio 1.0, and the M7 c6a.2xlarge log
+# that misses at 0.7677 passes with exit 0.
+printf 'window=1 arm=old qps=0.488 err_ratio=0.191\nwindow=2 arm=new qps=0.380 err_ratio=0.106\nwindow=3 arm=new qps=0.380 err_ratio=0.073\nwindow=4 arm=old qps=0.502 err_ratio=0.164\n' >"$TMP/sb-self.log"
+published sb-self c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$TMP/sb-self.log" --new-arm old
+if [ "$code" = 2 ] && grep -qF 'names the v0.28.0 arm itself' "$TMP/pub-sb-self.err"; then
+  pass "--new-arm old is refused"
+else
+  fail "same-box new arm old" "exit $code: $(head -c 300 "$TMP/pub-sb-self.out") $(head -c 300 "$TMP/pub-sb-self.err")"
+fi
+
+# zero_old_qps_is_refused. FLIP: without the refusal, an old arm that measured
+# zero QPS in every window leaves no baseline, and the 0 >= 0.95 x 0 test passes.
+printf 'window=1 arm=old qps=0 err_ratio=1.0\nwindow=2 arm=new qps=0 err_ratio=1.0\nwindow=3 arm=new qps=0 err_ratio=1.0\nwindow=4 arm=old qps=0 err_ratio=1.0\n' >"$TMP/sb-zero.log"
+published sb-zero c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$TMP/sb-zero.log"
+if [ "$code" = 2 ] && grep -qF 'measured zero QPS in every window' "$TMP/pub-sb-zero.err"; then
+  pass "an old arm with zero QPS is refused"
+else
+  fail "same-box zero old qps" "exit $code: $(head -c 300 "$TMP/pub-sb-zero.out") $(head -c 300 "$TMP/pub-sb-zero.err")"
+fi
+
+# m7_2xlarge_figures_fail. FLIP: the same-box ratio taken old over new (1.3026,
+# a pass): M7's c6a.2xlarge figures, new 0.380 and 0.380 over old 0.488 and
+# 0.502, are 0.7677 and miss.
+published sb-m7 c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$SB_FIX/qps-ab-m7-2xlarge.log"
+if [ "$code" = 1 ] \
+  && [ "$(sb_note sb-m7 MISS 'same-box')" = 'same-box qps: new (2 windows) over old v0.28.0 (2 windows), mean 0.3800 over 0.4950, ratio 0.7677' ] \
+  && [ -n "$(sb_note sb-m7 PASS 'same-box error ratio')" ]; then
+  pass "M7's c6a.2xlarge same-box figures miss at 0.7677"
+else
+  fail "same-box m7" "exit $code: $(grep 'same-box' "$TMP/pub-sb-m7.out") $(head -c 300 "$TMP/pub-sb-m7.err")"
+fi
+
+# m8a_off_arm_passes_as_new. FLIP: --new-arm ignored, or the log's other arm
+# (stock) pooled into the judged one: arm off, 0.462 and 0.453 over old 0.450
+# and 0.440, passes QPS at 1.0281, and its error ratio 0.1515 over 0.1395
+# misses, so the run exits 1 on that row alone.
+published sb-m8a c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" \
+  --qps-windows "$SB_FIX/qps-arms-m8a.log" --new-arm off
+if [ "$code" = 1 ] \
+  && [ "$(sb_note sb-m8a PASS 'same-box')" = 'same-box qps: off (2 windows) over old v0.28.0 (2 windows), mean 0.4575 over 0.4450, ratio 1.0281' ] \
+  && [ "$(sb_note sb-m8a MISS '')" = 'same-box error ratio: off (2 windows) over old v0.28.0 (2 windows), mean 0.1515 over 0.1395, ratio 1.0860' ] \
+  && [ "$(sb_note sb-m8a REPORTED 'concurrent qps')" = 'concurrent qps: mean off 0.458, published 0.478, ratio 0.9571; not gated' ]; then
+  pass "arm off judged as the new arm passes QPS and misses the error ratio"
+else
+  fail "same-box m8a off" "exit $code: $(grep -i 'same-box\|REPORTED' "$TMP/pub-sb-m8a.out") $(head -c 300 "$TMP/pub-sb-m8a.err")"
+fi
+
+# --- GCP: check-run, kit.py helpers, launch-gcp.sh, its user-data, ---------
+# --- box/run.sh on GCS, fetch-gcp.sh and teardown-gcp.sh --------------------
+
+GCP_SA=ravel-clickbench@kit-test-project.iam.gserviceaccount.com
+mkdir -p "$STUB_DIR/release"
+for a in amd64 arm64; do
+  cp "$BINSTUBS/ravel-server" "$STUB_DIR/release/ravel-server-linux-$a"
+  cp "$BINSTUBS/ravel-cli" "$STUB_DIR/release/ravel-cli-linux-$a"
+done
+(cd "$STUB_DIR/release" && sha256sum ravel-* >SHA256SUMS && echo sig >SHA256SUMS.sig && echo pem >SHA256SUMS.pem)
+GCP_SERVER_SHA="$(sha256sum "$BINSTUBS/ravel-server" | cut -d' ' -f1)"
+GCP_CLI_SHA="$(sha256sum "$BINSTUBS/ravel-cli" | cut -d' ' -f1)"
+
+# A pre-registration every stub run's figures satisfy.
+GCP_PREREG="$TMP/prereg-gcp.toml"
+cat >"$GCP_PREREG" <<EOF
+[figures]
+rows_written = 99997497
+count_star = 99997497
+statements_answered = 43
+null_tries = 0
+benchmark_error_ratio = 0
+data_size_bytes = [1, 100000]
+l0_objects = 100
+l0_objects_minus_objects_written = 0
+fold_entries_minus_objects_written = 0
+declared_columns = 104
+load_time_s = [0, 120]
+cold_sum_s = [10, 40]
+hot_sum_s = [10, 40]
+concurrent_qps = [0, 100000]
+concurrent_error_ratio = [0, 1]
+store = "gcs"
+store_identity = "gs://{store_bucket}"
+fold_precondition = "met"
+fetch_policy = "cost-based"
+fetch_policy_source = "default"
+binary_source = "release"
+release_tag = "v9.9.9"
+ravel_server_sha256 = "$GCP_SERVER_SHA"
+ravel_cli_sha256 = "$GCP_CLI_SHA"
+machine = "c2d-highcpu-16"
+EOF
+
+# write_gcp_toml FILE: a GCP run.toml for the stubs.
+write_gcp_toml() {
+  cat >"$1" <<EOF
+cloud = "gcp"
+store = "gcs"
+release_tag = "v9.9.9"
+release_url = "https://release.invalid"
+sha_a = "$SHA_A"
+ravel_server_sha256 = "$GCP_SERVER_SHA"
+ravel_cli_sha256 = "$GCP_CLI_SHA"
+phases = ["benchmark", "concurrent"]
+concurrent_rounds = 1
+concurrent_connections = 2
+concurrent_duration_s = 1
+project = "kit-test-project"
+region = "us-central1"
+zone = "us-central1-a"
+instance_type = "c2d-highcpu-16"
+image_family = "rocky-linux-9-optimized-gcp"
+image_project = "rocky-linux-cloud"
+service_account = "$GCP_SA"
+bucket = "kit-test-gcs-bucket"
+prefix = "clickbench-kit"
+store_bucket_prefix = "kit-test-cb"
+tenant = "clickbench-v4"
+shards = 8
+corpus = "benchmarks/clickbench/hits.corpus.json"
+mapping = "benchmarks/clickbench/hits.mapping.toml"
+dataset_url = "https://example.invalid/hits.parquet"
+dataset_sha256 = "$DATASET_SHA"
+rows_expected = 99997497
+memory_budget_bytes = 25769803776
+audit_mode = "off"
+prereg = "$GCP_PREREG"
+EOF
+}
+GCP_TOML="$TMP/run-gcp.toml"
+write_gcp_toml "$GCP_TOML"
+
+# gcp_run_case NAME SED WANT [FILE]: kit.py check-run on a copy of the GCP
+# run.toml (or FILE) edited by SED must exit 2 with WANT in its message.
+gcp_run_case() {
+  local name="$1" edit="$2" want="$3" src="${4:-$GCP_TOML}" code=0
+  sed "$edit" "$src" >"$TMP/gcp-run-case.toml"
+  python3 "$KIT_SRC/lib/kit.py" check-run "$TMP/gcp-run-case.toml" >/dev/null 2>"$TMP/gcp-run-case.err" || code=$?
+  if [ "$code" = 2 ] && grep -qF -- "$want" "$TMP/gcp-run-case.err"; then
+    pass "check-run refuses $name, naming it"
+  else
+    fail "check-run $name" "exit $code: $(head -c 300 "$TMP/gcp-run-case.err")"
+  fi
+}
+# Catches: the GCP run.toml itself refused, so every case below tests nothing.
+if python3 "$KIT_SRC/lib/kit.py" check-run "$GCP_TOML" >/dev/null 2>"$TMP/gcp-check.err"; then
+  pass "check-run accepts a cloud gcp run.toml"
+else
+  fail "check-run gcp" "$(head -c 300 "$TMP/gcp-check.err")"
+fi
+# Catches: an AWS-only key silently ignored on GCP, where one arm runs a
+# release: a second arm, a lane, or RustFS.
+gcp_run_case "sha_b under cloud gcp" '/^sha_a = /a\
+sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' 'unknown key(s) or table(s) for cloud gcp: sha_b'
+gcp_run_case "lanes under cloud gcp" '/^phases = /a\
+lanes = ["rlog"]' 'unknown key(s) or table(s) for cloud gcp: lanes'
+gcp_run_case "store rustfs under cloud gcp" 's/^store = .*/store = "rustfs"/' 'cloud gcp runs store gcs, got store'
+# Catches: an AWS run.toml asking for the GCS store it cannot run.
+gcp_run_case "store gcs under cloud aws" '/^shards = /i\
+store = "gcs"' 'cloud aws runs store rustfs, got store' "$RUN_TOML"
+# Catches: a zone outside the region, which puts the box and the buckets in
+# different regions.
+gcp_run_case "a zone outside the region" 's/^zone = .*/zone = "europe-west1-b"/' 'is not in region us-central1'
+# Catches: an --s3-* flag reaching a --store gcs server, which refuses it at
+# startup after the load.
+gcp_run_case "an S3 flag in server_flags_a" '/^shards = /i\
+server_flags_a = ["--s3-endpoint", "http://x"]' 'which --store gcs refuses'
+gcp_run_case "a 20 GB boot disk" '/^shards = /i\
+boot_disk_gb = 20' 'boot_disk_gb must be a whole number of at least 50'
+gcp_run_case "a missing release digest" '/^ravel_cli_sha256 = /d' 'missing required key(s): ravel_cli_sha256'
+# Catches: a GCP run naming the perf phase accepted at launch and failing on
+# the box, which installs no perf, after the load and the benchmark.
+gcp_run_case "phase perf under cloud gcp" 's/^phases = .*/phases = ["benchmark", "perf"]/;/^shards = /i\
+perf_record = true' 'phase perf (and perf_record = true) is not supported on cloud gcp'
+gcp_run_case "perf_record true under cloud gcp" '/^shards = /i\
+perf_record = true' 'phase perf (and perf_record = true) is not supported on cloud gcp'
+
+# Catches: the declared-column check counting an f64 mapping entry, which
+# typed-attr-column set skips, so a correct declaration fails after the load.
+printf '%s\n' '[ts_column]' 'column = "EventTime"' '[[resource_attribute]]' 'key = "A"' 'type = "i64"' \
+  '[[attribute]]' 'key = "B"' 'type = "f64"  # skipped' '[[attribute]]' 'key = "C"' 'type = "str"' \
+  >"$TMP/mapping-f64.toml"
+mc="$(python3 "$KIT_SRC/lib/kit.py" mapping-columns "$TMP/mapping-f64.toml")"
+mc_hits="$(python3 "$KIT_SRC/lib/kit.py" mapping-columns "$REPO_ROOT/benchmarks/clickbench/hits.mapping.toml")"
+if [ "$mc" = 2 ] && [ "$mc_hits" = 104 ]; then
+  pass "mapping-columns counts every entry but an f64 one"
+else
+  fail "mapping-columns" "fixture '$mc' (want 2), hits.mapping.toml '$mc_hits' (want 104)"
+fi
+
+# Catches: a page token sent raw (a base64 token holds + / =), the last page
+# read as having another, or a key listed twice counted twice.
+printf '{"items": [], "nextPageToken": "a+b/c="}' >"$TMP/page-a.json"
+printf '{"items": []}' >"$TMP/page-b.json"
+printf '{"items": [{"name": "t/h1/l/l0/x", "size": "10"}, {"name": "sys/qualify/p/1", "size": "2"}]}' >"$TMP/page-c.json"
+printf '{"items": [{"name": "t/h1/l/c/x", "size": "3"}, {"name": "t/h1/l/l0/x", "size": "10"}]}' >"$TMP/page-d.json"
+printf '{"items": [{"name": "t/h1/l/c/x", "size": "3"}, {"name": "t/h1/l/prov", "size": "4"}]}' >"$TMP/page-e.json"
+tok="$(python3 "$KIT_SRC/lib/kit.py" gcs-next-page "$TMP/page-a.json")"
+last="$(python3 "$KIT_SRC/lib/kit.py" gcs-next-page "$TMP/page-b.json")"
+fp="$(python3 "$KIT_SRC/lib/kit.py" footprint "$TMP/page-c.json" "$TMP/page-e.json" | python3 -c 'import json, sys
+d = json.load(sys.stdin); t = d["tenants"]["h1"]
+print(d["objects"], d["bytes"], t["objects"], t["bytes"], t["classes"]["l/l0"]["objects"], t["classes"]["l/c"]["bytes"], t["classes"]["l/prov"]["objects"], d["sys"]["sys/qualify"]["objects"])')"
+code=0
+python3 "$KIT_SRC/lib/kit.py" footprint "$TMP/page-c.json" "$TMP/page-d.json" >/dev/null 2>"$TMP/fp-dup.err" || code=$?
+if [ "$tok" = 'a%2Bb%2Fc%3D' ] && [ -z "$last" ] && [ "$fp" = "4 19 3 17 1 3 1 1" ] \
+  && [ "$code" = 2 ] && grep -q 't/h1/l/l0/x is listed twice' "$TMP/fp-dup.err"; then
+  pass "objects.list paging encodes the token, ends on the last page, and footprint splits keys by tenant and class"
+else
+  fail "gcs listing helpers" "token '$tok', last '$last', footprint '$fp', duplicate exit $code"
+fi
+
+# Catches: a load window read from a progress.log that stamps a step twice,
+# which would time whichever line came last.
+printf '%s\n' '2026-11-12T10:00:00Z step=load state=start' '2026-11-12T10:10:00Z step=load state=done' \
+  '2026-11-12T10:10:01Z step=compact state=start' '2026-11-12T10:10:02Z step=compact state=done' \
+  '2026-11-12T10:10:02Z step=fold state=start' '2026-11-12T10:10:05Z step=fold state=done' \
+  '2026-11-12T10:10:05Z step=declare state=start' '2026-11-12T10:10:06Z step=declare state=done' >"$TMP/lw.log"
+lw="$(python3 "$KIT_SRC/lib/kit.py" load-window "$TMP/lw.log")"
+{ cat "$TMP/lw.log"; echo '2026-11-12T10:20:00Z step=load state=start'; } >"$TMP/lw-dup.log"
+code=0
+python3 "$KIT_SRC/lib/kit.py" load-window "$TMP/lw-dup.log" >/dev/null 2>"$TMP/lw-dup.err" || code=$?
+if [ "$lw" = '{"steps": {"compact": 1, "declare": 1, "fold": 3, "load": 600}, "total_s": 605}' ] \
+  && [ "$code" = 2 ] && grep -q 'carries `step=load state=start` 2 times, not once' "$TMP/lw-dup.err"; then
+  pass "the load window sums the load, compact, fold and declare steps and refuses a step stamped twice"
+else
+  fail "load window" "'$lw', duplicate exit $code: $(head -c 200 "$TMP/lw-dup.err")"
+fi
+
+# launch_gcp ARGS...: launch-gcp.sh with git answering for the tag.
+launch_gcp() {
+  PATH="$GITSTUBS:$PATH" STUB_TAG_SHA="${STUB_TAG_SHA-$SHA_A}" bash "$KIT_SRC/launch-gcp.sh" "$@"
+}
+
+# Catches: setup-gcp.sh --dry-run stating the objectAdmin grant as done when
+# it only printed the change; a real run must still state it.
+reset_log
+code=0
+bash "$KIT_SRC/setup-gcp.sh" --dry-run "$GCP_TOML" >"$TMP/gsetup-dry.out" 2>"$TMP/gsetup-dry.err" || code=$?
+if [ "$code" = 0 ] && ! grep -q ' has roles/storage.objectAdmin' "$TMP/gsetup-dry.out" \
+  && grep -q 'dry run, nothing granted: .* would get roles/storage.objectAdmin on gs://kit-test-gcs-bucket' "$TMP/gsetup-dry.out" \
+  && grep -q '^DRY-RUN: gcloud storage buckets add-iam-policy-binding' "$TMP/gsetup-dry.err" \
+  && ! grep -q 'add-iam-policy-binding' "$STUB_LOG"; then
+  pass "setup-gcp --dry-run prints the grant as a planned change and does not state it as done"
+else
+  fail "setup-gcp dry run" "exit $code: $(tr '\n' ';' <"$TMP/gsetup-dry.out" | head -c 300)"
+fi
+reset_log
+code=0
+bash "$KIT_SRC/setup-gcp.sh" "$GCP_TOML" >"$TMP/gsetup.out" 2>"$TMP/gsetup.err" || code=$?
+if [ "$code" = 0 ] && grep -q " has roles/storage.objectAdmin on gs://kit-test-gcs-bucket" "$TMP/gsetup.out" \
+  && grep -q 'add-iam-policy-binding gs://kit-test-gcs-bucket' "$STUB_LOG"; then
+  pass "setup-gcp states the grant after it made it"
+else
+  fail "setup-gcp" "exit $code: $(tr '\n' ';' <"$TMP/gsetup.out" | head -c 300) $(head -c 300 "$TMP/gsetup.err")"
+fi
+rm -rf "$FAKE_GCS/kit-test-gcs-bucket"
+
+# Catches: a dry run that reaches gcloud, or a create that drops the 590
+# minute DELETE, the service account, the boot disk size or the label; or a
+# user-data without the guest shutdown, the reboot guard, the digest checks,
+# the cloud and store bucket files or the systemd unit.
+reset_log
+code=0
+launch_gcp --dry-run "$GCP_TOML" >"$TMP/gdry.out" 2>"$TMP/gdry.err" || code=$?
+grun="$(sed -n 's/^run id: *//p' "$TMP/gdry.out")"
+create="$(grep '^DRY-RUN: gcloud compute instances create' "$TMP/gdry.err" | tr -d '\\')"
+ud="$(sed -n '/^DRY-RUN user-data A:$/,/^DRY-RUN end user-data A$/p' "$TMP/gdry.err")"
+ok=1
+for want in '--max-run-duration 35400s' '--instance-termination-action DELETE' '--no-restart-on-failure' \
+  "--service-account $GCP_SA" '--scopes cloud-platform' '--boot-disk-size 100GB' '--machine-type c2d-highcpu-16' \
+  "ravel-clickbench-run=$(printf '%s' "$grun" | tr 'A-Z' 'a-z')"; do
+  case "$create" in *"$want"*) ;; *) ok=0; echo "  instances create lacks: $want" ;; esac
+done
+for want in 'shutdown -h +600' '[ ! -e "$KIT/BOOTED" ] || fail "reboot' 'sha256sum -c kit.sha256' \
+  'sha256sum -c SHA256SUMS' "printf '%s\\n' gcp >\"\$KIT/CLOUD\"" "printf '%s\\n' A >\"\$KIT/ARM\"" \
+  'systemd-run --unit=ravel-clickbench-kit' "OUT=kit-test-gcs-bucket/clickbench-kit/runs/$grun/out/A"; do
+  case "$ud" in *"$want"*) ;; *) ok=0; echo "  user-data lacks: $want" ;; esac
+done
+if [ "$code" = 0 ] && [ -n "$grun" ] && [ "$ok" = 1 ] && [ ! -s "$STUB_LOG" ] \
+  && grep -q '^DRY-RUN: gcloud compute instances add-iam-policy-binding .*roles/compute.instanceAdmin.v1' "$TMP/gdry.err" \
+  && grep -q '^DRY-RUN: gcloud storage buckets create gs://kit-test-cb-.*--uniform-bucket-level-access --soft-delete-duration 0' "$TMP/gdry.err"; then
+  pass "launch-gcp dry run prints the bucket, the self-deleting instance and the user-data, and calls nothing"
+  if grep -q '^launch-gcp: dry run, nothing was created' "$TMP/gdry.out" \
+    && grep -q '^DRY-RUN: gcloud compute machine-types describe c2d-highcpu-16 ' "$TMP/gdry.err"; then
+    pass "launch-gcp dry run says nothing was created and prints the machine type lookup"
+  else
+    fail "launch-gcp dry run notice" "stdout: $(head -c 300 "$TMP/gdry.out")"
+  fi
+else
+  fail "launch-gcp dry run" "exit $code, run id '$grun', calls: $(tr '\n' ';' <"$STUB_LOG" | head -c 300)"
+fi
+GDRY_STAGE="$(sed -n 's/^launch-gcp: staged in\/ files kept in //p' "$TMP/gdry.err")"
+[ -z "$GDRY_STAGE" ] || rm -rf "$GDRY_STAGE"
+
+# gcp_refusal NAME WANT_CODE WANT FILE [ENV=VALUE...]: launch-gcp.sh on FILE
+# must exit WANT_CODE naming WANT, and create no bucket and no instance.
+gcp_refusal() {
+  local name="$1" want_code="$2" want="$3" file="$4" code=0
+  shift 4
+  reset_log
+  env STUB_TAG_SHA="$SHA_A" "$@" PATH="$GITSTUBS:$PATH" bash "$KIT_SRC/launch-gcp.sh" "$file" \
+    >/dev/null 2>"$TMP/grefuse.err" || code=$?
+  if [ "$code" = "$want_code" ] && grep -qF -- "$want" "$TMP/grefuse.err" \
+    && ! grep -q 'buckets create\|instances create\|storage cp' "$STUB_LOG"; then
+    pass "launch-gcp refuses $name with exit $want_code before creating anything"
+  else
+    fail "launch-gcp $name" "exit $code: $(head -c 300 "$TMP/grefuse.err"); calls: $(tr '\n' ';' <"$STUB_LOG" | head -c 300)"
+  fi
+}
+# Catches: a release whose SHA256SUMS signature does not verify launched anyway.
+gcp_refusal "an unverified SHA256SUMS" 64 'does not verify against its signature' "$GCP_TOML" STUB_COSIGN_FAIL=1
+# Catches: a pinned digest the release does not list.
+sed 's/^ravel_cli_sha256 = .*/ravel_cli_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"/' \
+  "$GCP_TOML" >"$TMP/gcp-baddigest.toml"
+gcp_refusal "a pinned digest the release does not list" 64 'lists ravel-cli-linux-amd64 as' "$TMP/gcp-baddigest.toml"
+# Catches: a tag naming another commit than sha_a, so provenance would carry
+# the wrong SHA.
+gcp_refusal "a tag on another commit" 64 'run.toml'"'"'s sha_a is' "$GCP_TOML" \
+  STUB_TAG_SHA=cccccccccccccccccccccccccccccccccccccccc
+# Catches: a mapping that is not the release's, declaring other columns.
+printf '# another mapping\n' >"$TMP/other-mapping.toml"
+gcp_refusal "a mapping other than the tag's" 64 "differs from v9.9.9's" "$GCP_TOML" \
+  STUB_TAG_MAPPING="$TMP/other-mapping.toml"
+# Catches: a box launched with no write access to the results bucket, which
+# could never upload DONE.
+gcp_refusal "a service account without objectAdmin on the results bucket" 65 'lacks roles/storage.objectAdmin' \
+  "$GCP_TOML" STUB_NO_GRANT=1
+gcp_refusal "a missing service account" 65 'does not exist or cannot be read' "$GCP_TOML" STUB_NO_SA=1
+# Catches: an arm64 machine type reaching a box whose release step has no
+# pinned digest for it; a lookup that fails launching anyway.
+gcp_refusal "an arm64 machine type" 64 'machine type c2d-highcpu-16 reports architecture ARM64; only linux-amd64 release artifacts are pinned' \
+  "$GCP_TOML" STUB_MACHINE_ARCH=ARM64
+gcp_refusal "a machine type reporting an unknown architecture" 64 'machine type c2d-highcpu-16 reports architecture RISCV64; only linux-amd64' \
+  "$GCP_TOML" STUB_MACHINE_ARCH=RISCV64
+gcp_refusal "a machine type lookup that fails" 64 'cannot tell the architecture of machine type c2d-highcpu-16' \
+  "$GCP_TOML" STUB_GCLOUD_FAIL=machine-type
+# Catches: an explicit X86_64 answer refused.
+reset_log
+code=0
+STUB_MACHINE_ARCH=X86_64 launch_gcp "$GCP_TOML" >/dev/null 2>"$TMP/gx86.err" || code=$?
+if [ "$code" = 0 ] && grep -q 'gcloud compute instances create' "$STUB_LOG"; then
+  pass "launch-gcp launches a machine type GCE reports as X86_64"
+else
+  fail "launch-gcp X86_64 machine type" "exit $code: $(tail -n 3 "$TMP/gx86.err")"
+fi
+rm -f "$STUB_DIR"/gce/*
+rm -rf "$FAKE_GCS"/kit-test-cb-*
+
+# Catches: a pre-registration missing a figure reaching a launch.
+grep -v '^hot_sum_s = ' "$GCP_PREREG" >"$TMP/prereg-short.toml"
+sed "s#^prereg = .*#prereg = \"$TMP/prereg-short.toml\"#" "$GCP_TOML" >"$TMP/gcp-short.toml"
+gcp_refusal "a pre-registration without hot_sum_s" 64 'not pre-registered: hot_sum_s' "$TMP/gcp-short.toml"
+
+# Catches: a failed instance create leaving the run's store bucket behind.
+reset_log
+code=0
+STUB_GCLOUD_FAIL=create launch_gcp "$GCP_TOML" >/dev/null 2>"$TMP/gcreate.err" || code=$?
+if [ "$code" = 1 ] && grep -q 'gcloud storage rm --recursive gs://kit-test-cb-' "$STUB_LOG" \
+  && [ -z "$(ls "$FAKE_GCS" | grep '^kit-test-cb-')" ] && [ -z "$(ls "$STUB_DIR/gce")" ]; then
+  pass "a failed instance create deletes the store bucket it made"
+else
+  fail "failed create cleanup" "exit $code: $(tail -n 3 "$TMP/gcreate.err")"
+fi
+# Catches: a box left without the binding it deletes itself with, running
+# until the max run duration.
+reset_log
+code=0
+STUB_GCLOUD_FAIL=binding launch_gcp "$GCP_TOML" >/dev/null 2>"$TMP/gbind.err" || code=$?
+if [ "$code" = 1 ] && grep -q 'gcloud compute instances delete ravel-clickbench-' "$STUB_LOG" \
+  && [ -z "$(ls "$STUB_DIR/gce")" ] && [ -z "$(ls "$FAKE_GCS" | grep '^kit-test-cb-')" ]; then
+  pass "a failed self-delete binding deletes the instance and the store bucket"
+else
+  fail "failed binding cleanup" "exit $code: $(tail -n 3 "$TMP/gbind.err")"
+fi
+
+# The real launch every GCP box case below boots from. Catches: in/ missing a
+# file, a kit.tgz without the mapping or the pre-registration, a signature
+# checked against another identity, or a binding with the wrong role.
+reset_log
+code=0
+launch_gcp "$GCP_TOML" >"$TMP/glaunch.out" 2>"$TMP/glaunch.err" || code=$?
+GCP_RUN_ID="$(sed -n 's/^run id: *//p' "$TMP/glaunch.out")"
+GCP_STORE="$(sed -n 's/^store bucket: *gs:\/\///p' "$TMP/glaunch.out")"
+GCP_INSTANCE="$(sed -n 's/^instance: *\([^ ]*\) .*/\1/p' "$TMP/glaunch.out")"
+GCP_RUN_DIR="$FAKE_GCS/kit-test-gcs-bucket/clickbench-kit/runs/$GCP_RUN_ID"
+tar_list="$(tar -tzf "$GCP_RUN_DIR/in/kit.tgz" 2>/dev/null | grep -v '/$' | LC_ALL=C sort | tr '\n' ' ')"
+if [ "$code" = 0 ] && [ -f "$GCP_RUN_DIR/in/kit.sha256" ] && [ -f "$GCP_RUN_DIR/in/run.toml" ] \
+  && [ "$tar_list" = "kit/SHA256SUMS kit/box/run.sh kit/corpus.json kit/lib/kit.py kit/mapping.toml kit/prereg.toml " ] \
+  && [ -d "$FAKE_GCS/$GCP_STORE" ] && [ -f "$STUB_DIR/gce/$GCP_INSTANCE" ] \
+  && grep -q "^cosign verify-blob .*--certificate-identity https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml@refs/tags/v9.9.9 " "$STUB_LOG" \
+  && grep -q "gcloud storage buckets add-iam-policy-binding gs://$GCP_STORE .*serviceAccount:$GCP_SA --role roles/storage.objectAdmin" "$STUB_LOG" \
+  && grep -q "gcloud compute instances add-iam-policy-binding $GCP_INSTANCE .*serviceAccount:$GCP_SA --role roles/compute.instanceAdmin.v1" "$STUB_LOG"; then
+  pass "launch-gcp uploads in/, makes the store bucket and the instance, and lets the box delete only itself"
+else
+  fail "launch-gcp" "exit $code, run id '$GCP_RUN_ID', kit.tgz holds '$tar_list': $(tail -n 3 "$TMP/glaunch.err")"
+fi
+# Catches: the check refusing an x86 type (the stub answers empty, as GCE
+# does), or a launch that never asked GCE, and an instance created before the
+# answer came.
+if [ "$code" = 0 ] && grep -q '^gcloud compute machine-types describe c2d-highcpu-16 ' "$STUB_LOG" \
+  && [ "$(grep -n '^gcloud compute machine-types describe' "$STUB_LOG" | head -n 1 | cut -d: -f1)" -lt "$(grep -n '^gcloud compute instances create' "$STUB_LOG" | head -n 1 | cut -d: -f1)" ]; then
+  pass "launch-gcp asks GCE for the machine type's architecture before it creates anything, and launches an x86 one"
+else
+  fail "launch-gcp x86_64 machine type" "exit $code: $(tr '\n' ';' <"$STUB_LOG" | head -c 300)"
+fi
+cp "$STUB_DIR/startup-$GCP_INSTANCE" "$TMP/startup-gcp"
+
+export KIT_GCE_METADATA=http://gce-md.invalid/computeMetadata/v1 KIT_GCS_API=https://gcs.invalid \
+  KIT_GCE_API=https://gce.invalid/compute/v1
+
+# gcp_boot BOX [KEEP]: run the startup script with /root/kit moved to BOX/kit;
+# KEEP=keep boots again on BOX as it is, as a reboot would.
+gcp_boot() {
+  local box="$1"
+  [ "${2:-}" = keep ] || { rm -rf "$box"; mkdir -p "$box"; }
+  sed "s#^KIT=/root/kit\$#KIT=$box/kit#" "$TMP/startup-gcp" >"$box/startup.sh"
+  bash "$box/startup.sh"
+}
+
+# Catches: a startup script that starts run.sh without the kit, run.toml,
+# arm, cloud or store bucket in place, or without arming the guest shutdown.
+reset_log
+GBOX_UD="$TMP/gbox-ud"
+code=0
+gcp_boot "$GBOX_UD" || code=$?
+if [ "$code" = 0 ] && grep -q '^systemd-run --unit=ravel-clickbench-kit' "$STUB_LOG" \
+  && grep -q '^shutdown -h +600$' "$STUB_LOG" && ! grep -q '^shutdown -h now' "$STUB_LOG" \
+  && [ "$(cat "$GBOX_UD/kit/CLOUD")" = gcp ] && [ "$(cat "$GBOX_UD/kit/STORE_BUCKET")" = "$GCP_STORE" ] \
+  && [ "$(cat "$GBOX_UD/kit/ARM")" = A ] && [ "$(cat "$GBOX_UD/kit/RUN_ID")" = "$GCP_RUN_ID" ] \
+  && cmp -s "$GBOX_UD/kit/run.toml" "$GCP_RUN_DIR/in/run.toml" && [ -f "$GBOX_UD/kit/kit/box/run.sh" ]; then
+  pass "the GCP startup script arms shutdown -h +600, verifies the kit and starts run.sh as a systemd unit"
+else
+  fail "gcp user-data" "exit $code; log: $(tr '\n' ';' <"$STUB_LOG" | head -c 400); $(tail -n 3 "$GBOX_UD/kit/user-data.log" 2>/dev/null)"
+fi
+
+# Catches: a reboot running a second measurement on a half-used box.
+reset_log
+gcp_boot "$GBOX_UD" keep || true
+if grep -q 'FAILED step=user-data reboot' "$GCP_RUN_DIR/out/A/FAILED" 2>/dev/null \
+  && grep -q '^gce delete ravel-clickbench-stub$' "$STUB_LOG" && grep -q '^shutdown -h now$' "$STUB_LOG" \
+  && ! grep -q '^systemd-run' "$STUB_LOG"; then
+  pass "a second boot uploads FAILED and deletes the instance instead of running again"
+else
+  fail "gcp reboot" "log: $(tr '\n' ';' <"$STUB_LOG" | head -c 400)"
+fi
+rm -rf "$GCP_RUN_DIR/out"
+
+# Catches: a box trusting a kit.tgz rewritten in GCS.
+reset_log
+cp "$GCP_RUN_DIR/in/kit.tgz" "$TMP/gcp-kit.tgz"
+printf 'x' >>"$GCP_RUN_DIR/in/kit.tgz"
+gcp_boot "$TMP/gbox-tampered" || true
+if grep -q 'FAILED step=user-data sha256 check of kit.tgz and run.toml' "$GCP_RUN_DIR/out/A/FAILED" 2>/dev/null \
+  && grep -q '^gce delete ' "$STUB_LOG" && ! grep -q '^systemd-run' "$STUB_LOG"; then
+  pass "a tampered kit.tgz fails the GCP box and deletes it before any step runs"
+else
+  fail "gcp tampered kit.tgz" "log: $(tr '\n' ';' <"$STUB_LOG" | head -c 400)"
+fi
+cp "$TMP/gcp-kit.tgz" "$GCP_RUN_DIR/in/kit.tgz"
+rm -rf "$GCP_RUN_DIR/out"
+
+# The GCP box driver: run.sh's own main with only the package install, the
+# dataset, the cache drop and GNU time replaced; the release download, the
+# store, qualify and every listing run as run.sh wrote them, against the
+# curl stub.
+cat >"$TMP/gcp-box-driver.sh" <<'DRIVER'
+#!/usr/bin/env bash
+export KIT_ROOT="$1"
+export KIT_RUN_SH_LIB=1
+export KIT_DROP_CACHES_FILE="$KIT_ROOT/drop_caches"
+export KIT_READY_TRIES=100 KIT_READY_INTERVAL=0.02
+# shellcheck source=/dev/null
+. "$KIT_ROOT/kit/kit/box/run.sh"
+bootstrap_packages() { :; }
+start_dataset_download() { :; }
+wait_dataset() { echo 1111111111111111111111111111111111111111111111111111111111111111 >"$KIT/dataset.sha256"; }
+drop_caches() { sync; echo 3 >"$DROP_CACHES_FILE"; }
+timed() {
+  local file="$1" code=0
+  shift 2
+  "$@" || code=$?
+  [ "${file##*/}" != load.time ] || echo 'wall=600.50 rss_kb=4000000 user=5000.25 sys=100.50' >"$file"
+  return "$code"
+}
+main
+DRIVER
+
+# run_gcp_box NAME [ENV=VALUE...]: boot a GCP box and run main on it.
+run_gcp_box() {
+  local name="$1" box="$TMP/$1" code=0
+  shift
+  reset_log
+  rm -rf "$GCP_RUN_DIR/out"
+  rm -f "$STUB_DIR/server-argv" "$STUB_DIR/cli-argv" "$STUB_DIR/smoke-calls" "$STUB_DIR/server-ready"
+  gcp_boot "$box" || return 1
+  env "$@" bash "$TMP/gcp-box-driver.sh" "$box" >"$box/kit/run.log" 2>&1 || code=$?
+  return "$code"
+}
+
+GBOX="$TMP/gbox-a"
+code=0
+run_gcp_box gbox-a STUB_SQL_TIME=0.5 || code=$?
+GOUT="$GCP_RUN_DIR/out/A"
+# Catches: a GCP run that does not end in DONE with its files uploaded through
+# the JSON API, or that leaves its instance running.
+del_line="$(grep -n '^gce delete ravel-clickbench-stub$' "$STUB_LOG" | head -n 1 | cut -d: -f1)"
+shut_line="$(grep -n '^shutdown -h now$' "$STUB_LOG" | head -n 1 | cut -d: -f1)"
+if [ "$code" = 0 ] && grep -q '^DONE bands=none ' "$GOUT/DONE" 2>/dev/null && [ -f "$GOUT/results.json" ] \
+  && [ -f "$GOUT/evidence.tgz" ] && [ -f "$GOUT/progress.log" ] && [ ! -e "$GOUT/FAILED" ] \
+  && [ -n "$del_line" ] && [ -n "$shut_line" ] && [ "$shut_line" -gt "$del_line" ]; then
+  pass "a GCP box uploads results.json, evidence.tgz, progress.log and DONE, then deletes itself"
+else
+  fail "gcp box run" "exit $code; $(head -n 3 "$GOUT/FAILED" 2>/dev/null); run.log: $(tail -n 5 "$GBOX/kit/run.log")"
+fi
+
+# Catches: an S3 setting reaching a --store gcs process (ADR-3456 D6 refuses
+# it, from the command line or the environment), a command run against
+# another store, an LD_PRELOAD the release does not ship, or a build step on
+# a box that measures published binaries.
+steps="$(sed -n 's/^.* step=\([a-z0-9-]*\) state=start$/\1/p' "$GBOX/kit/progress.log" | tr '\n' ' ')"
+if [ -s "$STUB_DIR/cli-argv" ] && ! grep -v -- "--store gcs --gcs-bucket $GCP_STORE " "$STUB_DIR/cli-argv" >/dev/null \
+  && ! grep -q -- '--s3-\|--store s3' "$STUB_DIR/cli-argv" "$STUB_DIR/server-argv" \
+  && ! grep -v -- "^--store gcs --gcs-bucket $GCP_STORE " "$STUB_DIR/server-argv" >/dev/null \
+  && grep -q 'stub-server: env RAVEL_S3_ENDPOINT=unset RAVEL_S3_BUCKET=unset LD_PRELOAD=unset' "$GBOX/kit/server-1.log" \
+  && [[ "$steps" == *"packages dataset-start release dataset store arm-env arm-env-load qualify sql-smoke objects-before-load load objects-after-load compact fold declare declared footprint verify "* ]] \
+  && [[ "$steps" != *toolchain* ]] && [[ "$steps" != *build* ]] && [[ "$steps" != *rustfs* ]]; then
+  pass "every GCP command and server runs --store gcs on the run's bucket, with no S3 setting, no LD_PRELOAD and no build"
+else
+  fail "gcp store args" "steps '$steps'; cli: $(grep -v -- '--store gcs' "$STUB_DIR/cli-argv" | head -n 2)"
+fi
+
+# Catches: results.json losing a GCP stamp the pre-registration reads: the
+# store, the release and its digests, the footprint, the declared columns,
+# the fetch policy, the machine.
+check="$(python3 - "$GOUT/results.json" "$GCP_STORE" "$GCP_SERVER_SHA" "$GCP_CLI_SHA" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+p = r["provenance"]
+bad = []
+def want(cond, what):
+    if not cond:
+        bad.append(what)
+b = sys.argv[2]
+want(p["backend"] == {"store": "gcs", "bucket": b, "identity": "gs://" + b,
+                      "endpoint": "https://gcs.invalid", "version": "gcs"}, "backend %r" % p["backend"])
+rel = p.get("release") or {}
+want(rel.get("source") == "release" and rel.get("tag") == "v9.9.9", "release %r" % rel)
+want(rel.get("server_sha256") == sys.argv[3] and rel.get("cli_sha256") == sys.argv[4], "release digests")
+want("unexpected argument" in rel.get("server_version_output", ""), "server --version output")
+want(p["toolchain"].startswith("release v9.9.9"), "toolchain %r" % p["toolchain"])
+t = p["store_footprint"]["tenants"]
+want(list(t) == ["0123abcd"] and t["0123abcd"]["classes"]["l/l0"]["objects"] == 100
+     and t["0123abcd"]["classes"]["l/c"]["objects"] == 100, "store_footprint %r" % t)
+want(p["store_footprint"]["sys"]["sys/qualify"]["objects"] == 1, "sys/qualify in the footprint")
+want(p["declared_columns"] == {"tenant": "clickbench-v4", "count": 104, "mapping_columns": 104},
+     "declared_columns %r" % p["declared_columns"])
+want(p["fetch_policy"]["policy"] == "cost-based" and p["fetch_policy"]["policy_source"] == "default"
+     and p["fetch_policy"]["logs"] == 43, "fetch_policy %r" % p["fetch_policy"])
+want(p["hardware"]["instance_type"] == "c2d-highcpu-16", "hardware %r" % p["hardware"])
+want(p["burst_balance"]["start"]["value"] is None and "persistent disk" in p["burst_balance"]["start"]["reason"],
+     "burst_balance %r" % p["burst_balance"])
+want(p["server_flags"]["ld_preload"] == "", "ld_preload %r" % p["server_flags"]["ld_preload"])
+want(p["band_sections"] == [] and r["bands"] == [], "bands %r %r" % (p["band_sections"], r["bands"]))
+want(r["totals"]["answered"] == 43, "answered %r" % r["totals"]["answered"])
+print("; ".join(bad))
+PY
+)"
+# The listing goes to a file first: `tar | grep -q` under pipefail fails when
+# grep exits before GNU tar finishes writing (SIGPIPE), whatever the tarball
+# holds.
+tar -tzf "$GOUT/evidence.tgz" >"$TMP/gcp-evidence.list" 2>&1 || echo "tar exit $?" >>"$TMP/gcp-evidence.list"
+if [ -z "$check" ] && [ "$(wc -l <"$STUB_DIR/smoke-calls" | tr -d ' ')" = 1 ] \
+  && grep -qx 'qualify.out' "$TMP/gcp-evidence.list" \
+  && grep -qx 'object-counts/after-declare.json' "$TMP/gcp-evidence.list" \
+  && ! grep -q '^tar exit' "$TMP/gcp-evidence.list"; then
+  pass "a GCP results.json carries the store, release, footprint, declared-column and fetch-policy stamps"
+else
+  fail "gcp provenance" "${check:-stamps fine}; smoke calls $(cat "$STUB_DIR/smoke-calls" 2>/dev/null | wc -l | tr -d ' '); evidence: $(grep -c . "$TMP/gcp-evidence.list") entries, $(grep '^tar exit' "$TMP/gcp-evidence.list")"
+fi
+
+# Catches: fetch-gcp.sh printing a run instead of judging it, or a ClickBench
+# results file that does not carry the run's own figures.
+code=0
+bash "$KIT_SRC/fetch-gcp.sh" --run-toml "$GCP_TOML" --out "$TMP/gfetch" --interval 1 "$GCP_RUN_ID" \
+  >"$TMP/gfetch.out" 2>"$TMP/gfetch.err" || code=$?
+up="$(python3 - "$TMP/gfetch/c2d-highcpu-16.json" "$GOUT/results.json" <<'PY'
+import json, sys
+u = json.load(open(sys.argv[1]))
+r = json.load(open(sys.argv[2]))
+bad = []
+if [k for k in u] != ["system", "date", "machine", "cluster_size", "proprietary", "hardware", "tuned",
+                      "tags", "load_time", "data_size", "concurrent_qps", "concurrent_error_ratio", "result"]:
+    bad.append("keys %r" % list(u))
+if len(u["result"]) != 43 or any(len(t) != 3 or None in t for t in u["result"]):
+    bad.append("result shape")
+if u["result"][0] != [0.5, 0.5, 0.5]:
+    bad.append("q01 %r" % u["result"][0])
+if u["data_size"] != r["provenance"]["store_footprint"]["tenants"]["0123abcd"]["bytes"]:
+    bad.append("data_size %r" % u["data_size"])
+if u["machine"] != "c2d-highcpu-16" or not isinstance(u["load_time"], int):
+    bad.append("machine or load_time")
+if u["concurrent_qps"] != round(r["concurrent"]["pooled"]["qps_pooled"], 3):
+    bad.append("concurrent_qps")
+print("; ".join(bad))
+PY
+)"
+if [ "$code" = 0 ] && [ -z "$up" ] && [ "$(grep -c '^PASS ' "$TMP/gfetch.out")" = 25 ] \
+  && ! grep -q '^MISS\|^UNJUDGED' "$TMP/gfetch.out"; then
+  pass "fetch-gcp writes the ClickBench results file and passes all 25 pre-registered figures"
+else
+  fail "fetch-gcp" "exit $code, '$up': $(tail -n 3 "$TMP/gfetch.err") $(grep -v '^PASS' "$TMP/gfetch.out" | head -n 3)"
+fi
+
+# prereg_case NAME WANT_CODE WANT PREREG RESULTS PROGRESS: kit.py prereg on
+# the fetched run with one input replaced must exit WANT_CODE printing WANT.
+prereg_case() {
+  local name="$1" want_code="$2" want="$3" code=0
+  python3 "$KIT_SRC/lib/kit.py" prereg "$4" "$5" "$6" "$TMP/gfetch/c2d-highcpu-16.json" "$GCP_STORE" \
+    >"$TMP/prereg-case.out" 2>&1 || code=$?
+  if [ "$code" = "$want_code" ] && grep -qF -- "$want" "$TMP/prereg-case.out"; then
+    pass "the pre-registration judge: $name"
+  else
+    fail "prereg $name" "exit $code: $(grep -v '^PASS' "$TMP/prereg-case.out" | head -c 300)"
+  fi
+}
+GRES="$TMP/gfetch/A/results.json"
+GPROG="$TMP/gfetch/A/progress.log"
+# Catches: a band that cannot miss.
+sed 's/^hot_sum_s = .*/hot_sum_s = [0, 1]/' "$GCP_PREREG" >"$TMP/prereg-hot.toml"
+prereg_case "a hot sum outside its band is a miss, exit 1" 1 'MISS         A        hot_sum_s' \
+  "$TMP/prereg-hot.toml" "$GRES" "$GPROG"
+# Catches: a figure emitted twice read as whichever came last.
+python3 - "$GRES" "$TMP/res-dup.json" <<'PY'
+import sys
+t = open(sys.argv[1]).read()
+open(sys.argv[2], "w").write(t.replace('"answered": 43', '"answered": 43, "answered": 42', 1))
+PY
+prereg_case "a figure emitted twice is refused, exit 2" 2 "key 'answered' appears twice" \
+  "$GCP_PREREG" "$TMP/res-dup.json" "$GPROG"
+# Catches: a log figure stamped twice judged anyway.
+{ cat "$GPROG"; grep ' step=load state=start$' "$GPROG"; } >"$TMP/prog-dup.log"
+prereg_case "a load step stamped twice leaves load_time_s unjudged, exit 2" 2 'UNJUDGED     A        load_time_s' \
+  "$GCP_PREREG" "$GRES" "$TMP/prog-dup.log"
+# Catches: a missing stamp passing for an unremarkable one.
+python3 - "$GRES" "$TMP/res-nodecl.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+del r["provenance"]["declared_columns"]
+json.dump(r, open(sys.argv[2], "w"))
+PY
+prereg_case "a missing stamp is unjudged, exit 2" 2 'UNJUDGED     A        declared_columns' \
+  "$GCP_PREREG" "$TMP/res-nodecl.json" "$GPROG"
+# Catches: a run judged against a bucket other than its own.
+code=0
+python3 "$KIT_SRC/lib/kit.py" prereg "$GCP_PREREG" "$GRES" "$GPROG" "$TMP/gfetch/c2d-highcpu-16.json" \
+  other-bucket >"$TMP/prereg-other.out" 2>&1 || code=$?
+if [ "$code" = 1 ] && grep -q '^MISS .*store_identity' "$TMP/prereg-other.out"; then
+  pass "the pre-registration judge: the store identity must name the run's own bucket"
+else
+  fail "prereg other bucket" "exit $code"
+fi
+
+# gcp_box_fails NAME STEP [ENV=VALUE...]: the box must upload FAILED naming
+# STEP and delete itself.
+gcp_box_fails() {
+  local name="$1" step="$2" code=0
+  shift 2
+  run_gcp_box "$name" "$@" || code=$?
+  if [ "$code" != 0 ] && grep -q "^FAILED step=$step " "$GCP_RUN_DIR/out/A/FAILED" 2>/dev/null \
+    && grep -q '^gce delete ravel-clickbench-stub$' "$STUB_LOG"; then
+    return 0
+  fi
+  echo "  exit $code; FAILED: $(head -n 2 "$GCP_RUN_DIR/out/A/FAILED" 2>/dev/null | tr '\n' ' '); run.log: $(tail -n 3 "$TMP/$name/kit/run.log" | tr '\n' ' ')"
+  return 1
+}
+# Catches: a release binary other than the pinned one measured.
+for a in amd64 arm64; do printf 'x' >>"$STUB_DIR/release/ravel-server-linux-$a"; done
+if gcp_box_fails gbox-digest release && grep -q 'run.toml pins' "$TMP/gbox-digest/kit/run.log" \
+  && [ ! -s "$STUB_DIR/cli-argv" ]; then
+  pass "a release binary with another digest fails the GCP box at step release"
+else
+  fail "gcp release digest" "see above"
+fi
+for a in amd64 arm64; do cp "$BINSTUBS/ravel-server" "$STUB_DIR/release/ravel-server-linux-$a"; done
+# Catches: a binary without the SQL surface reaching the load.
+if gcp_box_fails gbox-smoke sql-smoke STUB_SMOKE_FAIL=1 && ! grep -q ' load ' "$STUB_DIR/cli-argv"; then
+  pass "a server that refuses SELECT 1 fails the GCP box before the load"
+else
+  fail "gcp sql smoke" "see above"
+fi
+# Catches: a tenant whose declaration did not take measured anyway.
+if gcp_box_fails gbox-declared declared STUB_DECLARED=42 \
+  && grep -q 'the tenant declares 42 columns, the mapping declares 104' "$TMP/gbox-declared/kit/run.log"; then
+  pass "a declared column count other than the mapping's fails the GCP box at step declared"
+else
+  fail "gcp declared" "see above"
+fi
+
+# Catches: a FAILED box read as a result.
+code=0
+bash "$KIT_SRC/fetch-gcp.sh" --run-toml "$GCP_TOML" --out "$TMP/gfetch-failed" --interval 1 "$GCP_RUN_ID" \
+  >/dev/null 2>"$TMP/gfetch-failed.err" || code=$?
+if [ "$code" = 2 ] && grep -q 'FAILED step=declared' "$TMP/gfetch-failed.err"; then
+  pass "fetch-gcp exits 2 on FAILED and prints it"
+else
+  fail "fetch-gcp FAILED" "exit $code: $(tail -n 2 "$TMP/gfetch-failed.err")"
+fi
+
+# Catches: a watcher that waits eleven hours on a box that is already gone.
+rm -rf "$GCP_RUN_DIR/out"
+mv "$STUB_DIR/gce/$GCP_INSTANCE" "$TMP/gce-saved"
+code=0
+bash "$KIT_SRC/fetch-gcp.sh" --run-toml "$GCP_TOML" --out "$TMP/gfetch-gone" --interval 1 --timeout 30 "$GCP_RUN_ID" \
+  >/dev/null 2>"$TMP/gfetch-gone.err" || code=$?
+if [ "$code" = 6 ] && grep -q 'the box is gone without a word' "$TMP/gfetch-gone.err"; then
+  pass "fetch-gcp exits 6 when the instance is gone and wrote no marker"
+else
+  fail "fetch-gcp gone" "exit $code: $(tail -n 2 "$TMP/gfetch-gone.err")"
+fi
+mv "$TMP/gce-saved" "$STUB_DIR/gce/$GCP_INSTANCE"
+
+# Catches: a teardown that leaves the store bucket or a stopped instance,
+# reports nothing left without asking again, or reads gcloud's stderr warning
+# for a label no instance carries as an instance that remains.
+reset_log
+code=0
+bash "$KIT_SRC/teardown-gcp.sh" "$GCP_TOML" "$GCP_RUN_ID" >"$TMP/gtear.out" 2>&1 || code=$?
+if [ "$code" = 0 ] && [ ! -e "$STUB_DIR/gce/$GCP_INSTANCE" ] && [ ! -d "$FAKE_GCS/$GCP_STORE" ] \
+  && grep -q '^Listed 0 items.$' "$TMP/gtear.out" && grep -q "gs://$GCP_STORE does not exist" "$TMP/gtear.out" \
+  && [ -d "$FAKE_GCS/kit-test-gcs-bucket" ]; then
+  pass "teardown deletes the run's instance and store bucket, keeps the results bucket, and says nothing remains"
+else
+  fail "teardown" "exit $code: $(tail -n 4 "$TMP/gtear.out")"
+fi
+echo us-central1-a >"$STUB_DIR/gce/$GCP_INSTANCE"
+code=0
+STUB_GCLOUD_FAIL=instance-delete bash "$KIT_SRC/teardown-gcp.sh" "$GCP_TOML" "$GCP_RUN_ID" >"$TMP/gtear2.out" 2>&1 || code=$?
+if [ "$code" = 1 ] && grep -q "instances of $GCP_RUN_ID remain" "$TMP/gtear2.out"; then
+  pass "teardown exits 1 when an instance of the run remains"
+else
+  fail "teardown remaining" "exit $code: $(tail -n 3 "$TMP/gtear2.out")"
+fi
+rm -f "$STUB_DIR/gce/$GCP_INSTANCE"
+
+# --- syntax -----------------------------------------------------------------
+
+# Catches: a kit script that no longer parses.
+syntax=0
+for f in launch.sh fetch.sh box/run.sh kit.test.sh launch-gcp.sh fetch-gcp.sh setup-gcp.sh teardown-gcp.sh; do
+  bash -n "$KIT_SRC/$f" || syntax=1
+done
+python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$KIT_SRC/lib/kit.py" || syntax=1
+if [ "$syntax" = 0 ]; then
+  pass "every kit script parses"
+else
+  fail "syntax" "see above"
+fi
+
+if [ "$fails" -ne 0 ]; then
+  echo "$fails case(s) failed"
+  exit 1
+fi
+echo "all kit cases passed"

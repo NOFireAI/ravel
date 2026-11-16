@@ -1,0 +1,17 @@
+{
+  "id": "B4",
+  "answer_facts": [
+    {"fact": "no 5xx in the baseline", "pattern": "\\b(0|zero|no)\\b"},
+    {"fact": "a 5xx rate of 0.2 per second, or 3 per 15 s scrape, during the rise", "pattern": "\\b0\\.2\\b|\\b3 (per|every|each) 15|\\b12 per minute"},
+    {"fact": "the rise starts at T0+20m", "pattern": "{hhmm:T0+20m}"},
+    {"fact": "a failed trace id", "pattern": "5eed0569000000000000000000000(02d|032|037)"},
+    {"fact": "the error log text", "pattern": "card processor timeout"}
+  ],
+  "evidence": [
+    {"item": "the PromQL query text", "pattern": "http_server_requests_total"},
+    {"item": "the logs lookup on a trace id", "pattern": "trace_id|ravel_search_logs"}
+  ],
+  "tools_expected": ["ravel_query_promql", "ravel_analyze_timeseries", "ravel_query_sql", "ravel_search_logs"],
+  "call_bound": 8,
+  "fixture_refs": ["entities.incident.checkout_5xx_per_scrape_incident", "entities.incident.checkout_5xx_per_scrape_baseline", "entities.incident.failing_trace_ids"]
+}

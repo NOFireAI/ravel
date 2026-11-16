@@ -1,0 +1,8 @@
+fulltext_sidecar decide stamp git=ff99909761620a02b617aae2370f9ba82fdda419 reports=hdfs_sidecar.json:39f60ebccf5b5346857a18ab5a2ceacfe8a7a14ffa5eb5773917a3dace16aa68,bgl_sidecar.json:b7bc25074d648050819c5a18850286f2f9eeaadef07871dd6c7144d7337d8f3c
+fulltext_sidecar decision hdfs_sidecar: NO-GO (rare/bytes_ratio_100gb=0.0978<=0.1 ok, sidecar/over_postings=4.3145<=1.2 FAIL, build/cpu_ratio=1.1800<=1.5 ok, delete/rebuild_cpu_over_compaction=1.4951 ok, delete/bytes_over_object=0.5287 ok, delete/residual_terms=0.0000<=0 ok)
+fulltext_sidecar decide subject=hdfs_sidecar misses=4 problems=0
+fulltext_sidecar decision bgl_sidecar: NO-GO (rare/bytes_ratio_100gb=0.0459<=0.1 ok, sidecar/over_postings=2.1884<=1.2 FAIL, build/cpu_ratio=1.8844<=1.5 FAIL, delete/rebuild_cpu_over_compaction=1.8438 ok, delete/bytes_over_object=0.5964 ok, delete/residual_terms=0.0000<=0 ok)
+fulltext_sidecar decide subject=bgl_sidecar misses=5 problems=0
+fulltext_sidecar decision overall: NO-GO (hdfs_sidecar=NO-GO, bgl_sidecar=NO-GO)
+
+EXIT=3

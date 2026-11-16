@@ -1,0 +1,400 @@
+2026-10-14 09:00:00.000 INFO [storage] Received block blk_9950380760115894566 of size 9622619 from /10.250.148.237
+2026-10-14 09:00:02.037 INFO [http] GET /api/v1/users/1918  500  942ms  trace=0x42f293ba
+2026-10-14 09:00:04.074 INFO [storage] DataNode registration from 10.251.54.16:50010 storage DS-5483
+2026-10-14 09:00:07.111 INFO [app] Health check passed
+2026-10-14 09:00:09.148 WARN [app] Retrying upload after transient error (attempt 1)
+2026-10-14 09:00:11.185 INFO [storage] Received block blk_-9697131076278799460 of size 60036780 from /10.250.243.105
+2026-10-14 09:00:14.222 DEBUG [http] req 3a7f362a routed to shard 8
+2026-10-14 09:00:16.259 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:00:18.296 INFO [db] query id=4cada44256cf rows=913 took 173.361 ms
+2026-10-14 09:00:21.333 INFO [http] GET /api/v1/users/91  200  281ms  trace=0x0065addc
+2026-10-14 09:00:23.370 INFO [storage] Received block blk_3659913541306244246 of size 44442754 from /10.250.133.62
+2026-10-14 09:00:25.407 INFO [app] Config reload requested by operator
+2026-10-14 09:00:28.444 INFO [app] Config reload requested by operator
+2026-10-14 09:00:30.481 INFO [storage] DataNode registration from 10.251.249.242:50010 storage DS-3348
+2026-10-14 09:00:32.518 INFO [db] query id=ec00fffe8fdd rows=4961 took 98.276 ms
+2026-10-14 09:00:35.555 INFO [storage] Received block blk_-1621610607338309685 of size 40208936 from /10.250.31.122
+2026-10-14 09:00:37.592 INFO [app] User session expired, redirecting to login page
+2026-10-14 09:00:39.629 INFO [http] GET /api/v1/users/6893  404  300ms  trace=0xf95fbc6e
+2026-10-14 09:00:42.666 INFO [app] Shutting down idle worker pool
+2026-10-14 09:00:44.703 DEBUG [http] req 3a7f3676 routed to shard 5
+2026-10-14 09:00:46.740 INFO [storage] Received block blk_-1680909212389588866 of size 5896537 from /10.250.161.178
+2026-10-14 09:00:49.777 INFO [http] GET /api/v1/users/9893  200  209ms  trace=0x908dede2
+2026-10-14 09:00:51.814 INFO [app] Background compaction finished without changes
+2026-10-14 09:00:53.851 WARN [app] Retrying upload after transient error (attempt 3)
+2026-10-14 09:00:56.888 INFO [storage] DataNode registration from 10.251.193.215:50010 storage DS-4432
+2026-10-14 09:00:58.925 INFO [storage] Received block blk_6794646892656494619 of size 29359740 from /10.250.134.192
+2026-10-14 09:01:00.962 INFO [db] query id=8ca8defed0e8 rows=3454 took 593.371 ms
+2026-10-14 09:01:03.999 INFO [app] Background compaction finished without changes
+2026-10-14 09:01:05.036 INFO [app] Shutting down idle worker pool
+2026-10-14 09:01:07.073 INFO [http] GET /api/v1/users/2549  200  456ms  trace=0x96508393
+2026-10-14 09:01:10.110 INFO [storage] Received block blk_-7720562225160679386 of size 29989965 from /10.250.57.1
+2026-10-14 09:01:12.147 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:01:14.184 DEBUG [http] req 3a7f31f9 routed to shard 0
+2026-10-14 09:01:17.221 INFO [http] GET /api/v1/users/3004  200  450ms  trace=0xfc025354
+2026-10-14 09:01:19.258 INFO [app] Shutting down idle worker pool
+2026-10-14 09:01:21.295 INFO [storage] Received block blk_2598918765313145286 of size 5013179 from /10.250.150.235
+2026-10-14 09:01:24.332 INFO [app] Config reload requested by operator
+2026-10-14 09:01:26.369 INFO [http] GET /api/v1/users/774  500  71ms  trace=0x84040d57
+2026-10-14 09:01:28.406 INFO [db] query id=07bdd2e7aee1 rows=3153 took 772.154 ms
+2026-10-14 09:01:31.443 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:01:33.480 INFO [storage] Received block blk_-5248804260709267323 of size 64583400 from /10.250.226.25
+2026-10-14 09:01:35.517 INFO [http] GET /api/v1/users/4190  404  870ms  trace=0x19b9d2ef
+2026-10-14 09:01:38.554 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:01:40.591 INFO [app] Background compaction finished without changes
+2026-10-14 09:01:42.628 INFO [db] query id=eba233ed7cc6 rows=3605 took 285.978 ms
+2026-10-14 09:01:45.665 INFO [storage] Received block blk_9710540162729119028 of size 39357061 from /10.250.168.226
+2026-10-14 09:01:47.702 INFO [storage] DataNode registration from 10.251.191.46:50010 storage DS-1217
+2026-10-14 09:01:49.739 INFO [app] Config reload requested by operator
+2026-10-14 09:01:52.776 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:01:54.813 INFO [http] GET /api/v1/users/29  200  43ms  trace=0x21b26a1c
+2026-10-14 09:01:56.850 INFO [storage] Received block blk_917091092872311883 of size 44033913 from /10.250.80.29
+2026-10-14 09:01:59.887 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:02:01.924 WARN [app] Retrying upload after transient error (attempt 2)
+2026-10-14 09:02:03.961 INFO [http] GET /api/v1/users/9833  200  320ms  trace=0xcb38c20d
+2026-10-14 09:02:06.998 INFO [app] User session expired, redirecting to login page
+2026-10-14 09:02:08.035 INFO [storage] Received block blk_8853029960321230926 of size 976752 from /10.250.19.224
+2026-10-14 09:02:10.072 INFO [db] query id=25e97d2dc5db rows=1063 took 37.834 ms
+2026-10-14 09:02:13.109 INFO [storage] DataNode registration from 10.251.31.91:50010 storage DS-8755
+2026-10-14 09:02:15.146 DEBUG [http] req 3a7f309d routed to shard 9
+2026-10-14 09:02:17.183 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:02:20.220 INFO [storage] Received block blk_240560480261839756 of size 38889359 from /10.250.166.164
+2026-10-14 09:02:22.257 INFO [http] GET /api/v1/users/1716  200  505ms  trace=0x2509ffa9
+2026-10-14 09:02:24.294 INFO [db] query id=ad03a2d441cb rows=3978 took 284.776 ms
+2026-10-14 09:02:27.331 INFO [app] Background compaction finished without changes
+2026-10-14 09:02:29.368 WARN [app] Retrying upload after transient error (attempt 5)
+2026-10-14 09:02:31.405 INFO [storage] Received block blk_3389140593373167725 of size 49539723 from /10.250.163.198
+2026-10-14 09:02:34.442 WARN [db] Connection to 10.0.167.15:5432 closed after timeout of 3000 ms
+2026-10-14 09:02:36.479 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:02:38.516 INFO [db] query id=b4345d2fd5ed rows=1751 took 290.758 ms
+2026-10-14 09:02:41.553 INFO [http] GET /api/v1/users/6516  404  167ms  trace=0x0fad1c5c
+2026-10-14 09:02:43.590 INFO [storage] Received block blk_-5438303503960761520 of size 42794281 from /10.250.210.31
+2026-10-14 09:02:45.627 INFO [app] Config reload requested by operator
+2026-10-14 09:02:48.664 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:02:50.701 WARN [db] Connection to 10.0.8.132:5432 closed after timeout of 30000 ms
+2026-10-14 09:02:52.738 INFO [db] query id=46dbeb1c2086 rows=568 took 786.829 ms
+2026-10-14 09:02:55.775 INFO [storage] Received block blk_9383421389131146404 of size 43590630 from /10.250.126.146
+2026-10-14 09:02:57.812 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:02:59.849 INFO [http] GET /api/v1/users/8558  200  715ms  trace=0xbcc9bee0
+2026-10-14 09:03:02.886 INFO [app] Background compaction finished without changes
+2026-10-14 09:03:04.923 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:03:06.960 INFO [storage] Received block blk_4954598441043039642 of size 47292953 from /10.250.80.204
+2026-10-14 09:03:09.997 INFO [http] GET /api/v1/users/9826  404  867ms  trace=0x5f9716d8
+2026-10-14 09:03:11.034 INFO [app] Shutting down idle worker pool
+2026-10-14 09:03:13.071 INFO [app] Config reload requested by operator
+2026-10-14 09:03:16.108 INFO [app] Background compaction finished without changes
+2026-10-14 09:03:18.145 INFO [storage] Received block blk_-8926649523815609951 of size 972841 from /10.250.162.82
+2026-10-14 09:03:20.182 INFO [db] query id=45406bf8c853 rows=3295 took 431.616 ms
+2026-10-14 09:03:23.219 WARN [db] Connection to 10.0.33.245:5432 closed after timeout of 30000 ms
+2026-10-14 09:03:25.256 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:03:27.293 INFO [http] GET /api/v1/users/8817  200  609ms  trace=0x9b706153
+2026-10-14 09:03:30.330 INFO [storage] Received block blk_-2104168644417777564 of size 23417644 from /10.250.30.135
+2026-10-14 09:03:32.367 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:03:34.404 INFO [db] query id=30c4f7f65fa2 rows=737 took 513.217 ms
+2026-10-14 09:03:37.441 INFO [http] GET /api/v1/users/3139  500  487ms  trace=0x3fe0a4c6
+2026-10-14 09:03:39.478 WARN [db] Connection to 10.0.29.162:5432 closed after timeout of 30000 ms
+2026-10-14 09:03:41.515 INFO [storage] Received block blk_-8088963376777176982 of size 9532163 from /10.250.92.125
+2026-10-14 09:03:44.552 INFO [app] Background compaction finished without changes
+2026-10-14 09:03:46.589 INFO [http] GET /api/v1/users/7053  200  2ms  trace=0xc42b7c1b
+2026-10-14 09:03:48.626 INFO [db] query id=1a4059cdbb38 rows=3561 took 130.185 ms
+2026-10-14 09:03:51.663 INFO [app] Shutting down idle worker pool
+2026-10-14 09:03:53.700 INFO [storage] Received block blk_8974910699843313265 of size 2696504 from /10.250.3.37
+2026-10-14 09:03:55.737 WARN [db] Connection to 10.0.96.190:5432 closed after timeout of 3000 ms
+2026-10-14 09:03:58.774 INFO [app] Shutting down idle worker pool
+2026-10-14 09:04:00.811 INFO [app] Shutting down idle worker pool
+2026-10-14 09:04:02.848 INFO [db] query id=20271f2f7cea rows=2633 took 437.155 ms
+2026-10-14 09:04:05.885 INFO [storage] Received block blk_-7412805138711552838 of size 63483342 from /10.250.253.128
+2026-10-14 09:04:07.922 INFO [app] Background compaction finished without changes
+2026-10-14 09:04:09.959 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:04:12.996 WARN [db] Connection to 10.0.220.124:5432 closed after timeout of 30000 ms
+2026-10-14 09:04:14.033 INFO [http] GET /api/v1/users/8816  200  131ms  trace=0x9d33f698
+2026-10-14 09:04:16.070 INFO [storage] Received block blk_9400681004156254885 of size 9072395 from /10.250.123.60
+2026-10-14 09:04:19.107 INFO [app] Config reload requested by operator
+2026-10-14 09:04:21.144 INFO [app] Health check passed
+2026-10-14 09:04:23.181 INFO [http] GET /api/v1/users/9123  200  371ms  trace=0xd15e3f2d
+2026-10-14 09:04:26.218 WARN [app] Retrying upload after transient error (attempt 4)
+2026-10-14 09:04:28.255 INFO [storage] Received block blk_9437199191129324803 of size 24742883 from /10.250.12.99
+2026-10-14 09:04:30.292 INFO [db] query id=ba83ae9a94ea rows=4153 took 670.445 ms
+2026-10-14 09:04:33.329 INFO [http] GET /api/v1/users/7336  500  728ms  trace=0x55de643f
+2026-10-14 09:04:35.366 INFO [app] Config reload requested by operator
+2026-10-14 09:04:37.403 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:04:40.440 INFO [storage] Received block blk_852521774680347423 of size 20868287 from /10.250.94.251
+2026-10-14 09:04:42.477 INFO [http] GET /api/v1/users/7791  200  901ms  trace=0x79bc0973
+2026-10-14 09:04:44.514 WARN [db] Connection to 10.0.40.187:5432 closed after timeout of 3000 ms
+2026-10-14 09:04:47.551 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:04:49.588 INFO [app] Health check passed
+2026-10-14 09:04:51.625 INFO [storage] Received block blk_5135557600413140527 of size 8109050 from /10.250.36.23
+2026-10-14 09:04:54.662 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:04:56.699 WARN [app] Retrying upload after transient error (attempt 3)
+2026-10-14 09:04:58.736 INFO [db] query id=206a3ab1c486 rows=3590 took 34.193 ms
+2026-10-14 09:05:01.773 INFO [http] GET /api/v1/users/2315  200  996ms  trace=0xdea9fb69
+2026-10-14 09:05:03.810 INFO [storage] Received block blk_6868151280345532057 of size 5265822 from /10.250.130.217
+2026-10-14 09:05:05.847 WARN [app] Retrying upload after transient error (attempt 5)
+2026-10-14 09:05:08.884 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:05:10.921 INFO [http] GET /api/v1/users/2818  404  269ms  trace=0xfa1e07e4
+2026-10-14 09:05:12.958 INFO [storage] DataNode registration from 10.251.42.57:50010 storage DS-9469
+2026-10-14 09:05:15.995 INFO [storage] Received block blk_-7509463618752045238 of size 50349128 from /10.250.35.107
+2026-10-14 09:05:17.032 INFO [app] Background compaction finished without changes
+2026-10-14 09:05:19.069 INFO [http] GET /api/v1/users/2396  500  92ms  trace=0x3c3278b0
+2026-10-14 09:05:22.106 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:05:24.143 INFO [storage] Wrote checkpoint to /var/lib/app/data/seg-223542.dat in 0012 ms
+2026-10-14 09:05:26.180 INFO [storage] Received block blk_-9646542536967342358 of size 7272375 from /10.250.236.183
+2026-10-14 09:05:29.217 INFO [http] GET /api/v1/users/4158  200  152ms  trace=0x6f56c999
+2026-10-14 09:05:31.254 WARN [app] Retrying upload after transient error (attempt 2)
+2026-10-14 09:05:33.291 INFO [app] Shutting down idle worker pool
+2026-10-14 09:05:36.328 INFO [app] Shutting down idle worker pool
+2026-10-14 09:05:38.365 INFO [storage] Received block blk_8358666766634927752 of size 49663015 from /10.250.73.30
+2026-10-14 09:05:40.402 INFO [db] query id=ea838aac9fa8 rows=4448 took 245.341 ms
+2026-10-14 09:05:43.439 INFO [app] User session expired, redirecting to login page
+2026-10-14 09:05:45.476 INFO [storage] Wrote checkpoint to /var/lib/app/data/seg-059263.dat in 0094 ms
+2026-10-14 09:05:47.513 INFO [http] GET /api/v1/users/6176  500  434ms  trace=0x8b728996
+2026-10-14 09:05:50.550 INFO [storage] Received block blk_-9683054933493519400 of size 41718581 from /10.250.130.241
+2026-10-14 09:05:52.587 INFO [app] Background compaction finished without changes
+2026-10-14 09:05:54.624 INFO [db] query id=98fe4fb50b2f rows=3537 took 304.531 ms
+2026-10-14 09:05:57.661 INFO [http] GET /api/v1/users/2369  404  845ms  trace=0xb3b3dd5a
+2026-10-14 09:05:59.698 INFO [app] Health check passed
+2026-10-14 09:06:01.735 INFO [storage] Received block blk_-7466332262828411578 of size 20138416 from /10.250.177.158
+2026-10-14 09:06:04.772 INFO [storage] DataNode registration from 10.251.231.204:50010 storage DS-3080
+2026-10-14 09:06:06.809 INFO [storage] Wrote checkpoint to /var/lib/app/data/seg-403053.dat in 0015 ms
+2026-10-14 09:06:08.846 INFO [db] query id=ab596c4f5b15 rows=2797 took 121.972 ms
+2026-10-14 09:06:11.883 WARN [app] Retrying upload after transient error (attempt 3)
+2026-10-14 09:06:13.920 INFO [storage] Received block blk_1529111324057755830 of size 1856320 from /10.250.197.50
+2026-10-14 09:06:15.957 INFO [http] GET /api/v1/users/5808  404  668ms  trace=0x8271c00c
+2026-10-14 09:06:18.994 INFO [app] User session expired, redirecting to login page
+2026-10-14 09:06:20.031 INFO [app] Config reload requested by operator
+2026-10-14 09:06:22.068 INFO [db] query id=241b03ea609e rows=2892 took 160.874 ms
+2026-10-14 09:06:25.105 INFO [storage] Received block blk_-1511663221626680768 of size 3110222 from /10.250.99.137
+2026-10-14 09:06:27.142 INFO [storage] Wrote checkpoint to /var/lib/app/data/seg-801862.dat in 0050 ms
+2026-10-14 09:06:29.179 INFO [storage] DataNode registration from 10.251.37.21:50010 storage DS-4100
+2026-10-14 09:06:32.216 INFO [app] User session expired, redirecting to login page
+2026-10-14 09:06:34.253 INFO [http] GET /api/v1/users/2278  500  839ms  trace=0x0dcf7b26
+2026-10-14 09:06:36.290 INFO [storage] Received block blk_2700597169968911376 of size 17836736 from /10.250.102.129
+2026-10-14 09:06:39.327 WARN [app] Retrying upload after transient error (attempt 2)
+2026-10-14 09:06:41.364 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:06:43.401 INFO [http] GET /api/v1/users/164  200  388ms  trace=0x3b9989e0
+2026-10-14 09:06:46.438 INFO [app] User session expired, redirecting to login page
+2026-10-14 09:06:48.475 INFO [storage] Received block blk_-8213103735773703328 of size 22660999 from /10.250.162.59
+2026-10-14 09:06:50.512 INFO [db] query id=1d403558abab rows=1144 took 783.517 ms
+2026-10-14 09:06:53.549 INFO [http] GET /api/v1/users/3023  404  881ms  trace=0x069558e6
+2026-10-14 09:06:55.586 INFO [storage] DataNode registration from 10.251.88.11:50010 storage DS-1230
+2026-10-14 09:06:57.623 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:07:00.660 INFO [storage] Received block blk_-7251953435152424653 of size 58145098 from /10.250.72.36
+2026-10-14 09:07:02.697 INFO [http] GET /api/v1/users/1183  200  996ms  trace=0x18200070
+2026-10-14 09:07:04.734 INFO [db] query id=fb9f10a305de rows=126 took 193.772 ms
+2026-10-14 09:07:07.771 INFO [app] Background compaction finished without changes
+2026-10-14 09:07:09.808 INFO [storage] Wrote checkpoint to /var/lib/app/data/seg-205589.dat in 0042 ms
+2026-10-14 09:07:11.845 INFO [storage] Received block blk_5004676177970776270 of size 34327516 from /10.250.21.2
+2026-10-14 09:07:14.882 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:07:16.919 INFO [app] Config reload requested by operator
+2026-10-14 09:07:18.956 INFO [db] query id=d33112b55947 rows=1638 took 895.317 ms
+2026-10-14 09:07:21.993 INFO [storage] DataNode registration from 10.251.186.81:50010 storage DS-5142
+2026-10-14 09:07:23.030 INFO [storage] Received block blk_-1039630541569273800 of size 38371298 from /10.250.8.156
+2026-10-14 09:07:25.067 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:07:28.104 WARN [db] Connection to 10.0.187.86:5432 closed after timeout of 3000 ms
+2026-10-14 09:07:30.141 INFO [http] GET /api/v1/users/8421  404  22ms  trace=0x5ae25996
+2026-10-14 09:07:32.178 INFO [db] query id=83aec41a7a41 rows=1212 took 472.124 ms
+2026-10-14 09:07:35.215 INFO [storage] Received block blk_6583632834970648420 of size 53669761 from /10.250.85.231
+2026-10-14 09:07:37.252 INFO [app] Health check passed
+2026-10-14 09:07:39.289 INFO [http] GET /api/v1/users/9688  200  711ms  trace=0x4a4ec910
+2026-10-14 09:07:42.326 INFO [app] Shutting down idle worker pool
+2026-10-14 09:07:44.363 WARN [db] Connection to 10.0.231.2:5432 closed after timeout of 60000 ms
+2026-10-14 09:07:46.400 INFO [storage] Received block blk_3938528883081428328 of size 19390092 from /10.250.217.84
+2026-10-14 09:07:49.437 INFO [http] GET /api/v1/users/5433  200  250ms  trace=0x9ede3f2c
+2026-10-14 09:07:51.474 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:07:53.511 INFO [app] User session expired, redirecting to login page
+2026-10-14 09:07:56.548 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:07:58.585 INFO [storage] Received block blk_2181312323762719829 of size 13953790 from /10.250.238.47
+2026-10-14 09:08:00.622 WARN [db] Connection to 10.0.210.98:5432 closed after timeout of 3000 ms
+2026-10-14 09:08:03.659 WARN [app] Retrying upload after transient error (attempt 3)
+2026-10-14 09:08:05.696 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:08:07.733 INFO [http] GET /api/v1/users/3145  200  941ms  trace=0x8851a63d
+2026-10-14 09:08:10.770 INFO [storage] Received block blk_-7401031203313977645 of size 22488693 from /10.250.38.44
+2026-10-14 09:08:12.807 INFO [app] Health check passed
+2026-10-14 09:08:14.844 INFO [db] query id=112c8f5b6c95 rows=2494 took 336.385 ms
+2026-10-14 09:08:17.881 WARN [db] Connection to 10.0.101.3:5432 closed after timeout of 3000 ms
+2026-10-14 09:08:19.918 INFO [app] User session expired, redirecting to login page
+2026-10-14 09:08:21.955 INFO [storage] Received block blk_9385186340476353003 of size 58650554 from /10.250.63.208
+2026-10-14 09:08:24.992 INFO [app] Shutting down idle worker pool
+2026-10-14 09:08:26.029 INFO [http] GET /api/v1/users/1792  500  890ms  trace=0x00e2dc65
+2026-10-14 09:08:28.066 INFO [db] query id=3cca9549782c rows=1209 took 578.725 ms
+2026-10-14 09:08:31.103 INFO [app] Shutting down idle worker pool
+2026-10-14 09:08:33.140 INFO [storage] Received block blk_6520967852306643097 of size 53999953 from /10.250.142.251
+2026-10-14 09:08:35.177 INFO [http] GET /api/v1/users/1696  200  82ms  trace=0xc8e5d376
+2026-10-14 09:08:38.214 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:08:40.251 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:08:42.288 INFO [db] query id=f9e68bca0532 rows=774 took 521.278 ms
+2026-10-14 09:08:45.325 INFO [storage] Received block blk_-4631266162702130305 of size 56919733 from /10.250.250.6
+2026-10-14 09:08:47.362 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:08:49.399 WARN [db] Connection to 10.0.182.191:5432 closed after timeout of 3000 ms
+2026-10-14 09:08:52.436 INFO [app] Background compaction finished without changes
+2026-10-14 09:08:54.473 INFO [http] GET /api/v1/users/3817  200  286ms  trace=0x855e1f76
+2026-10-14 09:08:56.510 INFO [storage] Received block blk_1461408518508291259 of size 40733536 from /10.250.175.13
+2026-10-14 09:08:59.547 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:09:01.584 WARN [app] Retrying upload after transient error (attempt 4)
+2026-10-14 09:09:03.621 INFO [http] GET /api/v1/users/5768  200  225ms  trace=0x200fa597
+2026-10-14 09:09:06.658 WARN [db] Connection to 10.0.70.240:5432 closed after timeout of 3000 ms
+2026-10-14 09:09:08.695 INFO [storage] Received block blk_1196890280051507495 of size 41758294 from /10.250.98.188
+2026-10-14 09:09:10.732 INFO [db] query id=11952d60f227 rows=129 took 559.198 ms
+2026-10-14 09:09:13.769 INFO [http] GET /api/v1/users/9685  200  408ms  trace=0xacf4553b
+2026-10-14 09:09:15.806 INFO [app] Shutting down idle worker pool
+2026-10-14 09:09:17.843 WARN [app] Retrying upload after transient error (attempt 2)
+2026-10-14 09:09:20.880 INFO [storage] Received block blk_-4540169877811933019 of size 46213653 from /10.250.9.7
+2026-10-14 09:09:22.917 WARN [db] Connection to 10.0.12.86:5432 closed after timeout of 3000 ms
+2026-10-14 09:09:24.954 INFO [db] query id=b58e4288c99f rows=4609 took 256.884 ms
+2026-10-14 09:09:27.991 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:09:29.028 INFO [app] Background compaction finished without changes
+2026-10-14 09:09:31.065 INFO [storage] Received block blk_-3408683158570029000 of size 60245853 from /10.250.22.34
+2026-10-14 09:09:34.102 WARN [app] Retrying upload after transient error (attempt 5)
+2026-10-14 09:09:36.139 INFO [app] Background compaction finished without changes
+2026-10-14 09:09:38.176 WARN [db] Connection to 10.0.64.123:5432 closed after timeout of 60000 ms
+2026-10-14 09:09:41.213 INFO [http] GET /api/v1/users/6782  200  947ms  trace=0x69bf4232
+2026-10-14 09:09:43.250 INFO [storage] Received block blk_-902891029843893350 of size 7589033 from /10.250.194.125
+2026-10-14 09:09:45.287 INFO [app] Shutting down idle worker pool
+2026-10-14 09:09:48.324 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:09:50.361 INFO [http] GET /api/v1/users/7711  200  575ms  trace=0xd39e75be
+2026-10-14 09:09:52.398 INFO [db] query id=d96b60fc6de7 rows=1963 took 490.206 ms
+2026-10-14 09:09:55.435 INFO [storage] Received block blk_-7365536581823122776 of size 42538769 from /10.250.82.209
+2026-10-14 09:09:57.472 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:09:59.509 INFO [http] GET /api/v1/users/8882  500  503ms  trace=0x1792b7e6
+2026-10-14 09:10:02.546 INFO [app] User session expired, redirecting to login page
+2026-10-14 09:10:04.583 INFO [app] Config reload requested by operator
+2026-10-14 09:10:06.620 INFO [storage] Received block blk_905643607920111257 of size 41043233 from /10.250.244.106
+2026-10-14 09:10:09.657 INFO [http] GET /api/v1/users/8381  200  957ms  trace=0x94ec7011
+2026-10-14 09:10:11.694 WARN [db] Connection to 10.0.200.4:5432 closed after timeout of 30000 ms
+2026-10-14 09:10:13.731 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:10:16.768 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:10:18.805 INFO [storage] Received block blk_7297744974328544238 of size 30116907 from /10.250.182.211
+2026-10-14 09:10:20.842 DEBUG [http] req 3a7f3856 routed to shard 15
+2026-10-14 09:10:23.879 INFO [app] Health check passed
+2026-10-14 09:10:25.916 INFO [app] Shutting down idle worker pool
+2026-10-14 09:10:27.953 WARN [db] Connection to 10.0.181.167:5432 closed after timeout of 3000 ms
+2026-10-14 09:10:30.990 INFO [storage] Received block blk_-3265755284515921088 of size 27973352 from /10.250.114.21
+2026-10-14 09:10:32.027 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:10:34.064 INFO [db] query id=52bc5688c9ee rows=770 took 803.220 ms
+2026-10-14 09:10:37.101 INFO [http] GET /api/v1/users/3024  200  877ms  trace=0xdeee5a24
+2026-10-14 09:10:39.138 INFO [app] Background compaction finished without changes
+2026-10-14 09:10:41.175 INFO [storage] Received block blk_-4351226899196708779 of size 32871036 from /10.250.155.212
+2026-10-14 09:10:44.212 WARN [db] Connection to 10.0.247.72:5432 closed after timeout of 60000 ms
+2026-10-14 09:10:46.249 INFO [http] GET /api/v1/users/1561  200  227ms  trace=0x6236acb7
+2026-10-14 09:10:48.286 INFO [db] query id=9fd93565bcc1 rows=1972 took 783.219 ms
+2026-10-14 09:10:51.323 DEBUG [http] req 3a7f3f0f routed to shard 10
+2026-10-14 09:10:53.360 INFO [storage] Received block blk_7464833820581039814 of size 64443574 from /10.250.187.155
+2026-10-14 09:10:55.397 INFO [http] GET /api/v1/users/4925  200  576ms  trace=0x99691c25
+2026-10-14 09:10:58.434 INFO [app] Background compaction finished without changes
+2026-10-14 09:11:00.471 WARN [db] Connection to 10.0.108.77:5432 closed after timeout of 30000 ms
+2026-10-14 09:11:02.508 INFO [db] query id=581103b45a5d rows=2818 took 536.448 ms
+2026-10-14 09:11:05.545 INFO [storage] Received block blk_9053484034254412351 of size 59908365 from /10.250.60.147
+2026-10-14 09:11:07.582 INFO [app] User session expired, redirecting to login page
+2026-10-14 09:11:09.619 WARN [app] Retrying upload after transient error (attempt 2)
+2026-10-14 09:11:12.656 INFO [app] User session expired, redirecting to login page
+2026-10-14 09:11:14.693 INFO [http] GET /api/v1/users/7691  200  878ms  trace=0x3af09309
+2026-10-14 09:11:16.730 INFO [storage] Received block blk_-6181259737853494177 of size 4784646 from /10.250.183.196
+2026-10-14 09:11:19.767 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:11:21.804 DEBUG [http] req 3a7f3cb5 routed to shard 7
+2026-10-14 09:11:23.841 INFO [http] GET /api/v1/users/799  200  484ms  trace=0x3dfb286b
+2026-10-14 09:11:26.878 INFO [app] Config reload requested by operator
+2026-10-14 09:11:28.915 INFO [storage] Received block blk_3941129062118082574 of size 23704870 from /10.250.33.68
+2026-10-14 09:11:30.952 INFO [db] query id=4f46d6a4b72b rows=87 took 323.978 ms
+2026-10-14 09:11:33.989 WARN [db] Connection to 10.0.124.238:5432 closed after timeout of 60000 ms
+2026-10-14 09:11:35.026 INFO [app] Health check passed
+2026-10-14 09:11:37.063 WARN [app] Retrying upload after transient error (attempt 4)
+2026-10-14 09:11:40.100 INFO [storage] Received block blk_-9376886020376134260 of size 58306769 from /10.250.167.39
+2026-10-14 09:11:42.137 INFO [http] GET /api/v1/users/4429  404  712ms  trace=0xaffa2977
+2026-10-14 09:11:44.174 INFO [db] query id=436fb54cb239 rows=3022 took 416.556 ms
+2026-10-14 09:11:47.211 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:11:49.248 WARN [db] Connection to 10.0.66.24:5432 closed after timeout of 30000 ms
+2026-10-14 09:11:51.285 INFO [storage] Received block blk_462952155686987963 of size 26538333 from /10.250.181.60
+2026-10-14 09:11:54.322 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:11:56.359 INFO [app] Background compaction finished without changes
+2026-10-14 09:11:58.396 INFO [db] query id=7276a2083b27 rows=4265 took 136.713 ms
+2026-10-14 09:12:01.433 INFO [http] GET /api/v1/users/4994  200  9ms  trace=0x9d40f515
+2026-10-14 09:12:03.470 INFO [storage] Received block blk_2013830382607435373 of size 38621723 from /10.250.253.253
+2026-10-14 09:12:05.507 WARN [db] Connection to 10.0.7.221:5432 closed after timeout of 3000 ms
+2026-10-14 09:12:08.544 INFO [app] User session expired, redirecting to login page
+2026-10-14 09:12:10.581 INFO [http] GET /api/v1/users/6689  200  362ms  trace=0x3b2b7db4
+2026-10-14 09:12:12.618 INFO [db] query id=a41b55821a55 rows=3096 took 214.850 ms
+2026-10-14 09:12:15.655 INFO [storage] Received block blk_7511930050139325271 of size 55331209 from /10.250.174.187
+2026-10-14 09:12:17.692 INFO [app] User session expired, redirecting to login page
+2026-10-14 09:12:19.729 INFO [http] GET /api/v1/users/9931  200  253ms  trace=0xcd0d2d0d
+2026-10-14 09:12:22.766 WARN [db] Connection to 10.0.233.114:5432 closed after timeout of 60000 ms
+2026-10-14 09:12:24.803 INFO [app] Background compaction finished without changes
+2026-10-14 09:12:26.840 INFO [storage] Received block blk_773512447894951960 of size 44711048 from /10.250.54.187
+2026-10-14 09:12:29.877 INFO [storage] DataNode registration from 10.251.174.163:50010 storage DS-3420
+2026-10-14 09:12:31.914 INFO [app] User session expired, redirecting to login page
+2026-10-14 09:12:33.951 INFO [app] Health check passed
+2026-10-14 09:12:36.988 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:12:38.025 INFO [storage] Received block blk_3068105612091894996 of size 24474501 from /10.250.78.127
+2026-10-14 09:12:40.062 INFO [db] query id=00e7e23e7153 rows=4940 took 328.149 ms
+2026-10-14 09:12:43.099 WARN [app] Retrying upload after transient error (attempt 1)
+2026-10-14 09:12:45.136 INFO [app] Config reload requested by operator
+2026-10-14 09:12:47.173 INFO [http] GET /api/v1/users/4633  404  722ms  trace=0xadd3c853
+2026-10-14 09:12:50.210 INFO [storage] Received block blk_8797175830816502700 of size 47087938 from /10.250.32.88
+2026-10-14 09:12:52.247 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:12:54.284 INFO [storage] DataNode registration from 10.251.99.50:50010 storage DS-6103
+2026-10-14 09:12:57.321 INFO [http] GET /api/v1/users/9492  404  608ms  trace=0x541e66e0
+2026-10-14 09:12:59.358 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:13:01.395 INFO [storage] Received block blk_5764123687861369240 of size 62073630 from /10.250.65.244
+2026-10-14 09:13:04.432 WARN [app] Retrying upload after transient error (attempt 2)
+2026-10-14 09:13:06.469 INFO [http] GET /api/v1/users/6486  404  358ms  trace=0x33af6135
+2026-10-14 09:13:08.506 INFO [db] query id=0878cd8dd4e0 rows=3467 took 502.680 ms
+2026-10-14 09:13:11.543 WARN [app] Retrying upload after transient error (attempt 1)
+2026-10-14 09:13:13.580 INFO [storage] Received block blk_7832857693104862701 of size 58807685 from /10.250.80.89
+2026-10-14 09:13:15.617 INFO [http] GET /api/v1/users/2487  500  731ms  trace=0x3eeff3b5
+2026-10-14 09:13:18.654 INFO [app] Shutting down idle worker pool
+2026-10-14 09:13:20.691 INFO [storage] DataNode registration from 10.251.216.68:50010 storage DS-7288
+2026-10-14 09:13:22.728 INFO [db] query id=a834ccebf87e rows=3818 took 856.254 ms
+2026-10-14 09:13:25.765 INFO [storage] Received block blk_-3225366722518117847 of size 50104834 from /10.250.120.175
+2026-10-14 09:13:27.802 WARN [app] Retrying upload after transient error (attempt 4)
+2026-10-14 09:13:29.839 INFO [app] Shutting down idle worker pool
+2026-10-14 09:13:32.876 INFO [app] Config reload requested by operator
+2026-10-14 09:13:34.913 INFO [http] GET /api/v1/users/198  200  809ms  trace=0xdcf1ac9f
+2026-10-14 09:13:36.950 INFO [storage] Received block blk_-9748685063420532049 of size 3277190 from /10.250.224.85
+2026-10-14 09:13:39.987 INFO [app] User session expired, redirecting to login page
+2026-10-14 09:13:41.024 WARN [app] Retrying upload after transient error (attempt 2)
+2026-10-14 09:13:43.061 INFO [http] GET /api/v1/users/6673  200  939ms  trace=0xae498cbe
+2026-10-14 09:13:46.098 INFO [storage] DataNode registration from 10.251.96.222:50010 storage DS-3090
+2026-10-14 09:13:48.135 INFO [storage] Received block blk_-4277208115252472245 of size 29430495 from /10.250.247.103
+2026-10-14 09:13:50.172 INFO [db] query id=e5260a07826a rows=1765 took 266.410 ms
+2026-10-14 09:13:53.209 INFO [http] GET /api/v1/users/5773  200  78ms  trace=0x2c8c1b36
+2026-10-14 09:13:55.246 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:13:57.283 INFO [app] Shutting down idle worker pool
+2026-10-14 09:14:00.320 INFO [storage] Received block blk_4653049443969598075 of size 34069770 from /10.250.238.250
+2026-10-14 09:14:02.357 INFO [http] GET /api/v1/users/4217  200  930ms  trace=0x1b9a59e4
+2026-10-14 09:14:04.394 INFO [db] query id=6364d5e40c3f rows=2497 took 375.917 ms
+2026-10-14 09:14:07.431 INFO [app] Config reload requested by operator
+2026-10-14 09:14:09.468 INFO [app] Background compaction finished without changes
+2026-10-14 09:14:11.505 INFO [storage] Received block blk_7686758490829984516 of size 10651937 from /10.250.64.237
+2026-10-14 09:14:14.542 INFO [app] Cache warmup complete, serving from memory
+2026-10-14 09:14:16.579 INFO [app] Config reload requested by operator
+2026-10-14 09:14:18.616 INFO [db] query id=4320362c0bfa rows=2627 took 539.373 ms
+2026-10-14 09:14:21.653 INFO [http] GET /api/v1/users/9210  200  317ms  trace=0x192f9da6
+2026-10-14 09:14:23.690 INFO [storage] Received block blk_-2101944104073979860 of size 48074462 from /10.250.223.248
+2026-10-14 09:14:25.727 INFO [app] Config reload requested by operator
+2026-10-14 09:14:28.764 INFO [app] Background compaction finished without changes
+2026-10-14 09:14:30.801 INFO [http] GET /api/v1/users/3563  404  539ms  trace=0x3e5c01ef
+2026-10-14 09:14:32.838 INFO [db] query id=581a9e84b9e4 rows=1335 took 104.570 ms
+2026-10-14 09:14:35.875 INFO [storage] Received block blk_2320348961031869607 of size 41138385 from /10.250.171.76
+2026-10-14 09:14:37.912 INFO [storage] DataNode registration from 10.251.108.236:50010 storage DS-0907
+2026-10-14 09:14:39.949 INFO [http] GET /api/v1/users/3953  200  140ms  trace=0x80c81bb8
+2026-10-14 09:14:42.986 INFO [app] Health check passed
+2026-10-14 09:14:44.023 WARN [app] Retrying upload after transient error (attempt 5)
+2026-10-14 09:14:46.060 INFO [storage] Received block blk_2122372854603311504 of size 54558246 from /10.250.232.96
+2026-10-14 09:14:49.097 INFO [http] GET /api/v1/users/6108  200  902ms  trace=0xe208c6d5
+2026-10-14 09:14:51.134 INFO [app] Rate limiter engaged for tenant acme
+2026-10-14 09:14:53.171 INFO [app] Shutting down idle worker pool
+2026-10-14 09:14:56.208 INFO [app] Health check passed
+2026-10-14 09:14:58.245 INFO [storage] Received block blk_646660739785056710 of size 65138170 from /10.250.223.198
+2026-10-14 09:15:00.282 INFO [db] query id=696992291281 rows=4838 took 662.174 ms
+2026-10-14 09:15:03.319 INFO [app] Shutting down idle worker pool
+2026-10-14 09:15:05.356 INFO [app] Background compaction finished without changes
+2026-10-14 09:15:07.393 INFO [http] GET /api/v1/users/9003  200  779ms  trace=0x0e37ee0c
+2026-10-14 09:15:10.430 INFO [storage] Received block blk_6833365816927323900 of size 29307112 from /10.250.23.47
+2026-10-14 09:15:12.467 INFO [storage] Wrote checkpoint to /var/lib/app/data/seg-399865.dat in 0098 ms
+2026-10-14 09:15:14.504 INFO [db] query id=fa78055d4612 rows=3734 took 410.466 ms
+2026-10-14 09:15:17.541 INFO [http] GET /api/v1/users/2817  500  44ms  trace=0x9b0a9067
+2026-10-14 09:15:19.578 INFO [app] User session expired, redirecting to login page
+2026-10-14 09:15:21.615 INFO [storage] Received block blk_-6862162039660227212 of size 37046215 from /10.250.12.115
+2026-10-14 09:15:24.652 INFO [app] Config reload requested by operator
+2026-10-14 09:15:26.689 INFO [http] GET /api/v1/users/8546  200  991ms  trace=0xb762fbf2
+2026-10-14 09:15:28.726 INFO [db] query id=afbfc845b33d rows=3766 took 18.556 ms
+2026-10-14 09:15:31.763 INFO [app] Background compaction finished without changes

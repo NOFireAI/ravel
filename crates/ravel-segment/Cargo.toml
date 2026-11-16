@@ -1,0 +1,44 @@
+[package]
+name = "ravel-segment"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# Test-only (ADR-4233 decision 9, issue #4242): adds the drill version, v7's
+# bytes under trailer version 8, and widens the reader window to {8, 7} so
+# compatibility tests run against two real versions. Off by default;
+# scripts/guards/check-release-profile.sh refuses it in the published-image
+# build and in any default or non-dev feature set.
+format-drill = []
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-proto = { workspace = true }
+ravel-codec = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+blake3 = { workspace = true }
+crc32c = { workspace = true }
+zstd = { workspace = true }
+lz4_flex = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true }
+criterion = { workspace = true }
+crc32c = { workspace = true }
+
+# tests/value_page_peak.rs installs jemalloc as its test binary's global
+# allocator and reads its per-thread allocated-bytes counter, to pin that an
+# ALP or GCD value page decodes within the 8 bytes per sample the query
+# fetcher charges for it (issue #4198). The same versions ravel-server and
+# ravel-query link; nothing new enters Cargo.lock.
+[target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
+tikv-jemallocator = { workspace = true }
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
+
+[lints]
+workspace = true

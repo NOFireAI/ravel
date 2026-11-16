@@ -1,0 +1,247 @@
+//! Process-global counters for one [`crate::Cache`], flat `AtomicU64`s
+//! behind an `Arc`, in the shape `StoreMetrics`/`StoreMetrics::snapshot`
+//! use in `ravel-object-store::instrument`: no per-key dimension, a
+//! [`CacheMetrics::snapshot`] that is a scrape rather than a consistent
+//! cut across fields, and no dependency on `ravel-types` or
+//! `QueryAccounting` (a later task wires this crate's counters into
+//! `QueryAccounting`; this crate does not reference it).
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::AccessIntent;
+
+/// Shared counters for one `Cache`, held behind an `Arc` and cloned out
+/// with [`crate::Cache::metrics`] so a scrape path can read them without
+/// touching the cache itself.
+#[derive(Debug, Default)]
+pub struct CacheMetrics {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    bytes_served: AtomicU64,
+    bytes_admitted: AtomicU64,
+    admissions_rejected_size: AtomicU64,
+    evictions: AtomicU64,
+    single_flight_collapses: AtomicU64,
+    single_flight_cancelled_leader_reentries: AtomicU64,
+    disk_errors_degraded_to_misses: AtomicU64,
+    disk_entries_expired_max_age: AtomicU64,
+    admission_copies: AtomicU64,
+    admission_copied_bytes: AtomicU64,
+    /// Indexed by [`intent_index`].
+    intent_hits: [AtomicU64; 3],
+    intent_bytes_served: [AtomicU64; 3],
+    bulk_bookkeeping_bytes: AtomicU64,
+}
+
+fn intent_index(intent: AccessIntent) -> usize {
+    match intent {
+        AccessIntent::Interactive => 0,
+        AccessIntent::BulkScan => 1,
+        AccessIntent::Maintenance => 2,
+    }
+}
+
+impl CacheMetrics {
+    pub(crate) fn record_hit(&self, bytes: u64) {
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        self.bytes_served.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// A RAM-tier hit, counted in [`Self::record_hit`]'s totals and under its
+    /// intent. The disk tier records plain hits and no intent.
+    pub(crate) fn record_hit_with_intent(&self, intent: AccessIntent, bytes: u64) {
+        self.record_hit(bytes);
+        let index = intent_index(intent);
+        self.intent_hits[index].fetch_add(1, Ordering::Relaxed);
+        self.intent_bytes_served[index].fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Publishes the bulk region's current bookkeeping bytes, a gauge. Stores
+    /// only when the value changed, so a lookup on a cache with no bulk
+    /// region writes nothing.
+    pub(crate) fn set_bulk_bookkeeping_bytes(&self, bytes: u64) {
+        if self.bulk_bookkeeping_bytes.load(Ordering::Relaxed) != bytes {
+            self.bulk_bookkeeping_bytes.store(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Hits and bytes served split by [`AccessIntent`], and the bulk region's
+    /// bookkeeping bytes. Read on its own, like [`Self::admission_copies`],
+    /// because [`CacheMetricsSnapshot`] is built field by field outside this
+    /// crate. A scrape, not a consistent cut, as [`Self::snapshot`] is.
+    pub fn intent_snapshot(&self) -> IntentMetricsSnapshot {
+        let counters = |intent| {
+            let index = intent_index(intent);
+            IntentCounters {
+                hits: self.intent_hits[index].load(Ordering::Relaxed),
+                bytes_served: self.intent_bytes_served[index].load(Ordering::Relaxed),
+            }
+        };
+        IntentMetricsSnapshot {
+            interactive: counters(AccessIntent::Interactive),
+            bulk_scan: counters(AccessIntent::BulkScan),
+            maintenance: counters(AccessIntent::Maintenance),
+            bulk_bookkeeping_bytes: self.bulk_bookkeeping_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn record_miss(&self) {
+        self.misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_admission(&self, bytes: u64) {
+        self.bytes_admitted.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_rejected_size(&self) {
+        self.admissions_rejected_size
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_eviction(&self) {
+        self.evictions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_collapse(&self) {
+        self.single_flight_collapses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A follower whose single-flight leader was cancelled re-entered the slot
+    /// `n` times (issue #4174). Separate from [`Self::record_collapse`]: a
+    /// re-entry is not a collapse, and a re-entering follower that then took
+    /// over leadership and ran its own fetch records re-entries here but no
+    /// collapse. `n` is the whole re-entry count for one `run`, added at once.
+    /// No `/metrics` surface renders this yet, so it names no metric family.
+    pub(crate) fn record_cancelled_leader_reentries(&self, n: u32) {
+        self.single_flight_cancelled_leader_reentries
+            .fetch_add(u64::from(n), Ordering::Relaxed);
+    }
+
+    /// Followers that lost a cancelled single-flight leader and re-entered the
+    /// slot, summed across calls (issue #4174). One increment per re-entry, so
+    /// a follower that took over leadership after one cancellation reads 1 here
+    /// and nothing on [`Self::record_collapse`]'s counter. Read on its own
+    /// rather than through [`Self::snapshot`] -- like [`Self::admission_copies`],
+    /// because [`CacheMetricsSnapshot`] is built field by field outside this
+    /// crate and a new field would break those constructions. Nothing renders a
+    /// metric family for it yet.
+    pub fn single_flight_cancelled_leader_reentries(&self) -> u64 {
+        self.single_flight_cancelled_leader_reentries
+            .load(Ordering::Relaxed)
+    }
+
+    /// A disk-tier read found an entry at its canonical path but discarded it
+    /// (short read, bad header, key mismatch, oversize, truncated payload, or
+    /// a failed crc32c check) rather than a clean "nothing at this path"
+    /// miss. Distinct from [`Self::record_miss`], which every discarded read
+    /// still also records: this counter exists to separate "the cache never
+    /// had it" from "the disk tier is unhealthy," the latter being operable.
+    pub(crate) fn record_disk_error(&self) {
+        self.disk_errors_degraded_to_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A disk-tier read (or the startup scan) found a well-formed entry whose
+    /// stamped write time is older than the configured max-age and dropped it
+    /// rather than serving it (ADR-0064). Distinct from
+    /// [`Self::record_disk_error`]: the entry was not corrupt or foreign, it
+    /// simply aged out. The dropped read still records a plain miss.
+    pub(crate) fn record_expired_max_age(&self) {
+        self.disk_entries_expired_max_age
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A RAM-tier admission made an exact-size copy of the value to store in
+    /// place of the value itself, because the value did not solely own an
+    /// allocation of exactly its own length (see `Cache::insert`). Recorded
+    /// where the copy is made, whether or not the entry is then stored.
+    pub(crate) fn record_admission_copy(&self, bytes: u64) {
+        self.admission_copies.fetch_add(1, Ordering::Relaxed);
+        self.admission_copied_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// RAM-tier admissions that copied the value given, whether or not the
+    /// copy was then stored (`ravel_cache_admission_copies_total`). Read on
+    /// its own rather than
+    /// through [`Self::snapshot`] because [`CacheMetricsSnapshot`] is built
+    /// field by field outside this crate.
+    pub fn admission_copies(&self) -> u64 {
+        self.admission_copies.load(Ordering::Relaxed)
+    }
+
+    /// Bytes copied by those admissions
+    /// (`ravel_cache_admission_copied_bytes_total`).
+    pub fn admission_copied_bytes(&self) -> u64 {
+        self.admission_copied_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Point-in-time copy of every counter but the two admission-copy ones, the
+    /// per-intent ones, and the cancelled-leader re-entry counter above, each of
+    /// which is read through its own accessor. Not atomic across fields:
+    /// concurrent calls may land between two loads, so a snapshot can show
+    /// `hits` from a hair later than `misses`. It is a scrape, not a
+    /// consistent cut, and nothing correctness-bearing reads it.
+    pub fn snapshot(&self) -> CacheMetricsSnapshot {
+        CacheMetricsSnapshot {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            bytes_served: self.bytes_served.load(Ordering::Relaxed),
+            bytes_admitted: self.bytes_admitted.load(Ordering::Relaxed),
+            admissions_rejected_size: self.admissions_rejected_size.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            single_flight_collapses: self.single_flight_collapses.load(Ordering::Relaxed),
+            disk_errors_degraded_to_misses: self
+                .disk_errors_degraded_to_misses
+                .load(Ordering::Relaxed),
+            disk_entries_expired_max_age: self.disk_entries_expired_max_age.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Point-in-time copy of a whole [`CacheMetrics`]. Plain `u64`s, so it is
+/// `Copy` and needs no allocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheMetricsSnapshot {
+    pub hits: u64,
+    pub misses: u64,
+    pub bytes_served: u64,
+    pub bytes_admitted: u64,
+    pub admissions_rejected_size: u64,
+    pub evictions: u64,
+    pub single_flight_collapses: u64,
+    pub disk_errors_degraded_to_misses: u64,
+    pub disk_entries_expired_max_age: u64,
+}
+
+/// Hits and bytes served for one [`AccessIntent`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IntentCounters {
+    pub hits: u64,
+    pub bytes_served: u64,
+}
+
+/// Point-in-time copy of [`CacheMetrics`]' per-intent counters, from
+/// [`CacheMetrics::intent_snapshot`]. On a RAM tier the three intents' hits
+/// sum to [`CacheMetricsSnapshot::hits`]; a disk tier records no intent and
+/// reads zero here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IntentMetricsSnapshot {
+    pub interactive: IntentCounters,
+    pub bulk_scan: IntentCounters,
+    pub maintenance: IntentCounters,
+    /// The bulk region's bookkeeping bytes, charged inside `max_bytes`; a
+    /// gauge, not a counter.
+    pub bulk_bookkeeping_bytes: u64,
+}
+
+impl IntentMetricsSnapshot {
+    /// The counters for `intent`.
+    pub fn for_intent(&self, intent: AccessIntent) -> IntentCounters {
+        match intent {
+            AccessIntent::Interactive => self.interactive,
+            AccessIntent::BulkScan => self.bulk_scan,
+            AccessIntent::Maintenance => self.maintenance,
+        }
+    }
+}

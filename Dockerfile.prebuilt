@@ -1,0 +1,73 @@
+# Runtime-only image assembly from binaries built outside Docker (ADR-0034,
+# decision 7).
+#
+# This is the CI companion to the root Dockerfile, not a replacement for it.
+# The root Dockerfile is self-contained: its builder stage compiles the
+# workspace from scratch inside Docker, which is what a release build and a
+# from-nothing local build need. That is also its cost -- a cold release build
+# of this workspace with the builder's CARGO_BUILD_JOBS=2 cap took 57 minutes
+# on the 8 GiB arm64 development host, and it cannot reuse the host's cargo
+# or GitHub Actions cache at all.
+#
+# The `k8s-build` job in .github/workflows/ci.yml (and in k8s-nightly.yml)
+# therefore builds the release binaries with scripts/build-prebuilt-binaries.sh,
+# against the target/ and cargo caches Swatinem/rust-cache restores on the
+# runner, and assembles the images from those binaries here.
+# `scripts/kind-up.sh RAVEL_SKIP_IMAGE_BUILD=1` exists for exactly this split.
+#
+# That script runs the cargo build inside the root Dockerfile's builder image
+# (rust:1.97.1-bookworm), not on the runner, so the binaries link against the
+# same glibc as the shipping build (2.36) and this file can use the shipping
+# runtime base. A binary built on the runner itself links against the
+# runner's glibc and fails to exec on an older base: Ubuntu 24.04 (2.39)
+# binaries needed GLIBC_2.38 and GLIBC_2.39 here, and Ubuntu 26.04 (2.43)
+# ones need GLIBC_2.43 (k8s-nightly run 39536520848, #3146).
+#
+# The build context is a directory holding just the three binaries (the repo root
+# cannot be used: .dockerignore excludes target/ from it, deliberately, so that
+# build artifacts never enter the root build context). Both stages mirror the
+# root Dockerfile's runtime stages -- same base, same paths, same entrypoints --
+# so the lane tests the image that ships as closely as it can.
+#
+# Usage (see the `k8s-integration` job for the real invocation):
+#
+#   ctx=$(mktemp -d)
+#   cp target/release/ravel-server target/release/ravel-cli target/release/ravel-operator "$ctx/"
+#   docker build --file Dockerfile.prebuilt --target server \
+#     --tag ravel-server:kind-ci "$ctx"
+#   docker build --file Dockerfile.prebuilt --target operator \
+#     --tag ravel-operator:kind-ci "$ctx"
+#
+# The binaries must be Linux binaries for the target architecture, dynamically
+# linked against a glibc no newer than the base image's, which
+# scripts/build-prebuilt-binaries.sh guarantees. The job smoke-runs
+# `--help` in both images immediately after assembly, so a mismatch surfaces as
+# the dynamic linker's own message rather than as a pod CrashLoopBackOff minutes
+# later.
+ARG RUNTIME_BASE=gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
+
+# ---- Runtime: server image --------------------------------------------------
+FROM ${RUNTIME_BASE} AS server
+
+COPY ravel-server /usr/local/bin/ravel-server
+# ravel-cli ships alongside ravel-server here too (matching the root
+# Dockerfile), not because anything in the operator or the manifests invokes
+# it, but because scripts/kind-up.sh's store-qualification Job (ADR-0050
+# section 6, EC7/#623) runs `ravel-cli store qualify` from inside this image
+# before the RavelCluster's own pods start -- there is no bootstrap path for
+# the qualification record, so this is the only place that write can happen.
+COPY ravel-cli /usr/local/bin/ravel-cli
+
+# Documentation only: HTTP (OTLP/HTTP, health) and gRPC (OTLP/gRPC) ports.
+EXPOSE 4318 4317
+
+# No default CMD, matching the root Dockerfile: the operator supplies every
+# argument from the CRD.
+ENTRYPOINT ["/usr/local/bin/ravel-server"]
+
+# ---- Runtime: operator image ------------------------------------------------
+FROM ${RUNTIME_BASE} AS operator
+
+COPY ravel-operator /usr/local/bin/ravel-operator
+
+ENTRYPOINT ["/usr/local/bin/ravel-operator"]

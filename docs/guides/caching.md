@@ -1,0 +1,853 @@
+# Read cache
+
+Ravel keeps every durable byte in object storage. Object storage is slower
+than local memory. The read cache keeps recently read bytes close to the query
+engine, so a repeat read of the same data does not go back to object storage.
+
+A process runs two of them, and every flag and metric on this page covers
+both:
+
+- the **fetcher cache**, holding byte ranges of the data objects a query
+  scans, reported under `cache="fetch"`;
+- the **catalog byte cache**, holding the catalog objects a resolve reads,
+  reported under `cache="catalog"`.
+
+The cache is an optimization only. It never changes a query result. A process
+with the cache off, or one that restarted with an empty cache, answers every
+query correctly and only more slowly.
+
+## What gets cached
+
+The cache stores byte ranges read from two kinds of objects:
+
+- **Metric segments (RSEG).** A metric query reads the footer of a segment,
+  then the catalog sections that it needs, then only the page ranges that
+  match the query. Each of these byte ranges is cached separately.
+- **Log objects (RLOG).** The cached unit depends on the size of the object,
+  against `--logs-block-range-threshold` (512 KiB by default):
+  - A log query reads a smaller object whole, so the cached unit is the whole
+    object.
+  - For a larger object, the query reads only the blocks that time and
+    predicate pruning kept: a probe of the tail of the object, the directory
+    sections that it needs, and the candidate blocks. Adjacent blocks are
+    fetched together in one request. Each of those is cached separately, one
+    entry per block, so a later query whose blocks partly overlap reuses what
+    it can.
+  - Set the threshold to `18446744073709551615` to read every log object whole
+    regardless of size.
+
+Both PromQL queries and SQL queries over the `samples` table use the metric
+path. SQL queries over the `logs`, `alerts` and `audit` tables use the log
+path.
+
+Each cache entry is keyed by tenant, the content hash of the object that it
+came from, and the byte offset and length. Content is immutable once written,
+so a cache entry never goes stale. It is the right bytes, or it is not
+present.
+
+### Log objects on default flags
+
+Against a remote store on default flags, Ravel makes the choice per object
+against a projection break-even. `--logs-fetch-policy` defaults to
+`cost-based` there, and at the shipped reference cost profile the break-even
+is 18,900,000 bytes:
+
+- The blocks of an object of that size or less are read in one whole-object
+  GET with no tail probe.
+- A larger object takes the block-range shape when the bytes that its
+  projection skips exceed the break-even. Otherwise it is read whole.
+- To get the block-range shape for every object that the threshold routes
+  there, set `--logs-fetch-policy byte-minimal` explicitly.
+
+Against a loopback `--s3-endpoint`, `--logs-fetch-policy` defaults to
+`latency-first` instead, which routes objects as `byte-minimal` does. No
+projection break-even applies there: the routing threshold,
+`--logs-block-range-threshold` (512 KiB by default), is the crossover, so an
+object above it takes the block-range shape. See
+[the cost model](cost-model.md#three-decisions-from-one-value) for the cases.
+
+See the [flag table](#cli-flags), and
+[the cost model](cost-model.md#the-derived-value) for the derivation.
+
+### Alerts and audit records
+
+Alert transitions and audit records are log objects on their own signal
+prefixes. The `alerts` and `audit` tables read them through the same log
+fetcher, so their bytes are cached on the same terms as any other log object:
+
+- whole object or block ranges, by the same size threshold and fetch policy
+- keyed the same way
+- accounted through the same funnel
+- held by whichever tiers the process built: the RAM tier whenever the fetcher
+  cache is built, plus the local-disk tier when `--cache-dir` is set
+
+### Spans are not cached
+
+The `spans` SQL table is queryable on `POST /api/v1/sql`, but its reads are
+uncached. This is the one cache gap.
+
+- The span scan fetches each RSPAN segment straight from the object store on
+  every query. RSPAN reads have no cache seam.
+- The fetch is accounted and tenant-checked. The tenant identity that the log
+  path uses to key its cache entries serves only as that tenant check here.
+- A repeated span query therefore reads the same objects again.
+
+## Two tiers
+
+The cache has a RAM tier and a local-disk tier.
+
+The RAM tier is on unless `--disable-cache` is set or the ceiling of the
+fetcher cache is `0`:
+
+- A `--cache-max-bytes` of `0` builds no fetcher cache.
+- A gateway with no cache flag set resolves all three ceilings to `0`.
+
+The disk tier is opt-in. `--cache-dir <path>` attaches a local-disk tier at
+that directory to both the fetcher cache and the catalog byte cache. A RAM
+eviction is then served from local disk and does not pay the object-store
+round trip again. With no `--cache-dir`, the process has a RAM tier only.
+
+The disk tier is disposable:
+
+- Its directory is created lazily on first admission and is never required to
+  exist.
+- A missing, full, or corrupt cache directory degrades to a store read, never
+  a query error. A node whose cache directory is deleted mid-flight answers
+  every query correctly and only more slowly.
+- Nothing durable is ever written there.
+- A cache directory from a previous release is discarded and rebuilt, not
+  repaired.
+
+### Encryption at rest
+
+Ravel does **not** encrypt the bytes that it writes to the cache directory,
+even with SSE-KMS configured for object storage. SSE-KMS protects object bytes
+at rest in the store, not the local cache. If you need bytes-at-rest
+encryption for the cache directory, provide it at the filesystem/volume layer
+(an encrypted volume mounted at `--cache-dir`).
+
+Ravel does restrict who can read those plaintext bytes locally. On Unix it
+creates each cache entry file owner-read-write only (`0600`) and each cache
+directory that it creates owner-only (`0700`), whatever the ambient umask is.
+That is filesystem permissions, not encryption. It stops another local user
+reading the bytes, and it does nothing against anyone who can read the volume
+itself.
+
+Ravel sets modes within its own namespace subtree under the
+configured directory, and never on the configured directory
+itself: a cache root you create yourself keeps the mode you gave
+it, while a root that does not exist yet is created owner-only along with
+any missing ancestor of it. On startup Ravel also narrows the directories
+and entries beneath its namespace that an older build left at the ambient
+umask, so upgrading a node in place closes the same gap on a cache tree that
+already exists.
+
+A tree from before the per-instance namespace layout sits beside the
+namespace, not under it, and the startup narrowing does not reach it. Remove
+it with `ravel-cli cache reclaim-legacy --cache-dir <dir> --apply`. Without
+`--apply` the command only lists. See the section of the maintenance guide on
+reclaiming a pre-namespacing cache directory.
+
+## CLI flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--cache-max-bytes <n>` | derived: 25% of the process memory budget, or 24% against a loopback `--s3-endpoint` (`268435456`, 256 MiB, when memory cannot be read; `0` in `--mode gateway`) | Maximum bytes the fetcher cache's RAM tier holds. Bounds the fetcher cache only; the catalog byte cache has its own `--catalog-cache-max-bytes` below and this flag never reaches it. **Unset**, it derives from the process memory budget (effective, cgroup-capped memory minus an overhead reserve, not raw host memory -- fixed at 2 GiB from 8 GiB of memory up and scaled down below it at the default ingest ceiling, and raised above 2 GiB in `--mode all` by an ingest ceiling above 1.75 GiB, see the [configuration guide](operations/configuration.md)): 25% (`7516192768` on the 30 GiB reference host) normally, or 24% (`7215545057` there) when the store is `s3` against a loopback endpoint. The loopback share comes from a ClickBench measurement on a RustFS loopback store: a cache of about 7 GB in place of the earlier 40% carve cut the concurrent error ratio from 0.099 to 0.029 at the same hot time, because the cache is carved from the budget that queries and fetches share. That gain has a cost: with the smaller carve alone, concurrent throughput was 11% lower (0.512 QPS against 0.574), while the smaller carve together with the loopback `latency-first` default raised it to 0.678 QPS. Set `--cache-max-bytes` to keep a larger cache. Startup refuses to start, rather than silently clamping, if an explicit value here together with the catalog byte cache's and the column-statistics cache's ceilings brings their sum to or above the process memory budget (not under `--disable-cache`, which builds none of these caches, so no cap claims anything, and not in `--mode gateway`, which serves no query and derives no memory budget). Read once at startup; there is no live resize. |
+| `--catalog-cache-max-bytes <n>` | derived: 5% of the process memory budget (`268435456`, 256 MiB, when memory cannot be read; `0` in `--mode gateway`) | Maximum bytes the catalog byte cache's RAM tier holds. A separate ceiling from `--cache-max-bytes` above; unset, it derives its own 5% share of the process memory budget (`1503238553` on the 30 GiB reference host) regardless of `--cache-max-bytes` or the loopback share it may have taken. Counted in the same startup refusal as `--cache-max-bytes`. Read once at startup. |
+| `--column-stats-cache-max-bytes <n>` | derived: 2% of the process memory budget (`67108864`, 64 MiB, when memory cannot be read; `0` in `--mode gateway`) | Maximum bytes the catalog's column-statistics cache holds: the decoded `.cstat` objects the resolve path reuses, one entry per snapshot part holding that part's summaries and only the dictionaries statements have asked for. A separate ceiling from the two flags above, RAM only, with no disk tier under `--cache-dir`. An entry larger than the ceiling is served but not cached. Unset, it derives its own 2% share of the process memory budget (`601295421` on the 30 GiB reference host), the same on a loopback store. The share was sized when an entry held a whole decoded `.cstat` (266,736,092 bytes on that host, of which 1.83 MB is summaries and the rest per-value dictionaries); a part's entry now holds its summaries plus only the requested dictionaries. `0` builds no column-statistics cache, and so does `--disable-cache`. Counted in the same startup refusal as `--cache-max-bytes`. Read once at startup. |
+| `--catalog-record-cache-max-bytes-per-tenant <bytes>` | `45000000` (45 MB) | Per-tenant byte budget of the catalog's two record caches. It is per actively-queried tenant and sits outside the process memory budget's shares, so it is counted in no startup refusal above. Each cache gets at most half of it, and the derived capacity is capped at the budget divided by 1,800 bytes, so raising it lets a tenant keep more of its unsealed tail resident; see [the catalog record caches](#the-catalog-record-caches). Startup refuses a value below the default, the flag together with `--disable-cache`, and the flag in `--mode gateway`, which reads no record cache. Read once at startup. |
+| `--cache-dir <path>` | none | Directory for the local-disk tier. Set, both the fetcher cache and the catalog byte cache gain a disk tier at this path, each bounded by its own resolved RAM ceiling: the fetcher cache's disk tier by its resolved `--cache-max-bytes`, the catalog byte cache's by its resolved `--catalog-cache-max-bytes`. There is no separate disk-tier capacity flag. Absent, the process has a RAM tier only. Bytes written here are not SSE-KMS encrypted, and on Unix Ravel keeps what it writes here readable by its own user only (see "Two tiers" above for both). |
+| `--cache-bulk-share <fraction>` | `0.5` | Share of the fetcher cache's RAM tier (`--cache-max-bytes`) that `bulk_scan` reads hold against interactive admissions, strictly between 0 and 1. See [admission by access intent](#admission-by-access-intent) for what the region does with it and [which statements read as bulk](#which-statements-read-as-bulk) for what reaches it. It applies to the RAM tier only: the disk tier admits every read under its own policy whatever its intent. `0`, `1`, a value outside that range, and `NaN` are refused at startup. Ignored when the fetcher cache is off. Read once at startup. |
+| `--cache-bulk-scan-min-bytes <bytes>` | unset | Read bytes at or above which a filtered `logs` statement sent as SQL text reads as `bulk_scan` from its next execution, unless it is a KEY_IDX key lookup; a `samples` statement, or one that did not arrive as SQL text, is never affected; see [which statements read as bulk](#which-statements-read-as-bulk). The threshold in force is this value raised to `--cache-max-bytes`, the RAM tier's size, when that is larger (a `--cache-dir` disk tier adds nothing to it); with the fetcher cache off it is this value as given. Startup logs it on a `performance default resolved` line with `setting="cache_bulk_scan_min_bytes"`, whose `source` is `flag`, or `flag-floored-to-cache-max-bytes` when the cache size replaced it. Unset, only the predicate-free rule applies. Read once at startup. |
+| `--disable-cache` | off | Turns **both** caches off, and the catalog's column-statistics cache with them. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. It covers the caches of object bytes only: the catalog's two per-tenant record caches stay on, held at their 10,000-entry floor rather than the derived capacity, about 18 MB per actively-queried tenant. See [the catalog record caches](#the-catalog-record-caches). Because none of these caches exists, no ceiling is charged against the process memory budget: the whole budget goes to the shared SQL/fetch accountant, and the startup refusal above cannot fire, whatever `--cache-max-bytes` says. |
+| `--logs-block-range-threshold <bytes>` | `524288` (512 KiB) | Log-object size above which a `logs` query reads only the pruning-relevant blocks (a tail probe plus per-block ranges, cached per block) instead of the whole object. Set it to `18446744073709551615` to read every log object whole regardless of size; set it to `0` to use the block-range path for every object. Read once at startup. Under a resolved fetch policy that reads every object whole (`--logs-fetch-policy request-minimal`, or `cost-based` at a profile whose bytes are free and which records no request timings) this flag is **overridden**, and startup logs a WARN naming the value it overrode. Under `cost-based` with a rate derived from the profile, the shipped default, it is kept, and a narrow projection is read ranged only where it skips more than the projection break-even, the larger of this threshold and three request costs. |
+| `--logs-fetch-policy <policy>` | `latency-first` against a loopback `--s3-endpoint`, `cost-based` otherwise | The logs read shape. `request-minimal` reads every object whole in one covering GET, with no tail probe and no ranged read: the cost-preferring shape where transfer is free and the object-store bill is requests. `byte-minimal` uses ranged reads wherever they save more bytes than a request costs, for egress-billed or network-constrained deployments. `cost-based` derives the choice from `--store-cost-profile`, as the larger of its price term and its time term; at the shipped reference profile (intra-region, transfer free) the rate is the time term, 6,300,000 bytes per request, so **a deployment on default flags against a remote store reads a log object whole unless the bytes a narrow projection skips exceed the 18,900,000-byte projection break-even**, which no object of that size or less can. `latency-first` resolves the same byte quantities as `byte-minimal`; it is the unset default against a loopback `--s3-endpoint`, where it measured faster cold than `cost-based` at the default concurrency, and elsewhere an intent for deployments where cold wall-clock matters more than the request bill, which on real S3 pays off only once GET concurrency is also raised explicitly (it sets no concurrency default of its own), which carries a memory caveat -- see the operations guide before turning it on. An explicit flag wins, on a loopback endpoint too: `--logs-fetch-policy cost-based` keeps the remote default there. Read once at startup; the running process never changes its own policy. The resolved policy, its source (`flag`, `default` or `default-loopback`), the profile, and the byte quantities are logged at startup on the `logs fetch policy resolved` line. |
+| `--store-cost-profile <path>` | reference profile (`s3-intra-region-2026`) | TOML file carrying this deployment's object-store prices in integer nanodollars: `name`, `put_class_nanodollars`, `get_class_nanodollars`, `transfer_nanodollars_per_gib`, `retrieval_nanodollars_per_gib`, and optionally `delete_class_nanodollars` and the measured request timings `request_latency_micros` and `per_connection_throughput_bytes_per_s` (both or neither), with `timings_measured` naming where they were measured. Only `--logs-fetch-policy cost-based` reads it, to derive how many transferred bytes one saved request is worth; no price reaches the fetch layer. An unreadable file, invalid TOML, an unknown key, one timing without the other, or a blank `name` fails startup rather than falling back to the reference prices. |
+| `--logs-max-fetch-run-bytes <bytes>` | `67108864` (64 MiB) | The fetch bound: the maximum length of one covering GET on the log path, on every policy. An object at or under it is read in a single request; a larger one is read as sequential block-aligned covering sub-ranges of at most this many bytes each, so one oversized object cannot pull an unbounded response into memory. `0` is refused at startup. |
+
+Both `--cache-max-bytes` and `--catalog-cache-max-bytes` are **caps, not
+reservations**. Neither cache pre-allocates its ceiling. Each holds only the
+bytes that it admitted and, once it reaches its cap, evicts with S3-FIFO, not
+least-recently-used. A new entry starts in a probation queue, an entry read
+again while there moves to a main queue when it leaves probation, and an
+entry read only once is evicted from probation. Probation is a tenth of the
+cap, and while it holds more than that, eviction takes from it first, so a
+long scan of data read once each passes through probation instead of
+evicting the main queue. The ceiling is an upper bound on resident cache
+bytes, not memory claimed at startup.
+
+The **sum of every ceiling can exceed physical RAM**. The three caches are
+independent, and the SQL memory pools (`--sql-max-query-bytes`,
+`--sql-tenant-max-bytes`) are bounded separately again. On the reference host,
+the following sum is more than 100% of raw host memory:
+
+- the fetcher cache (25% of the process memory budget by default, or 24%
+  against a loopback store)
+- the catalog byte cache (5%)
+- the column-statistics cache (2%)
+- the SQL pools
+
+The peaks do not coincide the way the arithmetic sum suggests. The caches only
+fill under a working set that touches that many distinct bytes, and the SQL
+pools abort a query and do not grow past their own ceiling. Size a host
+against its real working set, not against the sum of the caps.
+
+On a memory-constrained host:
+
+- To bound a cache, set an explicit `--cache-max-bytes`,
+  `--catalog-cache-max-bytes` or `--column-stats-cache-max-bytes`.
+- To hold no read-cache memory at all and leave the entire process memory
+  budget to the query path, set `--disable-cache`. The flag does not reach
+  [the catalog record caches](#the-catalog-record-caches), which are not read
+  caches of object bytes and cost about 18 MB per actively-queried tenant
+  under it.
+
+### Admission by access intent
+
+Each read of a RAM tier carries an access intent. The intent decides where
+the read's bytes are admitted and never what the read returns:
+
+- `interactive`: the S3-FIFO policy above.
+- `bulk_scan`, for a predicate-free SQL statement over one signal table
+  whose window runs from the epoch to now, or, with
+  `--cache-bulk-scan-min-bytes` set, a `logs` statement sent as SQL text
+  that read at least the RAM tier's size the last time it ran and is not a
+  key lookup (the full rule is under
+  [which statements read as bulk](#which-statements-read-as-bulk)): a hit
+  does not count toward promotion, and a bulk read never moves bytes into
+  the main queue. The bytes go to a bulk region, which holds up to its share
+  of the cap (`--cache-bulk-share`, half by default) against interactive
+  admissions and more while the probation and main queues leave bytes
+  unused. An `interactive` read of a region entry
+  moves it to probation, from where it can reach the main queue like any
+  entry read twice. When a repeated scan is larger than the region, the
+  region keeps one subset of its objects, chosen by a hash of each cache
+  key, and later passes are served that same subset from memory. That holds
+  while each object is re-read within the region entry's life. An entry no
+  read touches is evicted after one to two windows of its tenant's bulk
+  reads, a window being twice the tenant's pass bytes, held between 2 and
+  16 times the cap. For a loop over 8 times the cap an entry therefore
+  lives for 16 to 32 times the cap of reads, and a loop larger than about
+  32 times the cap is served nothing. A bulk read the region declines when
+  it arrives is not copied and evicts nothing. One it accepts is copied, if
+  its bytes need an exact-size copy, before the admission rechecks the room.
+  If another admission took the room in between, the recheck declines it,
+  and the copy already made is still counted: the admission copy counters
+  (`admission_copies`, `admission_copied_bytes`) count copies made, not
+  entries stored. A bulk admission evicts region entries of a higher hash
+  rank than its own, and probation entries only while the region is below
+  its share; a probation entry read again moves to the main queue instead of
+  being evicted. It never evicts the main queue.
+- `maintenance`: admitted to probation, and never moved to the main queue by
+  its own reads. Nothing sets it yet.
+
+The region's share is a reservation, not only a ceiling. An interactive
+admission reclaims bulk bytes above the share before it evicts anything
+else, but the region's bytes up to the share are evicted only once the
+probation and main queues are empty. After bulk reads stop, those bytes stay
+resident: no interactive admission rotates them out while the probation or
+main queue holds anything, and they leave only through later bulk reads,
+an interactive read that moves an entry to probation, or the max-age sweep
+below. A cache that served one whole-tenant
+scan and then only dashboards therefore runs its interactive working set in
+the cap less the bytes the scan left behind, up to the share. Lower
+`--cache-bulk-share` if that matters more than repeated scans.
+
+The region's bookkeeping is counted inside the cap and held to 1% of it: 192
+bytes per region entry and 2048 bytes per tenant whose bulk reads it tracks.
+The region therefore holds at most about `cap / 19200` entries, fewer for
+each tenant it tracks. For objects smaller than about the share times 19200
+bytes (9.6 KB at the default share) that entry count fills before the byte
+share does, and the region holds fewer bytes than its share. A bulk read
+that arrives with the bookkeeping full is declined unless it can replace a
+region entry of a higher rank.
+
+The disk tier applies the interactive policy to every read whatever its
+intent. A disk hit is copied back into RAM under the intent of the read that
+found it.
+
+### Which statements read as bulk
+
+Only the SQL executor sets `bulk_scan`, once per statement attempt, after it
+resolves which segments to read and before it reads any of them. It decides
+from what it knows by then: the resolve, the plan, and, for the size trigger,
+what earlier executions of the same statement read. Two rules
+can set it: the predicate-free rule below, which is always on, and the size
+trigger after it, which is off unless `--cache-bulk-scan-min-bytes` is set.
+The predicate-free rule reads a statement as `bulk_scan` only when all of
+these hold:
+
+- it names exactly one signal table, `samples` or `logs`, and no Parquet
+  table;
+- its plan is predicate-free: no `WHERE` or `HAVING` clause anywhere,
+  subqueries and CTEs included, no join and no `LIMIT`;
+- its window reaches from the Unix epoch to at least now;
+- for `samples`, the resolve pruned no segment and every segment lies
+  inside the window;
+- for `logs`, no erasure is pending and every resolved segment lies inside
+  the window.
+
+Under the predicate-free rule alone, a window that starts after the tenant's
+first data reads as `interactive` even when it holds most of the tenant, and
+so does a query whose metric name or label prunes any segment.
+
+The size trigger applies to `logs` statements only, and only to a statement
+sent as SQL text: `POST /api/v1/sql` and the SQL of alert rules. Flight SQL
+statements never reach it and read as `interactive` whatever they read. With
+`--cache-bulk-scan-min-bytes <BYTES>` set (it is unset by default), a
+statement the predicate-free rule left `interactive` reads as `bulk_scan`
+when all of these hold, whatever its `WHERE`, `LIMIT` or window:
+
+- it arrived as SQL text;
+- it names exactly one `logs` table and no Parquet table;
+- the last successful execution of the same SQL text for the same tenant, in
+  this process, over a window of the same length with the same row-window
+  setting and row cap, read at least the threshold: bytes served from the
+  cache, bytes a concurrent read of the same object handed it, and bytes
+  read from the object store, in every phase, catalog reads included. A
+  failed execution records nothing;
+- it is not an exact-key lookup: nowhere in its plan as the optimizer leaves
+  it, subqueries, CTEs and join conditions included, is there an equality on
+  a field the tenant indexes in KEY_IDX (a `key_index` typed attribute
+  column, or `trace_id` when the tenant indexes it). A one-element `IN`
+  counts as an equality, and so does a column renamed through a CTE or a
+  subquery.
+
+The threshold in force is `BYTES` raised to `--cache-max-bytes` when that is
+larger. That floor is the RAM tier's size only; a `--cache-dir` disk tier
+does not raise it. The bulk region only does better than the probation and
+main queues for a statement that reads more than the RAM tier holds, so a
+smaller threshold would hand the region statements the RAM tier could have
+kept whole.
+
+A statement's first execution in a process always reads as `interactive`,
+because nothing has recorded what it reads. The process keeps the read bytes
+of the 4,096 most recently recorded statements, one record for every tenant
+together, and drops the oldest past that. A statement whose text changes on
+every run, for example one that spells out absolute timestamps, never finds
+a record and always reads as `interactive`. Each of its successful runs
+still writes a record, so a stream of such statements evicts the records of
+statements that do repeat, and those read as `interactive` again on their
+next run.
+
+A key lookup stays `interactive` however much it reads. Only an equality
+on a key-indexed field is exempt, because only the KEY_IDX probe reliably
+narrows the read; an equality on another typed attribute column can also be
+pruned by block postings, but that pruning can decline (on older sections, or
+where statistics are absent), so such a statement still counts toward the
+threshold. When the executor cannot tell whether a statement is a key lookup,
+it reads it as one. A statement's `stats.cache.intent` reports the intent it
+read under, not which rule set it.
+
+Everything else reads as `interactive`:
+
+- a statement over two or more signal tables, or over a Parquet table;
+- a statement over `spans`, `alerts` or `audit`;
+- a `samples` statement the predicate-free rule does not cover, whatever it
+  resolves;
+- an ES|QL query, since both logs rules need SQL text the executor does not
+  have for it;
+- PromQL, the startup warmup, Flight SQL statements, and the fragments a
+  distributed worker runs, which read under the interactive intent
+  whatever the coordinator decided.
+
+The intent changes only where the bytes are admitted. A statement returns
+the same rows under either intent. Reads of one object that arrive together
+share one fetch, whose bytes are admitted under the intent of the read that
+started it.
+
+### Per-statement cache counters
+
+When the fetcher cache is on, the `stats` object of an `/api/v1/sql`
+response carries a `cache` object:
+
+| Key | Meaning |
+|---|---|
+| `intent` | The intent the statement read under: `interactive`, `bulkScan` or `maintenance`. |
+| `interactive`, `bulkScan`, `maintenance` | Each an object of `hits` and `servedBytes`: RAM-tier hits, and bytes served from them, under that intent. |
+| `misses` | RAM-tier misses under any intent. |
+| `admittedBytes` | Bytes admitted to the RAM tier under any intent. |
+
+The figures are the movement of the process-wide RAM-tier counters between
+the start of the statement and its end, across a retried attempt too. They
+are exact for a statement that ran alone. Statements that run at the same
+time move the same counters, so under concurrency each statement's figures
+include the others' reads, including reads under an intent it did not use.
+`misses` and `admittedBytes` are not split by intent because the cache does
+not count them per intent. With the fetcher cache off, `cache` is absent.
+
+### The max-age sweep
+
+Both tiers bound how long the raw bytes of an entry can persist. Bytes of an
+erased subject therefore cannot outlive the erasure pass on a query node by
+more than a fixed window, in RAM as well as on local disk. Two knobs govern
+it:
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `max_entry_age_ns` | `82800000000000` (23 h) | Maximum wall-clock age an entry is served at. A hit on an older entry is treated as a miss and its bytes dropped. |
+| `sweep_interval_ns` | `3600000000000` (1 h) | Period of the background sweep that drops over-age idle entries nothing re-reads, so an entry that is never touched still ages out on its own. |
+
+The worst-case residue of an idle entry is `max_entry_age_ns +
+sweep_interval_ns`. At the defaults that sum is 24 h. The max-age is one sweep
+interval below the bound, so the default meets the bound and does not
+overshoot it by the sweep period.
+
+Neither knob is a command-line flag. Both tiers are constructed with the
+shipped defaults, and you cannot override the max-age sweep from the command
+line.
+
+## Startup warmup
+
+When the cache is on, `ravel-server` warms it before it reports ready
+(`/readyz`). For each tenant that storage holds data for, it reads a small,
+bounded number of the most recent metric and log segments of that tenant. The
+first real query after a restart then does not pay the full cold cost.
+
+For logs it also reads the footer and directories of every log segment in the
+same warm set that a query plans from its directories, without the segment's
+column pages. Warmup finds each tenant's warm set, reads the most recent
+segments whole and runs this metadata pass, all at the same time: tenants are
+warmed in order as their warm sets are found, while later tenants' sets are
+still being found, and a tenant with many log segments gets its metadata read even
+while its whole segments are still loading. Warmup finds at most 4 tenants'
+warm sets at once, each using one of the store's GET requests while it runs. A first log query that plans from those directories, or
+opens such a segment by range, then reads its footer from the cache instead
+of storage; a query that reads a whole segment in one request, or that also
+needs the segment's key index, bloom or postings, gains less or nothing. The
+pass's ceiling is half of `--cache-max-bytes`, counting only the bytes the
+pass itself fetches from storage, not the segments warmed whole. It
+stops when the next segment's footer read would not fit beside what it has
+fetched and the footer reads still in flight; directory reads past a footer
+read can take it somewhat above.
+
+The segments read whole hold to the other half of `--cache-max-bytes` (all of
+it when the metadata pass does not run). Each read sets aside what it will
+fetch before it starts: a whole log segment, or, for a metric segment, the
+whole segment at or below 512 KiB and otherwise only its 64 KiB footer tail,
+since warming a metric segment reads its footer and catalog, not its samples.
+Once a read finishes it holds what it actually fetched, nothing if the
+segment was already cached. A segment that does not fit what is left waits
+for the reads of its tenant and signal still in flight, and is skipped only if
+it still does not fit once none are left. So the two together do not fill the
+cache past its size and evict what the other warmed, unless a metric
+segment's catalog lies outside its footer tail or directory reads take the
+metadata pass above its half.
+Warmup reads at most 2 segments of each signal of a tenant whole at once.
+
+The metadata pass reads at most one segment fewer at once than the store's
+GET concurrency (at least one). With a GET concurrency of 2 or more, one
+request stays free for the whole-segment reads, so a tenant whose metadata
+reads hang does not hold back a later tenant's whole segments. With a GET
+concurrency of 1 the pass uses the only request, and one hung read holds it,
+and with it every later warm set and whole-segment read, until the time
+budget runs out.
+docs/query-engine.md, "Startup warm-up of logs metadata", has the details.
+
+"Most recent" means most recently ingested, measured from the latest ingest
+hour of each tenant, not from wall-clock time. A tenant that has not ingested
+in the last day still gets its most recent parts warmed, not zero. The warm
+set is the segments stored in that latest ingest hour and the 24 hours before
+it, whatever their event times, newest ingest hour first. A tenant loaded with
+old data, such as a benchmark set whose event times are years in the past, is
+warmed the same way as one ingesting live data.
+
+Warmup is best-effort:
+
+- It has an overall time budget of 10 seconds, covering every step. If
+  storage is slow or a tenant list is large, warmup stops early and the
+  process still becomes ready. It starts with a smaller warm set.
+- A failure to warm one tenant or one segment is logged and skipped. It never
+  fails startup.
+
+### Warmup log lines
+
+To tell a warmed restart from an unwarmed one, or to see what was warmed, read
+the log lines of the `cache_warm` module. Do not guess from query latency.
+
+`cache_warm` alone decides the level of the per-(tenant, signal) line.
+`Catalog::latest_ingest_hour` never logs above `debug!`, so a signal that a
+tenant does not use never produces a `warn!` by itself.
+
+The per-(tenant, signal) line carries `tenant_hash`, `signal`, `parts_warmed`,
+`parts_over_budget` (segments skipped because they did not fit the whole
+segments' share of the cache once no read of theirs was in flight) and `latest_ingest_hour`. Its level is:
+
+- `info!` normally.
+- `warn!` if the tenant has a live part for that signal but none of them
+  warmed and none was skipped for the cache share, which means that a resolve
+  or fetch failure lost the whole signal.
+
+`latest_ingest_hour` takes one of three values:
+
+- **An hour number.** The latest ingest hour of the tenant was found. It is
+  the newest hour bucket that holds a commit-record-shaped key of any kind
+  (commit, compaction, rewrite, or tombstone), not only a live commit record.
+  - `parts_warmed` counts what warmed from it. It is 0 when the only key of
+    that hour was a tombstone. That case still logs at `info!`, because a
+    tombstone-only hour has no live part that failed to warm.
+  - An hour that holds both a live record and a tombstone counts as having a
+    live part, while the resolve drops the tombstoned bucket. When nothing
+    else in the window warms, the `warn!` can fire for it. Read that warning
+    as a hint to look at the resolve, not as a fault.
+- **`"none"`.** `Catalog::latest_ingest_hour` returned `Ok(None)`. The tenant
+  has no discoverable ingest for that signal: it never ingested the signal, or
+  its last ingest predates the discovery lookback cap (see below).
+  `parts_warmed` is always 0 for this value. The `cache_warm` pass logs it at
+  `info!`, not `warn!`, because no parts to warm is a normal outcome, not a
+  failure.
+- **`"error"`.** The `Catalog::latest_ingest_hour` listing itself failed: an
+  object store fault, or the per-shard LIST budget refused.
+  - This value appears on a separate `warn!` event, `cache warmup:
+    latest_ingest_hour failed; skipping this tenant and signal`. The event
+    carries `tenant_hash`, `signal`, `error` and `latest_ingest_hour` and no
+    `parts_warmed`.
+  - The pass emits no result line for that tenant and signal, so a filter on
+    `parts_warmed` alone will not show it.
+  - It is distinct from the `"none"` case, so a store fault is never mistaken
+    for a tenant that has no data.
+
+When `Catalog::latest_ingest_hour` exhausts its lookback cap (64 days) and
+finds nothing, it logs at `debug!`, not `warn!`. It cannot tell a tenant that
+never used a signal apart from one whose ingest is stuck past the cap. Both
+produce the identical `Ok(None)`, and neither case alone is a failure worth a
+warning.
+
+Do not expect a `warn!` from this path on a normal warmup pass. A
+tenant/signal combination can produce only two `warn!` lines: the `"error"`
+case, and the "has parts but none warmed" line of `cache_warm`.
+
+When the metadata pass runs, it logs one `cache warmup: warmed tenant logs
+metadata` line per tenant that has a log segment it plans to read. The line
+carries `metadata_objects_warmed` and `metadata_bytes_warmed`: the log
+segments whose footer and directories the pass read for that tenant, and the
+bytes it fetched from storage for them.
+
+One final `info!`, `cache warmup: pass complete`, carries the total
+`parts_warmed` across every tenant and signal and the `elapsed_ms` of the
+pass. It also carries the totals `metadata_objects_warmed` and
+`metadata_bytes_warmed`, and `metadata_budget_reached`, which is `true` when
+the metadata pass stopped at its share of the cache rather than at the end of
+the window, `metadata_get_permits`, the number of reads the metadata pass
+runs at once, and `whole_part_bytes_reserved`, the bytes the whole segments
+hold against their half of the cache. Four more fields say where the time
+went, in milliseconds:
+
+- `tenant_discovery_elapsed_ms`: listing the tenants.
+- `part_resolution_elapsed_ms`: finding every tenant's warm set.
+- `whole_part_warm_elapsed_ms`: reading the most recent segments whole.
+- `metadata_pass_elapsed_ms`: the logs metadata pass.
+
+The last three run at the same time, so they overlap and do not add up to
+`elapsed_ms`.
+
+- A restart whose log shows this final line warmed the cache.
+- A restart that hit the time budget never reaches it. It logs the `warn!`
+  that names the deadline instead. That warning carries `parts_warmed`,
+  `metadata_objects_warmed` and `metadata_bytes_warmed` as warmed when the
+  deadline hit, `metadata_get_permits` and `whole_part_bytes_reserved` as on
+  the final line, and `step`, the steps still running, comma-separated:
+  `tenant_discovery`, `part_resolution`, `whole_part_warm`, `metadata_pass`.
+  The per-(tenant, signal) lines up to that point are whatever the pass
+  warmed before it ran out of time.
+
+## Metrics
+
+When a cache is on, `GET /metrics` reports these counters, labeled by `mode`
+and by `cache`:
+
+- The `cache` label names which of the two caches the sample belongs to:
+  `cache="fetch"` for the fetcher cache, `cache="catalog"` for the catalog
+  byte cache.
+- When a disk tier is configured (`--cache-dir`), the samples of each cache
+  also carry a `tier="ram"`/`tier="disk"` label, so the hit rates of the two
+  tiers are reported separately. With a RAM tier only, no `tier=` label
+  appears.
+- Each cache renders its own series, so you can compute the hit-rate formulas
+  below per cache or summed across both.
+
+The counters are:
+
+- `ravel_cache_hits_total` / `ravel_cache_misses_total`: read outcomes.
+- `ravel_cache_bytes_served_total`: bytes returned from the cache on a
+  hit.
+- `ravel_cache_bytes_admitted_total`: bytes written into the cache.
+- `ravel_cache_evictions_total`: entries evicted to make room.
+- `ravel_cache_disk_errors_degraded_to_misses_total`: a disk-tier read
+  found a corrupt or unreadable entry and treated it as a miss instead of
+  failing the query. This is distinct from a normal miss, where nothing was
+  there. This counter means that something was there and could not be trusted.
+
+  It is nonzero only when a disk tier is configured (`--cache-dir`) and that
+  tier is unhealthy. A `tier="disk"` sample above zero means that the disk
+  tier found entries that it could not trust, not only that it was cold. A
+  process with no `--cache-dir` never emits it.
+- `ravel_cache_disk_entries_expired_max_age_total`: disk-tier entries
+  dropped because they aged past the per-entry max-age. It counts every drop
+  point: a hit that found an over-age entry, the startup scan, and the
+  periodic background sweep that reaches idle entries nothing re-reads. This
+  is distinct from an eviction, which makes room under the byte or entry
+  bound. This is a time bound, not a capacity bound.
+
+  It is nonzero only when a disk tier is configured (`--cache-dir`). A process
+  with no disk tier never emits it.
+
+Two more counters split the fetcher cache's RAM-tier hits by access intent.
+They carry `mode`, `cache="fetch"` and an `intent` label of `interactive`,
+`bulk_scan` or `maintenance`, and never a `tier=` label:
+
+- `ravel_cache_intent_hits_total`: RAM-tier hits under that intent.
+- `ravel_cache_intent_bytes_served_total`: bytes those hits served.
+
+They are separate families so that the label set of every counter above
+stays as it was. At rest, summed over `intent`, they equal the
+`cache="fetch"` RAM samples of `ravel_cache_hits_total` and
+`ravel_cache_bytes_served_total`; a scrape taken while reads are in flight
+can read the two families out of step.
+Misses and admitted bytes have no per-intent family, because the cache does
+not count them per intent.
+
+The RAM tier applies the same max-age but has no counter for it. An over-age
+RAM entry is reported as an ordinary miss. A workload whose entries routinely
+age out therefore shows a hit rate lower than its access pattern suggests, and
+nothing else.
+
+With both caches off (`--disable-cache`), none of these samples appear on
+`/metrics` at all: neither `cache="fetch"` nor `cache="catalog"`. A fetcher
+cache whose ceiling is `0` is not built either, so `cache="fetch"` is absent
+in that case too.
+
+Request hit rate is `hits / (hits + misses)`. Byte hit rate is
+`bytes_served / (bytes_served + bytes_admitted)`. Filter by the `cache` label
+for the rate of one cache, or omit it (let PromQL sum the series) for the
+whole process.
+
+### Late serves
+
+Two kinds of read are late serves:
+
+- A read that waited on the in-flight GET of another read (a single-flight
+  follower).
+- A read whose peek missed while a fetch for the same range was in flight, and
+  that reached the single flight only after that fetch finished. It is served
+  from the RAM tier.
+
+The second kind records nothing beyond the misses of its peek: a RAM miss,
+plus a disk miss when a disk tier is configured. It records no hit, no
+`bytes_served` and no `bytes_admitted`. When two such reads arrive together,
+one leads the RAM recheck, and the other follows it and records a
+single-flight collapse. This holds with a RAM tier only as well.
+
+A Parquet read counts a late serve in its query accounting as one cache miss
+with zero GETs and zero fetched bytes. So do the four read-through paths of
+the query fetchers:
+
+- a metrics (RSEG) read, ranged or whole-object (only a suffix read bypasses
+  the cache)
+- a log whole-object read
+- a log extent read: the block-range probe, directory and page-range reads,
+  and the covering read of an oversized object
+- a span whole-object read
+
+On those four paths:
+
+- A single-flight follower is a late serve with or without `--cache-dir`.
+- A read that the RAM recheck serves is a late serve only with a RAM tier
+  alone. With `--cache-dir` those paths have no RAM recheck, so a read that
+  arrives after the flight ends leads its own flight and counts the disk hit.
+- The `page_fetch` and `segment_open` spans record no request for a late
+  serve. A page-range read counts it in neither `block_range_gets` nor
+  `block_cache_hits`.
+- Only the read that ran the GET is charged it, and only a lookup that found
+  the bytes is a hit.
+- The cache hit and miss counts of the query
+  (`ravel_query_cache_hits_total`) do not depend on which caller fetched. A
+  late serve is a miss on these paths and is charged no GET.
+
+A log block-range read looks a second time at the blocks of a coalesced run.
+That second look records no hit or miss on either tier. A block that it finds
+on the disk tier is still re-admitted to RAM, so `bytes_admitted` moves.
+
+## Sizing for logs column-filtering waste
+
+The `QueryAccounting` of a logs (RLOG) query carries two decode-time byte
+counters next to its wire-byte counters:
+
+- `page_bytes_fetched`: the stored bytes of every page present in the blocks
+  that the query decoded.
+- `page_bytes_decoded`: the stored bytes of only the pages that the column
+  projection of the query kept.
+
+These are a decode-time measurement, not a wire measurement. They count bytes
+that a fetched block already holds. `s3_bytes` counts the bytes moved over the
+network.
+
+- On the whole-object read shape, the whole block arrives on the wire, and a
+  narrow projection skips decompressing the pages that it does not need.
+- On the ranged read shape, the page directory lets the fetch pull only the
+  pages of the projected columns, so the projection narrows the wire bytes as
+  well.
+
+Read the ratio `page_bytes_decoded / page_bytes_fetched` as follows:
+
+- **Close to 1.** The query decodes nearly everything that its blocks contain.
+  A larger cache working set is the main way to make repeat runs cheaper.
+- **Small.** Column filtering throws away most fetched page bytes: the
+  wide-schema, narrow-projection shape. A whole-object read fetches and caches
+  the block in full to serve a few columns. Two responses apply:
+  - Narrow the projection further where the query allows it.
+  - Size the cache to the *working set of whole blocks* that the workload
+    touches, not to the decoded byte volume. On the whole-object shape the
+    cache admits and holds whole blocks, regardless of how little of each a
+    given query decodes.
+
+A small decoded fraction across the queries of a tenant is the signal to size
+its cache against block footprint, not against what its projections read.
+
+The ratio is workload-dependent. It is set by how wide the log schema of the
+tenant is against how narrow the projections of its queries are, so there is
+no representative figure to quote. Measure your own.
+
+Neither counter reaches the query-facing accounting of a running server.
+`ravel-cli sql explain --analyze` ([inspecting data](inspecting-data.md#sql-explain))
+surfaces the sibling page-count fields,
+`pages_decoded`/`pages_skipped`, not their byte-denominated equivalents. The
+ratio is therefore available only to a caller that reads `QueryAccounting`
+in-process, which is what the `ravel-bench` logs scan does.
+
+## The catalog record caches
+
+The sections above describe read caches: caches of object bytes whose ceiling
+is a share of the process memory budget. The catalog also keeps two per-tenant
+caches of decoded commit and compaction records. Neither takes a share of that
+budget. Their memory comes out of what is left after the carved shares, never
+out of them. Budget for them separately.
+
+One capacity bounds both caches independently. The capacity is derived per
+deployment from the shard count, the signal count and the configured max flush
+delay, not from a flat constant:
+
+```text
+shards * 6 signals * ceil(3600 / max_flush_delay_seconds) * 3 unsealed hours
+```
+
+The result is floored at 10,000 entries and capped at 25,000. The cap is the
+default per-tenant budget divided by 1,800 bytes, one 900-byte entry in each
+of the two caches; `--catalog-record-cache-max-bytes-per-tenant` raises the
+budget and the cap with it. Each cache is
+ALSO held to a byte budget of `capacity x 900 bytes`, 22.5 MB per tenant at
+the cap, and evicts against whichever bound binds first. The byte budget
+exists because neither record type has a bounded size:
+
+- The **commit-record cache** is bounded in bytes at
+  `commit_cache_max_bytes_per_tenant`. `CommitRecord.declared_column_stats` is
+  a repeated field with no cap in the proto, in validation, or in the
+  tenant-config path for typed attribute columns. A record that declares 200
+  typed attribute columns charges about 20 KB when admitted and about 38 KB
+  once a resolve has kept its derivation (the kept stamp list adds about
+  18 KB), where an ordinary one charges 896 bytes: more than forty times the
+  planning rate. The cache charges each
+  entry an estimate of the live heap that it holds. It evicts
+  least-recently-used until the charged total is back inside the budget.
+- The **compaction-record cache** is bounded in bytes at the same share,
+  `compaction_cache_max_bytes_per_tenant`. A compaction record carries one
+  `CompactionInputIdentity` per L0 segment that it merged. Neither the format
+  nor validation caps that list. One L1 record over 1,800 L0 segments charges
+  about 137 KB, roughly 150 times the planning rate. An entry count alone
+  lets a single tenant hold hundreds of times the figure below. The cache
+  evicts oldest-first until its charged bytes are back inside the budget.
+
+The 900 bytes is a PLANNING rate the capacity is derived against, not a
+per-entry cap: an ordinary stats-free commit entry charges 896 bytes (a
+119-byte commit key held twice, the decoded struct, the record's own heap, and
+a 32-byte slot for the derivation a resolve keeps with the record),
+and what each cache enforces is the summed charge against its budget. So the
+capacity is an entry cap rather than a guaranteed residency: a tenant whose
+records carry typed attribute column statistics holds proportionally fewer than
+`capacity` of them, and the memory stays inside the figure either way.
+
+### Budgeting the record caches
+
+So the worst case is 45 MB per actively-queried tenant, both halves enforced in
+bytes by their own eviction path rather than projected from a per-entry
+estimate. That is what the cap holds constant across every deployment shape
+(`--shards 64` derives 2,073,600 entries and 3.7 GB per tenant uncapped).
+Budget it as 45 MB times the number of tenants queried concurrently: 100 of
+them is 4.5 GB worst case,
+and idle tenants are reclaimed by idle-tenant eviction. At the shipped
+2-second cadence the cap decides the value for every shard count, so
+`--shards` does not move it there. With
+`--catalog-record-cache-max-bytes-per-tenant` set, the worst case per
+actively-queried tenant is at most that budget instead, less the remainder of
+its division by 1,800 bytes, and the product scales with it. It is less when
+the derived capacity sits below the budget's cap: one shard at the 2-second
+cadence derives 32,400 entries, 58.3 MB at a 400 MB budget. Startup reports
+the budget in force, the entry bound and the exact worst case on the `catalog
+record caches sized` log line.
+
+The capacity covers the unsealed tail of a tenant up to the cap, not the whole
+tail. Three things put a real tail past it:
+
+- The cap itself. The estimate at the shipped defaults is already 129,600
+  entries.
+- The flush cadence term. It counts the age trigger only, while a shard also
+  flushes as soon as its estimated object bytes reach `target_bytes` (8 MiB by
+  default).
+- A fold that runs late. The three unsealed hours assume the catalog's seal
+  parameters, a 1-hour flush lifetime, a 5-minute clock-skew allowance and a
+  15-minute fold safety margin, so an hour seals 1h20m after it ends; it
+  stays in the tail until a fold runs after that.
+
+No server flag moves the seal parameters. `--gc-max-flush-lifetime` feeds the
+compactor (`CompactorConfig::max_flush_lifetime_ns`), not the catalog's fold
+or resolve, and the capacity derivation does not read it either, so it is not
+a lever on this tail.
+
+A tenant over the bound pays a per-record GET on every resolve. That is a
+change: the old cache held a flat 10,000 records whatever they cost. A tenant
+whose records carry typed attribute column statistics now holds fewer records
+than the entry capacity, and pays GETs for the records that it cannot hold.
+The bound trades that hit rate for a memory figure that the eviction path
+enforces. The levers are a coarser `--max-flush-delay` or a lower shard
+count. Both shrink the tail itself. The other lever leaves the tail as
+it is and raises the bound: a larger
+`--catalog-record-cache-max-bytes-per-tenant`, paid for in memory per
+actively-queried tenant.
+
+`--disable-cache` does not turn these caches off, because a resolve with no
+record cache re-reads every record from the store. It does hold the capacity
+at the 10,000-entry floor rather than the derived value, so the flag costs
+about 18 MB per actively-queried tenant: a 9 MB byte budget for each of the
+two caches, both enforced. Startup refuses it together with
+`--catalog-record-cache-max-bytes-per-tenant`, whose budget it would override.
+
+Two gauges report what the record caches hold, summed over every tenant in
+the process, one sample per cache (`cache="commit"` and
+`cache="compaction"`):
+
+- `ravel_catalog_record_cache_held_bytes{cache}` is the bytes the cache
+  charges, the figure its per-tenant eviction is bounded by. It is the sum of
+  each entry's charge, not the entry count times 900 bytes.
+- `ravel_catalog_record_cache_entries{cache}` is the entries it holds.
+
+Their ratio is the measured bytes per entry. Use it, not the 900-byte planning
+rate, to size `--catalog-record-cache-max-bytes-per-tenant`: the budget to hold
+a tail of N records is about N times the larger of the commit cache's measured
+bytes per entry and 900, times 2. Each cache gets at most half the budget, and
+the entry bound is the budget divided by 1,800 whatever the measured rate, so a
+measured rate below 900 bytes does not let a smaller budget hold more entries.
+The gauges sum over tenants and the ratio does not depend on how many there
+are, so read them while the tenant you are sizing for dominates the caches.
+They are not the generic read-cache gauges:
+`ravel_cache_resident_bytes` covers the tiers of the fetch family only, and
+`ravel_cache_max_bytes` the fetch and catalog byte ceilings.
+
+## Background
+
+The read cache is [ADR-0046](../adrs/0046-read-cache-tier.md); the max-age
+bound on cached bytes comes from the erasure guarantee in
+[ADR-0064](../adrs/0064-selective-subject-erasure.md); the logs block-range
+read shape is
+[ADR-0107](../adrs/0107-pruning-proportional-logs-fetch.md), and the fetch
+policy above it is
+[ADR-0996](../adrs/0996-request-cost-aware-fetching.md).

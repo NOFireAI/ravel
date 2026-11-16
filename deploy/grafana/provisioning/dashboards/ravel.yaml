@@ -1,0 +1,13 @@
+# Grafana dashboard provider for the quickstart. Loads the JSON dashboards
+# mounted at /var/lib/grafana/dashboards by deploy/docker-compose/ravel.yml.
+apiVersion: 1
+
+providers:
+  - name: Ravel
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

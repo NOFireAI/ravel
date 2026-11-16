@@ -1,0 +1,4058 @@
+//! Sealed-bucket scan with the advisory CAS cursor
+//! (ADR-0018). Walks the hours of one
+//! `(tenant, signal, shard)` upward from the cursor, compacting every sealed,
+//! eligible bucket, and advances the cursor past the buckets it finished. The
+//! cursor is advisory mutable state (the ADR-0003 HEAD-pointer precedent):
+//! losing or corrupting it costs a rescan, never correctness.
+
+use std::collections::{HashMap, HashSet};
+
+use bytes::Bytes;
+use ravel_commit::keys;
+use ravel_fleet::worker_set::MaintainRecordKeys;
+use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, Version};
+use ravel_types::{Signal, TenantHash};
+
+use crate::bucket::Bucket;
+use crate::claim_guard::ClaimSkip;
+use crate::clock::Clock;
+use crate::compact::{ClaimedCompaction, CompactionOutcome, compact_bucket};
+use crate::config::{CompactorConfig, NS_PER_HOUR, RetentionConfig};
+use crate::error::{MaintainError, Result};
+use crate::reachability::MarkerStats;
+use crate::retention::{
+    ObservedExpiry, RetentionOutcome, RewriteBound, RewriteBoundRead, SnapshotBlock,
+    SnapshotReachability, maintain_bucket_observed, resolve_retention_window_ns,
+    retention_sweep_bucket_observed,
+};
+use crate::sweep::LeaseCheck;
+use crate::unnamed_marker::MarkerReapOutcome;
+use run_admission::{AdmittedRun, admit_run};
+pub use snapshot_auth::VerifiedSnapshot;
+use uuid::Uuid;
+
+/// One-byte version tag on the advisory cursor payload. The cursor is not a
+/// frozen format; the tag only lets a future encoding change be detected and
+/// treated as "no usable cursor" (rescan), never misread; a payload carrying
+/// another tag is left in place.
+const CURSOR_TAG: u8 = 1;
+
+/// Outcome of one scan pass over a `(tenant, signal, shard)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanReport {
+    /// Buckets newly compacted this pass.
+    pub compacted: usize,
+    /// Sealed buckets found already done (already-compacted, tombstoned, or
+    /// below the input threshold).
+    pub already_done: usize,
+    /// Buckets skipped because they are not yet sealed (scan stops there).
+    pub not_sealed: usize,
+    /// Buckets held because an input's format version is outside this
+    /// build's reader window ([`CompactionOutcome::HeldOutOfWindow`]), or
+    /// because it carries section kinds this build does not know
+    /// ([`CompactionOutcome::HeldUnknownSection`]). Later hours still
+    /// compact; the cursor stops before the first held hour.
+    pub held_out_of_window: usize,
+    /// Buckets compaction refused for their merge geometry
+    /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), including a
+    /// two-level merge's refusal ([`CompactionOutcome::TwoLevelUnsupported`],
+    /// [`CompactionOutcome::ScratchHeadroom`],
+    /// [`CompactionOutcome::ScratchLocked`]) and a refusal for the part-index
+    /// windows ([`MaintainError::is_part_index_refusal`]). Later hours still compact; the
+    /// cursor stops before the first refused hour, so a build that can merge
+    /// it revisits it.
+    pub geometry_unsupported: usize,
+    /// The hour the cursor was advanced to, if it moved.
+    pub cursor_advanced_to: Option<u32>,
+}
+
+/// Scan and compact every eligible sealed bucket for one `(tenant, signal,
+/// shard)`, then advance the advisory cursor. Idempotent: re-running after a
+/// crash reprocesses at most the buckets past the last persisted cursor, and
+/// each bucket's own idempotency makes reprocessing harmless.
+pub async fn scan_and_compact(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    tenant_hash: TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<ScanReport> {
+    let cursor_key = keys::maint_cursor_key(&tenant_hash, signal, shard)?;
+    let (cursor, cursor_writable) = match read_cursor(store, &cursor_key).await? {
+        StoredCursor::Absent => (None, true),
+        StoredCursor::Usable { hour, version } => (Some((hour, version)), true),
+        StoredCursor::Unrecognized { version } => (Some((0, version)), true),
+        StoredCursor::ForeignTag { tag } => {
+            tracing::warn!(
+                cursor_key = %cursor_key,
+                tag,
+                "compaction cursor carries a tag this build does not know; scanning from the \
+                 beginning and leaving the stored cursor in place"
+            );
+            (None, false)
+        }
+    };
+    let start_after = cursor.as_ref().map(|(hour, _)| *hour);
+
+    let hours = list_shard_hours(store, &tenant_hash, signal, shard).await?;
+
+    let mut report = ScanReport {
+        compacted: 0,
+        already_done: 0,
+        not_sealed: 0,
+        held_out_of_window: 0,
+        geometry_unsupported: 0,
+        cursor_advanced_to: None,
+    };
+    let mut highest_done: Option<u32> = None;
+    // The cursor must not pass a held hour, or no later pass would revisit it.
+    let mut first_held: Option<u32> = None;
+
+    for hour in hours {
+        if start_after.is_some_and(|after| hour <= after) {
+            continue;
+        }
+        let bucket = Bucket::new(tenant_hash, signal, shard, hour);
+        let outcome = match compact_bucket(store, clock, config, &bucket).await {
+            Ok(outcome) => outcome,
+            // Refused for its part-index windows (ADR-3853): this build refuses
+            // it again, so it is counted and held like a geometry refusal.
+            Err(err) if err.is_part_index_refusal() => {
+                report.geometry_unsupported += 1;
+                first_held.get_or_insert(hour);
+                continue;
+            }
+            // Refused under the sys/compat write policy before the claim
+            // (ADR-4233): no run happened, already counted and logged. The
+            // hour is not done, so the cursor stays below it.
+            Err(err) if err.is_compat_refusal() => {
+                first_held.get_or_insert(hour);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        match outcome {
+            CompactionOutcome::NotSealed => {
+                // Hours are ascending, so every later bucket is also unsealed.
+                report.not_sealed += 1;
+                break;
+            }
+            CompactionOutcome::HeldOutOfWindow { .. }
+            | CompactionOutcome::HeldUnknownSection { .. } => {
+                report.held_out_of_window += 1;
+                first_held.get_or_insert(hour);
+            }
+            CompactionOutcome::GeometryUnsupported { .. }
+            | CompactionOutcome::TwoLevelUnsupported { .. }
+            | CompactionOutcome::ScratchHeadroom { .. }
+            | CompactionOutcome::ScratchLocked { .. } => {
+                report.geometry_unsupported += 1;
+                first_held.get_or_insert(hour);
+            }
+            CompactionOutcome::Compacted { .. } => {
+                report.compacted += 1;
+                if first_held.is_none() {
+                    highest_done = Some(hour);
+                }
+            }
+            CompactionOutcome::AlreadyCompacted
+            | CompactionOutcome::RewritePresent
+            | CompactionOutcome::Tombstoned
+            | CompactionOutcome::BelowMinInputs { .. } => {
+                report.already_done += 1;
+                if first_held.is_none() {
+                    highest_done = Some(hour);
+                }
+            }
+        }
+    }
+
+    if let Some(hour) = highest_done.filter(|_| cursor_writable) {
+        // Advisory: a lost CAS race just means another maintainer already
+        // moved the cursor, so treat AlreadyExists/PreconditionFailed as fine.
+        write_cursor(store, &cursor_key, hour, cursor.map(|(_, v)| v)).await?;
+        report.cursor_advanced_to = Some(hour);
+    }
+
+    Ok(report)
+}
+
+/// Outcome of one full-scan maintenance pass over a `(tenant, signal, shard)`
+/// ([`scan_and_maintain`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MaintainReport {
+    /// Sealed buckets whose retention pass wrote or already held a tombstone
+    /// (expired), or that were physically swept this pass.
+    pub retired: usize,
+    /// Buckets compacted this pass (retention left them live and they were
+    /// eligible).
+    pub compacted: usize,
+    /// Buckets already compacted / below the input threshold (retention left
+    /// them live, compaction found nothing to do).
+    pub already_done: usize,
+    /// Buckets skipped because not yet sealed.
+    pub not_sealed: usize,
+    /// Buckets whose compaction was held because an input's format version is
+    /// outside this build's reader window
+    /// ([`CompactionOutcome::HeldOutOfWindow`]), or because it carries section
+    /// kinds this build does not know
+    /// ([`CompactionOutcome::HeldUnknownSection`]). Retried every pass; the
+    /// scan continues to later hours.
+    pub held_out_of_window: usize,
+    /// Buckets whose compaction this pass refused for their merge geometry
+    /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), including a
+    /// two-level merge's refusal ([`CompactionOutcome::TwoLevelUnsupported`],
+    /// [`CompactionOutcome::ScratchHeadroom`],
+    /// [`CompactionOutcome::ScratchLocked`]), and a refusal for the part-index
+    /// windows ([`MaintainError::is_part_index_refusal`]). Not counted for a
+    /// bucket the [`MaintainMemo`] already holds as refused.
+    pub geometry_unsupported: usize,
+    /// Expired buckets whose physical sweep was blocked because the live
+    /// catalog HEAD snapshot still names an object inside the bucket
+    /// (ADR-0020 delete-blocker, [`RetentionOutcome::BlockedBySnapshot`] with
+    /// [`crate::retention::SnapshotBlock::Named`]). Nothing was deleted and the
+    /// tombstone was left in place; a later sweep finishes once the fold's
+    /// retention-frontier reconcile drops the bucket from the snapshot. A
+    /// nonzero steady-state value means the fold is lagging the sweep.
+    pub blocked_by_snapshot: usize,
+    /// Expired buckets whose physical sweep was blocked fail-closed because
+    /// HEAD, or a snapshot part covering the bucket's hour, could not be read
+    /// ([`RetentionOutcome::BlockedBySnapshot`] with
+    /// [`crate::retention::SnapshotBlock::Unreadable`]). Non-reachability
+    /// cannot be proven from data that cannot be read, so the delete is
+    /// refused. A persistent nonzero value is an operator signal that a HEAD or
+    /// part object is corrupt or missing, not the ordinary lagging-fold case.
+    pub blocked_by_unreadable_head: usize,
+    /// Expired buckets HEAD no longer names whose physical sweep waits for
+    /// their unnamed-since marker to age past the pinned-query window
+    /// ([`RetentionOutcome::BlockedBySnapshot`] with
+    /// [`crate::retention::SnapshotBlock::PinnedWindow`], ADR-1133). Nothing
+    /// was deleted; the bucket is swept once `observed_unix_ns +
+    /// max_query_duration + head_cache_ttl + 4 * clock_skew_allowance` has
+    /// passed. Every expired bucket reports here for at least one pass.
+    pub blocked_by_pinned_window: usize,
+    /// The unnamed-since marker requests and transitions of this pass.
+    pub unnamed_markers: MarkerStats,
+    /// What this pass's orphan-marker reap did, when it ran (any pass that
+    /// gated a candidate).
+    pub unnamed_marker_reap: Option<MarkerReapOutcome>,
+    /// Buckets skipped this pass because the [`MaintainMemo`] already knows them
+    /// terminal, so no per-bucket LIST/GET was issued for them.
+    /// Always zero on a cold pass and for the non-memoized
+    /// [`scan_and_maintain`] entry point.
+    pub skipped_terminal: usize,
+    /// Hours this pass classified as [`Zone::Head`] or [`Zone::Tail`], i.e.
+    /// evaluated every tick regardless of the memo. The maintain driver reuses
+    /// this set as the hour scope for the same tick's [`crate::sweep::sweep_shard_zoned`]
+    /// call (ADR-0065 decision 3), so the sweep never issues a second LIST of
+    /// the shard's hours to compute it.
+    pub head_tail_hours: Vec<u32>,
+    /// L0 commit records this pass found sealed but still below
+    /// `min_compaction_inputs` ([`CompactionOutcome::BelowMinInputs`]'s own
+    /// `count`), summed over every such bucket. These records sit live and
+    /// unswept until either a later flush pushes their bucket over the
+    /// threshold or retention expires the bucket outright; this is the only
+    /// L0-record count compaction exposes without an extra listing, so it is
+    /// the figure `ravel_maintain_l0_records_pending` renders (issue #1729).
+    pub l0_records_pending: usize,
+    /// Buckets this pass did not compact because another attempt holds their
+    /// advisory compaction claim (ADR-1029 decision 5), plus the ones whose
+    /// compaction was skipped without a claim request because a previous
+    /// tick's observation put them on hold until the holder's lease expires.
+    /// Retention still evaluates a held bucket, and one it retires is counted
+    /// under `retired` instead. Never counted as compacted: this process did
+    /// no merge for them, and the holder may still be running one.
+    pub claim_skipped: usize,
+    /// Buckets whose merge started under a claim this process then lost, and
+    /// which cancelled at a checkpoint and published nothing (ADR-1029
+    /// decision 3). Also never counted as compacted.
+    pub claim_cancelled: usize,
+    /// Buckets this pass took the advisory compaction claim for, fresh or
+    /// stolen (ADR-1029 decision 3): the count [`claims_stolen`] is a subset
+    /// of. Never counted for a bucket this process merely evaluated without
+    /// claiming (coordination off, no participant installed, below the cost
+    /// gate, or the `claim_deferred` hold from a previous tick's observation).
+    ///
+    /// [`claims_stolen`]: MaintainReport::claims_stolen
+    pub claims_acquired: usize,
+    /// The subset of [`claims_acquired`] that were taken over from an expired
+    /// claim rather than created fresh (ADR-1029 decision 3). An expired claim
+    /// is also what a crash, a restart or a failed run leaves behind, so a
+    /// steal alone does not say the lease is too short; the holder's
+    /// `claim_cancelled` does.
+    ///
+    /// [`claims_acquired`]: MaintainReport::claims_acquired
+    pub claims_stolen: usize,
+    /// The largest retention lag this pass observed, in nanoseconds: for the
+    /// oldest bucket that is expired (past `bucket_end + retention_window`) yet
+    /// still physically present (tombstoned, swept-partial, or blocked by a
+    /// HEAD snapshot), how far `now` is past that deadline. `0` when the pass
+    /// found no still-present expired bucket. A fully swept-empty bucket
+    /// contributes nothing: its data is gone, so there is no lag to report.
+    ///
+    /// The deadline is the bucket's exact expiry, `max_event_ts + window`, when
+    /// this process knows it: the pass that writes the tombstone reads it from
+    /// the bucket's records, and [`MaintainMemo`] carries it to the later
+    /// passes of the same process. The tombstone itself records no event
+    /// timestamp, so a pass over a bucket another process (or an earlier run of
+    /// this one) tombstoned measures from the earlier of the hour's nominal
+    /// expiry (`(hour + 1) * NS_PER_HOUR + retention_window_ns`) and the
+    /// tombstone's `retired_at_ns`. An event can sit up to `max_ingest_lag`
+    /// before its ingest hour, so that fallback under-reads the lag by up to
+    /// one hour plus `max_ingest_lag` (three hours at the defaults), and an
+    /// event running past its ingest hour by the allowed future clock skew can
+    /// make the nominal figure over-read by up to that skew. It over-reads by
+    /// more, transiently, after a physical sweep that stopped partway: the
+    /// sweep deletes rewrite records before data, L1 segments and the tombstone,
+    /// so a process that holds neither the exact expiry nor an earlier read of
+    /// those rewrites lists none, or only some that keep parts, and can
+    /// over-read by a deleted parts-less
+    /// rewrite's `created_unix_ns` minus the hour's end, until the next pass
+    /// finishes the sweep. A tombstoned
+    /// bucket that lists a rewrite record with no parts measures from
+    /// `retired_at_ns` alone, because such a rewrite stands its
+    /// `created_unix_ns` in for an event time and can move the expiry to any
+    /// instant before the tombstone: that figure never over-reads, and
+    /// under-reads by how long after its expiry the tombstone was written, with
+    /// no fixed bound. A rewrite that keeps parts carries their event times, so
+    /// its bucket keeps the nominal-or-tombstone figure. It is the figure
+    /// `ravel_maintain_retention_lag_seconds` renders (issue #1729).
+    pub retention_lag_ns: i64,
+    /// Rewrite-record GETs this pass issued only to bound the retention lag of
+    /// a tombstoned bucket that lists rewrite records and whose exact expiry
+    /// this process does not hold: each read tells a parts-less rewrite, which
+    /// leaves the tombstone as the only bound, from one that keeps parts, and
+    /// the reads stop at the first parts-less one. Never issued for a bucket
+    /// whose exact expiry, or whose earlier complete read, [`MaintainMemo`]
+    /// holds.
+    pub lag_bound_gets: usize,
+}
+
+/// The claim hold a skipped bucket earns, as the injected clock reads it: the
+/// skip's recheck point converted from unix milliseconds to nanoseconds. For a
+/// held claim that is one millisecond past the holder's expiry (the retry's
+/// own acquisition waits out this contender's jitter); for an unreadable one
+/// it is at most one lease plus jitter away, so a claim deleted by hand
+/// releases the bucket within about one lease rather than at the steal
+/// threshold. Saturating, so an absurd observed expiry cannot wrap into the
+/// past.
+fn reschedule_ns(skip: &ClaimSkip) -> i64 {
+    skip.recheck_after_unix_ms.saturating_mul(1_000_000)
+}
+
+/// Retention lag, in nanoseconds, of a bucket that is expired yet still present:
+/// how far `now_ns` is past the bucket's expiry, clamped at zero. `0` when the
+/// tenant has no retention policy.
+///
+/// With the exact expiry (`max_event_ts + window`, [`ObservedExpiry::Exact`])
+/// known, the lag is `now` past it. Without it, the lag is the larger of `now`
+/// past the hour's nominal deadline (`(hour + 1) * NS_PER_HOUR +
+/// retention_window_ns`) and `now` past the tombstone's `retired_at_ns`
+/// ([`ObservedExpiry::NoLaterThan`]). The true expiry is at or before both
+/// instants, except that an event running past its ingest hour by the allowed
+/// clock skew can put it after the nominal one, so the fallback under-reads by
+/// how far the earlier of the two sits past the true expiry: at most one hour
+/// plus `max_ingest_lag`, since an event can sit that far before its ingest
+/// hour. Its over-read is bounded by that skew except transiently after a
+/// physical sweep that stopped partway, which deletes a parts-less rewrite
+/// before the tombstone (see [`MaintainReport::retention_lag_ns`]). For a bucket that lists a rewrite record with no parts
+/// ([`ObservedExpiry::NoLaterThanOnly`]) the nominal deadline bounds nothing,
+/// so the lag is `now` past `retired_at_ns` alone, which under-reads by however
+/// long after the true expiry the tombstone was written. Uses saturating
+/// arithmetic throughout, matching [`classify_zone`].
+fn expired_bucket_retention_lag_ns(
+    hour: u32,
+    now_ns: i64,
+    retention_window_ns: Option<i64>,
+    expiry: Option<ObservedExpiry>,
+) -> i64 {
+    let Some(window_ns) = retention_window_ns else {
+        return 0;
+    };
+    let since = |instant_ns: i64| now_ns.saturating_sub(instant_ns).max(0);
+    match expiry {
+        Some(ObservedExpiry::Exact(expiry_ns)) => since(expiry_ns),
+        Some(ObservedExpiry::NoLaterThanOnly(retired_at_ns)) => since(retired_at_ns),
+        fallback => {
+            let bucket_end_ns = i64::from(hour)
+                .saturating_add(1)
+                .saturating_mul(NS_PER_HOUR);
+            let nominal = since(bucket_end_ns.saturating_add(window_ns));
+            match fallback {
+                Some(ObservedExpiry::NoLaterThan(retired_at_ns)) => {
+                    nominal.max(since(retired_at_ns))
+                }
+                _ => nominal,
+            }
+        }
+    }
+}
+
+/// List every ingest-hour bucket present under one `(tenant, signal, shard)`,
+/// ascending. Shared by [`scan_and_compact`] and [`scan_and_maintain`]; a
+/// non-hour common prefix under the shard is layout drift and errors.
+async fn list_shard_hours(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<Vec<u32>> {
+    let shard_prefix = keys::commit_shard_prefix(tenant_hash, signal, shard)?;
+    let listed = store.list_delimited(&shard_prefix).await?;
+    let mut hours: Vec<u32> = Vec::new();
+    for common in &listed.common_prefixes {
+        // common == "<shard_prefix><hour>/"; extract the hour segment.
+        let rest = common
+            .strip_prefix(&shard_prefix)
+            .and_then(|r| r.strip_suffix('/'))
+            .unwrap_or("");
+        match keys::parse_ingest_hour_string(rest) {
+            Ok(hour) => hours.push(hour),
+            Err(e) => return Err(MaintainError::Key(e)),
+        }
+    }
+    hours.sort_unstable();
+    Ok(hours)
+}
+
+/// A unit's hour zone (ADR-0065 decision 3). Recomputed fresh every tick
+/// from `now_ns` and the tenant's config by [`classify_zone`] -- never
+/// stored -- because both the head frontier and, when a retention policy
+/// exists, the tail window move with the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Zone {
+    /// Newer than the seal margin plus one hour of slack: sealing and first
+    /// compaction still happen here. Evaluated every tick, bypassing
+    /// [`MaintainMemo`] entirely, exactly as before this zone split existed.
+    Head,
+    /// From the bucket's computed retention expiry through the protection
+    /// horizon past it: tombstoning and the horizon-gated physical sweep
+    /// both happen in this window. Evaluated every tick, bypassing the
+    /// memo, same as `Head`. Unreachable when the tenant has no retention
+    /// policy (nothing ever expires, so there is no tail).
+    Tail,
+    /// Below the head frontier and before its computed retention expiry (or
+    /// the tenant has no retention policy at all): nothing can change a
+    /// terminal bucket here except that future expiry, an operator action
+    /// (tombstone, hold), or a future EJ erasure order
+    /// ([`MaintainMemo::invalidate`] is the seam for the latter two).
+    /// Memo-gated: skipped while a terminal entry is fresh, re-verified once
+    /// `CompactorConfig::interior_reverify_ns` has elapsed since the last
+    /// verification, or immediately once the zone recomputes to `Tail` at
+    /// the bucket's actual expiry.
+    Interior,
+}
+
+/// Classify `hour` into a [`Zone`] for `now_ns` (ADR-0065 decision 3).
+/// `retention_window_ns` is `None` when the tenant has no retention policy,
+/// in which case no hour is ever `Tail`.
+///
+/// The tail window anchors on `hour`'s own nominal bucket-end timestamp
+/// (`(hour + 1) * NS_PER_HOUR`) plus the window, not on the bucket's actual
+/// maximum event timestamp: the real expiry check
+/// ([`crate::retention::is_expired`]) reads decoded commit and compaction
+/// records and is only exact at evaluation time inside `maintain_bucket`,
+/// but this function is a scheduling heuristic, not a correctness gate --
+/// it only decides when to look, never whether to delete. Because a sealed
+/// bucket's events fall inside its own hour
+/// (`max_event_ts <= bucket_end_ns`, modulo the clock-skew allowance already
+/// folded into the seal margin), this heuristic's computed expiry instant is
+/// always at or after the bucket's true expiry, so the zone transition into
+/// `Tail` -- and thus tick-cadence evaluation -- can lag the true expiry by
+/// at most about one hour. That lag is bounded well inside
+/// `protection_horizon_ns` (which must clear `max_query_duration + grace`),
+/// so it costs a small, documented scheduling delay, never a promptness or
+/// safety violation.
+pub fn classify_zone(
+    hour: u32,
+    now_ns: i64,
+    config: &CompactorConfig,
+    retention_window_ns: Option<i64>,
+) -> Zone {
+    let bucket_end_ns = i64::from(hour)
+        .saturating_add(1)
+        .saturating_mul(NS_PER_HOUR);
+    let head_frontier_ns =
+        now_ns.saturating_sub(config.seal_margin_ns().saturating_add(NS_PER_HOUR));
+    if bucket_end_ns > head_frontier_ns {
+        return Zone::Head;
+    }
+    if let Some(window_ns) = retention_window_ns {
+        let expiry_ns = bucket_end_ns.saturating_add(window_ns);
+        let tail_hi = expiry_ns.saturating_add(config.protection_horizon_ns);
+        if now_ns >= expiry_ns && now_ns <= tail_hi {
+            return Zone::Tail;
+        }
+    }
+    Zone::Interior
+}
+
+/// Default full re-verify interval for [`MaintainMemo`] (1 hour). A bucket the
+/// memo has marked terminal is re-listed and re-evaluated at least this often,
+/// bounding how long a memo entry may be stale -- a bucket that became
+/// retention-expired, or an entry corrupted in memory -- before the maintain
+/// loop acts on it. One hour is far below any retention window (days) and any
+/// protection horizon, so the deferred action is never a correctness problem,
+/// only a small bound on promptness.
+pub const DEFAULT_MEMO_REVERIFY_INTERVAL_NS: i64 = NS_PER_HOUR;
+
+/// Staleness bound past which a durable memo snapshot (ADR-0065 decision 3,
+/// `sys/maintain/memo/<process_id>`) is not trusted for warm start or handoff
+/// seeding: a snapshot whose `snapshot_unix_ns` is further than this from the
+/// reader's clock (in either direction) is ignored, degrading that unit to the
+/// cold rescan we do unconditionally today.
+///
+/// This is deliberately an **independent** bound, not the worker heartbeat's
+/// `3 * H` liveness window, and it is set to the memo re-verify interval
+/// ([`DEFAULT_MEMO_REVERIFY_INTERVAL_NS`], 1 hour). The justification is exact:
+/// a snapshot is written at tick time and every entry it carries was verified
+/// at or before that write, so `snapshot_unix_ns >= max(entry.verified_at_ns)`.
+/// Past one re-verify interval, `now - snapshot_unix_ns > reverify_interval`
+/// implies `now - entry.verified_at_ns > reverify_interval` for *every* entry,
+/// so no seeded entry could pass [`MaintainMemo::is_fresh_terminal`] and none
+/// could suppress a single read -- loading such a snapshot is pure waste. Tying
+/// the bound to the re-verify interval makes it precisely "trust a snapshot
+/// only while at least its newest possible entry could still be fresh."
+///
+/// Coupling to worker liveness (`3 * H` = 180s) would be wrong here in the
+/// other direction: a live worker whose memo is stable does not rewrite its
+/// snapshot every tick (writes are debounced), so its own last snapshot can be
+/// many minutes old while the worker is perfectly healthy; a 180s bound would
+/// wrongly reject that worker's own snapshot on a warm restart. The re-verify
+/// interval is the only bound that matches what the snapshot is actually for.
+/// A far-future-dated snapshot (clock skew) is excluded symmetrically, exactly
+/// as [`crate::worker_set`] excludes a far-future heartbeat.
+pub const DEFAULT_MEMO_SNAPSHOT_STALENESS_NS: i64 = DEFAULT_MEMO_REVERIFY_INTERVAL_NS;
+
+/// Largest framed memo snapshot object (ADR-0065 decision 3, issue #3199) a
+/// maintain process reads or writes, its trailing MAC included: 32 MiB. Each
+/// frontier or exception run encodes in 17 bytes (two four-byte hour fields, a
+/// one-byte state, an eight-byte verify time), so 32 MiB holds about 1.97
+/// million runs, each one or more terminal hours. The reader skips a larger
+/// object ([`crate::memo_snapshot::read_all_memo_snapshots`]) and the maintain
+/// loop's writer does not write one, so an honest process over the cap leaves
+/// its units to a cold rescan on the next reseed, never a correctness change.
+pub const MAX_MEMO_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Largest number of per-hour terminal entries one decoded memo snapshot may
+/// expand to (issue #3199): 4,194,304. A decoded entry is 16 bytes (a `u32`
+/// hour, a one-byte state, an `i64` verify time, padded), and the decoder
+/// admits every run of a unit, then reserves the unit's admitted total exactly
+/// before expanding it, so the entry vectors of one decoded snapshot hold at
+/// most 64 MiB of capacity however long the runs it carries claim to be. The
+/// count is snapshot-wide, across every unit and run, and is checked before a
+/// run is expanded. An honest process whose memo holds more terminal entries
+/// writes no snapshot, which costs its units a cold rescan on the next reseed,
+/// never a correctness change.
+pub const MAX_MEMO_SNAPSHOT_ENTRIES: usize = 4 * 1024 * 1024;
+
+/// The two caps a memo snapshot is held to on the read, decode and write paths
+/// (issue #3199). Production uses [`MemoSnapshotLimits::DEFAULT`]; tests inject
+/// small limits so a boundary can be reached without a cap-sized memo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoSnapshotLimits {
+    /// Largest framed snapshot object, in bytes.
+    pub max_bytes: u64,
+    /// Largest number of per-hour terminal entries a snapshot expands to.
+    pub max_entries: usize,
+}
+
+impl MemoSnapshotLimits {
+    /// [`MAX_MEMO_SNAPSHOT_BYTES`] and [`MAX_MEMO_SNAPSHOT_ENTRIES`].
+    pub const DEFAULT: Self = Self {
+        max_bytes: MAX_MEMO_SNAPSHOT_BYTES,
+        max_entries: MAX_MEMO_SNAPSHOT_ENTRIES,
+    };
+
+    /// Whether a writer may persist a framed snapshot of `framed_bytes` whose
+    /// memo holds `entries` terminal entries
+    /// ([`MaintainMemo::snapshot_entry_count`]): true exactly when a reader
+    /// under the same limits would neither skip nor refuse it.
+    pub fn admits_write(&self, framed_bytes: usize, entries: usize) -> bool {
+        let framed_bytes = u64::try_from(framed_bytes).unwrap_or(u64::MAX);
+        framed_bytes <= self.max_bytes && entries <= self.max_entries
+    }
+}
+
+impl Default for MemoSnapshotLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Smallest encoded unit in a memo snapshot body: 16 tenant bytes, a one-byte
+/// signal, a four-byte shard, a one-byte frontier flag, and a four-byte
+/// exception count. Bounds a snapshot's claimed unit count by the bytes it
+/// actually carries.
+const MEMO_SNAPSHOT_MIN_UNIT_BYTES: usize = 16 + 1 + 4 + 1 + 4;
+
+/// Version tag on the durable memo snapshot payload (ADR-0065 decision 3). Like
+/// the advisory cursor's [`CURSOR_TAG`], the snapshot is not a frozen format:
+/// the tag only lets another encoding be detected and treated as "no usable
+/// snapshot" (cold rescan), never misread. Tag 2 is the MAC-authenticated frame
+/// (ADR-3130, memo snapshot amendment); a tag-1 object carries no MAC and is
+/// rejected as [`MemoSnapshotReject::UnknownTag`].
+const MEMO_SNAPSHOT_TAG: u8 = 2;
+
+/// Length of the keyed BLAKE3 MAC that ends a framed memo snapshot.
+pub const MEMO_SNAPSHOT_MAC_BYTES: usize = 32;
+
+/// Shortest framed memo snapshot a reader verifies: the one-byte tag, the
+/// eight-byte `snapshot_unix_ns`, and the MAC, 41 bytes. A shorter object is
+/// [`MemoSnapshotReject::Malformed`].
+pub const MIN_MEMO_SNAPSHOT_FRAME_BYTES: usize = 1 + 8 + MEMO_SNAPSHOT_MAC_BYTES;
+
+/// The bytes a memo snapshot MAC covers, from the frame without its MAC
+/// (`[tag][snapshot_unix_ns i64 LE][body]`): `tag || process_id (16 raw UUID
+/// bytes) || snapshot_unix_ns LE || body`. `process_id` is the writer's, which
+/// the reader takes from the object key, so a snapshot copied under another
+/// process's key does not verify.
+fn memo_snapshot_claim(process_id: &Uuid, unmaced: &[u8]) -> Vec<u8> {
+    let (tag, rest) = unmaced.split_at(unmaced.len().min(1));
+    let mut claim = Vec::with_capacity(unmaced.len() + 16);
+    claim.extend_from_slice(tag);
+    claim.extend_from_slice(process_id.as_bytes());
+    claim.extend_from_slice(rest);
+    claim
+}
+
+/// Why a memo snapshot object was not used (ADR-3130, memo snapshot
+/// amendment), in the order the read checks them. Every reason is decided
+/// before any of the object's body is decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoSnapshotReject {
+    /// The key's suffix under `sys/maintain/memo/` is not a UUID in its
+    /// canonical form (lowercase, hyphenated); never read.
+    NonUuidKey,
+    /// The LIST modification time is older than the staleness bound plus the
+    /// clock-skew allowance, so the snapshot could never seed; never read.
+    Stale,
+    /// Longer than [`MemoSnapshotLimits::max_bytes`], by its listed size or by
+    /// the bytes the bounded GET returned.
+    Oversize,
+    /// Empty, or shorter than [`MIN_MEMO_SNAPSHOT_FRAME_BYTES`].
+    Malformed,
+    /// A tag other than the one this build writes, tag 1 included.
+    UnknownTag,
+    /// The MAC verifies under none of the reader's maintain keys for the
+    /// process id named by the key.
+    BadMac,
+}
+
+impl MemoSnapshotReject {
+    /// Every reason, in check order.
+    pub const ALL: [MemoSnapshotReject; 6] = [
+        MemoSnapshotReject::NonUuidKey,
+        MemoSnapshotReject::Stale,
+        MemoSnapshotReject::Oversize,
+        MemoSnapshotReject::Malformed,
+        MemoSnapshotReject::UnknownTag,
+        MemoSnapshotReject::BadMac,
+    ];
+
+    /// A stable label for logs.
+    pub fn reason(self) -> &'static str {
+        match self {
+            MemoSnapshotReject::NonUuidKey => "non_uuid_key",
+            MemoSnapshotReject::Stale => "stale",
+            MemoSnapshotReject::Oversize => "oversize",
+            MemoSnapshotReject::Malformed => "malformed",
+            MemoSnapshotReject::UnknownTag => "unknown_tag",
+            MemoSnapshotReject::BadMac => "bad_mac",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            MemoSnapshotReject::NonUuidKey => 0,
+            MemoSnapshotReject::Stale => 1,
+            MemoSnapshotReject::Oversize => 2,
+            MemoSnapshotReject::Malformed => 3,
+            MemoSnapshotReject::UnknownTag => 4,
+            MemoSnapshotReject::BadMac => 5,
+        }
+    }
+}
+
+/// Per-reason counts of the memo snapshot objects one read rejected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoSnapshotRejects {
+    counts: [usize; MemoSnapshotReject::ALL.len()],
+}
+
+impl MemoSnapshotRejects {
+    /// Objects rejected for `reason`.
+    pub fn get(&self, reason: MemoSnapshotReject) -> usize {
+        self.counts[reason.index()]
+    }
+
+    /// Count one more object rejected for `reason`.
+    pub fn record(&mut self, reason: MemoSnapshotReject) {
+        self.counts[reason.index()] += 1;
+    }
+
+    /// Objects rejected for any reason.
+    pub fn total(&self) -> usize {
+        self.counts.iter().sum()
+    }
+
+    /// Every reason with its count, in [`MemoSnapshotReject::ALL`] order.
+    pub fn by_reason(&self) -> [(MemoSnapshotReject, usize); MemoSnapshotReject::ALL.len()] {
+        MemoSnapshotReject::ALL.map(|reason| (reason, self.get(reason)))
+    }
+}
+
+/// Kept in its own module so [`VerifiedSnapshot::verify`] is the only way to
+/// build one, and so the only way to reach the decoder.
+mod snapshot_auth {
+    use super::{
+        Bytes, MEMO_SNAPSHOT_MAC_BYTES, MEMO_SNAPSHOT_TAG, MIN_MEMO_SNAPSHOT_FRAME_BYTES,
+        MaintainRecordKeys, MemoSnapshotReject, Uuid, memo_snapshot_claim,
+    };
+
+    /// A memo snapshot whose MAC verified for the process id it was read
+    /// under: the frame without its MAC, `[tag][snapshot_unix_ns][body]`.
+    /// [`super::MaintainMemo::seed_from_snapshot`] takes only this type.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct VerifiedSnapshot {
+        process_id: Uuid,
+        unmaced: Bytes,
+    }
+
+    impl VerifiedSnapshot {
+        /// Check one framed snapshot written by `process_id`, without decoding
+        /// any of its body, in this order: shorter than
+        /// [`MIN_MEMO_SNAPSHOT_FRAME_BYTES`] is
+        /// [`MemoSnapshotReject::Malformed`], a tag other than the current one
+        /// is [`MemoSnapshotReject::UnknownTag`], and a MAC that verifies under
+        /// none of `keys` is [`MemoSnapshotReject::BadMac`].
+        pub fn verify(
+            process_id: Uuid,
+            framed: impl Into<Bytes>,
+            keys: &MaintainRecordKeys,
+        ) -> Result<Self, MemoSnapshotReject> {
+            let framed: Bytes = framed.into();
+            if framed.len() < MIN_MEMO_SNAPSHOT_FRAME_BYTES {
+                return Err(MemoSnapshotReject::Malformed);
+            }
+            if framed[0] != MEMO_SNAPSHOT_TAG {
+                return Err(MemoSnapshotReject::UnknownTag);
+            }
+            let split = framed.len() - MEMO_SNAPSHOT_MAC_BYTES;
+            let claim = memo_snapshot_claim(&process_id, &framed[..split]);
+            if !keys.memo_verifies(&claim, &framed[split..]) {
+                return Err(MemoSnapshotReject::BadMac);
+            }
+            Ok(VerifiedSnapshot {
+                process_id,
+                unmaced: framed.slice(..split),
+            })
+        }
+
+        /// The writer's process id, taken from the object key.
+        pub fn process_id(&self) -> Uuid {
+            self.process_id
+        }
+
+        /// The writer's `snapshot_unix_ns`, at its fixed offset after the tag
+        /// and covered by the MAC, read without decoding the body.
+        pub fn snapshot_unix_ns(&self) -> i64 {
+            let mut ts = [0u8; 8];
+            // `verify` admitted at least the tag and the timestamp before the MAC.
+            ts.copy_from_slice(&self.unmaced[1..9]);
+            i64::from_le_bytes(ts)
+        }
+
+        /// `[tag][snapshot_unix_ns i64 LE][body]`, MAC removed.
+        pub(super) fn unmaced(&self) -> &[u8] {
+            &self.unmaced
+        }
+    }
+}
+
+/// Memo key: `(tenant, signal, shard, ingest-hour)`, the full identity of one
+/// bucket. Tenant and signal are included so a single per-worker memo can span
+/// every `(signal, shard)` the worker maintains without cross-bucket aliasing.
+type BucketKey = (TenantHash, Signal, u32, u32);
+
+/// Snapshot grouping key for one `(tenant, signal-code, shard)` unit, with the
+/// signal held as its one-byte snapshot discriminant so the map orders
+/// deterministically (required for the debounce body to be a stable function of
+/// the memo).
+type SnapshotUnitKey = (TenantHash, u8, u32);
+
+/// One unit's terminal buckets as `(hour, state code, verified_at_ns)` before
+/// they are run-length encoded into a frontier plus exceptions.
+type SnapshotUnitEntries = Vec<(u32, u8, i64)>;
+
+/// Why a bucket is terminal for the maintain loop: no retention or compaction
+/// action is due now, and none can become due until either a later retention
+/// expiry (caught by the memo's periodic re-verify) or never. Recorded for
+/// observability and tests; the skip decision itself needs only an entry's
+/// presence and freshness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalState {
+    /// A compaction record is present and retention left the bucket live
+    /// ("compacted-and-sweep-complete"): compaction is done, and only a later
+    /// retention expiry can change the bucket.
+    Compacted,
+    /// Sealed, below `min_compaction_inputs`, retention left it live: a sealed
+    /// bucket's input set is frozen, so it can never reach the threshold and
+    /// will never compact; only a later retention expiry can change it.
+    BelowThreshold,
+    /// Tombstoned and physically swept empty ("tombstone-swept-empty"): the
+    /// bucket holds nothing further to do. (It normally also vanishes from the
+    /// shard listing, so its entry is pruned on the next pass.)
+    SweptEmpty,
+    /// Compaction refused the bucket for its merge geometry
+    /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), or refused
+    /// its two-level merge ([`CompactionOutcome::TwoLevelUnsupported`],
+    /// [`CompactionOutcome::ScratchHeadroom`],
+    /// [`CompactionOutcome::ScratchLocked`]), or refused it for its part-index
+    /// windows ([`MaintainError::is_part_index_refusal`]). Terminal
+    /// for this process's binary only, so it is held in memory and never
+    /// written to the durable snapshot: a restart, or a sibling seeded from a
+    /// snapshot, evaluates the bucket again.
+    GeometryUnsupported,
+}
+
+impl TerminalState {
+    /// Stable one-byte discriminant for the durable memo snapshot payload
+    /// (ADR-0065 decision 3). Fixed values: a persisted snapshot must decode
+    /// the same across versions, so these never change once shipped. `None`
+    /// for a state the snapshot does not carry.
+    fn to_code(self) -> Option<u8> {
+        match self {
+            TerminalState::Compacted => Some(0),
+            TerminalState::BelowThreshold => Some(1),
+            TerminalState::SweptEmpty => Some(2),
+            TerminalState::GeometryUnsupported => None,
+        }
+    }
+
+    /// Inverse of [`Self::to_code`]. An unrecognized code is a future-version or
+    /// corrupt snapshot; the decoder treats it as undecodable (cold rescan),
+    /// never a panic.
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(TerminalState::Compacted),
+            1 => Some(TerminalState::BelowThreshold),
+            2 => Some(TerminalState::SweptEmpty),
+            _ => None,
+        }
+    }
+}
+
+/// One memo entry: the terminal classification, the injected time the bucket
+/// was last verified against object storage, and (for
+/// [`TerminalState::BelowThreshold`] only) how many L0 records that
+/// verification found sitting under the compaction threshold.
+///
+/// The count exists so a skipped bucket still contributes to the pass's
+/// `l0_records_pending` total: an interior bucket below the threshold is
+/// memoized terminal and skipped for every tick inside
+/// [`CompactorConfig::interior_reverify_ns`] (6 h against a 300 s tick by
+/// default), and a total built only from buckets the pass evaluated would read
+/// near zero for 71 of every 72 ticks. `None` means the entry carries no known
+/// count: either a state where the count is meaningless, or a
+/// [`TerminalState::BelowThreshold`] entry seeded from a durable snapshot,
+/// which does not encode counts. [`MaintainMemo::is_fresh_terminal`] reports
+/// that second case as not fresh, so one tick re-evaluates the bucket and the
+/// count is known from then on, rather than the total quietly reading short.
+#[derive(Debug, Clone, Copy)]
+struct MemoEntry {
+    state: TerminalState,
+    verified_at_ns: i64,
+    l0_records_pending: Option<usize>,
+}
+
+/// Per-worker in-memory memo of terminal bucket states.
+///
+/// The full-scan-every-tick maintain loop is correct but re-lists and re-reads
+/// every retained bucket on every tick, at roughly two LISTs plus a few GETs
+/// per sealed bucket, growing linearly with the retention window. Most of those
+/// buckets are terminal -- compacted-and-not-yet-expired, below-threshold, or
+/// already swept empty -- and re-evaluating them re-issues identical store
+/// reads for an identical no-op. This memo records the terminal ones per
+/// [`BucketKey`] so [`scan_and_maintain_with_memo`] skips re-listing them, until
+/// a periodic full re-verify (`reverify_interval_ns`) forces a fresh
+/// evaluation.
+///
+/// The memo is **ephemeral and never correctness-bearing**. It lives only in
+/// one worker's memory and is reconstructible from object storage at any time:
+/// on worker restart it is cold (empty), giving exactly one full rescan
+/// identical to the pre-memo behavior. If an entry is wrong, absent, or
+/// corrupted, the worst case is a bucket re-evaluated late (bounded by the
+/// re-verify interval) or redundant work -- never a missed retention or
+/// compaction action, and never an object deleted early. No durability,
+/// visibility, or query path reads it.
+#[derive(Debug, Clone)]
+pub struct MaintainMemo {
+    entries: HashMap<BucketKey, MemoEntry>,
+    /// Buckets another attempt holds an advisory compaction claim on, and the
+    /// clock reading before which re-attempting one is pointless (one
+    /// millisecond past the observed expiry, ADR-1029 decision 1 step 2; the
+    /// retry pays this contender's jitter in its pre-acquisition wait).
+    ///
+    /// In memory only, never in the durable snapshot: it is a scheduling hint
+    /// whose whole lifetime is shorter than one lease, and a restarted worker
+    /// paying one extra claim request per bucket is cheaper than carrying a
+    /// stale hold across it.
+    claim_deferred_until_ns: HashMap<BucketKey, i64>,
+    reverify_interval_ns: i64,
+    /// When [`crate::sweep::sweep_shard`] (the full-keyspace safety-net pass,
+    /// not [`crate::sweep::sweep_shard_zoned`]) last ran for a `(tenant,
+    /// signal, shard)` unit, keyed the same way [`Self::split_unit`] and
+    /// [`Self::merge_unit`] already partition entries, so it rides the same
+    /// per-unit split/merge without its own concurrency plumbing. Absent means
+    /// never (a cold worker's first tick), which [`Self::full_sweep_due`]
+    /// treats as due, matching this memo's own cold-start behavior.
+    last_full_sweep_ns: HashMap<(TenantHash, Signal, u32), i64>,
+    /// The exact expiry (`max_event_ts + window`) of each still-present
+    /// expired bucket whose tombstone this process wrote, taken from the
+    /// records that pass read. The tombstone records no event timestamp, so
+    /// the later passes over the bucket read its retention lag from here.
+    ///
+    /// In memory only, like `claim_deferred_until_ns`: a restarted or newly
+    /// assigned worker falls back to the tombstone's own bound.
+    exact_expiry_ns: HashMap<BucketKey, i64>,
+    /// For a tombstoned bucket whose exact expiry this process does not hold,
+    /// whether its rewrite records keep the hour's nominal deadline as an
+    /// expiry bound (none of them has no parts), as the first pass that read
+    /// them all found it. The records are immutable and an erasure checks for
+    /// the tombstone before it rewrites a bucket, so later passes reuse the
+    /// answer instead of re-reading every record; a rewrite published in the
+    /// race with another replica's tombstone write is not seen. Only an
+    /// answer whose reads all succeeded is kept.
+    ///
+    /// In memory only, like `exact_expiry_ns`.
+    rewrites_keep_nominal_bound: HashMap<BucketKey, bool>,
+}
+
+impl MaintainMemo {
+    /// A cold memo that re-verifies each terminal bucket at least every
+    /// `reverify_interval_ns`. A non-positive interval disables skipping
+    /// entirely (every terminal entry is always treated as stale), reproducing
+    /// the pre-memo full-scan-every-tick behavior.
+    pub fn new(reverify_interval_ns: i64) -> Self {
+        MaintainMemo {
+            entries: HashMap::new(),
+            claim_deferred_until_ns: HashMap::new(),
+            reverify_interval_ns,
+            last_full_sweep_ns: HashMap::new(),
+            exact_expiry_ns: HashMap::new(),
+            rewrites_keep_nominal_bound: HashMap::new(),
+        }
+    }
+
+    /// A cold memo with the default re-verify interval
+    /// ([`DEFAULT_MEMO_REVERIFY_INTERVAL_NS`]).
+    pub fn with_default_interval() -> Self {
+        MaintainMemo::new(DEFAULT_MEMO_REVERIFY_INTERVAL_NS)
+    }
+
+    /// The re-verify interval in nanoseconds.
+    pub fn reverify_interval_ns(&self) -> i64 {
+        self.reverify_interval_ns
+    }
+
+    /// Number of memoized terminal buckets (introspection and tests).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the memo holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The memoized terminal state of one bucket, if any (introspection and
+    /// tests). Returns `None` when the bucket is not memoized, regardless of
+    /// freshness.
+    pub fn terminal_state(
+        &self,
+        tenant_hash: TenantHash,
+        signal: Signal,
+        shard: u32,
+        hour: u32,
+    ) -> Option<TerminalState> {
+        self.entries
+            .get(&(tenant_hash, signal, shard, hour))
+            .map(|entry| entry.state)
+    }
+
+    /// Whether `key` is memoized terminal and still fresh at `now_ns` (last
+    /// verified within the re-verify interval), so its bucket may be skipped
+    /// this tick. A non-positive interval is never fresh.
+    ///
+    /// A [`TerminalState::BelowThreshold`] entry with no known L0 record count
+    /// is never fresh either: skipping it would drop its records out of the
+    /// pass's `l0_records_pending` total for the rest of the re-verify
+    /// interval. Only a snapshot-seeded entry is in that state (the snapshot
+    /// format carries states and verify times, not counts), so this costs one
+    /// re-evaluation per below-threshold bucket after a warm start and nothing
+    /// afterwards.
+    fn is_fresh_terminal(&self, key: &BucketKey, now_ns: i64) -> bool {
+        match self.entries.get(key) {
+            Some(entry) => {
+                self.reverify_interval_ns > 0
+                    && now_ns.saturating_sub(entry.verified_at_ns) < self.reverify_interval_ns
+                    && !(entry.state == TerminalState::BelowThreshold
+                        && entry.l0_records_pending.is_none())
+            }
+            None => false,
+        }
+    }
+
+    /// The L0 record count `key` was last verified to hold while below the
+    /// compaction threshold, or 0 for any other entry (and for an absent one).
+    /// This is what a skipped bucket contributes to the pass's
+    /// `l0_records_pending` total.
+    fn l0_records_pending(&self, key: &BucketKey) -> usize {
+        self.entries
+            .get(key)
+            .and_then(|entry| entry.l0_records_pending)
+            .unwrap_or(0)
+    }
+
+    /// Whether the memo holds `key` as refused for its merge geometry
+    /// ([`TerminalState::GeometryUnsupported`]), fresh or not. Only this
+    /// process's own refusal puts it there: the snapshot never carries it.
+    fn geometry_refused(&self, key: &BucketKey) -> bool {
+        self.entries
+            .get(key)
+            .is_some_and(|entry| entry.state == TerminalState::GeometryUnsupported)
+    }
+
+    /// Record `key` as terminal in `state`, verified at `now_ns`, with no known
+    /// L0 record count. A below-threshold bucket's count is attached by
+    /// [`Self::set_l0_records_pending`] right after.
+    fn mark_terminal(&mut self, key: BucketKey, state: TerminalState, now_ns: i64) {
+        self.entries.insert(
+            key,
+            MemoEntry {
+                state,
+                verified_at_ns: now_ns,
+                l0_records_pending: None,
+            },
+        );
+    }
+
+    /// Attach the L0 record count a fresh evaluation found for `key`. No-op for
+    /// a key the memo does not hold: the memo is advisory, and a bucket that
+    /// was not memoized terminal is re-evaluated next tick anyway.
+    fn set_l0_records_pending(&mut self, key: &BucketKey, count: usize) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.l0_records_pending = Some(count);
+        }
+    }
+
+    /// Forget `key` (it is no longer terminal).
+    fn forget(&mut self, key: &BucketKey) {
+        self.entries.remove(key);
+    }
+
+    /// Mark `hours` of `(tenant, signal, shard)` as due for re-evaluation on
+    /// the next tick, regardless of interior re-verify cadence.
+    ///
+    /// This is the public invalidate seam named in ADR-0065: callers outside
+    /// this crate (the erasure rewrite work orders) use
+    /// it to force a specific interior hour back through `maintain_bucket`
+    /// without waiting for the slow safety-net sweep or the interior
+    /// re-verify interval to elapse. It is a thin wrapper over [`Self::forget`]:
+    /// a forgotten entry has no memoized verdict, so `is_fresh_terminal`
+    /// reports it as not fresh and the next tick re-evaluates it. Because
+    /// there is nothing to encode, this trivially survives a memo snapshot
+    /// save/load round-trip (there's no stale entry to reseed).
+    ///
+    /// Known gap, not addressed here: if a sibling worker's own snapshot
+    /// (taken before the invalidation, but merged in after it) re-seeds this
+    /// key as terminal via `seed_from_snapshot`'s freshest-verdict-wins rule,
+    /// and that snapshot's `verified_at_ns` is later than this invalidation
+    /// event, the entry can come back fresh before its next natural tick.
+    /// Closing this needs a durable invalidation marker (a tombstone with its
+    /// own timestamp) in the snapshot format, which is out of scope for this
+    /// task.
+    pub fn invalidate(&mut self, tenant: TenantHash, signal: Signal, shard: u32, hours: &[u32]) {
+        for hour in hours {
+            self.forget(&(tenant, signal, shard, *hour));
+        }
+    }
+
+    /// Split off the memo entries for one `(tenant, signal, shard)` unit into a
+    /// standalone memo carrying the same re-verify interval, removing them from
+    /// `self`. For the bounded-concurrent per-unit walk (ADR-0065 decision 2):
+    /// each owned unit maintains its own slice of the memo independently on its
+    /// own future, and [`Self::merge_unit`] folds the slice back once the unit's
+    /// concurrent tick completes. Distinct units never share a [`BucketKey`], so
+    /// split-then-merge is lossless.
+    pub fn split_unit(&mut self, tenant: TenantHash, signal: Signal, shard: u32) -> MaintainMemo {
+        let mut moved = HashMap::new();
+        self.entries.retain(|(t, s, sh, hour), entry| {
+            if *t == tenant && *s == signal && *sh == shard {
+                moved.insert((*t, *s, *sh, *hour), *entry);
+                false
+            } else {
+                true
+            }
+        });
+        let mut moved_sweep = HashMap::new();
+        if let Some(ns) = self.last_full_sweep_ns.remove(&(tenant, signal, shard)) {
+            moved_sweep.insert((tenant, signal, shard), ns);
+        }
+        let mut moved_defer = HashMap::new();
+        self.claim_deferred_until_ns
+            .retain(|(t, s, sh, hour), until| {
+                if *t == tenant && *s == signal && *sh == shard {
+                    moved_defer.insert((*t, *s, *sh, *hour), *until);
+                    false
+                } else {
+                    true
+                }
+            });
+        let mut moved_expiry = HashMap::new();
+        self.exact_expiry_ns.retain(|(t, s, sh, hour), expiry| {
+            if *t == tenant && *s == signal && *sh == shard {
+                moved_expiry.insert((*t, *s, *sh, *hour), *expiry);
+                false
+            } else {
+                true
+            }
+        });
+        let mut moved_bound = HashMap::new();
+        self.rewrites_keep_nominal_bound
+            .retain(|(t, s, sh, hour), keeps| {
+                if *t == tenant && *s == signal && *sh == shard {
+                    moved_bound.insert((*t, *s, *sh, *hour), *keeps);
+                    false
+                } else {
+                    true
+                }
+            });
+        MaintainMemo {
+            entries: moved,
+            claim_deferred_until_ns: moved_defer,
+            reverify_interval_ns: self.reverify_interval_ns,
+            last_full_sweep_ns: moved_sweep,
+            exact_expiry_ns: moved_expiry,
+            rewrites_keep_nominal_bound: moved_bound,
+        }
+    }
+
+    /// Merge a unit memo produced by [`Self::split_unit`] back into `self` after
+    /// its concurrent tick. The unit owns a disjoint [`BucketKey`] space, so
+    /// this never overwrites another unit's entry.
+    pub fn merge_unit(&mut self, unit: MaintainMemo) {
+        self.entries.extend(unit.entries);
+        self.claim_deferred_until_ns
+            .extend(unit.claim_deferred_until_ns);
+        self.last_full_sweep_ns.extend(unit.last_full_sweep_ns);
+        self.exact_expiry_ns.extend(unit.exact_expiry_ns);
+        self.rewrites_keep_nominal_bound
+            .extend(unit.rewrites_keep_nominal_bound);
+    }
+
+    /// The most precise expiry known for `key` after this pass observed
+    /// `observed`: an exact expiry is remembered and returned, and a pass that
+    /// only saw the tombstone's bound gets the exact expiry an earlier pass of
+    /// this process remembered, if any.
+    fn best_expiry(
+        &mut self,
+        key: BucketKey,
+        observed: Option<ObservedExpiry>,
+    ) -> Option<ObservedExpiry> {
+        match observed {
+            Some(ObservedExpiry::Exact(expiry_ns)) => {
+                self.exact_expiry_ns.insert(key, expiry_ns);
+                observed
+            }
+            _ => self
+                .exact_expiry_ns
+                .get(&key)
+                .map(|&expiry_ns| ObservedExpiry::Exact(expiry_ns))
+                .or(observed),
+        }
+    }
+
+    /// Hold `key` until `until_ns`: another attempt holds its advisory
+    /// compaction claim, so a re-attempt before the holder's lease can have
+    /// expired would spend a PUT-class request to learn the same thing
+    /// (ADR-1029 decision 1 step 2: never poll an active claim).
+    pub fn defer_claim_until(&mut self, key: BucketKey, until_ns: i64) {
+        self.claim_deferred_until_ns.insert(key, until_ns);
+    }
+
+    /// Whether `key` is still on hold behind another attempt's claim at
+    /// `now_ns`. Clears the hold once it lapses, so the entry does not outlive
+    /// the lease it was derived from.
+    pub fn claim_deferred(&mut self, key: &BucketKey, now_ns: i64) -> bool {
+        match self.claim_deferred_until_ns.get(key) {
+            Some(until) if now_ns < *until => true,
+            Some(_) => {
+                self.claim_deferred_until_ns.remove(key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Whether a full-keyspace sweep pass ([`crate::sweep::sweep_shard`]) is
+    /// due for `(tenant, signal, shard)` at `now_ns`, i.e. it has never run or
+    /// last ran at least `cadence_ns` ago. A non-positive `cadence_ns` is
+    /// always due, mirroring [`Self::is_fresh_terminal`]'s non-positive-
+    /// interval convention.
+    pub fn full_sweep_due(
+        &self,
+        tenant: TenantHash,
+        signal: Signal,
+        shard: u32,
+        now_ns: i64,
+        cadence_ns: i64,
+    ) -> bool {
+        if cadence_ns <= 0 {
+            return true;
+        }
+        match self.last_full_sweep_ns.get(&(tenant, signal, shard)) {
+            Some(last_ns) => now_ns.saturating_sub(*last_ns) >= cadence_ns,
+            None => true,
+        }
+    }
+
+    /// Record that a full-keyspace sweep pass ran for `(tenant, signal,
+    /// shard)` at `now_ns`, resetting [`Self::full_sweep_due`]'s clock.
+    pub fn record_full_sweep(
+        &mut self,
+        tenant: TenantHash,
+        signal: Signal,
+        shard: u32,
+        now_ns: i64,
+    ) {
+        self.last_full_sweep_ns
+            .insert((tenant, signal, shard), now_ns);
+    }
+
+    /// Drop entries for `(tenant, signal, shard)` whose hour is absent from
+    /// `present`, bounding memory to buckets that still exist. Entries for other
+    /// shards, signals, or tenants are untouched.
+    fn retain_present(
+        &mut self,
+        tenant: TenantHash,
+        signal: Signal,
+        shard: u32,
+        present: &HashSet<u32>,
+    ) {
+        self.entries.retain(|(t, s, sh, hour), _| {
+            *t != tenant || *s != signal || *sh != shard || present.contains(hour)
+        });
+        self.claim_deferred_until_ns.retain(|(t, s, sh, hour), _| {
+            *t != tenant || *s != signal || *sh != shard || present.contains(hour)
+        });
+        self.exact_expiry_ns.retain(|(t, s, sh, hour), _| {
+            *t != tenant || *s != signal || *sh != shard || present.contains(hour)
+        });
+        self.rewrites_keep_nominal_bound
+            .retain(|(t, s, sh, hour), _| {
+                *t != tenant || *s != signal || *sh != shard || present.contains(hour)
+            });
+    }
+
+    /// Seed one terminal entry from a durable snapshot (ADR-0065 decision 3),
+    /// keeping the freshest verdict when a bucket is seeded from more than one
+    /// snapshot: an existing entry verified at or after `verified_at_ns` wins,
+    /// so merging siblings' snapshots converges on the most recently verified
+    /// state per bucket regardless of read order.
+    fn seed_entry(&mut self, key: BucketKey, state: TerminalState, verified_at_ns: i64) {
+        match self.entries.get(&key) {
+            Some(existing) if existing.verified_at_ns >= verified_at_ns => {}
+            _ => {
+                self.entries.insert(
+                    key,
+                    MemoEntry {
+                        state,
+                        verified_at_ns,
+                        // The snapshot body carries states and verify times
+                        // only. A below-threshold entry therefore arrives with
+                        // no count and `is_fresh_terminal` re-verifies it once.
+                        l0_records_pending: None,
+                    },
+                );
+            }
+        }
+    }
+
+    /// The RLE-encoded snapshot **body** (ADR-0065 decision 3): every terminal
+    /// bucket the memo holds, grouped per `(tenant, signal, shard)` unit, each
+    /// unit summarized as a dense **frontier** run plus a sparse **exception**
+    /// list, without the [`MEMO_SNAPSHOT_TAG`]/`snapshot_unix_ns` header. The
+    /// body is a pure function of the memoized entries and is emitted in a
+    /// canonical order (units sorted by `(tenant, signal-code, shard)`, hours
+    /// ascending), so a driver can compare two bodies byte-for-byte to **debounce**
+    /// the durable write (skip a tick that changed nothing) without the ever-
+    /// changing timestamp forcing a write every tick.
+    ///
+    /// Encoding, per unit: the terminal hours are partitioned into maximal
+    /// contiguous same-state runs; the single longest run (ties broken toward
+    /// the highest hour) is the frontier -- the compacted interior of the
+    /// retention window, one run covering hundreds of hours -- stored as
+    /// `(frontier_start_hour, terminal_frontier_hour, state, verified_ns)`. Every
+    /// other run is an exception, stored as `(start_hour, run_len, state,
+    /// verified_ns)`. Each run's `verified_ns` is the *minimum* verified time
+    /// across its hours, so a warm-started entry is never treated as fresher
+    /// than its oldest member. See [`Self::encode_snapshot`] for the full framed
+    /// object and [`Self::seed_from_snapshot`] for the inverse.
+    pub fn snapshot_body(&self) -> Vec<u8> {
+        // Group terminal entries per unit, deterministically ordered so the
+        // body is a stable function of the memo (required for debounce).
+        let mut by_unit: std::collections::BTreeMap<SnapshotUnitKey, SnapshotUnitEntries> =
+            std::collections::BTreeMap::new();
+        for (&(t, s, sh, hour), entry) in &self.entries {
+            let Some(code) = entry.state.to_code() else {
+                continue;
+            };
+            by_unit
+                .entry((t, signal_to_code(s), sh))
+                .or_default()
+                .push((hour, code, entry.verified_at_ns));
+        }
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(by_unit.len() as u32).to_le_bytes());
+        for ((tenant, signal_code, shard), mut hours) in by_unit {
+            hours.sort_unstable_by_key(|(hour, _, _)| *hour);
+            let runs = terminal_runs(&hours);
+            // Frontier = the longest run; ties toward the highest end hour. The
+            // retention-window interior is one run, so this is the compression.
+            let frontier_idx = runs
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| {
+                    a.len()
+                        .cmp(&b.len())
+                        .then_with(|| a.end_hour.cmp(&b.end_hour))
+                })
+                .map(|(i, _)| i);
+
+            buf.extend_from_slice(&tenant.0);
+            buf.push(signal_code);
+            buf.extend_from_slice(&shard.to_le_bytes());
+
+            match frontier_idx {
+                Some(idx) => {
+                    let f = &runs[idx];
+                    buf.push(1); // frontier present
+                    buf.extend_from_slice(&f.start_hour.to_le_bytes());
+                    buf.extend_from_slice(&f.end_hour.to_le_bytes());
+                    buf.push(f.code);
+                    buf.extend_from_slice(&f.verified_ns.to_le_bytes());
+
+                    let exceptions: Vec<&TerminalRun> = runs
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != idx)
+                        .map(|(_, r)| r)
+                        .collect();
+                    buf.extend_from_slice(&(exceptions.len() as u32).to_le_bytes());
+                    for run in exceptions {
+                        buf.extend_from_slice(&run.start_hour.to_le_bytes());
+                        buf.extend_from_slice(&run.len().to_le_bytes());
+                        buf.push(run.code);
+                        buf.extend_from_slice(&run.verified_ns.to_le_bytes());
+                    }
+                }
+                None => {
+                    // A unit with an entry always has at least one run, so this
+                    // arm is only reached for an entry-less unit, which the
+                    // grouping above never produces; encode it as empty anyway.
+                    buf.push(0); // no frontier
+                    buf.extend_from_slice(&0u32.to_le_bytes()); // zero exceptions
+                }
+            }
+        }
+        buf
+    }
+
+    /// Number of per-hour terminal entries [`Self::snapshot_body`] encodes,
+    /// which is how many a reader's decode expands it back to. The writer
+    /// passes it to [`MemoSnapshotLimits::admits_write`] so it never persists a
+    /// snapshot the reader would reject.
+    pub fn snapshot_entry_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| entry.state.to_code().is_some())
+            .count()
+    }
+
+    /// Frame a snapshot body ([`Self::snapshot_body`]) into the durable object
+    /// bytes written to `process_id`'s key:
+    /// `[MEMO_SNAPSHOT_TAG][snapshot_unix_ns i64 LE][body][mac 32]`, the MAC
+    /// minted under the first of `keys` over the claim
+    /// `tag || process_id || snapshot_unix_ns LE || body` (ADR-3130, memo
+    /// snapshot amendment). Taking a pre-computed body lets a driver reuse the
+    /// body it already built for the debounce comparison rather than
+    /// re-encoding it.
+    pub fn snapshot_bytes_from_body(
+        body: &[u8],
+        snapshot_unix_ns: i64,
+        process_id: &Uuid,
+        keys: &MaintainRecordKeys,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 8 + body.len() + MEMO_SNAPSHOT_MAC_BYTES);
+        buf.push(MEMO_SNAPSHOT_TAG);
+        buf.extend_from_slice(&snapshot_unix_ns.to_le_bytes());
+        buf.extend_from_slice(body);
+        let mac = keys.memo_mac(&memo_snapshot_claim(process_id, &buf));
+        buf.extend_from_slice(&mac);
+        buf
+    }
+
+    /// The full durable snapshot object (ADR-0065 decision 3), stamped with the
+    /// writer's clock `snapshot_unix_ns` for the reader-side staleness check
+    /// ([`DEFAULT_MEMO_SNAPSHOT_STALENESS_NS`]). Convenience over
+    /// [`Self::snapshot_bytes_from_body`] when the caller does not separately
+    /// need the body for debouncing.
+    pub fn encode_snapshot(
+        &self,
+        snapshot_unix_ns: i64,
+        process_id: &Uuid,
+        keys: &MaintainRecordKeys,
+    ) -> Vec<u8> {
+        Self::snapshot_bytes_from_body(&self.snapshot_body(), snapshot_unix_ns, process_id, keys)
+    }
+
+    /// Seed this memo from one verified durable snapshot for the units `owns`
+    /// accepts (ADR-0065 decision 3's warm start and handoff). Only a
+    /// [`VerifiedSnapshot`] is decoded, so no unauthenticated object reaches
+    /// the decoder. Fail-open by contract: an undecodable or truncated payload,
+    /// or one that expands past `limits.max_entries`, returns an
+    /// [`MemoSnapshotError`] the caller logs and treats as a cold start for
+    /// those units, never a panic and never a blocked loop. Production passes
+    /// [`MemoSnapshotLimits::DEFAULT`].
+    ///
+    /// `staleness_ns` gates the whole snapshot on its `snapshot_unix_ns`: a
+    /// snapshot further than `staleness_ns` from `now_ns` in either direction is
+    /// ignored ([`SeedStats::stale`] set, nothing seeded, nothing decoded: the
+    /// timestamp is read from the verified frame), matching the
+    /// far-future exclusion [`crate::worker_set`] applies to heartbeats. A
+    /// non-positive `staleness_ns` disables the whole-snapshot gate (every
+    /// snapshot is loaded; per-entry freshness still governs skipping). Seeded
+    /// entries only ever *suppress reads* through the same freshness rules as a
+    /// warm in-memory entry ([`Self::is_fresh_terminal`]); the memo stays as
+    /// advisory as ever, so a wrong seed can at worst defer a bucket's
+    /// re-evaluation by one re-verify interval.
+    pub fn seed_from_snapshot(
+        &mut self,
+        snapshot: &VerifiedSnapshot,
+        limits: MemoSnapshotLimits,
+        now_ns: i64,
+        staleness_ns: i64,
+        owns: impl Fn(TenantHash, Signal, u32) -> bool,
+    ) -> std::result::Result<SeedStats, MemoSnapshotError> {
+        if staleness_ns > 0 {
+            let snapshot_unix_ns = snapshot.snapshot_unix_ns();
+            let too_old = now_ns.saturating_sub(snapshot_unix_ns) > staleness_ns;
+            let too_future = snapshot_unix_ns.saturating_sub(now_ns) > staleness_ns;
+            if too_old || too_future {
+                return Ok(SeedStats {
+                    stale: true,
+                    seeded_units: 0,
+                    seeded_buckets: 0,
+                });
+            }
+        }
+
+        let decoded = decode_snapshot(snapshot, limits.max_entries)?;
+
+        let mut stats = SeedStats {
+            stale: false,
+            seeded_units: 0,
+            seeded_buckets: 0,
+        };
+        for unit in decoded.units {
+            if !owns(unit.tenant, unit.signal, unit.shard) {
+                continue;
+            }
+            stats.seeded_units += 1;
+            for (hour, state, verified_ns) in unit.entries {
+                // Clamp each entry's verified_ns to the snapshot's own
+                // snapshot_unix_ns. By construction a snapshot is written at
+                // tick time and every entry was verified at or before that
+                // write, so `snapshot_unix_ns >= max(entry.verified_at_ns)`
+                // always holds for an honest snapshot (see the staleness bound
+                // doc above). A corrupted or clock-skewed entry with a future
+                // verified_ns would otherwise read as eternally fresh through
+                // `is_fresh_terminal` and, because the memo is re-encoded and
+                // republished each cycle, self-propagate fleet-wide. The clamp
+                // makes it structurally impossible for a decoded entry to be
+                // fresher than the snapshot it came from, which the header-level
+                // too_future guard has already bounded against `now_ns`.
+                let verified_ns = verified_ns.min(decoded.snapshot_unix_ns);
+                self.seed_entry(
+                    (unit.tenant, unit.signal, unit.shard, hour),
+                    state,
+                    verified_ns,
+                );
+                stats.seeded_buckets += 1;
+            }
+        }
+        Ok(stats)
+    }
+}
+
+/// What one [`MaintainMemo::seed_from_snapshot`] call did, for logging and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SeedStats {
+    /// The snapshot was excluded by the staleness gate; nothing was seeded.
+    pub stale: bool,
+    /// Owned units the snapshot carried entries for and seeded from.
+    pub seeded_units: usize,
+    /// Terminal bucket entries seeded (may include buckets already warm, which
+    /// keep whichever verdict is fresher).
+    pub seeded_buckets: usize,
+}
+
+/// A verified durable memo snapshot ([`MaintainMemo::encode_snapshot`]) that
+/// failed to decode. Every variant means the same thing to the caller -- treat the
+/// snapshot as absent and cold-start the affected units -- but they are
+/// distinguished so a log line can say why a snapshot was skipped.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MemoSnapshotError {
+    /// The payload ended before a field the format requires was fully read.
+    #[error("memo snapshot truncated: wanted {wanted} more bytes at offset {offset}")]
+    Truncated { offset: usize, wanted: usize },
+    /// A terminal-state discriminant outside [`TerminalState`]'s range.
+    #[error("memo snapshot carries unknown terminal-state code {0}")]
+    UnknownState(u8),
+    /// A signal discriminant outside [`Signal`]'s range.
+    #[error("memo snapshot carries unknown signal code {0}")]
+    UnknownSignal(u8),
+    /// An exception run with zero length, which the encoder never emits.
+    #[error("memo snapshot carries a zero-length run (a corrupt encoding)")]
+    ZeroLengthRun,
+    /// The unit count claims more units than the remaining payload bytes could
+    /// hold at the minimum encoded unit size, so it is not trusted to size an
+    /// allocation.
+    #[error("memo snapshot claims {unit_count} units but only {remaining} payload bytes remain")]
+    UnitCountExceedsPayload { unit_count: u32, remaining: usize },
+    /// A frontier run whose end hour precedes its start hour.
+    #[error("memo snapshot carries a frontier ending at hour {end} before its start {start}")]
+    FrontierEndBeforeStart { start: u32, end: u32 },
+    /// A run whose last hour would pass `u32::MAX`.
+    #[error("memo snapshot carries a run of {run_len} hours from {start} past the last hour")]
+    RunPastLastHour { start: u32, run_len: u32 },
+    /// Expanding the next run would take the snapshot past
+    /// [`MAX_MEMO_SNAPSHOT_ENTRIES`]. `total` is the entries already expanded
+    /// plus this run's length, computed before anything of the run is expanded.
+    #[error("memo snapshot expands to at least {total} entries, over the cap of {cap}")]
+    TooManyEntries { total: u64, cap: usize },
+}
+
+/// One maximal contiguous same-state run of terminal hours within a unit.
+#[derive(Debug, Clone, Copy)]
+struct TerminalRun {
+    start_hour: u32,
+    end_hour: u32,
+    /// The run's [`TerminalState::to_code`].
+    code: u8,
+    /// Minimum `verified_at_ns` across the run (conservative for freshness).
+    verified_ns: i64,
+}
+
+impl TerminalRun {
+    fn len(&self) -> u32 {
+        self.end_hour - self.start_hour + 1
+    }
+}
+
+/// Partition sorted `(hour, state code, verified_ns)` entries into maximal runs
+/// of consecutive hours sharing one [`TerminalState`]. A run breaks on a hour
+/// gap or a state change. Input must be sorted ascending by hour with unique
+/// hours (the memo keys one entry per bucket, so hours are unique by
+/// construction).
+fn terminal_runs(sorted: &[(u32, u8, i64)]) -> Vec<TerminalRun> {
+    let mut runs: Vec<TerminalRun> = Vec::new();
+    for &(hour, code, verified_ns) in sorted {
+        match runs.last_mut() {
+            Some(run) if run.end_hour + 1 == hour && run.code == code => {
+                run.end_hour = hour;
+                run.verified_ns = run.verified_ns.min(verified_ns);
+            }
+            _ => runs.push(TerminalRun {
+                start_hour: hour,
+                end_hour: hour,
+                code,
+                verified_ns,
+            }),
+        }
+    }
+    runs
+}
+
+/// One decoded unit of a snapshot: its identity plus every terminal bucket the
+/// runs expanded to.
+struct DecodedUnit {
+    tenant: TenantHash,
+    signal: Signal,
+    shard: u32,
+    entries: Vec<(u32, TerminalState, i64)>,
+}
+
+/// A fully decoded snapshot.
+struct DecodedSnapshot {
+    snapshot_unix_ns: i64,
+    units: Vec<DecodedUnit>,
+}
+
+/// Stable one-byte discriminant for a [`Signal`] in the memo snapshot. Fixed
+/// values (a persisted snapshot must decode identically across versions); every
+/// signal is mapped, not just the maintained three, so a snapshot is total.
+fn signal_to_code(signal: Signal) -> u8 {
+    match signal {
+        Signal::Metrics => 0,
+        Signal::Logs => 1,
+        Signal::Spans => 2,
+        Signal::Profiles => 3,
+        Signal::Alerts => 4,
+        Signal::Audit => 5,
+    }
+}
+
+/// Inverse of [`signal_to_code`]. An unknown code is a future-version or corrupt
+/// snapshot, surfaced as [`MemoSnapshotError::UnknownSignal`].
+fn signal_from_code(code: u8) -> Option<Signal> {
+    match code {
+        0 => Some(Signal::Metrics),
+        1 => Some(Signal::Logs),
+        2 => Some(Signal::Spans),
+        3 => Some(Signal::Profiles),
+        4 => Some(Signal::Alerts),
+        5 => Some(Signal::Audit),
+        _ => None,
+    }
+}
+
+/// A bounds-checked cursor over the snapshot bytes; every read that would run
+/// off the end is a typed [`MemoSnapshotError::Truncated`], never a panic.
+struct SnapshotReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> SnapshotReader<'a> {
+    fn take(&mut self, n: usize) -> std::result::Result<&'a [u8], MemoSnapshotError> {
+        let end = self
+            .offset
+            .checked_add(n)
+            .ok_or(MemoSnapshotError::Truncated {
+                offset: self.offset,
+                wanted: n,
+            })?;
+        if end > self.bytes.len() {
+            return Err(MemoSnapshotError::Truncated {
+                offset: self.offset,
+                wanted: n,
+            });
+        }
+        let out = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(out)
+    }
+
+    fn u8(&mut self) -> std::result::Result<u8, MemoSnapshotError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> std::result::Result<u32, MemoSnapshotError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn i64(&mut self) -> std::result::Result<i64, MemoSnapshotError> {
+        let b = self.take(8)?;
+        Ok(i64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+}
+
+/// Decode a verified snapshot, expanding every frontier/exception run back
+/// into per-bucket terminal entries. Every malformed input yields a typed
+/// [`MemoSnapshotError`] (fail-open at the caller), never a panic. No count the
+/// payload carries sizes an allocation unchecked: the unit count is bounded by
+/// the bytes that follow it, and the runs' total length by `max_entries`
+/// (production passes [`MAX_MEMO_SNAPSHOT_ENTRIES`]). Each unit is read twice:
+/// once to admit every run against the snapshot-wide total, then, after one
+/// exact reservation of the unit's admitted entries, to expand them.
+fn decode_snapshot(
+    snapshot: &VerifiedSnapshot,
+    max_entries: usize,
+) -> std::result::Result<DecodedSnapshot, MemoSnapshotError> {
+    #[cfg(test)]
+    decode_calls::bump();
+    let bytes = snapshot.unmaced();
+    // `VerifiedSnapshot::verify` already checked the tag.
+    let mut reader = SnapshotReader { bytes, offset: 1 };
+    let snapshot_unix_ns = reader.i64()?;
+    let unit_count = reader.u32()?;
+    let remaining = bytes.len().saturating_sub(reader.offset);
+    let max_units = remaining / MEMO_SNAPSHOT_MIN_UNIT_BYTES;
+    if unit_count as usize > max_units {
+        return Err(MemoSnapshotError::UnitCountExceedsPayload {
+            unit_count,
+            remaining,
+        });
+    }
+
+    // Entries admitted so far across every unit.
+    let mut expanded: u64 = 0;
+
+    let mut units = Vec::with_capacity(unit_count as usize);
+    for _ in 0..unit_count {
+        let tenant_bytes = reader.take(16)?;
+        let mut tenant = [0u8; 16];
+        tenant.copy_from_slice(tenant_bytes);
+        let tenant = TenantHash(tenant);
+        let signal_code = reader.u8()?;
+        let signal =
+            signal_from_code(signal_code).ok_or(MemoSnapshotError::UnknownSignal(signal_code))?;
+        let shard = reader.u32()?;
+
+        let runs_offset = reader.offset;
+        let unit_first = expanded;
+        read_unit_runs(&mut reader, |start, end, _, _| {
+            expanded = admit_run(expanded, max_entries, start, end)?.total();
+            Ok(())
+        })?;
+        let unit_entries = usize::try_from(expanded - unit_first).unwrap_or(usize::MAX);
+
+        let mut entries: Vec<(u32, TerminalState, i64)> = Vec::new();
+        entries.reserve_exact(unit_entries);
+        reader.offset = runs_offset;
+        let mut readmitted = unit_first;
+        read_unit_runs(&mut reader, |start, end, state, verified| {
+            let run = admit_run(readmitted, max_entries, start, end)?;
+            readmitted = run.total();
+            expand_run(&mut entries, run, state, verified);
+            Ok(())
+        })?;
+
+        units.push(DecodedUnit {
+            tenant,
+            signal,
+            shard,
+            entries,
+        });
+    }
+
+    Ok(DecodedSnapshot {
+        snapshot_unix_ns,
+        units,
+    })
+}
+
+/// Read one unit's optional frontier and its exception runs, handing each run
+/// to `on_run` as `(start, end, state, verified_ns)`.
+fn read_unit_runs(
+    reader: &mut SnapshotReader<'_>,
+    mut on_run: impl FnMut(u32, u32, TerminalState, i64) -> std::result::Result<(), MemoSnapshotError>,
+) -> std::result::Result<(), MemoSnapshotError> {
+    let frontier_present = reader.u8()?;
+    if frontier_present == 1 {
+        let start = reader.u32()?;
+        let end = reader.u32()?;
+        let state_code = reader.u8()?;
+        let state = TerminalState::from_code(state_code)
+            .ok_or(MemoSnapshotError::UnknownState(state_code))?;
+        let verified = reader.i64()?;
+        on_run(start, end, state, verified)?;
+    }
+
+    let exception_count = reader.u32()?;
+    for _ in 0..exception_count {
+        let start = reader.u32()?;
+        let run_len = reader.u32()?;
+        if run_len == 0 {
+            return Err(MemoSnapshotError::ZeroLengthRun);
+        }
+        let state_code = reader.u8()?;
+        let state = TerminalState::from_code(state_code)
+            .ok_or(MemoSnapshotError::UnknownState(state_code))?;
+        let verified = reader.i64()?;
+        let end = start
+            .checked_add(run_len - 1)
+            .ok_or(MemoSnapshotError::RunPastLastHour { start, run_len })?;
+        on_run(start, end, state, verified)?;
+    }
+    Ok(())
+}
+
+/// How many times [`decode_snapshot`] ran on this thread, so a test can show
+/// that a read decoded nothing it rejected.
+#[cfg(test)]
+pub(crate) mod decode_calls {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn bump() {
+        CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
+
+    pub(crate) fn get() -> usize {
+        CALLS.with(Cell::get)
+    }
+}
+
+/// Expand one admitted RLE run into per-hour terminal entries. The caller has
+/// already reserved the unit's admitted total, so this does not reallocate.
+/// Taking [`AdmittedRun`] means a run can only be expanded after [`admit_run`]
+/// has checked it against the entry cap.
+fn expand_run(
+    out: &mut Vec<(u32, TerminalState, i64)>,
+    run: AdmittedRun,
+    state: TerminalState,
+    verified_ns: i64,
+) {
+    for hour in run.start()..=run.end() {
+        out.push((hour, state, verified_ns));
+    }
+}
+
+/// Kept in its own module so [`AdmittedRun`]'s fields are private to
+/// [`admit_run`], its only constructor.
+mod run_admission {
+    use super::MemoSnapshotError;
+
+    /// A run of hours `start..=end` that [`admit_run`] found within the entry
+    /// cap, carrying the snapshot-wide total including it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct AdmittedRun {
+        start: u32,
+        end: u32,
+        total: u64,
+    }
+
+    impl AdmittedRun {
+        pub(super) fn start(self) -> u32 {
+            self.start
+        }
+
+        pub(super) fn end(self) -> u32 {
+            self.end
+        }
+
+        /// Hours in the run. Fits `usize` because it is at most `max_entries`.
+        #[cfg(test)]
+        pub(super) fn len(self) -> usize {
+            usize::try_from(self.end - self.start)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1)
+        }
+
+        /// Entries admitted across the snapshot, this run included.
+        pub(super) fn total(self) -> u64 {
+            self.total
+        }
+    }
+
+    /// Admit hours `start..=end` given `expanded` entries already admitted,
+    /// refusing the run when the total would pass `max_entries`. Pure: nothing
+    /// is allocated, so a refused run costs nothing however long it claims to
+    /// be.
+    pub(super) fn admit_run(
+        expanded: u64,
+        max_entries: usize,
+        start: u32,
+        end: u32,
+    ) -> Result<AdmittedRun, MemoSnapshotError> {
+        if end < start {
+            return Err(MemoSnapshotError::FrontierEndBeforeStart { start, end });
+        }
+        let total = expanded.saturating_add(u64::from(end - start) + 1);
+        if total > u64::try_from(max_entries).unwrap_or(u64::MAX) {
+            return Err(MemoSnapshotError::TooManyEntries {
+                total,
+                cap: max_entries,
+            });
+        }
+        Ok(AdmittedRun { start, end, total })
+    }
+}
+
+/// Classify one bucket's maintain outcome as terminal (memoizable) or not.
+/// Terminal means this tick did no durable work and the next tick would repeat
+/// the identical no-op store reads until a later retention expiry, or forever.
+fn classify_terminal(
+    retention: &RetentionOutcome,
+    compaction: &Option<CompactionOutcome>,
+) -> Option<TerminalState> {
+    match retention {
+        // Physically swept empty: nothing remains in the bucket.
+        RetentionOutcome::Swept => Some(TerminalState::SweptEmpty),
+        // A tombstone is present but the horizon-gated sweep is still pending,
+        // a sweep left residue, or the sweep is blocked because the snapshot
+        // still reaches the bucket (ADR-0020): real work is due on a later tick
+        // (once the fold drops the bucket, or the residue/HEAD read clears), so
+        // never memoize it as terminal.
+        RetentionOutcome::Tombstoned
+        | RetentionOutcome::SweptPartial
+        | RetentionOutcome::BlockedBySnapshot(_) => None,
+        // Retention left the bucket live; the compaction outcome decides.
+        RetentionOutcome::NoPolicy | RetentionOutcome::NotSealed | RetentionOutcome::NotExpired => {
+            match compaction {
+                Some(CompactionOutcome::AlreadyCompacted) => Some(TerminalState::Compacted),
+                // Mapped like an existing compaction record because the memo
+                // is advisory and never correctness-bearing: only interior-zone
+                // hours ever consult it, head and tail hours re-evaluate every
+                // tick regardless, and an interior entry is force-re-verified
+                // at least every re-verify interval. Even a wrong terminal
+                // state here only defers the next real evaluation by at most
+                // that interval; it gates no deletion or durability decision.
+                Some(CompactionOutcome::RewritePresent) => Some(TerminalState::Compacted),
+                Some(CompactionOutcome::BelowMinInputs { .. }) => {
+                    Some(TerminalState::BelowThreshold)
+                }
+                // Just compacted this tick: re-verify next tick to reach the stable
+                // AlreadyCompacted state before memoizing it.
+                Some(CompactionOutcome::Compacted { .. }) => None,
+                // Not sealed yet (the newest buckets): keep evaluating every tick
+                // until the seal margin passes.
+                Some(CompactionOutcome::NotSealed) | None => None,
+                // A tombstone appeared between the retention and compaction reads:
+                // not a steady state, let the next tick re-evaluate.
+                Some(CompactionOutcome::Tombstoned) => None,
+                // Held for an out-of-window input or unknown section kinds:
+                // retried every tick, so the bucket compacts on the first tick
+                // after the upgrade finishes.
+                Some(
+                    CompactionOutcome::HeldOutOfWindow { .. }
+                    | CompactionOutcome::HeldUnknownSection { .. },
+                ) => None,
+                // Refused only because this process's other two-level merges
+                // hold their share of the scratch (ADR-3853 D2): the volume
+                // alone has room, and it is free again once they end, so the
+                // next tick tries again.
+                Some(CompactionOutcome::ScratchHeadroom {
+                    need,
+                    free,
+                    reserved,
+                    ..
+                }) if free >= need && free.saturating_sub(*reserved) < *need => None,
+                // Refused for its merge geometry (ADR-3853 D0): this binary
+                // would refuse it again, so it is not retried while the memo
+                // holds it, and the memo never persists it. A two-level merge's
+                // refusal is the same: the same build would refuse it again,
+                // after paying for level 1 when the refusal came after it.
+                Some(
+                    CompactionOutcome::GeometryUnsupported { .. }
+                    | CompactionOutcome::TwoLevelUnsupported { .. }
+                    | CompactionOutcome::ScratchHeadroom { .. }
+                    | CompactionOutcome::ScratchLocked { .. },
+                ) => Some(TerminalState::GeometryUnsupported),
+            }
+        }
+    }
+}
+
+/// Run retention-before-compaction over *every* sealed bucket of one
+/// `(tenant, signal, shard)`, via [`maintain_bucket`]. Unlike
+/// [`scan_and_compact`], this does NOT use the advisory compaction cursor: the
+/// cursor advances monotonically past done buckets and never revisits them,
+/// but retention must re-evaluate every sealed bucket on every pass (a bucket
+/// compacted long ago becomes retention-expired only later, and a tombstoned
+/// bucket needs a later pass to run its horizon-gated physical sweep once the
+/// protection horizon has elapsed). A cursor-skipping driver would silently
+/// never retire aging data. So this walks all hours each pass, matching the
+/// cursorless full-scan model [`crate::sweep::sweep_shard`] uses, and pairs
+/// with a `sweep_shard` call for the same shard to run all three deletion
+/// paths per tick. Idempotent: `maintain_bucket` and every rule it
+/// drives converge on re-run.
+#[allow(clippy::too_many_arguments)]
+pub async fn scan_and_maintain(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    retention: &RetentionConfig,
+    lease: &dyn LeaseCheck,
+    tenant_hash: TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<MaintainReport> {
+    // A cold, discarded memo skips nothing (it is empty for the whole call), so
+    // this is byte-for-byte the pre-memo full-scan-every-tick behavior. A driver
+    // that wants the steady-state skip persists one MaintainMemo per worker
+    // across ticks and calls scan_and_maintain_with_memo instead.
+    let mut memo = MaintainMemo::new(0);
+    scan_and_maintain_with_memo(
+        &mut memo,
+        store,
+        clock,
+        config,
+        retention,
+        lease,
+        tenant_hash,
+        signal,
+        shard,
+    )
+    .await
+}
+
+/// [`scan_and_maintain`] with a caller-owned [`MaintainMemo`] persisted across
+/// ticks. Buckets the memo already knows terminal
+/// (compacted-and-not-expired, below-threshold, or swept empty) are skipped
+/// without any per-bucket LIST or GET, until the memo's periodic re-verify
+/// interval forces a fresh evaluation. On the first tick after a worker start
+/// the memo is empty, so this does exactly one full rescan identical to
+/// [`scan_and_maintain`].
+///
+/// The memo is advisory and never correctness-bearing (see [`MaintainMemo`]):
+/// the eventually-consistent full re-verify still re-evaluates every retained
+/// bucket, so no retention or compaction action is ever missed, only deferred
+/// by at most the re-verify interval.
+#[allow(clippy::too_many_arguments)]
+pub async fn scan_and_maintain_with_memo(
+    memo: &mut MaintainMemo,
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    retention: &RetentionConfig,
+    lease: &dyn LeaseCheck,
+    tenant_hash: TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<MaintainReport> {
+    let now = clock.now_ns();
+    let hours = list_shard_hours(store, &tenant_hash, signal, shard).await?;
+    let present: HashSet<u32> = hours.iter().copied().collect();
+    // Resolve the tenant's effective retention window once for the whole pass
+    // (durable record over CLI, ADR-0078; the same window the fold resolves).
+    // The window is constant across a tenant's buckets, so this is one config
+    // GET per pass rather than one per bucket, and every bucket's retention
+    // decision and this pass's zone classification use the same value.
+    let retention_window_ns = resolve_retention_window_ns(store, retention, &tenant_hash).await?;
+
+    // One HEAD-reachability cache for the whole pass: the delete-blocker gate
+    // (ADR-0020) reads the catalog HEAD at most once and each covering snapshot
+    // part at most once across every bucket of this (tenant, signal, shard),
+    // never once per bucket (ADR-0076 request cost).
+    let mut reach = SnapshotReachability::new().with_read_gate(config.read_gate.clone());
+
+    let mut report = MaintainReport::default();
+    for hour in hours {
+        let key: BucketKey = (tenant_hash, signal, shard, hour);
+
+        // Head and tail hours evaluate every tick, exactly as before this
+        // zone split existed (ADR-0065 decision 3): only an interior hour
+        // ever consults the memo. Steady state: the memo already proved an
+        // interior bucket terminal and the entry is still fresh (within
+        // `CompactorConfig::interior_reverify_ns`), so skip it without
+        // listing or reading anything.
+        // A bucket another attempt holds the claim on is on hold until that
+        // claim can have expired. The hold covers compaction only: retention
+        // and the zone split run as for any other bucket, so a held head or
+        // tail hour still reaches `head_tail_hours`.
+        let claim_deferred = memo.claim_deferred(&key, now);
+        // A bucket this process refused for its merge geometry (ADR-3853 D0)
+        // is not compacted again while the memo holds the refusal: the same
+        // binary would plan and refuse the same merge. Retention still runs
+        // whenever the bucket is evaluated.
+        let geometry_refused = memo.geometry_refused(&key);
+
+        let zone = classify_zone(hour, now, config, retention_window_ns);
+        if zone != Zone::Interior {
+            report.head_tail_hours.push(hour);
+        } else if memo.is_fresh_terminal(&key, now) {
+            report.skipped_terminal += 1;
+            // A skipped bucket still holds whatever L0 records the last
+            // evaluation found, so it keeps contributing them to this pass's
+            // total. Counting only evaluated buckets would make
+            // `l0_records_pending` a count of this tick's work rather than the
+            // pending population it is documented to be, and sawtooth it to
+            // near zero on every tick between interior re-verifies.
+            report.l0_records_pending += memo.l0_records_pending(&key);
+            continue;
+        }
+
+        let bucket = Bucket::new(tenant_hash, signal, shard, hour);
+        // A memoised exact expiry supersedes any tombstone bound, so the
+        // rewrite-record GETs that sharpen that bound are skipped, and so are
+        // they once an earlier pass has read their answer.
+        let mut bound_read = RewriteBoundRead::default();
+        let rewrite_bound = if memo.exact_expiry_ns.contains_key(&key) {
+            RewriteBound::Unread
+        } else if let Some(&keeps) = memo.rewrites_keep_nominal_bound.get(&key) {
+            RewriteBound::Known(keeps)
+        } else {
+            RewriteBound::Read(&mut bound_read)
+        };
+        let (retention_outcome, observed_expiry, compaction, acquisition, part_index_refused) =
+            if claim_deferred || geometry_refused {
+                let (outcome, expiry) = retention_sweep_bucket_observed(
+                    &mut reach,
+                    store,
+                    clock,
+                    config,
+                    retention_window_ns,
+                    lease,
+                    &bucket,
+                    rewrite_bound,
+                )
+                .await?;
+                (outcome, expiry, None, None, None)
+            } else {
+                maintain_bucket_observed(
+                    &mut reach,
+                    store,
+                    clock,
+                    config,
+                    retention_window_ns,
+                    lease,
+                    &bucket,
+                    rewrite_bound,
+                )
+                .await?
+            };
+        report.lag_bound_gets += bound_read.gets;
+        if let Some(keeps) = bound_read.learned {
+            memo.rewrites_keep_nominal_bound.insert(key, keeps);
+        }
+        let expiry = memo.best_expiry(key, observed_expiry);
+        // Counts a claim this bucket's run acquired, whether the compaction then
+        // ran or was cancelled at a checkpoint. A `claim_deferred` bucket never
+        // attempts one, so `acquisition` is `None` there. A run that errors after
+        // acquiring returns early through `?` above, so its acquisition is not
+        // counted (#1035).
+        if let Some(acq) = &acquisition {
+            report.claims_acquired += 1;
+            if acq.stolen {
+                report.claims_stolen += 1;
+            }
+        }
+        match retention_outcome {
+            // Fully retired: the bucket's data is gone, so it is not a
+            // still-present expired bucket and contributes no retention lag.
+            RetentionOutcome::Swept => {
+                report.retired += 1;
+                memo.exact_expiry_ns.remove(&key);
+                memo.rewrites_keep_nominal_bound.remove(&key);
+            }
+            // Expired but still present (tombstoned within the horizon, or
+            // horizon elapsed with residue left for the next pass); compaction
+            // was skipped by design. Its retention lag is a candidate for this
+            // pass's maximum.
+            RetentionOutcome::Tombstoned | RetentionOutcome::SweptPartial => {
+                report.retired += 1;
+                report.retention_lag_ns = report.retention_lag_ns.max(
+                    expired_bucket_retention_lag_ns(hour, now, retention_window_ns, expiry),
+                );
+            }
+            // The expired bucket's physical sweep was blocked by HEAD
+            // reachability (ADR-0020): count by reason and treat as retired
+            // work-in-progress (compaction was skipped, same as a tombstone).
+            // The bucket is still present, so it contributes retention lag too.
+            RetentionOutcome::BlockedBySnapshot(reason) => {
+                report.retired += 1;
+                match reason {
+                    SnapshotBlock::Named => report.blocked_by_snapshot += 1,
+                    SnapshotBlock::Unreadable => report.blocked_by_unreadable_head += 1,
+                    SnapshotBlock::PinnedWindow => report.blocked_by_pinned_window += 1,
+                }
+                report.retention_lag_ns = report.retention_lag_ns.max(
+                    expired_bucket_retention_lag_ns(hour, now, retention_window_ns, expiry),
+                );
+            }
+            // Retention left the bucket live; the compaction outcome classifies
+            // it (compaction ran in these arms unless the bucket is on a claim
+            // hold; see maintain_bucket).
+            RetentionOutcome::NoPolicy
+            | RetentionOutcome::NotSealed
+            | RetentionOutcome::NotExpired => match &compaction {
+                Some(ClaimedCompaction::Ran(CompactionOutcome::NotSealed)) => {
+                    report.not_sealed += 1
+                }
+                Some(ClaimedCompaction::Ran(CompactionOutcome::Compacted { .. })) => {
+                    report.compacted += 1
+                }
+                Some(ClaimedCompaction::Ran(
+                    CompactionOutcome::HeldOutOfWindow { .. }
+                    | CompactionOutcome::HeldUnknownSection { .. },
+                )) => report.held_out_of_window += 1,
+                Some(ClaimedCompaction::Ran(
+                    CompactionOutcome::GeometryUnsupported { .. }
+                    | CompactionOutcome::TwoLevelUnsupported { .. }
+                    | CompactionOutcome::ScratchHeadroom { .. }
+                    | CompactionOutcome::ScratchLocked { .. },
+                )) => report.geometry_unsupported += 1,
+                Some(ClaimedCompaction::Ran(CompactionOutcome::BelowMinInputs { count })) => {
+                    report.already_done += 1;
+                    report.l0_records_pending += count;
+                }
+                Some(ClaimedCompaction::Ran(
+                    CompactionOutcome::AlreadyCompacted
+                    | CompactionOutcome::RewritePresent
+                    | CompactionOutcome::Tombstoned,
+                )) => report.already_done += 1,
+                // Another attempt holds the claim: this process merged nothing
+                // and must not report a compaction. Hold the bucket until the
+                // holder's lease expires so the next tick does not re-issue
+                // the claim request, which is the polling the protocol exists
+                // to avoid.
+                Some(ClaimedCompaction::SkippedClaimed(skip)) => {
+                    report.claim_skipped += 1;
+                    memo.defer_claim_until(key, reschedule_ns(skip));
+                }
+                // The claim was lost mid-merge and the run cancelled without
+                // publishing. The holder that took it over is doing the work.
+                Some(ClaimedCompaction::Cancelled { .. }) => report.claim_cancelled += 1,
+                // Retention left a held bucket live, so compaction would have
+                // run here; the hold skipped it without a claim request.
+                None if claim_deferred => report.claim_skipped += 1,
+                // Refused for its part-index windows (ADR-3853): counted as
+                // a refusal and held below like one.
+                None if part_index_refused.is_some() => report.geometry_unsupported += 1,
+                None => {}
+            },
+        }
+        let retention_left_live = matches!(
+            retention_outcome,
+            RetentionOutcome::NoPolicy | RetentionOutcome::NotSealed | RetentionOutcome::NotExpired
+        );
+
+        // Update the memo from this fresh, authoritative evaluation: remember a
+        // newly terminal bucket, and forget one that transitioned away from a
+        // terminal state (e.g. a compacted bucket that just became expired).
+        // A skipped or cancelled run observed nothing about the bucket, so it
+        // is classified on the retention outcome alone (which is `None` for
+        // compaction) and is never memoized as terminal on this process's
+        // behalf.
+        let ran = compaction
+            .as_ref()
+            .and_then(ClaimedCompaction::ran)
+            .cloned();
+        let terminal = match classify_terminal(&retention_outcome, &ran) {
+            // A refusal the memo already held, on a bucket retention left live
+            // and compaction did not run on: still refused.
+            None if geometry_refused && ran.is_none() && retention_left_live => {
+                Some(TerminalState::GeometryUnsupported)
+            }
+            // A part-index refusal, which this build would repeat.
+            None if part_index_refused.is_some() && retention_left_live => {
+                Some(TerminalState::GeometryUnsupported)
+            }
+            other => other,
+        };
+        match terminal {
+            Some(state) => {
+                memo.mark_terminal(key, state, now);
+                // Carry this evaluation's below-threshold population on the
+                // entry so the ticks that skip the bucket can still add it.
+                if let Some(CompactionOutcome::BelowMinInputs { count }) = ran {
+                    memo.set_l0_records_pending(&key, count);
+                }
+            }
+            None => memo.forget(&key),
+        }
+    }
+
+    // The orphan-marker rule (ADR-1133 decision 6) runs on a pass that gated a
+    // candidate, reusing that pass's marker LIST.
+    report.unnamed_marker_reap = reach
+        .reap_after_pass(store, clock, config, &tenant_hash, signal, false)
+        .await;
+    report.unnamed_markers = reach.marker_stats().clone();
+
+    // Bound memory to buckets that still exist: a swept-empty bucket disappears
+    // from the shard listing entirely, and its stale memo entry can be dropped.
+    memo.retain_present(tenant_hash, signal, shard, &present);
+    Ok(report)
+}
+
+/// What [`read_cursor`] found at the cursor key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StoredCursor {
+    Absent,
+    Usable {
+        hour: u32,
+        version: Version,
+    },
+    /// This build's tag with a malformed body (or an empty payload): ignored
+    /// and CAS-overwritten by the next advance.
+    Unrecognized {
+        version: Version,
+    },
+    /// Another build's tag: the scan starts from the beginning and never
+    /// overwrites it (ADR-4233 decision 4, H9).
+    ForeignTag {
+        tag: u8,
+    },
+}
+
+/// Read the advisory cursor. A decode failure is treated as no cursor
+/// (advisory rescan), never an error; store faults propagate.
+async fn read_cursor(store: &dyn ObjectStoreBackend, key: &str) -> Result<StoredCursor> {
+    match store.get(key, GetRange::Full).await {
+        Ok(got) => {
+            let data = got.data;
+            match data.first() {
+                Some(&tag) if tag != CURSOR_TAG => Ok(StoredCursor::ForeignTag { tag }),
+                Some(_) if data.len() == 5 => Ok(StoredCursor::Usable {
+                    hour: u32::from_le_bytes([data[1], data[2], data[3], data[4]]),
+                    version: got.version,
+                }),
+                _ => Ok(StoredCursor::Unrecognized {
+                    version: got.version,
+                }),
+            }
+        }
+        Err(StoreError::NotFound) => Ok(StoredCursor::Absent),
+        Err(e) => Err(MaintainError::Store(e)),
+    }
+}
+
+/// Write the advisory cursor. First write is `CreateIfAbsent`; subsequent
+/// writes CAS against the version we read. A lost race
+/// (`AlreadyExists`/`PreconditionFailed`) is not an error: the cursor is
+/// advisory and another maintainer's update is equally valid.
+async fn write_cursor(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+    hour: u32,
+    prev_version: Option<Version>,
+) -> Result<()> {
+    let mut payload = Vec::with_capacity(5);
+    payload.push(CURSOR_TAG);
+    payload.extend_from_slice(&hour.to_le_bytes());
+    let mode = match prev_version {
+        Some(v) => PutMode::CasVersion(v),
+        None => PutMode::CreateIfAbsent,
+    };
+    let opts = PutOptions {
+        mode,
+        checksum: Some(ravel_object_store::UploadChecksum::Crc32c(crc32c::crc32c(
+            &payload,
+        ))),
+    };
+    match store.put(key, payload.into(), opts).await {
+        Ok(_) | Err(StoreError::AlreadyExists) | Err(StoreError::PreconditionFailed) => Ok(()),
+        Err(e) => Err(MaintainError::Store(e)),
+    }
+}
+
+#[cfg(test)]
+mod scratch_headroom_memo_tests {
+    use super::*;
+
+    fn headroom(need: u64, free: u64, reserved: u64) -> Option<CompactionOutcome> {
+        Some(CompactionOutcome::ScratchHeadroom {
+            need,
+            free,
+            reserved,
+            path: std::path::PathBuf::from("/scratch"),
+        })
+    }
+
+    /// ADR-3853 D2: a headroom refusal the volume alone would have admitted,
+    /// refused only for what this process's other two-level merges hold
+    /// reserved, is not memoized, so the next tick evaluates the bucket again
+    /// and merges it once those units end. A volume short on its own, and an
+    /// out-of-space write the figures do not explain, stay terminal.
+    #[test]
+    fn a_reservation_only_headroom_refusal_is_retried_next_tick() {
+        let live = RetentionOutcome::NotExpired;
+        assert_eq!(classify_terminal(&live, &headroom(100, 150, 60)), None);
+        assert_eq!(classify_terminal(&live, &headroom(100, 100, 1)), None);
+        assert_eq!(
+            classify_terminal(&live, &headroom(100, 99, 0)),
+            Some(TerminalState::GeometryUnsupported),
+            "the volume alone is short"
+        );
+        assert_eq!(
+            classify_terminal(&live, &headroom(100, 99, 60)),
+            Some(TerminalState::GeometryUnsupported),
+            "short with or without the reservations"
+        );
+        assert_eq!(
+            classify_terminal(&live, &headroom(100, 500, 0)),
+            Some(TerminalState::GeometryUnsupported),
+            "a scratch write ran out of space with room on the figures"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod memo_snapshot_tests {
+    use super::*;
+    use ravel_types::TenantId;
+
+    const PID: Uuid = Uuid::from_u128(0x5eed);
+
+    fn keys() -> MaintainRecordKeys {
+        MaintainRecordKeys::from_file_keys(&[[0x4D; 32]]).expect("one key")
+    }
+
+    /// `bytes` verified as [`PID`]'s snapshot under [`keys`].
+    fn verified(bytes: Vec<u8>) -> VerifiedSnapshot {
+        VerifiedSnapshot::verify(PID, bytes, &keys()).expect("honest frame verifies")
+    }
+
+    fn encode(memo: &MaintainMemo, snapshot_unix_ns: i64) -> Vec<u8> {
+        memo.encode_snapshot(snapshot_unix_ns, &PID, &keys())
+    }
+
+    fn frame(body: &[u8], snapshot_unix_ns: i64) -> Vec<u8> {
+        MaintainMemo::snapshot_bytes_from_body(body, snapshot_unix_ns, &PID, &keys())
+    }
+
+    /// Verify `bytes` and seed `memo` from them under the production limits.
+    fn seed(
+        memo: &mut MaintainMemo,
+        bytes: &[u8],
+        now_ns: i64,
+        staleness_ns: i64,
+        owns: impl Fn(TenantHash, Signal, u32) -> bool,
+    ) -> std::result::Result<SeedStats, MemoSnapshotError> {
+        memo.seed_from_snapshot(
+            &verified(bytes.to_vec()),
+            MemoSnapshotLimits::DEFAULT,
+            now_ns,
+            staleness_ns,
+            owns,
+        )
+    }
+
+    fn tenant() -> TenantHash {
+        TenantId::new("acme").hash()
+    }
+
+    /// A cold snapshot round-trips to nothing: an empty memo encodes a
+    /// well-formed object that seeds nothing and decodes clean.
+    #[test]
+    fn empty_memo_round_trips_to_empty() {
+        let memo = MaintainMemo::with_default_interval();
+        let bytes = encode(&memo, 1_000);
+        let mut seeded = MaintainMemo::with_default_interval();
+        let stats = seed(
+            &mut seeded,
+            &bytes,
+            1_000,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("decode empty");
+        assert!(!stats.stale);
+        assert_eq!(stats.seeded_buckets, 0);
+        assert!(seeded.is_empty());
+    }
+
+    /// The frontier/exception split reconstructs the exact terminal set: a long
+    /// same-state interior run (the frontier) plus divergent stragglers (the
+    /// exceptions), across two units, seed back byte-for-byte identical.
+    #[test]
+    fn frontier_and_exceptions_round_trip_exactly() {
+        let t = tenant();
+        let mut memo = MaintainMemo::with_default_interval();
+        // Unit A: a Compacted interior run 10..=20 (the frontier), an isolated
+        // BelowThreshold at hour 5, and a SweptEmpty at hour 25 (exceptions).
+        for hour in 10..=20 {
+            memo.mark_terminal(
+                (t, Signal::Metrics, 0, hour),
+                TerminalState::Compacted,
+                5_000,
+            );
+        }
+        memo.mark_terminal(
+            (t, Signal::Metrics, 0, 5),
+            TerminalState::BelowThreshold,
+            5_000,
+        );
+        memo.mark_terminal(
+            (t, Signal::Metrics, 0, 25),
+            TerminalState::SweptEmpty,
+            5_000,
+        );
+        // Unit B (different shard, different signal): a small Compacted run.
+        for hour in 100..=102 {
+            memo.mark_terminal((t, Signal::Logs, 3, hour), TerminalState::Compacted, 6_000);
+        }
+        let want_len = memo.len();
+
+        let bytes = encode(&memo, 9_000);
+        let mut seeded = MaintainMemo::with_default_interval();
+        let stats = seed(
+            &mut seeded,
+            &bytes,
+            9_000,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("decode");
+        assert!(!stats.stale);
+        assert_eq!(stats.seeded_units, 2);
+        assert_eq!(seeded.len(), want_len);
+
+        // Every original entry reconstructs with its exact state.
+        for hour in 10..=20 {
+            assert_eq!(
+                seeded.terminal_state(t, Signal::Metrics, 0, hour),
+                Some(TerminalState::Compacted)
+            );
+        }
+        assert_eq!(
+            seeded.terminal_state(t, Signal::Metrics, 0, 5),
+            Some(TerminalState::BelowThreshold)
+        );
+        assert_eq!(
+            seeded.terminal_state(t, Signal::Metrics, 0, 25),
+            Some(TerminalState::SweptEmpty)
+        );
+        for hour in 100..=102 {
+            assert_eq!(
+                seeded.terminal_state(t, Signal::Logs, 3, hour),
+                Some(TerminalState::Compacted)
+            );
+        }
+    }
+
+    /// A contiguous interior collapses to one frontier run and no exceptions,
+    /// so the body stays small (the compression the ADR relies on): the
+    /// exception-count field for the unit is zero regardless of run length.
+    #[test]
+    fn contiguous_interior_encodes_as_one_frontier_run() {
+        let t = tenant();
+        let mut memo = MaintainMemo::with_default_interval();
+        for hour in 0..500 {
+            memo.mark_terminal(
+                (t, Signal::Metrics, 0, hour),
+                TerminalState::Compacted,
+                1_000,
+            );
+        }
+        // Body is one unit header + one frontier record + a zero exception
+        // count -- far smaller than 500 per-bucket entries would be.
+        let body = memo.snapshot_body();
+        // 4 (unit count) + [16 tenant +1 sig +4 shard +1 present +4 start +4 end
+        // +1 state +8 verified +4 exc_count(=0)] = 4 + 43 = 47 bytes.
+        assert_eq!(body.len(), 47, "500 hours collapse to one frontier run");
+    }
+
+    /// The staleness gate reads the verified frame's timestamp and runs before
+    /// the decoder: a stale snapshot, and a stale one whose body would not
+    /// decode, both return `stale` with the decoder never called, while the
+    /// same snapshot inside the bound is decoded exactly once.
+    #[test]
+    fn stale_snapshot_is_refused_before_decode() {
+        let t = tenant();
+        let mut memo = MaintainMemo::with_default_interval();
+        memo.mark_terminal((t, Signal::Metrics, 0, 1), TerminalState::Compacted, 0);
+        let bytes = encode(&memo, 0);
+        let undecodable = frame(&[0xFF; 8], 0);
+        let now = DEFAULT_MEMO_SNAPSHOT_STALENESS_NS + 1;
+        assert_eq!(verified(bytes.clone()).snapshot_unix_ns(), 0);
+
+        let before = decode_calls::get();
+        for stale in [&bytes, &undecodable] {
+            let stats = seed(
+                &mut MaintainMemo::with_default_interval(),
+                stale,
+                now,
+                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+                |_, _, _| true,
+            )
+            .expect("a stale snapshot is not decoded, so it cannot fail to decode");
+            assert!(stats.stale);
+        }
+        assert_eq!(decode_calls::get() - before, 0);
+
+        let stats = seed(
+            &mut MaintainMemo::with_default_interval(),
+            &bytes,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("decode");
+        assert!(!stats.stale);
+        assert_eq!(decode_calls::get() - before, 1);
+    }
+
+    /// The whole-snapshot staleness gate excludes an old snapshot: nothing is
+    /// seeded and `stale` is set, exactly one re-verify interval past the write.
+    #[test]
+    fn stale_snapshot_is_ignored() {
+        let t = tenant();
+        let mut memo = MaintainMemo::with_default_interval();
+        memo.mark_terminal((t, Signal::Metrics, 0, 1), TerminalState::Compacted, 0);
+        let bytes = encode(&memo, 0);
+
+        // Read one nanosecond past the staleness bound: excluded.
+        let now = DEFAULT_MEMO_SNAPSHOT_STALENESS_NS + 1;
+        let mut seeded = MaintainMemo::with_default_interval();
+        let stats = seed(
+            &mut seeded,
+            &bytes,
+            now,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("decode");
+        assert!(stats.stale, "a snapshot past the bound is ignored");
+        assert_eq!(stats.seeded_buckets, 0);
+        assert!(seeded.is_empty());
+
+        // Exactly at the bound: still trusted (inclusive), seeded.
+        let mut seeded2 = MaintainMemo::with_default_interval();
+        let stats2 = seed(
+            &mut seeded2,
+            &bytes,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("decode");
+        assert!(!stats2.stale);
+        assert_eq!(stats2.seeded_buckets, 1);
+    }
+
+    /// A far-future-dated snapshot is excluded symmetrically, like a
+    /// far-future heartbeat: a skewed clock cannot seed stale facts as fresh.
+    #[test]
+    fn future_dated_snapshot_is_ignored() {
+        let t = tenant();
+        let mut memo = MaintainMemo::with_default_interval();
+        memo.mark_terminal(
+            (t, Signal::Metrics, 0, 1),
+            TerminalState::Compacted,
+            10 * NS_PER_HOUR,
+        );
+        let bytes = encode(&memo, 10 * NS_PER_HOUR);
+        let mut seeded = MaintainMemo::with_default_interval();
+        let stats = seed(
+            &mut seeded,
+            &bytes,
+            0,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("decode");
+        assert!(stats.stale, "a future-dated snapshot is excluded");
+    }
+
+    /// Only owned units are seeded: a snapshot spanning several units seeds
+    /// exactly the ones the ownership predicate accepts.
+    #[test]
+    fn only_owned_units_are_seeded() {
+        let t = tenant();
+        let mut memo = MaintainMemo::with_default_interval();
+        memo.mark_terminal((t, Signal::Metrics, 0, 1), TerminalState::Compacted, 0);
+        memo.mark_terminal((t, Signal::Metrics, 1, 1), TerminalState::Compacted, 0);
+        let bytes = encode(&memo, 0);
+
+        let mut seeded = MaintainMemo::with_default_interval();
+        let stats = seed(
+            &mut seeded,
+            &bytes,
+            0,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, shard| shard == 0,
+        )
+        .expect("decode");
+        assert_eq!(stats.seeded_units, 1);
+        assert_eq!(
+            seeded.terminal_state(t, Signal::Metrics, 0, 1),
+            Some(TerminalState::Compacted)
+        );
+        assert_eq!(
+            seeded.terminal_state(t, Signal::Metrics, 1, 1),
+            None,
+            "unowned unit not seeded"
+        );
+    }
+
+    /// Merging two snapshots keeps the freshest verdict per bucket regardless of
+    /// which is applied first, so sibling handoff converges deterministically.
+    #[test]
+    fn merging_snapshots_keeps_the_freshest_entry() {
+        let t = tenant();
+        let mut older = MaintainMemo::with_default_interval();
+        older.mark_terminal(
+            (t, Signal::Metrics, 0, 1),
+            TerminalState::BelowThreshold,
+            1_000,
+        );
+        let older_bytes = encode(&older, 1_000);
+
+        let mut newer = MaintainMemo::with_default_interval();
+        newer.mark_terminal((t, Signal::Metrics, 0, 1), TerminalState::Compacted, 5_000);
+        let newer_bytes = encode(&newer, 5_000);
+
+        // Apply older then newer: newer wins.
+        let mut a = MaintainMemo::new(0);
+        seed(&mut a, &older_bytes, 5_000, 0, |_, _, _| true).expect("older");
+        seed(&mut a, &newer_bytes, 5_000, 0, |_, _, _| true).expect("newer");
+        assert_eq!(
+            a.terminal_state(t, Signal::Metrics, 0, 1),
+            Some(TerminalState::Compacted)
+        );
+
+        // Apply newer then older: newer still wins (order independent).
+        let mut b = MaintainMemo::new(0);
+        seed(&mut b, &newer_bytes, 5_000, 0, |_, _, _| true).expect("newer");
+        seed(&mut b, &older_bytes, 5_000, 0, |_, _, _| true).expect("older");
+        assert_eq!(
+            b.terminal_state(t, Signal::Metrics, 0, 1),
+            Some(TerminalState::Compacted)
+        );
+    }
+
+    /// A verified payload whose body is cut short is a typed error, never a
+    /// panic, so the driver can log it and cold-start (fail-open). An empty
+    /// or wrong-tag payload never reaches the decoder: verification rejects it.
+    #[test]
+    fn corrupt_payloads_are_typed_errors_not_panics() {
+        assert_eq!(
+            VerifiedSnapshot::verify(PID, Vec::new(), &keys()),
+            Err(MemoSnapshotReject::Malformed)
+        );
+        assert_eq!(
+            VerifiedSnapshot::verify(PID, vec![9u8; MIN_MEMO_SNAPSHOT_FRAME_BYTES], &keys()),
+            Err(MemoSnapshotReject::UnknownTag)
+        );
+        // A unit count promising a unit that is not there: truncated, not a
+        // panic.
+        let t = tenant();
+        let mut good = MaintainMemo::with_default_interval();
+        good.mark_terminal((t, Signal::Metrics, 0, 1), TerminalState::Compacted, 0);
+        let mut body = good.snapshot_body();
+        body.truncate(body.len() - 3);
+        let bytes = frame(&body, 0);
+        let mut memo = MaintainMemo::with_default_interval();
+        assert!(matches!(
+            seed(&mut memo, &bytes, 0, 0, |_, _, _| true),
+            Err(MemoSnapshotError::Truncated { .. })
+        ));
+    }
+
+    /// The snapshot body is a stable function of the memo (debounce contract):
+    /// two memos with the same terminal set and verify times produce identical
+    /// bodies, and the body ignores the timestamp header.
+    #[test]
+    fn snapshot_body_is_stable_for_debounce() {
+        let t = tenant();
+        let mut a = MaintainMemo::with_default_interval();
+        let mut b = MaintainMemo::with_default_interval();
+        for hour in [3u32, 1, 2, 7, 5] {
+            a.mark_terminal(
+                (t, Signal::Metrics, 0, hour),
+                TerminalState::Compacted,
+                1_000,
+            );
+            b.mark_terminal(
+                (t, Signal::Metrics, 0, hour),
+                TerminalState::Compacted,
+                1_000,
+            );
+        }
+        assert_eq!(
+            a.snapshot_body(),
+            b.snapshot_body(),
+            "same content, same body"
+        );
+        // The framed object differs only in the timestamp header, so the body
+        // used for debounce is unchanged across two writes at different times.
+        let full_1 = encode(&a, 1);
+        let full_2 = encode(&a, 999);
+        assert_eq!(
+            &full_1[9..full_1.len() - MEMO_SNAPSHOT_MAC_BYTES],
+            &full_2[9..full_2.len() - MEMO_SNAPSHOT_MAC_BYTES]
+        );
+    }
+
+    /// A decoded entry whose `verified_ns` is past the
+    /// snapshot's own `snapshot_unix_ns` -- a corrupted or clock-skewed run --
+    /// is clamped to `snapshot_unix_ns` at the seed site, never trusted at its
+    /// raw future value. Without the clamp such an entry reads as eternally
+    /// fresh and, because the memo is re-encoded and republished each cycle,
+    /// self-propagates fleet-wide, permanently suppressing retention/compaction
+    /// for its bucket. The header stays fresh so only the per-entry value is out
+    /// of range, isolating the guard this test proves.
+    #[test]
+    fn future_dated_entry_is_clamped_to_snapshot_time() {
+        let t = tenant();
+        let snapshot_unix_ns = 5 * NS_PER_HOUR;
+        // Roughly a century past the snapshot's own write time.
+        let future_ns = snapshot_unix_ns + 100 * 365 * 24 * NS_PER_HOUR;
+
+        let mut poisoned = MaintainMemo::with_default_interval();
+        poisoned.mark_terminal(
+            (t, Signal::Metrics, 0, 1),
+            TerminalState::Compacted,
+            future_ns,
+        );
+        // Re-frame the poisoned body under an honest, fresh header, so the
+        // whole-snapshot staleness gate passes and only the entry is skewed.
+        let bytes = frame(&poisoned.snapshot_body(), snapshot_unix_ns);
+
+        let mut seeded = MaintainMemo::with_default_interval();
+        let stats = seed(
+            &mut seeded,
+            &bytes,
+            snapshot_unix_ns,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("decode");
+        assert_eq!(stats.seeded_buckets, 1);
+
+        let key = (t, Signal::Metrics, 0, 1);
+        let entry = seeded.entries.get(&key).expect("seeded entry");
+        assert_eq!(
+            entry.verified_at_ns, snapshot_unix_ns,
+            "a future-dated entry is clamped to the snapshot's own time"
+        );
+        // The clamp restores normal expiry: fresh at snapshot time, but no
+        // longer fresh one re-verify interval later (not eternally fresh).
+        assert!(seeded.is_fresh_terminal(&key, snapshot_unix_ns));
+        assert!(
+            !seeded.is_fresh_terminal(
+                &key,
+                snapshot_unix_ns + DEFAULT_MEMO_REVERIFY_INTERVAL_NS + 1
+            ),
+            "clamped entry expires on schedule instead of suppressing reads forever"
+        );
+    }
+
+    /// One hand-built snapshot unit: an optional `(start, end)` frontier and
+    /// `(start, run_len)` exception runs, all Compacted.
+    struct RawUnit {
+        shard: u32,
+        frontier: Option<(u32, u32)>,
+        exceptions: Vec<(u32, u32)>,
+    }
+
+    /// Frame hand-built units the way [`MaintainMemo::snapshot_body`] lays them
+    /// out, so a test can state run lengths no honest memo would produce.
+    fn raw_snapshot(units: &[RawUnit]) -> Vec<u8> {
+        frame(&raw_body(units), 7)
+    }
+
+    fn raw_body(units: &[RawUnit]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(units.len() as u32).to_le_bytes());
+        for unit in units {
+            body.extend_from_slice(&tenant().0);
+            body.push(signal_to_code(Signal::Metrics));
+            body.extend_from_slice(&unit.shard.to_le_bytes());
+            match unit.frontier {
+                Some((start, end)) => {
+                    body.push(1);
+                    body.extend_from_slice(&start.to_le_bytes());
+                    body.extend_from_slice(&end.to_le_bytes());
+                    body.push(compacted_code());
+                    body.extend_from_slice(&7i64.to_le_bytes());
+                }
+                None => body.push(0),
+            }
+            body.extend_from_slice(&(unit.exceptions.len() as u32).to_le_bytes());
+            for &(start, run_len) in &unit.exceptions {
+                body.extend_from_slice(&start.to_le_bytes());
+                body.extend_from_slice(&run_len.to_le_bytes());
+                body.push(compacted_code());
+                body.extend_from_slice(&7i64.to_le_bytes());
+            }
+        }
+        body
+    }
+
+    fn compacted_code() -> u8 {
+        TerminalState::Compacted
+            .to_code()
+            .expect("Compacted has a snapshot code")
+    }
+
+    fn frontier_unit(shard: u32, start: u32, end: u32) -> RawUnit {
+        RawUnit {
+            shard,
+            frontier: Some((start, end)),
+            exceptions: Vec::new(),
+        }
+    }
+
+    fn decoded_entries(
+        bytes: &[u8],
+        max_entries: usize,
+    ) -> std::result::Result<usize, MemoSnapshotError> {
+        decode_snapshot(&verified(bytes.to_vec()), max_entries)
+            .map(|d| d.units.iter().map(|u| u.entries.len()).sum())
+    }
+
+    const CAP: u32 = MAX_MEMO_SNAPSHOT_ENTRIES as u32;
+
+    /// An injected entry cap small enough that a boundary memo is a handful of
+    /// entries.
+    const SMALL_CAP: u32 = 16;
+
+    /// The 64 MiB figure in [`MAX_MEMO_SNAPSHOT_ENTRIES`]'s doc rests on a
+    /// decoded entry being 16 bytes.
+    #[test]
+    fn decoded_entry_is_sixteen_bytes() {
+        assert_eq!(std::mem::size_of::<(u32, TerminalState, i64)>(), 16);
+        assert_eq!(MAX_MEMO_SNAPSHOT_ENTRIES * 16, 64 * 1024 * 1024);
+        assert_eq!(MEMO_SNAPSHOT_MIN_UNIT_BYTES, 26);
+        assert_eq!(
+            MemoSnapshotLimits::default(),
+            MemoSnapshotLimits {
+                max_bytes: MAX_MEMO_SNAPSHOT_BYTES,
+                max_entries: MAX_MEMO_SNAPSHOT_ENTRIES,
+            }
+        );
+    }
+
+    /// At the real cap, the writer's check and the decoder agree on what an
+    /// entry count is: one frontier spanning exactly
+    /// [`MAX_MEMO_SNAPSHOT_ENTRIES`] hours decodes to that many entries, with
+    /// exactly that much capacity, and the writer admits that count; one hour
+    /// more is refused by both, the decoder reporting the would-be total.
+    #[test]
+    fn real_entry_cap_ties_the_writer_to_the_decoder() {
+        let limits = MemoSnapshotLimits::DEFAULT;
+        let at_cap = raw_snapshot(&[frontier_unit(0, 0, CAP - 1)]);
+        let decoded = decode_snapshot(&verified(at_cap.clone()), limits.max_entries)
+            .expect("at the cap decodes");
+        assert_eq!(decoded.units.len(), 1);
+        assert_eq!(decoded.units[0].entries.len(), MAX_MEMO_SNAPSHOT_ENTRIES);
+        assert_eq!(
+            decoded.units[0].entries.capacity(),
+            MAX_MEMO_SNAPSHOT_ENTRIES
+        );
+        drop(decoded);
+        assert!(limits.admits_write(at_cap.len(), MAX_MEMO_SNAPSHOT_ENTRIES));
+
+        let over = raw_snapshot(&[frontier_unit(0, 0, CAP)]);
+        assert_eq!(
+            decoded_entries(&over, limits.max_entries),
+            Err(MemoSnapshotError::TooManyEntries {
+                total: u64::from(CAP) + 1,
+                cap: MAX_MEMO_SNAPSHOT_ENTRIES,
+            })
+        );
+        assert!(!limits.admits_write(over.len(), MAX_MEMO_SNAPSHOT_ENTRIES + 1));
+    }
+
+    /// At a small injected entry cap, a memo of exactly the cap is admitted by
+    /// the writer check and its own encoded bytes decode under the same cap,
+    /// while a memo one entry over is refused by both.
+    #[test]
+    fn small_entry_cap_writer_and_decoder_share_a_boundary() {
+        let limits = MemoSnapshotLimits {
+            max_bytes: MAX_MEMO_SNAPSHOT_BYTES,
+            max_entries: SMALL_CAP as usize,
+        };
+        let memo_of = |entries: u32| {
+            let mut memo = MaintainMemo::with_default_interval();
+            // Alternating states keep every hour its own run.
+            for hour in 0..entries {
+                let state = if hour % 2 == 0 {
+                    TerminalState::Compacted
+                } else {
+                    TerminalState::SweptEmpty
+                };
+                memo.mark_terminal((tenant(), Signal::Metrics, hour % 3, hour), state, 5_000);
+            }
+            memo
+        };
+
+        let at = memo_of(SMALL_CAP);
+        let at_bytes = encode(&at, 9_000);
+        assert_eq!(at.snapshot_entry_count(), SMALL_CAP as usize);
+        assert!(limits.admits_write(at_bytes.len(), at.snapshot_entry_count()));
+        assert_eq!(
+            decoded_entries(&at_bytes, limits.max_entries),
+            Ok(SMALL_CAP as usize)
+        );
+
+        let over = memo_of(SMALL_CAP + 1);
+        let over_bytes = encode(&over, 9_000);
+        assert_eq!(over.snapshot_entry_count(), SMALL_CAP as usize + 1);
+        assert!(!limits.admits_write(over_bytes.len(), over.snapshot_entry_count()));
+        assert!(matches!(
+            decoded_entries(&over_bytes, limits.max_entries),
+            Err(MemoSnapshotError::TooManyEntries { total, cap })
+                if total == u64::from(SMALL_CAP) + 1 && cap == SMALL_CAP as usize
+        ));
+    }
+
+    /// [`MaintainMemo::seed_from_snapshot`] decodes under the limits it is
+    /// handed: a snapshot of one entry more than a small cap is refused under
+    /// that cap and seeds under the default.
+    #[test]
+    fn seed_decodes_under_the_limits_it_is_given() {
+        let small = MemoSnapshotLimits {
+            max_bytes: MAX_MEMO_SNAPSHOT_BYTES,
+            max_entries: SMALL_CAP as usize,
+        };
+        let over = verified(raw_snapshot(&[frontier_unit(0, 0, SMALL_CAP)]));
+        let mut memo = MaintainMemo::with_default_interval();
+        assert_eq!(
+            memo.seed_from_snapshot(&over, small, 7, 0, |_, _, _| true)
+                .err(),
+            Some(MemoSnapshotError::TooManyEntries {
+                total: u64::from(SMALL_CAP) + 1,
+                cap: SMALL_CAP as usize,
+            })
+        );
+        assert!(memo.is_empty());
+        let stats = memo
+            .seed_from_snapshot(&over, MemoSnapshotLimits::DEFAULT, 7, 0, |_, _, _| true)
+            .expect("seeds under the default cap");
+        assert_eq!(stats.seeded_buckets, SMALL_CAP as usize + 1);
+    }
+
+    /// The writer check's byte cap admits a framed snapshot of exactly
+    /// `max_bytes` and refuses one byte more, independent of the entry count.
+    #[test]
+    fn writer_byte_cap_boundary() {
+        let limits = MemoSnapshotLimits {
+            max_bytes: 300,
+            max_entries: SMALL_CAP as usize,
+        };
+        assert!(limits.admits_write(300, 0));
+        assert!(!limits.admits_write(301, 0));
+        assert!(!limits.admits_write(0, SMALL_CAP as usize + 1));
+    }
+
+    /// The cap counts every unit's runs together: two units each just over
+    /// half the cap are refused, and the reported total is the first unit's
+    /// run plus the offending one.
+    #[test]
+    fn entry_cap_is_snapshot_wide_across_units() {
+        let half = SMALL_CAP / 2 + 1;
+        let bytes = raw_snapshot(&[frontier_unit(0, 0, half - 1), frontier_unit(1, 0, half - 1)]);
+        assert_eq!(
+            decoded_entries(&bytes, SMALL_CAP as usize),
+            Err(MemoSnapshotError::TooManyEntries {
+                total: 2 * u64::from(half),
+                cap: SMALL_CAP as usize,
+            })
+        );
+    }
+
+    /// Within one unit, two exception runs each just over half the cap are
+    /// refused together, though neither run alone reaches the cap.
+    #[test]
+    fn entry_cap_is_snapshot_wide_across_runs() {
+        let half = SMALL_CAP / 2 + 1;
+        let bytes = raw_snapshot(&[RawUnit {
+            shard: 0,
+            frontier: None,
+            exceptions: vec![(0, half), (half + 10, half)],
+        }]);
+        assert_eq!(
+            decoded_entries(&bytes, SMALL_CAP as usize),
+            Err(MemoSnapshotError::TooManyEntries {
+                total: 2 * u64::from(half),
+                cap: SMALL_CAP as usize,
+            })
+        );
+    }
+
+    /// Exactly the cap decodes when split across two units.
+    #[test]
+    fn exactly_the_entry_cap_decodes_split_across_units() {
+        let split = raw_snapshot(&[
+            frontier_unit(0, 0, SMALL_CAP / 2 - 1),
+            RawUnit {
+                shard: 1,
+                frontier: None,
+                exceptions: vec![(100, SMALL_CAP / 2)],
+            },
+        ]);
+        assert_eq!(
+            decoded_entries(&split, SMALL_CAP as usize),
+            Ok(SMALL_CAP as usize)
+        );
+    }
+
+    /// Each unit's capacity is reserved once, exactly, for the entries its
+    /// runs admitted: a unit of a three-hour frontier and a three-hour
+    /// exception holds six entries in six slots, where growth by doubling
+    /// would leave eight.
+    #[test]
+    fn decoded_unit_capacity_matches_its_entries() {
+        let bytes = raw_snapshot(&[RawUnit {
+            shard: 0,
+            frontier: Some((0, 2)),
+            exceptions: vec![(10, 3)],
+        }]);
+        let decoded =
+            decode_snapshot(&verified(bytes.clone()), MAX_MEMO_SNAPSHOT_ENTRIES).expect("decode");
+        assert_eq!(decoded.units[0].entries.len(), 6);
+        assert_eq!(decoded.units[0].entries.capacity(), 6);
+    }
+
+    /// A frontier of `u32::MAX` hours (start 0, end `u32::MAX - 1`) under the
+    /// default cap is a typed error. Admission happens before expansion and
+    /// [`expand_run`] only accepts an [`AdmittedRun`], so an implementation
+    /// that expanded first (about 64 GiB here) does not compile.
+    #[test]
+    fn u32_max_run_is_refused_before_expansion() {
+        let bytes = raw_snapshot(&[frontier_unit(0, 0, u32::MAX - 1)]);
+        assert_eq!(
+            decoded_entries(&bytes, MemoSnapshotLimits::DEFAULT.max_entries),
+            Err(MemoSnapshotError::TooManyEntries {
+                total: u64::from(u32::MAX),
+                cap: MAX_MEMO_SNAPSHOT_ENTRIES,
+            })
+        );
+    }
+
+    /// [`admit_run`] on its own: it admits a run that lands exactly on the
+    /// cap and reports the running total, refuses one hour more with the
+    /// would-be total, counts entries already admitted, and refuses a run
+    /// that ends before it starts.
+    #[test]
+    fn admit_run_checks_the_running_total() {
+        let run = admit_run(0, 10, 5, 14).expect("ten hours fit a cap of ten");
+        assert_eq!(
+            (run.start(), run.end(), run.len(), run.total()),
+            (5, 14, 10, 10)
+        );
+        assert_eq!(
+            admit_run(0, 10, 5, 15),
+            Err(MemoSnapshotError::TooManyEntries { total: 11, cap: 10 })
+        );
+        let run = admit_run(7, 10, 0, 2).expect("seven plus three fit");
+        assert_eq!(run.total(), 10);
+        assert_eq!(
+            admit_run(8, 10, 0, 2),
+            Err(MemoSnapshotError::TooManyEntries { total: 11, cap: 10 })
+        );
+        assert_eq!(
+            admit_run(0, usize::MAX, 0, u32::MAX).map(AdmittedRun::len),
+            Ok(usize::try_from(u64::from(u32::MAX) + 1).expect("64-bit usize"))
+        );
+        assert_eq!(
+            admit_run(0, 10, 3, 2),
+            Err(MemoSnapshotError::FrontierEndBeforeStart { start: 3, end: 2 })
+        );
+    }
+
+    /// A unit count no payload of this length could hold is refused before
+    /// it sizes an allocation.
+    #[test]
+    fn unit_count_beyond_the_payload_is_refused() {
+        let mut bytes = frame(&u32::MAX.to_le_bytes(), 0);
+        assert_eq!(
+            decode_snapshot(&verified(bytes.clone()), MAX_MEMO_SNAPSHOT_ENTRIES).err(),
+            Some(MemoSnapshotError::UnitCountExceedsPayload {
+                unit_count: u32::MAX,
+                remaining: 0,
+            })
+        );
+        // One byte short of a second minimum unit admits only one.
+        let unit = RawUnit {
+            shard: 0,
+            frontier: None,
+            exceptions: Vec::new(),
+        };
+        let one = raw_snapshot(std::slice::from_ref(&unit));
+        let mut body = raw_body(&[unit]);
+        body[0..4].copy_from_slice(&2u32.to_le_bytes());
+        body.extend_from_slice(&[0u8; MEMO_SNAPSHOT_MIN_UNIT_BYTES - 1]);
+        bytes = frame(&body, 7);
+        assert_eq!(
+            decode_snapshot(&verified(bytes.clone()), MAX_MEMO_SNAPSHOT_ENTRIES).err(),
+            Some(MemoSnapshotError::UnitCountExceedsPayload {
+                unit_count: 2,
+                remaining: 2 * MEMO_SNAPSHOT_MIN_UNIT_BYTES - 1,
+            })
+        );
+        assert_eq!(decoded_entries(&one, MAX_MEMO_SNAPSHOT_ENTRIES), Ok(0));
+    }
+
+    /// The widest frontier is refused by the cap without wrapping its length,
+    /// and a frontier ending before its start is its own error. Both run under
+    /// the test profile's overflow checks, so an overflow would panic here.
+    #[test]
+    fn degenerate_frontiers_are_typed_errors() {
+        let widest = raw_snapshot(&[frontier_unit(0, 0, u32::MAX)]);
+        assert_eq!(
+            decoded_entries(&widest, MAX_MEMO_SNAPSHOT_ENTRIES),
+            Err(MemoSnapshotError::TooManyEntries {
+                total: u64::from(u32::MAX) + 1,
+                cap: MAX_MEMO_SNAPSHOT_ENTRIES,
+            })
+        );
+        let backwards = raw_snapshot(&[frontier_unit(0, 10, 9)]);
+        assert_eq!(
+            decoded_entries(&backwards, MAX_MEMO_SNAPSHOT_ENTRIES),
+            Err(MemoSnapshotError::FrontierEndBeforeStart { start: 10, end: 9 })
+        );
+    }
+
+    /// An exception run whose last hour would pass `u32::MAX` is an error, not
+    /// a silently shortened run.
+    #[test]
+    fn exception_run_past_the_last_hour_is_refused() {
+        let bytes = raw_snapshot(&[RawUnit {
+            shard: 0,
+            frontier: None,
+            exceptions: vec![(u32::MAX, 2)],
+        }]);
+        assert_eq!(
+            decoded_entries(&bytes, MAX_MEMO_SNAPSHOT_ENTRIES),
+            Err(MemoSnapshotError::RunPastLastHour {
+                start: u32::MAX,
+                run_len: 2,
+            })
+        );
+        let last = raw_snapshot(&[RawUnit {
+            shard: 0,
+            frontier: None,
+            exceptions: vec![(u32::MAX - 1, 2)],
+        }]);
+        assert_eq!(decoded_entries(&last, MAX_MEMO_SNAPSHOT_ENTRIES), Ok(2));
+    }
+
+    fn state_of(code: u8) -> TerminalState {
+        match code % 3 {
+            0 => TerminalState::Compacted,
+            1 => TerminalState::BelowThreshold,
+            _ => TerminalState::SweptEmpty,
+        }
+    }
+
+    proptest::proptest! {
+        /// RLE memo codec round-trip. For an arbitrary
+        /// per-hour terminal/non-terminal state sequence (independent choices at
+        /// each hour, so consecutive hours may alternate state), `decode(encode)`
+        /// reproduces the *effective* per-hour state and verified_ns. Effective
+        /// accounts for the codec's run collapse: `terminal_runs` folds a maximal
+        /// contiguous same-state span to that span's minimum verified_ns
+        /// (conservative for freshness), and every hour in the span decodes to
+        /// that minimum. The snapshot's write time is set at or above every
+        /// entry, so fix 1's clamp is a no-op here and the round-trip is exact
+        /// against that effective expectation.
+        #[test]
+        fn rle_snapshot_round_trips_per_hour(
+            hours in proptest::collection::vec(
+                proptest::option::of((0u8..3u8, 1i64..1_000_000i64)),
+                0usize..48usize,
+            )
+        ) {
+            let t = tenant();
+            let mut memo = MaintainMemo::with_default_interval();
+            let mut present: Vec<(u32, TerminalState, i64)> = Vec::new();
+            for (hour, cell) in hours.iter().enumerate() {
+                if let Some((code, verified_ns)) = cell {
+                    let hour = hour as u32;
+                    let state = state_of(*code);
+                    memo.mark_terminal((t, Signal::Metrics, 0, hour), state, *verified_ns);
+                    present.push((hour, state, *verified_ns));
+                }
+            }
+
+            // Independent oracle for the effective per-hour values: collapse each
+            // maximal contiguous same-state span to its minimum verified_ns.
+            present.sort_by_key(|e| e.0);
+            let mut expected: Vec<(u32, TerminalState, i64)> = Vec::new();
+            let mut i = 0;
+            while i < present.len() {
+                let (_, state, _) = present[i];
+                let mut j = i;
+                let mut run_min = present[i].2;
+                while j + 1 < present.len()
+                    && present[j].0 + 1 == present[j + 1].0
+                    && present[j + 1].1 == state
+                {
+                    j += 1;
+                    run_min = run_min.min(present[j].2);
+                }
+                for entry in present.iter().take(j + 1).skip(i) {
+                    expected.push((entry.0, state, run_min));
+                }
+                i = j + 1;
+            }
+
+            // Honest write time: at or after every entry, so the clamp is a no-op.
+            let snapshot_unix_ns = present.iter().map(|e| e.2).max().unwrap_or(0);
+            let bytes = encode(&memo, snapshot_unix_ns);
+
+            let mut seeded = MaintainMemo::with_default_interval();
+            seed(&mut seeded, &bytes, snapshot_unix_ns, 0, |_, _, _| true)
+                .expect("decode");
+
+            proptest::prop_assert_eq!(seeded.len(), expected.len());
+            for (hour, state, verified_ns) in expected {
+                let key = (t, Signal::Metrics, 0, hour);
+                proptest::prop_assert_eq!(
+                    seeded.terminal_state(t, Signal::Metrics, 0, hour),
+                    Some(state)
+                );
+                let entry = seeded.entries.get(&key).expect("entry");
+                proptest::prop_assert_eq!(entry.verified_at_ns, verified_ns);
+            }
+        }
+    }
+}
+
+/// Proves `erasure_rewrite_bucket` actually invalidates
+/// a memoized terminal state, for all three wired signals (metrics, logs,
+/// spans), including metrics. Lives here
+/// rather than in `erasure_rewrite.rs`'s own test module because
+/// `MaintainMemo::mark_terminal` is private to this module and only visible
+/// to its descendants (the same access pattern `memo_snapshot_tests` above
+/// already relies on).
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod invalidate_tests {
+    use bytes::Bytes;
+    use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_logseg::writer::ObjectIdentity as LogObjectIdentity;
+    use ravel_logseg::{LogRecord, RlogConfig, RlogWriter};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
+    use ravel_rspan::writer::ObjectIdentity as SpanObjectIdentity;
+    use ravel_rspan::{RspanConfig, RspanWriter, SpanRecord, StatusCode};
+    use ravel_segment::{
+        IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues, VERSION_V7,
+    };
+    use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId};
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::build::OUTPUT_FORMAT_VERSION;
+    use crate::clock::FixedClock;
+    use crate::erasure_rewrite::{
+        ErasureRewriteOutcome, PendingErasureRequest, erasure_rewrite_bucket,
+    };
+    use crate::publish::PublishOutcome;
+    use crate::sweep::NoLeases;
+
+    const TENANT: &str = "acme";
+    const SHARD: u32 = 3;
+    const HOUR: u32 = 500_000;
+    const EPOCH: u64 = 1;
+
+    fn tenant_hash() -> TenantHash {
+        TenantId::new(TENANT).hash()
+    }
+
+    fn sealed_now_ns() -> i64 {
+        (i64::from(HOUR) + 1) * NS_PER_HOUR + 2 * NS_PER_HOUR
+    }
+
+    fn erasure_request(signal: Signal, key: &str, value: &str) -> ErasureRequest {
+        ErasureRequest {
+            format_version: 1,
+            tenant_hash: tenant_hash().0.to_vec(),
+            signal: ravel_commit::signal::to_proto(signal) as i32,
+            request_id: Uuid::from_u128(1).to_string(),
+            created_unix_ns: 0,
+            predicate: vec![ErasurePredicateMatcher {
+                key: key.to_string(),
+                value: value.to_string(),
+            }],
+            window_start_ns: 0,
+            window_end_ns: 0,
+            reason: String::new(),
+        }
+    }
+
+    async fn seed_metrics(store: &dyn ObjectStoreBackend) {
+        let th = tenant_hash();
+        let writer_id = Uuid::from_u128(1);
+        let created = i64::from(HOUR) * NS_PER_HOUR;
+        let identity = SegmentIdentity {
+            tenant_hash: th.0,
+            shard: SHARD,
+            writer_id: writer_id.to_string(),
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+        };
+        let labels = LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: "checkout_latency".to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(&TenantId::new(TENANT), "checkout_latency", &labels)
+            .expect("series id");
+        let series = SeriesInputV3 {
+            series_id,
+            labels,
+            values: SeriesValues::Scalar(vec![Sample {
+                ts_ns: created + 1,
+                value: 1.0,
+            }]),
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+        };
+        let written = SegmentWriter::write_histograms_with_exemplars(
+            vec![series],
+            identity,
+            bounds,
+            Vec::new(),
+        )
+        .expect("write L0");
+        let content_hash = written.summary.blake3;
+        let data_key = keys::data_key(
+            &th,
+            Signal::Metrics,
+            SHARD,
+            writer_id,
+            EPOCH,
+            1,
+            &content_hash,
+        )
+        .expect("data key");
+        store
+            .put(&data_key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put data object");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: th,
+            signal: Signal::Metrics,
+            shard: SHARD,
+            writer_id,
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+            segment_format_version: u32::from(VERSION_V7),
+            created_unix_ns: created,
+            ingest_hour_bucket: HOUR,
+        })
+        .expect("build commit record");
+        let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+        store
+            .put(&commit_key, record::encode(&rec), PutOptions::default())
+            .await
+            .expect("put commit record");
+    }
+
+    async fn seed_logs(store: &dyn ObjectStoreBackend) {
+        let th = tenant_hash();
+        let writer_id = Uuid::from_u128(1);
+        let created = i64::from(HOUR) * NS_PER_HOUR;
+        let identity = LogObjectIdentity {
+            tenant_hash: th.0,
+            shard: SHARD,
+            writer_id: writer_id.into_bytes(),
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+        };
+        let res = vec![(
+            "service.name".to_string(),
+            ravel_logseg::AttrValue::Str("checkout".to_string()),
+        )];
+        let stream_id = ravel_types::logstream::log_stream_id(&res, "scope", "1", &[]);
+        let stream_attrs = ravel_logseg::stream_attrs_bytes(&res, "scope", "1", &[]);
+        let record = LogRecord {
+            stream_id,
+            stream_attrs,
+            ts_ns: created + 1,
+            observed_ts_ns: created + 1,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "checkout failed".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![(
+                "service".to_string(),
+                ravel_logseg::AttrValue::Str("checkout".to_string()),
+            )],
+        };
+        let mut w = RlogWriter::new(RlogConfig::default(), identity);
+        w.push(record).expect("push log record");
+        let bytes = Bytes::from(w.finish().expect("finish L0"));
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let data_key = keys::data_key(&th, Signal::Logs, SHARD, writer_id, EPOCH, 1, &content_hash)
+            .expect("data key");
+        store
+            .put(&data_key, bytes.clone(), PutOptions::default())
+            .await
+            .expect("put data object");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: th,
+            signal: Signal::Logs,
+            shard: SHARD,
+            writer_id,
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: created + 1,
+            max_event_ts_ns: created + 1,
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+            segment_format_version: OUTPUT_FORMAT_VERSION,
+            created_unix_ns: created,
+            ingest_hour_bucket: HOUR,
+        })
+        .expect("build commit record");
+        let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+        store
+            .put(&commit_key, record::encode(&rec), PutOptions::default())
+            .await
+            .expect("put commit record");
+    }
+
+    async fn seed_spans(store: &dyn ObjectStoreBackend) {
+        let th = tenant_hash();
+        let writer_id = Uuid::from_u128(1);
+        let created = i64::from(HOUR) * NS_PER_HOUR;
+        let identity = SpanObjectIdentity {
+            tenant_hash: th.0,
+            shard: SHARD,
+            writer_id: writer_id.into_bytes(),
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+        };
+        let record = SpanRecord {
+            trace_id: [1; 16],
+            span_id: [1; 8],
+            parent_span_id: None,
+            name: "op".into(),
+            start_ts_ns: created + 1,
+            end_ts_ns: created + 2,
+            status_code: StatusCode::Ok,
+            status_message: None,
+            attrs: vec![("service".to_string(), "checkout".to_string())],
+        };
+        let mut w = RspanWriter::new(RspanConfig::default(), identity);
+        w.push(record);
+        let bytes = Bytes::from(w.finish().expect("finish L0"));
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let data_key = keys::data_key(
+            &th,
+            Signal::Spans,
+            SHARD,
+            writer_id,
+            EPOCH,
+            1,
+            &content_hash,
+        )
+        .expect("data key");
+        store
+            .put(&data_key, bytes.clone(), PutOptions::default())
+            .await
+            .expect("put data object");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: th,
+            signal: Signal::Spans,
+            shard: SHARD,
+            writer_id,
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: created + 1,
+            max_event_ts_ns: created + 2,
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+            segment_format_version: OUTPUT_FORMAT_VERSION,
+            created_unix_ns: created,
+            ingest_hour_bucket: HOUR,
+        })
+        .expect("build commit record");
+        let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+        store
+            .put(&commit_key, record::encode(&rec), PutOptions::default())
+            .await
+            .expect("put commit record");
+    }
+
+    /// A successful METRICS rewrite forgets the bucket's memoized terminal
+    /// state, so the next scan tick re-evaluates it instead of trusting a
+    /// stale "already compacted" verdict.
+    /// Flip-line proof: in `invalidate_after_publish`
+    /// (`erasure_rewrite.rs`), changing the call's `bucket.signal` argument
+    /// to a hardcoded `Signal::Logs` (or deleting the call from the
+    /// `Signal::Metrics` dispatch arm) leaves this bucket's memo entry
+    /// intact, failing the `assert_eq!(memo.terminal_state(...), None)`
+    /// below.
+    #[tokio::test]
+    async fn metrics_rewrite_invalidates_memoized_terminal_state() {
+        let store = MemoryStore::new();
+        seed_metrics(&store).await;
+        let t = tenant_hash();
+        let mut memo = MaintainMemo::with_default_interval();
+        memo.mark_terminal(
+            (t, Signal::Metrics, SHARD, HOUR),
+            TerminalState::Compacted,
+            0,
+        );
+        assert_eq!(
+            memo.terminal_state(t, Signal::Metrics, SHARD, HOUR),
+            Some(TerminalState::Compacted)
+        );
+
+        let request = erasure_request(Signal::Metrics, "__name__", "checkout_latency");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+        let bucket = Bucket::new(t, Signal::Metrics, SHARD, HOUR);
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let outcome = erasure_rewrite_bucket(
+            &store, &clock, &config, &NoLeases, &bucket, &pending, &mut memo,
+        )
+        .await
+        .expect("rewrite");
+        assert!(matches!(
+            outcome,
+            ErasureRewriteOutcome::Rewritten {
+                publish: PublishOutcome::Published,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            memo.terminal_state(t, Signal::Metrics, SHARD, HOUR),
+            None,
+            "a published metrics rewrite must invalidate the memoized terminal state"
+        );
+    }
+
+    /// The LOGS sibling of the metrics invalidate test above: a published
+    /// LOGS rewrite forgets its bucket's memoized terminal state too, proving
+    /// the wiring is not scoped to the metrics dispatch arm alone. Flip-line
+    /// proof: same as above -- restricting `invalidate_after_publish`'s call
+    /// to fire only for `Signal::Metrics` leaves this bucket's entry intact.
+    #[tokio::test]
+    async fn logs_rewrite_invalidates_memoized_terminal_state() {
+        let store = MemoryStore::new();
+        seed_logs(&store).await;
+        let t = tenant_hash();
+        let mut memo = MaintainMemo::with_default_interval();
+        memo.mark_terminal((t, Signal::Logs, SHARD, HOUR), TerminalState::Compacted, 0);
+
+        let request = erasure_request(Signal::Logs, "service", "checkout");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+        let bucket = Bucket::new(t, Signal::Logs, SHARD, HOUR);
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let outcome = erasure_rewrite_bucket(
+            &store, &clock, &config, &NoLeases, &bucket, &pending, &mut memo,
+        )
+        .await
+        .expect("rewrite");
+        assert!(matches!(
+            outcome,
+            ErasureRewriteOutcome::Rewritten {
+                publish: PublishOutcome::Published,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            memo.terminal_state(t, Signal::Logs, SHARD, HOUR),
+            None,
+            "a published logs rewrite must invalidate the memoized terminal state"
+        );
+    }
+
+    /// The SPANS sibling of the two invalidate tests above: a published
+    /// SPANS rewrite forgets its bucket's memoized terminal state too.
+    /// Flip-line proof: same as above -- restricting
+    /// `invalidate_after_publish`'s call to fire only for
+    /// `Signal::Metrics`/`Signal::Logs` leaves this bucket's entry intact.
+    #[tokio::test]
+    async fn spans_rewrite_invalidates_memoized_terminal_state() {
+        let store = MemoryStore::new();
+        seed_spans(&store).await;
+        let t = tenant_hash();
+        let mut memo = MaintainMemo::with_default_interval();
+        memo.mark_terminal((t, Signal::Spans, SHARD, HOUR), TerminalState::Compacted, 0);
+
+        let request = erasure_request(Signal::Spans, "service", "checkout");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+        let bucket = Bucket::new(t, Signal::Spans, SHARD, HOUR);
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let outcome = erasure_rewrite_bucket(
+            &store, &clock, &config, &NoLeases, &bucket, &pending, &mut memo,
+        )
+        .await
+        .expect("rewrite");
+        assert!(matches!(
+            outcome,
+            ErasureRewriteOutcome::Rewritten {
+                publish: PublishOutcome::Published,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            memo.terminal_state(t, Signal::Spans, SHARD, HOUR),
+            None,
+            "a published spans rewrite must invalidate the memoized terminal state"
+        );
+    }
+
+    /// The pure lag function (issues #1729, #2073): with no expiry observed
+    /// the deadline is the hour's nominal end plus the retention window; an
+    /// exact expiry replaces it; a tombstone's `retired_at_ns` can only move
+    /// the deadline earlier. Clamped at zero, and `0` with no policy.
+    #[test]
+    fn expired_bucket_retention_lag_ns_is_now_past_the_best_known_expiry() {
+        let window = 6 * NS_PER_HOUR;
+        let hour_start = i64::from(HOUR) * NS_PER_HOUR;
+        let bucket_end = hour_start + NS_PER_HOUR;
+        let now = bucket_end + window + 5 * NS_PER_HOUR;
+        assert_eq!(
+            expired_bucket_retention_lag_ns(HOUR, now, Some(window), None),
+            5 * NS_PER_HOUR,
+            "lag is now minus (bucket_end + window)"
+        );
+        // Not yet at the deadline: clamped to zero, never negative.
+        assert_eq!(
+            expired_bucket_retention_lag_ns(HOUR, bucket_end, Some(window), None),
+            0
+        );
+        // No retention policy: no deadline, no lag.
+        assert_eq!(expired_bucket_retention_lag_ns(HOUR, now, None, None), 0);
+
+        // An exact expiry 1 ns into the hour: the full six hours minus 1 ns,
+        // not the nominal five.
+        let exact = Some(ObservedExpiry::Exact(hour_start + 1 + window));
+        assert_eq!(
+            expired_bucket_retention_lag_ns(HOUR, now, Some(window), exact),
+            6 * NS_PER_HOUR - 1
+        );
+        // A tombstone written 20 minutes before the nominal deadline moves it
+        // earlier; one written after the nominal deadline does not move it.
+        let early = Some(ObservedExpiry::NoLaterThan(
+            bucket_end + window - NS_PER_HOUR / 3,
+        ));
+        assert_eq!(
+            expired_bucket_retention_lag_ns(HOUR, now, Some(window), early),
+            5 * NS_PER_HOUR + NS_PER_HOUR / 3
+        );
+        let late = Some(ObservedExpiry::NoLaterThan(
+            bucket_end + window + NS_PER_HOUR,
+        ));
+        assert_eq!(
+            expired_bucket_retention_lag_ns(HOUR, now, Some(window), late),
+            5 * NS_PER_HOUR
+        );
+        // A bucket listing a rewrite record: an erasure's parts-less rewrite
+        // can push the expiry past the nominal deadline, so only the tombstone
+        // bounds it and the lag is `now` past `retired_at_ns`. Flipped line:
+        // delete the `NoLaterThanOnly` arm in `expired_bucket_retention_lag_ns`;
+        // "only the tombstone bounds a rewritten bucket" reads left 18000000000000,
+        // right 14400000000000.
+        let rewritten = Some(ObservedExpiry::NoLaterThanOnly(
+            bucket_end + window + NS_PER_HOUR,
+        ));
+        assert_eq!(
+            expired_bucket_retention_lag_ns(HOUR, now, Some(window), rewritten),
+            4 * NS_PER_HOUR,
+            "only the tombstone bounds a rewritten bucket"
+        );
+    }
+
+    /// End to end through `scan_and_maintain` with an injected clock: a sealed,
+    /// expired, still-present (freshly tombstoned) bucket makes
+    /// `MaintainReport::retention_lag_ns` the exact distance from `now` to the
+    /// bucket's retention expiry by its newest event (issues #1729, #2073). The
+    /// fixture's one event is 1 ns into its hour, so that is one hour minus 1
+    /// ns more than the nominal deadline gives. Flip-line proof: dropping the
+    /// `retention_lag_ns` update from the Tombstoned arm leaves this at `0`,
+    /// and replacing the `ObservedExpiry::Exact` on the tombstoning path of
+    /// `retention_sweep_bucket_observed` with `None` reads the nominal five
+    /// hours.
+    #[tokio::test]
+    async fn scan_reports_exact_retention_lag_for_a_still_present_expired_bucket() {
+        use crate::config::{DEFAULT_MAX_INGEST_LAG_NS, RetentionPolicy};
+
+        let store = MemoryStore::new();
+        seed_metrics(&store).await;
+        let t = tenant_hash();
+        let config = CompactorConfig::default();
+        // A window at the ADR-0019 floor, so the fixture's near-epoch event is
+        // safely expired, and read the exact window back for the assertion.
+        let window = config.retention_floor_ns(DEFAULT_MAX_INGEST_LAG_NS);
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: None,
+                tenants: vec![(TENANT.to_string(), window)],
+            },
+            &config,
+            DEFAULT_MAX_INGEST_LAG_NS,
+        )
+        .expect("valid retention config");
+        assert_eq!(retention.window_for(&t), Some(window));
+
+        let bucket_end = (i64::from(HOUR) + 1) * NS_PER_HOUR;
+        // Five hours past the deadline, and far enough in the future that the
+        // bucket is sealed.
+        let now = bucket_end + window + 5 * NS_PER_HOUR;
+        let clock = FixedClock::new(now);
+
+        let report = scan_and_maintain(
+            &store,
+            &clock,
+            &config,
+            &retention,
+            &NoLeases,
+            t,
+            Signal::Metrics,
+            SHARD,
+        )
+        .await
+        .expect("scan");
+
+        assert_eq!(report.retired, 1, "the expired bucket was tombstoned");
+        let max_event = i64::from(HOUR) * NS_PER_HOUR + 1;
+        assert_eq!(
+            report.retention_lag_ns,
+            now - (max_event + window),
+            "lag is now past the newest event's expiry"
+        );
+        assert_eq!(
+            report.retention_lag_ns,
+            6 * NS_PER_HOUR - 1,
+            "the bucket is six hours less 1 ns past its retention expiry"
+        );
+    }
+
+    /// The passes after the tombstoning one (issue #2073). The tombstone
+    /// records no event time, so a memo that saw the tombstone written keeps
+    /// the exact lag, and a cold memo falls back to the earlier of the nominal
+    /// deadline and the tombstone's `retired_at_ns`. Here the tombstone was
+    /// written after the nominal deadline, so the fallback reads the nominal
+    /// figure: exactly one hour less 1 ns under the true lag, the documented
+    /// under-read. Flip-line proof: returning `observed` unconditionally from
+    /// `MaintainMemo::best_expiry` makes the warm pass read the nominal figure.
+    #[tokio::test]
+    async fn later_passes_keep_the_exact_lag_only_on_the_memo_that_tombstoned() {
+        use crate::config::{DEFAULT_MAX_INGEST_LAG_NS, RetentionPolicy};
+
+        let store = MemoryStore::new();
+        seed_metrics(&store).await;
+        let t = tenant_hash();
+        let config = CompactorConfig::default();
+        let window = config.retention_floor_ns(DEFAULT_MAX_INGEST_LAG_NS);
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: None,
+                tenants: vec![(TENANT.to_string(), window)],
+            },
+            &config,
+            DEFAULT_MAX_INGEST_LAG_NS,
+        )
+        .expect("valid retention config");
+        let bucket_end = (i64::from(HOUR) + 1) * NS_PER_HOUR;
+        let tombstoned_at = bucket_end + window + 5 * NS_PER_HOUR;
+        let clock = FixedClock::new(tombstoned_at);
+        let pass = |memo: MaintainMemo| {
+            let (store, clock, config, retention) = (&store, &clock, &config, &retention);
+            async move {
+                let mut memo = memo;
+                let report = scan_and_maintain_with_memo(
+                    &mut memo,
+                    store,
+                    clock,
+                    config,
+                    retention,
+                    &NoLeases,
+                    t,
+                    Signal::Metrics,
+                    SHARD,
+                )
+                .await
+                .expect("scan");
+                (memo, report)
+            }
+        };
+
+        let (warm, first) = pass(MaintainMemo::new(0)).await;
+        assert_eq!(first.retention_lag_ns, 6 * NS_PER_HOUR - 1);
+
+        clock.set(tombstoned_at + NS_PER_HOUR);
+        let (_, second) = pass(warm).await;
+        assert_eq!(
+            second.retention_lag_ns,
+            7 * NS_PER_HOUR - 1,
+            "the memo that wrote the tombstone keeps the exact expiry"
+        );
+        let (_, cold) = pass(MaintainMemo::new(0)).await;
+        assert_eq!(
+            cold.retention_lag_ns,
+            6 * NS_PER_HOUR,
+            "a cold memo reads now past the nominal deadline, the earlier bound here"
+        );
+    }
+
+    /// A tombstoned bucket with a parts-less rewrite (issue #2073 review): the
+    /// pass whose memo holds the exact expiry reads the rewrite record no
+    /// further, and a cold pass reads it exactly once, counts that GET in
+    /// `lag_bound_gets`, and measures from the tombstone alone; the next pass
+    /// on that same memo reuses the answer and reads it no more. Flipped
+    /// lines: the `memo.exact_expiry_ns.contains_key(&key)` branch removed
+    /// reads the warm pass's `lag_bound_gets` as 1 against 0; the
+    /// `report.lag_bound_gets += bound_read.gets` removed reads the cold
+    /// pass's as 0 against 1; the `memo.rewrites_keep_nominal_bound.insert`
+    /// removed reads the second cold-memo pass's as 1 against 0.
+    #[tokio::test]
+    async fn only_a_pass_without_the_exact_expiry_reads_the_rewrite_record() {
+        use crate::config::{DEFAULT_MAX_INGEST_LAG_NS, RetentionPolicy};
+        use ravel_object_store::InstrumentedStore;
+        use ravel_object_store::instrument::StoreOp;
+        use ravel_proto::commit::v1::{CompactionInputIdentity, RewriteDrop, RewriteRecord};
+
+        let store = InstrumentedStore::new(MemoryStore::new());
+        seed_metrics(&store).await;
+        let t = tenant_hash();
+        let inputs = vec![CompactionInputIdentity {
+            writer_id: Uuid::from_u128(1).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }];
+        let request_id = Uuid::from_u128(7).to_string();
+        let created_unix_ns = i64::from(HOUR) * NS_PER_HOUR + 2;
+        let rewrite = RewriteRecord {
+            format_version: 1,
+            tenant_hash: t.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: SHARD,
+            ingest_hour_bucket: HOUR,
+            input_set_hash: ravel_commit::erasure::compute_rewrite_input_set_hash(
+                &inputs,
+                None,
+                std::slice::from_ref(&request_id),
+            )
+            .to_vec(),
+            inputs,
+            parts: Vec::new(),
+            drops: vec![RewriteDrop {
+                request_id,
+                dropped_count: 1,
+            }],
+            created_unix_ns,
+            superseded_record_key: String::new(),
+        };
+        store
+            .put(
+                &keys::rewrite_record_key_for(&rewrite).expect("key"),
+                ravel_commit::erasure::encode_rewrite(&rewrite),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed rewrite");
+
+        let config = CompactorConfig::default();
+        let window = config.retention_floor_ns(DEFAULT_MAX_INGEST_LAG_NS);
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: None,
+                tenants: vec![(TENANT.to_string(), window)],
+            },
+            &config,
+            DEFAULT_MAX_INGEST_LAG_NS,
+        )
+        .expect("valid retention config");
+        let bucket_end = (i64::from(HOUR) + 1) * NS_PER_HOUR;
+        let tombstoned_at = bucket_end + window + 5 * NS_PER_HOUR;
+        let clock = FixedClock::new(tombstoned_at);
+        let gets = || store.metrics().snapshot().op(StoreOp::Get).calls;
+        let pass = |memo: MaintainMemo| {
+            let (store, clock, config, retention) = (&store, &clock, &config, &retention);
+            async move {
+                let mut memo = memo;
+                let report = scan_and_maintain_with_memo(
+                    &mut memo,
+                    store,
+                    clock,
+                    config,
+                    retention,
+                    &NoLeases,
+                    t,
+                    Signal::Metrics,
+                    SHARD,
+                )
+                .await
+                .expect("scan");
+                (memo, report)
+            }
+        };
+
+        let (warm, first) = pass(MaintainMemo::new(0)).await;
+        assert_eq!(first.retired, 1, "the first pass tombstones the bucket");
+        assert_eq!(
+            first.lag_bound_gets, 0,
+            "the tombstoning pass knows the expiry"
+        );
+
+        clock.set(tombstoned_at + NS_PER_HOUR);
+        let before = gets();
+        let (_, second) = pass(warm).await;
+        let warm_gets = gets() - before;
+        assert_eq!(
+            second.lag_bound_gets, 0,
+            "a memoised exact expiry needs no GET"
+        );
+        assert_eq!(
+            second.retention_lag_ns,
+            tombstoned_at + NS_PER_HOUR - (created_unix_ns + window),
+            "the warm pass reads the exact lag"
+        );
+
+        let before = gets();
+        let (cold_memo, cold) = pass(MaintainMemo::new(0)).await;
+        let cold_gets = gets() - before;
+        assert_eq!(
+            cold.lag_bound_gets, 1,
+            "the cold pass reads the rewrite once"
+        );
+        assert_eq!(
+            cold_gets,
+            warm_gets + 1,
+            "exactly one GET more than the pass with the exact expiry"
+        );
+        assert_eq!(
+            cold.retention_lag_ns, NS_PER_HOUR,
+            "a parts-less rewrite leaves the tombstone as the only bound"
+        );
+
+        let before = gets();
+        let (_, again) = pass(cold_memo).await;
+        assert_eq!(
+            again.lag_bound_gets, 0,
+            "the memo keeps the answer the cold pass read"
+        );
+        assert_eq!(
+            gets() - before,
+            warm_gets,
+            "the second pass without the exact expiry issues no rewrite GET"
+        );
+        assert_eq!(
+            again.retention_lag_ns, NS_PER_HOUR,
+            "the memoised answer keeps the tombstone as the only bound"
+        );
+    }
+}

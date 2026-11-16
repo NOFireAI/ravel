@@ -1,0 +1,13 @@
+{
+  "agent": {
+    "kind": "order",
+    "key": "o-1"
+  },
+  "handler": "place",
+  "request_id": "req-1",
+  "payload": {
+    "qty": 2,
+    "sku": "A-1"
+  },
+  "wait_ms": 5000
+}

@@ -1,0 +1,12 @@
+{
+  "operation": "djE6b3A6MTljZDBlNjg3Njk5MTMxNGMxYjZkYmQ4YmQxMjkyOTc6MTox",
+  "result": {
+    "status": "completed",
+    "output": {
+      "total_cents": 1299
+    },
+    "error": null,
+    "dead_lettered": false,
+    "finished_unix_ns": "1767225600123456789"
+  }
+}

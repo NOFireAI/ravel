@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d2d746f0badf787b780ace2795f5371d46ef093c180ed585d686f5fba4dd71b0 # shrinks to segments = [ColumnStatsSegment { ingest_hour_bucket: 1, shard: 0, writer_id: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], writer_epoch: 1, writer_seq: 0, columns: [ColumnStat { name: "b", declared_type: 2, non_null_count: 0, null_count: 0, min: None, max: None, dictionary_present: false, dictionary: [], sum: Some(0) }] }, ColumnStatsSegment { ingest_hour_bucket: 1, shard: 0, writer_id: [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2], writer_epoch: 1, writer_seq: 1, columns: [] }], corruption = Some((109101323381216396, 0, 0)), keep = []

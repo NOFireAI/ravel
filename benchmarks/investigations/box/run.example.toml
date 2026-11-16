@@ -1,0 +1,193 @@
+# One selective-investigations run (issue #3699, ADR-3692 decision 8): copy
+# this file, fill it in, and pass it to box/launch.sh (s3 lane) or to
+# box/run.sh --lane local. box/run.sh copies it into the run directory, and
+# evaluate.py reads that copy. No key here is a credential: on the s3 lane the
+# instance role carries every permission the box needs.
+
+[run]
+# "s3" (an EC2 box against a real S3 bucket; the only lane timing is judged
+# on) or "local" (a loopback RustFS on the machine running run.sh).
+lane = "s3"
+# The states the statement matrix runs in, in this order (README.md
+# "States"). mixed is followed by the fold_advance transition and
+# compaction_in_flight by compaction_done, each stamped. advanced_leaves runs
+# row 18's key-set lookups against the catalog fold_advance left, and fails
+# unless fold_advance ran with the leaf switch on and added logs request_id
+# slices, so it belongs right after mixed. many_parts_N loads a fresh spans
+# tenant mpN over N strided ingest hours. erasure_in_flight is recorded
+# not-run when the corpus has no erasure victim. ADR-3939's multi-day states
+# (README.md "day_parts_N and retired_hour") are listed only by a run that
+# measures that ADR: day_parts_7 (tenant dp7, spans and logs) and
+# day_parts_30 (tenant dp30, logs) load N whole UTC days ending before the
+# current hour, each followed by its _advance transition; retired_hour runs
+# on dp7, so it needs day_parts_7 listed before it, and is followed by
+# retired_hour_drop. Each of these needs [retired_hour] c1_sha and r2_sha set.
+states = ["unfolded", "folded_no_leaves", "folded_leaves", "mixed", "advanced_leaves", "compaction_in_flight",
+          "erasure_in_flight", "many_parts_744", "many_parts_2160"]
+# The run's own deadline, below box.max_minutes: a state that would start
+# past it is recorded not-run (reason deadline), and evaluate and the upload
+# still happen. A run listing day_parts_7 and retired_hour sets 590: the
+# README's "Run time with retired_hour" has the arithmetic.
+max_minutes = 540
+# Logs objects rlog inspect reads for the needle-block count (0: all).
+needle_blocks_max_objects = 200
+# true: load the base corpus in two batches per signal so each shard and
+# hour holds two L0 objects (the local smoke; at s3 scale every shard and
+# hour already holds many).
+split_base_load = false
+# Cold calls per (statement, state); each one follows a server restart and a
+# page-cache drop. The warm repeat follows the last cold call without a
+# restart, once, for statements whose cold_only is false.
+cold_runs = 20
+warm_runs = 1
+# true: load the ClickBench hits tenant and run q20 and the 43-statement
+# control (ADR rows 5, 6, 16). Needs [hits] below.
+hits = false
+# The corpus scales the run loads (gen_corpus.py --scale). Row 12 needs 10 and
+# 100; this flow loads scale 1 only, so those rows report not-run.
+scales = [1]
+# true only when a baseline build's control figures are in the run (row 16).
+# This flow builds one commit, so row 16 reports not-run.
+baseline = false
+# The mixed state's extra hour must land in the ingest hour after the folded
+# one: run.sh waits for the next hour boundary, at most this long, and fails
+# rather than load into the sealed hour.
+mixed_wait_max_minutes = 70
+
+[box]
+# The commit to build and measure, a full 40-character SHA.
+sha = "FILL-IN-COMMIT"
+repo_url = "https://github.com/NOFireAI/ravel.git"
+region = "us-east-1"
+# The run's in/ and out/: s3://<bucket>/<prefix>/runs/<run-id>/.
+bucket = "FILL-IN-BUCKET-NAME"
+prefix = "investigations"
+# The store under test. Ravel keys a whole bucket (t/<tenant_hash>/...,
+# sys/...), so this is a dedicated bucket in the same region, and run.sh
+# refuses one that already holds an object.
+store_bucket = "FILL-IN-EMPTY-STORE-BUCKET"
+# Its role needs s3:GetObject on <prefix>/runs/*/in/*, s3:PutObject on
+# <prefix>/runs/*/out/*, and GetObject, PutObject, DeleteObject and
+# ListBucket on store_bucket; launch.sh checks all of them before launching. With ec2:TerminateInstances the box
+# terminates itself through the API; without it, it shuts itself down, which
+# terminates it too (launch.sh sets
+# --instance-initiated-shutdown-behavior terminate).
+instance_profile = "ravel-investigations-instance-profile"
+instance_type = "c6a.4xlarge"
+volume_gb = 200
+# The instance's life cap: its user-data arms `shutdown -h +max_minutes`
+# before anything else, and the shutdown terminates it whatever run.sh is
+# doing. 1 to 600; fetch.sh stops waiting 30 minutes after it.
+max_minutes = 600
+# Optional: ami (default: the latest Amazon Linux 2023 from SSM), subnet,
+# security_group, key_name.
+# ami = "ami-..."
+
+[corpus]
+# gen_corpus.py parameters. The ADR's corpus is 20,000,000 traces over 24
+# hours; seed 3692 is the generator's default.
+traces = 20000000
+hours = 24
+seed = 3692
+spans_per_trace = 10
+logs_per_trace = 5
+
+[server]
+tenant = "inv"
+shards = 8
+# Optional: memory_budget_bytes (ravel-server --memory-budget-bytes).
+# memory_budget_bytes = 25769803776
+# Optional: extra_flags, appended verbatim after --memory-budget-bytes on
+# every ravel-server command line (and stamped into <state>.server.json's
+# server_flags as passed). Each element is one argv token: no shell
+# evaluation, no word splitting and no globbing, so a flag that takes a
+# value is one "--flag=value" element, not two. An element that contains
+# whitespace or does not start with "--" ends the run before any step
+# (FAILED naming run.toml server.extra_flags, exit 1).
+# extra_flags = ["--sql-max-query-bytes=1048576"]
+
+[hits]
+# Read only when run.hits = true. The same dataset the ClickBench kit loads.
+dataset_url = "https://datasets.clickhouse.com/hits_compatible/hits.parquet"
+dataset_sha256 = "a390f6cb782f6aaef278c72fc1dd86c4f30bc843ebab3c159e9bd4d45ddb079f"
+rows_expected = 99997497
+
+[many_parts]
+# Each many_parts_N tenant's corpus: N hours at this many traces per hour,
+# loaded one ingest hour per batch (--ingest-hour-stride 1) and folded with
+# --snapshot-part-max-entries below, so every hour is its own part.
+traces_per_hour = 10
+snapshot_part_max_entries = 1
+
+[day_parts]
+# Read only when run.states lists day_parts_7 or day_parts_30. Traces per UTC
+# day of each state's even-hours corpus, a multiple of 24 so every hour holds
+# the same count. ADR-3939's harness-state amendment ("Two states",
+# docs/adrs/3939-key-index-day-seal.md): the 7-day state at box D's logs rate
+# (corpus.traces above per day, 20,000,000, at the nearest multiple of 24)
+# and the 30-day state at a reduced rate (a fifth of that, 4,000,000, at the
+# nearest multiple of 24), since 30 days at box D's rate do
+# not fit one run's deadline.
+traces_per_day_7 = 19999992
+traces_per_day_30 = 4000008
+# The 30-day state's `catalog fold --key-index-build-max-pairs`, on both its
+# folds (stamped in stamps/day_parts_30.logs.build_budget.json and in each
+# folds.jsonl kind). The amendment needs S, the most request_id slices one day
+# part carries, at 3 or more. From ADR-3939's figures: a box D logs day holds
+# 100,000,000 request_id pairs (4,166,667 an hour) at 20,000,000 traces, 5
+# per trace, and A1 takes 26 passes over it at the default 8,000,000 pairs,
+# a share of 4,000,000 for each of the two indexed fields (request_id and
+# trace_id). At 4,000,008 traces a day the request_id pairs are 20,000,040,
+# so the default gives ceil(20,000,040 / 4,000,000) = 6 passes (A1's 26
+# scaled by the rate, 5.2): S about 5, two above the floor. 1,600,000, the
+# default scaled by the same fifth, gives a share of 800,000 and
+# ceil(20,000,040 / 800,000) = 26 passes, A1's 26 again, so S is about 26
+# and the 30-day state's bounds read at box D's instance (T(26) + 100 = 126).
+key_index_build_max_pairs_30 = 1600000
+
+[retired_hour]
+# c1_sha and r2_sha are read by every state that writes a fold binary stamp
+# (retired_hour and each day_parts_N; stamps/STATE.logs.fold_binary.json),
+# which records whether the binary's SHA descends from each (W2 is judged only
+# on a binary carrying C1 and not R2). Both are required when run.states lists
+# any of those states. A SHA that names no commit fails the state.
+# c1_sha: ADR-3939 task C1, its last commit on main.
+c1_sha = "131ab993cd209e97597c7508b02f99cd794a6cbd"
+# r2_sha: ADR-3939 task R2, its last commit on main.
+r2_sha = "e7325ae0f5d7b1864cbfe42a0a8723d245563f4f"
+# Read only when run.states lists retired_hour. The maintain-mode server's pass interval, and the most minutes run.sh lists
+# the store for the expected tombstones before failing the state.
+maintain_interval_secs = 30
+wait_minutes = 20
+
+# Before each load, fold, leaf rebuild and compaction run.sh checks that the
+# run deadline (run.max_minutes) leaves this many minutes for it, and records
+# the state not-run otherwise, so evaluate and the upload always happen. The
+# waits are bounded by their own maxima instead (mixed_wait_max_minutes; 310 s
+# for compaction_in_flight's wait for the sealed hour). A state not named
+# here takes default; default absent is 30.
+[step_estimate_minutes]
+default = 30
+# Each retired_hour step's tail load and retention fold; its two waits
+# (retired_hour.wait_minutes, then the next ingest hour) are bounded apart.
+retired_hour = 10
+
+# Every price evaluate.py multiplies by, with the source it was read from.
+# A price without a source is reported missing.
+[prices]
+get_per_1000 = 0.0004
+get_per_1000_source = "AWS S3 Standard pricing, us-east-1: GET, SELECT and all other requests, $0.0004 per 1,000 requests"
+put_per_1000 = 0.005
+put_per_1000_source = "AWS S3 Standard pricing, us-east-1: PUT, COPY, POST, LIST requests, $0.005 per 1,000 requests"
+storage_gb_month = 0.023
+storage_gb_month_source = "AWS S3 Standard pricing, us-east-1: first 50 TB per month, $0.023 per GB"
+instance_per_hour = 0.612
+instance_per_hour_source = "AWS EC2 on-demand pricing, us-east-1, Linux: c6a.4xlarge $0.612 per hour"
+
+[cost]
+# The lookup frequency break-even is judged at. An assumption, not a
+# measurement: evaluate.py prints it beside every break-even figure.
+lookups_per_part_month = 1000
+lookups_per_part_month_source = "assumption: 1,000 selective lookups per snapshot part per month, ADR-3692 gives no frequency"
+# Required: the months a leaf build is amortised over (no default).
+amortise_months = 1

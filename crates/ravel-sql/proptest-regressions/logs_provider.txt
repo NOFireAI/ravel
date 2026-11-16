@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 48e40d9ed1a052d8b4e7f09ff97e02d737c8df790ce827158dd9f7786b849111 # shrinks to segs = [([None], None)], conjuncts = [In([0]), Eq(1)]
+cc 67e569056e58bb070f0e6437fd5a0c1fbfa7eebe8a8cd5c0a5256037a44d9630 # shrinks to segs = [([None], StampAndCstat)], conjuncts = [Eq(0)]
+cc 2587637925e0cb0470810b202278a0bf36ebb43a34020af9f6226f6d5f749d5b # shrinks to segs = [([Some(1)], Stamp)], conjuncts = [In([1])]
+cc 3199018966ef5eae5b8aabf489c609b568d91e214679da7ba24dd1e75fcd69f5 # shrinks to segs = [([Some(0)], StampAndCstat)], conjuncts = [Lt(0)]
+cc 28a0f1a13e80d630644bc882bd56bbc1aefc4c930069eb3aa5b1d032f9a11fdf # shrinks to segs = [([Some(2)], Cstat)], conjuncts = [Between(0, 0)]

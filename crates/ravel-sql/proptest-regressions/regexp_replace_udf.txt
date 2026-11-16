@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 88ef407acff666b16e86dba8483a7247a82e1ec7be07e61338d14d8a5a6e7abb # shrinks to first = Case { kind: 0, source: [], scalar_source: false, pattern: None, replacement: None, flags: None, array_pattern: false }, rows = []
+cc e4bcecc330e7240fb5109b3f581b02bc9ebb1e077693e3f32b4cdc42463064ae # shrinks to first = Case { kind: 0, source: [Some("http:///")], scalar_source: false, pattern: Some("^https?://(?:www\\.)?([^/]+)/.*$"), replacement: Some("\\1"), flags: None, array_pattern: false }, rows = []

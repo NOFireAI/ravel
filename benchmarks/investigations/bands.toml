@@ -1,0 +1,3310 @@
+# ADR-3692 Acceptance rows 1 to 18, transcribed from
+# docs/adrs/3692-selective-investigations-logs-traces.md ("Acceptance
+# (pre-registered ...)"), then ADR-3939's rows (see the block above
+# adr3939_a1). The text of `check`, `target`, `miss` and `source`
+# is the ADR's own cells, verbatim; the target_if and miss_if expressions are
+# transcriptions of that text into figures this harness can extract, and
+# where a transcription had to choose, the comment above the figure says
+# what it chose. Each [[row.figure]] is one figure evaluate.py extracts from
+# the run and judges:
+#
+#   name        the figure's name within the row
+#   statement   a statements.toml id; "fold" for a fold-report figure; "stamp"
+#               for a figure read from a per-state inspect or census stamp;
+#               "derived" for a figure computed from other figures; "all"
+#               for a whole-run figure; "control" for row 16's paired run
+#   state       the state the figure is measured in (for a fold figure, the
+#               transition whose report it reads, unless transition says)
+#   transition  optional, fold figures only: the fold stamp to read when it is
+#               not the state's own ("leaf_rebuild", the folded_leaves
+#               state's --rebuild-key-index step)
+#   metric      what evaluate.py extracts (README.md "Evaluation"):
+#                 <temp>.max|min.<name>       a statement's call counters
+#                 (temp cold or warm, or prefold: the cold calls a
+#                 multi-day state sends before its own fold)
+#                 <temp>.rows_exact, <temp>.rows_match_state.<state>,
+#                 <temp>.wall_p50_s, <temp>.wall_iqr_s,
+#                 <temp>.leaf_wall_p50_s, <temp>.control_1025
+#                 stamp.<what>.<label>        stamps/STATE.LABEL.*.json
+#                 stamp.slices.<label>.<field> the most leaves one part
+#                                             carries for the field
+#                 stamp.fold_binary_pre_r2|tombstoned_hour|
+#                   retired_hour_segments.<label>  the stamps the
+#                                             retired_hour state writes,
+#                                             each missing while absent;
+#                                             fold_binary_pre_r2 is 1 on a
+#                                             binary carrying C1 and not
+#                                             R2, 0 on one carrying R2
+#                 stamp.fold_binary_carries_r2.<label>  1 when the
+#                                             state's fold binary stamp
+#                                             carries R2, else 0 (A3, A4,
+#                                             on day_parts_7); missing
+#                                             while absent
+#                 leaf_share.<label>.<field>  that field's leaf bytes over the
+#                                             label's census data bytes, in %
+#                 census.<tenant>.<signal>.objects|bytes|objects_over_512k
+#                 truth.<path>                an integer truth.json holds
+#                 fold.<tenant>.<label>.<field>
+#                 derived (with expr, over m: the run's figures)
+#   expr        derived figures only: a Python expression over m
+#   lane        "counter": judged on every lane; "timing": judged on the s3
+#               lane only (decision 8: the local lane is counter-only), and
+#               reported but not judged on the local lane
+#   requires_states  optional, per figure: states the figure needs beyond its
+#               own; a figure whose state is not live is not-run
+#   target_if   Python expression over v (the figure) and m (every figure of
+#               the run by id); false is a miss
+#   miss_if     Python expression; true is a miss. A figure outside its target
+#               is a miss whether or not miss_if holds (the ADR: "a figure
+#               outside its band is a miss").
+#   miss_reason optional: the reason a miss carries when miss_if holds
+#   not_run_unless  optional: a Python expression over m (the run's figures;
+#               one defined below it is read once evaluate.py has built it);
+#               false makes the figure not-run with not_run_reason and the
+#               values it read, which leaves the run incomplete, never a pass.
+#               ADR-3939's reduced-rate figures use it for the S floor and
+#               A3's, A4's, W2's, W3's and W8's for their fold binary
+#   gate_not_requested  optional, with not_run_unless: true lists the figure
+#               not requested rather than incomplete when its expression read
+#               every figure it names and was false (a build the figure is
+#               not measured on); one it could not read leaves the run
+#               incomplete unless that figure is itself not requested
+#   not_requested_if  optional: a Python expression over v and m; true lists
+#               the figure not requested with not_requested_reason and its
+#               value, judged neither pass nor miss (W2's binary figure on a
+#               binary W2 is not measured on)
+#   unsupported optional: the reason no run can measure the figure; it reads
+#               unsupported-on-this-build with that reason once its state ran
+#               and its gate held, which leaves the run incomplete
+#
+# Expressions may call min, max and day_part_bound(S, factor=1), ADR-3939's
+# T(S) + 100 leaf GETs per day part (evaluate.py says how it rounds).
+#
+# A figure id is "<row key>.<name>". evaluate.py requires every figure of a
+# row the run covers to be present exactly once: absent is `missing`, two
+# inputs for it are `duplicate`, and a figure this build cannot produce is
+# `unsupported-on-this-build` with the reason (only the allowlisted fields:
+# the stats.keyIndex members, skipIdxDropped and the per-object and per-part
+# breakdowns). A row whose tenant, state or lane the run did not include is
+# `not-run` with the reason, and its figures are not required.
+
+[[row]]
+key = "row_01"
+adr_row = 1
+check = "spans lookup, no time range, folded with leaves, one covering part (the T12 tenant: 828 objects)"
+target = "leaf GETs = 2; GETs for objects the leaf proves absent = 0; data GETs at most 2 + holders x (footer + SKIP_IDX + block runs), 8 or fewer for a 10-span trace in one object; wire under 300 KB; 10 rows; `partsCovered` 1"
+miss = "over 20 GETs, over 1 MB, any `probe` GET on a pruned object, or a row count other than the unfolded answer's"
+source = "predicted from ADR-2707 decision 5 against T12's 2,429 GETs and 55.7 MB, #2763 comment 6276877460"
+requires_tenant = "inv"
+requires_states = ["folded_leaves", "unfolded"]
+
+# The Acceptance preamble: covering parts is the stamped part count.
+[[row.figure]]
+name = "covering_parts"
+statement = "stamp"
+state = "folded_leaves"
+metric = "stamp.covering_parts.spans"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "spans_lookup_norange"
+state = "folded_leaves"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+target_if = "v == 2 * m['row_01.covering_parts']"
+
+[[row.figure]]
+name = "absent_object_gets"
+statement = "spans_lookup_norange"
+state = "folded_leaves"
+metric = "cold.max.per_object.absent_object_gets"
+lane = "counter"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "data_gets"
+statement = "spans_lookup_norange"
+state = "folded_leaves"
+metric = "cold.max.data_gets"
+lane = "counter"
+target_if = "v <= 8"
+
+[[row.figure]]
+name = "total_gets"
+statement = "spans_lookup_norange"
+state = "folded_leaves"
+metric = "cold.max.total_gets"
+lane = "counter"
+miss_if = "v > 20"
+
+[[row.figure]]
+name = "wire_bytes"
+statement = "spans_lookup_norange"
+state = "folded_leaves"
+metric = "cold.max.wire_bytes"
+lane = "counter"
+target_if = "v < 300_000"
+miss_if = "v > 1_000_000"
+
+[[row.figure]]
+name = "rows_exact"
+statement = "spans_lookup_norange"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "rows_match_unfolded"
+statement = "spans_lookup_norange"
+state = "folded_leaves"
+metric = "cold.rows_match_state.unfolded"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "parts_covered"
+statement = "spans_lookup_norange"
+state = "folded_leaves"
+metric = "cold.max.parts_covered"
+lane = "counter"
+target_if = "v == m['row_01.covering_parts']"
+
+[[row]]
+key = "row_02"
+adr_row = 2
+check = "spans lookup, 1 h window, cold, folded with leaves"
+target = "leaf GETs = 2 x covering parts (1 or 2); data GETs as row 1; wire under 300 KB; median under 1 s"
+miss = "over 1 s, over 1 MB"
+source = "predicted; T12 measured 2.70 MB and 0.73 s, #2763 comment 6276877460"
+requires_tenant = "inv"
+requires_states = ["folded_leaves"]
+
+[[row.figure]]
+name = "covering_parts"
+statement = "stamp"
+state = "folded_leaves"
+metric = "stamp.covering_parts.spans"
+lane = "counter"
+target_if = "v in (1, 2)"
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "spans_lookup_1h"
+state = "folded_leaves"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+target_if = "v == 2 * m['row_02.covering_parts']"
+
+[[row.figure]]
+name = "data_gets"
+statement = "spans_lookup_1h"
+state = "folded_leaves"
+metric = "cold.max.data_gets"
+lane = "counter"
+target_if = "v <= 8"
+
+[[row.figure]]
+name = "wire_bytes"
+statement = "spans_lookup_1h"
+state = "folded_leaves"
+metric = "cold.max.wire_bytes"
+lane = "counter"
+target_if = "v < 300_000"
+miss_if = "v > 1_000_000"
+
+[[row.figure]]
+name = "wall_p50_s"
+statement = "spans_lookup_1h"
+state = "folded_leaves"
+metric = "cold.wall_p50_s"
+lane = "timing"
+target_if = "v < 1.0"
+miss_if = "v > 1.0"
+
+[[row]]
+key = "row_03"
+adr_row = 3
+check = "spans lookup, 1 h window, cold, unfolded tail only"
+target = "per candidate object the key is absent from: 3 GETs (footer at most 8 KiB in `probe`, prefix and one bucket in `keyIndex`) and at most 16 KB, no SKIP_IDX read; per holder: those plus SKIP_IDX and its block runs; `probe` wire at most 8,192 B per absent object; the count of objects SKIP_IDX dropped after a present key is reported; rows exact"
+miss = "over 3 GETs on an absent object, `probe` over 16 KiB per object (the old 64 KiB read), or any `keyIndex` GET on an object whose footer names no KEY_IDX"
+source = "predicted; T12 measured 65,536 B per object, #2763 comment 6276877460; restates the T12 acceptance amendment's spans rows"
+requires_tenant = "inv"
+requires_states = ["unfolded"]
+
+[[row.figure]]
+name = "absent_object_gets"
+statement = "spans_lookup_1h"
+state = "unfolded"
+metric = "cold.max.per_object.absent_object_gets"
+lane = "counter"
+target_if = "v <= 3"
+
+# Probe wire over the candidate objects: the unfolded spans data objects whose
+# event range (stamps/unfolded.spans.ranges.json) overlaps the call's window,
+# counted from the stamps, never from the call. A perObject breakdown must list
+# that many entries. The GET count is not the denominator: an object probed in
+# two GETs would halve the figure. It does not split absent
+# objects from holders (that needs the per-object breakdown); a holder's
+# probe is the same footer read.
+[[row.figure]]
+name = "probe_wire_per_object"
+statement = "spans_lookup_1h"
+state = "unfolded"
+metric = "cold.max.probe_wire_per_object"
+lane = "counter"
+target_if = "v <= 8192"
+miss_if = "v > 16384"
+
+[[row.figure]]
+name = "keyindex_gets_without_kidx"
+statement = "spans_lookup_1h"
+state = "unfolded"
+metric = "cold.max.per_object.keyindex_gets_without_kidx"
+lane = "counter"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "skip_idx_dropped_reported"
+statement = "spans_lookup_1h"
+state = "unfolded"
+metric = "cold.max.skip_idx_dropped"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "rows_exact"
+statement = "spans_lookup_1h"
+state = "unfolded"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row]]
+key = "row_04"
+adr_row = 4
+check = "spans lookup, warm (second run), folded with leaves"
+target = "0 data GETs, 0 leaf GETs, 1 resolve GET"
+miss = "any data or leaf GET"
+source = "predicted; T12 measured 0 data GETs, #2763 comment 6276877460"
+requires_tenant = "inv"
+requires_states = ["folded_leaves"]
+
+[[row.figure]]
+name = "data_gets"
+statement = "spans_lookup_1h"
+state = "folded_leaves"
+metric = "warm.max.data_gets"
+lane = "counter"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "spans_lookup_1h"
+state = "folded_leaves"
+metric = "warm.max.leaf_gets"
+lane = "counter"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "resolve_gets"
+statement = "spans_lookup_1h"
+state = "folded_leaves"
+metric = "warm.max.resolve_gets"
+lane = "counter"
+target_if = "v == 1"
+
+[[row]]
+key = "row_05"
+adr_row = 5
+check = "q20, cold, folded with leaves (398 `hits` objects)"
+target = "leaf GETs = 2 x covering parts; objects opened = holders (1); total GETs under 40; wire under 20 MB; under 1 s; 4 rows"
+miss = "over 100 GETs or over 100 MB"
+source = "predicted; ADR-2707's band, unreachable until the leaf is read; T12 measured 1,013 GETs and 907 MB, #2763 comment 6276877460"
+requires_tenant = "hits"
+requires_states = ["folded_leaves", "unfolded"]
+
+[[row.figure]]
+name = "covering_parts"
+statement = "stamp"
+state = "folded_leaves"
+metric = "stamp.covering_parts.hits"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "q20_hits"
+state = "folded_leaves"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+target_if = "v == 2 * m['row_05.covering_parts']"
+
+[[row.figure]]
+name = "parts_covered"
+statement = "q20_hits"
+state = "folded_leaves"
+metric = "cold.max.parts_covered"
+lane = "counter"
+target_if = "v == m['row_05.covering_parts']"
+
+# segmentsOpened: a 0 beside scan GETs is reported dead_counter.
+[[row.figure]]
+name = "objects_opened"
+statement = "q20_hits"
+state = "folded_leaves"
+metric = "cold.max.segments_opened"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "total_gets"
+statement = "q20_hits"
+state = "folded_leaves"
+metric = "cold.max.total_gets"
+lane = "counter"
+target_if = "v < 40"
+miss_if = "v > 100"
+
+[[row.figure]]
+name = "wire_bytes"
+statement = "q20_hits"
+state = "folded_leaves"
+metric = "cold.max.wire_bytes"
+lane = "counter"
+target_if = "v < 20_000_000"
+miss_if = "v > 100_000_000"
+
+[[row.figure]]
+name = "wall_p50_s"
+statement = "q20_hits"
+state = "folded_leaves"
+metric = "cold.wall_p50_s"
+lane = "timing"
+target_if = "v < 1.0"
+
+# Row 13's rule: the oracle is the unfolded run's own answer.
+[[row.figure]]
+name = "rows_exact"
+statement = "q20_hits"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "rows_match_unfolded"
+statement = "q20_hits"
+state = "folded_leaves"
+metric = "cold.rows_match_state.unfolded"
+lane = "counter"
+target_if = "v == 1"
+
+# The ADR's "4 rows", kept as the pre-registered prediction and reported
+# apart from the oracle comparison above.
+[[row.figure]]
+name = "rows_predicted"
+statement = "q20_hits"
+state = "folded_leaves"
+metric = "cold.max.rows"
+lane = "counter"
+target_if = "v == 4"
+
+[[row]]
+key = "row_06"
+adr_row = 6
+check = "q20, cold, unfolded, post-#3117"
+target = "every object above 512 KiB probed: `keyIndex` GETs = prefix + bucket per probed object (2 x 398 minus empty buckets); objects read past the probe = holders (1); scan wire under 20 MB; 4 rows"
+miss = "any object above 512 KiB read whole for an absent key; over 100 GETs beyond the probe; over 100 MB"
+source = "predicted from the #3117 amendment, docs/adrs/2707-exact-key-index-for-spans-and-logs.md:1229; T12 measured 81 survivors and 823 MB before the fix, #2763 comment 6276877460"
+requires_tenant = "hits"
+requires_states = ["unfolded"]
+
+# The 398 of the row's text, pre-registered as a census band of its own.
+[[row.figure]]
+name = "hits_objects"
+statement = "stamp"
+state = "unfolded"
+metric = "census.hits.logs.objects"
+lane = "counter"
+target_if = "v == 398"
+
+# Every object above 512 KiB is probed, so each costs at least one keyIndex
+# GET: the census count of those objects is the floor.
+[[row.figure]]
+name = "hits_objects_over_512k"
+statement = "stamp"
+state = "unfolded"
+metric = "census.hits.logs.objects_over_512k"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "keyindex_gets"
+statement = "q20_hits"
+state = "unfolded"
+metric = "cold.max.keyindex_gets"
+lane = "counter"
+target_if = "m['row_06.hits_objects_over_512k'] <= v <= 2 * m['row_06.hits_objects']"
+miss_if = "v < m['row_06.hits_objects_over_512k']"
+miss_reason = "fewer keyIndex GETs than objects above 512 KiB: one was read without its probe"
+
+# Objects read past the probe are the probed objects the key index did not
+# prune: the plan phase's segmentsOpened less pruning.segmentsPrunedByKeyIndex.
+# The logs keyed plan counts every object whose KEY_IDX footer it probed as
+# opened in the plan phase, absent key or not (log_fetcher.rs,
+# plan_segment_keyed and probe_segment_keyed). The scan phase's segmentsOpened
+# is not this figure: the plan does not probe an object at or under 512 KiB,
+# so the scan can open objects no probe saw. Box C's q20: 523 objects, 26
+# pruned by stats, 4 at or under 512 KiB, 493 probed, 492 of those pruned by
+# the key index, so 1 here and 5 survivors in all; the scan opened 4 of the 5,
+# and the stats do not name which.
+#
+# The figure is judged only when the plan opened exactly the probed objects:
+# plan segmentsOpened == census objects_over_512k - pruning.segmentsPrunedByStats
+# (box C: 519 - 26 = 493). The plan keeps objects at or under 512 KiB out
+# only when it skips sub-bound plans (plan.rs, skips_sub_bound_plans);
+# otherwise it opens them unprobed and they would count as survivors. When
+# the equality fails, or the census carries no objects_over_512k for the
+# statement's tenant and signal, the figure reads incomplete with the
+# precondition as its reason, never a hold or a miss. A small object pruned by stats also breaks
+# the equality (it is in segmentsPrunedByStats but not in objects_over_512k),
+# which reads incomplete too: the safe direction.
+[[row.figure]]
+name = "objects_past_probe"
+statement = "q20_hits"
+state = "unfolded"
+metric = "cold.max.probe_survivors"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "gets_beyond_probe"
+statement = "q20_hits"
+state = "unfolded"
+metric = "cold.max.scan_gets"
+lane = "counter"
+miss_if = "v > 100"
+
+[[row.figure]]
+name = "scan_wire_bytes"
+statement = "q20_hits"
+state = "unfolded"
+metric = "cold.max.scan_wire_bytes"
+lane = "counter"
+target_if = "v < 20_000_000"
+miss_if = "v > 100_000_000"
+
+[[row.figure]]
+name = "whole_reads_absent_key"
+statement = "q20_hits"
+state = "unfolded"
+metric = "cold.max.per_object.whole_reads_over_512k_absent"
+lane = "counter"
+target_if = "v == 0"
+
+# In the unfolded state q20's answer is the reference the other states are
+# judged against: rows_exact reads 1 there by definition.
+[[row.figure]]
+name = "rows_exact"
+statement = "q20_hits"
+state = "unfolded"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row]]
+key = "row_07"
+adr_row = 7
+check = "fold with the switch on, advancing fold over an unchanged tail plus one new hour"
+target = "section GETs = 2 x new entries (plus one per entry whose footer exceeds 8 KiB) plus one GET per previous leaf; `key_index_build_passes` 1 (`G` and a pass factor on the section GETs: the pass-end slice amendment); peak fold RSS under 1.5 GB at the T12 spans corpus (20 M distinct keys, budget 8 M pairs, so 3 passes on the from-scratch build of the sealed part and the report says 3)"
+miss = "section GETs over 2 x tail entries (a from-scratch rebuild), passes other than `ceil(pairs / budget)` (the #3704 amendment replaces this miss and the section GETs target), RSS over 2 GB"
+source = "predicted; the from-scratch cost is the leaf build switch amendment's `2T`, measured by T12 as 1,656 = 2 x 828 on spans and 796 = 2 x 398 on logs, #2763 comment 6276877460"
+requires_tenant = "inv"
+# fold_advance is the fold the mixed state runs after its statements. New
+# entries, previous leaves and the footer length come from the inspect
+# stamps before (mixed) and after (fold_advance) that fold. The footer term
+# reads the inspector's footer length of one census object as every new
+# entry's; the miss reads "over" as at least, since a from-scratch rebuild
+# is exactly 2 x tail entries.
+#
+# The section GETs are judged per build pass, the #3704 amendment's form as
+# the pass-end slice amendment restates it: a build of G passes re-reads its
+# new and still-uncovered entries' sections on every pass, so the target is
+# 2 x (new + uncovered) x passes ranged GETs (plus one per such entry and
+# pass whose footer exceeds 8 KiB), with the previous leaves read once per
+# fold as key_index_leaf_gets, a fold report field of its own, equal to the
+# previous leaves; the miss is 2 x tail entries per pass, 2 x tail x passes.
+# A total compared with 2 x tail entries cannot tell a rebuild from extra
+# passes: box D's logs advance read 22 new entries per pass over 27 passes,
+# 1,188 ranged GETs, over 2 x 570 = 1,140 and still no rebuild. The second
+# signal is the fold's own section count per pass, key_index_sections_read
+# over key_index_build_passes, which a rebuild puts at the tail's entry
+# count and an incremental advance at new + uncovered. Uncovered is the fold
+# report's key_index_uncovered_entries, the entries no leaf covers after the
+# fold summed over fields: each was read on every pass, and an entry
+# uncovered for two fields counts twice, which can only widen the target.
+# The report carries no per-field count, so the row cannot judge per field.
+# The sum is safe against a rebuild: neither miss line reads it, and a figure
+# whose miss holds is a miss whatever its target says.
+#
+# The target's passes are G, the pass-end slice amendment's greedy
+# partition, bounded (evaluate.py g_bounds) from the fold report's
+# key_index_pair_budget and key_index_field_pairs, each indexed field's total
+# pairs with zero-pair fields included (evaluate.py G_INPUTS): with share
+# s = max(1, budget // F), a field of P pairs takes between ceil(P / s) and
+# 2 x ceil(P / s) - 1 groups, at least 1, and the build's passes hold between
+# the largest low and the largest high bound over fields, missing outside.
+# Per-field key8 runs would give G exactly but would make the fold hold every
+# run in memory, which the pair budget exists to prevent. No fold report
+# carries the inputs yet (issue #3948 adds them), so build_passes_low and
+# build_passes_high read not-computable naming the missing inputs,
+# build_passes, judged against them, reads not-computable too, and each
+# leaves the run incomplete: row 7 cannot hold until the fold report carries
+# G's inputs. build_passes has no miss_if: a rebuild whose passes fall
+# between the bounds reads as within range there, and the per-pass section
+# figures (section_gets, sections_per_pass) are what catch a rebuild. The
+# passes still enter the section GETs and section reads per pass as the
+# build reports them.
+requires_states = ["mixed"]
+
+[[row.figure]]
+name = "spans_mixed_entries"
+statement = "stamp"
+state = "mixed"
+metric = "stamp.entries.spans"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "spans_tail_entries"
+statement = "stamp"
+state = "fold_advance"
+metric = "stamp.entries.spans"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "spans_new_entries"
+statement = "derived"
+state = "fold_advance"
+metric = "derived"
+expr = "m['row_07.spans_tail_entries'] - m['row_07.spans_mixed_entries']"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "spans_previous_leaves"
+statement = "stamp"
+state = "mixed"
+metric = "stamp.leaves.spans"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "spans_footer_len"
+statement = "stamp"
+state = "fold_advance"
+metric = "stamp.footer_len.spans"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "spans_uncovered_entries"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_uncovered_entries"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "spans_section_gets"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_ranged_gets"
+lane = "counter"
+target_if = "v <= (2 * (m['row_07.spans_new_entries'] + m['row_07.spans_uncovered_entries']) + ((m['row_07.spans_new_entries'] + m['row_07.spans_uncovered_entries']) if m['row_07.spans_footer_len'] > 8192 else 0)) * m['row_07.spans_build_passes']"
+miss_if = "v >= 2 * m['row_07.spans_tail_entries'] * m['row_07.spans_build_passes']"
+miss_reason = "from-scratch rebuild: section GETs = 2 x entry_count per pass"
+
+[[row.figure]]
+name = "spans_leaf_gets"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_leaf_gets"
+lane = "counter"
+target_if = "v == m['row_07.spans_previous_leaves']"
+
+[[row.figure]]
+name = "spans_build_passes_low"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_g_low"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "spans_build_passes_high"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_g_high"
+lane = "counter"
+target_if = "v >= m['row_07.spans_build_passes_low']"
+
+[[row.figure]]
+name = "spans_build_passes"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_build_passes"
+lane = "counter"
+target_if = "m['row_07.spans_build_passes_low'] <= v <= m['row_07.spans_build_passes_high']"
+
+[[row.figure]]
+name = "spans_sections_read"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_sections_read"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "spans_sections_per_pass"
+statement = "derived"
+state = "fold_advance"
+metric = "derived"
+expr = "m['row_07.spans_sections_read'] / max(m['row_07.spans_build_passes'], 1)"
+lane = "counter"
+target_if = "v <= m['row_07.spans_new_entries'] + m['row_07.spans_uncovered_entries']"
+miss_if = "v >= m['row_07.spans_tail_entries']"
+miss_reason = "from-scratch rebuild: every tail entry's section read on a pass"
+
+[[row.figure]]
+name = "spans_peak_rss_bytes"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.peak_rss_bytes"
+lane = "counter"
+target_if = "v < 1_500_000_000"
+miss_if = "v > 2_000_000_000"
+
+[[row.figure]]
+name = "logs_mixed_entries"
+statement = "stamp"
+state = "mixed"
+metric = "stamp.entries.logs"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "logs_tail_entries"
+statement = "stamp"
+state = "fold_advance"
+metric = "stamp.entries.logs"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "logs_new_entries"
+statement = "derived"
+state = "fold_advance"
+metric = "derived"
+expr = "m['row_07.logs_tail_entries'] - m['row_07.logs_mixed_entries']"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "logs_previous_leaves"
+statement = "stamp"
+state = "mixed"
+metric = "stamp.leaves.logs"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "logs_footer_len"
+statement = "stamp"
+state = "fold_advance"
+metric = "stamp.footer_len.logs"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "logs_uncovered_entries"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_uncovered_entries"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "logs_section_gets"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_ranged_gets"
+lane = "counter"
+target_if = "v <= (2 * (m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']) + ((m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']) if m['row_07.logs_footer_len'] > 8192 else 0)) * m['row_07.logs_build_passes']"
+miss_if = "v >= 2 * m['row_07.logs_tail_entries'] * m['row_07.logs_build_passes']"
+miss_reason = "from-scratch rebuild: section GETs = 2 x entry_count per pass"
+
+[[row.figure]]
+name = "logs_leaf_gets"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_leaf_gets"
+lane = "counter"
+target_if = "v == m['row_07.logs_previous_leaves']"
+
+[[row.figure]]
+name = "logs_build_passes_low"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_g_low"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "logs_build_passes_high"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_g_high"
+lane = "counter"
+target_if = "v >= m['row_07.logs_build_passes_low']"
+
+[[row.figure]]
+name = "logs_build_passes"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_build_passes"
+lane = "counter"
+target_if = "m['row_07.logs_build_passes_low'] <= v <= m['row_07.logs_build_passes_high']"
+
+[[row.figure]]
+name = "logs_sections_read"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_sections_read"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "logs_sections_per_pass"
+statement = "derived"
+state = "fold_advance"
+metric = "derived"
+expr = "m['row_07.logs_sections_read'] / max(m['row_07.logs_build_passes'], 1)"
+lane = "counter"
+target_if = "v <= m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']"
+miss_if = "v >= m['row_07.logs_tail_entries']"
+miss_reason = "from-scratch rebuild: every tail entry's section read on a pass"
+
+[[row.figure]]
+name = "logs_peak_rss_bytes"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.peak_rss_bytes"
+lane = "counter"
+target_if = "v < 1_500_000_000"
+miss_if = "v > 2_000_000_000"
+
+[[row]]
+key = "row_08"
+adr_row = 8
+check = "leaf bytes"
+target = "spans at most 6 % and logs at most 2.5 % of part bytes (the logs target sits above the one measurement, 2.06 %), slices x 194 B of HEAD per (part, field)"
+miss = "over 2x either"
+source = "predicted; T12 measured 4.40 % and 2.06 %, 194 B and 192 B, #2763 comment 6276877460"
+requires_tenant = "inv"
+requires_states = ["folded_leaves"]
+
+# Leaf bytes of one field over the signal's data bytes in the census, from
+# the folded_leaves catalog stamp. The ADR band was measured on a
+# repeated-key column (hits UserID); request_id has one key per row.
+[[row.figure]]
+name = "spans_trace_id_leaf_pct"
+statement = "stamp"
+state = "folded_leaves"
+metric = "leaf_share.spans.trace_id"
+lane = "counter"
+target_if = "v <= 6.0"
+miss_if = "v > 12.0"
+
+[[row.figure]]
+name = "logs_trace_id_leaf_pct"
+statement = "stamp"
+state = "folded_leaves"
+metric = "leaf_share.logs.trace_id"
+lane = "counter"
+target_if = "v <= 2.5"
+miss_if = "v > 5.0"
+
+[[row.figure]]
+name = "logs_request_id_leaf_pct"
+statement = "stamp"
+state = "folded_leaves"
+metric = "leaf_share.logs.request_id"
+lane = "counter"
+target_if = "v <= 2.5"
+miss_if = "v > 5.0"
+miss_reason = "key cardinality equals the row count"
+
+[[row.figure]]
+name = "head_bytes_per_part_field"
+statement = "fold"
+state = "folded_leaves"
+transition = "leaf_rebuild"
+metric = "fold.inv.spans.head_bytes_per_part_field"
+lane = "counter"
+target_if = "v <= 194 * 2"
+
+[[row]]
+key = "row_09"
+adr_row = 9
+check = "month-scale lane: spans lookup without a range over 744 hour-ranged parts (`--ingest-hour-stride 1`, a month)"
+target = "resolve: 1 part GET per covering part; leaf GETs = 2 x 744 = 1,488; 0 tier-1 GETs on covered objects; `partsBeyondCeiling` 0; `keyIndex` decompressed bytes per part at most `8 x sqrt(body)` as ADR-2707's row states; rows exact"
+miss = "more than 2 leaf GETs per part, any leaf GET outside `keyIndex`, any tier-1 GET on a covered object"
+source = "predicted; the ADR-2707 month-scale row, docs/adrs/2707-exact-key-index-for-spans-and-logs.md:877, unmeasured there"
+requires_tenant = "inv"
+# The s3 lane runs many_parts_744; the local lane runs the same flow at 24
+# hours (many_parts_24). Each figure names its own state. The resolve bound
+# is one part GET per covering part plus the HEAD and the tenant's config
+# and declared-column reads.
+
+[[row.figure]]
+name = "covering_parts"
+statement = "stamp"
+state = "many_parts_744"
+metric = "stamp.covering_parts.spans"
+lane = "counter"
+target_if = "v == 744"
+
+[[row.figure]]
+name = "resolve_gets"
+statement = "spans_lookup_norange"
+state = "many_parts_744"
+metric = "cold.max.resolve_gets"
+lane = "counter"
+target_if = "v <= m['row_09.covering_parts'] + 3"
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "spans_lookup_norange"
+state = "many_parts_744"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+target_if = "v == 2 * m['row_09.covering_parts']"
+
+[[row.figure]]
+name = "parts_beyond_ceiling"
+statement = "spans_lookup_norange"
+state = "many_parts_744"
+metric = "cold.max.parts_beyond_ceiling"
+lane = "counter"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "rows_exact"
+statement = "spans_lookup_norange"
+state = "many_parts_744"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "covering_parts_24"
+statement = "stamp"
+state = "many_parts_24"
+metric = "stamp.covering_parts.spans"
+lane = "counter"
+target_if = "v == 24"
+
+[[row.figure]]
+name = "resolve_gets_24"
+statement = "spans_lookup_norange"
+state = "many_parts_24"
+metric = "cold.max.resolve_gets"
+lane = "counter"
+target_if = "v <= m['row_09.covering_parts_24'] + 3"
+
+[[row.figure]]
+name = "leaf_gets_24"
+statement = "spans_lookup_norange"
+state = "many_parts_24"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+target_if = "v == 2 * m['row_09.covering_parts_24']"
+
+[[row.figure]]
+name = "rows_exact_24"
+statement = "spans_lookup_norange"
+state = "many_parts_24"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row]]
+key = "row_10"
+adr_row = 10
+check = "past `P_max` lane: 2,160 hour-ranged parts"
+target = "leaf GETs = 2 x 1,024 = 2,048 exactly; `partsBeyondCeiling` 1,136, the 1,136 smallest parts by entry count; those parts' objects probed at tier 1 (3 GETs, under 16 KB each, in `probe` and `keyIndex`), 0 leaf GETs for them; rows exact"
+miss = "any leaf GET for a part beyond the ceiling, more than 2,048 leaf GETs, a beyond-ceiling object read whole for an absent key"
+source = "predicted; restates the ADR-2707 `P_max` row (scan remainder) per decision 2's amendment, docs/adrs/2707-exact-key-index-for-spans-and-logs.md:878"
+requires_tenant = "inv"
+requires_states = ["many_parts_2160"]
+
+[[row.figure]]
+name = "covering_parts"
+statement = "stamp"
+state = "many_parts_2160"
+metric = "stamp.covering_parts.spans"
+lane = "counter"
+target_if = "v == 2160"
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "spans_lookup_norange"
+state = "many_parts_2160"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+target_if = "v == 2048"
+
+[[row.figure]]
+name = "parts_beyond_ceiling"
+statement = "spans_lookup_norange"
+state = "many_parts_2160"
+metric = "cold.max.parts_beyond_ceiling"
+lane = "counter"
+target_if = "v == 1136"
+
+[[row.figure]]
+name = "rows_exact"
+statement = "spans_lookup_norange"
+state = "many_parts_2160"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row]]
+key = "row_11"
+adr_row = 11
+check = "`IN` lists of 1, 10, 100 and 1,000 keys, folded with leaves, logs and spans"
+target = "rows equal the union of the per-key equality answers (the oracle), every list size, both tables; per covered part leaf GETs at most `1 + min(distinct buckets, 64)` (per (part, slice) under the Stage 1 amendment); `keysProbed` equals the list size; the 1,000-key list on a 13-bit leaf (8,192 buckets) is read as at most 64 bridged ranged GETs whose bytes are at most `entry_count x 11 KiB` for the part, else the part is `Uncovered` with no further leaf read, and the report says which"
+miss = "any row difference; over 65 leaf GETs on one part; leaf bytes over `entry_count x 11 KiB` on one part; a 1,001-key list served by the index (the control is a 1,025-key list, and the 65 is per slice, under the Stage 1 amendment)"
+source = "predicted; k and `B_run` are decision 6's constants, confirmed or changed by the Stage 1 amendment"
+requires_tenant = "inv"
+requires_states = ["folded_leaves"]
+
+[[row.figure]]
+name = "spans_1_rows_exact"
+statement = "spans_in_1"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "spans_10_rows_exact"
+statement = "spans_in_10"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "spans_100_rows_exact"
+statement = "spans_in_100"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "spans_1000_rows_exact"
+statement = "spans_in_1000"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "logs_trace_1_rows_exact"
+statement = "logs_trace_in_1"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "logs_trace_10_rows_exact"
+statement = "logs_trace_in_10"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "logs_trace_100_rows_exact"
+statement = "logs_trace_in_100"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "logs_trace_1000_rows_exact"
+statement = "logs_trace_in_1000"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "logs_1_rows_exact"
+statement = "logs_request_in_1"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "logs_10_rows_exact"
+statement = "logs_request_in_10"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "logs_100_rows_exact"
+statement = "logs_request_in_100"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "logs_1000_rows_exact"
+statement = "logs_request_in_1000"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "spans_1_keys_probed"
+statement = "spans_in_1"
+state = "folded_leaves"
+metric = "cold.max.keys_probed"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "spans_10_keys_probed"
+statement = "spans_in_10"
+state = "folded_leaves"
+metric = "cold.max.keys_probed"
+lane = "counter"
+target_if = "v == 10"
+
+[[row.figure]]
+name = "spans_100_keys_probed"
+statement = "spans_in_100"
+state = "folded_leaves"
+metric = "cold.max.keys_probed"
+lane = "counter"
+target_if = "v == 100"
+
+[[row.figure]]
+name = "spans_1000_keys_probed"
+statement = "spans_in_1000"
+state = "folded_leaves"
+metric = "cold.max.keys_probed"
+lane = "counter"
+target_if = "v == 1000"
+
+[[row.figure]]
+name = "logs_trace_1_keys_probed"
+statement = "logs_trace_in_1"
+state = "folded_leaves"
+metric = "cold.max.keys_probed"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "logs_trace_10_keys_probed"
+statement = "logs_trace_in_10"
+state = "folded_leaves"
+metric = "cold.max.keys_probed"
+lane = "counter"
+target_if = "v == 10"
+
+[[row.figure]]
+name = "logs_trace_100_keys_probed"
+statement = "logs_trace_in_100"
+state = "folded_leaves"
+metric = "cold.max.keys_probed"
+lane = "counter"
+target_if = "v == 100"
+
+[[row.figure]]
+name = "logs_trace_1000_keys_probed"
+statement = "logs_trace_in_1000"
+state = "folded_leaves"
+metric = "cold.max.keys_probed"
+lane = "counter"
+target_if = "v == 1000"
+
+[[row.figure]]
+name = "logs_1_keys_probed"
+statement = "logs_request_in_1"
+state = "folded_leaves"
+metric = "cold.max.keys_probed"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "logs_10_keys_probed"
+statement = "logs_request_in_10"
+state = "folded_leaves"
+metric = "cold.max.keys_probed"
+lane = "counter"
+target_if = "v == 10"
+
+[[row.figure]]
+name = "logs_100_keys_probed"
+statement = "logs_request_in_100"
+state = "folded_leaves"
+metric = "cold.max.keys_probed"
+lane = "counter"
+target_if = "v == 100"
+
+[[row.figure]]
+name = "logs_1000_keys_probed"
+statement = "logs_request_in_1000"
+state = "folded_leaves"
+metric = "cold.max.keys_probed"
+lane = "counter"
+target_if = "v == 1000"
+
+# The per-part bounds take their distinct-bucket and entry counts from the
+# folded_leaves leaf and catalog stamps.
+[[row.figure]]
+name = "spans_buckets"
+statement = "stamp"
+state = "folded_leaves"
+metric = "stamp.buckets.spans"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "spans_part_entries"
+statement = "stamp"
+state = "folded_leaves"
+metric = "stamp.part_entries.spans"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "logs_buckets"
+statement = "stamp"
+state = "folded_leaves"
+metric = "stamp.buckets.logs"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "logs_part_entries"
+statement = "stamp"
+state = "folded_leaves"
+metric = "stamp.part_entries.logs"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "spans_1000_leaf_gets_per_part"
+statement = "spans_in_1000"
+state = "folded_leaves"
+metric = "cold.max.per_part.leaf_gets"
+lane = "counter"
+target_if = "v <= 1 + min(m['row_11.spans_buckets'], 64)"
+miss_if = "v > 65"
+
+[[row.figure]]
+name = "spans_1000_leaf_bytes_per_part"
+statement = "spans_in_1000"
+state = "folded_leaves"
+metric = "cold.max.per_part.leaf_bytes"
+lane = "counter"
+target_if = "v <= m['row_11.spans_part_entries'] * 11 * 1024"
+
+[[row.figure]]
+name = "logs_trace_1000_leaf_gets_per_part"
+statement = "logs_trace_in_1000"
+state = "folded_leaves"
+metric = "cold.max.per_part.leaf_gets"
+lane = "counter"
+target_if = "v <= 1 + min(m['row_11.logs_buckets'], 64)"
+miss_if = "v > 65"
+
+[[row.figure]]
+name = "logs_trace_1000_leaf_bytes_per_part"
+statement = "logs_trace_in_1000"
+state = "folded_leaves"
+metric = "cold.max.per_part.leaf_bytes"
+lane = "counter"
+target_if = "v <= m['row_11.logs_part_entries'] * 11 * 1024"
+
+[[row.figure]]
+name = "logs_1000_leaf_gets_per_part"
+statement = "logs_request_in_1000"
+state = "folded_leaves"
+metric = "cold.max.per_part.leaf_gets"
+lane = "counter"
+target_if = "v <= 1 + min(m['row_11.logs_buckets'], 64)"
+miss_if = "v > 65"
+
+[[row.figure]]
+name = "logs_1000_leaf_bytes_per_part"
+statement = "logs_request_in_1000"
+state = "folded_leaves"
+metric = "cold.max.per_part.leaf_bytes"
+lane = "counter"
+target_if = "v <= m['row_11.logs_part_entries'] * 11 * 1024"
+
+# The over-cap controls, one per table and key kind (evaluate.py
+# control_1025): 1,025 keys, one over decision 6's k = 1,024 (the Stage 1
+# amendment). The guard admits the list (a flat list costs one unit plus one
+# per 64 literals, up to 4,096 literals) and the planner carries no key set
+# past 1,024 keys, so a correct build answers it with a scan: keysProbed 0,
+# partsCovered 0, 0 leaf GETs (services/ravel-server/tests/sql_key_in.rs,
+# in_list_rows_equal_the_union_of_equalities). The 1,025-key twin is judged
+# first: 0 when one of its cold calls carries a nonzero keyIndex figure, or
+# was served with no keyIndex figure, no probe or scan GET and no block
+# scanned. Then the 1,000-key list: refused-by-guard when the SQL complexity
+# guard refused it, unsupported-on-this-build when it was refused otherwise or
+# carries no keyIndex.keysProbed and partsCovered, 0 when it probed another
+# count or reported partsCovered 0 with no part in an Uncovered outcome, or
+# when the twin was refused while it was admitted, else 1. A part Uncovered
+# by budget (partsCovered 0, skippedByBudget 1, as on box C) still carried
+# the 1,000-key set, so it passes. A build from before ADR-3692's key set amendment refuses
+# both lists (MAX_STATEMENT_COMPLEXITY = 1,000 at one unit per token), so on
+# such a build all three read refused-by-guard (fixtures/local-smoke, pinned
+# by test_control_1025_refused_by_guard_on_main).
+[[row.figure]]
+name = "spans_control_1025"
+statement = "spans_in_1000"
+state = "folded_leaves"
+metric = "cold.control_1025"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "logs_trace_control_1025"
+statement = "logs_trace_in_1000"
+state = "folded_leaves"
+metric = "cold.control_1025"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "logs_request_control_1025"
+statement = "logs_request_in_1000"
+state = "folded_leaves"
+metric = "cold.control_1025"
+lane = "counter"
+target_if = "v == 1"
+
+[[row]]
+key = "row_12"
+adr_row = 12
+check = "scaling: matching rows fixed, irrelevant retained data 10x and 100x (objects and covering parts both grow)"
+target = "folded with leaves: GETs grow by at most 2 per added covering part and wire by at most the added leaf prefixes and buckets; the unfolded control grows per object"
+miss = "GET growth proportional to objects on the folded arm"
+source = "predicted from decision 2"
+requires_tenant = "inv"
+requires_states = ["folded_leaves"]
+requires_scales = [10, 100]
+
+[[row.figure]]
+name = "gets_growth_10x"
+statement = "spans_lookup_1h"
+state = "folded_leaves"
+metric = "scale.10.gets_growth_per_added_part"
+lane = "counter"
+target_if = "v <= 2"
+
+[[row.figure]]
+name = "gets_growth_100x"
+statement = "spans_lookup_1h"
+state = "folded_leaves"
+metric = "scale.100.gets_growth_per_added_part"
+lane = "counter"
+target_if = "v <= 2"
+
+[[row]]
+key = "row_13"
+adr_row = 13
+check = "correctness matrix"
+target = "exact agreement with the oracle on every statement of every state, including mixed sealed plus unsealed, concurrent compaction and an erasure in flight; the five negative controls of decision 9 each fail on their mutant"
+miss = "any disagreement, any control passing on its mutant"
+source = "predicted; the mutants are run and quoted in the report"
+requires_tenant = "inv"
+requires_states = ["unfolded", "folded_no_leaves", "folded_leaves", "mixed"]
+
+[[row.figure]]
+name = "wrong_answers"
+statement = "all"
+state = "all"
+metric = "matrix.wrong_answers"
+lane = "counter"
+target_if = "v == 0"
+
+# Calls that ended in an error (a typed refusal such as HTTP 422, or any
+# other non-ok outcome evaluate.py does not class). Each is also a problem,
+# so the verdict fails on it either way; counting it apart keeps a refusal
+# from reading as a row that disagreed with the oracle.
+[[row.figure]]
+name = "errors"
+statement = "all"
+state = "all"
+metric = "matrix.errors"
+lane = "counter"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "mixed_rows_exact"
+statement = "all"
+state = "mixed"
+metric = "matrix.state_rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+# The in-flight states' oracle is the unfolded answer to the same statement
+# and try.
+[[row.figure]]
+name = "compaction_in_flight_rows_exact"
+statement = "all"
+state = "compaction_in_flight"
+metric = "matrix.state_rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "compaction_done_rows_exact"
+statement = "all"
+state = "compaction_done"
+metric = "matrix.state_rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "erasure_in_flight_rows_exact"
+statement = "all"
+state = "erasure_in_flight"
+metric = "matrix.state_rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "negative_controls_failing_on_mutant"
+statement = "all"
+state = "all"
+metric = "matrix.negative_controls"
+lane = "counter"
+target_if = "v == 5"
+
+[[row]]
+key = "row_14"
+adr_row = 14
+check = "join baseline (ADR-2983 Stage 0): `spans JOIN logs ON trace_id`, build sides of 1, k/10, k and 10k traces, transfer absent"
+target = "per scan: objects and blocks opened, requests and wire bytes per phase, recorded as the Stage 0 figures ADR-2983 defers; no band on this first measurement; both sides' `signals[]` entries present"
+miss = "a scan without its `signals[]` entry, or a figure missing"
+source = "predicted; ADR-2983 Sequencing, docs/adrs/2983-predicate-transfer-across-signal-joins.md:325"
+requires_tenant = "inv"
+requires_states = ["folded_leaves"]
+
+[[row.figure]]
+name = "signals_1"
+statement = "journey_c_1"
+state = "folded_leaves"
+metric = "cold.min.signals_entries"
+lane = "counter"
+target_if = "v >= 2"
+
+[[row.figure]]
+name = "signals_102"
+statement = "journey_c_102"
+state = "folded_leaves"
+metric = "cold.min.signals_entries"
+lane = "counter"
+target_if = "v >= 2"
+
+[[row.figure]]
+name = "signals_1024"
+statement = "journey_c_1024"
+state = "folded_leaves"
+metric = "cold.min.signals_entries"
+lane = "counter"
+target_if = "v >= 2"
+
+[[row.figure]]
+name = "signals_10240"
+statement = "journey_c_10240"
+state = "folded_leaves"
+metric = "cold.min.signals_entries"
+lane = "counter"
+target_if = "v >= 2"
+
+[[row.figure]]
+name = "gets_1"
+statement = "journey_c_1"
+state = "folded_leaves"
+metric = "cold.max.total_gets"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "wire_1"
+statement = "journey_c_1"
+state = "folded_leaves"
+metric = "cold.max.wire_bytes"
+lane = "counter"
+target_if = "v >= 0"
+
+# A join that scans opens at least one object; segmentsOpened 0 beside scan
+# GETs is reported dead_counter.
+[[row.figure]]
+name = "objects_opened_1"
+statement = "journey_c_1"
+state = "folded_leaves"
+metric = "cold.max.segments_opened"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "blocks_scanned_1"
+statement = "journey_c_1"
+state = "folded_leaves"
+metric = "cold.max.blocks_scanned"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "gets_10240"
+statement = "journey_c_10240"
+state = "folded_leaves"
+metric = "cold.max.total_gets"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "wire_10240"
+statement = "journey_c_10240"
+state = "folded_leaves"
+metric = "cold.max.wire_bytes"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "objects_opened_10240"
+statement = "journey_c_10240"
+state = "folded_leaves"
+metric = "cold.max.segments_opened"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row]]
+key = "row_15"
+adr_row = 15
+check = "the journey: failing traces of one service in 1 h (about 50), their logs by `trace_id IN`, their rows"
+target = "total GETs at most resolve + 2 x covering parts on spans for the cell's traces + `1 + min(distinct buckets, 64)` per covering part on logs for the 50-key list (about 51 on a 13-bit leaf) + 50 x (footer + SKIP_IDX + block runs) on spans + the logs holders' block reads; under 5 s cold end to end; rows exact"
+miss = "over 20 s, or any whole-object read of a non-holder"
+source = "predicted from decisions 2 to 6"
+requires_tenant = "inv"
+requires_states = ["folded_leaves"]
+# The three steps: failing_cell (the cell's failing traces), journey_b (their
+# logs by trace_id IN) and spans_lookup_1h (one trace's rows). End to end is
+# the sum of the three steps' cold p50. The GET budget transcribes the
+# target's terms: each step's resolve GETs; 2 x the spans covering parts;
+# (1 + min(traces, 64)) x the logs covering parts, the trace count bounding
+# the distinct buckets; 3 GETs (footer, SKIP_IDX, one block run) per trace on
+# spans; and the logs holders' block reads from truth.json: the cell's
+# traces (the holders) x the logs rows planted per trace, each row at most
+# one block read. journey_b's own blocks_scanned is reported beside it and
+# is not part of the budget, which a measured figure cannot set.
+
+[[row.figure]]
+name = "cell_rows_exact"
+statement = "failing_cell"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "logs_rows_exact"
+statement = "journey_b"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "lookup_rows_exact"
+statement = "spans_lookup_1h"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "cell_wall_p50_s"
+statement = "failing_cell"
+state = "folded_leaves"
+metric = "cold.wall_p50_s"
+lane = "timing"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "logs_wall_p50_s"
+statement = "journey_b"
+state = "folded_leaves"
+metric = "cold.wall_p50_s"
+lane = "timing"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "lookup_wall_p50_s"
+statement = "spans_lookup_1h"
+state = "folded_leaves"
+metric = "cold.wall_p50_s"
+lane = "timing"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "journey_wall_p50_s"
+statement = "derived"
+state = "folded_leaves"
+metric = "derived"
+expr = "m['row_15.cell_wall_p50_s'] + m['row_15.logs_wall_p50_s'] + m['row_15.lookup_wall_p50_s']"
+lane = "timing"
+target_if = "v < 5.0"
+miss_if = "v > 20.0"
+
+[[row.figure]]
+name = "cell_total_gets"
+statement = "failing_cell"
+state = "folded_leaves"
+metric = "cold.max.total_gets"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "logs_total_gets"
+statement = "journey_b"
+state = "folded_leaves"
+metric = "cold.max.total_gets"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "lookup_total_gets"
+statement = "spans_lookup_1h"
+state = "folded_leaves"
+metric = "cold.max.total_gets"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "cell_resolve_gets"
+statement = "failing_cell"
+state = "folded_leaves"
+metric = "cold.max.resolve_gets"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "logs_resolve_gets"
+statement = "journey_b"
+state = "folded_leaves"
+metric = "cold.max.resolve_gets"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "lookup_resolve_gets"
+statement = "spans_lookup_1h"
+state = "folded_leaves"
+metric = "cold.max.resolve_gets"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "cell_traces"
+statement = "failing_cell"
+state = "folded_leaves"
+metric = "cold.max.rows"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "spans_covering_parts"
+statement = "stamp"
+state = "folded_leaves"
+metric = "stamp.covering_parts.spans"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "logs_covering_parts"
+statement = "stamp"
+state = "folded_leaves"
+metric = "stamp.covering_parts.logs"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "logs_blocks_scanned"
+statement = "journey_b"
+state = "folded_leaves"
+metric = "cold.max.blocks_scanned"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "truth_holders"
+statement = "truth"
+state = "folded_leaves"
+metric = "truth.failing_cell.count"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "truth_rows_per_holder"
+statement = "truth"
+state = "folded_leaves"
+metric = "truth.generator.logs_per_trace"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "journey_gets_budget"
+statement = "derived"
+state = "folded_leaves"
+metric = "derived"
+expr = "m['row_15.cell_resolve_gets'] + m['row_15.logs_resolve_gets'] + m['row_15.lookup_resolve_gets'] + 2 * m['row_15.spans_covering_parts'] + (1 + min(m['row_15.cell_traces'], 64)) * m['row_15.logs_covering_parts'] + 3 * m['row_15.cell_traces'] + m['row_15.truth_holders'] * m['row_15.truth_rows_per_holder']"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "journey_total_gets"
+statement = "derived"
+state = "folded_leaves"
+metric = "derived"
+expr = "m['row_15.cell_total_gets'] + m['row_15.logs_total_gets'] + m['row_15.lookup_total_gets']"
+lane = "counter"
+target_if = "v <= m['row_15.journey_gets_budget']"
+
+[[row.figure]]
+name = "logs_leaf_gets"
+statement = "journey_b"
+state = "folded_leaves"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+target_if = "v <= (1 + min(m['row_15.cell_traces'], 64)) * m['row_15.logs_covering_parts']"
+
+[[row.figure]]
+name = "non_holder_whole_reads"
+statement = "journey_b"
+state = "folded_leaves"
+metric = "cold.max.per_object.non_holder_whole_reads"
+lane = "counter"
+target_if = "v == 0"
+
+[[row]]
+key = "row_16"
+adr_row = 16
+check = "nonselective control: the 43 ClickBench statements, cold, this build against the build before Wave 1 on one box, paired"
+target = "no statement over 5 % slower outside the lane's noise, and no GET or byte increase on any statement without a key"
+miss = "over 5 % on any statement, or any added request"
+source = "predicted; the ADR-3072 decision 4 contract"
+requires_tenant = "hits"
+requires_states = ["folded_leaves"]
+requires_baseline = true
+
+[[row.figure]]
+name = "max_slowdown_pct"
+statement = "control"
+state = "folded_leaves"
+metric = "control.max_slowdown_pct"
+lane = "timing"
+target_if = "v <= 5.0"
+
+[[row.figure]]
+name = "added_requests"
+statement = "control"
+state = "folded_leaves"
+metric = "control.added_requests"
+lane = "counter"
+target_if = "v == 0"
+
+[[row]]
+key = "row_17"
+adr_row = 17
+check = "cost per successful investigation and break-even"
+target = "the dollar figure per statement of decision 8, folded against unfolded, with the index's amortised maintenance and the break-even lookups per part-month, each named with its price basis and query-frequency assumption"
+miss = "a figure without its basis, or a break-even stated without the frequency it assumes"
+source = "predicted; the formula is decision 8's"
+requires_tenant = "inv"
+requires_states = ["unfolded", "folded_leaves"]
+
+[[row.figure]]
+name = "cost_figures_without_basis"
+statement = "all"
+state = "all"
+metric = "cost.figures_without_basis"
+lane = "counter"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "cost_statements"
+statement = "all"
+state = "all"
+metric = "cost.statement_figures"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "break_even_without_frequency"
+statement = "all"
+state = "all"
+metric = "cost.break_even_without_frequency"
+lane = "counter"
+target_if = "v == 0"
+
+[[row]]
+key = "row_18"
+adr_row = 18
+check = "key-set lookup time: `IN` lists of 10 and 100 keys on logs request_id, logs trace_id and spans trace_id, folded with leaves after one fold advance (`advanced_leaves`), against the same statement unfolded (row 18 amendment)"
+target = "p50 at most the unfolded p50 of the same statement on the same box plus its noise, the larger of 5 % of that p50 and half the unfolded statement's interquartile range over its cold calls, for every field and list size, with no covering part `Uncovered`"
+miss = "over that bound for any field and list size; a cell whose part went `Uncovered` is not measured, not a hold, since its time is the tier-1 probe's"
+source = "predicted; comment 6703881894; box C before #3917: logs request_id at 100 keys 7.64 s against 3.01 s (s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl)"
+requires_tenant = "inv"
+# One cell per (field, list size): the advanced_leaves p50 of the cold calls
+# (cold.leaf_wall_p50_s) against the bound U + max(0.05 x U, 0.5 x IQR), U
+# the unfolded p50 of the same statement and IQR the 75th less the 25th
+# percentile of its unfolded cold wall times, both on this run's box. A
+# cell any of whose cold calls left a covering part Uncovered (partsCovered
+# 0, or partsUncovered, skippedByBudget, partsBeyondCeiling, leavesRejected
+# or reservationsRefused above 0) is not-measured: not a hold, and the run's
+# verdict is at best incomplete. The row is not-run, with the reason, when
+# either state is absent.
+requires_states = ["advanced_leaves", "unfolded"]
+
+[[row.figure]]
+name = "logs_request_id_10_unfolded_p50_s"
+statement = "logs_request_in_10"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_10_unfolded_iqr_s"
+statement = "logs_request_in_10"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_10_p50_s"
+statement = "logs_request_in_10"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.logs_request_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.logs_request_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_10_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.logs_request_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.logs_request_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_10_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "logs_request_id_100_unfolded_p50_s"
+statement = "logs_request_in_100"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_100_unfolded_iqr_s"
+statement = "logs_request_in_100"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_100_p50_s"
+statement = "logs_request_in_100"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.logs_request_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.logs_request_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_100_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.logs_request_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.logs_request_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_100_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "logs_trace_id_10_unfolded_p50_s"
+statement = "logs_trace_in_10"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_10_unfolded_iqr_s"
+statement = "logs_trace_in_10"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_10_p50_s"
+statement = "logs_trace_in_10"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.logs_trace_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.logs_trace_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_10_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.logs_trace_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.logs_trace_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_10_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "logs_trace_id_100_unfolded_p50_s"
+statement = "logs_trace_in_100"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_100_unfolded_iqr_s"
+statement = "logs_trace_in_100"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_100_p50_s"
+statement = "logs_trace_in_100"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.logs_trace_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_100_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.logs_trace_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_100_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "spans_trace_id_10_unfolded_p50_s"
+statement = "spans_in_10"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_10_unfolded_iqr_s"
+statement = "spans_in_10"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_10_p50_s"
+statement = "spans_in_10"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.spans_trace_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.spans_trace_id_10_unfolded_p50_s'], 0.5 * m['row_18.spans_trace_id_10_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.spans_trace_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.spans_trace_id_10_unfolded_p50_s'], 0.5 * m['row_18.spans_trace_id_10_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "spans_trace_id_100_unfolded_p50_s"
+statement = "spans_in_100"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_100_unfolded_iqr_s"
+statement = "spans_in_100"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_100_p50_s"
+statement = "spans_in_100"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.spans_trace_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.spans_trace_id_100_unfolded_p50_s'], 0.5 * m['row_18.spans_trace_id_100_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.spans_trace_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.spans_trace_id_100_unfolded_p50_s'], 0.5 * m['row_18.spans_trace_id_100_unfolded_iqr_s'])"
+
+# The slices per (part, field) the lookups touched, reported beside the
+# row: the most leaves one part of the advanced_leaves catalog stamp
+# carries for each field. The state's own precondition (inv.py
+# advance-check) is that logs request_id carries more than the leaf
+# rebuild wrote, so the figure that compares them repeats it.
+[[row.figure]]
+name = "logs_request_id_slices_rebuild"
+statement = "stamp"
+state = "folded_leaves"
+metric = "stamp.slices.logs.request_id"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "logs_request_id_slices"
+statement = "stamp"
+state = "advanced_leaves"
+metric = "stamp.slices.logs.request_id"
+lane = "counter"
+target_if = "v > m['row_18.logs_request_id_slices_rebuild']"
+
+[[row.figure]]
+name = "logs_trace_id_slices"
+statement = "stamp"
+state = "advanced_leaves"
+metric = "stamp.slices.logs.trace_id"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "spans_trace_id_slices"
+statement = "stamp"
+state = "advanced_leaves"
+metric = "stamp.slices.spans.trace_id"
+lane = "counter"
+target_if = "v >= 1"
+
+# ADR-3939 Acceptance rows A1 to A7 and the added rows W1 to W8 and F1 to F3,
+# transcribed from docs/adrs/3939-key-index-day-seal.md ("Acceptance
+# (pre-registered ...)" and "Acceptance (added rows ...)"), cells verbatim as
+# above. Each carries adr = "ADR-3939" and its ADR row label in adr_row. They
+# run on the multi-day states of the harness-state amendment, day_parts_7,
+# day_parts_30 and retired_hour, which box/run.sh builds (state_day_parts and
+# state_retired_hour) on their own tenants: day_parts_7 and retired_hour on
+# dp7, day_parts_30 on dp30, so their fold metrics read fold.dp7 and
+# fold.dp30. A run.toml without them reports each row not-run, naming the
+# state.
+
+[[row]]
+key = "adr3939_a1"
+adr = "ADR-3939"
+adr_row = "A1"
+check = "A1. advance at a full-day tail, logs, switch on"
+target = "at most 26 build passes, at most 1.4 GB leaf bytes written, fold peak RSS at most 2.0 GB"
+miss = "more than 26 passes, over 1.4 GB, or over 2.0 GB RSS (predicted peak about 1.93 GB). An RSS miss with the passes and bytes in band is not fixed inside this decision: it opens a follow-up on a 6-hour seal span (costed above) or on the held previous-leaf rule"
+source = "predicted; box D rates, comment 6700944105"
+# The advance rows run on a tail loaded through the server after the
+# 7-day state's fold (the harness-state amendment): the fold report of that
+# advance, transition day_parts_7_advance on the day-part tenant. The
+# passes are the report's key_index_build_passes, the bytes its leaf bytes
+# written, the RSS the fold stamp's measured peak.
+requires_tenant = "dp7"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "build_passes"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.dp7.logs.key_index_build_passes"
+lane = "counter"
+target_if = "v <= 26"
+miss_if = "v > 26"
+
+[[row.figure]]
+name = "leaf_bytes"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.dp7.logs.leaf_bytes"
+lane = "counter"
+target_if = "v <= 1_400_000_000"
+miss_if = "v > 1_400_000_000"
+
+[[row.figure]]
+name = "peak_rss_bytes"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.dp7.logs.peak_rss_bytes"
+lane = "counter"
+target_if = "v <= 2_000_000_000"
+miss_if = "v > 2_000_000_000"
+
+[[row]]
+key = "adr3939_a2"
+adr = "ADR-3939"
+adr_row = "A2"
+check = "A2. advance at a full-day tail, spans"
+target = "at most 3 passes, at most 0.25 GB leaf bytes"
+miss = "more than 3 passes or over 0.25 GB"
+source = "predicted; box D rates, comment 6700944105"
+# The spans half of A1's advance fold.
+requires_tenant = "dp7"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "build_passes"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.dp7.spans.key_index_build_passes"
+lane = "counter"
+target_if = "v <= 3"
+miss_if = "v > 3"
+
+[[row.figure]]
+name = "leaf_bytes"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.dp7.spans.leaf_bytes"
+lane = "counter"
+target_if = "v <= 250_000_000"
+miss_if = "v > 250_000_000"
+
+[[row]]
+key = "adr3939_a3"
+adr = "ADR-3939"
+adr_row = "A3"
+check = "A3. sealed days keep their leaves"
+target = "from the second fold after day d seals, an advance issues 0 leaf PUTs and 0 previous-leaf GETs for day d's part"
+miss = "any leaf PUT or GET for a sealed day it did not change, after its sealing fold"
+source = "predicted"
+# The advance fold runs after the 7-day state's fold sealed every day, so
+# it is at least the second fold after each day sealed. Both figures are the
+# advance's fold report fields sealed_day_leaf_puts and
+# sealed_day_previous_leaf_gets: the leaf PUTs and previous-leaf GETs the
+# fold issued for a part whose single UTC day the previous HEAD already held
+# sealed (a day's own sealing fold counts 0), so a sealed day it re-encoded
+# shows here. Both are gated on the row's binary figure being 1: the
+# day_parts_7 state's fold binary stamp
+# (stamps/day_parts_7.logs.fold_binary.json, which box/run.sh
+# state_day_parts writes whenever the state runs) saying the binary carries
+# R2. On an older binary the figure reads 0 and is listed not requested, and
+# so are both fold figures; with no stamp the binary figure is missing and
+# both fold figures are not-run naming it, so the run is incomplete, never
+# not requested. retired_hour does not enter: a run that lists day_parts_7
+# alone judges A3.
+requires_tenant = "dp7"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "fold_binary_carries_r2"
+statement = "stamp"
+state = "day_parts_7"
+metric = "stamp.fold_binary_carries_r2.logs"
+lane = "counter"
+not_requested_if = "v == 0"
+not_requested_reason = "A3 is measured only on a fold binary that carries R2 (the harness-state amendment)"
+target_if = "v in (0, 1)"
+
+[[row.figure]]
+name = "sealed_day_leaf_puts"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.dp7.logs.sealed_day_leaf_puts"
+lane = "counter"
+not_run_unless = "m['adr3939_a3.fold_binary_carries_r2'] == 1"
+not_run_reason = "A3 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "v == 0"
+
+[[row.figure]]
+name = "sealed_day_previous_leaf_gets"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.dp7.logs.sealed_day_previous_leaf_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_a3.fold_binary_carries_r2'] == 1"
+not_run_reason = "A3 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "v == 0"
+
+[[row]]
+key = "adr3939_a4"
+adr = "ADR-3939"
+adr_row = "A4"
+check = "A4. partition determinism"
+target = "two folds of the same entry set produce byte-identical HEADs; the switch-off partition is unchanged"
+miss = "any difference"
+source = "predicted"
+# Two folds of the same entry set: the 7-day state's own fold and a second
+# fold of the same tenant over the HEAD the first wrote (transition
+# day_parts_7_refold), a no-op that reads that HEAD back. Each reports
+# head_digest, the blake3 of the HEAD in effect after it (written, or read
+# back on a no-op) re-encoded with its folder id and creation time cleared,
+# so the digest does not depend on which folder wrote the HEAD or when. A
+# re-encode of the same entries within a run would need the HEAD deleted (a
+# fold over a missing or corrupt HEAD rebuilds from the commit layout at the
+# same watermark), and leaf boundaries can differ between builds
+# (crates/ravel-catalog/src/key_index_rebuild.rs, its header comment), so
+# A4's determinism is pinned by unit tests rather than measured: the
+# refold's digest matches the first by reading the same HEAD back, which
+# says nothing about determinism, and heads_differ is unsupported. That the
+# switch-off partition is unchanged is pinned by D1's partition unit tests
+# in crates/ravel-catalog/src/fold.rs and is not measurable in a run, so
+# that figure is unsupported too. Every figure is gated on the row's binary
+# figure being 1, read from the same day_parts_7 stamp as A3's.
+requires_tenant = "dp7"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "fold_binary_carries_r2"
+statement = "stamp"
+state = "day_parts_7"
+metric = "stamp.fold_binary_carries_r2.logs"
+lane = "counter"
+not_requested_if = "v == 0"
+not_requested_reason = "A4 is measured only on a fold binary that carries R2 (the harness-state amendment)"
+target_if = "v in (0, 1)"
+
+[[row.figure]]
+name = "head_digest"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7"
+metric = "fold.dp7.logs.head_digest"
+lane = "counter"
+not_run_unless = "m['adr3939_a4.fold_binary_carries_r2'] == 1"
+not_run_reason = "A4 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "isinstance(v, str) and len(v) > 0"
+
+[[row.figure]]
+name = "refold_head_digest"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_refold"
+metric = "fold.dp7.logs.head_digest"
+lane = "counter"
+not_run_unless = "m['adr3939_a4.fold_binary_carries_r2'] == 1"
+not_run_reason = "A4 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "isinstance(v, str) and len(v) > 0"
+
+[[row.figure]]
+name = "heads_differ"
+statement = "derived"
+state = "day_parts_7"
+metric = "derived"
+expr = "1 if m['adr3939_a4.head_digest'] != m['adr3939_a4.refold_head_digest'] else 0"
+lane = "counter"
+not_run_unless = "m['adr3939_a4.fold_binary_carries_r2'] == 1"
+not_run_reason = "A4 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+unsupported = "a re-encode of the same entries in a run would need the HEAD deleted, and leaf boundaries can differ between builds, so determinism is pinned by unit tests rather than measured: the refold returns the HEAD it read"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "switch_off_partition_changed"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7"
+metric = "fold.dp7.logs.switch_off_partition_changed"
+lane = "counter"
+not_run_unless = "m['adr3939_a4.fold_binary_carries_r2'] == 1"
+not_run_reason = "A4 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+unsupported = "the switch-off partition is pinned by D1's unit tests and is not measurable in a run"
+target_if = "v == 0"
+
+[[row]]
+key = "adr3939_a5"
+adr = "ADR-3939"
+adr_row = "A5"
+check = "A5. no-range lookup, 7 days of day parts, logs request_id IN 100"
+target = "every day covered; GETs at most 7 x 126"
+miss = "any day uncovered"
+source = "predicted"
+# Every day covered: each cold call covers every logs part the state's
+# catalog stamp holds and leaves none uncovered.
+requires_tenant = "dp7"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "parts_held"
+statement = "stamp"
+state = "day_parts_7"
+metric = "stamp.covering_parts.logs"
+lane = "counter"
+target_if = "v >= 7"
+
+[[row.figure]]
+name = "parts_covered"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.min.parts_covered"
+lane = "counter"
+target_if = "v == m['adr3939_a5.parts_held']"
+
+[[row.figure]]
+name = "parts_uncovered"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.max.parts_uncovered"
+lane = "counter"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+target_if = "v <= 7 * 126"
+
+[[row.figure]]
+name = "rows_exact"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row]]
+key = "adr3939_a6"
+adr = "ADR-3939"
+adr_row = "A6"
+check = "A6. ADR-3692 row 18 (key-set lookup time) on the day-sealed tail"
+target = "as row 18"
+miss = "as row 18"
+source = "predicted; issue #3918"
+# Row 18's cells on the day-sealed tail: the same six statements, cold, in
+# the 7-day state, against the same statements unfolded on the same data. The
+# unfolded reference is the prefold temperature: the statement's cold calls
+# sent on the state's tenant before its fold (box/run.sh state_day_parts).
+# A cell any of whose cold calls left a part to tier 1 is not-measured, as in
+# row 18.
+requires_tenant = "dp7"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "logs_request_id_10_unfolded_p50_s"
+statement = "logs_request_in_10"
+state = "day_parts_7"
+metric = "prefold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_10_unfolded_iqr_s"
+statement = "logs_request_in_10"
+state = "day_parts_7"
+metric = "prefold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_10_p50_s"
+statement = "logs_request_in_10"
+state = "day_parts_7"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['adr3939_a6.logs_request_id_10_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.logs_request_id_10_unfolded_p50_s'], 0.5 * m['adr3939_a6.logs_request_id_10_unfolded_iqr_s'])"
+miss_if = "v > m['adr3939_a6.logs_request_id_10_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.logs_request_id_10_unfolded_p50_s'], 0.5 * m['adr3939_a6.logs_request_id_10_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "logs_request_id_100_unfolded_p50_s"
+statement = "logs_request_in_100"
+state = "day_parts_7"
+metric = "prefold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_100_unfolded_iqr_s"
+statement = "logs_request_in_100"
+state = "day_parts_7"
+metric = "prefold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_100_p50_s"
+statement = "logs_request_in_100"
+state = "day_parts_7"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['adr3939_a6.logs_request_id_100_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.logs_request_id_100_unfolded_p50_s'], 0.5 * m['adr3939_a6.logs_request_id_100_unfolded_iqr_s'])"
+miss_if = "v > m['adr3939_a6.logs_request_id_100_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.logs_request_id_100_unfolded_p50_s'], 0.5 * m['adr3939_a6.logs_request_id_100_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "logs_trace_id_10_unfolded_p50_s"
+statement = "logs_trace_in_10"
+state = "day_parts_7"
+metric = "prefold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_10_unfolded_iqr_s"
+statement = "logs_trace_in_10"
+state = "day_parts_7"
+metric = "prefold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_10_p50_s"
+statement = "logs_trace_in_10"
+state = "day_parts_7"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['adr3939_a6.logs_trace_id_10_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.logs_trace_id_10_unfolded_p50_s'], 0.5 * m['adr3939_a6.logs_trace_id_10_unfolded_iqr_s'])"
+miss_if = "v > m['adr3939_a6.logs_trace_id_10_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.logs_trace_id_10_unfolded_p50_s'], 0.5 * m['adr3939_a6.logs_trace_id_10_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "logs_trace_id_100_unfolded_p50_s"
+statement = "logs_trace_in_100"
+state = "day_parts_7"
+metric = "prefold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_100_unfolded_iqr_s"
+statement = "logs_trace_in_100"
+state = "day_parts_7"
+metric = "prefold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_100_p50_s"
+statement = "logs_trace_in_100"
+state = "day_parts_7"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['adr3939_a6.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.logs_trace_id_100_unfolded_p50_s'], 0.5 * m['adr3939_a6.logs_trace_id_100_unfolded_iqr_s'])"
+miss_if = "v > m['adr3939_a6.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.logs_trace_id_100_unfolded_p50_s'], 0.5 * m['adr3939_a6.logs_trace_id_100_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "spans_trace_id_10_unfolded_p50_s"
+statement = "spans_in_10"
+state = "day_parts_7"
+metric = "prefold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_10_unfolded_iqr_s"
+statement = "spans_in_10"
+state = "day_parts_7"
+metric = "prefold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_10_p50_s"
+statement = "spans_in_10"
+state = "day_parts_7"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['adr3939_a6.spans_trace_id_10_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.spans_trace_id_10_unfolded_p50_s'], 0.5 * m['adr3939_a6.spans_trace_id_10_unfolded_iqr_s'])"
+miss_if = "v > m['adr3939_a6.spans_trace_id_10_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.spans_trace_id_10_unfolded_p50_s'], 0.5 * m['adr3939_a6.spans_trace_id_10_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "spans_trace_id_100_unfolded_p50_s"
+statement = "spans_in_100"
+state = "day_parts_7"
+metric = "prefold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_100_unfolded_iqr_s"
+statement = "spans_in_100"
+state = "day_parts_7"
+metric = "prefold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_100_p50_s"
+statement = "spans_in_100"
+state = "day_parts_7"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['adr3939_a6.spans_trace_id_100_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.spans_trace_id_100_unfolded_p50_s'], 0.5 * m['adr3939_a6.spans_trace_id_100_unfolded_iqr_s'])"
+miss_if = "v > m['adr3939_a6.spans_trace_id_100_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.spans_trace_id_100_unfolded_p50_s'], 0.5 * m['adr3939_a6.spans_trace_id_100_unfolded_iqr_s'])"
+
+[[row]]
+key = "adr3939_a7"
+adr = "ADR-3939"
+adr_row = "A7"
+check = "A7. no-range lookup over every day part the run holds, logs request_id IN 100"
+target = "at most 126 GETs per day part; days covered equal to min(days held, floor(2,048 / GETs per day))"
+miss = "over 126 GETs per day part, or fewer days covered than that"
+source = "predicted from box D rates"
+# At the reduced rate (the harness-state amendment): with S the most slices
+# one day part carries for request_id, the target per day part is
+# T(S) + 100 leaf GETs (evaluate.py day_part_bound), so the total is at most
+# that per part the state holds, and every day held is covered while
+# 30 x (T(S) + 100) is at most the key-set ceiling's 66,560. A run whose S is
+# under 3 is not-run for every figure that depends on it, not a pass. The
+# total is judged against 30 x (T(S) + 100), the 30-day state's 30 day parts;
+# a state holding other than 30 parts is not that state, so the total is
+# not-run there rather than rescaled. The stats carry no per-part leaf GET
+# breakdown (no keyIndex.perPart), so the per-part figure reads unsupported
+# until they do.
+requires_tenant = "dp30"
+requires_states = ["day_parts_30"]
+
+[[row.figure]]
+name = "slices"
+statement = "stamp"
+state = "day_parts_30"
+metric = "stamp.slices.logs.request_id"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "per_day_bound"
+statement = "derived"
+state = "day_parts_30"
+metric = "derived"
+expr = "day_part_bound(m['adr3939_a7.slices'])"
+lane = "counter"
+not_run_unless = "m['adr3939_a7.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v >= 100"
+
+[[row.figure]]
+name = "leaf_gets_per_part"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.per_part.leaf_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_a7.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v <= m['adr3939_a7.per_day_bound']"
+
+[[row.figure]]
+name = "parts_held"
+statement = "stamp"
+state = "day_parts_30"
+metric = "stamp.covering_parts.logs"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_a7.slices'] >= 3 and m['adr3939_a7.parts_held'] == 30"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised, and that state holds 30 day parts, so the total is 30 x (T(S) + 100)"
+target_if = "v <= 30 * m['adr3939_a7.per_day_bound']"
+
+[[row.figure]]
+name = "ceiling_gets"
+statement = "derived"
+state = "day_parts_30"
+metric = "derived"
+expr = "30 * m['adr3939_a7.per_day_bound']"
+lane = "counter"
+not_run_unless = "m['adr3939_a7.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v <= 66_560"
+
+[[row.figure]]
+name = "parts_covered"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.min.parts_covered"
+lane = "counter"
+not_run_unless = "m['adr3939_a7.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v == m['adr3939_a7.parts_held']"
+
+[[row.figure]]
+name = "parts_uncovered"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.parts_uncovered"
+lane = "counter"
+not_run_unless = "m['adr3939_a7.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "rows_exact"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row]]
+key = "adr3939_w1"
+adr = "ADR-3939"
+adr_row = "W1"
+check = "W1 advance at a full-day tail, logs, decision 5 landed"
+target = "at most 26 passes, at most 1.4 GB leaf bytes, fold peak RSS at most 1.2 GB"
+miss = "more than 26 passes, over 1.4 GB, or RSS over 1.2 GB"
+source = "predicted; comment 6700944105 (1.99 GB less 1.31 GB held plus 0.17 GB)"
+# A1's advance fold, on the build that carries decision 5.
+requires_tenant = "dp7"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "build_passes"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.dp7.logs.key_index_build_passes"
+lane = "counter"
+target_if = "v <= 26"
+miss_if = "v > 26"
+
+[[row.figure]]
+name = "leaf_bytes"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.dp7.logs.leaf_bytes"
+lane = "counter"
+target_if = "v <= 1_400_000_000"
+miss_if = "v > 1_400_000_000"
+
+[[row.figure]]
+name = "peak_rss_bytes"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.dp7.logs.peak_rss_bytes"
+lane = "counter"
+target_if = "v <= 1_200_000_000"
+miss_if = "v > 1_200_000_000"
+
+[[row]]
+key = "adr3939_w2"
+adr = "ADR-3939"
+adr_row = "W2"
+check = "W2 one tombstoned hour in a sealed logs day, decision 5 alone"
+target = "31 previous-leaf GETs, 0 section GETs for unchanged entries, at most 1.31 GB written"
+miss = "any section GET for an unchanged entry"
+source = "predicted; fold.rs `PreviousTail::from_head` and `feed_carried_key_index`"
+# W2 is measured on the main SHA that carries C1 and not R2 (the
+# harness-state amendment): after R2 a tombstoned hour in a sealed day takes
+# the retired_hours path and is not re-encoded. The retired_hour state's fold
+# (transition retired_hour) is the fold after the tombstone, and
+# stamps/retired_hour.logs.fold_binary.json names its binary: sha,
+# carries_c1, carries_r2 (box/run.sh state_retired_hour writes it from git
+# ancestry against run.toml's [retired_hour] c1_sha and r2_sha). Without the
+# stamp the binary figure is missing and every other figure is not-run until
+# it says C1 without R2. The fold is `ravel-cli catalog fold
+# --key-index-leaves --retention-default <R>`, whose --json report the three
+# fold fields are read from: key_index_leaf_gets, the report's
+# key_index_unchanged_section_gets (section GETs for entries a previous
+# leaf already held) and key_index_leaf_bytes_written. The binary figure is
+# 1 on a binary carrying C1 and not R2, passing, and 0 on one carrying R2,
+# listed not requested (not_requested_if): it is the gate, not the
+# measurement, and A3, A4, W3 and W8 read the same figure for `== 0`. On a 0
+# the three fold figures are not-run and listed not requested
+# (gate_not_requested), so no W2 figure passes or misses on the R2 build that
+# holds retired_hour for W3 and W8; a binary carrying no C1 leaves every
+# figure not-run and not requested with its SHA.
+requires_tenant = "dp7"
+requires_states = ["retired_hour"]
+
+[[row.figure]]
+name = "fold_binary_pre_r2"
+statement = "stamp"
+state = "retired_hour"
+metric = "stamp.fold_binary_pre_r2.logs"
+lane = "counter"
+not_requested_if = "v == 0"
+not_requested_reason = "W2 is measured only on a fold binary that carries C1 and not R2 (the harness-state amendment)"
+target_if = "v in (0, 1)"
+
+[[row.figure]]
+name = "previous_leaf_gets"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour"
+metric = "fold.dp7.logs.key_index_leaf_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 1"
+not_run_reason = "W2 runs only on a fold binary that carries C1 and not R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "v == 31"
+
+[[row.figure]]
+name = "unchanged_section_gets"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour"
+metric = "fold.dp7.logs.key_index_unchanged_section_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 1"
+not_run_reason = "W2 runs only on a fold binary that carries C1 and not R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "v == 0"
+miss_if = "v > 0"
+
+[[row.figure]]
+name = "leaf_bytes"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour"
+metric = "fold.dp7.logs.leaf_bytes"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 1"
+not_run_reason = "W2 runs only on a fold binary that carries C1 and not R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "v <= 1_310_000_000"
+
+[[row]]
+key = "adr3939_w3"
+adr = "ADR-3939"
+adr_row = "W3"
+check = "W3 one tombstoned hour in a sealed logs day, decision 6"
+target = "0 part PUTs, 0 leaf PUTs, `retired_hours = [h]`; a resolve over h yields 0 segments on either tier from that fold; the part leaves HEAD with 0 PUTs at the day's last tombstone"
+miss = "any PUT before the drop, any segment of hour h"
+source = "predicted"
+# The retired_hour state's fold after the tombstone (transition
+# retired_hour), then the fold at the day's last tombstone (transition
+# retired_hour_drop). box/run.sh state_retired_hour stamps the tombstoned
+# hour (stamps/retired_hour.logs.tombstone.json hour). Before each fold it
+# loads a tail hour into dp7, so the fold publishes a new tail and fold-wide counters
+# would count the tail's part and leaves, and a part sealed because the
+# tail's UTC day differs from the previous tail's, on either fold, whatever
+# decision 6 does for the tombstoned day. The part PUTs are
+# stamps/retired_hour.logs.retired_part_puts.json new_in_range (drop:
+# stamps/retired_hour_drop.logs.retired_part_puts.json): of the snapshot
+# part objects in the store listing taken right after the fold and not in
+# the one taken before the tail load, inv.py part-puts counts those whose
+# watermark hour (a sealed part's last hour) lies in the tombstoned day, so
+# the tail and any other day's seal do not enter. The leaf PUTs are the fold
+# report's sealed_day_leaf_puts, the leaf PUTs of a re-encoded part, not
+# the tail, whose UTC day a part of the previous HEAD other than its last
+# already held sealed: the tombstoned hour's day is the oldest dp7 day,
+# always such a part, while the tail's leaves and a day sealed for the
+# first time are outside it. retired_hours comes from the same --json
+# report. retired_hour_segments is
+# stamps/retired_hour.logs.retired_resolve.json segments: after the fold,
+# box/run.sh resolves the tenant with `ravel-cli rlog footprint --tenant`
+# and counts the resolved keys, on either tier, whose ingest hour is the
+# tombstoned one (an L1 key's hour from its path, an L0 key's from its
+# commit record); the stamp is missing when its hour is not the tombstone
+# stamp's or the resolve returned nothing. The part leaving HEAD is the
+# count of parts in the catalog stamp taken after the drop fold
+# (stamps/retired_hour_drop.logs.catalog.json) whose hour range holds the
+# tombstoned hour, so a drop fold that drops nothing misses rather than
+# passing on its 0 PUTs. Every figure is gated on W2's binary figure being
+# 0 (a binary carrying R2); on a C1-not-R2 binary they are not-run and not
+# requested while W2 is judged.
+requires_tenant = "dp7"
+requires_states = ["retired_hour"]
+
+[[row.figure]]
+name = "part_puts"
+statement = "stamp"
+state = "retired_hour"
+metric = "stamp.retired_part_puts.logs"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "W3 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "v == 0"
+miss_if = "v > 0"
+
+[[row.figure]]
+name = "leaf_puts"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour"
+metric = "fold.dp7.logs.sealed_day_leaf_puts"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "W3 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "v == 0"
+miss_if = "v > 0"
+
+[[row.figure]]
+name = "tombstoned_hour"
+statement = "stamp"
+state = "retired_hour"
+metric = "stamp.tombstoned_hour.logs"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "W3 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "retired_hours"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour"
+metric = "fold.dp7.logs.retired_hours"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "W3 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "v == [m['adr3939_w3.tombstoned_hour']]"
+
+[[row.figure]]
+name = "retired_hour_segments"
+statement = "stamp"
+state = "retired_hour"
+metric = "stamp.retired_hour_segments.logs"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "W3 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "v == 0"
+miss_if = "v > 0"
+
+[[row.figure]]
+name = "drop_part_puts"
+statement = "stamp"
+state = "retired_hour"
+metric = "stamp.drop_retired_part_puts.logs"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "W3 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "v == 0"
+miss_if = "v > 0"
+
+[[row.figure]]
+name = "drop_leaf_puts"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour_drop"
+metric = "fold.dp7.logs.sealed_day_leaf_puts"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "W3 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "v == 0"
+miss_if = "v > 0"
+
+[[row.figure]]
+name = "drop_parts_holding_hour"
+statement = "stamp"
+state = "retired_hour"
+metric = "stamp.drop_parts_holding_hour.logs"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "W3 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "v == 0"
+miss_if = "v > 0"
+
+[[row]]
+key = "adr3939_w4"
+adr = "ADR-3939"
+adr_row = "W4"
+check = "W4 7 days, 100 keys, logs request_id, day parts"
+target = "at most 882 leaf GETs, 7 of 7 days covered, p50 within ADR-3692 row 18's bound"
+miss = "over 882, a day uncovered, or over the bound"
+source = "predicted; comment 6700944105"
+# Row 18's bound on the no-range 100-key lookup over the 7-day state: the
+# cold p50 against the same statement's prefold p50 (W4's own
+# unfolded_p50_s) plus the larger of
+# 5 % of it and half its interquartile range.
+requires_tenant = "dp7"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "parts_held"
+statement = "stamp"
+state = "day_parts_7"
+metric = "stamp.covering_parts.logs"
+lane = "counter"
+target_if = "v >= 7"
+
+[[row.figure]]
+name = "parts_covered"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.min.parts_covered"
+lane = "counter"
+target_if = "v == m['adr3939_w4.parts_held']"
+
+[[row.figure]]
+name = "parts_uncovered"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.max.parts_uncovered"
+lane = "counter"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+target_if = "v <= 882"
+miss_if = "v > 882"
+
+[[row.figure]]
+name = "days_covered"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.min.parts_covered"
+lane = "counter"
+target_if = "v >= 7"
+miss_if = "v < 7"
+
+[[row.figure]]
+name = "rows_exact"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "unfolded_p50_s"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "prefold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "unfolded_iqr_s"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "prefold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "p50_s"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['adr3939_w4.unfolded_p50_s'] + max(0.05 * m['adr3939_w4.unfolded_p50_s'], 0.5 * m['adr3939_w4.unfolded_iqr_s'])"
+miss_if = "v > m['adr3939_w4.unfolded_p50_s'] + max(0.05 * m['adr3939_w4.unfolded_p50_s'], 0.5 * m['adr3939_w4.unfolded_iqr_s'])"
+
+[[row]]
+key = "adr3939_w5"
+adr = "ADR-3939"
+adr_row = "W5"
+check = "W5 30 days, no range, 100 keys"
+target = "3,780 leaf GETs, 30 of 30 covered, 0 tier-1 probes on those days, `parts_beyond_ceiling` 0"
+miss = "any day uncovered"
+source = "predicted"
+# At the reduced rate: 3,780 is the box D instance of 30 x (T(S) + 100),
+# with S the most slices one day part carries for request_id, and a run whose
+# S is under 3 is not-run for every figure that depends on it (the
+# harness-state amendment). Each day part is held to T(S) + 100 leaf GETs as
+# A7's is, besides the 30-day total, so one part over the bound cannot hide
+# under the total; the stats carry no per-part breakdown (no
+# keyIndex.perPart), so that figure reads unsupported until they do. The tier-1 probes are the
+# calls' probe-phase GETs.
+requires_tenant = "dp30"
+requires_states = ["day_parts_30"]
+
+[[row.figure]]
+name = "slices"
+statement = "stamp"
+state = "day_parts_30"
+metric = "stamp.slices.logs.request_id"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "per_day_bound"
+statement = "derived"
+state = "day_parts_30"
+metric = "derived"
+expr = "day_part_bound(m['adr3939_w5.slices'])"
+lane = "counter"
+not_run_unless = "m['adr3939_w5.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v >= 100"
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_w5.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v <= 30 * m['adr3939_w5.per_day_bound']"
+
+[[row.figure]]
+name = "leaf_gets_per_part"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.per_part.leaf_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_w5.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v <= m['adr3939_w5.per_day_bound']"
+
+[[row.figure]]
+name = "days_covered"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.min.parts_covered"
+lane = "counter"
+not_run_unless = "m['adr3939_w5.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v >= 30"
+miss_if = "v < 30"
+
+[[row.figure]]
+name = "parts_uncovered"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.parts_uncovered"
+lane = "counter"
+not_run_unless = "m['adr3939_w5.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v == 0"
+miss_if = "v > 0"
+
+[[row.figure]]
+name = "tier1_probe_gets"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.probe_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_w5.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "parts_beyond_ceiling"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.parts_beyond_ceiling"
+lane = "counter"
+not_run_unless = "m['adr3939_w5.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "rows_exact"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row]]
+key = "adr3939_w6"
+adr = "ADR-3939"
+adr_row = "W6"
+check = "W6 7 days, 1 key"
+target = "14 leaf GETs, 2 round trips"
+miss = "over 14, or 3 or more round trips"
+source = "predicted"
+# The stats carry no count of the key index's leaf round trips on this
+# build (dependencyDepth counts segment stages, not leaf waves), so the round
+# trips read unsupported until keyIndex.leafRoundTrips exists.
+requires_tenant = "dp7"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "logs_request_in_1_7d"
+state = "day_parts_7"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+target_if = "v <= 14"
+miss_if = "v > 14"
+
+[[row.figure]]
+name = "leaf_round_trips"
+statement = "logs_request_in_1_7d"
+state = "day_parts_7"
+metric = "cold.max.leaf_round_trips"
+lane = "counter"
+target_if = "v <= 2"
+miss_if = "v >= 3"
+
+[[row.figure]]
+name = "rows_exact"
+statement = "logs_request_in_1_7d"
+state = "day_parts_7"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row]]
+key = "adr3939_w7"
+adr = "ADR-3939"
+adr_row = "W7"
+check = "W7 1 hour across midnight"
+target = "4 leaf GETs"
+miss = "over 4"
+source = "predicted"
+# One key over the hour that spans a UTC midnight of the 7-day state (23:30
+# to 00:30), so it reads the two day parts either side of it. 4 leaf GETs
+# alone would also hold for a window reading one part, so the calls must
+# cover exactly 2 parts and leave none uncovered.
+requires_tenant = "dp7"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "logs_request_in_1_midnight"
+state = "day_parts_7"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+target_if = "v <= 4"
+miss_if = "v > 4"
+
+[[row.figure]]
+name = "parts_covered_min"
+statement = "logs_request_in_1_midnight"
+state = "day_parts_7"
+metric = "cold.min.parts_covered"
+lane = "counter"
+target_if = "v == 2"
+
+[[row.figure]]
+name = "parts_covered_max"
+statement = "logs_request_in_1_midnight"
+state = "day_parts_7"
+metric = "cold.max.parts_covered"
+lane = "counter"
+target_if = "v == 2"
+
+[[row.figure]]
+name = "parts_uncovered"
+statement = "logs_request_in_1_midnight"
+state = "day_parts_7"
+metric = "cold.max.parts_uncovered"
+lane = "counter"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "rows_exact"
+statement = "logs_request_in_1_midnight"
+state = "day_parts_7"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row]]
+key = "adr3939_w8"
+adr = "ADR-3939"
+adr_row = "W8"
+check = "W8 determinism"
+target = "as A4, and `retired_hours` identical across two folds observing the same tombstones"
+miss = "any difference"
+source = "predicted"
+# As A4 on the retired_hour state: its fold and a second fold observing the
+# same tombstones (transition retired_hour_refold), each reporting its HEAD
+# digest and retired_hours. Each fold's retired_hours must be exactly [h] for
+# W3's tombstoned hour h, so two folds that observed no tombstone (both [])
+# miss rather than agree. Both are read from the CLI fold's --json report:
+# head_digest is A4's digest of the HEAD in effect after the fold, its folder
+# id and creation time cleared, and retired_hours the HEAD's union of every
+# part's retired_hours. heads_differ is unsupported for A4's reason: a
+# re-encode of the same entries would need the HEAD deleted and leaf
+# boundaries can differ between builds, so W8's determinism is pinned by
+# unit tests, and the refold observing the same tombstones is a no-op that
+# reads the same HEAD back. Every figure is gated on W2's binary
+# figure being 0 (a binary carrying R2); on a C1-not-R2 binary they are
+# not-run and not requested while W2 is judged.
+requires_tenant = "dp7"
+requires_states = ["retired_hour"]
+
+[[row.figure]]
+name = "head_digest"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour"
+metric = "fold.dp7.logs.head_digest"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "W8 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "isinstance(v, str) and len(v) > 0"
+
+[[row.figure]]
+name = "refold_head_digest"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour_refold"
+metric = "fold.dp7.logs.head_digest"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "W8 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "isinstance(v, str) and len(v) > 0"
+
+[[row.figure]]
+name = "heads_differ"
+statement = "derived"
+state = "retired_hour"
+metric = "derived"
+expr = "1 if m['adr3939_w8.head_digest'] != m['adr3939_w8.refold_head_digest'] else 0"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "W8 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+unsupported = "a re-encode of the same entries in a run would need the HEAD deleted, and leaf boundaries can differ between builds, so determinism is pinned by unit tests rather than measured: a refold observing the same tombstones returns the HEAD it read"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "retired_hours"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour"
+metric = "fold.dp7.logs.retired_hours"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "W8 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "v == [m['adr3939_w3.tombstoned_hour']]"
+
+[[row.figure]]
+name = "refold_retired_hours"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour_refold"
+metric = "fold.dp7.logs.retired_hours"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "W8 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "v == [m['adr3939_w3.tombstoned_hour']]"
+
+[[row.figure]]
+name = "retired_hours_differ"
+statement = "derived"
+state = "retired_hour"
+metric = "derived"
+expr = "1 if m['adr3939_w8.retired_hours'] != m['adr3939_w8.refold_retired_hours'] else 0"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "W8 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+target_if = "v == 0"
+
+[[row]]
+key = "adr3939_f1"
+adr = "ADR-3939"
+adr_row = "F1"
+check = "F1 (flip row) W4's p50"
+target = "within row 18's bound"
+miss = "over it: ship the week merge"
+source = "predicted"
+# W4's p50 against W4's bound, judged again as the flip.
+requires_tenant = "dp7"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "p50_s"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['adr3939_w4.unfolded_p50_s'] + max(0.05 * m['adr3939_w4.unfolded_p50_s'], 0.5 * m['adr3939_w4.unfolded_iqr_s'])"
+miss_if = "v > m['adr3939_w4.unfolded_p50_s'] + max(0.05 * m['adr3939_w4.unfolded_p50_s'], 0.5 * m['adr3939_w4.unfolded_iqr_s'])"
+miss_reason = "over row 18's bound: ship the week merge"
+
+[[row]]
+key = "adr3939_f2"
+adr = "ADR-3939"
+adr_row = "F2"
+check = "F2 (flip row) W5's p50"
+target = "at most 2 x the same statement's unfolded p50"
+miss = "over it: ship the week merge"
+source = "predicted"
+# W5's statement against its own prefold p50, the 30-day state's statement
+# before the state's fold.
+requires_tenant = "dp30"
+requires_states = ["day_parts_30"]
+
+[[row.figure]]
+name = "unfolded_p50_s"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "prefold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "p50_s"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= 2 * m['adr3939_f2.unfolded_p50_s']"
+miss_if = "v > 2 * m['adr3939_f2.unfolded_p50_s']"
+miss_reason = "over 2 x the unfolded p50: ship the week merge"
+
+[[row]]
+key = "adr3939_f3"
+adr = "ADR-3939"
+adr_row = "F3"
+check = "F3 (flip row) leaf GETs per day part on W4 and W5, and S3 throttling"
+target = "at most 139 (126 + 10%), no `SlowDown`"
+miss = "over 139, or any `SlowDown`: re-derive before deciding"
+source = "predicted"
+# On W4 at box D's rate the bound is 139; on W5 at the reduced rate it is
+# 1.1 x (T(S) + 100) (evaluate.py day_part_bound with factor 1.1), not-run
+# under 3 slices. The stats carry no per-part leaf GET breakdown and no count
+# of SlowDown responses on this build, so those figures read unsupported. The
+# row runs on whichever of the two states the run holds, so it names no
+# tenant: its W4 figures read dp7 and its W5 figures read dp30.
+
+[[row.figure]]
+name = "w4_leaf_gets_per_part"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.max.per_part.leaf_gets"
+lane = "counter"
+target_if = "v <= 139"
+miss_if = "v > 139"
+miss_reason = "over 139: re-derive before deciding"
+
+[[row.figure]]
+name = "w4_slow_downs"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.max.slow_downs"
+lane = "counter"
+target_if = "v == 0"
+miss_if = "v > 0"
+miss_reason = "a SlowDown: re-derive before deciding"
+
+[[row.figure]]
+name = "slices"
+statement = "stamp"
+state = "day_parts_30"
+metric = "stamp.slices.logs.request_id"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "w5_per_day_bound"
+statement = "derived"
+state = "day_parts_30"
+metric = "derived"
+expr = "day_part_bound(m['adr3939_f3.slices'], 1.1)"
+lane = "counter"
+not_run_unless = "m['adr3939_f3.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v >= 110"
+
+[[row.figure]]
+name = "w5_leaf_gets_per_part"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.per_part.leaf_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_f3.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v <= m['adr3939_f3.w5_per_day_bound']"
+miss_reason = "over the bound: re-derive before deciding"
+
+[[row.figure]]
+name = "w5_slow_downs"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.slow_downs"
+lane = "counter"
+not_run_unless = "m['adr3939_f3.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v == 0"
+miss_if = "v > 0"
+miss_reason = "a SlowDown: re-derive before deciding"

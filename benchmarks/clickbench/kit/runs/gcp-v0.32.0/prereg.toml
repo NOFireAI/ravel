@@ -1,0 +1,85 @@
+# Pre-registration for the v0.32.0 ClickBench run on GCE against GCS
+# (run.toml beside this file). Written before launch and posted on the
+# tracking issue. fetch-gcp.sh judges every figure with
+# `kit.py prereg`: an exact value or an inclusive [low, high] band. A figure
+# the run did not produce, or produced twice, is unjudged and fetch-gcp.sh
+# exits 2; one outside its band is a miss and it exits 1.
+#
+# The measured binaries are the published v0.32.0 release artifacts
+# (ravel-server built with --features sql,flight-sql,otap,agents,mcp under the
+# release profile, LTO). No band below comes from that binary on any store:
+#   K  the kit lane on loopback RustFS, c6a.4xlarge, main 25c82d160, a
+#      frame-pointer source build without LTO (#1248 comment 6677491285, run
+#      clickbench-20261106T034355Z-22708-16958 arm B; its evidence.tgz for
+#      object and byte counts);
+#   E  the ClickBench entry lane on loopback RustFS, c6a.4xlarge, the v0.32.0
+#      release binaries (#4072 comment 6818187104; the bot's result file on
+#      pmoust/ClickBench@ravel-v0.32.0-upstream for cold);
+#   S  the entry lane on real S3, c6a.4xlarge, main c8efb93ac, source build
+#      (#1248 comment 6116907814; stamp: fetch policy cost-based, source
+#      default, profile s3-intra-region-2026).
+# This run is the kit lane's load geometry (8 shards, 65,536-row batches, 8
+# read cursors) on GCS, so its object count and size come from K, not E.
+
+[figures]
+# Box-asserted too (do_load, do_verify); hits.parquet's row count.
+rows_written = 99997497
+count_star = 99997497
+# E answered 43 of 43 with no null try; so did K.
+statements_answered = 43
+null_tries = 0
+benchmark_error_ratio = 0
+
+# Bytes of every key under the tenant's t/<hash>/ after the declare step.
+# K: 10,022,165,540 under t/ after the load (10,021,739,059 of it l0). The
+# encoder is unchanged in 25c82d160..v0.32.0; +-5 % for flush-boundary drift.
+data_size_bytes = [9500000000, 10600000000]
+# t/<hash>/l/l0/ data objects. K: 1,385; #3087's kit run: 1,421.
+l0_objects = [1250, 1550]
+# Nothing compacts right after the load, and the fold seals every object the
+# load wrote (K: 1,385 written, 1,385 listed, 1,385 entries).
+l0_objects_minus_objects_written = 0
+fold_entries_minus_objects_written = 0
+# hits.mapping.toml's 104 [[...]] entries.
+declared_columns = 104
+
+# Seconds of the load, compact, fold and declare steps. K: 621 s (load
+# 620.65 s, the rest under 1 s). The LTO release build should load faster;
+# c2d's all-core clock is below c6a's; GCS PUT latency (85 ms mean on GKE,
+# #3476) sits behind a 39-deep pipeline.
+load_time_s = [450, 1100]
+
+# Sum of try 1 over the answered statements. Not K's 1,445.5 s, which is
+# loopback RustFS reading gp3 at about 200 MB/s after each cache drop. On
+# GCS the server resolves cost-based (not latency-first as on loopback), and
+# at 6.3 MB per request a K-sized object (about 7.2 MB) is below the 18.9 MB
+# projection break-even, so each scanning statement reads its objects whole,
+# about 10 GB. Predicted 200 to 500 s; S (151.6 s) read 407 objects of
+# 24.6 MB ranged.
+cold_sum_s = [100, 1000]
+# Best of tries 2 and 3, summed. K: 48.1 s; E: 30.0 s (31.2 s in the bot's
+# file); S: 63.4 s. Two outcomes are possible here and the band covers both:
+# the fetch cache (6.18 GB derived from the pinned budget) holds the hot
+# statements' working set and hot lands near K or S (45 to 80 s), or whole-
+# object reads of a 10 GB corpus overrun it and each hot try refetches from
+# GCS, near the cold figure (150 to 400 s). The per-call stats say which.
+hot_sum_s = [30, 600]
+
+# Pooled over 3 rounds of 600 s at 10 connections. K: 0.691; S: 0.683; E:
+# 0.893. If hot tries refetch from GCS, every concurrent call does too:
+# predicted 0.15 to 0.7.
+concurrent_qps = [0.08, 1.2]
+# K: 0.048; S: 0.040; E: 0.063.
+concurrent_error_ratio = [0, 0.25]
+
+# State, stamped on the box before the first statement.
+store = "gcs"
+store_identity = "gs://{store_bucket}"
+fold_precondition = "met"
+fetch_policy = "cost-based"
+fetch_policy_source = "default"
+binary_source = "release"
+release_tag = "v0.32.0"
+ravel_server_sha256 = "f111c0dbf08eba7b1393c6e8139d0fd474f62cb932ba524f5ece5484bef41ea5"
+ravel_cli_sha256 = "850effdae0d8522deacfd3a4f9617ff602ccba7880ef3a4dc47df47f231d5e39"
+machine = "c2d-highcpu-16"

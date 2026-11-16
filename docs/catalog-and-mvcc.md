@@ -1,0 +1,3921 @@
+# Commit Protocol, Catalog, and MVCC
+
+Companion to ADR-0002, ADR-0003, and ADR-0010. This is the implementer
+contract for `ravel-commit` and `ravel-catalog`.
+
+## Key layout (all under one bucket root)
+
+```
+t/<tenant_hash>/m/l0/<shard>/<writer_id>.<epoch>.<seq>.<hash16>.rseg      data
+t/<tenant_hash>/m/c/<shard>/<ingest_hour>/<writer_id>.<epoch>.<seq>.cmt   commit
+t/<tenant_hash>/m/l1/<shard>/<ingest_hour>/<input_set_hash16>.<part:04>.<hash16>.rseg   L1 part
+t/<tenant_hash>/m/c/<shard>/<ingest_hour>/l1.<input_set_hash16>.cmt       compaction record
+t/<tenant_hash>/m/c/<shard>/<ingest_hour>/rw.<input_set_hash16>.cmt       rewrite record (selective erasure; ADR-0064)
+t/<tenant_hash>/m/c/<shard>/<ingest_hour>/retire.tmb                      retention tombstone
+t/<tenant_hash>/m/maint/<shard>/cursor                                    advisory scan cursor
+t/<tenant_hash>/<signal>/maint/migrate/<family>/cursor                  advisory migrate cursor (one per tenant, signal and format family; CAS-mutable)
+t/<tenant_hash>/<signal>/maint/unn/<shard>/<ingest_hour>/retire.unn     retention unnamed-since marker (CreateIfAbsent, immutable; ADR-1133)
+t/<tenant_hash>/<signal>/maint/unn/<shard>/<ingest_hour>/<l1|rw>.<input_set_hash16>.unn   superseded-input unnamed-since marker (CreateIfAbsent, immutable; ADR-1133)
+t/<tenant_hash>/a/state/latest                                            derived alert-state memo (per-tenant, Overwrite, versioned body, advisory; ADR-1294)
+t/<tenant_hash>/<signal>/del/<request_id>.dreq                          erasure request (CreateIfAbsent, immutable; ADR-0064)
+t/<tenant_hash>/<signal>/del/<request_id>.done                          erasure completion (CreateIfAbsent, immutable, PII-free; ADR-0064)
+t/<tenant_hash>/<signal>/prov                                           shard_count provisioning record (write-once, additive; ADR-0050 §5)
+t/<tenant_hash>/enc                                                     per-tenant KMS key-epoch record (CAS append-only, additive; ADR-0062 §1b)
+t/<tenant_hash>/config                                                  per-tenant lifecycle/limits/retention config (CAS whole-record replace, additive; ADR-0066 §6)
+t/<tenant_hash>/m/meta                                                  per-tenant metric family metadata record (CAS whole-record replace, additive; ADR-0085 §1)
+t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm              idempotency marker (logs/spans; additive)
+t/<tenant_hash>/catalog/<signal>/snap/<watermark>.<hash16>.csnap         snapshot part (immutable)
+t/<tenant_hash>/catalog/<signal>/HEAD                                    head pointer (mutable, CAS)
+t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.npost         name postings (immutable)
+t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.cstat         column statistics (immutable; ADR-0850, ADR-0942, ADR-1413)
+t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.kidx          per-part key-index leaf (immutable; ADR-2707)
+t/<tenant_hash>/pq/grants                                               Parquet table location grants record (CAS whole-record replace, format_version 1; ADR-2040 D1)
+t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm                        Parquet table manifest version (CreateIfAbsent, immutable, newest version is the table; ADR-2040 D1)
+t/<tenant_hash>/ag/<agent_id>/head                                      Ravel Agents HEAD (CreateIfAbsent once, then CAS whole-record replace, format_version 1, never deleted; the ADR-0066 R1 CAS-mutable exception per ADR-3331 decision 3; ADR-3331 decision 2)
+t/<tenant_hash>/ag/<agent_id>/o/<object_hash>                           Ravel Agents content-addressed object (CreateIfAbsent, immutable; ADR-3331 decision 2)
+t/<tenant_hash>/ag/_wake/<due_bucket>/<agent_id>                        Ravel Agents wake hint (Overwrite, advisory; ADR-3331 decision 2)
+t/<tenant_hash>/ag/_dir/<agent_id>                                      Ravel Agents directory entry (CreateIfAbsent, advisory; ADR-3331 decision 2)
+sys/qualification                                                       store qualification record (once per suite version, re-recorded on a version bump; ADR-1302)
+sys/qualify/<run-id>/...                                                store qualification scratch objects (transient)
+sys/pq-probe/<random>                                                   Ravel-bucket probe object, written and deleted by the probe (transient; ADR-2040 D1)
+sys/tenancy                                                             tenant-hash scheme marker (write-once, additive; ADR-0050 §3)
+sys/ipcrypt/policy                                                      IPCrypt policy fingerprint marker (CreateIfAbsent, then CAS whole-record replace on set-policy, additive; ADR-2993 §9)
+sys/auth                                                                deployment-wide keyed-token-hash -> tenant map (CAS whole-record replace, additive; ADR-0066 §6)
+sys/compat                                                              store-wide format activation record (CreateIfAbsent, then CAS whole-record replace, monotone, MACed, format_version 1; ADR-4233 decision 3)
+sys/t/<tenant_hash>                                                     per-tenant recovery manifest (keyed buckets only, write-once; ADR-0050 §3)
+admission/query/<process_id>.snapshot                                   fleet-global query concurrency snapshot (root-level, per-process, Overwrite; ADR-0061 §2)
+sys/maintain/workers/<process_id>                                       maintain-worker liveness heartbeat (root-level, per-process, Overwrite, MACed; ADR-0065 §1, ADR-3130)
+sys/maintain/memo/<process_id>                                          maintain-worker durable memo snapshot for warm start/handoff (root-level, per-process, Overwrite; ADR-0065 §3)
+sys/maintain/claims/compaction/<work_id_hex>                            advisory compaction claim (root-level, per-work-unit, CreateIfAbsent then CAS, additive; ADR-1029 §1)
+quarantine/<original key>/q<quarantined_at_ns>                          orphan-GC quarantine copy (root-level, immutable, reaped after the second horizon; ADR-0058 §6)
+```
+
+The compaction/retention key shapes (ADR-0018, ADR-0019) and the
+selective-erasure key shapes
+(`rw.` rewrite records and the `del/` request/completion prefix, ADR-0064) are
+additive: existing keys and their meaning are untouched.
+
+`quarantine/<original key>/q<quarantined_at_ns>` (ADR-0058 §6) is a third
+root-level prefix beside `t/` and `sys/`, so anything that enumerates the
+bucket by prefix has to account for it: a lifecycle rule, an IAM prefix
+policy, and the scope of a DR restore. Orphan GC copies a record-less data
+object here instead of deleting it, and reaps the copy after a second
+horizon. The whole original key is preserved verbatim between the prefix and
+the trailing `/q<ns>` segment, so stripping both recovers the live key a
+restore writes back to. Expiring this prefix out of band defeats the recovery
+window it exists for, and omitting it from a restore scope loses the only
+remaining copy of anything quarantined.
+
+`admission/query/<process_id>.snapshot` (ADR-0061 §2) is the fleet-global
+query concurrency ceiling's keyspace. Each query-serving process writes its
+current in-flight query count to the single key named by its own stable
+process id and reads every sibling's key under the `admission/query/` prefix,
+computing a fleet-wide reconciled total the local admission check enforces
+against (the ADR-0057 count-cap reconciliation pattern, reused for a query
+resource). It is deliberately a **root-level** key, outside any tenant's
+`t/<tenant_hash>/` space and carrying no tenant dimension at all, because the
+ceiling is fleet-global rather than per-tenant: the resource it bounds is
+aggregate query fan-out across all tenants, which has no single tenant to scope
+under, unlike ADR-0057's ingest admission snapshot, which is per-(tenant,
+signal) and lives under `t/<tenant_hash>/<signal>/admission/`. The key is
+owned exclusively by the one process that names it, so it is written with a
+plain `Overwrite` (no CAS, no concurrent writer to race); a stale or missing
+snapshot is self-correcting on the next reconciliation interval and, past the
+`2R` staleness window, is treated as contributing zero rather than trusted. The
+body is a small JSON object (`format_version`, `in_flight`, `snapshot_unix_ns`)
+rather than a protobuf message, because the keyspace is owned entirely by
+`ravel-query`'s query-admission module, single-writer per key and ephemeral, so
+its body is an internal contract of that module rather than a cross-crate frozen
+format. Nothing deletes these snapshots (staleness detection replaces a sweep),
+so no role holds a delete grant for the prefix.
+
+`sys/maintain/workers/<process_id>` (ADR-0065 §1) is the maintain role's
+worker-membership keyspace. Every maintain-role process writes, on a heartbeat
+interval `H` (default 60s), a small versioned-tag protobuf `WorkerHeartbeat`
+(`format_version` 2, `process_id`, `started_unix_ns`, `heartbeat_unix_ns`,
+`mac`) to the key named by its own stable process id, with a plain `Overwrite`
+(no CAS). The maintain role's IAM grant lets any holder write any key under
+the prefix, so the key name proves nothing; the record is authenticated
+instead (ADR-3130). `mac` is `blake3::keyed_hash(record_key, claim)` with
+`record_key = blake3::derive_key("ravel maintain worker record v1", file_key)`
+and `claim` built from field values, not protobuf bytes: `format_version` (u32
+BE), `process_id` (u64 BE length, then the bytes), `started_unix_ns` (i64 BE),
+`heartbeat_unix_ns` (i64 BE). The file keys come from `--maintain-key-file`,
+which `--mode maintain` requires: the first key mints and any key verifies. On
+the same cadence each process lists the `sys/maintain/workers/` prefix and
+GETs siblings to compute the **live set** -- itself plus every sibling whose
+record passes the ADR-3130 decision 4 checks (a GET bounded to 4096 + 1 bytes,
+`process_id` equal to the key, `format_version` exactly 2, a MAC that verifies
+under one of the reader's keys) and whose `heartbeat_unix_ns` is within
+`3 * H` of the reader's clock. A record that fails a check is skipped and
+counted in `ravel_maintain_worker_record_rejects_total{reason}`; a version-1
+record from an older process is rejected as `missing_mac`. Every process
+partitions the `(tenant_hash, signal, shard)` unit
+space over that live set by rendezvous (highest-random-weight) hashing, so N
+replicas divide the maintenance work rather than each paying for all of it.
+This is membership/ownership, deliberately **not** a lease (the existing
+`LeaseCheck` trait is the unrelated GC reader-protection gate). It is a
+root-level key with no tenant dimension, like the query-admission snapshot
+above; a stale or missing heartbeat is self-correcting on the next interval and,
+past the `3 * H` window, its owner is treated as gone and its units are taken
+over (idempotent overlap during the transition, never lost or double-counted
+work). A heartbeat key whose LIST modification time is older than twice the
+liveness window is deleted by the maintain heartbeat tick, from the same
+listing it reads the live set with, so on a backend that reports a LIST
+modification time the prefix stays proportional to the running fleet. Two
+cases keep a key under the prefix that never joins the live set. A running
+sibling whose clock is skewed past the liveness window keeps its modification
+time fresh, so its key is neither skipped nor reaped, and every read GETs it
+and counts it as `stale_stamp`. A backend that reports no usable modification
+time (`<= 0`) gets neither the GET skip nor the reap, so a dead process's key
+is never deleted and every read GETs it and counts it as `stale_stamp`.
+
+`sys/maintain/memo/<process_id>` (ADR-0065 §3) is the maintain role's durable
+per-worker memo snapshot: the same self-owned, root-level, `Overwrite` pattern
+beside the heartbeat prefix. On its discovery cadence each maintain process
+writes a compact summary of the `(tenant, signal, shard)` buckets it has
+verified terminal -- per unit a frontier run (the longest contiguous
+same-state terminal run) plus a sparse RLE exception list of the other
+terminal runs outside it, so the retention-window interior is one run and the
+object stays KBs even at large retention -- **debounced**, so a tick that
+verified nothing new writes nothing (the debounce compares the timestamp-free
+body, so it rides the existing tick and needs no separate timer). On startup,
+and whenever a membership change moves ownership of a unit to this process, the
+worker lists this prefix and GETs every sibling's snapshot (its own previous one
+included), seeding its in-memory memo from the freshest non-stale entries for
+the units it now owns, so a restart or ownership handoff warm-starts instead of
+rescanning the retention window cold. A snapshot is trusted only while it is
+within one memo re-verify interval (default 1h) of the reader's clock: past that
+every entry it carries would already be individually stale, so an older snapshot
+holds nothing that could suppress a read and is ignored. Like the heartbeat, the
+payload is a versioned-tag advisory record -- membership/warm-start state,
+deliberately **not** a lease -- and losing, staling, or corrupting it costs at
+most a rescan of the affected units, never correctness (the ADR-0003
+HEAD-pointer precedent). Nothing deletes these snapshots (staleness detection
+replaces a sweep; a bounded cleanup sweep is a future step if it ever matters). A
+reader skips an object over 32 MiB (`MAX_MEMO_SNAPSHOT_BYTES`), judged by its
+listed size and by a range GET of the cap plus one byte, and the decoder
+refuses a snapshot whose runs expand to more than 4,194,304 per-hour entries
+(`MAX_MEMO_SNAPSHOT_ENTRIES`); a writer whose snapshot is over either cap
+skips the write, leaving its units to a cold rescan (ADR-0065 snapshot size cap
+amendment). Each snapshot carries a MAC under the `--maintain-key-file` keys
+over the writer's process id, timestamp and body, and a reader seeds only from
+snapshots whose MAC verifies (ADR-3130 memo snapshot amendment).
+
+`sys/maintain/claims/compaction/<work_id_hex>` (ADR-1029 §1, Accepted) is the
+maintain role's advisory work-claim keyspace, the third root-level prefix
+beside the heartbeat and memo prefixes above. The primitive lives in
+`ravel_fleet::claim` (`acquire`, `renew`, `steal`, `mark_completed`) and two
+drivers call it: the background maintenance supervisor's compaction tick, and
+`ravel-cli maintain compact-bucket` / `compact-tenant`. Both reach it through
+`ravel_maintain::compact_bucket_claimed`, so an operator's run and a supervisor
+do not both pay for merging the same sealed bucket. The erasure
+rewrite of a bucket (`ravel_maintain::erasure_rewrite_bucket`) and a format
+migration of it (`ravel_maintain::migrate_bucket_format`, which `ravel-cli
+maintain migrate` drives and which publishes a compaction record) take the same
+claim under the same `work_id`, and every one of these passes holds it through
+its record PUT and re-lists the bucket just before that PUT, publishing nothing
+if its record set changed, so none publishes over another (ADR-1029's
+2026-10-03 amendment). Claiming is skipped, and the bucket processed unclaimed, only when
+coordination is switched off or when the driver installs no participant at all,
+which is what `ravel-cli`'s `--dry-run` and `--no-claim` do; the re-list still
+runs, and `claim_min_input_bytes` no longer decides anything. `work_id` is
+`blake3::derive_key("ravel-compaction-claim-v1", tenant_hash || signal ||
+shard || ingest_hour_bucket)`, hex-encoded, where `tenant_hash` is the raw 16
+bytes, `signal` is the one-byte signal key prefix (`l`, `m`, `s`, ...), and
+`shard` and `ingest_hour_bucket` are little-endian u32s (a fixed 25-byte
+body): exactly the four fields of a
+compaction bucket, the same granularity the commit-record key prefix is built
+from, and deliberately **not** including the input-set hash or any policy or
+geometry knob, so two nodes whose listings diverge on one bucket collide on one
+claim instead of running twice under two. The body is a versioned-tag protobuf
+`CompactionClaim` (`format_version`, `owner_process_id`, `attempt_id`,
+`input_set_hash`, `state`, `renewed_count`, `lease_duration_ns`,
+`owner_clock_ns`), of which `input_set_hash` and `owner_clock_ns` are operator
+forensics that no decision reads.
+
+Unlike its two siblings this key is **contended**, so it is never written with a
+plain `Overwrite`: it is acquired with `CreateIfAbsent` and every later write --
+renew, steal, mark-completed -- is a `CasVersion` update against the version the
+writer last saw. Expiry is `last_modified + lease_duration` (default 300 s)
+against the store's own server-assigned `last_modified` (milliseconds; the
+payload's nanosecond lease is converted to milliseconds for the sum), never
+against a node clock or the payload's `owner_clock_ns`. Every observed lease,
+the holder-declared one and the observer's configured fallback alike, is
+capped at 24 hours (`MAX_OBSERVED_LEASE_MS`), so a decodable-but-absurd lease
+suppresses a bucket for at most a day, except a version-protected claim
+(below). A contender that finds the claim held
+does exactly one GET plus one `head()`, reschedules its bucket past expiry with
+deterministic per-contender jitter, and never polls. Nothing deletes these
+objects PROGRAMMATICALLY: an unconditional DELETE by a worker whose claim was
+already stolen would destroy the newer owner's claim, so completion is a CAS
+state flip and reclamation is lifecycle aging. A claim whose payload no longer
+decodes is judged by the 24 hour ceiling: it holds its bucket against both the
+compaction and the erasure rewrite until its `last_modified` is more than
+`MAX_OBSERVED_LEASE_MS` plus the contender's jitter in the past, and then a
+contender steals it under CAS on the observed version, so the stealing pass
+runs fenced (ADR-1029, 2026-11-09 amendment). A claim whose `format_version`
+is 0 or above the version this build knows is version-protected instead
+(ADR-4233 decision 4, H8; ADR-1029, 2026-11-15 amendment): it decodes, is
+never stolen at any age, and holds its bucket until an operator deletes the
+object or a build that knows the version reclaims it; the contender rechecks
+it once per lease, so a hand delete is noticed without a restart. A pass never
+runs past an unreadable claim unclaimed, since it would publish unfenced. An operator who
+needs the bucket sooner may delete that one key by hand, but only once no
+compaction, migration or erasure rewrite of that bucket is running. A writer
+that re-PUTs a claim more often than every 24 hours still holds the bucket.
+Like the heartbeat and the memo it must sit
+outside any WORM-protected prefix, since it is mutated in place.
+
+Between two compactions the claim is **advisory and reconstructible**: it
+gives neither publication rights over the other, the record publish
+(`publish.rs`) never reads it, and losing or corrupting one costs at most a
+duplicated merge. Racing compactions still serialize at the compaction record's
+`CreateIfAbsent` and at content-addressed part keys.
+Between a compaction (or a migration) and an erasure
+rewrite of the same bucket it is a fence, as the paragraph above describes:
+their records have different keys, so no `CreateIfAbsent` serializes them, and
+a participating pass publishes only while it holds the claim, with the
+pre-publish re-list behind it. Each pass checks that before its own PUT; the
+store enforces no lock, and a pass that takes no claim (coordination off, or
+`--no-claim`) is fenced by the re-list alone, which leaves a short window
+between that re-list and its PUT.
+This is a claim, deliberately **not** a lease (`LeaseCheck` is the unrelated GC
+reader-protection gate) and **not** membership (that is the
+`sys/maintain/workers/` prefix above).
+
+`t/<tenant_hash>/a/state/latest` (ADR-1294, Proposed) is the alert evaluator's
+derived state memo, one object per tenant holding the folded latest record per
+`alert_id` plus the seal-bound hour it was stamped in: never the writer's own
+current-tick hour, always the newest hour no overlapping prior lease holder
+can still write into. It is a derived cache of the
+`Signal::Alerts` fold (ADR-0040 decision 3), placed deliberately outside the
+`t/<tenant_hash>/a/c/` commit prefix so neither the evaluator's own fold nor the
+`alerts` SQL table's listing of commit records ever sees it. On each tick every
+replica GETs the memo and folds only the commit records at or after its stamped
+hour (one server-side `start-after` LIST plus a commit/data GET pair per
+transition in that window), instead of re-folding the whole ever-growing alert
+history; the lease holder then rewrites the memo with a plain `Overwrite`
+(single writer per key, debounced so an unchanged tick writes nothing). The body
+carries its own `format_version`, and a reader that finds the memo absent,
+undecodable, of an unsupported version, or carrying duplicate `alert_id` entries
+falls back to a full fold and rewrites
+a valid memo, so the memo is **advisory and reconstructible**: losing, staling,
+or corrupting it costs at most one tick's full fold, never a wrong alert state.
+The non-optional tail LIST is what keeps a stale memo from being trusted: a
+transition written after the memo lands at an hour at or above the watermark and
+is folded in. The `Signal::Alerts` records, the RLOG format, and every other key
+are untouched; this is a new derived-object prefix, no version bump, following
+the `sys/maintain/memo/` precedent above (ADR-0065 §3).
+
+`sys/qualification` and the `sys/qualify/` prefix (ADR-0050 §6, ADR-1302)
+are additive root-level keys, outside any tenant's `t/<tenant_hash>/` space.
+`sys/qualification` is written by `ravel-cli store qualify`
+(services/ravel-cli/src/qualify.rs) via `CreateIfAbsent` after a passing
+conformance run, once per bucket at a given suite version. A record left
+by an older suite version is the one exception: a re-run overwrites it,
+guarded by `CasVersion` on the version it read so a concurrent newer
+record is never downgraded (ADR-1302). Server startup on a production
+store kind reads it to refuse starting when the record is absent or its
+suite version is stale. `sys/qualify/<run-id>/...` holds the
+scratch objects the conformance suite (crates/ravel-object-store/src/
+conformance.rs) writes and reads while probing conditional-write and
+listing consistency under a fresh `run-id` each run; these objects are
+transient probe fixtures, not durable state, and carry no lifecycle
+guarantee beyond the run that created them.
+
+`sys/compat` (ADR-4233 decision 3, proto/ravel/sys.proto `CompatRecord`) is
+the store-wide format activation record, outside any tenant's space. It
+holds a baseline release, one store-wide `compat_epoch`, the maximum publish
+lifetime, the adopted versions, and one entry per format family (`rseg`,
+`rlog`, `rspan`, the catalog families and the record families) carrying that
+family's `active_write_version`, the epoch and time it was activated, an
+optional census certificate, and its fence and late-write progress. It is
+created with `CreateIfAbsent` and then changed only by a `CasVersion`
+whole-record replace (`ravel_catalog::compat::create_compat`,
+`update_compat`), and every change is monotone: `compat_epoch`, each
+family's `active_write_version` and `activated_epoch`, and its certificate
+version never go down, and no family entry is removed; an update that would
+lower one is refused with `WouldLower`. `activate_family` raises one
+family's `active_write_version` by exactly one and `compat_epoch` by one,
+and refuses an absent record, a family without an entry, an equal or lower
+version, and a jump of more than one. The record carries a `mac` (field 8):
+a BLAKE3 keyed hash over its field values under a key derived from a
+deployment file key with the context `ravel compat record v1`; the first
+key signs and any configured key verifies, as for the maintain-worker
+heartbeat (ADR-3130). Readers accept `format_version` 1 only. A reader
+checks the version before the MAC, so a record from a newer writer is the
+typed `CompatRecordNewer` and never reads as absent, and an absent object is
+the only case that reads as no record. `CompatView` is a process's monotone
+view of the record: a refresh never lowers a version, epoch or certificate
+it has already seen, and a failed refresh leaves the view and the time of
+its last successful read unchanged. `CompatView::write_policy` refuses a
+write with `ViewStale` once the last successful read is 10 minutes old or
+there has been none (`COMPAT_VIEW_HORIZON`; the default refresh interval is
+60 s), with `CompatRecordMissing` when the record is absent but the target
+bucket is fenced or this process has already seen an epoch, and with
+`ActiveVersionNotWritable` when the family's active version, or the
+baseline for a family the record does not name, is not one the writer can
+produce. A refusal is retryable except `CompatRecordMissing`. When two
+refreshes overlap, each merges the monotone values it read, but the record
+and its presence are those of the read that started last, so a slow read
+that finishes after a later one never brings back an older record or an
+absence. The library takes its clock as a `CompatClock`; the server supplies
+the wall clock.
+
+`ravel-server` builds one `CompatView` per process in every mode, keyed by
+the deployment key (`--tenant-hash-key-file`), reads the record before any
+writer starts, and re-reads it every 60 s from one task. On an unkeyed bucket
+it builds none and installs no policy. The catalog fold follows the view for
+the catalog families (`catalog-head`, `csnap`, `npost`, `cstat`, `kidx`;
+`Catalog::with_compat_policy`, `Catalog::fold_compat_versions`): each must be
+active at the highest version the fold writes for it
+(`ravel_catalog::fold_write_version`), and otherwise the cycle is refused
+before anything is read or written. With no policy the fold writes what it
+always has. After an activation (the view has seen a `compat_epoch` above 0)
+a server first touch creates a new bucket's provisioning record born fenced
+at that epoch.
+
+`t/<tenant_hash>/<signal>/prov` (ADR-0050 §5) is the durable
+`shard_count` provisioning record: a per-(tenant, signal) object holding
+`tenant_hash`, `signal`, `shard_count`, a `format_version` floor,
+`created_unix_ns`, an append-only `generations` history (ADR-0052), and an
+append-only `format_floors` history (ADR-0066 §3): per-format-family floors
+below which no live object exists for this (tenant, signal), raised only,
+never lowered, CAS-appended by `ravel_catalog::raise_format_floor`
+(proto/ravel/sys.proto `ProvisioningRecord`). Each floor entry holds its
+family, `floor_version`, `raised_unix_ns`, `raised_by`, and the observation
+basis of the audit that verified the raise: `observed_entries` (live L0 commit
+records plus every compaction and rewrite part), the newest `created_unix_ns`
+among those commit records and every compaction and rewrite record, and
+`observed_shards` (the shard range scanned, never 0 on a written basis). A
+floor whose three basis fields are all zero has no basis; a raise carries
+every earlier entry through unchanged, so such a floor stays basis-less.
+Readers accept `format_version` 1 through 4. Version 4 adds the compat fence
+(ADR-4233 decision 4): `compat_epoch` (field 8), the newest `sys/compat`
+epoch this (tenant, signal) has been fenced at, and `compat_fenced_unix_ns`
+(field 9), when a record written before the fence was first raised to it. A
+writer stamps 4 on a record that carries either field or was already stamped
+4, and 3 otherwise, so an unfenced bucket stays readable by a version-3
+reader and no rewrite un-fences a fenced one. The two CAS rewrite paths
+(`append_generation`, `raise_format_floor`) carry both fields through and
+refuse a record above 4 rather than re-encode it without fields they do not
+model. `ravel_catalog::raise_compat_fence` CAS-raises `compat_epoch`, never
+lowers it, and leaves a record already at or above the requested epoch
+untouched; only a raise from a record below version 4 sets
+`compat_fenced_unix_ns`, to the raise time, and a later raise keeps the
+stored value. A record created by `ravel_catalog::validate_or_adopt_fenced`
+with a compat epoch for a bucket with no data is born fenced: version 4,
+that epoch, and `compat_fenced_unix_ns` 0, because it holds no pre-fence
+data. One that adopts a bucket already holding data is fenced at the
+adoption time instead, since some process wrote that data before the fence. The
+record is written with `CreateIfAbsent` at the tenant's first write for that signal
+(`ravel_catalog::validate_or_adopt`), so a racing loser re-reads and
+validates against the winner rather than erroring. It lives under the
+tenant's own prefix, alongside that signal's `l0/` and `c/` shard data, not
+in the bucket-root `sys/` space, because it is per-tenant state. Every
+ingest, catalog resolution, and maintenance each read the record and route
+over its generation history (`ravel_catalog::scan_count`, see below), never
+the scalar `shard_count` field alone, so a query never resolves over a
+subset of shards. The generation history is authoritative: it does not have
+to equal the
+process's live `--shards` value, which is only a default for tenants that have
+no record yet. A difference between the two (for example after lowering the
+global default) is tolerated and surfaced as an informational metric, not a
+refusal (ADR-0082). Three cases still fail closed: adopting a value that
+would hide existing data, an unreadable record whose true count cannot be
+trusted, and a decodable record whose generation history fails structural
+validation (`CorruptGenerations`). A (tenant, signal) with pre-ADR data but no record is adopted once
+(the record is written from config) only when every observed shard index is
+below the configured `shard_count`; a higher observed index proves the value
+would hide data and refuses without writing.
+`shard_count` is immutable per generation; the generation history is
+append-only; the shard-index domain of hour `h` is `0..scan_count(h)`
+(ADR-0052, online resharding), floored at `Signal::fixed_read_shards()` for
+the alerts and audit signals whose writers pin fixed shard indices (ADR-1101
+decision 2; see "Online resharding" below). A reshard appends a
+`(generation, shard_count, activation_hour)` entry to this record under
+`CasVersion` (`ravel_catalog::append_generation`); every existing byte of
+history is immutable, and the scalar `shard_count` field stays equal to
+generation 0's count. Readers derive the per-hour shard fan-out from the
+history via `ravel_catalog::scan_count` rather than a single static count.
+
+`t/<tenant_hash>/enc` (ADR-0062 §1b) is the durable per-tenant
+KMS key-epoch record: a tenant-scoped object (not per-signal, since a
+tenant's KMS key applies across every signal) holding `tenant_hash`, a
+`format_version` floor, `created_unix_ns`, and an append-only `epochs`
+history, each epoch `{epoch, key_arn (empty = deployment default),
+activated_ns}` (proto/ravel/sys.proto `KeyEpochRecord`/`KeyEpoch`). It is a
+wholly new additive object type; ADR-0062 authorizes it, no existing layout
+changes and no version bump is required. The first time a tenant's key is
+configured or changed, one epoch is appended
+(`ravel_catalog::record_key_epoch`): epoch 0 is bootstrapped with
+`CreateIfAbsent` (a racing loser surfaces a typed CAS conflict and re-reads,
+the `ProvisioningRecord` first-write precedent), and every later rotation is
+appended under `CasVersion` with an `activated_ns` strictly past the last and
+a `key_arn` different from the last (the `append_generation` reshard pattern).
+Every existing byte of history is immutable. Because data objects are
+immutable, every object's write time locates it in exactly one epoch, so
+"which key encrypts what" is answerable from the bucket alone;
+`ravel-cli maintain verify-custody` uses `ravel_catalog::epoch_for_write` to
+flag any live object whose write time predates the tenant's first recorded
+epoch as a custody anomaly. A tenant with no `enc` record has only ever used
+the deployment default key, which is not an error (`read_epochs_from_store`
+returns `Ok(None)`). This record is durable audit metadata only; it is not
+read on the live write path (the routing decorator carries the active key),
+so a slightly stale reader cannot misroute a write.
+
+`t/<tenant_hash>/config` (ADR-0066 §6) is the durable per-tenant
+config record that moves tenant lifecycle state, admission-limit overrides,
+retention, and indexed-field config off process flags and into durable state.
+A tenant-scoped object (not per-signal, since these apply across every signal)
+holding `tenant_hash`, a `format_version` floor, a `lifecycle_state`
+(`active` / `suspended` / `offboarding`), optional admission-limit and
+retention overrides, an optional indexed-field set, an optional declared
+typed-attribute-column set (ADR-0090; `str`/`i64`/`bool`/`bytes` only in v1),
+an optional clustering key (ADR-2135; its columns, bucket width and
+generation, where a cleared key keeps the field with an empty column list),
+a bloom scope (ADR-2135; an absent one reads as `ALL`), and
+`created`/`updated` timestamps (proto/ravel/sys.proto `TenantConfigRecord`).
+Defaults still come from flags/limits-file at startup; a field present here
+overrides the default for this tenant, an absent one leaves the default in
+place.
+
+The record's `format_version` history:
+
+- format version 1: the original layout, fields 1 to 12.
+- format version 2: the same field set, stamped by every writer by default; a
+  floor signal that makes a binary predating the version-2 reader refuse the
+  record rather than rewrite it.
+- format version 3: written on demand by the storage-layout setters behind an
+  operator opt-in; every reader must run a release with the version-3 reader
+  first.
+
+Version 3 adds the clustering key (field 13) and bloom scope (field 14). They
+are written only through `TenantConfig::set_clustering_key`,
+`TenantConfig::clear_clustering_key` and `TenantConfig::set_bloom_scope`, each
+of which takes a `StorageLayoutWrite` token and refuses with
+`WriterCannotEmit` unless it is `ReadersRolledOut`, the operator's statement
+that the version-3 reader is deployed everywhere. `ravel-cli clustering-key
+set`, `ravel-cli clustering-key clear` and `ravel-cli bloom-scope set` call
+them, passing `ReadersRolledOut` only under their required
+`--readers-rolled-out` flag. That is the ADR-0066 R1
+reader-first rule: a binary whose reader predates version 3 has a read
+ceiling of 2 and refuses a version-3 record outright, so its reads of that
+tenant's config fail and it will not rewrite the record. The token is not
+checked against the readers actually deployed. A config that carries
+neither field, or only a bloom scope of `ALL` (the zero value, which is not
+written), is still stamped 2 byte for byte. `set_tenant_config` refuses to
+rewrite a record above version 3, and refuses a config carrying either field
+that did not come from an opted-in setter or a decoded version-3 record, so a
+version-1 or version-2 record that carries field 13 or 14 cannot be written
+back. That opt-in check runs before any object-store request.
+
+The clustering generation follows ADR-2135. A tenant that never set a key or
+a bloom scope has an absent field 13 at generation 0. Every set and every
+clear stores the stored generation plus one: the first set is generation 1,
+and a clear of a key at generation `g` keeps field 13 present with an empty
+column list, an unspecified bucket width and generation `g + 1`, which ranks
+the clear above every earlier key. A bloom scope change takes a generation
+too, so one generation names exactly one key and one scope:
+`set_bloom_scope` with a scope other than the stored one stores the stored
+generation plus one and leaves the key's columns and bucket width as they
+were, and on a tenant with no field 13 it writes field 13 in its cleared form
+at generation 1. Setting the scope already stored changes nothing. Under
+the `undeclared` scope the writer's bloom coverage also depends on which
+typed attribute column names the record declares, so `set_tenant_config`
+takes a generation itself for a write at the stored generation whose declared
+name set differs from the stored record's: the stored generation plus one,
+keeping the key's columns and bucket width, or field 13 in its cleared form
+when there is no key. A retype or a reorder of the same names keeps the
+generation, and so does the same change under `all` or `text`. One
+generation therefore names one key, one scope and, under `undeclared`, one
+set of typed attribute column names. That generation is taken after the checks below, so a
+`typed_attr_columns` change the current key refuses is still refused.
+Clearing a key that was never set, or one already cleared, is refused and
+takes no generation. A record
+spells a cleared key differently from a log segment footer: the record keeps
+the field present with an empty column list and a generation, while the footer
+(docs/log-segment-format.md) carries no `sort_descriptor` and a nonzero
+`clustering_generation`. A set key names 1 to 4 distinct columns, each
+declared in the record's own `typed_attr_columns` (not the base columns a
+server falls back to when the record declares none), and a specified bucket
+width. On every write `set_tenant_config` runs the accessor's validation on a
+carried key, including those column rules, and refuses a bloom scope value
+the enum does not define. Field 14 follows the setter rule too: against the
+record it replaces, `set_tenant_config` refuses a bloom scope that differs
+from the stored one unless `set_bloom_scope` produced it
+(`BloomScopeChangedOutsideSetter`), and a scope change at the stored
+clustering generation (`BloomScopeChangedWithoutGeneration`), since that
+config was not read from the current record. It does not repeat the setters'
+generation arithmetic. Against the record it replaces it enforces that the
+generation never goes down and that a key whose columns, or whose bucket
+width while set, differ from the stored key's carries a new generation; it does not
+require the stored generation plus one, so two setter calls on one
+in-memory config store the stored generation plus two. While the stored set
+key is current it also refuses a `typed_attr_columns` change that drops or
+retypes a key column
+(`ClusteringKeyColumnRemoved`, `ClusteringKeyColumnRetyped`, both naming the
+column and saying to clear the key first), since one generation names exactly
+one descriptor, column types included. Declaring new columns or retyping a
+column outside the key is allowed.
+
+Unlike the append-only `prov`/`enc` histories, the config record is mutated by
+**whole-record CAS-replace** (`ravel_catalog::set_tenant_config`, the `sys/gc` `set_gc_config`
+pattern): a config override is mutable current state whose latest value is the
+only one that matters and which must support lowering a limit or clearing an
+override, so the record is read for its version and swapped in place under
+`CasVersion`; a concurrent write is a typed conflict the loser re-reads, never
+a silent overwrite. On a tenant with no record the first write bootstraps with
+`CreateIfAbsent`. `set_tenant_config` takes that version from its own read,
+so it guards only the window between its read and its swap: a caller that
+read the record earlier, changed it and passes the result overwrites a write
+that landed in between. `TenantConfig::write_if_unchanged` closes that window
+for a read-modify-write caller: it takes the version the caller read (or
+`None` for a record the caller found absent) and refuses with `CasConflict`,
+writing nothing, when the record now carries another version, was deleted,
+or was created since. The `ravel-cli clustering-key` and `bloom-scope`
+commands write through it. A tenant with no `config` record runs entirely on the
+deployment defaults (`read_config` returns `Ok(None)`). This record is durable
+control state only; the bounded-staleness refresh loop that reads it on a
+horizon and re-invokes the admission controller's `set_tenant_limits` is a
+separate concern.
+
+`ravel-cli clustering-key show --tenant <t>` and `ravel-cli bloom-scope show
+--tenant <t>` print fields 13 and 14 of a tenant's record, including one of
+version 3; `clustering-key set`/`clear` and `bloom-scope set` write them (see
+the [ingest guide](guides/ingest.md#setting-a-tenants-clustering-key-and-bloom-scope)).
+
+`t/<tenant_hash>/m/meta` (ADR-0085 §1) is the durable per-tenant metric
+metadata record: one entry per metric **family name** (never per series)
+holding the `{type, help, unit}` tuple captured at ingest, plus a
+`format_version` floor and the owning `tenant_hash`
+(proto/ravel/sys.proto `MetricMetadataRecord`/`MetricMetadataEntry`, zstd
+compressed on the wire). It sits under the metrics signal prefix `m/` beside
+`m/l0` and `m/c` rather than at a new top-level prefix. Like
+`t/<tenant_hash>/config` it is mutated by **whole-record CAS-replace**
+(`ravel_catalog::write_metrics_meta`, with `CreateIfAbsent` on the first write
+for a tenant): the entry set is mutable current state, and pruning it back
+under the per-tenant entry cap by evicting the oldest entries is a shrinking
+write an append-only history cannot express. A concurrent write is a typed
+conflict whose loser re-reads and field-wise re-merges onto the winner's body
+(`ravel_catalog::merge_entries`) rather than overwriting it; an absent incoming
+`help`/`unit`, or a `type` of `unknown`, never overwrites a populated stored
+value, so two ingest paths that each carry part of the tuple compose instead of
+clobbering. A tenant with no `m/meta` record has had nothing captured yet,
+which is not an error (`read_metrics_meta` returns `Ok(None)`) and reads as an
+empty `/api/v1/metadata` response. Grants: the **ingest role** (the process
+hosting the OTLP, OTAP, RW1, and RW2 surfaces, the same role that already
+writes that tenant's `<signal>/idem/*` and data/commit keys) holds read and CAS
+write on this key; the **query role** holds read-only, since it only serves the
+record through `/api/v1/metadata`; and **no role holds delete**. Like `config`
+and the `admission`/`maintain` keys, this key is never swept, only overwritten
+in place, so remediation of a record polluted by a bad client is the same CAS
+write with a smaller merged body, not a deletion.
+
+`sys/auth` (ADR-0066 §6) is the durable, deployment-wide bearer-token
+map replacing the startup-frozen `--tenant-token` allowlist: a bucket-root
+object (never under a tenant prefix, since an entry maps a token to whichever
+tenant it grants) holding a `format_version` floor, a 16-byte deployment-key
+fingerprint, and `entries` mapping a token hash to a tenant id
+(proto/ravel/sys.proto `AuthTokenMap`/`TokenHashEntry`). The bucket **never**
+holds a plaintext token: each `token_hash` is
+`blake3::keyed_hash(deployment_key, token)`, so the map is useless without the
+deployment key and a low-entropy token is not recoverable by an offline
+dictionary attack (the tenant-hash-v2 keyed-hashing pattern). The stored
+fingerprint lets a reader configured with the wrong deployment key refuse
+rather than silently mismatch every hash. Like `t/<tenant_hash>/config` it is
+mutated by whole-record CAS-replace (`ravel_catalog::upsert_token` /
+`remove_token`): the map is current-state and revocation (removing an entry) is
+a first-class operation an append-only history cannot express. A deployment
+with no provisioned tokens (or one using only OIDC/mTLS) has no `sys/auth`
+object, which is not an error (`read_auth_map` returns `Ok(None)`). The
+resolver refresh loop (rate-limited on-miss re-read, fail-closed revocation) is
+a separate concern; this module supplies only the object shape, the keyed hash,
+and the CAS read/write helpers.
+
+- `keyhash32` (idempotency marker keys only, ADR-0051 §5): 32 lowercase hex
+  chars, the first 16 bytes of `blake3("ravel-idem-v1" || tenant_id ||
+  client_key)`, where `tenant_id` is the logical tenant identifier (not
+  `tenant_hash`) and `client_key` is the caller's opaque
+  `x-ravel-idempotency-key`. The `idem/` prefix is additive: no existing
+  read, resolve, or sweep path lists it (commit resolution lists `c/…`, the
+  orphan sweep lists `l0/…`; the fail-loud unknown-key rule below applies
+  only to the `c/` prefix), and markers older than the dedup window
+  (default 24h, from the `ingest_hour` in the file name) are deleted by
+  `ravel_maintain::sweep::sweep_idempotency_markers` (ADR-0051 §5), not by
+  this crate: it LISTs the coarser
+  `t/<tenant_hash>/<signal>/idem/` prefix (no `keyhash32`, since the sweep
+  has no client key to scope by), deletes every marker whose `ingest_hour`
+  is more than `CompactorConfig::idem_dedup_window_hours` (default 24h)
+  behind the sweep's current ingest-hour bucket, and skips (rather than
+  errors on) any key under the prefix that fails to parse as
+  `<keyhash32>.<ingest_hour>.idm`. Under `CompactorConfig::dry_run` it counts
+  what it would delete without calling `delete`.
+- Marker body byte layout and checksum coverage: see "Idempotency marker
+  body layout" below.
+- `input_set_hash16`: first 16 hex chars of the compaction record's
+  `input_set_hash`. For a version 1 record that is the blake3 digest over its
+  sorted `inputs` list (canonical encoding, sorted by
+  `(writer_id, writer_epoch, writer_seq)`); for a version 2 record it is the
+  superseding-record hash described under "Version 2 compaction record"
+  below. `hash16` on an L1 segment is the
+  part object's own blake3, same convention as an L0 data key. `part` is
+  zero-padded 4 digits.
+- Compaction records, rewrite records, and the retention tombstone live in
+  the same `c/<shard>/<ingest_hour>/` prefix as L0 commit records, so the
+  per-shard bounded resolution LIST discovers every shape in one pass, without
+  a second LIST. Filenames are disjoint by construction:
+  `<writer_id>.<epoch>.<seq>.cmt` (L0 commit), `l1.<input_set_hash16>.cmt`
+  (compaction record), `rw.<input_set_hash16>.cmt` (selective-erasure rewrite
+  record, ADR-0064 decision 3), `retire.tmb` (tombstone, fixed name). A key in
+  this prefix matching none of these shapes is a fail-loud error (surfaced to
+  metrics), never silently skipped: layout drift must be visible, not
+  swallowed. `keys::partition_bucket_entry` classifies all four shapes, so
+  every caller handles a rewrite record explicitly rather than by wildcard.
+  This matters most in `crates/ravel-catalog/src/fold.rs`: the fold treats an
+  unrecognized shape as layout drift and skips it with a warning, so an
+  unclassified `rw.` key would have had its supersession of the erased inputs
+  ignored by the index fold, letting erased records reappear in a folded
+  snapshot.
+- Age-based retention (ADR-0019) reads and deletes all three record shapes.
+  ADR-0019 decision 1 names only L0 commit records and compaction records as
+  the inputs to a bucket's expiry maximum, and decision 4 names only those two
+  in the physical sweep's delete list, because selective erasure (ADR-0064)
+  postdates it. Both include rewrite records: a bucket's expiry maximum is
+  `max(max_event_ts_ns)` over L0 commit records, compaction-record parts, and
+  rewrite-record parts, and the sweep deletes the rewrite record with the other
+  records, before the data objects and parts and before the tombstone last. A
+  rewrite record with no parts (an erasure that dropped every record in the
+  bucket) carries no event timestamp and contributes its own `created_unix_ns`
+  to that maximum instead. Rewrite-record-only is the durable steady state of
+  an erased bucket -- the superseded-input sweep removes the rewrite's inputs
+  once their protection horizon elapses, and compaction refuses a bucket
+  holding a live rewrite record -- so a retention pass blind to that shape
+  retains erased-and-rewritten data past `R` with no path to deletion, and a
+  sweep blind to it can never see the bucket empty.
+- Format-version gate on read (ADR-0066 decision 2). A compaction record
+  carries a `format_version` in {1, 2} and a retention tombstone one of 1, and
+  every production reader decodes them through
+  `ravel_commit::record::decode_compaction` and `decode_tombstone`, which
+  validate that version against the supported set and return a typed
+  `RecordError::UnsupportedRecordFormatVersion` naming the record kind and the
+  version seen. A record a future writer stamps at a version this build does
+  not know is refused, never read as a known version: supersession is the
+  load-bearing consumer, so a misread compaction record would let the sweeper
+  delete a live L0 input or the resolver skip one. The raw `prost` decode,
+  which skips this gate, is confined to test helpers.
+- Version 2 compaction record (ADR-0066, "force 2 for compaction parts, a
+  superseding compaction record" amendment). A `format_version = 2`
+  `CompactionRecord` re-encodes an existing compaction record: it copies that
+  record's `inputs` verbatim and names it in `superseded_record_key`, and it
+  supersedes the record it names. Its `input_set_hash` is
+  `ravel_commit::erasure::compute_superseding_compaction_input_set_hash` over
+  `(inputs, superseded_record_key)`, a domain distinct from the version 1 and
+  rewrite hashes, so its key keeps the `l1.<input_set_hash16>.cmt` shape and
+  differs from its predecessor's. Decoding refuses a version 2 record whose
+  `superseded_record_key` is empty, is not a compaction record key (a rewrite
+  record key included), is not the canonical rendering of the key it parses
+  to (lowercase hex in the tenant and `hash16` fields, exactly as
+  `keys::compaction_record_key` renders it), names a different tenant,
+  signal, shard or hour bucket, or whose `input_set_hash` is not that hash,
+  and refuses a version 1 record that sets the field. The seal-divergence
+  check (`catalog verify`, scrub) recomputes each compaction record's hash for
+  its own version: the version 1 hash over `inputs` for a version 1 record,
+  the version 2 hash over `(inputs, superseded_record_key)` for a version 2
+  record. Resolution honours its supersession (step 3 of "Snapshot
+  resolution" below), and refuses a bucket where a version 2 record's inputs
+  differ from those of the present record it names. The superseded-input
+  sweep reclaims the record it names, with that record's parts, once the
+  version 2 record's protection horizon has passed (docs/deletion-and-gc.md,
+  the superseded-input row). No writer produces a version 2 record yet, so
+  that reclamation has nothing to act on until the writer ships.
+- Selective-erasure request and completion records (ADR-0064 decision 1) live
+  under a separate `t/<tenant_hash>/<signal>/del/` prefix, not in `c/`, so the
+  bucket-resolution LIST never sees them; the resolver LISTs `del/` once per
+  resolve to attach pending predicates (decision 2), concurrently with the
+  shard fan-out. A `.dreq` is written
+  `CreateIfAbsent`, is immutable, necessarily names the subject, and is deleted
+  after its `.done` exists plus the protection horizon (decision 5). A `.done`
+  is written `CreateIfAbsent`, is immutable, carries no plaintext subject
+  identifier (only a blake3 predicate hash and per-bucket dropped counts), and
+  is permanent audit evidence. The `rw.<input_set_hash16>.cmt` rewrite record's
+  `input_set_hash16` is the first 16 hex chars of the blake3 digest defined by
+  `ravel_commit::erasure::compute_rewrite_input_set_hash` (domain-separated,
+  over the record's superseded input set or superseded record key plus its
+  sorted applied request ids), a distinct domain from the compaction
+  `input_set_hash` so the two can never collide.
+- The maint cursor (`m/maint/<shard>/cursor`) is advisory mutable state,
+  updated by CAS, the same exemption from the immutability rule that the
+  ADR-0003 HEAD pointer has. Losing or corrupting it costs a rescan, never
+  correctness; it carries no durability role and is not a manifest.
+- The migrate cursor (`<signal>/maint/migrate/<family>/cursor`) is the
+  advisory position of `ravel-cli maintain migrate` for one tenant, signal
+  and format family: the last `(shard, hour)` bucket the walk finished. It
+  sits on a path disjoint from the maint cursor (a shard segment is always
+  numeric, `migrate` never is) and has the same CAS exemption; losing or
+  corrupting it costs a rescan from the start.
+- The unnamed-since markers (`<signal>/maint/unn/...`, ADR-1133) record when
+  a sweep first found a delete candidate past its protection horizon that the
+  live HEAD does not name. The retention marker `retire.unn` is one per
+  tombstoned bucket; the superseded-input marker is one per chain group,
+  named by the file stem of the compaction or rewrite record the group is
+  entered from. Each is written once with `CreateIfAbsent` and never
+  rewritten, and its body (`UnnamedSinceMarker` in proto/ravel/commit.proto)
+  holds the writer's clock reading and the identity of the tombstone or
+  record it was written for, never tenant data. A marker is deleted after
+  the objects it gated (a retention marker before its tombstone); when its
+  candidate is named by HEAD again; when its anchor no longer matches, in
+  which case a fresh one replaces it; or by the orphan-marker rule once its
+  anchor is gone (docs/deletion-and-gc.md). The prefix sits outside every
+  commit prefix, so no bucket listing returns a marker.
+
+- `tenant_hash`: hex, 32 chars (ADR-0009). The derivation is pinned per
+  bucket at bucket birth by the `sys/tenancy` marker (ADR-0050 §3), and one
+  binary carries both derivations, selected once at startup:
+  - v1-unkeyed: `blake3("ravel-tenant-v1" || tenant_id)[0..16]`. The
+    original derivation and the permanent scheme for every pre-ADR-0050
+    bucket. Unkeyed BLAKE3 hides tenant names from keys but lets anyone with
+    list access confirm a guessed id offline.
+  - v2-keyed (the default for buckets created after ADR-0050):
+    `blake3::keyed_hash(k, tenant_id)[0..16]` where `k =
+    blake3::derive_key("ravel-tenant-v2", deployment_key)` and the 32-byte
+    deployment key is loaded from `--tenant-hash-key-file`. Enumeration
+    resistant: without the key, prefixes reveal nothing about which tenants
+    exist. `sys/tenancy` records a 16-byte fingerprint of the key (never the
+    key), so a wrong key is a startup refusal, not a silent parallel
+    namespace, and keyed buckets write a `sys/t/<tenant_hash>` recovery
+    manifest (the tenant id encrypted under an AES-256-GCM key derived from
+    the deployment key) at each tenant's first write.
+
+  There is no re-key migration between schemes (ADR-0050 §3;
+  docs/guides/operations.md).
+- `m` = metrics signal, `l` = logs, `s` = spans; all three carry data today.
+  `p` is reserved for profiles, which no ingest or query path builds.
+  Alerts `a` and audit `u` (ADR-0040) share `l`'s RLOG segment format
+  verbatim - no new byte layout, only two new signal-keyspace prefixes.
+- `shard`: zero-padded 4-digit decimal. `shard_count` is immutable per
+  generation; the generation history is append-only; the shard-index domain
+  of hour `h` is `0..scan_count(h)` (ADR-0052, superseding ADR-0010 §9's
+  "immutable per (tenant, signal)"), floored at `Signal::fixed_read_shards()`
+  for `a` and `u`, whose writers pin fixed shard indices (ADR-1101 decision
+  2). A reshard appends a new generation with
+  a future `activation_hour`; existing data is never moved or re-keyed, and
+  reads derive the per-hour shard set from the history.
+- `ingest_hour`: `YYYYMMDDTHH` UTC formatted from the pinned
+  `ingest_hour_bucket` (unix hours) of the flush. Never recomputed on retry.
+- `writer_id`: UUIDv4 assigned per process start. MUST be freshly random;
+  MUST NOT be derived from hostname, pod name, shard index, or any config
+  (ADR-0010 §3). `epoch`: u64, informational (unix seconds at startup).
+  `seq`: u64 monotonic per (writer_id, epoch, shard), zero-padded 20 digits
+  so lexicographic = numeric order. Gaps are permitted (abandoned flushes)
+  and carry no meaning: never infer completeness from seq continuity.
+- `hash16`: first 16 hex chars of the object's blake3.
+- `signal` (catalog keys only): the same one-letter signal prefix as the
+  data/commit keys (`m` for metrics), scoping the snapshot index per
+  (tenant, signal) the same way `shard_count` and the commit layout already
+  are.
+- `watermark` (catalog keys only): the snapshot part's watermark hour,
+  formatted as the same `YYYYMMDDTHH` text as `ingest_hour`. Informational
+  for operators; HEAD's `watermark_hour` field is authoritative, never this
+  string.
+- Snapshot parts are content-addressed: `hash16` is the blake3 of the part's
+  full encoded bytes, computed over the final object, so two folders that
+  fold the same input independently write the same key and
+  `PutMode::CreateIfAbsent` `AlreadyExists` is idempotent success, exactly
+  like data objects (ADR-0010 §7).
+- Superseded snapshot parts (`catalog/<signal>/snap/`), name-postings objects
+  and column-statistics objects (both `catalog/<signal>/idx/`) are swept by
+  `ravel_maintain::sweep::sweep_unreferenced_catalog_objects`, the fifth GC
+  sweep rule alongside orphan GC, the
+  superseded-input and unreferenced-part sweeps, and the idempotency-marker
+  sweep. Every fold that rewrites a part, a postings object, or a
+  column-statistics object writes a new
+  content-addressed key and swaps HEAD, leaving the old object in place (the
+  "orphan part" crash case); without this rule each such fold leaks one object. The rule LISTs the two
+  prefixes first, then GETs the current `catalog/<signal>/HEAD`, treats every
+  `parts[].key`, the optional `postings.key`, each part's optional
+  per-part column-statistics key `parts[].column_stats.key` (field 7), and
+  each part's key-index leaf keys `parts[].key_index[].key` (field 8,
+  ADR-2707, in the same change as the fold's leaf writer, since a leaf HEAD
+  does not name is swept) as
+  referenced, and deletes any
+  object under the two prefixes that HEAD does not name once its
+  `last_modified` age exceeds `CompactorConfig::protection_horizon_ns`. A fresh
+  re-verify GET of HEAD is taken immediately before the delete loop (the same
+  batched-re-verify shape orphan GC uses for its commit-prefix LIST), so an
+  object a fold's HEAD CAS named between the two reads is spared. Like the
+  idempotency-marker sweep, it is per (tenant, signal) rather than per shard
+  (catalog objects carry no shard dimension) and consults the
+  `LeaseCheck`/legal-hold gate before every delete; under
+  `CompactorConfig::dry_run` it counts what it would delete without calling
+  `delete`. A present, decodable HEAD is the rule's only anchor: an absent HEAD
+  sweeps nothing for the (tenant, signal), exactly like a bucket with neither a
+  compaction record nor a tombstone in the unreferenced-part sweep. This is
+  because a recovery fold rebuilding from no HEAD (`HeadState::Absent`/`Corrupt`)
+  recomputes and re-PUTs every part, and a non-tail span keys on its stable
+  `watermark_hour`, so the recomputed key is byte-identical to any surviving old
+  object: the PUT returns `AlreadyExists` and the fold adopts the old object
+  *without rewriting it* (its `last_modified` stays old) before naming it in the
+  HEAD it is about to CAS. With no HEAD to compare against, such an object is
+  indistinguishable from a part a fold is mid-flight on, so it must be left
+  alone. The `protection_horizon_ns` gate is therefore a reader-pinning buffer
+  here (at least `max_query_duration + grace + clock_skew_allowance`), not a
+  writer interlock: unlike the orphan and unreferenced-part gates, whose
+  lifetime terms mirror a real writer
+  abandonment deadline, adoption-via-`AlreadyExists` never refreshes
+  `last_modified`, so an object's age does not bound the fold that may adopt it;
+  what bounds the writer race is the no-anchor rule plus the pre-delete HEAD
+  re-verify. A HEAD present but undecodable fails the pass without deleting, so
+  a corrupt HEAD can never make the live snapshot look unreferenced. The
+  outcome splits its deletes by kind (`deleted_csnap`, `deleted_npost`,
+  `deleted_cstat`, `deleted_kidx`, and `deleted_other` for any other key under
+  the two prefixes), and the server renders them as
+  `ravel_maintain_catalog_objects_deleted_total{kind=...}`.
+
+### Per-part column statistics (ADR-1413)
+
+`SnapshotPartRef` carries an additive field 7, `column_stats:
+SnapshotColumnStatsPartRef`. It points at a `.cstat` envelope version 3: same
+`RCST` header/body/CRC shape the format has always used, keyed by content
+hash (`ColumnStatsSegment.writer_id` is the entry's own content hash), but
+scoped to exactly the one snapshot part that owns it -- `ColumnStatsHeader.
+part_blake3` has length one, the owning part's hash, and `ColumnStatsHeader.
+segment_count` is that part's segment count. Field 7 is absent (proto3
+default) for a part with no per-part statistics; there is no fallback for
+such a part, it is scanned (ADR-1413 decision 6). Absence is never an error.
+
+The whole-tenant v1 (`SnapshotColumnStatsRef`, formerly HEAD field 11,
+ADR-0850) and v2 (`SnapshotColumnStatsPartRef` at the whole-tenant scope,
+formerly HEAD field 13, ADR-0942) forms are retired by ADR-1413 decision 6:
+the fold no longer publishes either at any size, fields 11 and 13
+are `reserved` on `SnapshotHead` (never reused), and the decoder's accepted
+set of `.cstat` envelope versions is exactly `{3}` -- a v1 or v2 object, if
+one somehow still existed, is rejected as an unsupported version rather than
+decoded.
+
+**Reader (`Catalog::load_column_stats`, ADR-1413 decision 2, amended by
+decision 6).** A query resolves its window to an hour range and narrows
+HEAD's parts to the ones `parts_intersecting` that window covers -- the same
+narrowing `load_snapshot` uses for segment refs. For each covered part,
+independently: if it carries a field-7 ref and the v3 object it names loads
+and decodes, that part's segment lands in the loaded statistics keyed by its
+own content hash -- one GET per such part, and no other object is ever
+fetched on its account. If the ref is absent, or the GET comes back
+not-found, or the object fails to decode (`FetchOutcome::DecodeRefused`,
+logged once per object key via `tracing::warn!` and counted on every
+occurrence in `Catalog::column_stats_decode_refusals`), that part is left
+with no loaded statistics. A read CPU gate decode job that failed is not a
+refused decode and leaves the part uncovered the same way: a cancelled job,
+or a closed gate, never ran and a retry can succeed, so it is logged each
+time and not counted; a panicked job panics again on the same bytes, so it
+is logged once per object key and counted on every occurrence in
+`Catalog::column_stats_decode_panics`. A load whose memory reservation the
+budget refuses (`FetchOutcome::BudgetRefused`) leaves the part uncovered too,
+counted in `Catalog::column_stats_budget_skips` and not as a refused decode.
+When the column-statistics cache holds an entry for the part but a refetch
+for a dictionary it lacks finds the object absent, fails to decode or is
+refused by the budget, the cached entry is served instead. The query scans a
+part left with no loaded statistics, exactly as if no statistics existed for
+that part. There
+is no whole-tenant fallback and no declared-entry-count coverage comparison to decide whether one is needed --
+per-part coverage is decided per part, from that part's own field-7 ref
+alone.
+
+Every load takes a `ColumnStatsRequest` naming the columns whose value
+dictionaries the statement reads: `summary_only()` names none,
+`with_dictionary(column)` adds one. Each part's statistics are held in memory
+without the dictionaries the request did not name: a column's `dictionary` is
+emptied while its `dictionary_present` and every other summary field stay as
+decoded. The decode streams the body one segment at a time, validating each
+segment in full before clearing the dictionaries it does not keep (those the
+request names, plus those the part's cached entry already held). An object
+with one defect is refused with the same `SnapshotFormatError` variant the
+whole-object decode gives (one with several can be refused for a different
+one of them), and the load never reserves more than one segment plus the kept
+bytes (step 1 of "Snapshot resolution from a folded snapshot" below).
+`LoadedColumnStats::dictionary_loaded(column)` is true only when every
+covered part holds that column's dictionary, and a reader that needs one (the
+not-equal count and the per-value group counts) declines when it is false, so
+the statement scans rather than reading an emptied dictionary. SQL over logs
+derives the request from the plan: a `GROUP BY` key's column, and every
+non-string typed column a `<>` conjunct or a conjunct the load decision cannot
+read names; `SUM` and `AVG` read the summary alone.
+
+The decoded parts are kept in a per-process cache with one entry per part,
+keyed by (tenant, signal, the part's declared `.cstat` blake3) as HEAD's
+field-7 ref names it. Every load reads HEAD first, so a fold that changes a
+part's statistics changes its key and the old entry is never served. An entry holds the part's stripped
+segments, the set of dictionaries it holds, and its exact size in bytes (the
+summed encoded length of those segments). A covered part is fetched only when
+it has no entry or its entry lacks a dictionary the request names; the refetch
+stores the union of the held and requested dictionaries, so the entry never
+loses a dictionary an earlier statement loaded. Entries are shared by `Arc`.
+The cache is bounded by `CatalogConfig::column_stats_cache_max_bytes` across
+all tenants and evicts least-recently-used entries past it; an entry larger
+than the whole budget is refused (served to its own load, not stored). Each
+decoded body adds to `Catalog::column_stats_decoded_bytes`, and a cache hit
+adds nothing.
+
+Cost, in accounted GETs: one HEAD GET, plus exactly one GET per covered part
+that carries its own field-7 ref and is not already cached with every
+dictionary the request names, and nothing else. A load whose covered parts are
+all cached with those dictionaries costs the HEAD GET alone. A fold that adds
+one part costs the next load one GET for that part. A part without a field-7
+ref, or whose v3 object is absent or refused, costs no additional GET beyond
+the one already spent (or not spent) on it; the query scans that part's
+segments directly.
+
+The fold writes one v3 object per part it actually re-encodes this fold
+(never for a part carried forward by reference, since that part's `.csnap`
+bytes, and therefore its existing field-7 ref, are unchanged), before
+PUTting the part object itself (so a refusal writes nothing) and under the same
+`column_stats_object_key(tenant, signal, part_watermark, stats_hash16)`
+scheme v1 and v2 use: keyed by the hash of the v3 object's OWN bytes
+(`stats_hash16`), not the part's hash. Keying by the part's hash instead
+would be unsound: the per-segment build has a warn-and-omit path
+(`column_stats_build`'s per-entry fetch degrading on a failed GET), so two
+folds over the same part can produce different statistics bytes, and a
+part-hash key would let the second fold's PUT collide with the first's
+under `AlreadyExists` -- treated as success on the false assumption that
+the bytes are identical, leaving a field-7 ref whose blake3 describes bytes
+that were never stored at its key. Content-addressing on the object's own
+bytes, like the part object's own PUT, makes `AlreadyExists` really mean
+"two folders raced the same input and wrote the same content-addressed
+bytes."
+
+**Per-part ceiling and degrade (ADR-1413 decisions 3-4, amended
+2026-09-08).** The per-part ceiling is `DEFAULT_MAX_COLUMN_STATS_BYTES` (256
+MiB), the same constant `ColumnStatsLimits` enforced on the now-retired
+whole-object v1/v2 guard, not a separate per-part formula (ADR-1413's
+rejected alternatives record the proportional bound and why it lost).
+Before compressing, the fold measures the concatenated uncompressed body
+once (`column_stats_segments_concat`, the same function the encoder's own
+ceiling check and the compressor's input use), measures every (segment,
+column) dictionary's exact contribution to it once into a max-heap, and,
+while the running total exceeds the ceiling, drops the single largest
+remaining dictionary by its own encoded size, adjusting the total by the
+bytes removed; the body is measured once more after the loop and the fold
+refuses on any disagreement between the two. Each drop marks that
+(segment, column)
+`dictionary_present = false` per ADR-0850 decision 3's omit-never-truncate
+rule -- min, max, count, and sum stay exact regardless of how many
+dictionaries are dropped. `FoldReport::column_stats_dictionaries_dropped`
+counts drops for the fold call. Only once no dictionary is left to drop and
+the dictionary-free statistics are still over the ceiling does the fold fail
+the whole (tenant, signal, part) with the declared size and the ceiling in
+the error (`SnapshotFormatError::ColumnStatsPartOverBound`/
+`CatalogError::ColumnStatsPartOverBound`) and write no object -- there is no
+truncated object for a reader to silently trust.
+
+**Retirement of the whole-object forms (ADR-1413 decision 6).** The
+fold no longer writes the v1 or v2 whole-tenant statistics at any size: v3
+per-part objects at field 7 are the only form published. `SnapshotHead`
+fields 11 and 13 are `reserved`, so there is no struct field left to set or
+read for either one; a HEAD encoded today carries neither.
+
+**GC-sweep coverage.** The sweep rule described above
+(`ravel_maintain::sweep::sweep_unreferenced_catalog_objects`) treats HEAD's
+`postings.key` and every `parts[].column_stats.key` (field 7) as referenced.
+It no longer reads `column_stats.key` (field 11) or `column_stats_part.key`
+(field 13) at all -- there is no struct field to read -- so a `.cstat`
+object named only by one of those retired fields on a HEAD written before
+this change is now unreferenced and swept once it crosses the protection
+horizon, exactly like any other orphaned catalog object. A v3 per-part
+object HEAD's current parts list still names is unaffected and is never
+swept as unreferenced while its owning part is live.
+
+### Per-part key-index leaves (ADR-2707)
+
+The proto fields, the leaf codec, the single-leaf probe, the fold's leaf
+build and HEAD attachment, and the sweep's `kidx` kind are implemented: the
+fold (the server's scheduled and on-demand fold and `ravel-cli catalog
+fold`) can write leaves for logs and spans, and for metrics with a second
+switch (the `label_value` leaf, below). The leaf build is behind a
+switch, `CatalogConfig::build_key_index_leaves`. The library default stays
+off, but both binaries that fold turn it on unless told otherwise:
+`ravel-server` builds leaves unless `--no-fold-key-index-leaves` is given,
+and `ravel-cli catalog fold` unless `--no-key-index-leaves` is given
+(`--fold-key-index-leaves` and `--key-index-leaves` are still accepted and
+change nothing). ADR-3692's Stage 1 amendment measured the build on real
+S3 and kept it off for both signals; the day seal (below, ADR-3939) bounds
+an advance by the tail's day rather than the whole history, and the
+binaries' default turned on with it. The switch is one per process, so a
+metrics fold builds the `label_value` leaf by default as well. Every process that runs a fold for a tenant
+(a maintain-mode process, and a query-mode process serving on-demand
+folds) MUST agree on the switch, since the switch also governs the
+partition (the day seal below, and "Rollout of the day seal"): a fold
+without it writes every part it re-encodes without refs;
+`ravel-cli catalog fold --rebuild-key-index` (under "Rollout") attaches
+them afterwards. Every later switch-off fold over those refs then logs the
+switch-disagreement warning and sets `key_index_switch_off_over_leaves`
+(test `key_index_switch_off_over_leaves_is_reported_and_warned`), from
+whichever part carries them
+(`key_index_switch_off_over_leaves_reads_a_non_tail_part`). The query path ("Reader") probes the
+leaves for a spans `trace_id` lookup and for a logs scan's declared-key
+equality, once per scan (docs/query-engine.md, "Tier-2 router").
+
+<a id="upgrading-to-the-default-leaf-build"></a>
+**Upgrading to the default leaf build.** A deployment that folded with the
+switch off (the earlier default) turns it on by upgrading, unless every
+folder passes the opt-out. The first fold with the switch on re-partitions
+the tenant's whole retained history into UTC-day parts and builds every
+day's leaves: a one-time rebuild whose cost "Rollout of the day seal"
+(below) states, about 39.2 GB of leaves over about 750 passes for a 30-day
+logs tenant. Later advances build leaves only for the tail and for days a
+late record changed. Before the upgrade, every process that folds a tenant
+(each `ravel-server --mode maintain` process, a `--mode query` or
+`--mode all` process serving on-demand folds, and any scheduled or manual
+`ravel-cli catalog fold`) MUST run a version with this default, and all of
+them MUST agree on the switch: either all of them build leaves, or all of
+them pass the opt-out (`--no-fold-key-index-leaves`,
+`--no-key-index-leaves`). A folder left on the switch-off side re-partitions
+the tenant by entry count on each of its folds, drops the leaf refs of
+every part it re-encodes, sets `key_index_switch_off_over_leaves` and logs
+the switch-disagreement warning, and the next switch-on fold rebuilds those
+days again. A logs tenant that declares no key-index field builds no leaf
+either way, but still gets the day seal.
+
+**Day seal (ADR-3939 decisions 1 and 2).** With `build_key_index_leaves`
+on, the fold's sealing policy (ADR-0063 section 1: a part seals at an
+hour boundary when the next hour would take it past
+`snapshot_part_max_entries`) also seals a part where the next hour that
+holds entries falls on a later UTC day than the part's first hour, so no
+part spans two UTC days (`partition_parts`,
+`crates/ravel-catalog/src/fold.rs`). The UTC day of an
+`ingest_hour_bucket` is `hour / 24`: the bucket counts whole hours since
+the unix epoch, which is a UTC midnight. A day with no entries gets no
+part, and the entry threshold still splits inside a day (test
+`partition_parts_seals_at_utc_days_with_the_leaf_switch`). The rule reads
+the entry set alone, so two folds of the same entries under the same
+clock and config write byte-identical HEADs
+(`day_sealed_folds_of_one_entry_set_write_identical_heads`). With the
+switch off the partition is the entry threshold's alone, as before. A
+sealed day part re-encodes to the same bytes on later folds, so the fold
+carries it forward by reference, `key_index` refs included, and an
+advance builds leaves only for the parts it re-encodes: the tail, which
+holds no day before the latest UTC day with entries, and any day a late
+record changed. Day d's leaves are built once more on the fold that seals
+it: the tail that held day d was encoded with the fold watermark (and,
+while it was the only part, `min_hour` 0), the sealed part with its own
+first and last hours, so its hash changes. That rebuild takes every
+entry from the leaves of the previous part that held day d: in
+`a_sealed_utc_day_keeps_its_leaves_across_advancing_folds` the sealing
+fold issues one previous-leaf GET, one leaf PUT and no section read for
+day d, and the two advances after it issue none of the three for day d.
+A sealed day that a late record changes (a retention tombstone, a
+compaction, an erasure rewrite) is re-encoded, and since the carry source
+is every overlapping previous part with leaves (ADR-3939 decision 5, under
+"Incremental tail build" below), its build carries from the day's own
+previous leaves and reads sections only for the entries those leaves do
+not cover (`a_dirty_sealed_day_carries_its_own_previous_leaves`: a
+tombstoned hour leaves 2 entries, and the re-encode GETs each of the
+day's 3 previous leaves once, reads no section of the 2 entries, and
+writes the leaves a fold of those 2 entries into a fresh store writes,
+byte for byte).
+
+The fold never builds leaves for a part it carries by reference
+(ADR-3939 decision 2): a carried part keeps exactly the `key_index` refs
+the previous HEAD gave it. A sealed day that lacks a declared field's
+leaves, for any cause (sealed while a metrics erasure request was
+pending, or before the field was declared with the type its sections
+index), keeps that gap on every later fold until `ravel-cli catalog fold
+--rebuild-key-index` (under "Rollout") attaches the missing leaves. The
+fold report counts such parts in `key_index_parts_missing_declared_leaves`:
+parts carried by reference, each with at least one entry, that hold no
+leaf ref for a field the tenant's key-index set names at fold time (the
+declared logs fields, spans `trace_id`, metrics `label_value` under
+`metrics_label_index`, whether or not an erasure request is pending). It
+is zero with the switch off and on a no-op fold, and a nonzero count logs
+one warning per fold naming the tenant, signal, count and missing fields.
+The warning names `--rebuild-key-index` for the two cases it repairs, a
+day sealed under the erasure gate and a field declared after the day
+sealed. A part whose field ends with no ref in the repair too (a metrics
+leaf over the byte cap, or no indexable entries) stays counted, and the
+warning repeats on every fold for it. In
+`a_sealed_day_missing_a_declared_fields_leaf_is_carried_unchanged_and_counted`
+two folds carry day d's ref byte for byte, with no section GET, leaf GET
+or leaf PUT for the day, and count 1; after the repair the next fold
+carries the repaired ref and counts 0.
+`a_metrics_day_sealed_under_the_erasure_gate_is_counted_until_repaired`
+pins the metrics case and `the_missing_leaves_count_is_zero_with_the_switch_off`
+the switch-off one. A field no entry of the part indexes gets no leaf from
+the repair either, so that part stays counted. Declaring a key-index field
+for a tenant with the switch on is therefore followed by `--rebuild-key-index`
+over its sealed days (`--field <name>` for that field alone): the fold
+builds the new field's leaves only for the parts it re-encodes, the tail
+and any day a late record changes.
+
+The codec is `ravel_catalog::snapshot_format::kidx`, re-exported at the
+crate root: `encode_key_index_leaf` (choosing `bucket_bits` with
+`choose_key_index_bucket_bits`) and `encode_key_index_leaf_with_bucket_bits`
+write one leaf and its ref (with an empty `key`), refusing a body over the
+ceiling as `BodyOverCeiling`; `split_key_index_entries` cuts a sorted
+(part, field) entry list into key slices that tile `[0, u64::MAX]` and each
+fit the ceiling, cutting only between distinct `key8` values;
+`select_key_index_slice` picks the one ref whose slice holds a `key8` after
+checking that the refs agree and tile; `probe_key_index_leaf_ranged` runs
+the two-GET probe below over a caller-supplied ranged byte source, and
+`Catalog::probe_key_index_leaf` runs it over the catalog's store, turning a
+tenant or signal disagreement into `CatalogError::FieldMismatch` and the
+breach counter; `verify_key_index_leaf` and `check_key_index_leaf_set` are
+the whole-object reader `ravel-cli inspect kidx KEY...` uses. A probe
+returns `Matches` or `Absent`, each with the leaf's uncovered entry
+ordinals, or `Rejected` with the reason the part reads as uncovered:
+`Corrupted`, `UnsupportedVersion`, `PartBindingMismatch`, `RequestMismatch`
+(a valid leaf for another field, key type or key slice than the lookup), or
+`Read` (a failed GET).
+
+`SnapshotPartRef` carries an additive field 8, `repeated
+SnapshotKeyIndexLeafRef key_index`: one reference per (field, key slice) of
+the exact-key index over exactly this part's segments. Each points at a
+`.kidx` object, the second tier of the exact-key index whose first tier is
+the KEY_IDX section inside every data object (docs/log-segment-format.md
+"KEY_IDX", docs/span-segment-format.md "KEY_IDX"). Field 8 is absent (proto3
+default) for a part with no leaves; absence means uncovered and is never an
+error, and the field does not bump the HEAD `format_version`, by the field
+6 and field 7 precedent: an older reader ignores the field and scans. The
+ref carries `key` (the object key), `blake3` (32, of the leaf's full
+bytes), `size`, `field`, `key_type`, `key8_lo` and `key8_hi` (the
+inclusive key slice this leaf covers), `prefix_len` (the bytes through the
+directory crc, so the first GET needs no probe), `bucket_bits`,
+`entry_count`, `uncovered_count` (the length of the header's
+`uncovered_entry_ordinals`, identical on every slice of the pair) and
+`part_blake3` (32, the one covered part).
+
+**Object layout (RKI1 envelope).**
+
+```
+.kidx:
+  magic       "RKI1"
+  u32 LE      header_len
+  u32 LE      prefix_len          (bytes from the object start through
+                                   dir_crc32c, which must equal
+                                   4 + 4 + 4 + header_len + 4
+                                   + 4 x 2^bucket_bits + 4; fixed width
+                                   outside the protobuf so its own encoding
+                                   cannot change header_len; the ref's copy
+                                   sizes GET 1, this one is authoritative)
+  header      KeyIndexLeafHeader protobuf (ravel.catalog.v1): format_version
+              (2, or 3 for a metrics leaf; 1 before the leaf format version 2 amendment), tenant_hash (16), signal, part_blake3 (32), field,
+              key_type, key8_lo, key8_hi, bucket_bits,
+              entry_count (index entries in this leaf's body),
+              part_entry_count (the covered part's SnapshotEntry count;
+              coverage = part_entry_count minus the uncovered ordinals),
+              repeated uncovered_entry_ordinals (each below
+              part_entry_count), body_len,
+              entry_kind (field 14; 0 entry, 1 posting; non-zero only at
+              format_version 3, see "Version 3 and the posting entry
+              kind" below)
+  u32 LE      header_crc32c       (over magic, header_len, prefix_len and
+                                   header)
+  u32 LE      ends[2^bucket_bits] (cumulative bucket ends, relative to body)
+  u32 LE      dir_crc32c          (over the ends bytes)
+  body:       bucket frames tiling [0, body_len) exactly (an empty bucket
+              occupies zero bytes and carries no frame: its end equals
+              the previous end), each
+              u32 LE entry_count (>= 1), u32 LE uncompressed_len (checked against
+              the body ceiling before the buffer is allocated; the
+              decompressed length must equal it exactly),
+              u32 LE frame_crc32c (over the zstd bytes),
+              zstd entries[entry_count] (entry_kind 0):
+                key8 [8]
+                uvarint entry_ordinal      (part-local SnapshotEntry ordinal)
+                uvarint block_count        (>= 1)
+                uvarint block_delta[block_count]  (strictly ascending block
+                                                   ordinals, delta-coded from
+                                                   -1, so every delta >= 1)
+              or zstd postings[entry_count] (entry_kind 1, version 3 only):
+                key8 [8]
+                uvarint count              (>= 1)
+                uvarint delta[count]       (strictly ascending u64 values,
+                                            delta-coded from -1)
+```
+
+Within a bucket, entries are sorted ascending by `(key8, entry_ordinal)`
+and unique, so a probe is a binary search. Buckets are selected by the same
+mix the section uses
+(`(u64::from_be_bytes(key8).wrapping_mul(0x9E3779B97F4A7C15)) >> (64 -
+bucket_bits)`), applied to the full `key8` (not to its offset within the
+leaf's slice), so a key's bucket depends only on the key and the leaf's
+`bucket_bits`. A block set is the block bitmap
+ADR-0849 section 1b requires, in the encoding that is small for the sets
+measured (p50 one object per key on the ClickBench corpus).
+
+**Binding and coverage.** A leaf binds the covered part's exact `blake3`,
+never its `watermark_hour` (ADR-0849 section 1). Three checks, with two
+outcomes. A leaf whose header `tenant_hash` or `signal` differs from the
+requesting tenant's or from the signal prefix it was read under is a hard
+`CatalogError::FieldMismatch` (ADR-0050 section 2; a misplaced object, not
+a degraded one),
+counted in `ravel_catalog_isolation_breach_total`, with no fallback: the
+lookup fails. A leaf whose header `part_blake3` differs from the part's hash
+in the HEAD it resolved, or whose `format_version` it does not support, is
+rejected and the reader treats the part as uncovered for that field. The
+entry writer writes version 2 (`KEY_INDEX_LEAF_FORMAT_VERSION`); the reader
+accepts 2 for every signal, 3 for metrics only
+(`KEY_INDEX_LEAF_FORMAT_VERSION_3`), and 1 for every signal except logs
+(`key_index_leaf_version_accepted`, `key_index_leaf_versions_for_signal`,
+`crates/ravel-catalog/src/snapshot_format/kidx.rs`). A logs leaf at
+version 1 was built before the leaf build listed a version 1 RLOG KEY_IDX
+section as uncovered, so it can prove absent a key such an entry holds; a
+spans leaf at version 1 has no such gap, since RSPAN keys the fixed
+`trace_id` column (ADR-3692, the leaf format version 2 amendment). `uncovered_entry_ordinals` lists the entries the fold could not
+index for this field: a segment with no KEY_IDX section, a section whose
+header does not name the field (declared after the flush opened, or
+de-declared), a failed or refused GET, a corrupt section. An uncovered entry
+has no indexed `key8`, so it belongs to no key slice: every slice of a
+(part, field) carries the identical, full list for that pair, the ref's
+`uncovered_count` is its length and is compared with the opened header's
+list like the other ref copies, and `inspect kidx` checks that the slices of
+one pair agree (slices whose lists differ are `Corrupted` for the pair). A
+lookup that opens any one slice therefore sees every uncovered entry of
+the part. The reader subtracts exactly those from coverage and scans them
+(ADR-0849 section 3).
+Coverage is read from the leaf header and never inferred from the tenant's
+current declaration.
+
+**Reader (`ravel_query::key_index_route`; the spans `trace_id` lookup
+calls it, ADR-3692 decision 3).** For a lookup on
+`field = value`, the resolve narrows HEAD's parts
+to the window as `load_snapshot` does; a lookup with no time bound covers
+every part. A (part, field)'s slices tile the whole `key8` space: a single
+unsliced leaf has `key8_lo = 0` and `key8_hi = u64::MAX`, and a split
+produces adjacent slices whose bounds meet, so every `key8` falls in
+exactly one slice of every part that carries leaves for the field, and a
+lookup key between the keys present still probes (and prunes) rather than
+scanning. A part whose slices do not tile is `Corrupted` for that field.
+For each covered part, in the one slice that holds the lookup's `key8`:
+a ref `prefix_len` of zero or greater than the ref's `size` rejects the
+leaf as `Corrupted` before any GET is issued (tier 1's zero-or-past-`len`
+rule), so GET 1 never exceeds the object's size; GET 1 is then
+`[0, prefix_len)` (header and directory, verified by their crcs). The
+ref's copies of `field`, `key_type`, `key8_lo`,
+`key8_hi`, `bucket_bits`, `entry_count`, `uncovered_count`, `part_blake3`
+and `prefix_len` serve only to pick the slice and size GET 1; the header is authoritative,
+being under the leaf's blake3, and after GET 1 the reader compares the two
+and rejects the leaf as `Corrupted` on any disagreement (the part reads as
+uncovered), never selecting a bucket from the ref's `bucket_bits`; a GET 1
+shorter than the header's `prefix_len` is the same rejection, so a short
+ref copy can only stop the probe, never truncate the directory. GET 2 is
+the one bucket the header's `bucket_bits` and the mix select: its declared
+`uncompressed_len` is checked against the body ceiling before any buffer
+is allocated, then the frame crc and the exact decompressed length are
+verified, and a binary search yields the `(entry_ordinal, block set)`
+matches; an empty bucket needs no GET 2 and answers absent from the
+directory alone. At most two ranged GETs per covering
+part for one key, issued concurrently across parts, under the per-statement
+ceilings `KEY_INDEX_LEAF_GET_CEILING` (2,048 leaf GETs, the one-key value)
+and `KEY_INDEX_MAX_PROBED_PARTS` (`P_max`, 1,024 parts), both in
+`ravel_catalog` and read together through `key_index_root_shape`, which a
+test pins (ADR-3692 decision 2 asks root validation to lint them as well;
+no root shape lint exists yet). A statement's leaf GET ceiling scales with
+its key set (ADR-3692's key-set ceiling amendment): `P_max x (1 + min(k,
+B_run))` for a set of `k` keys, 1,024 x 2 = 2,048 at k = 1 and 1,024 x 65
+= 66,560 at k >= 64, computed by the router from `k`. It is an absolute
+cap on the statement that charges each part as if the set sat in one
+slice, not a per-part budget. Parts are admitted in descending
+`entry_count`, ties by descending `watermark_hour`, until the next part's
+worst case would exceed the cap or the admitted count would exceed `P_max`;
+a part beyond either ceiling is uncovered and goes to the tier-1 probe like
+every other uncovered segment, never to a scan (ADR-3692 decision 2 amends
+ADR-2707 decision 5's remainder rule). Since a probed part's charge is
+refunded down to the GETs it issued, the cap's worst-case division is the
+fewest parts it admits: 528 logs day parts at k = 100 (66,560 / 126) and
+63 at k = 1,024 (66,560 / 1,050). Candidates are the matches over covered
+entries plus every uncovered segment: the entries a leaf lists as
+uncovered, every part without a leaf for the field, every leaf that failed
+validation, every part the ceilings left unprobed, every segment above the
+watermark (the unsealed tail, listed) and every token-resolved segment,
+each of which the tier-1 probe may still prune. The spans provider
+(`SpansTableProvider`, docs/query-engine.md, "Tier-2 router") drops a
+`Pruned` segment before any of its bytes are read, hands a `Blocks`
+segment's block set to the fetcher, which then reads the segment's footer
+suffix, SKIP_IDX and block runs and no KEY_IDX, and sends an `Uncovered`
+segment to the tier-1 probe.
+
+A key set of 1 to 1,024 keys (`IN`, ADR-3692 decision 2) issues GET 1 once
+per (part, slice) the set touches. A part's worst case, admitted against
+the statement's cap before GET 1, is `1 + min(k_s, 2^bucket_bits, B_run)`
+per touched slice, `k_s` the slice's own key count, with `B_run` =
+`KEY_INDEX_SET_PROBE_MAX_RUNS` (64), so a set of `k` keys costs at most
+`S + k` over a part's `S` touched slices. A part whose worst case exceeds
+two GETs for each of the part's segments in the routed snapshot (the
+statement's window), the tier-1 probe's two ranged GETs per segment, is not
+admitted: it reads as uncovered after no leaf GET and is counted in
+`parts_over_tier_one`, not `parts_uncovered`. A logs day part (26 slices,
+552 entries) with all 552 segments in the window at k = 1,024 costs at most
+1,050 against 1,104 and is admitted; the same part with 23 segments in the
+window is compared against 46 and left to tier 1; once the probe
+has run, the GETs it did not issue go back to the budget and the first
+part that did not fit is evaluated again, so the admitted set is the one
+sequential evaluation would give. When the set touches at most `B_run`
+non-empty buckets of a slice, each is one GET 2. Above `B_run`, the buckets
+are sorted by body offset and the smallest gaps between them are bridged
+until at most `B_run` ranged reads remain; the gap bytes are read and
+discarded, and the read is taken only when the bridged runs, bucket bytes
+and gap bytes together, total at most `entry_count x KEY_INDEX_T1_BYTES`
+(11 KiB) for the part, the tier-1 cost the part's segments would otherwise
+pay. The allowance is the part's, shared by every slice the set touches
+in slice order. Otherwise the part is uncovered for the statement and no
+bucket run of the slice that exceeded it, or of any later slice, is read.
+A part's leaf reads run concurrently in three phases: GET 1 of every
+touched slice; then, with no reads, a check for a tenant or signal breach
+and the allowance charged slice by slice, stopping at the first slice that
+did not plan (a failed or refused GET 1, a rejected prefix) or whose
+bridged bytes exceed what the earlier slices left; then the bucket runs of
+the slices before the stopping one. If any slice's GET 1 shows a breach,
+the first breaching slice in slice order is counted once in the catalog's
+isolation-breach counter and logged, the statement fails, and no bucket
+run of the part is read. This is the one departure from a one-at-a-time
+probe, which would never read the GET 1 of a slice past a failing run or
+past the stopping slice: ADR-0050 section 2 fails the query on a
+tenant_hash mismatch wherever it is seen, so every breach counted fails
+its statement. Otherwise each read phase holds at most
+`LEAF_READ_CONCURRENCY` (16) reads in flight and takes their results in
+slice and body order, so the part's outcome is the one a one-at-a-time
+probe gives, whatever order the reads complete in: the first slice in
+slice order whose run fails to read or decode, or whose decode
+reservation is refused, decides; failing that, the stopping slice
+decides; failing that, the part answers. With 16 parts probed at once, one
+routing pass holds at most 256 leaf reads in flight; the metrics
+`label_value` route runs up to `promql_fetch_fanout` passes at once, one
+per distinct value. The logs, spans and metrics fetchers' leaf readers
+take each read under the fetch reservation and the GET limiter, and a
+slice's GET 1 bytes, with their reservation, are held until that slice
+finishes decoding. The fetch reservation refuses at once rather than
+waiting, so under memory pressure, with up to 16 reads of a part asking
+at once, some parts' leaf reads are refused and those parts go to tier 1,
+each counted as a refused reservation. The rows the lookup returns are the
+same either way. A part that answers reads exactly the bytes a
+one-at-a-time probe would. A part the stopping slice decides, or a breach
+fails, has also read GET 1 of every slice after it. A part a run decides has also read
+GET 1 of the slices after the failing one, and may have issued up to 15
+(`LEAF_READ_CONCURRENCY - 1`) runs past the failing run. All of these
+reads are counted. Before a frame is
+decoded, its decoded bound (`decoded_bound`, `8 x uncompressed_len + 64`
+bytes) is reserved through the statement's memory handle; a refused
+reservation leaves the part uncovered and counts it, and never fails the
+statement.
+Spans lookups also drop
+every entry and tail object outside the shard `shard_for_span` selects for
+that hour's generation (ADR-0052). These probes are their own cost phase
+(`keyIndex` under `stats.phases`) and are never pooled into a scan counter.
+
+**Fold.** With the switch off (`--no-fold-key-index-leaves`,
+`--no-key-index-leaves`), the fold reads no footer or
+KEY_IDX section, writes no leaf, and re-encodes every part it re-encodes
+without `key_index` refs, dropping any the part carried; a part carried
+forward by reference keeps its refs unchanged. The sweep does not read the
+switch. With the switch on, the fold writes leaves for exactly the
+parts it re-encodes this fold (a part carried forward by reference keeps
+its refs, as for field 7),
+for every field the tenant's key-index set names at fold time (logs: the
+declared `key_index` columns, plus `trace_id` when `index_trace_id` is set;
+spans: `trace_id`) plus every field any entry's section header names, from
+the tier-1 sections and never from rows: per entry, a suffix GET of the
+last `min(8 KiB, object size)` bytes for the footer (a footer longer than
+that costs one more GET of the footer's own range) and a ranged GET of the
+KEY_IDX section (about 2% of a logs object and about 6% of a spans object
+on the ADR-2707 Stage 0 corpora), issued under the fold's
+`fold_bucket_concurrency` bound, merged across the part's entries, sorted,
+bucketed and PUT before the part PUT. A failed leaf PUT fails the fold
+before that part's PUT and before any HEAD CAS, so no HEAD references a
+part without its leaves; parts the same fold wrote earlier are
+unreferenced and reaped by the catalog sweep. An encode refusal is not a failed PUT: it leaves the
+field uncovered for that part (every entry counted in
+`key_index_uncovered_entries`, logged at error level) and the part is
+published without that field's refs. A logs tenant whose key-index set is
+empty (no declared `key_index` column and `index_trace_id` off) reads no
+section and writes no leaf. Each data object's footer and section are read
+once per fold, not once per HEAD CAS attempt: the result is kept by data
+object key for the rest of the fold, so an attempt after a lost CAS issues
+no further reads for an object already read; a transient GET failure is logged at warn level naming the
+object key, and the entry is uncovered in the part that fold writes (for
+the life of the part if it seals in that fold). A field's key type is the declared one, else the type
+the first entry naming the field gives it. Each leaf is PUT
+`CreateIfAbsent`.
+The object is content-addressed by its own bytes (`hash16` is the blake3
+of the leaf), not by the part's hash, for the reason the
+column-statistics section gives:
+two folds whose per-entry degrade differed would otherwise collide under
+`AlreadyExists`. `bucket_bits` is chosen so that the directory and the mean
+bucket are about equal in bytes, with no floor (the balance
+`body = 4 x 2^(2b)` in decompressed bytes gives 9 at a 1.2 MB hour-sized
+part and 13 at the 256 MiB ceiling, the largest value reachable under it,
+so a probe costs about `4 x sqrt(body)` decompressed bytes per part) and a
+writer sanity bound of 1..=13; the
+reader accepts 1..=16 and rejects any other value before allocating the
+directory. The leaf's corruption conditions, each a typed `Corrupted` that
+makes the reader treat the part as uncovered for that field (never a panic,
+never wrong data): a magic other than `RKI1`; a `header_len` past the
+object; a header, directory or frame crc32c mismatch; `bucket_bits` outside
+1..=16; a ref `prefix_len` of zero or greater than the ref's `size`
+(rejected before GET 1 is issued, so a bad ref copy can neither inflate
+nor truncate the read); a header `prefix_len` not equal to
+`4 + 4 + 4 + header_len + 4 + 4 x 2^bucket_bits + 4`, or a GET 1 (sized by
+the ref's copy) shorter than it, so a truncated directory is never read; a
+directory whose ends are not non-decreasing or whose last end
+differs from `body_len`; a frame whose declared `uncompressed_len` exceeds
+the body ceiling (refused before decompression allocates anything), or
+whose decompressed length differs from it, or whose decompressed bytes are
+not exactly `entry_count` entries' encodings; for a whole-object reader
+(`inspect kidx`) only, per-frame `entry_count`s that do not sum to the
+header's `entry_count` (a single-bucket probe cannot check the sum and
+treats the header total as advisory, used for `bucket_bits` sizing and the
+report); a header `tenant_hash` or `signal` that disagrees with the
+request, which is the hard `FieldMismatch` above rather than an uncovered
+part; an `uncovered_entry_ordinals` list whose length differs from the
+ref's `uncovered_count`, or, for a whole-object reader, slices of one
+(part, field) whose lists differ; a header `part_entry_count` that differs
+from the covered part ref's `entry_count` in the HEAD the lookup resolved
+(so coverage is never narrower than the part); an entry ordinal at or past
+the header's `part_entry_count`; a `key8` outside the leaf's slice; a
+`key8` that does not mix to the bucket it sits in; unsorted or duplicate
+`(key8, entry ordinal)` pairs; a block delta list that is empty, holds a
+zero delta, or overflows `u32`; a frame whose `entry_count` is zero; a
+header `uncovered_entry_ordinals` list that is not strictly ascending; a
+`part_blake3` not 32 bytes, or for a whole-object reader a `tenant_hash`
+not 16 (a probe compares the tenant first, so there it is the
+`FieldMismatch` above); an empty `field`, a `field` longer than
+`KEY_IDX_MAX_NAME_LEN` (128 bytes, which the encoder also refuses), or
+`key8_lo` above `key8_hi`; a ref `size` other than the header's
+`prefix_len + body_len`, and, for a whole-object reader, an object of any
+other length. The body ceiling is `DEFAULT_MAX_COLUMN_STATS_BYTES`
+(256 MiB) in that constant's own meaning, a cap on declared decompressed
+size applied before allocation, and the reader applies it per frame, the
+only bound a single-bucket probe can check (a frame declaring up to the
+ceiling is allocated, decompressed and then rejected by its crc or length,
+bounded but far above the 32 KB mean bucket the balance rule sizes). The
+whole-leaf rule, that the frames' `uncompressed_len` sum to at most the
+ceiling, is the writer's obligation, kept by the slice split and verified
+over the whole object by `inspect kidx`; it is not a bound on `body_len`
+(the stored bytes, which are smaller).
+A (part, field) whose decompressed body would exceed it is split by key
+range into several leaves under the ceiling, each with its own ref and
+slice, so a lookup opens exactly one leaf per (part, field). A build that
+runs in passes under the pair budget (below) also ends a slice at every
+pass end, so it can write several leaves for a body under the ceiling; the
+reader needs only that the slices tile the key space. A slice cuts
+only between distinct `key8` values, so a single `key8` whose own entries'
+encodings exceed the ceiling cannot be sliced: every entry carrying that
+`key8` is listed in `uncovered_entry_ordinals` for the field (it stays a
+candidate, so the lookup stays exact; an uncovered entry is uncovered for
+every key of the field, so its other keys leave the leaf too) and the leaf
+holds the rest. A per-entry
+failure (no KEY_IDX section, a section that does not name the field or
+names it under another key type, a failed GET, a corrupt section) lands the
+entry in `uncovered_entry_ordinals` and never aborts the leaf. So does an
+RLOG KEY_IDX section at a version the logs reader does not resolve
+(`ravel_logseg::key_index::section_resolves_like_the_reader`; version 1,
+whose own probe declines): a leaf built from it could prove a key absent
+that the object holds. The check is in `read_entry_key_index_counted`, the
+section read the fold's leaf build and `--rebuild-key-index` share, so both
+list such an entry (`version_one_sections_are_uncovered_in_the_leaf`,
+`version_one_sections_are_uncovered_in_a_rebuilt_leaf`). A field with
+no covered entry in the part writes no leaf (absence is uncovered). The
+fold report counts `key_index_ranged_gets` and `key_index_bytes_read` (the
+footer and section GETs and the bytes they returned, also counted in
+`get_requests`) as the total the fold issued across its CAS attempts, and
+`key_index_leaves_written`, `key_index_leaf_bytes_written` and
+`key_index_uncovered_entries` (per re-encoded part and field, the entries
+no leaf covers) for the CAS attempt that published: the first two count
+the leaves the published HEAD names for the parts that attempt re-encoded,
+the published leaf set, whether that attempt PUT them or an earlier attempt
+lost to a CAS built the same part. A leaf a build PUT and then abandoned
+(see the restart under "Pair budget" below) is not counted there; its PUT
+is in `put_requests` and the catalog sweep removes it (test
+`the_leaves_written_are_the_published_set`). A no-op fold reports 0 for
+those three. All five are zero with the switch off.
+
+**Metrics `label_value` leaf (ADR-3694 decision 2).** RSEG objects carry no
+KEY_IDX section; their tier-1 source is LABEL_DICT
+(docs/segment-format.md), read whole by
+`ravel_segment::label_dict_strings`. With `build_key_index_leaves` and
+`CatalogConfig::metrics_label_index` both on (the default of `ravel-cli
+catalog fold` and of `ravel-server`, unless `--no-key-index-leaves` or
+`--no-fold-key-index-leaves` turns the first off; the second
+switch is on by default, ADR-3694's Stage 1 acceptance amendment, and
+`--no-metrics-label-index` or `--no-fold-metrics-label-index` turns it
+off), the metrics fold builds one
+field, `label_value` (`ravel_catalog::METRICS_LABEL_VALUE_FIELD`, key type
+`str`), into the same `.kidx` leaf objects and refs as the other signals.
+Its pairs are `key8_str(s)` for every LABEL_DICT string `s` of the entry's
+object, label names and values alike (`__name__`, its metric names, every
+other label name and every value), each at block ordinal 0, which stands
+for the whole object: a match names the objects holding the string, never
+a block within one. With `build_key_index_leaves` off (the default) no
+leaf is built for any signal. With `metrics_label_index` off a metrics
+fold builds no leaf whatever `build_key_index_leaves` says, and the
+rebuild refuses metrics (`KeyIndexRebuildError::UnsupportedSignal`). An
+entry whose object the fold fetched whole for its name postings is read
+from those bytes with no further GET, when the fold held them: the postings
+build holds an object's pairs only for the entries of parts the CAS attempt
+builds a leaf for, and only while they fit the held allowance under "Pair
+budget" below. Any other entry costs a footer suffix GET of the last
+`min(8 KiB, object size)` bytes (a second footer GET when the footer is
+longer) and one ranged GET of the LABEL_DICT section in each pass of the
+build, counted in `key_index_ranged_gets` and `key_index_bytes_read`. A
+fold that merges the previous postings forward fetches only the new
+entries' objects. The entries it merges take their pairs from the
+`label_value` leaves of the previous parts they sat in, with no section
+GET, as the incremental tail build below describes; the carry costs one
+GET per previous leaf a pass reaches. The entries those leaves listed as
+uncovered are read by range. A previous part's entries are all read by
+range when that part has no such leaf (the switch was off on the earlier
+fold) or its lowest leaf's GET fails or the leaf does not verify, and
+every entry is read by range when the carry is dropped: a later previous
+leaf whose GET fails, that does not verify or that no longer decodes, or a
+section read naming an undeclared field. A
+footer naming another tenant, a missing LABEL_DICT section, or a section
+that fails its crc, decompression or decode leaves the entry in
+`uncovered_entry_ordinals` and the fold succeeds; a failed GET does the
+same, as for the other signals.
+
+Two limits apply to metrics only. The byte cap: a part whose `label_value`
+leaves would total more than `metrics_label_index_max_ratio_ppm` parts per
+million of its entries' object bytes (default 1%, ten thousand parts per
+million; rounded down) gets no ref for the field, every entry is counted
+uncovered, and the fold report's `metrics_label_index_parts_over_cap` counts
+the part. The cap is checked at the end of each pass against the slices
+earlier passes PUT plus the pass's own, so a build that crosses it in a
+later pass has already PUT the earlier passes' slices; HEAD names none of
+them, and the catalog sweep removes them as unreferenced (test
+`slices_each_under_the_byte_cap_but_over_it_together_are_uncovered`).
+Checking before any PUT would keep every pass's encoded slices until the
+last pass, which the per-pass memory bound under "Pair budget" rules out.
+The erasure gate: before building, the fold lists the tenant's pending
+metrics erasure requests (`t/<tenant>/m/del/`) once
+(`metrics_label_index_erasure_list_requests`, also in `list_requests`).
+While any request is pending, or when that listing fails, the fold builds no
+metrics leaf, so no leaf is built while a request is pending at the start of
+the fold; every part it re-encodes is published without refs and counted in
+`metrics_label_index_parts_erasure_gated`, and a part carried forward by
+reference keeps the refs it has. A request that arrives after that listing
+does not stop the fold's build, so the gate alone does not keep the key8 of
+an erased string out of every leaf; the router prunes nothing on metrics
+while an erasure request is pending, that is while a `.dreq` request is
+listed under `del/` (`.done` completion records stay there and do not
+count; ADR-3694 decision 2; the PromQL resolve checks the pinned snapshot's
+pending erasures), so no query acts on
+such a leaf until the erasure completes. A part re-encoded while a request was pending is
+published uncovered and stays uncovered while later folds reuse it by
+reference; after the erasure completes, `ravel-cli catalog fold
+--rebuild-key-index --signal metrics` attaches its leaf, and is refused
+with `--no-metrics-label-index`. `--rebuild-key-index --signal metrics` applies
+the same cap and the same gate (its report carries `parts_over_cap`,
+`parts_erasure_gated`, `erasure_list_requests` and `erasure_get_requests`,
+the GETs of the pending requests' `.dreq` objects; a gated run reads no part
+and publishes nothing), reads every entry by range, and writes the leaf a
+fold with both switches on writes for the same part, byte for byte
+(`a_rebuilt_metrics_leaf_is_byte_identical_to_the_folds_leaf`). The PromQL
+resolve routes through the metrics leaf (docs/query-engine.md, "The
+label-value route").
+
+**Version 3 and the posting entry kind (ADR-4146 decision 5).** Leaf
+format version 3 (`KEY_INDEX_LEAF_FORMAT_VERSION_3`) adds the header's
+`entry_kind` (field 14, under `header_crc32c`) and a second body shape,
+the posting (entry kind 1, the layout above): `(key8, count, delta[count])`,
+a strictly ascending list of `u64` values delta-coded from -1, one posting
+per `key8`. Version 3 is accepted for metrics only; a logs or spans leaf
+at 3 is `UnsupportedVersion`. A version 3 leaf of entry kind 0 means
+exactly what a version 2 leaf means. ADR-4146 decision 1 names three
+metrics fields, each with the kind it carries
+(`key_index_field_entry_kind`):
+
+| Field | Key type | Entry kind |
+|---|---|---|
+| `series_label` (`METRICS_SERIES_LABEL_FIELD`) | `Bytes` | 1, the ascending series keys carrying one label pair |
+| `series_class` (`METRICS_SERIES_CLASS_FIELD`) | `Id16` | 1, a one-element posting of the series' class ordinal |
+| `class_objects` (`METRICS_CLASS_OBJECTS_FIELD`) | `I64` | 0, `(key8, entry_ordinal, {0})` |
+
+Every other field, `label_value` and every logs and spans field included,
+carries kind 0. A `series_label` key is `key8_bytes` of the pair
+`u16_le(len(name)) name u16_le(len(value)) value`, with the metric name as
+the pair (`__name__`, name); `series_label_pair_bytes` and
+`series_label_pair_key8` are the one encoding the fold and the router
+share, and a name or value longer than `u16::MAX` bytes is refused. The
+reader checks the kind in GET 1, before any frame is read, in this order
+after the version gate: an `entry_kind` other than 0 or 1 is `Corrupted`;
+a non-zero `entry_kind` below version 3 is `Corrupted`; then, after the ref
+copies, the part binding and the request's field, a kind other than the
+one the header's own signal and field carry is
+`KeyIndexLeafRejection::EntryKindMismatch`, which makes the part read as
+uncovered for that field like every other rejection. The kind-0 decoders
+(the single-key probe, the set probe and `verify_key_index_leaf`'s entry
+pass) refuse a posting leaf the same way, and the posting decoders refuse a
+kind-0 leaf.
+
+A kind-1 frame's decode bound is `posting_decoded_bound`,
+`16 x uncompressed_len + 64` bytes; `decoded_bound` stays as it is for
+kind 0, and the set decoder reserves the posting bound for a posting
+frame. A posting is at least 10 wire bytes and decodes to a 32-byte entry
+plus 8 bytes per value, so the peak is the postings beside the matches a
+probe copies out (test
+`posting_decoded_bound_dominates_the_adversarial_frame`, which measures
+the most postings per byte and one posting of 4,000 one-byte deltas).
+Before it allocates, the decoder refuses a frame declaring more than
+`uncompressed_len / 10` postings, a zero `count`, and a `count` that
+leaves less than one byte per delta or less than 10 bytes for each posting
+still to come; each list is allocated at exactly its `count` (test
+`posting_count_is_checked_before_its_list_is_allocated`). A posting frame
+is also `Corrupted` for a zero or overflowing delta, postings unsorted or
+repeated by `key8`, a `key8` outside the slice or in the wrong bucket, and
+bytes past the last posting. The encoder (`encode_key_index_posting_leaf`,
+`encode_key_index_posting_leaf_with_bucket_bits`) writes version 3 and
+refuses a field that does not carry kind 1, an empty or unsorted posting,
+a repeated `key8`, and a posting whose first value is `u64::MAX`, which a
+delta from -1 cannot encode; the kind-0 encoder refuses a posting field.
+`split_key_index_postings` cuts a posting list into slices under the body
+ceiling as `split_key_index_entries` does for entries. `inspect kidx`
+prints the `entry_kind` and, with `--entries`, every posting's bucket,
+`key8` and values.
+
+No production caller reads or writes a version 3 leaf yet: no fold builds
+the three fields (ADR-4146's fold step writes them behind its own switch)
+and no router reads them (its series route step). What production reaches
+today is the version gate and the `entry_kind` checks every prefix parse
+runs, and `inspect kidx`. The readers-before-writers order of decision 5
+governs the rollout.
+
+**Incremental tail build (ADR-3692 decision 5, ADR-3939 decision 5).** The
+tail part is re-encoded on every fold that advances the watermark, and a
+sealed day is re-encoded when a late record changes it, but most of their
+entries were in a part of the previous HEAD whose leaves already hold
+their pairs. On a fold from a trusted HEAD (not a rebuild) with the leaf
+switch on, the carry sources of a part the fold re-encodes are every part
+of the previous HEAD that has leaves and whose `[min_hour,
+watermark_hour]` overlaps the part's own, and a source sharing no data
+object with the part costs no GET
+(`an_overlapping_part_sharing_no_object_is_not_a_carry_source`). Each
+source is mapped onto the part by data object key, never by ordinal,
+since the new part's ordinals shift wherever a late entry sorts in. A
+source's keys are derived once per fold attempt and only when needed: for
+a source a re-encoded part overlaps, or for one whose hours a reconcile
+or a late entry is about to change, whichever comes first, so an
+advancing fold derives the tail's keys and no other part's
+(`carry_keys_are_derived_only_for_overlapping_sources`). The source's
+entries are then found as the attempt's entries in its hour range, and
+used only when they hash to the digest taken before the first change;
+otherwise the source is not carried. A
+part can carry from several sources: a part over the end of one previous
+part and the start of the next carries from both
+(`a_part_carries_from_two_previous_parts`), and a re-encoded sealed day
+carries from its own previous leaves
+(`a_dirty_sealed_day_carries_its_own_previous_leaves`). A data object that
+two previous parts both list, which a valid HEAD never does, drops the
+whole carry for the part. Previous leaf bytes are held per pass, not for
+the build. Per source and field the build GETs only the lowest slice up
+front and verifies it (the leaf's own checks, its ref, and its tenant,
+signal, part hash and part entry count); its header gives the uncovered
+entries of the whole set, and the refs alone are checked for the rest
+(slices that tile the key8 space, one key type, one `uncovered_count`, the
+source's part hash). A pass feeds a field its carried pairs before it
+reads any section, walking each source's slices in key8 order from the one
+holding the pass's start. It fetches each later slice it walks to and has
+not kept, verifies it the same way and against the lowest slice's
+uncovered list (`a_later_slice_listing_other_uncovered_entries_is_refused`:
+a ref binds only `uncovered_count`, so a slice listing other entries at
+the same length is refused), and stops at the first slice whose `key8_lo`
+is at or past the end that the pairs fed so far have cut. The sections
+read after the feed can lower the end further, but cannot undo a fetch.
+A slice's bytes are dropped once a pass starts past its `key8_hi`, so
+each slice is fetched once per field build attempt. When a field is
+rebuilt after a pass finds a new uncovered entry, its passes start again
+from key8 0: a slice dropped during the first attempt is fetched again,
+and a slice still kept from it stays held through the rebuild until a
+pass starts past it. Each pass decodes the slices its range overlaps
+again, one frame at a time, from the kept bytes. A pass therefore holds,
+per field and source, every slice from the one holding its start through
+the last one it fetched, and any slice it kept from an earlier pass or
+attempt that no pass has yet started past. The bound is per source, and
+it holds while the cut advances through that source's slices. When the
+previous slices were cut under the same budget from the same pairs, a
+pass's range spans the slices one previous pass wrote and its feed stops
+at the first slice of the next, so the carry holds at most two slices per
+field per source when each previous pass wrote one slice
+(`the_carry_holds_at_most_two_slices_per_field_per_source`: 2 at the most
+in each of 7 passes over 6 slices a field, each slice fetched once), and
+one more than a previous pass wrote when the body ceiling split it into
+several. A pass wider than the previous slices, as after a tombstone
+removes entries, holds every slice its range overlaps (in
+`a_dirty_sealed_day_carries_its_own_previous_leaves` the first pass holds
+all 3 of day d's). A source whose entries in the part are few feeds few
+pairs, so the cut may not fire while its slices are walked, and the first
+pass fetches every slice of its set and holds each until a pass starts
+past it: such a source can hold up to its whole previous leaf set, every
+declared field together, for one pass. The fold that seals a day is that
+case, since its new tail carries only the next day's few entries from the
+previous tail. The fold report's `key_index_carry_peak_held_bytes` is the
+most previous-leaf bytes held at once. An entry is taken from its source
+when that source's leaves cover it for every declared field
+(`load_carry_source`, `crates/ravel-catalog/src/fold.rs`). Only the
+entries new to the part, and the entries the previous leaves listed as
+uncovered, have their sections read, so an entry that stays uncovered is
+read again on every advancing fold, not once; the leaves are
+byte-identical to a build that read every section (test
+`advancing_fold_reads_sections_for_new_entries_only`: three carried
+entries, two late ones read, and the leaf equal to a from-scratch build).
+A source is not carried, and its entries' sections are read, when its
+lowest slice is a logs leaf at format version 1, which the reader rejects
+(`an_advancing_fold_does_not_carry_a_logs_version_one_leaf`), when that
+slice cannot be read or does not verify
+(`a_failed_previous_leaf_get_falls_back_to_section_reads`,
+`a_corrupt_previous_leaf_falls_back_to_section_reads`), when its refs do
+not form one set, when a declared field has no leaf in it
+(`a_key_index_field_declared_between_folds_reads_every_entry`), or when one
+of its leaves' field is not declared under its key type
+(`a_key_index_field_retyped_between_folds_carries_no_old_type_pair`).
+Dropping one source leaves the others carried, and the leaves stay the
+same either way, since a carried entry contributes the pairs its section
+would (`a_failing_source_drops_only_its_own_entries_from_the_carry`: the
+GET of one source's lowest slice fails, that source's surviving entry has
+its section read in both passes, the other source's entries have none
+read, and the leaves equal a fold of the same entries into a fresh store,
+byte for byte). The whole carry is dropped, and the build restarts reading
+every entry's section, when a later slice cannot be read, does not verify or no
+longer decodes
+(`a_later_slice_whose_get_fails_restarts_the_build_without_the_carry`:
+2 previous-leaf GETs before the restart, the from-scratch leaves after it),
+and when a section read names a field the tenant does not declare, since a
+carried entry might name it too
+(`a_section_naming_an_undeclared_field_drops_the_carry`). A slice above
+every leaf version this signal reads is neither: it fails the fold with
+`SnapshotFormatError::NewerPart` (see "Parts and tenant config from a newer
+build" below). A part carried
+forward by reference, a sealed part included, keeps its refs and costs no
+GET at all (`sealed_tail_carries_its_leaf_refs_without_a_build`,
+`a_part_carried_forward_keeps_its_key_index_refs`).
+
+**Pair budget (ADR-3692 decision 5).** `key_index_build_max_pairs`
+(default 8,000,000; `DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`,
+`crates/ravel-catalog/src/config.rs`) bounds the (entry, key8) pairs the
+build holds for one part, the pairs read from sections and the pairs
+carried from previous parts together. Every field the build indexes gets
+a share, `max(1, floor(budget / F))` for `F` such fields, the ones the
+tenant declares and the ones a section names, whether or not a field is
+still building. The share is fixed once the first pass has read every
+section. During that first pass a section naming a field the tenant did
+not declare adds a field and lowers the share; a field that already held
+pairs under the larger share keeps them, so on that first pass a field can
+hold above its final share, and the part's total can pass
+`F x (max(share, R) + 1)` by about the number of fields declared before
+the new one. R, the longest run of one key8, is at most the part's entry
+count, since an entry contributes at most one pair per key8. A field holds every pair in its
+pass's range as it is read or decoded; when its held pairs pass the share,
+it gives up its highest key8 run, and that key8 becomes the exclusive end
+of the pass's range. So a pass holds, for each field, the longest run of
+whole key8s from where its last pass ended whose pairs fit the share, or
+that one key8 alone when its own pairs exceed it, which is held whole. A
+pass then sorts its pairs in their heap buffer, encodes them into slices
+under the leaf body ceiling and closes every slice before the next pass
+starts: the first slice starts where the field's last slice ended, the last
+ends at the pass's end, and no pair outlives its pass. Each later pass
+reads the sections it needs again, decodes the carried leaves its range
+overlaps, and keeps the next range; the slices tile the key space with no
+gap and no overlap, and every pass end is a slice end
+(`build_part_key_index`; test
+`pair_budget_builds_in_passes_and_closes_a_slice_at_each_pass_end`: 12
+pairs under a budget of 5 build in passes of 5, 5 and 2, which a 40-byte
+ceiling cuts into 5 slices where one pass writes 4).
+
+The leaves therefore depend on the budget. At a given budget they are the
+same whether the pairs were carried or read, and the same after a restart:
+they equal the leaves the one-call build over the final read set writes at
+that budget (test
+`the_leaves_are_the_same_carried_from_scratch_and_after_a_restart`, at
+budgets 1, 2, 3, 5, 6, 7, 15 and `u64::MAX`). They equal a one-pass build only
+when every field's pairs fit its share. The `--rebuild-key-index` repair
+runs the same build in the same passes, so at the same budget its leaves
+match a fold's byte for byte, for a part whose sections name no field the
+tenant does not declare (the repair builds the declared fields alone, so
+an undeclared one would change the fold's share).
+Lookups stay correct wherever the slices fall: the router reads the leaf
+whose `[key8_lo, key8_hi]` holds the key8, and ADR-2707's slice rule needs
+only that the slices tile the key space. Their cost does depend on it. A
+single-key lookup reads one slice whatever the count, but the router
+charges `1 + min(k, 2^bits, B_run)` GETs for every slice a key set touches
+(`crates/ravel-query/src/key_index_route.rs`), so a part built in more
+passes has more slices, a multi-key probe of it pays more GETs and reaches
+`KEY_INDEX_LEAF_GET_CEILING` sooner, and more parts fall back to tier 1;
+and the HEAD bytes per (part, field) grow with the slice count. Neither is
+measured yet (T9's Stage 1 run).
+
+The pass rule, for a part with one key-index field: the passes are the
+greedy partition of the field's key8 runs, in ascending order, into groups
+of at most `budget` pairs, a run over `budget` a group of its own. That is
+`ceil(P / budget)` for `P` pairs only when no key8 is shared between
+entries; 17 pairs over 11 runs, two of them shared by four entries each,
+take 4 passes at budget 6 where `ceil(17 / 6)` is 3, and every budget from
+1 to 20 matches the greedy count (test
+`the_pass_count_is_the_greedy_key8_partition`). With several fields each
+field's passes are the greedy partition under its share, and the part
+takes as many passes as its slowest field (test
+`a_two_field_build_takes_as_many_passes_as_its_slowest_field`: two fields
+of 16 and 8 pairs under a budget of 4, shares of 2, take 8 passes). A
+field that a pass finds a new uncovered entry for after an earlier pass
+ended holding pairs (a key8 over the body ceiling in a later range, or a
+section read that failed in a later pass) keeps passing to the end of the
+key space, collecting every uncovered entry the passes find, and is then
+rebuilt once from the first range with the complete list, so a rebuild
+adds that field's greedy count once more, at most twice the count in all
+(8 passes for the same 17 pairs under a 40-byte ceiling); a further
+finding in the rebuild, which only a section read failing then for the
+first time can cause, leaves the field with no leaf. When each entry's
+section reads the same in every pass, every leaf lists the same uncovered
+entries at every budget (test
+`a_restart_sees_every_uncovered_entry_at_every_budget`: two over-ceiling
+key8s in different ranges, five uncovered entries on every leaf at every
+budget from 1 to 20 and `u64::MAX`). One case still differs: a section
+read that fails in some passes and not others. Its entry is uncovered for
+the part where a one-pass build whose one read succeeded covers it, and a
+failure that first appears in a rebuild leaves the field with no leaf.
+Either way the stored leaves stay exact, only less complete, and a tail
+entry is read again by the next advancing fold. Carried pairs count
+against the budget like read ones
+(`carried_pairs_count_against_the_pair_budget`: 9 carried and 6 read pairs
+take 3 passes of 5 and write 3 leaves, with the previous leaf fetched
+once).
+
+The bound: on every pass, for each field, the pairs the heap holds at its
+peak plus the pairs of any slice left open across the pass end are at most
+`max(share, R) + 1`, `R` the field's largest key8 run, the `+ 1` the pair
+placed before a cut; the open slice, the pairs the field still holds once
+its pass has ended, is 0, since every pass closes its slices and frees its
+heap. Summed over the `F` fields, a pass holds at most
+`F x (max(share, R_max) + 1)` pairs, which is at most `budget + F` when no
+key8 run exceeds a share. Test
+`every_pass_holds_at_most_its_share_open_slice_included` pins the per-field
+bound on every pass of three fixtures at budgets 1, 2, 3, 5, 6 and
+`u64::MAX`.
+
+A held pair costs, as an upper-bound estimate, 88 B for one block: one
+40-byte `KeyIndexLeafEntry` (test
+`a_held_pair_is_forty_bytes_in_the_heap_buffer`), counted twice because
+the field's heap buffer grows to at most twice the most pairs it held, and
+a block list allocated at exactly its length, 4 B a block requested (the
+pass log `pass_ranges` asserts both on every pass of the tests above). The
+8 B a one- or two-block list costs is jemalloc's smallest size class, the
+binaries' allocator, and no test pins it. The sort reuses the heap buffer
+and copies no pair (test `a_pass_sorts_its_pairs_in_the_heap_buffer`). The
+budget does not bound: the previous leaf bytes as stored that the carry
+holds, each slice fetched once per field build attempt (again when a
+field is rebuilt) and held until a pass starts past it, the lowest slice of
+each source and field from the load before the first pass and every later
+slice from the pass that fetches it (under "Incremental tail build": at
+most two slices per field per source when the previous slices were cut
+under the same budget from the same pairs and each previous pass wrote one
+slice, more when a pass is wider than they are or a source has few entries
+in the part, up to that source's whole previous leaf set;
+`key_index_carry_peak_held_bytes` reports the most); one decoded frame of
+one previous
+leaf at a time (a frame is one bucket, near `4 x 2^bucket_bits` bytes for
+keys whose key8 spreads evenly, trace ids, strings and bytes, and up to the
+whole leaf body for I64 keys that share their high bits); the KEY_IDX or
+LABEL_DICT sections in flight, up to `fold_bucket_concurrency`; the encoded
+leaves of one pass until their PUTs; and per-entry bookkeeping. ADR-3692's
+amendments to decision 5 list these.
+
+The metrics postings build decodes each fetched object's catalog through
+the charged decoder, so an L1 object's per-sample provenance (up to 64 B
+of columns plus 32 B per sample) is charged to the fold's memory budget
+before it is allocated (the catalog's `memory_budget()`, the process budget on
+the server) and released once the entries are taken. A
+refused charge aborts that postings build like any decode error, and the
+snapshot is published without a postings ref.
+
+A metrics fold holds one more set of pairs, against an allowance of its
+own: the `label_value` pairs its postings build read from objects it
+fetched whole, held from the postings build until the leaf of the entry's
+part is built, so the leaf build reads them with no GET. That allowance is
+`key_index_build_max_pairs` pairs too, on top of what one pass holds. It is
+charged only for the entries of parts the CAS attempt builds a leaf for: a
+part reused by reference, or one an earlier attempt built, holds nothing.
+An object whose pairs would take the held total past the allowance is not
+held, and the leaf build reads it by range in every pass, as it does an
+object the postings build did not fetch. A part's held pairs are released
+once its leaf is built. Tests
+`a_reconciled_metrics_fold_holds_no_pairs_for_reused_parts` (a reconciled
+fold that fetches all five entries whole and reuses four of its five parts
+holds only the tail's 9 pairs) and
+`held_label_dict_pairs_stay_within_key_index_build_max_pairs` (at a budget
+of 20, two of six objects held, 18 pairs at the peak, the other four read
+by range in each pass, 0 held after the build) pin it.
+The server sets the budget with `--fold-key-index-build-max-pairs` and
+`ravel-cli catalog fold` with `--key-index-build-max-pairs`, each refused
+without the leaf build flag and at 0.
+
+The `--rebuild-key-index` repair (`Catalog::rebuild_key_index`, under
+"Rollout") builds each part it visits with the same build under the same
+budget, `key_index_build_max_pairs` from its catalog config, which
+`ravel-cli catalog fold --rebuild-key-index` leaves at the default
+8,000,000. A part it visits has no previous leaf to carry and holds no
+LABEL_DICT pairs from a postings build, so the per-field bound above is
+the whole of what it holds in pairs: at most `max(share, R) + 1` per field,
+at most `budget + F` for the part when no key8 run exceeds a share, read
+again from the sections on every pass, and released before the next part.
+Test `the_repair_holds_at_most_the_pair_budget_and_matches_the_fold_at_that_budget`
+pins it: 40 pairs of one field under a budget of 8 build in 5 passes, each
+holding 8 pairs, a peak of 9 with the pair placed before a cut, every
+section read in each pass (40 ranged GETs for 4 entries), and leaves byte
+for byte a fold's at the same budget. A repair that built in one pass with
+no budget, holding every section read of its batch whole, would hold about
+6.8 GB of pairs for a logs day (ADR-3939, "Decision 2, clarified").
+At the default budget the same day part, two fields at a share of
+4,000,000, holds at most 8,000,002 pairs when no key8 run exceeds a share,
+about 704 MB at the 88 B upper-bound estimate above, plus what the budget
+does not bound: the sections in flight, up to `fold_bucket_concurrency`,
+the encoded leaves of one pass until their PUTs, and per-entry
+bookkeeping. Its 100,000,000 `request_id` pairs take at least
+`ceil(100,000,000 / 4,000,000) = 25` passes (ADR-3939, "Two costs the
+decision did not count"), so the repair reads every section of the part
+25 times or more.
+
+The fold report carries four figures for this build, each also a
+`/metrics` counter in the `mode` label set the other fold counters use,
+summed over every fold that returned a report, a no-op included
+(`services/ravel-server/tests/fold_key_index_metrics.rs`):
+
+- `key_index_sections_read` (`ravel_catalog_fold_key_index_sections_read_total`):
+  KEY_IDX section reads the build issued, one per (entry, pass) whatever
+  GETs each cost, which `key_index_ranged_gets` counts. A carried entry
+  is not read. It is 2 for the two late entries of
+  `advancing_fold_reads_sections_for_new_entries_only` and 9 for three
+  entries over three passes in
+  `pair_budget_builds_in_passes_and_closes_a_slice_at_each_pass_end`.
+- `key_index_entries_carried` (`ravel_catalog_fold_key_index_entries_carried_total`):
+  entries whose pairs came from previous parts' leaves instead of a
+  section read. It is 3 in `advancing_fold_reads_sections_for_new_entries_only`
+  and 0 when the one source's carry was dropped
+  (`a_failed_previous_leaf_get_falls_back_to_section_reads`).
+- `key_index_build_passes` (`ravel_catalog_fold_key_index_build_passes_total`):
+  build passes summed over the re-encoded parts, by the pass rule above,
+  a rebuild's passes included. It is 3 under a budget of 5 and 1 under
+  `u64::MAX` in
+  `pair_budget_builds_in_passes_and_closes_a_slice_at_each_pass_end`.
+- `key_index_leaf_gets` (`ravel_catalog_fold_key_index_leaf_gets_total`):
+  whole-object GETs of previous parts' leaves, one per (field, slice) a
+  build fetches, also counted in `get_requests`; a pass decodes a kept
+  slice again from its bytes, with no further GET. It is 1 in
+  `advancing_fold_reads_sections_for_new_entries_only`, 12 for 12 slices in
+  `the_carry_holds_at_most_two_slices_per_field_per_source`, and 0 in
+  `sealed_tail_carries_its_leaf_refs_without_a_build`, where no
+  re-encoded part shares an object with a previous part.
+
+All four are zero with the switch off (test
+`the_key_index_leaves_flag_reaches_the_fold`), and `ravel-cli catalog fold`
+prints each (tests
+`the_pair_budget_reaches_the_fold_and_the_report_prints_the_build_figures`
+and `an_advancing_fold_reports_four_different_build_figures`, the second
+an advancing fold reading 4 sections, carrying 3 entries, in 2 passes with
+1 leaf GET, writing 2 leaves; both in `services/ravel-cli/tests/catalog_fold_key_index_leaves.rs`).
+
+The report also carries two figures that are not `/metrics` counters,
+so a reader can bound the pass count from the report alone:
+`key_index_pair_budget`, the budget the build ran under
+(`key_index_build_max_pairs`, at least 1), and `key_index_field_pairs`, a
+map from each field the build indexed to its pairs, one per distinct
+(key8, entry), summed over the parts the publishing attempt re-encoded. A
+declared field no section names is in the map with 0, and so is a field
+a section named during the build, so for a fold that re-encodes one part
+the map's size is the field count `F` the share `max(1, budget / F)`
+divides by. One fold covers one signal, so the map is keyed by field
+alone. Both are zero or empty with the switch off and on a no-op fold
+(test `the_fold_report_carries_the_pair_budget_and_every_fields_pairs`:
+`absent_key` 0, `session` 5 and `user_id` 5 under a budget of 6), and
+`ravel-cli catalog fold` prints both, under `--json` as a number and an
+object (test `the_json_report_carries_the_pair_budget_and_the_field_pairs`).
+It also carries `key_index_parts_missing_declared_leaves`, the count of
+carried parts that lack a declared field's leaf (under "Day seal"), which
+`ravel-cli catalog fold` prints in text and `--json` (test
+`a_switch_off_fold_over_leaves_is_reported`), and
+`key_index_carry_peak_held_bytes`, the most previous-leaf bytes the carry
+held at once while building any one part in the fold, every source and
+field together (under "Incremental tail build"; 0 when no previous slice
+was fetched, and 0 with the switch off, test
+`a_switch_off_fold_over_leaves_is_reported`, whose switch-off fold runs
+over a HEAD whose part has a leaf). A slice fetched by a source's load
+that then fails on another field counts, since its bytes were held
+(test `a_slice_released_by_a_failed_load_stays_in_the_peak`). It equals
+the largest total the passes held in
+`the_carry_holds_at_most_two_slices_per_field_per_source`, and
+`ravel-cli catalog fold` prints it in text and `--json` (test
+`fold_human_report_prints_every_fold_report_field`, which checks every
+serialized field against the text report).
+
+Six more fields are the figures the ADR-3939 investigation harness
+reads, none of them a `/metrics` counter; `ravel-cli catalog fold`
+prints each in text and `--json` (test
+`fold_report_renders_the_adr_3939_figures_in_text_and_json`):
+
+- `sealed_part_puts`: snapshot part object PUTs of parts other than the
+  tail, one per such part an attempt re-encoded, summed over every attempt
+  and also counted in `put_requests`. The tail's PUT, which every
+  publishing fold issues, is not counted, and a part carried by reference
+  issues none (1 of 2 part PUTs for a sealing fold, 0 of 1 for an advance
+  and 0 of 0 for a no-op refold in
+  `fold_report_counts_sealed_part_puts_and_not_the_tail`).
+- `sealed_day_leaf_puts` and `sealed_day_previous_leaf_gets`: the leaf
+  PUTs and previous-leaf GETs of re-encoded parts that are not the tail,
+  lie within one UTC day, and whose day the previous HEAD already held as
+  a sealed part (one that was not its last), so the fold that first seals
+  a day counts nothing for it. Acceptance A3 expects both to be 0 once a
+  day is sealed; a late commit or rewrite into a sealed day makes them
+  nonzero (2 and 3 for the dirty-day re-encode in
+  `fold_report_counts_a_sealed_days_leaf_puts_and_gets`).
+- `key_index_unchanged_section_gets`: the GETs of KEY_IDX section reads
+  for entries a previous part's leaves covered, also counted in
+  `key_index_ranged_gets`: an entry whose data object a previous part held
+  and whose leaves covered it for every declared field, or, when that
+  part's leaves could not be loaded or the carry was abandoned for a data
+  object listed twice, any entry whose object that part held, with no
+  per-field check. It is nonzero only when a carry was lost, whatever made
+  it fail, and an entry whose object no previous part held is never
+  counted (12 of the 18 section GETs when a slice GET fails mid-build in
+  `fold_report_counts_section_gets_for_entries_a_previous_leaf_held`, the
+  other 6 being a new entry's; 6 of 10 when the previous part lacks a
+  newly declared field's leaf in
+  `fold_report_counts_section_gets_of_a_refused_previous_part`, the other
+  4 being the late entries').
+- `head_digest`: lowercase hex blake3 of the HEAD in effect after the
+  call, the one published or, on a no-op, the one read, re-encoded with
+  `folder_id` set to sixteen zero bytes and `created_unix_ns` to zero;
+  empty when there is no valid HEAD, and a HEAD that fails to re-encode
+  fails the fold rather than reporting an empty digest
+  (`fold_report_head_digest_ignores_the_folder_id_and_clock`). The digest
+  covers every other HEAD field: `format_version`, `tenant_hash`,
+  `signal`, `shard_count`, `watermark_hour`, `parts`, `postings` and
+  `shard_generation_count`, not the process or clock that wrote them, so
+  two folds that publish the same HEAD content share it while their HEAD
+  bytes differ.
+  A re-encode of the same entries within a run would need the HEAD
+  deleted (a refold at the same watermark is a no-op that reports the
+  HEAD it read, and a later fold moves the watermark), and leaf
+  boundaries can differ between builds (the header comment of
+  `crates/ravel-catalog/src/key_index_rebuild.rs`), so ADR-3939's A4 and
+  W8 determinism is pinned by unit tests rather than measured: the
+  harness reports those figures as unsupported. The switch-off
+  partition's equality (A4) is likewise not reported: it holds by
+  construction of the partition and is pinned by its unit tests.
+- `retired_hours`: the sorted union of every HEAD part's `retired_hours`
+  (under "Retired hours"), read from the HEAD on a no-op
+  (`fold_report_retired_hours_is_the_heads_union`).
+
+When a compaction or erasure rewrite record lands, the fold re-encodes the
+part and rebuilds its leaves from the new entry set. An erasure rewrite
+therefore removes the subject's `key8` from the next leaf; the stale leaf is
+unreferenced and swept past the protection horizon. On metrics the refold
+that drops the erased inputs runs while the request is still pending, so
+it re-encodes the part under the erasure gate with no `label_value` leaf
+(under "Metrics `label_value` leaf"). The tail gets its new leaf from the
+first fold that re-encodes it once no request is pending
+(`metrics_erasure_rewrites_refolds_a_new_leaf_and_sweeps_the_stale_one`).
+A sealed day re-encoded under the gate stays without one, and label-index
+routing prunes none of its objects, until `ravel-cli catalog fold
+--rebuild-key-index` attaches it
+(`a_metrics_day_sealed_under_the_erasure_gate_is_counted_until_repaired`). A leaf holds key values
+(an `I64` subject value verbatim, an 8-byte hash prefix of a string value, a
+trace id), so the catalog family is no longer free of subject values
+(ADR-0064, `.kidx` amendment): the erasure completion rule for stale
+catalog objects covers a stale `.kidx` the same way it covers
+a stale `.cstat`, and the query path, once it reads leaves, keeps the
+pending-erasure predicate filtering rows after the index until the rewrite
+lands.
+
+**Rollout.** A fold process that predates field 8 re-encodes HEAD without
+it for every part it carries forward; the leaves those parts had are then
+unreferenced, the sweeper deletes them past the protection horizon exactly
+as it deletes an unreferenced `.cstat` (a kept leaf that nothing re-attaches
+would cost its bytes for the life of the part and buy nothing), and the
+affected parts read as uncovered for that field and are scanned (the
+ADR-0849 safety lemma). The lookup stays correct throughout. No HEAD field
+can constrain such a folder: it predates every field here, and the fold
+builds HEAD as a fresh struct, so an unknown field does not survive its
+CAS. The regular fold re-indexes a part only when it re-encodes it, and a
+sealed, compacted historical part with no erasure pending is never
+re-encoded by the regular fold, so the repair is explicit, operator-driven,
+and is not a fold: `ravel-cli catalog fold --rebuild-key-index [--field <name>]
+[--batch-entries <n>]` (`Catalog::rebuild_key_index`,
+`crates/ravel-catalog/src/key_index_rebuild.rs`) attaches leaves to parts
+it leaves unchanged. For every part in HEAD that lacks a `key_index` ref
+for a declared field (every part, for spans), or for `--field` alone,
+which is refused unless the tenant declares it, it reads the part object
+once, reads each entry's footer suffix and KEY_IDX section (the ranged
+GETs of the fold's own leaf build: two per entry in every pass of the
+build under the pair budget, see "Pair budget", and a third when the
+footer is larger than the 8 KiB suffix), writes the leaves for the
+declared fields under the fold's key layout (at the same budget, for a
+declared field the leaf is byte-identical to the one a fold with
+`build_key_index_leaves` on writes for the same part, when the part's
+sections name no undeclared field; a field a KEY_IDX section names that
+the tenant does not declare gets none), and publishes a HEAD whose part refs are the current
+ones with `key_index` attached (`SnapshotHead.parts` carries the refs
+inline, so the publish is the HEAD CAS alone). A part that already holds
+a ref for every requested field costs no GET; one that holds refs for
+some keeps them and gains the rest. The part objects, their blake3 and
+their `.csnap` baselines are untouched, so none of the fold's per-part
+machinery runs: no content-hash carry-forward, no dirty-hour reconcile,
+no column-stats baseline, no part, `.csnap` or `.cstat` PUT, no window
+LIST. It runs regardless of `build_key_index_leaves`, and the CLI refuses
+it beside `--key-index-leaves`, `--no-key-index-leaves` and
+`--max-flush-lifetime`. A logs tenant
+that declares no key-index field, or has no tenant config, is refused
+before HEAD is read, with a typed error naming the tenant
+(`KeyIndexRebuildError::NoFieldDeclared`). It publishes
+in batches bounded in entries: a batch is the longest run of the
+remaining unindexed parts whose entry total stays at or below
+`--batch-entries`, and at least one part, so an attempt costs at most
+`2 x P x max(batch_entries, largest part's entries)` ranged GETs while
+every footer fits the suffix (`3 x P x` otherwise), `P` the most passes
+any part of the batch takes: 1 when every field's pairs fit its share. The
+batch bounds requests, not memory: the parts of a batch are built one at a
+time, each under the pair budget. The default is 250,000, the
+fold's `DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`, which is a seal threshold
+rather than a cap (`partition_parts` splits only at hour boundaries, so
+one ingest hour larger than it yields one part above it), so the ceiling
+is `2 x P x batch_entries` only while no unindexed part exceeds the
+setting and `2 x P x` the largest part otherwise (`3 x P x` in either case
+once a footer is larger than the 8 KiB suffix); the report states the largest
+unindexed part's entries up front, computed from HEAD before the first
+part GET. Each batch is one HEAD CAS, bounded like the fold's at
+`MAX_HEAD_CAS_ATTEMPTS`; on a lost CAS the attempt re-reads HEAD, keeps
+the refs for the batch parts whose blake3 the new HEAD still names (a
+leaf is keyed by `part_blake3`) and drops the rest, whose leaves this
+sweep deletes; it reads no section again. The report carries the largest
+unindexed part's entries, parts rebuilt, parts deferred, leaves written
+and their bytes, section bytes read, ranged GETs issued (footer suffixes,
+any extra footer ranges and sections together, a failed GET included),
+uncovered entries, the attempt count, and per attempt the part
+GETs, ranged GETs, leaf PUTs, HEAD CAS tries and parts published (an
+attempt is one batch's publish including its retries, at most
+`MAX_HEAD_CAS_ATTEMPTS` tries, so a lost CAS adds a try, not an attempt).
+A run that stops or exhausts the CAS retries on one batch has therefore
+published every earlier batch (the error says how many parts, and the
+CLI prints the report so far), loses at most the ranged GETs of that
+batch's entries in every pass, and leaves that batch's leaves unreferenced for this
+sweep; the rerun skips every part whose ref an earlier batch published. A
+one-part tenant is a single batch, and an interruption there loses the
+whole run. A part none of whose entries carries the field (or whose leaf
+encode is refused) gains no ref, so every rerun reads it again; a batch
+in which no part gains a ref issues no HEAD CAS. A part with an entry
+whose ranged GET failed with a store error is deferred once the reads of
+that pass are done, before the pass's PUTs: it gains no ref this run, the
+leaves its earlier passes PUT are referenced by nothing and swept like any
+unreferenced leaf, the report counts it under parts deferred
+(`parts_deferred`), a warning names the object and the part, and a rerun
+reads it again. Likewise a metrics part whose `label_value` leaves pass
+the byte cap at a pass end gains no ref for the field
+(`parts_over_cap`), and the leaves its earlier passes PUT are swept. A KEY_IDX section that is absent or does not
+decode is not a failed GET; that entry reads as uncovered. A failed or
+mismatched part GET stops the run with the report so far, and the batch
+it was in publishes nothing. A rebuilt
+ref is carried forward by every later fold that carries the part by
+reference, and a fold that re-encodes the part while
+`build_key_index_leaves` is off drops it, so the rebuild must be rerun
+after such a re-encode. A logs leaf at format version 1 (see "Per-part
+key-index leaves") can prove absent a key its part holds, and the reader
+rejects it, so the rebuild also replaces it. Before any batch, on logs only,
+it reads each ref of a requested field with one ranged GET of the leaf's
+`[0, prefix_len)` to learn its `format_version` (`leaf_prefix_gets` and
+`leaf_prefix_bytes_read` in the report, text and JSON alike, counted when
+issued and not part of `ranged_gets`). That cost is
+paid on every run, by a tenant with no version 1 leaf too: one GET per
+held logs ref of each requested field. A part holding a version 1 ref for a
+field is counted under `parts_unindexed` and `parts_with_refused_leaves`, its
+sections are read, and the field's leaves are built again; the publish
+removes every ref of that field from the part and attaches the new ones. A
+version 2 leaf is written at a key derived from its own bytes, so it never
+lands on the version 1 leaf's key. The old leaf is neither overwritten nor
+deleted by the rebuild: once HEAD no longer names it, the catalog sweep
+deletes it like any unreferenced leaf (`deleted_kidx`). The sweep measures
+the protection horizon from the leaf's own `last_modified`, not from when
+HEAD stopped naming it, so a query pinned to an earlier HEAD can find the
+old leaf gone; that read counts the leaf as rejected and answers the part
+from tier 1, exactly. Every slice of a field is replaced together
+(`a_field_with_one_version_one_slice_hands_every_slice_over`). A prefix GET
+that fails with a store error defers the part, which keeps its refs this
+run, and a rerun replaces them
+(`a_failed_leaf_prefix_get_defers_the_part_and_a_rerun_replaces_it`); a
+prefix that does not decode leaves the ref alone, since the reader already
+reads it uncovered
+(`a_logs_version_one_ref_is_replaced_and_its_leaf_is_kept`). A spans ref is
+never read: spans accept version 1. The leaf build switch does not limit
+any of this: the rebuild writes leaves whether or not
+`build_key_index_leaves` is on, so a deployment that kept the switch off
+but ran the rebuild before this version holds version 1 logs leaves, and a
+rebuild run under this version replaces them. Like the plain CLI fold it holds no claim and
+keeps no cursor (HEAD is the cursor). It accepts `--writers-stopped` as
+the same assertion the plain fold takes, but seals no hour and reads no
+commit record, so the flag changes nothing it does. Detection: the sweep's
+`CatalogSweepOutcome` splits its deletes by kind, and the server renders
+`deleted_kidx` as
+`ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`; that series
+rising while HEAD carries no `key_index` refs (`ravel-cli catalog inspect`
+prints each part's `key_index (field 8)` line) is the signature an operator
+acts on. A sweeper that predates field 8 names no leaf in its reference
+set, so it deletes live leaves past the horizon with the same outcome: the
+parts read as uncovered until a fold re-encodes them or the repair runs.
+The cost of a bad rollout is one rebuild run over the affected
+parts, `2 x entries x P` ranged GETs in total while every footer fits
+the suffix (a footer suffix and a section range per entry in each of a
+part's `P` passes, at most `2 x P x max(batch_entries, largest part's
+entries)` per attempt, `P x 500,000` at the default while no part exceeds
+the seal threshold) plus the sections' bytes once per pass, and that run scans until it has run; nothing is retained and
+nothing is silent. Of the mixed-version combinations ADR-0849 section 1a
+requires tested (old folder then new sweeper, old sweeper against a new
+HEAD, new folder after an old folder, then the rebuild), the first is
+tested
+(`leaves_a_field_8_stripping_fold_drops_are_reaped_and_the_part_reads_uncovered`
+in `crates/ravel-maintain/src/sweep.rs`: a HEAD republished without field 8,
+the sweep reaping its leaves, and the lookup finding no ref). The rebuild
+half of the third is tested by
+`rebuild_attaches_leaves_to_a_stripped_part_and_the_probe_names_the_blocks`
+in `crates/ravel-catalog/src/key_index_rebuild.rs`: a HEAD whose parts
+carry no field 8 (folded with the leaf build off, which writes the same
+HEAD an old folder does), then the rebuild, HEAD otherwise unchanged, and
+the probe naming the exact blocks. The second, and a new folder running
+between the old one and the rebuild, are not tested yet.
+
+**Rollout of the day seal (ADR-3939 decision 4).** The first fold with the
+switch on under the day seal re-partitions the whole retained entry set:
+every part that spans more than one UTC day is re-encoded into day parts,
+which at the default `snapshot_part_max_entries` of 250,000 is every part
+(a logs day held 552 entries at ADR-3939's box D rate), and every day part's leaves are
+built once, under the pair budget per part. For a 30-day logs tenant that
+one fold writes about 39.2 GB of leaves over about 750 passes, the cost
+ADR-3939 decision 4 states for a switch disagreement, paid once. Every process that folds a tenant MUST agree on the switch. A
+switch-off fold partitions the whole retained entry set by entry count
+alone, so it re-encodes every part whose span differs under the entry
+threshold alone and drops the leaf refs of every part it re-encodes; the next switch-on fold splits
+the history into days again and rebuilds those days' leaves. Both
+partitions hold the same entries, so a disagreement costs object-store
+work on every pair of folds, never wrong rows. A folder that predates the
+day seal partitions the same way with the switch on, so every folder of
+a tenant runs a version with the day seal before the switch is turned on
+for that tenant. The fold builds no leaf for a part it carries by
+reference, so a day sealed without a declared field's leaves is counted in the fold report's
+`key_index_parts_missing_declared_leaves` (under "Day seal", which says
+which cases `ravel-cli catalog fold --rebuild-key-index` repairs and which
+stay counted); declaring a key-index field for a tenant with the switch on
+is followed by that repair over its sealed days. A switch-off fold whose previous HEAD has a part
+carrying key-index leaf refs sets `key_index_switch_off_over_leaves` in
+the fold report, which `ravel-cli catalog fold` prints in text and
+`--json`, and logs one warning naming the tenant and signal; it is not
+refused and its output does not change, because turning the switch off on
+purpose looks the same (tests
+`key_index_switch_off_over_leaves_is_reported_and_warned` and
+`a_switch_off_fold_over_leaves_is_reported`).
+
+### Retired hours
+
+ADR-3939 decision 6. `SnapshotPartRef` field 9, `repeated uint32
+retired_hours`, lists the ingest hours inside the part's `[min_hour,
+watermark_hour]` whose retention tombstone a fold has observed while the
+part still holds their entries. Absent means none. `validate_head`, which
+runs on encode and on decode, rejects a list that is not strictly
+ascending (`RetiredHoursNotAscending`, so a repeated hour fails too) and an
+hour outside the part's range (`RetiredHourOutsidePart`), both bounds
+inclusive (`retired_hours_outside_the_part_range_fail_head_validation`).
+
+**HEAD version.** A HEAD is written with `format_version` 2 exactly when
+some part ref carries a retired hour, and with 1 otherwise
+(`head_format_version_for`, stamped by every HEAD writer).
+`HEAD_FORMAT_VERSIONS` is `[1, 2]`: the reader accepts both, refuses a 1
+carrying a retired hour and a 2 carrying none
+(`HeadVersionContentMismatch`), and refuses any other version as
+`UnsupportedHeadVersion`, which counts as a newer format only above 2.
+The version is a function of the content, so a HEAD whose retired hours
+empty, or whose retired part re-encodes, is written at 1 again, and two
+folds of the same input write the same bytes. `ravel-cli catalog inspect`
+prints the HEAD's `format_version` and each part's `retired_hours (field
+9)` line, and the same two fields under `--json`
+(`inspect_prints_the_head_version_and_each_parts_retired_hours`).
+
+**Mixed versions.** A build that predates field 9 accepts only HEAD
+version 1, so `decode_head` refuses a version 2 HEAD as
+`UnsupportedHeadVersion(2)` rather than ignore field 9 and serve a retired
+hour. What each older component does with that refusal, while the HEAD of
+a tenant and signal stays at version 2:
+
+- Snapshot resolve treats an undecodable HEAD as no snapshot and falls
+  back to the listing resolve (`read_head` in
+  `crates/ravel-catalog/src/snapshot_resolve.rs`,
+  `corrupt_head_falls_back_to_full_listing`). Listing honours retention
+  tombstones (`tombstoned_bucket_is_excluded_from_resolution`), so the
+  answer is right and slower.
+- A SQL node resolving the logs table also loads per-part column
+  statistics when the statement is eligible for a metadata-only path
+  (`logs_column_stats_eligible` in `crates/ravel-sql/src/executor.rs`).
+  That loader decodes HEAD itself and has no listing fallback: the refusal
+  surfaces as `LoadColumnStatsError::HeadCorrupt`, which
+  `crates/ravel-sql/src/error.rs` classes as a newer format, a retryable
+  503 (`newer_version_head_through_column_stats_is_unavailable`). An
+  eligible logs statement on that node fails with a 503 until the node is
+  upgraded or the HEAD returns to version 1; a statement that is not
+  eligible takes the listing path above.
+- Maintain cannot prove an object unreachable from a HEAD it cannot read.
+  The retention sweep's reachability gate blocks every delete for that
+  tenant and signal (`ensure_head` in
+  `crates/ravel-maintain/src/reachability.rs`,
+  `sweep_blocked_fail_closed_when_head_undecodable`), and the catalog
+  sweep deletes nothing (`read_head_reference` in
+  `crates/ravel-maintain/src/sweep.rs`,
+  `catalog_sweep_corrupt_head_deletes_nothing`).
+- A folder fails closed: a HEAD above its supported version is
+  `HeadState::UnsupportedVersion`, the fold returns
+  `CatalogError::UnsupportedHeadVersion` and never rebuilds over it
+  (ADR-0066 decision 2, `newer_format_head_fails_loudly_and_never_clobbers`).
+  An older `--rebuild-key-index` refuses at the same decode.
+- The startup format-window audit (off by default) covers the tenants the
+  process was started with, its fold and alert-rule tenants
+  (`tenants_to_check`). For one of those it reports that tenant and signal
+  as a check that could not run (`read_catalog` in
+  `services/ravel-server/src/format_window.rs`,
+  `a_head_from_a_newer_build_is_not_reported_corrupt`), so an older
+  `ravel-server` started with `--format-window-check refuse` exits before
+  any listener binds, and one started with `warn` logs it and starts.
+- An older `ravel-cli catalog inspect` fails at the same decode and prints
+  nothing for that HEAD (`services/ravel-cli/src/catalog.rs`).
+
+The HEAD returns to version 1 when the part with retired hours re-encodes
+or leaves HEAD, and every older component then reads it again.
+
+**Parts and tenant config from a newer build.** Under a HEAD the fold can
+read, it also reads the previous `.csnap` parts, the previous `.npost`
+postings, the per-part `.cstat` objects it reuses as a statistics baseline,
+and the lowest `.kidx` slice of each previous part it carries leaves from. A
+version above the set this build reads is `SnapshotFormatError::NewerPart`,
+naming the object key, its kind, the version field and the version, and the
+fold returns it as `CatalogError::SnapshotFormat` without rebuilding over the
+object and before the HEAD CAS (ADR-4233 H1,
+`newer_previous_part_fails_cycle_without_rebuild`). The `.csnap`, `.npost`
+and `.cstat` envelope decoders check the stored version before any body or
+length field, so the version is readable from the object's front bytes
+alone; the `.kidx` decoder checks its magic, header length and header CRC
+first, then the version.
+
+A carried `.kidx` leaf is version-checked from the first bytes
+`fetch_carried_leaf` reads, before this part's leaves are PUT, so a leaf a
+newer build wrote is refused even when its frames would not verify under this
+build's reader. But the fold also *replaces* previous objects it never reads:
+a from-scratch postings rebuild (a rebuild or a reconcile) writes a fresh
+`.npost` without reading the old one, a `.cstat` is skipped for a dirty hour,
+a rebuild, or an untyped tenant, a `.kidx` carry may stop before it reads a
+slice (a failed field, a slice past a pass cut, a source sharing no data
+object, or the leaf switch off), and an error-triggered rebuild stops reading
+previous `.csnap` parts at the first failure. So before its first PUT the
+fold peeks every such object of a part it does **not** carry forward by
+reference, and refuses the cycle with the same `NewerPart` on any above its
+read set:
+
+- the previous `.npost` on a from-scratch postings rebuild, by a ranged GET
+  of its envelope prefix, which holds its only version;
+- each `.cstat` no statistics baseline reads, by a full GET and decode, since
+  a column's `declared_type` is in the body
+  (`newer_cstat_on_a_dirty_hour_fails_the_cycle`);
+- every `.kidx` leaf, by a ranged GET of its header prefix (a full GET when
+  the ref's `prefix_len` is malformed), whether or not a carry later reads it
+  (`newer_kidx_leaf_on_a_rebuilt_fold_with_the_switch_on_fails_the_cycle`);
+- on a rebuild, each `.csnap` part after the one whose read failed, by a full
+  GET and decode, since an entry's level is in the body
+  (`newer_second_part_on_a_rebuilt_fold_fails_the_cycle`).
+
+Every peek GET counts under `FoldReport.newer_part_peek_gets`. A peek GET
+that finds no object leaves nothing newer to drop, and the fold goes on. A
+store error other than `NotFound`, on a peek GET or on the fold's own read of
+a previous `.csnap`, `.npost`, `.cstat` baseline or carried `.kidx` slice,
+fails the cycle with `CatalogError::Store` before any PUT
+(`a_store_error_on_a_dropped_object_fails_the_cycle_before_any_put`): the
+object stays unchecked, and the catalog sweep deletes `snap/` and `idx/`
+objects HEAD no longer names. A previous `.npost` or `.cstat` GET that fails
+that way therefore no longer falls back to a from-scratch rebuild of the
+postings or statistics, and an unreadable previous `.csnap` takes the rebuild
+path only when its GET is `NotFound`, its bytes do not match the HEAD's
+hash, or it fails to decode for a reason other than a newer version
+(`unreadable_previous_part_falls_back_to_rebuild`). A peek refusal,
+and a `.kidx` carry refusal of a single-part fold, come before any PUT and
+leave the store untouched; a `.kidx` carry refusal of a later part comes
+before that part's leaves are PUT but after an earlier re-encoded part's,
+whose now-unreferenced objects the catalog sweep removes. A version below the
+read set, or an object that is corrupt, is not newer and keeps the rebuild
+path (`older_previous_part_keeps_the_rebuild_path`). A tenant
+config record above `TENANT_CONFIG_MAX_READ_VERSION` fails the fold with
+`ProvisioningError::NewerTenantConfig` instead of folding under deployment
+defaults (ADR-4233 H11, `newer_tenant_config_fails_cycle`). Both errors are
+retryable: `is_newer_format_version` holds for the first and
+`ProvisioningError::is_retryable` for the second, so a query surface that
+meets either answers 503, not a corruption 500. The
+query-side snapshot resolve is unchanged: a part it cannot read still falls
+back to the listing resolve.
+
+**The fold.** With `build_key_index_leaves` on, every part of the previous
+HEAD but the last that carries `key_index` refs and lies within one UTC
+day is retirable; a rebuilt fold has none. A part spanning more than one
+UTC day (a switch-off fold wrote it and `--rebuild-key-index` attached its
+leaves) is not: the switch-on partition seals at every UTC day, so no span
+reproduces its bytes and it is never carried by reference. A reconcile pass (the fixed window, the frontier band or a
+targeted re-fold) that lists a retention tombstone in a bucket inside a
+retirable part sets the bucket aside instead of dropping its entries,
+unless the bucket also lists a compaction or erasure rewrite record. Such a
+bucket's records are classified without the tombstone first, and unless
+the result is the entry set the snapshot already names, the bucket is not
+set aside: it takes the ordinary path, its hour is dropped and its part
+re-encodes this fold, so an erased input leaves HEAD at the fold that
+lists the record (ADR-0064;
+`a_rewrite_record_in_the_retired_hour_itself_re_encodes_now`). Once every
+pass has listed, each part with a set-aside bucket is settled in HEAD
+order:
+
+- If one of its hours was dirtied this fold (a compaction record, an
+  erasure rewrite record, or a late commit into a held-open hour), or a
+  set-aside hour was not tombstoned in every shard holding entries there,
+  the part re-encodes now. The entries of its retired and set-aside hours
+  are dropped for good and the new ref carries no retired hours
+  (`a_rewrite_record_in_a_retired_sealed_day_re_encodes_now`).
+- Otherwise each set-aside hour that holds entries joins the part's
+  retired hours, and the ref is carried with the same key, blake3 and leaf
+  refs: no part PUT and no leaf PUT
+  (`a_tombstoned_hour_in_a_leaf_bearing_sealed_day_is_recorded_not_reencoded`).
+- If that leaves every hour holding entries in the part retired, the part
+  leaves HEAD with its entries and no PUT
+  (`a_fully_tombstoned_day_part_is_dropped_without_a_put`).
+
+A part carried by reference in a later fold keeps its list
+(`a_part_carried_by_reference_keeps_its_retired_hours`). A switch-off fold
+over a part with retired hours re-encodes it without them and writes no
+field 9 (`a_switch_off_fold_over_retired_hours_re_encodes_the_part`). The
+frontier band lists a retired hour after every hour that is not retired,
+so a retired hour cannot hold the band in place, and lists it while
+`frontier_reconcile_max_hours` allows, so a rewrite record later published
+into it is found
+(`a_retired_hour_is_listed_after_every_other_frontier_hour`,
+`the_frontier_band_finds_a_rewrite_record_in_a_retired_hour`). When the
+partition gives a retired hour's entries to a span that is not carried by
+reference (a late commit into a held-open hour of the previous UTC day,
+which re-encodes that sealed day part, is one way), those entries are
+dropped and the partition is recomputed, so a re-encoded part never holds
+a retired hour
+(`a_late_commit_through_a_held_open_hour_re_encodes_the_previous_day`). Two
+folds that observe the same tombstones write byte-identical HEADs
+(`folds_that_retire_hours_write_identical_heads`).
+
+**The reader.** `SnapshotWindow::extract_into` skips an entry whose
+`ingest_hour_bucket` its part ref lists in `retired_hours` before it makes
+a `SegmentRef` or a `SegmentPartOrigin`. Both tiers read that output, so
+the tier-1 probe never opens a retired hour's object and the key-index
+router never routes it
+(`a_retired_hour_yields_no_segment_on_either_tier` in
+`services/ravel-server/tests/sql_logs_key_index_tier2.rs`). Entry ordinals
+do not shift, so leaves, postings and per-part statistics stay bound. The
+list is read from the pinned HEAD's ref, never from the decoded part, so a
+part decoded and cached before the tombstone hides the hour once a HEAD
+naming it is resolved
+(`a_decoded_part_cached_before_the_tombstone_hides_the_hour_after_it`).
+
+**Deletion.** Visibility changes at the fold that observes the tombstone.
+The sweep's HEAD-reachability gate reads the part's entries, so HEAD keeps
+a retired hour's objects named until the part re-encodes or leaves HEAD,
+and the physical delete waits for that. The bound differs by part:
+
+- A day part keeps a retired hour's entries until a record dirties the part
+  or every hour of the day holding entries is retired, when the part leaves
+  HEAD with no PUT. That is up to 24 h beyond today on top of the
+  protection horizon, the lag ADR-3939 decision 6 accepts.
+- A part spanning more than one UTC day is not retirable, so the fold that
+  lists a tombstone inside it drops that hour's entries and re-encodes the
+  part in the same fold, carrying the other entries' pairs from its
+  previous leaves (decision 5's carry). The partition splits it at each UTC
+  day boundary, and no new ref carries retired hours
+  (`a_fully_retired_day_in_a_multi_day_part_re_encodes_the_part`,
+  `a_partly_retired_day_in_a_multi_day_part_re_encodes_the_part`,
+  `folds_that_re_encode_a_multi_day_part_write_identical_heads`). Its
+  objects are released at the fold that observes the tombstone, as before
+  ADR-3939. This is stricter than decision 6, which re-encodes a longer part
+  only once a whole UTC day of it is retired and keeps other days' hours in
+  `retired_hours`: such a part could never be carried by reference to keep
+  them, and the tombstoned hours' entries are no longer visible anyway.
+
+### Idempotency marker body layout
+
+The object at an `idem/<keyhash32>.<ingest_hour>.idm` key (ADR-0051 §5,
+`crates/ravel-ingest/src/idempotency.rs`) is a small versioned, checksummed
+frame, header then payload:
+
+| bytes | field | encoding |
+|---|---|---|
+| 0..4 | magic | `RIDM`, fixed |
+| 4..6 | version | u16 LE, currently `1` |
+| 6..10 | crc32c | u32 LE |
+| 10..18 | `written_count` | u64 LE |
+| 18..20 | token-set length | u16 LE, byte length of the field below |
+| 20.. | token set | UTF-8, the `x-ravel-commit-token` header value: one `CommitToken::encode()` output per shard the request's points flushed through, comma-separated |
+
+Checksum coverage: the crc32c at bytes 6..10 covers `magic || version ||
+payload` (bytes 0..6 followed by everything from byte 10 onward): the crc
+field itself is excluded, same as any self-describing checksum has to
+exclude its own bytes. Folding the header into the checksum means a
+corrupted `magic` or `version` byte is caught here rather than surfacing
+later as a misdecode under a future version's body layout. Bytes 0..10 and
+the checksum coverage are the same at every marker version, so the decoder
+verifies the checksum before it reads the version: a flipped version byte is a
+checksum mismatch, and only a checksum-valid marker whose version is above the
+one the build reads refuses the lookup as a newer marker (ADR-4233 decision
+4). A checksum mismatch, truncation, bad magic, or malformed payload are all
+typed decode errors; the caller treats every one of them as a marker miss
+(fail-open to at-least-once, ADR-0051 §5), never a panic.
+
+## Pinned flush identity
+
+At flush open the writer fixes, immutably, for the lifetime of the flush:
+
+1. `seq` (allocated once, never reused for a different flush),
+2. `ingest_hour_bucket` = ingest wall clock at flush open, unix hours,
+3. the serialized segment bytes,
+4. the blake3 content hash of those bytes.
+
+Every retry of any step below reuses these verbatim. A retry MUST NOT
+re-serialize, MUST NOT accrete newly arrived samples, and MUST NOT re-read
+the clock. New samples always go to the next flush. A flush that cannot
+complete within `max_flush_lifetime` (default 1 h) is abandoned: the writer
+MUST NOT publish its commit record afterward (GC interlock, ADR-0010 §11);
+its buffered points are reported as failed to any strict-mode waiters.
+
+## Sealed hours
+
+Definition. For an ingest-hour bucket H (unix hours), let
+`end(H) = (H + 1) * 3600 s`. H is **sealed** at wall time T iff:
+
+```
+T >= end(H) + max_flush_lifetime + clock_skew_allowance + fold_safety_margin
+```
+
+with `max_flush_lifetime` (default 1 h) and `clock_skew_allowance`
+(default 5 m) as configured for the tenant's writers and catalog, and
+`fold_safety_margin` a catalog config (default 15 m).
+
+Seal lemma: the commit-record set of a sealed bucket is immutable. Proof
+sketch from the rules above: `ingest_hour_bucket` is pinned at flush open
+from the writer's clock ("Pinned flush identity"); a flush older than
+`max_flush_lifetime` is abandoned and MUST NOT be published afterward (GC
+interlock, ADR-0010 §11); so the last possible publish for bucket H happens
+before `end(H) + max_flush_lifetime` on the writer's clock, which is within
+`clock_skew_allowance` of true time. `fold_safety_margin` absorbs the
+folder's own clock error. Therefore one LIST of a sealed bucket, under the
+store contract's list-after-write guarantee (the same one orphan GC relies
+on, docs/consistency-model.md "Deletion and GC"), observes the full and
+final set.
+
+Clock assumption, stated plainly: the folder's clock error must be smaller
+than `fold_safety_margin`. This is the same class of assumption the system
+already makes about writer clocks (`clock_skew_allowance`) and it fails
+detectably, not silently: `ravel-cli catalog verify` re-lists sealed
+buckets and diffs them against the snapshot, and a rebuild repairs any
+divergence because commit records remain the ground truth.
+
+This diff is scoped to L0 commit records, and its identity map is keyed by a
+fixed-width writer_id, so both sides must agree on that width. A snapshot
+carries two entry levels: a level-0 L0 commit entry, whose `writer_id` is the
+16-byte flush writer uuid, and a level-1 compaction or rewrite part, whose
+`writer_id` slot instead carries the parent record's 32-byte `input_set_hash`
+(there is no dedicated L1-identity field; `crates/ravel-catalog/src/fold.rs`
+`build_l1_snapshot_entry`/`build_rewrite_l1_snapshot_entry` overload the
+`writer_*` slots, and `snapshot_format::part` `validate_entries` enforces the
+width per level: 16 for level 0, 32 for level 1). Every producer of a snapshot
+entry MUST honour that per-level width; a mismatch is a format violation, not a
+value to widen the reader around.
+
+An entry also carries `declared_column_stats` (field 15, ADR-0873), the
+per-declared-column exact min, max, and null count the fold copies from the
+record it folds: `CommitRecord.declared_column_stats` (field 20) for a level-0
+entry, `CompactionPart.declared_column_stats` (field 12) for a level-1 part.
+Only entries that passed the statistics validity predicate against the source
+record's own row count are copied, so a defective stamp never outlives the
+record that convicts it. The field is additive and permanently optional, and
+neither the `.csnap` envelope version nor `SnapshotPartHeader.format_version`
+is bumped for it: absence costs a reader the statistics shortcut and never
+yields a wrong answer, which is the same reasoning ADR-0063 applied to
+`SnapshotPartHeader.min_hour`. Entries grow by roughly `name_len + 25` bytes
+per stamped column, so a part's `entries_uncompressed_len` and the resolve
+path's per-record cache sizing note below grow by that order for a tenant with
+typed attribute columns. `verify_seal_divergence`
+(`crates/ravel-catalog/src/seal_divergence.rs`) therefore compares only the
+level-0 entries against the L0 commit history, and mirrors the fold's
+supersession exclusion on the ground-truth side: an L0 commit record named in a
+compaction or rewrite record's `inputs` is folded into an L1 segment and dropped
+from the snapshot, yet its commit record stays on the store until a later sweep,
+so a superseded L0 record is excluded from the ground truth rather than reported
+missing. Level-1 entries are counted but not diffed, since they have no L0
+commit record to match.
+
+Config discipline: `max_flush_lifetime` and `clock_skew_allowance` may only
+be raised for writers after every folder's seal computation uses the raised
+values (deployment ordering: folders before writers). Lowering them is
+always safe for sealing.
+
+Operator-asserted seal (ADR-2677 decision 1). A fold may also be given a
+seal-through hour S, in which case it seals every bucket up to and including
+`max(S, margin hour)`, where the margin hour is the last bucket the definition
+above seals at the fold's real wall time. HEAD is still stamped with that real
+time; the clock is not moved forward. Two callers pass S, and the assertion is
+theirs, not the catalog's: `ravel-cli catalog fold --writers-stopped` passes the
+hour the fold itself runs in, and `ravel-cli load --fold-after-load` (logs only)
+passes the latest ingest hour among the commits the load published, after its
+own writers have shut down. An S later than the hour bucket of the fold's own
+clock is refused with `CatalogError::InvalidConfig` before anything is read:
+no caller can assert anything about an hour that has not begun. Each caller
+asserts that no writer will publish into S or any earlier hour, so only an
+operator or loader that knows every writer of the tenant and signal has
+stopped should pass it. The loader also refuses to write into a sealed hour:
+with `--fold-after-load` it reads the logs HEAD before reading any row, and
+stops when the watermark is at or above the current hour.
+
+The fold does not take the assertion on trust past the natural margin. Every
+hour above the margin hour at a fold's own wall time and at or below HEAD's
+watermark is held open: the hour was sealed by an assertion only, so the seal
+lemma does not hold for it yet. Which hours those are is derived from HEAD's
+`watermark_hour` and the fold's real clock alone, so every later fold holds
+them open, whether or not it was given an S itself and whoever wrote the HEAD.
+Every fold, the scheduled one included, re-lists each held-open hour's buckets,
+one LIST per shard, and folds any level-0 commit record HEAD does not hold. A
+commit published into a held-open hour by any writer (a live server, another
+load, a load run without the flag) is therefore visible to a read without a
+commit token from the next fold on (the scheduled fold runs every
+`--fold-interval-secs`, 300 s by default), at the same watermark if the fold
+does not advance it. A fold that finds nothing new there is a no-op, as
+before, and so is one given an S at or below the watermark. Held-open hours
+number the watermark minus the margin hour, and never more than
+`fold_reconcile_window_hours` plus one: an hour further below the watermark
+than the reconcile window is not held open, so a watermark far above the
+margin (a seal asserted from a fast clock) costs no more than the window.
+Right after an assertion whose S is the fold's own hour that is three in the
+first twenty minutes of the hour and two after that, falling to one and then
+none as the margin catches up. A fold therefore issues at most that many
+LISTs per shard beyond what a fold over the same HEAD without held-open
+hours issues (twelve on a four-shard tenant), plus, when a targeted re-fold
+request is queued, the LISTs of up to `frontier_reconcile_max_hours` of its
+hours outside the held-open range. It also GETs each snapshot
+part covering those hours, once, whenever their listing names any commit
+record at all, which is the common case in the window, not only when a late
+commit landed; when HEAD holds every commit listed and no targeted re-fold
+request is queued, the fold is a no-op and reads nothing more. It loads the
+whole snapshot instead, reading each part once (a part the check above
+already read is not read again), when a held-open listing names a commit
+HEAD does not hold, when a held-open hour was compacted before the seal,
+and when a targeted re-fold request is queued for the pair (see Targeted
+re-fold requests below). That is the snapshot load an advancing fold pays.
+It then reads the commit records of each bucket it reconciles: the late
+records, or a compacted bucket's compaction and level-0 records, since in
+the compact-then-seal order the listing still names the compacted level-0
+records until garbage collection removes them. A compacted held-open hour
+and a queued request each cost that load on every fold while hours are held
+open, and both still end in a no-op when nothing changed. A fold whose
+margin hour is at or above HEAD's watermark issues no extra request. The
+query resolve path is unchanged. Once the margin passes an hour it is
+sealed by the lemma like any other, and a commit published into it after that is not
+folded by a later fold, because the reconcile window re-lists hours below the
+watermark but skips a bucket holding only level-0 commit records, so it is
+invisible to a read without a commit token until HEAD is rebuilt from the
+commit records. The assertion is therefore
+still unsafe under a live writer whose commit lands after the natural seal,
+or when no fold runs between that commit and the natural seal. A fold that
+does not advance the watermark reconciles the held-open hours, and the hours
+of a queued targeted re-fold request outside them, only when it takes the
+full path above: a held-open listing names a commit HEAD does not hold, or a
+request is queued. A quiet held-open fold with no request returns before
+reconciling anything, so a compaction record or tombstone landing in a
+sealed hour after the asserted seal may wait for the first later fold that
+advances the watermark: compact before sealing, not after. `FoldReport.seal_through_hour` carries S when S was above
+the margin hour and so set the target, including on such a no-op, and is absent
+when no S was given or the margin already sealed it.
+
+(ADR-0020.)
+
+## Who folds a tenant and signal (ADR-1693)
+
+The scheduled fold runs in two server modes: `maintain` and `all`. A `gateway`
+or `query` process runs no fold timer. A `query` process keeps the on-demand
+`POST /api/v1/admin/fold` route, which folds the tenant and signal the caller
+names regardless of ownership; a `gateway` process mounts no fold route at all
+and so cannot fold by any route.
+
+In `maintain`, a `(tenant, signal)` pair is normally folded by one process.
+"Normally" rather than "by exactly one at a time": a membership transition is
+the exception, during which two processes can fold the same pair, and the
+membership-transition paragraph below states the window and why the overlap is
+safe. The owner is the rendezvous-hash owner of the unit `(tenant_hash,
+signal, 0)` over the maintenance live set (ADR-0065 decision 1): the worker
+`w` in the live set maximizing `blake3(unit_key || w)`, ties broken toward the
+larger `process_id`. Shard `0` is a constant here, not a shard of the data: a
+fold covers a tenant and signal as a whole, so it is one unit rather than one
+per shard.
+
+The ownership test runs before every per-tenant read: before the pair's `HEAD`
+peek and before the `t/<hash>/config` record that decides whether the tenant is
+maintained. A non-owner therefore issues no request at all for a pair it does
+not own, which is what makes adding a `maintain` replica divide the fold's
+request cost rather than duplicate it. The one request a tick makes that is not
+attributable to a pair the process owns is the single delimited listing of `t/`
+that discovers which tenants exist, which is per signal and per tick rather
+than per tenant.
+
+During a membership transition the live sets of two processes can disagree for
+at most the liveness window plus one heartbeat, and both may fold the same
+pair. That is safe rather than merely tolerated: the fold's parts are
+content-addressed, so both processes write byte-identical objects, and the
+`HEAD` compare-and-swap after the work serializes the two publishes. The loser
+retries on its next tick and finds the pair already fresh. The overlap costs
+bounded duplicate reads and never a torn or forked catalog.
+
+A `--mode all` process publishes no heartbeat and computes its live set as
+itself alone, so it owns every unit and folds everything. Two `all` processes
+over one bucket therefore both fold everything; the CAS still serializes them,
+but the duplicate read cost is not bounded by a transition window. Run
+`maintain` replicas, not multiple `all` processes, when fold cost matters.
+
+## Fold reconcile pass (ADR-0063 section 4)
+
+The incremental fold lists only the buckets for hours strictly after the
+previous fold's watermark (`incremental_buckets`, hours
+`(watermark_hour_old, watermark_hour_new]`). A compaction record (`l1.*.cmt`),
+a retention tombstone (`retire.tmb`), or a selective-erasure rewrite record
+(`rw.*.cmt`, ADR-0064) can be published into an hour long after that hour
+was sealed and folded into a past fold's output; because no later fold ever
+re-lists an already-folded hour, such a late record would otherwise never be
+applied to the snapshot short of a full HEAD-corruption rebuild. Because sealed parts are deliberately carried forward by reference and never
+rewritten, such a late record must be addressed directly rather than being
+absorbed by a full recompute.
+
+The rewrite-record trigger is load-bearing, not incidental: ADR-0064 §3.1
+scopes the rewrite pass to already-sealed buckets by construction, so a
+rewrite ALWAYS lands in an already-folded hour. Without this trigger, a
+folded snapshot would keep serving a rewrite's pre-erasure inputs
+indefinitely for any hour outside the reconcile window -- the input objects
+stay physically present (GET-able) until the horizon-gated sweep runs, so
+there is no NotFound-driven re-resolve to force a refresh the way a deleted
+object would provide. See the amendment note in
+docs/adrs/0064-selective-subject-erasure.md §4 for the window-width
+consequence this has for erasure specifically (the 26h default reconcile
+window is far narrower than the rewrite pass's own scope, which can target
+any sealed bucket regardless of age).
+
+Each incremental fold, after the incremental-bucket processing and before the
+part spans are cut, runs a reconcile pass over a bounded window of
+already-sealed hours:
+
+- **Window.** Hours in `[watermark_hour_old - fold_reconcile_window_hours,
+  watermark_hour_old]`, inclusive at both ends. `watermark_hour_old` is the
+  boundary the incremental range excludes, so the reconcile window and the
+  incremental range are adjacent, never overlapping. `fold_reconcile_window_hours`
+  defaults to 26 hours: longer than `protection_horizon` (the age gate before
+  the sweeper may physically delete a superseded compaction input, 25 h 5 min
+  on the defaults) by a slack margin.
+  Because the sweeper only deletes an input after that horizon, any record
+  whose supersession could invalidate a snapshot entry is observed by a
+  reconcile pass before its inputs can disappear, provided the record lands
+  inside this window. Compaction does: it targets hours near the watermark.
+  A selective-erasure rewrite record can land in any sealed hour. A rewrite
+  whose hour is older than this window and newer than the retirement frontier
+  is re-listed by neither this window nor the frontier band below, so its
+  covering part keeps naming the pre-rewrite inputs until the frontier band
+  reaches that hour, until a caller names that hour in a targeted re-fold
+  request (below), or until an operator rebuilds HEAD. Subject erasure stays correct
+  meanwhile (the query-time predicate outlives the inputs), and the sweeper
+  does not delete an input the covering part still names: it holds it until
+  one of those two events, so a query over the hour keeps resolving normally.
+  What that hold costs, and what it guarantees, is stated in
+  docs/deletion-and-gc.md, "Selective subject erasure".
+- **Skipped when redundant.** The pass does not run on the first fold for a
+  tenant (no previous watermark exists) or on a rebuilt fold (absent, corrupt,
+  or unreadable-part HEAD): a rebuild already re-derives every hour from the
+  commit layout, so reconcile would repeat that work.
+- **Cheap common case.** Each window bucket is re-listed (bounded by the same
+  `fold_bucket_concurrency` semaphore the incremental path uses). A bucket
+  holding only immutable L0 records cannot have changed since it was folded
+  (seal lemma above), so it is skipped with no record GET. Only a bucket whose
+  listing contains a compaction record, a tombstone, or a rewrite record is
+  classified and diffed, plus, in an hour an operator-asserted seal holds open
+  (see "Operator-asserted seal" above), a bucket whose listing names a commit
+  record the in-progress entry set does not hold. When nothing late has
+  landed, the pass costs only the window LISTs and every unchanged sealed
+  part is still carried forward
+  by reference.
+- **Diff and apply.** A triggered bucket is classified by the same
+  commit/compaction/tombstone logic the incremental path applies
+  (`Catalog::classify_bucket`), yielding what the bucket should currently
+  contribute. That is compared, ignoring order, against what the in-progress
+  entry set already reflects for that `(shard, hour)` (found by each entry's
+  own `ingest_hour_bucket`; those entries were seeded from the previous fold's
+  own output). If they differ, whether because a late compaction supersedes
+  L0 inputs previously folded in directly or because a late tombstone means
+  the hour now
+  contributes nothing, exactly that bucket's entries are replaced and every
+  other entry is left untouched.
+- **Dirty parts rebuild, never carry forward.** A previous HEAD's sealed part
+  whose `[min_hour, watermark_hour]` range covers a changed hour is marked
+  dirty and excluded from the by-content-hash carry-forward reuse: it always
+  goes through the normal re-encode-and-PUT path. The changed content already
+  yields a different blake3, so a dirty part is re-PUT under a new
+  content-addressed key regardless; the explicit exclusion is a fail-safe that
+  refuses to keep stale content even in a hash coincidence.
+- **One CAS.** Reconcile findings fold into the same fold attempt's single
+  HEAD `CasVersion` write. There is never a second CAS: HEAD remains the only
+  mutable object and the only unit of atomic visibility.
+- **Postings.** A reconcile that changed any hour forces a full postings
+  rebuild this fold, since the forward postings merge assumes append-only,
+  stable-ordinal growth that a supersession or removal breaks. (A change that
+  introduces an L1 entry suppresses postings entirely, as elsewhere.)
+
+Invariant this closes: a compaction record or retention tombstone landing in
+an already-folded hour is now eventually applied, once that hour's own
+bucket falls within `[watermark_hour_old - fold_reconcile_window_hours,
+watermark_hour_old]` on some later fold, OR (for a tombstone) within the
+retention-frontier band below, rather than never. The fixed window is
+on the *target hour bucket*, not on how recently the late record was
+published: a compaction landing hours after its bucket sealed is caught on
+the very next fold (this is the common case the window is sized for). A
+retention tombstone's bucket, by contrast, is typically far outside the
+fixed window by the time retention runs: a tombstone is written at its
+bucket's ingest-hour key, which is `R` (the tenant's retention window,
+normally days) behind the watermark, so the fixed window alone would never
+observe it, and the snapshot would keep naming the retired bucket's segments
+forever. The retention-frontier reconcile below covers exactly that case.
+(This closes a latent correctness gap; see ADR-0063 Consequences and
+ADR-0020.) A rewrite record takes three routes: inside the fixed window it is
+applied on the next fold, in an hour at or approaching the retirement
+frontier it is applied by the frontier band, and in between it is applied
+only by a fold a caller asked to re-list that hour (targeted re-fold
+requests, below). Absent such a request it waits for the frontier band to
+reach its hour.
+
+## Retention-frontier reconcile (ADR-0020 delete blocker)
+
+ADR-0020 requires that GC treat reachability from HEAD-referenced snapshots
+(within the protection horizon) as a delete blocker. That has two halves; this
+is the fold half, and it makes the sweep's block (docs/consistency-model.md
+"Deletion and GC", the HEAD-reachability gate) clear on its own rather than
+leaving the sweep permanently blocked on a bucket no fold ever drops.
+
+Because a retention tombstone lands `R` behind the watermark, far outside the
+fixed reconcile window, each incremental fold ALSO reconciles the bounded set
+of snapshot-named hours at or approaching the tenant's retirement frontier:
+
+- **Which hours.** The tenant's effective retention window `R` is resolved as an
+  override-over-default overlay (ADR-0078), mirroring how ingest resolves
+  admission limits: the durable per-tenant config record
+  (`t/<tenant_hash>/config`, `retention_ns`) when it exists and carries a value,
+  otherwise the deployment-wide default the caller resolves from the CLI-derived
+  `RetentionConfig` (`--retention-default` / `--retention-tenant`), the same
+  source the physical sweep uses. A `TenantConfig` read failure or an absent
+  record falls back to that deployment default, not to "skip"; only a tenant with
+  neither a per-tenant override nor a deployment default gets no frontier
+  reconcile (nothing is being retired). The retirement frontier is the newest ingest hour at or approaching
+  retirement, `frontier_hi = (now - R + protection_horizon) / hour`: retention
+  tombstones a bucket once its newest event is older than `R`, so every hour
+  whose end is at or before `now - R` may already be tombstoned, and the
+  `+ protection_horizon` look-ahead pre-lists hours approaching the frontier so
+  an appearing tombstone is caught the fold it lands, a full horizon before the
+  sweep may delete the objects that hour still names. Candidates are the
+  snapshot-named hours at or below `frontier_hi` and below the fixed window
+  (which already covers the near-watermark region).
+- **Bounded per fold.** In steady state the frontier advances one hour per hour
+  and folds run far more often than hourly, so this is a handful of buckets. On
+  a jump (a shortened retention window, or a folder stopped for a long time),
+  the candidate set is capped at `frontier_reconcile_max_hours` (default 168,
+  seven days), reconciled oldest-first (an object is physically deletable
+  `protection_horizon` after its tombstone, so the oldest still-named hours are
+  closest to deletion). The remainder is NOT silently skipped: the snapshot
+  still names those hours, so the next fold recomputes them as candidates and
+  drains the backlog oldest-first, and the count carried is reported on
+  `FoldReport::frontier_hours_deferred` (with `frontier_hours_reconciled` for
+  the hours re-listed this fold).
+- **Same diff-and-apply.** A candidate bucket is re-listed and, if it holds a
+  tombstone (or a late compaction/rewrite record), reconciled by the identical
+  `Catalog::classify_bucket` diff the fixed window uses: a tombstoned hour now
+  contributes nothing, so its entries are dropped from the snapshot and its
+  covering part is marked dirty and re-PUT under the same single HEAD CAS.
+- **Skipped when redundant.** Like the fixed window, the frontier pass does not
+  run on a first fold or a rebuilt fold.
+
+Once the fold drops a tombstoned bucket, HEAD no longer names it and the
+retention sweep's HEAD-reachability gate clears, so the physical delete
+proceeds. Both halves are required: the sweep gate alone would turn a permanent
+`SnapshotInvalidated` (503) into permanent non-deletion (a compliance failure),
+because the tombstone stays outside the fixed window forever; the frontier
+reconcile is what lets retention actually complete. The frontier band is
+derived from the tenant's retention window and the protection horizon, never a
+hardcoded age, so it tracks each tenant's own frontier. The protection horizon
+here is the catalog's configured `protection_horizon_ns` (mirrored from
+ravel-maintain's default, since the dependency runs the other way); a drift from
+a deployment's true horizon only resizes the bounded band and is never a
+correctness property, because the sweep's HEAD gate is the actual delete
+blocker.
+
+## Targeted re-fold requests (ADR-0063 section 4 amendment)
+
+The fixed window is bounded by recency and the frontier band by the tenant's
+retirement frontier. An hour between the two that receives a late compaction
+or rewrite record is re-listed by neither, so its covering part keeps naming
+the pre-rewrite inputs, the superseded-input sweep's HEAD-reachability gate
+holds those inputs rather than deleting them, and they occupy storage until
+retention drops the hour. Queries keep resolving throughout and no delete is
+ever wrongly permitted: this is a liveness and storage gap, not a
+durability or availability one.
+
+The fold cannot close it alone. Which already-folded hour received a late
+record is not derivable from the snapshot entries; proving it requires
+listing that hour's commit buckets, and the candidate set is every hour the
+snapshot names, so a self-derived pass would cost a full-history LIST
+fan-out on every fold. The sweep already pays for those LISTs and already
+computes the answer: a bucket it holds on `SnapshotBlock::Named` is exactly
+an hour whose snapshot entries still name superseded inputs.
+
+`Catalog::fold_with_refold_request` is the receiving end. It takes a
+`RefoldRequest` (a set of ingest hours) and runs a third reconcile pass over
+those hours, after the fixed window and the frontier band:
+
+- **Which hours.** Of the hours requested, the pass re-lists only those
+  below the fixed window's floor (which also excludes every hour at or above
+  the old watermark, since the incremental range folds those fresh), not
+  already listed by the frontier band this fold, and named by at least one
+  snapshot entry. An hour no entry names cannot be blocking a delete on HEAD
+  reachability, so listing it would be pure cost.
+- **Bounded per fold.** What survives those filters is capped oldest-first at
+  `frontier_reconcile_max_hours`, the same runtime value the frontier band
+  reads (default 168), so lowering that bound lowers both. The remainder needs
+  no deferral bookkeeping in the snapshot: the requester re-derives its
+  blocked set on each pass, so a still-blocked hour is requested again. The
+  requester below passes a fold no more than that many hours and keeps the
+  rest queued.
+- **Same diff-and-apply, same CAS.** Requested buckets go through the
+  identical `Catalog::classify_bucket` diff, mark their covering parts dirty
+  the same way, and land in the same single HEAD CAS. A re-fold can
+  therefore only ever make the snapshot agree with the commit layout.
+- **Skipped when redundant.** A first fold and a rebuilt fold ignore a
+  request: both re-derive every hour from the commit layout. Neither is a
+  no-op, so the requester below removes the hours it passed to one, which
+  reconciles none of them from the request. A fold that does not advance the
+  watermark runs the pass only while HEAD holds hours open (see the
+  held-open hours above). It then loads the whole snapshot even when the
+  held-open range is quiet, re-lists the held-open hours as usual, and runs
+  the pass over the requested hours outside them, so a quiet pair whose
+  watermark sits above its margin is not starved of the pass. Such a fold
+  can be a no-op and still report the hours it reconciled. Every other fold
+  that does not advance the watermark returns before the reconcile block
+  and reconciles nothing from the request.
+- **A hint, never a durability dependency.** An hour nobody requests
+  degrades to the behaviour above (it keeps naming its pre-rewrite inputs
+  until the frontier band reaches it), and the sweep's HEAD-reachability
+  gate remains the delete blocker in every case.
+
+The requester is the maintain-role sweep of the process that folds the pair.
+Each maintain tick unions, per `(tenant, signal)`, the hours its zoned or
+full superseded-input sweeps held on `SnapshotBlock::Named`, and sends them
+to an in-process queue shared with the same process's fold loop. The queue
+keeps one entry per pair and merges a later send's hours into it. Each fold
+tick passes a tenant at most `frontier_reconcile_max_hours` of its oldest
+pending hours as its `RefoldRequest`, the most the fold reconciles, and
+removes those hours only after a fold that returned successfully and either
+was not a no-op or reported a nonzero `refold_hours_reconciled`. They
+survive a no-op fold that re-listed none of them, a tick that skips the
+tenant because its HEAD is fresh, and a failed fold, and reach the first
+successful fold of the pair that advances the watermark or whose targeted
+pass re-lists one of them outside the held-open range, without waiting for
+another sweep. A request whose hours all lie in
+HEAD's held-open range counts none of them, so it stays queued, and each
+fold while hours are held open pays the whole snapshot load for it, until
+the margin passes the watermark and the advancing fold removes it. The
+hours past the cap stay queued for the pair's next such fold, so a request
+larger than the cap takes more than one.
+Hours a sweep sends while a fold runs stay queued after it. The queue holds
+at most 256 pairs. An entry leaves it without a fold in three cases: the
+fold tick removes it, uncounted, when its process does not own shard 0 of
+the pair under the live set, or when the tick does not maintain the tenant
+(discovery no longer finds it, or the lifecycle restriction excludes it);
+and a new pair that finds the queue full evicts the pair inserted earliest,
+the one case counted, on `ravel_catalog_fold_refold_requests_dropped_total`.
+One entry keeps at most its 1024 smallest hours. Nothing about the queue is
+durable: an entry lost with the process on restart, an evicted pair, and
+hours cut past the per-entry cap are sent again by the next sweep pass that
+still finds the hold. The per-tick zoned sweep finds a hold only in its head
+and tail hours, the hours still sealing and those within a protection horizon
+after their retention expiry. Any other hold below the fold's reconcile
+window is found by the full sweep, which runs every `interior_reverify_ns`
+(`--maintain-interior-reverify`, 6 hours by default), so it can wait that
+long before it is queued. Only the process that owns shard 0 of a pair
+under the live set sweeps the pair, and it sweeps every shard of it,
+including the shards other processes own for retention and compaction
+(ADR-1693, the 2026-10-07 sweep ownership amendment). That is the process
+that folds the pair, so a hold found on any shard of the pair is queued in
+the process whose fold takes it. Only a process that runs the
+scheduled fold feeds the queue: in `--mode all` no maintain loop runs, and a
+maintain process whose scheduled fold is disabled (`--disable-fold`) hands
+its sweeps no queue, so neither queues anything and every fold request in
+`--mode all` is empty.
+
+## Commit sequence (strict mode)
+
+1. Pin the flush identity (above).
+2. PUT data object with `PutMode::CreateIfAbsent`. A CRC32C checksum is
+   computed and verified locally before upload as a pre-flight guard; that
+   CRC32C is not itself sent to the store. On S3, `ravel-server` attaches a
+   separate CRC64-NVME checksum to every PUT by default
+   (`--s3-upload-integrity`, which also reaches the stores
+   `--tenant-kms-config` routes to), which the endpoint verifies on receipt and
+   stores, and a full-object GET verifies the body against it
+   (docs/object-store-contract.md, "Upload checksums" and "Read-side checksum
+   verification"). `AlreadyExists` is
+   success: the key embeds the content hash, so the stored bytes are
+   identical by construction.
+3. PUT commit record with `PutMode::CreateIfAbsent`.
+   - `AlreadyExists`: GET the record. Same `content_hash`: success (a
+     previous attempt landed; ack path continues). Different: fatal
+     split-brain; crash loudly. With identity pinned, this cannot fire on a
+     benign retry.
+4. Ack all requests in the flush with the commit token.
+
+Crash between 2 and 3 leaves an orphan data object: invisible, GC-eligible
+only after `grace + max_flush_lifetime` with a re-verify before delete
+(ADR-0010 §11).
+
+Commit record: `ravel.commit.v1.CommitRecord` protobuf: tenant_hash, signal,
+shard, writer_id, epoch, seq, ingest_hour_bucket, object_key, object_size,
+content_hash (32B), sample_count, series_count, min/max event ts, min/max
+ingest ts, format_version, created_unix_ns, declared_column_stats.
+
+`declared_column_stats` (field 20, ADR-0873) carries the exact whole-object
+min, max, and null count for each stamp-eligible declared typed attribute
+column (I64 and BOOL only; STR, BYTES, and ADR-0101's `f64` are refused by
+the allowlist in `ravel-types::declared_stats`). The stamp is
+folded over the merged attribute view rather than over the record's own
+attribute set (ADR-0873's 2026-09-03 amendment; docs/log-segment-format.md,
+"What a numeric stat bounds"): a row's value for a column is the record's
+own attribute when the record sets that key at any value kind, and otherwise
+the row's stream-level resource or scope attribute of the same name, so a
+row counts NULL when that merged view resolves the name at another type or
+does not resolve it at all, never merely because the record itself omits it.
+The producer is the ingest fold
+(`crates/ravel-ingest/src/log_declared_stats.rs`), not the segment writer. It is
+additive and permanently optional, and `format_version` stays 1: an empty
+list means the object is uncovered for every typed attribute column, which is the
+normal state of every record written before ADR-0873, of every
+metrics/spans record, and of any column declared after the flush opened.
+Absence costs a reader the statistics shortcut and never yields a wrong
+answer, so it is never an error. A decoder validates each entry against the
+allowlist and drops (and counts) an entry whose declared type is ineligible
+or whose min/max kinds disagree with it; a defective statistic leaves that
+column uncovered and never makes the record unreadable.
+`CompactionPart.declared_column_stats` (field 12) is the same statement over
+the same merged view, per compaction or erasure-rewrite output part. The
+producer is the compaction recompute (`crates/ravel-maintain/src/rlog.rs`),
+again not the segment writer: it recomputes over the rows that part holds and
+never copies an input's stamp.
+
+`object_key` is informational. Readers MUST reconstruct the data key from
+(tenant_hash, signal, shard, writer_id, epoch, seq, content_hash) and treat
+any mismatch with the stored `object_key` as a fatal invariant breach
+(ADR-0010 §7). After the suffix GET, the segment reader MUST verify footer
+tenant_hash, shard, writer_id, epoch, seq against the commit record.
+
+## Commit tokens
+
+Token (opaque to clients): base64url of
+`v2:<shard>:<writer_id>:<epoch>:<seq>:<ingest_hour_bucket>`.
+
+A token fully determines its commit-record key. Ingest acks return one
+token per shard the request's points flushed through; the HTTP/gRPC surface
+carries them as a comma-separated list in `x-ravel-commit-token`.
+
+## Snapshot resolution by listing
+
+`Catalog::resolve(tenant, signal, range, min_tokens, now_ns) -> Snapshot`
+
+1. Discover the commit keys for every shard 0..shard_count and every
+   ingest_hour bucket overlapping `[range.start_ns - max_ingest_lag, now_ns +
+   clock_skew_allowance]` (max_ingest_lag default 2 h, clock_skew_allowance
+   default 5 m, config). Two traversals produce the identical key set
+   (ADR-0056); resolve picks between them on the width of the listing suffix.
+   Both issue one bounded LIST per shard over `t/<th>/m/c/<shard>/`, resuming
+   strictly after the watermark hour via the store's `start_after`
+   (`list_after`, the shard-hour prefix for the first listed hour sorts before
+   every key at or above it), so a folded snapshot's sealed hours below the
+   watermark are skipped server-side rather than paged through. Both group the
+   returned keys client-side by `(shard, ingest_hour)` and keep the buckets in
+   the window; a shard's below-watermark history is never listed by either:
+   - **Bounded per-shard fan-out** (narrow/warm windows): the per-shard LISTs
+     run concurrently, and each stops paging at the first key whose hour is
+     past the window end (the `YYYYMMDDTHH` hour strings sort chronologically,
+     so once a past-window key appears every later key in the shard is too).
+     Cost one LIST per shard for the hours above the watermark (plus pagination
+     for a dense tail), independent of how many hours or empty buckets the
+     window spans.
+   - **Prefix scan** (wide windows, at or above
+     `prefix_list_crossover_requests` suffix buckets, default 720): the
+     per-shard LISTs run concurrently, up to `resolve_get_concurrency` shards
+     at once, and pages within a shard stay sequential. Every page first
+     reserves a slot in one resolve-wide request cap
+     (`max_catalog_list_requests`), so the bound stays exact under
+     concurrency and a window whose pages exceed the cap is refused with
+     `WindowTooWide` on every run (ADR-2509). Which shard reaches the cap, and
+     how many reserved LISTs were issued before the refusal, can vary between
+     runs. Shard results are merged in completion order, which can vary; a
+     key is grouped under its own `(shard, hour)` bucket and the resolved
+     snapshot's segment order is set by the catalog sort ("Cross-segment
+     duplicate samples"), so neither the key set nor the order depends on
+     it. Cost `O(objects above the watermark / page_size)`.
+   Both traversals produce the identical key set and partition it identically
+   (step 2 onward).
+2. Partition the listed keys by shape (L0 commit record, compaction
+   record, selective-erasure rewrite record, tombstone; ADR-0018, ADR-0019,
+   ADR-0064). A key matching none of
+   the four shapes is a fail-loud error, not a skip. Decode all records.
+   Cache decoded records keyed by FULL object key; validate
+   tenant_hash/signal/shard fields against the expected values on every hit;
+   bound the cache per tenant. Records are immutable and never invalidated,
+   except: observing a tombstone for a bucket invalidates that bucket's
+   cached commit and compaction records (the trigger ADR-0010 §10 promises).
+
+   That cache is per process and outlives any one resolve, which is what
+   makes a repeated resolve over an unsealed ingest hour cost its LISTs and
+   nothing else. The newest `max_flush_lifetime +
+   clock_skew_allowance + fold_safety_margin` of any tenant is always
+   unsealed, so no snapshot part covers it and every query touching recent
+   data resolves it through this step; without the cache that is one GET per
+   hot commit record, per query. Caching by object key alone is sound because
+   a commit record never changes once written: its identity is pinned at
+   flush open (see "Pinned flush identity") and the object is immutable, so
+   only the bucket's LIST result can grow. The LIST therefore still runs on
+   every resolve -- it is what discovers records published since the last one
+   -- and only the per-record GET and decode are skipped. A record the LIST
+   names and the cache does not hold is fetched; a cached record the LIST no
+   longer names is never consulted, since the resolve builds its
+   segment set from the LIST (retention and GC remove records only after
+   their bucket is sealed and folded). A hit is counted as a cache hit with
+   the cached object's byte size and issues no GET; a miss is counted as a
+   miss and pays the GET, exactly as the part and postings caches do. The
+   cache carries TWO bounds, and evicts least-recently-used against whichever
+   binds first so a hot ingest hour survives a wider one-off scan or a fold's
+   sweep of older buckets: an entry cap of `cache_capacity_per_tenant`, and a
+   byte budget of `cache_capacity_per_tenant * RECORD_CACHE_ENTRY_BYTES`
+   (`CatalogConfig::commit_cache_max_bytes_per_tenant`). The byte budget is
+   what actually holds the memory figure, because a `CommitRecord` has no
+   bounded size: its `declared_column_stats` list is capped neither by the
+   format nor by validation, so a record declaring 200 columns charges about
+   20 KB when admitted and about 38 KB once a resolve has kept its derivation
+   (the kept stamp list adds about 18 KB), where an ordinary one charges 896
+   bytes: 864 for the record and 32 for the inline slot that keeps its
+   derivation. Each entry is charged an
+   estimate of the live heap it holds and eviction runs until the tenant's
+   summed charge is inside the budget. The derivation is what turns a cached
+   L0 record into its segment reference: the check that the record's
+   `object_key` is the data key its identity reconstructs, and the gated read
+   of its declared-column stamps. The first resolve to include a record
+   stores a successful derivation in the slot and charges the kept stamp list
+   to the entry; later resolves still validate the record against the listing
+   or token and rebuild the reference from the record and the slot, without
+   repeating either step. A failed derivation is never stored, so it fails
+   every resolve that reaches the record, and eviction or a tombstone's
+   invalidation drops the derivation with its record. At the shipped
+   defaults the capacity derivation returns the 25,000-entry cap, so the
+   budget is 22.5 MB per
+   actively-queried tenant; at the 10,000-entry floor (which is also what
+   `--disable-cache` holds) it is 9 MB. `0` disables the cache. On the
+   listing path each L0 commit record is read at most once per resolve: the
+   resolve looks every listed record up in the cache once, before any
+   bucket runs (per bucket, one bucket's misses would evict another's
+   hits), fetches the misses once, and hands the decoded records to the
+   include pass, so a resolve over N uncached records issues N record GETs
+   whatever the cap. The cap bounds the cache's memory, not the GET count,
+   and not what a resolve holds while it runs: the records it found
+   resident stay referenced for the listing pass's lifetime (at most the
+   cache budget, since they were resident when it started), and each
+   in-flight bucket holds its
+   own fetched records until that bucket's include pass ends, with
+   `resolve_get_concurrency` (default 128) buckets in flight at once. So
+   one resolve peaks at about the cache budget plus `resolve_get_concurrency`
+   times the largest bucket's decoded records, and that figure is per
+   concurrent resolve, which is the number to hold next to the host-memory
+   gate. Two paths stay outside the once-per-resolve rule: a `min_token`
+   lookup reads its record through the cache after the listing and
+   re-fetches it when a later miss evicted it, and compaction records keep
+   their own prewarm plus a cache re-read, so at a cap below their count
+   each is read twice. Rewrite records are not cached at all: one GET per
+   record per resolve, whatever the cap.
+3. Tombstone present: the bucket contributes nothing to the snapshot.
+   Otherwise, build ONE unified exclusion mechanism over the bucket
+   (ADR-0064 unifies rewrite supersession with compaction's, rather than
+   running two parallel mechanisms):
+   - An `excluded` set of L0 identities `(writer_id, writer_epoch,
+     writer_seq)`, and a `superseded_records` set of whole compaction/rewrite
+     record keys whose output parts are superseded.
+   - Each **compaction record** contributes its input list to `excluded`.
+   - Each **rewrite record** contributes its *effective* inputs to `excluded`
+     exactly as a compaction record does: its own `inputs` when set, or --
+     when it names a `superseded_record_key` instead -- the inputs of the
+     compaction/rewrite record that key names, chased through any
+     rewrite-of-a-rewrite chain until a record with `inputs` set directly is
+     reached (a bounded, cycle-checked walk; an over-deep or cyclic chain is
+     a typed error, never a hang). Every record a rewrite supersedes as a
+     whole is added to `superseded_records`.
+   - A **version 2 compaction record** names, in `superseded_record_key`, the
+     compaction record it re-encodes and supersedes (ADR-0066 force 2
+     amendment). Every compaction record a present version 2 record names is
+     excluded before the overlap components below are formed: its parts are
+     not included and its inputs do not join `excluded` on its account (the
+     version 2 record names the same inputs). Decoding sees one record and
+     cannot check that equality, so resolution does: a version 2 record
+     whose deduplicated input set differs from that of the present record it
+     names is a typed error naming both keys, never an exclusion, since
+     excluding the predecessor would stop covering an input only it names.
+     The check runs before erasure dominance as well as in the overlap
+     selection, so a dominated version 2 record cannot bypass it. Resolve,
+     the token fallback, the index fold, the erasure completion gate and
+     `migrate` fail with it; scrub logs it and scrubs every record of that
+     hour, and the sweep treats none of the bucket's inputs as superseded.
+     Chains are followed (C3
+     supersedes C2 supersedes C1 leaves only C3), with the same bounded,
+     cycle-checked walk the rewrite chase uses: a cycle or a chain longer
+     than the bound is a typed error, never a guess about which record is
+     live. A version 2 record naming a key that is not present excludes
+     nothing. The rewrite chase treats a version 2 record as a link, not an
+     end: a rewrite that names one also supersedes the record it names.
+   - **Erasure dominance.** A version 2 record whose predecessor a live
+     rewrite record supersedes (directly or through its chain, whether or not
+     the predecessor is still present), or whose predecessor is itself
+     dominated, is excluded as a whole: its parts re-encode the pre-erasure
+     data and may still hold an erased subject, so the rewrite wins. The
+     overlap selection sees only compaction records, so this rule is applied
+     first, wherever rewrite and compaction records are both in view:
+     resolution, the token fallback (step 5), the index fold, scrub, the
+     erasure completion gate and `migrate`. The erasure rewrite pass picks
+     the bucket's live record by the same rules: the one record no rewrite
+     chain, no present version 2 record and no dominance excludes. A cycle
+     or an over-deep chain fails the pass with an invariant error carrying
+     the catalog's error as text, not with an error type of its own.
+   - **Reclaiming superseded records.** The superseded-input sweep reclaims a
+     record a present version 2 record supersedes, with its parts, as one
+     chain group entered from the version 2 record at the head of the chain
+     and followed to its end (C3 over C2 over C1 reclaims C2 and C1), once
+     that record's protection horizon has passed, only when no reachable
+     HEAD names any part in the group, and never under a legal hold; parts
+     go first and records after, the oldest record first. The group holds
+     no raw L0 input: those are the version 2 record's own inputs, decided
+     by the authoritative-input rule below. A dominated version 2 record
+     joins the chain group of the rewrite whose chain reaches the record it
+     names and is deleted with its parts under that group's horizon,
+     reachability and hold rules, ahead of the chain's own records and
+     newest first. When the record it names is already gone, it joins the
+     group of the rewrite whose chain ends at that same absent key, even
+     when nothing else of that chain is left; a dominated record no group
+     takes is logged and counted, never skipped silently. A version 2
+     record naming a key that is not present reclaims nothing.
+     The sweep treats an input as superseded only where an authoritative
+     record names it both with and without version 2 supersession applied:
+     while a predecessor is present, excluding it can hand its overlap
+     component to another record, and the two views then disagree. It
+     treats none of a bucket's inputs as superseded, and reclaims nothing on
+     account of the bucket's version 2 records, when that bucket's
+     supersession does not resolve (a cycle, an over-deep chain, or a
+     version 2 record whose inputs differ from its predecessor's): in such
+     a bucket a rewrite's chain group that reaches a version 2 record
+     reclaims nothing at all, since the group is one unit and what the
+     version 2 record supersedes is not known.
+   - Include each compaction record's parts and each rewrite record's output
+     parts as segment refs, filtered by per-part event bounds, UNLESS that
+     record's key is in `superseded_records`. A superseded record's parts are
+     never included: overlap harmlessness does NOT hold across a rewrite
+     (the rewrite's output deliberately lacks records its predecessor's parts
+     contain, so including both would resurrect erased records; ADR-0064
+     decision 3 point 5). Rewrite output parts fold in as L1-equivalent
+     entries, keyed by the rewrite's own `input_set_hash`.
+   - Include any L0 record not in `excluded` normally, and raise an
+     interlock-violation metric if its created_unix_ns postdates the newest
+     compaction/rewrite record (it should have been sealed before that ran).
+   Two compaction records in one bucket with different input_set_hash:
+   disjoint input sets include both parts sets and all L0s not covered by
+   either (correct under overlap harmlessness; ADR-0018); overlapping input
+   sets resolve to one authoritative record per overlap group, whose parts
+   are included and whose inputs are excluded, with every input only a losing
+   record names served as a raw L0. The groups are formed after the version
+   2 and dominance exclusions above, so a predecessor and the version 2
+   record that re-encodes it are one record, not a conflict. Either way,
+   alarm loudly.
+4. Filter the remaining L0 commit records: [min_event_ts, max_event_ts]
+   overlaps the query range.
+5. For each `min_token`: reconstruct its commit key and GET it directly
+   (never by re-listing). Present: ensure it is in the snapshot set (its
+   event range might not overlap; include it anyway so read-your-write
+   holds). Absent: fall back to GETting the bucket's compaction record(s)
+   (cacheable, same as step 2) and check the token's writer identity
+   against each record's input list. Found in an input list: satisfied via
+   that record's parts. A rewrite record (ADR-0064) is treated the same:
+   if the token's identity is among a live (non-superseded) rewrite's
+   effective inputs, it is satisfied via that rewrite's erased output parts,
+   and a rewrite-superseded compaction record's parts are never served. A
+   tombstone present for the bucket: satisfied with zero segments (the data
+   was retired, not lost). Neither found after one retry: error
+   `unsatisfiable token`, surfaced as 5xx.
+6. Attach pending selective-erasure predicates (ADR-0064 decision 2). Once
+   per resolve -- independent of whether any physical rewrite has run -- LIST
+   `t/<th>/<sig>/del/` one time only. This LIST is started before the shard
+   fan-out and joined with it, so its round trip overlaps the bucket LISTs in
+   one wave rather than following them; it still completes before
+   the snapshot is constructed, so the visibility bound below is unchanged. For
+   every `.dreq` erasure request found, decode and structurally validate it
+   and verify its observed key against its own identity fields (ADR-0010 §7),
+   then attach it to the snapshot's `pending_erasure`. `.done` completion
+   records (PII-free audit evidence, no predicate) are recognized and
+   skipped; any other shape under `del/` is fail-loud layout drift. The
+   directory is empty for the common no-erasure case, costing exactly one
+   LIST and nothing more. This delivers the visibility bound: a `.dreq`
+   durable before a resolve is always seen by that resolve, so a query whose
+   snapshot resolves after the request ack can never return matching records
+   -- attachment depends on nothing a later rewrite pass does. The scan /
+   materialization layer is what filters query results against these
+   predicates; resolution only discovers and attaches them.
+7. Snapshot = the resulting segment set plus `pending_erasure`, pinned for
+   the query lifetime; later commits, compactions, rewrites, erasure
+   requests, or deletions do not affect a running query. A store NotFound on
+   a pinned segment surfaces as SnapshotInvalidated; the frontend re-resolves
+   and retries the query once (ADR-0010 §11).
+
+`SegmentRef` carries a level discriminator. L0 refs keep the existing
+commit-record provenance fields. L1 segment refs carry (ingest_hour,
+input_set_hash, part_index, content_hash, object_size, event bounds) and
+reconstruct the part key from those fields rather than trusting any
+stored string (ADR-0010 §7, same discipline as the L0 data key). Snapshot
+ordering stays a deterministic total order across mixed levels: L1 segments
+sort into the same (provenance, shard, writer_id) tiebreak chain as L0
+segments (see "Cross-segment duplicate samples" below) using the
+compaction record's created_unix_ns in place of a commit record's, and
+input_set_hash plus part_index as the final tiebreaks in place of
+writer_id/epoch/seq, since a part has no writer identity of its own.
+
+The listing window is sound because admission bounds event-time skew
+(ADR-0010 §8): points with `event_ts > ingest_ts + max_future_skew`
+(default 10 m) or `event_ts < ingest_ts - max_ingest_lag` are rejected at
+ingest. Late arrivals within bounds land in the current ingest hour and
+stay discoverable via the `now`-anchored upper bound.
+
+The window's upper bound is anchored on `now_ns`, not on `range.end_ns`, so a
+client-supplied `range.start_ns` near the epoch spans one bucket per (shard,
+ingest_hour) from that start all the way to the current hour, regardless of
+how narrow `range.end_ns` is. Both traversals cost one bounded LIST per shard
+for the hours above the watermark (`O(objects above the watermark /
+page_size)`), so a wide-but-sparse window no longer pays one LIST per empty
+hour; resolve switches to the prefix scan for wide windows only for its
+resolve-wide request cap, in which every page reserves a slot before it is
+issued (ADR-0056, ADR-2509).
+
+`Catalog::estimated_catalog_requests` still reports the per-bucket worst case
+`shard_count * hour_buckets + SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND`
+(ADR-0044 decision 3): it is a true upper envelope of whichever
+traversal runs (both bounded paths issue at most one LIST per shard per page
+of real objects, strictly fewer than the per-bucket worst case) and is
+threaded into the cost accounting. It is no longer the admission gate for wide
+windows. Instead:
+
+- A window whose per-bucket worst case would exceed
+  `CatalogConfig::max_catalog_list_requests` (default 100,000) is routed to
+  the prefix scan rather than refused, because neither bounded path amplifies
+  one-object-worth-of-data into thousands of empty LISTs.
+- The prefix scan carries a runtime LIST cap at the same ceiling: every page
+  reserves a slot with an atomic update that refuses at the ceiling, and a
+  refused reservation aborts the resolve with `WindowTooWide` (`estimate` is
+  the ceiling plus one, `limit` the ceiling) and cancels the shards still in
+  flight. The shards list concurrently, but a single resolve's scan never
+  issues more than `max_catalog_list_requests` catalog LISTs. The ADR-0064 pending-erasure LIST is one further LIST
+  outside that cap: it starts alongside the scan and is issued once even
+  when the scan is refused, so a resolve issues at most
+  `max_catalog_list_requests + 1` LISTs in total. Only a scan whose *actual
+  object volume* is unsustainable is refused; a wide-but-sparse window is
+  served.
+
+The refusal is never a silent narrowing to a partial result (exact semantics
+by default). The typed error carries the count and the limit so the caller
+can narrow its own range and retry; it maps to HTTP 422 on every query
+endpoint.
+
+`Catalog::resolve_ingest_hours(tenant, signal, start_hour, end_hour, now_ns,
+accounting) -> Snapshot` selects by ingest hour instead of event time, for
+callers that want data by when it was ingested (the server's startup cache
+warm-up). Its listing window is the explicit inclusive range
+`[start_hour, end_hour]` of unix ingest hours rather than one derived from an
+event-time range, and step 4's event-time filter is not applied: every segment
+filed in those hours is returned, whatever its event times. It takes no
+`min_tokens` and no name filter. Everything else is the same code as
+`resolve`: hours at or below the folded snapshot's watermark are served from
+its parts and only the hours above it are listed (next section), with the
+same supersession, tombstone and selective-erasure handling and the same
+request cap. `end_hour` is clamped to the hour of `now_ns +
+clock_skew_allowance`, the upper edge of every `resolve` window, so a bucket
+filed in a later hour is not returned, and a range whose start is past the
+clamped end selects no segment. Its only source is object storage: the
+commit records, snapshot HEAD and parts it reads are objects, fetched
+directly or through the same caches `resolve` uses.
+
+## Snapshot resolution from a folded snapshot
+
+Step 1 of the listing
+algorithm above is replaced by a snapshot-backed lookup that degrades to
+full listing on any index failure; min-token resolution and snapshot
+pinning are unchanged:
+
+1. Attempt snapshot read: GET HEAD (cached with a short TTL, default 30 s,
+   config `head_cache_ttl`). A HEAD GET that returns NotFound is cached for
+   the same TTL, so a tenant that has never folded lists without a HEAD GET
+   until the entry expires; any other GET failure is not cached. The fold
+   reads HEAD from the store and never consults this cache. Decode, validate signal/shard_count against
+   the catalog's own config (a shard_count mismatch is a loud error:
+   ADR-0010 §9 makes changing it forbidden) and validate tenant_hash
+   against the requesting tenant (per ADR-0050 §2, a hard
+   `CatalogError::FieldMismatch`, never a fallback: an isolation breach,
+   not a performance event). Fetch parts not in the decoded-part cache
+   (immutable, keyed by part key, verified against HEAD's blake3 before
+   decode, bounded per tenant by `snapshot_cache_parts`; the decoded-part
+   and postings caches together are also bounded across every tenant by
+   `CatalogConfig::decoded_cache_max_bytes`, unbounded by default, which
+   counts the bytes their entries' reservations hold and evicts
+   least-recently-used entries of either cache after an insert; a decoded
+   value whose own reservation is larger than that bound is not cached and
+   is decoded again on each resolve that needs it); a postings
+   object's tenant_hash is checked the same hard-fail way before its
+   entries are trusted. Before decoding a part or postings object, the
+   resolve reserves its header-declared uncompressed length (clamped to
+   the decoder's ceiling) against the catalog's `MemoryBudget`
+   (`Catalog::with_memory_budget`, unlimited by default; ravel-server
+   passes its process budget; ADR-1702 decision 6, ADR-1170), and the
+   reservation lives with the decoded value, in the
+   decoded-part and postings caches included, until it is dropped. Both
+   tenant_hash checks read the object's peeked header and run BEFORE that
+   reservation: an isolation breach must be reported as one even when the
+   budget has no room for the object it is in, rather than being reported
+   as a memory refusal with the breach and its counter lost. The
+   column-statistics load reserves through the same evict-then-retry path,
+   but its decode streams: the body is decompressed one
+   length-delimited segment at a time, each segment's encoded length is
+   reserved before it is read, and once the segment is validated and its
+   unkept dictionaries are cleared that charge is replaced by one for the
+   bytes it keeps. The keep charge is taken while the segment's charge is
+   still held, so a load's reservation peaks at one segment's encoded
+   length plus the bytes kept so far. When every dictionary is kept, the
+   kept bytes approach the declared body and the peak exceeds it by up to
+   one segment; streaming lowers the peak only when the request leaves
+   dictionaries out. A body declared over the ceiling is charged 0 and
+   refused before any segment is read. A refused reservation is a budget
+   skip, not an error: every reservation the load took for that part is
+   released, the part is left uncovered and the query scans it, and the
+   skip is logged at debug level (object key, requested bytes, limit) and
+   counted in `Catalog::column_stats_budget_skips`
+   (`ravel_catalog_column_stats_budget_skips_total`). It is not a refused
+   decode: it does not move `column_stats_decode_refusals` and does not
+   spend that object's warn-once latch, since the bytes were never judged.
+   ADR-1702's 2026-10-26 amendment records why the statistics load
+   degrades where the other decodes refuse. Its header
+   checks (tenant_hash, format version and part binding) also read the
+   peeked header and run before that reservation, so under memory pressure
+   a foreign-tenant object still fails with
+   `LoadColumnStatsError::TenantHashMismatch` and a stale-bound one still
+   degrades to no statistics; the kept bytes' reservation is released
+   when `load_column_stats` returns, since
+   `LoadedColumnStats` has no slot to carry it.
+   The catalog's budget defaults to unlimited and the server does not yet
+   pass it the process budget, so these reservations account without
+   refusing today. The segment fetcher's own decode reservations
+   (docs/query-engine.md) are already wired to the process budget and do
+   refuse.
+   With `Catalog::with_read_gate` (ADR-1702 decision 4), the part,
+   postings and column-statistics decodes run as jobs on the read CPU gate
+   instead of on the resolving task, each sized by its declared
+   uncompressed length, so a unit below the gate's inline floor still runs
+   inline. The header checks and the reservation above still run first,
+   and the reservation moves into the job with the object's bytes. A job
+   the gate cannot complete (the decode panicked, or the runtime dropped
+   the job before it ran while shutting down) fails that object's decode
+   with `SnapshotFormatError::DecodeJob`, and the resolve treats it like
+   any other decode error of that object without the object being
+   corrupt: a part falls back to listing (step 2), a postings object
+   disables pruning for the resolve, and a column-statistics object leaves
+   its part uncovered without being counted as a refused decode (a
+   cancelled job is logged each time; a panicked one is logged once per
+   object key and counted in `Catalog::column_stats_decode_panics`), with the
+   statistics loaded from the other parts cached for that HEAD as usual.
+   Without a gate every decode runs on the resolving task. The server
+   installs its read gate on the catalog it builds.
+2. On any other failure in step 1 (HEAD absent, corrupt, part missing or
+   hash-mismatched, postings content-hash or entry-count mismatch): log,
+   fall back to full listing for the whole window. Queries never
+   fail and never silently narrow because of index state. A part GET
+   NotFound races GC of a just-superseded part; re-read HEAD once before
+   falling back. tenant_hash and shard_count mismatches are excluded from
+   this fallback: both fail the query instead (previous step, and ADR-0010
+   §9). So is a decode reservation the memory budget refuses: it fails the
+   query with `CatalogError::MemoryExhausted`, since the listing pass it
+   would fall back to holds more memory, not less.
+3. With a snapshot at watermark W: for window buckets with `hour <= W`,
+   take entries from the parts (hour-major sort makes this a contiguous
+   range scan per part), filter by event-time overlap exactly as the
+   listing path does. For window buckets with `hour > W`, LIST and
+   GET-decode as that path does.
+4. min-token resolution: unchanged, exact commit-key GETs, never through
+   the snapshot.
+5. Build `SegmentRef`s from snapshot entries by reconstructing the data key
+   from identity fields, the same reconstruct-don't-trust rule as commit
+   records (ADR-0010 §7); dedup by data key across the snapshot/listing/
+   token sources, sort by the dedup total order ("Cross-segment duplicate
+   samples" below), return the pinned `Snapshot`.
+
+`SegmentRef.declared_column_stats` is filled on every catalog route
+(ADR-0873 decision 4): from the commit record for a listed or token-resolved
+segment, from the compaction part for a listed L1 segment, and from
+`SnapshotEntry.declared_column_stats` (field 15) for a sealed entry. Two
+routes are deliberately always empty: a rewrite output's parts (the rewrite
+dropped rows, so a pre-drop stamp is stale; ADR-0873 decision 3), and a
+`SegmentRef` rebuilt from a Flight `SegmentPin` (its wire layout does not
+carry the field yet), so a segment covered in the catalog reads as uncovered
+after a pin round trip -- costing the shortcut there, never an answer. The
+listing routes are what cover the always-unsealed recent tail and
+token-resolved segments, which no fold-built sibling object reaches. The
+entries are re-validated against the carrier's own row count wherever they are
+read, so a stamp is never trusted because some earlier reader accepted it, and
+an entry that fails leaves its column uncovered without affecting the rest of
+the record. An empty list means the segment is uncovered for every declared
+column and is never an error; a reader that finds a column uncovered scans.
+
+Every LIST call on the resolve path, in both phases, asserts that each
+returned key begins with the requesting tenant's prefix (per ADR-0050 §2,
+the same hard `CatalogError::FieldMismatch` as a tenant_hash mismatch): a
+backend or key-layout bug that hands back a foreign key is an isolation
+breach, never a silently dropped or served key. Both this and the HEAD/
+postings tenant_hash checks above increment
+`ravel_catalog_isolation_breach_total`, and so do the fold's tenant_hash
+checks on a tenant's previous postings object and previous snapshot parts.
+These other snapshot-part readers run the same check after the GET and
+before the decode, and count a foreign part on the `Catalog` they were given:
+the key-index rebuild (through the fold's part loader), the scrub's
+covering-postings load (`LoadPostingsError::PartTenantHashMismatch`, a hard
+error rather than a degrade to `None`) and its seal-divergence tier, and
+`verify_seal_divergence` and `snapshot_coverage`
+(`SealDivergenceError::PartTenantMismatch`), which `ravel-cli catalog
+verify` and `ravel-cli load` call. The server hands the scrub its own
+`Catalog`, so a foreign part the scrub reads is counted where `/metrics`
+renders it; the command-line readers count on a `Catalog` of their own and
+report the error as a failed command. Only after the check does each of
+these readers charge the part's declared decoded size to that `Catalog`'s
+memory budget (ADR-1170, catalog decode charge amendment), so a budget
+refusal never hides a foreign part; the refusal is
+`LoadPostingsError::MemoryExhausted` or
+`SealDivergenceError::MemoryExhausted`. A tenant_hash mismatch on the postings
+object in `load_covering_postings` (`LoadPostingsError::TenantHashMismatch`)
+is not counted.
+
+The GC reachability sweep (`crates/ravel-maintain/src/reachability.rs`) also
+checks the HEAD's tenant and signal and each part's tenant, but holds no
+`Catalog` to count a breach on. It compares the HEAD's tenant_hash with the
+swept tenant, and the HEAD's signal with the swept signal, right after
+decoding it, before reading any part the HEAD names, and it calls the same
+tenant-checked decode (`ravel_catalog::check_part_tenant` /
+`decode_part_for_tenant`, the public primitives `Catalog::decode_tenant_part`
+itself calls) directly on a HEAD-named part before reading its entries. A
+foreign tenant_hash on either, or another signal on the HEAD, refuses it and
+takes the fail-closed path the sweep already uses for an undecodable HEAD or
+part: the refusal is cached for the rest of the pass, the delete gate answers
+`SnapshotBlock::Unreadable`, the candidate is not deleted (the retention
+sweep counts it on the pass report's `blocked_by_unreadable_head`, the
+superseded-input sweep on `held_by_unreadable_head`), and the sweep logs one
+error-level line (`key`, `expected_tenant`, `actual_tenant` for a tenant;
+`key`, `expected_signal`, `actual_signal` for a signal). It does not
+increment `ravel_catalog_isolation_breach_total`, because it holds no
+`Catalog`.
+
+Three more snapshot-part readers check the part's tenant_hash before decoding
+its entries, each with its own answer to a foreign part:
+
+- The on-demand fold's outcome classification (`read_entry_ids` in
+  `services/ravel-server/src/fold_on_demand.rs`) decodes through
+  `Catalog::decode_tenant_part` on the server's `Catalog`, so a foreign part
+  is counted on `ravel_catalog_isolation_breach_total` before the memory
+  budget is charged. The classification then declines to compare entry sets,
+  logs a warning naming the part and both tenants, and the route answers
+  `published` with the fold's report, as it does for a part that will not
+  decode. The entry id sets the comparison accumulates are charged to the
+  same budget before any part is read, 288 bytes per compared entry from the
+  entry counts HEAD declares, and the charge is held until the comparison
+  ends. A budget that cannot admit them declines the comparison the same way,
+  and the route answers `published`. So does a part whose decoded entry count
+  differs from the count HEAD declares for it, since the charge is sized from
+  the declared counts.
+- The startup format-window audit (`services/ravel-server/src/format_window.rs`)
+  calls `ravel_catalog::decode_part_for_tenant`. A foreign part fails that
+  (tenant, signal) pair's read, none of its entries is counted as out of
+  window, and the pair is reported as a check that could not run, so
+  `--format-window-check refuse` fails startup on it and `warn` logs it. No
+  `Catalog` exists at that point in startup, so it counts nothing.
+- `ravel-cli catalog inspect` (`services/ravel-cli/src/catalog.rs`) calls
+  `decode_part_for_tenant`. A foreign part fails the command after printing
+  everything rendered before it, and counts nothing: no server is involved.
+
+The counter is rendered at `/metrics` beside the
+existing `ravel_catalog_interlock_violations_total` and
+`ravel_catalog_compaction_input_set_conflicts_total` anomaly counters
+(default alert rule: docs/guides/operations.md). Unlike those two, which
+tally a harmless-overlap anomaly the query still resolves past, every
+increment of the isolation-breach counter corresponds to a failed query, a
+failed fold tick, a scrub tick that skipped the check reading the part, or an
+on-demand fold whose outcome classification declined to compare entry sets.
+
+The fold's own liveness is exported beside those counters, from the same
+`Catalog`: `ravel_catalog_fold_cycles_total`,
+`ravel_catalog_fold_failures_total`, and the
+`ravel_catalog_fold_last_success_timestamp_seconds` gauge, stamped with the
+caller-supplied `now_ns` of the last fold that returned `Ok`. All three carry a
+`signal` label, because folding is per (tenant, signal) throughout and the
+server drives it as one independent task per signal: process-global figures
+would read as healthy for as long as any one of those tasks kept running,
+while the signal whose task had stopped went unsealed.
+
+They are accumulated inside `Catalog::fold` rather than at its callers. In the
+server the scheduled fold loops and the on-demand fold route are `Arc` clones
+of one `Catalog` in one process, and a family fed by only one of them would
+read as healthy while the other was dead; the single accounting point is what
+removes the per-call-site wiring that would have to be remembered. A
+`ravel-cli catalog fold` and the catalog bench each run in their own process,
+with their own `Catalog` and no `/metrics` route, so they account into counters
+nothing scrapes: a manual CLI fold never appears on a server's gauge, and a
+server gauge that stays flat across one is behaving correctly.
+
+A no-op fold counts as a cycle and advances the gauge, because the seal window
+above means a fold on a quiet tenant legitimately publishes nothing most
+cycles. The gauge's age is the signal that the fold has STOPPED, which is the
+failure the index has no other alarm for: nothing seals, the unsealed span
+grows without bound, and the first symptom is a recent-window query refused for
+exceeding its request budget. The alert rule and the threshold arithmetic are
+in docs/guides/observability.md.
+
+Soundness rests entirely on the seal lemma above: for sealed buckets, the
+fold's LIST equals any later LIST, so serving them from the snapshot
+returns exactly what full listing would; open buckets keep the listing path
+verbatim, so the window formula, the event-overlap filter, and the
+admission-time skew bounds that make it sound (ADR-0010 §8) are untouched.
+An index failure degrades performance only, never correctness: this is a
+derived, rebuildable index, never a durability or correctness dependency.
+
+(ADR-0020.)
+
+## Catalog snapshot staleness
+
+Folding is a cost optimization and nothing else: it changes which objects a
+resolve reads, never which commits a query sees. Without a `min_commit_token`,
+freshness above the watermark is whatever listing returns, which is
+listing-immediate for a just-published commit record, and sealed history below
+the watermark is complete by the seal lemma, so its staleness there is zero in
+healthy operation.
+
+Every index failure mode degrades to wider listing rather than to missing or
+wrong data. An absent or corrupt HEAD, a missing or hash-mismatched snapshot
+part, a stale cached HEAD, a folder stopped for hours, and two folders racing
+the HEAD CAS all take the step 2 fallback above. The index adds no false
+positive beyond what MVCC already handles: a snapshot entry whose object was
+since retired resolves to NotFound, raises SnapshotInvalidated, and the
+frontend re-resolves.
+
+One exception is narrow and documented. A folder whose clock runs fast beyond
+`fold_safety_margin` can seal an hour before every writer's flush for it has
+landed, and a commit published into that already-sealed bucket is invisible to
+non-token queries until an operator forces a HEAD rebuild (`ravel-cli catalog
+verify` finds the divergence; docs/guides/operations.md "Catalog fold and
+verify" carries the procedure). Read-your-write is unaffected: the
+`min_commit_token` path GETs its exact commit key directly and never consults
+the snapshot.
+
+## Query cost accounting
+
+`resolve` and `resolve_pruned` account for every store call and cache access
+they make on the caller's behalf when driven through their
+`*_with_accounting` counterparts (`resolve_with_accounting`,
+`resolve_pruned_with_accounting`; ADR-0044). The plain `resolve`
+and `resolve_pruned` entry points pass a discarded `QueryAccounting`
+handle.
+
+`Catalog::guarded_get` is the only place a resolve issues a GET, and
+`Catalog::guarded_list_all` is the LIST funnel for every path except the two
+shard-scan traversals named below. Accounting is recorded in the funnel,
+never at a call site: one `AccountedOp::Get` per GET attempt and one
+`AccountedOp::List` per LIST page, both unconditional; bytes are added only
+for a successful GET, matching `InstrumentedStore`'s convention that a
+failed request and a LIST move no bytes. `resolve`'s funnels never issue
+a HEAD.
+
+Every GET a resolve issues goes through `guarded_get`, including the two
+provisioning-record reads that provisioning enforcement adds: the generation
+history `Catalog::read_scan_generations` reads fresh on every resolve, and
+the one-shot `shard_count` check `Catalog::enforce_provisioning_once` runs on
+a (tenant, signal)'s first touch. The raw
+`store.get` in `provisioning.rs` remains
+only on the administrative paths, which never run under a query and hold no
+per-query accounting: `validate_or_adopt`'s adoption write and its race
+re-read, `append_generation` (reshard), `raise_format_floor`, and
+`read_floors_from_store`.
+
+The two shard-scan LIST paths (`Catalog::list_window_bounded`, via
+`list_shard_hours`, and `Catalog::list_window_by_prefix`) record their own
+`AccountedOp::List` per page instead of going through `guarded_list_all`.
+Both need `list_after`'s start-after marker to skip a shard's
+below-watermark history server-side, which `guarded_list_all`'s plain `list`
+does not take, and the prefix scan additionally reserves a slot in its
+runtime LIST ceiling before each page rather than draining unconditionally. Each still
+acquires the same request-semaphore permit per page and applies the same
+ADR-0050 section 2 tenant-prefix assertion, so the bound and the request
+count are what `guarded_list_all` would produce; only the code path differs.
+
+All five caches (`RecordCache`, `CompactionRecordCache`, `HeadCache`,
+`PartCache`, `PostingsCache`) record a cache hit or miss on every lookup and
+add the cached object's original wire-encoded byte size on a hit; a miss
+does not double-count bytes the funnel GET that filled the cache already
+recorded. The two record caches carry a per-tenant BYTE budget as well as the
+`cache_capacity_per_tenant` entry cap, because neither record type has a
+bounded size, and evict against whichever binds first: `RecordCache` evicts
+least-recently-used under `commit_cache_max_bytes_per_tenant`,
+`CompactionRecordCache` evicts by insertion order under
+`compaction_cache_max_bytes_per_tenant`. The two budgets are equal shares of
+the same per-tenant figure (22.5 MB each at the 25,000-entry cap, 45 MB
+together) at the default; `ravel-server`'s
+`--catalog-record-cache-max-bytes-per-tenant` raises that figure, and the
+entry cap with it (ADR-3513). `PartCache` and `PostingsCache` are bounded by their entry count
+alone and evict by insertion order. `HeadCache` additionally carries a
+process-wide capacity bound (`head_cache_capacity`, default 10,000 (tenant,
+signal) entries, FIFO eviction). An entry recording a
+missing HEAD counts against the same bound, but when the cache is full a new
+one is not cached rather than evicting a present HEAD. A present insert at
+capacity evicts the oldest missing-HEAD entry first, and falls back to the
+oldest entry only when none is held.
+
+## Compaction protocol (ADR-0018)
+
+Publish-then-supersede. A compaction run writes its L1 segments, then
+publishes one `CompactionRecord` with `PutMode::CreateIfAbsent`. The record
+names its exact input set (the sorted `(writer_id, writer_epoch, writer_seq)`
+list, hashed as `input_set_hash`), and nothing about the inputs is mutated or
+removed at publish time. The only ordering the protocol depends on is that the
+record becomes visible before any input is physically removed, and that
+removal is a separate, later, horizon-gated step (the MVCC rules below and
+docs/consistency-model.md "Deletion and GC").
+
+Overlap harmlessness is what makes every intermediate state query-correct
+without locking. As long as a compaction record's segments carry every sample
+of every input it names, a resolved snapshot holding both the record's segments
+and some or all of its listed inputs answers a query exactly as one holding
+only the segments does, because query-time dedup ("Cross-segment duplicate
+samples" below) collapses the duplicate candidates. So no dedup runs at
+compaction time, and a reader may transiently see an L0 input and its L1
+replacement together and still get exact answers.
+
+Record-count conservation is enforced, not assumed (ADR-0048). Before the
+record PUT, the run checks that the sum of `sample_count` over its input set
+equals the sum over its built segments (`conserve_exact`, the exact predicate
+compaction and the format-migration rewrite share; a selective-erasure rewrite
+plugs in "inputs minus the erased count" instead). Compaction never dedups, so
+any inequality means the merge dropped or invented records; the run aborts with
+a typed error and publishes nothing. The L0 inputs stay live and queryable, and
+the abandoned segments age out under the unreferenced-object rule. The check
+runs pre-publish because publish is the point of no return: once the record is
+visible the resolver excludes the inputs, and after the protection horizon the
+sweep removes them physically. The gate also runs under dry run, so a dry run
+of a bucket that would trip it reports the violation.
+
+Racing compactors over one sealed bucket are serialized by `CreateIfAbsent`
+picking a single winner; a loser's segments are unreferenced objects that age
+out under the same rule. Two records that legitimately name different input
+sets (rare, from concurrent partial seals) are not reconciled automatically,
+and the resolver derives an identical answer on every replica. When the two
+input sets are disjoint it includes both segment sets plus any L0 input covered
+by neither, harmless under the property above. When they overlap, query-time
+dedup would collapse the duplicate for metrics but not for logs or spans (which
+have none), so the resolver picks one authoritative record per overlap group by
+the largest input set, then the smallest `input_set_hash`, with the record
+key as the final fallback, includes that record's segments, serves every
+input the winner does not name as a raw L0 segment, and ignores the other
+records' segments; among the compaction records each input is then served
+from one place, inside the chosen record's segments or as a raw L0.
+Preferring the largest input set leaves the fewest inputs to serve raw, so
+the bucket reads mostly from compacted parts rather than falling back to the
+L0 objects a smaller winner would not cover. All three keys are computed from
+record bytes alone, so every replica and the index fold pick the same winner. Either way it raises
+`ravel_catalog_compaction_input_set_conflicts_total` for a human to look at.
+Durably refusing to publish a second overlapping record is a publish-time step
+in ravel-maintain; the resolve-time tie-break keeps reads correct until then.
+
+## Online resharding (ADR-0052)
+
+`shard_count` is changeable online, with ingest running. A reshard never moves,
+rewrites, or re-keys existing data: it appends a
+`(generation, shard_count, activation_hour)` entry to the tenant's provisioning
+record, and only data ingested from `activation_hour` onward routes with the
+new count. Old generations stay readable under their original shard indices
+until retention ages their hours out.
+
+Activation lead time. Activation is denominated in ingest-hour buckets and is
+placed `L` hours ahead: `activation_hour = now_hour + L`, with
+`L >= ceil(C / 1 h) + 1` hours, where `C` is the router's provisioning-record
+refresh interval (default 60 s, so the floor is 2 hours). `ravel-cli provision reshard`
+refuses a shorter lead. Every live writer re-reads the record at least once per
+`C`, so that floor guarantees each writer either observes the new generation
+before it activates or has already stopped on record staleness. Nothing routes
+past an activation a writer has not seen.
+
+What a writer observes. A writer routes new data with the count of the latest
+generation whose `activation_hour <= hour(now)`, and refreshes its view of the
+record on the bounded interval `C`. A writer whose cached view is older than
+`C` and cannot re-read the record fails the flush closed with a typed error and
+a metrics counter rather than routing on a stale view, so a writer in the
+transition either sees the new generation before it activates or stops. It
+never silently writes to the wrong shard set.
+
+What a reader observes. A reader derives its per-hour scan set from the
+generation history, read fresh on every resolve, so its fan-out widens on an
+increase or narrows on a decrease once its own record view is current, with no
+coordination with writers. A query spanning the activation hour returns
+complete results from both the old and the new shard range, because the engine
+merges a series' samples from any set of segments by series identity and the
+scan rule lists every written shard index for each hour. A snapshot HEAD folded
+before the reshard, carrying a lower generation count than the reader's, is
+accepted when its watermark predates the activation of the first generation it
+did not know about: the reader lists the newer hours the HEAD predates. A
+pre-reshard HEAD whose watermark instead reaches into hours an unknown
+generation was already active for is rejected loudly with a fail-closed
+`FieldMismatch`, because its parts cannot carry the wider shard range those
+hours were written under, and serving it would silently omit data below its own
+watermark.
+
+A read-side shard floor for the pinned signals. The alerts and audit writers do
+not hash a series into `0..shard_count`; they pin fixed shard indices by
+constant (`ALERT_SHARD` 0, `AUDIT_HOLD_SHARD` 0, `QUERY_AUDIT_SHARD` 1), and
+neither signal is ever provisioned, so both resolve through the implicit
+generation 0 at the process `shard_count`. A reader's scan set for hour `h` is
+therefore `max(scan_count(h), Signal::fixed_read_shards())` for every signal:
+1 for alerts, 2 for audit, 0 elsewhere (ADR-1101 decision 2). It is a floor
+only. A wider generation history or a larger configured `shard_count` raises
+the scan set above it and nothing lowers it below, so a `--shards 1`
+deployment still lists the query-audit shard instead of silently omitting every
+record pinned to it.
+
+Commit tokens are unaffected. A token minted under any generation resolves
+forever, because token resolution reconstructs the exact key from the token's
+own fields and never consults `shard_count` (ADR-0052 section 6).
+Read-your-write holds across a reshard in either direction. docs/ingest.md
+carries the decrease-specific straggler slack window.
+
+## MVCC rules
+
+- Snapshots are logical sets of immutable segments. Compaction
+  publishes a transaction adding outputs and removing inputs; running
+  queries keep their pinned set.
+- GC deletes an object only when all hold: unreachable from any snapshot
+  within the protection horizon, not lease-protected, and older than its age
+  gate; commit-record absence (for orphans) is re-verified immediately before
+  each delete. The horizon must satisfy `protection_horizon >=
+  max_query_duration + grace + clock_skew_allowance`: setting the GC config
+  refuses a violation and maintain refuses to start against one. The age gate
+  is `grace + max_flush_lifetime` for an orphan `l0/` data object and `grace +
+  max_compaction_lifetime` for an unreferenced `l1/` part. docs/deletion-and-gc.md
+  is normative for both.
+- Deletion (retention/tombstone) is a durable transaction that excludes
+  segments from new snapshots first; physical removal follows via GC. The
+  retention sweep enforces the "unreachable from any snapshot" precondition
+  directly: before deleting a bucket it loads the `(tenant, signal)` HEAD and
+  the parts covering the bucket's hour and refuses the delete if any snapshot
+  entry still names an object inside the bucket, or fail-closed if HEAD or a
+  covering part cannot be read (ADR-0020 delete blocker; see the
+  retention-frontier reconcile above and docs/consistency-model.md "Deletion
+  and GC"). An absent HEAD is not a block (the index is a pure optimization).
+
+## Cross-segment duplicate samples
+
+Queries dedup by (series_id, ts) under the provenance order
+(commit created_unix_ns, writer_epoch, writer_seq, in-page index); the
+greatest wins. Values compare by f64 bit pattern (ADR-0010 §5). The primary
+key `created_unix_ns` is the flush-open clock reading; each ingest shard actor
+(metrics, logs, spans) raises every reading to a monotonic floor
+within its process lifetime, so a backwards wall-clock step cannot stamp a
+correction below the stale sample it supersedes (ADR-1307). The floor is scoped
+to the shard index, not to one actor: where the router respawns a dead metrics
+shard actor (docs/ingest.md "Shard actor"), the replacement
+continues the same floor. Scoping it to an actor would end ADR-1307's guarantee
+at each respawn, and the fresh `writer_id` the replacement mints does not make
+that safe, for the reason given at the end of this paragraph. A step larger than a
+bounded hold (the catalog clock-skew allowance, 5 min) is refused rather than
+absorbed. Only the ingest shard actors apply this floor: the maintenance writers
+(compaction, migration, erasure rewrite in `ravel-maintain`) mint their commit
+records' `created_unix_ns` from their own clock with no floor, and are not
+covered by this guarantee. The floor is per-process and resets on restart; a
+backwards step spanning a restart can still invert resolution, and `writer_id`
+does not prevent it, being only the segment-order tiebreak below and not part of
+this comparator (ADR-1307 Known limitation).
+
+That provenance order is not total across segments: two same-shard segments
+from different writers can tie on (created_unix_ns, writer_epoch, writer_seq)
+because seq is monotonic only per (writer_id, epoch, shard) (ADR-0010 §3). To
+make the resolved snapshot's segment order a deterministic total order, the
+catalog sort appends shard then writer_id as final tiebreaks after the
+provenance components. writer_id is a per-segment identity component, so no
+two distinct segments can tie on the full key; the order never depends on
+arrival, insertion, or map iteration order.

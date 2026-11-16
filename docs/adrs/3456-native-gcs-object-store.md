@@ -1,0 +1,428 @@
+# ADR-3456: Native GCS object store backend
+
+- Status: Accepted (2026-10-29)
+- Date: 2026-10-29
+- Refs: #3456, ADR-0002, ADR-0008, ADR-0050, ADR-0055, ADR-1685, ADR-2040, ADR-2637
+
+## Context
+
+Object storage is Ravel's only durable store. The commit protocol (ADR-0002)
+and every CAS-mutable record (catalog `HEAD`, tenant config, agent HEADs)
+rest on two primitives: create-if-absent and compare-and-swap on a version
+token. ADR-0008 put `object_store` behind Ravel's own `ObjectStoreBackend`
+trait so that a backend with different precondition headers, named there as
+"GCS generation preconditions", could be added without touching commit code.
+
+Today `--store` accepts `memory` and `s3`. The S3 path cannot be pointed at
+GCS's S3-compatible XML API. Measured on 2026-10-29 with curl and an OAuth
+token against a fresh bucket in us-central1 (#3456):
+
+| Request | Required | GCS answered |
+|---|---|---|
+| PUT `If-None-Match: *` on an existing key | 412 | 200, object overwritten |
+| 8 concurrent `If-None-Match: *` PUTs on a new key | one 200 | eight 200s, last writer wins |
+| PUT `If-Match: <wrong etag>` | 412 | 200, object overwritten |
+| PUT `x-goog-if-generation-match: 0`, twice | 200, then 412 | 200, then 412 |
+| PUT `x-goog-if-generation-match: <wrong>`, then the right generation | 412, then 200 | 412, then 200 |
+| GET `If-Match: <current etag>`, then `If-Match: <wrong etag>` | 200, then 412 | 200, then 412 |
+| GET `?generation=<current>`, then the same generation after an overwrite | 200, then 404 | 200, then 404 |
+| GET `?generation=<current>` with `If-Match: <its etag>`, then with a wrong ETag | 200, then 412 | 200, then 412 |
+| GET `?generation=<replaced>` with `If-Match: <that generation's etag>`, and with a wrong ETag | 404, 404 | 404, 404 |
+| GET `?generation=<g>` with `If-Match: <its etag>` after the object is deleted | 404 | 404 |
+| GET a key that never existed: with `If-Match`, with `?generation=`, and with both | 404, 404, 404 | 404, 404, 404 |
+
+On PUT, the XML API ignores the S3 conditional headers and honours only its
+own generation headers. On GET it honours `If-Match`. A generation selector
+naming a replaced or deleted generation answers 404, whatever `If-Match`
+says, so GCS decides the selector before the ETag. The GET rows were measured
+the same day, against the same bucket. `ravel-cli store qualify` would refuse
+such a bucket, so the S3 path is unusable on GCS rather than unsafe.
+Separately, organisation policies commonly forbid service-account keys
+(`constraints/iam.disableServiceAccountKeyCreation` refused the HMAC key in
+the measurement project), so the S3 path would have no credential to sign
+with either.
+
+A GCS client already ships: `ExternalStore`'s GCS arm reads granted Parquet
+files (ADR-2040). It is read-only by design. `put`, `put_multipart` and
+`delete` return `ReadOnly`, and it reports `create_if_absent` and
+`cas_version` as false (`crates/ravel-object-store/src/external.rs`).
+
+## Decision
+
+### D1. A `GcsStore` backend in ravel-object-store
+
+`crates/ravel-object-store/src/gcs.rs` adds `GcsStore`, a full read-write
+`ObjectStoreBackend` over `object_store::gcp::GoogleCloudStorage` (the
+workspace's `object_store` 0.14 already enables `gcp`). It is a separate
+type from `ExternalStore`, which stays read-only.
+
+- **Version token.** The token is the object's GCS generation, as a decimal
+  string, on every path: `put` results, `head`, `get`, `list` entries and
+  `pin_of`. The ETag is never used as a token. A generation is assigned by
+  GCS on every write and never reused for a key, so a token cannot alias two
+  states.
+- **Put modes.**
+  - `CreateIfAbsent` sends `x-goog-if-generation-match: 0`. A 412 maps to
+    `AlreadyExists`.
+  - `CasVersion(v)` sends `x-goog-if-generation-match: v`. A 412 maps to
+    `PreconditionFailed`. `v` must be a positive decimal generation with no
+    leading zero; anything else is refused before a request is sent. GCS
+    never issues generation 0, and `x-goog-if-generation-match: 0` means
+    create-if-absent, so a CAS token of `0` would otherwise create an absent
+    key instead of failing.
+  - `Overwrite` sends no precondition.
+
+  `object_store` 0.14 sends both headers itself: `PutMode::Create` as
+  generation 0, and `PutMode::Update` from `UpdateVersion::version`, failing
+  with `MissingVersion` when it is absent. A test asserts each header on the
+  wire against an in-process fake endpoint, so an upgrade that changes this
+  fails CI.
+- **Reads.** Ranged and suffix reads use `get_opts`. A pinned read keeps the
+  `get_pinned` contract (`ObjectStoreBackend::get_pinned`): the pin's
+  version is the generation, sent as the `generation` selector (which
+  `get_opts` does for `GetOptions::version`), so a generation that no longer
+  exists answers 404 and maps to `NotFound`. The pin's ETag, when present,
+  goes out as `If-Match` on the same request (`GetOptions::if_match`), so
+  GCS evaluates it on the wire, as the trait requires; GCS answers a mismatch
+  with 412 (measured above), which maps to `PreconditionFailed`. For a pin
+  with no version, that `If-Match` is the whole mechanism. A generation
+  precondition header is not used for reads: it would turn a vanished
+  generation into `PreconditionFailed`, which the trait reserves for a
+  changed object.
+- **Listing.** `GcsStore` does not list through `object_store`, for two
+  reasons. First, ADR-2637 removed `Path`-based listing from `S3Store`:
+  `Path::parse` fails a whole page on a key it rejects, and resuming from
+  `Path::from(last_key)` re-delivers or skips keys that `Path` re-encodes.
+  Second, `object_store`'s GCS listing uses the XML API's `list-type=2` with
+  no `encoding-type`. So a foreign object whose name XML 1.0 cannot carry
+  makes every page that contains it unparseable: the same whole-page failure
+  as the first reason, by another route. (Measurement showed otherwise; see
+  the XML listing correction at the end of this ADR.) Every base backend's
+  listing must instead hand raw keys to `classify_objects` and
+  `classify_prefixes`, so unaddressable keys are reported in
+  `ListPage::unaddressable` rather than failing the page. `GcsStore`
+  therefore carries its own listing client, beside `s3/list.rs`:
+  - It calls the JSON API's `objects.list`
+    (`storage/v1/b/<bucket>/o`), sending `prefix`, `delimiter` and
+    `startOffset` as raw names. The response carries names as JSON strings,
+    with no URL encoding to undo.
+  - It sends `maxResults` on every page, and resumes from the service's
+    opaque `pageToken`, never from a re-encoded key.
+  - It authenticates with the same Application Default Credentials as the
+    data-plane client, and runs through the shared connector (D3).
+
+  The page size is a `GcsStore` constructor argument, sent as `maxResults`,
+  and it is what `store qualify --list-page-size` passes. So the cross-page
+  probes test the size the store really serves. (A delimited listing sends
+  a fixed wire maximum instead; see the XML listing correction at the end of
+  this ADR.)
+- **Multipart.** `multipart: false`. A single GCS upload takes objects far
+  larger than any Ravel object, so no caller needs it. (Replaced: maintain
+  mode requires multipart; see the multipart amendment at the end of this
+  ADR.)
+- **Upload checksum.** `upload_checksum: false` in this ADR. CRC32C through
+  `x-goog-hash` is follow-up work. The capability is not mandatory, and full
+  reads are counted on `ravel_store_get_unverified_total`, as they are for S3
+  with stored checksums off.
+
+### D2. Credentials: Application Default Credentials only
+
+`GcsStore` authenticates the way `object_store` does when no explicit
+credential is given. That means Application Default Credentials: GKE
+Workload Identity or the metadata server in a cluster, or
+`GOOGLE_APPLICATION_CREDENTIALS` where an operator chooses to point at a key
+file. There are no Ravel flags carrying credentials, so no secret ever
+passes through Ravel's configuration. A hidden `--gcs-endpoint` sets the
+base URL, for tests against a fake endpoint only. When it is set, the
+backend identity records it (D5), so a qualification taken against a fake
+endpoint cannot read as one taken against the real bucket. Skipping request
+authentication (which a fake endpoint needs) is constructible only under the
+crate's `test-support` feature, so no production configuration can reach it.
+
+### D3. The same instrumentation as S3
+
+The S3 store observes every HTTP attempt through its own connector
+(`s3/connector.rs`). That connector feeds `ravel_store_attempts_total` and
+`observed_store_time_ns`, and the ingest clock-lag check (ADR-1685) reads the
+second. A backend without it reports zero attempts and turns the clock-lag
+check off without saying so. `GcsStore` installs the same connector through
+`GoogleCloudStorageBuilder::with_http_connector`. `object_store` sends its
+credential requests (the metadata server, the token endpoint) through that
+same connector. So the connector counts, and reads a `Date` from, only
+requests to the storage host; a token refresh is neither a store attempt nor
+a store clock reading. Per-operation call and
+byte counters come from the shared instrumentation wrapper, so the per-phase
+cost split covers GCS exactly as it covers S3.
+
+### D4. Error classification by status, not by S3 error codes
+
+S3 errors are classified from S3 XML error codes (`SlowDown`,
+`NoSuchBucket`). `GcsStore` classifies from the HTTP status and
+`object_store`'s typed errors:
+
+- 429 and 503 are throttling (retryable);
+- 404 on an object is `NotFound`;
+- 404 on the bucket is a hard error, except on HEAD: GCS answers a HEAD on
+  a missing bucket with a bodiless 404, which cannot be told from a missing
+  object and maps to `NotFound`, the same as `S3Store` does;
+- 412 is the precondition outcome named in D1;
+- 401 and 403 are credential errors.
+
+GCS limits writes to one object name to about one per second; a 429 on a
+CAS-mutable key (catalog `HEAD`) retries like any throttle.
+
+### D5. Selection, identity and qualification
+
+- `--store gcs` with `--gcs-bucket` (env `RAVEL_GCS_BUCKET`) on ravel-server
+  and on every ravel-cli command that takes `--store`.
+- The backend identity is `gs://<bucket>`, or `gs://<bucket>@<endpoint>`
+  when `--gcs-endpoint` is set, the same shape as `s3://<bucket>@<endpoint>`.
+  It is written into `sys/qualification` by `store qualify` and compared at
+  server startup exactly as `s3://` is.
+- The conformance suite runs unchanged: it takes `&dyn ObjectStoreBackend`.
+  A GCS bucket is qualified by running `ravel-cli --store gcs store qualify`
+  against it. The server refuses to start on an unqualified bucket, as it does
+  for S3.
+
+### D6. Explicit refusals under `--store gcs`
+
+Each of these flags is an S3 control-plane feature with no GCS
+implementation in this ADR. Startup refuses the combination with an error
+naming the flag. None of them is accepted and ignored. A flag counts as
+given when it was passed on the command line or set through its environment
+variable, read through clap's `ArgMatches::value_source` (the mechanism
+`config.rs` already uses to tell a passed value from a default). A defaulted
+value is not a refusal: `--s3-request-stored-checksum` defaults to true and
+is ignored under `--store gcs` exactly as it is under `--store memory`.
+
+- `--s3-*` flags, including `--s3-upload-integrity` and
+  `--s3-request-stored-checksum`.
+- `--s3-kms-key` and `--tenant-kms-config`. Customer-managed encryption on
+  GCS is a bucket default key (CMEK) set outside Ravel.
+- `--require-bucket-protection`. The bucket-protection probes are S3
+  control-plane calls with no GCS implementation, so a server asked to
+  require protection on GCS refuses to start rather than starting
+  unverified (ADR-0050).
+
+`ravel-cli store verify-protection` under `--store gcs` refuses too: it
+exits non-zero with an error saying that GCS bucket protection is not
+checked, rather than printing a report of conditions it never probed.
+
+### D7. Ravel's own bucket stays ungrantable as a Parquet location
+
+ADR-2040 D4 refuses a Parquet grant that resolves to Ravel's own bucket. The
+config-time check (`RavelBucket::is_reached_by` in ravel-sql) builds Ravel's
+side as an S3 address, so under `--store gcs` a GCS grant naming Ravel's
+bucket would pass it. The profile side already resolves a GCS profile to a
+GCS address. What changes is Ravel's own side: it is built from the
+configured store, a GCS bucket under `--store gcs`, instead of always from
+the S3 configuration. A GCS profile on Ravel's GCS bucket is then refused at
+config time, as an S3 profile on Ravel's S3 bucket is today. This ships in the
+same release as `--store gcs`, never after it.
+
+### D8. Out of scope, filed as follow-ups
+
+- **The operator.** Its CRD requires `storage.s3`, and it hard-codes
+  `--store s3 --require-bucket-protection`. GCS in the CRD is a CRD change of
+  its own.
+- **CRC32C upload integrity** (`upload_checksum: true` on GCS).
+- **GCS bucket-protection probes**: retention policy, object versioning,
+  soft delete.
+- **ravel-bench's own store selection.**
+
+```mermaid
+flowchart LR
+  subgraph server["ravel-server / ravel-cli"]
+    cfg["--store gcs\n--gcs-bucket"] --> build["build_store"]
+  end
+  subgraph os["ravel-object-store"]
+    trait["ObjectStoreBackend"]
+    s3["S3Store\n(ETag, If-None-Match)"]
+    gcs["GcsStore\n(generation,\nx-goog-if-generation-match)"]
+    ext["ExternalStore\n(read-only, Parquet grants)"]
+    conn["instrumented HTTP connector\n(attempts, observed store time)"]
+    trait --> s3
+    trait --> gcs
+    trait --> ext
+    s3 --> conn
+    gcs --> conn
+  end
+  build --> trait
+  gcs -->|"object_store data plane + own JSON objects.list, ADC token"| bucket[("GCS bucket\nsys/qualification\ngs://bucket")]
+  s3 -->|"SigV4"| s3b[("S3 bucket")]
+```
+
+## Rejected alternatives
+
+1. **S3 path against GCS's XML API with HMAC keys.** Measured above: GCS
+   ignores the S3 conditional headers, so create-if-absent and CAS do not
+   exist on that path. HMAC keys are also refused by a common organisation
+   policy.
+2. **Teach `S3Store` to send `x-goog-*` headers when the endpoint is
+   `storage.googleapis.com`.** That makes the S3 adapter's correctness depend
+   on recognising a hostname. It still needs HMAC keys. And it mixes ETag and
+   generation as tokens inside one type, which is the aliasing ADR-0008 kept
+   out of commit code.
+3. **Make `ExternalStore`'s GCS arm writable.** `ExternalStore` exists to be
+   unable to write. ADR-2040's isolation argument for granted buckets rests
+   on that, and a writable mode on the same type removes it.
+4. **An S3-compatible proxy in front of GCS (s3proxy and similar).** It adds
+   a stateful process in the commit path whose own precondition handling
+   would need qualifying, and it breaks the rule that every compute process
+   is disposable and stateless beside the store.
+
+## Consequences
+
+- Ravel runs on GKE with Workload Identity and a GCS bucket, with no
+  long-lived credentials in its configuration.
+- Commit-protocol, catalog, agents and maintenance code is unchanged. All
+  of it reaches the store through the trait, and the conformance suite is the
+  gate a GCS bucket must pass.
+- CI cannot reach a real bucket. The trait mapping (headers sent, statuses
+  mapped) is tested against an in-process fake endpoint in every CI run. The
+  contract suite runs against a real bucket when `RAVEL_GCS_TEST_BUCKET` is
+  set, the same opt-in shape as the RustFS and floci lanes. That lane also
+  runs the `get_pinned` ordering cases (no object, a replaced generation with
+  a stale ETag, an ETag mismatch on a live generation), because the runtime
+  conformance suite has no pinned-read probe of its own. The first real
+  qualification, from an image built on main, is recorded on #3456 before
+  `--store gcs` is called supported.
+- Persistent formats, the key layout and the qualification record schema are
+  unchanged. `backend_identity` is a free-form string, and `gs://` is a new
+  value of it.
+- GCS's per-object write rate (about one write per second per object name)
+  bounds how often one CAS-mutable key can change. The catalog `HEAD` is
+  written at most once per fold (`--fold-interval-secs`, default 300), far
+  below it. A Ravel Agents HEAD (ADR-3331) is CAS'd once per state
+  transition of one agent, so an agent stepping faster than about once a
+  second on GCS sees throttle retries, counted like any other throttle.
+  Nothing is lost: the CAS either lands or is retried.
+
+## Correction (2026-10-29): GCS's XML listing rewrites names it cannot carry
+
+<!-- amendment-applies: sections="D1. A `GcsStore` backend in ravel-object-store" pointer="XML listing correction" -->
+
+D1 gives, as its second reason for not listing through `object_store`, that
+a name XML 1.0 cannot carry makes the XML listing page unparseable. That is
+not what GCS does. Measured on 2026-10-29 against the same bucket as the
+Context table, with an object named `probe/a<U+0001>b` uploaded through the
+JSON API:
+
+| Listing request | Key returned |
+|---|---|
+| XML `list-type=2`, no `encoding-type` (what `object_store` sends) | `probe/a<U+FFFD>b`, HTTP 200, a well-formed document |
+| XML `list-type=2&encoding-type=url` | `probe/a%01b` |
+| JSON `objects.list` | `probe/a<U+0001>b`, exactly |
+
+So the XML listing that `object_store` uses does not fail the page. It
+reports a key with the character replaced, and that key names an object that
+does not exist. A sweep, a retention pass or a drain acting on it would read
+404 or delete nothing, with no error to say a key was mis-reported. That is
+worse than the page failure D1 described. The decision stands: `GcsStore`
+lists through the JSON API's `objects.list`, which returns names exactly. The
+reason is this one.
+
+The JSON listing also reports a different ETag from the XML API. Its `etag`
+field is not the ETag a HEAD returns. `GcsStore` therefore reports each
+listed object's ETag as the quoted hex of its `md5Hash`, which equals the
+HEAD ETag for an object written in a single upload. Every object Ravel writes
+is a single upload (no longer so; see the multipart amendment below). A
+composite object has no `md5Hash`. Measured the same
+day, its HEAD ETag is a dash followed by its JSON `etag` (JSON
+`COTqrI7f35cDEAE=`, HEAD `"-COTqrI7f35cDEAE="`), so a listed composite is
+reported that way. A listed object with neither field fails the listing call
+rather than being given a guessed ETag. Ravel never composes objects, so the
+composite case can only arise from a foreign object.
+
+D1's page-size sentence holds for `list` and `list_after`, which send the
+configured page size as `maxResults`. A delimited listing (`list_delimited`)
+drains every page in one call, so it sends a fixed `maxResults` of 1000,
+exactly as the S3 lister does for the same case. The contract suite's
+delimited probes therefore finish in one response. The multi-response
+delimited drain is covered by the listing client's own unit tests, not by
+the cross-page probes.
+
+## Amendment (2026-11-04): multipart for maintain (#3802)
+
+<!-- amendment-applies: sections="D1. A `GcsStore` backend in ravel-object-store" pointer="multipart amendment" -->
+<!-- amendment-supersedes: phrase="so no caller needs it" pointer="multipart amendment" -->
+<!-- amendment-supersedes: phrase="Every object Ravel writes is a single upload" pointer="multipart amendment" -->
+
+D1's "Multipart" bullet is replaced. `GcsStore` reports `multipart: true` and
+implements `put_multipart` with the trait's semantics.
+
+**Why.** `--mode maintain` requires multipart: `required_capabilities(Mode::Maintain)`
+adds it to the mandatory set (`services/ravel-server/src/store.rs`), and
+startup refuses a backend that lacks it. D1 judged multipart only as a way to
+write objects too large for one upload, found none, and concluded no caller
+needed it. It did not check the mode-conditional capability gate, which reads
+the declared flag and not whether a caller uploads parts. Today no compactor
+calls `put_multipart` (ravel-maintain writes its outputs with single
+`CreateIfAbsent` puts); the gate is there for the large L1/L2 outputs
+compaction is meant to stream (docs/object-store-contract.md,
+"Mode-conditional capabilities"). So with `multipart: false` a GCS
+deployment had no maintain process, and with none, nothing compacts and
+nothing is garbage-collected.
+
+**Reproduction.** v0.30.0 with `ravel-server --mode maintain --store gcs`
+exits at startup with:
+
+```text
+object store backend does not satisfy mandatory capabilities (unsupported: multipart); refusing to start.
+```
+
+A 3 h logs benchmark on a GCS bucket with no maintain process left 99.9% of
+the bucket's objects as L0 flush objects, median size 0.18 MiB.
+
+**What changed.**
+
+- `put_multipart` uses the GCS XML API's S3-shaped multipart protocol through
+  `object_store`'s GCS client: `POST <key>?uploads` (the response names the
+  `UploadId`), `PUT <key>?partNumber=N&uploadId=X` per part (the part's
+  `ETag` comes back in the response header), `POST <key>?uploadId=X` with a
+  `CompleteMultipartUpload` body listing each part's number and ETag, and
+  `DELETE <key>?uploadId=X` to abort.
+- The handle is `S3Store`'s (`S3MultipartUpload`), shared rather than copied:
+  the checksum pre-flight on each part, the part-sequence rules, poisoning,
+  and abort are the same code on both backends. The one difference is the
+  completed outcome: S3 keeps its ETag as the version, and `GcsStore` takes
+  the version from the complete response's `x-goog-generation` header and
+  the ETag from its `CompleteMultipartUploadResult` body. `S3Store`'s
+  behaviour is unchanged.
+- The in-process fake serves the four requests, assigns a completed upload a
+  generation exactly as it does a PUT, and refuses a short non-final part at
+  completion with `EntityTooSmall`. The contract suite's multipart cases run
+  against `GcsStore` on the fake in every CI run.
+- As on S3, the multipart requests are not counted into `StoreMetrics`, and
+  there is no multipart `CreateIfAbsent` or `CasVersion`.
+
+**Qualification.** Nothing to re-run. The conformance suite
+(`crates/ravel-object-store/src/conformance.rs`, `CONFORMANCE_SUITE_VERSION`
+3) neither probes multipart nor records it in `sys/qualification`; its only
+multipart concern is the informational, non-blocking
+`AbortIncompleteMultipartUpload` lifecycle line, which `GcsStore` cannot
+answer because it has no bucket-protection probes (D6). The maintain gate reads the backend's
+declared capabilities at startup. A bucket qualified under v0.30.0 stays
+qualified, the suite version is not bumped, and an operator upgrades the
+image and starts the maintain process. Two things remain for the operator:
+
+- Configure an `AbortIncompleteMultipartUpload` lifecycle rule of 7 days or
+  less on the bucket, as docs/object-store-contract.md requires of any bucket
+  Ravel writes multipart uploads to. Nothing in Ravel checks it on GCS.
+- To check multipart against real GCS rather than the fake, run the
+  contract lane with `RAVEL_GCS_TEST_BUCKET` set (`cargo test -p
+  ravel-object-store --test contract gcs_contract`).
+
+**Open: listing a multipart object.** Google documents no MD5 for an object
+completed through XML multipart, and its ETag is the S3-style
+`"<digest>-<part count>"` form. `GcsStore`'s listing gives each item the
+ETag HEAD reports from `md5Hash` or `componentCount`, and fails the call on
+an item with neither (see the XML listing correction above). Whether GCS
+lists such an object with a `componentCount` is unmeasured. The fake lists it
+with neither, and `gcs::tests::listing_over_a_multipart_object_fails_the_call`
+pins that the listing then fails. The real-bucket contract lane deletes
+every object its multipart probes complete before its cleanup listing, so it
+does not answer the question either; #3805 tracks a probe that does. Until
+then, an object this path writes may fail a listing over its prefix on real
+GCS. No production writer uses `put_multipart` today
+(above), so no Ravel-written object reaches that listing yet.

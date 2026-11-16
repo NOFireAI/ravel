@@ -1,0 +1,10 @@
+{
+  "wake_list_pages": 1,
+  "dir_list_pages": 1,
+  "head_gets": 2,
+  "hints_read": 1,
+  "hints_deleted": 1,
+  "timers_fired": 1,
+  "agents_loaded": 1,
+  "dir_entries_repaired": 0
+}

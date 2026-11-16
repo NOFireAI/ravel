@@ -1,0 +1,415 @@
+//! Reachability tests for the reconciled MetricsBench report schema (ADR-0927,
+//! issue #936): a malformed artifact must fail through the shipping
+//! `metricsbench_report` binary, not only through a direct
+//! `report_schema::validate` call. The unit tests in `report_schema` prove the
+//! validator; these prove the binary that runs it is the fail-closed gate a
+//! consumer actually hits.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::path::PathBuf;
+use std::process::{Command, Output};
+
+use ravel_bench::promql_corpus::CostClass;
+use ravel_bench::report_schema::{
+    Backend, Comparator, Figure, Hardware, Measurement, MetricsBenchReport, Provenance,
+    ResultStatus, SCHEMA_VERSION,
+};
+
+fn bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_metricsbench_report"))
+}
+
+fn valid_report() -> MetricsBenchReport {
+    MetricsBenchReport {
+        provenance: Provenance {
+            schema_version: 2,
+            ravel_git_commit: "9fc85f421590d360e7979ee167eb38e166b45462".to_string(),
+            toolchain: "rustc 1.90.0".to_string(),
+            protocol: "remote_write_1.0".to_string(),
+            hardware: Hardware {
+                os: "Linux 6.8.0 x86_64".to_string(),
+                cpu_model: "AMD EPYC 7R13".to_string(),
+                logical_cores: 8,
+                instance_type: None,
+            },
+            backend: Backend {
+                store_backend: "s3".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: "n/a".to_string(),
+                backend_bills_requests: true,
+            },
+            comparators: vec![Comparator {
+                name: "prometheus".to_string(),
+                version: "3.13.1".to_string(),
+                image_digest:
+                    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                        .to_string(),
+            }],
+            generator_digest: "blake3:1111".to_string(),
+            corpus_digest: "blake3:2222".to_string(),
+            config: vec![],
+            allocator: ravel_bench::allocator::Allocator::System,
+        },
+        measurements: vec![Measurement {
+            id: "mb_fanout_total_rate".to_string(),
+            class: CostClass::HighFanOut,
+            status: ResultStatus::Ok,
+            figures: vec![
+                Figure {
+                    name: "min_ms".to_string(),
+                    value: 10.0,
+                },
+                Figure {
+                    name: "median_ms".to_string(),
+                    value: 12.5,
+                },
+                Figure {
+                    name: "max_ms".to_string(),
+                    value: 20.0,
+                },
+            ],
+            engine: None,
+            oracle: false,
+            endpoint: None,
+            query_kind: None,
+            refusal_reason: None,
+            error_class: None,
+            incomplete: false,
+            pass_statuses: vec![],
+            reps_per_pass: None,
+            pass_medians_ms: vec![],
+            rel_mad_pct: None,
+        }],
+        geomean_ms: Some(12.5),
+        cases_expected: vec![],
+        denominators: vec![],
+        exclusions: vec![],
+        run_verdict: None,
+        failed_bands: vec![],
+    }
+}
+
+/// A version-3 report as a producer writes it: Ravel answers `mb_a` and
+/// Prometheus, the oracle, answers it too, five passes each.
+fn valid_v3_json() -> serde_json::Value {
+    let mut provenance = serde_json::to_value(valid_report().provenance).expect("serialize");
+    provenance["schema_version"] = serde_json::json!(3);
+    let row = |engine: &str, oracle: bool| {
+        serde_json::json!({
+            "id": "mb_a",
+            "class": "high_fan_out",
+            "status": "ok",
+            "figures": [
+                {"name": "min_ms", "value": 9.0},
+                {"name": "median_ms", "value": 11.0},
+                {"name": "max_ms", "value": 15.0}
+            ],
+            "engine": engine,
+            "oracle": oracle,
+            "endpoint": format!("http://{engine}:9090"),
+            "query_kind": "instant",
+            "pass_statuses": ["ok", "ok", "ok", "ok", "ok"],
+            "reps_per_pass": 3,
+            "pass_medians_ms": [10.0, 12.0, 11.0, 15.0, 9.0],
+            "rel_mad_pct": 100.0 / 11.0
+        })
+    };
+    let den = |engine: &str| {
+        serde_json::json!({
+            "engine": engine, "corpus": 1, "correctness": 1, "timing": 1, "coverage_success": 1
+        })
+    };
+    serde_json::json!({
+        "provenance": provenance,
+        "measurements": [row("ravel", false), row("prometheus", true)],
+        "cases_expected": [
+            {"engine": "ravel", "id": "mb_a", "query_kind": "instant"},
+            {"engine": "prometheus", "id": "mb_a", "query_kind": "instant"}
+        ],
+        "denominators": [den("ravel"), den("prometheus")]
+    })
+}
+
+fn run_validate(dir: &tempfile::TempDir, name: &str, doc: &serde_json::Value) -> Output {
+    let path = dir.path().join(name);
+    std::fs::write(&path, serde_json::to_string_pretty(doc).expect("serialize")).expect("write");
+    Command::new(bin())
+        .args(["validate", path.to_str().expect("utf8 path")])
+        .output()
+        .expect("spawn metricsbench_report")
+}
+
+#[test]
+fn the_validate_subcommand_exits_zero_on_a_report_that_stands() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = run_validate(&dir, "good_v3.json", &valid_v3_json());
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The version-2 shape still validates under its own rules.
+    let v2 = serde_json::to_value(valid_report()).expect("serialize");
+    let out = run_validate(&dir, "good_v2.json", &v2);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn the_validate_subcommand_exits_non_zero_naming_the_failing_rule() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut doc = valid_v3_json();
+    doc["measurements"][0]["endpoint"] = serde_json::json!("in-process");
+    let out = run_validate(&dir, "in_process.json", &doc);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("endpoint `in-process`") && stderr.contains("amendment A"),
+        "the failing rule must be on stderr: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "nothing on stdout for a failing report"
+    );
+
+    let mut doc = valid_v3_json();
+    doc["denominators"][0]["timing"] = serde_json::json!(0);
+    let out = run_validate(&dir, "denominators.json", &doc);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("timing is reported as 0 but the rows give 1"),
+        "{stderr}"
+    );
+}
+
+/// Write a report artifact and run `metricsbench_report render` over it.
+fn render_report(dir: &tempfile::TempDir, name: &str, report: &MetricsBenchReport) -> Output {
+    let path = dir.path().join(name);
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(report).expect("serialize"),
+    )
+    .expect("write");
+    Command::new(bin())
+        .args(["render", "--report", path.to_str().expect("utf8 path")])
+        .output()
+        .expect("spawn metricsbench_report")
+}
+
+#[test]
+fn a_valid_report_renders_through_the_binary_with_the_retry_caveat() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = render_report(&dir, "valid.json", &valid_report());
+    assert!(
+        out.status.success(),
+        "a valid report must render: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The table is derived from the artifact.
+    assert!(stdout.contains("mb_fanout_total_rate"), "{stdout}");
+    assert!(stdout.contains("high_fan_out"), "{stdout}");
+    assert!(
+        stdout.contains("12.500"),
+        "the median figure is rendered: {stdout}"
+    );
+    // The retry caveat is in the rendered output, not only in a doc.
+    assert!(
+        stdout.contains("logical-call counts") && stdout.contains("#928"),
+        "the retry caveat must be rendered: {stdout}"
+    );
+    // A gap with no pre-registered band is a loud SKIP.
+    assert!(
+        stdout.contains("SKIP"),
+        "an unregistered band must render a loud SKIP: {stdout}"
+    );
+}
+
+#[test]
+fn a_report_missing_a_provenance_field_fails_through_the_binary() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut report = valid_report();
+    report.provenance.ravel_git_commit = String::new();
+    let out = render_report(&dir, "missing_field.json", &report);
+    assert!(
+        !out.status.success(),
+        "a blank git commit must fail through the binary"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ravel_git_commit"),
+        "the binary must name the missing field: {stderr}"
+    );
+}
+
+#[test]
+fn a_non_finite_figure_fails_through_the_binary() {
+    // serde_json cannot represent a non-finite number: it serializes NaN as
+    // `null` and rejects an out-of-range literal like `1e999` at parse time. So
+    // a non-finite figure can never reach the validator through a parsed
+    // artifact -- the parser is itself fail-closed against it, which is the
+    // property this proves through the binary. (The validator's own
+    // `NonFiniteFigure` path, reachable when a producer builds the struct
+    // in-process before serializing, is pinned by the `report_schema` unit
+    // test.)
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut report = valid_report();
+    report.geomean_ms = None;
+    // A distinctive sentinel so the textual swap below hits exactly the median
+    // figure and nothing else.
+    report.measurements[0].figures[1].value = 424_242.0;
+    let json = serde_json::to_string_pretty(&report)
+        .expect("serialize")
+        .replace("424242.0", "1e999");
+    let path = dir.path().join("non_finite.json");
+    std::fs::write(&path, json).expect("write");
+    let out = Command::new(bin())
+        .args(["render", "--report", path.to_str().expect("utf8 path")])
+        .output()
+        .expect("spawn");
+    assert!(
+        !out.status.success(),
+        "a non-finite figure must fail through the binary"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not a valid MetricsBench report"),
+        "the binary must reject the out-of-range figure at parse: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn an_unparseable_artifact_fails_through_the_binary() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("garbage.json");
+    std::fs::write(&path, "{ this is not json ]").expect("write");
+    let out = Command::new(bin())
+        .args(["render", "--report", path.to_str().expect("utf8 path")])
+        .output()
+        .expect("spawn");
+    assert!(!out.status.success(), "an unparseable artifact must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not a valid MetricsBench report"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn the_provenance_subcommand_stamps_a_block_a_report_accepts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Any two files: the subcommand digests their contents.
+    let workload = dir.path().join("workload.json");
+    let corpus = dir.path().join("corpus.json");
+    std::fs::write(&workload, r#"{"version":1}"#).expect("write");
+    std::fs::write(&corpus, r#"{"version":1,"entries":[]}"#).expect("write");
+    let out = Command::new(bin())
+        .args([
+            "provenance",
+            "--workload",
+            workload.to_str().expect("utf8 path"),
+            "--corpus",
+            corpus.to_str().expect("utf8 path"),
+            "--store-backend",
+            "s3",
+            "--region",
+            "us-east-1",
+            "--bills-requests",
+            "--config",
+            "max_flush_delay_ms=2000",
+        ])
+        .output()
+        .expect("spawn");
+    assert!(
+        out.status.success(),
+        "provenance must gather and self-validate: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let p: Provenance = serde_json::from_slice(&out.stdout).expect("emitted provenance is JSON");
+    assert_eq!(p.schema_version, SCHEMA_VERSION);
+    assert_eq!(p.backend.store_backend, "s3");
+    assert!(p.backend.backend_bills_requests);
+    assert!(p.generator_digest.starts_with("blake3:"));
+    assert!(p.corpus_digest.starts_with("blake3:"));
+    assert_eq!(p.config.len(), 1);
+    assert_eq!(p.config[0].key, "max_flush_delay_ms");
+    // A different corpus content is a different digest, so the stamp is not
+    // ignoring its inputs.
+    std::fs::write(&corpus, r#"{"version":1,"entries":[1]}"#).expect("rewrite");
+    let out2 = Command::new(bin())
+        .args([
+            "provenance",
+            "--workload",
+            workload.to_str().expect("utf8 path"),
+            "--corpus",
+            corpus.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("spawn");
+    let p2: Provenance = serde_json::from_slice(&out2.stdout).expect("JSON");
+    assert_ne!(p.corpus_digest, p2.corpus_digest);
+}
+
+/// A report that says `run_verdict: "failed"` is a diagnostic of a failed
+/// run, never a result: `validate` refuses it naming the verdict and every
+/// failed band, although the rest of it stands, and `render` prints that
+/// verdict and prints no table. A verdict without failed bands, or failed
+/// bands without the verdict, is refused as inconsistent.
+///
+/// TO SEE THIS FAIL: make `validate`'s `(Some(RunVerdict::Failed), false)`
+/// arm fall through to `validate_body`: the report then validates.
+#[test]
+fn validate_refuses_a_report_with_a_failed_run_verdict() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut doc = valid_v3_json();
+    doc["run_verdict"] = serde_json::json!("failed");
+    doc["failed_bands"] = serde_json::json!([
+        {"band": 6, "check": "readback", "system": "mimir", "reason": "query samples.0 failed: 422"}
+    ]);
+    let out = run_validate(&dir, "failed_run.json", &doc);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("diagnostic of a failed run")
+            && stderr.contains("run_verdict: failed")
+            && stderr.contains("band 6 on mimir: query samples.0 failed: 422"),
+        "{stderr}"
+    );
+    assert!(out.stdout.is_empty());
+
+    let report: MetricsBenchReport = serde_json::from_value(doc).expect("parses");
+    let out = render_report(&dir, "failed_run_render.json", &report);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("run_verdict: failed") && stderr.contains("band 6 on mimir"),
+        "{stderr}"
+    );
+    assert!(out.stdout.is_empty(), "no table for a failed run");
+
+    // Either field without the other is refused as inconsistent.
+    let mut verdict_only = valid_v3_json();
+    verdict_only["run_verdict"] = serde_json::json!("failed");
+    let mut bands_only = valid_v3_json();
+    bands_only["failed_bands"] = serde_json::json!([
+        {"band": null, "check": "stall", "system": "mimir", "reason": "projected 9000 s"}
+    ]);
+    for (name, doc) in [
+        ("verdict_only.json", verdict_only),
+        ("bands_only.json", bands_only),
+    ] {
+        let out = run_validate(&dir, name, &doc);
+        assert_eq!(out.status.code(), Some(1), "{name}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("run_verdict and failed_bands disagree"),
+            "{name}: {stderr}"
+        );
+    }
+}

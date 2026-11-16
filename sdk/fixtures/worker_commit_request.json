@@ -1,0 +1,55 @@
+{
+  "lease": {
+    "agent_id": "19cd0e6876991314c1b6dbd8bd129297",
+    "incarnation": 1,
+    "owner_id": "worker-a",
+    "epoch": 1,
+    "turn_id": "d746246fc5bd6d52e210c7e1883ca81e",
+    "base_state_version": 0,
+    "handler_version": "1.0.0",
+    "handler_digest": "3c20eb97686b101673103ee45ac9cb5f678f30cbee12933adc1f8b0a9868085f",
+    "observed_root_revision": 4
+  },
+  "outcome": "completed",
+  "state": {
+    "items": [
+      "A-1"
+    ],
+    "paid": false
+  },
+  "output": {
+    "total_cents": 1299
+  },
+  "events": [
+    {
+      "event_type": "order_placed",
+      "payload": {
+        "sku": "A-1"
+      }
+    }
+  ],
+  "timers": [
+    {
+      "change": "schedule",
+      "timer_key": "payment-reminder",
+      "due_unix_ns": "1767229200000000000",
+      "handler": "remind",
+      "payload": null
+    },
+    {
+      "change": "cancel",
+      "timer_key": "abandoned-cart"
+    }
+  ],
+  "intents": [
+    {
+      "intent_key": "send-receipt",
+      "tool_name": "mail.send",
+      "tool_version": "1",
+      "policy": "provider_idempotency",
+      "input": {
+        "to": "buyer"
+      }
+    }
+  ]
+}

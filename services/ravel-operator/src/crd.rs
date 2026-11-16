@@ -1,0 +1,4008 @@
+//! The `RavelCluster` custom resource (ADR-0034 decision 2).
+//!
+//! Group `ravel.nofire.ai`, version `v1alpha1`, namespaced, with a status
+//! subresource. The spec is built entirely from plain Rust types and a few
+//! small local structs, never from `k8s-openapi` API types: the reconcile
+//! layer ([`crate::reconcile`]) maps this spec into the actual Kubernetes
+//! objects. Keeping `k8s-openapi` types out of the schema-derived spec avoids
+//! coupling the CRD's `schemars` derivation to `k8s-openapi`'s optional
+//! `schemars` support, which tracks a different `schemars` major.
+
+use std::collections::BTreeMap;
+
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
+    CustomResourceDefinition, JSONSchemaProps, JSONSchemaPropsOrArray, ValidationRule,
+};
+use kube::CustomResource;
+use kube::CustomResourceExt;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+/// `RavelCluster` spec. Each field maps onto `ravel-server`'s real CLI surface
+/// (`services/ravel-server/src/config.rs`); the memory store is deliberately
+/// unrepresentable (ADR-0034 decision 2), so exactly one of `storage.s3` and
+/// `storage.azure` is required.
+#[derive(CustomResource, Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[kube(
+    group = "ravel.nofire.ai",
+    version = "v1alpha1",
+    kind = "RavelCluster",
+    namespaced,
+    status = "RavelClusterStatus",
+    shortname = "rc",
+    derive = "PartialEq"
+)]
+#[serde(rename_all = "camelCase")]
+pub struct RavelClusterSpec {
+    /// Container image for every mode's pod (`ravel-server`).
+    pub image: String,
+
+    /// Image pull policy (`Always`, `IfNotPresent`, `Never`). Defaults to the
+    /// Kubernetes default (`IfNotPresent`, or `Always` for a `:latest` tag)
+    /// when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_pull_policy: Option<String>,
+
+    /// Shard count, rendered into `--shards` for gateway, query, and maintain
+    /// alike so the must-match invariant is unrepresentable to break
+    /// (ADR-0034 decision 2). Immutable after creation, enforced by a CEL
+    /// transition rule on this field's schema (see [`ravel_cluster_crd`]).
+    pub shards: u32,
+
+    /// Object storage backend: exactly one of `s3` and `azure`. A
+    /// per-process memory store is incoherent across pods (ADR-0034
+    /// decision 2).
+    pub storage: StorageSpec,
+
+    /// Secret whose keys are tenant names and whose values are the bearer
+    /// tokens for those tenants. The operator renders `--tenant-token
+    /// $(VAR)=<tenant>` using kubelet `$(VAR)` expansion so token values never
+    /// appear in the Pod spec.
+    ///
+    /// WARNING: `ravel-server`'s `parse_tenant_tokens`
+    /// (`services/ravel-server/src/config.rs`) splits each `--tenant-token`
+    /// argument on the FIRST `=` via `str::split_once('=')`. A token VALUE that
+    /// contains `=` is therefore mis-parsed (the suffix after the first `=` is
+    /// taken as part of the tenant, not the token). This is pre-existing
+    /// behavior in a different crate, out of this operator's scope to change;
+    /// choose token values without `=` until a native token source lands.
+    ///
+    /// The rendered pair carries neither a capability suffix nor a
+    /// `subject=LABEL` entry, since a Secret key admits no `;`; issue #3580
+    /// tracks a CRD field for them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_tokens_secret_ref: Option<LocalSecretRef>,
+
+    /// Secret with a single key `key` holding the deployment's 32-byte
+    /// deployment key (64 hex characters or 32 raw bytes, the same format
+    /// `--tenant-hash-key-file` reads). This one key doubles as the v2-keyed
+    /// tenant-hash key and the `sys/auth` token-hashing key (ADR-0072
+    /// decision 4): when set, the operator mounts it and renders
+    /// `--tenant-hash-key-file` instead of `--tenant-hash-unkeyed`, and
+    /// reconciles `sys/auth` from `tenantTokensSecretRef` each cycle. Additive
+    /// opt-in, not a migration of existing unkeyed clusters; omit to keep
+    /// unkeyed behavior unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_key_secret_ref: Option<LocalSecretRef>,
+
+    /// Secret with a single key `key` holding 64 hex characters, the
+    /// query-audit token key the query tier reads as
+    /// `RAVEL_AUDIT_TOKEN_KEY` (#1487). Query tier only: gateway and
+    /// maintain never read a query-audit token. The query tier reads the key
+    /// only when `RAVEL_AUDIT_MODE` is `required` or `best-effort`; the
+    /// query audit is off by default since #2791. Omit on a cluster with
+    /// `deploymentKeySecretRef` set -- the server derives the key from the
+    /// deployment key. Omitting both leaves the query tier unable to start
+    /// audit tokenization: the operator does not generate this Secret
+    /// (issue #126's `secrets get`-only posture forbids the create/patch
+    /// that would need), so a cluster with neither ref set reports
+    /// `AuditTokenKeyMissing` and its query tier's Deployment is left as it
+    /// is until this field is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_token_key_secret_ref: Option<LocalSecretRef>,
+
+    /// Gateway (ingest + query API) tier.
+    #[serde(default)]
+    pub gateway: GatewaySpec,
+
+    /// Query tier.
+    #[serde(default)]
+    pub query: QuerySpec,
+
+    /// Background maintenance tier (compaction, retention, GC). Defaults to a
+    /// single replica; the bounded multi-worker ownership protocol (ADR-0065)
+    /// makes `replicas > 1` safe, superseding ADR-0034's single-replica
+    /// guidance.
+    #[serde(default)]
+    pub maintain: MaintainSpec,
+
+    /// Liveness and readiness probe wiring for the rendered `ravel-server`
+    /// pods (ADR-1702 decision 10). Omitting the block is the same as
+    /// `dedicatedHealthPort: true`: both probes go to the dedicated health
+    /// listener on 4316.
+    #[serde(default)]
+    pub probes: ProbesSpec,
+
+    /// Garbage-collection horizons that must match the bucket's stored `sys/gc`
+    /// values. Only the maintain tier validates against `sys/gc`, so these
+    /// render onto the maintain Deployment. Omit the whole block, or either
+    /// field, to render no flag and let the server's compiled-in default apply,
+    /// byte-identical to a cluster that never set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gc: Option<GcSpec>,
+
+    /// Age-based retention: a default window plus per-tenant overrides. Enforced
+    /// only by the maintain tier, so these render onto the maintain Deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionSpec>,
+
+    /// Per-tenant shard-count overrides (#147, ADR-0076 decision 2): the
+    /// primary operator-facing cost control, wired to the already-shipped
+    /// ADR-0052 online-resharding mechanism. Distinct from the immutable,
+    /// cluster-wide `shards` field above: this drives a durable
+    /// `append_generation` call per named tenant, never a Deployment
+    /// `--shards` flag, and does not relax `shards`'s own CEL immutability
+    /// rule (see [`ravel_cluster_crd`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_overrides: Option<ShardOverridesSpec>,
+}
+
+/// Reference to a Secret in the same namespace as the `RavelCluster`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalSecretRef {
+    /// Name of the Secret.
+    pub name: String,
+}
+
+/// Object storage configuration: exactly one backend, enforced by a CEL rule
+/// on this object (see [`ravel_cluster_crd`]) and again at render time.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageSpec {
+    /// S3 (or S3-compatible) backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3: Option<S3Spec>,
+
+    /// Azure Blob Storage backend, authenticated through AKS workload
+    /// identity (ADR-4158 D11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure: Option<AzureSpec>,
+}
+
+/// The one backend a valid [`StorageSpec`] names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageBackend<'a> {
+    S3(&'a S3Spec),
+    Azure(&'a AzureSpec),
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+impl StorageSpec {
+    /// `storage.s3` of a spec a test built with it.
+    pub(crate) fn test_s3(&self) -> &S3Spec {
+        self.s3.as_ref().expect("the test spec sets storage.s3")
+    }
+
+    pub(crate) fn test_s3_mut(&mut self) -> &mut S3Spec {
+        self.s3.as_mut().expect("the test spec sets storage.s3")
+    }
+}
+
+impl StorageSpec {
+    /// The configured backend, or `None` when neither or both are set.
+    pub fn backend(&self) -> Option<StorageBackend<'_>> {
+        match (&self.s3, &self.azure) {
+            (Some(s3), None) => Some(StorageBackend::S3(s3)),
+            (None, Some(azure)) => Some(StorageBackend::Azure(azure)),
+            _ => None,
+        }
+    }
+}
+
+/// Azure Blob Storage backend (ADR-4158 D11). Renders `--store azure
+/// --azure-account --azure-container` on every tier. There is no endpoint
+/// and no secret reference: every pod authenticates through AKS workload
+/// identity. The operator creates the ServiceAccounts `<name>-gateway`,
+/// `<name>-query`, `<name>-maintain` and `<name>-qualify`, each annotated
+/// with `azure.workload.identity/client-id`, and labels every tier pod and
+/// the store-qualification Job `azure.workload.identity/use: "true"`. The
+/// federated credential for each ServiceAccount, and one for the operator's
+/// own, is created outside Ravel. The account must have a flat namespace
+/// (hierarchical namespace off). The per-tier `credentialsSecretRef`
+/// overrides are refused. `--require-bucket-protection` is not rendered:
+/// the status condition `BucketProtectionVerified` is `False` with reason
+/// `NotImplementedForAzure`, and blob versioning with a lifecycle rule that
+/// deletes previous versions, and soft delete with a bounded retention, are
+/// configured by hand.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureSpec {
+    /// Storage account (`--azure-account`): 3 to 24 lowercase letters and
+    /// digits.
+    pub account: String,
+
+    /// Container (`--azure-container`): 3 to 63 lowercase letters, digits and
+    /// single hyphens, starting and ending with a letter or digit.
+    pub container: String,
+
+    /// Client ID (a UUID) of the user-assigned managed identity a role's
+    /// ServiceAccount is annotated with, unless `roleClientIds` names one for
+    /// that role. A pod keeps the identity it was admitted with, so changing
+    /// a tier's client ID rolls that tier's pods, and changing the `qualify`
+    /// role's client ID re-runs store qualification.
+    pub client_id: String,
+
+    /// Per-role client IDs, one managed identity per role with its own role
+    /// assignment on the container (ADR-0055's per-role scoping on Azure).
+    /// A role left unset uses `clientId`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_client_ids: Option<AzureRoleClientIds>,
+}
+
+impl AzureSpec {
+    /// The client ID the `role` ServiceAccount (`gateway`, `query`,
+    /// `maintain` or `qualify`) is annotated with.
+    pub fn client_id_for(&self, role: &str) -> &str {
+        let ids = self.role_client_ids.as_ref();
+        let role_id = match role {
+            "gateway" => ids.and_then(|ids| ids.gateway.as_deref()),
+            "query" => ids.and_then(|ids| ids.query.as_deref()),
+            "maintain" => ids.and_then(|ids| ids.maintain.as_deref()),
+            "qualify" => ids.and_then(|ids| ids.qualify.as_deref()),
+            _ => None,
+        };
+        role_id.unwrap_or(&self.client_id)
+    }
+}
+
+/// `storage.azure.roleClientIds`: a managed identity client ID per role.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureRoleClientIds {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintain: Option<String>,
+    /// The store-qualification Job's identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualify: Option<String>,
+}
+
+/// S3 backend configuration. `bucket`/`region`/`endpoint`/`allowHttp`/
+/// `uploadIntegrity`/`requestStoredChecksum` render as CLI flags. Under
+/// `auth: static` credentials are injected as env vars from a Secret via
+/// `valueFrom`, never as literal flag values (ADR-0034 decision 2); under
+/// `auth: podIdentity` no Secret is read and a credentials sidecar writes a
+/// short-lived credentials file instead (ADR-0034, Pod Identity storage
+/// credentials amendment).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct S3Spec {
+    /// Bucket name (`--s3-bucket`).
+    pub bucket: String,
+
+    /// AWS region (`--s3-region`). Defaults to `us-east-1`.
+    #[serde(default = "default_region")]
+    pub region: String,
+
+    /// Custom endpoint (`--s3-endpoint`) for S3-compatible backends such as
+    /// RustFS or floci. Omit for real AWS S3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+
+    /// Accept a plaintext `http://` `endpoint` whose host is not loopback
+    /// (`--s3-allow-http`). A pod never reaches its object store over
+    /// loopback, so an in-cluster RustFS or floci addressed by Service name
+    /// needs this. Without it the operator refuses to render the cluster at
+    /// all: the `RavelCluster` gets a `Degraded` condition with reason
+    /// `PlaintextS3Endpoint` naming this field, and no Deployment, Service, or
+    /// qualification Job is created, rather than moving telemetry and S3
+    /// credentials across the cluster network in the clear. The same rule
+    /// governs the operator's own S3 client (the one that reconciles
+    /// `sys/auth` and applies `shardOverrides`), the rendered server
+    /// containers, and the `ravel-cli store qualify` Job, all from one
+    /// decision. Setting it re-runs store qualification, because it changes
+    /// whether that check can reach the store. Leave false (the default) for
+    /// any `https://` endpoint and for real AWS S3: there it is inert, since
+    /// an `https://` endpoint never permits a downgrade.
+    #[serde(default)]
+    pub allow_http: bool,
+
+    /// Server-verified checksum attached to every PUT
+    /// (`--s3-upload-integrity`): `crc64nvme` (the default), `sha256`, or
+    /// `off`. The endpoint verifies each upload against it and stores it so
+    /// a full-object read can be verified. Set `off` only for an endpoint that
+    /// rejects the checksum header, which fails every PUT from the first flush.
+    /// Applies to the rendered server containers, the store qualification
+    /// Job, and the operator's own S3 client. The server flag is rendered only
+    /// when it differs from the default, which the server applies on its own.
+    /// The qualification Job PUTs with the same checksum, so an endpoint that
+    /// rejects the header fails qualification, and changing this field
+    /// re-runs it.
+    #[serde(default)]
+    pub upload_integrity: S3UploadIntegrity,
+
+    /// Ask the endpoint to return the checksum it stored at upload so a
+    /// full-object read is verified before it is served
+    /// (`--s3-request-stored-checksum`). Defaults to true. Set false only for
+    /// an endpoint that rejects the request header: every full-object read is
+    /// then counted in `ravel_store_get_unverified_total`. The server flag is
+    /// rendered only when false. The store qualification Job requests the
+    /// stored checksum under the same setting, and changing this field
+    /// re-runs it.
+    #[serde(default = "default_true")]
+    pub request_stored_checksum: bool,
+
+    /// Where every pod and the operator get their storage credentials:
+    /// `static` (the default) or `podIdentity`.
+    ///
+    /// `static`: the static key pair in `credentialsSecretRef` (and the
+    /// per-tier `credentialsSecretRef` overrides), injected as env vars.
+    ///
+    /// `podIdentity`: EKS Pod Identity, with no key in any Secret. Only EKS
+    /// Pod Identity is supported; IRSA (web identity) is not. The operator
+    /// creates the ServiceAccounts `<name>-gateway`, `<name>-query`,
+    /// `<name>-maintain` and `<name>-qualify` in this namespace and runs the
+    /// three tiers and the store-qualification Job as them; the cluster's
+    /// Pod Identity associations must name these four, each with the role
+    /// for that tier. The webhook then injects
+    /// `AWS_CONTAINER_CREDENTIALS_FULL_URI` and
+    /// `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`, and a native sidecar
+    /// (`ravel-operator pod-identity-credentials`, the operator's own image,
+    /// set by its `--credentials-sidecar-image` flag) keeps a credentials
+    /// file on a memory-backed volume at
+    /// `/var/run/ravel/aws/credentials.json`, which the server reads through
+    /// `--s3-credentials-file`. `RAVEL_S3_ACCESS_KEY` and
+    /// `RAVEL_S3_SECRET_KEY` are set to the literal
+    /// `unused-credentials-file-wins`: the binaries still require both under
+    /// `--s3-auth static` and the file overrides them. The operator's own
+    /// ServiceAccount (`ravel-system/ravel-operator` in the shipped
+    /// manifests) needs an association too, for its `sys/auth` and reshard
+    /// writes. The pods need egress to the agent at `169.254.170.23:80`.
+    /// `credentialsSecretRef` is not read and the per-tier overrides are
+    /// refused under this mode, and the maintain-first `sys/gc` bootstrap
+    /// hold applies.
+    /// Switching modes re-runs store qualification.
+    #[serde(default)]
+    pub auth: S3AuthSpec,
+
+    /// Secret with keys `accessKeyId` and `secretAccessKey`, injected as the
+    /// `RAVEL_S3_ACCESS_KEY` / `RAVEL_S3_SECRET_KEY` env vars. Required under
+    /// `auth: static`; not read under `auth: podIdentity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_secret_ref: Option<LocalSecretRef>,
+}
+
+/// The `storage.s3.auth` values.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum S3AuthSpec {
+    /// A static key pair from `credentialsSecretRef`. The default.
+    #[default]
+    Static,
+    /// EKS Pod Identity through the operator's credentials sidecar.
+    PodIdentity,
+}
+
+impl S3AuthSpec {
+    /// The value as the CRD spells it.
+    pub fn spelling(self) -> &'static str {
+        match self {
+            S3AuthSpec::Static => "static",
+            S3AuthSpec::PodIdentity => "podIdentity",
+        }
+    }
+}
+
+/// The `uploadIntegrity` values, spelled exactly as `ravel-server`'s
+/// `--s3-upload-integrity` values.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum S3UploadIntegrity {
+    /// Attach no checksum.
+    Off,
+    /// Attach `x-amz-checksum-crc64nvme`. The default.
+    #[default]
+    Crc64Nvme,
+    /// Attach `x-amz-checksum-sha256`; verified on upload, and a read of an
+    /// object stored with it is counted unverified.
+    Sha256,
+}
+
+impl S3UploadIntegrity {
+    /// The `--s3-upload-integrity` value this selects.
+    pub fn flag_value(self) -> &'static str {
+        match self {
+            S3UploadIntegrity::Off => "off",
+            S3UploadIntegrity::Crc64Nvme => "crc64nvme",
+            S3UploadIntegrity::Sha256 => "sha256",
+        }
+    }
+
+    /// The library-level mode the operator's own S3 client is built with.
+    pub fn mode(self) -> ravel_object_store::s3::UploadIntegrity {
+        match self {
+            S3UploadIntegrity::Off => ravel_object_store::s3::UploadIntegrity::Off,
+            S3UploadIntegrity::Crc64Nvme => ravel_object_store::s3::UploadIntegrity::Crc64Nvme,
+            S3UploadIntegrity::Sha256 => ravel_object_store::s3::UploadIntegrity::Sha256,
+        }
+    }
+}
+
+/// Gateway tier: replicas, resources, and optional fold tuning.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewaySpec {
+    /// Replica count for the gateway Deployment.
+    #[serde(default = "default_replicas")]
+    pub replicas: i32,
+
+    /// Container resource requests/limits. Omit to render the default request
+    /// of `100m` CPU / `256Mi` memory and no limits
+    /// ([`GATEWAY_DEFAULT_CPU_REQUEST`], [`GATEWAY_DEFAULT_MEMORY_REQUEST`]).
+    /// An explicit block here replaces the default entirely rather than
+    /// merging with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceRequirementsSpec>,
+
+    /// Per-role S3 credential override for the gateway tier (ADR-0055 section 5).
+    /// When set, the gateway Deployment sources `RAVEL_S3_ACCESS_KEY` /
+    /// `RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /
+    /// `secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`,
+    /// so an operator can scope the gateway to a narrower IAM credential. Falls
+    /// back to the shared credential when unset, so existing single-credential
+    /// clusters are unaffected.
+    /// Refused under `storage.s3.auth: podIdentity`, where the tier's role
+    /// comes from its ServiceAccount's Pod Identity association.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_secret_ref: Option<LocalSecretRef>,
+
+    /// Retired by ADR-1693: the scheduled fold moved to the maintain tier, and
+    /// `ravel-server` now refuses either fold flag in `--mode gateway`. The
+    /// field is still parsed so a cluster that sets it gets a `Degraded`
+    /// condition naming `maintain.fold` instead of having its setting dropped
+    /// on the floor. Set `maintain.fold` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fold: Option<FoldSpec>,
+
+    /// Layer-7 ingest affinity (ADR-0076 decision 1). Omit to keep today's
+    /// behavior exactly: no Ingress is rendered and ingest traffic reaches the
+    /// gateway Service however the platform owner already routes it.
+    ///
+    /// Ingest buffers are per `(tenant, signal, shard)` PER REPLICA, so a
+    /// tenant whose writes spray across every gateway replica pays one
+    /// age-triggered flush stream per replica for the same data. Pinning a
+    /// tenant to a stable subset divides that term. Affinity is best-effort:
+    /// `writer_id` and `epoch` already disambiguate concurrent writers in the
+    /// object key, so a reroute is always correct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_affinity: Option<IngestAffinitySpec>,
+
+    /// Gateway API exposure (ADR-0080 decision 2), independent of
+    /// [`GatewaySpec::ingest_affinity`]. Omit to keep today's behavior exactly:
+    /// no `HTTPRoute`/`GRPCRoute` is rendered and exposure for a plain
+    /// deployment stays entirely user-managed outside Ravel.
+    ///
+    /// Unlike `ingest_affinity`, this renders standard
+    /// `gateway.networking.k8s.io` routes onto a user-provided `Gateway`; it can
+    /// be set with affinity disabled (plain routing, no tenant pinning) or
+    /// combined with `backend: ravelNative`. It cannot be combined with an
+    /// enabled `ingestAffinity` on `backend: ingressNginx`: the Gateway API path
+    /// and the annotation-driven Ingress path are two independent routes to the
+    /// same Service, so traffic on the Gateway API route would bypass the nginx
+    /// subset annotations entirely. That combination is rejected at admission by
+    /// a CEL rule attached to the `gateway` object (see [`ravel_cluster_crd`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure: Option<GatewayExposureSpec>,
+
+    /// Per-shard cross-tenant flush isolation bound (`--max-inflight-flushes`).
+    /// It caps how many flushes a shard actor runs at once, so one tenant's
+    /// stalled flush cannot block co-resident tenants beyond this many permits.
+    /// Ingest runs only in the gateway tier (the query and maintain modes never
+    /// enter the ingest path), so this is a gateway-only field.
+    /// Omit to keep `ravel-server`'s own default of 8 (ADR-2708 D3). The CRD
+    /// schema enforces a minimum of 1 at admission: `ravel-server` rejects 0
+    /// as a flush deadlock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight_flushes: Option<u32>,
+
+    /// How many of a shard's flush permits one tenant may hold or wait on at
+    /// once (`--max-inflight-flushes-per-tenant`, ADR-2708 D3). Omit to keep
+    /// `ravel-server`'s own default of `max(1, maxInflightFlushes - 1)`, which
+    /// leaves a permit for co-resident tenants whenever there is more than
+    /// one. Gateway-only, like `maxInflightFlushes`. The CRD schema enforces a
+    /// minimum of 1 at admission, and a CEL rule on `gateway` refuses a value
+    /// above `maxInflightFlushes` (8 when that is omitted), which
+    /// `ravel-server` would otherwise reject at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight_flushes_per_tenant: Option<u32>,
+}
+
+impl Default for GatewaySpec {
+    fn default() -> Self {
+        Self {
+            replicas: default_replicas(),
+            resources: None,
+            credentials_secret_ref: None,
+            fold: None,
+            ingest_affinity: None,
+            exposure: None,
+            max_inflight_flushes: None,
+            max_inflight_flushes_per_tenant: None,
+        }
+    }
+}
+
+/// Ravel-owned exposure for the gateway tier (ADR-0080 decision 2), separate
+/// from ingest affinity.
+///
+/// A single wrapper struct so a later exposure mechanism (an alternative to
+/// Gateway API) becomes a new sibling field here rather than another optional
+/// on `GatewaySpec`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayExposureSpec {
+    /// Gateway API (`gateway.networking.k8s.io`) exposure: the operator renders
+    /// one `HTTPRoute` and, when `grpc` is true, one `GRPCRoute` attached to an
+    /// existing `Gateway`. Omit for no Gateway API routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_api: Option<GatewayApiExposureSpec>,
+}
+
+/// Gateway API exposure config (ADR-0080 decision 2).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayApiExposureSpec {
+    /// The existing `Gateway` the rendered routes attach to via `parentRefs`.
+    pub gateway_ref: GatewayReference,
+
+    /// Hostnames the rendered routes answer on. Empty renders routes with no
+    /// `hostnames`, which match every hostname the parent `Gateway`'s listeners
+    /// accept.
+    #[serde(default)]
+    pub hostnames: Vec<String>,
+
+    /// Also render a `GRPCRoute` for OTLP/gRPC (port 4317). Defaults to true,
+    /// mirroring [`IngestAffinitySpec::grpc`]: gRPC is the main OTLP ingest
+    /// path.
+    #[serde(default = "default_true")]
+    pub grpc: bool,
+}
+
+/// Reference to an existing `Gateway` (`gateway.networking.k8s.io`) the rendered
+/// routes attach to.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayReference {
+    /// Name of the `Gateway`.
+    pub name: String,
+
+    /// Namespace of the `Gateway`. Defaults to the `RavelCluster`'s own
+    /// namespace when omitted (Gateway API resolves an omitted `parentRefs`
+    /// namespace to the route's own namespace, which the operator renders into
+    /// the `RavelCluster`'s namespace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
+/// Layer-7 ingest affinity for the gateway tier (ADR-0076 decision 1).
+///
+/// The operator renders an Ingress (two, when `grpc` is on) carrying
+/// ingress-nginx's consistent-hash annotations
+/// (`nginx.ingress.kubernetes.io/upstream-hash-by` plus its subset pair). The
+/// hash key is tenant identity taken from authentication material, never from
+/// the URL path: OTLP connections are long-lived and Ravel resolves tenancy
+/// server-side from the credential, so a path-based rule cannot see the tenant.
+///
+/// This deliberately does NOT use the core Service `sessionAffinity: ClientIP`
+/// field. That keys on the client's source address, which is the collector's or
+/// the gateway proxy's address rather than the tenant's, and would look like
+/// affinity while pinning the wrong thing.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestAffinitySpec {
+    /// Whether affinity is active. Defaults to true, so declaring the block is
+    /// enough. Set it to false to turn affinity off during an incident without
+    /// deleting the rest of the configuration; the Ingress objects are then
+    /// removed and rendering returns to the affinity-absent baseline.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Which implementation carries out the pinning (ADR-0080 decision 1).
+    /// Defaults to [`AffinityBackend::IngressNginx`], so a CR written before
+    /// this field existed keeps the backend it already runs, with the same
+    /// `subsetSize` and `key` semantics.
+    ///
+    /// `ingressNginx` is deprecated: ingress-nginx is retiring upstream, and a
+    /// cluster using it gets an `IngestAffinityBackendDeprecated` condition on
+    /// its `RavelCluster` status.
+    #[serde(default)]
+    pub backend: AffinityBackend,
+
+    /// Container image for the `ravel-ingest-router` Deployment rendered under
+    /// [`AffinityBackend::RavelNative`] (ADR-0080 decision 3).
+    ///
+    /// The router is a DIFFERENT binary from `spec.image` (which is
+    /// `ravel-server`), so its image cannot be derived from `spec.image` and is
+    /// named explicitly here. Deriving it by string-manipulating `spec.image`
+    /// would be fragile: an image reference host can carry a port
+    /// (`localhost:5000/ravel-server:v1`), so any split-on-`:` guess breaks.
+    ///
+    /// Required when `backend: ravelNative`: the operator surfaces a `Degraded`
+    /// status condition (reason `RouterImageMissing`) and renders no router
+    /// objects when it is absent, rather than a Deployment with an empty
+    /// `image:` that would never schedule. Has no effect under
+    /// `backend: ingressNginx`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_image: Option<String>,
+
+    /// How many replicas a tenant's traffic is pinned to. Defaults to
+    /// [`DEFAULT_AFFINITY_SUBSET_SIZE`] (two), not one, so a single replica
+    /// loss does not concentrate a tenant on one process.
+    ///
+    /// A subset is a throughput ceiling by construction: a tenant can use at
+    /// most `subsetSize` gateway replicas no matter how many the Deployment
+    /// runs. Raise it for a high-volume tenant (see
+    /// `docs/guides/ingest-affinity.md`); the request-cost divisor is
+    /// `replicas / subsetSize`.
+    ///
+    /// This is a per-cluster setting, not per-tenant: ingress-nginx's subset
+    /// size is one number per Ingress. A tenant needing a materially larger
+    /// subset than its siblings belongs in its own `RavelCluster`.
+    #[serde(default = "default_subset_size")]
+    pub subset_size: u32,
+
+    /// Where the load balancer reads tenant identity from. Defaults to the
+    /// `Authorization` header, which is what Ravel itself resolves tenancy
+    /// from.
+    #[serde(default)]
+    pub key: AffinityKeySpec,
+
+    /// `spec.ingressClassName` on the rendered Ingress objects. Omit to let the
+    /// cluster's default IngressClass apply.
+    ///
+    /// Legacy `backend: ingressNginx` only. Has no effect under
+    /// `backend: ravelNative`, and no effect on `gateway.exposure.gatewayApi`
+    /// routing (Gateway API attachment goes through `exposure.gatewayApi
+    /// .gatewayRef` instead, ADR-0080 decision 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_class_name: Option<String>,
+
+    /// Hostnames the ingest Ingress answers on. Empty renders a single
+    /// host-less rule, which matches any host reaching the controller.
+    ///
+    /// Legacy `backend: ingressNginx` only. `gateway.exposure.gatewayApi
+    /// .hostnames` is the equivalent field for Gateway API exposure; the two
+    /// are independent and neither reads the other.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+
+    /// TLS Secret for `spec.tls` on the rendered Ingress objects. Strongly
+    /// recommended and effectively required for the gRPC Ingress: ingress-nginx
+    /// serves HTTP/2 to clients over TLS, and OTLP/gRPC needs HTTP/2. Tenant
+    /// tokens are bearer tokens, so plaintext ingest exposes them.
+    ///
+    /// Legacy `backend: ingressNginx` only. Gateway API exposure terminates
+    /// TLS at the referenced `Gateway`'s own listener, which this operator
+    /// does not render; configure `tls.certificateRefs` on that Gateway
+    /// directly (ADR-0080 decision 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_secret_name: Option<String>,
+
+    /// Also render a second Ingress for OTLP/gRPC (port 4317) carrying
+    /// `nginx.ingress.kubernetes.io/backend-protocol: GRPC`. Defaults to true:
+    /// gRPC is the main OTLP ingest path, and affinity that covers only
+    /// OTLP/HTTP would miss most of the traffic generating the request bill.
+    /// A separate object is required because `backend-protocol` is per-Ingress.
+    #[serde(default = "default_true")]
+    pub grpc: bool,
+
+    /// Extra annotations merged onto both rendered Ingress objects, for an
+    /// ingress controller other than ingress-nginx or for tuning
+    /// (`nginx.ingress.kubernetes.io/proxy-body-size` is the common one: the
+    /// ingress-nginx default of 1m rejects larger OTLP/HTTP payloads).
+    ///
+    /// The affinity annotations the operator computes are applied AFTER this
+    /// map, so an entry here can never silently disable the affinity it is
+    /// meant to configure.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub annotations: BTreeMap<String, String>,
+}
+
+impl Default for IngestAffinitySpec {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            backend: AffinityBackend::default(),
+            router_image: None,
+            subset_size: default_subset_size(),
+            key: AffinityKeySpec::default(),
+            ingress_class_name: None,
+            hosts: Vec::new(),
+            tls_secret_name: None,
+            grpc: default_true(),
+            annotations: BTreeMap::new(),
+        }
+    }
+}
+
+/// Which implementation carries out subset pinning (ADR-0080 decision 1).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum AffinityBackend {
+    /// Render ingress-nginx `Ingress` objects carrying the
+    /// `upstream-hash-by-subset` annotation family. The default, so an existing
+    /// CR that never set `backend` keeps running exactly what it runs today.
+    ///
+    /// Deprecated: ingress-nginx is retiring upstream. A cluster on this
+    /// backend gets an `IngestAffinityBackendDeprecated` condition on its
+    /// status; migrate to [`AffinityBackend::RavelNative`] or to an equivalent
+    /// Gateway API exposure (`docs/guides/ingest-affinity.md`).
+    #[default]
+    IngressNginx,
+
+    /// Ravel's own subset router: deterministic rendezvous-hash selection over
+    /// the gateway's live endpoints, independent of which ingress or Gateway
+    /// implementation terminates the connection.
+    RavelNative,
+}
+
+/// Which piece of authentication material the load balancer hashes to identify
+/// a tenant.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AffinityKeySpec {
+    /// The identity source. Defaults to
+    /// [`AffinityKeySource::AuthorizationHeader`].
+    #[serde(default)]
+    pub source: AffinityKeySource,
+
+    /// Header name when `source` is `header`. Required in that case, enforced
+    /// by a CEL rule on this object (see [`ravel_cluster_crd`]), and
+    /// constrained to HTTP token characters by an OpenAPI `pattern` so nothing
+    /// user-supplied can reach the rendered nginx directive as syntax.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_name: Option<String>,
+}
+
+/// The identity source behind [`AffinityKeySpec`].
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum AffinityKeySource {
+    /// Hash the `Authorization` header (nginx `$http_authorization`). This is
+    /// the credential Ravel itself resolves tenancy from, so it is stable per
+    /// tenant with no extra client configuration. Two consequences worth
+    /// knowing: a tenant using several distinct tokens hashes to several
+    /// subsets, and rotating a token moves that tenant to a new subset.
+    #[default]
+    AuthorizationHeader,
+
+    /// Hash a named header (`headerName`), e.g. a tenant header a trusted
+    /// upstream proxy stamps. Only use this when that header cannot be set by
+    /// the client, or a tenant can choose its own subset.
+    Header,
+
+    /// Hash the mTLS client certificate subject (nginx `$ssl_client_s_dn`).
+    /// Requires the ingress controller to terminate TLS with client-certificate
+    /// authentication configured; the variable is empty otherwise, which
+    /// collapses every tenant onto one subset.
+    MtlsSubject,
+
+    /// Hash the canonical `TenantId` resolved by the `ravel-tenant-resolve`
+    /// auth chain (ADR-0080 decision 3), immune to bearer-token rotation unlike
+    /// hashing the raw `Authorization` header.
+    ///
+    /// Only meaningful under [`AffinityBackend::RavelNative`]: ingress-nginx has
+    /// no way to run the tenant-resolution chain, so this key source combined
+    /// with `backend: ingressNginx` is rejected at admission by a CEL rule on
+    /// the `ingestAffinity` object (see [`ravel_cluster_crd`]).
+    ///
+    /// Requires a resolver: `ravel-ingest-router` refuses to start under
+    /// `canonical-tenant` unless at least one resolver is configured. The only
+    /// resolver surface this CRD exposes today is `tenantTokensSecretRef`;
+    /// selecting `canonicalTenant` without it makes the operator surface a
+    /// `Degraded` condition (reason `CanonicalTenantResolverMissing`) and render
+    /// no router objects, rather than a Deployment that would crashloop.
+    CanonicalTenant,
+}
+
+/// Catalog fold tuning (`--disable-fold`, `--fold-interval-secs`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FoldSpec {
+    /// Disable the background fold task entirely (`--disable-fold`). Never
+    /// changes query results, only their cost.
+    #[serde(default)]
+    pub disabled: bool,
+
+    /// How often each tenant's fold task wakes, in seconds
+    /// (`--fold-interval-secs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
+}
+
+/// Probe wiring for the rendered `ravel-server` pods (ADR-1702 decision 10).
+///
+/// The ingest-router Deployment is out of scope here: it runs a different
+/// binary that does no decode, and its probes stay on its own HTTP port.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbesSpec {
+    /// Probe the dedicated health listener instead of the main HTTP port.
+    ///
+    /// When true the operator renders `--listen-health 0.0.0.0:4316` on every
+    /// `ravel-server` container, a container port named `health` on 4316, and
+    /// points both probes at that port. That listener runs on its own thread
+    /// with its own `current_thread` runtime (ADR-1702 decision 8), so a busy
+    /// main runtime cannot make the kubelet time a probe out and restart the
+    /// pod.
+    ///
+    /// Defaults to true (ADR-1702 follow-up task 12): the flag requires a
+    /// `ravel-server` image that has `--listen-health`, v0.19.0 or newer. An
+    /// older image rejects the unknown flag and restart-loops the pod. The
+    /// API server stores the default on the write that creates or updates
+    /// the object, so a cluster already stored with `false` keeps it. Set
+    /// this to `false` to probe the main HTTP port on 4318 instead. A
+    /// cluster resolving to `false` gets a `HealthProbeOnMainHttpPort`
+    /// condition on its status.
+    #[serde(default = "default_dedicated_health_port")]
+    pub dedicated_health_port: bool,
+}
+
+impl Default for ProbesSpec {
+    fn default() -> Self {
+        Self {
+            dedicated_health_port: default_dedicated_health_port(),
+        }
+    }
+}
+
+fn default_dedicated_health_port() -> bool {
+    true
+}
+
+/// Query tier: replicas and resources.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct QuerySpec {
+    /// Replica count for the query Deployment.
+    #[serde(default = "default_replicas")]
+    pub replicas: i32,
+
+    /// Container resource requests/limits. Omit to render the default request
+    /// of `200m` CPU / `512Mi` memory and no limits
+    /// ([`QUERY_DEFAULT_CPU_REQUEST`], [`QUERY_DEFAULT_MEMORY_REQUEST`]). An
+    /// explicit block here replaces the default entirely rather than merging
+    /// with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceRequirementsSpec>,
+
+    /// Per-role S3 credential override for the query tier (ADR-0055 section 5).
+    /// When set, the query Deployment sources `RAVEL_S3_ACCESS_KEY` /
+    /// `RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /
+    /// `secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`,
+    /// so an operator can scope the query tier to a narrower IAM credential. Falls
+    /// back to the shared credential when unset, so existing single-credential
+    /// clusters are unaffected.
+    /// Refused under `storage.s3.auth: podIdentity`, where the tier's role
+    /// comes from its ServiceAccount's Pod Identity association.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_secret_ref: Option<LocalSecretRef>,
+
+    /// Distributed query fan-out across the query replicas (ADR-0071, ADR-1689
+    /// decision 4 and its operator-rendering amendment). Omit, or leave
+    /// `enabled` false, to keep the query tier on local execution with none of
+    /// the distributed-query flags, mounts, or NetworkPolicy rendered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distributed_query: Option<DistributedQuerySpec>,
+
+    /// Pins the query pods' memory budget: renders `--memory-budget-bytes`
+    /// with this value on the query container only (ADR-1170, issue #3200
+    /// amendment). Unset, no flag renders and the server derives its budget
+    /// from the pod's memory limit minus a reserve (a quarter of the limit
+    /// below 8 GiB, 2 GiB from 8 GiB up), so raising the limit raises the
+    /// budget with it and adds no headroom beyond that reserve. Set,
+    /// `resources.limits.memory` must be at least this value plus the 256 MiB
+    /// the server holds outside its budget in `--mode query`.
+    /// A missing, unparseable or smaller limit is refused: the query
+    /// Deployment is not applied (a running one is left unchanged) and the
+    /// cluster reports `Degraded` with reason `QueryMemoryBudgetExceedsLimit`
+    /// or `QueryMemoryLimitUnparseable`. A limit below that floor plus the
+    /// headroom (`memoryHeadroomBytes`) still rolls the Deployment and reports
+    /// `Degraded` with reason `QueryMemoryHeadroomLow`. Minimum 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_budget_bytes: Option<u64>,
+
+    /// Memory, in bytes, to leave in the query pods' limit above
+    /// `memoryBudgetBytes` plus the 256 MiB held outside the budget, for
+    /// allocations the budget does not charge. Refused at admission without
+    /// `memoryBudgetBytes`, and ignored on a cluster stored without one before that
+    /// rule. A limit below the floor plus this headroom reports `Degraded` with
+    /// reason `QueryMemoryHeadroomLow` but still rolls the query Deployment. Unset,
+    /// the operator uses a provisional default of `ceil(0.53 * budget) +
+    /// ceil(min(budget, 8 GiB) * 6.6 / 8)`: about 2.03 GiB at a 1.5 GiB budget and
+    /// 19.3 GiB at 24 GiB. The first term is uncharged SQL aggregation and
+    /// logs-scan state, up to 12.7 GB measured at a 24 GiB budget with ten
+    /// connections (issue #3181). The second is allocator-retained pages, up to 6.6
+    /// GB measured at an 8 GB budget (ADR-2633); retained pages are freed
+    /// allocations the allocator keeps, so they cannot exceed the process's peak
+    /// allocation, which is why the term scales down with smaller budgets. Below 8
+    /// GB that scaling is unmeasured: measure your own peak resident memory and set
+    /// this field. The default was sized before the 0.26 fixes for issue #3181, which
+    /// leave it unchanged; issue #3237 tracks the logs-scan state still uncharged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_headroom_bytes: Option<u64>,
+
+    /// Serves the MCP adapter at `POST /mcp` on the query pods (ADR-1374,
+    /// issue #3648 amendment). Omit, or leave `enabled` false, to render none
+    /// of the MCP flags. Turning the block on or off, or editing it while
+    /// enabled, changes the query Deployment's arguments, so the query pods
+    /// roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpSpec>,
+}
+
+impl Default for QuerySpec {
+    fn default() -> Self {
+        Self {
+            replicas: default_replicas(),
+            resources: None,
+            credentials_secret_ref: None,
+            distributed_query: None,
+            memory_budget_bytes: None,
+            memory_headroom_bytes: None,
+            mcp: None,
+        }
+    }
+}
+
+/// The MCP adapter on the query tier (ADR-1374 decisions 7 and 9).
+///
+/// When `enabled`, the query container runs `--mcp` and
+/// `--mcp-allowed-origins` with `allowedOrigins` comma-joined, plus
+/// `--mcp-max-body-bytes` when `maxBodyBytes` is set. The query pods listen
+/// on `0.0.0.0`, where `ravel-server` refuses `--mcp` with an empty allowlist,
+/// so `enabled: true` requires at least one origin at admission. The flag
+/// does nothing in an image built without the `mcp` cargo feature; the image
+/// built from `main` has it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct McpSpec {
+    /// Whether the query pods serve `POST /mcp`. Defaults to false.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// `Origin` header values the MCP route accepts, each compared whole and
+    /// ignoring ASCII case, for example `https://agents.example.com`. A
+    /// request with an `Origin` not on the
+    /// list is refused with 403. A request with no `Origin` header is
+    /// accepted: non-browser MCP clients send none, so the list governs
+    /// browser clients only. At least one entry is required when `enabled`
+    /// is true. Entries may not be empty or contain a comma, because the list
+    /// renders as one comma-separated flag value. At most 64 entries of at
+    /// most 1024 characters each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_origins: Vec<String>,
+
+    /// Largest MCP request body in bytes; a larger body is refused with 413.
+    /// Unset, no flag renders and the server default (1 MiB) applies.
+    /// Minimum 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<u64>,
+}
+
+/// Distributed query for the query tier (ADR-1689 decision 4).
+///
+/// When `enabled`, the query Deployment runs `--distributed-query` with the
+/// dedicated TLS fragment listener on [`crate::reconcile::FRAGMENT_PORT`], and
+/// the operator applies a NetworkPolicy admitting that port only from the
+/// query tier's own pods. Every Secret reference is optional in the schema so
+/// a disabled block can be kept half-written, but `enabled: true` with any of
+/// them unset renders none of it and records a `Degraded` condition naming
+/// the missing field.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DistributedQuerySpec {
+    /// Whether distributed query is on. Defaults to false: the block is an
+    /// explicit opt-in, because turning it on also restricts ingress to the
+    /// query pods with a NetworkPolicy.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Secret holding the fragment listener's server certificate and private
+    /// key under `tls.crt` and `tls.key` (the `kubernetes.io/tls` shape). The
+    /// certificate needs a `ravel-fragment` dNSName SAN and both the
+    /// `serverAuth` and `clientAuth` extended key usages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_tls_secret_ref: Option<LocalSecretRef>,
+
+    /// Secret holding the CA bundle that signed every query pod's fragment
+    /// certificate, under `ca.crt`. May name the same Secret as
+    /// `fragmentTlsSecretRef` when it carries all three keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_ca_secret_ref: Option<LocalSecretRef>,
+
+    /// Secret holding the cluster fragment key file under `keys`: one
+    /// 64-hex-character key per line, the first mints and all verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_key_secret_ref: Option<LocalSecretRef>,
+
+    /// Secret holding the SQL ticket key file under `keys`, the same shape as
+    /// the fragment key file and with different keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_ticket_key_secret_ref: Option<LocalSecretRef>,
+}
+
+/// Maintain tier: enabled flag, replicas, interval, resources.
+///
+/// `replicas` defaults to 1 (today's behavior). ADR-0065's bounded
+/// multi-worker ownership protocol (heartbeat records under
+/// `sys/maintain/workers/`, authenticated with the maintain key file per
+/// ADR-3130, plus rendezvous-hash unit partitioning) makes
+/// `replicas > 1` safe: every maintain pod runs `--mode maintain`, discovers
+/// the live worker set from the shared store, and independently owns a
+/// disjoint slice of the `(tenant, signal, shard)` unit space, so N replicas
+/// partition the work rather than each paying for all of it. This supersedes
+/// ADR-0034 decision 3's single-replica `Recreate` guidance (see ADR-0065's
+/// deployment-model consequence).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintainSpec {
+    /// Whether the maintain Deployment exists at all. Defaults to true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Replica count for the maintain Deployment. Defaults to 1. Values above 1
+    /// are made safe by the ADR-0065 ownership protocol (rendezvous over a
+    /// heartbeat-derived live worker set); the workers coordinate entirely
+    /// through the shared object store, so every replica shares the same
+    /// flags, store, and key Secret (`keySecretRef`). Omit to keep today's
+    /// single-replica behavior.
+    #[serde(default = "default_replicas")]
+    pub replicas: i32,
+
+    /// How often the maintenance task wakes, in seconds
+    /// (`--maintain-interval-secs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
+
+    /// Catalog fold tuning, rendered onto this tier's fold flags (ADR-1693).
+    /// The scheduled fold runs in `--mode maintain` and `--mode all`, so these
+    /// are the only replicas the fold flags reach; a `maintain` tier turned
+    /// off by `enabled: false` renders no fold flags because it renders no
+    /// Deployment. When this fold runs, `intervalSecs` also reaches the query
+    /// tier as `--fold-lag-interval-secs`, the interval its request-budget
+    /// refusals classify fold lag against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fold: Option<FoldSpec>,
+
+    /// Container resource requests/limits. Omit to render the default request
+    /// of `100m` CPU / `256Mi` memory and no limits
+    /// ([`MAINTAIN_DEFAULT_CPU_REQUEST`], [`MAINTAIN_DEFAULT_MEMORY_REQUEST`]).
+    /// An explicit block here replaces the default entirely rather than
+    /// merging with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceRequirementsSpec>,
+
+    /// Per-role S3 credential override for the maintain tier (ADR-0055 section 5).
+    /// When set, the maintain Deployment sources `RAVEL_S3_ACCESS_KEY` /
+    /// `RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /
+    /// `secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`.
+    /// Maintain is the only role ADR-0055 grants delete, so this is where an
+    /// operator points the delete-capable credential. Falls back to the shared
+    /// credential when unset, so existing single-credential clusters are
+    /// unaffected.
+    /// Refused under `storage.s3.auth: podIdentity`, where the tier's role
+    /// comes from its ServiceAccount's Pod Identity association.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_secret_ref: Option<LocalSecretRef>,
+
+    /// Secret holding the maintain key file under `keys`: one
+    /// 64-hex-character key per line, the first mints and all verify
+    /// (ADR-3130). Mounted on the maintain pods and passed as
+    /// `--maintain-key-file`, which `--mode maintain` requires. Required while
+    /// `enabled` is true: without it, or while the Secret it names does not
+    /// exist, the operator leaves any existing maintain Deployment exactly as
+    /// it is, creates none, and records a `Degraded` condition naming this
+    /// field or the Secret. The gateway and query tiers keep reconciling,
+    /// except on a fresh cluster with per-role storage credentials (including
+    /// `podIdentity`): there they wait for maintain to create `sys/gc`, so no
+    /// `ravel-server` Deployment is created until the Secret exists. A change
+    /// to the Secret rolls the maintain pods.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_secret_ref: Option<LocalSecretRef>,
+
+    /// Local scratch space for the two-level RLOG merge (ADR-3853 D2). When
+    /// set, the maintain pods get an `emptyDir` volume named `scratch` with a
+    /// `sizeLimit` of `sizeGi` GiB mounted at `mountPath`, an
+    /// `ephemeral-storage` request of the same size,
+    /// `--maintain-scratch-dir <mountPath>`, and `--maintain-scratch-max-bytes`
+    /// of `sizeGi` GiB in bytes. Omit to render none of these. Requires a
+    /// ravel-server release that includes the two-level merge flags.
+    /// The directory is a cache only: ravel-server publishes nothing from it,
+    /// so losing the volume loses no data. Each merge unit's own subdirectory
+    /// is wiped when the unit ends. Unit subdirectories a dead process left
+    /// are removed when the first two-level merge takes the directory's lock;
+    /// other files there are kept and count against
+    /// `--maintain-scratch-max-bytes`. Size it to about 1.3 times the largest
+    /// merge unit's input bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<MaintainScratchSpec>,
+}
+
+/// Scratch volume for the maintain tier (ADR-3853 D2).
+///
+/// The directory is a cache only: ravel-server wipes each merge unit's own
+/// subdirectory when the unit ends, removes the unit subdirectories a dead
+/// process left when its first two-level merge takes the directory's lock
+/// (other files are kept and count against `--maintain-scratch-max-bytes`),
+/// never publishes what it writes there, and a lost volume costs only a
+/// restart of the unit from object storage. Size it to
+/// about 1.3 times the input bytes of the largest merge unit; a unit whose
+/// need exceeds the free space is refused, not run in another mode.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintainScratchSpec {
+    /// Volume size in GiB: the `emptyDir` `sizeLimit` and the container's
+    /// `ephemeral-storage` request. About 1.3 times the largest merge unit's
+    /// input bytes. Minimum 1.
+    pub size_gi: u32,
+
+    /// Where the volume is mounted in the maintain container, and the value
+    /// of `--maintain-scratch-dir`. An absolute path; defaults to
+    /// `/var/lib/ravel/scratch`.
+    #[serde(default = "default_maintain_scratch_mount_path")]
+    pub mount_path: String,
+}
+
+/// Default `spec.maintain.scratch.mountPath`.
+pub const MAINTAIN_SCRATCH_DEFAULT_MOUNT_PATH: &str = "/var/lib/ravel/scratch";
+
+fn default_maintain_scratch_mount_path() -> String {
+    MAINTAIN_SCRATCH_DEFAULT_MOUNT_PATH.to_string()
+}
+
+impl Default for MaintainSpec {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            replicas: default_replicas(),
+            interval_secs: None,
+            fold: None,
+            resources: None,
+            credentials_secret_ref: None,
+            key_secret_ref: None,
+            scratch: None,
+        }
+    }
+}
+
+/// Garbage-collection horizons rendered onto the maintain tier
+/// (`--gc-protection-horizon`, `--gc-grace`).
+///
+/// Both fields are humantime duration strings in the syntax the server flags
+/// accept (`24h`, `25h5m`). Each is validated at render time and rendered
+/// verbatim, so the operator never reinterprets a duration; an invalid or empty
+/// value is a render error naming the field, not a flag the server would reject
+/// at startup. The engine deadline (`--gc-max-query-duration`) is a different
+/// quantity and is deliberately absent here.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GcSpec {
+    /// The GC protection horizon (`--gc-protection-horizon`). It must equal the
+    /// protection horizon stored in the bucket's `sys/gc` object, which you read
+    /// with `ravel-cli gc-config show`, or the maintain pod refuses to start.
+    /// Unset renders no flag and the server's compiled-in default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protection_horizon: Option<String>,
+
+    /// The GC grace period (`--gc-grace`). It must equal the grace stored in the
+    /// bucket's `sys/gc` object, which you read with `ravel-cli gc-config show`,
+    /// or the maintain pod refuses to start. Unset renders no flag and the
+    /// server's compiled-in default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace: Option<String>,
+}
+
+/// Retention policy (`--retention-default`, repeatable `--retention-tenant`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionSpec {
+    /// Default age-based retention window as a humantime duration (`30d`,
+    /// `720h`). Omitted means no default retention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+
+    /// Per-tenant retention overrides: tenant name to humantime duration.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tenants: BTreeMap<String, String>,
+}
+
+/// Per-tenant shard-count overrides (#147, ADR-0076 decision 2), patterned on
+/// [`RetentionSpec`]'s per-tenant map.
+///
+/// Costs an operator takes on by lowering a tenant's count are documented in
+/// `docs/guides/shard-overrides.md` (single-actor throughput ceiling,
+/// shard-0 concentration at one shard, coarser ADR-0065 maintenance units),
+/// not just discovered after the fact.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ShardOverridesSpec {
+    /// Per-tenant shard-count targets: tenant name to desired shard count.
+    /// Applied independently to every ingested signal (metrics, logs, spans).
+    /// A tenant absent here keeps whatever count its provisioning record (or,
+    /// absent one, the cluster's day-one `spec.shards`) already has.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tenants: BTreeMap<String, u32>,
+
+    /// Hours of lead time before the new count activates, passed to
+    /// `append_generation` as `activation_hour = now_hour + leadHours`.
+    /// Enforced to be at least [`MIN_RESHARD_LEAD_HOURS`] -- the same bound
+    /// `ravel-cli provision reshard` enforces (`services/ravel-cli/src/
+    /// provision.rs`) -- rejected outright rather than silently clamped up,
+    /// since a shorter lead could let a live writer route past the
+    /// activation on a view it had not yet refreshed.
+    #[serde(default = "default_reshard_lead_hours")]
+    pub lead_hours: u32,
+}
+
+/// Minimum lead hours accepted for a `shardOverrides` reshard, mirroring
+/// `ravel-cli provision reshard`'s own `MIN_LEAD_HOURS`
+/// (`services/ravel-cli/src/provision.rs`): `ceil(C) + 1` with the router's
+/// default 60s refresh interval `C` (ADR-0052 section 3).
+pub const MIN_RESHARD_LEAD_HOURS: u32 = 2;
+
+fn default_reshard_lead_hours() -> u32 {
+    MIN_RESHARD_LEAD_HOURS
+}
+
+/// Container resource requests and limits, mapping onto the Kubernetes
+/// `ResourceRequirements` shape (`cpu`/`memory` quantity strings).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceRequirementsSpec {
+    /// Minimum guaranteed resources (`resources.requests`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<BTreeMap<String, String>>,
+
+    /// Resource ceilings (`resources.limits`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<BTreeMap<String, String>>,
+}
+
+/// Default gateway request when `spec.gateway.resources` is omitted (#1726).
+/// Sized to keep the `kind` dev lane -- three tiers plus RustFS and floci on
+/// one node -- schedulable without every operator having to size it by hand.
+pub const GATEWAY_DEFAULT_CPU_REQUEST: &str = "100m";
+/// Companion to [`GATEWAY_DEFAULT_CPU_REQUEST`].
+pub const GATEWAY_DEFAULT_MEMORY_REQUEST: &str = "256Mi";
+
+/// Default query request when `spec.query.resources` is omitted (#1726), sized
+/// larger than gateway/maintain for the query engine's working set.
+pub const QUERY_DEFAULT_CPU_REQUEST: &str = "200m";
+/// Companion to [`QUERY_DEFAULT_CPU_REQUEST`].
+pub const QUERY_DEFAULT_MEMORY_REQUEST: &str = "512Mi";
+
+/// Default maintain request when `spec.maintain.resources` is omitted
+/// (#1726).
+pub const MAINTAIN_DEFAULT_CPU_REQUEST: &str = "100m";
+/// Companion to [`MAINTAIN_DEFAULT_CPU_REQUEST`].
+pub const MAINTAIN_DEFAULT_MEMORY_REQUEST: &str = "256Mi";
+
+/// Observed status (ADR-0034 decision 2). Written by the operator on the status
+/// subresource.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RavelClusterStatus {
+    /// The `.metadata.generation` this status reflects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+
+    /// Ready replicas reported by the gateway Deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_ready_replicas: Option<i32>,
+
+    /// Ready replicas reported by the query Deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_ready_replicas: Option<i32>,
+
+    /// Ready replicas reported by the maintain Deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintain_ready_replicas: Option<i32>,
+
+    /// RFC 3339 timestamp of the first reconcile pass that began holding the
+    /// gateway and query Deployments for the `sys/gc` bootstrap, set on that
+    /// pass and carried unchanged while the hold continues. Cleared once
+    /// maintain reports a ready replica or either request-serving Deployment
+    /// exists. The operator derives the bootstrap-stall condition from how long
+    /// ago this was rather than from a live in-process timer, since every
+    /// operator process is disposable and keeps no such counter across restarts.
+    ///
+    /// Unlike the other optional status fields, this one is serialized even when
+    /// absent (as an explicit `null`), so the status merge patch clears it when
+    /// the hold ends; a skipped field would leave a stale timestamp behind and
+    /// mis-report a later, unrelated wait as immediately stalled.
+    #[serde(default)]
+    pub gc_bootstrap_waiting_since: Option<String>,
+
+    /// The qualify-Job input hash (bucket, region, endpoint, `allowHttp`,
+    /// `uploadIntegrity`, `requestStoredChecksum`, image, credentials Secret
+    /// name and that Secret's `resourceVersion`; on Azure the account,
+    /// container, image and `qualify` client ID) that store qualification last
+    /// succeeded against (issue #36).
+    /// The operator gates serving on `ravel-cli store qualify` before it creates any
+    /// Deployment; recording the qualified inputs here makes that gate durable:
+    /// a later pass whose inputs still hash to this value proceeds without
+    /// re-running qualification even after the one-shot Job has been
+    /// TTL-garbage-collected, and a pass whose inputs no longer match re-runs it
+    /// (the `StoreQualified` condition flips back to `Pending`) without tearing
+    /// down the running Deployments. Absent until the first qualification
+    /// succeeds. Qualification is never re-run on a schedule; only an input
+    /// change re-triggers it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_qualified_hash: Option<String>,
+
+    /// Consecutive qualify-Job failures for the current inputs (issue #36, finding
+    /// 3). Drives the capped exponential recreation backoff and the terminal
+    /// cooldown: the operator does not recreate a failing qualify Job unboundedly,
+    /// it spaces the recreations out and, past a threshold, holds. Reset to absent
+    /// on a successful qualification and on any input change (a moving
+    /// `storeQualifiedHash` input); never part of the qualified-input hash, so
+    /// counting failures never re-runs a qualification that would otherwise pass.
+    ///
+    /// Serialized even when absent (as explicit `null`) so the status merge patch
+    /// clears it on success; a skipped field would leave a stale count behind.
+    #[serde(default)]
+    pub qualify_failure_count: Option<i32>,
+
+    /// RFC3339 instant before which the operator creates no new qualify Job after
+    /// a failure (issue #36, finding 3): the next point on the capped exponential
+    /// backoff, or the terminal cooldown's expiry. Absent when not holding.
+    ///
+    /// Serialized even when absent (as explicit `null`) so the status merge patch
+    /// clears it; a skipped field would leave a stale deadline behind.
+    #[serde(default)]
+    pub qualify_next_retry_time: Option<String>,
+
+    /// The qualify-Job input hash the persisted `qualifyFailureCount` and
+    /// `qualifyNextRetryTime` were recorded against (issue #36, finding 3). The
+    /// retry state is meaningful only for the inputs that produced the failures:
+    /// when the desired inputs no longer hash to this value the operator resets
+    /// the count and next-retry and qualifies the new inputs at once, whether or
+    /// not the failing Job still exists. Without this key the operator cannot tell
+    /// a changed-input pass from an unchanged one once the Failed Job is
+    /// TTL-garbage-collected (both observe the Job absent), so a config edit made
+    /// after the Job's TTL collected it would wait out the old inputs' cooldown and
+    /// inherit their failure count. This is never part of the qualified-input hash
+    /// itself, so recording it never re-runs a qualification that would pass.
+    ///
+    /// Serialized even when absent (as explicit `null`) so the status merge patch
+    /// clears it on reset or success; a skipped field would leave a stale key
+    /// behind.
+    #[serde(default)]
+    pub qualify_retry_hash: Option<String>,
+
+    /// `true` once the operator has applied the ServiceAccounts it owns under
+    /// `storage.s3.auth: podIdentity` or `storage.azure` (`<name>-gateway`,
+    /// `-query`, `-maintain`, `-qualify`). The operator deletes those
+    /// accounts after a switch to S3 `static` only while this is set, and
+    /// clears it once they are gone, so a cluster that never ran under either
+    /// never touches ServiceAccounts with those names. Recorded here because
+    /// the operator's RBAC cannot read a ServiceAccount to check who owns it.
+    ///
+    /// Serialized even when absent (as explicit `null`) so the status merge
+    /// patch clears it after the sweep.
+    #[serde(default)]
+    pub pod_identity_service_accounts: Option<bool>,
+
+    /// Status conditions the operator actually sets: `Available`, `Degraded`,
+    /// `StoreQualified`, `KubernetesVersionUnsupported`,
+    /// `IngestAffinityBackendDeprecated`, `HealthProbeOnMainHttpPort`,
+    /// `BucketProtectionVerified` (on a `storage.azure` cluster only, False
+    /// with reason NotImplementedForAzure: no bucket-protection check runs
+    /// there). The operator emits no `Progressing` condition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Condition>,
+}
+
+/// A standard Kubernetes status condition (the `metav1.Condition` shape). Kept
+/// as a local type rather than `k8s-openapi`'s `Condition` so the status schema
+/// derives from `schemars` without the `k8s-openapi` schemars coupling.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Condition {
+    /// Condition type, e.g. `Available`.
+    pub r#type: String,
+
+    /// `True`, `False`, or `Unknown`.
+    pub status: String,
+
+    /// The `.metadata.generation` the condition was set against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+
+    /// RFC3339 timestamp of the last transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition_time: Option<String>,
+
+    /// Machine-readable reason (PascalCase).
+    pub reason: String,
+
+    /// Human-readable message.
+    pub message: String,
+}
+
+fn default_region() -> String {
+    "us-east-1".to_string()
+}
+
+fn default_replicas() -> i32 {
+    1
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Default ingest-affinity subset size (ADR-0076 decision 1): **two** replicas,
+/// not one, so a single replica loss does not concentrate a tenant on one
+/// process.
+pub const DEFAULT_AFFINITY_SUBSET_SIZE: u32 = 2;
+
+fn default_subset_size() -> u32 {
+    DEFAULT_AFFINITY_SUBSET_SIZE
+}
+
+/// Build the `CustomResourceDefinition` for [`RavelCluster`], with the CEL
+/// immutability rule injected onto the `shards` field.
+///
+/// The base CRD is generated by the `CustomResource` derive
+/// ([`CustomResourceExt::crd`]); this function then stamps an
+/// `x-kubernetes-validations` transition rule (`self == oldSelf`) onto the
+/// `shards` property so the API server rejects any update that changes the
+/// shard count (ADR-0034 decision 2). Injecting it here, rather than through a
+/// derive attribute, keeps the rule visible and directly unit-testable without
+/// a live API server.
+pub fn ravel_cluster_crd() -> CustomResourceDefinition {
+    let mut crd = RavelCluster::crd();
+    inject_shards_immutability(&mut crd);
+    inject_minimum_bounds(&mut crd);
+    inject_ingest_affinity_constraints(&mut crd);
+    inject_gateway_exposure_affinity_guard(&mut crd);
+    inject_canonical_tenant_backend_guard(&mut crd);
+    inject_flush_share_guard(&mut crd);
+    inject_storage_auth_guards(&mut crd);
+    inject_query_headroom_needs_budget(&mut crd);
+    inject_query_mcp_guards(&mut crd);
+    crd
+}
+
+/// Immutability message surfaced to a user who tries to change `shards`.
+///
+/// `shards` itself stays immutable: it renders into every tier's `--shards`
+/// flag (ADR-0034 decision 2), and editing it directly would desync that
+/// must-match invariant across the gateway/query/maintain Deployments. This is
+/// not a claim that resharding at large is out of scope -- ADR-0052 shipped
+/// online resharding, and `spec.shardOverrides` (#147, ADR-0076 decision 2)
+/// reaches it through a distinct field this CEL rule does not touch.
+const SHARDS_IMMUTABLE_MESSAGE: &str = "shards is immutable after creation; use \
+    spec.shardOverrides for per-tenant resharding (ADR-0052)";
+
+/// Attach the `self == oldSelf` CEL transition rule to the `shards` property of
+/// every stored version's schema.
+fn inject_shards_immutability(crd: &mut CustomResourceDefinition) {
+    let rule = ValidationRule {
+        rule: "self == oldSelf".to_string(),
+        message: Some(SHARDS_IMMUTABLE_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    for version in &mut crd.spec.versions {
+        let Some(schema) = version.schema.as_mut() else {
+            continue;
+        };
+        let Some(root) = schema.open_api_v3_schema.as_mut() else {
+            continue;
+        };
+        let Some(props) = root.properties.as_mut() else {
+            continue;
+        };
+        let Some(spec) = props.get_mut("spec") else {
+            continue;
+        };
+        let Some(spec_props) = spec.properties.as_mut() else {
+            continue;
+        };
+        let Some(shards) = spec_props.get_mut("shards") else {
+            continue;
+        };
+        shards.x_kubernetes_validations = Some(vec![rule.clone()]);
+    }
+}
+
+/// Attach OpenAPI `minimum: 1` bounds to the count and interval fields that
+/// must be positive: `spec.shards`, `spec.gateway.replicas`,
+/// `spec.query.replicas`, `spec.maintain.replicas`,
+/// `spec.gateway.maxInflightFlushes`,
+/// `spec.gateway.maxInflightFlushesPerTenant`, `spec.maintain.intervalSecs`,
+/// `spec.maintain.fold.intervalSecs`, and `spec.maintain.scratch.sizeGi`.
+///
+/// Without this, `shards: 0` or a negative replica count passes CRD validation
+/// and only fails much later as a confusing Deployment-apply error or a
+/// catalog-config panic, and a zero interval crash-loops the maintain pods.
+/// schemars 1.2.2 renders these fields as plain integers (a `u32`'s implicit
+/// `minimum: 0` is not a positive floor, and `i32` replicas get none), so the
+/// `minimum` keyword is injected here for the
+/// same reason the CEL rule is: post-hoc injection keeps it directly
+/// unit-testable without a live API server, and does not depend on which
+/// numeric-bound attributes this schemars major happens to emit.
+fn inject_minimum_bounds(crd: &mut CustomResourceDefinition) {
+    for version in &mut crd.spec.versions {
+        let Some(schema) = version.schema.as_mut() else {
+            continue;
+        };
+        let Some(root) = schema.open_api_v3_schema.as_mut() else {
+            continue;
+        };
+        let Some(props) = root.properties.as_mut() else {
+            continue;
+        };
+        let Some(spec) = props.get_mut("spec") else {
+            continue;
+        };
+        let Some(spec_props) = spec.properties.as_mut() else {
+            continue;
+        };
+        if let Some(shards) = spec_props.get_mut("shards") {
+            shards.minimum = Some(1.0);
+        }
+        for tier in ["gateway", "query", "maintain"] {
+            if let Some(replicas) = spec_props
+                .get_mut(tier)
+                .and_then(|t| t.properties.as_mut())
+                .and_then(|p| p.get_mut("replicas"))
+            {
+                replicas.minimum = Some(1.0);
+            }
+        }
+        // schemars renders a u32 with `minimum: 0.0`, which is not a positive
+        // floor. ravel-server rejects `--max-inflight-flushes 0` as a flush
+        // deadlock, so the CRD must refuse it at admission rather than let the
+        // pod crashloop.
+        // A zero per-tenant share would defer every flush trigger, which
+        // ravel-server refuses at startup.
+        if let Some(gateway_props) = spec_props
+            .get_mut("gateway")
+            .and_then(|g| g.properties.as_mut())
+        {
+            for field in ["maxInflightFlushes", "maxInflightFlushesPerTenant"] {
+                if let Some(bound) = gateway_props.get_mut(field) {
+                    bound.minimum = Some(1.0);
+                }
+            }
+        }
+        // ravel-server refuses an explicit `--memory-budget-bytes 0` at
+        // startup: the cache ceilings leave no remainder of a zero budget.
+        if let Some(budget) = spec_props
+            .get_mut("query")
+            .and_then(|q| q.properties.as_mut())
+            .and_then(|p| p.get_mut("memoryBudgetBytes"))
+        {
+            budget.minimum = Some(1.0);
+        }
+        // ravel-server refuses `--mcp-max-body-bytes 0` at startup.
+        if let Some(max_body) = spec_props
+            .get_mut("query")
+            .and_then(|q| q.properties.as_mut())
+            .and_then(|p| p.get_mut("mcp"))
+            .and_then(|m| m.properties.as_mut())
+            .and_then(|p| p.get_mut("maxBodyBytes"))
+        {
+            max_body.minimum = Some(1.0);
+        }
+        // ravel-server refuses a zero `--maintain-interval-secs` and a zero
+        // `--fold-interval-secs` at startup, since either would run its loop
+        // without pause.
+        let maintain_props = spec_props
+            .get_mut("maintain")
+            .and_then(|m| m.properties.as_mut());
+        if let Some(maintain_props) = maintain_props {
+            if let Some(interval) = maintain_props.get_mut("intervalSecs") {
+                interval.minimum = Some(1.0);
+            }
+            if let Some(fold_interval) = maintain_props
+                .get_mut("fold")
+                .and_then(|f| f.properties.as_mut())
+                .and_then(|p| p.get_mut("intervalSecs"))
+            {
+                fold_interval.minimum = Some(1.0);
+            }
+            if let Some(scratch_props) = maintain_props
+                .get_mut("scratch")
+                .and_then(|f| f.properties.as_mut())
+            {
+                // A zero-size emptyDir leaves the merge no scratch space at all.
+                if let Some(size) = scratch_props.get_mut("sizeGi") {
+                    size.minimum = Some(1.0);
+                }
+                // Kubernetes refuses a relative volumeMount path.
+                if let Some(mount_path) = scratch_props.get_mut("mountPath") {
+                    mount_path.pattern = Some("^/".to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Message surfaced to a user who selects the `header` key source without
+/// naming a header.
+const AFFINITY_HEADER_NAME_MESSAGE: &str =
+    "gateway.ingestAffinity.key.headerName is required when key.source is \"header\"";
+
+/// Allowed characters for `gateway.ingestAffinity.key.headerName`.
+///
+/// The header name is turned into an nginx variable (`X-Scope-OrgID` becomes
+/// `$http_x_scope_orgid`) inside the rendered
+/// `nginx.ingress.kubernetes.io/upstream-hash-by` annotation. The renderer
+/// already maps every character outside `[a-z0-9]` to `_`, so nothing
+/// user-supplied can reach the nginx configuration as syntax; this pattern is
+/// the second belt, rejecting the mistake at admission with a clear message
+/// instead of silently hashing a mangled variable name.
+const AFFINITY_HEADER_NAME_PATTERN: &str = "^[A-Za-z0-9][A-Za-z0-9-]{0,62}$";
+
+/// Attach the ingest-affinity constraints (ADR-0076 decision 1):
+/// `minimum: 1` on `subsetSize`, a character `pattern` on `key.headerName`, and
+/// a CEL rule requiring `headerName` whenever `key.source` is `header`.
+///
+/// Injected post-hoc for the same reason the other two injectors are: it keeps
+/// each rule directly unit-testable without a live API server, and does not
+/// depend on which validation attributes this `schemars` major happens to emit.
+/// Every step bails out rather than panicking if the schema shape is not what
+/// it expects, matching the existing injectors.
+fn inject_ingest_affinity_constraints(crd: &mut CustomResourceDefinition) {
+    // `has(self.key)` and `has(self.key.source)` guard the field accesses: both
+    // have serde defaults, so a submitted manifest may omit either, and a CEL
+    // rule that reads a missing field errors instead of passing.
+    let rule = ValidationRule {
+        rule: "!has(self.key) || !has(self.key.source) || self.key.source != 'header' || \
+               (has(self.key.headerName) && self.key.headerName != '')"
+            .to_string(),
+        message: Some(AFFINITY_HEADER_NAME_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    for version in &mut crd.spec.versions {
+        let Some(schema) = version.schema.as_mut() else {
+            continue;
+        };
+        let Some(root) = schema.open_api_v3_schema.as_mut() else {
+            continue;
+        };
+        let Some(props) = root.properties.as_mut() else {
+            continue;
+        };
+        let Some(spec) = props.get_mut("spec") else {
+            continue;
+        };
+        let Some(spec_props) = spec.properties.as_mut() else {
+            continue;
+        };
+        let Some(affinity) = spec_props
+            .get_mut("gateway")
+            .and_then(|g| g.properties.as_mut())
+            .and_then(|p| p.get_mut("ingestAffinity"))
+        else {
+            continue;
+        };
+        affinity.x_kubernetes_validations = Some(vec![rule.clone()]);
+        let Some(affinity_props) = affinity.properties.as_mut() else {
+            continue;
+        };
+        if let Some(subset_size) = affinity_props.get_mut("subsetSize") {
+            subset_size.minimum = Some(1.0);
+        }
+        if let Some(header_name) = affinity_props
+            .get_mut("key")
+            .and_then(|k| k.properties.as_mut())
+            .and_then(|p| p.get_mut("headerName"))
+        {
+            header_name.pattern = Some(AFFINITY_HEADER_NAME_PATTERN.to_string());
+        }
+    }
+}
+
+/// Message surfaced to a user who combines Gateway API exposure with an enabled
+/// ingress-nginx ingest affinity (ADR-0080 decision 2).
+const GATEWAY_EXPOSURE_AFFINITY_MESSAGE: &str = "gateway.exposure.gatewayApi cannot be \
+    combined with an enabled gateway.ingestAffinity on backend: ingressNginx -- traffic on the \
+    Gateway API path would bypass the nginx subset annotations entirely; use backend: \
+    ravelNative or disable ingestAffinity";
+
+/// The CEL rule rejecting Gateway API exposure alongside an enabled
+/// ingress-nginx affinity (ADR-0080 decision 2), kept as a constant so the
+/// injected rule and the logic unit test cannot drift.
+///
+/// It passes (no rejection) unless ALL of these hold at once: `exposure.gatewayApi`
+/// is set, `ingestAffinity` is present and `enabled`, and its `backend` is
+/// `ingressNginx`. The disjunction reads as "the combination is fine if any
+/// precondition of the bad case is absent".
+const GATEWAY_EXPOSURE_AFFINITY_RULE: &str = "!has(self.exposure) || \
+    !has(self.exposure.gatewayApi) || !has(self.ingestAffinity) || \
+    !has(self.ingestAffinity.enabled) || !self.ingestAffinity.enabled || \
+    !has(self.ingestAffinity.backend) || self.ingestAffinity.backend != 'ingressNginx'";
+
+/// Attach the Gateway-API-exposure-versus-legacy-affinity guard (ADR-0080
+/// decision 2) to the `gateway` property itself.
+///
+/// The rule spans two sibling fields (`exposure` and `ingestAffinity`) rather
+/// than validating one struct against its own fields as the `headerName`
+/// precedent does, so it is attached at the `gateway` object level, not nested
+/// inside `ingestAffinity`. Injected post-hoc for the same reason the other
+/// injectors are: it keeps the rule directly unit-testable without a live API
+/// server, and does not depend on which validation attributes this `schemars`
+/// major happens to emit. Every step bails out rather than panicking if the
+/// schema shape is not what it expects, matching the existing injectors.
+fn inject_gateway_exposure_affinity_guard(crd: &mut CustomResourceDefinition) {
+    // `has()` guards on every field in the path -- exposure, exposure.gatewayApi,
+    // ingestAffinity, ingestAffinity.enabled, ingestAffinity.backend -- because
+    // each is optional or carries a serde default: a submitted manifest may omit
+    // any of them, and a CEL rule that reads a missing field errors instead of
+    // passing. `backend` is materialized to `ingressNginx` by the schema default
+    // before CEL evaluates, so the `has(self.ingestAffinity.backend)` guard is a
+    // defensive belt, not the load-bearing check.
+    let rule = ValidationRule {
+        rule: GATEWAY_EXPOSURE_AFFINITY_RULE.to_string(),
+        message: Some(GATEWAY_EXPOSURE_AFFINITY_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    for version in &mut crd.spec.versions {
+        let Some(schema) = version.schema.as_mut() else {
+            continue;
+        };
+        let Some(root) = schema.open_api_v3_schema.as_mut() else {
+            continue;
+        };
+        let Some(props) = root.properties.as_mut() else {
+            continue;
+        };
+        let Some(spec) = props.get_mut("spec") else {
+            continue;
+        };
+        let Some(spec_props) = spec.properties.as_mut() else {
+            continue;
+        };
+        let Some(gateway) = spec_props.get_mut("gateway") else {
+            continue;
+        };
+        // Append rather than replace: leave room for a future rule on `gateway`
+        // without silently dropping this one.
+        let mut rules = gateway.x_kubernetes_validations.take().unwrap_or_default();
+        rules.push(rule.clone());
+        gateway.x_kubernetes_validations = Some(rules);
+    }
+}
+
+/// Message surfaced to a user who selects the `canonicalTenant` key source on
+/// the legacy `ingressNginx` backend (ADR-0080 decision 3).
+const CANONICAL_TENANT_BACKEND_MESSAGE: &str = "gateway.ingestAffinity.key.source \
+    canonicalTenant requires backend: ravelNative -- ingress-nginx cannot run the \
+    ravel-tenant-resolve auth chain that canonical-tenant hashing needs";
+
+/// The CEL rule rejecting the `canonicalTenant` key source under
+/// `backend: ingressNginx` (ADR-0080 decision 3), kept as a constant so the
+/// injected rule and the logic unit test cannot drift.
+///
+/// It is attached at the `gateway` object level (so `self` is the gateway
+/// struct), following the exact shape of the exposure guard rather than nesting
+/// inside `ingestAffinity`: that keeps `ingestAffinity`'s own rule set to just
+/// its `headerName` rule. It passes (no rejection) unless BOTH
+/// `ingestAffinity.key.source` is `canonicalTenant` and `ingestAffinity.backend`
+/// is `ingressNginx`. The disjunction reads as "the combination is fine if any
+/// precondition of the bad case is absent". `backend` is materialized to
+/// `ingressNginx` by the schema default before CEL evaluates, so a manifest that
+/// sets `key.source: canonicalTenant` while omitting `backend` is still rejected
+/// (the omitted default IS `ingressNginx`); the `has()` guards are a defensive
+/// belt against a missing serde default, matching the other injectors.
+const CANONICAL_TENANT_BACKEND_RULE: &str = "!has(self.ingestAffinity) || \
+    !has(self.ingestAffinity.key) || !has(self.ingestAffinity.key.source) || \
+    self.ingestAffinity.key.source != 'canonicalTenant' || \
+    !has(self.ingestAffinity.backend) || self.ingestAffinity.backend != 'ingressNginx'";
+
+/// Attach the canonical-tenant-versus-legacy-backend guard (ADR-0080
+/// decision 3) to the `gateway` property.
+///
+/// Attached at the `gateway` level and APPENDED (not replaced), the exact shape
+/// of [`inject_gateway_exposure_affinity_guard`], so the exposure guard already
+/// on `gateway` is preserved and `ingestAffinity`'s own rule set stays at just
+/// its `headerName` rule. Injected post-hoc for the same reason the other
+/// injectors are, and every step bails out rather than panicking if the schema
+/// shape is not what it expects.
+fn inject_canonical_tenant_backend_guard(crd: &mut CustomResourceDefinition) {
+    let rule = ValidationRule {
+        rule: CANONICAL_TENANT_BACKEND_RULE.to_string(),
+        message: Some(CANONICAL_TENANT_BACKEND_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    for version in &mut crd.spec.versions {
+        let Some(schema) = version.schema.as_mut() else {
+            continue;
+        };
+        let Some(root) = schema.open_api_v3_schema.as_mut() else {
+            continue;
+        };
+        let Some(props) = root.properties.as_mut() else {
+            continue;
+        };
+        let Some(spec) = props.get_mut("spec") else {
+            continue;
+        };
+        let Some(spec_props) = spec.properties.as_mut() else {
+            continue;
+        };
+        let Some(gateway) = spec_props.get_mut("gateway") else {
+            continue;
+        };
+        // Append rather than replace: the exposure guard is already on `gateway`
+        // and dropping it would silently re-admit the exposure+ingressNginx
+        // combination.
+        let mut rules = gateway.x_kubernetes_validations.take().unwrap_or_default();
+        rules.push(rule.clone());
+        gateway.x_kubernetes_validations = Some(rules);
+    }
+}
+
+/// Message surfaced to a user whose per-tenant flush share exceeds the
+/// shard's permit count (ADR-2708 D3).
+const FLUSH_SHARE_ABOVE_PERMITS_MESSAGE: &str = "gateway.maxInflightFlushesPerTenant \
+    must not exceed gateway.maxInflightFlushes (ravel-server's default of 8 when unset); \
+    ravel-server refuses the pair at startup";
+
+/// The CEL rule refusing a per-tenant flush share above the permit count, kept
+/// as a constant so the injected rule and the logic unit test cannot drift.
+/// The `8` is `ravel-server`'s `--max-inflight-flushes` default, which applies
+/// when `maxInflightFlushes` is omitted.
+const FLUSH_SHARE_ABOVE_PERMITS_RULE: &str = "!has(self.maxInflightFlushesPerTenant) || \
+    self.maxInflightFlushesPerTenant <= \
+    (has(self.maxInflightFlushes) ? self.maxInflightFlushes : 8)";
+
+/// Attach the flush-share guard to the `gateway` property, appended like the
+/// other gateway guards. `ravel-server` rejects a share above its permit count
+/// with `FlushShareAboveMaxInflightFlushes`, so without this rule such a CR is
+/// admitted and every gateway pod crash-loops.
+fn inject_flush_share_guard(crd: &mut CustomResourceDefinition) {
+    let rule = ValidationRule {
+        rule: FLUSH_SHARE_ABOVE_PERMITS_RULE.to_string(),
+        message: Some(FLUSH_SHARE_ABOVE_PERMITS_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    for version in &mut crd.spec.versions {
+        let Some(schema) = version.schema.as_mut() else {
+            continue;
+        };
+        let Some(root) = schema.open_api_v3_schema.as_mut() else {
+            continue;
+        };
+        let Some(props) = root.properties.as_mut() else {
+            continue;
+        };
+        let Some(spec) = props.get_mut("spec") else {
+            continue;
+        };
+        let Some(spec_props) = spec.properties.as_mut() else {
+            continue;
+        };
+        let Some(gateway) = spec_props.get_mut("gateway") else {
+            continue;
+        };
+        let mut rules = gateway.x_kubernetes_validations.take().unwrap_or_default();
+        rules.push(rule.clone());
+        gateway.x_kubernetes_validations = Some(rules);
+    }
+}
+
+/// Message surfaced when `spec.query` sets a headroom without a budget.
+const QUERY_HEADROOM_NEEDS_BUDGET_MESSAGE: &str = "query.memoryHeadroomBytes needs \
+    query.memoryBudgetBytes: the headroom is measured above a pinned budget, and without \
+    one the operator would ignore it";
+
+/// The CEL rule refusing `memoryHeadroomBytes` without `memoryBudgetBytes`,
+/// kept as a constant so the injected rule and the logic unit test cannot
+/// drift. The operator checks the headroom only against a pinned budget, so a
+/// headroom alone would be accepted and do nothing.
+const QUERY_HEADROOM_NEEDS_BUDGET_RULE: &str =
+    "has(self.memoryBudgetBytes) || !has(self.memoryHeadroomBytes)";
+
+/// Attach the headroom guard to the `query` property, appended to any rules
+/// already there. The API server evaluates it when a CR is written, so a
+/// cluster stored with a headroom and no budget before the rule keeps
+/// reconciling with the headroom ignored, as before.
+fn inject_query_headroom_needs_budget(crd: &mut CustomResourceDefinition) {
+    let rule = ValidationRule {
+        rule: QUERY_HEADROOM_NEEDS_BUDGET_RULE.to_string(),
+        message: Some(QUERY_HEADROOM_NEEDS_BUDGET_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    for version in &mut crd.spec.versions {
+        let Some(schema) = version.schema.as_mut() else {
+            continue;
+        };
+        let Some(root) = schema.open_api_v3_schema.as_mut() else {
+            continue;
+        };
+        let Some(props) = root.properties.as_mut() else {
+            continue;
+        };
+        let Some(spec) = props.get_mut("spec") else {
+            continue;
+        };
+        let Some(spec_props) = spec.properties.as_mut() else {
+            continue;
+        };
+        let Some(query) = spec_props.get_mut("query") else {
+            continue;
+        };
+        let mut rules = query.x_kubernetes_validations.take().unwrap_or_default();
+        rules.push(rule.clone());
+        query.x_kubernetes_validations = Some(rules);
+    }
+}
+
+/// Message surfaced when `spec.query.mcp` is enabled with no origin.
+const QUERY_MCP_NEEDS_ORIGINS_MESSAGE: &str = "query.mcp.enabled needs at least one \
+    query.mcp.allowedOrigins entry: the query pods listen on 0.0.0.0, and ravel-server \
+    refuses to start --mcp on a non-loopback listener with an empty allowlist";
+
+/// The CEL rule refusing `enabled: true` without an origin. Both fields carry
+/// serde defaults and may be absent from the stored object, so each is
+/// `has()`-guarded.
+const QUERY_MCP_NEEDS_ORIGINS_RULE: &str = "!has(self.enabled) || !self.enabled || \
+    (has(self.allowedOrigins) && size(self.allowedOrigins) > 0)";
+
+/// Message surfaced when an `allowedOrigins` entry is empty or holds a comma.
+const QUERY_MCP_ORIGIN_SHAPE_MESSAGE: &str = "query.mcp.allowedOrigins entries must be \
+    non-empty and contain no comma: the list renders as one comma-joined \
+    --mcp-allowed-origins value, which ravel-server splits on commas";
+
+/// The CEL rule refusing an empty or comma-bearing origin entry.
+const QUERY_MCP_ORIGIN_SHAPE_RULE: &str = "!has(self.allowedOrigins) || \
+    self.allowedOrigins.all(o, size(o) > 0 && !o.contains(','))";
+
+/// Attach the two MCP rules to the `query.mcp` property, appended to any rules
+/// already there. They sit on `mcp` rather than `query`, so a cluster that
+/// omits the block has nothing to evaluate.
+fn inject_query_mcp_guards(crd: &mut CustomResourceDefinition) {
+    let rules = [
+        (
+            QUERY_MCP_NEEDS_ORIGINS_RULE,
+            QUERY_MCP_NEEDS_ORIGINS_MESSAGE,
+        ),
+        (QUERY_MCP_ORIGIN_SHAPE_RULE, QUERY_MCP_ORIGIN_SHAPE_MESSAGE),
+    ]
+    .map(|(rule, message)| ValidationRule {
+        rule: rule.to_string(),
+        message: Some(message.to_string()),
+        ..Default::default()
+    });
+    for version in &mut crd.spec.versions {
+        let Some(mcp) = version
+            .schema
+            .as_mut()
+            .and_then(|s| s.open_api_v3_schema.as_mut())
+            .and_then(|root| root.properties.as_mut())
+            .and_then(|p| p.get_mut("spec"))
+            .and_then(|spec| spec.properties.as_mut())
+            .and_then(|p| p.get_mut("query"))
+            .and_then(|query| query.properties.as_mut())
+            .and_then(|p| p.get_mut("mcp"))
+        else {
+            continue;
+        };
+        let mut existing = mcp.x_kubernetes_validations.take().unwrap_or_default();
+        existing.extend(rules.iter().cloned());
+        mcp.x_kubernetes_validations = Some(existing);
+        // The API server refuses a CRD whose rule's estimated cost exceeds
+        // its budget, and an unbounded list of unbounded strings is costed at
+        // the request size limit, so the shape rule needs both bounds.
+        if let Some(origins) = mcp
+            .properties
+            .as_mut()
+            .and_then(|p| p.get_mut("allowedOrigins"))
+        {
+            origins.max_items = Some(QUERY_MCP_MAX_ORIGINS);
+            if let Some(JSONSchemaPropsOrArray::Schema(item)) = origins.items.as_mut() {
+                item.max_length = Some(QUERY_MCP_MAX_ORIGIN_LENGTH);
+            }
+        }
+    }
+}
+
+/// Most `query.mcp.allowedOrigins` entries admitted.
+const QUERY_MCP_MAX_ORIGINS: i64 = 64;
+
+/// Longest `query.mcp.allowedOrigins` entry admitted, in characters. An
+/// origin is a scheme, a host of at most 253 characters and a port.
+const QUERY_MCP_MAX_ORIGIN_LENGTH: i64 = 1024;
+
+/// Message surfaced when `storage.s3` names no credential Secret under
+/// `auth: static`.
+const STATIC_AUTH_SECRET_MESSAGE: &str = "credentialsSecretRef is required under auth: static";
+
+/// `storage.s3.credentialsSecretRef` is required unless `auth` is
+/// `podIdentity`. `auth` carries a schema default, so `has()` is a belt for a
+/// manifest evaluated before defaulting.
+const STATIC_AUTH_SECRET_RULE: &str =
+    "(has(self.auth) && self.auth == 'podIdentity') || has(self.credentialsSecretRef)";
+
+/// Message surfaced when a per-tier credential override is set under
+/// `auth: podIdentity`.
+const POD_IDENTITY_TIER_OVERRIDE_MESSAGE: &str = "gateway, query and maintain \
+    credentialsSecretRef overrides are refused under storage.s3.auth: podIdentity; each tier's \
+    role comes from the Pod Identity association on its ServiceAccount (<name>-gateway, \
+    <name>-query, <name>-maintain)";
+
+/// No per-tier `credentialsSecretRef` under `podIdentity`. Each tier block
+/// carries a serde default and may be omitted, so each is `has()`-guarded,
+/// and `storage.s3` is optional, so it is too: `has()` on a field of an
+/// absent object is an evaluation error, not false.
+const POD_IDENTITY_TIER_OVERRIDE_RULE: &str = "!has(self.storage.s3) || \
+    !has(self.storage.s3.auth) || \
+    self.storage.s3.auth != 'podIdentity' || \
+    ((!has(self.gateway) || !has(self.gateway.credentialsSecretRef)) && \
+    (!has(self.query) || !has(self.query.credentialsSecretRef)) && \
+    (!has(self.maintain) || !has(self.maintain.credentialsSecretRef)))";
+
+/// Message surfaced when `storage` names neither backend or both.
+const STORAGE_ONE_OF_MESSAGE: &str = "storage must set exactly one of s3 and azure";
+
+/// Exactly one of `storage.s3` and `storage.azure`.
+const STORAGE_ONE_OF_RULE: &str = "has(self.s3) != has(self.azure)";
+
+/// Message surfaced when a per-tier credential override is set under
+/// `storage.azure`.
+const AZURE_TIER_OVERRIDE_MESSAGE: &str = "gateway, query and maintain \
+    credentialsSecretRef overrides are refused under storage.azure; each tier's identity is \
+    the client ID on its ServiceAccount (storage.azure.clientId or roleClientIds)";
+
+/// No per-tier `credentialsSecretRef` under `storage.azure`.
+const AZURE_TIER_OVERRIDE_RULE: &str = "!has(self.storage.azure) || \
+    ((!has(self.gateway) || !has(self.gateway.credentialsSecretRef)) && \
+    (!has(self.query) || !has(self.query.credentialsSecretRef)) && \
+    (!has(self.maintain) || !has(self.maintain.credentialsSecretRef)))";
+
+/// `storage.azure.account`: an Azure storage account name, 3 to 24 lowercase
+/// letters and digits.
+const AZURE_ACCOUNT_PATTERN: &str = "^[a-z0-9]{3,24}$";
+
+/// `storage.azure.container`: an Azure container name, 3 to 63 lowercase
+/// letters, digits and single hyphens, starting and ending with a letter or
+/// digit. The length is `minLength`/`maxLength` beside it.
+const AZURE_CONTAINER_PATTERN: &str = "^[a-z0-9]+(-[a-z0-9]+)*$";
+
+/// `storage.azure.clientId` and every `roleClientIds` entry: a UUID.
+const AZURE_CLIENT_ID_PATTERN: &str =
+    "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$";
+
+/// Stamp the name and client ID patterns onto the `storage.azure` schema, so
+/// the API server refuses a malformed value at admission rather than the
+/// pods failing at startup.
+fn inject_azure_field_validation(azure: &mut JSONSchemaProps) {
+    let Some(props) = azure.properties.as_mut() else {
+        return;
+    };
+    let constrain = |schema: &mut JSONSchemaProps, pattern: &str, min: i64, max: i64| {
+        schema.pattern = Some(pattern.to_string());
+        schema.min_length = Some(min);
+        schema.max_length = Some(max);
+    };
+    if let Some(account) = props.get_mut("account") {
+        constrain(account, AZURE_ACCOUNT_PATTERN, 3, 24);
+    }
+    if let Some(container) = props.get_mut("container") {
+        constrain(container, AZURE_CONTAINER_PATTERN, 3, 63);
+    }
+    if let Some(client_id) = props.get_mut("clientId") {
+        constrain(client_id, AZURE_CLIENT_ID_PATTERN, 36, 36);
+    }
+    let Some(role_ids) = props
+        .get_mut("roleClientIds")
+        .and_then(|role_ids| role_ids.properties.as_mut())
+    else {
+        return;
+    };
+    for role_id in role_ids.values_mut() {
+        constrain(role_id, AZURE_CLIENT_ID_PATTERN, 36, 36);
+    }
+}
+
+/// Attach the storage rules (ADR-0034, Pod Identity storage credentials
+/// amendment; ADR-4158 D11): on `storage`, exactly one backend; on
+/// `storage.s3`, the shared Secret is required under `static`; on `spec`,
+/// the per-tier overrides are refused under `podIdentity` and under
+/// `azure`. The tier rules read three sibling blocks, so they sit on
+/// `spec`, their common parent. Injected post-hoc and appended to any rules
+/// already there, like the other injectors.
+fn inject_storage_auth_guards(crd: &mut CustomResourceDefinition) {
+    let one_of_rule = ValidationRule {
+        rule: STORAGE_ONE_OF_RULE.to_string(),
+        message: Some(STORAGE_ONE_OF_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    let static_rule = ValidationRule {
+        rule: STATIC_AUTH_SECRET_RULE.to_string(),
+        message: Some(STATIC_AUTH_SECRET_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    let tier_rule = ValidationRule {
+        rule: POD_IDENTITY_TIER_OVERRIDE_RULE.to_string(),
+        message: Some(POD_IDENTITY_TIER_OVERRIDE_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    let azure_tier_rule = ValidationRule {
+        rule: AZURE_TIER_OVERRIDE_RULE.to_string(),
+        message: Some(AZURE_TIER_OVERRIDE_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    for version in &mut crd.spec.versions {
+        let Some(schema) = version.schema.as_mut() else {
+            continue;
+        };
+        let Some(root) = schema.open_api_v3_schema.as_mut() else {
+            continue;
+        };
+        let Some(props) = root.properties.as_mut() else {
+            continue;
+        };
+        let Some(spec) = props.get_mut("spec") else {
+            continue;
+        };
+        let mut spec_rules = spec.x_kubernetes_validations.take().unwrap_or_default();
+        spec_rules.push(tier_rule.clone());
+        spec_rules.push(azure_tier_rule.clone());
+        spec.x_kubernetes_validations = Some(spec_rules);
+        let Some(storage) = spec
+            .properties
+            .as_mut()
+            .and_then(|spec_props| spec_props.get_mut("storage"))
+        else {
+            continue;
+        };
+        let mut storage_rules = storage.x_kubernetes_validations.take().unwrap_or_default();
+        storage_rules.push(one_of_rule.clone());
+        storage.x_kubernetes_validations = Some(storage_rules);
+        let Some(storage_props) = storage.properties.as_mut() else {
+            continue;
+        };
+        // An explicit `null` must not count as present to the one-of rule
+        // while serde reads it as absent, so neither backend admits one.
+        for backend in ["s3", "azure"] {
+            if let Some(schema) = storage_props.get_mut(backend) {
+                schema.nullable = None;
+            }
+        }
+        if let Some(azure) = storage_props.get_mut("azure") {
+            inject_azure_field_validation(azure);
+        }
+        let Some(s3) = storage_props.get_mut("s3") else {
+            continue;
+        };
+        let mut s3_rules = s3.x_kubernetes_validations.take().unwrap_or_default();
+        s3_rules.push(static_rule.clone());
+        s3.x_kubernetes_validations = Some(s3_rules);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crd_has_expected_identity() {
+        let crd = ravel_cluster_crd();
+        assert_eq!(crd.spec.group, "ravel.nofire.ai");
+        assert_eq!(crd.spec.names.kind, "RavelCluster");
+        assert_eq!(crd.spec.scope, "Namespaced");
+        let version = &crd.spec.versions[0];
+        assert_eq!(version.name, "v1alpha1");
+        assert!(version.served);
+        assert!(version.storage);
+        // The status subresource must be declared for status writes to work.
+        assert!(
+            version
+                .subresources
+                .as_ref()
+                .expect("subresources present")
+                .status
+                .is_some(),
+            "status subresource must be enabled"
+        );
+    }
+
+    #[test]
+    fn crd_schema_includes_shard_immutability_rule() {
+        let crd = ravel_cluster_crd();
+        let version = &crd.spec.versions[0];
+        let root = version
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema");
+        let spec = root
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop");
+        let shards = spec
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("shards")
+            .expect("shards prop");
+        let rules = shards
+            .x_kubernetes_validations
+            .as_ref()
+            .expect("shards must carry a validation rule");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].rule, "self == oldSelf");
+        assert!(rules[0].message.is_some());
+    }
+
+    #[test]
+    fn count_fields_carry_minimum_one_bound() {
+        let crd = ravel_cluster_crd();
+        let version = &crd.spec.versions[0];
+        let root = version
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema");
+        let spec_props = root
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props");
+
+        assert_eq!(
+            spec_props.get("shards").expect("shards prop").minimum,
+            Some(1.0),
+            "shards must reject 0"
+        );
+        for tier in ["gateway", "query", "maintain"] {
+            let replicas = spec_props
+                .get(tier)
+                .expect("tier prop")
+                .properties
+                .as_ref()
+                .expect("tier props")
+                .get("replicas")
+                .expect("replicas prop");
+            assert_eq!(
+                replicas.minimum,
+                Some(1.0),
+                "{tier}.replicas must reject negative/zero"
+            );
+        }
+    }
+
+    #[test]
+    fn query_memory_budget_carries_minimum_one_bound() {
+        // ravel-server refuses an explicit --memory-budget-bytes 0 at startup;
+        // a zero headroom is a legitimate override and keeps schemars' 0.
+        let crd = ravel_cluster_crd();
+        let query_props = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .and_then(|root| root.properties.as_ref())
+            .and_then(|props| props.get("spec"))
+            .and_then(|spec| spec.properties.as_ref())
+            .and_then(|props| props.get("query"))
+            .and_then(|query| query.properties.as_ref())
+            .expect("query props");
+        let minimum = |field: &str| query_props.get(field).expect(field).minimum;
+        assert_eq!(minimum("memoryBudgetBytes"), Some(1.0));
+        assert_eq!(minimum("memoryHeadroomBytes"), Some(0.0));
+    }
+
+    #[test]
+    fn maintain_and_fold_intervals_carry_minimum_one_bound() {
+        // ravel-server refuses a zero --maintain-interval-secs and a zero
+        // --fold-interval-secs at startup, so admission must refuse 0 for the
+        // fields rendered into them. schemars alone emits `minimum: 0.0`.
+        let crd = ravel_cluster_crd();
+        let maintain_props = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("maintain")
+            .expect("maintain prop")
+            .properties
+            .as_ref()
+            .expect("maintain props");
+
+        assert_eq!(
+            maintain_props
+                .get("intervalSecs")
+                .expect("maintain.intervalSecs prop")
+                .minimum,
+            Some(1.0),
+            "maintain.intervalSecs must reject 0"
+        );
+        assert_eq!(
+            maintain_props
+                .get("fold")
+                .expect("maintain.fold prop")
+                .properties
+                .as_ref()
+                .expect("maintain.fold props")
+                .get("intervalSecs")
+                .expect("maintain.fold.intervalSecs prop")
+                .minimum,
+            Some(1.0),
+            "maintain.fold.intervalSecs must reject 0"
+        );
+    }
+
+    #[test]
+    fn per_tier_credential_overrides_are_in_the_schema_and_optional() {
+        // ADR-0055 section 5: each tier gains an optional credentialsSecretRef.
+        // The JsonSchema derive must surface them under each tier's properties,
+        // and they must be absent by default (Option::is_none skip) so an
+        // existing spec that omits them still deserializes.
+        let crd = ravel_cluster_crd();
+        let version = &crd.spec.versions[0];
+        let spec_props = version
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props");
+        for tier in ["gateway", "query", "maintain"] {
+            let tier_props = spec_props
+                .get(tier)
+                .expect("tier prop")
+                .properties
+                .as_ref()
+                .expect("tier props");
+            assert!(
+                tier_props.contains_key("credentialsSecretRef"),
+                "{tier} must expose credentialsSecretRef in its schema"
+            );
+        }
+
+        // A spec omitting every override still deserializes, with all None.
+        let json = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(spec.gateway.credentials_secret_ref, None);
+        assert_eq!(spec.query.credentials_secret_ref, None);
+        assert_eq!(spec.maintain.credentials_secret_ref, None);
+    }
+
+    #[test]
+    fn deployment_key_secret_ref_is_in_the_schema_and_optional() {
+        // ADR-0072 decision 4: the CRD carries an optional
+        // deploymentKeySecretRef at the top level (sibling of
+        // tenantTokensSecretRef, not per-tier: one deployment key covers the
+        // whole cluster). Must be visible in the schema and default to None so
+        // an existing keyless spec still deserializes unchanged.
+        let crd = ravel_cluster_crd();
+        let version = &crd.spec.versions[0];
+        let spec_props = version
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props");
+        assert!(
+            spec_props.contains_key("deploymentKeySecretRef"),
+            "spec must expose deploymentKeySecretRef in its schema"
+        );
+
+        let json = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(spec.deployment_key_secret_ref, None);
+    }
+
+    #[test]
+    fn audit_token_key_secret_ref_is_in_the_schema_and_optional() {
+        // #1487: the CRD carries an optional auditTokenKeySecretRef at the top
+        // level, sibling to deploymentKeySecretRef. Must be visible in the
+        // schema and default to None so an existing spec still deserializes
+        // unchanged.
+        let crd = ravel_cluster_crd();
+        let version = &crd.spec.versions[0];
+        let spec_props = version
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props");
+        assert!(
+            spec_props.contains_key("auditTokenKeySecretRef"),
+            "spec must expose auditTokenKeySecretRef in its schema"
+        );
+
+        let json = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(spec.audit_token_key_secret_ref, None);
+    }
+
+    /// `spec.query.distributedQuery` is optional, an empty block stays
+    /// disabled, and the schema carries the flag and the four Secret
+    /// references.
+    #[test]
+    fn distributed_query_is_optional_and_disabled_by_default() {
+        let crd = ravel_cluster_crd();
+        let dq_props = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .and_then(|root| root.properties.as_ref())
+            .and_then(|p| p.get("spec"))
+            .and_then(|spec| spec.properties.as_ref())
+            .and_then(|p| p.get("query"))
+            .and_then(|query| query.properties.as_ref())
+            .and_then(|p| p.get("distributedQuery"))
+            .and_then(|dq| dq.properties.as_ref())
+            .expect("query.distributedQuery properties in the schema");
+        let mut keys: Vec<&str> = dq_props.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "enabled",
+                "fragmentCaSecretRef",
+                "fragmentKeySecretRef",
+                "fragmentTlsSecretRef",
+                "sqlTicketKeySecretRef",
+            ]
+        );
+
+        let base = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(base.clone()).expect("deserialize");
+        assert_eq!(spec.query.distributed_query, None);
+
+        let mut declared = base;
+        declared["query"] = serde_json::json!({ "distributedQuery": {} });
+        let spec: RavelClusterSpec = serde_json::from_value(declared).expect("deserialize");
+        assert_eq!(
+            spec.query.distributed_query,
+            Some(DistributedQuerySpec::default())
+        );
+        assert!(!DistributedQuerySpec::default().enabled);
+    }
+
+    #[test]
+    fn ingest_affinity_is_optional_and_defaults_to_a_two_replica_subset() {
+        // ADR-0076 decision 1. The block is optional: an existing RavelCluster
+        // that never heard of affinity deserializes with None and therefore
+        // renders no Ingress at all. Declaring it empty enables it with the
+        // documented defaults, of which the load-bearing one is subsetSize = 2.
+        let crd = ravel_cluster_crd();
+        let gateway_props = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("gateway")
+            .expect("gateway prop")
+            .properties
+            .as_ref()
+            .expect("gateway props")
+            .clone();
+        assert!(
+            gateway_props.contains_key("ingestAffinity"),
+            "gateway must expose ingestAffinity in its schema"
+        );
+
+        let base = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(base.clone()).expect("deserialize");
+        assert_eq!(spec.gateway.ingest_affinity, None);
+
+        let mut with_affinity = base;
+        with_affinity["gateway"] = serde_json::json!({ "ingestAffinity": {} });
+        let spec: RavelClusterSpec = serde_json::from_value(with_affinity).expect("deserialize");
+        let affinity = spec
+            .gateway
+            .ingest_affinity
+            .expect("ingestAffinity present");
+        assert!(affinity.enabled, "declaring the block enables affinity");
+        assert_eq!(
+            affinity.subset_size, DEFAULT_AFFINITY_SUBSET_SIZE,
+            "the default subset is two replicas, not one"
+        );
+        assert_eq!(affinity.subset_size, 2);
+        assert_eq!(affinity.key.source, AffinityKeySource::AuthorizationHeader);
+        assert_eq!(affinity.key.header_name, None);
+        assert!(affinity.grpc, "OTLP/gRPC is pinned by default");
+        assert_eq!(affinity.hosts, Vec::<String>::new());
+    }
+
+    #[test]
+    fn ingest_affinity_schema_carries_its_bounds_and_header_rule() {
+        let crd = ravel_cluster_crd();
+        let affinity = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("gateway")
+            .expect("gateway prop")
+            .properties
+            .as_ref()
+            .expect("gateway props")
+            .get("ingestAffinity")
+            .expect("ingestAffinity prop")
+            .clone();
+
+        // subsetSize must reject 0: a zero subset routes nowhere.
+        let affinity_props = affinity.properties.as_ref().expect("affinity props");
+        assert_eq!(
+            affinity_props
+                .get("subsetSize")
+                .expect("subsetSize prop")
+                .minimum,
+            Some(1.0)
+        );
+
+        // headerName is constrained to HTTP token characters, so nothing
+        // user-supplied can reach the rendered nginx directive as syntax.
+        assert_eq!(
+            affinity_props
+                .get("key")
+                .expect("key prop")
+                .properties
+                .as_ref()
+                .expect("key props")
+                .get("headerName")
+                .expect("headerName prop")
+                .pattern
+                .as_deref(),
+            Some(AFFINITY_HEADER_NAME_PATTERN)
+        );
+
+        // And source: header without headerName is refused at admission rather
+        // than silently falling back to a different key.
+        let rules = affinity
+            .x_kubernetes_validations
+            .as_ref()
+            .expect("ingestAffinity must carry a validation rule");
+        assert_eq!(rules.len(), 1);
+        assert!(
+            rules[0].rule.contains("headerName"),
+            "rule must be about headerName: {}",
+            rules[0].rule
+        );
+        assert_eq!(
+            rules[0].message.as_deref(),
+            Some(AFFINITY_HEADER_NAME_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn affinity_backend_defaults_to_ingress_nginx_for_an_existing_cr() {
+        // ADR-0080 decision 1: `backend` is additive. A CR serialized before
+        // the field existed must deserialize onto the backend it already runs,
+        // with subsetSize and key semantics untouched -- an upgrade that
+        // silently moved either would be a behavior change.
+        let affinity: IngestAffinitySpec = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "subsetSize": 3,
+            "key": { "source": "header", "headerName": "x-tenant" },
+            "ingressClassName": "nginx",
+            "hosts": ["ingest.example.com"],
+            "tlsSecretName": "ingest-tls",
+            "grpc": true,
+        }))
+        .expect("legacy ingestAffinity JSON deserializes");
+        assert_eq!(affinity.backend, AffinityBackend::IngressNginx);
+        assert_eq!(affinity.subset_size, 3);
+        assert_eq!(affinity.key.source, AffinityKeySource::Header);
+        assert_eq!(affinity.key.header_name.as_deref(), Some("x-tenant"));
+
+        assert_eq!(
+            IngestAffinitySpec::default().backend,
+            AffinityBackend::IngressNginx
+        );
+
+        // The schema exposes the field, so a CR can opt into the new backend.
+        let affinity_props = ravel_cluster_crd().spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("gateway")
+            .expect("gateway prop")
+            .properties
+            .as_ref()
+            .expect("gateway props")
+            .get("ingestAffinity")
+            .expect("ingestAffinity prop")
+            .properties
+            .clone()
+            .expect("affinity props");
+        assert!(
+            affinity_props.contains_key("backend"),
+            "ingestAffinity must expose backend in its schema"
+        );
+    }
+
+    #[test]
+    fn affinity_backends_serialize_as_documented_camel_case() {
+        // Public CRD enum values, quoted in the guide and in manifests.
+        for (backend, text) in [
+            (AffinityBackend::IngressNginx, "ingressNginx"),
+            (AffinityBackend::RavelNative, "ravelNative"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(backend).expect("serialize"),
+                serde_json::Value::String(text.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn affinity_key_sources_serialize_as_documented_camel_case() {
+        // These strings are the CRD's public enum values and appear in the
+        // operations guide; renaming a variant silently would break manifests.
+        for (source, text) in [
+            (
+                AffinityKeySource::AuthorizationHeader,
+                "authorizationHeader",
+            ),
+            (AffinityKeySource::Header, "header"),
+            (AffinityKeySource::MtlsSubject, "mtlsSubject"),
+            (AffinityKeySource::CanonicalTenant, "canonicalTenant"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(source).expect("serialize"),
+                serde_json::Value::String(text.to_string())
+            );
+        }
+    }
+
+    /// Rust mirror of [`CANONICAL_TENANT_BACKEND_RULE`]: returns whether the
+    /// combination is ADMITTED (the CEL rule evaluates true). `backend` is
+    /// always materialized when the affinity block is present (serde/schema
+    /// default `ingressNginx`), so it is modeled as always present. The exact
+    /// rule string is pinned separately in
+    /// [`canonical_tenant_key_source_rejected_with_ingress_nginx_backend`], so a
+    /// change to the real rule that diverges from this model is caught there.
+    fn canonical_tenant_cel_admits(key_source: &str, backend: &str) -> bool {
+        key_source != "canonicalTenant" || backend != "ingressNginx"
+    }
+
+    #[test]
+    fn canonical_tenant_key_source_rejected_with_ingress_nginx_backend() {
+        // ADR-0080 decision 3. Test venue: schema assertion plus a plain-Rust
+        // logic mirror, the same venue #156/T2 established for this repo's CEL
+        // rules (no envtest exists here; x-kubernetes-validations runs in the
+        // API server, which a reconcile unit test cannot reach).
+
+        // The one rejected combination:
+        assert!(
+            !canonical_tenant_cel_admits("canonicalTenant", "ingressNginx"),
+            "canonicalTenant + ingressNginx must be rejected"
+        );
+
+        // Every allowed combination named in the deliverable:
+        assert!(
+            canonical_tenant_cel_admits("canonicalTenant", "ravelNative"),
+            "canonicalTenant + ravelNative is allowed"
+        );
+        for backend in ["ingressNginx", "ravelNative"] {
+            for source in ["authorizationHeader", "header", "mtlsSubject"] {
+                assert!(
+                    canonical_tenant_cel_admits(source, backend),
+                    "{source} + {backend} is allowed"
+                );
+            }
+        }
+
+        // The schema carries the exact rule and message on the `gateway`
+        // property (the same shape as the exposure guard), appended alongside it
+        // rather than nested inside ingestAffinity.
+        let gateway = ravel_cluster_crd().spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("gateway")
+            .expect("gateway prop")
+            .clone();
+        let rules = gateway
+            .x_kubernetes_validations
+            .as_ref()
+            .expect("gateway must carry CEL rules");
+        let guard = rules
+            .iter()
+            .find(|r| r.rule == CANONICAL_TENANT_BACKEND_RULE)
+            .expect("gateway must carry the exact canonical-tenant/backend rule");
+        assert_eq!(
+            guard.message.as_deref(),
+            Some(CANONICAL_TENANT_BACKEND_MESSAGE)
+        );
+        // The exposure guard already on `gateway` is not dropped by appending.
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.rule == GATEWAY_EXPOSURE_AFFINITY_RULE),
+            "appending the canonical-tenant rule must not drop the exposure guard"
+        );
+        // ingestAffinity still carries only its own headerName rule (the
+        // canonical-tenant rule lives on gateway, not here).
+        let affinity_rules = gateway
+            .properties
+            .as_ref()
+            .expect("gateway props")
+            .get("ingestAffinity")
+            .expect("ingestAffinity prop")
+            .x_kubernetes_validations
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            affinity_rules
+                .iter()
+                .all(|r| r.rule != CANONICAL_TENANT_BACKEND_RULE),
+            "the canonical-tenant rule must live on `gateway`, not on `ingestAffinity`"
+        );
+    }
+
+    #[test]
+    fn router_image_is_optional_and_defaults_to_none() {
+        // ADR-0080 decision 3, deliverable 1. A sibling of `backend`, optional
+        // and skipped when None so an existing CR is byte-identical.
+        assert_eq!(IngestAffinitySpec::default().router_image, None);
+
+        let affinity: IngestAffinitySpec = serde_json::from_value(serde_json::json!({
+            "backend": "ravelNative",
+            "routerImage": "registry.example/ravel-ingest-router:v1"
+        }))
+        .expect("deserialize");
+        assert_eq!(
+            affinity.router_image.as_deref(),
+            Some("registry.example/ravel-ingest-router:v1")
+        );
+
+        // Omitted routerImage deserializes to None, and the schema exposes it.
+        let affinity: IngestAffinitySpec =
+            serde_json::from_value(serde_json::json!({ "backend": "ravelNative" }))
+                .expect("deserialize");
+        assert_eq!(affinity.router_image, None);
+        let affinity_props = ravel_cluster_crd().spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("gateway")
+            .expect("gateway prop")
+            .properties
+            .as_ref()
+            .expect("gateway props")
+            .get("ingestAffinity")
+            .expect("ingestAffinity prop")
+            .properties
+            .clone()
+            .expect("affinity props");
+        assert!(
+            affinity_props.contains_key("routerImage"),
+            "ingestAffinity must expose routerImage in its schema"
+        );
+    }
+
+    #[test]
+    fn shard_overrides_is_optional_and_lead_hours_defaults_to_the_minimum() {
+        // #147, ADR-0076 decision 2. Absent by default, like retention: an
+        // existing RavelCluster that never heard of shardOverrides
+        // deserializes with None and the reconcile step (controller.rs) does
+        // nothing. Declaring an empty tenants map still surfaces
+        // leadHours == MIN_RESHARD_LEAD_HOURS.
+        let crd = ravel_cluster_crd();
+        let spec_props = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props");
+        assert!(
+            spec_props.contains_key("shardOverrides"),
+            "spec must expose shardOverrides in its schema"
+        );
+
+        let base = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(base.clone()).expect("deserialize");
+        assert_eq!(spec.shard_overrides, None);
+
+        let mut with_overrides = base;
+        with_overrides["shardOverrides"] = serde_json::json!({
+            "tenants": { "tenant-a": 1 }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(with_overrides).expect("deserialize");
+        let overrides = spec.shard_overrides.expect("shardOverrides present");
+        assert_eq!(overrides.tenants.get("tenant-a"), Some(&1));
+        assert_eq!(
+            overrides.lead_hours, MIN_RESHARD_LEAD_HOURS,
+            "omitting leadHours must default to the minimum, not zero"
+        );
+    }
+
+    #[test]
+    fn gc_block_is_optional_with_both_horizon_fields_optional() {
+        // #1083. The GC block is a new optional sibling of retention: an
+        // existing RavelCluster that never heard of it deserializes with None,
+        // so the maintain pod carries no --gc- flag and the server's compiled-in
+        // default applies (byte-identical to today). Both horizon fields inside
+        // it are optional too, so a spec may set one, both, or neither.
+        let crd = ravel_cluster_crd();
+        let gc = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("gc")
+            .expect("gc prop")
+            .clone();
+        let gc_props = gc.properties.as_ref().expect("gc props");
+        assert!(
+            gc_props.contains_key("protectionHorizon"),
+            "gc must expose protectionHorizon in its schema"
+        );
+        assert!(
+            gc_props.contains_key("grace"),
+            "gc must expose grace in its schema"
+        );
+        // Neither field is required: the block may set one, both, or neither.
+        let required = gc.required.clone().unwrap_or_default();
+        assert!(
+            !required.contains(&"protectionHorizon".to_string())
+                && !required.contains(&"grace".to_string()),
+            "both gc horizon fields must be optional, required was {required:?}"
+        );
+
+        let base = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(base.clone()).expect("deserialize");
+        assert_eq!(spec.gc, None, "omitting the block deserializes to None");
+
+        let mut with_gc = base;
+        with_gc["gc"] = serde_json::json!({ "protectionHorizon": "26h" });
+        let spec: RavelClusterSpec = serde_json::from_value(with_gc).expect("deserialize");
+        let gc = spec.gc.expect("gc present");
+        assert_eq!(gc.protection_horizon.as_deref(), Some("26h"));
+        assert_eq!(gc.grace, None, "grace may be set independently of horizon");
+    }
+
+    #[test]
+    fn spec_defaults_are_applied_on_deserialize() {
+        // A minimal spec: only the required fields. Optional tiers and region
+        // must fall back to their defaults.
+        let json = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(
+            spec.storage.s3.as_ref().expect("s3 is set").region,
+            "us-east-1"
+        );
+        assert_eq!(spec.gateway.replicas, 1);
+        assert_eq!(spec.query.replicas, 1);
+        // Maintain replicas is optional and defaults to 1: an existing spec
+        // that omits it keeps single-replica behavior.
+        assert_eq!(spec.maintain.replicas, 1);
+        assert!(spec.maintain.enabled);
+        assert_eq!(spec.image_pull_policy, None);
+    }
+
+    /// The `gateway` schema property for `ravel_cluster_crd()`.
+    fn gateway_schema_props() -> BTreeMap<
+        String,
+        k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::JSONSchemaProps,
+    > {
+        ravel_cluster_crd().spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("gateway")
+            .expect("gateway prop")
+            .properties
+            .clone()
+            .expect("gateway props")
+    }
+
+    #[test]
+    fn exposure_is_optional_and_defaults_to_none_with_grpc_defaulting_true() {
+        // ADR-0080 decision 2. The block is a new sibling of ingestAffinity and
+        // is optional: an existing RavelCluster that never heard of exposure
+        // deserializes with None, so it renders zero routes -- zero behavior
+        // change. GatewaySpec::default() also carries exposure: None.
+        assert_eq!(GatewaySpec::default().exposure, None);
+        assert!(
+            gateway_schema_props().contains_key("exposure"),
+            "gateway must expose the exposure block in its schema"
+        );
+
+        let base = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(base.clone()).expect("deserialize");
+        assert_eq!(spec.gateway.exposure, None);
+
+        // Declaring gatewayApi with only a gatewayRef enables it with grpc
+        // defaulting to true and empty hostnames, and the gatewayRef namespace
+        // defaulting to None (rendered as the CR's own namespace).
+        let mut with_exposure = base;
+        with_exposure["gateway"] = serde_json::json!({
+            "exposure": { "gatewayApi": { "gatewayRef": { "name": "public-gw" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(with_exposure).expect("deserialize");
+        let gateway_api = spec
+            .gateway
+            .exposure
+            .expect("exposure present")
+            .gateway_api
+            .expect("gatewayApi present");
+        assert_eq!(gateway_api.gateway_ref.name, "public-gw");
+        assert_eq!(gateway_api.gateway_ref.namespace, None);
+        assert!(gateway_api.grpc, "grpc defaults to true");
+        assert_eq!(gateway_api.hostnames, Vec::<String>::new());
+    }
+
+    #[test]
+    fn max_inflight_flushes_is_optional_and_carries_a_minimum_one_bound() {
+        // #1743: the gateway-only flush-isolation bound surfaces under the
+        // gateway schema with minimum 1.0 (injected by inject_minimum_bounds,
+        // since schemars renders a u32 with minimum 0.0). Omitting it still
+        // deserializes with None, so an existing spec is unaffected.
+        let props = gateway_schema_props();
+        assert_eq!(
+            props
+                .get("maxInflightFlushes")
+                .expect("maxInflightFlushes prop")
+                .minimum,
+            Some(1.0),
+            "maxInflightFlushes must reject 0 at admission"
+        );
+
+        let base = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(base.clone()).expect("deserialize");
+        assert_eq!(spec.gateway.max_inflight_flushes, None);
+
+        // A set value reaches the field, so the serde attributes are wired
+        // to the right name.
+        let mut with_field = base;
+        with_field["gateway"] = serde_json::json!({ "maxInflightFlushes": 4 });
+        let spec: RavelClusterSpec =
+            serde_json::from_value(with_field).expect("deserialize with field");
+        assert_eq!(spec.gateway.max_inflight_flushes, Some(4));
+        assert_eq!(spec.gateway.max_inflight_flushes_per_tenant, None);
+
+        // Gateway only: the query and maintain schemas carry no such property,
+        // so a field added to another tier without a renderer cannot hide here.
+        let crd = ravel_cluster_crd();
+        let spec_props = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .and_then(|s| s.properties.as_ref())
+            .and_then(|p| p.get("spec"))
+            .and_then(|s| s.properties.as_ref())
+            .expect("spec properties");
+        for tier in ["query", "maintain"] {
+            let props = spec_props
+                .get(tier)
+                .and_then(|t| t.properties.as_ref())
+                .expect("tier properties");
+            assert!(
+                !props.contains_key("maxInflightFlushes"),
+                "{tier} must not carry maxInflightFlushes"
+            );
+            assert!(
+                !props.contains_key("maxInflightFlushesPerTenant"),
+                "{tier} must not carry maxInflightFlushesPerTenant"
+            );
+        }
+    }
+
+    #[test]
+    fn max_inflight_flushes_per_tenant_is_optional_and_carries_a_minimum_one_bound() {
+        let props = gateway_schema_props();
+        assert_eq!(
+            props
+                .get("maxInflightFlushesPerTenant")
+                .expect("maxInflightFlushesPerTenant prop")
+                .minimum,
+            Some(1.0),
+            "maxInflightFlushesPerTenant must reject 0 at admission"
+        );
+        let spec: RavelClusterSpec = serde_json::from_value(serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } },
+            "gateway": { "maxInflightFlushesPerTenant": 2 }
+        }))
+        .expect("deserialize with field");
+        assert_eq!(spec.gateway.max_inflight_flushes_per_tenant, Some(2));
+    }
+
+    /// Rust mirror of [`FLUSH_SHARE_ABOVE_PERMITS_RULE`]: whether a gateway
+    /// with these optional fields is admitted. No CEL evaluator runs here, so
+    /// the schema test below pins the exact expression this mirrors.
+    fn flush_share_cel_admits(permits: Option<u32>, share: Option<u32>) -> bool {
+        match share {
+            None => true,
+            Some(share) => share <= permits.unwrap_or(8),
+        }
+    }
+
+    #[test]
+    fn flush_share_above_permits_is_refused_at_admission() {
+        let crd = ravel_cluster_crd();
+        let gateway = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .and_then(|s| s.properties.as_ref())
+            .and_then(|p| p.get("spec"))
+            .and_then(|s| s.properties.as_ref())
+            .and_then(|p| p.get("gateway"))
+            .expect("gateway prop");
+        let rules = gateway
+            .x_kubernetes_validations
+            .as_ref()
+            .expect("gateway must carry CEL rules");
+        let guard = rules
+            .iter()
+            .find(|r| {
+                r.rule
+                    == "!has(self.maxInflightFlushesPerTenant) || \
+                        self.maxInflightFlushesPerTenant <= \
+                        (has(self.maxInflightFlushes) ? self.maxInflightFlushes : 8)"
+            })
+            .expect("gateway must carry the exact flush-share rule");
+        assert_eq!(
+            guard.message.as_deref(),
+            Some(FLUSH_SHARE_ABOVE_PERMITS_MESSAGE)
+        );
+        // Appending keeps the guards already on `gateway`.
+        for other in [
+            GATEWAY_EXPOSURE_AFFINITY_RULE,
+            CANONICAL_TENANT_BACKEND_RULE,
+        ] {
+            assert!(rules.iter().any(|r| r.rule == other), "dropped {other}");
+        }
+
+        assert!(!flush_share_cel_admits(Some(2), Some(4)), "2/4 refused");
+        assert!(flush_share_cel_admits(Some(4), Some(3)), "4/3 admitted");
+        assert!(flush_share_cel_admits(Some(4), Some(4)), "4/4 admitted");
+        assert!(!flush_share_cel_admits(None, Some(9)), "unset/9 refused");
+        assert!(flush_share_cel_admits(None, Some(8)), "unset/8 admitted");
+        assert!(flush_share_cel_admits(None, Some(5)), "unset/5 admitted");
+        assert!(flush_share_cel_admits(None, Some(3)), "unset/3 admitted");
+        assert!(flush_share_cel_admits(Some(2), None), "2/unset admitted");
+        assert!(flush_share_cel_admits(None, None), "unset/unset admitted");
+    }
+
+    /// Rust mirror of [`QUERY_HEADROOM_NEEDS_BUDGET_RULE`]: whether a query
+    /// block with these optional fields is admitted. No CEL evaluator runs
+    /// here, so the schema test below pins the exact expression this mirrors.
+    fn query_headroom_cel_admits(budget: Option<u64>, headroom: Option<u64>) -> bool {
+        budget.is_some() || headroom.is_none()
+    }
+
+    #[test]
+    fn query_headroom_without_budget_is_refused_at_admission() {
+        let crd = ravel_cluster_crd();
+        let query = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .and_then(|s| s.properties.as_ref())
+            .and_then(|p| p.get("spec"))
+            .and_then(|s| s.properties.as_ref())
+            .and_then(|p| p.get("query"))
+            .expect("query prop");
+        let rules = query
+            .x_kubernetes_validations
+            .as_ref()
+            .expect("query must carry CEL rules");
+        let guard = rules
+            .iter()
+            .find(|r| r.rule == "has(self.memoryBudgetBytes) || !has(self.memoryHeadroomBytes)")
+            .expect("query must carry the exact headroom rule");
+        assert_eq!(
+            guard.message.as_deref(),
+            Some(QUERY_HEADROOM_NEEDS_BUDGET_MESSAGE)
+        );
+
+        assert!(
+            !query_headroom_cel_admits(None, Some(0)),
+            "headroom alone refused"
+        );
+        assert!(
+            !query_headroom_cel_admits(None, Some(1 << 30)),
+            "headroom alone refused"
+        );
+        assert!(
+            query_headroom_cel_admits(Some(1 << 30), None),
+            "budget alone admitted"
+        );
+        assert!(
+            query_headroom_cel_admits(Some(1 << 30), Some(1 << 30)),
+            "both admitted"
+        );
+        assert!(query_headroom_cel_admits(None, None), "neither admitted");
+    }
+
+    /// Rust mirror of [`QUERY_MCP_NEEDS_ORIGINS_RULE`], with `None` for an
+    /// absent field. No CEL evaluator runs here, so the schema test below pins
+    /// the exact expression this mirrors.
+    fn query_mcp_origins_cel_admits(enabled: Option<bool>, origins: Option<&[&str]>) -> bool {
+        enabled != Some(true) || origins.is_some_and(|o| !o.is_empty())
+    }
+
+    /// Rust mirror of [`QUERY_MCP_ORIGIN_SHAPE_RULE`].
+    fn query_mcp_origin_shape_cel_admits(origins: Option<&[&str]>) -> bool {
+        origins.is_none_or(|o| o.iter().all(|e| !e.is_empty() && !e.contains(',')))
+    }
+
+    /// The `query.mcp` schema node of a CRD rendered as JSON.
+    fn query_mcp_json(crd: &serde_json::Value) -> &serde_json::Value {
+        &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+            ["query"]["properties"]["mcp"]
+    }
+
+    /// Issue #3648: the two MCP rules sit on the `query.mcp` property with
+    /// their exact text and messages, not on `query`, both in
+    /// [`ravel_cluster_crd`] and in the checked-in `crd.yaml`;
+    /// `maxBodyBytes` carries minimum 1 and `allowedOrigins` the bounds the
+    /// rule cost estimate needs. The mirrors are then evaluated over the
+    /// admission cases.
+    ///
+    /// FLIP: injecting the rules on `query` instead of `query.mcp`, or
+    /// dropping the `size(...) > 0` check from either rule, fails the exact
+    /// rule assertions.
+    #[test]
+    fn query_mcp_rules_sit_on_the_mcp_property() {
+        let crd = serde_json::to_value(ravel_cluster_crd()).expect("serialize CRD");
+        let checked_in: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/k8s/operator/crd.yaml"
+        )))
+        .expect("crd.yaml is JSON");
+        let expected = serde_json::json!([
+            {
+                "rule": "!has(self.enabled) || !self.enabled || \
+                    (has(self.allowedOrigins) && size(self.allowedOrigins) > 0)",
+                "message": QUERY_MCP_NEEDS_ORIGINS_MESSAGE,
+            },
+            {
+                "rule": "!has(self.allowedOrigins) || \
+                    self.allowedOrigins.all(o, size(o) > 0 && !o.contains(','))",
+                "message": QUERY_MCP_ORIGIN_SHAPE_MESSAGE,
+            },
+        ]);
+        for (source, crd) in [("ravel_cluster_crd", &crd), ("crd.yaml", &checked_in)] {
+            let mcp = query_mcp_json(crd);
+            assert_eq!(mcp["x-kubernetes-validations"], expected, "{source}");
+            assert_eq!(
+                mcp["properties"]["maxBodyBytes"]["minimum"],
+                serde_json::json!(1.0),
+                "{source}"
+            );
+            let origins = &mcp["properties"]["allowedOrigins"];
+            assert_eq!(origins["maxItems"], serde_json::json!(64), "{source}");
+            assert_eq!(
+                origins["items"]["maxLength"],
+                serde_json::json!(1024),
+                "{source}"
+            );
+            let query_rules = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+                ["spec"]["properties"]["query"]["x-kubernetes-validations"]
+                .to_string();
+            assert!(
+                !query_rules.contains("allowedOrigins"),
+                "{source}: query carries no MCP rule"
+            );
+        }
+
+        let origins: &[&str] = &["https://a.example"];
+        let none: &[&str] = &[];
+        assert!(
+            !query_mcp_origins_cel_admits(Some(true), None),
+            "enabled, origins absent: refused"
+        );
+        assert!(
+            !query_mcp_origins_cel_admits(Some(true), Some(none)),
+            "enabled, origins empty: refused"
+        );
+        assert!(
+            query_mcp_origins_cel_admits(Some(true), Some(origins)),
+            "enabled with origins: admitted"
+        );
+        assert!(
+            query_mcp_origins_cel_admits(Some(false), None),
+            "disabled, no origins: admitted"
+        );
+        assert!(
+            query_mcp_origins_cel_admits(None, None),
+            "enabled absent: admitted"
+        );
+
+        assert!(query_mcp_origin_shape_cel_admits(None), "absent admitted");
+        assert!(
+            query_mcp_origin_shape_cel_admits(Some(&["https://a.example", "http://b:8080"])),
+            "plain origins admitted"
+        );
+        assert!(
+            !query_mcp_origin_shape_cel_admits(Some(&["https://a.example,https://b.example"])),
+            "comma refused"
+        );
+        assert!(
+            !query_mcp_origin_shape_cel_admits(Some(&["https://a.example", ""])),
+            "empty entry refused"
+        );
+    }
+
+    /// Issue #3648: `spec.query.mcp` reads from its camelCase wire form, an
+    /// omitted block stays `None` and is not serialized back, and a block
+    /// with only `enabled` defaults the rest.
+    ///
+    /// FLIP: dropping `rename_all = "camelCase"` from [`McpSpec`] leaves
+    /// `allowedOrigins` and `maxBodyBytes` unread and fails this test.
+    #[test]
+    fn query_mcp_reads_its_camel_case_wire_form() {
+        let query: QuerySpec = serde_json::from_value(serde_json::json!({
+            "mcp": {
+                "enabled": true,
+                "allowedOrigins": ["https://a.example"],
+                "maxBodyBytes": 4096,
+            },
+        }))
+        .expect("deserialize");
+        assert_eq!(
+            query.mcp,
+            Some(McpSpec {
+                enabled: true,
+                allowed_origins: vec!["https://a.example".to_string()],
+                max_body_bytes: Some(4096),
+            })
+        );
+
+        let omitted: QuerySpec =
+            serde_json::from_value(serde_json::json!({})).expect("deserialize");
+        assert_eq!(omitted, QuerySpec::default());
+        assert!(omitted.mcp.is_none());
+        let back = serde_json::to_value(&omitted).expect("serialize");
+        assert!(back.get("mcp").is_none());
+
+        let bare: McpSpec =
+            serde_json::from_value(serde_json::json!({ "enabled": true })).expect("deserialize");
+        assert_eq!(
+            bare,
+            McpSpec {
+                enabled: true,
+                ..McpSpec::default()
+            }
+        );
+    }
+
+    #[test]
+    fn exposure_gateway_api_carries_the_cel_guard_at_the_gateway_property() {
+        // ADR-0080 decision 2: the rule spans two sibling fields (exposure and
+        // ingestAffinity), so it must sit on the `gateway` object itself, NOT
+        // nested inside ingestAffinity where the headerName rule lives. A
+        // reconcile unit test cannot exercise admission-time CEL at all; this
+        // asserts the generated schema carries the correct rule and message.
+        let crd = ravel_cluster_crd();
+        let gateway = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("gateway")
+            .expect("gateway prop")
+            .clone();
+
+        let rules = gateway
+            .x_kubernetes_validations
+            .as_ref()
+            .expect("gateway must carry the exposure/affinity CEL rule");
+        let guard = rules
+            .iter()
+            .find(|r| r.rule == GATEWAY_EXPOSURE_AFFINITY_RULE)
+            .expect("gateway must carry the exact exposure/affinity rule");
+        assert_eq!(
+            guard.message.as_deref(),
+            Some(GATEWAY_EXPOSURE_AFFINITY_MESSAGE)
+        );
+        // The rule keys off both sibling fields.
+        assert!(guard.rule.contains("self.exposure.gatewayApi"));
+        assert!(guard.rule.contains("self.ingestAffinity"));
+        assert!(guard.rule.contains("ingressNginx"));
+
+        // The rule is NOT nested inside ingestAffinity (that property keeps only
+        // its own headerName rule).
+        let affinity_rules = gateway
+            .properties
+            .as_ref()
+            .expect("gateway props")
+            .get("ingestAffinity")
+            .expect("ingestAffinity prop")
+            .x_kubernetes_validations
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            affinity_rules
+                .iter()
+                .all(|r| r.rule != GATEWAY_EXPOSURE_AFFINITY_RULE),
+            "the cross-field guard must live on `gateway`, not on `ingestAffinity`"
+        );
+
+        // The rule's `!has(...)` guards fail OPEN (admit) when `backend` or
+        // `enabled` is omitted from a submitted manifest, relying entirely on
+        // schema defaulting (which the API server applies before CEL runs) to
+        // materialize `backend: ingressNginx` and `enabled: true` first. If
+        // either default is ever removed, the rejected combination
+        // (exposure.gatewayApi + an omitted-affinity-config CR) silently
+        // starts being admitted instead -- exactly the silent degrade this
+        // rule exists to forbid -- with every other test here still green.
+        // Pin both defaults so that regression fails loudly.
+        let affinity_props = gateway
+            .properties
+            .as_ref()
+            .expect("gateway props")
+            .get("ingestAffinity")
+            .expect("ingestAffinity prop")
+            .properties
+            .as_ref()
+            .expect("ingestAffinity props");
+        assert_eq!(
+            affinity_props
+                .get("backend")
+                .expect("backend prop")
+                .default
+                .as_ref()
+                .map(|j| &j.0),
+            Some(&serde_json::json!("ingressNginx")),
+            "the omitted-backend CEL case relies on this default"
+        );
+        assert_eq!(
+            affinity_props
+                .get("enabled")
+                .expect("enabled prop")
+                .default
+                .as_ref()
+                .map(|j| &j.0),
+            Some(&serde_json::json!(true)),
+            "the omitted-enabled CEL case relies on this default"
+        );
+    }
+
+    /// Rust mirror of [`GATEWAY_EXPOSURE_AFFINITY_RULE`]: returns whether the
+    /// combination is ADMITTED (the CEL rule evaluates true). `enabled` and
+    /// `backend` are always materialized when the affinity block is present
+    /// (serde/schema defaults), so they are modeled as present whenever the
+    /// block is. A separate test
+    /// ([`exposure_gateway_api_carries_the_cel_guard_at_the_gateway_property`])
+    /// pins the exact rule string in the schema, so a change to the real rule
+    /// that diverges from this model is caught there.
+    fn cel_admits(exposure_gateway_api: bool, affinity: Option<(bool, &str)>) -> bool {
+        if !exposure_gateway_api {
+            return true; // !has(self.exposure.gatewayApi)
+        }
+        let Some((enabled, backend)) = affinity else {
+            return true; // !has(self.ingestAffinity)
+        };
+        if !enabled {
+            return true; // !self.ingestAffinity.enabled
+        }
+        backend != "ingressNginx"
+    }
+
+    #[test]
+    fn cel_rule_rejects_only_exposure_plus_enabled_ingress_nginx_affinity() {
+        // ADR-0080 decision 2. The one rejected combination:
+        assert!(
+            !cel_admits(true, Some((true, "ingressNginx"))),
+            "exposure + enabled ingressNginx affinity must be rejected"
+        );
+
+        // Every allowed combination named in the deliverable:
+        assert!(
+            cel_admits(true, None),
+            "exposure alone (affinity absent) is allowed"
+        );
+        assert!(
+            cel_admits(true, Some((true, "ravelNative"))),
+            "exposure + enabled ravelNative affinity is allowed"
+        );
+        assert!(
+            cel_admits(false, Some((true, "ingressNginx"))),
+            "ingressNginx affinity alone (no exposure) is allowed"
+        );
+        assert!(
+            cel_admits(true, Some((false, "ingressNginx"))),
+            "exposure + disabled ingressNginx affinity is allowed"
+        );
+        // And the remaining benign corner: exposure + disabled ravelNative.
+        assert!(
+            cel_admits(true, Some((false, "ravelNative"))),
+            "exposure + disabled ravelNative affinity is allowed"
+        );
+    }
+
+    /// Regenerates the CRD from [`ravel_cluster_crd`] with the exact
+    /// serializer and trailing newline `main.rs`'s `--print-crd` path uses
+    /// (`serde_json::to_string_pretty` plus `println!`'s trailing `\n`), and
+    /// fails with the regeneration command when the checked-in
+    /// `deploy/k8s/operator/crd.yaml` differs. Both `--print-crd` and this
+    /// test call the same [`ravel_cluster_crd`], so this pins the file to the
+    /// function that also backs what an operator actually applies.
+    #[test]
+    fn checked_in_crd_matches_print_crd_output() {
+        let generated = serde_json::to_string_pretty(&ravel_cluster_crd())
+            .expect("serialize CRD to pretty JSON")
+            + "\n";
+        let checked_in_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/k8s/operator/crd.yaml"
+        );
+        let checked_in = std::fs::read_to_string(checked_in_path)
+            .unwrap_or_else(|error| panic!("read {checked_in_path}: {error}"));
+        assert_eq!(
+            checked_in, generated,
+            "deploy/k8s/operator/crd.yaml is stale; regenerate with: \
+             cargo run -p ravel-operator -- --print-crd > deploy/k8s/operator/crd.yaml"
+        );
+    }
+
+    /// The `storage.s3` and `spec` schema nodes of the generated CRD.
+    fn spec_and_s3_schema() -> (
+        k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::JSONSchemaProps,
+        k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::JSONSchemaProps,
+    ) {
+        let crd = ravel_cluster_crd();
+        let spec = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .and_then(|s| s.properties.as_ref())
+            .and_then(|p| p.get("spec"))
+            .cloned()
+            .expect("spec prop");
+        let s3 = spec
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("storage"))
+            .and_then(|s| s.properties.as_ref())
+            .and_then(|p| p.get("s3"))
+            .cloned()
+            .expect("storage.s3 prop");
+        (spec, s3)
+    }
+
+    #[test]
+    fn storage_auth_defaults_to_static_and_spells_pod_identity_in_camel_case() {
+        let spec: RavelClusterSpec = serde_json::from_value(serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        }))
+        .expect("a pre-auth manifest still deserializes");
+        assert_eq!(
+            spec.storage.s3.as_ref().expect("s3 is set").auth,
+            S3AuthSpec::Static
+        );
+
+        let spec: RavelClusterSpec = serde_json::from_value(serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "auth": "podIdentity" } }
+        }))
+        .expect("a podIdentity manifest needs no Secret");
+        let s3 = spec.storage.s3.as_ref().expect("s3 is set");
+        assert_eq!(s3.auth, S3AuthSpec::PodIdentity);
+        assert_eq!(s3.credentials_secret_ref, None);
+        assert_eq!(
+            serde_json::to_value(S3AuthSpec::PodIdentity).expect("serialize"),
+            serde_json::json!("podIdentity")
+        );
+        assert_eq!(S3AuthSpec::PodIdentity.spelling(), "podIdentity");
+        assert_eq!(S3AuthSpec::Static.spelling(), "static");
+
+        let (_, s3) = spec_and_s3_schema();
+        let auth = s3
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("auth"))
+            .expect("auth prop");
+        assert_eq!(
+            auth.default.as_ref().map(|d| d.0.clone()),
+            Some(serde_json::json!("static"))
+        );
+        assert!(
+            !s3.required
+                .clone()
+                .unwrap_or_default()
+                .contains(&"credentialsSecretRef".to_string()),
+            "credentialsSecretRef is optional in the schema; CEL requires it under static"
+        );
+    }
+
+    /// Rust mirror of [`STATIC_AUTH_SECRET_RULE`]: whether `storage.s3` is
+    /// admitted. `auth: None` is a manifest evaluated before defaulting.
+    fn static_auth_cel_admits(auth: Option<&str>, has_secret: bool) -> bool {
+        auth == Some("podIdentity") || has_secret
+    }
+
+    /// Rust mirror of [`POD_IDENTITY_TIER_OVERRIDE_RULE`].
+    fn tier_override_cel_admits(auth: Option<&str>, overrides: [bool; 3]) -> bool {
+        auth != Some("podIdentity") || overrides.iter().all(|set| !set)
+    }
+
+    #[test]
+    fn storage_auth_rules_sit_on_storage_s3_and_spec() {
+        let (spec, s3) = spec_and_s3_schema();
+        let s3_rules = s3
+            .x_kubernetes_validations
+            .expect("storage.s3 carries a CEL rule");
+        let rule = s3_rules
+            .iter()
+            .find(|r| {
+                r.rule
+                    == "(has(self.auth) && self.auth == 'podIdentity') || \
+                        has(self.credentialsSecretRef)"
+            })
+            .expect("the exact static-secret rule");
+        assert_eq!(
+            rule.message.as_deref(),
+            Some("credentialsSecretRef is required under auth: static")
+        );
+        let spec_rules = spec
+            .x_kubernetes_validations
+            .expect("spec carries a CEL rule");
+        let rule = spec_rules
+            .iter()
+            .find(|r| {
+                r.rule
+                    == "!has(self.storage.s3) || !has(self.storage.s3.auth) || \
+                        self.storage.s3.auth != 'podIdentity' || \
+                        ((!has(self.gateway) || !has(self.gateway.credentialsSecretRef)) && \
+                        (!has(self.query) || !has(self.query.credentialsSecretRef)) && \
+                        (!has(self.maintain) || !has(self.maintain.credentialsSecretRef)))"
+            })
+            .expect("the exact tier-override rule");
+        assert_eq!(
+            rule.message.as_deref(),
+            Some(POD_IDENTITY_TIER_OVERRIDE_MESSAGE)
+        );
+
+        assert!(static_auth_cel_admits(Some("static"), true));
+        assert!(static_auth_cel_admits(None, true));
+        assert!(!static_auth_cel_admits(Some("static"), false));
+        assert!(!static_auth_cel_admits(None, false));
+        assert!(static_auth_cel_admits(Some("podIdentity"), false));
+        assert!(static_auth_cel_admits(Some("podIdentity"), true));
+
+        assert!(tier_override_cel_admits(Some("static"), [true, true, true]));
+        assert!(tier_override_cel_admits(None, [true, false, false]));
+        assert!(tier_override_cel_admits(
+            Some("podIdentity"),
+            [false, false, false]
+        ));
+        for overrides in [
+            [true, false, false],
+            [false, true, false],
+            [false, false, true],
+        ] {
+            assert!(!tier_override_cel_admits(Some("podIdentity"), overrides));
+        }
+    }
+
+    /// The `storage` schema node of the generated CRD.
+    fn storage_schema()
+    -> k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::JSONSchemaProps {
+        let (spec, _) = spec_and_s3_schema();
+        spec.properties
+            .as_ref()
+            .and_then(|p| p.get("storage"))
+            .cloned()
+            .expect("storage prop")
+    }
+
+    /// Rust mirror of [`STORAGE_ONE_OF_RULE`].
+    fn storage_one_of_cel_admits(has_s3: bool, has_azure: bool) -> bool {
+        has_s3 != has_azure
+    }
+
+    /// Evaluate [`POD_IDENTITY_TIER_OVERRIDE_RULE`] as CEL does on a spec
+    /// whose `storage.s3` is `s3_auth` (`None`: no `storage.s3` at all).
+    /// Reading a field of an absent object is an evaluation error in CEL, so
+    /// the result is `Err` unless the rule's first clause guards it.
+    fn pod_identity_tier_rule_eval(
+        s3_auth: Option<Option<&str>>,
+        overrides: [bool; 3],
+    ) -> Result<bool, &'static str> {
+        let guarded = POD_IDENTITY_TIER_OVERRIDE_RULE.starts_with("!has(self.storage.s3) || ");
+        match s3_auth {
+            None if guarded => Ok(true),
+            None => Err("no such key: s3"),
+            Some(auth) => Ok(tier_override_cel_admits(auth, overrides)),
+        }
+    }
+
+    #[test]
+    fn storage_one_of_rule_sits_on_storage_and_refuses_neither_and_both() {
+        let storage = storage_schema();
+        let rules = storage
+            .x_kubernetes_validations
+            .expect("storage carries a CEL rule");
+        let rule = rules
+            .iter()
+            .find(|r| r.rule == "has(self.s3) != has(self.azure)")
+            .expect("the exact one-of rule");
+        assert_eq!(
+            rule.message.as_deref(),
+            Some("storage must set exactly one of s3 and azure")
+        );
+        assert!(
+            !storage
+                .required
+                .clone()
+                .unwrap_or_default()
+                .contains(&"s3".to_string()),
+            "storage.s3 is optional in the schema; the one-of rule requires a backend"
+        );
+
+        assert!(storage_one_of_cel_admits(true, false));
+        assert!(storage_one_of_cel_admits(false, true));
+        assert!(!storage_one_of_cel_admits(false, false), "neither");
+        assert!(!storage_one_of_cel_admits(true, true), "both");
+    }
+
+    #[test]
+    fn pod_identity_tier_rule_does_not_error_without_storage_s3() {
+        assert_eq!(pod_identity_tier_rule_eval(None, [false; 3]), Ok(true));
+        assert_eq!(pod_identity_tier_rule_eval(None, [true; 3]), Ok(true));
+        assert_eq!(
+            pod_identity_tier_rule_eval(Some(Some("podIdentity")), [true, false, false]),
+            Ok(false)
+        );
+        assert_eq!(
+            pod_identity_tier_rule_eval(Some(Some("static")), [true, false, false]),
+            Ok(true)
+        );
+    }
+
+    /// Rust mirror of [`AZURE_TIER_OVERRIDE_RULE`].
+    fn azure_tier_override_cel_admits(has_azure: bool, overrides: [bool; 3]) -> bool {
+        !has_azure || overrides.iter().all(|set| !set)
+    }
+
+    #[test]
+    fn azure_refuses_tier_credential_overrides_on_spec() {
+        let (spec, _) = spec_and_s3_schema();
+        let rules = spec
+            .x_kubernetes_validations
+            .expect("spec carries a CEL rule");
+        let rule = rules
+            .iter()
+            .find(|r| {
+                r.rule
+                    == "!has(self.storage.azure) || \
+                        ((!has(self.gateway) || !has(self.gateway.credentialsSecretRef)) && \
+                        (!has(self.query) || !has(self.query.credentialsSecretRef)) && \
+                        (!has(self.maintain) || !has(self.maintain.credentialsSecretRef)))"
+            })
+            .expect("the exact Azure tier-override rule");
+        assert_eq!(rule.message.as_deref(), Some(AZURE_TIER_OVERRIDE_MESSAGE));
+
+        assert!(azure_tier_override_cel_admits(false, [true, true, true]));
+        assert!(azure_tier_override_cel_admits(true, [false, false, false]));
+        for overrides in [
+            [true, false, false],
+            [false, true, false],
+            [false, false, true],
+        ] {
+            assert!(!azure_tier_override_cel_admits(true, overrides));
+        }
+    }
+
+    #[test]
+    fn azure_storage_deserializes_and_resolves_role_client_ids() {
+        let spec: RavelClusterSpec = serde_json::from_value(serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "azure": {
+                "account": "ravelprod",
+                "container": "data",
+                "clientId": "shared-id",
+                "roleClientIds": { "maintain": "maintain-id" },
+            } }
+        }))
+        .expect("an Azure manifest deserializes");
+        assert_eq!(spec.storage.s3, None);
+        let Some(StorageBackend::Azure(azure)) = spec.storage.backend() else {
+            panic!("the backend is Azure");
+        };
+        assert_eq!(azure.account, "ravelprod");
+        assert_eq!(azure.container, "data");
+        assert_eq!(azure.client_id_for("gateway"), "shared-id");
+        assert_eq!(azure.client_id_for("query"), "shared-id");
+        assert_eq!(azure.client_id_for("maintain"), "maintain-id");
+        assert_eq!(azure.client_id_for("qualify"), "shared-id");
+
+        let mut both = spec.storage.clone();
+        both.s3 = Some(S3Spec {
+            bucket: "b".to_string(),
+            region: default_region(),
+            endpoint: None,
+            allow_http: false,
+            upload_integrity: S3UploadIntegrity::default(),
+            request_stored_checksum: true,
+            auth: S3AuthSpec::Static,
+            credentials_secret_ref: None,
+        });
+        assert_eq!(both.backend(), None, "both");
+        assert_eq!(
+            StorageSpec {
+                s3: None,
+                azure: None
+            }
+            .backend(),
+            None,
+            "neither"
+        );
+    }
+
+    /// Neither backend is `nullable`: an explicit `null` beside the other
+    /// backend would otherwise pass the schema while `has()` and serde
+    /// disagree about whether it is present.
+    #[test]
+    fn neither_storage_backend_is_nullable() {
+        let storage = storage_schema();
+        let props = storage.properties.expect("storage properties");
+        for backend in ["s3", "azure"] {
+            let schema = props.get(backend).expect("backend property");
+            assert_eq!(schema.nullable, None, "storage.{backend}");
+        }
+    }
+
+    /// The `storage.azure` schema node of the generated CRD.
+    fn azure_schema() -> JSONSchemaProps {
+        storage_schema()
+            .properties
+            .and_then(|p| p.get("azure").cloned())
+            .expect("azure prop")
+    }
+
+    /// Whether `value` passes a string schema's `pattern`, `minLength` and
+    /// `maxLength`, evaluated the way the API server does.
+    fn string_schema_admits(schema: &JSONSchemaProps, value: &str) -> bool {
+        let pattern = schema.pattern.as_deref().expect("a pattern");
+        let regex = regex::Regex::new(pattern).expect("the pattern compiles");
+        let len = i64::try_from(value.chars().count()).expect("a short value");
+        regex.is_match(value)
+            && schema.min_length.is_none_or(|min| len >= min)
+            && schema.max_length.is_none_or(|max| len <= max)
+    }
+
+    #[test]
+    fn azure_names_and_client_ids_are_validated_at_admission() {
+        let azure = azure_schema();
+        let props = azure.properties.as_ref().expect("azure properties");
+        let field = |name: &str| props.get(name).cloned().expect("azure field");
+        let role_ids = field("roleClientIds")
+            .properties
+            .expect("roleClientIds properties");
+        assert_eq!(role_ids.len(), 4);
+
+        let uuid = "0f3c2a1b-4d5e-6f70-8192-a3b4c5d6e7f8";
+        let (a24, a25) = ("a".repeat(24), "a".repeat(25));
+        let (a63, a64) = ("a".repeat(63), "a".repeat(64));
+        let mut cases: Vec<(&str, JSONSchemaProps, &str, &str)> = vec![
+            ("account", field("account"), "ravelprod01", "Ravel-Prod"),
+            ("account", field("account"), "abc", "ab"),
+            ("account", field("account"), &a24, &a25),
+            ("container", field("container"), "ravel-data", "ravel--data"),
+            ("container", field("container"), "r0d", "-ravel"),
+            ("container", field("container"), "abc", "ravel-"),
+            ("container", field("container"), &a63, &a64),
+            ("container", field("container"), "a-b", "a_b"),
+            ("clientId", field("clientId"), uuid, "shared-id"),
+            (
+                "clientId",
+                field("clientId"),
+                uuid,
+                "0f3c2a1b4d5e6f708192a3b4c5d6e7f8",
+            ),
+        ];
+        for (role, schema) in &role_ids {
+            cases.push((role.as_str(), schema.clone(), uuid, "maintain-id"));
+        }
+        for (name, schema, accepted, refused) in &cases {
+            assert!(
+                string_schema_admits(schema, accepted),
+                "{name} accepts {accepted:?}"
+            );
+            assert!(
+                !string_schema_admits(schema, refused),
+                "{name} refuses {refused:?}"
+            );
+        }
+    }
+}

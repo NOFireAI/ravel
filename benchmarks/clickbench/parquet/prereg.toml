@@ -1,0 +1,5 @@
+# Moved: the ClickBench Parquet lane's pre-registration is now
+# benchmarks/clickbench/bands/parquet.toml (ADR-2867 change 2, one band file
+# per lane). Pass that path to clickbench_parquet_bench --prereg. This file
+# holds no key, so a --prereg pointed here is refused as missing
+# memory_cap_bytes.

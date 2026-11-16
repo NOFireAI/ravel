@@ -1,0 +1,830 @@
+//! Issue #680: a high-cardinality aggregate's pre-final group state must not
+//! scale with the scan's partition count.
+//!
+//! DataFusion builds one partial-aggregation hash table per input partition and
+//! merges them in a single final stage. When a group key's distinct values all
+//! appear in every partition -- which is the normal case for a
+//! high-cardinality key over a tenant's objects -- the pre-final state is
+//! roughly `partitions x distinct` entries, not `distinct`. Spilling is
+//! disabled by design (ADR-0102 decision 3, ADR-0013), so that multiplier does
+//! not degrade into slow, it fails the query with a typed pool error.
+//!
+//! `ravel_bench::groupby_scaling::run_distinct` measured it over the `logs`
+//! table across `D` in {10k, 100k, 1M} and `target_partitions` in {1, 4, 16,
+//! 32}: the 32-partition peak ran 5.0x to 16.2x the single-partition peak for
+//! the identical dataset and query. The fix is
+//! `SqlConfig::skip_partial_aggregation` (on by default), which tightens
+//! DataFusion's two skip-partial-aggregation probe thresholds in
+//! `session_config` so a partial partition stops building a hash table once its
+//! probe shows the key does not reduce.
+//!
+//! # Row counts, not bytes
+//!
+//! What this test pins is the probe's decision, not the memory pool's
+//! high-water mark. A peak-bytes figure depends on how many partial hash tables
+//! happen to be simultaneously resident, which is a scheduling property: it
+//! moves with machine load and partition timing, and an earlier version of this
+//! test that pinned a ratio of peak-byte figures passed on an idle box and
+//! failed on loaded 4-core CI runners.
+//!
+//! The probe itself is deterministic. Each partition decides from its own first
+//! [`SKIP_PARTIAL_AGGREGATION_PROBE_ROWS`] rows and the distinct ratio within
+//! them, so over a fixed fixture the decision, and every row count that follows
+//! from it, is the same on every machine under every load. Three figures come
+//! out of DataFusion's own execution metrics on the grouping `Partial`
+//! `AggregateExec`, summed across its partitions:
+//!
+//! * `output_rows` (the `BaselineMetrics` counter every operator publishes),
+//! * `skipped_aggregation_rows` (the counter DataFusion 55's
+//!   `PartialHashAggregateStream` increments for each row it forwards without
+//!   aggregating, which is zero exactly when no partition's probe ever fired),
+//! * `output_rows - skipped_aggregation_rows`, the rows the partial stage
+//!   emitted out of its hash tables, which is the number of group entries those
+//!   tables held. That last figure is the quantity issue #680 is about: what
+//!   the pre-final state costs, counted in entries instead of bytes.
+//!
+//! The group-entry figure is also read for each partition on its own, and the
+//! tightened session's bound is held against the largest of those, since how
+//! many partitions take an object is up to the schedule.
+//!
+//! Its input row count is `output_rows` of its child, and the fixture's own
+//! [`TOTAL_ROWS`] independently.
+//!
+//! Prove-the-test: the single flipped line is `skip_partial_aggregation` in
+//! `SqlConfig` (crates/ravel-sql/src/config.rs), which gates the
+//! `options.execution.skip_partial_aggregation_probe_{rows,ratio}_threshold`
+//! writes in `session_config` (crates/ravel-sql/src/session.rs). Stop writing
+//! either threshold and the on-side session becomes DataFusion's stock
+//! 0.8-after-100,000 probe, which no partition of this fixture meets (see
+//! [`MAX_STOCK_PROBE_RATIO`]): every partition
+//! then aggregates, so each partition that takes an object holds a full
+//! [`DISTINCT`]-entry table, above [`MAX_TIGHTENED_PARTITION_GROUP_ENTRIES`],
+//! and the first assertion below fails whichever partitions took the objects.
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::any::Any;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use datafusion::arrow::array::Int64Array;
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::datasource::MemTable;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion::physical_plan::{
+    ExecutionPlan, ExecutionPlanProperties, displayable, execute_stream,
+};
+use futures::StreamExt;
+use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
+use ravel_logseg::writer::ObjectIdentity;
+use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+use ravel_object_store::memory::MemoryStore;
+use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_query::{LogSegmentFetcher, PhaseAccounting};
+use ravel_sql::{
+    LogsTableProvider, SKIP_PARTIAL_AGGREGATION_PROBE_ROWS, SessionTable, SpillDecision, SqlConfig,
+    TenantMemoryAccountant, build_session,
+};
+use ravel_types::TenantHash;
+use ravel_types::accounting::QueryAccounting;
+use ravel_types::logstream::log_stream_id;
+use uuid::Uuid;
+
+/// Distinct values of the high-cardinality key.
+///
+/// Every object writes the same `DISTINCT` values in the same order, [`REPEATS`]
+/// whole rounds of them. With an un-cached fetcher every object is one unit of
+/// the scan's queue, so each partition that takes an object ends up holding all
+/// `DISTINCT` values in its own hash table, and no partition can hold more,
+/// however many objects it takes. That repetition across partitions is what
+/// makes the pre-final state `partitions x DISTINCT` instead of `DISTINCT`, and
+/// it is the shape issue #680 is about. It also has to stay above
+/// `2 x SKIP_PARTIAL_AGGREGATION_PROBE_ROWS`, or one full-sized per-partition
+/// table would fit inside [`MAX_TIGHTENED_PARTITION_GROUP_ENTRIES`] and the
+/// bound this test holds each tightened partition to would prove nothing.
+const DISTINCT: usize = 25_000;
+
+/// How many times each object repeats its full run of [`DISTINCT`] values.
+///
+/// Whole rounds, never interleaved, and `RlogConfig::default()` targets 8192
+/// records per block, so a block is a run of 8192 consecutive positions and
+/// therefore 8192 distinct values. A partition's first batch is one such block:
+/// the probe reads a ratio of 1.0 over its prefix, met with room to spare rather
+/// than by a hair, and because that prefix is all-distinct the tightened partial
+/// stage emits exactly as many rows as it aggregated. That is what makes its
+/// total `output_rows` its input row count exactly, not approximately.
+///
+/// A partition reads a whole object from its first block (an un-cached scan
+/// never splits an object into row-group runs, ADR-0102), so that prefix holds
+/// whatever the object count, the partition count or the order partitions take
+/// objects in. The repeat count only sizes an object: [`ROWS_PER_OBJECT`] rows
+/// in 10 blocks.
+const REPEATS: usize = 3;
+
+/// RLOG objects.
+///
+/// Also the declared fan-out: with an un-cached fetcher `LogsScanExec` keeps
+/// the segment-count bound (`min(target_partitions, segment_count)`, ADR-0102
+/// decision 1), and the shared queue hands each object to one partition whole.
+///
+/// How many of those partitions actually take an object depends on the
+/// schedule, so no assertion below depends on it.
+const OBJECTS: usize = 4;
+
+/// The scan's fan-out. Equal to [`OBJECTS`] so the fanned-out side really
+/// reaches this many partitions.
+const FANNED_OUT_PARTITIONS: usize = OBJECTS;
+
+/// Rows in one object.
+const ROWS_PER_OBJECT: usize = DISTINCT * REPEATS;
+
+/// Rows in the whole fixture, and so the partial stage's input row count.
+const TOTAL_ROWS: usize = ROWS_PER_OBJECT * OBJECTS;
+
+/// Records per RLOG block, which is `RlogConfig::default().block_target_records`.
+/// [`block_size_matches_the_writer`] holds the two together.
+const BLOCK_RECORDS: usize = 8192;
+
+/// DataFusion's own default for
+/// `datafusion.execution.skip_partial_aggregation_probe_rows_threshold`, which
+/// is what the option-off session runs with.
+/// [`stock_probe_threshold_matches_datafusion`] holds the two together.
+const STOCK_PROBE_ROWS_THRESHOLD: usize = 100_000;
+
+/// DataFusion's own default for
+/// `datafusion.execution.skip_partial_aggregation_probe_ratio_threshold`, held
+/// to DataFusion by the same test.
+const STOCK_PROBE_RATIO_THRESHOLD: f64 = 0.8;
+
+/// The highest distinct ratio the stock probe can read in any partition.
+///
+/// The probe decides once, on the batch that takes a partition to
+/// [`STOCK_PROBE_ROWS_THRESHOLD`] rows, from the groups its table holds over
+/// the rows it has read. A partition's table never holds more than
+/// [`DISTINCT`] groups, so the ratio there is at most
+/// `DISTINCT / STOCK_PROBE_ROWS_THRESHOLD` (0.25). A partition can reach the
+/// threshold: take-next may hand it two whole objects, 150,000 rows. What
+/// keeps the option-off side deterministic is this ratio staying under
+/// [`STOCK_PROBE_RATIO_THRESHOLD`], not a row count: no partition skips,
+/// whichever objects each partition takes.
+const MAX_STOCK_PROBE_RATIO: f64 = DISTINCT as f64 / STOCK_PROBE_ROWS_THRESHOLD as f64;
+
+const _: () = assert!(
+    MAX_STOCK_PROBE_RATIO < STOCK_PROBE_RATIO_THRESHOLD,
+    "a partition reaching the stock probe threshold must read a distinct ratio \
+     under the stock ratio threshold, or the option-off session's probe fires \
+     too and both sides of this test skip"
+);
+/// The largest number of group entries any one partition of the tightened
+/// partial stage may hold.
+///
+/// Structural, not tuned. A partition stops building its table as soon as the
+/// probe fires, and the probe fires on the first batch that takes the partition
+/// to [`SKIP_PARTIAL_AGGREGATION_PROBE_ROWS`] rows. That batch can carry a full
+/// `batch_size` of its own, and DataFusion's `batch_size` default is the same
+/// 8192, so a partition's table can reach two probe thresholds' worth of
+/// entries before it is frozen, and no more. Note what does not appear in this
+/// bound: [`DISTINCT`]. That is the whole point of the fix.
+///
+/// The bound is per partition, not summed: how many partitions take an object
+/// from the shared queue is a scheduling property, and a sum over them would
+/// let a regressed partition's full table pass whenever few partitions ran.
+const MAX_TIGHTENED_PARTITION_GROUP_ENTRIES: usize = 2 * SKIP_PARTIAL_AGGREGATION_PROBE_ROWS;
+
+const _: () = assert!(
+    DISTINCT > MAX_TIGHTENED_PARTITION_GROUP_ENTRIES,
+    "one full-sized per-partition table must not fit inside the bound each \
+     tightened partition is held to, or that bound proves nothing"
+);
+
+const SCOPE_NAME: &str = "skip-partial-aggregation-test";
+const SCOPE_VERSION: &str = "1.0";
+const TENANT: TenantHash = TenantHash([9u8; 16]);
+
+/// `COUNT(DISTINCT high)` over the `logs` table: the shape of the ClickBench
+/// statements that fail (q05/q06), and the one that puts every distinct value
+/// into a group key. DataFusion rewrites it into a `GROUP BY` over the key
+/// under a scalar count, so the plan below that count is exactly the
+/// partial/final pair issue #680 is about.
+const QUERY: &str = "SELECT count(DISTINCT attrs['u']) AS distinct_high FROM logs";
+
+/// Write [`OBJECTS`] RLOG objects into `store`, each carrying all [`DISTINCT`]
+/// values [`REPEATS`] times over, and return a snapshot over them.
+async fn write_high_cardinality_logs(store: &Arc<dyn ObjectStoreBackend>) -> Snapshot {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("hits".to_string()),
+    )];
+    let stream_id = log_stream_id(&resource, SCOPE_NAME, SCOPE_VERSION, &[]);
+    let stream_attrs = stream_attrs_bytes(&resource, SCOPE_NAME, SCOPE_VERSION, &[]);
+
+    let mut segments = Vec::with_capacity(OBJECTS);
+    let mut ts = 0i64;
+    for object in 0..OBJECTS {
+        let identity = ObjectIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: *Uuid::from_u128(0x680_0000 + object as u128).as_bytes(),
+            writer_epoch: 1,
+            writer_seq: object as u64 + 1,
+        };
+        let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+        let min_ts = ts;
+        for _round in 0..REPEATS {
+            for value in 0..DISTINCT {
+                writer
+                    .push(LogRecord {
+                        stream_id,
+                        stream_attrs: stream_attrs.clone(),
+                        ts_ns: ts,
+                        observed_ts_ns: ts,
+                        severity_num: 9,
+                        severity_text: "INFO".to_string(),
+                        body: String::new(),
+                        trace_id: None,
+                        span_id: None,
+                        flags: 0,
+                        attrs: vec![("u".to_string(), AttrValue::Str(format!("u{value:012}")))],
+                    })
+                    .expect("push");
+                ts += 1;
+            }
+        }
+        let bytes = writer.finish().expect("finish");
+        let size = bytes.len() as u64;
+        let key = format!("logs/skip-partial-{object}.rlog");
+        store
+            .put(&key, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        segments.push(SegmentRef {
+            data_object_key: key,
+            object_size: size,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: ts - 1,
+            ingest_hour_bucket: 0,
+            sample_count: ROWS_PER_OBJECT as u64,
+            series_count: 1,
+            shard: 0,
+            content_hash: [object as u8; 32],
+            writer_id: Uuid::from_u128(0x680_0000 + object as u128),
+            writer_epoch: 1,
+            writer_seq: object as u64 + 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        });
+    }
+
+    Snapshot {
+        segments,
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    }
+}
+
+/// The `LogsScanExec` output partition count of `plan`, read from the real
+/// plan's properties.
+fn logs_scan_partitions(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    if plan.name() == "LogsScanExec" {
+        return plan.output_partitioning().partition_count();
+    }
+    plan.children()
+        .into_iter()
+        .map(logs_scan_partitions)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Row counts read off the grouping `Partial` `AggregateExec` of an executed
+/// plan, summed over its partitions, plus the largest single partition's group
+/// entries.
+#[derive(Debug, Default)]
+struct PartialAggregate {
+    /// How many grouping `Partial` `AggregateExec` nodes were found. The plan
+    /// this test asserts over has exactly one; the scalar `Partial` count above
+    /// it has no group key, no hash table, and no probe, so it is not counted.
+    nodes: usize,
+    /// `BaselineMetrics::output_rows`: every row the partial stage emitted,
+    /// whether it came out of a hash table or was forwarded unaggregated.
+    output_rows: usize,
+    /// `skipped_aggregation_rows`: rows forwarded without being aggregated.
+    /// Exactly zero when no partition's probe ever fired.
+    skipped_rows: usize,
+    /// `BaselineMetrics::output_rows` of the child, which is the partial
+    /// stage's input row count.
+    input_rows: usize,
+    /// The largest `output_rows - skipped_aggregation_rows` of any one
+    /// partition: the most group entries a single partition's table held.
+    max_partition_group_entries: usize,
+    /// Partitions that published both counters, for the diagnostic print.
+    partitions: usize,
+}
+
+impl PartialAggregate {
+    /// Rows the partial stage emitted out of its hash tables, which is the
+    /// number of group entries those tables held.
+    fn group_entries(&self) -> usize {
+        self.output_rows - self.skipped_rows
+    }
+}
+
+/// Sum [`PartialAggregate`] over `plan`. Call it only after the plan's stream
+/// has been drained: DataFusion fills these metrics in as the operators run.
+fn partial_aggregate_rows(plan: &Arc<dyn ExecutionPlan>) -> PartialAggregate {
+    let mut totals = PartialAggregate::default();
+    for child in plan.children() {
+        let below = partial_aggregate_rows(child);
+        totals.nodes += below.nodes;
+        totals.output_rows += below.output_rows;
+        totals.skipped_rows += below.skipped_rows;
+        totals.input_rows += below.input_rows;
+        totals.max_partition_group_entries = totals
+            .max_partition_group_entries
+            .max(below.max_partition_group_entries);
+        totals.partitions += below.partitions;
+    }
+
+    let Some(aggregate) = (plan.as_ref() as &dyn Any).downcast_ref::<AggregateExec>() else {
+        return totals;
+    };
+    if *aggregate.mode() != AggregateMode::Partial || aggregate.group_expr().is_empty() {
+        return totals;
+    }
+
+    let metrics = plan
+        .metrics()
+        .expect("an AggregateExec publishes a MetricsSet");
+    totals.nodes += 1;
+    let output_rows = metrics
+        .output_rows()
+        .expect("an AggregateExec publishes BaselineMetrics::output_rows");
+    let skipped_rows = metrics
+        .sum_by_name("skipped_aggregation_rows")
+        .expect(
+            "a grouping Partial AggregateExec over an unordered single group set \
+             publishes skipped_aggregation_rows",
+        )
+        .as_usize();
+    totals.output_rows += output_rows;
+    totals.skipped_rows += skipped_rows;
+
+    // (output_rows, skipped_aggregation_rows) per partition.
+    let mut per_partition: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+    for metric in metrics.iter() {
+        let value = metric.value();
+        let name = value.name();
+        if name != "output_rows" && name != "skipped_aggregation_rows" {
+            continue;
+        }
+        let partition = metric
+            .partition()
+            .expect("a Partial AggregateExec records its row counters per partition");
+        let entry = per_partition.entry(partition).or_default();
+        if name == "output_rows" {
+            entry.0 += value.as_usize();
+        } else {
+            entry.1 += value.as_usize();
+        }
+    }
+    // The per-partition split must account for every row the summed figures
+    // count, or a partition the loop above missed could hide a full table.
+    assert_eq!(
+        per_partition
+            .values()
+            .map(|(output, _)| output)
+            .sum::<usize>(),
+        output_rows,
+        "per-partition output_rows do not add up to the AggregateExec's total"
+    );
+    assert_eq!(
+        per_partition
+            .values()
+            .map(|(_, skipped)| skipped)
+            .sum::<usize>(),
+        skipped_rows,
+        "per-partition skipped_aggregation_rows do not add up to the \
+         AggregateExec's total"
+    );
+    totals.partitions += per_partition.len();
+    for (output, skipped) in per_partition.values() {
+        totals.max_partition_group_entries =
+            totals.max_partition_group_entries.max(output - skipped);
+    }
+    totals.input_rows += plan
+        .children()
+        .iter()
+        .map(|child| {
+            child
+                .metrics()
+                .and_then(|metrics| metrics.output_rows())
+                .expect("the child of a Partial AggregateExec publishes output_rows")
+        })
+        .sum::<usize>();
+    totals
+}
+
+/// One run's observations.
+struct Run {
+    partial: PartialAggregate,
+    scan_partitions: usize,
+    /// The pool high-water mark. Diagnostic only: how many partial hash tables
+    /// are simultaneously resident is scheduling-dependent, so no assertion may
+    /// rest on this. It is printed because it is what a reader chasing #680
+    /// wants to see next to the row counts.
+    peak_bytes: u64,
+    /// The single scalar the query returned, so a run that silently produced
+    /// the wrong answer cannot contribute row counts.
+    answer: i64,
+    /// The executed plan with its metrics, printed alongside a failure.
+    plan_with_metrics: String,
+}
+
+/// Run [`QUERY`] at `target_partitions` over the fixture, with
+/// `skip_partial_aggregation` as given, and report what its partial stage did.
+async fn run(
+    store: &Arc<dyn ObjectStoreBackend>,
+    snapshot: Snapshot,
+    target_partitions: usize,
+    skip_partial_aggregation: bool,
+) -> Run {
+    let mut config = SqlConfig {
+        skip_partial_aggregation,
+        // Comfortably above anything this fixture reaches, so the run measures
+        // what the plan builds instead of tripping the ceiling.
+        max_query_bytes: 8 << 30,
+        ..SqlConfig::default()
+    };
+    config.engine.fetch_concurrency = target_partitions;
+
+    let accounting = QueryAccounting::new();
+    let accountant = TenantMemoryAccountant::new(16 << 30);
+    let (pool, _breach) = config.query_pool(accountant, accounting.clone());
+
+    let provider = Arc::new(LogsTableProvider::new(
+        snapshot,
+        TENANT,
+        LogSegmentFetcher::new(Arc::clone(store)),
+        PhaseAccounting::new(),
+    ));
+    let ctx = build_session(
+        &config,
+        pool,
+        SessionTable::Logs(provider),
+        false,
+        SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
+    )
+    .expect("session");
+
+    let plan = ctx
+        .sql(QUERY)
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let scan_partitions = logs_scan_partitions(&plan);
+
+    let mut stream = execute_stream(Arc::clone(&plan), ctx.task_ctx()).expect("execute");
+    let mut answer = -1i64;
+    while let Some(next) = stream.next().await {
+        let batch = next.expect("batch");
+        if batch.num_rows() == 1 {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .expect("a count aggregate is Int64");
+            answer = column.value(0);
+        }
+    }
+    drop(stream);
+
+    Run {
+        partial: partial_aggregate_rows(&plan),
+        scan_partitions,
+        peak_bytes: accounting.snapshot().peak_intermediate_bytes,
+        answer,
+        plan_with_metrics: format!("{}", displayable(plan.as_ref()).indent(true)),
+    }
+}
+
+/// Check the parts of a run that must hold whichever way the option is set: the
+/// query answered correctly, the scan really fanned out, and the plan really
+/// carries one grouping partial stage over the whole fixture.
+fn check_run_shape(label: &str, observed: &Run) {
+    assert_eq!(
+        observed.answer, DISTINCT as i64,
+        "{label}: the COUNT(DISTINCT) run must count every distinct value"
+    );
+    assert_eq!(
+        observed.scan_partitions, FANNED_OUT_PARTITIONS,
+        "{label}: target_partitions must reach LogsScanExec, else the two sides \
+         of the comparison are the same plan"
+    );
+    assert_eq!(
+        observed.partial.nodes, 1,
+        "{label}: expected exactly one grouping Partial AggregateExec, found {}. \
+         The row counts below are summed over those nodes, so a plan with a \
+         different aggregate structure needs the test rewritten, not the numbers \
+         adjusted.\n{}",
+        observed.partial.nodes, observed.plan_with_metrics
+    );
+    assert_eq!(
+        observed.partial.input_rows, TOTAL_ROWS,
+        "{label}: the partial stage read {} rows, not the fixture's {TOTAL_ROWS}. \
+         Every count below is stated against that input.\n{}",
+        observed.partial.input_rows, observed.plan_with_metrics
+    );
+}
+
+/// The pin, plus its own red demonstration, in one test.
+///
+/// Both runs go over one fixture at [`FANNED_OUT_PARTITIONS`], one with the
+/// option on and one with it off, and every assertion is an exact equality or
+/// an exact structural bound over row counts from DataFusion's metrics. Nothing
+/// here depends on wall-clock time or on the memory pool. Every assertion holds
+/// however the runtime interleaved the partitions and however many of them
+/// took an object from the shared queue. The test pins four runtime workers so
+/// the four partition tasks can run at once, as they do in the server.
+///
+/// 1. With the option on, every partition's probe fires and the partial stage
+///    forwards: each partition's own group entries fit in
+///    [`MAX_TIGHTENED_PARTITION_GROUP_ENTRIES`], a bound that does not mention
+///    [`DISTINCT`], and the stage's `output_rows` equals its input row count
+///    exactly. The bound is checked partition by partition, so it fails
+///    whenever any partition builds a full table, however many partitions
+///    took an object.
+/// 2. With the option off, no partition's probe fires at all: nothing is
+///    skipped, and the partial stage emits one row per distinct value it saw
+///    per partition, at most `FANNED_OUT_PARTITIONS x DISTINCT` and strictly
+///    fewer than it read. Those emitted rows are the group entries the
+///    pre-final state held, which is issue #680's multiplier stated in entries
+///    instead of bytes.
+/// 3. That off-side entry count is at least [`DISTINCT`]: a partition that
+///    takes an object builds a full table of every distinct value. One such
+///    table is more than one on-side partition may hold
+///    ([`MAX_TIGHTENED_PARTITION_GROUP_ENTRIES`], assertion 1's bound), which
+///    is what keeps assertion 1 from being vacuous:
+///    the fixture has to actually reproduce a table that follows `DISTINCT`
+///    for a bound on it to mean anything. The comparison is per partition, so
+///    it holds whichever partitions took the objects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn high_cardinality_partial_aggregate_forwards_instead_of_building_tables() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let snapshot = write_high_cardinality_logs(&store).await;
+
+    let tightened = run(&store, snapshot.clone(), FANNED_OUT_PARTITIONS, true).await;
+    let stock = run(&store, snapshot.clone(), FANNED_OUT_PARTITIONS, false).await;
+    check_run_shape("tightened", &tightened);
+    check_run_shape("stock", &stock);
+
+    println!(
+        "tightened: input_rows={} output_rows={} skipped={} group_entries={} \
+         partitions={} max_partition_group_entries={} peak_bytes={}\n\
+         stock:     input_rows={} output_rows={} skipped={} group_entries={} \
+         partitions={} max_partition_group_entries={} peak_bytes={}",
+        tightened.partial.input_rows,
+        tightened.partial.output_rows,
+        tightened.partial.skipped_rows,
+        tightened.partial.group_entries(),
+        tightened.partial.partitions,
+        tightened.partial.max_partition_group_entries,
+        tightened.peak_bytes,
+        stock.partial.input_rows,
+        stock.partial.output_rows,
+        stock.partial.skipped_rows,
+        stock.partial.group_entries(),
+        stock.partial.partitions,
+        stock.partial.max_partition_group_entries,
+        stock.peak_bytes,
+    );
+
+    assert!(
+        tightened.partial.max_partition_group_entries <= MAX_TIGHTENED_PARTITION_GROUP_ENTRIES,
+        "a tightened partial partition aggregated {} rows into group entries, \
+         above the {MAX_TIGHTENED_PARTITION_GROUP_ENTRIES} its probe prefix allows \
+         one partition (2 x {SKIP_PARTIAL_AGGREGATION_PROBE_ROWS}). The pre-final \
+         state is following DISTINCT again, which is issue #680: check that \
+         session_config still writes both \
+         datafusion.execution.skip_partial_aggregation_probe_* thresholds when \
+         SqlConfig::skip_partial_aggregation is on.\n{}",
+        tightened.partial.max_partition_group_entries,
+        tightened.plan_with_metrics
+    );
+    assert_eq!(
+        tightened.partial.output_rows, tightened.partial.input_rows,
+        "the tightened partial stage emitted {} rows for {} input rows. Every \
+         partition's probe should have fired inside its all-distinct prefix and \
+         forwarded the rest unaggregated, making the two equal. Fewer means \
+         partitions were still building hash tables: check that session_config \
+         still writes both \
+         datafusion.execution.skip_partial_aggregation_probe_* thresholds when \
+         SqlConfig::skip_partial_aggregation is on.\n{}",
+        tightened.partial.output_rows, tightened.partial.input_rows, tightened.plan_with_metrics
+    );
+
+    assert_eq!(
+        stock.partial.skipped_rows, 0,
+        "the stock session skipped {} rows. A partition reaching its \
+         {STOCK_PROBE_ROWS_THRESHOLD}-row probe threshold reads a distinct ratio \
+         of at most {MAX_STOCK_PROBE_RATIO}, under its \
+         {STOCK_PROBE_RATIO_THRESHOLD} ratio threshold, so it must never skip; \
+         if it does, this fixture has \
+         stopped reproducing the pre-fix behaviour and both it and the assertions \
+         below need rewriting.\n{}",
+        stock.partial.skipped_rows, stock.plan_with_metrics
+    );
+    assert!(
+        stock.partial.output_rows <= FANNED_OUT_PARTITIONS * DISTINCT
+            && stock.partial.output_rows < stock.partial.input_rows,
+        "the stock partial stage emitted {} rows for {} input rows. Aggregating \
+         every row, which is what it must do here, emits at most one row per \
+         distinct value per partition ({FANNED_OUT_PARTITIONS} x {DISTINCT}) and \
+         strictly fewer rows than it read.\n{}",
+        stock.partial.output_rows,
+        stock.partial.input_rows,
+        stock.plan_with_metrics
+    );
+
+    assert!(
+        stock.partial.group_entries() >= DISTINCT,
+        "the stock session held only {} group entries, under one full table of \
+         {DISTINCT}, so no partition built the table that follows DISTINCT and \
+         the per-partition bound of 2 x {SKIP_PARTIAL_AGGREGATION_PROBE_ROWS} \
+         the tightened session is held to proves nothing. Either DataFusion now \
+         bounds the partial stage on its own, or the fixture stopped giving a \
+         partition that takes an object a full-sized hash table; both the \
+         fixture and the bound need rewriting, not relaxing.",
+        stock.partial.group_entries()
+    );
+}
+
+/// Input partitions of the threshold fixture. Two, so the plan has a partial
+/// stage at all: one partition plans a single-stage aggregate with no probe.
+const THRESHOLD_PARTITIONS: usize = 2;
+
+/// Distinct keys in a threshold partition's first batch for the side that must
+/// skip: 820 / 8192 is 0.1001, just above a 0.1 ratio.
+const GROUPS_JUST_ABOVE: i64 = 820;
+
+/// Distinct keys for the side that must not skip: 819 / 8192 is 0.09998, just
+/// below a 0.1 ratio.
+const GROUPS_JUST_BELOW: i64 = 819;
+
+/// The `skipped_aggregation_rows` total of `GROUP BY k` over
+/// [`THRESHOLD_PARTITIONS`] partitions of two batches each, every batch
+/// [`SKIP_PARTIAL_AGGREGATION_PROBE_ROWS`] rows of keys `0..groups` cycled.
+///
+/// The probe first reads the ratio once the first batch is aggregated, so the
+/// first batch alone decides it, at `groups / 8192`. A partition that skips
+/// forwards the whole second batch unaggregated; one that does not skip reads
+/// a lower ratio after the second batch (the same `groups` over twice the
+/// rows) and still does not skip, so its count stays zero.
+async fn skipped_rows_for(groups: i64) -> usize {
+    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+    let batch = || {
+        let keys: Int64Array = (0..SKIP_PARTIAL_AGGREGATION_PROBE_ROWS as i64)
+            .map(|i| i % groups)
+            .collect();
+        RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(keys)]).expect("batch builds")
+    };
+    let parts: Vec<Vec<RecordBatch>> = (0..THRESHOLD_PARTITIONS)
+        .map(|_| vec![batch(), batch()])
+        .collect();
+
+    let mut config = SqlConfig::default();
+    config.engine.sql_partition_count = Some(THRESHOLD_PARTITIONS);
+    let accountant = TenantMemoryAccountant::new(1 << 30);
+    let (pool, _breach) = config.query_pool(accountant, QueryAccounting::new());
+    let logs = SessionTable::Logs(Arc::new(LogsTableProvider::new(
+        Snapshot {
+            segments: Vec::new(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        },
+        TENANT,
+        LogSegmentFetcher::new(Arc::new(MemoryStore::new())),
+        PhaseAccounting::new(),
+    )));
+    let ctx = build_session(
+        &config,
+        pool,
+        logs,
+        true,
+        SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(TENANT),
+    )
+    .expect("session");
+    ctx.register_table(
+        "t",
+        Arc::new(MemTable::try_new(Arc::clone(&schema), parts).expect("mem table")),
+    )
+    .expect("table registers");
+
+    let plan = ctx
+        .sql("SELECT k, count(*) AS n FROM t GROUP BY k")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let mut stream = execute_stream(Arc::clone(&plan), ctx.task_ctx()).expect("execute");
+    let mut result_groups = 0;
+    while let Some(next) = stream.next().await {
+        result_groups += next.expect("batch").num_rows();
+    }
+    drop(stream);
+    assert_eq!(
+        result_groups, groups as usize,
+        "GROUP BY k must return every key once, skipped or not"
+    );
+
+    let skipped = skipped_aggregation_rows(&plan);
+    assert_eq!(
+        skipped.len(),
+        1,
+        "expected exactly one node publishing skipped_aggregation_rows, the \
+         grouping Partial AggregateExec\n{}",
+        displayable(plan.as_ref()).indent(true)
+    );
+    skipped[0]
+}
+
+/// `skipped_aggregation_rows`, summed over partitions, for every node of `plan`
+/// that publishes it.
+fn skipped_aggregation_rows(plan: &Arc<dyn ExecutionPlan>) -> Vec<usize> {
+    let mut found: Vec<usize> = plan
+        .metrics()
+        .and_then(|metrics| metrics.sum_by_name("skipped_aggregation_rows"))
+        .map(|value| value.as_usize())
+        .into_iter()
+        .collect();
+    for child in plan.children() {
+        found.extend(skipped_aggregation_rows(child));
+    }
+    found
+}
+
+/// Issue #3231: the session's probe ratio sits between 819 and 820 new groups
+/// per 8192 probe rows, which is 0.1. Each side has its own fixture, one key
+/// either way of the threshold, so a ratio moved in either direction fails one
+/// of the two assertions: at the former 0.5, the 820-key side does not skip
+/// and its count reads 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_ratio_threshold_is_one_new_group_in_ten_rows() {
+    let above = skipped_rows_for(GROUPS_JUST_ABOVE).await;
+    let below = skipped_rows_for(GROUPS_JUST_BELOW).await;
+
+    assert_eq!(
+        above,
+        THRESHOLD_PARTITIONS * SKIP_PARTIAL_AGGREGATION_PROBE_ROWS,
+        "a partition whose probe read {GROUPS_JUST_ABOVE} groups in \
+         {SKIP_PARTIAL_AGGREGATION_PROBE_ROWS} rows must skip and forward its \
+         whole second batch: the session's \
+         SKIP_PARTIAL_AGGREGATION_PROBE_RATIO is no longer 0.1"
+    );
+    assert_eq!(
+        below, 0,
+        "a partition whose probe read {GROUPS_JUST_BELOW} groups in \
+         {SKIP_PARTIAL_AGGREGATION_PROBE_ROWS} rows must keep aggregating: the \
+         session's SKIP_PARTIAL_AGGREGATION_PROBE_RATIO is no longer 0.1"
+    );
+}
+
+/// [`BLOCK_RECORDS`] is the fixture's block arithmetic, and the all-distinct
+/// probe prefix is derived from it. A change to the writer's default would move
+/// it silently.
+#[test]
+fn block_size_matches_the_writer() {
+    assert_eq!(
+        RlogConfig::default().block_target_records,
+        BLOCK_RECORDS,
+        "the RLOG writer's default block size moved; the probe prefix this test \
+         reasons about is derived from it"
+    );
+}
+
+/// [`MAX_STOCK_PROBE_RATIO`] is what makes the option-off side of the test
+/// deterministic. If DataFusion moves either default so that
+/// `DISTINCT / rows threshold` reaches the ratio threshold, the off side starts
+/// skipping too and the fixture needs resizing, not the assertions relaxing.
+#[test]
+fn stock_probe_threshold_matches_datafusion() {
+    let config = datafusion::prelude::SessionConfig::new();
+    let execution = &config.options().execution;
+    assert_eq!(
+        execution.skip_partial_aggregation_probe_rows_threshold, STOCK_PROBE_ROWS_THRESHOLD,
+        "DataFusion's default skip_partial_aggregation_probe_rows_threshold moved"
+    );
+    assert_eq!(
+        execution
+            .skip_partial_aggregation_probe_ratio_threshold
+            .to_bits(),
+        STOCK_PROBE_RATIO_THRESHOLD.to_bits(),
+        "DataFusion's default skip_partial_aggregation_probe_ratio_threshold moved"
+    );
+}

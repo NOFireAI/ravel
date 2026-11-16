@@ -1,0 +1,1128 @@
+//! Answer two more ClickBench aggregate shapes straight from ADR-0850's
+//! per-object column statistics, with zero data-block GETs (issue #850, item
+//! 2 of epic #849; the first shape, predicate-free/ts-contained `COUNT(*)`
+//! and `MIN`/`MAX`, is [`crate::logs_scan::LogsScanExec::statistics_from_inputs`]
+//! feeding DataFusion's own built-in `AggregateStatistics` physical optimizer
+//! rule -- that rule requires zero `GROUP BY` and zero residual filter, so it
+//! can never fire for either shape here and this rule is additive, not
+//! competing):
+//!
+//! - **q02**: `COUNT(*) FROM logs WHERE <declared column> <> <literal>`, one
+//!   residual `FilterExec` over a [`LogsScanExec`], no `GROUP BY`. Answered by
+//!   [`LogsScanExec::declared_not_equal_count`]: `non_null_count -
+//!   count(value = literal)`, summed across every touched segment's exact
+//!   dictionary.
+//! - **q08**: `<declared column>, COUNT(*) FROM logs GROUP BY <declared
+//!   column>`, a plain column group key directly over a [`LogsScanExec`], no
+//!   filter (a filter combined with a `GROUP BY` is out of scope for this
+//!   rule). Answered by [`LogsScanExec::declared_group_counts`]: every
+//!   touched segment's exact dictionary merged by value, plus the summed
+//!   `null_count` as a synthetic NULL group when it is nonzero.
+//! - **q03/q04**: `SUM(<declared integer column> + <literal>) FROM logs`, an
+//!   ungrouped, filter-free aggregate directly over a [`LogsScanExec`].
+//!   Answered by [`LogsScanExec::declared_column_sum`] as `sum + k *
+//!   non_null_count` (#861); `k = 0` covers the plain `SUM(col)`. `SUM` over
+//!   zero non-null rows is `NULL`, matching the scan. With `k != 0`,
+//!   [`crate::sum_plus`] has already rewritten the call into an
+//!   `exact_sum_count(col)` aggregate under a projection that computes `sum +
+//!   k * count`; this rule answers that aggregate with the same sum and count,
+//!   and the projection applies the same overflow check on both paths, so the
+//!   statistics answer and the scanned one agree at the `i64` edge too.
+//! - **q30**: `AVG(<declared integer column>) FROM logs`, likewise ungrouped
+//!   and filter-free. Answered as `sum / non_null_count` in `f64`, `NULL` when
+//!   there are no non-null rows.
+//!
+//! The sum-backed shapes decompose only for an integer column, and only when
+//! every touched segment carries an exact sum: a would-be float column, or a
+//! per-object sum that overflowed `i64` at fold time, has no stored sum and
+//! the statement scans (the ADR-0850 safety lemma).
+//!
+//! Both delegate the actual statistics read to `LogsScanExec` (the crate's
+//! established split: `logs_scan.rs` owns every column-stats read,
+//! sibling optimizer-rule modules only match plan shape and splice in a
+//! replacement, the same way [`crate::late_materialization`] calls
+//! `scan.late_materialization_candidate()` rather than reaching into
+//! `LogsScanExec`'s fields). A `None` from either method means the ADR-0850
+//! safety lemma requires falling back to scanning (no loaded column-stats
+//! object, an unsupported declared type, a segment outside the loaded stats,
+//! a pending selective erasure, or -- specific to this path -- a segment
+//! whose dictionary was omitted for exceeding the cardinality ceiling): this
+//! rule simply declines the rewrite and the unmodified plan runs, scanning
+//! exactly as it would have without ADR-0850.
+//!
+//! [`MetadataOnlyExec`] is the observable marker (issue #850 deliverable 3):
+//! a purpose-named leaf `ExecutionPlan` whose `EXPLAIN` line always reads
+//! `MetadataOnlyExec: metadata_only=true, rows=<n>`, distinct from the
+//! generic `PlaceholderRowExec`/`ProjectionExec` pair DataFusion's own
+//! built-in rule (and any future one) produces, so a test can assert this
+//! specific optimization fired by matching that exact string rather than a
+//! node type multiple rules could have produced.
+
+use std::fmt;
+use std::sync::Arc;
+
+use datafusion::arrow::array::{ArrayRef, Decimal128Array, Int64Array, RecordBatch, StructArray};
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::common::config::ConfigOptions;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::TaskContext;
+use datafusion::logical_expr::utils::split_conjunction;
+use datafusion::logical_expr::{
+    Aggregate, BinaryExpr as LogicalBinaryExpr, Cast, Expr, LogicalPlan, Operator, TryCast,
+};
+use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::StatisticsArgs;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::coop::CooperativeExec;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::{
+    self, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    SendableRecordBatchStream, Statistics,
+};
+use datafusion::scalar::ScalarValue;
+use ravel_catalog::ColumnStatsRequest;
+
+use crate::declared::{DeclaredColumn, DeclaredType};
+use crate::logs_pushdown::{filter_has_row_filter, filter_is_exact};
+use crate::logs_scan::{DeclaredColumnSum, DeclaredGroupCounts, LogsScanExec};
+use crate::session::LOGS_TABLE;
+use crate::sum::SumKind;
+use crate::sum_plus::{EXACT_SUM_COUNT, sum_count_type};
+
+/// The rule's name, as it appears in DataFusion's optimizer diagnostics.
+pub const METADATA_ONLY_AGGREGATE_RULE: &str = "metadata_only_aggregate";
+
+/// Rewrites the q02 (`COUNT(*) WHERE <declared column> <> <literal>`) and q08
+/// (`GROUP BY <declared column>, COUNT(*)`) aggregate shapes into a
+/// [`MetadataOnlyExec`] over ADR-0850 statistics, when it can prove the
+/// answer exact. See the module docs for the shapes and every fallback
+/// condition.
+#[derive(Debug, Default)]
+pub struct MetadataOnlyAggregate;
+
+impl PhysicalOptimizerRule for MetadataOnlyAggregate {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        plan.transform_down(rewrite).data()
+    }
+
+    fn name(&self) -> &str {
+        METADATA_ONLY_AGGREGATE_RULE
+    }
+
+    fn schema_check(&self) -> bool {
+        // The replacement batch is built directly from the outer aggregate's
+        // own schema, but let DataFusion assert that rather than trusting it.
+        true
+    }
+}
+
+/// A pass-through node between the aggregate stages, or between the raw
+/// aggregate and the scan: partition shuffles the rewrite walks through
+/// without needing to remap anything, since the whole subtree above the scan
+/// is about to be discarded wholesale rather than rebuilt in place. Unlike
+/// [`crate::late_materialization`]'s allowlist, a hash repartition is
+/// admitted here for exactly that reason: the standard two-stage `GROUP BY`
+/// plan hash-repartitions by the group key between the partial and final
+/// aggregate, and this rule has no expression to remap across it.
+fn shuffle_child(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    if plan.fetch().is_some() {
+        return None;
+    }
+    if plan.is::<CoalescePartitionsExec>() || plan.is::<CooperativeExec>() {
+        return plan.children().first().map(|c| Arc::clone(c));
+    }
+    if plan.downcast_ref::<RepartitionExec>().is_some() {
+        return plan.children().first().map(|c| Arc::clone(c));
+    }
+    None
+}
+
+/// A pass-through node between the raw aggregate and the scan, in top-down
+/// order: at most one residual filter, plus the same opaque whitelist
+/// [`shuffle_child`] admits.
+enum ScanChainStep {
+    Filter(Arc<FilterExec>),
+    Opaque,
+}
+
+fn classify_scan_chain(plan: &Arc<dyn ExecutionPlan>) -> Option<ScanChainStep> {
+    if plan.fetch().is_some() {
+        return None;
+    }
+    if let Some(filter) = plan.downcast_ref::<FilterExec>() {
+        // A `FilterExec` projection only reshapes what flows UP out of the
+        // filter; `filter.predicate()` is always expressed over the filter's
+        // INPUT schema (this scan's output space), which is the only thing the
+        // q02 branch reads it for. The q08 branch declines outright when any
+        // filter is present, so a projected filter can never coexist with a
+        // group-key index that would be desynced by it. A COUNT(*) filter in
+        // particular carries `projection=[]` (nothing flows up), so rejecting a
+        // projected filter here would refuse the primary q02 shape entirely.
+        return Some(ScanChainStep::Filter(Arc::new(filter.clone())));
+    }
+    if plan.is::<CoalescePartitionsExec>() || plan.is::<CooperativeExec>() {
+        return Some(ScanChainStep::Opaque);
+    }
+    if plan.downcast_ref::<RepartitionExec>().is_some() {
+        return Some(ScanChainStep::Opaque);
+    }
+    None
+}
+
+/// `Some(None)` for a bare `COUNT(*)` (q02 shape candidate), `Some(Some(k))`
+/// for a single plain-`Column` group key at schema index `k` (q08 shape
+/// candidate), `None` for anything else this rule does not attempt: a
+/// grouping set, a null-expr placeholder, more than one group column, or a
+/// group expression that is not a plain column reference.
+fn group_index(group_by: &physical_plan::aggregates::PhysicalGroupBy) -> Option<Option<usize>> {
+    if group_by.has_grouping_set() || !group_by.null_expr().is_empty() {
+        return None;
+    }
+    match group_by.expr() {
+        [] => Some(None),
+        [(expr, _)] => {
+            let column = expr.downcast_ref::<Column>()?;
+            Some(Some(column.index()))
+        }
+        _ => None,
+    }
+}
+
+/// One aggregate call's single argument, reduced to the forms a statistics
+/// answer can take. `C` is the column reference: a scan-output index on the
+/// physical side ([`physical_arg`]), a declared column on the logical side
+/// ([`logical_arg`]).
+enum StatsArg<C> {
+    /// A non-null literal. `COUNT(*)` is `count(<non-null literal>)`; a
+    /// literal NULL would make DataFusion evaluate `COUNT(NULL)` as 0, so
+    /// treating it as `COUNT(*)` and answering from `non_null_count` would
+    /// return a filtered or grouped count where the correct answer is 0.
+    NonNullLiteral,
+    /// A plain column reference.
+    Column(C),
+    /// `col + k` or `k + col` with an integer literal `k`. A float addend
+    /// would make the result a float the integer sum cannot answer exactly.
+    ColumnPlus(C, i128),
+}
+
+/// An aggregate call this module's [`MetadataOnlyAggregate`] can answer from
+/// the loaded column statistics.
+enum StatsAggregate<C> {
+    CountStar,
+    /// `SUM(col + addend)`; `addend == 0` is the plain `SUM(col)`.
+    Sum {
+        col: C,
+        addend: i128,
+    },
+    Avg {
+        col: C,
+    },
+    /// `crate::sum_plus`'s shared exact sum and non-null count of `col`, the
+    /// aggregate an optimized `SUM(col + k)` runs.
+    SumCount {
+        col: C,
+    },
+}
+
+/// The one aggregate-call classification both sides share: the physical
+/// rewrite ([`classify_aggregate`]) and the logical load gate
+/// ([`logical_aggregate_answerable`]) each reduce their own expression form to
+/// `name`, `distinct`, `filtered` and a [`StatsArg`], and ask this.
+///
+/// A per-aggregate `FILTER (WHERE ...)` and `DISTINCT` are both refused: this
+/// module does not reason about either.
+fn stats_aggregate<C>(
+    name: &str,
+    distinct: bool,
+    filtered: bool,
+    arg: StatsArg<C>,
+) -> Option<StatsAggregate<C>> {
+    if filtered || distinct {
+        return None;
+    }
+    match (name, arg) {
+        ("count", StatsArg::NonNullLiteral) => Some(StatsAggregate::CountStar),
+        ("sum", StatsArg::Column(col)) => Some(StatsAggregate::Sum { col, addend: 0 }),
+        ("sum", StatsArg::ColumnPlus(col, addend)) => Some(StatsAggregate::Sum { col, addend }),
+        ("avg", StatsArg::Column(col)) => Some(StatsAggregate::Avg { col }),
+        (EXACT_SUM_COUNT, StatsArg::Column(col)) => Some(StatsAggregate::SumCount { col }),
+        _ => None,
+    }
+}
+
+/// Classify `agg`'s single aggregate, or `None` when it is not exactly one
+/// aggregate this rule handles: more than one aggregate expression, and
+/// anything [`stats_aggregate`] refuses, are declined.
+///
+/// The logical mirror of this rule's plan-shape conditions is
+/// [`logical_aggregate_answerable`]; a change to either belongs in both.
+fn classify_aggregate(
+    agg: &physical_plan::aggregates::AggregateExec,
+) -> Option<StatsAggregate<usize>> {
+    let aggr_exprs = agg.aggr_expr();
+    let filter_exprs = agg.filter_expr();
+    if aggr_exprs.len() != 1 || filter_exprs.len() != 1 {
+        return None;
+    }
+    let expr = &aggr_exprs[0];
+    let args = expr.expressions();
+    let [arg] = args.as_slice() else {
+        return None;
+    };
+    stats_aggregate(
+        expr.fun().name(),
+        expr.is_distinct(),
+        filter_exprs[0].is_some(),
+        physical_arg(arg)?,
+    )
+}
+
+/// `expr` as a [`StatsArg`] over scan-output column indices, or `None` for
+/// any other expression.
+fn physical_arg(expr: &Arc<dyn PhysicalExpr>) -> Option<StatsArg<usize>> {
+    if let Some(col) = expr.downcast_ref::<Column>() {
+        return Some(StatsArg::Column(col.index()));
+    }
+    if let Some(lit) = expr.downcast_ref::<Literal>() {
+        return (!lit.value().is_null()).then_some(StatsArg::NonNullLiteral);
+    }
+    let binary = expr.downcast_ref::<BinaryExpr>()?;
+    if *binary.op() != Operator::Plus {
+        return None;
+    }
+    let left = binary.left();
+    let right = binary.right();
+    if let (Some(col), Some(lit)) = (
+        left.downcast_ref::<Column>(),
+        right.downcast_ref::<Literal>(),
+    ) {
+        return Some(StatsArg::ColumnPlus(
+            col.index(),
+            scalar_to_i128(lit.value())?,
+        ));
+    }
+    if let (Some(lit), Some(col)) = (
+        left.downcast_ref::<Literal>(),
+        right.downcast_ref::<Column>(),
+    ) {
+        return Some(StatsArg::ColumnPlus(
+            col.index(),
+            scalar_to_i128(lit.value())?,
+        ));
+    }
+    None
+}
+
+/// An integer literal's value as `i128`, or `None` for a non-integer or NULL
+/// literal.
+fn scalar_to_i128(v: &ScalarValue) -> Option<i128> {
+    match v {
+        ScalarValue::Int64(Some(x)) => Some(i128::from(*x)),
+        ScalarValue::Int32(Some(x)) => Some(i128::from(*x)),
+        ScalarValue::Int16(Some(x)) => Some(i128::from(*x)),
+        ScalarValue::Int8(Some(x)) => Some(i128::from(*x)),
+        _ => None,
+    }
+}
+
+/// A `<declared column> <> <literal>` (or reversed) predicate's column
+/// index and literal value, or `None` for any other shape.
+fn not_equal_literal(predicate: &Arc<dyn PhysicalExpr>) -> Option<(usize, ScalarValue)> {
+    let binary = predicate.downcast_ref::<BinaryExpr>()?;
+    if *binary.op() != Operator::NotEq {
+        return None;
+    }
+    let left = binary.left();
+    let right = binary.right();
+    if let (Some(col), Some(lit)) = (
+        left.downcast_ref::<Column>(),
+        right.downcast_ref::<Literal>(),
+    ) {
+        return Some((col.index(), lit.value().clone()));
+    }
+    if let (Some(lit), Some(col)) = (
+        left.downcast_ref::<Literal>(),
+        right.downcast_ref::<Column>(),
+    ) {
+        return Some((col.index(), lit.value().clone()));
+    }
+    None
+}
+
+/// Whether the analyzed logical `aggregate` may be answered by
+/// [`MetadataOnlyAggregate`] from the column statistics, judged before they
+/// are loaded (issue #3244). This is the logical mirror of [`rewrite`] (with
+/// [`group_index`], [`classify_aggregate`] and [`not_equal_literal`]); a
+/// change to the conditions on either side belongs on both. The admitted
+/// shapes, each over a `logs` scan reached through at most
+/// [`logs_scan_residual`]'s pass-through nodes:
+///
+/// - **q02**: one `COUNT(*)`, no group key, and exactly one residual
+///   conjunct, `<declared column> <> <non-null literal>` on a non-`Str`
+///   column.
+/// - **q03/q04/q30**: one `SUM(col)`, `SUM(col + <int>)` or `AVG(col)` on an
+///   `I64` declared column, no group key, no residual conjunct.
+/// - **q08**: one `COUNT(*)`, a single group key that is a non-`Str` declared
+///   column, no residual conjunct.
+///
+/// `MIN`/`MAX` are not admitted: DataFusion's `AggregateStatistics` answers
+/// them from the `SegmentRef` stamps through [`LogsScanExec`]'s exact
+/// statistics, and the column statistics play no part in that answer.
+///
+/// A residual conjunct is one [`filter_is_exact`] does not report, or a
+/// declared `Str` column's `<>` against a string literal, which it does
+/// report: the provider reports that conjunct `Exact` and the scan evaluates
+/// it as a row filter, and [`rewrite`] refuses a scan with a row filter
+/// (`metadata_rewrite_stats_are_exact` in `crate::logs_scan`), so it is kept here
+/// to refuse what the rewrite would refuse
+/// (`str_not_equal_conjunct_stays_residual_for_the_rewrite_check`). The plan
+/// judged here is the analyzed one, before the optimizer folds casts and
+/// constant expressions, so a conjunct the scan later receives as a pure `ts`
+/// bound or as `<declared> <> <literal>` can still read here as something
+/// else (`TIMESTAMP '...'` is a cast of a string, `NOT (status = 200)` and
+/// `status <> 100 + 100` are not yet `status <> 200`). A residual conjunct
+/// that is neither `<declared column> <> <literal>` (casts on the literal
+/// stripped) nor exact is therefore unknown, and an unknown conjunct keeps
+/// the load whatever the residual rule above says, with one exception: on
+/// the q02 shape, when no residual conjunct names a non-`Str` declared
+/// column, none can become a `<>` conjunct the rewrite answers (a `<>` on a
+/// `Str` column is refused here and by
+/// [`LogsScanExec::declared_not_equal_count`]), and the statement is
+/// refused. Admission is
+/// by shape only: an admitted statement can still decline at execution (no
+/// stored sum, a dictionary over the cardinality ceiling, a clipped segment,
+/// a residual the optimizer leaves in place) and scans.
+///
+/// An admitted statement returns the [`ColumnStatsRequest`] its answer reads
+/// (issue #3244): the shape's dictionaries and nothing else, since a load
+/// pays for every dictionary it carries.
+///
+/// - **q08** requests the group key's dictionary.
+/// - **q02** requests the dictionary of every non-`Str` declared column a
+///   residual `<>` conjunct or unknown conjunct names: whichever of them the
+///   optimizer leaves as the scan's one `<>` conjunct is the one
+///   [`LogsScanExec::declared_not_equal_count`] reads.
+/// - **SUM/AVG** read the stored sum and counts, so they request no
+///   dictionary.
+///
+/// `None` refuses the statement: no statistics load at all.
+pub(crate) fn logical_aggregate_answerable(
+    aggregate: &Aggregate,
+    declared: &[DeclaredColumn],
+) -> Option<ColumnStatsRequest> {
+    let residual = logs_scan_residual(&aggregate.input, declared)?;
+    let calls = aggregate
+        .aggr_expr
+        .iter()
+        .map(|expr| logical_call(expr, declared))
+        .collect::<Option<Vec<_>>>()?;
+    let not_str = |col: &DeclaredColumn| !matches!(col.ty, DeclaredType::Str);
+    // `None` for q02, which needs exactly one `<>` conjunct and reads that
+    // conjunct's dictionary; the request itself for the shapes that need no
+    // conjunct.
+    let unfiltered_request = match (aggregate.group_expr.as_slice(), calls.as_slice()) {
+        ([], [StatsAggregate::CountStar]) => None,
+        ([], [StatsAggregate::Sum { col, .. } | StatsAggregate::Avg { col }])
+            if matches!(col.ty, DeclaredType::I64) =>
+        {
+            Some(ColumnStatsRequest::summary_only())
+        }
+        ([Expr::Column(key)], [StatsAggregate::CountStar]) => {
+            let key = declared_named(declared, &key.name).filter(|col| not_str(col))?;
+            Some(ColumnStatsRequest::summary_only().with_dictionary(key.key.as_str()))
+        }
+        _ => return None,
+    };
+    let mut not_equal = Vec::new();
+    let mut unknown = Vec::new();
+    for conjunct in &residual {
+        match logical_not_equal_literal(conjunct, declared) {
+            Some(col) => not_equal.push(col),
+            None => unknown.push(conjunct),
+        }
+    }
+    let Some(unfiltered_request) = unfiltered_request else {
+        let mut request = ColumnStatsRequest::summary_only();
+        if !unknown.is_empty() {
+            for col in not_equal.iter().filter(|col| not_str(col)) {
+                request.add_dictionary(col.key.as_str());
+            }
+            for conjunct in &unknown {
+                for col in non_str_declared_named(conjunct, declared) {
+                    request.add_dictionary(col.key.as_str());
+                }
+            }
+            return (!request.is_summary_only()).then_some(request);
+        }
+        return match not_equal.as_slice() {
+            [col] if not_str(col) => Some(request.with_dictionary(col.key.as_str())),
+            _ => None,
+        };
+    };
+    (!unknown.is_empty() || not_equal.is_empty()).then_some(unfiltered_request)
+}
+
+/// The non-`Str` declared columns `expr` references by name.
+fn non_str_declared_named<'a>(
+    expr: &Expr,
+    declared: &'a [DeclaredColumn],
+) -> Vec<&'a DeclaredColumn> {
+    expr.column_refs()
+        .iter()
+        .filter_map(|col| declared_named(declared, &col.name))
+        .filter(|col| !matches!(col.ty, DeclaredType::Str))
+        .collect()
+}
+
+/// The residual filter conjuncts between an aggregate's input and the `logs`
+/// scan under it, plus every declared `Str` `<>` row filter conjunct (see
+/// [`logical_aggregate_answerable`]), or `None` when the input is not a `logs`
+/// scan reached
+/// through `Filter`, `SubqueryAlias`, and `Projection`s of plain columns only.
+/// [`rewrite`]'s scan chain admits a filter and partition shuffles and nothing
+/// that computes (a computed projection survives as a `ProjectionExec`), and
+/// DataFusion's rule needs the scan's own exact statistics as its input.
+fn logs_scan_residual(mut plan: &LogicalPlan, declared: &[DeclaredColumn]) -> Option<Vec<Expr>> {
+    let mut residual = Vec::new();
+    let mut keep = |predicate: &Expr| {
+        residual.extend(
+            split_conjunction(predicate)
+                .into_iter()
+                .filter(|conjunct| {
+                    !filter_is_exact(conjunct, declared)
+                        || filter_has_row_filter(conjunct, declared)
+                })
+                .cloned(),
+        );
+    };
+    loop {
+        match plan {
+            LogicalPlan::TableScan(scan) => {
+                for filter in &scan.filters {
+                    keep(filter);
+                }
+                return (scan.table_name.table() == LOGS_TABLE).then_some(residual);
+            }
+            LogicalPlan::Filter(filter) => {
+                keep(&filter.predicate);
+                plan = &filter.input;
+            }
+            LogicalPlan::SubqueryAlias(alias) => plan = &alias.input,
+            LogicalPlan::Projection(projection)
+                if projection
+                    .expr
+                    .iter()
+                    .all(|expr| matches!(expr, Expr::Column(_))) =>
+            {
+                plan = &projection.input;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// `expr`, one entry of an `Aggregate`'s `aggr_expr`, as a [`StatsAggregate`]
+/// over declared columns, through the same [`stats_aggregate`] the physical
+/// [`classify_aggregate`] uses.
+fn logical_call<'a>(
+    expr: &Expr,
+    declared: &'a [DeclaredColumn],
+) -> Option<StatsAggregate<&'a DeclaredColumn>> {
+    let expr = match expr {
+        Expr::Alias(alias) => alias.expr.as_ref(),
+        other => other,
+    };
+    let Expr::AggregateFunction(call) = expr else {
+        return None;
+    };
+    let [arg] = call.params.args.as_slice() else {
+        return None;
+    };
+    stats_aggregate(
+        &call.func.name().to_ascii_lowercase(),
+        call.params.distinct,
+        call.params.filter.is_some(),
+        logical_arg(arg, declared)?,
+    )
+}
+
+/// [`physical_arg`] for a logical expression, with each column resolved to
+/// the declared column it names. A column naming no declared column is
+/// `None`: no consumer answers from statistics for it.
+fn logical_arg<'a>(
+    expr: &Expr,
+    declared: &'a [DeclaredColumn],
+) -> Option<StatsArg<&'a DeclaredColumn>> {
+    match strip_casts(expr) {
+        Expr::Column(col) => declared_named(declared, &col.name).map(StatsArg::Column),
+        Expr::Literal(value, _) => (!value.is_null()).then_some(StatsArg::NonNullLiteral),
+        Expr::BinaryExpr(LogicalBinaryExpr {
+            left,
+            op: Operator::Plus,
+            right,
+        }) => match (strip_casts(left), strip_casts(right)) {
+            (Expr::Column(col), Expr::Literal(value, _))
+            | (Expr::Literal(value, _), Expr::Column(col)) => Some(StatsArg::ColumnPlus(
+                declared_named(declared, &col.name)?,
+                scalar_to_i128(value)?,
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `expr` with any `CAST`/`TRY_CAST` wrapping a literal removed. The analyzer
+/// casts a literal to its operand's type and the optimizer folds that cast
+/// into the literal before [`rewrite`] sees it. A cast around anything else is
+/// kept: on a column it survives as a `CastExpr` the rewrite refuses.
+fn strip_casts(expr: &Expr) -> &Expr {
+    let mut inner = expr;
+    while let Expr::Cast(Cast { expr, .. }) | Expr::TryCast(TryCast { expr, .. }) = inner {
+        inner = expr.as_ref();
+    }
+    match inner {
+        Expr::Literal(..) => inner,
+        _ => expr,
+    }
+}
+
+/// [`not_equal_literal`] for a logical conjunct: the declared column of a
+/// `<declared column> <> <non-null literal>` (or reversed) predicate. The
+/// literal may sit under a cast ([`strip_casts`]). A cast on the column side
+/// is not matched, which leaves the conjunct unknown to
+/// [`logical_aggregate_answerable`].
+fn logical_not_equal_literal<'a>(
+    conjunct: &Expr,
+    declared: &'a [DeclaredColumn],
+) -> Option<&'a DeclaredColumn> {
+    let Expr::BinaryExpr(LogicalBinaryExpr {
+        left,
+        op: Operator::NotEq,
+        right,
+    }) = conjunct
+    else {
+        return None;
+    };
+    let (col, literal) = match (left.as_ref(), right.as_ref()) {
+        (Expr::Column(col), literal) | (literal, Expr::Column(col)) => (col, literal),
+        _ => return None,
+    };
+    match strip_casts(literal) {
+        Expr::Literal(value, _) if !value.is_null() => declared_named(declared, &col.name),
+        _ => None,
+    }
+}
+
+/// The declared column whose key is `name`.
+fn declared_named<'a>(declared: &'a [DeclaredColumn], name: &str) -> Option<&'a DeclaredColumn> {
+    declared.iter().find(|d| d.key == name)
+}
+
+/// Try to rewrite one node. Returns it unchanged unless it is a Final-output
+/// `COUNT(*)` aggregate, with or without a single declared-column group key,
+/// reachable down to a [`LogsScanExec`] in one of the two shapes the module
+/// docs describe, AND [`LogsScanExec::declared_not_equal_count`] /
+/// [`LogsScanExec::declared_group_counts`] can prove the answer exact.
+fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn ExecutionPlan>>> {
+    let Some(agg) = node.downcast_ref::<physical_plan::aggregates::AggregateExec>() else {
+        return Ok(Transformed::no(node));
+    };
+    if agg.mode().output_mode() != physical_plan::aggregates::AggregateOutputMode::Final {
+        return Ok(Transformed::no(node));
+    }
+
+    // Descend to the Raw-input-mode aggregate: `agg` itself when it is
+    // Single/SinglePartitioned, or found through a chain of partition-shuffle
+    // nodes over a Final/FinalPartitioned stage's Partial input.
+    let mut current: Arc<dyn ExecutionPlan> = Arc::clone(&node);
+    let (group, agg_kind, raw_input) = loop {
+        if let Some(a) = current.downcast_ref::<physical_plan::aggregates::AggregateExec>() {
+            if a.mode().input_mode() == physical_plan::aggregates::AggregateInputMode::Raw {
+                let Some(group) = group_index(a.group_expr()) else {
+                    return Ok(Transformed::no(node));
+                };
+                let Some(agg_kind) = classify_aggregate(a) else {
+                    return Ok(Transformed::no(node));
+                };
+                break (group, agg_kind, Arc::clone(a.input()));
+            }
+            current = Arc::clone(a.input());
+            continue;
+        }
+        let Some(child) = shuffle_child(&current) else {
+            return Ok(Transformed::no(node));
+        };
+        current = child;
+    };
+
+    // Walk down from the raw stage's input to the scan, admitting at most one
+    // residual filter.
+    let mut current = raw_input;
+    let mut filter: Option<Arc<FilterExec>> = None;
+    let scan = loop {
+        if let Some(scan) = current.downcast_ref::<LogsScanExec>() {
+            break scan;
+        }
+        let Some(step) = classify_scan_chain(&current) else {
+            return Ok(Transformed::no(node));
+        };
+        if let ScanChainStep::Filter(f) = &step {
+            if filter.is_some() {
+                return Ok(Transformed::no(node));
+            }
+            filter = Some(Arc::clone(f));
+        }
+        let Some(child) = current.children().first().map(|c| Arc::clone(c)) else {
+            return Ok(Transformed::no(node));
+        };
+        current = child;
+    };
+
+    let schema = node.schema();
+    let batch = match (group, agg_kind) {
+        // q02: COUNT(*) WHERE <declared column> <> <literal>. A predicate-
+        // free COUNT(*) here is already handled by DataFusion's own built-in
+        // AggregateStatistics rule, so require the filter this rule exists
+        // for rather than reproducing that case.
+        (None, StatsAggregate::CountStar) => {
+            let Some(filter) = filter else {
+                return Ok(Transformed::no(node));
+            };
+            let Some((col_index, literal)) = not_equal_literal(filter.predicate()) else {
+                return Ok(Transformed::no(node));
+            };
+            // `col_index` is in the scan's output space (projection pushdown
+            // has already run by the time this rule fires); resolve it to a
+            // declared-column index before reading statistics.
+            let Some(k) = scan.declared_index_for_output(col_index) else {
+                return Ok(Transformed::no(node));
+            };
+            if literal.is_null() {
+                return Ok(Transformed::no(node));
+            }
+            let Some(count) = scan.declared_not_equal_count(k, &literal) else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(count) = count_to_i64(count) else {
+                return Ok(Transformed::no(node));
+            };
+            match count_star_batch(&schema, count) {
+                Some(batch) => batch,
+                None => return Ok(Transformed::no(node)),
+            }
+        }
+        // q08: <declared column>, COUNT(*) GROUP BY <declared column>. A
+        // filter combined with a GROUP BY is out of scope for this rule.
+        (Some(col_index), StatsAggregate::CountStar) => {
+            if filter.is_some() {
+                return Ok(Transformed::no(node));
+            }
+            let Some(k) = scan.declared_index_for_output(col_index) else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(counts) = scan.declared_group_counts(k) else {
+                return Ok(Transformed::no(node));
+            };
+            match group_counts_batch(&schema, counts) {
+                Some(batch) => batch,
+                None => return Ok(Transformed::no(node)),
+            }
+        }
+        // q03/q04: SUM(<declared integer column> + k), ungrouped, no filter.
+        (
+            None,
+            StatsAggregate::Sum {
+                col: col_index,
+                addend,
+            },
+        ) => {
+            if filter.is_some() {
+                return Ok(Transformed::no(node));
+            }
+            let Some(k) = scan.declared_index_for_output(col_index) else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(cs) = scan.declared_column_sum(k) else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(scalar) = sum_scalar(&schema, &cs, addend) else {
+                return Ok(Transformed::no(node));
+            };
+            match single_scalar_batch(&schema, scalar) {
+                Some(batch) => batch,
+                None => return Ok(Transformed::no(node)),
+            }
+        }
+        // q30: AVG(<declared integer column>), ungrouped, no filter.
+        (None, StatsAggregate::Avg { col: col_index }) => {
+            if filter.is_some() {
+                return Ok(Transformed::no(node));
+            }
+            let Some(k) = scan.declared_index_for_output(col_index) else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(cs) = scan.declared_column_sum(k) else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(scalar) = avg_scalar(&schema, &cs) else {
+                return Ok(Transformed::no(node));
+            };
+            match single_scalar_batch(&schema, scalar) {
+                Some(batch) => batch,
+                None => return Ok(Transformed::no(node)),
+            }
+        }
+        // q03/q04 after `crate::sum_plus`: the sum and non-null count of a
+        // declared integer column, ungrouped, no filter. The projection above
+        // computes `sum + k * count` and its overflow check.
+        (None, StatsAggregate::SumCount { col: col_index }) => {
+            if filter.is_some() {
+                return Ok(Transformed::no(node));
+            }
+            let Some(k) = scan.declared_index_for_output(col_index) else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(cs) = scan.declared_column_sum(k) else {
+                return Ok(Transformed::no(node));
+            };
+            match sum_count_batch(&schema, &cs) {
+                Some(batch) => batch,
+                None => return Ok(Transformed::no(node)),
+            }
+        }
+        // A grouped SUM/AVG is out of scope for this rule.
+        (Some(_), StatsAggregate::Sum { .. })
+        | (Some(_), StatsAggregate::Avg { .. })
+        | (Some(_), StatsAggregate::SumCount { .. }) => {
+            return Ok(Transformed::no(node));
+        }
+    };
+
+    Ok(Transformed::new(
+        Arc::new(MetadataOnlyExec::new(schema, batch)) as Arc<dyn ExecutionPlan>,
+        true,
+        datafusion::common::tree_node::TreeNodeRecursion::Jump,
+    ))
+}
+
+/// `count` as the single-row, single-column `COUNT(*)` result batch under
+/// `schema`. `None` when `schema` is not the one-column shape this rewrite
+/// expects (an internal-error case: the raw stage's `COUNT(*)` shape check
+/// already passed, so a schema of any other width would mean this rule's own
+/// assumptions about the plan are wrong), which the caller treats as a
+/// decline rather than a panic.
+fn count_star_batch(schema: &SchemaRef, count: i64) -> Option<RecordBatch> {
+    if schema.fields().len() != 1 {
+        return None;
+    }
+    let array: ArrayRef = Arc::new(Int64Array::from(vec![count]));
+    RecordBatch::try_new(Arc::clone(schema), vec![array]).ok()
+}
+
+/// `counts` as the two-column `<declared column>, COUNT(*)` result batch
+/// under `schema` (group value column, then count column), with a synthetic
+/// NULL group row appended when `counts.null_count > 0`. `None` on a schema
+/// shape mismatch (see [`count_star_batch`]) or a per-group count that does
+/// not fit `i64` (`COUNT(*)`'s declared output type): both are declines, not
+/// partial answers, since the ADR-0850 safety lemma is exactness or
+/// fallback, never a truncated result.
+fn group_counts_batch(schema: &SchemaRef, counts: DeclaredGroupCounts) -> Option<RecordBatch> {
+    if schema.fields().len() != 2 {
+        return None;
+    }
+    let mut values: Vec<ScalarValue> = Vec::with_capacity(counts.counts.len() + 1);
+    let mut tallies: Vec<i64> = Vec::with_capacity(counts.counts.len() + 1);
+    for (value, count) in counts.counts {
+        values.push(value);
+        tallies.push(count_to_i64(count)?);
+    }
+    if counts.null_count > 0 {
+        values.push(ScalarValue::try_from(schema.field(0).data_type()).ok()?);
+        tallies.push(count_to_i64(counts.null_count)?);
+    }
+    let group_array = ScalarValue::iter_to_array(values).ok()?;
+    let count_array: ArrayRef = Arc::new(Int64Array::from(tallies));
+    RecordBatch::try_new(Arc::clone(schema), vec![group_array, count_array]).ok()
+}
+
+/// The `SUM(col + addend)` answer as a scalar: `sum + addend * non_null_count`,
+/// or SQL `NULL` when no non-null row exists (`SUM` over zero rows is `NULL`,
+/// never 0). `None` -- a decline, never a partial answer -- when the outer
+/// schema is not the single `Int64` column `SUM(<Int64>)` produces, or the
+/// arithmetic overflows `i64` (the declared output type): the ADR-0850 lemma
+/// admits no silent truncation, so an overflow falls back to the scan.
+fn sum_scalar(schema: &SchemaRef, cs: &DeclaredColumnSum, addend: i128) -> Option<ScalarValue> {
+    if schema.fields().len() != 1 || *schema.field(0).data_type() != DataType::Int64 {
+        return None;
+    }
+    if cs.non_null_count == 0 {
+        return Some(ScalarValue::Int64(None));
+    }
+    let term = addend.checked_mul(i128::from(cs.non_null_count))?;
+    let total = cs.sum.checked_add(term)?;
+    Some(ScalarValue::Int64(Some(i64::try_from(total).ok()?)))
+}
+
+/// The `exact_sum_count(col)` answer as a one-row batch: the exact sum and the
+/// non-null count. `None` -- a decline -- when the outer schema is not the
+/// single `exact_sum_count` column, the sum is outside `Decimal128(38, 0)`, or
+/// the count does not fit `i64`.
+fn sum_count_batch(schema: &SchemaRef, cs: &DeclaredColumnSum) -> Option<RecordBatch> {
+    let DataType::Struct(fields) = sum_count_type() else {
+        return None;
+    };
+    if schema.fields().len() != 1
+        || *schema.field(0).data_type() != DataType::Struct(fields.clone())
+    {
+        return None;
+    }
+    let sum = SumKind::Signed.state_value(cs.sum).ok()?;
+    let sums = Decimal128Array::from(vec![sum])
+        .with_precision_and_scale(38, 0)
+        .ok()?;
+    let counts = Int64Array::from(vec![count_to_i64(cs.non_null_count)?]);
+    let array = StructArray::try_new(
+        fields,
+        vec![Arc::new(sums) as ArrayRef, Arc::new(counts)],
+        None,
+    )
+    .ok()?;
+    RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(array)]).ok()
+}
+
+/// The `AVG(col)` answer as a scalar: `sum / non_null_count` in `f64`, or SQL
+/// `NULL` when no non-null row exists (`AVG` over zero rows is `NULL`). `None`
+/// when the outer schema is not the single `Float64` column `AVG(<Int64>)`
+/// produces. The division mirrors DataFusion's integer `AVG` exactly: the exact
+/// `i128` sum and the count are each cast to `f64` and divided once, so the
+/// rewritten answer is bit-identical to the scanned one.
+fn avg_scalar(schema: &SchemaRef, cs: &DeclaredColumnSum) -> Option<ScalarValue> {
+    if schema.fields().len() != 1 || *schema.field(0).data_type() != DataType::Float64 {
+        return None;
+    }
+    if cs.non_null_count == 0 {
+        return Some(ScalarValue::Float64(None));
+    }
+    let avg = (cs.sum as f64) / (cs.non_null_count as f64);
+    Some(ScalarValue::Float64(Some(avg)))
+}
+
+/// A single-row, single-column batch carrying `scalar` under `schema`. `None`
+/// on a schema-width mismatch (an internal-error decline; see
+/// [`count_star_batch`]).
+fn single_scalar_batch(schema: &SchemaRef, scalar: ScalarValue) -> Option<RecordBatch> {
+    if schema.fields().len() != 1 {
+        return None;
+    }
+    let array = scalar.to_array().ok()?;
+    RecordBatch::try_new(Arc::clone(schema), vec![array]).ok()
+}
+
+/// `count` as `i64`, `COUNT(*)`'s declared output type. `None` on overflow,
+/// which the caller treats as a decline (see [`group_counts_batch`]'s doc):
+/// astronomically unlikely for a real row count, but exactness-or-fallback
+/// admits no silent truncation.
+fn count_to_i64(count: u64) -> Option<i64> {
+    i64::try_from(count).ok()
+}
+
+/// A single fixed [`RecordBatch`] answer to a metadata-only aggregate,
+/// produced entirely from ADR-0850 catalog statistics with zero data-block
+/// GETs. The `EXPLAIN` marker issue #850 deliverable 3 requires: `name()`
+/// and [`DisplayAs`] both read `MetadataOnlyExec`, distinct from the generic
+/// nodes DataFusion's own built-in statistics rule produces, so a test can
+/// attribute a plan specifically to this optimization.
+#[derive(Debug)]
+pub struct MetadataOnlyExec {
+    schema: SchemaRef,
+    batch: RecordBatch,
+    properties: Arc<PlanProperties>,
+}
+
+impl MetadataOnlyExec {
+    fn new(schema: SchemaRef, batch: RecordBatch) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        MetadataOnlyExec {
+            schema,
+            batch,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for MetadataOnlyExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "MetadataOnlyExec: metadata_only=true, rows={}",
+                    self.batch.num_rows()
+                )
+            }
+            DisplayFormatType::TreeRender => Ok(()),
+        }
+    }
+}
+
+impl ExecutionPlan for MetadataOnlyExec {
+    fn name(&self) -> &'static str {
+        "MetadataOnlyExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    // Visits nothing: this node holds no physical expression it evaluates.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return Err(DataFusionError::Internal(
+                "MetadataOnlyExec: expected zero children".to_string(),
+            ));
+        }
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "MetadataOnlyExec: invalid partition {partition}, expected 0"
+            )));
+        }
+        Ok(Box::pin(physical_plan::memory::MemoryStream::try_new(
+            vec![self.batch.clone()],
+            Arc::clone(&self.schema),
+            None,
+        )?))
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DFResult<Arc<Statistics>> {
+        Ok(Arc::new(
+            physical_plan::common::compute_record_batch_statistics(
+                &[vec![self.batch.clone()]],
+                &self.schema,
+                None,
+            ),
+        ))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use datafusion::functions_aggregate::expr_fn::{count, sum};
+    use datafusion::logical_expr::LogicalPlanBuilder;
+    use datafusion::logical_expr::logical_plan::builder::table_scan_with_filters;
+    use datafusion::prelude::{col, lit};
+
+    use super::*;
+    use crate::logs_schema::logs_schema_with_declared;
+
+    /// ADR-0093, exact not-equal amendment, T4 (c): the optimizer's form of a
+    /// declared `Str` column's `<>`, `url <> Dictionary(Int32, Utf8(""))`,
+    /// which [`filter_is_exact`] accepts, stays in the residual. So the q31
+    /// shape (a `GROUP BY` under it) and a `SUM` under it are refused before
+    /// any column statistics load, whether the conjunct sits in a `Filter` or
+    /// in the scan's own filters. The same aggregates with no filter are
+    /// admitted, so the refusal is the conjunct's.
+    ///
+    /// The executor judges the analyzed plan, where type coercion leaves the
+    /// literal cast-wrapped and [`filter_is_exact`] does not accept it, so
+    /// `str_not_equal_shapes_load_no_column_statistics`
+    /// (`tests/logs_stats_load.rs`) passes with or without this rule; this
+    /// test pins the rule on the form the scan receives.
+    ///
+    /// Flipped: a `logs_scan_residual` that drops the conjunct with the other
+    /// `Exact` ones admits every filtered case and fails "refused".
+    #[test]
+    fn str_not_equal_conjunct_stays_residual_for_the_rewrite_check() {
+        let declared = vec![
+            DeclaredColumn::new("status", DeclaredType::I64),
+            DeclaredColumn::new("url", DeclaredType::Str),
+        ];
+        let schema = logs_schema_with_declared(&declared);
+        let conjunct = col("url").not_eq(lit(ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::Utf8(Some(String::new()))),
+        )));
+        assert!(filter_is_exact(&conjunct, &declared));
+        let shapes: [(&str, Vec<Expr>, Vec<Expr>); 2] = [
+            ("q31", vec![col("status")], vec![count(lit(1i64))]),
+            ("SUM", Vec::new(), vec![sum(col("status"))]),
+        ];
+        let aggregate_over = |input: LogicalPlanBuilder, group: &[Expr], aggr: &[Expr]| {
+            let plan = input
+                .aggregate(group.to_vec(), aggr.to_vec())
+                .expect("aggregate")
+                .build()
+                .expect("plan");
+            match plan {
+                LogicalPlan::Aggregate(aggregate) => aggregate,
+                other => panic!("not an aggregate: {other}"),
+            }
+        };
+        for (name, group, aggr) in &shapes {
+            let bare =
+                table_scan_with_filters(Some(LOGS_TABLE), &schema, None, Vec::new()).expect("scan");
+            let aggregate = aggregate_over(bare, group, aggr);
+            assert!(
+                logical_aggregate_answerable(&aggregate, &declared).is_some(),
+                "{name}: admitted with no filter"
+            );
+
+            let filtered = table_scan_with_filters(Some(LOGS_TABLE), &schema, None, Vec::new())
+                .expect("scan")
+                .filter(conjunct.clone())
+                .expect("filter");
+            let pushed =
+                table_scan_with_filters(Some(LOGS_TABLE), &schema, None, vec![conjunct.clone()])
+                    .expect("scan");
+            for (place, input) in [("Filter", filtered), ("scan filters", pushed)] {
+                let aggregate = aggregate_over(input, group, aggr);
+                assert!(
+                    logical_aggregate_answerable(&aggregate, &declared).is_none(),
+                    "{name}, conjunct in {place}: refused"
+                );
+            }
+        }
+    }
+}

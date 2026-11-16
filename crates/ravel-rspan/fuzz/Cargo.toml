@@ -1,0 +1,29 @@
+[package]
+name = "ravel-rspan-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# cargo-fuzz requires the fuzz project to be its own workspace root so the
+# nightly/sanitizer build flags do not leak into the main workspace. An empty
+# [workspace] table detaches it from the parent workspace at crates/*.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# The RSPAN decode path takes a single untrusted byte slice, so no `arbitrary`
+# split (unlike ravel-segment's catalog decoders) is needed; the target derives
+# the suffix-protocol size from a fixed prefix of the fuzz buffer.
+[dependencies.ravel-rspan]
+path = ".."
+
+[[bin]]
+name = "decode_rspan"
+path = "fuzz_targets/decode_rspan.rs"
+test = false
+doc = false
+bench = false

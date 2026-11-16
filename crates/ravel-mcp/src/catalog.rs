@@ -1,0 +1,933 @@
+//! The D2 nine-tool catalog (ADR-1374).
+//!
+//! Every tool advertises the same shallow envelope shape as its output
+//! schema (see [`envelope_output_schema`] for why it is shallow rather than
+//! the fully nested [`crate::envelope::Envelope`] derive): D4 defines one
+//! envelope for every tool result, success or failure, so there is nothing
+//! tool-specific to generate there. What differs per tool is its input
+//! schema, built from a small per-tool argument struct via
+//! [`schemars::JsonSchema`] and `rmcp`'s non-macro `Tool` builder (the
+//! `#[tool]` attribute macro cannot express a separate output schema, per
+//! the spike in this crate's earlier commits). Tool bodies -- the code that
+//! actually calls a [`crate::service`] trait -- land in #1380 and #1382;
+//! this module only advertises shape.
+
+use std::sync::Arc;
+
+use rmcp::model::{JsonObject, Tool, ToolAnnotations};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::envelope::{AnyJson, TimeRange};
+
+/// `ravel_capabilities` takes no arguments.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct CapabilitiesInput {}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DescribeDataInput {
+    pub signal: String,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct FindLabelsInput {
+    pub selector: Option<String>,
+    pub label_name: Option<String>,
+    pub filter: Option<String>,
+    pub time_range: TimeRange,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB. A label list is bounded by its own page, but the page is
+    /// still what a caller may need to make smaller.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ExplainQueryInput {
+    pub query: String,
+    pub time_range: TimeRange,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB. An explain returns a plan and an effective schema, both of
+    /// which grow with the statement.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
+}
+
+/// Every data-returning tool declares the same six lowerable budget knobs
+/// (docs/reference/mcp.md#budget-defaults-and-floors): `max_rows`,
+/// `max_bytes_scanned`, `max_store_requests`, `max_segments`,
+/// `max_response_bytes`, `deadline_ms`. An absent field resolves to its
+/// default or to the server ceiling, and a value above its ceiling clamps
+/// down; both happen in [`crate::budget::McpRequestBudgets::clamp`], never
+/// here. The fields are repeated per input struct rather than shared,
+/// because `tools/list` advertises each tool's input schema on its own and a
+/// caller reads that one schema, not a definition it would have to resolve.
+///
+/// `ravel_find_labels`, `ravel_explain_query`, and `ravel_analyze_timeseries`
+/// return no caller-sized row set, so they take the two knobs that still
+/// apply to them: `max_response_bytes` and `deadline_ms`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct QuerySqlInput {
+    pub query: String,
+    pub time_range: TimeRange,
+    /// Rows returned; default 200, ceiling 5,000.
+    pub max_rows: Option<u32>,
+    pub max_bytes_scanned: Option<u64>,
+    pub max_store_requests: Option<u32>,
+    pub max_segments: Option<u32>,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
+    pub cursor: Option<String>,
+    /// Not served by this build: any value is refused as `unsupported`.
+    pub evidence_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct QueryPromqlInput {
+    pub query: String,
+    /// Set together with `step` for a range evaluation. Exactly one of this
+    /// pair or `evaluation_time` must be present. Steps run from `start_ns`
+    /// while below `end_ns`.
+    pub time_range: Option<TimeRange>,
+    /// A duration with a unit, such as `30s`. The step and every time must be
+    /// a whole millisecond.
+    pub step: Option<String>,
+    /// Set alone for an instant evaluation. Exactly one of this or the
+    /// `time_range`/`step` pair must be present.
+    pub evaluation_time: Option<String>,
+    /// Absent means no consent: a partial-coverage result is refused rather
+    /// than the whole call failing to deserialize.
+    #[serde(default)]
+    pub allow_partial_coverage: bool,
+    /// Series rows returned; default 200, ceiling 5,000.
+    pub max_rows: Option<u32>,
+    pub max_bytes_scanned: Option<u64>,
+    pub max_store_requests: Option<u32>,
+    pub max_segments: Option<u32>,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
+    /// Not served by this build: any value is refused as `unsupported`.
+    pub evidence_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PredicateOp {
+    Eq,
+    Ne,
+    In,
+    Exists,
+}
+
+/// One string for `eq` and `ne`, a list for `in`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum PredicateValue {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// A condition on a declared or indexed key.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Predicate {
+    pub key: String,
+    pub op: PredicateOp,
+    pub value: Option<PredicateValue>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SearchLogsInput {
+    #[serde(default)]
+    pub predicates: Vec<Predicate>,
+    /// Rows whose body holds these words as a run of whole tokens.
+    pub has_word: Option<String>,
+    /// trace, debug, info, warn, error or fatal: that level or above.
+    pub severity: Option<String>,
+    /// 32 hex characters, either case.
+    pub trace_id: Option<String>,
+    pub time_range: TimeRange,
+    /// Rows returned; default 200, ceiling 5,000.
+    pub max_rows: Option<u32>,
+    pub max_bytes_scanned: Option<u64>,
+    pub max_store_requests: Option<u32>,
+    pub max_segments: Option<u32>,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
+    pub cursor: Option<String>,
+    /// Not served by this build: any value is refused as `unsupported`.
+    pub evidence_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GetTraceInput {
+    /// 32 hex characters, either case.
+    pub trace_id: String,
+    /// Optional. Omitted, the lookup reads every span the tenant retains.
+    pub time_range: Option<TimeRange>,
+    /// With `true`, the log records that carry trace_id in time_range
+    /// (required) come back in `logs`.
+    pub include_logs: Option<bool>,
+    /// Spans returned; default 200, ceiling 5,000.
+    pub max_rows: Option<u32>,
+    pub max_bytes_scanned: Option<u64>,
+    pub max_store_requests: Option<u32>,
+    pub max_segments: Option<u32>,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
+    /// Not served by this build: any value is refused as `unsupported`.
+    pub evidence_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalyzeOp {
+    ChangePoint,
+    Summary,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AnalyzeTimeseriesInput {
+    pub query: String,
+    pub time_range: TimeRange,
+    /// A duration with a unit, such as `30s`. The step and every time must be
+    /// a whole millisecond.
+    pub step: String,
+    pub op: AnalyzeOp,
+    /// Series rows returned; default 200, ceiling 5,000.
+    pub max_rows: Option<u32>,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB. An analysis runs a PromQL range evaluation underneath, so it
+    /// takes the same deadline and response bound the evaluation would.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
+    /// Not served by this build: any value is refused as `unsupported`.
+    pub evidence_ref: Option<String>,
+}
+
+/// The agent a Ravel Agents tool reads: `ravel_agent_describe`,
+/// `ravel_agent_state` and `ravel_agent_blocked_effects`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AgentInput {
+    pub kind: String,
+    pub key: String,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AgentSendInput {
+    pub kind: String,
+    pub key: String,
+    pub handler: String,
+    /// The handler's input, any JSON value.
+    #[serde(default)]
+    pub payload: AnyJson,
+    /// Becomes the send's request id: a repeat with the same key answers the
+    /// same operation and accepts nothing new.
+    pub idempotency_key: String,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AgentOperationInput {
+    /// The handle a send answered.
+    pub operation: String,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AgentEventsInput {
+    pub kind: String,
+    pub key: String,
+    /// Resume after this cursor; omitted reads from the oldest event.
+    pub cursor: Option<String>,
+    /// Only this operation's events.
+    pub operation: Option<String>,
+    /// Events per page; default 200, at most 1,000.
+    pub max_rows: Option<u32>,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
+}
+
+fn read_only_annotations() -> ToolAnnotations {
+    ToolAnnotations::new()
+        .read_only(true)
+        .destructive(false)
+        .open_world(false)
+}
+
+/// The 14 D4 envelope blocks, in the order [`crate::envelope::Envelope`]
+/// serializes them. Both halves of the output schema are built from this one
+/// list, so a block cannot appear in `properties` and be missing from
+/// `required`.
+const ENVELOPE_BLOCKS: [&str; 14] = [
+    "status",
+    "failure",
+    "data",
+    "plan",
+    "scope",
+    "ids",
+    "visibility",
+    "coverage",
+    "accuracy",
+    "presentation",
+    "budget",
+    "evidence",
+    "warnings",
+    "next_steps",
+];
+
+/// The D4 envelope's top-level shape, deliberately shallow.
+///
+/// [`crate::envelope::Envelope`] already derives `JsonSchema` and a caller
+/// with a use for the fully nested, per-block schema (a doc generator, a
+/// client-side validator) can ask for it directly. `tools/list` cannot: the
+/// derived schema serializes to 5,146 B, and D2 bounds the whole
+/// `tools/list` response to under 24,576 B for nine tools plus their input
+/// schemas, descriptions, and annotations, so attaching it to every one of
+/// the nine tools (46 KiB before anything else) blows that budget by
+/// roughly 2x on the output schemas alone. Every block's own shape is
+/// already normative in `docs/reference/mcp.md#the-envelope` and in
+/// `ravel_mcp::envelope`; leaving each block open here is the same
+/// "unconstrained schema is the honest one" choice `envelope.rs` already
+/// makes for `Cell` and `AnyJson`, extended to the tool-catalog level.
+fn envelope_output_schema() -> Arc<JsonObject> {
+    let mut properties = JsonObject::new();
+    for block in ENVELOPE_BLOCKS {
+        let shape = if block == "status" {
+            json!({"type": "string", "enum": ["ok", "ok_bounded", "ok_page", "error"]})
+        } else {
+            json!({})
+        };
+        properties.insert(block.to_string(), shape);
+    }
+    let required: Vec<Value> = ENVELOPE_BLOCKS
+        .iter()
+        .map(|block| Value::String((*block).to_string()))
+        .collect();
+
+    let mut schema = JsonObject::new();
+    schema.insert("type".to_string(), Value::String("object".to_string()));
+    schema.insert(
+        "description".to_string(),
+        Value::String(
+            "The D4 result envelope. See docs/reference/mcp.md#the-envelope.".to_string(),
+        ),
+    );
+    schema.insert("properties".to_string(), Value::Object(properties));
+    schema.insert("required".to_string(), Value::Array(required));
+    Arc::new(schema)
+}
+
+fn tool<T: JsonSchema + 'static>(
+    name: &'static str,
+    title: &'static str,
+    description: &'static str,
+) -> Tool {
+    annotated_tool::<T>(name, title, description, read_only_annotations())
+}
+
+fn annotated_tool<T: JsonSchema + 'static>(
+    name: &'static str,
+    title: &'static str,
+    description: &'static str,
+    annotations: ToolAnnotations,
+) -> Tool {
+    Tool::new_with_raw(name, Some(description.into()), JsonObject::default())
+        .with_input_schema::<T>()
+        .with_raw_output_schema(envelope_output_schema())
+        .with_title(title)
+        .with_annotations(annotations)
+}
+
+/// `ravel_agent_send` is the one tool in either catalog that writes: it
+/// accepts an input into an agent's inbox. It is not destructive (it removes
+/// nothing) and it is idempotent under its key, which is the one case rmcp
+/// documents `idempotentHint` as meaningful for.
+fn send_annotations() -> ToolAnnotations {
+    ToolAnnotations::new()
+        .read_only(false)
+        .destructive(false)
+        .idempotent(true)
+        .open_world(false)
+}
+
+/// The six Ravel Agents tools (ADR-3331 decision 10), in the order the
+/// reference doc lists them. The server merges these into `tools/list` only
+/// when it is built with both the `mcp` and `agents` features and runs with
+/// both enabled; every call requires the `agents` capability on the
+/// caller's principal.
+pub fn agents_tool_catalog() -> Vec<Tool> {
+    vec![
+        tool::<AgentInput>(
+            "ravel_agent_describe",
+            "Describe agent",
+            "Ravel Agents: an agent's identity, state version, open turn and \
+             inbox depth, without its state",
+        ),
+        annotated_tool::<AgentSendInput>(
+            "ravel_agent_send",
+            "Send to agent",
+            "Ravel Agents: accept one input into an agent's inbox and return \
+             its operation. A repeat with the same idempotency_key returns the \
+             same operation and accepts nothing new",
+            send_annotations(),
+        ),
+        tool::<AgentOperationInput>(
+            "ravel_agent_operation",
+            "Agent operation",
+            "Ravel Agents: an operation's status, and the effect blocking it",
+        ),
+        tool::<AgentInput>(
+            "ravel_agent_state",
+            "Agent state",
+            "Ravel Agents: an agent's state at its current version, open turn \
+             and inbox",
+        ),
+        tool::<AgentEventsInput>(
+            "ravel_agent_events",
+            "Agent events",
+            "Ravel Agents: an agent's events in order, one page after the \
+             cursor",
+        ),
+        tool::<AgentInput>(
+            "ravel_agent_blocked_effects",
+            "Blocked effects",
+            "Ravel Agents: an agent's effects in doubt and the reconcile \
+             request that unblocks each",
+        ),
+    ]
+}
+
+/// The nine D2 tools, in the fixed order the reference doc
+/// (docs/reference/mcp.md) lists them.
+pub fn tool_catalog() -> Vec<Tool> {
+    vec![
+        tool::<CapabilitiesInput>(
+            "ravel_capabilities",
+            "Capabilities",
+            "Protocol and server version, enabled tools, effective budget \
+             ceilings, dialect summaries, tenant hash, enabled signals",
+        ),
+        tool::<DescribeDataInput>(
+            "ravel_describe_data",
+            "Describe data",
+            "Effective schema, indexed keys, metric families, freshness \
+             watermark, coverage window, committed row count (an upper bound)",
+        ),
+        tool::<FindLabelsInput>(
+            "ravel_find_labels",
+            "Find labels",
+            "Metric names, label names, or label values for a selector",
+        ),
+        tool::<ExplainQueryInput>(
+            "ravel_explain_query",
+            "Explain query",
+            "Validate a SQL statement, estimate its cost, and return the \
+             plan shape. No scan runs.",
+        ),
+        tool::<QuerySqlInput>("ravel_query_sql", "Query SQL", "One SELECT over one table"),
+        tool::<QueryPromqlInput>(
+            "ravel_query_promql",
+            "Query PromQL",
+            "Instant or range PromQL evaluation",
+        ),
+        tool::<SearchLogsInput>(
+            "ravel_search_logs",
+            "Search logs",
+            "Typed log search compiled to SQL, ordered by (ts, observed_ts). \
+             Rows grouped by attribute key set; __ravel_group_attrs lists \
+             attributes the group shares once",
+        ),
+        tool::<GetTraceInput>(
+            "ravel_get_trace",
+            "Get trace",
+            "Every span of one trace id, ordered by start time, with \
+             __ravel_depth and __ravel_parent (root, present, missing, \
+             not_returned, cycle). time_range is optional; without it every \
+             span the tenant retains is read",
+        ),
+        tool::<AnalyzeTimeseriesInput>(
+            "ravel_analyze_timeseries",
+            "Analyze timeseries",
+            "change_point or summary over a PromQL range result",
+        ),
+    ]
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use rmcp::model::ListToolsResult;
+
+    use super::*;
+
+    use crate::envelope::{Envelope, Status};
+
+    /// The exact serialized size of the nine-tool `tools/list` response.
+    ///
+    /// Pinned rather than bounded: the D2 budget is what the figure must
+    /// stay under, but a schema change that moves it is a change to what
+    /// every client parses on every reconnect, and it should be read in a
+    /// diff rather than absorbed silently anywhere under the bound. Update
+    /// it in the same commit as the schema change that moves it.
+    const TOOLS_LIST_SERIALIZED_LEN: usize = 16_177;
+
+    /// D2 bounds `tools/list` so the catalog itself never competes with a
+    /// data response for the response-size budget.
+    const _: () = assert!(
+        TOOLS_LIST_SERIALIZED_LEN < 24_576,
+        "tools/list must serialize to under 24576 bytes"
+    );
+
+    /// `tools/list` is served once per session and re-parsed by every
+    /// client on every reconnect.
+    #[test]
+    fn tools_list_serializes_inside_band() {
+        let tools = tool_catalog();
+        assert_eq!(tools.len(), 9, "D2 names exactly nine tools");
+        let result = ListToolsResult::with_all_items(tools);
+        let bytes = serde_json::to_vec(&result).expect("tools/list serializes");
+        assert_eq!(bytes.len(), TOOLS_LIST_SERIALIZED_LEN);
+    }
+
+    /// The advertised output schema is hand-written, so nothing but a test
+    /// keeps it in step with the struct it describes. A block added to
+    /// [`Envelope`] and not to the schema would make every tool advertise a
+    /// shape its own results violate.
+    #[test]
+    fn schema_required_list_matches_envelope_keys() {
+        let schema = envelope_output_schema();
+
+        let mut required: Vec<&str> = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("the schema has a required list")
+            .iter()
+            .map(|entry| entry.as_str().expect("every required entry is a string"))
+            .collect();
+        required.sort_unstable();
+
+        let mut advertised: Vec<&str> = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("the schema has a properties object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        advertised.sort_unstable();
+
+        let envelope = serde_json::to_value(Envelope::default()).expect("envelope serializes");
+        let mut actual: Vec<&str> = envelope
+            .as_object()
+            .expect("an envelope is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        actual.sort_unstable();
+
+        assert_eq!(actual.len(), 14, "D4 defines exactly 14 envelope blocks");
+        assert_eq!(required, actual);
+        assert_eq!(advertised, actual);
+
+        // `ravel_get_trace`'s optional `logs` block: the shallow schema
+        // leaves it out of `required` and does not forbid it, and the derived
+        // envelope schema declares it, with its own `visibility` and
+        // `coverage`, as an optional property.
+        let with_logs = Envelope {
+            logs: Some(crate::envelope::LogsLeg {
+                status: crate::envelope::LegStatus::Ok,
+                failure: None,
+                skipped_reason: None,
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                row_cap_hit: false,
+                bytes_cap_hit: false,
+                rows_omitted: 0,
+                visibility: Some(crate::envelope::Visibility::default()),
+                coverage: Some(crate::envelope::Coverage::default()),
+                budget: crate::envelope::LegSpend::default(),
+                span_lookup_budget: crate::envelope::LegSpend::default(),
+            }),
+            ..Envelope::default()
+        };
+        let with_logs = serde_json::to_value(with_logs).expect("envelope serializes");
+        let mut extra: Vec<&str> = with_logs
+            .as_object()
+            .expect("an envelope is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !actual.contains(key))
+            .collect();
+        extra.sort_unstable();
+        assert_eq!(extra, ["logs"]);
+        assert!(!required.contains(&"logs"));
+        assert_ne!(
+            schema.get("additionalProperties"),
+            Some(&Value::Bool(false)),
+            "the shallow schema must not forbid the logs block"
+        );
+
+        let derived = serde_json::to_value(schemars::schema_for!(Envelope))
+            .expect("the derived schema serializes");
+        let derived_required = derived["required"]
+            .as_array()
+            .expect("the derived schema has a required list");
+        assert!(derived["properties"].get("logs").is_some(), "{derived}");
+        assert!(
+            !derived_required.contains(&Value::String("logs".to_string())),
+            "{derived}"
+        );
+        let leg = &derived["$defs"]["LogsLeg"];
+        let mut leg_keys: Vec<&str> = leg["properties"]
+            .as_object()
+            .expect("LogsLeg has properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut serialized: Vec<&str> = with_logs["logs"]
+            .as_object()
+            .expect("the logs block is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        serialized.sort_unstable();
+        leg_keys.sort_unstable();
+        assert_eq!(leg_keys, serialized);
+        assert!(serialized.contains(&"visibility") && serialized.contains(&"coverage"));
+    }
+
+    /// The `status` property enumerates the four D4 values, in the wire
+    /// spelling [`Status`] serializes to.
+    #[test]
+    fn schema_status_enum_matches_the_status_wire_values() {
+        let schema = envelope_output_schema();
+        let advertised = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get("status"))
+            .cloned()
+            .expect("the schema advertises status");
+
+        let wire: Vec<Value> = [Status::Ok, Status::OkBounded, Status::OkPage, Status::Error]
+            .iter()
+            .map(|status| serde_json::to_value(status).expect("a status serializes"))
+            .collect();
+
+        assert_eq!(wire.len(), 4);
+        assert_eq!(
+            advertised,
+            json!({"type": "string", "enum": Value::Array(wire)})
+        );
+    }
+
+    /// Every row-returning tool takes the same six lowerable budget knobs
+    /// (docs/reference/mcp.md#budget-defaults-and-floors), and every other
+    /// tool that spends a budget takes the two that apply to it. A tool
+    /// missing one advertises no way to lower it, so a caller that cannot
+    /// afford the default has only the server ceiling to fall back on.
+    ///
+    /// `ravel_analyze_timeseries` returns a caller-sized set of series rows
+    /// but takes no scan knob, because the analytics service call it reaches
+    /// applies no per-request scan budget; it refuses one as `unsupported`.
+    ///
+    /// `ravel_capabilities` and `ravel_describe_data` are the two tools with
+    /// no budget knob at all: the first reads nothing from the store, and
+    /// the second answers from the metadata cache and one resolve per
+    /// signal.
+    #[test]
+    fn every_data_tool_advertises_the_lowerable_budgets() {
+        const ROW_BUDGET_KEYS: [&str; 6] = [
+            "deadline_ms",
+            "max_bytes_scanned",
+            "max_response_bytes",
+            "max_rows",
+            "max_segments",
+            "max_store_requests",
+        ];
+        /// The subset that applies to a tool returning no caller-sized row
+        /// set: it still occupies a response and still spends wall clock.
+        const SHARED_BUDGET_KEYS: [&str; 2] = ["deadline_ms", "max_response_bytes"];
+        const UNSCANNED_ROW_KEYS: [&str; 3] = ["deadline_ms", "max_response_bytes", "max_rows"];
+
+        let expected: [(&str, &[&str]); 7] = [
+            ("ravel_query_sql", &ROW_BUDGET_KEYS),
+            ("ravel_query_promql", &ROW_BUDGET_KEYS),
+            ("ravel_search_logs", &ROW_BUDGET_KEYS),
+            ("ravel_get_trace", &ROW_BUDGET_KEYS),
+            ("ravel_find_labels", &SHARED_BUDGET_KEYS),
+            ("ravel_explain_query", &SHARED_BUDGET_KEYS),
+            ("ravel_analyze_timeseries", &UNSCANNED_ROW_KEYS),
+        ];
+
+        let catalog = tool_catalog();
+        for (name, keys) in expected {
+            let tool = catalog
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} is in the catalog"));
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("{name} advertises input properties"));
+
+            let mut present: Vec<&str> = ROW_BUDGET_KEYS
+                .into_iter()
+                .filter(|key| properties.contains_key(*key))
+                .collect();
+            present.sort_unstable();
+            assert_eq!(present, keys, "{name} advertises the wrong budget knobs");
+        }
+
+        for name in ["ravel_capabilities", "ravel_describe_data"] {
+            let tool = catalog
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} is in the catalog"));
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let present: Vec<&str> = ROW_BUDGET_KEYS
+                .into_iter()
+                .filter(|key| properties.contains_key(*key))
+                .collect();
+            assert!(present.is_empty(), "{name} spends no budget");
+        }
+    }
+
+    /// The server reads every budget knob out of an agents call's arguments
+    /// the same way it does for a query tool, and an agents tool body bounds
+    /// its route call by `deadline_ms` and its envelope by
+    /// `max_response_bytes`. Each agents tool advertises those two, and
+    /// `ravel_agent_events` also takes `max_rows`, its page size. The other
+    /// tools' row sets are not cut at `max_rows`, and none of them scans the
+    /// store under the query budgets, so advertising those knobs would offer
+    /// a caller a bound that bounds nothing.
+    #[test]
+    fn every_agents_tool_advertises_the_budgets_its_body_applies() {
+        const BUDGET_KEYS: [&str; 6] = [
+            "deadline_ms",
+            "max_bytes_scanned",
+            "max_response_bytes",
+            "max_rows",
+            "max_segments",
+            "max_store_requests",
+        ];
+        const SHARED: &[&str] = &["deadline_ms", "max_response_bytes"];
+        const PAGED: &[&str] = &["deadline_ms", "max_response_bytes", "max_rows"];
+
+        let expected: [(&str, &[&str]); 6] = [
+            ("ravel_agent_describe", SHARED),
+            ("ravel_agent_send", SHARED),
+            ("ravel_agent_operation", SHARED),
+            ("ravel_agent_state", SHARED),
+            ("ravel_agent_events", PAGED),
+            ("ravel_agent_blocked_effects", SHARED),
+        ];
+
+        let catalog = agents_tool_catalog();
+        let names: Vec<&str> = catalog.iter().map(|tool| tool.name.as_ref()).collect();
+        let expected_names: Vec<&str> = expected.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, expected_names, "every agents tool is checked");
+
+        for (tool, (name, keys)) in catalog.iter().zip(expected) {
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("{name} advertises input properties"));
+            let present: Vec<&str> = BUDGET_KEYS
+                .into_iter()
+                .filter(|key| properties.contains_key(*key))
+                .collect();
+            assert_eq!(present, keys, "{name} advertises the wrong budget knobs");
+        }
+    }
+
+    /// D2's three flat properties of the whole catalog, asserted for all
+    /// nine tools at once: the `readOnlyHint: true`, `destructiveHint:
+    /// false`, `openWorldHint: false` annotations, the `ravel_` name prefix,
+    /// and the order the reference doc lists the tools in (a client renders
+    /// `tools/list` in the order it arrives, so the order is part of what is
+    /// advertised).
+    ///
+    /// `idempotent_hint` stays unset on purpose. ADR-1374 D2 names three
+    /// annotations, and rmcp documents that hint as meaningful only when
+    /// `readOnlyHint == false`, so setting it here would advertise something
+    /// the ADR does not.
+    #[test]
+    fn every_tool_is_read_only_idempotent_and_ravel_prefixed_in_catalog_order() {
+        const CATALOG_ORDER: [&str; 9] = [
+            "ravel_capabilities",
+            "ravel_describe_data",
+            "ravel_find_labels",
+            "ravel_explain_query",
+            "ravel_query_sql",
+            "ravel_query_promql",
+            "ravel_search_logs",
+            "ravel_get_trace",
+            "ravel_analyze_timeseries",
+        ];
+
+        let catalog = tool_catalog();
+        let names: Vec<&str> = catalog.iter().map(|tool| tool.name.as_ref()).collect();
+        assert_eq!(names, CATALOG_ORDER);
+
+        for tool in &catalog {
+            assert!(
+                tool.name.starts_with("ravel_"),
+                "{} is missing the D2 prefix",
+                tool.name
+            );
+            let annotations = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} carries annotations", tool.name));
+            assert_eq!(annotations.read_only_hint, Some(true), "{}", tool.name);
+            assert_eq!(annotations.destructive_hint, Some(false), "{}", tool.name);
+            assert_eq!(annotations.open_world_hint, Some(false), "{}", tool.name);
+            assert_eq!(annotations.idempotent_hint, None, "{}", tool.name);
+        }
+    }
+
+    /// `allow_partial_coverage` absent means no consent, not a
+    /// deserialization failure: a caller that never asked for a partial
+    /// result should not have to say so to make a whole-coverage call.
+    #[test]
+    fn absent_allow_partial_coverage_deserializes_as_no_consent() {
+        let input: QueryPromqlInput = serde_json::from_value(
+            json!({"query": "up", "evaluation_time": "2026-09-08T00:00:00Z"}),
+        )
+        .expect("a call without the consent flag deserializes");
+        assert!(!input.allow_partial_coverage);
+
+        let schema = tool_catalog()
+            .into_iter()
+            .find(|tool| tool.name == "ravel_query_promql")
+            .expect("ravel_query_promql is in the catalog")
+            .input_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(schema, vec![Value::String("query".to_string())]);
+    }
+
+    /// `ravel_find_labels` takes no `evidence_ref`, and the schema a client
+    /// reads says so: the argument is removed from the tool, not accepted
+    /// and ignored.
+    ///
+    /// FLIP: a removal from the body alone, leaving the field on
+    /// `FindLabelsInput`, still advertises `evidence_ref` here.
+    #[test]
+    fn find_labels_schema_has_no_evidence_ref() {
+        let tool = tool_catalog()
+            .into_iter()
+            .find(|tool| tool.name == "ravel_find_labels")
+            .expect("ravel_find_labels is in the catalog");
+        let properties = tool
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("the input schema lists its properties");
+        assert!(properties.contains_key("label_name"));
+        assert!(!properties.contains_key("evidence_ref"));
+        let text = serde_json::to_string(tool.input_schema.as_ref()).expect("schema serializes");
+        assert!(!text.contains("evidence_ref"), "{text}");
+    }
+
+    /// The exact serialized size of `tools/list` with the six Ravel Agents
+    /// tools merged after the nine, as a server built with `mcp` and
+    /// `agents` and run with both enabled answers it. Pinned for the same
+    /// reason as [`TOOLS_LIST_SERIALIZED_LEN`], under the same D2 budget
+    /// (ADR-3331 decision 10).
+    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 24_066;
+
+    const _: () = assert!(
+        COMBINED_TOOLS_LIST_SERIALIZED_LEN < 24_576,
+        "the combined tools/list must serialize to under 24576 bytes"
+    );
+
+    #[test]
+    fn combined_tools_list_serializes_inside_band() {
+        let agents = agents_tool_catalog();
+        assert_eq!(agents.len(), 6, "ADR-3331 decision 10 names six tools");
+        let mut tools = tool_catalog();
+        tools.extend(agents);
+        let result = ListToolsResult::with_all_items(tools);
+        let bytes = serde_json::to_vec(&result).expect("tools/list serializes");
+        assert_eq!(bytes.len(), COMBINED_TOOLS_LIST_SERIALIZED_LEN);
+    }
+
+    /// Every agents tool carries the D2 prefix, an input schema of type
+    /// object, the envelope output schema, and its annotations: read-only
+    /// for all but `ravel_agent_send`, which writes, is not destructive, and
+    /// is idempotent under its key.
+    #[test]
+    fn every_agents_tool_is_annotated_and_only_send_writes() {
+        let catalog = agents_tool_catalog();
+        let names: Vec<&str> = catalog.iter().map(|tool| tool.name.as_ref()).collect();
+        assert_eq!(names, crate::tools::agents::AGENTS_TOOLS);
+
+        let envelope = envelope_output_schema();
+        for tool in &catalog {
+            assert!(tool.name.starts_with("ravel_agent_"), "{}", tool.name);
+            assert_eq!(
+                tool.input_schema.get("type"),
+                Some(&json!("object")),
+                "{}",
+                tool.name
+            );
+            assert_eq!(tool.output_schema.as_deref(), Some(envelope.as_ref()));
+            assert!(tool.description.as_deref().is_some_and(|d| !d.is_empty()));
+            let annotations = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} carries annotations", tool.name));
+            let writes = tool.name == "ravel_agent_send";
+            assert_eq!(annotations.read_only_hint, Some(!writes), "{}", tool.name);
+            assert_eq!(annotations.destructive_hint, Some(false), "{}", tool.name);
+            assert_eq!(annotations.open_world_hint, Some(false), "{}", tool.name);
+            let idempotent = if writes { Some(true) } else { None };
+            assert_eq!(annotations.idempotent_hint, idempotent, "{}", tool.name);
+        }
+
+        let send = &catalog[1];
+        let required = send
+            .input_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            required.contains(&json!("idempotency_key")),
+            "send requires its idempotency key: {required:?}"
+        );
+    }
+}

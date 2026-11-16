@@ -1,0 +1,6 @@
+# Synthetic, shaped on M7's c6a.2xlarge figures: mean new 0.380 over mean old
+# 0.495 is 0.77.
+window=1 arm=old qps=0.488 err_ratio=0.0480 connections=10 duration_s=600 seed=clickbench
+window=2 arm=new qps=0.380 err_ratio=0.0480 connections=10 duration_s=600 seed=clickbench
+window=3 arm=new qps=0.380 err_ratio=0.0480 connections=10 duration_s=600 seed=clickbench
+window=4 arm=old qps=0.502 err_ratio=0.0480 connections=10 duration_s=600 seed=clickbench

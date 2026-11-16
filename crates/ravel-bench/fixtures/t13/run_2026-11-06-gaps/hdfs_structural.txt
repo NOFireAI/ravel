@@ -1,0 +1,101 @@
+structural_fetch stamp git=b515bb8e1a37b1339b65d6dfc93c39cf025e7d1b arch=arm64 nproc=15 mem_total_kib=0 corpus=HDFS.log sha256=0783096174d7832c618337f9609e06e04abd86ddd7089b3c12b407e63bfebc52 bytes=1577982906 profile=release
+structural_fetch cpu_clock CLOCK_THREAD_CPUTIME_ID of the report thread; the measurement runs on a current-thread tokio runtime, so every decode the production fetcher does lands on that thread
+structural_fetch params block_records=8192 coalesce_gap=1887437 group_blocks=32 latency_ms=30 matched_rows=10 max_concurrent_gets=16 max_lines=2000000 mini_block_bytes=8192 mini_block_meta_bytes=4 object_max_bytes=11534336 object_min_bytes=10485760 runs=5 seed=13 trace_run_rows=4 zstd_level=3
+structural_fetch hdfs_structural blocks=66 predict=65 band=[52, 80] IN
+structural_fetch hdfs_structural gap_1m/ratio/bytes=1.0683579228700912 predict=0.55 band=[0.05, 1.1] IN
+structural_fetch hdfs_structural gap_1m/ratio/gets=0.6666666666666666 predict=2 band=[0.5, 6.5] IN
+structural_fetch hdfs_structural gap_1m/ratio/wall=0.5423504528116869 predict=0.53 band=[0.3, 0.9] IN
+structural_fetch hdfs_structural gap_1m/structural/bytes=11374888 predict=6000000 band=[600000, 11500000] IN
+structural_fetch hdfs_structural gap_1m/structural/data_ranges=1 predict=5 band=[1, 12] IN
+structural_fetch hdfs_structural gap_1m/structural/decode_cpu_ms=1.9592030316938056 predict=2.2 band=[0.7, 7] IN
+structural_fetch hdfs_structural gap_1m/structural/gets=2 predict=6 band=[2, 13] IN
+structural_fetch hdfs_structural gap_1m/structural/wall_ms=65.9435780316938 predict=64 band=[55, 110] IN
+structural_fetch hdfs_structural gap_1m/today/bytes=10647076 predict=10647076 band=[10300000, 11400000] IN
+structural_fetch hdfs_structural gap_1m/today/data_over_object=0.9354446205952295 predict=0.935 band=[0.9, 1] IN
+structural_fetch hdfs_structural gap_1m/today/decode_cpu_ms=25.409041000000077 predict=28 band=[10, 90] IN
+structural_fetch hdfs_structural gap_1m/today/gets=3 predict=3 band=[2, 4] IN
+structural_fetch hdfs_structural gap_1m/today/plan_bytes=262144 predict=262144 band=[262144, 1048576] IN
+structural_fetch hdfs_structural gap_1m/today/plan_gets=1 predict=1 band=[1, 2] IN
+structural_fetch hdfs_structural gap_1m/today/wall_ms=121.5885 predict=121 band=[80, 220] IN
+structural_fetch hdfs_structural gap_256k/ratio/bytes=0.19784119915370502 predict=0.5 band=[0.25, 1] MISS
+structural_fetch hdfs_structural gap_256k/ratio/gets=1.1578947368421053 predict=0.92 band=[0.6, 1.6] IN
+structural_fetch hdfs_structural gap_256k/ratio/wall=0.6410952715978108 predict=0.69 band=[0.4, 1.2] IN
+structural_fetch hdfs_structural gap_256k/structural/bytes=576111 predict=1000000 band=[500000, 2000000] IN
+structural_fetch hdfs_structural gap_256k/structural/data_ranges=21 predict=11 band=[8, 16] MISS
+structural_fetch hdfs_structural gap_256k/structural/decode_cpu_ms=1.9222305267301623 predict=2.2 band=[0.8, 7] IN
+structural_fetch hdfs_structural gap_256k/structural/gets=22 predict=12 band=[9, 17] MISS
+structural_fetch hdfs_structural gap_256k/structural/wall_ms=98.14185552673015 predict=64 band=[55, 110] IN
+structural_fetch hdfs_structural gap_256k/today/bytes=2911987 predict=2050000 band=[1600000, 2900000] MISS
+structural_fetch hdfs_structural gap_256k/today/data_over_object=0.2386901888016142 predict=0.16 band=[0.12, 0.26] IN
+structural_fetch hdfs_structural gap_256k/today/decode_cpu_ms=24.929542000000193 predict=28 band=[10, 80] IN
+structural_fetch hdfs_structural gap_256k/today/gets=19 predict=13 band=[11, 24] IN
+structural_fetch hdfs_structural gap_256k/today/plan_bytes=262144 predict=262144 band=[262144, 1048576] IN
+structural_fetch hdfs_structural gap_256k/today/plan_gets=1 predict=1 band=[1, 2] IN
+structural_fetch hdfs_structural gap_256k/today/wall_ms=153.084666 predict=95 band=[60, 190] IN
+structural_fetch hdfs_structural gap_64k/ratio/bytes=0.24728362393436853 predict=0.237 band=[0.17, 0.3] IN
+structural_fetch hdfs_structural gap_64k/ratio/gets=0.9583333333333334 predict=1.64 band=[0.9, 2.2] IN
+structural_fetch hdfs_structural gap_64k/ratio/wall=0.6483609314250327 predict=1.05 band=[0.6, 1.6] IN
+structural_fetch hdfs_structural gap_64k/structural/bytes=480525 predict=480525 band=[475000, 486000] IN
+structural_fetch hdfs_structural gap_64k/structural/data_ranges=22 predict=22 band=[21, 23] IN
+structural_fetch hdfs_structural gap_64k/structural/decode_cpu_ms=1.736892100396682 predict=2.2 band=[0.8, 7] IN
+structural_fetch hdfs_structural gap_64k/structural/gets=23 predict=23 band=[22, 24] IN
+structural_fetch hdfs_structural gap_64k/structural/wall_ms=97.32489210039667 predict=95 band=[65, 150] IN
+structural_fetch hdfs_structural gap_64k/today/bytes=1943214 predict=2030000 band=[1600000, 2800000] IN
+structural_fetch hdfs_structural gap_64k/today/data_over_object=0.15142592058802334 predict=0.16 band=[0.12, 0.25] IN
+structural_fetch hdfs_structural gap_64k/today/decode_cpu_ms=22.525874999999917 predict=28 band=[10, 80] IN
+structural_fetch hdfs_structural gap_64k/today/gets=24 predict=14 band=[11, 24] IN
+structural_fetch hdfs_structural gap_64k/today/plan_bytes=262144 predict=262144 band=[262144, 1048576] IN
+structural_fetch hdfs_structural gap_64k/today/plan_gets=1 predict=1 band=[1, 2] IN
+structural_fetch hdfs_structural gap_64k/today/wall_ms=150.109125 predict=95 band=[60, 190] IN
+structural_fetch hdfs_structural l0_64k/ratio/bytes=0.8178718739304576 predict=0.69 band=[0.4, 0.95] IN
+structural_fetch hdfs_structural l0_64k/ratio/gets=1.6666666666666667 predict=1.67 band=[1.25, 2.5] IN
+structural_fetch hdfs_structural l0_64k/ratio/wall=0.5475494901648101 predict=0.53 band=[0.3, 0.9] IN
+structural_fetch hdfs_structural l0_64k/structural/bytes=8707944 predict=7300000 band=[4500000, 10000000] IN
+structural_fetch hdfs_structural l0_64k/structural/data_ranges=4 predict=4 band=[4, 4] IN
+structural_fetch hdfs_structural l0_64k/structural/decode_cpu_ms=1.8412878677087319 predict=2.2 band=[0.7, 7] IN
+structural_fetch hdfs_structural l0_64k/structural/gets=5 predict=5 band=[5, 5] IN
+structural_fetch hdfs_structural l0_64k/structural/wall_ms=65.87237086770874 predict=64 band=[55, 110] IN
+structural_fetch hdfs_structural l0_64k/today/bytes=10647076 predict=10647076 band=[10300000, 11400000] IN
+structural_fetch hdfs_structural l0_64k/today/data_over_object=0.9354446205952295 predict=0.935 band=[0.9, 1] IN
+structural_fetch hdfs_structural l0_64k/today/decode_cpu_ms=23.879790999999706 predict=28 band=[10, 90] IN
+structural_fetch hdfs_structural l0_64k/today/gets=3 predict=3 band=[2, 4] IN
+structural_fetch hdfs_structural l0_64k/today/plan_bytes=262144 predict=262144 band=[262144, 1048576] IN
+structural_fetch hdfs_structural l0_64k/today/plan_gets=1 predict=1 band=[1, 2] IN
+structural_fetch hdfs_structural l0_64k/today/wall_ms=120.30395800000001 predict=121 band=[80, 220] IN
+structural_fetch hdfs_structural object_bytes=11101600 unpredicted (fixed by construction: the sizing search places it inside the registered object_min_bytes..object_max_bytes window)
+structural_fetch hdfs_structural ratio/bytes=1.0683579228700912 predict=1.07 band=[0.9, 1.2] IN
+structural_fetch hdfs_structural ratio/gets=0.6666666666666666 predict=1 band=[0.66, 1.5] IN
+structural_fetch hdfs_structural ratio/wall=0.5515182442852005 predict=0.5 band=[0.3, 0.8] IN
+structural_fetch hdfs_structural rows=540672 predict=532480 band=[425984, 655360] IN
+structural_fetch hdfs_structural structural/bytes=11374888 predict=12100000 band=[10700000, 14700000] IN
+structural_fetch hdfs_structural structural/data_ranges=1 predict=1 band=[1, 2] IN
+structural_fetch hdfs_structural structural/decode_cpu_ms=1.7931027621884557 predict=5 band=[1.5, 15] IN
+structural_fetch hdfs_structural structural/gets=2 predict=2 band=[2, 3] IN
+structural_fetch hdfs_structural structural/layout_bytes=11545750 predict=11900000 band=[10485760, 14417920] IN
+structural_fetch hdfs_structural structural/meta_bytes=7144 predict=5000 band=[2500, 9000] IN
+structural_fetch hdfs_structural structural/raw_ranges=72 predict=72 band=[60, 90] IN
+structural_fetch hdfs_structural structural/uncomp_bytes=928318 predict=900000 band=[450000, 1600000] IN
+structural_fetch hdfs_structural structural/wall_ms=65.86435376218846 predict=66 band=[60, 110] IN
+structural_fetch hdfs_structural target_blocks=10 unpredicted (fixed by construction: 10 evenly spaced rows land in 10 distinct blocks whenever the object has at least 10 blocks)
+structural_fetch hdfs_structural today/bytes=10647076 predict=11272192 band=[10747904, 12582912] MISS
+structural_fetch hdfs_structural today/data_over_object=0.9354446205952295 predict=0.935 band=[0.9, 1] IN
+structural_fetch hdfs_structural today/decode_cpu_ms=23.254874999999675 predict=70 band=[30, 150] MISS
+structural_fetch hdfs_structural today/gets=3 predict=2 band=[2, 3] IN
+structural_fetch hdfs_structural today/plan_bytes=262144 predict=262144 band=[262144, 1048576] IN
+structural_fetch hdfs_structural today/plan_gets=1 predict=1 band=[1, 2] IN
+structural_fetch hdfs_structural today/uncomp_bytes=12039421 predict=11960000 band=[10525000, 13395000] IN
+structural_fetch hdfs_structural today/wall_ms=119.423708 predict=130 band=[90, 220] IN
+structural_fetch note object: 540672 rows from the first lines of the corpus, 66 blocks, 11101600 bytes, sized in 2 writes; whole-object bound 9437185 bytes, so the plan is the ranged plan restricted to the known blocks. Whether today's scan then reads those blocks ranged or the whole object is the fetcher's coverage crossover, decided per gap: production gap 1887437 on L0: 2 ranged GETs of 10384932 bytes after the plan; gap_64k (65536 bytes on L1): 23 ranged GETs of 1681070 bytes after the plan; gap_256k (262144 bytes on L1): 18 ranged GETs of 2649843 bytes after the plan; gap_1m (1048576 bytes on L1): 2 ranged GETs of 10384932 bytes after the plan; l0_64k (65536 bytes on L0): 2 ranged GETs of 10384932 bytes after the plan
+structural_fetch note matched rows (block, row of block): [(3, 2457), (9, 7372), (16, 4095), (23, 818), (29, 5733), (36, 2457), (42, 7372), (49, 4095), (56, 818), (62, 5733)]
+structural_fetch note today: production plan_segment_routed + scan_accounted_with_tenant_subset_raw over every column, real GETs through InstrumentedStore behind a per-GET delay; decode CPU is the thread CPU of the scan open and drain
+structural_fetch note structural: a faithful simulation, not a real decode. Byte and GET counts come from the object's real pages, re-cut into independently compressed mini-blocks and fetched as real ranged GETs; the plan is the production plan run for real plus the mini-block index; decode CPU is modelled as today's CPU at the same gap times structural/uncomp_bytes over today/uncomp_bytes; wall is measured plan and data GET time plus that modelled CPU
+structural_fetch note coalescing: unprefixed figures are both sides at the production default gap, coalesce_gap = DEFAULT_LOG_REQUEST_COST_BYTES = 1887437 bytes (checked), on an L0 segment, the configuration round 0 measured. Targets 6 blocks apart sit closer than that, so both sides there tend to one range and ratio/* is a layout and recompression ratio; it is not counted toward the decision. gap_64k/* (65536 bytes), gap_256k/* (262144 bytes), gap_1m/* (1048576 bytes) are both sides at the named gap on an L1 segment, measured: today's side is the production fetcher with BlockRangeFetcher::with_coalesce_gap and nothing else changed, the structural ranges are coalesced at the same gap, and both sides' plans are made by that fetcher. The decision is taken at gap_64k (65536 bytes, DEFAULT_LOG_COALESCE_GAP). L1 because an L0 read is bridged to at most 4 (MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT) runs before the coverage crossover is checked, which spans the targets whatever the gap; l0_64k/* is that L0 case at 65536 bytes, with the structural ranges bounded to the same 4 runs by the same rule, reported beside the decision and not counted
+structural_fetch note latency model: every GET waits latency_ms before it returns, whatever its size; there is no bandwidth term, so wall time counts round trips and decode CPU, not bytes moved
+structural_fetch note medians of 5 interleaved runs (each run measures every gap, today then structural); every GET and byte count was identical across runs
+structural_fetch decision hdfs_structural: GO (gap_64k/ratio/bytes=0.2473<=0.25 ok, gap_64k/ratio/gets=0.9583<=1.5 ok, gap_64k/ratio/wall=0.6484<=1 ok)
+structural_fetch miss gap_256k/ratio/bytes: 0.19784119915370502 outside band [0.25, 1.0]
+structural_fetch miss gap_256k/structural/data_ranges: 21 outside band [8.0, 16.0]
+structural_fetch miss gap_256k/structural/gets: 22 outside band [9.0, 17.0]
+structural_fetch miss gap_256k/today/bytes: 2911987 outside band [1600000.0, 2900000.0]
+structural_fetch miss today/bytes: 10647076 outside band [10747904.0, 12582912.0]
+structural_fetch miss today/decode_cpu_ms: 23.254874999999675 outside band [30.0, 150.0]

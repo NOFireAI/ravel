@@ -1,0 +1,15723 @@
+//! The per-query SQL execution driver: validate, resolve, plan, execute.
+//!
+//! Request handling order is fixed and is not an implementation detail:
+//!
+//! 1. Parse and validate (security invariant 1, crate::validate) -- before
+//!    anything else, so a rejected statement costs no catalog LIST and
+//!    builds no plan.
+//! 2. Resolve one snapshot per signal table the statement names, each once per
+//!    attempt, through `catalog.resolve_pruned(&tenant_hash, signal, window,
+//!    lane_tokens, now_ns, name_filter)`, every lane at the same resolve
+//!    instant and window, with the instant threaded in from the caller (no
+//!    `SystemTime::now()` in library logic). The resolve instant is the
+//!    request's `now_ns` on every entry point but
+//!    [`SqlExecutor::execute_accounted_at`], which takes it separately so a
+//!    later page resolves at page one's instant while the declared-column and
+//!    key-index lookups and the idle-eviction last-touch read the caller's
+//!    `now_ns`. The signals are read off the
+//!    query's own `FROM` clause ([`SqlExecutor::statement_tables`], ADR-0033,
+//!    extended to `spans` by ADR-0045 decision 5 and to `alerts`/`audit` by
+//!    ADR-1101 decision 1): `Signal::Metrics` for `samples`, `Signal::Logs`
+//!    for `logs`, `Signal::Spans` for `spans`, `Signal::Alerts` for `alerts`,
+//!    `Signal::Audit` for `audit`, in that order, and `Signal::Metrics` alone
+//!    for a statement naming none. The HTTP statement path
+//!    ([`SqlExecutor::execute_accounted`], [`SqlExecutor::explain_accounted`])
+//!    runs a statement naming several of the five tables, one lane each
+//!    (ADR-2904 decision 1). Its `min_commit_token`s are admitted before any
+//!    catalog request ([`admit_http_tokens`], ADR-2904 decision 3): each one
+//!    is assigned to exactly one lane, by its table qualifier or, on a
+//!    statement naming at most one signal table, unqualified, and
+//!    `lane_tokens` is that lane's share alone. Flight SQL runs it too,
+//!    through the multi-lane pinned entry points
+//!    ([`SqlExecutor::resolve_pinned_lanes`], [`SqlExecutor::plan_pinned_lanes`])
+//!    and a ticket carrying one segment group per signal (ADR-2904 decision
+//!    10). The single-snapshot entry points, and ES|QL under its own one-table
+//!    rule (ADR-2887, unchanged by ADR-2904), refuse it with
+//!    [`SqlError::CrossSignalQuery`] before any catalog request. `name_filter`
+//!    is the equality
+//!    `__name__` value derived from the `samples` scans' pushed-down
+//!    predicates ([`SqlExecutor::pushed_down_name_filter`]) and is passed to
+//!    the metrics resolve alone, so a metrics query naming one metric prunes
+//!    by postings exactly as PromQL does; any other signal, or a query with
+//!    no such predicate, resolves unpruned, identical to the former plain
+//!    `resolve`.
+//!
+//!    The Parquet tables of the caller's tenant (ADR-2040) a statement names
+//!    resolve first: [`SqlExecutor::resolve_parquet_target`] reads each
+//!    table's newest live manifest and the tenant's current grants, and
+//!    refuses a file outside every grant. A statement whose only tables are
+//!    Parquet tables resolves no catalog. One that also names signal tables
+//!    (ADR-2904 decision 11) then resolves its signal lanes as above, with
+//!    the Parquet reads already in the resolve total each lane's request
+//!    budget check reads.
+//! 3. Build the fresh single-tenant `SessionContext` around the owned
+//!    snapshots, registering one table per resolved signal and each of the
+//!    query's Parquet tables (security invariant 2, crate::session).
+//! 4. Plan, then execute, draining the stream under the wall deadline.
+//!
+//! # Snapshot retry contract
+//!
+//! `docs/consistency-model.md` mandates re-resolve-and-retry-once when a
+//! pinned segment vanishes under a concurrent GC or compaction. On this path
+//! that means:
+//!
+//! - A store `NotFound` raised **before the first batch has been emitted**
+//!   re-resolves every signal the statement names at the *same* resolve
+//!   instant and with the *same* per-lane tokens, assigned once at admission and not
+//!   re-derived, rebuilds the whole session (new pool, new
+//!   providers, new context), and
+//!   re-executes the query exactly once. A second `NotFound` fails
+//!   [`SqlError::SnapshotInvalidated`].
+//! - A store `NotFound` raised **after** at least one batch has been emitted
+//!   fails [`SqlError::SnapshotInvalidated`] immediately, with zero retries:
+//!   a streaming plan cannot be re-run after partial emission, and silently
+//!   restarting it would duplicate already-emitted rows.
+//!
+//! "Emitted" means emitted by the plan's stream, which is the earliest point
+//! at which a batch could have been handed to a client; buffering the result
+//! before encoding does not move that line, and treating it as if it did
+//! would make the second rule unreachable.
+//!
+//! # The pinned surface (ticket C1d)
+//!
+//! [`SqlExecutor::resolve_snapshot`] and [`SqlExecutor::plan_pinned`] split
+//! the two halves above apart for a transport whose resolve and execute land
+//! in different RPCs (Flight SQL, crate::flight). They are not a second
+//! implementation: [`SqlExecutor::execute`] runs through `plan_pinned` too, so
+//! there is exactly one place that builds a query's pool, provider, and
+//! session, and exactly one `Catalog::resolve` call site. A transport that
+//! reimplemented either would be free to drift on tenant accounting, on the
+//! per-query session invariant, or on the retry contract; going through these
+//! two methods is what makes that impossible rather than merely unlikely.
+//!
+//! # Deadline
+//!
+//! The wall deadline wraps the whole call, retry included, so a query cannot
+//! double its budget by tripping the retry path. On expiry the stream is
+//! dropped, which frees every `MemoryReservation` and returns the tenant's
+//! reserved bytes (crate::memory); partial state is discarded,
+//! never returned (docs/query-engine.md "Budgets").
+
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::num::NonZeroUsize;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::error::ArrowError;
+use datafusion::catalog::TableProvider;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::common::{Column, DFSchema, DFSchemaRef, ScalarValue, TableReference};
+use datafusion::dataframe::DataFrame;
+use datafusion::datasource::empty::EmptyTable;
+use datafusion::error::DataFusionError;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::SessionState;
+use datafusion::execution::disk_manager::DiskManager;
+use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, UnboundedMemoryPool};
+use datafusion::logical_expr::{
+    Aggregate, Distinct, DistinctOn, Expr, ExprSchemable, FetchType, Filter, LogicalPlan,
+    Projection, SkipType, Sort, SortExpr, WindowFunctionDefinition, lit,
+};
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
+use datafusion::physical_plan::metrics::MetricsSet;
+use datafusion::physical_plan::{ExecutionPlan, execute_stream};
+use datafusion::prelude::SessionContext;
+use futures::{Stream, StreamExt};
+use ravel_catalog::{
+    Catalog, CatalogError, ColumnStatsRequest, SegmentOrigins, Snapshot, SnapshotParts,
+};
+use ravel_logseg::decoded_cache::{DecodedCacheSnapshot, PressureSnapshot};
+use ravel_memory::MemoryBudget;
+use ravel_parquet::ReadLimits;
+use ravel_pqtable::clock::Clock;
+use ravel_promql::{LabelMatcher, MatchOp};
+use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
+use ravel_query::io_shape::{IoShapeCounts, PlanClass, QueryIoShape, count_unfolded_segments};
+use ravel_query::{
+    EngineConfig, LogSegmentFetcher, PhaseAccounting, PhaseAccountingSnapshot, QueryError,
+    RequestBudget, RequestBudgets, SegmentAdmission, SegmentFetcher, admit,
+    request_budget_exceeded, resolved_fold_lag,
+};
+use ravel_types::accounting::{
+    AccessIntent, AccountedOp, CostEstimate, QueryAccounting, QueryAccountingSnapshot,
+};
+use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange};
+
+use crate::access_intent::{
+    CacheCounterMark, ReadShape, StatementCacheStats, StatementReadBytes, classify_access_intent,
+    plan_has_key_equality, plan_is_predicate_free, reads_whole_lane, size_trigger_applies,
+    size_trigger_lane, trigger_read_bytes,
+};
+use crate::alerts_provider::AlertsTableProvider;
+use crate::audit_provider::AuditTableProvider;
+use crate::bounded_topk;
+use crate::bucket_spill_tuning::{
+    BucketRetryFigures, BucketRetryShape, BucketSpillTuning, bucket_retry_derivation, spill_slots,
+    with_bucket_spill_tuning,
+};
+use crate::bucketed_final_aggregate::{BucketSpillFigures, bucket_spill_figures};
+use crate::clock::SystemClock;
+use crate::config::SqlConfig;
+use crate::cost::{estimate_logs_cost, estimate_metrics_cost, estimate_spans_cost};
+use crate::declared::{DeclaredColumn, DeclaredColumnSource, default_declared_source};
+use crate::error::SqlError;
+use crate::ipcrypt_udf::{IpcryptDeployment, SessionPrincipal, SqlCapabilities};
+use crate::logs_provider::LogsTableProvider;
+use crate::logs_pushdown::{extract_logs, prune_is_rewrite_neutral};
+use crate::logs_scan::ScanExecutions;
+use crate::memory::{
+    BudgetShare, CeilingBreach, MemoryRefusal, TenantDelegatingPool, TenantMemoryAccountant,
+    install_aggregate_profile,
+};
+use crate::min_commit_token::MinCommitToken;
+use crate::output::QueryOutput;
+use crate::parquet::{
+    self, MAX_STATEMENT_TABLE_NAMES, ParquetPin, ParquetQueryError, ParquetResolution,
+    ParquetSession, ParquetSources,
+};
+use crate::provider::RavelTableProvider;
+use crate::pushdown::extract;
+use crate::scan_budget::EnforcedBudgets;
+use crate::session::{
+    LOGS_TABLE, REWRITE_ONLY_AGGREGATES, SAMPLES_TABLE, SessionTable, SpillDecision,
+    build_bucket_retry_session, build_session_with_tables,
+};
+use crate::spans_fetcher::SpanSegmentFetcher;
+use crate::spans_provider::SpansTableProvider;
+use crate::spill::{
+    OperatorSpill, SpillBudget, SpillCounts, SpillReservation, SpillScratch,
+    accumulate_spill_counts,
+};
+use crate::statement::{
+    LowerError, LoweredStatement, LoweringSite, Statement, session_table_providers,
+};
+use crate::statement_accounting::StatementAccounting;
+use crate::validate::{
+    ValidationError, referenced_base_tables, shadowing_relation_name, unreadable_table_reference,
+    validate_query,
+};
+
+/// Which of the five v1 tables (and thus which `Signal`) a query targets, or
+/// whether it reads Parquet tables instead (ADR-2040).
+/// A closed enum rather than `Signal` directly: `Signal` carries a `Profiles`
+/// variant the SQL surface has no table for, and the executor must never
+/// resolve or register that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetSignal {
+    /// The `samples` table, resolved against `Signal::Metrics`.
+    Metrics,
+    /// The `logs` table, resolved against `Signal::Logs`.
+    Logs,
+    /// The `spans` table, resolved against `Signal::Spans` (ADR-0045 decision 5).
+    Spans,
+    /// The `alerts` table, resolved against `Signal::Alerts` (ADR-1101
+    /// decision 1).
+    Alerts,
+    /// The `audit` table, resolved against `Signal::Audit` (ADR-1101
+    /// decision 1).
+    Audit,
+    /// Only Parquet tables of the caller's tenant (ADR-2040), resolved from
+    /// their manifests rather than from a signal's catalog.
+    Parquet,
+}
+
+impl TargetSignal {
+    /// The signal whose catalog this target resolves; `None` for Parquet
+    /// tables, which have no catalog.
+    fn signal(self) -> Option<Signal> {
+        match self {
+            TargetSignal::Metrics => Some(Signal::Metrics),
+            TargetSignal::Logs => Some(Signal::Logs),
+            TargetSignal::Spans => Some(Signal::Spans),
+            TargetSignal::Alerts => Some(Signal::Alerts),
+            TargetSignal::Audit => Some(Signal::Audit),
+            TargetSignal::Parquet => None,
+        }
+    }
+}
+
+/// The base tables one statement names, split the way the target is chosen.
+pub(crate) struct StatementTables {
+    /// The signal tables named, each once, in [`SIGNAL_LANE_ORDER`].
+    pub(crate) signals: Vec<TargetSignal>,
+    /// Every other base table name: Parquet tables, or names that are no
+    /// table at all.
+    pub(crate) others: BTreeSet<String>,
+}
+
+/// The order a statement's signal tables are resolved, planned and reported
+/// in (ADR-2904 decision 2).
+pub(crate) const SIGNAL_LANE_ORDER: [TargetSignal; 5] = [
+    TargetSignal::Metrics,
+    TargetSignal::Logs,
+    TargetSignal::Spans,
+    TargetSignal::Alerts,
+    TargetSignal::Audit,
+];
+
+impl StatementTables {
+    /// A statement naming `signal` and nothing else.
+    pub(crate) fn one(signal: Option<TargetSignal>) -> Self {
+        StatementTables {
+            signals: signal.into_iter().collect(),
+            others: BTreeSet::new(),
+        }
+    }
+
+    /// The signal snapshots a catalog resolve of this statement reads: one
+    /// per named signal table, or the `samples` snapshot alone when it names
+    /// none (the pre-ADR-0033 default for a constant query).
+    pub(crate) fn lanes(&self) -> Vec<TargetSignal> {
+        if self.signals.is_empty() {
+            vec![TargetSignal::Metrics]
+        } else {
+            self.signals.clone()
+        }
+    }
+
+    /// The first of [`Self::lanes`]: the statement's target signal when it
+    /// names at most one signal table.
+    pub(crate) fn first_lane(&self) -> TargetSignal {
+        self.signals
+            .first()
+            .copied()
+            .unwrap_or(TargetSignal::Metrics)
+    }
+
+    /// Whether the statement names more than one base table of any kind.
+    pub(crate) fn names_several_tables(&self) -> bool {
+        self.signals.len() + self.others.len() > 1
+    }
+}
+
+/// Whether a statement reading `signal_lanes` signal tables, and a Parquet
+/// table beside them when `beside_parquet`, names more than one table. The
+/// resolve's budget check and the plan both ask this, so a refusal names its
+/// table exactly when the plan treats the statement as several tables.
+fn reads_several_tables(signal_lanes: usize, beside_parquet: bool) -> bool {
+    signal_lanes > 1 || beside_parquet
+}
+
+/// The one-table rule of the entry points that read one snapshot: refuse a
+/// statement naming two or more signal tables, before any catalog request.
+/// ES|QL keeps it as its own rule (ADR-2887), which ADR-2904 leaves unchanged;
+/// the single-snapshot pinned entry points ([`SqlExecutor::resolve_pinned`],
+/// [`SqlExecutor::plan_pinned`] and their siblings) keep it because one
+/// snapshot cannot hold two signals' pins. Flight SQL runs such a statement
+/// through the multi-lane pinned entry points (ADR-2904 decision 10).
+pub(crate) fn refuse_cross_signal(tables: &StatementTables) -> Result<(), SqlError> {
+    if tables.signals.len() > 1 {
+        return Err(SqlError::CrossSignalQuery);
+    }
+    Ok(())
+}
+
+/// The one-table rule of the MCP SQL tools (ADR-1374, ADR-2904 decision 9):
+/// refuse `sql` when it names more than one base table of any kind, reading
+/// the statement text alone, with no store or catalog request.
+///
+/// Two or more signal tables are [`SqlError::CrossSignalQuery`]. Any other
+/// second table (a Parquet table beside a signal table, or two names that are
+/// not signal tables) is [`SqlError::OneTablePerStatement`]. A table named in
+/// a subquery or a CTE body counts; a CTE name does not, and one table read
+/// twice is one table. Text that does not parse, and the shadowed-name and
+/// table-count refusals, are [`SqlExecutor::statement_tables`]'s errors.
+///
+/// This answers only for a read-only query statement and does not replace
+/// `validate_query`: a statement that is not a top-level query, such as
+/// `INSERT` or `EXPLAIN`, names no table here and is admitted.
+pub fn refuse_several_tables(sql: &str) -> Result<(), SqlError> {
+    let tables = SqlExecutor::statement_tables(sql)?;
+    refuse_cross_signal(&tables)?;
+    if tables.names_several_tables() {
+        return Err(SqlError::OneTablePerStatement);
+    }
+    Ok(())
+}
+
+/// [`SqlError::PinnedSignalsMismatch`] naming the pinned lanes and the
+/// statement's signal tables.
+pub(crate) fn pinned_signals_mismatch(
+    pinned: &[TargetSignal],
+    tables: &[TargetSignal],
+) -> SqlError {
+    SqlError::PinnedSignalsMismatch {
+        pinned: lane_names(pinned),
+        tables: lane_names(tables),
+    }
+}
+
+/// `signals`' table names, comma-separated, or `none`.
+fn lane_names(signals: &[TargetSignal]) -> String {
+    if signals.is_empty() {
+        return "none".to_owned();
+    }
+    signals
+        .iter()
+        .map(|signal| crate::statement::signal_table_name(*signal).unwrap_or("parquet"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The `min_commit_token`s each lane's catalog resolve waits for. Assigned
+/// once per statement, before any catalog request, and reused by every
+/// resolve attempt of that statement.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LaneTokens {
+    lanes: Vec<(TargetSignal, Vec<CommitToken>)>,
+}
+
+impl LaneTokens {
+    /// Every token on one lane: the plain tokens of a lowered statement over
+    /// at most one signal table.
+    pub(crate) fn one_lane(lane: TargetSignal, tokens: Vec<CommitToken>) -> Self {
+        let mut out = LaneTokens::default();
+        for token in tokens {
+            out.push(lane, token);
+        }
+        out
+    }
+
+    fn push(&mut self, lane: TargetSignal, token: CommitToken) {
+        match self.lanes.iter_mut().find(|(signal, _)| *signal == lane) {
+            Some((_, tokens)) => tokens.push(token),
+            None => self.lanes.push((lane, vec![token])),
+        }
+    }
+
+    /// The tokens `lane`'s resolve waits for: its own and no other lane's.
+    pub(crate) fn for_lane(&self, lane: TargetSignal) -> &[CommitToken] {
+        self.lanes
+            .iter()
+            .find(|(signal, _)| *signal == lane)
+            .map_or(&[], |(_, tokens)| tokens.as_slice())
+    }
+}
+
+/// The longest qualifier, in bytes, a refusal quotes back.
+const MAX_QUOTED_QUALIFIER_BYTES: usize = 64;
+
+/// The dependent reads a KEY_IDX probe adds to an object's read chain: the
+/// section's prefix, then one bucket (ADR-2707 decision 5).
+const KEY_IDX_PROBE_DEPTH: u32 = 2;
+
+/// The SQL statement token rule (ADR-2904 decision 3), applied from the
+/// statement text and the request alone, before any catalog request:
+///
+/// - a token qualified `<table>:` bounds that table's lane, and the qualifier
+///   must equal, exactly, the lower-case name of a signal table the statement
+///   reads ([`SqlError::CommitTokenQualifierNotRead`] otherwise);
+/// - an unqualified token bounds the statement's one signal table, or the
+///   `samples` lane of a statement naming no table; on a statement naming two
+///   or more it is [`SqlError::CommitTokenNeedsQualifier`];
+/// - a statement naming no signal table but some other table (Parquet, or
+///   unknown) takes no token at all ([`SqlError::CommitTokenOnParquetStatement`]).
+///
+/// [`SqlExecutor::execute_accounted`], [`SqlExecutor::explain_accounted`] and
+/// the pinned (Flight SQL) resolve call this; its result is each lane's share
+/// for every resolve attempt.
+pub(crate) fn admit_http_tokens(
+    tables: &StatementTables,
+    min_tokens: &[MinCommitToken],
+) -> Result<LaneTokens, SqlError> {
+    let mut lanes = LaneTokens::default();
+    if min_tokens.is_empty() {
+        return Ok(lanes);
+    }
+    if tables.signals.is_empty() && !tables.others.is_empty() {
+        return Err(SqlError::CommitTokenOnParquetStatement);
+    }
+    let names: Vec<&'static str> = tables
+        .signals
+        .iter()
+        .filter_map(|signal| crate::statement::signal_table_name(*signal))
+        .collect();
+    for min_token in min_tokens {
+        let lane = match min_token.table.as_deref() {
+            Some(qualifier) => {
+                let named =
+                    tables.signals.iter().copied().find(|signal| {
+                        crate::statement::signal_table_name(*signal) == Some(qualifier)
+                    });
+                match named {
+                    Some(signal) => signal,
+                    None => {
+                        return Err(SqlError::CommitTokenQualifierNotRead {
+                            qualifier: quoted_qualifier(qualifier),
+                            tables: if names.is_empty() {
+                                "none".to_owned()
+                            } else {
+                                names.join(", ")
+                            },
+                        });
+                    }
+                }
+            }
+            None => match tables.signals.as_slice() {
+                [] => TargetSignal::Metrics,
+                [only] => *only,
+                _ => {
+                    return Err(SqlError::CommitTokenNeedsQualifier {
+                        tables: names.join(", "),
+                    });
+                }
+            },
+        };
+        lanes.push(lane, min_token.token.clone());
+    }
+    Ok(lanes)
+}
+
+/// `qualifier` cut to [`MAX_QUOTED_QUALIFIER_BYTES`] on a char boundary, with
+/// `...` marking a cut.
+fn quoted_qualifier(qualifier: &str) -> String {
+    if qualifier.len() <= MAX_QUOTED_QUALIFIER_BYTES {
+        return qualifier.to_owned();
+    }
+    let mut end = MAX_QUOTED_QUALIFIER_BYTES;
+    while !qualifier.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &qualifier[..end])
+}
+
+/// Refuse a statement that reads two or more tables and declares a relation
+/// alias, derived-table alias or CTE name equal to a table name (ADR-2904,
+/// LIKE-scope amendment). The reserved names are the statement's other tables
+/// plus all five signal table names: [`referenced_base_tables`] drops a CTE's
+/// name from the tables it reports, so a CTE named `logs` reads as a statement
+/// that does not name `logs` and is only caught by reserving the name itself.
+/// The LIKE rewrite in a multi-table session trusts a `logs` qualifier to name
+/// the logs relation, which this makes true.
+fn refuse_shadowed_table_name(sql: &str, others: &BTreeSet<String>) -> Result<(), SqlError> {
+    let mut reserved = others.clone();
+    reserved.extend(
+        SIGNAL_LANE_ORDER
+            .into_iter()
+            .filter_map(crate::statement::signal_table_name)
+            .map(str::to_owned),
+    );
+    match shadowing_relation_name(sql, &reserved)? {
+        Some(found) => Err(SqlError::ShadowedTableName {
+            kind: found.kind,
+            name: quoted_qualifier(&found.name),
+            table: quoted_qualifier(&found.table),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a statement that names a table function or a URL-shaped table, with
+/// the planning error it would meet anyway, before anything is read.
+fn refuse_unreadable_table_reference(sql: &str) -> Result<(), SqlError> {
+    match unreadable_table_reference(sql)? {
+        Some(name) => Err(SqlError::Plan(format!(
+            "{name} is not a table this session can read: table functions and URL tables \
+             are not admitted"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The Parquet resolve a plan starts from.
+#[derive(Debug, Clone)]
+pub enum ParquetPlan {
+    /// Not resolved yet: the plan resolves each table's newest manifest
+    /// itself. What [`SqlExecutor::plan_pinned`] does, for a caller that has
+    /// no resolution in hand.
+    Unresolved,
+    /// Resolved by this request's own resolve; `None` when the statement
+    /// names no live Parquet table.
+    Resolved(Option<ParquetResolution>),
+    /// The manifest versions a Flight ticket pinned, redeemed as the `flight`
+    /// module doc, "The two-RPC problem, and the pin", states. Empty when the
+    /// statement named no Parquet table.
+    Pinned(Vec<ParquetPin>),
+}
+
+/// What a two-RPC (Flight SQL) plan takes beyond the snapshot and the
+/// statement.
+#[derive(Debug, Clone)]
+pub struct PinnedPlanInputs {
+    /// The tenant's declared typed attribute columns (ADR-0090).
+    pub declared: Vec<DeclaredColumn>,
+    /// Where the statement's Parquet tables come from.
+    pub parquet: ParquetPlan,
+    /// The request's lowered budgets, which bind the plan's scans as they bind
+    /// a one-shot [`SqlExecutor::execute`]. `None` plans under the executor's
+    /// own configuration.
+    pub budgets: Option<RequestBudgets>,
+}
+
+/// What [`SqlExecutor::resolve_pinned_lanes`] produced: one snapshot to pin
+/// per signal table the statement names, in [`SIGNAL_LANE_ORDER`] (the one
+/// `samples` lane for a statement naming none, one empty Parquet lane for a
+/// Parquet statement), the statement's summed cost estimate, and the Parquet
+/// tables the resolve read.
+#[derive(Debug, Clone)]
+pub struct PinnedLanes {
+    pub lanes: Vec<(TargetSignal, Snapshot)>,
+    pub estimate: CostEstimate,
+    /// The live Parquet tables the statement names, resolved once here so the
+    /// plan that follows reads no manifest again; `None` when it names none.
+    pub parquet: Option<ParquetResolution>,
+}
+
+/// What [`SqlExecutor::resolve_pinned`] produced: the snapshot to pin, the
+/// statement's cost estimate, and the Parquet tables the resolve read.
+#[derive(Debug, Clone)]
+pub struct PinnedResolve {
+    pub snapshot: Snapshot,
+    pub estimate: CostEstimate,
+    /// The live Parquet tables the statement names, resolved once here so the
+    /// plan that follows reads no manifest again; `None` when it names none.
+    pub parquet: Option<ParquetResolution>,
+}
+
+/// What one resolve produced for one statement.
+struct Resolved {
+    /// One entry per named signal table, in [`SIGNAL_LANE_ORDER`], all
+    /// resolved by the same attempt; a statement naming none has the one
+    /// `samples` lane, and a statement naming only Parquet tables one empty
+    /// Parquet lane.
+    lanes: Vec<ResolvedLane>,
+    /// The sum of the lanes' estimates and the Parquet tables' estimate.
+    estimate: CostEstimate,
+    unfolded_segments_resolved: u64,
+    target: TargetSignal,
+    parquet: Option<ParquetResolution>,
+    /// How many signal tables the statement names, before a statement naming
+    /// none is given the default `samples` lane.
+    signal_tables_named: usize,
+}
+
+/// One signal's snapshot within a [`Resolved`] statement.
+struct ResolvedLane {
+    signal: TargetSignal,
+    snapshot: Snapshot,
+    admission: SegmentAdmission,
+    /// The parts the snapshot's sealed segments came from, for the spans
+    /// and logs lanes' tier-2 key-index routers; `None` on every other lane.
+    parts: Option<SnapshotParts>,
+}
+
+impl Resolved {
+    /// Segments resolved across every lane.
+    fn segments_resolved(&self) -> usize {
+        self.lanes
+            .iter()
+            .map(|lane| lane.snapshot.segments.len())
+            .sum()
+    }
+
+    /// The lanes' admission counts, summed.
+    fn admission(&self) -> SegmentAdmission {
+        SegmentAdmission {
+            sealed_count: self
+                .lanes
+                .iter()
+                .map(|lane| lane.admission.sealed_count)
+                .sum(),
+            exempt_count: self
+                .lanes
+                .iter()
+                .map(|lane| lane.admission.exempt_count)
+                .sum(),
+        }
+    }
+
+    /// Each signal lane's counts, in lane order; a Parquet lane has none.
+    fn lane_counts(&self) -> Vec<LaneCounts> {
+        self.lanes
+            .iter()
+            .filter_map(|lane| {
+                crate::statement::signal_table_name(lane.signal).map(|table| LaneCounts {
+                    signal: lane.signal,
+                    table,
+                    segments: lane.snapshot.segments.len(),
+                    segments_pruned: lane.snapshot.segments_pruned,
+                })
+            })
+            .collect()
+    }
+
+    /// The spans and logs lanes' parts, taken out so the plan can route a
+    /// `trace_id` lookup or a declared-key equality through them.
+    fn take_lane_parts(&mut self) -> LaneParts {
+        let mut take = |signal: TargetSignal| {
+            self.lanes
+                .iter_mut()
+                .find(|lane| lane.signal == signal)
+                .and_then(|lane| lane.parts.take())
+        };
+        LaneParts {
+            spans: take(TargetSignal::Spans),
+            logs: take(TargetSignal::Logs),
+        }
+    }
+
+    /// The `(signal, snapshot)` pairs a plan is built over.
+    fn into_snapshots(self) -> (Vec<(TargetSignal, Snapshot)>, Option<ParquetResolution>) {
+        (
+            self.lanes
+                .into_iter()
+                .map(|lane| (lane.signal, lane.snapshot))
+                .collect(),
+            self.parquet,
+        )
+    }
+}
+
+/// The coordinator-side distributed samples scan for one query: the minted
+/// worker slices and the client that fetches each (ADR-0071).
+/// Cloneable so the pinned retry loop can re-plan without re-minting (the slice
+/// `Vec` and the `Arc` client both clone cheaply).
+#[cfg(feature = "flight-sql")]
+pub(crate) type DistributedScan = (
+    Vec<crate::distributed::WorkerSlice>,
+    Arc<dyn crate::distributed::WorkerSliceClient>,
+);
+
+/// Optional per-query plan inputs threaded into [`SqlExecutor::plan_pinned_with`]
+/// on top of the snapshot and SQL. Kept as a struct (rather than more
+/// positional arguments) so the field set can grow, and so it compiles to a
+/// zero-field value when `flight-sql` is off -- the local-only build carries no
+/// distributed machinery.
+struct PlanExtras {
+    /// The tenant's declared typed attribute columns (ADR-0090), resolved once
+    /// per plan at the entry point and threaded down here. Empty for a
+    /// zero-declaration query, and irrelevant to a metrics- or spans-target
+    /// query (only the `logs` provider consumes it).
+    declared: Vec<DeclaredColumn>,
+    /// The coordinator-side distributed samples scan to install for this query,
+    /// or `None` to run the samples scan locally.
+    #[cfg(feature = "flight-sql")]
+    distributed: Option<DistributedScan>,
+    /// Apply this window as a row filter above every scan
+    /// ([`SqlRequest::row_window`]). `None` leaves the plan untouched, which is
+    /// what every pre-ADR-1374 caller gets.
+    row_window: Option<TimeRange>,
+    /// This request's lowered budgets ([`SqlRequest::budgets`]). `None` plans
+    /// under the executor's own configuration unchanged.
+    budgets: Option<RequestBudgets>,
+    /// The window `Catalog::load_column_stats` bounds its per-part reads
+    /// against (ADR-1413): the request's own window where one exists
+    /// (`explain_inner`, `attempt`), or [`lanes_covering_window`]'s
+    /// derived cover for the two entry points planning an already-resolved
+    /// snapshot with no request window attached.
+    column_stats_window: TimeRange,
+    /// The injected clock reading paired with `column_stats_window`, same
+    /// provenance rule: the resolve instant, so the stats load covers the
+    /// hours the snapshot's listing covered.
+    column_stats_now_ns: i64,
+    /// The instant the tenant's KEY_IDX declaration is looked up at: the
+    /// caller's clock, which the declaration's cache judges freshness against.
+    /// The pinned plan entry points have no separate caller clock and pass
+    /// `column_stats_now_ns`.
+    key_index_now_ns: i64,
+    /// The Parquet tables the statement reads, when its resolve already
+    /// resolved them.
+    parquet: ParquetPlan,
+    /// What the authenticated principal may do; decides, with the executor's
+    /// [`IpcryptDeployment`], whether the session registers the ipcrypt UDFs.
+    capabilities: SqlCapabilities,
+    /// The spans and logs lanes' parts from the same resolve as their
+    /// snapshots, which turn on the tier-2 router for a `trace_id` lookup
+    /// (ADR-3692 decision 3) and a declared-key equality on logs (decision
+    /// 4). Empty on the pinned entry points, whose snapshots arrive without
+    /// them; their lookups probe each object's KEY_IDX alone.
+    lane_parts: LaneParts,
+    /// Which spill decision this plan takes (issue #3899).
+    spill: SpillAttempt,
+    /// The spill-budget share [`SqlExecutor::run`] reserved before a
+    /// [`SpillAttempt::Retry`]; `None` for every other attempt. A retry
+    /// planned without one is an internal error.
+    spill_share: Option<SpillReservation>,
+    /// The refused first attempt's figures a [`SpillAttempt::Retry`] derives
+    /// its bucket tuning from; `None` on every other plan, and on a retry
+    /// with no first attempt behind it.
+    retry_figures: Option<RetryFigures>,
+}
+
+/// What a refused first attempt measured that the bucket retry's tuning
+/// reads (ADR-3565 amendment 2, item 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryFigures {
+    /// `A`: the pool's peak asked bytes at the refusal.
+    asked_bytes: u64,
+    /// `n`: the logs scans' consumed input rows at the refusal; `None` when
+    /// the plan had no logs scan or the attempt failed before it started.
+    consumed_rows: Option<u64>,
+    /// The limit that refused the first attempt.
+    first: Option<MemoryRefusal>,
+    /// The refusing budget's figures, for [`retry_effective_limit`].
+    share: Option<BudgetShare>,
+}
+
+/// The plan a spill retry runs and why (ADR-0954, parallel bucket spill
+/// item 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryPlan {
+    /// The hash exchange and a bucketed final aggregate at the derived
+    /// tuning.
+    Bucket(BucketSpillTuning),
+    /// The repartition-free sort-merge retry, with the condition that kept
+    /// it.
+    SortMerge(&'static str),
+}
+
+/// Which spill decision a plan takes (issue #3899).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpillAttempt {
+    /// Decided at plan time from [`SqlConfig::spill`] (ADR-0954), in the
+    /// plain query pool: the pinned entry points and Flight SQL, which have
+    /// no spill retry of their own.
+    PlanTime,
+    /// An executed statement's first attempt: planned as if
+    /// [`SqlConfig::spill`] were `None`, so it runs with
+    /// [`SpillDecision::Disabled`] in the plain query pool.
+    First,
+    /// The one retry after a first attempt's memory refusal
+    /// ([`spill_retry_decision`]): the ADR-0954 plan, one share of the spill
+    /// ceiling ([`SpillBudget::reserve_share`], reserved before the retry
+    /// starts and carried in [`PlanExtras::spill_share`]), and a spill-mode
+    /// pool ([`SqlConfig::query_pool_spill_mode`]) while spill is enabled.
+    Retry,
+}
+
+/// The parts a resolve returned for the lanes the tier-2 router serves.
+#[derive(Default)]
+struct LaneParts {
+    spans: Option<SnapshotParts>,
+    logs: Option<SnapshotParts>,
+}
+
+/// One SQL request, fully resolved from its transport.
+#[derive(Debug, Clone)]
+pub struct SqlRequest {
+    /// The raw statement text. Validated before use.
+    pub sql: String,
+    /// Event-time window handed to `Catalog::resolve`. The endpoint derives
+    /// it from request parameters; the provider re-applies every predicate
+    /// above the scan, so this only bounds which segments are listed.
+    pub window: TimeRange,
+    /// Read-your-write tokens (docs/catalog-and-mvcc.md step 4), each
+    /// optionally qualified by the table it bounds. Every entry point taking
+    /// this request assigns them to lanes with [`admit_http_tokens`].
+    pub min_tokens: Vec<MinCommitToken>,
+    /// The caller's injected clock reading. The declared-column and key-index
+    /// lookups judge their caches' freshness against it, and the tenant's
+    /// idle-eviction last-touch is stamped with it.
+    ///
+    /// It is also the resolve instant, which bounds the listing window, on
+    /// every entry point but [`SqlExecutor::execute_accounted_at`], which
+    /// takes the resolve instant separately so a later page can resolve at
+    /// page one's instant on its own clock. The same resolve instant is
+    /// reused on the retry so both resolves see the same window.
+    pub now_ns: i64,
+    /// Wall deadline for the whole call, retry included.
+    pub deadline: Duration,
+    /// Apply `window` as a row filter above the scan, not only as the
+    /// segment-listing bound (ADR-1374 decision 3, prerequisite 2). Off by
+    /// default, which is the shipped behavior: `window` widens to whole
+    /// segments, so a segment overlapping the window contributes every row it
+    /// holds unless the statement itself says otherwise.
+    ///
+    /// An agent writing SQL against a window it did not choose cannot know to
+    /// add that predicate, so the caller that chose the window opts in here
+    /// instead. See [`window_ts_column`] for the column each table filters on
+    /// and [`SqlStats::window_predicate`] for what was applied.
+    ///
+    /// The row filter is half-open, `[start, end)` (ADR-1374 decision 4), while
+    /// the same `window` selects segments on the closed `[start, end]` bound
+    /// `TimeRange` carries. The two differ on purpose: a listing bound may only
+    /// widen, and a row bound must be exact. A request whose `start` equals its
+    /// `end` therefore returns zero rows under `row_window`, by definition.
+    pub row_window: bool,
+    /// Stop the stream once this many rows have been emitted, plus one
+    /// (ADR-1374 decision 3, prerequisite 4). The extra row is deliberate: it
+    /// is what lets a caller distinguish "this is the whole result" from "this
+    /// result was cut", reported as [`SqlStats::row_cap_hit`]. `None` (the
+    /// default) drains the plan to completion.
+    pub max_rows: Option<usize>,
+    /// Per-request budgets for this statement, which can only LOWER the
+    /// server's configured ceilings (ADR-1374 decision 3, prerequisite 1).
+    /// `None` runs under the server config unchanged.
+    ///
+    /// Every signal table's scan (`samples`, `logs`, `spans`, `alerts` and
+    /// `audit`) checks the effective `max_bytes_scanned` and
+    /// `max_store_requests` against the statement total, summed over every
+    /// table the statement reads, each time one of its segment reads
+    /// completes, and refuses with the same typed errors as the server
+    /// ceiling once the total passes either. [`SignalStats::budgets`] reports
+    /// the limits each table's scan checked.
+    pub budgets: Option<RequestBudgets>,
+}
+
+/// One request for a statement that is not SQL text
+/// ([`SqlExecutor::execute_statement_accounted`]): every [`SqlRequest`]
+/// field but the text, with the same meaning.
+#[derive(Debug, Clone)]
+pub(crate) struct StatementRequest {
+    pub window: TimeRange,
+    pub min_tokens: Vec<CommitToken>,
+    pub now_ns: i64,
+    pub deadline: Duration,
+    pub row_window: bool,
+    pub max_rows: Option<usize>,
+    pub budgets: Option<RequestBudgets>,
+}
+
+/// The two instants one SQL call reads. Equal on every entry point but
+/// [`SqlExecutor::execute_accounted_at`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Clocks {
+    /// The catalog resolve's instant: the listing window, the column-stats
+    /// window and the fold-lag figure, everything that must describe the
+    /// snapshot the rows come from.
+    resolve_at_ns: i64,
+    /// The caller's clock ([`SqlRequest::now_ns`]): the declared-column and
+    /// key-index lookups and the idle-eviction last-touch.
+    caller_now_ns: i64,
+}
+
+impl Clocks {
+    /// One instant for both: `req.now_ns`.
+    fn of(req: &SqlRequest) -> Clocks {
+        Clocks {
+            resolve_at_ns: req.now_ns,
+            caller_now_ns: req.now_ns,
+        }
+    }
+}
+
+/// One statement's decoded-column cache figures: the counters its scans moved
+/// and the cache's resident bytes when the statement finished.
+///
+/// `pressure` is the cache's process-wide pressure evictions between the
+/// statement's start and its end: the budget's evictor does not know which
+/// statement's reservation asked, so a concurrent statement's evictions land
+/// here too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DecodedCacheStats {
+    pub counters: DecodedCacheSnapshot,
+    pub resident_bytes: u64,
+    pub pressure: PressureSnapshot,
+}
+
+/// What the executor actually did, for tests and operator metrics.
+///
+/// Not `Copy`: [`Self::window_predicate`] carries the applied predicate text,
+/// and reporting the predicate that ran (rather than a flag saying one did) is
+/// what lets a caller check the executor filtered on the column it meant.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SqlStats {
+    /// `Catalog::resolve` calls. 1 normally, one more for each retry that
+    /// fired: the snapshot retry and the spill retry
+    /// ([`Self::spill_retries`]), each at most once, so at most 3.
+    pub resolves: u32,
+    /// Plan-and-execute attempts. Always equal to `resolves` on this path.
+    pub attempts: u32,
+    /// Batches the plan emitted across all attempts.
+    pub batches_emitted: usize,
+    /// Segments in the snapshot the successful attempt used.
+    pub segments: usize,
+    /// Blocks the successful attempt's `LogsScanExec` saw, read straight off
+    /// its DataFusion counters after the stream drained (reused rather
+    /// than recounted). Zero for a metrics query, and for a logs query whose
+    /// plan carries no scan node. Summed over every logs scan in the plan
+    /// ([`ScanTiming::scans`]), so a block two scans both read counts twice.
+    /// `blocks_scanned` over `blocks_total` is the prune selectivity ADR-0049
+    /// measures.
+    pub blocks_total: u64,
+    pub blocks_scanned: u64,
+    pub blocks_pruned_by_postings: u64,
+    /// Segments the successful attempt's logs scan skipped before any fetch
+    /// because their declared-column statistics excluded a pushed-down
+    /// predicate (ADR-2121 D1), read off the scan's
+    /// `segments_pruned_by_stats` counter, summed over every logs scan in the
+    /// plan ([`ScanTiming::scans`]). With one scan it is counted within
+    /// [`Self::segments`], which is the resolved snapshot; each further scan
+    /// prunes the same snapshot again, so the sum can exceed it. Zero for a
+    /// metrics query and for a logs plan with no scan node.
+    pub segments_pruned_by_stats: u64,
+    /// Segments an exact-key lookup read no block of because a key index
+    /// proves the key absent: on spans, a `trace_id` equality's segments the
+    /// tier-2 router dropped before the scan because their part's key-index
+    /// leaves prove the trace absent (ADR-3692 decision 3), plus the segments
+    /// the scan opened and whose own KEY_IDX section proves it absent
+    /// (ADR-2707 decision 5); on logs, an equality on an indexed declared
+    /// column or on `trace_id`, by the object's KEY_IDX. Read off the spans
+    /// and logs scans' `segments_pruned_by_key_index` counters. Counted
+    /// within [`Self::segments`]; a segment is counted by one tier only,
+    /// since a tier-2 prune is never opened. Zero for any other query.
+    pub segments_pruned_by_key_index: u64,
+    /// Blocks of the segments such a lookup did read that the plan's other
+    /// pruning kept and KEY_IDX named no entry for, read off the spans and
+    /// logs scans' `blocks_pruned_by_key_index` counters. On spans it is 0
+    /// when the skip index already narrows the object to the trace's blocks,
+    /// which it does on every object written in trace order, as
+    /// `RspanWriter::finish` writes every object today. An absent key's
+    /// segment is counted in [`Self::segments_pruned_by_key_index`], not here.
+    pub blocks_pruned_by_key_index: u64,
+    /// The tier-2 router's figures and the scans' SKIP_IDX drops
+    /// (`stats.keyIndex`), summed over every spans and logs scan in the plan.
+    /// `Some` exactly when a spans scan carried a pushed `trace_id` or a logs
+    /// scan a declared-key equality, zeros included; `None` for every other
+    /// statement.
+    pub key_index: Option<KeyIndexStats>,
+    /// Blocks of opened segments, and owned segments never opened, that the
+    /// successful attempt's logs scans skipped because their minimum `ts` was
+    /// above an `ORDER BY ts ... LIMIT k` TopK's threshold (ADR-2677 decision
+    /// 6), read off the scans' `blocks_skipped_by_threshold` and
+    /// `segments_skipped_by_threshold` counters and summed over every logs
+    /// scan in the plan. A skipped segment's blocks are not in the block
+    /// figure. On the striped path a segment is counted once per partition
+    /// that owned a share of it. Zero without such a TopK.
+    pub blocks_skipped_by_threshold: u64,
+    pub segments_skipped_by_threshold: u64,
+    /// Integer column value buffers the successful attempt's logs scans built
+    /// decoding blocks (ADR-2773 decision 1), read off the scans'
+    /// `int_values_buffers` counter and summed over every logs scan in the
+    /// plan. Zero for a metrics query.
+    pub int_values_buffers: u64,
+    /// Decoded blocks the successful attempt's logs scans kept whole without
+    /// evaluating the pushed exact predicate, every arm proven by the block's
+    /// skip-index bounds (ADR-2773 decision D2). Read off the scans'
+    /// `blocks_predicate_dropped` counter and summed over every logs scan in
+    /// the plan. Zero for a metrics query.
+    pub blocks_predicate_dropped: u64,
+    /// Rows of the successful attempt's decoded logs blocks that the pushed
+    /// exact predicate was evaluated over: every row of each decoded block not
+    /// counted in [`Self::blocks_predicate_dropped`]. Read off the scans'
+    /// `rows_predicate_evaluated` counter and summed over every logs scan in
+    /// the plan. Zero for a metrics query.
+    pub rows_predicate_evaluated: u64,
+    /// Cells the successful attempt's pushed `Contains` arms (`LIKE
+    /// '%literal%'` on a declared `Str` column) tested for their needle: a
+    /// dictionary entry once per test, a plain-page cell once (ADR-2773,
+    /// contains-arm amendment). Read off the scans' `contains_cells_tested`
+    /// counter and summed over every logs scan in the plan. Zero for a
+    /// metrics query and for a statement with no pushed `Contains` arm.
+    pub contains_cells_tested: u64,
+    /// String cells the successful attempt's logs scans UTF-8 validated, as
+    /// two halves. The reader's half is every string dictionary entry it
+    /// validated, once per validation, and every present cell of a plain-page
+    /// `Str` attribute column it validated whole at decode and found all
+    /// UTF-8. That decode-time validation happens only on the columnar exit
+    /// with a decoded-column cache attached, and only for a missed column the
+    /// cache will admit: an interactive statement's, or another intent's on
+    /// the touch after its ghost record (ravel-logseg's `decode_block`, which
+    /// asks `DecodedColumnCache::would_admit`; ADR-3326 decision 5). A column
+    /// served from the cache is not decoded and adds nothing. The columnar
+    /// build's half is every surviving present cell of every other plain-page
+    /// `Str` column, and of a page that was not all UTF-8, which its declared
+    /// and per-key `attrs['k']` cursors validate one by one. The row path,
+    /// taken when `attrs` is projected or an erasure is pending, validates its
+    /// plain cells per cell too but does not count them.
+    /// Read off the scans' `str_cells_validated` counter and summed over every
+    /// logs scan in the plan. Zero for a metrics query.
+    pub str_cells_validated: u64,
+    /// String dictionary values arrays the successful attempt's logs scans
+    /// built for declared `Str` columns (ADR-2773 decision D3): one per row
+    /// group dictionary per scan opening, one per per-block dictionary page,
+    /// one per plain-page block. With a pushed `Contains` arm the reader
+    /// hands each block a dictionary narrowed to its surviving rows, so a
+    /// dictionary column builds one per block that keeps a row instead. Read
+    /// off the scans' `str_dict_values_built` counter and summed over every
+    /// logs scan in the plan. Zero for a metrics query.
+    pub str_dict_values_built: u64,
+    /// Batches the successful attempt's logs scans built on the row path,
+    /// from a decoded block's rows ([`crate::logs_scan`]'s
+    /// `build_row_batch`): every batch of a query projecting `attrs` or under
+    /// a pending erasure, of a block carrying an `attrs_raw` page, of the rest
+    /// of a segment once `MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS` consecutive
+    /// overflow blocks commit it to the row path, and of a block the columnar
+    /// exit refused for an unexpected pending erasure. Only non-empty batches
+    /// handed downstream count; an all-erased or filtered-empty chunk does
+    /// not. Read off the scans' `rowpath_batches` counter and summed over
+    /// every logs scan in the plan. Zero for a metrics query.
+    pub rowpath_batches: u64,
+    /// Batches the successful attempt's logs scans built on the columnar
+    /// fast path (ADR-0099 decision 2), read off the scans'
+    /// `columnar_batches` counter and summed the same way.
+    pub columnar_batches: u64,
+    /// This query's spill totals (ADR-0954), read off the executed plan's own
+    /// DataFusion counters after the stream stopped, the same way the block
+    /// counters above are. All zero on the default configuration, where the
+    /// disk manager is disabled and no query can spill at all.
+    ///
+    /// The totals live here because they are operator metrics; the
+    /// per-operator attribution that makes a spill traceable to the operator
+    /// that wrote it lives on [`SqlOutcome::spill_by_operator`], which does not
+    /// have to stay `Copy`.
+    pub spill: SpillCounts,
+    /// Spill retries this statement took: 0 or 1 (issue #3899). A statement
+    /// runs first with spill off and is retried with spill on only after a
+    /// memory refusal with nothing emitted, when spill is configured and the
+    /// statement is spill-eligible. Counted apart from the snapshot retry in
+    /// [`Self::resolves`].
+    pub spill_retries: u32,
+    /// What the spill retry saw and did, present when one ran and answered.
+    pub spill_retry: Option<SpillRetryReport>,
+    /// The plan the answering spill retry drained, rendered as `EXPLAIN`
+    /// renders it, beside [`Self::spill_retry`]: the exchange and every
+    /// bucketed exec with the tuning it ran at.
+    pub spill_retry_plan: Option<String>,
+    /// The row filter [`SqlRequest::row_window`] applied above each scan, as
+    /// the display of the [`Expr`] that was actually planted
+    /// ([`window_filter_expr`]) rather than a separately formatted description
+    /// of it. `None` when the request did not ask for one, which is the
+    /// default, and when the plan carried no scan to filter.
+    pub window_predicate: Option<String>,
+    /// Whether [`SqlRequest::max_rows`] cut this result: true when the plan
+    /// produced the cap-plus-one'th row, meaning at least one more row
+    /// existed. False both when no cap was set and when the whole result fit
+    /// inside it.
+    pub row_cap_hit: bool,
+    /// The intent the successful attempt read the segment cache under and how
+    /// far the cache's counters moved over the statement's run. `None` when
+    /// the executor reads uncached, and on the Flight SQL and distributed
+    /// paths, which do not classify.
+    pub cache: Option<StatementCacheStats>,
+    /// The decoded-column cache's movement over the successful attempt
+    /// (ADR-3326). `None` when the executor's log fetcher
+    /// carries no decoded cache, which is the default.
+    pub decoded_cache: Option<DecodedCacheStats>,
+    /// The successful attempt's `LogsScanExec` wall-clock timing, read off the
+    /// same DataFusion metric set as the block counters. All zero for a plan
+    /// with no logs scan.
+    pub scan_timing: ScanTiming,
+    /// The successful attempt's wall time per executor stage (ADR-2677
+    /// decision 4). A retried statement reports only the attempt that
+    /// returned rows; [`Self::attempts`] says whether there was another.
+    pub wall: PhaseWallTiming,
+    /// Histogram-kind series the successful attempt's `RsegScanExec` matched
+    /// and did not return, read off its DataFusion counters the same way the
+    /// block counters above are (issue #1738). Nonzero means this result is
+    /// missing the histogram population of what the statement selected, which
+    /// is what [`SqlOutcome::warnings`] turns into a caller-visible warning.
+    ///
+    /// Counted per (segment, partition), so it is a presence signal rather than
+    /// a distinct-series count. Zero for every non-metrics statement, and for a
+    /// metrics statement over a tenant with no histogram data.
+    pub histogram_series_skipped: u64,
+}
+
+/// Wall time of one attempt's executor stages, in nanoseconds on a monotonic
+/// clock. The stages run one after another, and `drain_ns` covers the scan,
+/// decode and every operator above it. They do not sum to what the client
+/// waited: admission, audit and encoding sit outside them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PhaseWallTiming {
+    /// Around the attempt's snapshot resolve.
+    pub resolve_ns: u64,
+    /// Around logical planning against the pinned snapshot.
+    pub plan_ns: u64,
+    /// Physical plan creation plus starting the stream.
+    pub start_ns: u64,
+    /// From the stream starting to its first `Ok` batch; zero when the stream
+    /// emitted none.
+    pub first_batch_ns: u64,
+    /// From the first batch (or the stream starting, when there was none) to
+    /// the stream's end.
+    pub drain_ns: u64,
+}
+
+fn elapsed_ns(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Wall-clock timing of a query's `LogsScanExec` partitions (see
+/// `crate::logs_scan::BlockMetrics`). Every `*_ns` figure is nanoseconds on
+/// the exec's own monotonic clock. Sums add the partitions' intervals, which
+/// overlap in wall time, so a sum is never a query latency; the `*_max_ns` and
+/// `*_min_ns` figures are the per-partition extremes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScanTiming {
+    /// Segment-open stall, summed over partitions and the per-partition max.
+    pub open_elapsed_ns: u64,
+    pub open_elapsed_max_ns: u64,
+    /// `Opening` polls that returned `Pending`.
+    pub open_pending_polls: u64,
+    /// First opens, all partitions.
+    pub segments_opened: u64,
+    /// `attrs_raw` fallback reopens and their open stall.
+    pub reopen_elapsed_ns: u64,
+    pub reopens: u64,
+    /// Fast-path opens the fetch memory budget refused and the scan retried
+    /// once, and the unconsumed prefetches those refusals dropped (ADR-2414
+    /// decision A2), all partitions.
+    pub prefetch_memory_reopens: u64,
+    pub prefetch_revocations: u64,
+    /// Retried opens refused again while sibling partitions held opens, each
+    /// of which narrowed the statement's fan-out instead of failing it
+    /// (issue #3899), all partitions.
+    pub fan_out_narrowings: u64,
+    /// Synchronous decode plus Arrow build inside `poll_next`.
+    pub decode_build_elapsed_ns: u64,
+    pub decode_build_elapsed_max_ns: u64,
+    /// Buffered-output hand-off (includes the row path's batch build).
+    pub emit_elapsed_ns: u64,
+    /// Longest single partition's wait on the shared plan barrier.
+    pub planning_wait_elapsed_max_ns: u64,
+    /// The barrier's own cost, counted once per scan and summed over scans.
+    pub plan_init_elapsed_ns: u64,
+    /// Offset from exec creation to the earliest batch any partition emitted;
+    /// zero when no partition emitted one.
+    pub first_batch_elapsed_min_ns: u64,
+    /// Offset from exec creation to the last partition's `Done`.
+    pub stream_elapsed_max_ns: u64,
+    /// `poll_next` calls and how many returned `Pending`, all partitions.
+    pub polls: u64,
+    pub polls_pending: u64,
+    /// Partitions that ran to `Done`.
+    pub partitions: u64,
+    /// `LogsScanExec` nodes in the plan, counted by type during the same walk
+    /// that folds their metrics. The offset figures and
+    /// `plan_init_elapsed_ns` have one origin only when this is 1.
+    pub scans: u64,
+    /// Per-segment timeline points, one row per `(partition, segment)`.
+    pub segments: Vec<SegmentTiming>,
+}
+
+/// One segment's timeline on one partition: offsets in nanoseconds from the
+/// exec's creation. A point that never happened (a segment pruned at open, a
+/// stream that failed) reads zero. Rows are comparable with each other only
+/// within one exec; see [`accumulate_scan_timing`] for what a multi-scan plan
+/// does to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SegmentTiming {
+    pub partition: u64,
+    pub segment: u64,
+    pub open_start_ns: u64,
+    pub open_ready_ns: u64,
+    pub done_ns: u64,
+}
+
+/// Fold one node's `LogsScanExec` timing metrics into `timing`.
+///
+/// Called from [`accumulate_block_counts`] with the `MetricsSet` that walk
+/// already holds, so the tree is traversed once and each node's metrics are
+/// cloned once.
+///
+/// Elapsed sums and counts hold for any plan. Everything derived from an
+/// offset holds only while the plan has ONE `LogsScanExec`: each exec times
+/// from its own `created_at`, so under a multi-scan plan (a `UNION`, say) the
+/// `segments` offsets, `first_batch_elapsed_min_ns` and
+/// `stream_elapsed_max_ns` mix origins, and two execs can contribute rows for
+/// the same `(partition, segment)` pair. Making those comparable means giving
+/// the execs one query-level origin rather than merging harder here.
+fn accumulate_scan_timing(metrics: &MetricsSet, timing: &mut ScanTiming) {
+    {
+        let sum = |name: &str| metrics.sum_by_name(name).map_or(0, |v| v.as_usize() as u64);
+        timing.open_elapsed_ns += sum("open_elapsed");
+        timing.open_pending_polls += sum("open_pending_polls");
+        timing.segments_opened += sum("segments_opened");
+        timing.reopen_elapsed_ns += sum("reopen_elapsed");
+        timing.reopens += sum("reopens");
+        timing.prefetch_memory_reopens += sum("prefetch_memory_reopens");
+        timing.prefetch_revocations += sum("prefetch_revocations");
+        timing.fan_out_narrowings += sum("fan_out_narrowings");
+        timing.decode_build_elapsed_ns += sum("decode_build_elapsed");
+        timing.emit_elapsed_ns += sum("emit_elapsed");
+        timing.plan_init_elapsed_ns += sum("plan_init_elapsed");
+        timing.polls += sum("polls");
+        timing.polls_pending += sum("polls_pending");
+        let mut segments: HashMap<(u64, u64), SegmentTiming> = HashMap::new();
+        for metric in metrics.iter() {
+            let value = metric.value().as_usize() as u64;
+            let partition = metric.partition().unwrap_or(0) as u64;
+            match metric.value().name() {
+                "open_elapsed" => {
+                    timing.open_elapsed_max_ns = timing.open_elapsed_max_ns.max(value);
+                }
+                "decode_build_elapsed" => {
+                    timing.decode_build_elapsed_max_ns =
+                        timing.decode_build_elapsed_max_ns.max(value);
+                }
+                "planning_wait_elapsed" => {
+                    timing.planning_wait_elapsed_max_ns =
+                        timing.planning_wait_elapsed_max_ns.max(value);
+                }
+                "first_batch_elapsed" if value > 0 => {
+                    timing.first_batch_elapsed_min_ns = if timing.first_batch_elapsed_min_ns == 0 {
+                        value
+                    } else {
+                        timing.first_batch_elapsed_min_ns.min(value)
+                    };
+                }
+                "stream_elapsed" if value > 0 => {
+                    timing.stream_elapsed_max_ns = timing.stream_elapsed_max_ns.max(value);
+                    timing.partitions += 1;
+                }
+                name @ ("seg_open_start_offset" | "seg_open_ready_offset" | "seg_done_offset") => {
+                    let Some(segment) = metric
+                        .labels()
+                        .iter()
+                        .find(|l| l.name() == "segment")
+                        .and_then(|l| l.value().parse::<u64>().ok())
+                    else {
+                        continue;
+                    };
+                    let row = segments
+                        .entry((partition, segment))
+                        .or_insert(SegmentTiming {
+                            partition,
+                            segment,
+                            ..SegmentTiming::default()
+                        });
+                    match name {
+                        "seg_open_start_offset" => row.open_start_ns = value,
+                        "seg_open_ready_offset" => row.open_ready_ns = value,
+                        _ => row.done_ns = value,
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut rows: Vec<SegmentTiming> = segments.into_values().collect();
+        rows.sort_by_key(|r| (r.open_start_ns, r.partition, r.segment));
+        timing.segments.extend(rows);
+    }
+}
+
+/// What a spans `trace_id` lookup's or a logs declared-key lookup's key
+/// indexes did (ADR-3692 decisions 4 and 7), rendered as `stats.keyIndex`
+/// and as the matching entry's `keyIndex` in `stats.signals`. All but
+/// `skip_idx_dropped` are the tier-2 router's
+/// (`ravel_query::key_index_route::RouteFigures`); a part counts in exactly
+/// one of `parts_covered`, `parts_uncovered`, `parts_over_tier_one`,
+/// `parts_beyond_ceiling`, `leaves_rejected`, `reservations_refused` and
+/// `skipped_by_budget`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeyIndexStats {
+    /// Parts whose leaves answered the key.
+    pub parts_covered: u64,
+    /// Parts with no leaf for the signal and field; their segments go to
+    /// tier 1.
+    pub parts_uncovered: u64,
+    /// Parts whose worst-case leaf GETs exceed the tier-1 probe's cost for
+    /// their segments in the routed snapshot, 2 GETs a segment; their
+    /// segments go to tier 1 with no leaf GET.
+    pub parts_over_tier_one: u64,
+    /// Parts past the leaf GET or part ceiling; their segments go to tier 1.
+    pub parts_beyond_ceiling: u64,
+    /// Parts whose leaf, or whose leaf refs, did not answer.
+    pub leaves_rejected: u64,
+    /// Parts whose frame decode reservation the statement's pool refused.
+    pub reservations_refused: u64,
+    /// Leaf GETs the router issued, charged to the `keyIndex` phase.
+    pub leaf_get_requests: u64,
+    /// Wire bytes of those GETs.
+    pub leaf_wire_bytes: u64,
+    /// Keys in the probed set: 1 for a `trace_id` or declared-key equality.
+    pub keys_probed: u64,
+    /// Parts whose bridged bucket read exceeded its byte budget.
+    pub skipped_by_budget: u64,
+    /// Objects whose SKIP_IDX dropped every block KEY_IDX named for the
+    /// trace, after KEY_IDX had said it was present: tier 1's false positives
+    /// that SKIP_IDX's time or status ranges caught.
+    pub skip_idx_dropped: u64,
+}
+
+impl KeyIndexStats {
+    fn add(&mut self, other: &KeyIndexStats) {
+        self.parts_covered += other.parts_covered;
+        self.parts_uncovered += other.parts_uncovered;
+        self.parts_over_tier_one += other.parts_over_tier_one;
+        self.parts_beyond_ceiling += other.parts_beyond_ceiling;
+        self.leaves_rejected += other.leaves_rejected;
+        self.reservations_refused += other.reservations_refused;
+        self.leaf_get_requests += other.leaf_get_requests;
+        self.leaf_wire_bytes += other.leaf_wire_bytes;
+        self.keys_probed += other.keys_probed;
+        self.skipped_by_budget += other.skipped_by_budget;
+        self.skip_idx_dropped += other.skip_idx_dropped;
+    }
+
+    /// The figures one node's metric set publishes, `None` when it publishes
+    /// none of them: only a spans scan carrying a trace key and a logs scan
+    /// carrying a declared-key equality register them.
+    fn from_metrics(metrics: &datafusion::physical_plan::metrics::MetricsSet) -> Option<Self> {
+        use crate::spans_scan::METRIC_KEY_INDEX_FIGURES as NAMES;
+        let present = NAMES.iter().any(|name| metrics.sum_by_name(name).is_some());
+        if !present {
+            return None;
+        }
+        let v: [u64; 11] = std::array::from_fn(|i| {
+            metrics
+                .sum_by_name(NAMES[i])
+                .map_or(0, |v| v.as_usize() as u64)
+        });
+        Some(KeyIndexStats {
+            parts_covered: v[0],
+            parts_uncovered: v[1],
+            parts_beyond_ceiling: v[2],
+            leaves_rejected: v[3],
+            reservations_refused: v[4],
+            leaf_get_requests: v[5],
+            leaf_wire_bytes: v[6],
+            keys_probed: v[7],
+            skipped_by_budget: v[8],
+            parts_over_tier_one: v[9],
+            skip_idx_dropped: v[10],
+        })
+    }
+}
+
+/// The `LogsScanExec` block counters, summed over a plan tree, the scan's
+/// wall-clock timing read off the same metric set, and the metrics scan's
+/// skipped-histogram count.
+#[derive(Clone, Default)]
+struct BlockCounts {
+    total: u64,
+    scanned: u64,
+    pruned_by_postings: u64,
+    segments_pruned_by_stats: u64,
+    segments_pruned_by_key_index: u64,
+    blocks_pruned_by_key_index: u64,
+    blocks_skipped_by_threshold: u64,
+    segments_skipped_by_threshold: u64,
+    int_values_buffers: u64,
+    blocks_predicate_dropped: u64,
+    rows_predicate_evaluated: u64,
+    contains_cells_tested: u64,
+    str_cells_validated: u64,
+    str_dict_values_built: u64,
+    rowpath_batches: u64,
+    columnar_batches: u64,
+    timing: ScanTiming,
+    /// Summed from the counter `RsegScanExec` publishes (crate::scan). Lives
+    /// here rather than in a second walk because one traversal already reads
+    /// every node's metric set, and that read is the expensive part.
+    histogram_series_skipped: u64,
+    /// Whether a `LogsScanExec` in the plan carries KEY_IDX equalities, so
+    /// the statement's I/O shape reports the keyed dependency depth.
+    keyed_logs_scan: bool,
+    /// The key-index figures of every scan that registered them: a spans
+    /// scan carrying a trace key, a logs scan carrying a declared-key
+    /// equality. `Some` once one did.
+    key_index: Option<KeyIndexStats>,
+    /// The spans scans' share of [`Self::key_index`].
+    spans_key_index: Option<KeyIndexStats>,
+    /// The logs scans' share of [`Self::key_index`].
+    logs_key_index: Option<KeyIndexStats>,
+}
+
+/// Sum the `blocks_total` / `blocks_scanned` / `blocks_pruned_by_postings` /
+/// `segments_pruned_by_stats` / `blocks_skipped_by_threshold` /
+/// `segments_skipped_by_threshold` / `int_values_buffers` /
+/// `blocks_predicate_dropped` / `rows_predicate_evaluated` /
+/// `contains_cells_tested` / `str_cells_validated` /
+/// `str_dict_values_built` / `rowpath_batches` / `columnar_batches`
+/// DataFusion counters over `plan` and its descendants, plus the metrics
+/// scan's `histogram_series_skipped`. Only `LogsScanExec` publishes the first
+/// fourteen names (crate::logs_scan) and only `RsegScanExec` the last
+/// (crate::scan), so each sum is that scan's total however the optimizer
+/// nested it, and a plan carrying neither scan contributes nothing. The
+/// `segments_pruned_by_key_index` and `blocks_pruned_by_key_index` sums come
+/// from both `SpansScanExec` (crate::spans_scan) and `LogsScanExec` the same
+/// way. Reads the counters the scans already
+/// maintain rather than counting a second time.
+fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCounts) {
+    // One walk, one `metrics()` call per node: that call clones the node's
+    // whole `MetricsSet` out of its mutex, and with the per-segment timeline on
+    // the set holds three labelled metrics per segment per partition. Folding
+    // the timing here rather than in a second traversal halves both.
+    let logs_scan = plan.downcast_ref::<crate::logs_scan::LogsScanExec>();
+    if let Some(scan) = logs_scan {
+        counts.timing.scans += 1;
+        counts.keyed_logs_scan |= scan.has_key_equals();
+    }
+    if let Some(metrics) = plan.metrics() {
+        let sum = |name: &str| metrics.sum_by_name(name).map_or(0, |v| v.as_usize() as u64);
+        counts.total += sum("blocks_total");
+        counts.scanned += sum("blocks_scanned");
+        counts.pruned_by_postings += sum("blocks_pruned_by_postings");
+        counts.segments_pruned_by_stats += sum("segments_pruned_by_stats");
+        counts.segments_pruned_by_key_index += sum("segments_pruned_by_key_index");
+        counts.blocks_pruned_by_key_index += sum("blocks_pruned_by_key_index");
+        counts.blocks_skipped_by_threshold += sum("blocks_skipped_by_threshold");
+        counts.segments_skipped_by_threshold += sum("segments_skipped_by_threshold");
+        counts.int_values_buffers += sum("int_values_buffers");
+        counts.blocks_predicate_dropped += sum("blocks_predicate_dropped");
+        counts.rows_predicate_evaluated += sum("rows_predicate_evaluated");
+        counts.contains_cells_tested += sum("contains_cells_tested");
+        counts.str_cells_validated += sum("str_cells_validated");
+        counts.str_dict_values_built += sum("str_dict_values_built");
+        counts.rowpath_batches += sum("rowpath_batches");
+        counts.columnar_batches += sum("columnar_batches");
+        counts.histogram_series_skipped += sum(crate::scan::HISTOGRAM_SERIES_SKIPPED_METRIC);
+        if let Some(figures) = KeyIndexStats::from_metrics(&metrics) {
+            counts.key_index.get_or_insert_default().add(&figures);
+            let lane = if logs_scan.is_some() {
+                &mut counts.logs_key_index
+            } else {
+                &mut counts.spans_key_index
+            };
+            lane.get_or_insert_default().add(&figures);
+        }
+        accumulate_scan_timing(&metrics, &mut counts.timing);
+    }
+    for child in plan.children() {
+        accumulate_block_counts(child, counts);
+    }
+}
+
+/// The event-time column [`SqlRequest::row_window`] filters each table on.
+///
+/// One column per table, not a guess: `samples` and `logs` both carry `ts`,
+/// a span's event time is its `start_ts` (`end_ts` is when it finished), and
+/// the two RLOG-backed tables carry `ts_ns`. All five are
+/// `Timestamp(Nanosecond, None)`, so one literal type serves them all.
+fn window_ts_column(target: TargetSignal) -> Option<&'static str> {
+    match target {
+        TargetSignal::Metrics | TargetSignal::Logs => Some("ts"),
+        TargetSignal::Spans => Some("start_ts"),
+        TargetSignal::Alerts | TargetSignal::Audit => Some("ts_ns"),
+        TargetSignal::Parquet => None,
+    }
+}
+
+/// The row-window predicate for one scan: `ts_col >= start AND ts_col < end`,
+/// with the column qualified by the scan's own `relation` (an unqualified
+/// column would be ambiguous the moment a plan carries two scans).
+///
+/// Half-open on the right, per ADR-1374 decision 4, and deliberately NOT the
+/// bound the same window drives on segment listing: `TimeRange` is closed
+/// (`[start, end]`) where it selects segments, because that bound may only
+/// widen. A request with `start == end` therefore lists the segments covering
+/// that instant and, under `row_window`, returns zero rows.
+///
+/// This is the one place the predicate is built, and
+/// [`SqlStats::window_predicate`] reports this expression's own display, so the
+/// reported text cannot drift from the filter that ran.
+fn window_filter_expr(relation: &TableReference, ts_col: &str, window: TimeRange) -> Expr {
+    let ts = Expr::Column(Column::new(Some(relation.clone()), ts_col));
+    ts.clone()
+        .gt_eq(ts_literal(window.start_ns))
+        .and(ts.lt(ts_literal(window.end_ns)))
+}
+
+/// A nanosecond event-time literal, in the column's own Arrow type so the
+/// comparison needs no cast.
+fn ts_literal(ns: i64) -> Expr {
+    lit(ScalarValue::TimestampNanosecond(Some(ns), None))
+}
+
+/// A `(range, now_ns)` pair covering every segment already in `lanes`'
+/// snapshots, for [`Executor::plan_pinned`], [`Executor::plan_pinned_lanes`]
+/// and their distributed forms: each takes already-resolved snapshots with no
+/// request window attached, so
+/// `Catalog::load_column_stats` (which needs a window to bound which parts it
+/// loads) is given the widest window that still reproduces the snapshot's own
+/// resolve rather than a request window these entry points were never handed.
+///
+/// Built from each segment's `ingest_hour_bucket` (unix hours, pinned at flush
+/// open), never from `min_event_ts_ns`/`max_event_ts_ns`. `Catalog::
+/// window_hour_bounds` divides this pair by `NS_PER_HOUR` and
+/// `crate::snapshot_resolve::parts_intersecting` compares the result against
+/// `SnapshotPartRef`'s `min_hour`/`watermark_hour`, both ingest-hour buckets --
+/// so the pair this function returns has to already be in ingest-hour units.
+/// Event time and ingest time are different clocks (a tenant backfilling
+/// today data whose events happened years ago is the ordinary case, not an
+/// edge one), so a pair built from event timestamps can land on ingest hours
+/// no part in `snapshot` covers, and `load_column_stats` then silently
+/// returns `Ok(None)` for a snapshot that plainly has segments. Deriving from
+/// `ingest_hour_bucket` instead brackets the resolved segments' own ingest
+/// hours exactly; `window_hour_bounds` still widens the start down by
+/// `max_ingest_lag_ns` and the end up by `clock_skew_allowance_ns`, so every
+/// part holding a resolved segment intersects. An empty snapshot returns a
+/// zero window. That is not a short circuit: `window_hour_bounds(0, 0)` yields
+/// `Some((0, 0))`, so a legacy single-part HEAD whose `min_hour` is 0 still
+/// intersects and the loader still pays its HEAD read plus one whole-object
+/// GET. It is harmless, because an empty snapshot has no segment to join the
+/// loaded statistics against.
+fn lanes_covering_window(lanes: &[(TargetSignal, Snapshot)]) -> (TimeRange, i64) {
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+    let hours = || {
+        lanes
+            .iter()
+            .flat_map(|(_, snapshot)| snapshot.segments.iter())
+            .map(|seg| seg.ingest_hour_bucket)
+    };
+    let min_hour = hours().min().unwrap_or(0);
+    let max_hour = hours().max().unwrap_or(0);
+    // Saturating, not plain multiplication: `ingest_hour_bucket` is a u32 read
+    // from a catalog object, and anything at or above hour 2_562_048 overflows
+    // i64 nanoseconds. Under dev and ci, where overflow checks are on, that
+    // panics inside `plan_pinned`; under release it wraps, and a wrapped
+    // negative `now_ns` makes `window_hour_bounds` return None, which loses
+    // every column statistic silently. Saturating clamps to hour 2_562_047,
+    // which is the ceiling of the (TimeRange, now_ns) contract this pair feeds
+    // rather than a limit of this function: a part above it stays uncovered and
+    // scans, and a snapshot mixing real hours with one absurd bucket still
+    // covers all of its real parts.
+    let min_ns = i64::from(min_hour).saturating_mul(NS_PER_HOUR);
+    let max_ns = i64::from(max_hour).saturating_mul(NS_PER_HOUR);
+    (
+        TimeRange {
+            start_ns: min_ns,
+            end_ns: max_ns,
+        },
+        max_ns,
+    )
+}
+
+/// Insert `ts_col >= window.start_ns AND ts_col < window.end_ns` directly
+/// above every `TableScan` in `plan` (ADR-1374 decision 3, prerequisite 2).
+///
+/// Rewrites the UNOPTIMIZED logical plan. At this stage a `TableScan` still
+/// carries no projection, so the event-time column is always in scope; the
+/// optimizer then pushes projections and filters down over the rewritten plan
+/// exactly as it would over a predicate the statement itself carried. Pruning
+/// therefore tightens: the injected filter is offered to the provider like any
+/// other, and the result stays sound either way the provider answers. Every
+/// provider but a local `logs` scan reports `Inexact`, so DataFusion re-applies
+/// the filter above the scan and a segment straddling the window is read whole
+/// and filtered by row. A local `logs` scan reports the pure `ts` bound
+/// `Exact` ([`crate::logs_pushdown::filter_is_exact`]) and drops the residual,
+/// because the RLOG reader re-checks every decoded row against
+/// `Predicate::TsRange` with the half-open end taken as `end_ns - 1`.
+///
+/// The traversal descends into subqueries embedded in expressions
+/// (`Expr::ScalarSubquery`, `Expr::InSubquery`, `Expr::Exists`,
+/// `Expr::SetComparison`) as well as into
+/// plan children, so a statement whose `WHERE` clause carries its own `SELECT`
+/// gets the window on that scan too. A plain `transform_up` walks only the plan
+/// tree, which would leave the inner scan reading the whole overlapping segment
+/// while the reported predicate claimed the window had been applied.
+///
+/// A `Filter` preserves its input's schema, so the planned result schema is
+/// unchanged and the caller's `DataFrame` can be rebuilt around the new plan.
+///
+/// Each scan is filtered on its own table's column ([`window_ts_column`]),
+/// read off `scan.table_name`, which names the registered table even under an
+/// alias. A scan of a table that is not a signal table gets no window.
+///
+/// Returns the rewritten plan and the display of the predicates actually
+/// built, which is what [`SqlStats::window_predicate`] reports: one entry per
+/// signal table, in [`SIGNAL_LANE_ORDER`], joined by `"; "`, so a statement
+/// over one table reports exactly the one predicate. `None` when no scan was
+/// filtered.
+fn apply_row_window(
+    plan: LogicalPlan,
+    window: TimeRange,
+) -> Result<(LogicalPlan, Option<String>), SqlError> {
+    let mut applied: BTreeMap<usize, String> = BTreeMap::new();
+    let rewritten = plan
+        .transform_up_with_subqueries(|node| {
+            if let LogicalPlan::TableScan(scan) = &node {
+                let Some(signal) = crate::statement::signal_table(scan.table_name.table()) else {
+                    return Ok(Transformed::no(node));
+                };
+                let (Some(ts_col), Some(lane)) = (
+                    window_ts_column(signal),
+                    SIGNAL_LANE_ORDER.iter().position(|s| *s == signal),
+                ) else {
+                    return Ok(Transformed::no(node));
+                };
+                let predicate = window_filter_expr(&scan.table_name, ts_col, window);
+                // Rendered from the expression that is about to be planted, so
+                // the reported text cannot describe a different filter than the
+                // one that ran.
+                applied.insert(lane, predicate.to_string());
+                // An unresolvable column surfaces here as a typed plan error,
+                // never as a silently unfiltered scan.
+                let filter = Filter::try_new(predicate, Arc::new(node))?;
+                return Ok(Transformed::yes(LogicalPlan::Filter(filter)));
+            }
+            Ok(Transformed::no(node))
+        })
+        .map(|transformed| transformed.data)
+        .map_err(plan_error)?;
+    let reported =
+        (!applied.is_empty()).then(|| applied.into_values().collect::<Vec<_>>().join("; "));
+    Ok((rewritten, reported))
+}
+
+/// What [`SqlExecutor::explain`] found out about a statement without reading
+/// any of its data (ADR-1374 decision 3, prerequisite 3).
+#[derive(Debug, Clone)]
+pub struct ExplainReport {
+    /// The signal the validated statement targets, chosen from its `FROM`
+    /// clause the same way execution chooses it: for a statement naming
+    /// several signal tables, the first it names in the order `samples`,
+    /// `logs`, `spans`, `alerts`, `audit`.
+    pub target: TargetSignal,
+    /// The effective result schema, declared typed columns (ADR-0090)
+    /// included.
+    pub schema: SchemaRef,
+    /// Segments the resolve returned, of every origin.
+    pub segments_resolved: usize,
+    /// Of those, the sealed below-watermark segments checked against
+    /// `max_segments` (ADR-0073 decision 2).
+    pub segments_admitted: u64,
+    /// Of those, the recent and token-resolved segments exempt from
+    /// `max_segments`, whose cost the request budget bounds instead.
+    pub segments_recent_exempt: u64,
+    /// The pre-execution cost estimate (ADR-0044 "3."), from this resolve.
+    pub estimate: CostEstimate,
+    /// [`CostEstimate`] fields the estimator cannot bound for this target,
+    /// named so a caller does not read a structural zero as a real estimate of
+    /// zero. Empty for a metrics query, which the estimator bounds fully.
+    pub unbounded_components: Vec<&'static str>,
+    /// The row filter [`SqlRequest::row_window`] would apply, or `None`.
+    pub window_predicate: Option<String>,
+    /// The physical plan, rendered as DataFusion's indented display.
+    pub plan_text: String,
+    /// One entry per signal table the resolve read, in [`SIGNAL_LANE_ORDER`]
+    /// (ADR-2904 decision 7), the same entries [`SqlOutcome::signals`]
+    /// carries.
+    pub signals: Vec<SignalStats>,
+}
+
+/// One signal table's share of a statement's cost (ADR-2904 decision 7,
+/// issue #2912).
+///
+/// Every phase of every entry is that table's own handle, so the entries of
+/// one statement sum to its per-phase total, less the Parquet tables' share
+/// (a Parquet table has no entry) and the charges that belong to no table
+/// (the memory pool's peak report, which no rendered field carries).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalStats {
+    /// The table name: `samples`, `logs`, `spans`, `alerts` or `audit`.
+    pub table: &'static str,
+    /// Segments this table's resolve returned, of every origin. The entries
+    /// sum to [`SqlStats::segments`].
+    pub segments: usize,
+    /// Segments this table's catalog resolve pruned by postings
+    /// ([`Snapshot::segments_pruned`]). Per table only: the statement has no
+    /// total of it.
+    pub segments_pruned: u64,
+    /// This table's cost, split by phase like [`SqlOutcome::phase_accounting`].
+    pub phases: PhaseAccountingSnapshot,
+    /// The byte and store-request budgets this table's scan checked the
+    /// statement total against, and how many checks it ran (issue #1409).
+    /// `None` when no scan of this table was built with a budget.
+    pub budgets: Option<EnforcedBudgets>,
+    /// The `spans` or `logs` entry's share of [`SqlStats::key_index`]: `Some`
+    /// exactly when one of that table's scans registered the figures, and
+    /// `None` on every other table and on an explain, which runs no scan.
+    pub key_index: Option<KeyIndexStats>,
+}
+
+/// Merges `view`'s statement total into `into` when dropped, so a caller
+/// holding one pooled [`QueryAccounting`] receives exactly the statement's
+/// total on every exit, including a cancelled future.
+struct MergeOnDrop<'a> {
+    into: &'a QueryAccounting,
+    view: StatementAccounting,
+}
+
+impl Drop for MergeOnDrop<'_> {
+    fn drop(&mut self) {
+        self.into.merge_snapshot(&self.view.pooled_snapshot());
+    }
+}
+
+/// One signal lane's resolved counts, captured before its snapshot is handed
+/// to the plan.
+#[derive(Debug, Clone, Copy)]
+struct LaneCounts {
+    signal: TargetSignal,
+    table: &'static str,
+    segments: usize,
+    segments_pruned: u64,
+}
+
+/// The [`SignalStats`] of `lanes`, each read from its own handle in `view`.
+/// `spans_key_index` is reported on the `spans` entry only and
+/// `logs_key_index` on the `logs` entry only.
+fn signal_stats(
+    lanes: &[LaneCounts],
+    view: &StatementAccounting,
+    spans_key_index: Option<KeyIndexStats>,
+    logs_key_index: Option<KeyIndexStats>,
+) -> Vec<SignalStats> {
+    lanes
+        .iter()
+        .map(|lane| SignalStats {
+            table: lane.table,
+            segments: lane.segments,
+            segments_pruned: lane.segments_pruned,
+            phases: view.lane(lane.signal).snapshot(),
+            budgets: view.enforced_budgets(lane.signal),
+            key_index: match lane.signal {
+                TargetSignal::Spans => spans_key_index,
+                TargetSignal::Logs => logs_key_index,
+                _ => None,
+            },
+        })
+        .collect()
+}
+
+/// Which [`CostEstimate`] components the estimator cannot bound for `target`.
+///
+/// `estimate_logs_cost` and `estimate_spans_cost` both pass a literal zero for
+/// `estimated_decompressed_bytes`: the RLOG and RSPAN funnels never call
+/// `add_decompressed_bytes`, so that zero is a statement about where the
+/// accounting lives, not a claim that no bytes are decompressed. Reporting it
+/// as an estimate of zero would be a wrong answer to a question a caller
+/// budgeting a query is entitled to ask, so it is named as unknown instead.
+fn unbounded_estimate_components(target: TargetSignal) -> Vec<&'static str> {
+    match target {
+        TargetSignal::Metrics => Vec::new(),
+        TargetSignal::Logs | TargetSignal::Spans | TargetSignal::Alerts | TargetSignal::Audit => {
+            vec!["estimated_decompressed_bytes"]
+        }
+        // `parquet::estimate_cost` fills `estimated_requests` and
+        // `estimated_store_bytes` from the manifests (assuming a cold cache
+        // and a full scan), and neither bounds the query: an uncached footer
+        // or column chunk costs requests beyond the one per file it counts,
+        // and a range read again after eviction costs store bytes it already
+        // counted once. `estimated_decompressed_bytes` is a literal zero
+        // because no Parquet estimator computes one, the same "unknown, not
+        // zero" case as the logs/spans arm.
+        TargetSignal::Parquet => vec![
+            "estimated_requests",
+            "estimated_store_bytes",
+            "estimated_decompressed_bytes",
+        ],
+    }
+}
+
+/// [`unbounded_estimate_components`] over every lane of a statement, and over
+/// its Parquet tables when `parquet` is set, each component named once, in the
+/// order the lanes first name it. A summed estimate is unbounded wherever one
+/// of its terms is.
+fn unbounded_lane_components(lanes: &[ResolvedLane], parquet: bool) -> Vec<&'static str> {
+    let mut components = Vec::new();
+    let parquet = parquet.then_some(TargetSignal::Parquet);
+    for component in lanes
+        .iter()
+        .map(|lane| lane.signal)
+        .chain(parquet)
+        .flat_map(unbounded_estimate_components)
+    {
+        if !components.contains(&component) {
+            components.push(component);
+        }
+    }
+    components
+}
+
+/// A completed query.
+#[derive(Debug, Clone)]
+pub struct SqlOutcome {
+    pub output: QueryOutput,
+    pub stats: SqlStats,
+    /// This query's accounting counters (ADR-0044 "1. A per-request
+    /// accounting handle"), from the attempt that succeeded. A retried
+    /// attempt's discarded counters never bleed into this one: `run` builds
+    /// a fresh [`QueryAccounting`] per attempt.
+    pub accounting: QueryAccountingSnapshot,
+    /// The high-water mark of the bytes this query's memory consumers'
+    /// reservations hold live, before any reserve-ahead factor
+    /// ([`TenantDelegatingPool::peak_asked_bytes`]). It is at most
+    /// `accounting.peak_intermediate_bytes`, which is charged with the factor
+    /// and keeps held releases charged. Zero when the attempt failed before
+    /// the stream started.
+    pub peak_asked_intermediate_bytes: u64,
+    /// The same counters as [`Self::accounting`], split by [`QueryPhase`]
+    /// (issue #796) rather than pooled: `accounting` is
+    /// `phase_accounting.pooled()`, so the two never disagree on a total,
+    /// only on whether resolve/plan/probe/scan can be told apart.
+    pub phase_accounting: PhaseAccountingSnapshot,
+    /// One entry per signal table the statement read, in
+    /// [`SIGNAL_LANE_ORDER`] (ADR-2904 decision 7). A statement naming no
+    /// table resolves the `samples` snapshot and reports it here; a Parquet
+    /// table has no entry.
+    pub signals: Vec<SignalStats>,
+    /// This query's I/O shape (issue #1214): the structural request-fan-out
+    /// figures (dependency depth, list-page depth, service batches) plus the
+    /// unfolded-segment and plan-classification figures, computed purely from
+    /// the resolved snapshot and this attempt's phase accounting.
+    pub io_shape: QueryIoShape,
+    /// The pre-execution cost estimate (ADR-0044 "3."), from the same
+    /// successful attempt's resolve.
+    pub estimate: CostEstimate,
+    /// Which operator wrote this query's spill, and how much (ADR-0954). Empty
+    /// for a query that did not spill, which is every query on the default
+    /// configuration. The totals are on [`SqlStats::spill`]; this is the
+    /// attribution, because "the aggregate spilled 4 files" and "the exchange
+    /// spilled 4 files" are different findings that a pooled total cannot tell
+    /// apart.
+    pub spill_by_operator: Vec<OperatorSpill>,
+    /// Which signal this statement read, resolved from its `FROM` clause. The
+    /// same value [`ExplainReport::target`] carries for the same text.
+    ///
+    /// One of the three resolve inputs a paging cursor pins (ADR-1374 D5).
+    /// They are surfaced here, on the outcome, rather than being re-derived by
+    /// the caller: a cursor is only sound if it pins what the query that
+    /// produced the page actually ran against, and a second resolution at mint
+    /// time could see a different snapshot, a different declared set, or a
+    /// newer erasure.
+    pub target: TargetSignal,
+    /// The tenant's declared column set as this query resolved it, in the
+    /// order [`crate::DeclaredColumnSource`] returned. Empty for a tenant with
+    /// no declarations.
+    ///
+    /// A cursor pins this set and D5 expires a cursor whose redemption sees a
+    /// different one, because a declaration changes what the same statement
+    /// projects.
+    pub declared_columns: Vec<DeclaredColumn>,
+    /// The erasure predicates pending in the snapshot this query read, from
+    /// the attempt that succeeded.
+    ///
+    /// A cursor pins these and D5 expires a cursor once a newer intersecting
+    /// erasure is in force, so a later page cannot return rows an erasure
+    /// accepted between pages.
+    pub pending_erasure: Vec<ErasurePredicate>,
+    /// The greatest `ingest_hour_bucket` among the segments the succeeding
+    /// attempt resolved, over every signal lane, in whole hours since the
+    /// epoch. `None` when that resolve returned no segment.
+    ///
+    /// The freshness watermark ADR-1374 reports in
+    /// `visibility.ingest_watermark_hour` and a cursor carries forward (the
+    /// 2026-09-13 amendment, items 3 and 4). It is read off the snapshot the
+    /// rows came from, for the same reason as [`Self::pending_erasure`].
+    pub ingest_watermark_hour: Option<u32>,
+    /// The data-object keys of the segments the succeeding attempt resolved,
+    /// over every signal lane, sorted and deduplicated
+    /// ([`segment_set_keys`]).
+    ///
+    /// A paging cursor pins a digest of this set and compares it with the
+    /// redeeming resolve's (ADR-1374, the pinned segment set amendment),
+    /// because the resolve inputs a cursor pins bound which ingest-hour
+    /// buckets are listed and not what they hold. It is the set of data-object
+    /// keys, so a compaction changes it even though the rows it covers are
+    /// conserved.
+    pub segment_set: Vec<String>,
+    /// Whether the statement read a Parquet table (ADR-2040), alone or joined
+    /// with signal tables. A Parquet table is resolved from its manifest, not
+    /// from a signal snapshot, so no cursor pin covers it.
+    pub reads_parquet: bool,
+    /// [`CostEstimate`] fields the estimator cannot bound for this statement,
+    /// from the same rule over the same resolve as
+    /// [`ExplainReport::unbounded_components`], so explain and execute name the
+    /// same components for one statement. Empty for a statement reading only
+    /// `samples`.
+    pub unbounded_components: Vec<&'static str>,
+    /// How many signal tables the statement names in its text. Zero for a
+    /// statement naming none, which [`Self::signals`] still reports as the
+    /// default `samples` lane it resolved: that lane is not a table the
+    /// statement read, so no cursor pin may rest on it.
+    pub signal_tables_named: usize,
+}
+
+/// A resolved segment set in canonical form: its data-object keys, sorted
+/// and deduplicated, so two resolves over the same segments compare equal
+/// whatever order their lanes listed them in.
+pub fn segment_set_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut keys: Vec<String> = keys.map(str::to_owned).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+/// The warning a `samples` statement carries when its answer omits the
+/// tenant's native-histogram samples (issue #1738). One fixed string: the
+/// caller cannot act on a count of skipped series, only on the fact that the
+/// result is not the whole population.
+pub const HISTOGRAM_EXCLUDED_WARNING: &str = "native-histogram samples are excluded from the samples table, which has no \
+     column that can hold one; this result omits them, so counts and \
+     aggregations over samples are short by the histogram population";
+
+impl SqlOutcome {
+    /// Non-fatal diagnostics about what this result is NOT, for a transport to
+    /// render beside the rows (the PromQL surface's top-level `warnings`
+    /// array, ADR-0071 decision 2, is the shape this follows).
+    ///
+    /// The exactness posture makes approximation opt-in and visible; a
+    /// `samples` result that silently drops a tenant's histogram samples is
+    /// neither. The condition is the narrowest one the query path can see for
+    /// free: this statement's own scan matched histogram-kind series and
+    /// dropped them ([`SqlStats::histogram_series_skipped`], counted where the
+    /// fetcher's already-decoded catalog says a series is histogram-kind). A
+    /// tenant with no histogram data, and a statement whose matchers select
+    /// none, both warn about nothing.
+    ///
+    /// One gap: a statement that ran through the ADR-0071 distributed lane
+    /// counts nothing, because the scan that did the skipping ran on a worker
+    /// and the slice stream carries rows, not that worker's DataFusion
+    /// counters. Closing it needs a field on the slice summary, which is a
+    /// wire-format change (issue #1738).
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.stats.histogram_series_skipped > 0 {
+            warnings.push(HISTOGRAM_EXCLUDED_WARNING.to_string());
+        }
+        warnings
+    }
+}
+
+/// A shared, cloneable view of the [`QueryAccounting`] for the query currently
+/// running under [`SqlExecutor::execute_accounted`]. It lets a caller snapshot
+/// the cost incurred so far at any instant, including on the two exits that
+/// never yield a [`SqlOutcome`]: a wall-deadline trip (the `execute` timeout
+/// wrapper drops the run future and returns [`SqlError::DeadlineExceeded`]) and
+/// the whole execute future being dropped mid-fetch (a client disconnect).
+///
+/// The view is ADDITIVE, the mirror of `ravel_query::LiveQueryAccounting`: the
+/// snapshot retry builds a fresh [`StatementAccounting`] per attempt, the
+/// executor adds each one here before the attempt's first store call, and
+/// [`Self::snapshot`] sums them, because a caller that cancelled after a retry
+/// started owes what both attempts issued. Each attempt's scan budget and
+/// [`SqlOutcome::accounting`] read that attempt's own handle and never this
+/// view, so a discarded attempt counts against neither. On the success path of
+/// a statement that did not retry, the snapshot equals the returned
+/// [`SqlOutcome::accounting`]; after a retry it is that figure plus the
+/// discarded attempt's.
+#[derive(Clone, Default)]
+pub struct LiveAccounting(Arc<Mutex<Vec<StatementAccounting>>>);
+
+impl LiveAccounting {
+    /// A live view whose counters are all zero until an execution installs the
+    /// first attempt's handle.
+    pub fn new() -> Self {
+        LiveAccounting::default()
+    }
+
+    /// Snapshot every installed attempt's counters, each pooled across phases
+    /// and lanes (matching this type's pre-#1367 behavior: a caller of this
+    /// method never had a phase to ask for) and then summed. Safe from any
+    /// thread at any time, including a `Drop` running after the execute future
+    /// was dropped mid-await: each attempt's counter blocks live behind an
+    /// `Arc` this view shares, so they outlive the dropped future.
+    pub fn snapshot(&self) -> QueryAccountingSnapshot {
+        self.lock()
+            .iter()
+            .fold(QueryAccountingSnapshot::default(), |total, attempt| {
+                total.saturating_add(&attempt.pooled_snapshot())
+            })
+    }
+
+    /// Add `phase_accounting` (the attempt about to run) to this view. Clones
+    /// every lane's handle, so the two share the same atomic counter blocks
+    /// and every increment the attempt makes, in any lane, is visible through
+    /// [`Self::snapshot`].
+    fn install(&self, phase_accounting: &StatementAccounting) {
+        self.lock().push(phase_accounting.clone());
+    }
+
+    /// Lock the inner slot, recovering a poisoned guard. The slot holds
+    /// cheap-to-clone handles and no torn state, so recovering is safe and
+    /// strictly better than failing every later snapshot.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<StatementAccounting>> {
+        match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+/// Executes SQL for any tenant against one catalog and object store.
+///
+/// The executor holds no DataFusion state: it is the per-tenant memory
+/// accountants and the immutable catalog/fetcher handles, nothing else.
+/// Every query builds and drops its own `SessionContext` (security
+/// invariant 2).
+pub struct SqlExecutor {
+    catalog: Arc<Catalog>,
+    fetcher: SegmentFetcher,
+    /// The RLOG/logs sibling of `fetcher` (ADR-0033). Used only when a query
+    /// targets the `logs` table; a metrics-only query never touches it.
+    log_fetcher: LogSegmentFetcher,
+    /// The RSPAN/spans sibling of `fetcher` (ADR-0045 decision 5). Used only
+    /// when a query targets the `spans` table; a metrics- or logs-only query
+    /// never touches it. Its `fetch_accounted` path is tenant-checked (fails
+    /// closed on a footer tenant_hash mismatch) and records every span GET
+    /// against the query's `QueryAccounting`.
+    span_fetcher: SpanSegmentFetcher,
+    config: SqlConfig,
+    max_tenant_bytes: usize,
+    /// Per-tenant byte accountants, created on first use and shared across
+    /// that tenant's concurrent queries. This map is the one piece of state
+    /// that intentionally outlives a query, and it holds no query, plan, or
+    /// catalog data -- only a byte counter per tenant, so it cannot carry
+    /// data across the tenant boundary.
+    ///
+    /// Each entry also carries the tenant's last-touch (`now_ns` of its most
+    /// recent query resolve), so the server's idle-tenant sweep can evict the
+    /// accountants of tenants idle past a threshold (ADR-0069 decision 2). Eviction is re-derivable: a `TenantMemoryAccountant` is pure
+    /// process-local byte-counter state, rebuilt on the tenant's next query, so
+    /// dropping an idle one with no outstanding reservations changes no result.
+    tenants: Mutex<HashMap<TenantHash, TenantAccountantEntry>>,
+    /// The process-wide memory budget every tenant accountant this executor
+    /// builds is an adapter over (ADR-1170 decision 1), so the per-tenant
+    /// ceilings are a fairness bound nested inside one process ceiling rather
+    /// than N ceilings that multiply with the number of active tenants.
+    /// [`SqlExecutor::new`] defaults it to `MemoryBudget::unlimited()`, which
+    /// counts every SQL reservation and refuses none, so nothing observable
+    /// changes until a caller installs a bounded budget with
+    /// [`Self::with_process_memory_budget`].
+    process_memory_budget: Arc<MemoryBudget>,
+    /// The source of each tenant's declared typed attribute columns for the
+    /// `logs` table (ADR-0090 decision 2). Resolved once per plan at the entry
+    /// point (`run` for HTTP, Flight's `get_flight_info`) and threaded down as a
+    /// plain parameter; the planning functions never call this themselves.
+    /// [`SqlExecutor::new`] defaults it to an empty
+    /// [`crate::StaticDeclaredColumns`] so the constructor and every existing
+    /// call site stay source-compatible; a caller installs the real cache-aside
+    /// overlay (#302) with [`Self::with_declared_column_source`].
+    declared_source: Arc<dyn DeclaredColumnSource>,
+    /// What Parquet tables are read through (ADR-2040). `None` leaves every
+    /// name that is not a signal table resolving exactly as it did before
+    /// Parquet tables existed.
+    parquet: Option<ParquetSources>,
+    /// The clock `execute_ddl` threads into `ravel_pqtable::writer::apply`
+    /// for a manifest's `created_unix_ns` and the resolve-to-put elapsed-time
+    /// check. [`SqlExecutor::new`] defaults it to [`SystemClock`]; a test
+    /// installs a `ravel_pqtable::clock::FixedClock` with
+    /// [`Self::with_clock`] to drive that elapsed time deterministically.
+    clock: Arc<dyn Clock>,
+    /// The `min_grace_ms` `execute_ddl` passes to `ravel_pqtable::writer::apply`,
+    /// replacing [`crate::ddl::DEFAULT_MIN_GRACE_MS`] when set. `None` (the
+    /// [`SqlExecutor::new`] default) keeps that constant; the server installs
+    /// the deployment's own sweep grace with [`Self::with_ddl_min_grace_ms`].
+    ddl_min_grace_ms: Option<u64>,
+    /// The read-bytes threshold at or above which a single-lane `logs`
+    /// statement sent as SQL text with no exact-key equality reads as BulkScan
+    /// once its last successful execution read that much
+    /// ([`crate::access_intent::size_trigger_applies`]). `None` (the
+    /// [`SqlExecutor::new`] default) leaves the predicate-free rule deciding
+    /// alone; the server installs `--cache-bulk-scan-min-bytes`, raised to its
+    /// read cache's size, with [`Self::with_cache_bulk_scan_min_bytes`].
+    cache_bulk_scan_min_bytes: Option<u64>,
+    /// A lowered part ceiling for the spans tier-2 router; `None` is the
+    /// ADR's `P_max`.
+    key_index_max_probed_parts: Option<usize>,
+    /// The bytes each statement the size trigger considers read on its last
+    /// successful execution, recorded only while
+    /// [`Self::cache_bulk_scan_min_bytes`] is set.
+    statement_read_bytes: StatementReadBytes,
+    /// How often each logs scan has run (issue #3192), handed to every logs
+    /// scan this executor plans so a repeat of one publishes its units in the
+    /// opposite direction to the previous execution.
+    scan_executions: Arc<ScanExecutions>,
+    /// The process spill ceiling every query granted spill reserves its
+    /// scratch cap from (ADR-0954 requirement 2, issue #2416): the configured
+    /// `spill.max_bytes`, shared by every query this executor serves. `None`
+    /// when spill is not configured.
+    spill_budget: Option<SpillBudget>,
+    /// The deployment key and query-audit setting that, with a principal's
+    /// [`SqlCapabilities`], decide whether a session registers the ipcrypt
+    /// UDFs (ADR-2993 decision 6). [`SqlExecutor::new`] defaults it to no
+    /// key, which registers them for nobody; the server installs its own with
+    /// [`Self::with_ipcrypt_deployment`].
+    ipcrypt: IpcryptDeployment,
+    /// The host parallelism the reserve-ahead envelope width is capped at in
+    /// place of the process's own. `None` (the [`SqlExecutor::new`] default)
+    /// reads `available_parallelism`; a test sets it with
+    /// [`Self::with_envelope_parallelism`].
+    envelope_parallelism: Option<NonZeroUsize>,
+    /// The soft `RLIMIT_NOFILE` the bucket retry's descriptor budget is read
+    /// from. [`crate::DEFAULT_NOFILE_SOFT`] until the server installs the one
+    /// it read at start with [`Self::with_nofile_soft`].
+    nofile_soft: u64,
+    /// Replaces the plan a pinned statement executes after the tie-order
+    /// rewrite, so a test can make it diverge from the classification plan.
+    #[cfg(test)]
+    executed_plan_tamper: Option<fn(LogicalPlan) -> LogicalPlan>,
+    /// How many times [`Self::plan_pinned_with`] rebuilt a session without
+    /// spill because the executed plan failed the spill re-check.
+    #[cfg(test)]
+    spill_fallbacks: std::sync::atomic::AtomicUsize,
+    /// How many times [`Self::executed_plan`] built a plan to execute.
+    #[cfg(test)]
+    executed_plan_builds: std::sync::atomic::AtomicUsize,
+    /// Runs an executed statement's first pass as a spill retry, so a test
+    /// can reach the spill-enabled execute path without a memory refusal.
+    #[cfg(test)]
+    pub(crate) start_as_spill_retry: bool,
+}
+
+/// One tenant's memory accountant plus the last-touch stamp idle-tenant
+/// eviction reads (ADR-0069 decision 2). `last_touch_ns` is the injected
+/// `now_ns` of the tenant's most recent resolve; no clock is read here.
+struct TenantAccountantEntry {
+    accountant: Arc<TenantMemoryAccountant>,
+    last_touch_ns: i64,
+}
+
+impl SqlExecutor {
+    /// Build an executor. `max_tenant_bytes` is the ceiling each tenant's
+    /// accountant enforces across that tenant's concurrent queries; the
+    /// per-query ceiling comes from `config.max_query_bytes`.
+    pub fn new(
+        catalog: Arc<Catalog>,
+        fetcher: SegmentFetcher,
+        log_fetcher: LogSegmentFetcher,
+        span_fetcher: SpanSegmentFetcher,
+        config: SqlConfig,
+        max_tenant_bytes: usize,
+    ) -> Self {
+        let spill_budget = config
+            .spill
+            .as_ref()
+            .map(|spill| SpillBudget::new(spill.max_bytes));
+        SqlExecutor {
+            catalog,
+            fetcher,
+            log_fetcher,
+            span_fetcher,
+            spill_budget,
+            config,
+            max_tenant_bytes,
+            tenants: Mutex::new(HashMap::new()),
+            process_memory_budget: Arc::new(MemoryBudget::unlimited()),
+            declared_source: default_declared_source(),
+            parquet: None,
+            clock: Arc::new(SystemClock),
+            ddl_min_grace_ms: None,
+            cache_bulk_scan_min_bytes: None,
+            key_index_max_probed_parts: None,
+            statement_read_bytes: StatementReadBytes::new(),
+            scan_executions: Arc::new(ScanExecutions::new()),
+            ipcrypt: IpcryptDeployment::default(),
+            envelope_parallelism: None,
+            nofile_soft: crate::DEFAULT_NOFILE_SOFT,
+            #[cfg(test)]
+            executed_plan_tamper: None,
+            #[cfg(test)]
+            spill_fallbacks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            executed_plan_builds: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            start_as_spill_retry: false,
+        }
+    }
+
+    /// Make Parquet tables queryable (ADR-2040): a statement whose only
+    /// tables are Parquet tables of the caller's tenant resolves their
+    /// manifests through `sources` and reads their files through its external
+    /// stores.
+    pub fn with_parquet_sources(mut self, sources: ParquetSources) -> Self {
+        self.parquet = Some(sources);
+        self
+    }
+
+    /// The Parquet sources [`Self::with_parquet_sources`] installed.
+    pub fn parquet_sources(&self) -> Option<&ParquetSources> {
+        self.parquet.as_ref()
+    }
+
+    /// Size this executor's reserve-ahead envelopes as on a host of
+    /// `parallelism` cores: the envelope width becomes `parallelism` capped
+    /// at [`SqlConfig::aggregate_stream_count`], in place of the process's
+    /// `available_parallelism` ([`crate::process_envelope_width`]). A test
+    /// seam (ADR-1195, issue #4014 amendment, decision 5), so a figure that
+    /// moves with the envelope width does not move with the test host's
+    /// cores; production never calls it.
+    #[doc(hidden)]
+    pub fn with_envelope_parallelism(mut self, parallelism: NonZeroUsize) -> Self {
+        self.envelope_parallelism = Some(parallelism);
+        self
+    }
+
+    /// Install the soft `RLIMIT_NOFILE` the process read once at start, which
+    /// bounds the descriptors a bucket retry may hold open (ADR-0954, parallel
+    /// bucket spill item 1).
+    pub fn with_nofile_soft(mut self, nofile_soft: u64) -> Self {
+        self.nofile_soft = nofile_soft;
+        self
+    }
+
+    /// The soft `RLIMIT_NOFILE` [`Self::with_nofile_soft`] installed.
+    pub fn nofile_soft(&self) -> u64 {
+        self.nofile_soft
+    }
+
+    /// Install the deployment's ipcrypt setting (ADR-2993 decision 6): the
+    /// deployment key the `ipcrypt_encrypt`/`ipcrypt_prefix_encrypt` UDFs
+    /// derive their keys from, and whether the query audit records statement
+    /// text in plaintext, which keeps them unregistered for every principal.
+    pub fn with_ipcrypt_deployment(mut self, deployment: IpcryptDeployment) -> Self {
+        self.ipcrypt = deployment;
+        self
+    }
+
+    /// The ipcrypt setting [`Self::with_ipcrypt_deployment`] installed.
+    pub fn ipcrypt_deployment(&self) -> &IpcryptDeployment {
+        &self.ipcrypt
+    }
+
+    /// The session principal for `tenant_hash` holding `capabilities` under
+    /// this executor's ipcrypt setting.
+    fn session_principal(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+    ) -> SessionPrincipal {
+        SessionPrincipal::new(tenant_hash, capabilities, self.ipcrypt.clone())
+    }
+
+    /// Install the process-wide memory budget every tenant accountant this
+    /// executor builds charges (ADR-1170 decision 1), replacing the unlimited
+    /// default [`Self::new`] starts with. This is the seam the server wires its
+    /// derived budget through, without changing [`Self::new`]'s signature or
+    /// any existing call site.
+    ///
+    /// Call it before the first query: accountants already in the tenant map
+    /// keep the budget they were built with, and the map is populated on each
+    /// tenant's first use.
+    pub fn with_process_memory_budget(mut self, budget: Arc<MemoryBudget>) -> Self {
+        self.process_memory_budget = budget;
+        self
+    }
+
+    /// The process-wide memory budget this executor's tenant accountants charge
+    /// (ADR-1170 decision 1). Exposed so the server can gauge its reserved
+    /// bytes and assert the configured budget actually reached the executor.
+    pub fn process_memory_budget(&self) -> &Arc<MemoryBudget> {
+        &self.process_memory_budget
+    }
+
+    /// Install the clock `execute_ddl` threads into
+    /// `ravel_pqtable::writer::apply`, replacing the [`SystemClock`] default
+    /// [`Self::new`] starts with. This is the seam a test installs a
+    /// `ravel_pqtable::clock::FixedClock` through, so a resolve-to-put
+    /// elapsed-time check can be driven deterministically instead of
+    /// sleeping.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The clock [`Self::with_clock`] installed, or the [`SystemClock`]
+    /// default.
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
+    }
+
+    /// Install the `min_grace_ms` `execute_ddl` passes to
+    /// `ravel_pqtable::writer::apply`, replacing
+    /// [`crate::ddl::DEFAULT_MIN_GRACE_MS`]. This is the seam the server
+    /// threads the deployment's own sweep grace (`sys/gc`'s
+    /// `max_query_duration`, in milliseconds) through, without changing
+    /// [`Self::new`]'s signature or any existing call site.
+    pub fn with_ddl_min_grace_ms(mut self, min_grace_ms: u64) -> Self {
+        self.ddl_min_grace_ms = Some(min_grace_ms);
+        self
+    }
+
+    /// Install the bulk-scan size trigger (ADR-3072's size trigger
+    /// amendment and its read-bytes amendment): with `Some(min_bytes)`, a
+    /// statement sent as SQL text, naming one `logs` table and no Parquet
+    /// table, whose last successful execution by the same tenant with the same
+    /// text read at least `min_bytes` (cache-served plus store GET bytes, every
+    /// phase), and whose optimized plan has no equality on a field the tenant
+    /// indexes in KEY_IDX, reads as BulkScan. Its first execution has no
+    /// record and is Interactive. `None` keeps the predicate-free rule alone,
+    /// as [`Self::new`] does. The caller passes the threshold it means to
+    /// apply, [`crate::effective_bulk_scan_min_bytes`] for a server with a
+    /// read cache.
+    pub fn with_cache_bulk_scan_min_bytes(mut self, min_bytes: Option<u64>) -> Self {
+        self.cache_bulk_scan_min_bytes = min_bytes;
+        self
+    }
+
+    /// Lowers the spans tier-2 router's part ceiling to `max_parts`; it is
+    /// never raised past the ADR's `P_max`. The parts past it are left to
+    /// each object's KEY_IDX, so a test reaches that outcome with a handful
+    /// of parts.
+    pub fn with_key_index_max_probed_parts(mut self, max_parts: Option<usize>) -> Self {
+        self.key_index_max_probed_parts = max_parts;
+        self
+    }
+
+    /// Installs the process decoded-column cache on the logs fetcher, which the
+    /// `logs`, `alerts` and `audit` scans read through (ADR-3326). With
+    /// one installed every statement's [`SqlStats::decoded_cache`] is `Some`.
+    pub fn set_decoded_cache(
+        &mut self,
+        cache: Arc<ravel_logseg::decoded_cache::DecodedColumnCache>,
+    ) {
+        self.log_fetcher = self.log_fetcher.clone().with_decoded_cache(cache);
+    }
+
+    /// The `min_grace_ms` `execute_ddl` passes to
+    /// `ravel_pqtable::writer::apply`: [`Self::with_ddl_min_grace_ms`]'s
+    /// value, or [`crate::ddl::DEFAULT_MIN_GRACE_MS`] when none was set.
+    pub fn ddl_min_grace_ms(&self) -> u64 {
+        self.ddl_min_grace_ms
+            .unwrap_or(crate::ddl::DEFAULT_MIN_GRACE_MS)
+    }
+
+    /// Install the source of per-tenant declared typed attribute columns for the
+    /// `logs` table (ADR-0090 decision 2), replacing the empty default this
+    /// executor was built with. This is the seam the server's real cache-aside,
+    /// `TenantConfig`-backed overlay (#302) attaches through, without changing
+    /// [`Self::new`]'s signature or any existing call site.
+    pub fn with_declared_column_source(mut self, source: Arc<dyn DeclaredColumnSource>) -> Self {
+        self.declared_source = source;
+        self
+    }
+
+    /// Resolve the declared typed attribute columns for `tenant` as of
+    /// `now_ns` (ADR-0090 decision 2). This is the one call into the injected
+    /// [`DeclaredColumnSource`]; it happens exactly once per plan, at the entry
+    /// point that carries both the tenant and the query's injected clock
+    /// (`SqlExecutor::run` for HTTP, Flight's `get_flight_info`), and the
+    /// resolved list is threaded down as a plain parameter thereafter.
+    pub async fn resolve_declared_columns(
+        &self,
+        tenant: TenantHash,
+        now_ns: i64,
+    ) -> Vec<DeclaredColumn> {
+        self.declared_source.declared_columns(tenant, now_ns).await
+    }
+
+    pub fn config(&self) -> &SqlConfig {
+        &self.config
+    }
+
+    /// The per-tenant memory ceiling each tenant's accountant enforces across
+    /// that tenant's concurrent queries (the `max_tenant_bytes` passed to
+    /// [`SqlExecutor::new`]). Distinct from the per-query ceiling in
+    /// `config().max_query_bytes`. Exposed so a caller wiring the server's
+    /// `--sql-tenant-max-bytes` flag can assert the configured ceiling actually
+    /// reached the executor rather than a compiled-in default.
+    pub fn max_tenant_bytes(&self) -> usize {
+        self.max_tenant_bytes
+    }
+
+    /// Lock the tenant map, recovering a poisoned guard. A poisoned lock means
+    /// another thread panicked while holding it; the map is a plain HashMap of
+    /// Arc counters with no torn-state hazard, so recovering is safe and
+    /// strictly better than failing every subsequent query for the process's
+    /// life.
+    fn lock_tenants(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<TenantHash, TenantAccountantEntry>> {
+        match self.tenants.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// The accountant for `tenant`, creating it on first use.
+    ///
+    /// Exposed so the endpoint and the tenancy tests can read a tenant's
+    /// reserved bytes without running a query through it. A first-use creation
+    /// here stamps the entry's last-touch at [`i64::MIN`] so an accountant
+    /// created only to read a budget (never touched by a resolve) is a
+    /// candidate for the idle sweep as soon as it holds no reservations; a
+    /// query path always stamps a real `now_ns` first via [`Self::touch_tenant`].
+    pub fn tenant_budget(&self, tenant: TenantHash) -> Arc<TenantMemoryAccountant> {
+        let mut tenants = self.lock_tenants();
+        Arc::clone(
+            &tenants
+                .entry(tenant)
+                .or_insert_with(|| TenantAccountantEntry {
+                    accountant: TenantMemoryAccountant::with_process_budget(
+                        self.max_tenant_bytes,
+                        Arc::clone(&self.process_memory_budget),
+                    ),
+                    last_touch_ns: i64::MIN,
+                })
+                .accountant,
+        )
+    }
+
+    /// Stamp `tenant`'s last-touch at `now_ns`, creating its accountant on
+    /// first use (ADR-0069 decision 2). Called from [`Self::resolve`], the one
+    /// funnel every query's snapshot resolve passes through (HTTP SQL and
+    /// Flight SQL alike), so a tenant running any query is never a candidate
+    /// for the idle sweep. [`Self::resolve`] passes the caller's injected
+    /// clock reading ([`SqlRequest::now_ns`]) and not the resolve instant, so
+    /// a later page stamps the time of its own call rather than page one's
+    /// earlier instant; this reads no clock itself.
+    fn touch_tenant(&self, tenant: TenantHash, now_ns: i64) {
+        let mut tenants = self.lock_tenants();
+        let entry = tenants
+            .entry(tenant)
+            .or_insert_with(|| TenantAccountantEntry {
+                accountant: TenantMemoryAccountant::with_process_budget(
+                    self.max_tenant_bytes,
+                    Arc::clone(&self.process_memory_budget),
+                ),
+                last_touch_ns: now_ns,
+            });
+        entry.last_touch_ns = now_ns;
+    }
+
+    /// Evict the memory accountant of every tenant last touched before
+    /// `now_ns - ttl_ns` that also holds zero outstanding reservations
+    /// (ADR-0069 decision 2). Returns the number evicted.
+    ///
+    /// The zero-reservation guard is load-bearing: an accountant with live
+    /// reservations is backing an in-flight query's memory budget, and dropping
+    /// the map entry would let a concurrent query for the same tenant build a
+    /// second accountant, so the tenant's ceiling would stop being shared
+    /// across its concurrent queries. A tenant reserves bytes only for the
+    /// duration of a query, so a zero reservation means no query is currently
+    /// accounting against it, and a re-created accountant on the next query is
+    /// byte-for-byte equivalent (pure process-local counter state). Both
+    /// `now_ns` and `ttl_ns` are caller-supplied (the sweep loop); this reads
+    /// no clock.
+    pub fn evict_idle_accountants(&self, now_ns: i64, ttl_ns: i64) -> usize {
+        let mut tenants = self.lock_tenants();
+        let before = tenants.len();
+        tenants.retain(|_, entry| {
+            entry.accountant.reserved() > 0 || now_ns.saturating_sub(entry.last_touch_ns) <= ttl_ns
+        });
+        before - tenants.len()
+    }
+
+    /// Validate, resolve, plan, and execute `req` for `tenant_hash`.
+    pub async fn execute(
+        &self,
+        tenant_hash: TenantHash,
+        req: &SqlRequest,
+    ) -> Result<SqlOutcome, SqlError> {
+        self.execute_accounted(tenant_hash, req, &LiveAccounting::new())
+            .await
+    }
+
+    /// [`Self::execute`], with a caller-owned [`LiveAccounting`] the caller can
+    /// snapshot at any instant, independent of how the query ends.
+    ///
+    /// The server's cost guard passes one so a timed-out or dropped query still
+    /// records the requests and bytes it actually issued: neither a
+    /// [`SqlError::DeadlineExceeded`] nor the run future being dropped mid-fetch
+    /// carries those figures otherwise. On the success path the returned
+    /// [`SqlOutcome::accounting`] equals `live.snapshot()`.
+    pub async fn execute_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        req: &SqlRequest,
+        live: &LiveAccounting,
+    ) -> Result<SqlOutcome, SqlError> {
+        self.execute_accounted_with(tenant_hash, SqlCapabilities::default(), req, live)
+            .await
+    }
+
+    /// [`Self::execute_accounted`] for a principal holding `capabilities`.
+    /// Like `tenant_hash`, they are an authenticated property of the caller,
+    /// not a request field. With `ipcrypt` set and this executor's
+    /// [`IpcryptDeployment`] allowing it, the statement's session registers
+    /// the ipcrypt UDFs (ADR-2993 decision 6).
+    pub async fn execute_accounted_with(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        req: &SqlRequest,
+        live: &LiveAccounting,
+    ) -> Result<SqlOutcome, SqlError> {
+        self.execute_accounted_at(tenant_hash, capabilities, req, req.now_ns, live)
+            .await
+    }
+
+    /// [`Self::execute_accounted_with`] with the catalog resolve at
+    /// `resolve_at_ns` instead of `req.now_ns`: a later page of a paged result
+    /// resolves at page one's instant, so it lists the ingest hours page one
+    /// listed.
+    ///
+    /// The resolve, its listing window, the column-stats load paired with that
+    /// window and the fold-lag figure of a request-budget refusal use
+    /// `resolve_at_ns`. The declared-column and key-index lookups, whose
+    /// caches judge freshness against the instant they are asked at, and the
+    /// tenant's idle-eviction last-touch use `req.now_ns`, the caller's clock.
+    /// `resolve_at_ns` equal to `req.now_ns` is
+    /// [`Self::execute_accounted_with`].
+    pub async fn execute_accounted_at(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        req: &SqlRequest,
+        resolve_at_ns: i64,
+        live: &LiveAccounting,
+    ) -> Result<SqlOutcome, SqlError> {
+        let clocks = Clocks {
+            resolve_at_ns,
+            caller_now_ns: req.now_ns,
+        };
+        // Step 1: the security gate runs before any catalog or plan work.
+        validate_query(&req.sql)?;
+        let tokens = admit_http_tokens(&Statement::Sql(&req.sql).tables()?, &req.min_tokens)?;
+
+        let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
+        tokio::time::timeout(
+            req.deadline,
+            self.run(
+                tenant_hash,
+                capabilities,
+                Statement::Sql(&req.sql),
+                req,
+                clocks,
+                &tokens,
+                live,
+            ),
+        )
+        .await
+        .unwrap_or(Err(SqlError::DeadlineExceeded { millis }))
+    }
+
+    /// [`Self::execute_accounted`] for a statement that is not SQL text.
+    ///
+    /// The snapshot retry, spill, the deadline and the accounting are the ones
+    /// a SQL statement gets. Resolve and admission against `max_segments` and
+    /// the request budget run the same code, with one difference for a metrics
+    /// target: no `__name__` postings pruning is derived from a lowered
+    /// statement, so the resolve lists the window unpruned. A statement whose
+    /// SQL form would have pruned therefore counts more segments against
+    /// `max_segments`, gets a larger cost estimate and issues more catalog
+    /// requests; the rows it returns are the same. The statement is lowered
+    /// once per session the request builds, and every plan it lowers must
+    /// pass plan admission ([`LoweredStatement`]); a plan that does not is
+    /// [`SqlError::PlanNotAdmitted`].
+    ///
+    /// The read-only gate ([`crate::validate_query`]), the complexity guard it
+    /// runs and the SQL text's table-function and URL-table check do not run,
+    /// because there is no SQL text. Plan admission refuses every scan outside
+    /// the statement's target in place of the last; the caller must bound the
+    /// statement's size and nesting with its own structural guard before
+    /// calling. The statement's [`LoweredStatement::text`] is not read or
+    /// audited here; the caller records it.
+    pub(crate) async fn execute_statement_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        statement: &dyn LoweredStatement,
+        req: &StatementRequest,
+        live: &LiveAccounting,
+    ) -> Result<SqlOutcome, SqlError> {
+        let statement = Statement::Lowered(statement);
+        let tables = statement.tables()?;
+        refuse_cross_signal(&tables)?;
+        // At most one signal table: every plain token bounds it.
+        let tokens = LaneTokens::one_lane(tables.first_lane(), req.min_tokens.clone());
+        let sql_req = SqlRequest {
+            sql: String::new(),
+            window: req.window,
+            min_tokens: req
+                .min_tokens
+                .iter()
+                .cloned()
+                .map(MinCommitToken::from)
+                .collect(),
+            now_ns: req.now_ns,
+            deadline: req.deadline,
+            row_window: req.row_window,
+            max_rows: req.max_rows,
+            budgets: req.budgets,
+        };
+        let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
+        tokio::time::timeout(
+            req.deadline,
+            // A lowered statement (ES|QL, a plan source) is not SQL text and
+            // calls no ipcrypt UDF, so it is planned without capabilities.
+            self.run(
+                tenant_hash,
+                SqlCapabilities::default(),
+                statement,
+                &sql_req,
+                Clocks::of(&sql_req),
+                &tokens,
+                live,
+            ),
+        )
+        .await
+        .unwrap_or(Err(SqlError::DeadlineExceeded { millis }))
+    }
+
+    /// Answer "what would this statement do?" without reading a single data
+    /// object (ADR-1374 decision 3, prerequisite 3), except for a Parquet
+    /// table's schema.
+    ///
+    /// Runs the same first half [`Self::execute`] runs -- validate, resolve
+    /// each named signal's snapshot, admit them, estimate the cost, build the
+    /// session and plan -- and stops before execution. The catalog reads the
+    /// resolve issues are real (a plan over an imagined snapshot would answer
+    /// a different question than the one asked); no segment is fetched,
+    /// because nothing polls a stream. A Parquet table's provider is built
+    /// from its first file's footer, so explaining a statement over Parquet
+    /// tables reads that footer (a Probe GET on the external store, unless the
+    /// metadata cache holds it), and no column chunk.
+    ///
+    /// The returned schema is the effective one, declared typed columns
+    /// (ADR-0090) included, because those widen the `logs` table and a caller
+    /// deciding which columns to select has to see them.
+    /// `tenant_hash` is a separate argument rather than a [`SqlRequest`]
+    /// field, matching [`Self::execute`]: the tenant is an authenticated
+    /// property of the connection, and putting it inside the request body
+    /// would let a transport that deserializes one name any tenant it liked.
+    pub async fn explain(
+        &self,
+        tenant_hash: TenantHash,
+        req: &SqlRequest,
+    ) -> Result<ExplainReport, SqlError> {
+        self.explain_accounted(tenant_hash, req, &QueryAccounting::new())
+            .await
+    }
+
+    /// [`Self::explain`] with a caller-owned [`QueryAccounting`], so the
+    /// resolve's own store spend is attributable.
+    ///
+    /// Bounded by [`SqlRequest::deadline`] exactly as [`Self::execute_accounted`]
+    /// is. Explain fetches no segment, but it does issue the resolve's catalog
+    /// LISTs and GETs, and a Parquet table's footer reads, and a store that
+    /// stops answering would otherwise hang this call for as long as the
+    /// transport allowed.
+    pub async fn explain_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        req: &SqlRequest,
+        accounting: &QueryAccounting,
+    ) -> Result<ExplainReport, SqlError> {
+        // Same order as `execute`: the security gate first, so a rejected
+        // statement costs no catalog LIST here either, and it runs outside the
+        // timeout because a rejection is not a thing that can time out.
+        validate_query(&req.sql)?;
+        let tokens = admit_http_tokens(&Statement::Sql(&req.sql).tables()?, &req.min_tokens)?;
+
+        let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
+        // Every lane records into its own handle; the caller's `accounting`
+        // receives their sum when this call ends, by any exit: success, an
+        // error, the deadline, or this future being dropped.
+        let view = MergeOnDrop {
+            into: accounting,
+            view: StatementAccounting::new(),
+        };
+        tokio::time::timeout(
+            req.deadline,
+            self.explain_inner(tenant_hash, req, &tokens, &view.view),
+        )
+        .await
+        .unwrap_or(Err(SqlError::DeadlineExceeded { millis }))
+    }
+
+    /// The resolve-and-plan body behind [`Self::explain_accounted`], minus
+    /// validation and the deadline. Separate so the timeout wraps exactly the
+    /// work that can block, matching how [`Self::run`] sits under
+    /// [`Self::execute_accounted`].
+    async fn explain_inner(
+        &self,
+        tenant_hash: TenantHash,
+        req: &SqlRequest,
+        tokens: &LaneTokens,
+        phase_accounting: &StatementAccounting,
+    ) -> Result<ExplainReport, SqlError> {
+        let statement = Statement::Sql(&req.sql);
+        let clocks = Clocks::of(req);
+        let declared = self
+            .resolve_declared_columns(tenant_hash, clocks.caller_now_ns)
+            .await;
+        // `resolve_admitted` itself checks the effective `max_s3_requests`
+        // right after resolve returns, so `explain` gets that enforcement
+        // for free here without ever reaching the segment-fetch loop in
+        // scan.rs (which it never runs: explain fetches no segment).
+        let resolved = self
+            .resolve_admitted(
+                tenant_hash,
+                // A deliberate narrowing: explain does not carry a principal's
+                // capabilities, so it plans without the ipcrypt UDFs.
+                SqlCapabilities::default(),
+                statement,
+                req,
+                clocks,
+                tokens,
+                phase_accounting,
+            )
+            .await?;
+        let segments_resolved = resolved.segments_resolved();
+        let lane_counts = resolved.lane_counts();
+        let admission = resolved.admission();
+        let estimate = resolved.estimate;
+        let target = resolved.target;
+        let unbounded_components =
+            unbounded_lane_components(&resolved.lanes, resolved.parquet.is_some());
+        let (lanes, parquet) = resolved.into_snapshots();
+
+        let planned = self
+            .plan_pinned_with(
+                tenant_hash,
+                lanes,
+                statement,
+                phase_accounting,
+                PlanExtras {
+                    declared,
+                    #[cfg(feature = "flight-sql")]
+                    distributed: None,
+                    row_window: req.row_window.then_some(req.window),
+                    budgets: req.budgets,
+                    column_stats_window: req.window,
+                    column_stats_now_ns: clocks.resolve_at_ns,
+                    key_index_now_ns: clocks.caller_now_ns,
+                    parquet: ParquetPlan::Resolved(parquet),
+                    // A deliberate narrowing: explain does not carry a
+                    // principal's capabilities; no caller of it authenticates
+                    // one.
+                    capabilities: SqlCapabilities::default(),
+                    // An explain builds the physical plan, where the spans
+                    // router would read leaves; it issues no GET, so it
+                    // routes nothing and shows tier 1's plan.
+                    lane_parts: LaneParts::default(),
+                    // The plan an execution runs first; a spill retry runs
+                    // only after that plan's memory refusal.
+                    spill: SpillAttempt::First,
+                    spill_share: None,
+                    retry_figures: None,
+                },
+            )
+            .await?;
+        let schema = planned.schema();
+        let window_predicate = planned.window_predicate().map(str::to_string);
+        // Physical, not logical: the shapes worth linting (which columns a
+        // TopK's input scan decodes, whether a repartition fans the final
+        // aggregate out) exist only after physical planning. Building it polls
+        // nothing, so it issues no data GET.
+        let plan = planned.create_physical_plan().await?;
+        let plan_text = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+
+        Ok(ExplainReport {
+            target,
+            schema,
+            segments_resolved,
+            segments_admitted: admission.sealed_count,
+            segments_recent_exempt: admission.exempt_count,
+            estimate,
+            unbounded_components,
+            window_predicate,
+            plan_text,
+            signals: signal_stats(&lane_counts, phase_accounting, None, None),
+        })
+    }
+
+    /// The resolve/plan/execute loop, minus validation and the deadline.
+    ///
+    /// `statement` is what runs; `req.sql` is not read here or below, and
+    /// neither is `req.min_tokens`: `tokens` is each lane's share, assigned
+    /// once by the caller, and every attempt resolves with that same share.
+    /// `clocks` says which instant each step reads (see [`Clocks`]).
+    #[allow(clippy::too_many_arguments)]
+    async fn run(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        statement: Statement<'_>,
+        req: &SqlRequest,
+        clocks: Clocks,
+        tokens: &LaneTokens,
+        live: &LiveAccounting,
+    ) -> Result<SqlOutcome, SqlError> {
+        let mut stats = SqlStats::default();
+
+        // Resolve the tenant's declared typed attribute columns once for the
+        // whole request (ADR-0090 decision 2), before the retry loop, so the
+        // same declared schema is used across the original attempt and the one
+        // retry the consistency model allows -- never re-resolved per attempt
+        // with a source that might have refreshed in between. It is asked at
+        // the caller's clock, which its cache judges freshness against, not at
+        // the resolve instant: a later page resolving at page one's instant
+        // must not read a declaration cache as fresh by that earlier instant.
+        // A paged caller compares the set it gets with the one it pinned.
+        let declared = self
+            .resolve_declared_columns(tenant_hash, clocks.caller_now_ns)
+            .await;
+        let cache_mark = self.fetcher.cache_ram_metrics().map(CacheCounterMark::take);
+        let pressure_mark = self
+            .log_fetcher
+            .decoded_cache()
+            .map(|cache| cache.pressure_counters())
+            .unwrap_or_default();
+
+        // At most three passes: the original, the one snapshot retry the
+        // consistency model allows, and the one spill retry (issue #3899),
+        // each counted on its own. Each pass gets its own QueryAccounting
+        // (ADR-0044): a discarded attempt's counts must never bleed into the
+        // retry's. The caller's statement deadline covers every pass.
+        let mut snapshot_retried = false;
+        let mut spill_retry: Option<FirstRefusal> = None;
+        // The spill-budget share the next retry pass plans with, reserved
+        // before that pass starts (ADR-0954, refusal-retry amendment item 4).
+        let mut retry_share = if self.starts_as_spill_retry() {
+            self.reserve_spill_share()
+        } else {
+            None
+        };
+        loop {
+            let pass_started = Instant::now();
+            let spill_attempt = if spill_retry.is_some() || self.starts_as_spill_retry() {
+                SpillAttempt::Retry
+            } else {
+                SpillAttempt::First
+            };
+            let spill_share = retry_share.take();
+            let phase_accounting = StatementAccounting::new();
+            // Add this attempt's handle to the caller's live view before any
+            // store call, so a snapshot taken from a `Drop` or after a deadline
+            // trip includes this attempt's issued cost beside a discarded
+            // prior attempt's. The budget checks below read
+            // `phase_accounting` alone.
+            live.install(&phase_accounting);
+            // `resolve` (via `resolve_admitted`) itself checks the effective
+            // `max_s3_requests` right after resolve returns, so a statement
+            // whose snapshot resolves to zero segments cannot slip past this
+            // ceiling on the strength that it never reaches the
+            // segment-fetch loop in scan.rs. Each attempt resolves every
+            // signal table the statement names again, so a retry never pairs
+            // a fresh snapshot of one table with a stale one of another.
+            let resolve_started = Instant::now();
+            let resolved = self
+                .resolve(
+                    tenant_hash,
+                    capabilities,
+                    statement,
+                    req,
+                    clocks,
+                    tokens,
+                    &phase_accounting,
+                )
+                .await?;
+            let resolve_ns = elapsed_ns(resolve_started);
+            stats.resolves += 1;
+            stats.attempts += 1;
+            stats.segments = resolved.segments_resolved();
+            let lane_counts = resolved.lane_counts();
+            let estimate = resolved.estimate;
+            let target = resolved.target;
+            let unfolded_segments_resolved = resolved.unfolded_segments_resolved;
+            let signal_tables_named = resolved.signal_tables_named;
+            let unbounded_components =
+                unbounded_lane_components(&resolved.lanes, resolved.parquet.is_some());
+            let mut resolved = resolved;
+            let lane_parts = resolved.take_lane_parts();
+            let (lanes, parquet) = resolved.into_snapshots();
+            // Read off this attempt's snapshots, before they are moved into
+            // `attempt`, so they describe the snapshots the returned rows were
+            // read from and not ones a retry resolved afterwards. The I/O
+            // shape (issue #1214) is likewise a pure function of the resolved
+            // snapshots and this attempt's own phase accounting, computable
+            // here before a single segment is fetched (mirroring
+            // `ravel_query::engine`'s `io_shape_for_resolve`).
+            let pending_erasure = lanes
+                .iter()
+                .flat_map(|(_, snapshot)| snapshot_pending_erasure_predicates(snapshot))
+                .collect();
+            let ingest_watermark_hour = lanes
+                .iter()
+                .flat_map(|(_, snapshot)| snapshot.segments.iter())
+                .map(|seg| seg.ingest_hour_bucket)
+                .max();
+            let segment_set = segment_set_keys(
+                lanes
+                    .iter()
+                    .flat_map(|(_, snapshot)| snapshot.segments.iter())
+                    .map(|seg| seg.data_object_key.as_str()),
+            );
+            let reads_parquet = parquet.is_some();
+            let lane_refs: Vec<(TargetSignal, &Snapshot)> = lanes
+                .iter()
+                .map(|(signal, snapshot)| (*signal, snapshot))
+                .collect();
+            let read_shape = ReadShape::new(req.window, req.row_window, req.max_rows);
+            phase_accounting.set_access_intent(
+                self.statement_access_intent(
+                    tenant_hash,
+                    capabilities,
+                    statement,
+                    &lane_refs,
+                    parquet.is_some(),
+                    req.window,
+                    read_shape,
+                    clocks,
+                    &declared,
+                )
+                .await,
+            );
+            let read_bytes_key = self.read_bytes_key(
+                tenant_hash,
+                statement,
+                read_shape,
+                &lane_refs,
+                parquet.is_some(),
+            );
+            // Whether a logs scan probes KEY_IDX is known only once the plan
+            // has pushed its filters down, so both shapes are taken here and
+            // the attempt's plan picks one.
+            let io_shape = self.sql_io_shape(
+                &lane_refs,
+                &phase_accounting,
+                unfolded_segments_resolved,
+                false,
+            );
+            let keyed_io_shape = self.sql_io_shape(
+                &lane_refs,
+                &phase_accounting,
+                unfolded_segments_resolved,
+                true,
+            );
+
+            let (result, emitted, blocks, spill, spill_by_operator, caps) = self
+                .attempt(
+                    tenant_hash,
+                    capabilities,
+                    statement,
+                    req,
+                    clocks,
+                    lanes,
+                    &phase_accounting,
+                    &declared,
+                    parquet,
+                    lane_parts,
+                    spill_attempt,
+                    spill_share,
+                    spill_retry.map(|first| first.figures),
+                )
+                .await;
+            stats.batches_emitted += emitted;
+            // Overwritten per attempt, like `spill` below: these describe the
+            // attempt that just ran, and a retry's values replace the
+            // discarded attempt's rather than accumulating with them.
+            stats.window_predicate = caps.window_predicate;
+            stats.row_cap_hit = caps.row_cap_hit;
+            // Recorded for the failing attempt too: a spill that happened
+            // before the failure is a fact about this query, and a retried
+            // attempt overwrites it with its own, matching how the block
+            // counters and `QueryAccounting` treat a discarded attempt.
+            stats.spill = spill;
+
+            match result {
+                Ok(output) => {
+                    stats.blocks_total = blocks.total;
+                    stats.blocks_scanned = blocks.scanned;
+                    stats.blocks_pruned_by_postings = blocks.pruned_by_postings;
+                    stats.segments_pruned_by_stats = blocks.segments_pruned_by_stats;
+                    stats.segments_pruned_by_key_index = blocks.segments_pruned_by_key_index;
+                    stats.blocks_pruned_by_key_index = blocks.blocks_pruned_by_key_index;
+                    stats.key_index = blocks.key_index;
+                    stats.blocks_skipped_by_threshold = blocks.blocks_skipped_by_threshold;
+                    stats.segments_skipped_by_threshold = blocks.segments_skipped_by_threshold;
+                    stats.int_values_buffers = blocks.int_values_buffers;
+                    stats.blocks_predicate_dropped = blocks.blocks_predicate_dropped;
+                    stats.rows_predicate_evaluated = blocks.rows_predicate_evaluated;
+                    stats.contains_cells_tested = blocks.contains_cells_tested;
+                    stats.str_cells_validated = blocks.str_cells_validated;
+                    stats.str_dict_values_built = blocks.str_dict_values_built;
+                    stats.rowpath_batches = blocks.rowpath_batches;
+                    stats.columnar_batches = blocks.columnar_batches;
+                    stats.scan_timing = blocks.timing;
+                    stats.wall = PhaseWallTiming {
+                        resolve_ns,
+                        ..caps.wall
+                    };
+                    stats.histogram_series_skipped = blocks.histogram_series_skipped;
+                    stats.cache = cache_mark
+                        .as_ref()
+                        .map(|mark| mark.since(phase_accounting.access_intent()));
+                    stats.decoded_cache =
+                        self.log_fetcher
+                            .decoded_cache()
+                            .map(|cache| DecodedCacheStats {
+                                counters: phase_accounting.decoded_cache_snapshot(),
+                                resident_bytes: cache.resident_bytes(),
+                                pressure: cache.pressure_counters().since(&pressure_mark),
+                            });
+                    let phase_snapshot = phase_accounting.snapshot();
+                    let accounting = phase_snapshot.pooled();
+                    if let Some(key) = read_bytes_key {
+                        self.statement_read_bytes
+                            .record(key, trigger_read_bytes(&accounting));
+                    }
+                    if let Some(first) = spill_retry {
+                        let report = first.report(
+                            spill,
+                            &spill_by_operator,
+                            caps.retry_plan,
+                            caps.bucket_spill,
+                            caps.pool,
+                            caps.spill_share,
+                            caps.retry_derivation,
+                            caps.peak_asked_bytes,
+                            None,
+                        );
+                        report.emit(&statement_fingerprint(statement), "answered");
+                        stats.spill_retry = Some(report);
+                        stats.spill_retry_plan = caps.retry_plan_text;
+                    }
+                    return Ok(SqlOutcome {
+                        output,
+                        stats,
+                        accounting,
+                        peak_asked_intermediate_bytes: caps.peak_asked_bytes,
+                        phase_accounting: phase_snapshot,
+                        signals: signal_stats(
+                            &lane_counts,
+                            &phase_accounting,
+                            blocks.spans_key_index,
+                            blocks.logs_key_index,
+                        ),
+                        io_shape: if blocks.keyed_logs_scan {
+                            keyed_io_shape
+                        } else {
+                            io_shape
+                        },
+                        estimate,
+                        spill_by_operator,
+                        target,
+                        declared_columns: declared.clone(),
+                        pending_erasure,
+                        ingest_watermark_hour,
+                        segment_set,
+                        reads_parquet,
+                        unbounded_components,
+                        signal_tables_named,
+                    });
+                }
+                Err(err) => {
+                    let err = match retry_decision(
+                        err.is_segment_not_found(),
+                        emitted,
+                        u32::from(snapshot_retried),
+                    ) {
+                        RetryDecision::RetryOnce => {
+                            snapshot_retried = true;
+                            if spill_attempt != SpillAttempt::Retry {
+                                continue;
+                            }
+                            // The discarded pass's share was released with
+                            // its scratch, so the snapshot retry reserves
+                            // its own and never plans a retry without one.
+                            match self.reserve_spill_share() {
+                                Some(share) => {
+                                    retry_share = Some(share);
+                                    continue;
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        statement_fingerprint =
+                                            statement_fingerprint(statement).as_str(),
+                                        "SQL snapshot retry of a spill retry skipped: no spill \
+                                         share of at least the minimum remains of the process \
+                                         spill ceiling"
+                                    );
+                                    SqlError::SnapshotInvalidated
+                                }
+                            }
+                        }
+                        RetryDecision::FailInvalidated => SqlError::SnapshotInvalidated,
+                        RetryDecision::Propagate => {
+                            let spill_configured = self.config.spill.is_some();
+                            let spill_retried = spill_retry.is_some();
+                            // Eligibility costs a classification plan, so it
+                            // is asked only once every other condition holds.
+                            let candidate = spill_retry_decision(
+                                &err,
+                                caps.pool,
+                                emitted,
+                                spill_configured,
+                                true,
+                                spill_retried,
+                            ) == SpillRetry::Retry;
+                            let spill_eligible = match caps.spill_probe {
+                                Some(probe) if candidate => {
+                                    self.spill_retry_eligible(
+                                        tenant_hash,
+                                        statement,
+                                        &declared,
+                                        probe,
+                                    )
+                                    .await
+                                }
+                                _ => false,
+                            };
+                            if spill_retry_decision(
+                                &err,
+                                caps.pool,
+                                emitted,
+                                spill_configured,
+                                spill_eligible,
+                                spill_retried,
+                            ) == SpillRetry::Retry
+                            {
+                                // ADR-0954 refusal-retry amendment item 4:
+                                // the share is reserved before the retry
+                                // starts, and with none left the first
+                                // attempt's refusal is the statement's.
+                                match self.reserve_spill_share() {
+                                    Some(share) => {
+                                        stats.spill_retries += 1;
+                                        retry_share = Some(share);
+                                        spill_retry = Some(FirstRefusal {
+                                            class: first_refusal_class(&err, caps.pool),
+                                            after: pass_started.elapsed(),
+                                            figures: RetryFigures {
+                                                asked_bytes: caps.peak_asked_bytes,
+                                                consumed_rows: caps.rows_consumed,
+                                                first: caps.pool.first,
+                                                share: caps.pool.first_share,
+                                            },
+                                        });
+                                        continue;
+                                    }
+                                    None => tracing::warn!(
+                                        statement_fingerprint =
+                                            statement_fingerprint(statement).as_str(),
+                                        outcome = "skipped",
+                                        first_refusal = first_refusal_class(&err, caps.pool),
+                                        min_share_bytes = self
+                                            .spill_budget
+                                            .as_ref()
+                                            .map_or(0, SpillBudget::min_reservation),
+                                        "SQL spill retry skipped: no spill share of at least \
+                                         the minimum remains of the process spill ceiling; \
+                                         returning the first attempt's refusal"
+                                    ),
+                                }
+                            }
+                            err
+                        }
+                    };
+                    if let Some(first) = spill_retry {
+                        first
+                            .report(
+                                spill,
+                                &spill_by_operator,
+                                caps.retry_plan,
+                                caps.bucket_spill,
+                                caps.pool,
+                                caps.spill_share,
+                                caps.retry_derivation,
+                                caps.peak_asked_bytes,
+                                Some(&err),
+                            )
+                            .emit(&statement_fingerprint(statement), "failed");
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    /// One `Catalog::resolve` plus the `max_segments` budget check, exposed
+    /// for a transport that resolves and executes in two separate RPCs.
+    ///
+    /// Flight SQL resolves at `GetFlightInfo`, pins the resulting segment set
+    /// into its ticket, and executes against that pin at `DoGet`.
+    /// It must reach `Catalog::resolve` through this call rather than its own,
+    /// so both transports share one signature, one budget check, and one
+    /// injected-clock discipline. Validation is *not* performed here: the
+    /// caller runs [`crate::validate`] first, exactly as [`Self::execute`]
+    /// does, so a rejected statement still costs no catalog LIST.
+    ///
+    /// `accounting` receives this resolve's store counters; the returned
+    /// [`CostEstimate`] is the two-part estimate for the query this snapshot
+    /// will be planned against.
+    ///
+    /// A statement over Parquet tables also resolves them here, and this call
+    /// throws that resolution away: pair it with [`Self::plan_pinned`], which
+    /// then resolves the tables again. A caller that plans the statement next
+    /// uses [`Self::resolve_pinned`] and hands the resolution on.
+    pub async fn resolve_snapshot(
+        &self,
+        tenant_hash: TenantHash,
+        req: &SqlRequest,
+        accounting: &QueryAccounting,
+    ) -> Result<(Snapshot, CostEstimate), SqlError> {
+        let PinnedResolve {
+            snapshot, estimate, ..
+        } = self.resolve_pinned(tenant_hash, req, accounting).await?;
+        Ok((snapshot, estimate))
+    }
+
+    /// [`Self::resolve_snapshot`] keeping the Parquet tables it resolved, so
+    /// the plan that follows ([`Self::plan_pinned_with_inputs`] with
+    /// [`ParquetPlan::Resolved`]) reads each table's manifests and the grants
+    /// record once for the whole `GetFlightInfo`, not once here and again at
+    /// plan time.
+    ///
+    /// The pinned plan entries take no row window, so a request with
+    /// `row_window` set is [`SqlError::RowWindowNotPinned`] here, before any
+    /// store request, on this and every other pinned resolve.
+    pub async fn resolve_pinned(
+        &self,
+        tenant_hash: TenantHash,
+        req: &SqlRequest,
+        accounting: &QueryAccounting,
+    ) -> Result<PinnedResolve, SqlError> {
+        // One snapshot pins one signal table, so this path keeps the one-table
+        // rule; [`Self::resolve_pinned_lanes`] is the multi-lane form.
+        let tables = Statement::Sql(&req.sql).tables()?;
+        refuse_cross_signal(&tables)?;
+        let PinnedLanes {
+            lanes,
+            estimate,
+            parquet,
+        } = self
+            .resolve_pinned_tables(tenant_hash, req, &tables, accounting)
+            .await?;
+        let Some((_, snapshot)) = lanes.into_iter().next() else {
+            return Err(SqlError::Internal(
+                "a resolve returned no snapshot".to_string(),
+            ));
+        };
+        Ok(PinnedResolve {
+            snapshot,
+            estimate,
+            parquet,
+        })
+    }
+
+    /// [`Self::resolve_pinned`] for a statement over any number of signal
+    /// tables: one snapshot per signal table the statement names, in
+    /// [`SIGNAL_LANE_ORDER`], all from one resolve with the HTTP path's
+    /// admission, lane checks, summed segment budget and summed estimate
+    /// (ADR-2904 decision 10). A statement naming at most one signal table
+    /// resolves exactly as [`Self::resolve_pinned`] does and returns its one
+    /// lane.
+    ///
+    /// Tokens are admitted by [`admit_http_tokens`], the HTTP statement path's
+    /// rule, so each refusal is the HTTP path's error and comes before any
+    /// store request.
+    pub async fn resolve_pinned_lanes(
+        &self,
+        tenant_hash: TenantHash,
+        req: &SqlRequest,
+        accounting: &QueryAccounting,
+    ) -> Result<PinnedLanes, SqlError> {
+        let tables = Statement::Sql(&req.sql).tables()?;
+        self.resolve_pinned_tables(tenant_hash, req, &tables, accounting)
+            .await
+    }
+
+    async fn resolve_pinned_tables(
+        &self,
+        tenant_hash: TenantHash,
+        req: &SqlRequest,
+        tables: &StatementTables,
+        accounting: &QueryAccounting,
+    ) -> Result<PinnedLanes, SqlError> {
+        // `PinnedPlanInputs` carries no row window, so the plan that follows
+        // this resolve could not apply one.
+        if req.row_window {
+            return Err(SqlError::RowWindowNotPinned);
+        }
+        let tokens = admit_http_tokens(tables, &req.min_tokens)?;
+        // Kept on the pooled `&QueryAccounting` signature (the public Flight
+        // SQL `GetFlightInfo`-side resolve, whose caller has no phase-split
+        // handle to hand in): `pooled_over` shares this same handle's counters
+        // across all five phases and every lane.
+        let resolved = self
+            .resolve(
+                tenant_hash,
+                // A deliberate narrowing: Flight SQL does not carry a
+                // principal's capabilities, so it resolves without them.
+                SqlCapabilities::default(),
+                Statement::Sql(&req.sql),
+                req,
+                Clocks::of(req),
+                &tokens,
+                &StatementAccounting::One(PhaseAccounting::pooled_over(accounting)),
+            )
+            .await?;
+        let estimate = resolved.estimate;
+        let (lanes, parquet) = resolved.into_snapshots();
+        if lanes.is_empty() {
+            return Err(SqlError::Internal(
+                "a resolve returned no snapshot".to_string(),
+            ));
+        }
+        Ok(PinnedLanes {
+            lanes,
+            estimate,
+            parquet,
+        })
+    }
+
+    /// Build the fresh per-query, single-tenant session over an already
+    /// resolved `snapshot` and plan `sql` against it, without executing.
+    ///
+    /// This is the one construction path for a query's session: its own
+    /// `TenantDelegatingPool` over the tenant's accountant, its own
+    /// `RavelTableProvider` over the owned snapshot, its own `SessionContext`
+    /// (security invariant 2, crate::session). Both [`Self::execute`] and the
+    /// Flight SQL `DoGet` path go through it, which is what makes the two
+    /// transports share the memory-accounting and cancellation behaviour
+    /// rather than merely resemble it: the pool the returned
+    /// query owns is dropped with it, and every `MemoryReservation` the plan
+    /// took shrinks back through it into the tenant accountant.
+    ///
+    /// `accounting` is this query's [`QueryAccounting`] handle: it is cloned
+    /// into the query's memory pool (peak intermediate bytes) and into
+    /// the one table provider built over `snapshot` (every store fetch the
+    /// scan issues). One snapshot pins one signal table, so a statement naming
+    /// two signal tables is [`SqlError::CrossSignalQuery`] here;
+    /// [`Self::plan_pinned_lanes`] is the multi-lane form.
+    pub async fn plan_pinned(
+        &self,
+        tenant_hash: TenantHash,
+        snapshot: Snapshot,
+        sql: &str,
+        accounting: &QueryAccounting,
+        declared: &[DeclaredColumn],
+    ) -> Result<PinnedQuery, SqlError> {
+        self.plan_pinned_with_inputs(
+            tenant_hash,
+            snapshot,
+            sql,
+            accounting,
+            PinnedPlanInputs {
+                declared: declared.to_vec(),
+                parquet: ParquetPlan::Unresolved,
+                budgets: None,
+            },
+        )
+        .await
+    }
+
+    /// [`Self::plan_pinned`] with everything a two-RPC plan carries beyond the
+    /// snapshot: the Parquet tables the resolve already read (or the versions
+    /// a ticket pinned) and the request's lowered budgets.
+    ///
+    /// `GetFlightInfo` passes [`ParquetPlan::Resolved`] with what
+    /// [`Self::resolve_pinned`] returned and `DoGet` passes
+    /// [`ParquetPlan::Pinned`] with the ticket's pins; both pass the request's
+    /// budgets, so the scans are admitted against the clamped ceilings the
+    /// resolve already applied.
+    pub async fn plan_pinned_with_inputs(
+        &self,
+        tenant_hash: TenantHash,
+        snapshot: Snapshot,
+        sql: &str,
+        accounting: &QueryAccounting,
+        inputs: PinnedPlanInputs,
+    ) -> Result<PinnedQuery, SqlError> {
+        let lanes = Self::pinned_lane(sql, snapshot)?;
+        self.plan_checked_lanes(
+            tenant_hash,
+            lanes,
+            sql,
+            accounting,
+            #[cfg(feature = "flight-sql")]
+            None,
+            inputs,
+        )
+        .await
+    }
+
+    /// [`Self::plan_pinned_with_inputs`] over one pinned snapshot per signal
+    /// table: `lanes` is what [`Self::resolve_pinned_lanes`] returned, or what
+    /// a Flight ticket's segment groups rebuild (ADR-2904 decision 10). Each
+    /// table's provider reads only its own lane's snapshot and applies that
+    /// snapshot's pending erasure.
+    ///
+    /// For a statement naming one or more signal tables, the lanes' signals
+    /// must be exactly the statement's signal tables in [`SIGNAL_LANE_ORDER`];
+    /// a statement naming none takes exactly one lane. Anything else is
+    /// [`SqlError::PinnedSignalsMismatch`], refused before any store request.
+    pub async fn plan_pinned_lanes(
+        &self,
+        tenant_hash: TenantHash,
+        lanes: Vec<(TargetSignal, Snapshot)>,
+        sql: &str,
+        accounting: &QueryAccounting,
+        inputs: PinnedPlanInputs,
+    ) -> Result<PinnedQuery, SqlError> {
+        let lanes = Self::checked_lanes(sql, lanes)?;
+        self.plan_checked_lanes(
+            tenant_hash,
+            lanes,
+            sql,
+            accounting,
+            #[cfg(feature = "flight-sql")]
+            None,
+            inputs,
+        )
+        .await
+    }
+
+    /// [`Self::plan_pinned_with_inputs`] with a coordinator-side distributed
+    /// scan installed on the metrics provider for THIS query only (ADR-0071).
+    ///
+    /// `distributed`, when `Some`, carries the minted worker slices and the
+    /// production [`WorkerSliceClient`](crate::distributed::WorkerSliceClient)
+    /// the provider fans the samples scan out over. `None` is byte-identical to
+    /// [`Self::plan_pinned_with_inputs`]. The distribution decision itself is
+    /// made by the caller ([`Self::plan_distributed_slices_for`]); this method
+    /// only installs an already-made decision, so the local and distributed
+    /// plans share this one construction path and cannot drift.
+    #[cfg(feature = "flight-sql")]
+    pub async fn plan_pinned_distributed(
+        &self,
+        tenant_hash: TenantHash,
+        snapshot: Snapshot,
+        sql: &str,
+        accounting: &QueryAccounting,
+        distributed: Option<DistributedScan>,
+        inputs: PinnedPlanInputs,
+    ) -> Result<PinnedQuery, SqlError> {
+        let lanes = Self::pinned_lane(sql, snapshot)?;
+        self.plan_checked_lanes(tenant_hash, lanes, sql, accounting, distributed, inputs)
+            .await
+    }
+
+    /// [`Self::plan_pinned_lanes`] with [`Self::plan_pinned_distributed`]'s
+    /// optional coordinator-side distributed scan. `DoGet` installs one only
+    /// for a single-lane ticket.
+    #[cfg(feature = "flight-sql")]
+    pub async fn plan_pinned_lanes_distributed(
+        &self,
+        tenant_hash: TenantHash,
+        lanes: Vec<(TargetSignal, Snapshot)>,
+        sql: &str,
+        accounting: &QueryAccounting,
+        distributed: Option<DistributedScan>,
+        inputs: PinnedPlanInputs,
+    ) -> Result<PinnedQuery, SqlError> {
+        let lanes = Self::checked_lanes(sql, lanes)?;
+        self.plan_checked_lanes(tenant_hash, lanes, sql, accounting, distributed, inputs)
+            .await
+    }
+
+    /// The one lane a single pinned `snapshot` plans `sql` over: one snapshot
+    /// pins one signal table, so a statement naming several signal tables is
+    /// [`SqlError::CrossSignalQuery`] here, before anything is read.
+    fn pinned_lane(
+        sql: &str,
+        snapshot: Snapshot,
+    ) -> Result<Vec<(TargetSignal, Snapshot)>, SqlError> {
+        let tables = Statement::Sql(sql).tables()?;
+        refuse_cross_signal(&tables)?;
+        Ok(vec![(tables.first_lane(), snapshot)])
+    }
+
+    /// `lanes` checked against the signal tables `sql` names, before anything
+    /// is read: every signal table's lane, in [`SIGNAL_LANE_ORDER`], for a
+    /// statement naming one or more, so a one-table statement's lane must be
+    /// that table's signal; a statement naming no signal table takes exactly
+    /// one lane, which plans the way [`Self::pinned_lane`] plans it.
+    fn checked_lanes(
+        sql: &str,
+        lanes: Vec<(TargetSignal, Snapshot)>,
+    ) -> Result<Vec<(TargetSignal, Snapshot)>, SqlError> {
+        let tables = Statement::Sql(sql).tables()?;
+        let pinned: Vec<TargetSignal> = lanes.iter().map(|(signal, _)| *signal).collect();
+        if !tables.signals.is_empty() {
+            if pinned != tables.signals {
+                return Err(pinned_signals_mismatch(&pinned, &tables.signals));
+            }
+            return Ok(lanes);
+        }
+        let mut lanes = lanes.into_iter();
+        match (lanes.next(), lanes.next()) {
+            (Some((_, snapshot)), None) => Ok(vec![(tables.first_lane(), snapshot)]),
+            _ => Err(pinned_signals_mismatch(&pinned, &tables.signals)),
+        }
+    }
+
+    /// The shared body of the pinned plan entry points, over lanes already
+    /// checked against the statement. Public two-RPC surface: the caller holds
+    /// a pooled `&QueryAccounting`, so `pooled_over` bridges it to the
+    /// phase-split API `plan_pinned_with` takes without changing where the
+    /// cost lands.
+    ///
+    /// Plans with [`SpillAttempt::PlanTime`]: these entry points, Flight SQL's
+    /// `GetFlightInfo` and `DoGet` among them, decide spill at plan time as
+    /// ADR-0954 does, because they have no spill retry of their own. Giving
+    /// Flight SQL the execute path's retry is follow-up task T6 of issue #3899.
+    async fn plan_checked_lanes(
+        &self,
+        tenant_hash: TenantHash,
+        lanes: Vec<(TargetSignal, Snapshot)>,
+        sql: &str,
+        accounting: &QueryAccounting,
+        #[cfg(feature = "flight-sql")] distributed: Option<DistributedScan>,
+        inputs: PinnedPlanInputs,
+    ) -> Result<PinnedQuery, SqlError> {
+        let (window, now_ns) = lanes_covering_window(&lanes);
+        self.plan_pinned_with(
+            tenant_hash,
+            lanes,
+            Statement::Sql(sql),
+            &StatementAccounting::One(PhaseAccounting::pooled_over(accounting)),
+            PlanExtras {
+                declared: inputs.declared,
+                #[cfg(feature = "flight-sql")]
+                distributed,
+                row_window: None,
+                budgets: inputs.budgets,
+                column_stats_window: window,
+                column_stats_now_ns: now_ns,
+                key_index_now_ns: now_ns,
+                parquet: inputs.parquet,
+                // A deliberate narrowing: Flight SQL does not carry a
+                // principal's capabilities; it authenticates a tenant only.
+                capabilities: SqlCapabilities::default(),
+                lane_parts: LaneParts::default(),
+                // Flight SQL keeps the plan-time spill decision: a DoGet has
+                // no second attempt to spill on, so `SqlExecutor::run`'s spill
+                // retry does not apply here (issue #3899 follow-up T6).
+                spill: SpillAttempt::PlanTime,
+                spill_share: None,
+                retry_figures: None,
+            },
+        )
+        .await
+    }
+
+    /// The one body behind [`Self::plan_pinned_with_inputs`] and
+    /// [`Self::plan_pinned_distributed`]. `extras` carries the optional
+    /// coordinator-side distributed scan; with the `flight-sql` feature off it
+    /// is a zero-field struct and the metrics provider is always the local one.
+    ///
+    /// `statement` is lowered once for the classification session, when one
+    /// is built, and once for every session that executes, the spill
+    /// fallback's rebuild included.
+    ///
+    /// `lanes` carries one snapshot per signal table the statement names, in
+    /// [`SIGNAL_LANE_ORDER`]; each table's provider reads only its own lane's
+    /// snapshot, and every provider shares the statement's one memory pool. A
+    /// Parquet statement reads none of them.
+    async fn plan_pinned_with(
+        &self,
+        tenant_hash: TenantHash,
+        lanes: Vec<(TargetSignal, Snapshot)>,
+        statement: Statement<'_>,
+        phase_accounting: &StatementAccounting,
+        extras: PlanExtras,
+    ) -> Result<PinnedQuery, SqlError> {
+        // Every read of the executor's configuration below goes through this
+        // one binding, so a request's lowered budgets reach the memory pool,
+        // the metrics provider's scan limits, and the session together. `None`
+        // borrows the executor's own config and clones nothing.
+        let effective = self.effective_config(extras.budgets.as_ref());
+        let config: &SqlConfig = &effective;
+        let principal = self.session_principal(tenant_hash, extras.capabilities);
+        // Issue #3899: every spill read below goes through this binding. A
+        // first attempt plans as if no spill were configured, so its
+        // classification, tie-order edit, column-stats input, scratch and
+        // session are the ones a deployment without spill gets.
+        let spill_config = match extras.spill {
+            SpillAttempt::First => None,
+            SpillAttempt::PlanTime | SpillAttempt::Retry => config.spill.as_ref(),
+        };
+        // A spill retry plans only with the share `run` reserved for it
+        // before it started (ADR-0954, refusal-retry amendment item 4).
+        let mut retry_share = match (extras.spill, extras.spill_share) {
+            (SpillAttempt::Retry, Some(share)) => Some(share),
+            (SpillAttempt::Retry, None) => {
+                return Err(SqlError::Internal(
+                    "a spill retry reached planning without a reserved spill share".to_string(),
+                ));
+            }
+            (SpillAttempt::PlanTime | SpillAttempt::First, _) => None,
+        };
+        // ADR-0094 decision 1/2: classify the query's aggregates and GROUP BY
+        // keys before the real session is built, right here at the one call site
+        // that funnels into `build_session`. The result flips
+        // `repartition_aggregations` on only for a query proven exact-typed.
+        // Skipped entirely when the process-wide flag is off (decision 2): an
+        // unclassified query already gets `false`, so the extra plan+analyze
+        // pass costs nothing when the feature is disabled. Classified against
+        // `extras.declared` (the same declared columns the real logs provider
+        // installs), before it is moved into the table below.
+        //
+        // ONE analyzed plan serves both consumers below. Each of them used to
+        // build its own throwaway session and analyze the same SQL, so a logs
+        // query with declared columns planned three times before executing
+        // once. The build happens only when a consumer will read it.
+        //
+        // ADR-2040: a statement over Parquet tables resolves them here unless
+        // its request's resolve already did, or a Flight ticket pinned their
+        // manifest versions, and builds each table's provider before
+        // classification, which plans against their schemas.
+        let tables = statement.tables()?;
+        let parquet = match extras.parquet {
+            ParquetPlan::Resolved(resolution) => resolution,
+            ParquetPlan::Pinned(pins) => {
+                self.resolve_pinned_parquet(
+                    tenant_hash,
+                    statement,
+                    &pins,
+                    phase_accounting.parquet(),
+                )
+                .await?
+            }
+            ParquetPlan::Unresolved => {
+                self.resolve_parquet_target(
+                    tenant_hash,
+                    statement,
+                    &tables,
+                    extras.row_window.is_some(),
+                    phase_accounting.parquet(),
+                )
+                .await?
+            }
+        };
+        // A statement that names no signal table reads no lane, whatever lane
+        // its caller carried: the HTTP resolve hands an empty Parquet lane and
+        // a Flight ticket an empty `samples` one. A statement that names a
+        // signal table beside its Parquet tables reads both (ADR-2904
+        // decision 11).
+        let reads_lanes = parquet.is_none() || !tables.signals.is_empty();
+        let target = if reads_lanes {
+            lanes
+                .first()
+                .map_or(TargetSignal::Metrics, |(signal, _)| *signal)
+        } else {
+            TargetSignal::Parquet
+        };
+        let several_tables = reads_several_tables(lanes.len(), parquet.is_some() && reads_lanes);
+        let parquet_tables = match (parquet, &self.parquet) {
+            (Some(resolution), Some(sources)) => {
+                // One ledger per query, shared by every reader it opens, over
+                // the executor's process memory budget and the effective
+                // config's byte and request limits, which already carry a
+                // request's clamped budgets. Beside a signal table the reads
+                // are budgeted against the statement total, which the signal
+                // scans also charge; alone, the Parquet handle is that total.
+                let mut limits = ReadLimits::new(
+                    Arc::clone(&self.process_memory_budget),
+                    config.engine.max_bytes_scanned,
+                    config.engine.max_s3_requests,
+                );
+                if reads_lanes {
+                    let statement_total = phase_accounting.clone();
+                    limits = limits
+                        .with_budget_view(Arc::new(move || statement_total.pooled_snapshot()));
+                }
+                let tables = parquet::build_tables(
+                    sources,
+                    tenant_hash,
+                    &resolution,
+                    phase_accounting.parquet(),
+                    &limits,
+                    false,
+                )
+                .await?;
+                Some((resolution, tables))
+            }
+            (Some(_), None) => {
+                return Err(SqlError::Internal(
+                    "a Parquet resolution reached an executor without Parquet sources".to_string(),
+                ));
+            }
+            (None, _) => None,
+        };
+        let parquet_schemas = parquet_tables
+            .as_ref()
+            .map(|(_, tables)| parquet::schemas(tables));
+        let wants_stats_gate = reads_lanes
+            && lanes
+                .iter()
+                .any(|(signal, _)| matches!(signal, TargetSignal::Logs))
+            && !extras.declared.is_empty();
+        // ADR-0954: the spill eligibility predicate reads the same analyzed
+        // plan, so a configured-spill deployment is a third consumer of it
+        // rather than a second analyze pass.
+        let wants_spill_gate = spill_config.is_some();
+        let analyzed = if config.parallel_final_aggregation || wants_stats_gate || wants_spill_gate
+        {
+            self.analyzed_classification_plan(
+                tenant_hash,
+                statement,
+                &tables,
+                &extras.declared,
+                parquet_schemas.as_deref(),
+                &principal,
+            )
+            .await?
+        } else {
+            None
+        };
+        // ADR-0954 (issue #2416): make a `Sort` over a spill-exact aggregate
+        // spill-eligible before the scratch/decision below reads the plan, by
+        // proving its sort key total -- append the aggregate's own GROUP BY
+        // expressions as trailing tiebreak terms where they are not already
+        // present. Gated on `plan_is_spill_eligible_ignoring_sort_order` so a
+        // plan disqualified for a reason no rewrite can fix (a `Join`, a
+        // float GROUP BY key, a non-exact aggregate) is left untouched.
+        // Reassigning `analyzed` here is transparent to every other reader
+        // below (`exact_typed_aggregates`'s `plan_is_exact_typed` finds the
+        // same aggregates and distincts either way; rewriting a `Sort` node
+        // changes no `Aggregate` or `Distinct` node).
+        let analyzed = match analyzed {
+            Some(plan) if wants_spill_gate => {
+                Some(spill_tie_ordered(plan, config.bounded_topk_max_limit))
+            }
+            other => other,
+        };
+        // Issue #3899: a first attempt with spill configured keeps what the
+        // spill retry needs to classify the statement, read only if this
+        // attempt is refused. `analyzed` itself stays the unedited plan.
+        let spill_probe =
+            (extras.spill == SpillAttempt::First && config.spill.is_some()).then(|| SpillProbe {
+                analyzed: analyzed.clone(),
+                parquet_schemas: parquet_schemas.clone(),
+                principal: principal.clone(),
+                bounded_topk_max_limit: config.bounded_topk_max_limit,
+            });
+        // ADR-0954: spill needs BOTH an operator-configured scratch area and a
+        // plan whose every aggregate is exact under a changed folding order.
+        // Fail closed the same way: an unbuildable plan is not eligible, so it
+        // gets the disabled disk manager and today's typed refusal.
+        //
+        // The scratch directory is created here, before planning, so a missing
+        // or unwritable spill area is a typed `SpillUnavailable` raised with
+        // nothing written and no operator started, rather than an opaque IO
+        // failure from inside a spilling operator half way through a query.
+        //
+        // ADR-0954 requirement 2 (issue #2416): the query's scratch cap is
+        // reserved from the process-wide ceiling first, and a query that
+        // cannot reserve the minimum runs with spill disabled. Every spilling
+        // statement holds one share of that ceiling (issue #3899): a retry the
+        // share `run` reserved before it started, a plan-time statement one
+        // reserved here by the same rule, so up to `MAX_SPILL_SHARES`
+        // statements, retried or plan-time, hold spill at once.
+        let scratch = match (spill_config, &self.spill_budget) {
+            (Some(spill), Some(budget))
+                if analyzed.as_ref().is_some_and(plan_is_spill_eligible) =>
+            {
+                let reserved = match extras.spill {
+                    SpillAttempt::Retry => retry_share.take(),
+                    SpillAttempt::PlanTime | SpillAttempt::First => budget.reserve_share(),
+                };
+                match reserved {
+                    Some(reservation) => {
+                        let cap = reservation.bytes();
+                        Some((SpillScratch::create(spill)?.holding(reservation), cap))
+                    }
+                    None => {
+                        tracing::warn!(
+                            "SQL spill disabled for this statement: less than the minimum \
+                             reservation remains of the process spill ceiling"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        // Fail CLOSED, unchanged: an unbuildable plan is not exact-typed.
+        //
+        // A sort-merge spill retry is planned repartition-free whatever this
+        // says: `session_config` forces `repartition_aggregations` off (and
+        // round-robin repartitioning with it) for a `SpillDecision::Enabled`
+        // session, because the eligibility predicate above classified LOGICAL
+        // nodes while an enabled disk manager grants spill to every operator in
+        // the PHYSICAL plan, `RepartitionExec` included. The bucketed retry
+        // keeps the first attempt's exchange, admitted by the consumer table
+        // of `crate::bucket_spill_tuning::spill_consumers`, which lists the
+        // exchange. The classification is still computed here so the two
+        // decisions stay independent and the override lives in exactly one
+        // place (`crate::session::repartition_free`).
+        let exact_typed_aggregates =
+            config.parallel_final_aggregation && analyzed.as_ref().is_some_and(plan_is_exact_typed);
+        // Build one table per signal lane over the snapshot resolved for that
+        // signal. `resolve` resolved each lane's snapshot against exactly its
+        // signal, so every provider and its snapshot agree.
+        #[cfg(feature = "flight-sql")]
+        let mut distributed = extras.distributed;
+        #[cfg(feature = "flight-sql")]
+        if distributed.is_some() && lanes.len() > 1 {
+            return Err(SqlError::Internal(
+                "a distributed samples scan reached a statement over several signal tables"
+                    .to_string(),
+            ));
+        }
+        let LaneParts {
+            spans: mut span_parts,
+            logs: mut log_parts,
+        } = extras.lane_parts;
+        let mut session_tables = Vec::with_capacity(lanes.len());
+        if let Some((resolution, tables)) = parquet_tables {
+            // ADR-2040 D6: an exact-typed statement scans in up to
+            // `target_partitions` file groups; every other one scans one group
+            // in manifest file order, so its aggregates fold in a fixed order.
+            let tables = if exact_typed_aggregates {
+                tables
+                    .into_iter()
+                    .map(|(name, provider)| {
+                        provider
+                            .with_parallel(true)
+                            .map(|provider| (name, provider))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(ParquetQueryError::from)?
+            } else {
+                tables
+            };
+            session_tables.push(SessionTable::Parquet(parquet::session_tables(
+                tenant_hash,
+                &resolution,
+                tables,
+            )));
+        }
+        // A statement naming only Parquet tables built them above and reads
+        // no lane.
+        if reads_lanes {
+            for (signal, snapshot) in lanes {
+                let table = match signal {
+                    TargetSignal::Metrics => {
+                        #[cfg_attr(not(feature = "flight-sql"), allow(unused_mut))]
+                        let mut provider = RavelTableProvider::new(
+                            snapshot,
+                            tenant_hash,
+                            self.fetcher.clone(),
+                            config.clone(),
+                            phase_accounting.lane(signal).clone(),
+                        )
+                        .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine));
+                        // Install the distributed samples scan for this query only,
+                        // when the coordinator decided to fan out. `None`/feature-off
+                        // leaves the provider byte-identical to the local path.
+                        #[cfg(feature = "flight-sql")]
+                        if let Some((endpoints, client)) = distributed.take() {
+                            provider = provider.with_distributed_scan(endpoints, client);
+                        }
+                        SessionTable::Metrics(Arc::new(provider))
+                    }
+                    // The declared typed attribute columns (ADR-0090) resolved once per
+                    // plan are installed on the logs provider here; they widen the
+                    // table's schema and are consumed only by this provider. Every
+                    // other table leaves `extras.declared` unused.
+                    TargetSignal::Logs => {
+                        // ADR-0850: resolved once per plan from the current folded
+                        // catalog HEAD, independently of `snapshot` (a different
+                        // object, not versioned against the pinned snapshot). `None`
+                        // -- nothing folded yet, no configured typed columns, or the
+                        // last fold's build/PUT failed -- reproduces the
+                        // pre-ADR-0850 provider exactly; every metadata-only path
+                        // keyed off it degrades to scanning on a `None`.
+                        let column_stats = if extras.declared.is_empty() {
+                            // No configured typed columns: no metadata-only column path
+                            // can ever apply, so skip the HEAD GET load_column_stats
+                            // would issue. This keeps a predicate-free COUNT(*) on a
+                            // tenant with no declared columns reading zero objects, and
+                            // reproduces the pre-ADR-0850 provider exactly.
+                            None
+                        } else if let Some(request) = self.logs_column_stats_eligible(
+                            &snapshot,
+                            analyzed.as_ref(),
+                            &extras.declared,
+                            several_tables,
+                        ) {
+                            self.catalog
+                                .load_column_stats(
+                                    &tenant_hash,
+                                    Signal::Logs,
+                                    extras.column_stats_window,
+                                    extras.column_stats_now_ns,
+                                    &request,
+                                    phase_accounting.lane(signal).plan(),
+                                )
+                                .await?
+                        } else {
+                            // Issue #888: no metadata-only column path can fire for this
+                            // plan (decided from the plan and the resolved snapshot
+                            // alone, ahead of the load), so skip the two GETs
+                            // load_column_stats would issue. A `None` here reproduces
+                            // the pre-ADR-0850 provider exactly, the same as an absent
+                            // stats object would, so every failing-open behavior is
+                            // preserved.
+                            None
+                        };
+                        // Resolved per plan, not pinned: it only decides which
+                        // equalities reach the KEY_IDX probe, which narrows the
+                        // blocks read and never the rows returned.
+                        let key_index = self
+                            .declared_source
+                            .key_index(tenant_hash, extras.key_index_now_ns)
+                            .await;
+                        let provider = LogsTableProvider::new(
+                            snapshot,
+                            tenant_hash,
+                            self.log_fetcher.clone(),
+                            phase_accounting.lane(signal).clone(),
+                        )
+                        .with_declared_columns(extras.declared.clone())
+                        .with_key_index(key_index)
+                        .with_column_stats(column_stats)
+                        .with_segment_timing(config.segment_timing)
+                        .with_scan_executions(Arc::clone(&self.scan_executions))
+                        .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine));
+                        let provider = match log_parts.take() {
+                            Some(parts) => provider
+                                .with_key_index_route(Arc::clone(&self.catalog), parts)
+                                .with_key_index_max_probed_parts(self.key_index_max_probed_parts),
+                            None => provider,
+                        };
+                        SessionTable::Logs(Arc::new(provider))
+                    }
+                    // The alerts and audit providers are not yet threaded onto the
+                    // per-phase seam (issue #1367 scoped its phase split to the
+                    // `samples`/`logs` tables): each still takes one pooled
+                    // `QueryAccounting`, fed here by extracting the Scan-phase handle,
+                    // matching where every other pooled reader in this crate now
+                    // lands (`RowFetchSource`, `distributed_samples_plan`). Every
+                    // alert or audit GET is still recorded, just not split by phase.
+                    //
+                    // The spans provider takes the per-phase handles (issue #2754): a
+                    // trace lookup's footer and section reads land on the plan phase
+                    // and its block runs on the scan phase; a whole-object span read
+                    // lands on the scan phase. Every fetch is tenant-checked (fails
+                    // closed on a footer tenant_hash mismatch).
+                    //
+                    // With the lane's parts, a `trace_id` lookup routes through
+                    // the parts' key-index leaves first (ADR-3692 decision 3).
+                    TargetSignal::Spans => {
+                        let provider = SpansTableProvider::new(
+                            snapshot,
+                            tenant_hash,
+                            self.span_fetcher.clone(),
+                            phase_accounting.lane(signal).scan().clone(),
+                        )
+                        .with_phase_accounting(phase_accounting.lane(signal).clone())
+                        .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine));
+                        let provider = match span_parts.take() {
+                            Some(parts) => provider
+                                .with_key_index_route(Arc::clone(&self.catalog), parts)
+                                .with_key_index_max_probed_parts(self.key_index_max_probed_parts),
+                            None => provider,
+                        };
+                        SessionTable::Spans(Arc::new(provider))
+                    }
+                    // The two RLOG-backed tables (ADR-1101 decision 1) read through the
+                    // executor's existing `log_fetcher`: an alert and an audit record
+                    // ride RLOG v1 verbatim, so they share the `logs` table's accounted,
+                    // tenant-checked fetch funnel and its caches. No declared columns
+                    // and no column statistics apply to either.
+                    TargetSignal::Alerts => SessionTable::Alerts(Arc::new(
+                        AlertsTableProvider::new(
+                            snapshot,
+                            tenant_hash,
+                            self.log_fetcher.clone(),
+                            phase_accounting.lane(signal).scan().clone(),
+                        )
+                        .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine)),
+                    )),
+                    TargetSignal::Audit => SessionTable::Audit(Arc::new(
+                        AuditTableProvider::new(
+                            snapshot,
+                            tenant_hash,
+                            self.log_fetcher.clone(),
+                            phase_accounting.lane(signal).scan().clone(),
+                        )
+                        .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine)),
+                    )),
+                    // A lane read beside Parquet tables is a signal table.
+                    TargetSignal::Parquet => {
+                        return Err(SqlError::Internal(
+                            "a Parquet lane reached a statement that reads signal lanes"
+                                .to_string(),
+                        ));
+                    }
+                };
+                session_tables.push(table);
+            }
+        }
+
+        let decision = match &scratch {
+            Some((scratch, max_bytes)) => SpillDecision::Enabled {
+                dir: scratch.dir(),
+                max_bytes: *max_bytes,
+            },
+            None => SpillDecision::Disabled,
+        };
+        // Kept only while spill is enabled, to rebuild the session without it
+        // if the executed plan fails the re-check below.
+        let spill_enabled = matches!(decision, SpillDecision::Enabled { .. });
+        let fallback_tables = spill_enabled.then(|| {
+            session_tables
+                .iter()
+                .map(clone_session_table)
+                .collect::<Vec<_>>()
+        });
+        // The bucket retry's candidate session registers the same tables.
+        let bucket_tables = (spill_enabled && extras.spill == SpillAttempt::Retry).then(|| {
+            session_tables
+                .iter()
+                .map(clone_session_table)
+                .collect::<Vec<_>>()
+        });
+        // The memory pool's peak-reservation report is execution-time
+        // aggregate/sort spend, not a store request, so it has no Resolve/
+        // Plan/Probe phase home; it is charged to Scan, matching where the
+        // partitions that grow it run. The pool serves every table, so it is
+        // the statement's charge and no lane's.
+        let (mut pool, mut breach) = attempt_pool(
+            config,
+            extras.spill,
+            decision,
+            self.tenant_budget(tenant_hash),
+            phase_accounting.statement().scan().clone(),
+            self.envelope_parallelism,
+        );
+        let providers = session_tables
+            .iter()
+            .flat_map(session_table_providers)
+            .collect();
+        let mut ctx = build_session_with_tables(
+            config,
+            Arc::clone(&pool),
+            session_tables,
+            exact_typed_aggregates,
+            decision,
+            &principal,
+        )
+        .map_err(plan_error)?;
+        // ADR-0954 (issue #2416): the tiebreak rewrite applied to `analyzed`
+        // above, now applied to the plan this session executes, whatever the
+        // spill decision. Gated on the Sort's shape, group key types and
+        // aggregate function names (`plan_has_tie_order_edit`), not on
+        // argument types or spill eligibility: this plan has not been through the
+        // analyzer, whose type coercion the eligibility predicate depends on,
+        // so a statement whose executed plan the re-check below finds
+        // eligible also gets its total order here. The statement therefore
+        // returns the same rows with spill on, off or disabled.
+        let mut plan = self
+            .executed_plan(
+                statement,
+                &tables,
+                &ctx,
+                providers,
+                config.bounded_topk_max_limit,
+            )
+            .await?;
+        refuse_unrepeated_exact_typed(statement, exact_typed_aggregates, &ctx, &plan)?;
+        // The spill decision was taken on `analyzed`, a separate parse. Fail
+        // closed if the plan that actually runs is not eligible after the
+        // rewrite: rebuild the session with the disk manager disabled and drop
+        // the scratch directory, so no Sort without a total key ever runs
+        // with spill. SQL keeps the plan it already built. A lowered statement
+        // is lowered again against the rebuilt session and admitted against
+        // it, so its plan binds that session's tables and functions.
+        let mut scratch = scratch;
+        if let Some(fallback_tables) = fallback_tables
+            && !executed_plan_is_spill_eligible(&ctx.state(), &plan)
+        {
+            tracing::warn!(
+                "SQL spill disabled for this statement: the plan it executes is not \
+                 spill-eligible, although its classification plan was"
+            );
+            let providers = fallback_tables
+                .iter()
+                .flat_map(session_table_providers)
+                .collect();
+            // A spill-mode pool refuses a spillable consumer early so it
+            // spills; without a disk manager that refusal would fail it.
+            // Nothing has run against the pool yet, so it is replaced whole.
+            (pool, breach) = attempt_pool(
+                config,
+                extras.spill,
+                SpillDecision::Disabled,
+                self.tenant_budget(tenant_hash),
+                phase_accounting.statement().scan().clone(),
+                self.envelope_parallelism,
+            );
+            ctx = build_session_with_tables(
+                config,
+                Arc::clone(&pool),
+                fallback_tables,
+                exact_typed_aggregates,
+                SpillDecision::Disabled,
+                &principal,
+            )
+            .map_err(plan_error)?;
+            if statement.sql().is_none() {
+                plan = self
+                    .executed_plan(
+                        statement,
+                        &tables,
+                        &ctx,
+                        providers,
+                        config.bounded_topk_max_limit,
+                    )
+                    .await?;
+                refuse_unrepeated_exact_typed(statement, exact_typed_aggregates, &ctx, &plan)?;
+            }
+            scratch = None;
+            #[cfg(test)]
+            self.spill_fallbacks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let mut frame = DataFrame::new(ctx.state(), plan);
+        // The row window (ADR-1374 decision 3, prerequisite 2), inserted into
+        // the plan `ctx.sql` just produced -- before any optimizer pass, and
+        // before the schema is read, so the reported schema is the one the
+        // statement asked for either way (a `Filter` preserves its input's
+        // schema).
+        let window_predicate = match extras.row_window {
+            Some(window) => {
+                // A statement naming only Parquet tables with a row window was
+                // refused at resolve (`resolve_parquet_target`); this is the
+                // type's fallback. Beside a signal table the window filters
+                // the signal scans only (`apply_row_window`).
+                if !reads_lanes || window_ts_column(target).is_none() {
+                    return Err(ParquetQueryError::RowWindowUnsupported.into());
+                }
+                let (plan, predicate) = apply_row_window(frame.logical_plan().clone(), window)?;
+                frame = DataFrame::new(ctx.state(), plan);
+                predicate
+            }
+            None => None,
+        };
+        let schema = frame.schema().inner().clone();
+        let spill_share = scratch.as_ref().map(|(_, cap)| *cap);
+        // ADR-0954, parallel bucket spill item 1: a spill retry plans the hash
+        // exchange and a bucketed final aggregate when its shape admits one
+        // and the derivation tunes it, and keeps the repartition-free plan
+        // above otherwise. The candidate's placeholder plan never executes.
+        let mut physical = None;
+        let mut retry_derivation = None;
+        let retry_plan = match (extras.spill, bucket_tables, &scratch) {
+            (SpillAttempt::Retry, Some(tables), Some((retry_scratch, cap))) => {
+                let decision = SpillDecision::Enabled {
+                    dir: retry_scratch.dir(),
+                    max_bytes: *cap,
+                };
+                let first = extras.retry_figures;
+                let effective_limit = retry_effective_limit(
+                    config.max_query_bytes,
+                    first.and_then(|first| first.first),
+                    first.and_then(|first| first.share),
+                );
+                let figures = BucketRetryFigures {
+                    asked_bytes: first.map_or(0, |first| first.asked_bytes),
+                    consumed_rows: first.and_then(|first| first.consumed_rows),
+                    query_limit: effective_limit,
+                    nofile_soft: self.nofile_soft,
+                    slots: spill_slots(spill_config.map_or(0, |spill| spill.max_bytes)),
+                };
+                // The bucket candidate's pool runs at the limit its tuning was
+                // derived at, so the spill-mode cap, fair share and hard bound
+                // it enforces are the ones the derivation sized for. The
+                // sort-merge retry keeps the pool at `L` built above.
+                let bucket_config = SqlConfig {
+                    max_query_bytes: effective_limit,
+                    ..config.clone()
+                };
+                let (bucket_pool, bucket_breach) = attempt_pool(
+                    &bucket_config,
+                    extras.spill,
+                    decision,
+                    self.tenant_budget(tenant_hash),
+                    phase_accounting.statement().scan().clone(),
+                    self.envelope_parallelism,
+                );
+                let (planned, shape) = bucket_retry_plan(
+                    &bucket_config,
+                    &bucket_pool,
+                    tables,
+                    exact_typed_aggregates,
+                    decision,
+                    &principal,
+                    frame.logical_plan(),
+                    figures,
+                )
+                .await;
+                retry_derivation = Some(RetryDerivation {
+                    effective_limit,
+                    shape,
+                });
+                match planned {
+                    Ok((candidate, plan, tuning)) => {
+                        frame = DataFrame::new(candidate.state(), frame.logical_plan().clone());
+                        ctx = candidate;
+                        breach = bucket_breach;
+                        physical = Some(plan);
+                        Some(RetryPlan::Bucket(tuning))
+                    }
+                    Err(reason) => Some(RetryPlan::SortMerge(reason)),
+                }
+            }
+            (SpillAttempt::Retry, ..) => Some(RetryPlan::SortMerge(RETRY_SPILL_DISABLED)),
+            (SpillAttempt::PlanTime | SpillAttempt::First, ..) => None,
+        };
+        Ok(PinnedQuery {
+            ctx,
+            frame,
+            schema,
+            breach,
+            scratch: scratch.map(|(scratch, _)| scratch),
+            row_cap: None,
+            window_predicate,
+            spill_probe,
+            spill_share,
+            physical,
+            retry_plan,
+            retry_derivation,
+        })
+    }
+
+    /// Lower `statement` against the executing session `ctx` and apply the
+    /// edits every executed plan gets, ahead of the spill re-check.
+    ///
+    /// `providers` are the providers `ctx` was built over
+    /// ([`session_table_providers`]), and `bounded_topk_max_limit` the
+    /// [`SqlConfig::bounded_topk_max_limit`] it was built with.
+    async fn executed_plan(
+        &self,
+        statement: Statement<'_>,
+        tables: &StatementTables,
+        ctx: &SessionContext,
+        providers: Vec<(String, Arc<dyn TableProvider>)>,
+        bounded_topk_max_limit: Option<usize>,
+    ) -> Result<LogicalPlan, SqlError> {
+        #[cfg(test)]
+        self.executed_plan_builds
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut plan = match statement
+            .lower(ctx, providers, tables, LoweringSite::Executed)
+            .await
+        {
+            Ok(plan) => plan,
+            Err(LowerError::Plan(err)) => return Err(plan_error(err)),
+            Err(LowerError::NotAdmitted(err)) => return Err(err),
+        };
+        // Before any optimizer rule runs: `replace_distinct_aggregate` adds the
+        // rewrite-only `first_value` calls this check refuses in the caller's
+        // own statement.
+        refuse_unadmitted_planned_shapes(&plan)?;
+        if plan_has_tie_order_edit(&plan, bounded_topk_max_limit) {
+            plan = tie_ordered_or_unchanged(plan, bounded_topk_max_limit);
+        }
+        #[cfg(test)]
+        if let Some(tamper) = self.executed_plan_tamper {
+            plan = tamper(plan);
+        }
+        Ok(plan)
+    }
+
+    /// Decide whether THIS pinned statement should distribute its samples scan,
+    /// and if so mint the per-worker slice tickets (ADR-0071).
+    ///
+    /// Returns `Some(slices)` only for a metrics-target query whose pinned
+    /// snapshot clears the cost gate, advertises more than one worker slice, and
+    /// has workers to serve them (see
+    /// [`plan_distributed_slices`](crate::distributed::plan_distributed_slices)).
+    /// Logs have no distributed path, so a logs-target query is always `None`,
+    /// and so is a statement naming more than one table of any kind: the
+    /// distributed scan replaces one `samples` scan over one pinned snapshot.
+    ///
+    /// The gate re-derives the cost estimate from the ticket-pinned snapshot
+    /// with `catalog_requests = 0`. [`should_distribute`] reads only the
+    /// snapshot-derived store-bytes and segment terms of the estimate, never the
+    /// catalog term, so this recomputed estimate makes the identical
+    /// distribute/local decision `get_flight_info` made when it minted the
+    /// ticket -- the coordinator does not re-run `Catalog::resolve` at `DoGet`.
+    #[cfg(feature = "flight-sql")]
+    pub fn plan_distributed_slices_for(
+        &self,
+        snapshot: &Snapshot,
+        sql: &str,
+        config: &crate::distributed::DistributedFlightConfig,
+        template: &crate::flight_ticket::FlightTicket,
+    ) -> Option<Vec<crate::distributed::WorkerSlice>> {
+        let tables = Self::statement_tables(sql).ok()?;
+        if tables.names_several_tables()
+            || !matches!(tables.first_lane(), TargetSignal::Metrics)
+            || !tables.others.is_empty()
+        {
+            return None;
+        }
+        let estimate = estimate_metrics_cost(snapshot, 0);
+        crate::distributed::plan_distributed_slices(snapshot, &estimate, config, template)
+    }
+
+    /// Execute the worker-side scan fragment for one distributed slice
+    /// (ADR-0071), returning its internal-schema, `(series_id, ts)`-sorted
+    /// stream.
+    ///
+    /// This is the worker half of the SQL distributed lane: a coordinator's
+    /// `do_get` receives a slice ticket (`slice_count > 1`) and serves this
+    /// fragment over the pinned slice rather than planning the statement. There
+    /// is deliberately NO SQL text, no aggregation, and no dedup here
+    /// ([`RavelTableProvider::worker_fragment`]): the provenance columns are
+    /// retained and the authoritative cross-slice dedup stays at the coordinator
+    /// (crate::distributed). The result reuses [`PinnedStream`] so the same
+    /// memory ceiling and drop-cancellation apply as on the local path.
+    ///
+    /// `target_partitions` follows the segment count so the fragment's internal
+    /// merge fans out over the slice's segments exactly as the local scan does;
+    /// the coordinator re-merges and deduplicates above the union of slices.
+    #[cfg(feature = "flight-sql")]
+    pub async fn worker_fragment_stream(
+        &self,
+        tenant_hash: TenantHash,
+        snapshot: Snapshot,
+        accounting: &QueryAccounting,
+    ) -> Result<PinnedStream, SqlError> {
+        let (pool, breach) = self.config.query_pool_at(
+            self.tenant_budget(tenant_hash),
+            accounting.clone(),
+            self.config.envelope_width(self.envelope_parallelism),
+        );
+        let segments = snapshot.segments.clone();
+        let target_partitions = segments.len().max(1);
+        // Worker fragments keep the pre-#1367 pooled `&QueryAccounting` API
+        // (no `SqlOutcome` and thus no phase/I/O-shape breakdown crosses the
+        // Flight wire for a worker slice): `pooled_over` bridges it to the
+        // phase-split constructor the same way the Flight resolve does.
+        let provider = Arc::new(RavelTableProvider::new(
+            snapshot,
+            tenant_hash,
+            self.fetcher.clone(),
+            self.config.clone(),
+            PhaseAccounting::pooled_over(accounting),
+        ));
+        let plan = provider
+            .worker_fragment(target_partitions, &segments)
+            .map_err(plan_error)?;
+        // ADR-0094 decision 2: the worker fragment plans no new SQL and runs no
+        // aggregation of its own, so it never repartitions -- always `false`,
+        // never through the classification check.
+        // The worker fragment plans no SQL and runs no aggregation, so it never
+        // spills: the disk manager stays disabled regardless of the deployment's
+        // spill configuration.
+        let ctx = crate::session::build_session(
+            &self.config,
+            pool,
+            SessionTable::Metrics(Arc::clone(&provider)),
+            false,
+            SpillDecision::Disabled,
+            // It plans no SQL, so no principal capability applies.
+            &SessionPrincipal::without_capabilities(tenant_hash),
+        )
+        .map_err(plan_error)?;
+        let schema = plan.schema();
+        PinnedStream::start(ctx, plan, schema, breach)
+    }
+
+    /// One `Catalog::resolve` per signal table the query's `FROM` clause
+    /// names ([`Self::statement_tables`]), plus the `max_segments` check on
+    /// their summed sealed segments, so a metrics-only query never lists the
+    /// logs keyspace and vice versa.
+    ///
+    /// Also computes the two-part cost estimate (ADR-0044 "3.", amended), per
+    /// signal and summed: the catalog term from `shard_count` and the window's
+    /// hour-bucket count, computed *before* that signal's resolve runs
+    /// (resolve itself is not free, and an estimate computed only after
+    /// resolve structurally cannot bound resolve's own spend), and the segment
+    /// term from the resolved snapshot's `SegmentRef`s, computed after.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        statement: Statement<'_>,
+        req: &SqlRequest,
+        clocks: Clocks,
+        tokens: &LaneTokens,
+        phase_accounting: &StatementAccounting,
+    ) -> Result<Resolved, SqlError> {
+        self.resolve_admitted(
+            tenant_hash,
+            capabilities,
+            statement,
+            req,
+            clocks,
+            tokens,
+            phase_accounting,
+        )
+        .await
+    }
+
+    /// This executor's configuration with `budgets` applied (ADR-1374
+    /// decision 3). A caller's budgets can only lower the configured ceilings,
+    /// so the result is never more permissive than `self.config`.
+    ///
+    /// `None` borrows: the overwhelmingly common request carries no budgets
+    /// and must not pay a config clone for the feature's existence.
+    fn effective_config(&self, budgets: Option<&RequestBudgets>) -> Cow<'_, SqlConfig> {
+        match budgets {
+            None => Cow::Borrowed(&self.config),
+            Some(budgets) => {
+                let mut config = self.config.clone();
+                config.engine = budgets.clamp(&config.engine).applied_to(&config.engine);
+                Cow::Owned(config)
+            }
+        }
+    }
+
+    /// [`Self::resolve`] keeping the [`SegmentAdmission`] counts, for
+    /// [`Self::explain`], which reports them.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_admitted(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        statement: Statement<'_>,
+        req: &SqlRequest,
+        clocks: Clocks,
+        tokens: &LaneTokens,
+        phase_accounting: &StatementAccounting,
+    ) -> Result<Resolved, SqlError> {
+        // Idle-tenant eviction last-touch (ADR-0069 decision 2): stamp this
+        // tenant's activity with the caller's clock before resolving, not the
+        // resolve instant, which a later page sets earlier than the call.
+        // This is the one funnel both the HTTP (`execute`/`run`) and Flight SQL
+        // (`resolve_snapshot`) paths pass through, so any tenant running a query
+        // is kept out of the idle sweep.
+        self.touch_tenant(tenant_hash, clocks.caller_now_ns);
+        let engine_config = self.effective_config(req.budgets.as_ref()).engine;
+        let tables = statement.tables()?;
+        // ADR-2040: the Parquet tables a statement names resolve their
+        // manifests first, so a statement that also names signal tables
+        // (ADR-2904 decision 11) has those reads in its resolve total before
+        // any lane's budget check below. A Parquet table has no segments, so
+        // there is nothing to admit against `max_segments`.
+        let parquet = self
+            .resolve_parquet_target(
+                tenant_hash,
+                statement,
+                &tables,
+                req.row_window,
+                phase_accounting.parquet(),
+            )
+            .await?;
+        let mut estimate = CostEstimate::new(0, 0, 0, 0, 0);
+        if let Some(resolution) = &parquet {
+            // The request budget is checked here, as it is for a signal
+            // statement, on what the query is already known to cost: the
+            // manifest and grant reads this resolve made, plus one GET for
+            // each file it will open. Every read past that is admitted against
+            // the same budget as it is issued.
+            estimate = parquet::estimate_cost(
+                resolution,
+                phase_accounting.resolve_snapshot().total_s3_requests(),
+            );
+            if let Some(QueryError::RequestBudgetExceeded {
+                requests,
+                max,
+                fold_lag,
+            }) =
+                request_budget_exceeded(estimate.estimated_requests, engine_config.max_s3_requests)
+            {
+                return Err(SqlError::RequestBudgetExceeded {
+                    requests,
+                    max,
+                    fold_lag,
+                    table: None,
+                });
+            }
+            // A statement that names no signal table resolves no catalog.
+            if tables.signals.is_empty() {
+                return Ok(Resolved {
+                    lanes: vec![ResolvedLane {
+                        signal: TargetSignal::Parquet,
+                        snapshot: Snapshot {
+                            segments: Vec::new(),
+                            segments_pruned: 0,
+                            pending_erasure: Vec::new(),
+                        },
+                        admission: SegmentAdmission {
+                            sealed_count: 0,
+                            exempt_count: 0,
+                        },
+                        parts: None,
+                    }],
+                    estimate,
+                    unfolded_segments_resolved: 0,
+                    target: TargetSignal::Parquet,
+                    parquet,
+                    signal_tables_named: 0,
+                });
+            }
+        }
+        let lanes = tables.lanes();
+        // Past the early return above, a statement with Parquet tables also
+        // names a signal table, so it reads both.
+        let several = reads_several_tables(lanes.len(), parquet.is_some());
+        let target = tables.first_lane();
+        // Postings pruning by the equality `__name__` predicate pushed down
+        // from the query's WHERE clause. Without this the SQL
+        // path called plain `Catalog::resolve`, so the measured 5.9-40.9x
+        // postings pruning was structurally unreachable from SQL even for a
+        // query whose `WHERE label(labels,'__name__') = '...'` names one
+        // metric. Only a metrics query has a `__name__` postings index; a
+        // logs query never prunes by it. Derivation is best-effort: any
+        // planning hiccup yields no filter and the resolve simply does not
+        // prune, exactly as before, and pruning itself already degrades
+        // safely when postings are absent or unusable.
+        // A statement with no SQL text derives no filter and is not pruned.
+        // Only the metrics snapshot has a `__name__` postings index, so only
+        // the `samples` lane is resolved with the filter, and the filter is
+        // derived from the `samples` scans alone. A statement that also names
+        // a Parquet table derives none: a table's schema is known only once
+        // its footers are read at plan time, so the throwaway session cannot
+        // plan it here, and the `samples` lane resolves unpruned.
+        let name_filter = match statement.sql() {
+            Some(sql) if lanes.contains(&TargetSignal::Metrics) => {
+                self.pushed_down_name_filter(tenant_hash, capabilities, sql, &lanes)
+                    .await
+            }
+            _ => None,
+        };
+        // Every lane is admitted against the statement's one `max_segments`,
+        // so each is checked here unbounded and the running sum against the
+        // ceiling below.
+        let lane_admission_config = EngineConfig {
+            max_segments: usize::MAX,
+            ..engine_config
+        };
+        let mut resolved = Vec::with_capacity(lanes.len());
+        let mut unfolded_segments_resolved = 0_u64;
+        let mut sealed_total = 0_u64;
+        // Every lane resolves at the request's one resolve instant and window,
+        // in `SIGNAL_LANE_ORDER`, before anything is planned.
+        for lane in lanes {
+            let signal = lane.signal().ok_or_else(|| {
+                SqlError::Internal("a signal-table resolve reached the Parquet target".to_string())
+            })?;
+            let lane_name_filter = match lane {
+                TargetSignal::Metrics => name_filter.as_deref(),
+                TargetSignal::Logs
+                | TargetSignal::Spans
+                | TargetSignal::Alerts
+                | TargetSignal::Audit
+                | TargetSignal::Parquet => None,
+            };
+            let catalog_requests = self
+                .catalog
+                .estimated_catalog_requests(req.window, clocks.resolve_at_ns);
+            // The spans and logs lanes also take their parts, for the tier-2
+            // router. A refused charge for the parts' handles costs the lane
+            // its router, not the statement: the lane resolves again without
+            // parts and every segment takes the tier-1 KEY_IDX probe.
+            let with_parts = if matches!(lane, TargetSignal::Spans | TargetSignal::Logs) {
+                match self
+                    .catalog
+                    .resolve_pruned_with_parts(
+                        &tenant_hash,
+                        signal,
+                        req.window,
+                        tokens.for_lane(lane),
+                        clocks.resolve_at_ns,
+                        lane_name_filter,
+                        phase_accounting.lane(lane).resolve(),
+                    )
+                    .await
+                {
+                    Ok(resolved) => Some(resolved),
+                    Err(CatalogError::MemoryExhausted(_)) => None,
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                None
+            };
+            let (snapshot, origins, parts) = if let Some((snapshot, origins, parts)) = with_parts {
+                (snapshot, origins, Some(parts))
+            } else {
+                let (snapshot, origins) = self
+                    .catalog
+                    .resolve_pruned_with_admission(
+                        &tenant_hash,
+                        signal,
+                        req.window,
+                        tokens.for_lane(lane),
+                        clocks.resolve_at_ns,
+                        lane_name_filter,
+                        phase_accounting.lane(lane).resolve(),
+                    )
+                    .await?;
+                (snapshot, origins, None)
+            };
+            // Exact count of `SegmentOrigin::Recent` entries (issue #1214): the
+            // one origin a folded catalog has not yet sealed, so it is never
+            // served from the RSEG cache the way a folded, below-watermark
+            // segment can be.
+            unfolded_segments_resolved += count_unfolded_segments(&origins.origins);
+            // Sealed, below-watermark segments count against `max_segments`;
+            // recent and token-resolved segments are exempt (ADR-0073 decision
+            // 2), the same seam `ravel_query::engine::resolve_bounded` uses for
+            // PromQL. Their cost is bounded separately by the
+            // request budget checked incrementally during fetch (see scan.rs).
+            //
+            // Checked against the request's EFFECTIVE `max_segments`: a caller's
+            // lowered budget is a smaller ceiling here, never a larger one.
+            // The sum across lanes is what is checked (ADR-2904 decision 6).
+            let admission = admit(&snapshot, &origins, &lane_admission_config)
+                .map_err(admission_error_to_sql)?;
+            sealed_total = sealed_total.saturating_add(admission.sealed_count);
+            if usize::try_from(sealed_total).unwrap_or(usize::MAX) > engine_config.max_segments {
+                return Err(admission_error_to_sql(QueryError::TooManySegments {
+                    count: usize::try_from(sealed_total).unwrap_or(usize::MAX),
+                    max: engine_config.max_segments,
+                }));
+            }
+            estimate = estimate.saturating_add(&match lane {
+                TargetSignal::Metrics => estimate_metrics_cost(&snapshot, catalog_requests),
+                // The `alerts` and `audit` scans fetch through the same RLOG funnel
+                // the `logs` scan does, one GET per segment, so they share its
+                // estimate rather than a renamed copy of it (ADR-1101 decision 1).
+                TargetSignal::Logs | TargetSignal::Alerts | TargetSignal::Audit => {
+                    estimate_logs_cost(&snapshot, catalog_requests)
+                }
+                TargetSignal::Spans => estimate_spans_cost(&snapshot, catalog_requests),
+                TargetSignal::Parquet => CostEstimate::new(0, 0, 0, 0, 0),
+            });
+            self.check_lane_request_budget(
+                phase_accounting,
+                &snapshot,
+                &origins,
+                clocks.resolve_at_ns,
+                &engine_config,
+                several
+                    .then(|| crate::statement::signal_table_name(lane))
+                    .flatten(),
+            )?;
+            resolved.push(ResolvedLane {
+                signal: lane,
+                snapshot,
+                admission,
+                parts,
+            });
+        }
+        Ok(Resolved {
+            lanes: resolved,
+            estimate,
+            unfolded_segments_resolved,
+            target,
+            parquet,
+            signal_tables_named: tables.signals.len(),
+        })
+    }
+
+    /// The request budget checked after one lane's resolve, against what the
+    /// statement's resolve has issued so far across every lane, so the last
+    /// lane's check holds the sum. `table` names the lane in the refusal when
+    /// the statement names more than one signal table.
+    fn check_lane_request_budget(
+        &self,
+        phase_accounting: &StatementAccounting,
+        snapshot: &Snapshot,
+        origins: &SegmentOrigins,
+        now_ns: i64,
+        engine_config: &EngineConfig,
+        table: Option<&'static str>,
+    ) -> Result<(), SqlError> {
+        // Checked here, in the one resolve path `execute`, `explain`, and the
+        // Flight SQL `resolve_snapshot` all funnel through, right after
+        // resolve returns and not only in the segment-fetch loop in scan.rs:
+        // a statement whose snapshot resolves to zero segments never reaches
+        // that loop, so a caller's lowered `max_s3_requests` (ADR-1374
+        // decision 3) must still be enforced on the strength of the
+        // resolve's own catalog requests alone. Checked once here rather
+        // than once per caller, so a fourth resolve entry point cannot be
+        // added later without this check automatically covering it too.
+        // The budget carries what this resolve saw of the catalog's unsealed
+        // tail (ADR-1306 decision 6), read off the `origins` it just produced,
+        // so a refusal caused by fold lag names the tail and the fold-liveness
+        // gauge here exactly as it does on the PromQL path. This is the only
+        // SQL check with a resolve verdict in hand: the per-segment check in
+        // scan.rs builds its budget from the session config alone, so a
+        // refusal raised mid-scan renders the plain message.
+        if let Some(QueryError::RequestBudgetExceeded {
+            requests,
+            max,
+            fold_lag,
+        }) = request_budget_exceeded(
+            phase_accounting.resolve_snapshot().total_s3_requests(),
+            RequestBudget::new(
+                engine_config.max_s3_requests,
+                resolved_fold_lag(
+                    snapshot,
+                    origins,
+                    now_ns,
+                    engine_config.fold_lag_threshold(),
+                ),
+            ),
+        ) {
+            return Err(SqlError::RequestBudgetExceeded {
+                requests,
+                max,
+                fold_lag,
+                table,
+            });
+        }
+        Ok(())
+    }
+
+    /// The Parquet tables `sql` reads, when it reads any (ADR-2040 D3, D6).
+    ///
+    /// - A table function or a URL-shaped table name is refused with the
+    ///   planning error it would meet anyway, before anything is read. This
+    ///   runs before the `others.is_empty()` short-circuit below so that a URL
+    ///   table is refused whether or not a Parquet name is present.
+    /// - Without [`ParquetSources`], or when the statement names nothing but
+    ///   signal tables, this is `None` and reads nothing.
+    /// - With Parquet sources, a statement that names only non-signal tables
+    ///   and carries a row window is [`ParquetQueryError::RowWindowUnsupported`],
+    ///   before anything is read: such a statement can only succeed as a
+    ///   Parquet query, and a Parquet table has no event-time column.
+    /// - With no credential profiles configured, a live Parquet table is
+    ///   [`ParquetQueryError::NotConfigured`]. The names are listed in order
+    ///   and the first live table decides: one LIST per name up to it, and one
+    ///   GET of the newest manifest for each name that has versions, which is
+    ///   how a dropped table is told from a live one. No file is read.
+    /// - Otherwise each name's newest live manifest, checked against the
+    ///   tenant's current grants, whether or not the statement also names a
+    ///   signal table (ADR-2904 decision 11). A dropped table is no table on
+    ///   any of these paths: `None` when no name is a live Parquet table, so
+    ///   the statement then plans, and fails, as a statement naming an unknown
+    ///   table always has.
+    ///
+    /// Every read here is charged to the Resolve phase.
+    async fn resolve_parquet_target(
+        &self,
+        tenant_hash: TenantHash,
+        statement: Statement<'_>,
+        tables: &StatementTables,
+        row_window: bool,
+        phase_accounting: &PhaseAccounting,
+    ) -> Result<Option<ParquetResolution>, SqlError> {
+        // A lowered plan names no table function or URL table: plan
+        // admission refuses every scan outside its target.
+        if let Some(sql) = statement.sql() {
+            refuse_unreadable_table_reference(sql)?;
+        }
+        let Some(sources) = &self.parquet else {
+            return Ok(None);
+        };
+        if tables.others.is_empty() {
+            return Ok(None);
+        }
+        if row_window && tables.signals.is_empty() {
+            return Err(ParquetQueryError::RowWindowUnsupported.into());
+        }
+        let accounting = phase_accounting.resolve();
+        if !sources.is_configured() {
+            // The first live table decides the outcome, so the resolve stops
+            // there rather than listing every name.
+            let named =
+                parquet::first_live_table(sources, &tenant_hash, &tables.others, accounting)
+                    .await?;
+            return match named {
+                Some(table) => Err(ParquetQueryError::NotConfigured { table }.into()),
+                None => Ok(None),
+            };
+        }
+        Ok(parquet::resolve_tables(sources, &tenant_hash, &tables.others, accounting).await?)
+    }
+
+    /// The Parquet tables a Flight ticket pinned, read at exactly those
+    /// manifest versions (ADR-2040 D1, D3).
+    ///
+    /// The statement gets the same table-function and URL-table refusal
+    /// [`Self::resolve_parquet_target`] gives it. Then
+    /// [`parquet::resolve_pinned_tables`] redeems the pins, as the `flight`
+    /// module doc, "The two-RPC problem, and the pin", states. No pins is
+    /// `None`: the statement named no live Parquet table when it was planned,
+    /// and no newest manifest stands in for one.
+    ///
+    /// Every read here is charged to the Resolve phase.
+    async fn resolve_pinned_parquet(
+        &self,
+        tenant_hash: TenantHash,
+        statement: Statement<'_>,
+        pins: &[ParquetPin],
+        phase_accounting: &PhaseAccounting,
+    ) -> Result<Option<ParquetResolution>, SqlError> {
+        // A lowered plan names no table function or URL table: plan
+        // admission refuses every scan outside its target.
+        if let Some(sql) = statement.sql() {
+            refuse_unreadable_table_reference(sql)?;
+        }
+        if pins.is_empty() {
+            return Ok(None);
+        }
+        let Some(sources) = &self.parquet else {
+            return Err(ParquetQueryError::NotConfigured {
+                table: pins[0].table.clone(),
+            }
+            .into());
+        };
+        Ok(Some(
+            parquet::resolve_pinned_tables(sources, &tenant_hash, pins, phase_accounting.resolve())
+                .await?,
+        ))
+    }
+
+    /// This query's [`QueryIoShape`] (issue #1214), mirroring
+    /// `ravel_query::engine`'s private `io_shape_for_resolve`: every figure
+    /// here is a pure function of the resolved snapshots, this attempt's
+    /// `phase_accounting`, and static configuration, computed before a single
+    /// segment is fetched. Deliberately does not thread any new
+    /// instrumentation into the per-segment fetch loops in scan.rs/
+    /// logs_scan.rs.
+    ///
+    /// SQL resolves one snapshot per signal table a statement names, never
+    /// several matcher plans over several distinct fetch passes of one table
+    /// the way the PromQL engine's selector fan-out does. There is therefore
+    /// no `distinct_plans`/`service_fetch_multiplier` concept to sum waves
+    /// over here: per lane this is the single-plan reduction `service_batches_over_plan_waves`'s own doc
+    /// comment names, `service_batches(segments, min(sql_partition_count,
+    /// shared_get_permits))` -- the same reduction `ravel_query::engine`
+    /// computes for a single-plan PromQL query, both reading the same
+    /// process-wide `GetLimiter` (ADR-1195; `services/ravel-server/src/
+    /// query.rs` wires the identical `Arc<GetLimiter>` into this crate's
+    /// metrics, logs, and spans fetchers alike), so the two surfaces' figures
+    /// are directly comparable.
+    ///
+    /// A statement over several signal tables (ADR-2904) reads each lane's
+    /// segments through that lane's own fetcher: the dependency depth is the
+    /// deepest lane's, the service batches are the sum of each lane's, and the
+    /// plan class is `Unclassified`.
+    ///
+    /// `keyed` is whether a logs scan of the statement carries KEY_IDX
+    /// equalities (ADR-2707 decision 5); see [`Self::io_shape_bounds`].
+    fn sql_io_shape(
+        &self,
+        lanes: &[(TargetSignal, &Snapshot)],
+        phase_accounting: &StatementAccounting,
+        unfolded_segments_resolved: u64,
+        keyed: bool,
+    ) -> QueryIoShape {
+        let mut counts = IoShapeCounts::default();
+        let concurrency = self.config.engine.sql_partition_count().max(1) as u64;
+        let mut depth = 0;
+        let mut service_batches = 0u32;
+        for (target, snapshot) in lanes {
+            let (whole_object_threshold, key_probe_depth, shared_get_permits) =
+                self.io_shape_bounds(*target, keyed);
+            depth = snapshot
+                .segments
+                .iter()
+                .map(|seg| {
+                    let chain = ravel_query::io_shape::depth_for_object(
+                        seg.object_size,
+                        whole_object_threshold,
+                    );
+                    if seg.object_size > whole_object_threshold {
+                        chain + key_probe_depth
+                    } else {
+                        chain
+                    }
+                })
+                .fold(depth, u32::max);
+            // The two bounds `service_batches` divides by, mirroring
+            // `ravel_query::engine::io_shape_for_resolve`: the fan-out this
+            // crate's own scan partitions the segments into
+            // (`sql_partition_count`) and `target`'s own fetcher's permit
+            // count. The three fetchers this executor holds are not guaranteed
+            // to share one `GetLimiter` (ADR-1195 lets a caller wire each to
+            // its own private limiter, which
+            // `crates/ravel-bench/src/sql_latency.rs`'s `cold_executor` does
+            // for its logs fetcher); reading permits off `target`'s own
+            // fetcher rather than a fixed one keeps this figure correct
+            // regardless of how the embedder wired them, exactly like the
+            // PromQL engine reads its own `get_limiter` rather than a copy.
+            service_batches =
+                service_batches.saturating_add(ravel_query::io_shape::service_batches(
+                    snapshot.segments.len() as u64,
+                    concurrency.min(shared_get_permits),
+                ));
+        }
+        counts.record_dependency_chain(depth);
+        counts.record_service_batches(service_batches);
+        let resolve_snapshot = phase_accounting.resolve_snapshot();
+        let resolve_list_requests = resolve_snapshot.s3_requests(AccountedOp::List);
+        counts.record_list_pages(resolve_list_requests.min(u64::from(u32::MAX)) as u32);
+        // A metrics query's resolve carries a real pruning signal
+        // (`pushed_down_name_filter` above), so its `Snapshot::segments_pruned`
+        // genuinely distinguishes a pruned fetch from a full scan. The
+        // RLOG/RSPAN/alerts/audit lanes, and a statement over several lanes,
+        // report `PlanClass::Unclassified` instead; see that variant's doc on
+        // `ravel_query::io_shape::PlanClass` for why.
+        //
+        // This does not yet distinguish SQL's metadata-only fast paths (a
+        // predicate-free `SELECT COUNT(*)` answered from partition statistics
+        // with no scan node in the plan, or a declared-column min/max/count
+        // answered from ingest stamps) from a real scan: both still report
+        // `SelectiveIndexed`/`ExhaustiveScan`/`Unclassified` here rather than
+        // `MetadataOnly`, since this function has no signal for "the
+        // optimizer removed the scan node entirely" and adding one is out of
+        // scope for this change.
+        let plan_class = match lanes {
+            [(TargetSignal::Metrics, snapshot)] => {
+                if snapshot.segments_pruned > 0 {
+                    PlanClass::SelectiveIndexed
+                } else {
+                    PlanClass::ExhaustiveScan
+                }
+            }
+            _ => PlanClass::Unclassified,
+        };
+        counts.into_shape(
+            unfolded_segments_resolved,
+            resolve_snapshot.commit_record_cache_hits,
+            plan_class,
+        )
+    }
+
+    /// The per-lane inputs of [`Self::sql_io_shape`]: the size at or under
+    /// which `target`'s fetcher reads an object in one whole-object GET with no
+    /// dependent read, the dependent reads a keyed statement adds above it,
+    /// and the fetcher's GET permit count.
+    fn io_shape_bounds(&self, target: TargetSignal, keyed: bool) -> (u64, u32, u64) {
+        match target {
+            TargetSignal::Metrics => (
+                self.fetcher.whole_object_threshold(),
+                0,
+                self.fetcher.get_limiter_permits() as u64,
+            ),
+            // `plan_whole_object_bound` is the bound `plan_segment`'s guard
+            // routes on: the larger of the routing threshold and the
+            // projection break-even, so at or below it the read is one
+            // whole-object GET with no probe, and above it a footer probe
+            // precedes a dependent read. The routing threshold alone would
+            // report a probe chain for an object under the break-even that
+            // the plan reads whole. Above the bound the scan's fast path may
+            // still read whole when `ranged_projection_pays` declines, so the
+            // depth stays an upper bound there. Alerts and audit read
+            // through this same `log_fetcher`.
+            //
+            // A keyed statement (ADR-2707 decision 5) probes KEY_IDX on every
+            // object above the routing threshold, under the break-even too:
+            // the footer probe, the KEY_IDX prefix and a bucket, each needing
+            // the previous read's bytes, then the whole-object GET or the
+            // directory and block reads. So it routes on the threshold and adds
+            // the prefix and bucket reads to the unkeyed chain above it.
+            TargetSignal::Logs | TargetSignal::Alerts | TargetSignal::Audit if keyed => (
+                self.log_fetcher.block_range_threshold(),
+                KEY_IDX_PROBE_DEPTH,
+                self.log_fetcher.get_limiter_permits() as u64,
+            ),
+            TargetSignal::Logs | TargetSignal::Alerts | TargetSignal::Audit => (
+                self.log_fetcher.plan_whole_object_bound(),
+                0,
+                self.log_fetcher.get_limiter_permits() as u64,
+            ),
+            // `SpanSegmentFetcher` has no block-range/whole-object split: it
+            // always issues one whole-object GET per segment, so every span
+            // segment with a nonzero `object_size` reports dependency depth 1
+            // regardless of size (a threshold no nonzero `object_size` can
+            // exceed). `depth_for_object` special-cases `object_size == 0` to
+            // depth 4 (see its own doc comment); a published commit record
+            // should never carry a zero object size, so that case does not
+            // arise here in practice.
+            TargetSignal::Spans => (u64::MAX, 0, self.span_fetcher.get_limiter_permits() as u64),
+            // A Parquet statement resolves no segments, so neither figure is
+            // read; the scan's own reads go through the same process limiter.
+            TargetSignal::Parquet => (u64::MAX, 0, self.fetcher.get_limiter_permits() as u64),
+        }
+    }
+
+    /// The equality `__name__` value a metrics query's pushed-down predicates
+    /// pin, or `None` if none can be soundly used for postings pruning.
+    ///
+    /// This plans `sql` to a logical plan over a schema-only, empty-snapshot
+    /// `samples` table (no storage I/O, no execution) purely to recover its
+    /// WHERE predicates, then runs them through the same widen-only
+    /// [`crate::pushdown`] extractor the scan uses and keeps a lone equality
+    /// `__name__` matcher. The extractor already contributes nothing for an
+    /// `OR`, a regex, a negation, or a `__name__` matcher that is not a lone
+    /// `=`, so the returned name is always a predicate the query genuinely
+    /// requires at the top level: pruning to it drops only segments whose
+    /// rows the residual filter would drop anyway. The key is derived per
+    /// scan from the filters that bind that scan alone
+    /// ([`per_scan_name_keys`]), and one is returned only when every
+    /// `samples` scan yields the same key; scans of the other tables in
+    /// `lanes` read other snapshots and do not count. Any planning error yields
+    /// `None` (no prune); the real plan surfaces such errors later through
+    /// [`Self::plan_pinned`].
+    async fn pushed_down_name_filter(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        sql: &str,
+        lanes: &[TargetSignal],
+    ) -> Option<String> {
+        // Route through `build_session_with_tables`, the same construction
+        // `analyzed_classification_plan` uses, rather than a bare
+        // `SessionContext::new()` (ADR-0097 decision 7). This carries the
+        // `EmptyObjectStoreRegistry` (ADR-0013 security invariant 1) and the
+        // per-registry allowlist deregistrations plus the UDAF replacements,
+        // so the two throwaway-session sites converge on one path. The
+        // per-table `label`/`label_match` UDFs a metrics session needs are
+        // registered by the session builder itself.
+        let tables = lanes
+            .iter()
+            .map(|lane| self.empty_snapshot_table(*lane, tenant_hash, &[]))
+            .collect();
+        // A private, unbounded pool: this session only logical-plans and never
+        // executes, so nothing is reserved against it and it never touches the
+        // tenant accountant.
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        // Plan-inspection only: this throwaway session never executes, so it
+        // never spills whatever the query's own session was granted.
+        // The statement's own principal, so a statement calling an ipcrypt
+        // UDF plans here too and keeps its `__name__` pruning.
+        let ctx = build_session_with_tables(
+            &self.config,
+            pool,
+            tables,
+            false,
+            crate::session::SpillDecision::Disabled,
+            &self.session_principal(tenant_hash, capabilities),
+        )
+        .ok()?;
+        let plan = ctx.state().create_logical_plan(sql).await.ok()?;
+        // Every `samples` scan reads the one pruned metrics snapshot, so a key
+        // is usable only when every `samples` scan requires it (issue #2907).
+        // A key count that differs from the scan count means the walk missed
+        // a scan, which could be a `samples` scan, so decline rather than let
+        // the rest prune.
+        let mut keys = Vec::new();
+        per_scan_name_keys(&plan, &mut keys);
+        if keys.len() != count_table_scans(&plan) {
+            return None;
+        }
+        let mut samples = keys
+            .into_iter()
+            .filter(|(table, _)| table == SAMPLES_TABLE)
+            .map(|(_, key)| key);
+        let first = samples.next()??;
+        samples
+            .all(|key| key.as_ref() == Some(&first))
+            .then_some(first)
+    }
+
+    /// The intent a resolved statement's reads carry: [`classify_access_intent`],
+    /// and, when that reads Interactive, the statement carries SQL text and the
+    /// size trigger applies to the bytes its last successful execution read
+    /// ([`size_trigger_applies`]), BulkScan unless the
+    /// statement is an exact-key lookup ([`Self::reads_key_equality`]). A
+    /// statement with no SQL text (a lowered plan) never reaches the trigger.
+    /// Called once per attempt, after resolve and before the first segment
+    /// read. The window and snapshot tests read `clocks.resolve_at_ns`, the
+    /// instant the lanes were resolved at; the KEY_IDX lookup reads
+    /// `clocks.caller_now_ns`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn statement_access_intent(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        statement: Statement<'_>,
+        lanes: &[(TargetSignal, &Snapshot)],
+        names_parquet: bool,
+        window: TimeRange,
+        shape: ReadShape,
+        clocks: Clocks,
+        declared: &[DeclaredColumn],
+    ) -> AccessIntent {
+        let predicate_free = self
+            .lane_predicate_free(
+                tenant_hash,
+                capabilities,
+                statement,
+                lanes,
+                window,
+                clocks.resolve_at_ns,
+                declared,
+            )
+            .await;
+        let intent = classify_access_intent(
+            lanes,
+            names_parquet,
+            window,
+            clocks.resolve_at_ns,
+            predicate_free,
+        );
+        if intent != AccessIntent::Interactive {
+            return intent;
+        }
+        let Some(sql) = statement.sql() else {
+            return intent;
+        };
+        let last_read_bytes =
+            self.statement_read_bytes
+                .get(StatementReadBytes::key(tenant_hash, sql, shape));
+        if !size_trigger_applies(
+            lanes,
+            names_parquet,
+            self.cache_bulk_scan_min_bytes,
+            last_read_bytes,
+        ) {
+            return intent;
+        }
+        if self
+            .reads_key_equality(
+                tenant_hash,
+                capabilities,
+                statement,
+                clocks.caller_now_ns,
+                declared,
+            )
+            .await
+        {
+            AccessIntent::Interactive
+        } else {
+            AccessIntent::BulkScan
+        }
+    }
+
+    /// The [`StatementReadBytes`] key a successful execution of `statement`
+    /// records its read bytes under: `None` unless the size trigger is set,
+    /// the statement carries SQL text, and its lanes are ones the trigger
+    /// reads ([`size_trigger_lane`]).
+    fn read_bytes_key(
+        &self,
+        tenant_hash: TenantHash,
+        statement: Statement<'_>,
+        shape: ReadShape,
+        lanes: &[(TargetSignal, &Snapshot)],
+        names_parquet: bool,
+    ) -> Option<u64> {
+        self.cache_bulk_scan_min_bytes?;
+        let sql = statement.sql()?;
+        size_trigger_lane(lanes, names_parquet)
+            .then(|| StatementReadBytes::key(tenant_hash, sql, shape))
+    }
+
+    /// Whether `statement` over its one `logs` lane holds an equality on a
+    /// field the tenant indexes in KEY_IDX ([`plan_has_key_equality`]), in its
+    /// unoptimized plan or in the optimized one, whose `TableScan` filters are
+    /// what the KEY_IDX probe receives (a one-element `IN` simplified to `=`, a
+    /// predicate pushed through an alias or out of a join's `ON`). A tenant
+    /// that indexes nothing has no key lookup, so plans nothing. Fails closed:
+    /// a statement with no SQL text, or one that fails to plan or to optimize,
+    /// counts as a key lookup.
+    async fn reads_key_equality(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        statement: Statement<'_>,
+        now_ns: i64,
+        declared: &[DeclaredColumn],
+    ) -> bool {
+        let key_index = self.declared_source.key_index(tenant_hash, now_ns).await;
+        if key_index.columns.is_empty() && !key_index.trace_id {
+            return false;
+        }
+        let Some(sql) = statement.sql() else {
+            return true;
+        };
+        let Some(ctx) =
+            self.empty_table_session(tenant_hash, capabilities, TargetSignal::Logs, declared)
+        else {
+            return true;
+        };
+        let Ok(plan) = ctx.state().create_logical_plan(sql).await else {
+            return true;
+        };
+        if plan_has_key_equality(&plan, &key_index) {
+            return true;
+        }
+        match ctx.state().optimize(&plan) {
+            Ok(optimized) => plan_has_key_equality(&optimized, &key_index),
+            Err(_) => true,
+        }
+    }
+
+    /// Whether a statement whose one lane is `samples` or `logs` reads every
+    /// row of it ([`plan_is_predicate_free`]), for [`classify_access_intent`].
+    /// Plans only when the lane's snapshot and window conjuncts
+    /// ([`reads_whole_lane`]) already pass, so a dashboard statement pays no
+    /// extra planning; every other statement, and one that fails to plan,
+    /// reads as not predicate-free.
+    #[allow(clippy::too_many_arguments)]
+    async fn lane_predicate_free(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        statement: Statement<'_>,
+        lanes: &[(TargetSignal, &Snapshot)],
+        window: TimeRange,
+        now_ns: i64,
+        declared: &[DeclaredColumn],
+    ) -> bool {
+        let [(signal, snapshot)] = lanes else {
+            return false;
+        };
+        let Some(sql) = statement.sql() else {
+            return false;
+        };
+        if !reads_whole_lane(*signal, snapshot, window, now_ns) {
+            return false;
+        }
+        self.plans_predicate_free(tenant_hash, capabilities, *signal, sql, declared)
+            .await
+    }
+
+    /// Whether `sql`'s unoptimized plan over an empty `signal` table carrying
+    /// the tenant's `declared` columns ([`Self::empty_table_session`]) is
+    /// predicate-free; a statement that fails to plan is not.
+    async fn plans_predicate_free(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        signal: TargetSignal,
+        sql: &str,
+        declared: &[DeclaredColumn],
+    ) -> bool {
+        let Some(ctx) = self.empty_table_session(tenant_hash, capabilities, signal, declared)
+        else {
+            return false;
+        };
+        match ctx.state().create_logical_plan(sql).await {
+            Ok(plan) => plan_is_predicate_free(&plan),
+            Err(_) => false,
+        }
+    }
+
+    /// A throwaway session over an empty `signal` table carrying the tenant's
+    /// `declared` columns, built the way [`Self::pushed_down_name_filter`]
+    /// builds its own (no I/O); `None` when it cannot be built.
+    fn empty_table_session(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        signal: TargetSignal,
+        declared: &[DeclaredColumn],
+    ) -> Option<SessionContext> {
+        let tables = vec![self.empty_snapshot_table(signal, tenant_hash, declared)];
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        build_session_with_tables(
+            &self.config,
+            pool,
+            tables,
+            false,
+            crate::session::SpillDecision::Disabled,
+            &self.session_principal(tenant_hash, capabilities),
+        )
+        .ok()
+    }
+
+    /// ADR-0094 decision 1: whether every aggregate expression and GROUP BY key
+    /// in `sql`, once fully type-coerced, is provably order/partition-independent
+    /// -- the precondition for fanning the final aggregation across partitions.
+    ///
+    /// Reuses `pushed_down_name_filter`'s throwaway-session shape (an empty
+    /// snapshot, no I/O) but with one deliberate difference: the plan is run
+    /// through DataFusion's `Analyzer` (type coercion) before classification, so
+    /// a `sum`/`min`/`max` argument or a group key is classified by its
+    /// *resolved* Arrow type, not its syntactic operands (ADR-0094 decision 1;
+    /// `create_logical_plan` alone does not coerce). The throwaway session
+    /// registers everything a real query needs to plan -- the table's scalar
+    /// UDFs, the map-field `ExprPlanner`, and the tenant's ADR-0090 declared
+    /// columns -- via `build_session`, so a legitimate query does not silently
+    /// lose the optimization by failing to plan here.
+    ///
+    /// Fail-closed, the opposite polarity from `pushed_down_name_filter`'s
+    /// fail-open `None`: any error building or analyzing the throwaway plan
+    /// classifies the query as NOT exact, because wrongly admitting an
+    /// unclassifiable query could repartition an aggregate this check never
+    /// verified.
+    // Test-only since the shared-plan change: the production path composes the
+    // same two pieces inline (`analyzed_classification_plan` then
+    // `plan_is_exact_typed`) against the plan it shares with the column-stats
+    // gate, rather than building a second throwaway session. This composition
+    // is identical to prod's, so the ADR-0094 cases below still exercise the
+    // shipped classification.
+    #[cfg(test)]
+    async fn classify_exact_typed(
+        &self,
+        tenant_hash: TenantHash,
+        sql: &str,
+        declared: &[DeclaredColumn],
+    ) -> bool {
+        match self
+            .sql_classification_plan(tenant_hash, sql, declared, None)
+            .await
+        {
+            Some(plan) => plan_is_exact_typed(&plan),
+            None => false,
+        }
+    }
+
+    /// Every logs scan's execution count in [`Self::scan_executions`],
+    /// ascending.
+    #[cfg(test)]
+    pub(crate) fn scan_execution_counts(&self) -> Vec<u64> {
+        self.scan_executions.counts()
+    }
+
+    /// One share of the process spill ceiling for a spill retry
+    /// ([`SpillBudget::reserve_share`]), or `None` when spill is not
+    /// configured or less than the minimum remains.
+    fn reserve_spill_share(&self) -> Option<SpillReservation> {
+        self.spill_budget
+            .as_ref()
+            .and_then(SpillBudget::reserve_share)
+    }
+
+    /// [`Self::start_as_spill_retry`]; outside tests a first pass is always
+    /// [`SpillAttempt::First`].
+    #[cfg(test)]
+    fn starts_as_spill_retry(&self) -> bool {
+        self.start_as_spill_retry
+    }
+
+    #[cfg(not(test))]
+    fn starts_as_spill_retry(&self) -> bool {
+        false
+    }
+
+    /// [`Self::analyzed_classification_plan`] for SQL text, with any error
+    /// read as `None`, as the unit tests below call it.
+    #[cfg(test)]
+    async fn sql_classification_plan(
+        &self,
+        tenant_hash: TenantHash,
+        sql: &str,
+        declared: &[DeclaredColumn],
+        parquet: Option<&[(String, SchemaRef)]>,
+    ) -> Option<LogicalPlan> {
+        let tables = Self::statement_tables(sql).ok()?;
+        self.analyzed_classification_plan(
+            tenant_hash,
+            Statement::Sql(sql),
+            &tables,
+            declared,
+            parquet,
+            &SessionPrincipal::without_capabilities(tenant_hash),
+        )
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Build the throwaway empty-snapshot session for the statement's target
+    /// signal, lower the statement onto it, and run DataFusion's analyzer
+    /// (type coercion) over the result. `Ok(None)` on any error building,
+    /// lowering or analyzing (the fail-closed source for
+    /// [`Self::classify_exact_typed`]); a lowered plan that fails plan
+    /// admission is that error instead, ahead of the analyzer.
+    ///
+    /// `tables` is `statement.tables()`, which the caller already holds.
+    ///
+    /// The analyzer step is the `execute_and_check` pass DataFusion's own
+    /// physical planning applies before optimization; running it here is what
+    /// resolves, for example, `avg`'s argument to `Float64` and an integer
+    /// `sum`'s argument to `Int64` before the walk inspects their types.
+    ///
+    /// `parquet` carries the resolved Parquet tables' names and schemas for a
+    /// statement over them (ADR-2040 D6): the plan is then built over an empty
+    /// table of each schema, so its aggregates and keys classify by the types
+    /// the real scan produces, beside an empty table of each signal the
+    /// statement names. `None` builds the empty tables of the signals alone.
+    async fn analyzed_classification_plan(
+        &self,
+        tenant_hash: TenantHash,
+        statement: Statement<'_>,
+        tables: &StatementTables,
+        declared: &[DeclaredColumn],
+        parquet: Option<&[(String, SchemaRef)]>,
+        principal: &SessionPrincipal,
+    ) -> Result<Option<LogicalPlan>, SqlError> {
+        let mut session_tables = Vec::new();
+        if let Some(schemas) = parquet {
+            session_tables.push(SessionTable::Parquet(ParquetSession {
+                tables: schemas
+                    .iter()
+                    .map(|(name, schema)| {
+                        let table: Arc<dyn TableProvider> =
+                            Arc::new(EmptyTable::new(Arc::clone(schema)));
+                        (name.clone(), table)
+                    })
+                    .collect(),
+                store: Arc::new(ravel_parquet::TenantParquetStore::new(tenant_hash)),
+            }));
+        }
+        if parquet.is_none() || !tables.signals.is_empty() {
+            session_tables.extend(
+                tables
+                    .lanes()
+                    .into_iter()
+                    .map(|lane| self.empty_snapshot_table(lane, tenant_hash, declared)),
+            );
+        }
+        // A private, unbounded pool: this session never executes, so nothing is
+        // ever reserved against it and it never touches the tenant accountant.
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        // `exact_typed_aggregates` is irrelevant to a plan we only inspect; the
+        // classification decides the real session's value, not this throwaway.
+        // Plan-inspection only: this throwaway session never executes, so it
+        // never spills whatever the query's own session was granted.
+        let providers = session_tables
+            .iter()
+            .flat_map(session_table_providers)
+            .collect();
+        let Ok(ctx) = build_session_with_tables(
+            &self.config,
+            pool,
+            session_tables,
+            false,
+            crate::session::SpillDecision::Disabled,
+            principal,
+        ) else {
+            return Ok(None);
+        };
+        let state = ctx.state();
+        let plan = match statement
+            .lower(&ctx, providers, tables, LoweringSite::Classification)
+            .await
+        {
+            Ok(plan) => plan,
+            Err(LowerError::Plan(_)) => return Ok(None),
+            Err(LowerError::NotAdmitted(err)) => return Err(err),
+        };
+        let config_options = Arc::clone(state.config_options());
+        Ok(state
+            .analyzer()
+            .execute_and_check(plan, &config_options, |_, _| {})
+            .ok())
+    }
+
+    /// Whether any ADR-0850 metadata-only column-statistics path could fire for
+    /// this logs plan, decided from the plan and the resolved snapshot alone,
+    /// BEFORE the two-GET `load_column_stats` (issue #888). `false` means every
+    /// path is provably out of reach, so the load is pure waste and is skipped;
+    /// the query then answers exactly as an absent stats object would (the
+    /// pre-ADR-0850 provider).
+    ///
+    /// The load is kept only when some aggregate in the plan (subquery plans
+    /// included) has a shape [`crate::MetadataOnlyAggregate`] answers
+    /// ([`crate::metadata_agg::logical_aggregate_answerable`], issue #3244):
+    /// q02 `COUNT(*) WHERE declared <> lit`, q08 `declared, COUNT(*) GROUP BY
+    /// declared`, or one `SUM(declared [+ int])` or `AVG(declared)` (q03/q04/q30
+    /// in the `metadata_agg` module doc), each over a `logs` scan with no
+    /// classified residual filter other than q02's one `<>` conjunct (the
+    /// next paragraph covers unclassified ones). `MIN`/`MAX` are not among
+    /// them: DataFusion's `AggregateStatistics` answers them from the
+    /// `SegmentRef` stamps, which the snapshot already carries, so they load
+    /// nothing.
+    ///
+    /// Anything else (several aggregates beside a `SUM` or `AVG`, a distinct
+    /// count, a `GROUP BY` with a `<>` filter or with two keys, a raw select)
+    /// skips the load. A declared `Str` column's `<>` against a string literal
+    /// counts as a residual `<>` conjunct here although the provider reports
+    /// it `Exact` and no `FilterExec` holds it: the scan evaluates it as a row
+    /// filter, which the rewrite's gate refuses, so the q31 shape (`GROUP BY`
+    /// with `WHERE "SearchPhrase" <> ''`) and `SUM(n) WHERE s <> ''` still
+    /// skip the load (`str_not_equal_shapes_load_no_column_statistics`;
+    /// `str_not_equal_conjunct_stays_residual_for_the_rewrite_check` pins
+    /// the conjunct in the form the optimizer hands the scan).
+    /// Inside an admitted shape, a residual conjunct the
+    /// analyzed plan does not show as either a pure `ts` or `has_word`
+    /// conjunct or a `declared <> literal` keeps the load, except on the q02
+    /// shape when no residual conjunct names a non-`Str` declared column (no
+    /// consumer answers a `<>` on a `Str` column): the analyzed
+    /// plan still carries the casts and constant expressions the optimizer
+    /// folds (`TIMESTAMP '...'` is a cast of a string there). Beyond the shape
+    /// and residual rules, the load is skipped only for what the rewrite's own
+    /// gate, [`crate::logs_scan`]'s `metadata_rewrite_stats_are_exact`,
+    /// refuses and the checks below can read on the analyzed plan: a pending
+    /// erasure, a content predicate, a prune arm other than `NumNotEq`, and a
+    /// ts bound that clips a touched segment. A ts bound written with
+    /// `TIMESTAMP` literals is not read there, so its clip does not skip the
+    /// load; the rewrite then declines on the optimized plan and scans. A
+    /// condition known only once the statistics are read (no stored sum for
+    /// the column, a dictionary over the cardinality ceiling) is left to
+    /// decline downstream, so such a plan loads and then scans.
+    ///
+    /// `several_tables` is whether the statement names more than one table,
+    /// two signal tables or a signal table beside a Parquet table; the
+    /// pushdown checks then read only the `logs` scans' own conjuncts.
+    ///
+    /// A kept load returns the [`ColumnStatsRequest`] it carries: the union
+    /// of every admitted aggregate's request, so a part's dictionaries are
+    /// fetched only for the columns a q02 or q08 shape reads. With no plan
+    /// to judge, the request is summary-only: the q02 and q08 consumers check
+    /// `dictionary_loaded` and decline on a missing dictionary, so the
+    /// summaries alone can never answer them wrongly.
+    fn logs_column_stats_eligible(
+        &self,
+        snapshot: &Snapshot,
+        analyzed: Option<&LogicalPlan>,
+        declared: &[DeclaredColumn],
+        several_tables: bool,
+    ) -> Option<ColumnStatsRequest> {
+        // Pending selective erasure (ADR-0064) rejects the ENTIRE query for
+        // every metadata-only path (safety lemma): a pending erasure removes
+        // rows the precomputed counts/extrema still include. Snapshot-only and
+        // certain, so it is checked first and without building a plan.
+        if !snapshot.pending_erasure.is_empty() {
+            return None;
+        }
+        // The analyzed logical plan carries both the aggregate shape and the
+        // filter conjuncts this check needs. If it cannot be built, fall back
+        // to loading (the pre-hoist behavior always loaded).
+        // Fail OPEN, unchanged: no plan means keep the load. The caller shares
+        // one analyzed plan with the exact-typed classification rather than
+        // building a second throwaway session for the same SQL.
+        let Some(plan) = analyzed else {
+            return Some(ColumnStatsRequest::summary_only());
+        };
+        let request = plan_stats_answerable_request(plan, declared)?;
+        if several_tables {
+            return Self::some_logs_scan_may_use_column_stats(snapshot, plan, declared)
+                .then_some(request);
+        }
+        // Re-derive the reader pushdown from the plan's filter conjuncts with
+        // the SAME extractor the scan uses, so the content/prune/ts decisions
+        // match the scan's metadata-rewrite gate exactly. A content predicate,
+        // or a prune arm other than `NumNotEq`, makes every path decline; the
+        // analyzed (pre-optimizer) plan can only carry fewer such predicates
+        // than the scan ultimately sees, so a match here is real and skipping
+        // is safe, while a miss merely loads.
+        let mut filters = Vec::new();
+        collect_filter_predicates(plan, &mut filters);
+        let pushdown = extract_logs(&filters, declared);
+        if !pushdown.content.is_empty() || !prune_is_rewrite_neutral(&pushdown.prune) {
+            return None;
+        }
+        // A ts bound that clips even one touched segment makes `stats_are_exact`
+        // fail closed. The touched set is the ts-overlapping subset the provider
+        // resolves (`pruned_segments`); a segment fully outside the bound is
+        // pruned away and never reaches the containment check, so it must not
+        // count as a clip here either.
+        (!Self::ts_bound_clips(snapshot, pushdown.ts_min(), pushdown.ts_max())).then_some(request)
+    }
+
+    /// Whether `[ts_min, ts_max]` clips a segment of `snapshot` it touches.
+    fn ts_bound_clips(snapshot: &Snapshot, ts_min: i64, ts_max: i64) -> bool {
+        snapshot
+            .segments
+            .iter()
+            .filter(|s| LogSegmentFetcher::ts_range_relevant(s, ts_min, ts_max))
+            .any(|s| !(ts_min <= s.min_event_ts_ns && s.max_event_ts_ns <= ts_max))
+    }
+
+    /// [`Self::logs_column_stats_eligible`]'s pushdown checks for a plan that
+    /// scans several tables, where only the `logs` scans read the logs
+    /// snapshot: each `logs` scan is checked on its own conjuncts
+    /// ([`per_scan_conjuncts`]), and the load is skipped only when every one
+    /// of them declines. A walk that misses a scan keeps the load.
+    fn some_logs_scan_may_use_column_stats(
+        snapshot: &Snapshot,
+        plan: &LogicalPlan,
+        declared: &[DeclaredColumn],
+    ) -> bool {
+        let mut scans = Vec::new();
+        per_scan_conjuncts(plan, &[], &mut scans);
+        if scans.len() != count_table_scans(plan) {
+            return true;
+        }
+        let mut logs_scans = scans
+            .iter()
+            .filter(|(table, _)| table == LOGS_TABLE)
+            .peekable();
+        if logs_scans.peek().is_none() {
+            return true;
+        }
+        logs_scans.any(|(_, own)| {
+            let pushdown = extract_logs(own, declared);
+            pushdown.content.is_empty()
+                && prune_is_rewrite_neutral(&pushdown.prune)
+                && !Self::ts_bound_clips(snapshot, pushdown.ts_min(), pushdown.ts_max())
+        })
+    }
+
+    /// A throwaway [`SessionTable`] over an empty snapshot for `target`,
+    /// carrying the same table-specific surface a real query of that signal
+    /// would (the logs provider's ADR-0090 declared columns included), so the
+    /// classification plan resolves identically to the real one. Issues no I/O:
+    /// the snapshot has no segments and the session is discarded unexecuted.
+    fn empty_snapshot_table(
+        &self,
+        target: TargetSignal,
+        tenant_hash: TenantHash,
+        declared: &[DeclaredColumn],
+    ) -> SessionTable {
+        let empty_snapshot = || Snapshot {
+            segments: Vec::new(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        match target {
+            TargetSignal::Metrics => SessionTable::Metrics(Arc::new(RavelTableProvider::new(
+                empty_snapshot(),
+                tenant_hash,
+                self.fetcher.clone(),
+                self.config.clone(),
+                PhaseAccounting::new(),
+            ))),
+            TargetSignal::Logs => SessionTable::Logs(Arc::new(
+                LogsTableProvider::new(
+                    empty_snapshot(),
+                    tenant_hash,
+                    self.log_fetcher.clone(),
+                    PhaseAccounting::new(),
+                )
+                .with_declared_columns(declared.to_vec())
+                .with_segment_timing(self.config.segment_timing),
+            )),
+            TargetSignal::Spans => SessionTable::Spans(Arc::new(SpansTableProvider::new(
+                empty_snapshot(),
+                tenant_hash,
+                self.span_fetcher.clone(),
+                QueryAccounting::new(),
+            ))),
+            TargetSignal::Alerts => SessionTable::Alerts(Arc::new(AlertsTableProvider::new(
+                empty_snapshot(),
+                tenant_hash,
+                self.log_fetcher.clone(),
+                QueryAccounting::new(),
+            ))),
+            TargetSignal::Audit => SessionTable::Audit(Arc::new(AuditTableProvider::new(
+                empty_snapshot(),
+                tenant_hash,
+                self.log_fetcher.clone(),
+                QueryAccounting::new(),
+            ))),
+            // A Parquet table's schema comes from its resolved footer, which
+            // this schema-only helper does not have; a session with no table
+            // plans nothing, which the classification treats as not exact.
+            TargetSignal::Parquet => SessionTable::Parquet(ParquetSession {
+                tables: Vec::new(),
+                store: Arc::new(ravel_parquet::TenantParquetStore::new(tenant_hash)),
+            }),
+        }
+    }
+
+    /// The table (and thus the signal) a query resolves against, decided from
+    /// its `FROM` clause before any planning (ADR-0033 "one SQL endpoint, two
+    /// tables").
+    ///
+    /// The referenced table names come from the same `DFParser` front end the
+    /// validation gate uses ([`referenced_base_tables`]), never a raw-text
+    /// scan. The mapping (ADR-0045 decision 5 extends the ADR-0033 two-table
+    /// rule to a third arm, ADR-1101 decision 1 to a fourth and fifth):
+    ///
+    /// - references `logs` only -> [`TargetSignal::Logs`].
+    /// - references `spans` only -> [`TargetSignal::Spans`].
+    /// - references `alerts` only -> [`TargetSignal::Alerts`].
+    /// - references `audit` only -> [`TargetSignal::Audit`].
+    /// - references `samples` only, or references no real table ->
+    ///   [`TargetSignal::Metrics`].
+    /// - references two or more of {`samples`, `logs`, `spans`, `alerts`,
+    ///   `audit`} -> [`SqlError::CrossSignalQuery`], the one-table rule
+    ///   ([`refuse_cross_signal`]) the single-snapshot entry points and ES|QL
+    ///   apply.
+    ///
+    /// The "no real table" case (a constant query such as `SELECT 1`, or one
+    /// whose only source is a CTE with no base table) defaults to `Metrics`: it
+    /// preserves the pre-ADR-0033 behavior exactly -- such a query resolved a
+    /// metrics snapshot and never touched it -- and `crate::validate` already
+    /// rules out anything that would need a data source it cannot reach. Only
+    /// the multiple-table case is genuinely unsupported, so only it is an error.
+    ///
+    /// ADR-2040 D6 adds Parquet tables, which this text-only answer cannot see:
+    /// whether a name is one is a fact about the store. A statement naming
+    /// only Parquet tables returns `Metrics` here, and [`Self::resolve_admitted`]
+    /// and [`Self::plan_pinned_with`] choose [`TargetSignal::Parquet`] once the
+    /// manifests are resolved.
+    #[cfg(test)]
+    fn target_signal(sql: &str) -> Result<TargetSignal, SqlError> {
+        let tables = Self::statement_tables(sql)?;
+        refuse_cross_signal(&tables)?;
+        Ok(tables.first_lane())
+    }
+
+    /// The base tables `sql` names: every signal table, in
+    /// [`SIGNAL_LANE_ORDER`], and every other name. More than
+    /// [`MAX_STATEMENT_TABLE_NAMES`] other names are
+    /// [`SqlError::TooManyTables`], so the Parquet resolve's one LIST per
+    /// name is bounded before it starts. Two signal tables are not refused
+    /// here: each entry point applies its own rule ([`refuse_cross_signal`]
+    /// on ES|QL and on the entry points that pin one snapshot,
+    /// [`admit_http_tokens`] on HTTP and Flight SQL).
+    pub(crate) fn statement_tables(sql: &str) -> Result<StatementTables, SqlError> {
+        let mut tables = referenced_base_tables(sql)?;
+        let signals: Vec<TargetSignal> = SIGNAL_LANE_ORDER
+            .into_iter()
+            .filter(|signal| {
+                crate::statement::signal_table_name(*signal).is_some_and(|name| tables.remove(name))
+            })
+            .collect();
+        if tables.len() > MAX_STATEMENT_TABLE_NAMES {
+            return Err(SqlError::TooManyTables {
+                count: tables.len(),
+                max: MAX_STATEMENT_TABLE_NAMES,
+            });
+        }
+        if signals.len() + tables.len() >= 2 {
+            refuse_shadowed_table_name(sql, &tables)?;
+        }
+        Ok(StatementTables {
+            signals,
+            others: tables,
+        })
+    }
+
+    /// Build a session over each lane's snapshot, plan, and drain the stream.
+    ///
+    /// Returns the batch count alongside the result because the retry
+    /// contract turns on whether anything was emitted before the failure.
+    #[allow(clippy::too_many_arguments)]
+    async fn attempt(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        statement: Statement<'_>,
+        req: &SqlRequest,
+        clocks: Clocks,
+        lanes: Vec<(TargetSignal, Snapshot)>,
+        phase_accounting: &StatementAccounting,
+        declared: &[DeclaredColumn],
+        parquet: Option<ParquetResolution>,
+        lane_parts: LaneParts,
+        spill_attempt: SpillAttempt,
+        spill_share: Option<SpillReservation>,
+        retry_figures: Option<RetryFigures>,
+    ) -> (
+        Result<QueryOutput, SqlError>,
+        usize,
+        BlockCounts,
+        SpillCounts,
+        Vec<OperatorSpill>,
+        AttemptCaps,
+    ) {
+        let mut wall = PhaseWallTiming::default();
+        let plan_started = Instant::now();
+        let planned = match self
+            .plan_pinned_with(
+                tenant_hash,
+                lanes,
+                statement,
+                phase_accounting,
+                PlanExtras {
+                    declared: declared.to_vec(),
+                    #[cfg(feature = "flight-sql")]
+                    distributed: None,
+                    row_window: req.row_window.then_some(req.window),
+                    budgets: req.budgets,
+                    column_stats_window: req.window,
+                    column_stats_now_ns: clocks.resolve_at_ns,
+                    key_index_now_ns: clocks.caller_now_ns,
+                    parquet: ParquetPlan::Resolved(parquet),
+                    capabilities,
+                    lane_parts,
+                    spill: spill_attempt,
+                    spill_share,
+                    retry_figures,
+                },
+            )
+            .await
+        {
+            Ok(planned) => planned,
+            Err(e) => {
+                return (
+                    Err(e),
+                    0,
+                    BlockCounts::default(),
+                    SpillCounts::default(),
+                    Vec::new(),
+                    AttemptCaps::default(),
+                );
+            }
+        };
+        wall.plan_ns = elapsed_ns(plan_started);
+        let schema = planned.schema();
+        // Read before `execute` consumes the planned query. Reported even on
+        // the paths below that fail: the filter was applied to the plan that
+        // failed, and saying otherwise would misreport what ran.
+        let window_predicate = planned.window_predicate().map(str::to_string);
+        let mut planned = planned;
+        let spill_probe = planned.spill_probe.take();
+        let spill_share = planned.spill_share;
+        let retry_plan = planned.retry_plan;
+        let retry_derivation = planned.retry_derivation;
+        // The spill retry reads the pool's refusal record after a failure,
+        // which can come before a stream exists to read it from.
+        let pool = Arc::clone(&planned.ctx.runtime_env().memory_pool);
+
+        let start_started = Instant::now();
+        let mut stream = match planned.with_row_cap(req.max_rows).execute().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                return (
+                    Err(e),
+                    0,
+                    BlockCounts::default(),
+                    SpillCounts::default(),
+                    Vec::new(),
+                    AttemptCaps {
+                        window_predicate,
+                        row_cap_hit: false,
+                        wall,
+                        peak_asked_bytes: 0,
+                        pool: PoolReport::of(&pool),
+                        spill_probe,
+                        spill_share,
+                        bucket_spill: None,
+                        rows_consumed: None,
+                        retry_plan,
+                        retry_derivation,
+                        retry_plan_text: None,
+                    },
+                );
+            }
+        };
+        wall.start_ns = elapsed_ns(start_started);
+
+        let mut batches = Vec::new();
+        let mut emitted = 0usize;
+        let mut drain_started = Instant::now();
+        while let Some(next) = stream.next().await {
+            match next {
+                Ok(batch) => {
+                    if emitted == 0 {
+                        wall.first_batch_ns = elapsed_ns(drain_started);
+                        drain_started = Instant::now();
+                    }
+                    emitted += 1;
+                    batches.push(batch);
+                }
+                // The scan's block counters are final only after a clean drain,
+                // so a mid-stream error reports none: a partial prune ratio
+                // would misattribute. The spill counters are different: they
+                // record what was written, and what was written before a
+                // failure was still written, so they are read on both paths.
+                Err(e) => {
+                    let (spill, by_operator) = stream.spill_counts();
+                    return (
+                        Err(e),
+                        emitted,
+                        BlockCounts::default(),
+                        spill,
+                        by_operator,
+                        AttemptCaps {
+                            window_predicate,
+                            row_cap_hit: stream.row_cap_hit(),
+                            wall,
+                            peak_asked_bytes: stream.peak_asked_bytes(),
+                            pool: PoolReport::of(&pool),
+                            spill_probe,
+                            spill_share,
+                            bucket_spill: stream.bucket_spill(),
+                            rows_consumed: stream.rows_consumed(),
+                            retry_plan,
+                            retry_derivation,
+                            retry_plan_text: None,
+                        },
+                    );
+                }
+            }
+        }
+        wall.drain_ns = elapsed_ns(drain_started);
+
+        // The stream drained cleanly: the plan's LogsScanExec counters are now
+        // final, so read them off the plan we kept.
+        let blocks = stream.block_counts();
+        let (spill, by_operator) = stream.spill_counts();
+        (
+            Ok(QueryOutput::new(schema, batches)),
+            emitted,
+            blocks,
+            spill,
+            by_operator,
+            AttemptCaps {
+                window_predicate,
+                row_cap_hit: stream.row_cap_hit(),
+                wall,
+                peak_asked_bytes: stream.peak_asked_bytes(),
+                pool: PoolReport::of(&pool),
+                spill_probe,
+                spill_share,
+                bucket_spill: stream.bucket_spill(),
+                rows_consumed: stream.rows_consumed(),
+                retry_plan,
+                retry_derivation,
+                retry_plan_text: retry_plan.map(|_| stream.plan_text()),
+            },
+        )
+    }
+
+    /// Whether the statement a first attempt classified into `probe` is
+    /// spill-eligible once the tie-order edit has run: the predicate the
+    /// spill retry's scratch reservation reads (issue #3899). Read only after
+    /// a refusal, so a first attempt that succeeds never pays for it. Fails
+    /// closed: a statement that does not classify is not eligible.
+    async fn spill_retry_eligible(
+        &self,
+        tenant_hash: TenantHash,
+        statement: Statement<'_>,
+        declared: &[DeclaredColumn],
+        probe: SpillProbe,
+    ) -> bool {
+        let analyzed = match probe.analyzed {
+            Some(plan) => Some(plan),
+            None => match statement.tables() {
+                Ok(tables) => self
+                    .analyzed_classification_plan(
+                        tenant_hash,
+                        statement,
+                        &tables,
+                        declared,
+                        probe.parquet_schemas.as_deref(),
+                        &probe.principal,
+                    )
+                    .await
+                    .unwrap_or(None),
+                Err(_) => None,
+            },
+        };
+        analyzed.is_some_and(|plan| {
+            plan_is_spill_eligible(&spill_tie_ordered(plan, probe.bounded_topk_max_limit))
+        })
+    }
+}
+
+/// What a first attempt keeps for [`SqlExecutor::spill_retry_eligible`]: its
+/// classification plan when it built one, and what building one takes when
+/// it did not.
+#[derive(Debug, Clone)]
+struct SpillProbe {
+    analyzed: Option<LogicalPlan>,
+    parquet_schemas: Option<Vec<(String, SchemaRef)>>,
+    principal: SessionPrincipal,
+    bounded_topk_max_limit: Option<usize>,
+}
+
+/// The ADR-0954 tie-order edit the spill decision reads: a plan
+/// disqualified for a reason no edit can fix (a `Join`, a float GROUP BY
+/// key, a non-exact aggregate) is returned unchanged.
+fn spill_tie_ordered(plan: LogicalPlan, max_limit: Option<usize>) -> LogicalPlan {
+    if plan_is_spill_eligible_ignoring_sort_order(&plan) {
+        tie_ordered_or_unchanged(plan, max_limit)
+    } else {
+        plan
+    }
+}
+
+/// A sort-merge retry's reason when it runs without a scratch area: no share
+/// remained, or its plan is not spill-eligible.
+const RETRY_SPILL_DISABLED: &str = "spill_disabled";
+
+/// A sort-merge retry's reason when the bucket candidate could not be built.
+const RETRY_BUCKET_PLAN_FAILED: &str = "bucket_plan_failed";
+
+/// A spill retry's reason when it failed before choosing a plan.
+const RETRY_NOT_PLANNED: &str = "not_planned";
+
+/// Plan the bucket retry's candidate over `logical` in a session built by
+/// [`build_bucket_retry_session`], decide whether to keep it
+/// ([`bucket_retry_tuning`]), and set the derived tuning on its bucketed
+/// execs. The error is the reason the retry keeps its sort-merge plan.
+#[allow(clippy::too_many_arguments)]
+async fn bucket_retry_plan(
+    config: &SqlConfig,
+    pool: &Arc<dyn MemoryPool>,
+    tables: Vec<SessionTable>,
+    exact_typed_aggregates: bool,
+    decision: SpillDecision<'_>,
+    principal: &SessionPrincipal,
+    logical: &LogicalPlan,
+    figures: BucketRetryFigures,
+) -> (
+    Result<(SessionContext, Arc<dyn ExecutionPlan>, BucketSpillTuning), &'static str>,
+    BucketRetryShape,
+) {
+    let failed = |err: DataFusionError| {
+        tracing::warn!(
+            error = %err,
+            "SQL spill retry kept its sort-merge plan: the bucket candidate did not plan"
+        );
+        RETRY_BUCKET_PLAN_FAILED
+    };
+    let candidate = match build_bucket_retry_session(
+        config,
+        Arc::clone(pool),
+        tables,
+        exact_typed_aggregates,
+        decision,
+        principal,
+    ) {
+        Ok(candidate) => candidate,
+        Err(err) => return (Err(failed(err)), BucketRetryShape::default()),
+    };
+    let placeholder = match candidate.state().create_physical_plan(logical).await {
+        Ok(placeholder) => placeholder,
+        Err(err) => return (Err(failed(err)), BucketRetryShape::default()),
+    };
+    let (tuning, shape) = bucket_retry_derivation(&placeholder, figures);
+    let tuning = match tuning {
+        Ok(tuning) => tuning,
+        Err(reason) => return (Err(reason), shape),
+    };
+    match with_bucket_spill_tuning(placeholder, tuning) {
+        Ok(plan) => {
+            install_aggregate_profile(&plan, pool);
+            (Ok((candidate, plan, tuning)), shape)
+        }
+        Err(err) => (Err(failed(err)), shape),
+    }
+}
+
+/// The memory pool a plan's session gets. A spill retry whose session gets
+/// a disk manager ([`SpillDecision::Enabled`]) gets the spill-mode pool,
+/// which refuses a spillable consumer early so it spills and leaves room for
+/// the consumers that cannot (issue #3899); every other plan gets the plain
+/// query pool. Taking the session's decision rather than a flag means a
+/// spill-mode pool never runs without a disk manager, where its early refusal
+/// would fail the consumer instead of spilling it. A retry whose per-query
+/// limit is no larger than the spill-mode headroom also gets the plain pool,
+/// where the spill-mode cap would be zero and no spillable consumer could
+/// hold even the batch it spills.
+fn attempt_pool(
+    config: &SqlConfig,
+    spill: SpillAttempt,
+    decision: SpillDecision<'_>,
+    tenant: Arc<TenantMemoryAccountant>,
+    accounting: QueryAccounting,
+    envelope_parallelism: Option<NonZeroUsize>,
+) -> (Arc<dyn MemoryPool>, Arc<CeilingBreach>) {
+    let spill_mode_cap = config
+        .max_query_bytes
+        .saturating_sub(crate::memory::spill_mode_headroom(config.max_query_bytes));
+    let envelope_width = config.envelope_width(envelope_parallelism);
+    match spill {
+        SpillAttempt::Retry
+            if matches!(decision, SpillDecision::Enabled { .. }) && spill_mode_cap > 0 =>
+        {
+            config.query_pool_spill_mode_at(tenant, accounting, envelope_width)
+        }
+        SpillAttempt::Retry | SpillAttempt::PlanTime | SpillAttempt::First => {
+            config.query_pool_at(tenant, accounting, envelope_width)
+        }
+    }
+}
+
+/// What a statement's memory pool recorded by the time its attempt ended, for
+/// [`spill_retry_decision`] and the spill retry's log line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PoolReport {
+    /// [`TenantDelegatingPool::refused`].
+    pub(crate) refused: bool,
+    /// [`TenantDelegatingPool::host_gate_refused`].
+    pub(crate) host_gate: bool,
+    /// [`TenantDelegatingPool::first_refusal`].
+    pub(crate) first: Option<MemoryRefusal>,
+    /// The refusing budget's figures, when the first refusal was a tenant
+    /// budget, process budget or accounted reserve-ahead refusal.
+    pub(crate) first_share: Option<BudgetShare>,
+    /// [`TenantDelegatingPool::peak_unspillable_bytes`].
+    pub(crate) peak_unspillable_bytes: u64,
+    /// The pool's per-query limit.
+    pub(crate) query_limit: u64,
+}
+
+impl PoolReport {
+    /// Read off `pool`; all default when it is not a [`TenantDelegatingPool`].
+    fn of(pool: &Arc<dyn MemoryPool>) -> Self {
+        pool.downcast_ref::<TenantDelegatingPool>()
+            .map_or_else(PoolReport::default, |pool| PoolReport {
+                refused: pool.refused(),
+                host_gate: pool.host_gate_refused(),
+                first: pool.first_refusal(),
+                first_share: pool.first_refusal_record().and_then(|record| record.share),
+                peak_unspillable_bytes: pool.peak_unspillable_bytes(),
+                query_limit: match pool.memory_limit() {
+                    MemoryLimit::Finite(limit) => limit as u64,
+                    MemoryLimit::Infinite | MemoryLimit::Unknown => u64::MAX,
+                },
+            })
+    }
+}
+
+/// What one [`SqlExecutor::attempt`] applied on top of the statement itself:
+/// the row-window predicate and whether the row cap cut the result, plus the
+/// wall time of the stages it ran. Carried
+/// out separately from [`SqlStats`] because an attempt that is later discarded
+/// by the retry must not leave its values behind.
+#[derive(Debug, Clone, Default)]
+struct AttemptCaps {
+    window_predicate: Option<String>,
+    row_cap_hit: bool,
+    wall: PhaseWallTiming,
+    peak_asked_bytes: u64,
+    /// The session pool's refusal record; default when planning failed
+    /// before a pool existed.
+    pool: PoolReport,
+    /// [`PinnedQuery::spill_probe`]: present only on a first attempt planned
+    /// with spill configured.
+    spill_probe: Option<SpillProbe>,
+    /// [`PinnedQuery::spill_share`].
+    spill_share: Option<u64>,
+    /// The plan's spilling bucketed execs, read on both paths like the
+    /// spill counters.
+    bucket_spill: Option<BucketSpillFigures>,
+    /// The plan's logs scans' consumed input rows when the attempt ended,
+    /// `None` when it had no logs scan or no stream.
+    rows_consumed: Option<u64>,
+    /// [`PinnedQuery::retry_plan`].
+    retry_plan: Option<RetryPlan>,
+    /// [`PinnedQuery::retry_derivation`].
+    retry_derivation: Option<RetryDerivation>,
+    /// The plan a spill retry drained, for [`SqlStats::spill_retry_plan`].
+    retry_plan_text: Option<String>,
+}
+
+/// What a spill retry's planning derived, for its INFO line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryDerivation {
+    /// [`retry_effective_limit`]: the limit the bucket tuning was derived at
+    /// and the bucketed retry's pool runs under.
+    effective_limit: usize,
+    /// What the derivation read from the bucket candidate.
+    shape: BucketRetryShape,
+}
+
+/// The refusal that earned a statement its spill retry.
+#[derive(Debug, Clone, Copy)]
+struct FirstRefusal {
+    class: &'static str,
+    after: Duration,
+    figures: RetryFigures,
+}
+
+impl FirstRefusal {
+    /// This refusal beside what the retry it earned did. `plan` is the plan
+    /// the retry chose, `None` when it failed before choosing one;
+    /// `derivation` what its planning derived; `peak_asked` its pool's peak
+    /// asked bytes; `error` its error when it failed.
+    #[allow(clippy::too_many_arguments)]
+    fn report(
+        self,
+        spill: SpillCounts,
+        by_operator: &[OperatorSpill],
+        plan: Option<RetryPlan>,
+        bucket: Option<BucketSpillFigures>,
+        pool: PoolReport,
+        share: Option<u64>,
+        derivation: Option<RetryDerivation>,
+        peak_asked: u64,
+        error: Option<&SqlError>,
+    ) -> SpillRetryReport {
+        let of = |operator: &str| {
+            by_operator
+                .iter()
+                .filter(|spill| spill.operator == operator)
+                .fold((0u64, 0u64, 0u64), |(files, bytes, rows), spill| {
+                    (
+                        files + spill.files,
+                        bytes + spill.bytes_written,
+                        rows + spill.rows_written,
+                    )
+                })
+        };
+        let (exchange_files, exchange_bytes, _) = of("RepartitionExec");
+        let (_, bucket_bytes, bucket_rows) = of("BucketedFinalAggregateExec");
+        let plan = plan.unwrap_or(RetryPlan::SortMerge(RETRY_NOT_PLANNED));
+        let (retry_plan, retry_plan_reason, tuning) = match plan {
+            RetryPlan::Bucket(tuning) => {
+                let name = match bucket {
+                    Some(bucket) if bucket.executed && !bucket.disk => "bucket_without_disk",
+                    _ => "bucket",
+                };
+                (name, None, Some(tuning))
+            }
+            RetryPlan::SortMerge(reason) => ("sort_merge", Some(reason), None),
+        };
+        let retry_refusal = retry_refusal_class(error);
+        let shape = derivation.map(|derivation| derivation.shape);
+        SpillRetryReport {
+            effective_limit_bytes: derivation.map(|derivation| derivation.effective_limit as u64),
+            first_attempt_asked_bytes: self.figures.asked_bytes,
+            first_attempt_consumed_rows: self.figures.consumed_rows,
+            scan_rows_total: shape.and_then(|shape| shape.total_rows),
+            spillable_consumers: shape.and_then(|shape| shape.spill_consumers),
+            final_partitions: shape.and_then(|shape| shape.partitions),
+            descriptor_need: shape.and_then(|shape| shape.descriptor_need),
+            bucket_spill_rows_read: bucket.map_or(0, |bucket| bucket.rows_read),
+            retry_peak_asked_bytes: peak_asked,
+            retry_refusal,
+            first_refusal: self.class,
+            first_refusal_after: self.after,
+            retry_plan,
+            retry_plan_reason,
+            bits: tuning.map(|tuning| tuning.bits),
+            routed_chunk_rows: tuning.map(|tuning| tuning.routed_chunk_rows),
+            routed_chunk_bytes: tuning.and_then(|tuning| tuning.routed_chunk_bytes),
+            spill_bytes_written: spill.bytes_written,
+            spill_bytes_read: spill.bytes_read,
+            spill_files: spill.files,
+            exchange_spill_bytes_written: exchange_bytes,
+            exchange_spill_files: exchange_files,
+            bucket_spill_bytes_written: bucket_bytes,
+            bucket_spill_bytes_read: bucket.map_or(0, |bucket| bucket.bytes_read),
+            bucket_spill_rows_written: bucket_rows,
+            peak_unspillable_bytes: pool.peak_unspillable_bytes,
+            share_bytes: share,
+            retry_pool_limit_bytes: pool.query_limit,
+        }
+    }
+}
+
+/// What ended a spill retry, read from the error it surfaced and nothing
+/// else: the retry's pool also records refusals the retry absorbed (a
+/// bucketed exec's spill, a partial aggregate's early emit, an exchange's
+/// spill), and the spill-mode cap's refusals record nothing there.
+/// `none` when it answered; `bucket_spill_undershoot` for an error carrying
+/// [`crate::BUCKET_SPILL_UNDERSHOOT`]; else the class the pool's refusal
+/// message names ([`crate::memory::refusal_class_of_message`]); `other` for
+/// any other error.
+fn retry_refusal_class(error: Option<&SqlError>) -> &'static str {
+    let Some(error) = error else {
+        return "none";
+    };
+    let message = error.to_string();
+    if message.contains(crate::BUCKET_SPILL_UNDERSHOOT) {
+        return "bucket_spill_undershoot";
+    }
+    match error {
+        SqlError::ResourcesExhausted(_) => {
+            crate::memory::refusal_class_of_message(&message).unwrap_or("other")
+        }
+        _ => "other",
+    }
+}
+
+/// What a statement's spill retry saw and did (issue #3899): the refusal
+/// that ended its first attempt, and the retry's spill totals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpillRetryReport {
+    /// The first attempt's refusal class: the pool layer that refused
+    /// (`query_pool`, `tenant_budget`, `process_budget`,
+    /// `aggregate_reserve_ahead`), or `fetch_memory_exhausted` for a fetch
+    /// layer's own ledger.
+    pub first_refusal: &'static str,
+    /// Wall time from the start of the refused attempt to its refusal,
+    /// resolve included.
+    pub first_refusal_after: Duration,
+    /// The retry's plan: `bucket` when it planned the hash exchange and a
+    /// bucketed final aggregate at the derived tuning,
+    /// `bucket_without_disk` when that plan's exec found a disk manager
+    /// that allows no temp files, so it could not spill, `sort_merge` when
+    /// it kept the repartition-free plan.
+    pub retry_plan: &'static str,
+    /// Why a `sort_merge` retry did not plan buckets: `not_admitted` (a
+    /// final aggregate the bucketed rule does not admit, or none),
+    /// `order_preserving_exchange`, a [`crate::NoTuning::reason`],
+    /// `bucket_plan_failed`, `spill_disabled` (the retry runs without a
+    /// scratch area) or `not_planned`. `None` for `bucket`.
+    pub retry_plan_reason: Option<&'static str>,
+    /// The bucketed retry's derived `bits`; `None` for `sort_merge`.
+    pub bits: Option<u8>,
+    /// The bucketed retry's derived `routed_chunk_rows`; `None` for
+    /// `sort_merge`.
+    pub routed_chunk_rows: Option<usize>,
+    /// The bucketed retry's derived chunk byte budget `B`, on a route with a
+    /// string or binary column (ADR-4143 decision 3); `None` for a
+    /// fixed-width route and for `sort_merge`.
+    pub routed_chunk_bytes: Option<usize>,
+    /// [`SpillCounts::bytes_written`] of the retry, over every operator.
+    pub spill_bytes_written: u64,
+    /// [`SpillCounts::bytes_read`] of the retry: `None` on DataFusion 55,
+    /// which does not measure it.
+    pub spill_bytes_read: Option<u64>,
+    /// [`SpillCounts::files`] of the retry.
+    pub spill_files: u64,
+    /// Spill-file bytes the retry's `RepartitionExec`s wrote. DataFusion 55
+    /// records none read back, so the exchange has no read figure.
+    pub exchange_spill_bytes_written: u64,
+    /// Spill files the retry's `RepartitionExec`s created.
+    pub exchange_spill_files: u64,
+    /// Scratch-file bytes the bucketed exec wrote: Arrow IPC after the
+    /// session's spill compression (lz4_frame on the retry), framing
+    /// included.
+    pub bucket_spill_bytes_written: u64,
+    /// Arrow bytes the bucketed exec decoded from its scratch files, each
+    /// file once: buffer lengths after decompression, so not comparable
+    /// with `bucket_spill_bytes_written`'s compressed file bytes.
+    pub bucket_spill_bytes_read: u64,
+    /// State rows the bucketed exec wrote.
+    pub bucket_spill_rows_written: u64,
+    /// The retry pool's largest reservation by consumers that cannot spill.
+    pub peak_unspillable_bytes: u64,
+    /// The spill-budget share the retry reserved, or `None` when less than
+    /// the minimum share remained and the retry ran without spill.
+    pub share_bytes: Option<u64>,
+    /// The per-query limit the bucket derivation ran at and a bucketed
+    /// retry's pool runs under ([`retry_effective_limit`]); `None` when the
+    /// retry ran without spill.
+    pub effective_limit_bytes: Option<u64>,
+    /// `A`: the first attempt's peak asked bytes at its refusal.
+    pub first_attempt_asked_bytes: u64,
+    /// `n`: the first attempt's consumed logs-scan input rows at its
+    /// refusal; `None` when it reported no counter.
+    pub first_attempt_consumed_rows: Option<u64>,
+    /// `N`: the bucket candidate's logs scan total input rows; `None` when
+    /// the derivation did not read the plan or the sum overflowed.
+    pub scan_rows_total: Option<u64>,
+    /// `C`: the bucket candidate's spill-capable consumers; `None` when the
+    /// derivation did not read the plan.
+    pub spillable_consumers: Option<usize>,
+    /// `P`: the bucket candidate's final partitions; `None` when the
+    /// derivation did not read the plan.
+    pub final_partitions: Option<usize>,
+    /// The derived tuning's `2 x P x 2^bits + P`; `None` when no tuning was
+    /// derived.
+    pub descriptor_need: Option<u64>,
+    /// State rows the bucketed exec read back from its scratch files.
+    pub bucket_spill_rows_read: u64,
+    /// The retry pool's peak asked bytes, the figure
+    /// [`SqlOutcome::peak_asked_intermediate_bytes`] reports. 0 for a
+    /// bucketed retry that failed before its pool granted any reservation,
+    /// one that failed before it asked for anything included.
+    pub retry_peak_asked_bytes: u64,
+    /// What ended the retry, read from the error it surfaced
+    /// ([`retry_refusal_class`]), not from the refusals its pool recorded:
+    /// a [`MemoryRefusal`] log name, `spill_hard_bound` (a spill-mode
+    /// refusal over the hard bound), `spill_cap` (one over the spill-mode
+    /// cap or a fair share of it, without the under-shoot label),
+    /// `bucket_spill_undershoot`, or `other`; `none` when it answered.
+    pub retry_refusal: &'static str,
+    /// The per-query limit of the pool the retry ran under: the effective
+    /// limit on a bucketed retry, the configured limit on a sort-merge one.
+    /// Not on the INFO line, which carries `effective_limit_bytes`.
+    pub retry_pool_limit_bytes: u64,
+}
+
+impl SpillRetryReport {
+    /// The one INFO line a statement that took a spill retry logs. `outcome`
+    /// is `answered` or `failed`.
+    fn emit(&self, fingerprint: &str, outcome: &'static str) {
+        fn or_none<T: ToString>(figure: Option<T>) -> String {
+            figure.map_or_else(|| "none".to_string(), |figure| figure.to_string())
+        }
+        tracing::info!(
+            statement_fingerprint = fingerprint,
+            outcome,
+            first_refusal = self.first_refusal,
+            first_refusal_after_ms =
+                u64::try_from(self.first_refusal_after.as_millis()).unwrap_or(u64::MAX),
+            spill_bytes_written = self.spill_bytes_written,
+            spill_bytes_read = self
+                .spill_bytes_read
+                .map_or_else(|| "unmeasured".to_string(), |bytes| bytes.to_string()),
+            spill_files = self.spill_files,
+            retry_plan = self.retry_plan,
+            retry_plan_reason = self.retry_plan_reason.unwrap_or("none"),
+            bits = self
+                .bits
+                .map_or_else(|| "none".to_string(), |bits| bits.to_string()),
+            routed_chunk_rows = self
+                .routed_chunk_rows
+                .map_or_else(|| "none".to_string(), |rows| rows.to_string()),
+            routed_chunk_bytes = or_none(self.routed_chunk_bytes),
+            exchange_spill_bytes_written = self.exchange_spill_bytes_written,
+            exchange_spill_files = self.exchange_spill_files,
+            bucket_spill_bytes_written = self.bucket_spill_bytes_written,
+            bucket_spill_bytes_read = self.bucket_spill_bytes_read,
+            bucket_spill_rows_written = self.bucket_spill_rows_written,
+            peak_unspillable_bytes = self.peak_unspillable_bytes,
+            share_bytes = self.share_bytes.unwrap_or(0),
+            effective_limit_bytes = or_none(self.effective_limit_bytes),
+            first_attempt_asked_bytes = self.first_attempt_asked_bytes,
+            first_attempt_consumed_rows = or_none(self.first_attempt_consumed_rows),
+            scan_rows_total = or_none(self.scan_rows_total),
+            spillable_consumers = or_none(self.spillable_consumers),
+            final_partitions = or_none(self.final_partitions),
+            descriptor_need = or_none(self.descriptor_need),
+            bucket_spill_rows_read = self.bucket_spill_rows_read,
+            retry_peak_asked_bytes = self.retry_peak_asked_bytes,
+            retry_refusal = self.retry_refusal,
+            "SQL statement retried with spill after a memory refusal"
+        );
+    }
+}
+
+/// A query planned against one pinned snapshot, not yet executing.
+///
+/// Owns the throwaway `SessionContext` built by
+/// [`SqlExecutor::plan_pinned`], so dropping it drops the session, its
+/// `RuntimeEnv`, and its memory pool. Exposing the planned schema before
+/// execution is what lets Flight SQL's `GetFlightInfo` answer with the result
+/// schema without reading a single segment.
+pub struct PinnedQuery {
+    ctx: SessionContext,
+    frame: DataFrame,
+    schema: SchemaRef,
+    /// The best-effort memory ceiling's abort flag, tripped by the pool's
+    /// `grow` and moved into the [`PinnedStream`] on execute.
+    breach: Arc<CeilingBreach>,
+    /// This query's spill scratch directory (ADR-0954), present only when
+    /// spill is configured AND this plan passed the eligibility predicate.
+    /// Declared after `ctx` so it drops after the session that owns the files
+    /// inside it, and moved into the [`PinnedStream`] on execute so a query
+    /// abandoned mid-stream still removes its scratch.
+    scratch: Option<SpillScratch>,
+    /// [`SqlRequest::max_rows`], moved into the [`PinnedStream`] on execute.
+    row_cap: Option<usize>,
+    /// The row filter [`SqlRequest::row_window`] put above each scan, for
+    /// [`SqlStats::window_predicate`]. `None` when none was requested.
+    window_predicate: Option<String>,
+    /// What the spill retry classifies the statement with, kept by a first
+    /// attempt with spill configured (issue #3899). `None` on every other
+    /// plan.
+    spill_probe: Option<SpillProbe>,
+    /// The scratch bytes this plan reserved from the spill ceiling, `None`
+    /// when it runs without spill.
+    spill_share: Option<u64>,
+    /// The physical plan to execute in place of one built from `frame`: the
+    /// bucket retry's plan at its derived tuning. `None` on every other plan.
+    physical: Option<Arc<dyn ExecutionPlan>>,
+    /// The plan a spill retry chose; `None` on every other plan.
+    retry_plan: Option<RetryPlan>,
+    /// What a spill retry with spill enabled derived; `None` on every other
+    /// plan.
+    retry_derivation: Option<RetryDerivation>,
+}
+
+impl PinnedQuery {
+    /// The planned result schema.
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    /// Stop this query's stream once `max_rows` rows have been emitted, plus
+    /// one (ADR-1374 decision 3, prerequisite 4). `None` drains to completion.
+    ///
+    /// The extra row is the point: with it, the caller can tell a complete
+    /// result from a cut one without a second query, which is what
+    /// [`SqlStats::row_cap_hit`] reports.
+    #[must_use]
+    pub fn with_row_cap(mut self, max_rows: Option<usize>) -> Self {
+        self.row_cap = max_rows;
+        self
+    }
+
+    /// The row filter [`SqlRequest::row_window`] applied above each scan, or
+    /// `None` when the request did not ask for one.
+    pub fn window_predicate(&self) -> Option<&str> {
+        self.window_predicate.as_deref()
+    }
+
+    /// The scratch bytes this plan reserved from the process spill ceiling,
+    /// or `None` when it runs without spill.
+    pub fn spill_share_bytes(&self) -> Option<u64> {
+        self.spill_share
+    }
+
+    /// Every table this query's session registered, sorted: one provider per
+    /// signal table the statement reads, and the Parquet tables it names.
+    pub fn registered_tables(&self) -> Vec<String> {
+        let mut tables = Vec::new();
+        for catalog_name in self.ctx.catalog_names() {
+            let Some(catalog) = self.ctx.catalog(&catalog_name) else {
+                continue;
+            };
+            for schema_name in catalog.schema_names() {
+                if let Some(schema) = catalog.schema(&schema_name) {
+                    tables.extend(schema.table_names());
+                }
+            }
+        }
+        tables.sort();
+        tables
+    }
+
+    /// Whether this query's session resolves `tenant`'s Parquet store URL,
+    /// which only a session built with the Parquet store registry does.
+    pub fn reaches_parquet_store(&self, tenant: &TenantHash) -> bool {
+        datafusion::execution::object_store::ObjectStoreUrl::parse(ravel_parquet::store_url(tenant))
+            .is_ok_and(|url| self.ctx.runtime_env().object_store(&url).is_ok())
+    }
+
+    /// Build the physical plan for this query without consuming it or starting
+    /// a stream, for plan-shape inspection (ADR-0094 decision 5's EXPLAIN-shape
+    /// tests assert whether a `RepartitionExec` fans the `Final` `AggregateExec`
+    /// out). This is the same first step [`Self::execute`] takes, run over the
+    /// frame's logical plan by reference so it can be called on a borrow.
+    pub async fn create_physical_plan(&self) -> Result<Arc<dyn ExecutionPlan>, SqlError> {
+        if let Some(plan) = &self.physical {
+            return Ok(Arc::clone(plan));
+        }
+        self.ctx
+            .state()
+            .create_physical_plan(self.frame.logical_plan())
+            .await
+            .map_err(plan_error)
+    }
+
+    /// Start the plan's stream. The session stays alive inside the returned
+    /// [`PinnedStream`] for as long as the stream does.
+    pub async fn execute(self) -> Result<PinnedStream, SqlError> {
+        let PinnedQuery {
+            ctx,
+            frame,
+            schema,
+            breach,
+            scratch,
+            row_cap,
+            window_predicate: _,
+            spill_probe: _,
+            spill_share: _,
+            physical,
+            retry_plan: _,
+            retry_derivation: _,
+        } = self;
+        // Build the physical plan explicitly rather than through
+        // `frame.execute_stream()` (which does the same two steps internally)
+        // so the plan handle survives the stream and its `LogsScanExec`
+        // DataFusion counters can be read after the drain. The two
+        // are equivalent: `execute_stream` is `create_physical_plan` then
+        // `execute_stream(plan, task_ctx)`.
+        let plan = match physical {
+            Some(plan) => plan,
+            None => frame.create_physical_plan().await.map_err(plan_error)?,
+        };
+        Ok(
+            PinnedStream::start_with_scratch(ctx, plan, schema, breach, scratch)?
+                .with_row_cap(row_cap),
+        )
+    }
+
+    /// Run this query to completion, or to the row cap, and render the plan it
+    /// executed with DataFusion's per-operator metrics, the `EXPLAIN ANALYZE`
+    /// view (ADR-2867 change 7 item 3). When the row cap stops the run, the
+    /// metrics cover only the rows produced before the cut.
+    ///
+    /// The batches go through the same [`PinnedStream`] [`Self::execute`]
+    /// returns, so the memory ceiling, the row cap and the panic boundary
+    /// apply exactly as they do there; a failure mid-stream returns the
+    /// error and no plan. The plan is rendered after the drain from the same
+    /// handle the stream executed, which is where the operators recorded
+    /// their metrics. The rows themselves are counted and dropped.
+    pub async fn execute_analyzed(self) -> Result<AnalyzedRun, SqlError> {
+        let PinnedQuery {
+            ctx,
+            frame,
+            schema,
+            breach,
+            scratch,
+            row_cap,
+            window_predicate: _,
+            spill_probe: _,
+            spill_share: _,
+            physical,
+            retry_plan: _,
+            retry_derivation: _,
+        } = self;
+        let plan = match physical {
+            Some(plan) => plan,
+            None => frame.create_physical_plan().await.map_err(plan_error)?,
+        };
+        let mut stream =
+            PinnedStream::start_with_scratch(ctx, Arc::clone(&plan), schema, breach, scratch)?
+                .with_row_cap(row_cap);
+        let mut rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            rows += batch?.num_rows();
+        }
+        let row_cap_hit = stream.row_cap_hit();
+        drop(stream);
+        let plan_with_metrics = DisplayableExecutionPlan::with_metrics(plan.as_ref())
+            .indent(true)
+            .to_string();
+        Ok(AnalyzedRun {
+            plan_with_metrics,
+            rows,
+            row_cap_hit,
+        })
+    }
+}
+
+/// What [`PinnedQuery::execute_analyzed`] returns: the executed plan with
+/// its metrics, and how many rows the run produced.
+#[derive(Debug, Clone)]
+pub struct AnalyzedRun {
+    /// The executed physical plan, rendered as DataFusion's indented display
+    /// with each operator's `metrics=[...]`.
+    pub plan_with_metrics: String,
+    /// Rows the stream emitted. With a row cap set this is at most the cap
+    /// plus one, and [`Self::row_cap_hit`] says whether the cap cut it.
+    pub rows: usize,
+    /// Whether the row cap set by [`PinnedQuery::with_row_cap`] cut the run.
+    pub row_cap_hit: bool,
+}
+
+/// A running plan's `RecordBatch` stream, with its session attached.
+///
+/// Dropping this mid-stream is the cancellation path: the plan's operators
+/// and their `MemoryReservation`s drop with it, each reservation's `Drop`
+/// calls `MemoryPool::shrink`, and `TenantDelegatingPool` forwards that to
+/// the tenant accountant (crate::memory). No transport needs an
+/// explicit release step, and adding one would double-count.
+pub struct PinnedStream {
+    _ctx: SessionContext,
+    inner: SendableRecordBatchStream,
+    schema: SchemaRef,
+    /// The best-effort memory ceiling's abort flag. Checked
+    /// before every delegated poll; once the pool's `grow` has tripped it,
+    /// the stream fails with [`SqlError::ResourcesExhausted`] instead of
+    /// running the over-budget plan to completion.
+    breach: Arc<CeilingBreach>,
+    /// The physical plan behind `inner`, kept so its `LogsScanExec` block
+    /// counters can be read once the stream has drained. Holding
+    /// it changes nothing about execution: the operators live in `inner`, and
+    /// this is the same `Arc` handle.
+    plan: Arc<dyn ExecutionPlan>,
+    /// Set once an operator has panicked under [`Stream::poll_next`]. A stream
+    /// whose poll unwound is left in whatever state the panic interrupted, so
+    /// it is never polled again; this fuses it instead.
+    panicked: bool,
+    /// The pool installed on `ctx`'s `RuntimeEnv` (issue #740). Read at every
+    /// execution-error mapping so a `ResourcesExhausted` DataFusion raises
+    /// against a spill-capable operator (which names the operator holding the
+    /// reservation, not the consumer that filled it) can be re-attributed from
+    /// this pool's own `used`/`limit`, the same pool `try_grow` refused
+    /// against. Derived from `ctx` in [`Self::start`] rather than threaded in
+    /// separately, so no caller of `start` changes.
+    pool: Arc<dyn MemoryPool>,
+    /// Spill bookkeeping for this query (ADR-0954), `None` whenever the
+    /// session's disk manager is disabled -- which is every query on the
+    /// default configuration, so the default path pays nothing for this.
+    spill: Option<SpillState>,
+    /// [`SqlRequest::max_rows`]: stop after this many rows plus one. `None`
+    /// drains the plan, which is every pre-ADR-1374 caller.
+    row_cap: Option<usize>,
+    /// Rows emitted so far, counted only while `row_cap` is set.
+    rows_emitted: usize,
+    /// Set once the cap-plus-one'th row was emitted, meaning the plan had more
+    /// rows than the caller asked for.
+    row_cap_hit: bool,
+    /// This query's scratch directory. Declared LAST so it drops after `_ctx`:
+    /// the session's `RuntimeEnv` owns the spill files inside it and must
+    /// release them first. Removing the directory here is what makes cleanup
+    /// hold on the completion, error, AND cancellation paths alike -- all
+    /// three end with this value dropping.
+    _scratch: Option<SpillScratch>,
+}
+
+/// The live spill bookkeeping [`PinnedStream`] keeps while a query with an
+/// enabled disk manager runs.
+struct SpillState {
+    /// The session's disk manager, for its `spilling_progress()` gauge: the
+    /// bytes currently written across this query's spill files, and how many
+    /// of those files are open.
+    disk_manager: Arc<DiskManager>,
+    /// The configured per-query scratch ceiling, echoed in
+    /// [`SqlError::spill_budget_exhausted`]. Read from the disk manager rather
+    /// than threaded in, so it is the ceiling actually installed.
+    quota: u64,
+    /// Set while the last poll observed at least one open spill file; `None`
+    /// otherwise. See [`SpillCounts::duration`] for exactly what the resulting
+    /// figure measures.
+    active_since: Option<Instant>,
+    /// Accumulated spill window across every open/close cycle so far.
+    elapsed: Duration,
+}
+
+impl PinnedStream {
+    /// Execute `plan` under `ctx` and wrap its stream in this type's ceiling
+    /// and panic boundaries.
+    ///
+    /// This is the constructor [`PinnedQuery::execute`] uses. It is public so
+    /// a test can drive a plan the `SqlExecutor` path cannot produce: that
+    /// path registers exactly one table provider of its own choosing
+    /// (`crate::session::build_session`, security invariant 1), so an operator
+    /// that panics on demand has no way in through it.
+    pub fn start(
+        ctx: SessionContext,
+        plan: Arc<dyn ExecutionPlan>,
+        schema: SchemaRef,
+        breach: Arc<CeilingBreach>,
+    ) -> Result<Self, SqlError> {
+        PinnedStream::start_with_scratch(ctx, plan, schema, breach, None)
+    }
+
+    /// [`Self::start`] with this query's spill scratch directory attached
+    /// (ADR-0954), so the directory outlives the stream and is removed when the
+    /// stream drops. `None` is byte-identical to [`Self::start`].
+    pub fn start_with_scratch(
+        ctx: SessionContext,
+        plan: Arc<dyn ExecutionPlan>,
+        schema: SchemaRef,
+        breach: Arc<CeilingBreach>,
+        scratch: Option<SpillScratch>,
+    ) -> Result<Self, SqlError> {
+        // The same pool `build_session` installed on `ctx`'s `RuntimeEnv`
+        // (`crate::session`), read back here rather than passed in: every
+        // `ResourcesExhausted` this stream maps needs it, and deriving it from
+        // `ctx` keeps every `start` caller (the local path, the Flight SQL
+        // worker fragment, and the panic-boundary test) unchanged.
+        let pool = Arc::clone(&ctx.runtime_env().memory_pool);
+        // Same derivation for the disk manager: whether this query can spill
+        // at all is a property of the session `build_session` built, not
+        // something a caller of this constructor should be able to disagree
+        // with. `tmp_files_enabled()` is false for every `SpillDecision::
+        // Disabled` session, which is every session on the default config.
+        let disk_manager = Arc::clone(&ctx.runtime_env().disk_manager);
+        let spill = disk_manager.tmp_files_enabled().then(|| SpillState {
+            quota: disk_manager.max_temp_directory_size(),
+            disk_manager,
+            active_since: None,
+            elapsed: Duration::ZERO,
+        });
+        let inner = execute_stream(Arc::clone(&plan), ctx.task_ctx()).map_err(plan_error)?;
+        Ok(PinnedStream {
+            _ctx: ctx,
+            inner,
+            schema,
+            breach,
+            plan,
+            panicked: false,
+            pool,
+            spill,
+            row_cap: None,
+            rows_emitted: 0,
+            row_cap_hit: false,
+            _scratch: scratch,
+        })
+    }
+
+    /// Stop this stream after `max_rows` rows plus one (ADR-1374 decision 3,
+    /// prerequisite 4). `None` is byte-identical to an uncapped stream.
+    ///
+    /// Ending early drops `inner` with the stream, which is the existing
+    /// cancellation path: every operator's `MemoryReservation` drops with it
+    /// and shrinks back through `TenantDelegatingPool` into the tenant
+    /// accountant, exactly as on a normal end of stream. There is no separate
+    /// release step to get wrong, and adding one would double-count.
+    #[must_use]
+    pub fn with_row_cap(mut self, max_rows: Option<usize>) -> Self {
+        self.row_cap = max_rows;
+        self
+    }
+
+    /// Whether the cap set by [`Self::with_row_cap`] cut this result: true
+    /// once the cap-plus-one'th row was emitted. Always false for an uncapped
+    /// stream and for a result that fit inside its cap.
+    pub fn row_cap_hit(&self) -> bool {
+        self.row_cap_hit
+    }
+
+    /// The stream's schema, identical to the planned schema.
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    /// The `(blocks_total, blocks_scanned, blocks_pruned_by_postings)` the
+    /// plan's logs scan recorded. Meaningful only once the stream has drained;
+    /// zero on a plan with no logs scan. Reads the existing DataFusion counters
+    ///.
+    fn block_counts(&self) -> BlockCounts {
+        let mut counts = BlockCounts::default();
+        accumulate_block_counts(&self.plan, &mut counts);
+        counts
+    }
+
+    /// The pool's pre-factor high-water mark of requested bytes, 0 when the
+    /// stream's pool is not a [`TenantDelegatingPool`].
+    fn peak_asked_bytes(&self) -> u64 {
+        self.pool
+            .downcast_ref::<TenantDelegatingPool>()
+            .map_or(0, TenantDelegatingPool::peak_asked_bytes)
+    }
+
+    /// This query's spill totals and their per-operator attribution
+    /// (ADR-0954), read off the plan's own DataFusion counters the same way
+    /// [`Self::block_counts`] reads the scan's.
+    ///
+    /// Meaningful once the stream has stopped producing, whether it drained or
+    /// failed: a spill that happened before a failure is still a fact about the
+    /// query. All zero, with no operators listed, for a query that did not
+    /// spill.
+    pub fn spill_counts(&self) -> (SpillCounts, Vec<OperatorSpill>) {
+        let mut totals = SpillCounts::default();
+        let mut by_operator = Vec::new();
+        accumulate_spill_counts(&self.plan, &mut totals, &mut by_operator);
+        totals.duration = self
+            .spill
+            .as_ref()
+            .map_or(Duration::ZERO, SpillState::window);
+        (totals, by_operator)
+    }
+
+    /// The spilling bucketed execs' tuning and bytes read back, `None` when
+    /// the plan has none.
+    fn bucket_spill(&self) -> Option<BucketSpillFigures> {
+        bucket_spill_figures(&self.plan)
+    }
+
+    /// The executed plan rendered as `EXPLAIN` renders it.
+    fn plan_text(&self) -> String {
+        datafusion::physical_plan::displayable(self.plan.as_ref())
+            .indent(false)
+            .to_string()
+    }
+
+    /// The input rows the plan's logs scans have consumed so far, the bucket
+    /// retry's `n`; `None` when the plan has no logs scan.
+    fn rows_consumed(&self) -> Option<u64> {
+        fn walk(plan: &Arc<dyn ExecutionPlan>, total: &mut Option<u64>) {
+            if let Some(scan) = plan.downcast_ref::<crate::logs_scan::LogsScanExec>() {
+                let rows = u64::try_from(scan.rows_consumed()).unwrap_or(u64::MAX);
+                *total = Some(total.unwrap_or(0).saturating_add(rows));
+            }
+            for child in plan.children() {
+                walk(child, total);
+            }
+        }
+        let mut total = None;
+        walk(&self.plan, &mut total);
+        total
+    }
+
+    /// Sample the disk manager's open-spill-file gauge and fold the interval
+    /// since the previous sample into the spill window. Called on every poll
+    /// of a spill-enabled query and never on any other, so the default path
+    /// runs none of it.
+    fn sample_spill_window(&mut self) {
+        let Some(spill) = self.spill.as_mut() else {
+            return;
+        };
+        let active = spill.disk_manager.spilling_progress().active_files_count > 0;
+        match (active, spill.active_since) {
+            (true, None) => spill.active_since = Some(Instant::now()),
+            (false, Some(since)) => {
+                spill.elapsed = spill.elapsed.saturating_add(since.elapsed());
+                spill.active_since = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply the row cap to one emitted batch (ADR-1374 decision 3,
+    /// prerequisite 4).
+    ///
+    /// The budget is `cap + 1` rows, not `cap`: the extra row is what tells
+    /// the caller the result was cut rather than complete. A batch that
+    /// crosses the budget is sliced to it, so the emitted total is exactly
+    /// `cap + 1` and never a whole batch more.
+    fn cap_batch(&mut self, batch: RecordBatch) -> Option<Result<RecordBatch, SqlError>> {
+        let Some(cap) = self.row_cap else {
+            return Some(Ok(batch));
+        };
+        let allowance = cap.saturating_add(1).saturating_sub(self.rows_emitted);
+        if allowance == 0 {
+            self.row_cap_hit = true;
+            return None;
+        }
+        let batch = if batch.num_rows() > allowance {
+            batch.slice(0, allowance)
+        } else {
+            batch
+        };
+        self.rows_emitted += batch.num_rows();
+        // Strictly greater: a result that exactly fills the cap was not cut.
+        if self.rows_emitted > cap {
+            self.row_cap_hit = true;
+        }
+        Some(Ok(batch))
+    }
+
+    /// Map an execution error, classifying the two spill-specific failures
+    /// first (ADR-0954). Kept here rather than inside [`execution_error`]
+    /// because only the stream holds the disk manager the figures come from.
+    ///
+    /// Runs only for a query whose disk manager is enabled, so a query on the
+    /// default configuration reaches `execution_error` by exactly the path it
+    /// did before spill existed.
+    fn map_execution_error(&self, err: DataFusionError) -> SqlError {
+        if let Some(spill) = self.spill.as_ref()
+            && let Some(failure) = spill_failure_kind(&err)
+        {
+            return spill_error(failure, spill.disk_manager.used_disk_space(), spill.quota);
+        }
+        execution_error(err, &self.pool)
+    }
+}
+
+/// The typed error for a spill failure, its figures restated from the
+/// query's disk manager: `used` bytes of scratch held when the failure
+/// arrived, of a `quota`.
+fn spill_error(failure: SpillFailure, used: u64, quota: u64) -> SqlError {
+    match failure {
+        // DataFusion raises the scratch-quota trip as an IO error from
+        // its spill writer, which the Arrow IPC writer wraps, with text
+        // telling the caller to raise a DataFusion option no Ravel
+        // client can reach. The memory and scratch
+        // budgets are independently enforced, so they stay
+        // independently reportable: re-typed here, with the figures
+        // restated from the disk manager's own gauge.
+        SpillFailure::Quota => SqlError::spill_budget_exhausted(used, quota),
+        // A filesystem error reaching this stream while spill is
+        // enabled is a scratch failure: every read of durable data
+        // goes through this crate's own fetchers, which surface as
+        // `SqlError::Fetch`/`LogFetch`/`SpanFetch`, never as a bare
+        // DataFusion IO error. The commonest cause is the scratch
+        // volume filling mid-write.
+        SpillFailure::Io(detail) => SqlError::SpillUnavailable(format!(
+            "spill file write failed while the query held \
+             {used} of {quota} scratch bytes: {detail}"
+        )),
+    }
+}
+
+/// The two spill-specific failures, told apart from every other execution
+/// error.
+enum SpillFailure {
+    /// The per-query scratch quota was exceeded.
+    Quota,
+    /// The scratch area could not be written; the payload is the IO detail,
+    /// logged server-side only.
+    Io(String),
+}
+
+/// Find a spill failure at any wrapper depth, mirroring
+/// [`take_sql_error`]'s unwrapping but by reference: the error is still needed
+/// intact if this returns `None`.
+fn spill_failure_kind(err: &DataFusionError) -> Option<SpillFailure> {
+    match err {
+        DataFusionError::IoError(io)
+            if io
+                .to_string()
+                .contains(crate::error::MSG_SPILL_QUOTA_MARKER) =>
+        {
+            Some(SpillFailure::Quota)
+        }
+        // DataFusion 55 raises a failed spill-file write inside the Arrow IPC
+        // writer, so it arrives through the `ArrowError::IoError` arm below;
+        // this arm is reached by spill file creation and read-back.
+        DataFusionError::IoError(io) => Some(SpillFailure::Io(io.to_string())),
+        DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
+            spill_failure_kind(inner)
+        }
+        DataFusionError::Shared(inner) => spill_failure_kind(inner),
+        DataFusionError::External(boxed) => boxed
+            .downcast_ref::<DataFusionError>()
+            .and_then(spill_failure_kind),
+        DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {
+            ArrowError::IoError(desc, _) if desc.contains(crate::error::MSG_SPILL_QUOTA_MARKER) => {
+                Some(SpillFailure::Quota)
+            }
+            ArrowError::IoError(desc, _) => Some(SpillFailure::Io(desc.clone())),
+            ArrowError::ExternalError(boxed) => boxed
+                .downcast_ref::<DataFusionError>()
+                .and_then(spill_failure_kind),
+            _ => None,
+        },
+        DataFusionError::Collection(errors) => errors.iter().find_map(spill_failure_kind),
+        _ => None,
+    }
+}
+
+impl SpillState {
+    /// The spill window so far, including an interval still open at the moment
+    /// of the call.
+    fn window(&self) -> Duration {
+        match self.active_since {
+            Some(since) => self.elapsed.saturating_add(since.elapsed()),
+            None => self.elapsed,
+        }
+    }
+}
+
+impl Stream for PinnedStream {
+    type Item = Result<RecordBatch, SqlError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // The best-effort memory ceiling's hard-abort seam. The
+        // pool's `grow` cannot decline a reservation, so a join that overruns
+        // a ceiling reserves the bytes and then trips the breach. This is the
+        // one place every batch from every transport (HTTP SQL and Flight SQL,
+        // crate::flight) passes through, so checking here aborts both.
+        //
+        // The abort fires on the poll *after* the `grow` that tripped it: the
+        // batch already in flight during that `grow` is not retroactively
+        // suppressed. That is intentional, not a gap. `grow` runs synchronously
+        // inside an operator's own `poll`, deep under `inner.poll_next_unpin`;
+        // the earliest seam that sees the tripped flag without reaching into
+        // DataFusion's operators is the next poll of this outer stream. Bounding
+        // the overshoot to one more in-flight batch is the whole point of the
+        // ticket -- it stops the query short of running to completion over
+        // budget, which is what happened before.
+        if let Some(message) = self.breach.message() {
+            return Poll::Ready(Some(Err(SqlError::ResourcesExhausted(message.to_string()))));
+        }
+        if self.panicked {
+            return Poll::Ready(None);
+        }
+        // The row cap (ADR-1374 decision 3, prerequisite 4) has already
+        // yielded its cap-plus-one'th row: stop without polling the plan
+        // again. `inner` is dropped undrained with this stream, which releases
+        // every reservation through the pool exactly as a full drain does.
+        if self.row_cap_hit {
+            return Poll::Ready(None);
+        }
+        // The panic boundary (issue #737). A panic raised inside a DataFusion
+        // operator, or inside an arrow kernel it calls, unwinds through this
+        // poll: an `i32` offset overflow while a group-by table is decoded is
+        // the case that put it here, but nothing about the boundary is
+        // specific to that one. Unwinding past here kills whichever task is
+        // driving the query -- the HTTP handler or the Flight `DoGet` -- and
+        // the client sees a dropped connection rather than an error.
+        //
+        // `AssertUnwindSafe` is the honest annotation and not a shortcut: the
+        // borrows crossing the boundary really can be left inconsistent by a
+        // panic, which is exactly why `panicked` fuses the stream instead of
+        // resuming it. The default panic hook still runs, so the operator's
+        // own message and backtrace reach stderr before this returns.
+        let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.inner.poll_next_unpin(cx)
+        }));
+        match polled {
+            Ok(next) => {
+                // ADR-0954's spill window, sampled once per poll and only for
+                // a query whose disk manager is enabled. See
+                // `SpillCounts::duration` for what the resulting figure is and
+                // is not.
+                self.sample_spill_window();
+                match next {
+                    Poll::Ready(Some(Err(err))) => {
+                        Poll::Ready(Some(Err(self.map_execution_error(err))))
+                    }
+                    Poll::Ready(Some(Ok(batch))) => Poll::Ready(self.cap_batch(batch)),
+                    Poll::Ready(None) => Poll::Ready(None),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            Err(payload) => {
+                self.panicked = true;
+                // `payload.as_ref()`, not `&payload`: coercing the `Box`
+                // itself to `&dyn Any` would downcast the box rather than
+                // what it holds, and every arm would miss.
+                let message = panic_message(payload.as_ref());
+                Poll::Ready(Some(Err(SqlError::OperatorPanic(message))))
+            }
+        }
+    }
+}
+
+/// The message carried by a caught panic, for the server-side log.
+///
+/// `panic!` payloads are `&'static str` for a literal and `String` for a
+/// formatted message; anything else came from `panic_any` and has no text to
+/// recover.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "panic with a non-string payload".to_string()
+    }
+}
+
+/// What to do after a failed attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryDecision {
+    /// Re-resolve at the same resolve instant with the same per-lane tokens
+    /// and re-execute.
+    RetryOnce,
+    /// Fail with [`SqlError::SnapshotInvalidated`].
+    FailInvalidated,
+    /// Not a snapshot problem: return the original error unchanged.
+    Propagate,
+}
+
+/// The whole retry contract, as a pure function of three facts.
+///
+/// Isolated from the I/O so every combination is testable, including the
+/// post-emission branch. That branch is *not* reachable end-to-end against
+/// today's `RsegScanExec`: a partition fetches every one of its segments
+/// before it emits its first batch, and `SortPreservingMergeExec` needs one
+/// batch from every partition before it emits anything, so a store
+/// `NotFound` always surfaces with `emitted == 0`. The branch exists because
+/// the consistency model requires the behavior, and it becomes reachable the
+/// moment the scan fetches lazily per segment (or Flight SQL streams to a
+/// slow consumer). Deleting it as "dead" would silently
+/// convert a future lazy scan into one that re-runs a partially-emitted
+/// query and duplicates rows.
+pub(crate) fn retry_decision(retryable: bool, emitted: usize, attempt: u32) -> RetryDecision {
+    if !retryable {
+        return RetryDecision::Propagate;
+    }
+    if emitted > 0 {
+        // Partial emission already happened: re-running the plan would
+        // duplicate rows. Fail immediately, zero retries.
+        return RetryDecision::FailInvalidated;
+    }
+    if attempt == 0 {
+        RetryDecision::RetryOnce
+    } else {
+        // Second NotFound: the snapshot is genuinely gone.
+        RetryDecision::FailInvalidated
+    }
+}
+
+/// What to do after an attempt failed, as far as spilling goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpillRetry {
+    /// Re-resolve and run again, planned with spill allowed, a share of the
+    /// spill budget reserved, and the spill-mode pool.
+    Retry,
+    /// Return the error as it is.
+    Propagate,
+}
+
+/// The spill retry's trigger, as a pure function of what the failed attempt
+/// left behind (issue #3899). A first attempt runs with spill off; this
+/// decides whether its failure earns one more attempt with spill on. Every
+/// condition must hold:
+///
+/// - the error is a `ResourcesExhausted` the session's pool refused itself
+///   (`pool.refused`), and the pool's first refusal is the statement's own
+///   ([`refusal_is_own`]). A host memory gate refusal is about the host, not
+///   this query, and spilling does not change it; nor does it change a
+///   fetch layer's `FetchMemoryExhausted`, whose buffers do not spill, or a
+///   spill-budget, scratch, deadline or any other error;
+/// - nothing was emitted, so the failed output can be discarded whole;
+/// - spill is configured;
+/// - the statement is spill-eligible after the tie-order edit;
+/// - no spill retry has run yet for this statement.
+///
+/// It counts independently of [`retry_decision`]: a snapshot retry does not
+/// use up the spill retry, nor the spill retry the snapshot one.
+pub(crate) fn spill_retry_decision(
+    err: &SqlError,
+    pool: PoolReport,
+    emitted: usize,
+    spill_configured: bool,
+    spill_eligible: bool,
+    spill_retried: bool,
+) -> SpillRetry {
+    let memory_refusal = matches!(err, SqlError::ResourcesExhausted(_))
+        && pool.refused
+        && !pool.host_gate
+        && refusal_is_own(pool);
+    if memory_refusal && emitted == 0 && spill_configured && spill_eligible && !spill_retried {
+        SpillRetry::Retry
+    } else {
+        SpillRetry::Propagate
+    }
+}
+
+/// The share of the refusing budget's SQL execution bytes, in percent (all of
+/// a tenant budget's reserved bytes; on the process budget, reserved bytes
+/// less fetch buffers and caches, see [`BudgetShare`]), that the refused
+/// statement's own bytes on it must reach for that budget's refusal to earn a
+/// spill retry. Below it the refusal is contention: other
+/// statements' reservations filled the shared budget, spilling this one does
+/// not free them, and the retry holds memory and a spill share while it runs.
+pub(crate) const SPILL_RETRY_DOMINANT_SHARE_PERCENT: u64 = 50;
+
+/// Whether the pool's first refusal is one the statement's own spill can
+/// answer: its per-query limit, always; or a tenant budget, process budget
+/// or reserve-ahead refusal at which its own bytes on the refusing budget
+/// were at least [`SPILL_RETRY_DOMINANT_SHARE_PERCENT`] of SQL execution's
+/// reserved bytes on it ([`BudgetShare`]); on the process budget that leaves
+/// out the fetch layer's buffers and caches. A reserve-ahead refusal is a
+/// refusal of the shared process budget, so it passes the same test as a
+/// process budget refusal; one with no recorded figures does not retry.
+///
+/// A reserve-ahead refusal is not asked whether its consumer can spill: the
+/// first attempt has no disk manager, and DataFusion registers every
+/// aggregate of such a plan as unable to spill. Its aggregates are the ones
+/// the retry plans with a disk manager, where they spill.
+fn refusal_is_own(pool: PoolReport) -> bool {
+    match pool.first {
+        Some(MemoryRefusal::Query) => true,
+        Some(MemoryRefusal::Tenant | MemoryRefusal::Process | MemoryRefusal::ReserveAhead) => {
+            pool.first_share.is_some_and(|share| {
+                u128::from(share.own) * 100
+                    >= u128::from(share.budget_reserved)
+                        * u128::from(SPILL_RETRY_DOMINANT_SHARE_PERCENT)
+            })
+        }
+        Some(MemoryRefusal::HostGate) | None => false,
+    }
+}
+
+/// The per-query limit a bucketed spill retry derives its tuning at and runs
+/// its pool under: `query_limit` (`L`) on a query-pool refusal or with no
+/// recorded share, else `min(L, B - others)` on the refusing budget's
+/// [`BudgetShare`], where `B` is its limit and `others` everything it held
+/// at the refusal that was not this statement's: SQL execution's reserved
+/// bytes less the statement's own (`budget_reserved - own`), plus the bytes
+/// the fetch layer and the caches held ([`BudgetShare::non_sql_reserved`],
+/// 0 on a tenant budget). So the limit is the room that budget had left for
+/// this statement at the refusal, capped at `L`. Saturating throughout, so
+/// others holding more than `B` give 0; an unbounded `B` (`u64::MAX`) gives
+/// `L`.
+///
+/// The room is read at the first refusal. Memory the budget's other holders
+/// take after it, before or while the retry runs, is not known here, and
+/// the retry can still be refused for it.
+pub(crate) fn retry_effective_limit(
+    query_limit: usize,
+    first: Option<MemoryRefusal>,
+    share: Option<BudgetShare>,
+) -> usize {
+    match (first, share) {
+        (
+            Some(MemoryRefusal::Tenant | MemoryRefusal::Process | MemoryRefusal::ReserveAhead),
+            Some(share),
+        ) if share.limit != u64::MAX => {
+            let others = share
+                .budget_reserved
+                .saturating_sub(share.own)
+                .saturating_add(share.non_sql_reserved);
+            let room = share.limit.saturating_sub(others);
+            usize::try_from(room).map_or(query_limit, |room| room.min(query_limit))
+        }
+        _ => query_limit,
+    }
+}
+
+/// The refusal class a spill retry's log line names for its first attempt.
+fn first_refusal_class(err: &SqlError, pool: PoolReport) -> &'static str {
+    match err {
+        SqlError::ResourcesExhausted(_) => pool
+            .first
+            .map_or("resources_exhausted", MemoryRefusal::as_str),
+        _ => "fetch_memory_exhausted",
+    }
+}
+
+/// A short stable identifier for a statement's text in log lines: no
+/// statement fingerprint existed before the spill retry needed one.
+fn statement_fingerprint(statement: Statement<'_>) -> String {
+    use std::hash::{Hash, Hasher};
+
+    match statement.sql() {
+        Some(sql) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            sql.hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        }
+        None => "lowered".to_string(),
+    }
+}
+
+/// Maps [`admit`]'s error into a [`SqlError`]. `admit`
+/// has exactly one failure variant
+/// (`QueryError::TooManySegments`); the wildcard arm exists only because
+/// `QueryError` is not restricted to that variant at the type level, and is
+/// unreachable in practice.
+fn admission_error_to_sql(err: QueryError) -> SqlError {
+    match err {
+        QueryError::TooManySegments { count, max } => SqlError::TooManySegments { count, max },
+        other => SqlError::Internal(format!("unexpected admission error: {other}")),
+    }
+}
+
+/// Map a planning-phase `DataFusionError` into a `SqlError`, recovering a
+/// ravel error carried across the boundary when there is one.
+fn plan_error(err: DataFusionError) -> SqlError {
+    match take_sql_error(err) {
+        Ok(sql) => sql,
+        Err(other) => match other {
+            DataFusionError::ResourcesExhausted(msg) => SqlError::ResourcesExhausted(msg),
+            other => match parquet::read_error(&other) {
+                Some(read) => ParquetQueryError::Read(read).into(),
+                None => SqlError::Plan(other.to_string()),
+            },
+        },
+    }
+}
+
+/// Same, for the execution phase. Kept distinct so the client-visible
+/// message can distinguish "this query cannot be planned" from "this query
+/// failed while running", which is the only diagnostic signal that survives
+/// redaction.
+///
+/// `pool` is the stream's own `MemoryPool` (issue #740): a `ResourcesExhausted`
+/// reaching here can be a spill-capable operator's refusal (a `RepartitionExec`
+/// exchange or an external sort, named by DataFusion's own message, with no
+/// byte figures) rather than this pool's own `try_grow` text (which already
+/// names its budget and figures). [`SqlError::resources_exhausted_reattributed`]
+/// tells the two apart and rewrites only the former, from `pool`'s occupancy at
+/// this moment; the caller does not need to classify the message itself.
+///
+/// `take_sql_error` already unwraps a `ResourcesExhausted` at any wrapper depth
+/// into `Ok(SqlError::ResourcesExhausted(msg))` (its own doc comment above),
+/// so the re-attribution runs after that recovery, on the recovered
+/// `SqlError::ResourcesExhausted` itself, not in the `Err` branch below (which
+/// a bare or wrapped `ResourcesExhausted` never reaches).
+fn execution_error(err: DataFusionError, pool: &Arc<dyn MemoryPool>) -> SqlError {
+    let sql = match take_sql_error(err) {
+        Ok(sql) => sql,
+        Err(other) => match other {
+            DataFusionError::ResourcesExhausted(msg) => SqlError::ResourcesExhausted(msg),
+            // A Parquet read fails inside DataFusion's own scan, which wraps
+            // the reader's typed error rather than a `SqlError`.
+            other => match parquet::read_error(&other) {
+                Some(read) => return ParquetQueryError::Read(read).into(),
+                None => return SqlError::Execution(other.to_string()),
+            },
+        },
+    };
+    match sql {
+        SqlError::ResourcesExhausted(msg) => {
+            let limit = match pool.memory_limit() {
+                MemoryLimit::Finite(limit) => limit,
+                MemoryLimit::Infinite | MemoryLimit::Unknown => usize::MAX,
+            };
+            SqlError::resources_exhausted_reattributed(&msg, pool.reserved(), limit)
+        }
+        other => other,
+    }
+}
+
+/// Recover an owned [`SqlError`] from a `DataFusionError`, unwrapping the
+/// wrappers DataFusion adds on the way up: `Context`, `Diagnostic`,
+/// `Shared`, `Collection`, and the arrow round trip
+/// (`ArrowError::ExternalError`) that operators such as
+/// `SortPreservingMergeExec` introduce when an error crosses a
+/// `RecordBatchStream`.
+///
+/// Returns the original error unchanged when there is no ravel error inside,
+/// so no detail is lost on the way to the log.
+pub(crate) fn take_sql_error(err: DataFusionError) -> Result<SqlError, DataFusionError> {
+    match err {
+        DataFusionError::External(boxed) => match boxed.downcast::<SqlError>() {
+            Ok(sql) => Ok(*sql),
+            Err(boxed) => match boxed.downcast::<DataFusionError>() {
+                Ok(inner) => take_sql_error(*inner),
+                Err(boxed) => Err(DataFusionError::External(boxed)),
+            },
+        },
+        DataFusionError::Context(msg, inner) => match take_sql_error(*inner) {
+            Ok(sql) => Ok(sql),
+            Err(inner) => Err(DataFusionError::Context(msg, Box::new(inner))),
+        },
+        DataFusionError::Diagnostic(diag, inner) => match take_sql_error(*inner) {
+            Ok(sql) => Ok(sql),
+            Err(inner) => Err(DataFusionError::Diagnostic(diag, Box::new(inner))),
+        },
+        DataFusionError::ArrowError(arrow, backtrace) => match *arrow {
+            ArrowError::ExternalError(boxed) => match boxed.downcast::<DataFusionError>() {
+                Ok(inner) => take_sql_error(*inner),
+                Err(boxed) => match boxed.downcast::<SqlError>() {
+                    Ok(sql) => Ok(*sql),
+                    Err(boxed) => Err(DataFusionError::ArrowError(
+                        Box::new(ArrowError::ExternalError(boxed)),
+                        backtrace,
+                    )),
+                },
+            },
+            other => Err(DataFusionError::ArrowError(Box::new(other), backtrace)),
+        },
+        // `Shared` holds an `Arc`, so the inner error cannot be moved out.
+        // Classify from the shared value and rebuild an equivalent owned
+        // error rather than losing the classification: the only thing lost
+        // is the exact original allocation, not the detail.
+        DataFusionError::Shared(shared) => match classify_shared(shared.as_ref()) {
+            Some(sql) => Ok(sql),
+            None => Err(DataFusionError::Shared(shared)),
+        },
+        DataFusionError::Collection(errors) => {
+            let mut remaining = Vec::with_capacity(errors.len());
+            for error in errors {
+                match take_sql_error(error) {
+                    Ok(sql) => return Ok(sql),
+                    Err(other) => remaining.push(other),
+                }
+            }
+            Err(DataFusionError::Collection(remaining))
+        }
+        // A native budget exhaustion is a signal the client must see, so
+        // recover it here rather than let a wrapper above collapse it into a
+        // generic execution message. Because every wrapper arm recurses
+        // through `take_sql_error`, a `ResourcesExhausted` at any depth
+        // surfaces as `SqlError::ResourcesExhausted` (with its byte counts
+        // intact), whichever `Context`/`Diagnostic`/`Collection` wrapper an
+        // operator such as the external sort or hash aggregate carried it in.
+        // This mirrors the nested-`SqlError` recovery the other arms already
+        // do, and matches the `Shared`-wrapped case classify_shared handles.
+        DataFusionError::ResourcesExhausted(msg) => Ok(SqlError::ResourcesExhausted(msg)),
+        other => Err(other),
+    }
+}
+
+/// Best-effort classification of a `DataFusionError` we can only borrow.
+/// The retry contract needs the not-found case reconstructed exactly (it
+/// drives `retry_decision`); everything else is captured through its own
+/// `class()`/`client_message()` rather than collapsed into a generic
+/// execution failure, so a budget error that happens to cross a `Shared`
+/// boundary keeps its own HTTP class and text (checkpoint review finding).
+fn classify_shared(err: &DataFusionError) -> Option<SqlError> {
+    match err {
+        DataFusionError::External(boxed) => {
+            let sql = boxed.downcast_ref::<SqlError>()?;
+            Some(if sql.is_segment_not_found() {
+                SqlError::Fetch(ravel_query::FetchError::Store {
+                    key: String::new(),
+                    source: ravel_object_store::StoreError::NotFound,
+                })
+            } else {
+                SqlError::Shared {
+                    class: sql.class(),
+                    message: sql.client_message(),
+                }
+            })
+        }
+        DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
+            classify_shared(inner)
+        }
+        DataFusionError::Shared(inner) => classify_shared(inner),
+        // A budget exhaustion behind an `Arc` keeps its own type and message
+        // for the client, same as it does through the owned wrappers above.
+        DataFusionError::ResourcesExhausted(msg) => Some(SqlError::ResourcesExhausted(msg.clone())),
+        _ => None,
+    }
+}
+
+/// Collect every `WHERE`/`HAVING` predicate in `plan` as a top-level AND
+/// conjunct for [`crate::pushdown::extract`]. Recurses through
+/// the plan's inputs so a predicate under a projection or aggregate is still
+/// seen; the extractor treats each collected expression as an implicit
+/// top-level AND conjunct and splits nested `AND`s itself.
+///
+/// The result pools predicates from every scan and every branch, so it is
+/// sound only for a decision that cannot drop rows (such as skipping a load
+/// that would only have been consulted). Anything that prunes what a scan
+/// reads must take its predicates per scan, from [`per_scan_name_keys`] or
+/// [`per_scan_conjuncts`].
+fn collect_filter_predicates(plan: &LogicalPlan, out: &mut Vec<Expr>) {
+    if let LogicalPlan::Filter(filter) = plan {
+        out.push(filter.predicate.clone());
+    }
+    for input in plan.inputs() {
+        collect_filter_predicates(input, out);
+    }
+}
+
+/// The number of `TableScan` nodes in `plan`, subquery plans included.
+fn count_table_scans(plan: &LogicalPlan) -> usize {
+    let mut scans = 0;
+    // Never errors: the closure only counts and returns a recursion verb.
+    let _ = plan.apply_with_subqueries(|node| {
+        if matches!(node, LogicalPlan::TableScan(_)) {
+            scans += 1;
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    scans
+}
+
+/// Push one entry per `TableScan` in `plan` (subquery plans included) onto
+/// `keys`: the registered table the scan reads, and the `__name__` pruning
+/// key that scan's rows are required to satisfy, or `None`.
+fn per_scan_name_keys(plan: &LogicalPlan, keys: &mut Vec<(String, Option<String>)>) {
+    let mut scans = Vec::new();
+    per_scan_conjuncts(plan, &[], &mut scans);
+    keys.extend(
+        scans
+            .into_iter()
+            .map(|(table, own)| (table, equality_name_filter(&extract(&own).matchers))),
+    );
+}
+
+/// Push one entry per `TableScan` in `plan` (subquery plans included) onto
+/// `scans`: the registered table the scan reads, and the conjuncts every row
+/// it contributes is required to satisfy, with columns qualified by the
+/// scan's own relation (its alias, when it has one).
+///
+/// `inherited` holds the predicates of the `Filter` nodes above `plan` that
+/// still constrain the rows it produces. They pass down only through a
+/// `Filter`, an inner `Join`, and a `SubqueryAlias` directly over a scan; any
+/// other node can rename, aggregate, or null-extend its input, so its inputs
+/// start with none. At a scan, only the conjuncts whose columns all carry
+/// that scan's qualifier, and that reference no outer column, count.
+fn per_scan_conjuncts(
+    plan: &LogicalPlan,
+    inherited: &[Expr],
+    scans: &mut Vec<(String, Vec<Expr>)>,
+) {
+    let own = |qualifier: &TableReference, inherited: &[Expr]| -> Vec<Expr> {
+        inherited
+            .iter()
+            .flat_map(|p| datafusion::logical_expr::utils::split_conjunction(p))
+            .filter(|c| conjunct_is_scoped_to(c, qualifier))
+            .cloned()
+            .collect()
+    };
+    // Subquery plans nested in this node's expressions see none of the
+    // filters above it.
+    let _ = plan.apply_subqueries(|sub| {
+        per_scan_conjuncts(sub, &[], scans);
+        Ok(TreeNodeRecursion::Continue)
+    });
+    match plan {
+        LogicalPlan::TableScan(scan) => scans.push((
+            scan.table_name.table().to_string(),
+            own(&scan.table_name, inherited),
+        )),
+        LogicalPlan::SubqueryAlias(alias) => match alias.input.as_ref() {
+            LogicalPlan::TableScan(scan) => scans.push((
+                scan.table_name.table().to_string(),
+                own(&alias.alias, inherited),
+            )),
+            input => per_scan_conjuncts(input, &[], scans),
+        },
+        LogicalPlan::Filter(filter) => {
+            let mut next = inherited.to_vec();
+            next.push(filter.predicate.clone());
+            per_scan_conjuncts(&filter.input, &next, scans);
+        }
+        LogicalPlan::Join(join) if join.join_type == datafusion::common::JoinType::Inner => {
+            per_scan_conjuncts(&join.left, inherited, scans);
+            per_scan_conjuncts(&join.right, inherited, scans);
+        }
+        other => {
+            for input in other.inputs() {
+                per_scan_conjuncts(input, &[], scans);
+            }
+        }
+    }
+}
+
+/// Whether every column `conjunct` references is qualified by `qualifier`,
+/// and it references no column of an enclosing query.
+fn conjunct_is_scoped_to(conjunct: &Expr, qualifier: &TableReference) -> bool {
+    let mut scoped = true;
+    // Never errors: the closure only inspects and returns a recursion verb.
+    let _ = conjunct.apply(|e| {
+        match e {
+            Expr::Column(c) if c.relation.as_ref() == Some(qualifier) => {}
+            Expr::Column(_) | Expr::OuterReferenceColumn(..) => {
+                scoped = false;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            _ => {}
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    scoped
+}
+
+/// Collect every grouping node reachable in `plan` for ADR-0094 decision 1's
+/// exact-typed classification: [`LogicalPlan::Aggregate`] nodes into
+/// `aggregates`, and [`LogicalPlan::Distinct`] nodes into `distincts`. A
+/// `SELECT DISTINCT` lowers to a `GROUP BY` on its distinct keys only in the
+/// optimizer; the analyzer this walk runs over leaves it as a `Distinct` node,
+/// so it is captured here and classified for its keys (the
+/// `SELECT DISTINCT float_col` case). Sibling to [`collect_filter_predicates`],
+/// with two reach rules:
+///
+/// - `plan.inputs()` recursion, for grouping nodes in the direct operator tree.
+/// - a scan of every visited node's own `expressions()` for an embedded
+///   subquery plan (`Expr::ScalarSubquery`/`InSubquery`/`Exists`), each of
+///   which wraps a `LogicalPlan` that `plan.inputs()` never descends into. Every
+///   embedded plan is walked with this same recursion, so a disqualifying
+///   aggregate hidden inside a scalar subquery is found the same as one at the
+///   top level.
+///
+/// Nodes are cloned out (both variants hold an `Arc`-backed input and their own
+/// expression vectors, so a clone is cheap) rather than borrowed, because the
+/// subquery plans live inside the owned `Vec<Expr>` that `expressions()` returns
+/// and would not outlive the walk.
+fn collect_aggregate_exprs(
+    plan: &LogicalPlan,
+    aggregates: &mut Vec<Aggregate>,
+    distincts: &mut Vec<Distinct>,
+) {
+    match plan {
+        LogicalPlan::Aggregate(aggregate) => aggregates.push(aggregate.clone()),
+        LogicalPlan::Distinct(distinct) => distincts.push(distinct.clone()),
+        _ => {}
+    }
+    for input in plan.inputs() {
+        collect_aggregate_exprs(input, aggregates, distincts);
+    }
+    for expr in plan.expressions() {
+        // Never errors: the closure only recurses and returns `Continue`.
+        let _ = expr.apply(|node| {
+            match node {
+                Expr::ScalarSubquery(subquery) => {
+                    collect_aggregate_exprs(&subquery.subquery, aggregates, distincts);
+                }
+                Expr::InSubquery(in_subquery) => {
+                    collect_aggregate_exprs(&in_subquery.subquery.subquery, aggregates, distincts);
+                }
+                Expr::Exists(exists) => {
+                    collect_aggregate_exprs(&exists.subquery.subquery, aggregates, distincts);
+                }
+                _ => {}
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+    }
+}
+
+/// Whether every grouping node in `plan` (analyzed/type-coerced) is
+/// order/partition-independent (ADR-0094 decision 1). A single disqualifying
+/// aggregate, GROUP BY key, or DISTINCT key anywhere, including inside a
+/// subquery, makes the whole query not exact -- `repartition_aggregations` is
+/// one session-wide knob, not a per-node choice.
+fn plan_is_exact_typed(plan: &LogicalPlan) -> bool {
+    let mut aggregates = Vec::new();
+    let mut distincts = Vec::new();
+    collect_aggregate_exprs(plan, &mut aggregates, &mut distincts);
+    aggregates.iter().all(aggregate_node_is_exact) && distincts.iter().all(distinct_node_is_exact)
+}
+
+/// Whether `plan` (analyzed/type-coerced) may spill (ADR-0954).
+///
+/// This is a predicate over the plan's shape and its aggregate expressions'
+/// resolved types, deliberately NOT an operator-name allowlist: what is at
+/// stake is exactness, and "this operator can spill" says nothing about
+/// whether spilling changes its answer. Spilling a grouped aggregation makes
+/// DataFusion emit partial group state, sort it, write it, and re-merge it, so
+/// the aggregate's folding order changes. An aggregate whose merge is exact
+/// under any order is unaffected; one whose merge is order-dependent is not,
+/// and this repo's exactness invariant is the thing the spill would trade
+/// away.
+///
+/// A plan is eligible when ALL of the following hold:
+///
+/// - it contains at least one [`LogicalPlan::Aggregate`]. With no aggregate
+///   there is nothing whose exactness this predicate has reasoned about, so
+///   enabling spill could only benefit an operator it never classified.
+/// - every node is one of the shapes below. This is an allowlist, so a
+///   DataFusion release that adds a `LogicalPlan` variant makes plans using it
+///   ineligible rather than silently spillable. An external merge sort
+///   returns the same rows as an in-memory one, but nothing proves their tie
+///   order agrees, and row order is part of an `ORDER BY` result; `Sort` is
+///   therefore admitted only when its sort key is already total over the
+///   aggregate it orders. The planner
+///   ([`rewrite_sort_group_key_tie_order`]) makes it total first, whenever it
+///   can: it appends the aggregate's own GROUP BY expressions, in group
+///   order, ascending with nulls last, as trailing sort terms, unless they
+///   are already present, to every `Sort` whose input is that `Aggregate`, a
+///   `HAVING` `Filter` directly over it, or a `Projection` directly over
+///   either. A `Filter` only drops aggregate rows, so the group keys stay
+///   unique across the rows it keeps. Each group key is matched to the
+///   aggregate's own qualified output column, never to a projected column
+///   that merely shares its name, and a key the `Projection` drops is
+///   projected through it. A `Sort` the rewrite cannot reach this way -- its
+///   input is any other shape (a nested projection, a subquery alias), or
+///   the aggregate groups by grouping sets -- is left unchanged and stays
+///   ineligible. A `DISTINCT ON` keeps its `ORDER BY` inside the `Distinct`
+///   node, which the optimizer turns into an ordered `first_value` aggregate,
+///   so an order that ties within an ON group picks its surviving row by
+///   input order, and a spill changes input order. `Distinct::On` is
+///   therefore admitted only when its `ORDER BY` is already total
+///   ([`distinct_on_order_is_total`]): every output column of the node must
+///   appear among the `ORDER BY` terms as a plain column reference. Nothing
+///   appends tiebreak terms to it; a `DISTINCT ON` without such an order is
+///   ineligible, and [`refuse_unadmitted_planned_shapes`] refuses it before
+///   it runs at all. Plain `DISTINCT` (`Distinct::All`) picks no row and is
+///   admitted. `Join` and `Window` are outside the allowlist for the
+///   original reason, one level up: nothing here has classified their spill
+///   behavior.
+/// - every aggregate expression is exactness-preserving under spill
+///   ([`aggregate_expr_is_spill_exact`]) and no GROUP BY or DISTINCT key is a
+///   float ([`aggregate_node_is_spill_exact`], [`distinct_node_is_exact`]).
+///
+/// Anything this predicate cannot classify -- an unresolvable expression type,
+/// an aggregate that is not an `AggregateFunction`, an unknown plan node -- is
+/// ineligible. Fail closed: the cost of a false negative is today's typed
+/// refusal, and the cost of a false positive is a silently wrong answer.
+///
+/// This predicate reasons about the logical plan, but the permission it leads
+/// to (an enabled disk manager) is held by every operator in the physical plan
+/// the session goes on to build. Only physical nodes that correspond to the
+/// shapes above may therefore be admitted, which is why an eligible query is
+/// also planned repartition-free (`crate::session::repartition_free`): a
+/// `RepartitionExec` appears in no logical plan, so nothing here classifies it,
+/// and it spills. The bucketed retry is the exception: it keeps the exchange
+/// only after `crate::bucket_spill_tuning::spill_consumers` admits every
+/// physical node, the exchange among them.
+fn plan_is_spill_eligible(plan: &LogicalPlan) -> bool {
+    if !plan_nodes_are_spill_classifiable(plan) {
+        return false;
+    }
+    let mut aggregates = Vec::new();
+    let mut distincts = Vec::new();
+    collect_aggregate_exprs(plan, &mut aggregates, &mut distincts);
+    !aggregates.is_empty()
+        && aggregates.iter().all(aggregate_node_is_spill_exact)
+        && distincts.iter().all(distinct_node_is_exact)
+}
+
+/// [`plan_is_spill_eligible`] for a plan `ctx.sql` produced, which the
+/// analyzer has not run over yet: the predicate reads resolved, type-coerced
+/// expression types, so it runs on the analyzed form. A plan the analyzer
+/// rejects is not eligible.
+fn executed_plan_is_spill_eligible(state: &SessionState, plan: &LogicalPlan) -> bool {
+    let config_options = Arc::clone(state.config_options());
+    state
+        .analyzer()
+        .execute_and_check(plan.clone(), &config_options, |_, _| {})
+        .is_ok_and(|analyzed| plan_is_spill_eligible(&analyzed))
+}
+
+/// Refuse a lowered statement whose classification plan was exact-typed and
+/// whose executed plan is not, with [`SqlError::PlanNotAdmitted`].
+///
+/// `exact_typed_aggregates` was read off the classification lowering and
+/// already chose `ctx`'s parallel aggregation (and a Parquet target's file
+/// groups), which only an exact-typed plan may run under. Re-derived here
+/// from the plan `ctx` executes, analyzed the same way. The other direction
+/// runs: a session chosen for a plan that is not exact-typed, or built with
+/// no classification plan, repartitions neither its aggregation nor its file
+/// scans, which every plan is correct under. SQL text is planned by the same
+/// binder at both sites and is not re-checked.
+fn refuse_unrepeated_exact_typed(
+    statement: Statement<'_>,
+    exact_typed_aggregates: bool,
+    ctx: &SessionContext,
+    plan: &LogicalPlan,
+) -> Result<(), SqlError> {
+    if statement.sql().is_some() || !exact_typed_aggregates {
+        return Ok(());
+    }
+    let state = ctx.state();
+    let config_options = Arc::clone(state.config_options());
+    let executed = state
+        .analyzer()
+        .execute_and_check(plan.clone(), &config_options, |_, _| {})
+        .is_ok_and(|analyzed| plan_is_exact_typed(&analyzed));
+    if executed {
+        return Ok(());
+    }
+    Err(SqlError::PlanNotAdmitted(
+        "the classification plan was exact-typed and the executed plan is not: \
+         the lowering is not repeatable"
+            .to_string(),
+    ))
+}
+
+/// A second handle on the table `table` serves, for rebuilding a query's
+/// session: every variant holds its providers behind `Arc`s.
+fn clone_session_table(table: &SessionTable) -> SessionTable {
+    match table {
+        SessionTable::Metrics(provider) => SessionTable::Metrics(Arc::clone(provider)),
+        SessionTable::Logs(provider) => SessionTable::Logs(Arc::clone(provider)),
+        SessionTable::Spans(provider) => SessionTable::Spans(Arc::clone(provider)),
+        SessionTable::Alerts(provider) => SessionTable::Alerts(Arc::clone(provider)),
+        SessionTable::Audit(provider) => SessionTable::Audit(Arc::clone(provider)),
+        SessionTable::Parquet(session) => SessionTable::Parquet(ParquetSession {
+            tables: session.tables.clone(),
+            store: Arc::clone(&session.store),
+        }),
+    }
+}
+
+/// [`plan_is_spill_eligible`], except a `Sort` is always treated as a
+/// classifiable shape rather than requiring an already-total sort key. A
+/// `DISTINCT ON` is still held to [`distinct_on_order_is_total`], since the
+/// rewrite never edits its order.
+///
+/// Used only to decide whether [`rewrite_sort_group_key_tie_order`] is worth
+/// attempting on a plan: a plan this predicate rejects cannot become eligible
+/// no matter what the rewrite appends to its `Sort` nodes (a disqualifying
+/// `Join`, `Window`, non-exact aggregate, or float GROUP BY key is unaffected
+/// by sort order), so there is nothing for the rewrite to fix. The actual
+/// enable/disable decision always goes through the real, total-order-checking
+/// [`plan_is_spill_eligible`] on the plan the rewrite has already run over,
+/// never through this predicate: it would admit a `Sort` whose group key
+/// turns out unresolvable just as readily as one the rewrite can fix, which
+/// would spill a query with no proof its tie order is reproduced.
+fn plan_is_spill_eligible_ignoring_sort_order(plan: &LogicalPlan) -> bool {
+    if !plan_nodes_are_spill_classifiable_with(plan, &|_| true) {
+        return false;
+    }
+    let mut aggregates = Vec::new();
+    let mut distincts = Vec::new();
+    collect_aggregate_exprs(plan, &mut aggregates, &mut distincts);
+    !aggregates.is_empty()
+        && aggregates.iter().all(aggregate_node_is_spill_exact)
+        && distincts.iter().all(distinct_node_is_exact)
+}
+
+/// Whether every node in `plan` is a shape [`plan_is_spill_eligible`] has
+/// classified. Walks inputs and embedded subquery plans with the same reach
+/// [`collect_aggregate_exprs`] uses: a `Sort` hidden inside a scalar
+/// subquery is held to the same total-order test, but
+/// [`rewrite_sort_group_key_tie_order`] does not reach into subquery plans,
+/// so a subquery `Sort` is eligible only when the query itself already wrote
+/// a total order.
+fn plan_nodes_are_spill_classifiable(plan: &LogicalPlan) -> bool {
+    plan_nodes_are_spill_classifiable_with(plan, &|sort| {
+        matches!(tie_order_edit(sort), Some(TieOrderEdit::AlreadyTotal))
+    })
+}
+
+/// Shared recursive walk behind [`plan_nodes_are_spill_classifiable`] and
+/// [`plan_is_spill_eligible_ignoring_sort_order`]; `sort_admits` is the only
+/// difference between the two: whether a `Sort` node's own sort key is
+/// accepted as it stands.
+fn plan_nodes_are_spill_classifiable_with(
+    plan: &LogicalPlan,
+    sort_admits: &impl Fn(&Sort) -> bool,
+) -> bool {
+    let classifiable = match plan {
+        LogicalPlan::Sort(sort) => sort_admits(sort),
+        LogicalPlan::Distinct(Distinct::On(distinct_on)) => distinct_on_order_is_total(distinct_on),
+        _ => matches!(
+            plan,
+            LogicalPlan::Projection(_)
+                | LogicalPlan::Filter(_)
+                | LogicalPlan::Aggregate(_)
+                | LogicalPlan::Distinct(Distinct::All(_))
+                | LogicalPlan::TableScan(_)
+                | LogicalPlan::SubqueryAlias(_)
+                | LogicalPlan::Limit(_)
+                | LogicalPlan::EmptyRelation(_)
+                | LogicalPlan::Values(_)
+        ),
+    };
+    if !classifiable {
+        return false;
+    }
+    if !plan
+        .inputs()
+        .iter()
+        .all(|input| plan_nodes_are_spill_classifiable_with(input, sort_admits))
+    {
+        return false;
+    }
+    for expr in plan.expressions() {
+        let mut ok = true;
+        // Never errors: the closure only inspects and returns a recursion verb.
+        let _ = expr.apply(|node| {
+            let nested = match node {
+                Expr::ScalarSubquery(subquery) => Some(&subquery.subquery),
+                Expr::InSubquery(in_subquery) => Some(&in_subquery.subquery.subquery),
+                Expr::Exists(exists) => Some(&exists.subquery.subquery),
+                _ => None,
+            };
+            if let Some(nested) = nested
+                && !plan_nodes_are_spill_classifiable_with(nested, sort_admits)
+            {
+                ok = false;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether a `DISTINCT ON` node's own `ORDER BY` decides which row of each ON
+/// group survives: every output column, its alias stripped, must be a plain
+/// column reference that some `ORDER BY` term names exactly, qualifier
+/// included. Two rows the order then ties on agree in every output column, so
+/// the input order a spill changes cannot change the answer. No `ORDER BY` at
+/// all is never total.
+fn distinct_on_order_is_total(distinct_on: &DistinctOn) -> bool {
+    let Some(sort_expr) = &distinct_on.sort_expr else {
+        return false;
+    };
+    distinct_on.select_expr.iter().all(|expr| {
+        let inner = match expr {
+            Expr::Alias(alias) => alias.expr.as_ref(),
+            other => other,
+        };
+        let Expr::Column(column) = inner else {
+            return false;
+        };
+        sort_expr
+            .iter()
+            .any(|term| matches!(&term.expr, Expr::Column(term_column) if term_column == column))
+    })
+}
+
+/// Refuse a planned statement, before any optimizer rule runs over it, that
+/// the session's registries alone would let through (ADR-0022, DISTINCT ON
+/// amendment). Walks every node, subquery plans included:
+///
+/// - a `DISTINCT ON` whose `ORDER BY` is not total
+///   ([`distinct_on_order_is_total`]) is
+///   [`ValidationError::DistinctOnOrderNotTotal`]. The optimizer turns it into
+///   an ordered `first_value` aggregate, and an order that ties within an ON
+///   group keeps whichever tied row the scan and the partition merge happen
+///   to deliver first.
+/// - a call to a [`REWRITE_ONLY_AGGREGATES`] name is the excluded-aggregate
+///   or, with `OVER`, the excluded-window refusal `crate::validate` gives the
+///   same name. The name stays registered for the `DISTINCT ON` rewrite, so
+///   this is the check that keeps a caller from naming it in a spelling the
+///   text walk does not match, such as a quoted identifier.
+fn refuse_unadmitted_planned_shapes(plan: &LogicalPlan) -> Result<(), ValidationError> {
+    let mut refusal = None;
+    // Never errors: the closures only inspect and return a recursion verb.
+    let _ = plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::Distinct(Distinct::On(distinct_on)) = node
+            && !distinct_on_order_is_total(distinct_on)
+        {
+            refusal = Some(ValidationError::DistinctOnOrderNotTotal);
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        node.apply_expressions(|expr| {
+            expr.apply(|inner| {
+                if let Some(found) = rewrite_only_call(inner) {
+                    refusal = Some(found);
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })
+    });
+    refusal.map_or(Ok(()), Err)
+}
+
+/// The refusal for `expr` when it calls a [`REWRITE_ONLY_AGGREGATES`] name
+/// directly, as an aggregate or as a window aggregate.
+fn rewrite_only_call(expr: &Expr) -> Option<ValidationError> {
+    let (name, windowed) = match expr {
+        Expr::AggregateFunction(call) => (call.func.name().to_ascii_lowercase(), false),
+        Expr::WindowFunction(window) => match &window.fun {
+            WindowFunctionDefinition::AggregateUDF(udaf) => {
+                (udaf.name().to_ascii_lowercase(), true)
+            }
+            WindowFunctionDefinition::WindowUDF(_) => return None,
+        },
+        _ => return None,
+    };
+    if !REWRITE_ONLY_AGGREGATES.contains(&name.as_str()) {
+        return None;
+    }
+    Some(if windowed {
+        ValidationError::ExcludedWindow { name }
+    } else {
+        ValidationError::ExcludedAggregate { name }
+    })
+}
+
+/// Name prefix of the column a group key the `Projection` under a `Sort` drops
+/// is projected through as, suffixed with the key's index in the GROUP BY
+/// list. The restoring `Projection` above the `Sort` drops it again, so it
+/// never reaches a result. A user column already carrying the name makes
+/// `Projection::try_new` fail, which the callers of
+/// [`rewrite_sort_group_key_tie_order`] treat as "leave the plan as it was".
+const TIEBREAK_COLUMN_PREFIX: &str = "__ravel_tiebreak_";
+
+/// What [`rewrite_sort_group_key_tie_order`] does to one `Sort` whose input is
+/// an `Aggregate` or a `Projection` directly over one.
+#[derive(Debug)]
+enum TieOrderEdit {
+    /// Every GROUP BY key already has a sort term: nothing to append.
+    AlreadyTotal,
+    /// The `Sort`'s input exposes every missing key; append these terms.
+    Extend(Vec<SortExpr>),
+    /// The `Projection` under the `Sort` drops at least one key. Rebuild it
+    /// with `projected` (its own expressions plus each dropped key, aliased
+    /// to a [`TIEBREAK_COLUMN_PREFIX`] name) over `input` (the aggregate, or
+    /// the `HAVING` filter over it), append `terms`, and put a `Projection`
+    /// back to `restore` (the original projection's schema) on top, so the
+    /// statement's schema is unchanged.
+    ProjectThrough {
+        terms: Vec<SortExpr>,
+        projected: Vec<Expr>,
+        input: Arc<LogicalPlan>,
+        restore: DFSchemaRef,
+    },
+}
+
+/// An ascending, nulls-last tiebreak term on `column`.
+fn tiebreak_term(column: Column) -> SortExpr {
+    SortExpr::new(Expr::Column(column), true, false)
+}
+
+/// Whether some term of `sort` is exactly `column`, qualifier included.
+fn sort_has_column_term(sort: &Sort, column: &Column) -> bool {
+    sort.expr
+        .iter()
+        .any(|term| matches!(&term.expr, Expr::Column(term_column) if term_column == column))
+}
+
+/// The output column under which `projection` exposes `key`, the aggregate's
+/// own qualified output column for one GROUP BY key: the first projected
+/// expression that IS `key`, bare or under one alias. A projected column that
+/// only shares `key`'s unqualified name (`sum(x) AS a` over `GROUP BY t.a`) is
+/// a different column and does not count.
+fn projected_group_key(projection: &Projection, key: &Column) -> Option<Column> {
+    projection
+        .expr
+        .iter()
+        .enumerate()
+        .find_map(|(index, expr)| {
+            let inner = match expr {
+                Expr::Alias(alias) => alias.expr.as_ref(),
+                other => other,
+            };
+            matches!(inner, Expr::Column(column) if column == key).then(|| {
+                let (qualifier, field) = projection.schema.qualified_field(index);
+                Column::new(qualifier.cloned(), field.name().clone())
+            })
+        })
+}
+
+/// The `Aggregate` `plan` is, or the one a `HAVING` `Filter` directly over it
+/// reads. A `Filter` keeps the aggregate's schema and only drops rows, so its
+/// output still holds one row per group.
+fn aggregate_or_having(plan: &LogicalPlan) -> Option<&Aggregate> {
+    match plan {
+        LogicalPlan::Aggregate(aggregate) => Some(aggregate),
+        LogicalPlan::Filter(filter) => match filter.input.as_ref() {
+            LogicalPlan::Aggregate(aggregate) => Some(aggregate),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The `Projection` directly under `sort`, if there is one, and the aggregate
+/// `sort` orders ([`aggregate_or_having`] of the `Sort`'s input or of that
+/// projection's input), or `None` for any other shape.
+fn sorted_aggregate(sort: &Sort) -> Option<(Option<&Projection>, &Aggregate)> {
+    match sort.input.as_ref() {
+        LogicalPlan::Projection(projection) => {
+            aggregate_or_having(&projection.input).map(|aggregate| (Some(projection), aggregate))
+        }
+        other => aggregate_or_having(other).map(|aggregate| (None, aggregate)),
+    }
+}
+
+/// The edit that makes `sort`'s key total over the GROUP BY keys of the
+/// aggregate it orders, or `None` when no edit can: [`sorted_aggregate`] finds
+/// no aggregate under it, or the aggregate groups by grouping sets (whose
+/// per-row null group columns this does not attempt to order).
+fn tie_order_edit(sort: &Sort) -> Option<TieOrderEdit> {
+    let (projection, aggregate) = sorted_aggregate(sort)?;
+    if aggregate
+        .group_expr
+        .iter()
+        .any(|key| matches!(key, Expr::GroupingSet(_)))
+    {
+        return None;
+    }
+    let group_keys = (0..aggregate.group_expr.len()).map(|index| {
+        let (qualifier, field) = aggregate.schema.qualified_field(index);
+        (index, Column::new(qualifier.cloned(), field.name().clone()))
+    });
+    let mut terms = Vec::new();
+    let Some(projection) = projection else {
+        for (_, key) in group_keys {
+            if !sort_has_column_term(sort, &key) {
+                terms.push(tiebreak_term(key));
+            }
+        }
+        return Some(if terms.is_empty() {
+            TieOrderEdit::AlreadyTotal
+        } else {
+            TieOrderEdit::Extend(terms)
+        });
+    };
+    let mut dropped = Vec::new();
+    for (index, key) in group_keys {
+        match projected_group_key(projection, &key) {
+            Some(column) => {
+                if !sort_has_column_term(sort, &column) {
+                    terms.push(tiebreak_term(column));
+                }
+            }
+            None => {
+                let name = format!("{TIEBREAK_COLUMN_PREFIX}{index}");
+                terms.push(tiebreak_term(Column::new_unqualified(name.clone())));
+                dropped.push(Expr::Column(key).alias(name));
+            }
+        }
+    }
+    Some(if terms.is_empty() {
+        TieOrderEdit::AlreadyTotal
+    } else if dropped.is_empty() {
+        TieOrderEdit::Extend(terms)
+    } else {
+        let mut projected = projection.expr.clone();
+        projected.extend(dropped);
+        TieOrderEdit::ProjectThrough {
+            terms,
+            projected,
+            input: Arc::clone(&projection.input),
+            restore: Arc::clone(&projection.schema),
+        }
+    })
+}
+
+/// The aggregate functions [`aggregate_expr_is_spill_exact`] can admit, by
+/// name, whatever their argument types.
+const SPILL_AGGREGATE_FAMILIES: [&str; 6] = ["count", "sum", "avg", "mean", "min", "max"];
+
+/// `expr` with one alias layer removed, the form every `aggr_expr` entry takes.
+fn unaliased(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Alias(alias) => alias.expr.as_ref(),
+        other => other,
+    }
+}
+
+/// Whether every aggregate expression of `aggregate` calls one of
+/// [`SPILL_AGGREGATE_FAMILIES`]. Reads function names only, never argument
+/// types, so it gives the same answer before and after the analyzer coerces
+/// those arguments.
+fn aggregate_functions_are_spill_families(aggregate: &Aggregate) -> bool {
+    aggregate.aggr_expr.iter().all(|expr| {
+        matches!(
+            unaliased(expr),
+            Expr::AggregateFunction(function)
+                if SPILL_AGGREGATE_FAMILIES
+                    .contains(&function.func.name().to_ascii_lowercase().as_str())
+        )
+    })
+}
+
+/// Whether `sort`, with `fetch` as its row limit (its own, or that of the
+/// `Limit` above it, since this runs before limit pushdown), has the logical
+/// shape of a top-k the bounded aggregate (`crate::bounded_topk`) bounds.
+///
+/// Two conjuncts call the rule's own helpers, so the two cannot disagree on
+/// them:
+///
+/// - the ceiling: [`bounded_topk::limit_within_ceiling`] on `fetch` and
+///   `max_limit`.
+/// - the types: [`bounded_topk::topk_types_admitted`] on the group key's type
+///   and the `min`/`max` output type, both resolved on the logical plan. The
+///   key type first goes through [`grouped_key_type`], a restatement of the
+///   dictionary-to-`Utf8View` cast the physical plan applies before the rule
+///   reads it.
+///
+/// The rest are the rule's structural refusals, restated on the logical plan
+/// because the rule reads the physical one. Agreement on them is what
+/// `the_bounded_topk_candidate_agrees_with_the_rule` checks, case by case:
+///
+/// - `max_limit` ([`SqlConfig::bounded_topk_max_limit`]) is `Some`: with
+///   `None` the rule is not installed.
+/// - `fetch` is `Some`: no fetch is no top-k.
+/// - one sort term, and it is a column.
+/// - the `Sort`'s input is the aggregate, or a `Projection` directly over it
+///   in which that column is a plain column of the aggregate. A `HAVING`
+///   filter in between is refused, as the rule's pass-through allowlist
+///   refuses a `FilterExec`.
+/// - the aggregate groups by one plain key (no grouping set).
+/// - its only aggregate expression, after duplicates are merged, is a `min` or
+///   a `max` with no `FILTER` clause, and the sort column is its output.
+/// - that function's one argument is a column of the aggregate's input that is
+///   not nullable.
+/// - the term is descending for `max` and ascending for `min`, the direction
+///   that function's extreme runs.
+fn is_bounded_topk_candidate(sort: &Sort, fetch: Option<usize>, max_limit: Option<usize>) -> bool {
+    let (Some(fetch), Some(max_limit)) = (fetch, max_limit) else {
+        return false;
+    };
+    if !bounded_topk::limit_within_ceiling(fetch, max_limit) {
+        return false;
+    }
+    let [term] = sort.expr.as_slice() else {
+        return false;
+    };
+    let Expr::Column(sort_column) = &term.expr else {
+        return false;
+    };
+    let (aggregate_column, aggregate) = match sort.input.as_ref() {
+        LogicalPlan::Projection(projection) => {
+            let LogicalPlan::Aggregate(aggregate) = projection.input.as_ref() else {
+                return false;
+            };
+            let Ok(index) = projection.schema.index_of_column(sort_column) else {
+                return false;
+            };
+            let Some(Expr::Column(source)) = projection.expr.get(index).map(unaliased) else {
+                return false;
+            };
+            (source, aggregate)
+        }
+        LogicalPlan::Aggregate(aggregate) => (sort_column, aggregate),
+        _ => return false,
+    };
+    let [group_key] = aggregate.group_expr.as_slice() else {
+        return false;
+    };
+    if matches!(group_key, Expr::GroupingSet(_)) {
+        return false;
+    }
+    let Some((first, rest)) = aggregate.aggr_expr.split_first() else {
+        return false;
+    };
+    let first = unaliased(first);
+    if !rest.iter().all(|expr| unaliased(expr) == first) {
+        return false;
+    }
+    let Expr::AggregateFunction(function) = first else {
+        return false;
+    };
+    if function.params.filter.is_some() {
+        return false;
+    }
+    let descending = match function.func.name().to_ascii_lowercase().as_str() {
+        "max" => true,
+        "min" => false,
+        _ => return false,
+    };
+    let [Expr::Column(argument)] = function.params.args.as_slice() else {
+        return false;
+    };
+    match aggregate
+        .input
+        .schema()
+        .qualified_field_from_column(argument)
+    {
+        Ok((_, field)) if !field.is_nullable() => {}
+        _ => return false,
+    }
+    let Ok(index) = aggregate.schema.index_of_column(aggregate_column) else {
+        return false;
+    };
+    if index < aggregate.group_expr.len() || term.asc == descending {
+        return false;
+    }
+    let Ok(key_type) = group_key.get_type(aggregate.input.schema()) else {
+        return false;
+    };
+    let value_type = aggregate.schema.field(index).data_type();
+    bounded_topk::topk_types_admitted(&grouped_key_type(key_type), value_type)
+}
+
+/// The type the bounded aggregate sees for a group key declared as
+/// `data_type`. `crate::group_keys::DictionaryGroupKeysAsViews` runs first and
+/// groups a dictionary-encoded string key as `Utf8View`.
+fn grouped_key_type(
+    data_type: datafusion::arrow::datatypes::DataType,
+) -> datafusion::arrow::datatypes::DataType {
+    use datafusion::arrow::datatypes::DataType;
+    match &data_type {
+        DataType::Dictionary(_, value)
+            if matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            DataType::Utf8View
+        }
+        _ => data_type,
+    }
+}
+
+/// [`tie_order_edit`] for a `Sort` whose aggregate has only non-float GROUP BY
+/// keys ([`group_keys_are_non_float`]) and only
+/// [`SPILL_AGGREGATE_FAMILIES`] functions, and which is not a bounded top-k
+/// candidate ([`is_bounded_topk_candidate`]), else `None`.
+///
+/// A float key is left alone for the reason it disqualifies spill: nothing
+/// proves which `-0.0` or NaN bit pattern represents its group, so ordering on
+/// it proves nothing. Any other aggregate function can never make the plan
+/// spill-eligible, so it gains nothing from a total order. A bounded top-k
+/// candidate is left as written so the bounded aggregate can still bound its
+/// state; it stays spill-ineligible unless its single term already orders by
+/// every group key. `fetch` is the `Sort`'s row limit ([`sort_fetch`]) and
+/// `max_limit` the session's [`SqlConfig::bounded_topk_max_limit`].
+fn total_tie_order_edit(
+    sort: &Sort,
+    fetch: Option<usize>,
+    max_limit: Option<usize>,
+) -> Option<TieOrderEdit> {
+    let (_, aggregate) = sorted_aggregate(sort)?;
+    if !group_keys_are_non_float(aggregate)
+        || !aggregate_functions_are_spill_families(aggregate)
+        || is_bounded_topk_candidate(sort, fetch, max_limit)
+    {
+        return None;
+    }
+    tie_order_edit(sort)
+}
+
+/// Whether `plan` has a `Sort` [`rewrite_sort_group_key_tie_order`] edits:
+/// one [`total_tie_order_edit`] admits whose GROUP BY keys are not yet all
+/// sort terms. Shape, key types and function names only, plus, for a lone
+/// `min`/`max`, the nullability of its argument column and its result type
+/// ([`is_bounded_topk_candidate`]). No other argument type: the plan this
+/// reads has not been through the analyzer that coerces them.
+fn plan_has_tie_order_edit(plan: &LogicalPlan, max_limit: Option<usize>) -> bool {
+    has_tie_order_edit_under(plan, None, max_limit)
+}
+
+/// [`plan_has_tie_order_edit`] for `node`, which sits under the row limit
+/// `fetch` ([`fetch_for_inputs`] of its parent).
+fn has_tie_order_edit_under(
+    node: &LogicalPlan,
+    fetch: Option<usize>,
+    max_limit: Option<usize>,
+) -> bool {
+    if let LogicalPlan::Sort(sort) = node
+        && matches!(
+            total_tie_order_edit(sort, sort_fetch(sort, fetch), max_limit),
+            Some(TieOrderEdit::Extend(_) | TieOrderEdit::ProjectThrough { .. })
+        )
+    {
+        return true;
+    }
+    let fetch = fetch_for_inputs(node, fetch);
+    node.inputs()
+        .into_iter()
+        .any(|input| has_tie_order_edit_under(input, fetch, max_limit))
+}
+
+/// The row limit `sort` is under: its own `fetch`, else `fetch`, the one its
+/// ancestors put on it. The tie-order rewrite runs before DataFusion's limit
+/// pushdown, so a `LIMIT` is still a `Limit` node above the `Sort` there.
+fn sort_fetch(sort: &Sort, fetch: Option<usize>) -> Option<usize> {
+    sort.fetch.or(fetch)
+}
+
+/// The row limit `node`'s inputs are under, given that `node` is under
+/// `fetch`: a `Limit`'s literal `fetch` plus its literal `skip` (the fetch
+/// limit pushdown gives the `Sort` under it), the same `fetch` through a
+/// `Projection` (which keeps every row), and none below anything else.
+fn fetch_for_inputs(node: &LogicalPlan, fetch: Option<usize>) -> Option<usize> {
+    match node {
+        LogicalPlan::Limit(limit) => match (limit.get_skip_type(), limit.get_fetch_type()) {
+            (Ok(SkipType::Literal(skip)), Ok(FetchType::Literal(fetch))) => {
+                fetch.map(|fetch| fetch.saturating_add(skip))
+            }
+            _ => None,
+        },
+        LogicalPlan::Projection(_) => fetch,
+        _ => None,
+    }
+}
+
+/// Apply `edit` to `sort`, leaving `fetch` unchanged.
+fn apply_tie_order_edit(
+    sort: Sort,
+    edit: TieOrderEdit,
+) -> Result<Transformed<LogicalPlan>, DataFusionError> {
+    match edit {
+        TieOrderEdit::AlreadyTotal => Ok(Transformed::no(LogicalPlan::Sort(sort))),
+        TieOrderEdit::Extend(terms) => {
+            let mut expr = sort.expr;
+            expr.extend(terms);
+            Ok(Transformed::yes(LogicalPlan::Sort(Sort {
+                expr,
+                input: sort.input,
+                fetch: sort.fetch,
+            })))
+        }
+        TieOrderEdit::ProjectThrough {
+            terms,
+            projected,
+            input,
+            restore,
+        } => {
+            let inner = Projection::try_new(projected, input)?;
+            let mut expr = sort.expr;
+            expr.extend(terms);
+            let sorted = LogicalPlan::Sort(Sort {
+                expr,
+                input: Arc::new(LogicalPlan::Projection(inner)),
+                fetch: sort.fetch,
+            });
+            let restored = Projection::new_from_schema(Arc::new(sorted), restore);
+            Ok(Transformed::yes(LogicalPlan::Projection(restored)))
+        }
+    }
+}
+
+/// Rewrites every `Sort` whose input is an `Aggregate` (or a `HAVING` filter
+/// or a `Projection` directly over one, [`sorted_aggregate`]) with no float
+/// GROUP BY key so its key is total over
+/// that aggregate's GROUP BY keys ([`total_tie_order_edit`]): each key without
+/// a sort term is appended, in group order, ascending with nulls last, and
+/// `fetch` is unchanged. A `Sort` no edit applies to is returned unchanged.
+/// Does not reach into subquery plans. `max_limit` is the session's
+/// [`SqlConfig::bounded_topk_max_limit`].
+///
+/// Errors only when a rebuilt `Projection` does not validate (a user column
+/// already named like a [`TIEBREAK_COLUMN_PREFIX`] column). Every caller then
+/// keeps the plan it had, which leaves a `Sort` that needed the edit
+/// spill-ineligible; the rewrite exists to admit spill and never fails a
+/// query.
+fn rewrite_sort_group_key_tie_order(
+    plan: LogicalPlan,
+    max_limit: Option<usize>,
+) -> Result<LogicalPlan, DataFusionError> {
+    Ok(rewrite_tie_order_under(plan, None, max_limit)?.data)
+}
+
+/// [`rewrite_sort_group_key_tie_order`] for `node`, which sits under the row
+/// limit `fetch` ([`fetch_for_inputs`] of its parent). Top-down: an edited
+/// `Sort`'s new inputs are visited too, as `transform_down` would.
+fn rewrite_tie_order_under(
+    node: LogicalPlan,
+    fetch: Option<usize>,
+    max_limit: Option<usize>,
+) -> Result<Transformed<LogicalPlan>, DataFusionError> {
+    let input_fetch = fetch_for_inputs(&node, fetch);
+    let node = match node {
+        LogicalPlan::Sort(sort) => {
+            let fetch = sort_fetch(&sort, fetch);
+            match total_tie_order_edit(&sort, fetch, max_limit) {
+                Some(edit) => apply_tie_order_edit(sort, edit)?,
+                None => Transformed::no(LogicalPlan::Sort(sort)),
+            }
+        }
+        other => Transformed::no(other),
+    };
+    node.transform_children(|node| {
+        node.map_children(|input| rewrite_tie_order_under(input, input_fetch, max_limit))
+    })
+}
+
+/// [`rewrite_sort_group_key_tie_order`], or `plan` as it was when the rewrite
+/// fails. A `Sort` the rewrite could not make total stays spill-ineligible, so
+/// the failure costs the statement its spill permission, never its answer.
+fn tie_ordered_or_unchanged(plan: LogicalPlan, max_limit: Option<usize>) -> LogicalPlan {
+    match rewrite_sort_group_key_tie_order(plan.clone(), max_limit) {
+        Ok(rewritten) => rewritten,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "SQL Sort tie-order rewrite failed; planning the statement without it, \
+                 which leaves its Sort spill-ineligible"
+            );
+            plan
+        }
+    }
+}
+
+/// Classify one [`Aggregate`] node for spill (ADR-0954): every GROUP BY key
+/// non-float, every aggregate expression exact under a changed folding order.
+///
+/// A float GROUP BY key disqualifies for the same reason it disqualifies
+/// ADR-0094's repartition classification: `-0.0` and NaN payloads are
+/// significant here, and nothing proves the sort DataFusion applies to the
+/// spilled group state picks a merge-order-stable representative bit pattern.
+fn aggregate_node_is_spill_exact(aggregate: &Aggregate) -> bool {
+    let schema = aggregate.input.schema().as_ref();
+    group_keys_are_non_float(aggregate)
+        && aggregate
+            .aggr_expr
+            .iter()
+            .all(|expr| aggregate_expr_is_spill_exact(expr, schema))
+}
+
+/// Whether every GROUP BY key of `aggregate` resolves to a type that is not a
+/// float. Fail closed: a key whose type will not resolve does not count.
+fn group_keys_are_non_float(aggregate: &Aggregate) -> bool {
+    let schema = aggregate.input.schema().as_ref();
+    aggregate
+        .group_expr
+        .iter()
+        .all(|key| matches!(key.get_type(schema), Ok(ty) if !crate::minmax::is_float(&ty)))
+}
+
+/// Whether one aggregate expression keeps its exact answer when the spill path
+/// changes the order its partial states are folded in (ADR-0954):
+///
+/// - `count(...)` / `count(DISTINCT ...)`: eligible. Its accumulator is an
+///   integer and its merge is integer addition (a distinct count merges sets),
+///   neither of which depends on order, whatever the counted expression's type
+///   is.
+/// - `sum` over a resolved integer input: eligible. Integer addition is
+///   associative, so partial sums merged in any order give the same total.
+/// - `avg`/`mean` over a resolved integer input `crate::avg` computes exactly
+///   ([`crate::avg::is_admitted_integer`]: `Int8` to `Int64`, `UInt8` to
+///   `UInt32`, or a dictionary of one): eligible. That is `crate::avg`'s exact integer path,
+///   an `i128` numerator with checked addition and an integer count (ADR-0825
+///   decision 2), whose partial states merge by adding numerators and counts.
+///   The analyzer coerces each of those widths to `Int64`, so an analyzed plan
+///   carries an `Int64` argument; the narrower widths are the same path seen
+///   before coercion. `avg(DISTINCT)` over the same input keeps a set of the
+///   distinct values instead, and its merge is a set union, which does not
+///   depend on order either. `UInt64` is not one of them: `crate::avg` widens
+///   it to `Float64` and folds it as a float.
+/// - `min`/`max` over a resolved type whose comparison is a total order that
+///   no float is part of ([`is_exact_extreme_type`]): eligible. Ravel's
+///   `crate::minmax` delegates every non-float type to DataFusion's built-in
+///   `min`/`max`, whose partial state is the running extreme in the argument's
+///   own type and whose merge keeps the smaller (or larger) of two states. The
+///   extreme of a multiset does not depend on how it is split or the order the
+///   parts are merged in, and two values the comparison calls equal are equal.
+///
+/// Everything else is ineligible, including `sum` over a float (order-dependent
+/// IEEE addition), `avg` over a float (the same fold) or a `UInt64`, `min`/`max`
+/// over a float or over any type outside [`is_exact_extreme_type`]'s list,
+/// `sum` over a Decimal, and any expression that is not an aggregate function
+/// call.
+fn aggregate_expr_is_spill_exact(expr: &Expr, schema: &DFSchema) -> bool {
+    let Expr::AggregateFunction(aggregate_function) = unaliased(expr) else {
+        // Not an aggregate function where one is required: fail closed.
+        return false;
+    };
+    let arg_type =
+        |wanted: fn(&datafusion::arrow::datatypes::DataType) -> bool| match aggregate_function
+            .params
+            .args
+            .first()
+        {
+            Some(arg) => match arg.get_type(schema) {
+                Ok(ty) => wanted(&ty),
+                Err(_) => false,
+            },
+            None => false,
+        };
+    match aggregate_function.func.name().to_ascii_lowercase().as_str() {
+        "count" => true,
+        "sum" => arg_type(is_exact_integer),
+        "avg" | "mean" => arg_type(crate::avg::is_admitted_integer),
+        "min" | "max" => arg_type(is_exact_extreme_type),
+        _ => false,
+    }
+}
+
+/// The argument types `min`/`max` merge exactly under spill: integers,
+/// decimals, booleans, strings, binary, dates, times and timestamps, plain or
+/// as a dictionary's values. Every one is compared by a total order in which
+/// equal means identical, so the extreme of a group is the same whatever order
+/// its partial states merge in. Floats are never on the list
+/// (`crate::minmax::is_float`), and every type not named here (durations,
+/// intervals, nested types, nulls) fails closed.
+fn is_exact_extreme_type(ty: &datafusion::arrow::datatypes::DataType) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    let value_type = match ty {
+        DataType::Dictionary(_, value_type) => value_type.as_ref(),
+        other => other,
+    };
+    is_exact_integer(value_type)
+        || matches!(
+            value_type,
+            DataType::Decimal32(..)
+                | DataType::Decimal64(..)
+                | DataType::Decimal128(..)
+                | DataType::Decimal256(..)
+                | DataType::Boolean
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView
+                | DataType::FixedSizeBinary(_)
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Timestamp(..)
+        )
+}
+
+/// The integer types whose addition is exact and associative, so a partial sum
+/// merged in any order is the same total. Deliberately narrower than "not a
+/// float": `Decimal128`/`Decimal256` addition is exact too but can overflow
+/// into a different error depending on where the split falls, and neither is
+/// reachable on the v1 surface, so both fail closed here.
+fn is_exact_integer(ty: &datafusion::arrow::datatypes::DataType) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    matches!(
+        ty,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    )
+}
+
+/// The union of the column-statistics requests of every
+/// [`LogicalPlan::Aggregate`] in `plan` (analyzed) whose shape a
+/// column-statistics consumer accepts
+/// ([`crate::metadata_agg::logical_aggregate_answerable`], issue #3244), or
+/// `None` when no aggregate is accepted. Reuses [`collect_aggregate_exprs`]'s
+/// reach (inputs plus embedded subquery plans), so `SELECT (SELECT SUM(status)
+/// FROM logs)` is judged on the nested aggregate. The plan's `logs` scans share
+/// one load, so it carries every dictionary any accepted aggregate reads.
+fn plan_stats_answerable_request(
+    plan: &LogicalPlan,
+    declared: &[DeclaredColumn],
+) -> Option<ColumnStatsRequest> {
+    let mut aggregates = Vec::new();
+    let mut distincts = Vec::new();
+    collect_aggregate_exprs(plan, &mut aggregates, &mut distincts);
+    aggregates
+        .iter()
+        .filter_map(|aggregate| {
+            crate::metadata_agg::logical_aggregate_answerable(aggregate, declared)
+        })
+        .reduce(|mut union, request| {
+            union.extend(&request);
+            union
+        })
+}
+
+/// Classify a DISTINCT node's implicit group keys (ADR-0094 decision 1): a
+/// float key disqualifies exactly as a float `GROUP BY` key does, since a
+/// DISTINCT lowers to a `GROUP BY` on these keys. Plain `DISTINCT` keys on
+/// every output column; `DISTINCT ON` keys on its `on_expr` list.
+fn distinct_node_is_exact(distinct: &Distinct) -> bool {
+    match distinct {
+        Distinct::All(input) => input
+            .schema()
+            .fields()
+            .iter()
+            .all(|field| !crate::minmax::is_float(field.data_type())),
+        Distinct::On(distinct_on) => {
+            let schema = distinct_on.input.schema().as_ref();
+            distinct_on
+                .on_expr
+                .iter()
+                .all(|key| match key.get_type(schema) {
+                    Ok(ty) => !crate::minmax::is_float(&ty),
+                    Err(_) => false,
+                })
+        }
+    }
+}
+
+/// Classify one [`Aggregate`] node (ADR-0094 decision 1): every GROUP BY key
+/// must be non-float, and every aggregate expression must be exact-eligible.
+/// Types are resolved against the node's *input* schema, over which both group
+/// and aggregate-argument expressions are evaluated.
+fn aggregate_node_is_exact(aggregate: &Aggregate) -> bool {
+    let schema = aggregate.input.schema().as_ref();
+    // A float GROUP BY key disqualifies the query even when every aggregate is
+    // exact (`-0.0`/NaN bit-significance, ADR-0013): this ADR has no proof
+    // DataFusion picks a merge-order-stable representative bit pattern for a
+    // float group key. This also covers `SELECT DISTINCT float_col`, a
+    // zero-aggregate `Aggregate` whose group key is the DISTINCT column.
+    for key in &aggregate.group_expr {
+        match key.get_type(schema) {
+            Ok(ty) if crate::minmax::is_float(&ty) => return false,
+            Ok(_) => {}
+            // Fail closed: a key whose type will not resolve is not admitted.
+            Err(_) => return false,
+        }
+    }
+    aggregate
+        .aggr_expr
+        .iter()
+        .all(|expr| aggregate_expr_is_exact(expr, schema))
+}
+
+/// Whether one aggregate expression is exact-eligible (ADR-0094 decision 1):
+///
+/// - `count(...)`/`count(DISTINCT ...)`: always exact, any input type.
+/// - `sum`/`min`/`max` over a resolved non-float input: exact.
+/// - `avg`/`mean` over a resolved `Int64` input: exact (ADR-0825 decision 3).
+/// - `avg`/`mean` over any other input, `sum`/`min`/`max` over a float input,
+///   and anything unexpected: not exact (fail closed).
+fn aggregate_expr_is_exact(expr: &Expr, schema: &DFSchema) -> bool {
+    // `aggr_expr` entries are either an `AggregateFunction` or an `Alias`
+    // wrapping one; unwrap a single alias layer.
+    let inner = match expr {
+        Expr::Alias(alias) => alias.expr.as_ref(),
+        other => other,
+    };
+    let Expr::AggregateFunction(aggregate_function) = inner else {
+        // Not an aggregate function where one is required: fail closed.
+        return false;
+    };
+    match aggregate_function.func.name().to_ascii_lowercase().as_str() {
+        // Counting presence is order-independent regardless of the counted
+        // value's type; a partial-count merge is exact integer addition, and
+        // distinctness is a per-row property merge order cannot change.
+        "count" => true,
+        // Exact only over a resolved non-float input.
+        "sum" | "min" | "max" => match aggregate_function.params.args.first() {
+            Some(arg) => match arg.get_type(schema) {
+                Ok(ty) => !crate::minmax::is_float(&ty),
+                Err(_) => false,
+            },
+            // A sum/min/max with no argument should not occur; fail closed.
+            None => false,
+        },
+        // `avg`/`mean` over a resolved integer input runs exact i128
+        // accumulation with checked addition (crate::avg, ADR-0825 decision
+        // 2): the analyzer coerces the admitted integer types (Int8-Int64,
+        // UInt8-UInt32, and a Dictionary of one of those; crate::avg's
+        // `is_admitted_integer` is the list) to Int64, so a resolved Int64
+        // argument's partial sum is exact regardless of partitioning or merge
+        // order. `avg(DISTINCT)` over Int64 keeps a set of the distinct values
+        // and merges by union, which is exact in any order too (ADR-0825's
+        // #2930 amendment). A Float64 argument still runs the plain IEEE f64
+        // fold (ADR-0094's original amendment for issue #771) and is not
+        // exact: that partial sum is order-dependent. Any other resolved type
+        // (Decimal, Duration) is unreachable on the v1 `samples` surface and
+        // fails closed.
+        "avg" | "mean" => match aggregate_function.params.args.first() {
+            Some(arg) => matches!(
+                arg.get_type(schema),
+                Ok(datafusion::arrow::datatypes::DataType::Int64)
+            ),
+            None => false,
+        },
+        // Any other name is outside the admitted aggregate set and fails
+        // closed.
+        _ => false,
+    }
+}
+
+/// Leading sentinel marking a `name_filter` as a literal-prefix range key
+/// rather than an exact `__name__` value (ADR-0061 decision 3).
+///
+/// This MUST equal `ravel_catalog`'s
+/// `snapshot_resolve::PREFIX_FILTER_SENTINEL`, the byte the catalog strips to
+/// decide the prefix-vs-exact postings lookup. The value is duplicated inline
+/// here (matching this codebase's language-specific-enforcement precedent for
+/// name filters, which already duplicates `equality_name_filter` across
+/// ravel-query and ravel-sql) rather than shared across the crate boundary; the
+/// catalog pins the value with a test and the postings-pruning oracles round-
+/// trip it end to end, so a silent drift cannot pass.
+const PREFIX_FILTER_SENTINEL: char = '\u{1}';
+
+/// The literal prefix of a fully-anchored `__name__` regex of the exact shape
+/// `^literal.*$`, or `None` for every other shape (ADR-0061 decision 3).
+///
+/// SQL's `label_match(labels, '__name__', 'pattern')` UDF lowers to the same
+/// fully-anchored `ravel_promql` regex matcher PromQL selectors use (the raw
+/// pattern in `LabelMatcher.value`, evaluated as `^(?:value)$`), so this is the
+/// byte-for-byte twin of the PromQL engine's own detector. It accepts ONLY the
+/// prefix shape and rejects everything else so a misclassification can never
+/// prune a segment the query could match:
+///
+/// - one optional explicit leading `^` and trailing `$` are tolerated;
+/// - the remainder MUST end with an unanchored `.*` wildcard tail;
+/// - the literal before that tail MUST be non-empty and consist solely of
+///   plain metric-name bytes (`[A-Za-z0-9_:]`).
+///
+/// Infix wildcards, alternations, character classes, non-`.*` tails, and ANY
+/// backslash escape are rejected; the caller falls back to the pre-existing
+/// unpruned resolve.
+fn literal_prefix_from_anchored_regex(pattern: &str) -> Option<String> {
+    let mut p = pattern;
+    p = p.strip_prefix('^').unwrap_or(p);
+    p = p.strip_suffix('$').unwrap_or(p);
+    let literal = p.strip_suffix(".*")?;
+    if literal.is_empty() {
+        return None;
+    }
+    if literal.bytes().all(is_literal_prefix_byte) {
+        Some(literal.to_string())
+    } else {
+        None
+    }
+}
+
+/// A byte that is unambiguously a literal in a Prometheus-anchored regex and a
+/// valid metric-name character. Conservative on purpose: any byte outside this
+/// set (including every regex metacharacter and every escape) forces a bypass.
+fn is_literal_prefix_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b':'
+}
+
+/// The postings pruning key a single `__name__` matcher yields, or `None` if
+/// it cannot be soundly used to prune: an exact value verbatim, a prefix-
+/// anchored regex (`^foo.*$`) as its sentinel-encoded literal prefix, and a
+/// negation / non-prefix regex as `None`.
+fn name_pruning_key(m: &LabelMatcher) -> Option<String> {
+    match &m.op {
+        MatchOp::Eq => Some(m.value.clone()),
+        MatchOp::Re(_) => literal_prefix_from_anchored_regex(&m.value)
+            .map(|prefix| format!("{PREFIX_FILTER_SENTINEL}{prefix}")),
+        MatchOp::Ne | MatchOp::Nre(_) => None,
+    }
+}
+
+/// The lone `__name__` pruning key in `matchers`, or `None` if none can be
+/// soundly used to prune (extended by ADR-0061 decision 3).
+/// Mirrors the PromQL engine's `equality_name_filter`: a single `__name__`
+/// matcher that is either an exact `=` or a literal-prefix-anchored regex
+/// yields its (possibly sentinel-encoded) key; a second `__name__` matcher of
+/// any kind, a negation, or a non-prefix regex takes the conservative bypass
+/// so pruning never drops a segment the query could still match.
+fn equality_name_filter(matchers: &[LabelMatcher]) -> Option<String> {
+    let mut found: Option<String> = None;
+    for m in matchers {
+        if m.name != METRIC_NAME_LABEL {
+            continue;
+        }
+        // A second `__name__` matcher of any kind: the pruning key is no longer
+        // well defined, so bypass (unchanged from the equality-only behaviour).
+        if found.is_some() {
+            return None;
+        }
+        found = Some(name_pruning_key(m)?);
+    }
+    found
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod name_filter_tests {
+    use super::*;
+
+    fn re(pattern: &str) -> LabelMatcher {
+        LabelMatcher::regex(METRIC_NAME_LABEL, pattern).expect("compilable regex")
+    }
+
+    fn encoded(prefix: &str) -> String {
+        format!("{PREFIX_FILTER_SENTINEL}{prefix}")
+    }
+
+    /// The SQL detector is the byte-for-byte twin of the PromQL engine's, so it
+    /// accepts exactly the same literal-prefix shapes and rejects everything
+    /// else (including escapes, which it declines rather than mis-parses).
+    #[test]
+    fn detector_accepts_and_rejects_the_same_shapes_as_promql() {
+        for (pattern, prefix) in [
+            ("foo.*", "foo"),
+            ("^foo.*$", "foo"),
+            ("^foo.*", "foo"),
+            ("foo.*$", "foo"),
+            ("a1_b:c.*", "a1_b:c"),
+        ] {
+            assert_eq!(
+                literal_prefix_from_anchored_regex(pattern).as_deref(),
+                Some(prefix),
+                "{pattern:?} must yield {prefix:?}"
+            );
+        }
+        for pattern in [
+            "foo",
+            "^foo$",
+            ".*",
+            "^.*$",
+            ".*foo.*",
+            "foo.*bar.*",
+            "foo.*bar",
+            "fo.o.*",
+            "foo*",
+            "foo.+",
+            "foo|bar",
+            "(foo).*",
+            "[a-z].*",
+            r"a\.b.*",
+            r"^a\.b.*$",
+            "^^foo.*$",
+        ] {
+            assert_eq!(
+                literal_prefix_from_anchored_regex(pattern),
+                None,
+                "{pattern:?} must be rejected (unpruned bypass)"
+            );
+        }
+    }
+
+    #[test]
+    fn equality_name_filter_routes_prefix_and_preserves_bypass() {
+        // Exact case unchanged.
+        assert_eq!(
+            equality_name_filter(&[LabelMatcher::equal(METRIC_NAME_LABEL, "foo")]),
+            Some("foo".to_string())
+        );
+        // Prefix regex now prunes, via the sentinel encoding.
+        assert_eq!(equality_name_filter(&[re("^foo.*$")]), Some(encoded("foo")));
+        // Non-prefix regex and negations bypass.
+        assert_eq!(equality_name_filter(&[re(".*foo.*")]), None);
+        assert_eq!(equality_name_filter(&[re("foo|bar")]), None);
+        assert_eq!(
+            equality_name_filter(&[LabelMatcher::not_equal(METRIC_NAME_LABEL, "foo")]),
+            None
+        );
+        // Two `__name__` matchers bypass, even when each alone would prune.
+        assert_eq!(
+            equality_name_filter(&[LabelMatcher::equal(METRIC_NAME_LABEL, "foo"), re("^foo.*$"),]),
+            None
+        );
+        // No `__name__` matcher bypasses.
+        assert_eq!(
+            equality_name_filter(&[LabelMatcher::equal("job", "api")]),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) mod tests {
+    use datafusion::arrow::array::TimestampNanosecondArray;
+    use ravel_catalog::CatalogConfig;
+    use ravel_commit::publish::RetryPolicy;
+    use ravel_commit::record::NewCommitRecord;
+    use ravel_commit::{keys, publish, record};
+    use ravel_logseg::writer::ObjectIdentity as LogObjectIdentity;
+    use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::StoreError;
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
+    use ravel_object_store::instrument::InstrumentedStore;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_query::{ByteLimit, FetchError, RequestLimit};
+    use ravel_rspan::{
+        ObjectIdentity as SpanObjectIdentity, RspanConfig, RspanWriter, SpanRecord, StatusCode,
+    };
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
+    use uuid::Uuid;
+
+    use crate::declared::{DeclaredType, StaticDeclaredColumns};
+    use crate::memory::TenantDelegatingPool;
+
+    use super::*;
+
+    /// A spill-file write that fails for a reason other than the quota is
+    /// `SpillUnavailable`. DataFusion 55's spill writer raises the write
+    /// error inside the Arrow IPC writer, which wraps it as
+    /// `ArrowError::IoError`; this builds that exact chain, the disk-full
+    /// error converted the way `FileSpillWriter::write` and Arrow convert it.
+    #[test]
+    fn a_failed_spill_write_through_the_arrow_writer_is_spill_unavailable() {
+        let disk_full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        let from_spill_writer = std::io::Error::from(DataFusionError::IoError(disk_full));
+        let detail = from_spill_writer.to_string();
+        let err = DataFusionError::from(ArrowError::from(from_spill_writer));
+
+        let failure = spill_failure_kind(&err).expect("a failed spill write is a spill failure");
+        match spill_error(failure, 4096, 65_536) {
+            SqlError::SpillUnavailable(message) => assert_eq!(
+                message,
+                format!(
+                    "spill file write failed while the query held 4096 of 65536 \
+                     scratch bytes: {detail}"
+                )
+            ),
+            other => panic!("expected SpillUnavailable, got {other:?}"),
+        }
+    }
+
+    pub(crate) fn empty_store() -> Arc<InstrumentedStore<FaultStore<MemoryStore>>> {
+        Arc::new(InstrumentedStore::new(FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty(),
+        )))
+    }
+
+    const FOLD_LAG_NS_PER_SEC: i64 = 1_000_000_000;
+    const FOLD_LAG_NS_PER_MIN: i64 = 60 * FOLD_LAG_NS_PER_SEC;
+    const FOLD_LAG_NS_PER_HOUR: i64 = 60 * FOLD_LAG_NS_PER_MIN;
+    /// An arbitrary but fixed ingest hour the fold-lag fixture calls "now",
+    /// large enough that subtracting seven hours stays positive.
+    const FOLD_LAG_NOW_HOUR: u32 = 490_000;
+
+    /// Writes one real RSEG segment carrying a single sample into
+    /// `ingest_hour_bucket` and publishes its commit record.
+    async fn publish_fold_lag_segment(
+        store: &MemoryStore,
+        tenant: &TenantId,
+        tenant_hash: TenantHash,
+        writer_seq: u64,
+        ingest_hour_bucket: u32,
+        ts_ns: i64,
+    ) {
+        let writer_id = Uuid::from_u128(u128::from(writer_seq) + 1_306);
+        let labels = LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: "m".to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(tenant, "m", &labels).expect("series id");
+        let written = SegmentWriter::write(
+            vec![SeriesInput {
+                series_id,
+                labels,
+                samples: vec![Sample {
+                    ts_ns,
+                    value: 1.125,
+                }],
+            }],
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: u32::from(ravel_segment::VERSION_V7),
+            created_unix_ns: 0,
+            ingest_hour_bucket,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// The data-object keys `SqlOutcome::segment_set` reports for one
+    /// `samples` run over `window`, from a fresh executor so no cache of an
+    /// earlier run answers it.
+    async fn resolved_segment_set(
+        store: &Arc<InstrumentedStore<FaultStore<MemoryStore>>>,
+        tenant_hash: TenantHash,
+        window: TimeRange,
+        now_ns: i64,
+    ) -> Vec<String> {
+        let mut req = sql_request("SELECT ts, value FROM samples", window);
+        req.now_ns = now_ns;
+        executor_over(store.clone())
+            .execute(tenant_hash, &req)
+            .await
+            .expect("executes")
+            .segment_set
+    }
+
+    /// The segment set a run reports is the data-object keys of the segments
+    /// it resolved: the same over an unchanged store, changed by a commit into
+    /// an hour the window lists whose rows overlap it, and unchanged by a
+    /// commit whose rows do not.
+    ///
+    /// FLIP D: with `segment_set` built from `ingest_watermark_hour` instead
+    /// of the segments' keys in `run`, the overlapping-commit assertion fails:
+    /// the late segment lands in the hour already listed, so the watermark
+    /// does not move.
+    #[tokio::test]
+    async fn the_segment_set_moves_with_an_overlapping_commit_and_only_then() {
+        let tenant = TenantId::new("acme-sql-segment-set".to_string());
+        let tenant_hash = tenant.hash();
+        let store = wrap_fixture_store(MemoryStore::new());
+        let memory = store.inner().inner();
+        let hour = FOLD_LAG_NOW_HOUR;
+        let hour_ns = i64::from(hour) * FOLD_LAG_NS_PER_HOUR;
+        let window = TimeRange {
+            start_ns: hour_ns,
+            end_ns: hour_ns + FOLD_LAG_NS_PER_HOUR,
+        };
+        let now_ns = hour_ns + FOLD_LAG_NS_PER_HOUR + 30 * FOLD_LAG_NS_PER_MIN;
+        publish_fold_lag_segment(
+            memory,
+            &tenant,
+            tenant_hash,
+            1,
+            hour,
+            hour_ns + 10 * FOLD_LAG_NS_PER_MIN,
+        )
+        .await;
+
+        let first = resolved_segment_set(&store, tenant_hash, window, now_ns).await;
+        assert_eq!(
+            first.len(),
+            1,
+            "test setup: one segment resolved: {first:?}"
+        );
+        let again = resolved_segment_set(&store, tenant_hash, window, now_ns).await;
+        assert_eq!(first, again, "an unchanged store resolves the same set");
+
+        // A late row into the hour the window lists.
+        publish_fold_lag_segment(
+            memory,
+            &tenant,
+            tenant_hash,
+            2,
+            hour,
+            hour_ns + 20 * FOLD_LAG_NS_PER_MIN,
+        )
+        .await;
+        let moved = resolved_segment_set(&store, tenant_hash, window, now_ns).await;
+        assert_ne!(moved, first, "an overlapping commit moves the set");
+        assert_eq!(moved.len(), 2, "both segments resolved: {moved:?}");
+        assert!(moved.contains(&first[0]));
+        assert!(
+            moved.iter().all(|key| key.ends_with(".rseg")),
+            "data-object keys: {moved:?}"
+        );
+
+        // A commit whose rows are outside the window, in a later hour.
+        publish_fold_lag_segment(
+            memory,
+            &tenant,
+            tenant_hash,
+            3,
+            hour + 1,
+            hour_ns + FOLD_LAG_NS_PER_HOUR + 10 * FOLD_LAG_NS_PER_MIN,
+        )
+        .await;
+        let after = resolved_segment_set(&store, tenant_hash, window, now_ns).await;
+        assert_eq!(after, moved, "a non-overlapping commit leaves the set");
+    }
+
+    /// The key set is sorted and deduplicated, so it does not depend on the
+    /// order the lanes and segments were listed in.
+    ///
+    /// FLIP E (keys): with the `sort_unstable` removed from
+    /// `segment_set_keys`, the first assertion fails.
+    #[test]
+    fn the_segment_set_keys_are_sorted_and_deduplicated() {
+        assert_eq!(
+            segment_set_keys(["b.rseg", "a.rseg", "b.rseg"].into_iter()),
+            vec!["a.rseg".to_string(), "b.rseg".to_string()],
+        );
+        assert_eq!(
+            segment_set_keys(["a.rseg", "b.rseg"].into_iter()),
+            segment_set_keys(["b.rseg", "a.rseg", "a.rseg"].into_iter()),
+        );
+        assert!(segment_set_keys(std::iter::empty()).is_empty());
+    }
+
+    /// The fold-lag fixture: one segment in an hour the fold sealed
+    /// (`FOLD_LAG_NOW_HOUR - 7`) and two in hours it did not
+    /// (`- 5` and `- 0`), folded once at an instant six hours before query
+    /// time and never again. The executor shares the catalog handle the fold
+    /// ran through, so its resolve reads the snapshot that fold wrote.
+    async fn fold_lag_executor() -> (SqlExecutor, TenantHash) {
+        let tenant = TenantId::new("acme-sql-fold-lag".to_string());
+        let tenant_hash = tenant.hash();
+        let memory = MemoryStore::new();
+        for (seq, back) in [7u32, 5, 0].iter().enumerate() {
+            let hour = FOLD_LAG_NOW_HOUR - back;
+            publish_fold_lag_segment(
+                &memory,
+                &tenant,
+                tenant_hash,
+                seq as u64 + 1,
+                hour,
+                // Ten minutes into the hour, inside the window below.
+                i64::from(hour) * FOLD_LAG_NS_PER_HOUR + 10 * FOLD_LAG_NS_PER_MIN,
+            )
+            .await;
+        }
+        let store = Arc::new(InstrumentedStore::new(FaultStore::new(
+            memory,
+            FaultPlan::empty(),
+        )));
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        // 1 h 50 m into FOLD_LAG_NOW_HOUR - 5 the 4,800 s seal margin has
+        // elapsed for `- 6` and not for `- 5`, so this fold seals to `- 6` and
+        // the `- 7` segment sits below the watermark.
+        let fold_now =
+            i64::from(FOLD_LAG_NOW_HOUR - 5) * FOLD_LAG_NS_PER_HOUR + 110 * FOLD_LAG_NS_PER_MIN;
+        let report = catalog
+            .fold(
+                &tenant_hash,
+                Signal::Metrics,
+                Uuid::new_v4(),
+                fold_now,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert_eq!(
+            report.watermark_hour,
+            Some(FOLD_LAG_NOW_HOUR - 6),
+            "test setup: the one fold that ran sealed through FOLD_LAG_NOW_HOUR - 6"
+        );
+        let executor = SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(store.clone()),
+            LogSegmentFetcher::new(store.clone()),
+            SpanSegmentFetcher::new(store),
+            SqlConfig::default(),
+            1 << 30,
+        );
+        (executor, tenant_hash)
+    }
+
+    /// ADR-1306 decision 6 and its 2026-09-27 amendment, on the SQL path, end
+    /// to end: the resolve-boundary check in `resolve_admitted` is where a SQL
+    /// refusal picks up the fold-lag clause, so a statement refused there
+    /// during real fold lag reads the tail and the gauge, not a bare budget
+    /// figure.
+    ///
+    /// The flipped line: `resolve_admitted`'s
+    /// `resolved_fold_lag(&snapshot, &origins, req.now_ns,
+    /// engine_config.fold_lag_threshold())`. Replace it with
+    /// `ravel_query::FoldLag::Healthy` and this test fails with
+    /// `left: Healthy, right: Lagging { unsealed_tail: 19800s,
+    /// fold_lag_threshold: 8730s }`.
+    ///
+    /// Injected time throughout: every instant is derived from
+    /// `FOLD_LAG_NOW_HOUR`, and neither the fold nor the query reads a wall
+    /// clock.
+    #[tokio::test]
+    async fn sql_resolve_boundary_refusal_names_the_unsealed_tail() {
+        let (executor, tenant_hash) = fold_lag_executor().await;
+        let now_ns = i64::from(FOLD_LAG_NOW_HOUR) * FOLD_LAG_NS_PER_HOUR + 30 * FOLD_LAG_NS_PER_MIN;
+        // Back past the sealed segment's event time, so the resolve extracts
+        // it from the snapshot and therefore knows where the watermark is. The
+        // tail is set by the oldest RECENT hour, `- 5`, not by the width.
+        let window = TimeRange {
+            start_ns: i64::from(FOLD_LAG_NOW_HOUR - 7) * FOLD_LAG_NS_PER_HOUR
+                + 5 * FOLD_LAG_NS_PER_MIN,
+            end_ns: now_ns,
+        };
+        let expected_tail = Duration::from_nanos(
+            (now_ns - i64::from(FOLD_LAG_NOW_HOUR - 5) * FOLD_LAG_NS_PER_HOUR)
+                .try_into()
+                .expect("a positive tail"),
+        );
+        assert_eq!(
+            expected_tail,
+            Duration::from_secs(19_800),
+            "test setup: the fixture's tail is 5 h 30 m"
+        );
+
+        let mut req = sql_request("SELECT ts, value FROM samples", window);
+        req.now_ns = now_ns;
+        req.budgets = Some(ravel_query::RequestBudgets {
+            max_store_requests: Some(ravel_query::RequestLimit::Bounded(1)),
+            ..Default::default()
+        });
+        let err = executor
+            .execute(tenant_hash, &req)
+            .await
+            .expect_err("a budget of 1 must refuse this resolve");
+        let SqlError::RequestBudgetExceeded {
+            requests,
+            max,
+            fold_lag,
+            table: None,
+        } = &err
+        else {
+            panic!("expected SqlError::RequestBudgetExceeded, got {err:?}");
+        };
+        assert!(
+            requests > max,
+            "the refusal must carry the spend that passed the budget: {requests} vs {max}"
+        );
+        assert_eq!(
+            *fold_lag,
+            ravel_query::FoldLag::Lagging {
+                unsealed_tail: expected_tail,
+                // The literal the PromQL side pins too: 8,400 s of healthy
+                // tail + the 300 s fold interval + the 30 s HEAD cache TTL.
+                fold_lag_threshold: Duration::from_secs(8_730),
+            },
+            "the SQL resolve boundary must carry the tail its own resolve listed"
+        );
+        let message = err.client_message();
+        assert_eq!(message, err.to_string());
+        assert!(
+            message.contains("19800 s"),
+            "the message must name the tail's length: {message}"
+        );
+        assert!(
+            message.contains("8730 s"),
+            "the message must name the threshold it exceeded: {message}"
+        );
+        assert!(
+            message.contains(ravel_query::FOLD_LAST_SUCCESS_GAUGE),
+            "the message must name the fold-liveness gauge: {message}"
+        );
+        // Unchanged status: 422 over HTTP, `FailedPrecondition` over Flight SQL.
+        assert_eq!(err.class(), crate::ErrorClass::Unsupported);
+
+        // Non-vacuity: the identical fixture and window with no lowered budget
+        // runs to a result, so the assertions above are about the budget and
+        // not about a fixture that cannot resolve at all.
+        let (control_executor, control_tenant) = fold_lag_executor().await;
+        let mut control = sql_request("SELECT ts, value FROM samples", window);
+        control.now_ns = now_ns;
+        let outcome = control_executor
+            .execute(control_tenant, &control)
+            .await
+            .expect("the default ceiling must admit the fixture's statement");
+        assert_eq!(
+            ts_values(&outcome.output).len(),
+            3,
+            "the fixture's three segments each carry one sample"
+        );
+    }
+
+    /// SQL side of the resolve-time request-budget gap: a statement whose
+    /// snapshot resolves to zero segments never reaches the segment-fetch
+    /// loop in scan.rs, so the incremental `max_s3_requests` check there
+    /// never runs. A caller-lowered budget of zero (ADR-1374
+    /// decision 3) must still be enforced right after resolve, on the
+    /// `execute`, `explain`, and Flight SQL `resolve_snapshot` paths alike --
+    /// round 2 moved the check into `resolve_admitted`, the one resolve path
+    /// all three funnel through, so this covers all three with one shared
+    /// check instead of one copy per caller -- and the server default
+    /// ceiling must not change behavior for the same fixture.
+    #[tokio::test]
+    async fn lowered_request_budget_is_enforced_after_resolve() {
+        let tenant_hash = TenantId::new("acme-sql-budget").hash();
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: 60_000_000_000,
+        };
+        let sql = "SELECT ts, value FROM samples";
+        let budgets = Some(ravel_query::RequestBudgets {
+            max_store_requests: Some(ravel_query::RequestLimit::Bounded(0)),
+            ..Default::default()
+        });
+
+        // execute(): the attempt path in `run`.
+        let mut exec_req = sql_request(sql, window);
+        exec_req.budgets = budgets;
+        let executor = executor_over(empty_store());
+        let err = executor
+            .execute(tenant_hash, &exec_req)
+            .await
+            .expect_err("a zero store-request budget must trip even on an empty snapshot");
+        let SqlError::RequestBudgetExceeded {
+            requests,
+            max,
+            fold_lag: _,
+            table: None,
+        } = err
+        else {
+            panic!("expected SqlError::RequestBudgetExceeded, got {err:?}");
+        };
+        assert_eq!(
+            max, 0,
+            "the caller's lowered ceiling must be reported exactly"
+        );
+        // Pinned: an empty-snapshot resolve against a fresh `MemoryStore`
+        // issues exactly 3 catalog requests, on both the execute and
+        // explain paths (both funnel through `resolve_admitted`).
+        assert_eq!(
+            requests, 3,
+            "the resolve's own catalog request count must be exact, not just nonzero"
+        );
+
+        // explain(): the same check in `explain_inner`, against a fresh
+        // store/executor so the two paths' resolves are not comparing a warm
+        // cache against a cold one.
+        let mut explain_req = sql_request(sql, window);
+        explain_req.budgets = budgets;
+        let explain_executor = executor_over(empty_store());
+        let explain_err = explain_executor
+            .explain(tenant_hash, &explain_req)
+            .await
+            .expect_err("explain must also trip on a zero store-request budget");
+        let SqlError::RequestBudgetExceeded {
+            requests: explain_requests,
+            max: explain_max,
+            fold_lag: _,
+            table: None,
+        } = explain_err
+        else {
+            panic!("expected SqlError::RequestBudgetExceeded, got {explain_err:?}");
+        };
+        assert_eq!(explain_max, 0);
+        assert_eq!(
+            explain_requests, 3,
+            "explain's resolve must issue the same exact catalog request count as execute's"
+        );
+
+        // resolve_snapshot(): the Flight SQL resolve path, which used to
+        // return right after `resolve` with no post-resolution check of its
+        // own. It shares `resolve_admitted` with `execute` and `explain`, so
+        // it must trip on the identical fixture with the identical pinned
+        // cost.
+        let mut snapshot_req = sql_request(sql, window);
+        snapshot_req.budgets = budgets;
+        let snapshot_executor = executor_over(empty_store());
+        let snapshot_accounting = QueryAccounting::new();
+        let snapshot_err = snapshot_executor
+            .resolve_snapshot(tenant_hash, &snapshot_req, &snapshot_accounting)
+            .await
+            .expect_err("resolve_snapshot must also trip on a zero store-request budget");
+        let SqlError::RequestBudgetExceeded {
+            requests: snapshot_requests,
+            max: snapshot_max,
+            fold_lag: _,
+            table: None,
+        } = snapshot_err
+        else {
+            panic!("expected SqlError::RequestBudgetExceeded, got {snapshot_err:?}");
+        };
+        assert_eq!(snapshot_max, 0);
+        assert_eq!(
+            snapshot_requests, 3,
+            "resolve_snapshot's resolve must issue the same exact catalog request count \
+             as execute's and explain's"
+        );
+
+        // Control: the server's default ceiling is far above any resolve
+        // cost, so the identical fixture succeeds under it, and the
+        // accounted request count is the same exact number both budgeted
+        // attempts tripped on.
+        let control_req = sql_request(sql, window);
+        let control_executor = executor_over(empty_store());
+        let outcome = control_executor
+            .execute(tenant_hash, &control_req)
+            .await
+            .expect("the server default ceiling must not trip on the resolve's own cost");
+        assert_eq!(
+            outcome.accounting.total_s3_requests(),
+            requests,
+            "the default-ceiling control must account the same resolve cost as the trip"
+        );
+    }
+
+    fn not_found() -> SqlError {
+        SqlError::Fetch(FetchError::Store {
+            key: "t/hash/metrics/l0/0/w.1.2.abc.rseg".to_string(),
+            source: StoreError::NotFound,
+        })
+    }
+
+    #[test]
+    fn a_bare_external_sql_error_is_recovered() {
+        let df: DataFusionError = not_found().into();
+        let recovered = take_sql_error(df).expect("recovered");
+        assert!(recovered.is_segment_not_found());
+    }
+
+    /// The scan's error crosses `SortPreservingMergeExec`, which round-trips
+    /// it through arrow. If that wrapper were not unwrapped the retry
+    /// contract would never fire in a real plan.
+    #[test]
+    fn an_arrow_wrapped_error_is_recovered() {
+        let df: DataFusionError = not_found().into();
+        let wrapped =
+            DataFusionError::ArrowError(Box::new(ArrowError::ExternalError(Box::new(df))), None);
+        let recovered = take_sql_error(wrapped).expect("recovered");
+        assert!(recovered.is_segment_not_found());
+    }
+
+    #[test]
+    fn a_context_wrapped_error_is_recovered() {
+        let df: DataFusionError = not_found().into();
+        let wrapped = DataFusionError::Context("while scanning".to_string(), Box::new(df));
+        let recovered = take_sql_error(wrapped).expect("recovered");
+        assert!(recovered.is_segment_not_found());
+    }
+
+    #[test]
+    fn a_shared_error_keeps_its_retry_classification() {
+        let df: DataFusionError = not_found().into();
+        let shared = DataFusionError::Shared(Arc::new(df));
+        let recovered = take_sql_error(shared).expect("recovered");
+        assert!(recovered.is_segment_not_found());
+    }
+
+    /// Checkpoint review finding: a budget error crossing a `Shared`
+    /// boundary must keep its own class and message, not collapse into a
+    /// generic execution failure that loses the count/limit text and
+    /// reports the wrong HTTP status.
+    #[test]
+    fn a_shared_budget_error_keeps_its_own_class_and_message() {
+        let inner = SqlError::TooManySamples { count: 20, max: 10 };
+        let want_class = inner.class();
+        let want_message = inner.client_message();
+        let df: DataFusionError = inner.into();
+        let shared = DataFusionError::Shared(Arc::new(df));
+
+        let recovered = take_sql_error(shared).expect("recovered");
+        assert_eq!(recovered.class(), want_class);
+        assert_eq!(recovered.client_message(), want_message);
+        assert!(recovered.client_message().contains("20"));
+        assert!(recovered.client_message().contains("10"));
+    }
+
+    #[test]
+    fn a_plain_datafusion_error_is_returned_untouched_and_redacted() {
+        let df = DataFusionError::Plan("No field named samples.nope".to_string());
+        let err = plan_error(df);
+        assert!(matches!(err, SqlError::Plan(_)));
+        assert!(
+            !err.client_message().contains("samples.nope"),
+            "plan detail must not reach the client"
+        );
+        assert!(
+            err.to_string().contains("samples.nope"),
+            "plan detail must survive for the log"
+        );
+    }
+
+    /// Every combination of the retry contract's three inputs, including
+    /// the post-emission branch that today's eager scan cannot reach
+    /// end-to-end (see [`retry_decision`]'s docs).
+    #[test]
+    fn the_retry_contract_covers_every_combination() {
+        // Not a vanished segment: never a snapshot problem.
+        for emitted in [0usize, 1] {
+            for attempt in [0u32, 1] {
+                assert_eq!(
+                    retry_decision(false, emitted, attempt),
+                    RetryDecision::Propagate,
+                    "emitted={emitted} attempt={attempt}"
+                );
+            }
+        }
+
+        // Vanished segment, nothing emitted, first attempt: retry exactly
+        // once.
+        assert_eq!(retry_decision(true, 0, 0), RetryDecision::RetryOnce);
+        // Vanished segment, nothing emitted, already retried: give up.
+        assert_eq!(retry_decision(true, 0, 1), RetryDecision::FailInvalidated);
+        // Vanished segment after emission: give up immediately, on either
+        // attempt. Never a retry, because the plan already handed rows out.
+        assert_eq!(retry_decision(true, 1, 0), RetryDecision::FailInvalidated);
+        assert_eq!(retry_decision(true, 7, 1), RetryDecision::FailInvalidated);
+    }
+
+    /// Issue #3899: the spill retry's trigger. A query-pool refusal with
+    /// nothing emitted, spill configured, an eligible statement and no spill
+    /// retry yet retries; taking away any one of those does not, and no other
+    /// error retries whatever the pool recorded, a fetch refusal included.
+    #[test]
+    fn the_spill_retry_fires_only_on_a_memory_refusal_with_every_condition() {
+        use ravel_memory::ExhaustionCause;
+
+        let refused = PoolReport {
+            refused: true,
+            first: Some(MemoryRefusal::Query),
+            ..PoolReport::default()
+        };
+        let pool_err = || SqlError::ResourcesExhausted("query memory pool exhausted".into());
+        let fetch_err = |cause| {
+            SqlError::Fetch(FetchError::FetchMemoryExhausted {
+                requested: 10,
+                reserved: 90,
+                limit: 100,
+                cause,
+            })
+        };
+        let decide = |err: &SqlError, pool, emitted, retried| {
+            spill_retry_decision(err, pool, emitted, true, true, retried)
+        };
+
+        assert_eq!(decide(&pool_err(), refused, 0, false), SpillRetry::Retry);
+        for pool in [PoolReport::default(), refused] {
+            assert_eq!(
+                decide(&fetch_err(ExhaustionCause::Accounted), pool, 0, false),
+                SpillRetry::Propagate,
+                "spilling does not shrink fetch buffers, so an accounted fetch refusal \
+                 never retries: {pool:?}"
+            );
+        }
+
+        assert_eq!(
+            decide(&pool_err(), PoolReport::default(), 0, false),
+            SpillRetry::Propagate,
+            "a ResourcesExhausted the pool did not refuse is not a memory refusal"
+        );
+        assert_eq!(
+            decide(&pool_err(), refused, 1, false),
+            SpillRetry::Propagate,
+            "rows already emitted"
+        );
+        assert_eq!(
+            decide(&pool_err(), refused, 0, true),
+            SpillRetry::Propagate,
+            "a second refusal after the spill retry"
+        );
+        assert_eq!(
+            spill_retry_decision(&pool_err(), refused, 0, false, true, false),
+            SpillRetry::Propagate,
+            "spill not configured"
+        );
+        assert_eq!(
+            spill_retry_decision(&pool_err(), refused, 0, true, false, false),
+            SpillRetry::Propagate,
+            "statement not spill-eligible"
+        );
+
+        let gate = PoolReport {
+            refused: true,
+            host_gate: true,
+            first: Some(MemoryRefusal::HostGate),
+            ..PoolReport::default()
+        };
+        assert_eq!(
+            decide(&pool_err(), gate, 0, false),
+            SpillRetry::Propagate,
+            "a host-gate refusal"
+        );
+        assert_eq!(
+            decide(
+                &fetch_err(ExhaustionCause::HostMemory {
+                    available: 1,
+                    floor: 2
+                }),
+                refused,
+                0,
+                false
+            ),
+            SpillRetry::Propagate,
+            "a fetch refused by the host gate"
+        );
+        for err in [
+            SqlError::SpillBudgetExhausted("quota".into()),
+            SqlError::SpillUnavailable("no scratch".into()),
+            SqlError::DeadlineExceeded { millis: 5 },
+            SqlError::Internal("boom".into()),
+        ] {
+            assert_eq!(
+                decide(&err, refused, 0, false),
+                SpillRetry::Propagate,
+                "{err:?}"
+            );
+        }
+
+        // Counted independently: a snapshot retry already taken leaves the
+        // spill retry available, and a spill retry already taken leaves the
+        // snapshot retry available.
+        assert_eq!(retry_decision(true, 0, 1), RetryDecision::FailInvalidated);
+        assert_eq!(decide(&pool_err(), refused, 0, false), SpillRetry::Retry);
+        assert_eq!(decide(&pool_err(), refused, 0, true), SpillRetry::Propagate);
+        assert_eq!(retry_decision(true, 0, 0), RetryDecision::RetryOnce);
+    }
+
+    /// Issue #3899 (M2): a tenant budget, process budget or reserve-ahead
+    /// refusal retries only when the refused statement held at least half of
+    /// that budget's reserved bytes; its own query-pool refusal retries
+    /// whatever any budget holds; a fetch-layer refusal never retries.
+    #[test]
+    fn a_budget_refusal_retries_only_when_the_statement_dominates_the_budget() {
+        use ravel_memory::ExhaustionCause;
+
+        let pool_err = || SqlError::ResourcesExhausted("process memory budget exhausted".into());
+        let decide = |pool| spill_retry_decision(&pool_err(), pool, 0, true, true, false);
+        let refused = |first, own, budget_reserved| PoolReport {
+            refused: true,
+            first: Some(first),
+            first_share: Some(BudgetShare {
+                budget_reserved,
+                own,
+                limit: u64::MAX,
+                non_sql_reserved: 0,
+            }),
+            ..PoolReport::default()
+        };
+
+        assert_eq!(
+            decide(refused(MemoryRefusal::Process, 800, 1000)),
+            SpillRetry::Retry,
+            "the statement holds 80% of the process reservation"
+        );
+        assert_eq!(
+            decide(refused(MemoryRefusal::Process, 100, 1000)),
+            SpillRetry::Propagate,
+            "the statement holds 10% of the process reservation"
+        );
+        assert_eq!(
+            decide(refused(MemoryRefusal::Tenant, 500, 1000)),
+            SpillRetry::Retry,
+            "exactly half of the tenant reservation"
+        );
+        assert_eq!(
+            decide(refused(MemoryRefusal::Tenant, 499, 1000)),
+            SpillRetry::Propagate,
+            "just under half of the tenant reservation"
+        );
+        assert_eq!(
+            decide(PoolReport {
+                first_share: None,
+                ..refused(MemoryRefusal::Process, 0, 0)
+            }),
+            SpillRetry::Propagate,
+            "a budget refusal with no recorded figures"
+        );
+
+        assert_eq!(
+            decide(refused(MemoryRefusal::Query, 1, 1000)),
+            SpillRetry::Retry,
+            "a query-pool refusal retries whatever the budget holds"
+        );
+        assert_eq!(
+            spill_retry_decision(
+                &pool_err(),
+                refused(MemoryRefusal::Query, 1, 1000),
+                1,
+                true,
+                true,
+                false
+            ),
+            SpillRetry::Propagate,
+            "a query-pool refusal still needs every other condition"
+        );
+        assert_eq!(
+            decide(refused(MemoryRefusal::ReserveAhead, 1, 1000)),
+            SpillRetry::Propagate,
+            "a reserve-ahead refusal takes the dominance test"
+        );
+        assert_eq!(
+            decide(PoolReport {
+                first_share: None,
+                ..refused(MemoryRefusal::ReserveAhead, 0, 0)
+            }),
+            SpillRetry::Propagate,
+            "a reserve-ahead refusal with no recorded figures"
+        );
+
+        let fetch = SqlError::Fetch(FetchError::FetchMemoryExhausted {
+            requested: 10,
+            reserved: 90,
+            limit: 100,
+            cause: ExhaustionCause::Accounted,
+        });
+        assert_eq!(
+            spill_retry_decision(
+                &fetch,
+                refused(MemoryRefusal::Process, 800, 1000),
+                0,
+                true,
+                true,
+                false
+            ),
+            SpillRetry::Propagate,
+            "a fetch-layer refusal never retries"
+        );
+    }
+
+    /// A statement's pool on `budget` whose migrated aggregates are charged one
+    /// to one with an envelope of what they asked, `width` of the process's
+    /// largest envelopes on the budget, and no tenant or query limit in reach.
+    fn statement_pool(budget: &Arc<MemoryBudget>, width: usize) -> Arc<TenantDelegatingPool> {
+        let tenant = TenantMemoryAccountant::with_process_budget(1 << 40, Arc::clone(budget));
+        Arc::new(
+            TenantDelegatingPool::new(
+                1 << 40,
+                tenant,
+                CeilingBreach::new(),
+                ravel_types::accounting::QueryAccounting::new(),
+            )
+            .with_aggregate_reserve_ahead(
+                crate::memory::tests::ENVELOPE_AS_ASKED,
+                std::num::NonZeroUsize::new(width).expect("a non-zero width"),
+            ),
+        )
+    }
+
+    fn register(
+        pool: &Arc<TenantDelegatingPool>,
+        name: &str,
+    ) -> datafusion::execution::memory_pool::MemoryReservation {
+        let pool: Arc<dyn MemoryPool> = Arc::clone(pool) as Arc<dyn MemoryPool>;
+        datafusion::execution::memory_pool::MemoryConsumer::new(name).register(&pool)
+    }
+
+    fn report(pool: &Arc<TenantDelegatingPool>) -> PoolReport {
+        PoolReport::of(&(Arc::clone(pool) as Arc<dyn MemoryPool>))
+    }
+
+    /// Issue #3899 (M2 review): an accounted reserve-ahead refusal is a
+    /// refusal of the shared process budget, so it records the budget's
+    /// figures and retries only when the statement dominates that budget.
+    /// With another statement holding 900 of 1000 reserved bytes, this one's
+    /// 50 charged and 50 enveloped bytes are 10% and it does not retry; with
+    /// the other holding 200, its 400 and 400 are 80% and it retries.
+    ///
+    /// FLIP: restore the always-true reserve-ahead arm of `refusal_is_own`
+    /// and the 10% case retries.
+    #[test]
+    fn a_reserve_ahead_refusal_retries_only_when_the_statement_dominates_the_process_budget() {
+        let _serial = crate::memory::tests::envelope_tests();
+        let decide = |pool| {
+            spill_retry_decision(
+                &SqlError::ResourcesExhausted("aggregate reserve-ahead refused".into()),
+                pool,
+                0,
+                true,
+                true,
+                false,
+            )
+        };
+        for (other_holds, own_asks, own, expected) in [
+            (900, 50, 100, SpillRetry::Propagate),
+            (200, 400, 800, SpillRetry::Retry),
+        ] {
+            let budget = Arc::new(MemoryBudget::new(1050));
+            let other = statement_pool(&budget, 1);
+            let theirs = register(&other, "ExternalSorter[0]");
+            theirs
+                .try_grow(other_holds)
+                .expect("the other statement fits");
+            let pool = statement_pool(&budget, 1);
+            let aggregate = register(&pool, "PartialHashAggregateStream[0]");
+            aggregate
+                .try_grow(own_asks)
+                .expect("the asked bytes and their envelope fit");
+            assert_eq!(budget.reserved(), 1000);
+            aggregate
+                .try_grow(100)
+                .expect_err("the envelope's 100 more bytes are over 1050");
+
+            let report = report(&pool);
+            assert_eq!(
+                (report.first, report.first_share),
+                (
+                    Some(MemoryRefusal::ReserveAhead),
+                    Some(BudgetShare {
+                        budget_reserved: 1000,
+                        own,
+                        limit: 1050,
+                        non_sql_reserved: 0,
+                    })
+                )
+            );
+            assert_eq!(
+                decide(report),
+                expected,
+                "the statement holds {own} of 1000 reserved bytes"
+            );
+            drop((aggregate, theirs));
+        }
+    }
+
+    /// Issue #3899 (M2 review), the single-statement case: with one statement
+    /// running, its own bytes dominate the process budget and it retries
+    /// both on a reserve-ahead refusal and on a process budget refusal. The
+    /// budget's limit is 1050. A cache holds 300 outside any statement,
+    /// through the fetch layer's reserve path, so it is not SQL's share. The
+    /// statement's two aggregates are charged 200 and 100 with envelopes of
+    /// the same size, both among the 2 the budget holds, and a join holds
+    /// 100: own is 700 of SQL's 700 of the 1000 reserved.
+    #[test]
+    fn a_single_statement_retries_on_a_reserve_ahead_and_a_process_refusal() {
+        let _serial = crate::memory::tests::envelope_tests();
+        let budget = Arc::new(MemoryBudget::new(1050));
+        let _cache = budget.reserve(300).expect("the cache share fits");
+        let statement = || {
+            let pool = statement_pool(&budget, 2);
+            let first = register(&pool, "PartialHashAggregateStream[0]");
+            first.try_grow(200).expect("within the budget");
+            let second = register(&pool, "PartialHashAggregateStream[1]");
+            second.try_grow(100).expect("within the budget");
+            let join = register(&pool, "HashJoinInput[0]");
+            join.try_grow(100).expect("within the budget");
+            assert_eq!(budget.reserved(), 1000);
+            (pool, first, second, join)
+        };
+        let decide = |pool| {
+            spill_retry_decision(
+                &SqlError::ResourcesExhausted("refused".into()),
+                pool,
+                0,
+                true,
+                true,
+                false,
+            )
+        };
+        let all_of_sql = Some(BudgetShare {
+            budget_reserved: 700,
+            own: 700,
+            limit: 1050,
+            non_sql_reserved: 300,
+        });
+
+        let (pool, first, second, join) = statement();
+        first
+            .try_grow(100)
+            .expect_err("the envelope's 100 more bytes are over 1050");
+        let refused = report(&pool);
+        assert_eq!(
+            (refused.first, refused.first_share),
+            (Some(MemoryRefusal::ReserveAhead), all_of_sql)
+        );
+        assert_eq!(decide(refused), SpillRetry::Retry);
+        drop((first, second, join, pool));
+        assert_eq!(budget.reserved(), 300, "only the cache is left");
+
+        let (pool, first, second, join) = statement();
+        join.try_grow(100)
+            .expect_err("100 more charged bytes are over 1050");
+        let refused = report(&pool);
+        assert_eq!(
+            (refused.first, refused.first_share),
+            (Some(MemoryRefusal::Process), all_of_sql)
+        );
+        assert_eq!(decide(refused), SpillRetry::Retry);
+        drop((first, second, join, pool));
+        assert_eq!(budget.reserved(), 300, "only the cache is left");
+    }
+
+    /// The shares a statement's reserve-ahead refusal and process budget
+    /// refusal record, on a budget whose fetch layer holds `fetch` bytes
+    /// through its reserve path and where another statement holds `other`
+    /// charged bytes. The statement's aggregate asks `aggregate` bytes with
+    /// an envelope of the same size, and its join holds `join`; each refusal
+    /// asks 100 bytes over a limit 50 above what the budget holds.
+    fn shares_beside_a_fetch_reservation(
+        fetch: u64,
+        other: usize,
+        aggregate: usize,
+        join: usize,
+    ) -> [(Option<MemoryRefusal>, Option<BudgetShare>, SpillRetry); 2] {
+        let _serial = crate::memory::tests::envelope_tests();
+        let held = fetch + other as u64 + 2 * aggregate as u64 + join as u64;
+        let budget = Arc::new(MemoryBudget::new(held + 50));
+        let _cache = budget.reserve(fetch).expect("the cache share fits");
+        assert_eq!(budget.fetch_reserved(), fetch);
+        let other_pool = statement_pool(&budget, 2);
+        let theirs = register(&other_pool, "ExternalSorter[0]");
+        if other > 0 {
+            theirs.try_grow(other).expect("the other statement fits");
+        }
+        let decide = |pool| {
+            spill_retry_decision(
+                &SqlError::ResourcesExhausted("refused".into()),
+                pool,
+                0,
+                true,
+                true,
+                false,
+            )
+        };
+        let statement = || {
+            let pool = statement_pool(&budget, 2);
+            let first = register(&pool, "PartialHashAggregateStream[0]");
+            first.try_grow(aggregate).expect("within the budget");
+            let joined = register(&pool, "HashJoinInput[0]");
+            if join > 0 {
+                joined.try_grow(join).expect("within the budget");
+            }
+            assert_eq!(budget.reserved(), held);
+            (pool, first, joined)
+        };
+        let ahead = {
+            let (pool, first, joined) = statement();
+            first
+                .try_grow(100)
+                .expect_err("the envelope's 100 more bytes are over the limit");
+            let refused = report(&pool);
+            drop((first, joined, pool));
+            (refused.first, refused.first_share, decide(refused))
+        };
+        let process = {
+            let (pool, first, joined) = statement();
+            joined
+                .try_grow(100)
+                .expect_err("100 more charged bytes are over the limit");
+            let refused = report(&pool);
+            drop((first, joined, pool));
+            (refused.first, refused.first_share, decide(refused))
+        };
+        drop((theirs, other_pool));
+        assert_eq!(budget.reserved(), fetch, "only the cache is left");
+        [ahead, process]
+    }
+
+    /// Issue #3899 (second M2 review): a single statement beside a large
+    /// cache. The fetch layer holds 600 bytes and the statement's own 400
+    /// (an aggregate charged 100 with a 100-byte envelope, and a join holding
+    /// 200) are all of SQL's 400 on the process budget, so both refusals
+    /// retry.
+    ///
+    /// FLIP: judge against the whole reserved total (1000) and own is 40%;
+    /// both refusals propagate.
+    #[test]
+    fn a_single_statement_beside_a_large_cache_retries() {
+        let all_of_sql = Some(BudgetShare {
+            budget_reserved: 400,
+            own: 400,
+            limit: 1050,
+            non_sql_reserved: 600,
+        });
+        assert_eq!(
+            shares_beside_a_fetch_reservation(600, 0, 100, 200),
+            [
+                (
+                    Some(MemoryRefusal::ReserveAhead),
+                    all_of_sql,
+                    SpillRetry::Retry
+                ),
+                (Some(MemoryRefusal::Process), all_of_sql, SpillRetry::Retry),
+            ]
+        );
+    }
+
+    /// Issue #3899 (second M2 review): leaving the fetch layer out does not
+    /// hide contention. With the same 600 fetch bytes, another statement
+    /// holding 900 and this one 100 (an aggregate charged 50 with a 50-byte
+    /// envelope), own is 100 of SQL's 1000, and both refusals propagate.
+    #[test]
+    fn a_statement_beside_a_cache_and_a_larger_statement_does_not_retry() {
+        let tenth = Some(BudgetShare {
+            budget_reserved: 1000,
+            own: 100,
+            limit: 1650,
+            non_sql_reserved: 600,
+        });
+        assert_eq!(
+            shares_beside_a_fetch_reservation(600, 900, 50, 0),
+            [
+                (
+                    Some(MemoryRefusal::ReserveAhead),
+                    tenth,
+                    SpillRetry::Propagate
+                ),
+                (Some(MemoryRefusal::Process), tenth, SpillRetry::Propagate),
+            ]
+        );
+    }
+
+    /// A process share's own bytes are capped at SQL's share, which a stale
+    /// read could leave below them, and a pool holding the whole SQL share
+    /// is dominant, an empty one included.
+    ///
+    /// FLIP: drop the cap in `BudgetShare::of_sql_share` and the first
+    /// share reads own 500.
+    #[test]
+    fn a_process_share_caps_own_at_the_sql_share() {
+        let refused = |share| PoolReport {
+            refused: true,
+            first: Some(MemoryRefusal::Process),
+            first_share: Some(share),
+            ..PoolReport::default()
+        };
+        for (sql_reserved, own, capped) in [(300, 500, 300), (0, 5, 0), (300, 100, 100)] {
+            let share = BudgetShare::of_sql_share(sql_reserved, 0, own, 1000);
+            assert_eq!(
+                share,
+                BudgetShare {
+                    budget_reserved: sql_reserved,
+                    own: capped,
+                    limit: 1000,
+                    non_sql_reserved: 0,
+                }
+            );
+        }
+        for (sql_reserved, own, expected) in [
+            (300, 500, SpillRetry::Retry),
+            (0, 5, SpillRetry::Retry),
+            (300, 100, SpillRetry::Propagate),
+        ] {
+            assert_eq!(
+                spill_retry_decision(
+                    &SqlError::ResourcesExhausted("refused".into()),
+                    refused(BudgetShare::of_sql_share(sql_reserved, 0, own, 1000)),
+                    0,
+                    true,
+                    true,
+                    false,
+                ),
+                expected,
+                "own {own} against SQL's {sql_reserved}"
+            );
+        }
+    }
+
+    /// Issue #3899: the spill retry's pool is the spill-mode pool, so a
+    /// consumer that can spill is held to `L - H` and a consumer that cannot
+    /// spill still finds `H` free; the first attempt's pool, and a retry that
+    /// could not enable spill, let the spillable consumer take all of `L`.
+    #[test]
+    fn the_spill_retry_runs_in_the_spill_mode_pool() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        const MIB: usize = 1 << 20;
+        let config = SqlConfig {
+            max_query_bytes: 1000 * MIB,
+            ..SqlConfig::default()
+        };
+        // Whether a non-spillable consumer can take 100 MiB after a
+        // spillable one asked for 950 MiB of the 1000 MiB limit.
+        let join_fits = |spill, spill_enabled: bool| {
+            let decision = if spill_enabled {
+                SpillDecision::Enabled {
+                    dir: std::path::Path::new("unused"),
+                    max_bytes: 1,
+                }
+            } else {
+                SpillDecision::Disabled
+            };
+            let (pool, _breach) = attempt_pool(
+                &config,
+                spill,
+                decision,
+                TenantMemoryAccountant::new(usize::MAX),
+                QueryAccounting::new(),
+                None,
+            );
+            let sorter = MemoryConsumer::new("ExternalSorter[0]")
+                .with_can_spill(true)
+                .register(&pool);
+            let _ = sorter.try_grow(950 * MIB);
+            let join = MemoryConsumer::new("HashJoinInput[0]").register(&pool);
+            join.try_grow(100 * MIB).is_ok()
+        };
+        assert_eq!(
+            [
+                join_fits(SpillAttempt::Retry, true),
+                join_fits(SpillAttempt::Retry, false),
+                join_fits(SpillAttempt::First, false),
+                join_fits(SpillAttempt::PlanTime, true),
+            ],
+            [true, false, false, false]
+        );
+    }
+
+    /// Issue #3899: the one INFO line a statement that took a spill retry
+    /// logs, field by field.
+    #[test]
+    fn the_spill_retry_logs_one_info_line_with_its_figures() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        type Fields = BTreeMap<String, String>;
+        #[derive(Clone, Default)]
+        struct Infos(Arc<Mutex<Vec<Fields>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Infos {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() != tracing::Level::INFO {
+                    return;
+                }
+                struct Visit(Fields);
+                impl tracing::field::Visit for Visit {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0
+                            .insert(field.name().to_string(), format!("{value:?}"));
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.insert(field.name().to_string(), value.to_string());
+                    }
+                }
+                let mut visit = Visit(Fields::new());
+                event.record(&mut visit);
+                self.0.lock().expect("not poisoned").push(visit.0);
+            }
+        }
+        static KEEP_TWO_DISPATCHERS: std::sync::OnceLock<tracing::Dispatch> =
+            std::sync::OnceLock::new();
+        KEEP_TWO_DISPATCHERS
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+
+        let first = FirstRefusal {
+            class: "query_pool",
+            after: Duration::from_millis(1234),
+            figures: RetryFigures {
+                asked_bytes: 96 << 20,
+                consumed_rows: Some(40_000),
+                first: Some(MemoryRefusal::Query),
+                share: None,
+            },
+        };
+        let derivation = RetryDerivation {
+            effective_limit: 128 << 20,
+            shape: BucketRetryShape {
+                total_rows: Some(100_000),
+                spill_consumers: Some(6),
+                partitions: Some(2),
+                descriptor_need: Some(66),
+            },
+        };
+        let spill = SpillCounts {
+            files: 3,
+            bytes_written: 4096,
+            rows_written: 10,
+            bytes_read: None,
+            duration: Duration::from_millis(7),
+        };
+        let capture = |report: SpillRetryReport, outcome: &'static str| {
+            let infos = Infos::default();
+            tracing::subscriber::with_default(
+                tracing_subscriber::registry().with(infos.clone()),
+                || report.emit("00000000deadbeef", outcome),
+            );
+            infos.0.lock().expect("not poisoned").clone()
+        };
+        let expected = |changed: &[(&str, &str)]| -> Fields {
+            let mut fields: Fields = [
+                (
+                    "message",
+                    "SQL statement retried with spill after a memory refusal",
+                ),
+                ("statement_fingerprint", "00000000deadbeef"),
+                ("outcome", "answered"),
+                ("first_refusal", "query_pool"),
+                ("first_refusal_after_ms", "1234"),
+                ("spill_bytes_written", "4096"),
+                ("spill_bytes_read", "unmeasured"),
+                ("spill_files", "3"),
+                ("retry_plan", "bucket"),
+                ("retry_plan_reason", "none"),
+                ("bits", "4"),
+                ("routed_chunk_rows", "2048"),
+                ("routed_chunk_bytes", "262144"),
+                ("exchange_spill_bytes_written", "1024"),
+                ("exchange_spill_files", "1"),
+                ("bucket_spill_bytes_written", "3072"),
+                ("bucket_spill_bytes_read", "3072"),
+                ("bucket_spill_rows_written", "6"),
+                ("peak_unspillable_bytes", "2200000"),
+                ("share_bytes", "17179869184"),
+                ("effective_limit_bytes", "134217728"),
+                ("first_attempt_asked_bytes", "100663296"),
+                ("first_attempt_consumed_rows", "40000"),
+                ("scan_rows_total", "100000"),
+                ("spillable_consumers", "6"),
+                ("final_partitions", "2"),
+                ("descriptor_need", "66"),
+                ("bucket_spill_rows_read", "6"),
+                ("retry_peak_asked_bytes", "5000000"),
+                ("retry_refusal", "none"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+            for (k, v) in changed {
+                assert!(fields.contains_key(*k), "{k} is a field");
+                fields.insert(k.to_string(), v.to_string());
+            }
+            fields
+        };
+
+        let sort_merge = first.report(
+            spill,
+            &[],
+            Some(RetryPlan::SortMerge("descriptor_budget")),
+            None,
+            PoolReport::default(),
+            Some(16 << 30),
+            Some(derivation),
+            7_000_000,
+            None,
+        );
+        assert_eq!(
+            capture(sort_merge, "answered"),
+            vec![expected(&[
+                ("retry_plan", "sort_merge"),
+                ("retry_plan_reason", "descriptor_budget"),
+                ("bits", "none"),
+                ("routed_chunk_rows", "none"),
+                ("routed_chunk_bytes", "none"),
+                ("exchange_spill_bytes_written", "0"),
+                ("exchange_spill_files", "0"),
+                ("bucket_spill_bytes_written", "0"),
+                ("bucket_spill_bytes_read", "0"),
+                ("bucket_spill_rows_written", "0"),
+                ("bucket_spill_rows_read", "0"),
+                ("peak_unspillable_bytes", "0"),
+                ("retry_peak_asked_bytes", "7000000"),
+            ])]
+        );
+
+        let failed = FirstRefusal {
+            figures: RetryFigures {
+                consumed_rows: None,
+                ..first.figures
+            },
+            ..first
+        }
+        .report(
+            spill,
+            &[],
+            None,
+            None,
+            PoolReport {
+                first: Some(MemoryRefusal::Tenant),
+                ..PoolReport::default()
+            },
+            Some(16 << 30),
+            None,
+            3_000_000,
+            Some(&SqlError::ResourcesExhausted(
+                "tenant memory budget exhausted".into(),
+            )),
+        );
+        assert_eq!(
+            capture(failed, "failed"),
+            vec![expected(&[
+                ("outcome", "failed"),
+                ("retry_plan", "sort_merge"),
+                ("retry_plan_reason", "not_planned"),
+                ("bits", "none"),
+                ("routed_chunk_rows", "none"),
+                ("routed_chunk_bytes", "none"),
+                ("exchange_spill_bytes_written", "0"),
+                ("exchange_spill_files", "0"),
+                ("bucket_spill_bytes_written", "0"),
+                ("bucket_spill_bytes_read", "0"),
+                ("bucket_spill_rows_written", "0"),
+                ("bucket_spill_rows_read", "0"),
+                ("peak_unspillable_bytes", "0"),
+                ("effective_limit_bytes", "none"),
+                ("first_attempt_consumed_rows", "none"),
+                ("scan_rows_total", "none"),
+                ("spillable_consumers", "none"),
+                ("final_partitions", "none"),
+                ("descriptor_need", "none"),
+                ("retry_peak_asked_bytes", "3000000"),
+                ("retry_refusal", "tenant_budget"),
+            ])]
+        );
+        for (error, refusal) in [
+            (
+                SqlError::ResourcesExhausted(format!(
+                    "query memory pool exhausted; {}: no routed state",
+                    crate::BUCKET_SPILL_UNDERSHOOT
+                )),
+                "bucket_spill_undershoot",
+            ),
+            (SqlError::Internal("boom".into()), "other"),
+        ] {
+            let report = first.report(
+                spill,
+                &[],
+                None,
+                None,
+                PoolReport {
+                    first: Some(MemoryRefusal::Query),
+                    ..PoolReport::default()
+                },
+                None,
+                None,
+                0,
+                Some(&error),
+            );
+            assert_eq!(report.retry_refusal, refusal, "{error}");
+        }
+
+        let report = first.report(
+            spill,
+            &[
+                OperatorSpill {
+                    operator: "RepartitionExec".to_string(),
+                    files: 1,
+                    bytes_written: 1024,
+                    rows_written: 4,
+                },
+                OperatorSpill {
+                    operator: "BucketedFinalAggregateExec".to_string(),
+                    files: 2,
+                    bytes_written: 3072,
+                    rows_written: 6,
+                },
+            ],
+            Some(RetryPlan::Bucket(BucketSpillTuning {
+                bits: 4,
+                routed_chunk_rows: 2048,
+                routed_chunk_bytes: Some(262_144),
+                descriptor_need: 66,
+            })),
+            Some(BucketSpillFigures {
+                bits: 4,
+                routed_chunk_rows: 2048,
+                bytes_read: 3072,
+                rows_read: 6,
+                disk: true,
+                executed: true,
+            }),
+            PoolReport {
+                peak_unspillable_bytes: 2_200_000,
+                ..PoolReport::default()
+            },
+            Some(16 << 30),
+            Some(derivation),
+            5_000_000,
+            None,
+        );
+        assert_eq!(capture(report, "answered"), vec![expected(&[])]);
+    }
+
+    /// ADR-0954's parallel bucket spill item 4: the exchange's and the
+    /// bucketed exec's figures come from their own operators, they sum to
+    /// the total, and a retry with no spilling bucketed exec reports
+    /// `sort_merge` with no bucket figures.
+    #[test]
+    fn spill_retry_report_splits_exchange_and_bucket_bytes() {
+        let first = FirstRefusal {
+            class: "query_pool",
+            after: Duration::from_millis(5),
+            figures: RetryFigures {
+                asked_bytes: 0,
+                consumed_rows: None,
+                first: None,
+                share: None,
+            },
+        };
+        let operators = [
+            OperatorSpill {
+                operator: "RepartitionExec".to_string(),
+                files: 2,
+                bytes_written: 700,
+                rows_written: 30,
+            },
+            OperatorSpill {
+                operator: "RepartitionExec".to_string(),
+                files: 1,
+                bytes_written: 300,
+                rows_written: 10,
+            },
+            OperatorSpill {
+                operator: "BucketedFinalAggregateExec".to_string(),
+                files: 16,
+                bytes_written: 9_000,
+                rows_written: 400,
+            },
+        ];
+        let mut totals = SpillCounts::default();
+        for operator in &operators {
+            totals.files += operator.files;
+            totals.bytes_written += operator.bytes_written;
+            totals.rows_written += operator.rows_written;
+        }
+        let bucket = BucketSpillFigures {
+            bits: 4,
+            routed_chunk_rows: 8192,
+            bytes_read: 9_000,
+            rows_read: 400,
+            disk: true,
+            executed: true,
+        };
+        let tuning = BucketSpillTuning {
+            bits: 4,
+            routed_chunk_rows: 8192,
+            routed_chunk_bytes: None,
+            descriptor_need: 66,
+        };
+        let report = first.report(
+            totals,
+            &operators,
+            Some(RetryPlan::Bucket(tuning)),
+            Some(bucket),
+            PoolReport::default(),
+            None,
+            None,
+            0,
+            None,
+        );
+        assert_eq!(report.retry_plan, "bucket");
+        assert_eq!(report.retry_plan_reason, None);
+        assert_eq!(
+            (report.bits, report.routed_chunk_rows),
+            (Some(4), Some(8192))
+        );
+        assert_eq!(report.exchange_spill_bytes_written, 1_000);
+        assert_eq!(report.exchange_spill_files, 3);
+        assert_eq!(report.bucket_spill_bytes_written, 9_000);
+        assert_eq!(report.bucket_spill_bytes_read, 9_000);
+        assert_eq!(report.bucket_spill_rows_written, 400);
+        assert_eq!(
+            report.exchange_spill_bytes_written + report.bucket_spill_bytes_written,
+            report.spill_bytes_written
+        );
+
+        let sort_merge = first.report(
+            totals,
+            &operators[..2],
+            Some(RetryPlan::SortMerge(crate::RETRY_NOT_ADMITTED)),
+            None,
+            PoolReport::default(),
+            None,
+            None,
+            0,
+            None,
+        );
+        assert_eq!(sort_merge.retry_plan, "sort_merge");
+        assert_eq!(sort_merge.retry_plan_reason, Some("not_admitted"));
+        assert_eq!(
+            (sort_merge.bits, sort_merge.routed_chunk_rows),
+            (None, None)
+        );
+        assert_eq!(sort_merge.exchange_spill_bytes_written, 1_000);
+        assert_eq!(
+            (
+                sort_merge.bucket_spill_bytes_written,
+                sort_merge.bucket_spill_bytes_read,
+                sort_merge.bucket_spill_rows_written
+            ),
+            (0, 0, 0)
+        );
+
+        let no_disk = BucketSpillFigures {
+            disk: false,
+            bytes_read: 0,
+            rows_read: 0,
+            ..bucket
+        };
+        let without_disk = first.report(
+            totals,
+            &operators[..2],
+            Some(RetryPlan::Bucket(tuning)),
+            Some(no_disk),
+            PoolReport::default(),
+            None,
+            None,
+            0,
+            None,
+        );
+        assert_eq!(without_disk.retry_plan, "bucket_without_disk");
+        assert_eq!(
+            (without_disk.bits, without_disk.bucket_spill_bytes_written),
+            (Some(4), 0)
+        );
+
+        // An exec that never ran found no disk manager to lack.
+        let not_executed = first.report(
+            totals,
+            &operators[..2],
+            Some(RetryPlan::Bucket(tuning)),
+            Some(BucketSpillFigures {
+                executed: false,
+                ..no_disk
+            }),
+            PoolReport::default(),
+            None,
+            None,
+            0,
+            None,
+        );
+        assert_eq!(not_executed.retry_plan, "bucket");
+    }
+
+    /// Issue #4114: the retry line's `retry_refusal` names the refusal that
+    /// ended the retry, read from its error, not the first refusal its pool
+    /// recorded. Each error is a real refusal of a spill-mode pool (per-query
+    /// limit 1000, headroom 100: cap 900, fair share 450 for two spill-capable
+    /// consumers, hard bound 950) on a 1200-byte process budget, carried
+    /// through [`FirstRefusal::report`] with the pool's own report and read
+    /// off the emitted INFO line.
+    ///
+    /// - A process budget refusal the retry absorbed (a fetch hold fills the
+    ///   budget, then leaves), then a hard-bound refusal: `spill_hard_bound`.
+    ///   Today's first-recorded read names `process_budget`.
+    /// - A per-query limit refusal absorbed, then a process budget refusal:
+    ///   `process_budget`. The first-recorded read names `query_pool`.
+    /// - A fair-share refusal with nothing recorded before it: `spill_cap`,
+    ///   and the same message with the exec's under-shoot label:
+    ///   `bucket_spill_undershoot`.
+    ///
+    /// Driven at the report rather than through an executor: a retry that
+    /// absorbs one refusal and surfaces another depends on how its streams
+    /// interleave, so no fixture reaches either order deterministically.
+    #[test]
+    fn the_retry_refusal_names_what_ended_the_retry() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+
+        #[derive(Clone, Default)]
+        struct Lines(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("not poisoned")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        static KEEP_TWO_DISPATCHERS: std::sync::OnceLock<tracing::Dispatch> =
+            std::sync::OnceLock::new();
+        KEEP_TWO_DISPATCHERS
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+
+        let pool = |budget: &Arc<MemoryBudget>| {
+            let tenant = TenantMemoryAccountant::with_process_budget(1 << 40, Arc::clone(budget));
+            Arc::new(
+                TenantDelegatingPool::new(
+                    1000,
+                    tenant,
+                    CeilingBreach::new(),
+                    ravel_types::accounting::QueryAccounting::new(),
+                )
+                .with_spill_headroom(100),
+            )
+        };
+        let spillable = |pool: &Arc<TenantDelegatingPool>, name: &str| -> MemoryReservation {
+            let pool: Arc<dyn MemoryPool> = Arc::clone(pool) as Arc<dyn MemoryPool>;
+            MemoryConsumer::new(name)
+                .with_can_spill(true)
+                .register(&pool)
+        };
+        let refusal = |result: datafusion::error::Result<()>| match result {
+            Err(DataFusionError::ResourcesExhausted(message)) => {
+                SqlError::ResourcesExhausted(message)
+            }
+            other => panic!("a memory refusal, got {other:?}"),
+        };
+        let line = |pool: PoolReport, error: &SqlError| {
+            let first = FirstRefusal {
+                class: "query_pool",
+                after: Duration::ZERO,
+                figures: RetryFigures {
+                    asked_bytes: 0,
+                    consumed_rows: None,
+                    first: Some(MemoryRefusal::Query),
+                    share: None,
+                },
+            };
+            let report = first.report(
+                SpillCounts::default(),
+                &[],
+                None,
+                None,
+                pool,
+                None,
+                None,
+                0,
+                Some(error),
+            );
+            let lines = Lines::default();
+            let writer = lines.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                report.emit("00000000deadbeef", "failed");
+            });
+            let text = String::from_utf8(lines.0.lock().expect("not poisoned").clone())
+                .expect("utf-8 log");
+            assert_eq!(text.lines().count(), 1, "{text}");
+            let field = text
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("retry_refusal="))
+                .unwrap_or_else(|| panic!("no retry_refusal on the line: {text}"))
+                .trim_matches('"')
+                .to_string();
+            assert_eq!(field, report.retry_refusal, "the line is the report");
+            field
+        };
+
+        let budget = Arc::new(MemoryBudget::new(1200));
+        let absorbed_process = pool(&budget);
+        let exchange = spillable(&absorbed_process, "RepartitionExec[0]");
+        let bucketed = spillable(&absorbed_process, "BucketedFinalAggregate[0]");
+        let fetch = budget.reserve(1000).expect("the fetch hold fits");
+        let absorbed = refusal(exchange.try_grow(300));
+        assert!(
+            absorbed
+                .to_string()
+                .contains("process memory budget exhausted"),
+            "{absorbed}"
+        );
+        drop(fetch);
+        exchange.grow(600);
+        let ended = refusal(bucketed.try_grow(400));
+        assert!(
+            ended.to_string().contains("over the spill-mode hard bound"),
+            "{ended}"
+        );
+        let recorded = report(&absorbed_process);
+        assert_eq!(recorded.first, Some(MemoryRefusal::Process));
+        assert_eq!(line(recorded, &ended), "spill_hard_bound");
+        drop((exchange, bucketed, absorbed_process));
+
+        let absorbed_query = pool(&budget);
+        let unspillable = register(&absorbed_query, "HashJoinInput[0]");
+        let sorter = spillable(&absorbed_query, "ExternalSorter[0]");
+        let _bucketed = spillable(&absorbed_query, "BucketedFinalAggregate[0]");
+        let absorbed = refusal(unspillable.try_grow(1100));
+        assert!(
+            absorbed.to_string().contains("query memory pool exhausted"),
+            "{absorbed}"
+        );
+        let fetch = budget.reserve(1150).expect("the fetch hold fits");
+        let ended = refusal(sorter.try_grow(100));
+        assert!(
+            ended
+                .to_string()
+                .contains("process memory budget exhausted"),
+            "{ended}"
+        );
+        let recorded = report(&absorbed_query);
+        assert_eq!(recorded.first, Some(MemoryRefusal::Query));
+        assert_eq!(line(recorded, &ended), "process_budget");
+        drop((fetch, unspillable, sorter, _bucketed, absorbed_query));
+
+        let share_pool = pool(&budget);
+        let bucketed = spillable(&share_pool, "BucketedFinalAggregate[0]");
+        let _exchange = spillable(&share_pool, "RepartitionExec[0]");
+        let ended = refusal(bucketed.try_grow(500));
+        assert!(ended.to_string().contains("over its fair share"), "{ended}");
+        let recorded = report(&share_pool);
+        assert_eq!(
+            recorded.first, None,
+            "a spill-mode cap refusal records nothing"
+        );
+        assert_eq!(line(recorded, &ended), "spill_cap");
+        let undershoot = SqlError::ResourcesExhausted(format!(
+            "{ended}; {}: the stream had no routed state left to write",
+            crate::BUCKET_SPILL_UNDERSHOOT
+        ));
+        assert_eq!(line(recorded, &undershoot), "bucket_spill_undershoot");
+        drop((bucketed, _exchange, share_pool));
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Every refusal message the pool builds is classified by the phrase it
+    /// was built with, and the more specific phrase wins where a message
+    /// names two: a reserve-ahead refusal names the process budget or the
+    /// host gate as its cause.
+    #[test]
+    fn a_refusal_message_classifies_by_its_phrase() {
+        for (message, class) in [
+            (
+                "query memory pool exhausted: 10 more bytes",
+                Some("query_pool"),
+            ),
+            (
+                "tenant memory budget exhausted: 10 more bytes",
+                Some("tenant_budget"),
+            ),
+            (
+                "process memory budget exhausted: 10 more bytes",
+                Some("process_budget"),
+            ),
+            (
+                "host memory gate refused the reservation: host available memory",
+                Some("host_memory_gate"),
+            ),
+            (
+                "aggregate reserve-ahead refused: process memory budget exhausted for this \
+                 aggregate's reserve-ahead envelope",
+                Some("aggregate_reserve_ahead"),
+            ),
+            (
+                "query memory pool spill threshold reached: process memory budget exhausted \
+                 for this aggregate's reserve-ahead envelope",
+                Some("aggregate_reserve_ahead"),
+            ),
+            (
+                "aggregate reserve-ahead refused: host memory gate refused the reservation \
+                 for this aggregate's reserve-ahead envelope",
+                Some("host_memory_gate"),
+            ),
+            (
+                "query memory pool spill threshold reached: spill-capable consumers would \
+                 hold 1000 bytes charged and enveloped, over the spill-mode hard bound 950",
+                Some("spill_hard_bound"),
+            ),
+            (
+                "query memory pool spill threshold reached: spill-capable consumers would \
+                 hold 931 bytes charged and enveloped, over the spill-mode cap 900",
+                Some("spill_cap"),
+            ),
+            (
+                "query memory pool spill threshold reached: x would hold 500 bytes charged \
+                 and enveloped, over its fair share 450 of the spill-mode cap 900",
+                Some("spill_cap"),
+            ),
+            ("spill budget exhausted", None),
+        ] {
+            assert_eq!(
+                crate::memory::refusal_class_of_message(message),
+                class,
+                "{message}"
+            );
+        }
+    }
+
+    /// The bucketed retry's limit follows the budget that refused: the
+    /// query limit on a query-pool refusal or with no share, else the room
+    /// the refusing budget leaves beside everyone else's reservations,
+    /// the fetch layer's and the caches' among them, never above the query
+    /// limit.
+    ///
+    /// FLIP: drop `non_sql_reserved` from `others` and the first, third and
+    /// fourth rows read 1000, 900 and 900.
+    #[test]
+    fn the_retry_limit_follows_the_budget_that_refused() {
+        const L: usize = 1_000;
+        let share = |budget_reserved: u64, own: u64, limit: u64| {
+            Some(BudgetShare {
+                budget_reserved,
+                own,
+                limit,
+                non_sql_reserved: 0,
+            })
+        };
+        let beside = |budget_reserved: u64, own: u64, limit: u64, non_sql_reserved: u64| {
+            Some(BudgetShare {
+                budget_reserved,
+                own,
+                limit,
+                non_sql_reserved,
+            })
+        };
+        let cases: [(&str, Option<MemoryRefusal>, Option<BudgetShare>, usize); 14] = [
+            (
+                "process, only this statement's SQL, non-SQL 30% of B, B less it below L",
+                Some(MemoryRefusal::Process),
+                beside(500, 500, 1_200, 360),
+                1_200 - 360,
+            ),
+            (
+                "process, only this statement's SQL, non-SQL 30% of B, B less it above L",
+                Some(MemoryRefusal::Process),
+                beside(500, 500, 2_000, 600),
+                L,
+            ),
+            (
+                "process, non-SQL above B",
+                Some(MemoryRefusal::Process),
+                beside(100, 100, 900, 1_000),
+                0,
+            ),
+            (
+                "reserve-ahead, others' SQL and non-SQL both subtracted",
+                Some(MemoryRefusal::ReserveAhead),
+                beside(600, 400, 1_100, 300),
+                1_100 - 200 - 300,
+            ),
+            (
+                "tenant, non-SQL 0, unchanged",
+                Some(MemoryRefusal::Tenant),
+                beside(700, 500, 800, 0),
+                600,
+            ),
+            (
+                "query pool",
+                Some(MemoryRefusal::Query),
+                share(900, 100, 500),
+                L,
+            ),
+            (
+                "process, only this pool, B >= L",
+                Some(MemoryRefusal::Process),
+                share(800, 800, 2_000),
+                L,
+            ),
+            (
+                "process, others hold 40% of B",
+                Some(MemoryRefusal::Process),
+                share(1_200, 400, 2_000),
+                L.min(2_000 - 800),
+            ),
+            (
+                "process, others hold 40% of B below L",
+                Some(MemoryRefusal::Process),
+                share(800, 400, 1_000),
+                600,
+            ),
+            (
+                "tenant below L, others hold some",
+                Some(MemoryRefusal::Tenant),
+                share(700, 500, 800),
+                600,
+            ),
+            (
+                "reserve-ahead, others hold some",
+                Some(MemoryRefusal::ReserveAhead),
+                share(1_500, 1_000, 1_200),
+                700,
+            ),
+            (
+                "others above B",
+                Some(MemoryRefusal::Tenant),
+                share(2_000, 100, 1_000),
+                0,
+            ),
+            (
+                "unbounded B",
+                Some(MemoryRefusal::Process),
+                share(5_000, 10, u64::MAX),
+                L,
+            ),
+            ("no share", Some(MemoryRefusal::Tenant), None, L),
+        ];
+        for (name, first, share, want) in cases {
+            assert_eq!(retry_effective_limit(L, first, share), want, "{name}");
+        }
+        assert_eq!(retry_effective_limit(L, None, None), L);
+    }
+
+    /// The fingerprint is a stable hash of the SQL text, and a lowered
+    /// statement, which has no text, says so.
+    #[test]
+    fn a_statement_fingerprint_is_sixteen_hex_digits_of_its_text() {
+        let a = statement_fingerprint(Statement::Sql("SELECT 1"));
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_eq!(a, statement_fingerprint(Statement::Sql("SELECT 1")));
+        assert_ne!(a, statement_fingerprint(Statement::Sql("SELECT 2")));
+    }
+
+    #[test]
+    fn target_signal_maps_the_from_clause_to_a_signal() {
+        // samples -> metrics; logs -> logs.
+        assert_eq!(
+            SqlExecutor::target_signal("SELECT ts FROM samples").expect("ok"),
+            TargetSignal::Metrics
+        );
+        assert_eq!(
+            SqlExecutor::target_signal("SELECT ts FROM logs").expect("ok"),
+            TargetSignal::Logs
+        );
+        // A tableless constant query defaults to metrics, matching the
+        // pre-ADR-0033 behavior (it resolved a metrics snapshot it never read).
+        assert_eq!(
+            SqlExecutor::target_signal("SELECT 1").expect("ok"),
+            TargetSignal::Metrics
+        );
+        // A string literal naming the other table does not change the signal.
+        assert_eq!(
+            SqlExecutor::target_signal("SELECT body FROM logs WHERE body = 'samples'").expect("ok"),
+            TargetSignal::Logs
+        );
+        // spans -> spans (ADR-0045 decision 5, the third arm).
+        assert_eq!(
+            SqlExecutor::target_signal("SELECT trace_id FROM spans").expect("ok"),
+            TargetSignal::Spans
+        );
+    }
+
+    #[test]
+    fn target_signal_rejects_a_query_touching_both_tables() {
+        let err =
+            SqlExecutor::target_signal("SELECT * FROM samples JOIN logs ON samples.ts = logs.ts")
+                .expect_err("both tables rejected");
+        assert!(matches!(err, SqlError::CrossSignalQuery));
+    }
+
+    /// Text that does not parse, or that the complexity guard refuses, is
+    /// refused by `refuse_several_tables` with exactly the error
+    /// `statement_tables` returns for it.
+    ///
+    /// FLIP: a `refuse_several_tables` that answers Ok when `statement_tables`
+    /// fails (`let Ok(tables) = .. else { return Ok(()) }`) panics at the
+    /// second `let .. else`.
+    #[test]
+    fn refuse_several_tables_returns_the_statement_tables_error_for_bad_text() {
+        let too_complex = format!(
+            "SELECT 1{}",
+            "+1".repeat(crate::complexity_guard::MAX_STATEMENT_COMPLEXITY)
+        );
+        for sql in ["SELEC ts FROM logs", "SELECT * FROM", too_complex.as_str()] {
+            let Err(SqlError::Validation(expected)) = SqlExecutor::statement_tables(sql) else {
+                panic!("statement_tables must refuse {sql:?} with a validation error");
+            };
+            let Err(SqlError::Validation(got)) = refuse_several_tables(sql) else {
+                panic!("refuse_several_tables must refuse {sql:?} with a validation error");
+            };
+            assert_eq!(got, expected, "{sql:?}");
+        }
+    }
+
+    /// ADR-0045 decision 5: the one-signal-per-query rule, which ADR-2904
+    /// keeps only in `refuse_cross_signal` (ES|QL and the single-snapshot
+    /// entry points), spans three tables, so a query naming any two of
+    /// {samples, logs, spans} -- or all three -- is rejected as
+    /// `CrossSignalQuery`, exactly as samples+logs was.
+    #[test]
+    fn target_signal_rejects_two_of_the_three_tables() {
+        for sql in [
+            "SELECT * FROM samples JOIN spans ON samples.ts = spans.start_ts",
+            "SELECT * FROM logs JOIN spans ON logs.ts = spans.start_ts",
+            "SELECT * FROM samples JOIN logs ON samples.ts = logs.ts \
+             JOIN spans ON spans.start_ts = logs.ts",
+        ] {
+            let err = SqlExecutor::target_signal(sql)
+                .expect_err("a query naming two of the three tables is rejected");
+            assert!(
+                matches!(err, SqlError::CrossSignalQuery),
+                "expected CrossSignalQuery for {sql:?}, got {err:?}"
+            );
+        }
+    }
+
+    /// A CTE named after the other table is query-local, not a base-table
+    /// reference, so it must not flip the signal or trip the cross-signal
+    /// rejection (ADR-0033 amendment; regression for the wiring wave, which
+    /// collected CTE names as if they were real tables).
+    #[test]
+    fn target_signal_does_not_treat_a_cte_name_as_the_real_table() {
+        // A CTE named `logs` reading only `samples` is a metrics query.
+        assert_eq!(
+            SqlExecutor::target_signal(
+                "WITH logs AS (SELECT value FROM samples) SELECT count(*) FROM logs"
+            )
+            .expect("cte named logs over samples is metrics-only"),
+            TargetSignal::Metrics
+        );
+        // A CTE named `samples` reading only `logs` is a logs query.
+        assert_eq!(
+            SqlExecutor::target_signal(
+                "WITH samples AS (SELECT body FROM logs) SELECT count(*) FROM samples"
+            )
+            .expect("cte named samples over logs is logs-only"),
+            TargetSignal::Logs
+        );
+    }
+
+    /// ADR-1101 decision 1: the fourth and fifth arms. `FROM alerts` resolves
+    /// `Signal::Alerts` and `FROM audit` resolves `Signal::Audit`, while a CTE
+    /// named after either is query-local and leaves the target alone, exactly
+    /// as for the other three tables.
+    #[test]
+    fn target_signal_maps_alerts_and_audit() {
+        assert_eq!(
+            SqlExecutor::target_signal("SELECT alert_id FROM alerts").expect("ok"),
+            TargetSignal::Alerts
+        );
+        assert_eq!(
+            SqlExecutor::target_signal("SELECT body FROM audit").expect("ok"),
+            TargetSignal::Audit
+        );
+        // A CTE named `audit` reading only `samples` is a metrics query: the
+        // name is query-local, not a base table.
+        assert_eq!(
+            SqlExecutor::target_signal(
+                "WITH audit AS (SELECT value FROM samples) SELECT count(*) FROM audit"
+            )
+            .expect("cte named audit over samples is metrics-only"),
+            TargetSignal::Metrics
+        );
+    }
+
+    /// ADR-1101 decision 1: the one-signal-per-query rule (kept by ADR-2904
+    /// only in `refuse_cross_signal`) counts five names, so a query
+    /// naming `alerts` and `audit` -- or `samples` and `audit` -- is
+    /// `CrossSignalQuery`, exactly as samples+logs is.
+    #[test]
+    fn target_signal_rejects_a_query_naming_alerts_and_audit() {
+        for sql in [
+            "SELECT * FROM alerts JOIN audit ON alerts.ts_ns = audit.ts_ns",
+            "SELECT * FROM samples JOIN audit ON samples.ts = audit.ts_ns",
+            "SELECT * FROM alerts JOIN logs ON alerts.ts_ns = logs.ts",
+        ] {
+            let err = SqlExecutor::target_signal(sql)
+                .expect_err("a query naming two of the five tables is rejected");
+            assert!(
+                matches!(err, SqlError::CrossSignalQuery),
+                "expected CrossSignalQuery for {sql:?}, got {err:?}"
+            );
+        }
+    }
+
+    /// ADR-1374 D5: a cursor pins the declared column set the query it paged
+    /// resolved, so [`SqlOutcome::declared_columns`] carries that set and not
+    /// one a later resolution might see. Asserts the exact set for a tenant
+    /// with declarations and the exact empty set for a tenant with none, over
+    /// the same statement and the same store.
+    #[tokio::test]
+    async fn outcome_declared_columns_are_the_tenants_declared_set() {
+        let declared = vec![
+            DeclaredColumn::new("http_status", DeclaredType::I64),
+            DeclaredColumn::new("region", DeclaredType::Str),
+        ];
+        let store = empty_store();
+        let executor = executor_over(store.clone())
+            .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared.clone())));
+        let request = sql_request(
+            "SELECT ts FROM logs",
+            TimeRange {
+                start_ns: 0,
+                end_ns: 2_000,
+            },
+        );
+
+        let outcome = executor
+            .execute(TenantHash([7u8; 16]), &request)
+            .await
+            .expect("a logs query over an empty store succeeds");
+        assert_eq!(
+            outcome.declared_columns, declared,
+            "the outcome must carry the tenant's declared set, in source order"
+        );
+
+        // Same statement, same store, no declared source: the default source
+        // declares nothing, so the set is exactly empty.
+        let bare = executor_over(store);
+        let bare_outcome = bare
+            .execute(TenantHash([7u8; 16]), &request)
+            .await
+            .expect("a logs query over an empty store succeeds");
+        assert_eq!(
+            bare_outcome.declared_columns,
+            Vec::<DeclaredColumn>::new(),
+            "a tenant with no declarations must carry an empty set"
+        );
+    }
+
+    /// ADR-1374 D5: a cursor pins the signal the query it paged resolved. The
+    /// outcome's target must therefore be the same value `explain` reports for
+    /// the same text, since the MCP adapter mints cursors from one and operators
+    /// read the other.
+    #[tokio::test]
+    async fn outcome_target_matches_the_explain_report_target() {
+        let store = empty_store();
+        let executor = executor_over(store);
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: 2_000,
+        };
+        let tenant_hash = TenantHash([7u8; 16]);
+
+        for (sql, expected) in [
+            ("SELECT ts FROM logs", TargetSignal::Logs),
+            ("SELECT ts FROM samples", TargetSignal::Metrics),
+            ("SELECT trace_id FROM spans", TargetSignal::Spans),
+        ] {
+            let request = sql_request(sql, window);
+            let report = executor
+                .explain(tenant_hash, &request)
+                .await
+                .expect("explain succeeds over an empty store");
+            let outcome = executor
+                .execute(tenant_hash, &request)
+                .await
+                .expect("execute succeeds over an empty store");
+            assert_eq!(
+                outcome.target, report.target,
+                "outcome and explain must agree on the target for {sql:?}"
+            );
+            assert_eq!(outcome.target, expected, "unexpected target for {sql:?}");
+        }
+    }
+
+    /// The single-snapshot resolve keeps the one-table rule (Flight SQL takes
+    /// the multi-lane resolve instead, ADR-2904 decision 10) and refuses a
+    /// cross-signal query before any catalog work, so it costs zero store
+    /// requests. Runs a `spans` + `samples` join through
+    /// `resolve_snapshot` against an `InstrumentedStore` and asserts both that
+    /// the error is `CrossSignalQuery` and that the store saw no LIST/GET/HEAD
+    /// at all.
+    #[tokio::test]
+    async fn cross_signal_query_rejected_before_any_catalog_listing() {
+        use ravel_catalog::CatalogConfig;
+        use ravel_object_store::instrument::InstrumentedStore;
+        use ravel_object_store::memory::MemoryStore;
+
+        let store = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        let executor = SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(store.clone()),
+            LogSegmentFetcher::new(store.clone()),
+            SpanSegmentFetcher::new(store.clone()),
+            SqlConfig::default(),
+            1 << 30,
+        );
+
+        let request = SqlRequest {
+            sql: "SELECT * FROM spans JOIN samples ON spans.start_ts = samples.ts".to_string(),
+            window: TimeRange {
+                start_ns: 0,
+                end_ns: 2_000,
+            },
+            min_tokens: Vec::new(),
+            now_ns: 2_000,
+            deadline: Duration::from_secs(30),
+            row_window: false,
+            max_rows: None,
+            budgets: None,
+        };
+
+        let before = store.metrics().snapshot();
+        let err = executor
+            .resolve_snapshot(TenantHash([7u8; 16]), &request, &QueryAccounting::new())
+            .await
+            .expect_err("a spans+samples cross-signal query is rejected");
+        let after = store.metrics().snapshot();
+
+        assert!(
+            matches!(err, SqlError::CrossSignalQuery),
+            "expected CrossSignalQuery, got {err:?}"
+        );
+        assert_eq!(
+            after.list.calls, before.list.calls,
+            "a cross-signal query must be rejected before any catalog LIST"
+        );
+        assert_eq!(
+            after.get.calls, before.get.calls,
+            "a cross-signal query must issue no GET"
+        );
+        assert_eq!(
+            after.head.calls, before.head.calls,
+            "a cross-signal query must issue no HEAD"
+        );
+    }
+
+    #[test]
+    fn resources_exhausted_keeps_its_own_counts() {
+        // A message without MSG_SPILL_DISABLED_MARKER is not DataFusion's
+        // spill-refusal shape (issue #740); `execution_error` must pass it
+        // through unchanged rather than substituting the pool's own figures,
+        // so the pool here is a throwaway the reattribution never reads.
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let df = DataFusionError::ResourcesExhausted("needs 40 bytes, limit 8".to_string());
+        let err = execution_error(df, &pool);
+        assert!(matches!(err, SqlError::ResourcesExhausted(_)));
+        assert!(err.client_message().contains("limit 8"));
+    }
+
+    /// Issue #740, finding 1: a `RepartitionExec` output channel's spill
+    /// refusal (DataFusion 55's `"... SpillPool (DiskManager is disabled)"`,
+    /// carrying no byte figures) is re-attributed from the stream's own pool
+    /// occupancy at the moment of refusal, not passed through with the
+    /// exchange's name and no figures. Exercises the real seam
+    /// [`execution_error`] runs at (issue #740's named caller,
+    /// [`PinnedStream::poll_next`]'s `batch.map_err`), with a real
+    /// `TenantDelegatingPool` reserved to a known figure rather than a bare
+    /// `resources_exhausted_reattributed` unit call.
+    #[test]
+    fn a_spill_refusal_from_the_streams_own_pool_names_its_occupancy() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let tenant = TenantMemoryAccountant::new(1 << 30);
+        let pool: Arc<dyn MemoryPool> = Arc::new(crate::memory::TenantDelegatingPool::new(
+            8000,
+            tenant,
+            CeilingBreach::new(),
+            QueryAccounting::new(),
+        ));
+        let consumer = MemoryConsumer::new("PartialHashAggregateStream[0]").register(&pool);
+        consumer.try_grow(6144).expect("within the query ceiling");
+
+        let df = DataFusionError::ResourcesExhausted(
+            "Memory Exhausted while SpillPool (DiskManager is disabled)".to_string(),
+        );
+        let err = execution_error(df, &pool);
+        let SqlError::ResourcesExhausted(message) = &err else {
+            panic!("still a typed ResourcesExhausted; got {err:?}");
+        };
+        assert!(
+            message.contains("6144") && message.contains("8000"),
+            "message must name the pool's reserved bytes and limit; got {message:?}"
+        );
+        assert!(
+            !message.contains("SpillPool"),
+            "the exchange's own name must not survive re-attribution; got {message:?}"
+        );
+    }
+
+    /// ADR-0094 report sanity check: the analyzer step
+    /// ([`SqlExecutor::analyzed_classification_plan`]) actually resolves `avg`'s
+    /// argument to `Float64` for an integer input -- the whole reason
+    /// classification runs DataFusion's analyzer and not `create_logical_plan`
+    /// alone. Proven by inspecting the coerced argument's type, not just that the
+    /// code compiles.
+    #[tokio::test]
+    async fn analyzer_preserves_avg_integer_argument_as_int64() {
+        use datafusion::arrow::datatypes::DataType;
+
+        let exec = eviction_test_executor();
+        let plan = exec
+            .sql_classification_plan(
+                TenantHash([9u8; 16]),
+                "SELECT avg(CAST(value AS BIGINT)) AS a FROM samples",
+                &[],
+                None,
+            )
+            .await
+            .expect("throwaway avg plan analyzes");
+
+        let mut aggregates = Vec::new();
+        let mut distincts = Vec::new();
+        collect_aggregate_exprs(&plan, &mut aggregates, &mut distincts);
+        let aggregate = aggregates.first().expect("one aggregate node");
+        let schema = aggregate.input.schema().as_ref();
+        let expr = aggregate.aggr_expr.first().expect("one aggregate expr");
+        let inner = match expr {
+            Expr::Alias(alias) => alias.expr.as_ref(),
+            other => other,
+        };
+        let Expr::AggregateFunction(af) = inner else {
+            panic!("aggregate expression is not an AggregateFunction: {inner:?}");
+        };
+        assert_eq!(af.func.name().to_ascii_lowercase(), "avg");
+        let arg_type = af
+            .params
+            .args
+            .first()
+            .expect("avg has an argument")
+            .get_type(schema)
+            .expect("argument type resolves");
+        assert_eq!(
+            arg_type,
+            DataType::Int64,
+            "an admitted integer argument to avg must stay Int64, not widen to Float64 (ADR-0825 decision 2)"
+        );
+        // And avg over that resolved Int64 argument is exact.
+        assert!(
+            aggregate_expr_is_exact(expr, schema),
+            "avg over a resolved integer input is exact-eligible (ADR-0094 amendment, ADR-0825 decision 3)"
+        );
+    }
+
+    #[tokio::test]
+    async fn analyzer_still_coerces_avg_float_argument_to_float64() {
+        use datafusion::arrow::datatypes::DataType;
+
+        let exec = eviction_test_executor();
+        let plan = exec
+            .sql_classification_plan(
+                TenantHash([9u8; 16]),
+                "SELECT avg(value) AS a FROM samples",
+                &[],
+                None,
+            )
+            .await
+            .expect("throwaway avg plan analyzes");
+
+        let mut aggregates = Vec::new();
+        let mut distincts = Vec::new();
+        collect_aggregate_exprs(&plan, &mut aggregates, &mut distincts);
+        let aggregate = aggregates.first().expect("one aggregate node");
+        let schema = aggregate.input.schema().as_ref();
+        let expr = aggregate.aggr_expr.first().expect("one aggregate expr");
+        let inner = match expr {
+            Expr::Alias(alias) => alias.expr.as_ref(),
+            other => other,
+        };
+        let Expr::AggregateFunction(af) = inner else {
+            panic!("aggregate expression is not an AggregateFunction: {inner:?}");
+        };
+        let arg_type = af
+            .params
+            .args
+            .first()
+            .expect("avg has an argument")
+            .get_type(schema)
+            .expect("argument type resolves");
+        assert_eq!(arg_type, DataType::Float64);
+        // Float avg is never exact.
+        assert!(
+            !aggregate_expr_is_exact(expr, schema),
+            "avg over a Float64 input is never exact-eligible (ADR-0094 decision 1)"
+        );
+    }
+
+    /// Issue #3244: the column-statistics request each admitted shape derives,
+    /// read from the same analyzed plan the executor's gate judges. q02 names
+    /// its `<>` column, q08 its group key, SUM and AVG no dictionary, an
+    /// unknown conjunct every non-`Str` declared column it names, and two
+    /// `logs` aggregates in one statement the union of theirs.
+    ///
+    /// FLIP: make `plan_stats_answerable_request` return every non-`Str`
+    /// declared column's dictionary for an admitted plan (what the
+    /// pre-change load always carried); the q02 case fails first, naming
+    /// `code`, `level` and `status`. `level` is declared and named by no
+    /// statement here so the unknown-conjunct and union cases fail too.
+    #[tokio::test]
+    async fn column_stats_request_names_only_the_dictionaries_a_shape_reads() {
+        let exec = eviction_test_executor();
+        let t = TenantHash([3u8; 16]);
+        let declared = [
+            DeclaredColumn::new("status", DeclaredType::I64),
+            DeclaredColumn::new("code", DeclaredType::I64),
+            DeclaredColumn::new("level", DeclaredType::I64),
+            DeclaredColumn::new("region", DeclaredType::Str),
+        ];
+        let request_for = |sql: &'static str| {
+            let exec = &exec;
+            let declared = &declared;
+            async move {
+                let plan = exec
+                    .sql_classification_plan(t, sql, declared, None)
+                    .await
+                    .expect("the statement plans");
+                plan_stats_answerable_request(&plan, declared)
+            }
+        };
+        let names = |request: Option<ColumnStatsRequest>| {
+            request.map(|request| {
+                request
+                    .dictionary_columns()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        assert_eq!(
+            names(request_for("SELECT COUNT(*) FROM logs WHERE status <> 500").await),
+            Some(vec!["status".to_string()]),
+            "q02 names exactly its <> column"
+        );
+        assert_eq!(
+            names(request_for("SELECT code, COUNT(*) FROM logs GROUP BY code").await),
+            Some(vec!["code".to_string()]),
+            "q08 names exactly its key"
+        );
+        assert_eq!(
+            names(request_for("SELECT SUM(status) FROM logs").await),
+            Some(Vec::new()),
+            "SUM is summary only"
+        );
+        assert_eq!(
+            names(request_for("SELECT AVG(status) FROM logs").await),
+            Some(Vec::new()),
+            "AVG is summary only"
+        );
+        assert_eq!(
+            names(request_for("SELECT COUNT(*) FROM logs WHERE status + code <> 7").await),
+            Some(vec!["code".to_string(), "status".to_string()]),
+            "an unknown conjunct names both non-Str columns it reads"
+        );
+        assert_eq!(
+            names(
+                request_for(
+                    "SELECT (SELECT COUNT(*) FROM logs WHERE status <> 1) AS a, \
+                     (SELECT COUNT(*) FROM logs WHERE code <> 2) AS b"
+                )
+                .await
+            ),
+            Some(vec!["code".to_string(), "status".to_string()]),
+            "two logs aggregates take the union"
+        );
+        assert_eq!(
+            names(request_for("SELECT COUNT(*) FROM logs WHERE region <> 'eu'").await),
+            None,
+            "a <> on a Str column is refused"
+        );
+    }
+
+    /// Issue #3244: with no analyzed plan to judge, the load is kept but asks
+    /// for no dictionary. The q02 and q08 consumers in `logs_scan` check
+    /// `dictionary_loaded` and decline, so a summary-only load cannot answer
+    /// them wrongly, and nothing is fetched that no shape was shown to read.
+    ///
+    /// FLIP: restore the loop that added every non-`Str` declared column's
+    /// dictionary to the no-plan request; the request then names `code` and
+    /// `status` and the `dictionary_columns` assertion fails.
+    #[tokio::test]
+    async fn a_load_with_no_plan_requests_summaries_only() {
+        let exec = eviction_test_executor();
+        let declared = [
+            DeclaredColumn::new("status", DeclaredType::I64),
+            DeclaredColumn::new("code", DeclaredType::I64),
+            DeclaredColumn::new("region", DeclaredType::Str),
+        ];
+        let snapshot = Snapshot {
+            segments: Vec::new(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+
+        let request = exec
+            .logs_column_stats_eligible(&snapshot, None, &declared, false)
+            .expect("no plan keeps the load");
+        assert_eq!(
+            request.dictionary_columns().collect::<Vec<_>>(),
+            Vec::<&str>::new()
+        );
+        assert!(request.is_summary_only());
+    }
+
+    /// ADR-0094 decision 1: the classifier admits exactly the exact-typed
+    /// shapes and rejects the rest, exercised through the real throwaway-session
+    /// plan+analyze path (not the pure helpers in isolation).
+    #[tokio::test]
+    async fn classify_exact_typed_admits_and_rejects_per_adr_0094() {
+        let exec = eviction_test_executor();
+        let t = TenantHash([3u8; 16]);
+
+        // Integer sum + string group key + count: exact.
+        assert!(
+            exec.classify_exact_typed(
+                t,
+                "SELECT label(labels,'__name__') AS m, \
+                 sum(CAST(value AS BIGINT)) AS s, count(*) AS c FROM samples GROUP BY m",
+                &[],
+            )
+            .await
+        );
+        // count(DISTINCT float): count is always exact.
+        assert!(
+            exec.classify_exact_typed(t, "SELECT count(DISTINCT value) FROM samples", &[])
+                .await
+        );
+        // No aggregate at all: trivially exact.
+        assert!(
+            exec.classify_exact_typed(t, "SELECT ts, value FROM samples", &[])
+                .await
+        );
+        // Float sum: not exact.
+        assert!(
+            !exec
+                .classify_exact_typed(t, "SELECT sum(value) FROM samples", &[])
+                .await
+        );
+        // Float GROUP BY key (aggregate itself exact): not exact.
+        assert!(
+            !exec
+                .classify_exact_typed(t, "SELECT value, count(*) FROM samples GROUP BY value", &[])
+                .await
+        );
+        // SELECT DISTINCT on a float column (zero-aggregate float group key):
+        // not exact.
+        assert!(
+            !exec
+                .classify_exact_typed(t, "SELECT DISTINCT value FROM samples", &[])
+                .await
+        );
+        // avg over a resolved integer input: exact (ADR-0825 decision 3).
+        assert!(
+            exec.classify_exact_typed(t, "SELECT avg(CAST(value AS BIGINT)) FROM samples", &[])
+                .await
+        );
+        // avg over a float input: still not exact.
+        assert!(
+            !exec
+                .classify_exact_typed(t, "SELECT avg(value) FROM samples", &[])
+                .await
+        );
+        // A disqualifying float avg hidden inside a scalar subquery: not exact,
+        // proving the expression-embedded subquery walk (decision 1).
+        assert!(
+            !exec
+                .classify_exact_typed(
+                    t,
+                    "SELECT count(*) FROM samples \
+                     WHERE value > (SELECT avg(value) FROM samples)",
+                    &[],
+                )
+                .await
+        );
+    }
+
+    /// An executor over an empty store, for the idle-accountant eviction tests.
+    /// ADR-2040 D6: the spill and exact-typed classifiers see a Parquet
+    /// statement's plan, built over empty tables of the resolved schemas. A
+    /// statement naming no signal table would otherwise plan against the
+    /// metrics table, fail to find its tables, and classify as neither.
+    #[tokio::test]
+    async fn the_classification_plan_has_a_parquet_arm() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let executor = eviction_test_executor();
+        let tenant = TenantHash([9u8; 16]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("score", DataType::Float64, false),
+        ]));
+        let schemas = vec![("hits".to_string(), schema)];
+        let grouped = "SELECT name, count(*) FROM hits GROUP BY name";
+        let plan = executor
+            .sql_classification_plan(tenant, grouped, &[], Some(&schemas))
+            .await
+            .expect("a plan over the Parquet schema");
+        assert!(plan_is_spill_eligible(&plan));
+        assert!(plan_is_exact_typed(&plan));
+        let float = executor
+            .sql_classification_plan(tenant, "SELECT sum(score) FROM hits", &[], Some(&schemas))
+            .await
+            .expect("a plan over the Parquet schema");
+        assert!(!plan_is_exact_typed(&float));
+        assert!(
+            executor
+                .sql_classification_plan(tenant, grouped, &[], None)
+                .await
+                .is_none(),
+            "without the Parquet arm the statement does not plan"
+        );
+    }
+
+    /// The reference suite's q33 shape (issue #2416): two string GROUP BY
+    /// keys, an exact `COUNT`, an exact integer `SUM`, an exact integer `AVG`,
+    /// ordered by the count descending with a `LIMIT`. Every aggregate here is
+    /// spill-exact on its own; the only question the tests below answer is
+    /// whether the trailing `ORDER BY` is total over the group key. `s` is the
+    /// one nullable column, the shape of every declared logs column.
+    fn q33_schema() -> Arc<datafusion::arrow::datatypes::Schema> {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Utf8, false),
+            Field::new("x", DataType::Int64, false),
+            Field::new("y", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, true),
+        ]))
+    }
+
+    /// The default [`SqlConfig::bounded_topk_max_limit`].
+    const DEFAULT_TOPK_MAX: Option<usize> = Some(crate::config::DEFAULT_BOUNDED_TOPK_MAX_LIMIT);
+
+    const Q33_SQL: &str = "SELECT a, b, count(*) AS c, sum(x) AS sx, avg(y) AS ay \
+                            FROM q33 GROUP BY a, b ORDER BY c DESC LIMIT 10";
+
+    /// The first `Sort` node found by depth-first walk, or `None` if the plan
+    /// has none. Every plan below has exactly one.
+    fn find_sort(plan: &LogicalPlan) -> Option<&Sort> {
+        if let LogicalPlan::Sort(sort) = plan {
+            return Some(sort);
+        }
+        plan.inputs().into_iter().find_map(find_sort)
+    }
+
+    /// The unqualified column name a [`SortExpr`]'s expression names. Panics
+    /// on anything else: every term this module appends or starts from is a
+    /// bare column reference.
+    fn sort_term_column_name(term: &SortExpr) -> &str {
+        match &term.expr {
+            Expr::Column(column) => column.name.as_str(),
+            other => panic!("expected a bare column reference, got {other:?}"),
+        }
+    }
+
+    /// Before the rewrite, `ORDER BY c DESC` alone is not total over the `(a,
+    /// b)` groups (many groups can share one count), so the q33 shape is
+    /// refused. [`rewrite_sort_group_key_tie_order`] appends `(a, b)` as
+    /// trailing tiebreak terms, which makes the same Sort's key total and the
+    /// plan eligible: this is the fix issue #2416 asks for.
+    #[tokio::test]
+    async fn a_q33_shaped_sort_is_ineligible_before_the_rewrite_and_eligible_after() {
+        let executor = eviction_test_executor();
+        let tenant = TenantHash([101u8; 16]);
+        let schemas = vec![("q33".to_string(), q33_schema())];
+        let plan = executor
+            .sql_classification_plan(tenant, Q33_SQL, &[], Some(&schemas))
+            .await
+            .expect("the q33 shape plans");
+
+        assert!(
+            !plan_is_spill_eligible(&plan),
+            "ORDER BY c alone must not be treated as total over (a, b) before the rewrite"
+        );
+
+        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX)
+            .expect("the rewrite never errors");
+        assert!(
+            plan_is_spill_eligible(&rewritten),
+            "appending (a, b) as trailing tiebreak terms must make the Sort eligible"
+        );
+    }
+
+    /// Pins the exact shape of the rewrite: the original `c DESC` term is
+    /// untouched, and the group keys are appended afterward, in GROUP BY
+    /// order, ascending, with nulls last.
+    #[tokio::test]
+    async fn the_rewrite_appends_group_keys_in_order_ascending_nulls_last() {
+        let executor = eviction_test_executor();
+        let tenant = TenantHash([102u8; 16]);
+        let schemas = vec![("q33".to_string(), q33_schema())];
+        let plan = executor
+            .sql_classification_plan(tenant, Q33_SQL, &[], Some(&schemas))
+            .await
+            .expect("the q33 shape plans");
+        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX)
+            .expect("the rewrite never errors");
+        let sort = find_sort(&rewritten).expect("the rewritten plan has a Sort node");
+
+        assert_eq!(
+            sort.expr.len(),
+            3,
+            "the original c DESC term plus two appended tiebreak terms"
+        );
+        assert_eq!(sort_term_column_name(&sort.expr[0]), "c");
+        assert!(!sort.expr[0].asc, "the original DESC term is untouched");
+        assert_eq!(
+            sort_term_column_name(&sort.expr[1]),
+            "a",
+            "group keys are appended in GROUP BY order"
+        );
+        assert!(sort.expr[1].asc, "tiebreak terms are ascending");
+        assert!(!sort.expr[1].nulls_first, "tiebreak terms put nulls last");
+        assert_eq!(sort_term_column_name(&sort.expr[2]), "b");
+        assert!(sort.expr[2].asc, "tiebreak terms are ascending");
+        assert!(!sort.expr[2].nulls_first, "tiebreak terms put nulls last");
+    }
+
+    /// A `Sort` whose key is already total over the group (every group
+    /// expression already has a matching term) is left unchanged: the rewrite
+    /// has nothing to add, and the plan was already eligible.
+    #[tokio::test]
+    async fn an_already_total_sort_is_unchanged_by_the_rewrite() {
+        let executor = eviction_test_executor();
+        let tenant = TenantHash([103u8; 16]);
+        let schemas = vec![("q33".to_string(), q33_schema())];
+        let sql = "SELECT a, b, count(*) AS c, sum(x) AS sx, avg(y) AS ay \
+                   FROM q33 GROUP BY a, b ORDER BY c DESC, a, b LIMIT 10";
+        let plan = executor
+            .sql_classification_plan(tenant, sql, &[], Some(&schemas))
+            .await
+            .expect("the already-total q33 shape plans");
+        assert!(
+            plan_is_spill_eligible(&plan),
+            "a sort key already total over the group must already be eligible"
+        );
+
+        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX)
+            .expect("the rewrite never errors");
+        let sort = find_sort(&rewritten).expect("the rewritten plan has a Sort node");
+        assert_eq!(
+            sort.expr.len(),
+            3,
+            "an already-total key gets nothing appended"
+        );
+    }
+
+    /// A `GROUP BY GROUPING SETS` aggregate is excluded outright
+    /// ([`tie_order_edit`] returns `None`): the rewrite does not order a
+    /// grouping set's per-row null group columns, so it leaves the Sort
+    /// unchanged and the plan stays ineligible.
+    #[tokio::test]
+    async fn a_grouping_set_sort_stays_ineligible_after_the_rewrite() {
+        let executor = eviction_test_executor();
+        let tenant = TenantHash([104u8; 16]);
+        let schemas = vec![("q33".to_string(), q33_schema())];
+        let sql = "SELECT a, b, count(*) AS c FROM q33 \
+                   GROUP BY GROUPING SETS ((a, b), (a)) ORDER BY c DESC LIMIT 10";
+        let plan = executor
+            .sql_classification_plan(tenant, sql, &[], Some(&schemas))
+            .await
+            .expect("the grouping-set shape plans");
+        assert!(!plan_is_spill_eligible(&plan));
+
+        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX)
+            .expect("the rewrite never errors");
+        assert!(
+            !plan_is_spill_eligible(&rewritten),
+            "a grouping set's synthetic group columns must fail closed, not be guessed at"
+        );
+    }
+
+    /// The grouped subquery the `DISTINCT` cases below read: its `Aggregate`
+    /// is spill-exact, so the `Distinct` node over it is what decides.
+    const GROUPED_Q33: &str = "(SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b) s";
+
+    /// Whether `plan` holds a `Distinct` node of the `DISTINCT ON` kind.
+    fn has_distinct_on(plan: &LogicalPlan) -> bool {
+        matches!(find_distinct(plan), Some(Distinct::On(_)))
+    }
+
+    /// A `DISTINCT ON` whose `ORDER BY c DESC` ties within a `b` group keeps
+    /// whichever tied row reaches it first, so it is not spill-eligible, and
+    /// the tie-order rewrite cannot make it so. Naming every output column in
+    /// the `ORDER BY` makes it eligible; plain `DISTINCT` stays eligible.
+    #[tokio::test]
+    async fn distinct_on_is_spill_eligible_only_with_a_total_order() {
+        let tied = q33_plan(&format!(
+            "SELECT DISTINCT ON (b) b, a, c FROM {GROUPED_Q33} ORDER BY b, c DESC"
+        ))
+        .await;
+        assert!(has_distinct_on(&tied), "the statement plans a DISTINCT ON");
+        assert!(
+            !plan_is_spill_eligible(&tied),
+            "an ORDER BY that ties within an ON group must not spill"
+        );
+        assert!(!plan_is_spill_eligible_ignoring_sort_order(&tied));
+
+        let unordered = q33_plan(&format!("SELECT DISTINCT ON (b) b, a FROM {GROUPED_Q33}")).await;
+        assert!(has_distinct_on(&unordered));
+        assert!(!plan_is_spill_eligible(&unordered));
+
+        let total = q33_plan(&format!(
+            "SELECT DISTINCT ON (b) b, a, c FROM {GROUPED_Q33} ORDER BY b, c DESC, a"
+        ))
+        .await;
+        assert!(has_distinct_on(&total));
+        assert!(
+            plan_is_spill_eligible(&total),
+            "an ORDER BY naming every output column decides the surviving row"
+        );
+
+        let plain = q33_plan(&format!("SELECT DISTINCT b, c FROM {GROUPED_Q33}")).await;
+        assert!(matches!(find_distinct(&plain), Some(Distinct::All(_))));
+        assert!(
+            plan_is_spill_eligible(&plain),
+            "plain DISTINCT is unaffected"
+        );
+    }
+
+    /// The first `Distinct` node found by depth-first walk.
+    fn find_distinct(plan: &LogicalPlan) -> Option<&Distinct> {
+        if let LogicalPlan::Distinct(distinct) = plan {
+            return Some(distinct);
+        }
+        plan.inputs().into_iter().find_map(find_distinct)
+    }
+
+    /// Every term of the first `Sort` in `plan`, as `(qualifier, name, asc,
+    /// nulls_first)`, so a test can pin the exact key including which
+    /// relation each column belongs to.
+    fn sort_terms(plan: &LogicalPlan) -> Vec<(Option<String>, String, bool, bool)> {
+        let sort = find_sort(plan).expect("the plan has a Sort node");
+        sort.expr
+            .iter()
+            .map(|term| match &term.expr {
+                Expr::Column(column) => (
+                    column.relation.as_ref().map(ToString::to_string),
+                    column.name.clone(),
+                    term.asc,
+                    term.nulls_first,
+                ),
+                other => panic!("expected a bare column reference, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// A sort term with SQL's default null placement for its direction (nulls
+    /// first descending, last ascending), which is also what every appended
+    /// ascending tiebreak term carries.
+    fn term(
+        qualifier: Option<&str>,
+        name: &str,
+        asc: bool,
+    ) -> (Option<String>, String, bool, bool) {
+        (qualifier.map(str::to_string), name.to_string(), asc, !asc)
+    }
+
+    /// The expressions of the `Projection` directly under the first `Sort`.
+    fn projection_under_sort(plan: &LogicalPlan) -> Vec<Expr> {
+        let sort = find_sort(plan).expect("the plan has a Sort node");
+        let LogicalPlan::Projection(projection) = sort.input.as_ref() else {
+            panic!("expected a Projection under the Sort, got {:?}", sort.input);
+        };
+        projection.expr.clone()
+    }
+
+    async fn q33_plan(sql: &str) -> LogicalPlan {
+        let schemas = vec![("q33".to_string(), q33_schema())];
+        eviction_test_executor()
+            .sql_classification_plan(TenantHash([105u8; 16]), sql, &[], Some(&schemas))
+            .await
+            .expect("the statement plans")
+    }
+
+    /// A `Projection` that renames a group key (`a AS a2`) still exposes it:
+    /// [`projected_group_key`] matches the projected expression to the
+    /// aggregate's qualified group column `q33.a`, so the rewrite appends the
+    /// renamed column `a2`, then `q33.b`, and the plan becomes eligible.
+    #[tokio::test]
+    async fn a_renamed_group_key_is_appended_under_its_new_name() {
+        let plan = q33_plan(
+            "SELECT a AS a2, b, count(*) AS c FROM q33 GROUP BY a, b ORDER BY c DESC LIMIT 10",
+        )
+        .await;
+        assert!(!plan_is_spill_eligible(&plan));
+
+        let rewritten =
+            rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+        assert_eq!(
+            sort_terms(&rewritten),
+            vec![
+                term(None, "c", false),
+                term(None, "a2", true),
+                term(Some("q33"), "b", true),
+            ]
+        );
+        assert!(plan_is_spill_eligible(&rewritten));
+    }
+
+    /// Issue #2416 counterexample: the projection alias `a` is `sum(x)`, not
+    /// the group key `q33.a`, which the projection drops. The rewrite projects
+    /// `q33.a` through under a tiebreak name and sorts on it, so the key is
+    /// total over `(q33.a, q33.b)`; the restoring projection keeps the
+    /// statement's four output columns.
+    #[tokio::test]
+    async fn an_alias_named_like_a_group_key_is_not_taken_for_it() {
+        let plan = q33_plan(
+            "SELECT sum(x) AS a, b, count(*) AS c, avg(y) AS ay FROM q33 \
+             GROUP BY q33.a, b ORDER BY c DESC LIMIT 10",
+        )
+        .await;
+        let schema = Arc::clone(plan.schema());
+        assert!(!plan_is_spill_eligible(&plan));
+
+        let rewritten =
+            rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+        let tiebreak = format!("{TIEBREAK_COLUMN_PREFIX}0");
+        assert_eq!(
+            sort_terms(&rewritten),
+            vec![
+                term(None, "c", false),
+                term(None, &tiebreak, true),
+                term(Some("q33"), "b", true),
+            ]
+        );
+        let projected = projection_under_sort(&rewritten);
+        assert_eq!(
+            projected.last(),
+            Some(&Expr::Column(Column::new(Some("q33"), "a")).alias(tiebreak.as_str())),
+            "the tiebreak column is the aggregate's own q33.a"
+        );
+        assert_eq!(
+            rewritten.schema(),
+            &schema,
+            "the output schema is unchanged"
+        );
+        assert!(plan_is_spill_eligible(&rewritten));
+    }
+
+    /// The same counterexample on the already-present check: the sort term
+    /// `a` is the `count(*)` alias, so it does not cover the group key
+    /// `q33.a`, which the rewrite still projects through and appends.
+    #[tokio::test]
+    async fn an_order_by_alias_named_like_a_group_key_does_not_cover_it() {
+        let plan = q33_plan(
+            "SELECT b, count(*) AS a, avg(y) AS ay FROM q33 \
+             GROUP BY q33.a, b ORDER BY a DESC LIMIT 10",
+        )
+        .await;
+        assert!(!plan_is_spill_eligible(&plan));
+
+        let rewritten =
+            rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+        assert_eq!(
+            sort_terms(&rewritten),
+            vec![
+                term(None, "a", false),
+                term(None, &format!("{TIEBREAK_COLUMN_PREFIX}0"), true),
+                term(Some("q33"), "b", true),
+            ]
+        );
+        assert!(plan_is_spill_eligible(&rewritten));
+    }
+
+    /// A `HAVING` filter between the `Sort`'s projection and the aggregate
+    /// only drops groups, so the group keys still identify each row it keeps:
+    /// [`tie_order_edit`] reaches through it, appends `(a, b)`, and the plan
+    /// becomes eligible (issue #3899).
+    ///
+    /// Prove-the-test: make `aggregate_or_having` return `None` for a
+    /// `Filter` and `plan_has_tie_order_edit` reads false here and in the row
+    /// 29 test below.
+    #[tokio::test]
+    async fn a_having_filter_gets_the_tie_order_and_becomes_eligible() {
+        let plan = q33_plan(
+            "SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b HAVING count(*) > 1 \
+             ORDER BY c DESC LIMIT 10",
+        )
+        .await;
+        assert!(!plan_is_spill_eligible(&plan));
+        assert!(plan_has_tie_order_edit(&plan, DEFAULT_TOPK_MAX));
+        let rewritten =
+            rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+        assert_eq!(
+            sort_terms(&rewritten),
+            vec![
+                term(None, "c", false),
+                term(Some("q33"), "a", true),
+                term(Some("q33"), "b", true),
+            ]
+        );
+        assert!(plan_is_spill_eligible(&rewritten));
+    }
+
+    /// One column of each type the min/max and avg spill gate distinguishes,
+    /// plus a string group key `k`.
+    fn spill_types_schema() -> Arc<datafusion::arrow::datatypes::Schema> {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("s", DataType::Utf8, false),
+            Field::new("i8", DataType::Int8, false),
+            Field::new("i32", DataType::Int32, false),
+            Field::new("i64", DataType::Int64, false),
+            Field::new("u32", DataType::UInt32, false),
+            Field::new("u64", DataType::UInt64, false),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("d", DataType::Decimal128(18, 2), false),
+            Field::new("f", DataType::Float64, false),
+        ]))
+    }
+
+    /// Whether `SELECT k, <aggregate> FROM types GROUP BY k` is spill-eligible
+    /// on its analyzed classification plan.
+    async fn grouped_aggregate_is_spill_eligible(aggregate: &str) -> bool {
+        let schemas = vec![("types".to_string(), spill_types_schema())];
+        let sql = format!("SELECT k, {aggregate} AS v FROM types GROUP BY k");
+        let plan = eviction_test_executor()
+            .sql_classification_plan(TenantHash([111u8; 16]), &sql, &[], Some(&schemas))
+            .await
+            .expect("the statement plans");
+        plan_is_spill_eligible(&plan)
+    }
+
+    /// Issue #3899: `min`/`max` over a non-float type merge exactly under
+    /// spill and are eligible; over a float they are not.
+    ///
+    /// Prove-the-test: let `is_exact_extreme_type` admit `Float64` and the
+    /// float rows read true.
+    #[tokio::test]
+    async fn min_and_max_are_spill_eligible_over_non_float_types_only() {
+        use datafusion::arrow::datatypes::{DataType, TimeUnit};
+
+        let dictionary =
+            |value: DataType| DataType::Dictionary(Box::new(DataType::Int32), Box::new(value));
+        for admitted in [
+            dictionary(DataType::Utf8),
+            DataType::Boolean,
+            DataType::Date32,
+        ] {
+            assert!(is_exact_extreme_type(&admitted), "{admitted} is admitted");
+        }
+        for refused in [
+            DataType::Float16,
+            DataType::Float32,
+            DataType::Float64,
+            dictionary(DataType::Float64),
+            DataType::Duration(TimeUnit::Second),
+        ] {
+            assert!(!is_exact_extreme_type(&refused), "{refused} is refused");
+        }
+        for column in ["s", "i32", "ts", "d"] {
+            for function in ["min", "max"] {
+                let aggregate = format!("{function}({column})");
+                assert!(
+                    grouped_aggregate_is_spill_eligible(&aggregate).await,
+                    "{aggregate} must be spill-eligible"
+                );
+            }
+        }
+        for function in ["min", "max"] {
+            let aggregate = format!("{function}(f)");
+            assert!(
+                !grouped_aggregate_is_spill_eligible(&aggregate).await,
+                "{aggregate} over Float64 must not be spill-eligible"
+            );
+        }
+    }
+
+    /// Issue #3899: `avg` over every integer width `crate::avg` averages
+    /// exactly is eligible; over `UInt64` (a float fold there) and `Float64`
+    /// it is not. Checked on the analyzed plan and on the argument type
+    /// before coercion.
+    #[tokio::test]
+    async fn avg_is_spill_eligible_over_the_exact_integer_widths_only() {
+        use datafusion::arrow::datatypes::DataType;
+
+        for column in ["i8", "i32", "i64", "u32"] {
+            for function in ["avg", "mean"] {
+                let aggregate = format!("{function}({column})");
+                assert!(
+                    grouped_aggregate_is_spill_eligible(&aggregate).await,
+                    "{aggregate} must be spill-eligible"
+                );
+            }
+        }
+        for column in ["u64", "f"] {
+            let aggregate = format!("avg({column})");
+            assert!(
+                !grouped_aggregate_is_spill_eligible(&aggregate).await,
+                "{aggregate} must not be spill-eligible"
+            );
+        }
+        for admitted in [
+            DataType::Int8,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt32,
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32)),
+        ] {
+            assert!(
+                crate::avg::is_admitted_integer(&admitted),
+                "{admitted} is admitted"
+            );
+        }
+        for refused in [
+            DataType::UInt64,
+            DataType::Float64,
+            DataType::Decimal128(18, 2),
+        ] {
+            assert!(
+                !crate::avg::is_admitted_integer(&refused),
+                "{refused} is refused"
+            );
+        }
+    }
+
+    /// The ClickBench row 29 statement, over a `hits` table with a string
+    /// `Referer` column (issue #3899): a `regexp_replace` group key,
+    /// `AVG(length(..))`, `COUNT(*)`, `MIN` of a string, a `HAVING` filter, an
+    /// `ORDER BY` the average, and a `LIMIT`. Its `ORDER BY l DESC` ties
+    /// across groups, so it is ineligible as written; the tie-order rewrite
+    /// reaches through the `HAVING` filter, appends the key, and makes it
+    /// eligible.
+    #[tokio::test]
+    async fn the_clickbench_row_29_shape_is_spill_eligible_after_the_rewrite() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "Referer",
+            DataType::Utf8,
+            false,
+        )]));
+        let schemas = vec![("hits".to_string(), schema)];
+        let plan = eviction_test_executor()
+            .sql_classification_plan(TenantHash([112u8; 16]), ROW_29_SQL, &[], Some(&schemas))
+            .await
+            .expect("the row 29 shape plans");
+        assert!(!plan_is_spill_eligible(&plan), "ORDER BY l alone ties");
+        assert!(plan_is_spill_eligible_ignoring_sort_order(&plan));
+        assert!(plan_has_tie_order_edit(&plan, DEFAULT_TOPK_MAX));
+        let rewritten =
+            rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+        assert_eq!(
+            sort_terms(&rewritten),
+            vec![term(None, "l", false), term(None, "k", true)]
+        );
+        assert!(plan_is_spill_eligible(&rewritten));
+    }
+
+    const ROW_29_SQL: &str = "SELECT regexp_replace(\"Referer\", \
+        '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(\"Referer\")) AS l, \
+        COUNT(*) AS c, MIN(\"Referer\") FROM hits WHERE \"Referer\" <> '' GROUP BY k \
+        HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25";
+
+    /// A `min`/`max` top-k the bounded aggregate (`crate::bounded_topk`) can
+    /// serve keeps its single sort term: admitting `min`/`max` to the spill
+    /// families must not append a tiebreak, which would take the top-k from
+    /// that rule. A second aggregate, or a second sort term, is not such a
+    /// candidate, and gets the tiebreak.
+    ///
+    /// Prove-the-test: drop the `is_bounded_topk_candidate` check from
+    /// `total_tie_order_edit` and the single-`max` rows read true.
+    #[tokio::test]
+    async fn a_min_or_max_top_k_keeps_its_single_sort_term() {
+        for sql in BOUNDED_TOPK_SERVED {
+            let plan = q33_plan(sql).await;
+            assert!(!plan_has_tie_order_edit(&plan, DEFAULT_TOPK_MAX), "{sql}");
+            let rewritten = rewrite_sort_group_key_tie_order(plan.clone(), DEFAULT_TOPK_MAX)
+                .expect("nothing to do");
+            assert_eq!(rewritten, plan, "{sql}");
+        }
+
+        let two_aggregates = q33_plan(
+            "SELECT a, max(x) AS m, count(*) AS c FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10",
+        )
+        .await;
+        assert!(plan_has_tie_order_edit(&two_aggregates, DEFAULT_TOPK_MAX));
+        let rewritten = rewrite_sort_group_key_tie_order(two_aggregates, DEFAULT_TOPK_MAX)
+            .expect("the rewrite applies");
+        assert_eq!(
+            sort_terms(&rewritten),
+            vec![term(None, "m", false), term(Some("q33"), "a", true)]
+        );
+        assert!(plan_is_spill_eligible(&rewritten));
+    }
+
+    /// One [`sort_terms`] entry: qualifier, name, ascending, nulls first.
+    type SortTerm = (Option<String>, String, bool, bool);
+
+    /// The single-`min`/`max` statements the bounded aggregate bounds.
+    const BOUNDED_TOPK_SERVED: [&str; 3] = [
+        "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10",
+        "SELECT a, min(y) AS m FROM q33 GROUP BY a ORDER BY m LIMIT 10",
+        "SELECT a, max(x) AS m, max(x) AS m2 FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10",
+    ];
+
+    /// Single-`min`/`max`, single-term sorts the bounded aggregate refuses,
+    /// each with the sort terms the tie-order rewrite gives it: no `LIMIT`,
+    /// the direction opposite to `max`'s extreme, a sort on a group key of a
+    /// two-key aggregate, and a `HAVING` filter between the sort and the
+    /// aggregate.
+    fn bounded_topk_refused() -> [(&'static str, Vec<SortTerm>); 4] {
+        [
+            (
+                "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC",
+                vec![term(None, "m", false), term(Some("q33"), "a", true)],
+            ),
+            (
+                "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m ASC LIMIT 10",
+                vec![term(None, "m", true), term(Some("q33"), "a", true)],
+            ),
+            (
+                "SELECT a, b, max(x) AS m FROM q33 GROUP BY a, b ORDER BY a LIMIT 10",
+                vec![term(Some("q33"), "a", true), term(Some("q33"), "b", true)],
+            ),
+            (
+                "SELECT a, max(x) AS m FROM q33 GROUP BY a HAVING max(x) > 1 \
+                 ORDER BY m DESC LIMIT 10",
+                vec![term(None, "m", false), term(Some("q33"), "a", true)],
+            ),
+        ]
+    }
+
+    /// Issue #3899: a single-term sort over a lone `min`/`max` that the bounded
+    /// aggregate cannot serve is not left as written. It gets the group keys
+    /// as tiebreaks and becomes spill-eligible.
+    ///
+    /// Prove-the-test: drop the `fetch` check from `is_bounded_topk_candidate`
+    /// and the no-`LIMIT` row fails; drop its direction check and the `ASC`
+    /// row fails.
+    #[tokio::test]
+    async fn a_min_or_max_sort_the_bounded_aggregate_refuses_gets_the_tiebreak() {
+        for (sql, terms) in bounded_topk_refused() {
+            let plan = q33_plan(sql).await;
+            assert!(!plan_is_spill_eligible(&plan), "{sql} ties as written");
+            assert!(plan_has_tie_order_edit(&plan, DEFAULT_TOPK_MAX), "{sql}");
+            let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX)
+                .expect("the rewrite applies");
+            assert_eq!(sort_terms(&rewritten), terms, "{sql}");
+            assert!(plan_is_spill_eligible(&rewritten), "{sql}");
+        }
+    }
+
+    /// A lone `min` over a nullable column, the shape of every declared logs
+    /// column, under an ascending single-term top-k.
+    const NULLABLE_MIN_SQL: &str = "SELECT a, min(s) AS m FROM q33 GROUP BY a ORDER BY m LIMIT 25";
+
+    /// The bounded aggregate refuses a nullable `min` argument, so the sort
+    /// gets the group key as a tiebreak and becomes spill-eligible rather than
+    /// staying a single-term top-k nothing bounds.
+    ///
+    /// Prove-the-test: drop the nullability check from
+    /// `is_bounded_topk_candidate` and the plan reads no tie-order edit.
+    #[tokio::test]
+    async fn a_nullable_min_top_k_gets_the_tiebreak() {
+        let plan = q33_plan(NULLABLE_MIN_SQL).await;
+        assert!(!plan_is_spill_eligible(&plan), "ORDER BY m alone ties");
+        assert!(plan_has_tie_order_edit(&plan, DEFAULT_TOPK_MAX));
+        let rewritten =
+            rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+        assert_eq!(
+            sort_terms(&rewritten),
+            vec![term(None, "m", true), term(Some("q33"), "a", true)]
+        );
+        assert!(plan_is_spill_eligible(&rewritten));
+    }
+
+    /// Whether the logical plan's first `Sort` is a bounded top-k candidate,
+    /// under the row limit the plan's `Limit` nodes give it and the ceiling
+    /// `max_limit`.
+    fn first_sort_is_candidate(
+        node: &LogicalPlan,
+        fetch: Option<usize>,
+        max_limit: Option<usize>,
+    ) -> Option<bool> {
+        if let LogicalPlan::Sort(sort) = node {
+            return Some(is_bounded_topk_candidate(
+                sort,
+                sort_fetch(sort, fetch),
+                max_limit,
+            ));
+        }
+        let fetch = fetch_for_inputs(node, fetch);
+        node.inputs()
+            .into_iter()
+            .find_map(|input| first_sort_is_candidate(input, fetch, max_limit))
+    }
+
+    /// Whether any `AggregateExec` in `plan` carries the limit
+    /// `crate::bounded_topk` sets when it bounds one.
+    fn has_bounded_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        plan.downcast_ref::<datafusion::physical_plan::aggregates::AggregateExec>()
+            .is_some_and(|aggregate| aggregate.limit_options().is_some())
+            || plan.children().into_iter().any(has_bounded_aggregate)
+    }
+
+    /// `is_bounded_topk_candidate` evaluates `crate::bounded_topk`'s gate on
+    /// the logical plan, since that rule reads the physical one. Every case of
+    /// the two tests above, and each case below, is planned through a session
+    /// built with that case's `bounded_topk_max_limit`, and the candidate
+    /// check must agree with whether the rule bounded the aggregate: a
+    /// nullable `min` argument, a `LIMIT` above the ceiling (directly, or
+    /// through an `OFFSET` the pushdown adds to the `Sort`'s fetch), and a
+    /// session with no ceiling, where the rule is not installed, are each
+    /// refused. Then every pairing of a [`TOPK_KEY_TYPES`] group key with a
+    /// [`TOPK_VALUE_TYPES`] argument, under `min ... ASC LIMIT 25` and
+    /// `max ... DESC LIMIT 25`, must agree too.
+    ///
+    /// Prove-the-test: drop the nullability check from
+    /// `is_bounded_topk_candidate` and the nullable `min(s)` row fails; drop
+    /// its ceiling check and the `LIMIT 1025` row fails; drop its
+    /// `topk_types_admitted` check and the dictionary-key rows fail.
+    #[tokio::test]
+    async fn the_bounded_topk_candidate_agrees_with_the_rule() {
+        let refused = bounded_topk_refused();
+        let max_10 = "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10";
+        let cases = BOUNDED_TOPK_SERVED
+            .iter()
+            .map(|sql| (*sql, DEFAULT_TOPK_MAX, true))
+            .chain(
+                refused
+                    .iter()
+                    .map(|(sql, _)| (*sql, DEFAULT_TOPK_MAX, false)),
+            )
+            .chain([
+                (NULLABLE_MIN_SQL, DEFAULT_TOPK_MAX, false),
+                (
+                    "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC LIMIT 1024",
+                    DEFAULT_TOPK_MAX,
+                    true,
+                ),
+                (
+                    "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC LIMIT 1025",
+                    DEFAULT_TOPK_MAX,
+                    false,
+                ),
+                (
+                    "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC \
+                     LIMIT 1020 OFFSET 10",
+                    DEFAULT_TOPK_MAX,
+                    false,
+                ),
+                (max_10, None, false),
+            ]);
+        for (sql, max_limit, served) in cases {
+            let plan = q33_plan(sql).await;
+            assert_eq!(
+                first_sort_is_candidate(&plan, None, max_limit),
+                Some(served),
+                "{sql} under {max_limit:?}"
+            );
+            assert_eq!(
+                rule_bounds("q33", q33_schema(), &plan, max_limit).await,
+                served,
+                "{sql} under {max_limit:?}"
+            );
+        }
+
+        let mut outcomes = [0usize; 2];
+        let mut disagreements = Vec::new();
+        for (key, _) in TOPK_KEY_TYPES {
+            for (value, _) in TOPK_VALUE_TYPES {
+                for (function, direction) in [("min", "ASC"), ("max", "DESC")] {
+                    let sql = format!(
+                        "SELECT k_{key}, {function}(v_{value}) AS m FROM typed \
+                         GROUP BY k_{key} ORDER BY m {direction} LIMIT 25"
+                    );
+                    let plan = typed_plan(&sql).await;
+                    let candidate = first_sort_is_candidate(&plan, None, DEFAULT_TOPK_MAX)
+                        .expect("the plan has a Sort");
+                    let bounded =
+                        rule_bounds("typed", typed_schema(), &plan, DEFAULT_TOPK_MAX).await;
+                    if candidate != bounded {
+                        disagreements.push(format!("{sql}: candidate {candidate}, rule {bounded}"));
+                    }
+                    outcomes[usize::from(bounded)] += 1;
+                }
+            }
+        }
+        assert!(disagreements.is_empty(), "{disagreements:#?}");
+        // Both answers occur, so the matrix cannot pass by never reaching
+        // the rule's type refusal, or by reaching nothing else.
+        assert!(outcomes[0] > 0 && outcomes[1] > 0, "{outcomes:?}");
+    }
+
+    /// Whether `crate::bounded_topk` bounds an aggregate in `plan`, lowered
+    /// through a session with `table` as an empty table of `schema` and
+    /// `max_limit` as its `bounded_topk_max_limit`.
+    async fn rule_bounds(
+        table: &str,
+        schema: Arc<datafusion::arrow::datatypes::Schema>,
+        plan: &LogicalPlan,
+        max_limit: Option<usize>,
+    ) -> bool {
+        let provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(schema));
+        let tables = vec![SessionTable::Parquet(ParquetSession {
+            tables: vec![(table.to_string(), provider)],
+            store: Arc::new(ravel_parquet::TenantParquetStore::new(TenantHash(
+                [105u8; 16],
+            ))),
+        })];
+        let ctx = build_session_with_tables(
+            &SqlConfig {
+                bounded_topk_max_limit: max_limit,
+                ..SqlConfig::default()
+            },
+            Arc::new(UnboundedMemoryPool::default()),
+            tables,
+            false,
+            SpillDecision::Disabled,
+            &SessionPrincipal::without_capabilities(TenantHash([105u8; 16])),
+        )
+        .expect("the session builds");
+        let physical = ctx
+            .state()
+            .create_physical_plan(plan)
+            .await
+            .expect("the plan lowers");
+        has_bounded_aggregate(&physical)
+    }
+
+    /// One agreement-matrix type: the column-name suffix and the type.
+    type MatrixType = (&'static str, fn() -> datafusion::arrow::datatypes::DataType);
+
+    /// Group-key types of the agreement matrix: the types a declared logs
+    /// column takes (`Str` is a `Dictionary(Int32, Utf8)`, `Bool` a
+    /// `Boolean`, `Bytes` a `Binary`), plus `Int64` and plain `Utf8`.
+    const TOPK_KEY_TYPES: [MatrixType; 5] = {
+        use datafusion::arrow::datatypes::DataType;
+        [
+            ("int64", || DataType::Int64),
+            ("utf8", || DataType::Utf8),
+            ("dict", || {
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+            }),
+            ("bool", || DataType::Boolean),
+            ("bin", || DataType::Binary),
+        ]
+    };
+
+    /// `min`/`max` argument types of the agreement matrix: the key types plus
+    /// a timestamp.
+    const TOPK_VALUE_TYPES: [MatrixType; 6] = {
+        use datafusion::arrow::datatypes::{DataType, TimeUnit};
+        [
+            ("int64", || DataType::Int64),
+            ("utf8", || DataType::Utf8),
+            ("dict", || {
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+            }),
+            ("bool", || DataType::Boolean),
+            ("bin", || DataType::Binary),
+            ("ts", || DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        ]
+    };
+
+    /// One non-nullable `k_<type>` column per [`TOPK_KEY_TYPES`] entry and
+    /// one `v_<type>` column per [`TOPK_VALUE_TYPES`] entry.
+    fn typed_schema() -> Arc<datafusion::arrow::datatypes::Schema> {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let keys = TOPK_KEY_TYPES
+            .iter()
+            .map(|(name, data_type)| Field::new(format!("k_{name}"), data_type(), false));
+        let values = TOPK_VALUE_TYPES
+            .iter()
+            .map(|(name, data_type)| Field::new(format!("v_{name}"), data_type(), false));
+        Arc::new(Schema::new(keys.chain(values).collect::<Vec<_>>()))
+    }
+
+    async fn typed_plan(sql: &str) -> LogicalPlan {
+        let schemas = vec![("typed".to_string(), typed_schema())];
+        eviction_test_executor()
+            .sql_classification_plan(TenantHash([105u8; 16]), sql, &[], Some(&schemas))
+            .await
+            .expect("the statement plans")
+    }
+
+    /// A lone `min` grouped by a dictionary-encoded key, the type of a
+    /// declared `Str` logs column, over a `Boolean` or `Binary` argument (a
+    /// declared `Bool` or `Bytes` column): the bounded aggregate refuses the
+    /// value type, so the single-term top-k gets the group key as a tiebreak
+    /// and becomes spill-eligible. The same key under a `min` of a plain
+    /// `Utf8` column is one the rule bounds, since the key reaches it as
+    /// `Utf8View`, and keeps its single sort term.
+    ///
+    /// Prove-the-test: drop the `topk_types_admitted` check from
+    /// `is_bounded_topk_candidate` and the `Boolean` and `Binary` plans read
+    /// no tie-order edit; drop the `grouped_key_type` mapping and the
+    /// `min(v_utf8)` plan reads one.
+    #[tokio::test]
+    async fn a_dictionary_key_min_top_k_gets_the_tiebreak() {
+        for value in ["v_bool", "v_bin"] {
+            let plan = typed_plan(&format!(
+                "SELECT k_dict, min({value}) AS m FROM typed GROUP BY k_dict ORDER BY m LIMIT 25"
+            ))
+            .await;
+            assert!(
+                !plan_is_spill_eligible(&plan),
+                "{value}: ORDER BY m alone ties"
+            );
+            assert!(plan_has_tie_order_edit(&plan, DEFAULT_TOPK_MAX), "{value}");
+            let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX)
+                .expect("the rewrite applies");
+            assert_eq!(
+                sort_terms(&rewritten),
+                vec![term(None, "m", true), term(Some("typed"), "k_dict", true)],
+                "{value}"
+            );
+            assert!(plan_is_spill_eligible(&rewritten), "{value}");
+        }
+
+        let served = typed_plan(
+            "SELECT k_dict, min(v_utf8) AS m FROM typed GROUP BY k_dict ORDER BY m LIMIT 25",
+        )
+        .await;
+        assert!(!plan_has_tie_order_edit(&served, DEFAULT_TOPK_MAX));
+        assert!(rule_bounds("typed", typed_schema(), &served, DEFAULT_TOPK_MAX).await);
+    }
+
+    /// An `ORDER BY` over a subquery puts a second projection (and the
+    /// subquery's alias) between the Sort and the aggregate, which
+    /// [`tie_order_edit`] does not reach: the plan is unchanged and stays
+    /// ineligible.
+    #[tokio::test]
+    async fn a_sort_over_nested_projections_stays_ineligible() {
+        let plan = q33_plan(
+            "SELECT * FROM (SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b) s \
+             ORDER BY c DESC LIMIT 10",
+        )
+        .await;
+        let rewritten = rewrite_sort_group_key_tie_order(plan.clone(), DEFAULT_TOPK_MAX)
+            .expect("nothing to do");
+        assert_eq!(rewritten, plan);
+        assert!(!plan_is_spill_eligible(&rewritten));
+    }
+
+    /// A user column already named like the tiebreak column makes the rebuilt
+    /// projection invalid. The rewrite reports that as an error, which every
+    /// caller treats as "keep the plan, not eligible", rather than panicking.
+    #[tokio::test]
+    async fn a_tiebreak_name_collision_is_an_error_not_a_panic() {
+        let plan = q33_plan(&format!(
+            "SELECT b, count(*) AS c, sum(x) AS {TIEBREAK_COLUMN_PREFIX}0 FROM q33 \
+             GROUP BY a, b ORDER BY c DESC LIMIT 10"
+        ))
+        .await;
+        assert!(rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).is_err());
+    }
+
+    /// A float GROUP BY key stays spill-ineligible under an `ORDER BY`, and
+    /// the rewrite leaves its `Sort` as written: ordering on a float group key
+    /// proves no total order, so the executed-plan gate does not fire and the
+    /// rewrite itself appends nothing.
+    ///
+    /// Prove-the-test: drop the `group_keys_are_non_float` check from
+    /// `total_tie_order_edit` and the gate reads true.
+    #[tokio::test]
+    async fn a_float_group_key_under_order_by_stays_ineligible() {
+        let plan = eviction_test_executor()
+            .sql_classification_plan(
+                TenantHash([109u8; 16]),
+                "SELECT value, count(*) AS c FROM samples GROUP BY value ORDER BY c DESC LIMIT 10",
+                &[],
+                None,
+            )
+            .await
+            .expect("the statement plans");
+        assert!(!plan_is_spill_eligible_ignoring_sort_order(&plan));
+        assert!(!plan_has_tie_order_edit(&plan, DEFAULT_TOPK_MAX));
+        let rewritten =
+            rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+        assert_eq!(sort_terms(&rewritten), vec![term(None, "c", false)]);
+        assert!(!plan_is_spill_eligible(&rewritten));
+    }
+
+    /// The executed-plan gate reads the `Sort`'s shape, the group key types
+    /// and the aggregate function names, never argument types: a `sum` over a
+    /// float expression is not spill-exact, yet its `Sort` gets the group keys
+    /// as tiebreaks. A lone `max` over one group key, under a single
+    /// descending sort term and a `LIMIT`, is a bounded top-k candidate and
+    /// its `Sort` is left as written, which keeps it a
+    /// single-term top-k the bounded aggregate can serve. A `Sort` that
+    /// already orders by every group key has nothing to edit.
+    ///
+    /// Prove-the-test: return `plan_is_spill_eligible_ignoring_sort_order` from
+    /// `plan_has_tie_order_edit` and the float `sum` row reads false; drop the
+    /// `is_bounded_topk_candidate` check from `total_tie_order_edit` and the
+    /// `max` row reads true; drop the
+    /// `Extend`/`ProjectThrough` filter (accept any `Some`) and the
+    /// already-total row reads true.
+    #[tokio::test]
+    async fn the_tie_order_gate_reads_shape_not_argument_types() {
+        let plan = q33_plan(
+            "SELECT a, b, sum(x * 1.5) AS s FROM q33 GROUP BY a, b ORDER BY s DESC LIMIT 10",
+        )
+        .await;
+        assert!(!plan_is_spill_eligible_ignoring_sort_order(&plan));
+        assert!(plan_has_tie_order_edit(&plan, DEFAULT_TOPK_MAX));
+        let rewritten =
+            rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+        assert_eq!(
+            sort_terms(&rewritten),
+            vec![
+                term(None, "s", false),
+                term(Some("q33"), "a", true),
+                term(Some("q33"), "b", true),
+            ]
+        );
+
+        let max =
+            q33_plan("SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10").await;
+        assert!(!plan_has_tie_order_edit(&max, DEFAULT_TOPK_MAX));
+        let rewritten =
+            rewrite_sort_group_key_tie_order(max.clone(), DEFAULT_TOPK_MAX).expect("nothing to do");
+        assert_eq!(rewritten, max);
+
+        let already_total = q33_plan(
+            "SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b ORDER BY c DESC, a, b LIMIT 10",
+        )
+        .await;
+        assert!(!plan_has_tie_order_edit(&already_total, DEFAULT_TOPK_MAX));
+    }
+
+    /// Strips every `Sort` back to its first term: the shape a classification
+    /// plan and an executed plan would have if the rewrite reached only one.
+    fn keep_the_first_sort_term(plan: LogicalPlan) -> LogicalPlan {
+        plan.transform_down(|node| match node {
+            LogicalPlan::Sort(mut sort) => {
+                sort.expr.truncate(1);
+                Ok(Transformed::yes(LogicalPlan::Sort(sort)))
+            }
+            other => Ok(Transformed::no(other)),
+        })
+        .expect("the closure never fails")
+        .data
+    }
+
+    /// Issue #2416: spill is decided on the classification plan, and the plan
+    /// a pinned statement executes is checked again after the rewrite. When
+    /// the two diverge (here the executed plan loses its tiebreak terms), the
+    /// statement runs with spill disabled: no scratch directory, and the plan
+    /// it runs is the diverged one. The control pins the same statement with
+    /// spill granted.
+    #[tokio::test]
+    async fn an_executed_plan_that_is_not_eligible_runs_with_spill_disabled() {
+        let root = tempfile::tempdir().expect("spill root");
+        let granted = pin_spill_eligible(&spill_test_executor(root.path(), 1 << 30)).await;
+        assert!(granted.scratch.is_some(), "the control is granted spill");
+        assert_eq!(sort_terms(granted.frame.logical_plan()).len(), 3);
+        drop(granted);
+
+        let mut executor = spill_test_executor(root.path(), 1 << 30);
+        executor.executed_plan_tamper = Some(keep_the_first_sort_term);
+        let refused = pin_spill_eligible(&executor).await;
+        assert!(
+            refused.scratch.is_none(),
+            "a diverged executed plan must not keep its spill grant"
+        );
+        assert_eq!(
+            sort_terms(refused.frame.logical_plan()),
+            vec![term(None, "c", false)]
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).expect("readable").count(),
+            0,
+            "the scratch directory the classification granted is removed"
+        );
+    }
+
+    /// A SQL statement that falls back to spill disabled keeps the plan it
+    /// already built: over one series its rows, and the requests each phase
+    /// issued, equal those of the same statement run without the fallback.
+    /// Each run gets its own executor over the shared store, so both resolve
+    /// and fetch cold.
+    #[tokio::test]
+    async fn sql_through_the_spill_fallback_matches_the_run_without_it() {
+        let (store, tenant_hash, _data_key) =
+            one_metrics_segment("spill-fallback-2890", 100, FaultPlan::empty()).await;
+        let root = tempfile::tempdir().expect("spill root");
+        let request = sql_request(
+            "SELECT ts, series_id, count(*) AS c FROM samples \
+             GROUP BY ts, series_id ORDER BY ts DESC LIMIT 10",
+            TimeRange {
+                start_ns: 0,
+                end_ns: 100,
+            },
+        );
+
+        let control = spill_executor_over(store.clone(), root.path());
+        let without = control
+            .execute(tenant_hash, &request)
+            .await
+            .expect("the statement runs with spill granted");
+        assert_eq!(
+            control
+                .spill_fallbacks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the control must not fall back"
+        );
+
+        let mut fallback = spill_executor_over(store.clone(), root.path());
+        fallback.executed_plan_tamper = Some(keep_the_first_sort_term);
+        let with = fallback
+            .execute(tenant_hash, &request)
+            .await
+            .expect("the statement runs with spill disabled");
+        assert_eq!(
+            fallback
+                .spill_fallbacks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the tampered plan must take the fallback"
+        );
+
+        assert_eq!(ts_values(&with.output), (90..100).rev().collect::<Vec<_>>());
+        assert_eq!(ts_values(&with.output), ts_values(&without.output));
+        assert_eq!(with.output.batches(), without.output.batches());
+        // The memory peak is the one figure allowed to differ: the fallback
+        // runs the tampered one-term sort in a session without a disk manager.
+        let mut with_accounting = with.phase_accounting;
+        let mut without_accounting = without.phase_accounting;
+        with_accounting.scan.peak_intermediate_bytes = 0;
+        without_accounting.scan.peak_intermediate_bytes = 0;
+        assert_eq!(with_accounting, without_accounting);
+        assert!(
+            without.accounting.s3_requests.iter().sum::<u64>() > 0,
+            "the comparison must cover a run that read the store"
+        );
+    }
+
+    /// SQL that falls back to spill disabled keeps the plan it already built:
+    /// the executed plan is built once.
+    #[tokio::test]
+    async fn sql_plans_once_on_the_spill_fallback() {
+        let (store, tenant_hash, _data_key) =
+            one_metrics_segment("spill-fallback-2967", 100, FaultPlan::empty()).await;
+        let root = tempfile::tempdir().expect("spill root");
+        let request = sql_request(
+            "SELECT ts, series_id, count(*) AS c FROM samples \
+             GROUP BY ts, series_id ORDER BY ts DESC LIMIT 10",
+            TimeRange {
+                start_ns: 0,
+                end_ns: 100,
+            },
+        );
+        let mut executor = spill_executor_over(store, root.path());
+        executor.executed_plan_tamper = Some(keep_the_first_sort_term);
+        let outcome = executor
+            .execute(tenant_hash, &request)
+            .await
+            .expect("the statement runs with spill disabled");
+        assert_eq!(
+            executor
+                .spill_fallbacks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the tampered plan must take the fallback"
+        );
+        assert_eq!(
+            executor
+                .executed_plan_builds
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "SQL is not planned again on the fallback"
+        );
+        assert_eq!(
+            ts_values(&outcome.output),
+            (90..100).rev().collect::<Vec<_>>()
+        );
+    }
+
+    /// A lowered statement that falls back to spill disabled is lowered
+    /// again, for the rebuilt session, and that lowering is the one that
+    /// runs.
+    #[tokio::test]
+    async fn lowered_statement_relowers_on_the_spill_fallback() {
+        use datafusion::logical_expr::{col, lit};
+        use ravel_object_store::fault::FaultPlan;
+
+        use crate::statement::plan_source::{
+            Programmatic, aggregate_call, logs_fixture, owned, rows, run_statement,
+            spill_enabled_config, statement_request, tenant_id,
+        };
+        use crate::statement::{DialectPolicy, LoweringSite};
+
+        let tenant = tenant_id("acme-logs");
+        let root = tempfile::tempdir().expect("spill root");
+        let (_store, mut fixture) = logs_fixture(
+            FaultPlan::empty(),
+            &tenant,
+            spill_enabled_config(root.path()),
+        )
+        .await;
+        fixture.executor.start_as_spill_retry = true;
+        fixture.executor.executed_plan_tamper = Some(keep_the_first_sort_term);
+        let statement = Programmatic::over_logs(
+            DialectPolicy::new(Vec::<String>::new(), ["count"], Vec::<String>::new()),
+            |ctx, _call| {
+                let count = ctx.aggregate("count")?;
+                ctx.scan("logs")?
+                    .aggregate(
+                        vec![col("severity_text")],
+                        vec![aggregate_call(count, vec![lit(1i64)]).alias("n")],
+                    )?
+                    .sort(vec![col("n").sort(false, false)])?
+                    .limit(0, Some(10))?
+                    .build()
+            },
+        );
+
+        let outcome = run_statement(&fixture, &tenant, &statement, &statement_request())
+            .await
+            .expect("the statement runs with spill disabled");
+        let executor = &fixture.executor;
+        assert_eq!(
+            executor
+                .spill_fallbacks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the tampered plan must take the fallback"
+        );
+        assert_eq!(
+            executor
+                .executed_plan_builds
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the first executed session's plan and the rebuilt session's"
+        );
+        assert_eq!(
+            statement.sites(),
+            [
+                LoweringSite::Classification,
+                LoweringSite::Executed,
+                LoweringSite::Executed
+            ]
+        );
+        // The rebuilt session is built over the first executed session's
+        // providers (`clone_session_table`).
+        assert_eq!(statement.distinct_sessions(), 2);
+        assert_eq!(
+            rows(outcome.output.batches()),
+            owned(&[&["INFO", "3"], &["WARN", "2"], &["DEBUG", "1"]])
+        );
+    }
+
+    /// [`executor_over`] with spill configured at `root`, whose executed
+    /// statements start as a spill retry (issue #3899): only a retry plans
+    /// with spill allowed on the execute path.
+    fn spill_executor_over(
+        store: Arc<InstrumentedStore<FaultStore<MemoryStore>>>,
+        root: &std::path::Path,
+    ) -> SqlExecutor {
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        let mut executor = SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(store.clone()),
+            LogSegmentFetcher::new(store.clone()),
+            SpanSegmentFetcher::new(store),
+            SqlConfig {
+                spill: Some(crate::config::SpillConfig {
+                    dir: root.to_path_buf(),
+                    max_bytes: 1 << 30,
+                    merge_fan_in: crate::DEFAULT_SPILL_MERGE_FAN_IN,
+                }),
+                ..SqlConfig::default()
+            },
+            1 << 30,
+        );
+        executor.start_as_spill_retry = true;
+        executor
+    }
+
+    /// An executor over an empty store with spill configured at `root` and a
+    /// process spill ceiling of `max_bytes`.
+    fn spill_test_executor(root: &std::path::Path, max_bytes: u64) -> SqlExecutor {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Arc::new(
+            ravel_catalog::Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"),
+        );
+        SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(store.clone()),
+            LogSegmentFetcher::new(store.clone()),
+            SpanSegmentFetcher::new(store),
+            SqlConfig {
+                spill: Some(crate::config::SpillConfig {
+                    dir: root.to_path_buf(),
+                    max_bytes,
+                    merge_fan_in: crate::DEFAULT_SPILL_MERGE_FAN_IN,
+                }),
+                ..SqlConfig::default()
+            },
+            1 << 30,
+        )
+    }
+
+    /// Pin a spill-eligible statement over an empty `samples` snapshot.
+    async fn pin_spill_eligible(executor: &SqlExecutor) -> PinnedQuery {
+        pin_samples_statement(
+            executor,
+            "SELECT ts, series_id, count(*) AS c FROM samples \
+             GROUP BY ts, series_id ORDER BY c DESC LIMIT 10",
+        )
+        .await
+    }
+
+    /// Pin `sql` over an empty `samples` snapshot.
+    async fn pin_samples_statement(executor: &SqlExecutor, sql: &str) -> PinnedQuery {
+        try_pin_samples_statement(executor, sql)
+            .await
+            .expect("the statement plans")
+    }
+
+    /// [`pin_samples_statement`], returning a refusal instead of panicking.
+    async fn try_pin_samples_statement(
+        executor: &SqlExecutor,
+        sql: &str,
+    ) -> Result<PinnedQuery, SqlError> {
+        let snapshot = Snapshot {
+            segments: Vec::new(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        executor
+            .plan_pinned(
+                TenantHash([110u8; 16]),
+                snapshot,
+                sql,
+                &QueryAccounting::new(),
+                &[],
+            )
+            .await
+    }
+
+    /// The grouped subquery the `DISTINCT ON` spill-grant case reads: its
+    /// `Aggregate` is spill-exact, so the plan is eligible unless the
+    /// `Distinct` node over it is not.
+    const GROUPED_SAMPLES: &str =
+        "(SELECT ts, series_id, count(*) AS c FROM samples GROUP BY ts, series_id) s";
+
+    /// A `DISTINCT ON` whose `ORDER BY` ties within an ON group is refused
+    /// when it is pinned, leaving no scratch directory behind, so neither a
+    /// spilled nor an in-memory run can keep a tied row chosen by input order;
+    /// the same statement with every output column in its `ORDER BY` is
+    /// granted spill.
+    #[tokio::test]
+    async fn a_distinct_on_with_tied_ordering_is_refused_and_a_total_one_spills() {
+        let root = tempfile::tempdir().expect("spill root");
+        let executor = spill_test_executor(root.path(), 1 << 30);
+
+        let tied = format!(
+            "SELECT DISTINCT ON (series_id) series_id, ts, c FROM {GROUPED_SAMPLES} \
+             ORDER BY series_id, c DESC"
+        );
+        let refused = try_pin_samples_statement(&executor, &tied).await;
+        assert!(
+            matches!(
+                refused,
+                Err(SqlError::Validation(
+                    ValidationError::DistinctOnOrderNotTotal
+                ))
+            ),
+            "a DISTINCT ON whose order ties within a group must be refused"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).expect("readable").count(),
+            0,
+            "no scratch directory is left for it"
+        );
+
+        let total = pin_samples_statement(
+            &executor,
+            &format!(
+                "SELECT DISTINCT ON (series_id) series_id, ts, c FROM {GROUPED_SAMPLES} \
+                 ORDER BY series_id, c DESC, ts"
+            ),
+        )
+        .await;
+        assert!(has_distinct_on(total.frame.logical_plan()));
+        assert!(
+            total.scratch.is_some(),
+            "a DISTINCT ON whose order names every output column keeps its spill grant"
+        );
+    }
+
+    /// ADR-0954 requirement 2 (issue #2416): one executor's statements share
+    /// one spill ceiling. The first statement granted spill reserves all of it,
+    /// so a second pinned while the first lives runs with spill disabled, and
+    /// once the first is dropped a third is granted spill again.
+    #[tokio::test]
+    async fn concurrent_statements_share_the_process_spill_ceiling() {
+        let root = tempfile::tempdir().expect("spill root");
+        let executor = spill_test_executor(root.path(), 1 << 30);
+        let first = pin_spill_eligible(&executor).await;
+        assert!(
+            first.scratch.is_some(),
+            "the first statement is granted spill"
+        );
+        let second = pin_spill_eligible(&executor).await;
+        assert!(
+            second.scratch.is_none(),
+            "nothing remains of the ceiling for a concurrent statement"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).expect("readable").count(),
+            1,
+            "only the first statement has a scratch directory"
+        );
+        drop((first, second));
+        let third = pin_spill_eligible(&executor).await;
+        assert!(
+            third.scratch.is_some(),
+            "the released ceiling is granted again"
+        );
+    }
+
+    /// The classifier's plan test over SQL text, through the same planning
+    /// call `lane_predicate_free` makes: a statement reads every row only
+    /// with no WHERE, HAVING, predicate in a CTE or subquery, JOIN or LIMIT.
+    ///
+    /// FLIP: removing `LogicalPlan::Join(_) | LogicalPlan::Limit(_)` from
+    /// `plan_is_predicate_free`'s match fails the logs JOIN row; removing only
+    /// `LogicalPlan::Limit(_)` fails the logs `LIMIT 10` row.
+    #[tokio::test]
+    async fn a_statement_is_predicate_free_only_without_a_predicate_join_or_limit() {
+        let exec = eviction_test_executor();
+        let t = TenantHash([3u8; 16]);
+        let declared = [DeclaredColumn::new("http_status", DeclaredType::I64)];
+        let cases: [(TargetSignal, &str, &[&str], &[&str]); 2] = [
+            (
+                TargetSignal::Logs,
+                "logs",
+                &[
+                    "SELECT * FROM logs",
+                    "SELECT count(*) FROM logs",
+                    "SELECT severity_text, count(*) AS n FROM logs GROUP BY severity_text",
+                    "SELECT * FROM logs ORDER BY ts DESC",
+                    "SELECT http_status, count(*) AS n FROM logs GROUP BY http_status",
+                ],
+                &[
+                    "SELECT * FROM logs WHERE severity_text = 'ERROR'",
+                    "SELECT severity_text, count(*) AS n FROM logs \
+                     GROUP BY severity_text HAVING count(*) > 1",
+                    "WITH e AS (SELECT * FROM logs WHERE severity_text = 'ERROR') \
+                     SELECT count(*) FROM e",
+                    "SELECT count(*) FROM \
+                     (SELECT * FROM logs WHERE severity_text = 'ERROR') AS s",
+                    "SELECT count(*) FROM logs a JOIN logs b ON a.ts = b.ts",
+                    "SELECT * FROM logs LIMIT 10",
+                    "SELECT * FROM logs ORDER BY ts DESC LIMIT 50",
+                ],
+            ),
+            (
+                TargetSignal::Metrics,
+                "samples",
+                &[
+                    "SELECT * FROM samples",
+                    "SELECT count(*) FROM samples",
+                    "SELECT label(labels, '__name__') AS m, count(*) AS n FROM samples GROUP BY m",
+                    "SELECT * FROM samples ORDER BY ts DESC",
+                ],
+                &[
+                    "SELECT * FROM samples WHERE value > 1",
+                    "SELECT label(labels, '__name__') AS m, count(*) AS n FROM samples \
+                     GROUP BY m HAVING count(*) > 1",
+                    "WITH e AS (SELECT * FROM samples WHERE value > 1) SELECT count(*) FROM e",
+                    "SELECT count(*) FROM (SELECT * FROM samples WHERE value > 1) AS s",
+                    "SELECT count(*) FROM samples a JOIN samples b ON a.ts = b.ts",
+                    "SELECT * FROM samples LIMIT 10",
+                    "SELECT * FROM samples ORDER BY ts DESC LIMIT 50",
+                ],
+            ),
+        ];
+        for (signal, table, free, narrowed) in cases {
+            for sql in free {
+                assert!(
+                    exec.plans_predicate_free(
+                        t,
+                        SqlCapabilities::default(),
+                        signal,
+                        sql,
+                        &declared
+                    )
+                    .await,
+                    "{table}: {sql} is predicate-free"
+                );
+            }
+            for sql in narrowed {
+                assert!(
+                    !exec
+                        .plans_predicate_free(t, SqlCapabilities::default(), signal, sql, &declared)
+                        .await,
+                    "{table}: {sql} is not predicate-free"
+                );
+            }
+        }
+        // Without the declared column in scope the statement naming it fails
+        // to plan and reads as not predicate-free.
+        assert!(
+            !exec
+                .plans_predicate_free(
+                    t,
+                    SqlCapabilities::default(),
+                    TargetSignal::Logs,
+                    "SELECT http_status, count(*) AS n FROM logs GROUP BY http_status",
+                    &[]
+                )
+                .await
+        );
+    }
+
+    const SIZE_TRIGGER_HOUR: i64 = 3_600_000_000_000;
+    const SIZE_TRIGGER_NOW: i64 = 100 * SIZE_TRIGGER_HOUR;
+
+    /// The declared columns the size-trigger tests plan over.
+    fn size_trigger_declared() -> Vec<DeclaredColumn> {
+        vec![
+            DeclaredColumn::new("http_status", DeclaredType::I64),
+            DeclaredColumn::new("user_id", DeclaredType::Str),
+        ]
+    }
+
+    /// A 1,200-byte resolve: two 600-byte segments inside a window from the
+    /// epoch to [`SIZE_TRIGGER_NOW`].
+    fn size_trigger_snapshot() -> (Snapshot, TimeRange) {
+        use ravel_catalog::{SegmentLevel, SegmentRef};
+
+        let hour = SIZE_TRIGGER_HOUR;
+        let segment = |h: i64| SegmentRef {
+            data_object_key: format!("t/{h}.obj"),
+            object_size: 600,
+            min_event_ts_ns: h * hour,
+            max_event_ts_ns: (h + 1) * hour - 1,
+            ingest_hour_bucket: u32::try_from(h).expect("small hour"),
+            sample_count: 1,
+            series_count: 1,
+            shard: 0,
+            content_hash: [0u8; 32],
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: u64::try_from(h).expect("small hour"),
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: 0,
+            declared_column_stats: Default::default(),
+        };
+        let snapshot = Snapshot {
+            segments: vec![segment(97), segment(98)],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: SIZE_TRIGGER_NOW,
+        };
+        (snapshot, window)
+    }
+
+    /// The bytes every size-trigger statement below is recorded as having read
+    /// on its last execution: between the 1,000 and 2,000-byte thresholds.
+    const SIZE_TRIGGER_READ_BYTES: u64 = 1_500;
+
+    /// Record that `sql`, sent by `tenant`, read `bytes` on its last
+    /// execution, as a successful run of it would.
+    fn record_read_bytes(
+        exec: &SqlExecutor,
+        tenant: TenantHash,
+        sql: &str,
+        window: TimeRange,
+        bytes: u64,
+    ) {
+        exec.statement_read_bytes.record(
+            StatementReadBytes::key(tenant, sql, ReadShape::new(window, false, None)),
+            bytes,
+        );
+    }
+
+    /// The bulk-scan size trigger through `statement_access_intent`, the call
+    /// the attempt loop makes after resolve: before any execution is recorded
+    /// every row reads as the predicate-free rule alone gives it; once each
+    /// statement is recorded as having read 1,500 bytes, a filtered `logs`
+    /// statement is BulkScan with the threshold at 1,000 and Interactive at
+    /// 2,000, and an equality on a KEY_IDX field stays
+    /// Interactive at 1,000 wherever the probe would see it: a one-element
+    /// `IN`, a column renamed through a CTE, a join's `ON`, a subquery. A
+    /// `samples` statement is never read as BulkScan by the trigger. Unset,
+    /// every row reads as the predicate-free rule alone gives it.
+    ///
+    /// FLIP: making `size_trigger_applies` return `false` fails the first
+    /// filtered row above the threshold; comparing the 1,200-byte resolve
+    /// instead of the recorded read bytes fails the unrecorded pass at 1,000;
+    /// making `reads_key_equality` return
+    /// `false` fails the `user_id = 'u-1'` row; dropping the optimized-plan
+    /// walk in `reads_key_equality` fails the `IN` and CTE rows, and the
+    /// `JOIN` row too once the `Join` arm of `plan_has_key_equality` goes
+    /// with it (the optimizer pushes the `ON` equality into the scan's
+    /// filters); walking with `apply` instead of `apply_with_subqueries` in
+    /// `plan_has_key_equality` fails the scalar subquery row. The `samples`
+    /// row holds under a `Metrics` flip because `samples` does not plan over
+    /// the logs-only session and so reads as a key lookup;
+    /// `a_samples_statement_never_reads_bulk_through_the_size_trigger` is the
+    /// test that flip fails.
+    #[tokio::test]
+    async fn the_size_trigger_reads_a_large_filtered_logs_scan_as_bulk_unless_it_is_a_key_lookup() {
+        use crate::declared::{KeyIndexDeclaration, StaticDeclaredColumns};
+
+        const NOW: i64 = SIZE_TRIGGER_NOW;
+        let declared = size_trigger_declared();
+        let source =
+            StaticDeclaredColumns::new(declared.clone()).with_key_index(KeyIndexDeclaration {
+                columns: vec!["user_id".to_string()],
+                trace_id: true,
+            });
+        let t = TenantHash([3u8; 16]);
+        let (snapshot, window) = size_trigger_snapshot();
+        use AccessIntent::{BulkScan, Interactive};
+        // (signal, statement, threshold 1,000, threshold 2,000, unset)
+        let cases: [(TargetSignal, &str, [AccessIntent; 3]); 17] = [
+            (
+                TargetSignal::Logs,
+                "SELECT count(*) FROM logs WHERE http_status >= 500",
+                [BulkScan, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "SELECT * FROM logs WHERE severity_text = 'ERROR'",
+                [BulkScan, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "SELECT * FROM logs WHERE http_status = 404",
+                [BulkScan, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "SELECT * FROM logs WHERE user_id = 'u-1'",
+                [Interactive, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "SELECT count(*) FROM logs WHERE severity_text = 'ERROR' AND 'u-1' = user_id",
+                [Interactive, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "SELECT count(*) FROM logs \
+                 WHERE ts > TIMESTAMP '1970-01-01 01:00:00' \
+                 AND (user_id = 'u-1' OR severity_text = 'ERROR')",
+                [Interactive, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "SELECT count(*) FROM (SELECT * FROM logs WHERE user_id = 'u-1') AS s",
+                [Interactive, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "SELECT count(*) FROM logs WHERE user_id IN ('u-1')",
+                [Interactive, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "WITH s AS (SELECT user_id AS u FROM logs) \
+                 SELECT count(*) FROM s WHERE u = 'u-1'",
+                [Interactive, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "WITH s AS (SELECT http_status AS h FROM logs) \
+                 SELECT count(*) FROM s WHERE h = 404",
+                [BulkScan, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "SELECT count(*) FROM logs a JOIN logs b \
+                 ON a.ts = b.ts AND a.user_id = 'u-1'",
+                [Interactive, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "SELECT count(*) FROM logs a JOIN logs b \
+                 ON a.ts = b.ts AND a.http_status = 404",
+                [BulkScan, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "SELECT count(*) FROM logs \
+                 WHERE http_status > (SELECT count(*) FROM logs WHERE user_id = 'u-1')",
+                [Interactive, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "SELECT count(*) FROM logs WHERE http_status > (SELECT count(*) FROM logs)",
+                [BulkScan, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "SELECT count(*) FROM logs",
+                [BulkScan, BulkScan, BulkScan],
+            ),
+            (
+                TargetSignal::Metrics,
+                "SELECT count(*) FROM samples WHERE value > 1",
+                [Interactive, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Metrics,
+                "SELECT count(*) FROM samples",
+                [BulkScan, BulkScan, BulkScan],
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (column, min_bytes) in [Some(1_000), Some(2_000), None].into_iter().enumerate() {
+            let exec = eviction_test_executor()
+                .with_declared_column_source(Arc::new(source.clone()))
+                .with_cache_bulk_scan_min_bytes(min_bytes);
+            for (signal, sql, expected) in &cases {
+                let unrecorded = exec
+                    .statement_access_intent(
+                        t,
+                        SqlCapabilities::default(),
+                        Statement::Sql(sql),
+                        &[(*signal, &snapshot)],
+                        false,
+                        window,
+                        ReadShape::new(window, false, None),
+                        Clocks {
+                            resolve_at_ns: NOW,
+                            caller_now_ns: NOW,
+                        },
+                        &declared,
+                    )
+                    .await;
+                if unrecorded != expected[2] {
+                    mismatches.push(format!(
+                        "{min_bytes:?} unrecorded: {sql}: got {unrecorded:?}, want {:?}",
+                        expected[2]
+                    ));
+                }
+                record_read_bytes(&exec, t, sql, window, SIZE_TRIGGER_READ_BYTES);
+                let intent = exec
+                    .statement_access_intent(
+                        t,
+                        SqlCapabilities::default(),
+                        Statement::Sql(sql),
+                        &[(*signal, &snapshot)],
+                        false,
+                        window,
+                        ReadShape::new(window, false, None),
+                        Clocks {
+                            resolve_at_ns: NOW,
+                            caller_now_ns: NOW,
+                        },
+                        &declared,
+                    )
+                    .await;
+                if intent != expected[column] {
+                    mismatches.push(format!(
+                        "{min_bytes:?}: {sql}: got {intent:?}, want {:?}",
+                        expected[column]
+                    ));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    /// A statement with no SQL text (a lowered plan, as ES|QL sends) never
+    /// reads as BulkScan through the size trigger, even over a tenant that
+    /// indexes no key, while the same shape sent as SQL text, recorded as
+    /// having read more than the threshold, does.
+    ///
+    /// FLIP: removing the `statement.sql().is_none()` check at the head of
+    /// the trigger in `statement_access_intent` fails the lowered assertion.
+    #[tokio::test]
+    async fn a_statement_without_sql_text_never_reads_bulk_through_the_size_trigger() {
+        use crate::declared::StaticDeclaredColumns;
+        use crate::statement::DialectPolicy;
+        use crate::statement::plan_source::Programmatic;
+
+        let declared = size_trigger_declared();
+        let (snapshot, window) = size_trigger_snapshot();
+        let t = TenantHash([4u8; 16]);
+        let exec = eviction_test_executor()
+            .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared.clone())))
+            .with_cache_bulk_scan_min_bytes(Some(1_000));
+        let lowered = Programmatic::over_logs(
+            DialectPolicy::new(Vec::<String>::new(), ["count"], Vec::<String>::new()),
+            |_ctx, _call| Err(DataFusionError::Internal("never lowered".to_string())),
+        );
+        let sql = "SELECT count(*) FROM logs WHERE http_status >= 500";
+        record_read_bytes(&exec, t, sql, window, SIZE_TRIGGER_READ_BYTES);
+        let mut intents = Vec::new();
+        for statement in [Statement::Lowered(&lowered), Statement::Sql(sql)] {
+            intents.push(
+                exec.statement_access_intent(
+                    t,
+                    SqlCapabilities::default(),
+                    statement,
+                    &[(TargetSignal::Logs, &snapshot)],
+                    false,
+                    window,
+                    ReadShape::new(window, false, None),
+                    Clocks {
+                        resolve_at_ns: SIZE_TRIGGER_NOW,
+                        caller_now_ns: SIZE_TRIGGER_NOW,
+                    },
+                    &declared,
+                )
+                .await,
+            );
+        }
+        assert_eq!(
+            intents,
+            [AccessIntent::Interactive, AccessIntent::BulkScan],
+            "lowered, then SQL text"
+        );
+    }
+
+    /// A filtered `samples` statement recorded as having read more than the
+    /// threshold stays Interactive with the size trigger set, over a tenant
+    /// that indexes no key, so no key-lookup test can be what keeps it there;
+    /// the same statement shape over `logs` reads as BulkScan.
+    ///
+    /// FLIP: letting `size_trigger_applies` take `TargetSignal::Metrics` fails
+    /// the `samples` assertion.
+    #[tokio::test]
+    async fn a_samples_statement_never_reads_bulk_through_the_size_trigger() {
+        use crate::declared::StaticDeclaredColumns;
+
+        let declared = size_trigger_declared();
+        let (snapshot, window) = size_trigger_snapshot();
+        let t = TenantHash([5u8; 16]);
+        let exec = eviction_test_executor()
+            .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared.clone())))
+            .with_cache_bulk_scan_min_bytes(Some(1_000));
+        let mut intents = Vec::new();
+        for (signal, sql) in [
+            (
+                TargetSignal::Metrics,
+                "SELECT count(*) FROM samples WHERE value > 1",
+            ),
+            (
+                TargetSignal::Logs,
+                "SELECT count(*) FROM logs WHERE http_status > 1",
+            ),
+        ] {
+            record_read_bytes(&exec, t, sql, window, SIZE_TRIGGER_READ_BYTES);
+            intents.push(
+                exec.statement_access_intent(
+                    t,
+                    SqlCapabilities::default(),
+                    Statement::Sql(sql),
+                    &[(signal, &snapshot)],
+                    false,
+                    window,
+                    ReadShape::new(window, false, None),
+                    Clocks {
+                        resolve_at_ns: SIZE_TRIGGER_NOW,
+                        caller_now_ns: SIZE_TRIGGER_NOW,
+                    },
+                    &declared,
+                )
+                .await,
+            );
+        }
+        assert_eq!(
+            intents,
+            [AccessIntent::Interactive, AccessIntent::BulkScan],
+            "samples, then logs"
+        );
+    }
+
+    fn eviction_test_executor() -> SqlExecutor {
+        use ravel_catalog::{Catalog, CatalogConfig};
+        use ravel_object_store::memory::MemoryStore;
+
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("cat"));
+        let fetcher = SegmentFetcher::new(store.clone());
+        let log_fetcher = LogSegmentFetcher::new(store.clone());
+        let span_fetcher = SpanSegmentFetcher::new(store.clone());
+        SqlExecutor::new(
+            catalog,
+            fetcher,
+            log_fetcher,
+            span_fetcher,
+            SqlConfig::default(),
+            1 << 30,
+        )
+    }
+
+    /// `SqlStats::scan_timing` carries the logs scan's three prefetch-pool
+    /// counters, summed over partitions beside `reopens`, under the metric
+    /// names the scan publishes. Fails against a fold that leaves any of
+    /// them out (it reads 0).
+    #[test]
+    fn scan_timing_sums_the_prefetch_pool_counters() {
+        use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
+
+        let set = ExecutionPlanMetricsSet::new();
+        MetricBuilder::new(&set)
+            .counter("prefetch_memory_reopens", 0)
+            .add(1);
+        MetricBuilder::new(&set)
+            .counter("prefetch_memory_reopens", 1)
+            .add(1);
+        MetricBuilder::new(&set)
+            .counter("prefetch_revocations", 0)
+            .add(3);
+        MetricBuilder::new(&set)
+            .counter("fan_out_narrowings", 0)
+            .add(1);
+        MetricBuilder::new(&set)
+            .counter("fan_out_narrowings", 1)
+            .add(3);
+        MetricBuilder::new(&set).counter("reopens", 1).add(1);
+        let mut timing = ScanTiming::default();
+        accumulate_scan_timing(&set.clone_inner(), &mut timing);
+        assert_eq!(
+            (
+                timing.reopens,
+                timing.prefetch_memory_reopens,
+                timing.prefetch_revocations,
+                timing.fan_out_narrowings
+            ),
+            (1, 2, 3, 4)
+        );
+        let rendered = format!("{timing:?}");
+        assert!(
+            rendered.contains("prefetch_memory_reopens: 2"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("prefetch_revocations: 3"), "{rendered}");
+        assert!(rendered.contains("fan_out_narrowings: 4"), "{rendered}");
+    }
+
+    /// A logs statement's dependency depth reads the bound `plan_segment`
+    /// routes on, `plan_whole_object_bound`: a 1,000,000 byte object above the
+    /// 524,288 byte routing threshold and under the 18,900,000 byte
+    /// projection break-even is read whole with no probe, depth 1. Fails
+    /// against feeding `block_range_threshold()`, which reports the probe
+    /// chain's depth 4.
+    #[test]
+    fn sql_io_shape_reports_whole_object_depth_under_the_break_even() {
+        let (exec, snapshot) = io_shape_fixture(1_000_000);
+        let shape = exec.sql_io_shape(
+            &[(TargetSignal::Logs, &snapshot)],
+            &StatementAccounting::new(),
+            0,
+            false,
+        );
+        assert_eq!(shape.dependency_depth, 1);
+    }
+
+    /// A keyed logs statement probes KEY_IDX on every object above the
+    /// 524,288 byte routing threshold, under the break-even too: the
+    /// 1,000,000 byte object's chain is the footer probe (and its chase), the
+    /// KEY_IDX prefix, a bucket, then the whole-object GET, so the reported
+    /// depth is 6, the unkeyed probe chain's 4 plus the two KEY_IDX reads. An
+    /// object at the threshold is read whole unprobed, depth 1. Fails against
+    /// routing a keyed statement on `plan_whole_object_bound`, which reports
+    /// depth 1 for the probed object.
+    #[test]
+    fn sql_io_shape_reports_key_probe_depth_for_a_keyed_statement() {
+        let (exec, snapshot) = io_shape_fixture(1_000_000);
+        let shape = exec.sql_io_shape(
+            &[(TargetSignal::Logs, &snapshot)],
+            &StatementAccounting::new(),
+            0,
+            true,
+        );
+        assert_eq!(shape.dependency_depth, 6);
+
+        let (exec, snapshot) = io_shape_fixture(524_288);
+        let shape = exec.sql_io_shape(
+            &[(TargetSignal::Logs, &snapshot)],
+            &StatementAccounting::new(),
+            0,
+            true,
+        );
+        assert_eq!(shape.dependency_depth, 1);
+    }
+
+    /// An executor whose log fetcher routes at 524,288 bytes with an
+    /// 18,900,000 byte projection break-even, and a logs snapshot of one
+    /// object of `object_size` bytes.
+    fn io_shape_fixture(object_size: u64) -> (SqlExecutor, Snapshot) {
+        use ravel_catalog::{Catalog, CatalogConfig, SegmentLevel, SegmentRef};
+        use ravel_object_store::memory::MemoryStore;
+
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("cat"));
+        let log_fetcher = LogSegmentFetcher::new(store.clone())
+            .with_block_range_threshold(524_288)
+            .with_projection_break_even_bytes(Some(18_900_000));
+        assert_eq!(log_fetcher.plan_whole_object_bound(), 18_900_000);
+        let exec = SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(store.clone()),
+            log_fetcher,
+            SpanSegmentFetcher::new(store),
+            SqlConfig::default(),
+            1 << 30,
+        );
+        let snapshot = Snapshot {
+            segments: vec![SegmentRef {
+                data_object_key: "t/obj.rlog".to_string(),
+                object_size,
+                min_event_ts_ns: 0,
+                max_event_ts_ns: 1,
+                ingest_hour_bucket: 0,
+                sample_count: 1,
+                series_count: 0,
+                shard: 0,
+                content_hash: [0u8; 32],
+                writer_id: Uuid::from_u128(1),
+                writer_epoch: 1,
+                writer_seq: 1,
+                created_unix_ns: 0,
+                level: SegmentLevel::L0,
+                segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+                declared_column_stats: Default::default(),
+            }],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        (exec, snapshot)
+    }
+
+    /// ADR-0069 decision 2: a tenant idle past the TTL has its
+    /// memory accountant evicted, a subsequent access re-derives a fresh one,
+    /// and a tenant still running queries (recently touched) survives the same
+    /// sweep. Deterministic via injected `now_ns` (touch_tenant, the resolve
+    /// funnel's stamp, is driven directly here so no store I/O is needed).
+    #[test]
+    fn idle_sql_accountant_evicted_and_rederived() {
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        let exec = eviction_test_executor();
+        let idle = TenantHash([1; 16]);
+        let active = TenantHash([2; 16]);
+        let ttl_ns = 100 * NS_PER_HOUR;
+
+        let t0 = 1_000 * NS_PER_HOUR;
+        exec.touch_tenant(idle, t0);
+        exec.touch_tenant(active, t0);
+
+        // The active tenant runs another query right before the sweep.
+        let sweep_ns = t0 + ttl_ns + 1;
+        exec.touch_tenant(active, sweep_ns);
+
+        // Both accountants hold zero reservations, so only last-touch decides:
+        // the idle one is evicted, the active one survives.
+        let evicted = exec.evict_idle_accountants(sweep_ns, ttl_ns);
+        assert_eq!(evicted, 1, "only the idle tenant's accountant is evicted");
+
+        // Re-derivation: the evicted tenant's next access rebuilds a fresh
+        // accountant with zero reserved bytes, at the configured ceiling.
+        let rebuilt = exec.tenant_budget(idle);
+        assert_eq!(rebuilt.reserved(), 0);
+        assert_eq!(rebuilt.limit(), 1 << 30);
+    }
+
+    /// The zero-reservation guard: an accountant with outstanding reservations
+    /// is never evicted, even when idle past the TTL, because a live query is
+    /// still accounting against it (ADR-0069 decision 2). Dropping it would let
+    /// a concurrent query build a second accountant and stop sharing the
+    /// tenant ceiling.
+    #[test]
+    fn sql_accountant_with_outstanding_reservation_survives_sweep() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+
+        use crate::memory::{CeilingBreach, TenantDelegatingPool};
+
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        let exec = eviction_test_executor();
+        let tenant = TenantHash([7; 16]);
+        let ttl_ns = 100 * NS_PER_HOUR;
+
+        // Create the accountant (last-touch i64::MIN, so idle by any clock) and
+        // hold an outstanding reservation against it through a query pool.
+        let accountant = exec.tenant_budget(tenant);
+        let pool: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            Arc::clone(&accountant),
+            CeilingBreach::new(),
+            QueryAccounting::new(),
+        ));
+        let reservation = MemoryConsumer::new("live-query").register(&pool);
+        reservation.grow(4096);
+        assert!(accountant.reserved() > 0);
+
+        let evicted = exec.evict_idle_accountants(10 * NS_PER_HOUR, ttl_ns);
+        assert_eq!(
+            evicted, 0,
+            "an accountant with outstanding reservations is never evicted"
+        );
+
+        // Once the reservation drops and the tenant is idle, the sweep reclaims it.
+        drop(reservation);
+        assert_eq!(accountant.reserved(), 0);
+        assert_eq!(exec.evict_idle_accountants(10 * NS_PER_HOUR, ttl_ns), 1);
+    }
+
+    /// ADR-1170 decision 1: every accountant the executor builds charges the
+    /// ONE process budget it carries, so two tenants' reservations add on it
+    /// rather than being counted against N independent ceilings. Installed
+    /// budget, so the refusal is reachable; the default is exercised by
+    /// `the_installed_process_budget_defaults_to_unlimited_and_counts`.
+    #[test]
+    fn every_tenant_accountant_charges_the_executors_one_process_budget() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+
+        use crate::memory::TenantDelegatingPool;
+
+        let budget = Arc::new(MemoryBudget::new(100));
+        let exec = eviction_test_executor().with_process_memory_budget(Arc::clone(&budget));
+        let a = exec.tenant_budget(TenantHash([1; 16]));
+        let b = exec.tenant_budget(TenantHash([2; 16]));
+
+        let pool_a: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            Arc::clone(&a),
+            CeilingBreach::new(),
+            QueryAccounting::new(),
+        ));
+        let pool_b: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            Arc::clone(&b),
+            CeilingBreach::new(),
+            QueryAccounting::new(),
+        ));
+        let res_a = MemoryConsumer::new("tenant-a").register(&pool_a);
+        let res_b = MemoryConsumer::new("tenant-b").register(&pool_b);
+
+        res_a.try_grow(60).expect("60 of the 100-byte budget fits");
+        assert_eq!(a.process_reserved(), 60);
+        assert_eq!(
+            b.process_reserved(),
+            60,
+            "both accountants read the same process counter"
+        );
+        res_b
+            .try_grow(50)
+            .expect_err("A's 60 leaves 40, so B's 50 is refused by the process budget");
+        assert_eq!(budget.reserved(), 60);
+        assert_eq!(b.reserved(), 0, "the refused tenant charge is rolled back");
+    }
+
+    /// The default: an executor built without an installed budget counts every
+    /// SQL reservation against an unlimited one and refuses nothing, so nothing
+    /// observable changes until a caller sets a limit.
+    #[test]
+    fn the_installed_process_budget_defaults_to_unlimited_and_counts() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+
+        use crate::memory::TenantDelegatingPool;
+
+        let exec = eviction_test_executor();
+        assert_eq!(exec.process_memory_budget().limit(), u64::MAX);
+        let accountant = exec.tenant_budget(TenantHash([3; 16]));
+        let pool: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            Arc::clone(&accountant),
+            CeilingBreach::new(),
+            QueryAccounting::new(),
+        ));
+        let reservation = MemoryConsumer::new("default-budget").register(&pool);
+
+        reservation
+            .try_grow(4096)
+            .expect("the unlimited default refuses nothing");
+        assert_eq!(exec.process_memory_budget().reserved(), 4096);
+        assert_eq!(accountant.process_reserved(), 4096);
+
+        drop(reservation);
+        assert_eq!(exec.process_memory_budget().reserved(), 0);
+    }
+
+    /// ADR-1170 decision 1, the infallible path end to end: a `grow` that
+    /// overshoots the process budget cannot be declined, so it trips the
+    /// `CeilingBreach` with the process figures and the query's real stream
+    /// turns that into `SqlError::ResourcesExhausted` on its next poll, the
+    /// same seam a query or tenant overshoot uses.
+    #[tokio::test]
+    async fn a_process_ceiling_breach_aborts_the_stream_with_resources_exhausted() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        use datafusion::prelude::SessionConfig;
+
+        use crate::memory::{TenantDelegatingPool, TenantMemoryAccountant};
+
+        let budget = Arc::new(MemoryBudget::new(1024));
+        let accountant = TenantMemoryAccountant::with_process_budget(1 << 30, Arc::clone(&budget));
+        let breach = CeilingBreach::new();
+        let pool: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            accountant,
+            Arc::clone(&breach),
+            QueryAccounting::new(),
+        ));
+
+        // The unchecked delta DataFusion's `resize` and join operators reach
+        // `grow` with: the bytes are reserved past the process limit and the
+        // breach records the overshoot.
+        let reservation = MemoryConsumer::new("process-overshoot").register(&pool);
+        reservation.grow(4096);
+        assert_eq!(budget.reserved(), 4096);
+
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()
+            .expect("runtime builds");
+        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+        let plan = ctx
+            .sql("SELECT 1 AS one")
+            .await
+            .expect("query plans")
+            .create_physical_plan()
+            .await
+            .expect("physical plan builds");
+        let schema = plan.schema();
+        let mut stream =
+            PinnedStream::start(ctx, plan, schema, Arc::clone(&breach)).expect("stream starts");
+
+        let first = stream.next().await.expect("the stream yields one item");
+        let err = first.expect_err("a tripped breach must abort the stream");
+        let SqlError::ResourcesExhausted(message) = &err else {
+            panic!("a process ceiling breach must surface as ResourcesExhausted; got {err:?}");
+        };
+        assert_eq!(
+            message,
+            "process memory ceiling breached: 4096 bytes reserved exceeds process limit 1024"
+        );
+    }
+
+    /// The profile set on the pool before execution for the six statements
+    /// the reservation-lag matrix measured, each planned over `logs` with the
+    /// ClickBench columns it reads declared, and no profile for a plan with no
+    /// grouped aggregate.
+    ///
+    /// A declared `I64` is `Int64`, so q33's `ClientIP` key is 8 bytes and its
+    /// `W` is 8 + 8 (keys) + 8 (COUNT) + 8 (Ravel's checked integer SUM, an
+    /// `i64`) + 24 (Ravel's exact AVG) = 56.
+    /// The optimizer drops q35's constant key, leaving the single view key
+    /// q34 has. `date_part` is `Int32`, so q19's `W` is 8 + 4 + 16 + 8 = 36.
+    /// q14's `COUNT(DISTINCT)` is rewritten into two plain group-bys, the
+    /// outer one a view key with a COUNT: `W` 24, `w_max` 16, the same ratio
+    /// as the inner `(SearchPhrase, UserID)` stream, so the outer node, met
+    /// first, is kept. The multi-column streams (q33, q19, q17) report every
+    /// table and `Vec` by capacity, view columns included; the single view
+    /// key map (q34, q35, q14) reports its views by length.
+    ///
+    /// FLIP: an `install_aggregate_profile` that sets nothing reads `None`
+    /// for every statement; one that marks every layout capacity accounted
+    /// reads `true` for q34, q35 and q14.
+    #[tokio::test]
+    async fn the_aggregate_profile_of_the_six_measured_statements() {
+        use crate::memory::{AggregateLayout, AggregateProfile};
+
+        let declared = vec![
+            DeclaredColumn::new("WatchID", DeclaredType::I64),
+            DeclaredColumn::new("ClientIP", DeclaredType::I64),
+            DeclaredColumn::new("IsRefresh", DeclaredType::I64),
+            DeclaredColumn::new("ResolutionWidth", DeclaredType::I64),
+            DeclaredColumn::new("URL", DeclaredType::Str),
+            DeclaredColumn::new("UserID", DeclaredType::I64),
+            DeclaredColumn::new("SearchPhrase", DeclaredType::Str),
+        ];
+        let layout = |entry_size, vec_width_total, vec_width_max, capacity_accounted| {
+            Some(AggregateProfile::Layout(AggregateLayout {
+                entry_size,
+                vec_width_total,
+                vec_width_max,
+                capacity_accounted,
+            }))
+        };
+        let statements = [
+            (
+                "SELECT \"WatchID\", \"ClientIP\", COUNT(*) AS c, SUM(\"IsRefresh\"), \
+                 AVG(\"ResolutionWidth\") FROM logs GROUP BY \"WatchID\", \"ClientIP\" \
+                 ORDER BY c DESC LIMIT 10",
+                layout(16, 56, 16, true),
+            ),
+            (
+                "SELECT \"URL\", COUNT(*) AS c FROM logs GROUP BY \"URL\" \
+                 ORDER BY c DESC LIMIT 10",
+                layout(32, 24, 16, false),
+            ),
+            (
+                "SELECT 1, \"URL\", COUNT(*) AS c FROM logs GROUP BY 1, \"URL\" \
+                 ORDER BY c DESC LIMIT 10",
+                layout(32, 24, 16, false),
+            ),
+            (
+                "SELECT \"UserID\", date_part('minute', ts) AS m, \"SearchPhrase\", COUNT(*) \
+                 FROM logs GROUP BY \"UserID\", m, \"SearchPhrase\" \
+                 ORDER BY COUNT(*) DESC LIMIT 10",
+                layout(16, 36, 16, true),
+            ),
+            (
+                "SELECT \"UserID\", \"SearchPhrase\", COUNT(*) FROM logs \
+                 GROUP BY \"UserID\", \"SearchPhrase\" ORDER BY COUNT(*) DESC LIMIT 10",
+                layout(16, 32, 16, true),
+            ),
+            (
+                "SELECT \"SearchPhrase\", COUNT(DISTINCT \"UserID\") AS u FROM logs \
+                 WHERE \"SearchPhrase\" <> '' GROUP BY \"SearchPhrase\" \
+                 ORDER BY u DESC LIMIT 10",
+                layout(32, 24, 16, false),
+            ),
+            ("SELECT \"URL\", ts FROM logs ORDER BY ts LIMIT 10", None),
+        ];
+
+        let executor = executor_over(empty_store());
+        let mut installed = Vec::new();
+        for (sql, _) in &statements {
+            let snapshot = Snapshot {
+                segments: Vec::new(),
+                segments_pruned: 0,
+                pending_erasure: Vec::new(),
+            };
+            let plan = executor
+                .plan_pinned(
+                    TenantHash([111u8; 16]),
+                    snapshot,
+                    sql,
+                    &QueryAccounting::new(),
+                    &declared,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{sql} plans: {e}"))
+                .create_physical_plan()
+                .await
+                .expect("physical plan builds");
+            let pool: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+                1 << 30,
+                TenantMemoryAccountant::new(1 << 30),
+                CeilingBreach::new(),
+                QueryAccounting::new(),
+            ));
+            crate::memory::install_aggregate_profile(&plan, &pool);
+            let pool = pool
+                .downcast_ref::<TenantDelegatingPool>()
+                .expect("the pool is a TenantDelegatingPool");
+            installed.push((*sql, pool.aggregate_profile()));
+        }
+        let expected: Vec<_> = statements.iter().map(|(sql, p)| (*sql, *p)).collect();
+        assert_eq!(installed, expected);
+    }
+
+    /// Run `source` through the ES|QL entry point and return the aggregate
+    /// profiles set on any pool while it ran.
+    async fn esql_profiles(source: &str) -> Vec<crate::memory::AggregateProfile> {
+        let executor = executor_over(empty_store());
+        let context = crate::esql::PrepareContext {
+            declared: Vec::new(),
+            now_ns: 1_700_000_000_000_000_000,
+            start: None,
+            end: None,
+        };
+        let prepared = crate::esql::prepare(source, &ravel_esql::Limits::default(), &context)
+            .unwrap_or_else(|e| panic!("{source} prepares: {e:?}"));
+        let request = crate::esql::EsqlRequest {
+            min_tokens: Vec::new(),
+            deadline: Duration::from_secs(30),
+            budgets: None,
+            max_rows: None,
+        };
+        crate::memory::take_profiles_set_on_this_thread();
+        crate::esql::execute(
+            &executor,
+            TenantHash([112u8; 16]),
+            &prepared,
+            &request,
+            &LiveAccounting::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{source} runs: {e:?}"));
+        crate::memory::take_profiles_set_on_this_thread()
+    }
+
+    /// A `FROM logs` statement's grouped aggregate, keyed on the 8-byte
+    /// timestamp with an 8-byte `COUNT`, gets its layout on the query pool.
+    #[tokio::test]
+    async fn the_esql_path_installs_the_aggregate_profile() {
+        use crate::memory::{AggregateLayout, AggregateProfile};
+
+        let profiles = esql_profiles("FROM logs | STATS c = COUNT(*) BY @timestamp").await;
+        assert_eq!(
+            profiles.last(),
+            Some(&AggregateProfile::Layout(AggregateLayout {
+                entry_size: 16,
+                vec_width_total: 16,
+                vec_width_max: 8,
+                capacity_accounted: true,
+            })),
+            "{profiles:?}"
+        );
+    }
+
+    /// A `ROW` statement runs in a session of its own, outside the executor's
+    /// stream, and its grouped aggregate gets its layout on that pool too.
+    /// FLIP: collecting the frame without the profile sets none.
+    #[tokio::test]
+    async fn the_esql_row_path_installs_the_aggregate_profile() {
+        use crate::memory::{AggregateLayout, AggregateProfile};
+
+        let profiles = esql_profiles("ROW k = 1 | STATS c = COUNT(*) BY k").await;
+        assert_eq!(
+            profiles.last(),
+            Some(&AggregateProfile::Layout(AggregateLayout {
+                entry_size: 16,
+                vec_width_total: 16,
+                vec_width_max: 8,
+                capacity_accounted: true,
+            })),
+            "{profiles:?}"
+        );
+    }
+
+    /// ADR-0044 acceptance test: one `execute` call, checked
+    /// against an `InstrumentedStore`'s own before/after deltas, the same
+    /// cross-check `Catalog::resolve_with_accounting`'s own test uses
+    /// (crates/ravel-catalog/src/catalog.rs). Proves the SQL path now
+    /// contributes to per-query accounting end to end, including the
+    /// `peak_intermediate_bytes` high-water mark deliverable 2 adds.
+    #[tokio::test]
+    async fn sql_execute_records_requests_bytes_and_peak_memory() {
+        use ravel_catalog::CatalogConfig;
+        use ravel_commit::publish::RetryPolicy;
+        use ravel_commit::record::NewCommitRecord;
+        use ravel_commit::{keys, publish, record};
+        use ravel_object_store::instrument::InstrumentedStore;
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_object_store::{ObjectStoreBackend, PutOptions};
+        use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+        use ravel_types::accounting::AccountedOp;
+        use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
+        use uuid::Uuid;
+
+        let tenant = TenantId::new("acceptance-424".to_string());
+        let tenant_hash = tenant.hash();
+        let labels = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: "m".to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(&tenant, "m", &labels).expect("series id");
+        let samples: Vec<Sample> = (0..1_000)
+            .map(|i| Sample {
+                ts_ns: i,
+                value: i as f64,
+            })
+            .collect();
+
+        let writer_id = Uuid::from_u128(4_240);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let written = SegmentWriter::write(
+            vec![SeriesInput {
+                series_id,
+                labels,
+                samples,
+            }],
+            identity,
+            bounds,
+        )
+        .expect("write segment");
+
+        let new_record = NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 1,
+            ingest_hour_bucket: 0,
+        };
+        let rec = record::build(new_record).expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+
+        let inner = MemoryStore::new();
+        inner
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(&inner, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        let store = Arc::new(InstrumentedStore::new(inner));
+
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        let fetcher = SegmentFetcher::new(store.clone());
+        let log_fetcher = LogSegmentFetcher::new(store.clone());
+        let span_fetcher = SpanSegmentFetcher::new(store.clone());
+        let executor = SqlExecutor::new(
+            catalog,
+            fetcher,
+            log_fetcher,
+            span_fetcher,
+            SqlConfig::default(),
+            1 << 30,
+        );
+
+        let request = SqlRequest {
+            sql: "SELECT ts, value FROM samples".to_string(),
+            window: TimeRange {
+                start_ns: 0,
+                end_ns: 2_000,
+            },
+            min_tokens: Vec::new(),
+            now_ns: 2_000,
+            deadline: Duration::from_secs(30),
+            row_window: false,
+            max_rows: None,
+            budgets: None,
+        };
+
+        let before = store.metrics().snapshot();
+        let outcome = executor
+            .execute(tenant_hash, &request)
+            .await
+            .expect("accounted execute");
+        let after = store.metrics().snapshot();
+
+        let get_calls_diff = after.get.calls - before.get.calls;
+        let list_calls_diff = after.list.calls - before.list.calls;
+        let head_calls_diff = after.head.calls - before.head.calls;
+        let get_bytes_diff = after.get.bytes - before.get.bytes;
+
+        assert_eq!(head_calls_diff, 0, "the SQL path issues no HEAD request");
+
+        let acc = outcome.accounting;
+        assert_eq!(acc.s3_requests(AccountedOp::Get), get_calls_diff);
+        assert_eq!(acc.s3_requests(AccountedOp::List), list_calls_diff);
+        assert_eq!(acc.s3_requests(AccountedOp::Head), 0);
+        assert_eq!(acc.s3_bytes(AccountedOp::Get), get_bytes_diff);
+        assert_eq!(
+            acc.total_s3_requests(),
+            get_calls_diff + list_calls_diff + head_calls_diff
+        );
+        assert!(
+            acc.peak_intermediate_bytes > 0,
+            "the tenant accountant's reserved high-water mark must feed \
+             observe_intermediate_bytes, so this \
+             is not always zero"
+        );
+    }
+
+    /// One published metrics segment holding `count` samples at `ts_ns`
+    /// `0..count`, under a store that both counts requests and can refuse one
+    /// by key. Returns the store, the tenant hash, and the data object's key.
+    ///
+    /// The segment is written and published against the bare `MemoryStore`, so
+    /// the counters and the fault plan see only what the query does.
+    async fn one_metrics_segment(
+        tenant_name: &str,
+        count: i64,
+        plan: FaultPlan,
+    ) -> (
+        Arc<InstrumentedStore<FaultStore<MemoryStore>>>,
+        TenantHash,
+        String,
+    ) {
+        let tenant = TenantId::new(tenant_name.to_string());
+        let samples: Vec<Sample> = (0..count)
+            .map(|i| Sample {
+                ts_ns: i,
+                value: i as f64,
+            })
+            .collect();
+        let memory = MemoryStore::new();
+        let data_key = publish_metric_samples(&memory, &tenant, 1, "m", samples).await;
+        let store = Arc::new(InstrumentedStore::new(FaultStore::new(memory, plan)));
+        (store, tenant.hash(), data_key)
+    }
+
+    /// The writer every published fixture segment names.
+    const FIXTURE_WRITER: u128 = 1_376;
+
+    /// Write one series of `metric` holding `samples` as an RSEG segment of
+    /// writer sequence `writer_seq`, put it into `memory` and publish its
+    /// commit record into ingest hour 0. Returns the data object's key.
+    pub(crate) async fn publish_metric_samples(
+        memory: &MemoryStore,
+        tenant: &TenantId,
+        writer_seq: u64,
+        metric: &str,
+        samples: Vec<Sample>,
+    ) -> String {
+        let tenant_hash = tenant.hash();
+        let labels = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(tenant, metric, &labels).expect("series id");
+
+        let writer_id = Uuid::from_u128(FIXTURE_WRITER);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let written = SegmentWriter::write(
+            vec![SeriesInput {
+                series_id,
+                labels,
+                samples,
+            }],
+            identity,
+            bounds,
+        )
+        .expect("write segment");
+
+        let new_record = NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 1,
+            ingest_hour_bucket: 0,
+        };
+        put_and_publish(memory, new_record, written.bytes).await
+    }
+
+    /// Put `bytes` into `memory` as the data object `new_record` names and
+    /// publish the record. Returns the data object's key.
+    async fn put_and_publish(
+        memory: &MemoryStore,
+        new_record: NewCommitRecord,
+        bytes: bytes::Bytes,
+    ) -> String {
+        put_and_publish_with_token(memory, new_record, bytes)
+            .await
+            .0
+    }
+
+    /// [`put_and_publish`], also returning the published record's commit
+    /// token.
+    async fn put_and_publish_with_token(
+        memory: &MemoryStore,
+        new_record: NewCommitRecord,
+        bytes: bytes::Bytes,
+    ) -> (String, CommitToken) {
+        let rec = record::build(new_record).expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        memory
+            .put(&data_key, bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(memory, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        let token = record::token_for(&rec).expect("commit token");
+        (data_key, token)
+    }
+
+    /// One published RSPAN segment holding `count` spans whose `start_ts` is
+    /// `0, 100, 200, ...`, under the same instrumented store the metrics
+    /// fixture uses. Published as a real `Signal::Spans` commit record, so the
+    /// executor resolves it exactly as a production caller would.
+    async fn one_spans_segment(
+        tenant_name: &str,
+        count: i64,
+    ) -> (Arc<InstrumentedStore<FaultStore<MemoryStore>>>, TenantHash) {
+        let tenant = TenantId::new(tenant_name.to_string());
+        let tenant_hash = tenant.hash();
+        let records: Vec<SpanRecord> = (0..count)
+            .map(|i| SpanRecord {
+                trace_id: [1u8; 16],
+                span_id: [u8::try_from(i).unwrap_or(u8::MAX); 8],
+                parent_span_id: None,
+                name: "op".to_string(),
+                start_ts_ns: i * 100,
+                end_ts_ns: i * 100 + 10,
+                status_code: StatusCode::Ok,
+                status_message: None,
+                attrs: vec![("service.name".to_string(), "checkout".to_string())],
+            })
+            .collect();
+        let memory = MemoryStore::new();
+        publish_spans(&memory, tenant_hash, 1, &records).await;
+        (wrap_fixture_store(memory), tenant_hash)
+    }
+
+    /// Encode `records` as one RSPAN object of writer sequence `writer_seq`,
+    /// put it into `memory` and publish its `Signal::Spans` commit record.
+    /// Returns the data object's key.
+    pub(crate) async fn publish_spans(
+        memory: &MemoryStore,
+        tenant_hash: TenantHash,
+        writer_seq: u64,
+        records: &[SpanRecord],
+    ) -> String {
+        let identity = SpanObjectIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: *Uuid::from_u128(FIXTURE_WRITER).as_bytes(),
+            writer_epoch: 1,
+            writer_seq,
+        };
+        let mut writer = RspanWriter::new(RspanConfig::default(), identity);
+        for record in records {
+            writer.push(record.clone());
+        }
+        let bytes = writer.finish().expect("finish span object");
+
+        let min = records.iter().map(|r| r.start_ts_ns).min().expect("rows");
+        let max = records.iter().map(|r| r.end_ts_ns).max().expect("rows");
+        publish_encoded(
+            memory,
+            EncodedSegment {
+                tenant_hash,
+                signal: Signal::Spans,
+                writer_seq,
+                bytes,
+                row_count: records.len() as u64,
+                min_event_ts_ns: min,
+                max_event_ts_ns: max,
+                segment_format_version: u32::from(ravel_rspan::footer::VERSION),
+                ingest_hour_bucket: 0,
+            },
+        )
+        .await
+        .0
+    }
+
+    /// One published RLOG segment on the audit stream holding `count` records
+    /// whose `ts_ns` is `0, 100, 200, ...`. The RLOG footer carries a tenant
+    /// hash the read path checks, so the identity below names the same tenant
+    /// the query resolves as.
+    async fn one_audit_segment(
+        tenant_name: &str,
+        count: i64,
+    ) -> (Arc<InstrumentedStore<FaultStore<MemoryStore>>>, TenantHash) {
+        let tenant = TenantId::new(tenant_name.to_string());
+        let tenant_hash = tenant.hash();
+        let records: Vec<LogRecord> = (0..count).map(|i| log_record("audit", i * 100)).collect();
+        let memory = MemoryStore::new();
+        publish_log_records(&memory, tenant_hash, Signal::Audit, 1, &records).await;
+        (wrap_fixture_store(memory), tenant_hash)
+    }
+
+    /// One `INFO` record on the log stream of scope `scope`, at `ts_ns`.
+    pub(crate) fn log_record(scope: &str, ts_ns: i64) -> LogRecord {
+        LogRecord {
+            stream_id: ravel_types::logstream::log_stream_id(&[], scope, "1", &[]),
+            stream_attrs: stream_attrs_bytes(&[], scope, "1", &[]),
+            ts_ns,
+            observed_ts_ns: ts_ns,
+            severity_num: 0,
+            severity_text: "INFO".to_string(),
+            body: "query".to_string(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        }
+    }
+
+    /// Encode `records` as one RLOG object of writer sequence `writer_seq`,
+    /// put it into `memory` and publish its commit record under `signal`
+    /// (`Logs` or `Audit`). The RLOG footer carries a tenant hash the read
+    /// path checks, so the identity names `tenant_hash`. Returns the data
+    /// object's key.
+    pub(crate) async fn publish_log_records(
+        memory: &MemoryStore,
+        tenant_hash: TenantHash,
+        signal: Signal,
+        writer_seq: u64,
+        records: &[LogRecord],
+    ) -> String {
+        publish_log_records_in_hour(memory, tenant_hash, signal, writer_seq, 0, records)
+            .await
+            .0
+    }
+
+    /// [`publish_log_records`] into ingest hour `ingest_hour_bucket`, created
+    /// 1 ns into that hour. Returns the data object's key and the commit
+    /// token of the published record.
+    pub(crate) async fn publish_log_records_in_hour(
+        memory: &MemoryStore,
+        tenant_hash: TenantHash,
+        signal: Signal,
+        writer_seq: u64,
+        ingest_hour_bucket: u32,
+        records: &[LogRecord],
+    ) -> (String, CommitToken) {
+        let identity = LogObjectIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: *Uuid::from_u128(FIXTURE_WRITER).as_bytes(),
+            writer_epoch: 1,
+            writer_seq,
+        };
+        let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+        for record in records {
+            writer.push(record.clone()).expect("push log record");
+        }
+        let bytes = writer.finish().expect("finish log object");
+
+        let min = records.iter().map(|r| r.ts_ns).min().expect("rows");
+        let max = records.iter().map(|r| r.ts_ns).max().expect("rows");
+        publish_encoded(
+            memory,
+            EncodedSegment {
+                tenant_hash,
+                signal,
+                writer_seq,
+                bytes,
+                row_count: records.len() as u64,
+                min_event_ts_ns: min,
+                max_event_ts_ns: max,
+                segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+                ingest_hour_bucket,
+            },
+        )
+        .await
+    }
+
+    /// One already-encoded data object and the commit-record fields that
+    /// describe it.
+    struct EncodedSegment {
+        tenant_hash: TenantHash,
+        signal: Signal,
+        writer_seq: u64,
+        bytes: Vec<u8>,
+        row_count: u64,
+        min_event_ts_ns: i64,
+        max_event_ts_ns: i64,
+        segment_format_version: u32,
+        ingest_hour_bucket: u32,
+    }
+
+    /// Put `segment` into `memory` and publish its commit record into its
+    /// ingest hour, created 1 ns into that hour. Returns the data object's key
+    /// and the record's commit token.
+    async fn publish_encoded(
+        memory: &MemoryStore,
+        segment: EncodedSegment,
+    ) -> (String, CommitToken) {
+        const NS_PER_HOUR: i64 = 3_600 * 1_000_000_000;
+        let new_record = NewCommitRecord {
+            tenant_hash: segment.tenant_hash,
+            signal: segment.signal,
+            shard: 0,
+            writer_id: Uuid::from_u128(FIXTURE_WRITER),
+            writer_epoch: 1,
+            writer_seq: segment.writer_seq,
+            object_size: segment.bytes.len() as u64,
+            content_hash: *blake3::hash(&segment.bytes).as_bytes(),
+            sample_count: segment.row_count,
+            series_count: 0,
+            min_event_ts_ns: segment.min_event_ts_ns,
+            max_event_ts_ns: segment.max_event_ts_ns,
+            min_ingest_ts_ns: segment.min_event_ts_ns,
+            max_ingest_ts_ns: segment.max_event_ts_ns,
+            segment_format_version: segment.segment_format_version,
+            created_unix_ns: i64::from(segment.ingest_hour_bucket) * NS_PER_HOUR + 1,
+            ingest_hour_bucket: segment.ingest_hour_bucket,
+        };
+        put_and_publish_with_token(memory, new_record, bytes::Bytes::from(segment.bytes)).await
+    }
+
+    /// `memory` under the counting, fault-injecting wrapper every fixture
+    /// store uses, with no fault planned.
+    pub(crate) fn wrap_fixture_store(
+        memory: MemoryStore,
+    ) -> Arc<InstrumentedStore<FaultStore<MemoryStore>>> {
+        Arc::new(InstrumentedStore::new(FaultStore::new(
+            memory,
+            FaultPlan::empty(),
+        )))
+    }
+
+    pub(crate) fn executor_over(
+        store: Arc<InstrumentedStore<FaultStore<MemoryStore>>>,
+    ) -> SqlExecutor {
+        executor_with(store, SqlConfig::default())
+    }
+
+    /// An executor over `store` under `config`, with its own catalog handle.
+    pub(crate) fn executor_with(
+        store: Arc<dyn ObjectStoreBackend>,
+        config: SqlConfig,
+    ) -> SqlExecutor {
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(store.clone()),
+            LogSegmentFetcher::new(store.clone()),
+            SpanSegmentFetcher::new(store),
+            config,
+            1 << 30,
+        )
+    }
+
+    /// The `ts` column of a metrics result, as raw nanoseconds.
+    fn ts_values(output: &QueryOutput) -> Vec<i64> {
+        ts_column_values(output, "ts")
+    }
+
+    /// The named event-time column of a result, as raw nanoseconds. Every
+    /// table's event-time column is `Timestamp(Nanosecond, None)`, so the same
+    /// reader serves `ts`, `start_ts`, and `ts_ns`.
+    pub(crate) fn ts_column_values(output: &QueryOutput, name: &str) -> Vec<i64> {
+        let mut values = Vec::new();
+        for batch in output.batches() {
+            let column = batch.column_by_name(name).expect("event-time column");
+            let ts = column
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("ts is Timestamp(Nanosecond)");
+            values.extend(ts.values().iter().copied());
+        }
+        values
+    }
+
+    /// A request carrying the T1 defaults off: the struct names no table, so
+    /// the statement is the only thing that selects one.
+    pub(crate) fn sql_request(sql: &str, window: TimeRange) -> SqlRequest {
+        SqlRequest {
+            sql: sql.to_string(),
+            window,
+            min_tokens: Vec::new(),
+            now_ns: 2_000,
+            deadline: Duration::from_secs(30),
+            row_window: false,
+            max_rows: None,
+            budgets: None,
+        }
+    }
+
+    /// Prerequisite 2. Segment pruning is widen-only, so ONE segment whose rows
+    /// straddle the window contributes every row it holds: the statement itself
+    /// carries no time predicate, and the request window only bounded which
+    /// segments were listed. `row_window` is what turns that window into a row
+    /// filter, and the two executions below differ in nothing else.
+    ///
+    /// Each run gets its own executor over the one shared store, so both
+    /// resolve and fetch cold and their request counts are comparable: reusing
+    /// one executor would let the second run read the first's caches, and the
+    /// second run's lower count would say nothing about pruning.
+    #[tokio::test]
+    async fn row_window_excludes_rows_outside_range_inside_overlapping_segment() {
+        let (store, tenant_hash, _data_key) =
+            one_metrics_segment("row-window-1376", 1_000, FaultPlan::empty()).await;
+
+        let window = TimeRange {
+            start_ns: 200,
+            end_ns: 500,
+        };
+        let base = sql_request("SELECT ts, value FROM samples", window);
+
+        let before = store.metrics().snapshot();
+        let unfiltered = executor_over(store.clone())
+            .execute(tenant_hash, &base)
+            .await
+            .expect("execute without the row window");
+        let after_unfiltered = store.metrics().snapshot();
+        assert_eq!(
+            unfiltered.stats.segments, 1,
+            "the fixture is one segment straddling the window"
+        );
+        assert_eq!(
+            unfiltered.output.num_rows(),
+            1_000,
+            "widen-only pruning returns the whole overlapping segment"
+        );
+        assert_eq!(unfiltered.stats.window_predicate, None);
+
+        let filtered = executor_over(store.clone())
+            .execute(
+                tenant_hash,
+                &SqlRequest {
+                    row_window: true,
+                    ..base.clone()
+                },
+            )
+            .await
+            .expect("execute with the row window");
+        let after_filtered = store.metrics().snapshot();
+
+        // The injected filter is pushed down like any predicate the statement
+        // itself carried, so pruning with the row window is a SUBSET of pruning
+        // without it: never more work, and sound either way because the
+        // provider reports `Inexact` and the filter is re-applied above the
+        // scan. Both counts are pinned exactly, so a run that started reading
+        // more (or that pruned an object it still needed) fails here rather
+        // than passing an inequality that holds for the wrong reason.
+        let unfiltered_gets = after_unfiltered.get.calls - before.get.calls;
+        let filtered_gets = after_filtered.get.calls - after_unfiltered.get.calls;
+        assert!(
+            filtered_gets <= unfiltered_gets,
+            "the row window must never make the run read more: \
+             {filtered_gets} > {unfiltered_gets}"
+        );
+        assert_eq!(unfiltered_gets, ROW_WINDOW_RUN_GETS);
+        assert_eq!(filtered_gets, ROW_WINDOW_RUN_GETS);
+
+        // What was applied, before what it did: the reported text is the
+        // display of the expression the rewrite built, not an independently
+        // formatted description of it, and it is pinned to an exact string so a
+        // changed bound cannot leave the report intact.
+        assert_eq!(
+            filtered.stats.window_predicate.as_deref(),
+            Some(
+                window_filter_expr(&TableReference::bare("samples"), "ts", window)
+                    .to_string()
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            filtered.stats.window_predicate.as_deref(),
+            Some(ROW_WINDOW_200_500_PREDICATE)
+        );
+
+        assert_eq!(filtered.output.num_rows(), 300);
+        assert_eq!(
+            unfiltered.output.num_rows() - filtered.output.num_rows(),
+            700,
+            "exactly the rows outside [200, 500) are excluded"
+        );
+
+        let mut kept = ts_values(&filtered.output);
+        kept.sort_unstable();
+        assert_eq!(kept.len(), 300);
+        assert_eq!(kept.first().copied(), Some(200), "start is inclusive");
+        assert_eq!(kept.last().copied(), Some(499), "end is exclusive");
+        assert_eq!(kept, (200..500).collect::<Vec<i64>>());
+    }
+
+    /// Every GET one whole `SELECT ts, value FROM samples` run issues against
+    /// the one-segment fixture from a cold executor: the resolve's
+    /// [`EXPLAIN_RESOLVE_GETS`] catalog reads plus the data object's own. The
+    /// same figure holds with and without the row window on this fixture, which
+    /// is the point: one segment overlaps the window, so the tightened pruning
+    /// the injected filter allows cannot drop it, and the run still reads it
+    /// whole and filters by row.
+    const ROW_WINDOW_RUN_GETS: u64 = 3;
+
+    /// The exact predicate text a `[200, 500)` row window on `samples` reports,
+    /// pinned so a change to the rendering (a dropped qualifier, a literal
+    /// printed in another unit) fails here rather than silently changing what
+    /// `SqlStats::window_predicate` promises a caller.
+    const ROW_WINDOW_200_500_PREDICATE: &str = "samples.ts >= TimestampNanosecond(200, None) AND \
+         samples.ts < TimestampNanosecond(500, None)";
+
+    /// Finding 1. A subquery embedded in an expression is not a plan child, so
+    /// a plain `transform_up` never reaches its `TableScan`: the outer scan
+    /// would be windowed, the inner one would read the whole overlapping
+    /// segment, and `window_predicate` would still report the window as
+    /// applied. Both statements below are answerable only if BOTH scans are
+    /// filtered.
+    #[tokio::test]
+    async fn row_window_reaches_scans_inside_expression_subqueries() {
+        let (store, tenant_hash, _data_key) =
+            one_metrics_segment("row-window-subquery-1376", 1_000, FaultPlan::empty()).await;
+        let executor = executor_over(store);
+
+        let window = TimeRange {
+            start_ns: 200,
+            end_ns: 500,
+        };
+
+        // value == ts, so the windowed inner AVG is (200 + 499) / 2 = 349.5 and
+        // the outer scan keeps ts 350..500. Unwindowed, the inner AVG over the
+        // whole segment is 499.5 and the outer result is empty.
+        let scalar = executor
+            .execute(
+                tenant_hash,
+                &SqlRequest {
+                    row_window: true,
+                    ..sql_request(
+                        "SELECT ts FROM samples WHERE value > (SELECT avg(value) FROM samples)",
+                        window,
+                    )
+                },
+            )
+            .await
+            .expect("execute the scalar-subquery statement under the row window");
+        assert_eq!(
+            scalar.output.num_rows(),
+            150,
+            "the windowed inner average is 349.5, so ts 350..500 survives"
+        );
+        let mut kept = ts_values(&scalar.output);
+        kept.sort_unstable();
+        assert_eq!(kept.first().copied(), Some(350));
+        assert_eq!(kept.last().copied(), Some(499));
+    }
+
+    /// The IN-subquery shape of [`row_window_reaches_scans_inside_expression_subqueries`].
+    /// The inner select shifts every value down by 100, so its windowed rows
+    /// (values 200..500) yield 100..400 and the outer windowed scan keeps
+    /// ts 200..400: 200 rows. An unwindowed inner scan yields -100..900, which
+    /// covers the whole outer window and keeps 300 rows.
+    ///
+    /// FLIP: `plan.transform_up(` in place of
+    /// `plan.transform_up_with_subqueries(` in `apply_row_window` returns 300
+    /// rows, failing the `num_rows() == 200` assertion.
+    #[tokio::test]
+    async fn row_window_reaches_scans_inside_in_subqueries() {
+        let (store, tenant_hash, _data_key) =
+            one_metrics_segment("row-window-in-subquery-1376", 1_000, FaultPlan::empty()).await;
+        let in_list = executor_over(store)
+            .execute(
+                tenant_hash,
+                &SqlRequest {
+                    row_window: true,
+                    ..sql_request(
+                        "SELECT ts FROM samples WHERE value IN (SELECT value - 100 FROM samples)",
+                        TimeRange {
+                            start_ns: 200,
+                            end_ns: 500,
+                        },
+                    )
+                },
+            )
+            .await
+            .expect("execute the IN-subquery statement under the row window");
+        assert_eq!(
+            in_list.output.num_rows(),
+            200,
+            "the window bounds the inner scan too, so ts 200..400 survives"
+        );
+        let mut kept = ts_values(&in_list.output);
+        kept.sort_unstable();
+        assert_eq!(kept.first().copied(), Some(200));
+        assert_eq!(kept.last().copied(), Some(399));
+    }
+
+    /// Prerequisite 3. `explain` resolves, admits, and plans; it must never
+    /// open a data object. The fault rule below refuses any GET whose key names
+    /// an RSEG, which is exactly the data objects: if `explain` read one it
+    /// would fire.
+    #[tokio::test]
+    async fn explain_resolves_without_issuing_data_gets() {
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("data object read in explain".to_string()),
+            )
+            .with_key_contains(".rseg")
+            .with_occurrence(Occurrence::Nth(1)),
+        );
+        let (store, tenant_hash, data_key) = one_metrics_segment("explain-1376", 1_000, plan).await;
+        assert!(
+            data_key.ends_with(".rseg"),
+            "the rule's key pattern must match the data object: {data_key}"
+        );
+        let executor = executor_over(store.clone());
+
+        let request = SqlRequest {
+            row_window: true,
+            ..sql_request(
+                "SELECT ts, value FROM samples",
+                TimeRange {
+                    start_ns: 200,
+                    end_ns: 500,
+                },
+            )
+        };
+
+        let before = store.metrics().snapshot();
+        let report = executor
+            .explain(tenant_hash, &request)
+            .await
+            .expect("explain");
+        let after = store.metrics().snapshot();
+
+        assert_eq!(
+            store.inner().fault_count(Op::Get, FaultKind::Permanent),
+            0,
+            "explain opened a data object"
+        );
+        assert_eq!(after.head.calls - before.head.calls, 0);
+        assert_eq!(
+            after.list.calls - before.list.calls,
+            EXPLAIN_RESOLVE_LISTS,
+            "explain's LIST count is the resolve's alone"
+        );
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            EXPLAIN_RESOLVE_GETS,
+            "explain's GET count is the resolve's commit-record reads alone"
+        );
+
+        assert_eq!(report.target, TargetSignal::Metrics);
+        assert_eq!(
+            report.schema.fields().len(),
+            2,
+            "the effective schema is the statement's projection"
+        );
+        assert_eq!(report.segments_resolved, 1);
+        assert_eq!(
+            report.segments_admitted + report.segments_recent_exempt,
+            1,
+            "every resolved segment is either admitted or exempt"
+        );
+        assert!(
+            report.unbounded_components.is_empty(),
+            "the estimator bounds a metrics query fully"
+        );
+        assert_eq!(
+            report.window_predicate.as_deref(),
+            Some(ROW_WINDOW_200_500_PREDICATE)
+        );
+        assert!(
+            report.plan_text.contains("RsegScanExec"),
+            "the report carries the physical plan: {}",
+            report.plan_text
+        );
+
+        // Non-vacuity: the rule is armed and it does match this fixture's data
+        // object. Executing the same request fires it, so the zero above is
+        // explain's doing and not a pattern that never matched.
+        let _ = executor.execute(tenant_hash, &request).await;
+        assert_eq!(
+            store.inner().fault_count(Op::Get, FaultKind::Permanent),
+            1,
+            "executing the same request does open the data object"
+        );
+    }
+
+    /// The resolve's own request counts against the one-segment fixture: two
+    /// commit-record listings and two catalog object reads, none of them a data
+    /// object (the fault rule in the test proves that part). Pinned exactly so
+    /// a regression that made `explain` read more than the catalog needs fails
+    /// here, rather than becoming a larger number nobody compares.
+    const EXPLAIN_RESOLVE_LISTS: u64 = 2;
+    const EXPLAIN_RESOLVE_GETS: u64 = 2;
+
+    /// A snapshot invalidated under a running statement: the first attempt's
+    /// data-object GET finds the object gone, so `run` resolves again through a
+    /// fresh handle. A caller that drops the execute future during the second
+    /// attempt reads, through its live view, the spend of both attempts.
+    ///
+    /// FLIP: make `LiveAccounting::install` replace the held handle instead of
+    /// pushing one, and the view reads the held attempt's 1 request (one
+    /// listing, no get) instead of 6.
+    #[tokio::test]
+    async fn live_accounting_sums_both_attempts_of_a_retry() {
+        let (store, tenant_hash, data_key) = one_metrics_segment(
+            "live-retry-1456",
+            1_000,
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+                    .with_key_contains(".rseg")
+                    .with_occurrence(Occurrence::Nth(1)),
+            ),
+        )
+        .await;
+        assert!(
+            data_key.ends_with(".rseg"),
+            "the rule names the data object"
+        );
+        // The first attempt lists twice, so the second attempt's first
+        // listing is the statement's third.
+        let gate = store
+            .inner()
+            .hold(Op::List, None, Occurrence::Nth(EXPLAIN_RESOLVE_LISTS + 1));
+        let executor = executor_over(store.clone());
+
+        let request = sql_request(
+            "SELECT ts, value FROM samples",
+            TimeRange {
+                start_ns: 0,
+                end_ns: 2_000,
+            },
+        );
+        let live = LiveAccounting::new();
+        let mut run = Box::pin(executor.execute_accounted(tenant_hash, &request, &live));
+
+        tokio::select! {
+            _ = &mut run => panic!("the statement is held inside the second attempt's listing"),
+            () = gate.wait_until_held(1) => {}
+        }
+        assert_eq!(gate.held_count(), 1);
+        // The retry happened because the fault fired, not because of a race.
+        assert_eq!(
+            store.inner().fault_count(Op::Get, FaultKind::NotFoundBlip),
+            1
+        );
+
+        drop(run);
+
+        // The discarded attempt in full: its two listings and three gets (the
+        // catalog HEAD read, the commit-record read, and the 404'd data-object
+        // GET). Plus the held attempt's one listing, the only request it had
+        // issued when the gate held it: the replacing view reads that 1 alone.
+        let spent = live.snapshot();
+        assert_eq!(
+            spent.s3_requests(AccountedOp::List),
+            EXPLAIN_RESOLVE_LISTS + 1
+        );
+        assert_eq!(
+            spent.s3_requests(AccountedOp::Get),
+            EXPLAIN_RESOLVE_GETS + 1
+        );
+        assert_eq!(spent.total_s3_requests(), 6);
+    }
+
+    /// Finding 2. `explain` never opens a data object, but it does issue the
+    /// resolve's catalog reads, so it needs the same wall bound `execute` has.
+    /// A hold gate on the first commit-record GET stops the resolve inside the
+    /// call and never yields (a `MemoryStore` answers every read, so nothing
+    /// else here is slow), and the clock is the runtime's injected one: the
+    /// test parks, tokio advances to the timer, and no wall time passes.
+    #[tokio::test(start_paused = true)]
+    async fn explain_honors_the_request_deadline() {
+        let (store, tenant_hash, _data_key) =
+            one_metrics_segment("explain-deadline-1376", 1_000, FaultPlan::empty()).await;
+        let held = store
+            .inner()
+            .hold(Op::Get, Some(".cmt".to_string()), Occurrence::Nth(1));
+        let executor = executor_over(store);
+
+        let request = sql_request(
+            "SELECT ts, value FROM samples",
+            TimeRange {
+                start_ns: 0,
+                end_ns: 2_000,
+            },
+        );
+        let request = SqlRequest {
+            deadline: Duration::from_millis(50),
+            ..request
+        };
+
+        // The outer guard is 1200x the request deadline and exists only so a
+        // regression that drops the wrapper fails here instead of hanging the
+        // suite. Under the paused clock both are virtual: the runtime advances
+        // to the earliest timer, which is the 50 ms one whenever it is armed.
+        let err = tokio::time::timeout(
+            Duration::from_secs(60),
+            executor.explain(tenant_hash, &request),
+        )
+        .await
+        .expect("explain must return under its own deadline rather than run unbounded")
+        .expect_err("the held commit-record GET must trip the deadline");
+        assert!(
+            matches!(err, SqlError::DeadlineExceeded { millis: 50 }),
+            "explain must report the typed deadline error: {err:?}"
+        );
+
+        // Non-vacuity: the gate matched exactly one call, and it is the
+        // commit-record GET, so the deadline tripped on the resolve being held
+        // and not on some unrelated stall.
+        let details = held.held_details();
+        assert_eq!(details.len(), 1, "the gate held exactly one call");
+        assert_eq!(details[0].1, Op::Get);
+        assert!(
+            details[0].2.ends_with(".cmt"),
+            "the held call is the commit-record GET: {}",
+            details[0].2
+        );
+    }
+
+    /// Prerequisite 4. The cap stops the stream at `max_rows + 1` rows: the
+    /// extra row is the evidence that more existed, reported as `row_cap_hit`.
+    #[tokio::test]
+    async fn max_rows_stops_stream_after_cap_plus_one() {
+        let (store, tenant_hash, _data_key) =
+            one_metrics_segment("max-rows-1376", 1_000, FaultPlan::empty()).await;
+        let executor = executor_over(store);
+
+        let base = sql_request(
+            "SELECT ts, value FROM samples",
+            TimeRange {
+                start_ns: 0,
+                end_ns: 2_000,
+            },
+        );
+
+        let capped = executor
+            .execute(
+                tenant_hash,
+                &SqlRequest {
+                    max_rows: Some(10),
+                    ..base.clone()
+                },
+            )
+            .await
+            .expect("execute under a row cap");
+        assert_eq!(
+            capped.output.num_rows(),
+            11,
+            "the cap emits max_rows + 1 rows and no more"
+        );
+        assert!(
+            capped.stats.row_cap_hit,
+            "the cap-plus-one'th row existed, so the result was cut"
+        );
+
+        let uncut = executor
+            .execute(
+                tenant_hash,
+                &SqlRequest {
+                    max_rows: Some(5_000),
+                    ..base.clone()
+                },
+            )
+            .await
+            .expect("execute under a cap the result fits inside");
+        assert_eq!(uncut.output.num_rows(), 1_000);
+        assert!(
+            !uncut.stats.row_cap_hit,
+            "the whole result fit inside the cap"
+        );
+
+        let uncapped = executor
+            .execute(tenant_hash, &base)
+            .await
+            .expect("execute with no cap");
+        assert_eq!(uncapped.output.num_rows(), 1_000);
+        assert!(!uncapped.stats.row_cap_hit);
+
+        // The two boundaries, where an off-by-one lives. At `max_rows` exactly
+        // equal to the result size the stream drains and nothing was cut: the
+        // cap-plus-one'th row does not exist. One row lower, the extra row does
+        // exist, so the same `max_rows + 1` rows come back and the flag is set.
+        // The two cases return the SAME row count (1_000) and differ only in
+        // the flag, which is what makes the flag the only usable signal.
+        let exact = executor
+            .execute(
+                tenant_hash,
+                &SqlRequest {
+                    max_rows: Some(1_000),
+                    ..base.clone()
+                },
+            )
+            .await
+            .expect("execute under a cap equal to the result size");
+        assert_eq!(exact.output.num_rows(), 1_000);
+        assert!(
+            !exact.stats.row_cap_hit,
+            "a cap equal to the result size cuts nothing"
+        );
+
+        let one_short = executor
+            .execute(
+                tenant_hash,
+                &SqlRequest {
+                    max_rows: Some(999),
+                    ..base.clone()
+                },
+            )
+            .await
+            .expect("execute under a cap one row below the result size");
+        assert_eq!(
+            one_short.output.num_rows(),
+            1_000,
+            "max_rows + 1 rows, which here is the whole result"
+        );
+        assert!(
+            one_short.stats.row_cap_hit,
+            "the 1000th row is the cap-plus-one'th, so the result is reported cut"
+        );
+    }
+
+    /// Finding 6. The window column is per table, and only `samples` was
+    /// covered. `spans` filters on `start_ts` and `audit` on `ts_ns`, so a
+    /// wrong entry in [`window_ts_column`] for either would plan a predicate on
+    /// a column that is not in scope, or on the wrong one. Both fixtures
+    /// straddle the window, so widen-only pruning returns every row without
+    /// `row_window` and exactly the in-window rows with it.
+    #[tokio::test]
+    async fn row_window_applies_to_spans_start_ts_and_audit_ts_ns() {
+        let window = TimeRange {
+            start_ns: 200,
+            end_ns: 500,
+        };
+
+        let (spans_store, spans_tenant) = one_spans_segment("row-window-spans-1376", 10).await;
+        let spans_sql = "SELECT start_ts FROM spans";
+        let spans_base = sql_request(spans_sql, window);
+
+        let spans_unfiltered = executor_over(spans_store.clone())
+            .execute(spans_tenant, &spans_base)
+            .await
+            .expect("execute spans without the row window");
+        assert_eq!(
+            spans_unfiltered.output.num_rows(),
+            10,
+            "widen-only pruning returns the whole overlapping span segment"
+        );
+        assert_eq!(spans_unfiltered.stats.window_predicate, None);
+
+        let spans_filtered = executor_over(spans_store)
+            .execute(
+                spans_tenant,
+                &SqlRequest {
+                    row_window: true,
+                    ..spans_base
+                },
+            )
+            .await
+            .expect("execute spans with the row window");
+        assert_eq!(
+            spans_filtered.stats.window_predicate.as_deref(),
+            Some(
+                window_filter_expr(&TableReference::bare("spans"), "start_ts", window)
+                    .to_string()
+                    .as_str()
+            )
+        );
+        let mut spans_kept = ts_column_values(&spans_filtered.output, "start_ts");
+        spans_kept.sort_unstable();
+        assert_eq!(
+            spans_kept,
+            vec![200, 300, 400],
+            "exactly the spans starting inside [200, 500)"
+        );
+        assert_eq!(
+            spans_unfiltered.output.num_rows() - spans_filtered.output.num_rows(),
+            7,
+            "the seven spans starting outside the window are excluded"
+        );
+
+        let (audit_store, audit_tenant) = one_audit_segment("row-window-audit-1376", 10).await;
+        let audit_sql = "SELECT ts_ns FROM audit";
+        let audit_base = sql_request(audit_sql, window);
+
+        let audit_unfiltered = executor_over(audit_store.clone())
+            .execute(audit_tenant, &audit_base)
+            .await
+            .expect("execute audit without the row window");
+        assert_eq!(
+            audit_unfiltered.output.num_rows(),
+            10,
+            "widen-only pruning returns the whole overlapping audit segment"
+        );
+        assert_eq!(audit_unfiltered.stats.window_predicate, None);
+
+        let audit_filtered = executor_over(audit_store)
+            .execute(
+                audit_tenant,
+                &SqlRequest {
+                    row_window: true,
+                    ..audit_base
+                },
+            )
+            .await
+            .expect("execute audit with the row window");
+        assert_eq!(
+            audit_filtered.stats.window_predicate.as_deref(),
+            Some(
+                window_filter_expr(&TableReference::bare("audit"), "ts_ns", window)
+                    .to_string()
+                    .as_str()
+            )
+        );
+        let mut audit_kept = ts_column_values(&audit_filtered.output, "ts_ns");
+        audit_kept.sort_unstable();
+        assert_eq!(
+            audit_kept,
+            vec![200, 300, 400],
+            "exactly the audit records inside [200, 500)"
+        );
+        assert_eq!(
+            audit_unfiltered.output.num_rows() - audit_filtered.output.num_rows(),
+            7,
+            "the seven audit records outside the window are excluded"
+        );
+    }
+
+    /// The row window on the two RLOG tables that answer the injected filter
+    /// differently. A local `logs` scan reports the pure `ts` bound `Exact`,
+    /// so no residual runs and the reader's `Predicate::TsRange` re-check is
+    /// the only row filter; `alerts` reports it `Inexact` and DataFusion
+    /// re-applies it. One segment straddles the window, with records at
+    /// `0, 100, ..., 900` plus `199` and `499` either side of the edges: 12
+    /// rows, of which exactly `200, 300, 400, 499` are inside `[200, 500)`.
+    ///
+    /// FLIP (logs): `Operator::Lt => tighten_hi(out, ns)` in
+    /// `logs_pushdown::apply_ts_bound`, taking `ts < 500` as `ts <= 500`,
+    /// also returns the record at 500.
+    /// FLIP (alerts): `TargetSignal::Alerts => None` in `window_ts_column`
+    /// refuses the windowed `alerts` statement as `RowWindowUnsupported`.
+    #[tokio::test]
+    async fn row_window_applies_to_logs_ts_and_alerts_ts_ns() {
+        let window = TimeRange {
+            start_ns: 200,
+            end_ns: 500,
+        };
+        let mut stamps: Vec<i64> = (0..10).map(|i| i * 100).collect();
+        stamps.extend([199, 499]);
+        stamps.sort_unstable();
+
+        for (signal, table, ts_col) in [
+            (Signal::Logs, "logs", "ts"),
+            (Signal::Alerts, "alerts", "ts_ns"),
+        ] {
+            let tenant_hash = TenantId::new(format!("row-window-{table}-1409")).hash();
+            let records: Vec<LogRecord> = stamps.iter().map(|&ts| log_record(table, ts)).collect();
+            let memory = MemoryStore::new();
+            publish_log_records(&memory, tenant_hash, signal, 1, &records).await;
+            let store = wrap_fixture_store(memory);
+            let base = sql_request(&format!("SELECT {ts_col} FROM {table}"), window);
+
+            let unfiltered = executor_over(store.clone())
+                .execute(tenant_hash, &base)
+                .await
+                .unwrap_or_else(|e| panic!("execute {table} without the row window: {e}"));
+            assert_eq!(unfiltered.output.num_rows(), 12, "{table}");
+
+            let filtered = executor_over(store)
+                .execute(
+                    tenant_hash,
+                    &SqlRequest {
+                        row_window: true,
+                        ..base
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("execute {table} with the row window: {e}"));
+            assert_eq!(
+                filtered.stats.window_predicate.as_deref(),
+                Some(
+                    window_filter_expr(&TableReference::bare(table), ts_col, window)
+                        .to_string()
+                        .as_str()
+                ),
+                "{table}"
+            );
+            let mut kept = ts_column_values(&filtered.output, ts_col);
+            kept.sort_unstable();
+            assert_eq!(kept, vec![200, 300, 400, 499], "{table}");
+            assert_eq!(filtered.output.num_rows(), 4, "{table}");
+        }
+    }
+
+    /// The pinned plan entries take no row window, so a pinned resolve of a
+    /// request that sets one is refused typed, before any store request,
+    /// instead of planning rows outside the window.
+    ///
+    /// FLIP: removing the `req.row_window` refusal from
+    /// `resolve_pinned_tables` resolves the snapshot and returns `Ok`.
+    #[tokio::test]
+    async fn a_pinned_resolve_refuses_a_row_window() {
+        let (store, tenant_hash, _data_key) =
+            one_metrics_segment("row-window-pinned-1409", 10, FaultPlan::empty()).await;
+        let executor = executor_over(store.clone());
+        let req = SqlRequest {
+            row_window: true,
+            ..sql_request(
+                "SELECT ts FROM samples",
+                TimeRange {
+                    start_ns: 2,
+                    end_ns: 5,
+                },
+            )
+        };
+        let before = store.metrics().snapshot();
+        let single = executor
+            .resolve_pinned(tenant_hash, &req, &QueryAccounting::new())
+            .await;
+        assert!(
+            matches!(single, Err(SqlError::RowWindowNotPinned)),
+            "{:?}",
+            single.err()
+        );
+        let lanes = executor
+            .resolve_pinned_lanes(tenant_hash, &req, &QueryAccounting::new())
+            .await;
+        assert!(
+            matches!(lanes, Err(SqlError::RowWindowNotPinned)),
+            "{:?}",
+            lanes.err()
+        );
+        let after = store.metrics().snapshot();
+        assert_eq!(after.get.calls, before.get.calls);
+        assert_eq!(after.list.calls, before.list.calls);
+        assert_eq!(
+            SqlError::RowWindowNotPinned.class(),
+            crate::error::ErrorClass::BadRequest
+        );
+
+        let unwindowed = executor
+            .resolve_pinned(
+                tenant_hash,
+                &SqlRequest {
+                    row_window: false,
+                    ..req
+                },
+                &QueryAccounting::new(),
+            )
+            .await;
+        assert!(unwindowed.is_ok(), "{:?}", unwindowed.err());
+    }
+
+    /// Every signal table reports the budgets its scan checked: the request's
+    /// lowered budgets when it carries some, the executor's configuration when
+    /// it does not, and one check per data object fetched.
+    ///
+    /// FLIP: a constant `budgets` field (or one read from the server config
+    /// instead of the effective one) reports the same limits for both runs
+    /// below; a table whose scan carries no budget reports `None`.
+    #[tokio::test]
+    async fn stats_report_which_budgets_each_table_enforces() {
+        let tenant = TenantId::new("stats-budgets-1409".to_string());
+        let tenant_hash = tenant.hash();
+        let memory = MemoryStore::new();
+        let samples: Vec<Sample> = (0..4)
+            .map(|i| Sample {
+                ts_ns: i * 100,
+                value: i as f64,
+            })
+            .collect();
+        publish_metric_samples(&memory, &tenant, 1, "m", samples).await;
+        let logs: Vec<LogRecord> = (0..4).map(|i| log_record("logs", i * 100)).collect();
+        publish_log_records(&memory, tenant_hash, Signal::Logs, 2, &logs).await;
+        publish_log_records(&memory, tenant_hash, Signal::Audit, 3, &logs).await;
+        publish_log_records(&memory, tenant_hash, Signal::Alerts, 4, &logs).await;
+        let spans: Vec<SpanRecord> = (0..4)
+            .map(|i| SpanRecord {
+                trace_id: [1u8; 16],
+                span_id: [u8::try_from(i).unwrap_or(u8::MAX); 8],
+                parent_span_id: None,
+                name: "op".to_string(),
+                start_ts_ns: i * 100,
+                end_ts_ns: i * 100 + 10,
+                status_code: StatusCode::Ok,
+                status_message: None,
+                attrs: vec![("service.name".to_string(), "checkout".to_string())],
+            })
+            .collect();
+        publish_spans(&memory, tenant_hash, 5, &spans).await;
+        let store = wrap_fixture_store(memory);
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: 1_000,
+        };
+        let server = EngineConfig::default();
+        let lowered = RequestBudgets {
+            max_bytes_scanned: Some(ByteLimit::Bounded(1 << 30)),
+            max_store_requests: Some(RequestLimit::Bounded(64)),
+            ..Default::default()
+        };
+
+        for (sql, tables) in [
+            ("SELECT * FROM samples", &["samples"][..]),
+            ("SELECT * FROM logs", &["logs"][..]),
+            ("SELECT * FROM spans", &["spans"][..]),
+            ("SELECT * FROM alerts", &["alerts"][..]),
+            ("SELECT * FROM audit", &["audit"][..]),
+            (
+                "SELECT s.ts FROM samples s JOIN logs l ON s.ts = l.ts",
+                &["samples", "logs"][..],
+            ),
+        ] {
+            for budgets in [None, Some(lowered)] {
+                let mut request = sql_request(sql, window);
+                request.budgets = budgets;
+                let outcome = executor_over(store.clone())
+                    .execute(tenant_hash, &request)
+                    .await
+                    .unwrap_or_else(|e| panic!("{sql}: {e}"));
+                let (bytes, requests) = match &budgets {
+                    None => (server.max_bytes_scanned, server.max_s3_requests),
+                    Some(_) => (ByteLimit::Bounded(1 << 30), RequestLimit::Bounded(64)),
+                };
+                let reported: Vec<(&str, Option<EnforcedBudgets>)> = outcome
+                    .signals
+                    .iter()
+                    .map(|signal| (signal.table, signal.budgets))
+                    .collect();
+                let expected: Vec<(&str, Option<EnforcedBudgets>)> = tables
+                    .iter()
+                    .map(|&table| {
+                        (
+                            table,
+                            Some(EnforcedBudgets {
+                                max_bytes_scanned: bytes,
+                                max_store_requests: requests,
+                                checks: 1,
+                            }),
+                        )
+                    })
+                    .collect();
+                assert_eq!(reported, expected, "{sql} under {budgets:?}");
+            }
+        }
+    }
+
+    /// A [`DeclaredColumnSource`] declaring nothing that records the instant
+    /// each lookup was asked at.
+    #[derive(Default)]
+    struct RecordingDeclaredColumns {
+        declared_at: std::sync::Mutex<Vec<i64>>,
+        key_index_at: std::sync::Mutex<Vec<i64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DeclaredColumnSource for RecordingDeclaredColumns {
+        async fn declared_columns(&self, _tenant: TenantHash, now_ns: i64) -> Vec<DeclaredColumn> {
+            self.declared_at.lock().expect("declared lock").push(now_ns);
+            Vec::new()
+        }
+
+        async fn key_index(
+            &self,
+            _tenant: TenantHash,
+            now_ns: i64,
+        ) -> crate::declared::KeyIndexDeclaration {
+            self.key_index_at
+                .lock()
+                .expect("key index lock")
+                .push(now_ns);
+            crate::declared::KeyIndexDeclaration::default()
+        }
+    }
+
+    const CLOCKS_NS_PER_HOUR: i64 = 3_600_000_000_000;
+    /// The later page's own call: 10h30m.
+    const CLOCKS_CALLER_NS: i64 = 10 * CLOCKS_NS_PER_HOUR + 1_800_000_000_000;
+    /// Page one's resolve instant: 5h30m. With the default 5-minute clock
+    /// skew allowance its listing ends at ingest hour 5.
+    const CLOCKS_RESOLVE_NS: i64 = 5 * CLOCKS_NS_PER_HOUR + 1_800_000_000_000;
+    const CLOCKS_EARLY_TS: i64 = 2 * CLOCKS_NS_PER_HOUR + 5;
+    const CLOCKS_LATE_TS: i64 = 8 * CLOCKS_NS_PER_HOUR + 5;
+
+    /// One logs record in ingest hour 2 and one in ingest hour 8, an executor
+    /// over them reading `source`, and a `SELECT ts FROM logs` over
+    /// `[0, CLOCKS_CALLER_NS]` whose `now_ns` is `CLOCKS_CALLER_NS`.
+    async fn two_clock_fixture(
+        name: &str,
+        source: &Arc<RecordingDeclaredColumns>,
+    ) -> (SqlExecutor, TenantHash, SqlRequest) {
+        let tenant_hash = TenantId::new(name).hash();
+        let memory = MemoryStore::new();
+        for (seq, hour, ts) in [(1, 2, CLOCKS_EARLY_TS), (2, 8, CLOCKS_LATE_TS)] {
+            publish_log_records_in_hour(
+                &memory,
+                tenant_hash,
+                Signal::Logs,
+                seq,
+                hour,
+                &[log_record("logs", ts)],
+            )
+            .await;
+        }
+        let source: Arc<dyn DeclaredColumnSource> = source.clone();
+        let executor =
+            executor_over(wrap_fixture_store(memory)).with_declared_column_source(source);
+        let request = SqlRequest {
+            now_ns: CLOCKS_CALLER_NS,
+            ..sql_request(
+                "SELECT ts FROM logs",
+                TimeRange {
+                    start_ns: 0,
+                    end_ns: CLOCKS_CALLER_NS,
+                },
+            )
+        };
+        (executor, tenant_hash, request)
+    }
+
+    /// A later page (resolve instant before the caller's clock) resolves the
+    /// catalog at the resolve instant, so the record in ingest hour 8, past
+    /// that listing's end, is not read, while the declared-column and KEY_IDX
+    /// lookups are asked at the caller's clock.
+    ///
+    /// FLIP (resolve): `execute_accounted_at` building
+    /// `Clocks { resolve_at_ns: req.now_ns, .. }`, everything at the caller's
+    /// clock, reads both records.
+    /// FLIP (caches): `execute_accounted_at` building
+    /// `Clocks { caller_now_ns: resolve_at_ns, .. }`, everything at the
+    /// resolve instant, asks both lookups at `CLOCKS_RESOLVE_NS`.
+    #[tokio::test]
+    async fn a_later_page_resolves_at_its_instant_and_looks_up_at_the_callers_clock() {
+        let source = Arc::new(RecordingDeclaredColumns::default());
+        let (executor, tenant_hash, request) =
+            two_clock_fixture("clocks-split-3663", &source).await;
+
+        let outcome = executor
+            .execute_accounted_at(
+                tenant_hash,
+                SqlCapabilities::default(),
+                &request,
+                CLOCKS_RESOLVE_NS,
+                &LiveAccounting::new(),
+            )
+            .await
+            .expect("execute at the resolve instant");
+
+        assert_eq!(
+            ts_column_values(&outcome.output, "ts"),
+            vec![CLOCKS_EARLY_TS]
+        );
+        assert_eq!(
+            *source.declared_at.lock().expect("declared lock"),
+            vec![CLOCKS_CALLER_NS]
+        );
+        assert_eq!(
+            *source.key_index_at.lock().expect("key index lock"),
+            vec![CLOCKS_CALLER_NS]
+        );
+    }
+
+    /// A later page stamps the tenant's idle-eviction last-touch with the
+    /// caller's clock: a sweep at `caller + ttl - 1` keeps the accountant, and
+    /// one at `caller + ttl + 1` evicts it.
+    ///
+    /// FLIP: `resolve_admitted` calling
+    /// `touch_tenant(tenant_hash, clocks.resolve_at_ns)` stamps 5 hours
+    /// earlier, so the first sweep evicts.
+    #[tokio::test]
+    async fn a_later_page_stamps_the_last_touch_with_the_callers_clock() {
+        let ttl_ns = 100 * CLOCKS_NS_PER_HOUR;
+        let source = Arc::new(RecordingDeclaredColumns::default());
+        let (executor, tenant_hash, request) =
+            two_clock_fixture("clocks-touch-3663", &source).await;
+
+        executor
+            .execute_accounted_at(
+                tenant_hash,
+                SqlCapabilities::default(),
+                &request,
+                CLOCKS_RESOLVE_NS,
+                &LiveAccounting::new(),
+            )
+            .await
+            .expect("execute at the resolve instant");
+
+        assert_eq!(
+            executor.evict_idle_accountants(CLOCKS_CALLER_NS + ttl_ns - 1, ttl_ns),
+            0
+        );
+        assert_eq!(
+            executor.evict_idle_accountants(CLOCKS_CALLER_NS + ttl_ns + 1, ttl_ns),
+            1
+        );
+    }
+
+    /// The HTTP entry has one instant: it resolves at the request's `now_ns`,
+    /// so both records are read, and asks both lookups at the same `now_ns`.
+    ///
+    /// FLIP: `execute_accounted_with` passing `CLOCKS_RESOLVE_NS` (any
+    /// instant but `req.now_ns`) as the resolve instant reads one record.
+    #[tokio::test]
+    async fn the_http_entry_resolves_and_looks_up_at_one_instant() {
+        let source = Arc::new(RecordingDeclaredColumns::default());
+        let (executor, tenant_hash, request) = two_clock_fixture("clocks-http-3663", &source).await;
+
+        let outcome = executor
+            .execute(tenant_hash, &request)
+            .await
+            .expect("execute on the HTTP entry");
+
+        let mut read = ts_column_values(&outcome.output, "ts");
+        read.sort_unstable();
+        assert_eq!(read, vec![CLOCKS_EARLY_TS, CLOCKS_LATE_TS]);
+        assert_eq!(
+            *source.declared_at.lock().expect("declared lock"),
+            vec![CLOCKS_CALLER_NS]
+        );
+        assert_eq!(
+            *source.key_index_at.lock().expect("key index lock"),
+            vec![CLOCKS_CALLER_NS]
+        );
+    }
+
+    /// A one-row Parquet file of `id: Int64`, `name: Utf8`.
+    fn unbounded_parquet_file() -> bytes::Bytes {
+        use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .expect("batch");
+        let mut out = Vec::new();
+        let mut writer =
+            ::parquet::arrow::ArrowWriter::try_new(&mut out, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        bytes::Bytes::from(out)
+    }
+
+    /// Explain and execute name the same unbounded estimate components for
+    /// every signal table, for a Parquet table, and for a statement joining
+    /// the two, in the order the lanes first name them. An MCP envelope maps
+    /// [`SqlOutcome::unbounded_components`] for `ravel_query_sql` and
+    /// [`ExplainReport::unbounded_components`] for `ravel_explain_query`, so
+    /// a disagreement here is the two tools contradicting each other.
+    #[tokio::test]
+    async fn explain_and_execute_name_the_same_unbounded_components() {
+        use ravel_catalog::Catalog;
+        use ravel_pqtable::clock::FixedClock;
+        use ravel_pqtable::grants;
+
+        const PROFILE: &str = "lake";
+        const GRANT: &str = "s3://lake/t";
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let lake: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let external = Arc::new(crate::ExternalStoreMap::new(HashMap::from([(
+            PROFILE.to_string(),
+            Arc::clone(&lake),
+        )]))) as Arc<dyn crate::ExternalStores>;
+        let sources = ParquetSources::new(
+            Arc::clone(&store),
+            Some(external),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("limiter")),
+            None,
+            crate::DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+        );
+        let catalog =
+            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+        let executor = SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(Arc::clone(&store)),
+            LogSegmentFetcher::new(Arc::clone(&store)),
+            SpanSegmentFetcher::new(Arc::clone(&store)),
+            SqlConfig::default(),
+            1 << 30,
+        )
+        .with_parquet_sources(sources);
+
+        let tenant = TenantId::new("unbounded-components").hash();
+        grants::add(
+            store.as_ref(),
+            &tenant,
+            PROFILE,
+            GRANT,
+            "test",
+            &FixedClock::new(1_700_000_000_000_000_000),
+        )
+        .await
+        .expect("grant");
+        lake.put(
+            "t/hits/0.parquet",
+            unbounded_parquet_file(),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put");
+        executor
+            .execute_ddl(
+                tenant,
+                &format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'"),
+                "test",
+                Duration::from_secs(5),
+            )
+            .await
+            .result
+            .expect("create");
+
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: 1_000,
+        };
+        let decompressed = "estimated_decompressed_bytes";
+        let requests = "estimated_requests";
+        let store_bytes = "estimated_store_bytes";
+        for (sql, expected) in [
+            ("SELECT value FROM samples", vec![]),
+            ("SELECT body FROM logs", vec![decompressed]),
+            ("SELECT name FROM spans", vec![decompressed]),
+            ("SELECT * FROM alerts", vec![decompressed]),
+            ("SELECT * FROM audit", vec![decompressed]),
+            (
+                "SELECT id FROM hits",
+                vec![requests, store_bytes, decompressed],
+            ),
+            (
+                "SELECT h.id FROM hits h JOIN logs l ON h.name = l.body",
+                vec![decompressed, requests, store_bytes],
+            ),
+        ] {
+            let request = sql_request(sql, window);
+            let report = executor.explain(tenant, &request).await.expect("explain");
+            let outcome = executor.execute(tenant, &request).await.expect("execute");
+            assert_eq!(report.unbounded_components, expected, "{sql}: explain");
+            assert_eq!(outcome.unbounded_components, expected, "{sql}: execute");
+        }
+    }
+}

@@ -1,0 +1,925 @@
+#!/usr/bin/env bash
+# Run Ravel's merge gates (CLAUDE.md "Gates"): fmt, clippy, tests, doctests.
+#
+# Usage:
+#   scripts/gates.sh                 # workspace-wide -- run this once,
+#                                     # right before a commit that touches
+#                                     # more than one crate
+#   scripts/gates.sh -p CRATE ...     # scoped: clippy/test/doctests over
+#                                     # the named crates and every workspace
+#                                     # crate that depends on them,
+#                                     # transitively, plus the feature lanes
+#                                     # that closure reaches (see below)
+#   scripts/gates.sh [-p CRATE ...] --dry-run
+#                                     # print the crates and the feature
+#                                     # lanes the same arguments would gate,
+#                                     # then exit 0 without building
+#                                     # anything (scoped mode still reads
+#                                     # `cargo metadata --no-deps` for the
+#                                     # closure)
+#   scripts/gates.sh --tier executor -p CRATE ... [--dry-run]
+#                                     # the executor tier (ADR-4034 D1): fmt
+#                                     # and the source guards; clippy, tests
+#                                     # and doctests for the named (edited)
+#                                     # crates only; one `cargo check` of the
+#                                     # rest of the closure with every lane
+#                                     # feature it reaches; the clippy of
+#                                     # each lane that covers an edited
+#                                     # crate, restricted to the edited
+#                                     # crates it names; and one test run of
+#                                     # the edited crates with all of those
+#                                     # lanes' features unified, dropping
+#                                     # each lane's own --test selection. A
+#                                     # test that fails only with one lane
+#                                     # feature on alone is not run here;
+#                                     # CI's own lane jobs run it. Dependents'
+#                                     # tests and their lane suites are also
+#                                     # left to CI.
+#                                     # Needs at least one -p. `--tier merge`
+#                                     # is the default and is the full gate
+#                                     # described above.
+#
+# In a dispatched fleet clone (a checkout under the fleet work root:
+# /fleet/work/ or /var/lib/fleet) an unscoped run is refused with exit 64
+# (ADR-2867 change 5): the executor's gate is the scoped form, and the
+# PreToolUse hook covers the hand-typed workspace clippy while this covers
+# the script's own. RAVEL_GATES_ALLOW_UNSCOPED=1 is the escape hatch for a
+# genuinely cross-crate task; verify-dispatch-gates.sh sets it for its own
+# unscoped run so a verification host under that root still produces a
+# gates-pass receipt.
+#
+# A workspace run also runs the TypeScript SDK gate (scripts/gates-sdk.sh),
+# which refuses with exit 64 on a host without the pinned node major, before
+# any cargo work. RAVEL_GATES_SKIP_SDK=1 skips that step with one printed line,
+# for a full gate on a node-less host (verify-dispatch-gates.sh --with-gates,
+# or a run whose receipt FLEET_MERGE_SKIP_GATES=1 will reuse); CI's sdk job is
+# then the gate for sdk/typescript. Without it the refusal stands.
+#
+#   scripts/gates.sh --flag-doc-guard-only [FILE]
+#                                     # run only the ingest-memory flag-doc
+#                                     # overclaim guard, against FILE or the
+#                                     # committed config.rs, and exit with its
+#                                     # code (so the guard itself is testable)
+set -euo pipefail
+
+crate_args=()
+dry_run=0
+flag_doc_guard_only=0
+flag_doc_guard_file=""
+tier=merge
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tier)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "gates.sh: --tier requires executor or merge" >&2
+        exit 64
+      fi
+      case "$1" in
+        executor | merge) tier="$1" ;;
+        *)
+          echo "gates.sh: unknown tier: $1 (want executor or merge)" >&2
+          exit 64
+          ;;
+      esac
+      shift
+      ;;
+    -p)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "gates.sh: -p requires a crate name" >&2
+        exit 64
+      fi
+      crate_args+=("-p" "$1")
+      shift
+      ;;
+    --dry-run)
+      shift
+      dry_run=1
+      ;;
+    --flag-doc-guard-only)
+      shift
+      flag_doc_guard_only=1
+      if [[ $# -gt 0 ]]; then
+        flag_doc_guard_file="$1"
+        shift
+      fi
+      ;;
+    *)
+      echo "gates.sh: unknown argument: $1" >&2
+      exit 64
+      ;;
+  esac
+done
+
+if [[ "${tier}" == "executor" && ${#crate_args[@]} -eq 0 ]]; then
+  echo "gates.sh: --tier executor needs at least one -p CRATE: it tests the edited crates and only compiles their dependents" >&2
+  exit 64
+fi
+
+# Unscoped in a fleet clone: see the header. Judged on the script's own
+# checkout, not the caller's cwd, since the gate runs on the tree it lives in.
+if [[ ${#crate_args[@]} -eq 0 && ${flag_doc_guard_only} -eq 0 ]]; then
+  gates_repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
+  case "${gates_repo_root}" in
+    */fleet/work/*|*/var/lib/fleet*)
+      if [[ "${RAVEL_GATES_ALLOW_UNSCOPED:-0}" != "1" ]]; then
+        echo "gates.sh: an unscoped run in a dispatched fleet clone (${gates_repo_root}) is not the executor's gate: run scripts/gates.sh -p <crate> [-p <crate2>], or set RAVEL_GATES_ALLOW_UNSCOPED=1 for a deliberate workspace gate" >&2
+        exit 64
+      fi
+      ;;
+  esac
+fi
+
+# Ingest-memory flag-doc overclaim guard (issue #1297). The two ingest memory
+# flags (--max-inflight-ingest-requests, --max-ingest-buffer-bytes) once
+# documented a memory bound that silently excluded the transient gzip inflate,
+# so the flags claimed a ceiling they did not enforce. Each flag's own doc block
+# must therefore both state what ingest memory it bounds and name the gzip
+# inflate/decompression term that qualifies the claim.
+#
+# The check is scoped to the two flags' `///` blocks, not to config.rs as a
+# whole: a file-wide scan passes on any file that mentions inflate anywhere,
+# including a regression test's own doc comments, so both flag descriptions
+# could lose the inflate wording while keeping their memory claim and the guard
+# would still be green.
+#
+# Each block is flattened to one line (the `///` prefixes stripped, newlines
+# turned into spaces) before matching, so a wording that wraps across two
+# comment lines is still seen as one sentence. grep -q reports its own exit
+# code (no pipe), per the script's own conventions.
+config_rs="${flag_doc_guard_file:-$(dirname "$0")/../services/ravel-server/src/config.rs}"
+
+# The contiguous `///` block immediately above `pub <ident>:`, flattened to a
+# single line. The flag's own `#[arg(...)]` attribute lines are skipped so they
+# do not break the block; any other line resets it. Exit 1 when the identifier
+# is not found at all, so a renamed field fails the guard instead of emptying
+# it.
+flag_doc_block() {
+  awk -v ident="$1" '
+    /^[[:space:]]*\/\/\// {
+      line = $0
+      sub(/^[[:space:]]*\/\/\/[[:space:]]?/, "", line)
+      block = block line " "
+      next
+    }
+    /^[[:space:]]*#\[/ { next }
+    $0 ~ "pub[[:space:]]+" ident "[[:space:]]*:" { print block; found = 1; exit }
+    { block = "" }
+    END { if (!found) exit 1 }
+  ' "$2"
+}
+
+check_ingest_memory_flag_docs() {
+  local file="$1"
+  local failed=0
+  local pair ident flag block tmp
+  for pair in \
+    "max_inflight_ingest_requests:--max-inflight-ingest-requests" \
+    "max_ingest_buffer_bytes:--max-ingest-buffer-bytes"; do
+    ident="${pair%%:*}"
+    flag="${pair##*:}"
+    block="$(flag_doc_block "${ident}" "${file}")" || block=""
+    if [[ -z "${block// /}" ]]; then
+      echo "gates.sh: no /// doc block found for ${flag} (${ident}) in ${file}; \
+the guard cannot check a flag whose doc it cannot find (issue #1297)" >&2
+      failed=1
+      continue
+    fi
+    tmp="$(mktemp)"
+    printf '%s\n' "${block}" >"${tmp}"
+    if ! grep -qiE '(buffered|resident|ingest)[^.]*memory' "${tmp}"; then
+      echo "gates.sh: ${flag}'s doc no longer says which ingest memory it \
+bounds, so the inflate qualification below has nothing to qualify (issue \
+#1297)" >&2
+      failed=1
+    fi
+    # The term must be the gzip inflate, in one sentence with the word gzip: an
+    # unqualified "decompress" matches Remote Write's own post-decompression cap,
+    # which these flags mention for unrelated reasons and which would satisfy a
+    # looser pattern while the gzip qualification was gone.
+    if ! grep -qiE '(gzip[^.]*(inflate|decompress)|(inflate|decompress)[^.]*gzip)' "${tmp}"; then
+      echo "gates.sh: ${flag}'s doc claims an ingest memory bound without \
+naming the gzip inflate/decompression term (issue #1297); no sentence in \
+the doc block pairs gzip with inflate or decompress" >&2
+      failed=1
+    fi
+    rm -f "${tmp}"
+  done
+  return "${failed}"
+}
+
+if [[ ${flag_doc_guard_only} -eq 1 ]]; then
+  guard_code=0
+  check_ingest_memory_flag_docs "${config_rs}" || guard_code=$?
+  exit "${guard_code}"
+fi
+
+# Scoped mode gates the reverse-dependency closure of the named crates, not
+# only the crates themselves: a change to ravel-query can break ravel-sql and
+# ravel-server, and a gate that never compiles them reports green on a tree CI
+# rejects. The closure comes from `affected-tests.sh -n`, so the two scripts
+# share one implementation and cannot disagree about what a change reaches.
+gate_crates=()
+gate_args=()
+if [[ ${#crate_args[@]} -gt 0 ]]; then
+  closure_rc=0
+  closure_out="$("$(dirname "$0")/affected-tests.sh" -n "${crate_args[@]}")" || closure_rc=$?
+  if [[ ${closure_rc} -ne 0 ]]; then
+    echo "gates.sh: could not compute the reverse-dependency closure of ${crate_args[*]} (affected-tests.sh -n exited ${closure_rc})" >&2
+    exit "${closure_rc}"
+  fi
+  closure_line="$(printf '%s\n' "${closure_out}" | sed -n 's/^affected crates://p')"
+  read -r -a gate_crates <<<"${closure_line}"
+  if [[ ${#gate_crates[@]} -eq 0 ]]; then
+    echo "gates.sh: affected-tests.sh -n printed no closure for ${crate_args[*]}:" >&2
+    printf '%s\n' "${closure_out}" >&2
+    exit 70
+  fi
+  for c in "${gate_crates[@]}"; do
+    gate_args+=("-p" "${c}")
+  done
+fi
+
+# Feature-gated surfaces (issues #609, #616, #714, #732). ravel-server's `sql`
+# and `flight-sql` features, and ravel-bench's bench-lane features, are off by
+# default, so the plain clippy and test runs below compile neither the Flight
+# SQL service, the bench lanes, nor their tests. The workspace run below does
+# build ravel-server with `sql` on, through ravel-cli's dev-dependency, but only
+# together with the
+# dependency features the rest of the workspace adds: a break that shows with
+# `sql` selected on its own passes it. Without these lanes a local run prints "All
+# gates passed" on a tree CI rejects. That happened while rebasing #511: the
+# workspace gate was green and `--features sql` failed with E0061 on a call
+# site that had gone stale under a textually clean merge. It happened again for
+# ravel-bench: #712 merged on a receipt but went red in CI's features job
+# because gates.sh never built ravel-bench's sql-latency tests, and #724's
+# `flight-lane` feature left main uncompilable under
+# `--features sql-latency,profiling,flight-lane` because nothing gated it.
+#
+# Mirrors CI's `lint`, `sql`, `flight-sql`, `features`, `features-agents` and
+# `features-mcp` jobs. In scoped mode each lane runs when a crate it covers is
+# in the closure computed above, so `-p ravel-query` runs the sql, agents, mcp,
+# flight-sql and esql lanes (ravel-sql and ravel-server depend on it) and
+# `-p ravel-affinity` runs none.
+#
+# Under --dry-run every cargo command below is printed by `run` and not
+# executed, so the printed list is the list a real run executes.
+run() {
+  echo "==> $*"
+  if [[ ${dry_run} -eq 1 ]]; then
+    return 0
+  fi
+  "$@"
+}
+
+# The same tests as CI's `check` job, on the `ci` profile. CI runs them on
+# `ci-opt`, which is `ci` with third-party dependencies at opt-level 2
+# (ADR-0053, "check on ci-opt" amendment): CI restores a dependency cache
+# and pays for that optimisation once, a local or fleet run builds cold and
+# would pay it every time. So this run and CI's do not share artifacts, and
+# a test whose result depends on how dependencies are compiled can pass
+# here and fail there. To reproduce such a failure, run
+# `cargo nextest run --locked --workspace --cargo-profile ci-opt`.
+# Use nextest when it is installed; fall back to `cargo
+# test` (which every dev machine has) otherwise. nextest cannot run
+# doctests, so those always go through `cargo test --doc`, pinned to the
+# `ci` profile for consistency. `command -v` in an `if` condition does not
+# trip `set -e` when nextest is absent.
+if command -v cargo-nextest >/dev/null 2>&1; then
+  have_nextest=1
+else
+  have_nextest=0
+fi
+
+run_cargo_gates() {
+  if [[ ${#crate_args[@]} -eq 0 ]]; then
+    run cargo clippy --locked --workspace --all-targets -- -D warnings
+    if [[ ${have_nextest} -eq 1 ]]; then
+      run cargo nextest run --locked --workspace --cargo-profile ci
+    else
+      run cargo test --locked --workspace
+    fi
+    run cargo test --locked --doc --profile ci --workspace
+  else
+    echo "==> closure of ${crate_args[*]}: ${gate_crates[*]}"
+    run cargo clippy --locked "${gate_args[@]}" --all-targets -- -D warnings
+    if [[ ${have_nextest} -eq 1 ]]; then
+      run cargo nextest run --locked "${gate_args[@]}" --cargo-profile ci
+    else
+      run cargo test --locked "${gate_args[@]}"
+    fi
+    run cargo test --locked --doc --profile ci "${gate_args[@]}"
+  fi
+}
+
+run_feature_lane() {
+  local feature="$1"
+  shift
+  run cargo clippy --locked "$@" --features "${feature}" --all-targets -- -D warnings
+  if [[ ${have_nextest} -eq 1 ]]; then
+    run cargo nextest run --locked "$@" --features "${feature}"
+  else
+    run cargo test --locked "$@" --features "${feature}"
+  fi
+}
+
+# run_lane_tests <cargo args...>: one test run of a feature lane with an
+# explicit target selection (`--test NAME`, `--lib FILTER`), which nextest and
+# `cargo test` both spell the same way.
+run_lane_tests() {
+  if [[ ${have_nextest} -eq 1 ]]; then
+    run cargo nextest run --locked "$@"
+  else
+    run cargo test --locked "$@"
+  fi
+}
+
+want_sql=0
+want_agents=0
+want_agents_small_pages=0
+want_mcp=0
+want_flight_sql=0
+want_esql=0
+want_bench=0
+want_stage_timing=0
+want_cli_sql_explain=0
+want_ingest_shipping=0
+if [[ ${#crate_args[@]} -eq 0 ]]; then
+  want_sql=1
+  want_agents=1
+  want_agents_small_pages=1
+  want_mcp=1
+  want_flight_sql=1
+  want_esql=1
+  want_bench=1
+  want_stage_timing=1
+  want_cli_sql_explain=1
+  want_ingest_shipping=1
+else
+  for c in "${gate_crates[@]}"; do
+    case "${c}" in
+      ravel-server) want_sql=1 ;;
+    esac
+    case "${c}" in
+      ravel-server) want_agents=1 ;;
+    esac
+    case "${c}" in
+      ravel-agents-runtime | ravel-agents-sim) want_agents_small_pages=1 ;;
+    esac
+    case "${c}" in
+      ravel-server) want_mcp=1 ;;
+    esac
+    case "${c}" in
+      ravel-server | ravel-sql) want_flight_sql=1 ;;
+    esac
+    case "${c}" in
+      ravel-server | ravel-sql | ravel-esql) want_esql=1 ;;
+    esac
+    # ravel-bench's feature tests exercise these crates, so any of them in
+    # scope should pay for the bench lanes.
+    case "${c}" in
+      ravel-bench | ravel-sql | ravel-query | ravel-ingest) want_bench=1 ;;
+    esac
+    # The crates that DECLARE stage-timing, and whose own cfg-gated tests the
+    # ravel-bench lane below cannot reach.
+    case "${c}" in
+      ravel-bench | ravel-ingest | ravel-logseg) want_stage_timing=1 ;;
+    esac
+    case "${c}" in
+      ravel-cli) want_cli_sql_explain=1 ;;
+    esac
+    case "${c}" in
+      ravel-ingest) want_ingest_shipping=1 ;;
+    esac
+  done
+fi
+
+run_feature_lanes() {
+  if [[ ${want_sql} -eq 1 ]]; then
+    run_feature_lane sql -p ravel-server
+  fi
+  # ravel-server's `agents` feature (ADR-3331 decision 14): the agents router,
+  # routes and metric families compile only under it. The lane has the shape
+  # of CI's features-otap job: the lib tests whole, plus the integration
+  # binaries that exist only under the feature. Tests are selected by binary,
+  # never by a test-name filter: nextest and `cargo test` filter on the test
+  # path and never on the binary, so a filtered run skips any test whose
+  # name omits the keyword, and a filter that matches nothing exits 0. The
+  # other integration binaries are left out for cost, not correctness:
+  # `--agents` and `--mcp` are declared in every build
+  # (services/ravel-server/src/config.rs), so `tests/cli_reference.rs`
+  # passes under either feature, and the binaries that do not mention the
+  # feature already run in the main suite without it. A binary whose tests
+  # compile only under the feature has no such second run, so each lane
+  # names every one of those. This is the one
+  # statement of that reason; scripts/affected-tests.sh and ci.yml's
+  # features-agents and features-mcp jobs point here.
+  # The classification test stays in ravel-catalog and covers
+  # proto/ravel/agents.proto (ADR-3331 decision 3), so the lane names it and a
+  # scoped run that does not reach ravel-catalog still checks it.
+  if [[ ${want_agents} -eq 1 ]]; then
+    run cargo clippy --locked -p ravel-server --features agents --all-targets -- -D warnings
+    run_lane_tests -p ravel-server --features agents --test agents_seam --test agents_effects_e2e --test agents_e2e --test agents_timers_e2e --test agents_projection_e2e --test agents_real_store
+    run_lane_tests -p ravel-server --features agents --lib
+    run_lane_tests -p ravel-catalog --test sys_proto_format_version_classification
+  fi
+  # The agents lane's second page size: ravel-agents-runtime and
+  # ravel-agents-sim again with RAVEL_AGENTS_PAGE_ENTRIES=2, where every paged
+  # list seals after two entries, so the sealed-page paths run and the sim
+  # batches assert their size-2 pins (SMALL_PAGE_ENTRIES). The main suite runs
+  # them at the default size only. Selected by the closure holding either
+  # crate, not by ravel-server, which depends on them and not the reverse.
+  if [[ ${want_agents_small_pages} -eq 1 ]]; then
+    if [[ ${have_nextest} -eq 1 ]]; then
+      run env RAVEL_AGENTS_PAGE_ENTRIES=2 cargo nextest run --locked -p ravel-agents-runtime -p ravel-agents-sim
+    else
+      run env RAVEL_AGENTS_PAGE_ENTRIES=2 cargo test --locked -p ravel-agents-runtime -p ravel-agents-sim
+    fi
+  fi
+  # ravel-server's `mcp` feature (ADR-1374): the /mcp route and its tests
+  # compile only under it. Same shape as the agents lane above: mcp_e2e,
+  # trace_by_id (whose `with_mcp` module compiles only under the feature),
+  # mcp_conformance, mcp_escape_routes, mcp_audit and the five
+  # mcp_adversarial_* binaries whole, and the lib tests whole. Every binary
+  # gated on `feature = "mcp"` belongs in this list: one left out compiles in
+  # every lane and runs in none. This command is the list;
+  # scripts/affected-tests.sh, ci.yml's features-mcp job and CLAUDE.md run or
+  # point at the same selection without restating it. The Ravel Agents MCP tools compile only
+  # with both features, so mcp_agents_e2e and the clippy run that covers the
+  # adapter's agents path run under `mcp,agents`.
+  if [[ ${want_mcp} -eq 1 ]]; then
+    run cargo clippy --locked -p ravel-server --features mcp --all-targets -- -D warnings
+    run_lane_tests -p ravel-server --features mcp --test mcp_e2e --test trace_by_id --test mcp_conformance --test mcp_escape_routes --test mcp_audit --test mcp_adversarial_isolation --test mcp_adversarial_replay --test mcp_adversarial_hostile --test mcp_adversarial_precision --test mcp_adversarial_paging
+    run_lane_tests -p ravel-server --features mcp --lib
+    run cargo clippy --locked -p ravel-server --features mcp,agents --all-targets -- -D warnings
+    run_lane_tests -p ravel-server --features mcp,agents --test mcp_agents_e2e
+  fi
+  if [[ ${want_flight_sql} -eq 1 ]]; then
+    run_feature_lane flight-sql -p ravel-server -p ravel-sql
+  fi
+  # POST /api/v1/esql and its tests compile only under `esql`, which `sql`
+  # does not imply.
+  if [[ ${want_esql} -eq 1 ]]; then
+    run_feature_lane esql -p ravel-server
+  fi
+
+  # ravel-bench bench lanes. The ClickBench box builds
+  # `--features sql-latency,profiling` and `--features
+  # sql-latency,profiling,flight-lane`; gate the widest combination so a break
+  # in any of the three features (SQL corpus, profiling, Flight SQL bench) is
+  # caught locally. stage-timing is a separate lane CI checks and runs, kept at
+  # parity. saturation builds the ADR-1702 task 11 bins, which carry
+  # `required-features = ["saturation"]`, and runs their band tests; no other
+  # local gate compiles them. walk-expiry does the same for the issue #3779
+  # probe (`required-features = ["walk-expiry"]`).
+  if [[ ${want_bench} -eq 1 ]]; then
+    run_feature_lane sql-latency,profiling,flight-lane -p ravel-bench
+    run_feature_lane saturation -p ravel-bench
+    run_feature_lane walk-expiry -p ravel-bench
+    run cargo check --locked -p ravel-bench --features stage-timing --all-targets
+    run cargo test --locked -p ravel-bench --features stage-timing
+  fi
+
+  # stage-timing tests in the crates that declare the feature. The ravel-bench
+  # lane above enables ravel-logseg/stage-timing and ravel-ingest/stage-timing
+  # transitively, so it type-checks their production code, but a `-p
+  # ravel-bench` selection builds both as library dependencies and cargo never
+  # compiles a dependency's `#[cfg(test)]` module. Every `#[cfg(feature =
+  # "stage-timing")]` test in those two crates was therefore unreachable from
+  # any lane. This runs them. Not extended to services/ravel-cli: its
+  # stage-timing test is broken on main under issue #1522, and a lane running
+  # it would be red for an unrelated reason.
+  if [[ ${want_stage_timing} -eq 1 ]]; then
+    run_feature_lane stage-timing -p ravel-logseg -p ravel-ingest
+  fi
+
+  # ravel-cli's `sql explain` subcommand (issue #2881) and its tests compile
+  # only under `sql-explain`, which no other lane selects. Mirrors CI's
+  # `cli-sql-explain` features leg.
+  if [[ ${want_cli_sql_explain} -eq 1 ]]; then
+    run_feature_lane sql-explain -p ravel-cli
+  fi
+
+  # ravel-ingest as it ships, with `flush-input-bytes` off. Any selection that
+  # also holds ravel-bench, the workspace and every scoped closure of
+  # ravel-ingest included, unifies that feature on through ravel-bench's
+  # dev-dependency. Mirrors the `lint` job's shipping-features clippy step.
+  if [[ ${want_ingest_shipping} -eq 1 ]]; then
+    run cargo clippy --locked -p ravel-ingest --all-targets -- -D warnings
+  fi
+}
+
+# The executor tier (ADR-4034 D1). The edited crates are the ones named with
+# -p; the rest of the closure is compiled, not tested, and CI runs its tests
+# and lane suites. The lanes come from run_feature_lanes itself, run dry with
+# every lane selected, so a lane added there reaches this tier without a
+# second list. Its output is captured into a variable first and its exit
+# status checked explicitly (the same pattern the closure computation above
+# uses for affected-tests.sh), not read by a `while` loop fed through process
+# substitution: that loses the subshell's exit status, so a lane listing that
+# fails partway would silently drop every lane clippy and test line after the
+# failure instead of refusing.
+#
+# Parsing rules for each listed line:
+#   - a clippy or check line naming an edited crate runs restricted to the
+#     edited crates it names;
+#   - a test line with features contributes those features, per edited
+#     crate, to ONE test run of the edited crates with all of them unified;
+#   - a test line with an environment prefix runs restricted, on ci;
+#   - a test line with neither is a test of a crate's default build, which
+#     the edited crates' own test run already covers;
+#   - every feature a lane line gives a non-edited crate goes on the one
+#     `cargo check` of the rest of the closure.
+# Commands are kept as space-joined words: no lane argument contains a space.
+executor_test_cmd() {
+  if [[ ${have_nextest} -eq 1 ]]; then
+    echo "cargo nextest run --locked $* --cargo-profile ci"
+  else
+    echo "cargo test --locked --profile ci $*"
+  fi
+}
+
+# add_word <list> <word>: <list> with <word> appended unless already present.
+add_word() {
+  if [[ " $1 " == *" $2 "* ]]; then
+    echo "$1"
+  else
+    echo "${1:+$1 }$2"
+  fi
+}
+
+run_executor_gates() {
+  local edited="" rest="" edited_sel="" rest_sel="" c
+  local i
+  for ((i = 1; i < ${#crate_args[@]}; i += 2)); do
+    edited="$(add_word "${edited}" "${crate_args[i]}")"
+  done
+  for c in "${gate_crates[@]}"; do
+    if [[ " ${edited} " != *" ${c} "* ]]; then
+      rest="$(add_word "${rest}" "${c}")"
+    fi
+  done
+  for c in ${edited}; do edited_sel="${edited_sel:+${edited_sel} }-p ${c}"; done
+  for c in ${rest}; do rest_sel="${rest_sel:+${rest_sel} }-p ${c}"; done
+
+  local edited_clippy="cargo clippy --locked ${edited_sel} --all-targets -- -D warnings"
+  local check_features="" lane_test_crates="" lane_test_features=""
+  local lint_cmds=() env_test_cmds=()
+  local line words envp kind cmd pkgs feats other restricted p f n seen w
+
+  # Capture run_feature_lanes' dry-run listing into a variable and check its
+  # exit status before parsing it: a `while read` fed by `< <(...)` discards
+  # the subshell's exit status, so a listing that fails partway would pass
+  # silently and drop every lane clippy and test line after the failure.
+  # RAVEL_GATES_TEST_FORCE_LANE_LISTING_FAILURE=1 is a test-only seam: nothing
+  # in the listing runs a real command under --dry-run, so this is how the
+  # refusal path below is exercised at all.
+  local lanes_output
+  local lanes_rc=0
+  lanes_output="$(
+    if [[ "${RAVEL_GATES_TEST_FORCE_LANE_LISTING_FAILURE:-0}" == "1" ]]; then
+      echo "gates.sh: RAVEL_GATES_TEST_FORCE_LANE_LISTING_FAILURE=1 (test-only forced failure)" >&2
+      exit 3
+    fi
+    dry_run=1
+    want_sql=1 want_agents=1 want_agents_small_pages=1 want_mcp=1
+    want_flight_sql=1 want_esql=1 want_bench=1 want_stage_timing=1
+    want_cli_sql_explain=1 want_ingest_shipping=1
+    run_feature_lanes
+  )" || lanes_rc=$?
+  if [[ ${lanes_rc} -ne 0 ]]; then
+    echo "gates.sh: could not list the executor tier's lanes (run_feature_lanes exited ${lanes_rc} under --dry-run); refusing rather than silently dropping lane clippy and tests" >&2
+    exit 70
+  fi
+
+  while IFS= read -r line; do
+    read -r -a words <<<"${line#==> }"
+    envp=""
+    if [[ "${words[0]:-}" == "env" ]]; then
+      envp="${words[0]} ${words[1]}"
+      words=("${words[@]:2}")
+    fi
+    [[ "${words[0]:-}" == "cargo" ]] || continue
+    case "${words[1]:-}" in
+      clippy | check) kind=lint cmd="cargo ${words[1]}" i=2 ;;
+      nextest) kind=test cmd="" i=3 ;;
+      test) kind=test cmd="" i=2 ;;
+      *) continue ;;
+    esac
+    pkgs="" feats="" other=""
+    n=${#words[@]}
+    while [[ ${i} -lt ${n} ]]; do
+      case "${words[i]}" in
+        --locked) i=$((i + 1)) ;;
+        -p) pkgs="${pkgs:+${pkgs} }${words[i + 1]}" i=$((i + 2)) ;;
+        --features) feats="${words[i + 1]}" i=$((i + 2)) ;;
+        *) other="${other:+${other} }${words[i]}" i=$((i + 1)) ;;
+      esac
+    done
+    restricted=""
+    for p in ${pkgs}; do
+      if [[ " ${edited} " == *" ${p} "* ]]; then
+        restricted="${restricted:+${restricted} }-p ${p}"
+        if [[ -n "${feats}" && "${kind}" == "test" ]]; then
+          lane_test_crates="$(add_word "${lane_test_crates}" "-p ${p}")"
+          for f in ${feats//,/ }; do
+            lane_test_features="$(add_word "${lane_test_features}" "${p}/${f}")"
+          done
+        fi
+      elif [[ " ${rest} " == *" ${p} "* ]]; then
+        for f in ${feats//,/ }; do
+          check_features="$(add_word "${check_features}" "${p}/${f}")"
+        done
+      fi
+    done
+    [[ -n "${restricted}" ]] || continue
+    if [[ "${kind}" == "lint" ]]; then
+      cmd="${cmd} --locked ${restricted}${feats:+ --features ${feats}}${other:+ ${other}}"
+      seen=0
+      for w in "${edited_clippy}" ${lint_cmds[@]+"${lint_cmds[@]}"}; do
+        [[ "${w}" == "${cmd}" ]] && seen=1
+      done
+      [[ ${seen} -eq 1 ]] || lint_cmds+=("${cmd}")
+    elif [[ -z "${feats}" && -n "${envp}" ]]; then
+      env_test_cmds+=("${envp} $(executor_test_cmd "${restricted}")")
+    fi
+  done <<<"${lanes_output}"
+
+  echo "==> closure of ${crate_args[*]}: ${gate_crates[*]}"
+  echo "==> executor tier: tests for ${edited}; compile only for ${rest:-nothing else}"
+  local all=()
+  all+=("${edited_clippy}")
+  all+=("$(executor_test_cmd "${edited_sel}")")
+  all+=("cargo test --locked --doc --profile ci ${edited_sel}")
+  if [[ -n "${rest}" ]]; then
+    check_features="${check_features// /,}"
+    all+=("cargo check --locked ${rest_sel} --all-targets${check_features:+ --features ${check_features}}")
+  fi
+  if [[ ${#lint_cmds[@]} -gt 0 ]]; then
+    all+=("${lint_cmds[@]}")
+  fi
+  if [[ -n "${lane_test_crates}" ]]; then
+    lane_test_features="${lane_test_features// /,}"
+    all+=("$(executor_test_cmd "${lane_test_crates} --features ${lane_test_features}")")
+  fi
+  if [[ ${#env_test_cmds[@]} -gt 0 ]]; then
+    all+=("${env_test_cmds[@]}")
+  fi
+  for cmd in "${all[@]}"; do
+    read -r -a w <<<"${cmd}"
+    run "${w[@]}"
+  done
+}
+
+run_tier_gates() {
+  if [[ "${tier}" == "executor" ]]; then
+    run_executor_gates
+  else
+    run_cargo_gates
+    run_feature_lanes
+  fi
+}
+
+# The TypeScript SDK gate (scripts/gates-sdk.sh: npm ci, lint, typecheck and
+# test under sdk/typescript). Workspace mode only: scoped mode selects cargo
+# packages and the SDK is not one, so no -p argument reaches it. It refuses
+# with exit 64 when node is absent or not the major sdk/typescript/.node-version
+# pins, which fails the workspace gate. RAVEL_GATES_SKIP_SDK=1 (see the header)
+# skips it on a host without that node and says so.
+want_sdk=0
+if [[ ${#crate_args[@]} -eq 0 ]]; then
+  want_sdk=1
+fi
+run_sdk_gate() {
+  if [[ ${want_sdk} -eq 1 ]]; then
+    if [[ "${RAVEL_GATES_SKIP_SDK:-0}" == "1" ]]; then
+      echo "==> SDK gate skipped (RAVEL_GATES_SKIP_SDK=1): CI's sdk job is the gate for sdk/typescript"
+      return 0
+    fi
+    run "$(dirname "$0")/gates-sdk.sh"
+  fi
+}
+
+if [[ ${dry_run} -eq 1 ]]; then
+  echo "gates.sh: dry run; tier ${tier}: the cargo commands below are printed, not run, and fmt and the source guards are skipped"
+  run_sdk_gate
+  run_tier_gates
+  exit 0
+fi
+
+# Linker OOM guard. On low-memory hosts (fleet executors run with 8 GB)
+# the default parallelism links several multi-GB test binaries at once and
+# the kernel kills ld ("signal 9"). That is a resource failure, not a code
+# failure, and it wastes a full gate cycle. Cap build jobs before it
+# happens. An explicit CARGO_BUILD_JOBS in the environment wins.
+if [[ -z "${CARGO_BUILD_JOBS:-}" ]]; then
+  mem_gb=""
+  if [[ "$(uname)" == "Darwin" ]]; then
+    mem_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+  elif [[ -r /proc/meminfo ]]; then
+    mem_gb=$(( $(awk '/^MemTotal/{print $2}' /proc/meminfo) / 1048576 ))
+  fi
+  if [[ -n "${mem_gb}" && "${mem_gb}" -le 11 ]]; then
+    export CARGO_BUILD_JOBS=2
+    echo "gates.sh: ${mem_gb} GB RAM; capping cargo build jobs at 2"
+  fi
+fi
+
+# --locked everywhere so a local green gate warms the exact artifacts CI's
+# `check` job reuses (and vice versa): CI runs against a committed
+# Cargo.lock, so a divergent local resolve would recompile from scratch on
+# CI and mask lockfile drift here. `cargo fmt` (rustfmt) does not accept
+# --locked after the subcommand, so it takes the global-flag position.
+echo "==> cargo --locked fmt --all --check"
+cargo --locked fmt --all --check
+
+# The test-hygiene shapes CLAUDE.md names under "Testing patterns": a
+# wall-clock assertion, an unseeded rng, an untracked proptest seed. Each
+# costs a gate rerun after the rule was already written down, so it is a
+# check rather than another paragraph. A source scan, no build, so it runs
+# ahead of the expensive lanes and fails at authoring time.
+echo "==> scripts/guards/check-test-hygiene.sh"
+"$(dirname "$0")/guards/check-test-hygiene.sh"
+
+# Every workflow declares a top-level permissions floor (issue #1717). No local
+# gate compiles .github/, so nothing else here would notice a workflow added
+# without one, and the repository default workflow permission is write. Its own
+# cases run first, so a guard broken into always-passing fails here rather than
+# going quiet. A file scan, no build, so it sits with the other cheap guards.
+echo "==> scripts/guards/check-workflow-permissions.test.sh"
+bash "$(dirname "$0")/guards/check-workflow-permissions.test.sh"
+echo "==> scripts/guards/check-workflow-permissions.sh"
+"$(dirname "$0")/guards/check-workflow-permissions.sh"
+
+# Operator-facing figures derived from the record-cache constants. The
+# cargo tests that pin these run in CI only, and this repository's
+# sessions do not run cargo locally, so four review rounds on issue #1927
+# went to defects a one-second scan finds. A file scan, no build.
+echo "==> scripts/guards/check-doc-figures.test.sh"
+bash "$(dirname "$0")/guards/check-doc-figures.test.sh"
+echo "==> scripts/guards/check-doc-figures.sh"
+"$(dirname "$0")/guards/check-doc-figures.sh"
+
+# What a `0` on the store-probe liveness gauge means had been written out
+# across the probe source, its tests, the rule file and the guides. Four
+# sweeps had failed to consolidate it and two had added a copy (issue #1982).
+# One canonical block, every other site a pointer, and this check keeps it
+# that way. A file scan, no build.
+echo "==> scripts/guards/check-claim-single-source.test.sh"
+bash "$(dirname "$0")/guards/check-claim-single-source.test.sh"
+echo "==> scripts/guards/check-claim-single-source.sh"
+"$(dirname "$0")/guards/check-claim-single-source.sh"
+
+# An ADR amendment sometimes claims it updated other places in the same
+# document to point back at it. Review kept finding the edit only reached one
+# of the named places (issue #1985): this checks the claim against the
+# document instead of trusting the prose. Cases first, same reason as the
+# guards above: a source scan, no build.
+echo "==> scripts/guards/check-amendment-integrity.test.sh"
+bash "$(dirname "$0")/guards/check-amendment-integrity.test.sh"
+echo "==> scripts/guards/check-amendment-integrity.sh"
+"$(dirname "$0")/guards/check-amendment-integrity.sh"
+
+# An ADR band table is copied into fleet specs as the bar a task must clear,
+# so every row names where its figure came from: a comment id, a report
+# path, a file:line, a measured date, or the word predicted (issue #2879).
+# Cases first, same reason as the guards above: a source scan, no build.
+echo "==> scripts/guards/check-adr-band-sources.test.sh"
+bash "$(dirname "$0")/guards/check-adr-band-sources.test.sh"
+echo "==> scripts/guards/check-adr-band-sources.sh"
+"$(dirname "$0")/guards/check-adr-band-sources.sh"
+
+# The post-fork shape guard (issue #2811) needs a pull request to check, so
+# pr-review-status.sh runs it and this runs only its cases: fixture git
+# repositories, no network, no build.
+echo "==> scripts/guards/assert-struct-literals-current.test.sh"
+bash "$(dirname "$0")/guards/assert-struct-literals-current.test.sh"
+
+# "No wall-clock wait in an injected-clock test helper" cost two gate reruns
+# (issue #1260: the flaky pair test, then its rewrite under #1235). Another
+# check rather than another paragraph, same reasoning as the hygiene guard
+# above: a source scan, no build, ahead of the expensive lanes.
+echo "==> scripts/check-injected-clock-helpers.sh"
+"$(dirname "$0")/check-injected-clock-helpers.sh"
+
+# Format-lifecycle docs drifted from the shipped reader once already (issue
+# #531). This ties each bulk-format doc's declared supported-version marker to
+# its crate's SUPPORTED_VERSIONS. A source scan, no build, and it runs its own
+# mismatch self-check first so it cannot go vacuous.
+echo "==> scripts/check_format_version_docs.py"
+python3 "$(dirname "$0")/check_format_version_docs.py"
+
+# Every absence-marker line in a normative doc is registered in
+# docs/review/claims.yaml and every bound symbol is still defined (ADR-1658).
+# CI's doc-scripts job runs it; without it here a branch passes every local
+# and executor gate and fails CI on a new "is not created" sentence (issue
+# #3188). Stdlib Python, no build.
+echo "==> scripts/check-doc-claims.py"
+python3 "$(dirname "$0")/check-doc-claims.py"
+
+# Every parse of caller text in ravel-sql runs the pre-parse complexity guard,
+# because the walks over the parsed tree abort the process on a statement the
+# parser's own recursion limit does not bound (issue #1680). That was a
+# convention until issue #1760 made it a property: one guarded parse, and this
+# check refuses any other. A source scan, no build, same placement reasoning as
+# the two above.
+echo "==> scripts/guards/check-guarded-sql-parse.sh"
+"$(dirname "$0")/guards/check-guarded-sql-parse.sh"
+
+# The same rule on the PromQL side, where an over-bound query aborts the
+# process inside the parser itself (issue #529). Its funnel has a caller in
+# another crate, so this one scans both crates/ravel-promql/src and
+# crates/ravel-query/src (issue #1817). A source scan, no build.
+echo "==> scripts/guards/check-guarded-promql-parse.sh"
+"$(dirname "$0")/guards/check-guarded-promql-parse.sh"
+
+# ES|QL source text enters only through ravel_esql::parse and ravel_esql::lex,
+# which apply the byte, token, nesting and stage limits; this refuses any
+# other public entry in the crate and any caller path to its lexer or parser
+# modules (issue #2892). A source scan, no build.
+echo "==> scripts/guards/check-guarded-esql-parse.sh"
+"$(dirname "$0")/guards/check-guarded-esql-parse.sh"
+
+# A parsed tenant query could reach an evaluator unreachable!() arm and abort
+# the process instead of rejecting the query (issue #1701). That round
+# converted every reachable arm to Error::Unsupported and left only the arms
+# an exhaustive prior match already narrows out of reach, each carrying a
+# one-line justification. This guard keeps new unreachable! arms honest: a
+# source scan, no build, same placement reasoning as the two above.
+echo "==> scripts/guards/check-promql-unreachable.sh"
+"$(dirname "$0")/guards/check-promql-unreachable.sh"
+
+# Published binaries are built on the optimised release profile (issue #2528):
+# LTO and one codegen unit in [profile.release], and `cargo build --release`
+# on every build line of the shipping Dockerfile. CI tunes other profiles for
+# test speed; this is the one that must not follow them. Cases first, since
+# the guard passes everything if its anchors move. A text scan, no build.
+echo "==> scripts/guards/check-release-profile.test.sh"
+bash "$(dirname "$0")/guards/check-release-profile.test.sh"
+echo "==> scripts/guards/check-release-profile.sh"
+"$(dirname "$0")/guards/check-release-profile.sh"
+
+# A user guide must not keep a figure a later record superseded, or an operator
+# picks a flag value from a retired number (issue #1736). This scans the guides
+# tree for the retired ADR-0996 ClickBench pair. Cases first, same reason as the
+# guards above: a source scan, no build, and it passes everything if its anchor
+# page is gone.
+echo "==> scripts/guards/check-superseded-figures.test.sh"
+bash "$(dirname "$0")/guards/check-superseded-figures.test.sh"
+echo "==> scripts/guards/check-superseded-figures.sh"
+"$(dirname "$0")/guards/check-superseded-figures.sh"
+
+# deny.toml's quick-xml ignore comment records the direct Cargo.lock parents
+# of RUSTSEC-2026-0194/-0195 (issue #1718); this checks the comment still
+# names every one of them. Cases first, same reason as the guards above. A
+# Cargo.lock/deny.toml scan, no build, so it sits with the other cheap
+# guards.
+echo "==> scripts/guards/check-quick-xml-entry-points.test.sh"
+bash "$(dirname "$0")/guards/check-quick-xml-entry-points.test.sh"
+echo "==> scripts/guards/check-quick-xml-entry-points.sh"
+"$(dirname "$0")/guards/check-quick-xml-entry-points.sh"
+
+# check-quick-xml-shipped-reachability.sh itself needs a real cargo toolchain
+# and dependency graph (it stays CI-only, in the supply-chain job and
+# supply-chain-nightly.yml), but its own cases run against a stubbed cargo
+# and cost nothing here, same reason as the entry-points cases above.
+echo "==> scripts/guards/check-quick-xml-shipped-reachability.test.sh"
+bash "$(dirname "$0")/guards/check-quick-xml-shipped-reachability.test.sh"
+
+# Every shell test suite must be run by some workflow (issue #1834). Here as
+# well as in CI, because the person this guard exists for is the one who just
+# added a suite and has not wired it: they run gates.sh before committing, per
+# the gate list in CLAUDE.md, and would otherwise learn it from a red pull
+# request instead. Cases first, so a guard broken into always-passing fails
+# here rather than going quiet. A git and grep scan, no build.
+echo "==> scripts/tests/check-test-suites-run.test.sh"
+bash "$(dirname "$0")/tests/check-test-suites-run.test.sh"
+echo "==> scripts/guards/check-test-suites-run.sh"
+"$(dirname "$0")/guards/check-test-suites-run.sh"
+
+# The flag-doc overclaim guard defined above, in the ordinary gate run: a source
+# scan, no build, so it fails before the expensive lanes.
+echo "==> ingest-memory flag-doc overclaim guard (issue #1297)"
+check_ingest_memory_flag_docs "${config_rs}"
+
+run_sdk_gate
+run_tier_gates
+
+# --- Gates-pass receipt ---------------------------------------------------
+# Record the tree this run passed. fleet-result-merge.sh honors
+# FLEET_MERGE_SKIP_GATES=1 only for a tree with a receipt here. Keyed by
+# TREE hash because the merge path's authorship/squash rewrite changes
+# commit ids but not content. Receipts live in the shared common dir (one
+# file per tree) so worktrees see each other's runs and concurrent
+# sessions never clobber each other. Written only for a full (unscoped)
+# run on a clean tree; a scoped or dirty run does not prove the tree.
+if [[ ${#crate_args[@]} -eq 0 && -z "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+  receipt_dir="$(cd "$(git rev-parse --git-common-dir)" && pwd)/gates-pass"
+  mkdir -p "${receipt_dir}"
+  gated_tree="$(git rev-parse 'HEAD^{tree}')"
+  date -u +%Y-%m-%dT%H:%M:%SZ >"${receipt_dir}/${gated_tree}"
+  echo "gates.sh: receipt written for tree ${gated_tree}"
+fi
+
+echo "All gates passed."

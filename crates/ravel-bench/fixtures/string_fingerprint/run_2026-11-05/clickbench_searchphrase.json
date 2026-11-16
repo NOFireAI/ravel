@@ -1,0 +1,1168 @@
+{
+  "stamp": {
+    "git": "a277643bb963cff2aa39bba446b5832640d4cd26",
+    "arch": "x86_64",
+    "nproc": 16,
+    "mem_total_kib": 32132612,
+    "corpus_file": "hits_0.parquet",
+    "corpus_sha256": "fa134fe101e68324e0de851146fda69624f5cbb707d387141d1c2a88a219a16d",
+    "corpus_bytes": 122446530,
+    "zstd_level": 3,
+    "cpu_clock": "CLOCK_THREAD_CPUTIME_ID of the report thread, one run each. zstd_cpu_s compresses every block's values joined with a 0x00 byte at the pre-registered zstd level. The build (summary::build: the training grams' block counts, the learned set, and every block's bitset) runs once on the same thread."
+  },
+  "subject": "clickbench_searchphrase",
+  "params": {
+    "column": "SearchPhrase",
+    "gram_len": 3,
+    "budget_share": 0.01,
+    "fallback_min_bits": 256,
+    "zstd_level": 3,
+    "block_records": 8192,
+    "object_records": 262144,
+    "max_lines": 1000000,
+    "seed": 3710,
+    "literals_per_kind": 40,
+    "eq_max_len": 64,
+    "like_min_len": 5,
+    "like_max_len": 12
+  },
+  "decision_rule": "Per subject: GO when unseen/equals/false_positive_share and unseen/like/false_positive_share are both at most 0.10, summary_bytes_share is at most 0.01, and build_cpu_over_zstd is at most 2; otherwise NO-GO, and a missing figure fails its leg. Saturation is a separate verdict: with values over 1024 bytes, saturation/unseen/like/false_positive_share at most 0.30 is body-eligible and above it body-ineligible; with none, untested. Overall: GO when every pre-registered subject has exactly one report, it is GO, and it has no structural problem (a missing, duplicate or unexpected figure); a figure outside its prediction band is reported as a miss and does not change the decision.",
+  "summary_bytes_rule": "summary_bytes = blocks * ceil(bits_per_block / 8) + learned_bits * gram_len (the shared table of learned grams, each stored as its raw bytes)",
+  "cpu_clock": "CLOCK_THREAD_CPUTIME_ID of the report thread, one run each. zstd_cpu_s compresses every block's values joined with a 0x00 byte at the pre-registered zstd level. The build (summary::build: the training grams' block counts, the learned set, and every block's bitset) runs once on the same thread.",
+  "workload": {
+    "training": [
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "курорты москва смотреть"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "пончо без опытанике"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "коляски на ката для детей отзывы"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "шоу виолеты фотоаппарат"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "автомобильные"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "опылова и медведя"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "ведомосквиталия страции"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "зарядное пусты сам хозяин мэндэн"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "песен нижних условать в детей"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "что это"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "покеты рецепт засня"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "вспомидор тольяттие"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "схема"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "гормони купить фильм"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "ведомосквы вы из"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "ведомосква в детская 12.4.1342 масло чi"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "снитель спб"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "великал ников шарарта год"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "доктории смотреть фильм анимает"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "авторий"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "lfthb"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "ведомосквы лучшие отдых 1013 год"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "izhcjmmunicoqated by see"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "usd на алекомедиционера"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "прибами для детскую 2016"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "usc на юбился воды вости на"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "gsb на юбился ворожная компьютер"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "а я хочет обору 2013 1955) 4-я семейка"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "commak-530 белок для"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "wwwww.virtual breaking lte braxton – loveplanlt"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "ведомоскве наруто+море 2017-82 поль"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "nnnm d [fhmrjd gfwfnjd"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "usg на алекомедицин алексей в киев"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "ведомосквы купить квартс неa"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "новые огуртних условать в той 2614"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "шарартроза в пб 03-20"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "ведомоскве все сексон гост 0.602-2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "сорова 2153 индейки"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "жби видео 91 июль"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "арвин 6 скать бесплатно в хорошем"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "арфейс"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "елю"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "rresid"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " см"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "засня"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ско"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "евск н"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "орош"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "акти"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "терье"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "g tes"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "2013 с ope"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "отре"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "сберб"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " rey "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "жден"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "квита"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " 19986"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "тный "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "енд"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "loviag tha"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "deadpob"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "фт 7.5."
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "a tsiott"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "окус 32d"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ifg than mu"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ltgo "
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " ваз 6"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "8 улья"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "bter us"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ены 2406p"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ing bhan mu"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "в 101"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " 0 се"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ng thinh n"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ldbedr"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "пг 1+7 "
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "57мм"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "r v45-4"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "y futmcrbt ,"
+      }
+    ],
+    "evaluation": [
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "бонприкоз"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "ведомосквы на носа пятно"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "newsru.com.новгороде"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "коптимизации в видео втори"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "трехлитера"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "my loving than multing"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "рецепты сбербан"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "ведомосквы вместу"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "живи смотреть онлайн бесплатно! да!"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "черны 1 2 33"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "мастелс над уровень рождестве"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "usb на юбился ворожная зонт"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "абрикола nissa"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "август багажников о фильм"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "ария сварочные игры для плиты"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "такси на скачать рк"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "востовске смотрейлер"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "великвида"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "клипы подборови"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "провое колеса нужно кондин"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "hp 108.460 2007 годов"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "wws.растными"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "похудентов в zippk piano find black eyeshift"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "motorolly loik you bad r500gb12 13 украине"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "usb 3.0.0 wush 100e comforter 2013 года в микла"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "izhcjmmuhity перевозки на фиксиковый"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "сезон 0"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "коптимашевск нос игры 6 серия"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "usv на юбился ворождение крыша"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "wnw.растными цена уфаленьки богин"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "xsb на юбился воды вости на"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "работы в minecradt на помещению"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "sbednet 300 обзор инсулиней"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "наклеики 2003 ютубі"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "swatch volvr"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "priyamedvirb yj;rf ltymub yf pf,skf"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "арвин 5 скать бесплатно в хорошем"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "премьера 8 минск"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "активный углов 39 сеткой"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "ведомосквы на пк скороллея 30 серия"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "вао "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " аден"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "шем "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "0 9.4 ска"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "квы "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "моск"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "лся "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "йн бе"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "огр"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "е ав"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "укция "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "е пчел"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " че"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "фиксик"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "едомо"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "машевс"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "цел"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "дом"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "упи"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "блак"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "d yd r"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "bst b"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "watce v"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " bizkit 180"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "http://lisa"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "rud gfhfnj"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " in my gifi "
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " ykdu"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "vfufpey"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " 103 в"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "уск oi"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "-eoxoplast "
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "woly sh"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "mrjb gfhfn"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "atalc"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "1084-20"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "13 ту 53"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ф 0013 к"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " 3 июле"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ства 27"
+      }
+    ]
+  },
+  "figures": [
+    {
+      "key": "clickbench_searchphrase/lines",
+      "value": 1000000.0
+    },
+    {
+      "key": "clickbench_searchphrase/blocks",
+      "value": 123.0
+    },
+    {
+      "key": "clickbench_searchphrase/column_bytes",
+      "value": 3528017.0
+    },
+    {
+      "key": "clickbench_searchphrase/compressed_bytes",
+      "value": 677428.0
+    },
+    {
+      "key": "clickbench_searchphrase/zstd_cpu_s",
+      "value": 0.015150175000000016
+    },
+    {
+      "key": "clickbench_searchphrase/build_cpu_over_zstd",
+      "value": 3.0171564354867146
+    },
+    {
+      "key": "clickbench_searchphrase/candidate_grams",
+      "value": 627.0
+    },
+    {
+      "key": "clickbench_searchphrase/learned_bits",
+      "value": 152.0
+    },
+    {
+      "key": "clickbench_searchphrase/fallback_bits",
+      "value": 256.0
+    },
+    {
+      "key": "clickbench_searchphrase/bits_per_block",
+      "value": 408.0
+    },
+    {
+      "key": "clickbench_searchphrase/summary_bytes_share",
+      "value": 0.009933158948257232
+    },
+    {
+      "key": "clickbench_searchphrase/fallback_density",
+      "value": 0.8914189532520326
+    },
+    {
+      "key": "clickbench_searchphrase/eval_equals_bloom_testable",
+      "value": 40.0
+    },
+    {
+      "key": "clickbench_searchphrase/seen/equals/false_positive_share",
+      "value": 0.33405312027639816
+    },
+    {
+      "key": "clickbench_searchphrase/seen/like/false_positive_share",
+      "value": 0.24029000517866392
+    },
+    {
+      "key": "clickbench_searchphrase/unseen/equals/false_positive_share",
+      "value": 0.6385390428211587
+    },
+    {
+      "key": "clickbench_searchphrase/unseen/like/false_positive_share",
+      "value": 0.6978644872132876
+    },
+    {
+      "key": "clickbench_searchphrase/unseen/equals_absent/false_positive_share",
+      "value": 0.5304878048780488
+    },
+    {
+      "key": "clickbench_searchphrase/unseen/like_absent/false_positive_share",
+      "value": 0.6231707317073171
+    },
+    {
+      "key": "clickbench_searchphrase/production/equals/false_positive_share",
+      "value": 0.011335012594458438
+    },
+    {
+      "key": "clickbench_searchphrase/bloom/equals/false_positive_share",
+      "value": 0.011335012594458438
+    },
+    {
+      "key": "clickbench_searchphrase/summary/equals_bloom_testable/false_positive_share",
+      "value": 0.6385390428211587
+    },
+    {
+      "key": "clickbench_searchphrase/contains/like/cells_tested_per_row",
+      "value": 0.019369
+    },
+    {
+      "key": "clickbench_searchphrase/summary/like/cells_tested_share",
+      "value": 0.9074293974908358
+    },
+    {
+      "key": "clickbench_searchphrase/saturation/long_values",
+      "value": 4.0
+    },
+    {
+      "key": "clickbench_searchphrase/saturation/blocks",
+      "value": 1.0
+    },
+    {
+      "key": "clickbench_searchphrase/saturation/fallback_density",
+      "value": 0.8125
+    },
+    {
+      "key": "clickbench_searchphrase/saturation/unseen/like/false_positive_share",
+      "value": 0.5882352941176471
+    }
+  ],
+  "expect": {
+    "clickbench_searchphrase/bits_per_block": {
+      "predict": 1500.0,
+      "band": [
+        900.0,
+        2100.0
+      ]
+    },
+    "clickbench_searchphrase/blocks": {
+      "predict": 123.0,
+      "band": [
+        123.0,
+        123.0
+      ]
+    },
+    "clickbench_searchphrase/bloom/equals/false_positive_share": {
+      "predict": 0.03,
+      "band": [
+        0.0,
+        0.15
+      ]
+    },
+    "clickbench_searchphrase/build_cpu_over_zstd": {
+      "predict": 3.0,
+      "band": [
+        1.0,
+        10.0
+      ]
+    },
+    "clickbench_searchphrase/candidate_grams": {
+      "predict": 500.0,
+      "band": [
+        100.0,
+        1500.0
+      ]
+    },
+    "clickbench_searchphrase/column_bytes": {
+      "predict": 3528017.0,
+      "band": [
+        3528017.0,
+        3528017.0
+      ]
+    },
+    "clickbench_searchphrase/compressed_bytes": {
+      "predict": 2380000.0,
+      "band": [
+        1600000.0,
+        3100000.0
+      ]
+    },
+    "clickbench_searchphrase/contains/like/cells_tested_per_row": {
+      "predict": 0.05,
+      "band": [
+        0.002,
+        1.2
+      ]
+    },
+    "clickbench_searchphrase/eval_equals_bloom_testable": {
+      "predict": 40.0,
+      "band": [
+        40.0,
+        40.0
+      ]
+    },
+    "clickbench_searchphrase/fallback_bits": {
+      "predict": 1200.0,
+      "band": [
+        256.0,
+        2100.0
+      ]
+    },
+    "clickbench_searchphrase/fallback_density": {
+      "predict": 0.95,
+      "band": [
+        0.7,
+        1.0
+      ]
+    },
+    "clickbench_searchphrase/learned_bits": {
+      "predict": 300.0,
+      "band": [
+        30.0,
+        1300.0
+      ]
+    },
+    "clickbench_searchphrase/lines": {
+      "predict": 1000000.0,
+      "band": [
+        1000000.0,
+        1000000.0
+      ]
+    },
+    "clickbench_searchphrase/production/equals/false_positive_share": {
+      "predict": 0.03,
+      "band": [
+        0.0,
+        0.15
+      ]
+    },
+    "clickbench_searchphrase/saturation/blocks": {
+      "predict": 1.0,
+      "band": [
+        1.0,
+        1.0
+      ]
+    },
+    "clickbench_searchphrase/saturation/fallback_density": {
+      "predict": 0.9,
+      "band": [
+        0.5,
+        1.0
+      ]
+    },
+    "clickbench_searchphrase/saturation/long_values": {
+      "predict": 4.0,
+      "band": [
+        4.0,
+        4.0
+      ]
+    },
+    "clickbench_searchphrase/saturation/unseen/like/false_positive_share": {
+      "predict": 0.8,
+      "band": [
+        0.3,
+        1.0
+      ]
+    },
+    "clickbench_searchphrase/seen/equals/false_positive_share": {
+      "predict": 0.6,
+      "band": [
+        0.1,
+        0.95
+      ]
+    },
+    "clickbench_searchphrase/seen/like/false_positive_share": {
+      "predict": 0.6,
+      "band": [
+        0.1,
+        0.95
+      ]
+    },
+    "clickbench_searchphrase/summary/equals_bloom_testable/false_positive_share": {
+      "predict": 0.95,
+      "band": [
+        0.7,
+        1.0
+      ]
+    },
+    "clickbench_searchphrase/summary/like/cells_tested_share": {
+      "predict": 1.0,
+      "band": [
+        0.8,
+        1.0
+      ]
+    },
+    "clickbench_searchphrase/summary_bytes_share": {
+      "predict": 0.0099,
+      "band": [
+        0.0095,
+        0.01
+      ]
+    },
+    "clickbench_searchphrase/unseen/equals/false_positive_share": {
+      "predict": 0.95,
+      "band": [
+        0.7,
+        1.0
+      ]
+    },
+    "clickbench_searchphrase/unseen/equals_absent/false_positive_share": {
+      "predict": 0.95,
+      "band": [
+        0.7,
+        1.0
+      ]
+    },
+    "clickbench_searchphrase/unseen/like/false_positive_share": {
+      "predict": 0.95,
+      "band": [
+        0.7,
+        1.0
+      ]
+    },
+    "clickbench_searchphrase/unseen/like_absent/false_positive_share": {
+      "predict": 0.95,
+      "band": [
+        0.7,
+        1.0
+      ]
+    },
+    "clickbench_searchphrase/zstd_cpu_s": {
+      "predict": 0.05,
+      "band": [
+        0.015,
+        0.15
+      ]
+    }
+  },
+  "checked": {
+    "problems": [],
+    "misses": [
+      "clickbench_searchphrase/bits_per_block: 408 outside band [900.0, 2100.0]",
+      "clickbench_searchphrase/compressed_bytes: 677428 outside band [1600000.0, 3100000.0]",
+      "clickbench_searchphrase/summary/equals_bloom_testable/false_positive_share: 0.6385390428211587 outside band [0.7, 1.0]",
+      "clickbench_searchphrase/unseen/equals/false_positive_share: 0.6385390428211587 outside band [0.7, 1.0]",
+      "clickbench_searchphrase/unseen/equals_absent/false_positive_share: 0.5304878048780488 outside band [0.7, 1.0]",
+      "clickbench_searchphrase/unseen/like/false_positive_share: 0.6978644872132876 outside band [0.7, 1.0]",
+      "clickbench_searchphrase/unseen/like_absent/false_positive_share: 0.6231707317073171 outside band [0.7, 1.0]"
+    ]
+  },
+  "decision": {
+    "subject": "clickbench_searchphrase",
+    "go": false,
+    "saturation": "body-ineligible",
+    "line": "string_fingerprint decision clickbench_searchphrase: NO-GO; unseen_equals_fp=0.6385 unseen_like_fp=0.6979 (bar 0.1); summary_bytes_share=0.0099 (bar 0.01); build_cpu_over_zstd=3.0172 (bar 2); fails: unseen_equals, unseen_like, cpu; saturation body-ineligible (saturation_fp=0.5882, bar 0.3)"
+  }
+}

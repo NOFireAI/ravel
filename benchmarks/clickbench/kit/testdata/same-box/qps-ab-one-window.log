@@ -1,0 +1,3 @@
+# Synthetic: one window per arm, which the gate refuses.
+window=1 arm=old qps=0.500 err_ratio=0.0200 connections=10 duration_s=600 seed=clickbench
+window=2 arm=new qps=0.600 err_ratio=0.0100 connections=10 duration_s=600 seed=clickbench

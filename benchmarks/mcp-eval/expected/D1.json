@@ -1,0 +1,18 @@
+{
+  "id": "D1",
+  "answer_facts": [
+    {"fact": "the refusal is quoted exactly", "pattern": "@first_failure_message"},
+    {"fact": "the corrected statement uses severity_text or severity_num", "pattern": "severity_text|severity_num"},
+    {"fact": "716 INFO rows", "pattern": "\\b716\\b"},
+    {"fact": "3 WARN rows", "pattern": "warn[^0-9]{0,20}\\b3\\b|\\b3\\b[^0-9]{0,20}warn"},
+    {"fact": "6 ERROR rows", "pattern": "error[^0-9]{0,20}\\b6\\b|\\b6\\b[^0-9]{0,20}error"}
+  ],
+  "evidence": [
+    {"item": "the corrected query text", "pattern": "group by"}
+  ],
+  "expected_failure_classes": ["validation"],
+  "retry_bound": 1,
+  "tools_expected": ["ravel_explain_query", "ravel_describe_data", "ravel_query_sql"],
+  "call_bound": 4,
+  "fixture_refs": ["counts.log_rows", "counts.error_log_rows"]
+}

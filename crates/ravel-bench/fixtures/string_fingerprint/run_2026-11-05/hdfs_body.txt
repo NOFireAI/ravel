@@ -1,0 +1,40 @@
+string_fingerprint stamp git=a2a8c50678f5b61cfe395605f000826152067e5e arch=x86_64 nproc=16 mem_total_kib=32132612 corpus_file=HDFS.log corpus_sha256=0783096174d7832c618337f9609e06e04abd86ddd7089b3c12b407e63bfebc52 corpus_bytes=1577982906 zstd_level=3 cpu_clock=CLOCK_THREAD_CPUTIME_ID
+string_fingerprint params column=value gram_len=3 budget_share=0.01 fallback_min_bits=256 zstd_level=3 block_records=8192 object_records=262144 max_lines=11175629 seed=3710 literals_per_kind=40 eq_max_len=1024 like_min_len=5 like_max_len=12
+string_fingerprint workload training present equals=20 like=20 absent equals=20 like=20; evaluation present equals=20 like=20 absent equals=20 like=20
+string_fingerprint figure hdfs_body/lines = 11175629 predict 11175629 band [11175629, 11175629] ok
+string_fingerprint figure hdfs_body/blocks = 1365 predict 1365 band [1365, 1365] ok
+string_fingerprint figure hdfs_body/column_bytes = 1555631648 predict 1555631648 band [1555631648, 1555631648] ok
+string_fingerprint figure hdfs_body/compressed_bytes = 155256427 predict 155256427 band [108700000, 201800000] ok
+string_fingerprint figure hdfs_body/zstd_cpu_s = 2.7121428219999997 predict 3.1 band [1, 9.5] ok
+string_fingerprint figure hdfs_body/build_cpu_over_zstd = 9.215074646979636 predict 2.5 band [1, 6] MISS
+string_fingerprint figure hdfs_body/candidate_grams = 1425 predict 1200 band [300, 3500] ok
+string_fingerprint figure hdfs_body/learned_bits = 677 predict 300 band [20, 2000] ok
+string_fingerprint figure hdfs_body/fallback_bits = 8403 predict 8800 band [4000, 11900] ok
+string_fingerprint figure hdfs_body/bits_per_block = 9080 predict 9100 band [6300, 11900] ok
+string_fingerprint figure hdfs_body/summary_bytes_share = 0.00999189553679475 predict 0.0099 band [0.0095, 0.01] ok
+string_fingerprint figure hdfs_body/fallback_density = 0.1951075383420973 predict 0.5 band [0.2, 0.85] MISS
+string_fingerprint figure hdfs_body/eval_equals_bloom_testable = 0 predict 0 band [0, 0] ok
+string_fingerprint figure hdfs_body/seen/equals/false_positive_share = 0.10692561377794063 predict 0.6 band [0.1, 0.95] ok
+string_fingerprint figure hdfs_body/seen/like/false_positive_share = 0.29276050080775445 predict 0.6 band [0.1, 0.95] ok
+string_fingerprint figure hdfs_body/unseen/equals/false_positive_share = 0.05776841333821913 predict 0.95 band [0.7, 1] MISS
+string_fingerprint figure hdfs_body/unseen/like/false_positive_share = 0.25878390446786254 predict 0.9 band [0.5, 1] MISS
+string_fingerprint figure hdfs_body/unseen/equals_absent/false_positive_share = 0.03600732600732601 predict 0.95 band [0.7, 1] MISS
+string_fingerprint figure hdfs_body/unseen/like_absent/false_positive_share = 0.133003663003663 predict 0.9 band [0.5, 1] MISS
+string_fingerprint figure hdfs_body/production/equals/false_positive_share = 1 predict 1 band [0.95, 1] ok
+string_fingerprint figure hdfs_body/contains/like/cells_tested_per_row = 1 predict 1 band [0.8, 1.2] ok
+string_fingerprint figure hdfs_body/summary/like/cells_tested_share = 0.46815057568571755 predict 0.95 band [0.6, 1] MISS
+string_fingerprint figure hdfs_body/saturation/long_values = 0 predict 0 band [0, 0] ok
+string_fingerprint figure hdfs_body/bloom/equals/false_positive_share absent as pre-registered (no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0))
+string_fingerprint figure hdfs_body/saturation/blocks absent as pre-registered (no value over 1024 bytes (describe over_1024_bytes=0))
+string_fingerprint figure hdfs_body/saturation/fallback_density absent as pre-registered (no value over 1024 bytes (describe over_1024_bytes=0))
+string_fingerprint figure hdfs_body/saturation/unseen/like/false_positive_share absent as pre-registered (no value over 1024 bytes (describe over_1024_bytes=0))
+string_fingerprint figure hdfs_body/summary/equals_bloom_testable/false_positive_share absent as pre-registered (no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0))
+string_fingerprint decision hdfs_body: NO-GO; unseen_equals_fp=0.0578 unseen_like_fp=0.2588 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=9.2151 (bar 2); fails: unseen_like, cpu; saturation untested (no value over 1024 bytes) (saturation_fp=missing, bar 0.3)
+string_fingerprint objects=43 object_bytes=171424434
+string_fingerprint miss hdfs_body/build_cpu_over_zstd: 9.215074646979636 outside band [1.0, 6.0]
+string_fingerprint miss hdfs_body/fallback_density: 0.1951075383420973 outside band [0.2, 0.85]
+string_fingerprint miss hdfs_body/summary/like/cells_tested_share: 0.46815057568571755 outside band [0.6, 1.0]
+string_fingerprint miss hdfs_body/unseen/equals/false_positive_share: 0.05776841333821913 outside band [0.7, 1.0]
+string_fingerprint miss hdfs_body/unseen/equals_absent/false_positive_share: 0.03600732600732601 outside band [0.7, 1.0]
+string_fingerprint miss hdfs_body/unseen/like/false_positive_share: 0.25878390446786254 outside band [0.5, 1.0]
+string_fingerprint miss hdfs_body/unseen/like_absent/false_positive_share: 0.133003663003663 outside band [0.5, 1.0]

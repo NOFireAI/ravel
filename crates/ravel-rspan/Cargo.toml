@@ -1,0 +1,33 @@
+[package]
+name = "ravel-rspan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "RSPAN v1: Ravel's columnar span segment format (ADR-0041)."
+
+[features]
+# Test-only (ADR-4233 decision 9, issue #4242): adds the drill version, v5's
+# bytes under trailer version 6, widens the reader window to {6, 5} and lets
+# `WriteVersion::new(6)` succeed, so compatibility tests run against two real
+# versions. Off by default; scripts/guards/check-release-profile.sh refuses it
+# in the published-image build and in any default or non-dev feature set.
+format-drill = []
+
+[dependencies]
+thiserror = { workspace = true }
+zstd = { workspace = true }
+crc32c = { workspace = true }
+prost = { workspace = true }
+ravel-codec = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+protox = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+blake3 = { workspace = true }
+
+[lints]
+workspace = true
