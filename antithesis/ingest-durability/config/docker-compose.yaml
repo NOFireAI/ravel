@@ -111,3 +111,6 @@ services:
     environment:
       RAVEL_NODES: http://ravel1:4318,http://ravel2:4318
       RAVEL_TOKEN: wl-token
+      # The eventually's full-table reads are proven at about 2400 writes in
+      # the local loop; past this cap the write rules stop writing.
+      WORKLOAD_MAX_WRITES: "2500"

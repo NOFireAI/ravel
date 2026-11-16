@@ -15,12 +15,15 @@ attempts that could have written it.
 - `rustfs`: the only durable component, a RustFS container (the release and
   digest the repository's quickstart stacks and the object-store contract CI
   lane already run). RustFS supports every operation Ravel requires,
-  including create-if-absent and compare-and-swap. Its default durability mode,
-  `strict`, fsyncs payload, metadata and directory entries before it acknowledges
-  a PUT. The compose file sets that mode explicitly, so a killed `rustfs`
-  container never loses an acknowledged PUT. Ravel promises only the store's
-  own durability floor, so a store that lost acked PUTs would show up as a
-  Ravel loss. MinIO was not chosen because nothing in this repository runs
+  including create-if-absent and compare-and-swap. RustFS's documentation
+  (docs/operations/durability-modes.md in rustfs/rustfs) describes its default
+  mode, `strict`, as what it has always shipped: payload, metadata and
+  directory entries are fsynced before a PUT is acknowledged. The compose file
+  sets that mode explicitly, but the 1.0.0 image does not log the mode it
+  resolved, so this rests on RustFS's documentation rather than on an
+  observation. Ravel promises only the store's own durability floor, so a store
+  that lost acked PUTs would show up as a Ravel loss. When a durability failure
+  follows a `rustfs` kill, suspect the store first. MinIO was not chosen because nothing in this repository runs
   against it, while RustFS is the backend the contract CI lane checks.
 - `init`: a one-shot that creates the bucket and runs `ravel-cli store
   qualify`, which ravel-server requires before it serves.
@@ -115,6 +118,12 @@ Exploration assertions:
   metrics); a graceful drain started by a signal; and a drain that did not
   complete cleanly.
 
+Some of these may stay unreached even in long runs, so read their absence as
+coverage, not as a finding. The 429 shed needs a process-wide budget to fill.
+`ShardUnavailable` needs a dead shard actor. An unclean drain needs a stop
+fault during a store outage. A partial success needs a clock skip larger than
+the 10 minute future-skew bound in the middle of a request.
+
 The flush, retry and abandon logic itself lives in `ravel-ingest`. It carries
 no assertions yet: the SDK is linked only into ravel-server. Its outcomes are
 observed at the handler instead.
@@ -146,11 +155,13 @@ The scope is ingest durability only:
   during a store outage would stay down for the rest of the timeline. Each node's
   entrypoint therefore waits until the bucket answers a signed list, then
   `exec`s ravel-server. The window between that check and the server's own
-  read remains.
+  read remains. When "the system recovers once faults stop" fails, first
+  look for "refusing to start" in the down node's log.
 - `snouty validate` on an Apple Silicon Mac needs Docker Desktop's Rosetta
   emulation. Under its QEMU fallback, the amd64 `ravel-cli` in `init` crashes
   with a segmentation fault, and setup never completes. Validate on an amd64 host,
-  or turn Rosetta on.
+  or turn Rosetta on. `SKIP_VALIDATE=1 scripts/launch.sh ...` launches without
+  the local validation, for use once the same config passed on an amd64 host.
 
 ### New external dependencies
 
@@ -199,7 +210,7 @@ The harness expects these fault flags (`scripts/launch.sh`):
 
 Driver environment for the local loop: `WORKLOAD_EVENTUALLY=off` turns the
 eventually off, `WORKLOAD_EVENTUALLY_AFTER_SECS=N` runs it after N seconds,
-and `WORKLOAD_MAX_WRITES` caps the writes per timeline (default 5000).
+and `WORKLOAD_MAX_WRITES` caps the writes per timeline (the compose file sets 2500; the eventually is proven at about 2400 writes).
 `WORKLOAD_INJECT_MISSING_RECORD=1` is a self-check: the model then expects one
 record more than is sent for every 50th log write, so the presence assertions
 must fail.

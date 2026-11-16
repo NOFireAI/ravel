@@ -11,7 +11,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 CONFIG="$HERE/../config"
 REF=$(git -C "$HERE" rev-parse HEAD)
 
-snouty validate "$CONFIG" --timeout 10m
+# SKIP_VALIDATE=1 skips the local validation on a host that cannot run the
+# amd64 images (an Apple Silicon Mac without Rosetta emulation), once the same
+# config was validated on an amd64 host.
+if [ "${SKIP_VALIDATE:-}" != 1 ]; then
+    snouty validate "$CONFIG" --timeout 10m
+fi
 snouty launch --launcher basic_test --config "$CONFIG" \
     --test-name ravel-ingest-durability \
     --description "$DESC" \
