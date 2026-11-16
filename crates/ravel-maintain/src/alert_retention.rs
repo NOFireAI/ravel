@@ -186,10 +186,11 @@ pub struct AlertRetentionOutcome {
     /// of `kept`.
     pub gets_skipped_by_hour_prefilter: usize,
     /// Expired, past-horizon records kept because their data object's trailer
-    /// version is outside this build's reader window (ADR-4233 decision 4, H7).
-    /// An object a later build can read must survive this build's sweep, so the
-    /// whole record is kept and counted here and under `kept`, never deleted,
-    /// and each held object also counts into
+    /// version is outside this build's reader window, or a nested POSTINGS or
+    /// KEY_IDX section is at a version outside this build's read set (ADR-4233
+    /// decision 4, H7 and H5). An object a later build can read must survive
+    /// this build's sweep, so the whole record is kept and counted here and
+    /// under `kept`, never deleted, and each held object also counts into
     /// [`crate::retention::held_out_of_window_objects_total`]. A subset of
     /// `kept`. A corrupt object is not a hold: no build reads it, so it is
     /// swept as before.
@@ -311,13 +312,15 @@ pub async fn sweep_alert_retention(
                     outcome.kept += 1;
                     continue;
                 }
-                // Version hold (ADR-4233 decision 4, H7): an alert data object
-                // whose trailer version is outside this build's reader window is
-                // kept, never deleted. Alert objects are RLOG, so the same RLOG
-                // gate the audit sweep applies decides it. Keeping the object
-                // means keeping its commit record too, so a later build that can
-                // read it still finds the record that names it. A corrupt object
-                // is not held: no build reads it, so it is swept as before.
+                // Version hold (ADR-4233 decision 4, H7 and H5): an alert data
+                // object whose trailer version is outside this build's reader
+                // window, or whose nested POSTINGS or KEY_IDX section version is
+                // outside its read set, is kept, never deleted. Alert objects
+                // are RLOG, so the same RLOG gate the audit sweep applies
+                // decides it. Keeping the object means keeping its commit record
+                // too, so a later build that can read it still finds the record
+                // that names it. A corrupt object is not held: no build reads it,
+                // so it is swept as before.
                 let held = held_out_of_window_rlog(store, std::slice::from_ref(&data_key)).await?;
                 if !held.is_empty() {
                     tracing::warn!(
@@ -538,6 +541,106 @@ mod tests {
             out.push(seed_alert(store, tenant, writer, *seq, ts).await);
         }
         out
+    }
+
+    /// As [`seed_alert_created`], but the data object is a real `.rlog` object
+    /// carrying a POSTINGS section, bumped above the read set when `bump` is
+    /// set. The sweep's version hold reads the object; the evaluator's opaque
+    /// body in the other seeders would carry no section to bump.
+    async fn seed_alert_rlog(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        seq: u64,
+        ts_ns: i64,
+        bump: bool,
+    ) -> Seeded {
+        let body = Bytes::from(crate::compat_certify::rlog_object_with_sections(bump));
+        let content_hash: [u8; 32] = *blake3::hash(&body).as_bytes();
+        let commit = record::build(NewCommitRecord {
+            tenant_hash: *tenant,
+            signal: Signal::Alerts,
+            shard: ALERT_SHARD,
+            writer_id: Uuid::from_u128(u128::from(seq)),
+            writer_epoch: ALERT_WRITER_EPOCH,
+            writer_seq: seq,
+            object_size: body.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: ts_ns,
+            max_event_ts_ns: ts_ns,
+            min_ingest_ts_ns: ts_ns,
+            max_ingest_ts_ns: ts_ns,
+            segment_format_version: u32::from(ravel_logseg::footer::WriteVersion::CURRENT.number()),
+            created_unix_ns: ts_ns,
+            ingest_hour_bucket: hour_of(ts_ns),
+        })
+        .expect("build alert commit record");
+        let data_key = keys::reconstruct_data_key(&commit).expect("data key");
+        store
+            .put(&data_key, body, PutOptions::create_if_absent())
+            .await
+            .expect("put alert data object");
+        let commit_key = keys::commit_key_for_record(&commit).expect("commit key");
+        store
+            .put(
+                &commit_key,
+                record::encode(&commit),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put alert commit record");
+        Seeded {
+            commit_key,
+            data_key,
+            ts_ns,
+        }
+    }
+
+    /// ADR-4233 decision 4, hazard H5: an expired alert data object whose
+    /// trailer version is in window but whose nested POSTINGS section is at a
+    /// grammar version this build cannot read is held, not deleted. Alerts had
+    /// no retention version hold before this change, so without it the object
+    /// would be deleted. The readable control is swept, proving the hold is
+    /// section-specific rather than a blanket refusal.
+    #[tokio::test]
+    async fn unreadable_section_version_alert_object_is_held() {
+        let store = MemoryStore::new();
+        let tenant = tenant();
+        let now = 400 * NS_PER_DAY;
+        let clock = FixedClock::new(now);
+        let config = CompactorConfig::default();
+        let keep = keep_none_below(now);
+
+        let held = seed_alert_rlog(&store, &tenant, 1, now - 100 * NS_PER_DAY, true).await;
+        let swept = seed_alert_rlog(&store, &tenant, 2, now - 99 * NS_PER_DAY, false).await;
+
+        let outcome = sweep_alert_retention(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant,
+            ALERT_SHARD,
+            &keep,
+        )
+        .await
+        .expect("sweep");
+
+        assert_eq!(outcome.held_out_of_window, 1, "{outcome:?}");
+        assert_eq!(outcome.records_deleted, 1, "the readable record is swept");
+        assert!(
+            exists(&store, &held.data_key).await,
+            "the held object stays"
+        );
+        assert!(
+            exists(&store, &held.commit_key).await,
+            "its record stays too"
+        );
+        assert!(
+            !exists(&store, &swept.data_key).await,
+            "the readable object goes"
+        );
     }
 
     /// The acceptance test (ADR-1688 follow-up task 1). An alert history

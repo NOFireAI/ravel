@@ -43,6 +43,7 @@ pub mod claim_guard;
 pub mod clock;
 pub mod codec;
 pub mod compact;
+pub mod compat_certify;
 pub mod compat_policy;
 pub mod config;
 pub mod discover;
@@ -50,6 +51,7 @@ pub mod erasure_rewrite;
 pub mod error;
 mod format_floor;
 pub mod gc_config;
+pub mod late_writes;
 pub mod legal_hold;
 pub mod memo_snapshot;
 pub mod migrate;
@@ -86,6 +88,7 @@ pub use compact::{
     buckets_held_unknown_section_total, compact_bucket, compact_bucket_claimed,
     compaction_inputs_skipped_total, compaction_refused_total, compactions_in_flight,
 };
+pub use compat_certify::{CertifyRefusal, CertifyReport, CertifyTimings, certify};
 pub use compat_policy::{
     CompatRun, CompatRunRefusal, DEFAULT_PUBLISH_LIFETIME_NS, FamilyVersions, MaintainCompatPolicy,
     compat_publish_refused_snapshot, compat_publish_refused_total,
@@ -119,6 +122,7 @@ pub use gc_config::{
     validate_maintain, validate_maintain_compaction_lifetime, validate_maintain_skew,
     validate_query_deadline, validate_query_head_cache_ttl,
 };
+pub use late_writes::{LateWrite, LateWriteReport, late_write_pass};
 pub use legal_hold::{
     AUDIT_HOLD_SHARD, LegalHoldCheck, shard_hold_scopes, write_hold_clear,
     write_hold_clear_with_compat, write_hold_set, write_hold_set_with_compat,
