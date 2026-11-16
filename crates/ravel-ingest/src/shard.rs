@@ -3290,6 +3290,8 @@ mod tests {
     use ravel_types::METRIC_NAME_LABEL;
     use tokio::sync::watch;
 
+    use crate::compat_get_store::{CompatGet, CompatGetStore};
+
     use super::*;
     use crate::budget::{IngestByteBudget, IngestByteBudgetLimit};
     use crate::config::NS_PER_HOUR;
@@ -6557,40 +6559,39 @@ mod tests {
         versions
     }
 
-    /// A store whose `sys/compat` GET fails with a permanent error (as an
-    /// `AccessDenied` from a credential without the grant does), when
-    /// `denied`, and `acme` provisioned in it; a view that tried to read it,
-    /// aged past the horizon.
-    async fn unread_view(
-        denied: bool,
+    /// A store with `acme` provisioned in it whose `sys/compat` GET answers
+    /// as `get` says, and a view that refreshed once against it. A
+    /// `Passthrough` refresh reads the record absent, a successful read.
+    async fn view_after_one_refresh(
+        get: CompatGet,
     ) -> (
-        Arc<FaultStore<MemoryStore>>,
+        Arc<CompatGetStore>,
         Arc<CompatTestClock>,
         ravel_catalog::CompatView,
     ) {
-        use ravel_object_store::fault::{FaultKind, Rule, ScriptedFault};
-        let plan = if denied {
-            FaultPlan::empty().with_rule(
-                Rule::new(Op::Get, ScriptedFault::Permanent("access denied".into()))
-                    .with_key_contains(ravel_catalog::compat::COMPAT_KEY),
-            )
-        } else {
-            FaultPlan::empty()
-        };
-        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
-        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let compat_store = Arc::new(CompatGetStore::new(get));
+        let store: Arc<dyn ObjectStoreBackend> = compat_store.clone();
         let compat_clock = CompatTestClock::at(BASE_NS);
         provision(store.as_ref(), &TenantId::new("acme")).await;
         let view =
             ravel_catalog::CompatView::new(Arc::clone(&store), compat_keys(), compat_clock.clone());
-        assert_eq!(view.refresh().await.is_err(), denied);
+        let refreshed = view.refresh().await;
+        match get {
+            CompatGet::Passthrough => assert!(!refreshed.expect("absent reads").present),
+            CompatGet::AccessDenied => {
+                assert!(refreshed.expect_err("denied").is_access_denied());
+            }
+            CompatGet::ServerError => {
+                assert!(!refreshed.expect_err("5xx").is_access_denied());
+            }
+        }
         assert_eq!(
-            fault_store.fault_count(Op::Get, FaultKind::Permanent) > 0,
-            denied
+            compat_store.failed(),
+            usize::from(get != CompatGet::Passthrough),
+            "{get:?}"
         );
         assert!(!view.record_seen());
-        compat_clock.advance_ns(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS);
-        (fault_store, compat_clock, view)
+        (compat_store, compat_clock, view)
     }
 
     /// One strict write of `acme` through `router`, flushed by one tick.
@@ -6607,49 +6608,92 @@ mod tests {
         write.await.expect("write task")
     }
 
-    /// ADR-4233 decision 3: a `sys/compat` that was never read (its GET
-    /// fails) or was read absent, on a bucket at `compat_epoch` 0, keeps
-    /// publishing at the baseline past the horizon, because each attempt asks
-    /// the view with the bucket's record. A bare freshness check before each
-    /// PUT refuses the first one.
+    /// ADR-4233 decision 3: a view that no refresh has succeeded for and
+    /// whose latest refresh was refused with `AccessDenied` (a credential
+    /// without the `sys/compat` grant) is blind. On a bucket at
+    /// `compat_epoch` 0 it keeps publishing at the baseline past the horizon,
+    /// because each attempt asks the view with the bucket's record. A bare
+    /// freshness check before each PUT refuses the first one.
     #[tokio::test]
-    async fn an_unread_or_absent_sys_compat_on_an_unfenced_bucket_publishes_at_the_baseline() {
-        for denied in [true, false] {
-            let (fault_store, compat_clock, view) = unread_view(denied).await;
-            let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
-            let clock = TestClock::new(BASE_NS);
-            let acme = TenantId::new("acme");
-            let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone());
-            let router = compat_router(
-                one_permit_one_queue(Duration::from_secs(3600)),
-                &store,
-                &clock,
-                policy,
-            );
+    async fn an_access_denied_never_read_view_on_an_unfenced_bucket_publishes_at_the_baseline() {
+        let (compat_store, compat_clock, view) =
+            view_after_one_refresh(CompatGet::AccessDenied).await;
+        compat_clock.advance_ns(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS);
+        let store: Arc<dyn ObjectStoreBackend> = compat_store.clone();
+        let clock = TestClock::new(BASE_NS);
+        let acme = TenantId::new("acme");
+        let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone());
+        let router = compat_router(
+            one_permit_one_queue(Duration::from_secs(3600)),
+            &store,
+            &clock,
+            policy,
+        );
 
-            strict_write(&router, &clock, "h0")
-                .await
-                .expect("written at the baseline");
-            assert_eq!(
-                committed_rseg_versions(store.as_ref(), &acme).await,
-                vec![u32::from(crate::SEGMENT_FORMAT_VERSION)],
-                "denied {denied}"
-            );
-            assert_eq!(bucket_compat_epoch(store.as_ref(), &acme).await, 0);
-            assert_eq!(refused(&router).total(), 0, "denied {denied}");
-            router.flush_all().await;
-        }
+        strict_write(&router, &clock, "h0")
+            .await
+            .expect("written at the baseline");
+        assert_eq!(
+            committed_rseg_versions(store.as_ref(), &acme).await,
+            vec![u32::from(crate::SEGMENT_FORMAT_VERSION)]
+        );
+        assert_eq!(bucket_compat_epoch(store.as_ref(), &acme).await, 0);
+        assert_eq!(refused(&router).total(), 0);
+        router.flush_all().await;
     }
 
-    /// ADR-4233 decision 3: past the horizon, a view whose `sys/compat` GET
-    /// fails refuses a bucket that carries a fence, and a view that has read
-    /// a record refuses an unfenced bucket. Both are counted under
-    /// `view_stale` and store nothing.
+    /// ADR-4233 decision 3: a view that no refresh has succeeded for and
+    /// whose latest refresh failed with a store error other than
+    /// `AccessDenied` (here a 503) cannot tell whether an activation
+    /// happened, so it is not blind. The same flush on a bucket at
+    /// `compat_epoch` 0 is refused under `view_stale` at once, inside the
+    /// horizon, and stores nothing.
     #[tokio::test]
-    async fn past_the_horizon_a_fenced_bucket_or_a_seen_record_is_refused_view_stale() {
+    async fn a_never_read_view_behind_a_5xx_refuses_an_unfenced_bucket_view_stale() {
+        let (compat_store, compat_clock, view) =
+            view_after_one_refresh(CompatGet::ServerError).await;
+        let store: Arc<dyn ObjectStoreBackend> = compat_store.clone();
+        let clock = TestClock::new(BASE_NS);
         let acme = TenantId::new("acme");
-        let (fault_store, compat_clock, view) = unread_view(true).await;
-        let denied: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone());
+        let router = compat_router(
+            one_permit_one_queue(Duration::from_secs(3600)),
+            &store,
+            &clock,
+            policy,
+        );
+
+        let err = strict_write(&router, &clock, "h0")
+            .await
+            .expect_err("a never-read view behind a 5xx is not blind");
+        assert_policy_refusal(&err, |r| {
+            matches!(
+                r,
+                ravel_catalog::CompatRefusal::ViewStale {
+                    last_read_unix_ns: None,
+                    now_unix_ns: BASE_NS,
+                }
+            )
+        });
+        assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 0);
+        assert_eq!(bucket_compat_epoch(store.as_ref(), &acme).await, 0);
+        assert_eq!(refused(&router).view_stale, 1);
+        assert_eq!(refused(&router).total(), 1);
+        router.flush_all().await;
+    }
+
+    /// ADR-4233 decision 3: past the horizon, a blind view (its only refresh
+    /// refused with `AccessDenied`) refuses a bucket that carries a fence,
+    /// and a view that has read `sys/compat`, present or absent, refuses an
+    /// unfenced bucket. Each is counted under `view_stale` and stores
+    /// nothing.
+    #[tokio::test]
+    async fn past_the_horizon_a_fenced_bucket_or_a_read_view_is_refused_view_stale() {
+        let acme = TenantId::new("acme");
+        let (denied_store, denied_clock, denied_view) =
+            view_after_one_refresh(CompatGet::AccessDenied).await;
+        denied_clock.advance_ns(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS);
+        let denied: Arc<dyn ObjectStoreBackend> = denied_store;
         ravel_catalog::raise_compat_fence(
             denied.as_ref(),
             &acme.hash(),
@@ -6660,15 +6704,28 @@ mod tests {
         .await
         .expect("fence acme");
 
+        let (absent_store, absent_clock, absent_view) =
+            view_after_one_refresh(CompatGet::Passthrough).await;
+        absent_clock.advance_ns(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS);
+        let absent: Arc<dyn ObjectStoreBackend> = absent_store;
+
         let seen: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         provision(seen.as_ref(), &acme).await;
         let seen_clock = CompatTestClock::at(BASE_NS);
         let seen_view = compat_view(&seen, &seen_clock, Some(compat_record(1, 7, 0))).await;
         seen_clock.advance_ns(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS);
 
-        for (store, view, compat_clock) in
-            [(denied, view, compat_clock), (seen, seen_view, seen_clock)]
-        {
+        for (case, store, view, compat_clock, last_read) in [
+            ("fenced, blind", denied, denied_view, denied_clock, None),
+            (
+                "read absent",
+                absent,
+                absent_view,
+                absent_clock,
+                Some(BASE_NS),
+            ),
+            ("read a record", seen, seen_view, seen_clock, Some(BASE_NS)),
+        ] {
             let clock = TestClock::new(BASE_NS);
             let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock);
             let router = compat_router(
@@ -6681,11 +6738,19 @@ mod tests {
                 .await
                 .expect_err("the view is past the horizon");
             assert_policy_refusal(&err, |r| {
-                matches!(r, ravel_catalog::CompatRefusal::ViewStale { .. })
+                matches!(
+                    r,
+                    ravel_catalog::CompatRefusal::ViewStale { last_read_unix_ns, .. }
+                        if *last_read_unix_ns == last_read
+                )
             });
-            assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 0);
-            assert_eq!(refused(&router).view_stale, 1);
-            assert_eq!(refused(&router).total(), 1);
+            assert_eq!(
+                objects(&tenant_keys(store.as_ref(), &acme).await),
+                0,
+                "{case}"
+            );
+            assert_eq!(refused(&router).view_stale, 1, "{case}");
+            assert_eq!(refused(&router).total(), 1, "{case}");
             router.flush_all().await;
         }
     }
