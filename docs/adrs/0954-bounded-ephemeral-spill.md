@@ -1698,7 +1698,7 @@ changes no code and no decision.
 The gate was pre-registered before the build existed, in #4154 comment
 6899799509. That registration has 18 band rows, the file and field each
 one reads, and the script that judges it: `m9-judge.py` and
-`m9-retry-judge.py`, with 35 and 109 cases. Run against the M8 logs, both
+`m9-retry-judge.py`, whose own test suites hold 35 and 109 cases. Run against the M8 logs, both
 scripts exit 1 on the rows the M8 binary misses. The owner set the
 concurrent QPS row to be reported against 0.95, not gated, and the upper
 edge of the string-byte row to 1.25 times the predicted cell in
@@ -1716,11 +1716,20 @@ the commit M8 ran. Every box returned a result row for all 43 statements,
 and no box had a null answer. The full results are #4154 comment
 6902901483.
 
-**The gate passed.** `m9-judge.py` passed 18 row-box cells and
-`m9-retry-judge.py` passed 32, with none missed and none not judged.
+**The gate passed.** Each script judges each of its band rows once per
+box it applies to, a row-box cell. `m9-judge.py` passed all 18 of its
+cells and `m9-retry-judge.py` all 32. No cell missed, and no cell was
+left without a figure.
+
 Statements 19, 34 and 35 have 49 retry lines across the serial passes
 and the three new-arm windows: 11 on c6a.large, 17 on c6a.xlarge and 21
-on c6a.2xlarge. 47 answered. The other 2 are c6a.large window lines, for
+on c6a.2xlarge. The registration banded the serial counts, from M8's
+logs: 3 each on c6a.large and c6a.xlarge, none on c6a.2xlarge. The run
+matched them, 9, 9 and 0. It recorded M8's window counts as reference
+only, since they depend on the scheduler: 3, 8 and 28 lines including
+failures, against M9's 2, 8 and 21.
+
+47 of the 49 lines answered. The other 2 are c6a.large window lines, for
 statements 19 and 35, that ran the bucketed route and then failed. Their
 plan, routed chunk size and recomputed budget were judged like every
 other line. Their rows-read check was not, because a failed retry stops
@@ -1730,15 +1739,15 @@ before it reads back; the judge records each as a note.
 
 | figure | band | result | outcome | source |
 |---|---|---|---|---|
-| statement 33 on c6a.large: plan and `bits` | bucket, `bits` 6 or 7 (7 predicted) | bucket, `bits` 7 on every try | inside | measured 2026-11-16, comment 6902901483 |
-| statement 33 on c6a.large: retry spill per try | at most 2.0 GB | 1.796 to 1.797 GB | inside | measured 2026-11-16, comment 6902901483 |
-| statement 33 hot, c6a.large | at most 56 s (about 35 s predicted) | 39.5 s; M8's sort-merge retry took 112 s | inside, prediction missed | measured 2026-11-16, comment 6902901483 |
-| statement 33 hot, c6a.xlarge and c6a.2xlarge | at most 1.10 x 16.8 s and 9.6 s | 17.1 s and 9.37 s | inside | measured 2026-11-16, comment 6902901483 |
-| statements 19, 34, 35: plan on every retry line | `bucket`, with a numeric `routed_chunk_bytes` equal to the recomputed budget | `bucket` on all 49 lines (11, 17, 21); `routed_chunk_bytes` numeric on every line and equal to the budget recomputed from the line's own inputs | inside | measured 2026-11-16, comment 6902901483 |
-| statements 19, 34, 35: bucket bytes against M8's sort-merge threshold | below it | 0.267 to 0.333 on c6a.large, 0.345 to 0.426 on c6a.xlarge, 0.373 to 0.503 on c6a.2xlarge | inside | measured 2026-11-16, comment 6902901483 |
-| statements 19, 34, 35: bucket bytes against the predicted cell | at most 1.25 x | every line inside; statement 19 at 1.002 of its `bits` 4 cell on c6a.2xlarge | inside | measured 2026-11-16, comment 6902901483 |
-| null answers, each box | 0 | 0 on all three | inside | measured 2026-11-16, comment 6902901483 |
-| concurrent QPS, new over v0.28.0 (reported, not gated) | 0.95 | 0.900, 0.667, 0.857 (M8: 0.847, 0.761, 0.744) | reported | measured 2026-11-16, comment 6902901483 |
+| statement 33 on c6a.large: plan and `bits` | bucket, `bits` 6 or 7 (7 predicted) | bucket, `bits` 7 on every try | inside | measured 2026-11-15, comment 6902901483 |
+| statement 33 on c6a.large: retry spill per try | at most 2.0 GB | 1.796 to 1.797 GB | inside | measured 2026-11-15, comment 6902901483 |
+| statement 33 hot, c6a.large | at most 56 s (about 35 s predicted) | 39.5 s; M8's sort-merge retry took 112 s | inside, prediction missed | measured 2026-11-15, comment 6902901483 |
+| statement 33 hot, c6a.xlarge and c6a.2xlarge | at most 1.10 x 16.8 s and 9.6 s | 17.1 s and 9.37 s | inside | measured 2026-11-15, comment 6902901483 |
+| statements 19, 34, 35: plan on every retry line | `bucket`, with a numeric `routed_chunk_bytes` equal to the recomputed budget | `bucket` on all 49 lines (11, 17, 21); `routed_chunk_bytes` numeric on every line and equal to the budget recomputed from the line's own inputs | inside | measured 2026-11-15, comment 6902901483 |
+| statements 19, 34, 35: bucket bytes against M8's sort-merge threshold | below it | 0.267 to 0.333 on c6a.large, 0.345 to 0.426 on c6a.xlarge, 0.373 to 0.503 on c6a.2xlarge | inside | measured 2026-11-15, comment 6902901483 |
+| statements 19, 34, 35: bucket bytes against the predicted cell | at most 1.25 x | every line inside; statement 19 at 1.002 of its `bits` 4 cell on c6a.2xlarge | inside | measured 2026-11-15, comment 6902901483 |
+| null answers, each box | 0 | 0 on all three | inside | measured 2026-11-15, comment 6902901483 |
+| concurrent QPS, new over v0.28.0 (reported, not gated) | 0.95 | 0.900, 0.667, 0.857 (M8: 0.847, 0.761, 0.744) | reported | measured 2026-11-15, comment 6902901483 |
 
 ### What the run shows beyond the gate
 
