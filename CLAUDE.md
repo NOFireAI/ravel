@@ -70,10 +70,13 @@ executors.
   key layout (docs/catalog-and-mvcc.md). Changing any of them requires an
   ADR, never an in-place edit. How the change is versioned depends on what
   changes:
-  - Every versioned binary format bumps its version: the RSEG, RLOG and
-    RSPAN layouts (their trailers and their section versions, such as
-    POSTINGS and KEY_IDX) and the catalog's binary objects (`.csnap`,
-    `.npost`, `.cstat` and the `.kidx` leaf).
+  - A change to a versioned binary layout bumps that layout's version: the
+    RSEG, RLOG and RSPAN layouts (their trailers and their section versions,
+    such as POSTINGS and KEY_IDX) and the envelopes of the catalog's binary
+    objects (`.csnap`, `.npost`, `.cstat` and the `.kidx` leaf). A proto
+    record carried inside such an object, such as a `.csnap` entry or part
+    header, follows the proto-record bullet below instead (ADR-0873 added
+    `SnapshotEntry` field 15 that way, with no bump).
   - The catalog HEAD bumps its version on any change (ADR-4233, H2): an
     older build's HEAD rebuild would otherwise strip the new field.
   - Series identity and commit tokens get a new domain string.
