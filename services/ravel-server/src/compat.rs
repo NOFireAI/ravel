@@ -76,12 +76,17 @@ pub enum CompatRefusalReason {
 }
 
 impl CompatRefusalReason {
-    /// The view-policy reasons every writer can raise, so each series renders
-    /// from the first scrape. A maintenance-only reason renders once counted.
-    pub const ALL: [CompatRefusalReason; 3] = [
+    /// The reasons an ingest writer can raise ([`ravel_ingest::CompatRefusalReason`]),
+    /// so each series renders from the first scrape. A maintenance-only reason
+    /// renders once counted.
+    pub const ALL: [CompatRefusalReason; 7] = [
         CompatRefusalReason::ViewStale,
         CompatRefusalReason::ActiveVersionNotWritable,
         CompatRefusalReason::CompatRecordMissing,
+        CompatRefusalReason::FenceFailed,
+        CompatRefusalReason::ActiveVersionMoved,
+        CompatRefusalReason::NoBucketView,
+        CompatRefusalReason::PublishLifetimeAboveCompat,
     ];
 
     /// Every named reason, in label order.
@@ -144,9 +149,10 @@ impl CompatRefusalReason {
 
     /// Add one ingest router's per-signal refusals ([`ravel_ingest`]) to
     /// `series`, keyed by `family` (the signal's format family), summing into
-    /// an existing `(family, reason)` entry or appending a new one. The ingest
-    /// routers count these in their own `IngestMetrics`, apart from the server
-    /// static and `ravel-maintain`, so `/metrics` sums them in here (#4301).
+    /// an existing `(family, reason)` entry or adding a new one, and leaves
+    /// `series` sorted by `(family, reason)`. The ingest routers count these
+    /// in their own `IngestMetrics`, apart from the server static and
+    /// `ravel-maintain`, so `/metrics` sums them in here (#4301).
     pub fn merge_ingest_refusals(
         series: &mut Vec<(CompatFamilyLabel, CompatRefusalReason, u64)>,
         family: &str,
@@ -167,6 +173,7 @@ impl CompatRefusalReason {
                 None => series.push((label, reason, count)),
             }
         }
+        series.sort_by_key(|(family, reason, _)| (*family, *reason));
     }
 }
 
@@ -417,6 +424,76 @@ mod tests {
         assert_eq!(
             CompatRefusalReason::of_maintain("a_reason_from_a_newer_build"),
             CompatRefusalReason::Other
+        );
+    }
+
+    /// Every reason an ingest router counts has a named label and is
+    /// pre-filled, so its series renders from the first scrape; a reason
+    /// missing from `ALL` renders only once counted.
+    #[test]
+    fn every_ingest_reason_is_named_and_pre_filled() {
+        for reason in ravel_ingest::CompatRefusalReason::ALL {
+            let label = CompatRefusalReason::of_label(reason.as_str());
+            assert_ne!(label, CompatRefusalReason::Other, "{reason:?}");
+            assert!(CompatRefusalReason::ALL.contains(&label), "{reason:?}");
+        }
+        assert_eq!(
+            CompatRefusalReason::ALL.len(),
+            ravel_ingest::CompatRefusalReason::ALL.len()
+        );
+        let series = merge_refusals(RefusalCounts::new(), Vec::new());
+        for reason in ["fence_failed", "active_version_moved", "no_bucket_view"] {
+            let reason = CompatRefusalReason::of_label(reason);
+            assert!(
+                series
+                    .iter()
+                    .any(|(f, r, c)| f.as_str() == "rseg" && *r == reason && *c == 0),
+                "{reason:?}: {series:?}"
+            );
+        }
+    }
+
+    /// An ingest refusal under a reason the series did not hold yet lands in
+    /// `(family, reason)` order, not at the end.
+    #[test]
+    fn merged_ingest_refusals_stay_sorted() {
+        let mut series = vec![
+            (
+                CompatFamilyLabel::of("rlog"),
+                CompatRefusalReason::ViewStale,
+                1,
+            ),
+            (
+                CompatFamilyLabel::of("rseg"),
+                CompatRefusalReason::ViewStale,
+                0,
+            ),
+        ];
+        let snapshot = ravel_ingest::CompatRefusalSnapshot {
+            compat_record_missing: 2,
+            view_stale: 3,
+            ..Default::default()
+        };
+        CompatRefusalReason::merge_ingest_refusals(&mut series, "rlog", &snapshot);
+        assert_eq!(
+            series,
+            vec![
+                (
+                    CompatFamilyLabel::of("rlog"),
+                    CompatRefusalReason::ViewStale,
+                    4,
+                ),
+                (
+                    CompatFamilyLabel::of("rlog"),
+                    CompatRefusalReason::CompatRecordMissing,
+                    2,
+                ),
+                (
+                    CompatFamilyLabel::of("rseg"),
+                    CompatRefusalReason::ViewStale,
+                    0,
+                ),
+            ]
         );
     }
 

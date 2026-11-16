@@ -6313,11 +6313,27 @@ mod tests {
         router.flush_all().await;
     }
 
+    /// Advances `clock` one [`crate::compat::STALE_VIEW_RETRY`] at a time,
+    /// `steps` times, letting a flush waiting out a stale view ask again
+    /// after each.
+    async fn stale_retries(clock: &TestClock, steps: usize) {
+        let step = i64::try_from(crate::compat::STALE_VIEW_RETRY.as_nanos()).expect("fits");
+        for _ in 0..steps {
+            clock.advance_ns(step);
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
     /// A view that ages to the horizon after the flush's grant, here while
-    /// the bucket fence is in flight, abandons the flush before its data PUT.
-    /// A check made only at grant (or at flush open) lets the PUT through.
+    /// the bucket fence is in flight, holds the flush before its data PUT
+    /// (ADR-4233 decision 3) without dropping its acknowledged rows: the
+    /// flush asks again until a refresh makes the view fresh, then publishes.
+    /// A check made only at grant (or at flush open) lets the PUT through
+    /// while stale; one that refuses the attempt drops the rows.
     #[tokio::test]
-    async fn a_view_stale_between_grant_and_put_abandons_the_flush_without_a_put() {
+    async fn a_view_stale_between_grant_and_put_waits_for_a_refresh_then_publishes() {
         let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
         let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
         let clock = TestClock::new(BASE_NS);
@@ -6325,7 +6341,7 @@ mod tests {
         let acme = TenantId::new("acme");
         provision(store.as_ref(), &acme).await;
         let view = compat_view(&store, &compat_clock, Some(compat_record(1, 7, 0))).await;
-        let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone())
+        let policy = crate::compat::IngestCompatPolicy::new(view.clone(), compat_clock.clone())
             .with_family_versions(FormatFamily::Rseg, vec![7], 6);
         let router = compat_router(
             one_permit_one_queue(Duration::from_secs(3600)),
@@ -6345,16 +6361,63 @@ mod tests {
             assert!(gate.release(id));
         }
 
+        stale_retries(&clock, 5).await;
+        assert!(!write.is_finished(), "the flush waits for a fresh view");
+        let held = tenant_keys(store.as_ref(), &acme).await;
+        assert_eq!(objects(&held), 0, "no PUT while the view is stale");
+        assert_eq!(held.len(), before.len());
+        assert_eq!(refused(&router).total(), 0);
+
+        view.refresh().await.expect("the view reads sys/compat again");
+        stale_retries(&clock, 2).await;
+        write
+            .await
+            .expect("write task")
+            .expect("published once the view is fresh");
+        assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 2);
+        assert_eq!(committed_rseg_versions(store.as_ref(), &acme).await, vec![7]);
+        assert_eq!(refused(&router).total(), 0);
+        router.flush_all().await;
+    }
+
+    /// The same flush when the view stays stale: refused `view_stale` only
+    /// once its `max_flush_lifetime` from grant elapses, with nothing stored.
+    #[tokio::test]
+    async fn a_view_stale_between_grant_and_put_is_refused_only_past_the_lifetime() {
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let clock = TestClock::new(BASE_NS);
+        let compat_clock = CompatTestClock::at(BASE_NS);
+        let acme = TenantId::new("acme");
+        provision(store.as_ref(), &acme).await;
+        let view = compat_view(&store, &compat_clock, Some(compat_record(1, 7, 0))).await;
+        let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone())
+            .with_family_versions(FormatFamily::Rseg, vec![7], 6);
+        let lifetime = Duration::from_secs(60);
+        let router = compat_router(one_permit_one_queue(lifetime), &store, &clock, policy);
+        let gate = fault_store.hold(Op::Put, Some("/prov".to_string()), Occurrence::Nth(1));
+
+        let write = spawn_write(&router, &acme, "h0", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        gate.wait_until_held(1).await;
+        compat_clock.advance_ns(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS);
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+
+        stale_retries(&clock, 30).await;
+        assert!(!write.is_finished(), "inside the lifetime the flush waits");
+        assert_eq!(refused(&router).total(), 0);
+        stale_retries(&clock, 31).await;
         let err = write
             .await
             .expect("write task")
-            .expect_err("the view went stale before the data PUT");
+            .expect_err("the lifetime elapsed with the view still stale");
         assert_policy_refusal(&err, |r| {
             matches!(r, ravel_catalog::CompatRefusal::ViewStale { .. })
         });
-        let after = tenant_keys(store.as_ref(), &acme).await;
-        assert_eq!(before, after, "no object was stored");
-        assert_eq!(objects(&after), 0);
+        assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 0);
         assert_eq!(refused(&router).view_stale, 1);
         assert_eq!(refused(&router).total(), 1);
         router.flush_all().await;
@@ -6373,12 +6436,21 @@ mod tests {
     }
 
     /// The view is asked before every PUT attempt, retries included: the
-    /// first attempt of `key_fragment`'s PUT is throttled, the view ages to
-    /// the horizon during the backoff, and the retry is never sent. A check
-    /// made only before the first attempt (or at grant) sends it.
+    /// first attempt of `key_fragment`'s PUT is throttled, and the view ages
+    /// to the horizon during the backoff. The retry is not sent while the
+    /// view is stale; with `recover` a refresh makes it fresh and the retry
+    /// goes out inside the same lifetime, and without it the attempt is
+    /// refused `view_stale` once the lifetime elapses. A check made only
+    /// before the first attempt (or at grant) sends the retry stale; one that
+    /// refuses at once drops the rows even when the view recovers.
     async fn stale_at_retry(
         key_fragment: &str,
-    ) -> (Vec<String>, crate::compat::CompatRefusalSnapshot) {
+        recover: bool,
+    ) -> (
+        Result<crate::router::WriteReceipt, WriteError>,
+        Vec<String>,
+        crate::compat::CompatRefusalSnapshot,
+    ) {
         use ravel_object_store::fault::{Rule, ScriptedFault};
         let plan = FaultPlan::empty().with_rule(
             Rule::new(Op::Put, ScriptedFault::Throttled { retry_after_ms: 0 })
@@ -6392,12 +6464,12 @@ mod tests {
         let acme = TenantId::new("acme");
         provision(store.as_ref(), &acme).await;
         let view = compat_view(&store, &compat_clock, Some(compat_record(1, 7, 0))).await;
-        let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone());
+        let policy = crate::compat::IngestCompatPolicy::new(view.clone(), compat_clock.clone());
         // The full backoff, never a zero-jitter one, so the flush parks in it
         // until the clock moves.
         let router = Arc::new(
             IngestRouter::with_rng(
-                one_permit_one_queue(Duration::from_secs(3600)),
+                one_permit_one_queue(Duration::from_secs(60)),
                 Arc::clone(&store),
                 Signal::Metrics,
                 clock.clone(),
@@ -6414,36 +6486,72 @@ mod tests {
         clock.advance_ns(TICK_ADVANCE_NS);
         until(|| router.metrics().snapshot().put_retries >= 1).await;
         compat_clock.advance_ns(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS);
+        stale_retries(&clock, 30).await;
+        assert!(!write.is_finished(), "inside the lifetime the flush waits");
+        let held = tenant_keys(store.as_ref(), &acme).await;
+        assert_eq!(
+            held.iter().filter(|k| k.contains(key_fragment)).count(),
+            0,
+            "no retry is sent while the view is stale: {held:?}"
+        );
+        assert_eq!(router.metrics().snapshot().put_retries, 1);
+        assert_eq!(refused(&router).total(), 0);
+        if recover {
+            view.refresh().await.expect("the view reads sys/compat again");
+        }
         while !write.is_finished() {
-            clock.advance_ns(10_000_000);
-            tokio::task::yield_now().await;
+            stale_retries(&clock, 1).await;
         }
 
-        let err = write
-            .await
-            .expect("write task")
-            .expect_err("the view went stale before the retry");
-        assert_policy_refusal(&err, |r| {
-            matches!(r, ravel_catalog::CompatRefusal::ViewStale { .. })
-        });
-        assert_eq!(router.metrics().snapshot().put_retries, 1);
+        let written = write.await.expect("write task");
+        if recover {
+            assert_eq!(router.metrics().snapshot().put_retries, 1);
+        }
         let keys = tenant_keys(store.as_ref(), &acme).await;
         let snapshot = refused(&router);
         router.flush_all().await;
-        (keys, snapshot)
+        (written, keys, snapshot)
     }
 
     #[tokio::test]
-    async fn a_view_stale_at_a_data_put_retry_abandons_before_the_retry() {
-        let (keys, refused) = stale_at_retry("/l0/").await;
+    async fn a_view_stale_at_a_data_put_retry_waits_for_a_refresh_then_retries() {
+        let (written, keys, refused) = stale_at_retry("/l0/", true).await;
+        written.expect("published once the view is fresh");
+        assert_eq!(objects(&keys), 2, "{keys:?}");
+        assert_eq!(refused.total(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_view_stale_at_a_data_put_retry_is_refused_only_past_the_lifetime() {
+        let (written, keys, refused) = stale_at_retry("/l0/", false).await;
+        let err = written.expect_err("the lifetime elapsed with the view still stale");
+        assert_policy_refusal(&err, |r| {
+            matches!(r, ravel_catalog::CompatRefusal::ViewStale { .. })
+        });
         assert_eq!(objects(&keys), 0, "{keys:?}");
         assert_eq!(refused.view_stale, 1);
         assert_eq!(refused.total(), 1);
     }
 
     #[tokio::test]
-    async fn a_view_stale_at_a_commit_put_retry_abandons_before_the_retry() {
-        let (keys, refused) = stale_at_retry("/c/").await;
+    async fn a_view_stale_at_a_commit_put_retry_waits_for_a_refresh_then_retries() {
+        let (written, keys, refused) = stale_at_retry("/c/", true).await;
+        written.expect("published once the view is fresh");
+        assert_eq!(
+            keys.iter().filter(|k| k.contains("/c/")).count(),
+            1,
+            "the commit record went out after the refresh: {keys:?}"
+        );
+        assert_eq!(refused.total(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_view_stale_at_a_commit_put_retry_is_refused_only_past_the_lifetime() {
+        let (written, keys, refused) = stale_at_retry("/c/", false).await;
+        let err = written.expect_err("the lifetime elapsed with the view still stale");
+        assert_policy_refusal(&err, |r| {
+            matches!(r, ravel_catalog::CompatRefusal::ViewStale { .. })
+        });
         assert_eq!(
             keys.iter().filter(|k| k.contains("/c/")).count(),
             0,
@@ -6871,18 +6979,22 @@ mod tests {
 
     /// ADR-4233 decision 3: a view that no refresh has succeeded for and
     /// whose latest refresh failed with a store error other than
-    /// `AccessDenied` (here a 503) cannot tell whether an activation
-    /// happened, so it is not blind. The same flush on a bucket at
-    /// `compat_epoch` 0 is refused under `view_stale` at once, inside the
-    /// horizon, and stores nothing.
+    /// `AccessDenied` (here a 503 at startup) cannot tell whether an
+    /// activation happened, so it is not blind. A write on a bucket at
+    /// `compat_epoch` 0 is refused under `view_stale` at admission, inside
+    /// the horizon, before anything is acknowledged: a buffered write that
+    /// admission let through would be acknowledged and then dropped at
+    /// grant. Once a refresh succeeds and reads `sys/compat` absent, writes
+    /// publish at the baseline with the bucket left unfenced.
     #[tokio::test]
-    async fn a_never_read_view_behind_a_5xx_refuses_an_unfenced_bucket_view_stale() {
+    async fn a_never_read_view_behind_a_5xx_refuses_admission_until_a_refresh_then_publishes_at_the_baseline()
+     {
         let (compat_store, compat_clock, view) =
             view_after_one_refresh(CompatGet::ServerError).await;
         let store: Arc<dyn ObjectStoreBackend> = compat_store.clone();
         let clock = TestClock::new(BASE_NS);
         let acme = TenantId::new("acme");
-        let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone());
+        let policy = crate::compat::IngestCompatPolicy::new(view.clone(), compat_clock.clone());
         let router = compat_router(
             one_permit_one_queue(Duration::from_secs(3600)),
             &store,
@@ -6890,9 +7002,10 @@ mod tests {
             policy,
         );
 
-        let err = strict_write(&router, &clock, "h0")
+        let buffered = spawn_write(&router, &acme, "h0", WriteMode::Buffered)
             .await
-            .expect_err("a never-read view behind a 5xx is not blind");
+            .expect("write task");
+        let err = buffered.expect_err("a never-read view behind a 5xx is not blind");
         assert_policy_refusal(&err, |r| {
             matches!(
                 r,
@@ -6902,18 +7015,190 @@ mod tests {
                 }
             )
         });
+        assert_eq!(router.metrics().snapshot().buffered_points_total, 0);
+        let err = strict_write(&router, &clock, "h1")
+            .await
+            .expect_err("still not blind");
+        assert_policy_refusal(&err, |r| {
+            matches!(r, ravel_catalog::CompatRefusal::ViewStale { .. })
+        });
         assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 0);
         assert_eq!(bucket_compat_epoch(store.as_ref(), &acme).await, 0);
-        assert_eq!(refused(&router).view_stale, 1);
-        assert_eq!(refused(&router).total(), 1);
+        assert_eq!(refused(&router).view_stale, 2);
+        assert_eq!(refused(&router).total(), 2);
+
+        compat_store.set_get(CompatGet::Passthrough);
+        assert!(!view.refresh().await.expect("absent reads").present);
+        strict_write(&router, &clock, "h2")
+            .await
+            .expect("written at the baseline");
+        assert_eq!(
+            committed_rseg_versions(store.as_ref(), &acme).await,
+            vec![u32::from(crate::SEGMENT_FORMAT_VERSION)]
+        );
+        assert_eq!(bucket_compat_epoch(store.as_ref(), &acme).await, 0);
+        assert_eq!(refused(&router).total(), 2);
         router.flush_all().await;
+    }
+
+    /// ADR-4233 decision 3: an outage of `sys/compat` that outlasts the
+    /// horizon after a read that found it absent. Admission refuses new
+    /// writes `view_stale`. A buffered write acknowledged before the outage
+    /// is not dropped at grant: its flush waits out the stale view and
+    /// publishes at the baseline once a refresh succeeds inside its
+    /// `max_flush_lifetime`, or is refused `view_stale`, counted and with
+    /// nothing stored, only once that lifetime elapses.
+    async fn outage_after_an_absent_read(recover: bool) {
+        let (compat_store, compat_clock, view) =
+            view_after_one_refresh(CompatGet::Passthrough).await;
+        let store: Arc<dyn ObjectStoreBackend> = compat_store.clone();
+        let clock = TestClock::new(BASE_NS);
+        let acme = TenantId::new("acme");
+        let policy = crate::compat::IngestCompatPolicy::new(view.clone(), compat_clock.clone());
+        let router = compat_router(
+            buffered_on_the_tick(Duration::from_secs(60)),
+            &store,
+            &clock,
+            policy,
+        );
+
+        spawn_write(&router, &acme, "h0", WriteMode::Buffered)
+            .await
+            .expect("write task")
+            .expect("acknowledged while the view is fresh");
+        compat_store.set_get(CompatGet::ServerError);
+        compat_clock.advance_ns(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS);
+        assert!(view.refresh().await.is_err(), "the outage fails the read");
+
+        let err = spawn_write(&router, &acme, "h1", WriteMode::Buffered)
+            .await
+            .expect("write task")
+            .expect_err("admission refuses past the horizon");
+        assert_policy_refusal(&err, |r| {
+            matches!(r, ravel_catalog::CompatRefusal::ViewStale { .. })
+        });
+        assert_eq!(router.metrics().snapshot().buffered_points_total, 1);
+        assert_eq!(refused(&router).view_stale, 1);
+
+        clock.advance_ns(TICK_ADVANCE_NS);
+        stale_retries(&clock, 30).await;
+        assert_eq!(
+            objects(&tenant_keys(store.as_ref(), &acme).await),
+            0,
+            "no PUT while the view is stale"
+        );
+        assert_eq!(refused(&router).view_stale, 1, "the flush is not dropped");
+
+        if recover {
+            compat_store.set_get(CompatGet::Passthrough);
+            view.refresh().await.expect("the outage ends");
+            for _ in 0..5 {
+                if objects(&tenant_keys(store.as_ref(), &acme).await) == 2 {
+                    break;
+                }
+                stale_retries(&clock, 1).await;
+            }
+            assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 2);
+            assert_eq!(
+                committed_rseg_versions(store.as_ref(), &acme).await,
+                vec![u32::from(crate::SEGMENT_FORMAT_VERSION)]
+            );
+            assert_eq!(bucket_compat_epoch(store.as_ref(), &acme).await, 0);
+            assert_eq!(refused(&router).total(), 1);
+        } else {
+            stale_retries(&clock, 31).await;
+            assert_eq!(refused(&router).view_stale, 2, "abandoned past the lifetime");
+            assert_eq!(refused(&router).total(), 2);
+            assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 0);
+        }
+        router.flush_all().await;
+    }
+
+    /// [`one_permit_one_queue`] with a buffered write's flush, too, opened
+    /// by the first tick past [`TICK_ADVANCE_NS`].
+    fn buffered_on_the_tick(max_flush_lifetime: Duration) -> IngestConfig {
+        IngestConfig {
+            max_flush_delay_idle: Duration::from_millis(50),
+            ..one_permit_one_queue(max_flush_lifetime)
+        }
+    }
+
+    /// ADR-4233 decision 7: `sys/compat` lowers `max_publish_lifetime_ns`
+    /// below the router's `max_flush_lifetime` after the router was built.
+    /// The next write is refused at admission and the flush already
+    /// acknowledged is refused at grant, both `publish_lifetime_above_compat`
+    /// with nothing stored; a check made only when the policy was installed
+    /// publishes it.
+    #[tokio::test]
+    async fn a_publish_lifetime_lowered_below_the_router_is_refused_at_admission_and_grant() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let clock = TestClock::new(BASE_NS);
+        let compat_clock = CompatTestClock::at(BASE_NS);
+        let acme = TenantId::new("acme");
+        provision(store.as_ref(), &acme).await;
+        let view = compat_view(&store, &compat_clock, Some(compat_record(1, 7, 0))).await;
+        let policy = crate::compat::IngestCompatPolicy::new(view.clone(), compat_clock.clone());
+        let router = compat_router(
+            buffered_on_the_tick(Duration::from_secs(3600)),
+            &store,
+            &clock,
+            policy,
+        );
+
+        spawn_write(&router, &acme, "h0", WriteMode::Buffered)
+            .await
+            .expect("write task")
+            .expect("acknowledged under an unbounded record");
+        ravel_catalog::compat::update_compat(store.as_ref(), &compat_keys(), |record| {
+            record.max_publish_lifetime_ns = 60_000_000_000;
+            Ok(())
+        })
+        .await
+        .expect("lower the publish lifetime");
+        view.refresh().await.expect("read sys/compat");
+
+        let above = |err: &WriteError| {
+            matches!(
+                err,
+                WriteError::CompatRefused(
+                    crate::compat::CompatPublishRefusal::PublishLifetimeAboveCompat {
+                        family: FormatFamily::Rseg,
+                        max_flush_lifetime_ns: 3_600_000_000_000,
+                        max_publish_lifetime_ns: 60_000_000_000,
+                    }
+                )
+            )
+        };
+        let err = spawn_write(&router, &acme, "h1", WriteMode::Buffered)
+            .await
+            .expect("write task")
+            .expect_err("refused at admission");
+        assert!(above(&err), "{err:?}");
+        assert_eq!(refused(&router).publish_lifetime_above_compat, 1);
+
+        clock.advance_ns(TICK_ADVANCE_NS);
+        let settled = settles(|| refused(&router).publish_lifetime_above_compat == 2).await;
+        assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 0);
+        assert!(settled, "{:?}", refused(&router));
+        assert_eq!(refused(&router).total(), 2);
+        router.flush_all().await;
+    }
+
+    #[tokio::test]
+    async fn an_outage_after_an_absent_read_publishes_acknowledged_rows_once_the_view_recovers() {
+        outage_after_an_absent_read(true).await;
+    }
+
+    #[tokio::test]
+    async fn an_outage_after_an_absent_read_abandons_acknowledged_rows_only_past_the_lifetime() {
+        outage_after_an_absent_read(false).await;
     }
 
     /// ADR-4233 decision 3: past the horizon, a blind view (its only refresh
     /// refused with `AccessDenied`) refuses a bucket that carries a fence,
     /// and a view that has read `sys/compat`, present or absent, refuses an
-    /// unfenced bucket. Each is counted under `view_stale` and stores
-    /// nothing.
+    /// unfenced bucket. Each is refused at admission, counted under
+    /// `view_stale`, and stores nothing.
     #[tokio::test]
     async fn past_the_horizon_a_fenced_bucket_or_a_read_view_is_refused_view_stale() {
         let acme = TenantId::new("acme");

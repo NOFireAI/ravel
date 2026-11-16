@@ -3,6 +3,7 @@
 //! a real [`StoreError::AccessDenied`] models a credential without the
 //! `sys/compat` grant, and any other error must not read as one.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
@@ -30,7 +31,7 @@ pub(crate) enum CompatGet {
 /// inner store.
 pub(crate) struct CompatGetStore {
     inner: MemoryStore,
-    get: CompatGet,
+    get: Mutex<CompatGet>,
     failed: AtomicUsize,
 }
 
@@ -38,9 +39,14 @@ impl CompatGetStore {
     pub(crate) fn new(get: CompatGet) -> Self {
         CompatGetStore {
             inner: MemoryStore::new(),
-            get,
+            get: Mutex::new(get),
             failed: AtomicUsize::new(0),
         }
+    }
+
+    /// How later `sys/compat` GETs answer, as an outage starts or ends.
+    pub(crate) fn set_get(&self, get: CompatGet) {
+        *self.get.lock().unwrap_or_else(|p| p.into_inner()) = get;
     }
 
     /// How many `sys/compat` GETs this store has failed.
@@ -52,7 +58,8 @@ impl CompatGetStore {
         if key != COMPAT_KEY {
             return None;
         }
-        let err = match self.get {
+        let get = *self.get.lock().unwrap_or_else(|p| p.into_inner());
+        let err = match get {
             CompatGet::Passthrough => return None,
             CompatGet::AccessDenied => StoreError::AccessDenied("no s3:GetObject".to_string()),
             CompatGet::ServerError => StoreError::Transient("503 Service Unavailable".to_string()),

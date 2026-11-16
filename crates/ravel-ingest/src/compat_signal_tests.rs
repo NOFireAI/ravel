@@ -3,7 +3,8 @@
 //! the policy's family-version seam: no policy publishes byte for byte what
 //! the parent of the policy work published, the bucket is fenced before the
 //! first PUT of a version above the baseline, a view that ages past the
-//! horizon after grant stops the flush before its next attempt, and a view
+//! horizon after grant holds the flush before its next attempt until a
+//! refresh or the end of its lifetime, and a view
 //! no read has succeeded for publishes only while its latest refresh was
 //! refused with `AccessDenied`.
 #![allow(clippy::expect_used)]
@@ -475,35 +476,102 @@ async fn a_span_flush_above_the_baseline_fences_the_bucket_before_its_first_put(
     assert_eq!(router.metrics_snapshot().compat_publish_refused.total(), 0);
 }
 
-/// ADR-4233 decision 3 on the log path: the view ages to the horizon while
-/// the granted flush's fence PUT is in flight, and the flush is abandoned
-/// before its data PUT. A check made only at grant lets the PUT through.
-#[tokio::test]
-async fn a_log_view_stale_after_grant_abandons_the_flush_without_a_put() {
-    let acme = TenantId::new("acme");
-    let (fault_store, compat_clock, policy) =
-        above_baseline(&acme, Signal::Logs, FormatFamily::Rlog).await;
-    let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
-    let router = Arc::new(
-        seeded_log_router(Arc::clone(&store))
-            .with_compat_policy(Some(policy))
-            .expect("no publish bound"),
-    );
-    let gate = fault_store.hold(Op::Put, Some("/prov".to_string()), Occurrence::Nth(1));
+/// A clock the test moves by hand; a `sleep` on it completes once the test
+/// advances it past the sleep's end.
+struct ManualClock {
+    now_ns: AtomicI64,
+    wake: tokio::sync::watch::Sender<()>,
+}
 
-    let write = tokio::spawn({
-        let (router, acme) = (Arc::clone(&router), acme.clone());
-        async move {
-            router
-                .write(
-                    acme,
-                    vec![log_record()],
-                    WriteMode::StrictArrival,
-                    ACK_DEADLINE,
-                )
-                .await
+impl ManualClock {
+    fn new() -> Arc<Self> {
+        Arc::new(ManualClock {
+            now_ns: AtomicI64::new(BASE_NS),
+            wake: tokio::sync::watch::channel(()).0,
+        })
+    }
+
+    /// Moves the clock one [`crate::compat::STALE_VIEW_RETRY`] at a time,
+    /// `steps` times, letting a flush waiting out a stale view ask again
+    /// after each.
+    async fn step(&self, steps: usize) {
+        let step = i64::try_from(crate::compat::STALE_VIEW_RETRY.as_nanos()).expect("fits");
+        for _ in 0..steps {
+            self.now_ns.fetch_add(step, Ordering::SeqCst);
+            let _ = self.wake.send(());
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
         }
-    });
+    }
+}
+
+impl Clock for ManualClock {
+    fn now_ns(&self) -> i64 {
+        self.now_ns.load(Ordering::SeqCst)
+    }
+
+    fn sleep(
+        &self,
+        dur: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let end = self
+            .now_ns()
+            .saturating_add(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX));
+        let mut rx = self.wake.subscribe();
+        Box::pin(async move {
+            while self.now_ns() < end {
+                if rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+}
+
+const STALE_LIFETIME: Duration = Duration::from_secs(30);
+
+/// One shard, flushes on arrival, and a lifetime below [`ACK_DEADLINE`] so
+/// a flush refused at its end reaches the writer.
+fn stale_config() -> IngestConfig {
+    IngestConfig {
+        max_flush_delay: Duration::from_secs(10),
+        max_flush_delay_idle: Duration::from_secs(10),
+        max_flush_lifetime: STALE_LIFETIME,
+        ..config()
+    }
+}
+
+/// ADR-4233 decision 3 on `signal`'s path: the view ages to the horizon
+/// while the granted flush's fence PUT is in flight. The flush sends no PUT
+/// while the view is stale and keeps its acknowledged rows: with `recover`
+/// a refresh inside its lifetime lets it publish, and without one it is
+/// refused `view_stale` once the lifetime elapses. A check made only at
+/// grant lets the PUT through stale; one that refuses the attempt at once
+/// drops the rows even when the view recovers.
+async fn stale_after_grant<T: std::fmt::Debug, E: std::fmt::Debug>(
+    signal: Signal,
+    family: FormatFamily,
+    recover: bool,
+    write: impl FnOnce(
+        Arc<dyn ObjectStoreBackend>,
+        Arc<ManualClock>,
+        Arc<IngestCompatPolicy>,
+        TenantId,
+    )
+        -> (
+            tokio::task::JoinHandle<Result<T, E>>,
+            Box<dyn Fn() -> crate::compat::CompatRefusalSnapshot>,
+        ),
+    refused_view_stale: impl Fn(&E) -> bool,
+) {
+    let acme = TenantId::new("acme");
+    let (fault_store, compat_clock, policy) = above_baseline(&acme, signal, family).await;
+    let view = policy.view().clone();
+    let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+    let gate = fault_store.hold(Op::Put, Some("/prov".to_string()), Occurrence::Nth(1));
+    let clock = ManualClock::new();
+    let (written, refused) = write(Arc::clone(&store), Arc::clone(&clock), policy, acme.clone());
     held(&gate).await;
     compat_clock
         .0
@@ -512,64 +580,142 @@ async fn a_log_view_stale_after_grant_abandons_the_flush_without_a_put() {
         assert!(gate.release(id));
     }
 
-    let err = write
-        .await
-        .expect("write task")
-        .expect_err("the view went stale before the data PUT");
-    assert!(
-        matches!(&err, LogWriteError::CompatRefused(r)
-            if policy_refusal(r, FormatFamily::Rlog, |r| matches!(r, CompatRefusal::ViewStale { .. }))),
-        "{err:?}"
+    clock.step(15).await;
+    assert!(!written.is_finished(), "inside the lifetime the flush waits");
+    assert_eq!(
+        objects(&keys(store.as_ref(), &acme, signal).await),
+        0,
+        "no PUT while the view is stale"
     );
-    assert_eq!(objects(&keys(store.as_ref(), &acme, Signal::Logs).await), 0);
-    let refused = router.metrics_snapshot().compat_publish_refused;
-    assert_eq!(refused.view_stale, 1);
-    assert_eq!(refused.total(), 1);
+    assert_eq!(refused().total(), 0, "the flush is not dropped");
+
+    if recover {
+        view.refresh().await.expect("the view reads sys/compat again");
+        for _ in 0..5 {
+            if written.is_finished() {
+                break;
+            }
+            clock.step(1).await;
+        }
+        assert!(written.is_finished(), "published within a retry of the refresh");
+        written
+            .await
+            .expect("write task")
+            .expect("published once the view is fresh");
+        assert_eq!(objects(&keys(store.as_ref(), &acme, signal).await), 2);
+        assert_eq!(refused().total(), 0);
+    } else {
+        clock.step(16).await;
+        assert!(written.is_finished(), "refused once the lifetime elapsed");
+        let err = written
+            .await
+            .expect("write task")
+            .expect_err("the lifetime elapsed with the view still stale");
+        assert!(refused_view_stale(&err), "{err:?}");
+        assert_eq!(objects(&keys(store.as_ref(), &acme, signal).await), 0);
+        assert_eq!(refused().view_stale, 1);
+        assert_eq!(refused().total(), 1);
+    }
+}
+
+async fn log_stale_after_grant(recover: bool) {
+    stale_after_grant(
+        Signal::Logs,
+        FormatFamily::Rlog,
+        recover,
+        |store, clock, policy, acme| {
+            let router = Arc::new(
+                LogIngestRouter::with_rng(
+                    stale_config(),
+                    store,
+                    clock,
+                    Arc::new(IndexedFieldsOverlay::new(Arc::new(NoIndexedFields))),
+                    Arc::new(SeededRng::new(4244)),
+                    Arc::new(PendingAckBudget::new(0)),
+                )
+                .with_compat_policy(Some(policy))
+                .expect("no publish bound"),
+            );
+            let written = tokio::spawn({
+                let router = Arc::clone(&router);
+                async move {
+                    router
+                        .write(
+                            acme,
+                            vec![log_record()],
+                            WriteMode::StrictArrival,
+                            ACK_DEADLINE,
+                        )
+                        .await
+                }
+            });
+            (
+                written,
+                Box::new(move || router.metrics_snapshot().compat_publish_refused),
+            )
+        },
+        |err| {
+            matches!(err, LogWriteError::CompatRefused(r)
+                if policy_refusal(r, FormatFamily::Rlog, |r| matches!(r, CompatRefusal::ViewStale { .. })))
+        },
+    )
+    .await;
+}
+
+async fn span_stale_after_grant(recover: bool) {
+    stale_after_grant(
+        Signal::Spans,
+        FormatFamily::Rspan,
+        recover,
+        |store, clock, policy, acme| {
+            let router = Arc::new(
+                SpanIngestRouter::with_rng(
+                    stale_config(),
+                    store,
+                    clock,
+                    Arc::new(SeededRng::new(4244)),
+                    Arc::new(PendingAckBudget::new(0)),
+                )
+                .with_compat_policy(Some(policy))
+                .expect("no publish bound"),
+            );
+            let written = tokio::spawn({
+                let router = Arc::clone(&router);
+                async move {
+                    router
+                        .write(acme, vec![span()], WriteMode::StrictArrival, ACK_DEADLINE)
+                        .await
+                }
+            });
+            (
+                written,
+                Box::new(move || router.metrics_snapshot().compat_publish_refused),
+            )
+        },
+        |err| {
+            matches!(err, SpanWriteError::CompatRefused(r)
+                if policy_refusal(r, FormatFamily::Rspan, |r| matches!(r, CompatRefusal::ViewStale { .. })))
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn a_span_view_stale_after_grant_abandons_the_flush_without_a_put() {
-    let acme = TenantId::new("acme");
-    let (fault_store, compat_clock, policy) =
-        above_baseline(&acme, Signal::Spans, FormatFamily::Rspan).await;
-    let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
-    let router = Arc::new(
-        seeded_span_router(Arc::clone(&store))
-            .with_compat_policy(Some(policy))
-            .expect("no publish bound"),
-    );
-    let gate = fault_store.hold(Op::Put, Some("/prov".to_string()), Occurrence::Nth(1));
+async fn a_log_view_stale_after_grant_waits_for_a_refresh_then_publishes() {
+    log_stale_after_grant(true).await;
+}
 
-    let write = tokio::spawn({
-        let (router, acme) = (Arc::clone(&router), acme.clone());
-        async move {
-            router
-                .write(acme, vec![span()], WriteMode::StrictArrival, ACK_DEADLINE)
-                .await
-        }
-    });
-    held(&gate).await;
-    compat_clock
-        .0
-        .fetch_add(COMPAT_VIEW_HORIZON_NS, Ordering::SeqCst);
-    for id in gate.held() {
-        assert!(gate.release(id));
-    }
+#[tokio::test]
+async fn a_log_view_stale_after_grant_is_refused_only_past_the_lifetime() {
+    log_stale_after_grant(false).await;
+}
 
-    let err = write
-        .await
-        .expect("write task")
-        .expect_err("the view went stale before the data PUT");
-    assert!(
-        matches!(&err, SpanWriteError::CompatRefused(r)
-            if policy_refusal(r, FormatFamily::Rspan, |r| matches!(r, CompatRefusal::ViewStale { .. }))),
-        "{err:?}"
-    );
-    assert_eq!(
-        objects(&keys(store.as_ref(), &acme, Signal::Spans).await),
-        0
-    );
-    let refused = router.metrics_snapshot().compat_publish_refused;
-    assert_eq!(refused.view_stale, 1);
-    assert_eq!(refused.total(), 1);
+#[tokio::test]
+async fn a_span_view_stale_after_grant_waits_for_a_refresh_then_publishes() {
+    span_stale_after_grant(true).await;
+}
+
+#[tokio::test]
+async fn a_span_view_stale_after_grant_is_refused_only_past_the_lifetime() {
+    span_stale_after_grant(false).await;
 }
