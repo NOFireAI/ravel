@@ -1256,7 +1256,7 @@ mod tests {
         matched: u64,
     }
 
-    /// A `QueryStats` whose five phase handles carry a distinct, exactly known
+    /// A `QueryStats` whose six phase handles carry a distinct, exactly known
     /// figure in every counter `stats.phases` renders, so a test can name the
     /// expected number per phase per field and a swapped or pooled phase is a
     /// failing assertion rather than a plausible-looking total.

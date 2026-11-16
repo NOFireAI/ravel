@@ -109,8 +109,8 @@ impl ScanBudget {
     ///
     /// Reads [`StatementAccounting::pooled_snapshot`], not
     /// `snapshot().pooled()`: a handle built with `PhaseAccounting::pooled_over`
-    /// shares one counter across its five phases, and summing the phases would
-    /// report five times the real total.
+    /// shares one counter across its six phases, and summing the phases would
+    /// report six times the real total.
     ///
     /// A request refusal names no fold lag: this budget carries no resolve
     /// verdict, so the resolve-boundary check in `executor.rs` is where a SQL

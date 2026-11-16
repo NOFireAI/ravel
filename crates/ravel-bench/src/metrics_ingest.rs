@@ -8869,7 +8869,7 @@ mod tests {
     /// [`query_stub`] does. The `n`th `count_over_time` answer it serves,
     /// from 1, carries `data.stats` with `segmentsFetched` `n`,
     /// `io.unfoldedSegmentsResolved` `100 + n`, `accounting.requests` `n`
-    /// and the five PromQL phases at `n` GETs each, so every call's stats
+    /// and the six PromQL phases at `n` GETs each, so every call's stats
     /// differ from every other's.
     fn day_limited_query_stub(
         points: Vec<LogicalPoint>,
@@ -9104,7 +9104,7 @@ mod tests {
     /// A two-day read-back records every `/api/v1/query` call of each
     /// windowed count as its own entry, in query order, with its window
     /// beside it and the `data.stats` members a `ravel_cost` record copies:
-    /// every entry carries the five PromQL phases, the stub's per-call
+    /// every entry carries the six PromQL phases, the stub's per-call
     /// `segmentsFetched` runs 1, 2, 3, ... across all calls (so no entry is
     /// a sum and no call is dropped), `unfoldedSegmentsResolved` is copied
     /// out of `io`, and a member the answer lacks is `null`. Both series

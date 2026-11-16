@@ -283,12 +283,15 @@ impl ServerHandler for RavelMcp {
             Some(router) if is_agents => Some(AgentsRoute::new(router.clone(), &context)),
             _ => None,
         };
+        // Both tool futures are boxed: inline, this block's state holds them
+        // side by side, and an unoptimized build's poll frame for it alone
+        // took over 250 KiB of the runtime thread's stack.
         let call = async {
             match &agents {
-                Some(route) => dispatch_agents(&request.name, args, &ctx, route)
+                Some(route) => Box::pin(dispatch_agents(&request.name, args, &ctx, route))
                     .await
                     .ok_or_else(|| ToolError::UnknownTool(request.name.to_string())),
-                None => dispatch(&request.name, args, &ctx, &backend).await,
+                None => Box::pin(dispatch(&request.name, args, &ctx, &backend)).await,
             }
         };
         // The cancellation arm is biased first so a token already cancelled

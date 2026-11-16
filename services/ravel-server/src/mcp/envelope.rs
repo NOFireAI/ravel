@@ -990,7 +990,10 @@ mod tests {
         let split = actual["phases"]
             .as_object()
             .expect("the split is an object");
-        assert_eq!(split.len(), 5);
+        let names: std::collections::BTreeSet<&str> = split.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> =
+            ["resolve", "plan", "probe", "scan", "keyIndex", "fetch"].into();
+        assert_eq!(names, expected);
         for phase in QueryPhase::ALL {
             assert_eq!(split[phase.name()]["store_requests"], json!(0));
             assert_eq!(split[phase.name()]["wire_bytes"], json!(0));
