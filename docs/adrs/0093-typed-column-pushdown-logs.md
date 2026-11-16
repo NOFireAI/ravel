@@ -867,7 +867,7 @@ Issue #4232 comment 6920855702: a c6a.4xlarge, the ClickBench tenant, 222 object
    leaf that populates either channel still answers `false`.
 3. **Row path order.** When a row-path chunk carries row filters, the scan:
    1. applies pending erasure, before any column is built, as today;
-   2. builds only the columns the row filters read (`RowFilters::column_names`), for the chunk's
+   2. builds only the columns the row filters read (`BoundRowFilters::reads`), for the chunk's
       unerased rows;
    3. evaluates the row filters on that batch;
    4. builds the whole build projection (the `attrs` map, every `attrs['k']` column, every other
