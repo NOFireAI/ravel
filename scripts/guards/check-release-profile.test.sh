@@ -101,6 +101,22 @@ name = "ravel-compat-tests"
 [dev-dependencies]
 ravel-segment = { path = "../ravel-segment", features = ["format-drill"] }
 TOML
+  # The crate that defines the Antithesis features (ADR-4326), and the server's
+  # same-name forward of them.
+  mkdir -p "${dir}/crates/ravel-invariant"
+  cat >"${dir}/crates/ravel-invariant/Cargo.toml" <<'TOML'
+[package]
+name = "ravel-invariant"
+
+[dependencies]
+antithesis_sdk = { version = "0.4", optional = true }
+
+[features]
+# antithesis in a comment is not a finding.
+antithesis = ["dep:antithesis_sdk"]
+capture = []
+antithesis-mutants = []
+TOML
   printf '%s\n' "${dir}"
 }
 
@@ -300,7 +316,7 @@ check "publish_without_build_step_is_cannot_check" "${d}" 2 "no build-push-actio
 
 d="$(new_repo drill-clean-report)"
 check "format_drill_scan_says_what_it_read" "${d}" 0 \
-  "format-drill test-only: 3 defining crate(s), 6 manifest(s) scanned"
+  "format-drill test-only: 3 defining crate(s), 7 manifest(s) scanned"
 
 d="$(new_repo docker-format-drill)"
 edit "${d}/Dockerfile" 's/--features sql /--features sql,ravel-segment\/format-drill /'
@@ -401,6 +417,82 @@ d="$(new_repo drill-definition-missing)"
 edit "${d}/crates/ravel-rspan/Cargo.toml" '/^format-drill = \[\]$/d'
 check "missing_drill_feature_definition_is_cannot_check" "${d}" 2 \
   "crates/ravel-rspan/Cargo.toml declares no format-drill feature"
+
+# --- antithesis and antithesis-mutants stay out of release builds (ADR-4326) --
+
+d="$(new_repo antithesis-clean-report)"
+check "antithesis_scan_says_what_it_read" "${d}" 0 \
+  "antithesis test-only: defined in crates/ravel-invariant, 7 manifest(s) scanned"
+
+d="$(new_repo docker-antithesis-mutants)"
+edit "${d}/Dockerfile" 's/--features sql /--features sql,antithesis-mutants /'
+check "antithesis-mutants in the published build is a finding" "${d}" 1 \
+  "Dockerfile:4: release build enables antithesis or antithesis-mutants"
+
+d="$(new_repo docker-antithesis)"
+edit "${d}/Dockerfile" 's/-p ravel-cli$/-p ravel-cli --features ravel-invariant\/antithesis/'
+check "antithesis_in_the_published_build_is_a_finding" "${d}" 1 \
+  "Dockerfile:5: release build enables antithesis or antithesis-mutants"
+
+# The instrumentation shim's crate name is not the feature.
+d="$(new_repo docker-antithesis-other-word)"
+insert_after "${d}/Dockerfile" "FROM rust:1 AS builder" "LABEL tool=antithesis-instrumentation-free"
+check "antithesis_inside_a_longer_word_passes" "${d}" 0 ""
+
+d="$(new_repo docker-antithesis-comment)"
+insert_after "${d}/Dockerfile" "FROM rust:1 AS builder" "# never --features antithesis here"
+check "antithesis_in_a_dockerfile_comment_passes" "${d}" 0 ""
+
+d="$(new_repo publish-antithesis)"
+printf '          build-args: |\n            CARGO_FEATURES=antithesis\n' \
+  >>"${d}/.github/workflows/publish-images.yml"
+check "antithesis_in_the_publish_workflow_is_a_finding" "${d}" 1 \
+  "publish-images.yml:9: release build enables antithesis or antithesis-mutants"
+
+d="$(new_repo antithesis-default)"
+insert_after "${d}/crates/ravel-invariant/Cargo.toml" "capture = []" 'default = ["antithesis-mutants"]'
+check "antithesis_in_a_default_feature_list_is_a_finding" "${d}" 1 \
+  "crates/ravel-invariant/Cargo.toml:11: enables antithesis outside its own same-name feature"
+
+d="$(new_repo antithesis-forward-other-name)"
+insert_after "${d}/services/ravel-server/Cargo.toml" "sql = []" 'chaos = ["ravel-invariant/antithesis"]'
+check "antithesis_forwarded_under_another_name_is_a_finding" "${d}" 1 \
+  "services/ravel-server/Cargo.toml:6: enables antithesis outside its own same-name feature"
+
+d="$(new_repo antithesis-forward-same-name)"
+insert_after "${d}/services/ravel-server/Cargo.toml" "sql = []" \
+  'antithesis = [\n    "dep:antithesis-instrumentation",\n    "ravel-invariant/antithesis",\n]\nantithesis-mutants = ["ravel-invariant/antithesis-mutants"]'
+check "antithesis_forwarded_under_the_same_name_passes" "${d}" 0 ""
+
+d="$(new_repo antithesis-dependency-edge)"
+edit "${d}/services/ravel-server/Cargo.toml" \
+  's/^ravel-segment = { workspace = true } #.*$/ravel-invariant = { workspace = true, features = ["antithesis"] }/'
+check "antithesis_on_a_dependency_edge_is_a_finding" "${d}" 1 \
+  "services/ravel-server/Cargo.toml:8: enables antithesis outside its own same-name feature"
+
+d="$(new_repo antithesis-workspace-edge)"
+printf '\n[workspace.dependencies]\nravel-invariant = { path = "crates/ravel-invariant", features = ["antithesis-mutants"] }\n' \
+  >>"${d}/Cargo.toml"
+check "antithesis_on_a_workspace_dependency_edge_is_a_finding" "${d}" 1 \
+  "Cargo.toml:21: enables antithesis outside its own same-name feature"
+
+# Unlike format-drill, no crate may turn it on through a dev-dependency: the
+# workspace's test builds would unify it into every crate they compile.
+d="$(new_repo antithesis-dev-dependency-edge)"
+printf '\n[dev-dependencies.ravel-invariant]\npath = "../ravel-invariant"\nfeatures = [\n    "antithesis",\n]\n' \
+  >>"${d}/crates/ravel-compat-tests/Cargo.toml"
+check "antithesis_on_a_dev_dependency_edge_is_a_finding" "${d}" 1 \
+  "crates/ravel-compat-tests/Cargo.toml:10: enables antithesis outside its own same-name feature"
+
+d="$(new_repo antithesis-definition-missing)"
+edit "${d}/crates/ravel-invariant/Cargo.toml" '/^antithesis-mutants = \[\]$/d'
+check "missing_antithesis_feature_definition_is_cannot_check" "${d}" 2 \
+  "crates/ravel-invariant/Cargo.toml declares no antithesis-mutants feature"
+
+d="$(new_repo antithesis-crate-missing)"
+rm "${d}/crates/ravel-invariant/Cargo.toml"
+check "missing_invariant_crate_manifest_is_cannot_check" "${d}" 2 \
+  "crates/ravel-invariant/Cargo.toml does not exist"
 
 printf '\n%s passed, %s failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]

@@ -5,7 +5,19 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# ADR-4326: the Antithesis assertions and the test-only mutant switches at
+# this crate's sites, forwarded so ravel-server and ravel-cli turn them on for
+# the whole build. Off by default and in no published build
+# (scripts/guards/check-release-profile.sh).
+antithesis = ["ravel-invariant/antithesis"]
+antithesis-mutants = ["ravel-invariant/antithesis-mutants"]
+
 [dependencies]
+# ADR-4326 assertion and mutant macros; with no feature on they expand to
+# nothing. A path dependency pinned to a version so cargo-deny does not count
+# it as a wildcard.
+ravel-invariant = { path = "../ravel-invariant", version = "0.33.0" }
 ravel-types = { workspace = true }
 ravel-proto = { workspace = true }
 ravel-object-store = { workspace = true }

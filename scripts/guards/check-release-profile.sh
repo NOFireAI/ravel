@@ -65,6 +65,8 @@ done
 for c in "${drill_crates[@]}"; do
   [[ -f "${c}/Cargo.toml" ]] || missing "${c}/Cargo.toml does not exist"
 done
+invariant_crate=crates/ravel-invariant
+[[ -f "${invariant_crate}/Cargo.toml" ]] || missing "${invariant_crate}/Cargo.toml does not exist"
 
 # --- 1. the release profile --------------------------------------------------
 
@@ -251,9 +253,56 @@ for f in "${manifests[@]}"; do
   ' "${f}")
 done
 
+# --- 6. antithesis and antithesis-mutants stay out of release builds ----------
+
+# ADR-4326: the Antithesis SDK and the mutant switches are for the workload
+# images under antithesis/ only. A whole-word match, so the
+# antithesis-instrumentation crate name is not one.
+for f in "${dockerfile}" "${publish}"; do
+  while IFS= read -r hit; do
+    [[ -n "${hit}" ]] || continue
+    finding "${f}:${hit%%:*}: release build enables antithesis or antithesis-mutants: ${hit#*:}"
+  done < <(awk '
+    { line = $0; sub(/(^|[[:space:]])#.*$/, "", line) }
+    line ~ /(^|[^A-Za-z0-9_-])antithesis(-mutants)?($|[^A-Za-z0-9_-])/ { print NR ":" $0 }
+  ' "${f}")
+done
+
+for want in antithesis antithesis-mutants; do
+  awk -v want="${want}" '
+    /^[[:space:]]*\[/ { in_features = ($0 == "[features]"); next }
+    in_features && $0 ~ ("^[[:space:]]*" want "[[:space:]]*=") { found = 1 }
+    END { exit !found }
+  ' "${invariant_crate}/Cargo.toml" \
+    || missing "${invariant_crate}/Cargo.toml declares no ${want} feature"
+done
+
+# Each manifest line naming either feature as a value, with the table and key
+# it belongs to (as for format-drill above). Allowed: the value of a feature of
+# the same name, which only forwards a feature something else must turn on.
+# A default list, a feature of another name, and any dependency edge are
+# findings, dev-dependencies included: the workspace's test builds would unify
+# it into every crate they compile.
+for f in "${manifests[@]}"; do
+  while IFS= read -r hit; do
+    [[ -n "${hit}" ]] || continue
+    finding "${f}:${hit%%:*}: enables antithesis outside its own same-name feature: ${hit#*:}"
+  done < <(awk '
+    /^[[:space:]]*\[/ { table = $0; gsub(/[[:space:]]/, "", table); key = ""; next }
+    { line = $0; sub(/(^|[[:space:]])#.*$/, "", line) }
+    match(line, /^[[:space:]]*[A-Za-z0-9_.-]+[[:space:]]*=/) {
+      key = substr(line, RSTART, RLENGTH); sub(/=$/, "", key); gsub(/[[:space:]]/, "", key)
+    }
+    line !~ /["\/]antithesis(-mutants)?"/ { next }
+    table == "[features]" && (key == "antithesis" || key == "antithesis-mutants") { next }
+    { print FNR ":" $0 }
+  ' "${f}")
+done
+
 if [[ "${findings}" -gt 0 ]]; then
   printf '%s finding(s): published binaries would not be built on the optimised release profile\n' "${findings}"
   exit 1
 fi
-printf 'release profile guard: clean (lto=%s, codegen-units=%s, debug=%s, %s cargo build(s) in %s; format-drill test-only: %s defining crate(s), %s manifest(s) scanned)\n' \
-  "${lto}" "${units}" "${debug}" "${builds}" "${dockerfile}" "${#drill_crates[@]}" "${#manifests[@]}"
+printf 'release profile guard: clean (lto=%s, codegen-units=%s, debug=%s, %s cargo build(s) in %s; format-drill test-only: %s defining crate(s), %s manifest(s) scanned; antithesis test-only: defined in %s, %s manifest(s) scanned)\n' \
+  "${lto}" "${units}" "${debug}" "${builds}" "${dockerfile}" "${#drill_crates[@]}" "${#manifests[@]}" \
+  "${invariant_crate}" "${#manifests[@]}"
