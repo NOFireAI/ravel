@@ -520,10 +520,19 @@ instead:
 | flat cap at 32 | 137.2 | 16.5 | 0.861 | 0.580 | comment 6902318979 |
 | per-statement min(derived, objects) | 139.7 | 15.7 | 0.878 | 0.596 | comment 6902318979 |
 
-**The TopK first-wave gate (drafted as decision 10) is held.** It waits on
-a later run that measures the objects opened in the first wave at 8
-partitions: under 30 opens selects the gate, 45 or more cancels it. No arm
-here measured that, so decision 10 is neither adopted nor rejected yet.
+**The TopK first-wave gate (drafted as decision 10) is not adopted.** Its
+pre-registered test (issue #4203 comment 6902440325) measured the objects
+Q25 opens at 8 partitions: under 30 selects the gate, 45 or more cancels it.
+M4 (comment 6904276040, one c6a.4xlarge, drift N = 0.061 s) measured 48, so
+the gate is cancelled. The same run also found 32 partitions the best width
+measured on that box:
+
+| Arm (c6a.4xlarge) | Q25 objects opened | Q25 wire MB | Cold total, s | Cold total without Q24, Q25, Q27, s | Source |
+|---|---|---|---|---|---|
+| 8 partitions | 48 | 101.8 | 111.7 | | comment 6904276040 |
+| 16 partitions | | | 105.7 | 99.9 | comment 6904276040 |
+| 32 partitions (derived) | 69 | 148.1 | 100.8 | 95.7 | comment 6904276040 |
+| 64 partitions | | | 102.2 | 96.7 | comment 6904276040 |
 
 **The publication run gate (predicted).** The publication run on c6a.metal
 must show the stock (no explicit flags) cold total at or under 0.93x, and
