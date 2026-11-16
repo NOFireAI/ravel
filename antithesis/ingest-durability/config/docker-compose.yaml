@@ -19,6 +19,21 @@ x-ravel-store: &ravel-store
 x-ravel-server: &ravel-server
   image: 819709950457.dkr.ecr.us-east-1.amazonaws.com/ravel-antithesis/ravel-server:ingest-durability
   platform: linux/amd64
+  # ravel-server exits within seconds when the store does not answer its
+  # startup read of sys/qualification, and nothing would start it again. A
+  # node Antithesis restarts during a store outage would then stay down for
+  # the rest of the timeline. So wait until the store answers, then exec the
+  # server as the container's main process.
+  entrypoint:
+    - /bin/sh
+    - -c
+    - |
+      trap 'exit 143' TERM INT
+      until [ "$$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 "aws:amz:$$RAVEL_S3_REGION:s3" --user "$$RAVEL_S3_ACCESS_KEY:$$RAVEL_S3_SECRET_KEY" "$$RAVEL_S3_ENDPOINT/$$RAVEL_S3_BUCKET?max-keys=1")" = 200 ]; do
+        sleep 1
+      done
+      exec /usr/local/bin/ravel-server "$$@"
+    - ravel-server
   command:
     - "--mode"
     - "all"
