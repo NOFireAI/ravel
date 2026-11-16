@@ -1,4 +1,4 @@
-//! `ravel-cli load --page-choice` (issue #4212, ADR-4203 decision 7).
+//! `ravel-cli load --page-choice` (issue #4212, ADR-4203 decisions 6 and 7).
 //!
 //! Drives `ravel_cli::load::run`, the function `main.rs` dispatches `load` to,
 //! in-process, because a subprocess against `--store memory` could not hand

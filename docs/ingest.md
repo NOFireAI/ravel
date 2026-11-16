@@ -1103,7 +1103,7 @@ exactly five places:
   ingest setting `rlog_page_choice` (ADR-3492 decision 1): `Estimated` for the
   server's logs ingest, the default. `ravel-cli load` sets it from
   `--page-choice exhaustive|estimated`, default `estimated` (ADR-4203
-  decision 7), for every flush of the load, on the columnar and the row path
+  decisions 6 and 7), for every flush of the load, on the columnar and the row path
   alike; the load summary's `page choice` line and the report JSON's
   `page_choice` field name the value used. `exhaustive` seals every
   candidate encoding of each page and keeps the one with the fewest stored

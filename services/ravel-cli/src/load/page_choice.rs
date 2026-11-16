@@ -1,5 +1,6 @@
-//! `ravel-cli load --page-choice` (issue #4212, ADR-4203 decision 7): how the
-//! RLOG writer of every flush a logs load runs picks each page's encoding.
+//! `ravel-cli load --page-choice` (issue #4212, ADR-4203 decisions 6 and 7):
+//! how the RLOG writer of every flush a logs load runs picks each page's
+//! encoding.
 
 use serde::{Deserialize, Serialize};
 
