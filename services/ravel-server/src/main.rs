@@ -19,6 +19,12 @@ use tracing_subscriber::EnvFilter;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Links the Antithesis coverage runtime shim into the binary; the
+// instrumentation itself comes from the build flags in
+// antithesis/ingest-durability/ravel/Dockerfile.
+#[cfg(feature = "antithesis")]
+use antithesis_instrumentation as _;
+
 /// Wall-clock unix nanoseconds for stamping the `sys/tenancy` marker's
 /// informational `created_unix_ns` at bootstrap. This is the binary entry
 /// point, not library logic, so a direct clock read here does not violate the
@@ -33,6 +39,11 @@ fn now_unix_ns() -> i64 {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Registers the assertion catalog with Antithesis, so an assertion that is
+    // never reached still reports (the off-by-default `antithesis` feature).
+    #[cfg(feature = "antithesis")]
+    antithesis_sdk::antithesis_init();
+
     // Not `Cli::parse()`: this also refuses the fold flags in the modes that
     // never schedule a fold (ADR-1693), which needs the `ArgMatches` to tell a
     // passed `--fold-interval-secs` from its generated default. `exit` gives a
@@ -761,12 +772,22 @@ async fn main() -> anyhow::Result<()> {
     }
 
     wait_for_shutdown_signal().await;
+    #[cfg(feature = "antithesis")]
+    antithesis_sdk::assert_reachable!(
+        "server: a shutdown signal started a graceful drain",
+        &serde_json::json!({})
+    );
     tracing::info!("shutdown signal received, draining");
     // A drain that overran `--shutdown-timeout`, a listener error, or a failed
     // query-audit drain each return `Err`: log it at error level and propagate
     // so the process exits non-zero, rather than falling through to the
     // "shutdown complete" line and a clean exit it did not earn.
     if let Err(err) = running.shutdown().await {
+        #[cfg(feature = "antithesis")]
+        antithesis_sdk::assert_reachable!(
+            "server: a graceful drain did not complete cleanly",
+            &serde_json::json!({ "error": err.to_string() })
+        );
         tracing::error!(error = %err, "graceful shutdown did not complete cleanly");
         return Err(err);
     }

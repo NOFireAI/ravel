@@ -370,6 +370,10 @@ pub async fn handle_export_releasing(
         // duplicating.
         let durable_shard_count = err.durable_tokens().len();
         if durable_shard_count > 0 {
+            antithesis_reachable!(
+                "metrics ingest: a write committed on some shards before a sibling shard failed",
+                serde_json::json!({ "durable_shard_count": durable_shard_count })
+            );
             tracing::warn!(
                 tenant_hash = %tenant_hash.to_hex(),
                 durable_shard_count,
