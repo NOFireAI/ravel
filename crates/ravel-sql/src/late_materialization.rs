@@ -88,21 +88,28 @@
 //!
 //! # Cost
 //!
-//! Phase 2 re-reads bytes phase 1 already read: `k` block fetches, accounted
-//! like any other scan read because they go through the same
+//! Phase 2 re-reads bytes phase 1 already read, accounted like any other scan
+//! read because it goes through the same
 //! `LogSegmentFetcher::scan_accounted_with_tenant_subset` funnel the striped
-//! scan path uses.
+//! scan path uses, under the scan phase.
 //!
-//! Be precise about what a "block fetch" costs, because the request count and
-//! the byte count do not say the same thing. That entry point restricts the
-//! DECODE to the named block, but its byte fetch is the query's ordinary fetch
-//! for the whole object: one whole-object GET at or below the block-range
-//! threshold (ADR-0107), and above it the version-4 coalesced ranges over the
-//! fetch-side candidate set (ADR-0699 decision 5) -- which, for a query whose
-//! only predicate is a residual the skip index cannot decide, is every block.
-//! So phase 2 costs `k` requests and up to `k` objects' bytes, not `k` blocks'
-//! bytes. Narrowing that fetch to the named indices is a ravel-query
-//! follow-up, deliberately not done here.
+//! It opens each segment holding a winner once (issue #797): one subset open
+//! names all of that segment's winning block positions in ascending order and
+//! drains them in that order. What the open moves depends on the object:
+//!
+//! - At or below the block-range threshold (ADR-0107) it is one whole-object
+//!   GET, as for any scan of that object.
+//! - Above it, on a version-4 object, the fetcher resolves the positions to
+//!   whole-object block indices from the survivor list the scan computes,
+//!   after placing the directory and filter sections that list needs (no
+//!   block is decoded for it), and fetches only those blocks' projected pages
+//!   (ADR-0699 decision 5). The coverage and size crossovers weigh those pages
+//!   alone, so the whole object is read only when the winners' own pages make
+//!   it the cheaper read.
+//! - A version-3 object has no such narrowing and reads the query's ordinary
+//!   candidate blocks.
+//!
+//! So phase 2 costs one open per segment holding a winner, at most `k`.
 //!
 //! Either way the cost is bounded by `k` and by one object, while what it
 //! removes is bounded by the table.
@@ -209,7 +216,7 @@ impl RowRef {
 
     /// The inverse of [`Self::pack`]. Total: every `u64` decodes to some
     /// address, and whether that address exists is what
-    /// [`RowFetchSource::fetch_block`] answers.
+    /// [`RowFetchSource::fetch_blocks`] answers.
     pub(crate) fn unpack(packed: u64) -> Self {
         let row_mask = (1u64 << ROW_BITS) - 1;
         let block_mask = (1u64 << BLOCK_BITS) - 1;
@@ -727,6 +734,11 @@ impl ExecutionPlan for LogsRowFetchExec {
 /// phase holds (the fetched records first, then the batches built from them,
 /// with the record term released as the records are dropped) and returned so
 /// the stream can release each batch's share as it hands it downstream.
+/// One segment's winning blocks for a phase-2 fetch: each a surviving-block
+/// position paired with the `(surviving-row, output position)` pairs to read
+/// from it, in ascending block order.
+type SegmentBlocks = Vec<(usize, Vec<(usize, usize)>)>;
+
 async fn fetch_rows(
     input: SendableRecordBatchStream,
     source: RowFetchSource,
@@ -778,13 +790,19 @@ async fn fetch_rows(
     let segments: HashSet<usize> = groups.keys().map(|&(segment, _)| segment).collect();
     metrics.segments_fetched.add(segments.len());
 
-    // One fetch per block, `concurrency` in flight. Built as a `Vec` of
-    // not-yet-polled futures for the same reason `compute_plan_counts` is: a
-    // closure returning a future that borrows its argument cannot satisfy the
-    // higher-ranked bound `buffered` needs here.
-    let mut fetches = Vec::with_capacity(groups.len());
-    for (&(segment, block), rows) in &groups {
-        fetches.push(source.fetch_block(segment, block, rows));
+    // One fetch per segment, holding all of that segment's winning blocks in
+    // ascending order, so each segment is opened once and its ranged read
+    // covers only those blocks (issue #797). `concurrency` in flight. Built as
+    // a `Vec` of not-yet-polled futures for the same reason
+    // `compute_plan_counts` is: a closure returning a future that borrows its
+    // argument cannot satisfy the higher-ranked bound `buffered` needs here.
+    let mut by_segment: BTreeMap<usize, SegmentBlocks> = BTreeMap::new();
+    for ((segment, block), rows) in groups {
+        by_segment.entry(segment).or_default().push((block, rows));
+    }
+    let mut fetches = Vec::with_capacity(by_segment.len());
+    for (&segment, blocks) in &by_segment {
+        fetches.push(source.fetch_blocks(segment, blocks));
     }
     let fetched: Vec<Vec<(usize, LogRecord)>> = futures::stream::iter(fetches)
         .buffered(source.concurrency().max(1))

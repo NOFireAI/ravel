@@ -147,7 +147,8 @@ most `k` logical block fetches (fewer when winners share a block), and the
 object-store request count behind them depends on the fetch path: zero on
 a cache hit, one whole-object GET at or below the block-range threshold,
 the coalesced ranges above it. Bytes are up to `k` objects', not `k`
-blocks'. See the consequences below.
+blocks'. See the consequences below, and the phase-2 narrowing amendment at
+the end, which replaces this cost.
 
 No projection node is inserted to drop the row-ref column. Phase 2's output
 schema is `Arc::clone`d off the original scan's, so the restored column
@@ -253,7 +254,8 @@ it.
   replaces is bounded by the table, but narrowing that fetch to the named
   block indices is a real follow-up in ravel-query, deliberately out of
   this change's scope (which was to ride the existing PAGE_DIR fetch path,
-  not add one).
+  not add one). That follow-up has landed: see the phase-2 narrowing
+  amendment below.
 - The rewrite is invisible to results: the same rows, in the same order,
   under the same schema. So `late_materialization_extra_columns` is a cost
   knob, never a correctness one, and it is not exposed as a server flag.
@@ -270,3 +272,39 @@ it.
   variant's 24.8 s, i.e. under about 37 s, against a run that previously
   exceeded a 900 s deadline. The orchestrator runs that measurement; it is
   a prediction recorded before the fact, not a reported result.
+
+## Amendment (2026-11-16): phase 2 opens each segment once and reads only the winners' blocks (issue #797)
+
+<!-- amendment-applies: sections="4. The two phases|Consequences" pointer="phase-2 narrowing amendment" -->
+
+Phase 2 now groups its row refs by segment and opens each segment holding a
+winner once, naming all of that segment's winning block positions in
+ascending order, through the same
+`LogSegmentFetcher::scan_accounted_with_tenant_subset` entry point. Above
+the block-range threshold, on a version-4 object, the ranged read resolves
+those survivor positions to whole-object block indices from the survivor
+list the scan computes over the object: it places the directory and filter
+sections the scan needs, opens the scan over them without decoding a block,
+and maps each position through that list. It then restricts its candidate
+set to the resolved blocks and fetches only their projected pages. The
+coverage crossover and the size break-even weigh those pages alone, so the
+object is read whole only when the winners' own pages make that the cheaper
+read; below the threshold the whole-object GET stays. The open names the
+resolved blocks by value and checks its own survivor list against the
+resolution's, failing closed on a mismatch. The row ref's meaning and
+packing are unchanged, and phase 2's BLOCKS bytes are still charged to the
+scan phase.
+
+Measured in `crates/ravel-sql/tests/logs_topk_late_materialization.rs`,
+`phase_two_reads_only_the_winners_pages_and_opens_the_object_once`: one
+six-block L1 object of 9,708 bytes, three winners in blocks 1, 3 and 5
+behind a pruned block 0, no cache and no coalescing gap. Before, phase 2
+issued 6 GETs and 41,604 bytes: three opens, each a footer probe and a
+whole-object read, because the object's candidate set crossed the coverage
+threshold. After, it issues 115 GETs and 6,980 bytes: one 4,160-byte probe
+and 114 page runs totalling 2,820 bytes, exactly the winners' pages. The
+request count follows from the zero coalescing gap the test pins to isolate
+the bytes; the default gap joins those runs. Below the threshold, the
+uncached regression fixture's ten winners in four segments now cost four
+whole-object re-reads, 8 GETs and 55,154 bytes for the whole statement,
+where they cost ten, 14 GETs and 96,370 bytes.
