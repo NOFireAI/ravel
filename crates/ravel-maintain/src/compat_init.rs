@@ -23,7 +23,9 @@
 //!   for RLOG and RSPAN, the footer the trailer names).
 //!
 //! Every other key under the tenant is outside the census and counted as
-//! ignored.
+//! ignored. Keys outside `t/<h>/` are not listed at all: an object under
+//! `quarantine/` is never checked, so one restored from quarantine after
+//! init has not been checked against the read set.
 
 use std::collections::BTreeMap;
 
@@ -35,11 +37,11 @@ use ravel_catalog::compat::{
 };
 use ravel_catalog::{
     COMPAT_KEY, CompatClock, CompatError, CompatKeys, HEAD_FORMAT_VERSIONS,
-    KEY_INDEX_LEAF_FORMAT_VERSION, KeyIndexLeafRejection, PROVISIONING_MAX_READ_VERSION,
-    PROVISIONING_MIN_READ_VERSION, PartLimits, PostingsLimits, SnapshotFormatError,
-    TENANT_CONFIG_MAX_READ_VERSION, TENANT_CONFIG_MIN_READ_VERSION, decode_column_stats_header,
-    decode_head, decode_part, decode_postings, fold_write_version, key_index_leaf_format_version,
-    key_index_leaf_version_accepted,
+    KEY_INDEX_LEAF_FORMAT_VERSION, KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN, KeyIndexLeafRejection,
+    PROVISIONING_MAX_READ_VERSION, PROVISIONING_MIN_READ_VERSION, PartLimits, PostingsLimits,
+    SnapshotFormatError, TENANT_CONFIG_MAX_READ_VERSION, TENANT_CONFIG_MIN_READ_VERSION,
+    decode_column_stats_header, decode_head, decode_part, decode_postings, fold_write_version,
+    key_index_leaf_format_version, key_index_leaf_versions_for_signal,
 };
 use ravel_commit::erasure;
 use ravel_commit::keys::{BucketEntry, partition_bucket_entry};
@@ -286,7 +288,9 @@ pub enum CompatInitError {
 
 /// Adopt the store: refuse an unkeyed store, return the existing record when
 /// it is the one `init` would write (and refuse when it differs), otherwise
-/// run the census and create `sys/compat` from it.
+/// run the census and create `sys/compat` from it. The census lists only
+/// `t/<h>/`; `quarantine/` is skipped, so an object restored from quarantine
+/// after init was never checked.
 pub async fn init_compat(
     store: &dyn ObjectStoreBackend,
     keys: Option<&CompatKeys>,
@@ -394,8 +398,9 @@ pub fn baseline_version(family: &str) -> Result<u32, CompatInitError> {
         family: family.to_string(),
     };
     match family {
-        // ADR-4233's inventory records kidx at the leaf format constant even
-        // though the fold writes a higher version for metrics.
+        // The leaf version the fold writes for every signal. Not
+        // `fold_write_version`, which names a higher metrics version than
+        // the fold emits.
         FAMILY_KIDX => Ok(KEY_INDEX_LEAF_FORMAT_VERSION),
         FAMILY_CATALOG_HEAD | FAMILY_CSNAP | FAMILY_NPOST | FAMILY_CSTAT => {
             let mut versions = SIGNALS
@@ -675,8 +680,16 @@ async fn check_object(
             Ok(peek) => tally.adopt(FAMILY_CSTAT, u32::from(peek.envelope_version)),
             Err(e) => catalog_refusal(tenant, None, FAMILY_CSTAT, key, &e, tally)?,
         },
+        // The read set is every version the decoder parses for the signal,
+        // not the narrower set a lookup accepts: a logs version-1 leaf is
+        // decoded and its part treated as uncovered, which is a safe read.
         Class::CatalogKeyIndex(signal) => match key_index_leaf_format_version(bytes) {
-            Ok(v) if key_index_leaf_version_accepted(signal, v) => tally.adopt(FAMILY_KIDX, v),
+            Ok(v)
+                if KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN.contains(&v)
+                    && key_index_leaf_versions_for_signal(signal).contains(&v) =>
+            {
+                tally.adopt(FAMILY_KIDX, v)
+            }
             Ok(v) | Err(KeyIndexLeafRejection::UnsupportedVersion(v)) => {
                 tally.outside(tenant, Some(signal), FAMILY_KIDX, v, key);
             }
@@ -891,6 +904,10 @@ fn trailer_version(suffix: &[u8]) -> Option<u16> {
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
+mod census_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
 pub(crate) mod tests {
     use super::*;
     use bytes::Bytes;
@@ -1002,7 +1019,7 @@ pub(crate) mod tests {
     }
 
     /// Rewrite the trailer version of the object at `key`.
-    async fn restamp_trailer(store: &dyn ObjectStoreBackend, key: &str, version: u16) {
+    pub(crate) async fn restamp_trailer(store: &dyn ObjectStoreBackend, key: &str, version: u16) {
         let got = store.get(key, GetRange::Full).await.expect("get");
         let mut bytes = got.data.to_vec();
         let at = bytes.len() - TRAILER_LEN as usize + TRAILER_VERSION_OFFSET;

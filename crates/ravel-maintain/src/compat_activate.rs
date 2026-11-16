@@ -99,16 +99,28 @@ pub struct ActivateRequest {
     /// Tenants named by the alert rules file. Their leases are parked on an
     /// `rlog` activation even when no alert key exists for them yet.
     pub alert_rule_tenants: Vec<TenantHash>,
-    /// Where an interrupted walk stopped. Ignored unless it names this
-    /// family and the epoch being walked.
+    /// Where an interrupted walk stopped. Ignored unless its epoch is the
+    /// `activated_epoch` of the walk this call runs.
     pub resume_from: Option<FenceCursor>,
 }
 
 /// The fence walk item a resumed walk starts at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FencePosition {
-    Provisioning { tenant: TenantHash, signal: Signal },
-    Leases { tenant: TenantHash },
+    Provisioning {
+        tenant: TenantHash,
+        signal: Signal,
+    },
+    /// Finding which tenants hold alert keys failed at `tenant`. Finding
+    /// writes nothing and its result is not carried in the cursor, so a walk
+    /// resumed here finds every tenant again and parks every lease.
+    LeaseDiscovery {
+        tenant: TenantHash,
+    },
+    /// Parking failed at `tenant`'s lease; every lease before it is parked.
+    Leases {
+        tenant: TenantHash,
+    },
 }
 
 impl FencePosition {
@@ -119,7 +131,8 @@ impl FencePosition {
                 tenant,
                 SIGNALS.iter().position(|s| *s == signal).unwrap_or(0),
             ),
-            FencePosition::Leases { tenant } => (1, tenant, 0),
+            FencePosition::LeaseDiscovery { tenant } => (1, tenant, 0),
+            FencePosition::Leases { tenant } => (2, tenant, 0),
         }
     }
 }
@@ -251,10 +264,23 @@ fn family_entry<'a>(
 }
 
 /// The family's last activation has not recorded a finished fence walk.
+///
+/// `sys/compat` carries no fenced epoch, and ravel-catalog defines a walk as
+/// finished once `fence_complete_unix_ns` is at or after `activated_unix_ns`.
+/// [`activation_stamp`] stamps every activation strictly after the family's
+/// previous `fence_complete_unix_ns`, so that rule holds for the current
+/// `activated_epoch` only, whatever the clocks of the processes involved.
 fn fence_pending(entry: &sysproto::CompatFamily) -> bool {
     entry.activated_epoch > 0
         && (entry.fence_complete_unix_ns == 0
             || entry.fence_complete_unix_ns < entry.activated_unix_ns)
+}
+
+/// The `activated_unix_ns` for a new activation of `entry`'s family: `now`,
+/// or one past the previous walk's `fence_complete_unix_ns` when a clock
+/// behind that walk's would otherwise read the new walk as already finished.
+fn activation_stamp(now: i64, entry: &sysproto::CompatFamily) -> i64 {
+    now.max(entry.fence_complete_unix_ns.saturating_add(1))
 }
 
 /// Activate `request.version` for `request.family`, or resume the family's
@@ -310,7 +336,7 @@ pub async fn activate(
             family,
             request.version,
             &request.activated_by,
-            clock.now_unix_ns(),
+            activation_stamp(clock.now_unix_ns(), entry),
         )
         .await
         {
@@ -412,9 +438,6 @@ async fn fence_walk(
         let mut lease_tenants: BTreeSet<TenantHash> =
             request.alert_rule_tenants.iter().copied().collect();
         for tenant in &tenants {
-            if before_resume(FencePosition::Leases { tenant: *tenant }) {
-                continue;
-            }
             match has_alert_prefix(store, tenant).await {
                 Ok(true) => {
                     lease_tenants.insert(*tenant);
@@ -423,7 +446,7 @@ async fn fence_walk(
                 Err(err) => {
                     fail(
                         &mut report,
-                        Some(FencePosition::Leases { tenant: *tenant }),
+                        Some(FencePosition::LeaseDiscovery { tenant: *tenant }),
                         err.into(),
                     );
                     return report;
@@ -1114,6 +1137,173 @@ mod tests {
         assert_eq!(rseg.active_write_version, baseline(FAMILY_RSEG) + 1);
         assert_eq!(rseg.activated_epoch, 1);
         assert_eq!(rseg.fence_complete_unix_ns, T0 + 20);
+    }
+
+    #[tokio::test]
+    async fn a_lease_finding_failure_resumes_without_skipping_an_unparked_lease() {
+        let mem = initialized().await;
+        // Tenants sort 1, 2, 3: finding fails on the third tenant, after it
+        // found tenant 1's alert keys and before any lease was parked.
+        let third = format!("t/{}/", tenant(3).to_hex());
+        let store = FaultStore::new(
+            mem.clone(),
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::List, ScriptedFault::Transient("list down".into()))
+                    .with_key_contains(&third)
+                    .with_occurrence(Occurrence::Nth(1)),
+            ),
+        );
+        let first = activate(
+            &store,
+            Some(&test_keys()),
+            &TestClock(T0 + 10),
+            &writable_next(FAMILY_RLOG),
+            &request(FAMILY_RLOG),
+        )
+        .await
+        .expect("activate");
+        assert_eq!(store.fault_count(Op::List, FaultKind::Transient), 1);
+        assert!(
+            matches!(first.walk.failure, Some(FenceFailure::Listing(_))),
+            "{:?}",
+            first.walk.failure
+        );
+        assert_eq!(first.walk.buckets_raised, 4);
+        assert_eq!(first.walk.leases_created + first.walk.leases_replaced, 0);
+        let cursor = first.walk.resume_from.expect("cursor");
+        assert_eq!(
+            cursor.position,
+            FencePosition::LeaseDiscovery { tenant: tenant(3) }
+        );
+        assert!(
+            !lease(mem.as_ref(), tenant(1))
+                .await
+                .expect("lease")
+                .is_parked()
+        );
+
+        // The resume is checked against fence_complete as it is written: the
+        // put to sys/compat that records it is held until the leases are
+        // inspected.
+        let gate = store.hold(Op::Put, Some(COMPAT_KEY.to_string()), Occurrence::Nth(1));
+        let (keys, clock, writable) = (test_keys(), TestClock(T0 + 20), writable_next(FAMILY_RLOG));
+        let resume_request = ActivateRequest {
+            resume_from: Some(cursor),
+            ..request(FAMILY_RLOG)
+        };
+        let resume = activate(&store, Some(&keys), &clock, &writable, &resume_request);
+        let inspect = async {
+            gate.wait_until_held(1).await;
+            assert_eq!(
+                entry(mem.as_ref(), FAMILY_RLOG)
+                    .await
+                    .fence_complete_unix_ns,
+                0
+            );
+            for t in [tenant(1), tenant(3), tenant(4)] {
+                let parked = lease(mem.as_ref(), t).await.expect("lease present");
+                assert!(parked.is_parked(), "{t:?} not parked before fence_complete");
+                assert_eq!(parked.compat_epoch, 1, "{t:?}");
+            }
+            for id in gate.held() {
+                assert!(gate.release(id));
+            }
+        };
+        let (resumed, ()) = tokio::join!(resume, inspect);
+        let resumed = resumed.expect("resume");
+        assert_eq!(resumed.outcome, ActivateOutcome::ResumedPendingWalk);
+        assert!(resumed.walk.complete, "{:?}", resumed.walk.failure);
+        assert_eq!(resumed.walk.leases_replaced, 1);
+        assert_eq!(resumed.walk.leases_created, 2);
+        assert_eq!(
+            entry(mem.as_ref(), FAMILY_RLOG)
+                .await
+                .fence_complete_unix_ns,
+            T0 + 20
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reactivation_stamped_at_or_before_the_previous_fence_still_resumes_its_walk() {
+        for skew in [0, 5] {
+            let mem = initialized().await;
+            let base = baseline(FAMILY_RLOG);
+            let writable = WritableVersions::current()
+                .with_family(FAMILY_RLOG, vec![base, base + 1, base + 2, base + 3]);
+            let first = activate(
+                mem.as_ref(),
+                Some(&test_keys()),
+                &TestClock(T0 + 10),
+                &writable,
+                &request(FAMILY_RLOG),
+            )
+            .await
+            .expect("first activation");
+            assert_eq!(first.walk.fence_complete_unix_ns, Some(T0 + 10));
+
+            // The second activation runs on a clock at or behind the first
+            // walk's fence_complete, and its walk fails.
+            let store = FaultStore::new(
+                mem.clone(),
+                FaultPlan::empty().with_rule(
+                    Rule::new(Op::Put, ScriptedFault::Transient("prov down".into()))
+                        .with_key_contains("/prov")
+                        .with_occurrence(Occurrence::Nth(1)),
+                ),
+            );
+            let second = activate(
+                &store,
+                Some(&test_keys()),
+                &TestClock(T0 + 10 - skew),
+                &writable,
+                &ActivateRequest {
+                    version: base + 2,
+                    ..request(FAMILY_RLOG)
+                },
+            )
+            .await
+            .expect("second activation");
+            assert_eq!(store.fault_count(Op::Put, FaultKind::Transient), 1);
+            assert!(!second.walk.complete);
+            assert_eq!(second.walk.compat_epoch, 2);
+            let rlog = entry(mem.as_ref(), FAMILY_RLOG).await;
+            assert_eq!(rlog.activated_epoch, 2);
+            assert!(
+                rlog.activated_unix_ns > rlog.fence_complete_unix_ns,
+                "skew {skew}: activation at {} reads as fenced by {}",
+                rlog.activated_unix_ns,
+                rlog.fence_complete_unix_ns
+            );
+            assert!(fence_pending(&rlog), "skew {skew}");
+
+            // Asking for the next version resumes epoch 2's walk instead.
+            let third = activate(
+                &store,
+                Some(&test_keys()),
+                &TestClock(T0 + 10 - skew),
+                &writable,
+                &ActivateRequest {
+                    version: base + 3,
+                    ..request(FAMILY_RLOG)
+                },
+            )
+            .await
+            .expect("third call");
+            assert_eq!(
+                third.outcome,
+                ActivateOutcome::ResumedPendingWalk,
+                "skew {skew}"
+            );
+            assert!(third.walk.complete);
+            assert_eq!(third.walk.compat_epoch, 2);
+            let rlog = entry(mem.as_ref(), FAMILY_RLOG).await;
+            assert_eq!(rlog.active_write_version, base + 2);
+            assert!(!fence_pending(&rlog));
+            assert_eq!(
+                prov_epoch(mem.as_ref(), tenant(1), Signal::Metrics).await,
+                2
+            );
+        }
     }
 
     #[tokio::test]
