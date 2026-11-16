@@ -586,8 +586,13 @@ pub(super) fn build_row_batch_filtered(
         projection: &reads,
         ..*shape
     };
-    let (columns, kept) =
-        build_row_columns(block, RowSet::Range(start, end), streams, &first, reservation)?;
+    let (columns, kept) = build_row_columns(
+        block,
+        RowSet::Range(start, end),
+        streams,
+        &first,
+        reservation,
+    )?;
     let kept: Vec<usize> = kept.unwrap_or_else(|| (start..end).collect());
     if kept.is_empty() {
         return Ok(FilteredRows {
@@ -607,14 +612,22 @@ pub(super) fn build_row_batch_filtered(
         });
     }
     charge.grow(passed.capacity() * std::mem::size_of::<usize>() * 2)?;
-    let survivors: Vec<usize> = passed.iter().filter_map(|&p| kept.get(p).copied()).collect();
+    let survivors: Vec<usize> = passed
+        .iter()
+        .filter_map(|&p| kept.get(p).copied())
+        .collect();
     // Erasure already kept every survivor.
     let second = RowBatchShape {
         erasure: &[],
         ..*shape
     };
-    let (columns, rebuilt) =
-        build_row_columns(block, RowSet::List(&survivors), streams, &second, reservation)?;
+    let (columns, rebuilt) = build_row_columns(
+        block,
+        RowSet::List(&survivors),
+        streams,
+        &second,
+        reservation,
+    )?;
     if rebuilt.is_some_and(|r| r.len() != survivors.len()) {
         return Err(DataFusionError::Internal(
             "logs scan row filter survivor dropped by its rebuild".into(),
@@ -656,13 +669,11 @@ fn build_row_columns(
         let mut columns = Vec::with_capacity(shape.projection.len());
         for &idx in shape.projection {
             columns.push(
-                fixed_column_array(&fixed_view, idx, fixed_start, fixed_end)?.ok_or_else(
-                    || {
-                        DataFusionError::Internal(format!(
-                            "logs scan projection index {idx} out of range"
-                        ))
-                    },
-                )?,
+                fixed_column_array(&fixed_view, idx, fixed_start, fixed_end)?.ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "logs scan projection index {idx} out of range"
+                    ))
+                })?,
             );
         }
         return Ok((columns, None));
@@ -784,7 +795,8 @@ fn build_row_columns(
     let mut row_ends: Vec<usize> = Vec::with_capacity(if attrs_projected { rows_len } else { 0 });
     let mut record: Vec<(usize, &str, Cell<'_>)> = Vec::with_capacity(record_bound);
     let mut kept: Vec<usize> = Vec::with_capacity(rows_len);
-    let mut key_cells: Vec<Vec<Option<Cell<'_>>>> = vec![Vec::with_capacity(rows_len); slot_ids.len()];
+    let mut key_cells: Vec<Vec<Option<Cell<'_>>>> =
+        vec![Vec::with_capacity(rows_len); slot_ids.len()];
     let mut overflow_from = 0;
     for (n, i) in rows.iter().enumerate() {
         let stamp = n + 1;
@@ -8619,9 +8631,16 @@ mod row_path_tests {
             row_refs,
             &filters,
         );
-        assert_eq!(first_attrs, KEPT.len(), "the attrs map is built for the kept rows only");
+        assert_eq!(
+            first_attrs,
+            KEPT.len(),
+            "the attrs map is built for the kept rows only"
+        );
         assert_eq!(then_attrs, N, "build-then-filter builds every row's map");
-        assert_eq!((first_dropped, then_dropped), (N - KEPT.len(), N - KEPT.len()));
+        assert_eq!(
+            (first_dropped, then_dropped),
+            (N - KEPT.len(), N - KEPT.len())
+        );
         assert_eq!(first.unerased, N);
         let got = first.batch.expect("kept rows");
         assert_same_columns(&got, &then);
@@ -8641,7 +8660,11 @@ mod row_path_tests {
             .iter()
             .map(|&r| RowRef::unpack(r).row)
             .collect();
-        assert_eq!(rows, vec![100, 101, 104, 105, 108, 109], "row refs by block position");
+        assert_eq!(
+            rows,
+            vec![100, 101, 104, 105, 108, 109],
+            "row refs by block position"
+        );
         assert_eq!(
             reservation.size(),
             streams.charged(),

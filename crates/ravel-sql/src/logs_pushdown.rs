@@ -450,9 +450,7 @@ fn leaf_is_exact(expr: &Expr, declared: &[DeclaredColumn]) -> bool {
             Some((Operator::Lt | Operator::LtEq, _)) => out.ts_hi.is_some(),
             Some(_) => false,
             // The scan evaluates the whole leaf as its row filter.
-            None => {
-                (is_str_not_equal(be, declared) || i64_equality) && out.row_filters.len() == 1
-            }
+            None => (is_str_not_equal(be, declared) || i64_equality) && out.row_filters.len() == 1,
         },
         Expr::Between(bt) if !bt.negated && is_ts_col(&bt.expr) => {
             out.ts_lo.is_some() && out.ts_hi.is_some()
@@ -2114,6 +2112,16 @@ mod tests {
             ("n < 5", col("n").lt(lit(5i64))),
             ("n > 5", col("n").gt(lit(5i64))),
             ("n >= 5", col("n").gt_eq(lit(5i64))),
+            ("n <= 5", col("n").lt_eq(lit(5i64))),
+            (
+                "n BETWEEN 5 AND 5",
+                Expr::Between(Between::new(
+                    Box::new(col("n")),
+                    false,
+                    Box::new(lit(5i64)),
+                    Box::new(lit(5i64)),
+                )),
+            ),
             ("n = NULL", col("n").eq(lit(ScalarValue::Int64(None)))),
             (
                 "n = u64 past i64::MAX",
@@ -2130,17 +2138,17 @@ mod tests {
                 ))
                 .eq(lit(5i64)),
             ),
-            ("NOT (n <> 5)", Expr::Not(Box::new(col("n").not_eq(lit(5i64))))),
+            (
+                "NOT (n <> 5)",
+                Expr::Not(Box::new(col("n").not_eq(lit(5i64)))),
+            ),
             ("b = true", col("b").eq(lit(true))),
             ("s = 'x'", col("s").eq(lit("x"))),
             ("blob = x'01'", col("blob").eq(lit(vec![1u8]))),
             ("fixed severity_num = 5", col("severity_num").eq(lit(5i64))),
             ("undeclared = 5", col("other").eq(lit(5i64))),
             ("OR", or(col("n").eq(lit(5i64)), col("n").eq(lit(6i64)))),
-            (
-                "IN",
-                col("n").in_list(vec![lit(5i64), lit(6i64)], false),
-            ),
+            ("IN", col("n").in_list(vec![lit(5i64), lit(6i64)], false)),
             (
                 "n = 5 AND n > 1",
                 col("n").eq(lit(5i64)).and(col("n").gt(lit(1i64))),
@@ -2157,7 +2165,9 @@ mod tests {
         );
         for (name, e) in &rejected[..rejected.len() - 1] {
             assert!(
-                extract_logs(std::slice::from_ref(e), &d).row_filters.is_empty(),
+                extract_logs(std::slice::from_ref(e), &d)
+                    .row_filters
+                    .is_empty(),
                 "{name} is not a row filter"
             );
         }

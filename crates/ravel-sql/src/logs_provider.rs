@@ -2764,7 +2764,9 @@ mod tests {
             col("status_code").eq(lit(500i64)),
             lit(500i64).eq(col("status_code")),
             col("status_code").eq(lit(datafusion::scalar::ScalarValue::Int32(Some(500)))),
-            col("ts").gt_eq(ts_lit(100)).and(col("status_code").eq(lit(500i64))),
+            col("ts")
+                .gt_eq(ts_lit(100))
+                .and(col("status_code").eq(lit(500i64))),
         ] {
             assert_eq!(
                 pushdown_for(&p, &filter),

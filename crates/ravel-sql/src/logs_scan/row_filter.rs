@@ -1,7 +1,11 @@
-//! The scan's own row filter (ADR-0093, exact not-equal amendment): the
-//! conjuncts of [`crate::logs_pushdown::LogsPushdown::row_filters`] as the
-//! physical expressions the session built, evaluated on each batch after the
-//! column build and before the batch is emitted or charged.
+//! The scan's own row filter (ADR-0093, exact not-equal and I64 equality
+//! amendments): the conjuncts of
+//! [`crate::logs_pushdown::LogsPushdown::row_filters`] as the physical
+//! expressions the session built, evaluated before a batch is emitted or
+//! charged. The columnar path evaluates them on each batch it built. The row
+//! path builds only the columns they read ([`BoundRowFilters::reads`]),
+//! evaluates them there ([`BoundRowFilters::survivors`]), and builds the
+//! other columns for the surviving rows only (`build_row_batch_filtered`).
 //!
 //! The provider binds each expression against the resolved full `logs` schema.
 //! [`LogsScanExec::build`](super::LogsScanExec) widens the build projection by

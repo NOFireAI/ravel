@@ -84,7 +84,10 @@ struct Corpus {
     value: i64,
 }
 
-fn stream_attrs(uid: StreamUid) -> (Vec<(String, AttrValue)>, Vec<(String, AttrValue)>) {
+type Attrs = Vec<(String, AttrValue)>;
+
+/// A stream's resource and scope attributes.
+fn stream_attrs(uid: StreamUid) -> (Attrs, Attrs) {
     let mut resource = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
     let mut scope = Vec::new();
     match uid {
@@ -286,7 +289,11 @@ async fn check_corpus(corpus: &Corpus) -> Result<(), TestCaseError> {
         let (_, want) = run(&off, &sql).await;
         let (plan, got) = run(&on, &sql).await;
         prop_assert_eq!(pretty(&got), pretty(&want), "{}", sql);
-        prop_assert!(nodes(&plan, "FilterExec").is_empty(), "{}: no FilterExec", sql);
+        prop_assert!(
+            nodes(&plan, "FilterExec").is_empty(),
+            "{}: no FilterExec",
+            sql
+        );
     }
     Ok(())
 }
