@@ -623,9 +623,10 @@ pub trait CompatClock: Send + Sync {
 pub enum CompatRefusal {
     /// The last successful read of `sys/compat` is at least
     /// [`COMPAT_VIEW_HORIZON`] old, or there has been none. Only a blind view
-    /// is exempt: one no refresh has ever succeeded for, whose every refresh
-    /// error so far is an `AccessDenied`, writing a bucket that carries no
-    /// `compat_epoch`. It answers the baseline (ADR-4233 decision 1).
+    /// is exempt: one no refresh has ever succeeded for, whose latest
+    /// finished refresh (if any) failed with an `AccessDenied`, writing a
+    /// bucket that carries no `compat_epoch`. It answers the baseline
+    /// (ADR-4233 decision 1).
     #[error(
         "{COMPAT_KEY} view is stale: last successful read {last_read_unix_ns:?}, now {now_unix_ns}"
     )]
@@ -704,10 +705,11 @@ struct ViewState {
     /// Whether any GET of `sys/compat` in this run returned an object, read
     /// or not: a decoded record, or one this build refused to decode.
     record_seen: bool,
-    /// Whether any refresh in this run failed with a store error other than
-    /// `AccessDenied`. Such a failure says nothing about the grant, so it
-    /// ends the blind-view exemption.
-    refresh_failed_not_denied: bool,
+    /// Whether the refresh that finished last failed with a store error other
+    /// than `AccessDenied`. Such a failure says nothing about the grant, so
+    /// while no read has succeeded the view cannot tell whether an activation
+    /// happened and is not blind. The next refresh to finish overwrites it.
+    latest_failed_not_denied: bool,
     last_record: Option<sysproto::CompatRecord>,
     seen_epoch: u64,
     families: BTreeMap<String, SeenFamily>,
@@ -819,9 +821,10 @@ impl CompatView {
     /// `write_policy` answers as for an absent one: the baseline, or, on a
     /// bucket whose provisioning record carries a `compat_epoch`,
     /// [`CompatRefusal::ViewStale`] before the first successful read and
-    /// [`CompatRefusal::CompatRecordMissing`] after it. A refresh that fails
-    /// with anything but `AccessDenied` before the first successful read
-    /// makes the view stale for every bucket until a read succeeds.
+    /// [`CompatRefusal::CompatRecordMissing`] after it. Before the first
+    /// successful read, a refresh that fails with a store error other than
+    /// `AccessDenied` makes the view stale for every bucket until a later
+    /// refresh succeeds or fails with `AccessDenied`.
     pub fn new(
         store: Arc<dyn ObjectStoreBackend>,
         keys: CompatKeys,
@@ -843,8 +846,9 @@ impl CompatView {
     /// keeps the last successful read and its age. One that failed after the
     /// GET returned an object (a newer, unauthenticated or corrupt record)
     /// still marks a record as seen, so the view refuses once it goes stale.
-    /// A store error other than `AccessDenied` ends the blind-view exemption
-    /// for the rest of the run.
+    /// While no read has succeeded, a store error other than `AccessDenied`
+    /// suspends the blind-view exemption until a later refresh succeeds or
+    /// fails with `AccessDenied`.
     /// Overlapping refreshes merge every monotone value they read, but the
     /// record and its presence come from the read that started last.
     pub async fn refresh(&self) -> Result<CompatRefresh, CompatError> {
@@ -853,15 +857,17 @@ impl CompatView {
         let read = match read_compat(self.inner.store.as_ref(), &self.inner.keys).await {
             Ok(read) => read,
             Err(err) => {
-                if !matches!(err, CompatError::Store { .. }) {
-                    self.inner.state.write().record_seen = true;
-                } else if !err.is_access_denied() {
-                    self.inner.state.write().refresh_failed_not_denied = true;
+                let mut state = self.inner.state.write();
+                if matches!(err, CompatError::Store { .. }) {
+                    state.latest_failed_not_denied = !err.is_access_denied();
+                } else {
+                    state.record_seen = true;
                 }
                 return Err(err);
             }
         };
         let mut state = self.inner.state.write();
+        state.latest_failed_not_denied = false;
         Ok(state.merge(read.map(|(record, _)| record), ticket, started))
     }
 
@@ -873,9 +879,9 @@ impl CompatView {
     ///
     /// A view past [`COMPAT_VIEW_HORIZON`] refuses with
     /// [`CompatRefusal::ViewStale`] unless it is blind: no refresh has ever
-    /// succeeded, every refresh error so far is an `AccessDenied` from a
-    /// credential without the grant, and the bucket carries no
-    /// `compat_epoch`. A blind view answers the baseline.
+    /// succeeded, the refresh that finished last (if any) failed with an
+    /// `AccessDenied` from a credential without the grant, and the bucket
+    /// carries no `compat_epoch`. A blind view answers the baseline.
     pub fn write_policy(
         &self,
         now_unix_ns: i64,
@@ -912,8 +918,9 @@ impl CompatView {
     /// recheck it before every PUT. [`CompatRefusal::ViewStale`] when the
     /// last successful read is at least [`COMPAT_VIEW_HORIZON_NS`] old, or
     /// there has been none, unless the view is blind: no refresh has
-    /// succeeded, every refresh error so far is an `AccessDenied`, no object
-    /// was seen, and `bucket_compat_epoch` is 0.
+    /// succeeded, the refresh that finished last (if any) did not fail with
+    /// a store error other than `AccessDenied`, no object was seen, and
+    /// `bucket_compat_epoch` is 0.
     pub fn check_fresh(
         &self,
         now_unix_ns: i64,
@@ -924,7 +931,7 @@ impl CompatView {
             .last_read_unix_ns
             .is_some_and(|last| now_unix_ns.saturating_sub(last) < COMPAT_VIEW_HORIZON_NS);
         let blind = state.last_read_unix_ns.is_none()
-            && !state.refresh_failed_not_denied
+            && !state.latest_failed_not_denied
             && !state.record_seen;
         if !fresh && !(blind && bucket_compat_epoch == 0) {
             return Err(CompatRefusal::ViewStale {
@@ -1368,10 +1375,11 @@ mod tests {
     /// A view no read has ever succeeded for has no read inside the horizon,
     /// so it is already past it. Once a refresh fails with anything but
     /// `AccessDenied` (a 5xx, a timeout, throttling) the failure says nothing
-    /// about a missing grant, and the view refuses at once and from then on,
-    /// on a bucket with no `compat_epoch` too. Here the store holds an
-    /// activated record the view never got to read: answering the baseline
-    /// would publish version 7 under an activation of 8.
+    /// about a missing grant, and the view refuses at once, on a bucket with
+    /// no `compat_epoch` too, and keeps refusing while every later refresh
+    /// fails the same way. Here the store holds an activated record the view
+    /// never got to read: answering the baseline would publish version 7
+    /// under an activation of 8.
     #[tokio::test]
     async fn a_never_read_view_with_a_non_access_denied_error_refuses_at_once() {
         let faults = [
@@ -1394,8 +1402,20 @@ mod tests {
             let err = view.refresh().await.expect_err("refresh fails");
             assert!(!err.is_access_denied(), "{kind:?}: {err}");
             assert_eq!(store.fault_count(Op::Get, kind), 1, "{kind:?}");
+            assert_eq!(
+                view.check_fresh(T0, 0),
+                Err(CompatRefusal::ViewStale {
+                    last_read_unix_ns: None,
+                    now_unix_ns: T0,
+                }),
+                "{kind:?}"
+            );
+            clock.set(T0 + 1);
+            let err = view.refresh().await.expect_err("refresh fails again");
+            assert!(!err.is_access_denied(), "{kind:?}: {err}");
+            assert_eq!(store.fault_count(Op::Get, kind), 2, "{kind:?}");
             for at in [
-                T0,
+                T0 + 1,
                 T0 + COMPAT_VIEW_HORIZON_NS,
                 T0 + 3 * COMPAT_VIEW_HORIZON_NS,
             ] {
@@ -1468,12 +1488,59 @@ mod tests {
         }
     }
 
-    /// A blind view keeps its exemption only while every error is an
-    /// `AccessDenied`. A 5xx after one ends it: the view has never read, so it
-    /// is past the horizon and refuses, and a later `AccessDenied` does not
-    /// restore the exemption.
+    /// Before the first successful read only the latest refresh outcome
+    /// counts. A 5xx says nothing about the grant, so the view refuses; an
+    /// `AccessDenied` after it says the grant is missing, and the blind
+    /// exemption holds again for a bucket with no `compat_epoch`.
     #[tokio::test]
-    async fn access_denied_then_a_5xx_refuses_at_once() {
+    async fn a_5xx_then_access_denied_is_exempt_again() {
+        let plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Get)
+                .with_key_contains(COMPAT_KEY)
+                .then_fault(ScriptedFault::Transient("503".to_string())),
+        );
+        let store = Arc::new(FaultStore::new(DeniedCompatGet::unshared(true), plan));
+        let clock = ManualClock::at(T0);
+        let view = view(store.clone(), clock.clone());
+
+        let err = view.refresh().await.expect_err("5xx");
+        assert!(!err.is_access_denied(), "{err}");
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 1);
+        assert_eq!(
+            view.check_fresh(T0, 0),
+            Err(CompatRefusal::ViewStale {
+                last_read_unix_ns: None,
+                now_unix_ns: T0,
+            })
+        );
+
+        clock.set(T0 + 1);
+        let err = view.refresh().await.expect_err("denied");
+        assert!(err.is_access_denied(), "{err}");
+        assert_eq!(store.inner().denied.load(Ordering::SeqCst), 1);
+        for at in [T0 + 1, T0 + 3 * COMPAT_VIEW_HORIZON_NS] {
+            assert_eq!(view.check_fresh(at, 0), Ok(()), "at {at}");
+            assert_eq!(
+                view.write_policy(at, FAMILY_RSEG, &[7], 7, None),
+                Ok(7),
+                "at {at}"
+            );
+        }
+        assert_eq!(
+            view.check_fresh(T0 + 1, 1),
+            Err(CompatRefusal::ViewStale {
+                last_read_unix_ns: None,
+                now_unix_ns: T0 + 1,
+            })
+        );
+    }
+
+    /// An `AccessDenied` leaves a never-read view blind. A 5xx after it
+    /// suspends the exemption: the view has never read, so it is past the
+    /// horizon and refuses at once and however long the outage lasts. The
+    /// next `AccessDenied` restores the exemption.
+    #[tokio::test]
+    async fn access_denied_then_a_5xx_refuses_until_the_next_refresh() {
         let plan = FaultPlan::empty().with_sequence(
             Sequence::new(Op::Get)
                 .with_key_contains(COMPAT_KEY)
@@ -1492,14 +1559,8 @@ mod tests {
         let err = view.refresh().await.expect_err("5xx");
         assert!(!err.is_access_denied(), "{err}");
         assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 1);
-
-        clock.set(T0 + 2);
-        let err = view.refresh().await.expect_err("denied again");
-        assert!(err.is_access_denied(), "{err}");
-        assert_eq!(store.inner().denied.load(Ordering::SeqCst), 2);
-
         for at in [
-            T0 + 2,
+            T0 + 1,
             T0 + COMPAT_VIEW_HORIZON_NS,
             T0 + 3 * COMPAT_VIEW_HORIZON_NS,
         ] {
@@ -1517,6 +1578,22 @@ mod tests {
                     now_unix_ns: at,
                 })
             );
+        }
+
+        clock.set(T0 + 3 * COMPAT_VIEW_HORIZON_NS + 1);
+        let err = view.refresh().await.expect_err("denied again");
+        assert!(err.is_access_denied(), "{err}");
+        assert_eq!(store.inner().denied.load(Ordering::SeqCst), 2);
+        for at in [
+            T0 + 3 * COMPAT_VIEW_HORIZON_NS + 1,
+            T0 + 6 * COMPAT_VIEW_HORIZON_NS,
+        ] {
+            assert_eq!(
+                view.write_policy(at, FAMILY_RSEG, &[7], 7, None),
+                Ok(7),
+                "at {at}"
+            );
+            assert_eq!(view.check_fresh(at, 0), Ok(()), "at {at}");
         }
     }
 

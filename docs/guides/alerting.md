@@ -329,10 +329,11 @@ On a keyed bucket (`--tenant-hash-key-file`), every process reads
 - Before the PUT of a history object, and before every attempt to publish
   its commit record, it checks that `sys/compat` was read less than 10
   minutes ago and is still present after an activation. A process that has
-  never read `sys/compat` passes this check only while every failed read
-  was refused as `AccessDenied` and no record was seen; one whose reads
-  failed any other way (a 5xx, a timeout, throttling) refuses from the
-  first tick and takes no lease. A refused PUT fails the rule
+  never read `sys/compat` passes this check only while no record was seen
+  and its latest failed read was refused as `AccessDenied`; while its latest
+  read failed any other way (a 5xx, a timeout, throttling) it refuses and
+  takes no lease, until a read succeeds or is refused as `AccessDenied`
+  again. A refused PUT fails the rule
   for this tick, as any failed record write does.
 - A tick that runs longer than the publish lifetime the record states
   (`max_publish_lifetime_ns`) stops: the rules it has not reached fail with
