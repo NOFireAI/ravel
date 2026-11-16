@@ -871,6 +871,88 @@ async fn required_mode_fails_closed_on_audit_write_fault() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
+/// The query audit pipeline is a published-object writer like any other,
+/// so `start` installs the `sys/compat` policy on it (ADR-4233, #4301). On a
+/// keyed bucket whose `sys/compat` names an `rlog` version this build cannot
+/// write, the audit flush is refused before its data PUT, and under
+/// `audit_mode=required` the query fails closed with no audit object stored.
+/// A pipeline spawned without the policy writes the record at the built-in
+/// version and answers 200.
+#[tokio::test]
+async fn an_activated_store_refuses_the_query_audit_write() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_segment(store.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
+    let deployment_key = [0x4d; 32];
+    let family = |name: &str, version: u32| ravel_proto::sys::v1::CompatFamily {
+        family: name.to_string(),
+        active_write_version: version,
+        activated_epoch: 1,
+        ..Default::default()
+    };
+    ravel_catalog::compat::create_compat(
+        store.as_ref(),
+        &ravel_catalog::compat::CompatKeys::from_file_keys(&[deployment_key]).expect("key"),
+        ravel_proto::sys::v1::CompatRecord {
+            compat_epoch: 1,
+            families: vec![family(
+                ravel_catalog::compat::FAMILY_RLOG,
+                u32::from(ravel_logseg::footer::SUPPORTED_VERSIONS.newest()) + 1,
+            )],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create sys/compat");
+    let mut tokens = HashMap::new();
+    tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
+    let mut config = server_config(
+        tokens,
+        Mode::All,
+        required(),
+        vec![TenantId::new(TENANT).hash()],
+        Default::default(),
+    );
+    config.deployment_key = Some(Box::new(deployment_key));
+    let running = ravel_server::start(
+        config,
+        store.clone(),
+        store.clone(),
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts");
+    let base = format!("http://{}", running.http_addr);
+
+    let response = reqwest::Client::new()
+        .get(format!("{base}/api/v1/query_range"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .query(&[
+            ("query", "m".to_string()),
+            ("start", "0".to_string()),
+            ("end", NOW_S.to_string()),
+            ("step", "60s".to_string()),
+        ])
+        .send()
+        .await
+        .expect("query_range request sent");
+    assert_eq!(
+        response.status(),
+        503,
+        "the audit write is refused under the compat policy, so the query fails closed"
+    );
+    let audit_objects: Vec<String> = list_all(store.as_ref(), "t/")
+        .await
+        .expect("list every tenant prefix")
+        .into_iter()
+        .map(|meta| meta.key)
+        .filter(|key| key.contains("/u/"))
+        .collect();
+    assert_eq!(audit_objects, Vec::<String>::new());
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
 /// `audit_mode=best-effort`: the same fault logs and counts the failure
 /// instead of failing the response.
 #[tokio::test]

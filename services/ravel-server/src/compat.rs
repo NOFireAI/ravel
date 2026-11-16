@@ -527,9 +527,10 @@ mod tests {
         assert_eq!(count("rlog", CompatRefusalReason::FenceFailed), 5);
         assert_eq!(count("other", CompatRefusalReason::Other), 7);
         assert_eq!(count("rlog", CompatRefusalReason::ViewStale), 0);
+        // `rlog fence_failed` is pre-filled, so only `other other` adds a row.
         assert_eq!(
             series.len(),
-            KNOWN_FAMILIES.len() * CompatRefusalReason::ALL.len() + 2
+            KNOWN_FAMILIES.len() * CompatRefusalReason::ALL.len() + 1
         );
     }
 }
