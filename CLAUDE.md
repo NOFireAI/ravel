@@ -68,7 +68,18 @@ executors.
   (docs/segment-format.md), the protobuf schemas under proto/, canonical
   series identity and commit tokens (crates/ravel-types), and the object
   key layout (docs/catalog-and-mvcc.md). Changing any of them requires an
-  ADR and a version bump, never an in-place edit.
+  ADR, never an in-place edit. How the change is versioned depends on what
+  changes:
+  - The RSEG layout and the catalog HEAD bump their version. A HEAD change
+    always bumps the HEAD version (ADR-4233, H2): a rebuild by an older
+    build would otherwise strip the new field.
+  - Series identity and commit tokens get a new domain string.
+  - The object key layout gets a new prefix.
+  - Any other proto record may add a field with a new field number and no
+    version bump, but only when a reader that ignores the field still gets
+    the same query answer, durability, retention and fencing. Otherwise it
+    bumps the record's version.
+  - Field numbers are never renumbered or reused.
 - `unsafe` is denied workspace-wide. No unwrap/expect in production code
   paths; test modules carry `#[allow(clippy::expect_used)]`.
 - Exact semantics by default. Approximation is opt-in and visible.
