@@ -319,10 +319,12 @@ groups:
             every tenant in the process is blocked; for a single blocked
             tenant this rule is the only one that fires. An alert history
             object whose bytes match its commit record's content hash and
-            whose RLOG version this build cannot read does not block
-            evaluation: it is skipped and counted instead.
-            Check the store reachability family and the evaluator's warn logs,
-            which name the tenant.
+            whose RLOG version is older than this build reads is skipped and
+            counted instead. One whose version is newer refuses every tick
+            and is counted in ravel_alert_history_newer_version_refusals_total;
+            the remedy for that is to run a build that reads its version.
+            Otherwise check the store reachability family and the evaluator's
+            warn logs, which name the tenant.
           runbook: docs/guides/observability.md#the-alerting-pipeline-alerts
 
   - name: ravel-ingest-rejections

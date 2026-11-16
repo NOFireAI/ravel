@@ -5230,10 +5230,13 @@ mod tick_tests {
     /// and the memo is left as it was, rather than rebuilt from a fold that
     /// dropped the object.
     ///
-    /// Watch it fail against a refusal that still reaches the memo-write path:
-    /// it rewrites `a/state/latest` from the partial fold, moving the watermark
-    /// to this tick's seal bound, so the memo's watermark after the tick differs
-    /// from the one before.
+    /// The tail also holds a readable record that resolves the firing alert, so
+    /// the partial fold's state differs from the memo's: a refusal that still
+    /// reached the memo-write path would rewrite `a/state/latest` with the
+    /// alert `Resolved`, and the `Firing` assertion below fails. (With only the
+    /// newer object in the tail the fold equals the memo, the unchanged-memo
+    /// check skips the write, and the assertions pass whether or not the tick
+    /// refused.)
     #[tokio::test]
     async fn a_newer_version_refusal_leaves_the_prior_memo_intact() {
         let store = seeded_store().await;
@@ -5260,6 +5263,9 @@ mod tick_tests {
         };
         let newer = build_transition_record(&other, AlertState::Firing, 1, NOW_NS - NS_PER_SEC);
         seed_alert_object_with(&ev, &newer, 10_000, NEWER_VERSION, to_newer_version).await;
+        let resolves =
+            build_transition_record(&rule, AlertState::Resolved, 1, NOW_NS - 5 * NS_PER_SEC);
+        seed_alert_object_with(&ev, &resolves, 9_999, ravel_logseg::footer::VERSION, |_| {}).await;
 
         let report = ev.run_tick().await;
         assert_eq!(report.outcome(), AlertTickOutcome::HistoryUnavailable);
