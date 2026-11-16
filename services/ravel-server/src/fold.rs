@@ -1002,6 +1002,9 @@ async fn run_tenant_tick(
         );
         return TenantTickOutcome::SkippedFresh;
     }
+    if crate::compat::fold_compat_gate(catalog, tenant, signal, now_ns).is_err() {
+        return TenantTickOutcome::Failed;
+    }
 
     match catalog
         .fold_with_refold_request(
