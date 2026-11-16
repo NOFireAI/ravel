@@ -644,9 +644,11 @@ async fn compat_policy_installed_on_an_uninitialised_store_writes_the_baseline()
 
 /// A 503 on the first `sys/compat` read leaves the view unread and not blind,
 /// so the server cannot tell an uninitialised store from an activated one.
-/// Ingest is refused at admission (503, counted `view_stale`, nothing
-/// written), and once a read succeeds and finds no record the same writes
-/// land at the baseline.
+/// The metrics tenant was provisioned by an earlier v0.33.0 writer, so its
+/// write passes first touch and is refused by the ingest router's admission;
+/// the log tenant is new and is refused at first touch. Both answer 503,
+/// count `view_stale` under their family and write nothing. Once a read
+/// succeeds and finds no record the same writes land at the baseline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_5xx_at_startup_refuses_until_a_refresh_then_writes_the_baseline() {
     let _serial = SERIAL.lock().await;
@@ -659,6 +661,25 @@ async fn a_5xx_at_startup_refuses_until_a_refresh_then_writes_the_baseline() {
     );
     let faults = Arc::new(FaultStore::new(MemoryStore::new(), plan));
     let store: Arc<dyn ObjectStoreBackend> = faults.clone();
+    let tenant = TenantId::new(TENANT).hash();
+    let now_ns = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_nanos(),
+    )
+    .expect("fits");
+    ravel_catalog::validate_or_adopt(
+        store.as_ref(),
+        &tenant,
+        Signal::Metrics,
+        1,
+        now_ns,
+        ravel_catalog::AbsentPolicy::CreateFromConfig,
+    )
+    .await
+    .expect("a v0.33.0 writer provisioned the metrics tenant");
+    let provisioned = vec![ravel_catalog::provisioning_key(&tenant, Signal::Metrics)];
 
     let running = start(store.clone(), Mode::Gateway).await;
     assert_eq!(
@@ -668,24 +689,32 @@ async fn a_5xx_at_startup_refuses_until_a_refresh_then_writes_the_baseline() {
     );
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
-    let before = refusals(&scrape(running.http_addr).await);
-    let stale = "{mode=\"gateway\",family=\"rseg\",reason=\"view_stale\"}";
+    for (path, body, family) in [
+        ("/v1/metrics", metrics_body(), "rseg"),
+        ("/v1/logs", logs_body(), "rlog"),
+    ] {
+        let stale = format!("{{mode=\"gateway\",family=\"{family}\",reason=\"view_stale\"}}");
+        let before = refusals(&scrape(running.http_addr).await);
+        assert_eq!(
+            post(&client, &base, path, body).await,
+            503,
+            "{path}: a view that never read sys/compat refuses ingest"
+        );
+        let after = refusals(&scrape(running.http_addr).await);
+        assert_eq!(
+            after.get(&stale).copied().unwrap_or(0),
+            before.get(&stale).copied().unwrap_or(0) + 1,
+            "{path}: the refusal is counted view_stale: {after:?}"
+        );
+    }
     assert_eq!(
-        post(&client, &base, "/v1/metrics", metrics_body()).await,
-        503,
-        "a view that never read sys/compat refuses ingest"
-    );
-    let after = refusals(&scrape(running.http_addr).await);
-    assert_eq!(
-        after.get(stale).copied().unwrap_or(0),
-        before.get(stale).copied().unwrap_or(0) + 1,
-        "the refusal is counted view_stale: {after:?}"
-    );
-    assert!(
         list_all(store.as_ref(), "t/")
             .await
             .expect("list tenants")
-            .is_empty(),
+            .into_iter()
+            .map(|meta| meta.key)
+            .collect::<Vec<_>>(),
+        provisioned,
         "nothing is written while the view is unread"
     );
 
