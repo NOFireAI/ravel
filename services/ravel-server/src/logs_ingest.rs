@@ -397,6 +397,10 @@ pub async fn handle_export_logs_releasing(
         .await
         {
             Ok(LookupOutcome::Hit(receipt)) => {
+                antithesis_reachable!(
+                    "logs ingest: a keyed request replayed a stored idempotency receipt",
+                    serde_json::json!({ "written_count": receipt.written_count })
+                );
                 // A replay reports the original outcome, not a fresh
                 // rejection count: the first request already accounted for
                 // its own rejections at write time.
@@ -415,6 +419,13 @@ pub async fn handle_export_logs_releasing(
             // plain Miss which is the expected common case.
             Ok(LookupOutcome::Miss) => {}
             Ok(LookupOutcome::Corrupt) => {
+                // Markers are immutable and written once with
+                // create-if-absent, so a marker that reads back undecodable
+                // is corruption or a reader bug, not a race.
+                antithesis_unreachable!(
+                    "logs ingest: an idempotency marker read back undecodable",
+                    serde_json::json!({})
+                );
                 tracing::warn!("idempotency marker found but failed to decode; treating as a miss");
             }
             // A store error on the lookup, a lookup past the deadline, or a
@@ -424,6 +435,10 @@ pub async fn handle_export_logs_releasing(
             // not written yet, so the retryable error is safe for the client
             // to retry.
             Err(message) => {
+                antithesis_reachable!(
+                    "logs ingest: a keyed request was refused because its marker lookup failed",
+                    serde_json::json!({ "message": &message })
+                );
                 return Err(LogIngestRequestError::Write(LogWriteError::Abandoned(
                     message,
                 )));
@@ -506,6 +521,10 @@ pub async fn handle_export_logs_releasing(
         // the count is the only recovery this path offers.
         let durable_shard_count = err.durable_tokens().len();
         if durable_shard_count > 0 {
+            antithesis_reachable!(
+                "logs ingest: a write committed on some shards before a sibling shard failed",
+                serde_json::json!({ "durable_shard_count": durable_shard_count })
+            );
             tracing::warn!(
                 durable_shard_count,
                 "log write partially committed before a sibling shard \
@@ -583,6 +602,10 @@ pub async fn handle_export_logs_releasing(
             // falsely tell the client its committed write was lost. Log
             // and still ack. The retry simply reingests (at-least-once,
             // the documented fallback) since no marker exists.
+            antithesis_reachable!(
+                "logs ingest: the idempotency marker write failed after a durable commit",
+                serde_json::json!({ "error": err.to_string() })
+            );
             tracing::warn!(
                 %err,
                 "idempotency marker write failed after a durable commit; acking anyway"

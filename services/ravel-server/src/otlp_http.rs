@@ -316,6 +316,8 @@ async fn export_metrics(
         // Retryable at the client: the same replica or a healthy one can
         // succeed on the identical request later.
         Err(IngestRequestError::Write(write_err)) if write_err.is_retryable() => {
+            #[cfg(feature = "antithesis")]
+            antithesis_metrics_write_failure(&write_err);
             (StatusCode::SERVICE_UNAVAILABLE, write_err.to_string()).into_response()
         }
         // Not retryable: the input itself cannot be accepted (e.g. a
@@ -408,6 +410,8 @@ async fn export_logs(
         // Retryable at the client: the same replica or a healthy one can
         // succeed on the identical request later.
         Err(LogIngestRequestError::Write(write_err)) if write_err.is_retryable() => {
+            #[cfg(feature = "antithesis")]
+            antithesis_logs_write_failure(&write_err);
             (StatusCode::SERVICE_UNAVAILABLE, write_err.to_string()).into_response()
         }
         // Not retryable: the input itself cannot be accepted, so 400 rather
@@ -416,6 +420,55 @@ async fn export_logs(
         Err(LogIngestRequestError::Write(write_err)) => {
             (StatusCode::BAD_REQUEST, write_err.to_string()).into_response()
         }
+    }
+}
+
+/// Marks which retryable failure a metrics write answered with, so a run
+/// shows which of the outcome-unknown paths it reached.
+#[cfg(feature = "antithesis")]
+fn antithesis_metrics_write_failure(err: &WriteError) {
+    let err = match err {
+        WriteError::PartialWrite { inner, .. } => inner.as_ref(),
+        other => other,
+    };
+    match err {
+        WriteError::AckTimeout => antithesis_reachable!(
+            "metrics ingest: a strict write timed out waiting for its shard ack",
+            serde_json::json!({})
+        ),
+        WriteError::Abandoned(message) => antithesis_reachable!(
+            "metrics ingest: a write was answered Abandoned",
+            serde_json::json!({ "message": message })
+        ),
+        WriteError::ShardUnavailable => antithesis_reachable!(
+            "metrics ingest: a write found its shard actor unavailable",
+            serde_json::json!({})
+        ),
+        _ => {}
+    }
+}
+
+/// The log-pipeline counterpart of [`antithesis_metrics_write_failure`].
+#[cfg(feature = "antithesis")]
+fn antithesis_logs_write_failure(err: &LogWriteError) {
+    let err = match err {
+        LogWriteError::PartialWrite { inner, .. } => inner.as_ref(),
+        other => other,
+    };
+    match err {
+        LogWriteError::AckTimeout => antithesis_reachable!(
+            "logs ingest: a strict write timed out waiting for its shard ack",
+            serde_json::json!({})
+        ),
+        LogWriteError::Abandoned(message) => antithesis_reachable!(
+            "logs ingest: a write was answered Abandoned",
+            serde_json::json!({ "message": message })
+        ),
+        LogWriteError::ShardUnavailable => antithesis_reachable!(
+            "logs ingest: a write found its shard actor unavailable",
+            serde_json::json!({})
+        ),
+        _ => {}
     }
 }
 
