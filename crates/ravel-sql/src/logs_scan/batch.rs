@@ -7725,18 +7725,21 @@ mod row_path_tests {
 
     /// A value of another variant under a declared column reads null, except
     /// a `List` or `Map` under a `Bytes` declaration, which reads as its
-    /// canonical bytes; the `attrs` map still carries every value.
+    /// canonical bytes, whether a FIELD_DIR `Bytes` column stores it (row 0)
+    /// or `attrs_raw` carries it as a nested value (row 2, whose second `k3`
+    /// the writer spills there and the merge lets win); the `attrs` map still
+    /// carries every value.
     #[test]
     fn a_wrong_variant_under_a_declared_column() {
-        let stream = Stream {
+        let list = AttrValue::List(vec![AttrValue::I64(1), AttrValue::Str("x".into())]);
+        let plain = Stream {
             resource: Vec::new(),
             scope: Vec::new(),
         };
-        let list = AttrValue::List(vec![AttrValue::I64(1), AttrValue::Str("x".into())]);
         let records = vec![
             record(
                 0,
-                &stream,
+                &plain,
                 1,
                 vec![
                     ("k0".into(), AttrValue::I64(5)),
@@ -7746,7 +7749,7 @@ mod row_path_tests {
             ),
             record(
                 0,
-                &stream,
+                &plain,
                 2,
                 vec![
                     ("k0".into(), AttrValue::Str("s".into())),
@@ -7754,26 +7757,39 @@ mod row_path_tests {
                     ("k3".into(), AttrValue::Bytes(vec![1, 2])),
                 ],
             ),
+            record(
+                0,
+                &plain,
+                3,
+                vec![
+                    ("k3".into(), AttrValue::List(vec![AttrValue::I64(9)])),
+                    ("k3".into(), list.clone()),
+                ],
+            ),
         ];
         let x = explicit();
-        let (got, want, _) = both_builds(&records, 8, &ColumnSelection::all(), &x.shape(&[]), None);
-        assert_eq!(texts(&got, X_K0), vec![None, Some("s".to_string())]);
+        let (got, want, has_attrs_raw) =
+            both_builds(&records, 8, &ColumnSelection::all(), &x.shape(&[]), None);
+        assert!(has_attrs_raw);
+        assert_eq!(texts(&got, X_K0), vec![None, Some("s".to_string()), None]);
         let k1 = got
             .column(X_K1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("k1 is I64");
-        assert_eq!(k1.iter().collect::<Vec<_>>(), vec![None, Some(7)]);
+        assert_eq!(k1.iter().collect::<Vec<_>>(), vec![None, Some(7), None]);
         let k3 = got
             .column(X_K3)
             .as_any()
             .downcast_ref::<BinaryArray>()
             .expect("k3 is Bytes");
+        let canonical = canonical_value_bytes(&list);
         assert_eq!(
             k3.iter().collect::<Vec<_>>(),
             vec![
-                Some(canonical_value_bytes(&list).as_slice()),
-                Some(&[1u8, 2][..])
+                Some(canonical.as_slice()),
+                Some(&[1u8, 2][..]),
+                Some(canonical.as_slice()),
             ]
         );
         assert_eq!(
@@ -7781,7 +7797,7 @@ mod row_path_tests {
                 .iter()
                 .map(Vec::len)
                 .collect::<Vec<_>>(),
-            vec![3, 3]
+            vec![3, 3, 1]
         );
         assert_same_columns(&got, &want);
     }
