@@ -958,22 +958,18 @@ async fn the_warm_covers_directories_beyond_the_suffix_probe() {
 /// the metadata pass stops at its share of the budget, and the first
 /// statement reads exactly the footers of the objects the pass did not reach.
 ///
-/// The whole-part warm leaves the 4 newest objects resident first, `R`
-/// bytes. The pass charges its ceiling only with the bytes its own reads
-/// fetch, one probe `P` per object here (every fixture object's directories
-/// fit in its probe), and admits objects most recent first while those stay
-/// within half of `--cache-max-bytes`. A budget of `2 * (2 * P) + P` admits
-/// exactly 2, though `R` alone exceeds half of it. The read cache itself is
-/// roomy, so no eviction decides which footers the statement finds.
+/// The pass charges its ceiling only with the bytes its own reads fetch, one
+/// probe `P` per object here (every fixture object's directories fit in its
+/// probe), and admits objects most recent first while those stay within half
+/// of `--cache-max-bytes`. A budget of `2 * (2 * P) + P` admits exactly 2.
+/// The whole-part warm, running beside the pass, holds to the other half: of
+/// the 4 newest objects it reads, newest first, each one that still fits,
+/// `R` bytes, enough that a ceiling also charged with them would admit fewer
+/// than 2. The read cache itself is roomy, so no eviction decides which
+/// footers the statement finds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_metadata_warm_stops_at_the_cache_budget() {
     let tenant = ingest_tenant().await;
-    let resident: u64 = tenant
-        .keys
-        .iter()
-        .take(4)
-        .map(|key| tenant.layouts[key].size)
-        .sum();
     let probes: Vec<u64> = tenant
         .keys
         .iter()
@@ -985,11 +981,25 @@ async fn the_metadata_warm_stops_at_the_cache_budget() {
         "one probe length: {probes:?}"
     );
     let cache_max_bytes = 2 * (2 * probe) + probe;
-    assert!(
-        resident > cache_max_bytes / 2,
-        "the whole-part warm alone exceeds the pass's ceiling: {resident} vs {cache_max_bytes}"
-    );
     const ADMITTED: usize = 2;
+    let whole_part_share = cache_max_bytes - cache_max_bytes / 2;
+    let resident = tenant
+        .keys
+        .iter()
+        .take(4)
+        .map(|key| tenant.layouts[key].size)
+        .fold(0, |held, size| {
+            if held + size <= whole_part_share {
+                held + size
+            } else {
+                held
+            }
+        });
+    assert!(
+        resident > 0 && resident + ADMITTED as u64 * probe > cache_max_bytes / 2,
+        "the whole parts that fit would crowd the pass under a ceiling charged with them: \
+         {resident} vs {cache_max_bytes}"
+    );
 
     let server = tenant
         .restart_with_budget(FAST_PATH.1, ROOMY_CACHE_BYTES, cache_max_bytes, true)
@@ -997,7 +1007,7 @@ async fn the_metadata_warm_stops_at_the_cache_budget() {
     assert_eq!(
         server.cache.total_bytes(),
         resident + ADMITTED as u64 * probe,
-        "the 4 whole parts and the admitted probes are resident"
+        "the whole parts that fit their share and the admitted probes are resident"
     );
     let run = server.sql(&tenant, FAST_PATH.0).await;
     server.stop().await;
