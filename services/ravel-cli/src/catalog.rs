@@ -903,6 +903,36 @@ pub fn render_rebuild_report(
         report.section_bytes_read
     ));
     out.push_str(&format!("ranged_gets: {}\n", report.ranged_gets));
+    out.push_str(&format!(
+        "footer_phase_ranged_gets: {}\n",
+        report.footer_phase_ranged_gets
+    ));
+    out.push_str(&format!(
+        "footer_phase_bytes_read: {}\n",
+        report.footer_phase_bytes_read
+    ));
+    out.push_str(&format!(
+        "section_phase_ranged_gets: {}\n",
+        report.section_phase_ranged_gets
+    ));
+    out.push_str(&format!(
+        "section_phase_bytes_read: {}\n",
+        report.section_phase_bytes_read
+    ));
+    out.push_str(&format!(
+        "key_index_build_max_pairs: {}\n",
+        report.key_index_build_max_pairs
+    ));
+    out.push_str(&format!("passes: {}\n", report.passes));
+    out.push_str(&format!(
+        "passes_per_field: {}\n",
+        field_counts(&report.passes_per_field)
+    ));
+    out.push_str(&format!("sections_read: {}\n", report.sections_read));
+    out.push_str(&format!(
+        "field_pairs: {}\n",
+        field_counts(&report.field_pairs)
+    ));
     out.push_str(&format!("leaf_prefix_gets: {}\n", report.leaf_prefix_gets));
     out.push_str(&format!(
         "leaf_prefix_bytes_read: {}\n",
@@ -926,20 +956,40 @@ pub fn render_rebuild_report(
         report.erasure_get_requests
     ));
     out.push_str(&format!("attempt_count: {}\n", report.attempt_count));
-    for (i, attempt) in report.attempts.iter().enumerate() {
+    for (i, attempt) in (1u64..).zip(&report.attempts) {
+        // Only the batch that stopped the run is listed past `attempt_count`.
+        let stopped = if i > report.attempt_count {
+            " (stopped before publish)"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "attempt {}: parts={} part_gets={} ranged_gets={} leaf_puts={} \
-             head_cas_tries={} parts_published={}\n",
-            i + 1,
+            "attempt {i}{stopped}: parts={} part_gets={} ranged_gets={} \
+             footer_phase_ranged_gets={} section_phase_ranged_gets={} passes={} \
+             sections_read={} leaf_puts={} head_cas_tries={} parts_published={}\n",
             attempt.parts,
             attempt.part_gets,
             attempt.ranged_gets,
+            attempt.footer_phase_ranged_gets,
+            attempt.section_phase_ranged_gets,
+            attempt.passes,
+            attempt.sections_read,
             attempt.leaf_puts,
             attempt.head_cas_tries,
             attempt.parts_published
         ));
     }
     Ok(out)
+}
+
+/// `name=count` pairs joined by commas, in field name order; empty for an
+/// empty map.
+fn field_counts(counts: &std::collections::BTreeMap<String, u64>) -> String {
+    counts
+        .iter()
+        .map(|(field, count)| format!("{field}={count}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub async fn inspect(
@@ -1922,8 +1972,9 @@ mod tests {
         const TRACES: u8 = 3;
 
         /// A spans tenant whose one part, folded with the leaf build off,
-        /// holds one RSPAN object with `TRACES` distinct trace ids.
-        async fn folded_without_leaves() -> Arc<MemoryStore> {
+        /// holds one RSPAN object with `TRACES` distinct trace ids. Returns
+        /// the store and the object's bytes.
+        async fn folded_without_leaves() -> (Arc<MemoryStore>, Bytes) {
             let store = Arc::new(MemoryStore::new());
             let tenant_hash = TenantId::new(TENANT).hash();
             let writer_id = Uuid::from_u128(1);
@@ -1974,7 +2025,7 @@ mod tests {
             })
             .expect("valid record");
             let data_key = keys::reconstruct_data_key(&commit).expect("data key");
-            publish::put_data_object(store.as_ref(), &data_key, bytes)
+            publish::put_data_object(store.as_ref(), &data_key, bytes.clone())
                 .await
                 .expect("put data object");
             publish::publish(store.as_ref(), &commit, &RetryPolicy::default())
@@ -1996,12 +2047,18 @@ mod tests {
             .expect("fold succeeds");
             assert_eq!(report.entry_count, 1);
             assert_eq!(report.key_index_leaves_written, 0, "folded with leaves off");
-            store
+            (store, bytes)
         }
 
         async fn rebuild_at(budget: u64) -> KeyIndexRebuildReport {
-            let store = folded_without_leaves().await;
-            let (report, _) = rebuild_key_index_at_budget(
+            rebuild_json_at(budget).await.0
+        }
+
+        /// The rebuild at `budget` with `--json`: the report, the printed
+        /// JSON, and the RSPAN object's bytes.
+        async fn rebuild_json_at(budget: u64) -> (KeyIndexRebuildReport, String, Bytes) {
+            let (store, object) = folded_without_leaves().await;
+            let (report, printed) = rebuild_key_index_at_budget(
                 store as Arc<dyn ObjectStoreBackend>,
                 MEMORY,
                 TENANT,
@@ -2015,7 +2072,75 @@ mod tests {
             )
             .await
             .expect("rebuild");
-            report
+            (report, printed, object)
+        }
+
+        /// Issue #4348: `--json` carries the budget, the passes, the pairs
+        /// and the ranged reads split by phase. At a budget of one pair the
+        /// part's three trace ids take three passes; each reads the object's
+        /// footer with one suffix GET, which returns the whole object since
+        /// it is under the 8 KiB suffix, and its KEY_IDX section with one
+        /// range GET of exactly the section's length.
+        #[tokio::test]
+        async fn the_json_report_carries_the_passes_and_phase_costs() {
+            let (report, printed, object) = rebuild_json_at(1).await;
+            let key_idx_len =
+                match ravel_rspan::footer::open_from_suffix(&object, object.len() as u64)
+                    .expect("footer")
+                {
+                    ravel_rspan::footer::SuffixOutcome::Ready(footer) => {
+                        footer
+                            .section(ravel_rspan::footer::kind::KEY_IDX)
+                            .expect("a KEY_IDX section")
+                            .len
+                    }
+                    ravel_rspan::footer::SuffixOutcome::NeedRange { .. } => {
+                        panic!("the whole object holds its footer")
+                    }
+                };
+            let object_len = object.len() as u64;
+            assert!(object_len < 8 * 1024, "{object_len}");
+            assert_ne!(object_len, key_idx_len);
+            let passes = u64::from(TRACES);
+            let value: serde_json::Value =
+                serde_json::from_str(&printed).expect("one JSON document");
+            assert_eq!(value["key_index_build_max_pairs"], 1, "{printed}");
+            assert_eq!(value["passes"], passes, "{printed}");
+            assert_eq!(
+                value["passes_per_field"],
+                serde_json::json!({ "trace_id": passes }),
+                "{printed}"
+            );
+            assert_eq!(value["sections_read"], passes, "{printed}");
+            assert_eq!(
+                value["field_pairs"],
+                serde_json::json!({ "trace_id": u64::from(TRACES) }),
+                "{printed}"
+            );
+            assert_eq!(value["footer_phase_ranged_gets"], passes, "{printed}");
+            assert_eq!(value["section_phase_ranged_gets"], passes, "{printed}");
+            assert_eq!(value["ranged_gets"], 2 * passes, "{printed}");
+            assert_eq!(
+                value["footer_phase_bytes_read"],
+                passes * object_len,
+                "{printed}"
+            );
+            assert_eq!(
+                value["section_phase_bytes_read"],
+                passes * key_idx_len,
+                "{printed}"
+            );
+            assert_eq!(
+                value["section_bytes_read"],
+                passes * (object_len + key_idx_len),
+                "{printed}"
+            );
+            let attempt = &value["attempts"][0];
+            assert_eq!(attempt["passes"], passes, "{printed}");
+            assert_eq!(attempt["sections_read"], passes, "{printed}");
+            assert_eq!(attempt["footer_phase_ranged_gets"], passes, "{printed}");
+            assert_eq!(attempt["section_phase_ranged_gets"], passes, "{printed}");
+            assert_eq!(report.passes, passes);
         }
 
         /// `--key-index-build-max-pairs` reaches `Catalog::rebuild_key_index`

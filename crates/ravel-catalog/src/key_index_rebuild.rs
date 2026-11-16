@@ -21,7 +21,7 @@
 //! rest. A larger share can then end a pass at another key8, and every pass
 //! end is a slice end.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use bytes::Bytes;
 use ravel_codec::key_idx::KeyType;
@@ -77,8 +77,18 @@ pub struct KeyIndexRebuildAttempt {
     /// Whole-object GETs of those parts.
     pub part_gets: u64,
     /// Ranged GETs of data objects (footer suffix, any extra footer range,
-    /// KEY_IDX section) the batch issued.
+    /// KEY_IDX section) the batch issued: `footer_phase_ranged_gets` plus
+    /// `section_phase_ranged_gets`.
     pub ranged_gets: u64,
+    /// Of `ranged_gets`, the footer suffix and extra footer range GETs.
+    pub footer_phase_ranged_gets: u64,
+    /// Of `ranged_gets`, the section GETs.
+    pub section_phase_ranged_gets: u64,
+    /// Build passes over the batch's parts, summed
+    /// ([`KeyIndexRebuildReport::passes`]).
+    pub passes: u64,
+    /// KEY_IDX section reads the batch issued, one per (entry, pass).
+    pub sections_read: u64,
     /// Leaf PUTs the batch issued.
     pub leaf_puts: u64,
     /// HEAD CAS writes the batch issued: 0 when no part gained a ref.
@@ -123,11 +133,52 @@ pub struct KeyIndexRebuildReport {
     /// Total bytes of the leaves those PUTs sent, the failed PUT's included.
     pub leaf_bytes_written: u64,
     /// Bytes the ranged GETs returned: footer suffixes, any extra footer
-    /// ranges, and KEY_IDX sections, as transferred, retries excluded.
+    /// ranges, and KEY_IDX sections, as transferred, retries excluded. The
+    /// sum of `footer_phase_bytes_read` and `section_phase_bytes_read`.
     pub section_bytes_read: u64,
     /// Ranged GETs of data objects: footer suffixes, any extra footer
-    /// ranges, and KEY_IDX sections together.
+    /// ranges, and KEY_IDX sections together. The sum of
+    /// `footer_phase_ranged_gets` and `section_phase_ranged_gets`.
     pub ranged_gets: u64,
+    /// Footer phase of `ranged_gets`: each read's footer suffix GET and, when
+    /// the footer is longer than the suffix, its extra footer range GET.
+    pub footer_phase_ranged_gets: u64,
+    /// Bytes the footer phase GETs returned, as transferred, retries
+    /// excluded.
+    pub footer_phase_bytes_read: u64,
+    /// Section phase of `ranged_gets`: the GETs of the KEY_IDX section (the
+    /// LABEL_DICT section on metrics) the footer names, one per section read
+    /// that got that far.
+    pub section_phase_ranged_gets: u64,
+    /// Bytes the section phase GETs returned, as transferred, retries
+    /// excluded.
+    pub section_phase_bytes_read: u64,
+    /// The pair budget every part was built under:
+    /// [`CatalogConfig::key_index_build_max_pairs`](crate::CatalogConfig::key_index_build_max_pairs),
+    /// at least 1. Set once the requested fields are known, before HEAD is
+    /// read.
+    pub key_index_build_max_pairs: u64,
+    /// Build passes, summed over the parts read, a deferred part's and a
+    /// failed build's included. One pass serves every field the part builds
+    /// and reads each of the part's entries' sections once, so when every
+    /// read yields a section `sections_read` is the parts' entries times
+    /// their passes; an entry whose read yields none is not read again.
+    pub passes: u64,
+    /// For each field built, the passes that started with it still building,
+    /// summed over the same parts. Every field of a part starts building at
+    /// its first pass, so a part's passes are the largest of its fields'
+    /// counts, not their sum. A part whose build failed and stopped the run is
+    /// in `passes` but not here.
+    pub passes_per_field: BTreeMap<String, u64>,
+    /// KEY_IDX (LABEL_DICT on metrics) section reads, one per (entry, pass),
+    /// whatever GETs each cost; a read that failed at its footer counts too.
+    pub sections_read: u64,
+    /// For each field built, its key pairs, one per distinct (key8, entry),
+    /// summed over the parts built (deferred parts excluded, a part over the
+    /// byte cap included). A field built with no pair is present with 0. For
+    /// a field rebuilt after a later pass found a new uncovered entry, the
+    /// pairs of the rebuild only.
+    pub field_pairs: BTreeMap<String, u64>,
     /// For each part built (deferred parts excluded) and each field built for
     /// it, the part entries no leaf covers, summed.
     pub uncovered_entries: u64,
@@ -411,6 +462,7 @@ impl Catalog {
         }
         let mut report = KeyIndexRebuildReport {
             fields: requested.iter().map(|(name, _)| name.clone()).collect(),
+            key_index_build_max_pairs: self.config().key_index_build_max_pairs.max(1),
             ..KeyIndexRebuildReport::default()
         };
 
@@ -731,16 +783,35 @@ impl Catalog {
             // A build that fails has still issued its reads and PUTs, so the
             // report counts them before the error interrupts the run.
             let ranged_gets = counters.key_index_ranged_gets - before.key_index_ranged_gets;
+            let footer_gets = counters.key_index_footer_gets - before.key_index_footer_gets;
+            let section_gets = counters.key_index_section_gets - before.key_index_section_gets;
+            let passes = counters.key_index_build_passes - before.key_index_build_passes;
+            let sections_read = counters.key_index_sections_read - before.key_index_sections_read;
             let leaf_puts = counters.put_requests - before.put_requests;
             attempt.ranged_gets += ranged_gets;
+            attempt.footer_phase_ranged_gets += footer_gets;
+            attempt.section_phase_ranged_gets += section_gets;
+            attempt.passes += passes;
+            attempt.sections_read += sections_read;
             attempt.leaf_puts += leaf_puts;
             report.ranged_gets += ranged_gets;
+            report.footer_phase_ranged_gets += footer_gets;
+            report.section_phase_ranged_gets += section_gets;
             report.section_bytes_read +=
                 counters.key_index_bytes_read - before.key_index_bytes_read;
+            report.footer_phase_bytes_read +=
+                counters.key_index_footer_bytes_read - before.key_index_footer_bytes_read;
+            report.section_phase_bytes_read +=
+                counters.key_index_section_bytes_read - before.key_index_section_bytes_read;
+            report.passes += passes;
+            report.sections_read += sections_read;
             report.leaves_written += leaf_puts;
             report.leaf_bytes_written +=
                 counters.key_index_leaf_bytes_put - before.key_index_leaf_bytes_put;
             let leaves = built_part?;
+            for (field, passes) in &leaves.field_passes {
+                *report.passes_per_field.entry(field.clone()).or_insert(0) += passes;
+            }
             if leaves.stopped_on_failed_get {
                 report.parts_deferred += 1;
                 tracing::warn!(
@@ -752,6 +823,9 @@ impl Catalog {
             }
             if leaves.over_cap {
                 report.parts_over_cap += 1;
+            }
+            for (field, pairs) in &leaves.field_pairs {
+                *report.field_pairs.entry(field.clone()).or_insert(0) += pairs;
             }
             report.uncovered_entries += leaves.uncovered_entries;
             if !leaves.refs.is_empty() {
@@ -1076,6 +1150,15 @@ mod tests {
                 leaf_bytes_written: report.leaf_bytes_written,
                 section_bytes_read: report.section_bytes_read,
                 ranged_gets: 6,
+                footer_phase_ranged_gets: 3,
+                footer_phase_bytes_read: report.footer_phase_bytes_read,
+                section_phase_ranged_gets: 3,
+                section_phase_bytes_read: report.section_phase_bytes_read,
+                key_index_build_max_pairs: crate::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+                passes: 1,
+                passes_per_field: BTreeMap::from([(USER_ID.to_string(), 1)]),
+                sections_read: 3,
+                field_pairs: BTreeMap::from([(USER_ID.to_string(), 9)]),
                 uncovered_entries: 0,
                 parts_over_cap: 0,
                 parts_erasure_gated: 0,
@@ -1086,6 +1169,10 @@ mod tests {
                     parts: 1,
                     part_gets: 1,
                     ranged_gets: 6,
+                    footer_phase_ranged_gets: 3,
+                    section_phase_ranged_gets: 3,
+                    passes: 1,
+                    sections_read: 3,
                     leaf_puts: 1,
                     head_cas_tries: 1,
                     parts_published: 1,
@@ -1465,6 +1552,15 @@ mod tests {
                 leaf_bytes_written: report.leaf_bytes_written,
                 section_bytes_read: report.section_bytes_read,
                 ranged_gets: 8,
+                footer_phase_ranged_gets: 4,
+                footer_phase_bytes_read: report.footer_phase_bytes_read,
+                section_phase_ranged_gets: 4,
+                section_phase_bytes_read: report.section_phase_bytes_read,
+                key_index_build_max_pairs: crate::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+                passes: 2,
+                passes_per_field: BTreeMap::from([(USER_ID.to_string(), 2)]),
+                sections_read: 4,
+                field_pairs: BTreeMap::from([(USER_ID.to_string(), 8)]),
                 uncovered_entries: 0,
                 parts_over_cap: 0,
                 parts_erasure_gated: 0,
@@ -1475,6 +1571,10 @@ mod tests {
                     parts: 2,
                     part_gets: 2,
                     ranged_gets: 8,
+                    footer_phase_ranged_gets: 4,
+                    section_phase_ranged_gets: 4,
+                    passes: 2,
+                    sections_read: 4,
                     leaf_puts: 2,
                     head_cas_tries: 2,
                     parts_published: 1,
@@ -1630,6 +1730,16 @@ mod tests {
                     leaf_bytes_written: 0,
                     section_bytes_read: report.section_bytes_read,
                     ranged_gets: 2,
+                    footer_phase_ranged_gets: 2,
+                    // No section GET: every byte read is a footer byte.
+                    footer_phase_bytes_read: report.section_bytes_read,
+                    section_phase_ranged_gets: 0,
+                    section_phase_bytes_read: 0,
+                    key_index_build_max_pairs: crate::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+                    passes: 1,
+                    passes_per_field: BTreeMap::from([(USER_ID.to_string(), 1)]),
+                    sections_read: 2,
+                    field_pairs: BTreeMap::from([(USER_ID.to_string(), 0)]),
                     uncovered_entries: 2,
                     parts_over_cap: 0,
                     parts_erasure_gated: 0,
@@ -1640,6 +1750,10 @@ mod tests {
                         parts: 1,
                         part_gets: 1,
                         ranged_gets: 2,
+                        footer_phase_ranged_gets: 2,
+                        section_phase_ranged_gets: 0,
+                        passes: 1,
+                        sections_read: 2,
                         leaf_puts: 0,
                         head_cas_tries: 0,
                         parts_published: 0,
@@ -1957,6 +2071,65 @@ mod tests {
         assert_eq!(report.parts_rebuilt, 1, "{report:?}");
         assert_eq!(report.uncovered_entries, 0, "{report:?}");
 
+        // Issue #4348: the budget, the passes and the pairs, and each ranged
+        // GET under its phase. Every footer fits the suffix, so the footer
+        // phase is the suffix GETs and the section phase the range GETs.
+        assert_eq!(report.key_index_build_max_pairs, MAX_PAIRS, "{report:?}");
+        assert_eq!(report.passes, 5, "{report:?}");
+        assert_eq!(
+            report.passes_per_field,
+            BTreeMap::from([(USER_ID.to_string(), 5)]),
+            "{report:?}"
+        );
+        assert_eq!(report.sections_read, 4 * 5, "{report:?}");
+        assert_eq!(
+            report.field_pairs,
+            BTreeMap::from([(USER_ID.to_string(), 40)]),
+            "{report:?}"
+        );
+        let (footer, section): (Vec<_>, Vec<_>) = rebuilt
+            .data_ranged_gets()
+            .into_iter()
+            .partition(|(_, range, _)| matches!(range, GetRange::Suffix(_)));
+        assert_eq!((footer.len(), section.len()), (4 * 5, 4 * 5));
+        let footer_bytes: u64 = footer.iter().map(|(_, _, bytes)| bytes).sum();
+        let section_bytes: u64 = section.iter().map(|(_, _, bytes)| bytes).sum();
+        assert_ne!(footer_bytes, section_bytes);
+        assert_eq!(
+            (
+                report.footer_phase_ranged_gets,
+                report.section_phase_ranged_gets
+            ),
+            (4 * 5, 4 * 5),
+            "{report:?}"
+        );
+        assert_eq!(
+            report.footer_phase_ranged_gets + report.section_phase_ranged_gets,
+            report.ranged_gets
+        );
+        assert_eq!(
+            (
+                report.footer_phase_bytes_read,
+                report.section_phase_bytes_read
+            ),
+            (footer_bytes, section_bytes),
+            "{report:?}"
+        );
+        assert_eq!(report.section_bytes_read, footer_bytes + section_bytes);
+        assert_eq!(report.attempts.len(), 1, "{report:?}");
+        let attempt = &report.attempts[0];
+        assert_eq!(
+            (
+                attempt.passes,
+                attempt.sections_read,
+                attempt.footer_phase_ranged_gets,
+                attempt.section_phase_ranged_gets,
+                attempt.ranged_gets
+            ),
+            (5, 4 * 5, 4 * 5, 4 * 5, 5 * 2 * 4),
+            "{attempt:?}"
+        );
+
         let head = read_signal_head(rebuilt.as_ref(), Signal::Logs).await;
         let part = &head.parts[0];
         assert_eq!(part.entry_count, 4);
@@ -2022,6 +2195,58 @@ mod tests {
                 .expect("rebuilt leaf");
             assert_eq!(a.data, b.data, "{}", leaf.key);
         }
+    }
+
+    /// Issue #4348: the passes of a two-field build are the part's passes, not
+    /// the fields' passes summed. The 40-pair part with `trace_id` declared
+    /// beside `user_id` at a budget of 8: each field's share is 4, so
+    /// `user_id` takes 10 passes; no section names `trace_id`, so it leaves
+    /// every entry uncovered and stops building after the first pass. Each
+    /// of the 10 passes reads the 4 sections once.
+    #[tokio::test]
+    async fn the_repair_reports_the_parts_passes_and_each_fields_own() {
+        use crate::tenant_config::StorageLayoutWrite;
+        let store = recording_store();
+        forty_pair_part(&store).await;
+        let mut cfg = crate::tenant_config::read_config_values(store.as_ref(), &tenant())
+            .await
+            .expect("read config")
+            .expect("config present");
+        cfg.set_index_trace_id(true, StorageLayoutWrite::ReadersRolledOut)
+            .expect("index trace_id");
+        crate::tenant_config::set_tenant_config(store.as_ref(), &tenant(), &cfg, 2)
+            .await
+            .expect("write config");
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                key_index_build_max_pairs: 8,
+                ..config(1)
+            },
+        )
+        .expect("catalog");
+        fold_through(&catalog, Signal::Logs, KIDX_HOUR).await;
+        let report = rebuild(&catalog, Signal::Logs).await;
+        let trace_id = ravel_logseg::key_index::TRACE_ID_FIELD.to_string();
+        assert_eq!(
+            report.fields,
+            vec![USER_ID.to_string(), trace_id.clone()],
+            "{report:?}"
+        );
+        assert_eq!(report.passes, 10, "{report:?}");
+        assert_eq!(
+            report.passes_per_field,
+            BTreeMap::from([(USER_ID.to_string(), 10), (trace_id.clone(), 1)]),
+            "{report:?}"
+        );
+        assert_eq!(report.sections_read, 4 * 10, "{report:?}");
+        assert_eq!(report.ranged_gets, 2 * 4 * 10, "{report:?}");
+        assert_eq!(
+            report.field_pairs,
+            BTreeMap::from([(USER_ID.to_string(), 40), (trace_id, 0)]),
+            "{report:?}"
+        );
+        assert_eq!(report.attempts[0].passes, 10, "{report:?}");
     }
 
     /// The 40-pair part at a budget of 8, rebuilt clean: the leaf keys in PUT
@@ -2196,12 +2421,25 @@ mod tests {
                 parts: 1,
                 part_gets,
                 ranged_gets: report.ranged_gets,
+                footer_phase_ranged_gets: 4 * 4,
+                section_phase_ranged_gets: 4 * 4,
+                passes: 4,
+                sections_read: 4 * 4,
                 leaf_puts: report.leaves_written,
                 head_cas_tries: 0,
                 parts_published: 0,
             }],
             "the stopped batch is listed, its GETs and PUTs summing to the totals"
         );
+        // The failed build's four passes count; it returned no per-field
+        // figure, so none is reported for it.
+        assert_eq!(
+            (report.passes, report.sections_read),
+            (4, 4 * 4),
+            "{report:?}"
+        );
+        assert!(report.passes_per_field.is_empty(), "{report:?}");
+        assert!(report.field_pairs.is_empty(), "{report:?}");
     }
 
     /// A ranged GET that fails with a store error for one entry defers its
@@ -2244,6 +2482,17 @@ mod tests {
                 leaf_bytes_written: report.leaf_bytes_written,
                 section_bytes_read: report.section_bytes_read,
                 ranged_gets: 7,
+                // The failed GET is the deferred entry's footer suffix GET.
+                footer_phase_ranged_gets: 4,
+                footer_phase_bytes_read: report.footer_phase_bytes_read,
+                section_phase_ranged_gets: 3,
+                section_phase_bytes_read: report.section_phase_bytes_read,
+                key_index_build_max_pairs: crate::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+                // The deferred part's one pass counts; its pairs do not.
+                passes: 2,
+                passes_per_field: BTreeMap::from([(USER_ID.to_string(), 2)]),
+                sections_read: 4,
+                field_pairs: BTreeMap::from([(USER_ID.to_string(), 4)]),
                 uncovered_entries: 0,
                 parts_over_cap: 0,
                 parts_erasure_gated: 0,
@@ -2254,6 +2503,10 @@ mod tests {
                     parts: 2,
                     part_gets: 2,
                     ranged_gets: 7,
+                    footer_phase_ranged_gets: 4,
+                    section_phase_ranged_gets: 3,
+                    passes: 2,
+                    sections_read: 4,
                     leaf_puts: 1,
                     head_cas_tries: 1,
                     parts_published: 1,
@@ -2465,6 +2718,7 @@ mod tests {
             metrics,
             KeyIndexRebuildReport {
                 fields: vec!["label_value".to_string()],
+                key_index_build_max_pairs: crate::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
                 ..KeyIndexRebuildReport::default()
             }
         );
@@ -2506,6 +2760,7 @@ mod tests {
                 fields: vec![USER_ID.to_string()],
                 leaf_prefix_gets: 2,
                 leaf_prefix_bytes_read: leaves.iter().map(|l| u64::from(l.prefix_len)).sum(),
+                key_index_build_max_pairs: crate::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
                 ..KeyIndexRebuildReport::default()
             }
         );
