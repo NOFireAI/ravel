@@ -8977,7 +8977,7 @@ mod tests {
                             };
                             let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                             let phases: Vec<serde_json::Value> =
-                                ["resolve", "plan", "probe", "scan", "keyIndex"]
+                                ["resolve", "plan", "probe", "scan", "keyIndex", "fetch"]
                                     .into_iter()
                                     .map(|phase| {
                                         serde_json::json!({
@@ -9221,7 +9221,7 @@ mod tests {
                     .collect();
                 assert_eq!(
                     phases,
-                    ["resolve", "plan", "probe", "scan", "keyIndex"],
+                    ["resolve", "plan", "probe", "scan", "keyIndex", "fetch"],
                     "{name}"
                 );
                 assert_eq!(got["segmentsFetched"], call, "{name}: {got}");

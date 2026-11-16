@@ -1347,6 +1347,24 @@ mod tests {
         phases.key_index().add_cache_bytes(55);
         phases.key_index().add_late_served_bytes(505);
 
+        // fetch: TopK late materialization's phase-2 row fetch (issue #797),
+        // which opens the winners' object and decodes their pages.
+        for _ in 0..23 {
+            phases.fetch().record_s3_request(AccountedOp::Get);
+        }
+        phases.fetch().add_s3_bytes(AccountedOp::Get, 32_000);
+        for _ in 0..24 {
+            phases.fetch().record_cache_hit();
+        }
+        for _ in 0..25 {
+            phases.fetch().record_cache_miss();
+        }
+        phases.fetch().add_cache_bytes(66);
+        phases.fetch().add_late_served_bytes(606);
+        phases.fetch().add_decompressed_bytes(7_000);
+        phases.fetch().add_bytes_reused(320);
+        phases.fetch().add_segments_opened(21);
+
         let snapshot = phases.snapshot();
         crate::QueryStats {
             // `accounting` is the pooled sum in production
@@ -1360,9 +1378,9 @@ mod tests {
     }
 
     #[test]
-    fn phase_accounting_renders_all_four_phases_exactly_once() {
+    fn phase_accounting_renders_all_six_phases_exactly_once() {
         // ACCEPTANCE TEST (issue #935). `PhaseAccounting` splits every
-        // `QueryAccounting` counter four ways on every PromQL query, and until
+        // `QueryAccounting` counter six ways on every PromQL query, and until
         // this field existed the split reached no reader outside the engine's
         // own unit tests. This pins the rendered shape: the exact phase names,
         // in `QueryPhase::ALL` order, each appearing exactly once, with every
@@ -1376,7 +1394,7 @@ mod tests {
         let value = serde_json::to_value(&json).expect("serializes");
 
         let phases = value["phases"].as_array().expect("phases is an array");
-        assert_eq!(phases.len(), 5, "five phases, no more and no fewer");
+        assert_eq!(phases.len(), 6, "six phases, no more and no fewer");
 
         // The exact names, in order. Not a set comparison: the order is
         // `QueryPhase::ALL`'s, and a report that pairs a phase name with the
@@ -1385,12 +1403,15 @@ mod tests {
             .iter()
             .map(|p| p["phase"].as_str().expect("phase name is a string"))
             .collect();
-        assert_eq!(names, vec!["resolve", "plan", "probe", "scan", "keyIndex"]);
+        assert_eq!(
+            names,
+            vec!["resolve", "plan", "probe", "scan", "keyIndex", "fetch"]
+        );
 
         // Each name appears exactly once. A figure emitted twice is as much a
         // defect as one emitted wrong: a consumer summing the array would
         // double-count that phase.
-        for want in ["resolve", "plan", "probe", "scan", "keyIndex"] {
+        for want in ["resolve", "plan", "probe", "scan", "keyIndex", "fetch"] {
             assert_eq!(
                 names.iter().filter(|n| **n == want).count(),
                 1,
@@ -1470,6 +1491,20 @@ mod tests {
                 opened: 0,
                 matched: 0,
             },
+            ExpectedPhase {
+                phase: "fetch",
+                gets: 23,
+                wire_bytes: 32_000,
+                lists: 0,
+                hits: 24,
+                misses: 25,
+                cache_bytes: 66,
+                late_bytes: 606,
+                decompressed: 7_000,
+                reused: 320,
+                opened: 21,
+                matched: 0,
+            },
         ];
         for (got, want) in phases.iter().zip(expected) {
             let name = want.phase;
@@ -1521,29 +1556,29 @@ mod tests {
                 .sum()
         };
 
-        assert_eq!(sum("s3GetRequests"), 3 + 5 + 7 + 11 + 17);
-        assert_eq!(value["accounting"]["s3GetRequests"], 43);
+        assert_eq!(sum("s3GetRequests"), 3 + 5 + 7 + 11 + 17 + 23);
+        assert_eq!(value["accounting"]["s3GetRequests"], 66);
         assert_eq!(
             sum("s3GetWireBytes"),
-            1_000 + 2_000 + 4_000 + 8_000 + 16_000
+            1_000 + 2_000 + 4_000 + 8_000 + 16_000 + 32_000
         );
-        assert_eq!(value["accounting"]["s3GetBytes"], 31_000);
+        assert_eq!(value["accounting"]["s3GetBytes"], 63_000);
         assert_eq!(sum("s3ListRequests"), 2);
         assert_eq!(value["accounting"]["s3ListRequests"], 2);
-        assert_eq!(sum("cacheHits"), 1 + 3 + 8 + 13 + 18);
-        assert_eq!(value["accounting"]["cacheHits"], 43);
-        assert_eq!(sum("cacheMisses"), 2 + 4 + 9 + 14 + 19);
-        assert_eq!(value["accounting"]["cacheMisses"], 48);
-        assert_eq!(sum("cacheServedBytes"), 11 + 22 + 33 + 44 + 55);
-        assert_eq!(value["accounting"]["cacheBytes"], 165);
-        assert_eq!(sum("lateServedBytes"), 101 + 202 + 303 + 404 + 505);
-        assert_eq!(value["accounting"]["lateServedBytes"], 1_515);
-        assert_eq!(sum("decompressedOutputBytes"), 5_000);
-        assert_eq!(value["accounting"]["decompressedBytes"], 5_000);
-        assert_eq!(sum("reusedRegionBytes"), 640);
-        assert_eq!(value["accounting"]["bytesReused"], 640);
-        assert_eq!(sum("segmentsOpened"), 6 + 15);
-        assert_eq!(value["accounting"]["segmentsOpened"], 21);
+        assert_eq!(sum("cacheHits"), 1 + 3 + 8 + 13 + 18 + 24);
+        assert_eq!(value["accounting"]["cacheHits"], 67);
+        assert_eq!(sum("cacheMisses"), 2 + 4 + 9 + 14 + 19 + 25);
+        assert_eq!(value["accounting"]["cacheMisses"], 73);
+        assert_eq!(sum("cacheServedBytes"), 11 + 22 + 33 + 44 + 55 + 66);
+        assert_eq!(value["accounting"]["cacheBytes"], 231);
+        assert_eq!(sum("lateServedBytes"), 101 + 202 + 303 + 404 + 505 + 606);
+        assert_eq!(value["accounting"]["lateServedBytes"], 2_121);
+        assert_eq!(sum("decompressedOutputBytes"), 5_000 + 7_000);
+        assert_eq!(value["accounting"]["decompressedBytes"], 12_000);
+        assert_eq!(sum("reusedRegionBytes"), 640 + 320);
+        assert_eq!(value["accounting"]["bytesReused"], 960);
+        assert_eq!(sum("segmentsOpened"), 6 + 15 + 21);
+        assert_eq!(value["accounting"]["segmentsOpened"], 42);
         assert_eq!(sum("seriesMatched"), 12 + 16);
         assert_eq!(value["accounting"]["seriesMatched"], 28);
     }

@@ -846,7 +846,10 @@ fn print_human_table(report: &SqlLatencyReport) {
         // The cold run is run index 0, so this needs no minimum run count, only
         // the per-run array the Flight lane does not carry.
         let probe_misses = match e.per_run_accounting.as_deref() {
-            Some([cold, ..]) => (cold.probe_misses_plan + cold.probe_misses_scan).to_string(),
+            Some([cold, ..]) => {
+                (cold.probe_misses_plan + cold.probe_misses_scan + cold.probe_misses_fetch)
+                    .to_string()
+            }
             _ => "-".to_string(),
         };
         eprintln!(
@@ -1038,9 +1041,10 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
         "  Not the same quantity as page_bytes_fetched / page_bytes_decoded, which is stored over stored."
     );
     eprintln!(
-        "  {:<32} | {:>16} | {:>16} | {:>20} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13}",
+        "  {:<32} | {:>16} | {:>16} | {:>16} | {:>20} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13}",
         "id",
         "wire_bytes_scan",
+        "wire_bytes_fetch",
         "wire_bytes_probe",
         "wire_bytes_key_index",
         "wire_bytes_plan",
@@ -1051,8 +1055,8 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
         "amplification",
     );
     eprintln!(
-        "  {:-<32}-+-{:-<16}-+-{:-<16}-+-{:-<20}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<25}-+-{:-<13}",
-        "", "", "", "", "", "", "", "", "", ""
+        "  {:-<32}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<20}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<25}-+-{:-<13}",
+        "", "", "", "", "", "", "", "", "", "", ""
     );
     let phase = |acc: &RunAccounting, name: &str| {
         acc.wire_bytes_by_phase
@@ -1062,9 +1066,10 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
     };
     for (id, acc) in rows {
         eprintln!(
-            "  {:<32} | {:>16} | {:>16} | {:>20} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13.3}",
+            "  {:<32} | {:>16} | {:>16} | {:>16} | {:>20} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13.3}",
             id,
             phase(acc, "scan"),
+            phase(acc, "fetch"),
             phase(acc, "probe"),
             phase(acc, "keyIndex"),
             phase(acc, "plan"),

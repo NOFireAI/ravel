@@ -1141,9 +1141,12 @@ mod tests {
 
         let figures = phase_figures(&phases);
 
-        assert_eq!(figures.len(), 5);
+        assert_eq!(figures.len(), 6);
         let names: Vec<&str> = figures.iter().map(|(phase, _, _)| phase.name()).collect();
-        assert_eq!(names, vec!["resolve", "plan", "probe", "scan", "keyIndex"]);
+        assert_eq!(
+            names,
+            vec!["resolve", "plan", "probe", "scan", "keyIndex", "fetch"]
+        );
     }
 
     /// `budget.actual` reports each pooled figure under its own name: four

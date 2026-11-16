@@ -344,7 +344,10 @@ async fn wire_rendering_names_each_phase_exactly_once_on_a_real_query() {
         .iter()
         .map(|e| e["phase"].as_str().expect("phase is a string"))
         .collect();
-    assert_eq!(names, vec!["resolve", "plan", "probe", "scan", "keyIndex"]);
+    assert_eq!(
+        names,
+        vec!["resolve", "plan", "probe", "scan", "keyIndex", "fetch"]
+    );
 }
 
 /// `SqlOutcome::io_shape` on this fixture's two queries, pinned by exact

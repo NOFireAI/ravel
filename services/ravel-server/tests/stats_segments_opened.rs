@@ -94,13 +94,21 @@ fn segments_opened(value: &Value) -> BTreeMap<String, u64> {
         .collect()
 }
 
-fn want(resolve: u64, plan: u64, probe: u64, scan: u64, key_index: u64) -> BTreeMap<String, u64> {
+fn want(
+    resolve: u64,
+    plan: u64,
+    probe: u64,
+    scan: u64,
+    key_index: u64,
+    fetch: u64,
+) -> BTreeMap<String, u64> {
     BTreeMap::from([
         ("resolve".to_string(), resolve),
         ("plan".to_string(), plan),
         ("probe".to_string(), probe),
         ("scan".to_string(), scan),
         ("keyIndex".to_string(), key_index),
+        ("fetch".to_string(), fetch),
     ])
 }
 
@@ -292,7 +300,7 @@ async fn audit_table_statement_opens_every_object_under_scan() {
         .flat_map(|seq| (0..4).map(move |i| format!("seq{seq}rec{i}")))
         .collect();
     assert_eq!(value_rows(&v), want_rows, "{v}");
-    assert_eq!(segments_opened(&v), want(0, 0, 0, 3, 0), "{v}");
+    assert_eq!(segments_opened(&v), want(0, 0, 0, 3, 0, 0), "{v}");
 }
 
 /// The `alerts` table reads each object through the same
@@ -316,7 +324,7 @@ async fn alerts_table_statement_opens_every_object_under_scan() {
     let rows = value_rows(&v);
     assert_eq!(rows.len(), 12, "{v}");
     assert_eq!(rows.iter().collect::<BTreeSet<_>>().len(), 3, "{v}");
-    assert_eq!(segments_opened(&v), want(0, 0, 0, 3, 0), "{v}");
+    assert_eq!(segments_opened(&v), want(0, 0, 0, 3, 0, 0), "{v}");
 }
 
 /// Three small, undeclared-key-index RLOG objects: object 0 carries
@@ -392,7 +400,7 @@ async fn small_object_equality_opens_every_object_under_scan() {
         ],
         "{v}"
     );
-    assert_eq!(segments_opened(&v), want(0, 0, 0, 3, 0), "{v}");
+    assert_eq!(segments_opened(&v), want(0, 0, 0, 3, 0, 0), "{v}");
 }
 
 /// The logs counterpart of the warm trace lookup below: the same statement
@@ -410,8 +418,8 @@ async fn warm_logs_statement_opens_the_same_objects_with_zero_data_gets() {
     let warm = post_sql(&app, sql, 0.0, NOW_NS as f64 / 1e9).await;
     assert_eq!(value_rows(&warm), value_rows(&cold), "{warm}");
     assert_eq!(value_rows(&cold).len(), 4, "{cold}");
-    assert_eq!(segments_opened(&cold), want(0, 3, 0, 0, 0), "{cold}");
-    assert_eq!(segments_opened(&warm), want(0, 3, 0, 0, 0), "{warm}");
+    assert_eq!(segments_opened(&cold), want(0, 3, 0, 0, 0, 0), "{cold}");
+    assert_eq!(segments_opened(&warm), want(0, 3, 0, 0, 0, 0), "{warm}");
     assert_eq!(phase_field(&cold, "plan", "s3GetRequests"), 3, "{cold}");
     for phase in DATA_PHASES {
         assert_eq!(
@@ -447,7 +455,7 @@ async fn a_window_outside_every_object_opens_nothing() {
     )
     .await;
     assert!(value_rows(&v).is_empty(), "{v}");
-    assert_eq!(segments_opened(&v), want(0, 0, 0, 0, 0), "{v}");
+    assert_eq!(segments_opened(&v), want(0, 0, 0, 0, 0, 0), "{v}");
 }
 
 // --- logs: large, key-indexed objects -------------------------------------
@@ -595,7 +603,7 @@ async fn key_indexed_equality_opens_every_object_under_plan_not_scan() {
     // Objects 1 and 2 are pruned by KEY_IDX before any block read, but their
     // footer is still opened to run the probe, so the open counts under
     // `plan`, not `scan`.
-    assert_eq!(segments_opened(&v), want(0, 3, 0, 0, 0), "{v}");
+    assert_eq!(segments_opened(&v), want(0, 3, 0, 0, 0, 0), "{v}");
     // Object 0 is read by two ranged GETs, the plan pass's tail probe and the
     // scan's block run, and counts once: 4 GETs over 3 objects, 3 opens.
     assert_eq!(phase_field(&v, "plan", "s3GetRequests"), 3, "{v}");
@@ -673,7 +681,7 @@ async fn probe_only_keyed_scan_opens_every_object_once_under_plan() {
     )
     .await;
     assert_eq!(v["data"]["rows"][0][0], 3 * RECORDS as u64 - 1, "{v}");
-    assert_eq!(segments_opened(&v), want(0, 3, 0, 0, 0), "{v}");
+    assert_eq!(segments_opened(&v), want(0, 3, 0, 0, 0, 0), "{v}");
     // The probe's tail GET (which holds the KEY_IDX under the default suffix
     // length) and the scan's whole-object GET each read every object once:
     // `scan` reads at zero opens because the plan pass recorded them.
@@ -831,7 +839,7 @@ fn server_cache(max_bytes: u64) -> ReadCache {
     ravel_server::store::build_cache(&cli, max_bytes).expect("a nonzero cache is built")
 }
 
-const DATA_PHASES: [&str; 4] = ["plan", "probe", "scan", "keyIndex"];
+const DATA_PHASES: [&str; 5] = ["plan", "probe", "scan", "keyIndex", "fetch"];
 
 /// ADR-3692 acceptance row 4 (a warm spans lookup reads no data object) on
 /// an unfolded tail: the same trace lookup twice through one read cache. The
@@ -849,8 +857,8 @@ async fn adr_3692_row_4_warm_trace_lookup_opens_the_same_objects_with_zero_data_
     let warm = post_sql(&app, &sql, 0.0, NOW_NS as f64 / 1e9).await;
     assert_eq!(value_rows(&cold), vec!["target".to_string()], "{cold}");
     assert_eq!(value_rows(&warm), vec!["target".to_string()], "{warm}");
-    assert_eq!(segments_opened(&cold), want(0, 0, 3, 0, 0), "{cold}");
-    assert_eq!(segments_opened(&warm), want(0, 0, 3, 0, 0), "{warm}");
+    assert_eq!(segments_opened(&cold), want(0, 0, 3, 0, 0, 0), "{cold}");
+    assert_eq!(segments_opened(&warm), want(0, 0, 3, 0, 0, 0), "{warm}");
     for phase in DATA_PHASES {
         assert_eq!(
             phase_field(&warm, phase, "s3GetRequests"),
@@ -873,7 +881,7 @@ async fn trace_lookup_by_sql_opens_every_object_under_probe_not_scan() {
     assert_eq!(value_rows(&v), vec!["target".to_string()], "{v}");
     // Every object's tail is probed for KEY_IDX, pruned or not; only the
     // holding object's block run follows, which does not reopen the footer.
-    assert_eq!(segments_opened(&v), want(0, 0, 3, 0, 0), "{v}");
+    assert_eq!(segments_opened(&v), want(0, 0, 3, 0, 0, 0), "{v}");
 }
 
 #[tokio::test]
@@ -888,5 +896,5 @@ async fn trace_lookup_by_get_api_traces_opens_every_object_under_probe_not_scan(
         1,
         "{v}"
     );
-    assert_eq!(segments_opened(&v), want(0, 0, 3, 0, 0), "{v}");
+    assert_eq!(segments_opened(&v), want(0, 0, 3, 0, 0, 0), "{v}");
 }
