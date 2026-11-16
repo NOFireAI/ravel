@@ -127,7 +127,8 @@ for a tier that is listed in `autoscaledTiers` and no longer has
 
 1. Write to status, before anything else, an adoption record for the tier:
    the live replica count and the `spec.<tier>.replicas` declared at that
-   moment. If that write fails, the pass fails for the tier and nothing
+   moment (corrected: see the declared-count amendment below). If that
+   write fails, the pass fails for the tier and nothing
    else is applied.
 2. Delete the HPA it rendered (sweep by label, as for every other owned
    object), apply the Deployment with `spec.replicas` at the adopted count,
@@ -252,3 +253,30 @@ before any scaler should remove its pods; that is a separate issue.
   proves the outcome: on a real apiserver, enabling autoscaling on a
   three-replica gateway leaves three replicas, and an external `kubectl
   scale` survives a reconcile.
+
+## Amendment (2026-11-16): record the declared count while autoscaling is on
+
+<!-- amendment-applies: sections="2. Handing `spec.replicas` to the scaler" pointer="declared-count amendment" -->
+
+Decision 2 had the turn-off pass record the `spec.<tier>.replicas` declared
+at that moment. Recorded that way, a `replicas` change made in the same
+edit that removes the `autoscaling` block becomes the record's baseline,
+so it never applies, which contradicts the Consequences' advice to change
+it in the same edit.
+
+Corrected rule:
+
+- Each `autoscaledTiers` entry holds the tier and `declaredReplicas`, the
+  `spec.<tier>.replicas` seen on an autoscaled pass, refreshed on every
+  autoscaled pass.
+- On the turn-off pass, if `spec.<tier>.replicas` differs from the entry's
+  `declaredReplicas`, the user changed it in the same edit: the operator
+  deletes the HPA, applies that value with force, drops the entry and
+  writes no adoption record.
+- Otherwise the adoption record holds the live count and the entry's
+  `declaredReplicas`, and the rest of decision 2 stands: written to status
+  before the apply, and kept until `spec.<tier>.replicas` changes.
+
+The guide spells out the consequence with an example: a tier declared at
+`replicas: 3` and scaled to 12 stays at 12 when the block is removed, and
+re-applying an unchanged `replicas: 3` (from Git, say) leaves it at 12.
