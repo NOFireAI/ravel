@@ -231,6 +231,31 @@ check_eq "gates -p ravel-logseg: invariants lane (ravel-ingest in the closure)" 
 check_eq "gates -p ravel-logseg: invariants lane directly after stage-timing" "1" \
   "$(grep -A2 -xF -- "${stage_clippy}" "${tmp}/logseg.out" | grep -cxF -- "${invariants_clippy}")"
 
+# Each of the six crates selects the invariants lane by itself. In the graph
+# above most of them reach another through the closure, so these runs use a
+# graph where each is a leaf no other crate depends on: dropping any one from
+# gates.sh's case arm fails exactly its own check.
+{
+  printf '{"packages":['
+  pkg ravel-types
+  for c in ravel-invariant ravel-commit ravel-ingest ravel-catalog ravel-maintain ravel-fleet; do
+    printf ','
+    pkg "${c}"
+  done
+  printf ']}\n'
+} >"${tmp}/leaves.json"
+for c in ravel-invariant ravel-commit ravel-ingest ravel-catalog ravel-maintain ravel-fleet ravel-types; do
+  want=1
+  [[ "${c}" == ravel-types ]] && want=0
+  run_stubbed "leaf_${c}" env CARGO_STUB_METADATA="${tmp}/leaves.json" \
+    bash "${SCRIPTS}/gates.sh" -p "${c}" --dry-run
+  check_eq "gates -p ${c} (a leaf): exit 0" "0" "${rc}"
+  check_eq "gates -p ${c} (a leaf): invariants lane clippy" "${want}" \
+    "$(count "${tmp}/leaf_${c}.out" "${invariants_clippy}")"
+  check_eq "gates -p ${c} (a leaf): invariants lane tests" "${want}" \
+    "$(count "${tmp}/leaf_${c}.out" "${invariants_test}")"
+done
+
 # -p ravel-cli: the sql-explain lane, and no lane of a crate outside it.
 run_stubbed cli bash "${SCRIPTS}/gates.sh" -p ravel-cli --dry-run
 out="${tmp}/cli.out"

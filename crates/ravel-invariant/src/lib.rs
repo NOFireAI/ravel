@@ -11,8 +11,8 @@
 //!   mutant control flips: `if inv_mutant!("commit/commit-before-data") { .. }`.
 //!
 //! Every feature is off by default and none is in a published build
-//! (`scripts/guards/check-release-profile.sh` refuses `antithesis` and
-//! `antithesis-mutants` there):
+//! (`scripts/guards/check-release-profile.sh` refuses `antithesis`,
+//! `antithesis-mutants` and `capture` there):
 //!
 //! - `antithesis`: each assertion calls the Antithesis SDK at its site, and
 //!   [`init`] registers the assertion catalog.
@@ -337,6 +337,7 @@ pub mod capture {
 pub mod mutant {
     use std::cell::Cell;
     use std::ffi::OsStr;
+    use std::marker::PhantomData;
     use std::sync::OnceLock;
 
     use crate::{InitError, MUTANT_ENV};
@@ -446,13 +447,25 @@ pub mod mutant {
     pub fn scoped(name: &str) -> Result<ScopedMutant, InitError> {
         let name = registered(name)?;
         let previous = SCOPED.with(|s| s.replace(Some(Some(name))));
-        Ok(ScopedMutant { previous })
+        Ok(ScopedMutant {
+            previous,
+            _not_send: PhantomData,
+        })
     }
 
     /// Restores the calling thread's previous selection on drop.
+    ///
+    /// It is not `Send`: dropped on another thread it would restore that
+    /// thread's slot and leave the selection open on this one.
+    ///
+    /// ```compile_fail,E0277
+    /// fn assert_send<T: Send>() {}
+    /// assert_send::<ravel_invariant::mutant::ScopedMutant>();
+    /// ```
     #[must_use = "the mutant is deselected when this guard drops"]
     pub struct ScopedMutant {
         previous: Option<Option<&'static str>>,
+        _not_send: PhantomData<*const ()>,
     }
 
     impl Drop for ScopedMutant {
@@ -460,6 +473,16 @@ pub mod mutant {
             SCOPED.with(|s| s.set(self.previous));
         }
     }
+
+    // Fails to compile if ScopedMutant becomes Send: the call below is then
+    // ambiguous between the two impls.
+    trait AmbiguousIfSend<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    struct IsSend;
+    impl<T: ?Sized + Send> AmbiguousIfSend<IsSend> for T {}
+    const _: fn() = || <ScopedMutant as AmbiguousIfSend<_>>::check();
 }
 
 #[cfg(test)]

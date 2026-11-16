@@ -20,6 +20,7 @@ crates/ravel-esql	sql,flight-sql,agents,mcp,promql
 crates/ravel-failure-tests	-
 crates/ravel-fleet	sql,flight-sql,agents,mcp,promql
 crates/ravel-ingest	sql,flight-sql,agents,mcp,promql
+crates/ravel-invariant	sql,flight-sql,agents,mcp,promql
 crates/ravel-ipcrypt	sql,flight-sql,agents,mcp,promql
 crates/ravel-logseg	sql,flight-sql,agents,mcp,promql
 crates/ravel-maintain	sql,flight-sql,agents,mcp,promql

@@ -462,10 +462,20 @@ than passing for "no pull request open".
   manifests (root, `crates/*`, `services/*`) `format-drill` may appear only
   under a dev-dependencies table or in the value of a feature itself named
   `format-drill`, so no `default` list, renamed forward or non-dev dependency
-  can turn it on.
+  can turn it on. It keeps ravel-invariant's test-only `antithesis`,
+  `antithesis-mutants` and `capture` features (ADR-4326) out the same way:
+  neither file may name `antithesis`, `antithesis-mutants` or
+  `ravel-invariant/capture` outside a comment, or `capture` in a features
+  argument, and in the workspace manifests a value naming `antithesis` or
+  `antithesis-mutants`, double-quoted, single-quoted or bare, may appear only
+  in a feature of the same name, while `ravel-invariant/capture`, or `capture`
+  in ravel-invariant's own features or on a ravel-invariant dependency edge,
+  may appear nowhere. Unlike `format-drill`, dev-dependencies are not exempt.
   Exit 1 is a finding, 2 is a missing anchor (no `[profile.release]` table, no
   `cargo build` line, no build step in the publish workflow, a drill crate
-  manifest missing or no longer declaring `format-drill`), which is the
+  manifest missing or no longer declaring `format-drill`, the ravel-invariant
+  manifest missing or no longer declaring one of its three test-only
+  features), which is the
   case where the scan would otherwise pass everything. Wired into `gates.sh`
   and CI's doc-scripts job, cases first; cases in
   `scripts/guards/check-release-profile.test.sh`.
