@@ -750,12 +750,39 @@ strip_code_span() {
     printf '%s' "$s"
 }
 
+# rust_literal_live <literal> <file.rs>: the literal occurs in the file on a
+# line that is not a comment (after leading whitespace, //, /* or *) and comes
+# before the file's first #[cfg(test)] line, so a commented-out or test-only
+# occurrence does not count. The literal is passed through the environment,
+# never as awk program text or -v, so backslashes stay literal.
+rust_literal_live() {
+    RUST_LITERAL="$1" awk '
+        /^[[:space:]]*#\[cfg\(test\)\]/ { exit }
+        /^[[:space:]]*(\/\/|\/\*|\*)/ { next }
+        index($0, ENVIRON["RUST_LITERAL"]) { found = 1; exit }
+        END { exit !found }' "$2"
+}
+
+# rust_literal_live_under <literal> <dir>...: rust_literal_live holds for some
+# .rs file under the directories, not counting files under a tests/ directory.
+rust_literal_live_under() {
+    local lit="$1" f rel
+    shift
+    while IFS= read -r f; do
+        rel="${f#"$REPO_ROOT"/}"
+        case "$rel" in tests/*|*/tests/*) continue ;; esac
+        rust_literal_live "$lit" "$f" && return 0
+    done < <(grep -rlF --include='*.rs' -- "$lit" "$@" 2>/dev/null)
+    return 1
+}
+
 # Check one "Antithesis property" cell (ADR-4326 decision 6):
-#   sut: <path.rs> -- <message>      the file exists and holds the message
-#   driver: <workload> -- <message>  the message occurs under antithesis/<workload>/
+#   sut: <path.rs> -- <message>      the file holds "<message>" as a string literal
+#   driver: <workload> -- <message>  a .rs file under antithesis/<workload>/ does
 #   none: <reason>                   the reason is non-empty
-# The path and the message may each be one backtick code span. Sets
-# ANTITHESIS_MSG to the message for sut: and driver:, empty for none:.
+# A literal counts only as rust_literal_live sees it. The path and the message
+# may each be one backtick code span. Sets ANTITHESIS_MSG to the message for
+# sut: and driver:, empty for none:.
 check_antithesis_cell() {
     local area="$1" lineno="$2" cell="$3" kind rest target msg
     local where="$area traceability: line $lineno: $ANTITHESIS_COLUMN"
@@ -763,11 +790,13 @@ check_antithesis_cell() {
     case "$cell" in
         "sut: "*) kind=sut; rest="${cell#sut: }" ;;
         "driver: "*) kind=driver; rest="${cell#driver: }" ;;
-        none:*)
-            rest="${cell#none:}"
+        none:) note "$where: none: needs a reason"; return 1 ;;
+        "none: "*)
+            rest="${cell#none: }"
             rest="${rest#"${rest%%[![:space:]]*}"}"
             [ -n "$rest" ] || { note "$where: none: needs a reason"; return 1; }
             return 0 ;;
+        none:*) note "$where: none: needs a space before its reason: '$cell'"; return 1 ;;
         *) note "$where: '$cell' is not sut: <path.rs> -- <message>, driver: <workload> -- <message> or none: <reason>"; return 1 ;;
     esac
     case "$rest" in
@@ -786,16 +815,16 @@ check_antithesis_cell() {
             *) note "$where: sut: path '$target' is not a Rust (.rs) path"; return 1 ;;
         esac
         [ -f "$REPO_ROOT/$target" ] || { note "$where: sut: no such file '$target'"; return 1; }
-        grep -qF -- "$msg" "$REPO_ROOT/$target" \
-            || { note "$where: message '$msg' not found in '$target'"; return 1; }
+        rust_literal_live "\"$msg\"" "$REPO_ROOT/$target" \
+            || { note "$where: message '$msg' not found as the string literal \"$msg\" in '$target'"; return 1; }
     else
         case "$target" in
             ''|*/*|.*|*[!A-Za-z0-9._-]*) note "$where: driver: '$target' is not a workload name"; return 1 ;;
         esac
         [ -d "$REPO_ROOT/antithesis/$target" ] \
             || { note "$where: driver: no workload directory 'antithesis/$target/'"; return 1; }
-        grep -rqF -- "$msg" "$REPO_ROOT/antithesis/$target" \
-            || { note "$where: message '$msg' not found under 'antithesis/$target/'"; return 1; }
+        rust_literal_live_under "\"$msg\"" "$REPO_ROOT/antithesis/$target" \
+            || { note "$where: message '$msg' not found as the string literal \"$msg\" in a .rs file under 'antithesis/$target/'"; return 1; }
     fi
     ANTITHESIS_MSG="$msg"
     return 0
@@ -805,14 +834,16 @@ check_antithesis_cell() {
 #   <negative cfg stem> TAB <area>/<stem> TAB <property message>
 # or
 #   <negative cfg stem> TAB none: <reason>
-# where the mutant occurs in Rust as the literal inv_mutant!("<area>/<stem>")
-# and the property is the message of a sut: or driver: cell in the area's
-# tables. Every negative/*.cfg has exactly one line.
+# where the mutant occurs as the literal inv_mutant!("<area>/<stem>") in a .rs
+# file under crates/, services/ or antithesis/*/driver/ (the driver-side
+# broken store of ADR-4326 decision 3), as rust_literal_live sees it, and the
+# property is the message of a sut: or driver: cell in the area's tables.
+# Every negative/*.cfg has exactly one line.
 check_antithesis_tsv() {
     local area="$1" carried="$2"
     local area_dir="$FORMAL_DIR/$area" tsv="$FORMAL_DIR/$area/$ANTITHESIS_TSV"
     local rc=0 n=0 tline stem f2 f3 extra seen="" reason cfg roots=() d where
-    for d in "$REPO_ROOT/crates" "$REPO_ROOT/services"; do
+    for d in "$REPO_ROOT/crates" "$REPO_ROOT/services" "$REPO_ROOT"/antithesis/*/driver; do
         [ -d "$d" ] && roots+=("$d")
     done
     while IFS= read -r tline || [ -n "$tline" ]; do
@@ -834,7 +865,14 @@ check_antithesis_tsv() {
             none:*)
                 reason="${f2#none:}"
                 reason="${reason#"${reason%%[![:space:]]*}"}"
-                [ -n "$reason" ] || { note "$where: none: needs a reason"; rc=1; }
+                if [ -z "$reason" ]; then
+                    note "$where: none: needs a reason"; rc=1
+                else
+                    case "$f2" in
+                        "none: "*) : ;;
+                        *) note "$where: none: needs a space before its reason: '$f2'"; rc=1 ;;
+                    esac
+                fi
                 [ -z "$f3" ] || { note "$where: a none: line names no property"; rc=1; }
                 continue ;;
         esac
@@ -842,7 +880,7 @@ check_antithesis_tsv() {
             note "$where: mutant '$f2' must be named '$area/$stem'"; rc=1; continue
         fi
         if [ "${#roots[@]}" -eq 0 ] \
-            || ! grep -rqF --include='*.rs' -- "inv_mutant!(\"$f2\")" "${roots[@]}"; then
+            || ! rust_literal_live_under "inv_mutant!(\"$f2\")" "${roots[@]}"; then
             note "$where: mutant '$f2' not found as inv_mutant!(\"$f2\") in Rust"; rc=1
         fi
         if [ -z "$f3" ]; then
@@ -873,7 +911,7 @@ check_traceability() {
         fi
         note "$area: no traceability.md, skipping"; return 0
     fi
-    local rc=0 count=0 lineno=0 in_table=0 table_ok=0 carried=""
+    local rc=0 count=0 lineno=0 in_table=0 table_ok=0 after_header=0 carried=""
 
     # D8 columns, the sixth only in an area enrolled by antithesis-mutants.tsv:
     #   | TLA+ action or property | meaning | Rust path and symbol
@@ -892,7 +930,7 @@ check_traceability() {
         esac
         trace_cells "$line"
         if [ "$in_table" -eq 0 ]; then
-            in_table=1; table_ok=0
+            in_table=1; table_ok=0; after_header=1
             if [ "${TRACE_CELLS[0]:-}" != "$TRACE_HEADER_FIRST_CELL" ]; then
                 note "$area traceability: line $lineno: table header's first cell is '${TRACE_CELLS[0]:-}', not '$TRACE_HEADER_FIRST_CELL'"
                 rc=1; continue
@@ -913,7 +951,12 @@ check_traceability() {
         fi
         # Rows under a rejected header were already failed with it.
         [ "$table_ok" -eq 1 ] || continue
-        [[ "$line" =~ $TRACE_DELIMITER_ROW ]] && continue
+        # Only the row directly under the header may be its delimiter; a
+        # later row of pipes and dashes is a data row and is checked as one.
+        if [ "$after_header" -eq 1 ]; then
+            after_header=0
+            [[ "$line" =~ $TRACE_DELIMITER_ROW ]] && continue
+        fi
         if [ "${#TRACE_CELLS[@]}" -ne "$want" ]; then
             note "$area traceability: line $lineno: row has ${#TRACE_CELLS[@]} cells, the table $want: $line"
             rc=1; continue

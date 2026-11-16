@@ -1260,7 +1260,7 @@ TLA_JAR_SHA256="$orig_sha_af"
 PATH="$orig_path_af"
 rm -rf "$afdir"
 
-# --- (ai)-(at) traceability: the Antithesis property column (issue #4330) ----
+# --- (ai)-(ba) traceability: the Antithesis property column (issue #4330) ----
 # ADR-4326 decision 6, ADR-1113 D8 amendment. An area holding
 # antithesis-mutants.tsv is enrolled: every row of every traceability table
 # then carries a sixth "Antithesis property" cell (sut:, driver: or none:),
@@ -1271,15 +1271,20 @@ orig_formal_dir_ai="$FORMAL_DIR"
 airepo="$(mktemp -d)"
 REPO_ROOT="$airepo"
 FORMAL_DIR="$airepo/formal/tla"
-mkdir -p "$airepo/crates" "$airepo/antithesis/ingest-durability"
+mkdir -p "$airepo/crates" "$airepo/antithesis/ingest-durability/driver/src"
 cat > "$airepo/crates/a.rs" <<'EOF'
 fn publish() {
     inv_always!(ok, "commit never precedes data");
     if inv_mutant!("enr/commit-before-data") {}
 }
 EOF
-cat > "$airepo/antithesis/ingest-durability/driver.py" <<'EOF'
-always(acked, "acked write is durable")
+cat > "$airepo/antithesis/ingest-durability/driver/src/main.rs" <<'EOF'
+fn check() {
+    assert_always!(acked, "acked write is durable");
+}
+EOF
+cat > "$airepo/antithesis/ingest-durability/README.md" <<'EOF'
+The driver asserts "acked write is replayed" after every restart.
 EOF
 
 TAB="$(printf '\t')"
@@ -1354,13 +1359,13 @@ expect_trace al1 enr fail "Antithesis property: sut: no such file 'services/gone
 make_area enr 1 "$HDR6
 $ROW6_SUT
 | Absent | absent | \`crates/a.rs::publish\` | none | none | sut: \`crates/a.rs\` -- data never precedes commit |"
-expect_trace al2 enr fail "Antithesis property: message 'data never precedes commit' not found in 'crates/a.rs'"
+expect_trace al2 enr fail "Antithesis property: message 'data never precedes commit' not found as the string literal \"data never precedes commit\" in 'crates/a.rs'"
 
 echo "--- (am) traceability: driver: with a message absent under the workload fails"
 make_area enr 1 "$HDR6
 $ROW6_SUT
 | Ack | acked | \`crates/a.rs::publish\` | none | none | driver: ingest-durability -- acked write is lost |"
-expect_trace am1 enr fail "Antithesis property: message 'acked write is lost' not found under 'antithesis/ingest-durability/'"
+expect_trace am1 enr fail "Antithesis property: message 'acked write is lost' not found as the string literal \"acked write is lost\" in a .rs file under 'antithesis/ingest-durability/'"
 make_area enr 1 "$HDR6
 $ROW6_SUT
 | Ack | acked | \`crates/a.rs::publish\` | none | none | driver: no-such-workload -- acked write is durable |"
@@ -1427,6 +1432,141 @@ $HDR6
 $ROW6_DRV
 $ROW6_NONE"
 expect_trace as3 enr pass 'PASS (3 rows resolve)'
+
+echo "--- (au) traceability: a row of only pipes, spaces, dashes and colons is a data row unless it is directly under the header"
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| | | | | | |"
+expect_trace au1 enr fail 'row has no Rust source ref: | | | | | | |'
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| - | - | - | - | - | - |"
+expect_trace au2 enr fail "ref '-' is not a Rust (.rs) path"
+make_area unenr 0 "$HDR5
+$ROW5
+| | | | | |"
+expect_trace au3 unenr fail 'row has no Rust source ref: | | | | | |'
+make_area unenr 0 "$HDR5
+$ROW5
+| - | - | - | - | - |"
+expect_trace au4 unenr fail "ref '-' is not a Rust (.rs) path"
+
+echo "--- (av) traceability: a sut: message counts only as a whole string literal"
+# inv_always occurs in crates/a.rs, but not as a string literal.
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| Bare | bare | \`crates/a.rs::publish\` | none | none | sut: \`crates/a.rs\` -- inv_always |"
+expect_trace av1 enr fail "message 'inv_always' not found as the string literal \"inv_always\" in 'crates/a.rs'"
+# "never precedes" is only part of the longer literal "commit never precedes data".
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| Part | part | \`crates/a.rs::publish\` | none | none | sut: \`crates/a.rs\` -- never precedes |"
+expect_trace av2 enr fail "message 'never precedes' not found as the string literal \"never precedes\" in 'crates/a.rs'"
+
+echo "--- (aw) traceability: a driver: message in the workload's markdown, not its .rs source, fails"
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| Replay | replay | \`crates/a.rs::publish\` | none | none | driver: ingest-durability -- acked write is replayed |"
+expect_trace aw enr fail "message 'acked write is replayed' not found as the string literal \"acked write is replayed\" in a .rs file under 'antithesis/ingest-durability/'"
+
+# Mutant fixtures for (ax)-(ay): a live one in a driver-side store, one
+# outside any driver/ directory, and ones that are commented out, test-only
+# or under a tests/ directory.
+mkdir -p "$airepo/antithesis/x/driver/src" "$airepo/antithesis/x/notdriver/src" "$airepo/crates/m/tests"
+cat > "$airepo/antithesis/x/driver/src/store.rs" <<'EOF'
+fn put() {
+    if inv_mutant!("enr/lost-response") {}
+}
+EOF
+cat > "$airepo/antithesis/x/notdriver/src/store.rs" <<'EOF'
+fn put() {
+    if inv_mutant!("enr/not-driver") {}
+}
+EOF
+cat > "$airepo/crates/m/lib.rs" <<'EOF'
+fn live() {
+    // if inv_mutant!("enr/line-comment") {}
+    /* if inv_mutant!("enr/block-comment") {} */
+    /*
+     * if inv_mutant!("enr/block-body") {}
+     */
+}
+#[cfg(test)]
+mod tests {
+    fn t() { if inv_mutant!("enr/cfg-test") {} }
+}
+EOF
+cat > "$airepo/crates/m/tests/it.rs" <<'EOF'
+fn t() { if inv_mutant!("enr/tests-dir") {} }
+EOF
+
+# tsv_mutant <stem>: an enrolled area whose .tsv also maps negative/<stem>.cfg
+# to the mutant enr/<stem>.
+tsv_mutant() {
+    make_area enr 1 "$HDR6
+$ROW6_SUT"
+    : > "$FORMAL_DIR/enr/negative/$1.cfg"
+    printf '%s\tenr/%s\tcommit never precedes data\n' "$1" "$1" >> "$FORMAL_DIR/enr/antithesis-mutants.tsv"
+}
+
+echo "--- (ax) traceability: a mutant whose only literal is in antithesis/<w>/driver/ passes; outside driver/ it fails"
+tsv_mutant lost-response
+expect_trace ax1 enr pass 'PASS (1 rows resolve)'
+tsv_mutant not-driver
+expect_trace ax2 enr fail "mutant 'enr/not-driver' not found as inv_mutant!(\"enr/not-driver\") in Rust"
+
+echo "--- (ay) traceability: a commented-out, cfg(test) or tests/ mutant literal does not count"
+for m in line-comment block-comment block-body cfg-test tests-dir; do
+    tsv_mutant "$m"
+    expect_trace "ay-$m" enr fail "mutant 'enr/$m' not found as inv_mutant!(\"enr/$m\") in Rust"
+done
+
+echo "--- (az) traceability: each remaining cell, header and .tsv rule fails on its own"
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| Short | short | \`crates/a.rs::publish\` | none | sut: \`crates/a.rs\` -- commit never precedes data |"
+expect_trace az1-cells enr fail 'row has 5 cells, the table 6'
+make_area enr 1 "$HDR6
+$ROW6_SUT"
+printf 'commit-before-data\tnone: duplicate\n' >> "$FORMAL_DIR/enr/antithesis-mutants.tsv"
+expect_trace az2-dup enr fail 'antithesis-mutants.tsv:3: second line for negative/commit-before-data.cfg'
+make_area enr 1 "$HDR6
+$ROW6_SUT"
+printf 'no-such\tnone: unknown\n' >> "$FORMAL_DIR/enr/antithesis-mutants.tsv"
+expect_trace az3-unknown enr fail "antithesis-mutants.tsv:3: 'no-such' names no negative/no-such.cfg"
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| Sep | sep | \`crates/a.rs::publish\` | none | none | sut: \`crates/a.rs\` commit never precedes data |"
+expect_trace az4-sep enr fail "sut: needs ' -- ' between the target and the message"
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| Pre | pre | \`crates/a.rs::publish\` | none | none | assert: \`crates/a.rs\` -- commit never precedes data |"
+expect_trace az5-prefix enr fail "'assert: \`crates/a.rs\` -- commit never precedes data' is not sut: <path.rs>"
+make_area enr 1 "| TLA+ action or property | meaning | Rust path and symbol | existing test | new test needed | Antithesis |
+|---|---|---|---|---|---|
+$ROW6_SUT"
+expect_trace az6-header enr fail "sixth column is 'Antithesis', not 'Antithesis property'"
+make_area enr 1 "$HDR6
+$ROW6_SUT"
+: > "$FORMAL_DIR/enr/negative/ack-before-commit.cfg"
+printf 'ack-before-commit\tnone:\n' >> "$FORMAL_DIR/enr/antithesis-mutants.tsv"
+expect_trace az7-tsv-none enr fail 'antithesis-mutants.tsv:3: none: needs a reason'
+make_area enr 1 "$HDR6
+$ROW6_SUT"
+: > "$FORMAL_DIR/enr/negative/ack-before-commit.cfg"
+printf 'ack-before-commit\tenr/commit-before-data\tcommit never precedes data\n' >> "$FORMAL_DIR/enr/antithesis-mutants.tsv"
+expect_trace az8-name enr fail "mutant 'enr/commit-before-data' must be named 'enr/ack-before-commit'"
+
+echo "--- (ba) traceability: none: needs a space before its reason, in the cell and in the .tsv"
+make_area enr 1 "$HDR6
+$ROW6_SUT
+| TypeOK | shape | \`crates/a.rs::publish\` | none | none | none:unit tested |"
+expect_trace ba1 enr fail "Antithesis property: none: needs a space before its reason: 'none:unit tested'"
+make_area enr 1 "$HDR6
+$ROW6_SUT"
+: > "$FORMAL_DIR/enr/negative/ack-before-commit.cfg"
+printf 'ack-before-commit\tnone:out of scope\n' >> "$FORMAL_DIR/enr/antithesis-mutants.tsv"
+expect_trace ba2 enr fail "antithesis-mutants.tsv:3: none: needs a space before its reason: 'none:out of scope'"
 
 echo "--- (at) traceability: the real tree has no enrolled area and passes five-column"
 REPO_ROOT="$orig_repo_root_ai"
