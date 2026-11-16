@@ -7315,8 +7315,15 @@ mod row_path_tests {
         let before = records_rebuilt_on_this_thread();
         let block = rows.next_row_block(&obj).expect("row exit").expect("block");
         assert!(block.view().has_attrs_raw_page(), "the block overflows");
-        let batch = build_row_batch(&block, 0, block.len(), &mut StreamAttrsCache::new(), &shape, None)
-            .expect("row batch");
+        let batch = build_row_batch(
+            &block,
+            0,
+            block.len(),
+            &mut StreamAttrsCache::new(),
+            &shape,
+            None,
+        )
+        .expect("row batch");
         assert_eq!(
             records_rebuilt_on_this_thread() - before,
             0,
@@ -7401,7 +7408,15 @@ mod row_path_tests {
             1usize..6,
         )
             .prop_map(
-                |(max_dynamic_columns, block_target_records, mut streams, records, erasure, mask, chunk)| {
+                |(
+                    max_dynamic_columns,
+                    block_target_records,
+                    mut streams,
+                    records,
+                    erasure,
+                    mask,
+                    chunk,
+                )| {
                     if let Some((resource, scope)) = streams.first_mut() {
                         resource.push(("shared".into(), AttrValue::Str("res".into())));
                         scope.push(("shared".into(), AttrValue::Str("scope".into())));
@@ -7549,10 +7564,7 @@ mod row_path_tests {
         let mut runner = TestRunner::deterministic();
         let mut all = Reached::default();
         for _ in 0..64 {
-            let case = case()
-                .new_tree(&mut runner)
-                .expect("case")
-                .current();
+            let case = case().new_tree(&mut runner).expect("case").current();
             let r = check_case(&case).expect("property holds");
             all.attrs_raw |= r.attrs_raw;
             all.erased |= r.erased;
