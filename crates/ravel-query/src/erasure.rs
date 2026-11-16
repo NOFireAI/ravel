@@ -165,6 +165,14 @@ impl ErasurePredicate {
         })
     }
 
+    /// [`Self::matches_log_attrs`] over an attribute view read through
+    /// `lookup`, which returns the first string value the view holds under a
+    /// key, the value `matches_log_attrs` finds in a list. For a reader that
+    /// holds a row's attributes in another shape than a list of owned pairs.
+    pub fn matches_log_lookup<'a>(&self, lookup: impl FnMut(&str) -> Option<&'a str>) -> bool {
+        self.matchers_satisfied(lookup)
+    }
+
     /// Whether this predicate's conjunction matches a set of decoded
     /// string-valued attributes (the shape a span's merged attributes take).
     /// The span query surface lives in `ravel-sql`; this method plus
@@ -436,6 +444,25 @@ pub fn retain_unerased_log_records_by<T>(
     }
     *items = survivors;
     Ok(())
+}
+
+/// Whether `predicates` erase one log row at event time `ts_ns`: the rule
+/// [`retain_log_records`] and [`retain_unerased_log_records`] apply in turn,
+/// as one test, for a reader that keeps no [`LogRecord`] per row. `record`
+/// reads the row's per-record attributes, `merged` its
+/// [`merged_log_attrs`] view, each returning the first string value held
+/// under a key. The row is erased when some predicate's window holds `ts_ns`
+/// and its conjunction matches either view.
+pub fn is_erased_log_row<'a, 'b>(
+    predicates: &[ErasurePredicate],
+    ts_ns: i64,
+    mut record: impl FnMut(&str) -> Option<&'a str>,
+    mut merged: impl FnMut(&str) -> Option<&'b str>,
+) -> bool {
+    predicates.iter().any(|p| {
+        (!p.has_window() || p.ts_in_window(ts_ns))
+            && (p.matchers_satisfied(&mut record) || p.matchers_satisfied(&mut merged))
+    })
 }
 
 /// The pending selective-erasure predicates attached to a resolved snapshot

@@ -78,7 +78,7 @@ use ravel_logseg::skip_index::{Level0Entry, NumArm, SkipIndex, merge_stats};
 use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{
     AttrValue, BlockScan, ByteSource, ColumnSelection, ColumnarBlockView, FilterSectionReads,
-    LogRecord, LogSegError, LogStreamId, Predicate, RlogConfig, RlogReader, ScanStats,
+    LogRecord, LogSegError, LogStreamId, Predicate, RlogConfig, RlogReader, RowBlock, ScanStats,
     SegmentDirectories, SparseObject, SuffixOutcome, decode_section_accounted, open_from_suffix,
     read_section_accounted_from,
 };
@@ -617,6 +617,31 @@ impl LogSegmentScan {
         if self.remaining_blocks() == 0 {
             return self.next_block();
         }
+        let decoded = self.decode_on_gate(gate, BlockScan::next_block).await?;
+        self.finish_block(decoded)
+    }
+
+    /// [`next_row_block`](Self::next_row_block) with the block decode run on
+    /// the fetcher's read gate, exactly as
+    /// [`next_block_on_gate`](Self::next_block_on_gate) runs the record exit's.
+    pub async fn next_row_block_on_gate(&mut self) -> Result<Option<RowBlock>, LogFetchError> {
+        let Some(gate) = self.read_gate.clone() else {
+            return self.next_row_block();
+        };
+        if self.remaining_blocks() == 0 {
+            return self.next_row_block();
+        }
+        let decoded = self.decode_on_gate(gate, BlockScan::next_row_block).await?;
+        self.finish_row_block(decoded)
+    }
+
+    /// One block decode run on `gate` as one job, the cursor moved into the
+    /// job and back. A failed job loses the cursor.
+    async fn decode_on_gate<T: Send + 'static>(
+        &mut self,
+        gate: Arc<ReadGate>,
+        decode: fn(&mut BlockScan, &LogObjectBytes) -> Result<Option<T>, LogSegError>,
+    ) -> Result<Result<Option<T>, LogSegError>, LogFetchError> {
         let Some(mut scan) = self.scan.take() else {
             return Err(self.lost_error());
         };
@@ -632,7 +657,7 @@ impl LogSegmentScan {
                 move || {
                     #[cfg(test)]
                     assert!(!panic_in_job, "injected gated block decode panic");
-                    let decoded = span.in_scope(|| scan.next_block(&bytes));
+                    let decoded = span.in_scope(|| decode(&mut scan, &bytes));
                     (scan, decoded)
                 },
             )
@@ -648,7 +673,7 @@ impl LogSegmentScan {
             }
         };
         self.scan = Some(scan);
-        self.finish_block(decoded)
+        Ok(decoded)
     }
 
     /// What an exit reports once the cursor is gone: the classified gate
@@ -693,6 +718,46 @@ impl LogSegmentScan {
         // predicate is per record and carries no cross-record state.
         crate::erasure::retain_log_records(&mut records, &self.erasure);
         Ok(Some(records))
+    }
+
+    /// Decode the next surviving block and hand it out owned, its matching
+    /// rows unfiltered by erasure, or `None` once every surviving block has
+    /// been decoded (ADR-2773 decision 4). See [`BlockScan::next_row_block`].
+    ///
+    /// The rows are the ones [`next_block`](Self::next_block) would rebuild
+    /// before its erasure exclusion. This exit applies none: a caller that
+    /// takes it must exclude every row a pending predicate erases
+    /// ([`erasure_pending`](Self::erasure_pending)) before any of the row's
+    /// values leave it, matching both the record attributes, as
+    /// [`crate::erasure::retain_log_records`] does, and the merged view, as
+    /// [`crate::erasure::retain_unerased_log_records`] does
+    /// ([`crate::erasure::is_erased_log_row`]).
+    pub fn next_row_block(&mut self) -> Result<Option<RowBlock>, LogFetchError> {
+        let Some(scan) = self.scan.as_mut() else {
+            return Err(self.lost_error());
+        };
+        let bytes = &self.bytes;
+        let decoded = self.span.in_scope(|| scan.next_row_block(bytes));
+        self.finish_row_block(decoded)
+    }
+
+    /// The row-block exit's handling of one decoded block, shared by the
+    /// inline and the gated decode.
+    fn finish_row_block(
+        &mut self,
+        decoded: Result<Option<RowBlock>, LogSegError>,
+    ) -> Result<Option<RowBlock>, LogFetchError> {
+        let decoded = decoded.map_err(|source| corrupt(&self.key, source))?;
+        if decoded.is_none() {
+            self.finish();
+        }
+        Ok(decoded)
+    }
+
+    /// The pending erasure predicates a caller of
+    /// [`next_row_block`](Self::next_row_block) must apply.
+    pub fn erasure(&self) -> &[ErasurePredicate] {
+        &self.erasure
     }
 
     /// Whether a pending erasure predicate applies to this scan, which is what

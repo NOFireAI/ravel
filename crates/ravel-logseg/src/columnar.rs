@@ -499,6 +499,28 @@ impl<'a> ColumnarBlockView<'a> {
         self.block.has_attrs_raw_page()
     }
 
+    /// Decode surviving row `i`'s `attrs_raw` overflow attributes, appending
+    /// them to `out` in stored order, the order a rebuilt record lists them
+    /// after its FIELD_DIR attributes. Returns how many were appended: zero
+    /// for a row without overflow, or when the scan's column selection
+    /// skipped `attrs_raw`. A corrupt cell is the same typed `Corrupted` error
+    /// a record rebuild returns, and `out` may then hold some of its entries.
+    pub fn decode_attrs_raw_into(
+        &self,
+        i: usize,
+        out: &mut Vec<(String, ravel_types::logstream::AttrValue)>,
+    ) -> Result<usize, crate::error::LogSegError> {
+        let Some(raw) = self
+            .row(i)
+            .and_then(|row| self.block.str_at(crate::record::COL_ATTRS_RAW, row))
+        else {
+            return Ok(0);
+        };
+        let before = out.len();
+        crate::reader::decode_canonical_attrs_into(raw, out)?;
+        Ok(out.len() - before)
+    }
+
     /// The heap bytes the decoded block behind this view holds resident: every
     /// decoded column vector plus every present string and fixed-width cell's
     /// own allocation.

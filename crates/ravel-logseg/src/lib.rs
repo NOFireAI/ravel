@@ -66,7 +66,7 @@ pub use footer::{
 };
 pub use ranged::{RlogRangeReader, StreamBlockLoc, StreamBlockRows, StreamBlockSpan};
 pub use reader::{
-    BlockScan, FilterSectionReads, RlogReader, ScanStats, SegmentDirectories, decode_section,
+    BlockScan, FilterSectionReads, RlogReader, RowBlock, ScanStats, SegmentDirectories, decode_section,
     decode_section_accounted, read_section, read_section_accounted, read_section_accounted_from,
     read_section_from, stream_attr_pairs,
 };

@@ -1579,6 +1579,45 @@ impl BlockScan {
         ))
     }
 
+    /// Decode the next surviving block and hand it out owned, with the rows of
+    /// it that match the exact filter, or `None` once every surviving block has
+    /// been decoded (ADR-2773 decision 4).
+    ///
+    /// A third exit over the same decode primitive: the [`RowBlock`]'s rows are
+    /// exactly the rows [`Self::next_block`] would have rebuilt records for, in
+    /// the same order, and nothing is rebuilt. Every surviving row is checked
+    /// up front for each fault `next_block` reports while rebuilding a record,
+    /// with the same typed `Corrupted` error, except a corrupt `attrs_raw`
+    /// cell, which the caller sees when it decodes the cell
+    /// ([`ColumnarBlockView::decode_attrs_raw_into`]). A block that would
+    /// have failed `next_block` therefore fails here, before a caller builds
+    /// anything from it.
+    ///
+    /// Unlike the columnar exit the block is moved out, so the cursor holds
+    /// nothing while the caller drains it, as after [`Self::next_block`].
+    pub fn next_row_block<S: ByteSource + ?Sized>(
+        &mut self,
+        object_bytes: &S,
+    ) -> Result<Option<RowBlock>, LogSegError> {
+        if !self.decode_block(object_bytes, false)? {
+            return Ok(None);
+        }
+        let Some(block) = self.current.take() else {
+            return Err(LogSegError::Corrupted("block not decoded".into()));
+        };
+        let rows = std::mem::take(&mut self.surviving);
+        let strict = self.columns.is_none();
+        for &row in &rows {
+            check_row(&self.stream_dir, &block, row, strict)?;
+        }
+        Ok(Some(RowBlock {
+            stream_dir: Arc::clone(&self.stream_dir),
+            field_dir: Arc::clone(&self.field_dir),
+            block,
+            rows,
+        }))
+    }
+
     /// The decode primitive both exits run on: locate the next surviving block,
     /// decode its selected columns, account for its pages, and evaluate the
     /// exact content predicate into [`Self::surviving`].
@@ -1760,6 +1799,96 @@ impl BlockScan {
         self.current = Some(decoded);
         Ok(true)
     }
+}
+
+/// One decoded block, owned, with the rows of it that matched the scan's
+/// exact filter ([`BlockScan::next_row_block`]). Read through
+/// [`Self::view`], the same columnar view [`BlockScan::next_block_columnar`]
+/// hands out, or through [`Self::view_over`] for a subset of the rows.
+pub struct RowBlock {
+    stream_dir: Arc<StreamDir>,
+    field_dir: Arc<FieldDir>,
+    block: DecodedBlock,
+    /// Block row positions of the surviving rows, ascending.
+    rows: Vec<usize>,
+}
+
+impl std::fmt::Debug for RowBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RowBlock")
+            .field("record_count", &self.block.record_count())
+            .field("rows", &self.rows.len())
+            .finish()
+    }
+}
+
+impl RowBlock {
+    /// A view of every surviving row, surviving row `i` at index `i`.
+    pub fn view(&self) -> ColumnarBlockView<'_> {
+        ColumnarBlockView::new(&self.stream_dir, &self.field_dir, &self.block, &self.rows)
+    }
+
+    /// A view of the block rows `rows` only, row `rows[i]` at index `i`.
+    /// `rows` holds block row positions, ascending, taken from
+    /// [`Self::rows`]; a position past the block reads as absent in every
+    /// column.
+    pub fn view_over<'a>(&'a self, rows: &'a [usize]) -> ColumnarBlockView<'a> {
+        ColumnarBlockView::new(&self.stream_dir, &self.field_dir, &self.block, rows)
+    }
+
+    /// Block row positions of the surviving rows, ascending.
+    pub fn rows(&self) -> &[usize] {
+        &self.rows
+    }
+
+    /// How many rows survived the exact filter.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether no row survived the exact filter.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The heap bytes the decoded block holds resident, the whole block and
+    /// not only the surviving rows ([`ColumnarBlockView::decoded_bytes`]).
+    pub fn decoded_bytes(&self) -> usize {
+        self.block.decoded_heap_bytes()
+    }
+}
+
+/// Every fault [`rebuild_record_projected`] reports for `row` other than a
+/// corrupt `attrs_raw` cell, as the same error, without building the record.
+fn check_row(
+    stream_dir: &StreamDir,
+    block: &DecodedBlock,
+    row: usize,
+    strict: bool,
+) -> Result<(), LogSegError> {
+    let sref = u32::try_from(i64_at(block, COL_STREAM_REF, row)?)
+        .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+    if stream_dir.entries().get(sref as usize).is_none() {
+        return Err(LogSegError::Corrupted("stream_ref out of range".into()));
+    }
+    for col in [COL_SEVERITY_TEXT, COL_BODY] {
+        if let Some(bytes) = block.str_at(col, row) {
+            std::str::from_utf8(bytes)
+                .map_err(|_| LogSegError::Corrupted("value not utf-8".into()))?;
+        }
+    }
+    for (col, width, what) in [(COL_TRACE_ID, 16, "trace_id width"), (COL_SPAN_ID, 8, "span_id width")] {
+        if let Some(Some(id)) = block.fixed_col(col).and_then(|c| c.get(row))
+            && id.len() != width
+        {
+            return Err(LogSegError::Corrupted(what.into()));
+        }
+    }
+    i64_at(block, COL_TS, row)?;
+    for col in [COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_FLAGS] {
+        i64_projected(block, col, row, strict)?;
+    }
+    Ok(())
 }
 
 /// The survivor-only values build: each `deferred` column held in dictionary
@@ -3793,12 +3922,23 @@ pub fn stream_attr_pairs(blob: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSeg
 pub(crate) fn decode_canonical_attrs(
     bytes: &[u8],
 ) -> Result<Vec<(String, AttrValue)>, LogSegError> {
+    let mut out = Vec::new();
+    decode_canonical_attrs_into(bytes, &mut out)?;
+    Ok(out)
+}
+
+/// [`decode_canonical_attrs`], appending the entries to `out`. On an error
+/// `out` may hold some of the entries.
+pub(crate) fn decode_canonical_attrs_into(
+    bytes: &[u8],
+    out: &mut Vec<(String, AttrValue)>,
+) -> Result<(), LogSegError> {
     let mut pos = 0usize;
-    let out = decode_attr_set(bytes, &mut pos, 0)?;
+    decode_attr_set_into(bytes, &mut pos, 0, out)?;
     if pos != bytes.len() {
         return Err(LogSegError::Corrupted("attrs_raw trailing bytes".into()));
     }
-    Ok(out)
+    Ok(())
 }
 
 /// The `attrs_raw` decoder's map bound: a map entry set nested inside more
@@ -3891,11 +4031,23 @@ fn decode_attr_set(
     pos: &mut usize,
     depth: u32,
 ) -> Result<Vec<(String, AttrValue)>, LogSegError> {
+    let mut out = Vec::new();
+    decode_attr_set_into(bytes, pos, depth, &mut out)?;
+    Ok(out)
+}
+
+/// [`decode_attr_set`], appending the entries to `out`.
+fn decode_attr_set_into(
+    bytes: &[u8],
+    pos: &mut usize,
+    depth: u32,
+    out: &mut Vec<(String, AttrValue)>,
+) -> Result<(), LogSegError> {
     attrs_raw_set_depth(depth)?;
     use crate::varint::get_uvarint;
     let count = get_uvarint(bytes, pos)?;
     attrs_raw_set_count(count)?;
-    let mut out = Vec::with_capacity((count as usize).min(1 << 12));
+    out.reserve((count as usize).min(1 << 12));
     for _ in 0..count {
         let klen = usize::try_from(get_uvarint(bytes, pos)?)
             .map_err(|_| LogSegError::Corrupted("attr key len".into()))?;
@@ -3912,7 +4064,7 @@ fn decode_attr_set(
         let value = decode_attr_value(bytes, pos, depth)?;
         out.push((key, value));
     }
-    Ok(out)
+    Ok(())
 }
 
 /// The nesting level of a map's or list's contents, given `depth`, the number
