@@ -14711,7 +14711,7 @@ mod read_gate_tests {
             .expect("scan")
             .expect("the segment is relevant");
 
-        let other = vec![ErasurePredicate::windowless(vec![(
+        let other = [ErasurePredicate::windowless(vec![(
             "request.id".to_string(),
             "r1".to_string(),
         )])];
