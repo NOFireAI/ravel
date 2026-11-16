@@ -25,8 +25,7 @@ use ravel_catalog::compat::{COMPAT_KEY, CompatError, CompatKeys, read_compat, up
 use ravel_commit::record;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all_reporting};
 
-use crate::compat_certify::{CensusStop, family_signals, scan_shards_for};
-use crate::discover::discover_tenants;
+use crate::compat_certify::{CensusStop, family_signals, list_tenants, scan_shards_for};
 use crate::error::{MaintainError, Result};
 
 /// One record found below the certified version after certification.
@@ -136,8 +135,7 @@ pub async fn late_write_pass(
     let watermark = entry.late_writes_verified_through_unix_ns;
     let threshold_ns = watermark.saturating_sub(clock_skew_allowance_ns);
 
-    let mut tenants = discover_tenants(store).await?;
-    tenants.sort();
+    let tenants = list_tenants(store).await?;
 
     let mut examined = 0usize;
     let mut late_writes = Vec::new();

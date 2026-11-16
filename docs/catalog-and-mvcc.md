@@ -47,7 +47,7 @@ admission/query/<process_id>.snapshot                                   fleet-gl
 sys/maintain/workers/<process_id>                                       maintain-worker liveness heartbeat (root-level, per-process, Overwrite, MACed; ADR-0065 §1, ADR-3130)
 sys/maintain/memo/<process_id>                                          maintain-worker durable memo snapshot for warm start/handoff (root-level, per-process, Overwrite; ADR-0065 §3)
 sys/maintain/claims/compaction/<work_id_hex>                            advisory compaction claim (root-level, per-work-unit, CreateIfAbsent then CAS, additive; ADR-1029 §1)
-sys/maintain/certify/<family>/cursor                                    compat certify census cursor: target version, activated epoch, start time S, pre-census certificate state, per-bucket progress by key (root-level, per-family, CreateIfAbsent then CAS, deleted after the certificate is written; ADR-4233 decision 7)
+sys/maintain/certify/<family>/cursor                                    compat certify census cursor: target version, activated epoch, start time S, pre-census certificate state, per-bucket progress by key, and a finalizing marker set to the certificate's time just before the CAS (root-level, per-family, CreateIfAbsent then CAS; deleted after the floor raises finish, so it outlives a crash between the CAS and the last raise carrying the finalizing marker, and a later run finishes those raises once a late-write pass has advanced the watermark past the certificate time; ADR-4233 decision 7)
 quarantine/<original key>/q<quarantined_at_ns>                          orphan-GC quarantine copy (root-level, immutable, reaped after the second horizon; ADR-0058 §6)
 ```
 
