@@ -16,23 +16,37 @@
 //! - `the_scan_builds_attrs_only_for_the_rows_uid_keeps`: the scan's
 //!   `attrs_rows_built` counter equals the matching rows, and the plan holds
 //!   no `FilterExec`.
+//! - `limit_under_the_row_filter_matches_filter_exec`: `LIMIT k` and
+//!   `ORDER BY ts LIMIT k`, for `SELECT *` and an `attrs` projection.
+//! - `the_row_filter_matches_filter_exec_with_key_index_and_decoded_cache`:
+//!   the KEY_IDX probe and the decoded column cache, each statement run twice.
+//! - `i64_extreme_and_narrow_literals_match_filter_exec`: negative,
+//!   `i64::MIN`, `i64::MAX`, large and `Int32`-fitting values, and literals
+//!   typed narrower than `Int64`.
+//! - `a_resource_sourced_uid_matches_by_a_fixed_answer`: a fixed expected
+//!   answer for rows whose `uid` comes only from the resource.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
 
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use proptest::prelude::*;
 use ravel_catalog::{SegmentRef, Snapshot};
+use ravel_logseg::decoded_cache::DecodedColumnCache;
+use ravel_logseg::key_index::KeyType;
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_query::{LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{
-    CeilingBreach, DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpillDecision,
-    SqlConfig, TenantDelegatingPool, TenantMemoryAccountant, build_session,
+    CeilingBreach, DeclaredColumn, DeclaredType, KeyIndexDeclaration, LogsTableProvider,
+    SessionTable, SpillDecision, SqlConfig, TenantDelegatingPool, TenantMemoryAccountant,
+    build_session,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -132,6 +146,11 @@ fn log_record(ts: i64, stream: StreamUid, row: &Row) -> LogRecord {
 }
 
 async fn write_corpus(corpus: &Corpus) -> (Arc<MemoryStore>, Vec<SegmentRef>) {
+    write_corpus_keyed(corpus, false).await
+}
+
+/// `keyed` writes a KEY_IDX over `uid`.
+async fn write_corpus_keyed(corpus: &Corpus, keyed: bool) -> (Arc<MemoryStore>, Vec<SegmentRef>) {
     let store = Arc::new(MemoryStore::new());
     let cfg = RlogConfig {
         block_target_records: 4,
@@ -159,6 +178,9 @@ async fn write_corpus(corpus: &Corpus) -> (Arc<MemoryStore>, Vec<SegmentRef>) {
                 writer_seq: o as u64 + 1,
             },
         );
+        if keyed {
+            w = w.with_key_index_fields(vec![("uid".to_string(), KeyType::I64)]);
+        }
         for r in &records {
             w.push(r.clone()).expect("push");
         }
@@ -174,6 +196,19 @@ fn session(
     erasure: bool,
     row_filter: bool,
 ) -> SessionContext {
+    session_with(store, segments, erasure, row_filter, false, None)
+}
+
+/// `key_index` declares `uid`'s KEY_IDX to the provider; `cache` gives the
+/// fetcher a decoded column cache.
+fn session_with(
+    store: &Arc<MemoryStore>,
+    segments: Vec<SegmentRef>,
+    erasure: bool,
+    row_filter: bool,
+    key_index: bool,
+    cache: Option<Arc<DecodedColumnCache>>,
+) -> SessionContext {
     let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(store) as Arc<dyn ObjectStoreBackend>;
     let pending_erasure = if erasure {
         vec![ravel_proto::commit::v1::ErasureRequest {
@@ -186,6 +221,14 @@ fn session(
     } else {
         Vec::new()
     };
+    let mut fetcher = LogSegmentFetcher::new(backend);
+    if key_index {
+        // The KEY_IDX probe reads only objects above the block-range threshold.
+        fetcher = fetcher.with_block_range_threshold(0);
+    }
+    if let Some(cache) = cache {
+        fetcher = fetcher.with_decoded_cache(cache);
+    }
     let provider = LogsTableProvider::new(
         Snapshot {
             segments,
@@ -193,11 +236,19 @@ fn session(
             pending_erasure,
         },
         TENANT,
-        LogSegmentFetcher::new(backend),
+        fetcher,
         PhaseAccounting::new(),
     )
     .with_declared_columns(declared())
     .with_row_filter_pushdown(row_filter);
+    let provider = if key_index {
+        provider.with_key_index(KeyIndexDeclaration {
+            columns: vec!["uid".to_string()],
+            trace_id: false,
+        })
+    } else {
+        provider
+    };
     let pool = Arc::new(TenantDelegatingPool::new(
         1 << 30,
         TenantMemoryAccountant::new(1 << 30),
@@ -386,4 +437,297 @@ async fn the_scan_builds_attrs_only_for_the_rows_uid_keeps() {
         ROWS - MATCHING
     );
     assert_eq!(scan_metric(&reference_plan, "attrs_rows_built"), ROWS);
+}
+
+/// Each row of `batches` as one line of its cells' display text.
+fn row_texts(batches: &[RecordBatch]) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            (0..b.num_rows()).map(move |r| {
+                b.columns()
+                    .iter()
+                    .map(|c| array_value_to_string(c, r).expect("display"))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            })
+        })
+        .collect()
+}
+
+/// Two objects: the first is `counter_fixture`'s 12 rows, 6 of which match
+/// `uid = 7`; the second's 8 rows hold `uid` 0 or 201 to 207 on a stream with
+/// no `uid`, so each of its blocks spans 7 and holds no 7. `max_dynamic_columns`
+/// 0 puts every attribute in `attrs_raw`.
+fn two_object_corpus(max_dynamic_columns: usize) -> Corpus {
+    let first = (0..ROWS)
+        .map(|i| Row {
+            stream: 0,
+            uid: match i % 4 {
+                0 => RecordUid::None,
+                1 => RecordUid::I64(7),
+                2 => RecordUid::WrongVariant(7),
+                _ => RecordUid::I64(100 + i as i64),
+            },
+            erased: false,
+        })
+        .collect();
+    let second = (0..8)
+        .map(|i| Row {
+            stream: 1,
+            uid: RecordUid::I64(if i % 2 == 0 { 0 } else { 200 + i }),
+            erased: false,
+        })
+        .collect();
+    Corpus {
+        streams: vec![StreamUid::Resource(7), StreamUid::None],
+        objects: vec![first, second],
+        erasure: false,
+        max_dynamic_columns,
+        value: 7,
+    }
+}
+
+/// `LIMIT k` and `ORDER BY ts LIMIT k` under the row filter, for `SELECT *`
+/// and for a projection that reads `attrs`, on the columnar and the
+/// `attrs_raw` row path. With an order the rows equal the reference's; without
+/// one the scan may return any k matching rows, so the test asserts the count
+/// and that every row is one of the reference's matching rows.
+///
+/// Flipped: counting the limit before the row filter returns fewer than k
+/// rows, or a non-matching row, and fails the count or the membership check.
+#[tokio::test]
+async fn limit_under_the_row_filter_matches_filter_exec() {
+    for max_dynamic_columns in [8, 0] {
+        let (store, segments) = write_corpus(&two_object_corpus(max_dynamic_columns)).await;
+        let on = session(&store, segments.clone(), false, true);
+        let off = session(&store, segments, false, false);
+        for select in ["*", "ts, uid, attrs, attrs['n'] AS n"] {
+            let (_, all) = run(
+                &off,
+                &format!("SELECT {select} FROM logs WHERE uid = 7 ORDER BY ts"),
+            )
+            .await;
+            let all = row_texts(&all);
+            assert_eq!(all.len(), MATCHING);
+            for k in [1, 4, MATCHING, MATCHING + 3] {
+                let ordered =
+                    format!("SELECT {select} FROM logs WHERE uid = 7 ORDER BY ts LIMIT {k}");
+                let (_, want) = run(&off, &ordered).await;
+                let (plan, got) = run(&on, &ordered).await;
+                assert_eq!(
+                    pretty(&got),
+                    pretty(&want),
+                    "{ordered} ({max_dynamic_columns})"
+                );
+                assert!(
+                    nodes(&plan, "FilterExec").is_empty(),
+                    "{ordered}: no FilterExec"
+                );
+
+                let limited = format!("SELECT {select} FROM logs WHERE uid = 7 LIMIT {k}");
+                let (plan, got) = run(&on, &limited).await;
+                let got = row_texts(&got);
+                assert_eq!(
+                    got.len(),
+                    k.min(MATCHING),
+                    "{limited} ({max_dynamic_columns})"
+                );
+                for row in &got {
+                    assert!(all.contains(row), "{limited}: {row} is a matching row");
+                }
+                let mut distinct = got.clone();
+                distinct.sort();
+                distinct.dedup();
+                assert_eq!(distinct.len(), got.len(), "{limited}: no row twice");
+                assert!(
+                    nodes(&plan, "FilterExec").is_empty(),
+                    "{limited}: no FilterExec"
+                );
+            }
+        }
+    }
+}
+
+/// The row filter beside the KEY_IDX probe and the fetcher's decoded column
+/// cache: each statement runs twice on one provider holding both, and both runs
+/// equal the reference, a provider with neither and the row filter off. The
+/// probe prunes the second object and the second run is served from
+/// the cache.
+///
+/// Flipped: a cached column served for the wrong block, or a pruned block's
+/// rows kept, changes the rows and fails the comparison.
+#[tokio::test]
+async fn the_row_filter_matches_filter_exec_with_key_index_and_decoded_cache() {
+    for max_dynamic_columns in [8, 0] {
+        let (store, segments) =
+            write_corpus_keyed(&two_object_corpus(max_dynamic_columns), true).await;
+        let cache = Arc::new(DecodedColumnCache::new(1 << 30, None));
+        let on = session_with(
+            &store,
+            segments.clone(),
+            false,
+            true,
+            true,
+            Some(Arc::clone(&cache)),
+        );
+        let off = session(&store, segments, false, false);
+        let mut pruned = 0;
+        for sql in [
+            "SELECT ts, uid FROM logs WHERE uid = 7 ORDER BY ts",
+            "SELECT ts, uid, region FROM logs WHERE uid = 7 ORDER BY ts",
+            "SELECT * FROM logs WHERE uid = 7 ORDER BY ts",
+            "SELECT count(*) AS c FROM logs WHERE uid = 7",
+        ] {
+            let (_, want) = run(&off, sql).await;
+            for pass in ["first", "second"] {
+                let (plan, got) = run(&on, sql).await;
+                assert_eq!(
+                    pretty(&got),
+                    pretty(&want),
+                    "{sql}, {pass} run ({max_dynamic_columns})"
+                );
+                assert!(
+                    nodes(&plan, "FilterExec").is_empty(),
+                    "{sql}: no FilterExec"
+                );
+                pruned += scan_metric(&plan, "segments_pruned_by_key_index")
+                    + scan_metric(&plan, "blocks_pruned_by_key_index");
+            }
+        }
+        assert!(
+            pruned > 0,
+            "the KEY_IDX probe pruned blocks ({max_dynamic_columns})"
+        );
+        if max_dynamic_columns > 0 {
+            assert!(
+                cache.process_counters().hits > 0,
+                "the second runs read the decoded cache"
+            );
+        }
+    }
+}
+
+/// `uid` literals across the I64 range, each against the reference. The
+/// stream's resource holds `i64::MAX` and a scope holds -3, so both reach rows
+/// through stream attributes as well as record cells.
+///
+/// Flipped: a literal narrowed or widened on the way into the scan's filter
+/// (an `i64::MIN` or `i64::MAX` that wraps, an `Int32` literal compared by
+/// its own width) keeps or drops rows the `FilterExec` does not.
+#[tokio::test]
+async fn i64_extreme_and_narrow_literals_match_filter_exec() {
+    let values = [-3, i64::MIN, i64::MAX, 1 << 40, 5, 0];
+    for max_dynamic_columns in [8, 0] {
+        let objects = vec![
+            (0..18)
+                .map(|i| Row {
+                    stream: i % 3,
+                    uid: match i % 4 {
+                        0 => RecordUid::None,
+                        3 => RecordUid::WrongVariant(5),
+                        _ => RecordUid::I64(values[i % values.len()]),
+                    },
+                    erased: false,
+                })
+                .collect(),
+        ];
+        let corpus = Corpus {
+            streams: vec![
+                StreamUid::Resource(i64::MAX),
+                StreamUid::Scope(-3),
+                StreamUid::None,
+            ],
+            objects,
+            erasure: false,
+            max_dynamic_columns,
+            value: 0,
+        };
+        let (store, segments) = write_corpus(&corpus).await;
+        let on = session(&store, segments.clone(), false, true);
+        let off = session(&store, segments, false, false);
+        let mut literals: Vec<String> = values
+            .iter()
+            .filter(|v| **v != i64::MIN)
+            .map(|v| v.to_string())
+            .collect();
+        literals.push(i64::MIN.to_string());
+        literals.push(format!("({} - 1)", i64::MIN + 1));
+        literals.push("CAST(5 AS INT)".to_string());
+        literals.push("arrow_cast(-3, 'Int16')".to_string());
+        for literal in literals {
+            for select in ["ts, uid", "ts, uid, attrs"] {
+                let sql = format!("SELECT {select} FROM logs WHERE uid = {literal} ORDER BY ts");
+                let (_, want) = run(&off, &sql).await;
+                let (plan, got) = run(&on, &sql).await;
+                assert_eq!(pretty(&got), pretty(&want), "{sql} ({max_dynamic_columns})");
+                assert!(
+                    nodes(&plan, "FilterExec").is_empty(),
+                    "{sql}: no FilterExec"
+                );
+            }
+        }
+    }
+}
+
+/// A fixed answer, not a comparison: on a block whose `uid` comes only from
+/// its stream's resource (`uid = 7`), the rows on that stream match and the
+/// rows on a stream without `uid` do not, on the columnar path, the row path
+/// (`attrs` projected) and the `attrs_raw` row path.
+///
+/// Flipped: a first pass that resolves the record cells and not the stream
+/// entries drops ts 2, 4 and 6 and fails "the resource-sourced rows".
+#[tokio::test]
+async fn a_resource_sourced_uid_matches_by_a_fixed_answer() {
+    for max_dynamic_columns in [8, 0] {
+        let corpus = Corpus {
+            streams: vec![StreamUid::Resource(7), StreamUid::None],
+            objects: vec![
+                (0..6)
+                    .map(|i| Row {
+                        stream: i % 2,
+                        uid: RecordUid::None,
+                        erased: false,
+                    })
+                    .collect(),
+            ],
+            erasure: false,
+            max_dynamic_columns,
+            value: 7,
+        };
+        let (store, segments) = write_corpus(&corpus).await;
+        let on = session(&store, segments, false, true);
+        for select in ["ts, uid", "ts, uid, attrs"] {
+            let sql = format!("SELECT {select} FROM logs WHERE uid = 7 ORDER BY ts");
+            let (plan, got) = run(&on, &sql).await;
+            let ts: Vec<String> = got
+                .iter()
+                .flat_map(|b| {
+                    let c = b.column(b.schema().index_of("ts").expect("ts"));
+                    (0..b.num_rows()).map(move |r| array_value_to_string(c, r).expect("ts"))
+                })
+                .collect();
+            let uid: Vec<String> = got
+                .iter()
+                .flat_map(|b| {
+                    let c = b.column(b.schema().index_of("uid").expect("uid"));
+                    (0..b.num_rows()).map(move |r| array_value_to_string(c, r).expect("uid"))
+                })
+                .collect();
+            assert_eq!(
+                ts,
+                [
+                    "1970-01-01T00:00:00.000000002",
+                    "1970-01-01T00:00:00.000000004",
+                    "1970-01-01T00:00:00.000000006"
+                ],
+                "the resource-sourced rows: {sql} ({max_dynamic_columns})"
+            );
+            assert_eq!(uid, ["7", "7", "7"], "{sql}");
+            assert!(
+                nodes(&plan, "FilterExec").is_empty(),
+                "{sql}: no FilterExec"
+            );
+        }
+    }
 }

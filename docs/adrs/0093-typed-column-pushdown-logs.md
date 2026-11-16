@@ -948,6 +948,8 @@ class. A ratio from 2 to 3 is neither inside the band nor a miss; it is recorded
 | Q48 rows returned | 4 | any other count | measured 4 before the change, #4232 comment 6920855702 |
 | `FilterExec` in Q48's and Q47's plans | absent | present | predicted |
 | Q48 `attrs_rows_built` summed over the scan | equal to Q48's rows returned | any other value | predicted |
+| Q48 `attrs_rows_merged` summed over the scan | equal to Q48's rows returned | any other value | predicted; item 3, the first pass resolves the filter key's cells without a merge (`row_filter_first_pass_merges_no_row`) |
+| Hot wall ratio of the Str `<>` statements the 2026-11-05 amendment banded (q11-q15, q22, q23, q25-q29, q31, q32), this change against its parent | 0.98 to 1.02, unchanged against their existing bands | outside 0.98 to 1.02 | predicted; item 3: a row-path chunk with a row filter merges each kept row once and no dropped row (`row_filter_first_pass_merges_no_row`, and `first_merged <= then_merged` in the filter-first proptest), so its per-row merge work stays at most N; a chunk with a pending erasure or an `attrs` read builds whole as before; width from docs/adrs/3326-decoded-column-block-cache.md:800 |
 
 ### Not established
 
