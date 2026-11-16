@@ -19,8 +19,11 @@ name: antithesis-weekly
 #                                    commit statuses read/write. Antithesis
 #                                    posts the result after this job has ended,
 #                                    when GITHUB_TOKEN has already expired.
+#   secrets.ANTITHESIS_REGISTRY_KEY  the tenant registry's service-account key
+#                                    (the JSON key file Antithesis issues), for
+#                                    `docker login -u _json_key`.
 #   vars.ANTITHESIS_TENANT           taffy-sheep
-#   vars.ANTITHESIS_REPOSITORY       registry.taffy-sheep.antithesis.com
+#   vars.ANTITHESIS_REPOSITORY       us-central1-docker.pkg.dev/molten-verve-216720/taffy-psheep-repository
 on:
   schedule:
     # Tuesday 03:07 UTC. Off the :00/:30 mark and distinct from every other
@@ -45,26 +48,16 @@ env:
   ISSUE_LABEL: antithesis-weekly
 
 jobs:
-  launch:
+  # Its own job so a refused manual input fails here, leaves `launch` skipped,
+  # and files no tracking issue (the report job only fires on a launch failure).
+  hours:
     runs-on: ubuntu-latest
-    # The instrumented ravel-server build dominates; the launch returns as soon
-    # as the run is accepted, so the run's own hours are not spent here.
-    timeout-minutes: 180
-    # One launch at a time: a manual dispatch while the scheduled job is still
-    # building waits instead of launching a second run.
-    concurrency:
-      group: antithesis-weekly-launch
-      cancel-in-progress: false
+    timeout-minutes: 5
     env:
       MAX_COMPUTE_HOURS: '240'
-      WORKLOAD: antithesis/ingest-durability
+    outputs:
+      value: ${{ steps.hours.outputs.value }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-
-      - uses: ./.github/actions/free-disk-space
-
       - name: Resolve compute hours
         id: hours
         env:
@@ -82,6 +75,26 @@ jobs:
             exit 1
           fi
           echo "value=$REQUESTED" >> "$GITHUB_OUTPUT"
+
+  launch:
+    needs: hours
+    runs-on: ubuntu-latest
+    # The instrumented ravel-server build dominates; the launch returns as soon
+    # as the run is accepted, so the run's own hours are not spent here.
+    timeout-minutes: 180
+    # One launch at a time: a manual dispatch while the scheduled job is still
+    # building waits instead of launching a second run.
+    concurrency:
+      group: antithesis-weekly-launch
+      cancel-in-progress: false
+    env:
+      WORKLOAD: antithesis/ingest-durability
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/free-disk-space
 
       - name: Check the workload is present
         run: |
@@ -128,13 +141,25 @@ jobs:
             fi
           done < services.txt
 
+      # The tenant registry is an Artifact Registry repository; snouty pushes
+      # the workload images and the config image there with this login.
+      - name: Log in to the tenant registry
+        env:
+          REGISTRY_KEY: ${{ secrets.ANTITHESIS_REGISTRY_KEY }}
+          ANTITHESIS_REPOSITORY: ${{ vars.ANTITHESIS_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          [ -n "$REGISTRY_KEY" ] || { echo "secrets.ANTITHESIS_REGISTRY_KEY is not set" >&2; exit 1; }
+          host="${ANTITHESIS_REPOSITORY%%/*}"
+          printf '%s' "$REGISTRY_KEY" | docker login -u _json_key --password-stdin "https://$host"
+
       - name: Launch
         env:
           ANTITHESIS_API_KEY: ${{ secrets.ANTITHESIS_API_KEY }}
           ANTITHESIS_GITHUB_TOKEN: ${{ secrets.ANTITHESIS_GITHUB_TOKEN }}
           ANTITHESIS_TENANT: ${{ vars.ANTITHESIS_TENANT }}
           ANTITHESIS_REPOSITORY: ${{ vars.ANTITHESIS_REPOSITORY }}
-          HOURS: ${{ steps.hours.outputs.value }}
+          HOURS: ${{ needs.hours.outputs.value }}
         run: |
           "$WORKLOAD/scripts/launch.sh" "$HOURS" "weekly ingest durability, ${GITHUB_SHA::12}"
 
