@@ -411,7 +411,7 @@ use ravel_query::key_index_route::{
 };
 use ravel_query::{
     CarriedWholeObject, ColumnarBlockOutcome, KeyEquals, KeyIn, KeyIndexPruning, LogFetchError,
-    LogLeafRangeReader, LogQuery, LogSegmentFetcher, LogSegmentScan, PhaseAccounting,
+    LogLeafRangeReader, LogQuery, LogSegmentFetcher, LogSegmentScan, PhaseAccounting, ProbePhase,
     RowBlockOutcome, log_key_in_set, log_key_set,
 };
 use ravel_types::TenantHash;
@@ -3032,7 +3032,7 @@ impl LogsScanExec {
             attr_keys: Arc::clone(&self.attr_keys),
             full_len: self.full_schema.fields().len(),
             schema: Arc::clone(&self.schema),
-            accounting: self.phase_accounting.scan().clone(),
+            accounting: self.phase_accounting.fetch().clone(),
             budget: self.budget.clone(),
             concurrency: self.target_partitions,
         }
@@ -3178,6 +3178,7 @@ impl RowFetchSource {
                 &positions,
                 None,
                 None,
+                ProbePhase::Fetch,
                 &self.accounting,
             )
             .await

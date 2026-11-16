@@ -429,12 +429,15 @@ mod tests {
 
         let stats = &json["data"]["stats"];
         let phases = stats["phases"].as_array().expect("phases array present");
-        assert_eq!(phases.len(), 5, "five phases, body: {json}");
+        assert_eq!(phases.len(), 6, "six phases, body: {json}");
         let names: Vec<&str> = phases
             .iter()
             .map(|p| p["phase"].as_str().expect("phase name"))
             .collect();
-        assert_eq!(names, vec!["resolve", "plan", "probe", "scan", "keyIndex"]);
+        assert_eq!(
+            names,
+            vec!["resolve", "plan", "probe", "scan", "keyIndex", "fetch"]
+        );
 
         // Every phase's every figure, at the exact value this fixture produces.
         // What the split buys is visible in these rows and in no pooled total:
@@ -498,6 +501,9 @@ mod tests {
                 opened: 0,
                 matched: 0,
             },
+            // `keyIndex` and `fetch` are both all zeros on this metrics range
+            // query; `zip` stops at this array's length, and the names check
+            // above already pins their presence and order.
         ];
         for (row, expect) in phases.iter().zip(want) {
             let name = expect.phase;
@@ -579,6 +585,7 @@ mod tests {
                 ("probe", 0, 0),
                 ("scan", 0, 0),
                 ("keyIndex", 0, 0),
+                ("fetch", 0, 0),
             ],
             "body: {json}"
         );

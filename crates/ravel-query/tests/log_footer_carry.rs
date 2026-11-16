@@ -33,7 +33,7 @@ use ravel_object_store::{
     Capabilities, DelimitedList, Etag, GetOutcome, GetRange, ListPage, ObjectMeta,
     ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{BlockRangeFetcher, LogQuery, LogSegmentFetcher};
+use ravel_query::{BlockRangeFetcher, LogQuery, LogSegmentFetcher, ProbePhase};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 use uuid::Uuid;
@@ -322,6 +322,7 @@ async fn footer_carried_subset_open_skips_the_probe() {
             &indices,
             Some(&footer),
             None,
+            ProbePhase::Scan,
             &acc,
         )
         .await
@@ -356,6 +357,7 @@ async fn footer_carried_subset_open_skips_the_probe() {
             &indices,
             None,
             None,
+            ProbePhase::Scan,
             &acc2,
         )
         .await
@@ -420,6 +422,7 @@ async fn footer_carried_open_still_catches_an_etag_change() {
             &indices,
             Some(&footer),
             None,
+            ProbePhase::Scan,
             &QueryAccounting::new(),
         )
         .await;
@@ -484,6 +487,7 @@ async fn a_carried_whole_object_is_refused_for_another_segment_or_tenant() {
             &[0],
             None,
             Some(carry.clone()),
+            ProbePhase::Scan,
             &acc,
         )
         .await;
@@ -522,6 +526,7 @@ async fn a_carried_whole_object_is_refused_for_another_segment_or_tenant() {
             &[0],
             None,
             Some(carry.clone()),
+            ProbePhase::Scan,
             &acc,
         )
         .await;
@@ -547,6 +552,7 @@ async fn a_carried_whole_object_is_refused_for_another_segment_or_tenant() {
             &[0],
             None,
             Some(carry),
+            ProbePhase::Scan,
             &acc,
         )
         .await
@@ -573,6 +579,7 @@ async fn a_carried_whole_object_is_refused_for_another_segment_or_tenant() {
             &[0],
             None,
             None,
+            ProbePhase::Scan,
             &acc,
         )
         .await

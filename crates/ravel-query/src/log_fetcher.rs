@@ -3308,6 +3308,11 @@ impl LogSegmentFetcher {
     /// `accounting` handling as
     /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant)'s doc
     /// comment.
+    ///
+    /// `phase` is which of the caller's phases this read charges its probe,
+    /// metadata and BLOCKS GETs to (issue #797): [`ProbePhase::Scan`] for a
+    /// phase-1 striped scan, [`ProbePhase::Fetch`] for TopK late
+    /// materialization's phase-2 row fetch of the winners.
     #[allow(clippy::too_many_arguments)]
     pub async fn scan_accounted_with_tenant_subset(
         &self,
@@ -3318,6 +3323,7 @@ impl LogSegmentFetcher {
         indices: &[usize],
         footer: Option<&footer::LogFooter>,
         carried_whole: Option<CarriedWholeObject>,
+        phase: ProbePhase,
         accounting: &QueryAccounting,
     ) -> Result<Option<LogSegmentScan>, LogFetchError> {
         let result = self
@@ -3334,10 +3340,11 @@ impl LogSegmentFetcher {
                 footer,
                 carried_whole,
                 None,
+                phase,
                 accounting,
             )
             .await;
-        self.settle_version_refusal(seg_ref, ReadPhases::SCAN.metadata, accounting, result)
+        self.settle_version_refusal(seg_ref, phase.read_phases().metadata, accounting, result)
             .await
     }
 
@@ -3391,6 +3398,7 @@ impl LogSegmentFetcher {
                 footer,
                 carried_whole,
                 dirs,
+                ProbePhase::Scan,
                 accounting,
             )
             .await;
@@ -3411,6 +3419,7 @@ impl LogSegmentFetcher {
         footer: Option<&footer::LogFooter>,
         carried_whole: Option<CarriedWholeObject>,
         dirs: Option<&Arc<SegmentDirectories>>,
+        phase: ProbePhase,
         accounting: &QueryAccounting,
     ) -> Result<Option<LogSegmentScan>, LogFetchError> {
         // `indices` is only raw whole-object block indices when `raw` holds
@@ -3445,7 +3454,7 @@ impl LogSegmentFetcher {
                 owned_blocks,
                 ordinal_blocks,
                 None,
-                ProbePhase::Scan,
+                phase,
                 accounting,
             )
             .await?
@@ -4701,12 +4710,12 @@ pub struct BlockRangeStats {
 
 /// The query phase a tail-section probe miss is charged to (#883).
 ///
-/// Only two of [`QueryPhase`]'s four can issue a suffix probe: `Resolve` reads
-/// commit records and `Probe` is the RSEG segment-catalog fetch, neither of
-/// which touches an RLOG object's tail. Naming the two that can, rather than
-/// taking a `QueryPhase` with two impossible arms, keeps the charge total: every
-/// value here maps to a real phase, so a miss can never be recorded against a
-/// phase that issued no request.
+/// Only three of [`QueryPhase`]'s phases can issue a suffix probe here:
+/// `Resolve` reads commit records and `Probe` is the RSEG segment-catalog
+/// fetch, neither of which touches an RLOG object's tail. Naming the ones that
+/// can, rather than taking a `QueryPhase` with impossible arms, keeps the charge
+/// total: every value here maps to a real phase, so a miss can never be recorded
+/// against a phase that issued no request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProbePhase {
     /// A probe issued to build a fetch plan: [`LogSegmentFetcher::plan_segment`]
@@ -4717,6 +4726,11 @@ pub enum ProbePhase {
     /// [`LogSegmentFetcher::fetch_accounted_with_tenant`] and
     /// [`LogSegmentFetcher::scan_accounted_with_tenant`].
     Scan,
+    /// A probe issued by TopK late materialization's phase-2 row fetch of the
+    /// winners (ADR-0774, issue #797), a data read like [`Self::Scan`] but
+    /// charged to [`QueryPhase::Fetch`] so phase 2's cost is reported apart
+    /// from phase 1's ordinary scan.
+    Fetch,
 }
 
 impl ProbePhase {
@@ -4727,6 +4741,7 @@ impl ProbePhase {
         match self {
             ProbePhase::Plan => QueryPhase::Plan,
             ProbePhase::Scan => QueryPhase::Scan,
+            ProbePhase::Fetch => QueryPhase::Fetch,
         }
     }
 
@@ -4737,6 +4752,7 @@ impl ProbePhase {
         match self {
             ProbePhase::Plan => ReadPhases::PLAN,
             ProbePhase::Scan => ReadPhases::SCAN,
+            ProbePhase::Fetch => ReadPhases::FETCH,
         }
     }
 
@@ -4791,6 +4807,18 @@ impl ReadPhases {
         metadata: QueryPhase::Plan,
         blocks: QueryPhase::Plan,
     };
+
+    /// TopK late materialization's phase-2 row fetch (ADR-0774, issue #797), a
+    /// data read whose every GET -- its metadata probes and its BLOCKS-section
+    /// pages alike -- is charged to [`QueryPhase::Fetch`], so phase 2's cost is
+    /// reported apart from phase 1's ordinary scan. Both halves land on the
+    /// same phase (unlike [`Self::SCAN`], which splits metadata to `Probe`):
+    /// the fetch figure is the whole cost of materializing the winners, probes
+    /// included.
+    pub const FETCH: ReadPhases = ReadPhases {
+        metadata: QueryPhase::Fetch,
+        blocks: QueryPhase::Fetch,
+    };
 }
 
 /// Per-phase tail-section probe misses ([`BlockRangeStats::probe_misses`])
@@ -4816,6 +4844,7 @@ pub struct ProbeMissCounter(Arc<ProbeMissInner>);
 struct ProbeMissInner {
     plan: AtomicU64,
     scan: AtomicU64,
+    fetch: AtomicU64,
 }
 
 impl ProbeMissCounter {
@@ -4833,6 +4862,7 @@ impl ProbeMissCounter {
         let cell = match phase {
             ProbePhase::Plan => &self.0.plan,
             ProbePhase::Scan => &self.0.scan,
+            ProbePhase::Fetch => &self.0.fetch,
         };
         cell.fetch_add(n, Ordering::Relaxed);
     }
@@ -4843,6 +4873,7 @@ impl ProbeMissCounter {
         ProbeMissCounts {
             plan: self.0.plan.load(Ordering::Relaxed),
             scan: self.0.scan.load(Ordering::Relaxed),
+            fetch: self.0.fetch.load(Ordering::Relaxed),
         }
     }
 }
@@ -4854,6 +4885,8 @@ pub struct ProbeMissCounts {
     pub plan: u64,
     /// Misses charged to [`ProbePhase::Scan`].
     pub scan: u64,
+    /// Misses charged to [`ProbePhase::Fetch`] (issue #797).
+    pub fetch: u64,
 }
 
 impl ProbeMissCounts {
@@ -4866,13 +4899,16 @@ impl ProbeMissCounts {
         ProbeMissCounts {
             plan: self.plan.saturating_sub(earlier.plan),
             scan: self.scan.saturating_sub(earlier.scan),
+            fetch: self.fetch.saturating_sub(earlier.fetch),
         }
     }
 
-    /// Misses across both phases.
+    /// Misses across every phase.
     #[must_use]
     pub fn total(&self) -> u64 {
-        self.plan.saturating_add(self.scan)
+        self.plan
+            .saturating_add(self.scan)
+            .saturating_add(self.fetch)
     }
 
     /// One phase's total, named through [`ProbePhase`] rather than by field.
@@ -4881,6 +4917,7 @@ impl ProbeMissCounts {
         match phase {
             ProbePhase::Plan => self.plan,
             ProbePhase::Scan => self.scan,
+            ProbePhase::Fetch => self.fetch,
         }
     }
 }
@@ -12339,6 +12376,7 @@ mod plan_skip_decidable_span_tests {
                     &indices,
                     footer.as_ref(),
                     None,
+                    ProbePhase::Scan,
                     &acc,
                 )
                 .await
@@ -17721,10 +17759,20 @@ mod version_refusal_tests {
                     .expect_err("fetch_stream_dir refuses"),
             );
             out.push(
-                f.scan_accounted_with_tenant_subset(seg, TENANT, &q, &all, &[0], None, None, &acc)
-                    .await
-                    .err()
-                    .expect("scan_accounted_with_tenant_subset refuses"),
+                f.scan_accounted_with_tenant_subset(
+                    seg,
+                    TENANT,
+                    &q,
+                    &all,
+                    &[0],
+                    None,
+                    None,
+                    ProbePhase::Scan,
+                    &acc,
+                )
+                .await
+                .err()
+                .expect("scan_accounted_with_tenant_subset refuses"),
             );
             out.push(
                 f.scan_accounted_with_tenant_subset_raw(

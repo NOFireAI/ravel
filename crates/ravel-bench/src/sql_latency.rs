@@ -680,9 +680,15 @@ pub struct RunAccounting {
     /// Tail sections this run's SCAN-phase probes failed to reach, charged to
     /// `ravel_query::ProbePhase::Scan`: the block/page/chunk data reads. Same
     /// units and same window-not-cache semantics as [`Self::probe_misses_plan`];
-    /// the run's total is the two summed.
+    /// the run's total is the three `probe_misses_*` fields summed.
     #[serde(default)]
     pub probe_misses_scan: u64,
+    /// Tail sections TopK late materialization's phase-2 row fetch failed to
+    /// reach, charged to `ravel_query::ProbePhase::Fetch` (issue #797). Same
+    /// units and semantics as [`Self::probe_misses_plan`]; 0 on a statement
+    /// that runs no late materialization.
+    #[serde(default)]
+    pub probe_misses_fetch: u64,
     /// WIRE bytes this run transferred, split by the query phase that issued
     /// the request, one entry per `ravel_query::QueryPhase` and no phase twice
     /// (issue #913). Read off `LogSegmentFetcher`'s per-phase counter, so a
@@ -2126,6 +2132,7 @@ pub async fn measure_corpus(
                 cache_bytes: acc.cache_bytes,
                 probe_misses_plan: run_probe_misses.plan,
                 probe_misses_scan: run_probe_misses.scan,
+                probe_misses_fetch: run_probe_misses.fetch,
                 wire_bytes_by_phase: phase_wire_bytes(&run_wire),
                 wire_bytes_unattributed: acc.total_s3_bytes().saturating_sub(run_wire.total()),
                 get_requests_unattributed: Some(
@@ -5270,6 +5277,10 @@ mod tests {
         assert_eq!(per_run[0]["probe_misses_scan"], scan_misses);
         assert_eq!(per_run[1]["probe_misses_plan"], plan_misses);
         assert_eq!(per_run[1]["probe_misses_scan"], scan_misses);
+        // No late materialization on this statement: the fetch phase probed
+        // nothing (issue #797).
+        assert_eq!(per_run[0]["probe_misses_fetch"], 0);
+        assert_eq!(per_run[1]["probe_misses_fetch"], 0);
     }
 
     /// A trailer that FITS inside the derived probe reports exactly zero, on
@@ -6181,6 +6192,7 @@ mod tests {
             cache_bytes: 0,
             probe_misses_plan: 0,
             probe_misses_scan: 0,
+            probe_misses_fetch: 0,
             wire_bytes_by_phase: QueryPhase::ALL
                 .iter()
                 .map(|p| PhaseWireBytes {

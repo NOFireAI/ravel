@@ -489,9 +489,12 @@ async fn generated_lane_reports_get_latency_per_phase_per_bucket() {
     for entry in json["entries"].as_array().expect("entries") {
         for run in entry["per_run_accounting"].as_array().expect("runs") {
             for phase in run["wire_bytes_by_phase"].as_array().into_iter().flatten() {
-                // KEY_IDX reads are timed under the probe GET phase.
+                // KEY_IDX reads are timed under the probe GET phase; late
+                // materialization's phase-2 fetch is a data read, timed under
+                // scan (issue #797).
                 let timed_as = match phase["phase"].as_str().expect("phase name") {
                     "keyIndex" => "probe",
+                    "fetch" => "scan",
                     other => other,
                 };
                 let at = names

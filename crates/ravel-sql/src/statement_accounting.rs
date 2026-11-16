@@ -215,6 +215,7 @@ pub(crate) fn add_phases(
         probe: a.probe.saturating_add(&b.probe),
         scan: a.scan.saturating_add(&b.scan),
         key_index: a.key_index.saturating_add(&b.key_index),
+        fetch: a.fetch.saturating_add(&b.fetch),
     }
 }
 
@@ -320,6 +321,7 @@ mod tests {
                 handle.probe(),
                 handle.scan(),
                 handle.key_index(),
+                handle.fetch(),
             ] {
                 assert_eq!(phase.access_intent(), AccessIntent::BulkScan);
             }

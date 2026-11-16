@@ -1425,6 +1425,27 @@ struct RangedRun {
 }
 
 async fn run_ranged(rule: bool) -> RangedRun {
+    run_ranged_gap(rule, Some(0), false).await
+}
+
+/// [`run_ranged`], with the block-range fetcher's coalescing gap chosen by the
+/// caller: `Some(0)` fetches each winner-page run as its own GET (every GET is
+/// one the read asked for, no coalesced holes); `None` leaves the production
+/// default ([`BlockRangeFetcher`]'s request-cost gap), under which the winners'
+/// non-adjacent pages coalesce and the fetch carries the holes between them.
+///
+/// `disable_crossover` turns off the coverage crossover
+/// ([`BlockRangeFetcher::with_coverage_threshold`] raised past 1) so the ranged
+/// path is taken even when the winners' coalesced span covers most of this tiny
+/// fixture's object. It stands in for a production object large enough that
+/// sparse winners never cross the whole-object threshold, which is the state
+/// issue #797 measures; without it the production gap would read the whole
+/// object and no coalesced range would exist to inspect.
+async fn run_ranged_gap(
+    rule: bool,
+    coalesce_gap: Option<u64>,
+    disable_crossover: bool,
+) -> RangedRun {
     let base = Arc::new(MemoryStore::new());
     let (snapshot, object) = ranged_snapshot(base.as_ref()).await;
     let recording = Arc::new(RecordingStore {
@@ -1435,12 +1456,18 @@ async fn run_ranged(rule: bool) -> RangedRun {
     // The probe reaches back to the end of BLOCKS and no further, so it holds
     // every directory section and no page.
     let (_, blocks_end) = blocks_extent(&object);
+    let mut block_range =
+        BlockRangeFetcher::new(store.clone()).with_suffix_len(object.len() as u64 - blocks_end);
+    if let Some(gap) = coalesce_gap {
+        block_range = block_range.with_coalesce_gap(gap);
+    }
+    if disable_crossover {
+        block_range = block_range
+            .with_coverage_threshold(2.0)
+            .with_whole_object_threshold(0);
+    }
     let fetcher = LogSegmentFetcher::new(Arc::clone(&store))
-        .with_block_range(
-            BlockRangeFetcher::new(store)
-                .with_coalesce_gap(0)
-                .with_suffix_len(object.len() as u64 - blocks_end),
-        )
+        .with_block_range(block_range)
         .with_block_range_threshold(0);
     let wire = fetcher.phase_wire_byte_counter();
     let provider = LogsTableProvider::new(
@@ -1600,22 +1627,156 @@ async fn phase_two_reads_only_the_winners_pages_and_opens_the_object_once() {
     let probe = with.object.len() as u64 - blocks_end;
     assert_eq!(phase_two.len(), 1 + page_runs);
     assert_eq!(total, probe + pages);
+    // Phase 2 is the fetch phase (issue #797): these are its exact GETs, its
+    // WIRE bytes (probe metadata plus winner pages, as transferred), and its
+    // BLOCKS-section bytes (the winner pages alone) on this fixture.
     assert_eq!(
         (phase_two.len(), total, pages),
         (115, 6_980, 2_820),
         "phase 2's exact request and wire-byte figures on this fixture"
     );
-    // Every BLOCKS byte either phase moved is charged to the scan phase, and
-    // nothing else is.
+    // The fetch phase's own counter agrees with the GETs the store log slices
+    // out as phase 2: every probe, section and page read phase 2 issued lands
+    // on QueryPhase::Fetch, metadata and BLOCKS alike (ReadPhases::FETCH).
+    assert_eq!(
+        with.wire.phase_requests(QueryPhase::Fetch),
+        phase_two.len() as u64,
+        "fetch-phase GET count is phase 2's, exactly"
+    );
+    assert_eq!(
+        with.wire.phase(QueryPhase::Fetch),
+        total,
+        "fetch-phase wire bytes are phase 2's whole cost, probe included"
+    );
+    // The scan phase now holds phase 1's BLOCKS bytes only: every BLOCKS byte
+    // phase 2 moved is on the fetch phase instead. all_block_bytes is both
+    // phases' BLOCKS bytes; phase 2's share (`block_bytes`) is on fetch.
     let all_block_bytes: u64 = with
         .log
         .iter()
         .filter(|(range, _)| in_blocks(range))
         .map(|(_, len)| len)
         .sum();
-    assert_eq!(with.wire.phase(QueryPhase::Scan), all_block_bytes);
+    assert_eq!(
+        with.wire.phase(QueryPhase::Scan),
+        all_block_bytes - block_bytes,
+        "scan phase holds phase 1's BLOCKS bytes only"
+    );
+    // The six phases still sum to every wire byte the statement moved: moving
+    // phase 2 to its own phase moved no byte out of the total.
     assert_eq!(
         with.wire.total(),
         with.log.iter().map(|(_, len)| len).sum::<u64>()
     );
+}
+
+/// A statement that runs no late materialization writes nothing to the fetch
+/// phase. `run_ranged(false)` disables the rewrite, so there is no
+/// `LogsRowFetchExec` and no phase-2 row fetch; phase 1's reads keep charging
+/// the scan and probe phases.
+///
+/// Fails against distinguishing case (b) -- phase 1's own reads charged to the
+/// fetch phase -- because there is no phase 2 here, so any nonzero fetch figure
+/// is a phase-1 read misattributed. The flipped line is
+/// `logs_scan/mod.rs`'s `ProbePhase::Fetch` moved onto phase 1's striped scan.
+#[tokio::test]
+async fn fetch_phase_is_zero_without_late_materialization() {
+    let without = run_ranged(false).await;
+    assert!(
+        !without.explain.contains("LogsRowFetchExec"),
+        "{}",
+        without.explain
+    );
+    assert_eq!(
+        without.wire.phase_requests(QueryPhase::Fetch),
+        0,
+        "no late materialization: zero fetch-phase GETs"
+    );
+    assert_eq!(
+        without.wire.phase(QueryPhase::Fetch),
+        0,
+        "no late materialization: zero fetch-phase wire bytes"
+    );
+}
+
+/// Phase 2 at the production coalescing gap (issue #797): the winners sit in
+/// non-adjacent whole-object blocks 1, 3 and 5, and the default request-cost
+/// gap ([`BlockRangeFetcher`]'s, not `with_coalesce_gap(0)`) coalesces their
+/// pages into runs that also carry the holes between them (blocks 2 and 4's
+/// pages). The fetch phase reports the whole cost; this pins its exact GETs and
+/// wire bytes, and the ratio of fetch-phase BLOCKS bytes to the winners' own
+/// page bytes, which is above 1 because of the coalesced holes.
+#[tokio::test]
+async fn phase_two_at_production_gap_coalesces_the_winners_blocks() {
+    let prod = run_ranged_gap(true, None, true).await;
+    assert!(
+        prod.explain.contains("LogsRowFetchExec"),
+        "{}",
+        prod.explain
+    );
+    assert_eq!(
+        ts_of(&prod.rows),
+        vec![RANGED_TS_BASE + 7, RANGED_TS_BASE + 14, RANGED_TS_BASE + 21],
+        "the production gap changes cost, not the winners"
+    );
+    assert_eq!(prod.blocks_fetched, RANGED_WINNER_BLOCKS.len());
+    assert_eq!(prod.segments_fetched, 1);
+
+    // Phase 2 is the fetch phase, so its GETs are exactly the fetch-phase
+    // request count, and they are the tail of the store log (phase 1's TopK
+    // scan runs to completion first). This is authoritative where the
+    // suffix-probe slice is not: with the crossover off, phase 1 itself probes
+    // more than once.
+    let fetch_gets = prod.wire.phase_requests(QueryPhase::Fetch);
+    let fetch_wire = prod.wire.phase(QueryPhase::Fetch);
+    let phase_two = &prod.log[prod.log.len() - fetch_gets as usize..];
+    let (pages, _gap0_runs) = winner_pages(&prod.object);
+    let (blocks_start, blocks_end) = blocks_extent(&prod.object);
+    let in_blocks = |range: &GetRange| match *range {
+        GetRange::Range(start, end) => start >= blocks_start && end <= blocks_end,
+        GetRange::Full | GetRange::Suffix(_) => false,
+    };
+    let fetch_block_bytes: u64 = phase_two
+        .iter()
+        .filter(|(range, _)| in_blocks(range))
+        .map(|(_, len)| len)
+        .sum();
+    // Exact figures this fixture produces (issue #797). Phase 2 is one suffix
+    // probe plus one coalesced BLOCKS range: the production gap is larger than
+    // the whole BLOCKS section, so the winners' pages in blocks 1, 3 and 5
+    // coalesce into a single range that spans the whole section, carrying
+    // blocks 0, 2 and 4's pages as the holes between the winners.
+    assert_eq!(fetch_gets, 2, "one probe plus one coalesced range");
+    assert_eq!(
+        fetch_wire, 9_704,
+        "probe plus the coalesced range, as transferred"
+    );
+    assert_eq!(
+        fetch_block_bytes, 5_544,
+        "the coalesced range is the whole BLOCKS section"
+    );
+    assert_eq!(fetch_wire, prod.wire.phase(QueryPhase::Fetch));
+    // The winners' three non-adjacent blocks coalesced into ONE range (not the
+    // three runs a zero gap would issue), reaching the end of the BLOCKS
+    // section: it carries blocks 2 and 4's pages as the holes between winners.
+    let block_ranges: Vec<_> = phase_two.iter().filter(|(r, _)| in_blocks(r)).collect();
+    assert_eq!(
+        block_ranges.len(),
+        1,
+        "the winners' blocks coalesced into one range: {block_ranges:?}"
+    );
+    assert_eq!(block_ranges[0].1, 5_544, "the coalesced range's wire bytes");
+    match block_ranges[0].0 {
+        GetRange::Range(_, end) => assert_eq!(end, blocks_end, "reaches the section end"),
+        other => panic!("expected a byte range, got {other:?}"),
+    }
+    // Ratio of fetch-phase BLOCKS bytes to the winners' own pages, in basis
+    // points to pin it without a float compare: 5544 / 2820 = 1.966, below 2.
+    let ratio_bp = fetch_block_bytes * 10_000 / pages;
+    assert_eq!(pages, 2_820, "the winners' own page bytes");
+    assert_eq!(
+        ratio_bp, 19_659,
+        "fetch BLOCKS bytes / winner pages = 1.966"
+    );
+    assert!(ratio_bp < 20_000, "ratio is below 2 on this fixture");
 }

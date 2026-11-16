@@ -40,7 +40,7 @@ use ravel_object_store::{
 };
 use ravel_query::{
     BlockRangeFetcher, DEFAULT_LOG_REQUEST_COST_BYTES, DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
-    EngineConfig, EngineConfigError, LogQuery, LogSegmentFetcher, LogsFetchPolicy,
+    EngineConfig, EngineConfigError, LogQuery, LogSegmentFetcher, LogsFetchPolicy, ProbePhase,
     ResolvedLogsFetch, resolve_logs_fetch,
 };
 use ravel_types::TenantHash;
@@ -713,6 +713,7 @@ async fn striped_subset_scans_do_not_double_count_a_touch() {
                 &indices,
                 None,
                 None,
+                ProbePhase::Scan,
                 &accounting,
             )
             .await
@@ -1291,6 +1292,7 @@ async fn the_planned_route_reads_an_object_under_the_break_even_whole() {
             &(0..indices.len()).collect::<Vec<_>>(),
             footer.as_ref(),
             carried,
+            ProbePhase::Scan,
             &QueryAccounting::new(),
         )
         .await
