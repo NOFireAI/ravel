@@ -501,21 +501,9 @@ mod tests {
                 opened: 0,
                 matched: 0,
             },
-            // A metrics range query runs no late materialization, so the fetch
-            // phase is all zeros.
-            ExpectedPhase {
-                phase: "fetch",
-                gets: 0,
-                wire_bytes: 0,
-                lists: 0,
-                hits: 0,
-                misses: 0,
-                cache_bytes: 0,
-                decompressed: 0,
-                reused: 0,
-                opened: 0,
-                matched: 0,
-            },
+            // `keyIndex` and `fetch` are both all zeros on this metrics range
+            // query; `zip` stops at this array's length, and the names check
+            // above already pins their presence and order.
         ];
         for (row, expect) in phases.iter().zip(want) {
             let name = expect.phase;

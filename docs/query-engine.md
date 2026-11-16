@@ -3971,7 +3971,11 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   snapshot resolve), `plan` (footer and skip-index probing), `probe`
   (segment catalog fetch), `scan` (block and page data reads), `keyIndex`
   (the KEY_IDX reads of a spans `trace_id =` lookup or a logs exact-key
-  equality; 0 on every other statement). The rendering iterates `QueryPhase::ALL`, so a phase added to
+  equality; 0 on every other statement), `fetch` (TopK late materialization's
+  phase-2 row fetch of the winners, ADR-0774 and issue #797: every probe,
+  footer, section and page read the winners' row fetch issues, held apart from
+  the ordinary phase-1 `scan`; 0 on any statement that runs no late
+  materialization). The rendering iterates `QueryPhase::ALL`, so a phase added to
   the enum cannot be silently dropped. Per-phase fields: `phase`,
   `s3GetRequests`, `s3GetWireBytes`, `s3ListRequests`, `cacheHits`,
   `cacheMisses`, `cacheServedBytes`, `lateServedBytes`,
@@ -4016,6 +4020,19 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
     unplanned routes read `scan` 2; with no threshold published, the planned
     route reads `plan` 3 and the others `scan` 3
     (`crates/ravel-sql/tests/topk_threshold_skip_order.rs`).
+  - SQL `logs` with TopK late materialization (a `SELECT *` or wide
+    projection under `ORDER BY ... LIMIT k`, ADR-0774): phase 1 (the ordinary
+    scan) charges `scan`, and phase 2's row fetch of the winners charges
+    `fetch` -- its probe, section and page GETs, its wire bytes, its cache
+    hits and misses, its decompressed bytes and the opens it makes. The split
+    is pinned on a fixture that fetches the winners of three non-adjacent
+    blocks of one object
+    (`crates/ravel-sql/tests/logs_topk_late_materialization.rs`,
+    `phase_two_reads_only_the_winners_pages_and_opens_the_object_once` and
+    `phase_two_at_production_gap_coalesces_the_winners_blocks`), and is
+    reported on the real `/api/v1/sql` surface by
+    `select_star_topk_reports_a_nonzero_fetch_phase_that_sums_to_accounting`
+    in `services/ravel-server/tests/sql_topk_threshold_skip.rs`.
   - SQL `logs` and `spans` across a distributed query: a remote slice
     folds only its wire bytes into the coordinator's accounting, so the
     coordinator reports 0 `segmentsOpened` for the objects remote workers
