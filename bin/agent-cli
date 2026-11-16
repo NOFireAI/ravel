@@ -137,6 +137,11 @@ def read_body_arg(value):
         return sys.stdin.read()
     if value.startswith("@"):
         return Path(value[1:]).read_text()
+    # A body that is nothing but the path of an existing file is a forgotten
+    # '@': posting it publishes the path instead of the text.
+    bare = value.strip()
+    if bare and os.path.isfile(bare):
+        raise CliError(f"body is the path of an existing file; pass @{bare} to post its contents", 64)
     return value
 
 
