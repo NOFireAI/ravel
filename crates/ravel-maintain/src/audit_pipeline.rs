@@ -365,6 +365,7 @@ impl QueryAuditSink for AuditPipeline {
 /// idle flushes are at least `max_age` apart, so each adds at most one PUT
 /// pair over the window-only loop, and traffic faster than `max_age` takes
 /// this path only for its first event.
+#[allow(clippy::too_many_arguments)]
 async fn run_flush_loop(
     mut rx: mpsc::Receiver<Submission>,
     store: Arc<dyn ObjectStoreBackend>,
