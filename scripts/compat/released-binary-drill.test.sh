@@ -137,7 +137,8 @@ positive_control /dev/null "$H" "$TMP/pc-report" > "$TMP/pc-empty" && bad "empty
 printf 'figure a 3\nfigure b 1\nfigure b 1\nfigure c x\n' > "$TMP/fig"
 drill_check_figure "$TMP/fig" a 1 5 > /dev/null && ok "figure in band passes" || bad "figure a failed"
 drill_check_figure "$TMP/fig" a 4 5 > /dev/null && bad "figure out of band passed" || ok "figure out of band fails"
-drill_check_figure "$TMP/fig" b 0 5 > /dev/null && bad "duplicated figure passed" || ok "duplicated figure fails"
+drill_check_figure "$TMP/fig" b 0 5 > "$TMP/fig-b" && bad "duplicated figure passed" || ok "duplicated figure fails"
+grep -qF "band-miss b present 2 times (want exactly 1)" "$TMP/fig-b" && ok "duplicated figure named as such" || bad "duplicate reason: $(cat "$TMP/fig-b")"
 drill_check_figure "$TMP/fig" c 0 5 > /dev/null && bad "non-integer figure passed" || ok "non-integer figure fails"
 drill_check_figure "$TMP/fig" missing 0 5 > /dev/null && bad "missing figure passed" || ok "missing figure fails"
 

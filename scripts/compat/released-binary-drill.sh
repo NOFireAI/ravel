@@ -371,13 +371,20 @@ phase_cold() {
   start_v033 "$c" "$COLD_BUCKET" $((PORT + 15)) $((PORT + 16)) $((PORT + 17)) $((PORT + 18)) || true
   spawn "$c/drive" bash "$0" drive "$c" $((PORT + 15))
   say "cold: restarted on the fenced bucket, driving for $COLD_SECS s"
-  sleep "$COLD_SECS"
+  # A listing midway, while the process runs, tells a periodic writer from
+  # one that writes only at shutdown.
+  sleep $((COLD_SECS / 2))
+  ls_bucket "$COLD_BUCKET" "$c/mid.list"
+  sleep $((COLD_SECS - COLD_SECS / 2))
   stop_pid "$c/drive.pid"
   stop_pid "$c/server.pid"
   stop_pid "$c/maintain.pid"
   ls_bucket "$COLD_BUCKET" "$c/after.list"
   # A cold process has no cached view to trust, so its horizon is the fence.
-  judge "$c" "$d/fenced.list" "$c/after.list" "$w" "$w" cold | tee "$c/verdict"
+  {
+    judge "$c" "$d/fenced.list" "$c/mid.list" "$w" "$w" cold-mid
+    judge "$c" "$d/fenced.list" "$c/after.list" "$w" "$w" cold
+  } | tee "$c/verdict"
 }
 
 # One read-only query against a server, its JSON normalized (keys sorted,
