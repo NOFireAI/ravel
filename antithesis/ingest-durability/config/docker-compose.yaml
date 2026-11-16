@@ -1,0 +1,120 @@
+# Ravel ingest-durability workload for Antithesis (antithesis/README.md).
+#
+# rustfs is the one durable component. init creates the bucket and qualifies
+# it, then exits. ravel1 and ravel2 are two `--mode all` processes over that
+# one bucket: each ingests, serves queries and folds. driver is the workload
+# and is the only container excluded from faults.
+#
+# No service has a restart policy: Antithesis restarts the containers it
+# kills or stops, and a policy would restart them early and cancel the fault.
+
+x-ravel-store: &ravel-store
+  RAVEL_S3_ENDPOINT: http://rustfs:9000
+  RAVEL_S3_ALLOW_HTTP: "true"
+  RAVEL_S3_BUCKET: ravel
+  RAVEL_S3_REGION: us-east-1
+  RAVEL_S3_ACCESS_KEY: ravel
+  RAVEL_S3_SECRET_KEY: ravel-dev-secret
+
+# The workload's own images are named without a registry: snouty pushes a
+# local-only image into the tenant registry, but skips one it finds served by
+# another registry (such as the ECR it was moved through), which Antithesis
+# then cannot pull. scripts/build.sh and scripts/import-images.sh tag them.
+x-ravel-server: &ravel-server
+  image: ravel-antithesis-server:ingest-durability
+  platform: linux/amd64
+  # ravel-server exits within seconds when the store does not answer its
+  # startup read of sys/qualification, and nothing would start it again. A
+  # node Antithesis restarts during a store outage would then stay down for
+  # the rest of the timeline. So wait until the store answers, then exec the
+  # server as the container's main process.
+  entrypoint:
+    - /bin/sh
+    - -c
+    - |
+      trap 'exit 143' TERM INT
+      until [ "$$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 "aws:amz:$$RAVEL_S3_REGION:s3" --user "$$RAVEL_S3_ACCESS_KEY:$$RAVEL_S3_SECRET_KEY" "$$RAVEL_S3_ENDPOINT/$$RAVEL_S3_BUCKET?max-keys=1")" = 200 ]; do
+        sleep 1
+      done
+      exec /usr/local/bin/ravel-server "$$@"
+    - ravel-server
+  command:
+    - "--mode"
+    - "all"
+    - "--store"
+    - "s3"
+    - "--listen-http"
+    - "0.0.0.0:4318"
+    - "--listen-grpc"
+    - "0.0.0.0:4317"
+    - "--shards"
+    - "4"
+    - "--tenant-token"
+    - "wl-token=wl-tenant"
+    - "--tenant-hash-unkeyed"
+    # The three flush knobs move as a set (ADR-0076 decision 4). A shorter
+    # cadence than the defaults (2 s, 40 s, 256 KiB) puts more flushes, and so
+    # more commit races, into each timeline.
+    - "--max-flush-delay"
+    - "500ms"
+    - "--max-flush-delay-idle"
+    - "5s"
+    - "--min-flush-bytes"
+    - "262144"
+  environment:
+    <<: *ravel-store
+    RUST_LOG: info
+  depends_on:
+    init:
+      condition: service_completed_successfully
+
+services:
+  rustfs:
+    container_name: rustfs
+    hostname: rustfs
+    # The same RustFS release and digest the repository's own compose stacks
+    # and CI contract lane run (deploy/docker-compose/rustfs.yml).
+    image: ghcr.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+    platform: linux/amd64
+    command: ["/data"]
+    user: "0:0"
+    environment:
+      RUSTFS_ACCESS_KEY: ravel
+      RUSTFS_SECRET_KEY: ravel-dev-secret
+      # Fsync every acknowledged write before its 200 (RustFS's default,
+      # stated here so a killed rustfs container never loses an acked PUT;
+      # Ravel only promises the store's own durability floor).
+      RUSTFS_DURABILITY_MODE: strict
+      RUSTFS_DRIVE_SYNC_ENABLE: "true"
+
+  init:
+    container_name: init
+    hostname: init
+    image: ravel-antithesis-server:ingest-durability
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/ravel-antithesis-init"]
+    environment:
+      <<: *ravel-store
+    depends_on: [rustfs]
+
+  ravel1:
+    <<: *ravel-server
+    container_name: ravel1
+    hostname: ravel1
+
+  ravel2:
+    <<: *ravel-server
+    container_name: ravel2
+    hostname: ravel2
+
+  driver:
+    container_name: driver
+    hostname: driver
+    image: ravel-antithesis-driver:ingest-durability
+    platform: linux/amd64
+    environment:
+      RAVEL_NODES: http://ravel1:4318,http://ravel2:4318
+      RAVEL_TOKEN: wl-token
+      # The eventually's full-table reads are proven at about 2400 writes in
+      # the local loop; past this cap the write rules stop writing.
+      WORKLOAD_MAX_WRITES: "2500"

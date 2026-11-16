@@ -1,0 +1,28 @@
+[package]
+name = "ravel-antithesis-driver"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Antithesis driver for Ravel's ingest acknowledgement and visibility contract"
+license = "Apache-2.0"
+
+# Its own workspace: the repository's workspace never builds this crate, so
+# hegel and the driver's other dependencies stay out of the root Cargo.lock.
+[workspace]
+
+[[bin]]
+name = "driver"
+path = "src/main.rs"
+
+[dependencies]
+antithesis_sdk = "0.4"
+antithesis-instrumentation = "0.1"
+hegeltest = { version = "0.52", features = ["static-engine"] }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs", "metrics"] }
+prost = "0.14"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json"] }
+serde_json = "1"
+flate2 = "1"
+
+[profile.release]
+debug = 1
