@@ -691,7 +691,8 @@ publishes, and neither pass may skip it. Concretely:
    lease later) until an operator removes the object (until it is older than
    the lease ceiling, since the 2026-11-09 amendment): running past it would
    publish unfenced. A claim written in a newer claim format reads as
-   unreadable too, and claims are never deleted, so a future claim format
+   unreadable too (no longer: since the 2026-11-15 amendment it is
+   version-protected and never stolen), and claims are never deleted, so a future claim format
    bump followed by a rollback would hold every bucket the newer build
    claimed, erasures included, until each claim key is removed by hand (for
    at most the lease ceiling, since the 2026-11-09 amendment); a
@@ -828,7 +829,8 @@ steal moves its version and defeats the steal, which reports `Steal::Lost`.
 removed.
 
 **The invariant.** No claim object holds its bucket past its `last_modified`
-plus 24 h plus one contender's jitter without a write to the object. A
+(except a version-protected claim, 2026-11-15 amendment) plus 24 h plus one
+contender's jitter without a write to the object. A
 readable claim's lease is already capped at the same ceiling; an unreadable
 one now gets exactly the ceiling. The jitter for an unreadable claim is drawn
 from the contender's configured lease (capped at the ceiling), not from the
@@ -937,6 +939,8 @@ Tests, each shown failing against the code before this amendment:
 <!-- amendment-supersedes: phrase="a `format_version` above this build's, an unspecified state, or an id that is" pointer="2026-11-15 amendment" -->
 <!-- amendment-supersedes: phrase="garbage and future-format payloads" pointer="2026-11-15 amendment" -->
 <!-- amendment-supersedes: phrase="a_future_format_claim_stalls_an_erasure_for_at_most_the_lease_ceiling" pointer="2026-11-15 amendment" -->
+<!-- amendment-supersedes: phrase="A claim written in a newer claim format reads as" pointer="2026-11-15 amendment" -->
+<!-- amendment-supersedes: phrase="No claim object holds its bucket past its `last_modified`" pointer="2026-11-15 amendment" -->
 
 **The problem.** The 2026-11-09 amendment gave every unreadable claim,
 including one whose `format_version` is 0 (never written by any build) or
