@@ -7,9 +7,15 @@
 //! family with the version writers emit, and one store-wide `compat_epoch`
 //! raised by every activation of any family.
 //!
-//! Every value in it is monotone. [`activate_family`] raises one family by
-//! exactly one and the epoch by one; [`update_compat`] refuses any change
-//! that would lower a version, the epoch, or a certificate; and a
+//! The values writers act on are monotone: `compat_epoch`, each family's
+//! `active_write_version` and `activated_epoch`, and the certificate's
+//! version. [`activate_family`] raises one family by exactly one and the
+//! epoch by one; [`update_compat`] refuses any change that would lower one of
+//! those or drop a family entry. Other fields are not guarded here: the
+//! baseline release, `max_publish_lifetime_ns` and `adopted` are written by
+//! `compat init`, and a same-version re-certify (ADR-4233 decision 7) replaces
+//! the certificate, resets `late_writes_verified_through_unix_ns` and clears
+//! `contradicted`. A
 //! [`CompatView`] never lowers a value it has seen in this run, whatever a
 //! later read returns.
 //!

@@ -1589,6 +1589,13 @@ fn build_record(
 /// record), so the winner's record wins — the correct record-wins semantics of a
 /// mid-rolling-upgrade race (ADR-0050 section 5, mirroring the `sys/tenancy`
 /// write_marker race handling).
+///
+/// `adopting_data` is true when the bucket already holds shard data with no
+/// record. With a compat epoch, such a record is fenced at `now_ns`, not born
+/// fenced: some process wrote there before the fence, so certify must wait
+/// out `G_pre` from now (ADR-4233 decisions 4 and 7). Only a bucket with no
+/// data is born fenced (`compat_fenced_unix_ns` 0).
+#[allow(clippy::too_many_arguments)]
 async fn write_record_race_safe(
     store: &dyn ObjectStoreBackend,
     key: &str,
@@ -1597,8 +1604,12 @@ async fn write_record_race_safe(
     shard_count: u32,
     now_ns: i64,
     compat_epoch: Option<NonZeroU64>,
+    adopting_data: bool,
 ) -> Result<ProvisioningCheck, ProvisioningError> {
-    let record = build_record(tenant_hash, signal, shard_count, now_ns, compat_epoch);
+    let mut record = build_record(tenant_hash, signal, shard_count, now_ns, compat_epoch);
+    if adopting_data && compat_epoch.is_some() {
+        record.compat_fenced_unix_ns = now_ns;
+    }
     match store
         .put(
             key,
@@ -1741,6 +1752,7 @@ pub async fn validate_or_adopt_fenced(
                     shard_count,
                     now_ns,
                     compat_epoch,
+                    false,
                 )
                 .await
             }
@@ -1754,7 +1766,8 @@ pub async fn validate_or_adopt_fenced(
             })
         }
         Some(_) => {
-            // Pre-ADR data, all shard indices in range: safe to adopt.
+            // Pre-ADR data, all shard indices in range: safe to adopt. The
+            // bucket already holds data, so a fenced adoption is fenced now.
             write_record_race_safe(
                 store,
                 &key,
@@ -1763,6 +1776,7 @@ pub async fn validate_or_adopt_fenced(
                 shard_count,
                 now_ns,
                 compat_epoch,
+                true,
             )
             .await
         }
@@ -6210,6 +6224,36 @@ pub(crate) mod tests {
             seeded,
             "the version-5 record is byte-for-byte unchanged"
         );
+    }
+
+    /// Adopting a bucket that already holds data, after an activation, is a
+    /// fence raised now, not a born fence: some process wrote that data before
+    /// the fence, so the record carries the adoption time as its fence time
+    /// and certify waits `G_pre` from it (ADR-4233 decisions 4 and 7). A
+    /// create with no data stays born fenced at 0.
+    ///
+    /// Fails against a build that stamps 0 on every fenced create (the
+    /// adoption arm passing `adopting_data: false`).
+    #[tokio::test]
+    async fn fenced_adoption_of_existing_data_stamps_the_fence_time() {
+        let store = mem();
+        for shard in 0..=2 {
+            seed_l0_shard(store.as_ref(), &tenant(), Signal::Logs, shard).await;
+        }
+        let out = validate_or_adopt_fenced(
+            store.as_ref(),
+            &tenant(),
+            Signal::Logs,
+            4,
+            7_000,
+            AbsentPolicy::AdoptIfData,
+            NonZeroU64::new(2),
+        )
+        .await
+        .expect("fenced adoption");
+        assert_eq!(out, ProvisioningCheck::Written);
+        let (adopted, _) = stored_record(store.as_ref(), Signal::Logs).await;
+        assert_eq!(fence_fields(&adopted), (4, 2, 7_000));
     }
 
     /// A first touch that knows a compat epoch creates the record born fenced:
