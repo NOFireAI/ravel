@@ -765,10 +765,11 @@ pub(super) enum LogScanState {
     /// taken the one block that carried an `attrs_raw` overflow page, so only
     /// that block runs the row path instead of the rest of the segment.
     Columnar(Box<LogSegmentScan>),
-    /// Draining one segment's surviving blocks through the row path
-    /// ([`LogSegmentScan::next_block`]), rebuilding a [`LogRecord`] per row: the
-    /// unchanged pre-ADR-0099 path, taken by a scan that is statically
-    /// ineligible for the columnar fast path, OR handed the
+    /// Draining one segment's surviving blocks through the row path: each
+    /// block comes out of [`LogSegmentScan::next_row_block`] owned and
+    /// [`build_row_batch`] builds its batches from the decoded columns with
+    /// no per-row record (ADR-2773 decision 4). Taken by a scan that is
+    /// statically ineligible for the columnar fast path, OR handed the
     /// still-open scan by [`LogScanState::RowFallbackBlock`] once a segment
     /// has hit [`MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS`] consecutive `attrs_raw`
     /// fallbacks, committing the rest of this partition's block list to the
@@ -827,7 +828,7 @@ pub(super) enum LogScanState {
         started: Instant,
     },
     /// One row-path block decoding on the read gate through
-    /// [`LogSegmentScan::next_block_on_gate`]. Resolved, the scan goes back
+    /// [`LogSegmentScan::next_row_block_on_gate`]. Resolved, the scan goes back
     /// to the state `resume` names with the block in
     /// [`LogScanStream::decoded`].
     DecodingRows {
@@ -855,7 +856,7 @@ type RowJobFuture = Pin<
                 Output = (
                     Box<LogSegmentScan>,
                     Option<usize>,
-                    Result<Option<RowBlock>, LogFetchError>,
+                    DFResult<Option<RowBlock>>,
                 ),
             > + Send,
     >,
@@ -875,14 +876,14 @@ pub(super) enum Decoded {
     Rows {
         /// The block's whole-object index, read before the decode.
         block: Option<usize>,
-        next: Result<Option<RowBlock>, LogFetchError>,
+        next: DFResult<Option<RowBlock>>,
     },
 }
 
 /// What [`LogScanStream::next_row_block`] did.
 enum RowNext {
     /// The block's whole-object index, read before the decode, and the block.
-    Ready(Option<usize>, Box<Result<Option<RowBlock>, LogFetchError>>),
+    Ready(Option<usize>, Box<DFResult<Option<RowBlock>>>),
     /// The decode went to the read gate; the state is now
     /// [`LogScanState::DecodingRows`].
     Submitted,
@@ -1050,12 +1051,29 @@ fn take_columnar_job_panic(key: &str) -> bool {
 }
 
 /// The row path's next block on the read gate, the scan returned with it.
-fn row_block_on_gate(mut scan: Box<LogSegmentScan>) -> RowJobFuture {
+/// `erasure` is the pending set [`build_row_batch`] applies to its rows.
+fn row_block_on_gate(
+    mut scan: Box<LogSegmentScan>,
+    erasure: Arc<Vec<ErasurePredicate>>,
+) -> RowJobFuture {
     Box::pin(async move {
         let block = scan.next_block_index();
-        let next = scan.next_row_block_on_gate().await;
+        let next = row_block(scan.next_row_block_on_gate(&erasure).await);
         (scan, block, next)
     })
+}
+
+/// The row-block exit's outcome as the row path consumes it. A refusal for
+/// an unapplied erasure is an internal error: the scan passes the same set it
+/// built its fetch query from.
+fn row_block(outcome: Result<RowBlockOutcome, LogFetchError>) -> DFResult<Option<RowBlock>> {
+    match outcome.map_err(SqlError::from)? {
+        RowBlockOutcome::Block(block) => Ok(Some(block)),
+        RowBlockOutcome::Exhausted => Ok(None),
+        RowBlockOutcome::ErasureUnapplied => Err(DataFusionError::Internal(
+            "the row-block exit refused the scan's erasure predicate set".into(),
+        )),
+    }
 }
 
 /// A columnar block job that failed on the gate, classified the way the
@@ -1102,6 +1120,8 @@ pub(super) struct RowsPending {
     /// Rows already emitted, after erasure: the row-ref position of the next
     /// kept row.
     kept: usize,
+    /// The block's decoded stream attributes, charged into `held` as each is
+    /// decoded and released with the block.
     streams: StreamAttrsCache,
     /// The object key, for attributing a corrupt `attrs_raw` cell.
     key: String,
@@ -1570,7 +1590,10 @@ impl LogScanStream {
 
     /// Emit the next row-path batch out of `pending`, moving the reservation
     /// with it: the previous batch's charge is released (it is downstream's
-    /// now), the new batch's charge is taken before it is handed over.
+    /// now), the new batch's charge is taken before it is handed over. The
+    /// block's decoded stream attributes join its charge in `held`; each
+    /// chunk's decoded `attrs_raw` entries and merge scratch are charged by
+    /// [`build_row_batch`] for the length of the build.
     ///
     /// With a row filter, each chunk is filtered as soon as it is built, and a
     /// chunk the filter empties is skipped; `None` means the block's remaining
@@ -1604,17 +1627,23 @@ impl LogScanStream {
                 return Ok(None);
             }
             let end = (*pos + BATCH_ROWS).min(block.len());
+            let streams_before = streams.charged();
             let built = build_row_batch(
                 block,
                 *pos,
                 end,
                 streams,
                 &shape,
+                &self.reservation,
                 pending_range.map(|r| RowRefRange {
                     first_row: r.first_row + *kept,
                     ..r
                 }),
-            )?;
+            );
+            // Decoded stream attributes stay charged with the block, even
+            // when the build fails after decoding them.
+            self.held += streams.charged() - streams_before;
+            let built = built?;
             *pos = end;
             *kept += built.num_rows();
             if built.num_rows() == 0 {
@@ -1778,7 +1807,7 @@ impl LogScanStream {
                 ));
             };
             self.state = LogScanState::DecodingRows {
-                job: row_block_on_gate(scan),
+                job: row_block_on_gate(scan, Arc::clone(&self.erasure)),
                 resume,
                 started: Instant::now(),
             };
@@ -1786,7 +1815,7 @@ impl LogScanStream {
         }
         let decode_started = Instant::now();
         let block = scan.next_block_index();
-        let next = scan.next_row_block();
+        let next = row_block(scan.next_row_block(&self.erasure));
         self.blocks.decode_build_elapsed.add_elapsed(decode_started);
         RowNext::Ready(block, Box::new(next))
     }
@@ -1885,7 +1914,11 @@ impl LogScanStream {
             LogScanState::Rows(scan)
             | LogScanState::RowFallbackBlock { scan, .. }
             | LogScanState::Columnar(scan) => scan.key().to_string(),
-            _ => String::new(),
+            _ => {
+                return Err(DataFusionError::Internal(
+                    "row block taken off a scan-holding state".into(),
+                ));
+            }
         };
         self.hold_block(block, key)
     }
@@ -2562,7 +2595,7 @@ impl LogScanStream {
                         // Only `None` ends the segment. Its counters are final
                         // now, so publish them before moving on.
                         Ok(None) => this.end_scanned_segment(),
-                        Err(e) => return this.fail(SqlError::from(e).into()),
+                        Err(e) => return this.fail(e),
                     }
                 }
                 LogScanState::RowFallbackBlock { skip, .. } => {
@@ -2587,7 +2620,7 @@ impl LogScanStream {
                                 }
                             }
                             Ok(None) => this.end_scanned_segment(),
-                            Err(e) => return this.fail(SqlError::from(e).into()),
+                            Err(e) => return this.fail(e),
                         }
                         continue;
                     }
@@ -2645,7 +2678,7 @@ impl LogScanStream {
                         // as end-of-segment rather than panicking, matching
                         // `ReopenRows`'s own `Ok(None)` handling above.
                         Ok(None) => this.end_scanned_segment(),
-                        Err(e) => return this.fail(SqlError::from(e).into()),
+                        Err(e) => return this.fail(e),
                     }
                 }
                 LogScanState::DecodingColumnar { job, started } => {

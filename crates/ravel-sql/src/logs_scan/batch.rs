@@ -380,8 +380,75 @@ fn projected_key<'k>(
 // ---------------------------------------------------------------------------
 
 /// Each stream's resource and scope attributes, by `stream_ref`, decoded once
-/// for a row-path block ([`decode_stream_attrs`]).
-pub(super) type StreamAttrsCache = HashMap<u32, Vec<(String, AttrValue)>>;
+/// for a row-path block ([`decode_stream_attrs`]), and the pool bytes charged
+/// for them, which the block's holder releases with the block.
+#[derive(Default)]
+pub(super) struct StreamAttrsCache {
+    attrs: HashMap<u32, Vec<(String, AttrValue)>>,
+    charged: usize,
+}
+
+impl StreamAttrsCache {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The pool bytes [`build_row_batch`] charged for the decoded streams.
+    pub(super) fn charged(&self) -> usize {
+        self.charged
+    }
+}
+
+/// Heap bytes `attrs` holds: its spine plus each key's and value's payload,
+/// the per-attribute terms of [`records_memory`].
+fn attrs_memory(attrs: &[(String, AttrValue)], capacity: usize) -> usize {
+    capacity * std::mem::size_of::<(String, AttrValue)>()
+        + attrs
+            .iter()
+            .map(|(k, v)| k.len() + attr_value_memory(v))
+            .sum::<usize>()
+}
+
+/// Bytes a hash table allocates for `capacity` entries of `entry` bytes: a
+/// power-of-two bucket count at most 7/8 full, and one control byte per
+/// bucket.
+fn hash_table_bytes(capacity: usize, entry: usize) -> usize {
+    let buckets = match capacity {
+        0 => return 0,
+        1..=3 => 4,
+        4..=7 => 8,
+        _ => (capacity.saturating_mul(8) / 7).next_power_of_two(),
+    };
+    buckets.saturating_mul(entry + 1)
+}
+
+/// A row-path chunk's working memory, charged to the scan's reservation and
+/// released when the chunk's batch is built or its build fails.
+struct ChunkCharge<'r> {
+    reservation: &'r MemoryReservation,
+    bytes: usize,
+}
+
+impl<'r> ChunkCharge<'r> {
+    fn new(reservation: &'r MemoryReservation) -> Self {
+        Self {
+            reservation,
+            bytes: 0,
+        }
+    }
+
+    fn grow(&mut self, bytes: usize) -> DFResult<()> {
+        self.reservation.try_grow(bytes)?;
+        self.bytes += bytes;
+        Ok(())
+    }
+}
+
+impl Drop for ChunkCharge<'_> {
+    fn drop(&mut self) {
+        self.reservation.shrink(self.bytes);
+    }
+}
 
 /// The output shape of a row-path batch and the pending erasure it applies.
 pub(super) struct RowBatchShape<'s> {
@@ -408,14 +475,25 @@ pub(super) struct RowBatchShape<'s> {
 /// `shape.erasure` against its record attributes or that view
 /// ([`is_erased_log_row`]) is dropped before any column is built. The
 /// `row_refs` positions count the rows kept.
+///
+/// What this materializes beyond the decoded block is charged to
+/// `reservation`, a refusal failing the build with the pool's
+/// `ResourcesExhausted`. A stream's decoded attributes are charged into
+/// `streams` once each is decoded, and stay charged with the block. A row's
+/// decoded `attrs_raw` entries are charged once each row is decoded, before
+/// the next, and the merge's working vectors and maps before they are
+/// allocated, at the capacity they are allocated with; both are released
+/// when this returns.
 pub(super) fn build_row_batch(
     block: &RowBlock,
     start: usize,
     end: usize,
     streams: &mut StreamAttrsCache,
     shape: &RowBatchShape<'_>,
+    reservation: &MemoryReservation,
     row_refs: Option<RowRefRange>,
 ) -> DFResult<RecordBatch> {
+    use std::mem::size_of;
     let view = block.view();
     let end = end.min(view.surviving_count());
     let start = start.min(end);
@@ -433,23 +511,40 @@ pub(super) fn build_row_batch(
         return finish_row_batch(shape.schema, columns, row_refs, end - start);
     }
 
+    let rows = end - start;
+    let mut charge = ChunkCharge::new(reservation);
+    // Stream entries over the chunk's rows, and the most one row has.
+    let mut stream_entries = 0;
+    let mut max_stream = 0;
     for i in start..end {
         let stream_ref = row_stream_ref(&view, i)?;
-        if let std::collections::hash_map::Entry::Vacant(e) = streams.entry(stream_ref) {
-            let blob = view.stream_attrs_of(stream_ref).ok_or_else(|| {
-                DataFusionError::Internal(format!("stream_ref {stream_ref} not in STREAM_DIR"))
-            })?;
-            e.insert(decode_stream_attrs(blob)?);
-        }
+        let attrs = match streams.attrs.entry(stream_ref) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let blob = view.stream_attrs_of(stream_ref).ok_or_else(|| {
+                    DataFusionError::Internal(format!("stream_ref {stream_ref} not in STREAM_DIR"))
+                })?;
+                let decoded = decode_stream_attrs(blob)?;
+                let bytes = attrs_memory(&decoded, decoded.capacity());
+                reservation.try_grow(bytes)?;
+                streams.charged += bytes;
+                e.insert(decoded)
+            }
+        };
+        stream_entries += attrs.len();
+        max_stream = max_stream.max(attrs.len());
     }
-    let streams: &StreamAttrsCache = streams;
+    let streams = &streams.attrs;
 
     // `overflow_ends[n]` is where row `start + n`'s `attrs_raw` entries end.
     let mut overflow: Vec<(String, AttrValue)> = Vec::new();
     let mut overflow_ends: Vec<usize> = Vec::new();
+    let mut max_overflow = 0;
     if view.has_attrs_raw_page() {
-        overflow_ends.reserve(end - start);
+        charge.grow(rows * size_of::<usize>())?;
+        overflow_ends.reserve_exact(rows);
         for i in start..end {
+            let (len, capacity) = (overflow.len(), overflow.capacity());
             view.decode_attrs_raw_into(i, &mut overflow)
                 .map_err(|source| {
                     SqlError::from(LogFetchError::Corrupt {
@@ -457,54 +552,80 @@ pub(super) fn build_row_batch(
                         source,
                     })
                 })?;
+            let added = overflow.get(len..).unwrap_or_default();
+            charge.grow(attrs_memory(added, overflow.capacity() - capacity))?;
+            max_overflow = max_overflow.max(added.len());
             overflow_ends.push(overflow.len());
         }
     }
 
+    // Each projected key column's slot in `key_cells`; a declared column and
+    // an `attrs['k']` column of one key share a slot.
+    let mut slot_of_key: HashMap<&str, usize> = HashMap::new();
+    let mut slot_of_index: HashMap<usize, usize> = HashMap::new();
+    for &idx in shape.projection {
+        let Some(key) = projected_key(idx, shape.declared, shape.attr_keys, shape.full_len) else {
+            continue;
+        };
+        let next = slot_of_key.len();
+        let slot = *slot_of_key.entry(key).or_insert(next);
+        slot_of_index.insert(idx, slot);
+    }
+
+    // The merge's working memory, at the capacity each piece is allocated
+    // with below. `entries` holds every kept row's merged view when the
+    // `attrs` map is built, else one row's at a time.
+    let field_count = view.attr_columns().count();
+    let cached_entries: usize = streams.values().map(Vec::len).sum();
+    let name_bound = field_count + cached_entries + overflow.len();
+    let entry_bound = if attrs_projected {
+        stream_entries + rows * field_count + overflow.len()
+    } else {
+        max_stream + field_count + max_overflow
+    };
+    let record_bound = field_count + max_overflow;
+    let word = size_of::<usize>();
+    let chunk_bytes = field_count * size_of::<(&str, usize, DeclaredCursor<'_>)>()
+        + hash_table_bytes(name_bound, size_of::<(&str, usize)>())
+        + name_bound * 2 * word
+        + hash_table_bytes(streams.len(), size_of::<(u32, Vec<usize>)>())
+        + (cached_entries + overflow.len()) * word
+        + entry_bound * size_of::<(&str, Cell<'_>)>()
+        + record_bound * size_of::<(usize, &str, Cell<'_>)>()
+        + rows * (3 * word + slot_of_key.len() * size_of::<Option<Cell<'_>>>());
+    charge.grow(chunk_bytes)?;
+
     // Every attribute name the rows can hold, numbered, so the merge finds a
     // key's first entry in a row by index instead of by search.
-    let mut ids: HashMap<&str, usize> = HashMap::new();
+    let mut ids: HashMap<&str, usize> = HashMap::with_capacity(name_bound);
     let mut intern = |name| {
         let next = ids.len();
         *ids.entry(name).or_insert(next)
     };
-    let field_cols: Vec<(&str, usize, DeclaredCursor<'_>)> = view
-        .attr_columns()
-        .map(|(name, col)| (name, intern(name), DeclaredCursor::resolve(&view, col)))
-        .collect();
+    let mut field_cols: Vec<(&str, usize, DeclaredCursor<'_>)> = Vec::with_capacity(field_count);
+    field_cols.extend(
+        view.attr_columns()
+            .map(|(name, col)| (name, intern(name), DeclaredCursor::resolve(&view, col))),
+    );
     let stream_ids: HashMap<u32, Vec<usize>> = streams
         .iter()
         .map(|(&sref, attrs)| (sref, attrs.iter().map(|(k, _)| intern(k)).collect()))
         .collect();
     let overflow_ids: Vec<usize> = overflow.iter().map(|(k, _)| intern(k)).collect();
-
-    // Each projected key column's slot in `key_cells`; a declared column and
-    // an `attrs['k']` column of one key share a slot.
-    let mut slot_of_index: HashMap<usize, usize> = HashMap::new();
-    let mut slot_keys: Vec<&str> = Vec::new();
-    for &idx in shape.projection {
-        let Some(key) = projected_key(idx, shape.declared, shape.attr_keys, shape.full_len) else {
-            continue;
-        };
-        let slot = match slot_keys.iter().position(|k| *k == key) {
-            Some(slot) => slot,
-            None => {
-                slot_keys.push(key);
-                slot_keys.len() - 1
-            }
-        };
-        slot_of_index.insert(idx, slot);
+    let mut slot_ids: Vec<Option<usize>> = vec![None; slot_of_key.len()];
+    for (key, &slot) in &slot_of_key {
+        if let Some(id) = slot_ids.get_mut(slot) {
+            *id = ids.get(key).copied();
+        }
     }
-    let slot_ids: Vec<Option<usize>> = slot_keys.iter().map(|k| ids.get(k).copied()).collect();
 
-    let rows = end - start;
     // `stamp_of[id] == stamp` when the current row holds name `id`, its
     // first entry at `entries[slot_of[id]]`.
     let mut stamp_of = vec![0usize; ids.len()];
     let mut slot_of = vec![0usize; ids.len()];
-    let mut entries: Vec<(&str, Cell<'_>)> = Vec::new();
-    let mut row_ends: Vec<usize> = Vec::with_capacity(rows);
-    let mut record: Vec<(usize, &str, Cell<'_>)> = Vec::new();
+    let mut entries: Vec<(&str, Cell<'_>)> = Vec::with_capacity(entry_bound);
+    let mut row_ends: Vec<usize> = Vec::with_capacity(if attrs_projected { rows } else { 0 });
+    let mut record: Vec<(usize, &str, Cell<'_>)> = Vec::with_capacity(record_bound);
     let mut kept: Vec<usize> = Vec::with_capacity(rows);
     let mut key_cells: Vec<Vec<Option<Cell<'_>>>> = vec![Vec::with_capacity(rows); slot_ids.len()];
     let mut overflow_from = 0;
@@ -7155,9 +7276,14 @@ mod key_cells_tests {
 #[allow(clippy::expect_used)]
 mod row_path_tests {
     use super::*;
+    use crate::late_materialization::RowRef;
     use crate::logs_schema::logs_schema_with_declared;
     use crate::rlog_attrs::retain_unerased;
-    use datafusion::arrow::array::{Array, MapArray};
+    use datafusion::arrow::array::{
+        Array, BinaryArray, Int64Array, MapArray, StringArray, UInt64Array,
+    };
+    use datafusion::arrow::compute::cast;
+    use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, UnboundedMemoryPool};
     use proptest::prelude::*;
     use ravel_logseg::record::stream_attrs_bytes;
     use ravel_logseg::{
@@ -7166,6 +7292,7 @@ mod row_path_tests {
     };
     use ravel_query::erasure::retain_log_records;
     use ravel_types::logstream::LogStreamId;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const KEYS: [&str; 6] = ["k0", "k1", "k2", "k3", "shared", "user"];
 
@@ -7264,6 +7391,163 @@ mod row_path_tests {
         }
     }
 
+    fn unbounded() -> MemoryReservation {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        MemoryConsumer::new("row path").register(&pool)
+    }
+
+    fn str_attrs(pairs: &[(&str, &str)]) -> Vec<(String, AttrValue)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), AttrValue::Str((*v).to_string())))
+            .collect()
+    }
+
+    /// One block over `records`: the row path's batch over all of it, read
+    /// through `selection`, and the record-based build over the same rows'
+    /// records read through the same selection.
+    fn both_builds(
+        records: &[LogRecord],
+        max_dynamic_columns: usize,
+        selection: &ColumnSelection,
+        shape: &RowBatchShape<'_>,
+        row_refs: Option<RowRefRange>,
+    ) -> (RecordBatch, RecordBatch, bool) {
+        let cfg = RlogConfig {
+            block_target_records: 64,
+            max_dynamic_columns,
+            ..RlogConfig::default()
+        };
+        let obj = write(records, &cfg);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let open = || {
+            reader
+                .scan_blocks(&Predicate::And(Vec::new()), &[], selection)
+                .expect("scan")
+        };
+        let block = open()
+            .next_row_block(&obj)
+            .expect("row exit")
+            .expect("block");
+        assert_eq!(block.len(), records.len(), "one block");
+        let got = build_row_batch(
+            &block,
+            0,
+            block.len(),
+            &mut StreamAttrsCache::new(),
+            shape,
+            &unbounded(),
+            row_refs,
+        )
+        .expect("row batch");
+        let mut recs = open()
+            .next_block(&obj)
+            .expect("record exit")
+            .expect("block");
+        retain_log_records(&mut recs, shape.erasure);
+        retain_unerased(&mut recs, shape.erasure).expect("erasure");
+        let want = build_batch(
+            &recs,
+            Arc::clone(shape.schema),
+            shape.projection,
+            shape.declared,
+            shape.attr_keys,
+            shape.full_len,
+            row_refs,
+        )
+        .expect("record batch");
+        (got, want, block.view().has_attrs_raw_page())
+    }
+
+    /// Column `col` of `batch` as text, a dictionary or plain string column.
+    fn texts(batch: &RecordBatch, col: usize) -> Vec<Option<String>> {
+        let array = cast(batch.column(col), &DataType::Utf8).expect("cast");
+        let strings = array.as_any().downcast_ref::<StringArray>().expect("utf8");
+        (0..strings.len())
+            .map(|i| strings.is_valid(i).then(|| strings.value(i).to_string()))
+            .collect()
+    }
+
+    /// Each row's `attrs` map entries, in order.
+    fn map_rows(batch: &RecordBatch, col: usize) -> Vec<Vec<(String, String)>> {
+        let map = batch
+            .column(col)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("attrs map");
+        (0..map.len())
+            .map(|r| {
+                let entries = map.value(r);
+                let keys = entries
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("keys");
+                let values = entries
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("values");
+                (0..keys.len())
+                    .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The projection of the explicit row-path cases: `attrs`, the declared
+    /// `k0`, `k1`, `k3` and `shared` columns, and `attrs['shared']`.
+    struct Explicit {
+        declared: Vec<DeclaredColumn>,
+        attr_keys: Vec<String>,
+        schema: SchemaRef,
+        projection: Vec<usize>,
+        full_len: usize,
+    }
+
+    /// Output column positions in [`Explicit`]'s projection.
+    const X_ATTRS: usize = 0;
+    const X_K0: usize = 1;
+    const X_K1: usize = 2;
+    const X_K3: usize = 3;
+    const X_SHARED: usize = 4;
+    const X_ATTR_SHARED: usize = 5;
+
+    fn explicit() -> Explicit {
+        let declared = declared();
+        let attr_keys = vec!["shared".to_string()];
+        let (extended, full_len) = extended_schema(&declared, &attr_keys);
+        let projection = vec![
+            LOG_COL_ATTRS,
+            FIRST_DECLARED_COL,
+            FIRST_DECLARED_COL + 1,
+            FIRST_DECLARED_COL + 3,
+            FIRST_DECLARED_COL + 4,
+            full_len,
+        ];
+        let schema = Arc::new(extended.project(&projection).expect("project"));
+        Explicit {
+            declared,
+            attr_keys,
+            schema,
+            projection,
+            full_len,
+        }
+    }
+
+    impl Explicit {
+        fn shape<'s>(&'s self, erasure: &'s [ErasurePredicate]) -> RowBatchShape<'s> {
+            shape(
+                &self.schema,
+                &self.projection,
+                &self.declared,
+                &self.attr_keys,
+                self.full_len,
+                erasure,
+            )
+        }
+    }
+
     /// A row-path batch over a block of N rows, projecting the `attrs` map,
     /// every declared column and every `attrs['k']` column under a pending
     /// erasure, rebuilds no `LogRecord`; the record exit over the same block
@@ -7321,6 +7605,7 @@ mod row_path_tests {
             block.len(),
             &mut StreamAttrsCache::new(),
             &shape,
+            &unbounded(),
             None,
         )
         .expect("row batch");
@@ -7349,6 +7634,394 @@ mod row_path_tests {
             .expect("block");
         assert_eq!(rebuilt.len(), N);
         assert_eq!(records_rebuilt_on_this_thread() - before, N as u64);
+    }
+
+    fn assert_same_columns(got: &RecordBatch, want: &RecordBatch) {
+        assert_eq!(got.num_rows(), want.num_rows());
+        for (n, field) in got.schema().fields().iter().enumerate() {
+            assert_eq!(
+                got.column(n).to_data(),
+                want.column(n).to_data(),
+                "column {}",
+                field.name()
+            );
+        }
+    }
+
+    fn some(values: &[&str]) -> Vec<Option<String>> {
+        values.iter().map(|v| Some((*v).to_string())).collect()
+    }
+
+    fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {
+        values
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// A row carrying `k0` twice, the first occurrence in its FIELD_DIR
+    /// column and the second spilled into `attrs_raw`, reads the `attrs_raw`
+    /// value: record entries merge in FIELD_DIR order and then `attrs_raw`
+    /// order, the later overwriting the earlier in place.
+    #[test]
+    fn a_key_in_a_field_dir_column_and_in_attrs_raw_reads_the_attrs_raw_value() {
+        let stream = Stream {
+            resource: Vec::new(),
+            scope: Vec::new(),
+        };
+        let records = vec![
+            record(0, &stream, 1, str_attrs(&[("k0", "col"), ("k0", "raw")])),
+            record(0, &stream, 2, str_attrs(&[("k0", "only")])),
+        ];
+        let x = explicit();
+        let (got, want, attrs_raw) =
+            both_builds(&records, 8, &ColumnSelection::all(), &x.shape(&[]), None);
+        assert!(attrs_raw, "the duplicate spilled into attrs_raw");
+        assert_eq!(texts(&got, X_K0), some(&["raw", "only"]));
+        assert_eq!(
+            map_rows(&got, X_ATTRS),
+            vec![pairs(&[("k0", "raw")]), pairs(&[("k0", "only")])]
+        );
+        assert_same_columns(&got, &want);
+    }
+
+    /// A record attribute overwrites its resource's value in place, ahead of
+    /// the scope's value for the same key, from a FIELD_DIR column or from
+    /// `attrs_raw`; a row without one reads the resource's value.
+    #[test]
+    fn a_record_value_overrides_the_resource_value() {
+        let stream = Stream {
+            resource: str_attrs(&[("shared", "res"), ("k0", "r0")]),
+            scope: str_attrs(&[("shared", "scope")]),
+        };
+        let records = vec![
+            record(0, &stream, 1, str_attrs(&[("shared", "rec")])),
+            record(0, &stream, 2, Vec::new()),
+            record(
+                0,
+                &stream,
+                3,
+                str_attrs(&[("shared", "rec-col"), ("shared", "rec-raw")]),
+            ),
+        ];
+        let x = explicit();
+        let (got, want, attrs_raw) =
+            both_builds(&records, 8, &ColumnSelection::all(), &x.shape(&[]), None);
+        assert!(attrs_raw, "row 2's second value spilled into attrs_raw");
+        assert_eq!(texts(&got, X_SHARED), some(&["rec", "res", "rec-raw"]));
+        assert_eq!(texts(&got, X_ATTR_SHARED), some(&["rec", "res", "rec-raw"]));
+        assert_eq!(texts(&got, X_K0), some(&["r0", "r0", "r0"]));
+        assert_eq!(
+            map_rows(&got, X_ATTRS),
+            vec![
+                pairs(&[("shared", "rec"), ("k0", "r0"), ("shared", "scope")]),
+                pairs(&[("shared", "res"), ("k0", "r0"), ("shared", "scope")]),
+                pairs(&[("shared", "rec-raw"), ("k0", "r0"), ("shared", "scope")]),
+            ]
+        );
+        assert_same_columns(&got, &want);
+    }
+
+    /// A value of another variant under a declared column reads null, except
+    /// a `List` or `Map` under a `Bytes` declaration, which reads as its
+    /// canonical bytes; the `attrs` map still carries every value.
+    #[test]
+    fn a_wrong_variant_under_a_declared_column() {
+        let stream = Stream {
+            resource: Vec::new(),
+            scope: Vec::new(),
+        };
+        let list = AttrValue::List(vec![AttrValue::I64(1), AttrValue::Str("x".into())]);
+        let records = vec![
+            record(
+                0,
+                &stream,
+                1,
+                vec![
+                    ("k0".into(), AttrValue::I64(5)),
+                    ("k1".into(), AttrValue::Str("not an int".into())),
+                    ("k3".into(), list.clone()),
+                ],
+            ),
+            record(
+                0,
+                &stream,
+                2,
+                vec![
+                    ("k0".into(), AttrValue::Str("s".into())),
+                    ("k1".into(), AttrValue::I64(7)),
+                    ("k3".into(), AttrValue::Bytes(vec![1, 2])),
+                ],
+            ),
+        ];
+        let x = explicit();
+        let (got, want, _) = both_builds(&records, 8, &ColumnSelection::all(), &x.shape(&[]), None);
+        assert_eq!(texts(&got, X_K0), vec![None, Some("s".to_string())]);
+        let k1 = got
+            .column(X_K1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("k1 is I64");
+        assert_eq!(k1.iter().collect::<Vec<_>>(), vec![None, Some(7)]);
+        let k3 = got
+            .column(X_K3)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("k3 is Bytes");
+        assert_eq!(
+            k3.iter().collect::<Vec<_>>(),
+            vec![
+                Some(canonical_value_bytes(&list).as_slice()),
+                Some(&[1u8, 2][..])
+            ]
+        );
+        assert_eq!(
+            map_rows(&got, X_ATTRS)
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![3, 3]
+        );
+        assert_same_columns(&got, &want);
+    }
+
+    /// Under a selection that decodes `k0` alone, the record's undecoded
+    /// `shared` and `k1` columns read as absent: `shared` reads its
+    /// resource's value and `k1` null, as the record-based build over the
+    /// same selection reads them.
+    #[test]
+    fn undecoded_attribute_columns_read_as_absent_under_a_projected_selection() {
+        let stream = Stream {
+            resource: str_attrs(&[("shared", "res")]),
+            scope: Vec::new(),
+        };
+        let records = vec![
+            record(
+                0,
+                &stream,
+                1,
+                vec![
+                    ("k0".into(), AttrValue::Str("a".into())),
+                    ("shared".into(), AttrValue::Str("rec0".into())),
+                    ("k1".into(), AttrValue::I64(3)),
+                ],
+            ),
+            record(0, &stream, 2, str_attrs(&[("k0", "b"), ("shared", "rec1")])),
+        ];
+        let x = explicit();
+        let projection = x.projection[X_K0..].to_vec();
+        let (extended, _) = extended_schema(&x.declared, &x.attr_keys);
+        let schema = Arc::new(extended.project(&projection).expect("project"));
+        let shape = shape(
+            &schema,
+            &projection,
+            &x.declared,
+            &x.attr_keys,
+            x.full_len,
+            &[],
+        );
+        let selection = ColumnSelection::fixed_only().with_attr("k0");
+        assert!(!selection.is_all(), "a projected selection");
+        let (got, want, attrs_raw) = both_builds(&records, 8, &selection, &shape, None);
+        assert!(!attrs_raw, "every attribute has its own column");
+        let col = |x_col: usize| x_col - X_K0;
+        assert_eq!(texts(&got, col(X_K0)), some(&["a", "b"]));
+        assert_eq!(texts(&got, col(X_K1)), vec![None, None]);
+        assert_eq!(texts(&got, col(X_SHARED)), some(&["res", "res"]));
+        assert_eq!(texts(&got, col(X_ATTR_SHARED)), some(&["res", "res"]));
+        assert_same_columns(&got, &want);
+    }
+
+    /// The row-ref column of a row-path batch numbers the rows kept after
+    /// erasure from the range's first row; a chunk whose every row is
+    /// erased builds an empty batch.
+    #[test]
+    fn row_refs_number_the_rows_kept_after_erasure() {
+        let stream = Stream {
+            resource: Vec::new(),
+            scope: Vec::new(),
+        };
+        let records: Vec<LogRecord> = ["u1", "u2", "u1", "u2", "u3"]
+            .iter()
+            .enumerate()
+            .map(|(i, u)| record(0, &stream, i as i64 + 1, str_attrs(&[("user", u)])))
+            .collect();
+        let declared = declared();
+        let full = logs_schema_with_declared(&declared);
+        let schema = Arc::new(Schema::new(vec![
+            full.field(LOG_COL_TS).clone(),
+            Field::new("__ravel_row_ref", DataType::UInt64, false),
+        ]));
+        let projection = vec![LOG_COL_TS];
+        let erasure = vec![ErasurePredicate::windowless(vec![(
+            "user".into(),
+            "u1".into(),
+        )])];
+        let attr_keys: Vec<String> = Vec::new();
+        let shape = shape(
+            &schema,
+            &projection,
+            &declared,
+            &attr_keys,
+            full.fields().len(),
+            &erasure,
+        );
+        let range = RowRefRange {
+            segment: 3,
+            block: 2,
+            first_row: 10,
+        };
+        let refs = |batch: &RecordBatch| -> Vec<(usize, usize, usize)> {
+            let packed = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("row refs");
+            packed
+                .values()
+                .iter()
+                .map(|&p| {
+                    let r = RowRef::unpack(p);
+                    (r.segment, r.block, r.row)
+                })
+                .collect()
+        };
+        let (got, want, _) = both_builds(&records, 8, &ColumnSelection::all(), &shape, Some(range));
+        assert_eq!(refs(&got), vec![(3, 2, 10), (3, 2, 11), (3, 2, 12)]);
+        assert_same_columns(&got, &want);
+
+        let cfg = RlogConfig {
+            block_target_records: 64,
+            max_dynamic_columns: 8,
+            ..RlogConfig::default()
+        };
+        let obj = write(&records, &cfg);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let block = scan(&reader)
+            .next_row_block(&obj)
+            .expect("row exit")
+            .expect("block");
+        let erased = build_row_batch(
+            &block,
+            2,
+            3,
+            &mut StreamAttrsCache::new(),
+            &shape,
+            &unbounded(),
+            Some(range),
+        )
+        .expect("row batch");
+        assert_eq!(erased.num_rows(), 0, "the chunk's one row is erased");
+        assert!(refs(&erased).is_empty());
+    }
+
+    /// A pool that admits every request and records the most it held at once.
+    #[derive(Debug, Default)]
+    struct PeakPool {
+        now: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    impl std::fmt::Display for PeakPool {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PeakPool")
+        }
+    }
+
+    impl MemoryPool for PeakPool {
+        fn name(&self) -> &str {
+            "PeakPool"
+        }
+
+        fn grow(&self, _: &MemoryReservation, additional: usize) {
+            let now = self.now.fetch_add(additional, Ordering::SeqCst) + additional;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+        }
+
+        fn shrink(&self, _: &MemoryReservation, shrink: usize) {
+            self.now.fetch_sub(shrink, Ordering::SeqCst);
+        }
+
+        fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> DFResult<()> {
+            self.grow(reservation, additional);
+            Ok(())
+        }
+
+        fn reserved(&self) -> usize {
+            self.now.load(Ordering::SeqCst)
+        }
+    }
+
+    /// The most `build_row_batch` held over `N` rows whose one attribute, a
+    /// `len`-byte string, overflows into `attrs_raw`, and what it still held
+    /// once the batch was built, with the stream cache's charge.
+    fn overflow_charge(len: usize) -> (usize, usize, usize) {
+        const N: usize = 32;
+        let stream = Stream {
+            resource: str_attrs(&[("shared", "res")]),
+            scope: Vec::new(),
+        };
+        let records: Vec<LogRecord> = (0..N)
+            .map(|i| {
+                let value = format!("{i:0len$}");
+                record(
+                    0,
+                    &stream,
+                    i as i64 + 1,
+                    vec![("k0".into(), AttrValue::Str(value))],
+                )
+            })
+            .collect();
+        let cfg = RlogConfig {
+            block_target_records: 64,
+            max_dynamic_columns: 0,
+            ..RlogConfig::default()
+        };
+        let obj = write(&records, &cfg);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let block = scan(&reader)
+            .next_row_block(&obj)
+            .expect("row exit")
+            .expect("block");
+        assert_eq!(block.len(), N);
+        assert!(block.view().has_attrs_raw_page());
+        let x = explicit();
+        let pool = Arc::new(PeakPool::default());
+        let reservation =
+            MemoryConsumer::new("row path").register(&(Arc::clone(&pool) as Arc<dyn MemoryPool>));
+        let mut streams = StreamAttrsCache::new();
+        let batch = build_row_batch(
+            &block,
+            0,
+            N,
+            &mut streams,
+            &x.shape(&[]),
+            &reservation,
+            None,
+        )
+        .expect("row batch");
+        assert_eq!(batch.num_rows(), N);
+        assert_eq!(
+            reservation.size(),
+            streams.charged(),
+            "the chunk's charge is released once the batch is built"
+        );
+        (pool.peak.load(Ordering::SeqCst), reservation.size(), N)
+    }
+
+    /// The row path charges each decoded `attrs_raw` value's bytes: two
+    /// builds that differ only in their overflow values' lengths peak apart
+    /// by exactly the extra bytes, and the peak covers the overflow payload.
+    #[test]
+    fn the_row_path_charges_its_decoded_attrs_raw_bytes() {
+        const SHORT: usize = 8;
+        const LONG: usize = 8 + 4096;
+        let (short_peak, short_held, rows) = overflow_charge(SHORT);
+        let (long_peak, long_held, _) = overflow_charge(LONG);
+        assert!(short_held > 0, "the stream's attributes stay charged");
+        assert_eq!(short_held, long_held, "the same stream attributes");
+        assert_eq!(long_peak - short_peak, rows * (LONG - SHORT));
+        assert!(long_peak >= short_held + rows * LONG);
     }
 
     fn value() -> BoxedStrategy<AttrValue> {
@@ -7509,11 +8182,18 @@ mod row_path_tests {
             prop_assert_eq!(block.len(), recs.len());
             reached.attrs_raw |= block.view().has_attrs_raw_page();
             let mut streams = StreamAttrsCache::new();
+            let reservation = unbounded();
             let mut start = 0;
             while start < block.len() {
                 let end = (start + case.chunk).min(block.len());
-                let got = build_row_batch(&block, start, end, &mut streams, &shape, None)
-                    .expect("row batch");
+                let got =
+                    build_row_batch(&block, start, end, &mut streams, &shape, &reservation, None)
+                        .expect("row batch");
+                prop_assert_eq!(
+                    reservation.size(),
+                    streams.charged(),
+                    "a chunk's charge is released when its batch is built"
+                );
                 let mut want_recs = recs[start..end].to_vec();
                 retain_log_records(&mut want_recs, &erasure);
                 retain_unerased(&mut want_recs, &erasure).expect("erasure");

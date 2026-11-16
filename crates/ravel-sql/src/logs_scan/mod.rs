@@ -412,7 +412,7 @@ use ravel_query::key_index_route::{
 use ravel_query::{
     CarriedWholeObject, ColumnarBlockOutcome, KeyEquals, KeyIn, KeyIndexPruning, LogFetchError,
     LogLeafRangeReader, LogQuery, LogSegmentFetcher, LogSegmentScan, PhaseAccounting,
-    log_key_in_set, log_key_set,
+    RowBlockOutcome, log_key_in_set, log_key_set,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;

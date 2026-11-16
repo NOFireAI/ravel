@@ -59,9 +59,9 @@ pub use log_fetcher::{
     DEFAULT_LOG_REQUEST_COST_BYTES, DEFAULT_LOG_SUFFIX_LEN, DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
     KeyEquals, KeyIn, KeyedSegmentPlan, LOG_SUFFIX_FLOOR_BYTES, LOG_SUFFIX_SIZE_DIVISOR,
     LogFetchError, LogFetchOutput, LogLeafRangeReader, LogObjectBytes, LogQuery, LogSegmentFetcher,
-    LogSegmentScan, ProbeMissCounter, ProbeMissCounts, ProbePhase, ReadPhases, SegmentPlan,
-    StreamAttrEquals, WHOLE_OBJECT_REQUEST_MULTIPLE, derive_suffix_len, log_key_in_set,
-    log_key_set,
+    LogSegmentScan, ProbeMissCounter, ProbeMissCounts, ProbePhase, ReadPhases, RowBlockOutcome,
+    SegmentPlan, StreamAttrEquals, WHOLE_OBJECT_REQUEST_MULTIPLE, derive_suffix_len,
+    log_key_in_set, log_key_set,
 };
 pub use phase_accounting::{
     PhaseAccounting, PhaseAccountingSnapshot, PhaseWireByteCounter, PhaseWireByteCounts, QueryPhase,

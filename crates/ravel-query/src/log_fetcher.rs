@@ -624,12 +624,16 @@ impl LogSegmentScan {
     /// [`next_row_block`](Self::next_row_block) with the block decode run on
     /// the fetcher's read gate, exactly as
     /// [`next_block_on_gate`](Self::next_block_on_gate) runs the record exit's.
-    pub async fn next_row_block_on_gate(&mut self) -> Result<Option<RowBlock>, LogFetchError> {
+    /// Refuses as `next_row_block` does, before submitting a job.
+    pub async fn next_row_block_on_gate(
+        &mut self,
+        applies: &[ErasurePredicate],
+    ) -> Result<RowBlockOutcome, LogFetchError> {
         let Some(gate) = self.read_gate.clone() else {
-            return self.next_row_block();
+            return self.next_row_block(applies);
         };
-        if self.remaining_blocks() == 0 {
-            return self.next_row_block();
+        if self.erasure != applies || self.remaining_blocks() == 0 {
+            return self.next_row_block(applies);
         }
         let decoded = self.decode_on_gate(gate, BlockScan::next_row_block).await?;
         self.finish_row_block(decoded)
@@ -721,18 +725,28 @@ impl LogSegmentScan {
     }
 
     /// Decode the next surviving block and hand it out owned, its matching
-    /// rows unfiltered by erasure, or `None` once every surviving block has
-    /// been decoded (ADR-2773 decision 4). See [`BlockScan::next_row_block`].
+    /// rows unfiltered by erasure, or [`RowBlockOutcome::Exhausted`] once
+    /// every surviving block has been decoded (ADR-2773 decision 4). See
+    /// [`BlockScan::next_row_block`].
     ///
     /// The rows are the ones [`next_block`](Self::next_block) would rebuild
-    /// before its erasure exclusion. This exit applies none: a caller that
-    /// takes it must exclude every row a pending predicate erases
-    /// ([`erasure_pending`](Self::erasure_pending)) before any of the row's
-    /// values leave it, matching both the record attributes, as
+    /// before its erasure exclusion. This exit applies none: `applies` is the
+    /// pending predicate set the caller excludes every row of before any of
+    /// the row's values leave it, matching both the record attributes, as
     /// [`crate::erasure::retain_log_records`] does, and the merged view, as
     /// [`crate::erasure::retain_unerased_log_records`] does
-    /// ([`crate::erasure::is_erased_log_row`]).
-    pub fn next_row_block(&mut self) -> Result<Option<RowBlock>, LogFetchError> {
+    /// ([`crate::erasure::is_erased_log_row`]). When `applies` is not this
+    /// scan's pending set the exit returns
+    /// [`RowBlockOutcome::ErasureUnapplied`] without decoding anything or
+    /// advancing the cursor, so a caller that has not taken the exclusion on
+    /// cannot receive an erased row.
+    pub fn next_row_block(
+        &mut self,
+        applies: &[ErasurePredicate],
+    ) -> Result<RowBlockOutcome, LogFetchError> {
+        if self.erasure != applies {
+            return Ok(RowBlockOutcome::ErasureUnapplied);
+        }
         let Some(scan) = self.scan.as_mut() else {
             return Err(self.lost_error());
         };
@@ -746,18 +760,14 @@ impl LogSegmentScan {
     fn finish_row_block(
         &mut self,
         decoded: Result<Option<RowBlock>, LogSegError>,
-    ) -> Result<Option<RowBlock>, LogFetchError> {
-        let decoded = decoded.map_err(|source| corrupt(&self.key, source))?;
-        if decoded.is_none() {
-            self.finish();
+    ) -> Result<RowBlockOutcome, LogFetchError> {
+        match decoded.map_err(|source| corrupt(&self.key, source))? {
+            Some(block) => Ok(RowBlockOutcome::Block(block)),
+            None => {
+                self.finish();
+                Ok(RowBlockOutcome::Exhausted)
+            }
         }
-        Ok(decoded)
-    }
-
-    /// The pending erasure predicates a caller of
-    /// [`next_row_block`](Self::next_row_block) must apply.
-    pub fn erasure(&self) -> &[ErasurePredicate] {
-        &self.erasure
     }
 
     /// The object key, for attributing a fault a caller finds in a
@@ -895,6 +905,19 @@ pub enum ColumnarBlockOutcome<'a> {
     /// out. Nothing was decoded and the cursor did not advance; drain
     /// [`LogSegmentScan::next_block`] instead.
     ErasurePending,
+}
+
+/// What [`LogSegmentScan::next_row_block`] produced.
+#[derive(Debug)]
+pub enum RowBlockOutcome {
+    /// The next surviving block, its rows not yet filtered by erasure.
+    Block(RowBlock),
+    /// Every surviving block has been decoded.
+    Exhausted,
+    /// The caller's predicate set is not this scan's pending erasure set, so
+    /// no block is handed out. Nothing was decoded and the cursor did not
+    /// advance.
+    ErasureUnapplied,
 }
 
 /// Errors fetching and decoding one RLOG segment. Every variant is a hard
@@ -14651,6 +14674,62 @@ mod read_gate_tests {
             site_counts(&high_floor, ReadSite::LogBlock),
             (0, BLOCKS as u64)
         );
+    }
+
+    /// The gated row-block exit refuses a caller whose predicate set is not
+    /// the scan's pending erasure set before it submits a job, so no block,
+    /// and with it no erased row, reaches that caller; the scan's own set
+    /// then drains every block through the gate.
+    ///
+    /// FLIP: drop the `self.erasure != applies` test from
+    /// `next_row_block_on_gate` and the empty-set call decodes block 0 on the
+    /// gate: the refusal assertion panics on `Block(RowBlock { .. })`.
+    #[tokio::test]
+    async fn gated_row_block_exit_refuses_an_unapplied_erasure() {
+        let (store, seg_ref) = fixture().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let gate = floor_zero_gate();
+        let fetcher = LogSegmentFetcher::new(backend).with_read_gate(gate.clone());
+        let pending = vec![ErasurePredicate::windowless(vec![(
+            "request.id".to_string(),
+            "r0".to_string(),
+        )])];
+        let query = LogQuery::new(i64::MIN, i64::MAX).with_erasure(pending.clone());
+        let mut scan = fetcher
+            .scan_accounted_with_tenant(
+                &seg_ref,
+                TENANT,
+                &query,
+                &ColumnSelection::all(),
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("scan")
+            .expect("the segment is relevant");
+
+        let other = vec![ErasurePredicate::windowless(vec![(
+            "request.id".to_string(),
+            "r1".to_string(),
+        )])];
+        for applies in [&[][..], &other[..]] {
+            let outcome = scan.next_row_block_on_gate(applies).await.expect("exit");
+            assert!(
+                matches!(outcome, RowBlockOutcome::ErasureUnapplied),
+                "refused, got {outcome:?}"
+            );
+        }
+        assert_eq!(scan.stats().blocks_scanned, 0, "nothing decoded");
+        assert_eq!(site_counts(&gate, ReadSite::LogBlock), (0, 0), "no job");
+
+        let mut blocks = 0;
+        while let RowBlockOutcome::Block(block) =
+            scan.next_row_block_on_gate(&pending).await.expect("exit")
+        {
+            assert_eq!(block.len(), 1);
+            blocks += 1;
+        }
+        assert_eq!(blocks, BLOCKS);
+        assert_eq!(site_counts(&gate, ReadSite::LogBlock), (BLOCKS as u64, 0));
     }
 
     /// The job size is the largest block's summed uncompressed page length,
