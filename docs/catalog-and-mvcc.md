@@ -202,7 +202,8 @@ payload's nanosecond lease is converted to milliseconds for the sum), never
 against a node clock or the payload's `owner_clock_ns`. Every observed lease,
 the holder-declared one and the observer's configured fallback alike, is
 capped at 24 hours (`MAX_OBSERVED_LEASE_MS`), so a decodable-but-absurd lease
-suppresses a bucket for at most a day. A contender that finds the claim held
+suppresses a bucket for at most a day, except a version-protected claim
+(below). A contender that finds the claim held
 does exactly one GET plus one `head()`, reschedules its bucket past expiry with
 deterministic per-contender jitter, and never polls. Nothing deletes these
 objects PROGRAMMATICALLY: an unconditional DELETE by a worker whose claim was
@@ -212,8 +213,13 @@ decodes is judged by the 24 hour ceiling: it holds its bucket against both the
 compaction and the erasure rewrite until its `last_modified` is more than
 `MAX_OBSERVED_LEASE_MS` plus the contender's jitter in the past, and then a
 contender steals it under CAS on the observed version, so the stealing pass
-runs fenced (ADR-1029, 2026-11-09 amendment). A pass never runs past an
-unreadable claim unclaimed, since it would publish unfenced. An operator who
+runs fenced (ADR-1029, 2026-11-09 amendment). A claim whose `format_version`
+is 0 or above the version this build knows is version-protected instead
+(ADR-4233 decision 4, H8; ADR-1029, 2026-11-15 amendment): it decodes, is
+never stolen at any age, and holds its bucket until an operator deletes the
+object or a build that knows the version reclaims it; the contender rechecks
+it once per lease, so a hand delete is noticed without a restart. A pass never
+runs past an unreadable claim unclaimed, since it would publish unfenced. An operator who
 needs the bucket sooner may delete that one key by hand, but only once no
 compaction, migration or erasure rewrite of that bucket is running. A writer
 that re-PUTs a claim more often than every 24 hours still holds the bucket.
