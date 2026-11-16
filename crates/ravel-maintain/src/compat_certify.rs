@@ -72,7 +72,7 @@ use ravel_proto::sys::v1 as sysproto;
 use ravel_rspan::footer::SpanFooter;
 use ravel_types::{Signal, TenantHash};
 
-use crate::discover::discover_tenants;
+use crate::compat_init::{StrictListError, list_tenants_strict};
 use crate::error::{MaintainError, Result};
 
 /// The staleness horizon `H`: a writer stops starting to encode a
@@ -202,6 +202,18 @@ pub enum CertifyReport {
     /// The budget stopped the census before it covered every bucket. The
     /// cursor keeps `S`; a later run resumes from it.
     Incomplete { units_examined: usize },
+    /// The family carries an uncontradicted certificate whose floor raises a
+    /// crashed run left unfinished, and no late-write pass has cleared the
+    /// window since the CAS: the watermark is not past `certified_unix_ns`, so
+    /// finishing the raises on the census numbers could floor a bucket that
+    /// holds a below-target write landed after the CAS (ADR-4233 decision 7).
+    /// The cursor is kept; a run after a late-write pass advances the watermark
+    /// finishes them. Nothing was written this run.
+    FinalizationPending {
+        version: u32,
+        certified_unix_ns: i64,
+        watermark_unix_ns: i64,
+    },
     /// A precondition refused the run before any certificate was written.
     Refused(CertifyRefusal),
 }
@@ -451,6 +463,22 @@ fn prov_err(err: ProvisioningError) -> MaintainError {
     MaintainError::Invariant(format!("provisioning: {err}"))
 }
 
+/// Every tenant with data under `t/`, sorted, by the same strict listing
+/// `compat init` uses ([`list_tenants_strict`]): an unaddressable key or
+/// prefix, or any directory that is not a lowercase 32-hex tenant hash,
+/// refuses rather than skipping it (ADR-4233 decision 6). The census, its
+/// recheck and the late-write pass share this so none widens or narrows the
+/// population past the others.
+pub(crate) async fn list_tenants(store: &dyn ObjectStoreBackend) -> Result<Vec<TenantHash>> {
+    list_tenants_strict(store).await.map_err(|err| match err {
+        StrictListError::Store { source, .. } => MaintainError::Store(source),
+        StrictListError::Unaddressable { prefix, key, count } => {
+            MaintainError::UnaddressableKey { prefix, key, count }
+        }
+        StrictListError::NotATenant { name, .. } => MaintainError::InvalidTenantPrefix(name),
+    })
+}
+
 /// The shard count to scan for a `(tenant, signal)`: the widest the generation
 /// history ever used, widened to cover every shard directory present under
 /// `l0/`, `l1/` and `c/`, and floored at the signal's pinned read shards and at
@@ -502,15 +530,17 @@ pub(crate) async fn scan_shards_for(
 }
 
 /// The shard index of a common prefix `<listed>/<digits>/`, or `None` when the
-/// segment is not a plain decimal shard number.
+/// segment is not a shard directory in its canonical spelling. `census_shard`
+/// lists `{shard:04}`, the same zero-padded form `keys::format_shard` writes,
+/// so a directory like `l0/1/` or `l0/00001/` parses to a number the census
+/// never lists under and is refused rather than widening the range to cover a
+/// shard no object key uses.
 fn shard_index_of(common_prefix: &str, listed_prefix: &str) -> Option<u32> {
     let segment = common_prefix
         .strip_prefix(listed_prefix)?
         .strip_suffix('/')?;
-    if segment.is_empty() || !segment.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    segment.parse().ok()
+    let index: u32 = segment.parse().ok()?;
+    (format!("{index:04}") == segment).then_some(index)
 }
 
 /// One data or part object the census checks. `stamp` is the version its
@@ -769,33 +799,55 @@ pub async fn certify(
     };
 
     // A certification whose CAS succeeded but whose floor raises did not all
-    // finish left its cursor marked with the certificate it wrote: finish
-    // the raises first. A contradicted certificate gets none, so `migrate`
-    // still rewrites the bucket holding the late write.
+    // finish left its cursor marked with the certificate it wrote.
     let cursor_key = certify_cursor_key(family);
     let mut stored = read_certify_cursor(store, &cursor_key, signals.len()).await?;
-    if let StoredCursor::Present(pending, _) = &stored
+    if let StoredCursor::Present(pending, pending_version) = &stored
         && let Some(certificate) = entry.certificate.as_ref()
         && pending.finalizing_unix_ns == Some(certificate.certified_unix_ns)
         && pending.target_version == certificate.version
     {
-        if !entry.contradicted {
+        if entry.contradicted {
+            // A late write already contradicted the certificate: the bucket
+            // holding it gets no floor, so `migrate` still rewrites it. Drop
+            // the finalizing cursor and let a fresh census run for the retry.
+            delete_cursor(store, &cursor_key, pending_version).await;
+            stored = read_certify_cursor(store, &cursor_key, signals.len()).await?;
+        } else if entry.late_writes_verified_through_unix_ns > certificate.certified_unix_ns {
+            // The raises finish only once a late-write pass that started after
+            // the CAS found nothing (the watermark passes `certified_unix_ns`
+            // only then, since `late_write_pass` advances it to its own start).
+            // Flooring on the census numbers before that pass could raise a
+            // bucket to the target while it holds a below-target write that
+            // landed after the CAS and that no pass has yet turned into
+            // `contradicted`, and `background_migrate_unit` would then skip it.
             let bases = match floor_bases(store, signals, pending).await? {
                 Ok(bases) => bases,
                 Err(refusal) => return Ok(CertifyReport::Refused(refusal)),
             };
             raise_floors(store, family, certificate.version, &bases, now_ns).await?;
-        }
-        delete_cursor(store, &cursor_key).await;
-        if !entry.contradicted && certificate.version == target_version {
-            return Ok(CertifyReport::Certified {
+            let finished = certificate.version == target_version;
+            let report = CertifyReport::Certified {
                 version: certificate.version,
                 member_count: certificate.member_count,
                 buckets_scanned: certificate.buckets_scanned,
                 newest_created_unix_ns: certificate.newest_created_unix_ns,
+            };
+            delete_cursor(store, &cursor_key, pending_version).await;
+            if finished {
+                return Ok(report);
+            }
+            stored = read_certify_cursor(store, &cursor_key, signals.len()).await?;
+        } else {
+            // The certificate is written but its finalization is pending a
+            // late-write pass. Keep the cursor and report it rather than
+            // raising on stale census numbers or masking it as AlreadyCertified.
+            return Ok(CertifyReport::FinalizationPending {
+                version: certificate.version,
+                certified_unix_ns: certificate.certified_unix_ns,
+                watermark_unix_ns: entry.late_writes_verified_through_unix_ns,
             });
         }
-        stored = read_certify_cursor(store, &cursor_key, signals.len()).await?;
     }
 
     if target_version > entry.active_write_version {
@@ -828,9 +880,9 @@ pub async fn certify(
     let g_pre = timings.g_pre_ns(p_ns);
 
     // The tenant set, fixed before the census so the digest, the census and
-    // the recheck use the same population.
-    let mut tenants = discover_tenants(store).await?;
-    tenants.sort();
+    // the recheck use the same population. The strict listing refuses an
+    // unaddressable prefix or a non-tenant directory rather than skipping it.
+    let tenants = list_tenants(store).await?;
 
     // The newest non-born fence over every provisioned bucket: the second term
     // of the time precondition (a born-fenced bucket, time 0, is left out).
@@ -970,8 +1022,7 @@ pub async fn certify(
     // every tenant whichever run censused it: the tenant set is the one the
     // census covered, every bucket is fenced at or above the activation epoch,
     // and every bucket's own G_pre has passed.
-    let mut tenants_now = discover_tenants(store).await?;
-    tenants_now.sort();
+    let tenants_now = list_tenants(store).await?;
     if tenants_now != tenants {
         return Ok(CertifyReport::Refused(CertifyRefusal::TenantSetChanged));
     }
@@ -1047,12 +1098,11 @@ pub async fn certify(
     // run that stops between the CAS and the last floor raise is completed by
     // the next one.
     cursor.finalizing_unix_ns = Some(now_ns);
-    if put_certify_cursor(store, &cursor_key, &cursor, cursor_version.as_ref())
-        .await?
-        .is_none()
-    {
+    let Some(finalizing_version) =
+        put_certify_cursor(store, &cursor_key, &cursor, cursor_version.as_ref()).await?
+    else {
         return Ok(CertifyReport::Refused(CertifyRefusal::ConcurrentCertify));
-    }
+    };
 
     let mut refusal = None;
     let written = update_compat(store, keys_compat, |record| {
@@ -1096,9 +1146,9 @@ pub async fn certify(
     raise_floors(store, family, target_version, &bases, now_ns).await?;
 
     // A cursor this delete leaves behind is never resumed as a census: its
-    // marker matches the certificate, so the next run repeats the floor
-    // raises (each already at the target is a no-op) and deletes it.
-    delete_cursor(store, &cursor_key).await;
+    // marker matches the certificate, so the next run finishes the floor
+    // raises once a late-write pass has cleared the window and deletes it.
+    delete_cursor(store, &cursor_key, &finalizing_version).await;
 
     Ok(CertifyReport::Certified {
         version: target_version,
@@ -1185,16 +1235,29 @@ async fn raise_floors(
     Ok(())
 }
 
-/// Delete the certify cursor. A failure is logged, not returned: every caller
-/// has already written what the cursor tracked, and a cursor left behind is
-/// either completed or found stale by the next run.
-async fn delete_cursor(store: &dyn ObjectStoreBackend, cursor_key: &str) {
-    match store.delete(cursor_key).await {
-        Ok(()) | Err(StoreError::NotFound) => {}
+/// Delete the certify cursor, but only while it is still at `expected`, the
+/// version this run read: a concurrent run that replaced it with its own census
+/// keeps its cursor, so a plain key delete cannot remove another run's work
+/// (finding 4). A failure is logged, not returned: every caller has already
+/// written what the cursor tracked, and a cursor left behind is either
+/// completed or found stale by the next run.
+async fn delete_cursor(store: &dyn ObjectStoreBackend, cursor_key: &str, expected: &Version) {
+    match store.get(cursor_key, GetRange::Full).await {
+        Ok(got) if &got.version == expected => match store.delete(cursor_key).await {
+            Ok(()) | Err(StoreError::NotFound) => {}
+            Err(err) => tracing::warn!(
+                key = %cursor_key,
+                error = %err,
+                "compat certify: could not delete the completed cursor"
+            ),
+        },
+        // Another run replaced the cursor since we read it, or it is already
+        // gone: leave it for whichever run now owns it.
+        Ok(_) | Err(StoreError::NotFound) => {}
         Err(err) => tracing::warn!(
             key = %cursor_key,
             error = %err,
-            "compat certify: could not delete the completed cursor"
+            "compat certify: could not read the cursor before deleting it"
         ),
     }
 }
@@ -2631,7 +2694,16 @@ mod tests {
     /// directory refuses: no shard census would cover it.
     #[tokio::test]
     async fn a_non_shard_entry_refuses() {
-        for stray in ["l0/stray.rlog", "l1/abc/stray.rlog", "c/0x01/stray.cmt"] {
+        for stray in [
+            "l0/stray.rlog",
+            "l1/abc/stray.rlog",
+            "c/0x01/stray.cmt",
+            // Digits that are not the canonical zero-padded shard spelling the
+            // census lists under (finding 2): `l0/1/` is too short, `c/00001/`
+            // too long, so both parse to a shard the census never probes.
+            "l0/1/stray.rlog",
+            "c/00001/stray.cmt",
+        ] {
             let store = new_store();
             seed_compat(&*store, FAMILY_RLOG, V_LOG).await;
             seed_log(&store, tenant(), 0, 1, 1_000).await;
@@ -3274,16 +3346,28 @@ mod tests {
         assert_eq!(rlog_floor(&*inner, tenant(), Signal::Logs).await, None);
     }
 
-    /// A run that stops after the certificate CAS and before its floor raises
-    /// finish is completed by the next run: the floor is raised and the
-    /// cursor removed, and the same-version run reports the certificate the
-    /// first run wrote rather than refusing it as already certified.
+    /// ACCEPTANCE (finding 1): a run that stops after the certificate CAS and
+    /// before its floor raises finish leaves the floor unraised until a
+    /// late-write pass has cleared the window the CAS opened. A resume before
+    /// any such pass reports `FinalizationPending` and raises nothing; a resume
+    /// after one finishes the raises and reports the certificate.
+    ///
+    /// DISTINGUISHING, two wrong implementations this rules out:
+    ///  1. a resume that finishes the raises with no watermark check (the
+    ///     behaviour before this fix) would floor the bucket on the first
+    ///     resume, before any pass -- the `floor == None` assertion after the
+    ///     first resume fails.
+    ///  2. a resume gated on `watermark >= certified_unix_ns` rather than `>`
+    ///     would pass on the first resume, where the CAS left the two equal, and
+    ///     would floor the bucket then -- the same assertion fails.
     #[tokio::test]
-    async fn floor_raises_interrupted_after_the_cas_are_completed() {
+    async fn finalizing_floor_raises_wait_for_a_late_write_pass_after_the_cas() {
         let inner = new_store();
         seed_compat(&*inner, FAMILY_RLOG, V_LOG).await;
         provision_fenced(&*inner, tenant(), Signal::Logs, 1).await;
         seed_log(&inner, tenant(), 0, 1, 1_000).await;
+        // Fault the provisioning-record PUT `raise_format_floor` performs, so
+        // the CAS succeeds but the floor raises do not finish.
         let plan = FaultPlan::empty().with_rule(
             Rule::new(Op::Put, ScriptedFault::Permanent("put down".to_string()))
                 .with_key_contains(provisioning_key(&tenant(), Signal::Logs)),
@@ -3309,7 +3393,40 @@ mod tests {
         assert_eq!(rlog_floor(&*inner, tenant(), Signal::Logs).await, None);
         assert!(cursor_present(&*inner).await);
 
+        // Resume before any late-write pass: the watermark (S == NOW1) is not
+        // past the certificate time, so nothing is raised.
         let report = certify_rlog(&*inner, NOW1 + HOUR, V_LOG, None).await;
+        assert_eq!(
+            report,
+            CertifyReport::FinalizationPending {
+                version: V_LOG,
+                certified_unix_ns: NOW1,
+                watermark_unix_ns: NOW1,
+            }
+        );
+        assert_eq!(
+            rlog_floor(&*inner, tenant(), Signal::Logs).await,
+            None,
+            "no raise before a late-write pass"
+        );
+        assert!(
+            cursor_present(&*inner).await,
+            "cursor kept for a later finalization"
+        );
+
+        // A late-write pass after the CAS finds nothing and advances the
+        // watermark past the certificate time.
+        let pass = late_write_pass(&*inner, &ckeys(), NOW1 + 2 * HOUR, FAMILY_RLOG, skew())
+            .await
+            .expect("pass");
+        assert!(pass.late_writes.is_empty(), "{pass:?}");
+        assert!(
+            pass.watermark_unix_ns > NOW1,
+            "watermark past the certificate time: {pass:?}"
+        );
+
+        // Now the resume finishes the raises and reports the certificate.
+        let report = certify_rlog(&*inner, NOW1 + 3 * HOUR, V_LOG, None).await;
         assert_eq!(
             report,
             CertifyReport::Certified {
