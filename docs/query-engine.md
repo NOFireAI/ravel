@@ -3972,7 +3972,7 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   (segment catalog fetch), `scan` (block and page data reads), `keyIndex`
   (the KEY_IDX reads of a spans `trace_id =` lookup or a logs exact-key
   equality; 0 on every other statement), `fetch` (TopK late materialization's
-  phase-2 row fetch of the winners, ADR-0774 and issue #797: every probe,
+  phase-2 row fetch of the winners, ADR-0774: every probe,
   footer, section and page read the winners' row fetch issues, held apart from
   the ordinary phase-1 `scan`; 0 on any statement that runs no late
   materialization). The rendering iterates `QueryPhase::ALL`, so a phase added to
@@ -6284,7 +6284,7 @@ would shift surviving-row positions between the phases.
 What it costs is at most `k` logical block fetches (winners in one block
 share a fetch); the object-store requests behind them depend on the fetch
 path, as the next paragraph says. Those are accounted under the `fetch` entry
-of `stats.phases`, apart from phase 1's `scan` (issue #797), and
+of `stats.phases`, apart from phase 1's `scan`, and
 `LogsRowFetchExec` publishes `row_refs`, `blocks_fetched`, and
 `segments_fetched` as metrics (`ravel-cli sql explain --analyze` prints them)
 so a report can state phase 2's cost instead of inferring it. With a read

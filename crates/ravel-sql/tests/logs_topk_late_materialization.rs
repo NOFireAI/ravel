@@ -1441,7 +1441,11 @@ async fn run_ranged(rule: bool) -> RangedRun {
 /// sparse winners never cross the whole-object threshold, which is the state
 /// issue #797 measures; without it the production gap would read the whole
 /// object and no coalesced range would exist to inspect.
-async fn run_ranged_gap(rule: bool, coalesce_gap: Option<u64>, disable_crossover: bool) -> RangedRun {
+async fn run_ranged_gap(
+    rule: bool,
+    coalesce_gap: Option<u64>,
+    disable_crossover: bool,
+) -> RangedRun {
     let base = Arc::new(MemoryStore::new());
     let (snapshot, object) = ranged_snapshot(base.as_ref()).await;
     let recording = Arc::new(RecordingStore {
@@ -1743,7 +1747,10 @@ async fn phase_two_at_production_gap_coalesces_the_winners_blocks() {
     // coalesce into a single range that spans the whole section, carrying
     // blocks 0, 2 and 4's pages as the holes between the winners.
     assert_eq!(fetch_gets, 2, "one probe plus one coalesced range");
-    assert_eq!(fetch_wire, 9_704, "probe plus the coalesced range, as transferred");
+    assert_eq!(
+        fetch_wire, 9_704,
+        "probe plus the coalesced range, as transferred"
+    );
     assert_eq!(
         fetch_block_bytes, 5_544,
         "the coalesced range is the whole BLOCKS section"
@@ -1767,6 +1774,9 @@ async fn phase_two_at_production_gap_coalesces_the_winners_blocks() {
     // points to pin it without a float compare: 5544 / 2820 = 1.966, below 2.
     let ratio_bp = fetch_block_bytes * 10_000 / pages;
     assert_eq!(pages, 2_820, "the winners' own page bytes");
-    assert_eq!(ratio_bp, 19_659, "fetch BLOCKS bytes / winner pages = 1.966");
+    assert_eq!(
+        ratio_bp, 19_659,
+        "fetch BLOCKS bytes / winner pages = 1.966"
+    );
     assert!(ratio_bp < 20_000, "ratio is below 2 on this fixture");
 }

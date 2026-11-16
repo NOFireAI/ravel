@@ -846,8 +846,10 @@ fn print_human_table(report: &SqlLatencyReport) {
         // The cold run is run index 0, so this needs no minimum run count, only
         // the per-run array the Flight lane does not carry.
         let probe_misses = match e.per_run_accounting.as_deref() {
-            Some([cold, ..]) => (cold.probe_misses_plan + cold.probe_misses_scan + cold.probe_misses_fetch)
-                .to_string(),
+            Some([cold, ..]) => {
+                (cold.probe_misses_plan + cold.probe_misses_scan + cold.probe_misses_fetch)
+                    .to_string()
+            }
             _ => "-".to_string(),
         };
         eprintln!(

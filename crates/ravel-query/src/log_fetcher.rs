@@ -17770,9 +17770,9 @@ mod version_refusal_tests {
                     ProbePhase::Scan,
                     &acc,
                 )
-                    .await
-                    .err()
-                    .expect("scan_accounted_with_tenant_subset refuses"),
+                .await
+                .err()
+                .expect("scan_accounted_with_tenant_subset refuses"),
             );
             out.push(
                 f.scan_accounted_with_tenant_subset_raw(
