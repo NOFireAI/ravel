@@ -5809,4 +5809,299 @@ mod tests {
         assert_eq!(compaction_record_count(&store, 0, 101).await, 1);
         assert_eq!(stored().await, foreign, "the drain deleted no cursor");
     }
+
+    /// Every object in the store with its bytes' hash, for before/after
+    /// comparisons around a refused run.
+    async fn store_snapshot(store: &dyn ObjectStoreBackend) -> Vec<(String, [u8; 32])> {
+        let mut out = Vec::new();
+        for meta in ravel_object_store::list_all(store, "")
+            .await
+            .expect("list")
+        {
+            let got = store.get(&meta.key, GetRange::Full).await.expect("get");
+            out.push((meta.key, *blake3::hash(&got.data).as_bytes()));
+        }
+        out
+    }
+
+    async fn provisioned_compat_epoch(store: &dyn ObjectStoreBackend) -> u64 {
+        use prost::Message;
+        let key = ravel_catalog::provisioning_key(&tenant_hash(), Signal::Metrics);
+        let got = store.get(&key, GetRange::Full).await.expect("provisioning");
+        ravel_proto::sys::v1::ProvisioningRecord::decode(got.data.as_ref())
+            .expect("decode provisioning")
+            .compat_epoch
+    }
+
+    /// The format versions of `(shard, hour)`'s compaction output: each
+    /// record part's stamp and its object's trailer.
+    async fn compacted_versions(
+        store: &dyn ObjectStoreBackend,
+        shard: u32,
+        hour: u32,
+    ) -> Vec<(u32, u16)> {
+        let bucket = Bucket::new(tenant_hash(), Signal::Metrics, shard, hour);
+        let listing = list_bucket(store, &bucket).await.expect("list bucket");
+        let mut out = Vec::new();
+        for key in &listing.compaction_record_keys {
+            let got = store.get(key, GetRange::Full).await.expect("record");
+            let rec = record::decode_compaction(&got.data).expect("decode record");
+            for part in &rec.parts {
+                let part_key = keys::reconstruct_l1_part_key(&rec, part).expect("part key");
+                let obj = store.get(&part_key, GetRange::Full).await.expect("part");
+                let trailer = ravel_segment::open_from_full(
+                    &obj.data,
+                    ravel_segment::ReaderLimits::default(),
+                )
+                .expect("open part")
+                .version;
+                out.push((part.segment_format_version, trailer));
+            }
+        }
+        out
+    }
+
+    /// The RSEG table of a build that writes 6 and 7, baseline 6.
+    fn two_rseg() -> crate::FamilyVersions {
+        crate::FamilyVersions {
+            writable: vec![6, 7],
+            baseline: 6,
+        }
+    }
+
+    fn compat_refusal(err: &MaintainError) -> crate::compat_policy::CompatRunRefusal {
+        match err {
+            MaintainError::CompatRefused { refusal, .. } => refusal.clone(),
+            other => panic!("expected a compat refusal, got {other:?}"),
+        }
+    }
+
+    /// ADR-4233 decision 6: under a compat policy `migrate` writes only the
+    /// family's active version. A target the record does not name active is
+    /// refused before the walk lists or writes anything, counted. Once the
+    /// family is activated to the target the same walk rewrites the bucket at
+    /// it, raises the bucket's fence first (the first publish above the
+    /// baseline), and raises the floor; the old version is then refused.
+    #[tokio::test]
+    async fn migrate_writes_the_active_version_and_refuses_an_inactive_target() {
+        use crate::compat_policy::CompatRunRefusal;
+        use crate::compat_policy::test_support::{
+            ManualClock, T0, activate, family, policy, write_compat,
+        };
+        use ravel_catalog::compat::FAMILY_RSEG;
+
+        let store = Arc::new(MemoryStore::new());
+        write_compat(store.as_ref(), vec![family(FAMILY_RSEG, 6)], NS_PER_HOUR).await;
+        provision(store.as_ref(), 1).await;
+        seed_at(store.as_ref(), 0, 100, 1, "alpha", 6).await;
+        let clock = FixedClock::new(sealed_now_ns_for(100));
+        let compat_clock = ManualClock::at(T0);
+        let config_at = |policy| CompactorConfig {
+            compat_policy: Some(policy),
+            ..CompactorConfig::default()
+        };
+        let migrate = |config: CompactorConfig, target: u32| {
+            let store = store.clone();
+            let clock = clock.clone();
+            async move {
+                migrate_family(
+                    store.as_ref(),
+                    &clock,
+                    &config,
+                    tenant_hash(),
+                    Signal::Metrics,
+                    FAMILY,
+                    target,
+                    1,
+                    MigrateBudget::unlimited(),
+                    "test",
+                )
+                .await
+            }
+        };
+        let refused = || crate::compat_publish_refused_total(FAMILY_RSEG, "target_not_active");
+        let before_count = refused();
+        let before = store_snapshot(store.as_ref()).await;
+
+        let config = config_at(
+            policy(store.clone(), compat_clock.clone())
+                .await
+                .with_family(FAMILY_RSEG, two_rseg()),
+        );
+        let err = migrate(config, 7).await.expect_err("7 is not active");
+        assert_eq!(
+            compat_refusal(&err),
+            CompatRunRefusal::TargetNotActive {
+                target: 7,
+                active: 6
+            }
+        );
+        assert_eq!(store_snapshot(store.as_ref()).await, before, "nothing is written");
+        assert_eq!(refused(), before_count + 1);
+
+        activate(store.as_ref(), FAMILY_RSEG, 7).await;
+        let config = config_at(
+            policy(store.clone(), compat_clock.clone())
+                .await
+                .with_family(FAMILY_RSEG, two_rseg()),
+        );
+        let report = migrate(config.clone(), 7).await.expect("7 is active");
+        assert_eq!(report.buckets_migrated, 1, "{report:?}");
+        assert_eq!(
+            report.verification,
+            Some(Verification::FloorRaised { floor_version: 7 })
+        );
+        assert_eq!(compacted_versions(store.as_ref(), 0, 100).await, vec![(7, 7)]);
+        assert_eq!(
+            provisioned_compat_epoch(store.as_ref()).await,
+            1,
+            "the bucket's first publish above the baseline raised its fence"
+        );
+
+        let before = store_snapshot(store.as_ref()).await;
+        let err = migrate(config, 6).await.expect_err("6 is no longer active");
+        assert_eq!(
+            compat_refusal(&err),
+            CompatRunRefusal::TargetNotActive {
+                target: 6,
+                active: 7
+            }
+        );
+        assert_eq!(store_snapshot(store.as_ref()).await, before, "nothing is written");
+        assert_eq!(refused(), before_count + 2);
+    }
+
+    /// The background unit does nothing without a policy, walks toward the
+    /// active version while the floor is below it, and is a provisioning read
+    /// once the walk raised the floor.
+    #[tokio::test]
+    async fn the_background_unit_walks_to_the_active_version_then_rests() {
+        use crate::compat_policy::test_support::{
+            ManualClock, T0, activate, family, policy, write_compat,
+        };
+        use ravel_catalog::compat::FAMILY_RSEG;
+
+        let store = Arc::new(MemoryStore::new());
+        write_compat(store.as_ref(), vec![family(FAMILY_RSEG, 6)], NS_PER_HOUR).await;
+        provision(store.as_ref(), 1).await;
+        seed_at(store.as_ref(), 0, 100, 1, "alpha", 6).await;
+        activate(store.as_ref(), FAMILY_RSEG, 7).await;
+        let clock = FixedClock::new(sealed_now_ns_for(100));
+        let unit = |config: CompactorConfig| {
+            let store = store.clone();
+            let clock = clock.clone();
+            async move {
+                background_migrate_unit(
+                    store.as_ref(),
+                    &clock,
+                    &config,
+                    tenant_hash(),
+                    Signal::Metrics,
+                    FAMILY,
+                    1,
+                    MigrateBudget::unlimited(),
+                )
+                .await
+                .expect("unit")
+            }
+        };
+
+        let before = store_snapshot(store.as_ref()).await;
+        assert_eq!(
+            unit(CompactorConfig::default()).await,
+            BackgroundMigrateOutcome::NoPolicy
+        );
+        assert_eq!(store_snapshot(store.as_ref()).await, before);
+
+        let config = CompactorConfig {
+            compat_policy: Some(
+                policy(store.clone(), ManualClock::at(T0))
+                    .await
+                    .with_family(FAMILY_RSEG, two_rseg()),
+            ),
+            ..CompactorConfig::default()
+        };
+        let BackgroundMigrateOutcome::Walked {
+            active_version,
+            report,
+            held,
+        } = unit(config.clone()).await
+        else {
+            panic!("expected a walk");
+        };
+        assert_eq!(active_version, 7);
+        assert!(held.is_empty(), "{held:?}");
+        assert_eq!(report.buckets_migrated, 1, "{report:?}");
+        assert_eq!(
+            report.verification,
+            Some(Verification::FloorRaised { floor_version: 7 })
+        );
+        assert_eq!(compacted_versions(store.as_ref(), 0, 100).await, vec![(7, 7)]);
+        let floor =
+            current_floor_from_store(store.as_ref(), &tenant_hash(), Signal::Metrics, FAMILY)
+                .await
+                .expect("floor");
+        assert_eq!(floor, Some(7));
+
+        let before = store_snapshot(store.as_ref()).await;
+        assert_eq!(
+            unit(config).await,
+            BackgroundMigrateOutcome::UpToDate {
+                active_version: 7,
+                floor: 7
+            }
+        );
+        assert_eq!(store_snapshot(store.as_ref()).await, before);
+    }
+
+    /// An active version this build cannot write makes the background unit a
+    /// counted refusal, not an error and not a write.
+    #[tokio::test]
+    async fn the_background_unit_reports_a_refused_run_as_no_run() {
+        use crate::compat_policy::CompatRunRefusal;
+        use crate::compat_policy::test_support::{ManualClock, T0, family, policy, write_compat};
+        use ravel_catalog::compat::{CompatRefusal, FAMILY_RSEG};
+
+        let store = Arc::new(MemoryStore::new());
+        write_compat(store.as_ref(), vec![family(FAMILY_RSEG, 8)], NS_PER_HOUR).await;
+        provision(store.as_ref(), 1).await;
+        seed_at(store.as_ref(), 0, 100, 1, "alpha", 6).await;
+        let config = CompactorConfig {
+            compat_policy: Some(policy(store.clone(), ManualClock::at(T0)).await),
+            ..CompactorConfig::default()
+        };
+        let before = store_snapshot(store.as_ref()).await;
+        let refused =
+            crate::compat_publish_refused_total(FAMILY_RSEG, "active_version_not_writable");
+
+        let outcome = background_migrate_unit(
+            store.as_ref(),
+            &FixedClock::new(sealed_now_ns_for(100)),
+            &config,
+            tenant_hash(),
+            Signal::Metrics,
+            FAMILY,
+            1,
+            MigrateBudget::unlimited(),
+        )
+        .await
+        .expect("a refusal is an outcome");
+
+        assert!(
+            matches!(
+                outcome,
+                BackgroundMigrateOutcome::Refused {
+                    refusal: CompatRunRefusal::Compat(
+                        CompatRefusal::ActiveVersionNotWritable { active: 8, .. }
+                    )
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(store_snapshot(store.as_ref()).await, before);
+        assert_eq!(
+            crate::compat_publish_refused_total(FAMILY_RSEG, "active_version_not_writable"),
+            refused + 1
+        );
+    }
 }
