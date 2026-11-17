@@ -26,6 +26,7 @@ OTHER=00000000000000000000000000000001
 FENCE=$(date -u -d 2026-11-16T19:40:18Z +%s)
 HORIZON=$(drill_ingest_horizon "$FENCE" 60)
 ALERTS=$((FENCE + 63))
+TRUST=$(drill_trust_limit "$FENCE")
 
 # Horizon: (hour of the fence + 3) hours, plus the request margin.
 [ "$HORIZON" -eq "$(date -u -d 2026-11-16T22:01:00Z +%s)" ] && ok "horizon of a 19:40:18 fence is 22:01:00" || bad "horizon 19:40:18 gave $HORIZON"
@@ -34,66 +35,12 @@ h2=$(drill_ingest_horizon "$(date -u -d 2026-11-16T20:00:00Z +%s)" 0)
 h3=$(drill_ingest_horizon "$(date -u -d 2026-11-16T19:59:59Z +%s)" 0)
 [ "$h3" -eq "$(date -u -d 2026-11-16T22:00:00Z +%s)" ] && ok "horizon of a 19:59:59 fence is 22:00:00" || bad "horizon 19:59:59 gave $h3"
 
-# Classification.
-for case in \
-  "t/$H/m/l0/0000/x.rseg fenced" \
-  "t/$H/l/c/0003/20261116T19/x.cmt fenced" \
-  "t/$H/s/admission/p.snapshot fenced" \
-  "t/$H/m/prov fenced" \
-  "t/$H/catalog/m/HEAD fenced" \
-  "t/$H/catalog/s/snap/x.csnap fenced" \
-  "t/$H/a/alert-lease alerts" \
-  "t/$H/a/state/latest alerts" \
-  "t/$H/u/l0/0001/x.rseg audit" \
-  "t/$H/config tenant" \
-  "t/$OTHER/m/l0/0000/x.rseg other" \
-  "sys/maintain/memo/x other"; do
-  set -- $case
-  got=$(drill_classify "$1" "$H")
-  [ "$got" = "$2" ] && ok "classify $1 = $2" || bad "classify $1 = $got, want $2"
-done
-
-# Recorded listings: the fenced listing, then an after listing with
-#   - a new metrics object inside the horizon (allowed),
-#   - an audit object after the horizon (audit is not fenced),
-#   - an overwrite of the provisioning record's neighbour with a new time,
-#   - an untouched key.
-printf '%s\t%s\t%s\n' \
-  "t/$H/m/prov" 2026-11-16T19:40:18.635Z 120 \
-  "t/$H/m/l0/0000/a.rseg" 2026-11-16T19:39:00.000Z 900 \
-  "t/$H/l/admission/p.snapshot" 2026-11-16T19:40:10.000Z 80 \
-  "t/$H/a/alert-lease" 2026-11-16T19:40:18.900Z 100 \
-  > "$TMP/fenced"
-cp "$TMP/fenced" "$TMP/after-pass"
-printf '%s\t%s\t%s\n' \
-  "t/$H/m/l0/0000/b.rseg" 2026-11-16T21:30:00.000Z 900 \
-  "t/$H/u/l0/0001/c.rseg" 2026-11-16T23:30:00.000Z 400 \
-  "t/$OTHER/m/l0/0000/d.rseg" 2026-11-16T23:30:00.000Z 400 \
-  >> "$TMP/after-pass"
-drill_written_keys "$TMP/fenced" "$TMP/after-pass" > "$TMP/w-pass"
-[ "$(grep -c . "$TMP/w-pass")" -eq 3 ] && ok "three keys written in the pass case" || bad "written count $(grep -c . "$TMP/w-pass")"
-if drill_late_writes "$TMP/w-pass" "$H" "$HORIZON" "$ALERTS" > "$TMP/late-pass"; then
-  ok "in-horizon fenced write, late audit and other tenant pass"
-else
-  bad "pass case reported late writes: $(cat "$TMP/late-pass")"
-fi
-
-# Fail: a fenced object one second past the horizon, and an overwritten
-# admission snapshot (same key, new LastModified) past it.
-cp "$TMP/fenced" "$TMP/after-fail"
-sed -i "s#^t/$H/l/admission/p.snapshot\t[^\t]*#t/$H/l/admission/p.snapshot\t2026-11-16T22:05:00.000Z#" "$TMP/after-fail"
-printf '%s\t%s\t%s\n' "t/$H/s/c/0000/20261116T21/x.cmt" 2026-11-16T22:01:01.000Z 300 >> "$TMP/after-fail"
-drill_written_keys "$TMP/fenced" "$TMP/after-fail" > "$TMP/w-fail"
-if drill_late_writes "$TMP/w-fail" "$H" "$HORIZON" "$ALERTS" > "$TMP/late-fail"; then
-  bad "post-horizon fenced writes were not reported"
-else
-  ok "post-horizon fenced writes fail the drill"
-fi
-grep -qF "late fenced t/$H/s/c/0000/20261116T21/x.cmt 2026-11-16T22:01:01.000Z" "$TMP/late-fail" \
-  && ok "late commit record named with its LastModified" || bad "late commit record missing: $(cat "$TMP/late-fail")"
-grep -qF "late fenced t/$H/l/admission/p.snapshot 2026-11-16T22:05:00.000Z" "$TMP/late-fail" \
-  && ok "overwrite past the horizon is a late write with no exempt list" || bad "overwrite missing: $(cat "$TMP/late-fail")"
-[ "$(grep -c . "$TMP/late-fail")" -eq 2 ] && ok "exactly two late writes" || bad "late count $(grep -c . "$TMP/late-fail")"
+# Trust limit: (hour of the fence + 2) hours, no margin.
+[ "$TRUST" -eq "$(date -u -d 2026-11-16T21:00:00Z +%s)" ] && ok "trust limit of a 19:40:18 fence is 21:00:00" || bad "trust 19:40:18 gave $TRUST"
+t2=$(drill_trust_limit "$(date -u -d 2026-11-16T20:00:00Z +%s)")
+[ "$t2" -eq "$(date -u -d 2026-11-16T22:00:00Z +%s)" ] && ok "trust limit of a 20:00:00 fence is 22:00:00" || bad "trust 20:00:00 gave $t2"
+t3=$(drill_trust_limit "$(date -u -d 2026-11-16T19:59:59Z +%s)")
+[ "$t3" -eq "$(date -u -d 2026-11-16T21:00:00Z +%s)" ] && ok "trust limit of a 19:59:59 fence is 21:00:00" || bad "trust 19:59:59 gave $t3"
 
 # The shipped exempt list, read from the drill itself.
 eval "$(grep '^EXEMPT_PATTERNS=' "$HERE/released-binary-drill.sh")"
@@ -123,50 +70,241 @@ for case in \
   [ "$got" = "$2" ] && ok "exempt $1 = $2" || bad "exempt $1 = $got, want $2"
 done
 
-# Narrowed rule: with the shipped list, the late admission overwrite is an
-# exempt write recorded with its LastModified, and the late commit record
-# still fails.
-if drill_late_writes "$TMP/w-fail" "$H" "$HORIZON" "$ALERTS" "$EXEMPT_PATTERNS" > "$TMP/ev-fail"; then
-  bad "non-exempt post-horizon commit record passed under the exempt list"
-else
-  ok "non-exempt post-horizon commit record fails under the exempt list"
-fi
-[ "$(grep -c '^late ' "$TMP/ev-fail")" -eq 1 ] && grep -qF "late fenced t/$H/s/c/0000/20261116T21/x.cmt 2026-11-16T22:01:01.000Z" "$TMP/ev-fail" \
-  && ok "exactly the commit record is late" || bad "late lines: $(grep '^late ' "$TMP/ev-fail")"
-grep -qxF "exempt fenced t/$H/l/admission/p.snapshot 2026-11-16T22:05:00.000Z after" "$TMP/ev-fail" \
-  && ok "exempt write recorded with LastModified, after the horizon" || bad "exempt line: $(cat "$TMP/ev-fail")"
-
-# An exempt key alone, past the horizon, passes; an exempt key inside the
-# horizon is recorded as within.
+# Post-fence events over a listing chain. The fence listing, a snapshot
+# while running, the running listing after the driver stopped, and the
+# listing after the processes stopped.
 printf '%s\t%s\t%s\n' \
-  "t/$H/m/maint/scrub/0000.cursor" 2026-11-16T22:40:00.000Z 200 \
-  "t/$H/s/admission/q.snapshot" 2026-11-16T20:00:00.000Z 80 > "$TMP/w-exempt"
-if drill_late_writes "$TMP/w-exempt" "$H" "$HORIZON" "$ALERTS" "$EXEMPT_PATTERNS" > "$TMP/ev-exempt"; then
-  ok "exempt keys past the horizon pass"
-else
-  bad "exempt keys failed: $(cat "$TMP/ev-exempt")"
-fi
-grep -qxF "exempt fenced t/$H/m/maint/scrub/0000.cursor 2026-11-16T22:40:00.000Z after" "$TMP/ev-exempt" \
-  && grep -qxF "exempt fenced t/$H/s/admission/q.snapshot 2026-11-16T20:00:00.000Z within" "$TMP/ev-exempt" \
-  && ok "exempt keys recorded after and within" || bad "exempt records: $(cat "$TMP/ev-exempt")"
-
-# A non-exempt advisory-looking key past the horizon fails: m/meta and an
-# extra-segment admission key are not on the list.
+  "t/$H/m/prov" 2026-11-16T19:40:18.635Z 120 \
+  "t/$H/m/l0/0000/a.rseg" 2026-11-16T19:39:00.000Z 900 \
+  "t/$H/m/l0/0000/old.rseg" 2026-11-16T19:30:00.000Z 900 \
+  "t/$H/l/admission/p.snapshot" 2026-11-16T19:40:10.000Z 80 \
+  "t/$H/a/alert-lease" 2026-11-16T19:40:18.900Z 100 > "$TMP/l0"
+cp "$TMP/l0" "$TMP/l1"
+sed -i "s#^t/$H/l/admission/p.snapshot\t[^\t]*#t/$H/l/admission/p.snapshot\t2026-11-16T20:05:00.000Z#" "$TMP/l1"
 printf '%s\t%s\t%s\n' \
-  "t/$H/m/meta" 2026-11-16T22:40:00.000Z 300 \
-  "t/$H/m/admission/x/q.snapshot" 2026-11-16T22:40:00.000Z 80 > "$TMP/w-nonexempt"
-if drill_late_writes "$TMP/w-nonexempt" "$H" "$HORIZON" "$ALERTS" "$EXEMPT_PATTERNS" > "$TMP/ev-nonexempt"; then
-  bad "non-exempt keys passed: $(cat "$TMP/ev-nonexempt")"
-else
-  ok "non-exempt keys past the horizon fail"
-fi
-[ "$(grep -c '^late ' "$TMP/ev-nonexempt")" -eq 2 ] && ok "both non-exempt keys late" || bad "late lines: $(cat "$TMP/ev-nonexempt")"
+  "t/$H/m/l0/0000/b.rseg" 2026-11-16T20:00:00.000Z 900 \
+  "t/$H/m/l1/0000/t.rseg" 2026-11-16T20:10:00.000Z 900 >> "$TMP/l1"
+grep -v -e '/l1/0000/t.rseg' -e '/old.rseg' "$TMP/l1" > "$TMP/l2"
+printf '%s\t%s\t%s\n' "t/$H/m/l0/0000/early.rseg" 2026-11-16T19:40:00.000Z 900 >> "$TMP/l2"
+cp "$TMP/l2" "$TMP/l3"
+printf '%s\t%s\t%s\n' "t/$H/m/l0/0000/td.rseg" 2026-11-16T22:30:00.000Z 900 >> "$TMP/l3"
+{
+  drill_post_fence_events running "$FENCE" "$TMP/l0" "$TMP/l1" "$TMP/l2"
+  drill_post_fence_events teardown "$FENCE" "$TMP/l2" "$TMP/l3"
+} > "$TMP/ev"
+for want in \
+  "write	t/$H/m/l0/0000/b.rseg	2026-11-16T20:00:00.000Z	running" \
+  "write	t/$H/m/l1/0000/t.rseg	2026-11-16T20:10:00.000Z	running" \
+  "write	t/$H/l/admission/p.snapshot	2026-11-16T20:05:00.000Z	running" \
+  "remove	t/$H/m/l1/0000/t.rseg	2026-11-16T20:10:00.000Z	running" \
+  "remove	t/$H/m/l0/0000/old.rseg	2026-11-16T19:30:00.000Z	running" \
+  "write	t/$H/m/l0/0000/td.rseg	2026-11-16T22:30:00.000Z	teardown"; do
+  grep -qxF "$want" "$TMP/ev" && ok "event: $(echo "$want" | cut -f1,2,4 | tr '\t' ' ')" || bad "event missing: $want"
+done
+[ "$(grep -c . "$TMP/ev")" -eq 6 ] && ok "exactly six post-fence events" || bad "event count: $(cat "$TMP/ev")"
+grep -qF early.rseg "$TMP/ev" && bad "a key last modified before the fence counted as post-fence" || ok "pre-fence LastModified is not a post-fence event"
+drill_post_fence_events running "$FENCE" "$TMP/l0" "$TMP/l2" > "$TMP/ev-pair"
+grep -qF /l1/0000/t.rseg "$TMP/ev-pair" && bad "pair listing saw the transient key" || ok "only the snapshot chain sees a key written and removed between listings"
+drill_post_fence_events running "$FENCE" "$TMP/l0" "$TMP/l1" "$TMP/l1" "$TMP/l2" > "$TMP/ev-dup"
+[ "$(grep -c . "$TMP/ev-dup")" -eq 5 ] && ok "a repeated listing adds no duplicate event" || bad "dup events: $(cat "$TMP/ev-dup")"
+# A key seen written by two pairs (listed, gone, listed again) is one event.
+drill_post_fence_events running "$FENCE" "$TMP/l0" "$TMP/l1" "$TMP/l0" "$TMP/l1" > "$TMP/ev-twice"
+[ "$(grep -c . "$TMP/ev-twice")" -eq 5 ] && ok "an event two pairs show is printed once" || bad "twice events: $(cat "$TMP/ev-twice")"
 
-# The parked lease is not exempt: a rewrite after the alert horizon fails
-# with the shipped list too.
-printf '%s\t%s\t%s\n' "t/$H/a/alert-lease" 2026-11-16T19:45:00.000Z 100 > "$TMP/w-alert2"
-drill_late_writes "$TMP/w-alert2" "$H" "$HORIZON" "$ALERTS" "$EXEMPT_PATTERNS" > /dev/null \
-  && bad "lease rewrite passed under the exempt list" || ok "lease rewrite fails under the exempt list"
+# Classes, one row per enumerated case: op, key relative to t/<h>/ (or
+# absolute when it starts with "/"), LastModified, phase, class.
+R=2026-11-16T20:00:00.000Z
+while read -r op rel lm phase want; do
+  [ -n "$op" ] || continue
+  case "$rel" in
+    /*) key=${rel#/} ;;
+    *) key=t/$H/$rel ;;
+  esac
+  got=$(drill_post_fence_class "$op" "$key" "$lm" "$phase" "$H" "$HORIZON" "$ALERTS" "$EXEMPT_PATTERNS")
+  [ "$got" = "$want" ] && ok "class $op $rel $phase = $want" || bad "class $op $rel $lm $phase = $got, want $want"
+done << EOF
+write /sys/maintain/workers/x $R running root
+write /t/$OTHER/m/l0/0000/x.rseg $R running root
+write m/admission/p.snapshot 2026-11-16T22:30:00.000Z running exempt-advisory
+remove s/admission/p.snapshot $R running exempt-advisory
+write l/maint/scrub/0003.cursor 2026-11-16T22:30:00.000Z running exempt-advisory
+remove m/maint/scrub/0000.cursor $R running maintenance
+write m/admission/x/p.snapshot $R running maintenance
+write m/meta $R running prerequisite-only
+write l/meta $R running maintenance
+write u/l0/0001/x.rseg 2026-11-16T23:30:00.000Z running prerequisite-only
+write u/c/0001/20261116T23/x.cmt 2026-11-16T23:30:00.000Z teardown prerequisite-only
+write u/maint/0001/cursor $R running prerequisite-only
+remove a/l0/0000/x.rseg $R running prerequisite-only
+write enc $R running prerequisite-only
+write config $R running prerequisite-only
+write a/alert-lease 2026-11-16T19:41:21.900Z running alerts-grace
+write a/alert-lease 2026-11-16T19:41:22.000Z running alerts-late
+write a/state/latest 2026-11-16T19:45:00.000Z running alerts-late
+write a/l0/0000/x.rseg 2026-11-16T19:41:00.000Z running alerts-grace
+write a/c/0000/20261116T19/x.cmt 2026-11-16T19:45:00.000Z teardown alerts-late
+write a/other 2026-11-16T19:41:00.000Z running unclassified
+write m/l0/0000/x.rseg 2026-11-16T22:01:00.999Z running ingest-grace
+write m/l0/0000/x.rseg 2026-11-16T22:01:01.000Z running l0c-after-horizon
+write s/c/0000/20261116T21/x.cmt 2026-11-16T22:01:01.000Z running l0c-after-horizon
+write l/c/0001/20261116T22/x.cmt 2026-11-16T22:30:00.000Z teardown teardown-data
+write m/l0/0000/x.rseg 2026-11-16T19:50:00.000Z teardown teardown-data
+write l/idem/k.20261116T19.idm 2026-11-16T19:50:00.000Z running idem
+write s/idem/k.20261116T19.idm 2026-11-16T23:50:00.000Z running idem
+write m/idem/k.20261116T19.idm $R running maintenance
+write catalog/m/HEAD $R running maintenance
+write m/l1/0000/x.rseg $R running maintenance
+remove m/l0/0000/x.rseg $R running maintenance
+remove l/idem/k.20261116T19.idm $R running maintenance
+write m/prov $R running maintenance
+write m/maint/0001/cursor $R running maintenance
+write foo $R running unclassified
+write catalog/u/HEAD $R running unclassified
+EOF
+
+# Class figures: one event of every recorded class passes, each figure
+# present once.
+cat > "$TMP/ev-pass" << EOF
+write	sys/maintain/workers/x	$R	running
+write	t/$H/m/admission/p.snapshot	$R	running
+write	t/$H/m/meta	$R	running
+write	t/$H/a/alert-lease	2026-11-16T19:41:00.000Z	running
+write	t/$H/m/l0/0000/x.rseg	$R	running
+write	t/$H/m/l0/0000/y.rseg	$R	teardown
+write	t/$H/l/idem/k.20261116T19.idm	$R	running
+EOF
+: > "$TMP/cls-report"
+if drill_classify_events "$TMP/ev-pass" "$TMP/cls" "$TMP/cls-report" warm "$H" "$HORIZON" "$ALERTS" "$EXEMPT_PATTERNS" > "$TMP/cls-out"; then
+  ok "one event of every recorded class passes"
+else
+  bad "recorded classes failed: $(cat "$TMP/cls-out")"
+fi
+[ "$(grep -c '^band-ok ' "$TMP/cls-out")" -eq 11 ] && ok "eleven class figures checked" || bad "class figures: $(cat "$TMP/cls-out")"
+grep -qxF "figure class_teardown-data_warm 1" "$TMP/cls-report" && grep -qxF "figure class_unclassified_warm 0" "$TMP/cls-report" \
+  && ok "class counts written as figures, zero included" || bad "class report: $(cat "$TMP/cls-report")"
+grep -qxF "teardown-data	write	t/$H/m/l0/0000/y.rseg	$R	teardown" "$TMP/cls" \
+  && ok "classified event keeps its key, LastModified and phase" || bad "classes file: $(cat "$TMP/cls")"
+
+# Each fail-row class fails the check alone and is named.
+for extra in \
+  "alerts-late|write	t/$H/a/state/latest	2026-11-16T19:45:00.000Z	running" \
+  "l0c-after-horizon|write	t/$H/m/c/0000/20261116T22/x.cmt	2026-11-16T22:30:00.000Z	running" \
+  "maintenance|remove	t/$H/m/l0/0000/a.rseg	$R	running" \
+  "unclassified|write	t/$H/foo	$R	running"; do
+  cls=${extra%%|*}
+  { cat "$TMP/ev-pass"; printf '%s\n' "${extra#*|}"; } > "$TMP/ev-bad"
+  : > "$TMP/cls-report"
+  if drill_classify_events "$TMP/ev-bad" "$TMP/cls" "$TMP/cls-report" warm "$H" "$HORIZON" "$ALERTS" "$EXEMPT_PATTERNS" > "$TMP/cls-out"; then
+    bad "one $cls event passed"
+  else
+    ok "one $cls event fails"
+  fi
+  grep -qxF "band-miss class_${cls}_warm=1 outside [0, 0]" "$TMP/cls-out" && ok "$cls named in the miss" || bad "$cls miss: $(cat "$TMP/cls-out")"
+done
+# A report that already holds a class figure fails it: exactly once.
+printf 'figure class_root_warm 0\n' > "$TMP/cls-report"
+drill_classify_events "$TMP/ev-pass" "$TMP/cls" "$TMP/cls-report" warm "$H" "$HORIZON" "$ALERTS" "$EXEMPT_PATTERNS" > "$TMP/cls-out" \
+  && bad "duplicated class figure passed" || ok "duplicated class figure fails"
+
+# 2xx responses requested after a limit: the driver's curl -m 30 bound.
+printf '%s\t%s\t%s\n' \
+  $((TRUST - 5)) otlp-metrics 200 \
+  $((TRUST + 30)) otlp-metrics 200 \
+  $((TRUST + 31)) otlp-logs 503 \
+  $((TRUST + 31)) promql 200 \
+  $((TRUST + 40)) otlp-traces 000 > "$TMP/drive-pass"
+[ "$(drill_count_2xx_after "$TMP/drive-pass" "$TRUST" 'otlp-metrics|otlp-logs|otlp-traces|remote-write' 30)" -eq 0 ] \
+  && ok "no ingest 2xx requested after the trust limit counts 0" || bad "ingest pass case counted"
+{ cat "$TMP/drive-pass"; printf '%s\t%s\t%s\n' $((TRUST + 31)) remote-write 204; } > "$TMP/drive-fail"
+[ "$(drill_count_2xx_after "$TMP/drive-fail" "$TRUST" 'otlp-metrics|otlp-logs|otlp-traces|remote-write' 30)" -eq 1 ] \
+  && ok "a 204 remote write requested after the trust limit counts 1" || bad "ingest fail case not counted"
+[ "$(drill_count_2xx_after "$TMP/drive-pass" "$TRUST" promql 30)" -eq 1 ] && ok "a 200 query requested after the fence counts 1" || bad "query not counted"
+[ "$(drill_count_2xx_after "$TMP/drive-pass" $((TRUST + 1)) promql 30)" -eq 0 ] && ok "a query that may predate the limit counts 0" || bad "query inside the curl bound counted"
+[ "$(drill_count_2xx_after "$TMP/drive-fail" "$TRUST" 'remote' 30)" -eq 0 ] && ok "kind must match whole" || bad "kind matched a prefix"
+
+# Data-bearing versions.
+DM="t/$H/m/l0/0000/w.1.00000000000000000007.0011223344556677.rseg"
+CM="t/$H/m/c/0000/20261116T22/w.1.00000000000000000007.cmt"
+DL="t/$H/l/l0/0001/w.1.00000000000000000003.8899aabbccddeeff.rseg"
+CL="t/$H/l/c/0001/20261116T22/w.1.00000000000000000003.cmt"
+DS="t/$H/s/l0/0000/w.1.00000000000000000002.0102030405060708.rseg"
+T=2026-11-16T23:02:39.000Z
+printf '%s\t%s\t%s\n' "$DM" "$T" 900 "$CM" "$T" 300 "$DL" "$T" 900 "$CL" "$T" 300 "$DS" "$T" 900 > "$TMP/dv-listing"
+printf '%s\t%s\t%s\n' "$DM" RSG1 7 "$DL" RLG1 5 "$DS" RSP1 5 > "$TMP/dv-trailers"
+for k in "$DM" "$CM" "$DL" "$CL" "$DS"; do
+  drill_data_version "$k" "$T" "$H" "$TMP/dv-listing" "$TMP/dv-trailers" > "$TMP/dv" \
+    && ok "release version passes: ${k#"t/$H/"}" || bad "release version failed: $(cat "$TMP/dv")"
+done
+drill_data_version "$CM" "$T" "$H" "$TMP/dv-listing" "$TMP/dv-trailers" > "$TMP/dv" || true
+grep -qxF "ok commit $CM $T data=$DM RSG1 7" "$TMP/dv" && ok "commit record checked through its data object" || bad "commit line: $(cat "$TMP/dv")"
+for wrong in "$DM RSG1 8" "$DS RSP1 4" "$DL RSG1 5" "$DL RLG1 6"; do
+  set -- $wrong
+  awk -F'\t' -v k="$1" -v m="$2" -v v="$3" 'BEGIN { OFS = "\t" } $1 == k { $2 = m; $3 = v } { print }' \
+    "$TMP/dv-trailers" > "$TMP/dv-wrong"
+  drill_data_version "$1" "$T" "$H" "$TMP/dv-listing" "$TMP/dv-wrong" > /dev/null && bad "data object at $2 $3 passed" || ok "data object at $2 $3 fails"
+done
+awk -F'\t' -v k="$DM" 'BEGIN { OFS = "\t" } $1 == k { $3 = 8 } { print }' "$TMP/dv-trailers" > "$TMP/dv-wrong"
+drill_data_version "$CM" "$T" "$H" "$TMP/dv-listing" "$TMP/dv-wrong" > "$TMP/dv" && bad "commit over an RSEG 8 object passed" || ok "commit record inherits its data object's version failure"
+grep -v "^$DS" "$TMP/dv-trailers" > "$TMP/dv-missing"
+drill_data_version "$DS" "$T" "$H" "$TMP/dv-listing" "$TMP/dv-missing" > /dev/null && bad "unread trailer passed" || ok "unread trailer fails"
+{ cat "$TMP/dv-trailers"; printf '%s\t%s\t%s\n' "$DS" RSP1 5; } > "$TMP/dv-twice"
+drill_data_version "$DS" "$T" "$H" "$TMP/dv-listing" "$TMP/dv-twice" > /dev/null && bad "trailer read twice passed" || ok "a key with two trailer lines fails"
+grep -v "^$DL" "$TMP/dv-listing" > "$TMP/dv-nodata"
+drill_data_version "$CL" "$T" "$H" "$TMP/dv-nodata" "$TMP/dv-trailers" > "$TMP/dv" && bad "unpaired commit passed" || ok "unpaired commit record fails"
+grep -qxF "bad commit $CL $T no single paired data object" "$TMP/dv" && ok "unpaired commit named" || bad "unpaired line: $(cat "$TMP/dv")"
+drill_data_version "t/$H/l/idem/k.20261116T22.idm" "$T" "$H" "$TMP/dv-listing" "$TMP/dv-trailers" > "$TMP/dv" \
+  && bad "idem object passed with no trailer rule" || ok "idem object has no version rule and fails"
+grep -qxF "bad other t/$H/l/idem/k.20261116T22.idm $T no version rule covers this key" "$TMP/dv" && ok "idem named" || bad "idem line: $(cat "$TMP/dv")"
+
+# Census: every judged key named once and flagged.
+printf '%s\n' "$DM" "$CM" "$DL" > "$TMP/cn-keys"
+cat > "$TMP/cn-out" << EOF
+certify family=rseg target=8 report=Contradicted
+key $DM flagged=contradicted
+key $CM flagged=late-write
+key $DL flagged=held
+census keys=3 flagged=3 not_flagged=0
+EOF
+drill_census_check "$TMP/cn-keys" "$TMP/cn-out" > "$TMP/cn" && ok "every key flagged passes" || bad "flagged census failed: $(cat "$TMP/cn")"
+grep -qxF "flagged held $DL" "$TMP/cn" && ok "flag kind recorded" || bad "census lines: $(cat "$TMP/cn")"
+sed "s#^key $CM flagged=late-write#key $CM flagged=no#" "$TMP/cn-out" > "$TMP/cn-no"
+drill_census_check "$TMP/cn-keys" "$TMP/cn-no" > "$TMP/cn" && bad "unflagged key passed" || ok "one unflagged key fails"
+grep -qxF "not-flagged $CM" "$TMP/cn" && ok "unflagged key named" || bad "census lines: $(cat "$TMP/cn")"
+grep -v "^key $DL " "$TMP/cn-out" > "$TMP/cn-missing"
+drill_census_check "$TMP/cn-keys" "$TMP/cn-missing" > "$TMP/cn" && bad "unjudged key passed" || ok "a key the census never printed fails"
+{ cat "$TMP/cn-out"; echo "key $DM flagged=contradicted"; } > "$TMP/cn-dup"
+drill_census_check "$TMP/cn-keys" "$TMP/cn-dup" > /dev/null && bad "key printed twice passed" || ok "a key printed twice fails"
+printf 'key %s flagged=maybe\n' "$DM" > "$TMP/cn-odd"
+printf '%s\n' "$DM" > "$TMP/cn-one"
+drill_census_check "$TMP/cn-one" "$TMP/cn-odd" > /dev/null && bad "unknown flag passed" || ok "an unknown flag value fails"
+drill_census_check /dev/null "$TMP/cn-out" > /dev/null && ok "no data-bearing keys passes" || bad "empty key list failed"
+
+# Warm observation: tail, a scrub cursor after the horizon, graceful stops.
+printf 'exempt-advisory\twrite\tt/%s/m/maint/scrub/0000.cursor\t2026-11-16T22:40:00.000Z\trunning\n' "$H" > "$TMP/wo-cls"
+echo "graceful $((HORIZON + 3660))" > "$TMP/wo-server"
+echo "graceful $((HORIZON + 3661))" > "$TMP/wo-maint"
+: > "$TMP/wo-report"
+drill_warm_observation "$TMP/wo-report" "$TMP/wo-cls" "$HORIZON" 3660 "$TMP/wo-server" "$TMP/wo-maint" > "$TMP/wo" \
+  && ok "61 min tail, a cursor after the horizon and two graceful stops pass" || bad "warm observation failed: $(cat "$TMP/wo")"
+echo "graceful $((HORIZON + 3659))" > "$TMP/wo-short"
+: > "$TMP/wo-report"
+drill_warm_observation "$TMP/wo-report" "$TMP/wo-cls" "$HORIZON" 3660 "$TMP/wo-short" "$TMP/wo-maint" > "$TMP/wo" \
+  && bad "a 3659 s tail passed" || ok "a tail one second short fails"
+grep -qxF "band-miss warm_tail_s=3659 outside [3660, 1000000000]" "$TMP/wo" && ok "short tail named" || bad "tail line: $(cat "$TMP/wo")"
+for how in killed absent; do
+  echo "$how $((HORIZON + 3700))" > "$TMP/wo-m2"
+  : > "$TMP/wo-report"
+  drill_warm_observation "$TMP/wo-report" "$TMP/wo-cls" "$HORIZON" 3660 "$TMP/wo-server" "$TMP/wo-m2" > /dev/null \
+    && bad "a $how maintain process passed" || ok "a $how maintain process fails the graceful stop"
+done
+sed 's/2026-11-16T22:40:00.000Z/2026-11-16T22:01:00.000Z/' "$TMP/wo-cls" > "$TMP/wo-cls-early"
+: > "$TMP/wo-report"
+drill_warm_observation "$TMP/wo-report" "$TMP/wo-cls-early" "$HORIZON" 3660 "$TMP/wo-server" "$TMP/wo-maint" > /dev/null \
+  && bad "a cursor only up to the horizon passed" || ok "no scrub cursor after the horizon fails"
+sed 's#maint/scrub/0000.cursor#admission/p.snapshot#' "$TMP/wo-cls" > "$TMP/wo-cls-adm"
+: > "$TMP/wo-report"
+drill_warm_observation "$TMP/wo-report" "$TMP/wo-cls-adm" "$HORIZON" 3660 "$TMP/wo-server" "$TMP/wo-maint" > /dev/null \
+  && bad "an admission snapshot counted as a scrub rotation" || ok "only a scrub cursor counts as a rotation"
 
 # Trailer parsing: version is the u16 LE at bytes 8..10, magic the last 4.
 printf 'payload\x05\x00\x00\x00\xaa\xbb\xcc\xdd\x07\x00\x01\x00RSG1' > "$TMP/obj"
@@ -178,84 +316,9 @@ tl=$(python3 -I "$HERE/drill_s3.py" trailer-file "$TMP/obj2" | cut -f2-)
 printf 'short' > "$TMP/obj3"
 python3 -I "$HERE/drill_s3.py" trailer-file "$TMP/obj3" > /dev/null 2>&1 && bad "short object read as a trailer" || ok "short object refused"
 
-# Teardown: the writes between the running and the post-stop listing.
-DM="t/$H/m/l0/0000/w.1.00000000000000000007.0011223344556677.rseg"
-CM="t/$H/m/c/0000/20261116T22/w.1.00000000000000000007.cmt"
-DL="t/$H/l/l0/0001/w.1.00000000000000000003.8899aabbccddeeff.rseg"
-CL="t/$H/l/c/0001/20261116T22/w.1.00000000000000000003.cmt"
-DS="t/$H/s/l0/0000/w.1.00000000000000000002.0102030405060708.rseg"
-AD="t/$H/m/admission/0f3c.snapshot"
-printf '%s\t%s\t%s\n' \
-  "$DM" 2026-11-16T23:02:39.000Z 900 \
-  "$CM" 2026-11-16T23:02:39.500Z 300 \
-  "$DL" 2026-11-16T23:02:40.000Z 900 \
-  "$CL" 2026-11-16T23:02:40.500Z 300 \
-  "$DS" 2026-11-16T23:02:41.000Z 900 \
-  "$AD" 2026-11-16T23:02:38.000Z 80 \
-  "t/$H/u/l0/0001/audit.rseg" 2026-11-16T23:02:41.000Z 400 > "$TMP/td-written"
-cp "$TMP/td-written" "$TMP/td-listing"
-printf '%s\t%s\t%s\n' "$DM" RSG1 7 "$DL" RLG1 5 "$DS" RSP1 5 > "$TMP/td-trailers"
-if drill_teardown_check "$TMP/td-written" "$H" "$TMP/td-listing" "$TMP/td-trailers" "$EXEMPT_PATTERNS" > "$TMP/td-ok"; then
-  ok "teardown writes at the release versions pass"
-else
-  bad "teardown at release versions failed: $(cat "$TMP/td-ok")"
-fi
-[ "$(grep -c '^teardown-ok ' "$TMP/td-ok")" -eq 5 ] && ok "five teardown keys checked" || bad "teardown-ok count: $(cat "$TMP/td-ok")"
-grep -qxF "teardown-ok commit $CM 2026-11-16T23:02:39.500Z data=$DM RSG1 7" "$TMP/td-ok" \
-  && ok "commit record checked through its data object" || bad "commit line: $(cat "$TMP/td-ok")"
-grep -qxF "teardown-exempt fenced $AD 2026-11-16T23:02:38.000Z" "$TMP/td-ok" \
-  && ok "exempt teardown write recorded" || bad "exempt teardown line: $(cat "$TMP/td-ok")"
-grep -q "u/l0" "$TMP/td-ok" && bad "audit key judged at teardown" || ok "audit key not judged at teardown"
-
-# Wrong version: metrics at RSEG 8, spans at RSPAN 4, logs with RSEG's magic.
-for wrong in "$DM RSG1 8" "$DS RSP1 4" "$DL RSG1 5"; do
-  set -- $wrong
-  awk -F'\t' -v k="$1" -v m="$2" -v v="$3" 'BEGIN { OFS = "\t" } $1 == k { $2 = m; $3 = v } { print }' \
-    "$TMP/td-trailers" > "$TMP/td-wrong"
-  if drill_teardown_check "$TMP/td-written" "$H" "$TMP/td-listing" "$TMP/td-wrong" "$EXEMPT_PATTERNS" > "$TMP/td-bad"; then
-    bad "teardown write at $2 $3 passed"
-  else
-    ok "teardown write at $2 $3 fails"
-  fi
-done
-# The commit record inherits its data object's failure.
-awk -F'\t' -v k="$DM" 'BEGIN { OFS = "\t" } $1 == k { $3 = 8 } { print }' "$TMP/td-trailers" > "$TMP/td-wrong"
-drill_teardown_check "$TMP/td-written" "$H" "$TMP/td-listing" "$TMP/td-wrong" "$EXEMPT_PATTERNS" > "$TMP/td-bad" || true
-[ "$(grep -c '^teardown-bad version ' "$TMP/td-bad")" -eq 2 ] && ok "data object and its commit record both fail at RSEG 8" \
-  || bad "wrong-version lines: $(cat "$TMP/td-bad")"
-
-# A missing trailer, a commit record with no data object, and a teardown key
-# no version rule covers each fail.
-grep -v "^$DS" "$TMP/td-trailers" > "$TMP/td-missing"
-drill_teardown_check "$TMP/td-written" "$H" "$TMP/td-listing" "$TMP/td-missing" "$EXEMPT_PATTERNS" > /dev/null \
-  && bad "teardown data object with no trailer passed" || ok "teardown data object with no trailer fails"
-grep -v "^$DL" "$TMP/td-listing" > "$TMP/td-nodata"
-printf '%s\t%s\t%s\n' "$CL" 2026-11-16T23:02:40.500Z 300 > "$TMP/td-w-commit"
-drill_teardown_check "$TMP/td-w-commit" "$H" "$TMP/td-nodata" "$TMP/td-trailers" "$EXEMPT_PATTERNS" > "$TMP/td-c" \
-  && bad "unpaired teardown commit record passed" || ok "unpaired teardown commit record fails"
-grep -qxF "teardown-bad commit $CL 2026-11-16T23:02:40.500Z no single paired data object" "$TMP/td-c" \
-  && ok "commit record with no data object fails" || bad "unpaired commit: $(cat "$TMP/td-c")"
-printf '%s\t%s\t%s\n' "t/$H/m/meta" 2026-11-16T23:02:41.000Z 300 > "$TMP/td-w-meta"
-drill_teardown_check "$TMP/td-w-meta" "$H" "$TMP/td-listing" "$TMP/td-trailers" "$EXEMPT_PATTERNS" > "$TMP/td-m" \
-  && bad "teardown m/meta passed" || ok "teardown key with no version rule fails"
-grep -qxF "teardown-bad other t/$H/m/meta 2026-11-16T23:02:41.000Z no version rule covers this key" "$TMP/td-m" \
-  && ok "unversioned teardown key named" || bad "meta line: $(cat "$TMP/td-m")"
-
-# Exactly at the horizon second is still inside it.
-printf '%s\t%s\t%s\n' "t/$H/m/l0/0000/edge.rseg" 2026-11-16T22:01:00.999Z 1 > "$TMP/w-edge"
-drill_late_writes "$TMP/w-edge" "$H" "$HORIZON" "$ALERTS" > /dev/null && ok "write within the horizon second passes" || bad "horizon second reported late"
-
-# Alerts: the parked lease rewritten after the alert horizon fails.
-printf '%s\t%s\t%s\n' "t/$H/a/alert-lease" 2026-11-16T19:45:00.000Z 100 > "$TMP/w-alert"
-if drill_late_writes "$TMP/w-alert" "$H" "$HORIZON" "$ALERTS" > "$TMP/late-alert"; then
-  bad "lease rewrite after the alert horizon passed"
-else
-  ok "lease rewrite after the alert horizon fails"
-fi
-
 # Removed keys.
-drill_removed_keys "$TMP/after-pass" "$TMP/fenced" > "$TMP/removed"
-[ "$(grep -c . "$TMP/removed")" -eq 3 ] && ok "removed keys found" || bad "removed count $(grep -c . "$TMP/removed")"
+drill_removed_keys "$TMP/l1" "$TMP/l0" > "$TMP/removed"
+[ "$(grep -c . "$TMP/removed")" -eq 2 ] && ok "removed keys found" || bad "removed count $(grep -c . "$TMP/removed")"
 
 # Positive control: every prefix nonzero passes.
 : > "$TMP/pc-listing"
