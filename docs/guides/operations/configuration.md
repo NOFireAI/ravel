@@ -2275,21 +2275,23 @@ states the rule and the cost.
 ### Key-index repair cost and budget
 
 `ravel-cli catalog fold --rebuild-key-index [--field <name>] [--batch-entries
-<n>]` attaches key-index leaves to parts the regular fold never re-encodes: a
-sealed, compacted historical part with no erasure pending. Run it after
-declaring a new key-index field, to repair the retained sealed days the next
-regular fold will not touch. It accepts `--key-index-build-max-pairs` as its
-pair budget, the same flag and the same per-field share rule the fold's leaf
+<n>]` attaches key-index leaves to every part in HEAD that has no leaf for a
+declared field. Run it after declaring a new key-index field, to repair the
+retained sealed days the regular fold never re-encodes. On metrics it builds
+nothing while the tenant has an erasure pending. It accepts
+`--key-index-build-max-pairs` as its pair budget, the same flag and the same per-field share rule the fold's leaf
 build uses (see "Key-index leaf build budget" above and
 [the catalog spec's pair budget](../../catalog-and-mvcc.md#per-part-key-index-leaves-adr-2707)).
 
 **What drives the cost.** Each build pass re-reads every entry's KEY_IDX
-section. A field's passes are `ceil(its pairs / its share)`, and the share is
-the budget divided by the fields the repair builds for that part: one new
-field on a part that carries no other leaf gets the whole budget, but one
-new field on a part that already carries other declared fields' leaves only
-gets a fraction of it. A part's passes, section reads and GETs follow its
-slowest field.
+section. A field's share is the budget divided by the fields the repair
+builds for that part: the declared fields the part has no leaf for, plus
+any whose leaf version the reader refuses. `--field` narrows that to one
+field. Fields that already have leaves on the part do not count, so one
+new field on a part that already carries the other fields' leaves gets the
+whole budget. A field takes at least `ceil(its pairs / its share)` passes,
+more when key8s repeat across entries (see the pass rule above). A part's
+passes, section reads and GETs follow its slowest field.
 
 **Measured (real S3, c6a.4xlarge; source in [Background](#background)).** One sealed logs day, 548
 entries, two missing fields (`request_id` 100,000,000 pairs, `trace_id`
@@ -2314,27 +2316,32 @@ cent; in-region bytes are not billed.
 16000000`, on a host with about 1.7 GB of memory headroom for the repair
 process. It halves the logs day's passes and section reads against the
 default (25 to 13 passes, 28.8 GB to 15.0 GB of section reads) and cuts its
-wall time from 589 s to 426 s. The headroom to plan for is 1.7 GB, not the
-logs day's 1.24 GB peak: a repair that builds only one field for a part
-gives that field the whole budget, and the spans day above, repairing its
-one field alone, peaked at 1.69 GB at 16,000,000. Keep the default
+wall time from 589 s to 426 s. The 1.7 GB is the highest peak measured at
+16,000,000 (the spans day above), not the logs day's 1.24 GB. At that
+budget both days hold about the same number of pairs at
+once (two fields at 8,000,000 each for logs, one field at 16,000,000 for
+spans), so the split of the budget does not explain the higher spans
+peak, and the measurements do not show what does. Keep the default
 8,000,000 on a host without that headroom.
 
 **Thirty retained days.** Derived from the one measured logs day above, not
-separately measured: 30 sealed logs days at the default budget cost about
-30 x 589 s, about 4.9 hours; at 16,000,000, about 30 x 426 s, about 3.5
-hours.
+separately measured, and only for days whose entries hold the field: 30
+sealed logs days at the default budget cost about 30 x 589 s, about 4.9
+hours; at 16,000,000, about 30 x 426 s, about 3.5 hours.
 
 **Days that predate the field.** A KEY_IDX section whose header does not
-name the field it is asked to index -- because the entry was written before
-the field was declared, or after it was de-declared -- reads as uncovered
-for that field, and a field with no covered entry in a part writes no leaf
+name the field it is asked to index (the entry was written before the field
+was declared, or after it was de-declared) reads as uncovered for that
+field, and a field with no covered entry in a part writes no leaf
 ([catalog spec](../../catalog-and-mvcc.md#per-part-key-index-leaves-adr-2707),
 which states that this uncovered-entry accounting is shared by the fold's
-leaf build and the repair). A day sealed entirely before the field's
-declaration therefore costs the same ranged GETs to repair -- it still reads
-every entry's section -- but publishes no ref for that field, since the
-repair finds nothing in any section to index.
+leaf build and the repair). When no field the repair builds for a day has a
+covered entry, the build stops after one pass: it reads each entry's
+section once, about two ranged GETs an entry (three when the footer is
+larger than 8 KiB, one when the object has no KEY_IDX section), and
+publishes no ref. For a 548-entry day that is up to about 1,096 GETs, derived from the pass rule rather than measured, against
+27,400 for the measured logs day at the default budget. A day with no ref
+is still missing the field, so every later run of the repair reads it again at the same cost.
 
 ### Metrics label-value leaves
 
