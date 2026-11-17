@@ -1415,12 +1415,14 @@ async fn reencode_compaction_parts_scoped(
     .await
     {
         Err(MaintainError::ClaimLost { .. }) if guard.is_some() => None,
-        // A part `migrate` holds the bucket for: no record was published, so
-        // release the claim now rather than hold the bucket off for the lease.
+        // A part `migrate` holds the bucket for: no record was published, and
+        // the run is over, so mark the claim completed as a finished run does.
+        // Another process still defers to it until the lease expires.
         Err(
             err @ (MaintainError::UnknownSectionKinds { .. }
             | MaintainError::InputOutOfWindow { .. }
             | MaintainError::NewerThanWritable { .. }
+            | MaintainError::PartContentHashMismatch { .. }
             | MaintainError::Segment(_)
             | MaintainError::LogSeg(_)
             | MaintainError::SpanSeg(_)),
@@ -1554,9 +1556,17 @@ async fn reencode_and_publish(
                 .iter()
                 .zip(&part_keys)
                 .map(|(part, key)| async move {
-                    crate::rlog::load_catalog_from_object(store, config, key.clone(), true)
+                    match crate::rlog::load_catalog_from_object(store, config, key.clone(), true)
                         .await
-                        .map_err(|err| err.noting_version(key, &part.content_hash))
+                    {
+                        Err(err) => Err(confirm_out_of_window(
+                            store,
+                            config,
+                            err.noting_version(key, &part.content_hash),
+                        )
+                        .await),
+                        ok => ok,
+                    }
                 });
             let catalogs: Vec<_> = stream_iter(pending)
                 .buffered(config.input_read_concurrency.max(1))
@@ -1590,9 +1600,17 @@ async fn reencode_and_publish(
                 .iter()
                 .zip(&part_keys)
                 .map(|(part, key)| async move {
-                    crate::rspan_codec::load_catalog_from_object(store, config, key.clone())
+                    match crate::rspan_codec::load_catalog_from_object(store, config, key.clone())
                         .await
-                        .map_err(|err| err.noting_version(key, &part.content_hash))
+                    {
+                        Err(err) => Err(confirm_out_of_window(
+                            store,
+                            config,
+                            err.noting_version(key, &part.content_hash),
+                        )
+                        .await),
+                        ok => ok,
+                    }
                 });
             let catalogs: Vec<_> = stream_iter(pending)
                 .buffered(config.input_read_concurrency.max(1))
@@ -1641,6 +1659,41 @@ async fn reencode_and_publish(
         parts: parts.len(),
         publish,
     }))
+}
+
+/// `err`, a re-encode loader's error, with an out-of-window refusal confirmed
+/// against the part's recorded content hash, as compaction does: the RLOG and
+/// RSPAN loaders read by range, so only a full GET can tell an intact object
+/// from a corrupt one. On a mismatch the part is
+/// [`MaintainError::PartContentHashMismatch`]; any other error is unchanged.
+async fn confirm_out_of_window(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    err: MaintainError,
+) -> MaintainError {
+    let MaintainError::InputOutOfWindow {
+        object_key,
+        content_hash,
+        ..
+    } = &err
+    else {
+        return err;
+    };
+    let got = store.get(object_key, GetRange::Full).await;
+    note_get(
+        config.request_ledger.as_ref(),
+        RequestPhase::CatalogRead,
+        &got,
+    );
+    match got {
+        Err(get_err) => get_err.into(),
+        Ok(got) if blake3::hash(&got.data).as_bytes().as_slice() != content_hash.as_slice() => {
+            MaintainError::PartContentHashMismatch {
+                object_key: object_key.clone(),
+            }
+        }
+        Ok(_) => err,
+    }
 }
 
 /// The declared columns the predecessor's RLOG parts carry stamps for, so the

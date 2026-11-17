@@ -276,6 +276,13 @@ pub enum MaintainError {
     /// A migrate walk held one or more buckets (ADR-4233 decision 6): the walk
     /// went on past each, and the floor was not raised. `report` is the walk's
     /// report as it stood when the run stopped.
+    ///
+    /// A budget stop that migrated nothing from where it started persists the
+    /// position it examined, past its holds, so the next run can return `Ok`
+    /// without reporting them; they are reported again once the walk drains
+    /// and restarts. A run that drains the walk past them re-audits, and the
+    /// re-audit still counts a held bucket's L0 records below the target, so
+    /// it raises no floor either.
     #[error(
         "migrate held {} bucket(s) and did not raise the floor: {}",
         held.len(),
