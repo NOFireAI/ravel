@@ -889,6 +889,23 @@ bash "$(dirname "$0")/guards/check-release-profile.test.sh"
 echo "==> scripts/guards/check-release-profile.sh"
 "$(dirname "$0")/guards/check-release-profile.sh"
 
+# The compat corpus is append-only (ADR-4233 decision 9, issue #4249): a
+# published fixture under crates/ravel-compat-tests/corpus/ is frozen evidence
+# of what a released build wrote, so it may be added, never edited or removed.
+# Cases first, same reason as the guards above: a git-history scan, no build.
+# The guard itself needs a base ref to range from; locally that is origin/main
+# when it is fetched, and CI's doc-scripts job (fetch-depth 0) is the enforcing
+# run. When origin/main is not available (a shallow fleet clone), the cases
+# still run and the range check is left to CI rather than failing could-not-check.
+echo "==> scripts/guards/check-compat-corpus-append-only.test.sh"
+bash "$(dirname "$0")/guards/check-compat-corpus-append-only.test.sh"
+echo "==> scripts/guards/check-compat-corpus-append-only.sh"
+if git rev-parse --verify --quiet origin/main >/dev/null; then
+  "$(dirname "$0")/guards/check-compat-corpus-append-only.sh" origin/main HEAD
+else
+  echo "    (skipped range check: origin/main not available; CI doc-scripts enforces it)"
+fi
+
 # A user guide must not keep a figure a later record superseded, or an operator
 # picks a flag value from a retired number (issue #1736). This scans the guides
 # tree for the retired ADR-0996 ClickBench pair. Cases first, same reason as the
