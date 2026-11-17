@@ -1736,15 +1736,17 @@ dependencies = [
 name = "ravel-compat-tests"
 version = "0.33.0"
 dependencies = [
- "hex",
  "ravel-catalog",
+ "ravel-commit",
  "ravel-logseg",
  "ravel-maintain",
  "ravel-object-store",
  "ravel-proto",
  "ravel-rspan",
  "ravel-segment",
+ "ravel-types",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
