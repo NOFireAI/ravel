@@ -1,0 +1,31 @@
+[package]
+name = "ravel-antithesis-catalog-driver"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Antithesis driver for Ravel's catalog fold, compaction and sweep"
+license = "Apache-2.0"
+
+# Its own workspace, like the ingest-durability driver: the repository's
+# workspace never builds this crate.
+[workspace]
+
+[[bin]]
+name = "driver"
+path = "src/main.rs"
+
+[dependencies]
+# The acked-record model and the OTLP/SQL client.
+ravel-antithesis-driver = { path = "../../ingest-durability/driver" }
+antithesis_sdk = "0.4"
+antithesis-instrumentation = "0.1"
+hegeltest = { version = "0.52", features = ["static-engine"] }
+serde_json = "1"
+# The seed file `ravel-cli load` reads. The versions the repository's own
+# Cargo.lock pins.
+arrow-array = "59"
+arrow-schema = "59"
+parquet = { version = "59", default-features = false, features = ["arrow"] }
+
+[profile.release]
+debug = 1

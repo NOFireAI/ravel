@@ -8,9 +8,7 @@
 //! or one query to a ravel-server node and records the outcome in the model
 //! (`model.rs`). See antithesis/README.md for the properties.
 
-mod model;
-mod otlp;
-mod ravel;
+use ravel_antithesis_driver::{model, otlp, ravel};
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,9 +23,9 @@ use serde_json::json;
 
 use antithesis_instrumentation as _;
 
-use crate::model::{Attempt, Mode, Model, Signal, Write};
-use crate::otlp::{METRIC_SERIES, PartialSuccess, Sample, VALUE_STRIDE};
-use crate::ravel::{Ravel, Reply, SqlFailure};
+use model::{Attempt, Mode, Model, Signal, Write};
+use otlp::{METRIC_SERIES, PartialSuccess, Sample, VALUE_STRIDE};
+use ravel::{Ravel, Reply, SqlFailure};
 
 /// Retries after the first attempt of a write with no definite outcome.
 const MAX_RETRIES: u32 = 2;
