@@ -647,7 +647,7 @@ pub struct PartShape {
     /// The decoded length of the catalog sections `SegmentFetcher` reserves
     /// before a catalog decode, each clamped to the reader's section ceiling.
     pub catalog_decode_bytes: u64,
-    /// An upper bound on the wire bytes the listing's GETs hold while the
+    /// The wire bytes the listing's GETs hold while the
     /// catalog decodes ([`held_fetch_bound`]).
     pub held_fetch_bytes: u64,
     pub samples: u64,
@@ -718,15 +718,16 @@ pub async fn part_shape(
     })
 }
 
-/// An upper bound on the wire bytes `SegmentFetcher` holds reserved while it
-/// decodes a whole-SERIES_META catalog, from the object's layout and the
-/// fetcher's default read shape. `open_segment` reads an object of at most
-/// [`DEFAULT_WHOLE_OBJECT_THRESHOLD`] whole, and otherwise its last
-/// [`DEFAULT_SUFFIX_LEN`] bytes plus the footer when the footer starts before
-/// that tail. `decode_selected` then fetches LABEL_DICT, SERIES_IDS and
-/// SERIES_META as one coalesced run, which lies inside the span from the first
-/// section's start to the last one's end (`catalog_sections`, as
-/// `(start, end)`). Both stay held until the decode returns.
+/// The wire bytes `SegmentFetcher` holds reserved while it decodes a
+/// whole-SERIES_META catalog, from the object's layout and the fetcher's
+/// default read shape. `open_segment` reads an object of at most
+/// [`DEFAULT_WHOLE_OBJECT_THRESHOLD`] whole. A larger one it reads as its last
+/// [`DEFAULT_SUFFIX_LEN`] bytes, plus a second GET from the footer's start to
+/// the object's end when the footer starts before that tail. `decode_selected`
+/// then fetches whichever of LABEL_DICT, SERIES_IDS and SERIES_META
+/// (`catalog_sections`, as `(start, end)`) those reads do not already cover,
+/// as one run from the first such section's start to the last one's end. All
+/// of it stays held until the decode returns.
 pub fn held_fetch_bound(
     object_size: u64,
     footer_offset: u64,
@@ -735,14 +736,24 @@ pub fn held_fetch_bound(
     if object_size <= DEFAULT_WHOLE_OBJECT_THRESHOLD {
         return object_size;
     }
-    let tail = DEFAULT_SUFFIX_LEN.min(object_size);
-    let chase = object_size
-        .saturating_sub(footer_offset)
-        .saturating_sub(tail);
-    let start = catalog_sections.iter().map(|r| r.0).min().unwrap_or(0);
-    let end = catalog_sections.iter().map(|r| r.1).max().unwrap_or(0);
-    tail.saturating_add(chase)
-        .saturating_add(end.saturating_sub(start))
+    let tail_start = object_size.saturating_sub(DEFAULT_SUFFIX_LEN);
+    let (held_from, chase) = if footer_offset < tail_start {
+        (footer_offset, object_size - footer_offset)
+    } else {
+        (tail_start, 0)
+    };
+    let missing = || {
+        catalog_sections
+            .iter()
+            .filter(|&&(start, end)| !(held_from <= start && end <= object_size))
+    };
+    let run = match (missing().map(|r| r.0).min(), missing().map(|r| r.1).max()) {
+        (Some(start), Some(end)) => end.saturating_sub(start),
+        _ => 0,
+    };
+    (object_size - tail_start)
+        .saturating_add(chase)
+        .saturating_add(run)
 }
 
 /// The upper bound issue #4393 states for a listing's charge over one part:
@@ -924,7 +935,10 @@ pub async fn measure_cap(
     let upper = upper_bound(&shape);
     let bound = listing_bound(&shape);
     let store = &compacted.store;
-    let search = minimal_budget(upper, |limit| {
+    // Starting at the listing bound makes it the search's first probe, so when
+    // it succeeds the reported peak is at or below it, and `check_report` can
+    // compare the two directly.
+    let search = minimal_budget(bound, |limit| {
         listing_succeeds(store, part, shape.series, limit)
     })
     .await?;
@@ -1092,11 +1106,9 @@ pub fn report_table(report: &RunReport) -> String {
 ///
 /// - peak per sample in [`PEAK_PER_SAMPLE_BAND`];
 /// - the largest refused limit below the peak and within 1 % of it;
-/// - the peak at or below [`listing_bound`]: the largest limit the search
-///   refused sits below that bound and a listing under exactly that bound
-///   succeeded, which bracket the true peak at or below it (the reported peak
-///   itself overshoots by up to the search's 1 % resolution, so it is not the
-///   figure compared);
+/// - the peak at or below [`listing_bound`], compared directly, beside a
+///   listing under exactly that bound succeeding and no refused limit
+///   reaching it;
 /// - the peak non-decreasing as samples per part grow.
 ///
 /// Returns every violation.
@@ -1173,16 +1185,11 @@ pub fn check_report(text: &str, caps: &[u64]) -> Result<(), Vec<String>> {
                          1 % bracket"
                     ));
                 }
-                // "The peak sits at or below the listing bound" is checked
-                // directly against the bound from both sides: the largest
-                // budget the search proved insufficient must fall below the
-                // bound (`refused < bound`), and a listing under a budget of
-                // exactly the bound must succeed (`listing_bound_succeeds`),
-                // which together put the true peak in `(refused, bound]`. The
-                // reported `peak` (`succeeds_at`) is not compared: it is the
-                // smallest budget the search *probed* that succeeded, so it
-                // overshoots the true peak by up to the search's 1 %
-                // resolution and lands above a tight bound on every real run.
+                if peak > bound {
+                    failures.push(format!(
+                        "cap {cap}: the peak {peak} B is above the listing bound {bound} B"
+                    ));
+                }
                 if refused >= bound {
                     failures.push(format!(
                         "cap {cap}: a {refused} B budget was refused, at or above the listing \

@@ -228,51 +228,147 @@ async fn check_report_rejects_missing_duplicate_and_out_of_band_figures() {
     );
 }
 
-/// `held_fetch_bound`'s large-object branch: above the whole-object threshold
-/// the open GET holds only the suffix tail (plus the footer chase above it),
-/// not the whole object, and the catalog run adds the span from the first
-/// section's start to the last one's end. Pinned exactly so a bound that
-/// overestimates (for example one that charges the whole object) is caught.
-#[test]
-fn held_fetch_bound_large_object_holds_tail_chase_and_catalog_span() {
-    // At or below the threshold the whole object is held.
-    assert_eq!(
-        held_fetch_bound(
-            DEFAULT_WHOLE_OBJECT_THRESHOLD,
-            DEFAULT_WHOLE_OBJECT_THRESHOLD - 4_096,
-            &[(1_000, 5_000)],
-        ),
-        DEFAULT_WHOLE_OBJECT_THRESHOLD,
-    );
-
-    // Above it: 614_400 B object, footer at 500_000 so the chase runs from the
-    // footer up to the 64 KiB tail, two catalog sections spanning 2_048..70_000.
-    let object_size = DEFAULT_WHOLE_OBJECT_THRESHOLD + 90_112; // 614_400 B
-    let footer_offset = 500_000u64;
-    let sections = [(2_048u64, 6_144u64), (6_144u64, 70_000u64)];
-    let tail = DEFAULT_SUFFIX_LEN; // 65_536, smaller than the object
-    let chase = object_size - footer_offset - tail; // 48_864
-    let span = 70_000 - 2_048; // 67_952
-    let expected = tail + chase + span; // 182_352
-    assert_eq!(
-        held_fetch_bound(object_size, footer_offset, &sections),
-        expected,
-    );
-    assert_eq!(
-        held_fetch_bound(object_size, footer_offset, &sections),
-        182_352,
-        "the large-object branch must hold the tail, chase and catalog span exactly"
+/// The budget limit at which listing `part` starts to succeed, to the byte:
+/// refused at `refused`, succeeding at `succeeds`.
+async fn exact_threshold(
+    store: &std::sync::Arc<ravel_object_store::memory::MemoryStore>,
+    part: &ravel_catalog::SegmentRef,
+    series: u64,
+    mut refused: u64,
+    mut succeeds: u64,
+) -> u64 {
+    assert!(
+        !listing_succeeds(store, part, series, refused)
+            .await
+            .expect("list")
     );
     assert!(
-        expected < object_size,
-        "the large-object branch must hold less than the whole {object_size} B object"
+        listing_succeeds(store, part, series, succeeds)
+            .await
+            .expect("list")
+    );
+    while succeeds - refused > 1 {
+        let mid = refused + (succeeds - refused) / 2;
+        if listing_succeeds(store, part, series, mid)
+            .await
+            .expect("list")
+        {
+            succeeds = mid;
+        } else {
+            refused = mid;
+        }
+    }
+    succeeds
+}
+
+/// `held_fetch_bound` equals, to the byte, what the fetcher holds on a real
+/// part on each side of the whole-object threshold: the listing's exact
+/// threshold minus the `(64 + 32) * samples + catalog` formula. At 72 h of
+/// history the compactor's one-series overshoot closes the first part of a
+/// 256 KiB cap above 512 KiB (853,172 B, measured 2026-11-17), where the open
+/// GET holds only the 64 KiB footer tail plus the catalog run; the last part
+/// stays below the threshold and is held whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_fetch_bound_matches_the_bytes_a_real_part_holds() {
+    let config = RunConfig {
+        series: 24,
+        scrape_secs: 15,
+        history_hours: 72,
+        flush_hours: 2,
+        caps: vec![256 << 10],
+    };
+    let bucket = build_bucket(&config).expect("bucket");
+    let compacted = compact_at(&bucket, &config, 256 << 10)
+        .await
+        .expect("compact");
+    let store = &compacted.store;
+    let mut large = 0;
+    let mut small = 0;
+    for part in [&compacted.parts[0], compacted.parts.last().expect("a part")] {
+        let shape = part_shape(store, part).await.expect("shape");
+        if shape.wire_bytes > DEFAULT_WHOLE_OBJECT_THRESHOLD {
+            large += 1;
+            assert!(
+                shape.held_fetch_bytes < DEFAULT_SUFFIX_LEN + (4 << 10),
+                "a {} B part holds the footer tail and a small catalog run, not {} B",
+                shape.wire_bytes,
+                shape.held_fetch_bytes
+            );
+        } else {
+            small += 1;
+            assert_eq!(shape.held_fetch_bytes, shape.wire_bytes);
+        }
+        let threshold = exact_threshold(
+            store,
+            part,
+            shape.series,
+            upper_bound(&shape),
+            listing_bound(&shape),
+        )
+        .await;
+        assert_eq!(
+            threshold - upper_bound(&shape),
+            shape.held_fetch_bytes,
+            "a {} B part: the fetcher holds {} B, held_fetch_bound says {} B",
+            shape.wire_bytes,
+            threshold - upper_bound(&shape),
+            shape.held_fetch_bytes
+        );
+    }
+    assert_eq!(
+        (large, small),
+        (1, 1),
+        "one part on each side of the threshold"
+    );
+}
+
+/// `held_fetch_bound` term by term on synthetic layouts, including the two the
+/// bench's parts do not reach: a footer that starts before the 64 KiB tail
+/// (the fetcher's second GET runs from the footer's start to the object's
+/// end) and catalog sections the tail already covers (not fetched again).
+#[test]
+fn held_fetch_bound_charges_the_tail_the_footer_chase_and_the_uncovered_catalog() {
+    let threshold = DEFAULT_WHOLE_OBJECT_THRESHOLD;
+    let tail = DEFAULT_SUFFIX_LEN;
+    // At or below the threshold the whole object is held, whatever the layout.
+    assert_eq!(
+        held_fetch_bound(threshold, threshold - 4_096, &[(1_000, 5_000)]),
+        threshold
     );
 
-    // Footer inside the tail: the chase saturates to zero, only tail and span.
-    let small_chase = DEFAULT_WHOLE_OBJECT_THRESHOLD + 1;
+    let object_size = 614_400u64;
+    assert!(object_size > threshold);
+    let sections = [(2_048u64, 6_144u64), (6_144u64, 70_000u64)];
+    // Footer inside the tail: the tail and the catalog run, nothing more.
     assert_eq!(
-        held_fetch_bound(small_chase, small_chase - 1_000, &[(1_000, 2_000)]),
-        DEFAULT_SUFFIX_LEN + 1_000,
+        held_fetch_bound(object_size, object_size - 1_000, &sections),
+        tail + (70_000 - 2_048)
+    );
+    assert_eq!(
+        held_fetch_bound(object_size, object_size - 1_000, &sections),
+        133_488
+    );
+    // Footer at 500_000, before the tail at 548_864: the chase GET holds
+    // 500_000..614_400 on top of the tail.
+    assert_eq!(
+        held_fetch_bound(object_size, 500_000, &sections),
+        tail + (object_size - 500_000) + (70_000 - 2_048)
+    );
+    assert_eq!(held_fetch_bound(object_size, 500_000, &sections), 247_888);
+    // A section inside the tail is already held; only the other is fetched.
+    let tail_start = object_size - tail;
+    assert_eq!(
+        held_fetch_bound(
+            object_size,
+            object_size - 1_000,
+            &[(2_048, 6_144), (tail_start + 10, tail_start + 500)]
+        ),
+        tail + 4_096
+    );
+    // A section the chase covers is held too, and none left means no run.
+    assert_eq!(
+        held_fetch_bound(object_size, 500_000, &[(500_100, 500_200)]),
+        tail + (object_size - 500_000)
     );
 }
 
@@ -309,37 +405,46 @@ async fn peak_per_sample_band_rejects_missing_and_doubled_provenance() {
     check_report(&with_per_sample(97.8), &caps).expect("97.8 B a sample is inside the band");
 }
 
-/// The "peak at or below the listing bound" band admits the reported peak
-/// sitting just above the bound, because the 1 %-resolution search reports the
-/// smallest probed succeeding budget rather than the true threshold; it still
-/// catches a budget at or above the bound that the search refused.
+/// The reported peak sits at or below the listing bound on a real run, and
+/// `check_report` compares the two directly: a peak one byte above the bound
+/// fails even when the refused limit stays below the bound, the 1 % bracket
+/// holds and the listing under the bound succeeded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn band_admits_peak_above_bound_within_the_search_bracket() {
+async fn peak_above_the_listing_bound_fails_the_direct_check() {
+    let report = run(small_config(CAPS.to_vec())).await.expect("run");
+    for entry in &report.caps {
+        assert!(
+            entry.search.succeeds_at <= entry.listing_bound_bytes,
+            "cap {}: the reported peak {} B is above the listing bound {} B",
+            entry.cap_bytes,
+            entry.search.succeeds_at,
+            entry.listing_bound_bytes
+        );
+    }
+
     let caps = [CAPS[0]];
     let report = run(small_config(caps.to_vec())).await.expect("run");
-    let entry = &report.caps[0];
-    assert!(
-        entry.search.succeeds_at > entry.listing_bound_bytes,
-        "expected the reported peak {} B above the listing bound {} B",
-        entry.search.succeeds_at,
-        entry.listing_bound_bytes
-    );
     let json = report_json(&report);
     let text = serde_json::to_string_pretty(&json).expect("render");
-    check_report(&text, &caps).expect("the band admits a peak above the bound within the bracket");
+    check_report(&text, &caps).expect("the real report holds every band");
 
-    // A budget at the bound that the search refused means the true peak is
-    // above the bound: a real violation, rejected directly.
-    let mut doc = json.clone();
-    let bound = doc["caps"][0]["listing_bound_bytes"]
+    let bound = json["caps"][0]["listing_bound_bytes"]
         .as_u64()
         .expect("bound");
-    doc["caps"][0]
-        .as_object_mut()
-        .expect("cap entry")
-        .insert("refused_at_bytes".into(), bound.into());
+    let mut doc = json.clone();
+    let entry = doc["caps"][0].as_object_mut().expect("cap entry");
+    entry.insert("peak_charge_bytes".into(), (bound + 1).into());
+    entry.insert("refused_at_bytes".into(), (bound - 1).into());
+    entry.insert("listing_bound_succeeds".into(), true.into());
     let violated = serde_json::to_string_pretty(&doc).expect("render");
-    assert!(check_report(&violated, &caps).is_err());
+    assert_eq!(
+        check_report(&violated, &caps),
+        Err(vec![format!(
+            "cap {}: the peak {} B is above the listing bound {bound} B",
+            caps[0],
+            bound + 1
+        )])
+    );
 }
 
 /// `minimal_budget` terminates when the threshold is below 100 bytes, where the
