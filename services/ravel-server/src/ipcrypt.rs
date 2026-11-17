@@ -586,8 +586,7 @@ mod tests {
     #[tokio::test]
     async fn marker_check_transient_past_the_deadline_refuses_naming_the_site() {
         use crate::startup_retry::test_support::{
-            DEADLINE, ManualClock, StartupClock, always_transient, assert_deadline_refusal,
-            retry_on,
+            DEADLINE, ManualClock, always_transient, assert_deadline_refusal, retry_on,
         };
         let clock = Arc::new(ManualClock::default());
         let store = FaultStore::new(
@@ -604,7 +603,7 @@ mod tests {
         .expect_err("refuses once the deadline passes");
         let attempts = store.fault_count(Op::Get, FaultKind::Transient);
         assert_deadline_refusal(&err, SITE_IPCRYPT_MARKER, attempts);
-        assert_eq!(clock.elapsed(), DEADLINE);
+        assert_eq!(clock.virtual_now(), DEADLINE);
         assert!(format!("{err:#}").contains("IPCrypt policy marker check failed"));
     }
 

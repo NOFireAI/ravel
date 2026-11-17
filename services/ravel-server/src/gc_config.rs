@@ -485,7 +485,7 @@ mod tests {
                 .expect_err("refuses once the deadline passes");
             let attempts = store.fault_count(Op::Get, FaultKind::Transient);
             assert_deadline_refusal(&err, SITE_GC_CONFIG, attempts);
-            assert_eq!(clock.elapsed(), DEADLINE);
+            assert_eq!(clock.virtual_now(), DEADLINE);
             assert!(
                 format!("{err:#}")
                     .contains("failed to bootstrap or read the durable GC config (sys/gc)")

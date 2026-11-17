@@ -43,6 +43,13 @@ struct GatedClock {
     release: Semaphore,
 }
 
+impl GatedClock {
+    /// The virtual time the sleeps have advanced to.
+    fn virtual_now(&self) -> Duration {
+        *self.now.lock().unwrap()
+    }
+}
+
 #[async_trait::async_trait]
 impl StartupClock for GatedClock {
     fn elapsed(&self) -> Duration {
@@ -277,7 +284,7 @@ async fn transient_store_failures_at_startup_delay_it_and_the_server_then_serves
         retries,
         QUALIFICATION_FAILURES + LISTING_FAILURES + MARKER_FAILURES
     );
-    assert!(clock.elapsed() < Duration::from_secs(15));
+    assert!(clock.virtual_now() < Duration::from_secs(15));
 
     let readyz = format!("http://{}/readyz", running.http_addr);
     assert_eq!(status(&client, readyz).await, 200);

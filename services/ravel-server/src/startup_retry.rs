@@ -397,8 +397,7 @@ pub(crate) mod test_support {
 
     use ravel_object_store::fault::{FaultPlan, Occurrence, Op, Rule, ScriptedFault, Sequence};
 
-    pub(crate) use super::StartupClock;
-    use super::StartupRetry;
+    use super::{StartupClock, StartupRetry};
 
     /// Virtual time: `sleep` advances it at once and records the request.
     #[derive(Default)]
@@ -410,6 +409,11 @@ pub(crate) mod test_support {
     impl ManualClock {
         pub(crate) fn sleeps(&self) -> Vec<Duration> {
             self.sleeps.lock().expect("sleeps lock").clone()
+        }
+
+        /// The virtual time the sleeps have advanced to.
+        pub(crate) fn virtual_now(&self) -> Duration {
+            *self.now.lock().expect("clock lock")
         }
     }
 
@@ -692,7 +696,7 @@ mod tests {
             .expect_err("refuses once the deadline passes");
         let attempts = store.fault_count(Op::Get, FaultKind::Transient);
         assert_deadline_refusal(&err, SITE_QUALIFICATION, attempts);
-        assert_eq!(clock.elapsed(), DEADLINE);
+        assert_eq!(clock.virtual_now(), DEADLINE);
         assert!(format!("{err:#}").contains("store backend is not qualified"));
     }
 
