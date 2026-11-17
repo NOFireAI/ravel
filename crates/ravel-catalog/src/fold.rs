@@ -3784,7 +3784,8 @@ pub(crate) enum KeyIndexBuildCaller {
 /// complete list; a further finding in the rebuild leaves it with no leaf.
 ///
 /// `caller` is [`KeyIndexBuildCaller::Repair`] for the `--rebuild-key-index`
-/// repair, which passes no source and nothing held: the passes are the same,
+/// repair, which passes no source and no held LABEL_DICT pairs: the passes
+/// are the same,
 /// but only `declared` is indexed and a failed ranged GET stops the build
 /// ([`BuiltPartKeyIndex::stopped_on_failed_get`]).
 ///
