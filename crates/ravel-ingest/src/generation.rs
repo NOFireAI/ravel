@@ -1046,7 +1046,7 @@ impl<H> GenerationSwitch<H> {
 
     /// Install (or with `None` remove) the activation policy every flush of
     /// this router's shards applies, existing actors included, with the
-    /// router's `max_flush_lifetime` each grant checks against the record.
+    /// router's `max_flush_lifetime` admission checks against the record.
     pub(crate) fn set_compat_policy(
         &self,
         policy: Option<Arc<crate::compat::IngestCompatPolicy>>,
