@@ -16,16 +16,18 @@ publish = false
 
 [dev-dependencies]
 ravel-catalog = { path = "../ravel-catalog", version = "0.33.0" }
+ravel-commit = { path = "../ravel-commit", version = "0.33.0" }
 ravel-maintain = { path = "../ravel-maintain", version = "0.33.0" }
 ravel-object-store = { path = "../ravel-object-store", version = "0.33.0" }
 ravel-proto = { path = "../ravel-proto", version = "0.33.0" }
+ravel-types = { path = "../ravel-types", version = "0.33.0" }
 # The drill versions (RSEG 8, RLOG 6, RSPAN 6), test-only. This table is the
 # one place scripts/guards/check-release-profile.sh rule 5 allows them.
 ravel-segment = { path = "../ravel-segment", version = "0.33.0", features = ["format-drill"] }
 ravel-logseg = { path = "../ravel-logseg", version = "0.33.0", features = ["format-drill"] }
 ravel-rspan = { path = "../ravel-rspan", version = "0.33.0", features = ["format-drill"] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }
-hex = "0.4"
+uuid = "1.24"
 
 [lints.rust]
 unsafe_code = "forbid"
