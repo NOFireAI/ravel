@@ -825,6 +825,7 @@ pub(crate) mod test_support {
 #[allow(clippy::expect_used)]
 mod tests {
     use bytes::Bytes;
+    use ravel_catalog::compat::CompatError;
     use ravel_object_store::conformance::{
         CONFORMANCE_SUITE_VERSION, QUALIFICATION_KEY, QualificationRecord,
     };
@@ -1605,6 +1606,106 @@ mod tests {
             assert!(check(gate_err), "{name}: {gate_err:?}");
             assert!(clock.sleeps().is_empty(), "{name}: retried");
         }
+    }
+
+    /// A `sys/compat` the gate cannot read for a reason other than a
+    /// transient store error refuses on the first attempt: one GET, no sleep.
+    #[tokio::test]
+    async fn retired_reader_gate_unreadable_compat_refuses_on_the_first_attempt() {
+        type Check = fn(&CompatError) -> bool;
+        let one_get = || {
+            FaultPlan::empty().with_sequence(
+                ravel_object_store::fault::Sequence::new(Op::Get)
+                    .with_key_contains(ravel_catalog::compat::COMPAT_KEY)
+                    .then_passthrough()
+                    .then_passthrough(),
+            )
+        };
+        let cases: [(&str, FaultPlan, bool, ConfiguredScheme, Check); 3] = [
+            (
+                "wrong deployment key",
+                one_get(),
+                true,
+                ConfiguredScheme::Keyed(Box::new([0x55; 32])),
+                |err| matches!(err, CompatError::BadMac { .. }),
+            ),
+            ("corrupt body", one_get(), false, keyed(), |err| {
+                matches!(err, CompatError::Decode { .. })
+            }),
+            (
+                "permanent store error on the GET",
+                fault_then_ok(
+                    Op::Get,
+                    ravel_catalog::compat::COMPAT_KEY,
+                    ScriptedFault::Permanent("bad request".into()),
+                    2,
+                ),
+                true,
+                keyed(),
+                |err| matches!(err, CompatError::Store { .. }),
+            ),
+        ];
+        for (name, plan, sealed, configured, check) in cases {
+            let clock = Arc::new(ManualClock::default());
+            let store = faulted(plan);
+            if sealed {
+                seed_compat(store.inner(), rseg_entry(true, CERTIFIED_NS + 1, false)).await;
+            } else {
+                store
+                    .inner()
+                    .put(
+                        ravel_catalog::compat::COMPAT_KEY,
+                        Bytes::from_static(b"not a protobuf"),
+                        PutOptions::default(),
+                    )
+                    .await
+                    .expect("put corrupt sys/compat");
+                put_tenancy_marker(store.inner()).await;
+            }
+            let err = enforce_retired_reader_gate(
+                &retry_on(clock.clone()),
+                &store,
+                &configured,
+                &[RSEG_8],
+                GATE_NOW_NS,
+            )
+            .await
+            .expect_err(name);
+            assert_eq!(err.to_string(), GATE_REFUSAL, "{name}");
+            match err.downcast_ref::<CompatGateError>() {
+                Some(CompatGateError::CompatUnreadable(cause)) => {
+                    assert!(check(cause), "{name}: {cause:?}");
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+            assert_eq!(store.sequence_progress(0), 1, "{name}: GETs of sys/compat");
+            assert!(clock.sleeps().is_empty(), "{name}: retried");
+        }
+    }
+
+    /// With `sys/compat` absent the gate HEADs `sys/tenancy`; a transient
+    /// failure there retries the gate, which then starts on a fresh store.
+    #[tokio::test]
+    async fn retired_reader_gate_retries_a_transient_tenancy_head_then_starts() {
+        let clock = Arc::new(ManualClock::default());
+        let store = faulted(transient_then_ok(
+            Op::Head,
+            crate::tenancy::TENANCY_MARKER_KEY,
+            2,
+        ));
+        let outcome = enforce_retired_reader_gate(
+            &retry_on(clock.clone()),
+            &store,
+            &keyed(),
+            &[RSEG_8],
+            GATE_NOW_NS,
+        )
+        .await
+        .expect("starts once the store answers");
+        assert_eq!(outcome, crate::compat_gate::GateOutcome::Fresh);
+        assert_eq!(store.fault_count(Op::Head, FaultKind::Transient), 2);
+        assert_eq!(store.sequence_progress(0), 3);
+        assert_eq!(clock.sleeps().len(), 2);
     }
 
     /// With this build's empty retired set the gate sends no request, so a
