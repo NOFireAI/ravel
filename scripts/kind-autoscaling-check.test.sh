@@ -69,6 +69,10 @@ mkdir -p "${STUB_BIN}"
 #                        leave spec.replicas with the handover manager.
 #   $drop_external_entry -- non-empty: an External pass that finds the tier
 #                        already listed drops its autoscaledTiers entry.
+#   $turnoff_ignores_same_edit -- non-empty: a turn-off adopts the live count
+#                        even when the same edit changed spec.replicas.
+#   $keep_adoptions   -- non-empty: a changed declared value is applied but
+#                        the tier's replicaAdoptions entry is never dropped.
 JQ_LIB="${TMP}/reconcile.jq"
 cat >"${JQ_LIB}" <<'JQ'
 # RFC 7396 JSON Merge Patch: a null value deletes the key, unlike jq's own
@@ -102,7 +106,9 @@ def reconcile_tier(tierKey; depName):
           else
             .deployments[depName].replicas = $spec.replicas
             | .deployments[depName].manager = "ravel-operator"
-            | .status.replicaAdoptions = (.status.replicaAdoptions | map(select(.tier != tierKey)))
+            | (if ($keep_adoptions // "") == "" then
+                 .status.replicaAdoptions = (.status.replicaAdoptions | map(select(.tier != tierKey)))
+               else . end)
           end)
        elif $dep.manager == "ravel-operator-handover" then
          # Just turned off. ADR-4314's declared-count amendment: compare the
@@ -112,7 +118,8 @@ def reconcile_tier(tierKey; depName):
          # declared value forces it immediately; otherwise the live count
          # (wherever the HPA or external scaler left it) is adopted and held
          # until spec.replicas actually changes.
-         (if ($declaredEntry == null) or ($spec.replicas != $declaredEntry.declaredReplicas) then
+         (if ($declaredEntry == null)
+             or ($spec.replicas != $declaredEntry.declaredReplicas and ($turnoff_ignores_same_edit // "") == "") then
             .deployments[depName].replicas = $spec.replicas
             | .deployments[depName].manager = "ravel-operator"
           else
@@ -242,6 +249,8 @@ world_jq() {
      --arg turnoff_applies "${STUB_TURNOFF_APPLIES:-}" \
      --arg turnoff_keeps_handover "${STUB_TURNOFF_KEEPS_HANDOVER:-}" \
      --arg drop_external_entry "${STUB_DROP_EXTERNAL_ENTRY:-}" \
+     --arg turnoff_ignores_same_edit "${STUB_TURNOFF_IGNORES_SAME_EDIT:-}" \
+     --arg keep_adoptions "${STUB_KEEP_ADOPTIONS:-}" \
      --arg no_observed "${STUB_NO_OBSERVED_GEN:-}" \
      --arg degraded_tier "${STUB_DEGRADED_TIER:-}" \
      --arg degraded_mode "${STUB_DEGRADED_MODE:-}" \
@@ -717,6 +726,24 @@ check "a turn-off that does not take spec.replicas back fails step d" \
   1 "gateway Deployment spec.replicas owners after turn-off: ravel-operator must own spec.replicas after turn-off (owners: ravel-operator-handover)" \
   run_case turnoff-keeps-handover \
   STUB_TURNOFF_KEEPS_HANDOVER=1
+
+# --- case 5j: step e's query count must come from the operator ------------
+# The operator adopts the live count on turn-off even when the same edit
+# changed spec.replicas. Step e1 declares 2 while the live count is 3, so the
+# read after the completed pass must see 3 and fail. (The pre-fix step e
+# scaled the Deployment to 1 itself first, so its own scale met its waits.)
+check "a turn-off that ignores a same-edit replicas change fails step e1" \
+  1 "query Deployment spec.replicas after step e1 (same-edit declared value): expected '2', got '3'" \
+  run_case turnoff-ignores-same-edit \
+  STUB_TURNOFF_IGNORES_SAME_EDIT=1
+
+# --- case 5k: step e must leave no replicaAdoptions entry -----------------
+# The operator applies a changed declared value but never drops the adoption:
+# the gateway's entry from step d survives the restore.
+check "an adoption left in status.replicaAdoptions after the restore fails step e" \
+  1 "status.replicaAdoptions entry count after restore: expected '0', got '1'" \
+  run_case adoption-kept \
+  STUB_KEEP_ADOPTIONS=1
 
 # --- distinguishing test C: observedGeneration-only wait must wrongly pass -
 # Mutates wait_reconcile_complete's predicate so it accepts any Available and
