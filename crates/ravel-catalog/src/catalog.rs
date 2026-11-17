@@ -23,7 +23,8 @@ use ravel_object_store::{
     drain_pages,
 };
 use ravel_proto::commit::v1::{
-    CommitRecord, CompactionPart, CompactionRecord, ErasureRequest, RewriteRecord,
+    CommitRecord, CompactionInputIdentity, CompactionPart, CompactionRecord, ErasureRequest,
+    RewriteRecord,
 };
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::{CommitToken, Signal, TenantHash, TimeRange};
@@ -3059,18 +3060,6 @@ impl Catalog {
             }
         }
 
-        for token in min_tokens {
-            self.resolve_min_token(
-                tenant,
-                signal,
-                token,
-                &mut segments,
-                &mut origin_by_key,
-                accounting,
-            )
-            .await?;
-        }
-
         // One LIST of `t/<th>/<sig>/del/` per resolve (ADR-0064 decision 2):
         // attach every pending erasure predicate to the snapshot. Runs
         // unconditionally, independent of the segment fan-out and of whether
@@ -3078,7 +3067,8 @@ impl Catalog {
         // holds -- a `.dreq` durable before this resolve is always seen by it.
         // Empty (the common case) costs exactly one LIST and nothing more. When
         // a window was listed above, this LIST already ran concurrently with
-        // the bucket fan-out and is reused here; otherwise it runs now.
+        // the bucket fan-out and is reused here; otherwise it runs now, before
+        // the token step, which reads whether any erasure is pending.
         let pending_erasure = match pending_erasure {
             Some(pending) => pending,
             None => {
@@ -3086,6 +3076,45 @@ impl Catalog {
                     .await?
             }
         };
+
+        // Record-absent tokens run first: their fallback adds a replacement's
+        // parts whatever the set holds, and a present token is left out once
+        // the set holds such a part, so the answer does not depend on the
+        // order of the tokens (docs/catalog-and-mvcc.md step 5).
+        let erasure_pending = !pending_erasure.is_empty();
+        let mut present_tokens: Vec<(&CommitToken, SegmentRef)> = Vec::new();
+        for token in min_tokens {
+            match self
+                .probe_min_token(tenant, signal, token, accounting)
+                .await?
+            {
+                Some(segment_ref) => present_tokens.push((token, segment_ref)),
+                None => {
+                    self.resolve_min_token_fallback(
+                        tenant,
+                        signal,
+                        token,
+                        &mut segments,
+                        &mut origin_by_key,
+                        accounting,
+                    )
+                    .await?
+                }
+            }
+        }
+        for (token, segment_ref) in present_tokens {
+            self.include_token_l0(
+                tenant,
+                signal,
+                token,
+                segment_ref,
+                &mut segments,
+                &mut origin_by_key,
+                erasure_pending,
+                accounting,
+            )
+            .await?;
+        }
 
         let mut segments: Vec<SegmentRef> = segments.into_values().collect();
         // Deterministic total order: the cross-segment dedup provenance order
@@ -4203,7 +4232,7 @@ impl Catalog {
     /// the include pass reads the decoded records it is handed and never
     /// touches the cache, so each record is credited at most once and a
     /// record this resolve fetched itself is never credited.
-    /// `resolve_min_token` looks an L0 key up in the cache after the listing
+    /// `probe_min_token` looks an L0 key up in the cache after the listing
     /// pass, but it credits nothing; a credit added there would double-count
     /// a record this lookup already served.
     fn cached_commit_records(
@@ -4498,30 +4527,22 @@ impl Catalog {
             .invalidate_prefix(tenant, bucket_prefix);
     }
 
-    async fn resolve_min_token(
+    /// The token's L0 input when its commit record is present, or `None`
+    /// when the record is absent after one retry and the token goes to
+    /// [`Self::resolve_min_token_fallback`].
+    async fn probe_min_token(
         &self,
         tenant: &TenantHash,
         signal: Signal,
         token: &CommitToken,
-        out: &mut HashMap<String, SegmentRef>,
-        origin_by_key: &mut HashMap<String, SegmentOrigin>,
         accounting: &QueryAccounting,
-    ) -> Result<(), CatalogError> {
+    ) -> Result<Option<SegmentRef>, CatalogError> {
         let key = keys::commit_key_for_token(tenant, signal, token)?;
         if let Some(cached) = self.cache.get_cached(tenant, &key, accounting)
             && validate_expected_fields(self, &cached.record, tenant, signal, token.shard, &key)
                 .is_ok()
         {
-            let segment_ref = self.l0_segment_ref(tenant, &key, &cached)?;
-            if !out.contains_key(&segment_ref.data_object_key) {
-                origin_by_key.insert(
-                    segment_ref.data_object_key.clone(),
-                    SegmentOrigin::TokenResolved,
-                );
-            }
-            out.entry(segment_ref.data_object_key.clone())
-                .or_insert(segment_ref);
-            return Ok(());
+            return self.l0_segment_ref(tenant, &key, &cached).map(Some);
         }
 
         // Independent retry budgets for the two distinct failure modes. A
@@ -4555,16 +4576,7 @@ impl Catalog {
                         record,
                         derived: None,
                     };
-                    let segment_ref = self.l0_segment_ref(tenant, &key, &entry)?;
-                    if !out.contains_key(&segment_ref.data_object_key) {
-                        origin_by_key.insert(
-                            segment_ref.data_object_key.clone(),
-                            SegmentOrigin::TokenResolved,
-                        );
-                    }
-                    out.entry(segment_ref.data_object_key.clone())
-                        .or_insert(segment_ref);
-                    return Ok(());
+                    return self.l0_segment_ref(tenant, &key, &entry).map(Some);
                 }
                 Err(StoreError::NotFound) if notfound_retries > 0 => {
                     notfound_retries -= 1;
@@ -4577,16 +4589,7 @@ impl Catalog {
                     // step 5): a swept-post-compaction record is served via its
                     // L1 parts, a tombstoned bucket is satisfied with zero
                     // segments.
-                    return self
-                        .resolve_min_token_fallback(
-                            tenant,
-                            signal,
-                            token,
-                            out,
-                            origin_by_key,
-                            accounting,
-                        )
-                        .await;
+                    return Ok(None);
                 }
                 Err(e) if e.is_retryable() && transient_retries > 0 => {
                     transient_retries -= 1;
@@ -4595,6 +4598,197 @@ impl Catalog {
                 Err(e) => return Err(CatalogError::Store(e)),
             }
         }
+    }
+
+    /// Add a token's present L0 input to the snapshot set unless the set
+    /// already serves its rows: the input itself, or (issue #4418) the output
+    /// of a record that replaced it, which the key alone cannot show because
+    /// an L1 part and its inputs have different keys.
+    #[allow(clippy::too_many_arguments)]
+    async fn include_token_l0(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        token: &CommitToken,
+        segment_ref: SegmentRef,
+        out: &mut HashMap<String, SegmentRef>,
+        origin_by_key: &mut HashMap<String, SegmentOrigin>,
+        erasure_pending: bool,
+        accounting: &QueryAccounting,
+    ) -> Result<(), CatalogError> {
+        if out.contains_key(&segment_ref.data_object_key) {
+            return Ok(());
+        }
+        let included = match self
+            .token_input_replacement(tenant, signal, token, out, erasure_pending, accounting)
+            .await?
+        {
+            None => vec![segment_ref],
+            Some(replacement) => replacement,
+        };
+        for segment_ref in included {
+            if !out.contains_key(&segment_ref.data_object_key) {
+                origin_by_key.insert(
+                    segment_ref.data_object_key.clone(),
+                    SegmentOrigin::TokenResolved,
+                );
+            }
+            out.entry(segment_ref.data_object_key.clone())
+                .or_insert(segment_ref);
+        }
+        Ok(())
+    }
+
+    /// What serves the token's L0 input, whose commit record is still
+    /// present, in its place (docs/catalog-and-mvcc.md step 5): `None` when
+    /// the input itself is added, otherwise the segments to add instead.
+    /// For logs, spans and every other signal without query-time dedup the
+    /// input stays out when:
+    ///
+    /// - the bucket is tombstoned: satisfied with zero segments, as the
+    ///   missing-record fallback answers;
+    /// - a compaction or rewrite record of the token's bucket, live or not,
+    ///   names the input (a rewrite through its effective inputs) and `out`
+    ///   holds one of that record's output parts, which serves the input's
+    ///   rows already: nothing is added;
+    /// - otherwise, a live rewrite names the input (the one the
+    ///   missing-record fallback picks) and `out` holds nothing that rewrite
+    ///   replaced: its parts are added, as the missing-record fallback adds
+    ///   them. When `out` does hold an object it replaced, the input itself
+    ///   is added, since the rewrite's parts would serve that object's rows a
+    ///   second time.
+    ///
+    /// The check runs only when `out` holds an output part of the bucket or
+    /// an erasure request is pending (a live rewrite's `.dreq` outlives its
+    /// inputs' commit records), so with neither the answer is `None` at no
+    /// store read, tombstone or not. Otherwise the
+    /// bucket is LISTed and its compaction (cached) and rewrite records
+    /// loaded, as the missing-record fallback does. Metrics dedup at query
+    /// time and always get `None`.
+    async fn token_input_replacement(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        token: &CommitToken,
+        out: &HashMap<String, SegmentRef>,
+        erasure_pending: bool,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<Vec<SegmentRef>>, CatalogError> {
+        let bucket_output_in_out = out.values().any(|segment| {
+            matches!(segment.level, SegmentLevel::L1 { .. })
+                && segment.shard == token.shard
+                && segment.ingest_hour_bucket == token.ingest_hour_bucket
+        });
+        // Metrics dedup on (series_id, ts) at query time, so the input beside
+        // its replacement is harmless there and the step stays as it was.
+        if signal == Signal::Metrics || (!bucket_output_in_out && !erasure_pending) {
+            return Ok(None);
+        }
+        let Some(bucket) = self
+            .load_token_bucket(tenant, signal, token, accounting)
+            .await?
+        else {
+            return Ok(Some(Vec::new()));
+        };
+        let identity = token_identity(token);
+        for (_, record) in &bucket.compaction_records {
+            if !names_input(&record.inputs, &identity) {
+                continue;
+            }
+            for part in &record.parts {
+                if out.contains_key(&keys::reconstruct_l1_part_key(record, part)?) {
+                    return Ok(Some(Vec::new()));
+                }
+            }
+        }
+        // A served part of a superseded rewrite (a stale HEAD) is checked
+        // before a live successor is added, which would serve its rows twice.
+        for (rkey, record) in &bucket.rewrite_records {
+            if !bucket
+                .rewrite_effective_inputs(rkey, record)?
+                .contains(&identity)
+            {
+                continue;
+            }
+            for part in &record.parts {
+                if out.contains_key(&keys::reconstruct_rewrite_part_key(record, part)?) {
+                    return Ok(Some(Vec::new()));
+                }
+            }
+        }
+        let superseded_records = bucket.supersession()?.superseded_records;
+        self.check_rewrite_siblings(
+            token.shard,
+            token.ingest_hour_bucket,
+            &bucket.rewrite_records,
+            &superseded_records,
+        );
+        let Some((rkey, record)) = bucket.live_rewrite_naming(&superseded_records, &identity)?
+        else {
+            return Ok(None);
+        };
+        // The rewrite's parts also carry the rows of every other input it
+        // replaced. While the set still serves one of those from a stale
+        // HEAD, its `.dreq` stays pending, so the token's own input is added
+        // and the erasure filter drops its erased rows.
+        if bucket.set_holds_a_replaced_object(rkey, record, token, out)? {
+            return Ok(None);
+        }
+        record
+            .parts
+            .iter()
+            .map(|part| build_rewrite_l1_segment_ref(record, part, rkey))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+
+    /// LIST the token's `(shard, ingest_hour)` bucket and load its compaction
+    /// and rewrite records, or `None` when the bucket is tombstoned. Observing
+    /// the tombstone invalidates the bucket's cached records (ADR-0010 §10),
+    /// same as the listing path. A rewrite (ADR-0064 decision 3) supersedes
+    /// inputs exactly as compaction does, so both kinds are loaded.
+    async fn load_token_bucket(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        token: &CommitToken,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<TokenBucketRecords>, CatalogError> {
+        let prefix =
+            keys::commit_shard_hour_prefix(tenant, signal, token.shard, token.ingest_hour_bucket)?;
+        let objects = self.guarded_list_all(tenant, &prefix, accounting).await?;
+        let mut compaction_keys: Vec<String> = Vec::new();
+        let mut rewrite_keys: Vec<String> = Vec::new();
+        for meta in objects {
+            match keys::partition_bucket_entry(&meta.key)? {
+                BucketEntry::Tombstone(_) => {
+                    self.invalidate_bucket_cache(tenant, &prefix);
+                    return Ok(None);
+                }
+                BucketEntry::CompactionRecord(_) => compaction_keys.push(meta.key),
+                BucketEntry::RewriteRecord(_) => rewrite_keys.push(meta.key),
+                BucketEntry::CommitRecord(_) => {}
+            }
+        }
+        let mut compaction_records: Vec<(String, Arc<CompactionRecord>)> = Vec::new();
+        for ckey in compaction_keys {
+            let record = self
+                .load_and_validate_compaction(tenant, signal, token.shard, &ckey, accounting)
+                .await?;
+            compaction_records.push((ckey, record));
+        }
+        let mut rewrite_records: Vec<(String, Arc<RewriteRecord>)> = Vec::new();
+        for rkey in rewrite_keys {
+            let record = self
+                .load_and_validate_rewrite(tenant, signal, token.shard, &rkey, accounting)
+                .await?;
+            rewrite_records.push((rkey, record));
+        }
+        Ok(Some(TokenBucketRecords {
+            prefix,
+            compaction_records,
+            rewrite_records,
+        }))
     }
 
     /// Token fallback when the exact commit-record GET returned NotFound
@@ -4619,118 +4813,34 @@ impl Catalog {
         origin_by_key: &mut HashMap<String, SegmentOrigin>,
         accounting: &QueryAccounting,
     ) -> Result<(), CatalogError> {
-        let prefix =
-            keys::commit_shard_hour_prefix(tenant, signal, token.shard, token.ingest_hour_bucket)?;
-        let objects = self.guarded_list_all(tenant, &prefix, accounting).await?;
-        let mut compaction_keys: Vec<String> = Vec::new();
-        let mut rewrite_keys: Vec<String> = Vec::new();
-        for meta in objects {
-            match keys::partition_bucket_entry(&meta.key)? {
-                BucketEntry::Tombstone(_) => {
-                    // Satisfied with zero segments (ADR-0019 decision 3), and
-                    // observing the tombstone invalidates this bucket's cached
-                    // records (ADR-0010 §10), same as the listing path.
-                    self.invalidate_bucket_cache(tenant, &prefix);
-                    return Ok(());
-                }
-                BucketEntry::CompactionRecord(_) => compaction_keys.push(meta.key),
-                BucketEntry::RewriteRecord(_) => rewrite_keys.push(meta.key),
-                BucketEntry::CommitRecord(_) => {}
-            }
-        }
-
-        let token_identity = (token.writer_id.to_string(), token.epoch, token.seq);
-
-        // Load the bucket's compaction and rewrite records. A rewrite (ADR-0064
-        // decision 3) supersedes inputs exactly as compaction does, so
-        // read-your-write for a swept L0 whose data a rewrite absorbed must be
-        // served from the rewrite's (erased) output, never from a superseded
-        // predecessor's parts (which would resurrect erased records).
-        let mut compaction_records: Vec<(String, Arc<CompactionRecord>)> = Vec::new();
-        for ckey in &compaction_keys {
-            let record = self
-                .load_and_validate_compaction(tenant, signal, token.shard, ckey, accounting)
-                .await?;
-            compaction_records.push((ckey.clone(), record));
-        }
-        let mut rewrite_records: Vec<(String, Arc<RewriteRecord>)> = Vec::new();
-        for rkey in &rewrite_keys {
-            let record = self
-                .load_and_validate_rewrite(tenant, signal, token.shard, rkey, accounting)
-                .await?;
-            rewrite_records.push((rkey.clone(), record));
-        }
-
-        // Overlapping input sets in this bucket (issue #1171, the same
-        // hazard #1070 fixed on the listing path): without this, a token
-        // covered by a losing record's inputs is satisfied via that loser's
-        // parts even though `process_bucket` never serves them, so a snapshot
-        // can carry parts from both overlapping records. Pick one
-        // authoritative record per overlap component here too, and skip a
-        // loser below before testing whether it covers the token. A version 2
-        // record a present one supersedes is excluded the same way, and one a
-        // live rewrite dominates is dropped before the selection runs.
-        let dominated =
-            erasure_dominated_compaction_records(&compaction_records, &rewrite_records, &prefix)?;
-        let candidates: Vec<(&str, &CompactionRecord)> = compaction_records
-            .iter()
-            .map(|(k, r)| (k.as_str(), r.as_ref()))
-            .filter(|(k, _)| !dominated.contains(k))
-            .collect();
-        let selection = select_authoritative_compaction_records(&candidates)?;
-
-        // Which records a live rewrite superseded as a whole (their parts must
-        // never be served). No rewrites -> empty set -> exactly the pre-ADR-0064
-        // behavior below.
-        let compaction_by_key: HashMap<&str, &CompactionRecord> = compaction_records
-            .iter()
-            .map(|(k, r)| (k.as_str(), r.as_ref()))
-            .collect();
-        let rewrite_by_key: HashMap<&str, &RewriteRecord> = rewrite_records
-            .iter()
-            .map(|(k, r)| (k.as_str(), r.as_ref()))
-            .collect();
-        let mut superseded_records: HashSet<String> = HashSet::new();
-        {
-            let mut discard: HashSet<(String, u64, u64)> = HashSet::new();
-            for (rkey, record) in &rewrite_records {
-                resolve_rewrite_supersession(
-                    rkey,
-                    record,
-                    &prefix,
-                    &compaction_by_key,
-                    &rewrite_by_key,
-                    &mut discard,
-                    &mut superseded_records,
-                )?;
-            }
-        }
+        let Some(bucket) = self
+            .load_token_bucket(tenant, signal, token, accounting)
+            .await?
+        else {
+            // Satisfied with zero segments (ADR-0019 decision 3).
+            return Ok(());
+        };
+        let token_identity = token_identity(token);
+        let TokenBucketSupersession {
+            non_authoritative,
+            superseded_records,
+        } = bucket.supersession()?;
 
         // Third and last classifier that resolves rewrite supersession; it
         // raises the sibling alarm for the same reason the other two do.
         self.check_rewrite_siblings(
             token.shard,
             token.ingest_hour_bucket,
-            &rewrite_records,
+            &bucket.rewrite_records,
             &superseded_records,
         );
 
         // A live compaction record whose inputs cover the token: serve its parts.
-        for (ckey, record) in &compaction_records {
-            if superseded_records.contains(ckey)
-                || dominated.contains(ckey.as_str())
-                || selection.is_excluded(ckey)
-            {
+        for (ckey, record) in &bucket.compaction_records {
+            if superseded_records.contains(ckey) || non_authoritative.contains(ckey) {
                 continue;
             }
-            let covers = record.inputs.iter().any(|input| {
-                (
-                    input.writer_id.clone(),
-                    input.writer_epoch,
-                    input.writer_seq,
-                ) == token_identity
-            });
-            if covers {
+            if names_input(&record.inputs, &token_identity) {
                 for part in &record.parts {
                     let segment_ref = build_l1_segment_ref(record, part, ckey)?;
                     if !out.contains_key(&segment_ref.data_object_key) {
@@ -4750,35 +4860,21 @@ impl Catalog {
         // through `superseded_record_key`) cover the token: serve its erased
         // output parts. This is the read-your-write answer after an erasure
         // rewrite absorbed the token's flush.
-        for (rkey, record) in &rewrite_records {
-            if superseded_records.contains(rkey) {
-                continue;
-            }
-            let mut effective_inputs: HashSet<(String, u64, u64)> = HashSet::new();
-            let mut discard_superseded: HashSet<String> = HashSet::new();
-            resolve_rewrite_supersession(
-                rkey,
-                record,
-                &prefix,
-                &compaction_by_key,
-                &rewrite_by_key,
-                &mut effective_inputs,
-                &mut discard_superseded,
-            )?;
-            if effective_inputs.contains(&token_identity) {
-                for part in &record.parts {
-                    let segment_ref = build_rewrite_l1_segment_ref(record, part, rkey)?;
-                    if !out.contains_key(&segment_ref.data_object_key) {
-                        origin_by_key.insert(
-                            segment_ref.data_object_key.clone(),
-                            SegmentOrigin::TokenResolved,
-                        );
-                    }
-                    out.entry(segment_ref.data_object_key.clone())
-                        .or_insert(segment_ref);
+        if let Some((rkey, record)) =
+            bucket.live_rewrite_naming(&superseded_records, &token_identity)?
+        {
+            for part in &record.parts {
+                let segment_ref = build_rewrite_l1_segment_ref(record, part, rkey)?;
+                if !out.contains_key(&segment_ref.data_object_key) {
+                    origin_by_key.insert(
+                        segment_ref.data_object_key.clone(),
+                        SegmentOrigin::TokenResolved,
+                    );
                 }
-                return Ok(());
+                out.entry(segment_ref.data_object_key.clone())
+                    .or_insert(segment_ref);
             }
+            return Ok(());
         }
 
         Err(unsatisfiable_token(token))
@@ -4877,6 +4973,227 @@ fn segment_sort_key(s: &SegmentRef) -> (i64, u64, u64, u32, Uuid, u8, [u8; 32], 
         input_set_hash,
         part_index,
     )
+}
+
+/// A token bucket's compaction and rewrite records, as
+/// [`Catalog::load_token_bucket`] loaded them.
+struct TokenBucketRecords {
+    prefix: String,
+    compaction_records: Vec<(String, Arc<CompactionRecord>)>,
+    rewrite_records: Vec<(String, Arc<RewriteRecord>)>,
+}
+
+/// Which of a token bucket's records the token step must not serve.
+struct TokenBucketSupersession {
+    /// Compaction records a live rewrite dominates or the authoritative
+    /// selection excludes.
+    non_authoritative: HashSet<String>,
+    /// Compaction and rewrite records a live rewrite superseded as a whole.
+    superseded_records: HashSet<String>,
+}
+
+impl TokenBucketRecords {
+    fn supersession(&self) -> Result<TokenBucketSupersession, CatalogError> {
+        // Overlapping input sets in this bucket (issue #1171, the same
+        // hazard #1070 fixed on the listing path): without this, a token
+        // covered by a losing record's inputs is satisfied via that loser's
+        // parts even though `process_bucket` never serves them, so a snapshot
+        // can carry parts from both overlapping records. Pick one
+        // authoritative record per overlap component here too. A version 2
+        // record a present one supersedes is excluded the same way, and one a
+        // live rewrite dominates is dropped before the selection runs.
+        let dominated = erasure_dominated_compaction_records(
+            &self.compaction_records,
+            &self.rewrite_records,
+            &self.prefix,
+        )?;
+        let candidates: Vec<(&str, &CompactionRecord)> = self
+            .compaction_records
+            .iter()
+            .map(|(k, r)| (k.as_str(), r.as_ref()))
+            .filter(|(k, _)| !dominated.contains(k))
+            .collect();
+        let selection = select_authoritative_compaction_records(&candidates)?;
+        let non_authoritative: HashSet<String> = dominated
+            .iter()
+            .copied()
+            .chain(selection.excluded())
+            .map(str::to_owned)
+            .collect();
+
+        // Which records a live rewrite superseded as a whole (their parts must
+        // never be served). No rewrites -> empty set -> exactly the pre-ADR-0064
+        // behavior.
+        let (compaction_by_key, rewrite_by_key) = self.records_by_key();
+        let mut superseded_records: HashSet<String> = HashSet::new();
+        let mut discard: HashSet<(String, u64, u64)> = HashSet::new();
+        for (rkey, record) in &self.rewrite_records {
+            resolve_rewrite_supersession(
+                rkey,
+                record,
+                &self.prefix,
+                &compaction_by_key,
+                &rewrite_by_key,
+                &mut discard,
+                &mut superseded_records,
+            )?;
+        }
+        Ok(TokenBucketSupersession {
+            non_authoritative,
+            superseded_records,
+        })
+    }
+
+    /// A rewrite's effective inputs: its own, or chased through
+    /// `superseded_record_key`.
+    fn rewrite_effective_inputs(
+        &self,
+        rkey: &str,
+        record: &RewriteRecord,
+    ) -> Result<HashSet<(String, u64, u64)>, CatalogError> {
+        self.rewrite_chain(rkey, record)
+            .map(|(effective_inputs, _)| effective_inputs)
+    }
+
+    /// A rewrite's effective inputs and the keys of the records its
+    /// `superseded_record_key` chain replaced as a whole.
+    #[allow(clippy::type_complexity)]
+    fn rewrite_chain(
+        &self,
+        rkey: &str,
+        record: &RewriteRecord,
+    ) -> Result<(HashSet<(String, u64, u64)>, HashSet<String>), CatalogError> {
+        let (compaction_by_key, rewrite_by_key) = self.records_by_key();
+        let mut effective_inputs: HashSet<(String, u64, u64)> = HashSet::new();
+        let mut chain: HashSet<String> = HashSet::new();
+        resolve_rewrite_supersession(
+            rkey,
+            record,
+            &self.prefix,
+            &compaction_by_key,
+            &rewrite_by_key,
+            &mut effective_inputs,
+            &mut chain,
+        )?;
+        Ok((effective_inputs, chain))
+    }
+
+    /// The first rewrite, in listing order, that no live rewrite superseded
+    /// and whose effective inputs hold `identity`: the rewrite the token step
+    /// serves for an input, whether its commit record is present or swept.
+    fn live_rewrite_naming(
+        &self,
+        superseded_records: &HashSet<String>,
+        identity: &(String, u64, u64),
+    ) -> Result<Option<(&str, &RewriteRecord)>, CatalogError> {
+        for (rkey, record) in &self.rewrite_records {
+            if superseded_records.contains(rkey) {
+                continue;
+            }
+            if self
+                .rewrite_effective_inputs(rkey, record)?
+                .contains(identity)
+            {
+                return Ok(Some((rkey, record)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether `out` holds an object whose rows the rewrite at `rkey` also
+    /// serves: a level-0 input of the token's bucket among its effective
+    /// inputs, or an output part of a record its chain replaced or of any
+    /// other compaction or rewrite record naming one of those inputs.
+    fn set_holds_a_replaced_object(
+        &self,
+        rkey: &str,
+        record: &RewriteRecord,
+        token: &CommitToken,
+        out: &HashMap<String, SegmentRef>,
+    ) -> Result<bool, CatalogError> {
+        let (effective_inputs, chain) = self.rewrite_chain(rkey, record)?;
+        let held_input = out.values().any(|segment| {
+            segment.level == SegmentLevel::L0
+                && segment.shard == token.shard
+                && segment.ingest_hour_bucket == token.ingest_hour_bucket
+                && effective_inputs.contains(&(
+                    segment.writer_id.to_string(),
+                    segment.writer_epoch,
+                    segment.writer_seq,
+                ))
+        });
+        if held_input {
+            return Ok(true);
+        }
+        let names_effective_input = |inputs: &[CompactionInputIdentity]| {
+            inputs.iter().any(|input| {
+                effective_inputs.contains(&(
+                    input.writer_id.clone(),
+                    input.writer_epoch,
+                    input.writer_seq,
+                ))
+            })
+        };
+        for (ckey, compaction) in &self.compaction_records {
+            if !chain.contains(ckey) && !names_effective_input(&compaction.inputs) {
+                continue;
+            }
+            for part in &compaction.parts {
+                if out.contains_key(&keys::reconstruct_l1_part_key(compaction, part)?) {
+                    return Ok(true);
+                }
+            }
+        }
+        for (other_key, other) in &self.rewrite_records {
+            if other_key == rkey {
+                continue;
+            }
+            if !chain.contains(other_key)
+                && self
+                    .rewrite_effective_inputs(other_key, other)?
+                    .is_disjoint(&effective_inputs)
+            {
+                continue;
+            }
+            for part in &other.parts {
+                if out.contains_key(&keys::reconstruct_rewrite_part_key(other, part)?) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn records_by_key(
+        &self,
+    ) -> (
+        HashMap<&str, &CompactionRecord>,
+        HashMap<&str, &RewriteRecord>,
+    ) {
+        (
+            self.compaction_records
+                .iter()
+                .map(|(k, r)| (k.as_str(), r.as_ref()))
+                .collect(),
+            self.rewrite_records
+                .iter()
+                .map(|(k, r)| (k.as_str(), r.as_ref()))
+                .collect(),
+        )
+    }
+}
+
+fn token_identity(token: &CommitToken) -> (String, u64, u64) {
+    (token.writer_id.to_string(), token.epoch, token.seq)
+}
+
+fn names_input(inputs: &[CompactionInputIdentity], identity: &(String, u64, u64)) -> bool {
+    inputs.iter().any(|input| {
+        input.writer_id == identity.0
+            && input.writer_epoch == identity.1
+            && input.writer_seq == identity.2
+    })
 }
 
 fn unsatisfiable_token(token: &CommitToken) -> CatalogError {
