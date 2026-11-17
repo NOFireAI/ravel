@@ -127,8 +127,9 @@ list every page by kind.
   raising one tenant's shard count without touching the cluster-wide
   count, and what that trades.
 - [guides/kubernetes.md](guides/kubernetes.md): the operator and the
-  `RavelCluster` custom resource, the local kind environment, and what the
-  health and readiness probes mean.
+  `RavelCluster` custom resource, the local kind environment, what the
+  health and readiness probes mean, and how to autoscale the gateway, query
+  and maintain Deployments with a HorizontalPodAutoscaler.
 - [guides/disaster-recovery.md](guides/disaster-recovery.md): recovering a
   deployment from the bucket alone, the three configuration levels and
   what each requires, the verified restore procedure, and the rehearsal
