@@ -1424,8 +1424,7 @@ async fn a_store_that_recovers_with_no_attempt_publishes_past_the_bound<P: Pipe>
 /// (which only writes and the router's own installs move), never restarts the
 /// hold, so the first attempt past the trust horizon drops the buffer.
 async fn a_read_that_succeeds_mid_hold_restarts_it<P: Pipe>() {
-    let HeldView { world, keys: _, .. } =
-        hold_under::<P>(provisioning_outages::<P>(1, NEVER)).await;
+    let HeldView { world, .. } = hold_under::<P>(provisioning_outages::<P>(1, NEVER)).await;
     assert!(
         drive(&world.clock, || world.fault.sequence_progress(0)
             == PROV_READS_BEFORE + 2)
