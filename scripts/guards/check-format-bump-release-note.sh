@@ -14,20 +14,29 @@
 #
 # Formats, their anchors, and the signals a fragment must name:
 #
-#   RLOG   crates/ravel-logseg/src/footer.rs  `pub const VERSION: u16` and
-#                                             `pub const SUPPORTED_VERSIONS`
+#   RLOG   crates/ravel-logseg/src/footer.rs  `pub const VERSION: u16`,
+#                                             `pub const SUPPORTED_VERSIONS` and
+#                                             `WriteVersion::CURRENT`
 #          logs (or log), alerts (or alert), audit
-#   RSPAN  crates/ravel-rspan/src/footer.rs   `pub const VERSION: u16` and
-#                                             `pub const SUPPORTED_VERSIONS`
+#   RSPAN  crates/ravel-rspan/src/footer.rs   `pub const VERSION: u16`,
+#                                             `pub const SUPPORTED_VERSIONS` and
+#                                             `WriteVersion::CURRENT`
 #          spans (or span)
-#   RSEG   crates/ravel-segment/src/format.rs `SegmentVersion::WINDOW`
+#   RSEG   crates/ravel-segment/src/format.rs `SegmentVersion::WINDOW` and
+#                                             `SegmentVersion::CURRENT`
 #          metrics (or metric)
 #
 # RSEG's `VERSION` constant pins the retired v1 number and never moves, so its
-# anchor is the reader window, which the PR adding a new RSEG version edits.
-# For RLOG and RSPAN the reader window (`SUPPORTED_VERSIONS`) is watched beside
-# `VERSION`, because dropping an old reader changes the window and not the
-# version, and makes stored objects of that version unreadable just the same.
+# anchors are the reader window, which the PR adding a new RSEG version edits,
+# and `CURRENT`, the writer's default emitted version. Under the baseline's
+# two-version window (ADR-4233) the window can be two wide while `CURRENT` stays
+# N, so a flip of `CURRENT` (the version writers default to) is a separate event
+# the window anchor does not catch, and it needs a release note too. For RLOG
+# and RSPAN the reader window (`SUPPORTED_VERSIONS`) is watched beside `VERSION`,
+# because dropping an old reader changes the window and not the version, and
+# makes stored objects of that version unreadable just the same; their
+# `WriteVersion::CURRENT` is watched for the same writer-default reason as
+# RSEG's.
 #
 # A format counts as bumped when its anchor's VALUE differs between the merge
 # base and head; an edit elsewhere in the same file does not count. Fragments
@@ -87,9 +96,12 @@ range="${merge_base}..${head_sha}"
 formats=(
   'RLOG|crates/ravel-logseg/src/footer.rs|^pub const VERSION: u16 = ([0-9]+);|logs,log alerts,alert audit'
   'RLOG|crates/ravel-logseg/src/footer.rs|^pub const SUPPORTED_VERSIONS: SupportedVersions = (.*);|logs,log alerts,alert audit'
+  'RLOG|crates/ravel-logseg/src/footer.rs|^[[:space:]]*pub const CURRENT: WriteVersion = (.*);|logs,log alerts,alert audit'
   'RSPAN|crates/ravel-rspan/src/footer.rs|^pub const VERSION: u16 = ([0-9]+);|spans,span'
   'RSPAN|crates/ravel-rspan/src/footer.rs|^pub const SUPPORTED_VERSIONS: SupportedVersions = (.*);|spans,span'
+  'RSPAN|crates/ravel-rspan/src/footer.rs|^[[:space:]]*pub const CURRENT: WriteVersion = (.*);|spans,span'
   "RSEG|crates/ravel-segment/src/format.rs|^[[:space:]]*pub const WINDOW: &'static \\[SegmentVersion\\] = (.*);|metrics,metric"
+  'RSEG|crates/ravel-segment/src/format.rs|^[[:space:]]*pub const CURRENT: SegmentVersion = (.*);|metrics,metric'
 )
 
 # anchor_value <commit> <file> <regex>: prints the single captured value, or
