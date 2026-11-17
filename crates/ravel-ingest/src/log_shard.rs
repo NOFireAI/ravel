@@ -81,7 +81,7 @@ use crate::format_floor::{
 };
 use crate::generation::{
     FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, STALE_VIEW_ABANDONED,
-    ScanCheck, mismatch_retry_spent, reread_and_check, send_hand_back, stale_view_hold_since,
+    ScanCheck, held_view_check, mismatch_retry_spent, reread_and_check, send_hand_back,
     stale_view_hold_spent,
 };
 use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
@@ -2112,18 +2112,38 @@ impl LogShardActor {
     }
 
     /// The scan-set check at flush open, re-reading an untrusted view once per
-    /// drain; see `shard::ShardActor::scan_check`.
-    async fn scan_check(&mut self, tenant: TenantHash, hour: u32, now_ns: i64) -> ScanCheck {
-        let verdict = self.scope.check(tenant, self.shard, hour, now_ns);
-        if verdict != ScanCheck::Unknown
-            || !self
+    /// drain and once more before a spent stale-view hold drops the buffer;
+    /// see `shard::ShardActor::scan_check`.
+    async fn scan_check(
+        &mut self,
+        tenant: TenantHash,
+        hour: u32,
+        now_ns: i64,
+        hold_since_ns: &mut Option<i64>,
+        lag_check: LagCheck,
+    ) -> ScanCheck {
+        let mut verdict = self.scope.check(tenant, self.shard, hour, now_ns);
+        if verdict == ScanCheck::Unknown
+            && self
                 .drain_rereads
                 .as_mut()
                 .is_some_and(|reread| reread.insert(tenant))
         {
+            verdict = reread_and_check(
+                self.scope.as_ref(),
+                self.clock.as_ref(),
+                self.config.max_flush_lifetime,
+                tenant,
+                self.shard,
+                hour,
+                now_ns,
+            )
+            .await;
+        }
+        if verdict != ScanCheck::Unknown {
             return verdict;
         }
-        reread_and_check(
+        held_view_check(
             self.scope.as_ref(),
             self.clock.as_ref(),
             self.config.max_flush_lifetime,
@@ -2131,6 +2151,9 @@ impl LogShardActor {
             self.shard,
             hour,
             now_ns,
+            hold_since_ns,
+            matches!(lag_check, LagCheck::Enforced),
+            self.drain_rereads.is_some(),
         )
         .await
     }
@@ -2861,10 +2884,16 @@ impl LogShardActor {
         // ADR-1642 scan-set amendment: write under this shard index only if
         // the read side scans it for the hour this flush is about to pin, and
         // no other generation owns that hour alone (issue #2429).
-        let buf = match self
-            .scan_check(tenant_hash, ingest_hour_bucket, raw_ns)
-            .await
-        {
+        let verdict = self
+            .scan_check(
+                tenant_hash,
+                ingest_hour_bucket,
+                raw_ns,
+                &mut buf.stale_view_since_ns,
+                lag_check,
+            )
+            .await;
+        let buf = match verdict {
             ScanCheck::InScanSet => {
                 self.handing_back = false;
                 self.in_place_warnings.rearm(tenant_hash);
@@ -3012,12 +3041,6 @@ impl LogShardActor {
                 if !std::mem::replace(&mut buf.stale_view_counted, true) {
                     self.metrics.record_stale_provisioning_flush();
                 }
-                buf.stale_view_since_ns = stale_view_hold_since(
-                    buf.stale_view_since_ns,
-                    self.scope.view_refreshed_at(tenant_hash),
-                    raw_ns,
-                    matches!(lag_check, LagCheck::Enforced),
-                );
                 if stale_view_hold_spent(
                     buf.stale_view_since_ns,
                     raw_ns,

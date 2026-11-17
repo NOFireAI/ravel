@@ -217,25 +217,35 @@ Buffered mode (opt-in per request, named "buffered"):
   router's switch is gone, so it is granted, fenced and refused exactly as
   above, and the `no_bucket_view` reason is never raised. Nine: the
   flush is held closed on a provisioning view its router cannot trust for
-  `max_flush_lifetime` (ADR-1642 scan-set amendment, bounded by its
+  `max_flush_lifetime` with no provisioning read succeeding (ADR-1642
+  scan-set amendment, bounded by its
   stale-view hold amendment). A flush whose ingest hour is at or past
   `hour(refreshed_at) + ceil(C) + 1` cannot confirm its shard index is in the
   read side's scan set, so it does not open and its buffer is kept while the
   provisioning record is re-read. The hold starts at the first enforced flush
   attempt that finds no trusted view and ends when a flush attempt opens on a
-  trusted view (a scan-set or hand-back verdict). A provisioning read issued
-  after the hold began that succeeds restarts it at the next flush attempt
+  trusted view (a scan-set or hand-back verdict, including a hand-back that
+  keeps its rows because a target is not live or its mailbox is full). A
+  provisioning read issued at or after the hold's start that succeeds
+  restarts it at the next flush attempt
   that still finds no trusted view, whether or not flush attempts were made
   in between (a deferred flush makes none). Once it has lasted
   `max_flush_lifetime` (3600 s by default) with no such read, the next flush
-  attempt, enforced or teardown, drops the buffer with no store call: any strict waiter
-  is acked with the retryable `Abandoned` (503), the buffer's ADR-0069 byte
+  attempt, enforced or teardown, re-reads the record before it drops anything
+  (joining a read already in flight), and the shard waits for that read at
+  most until the deadline a flush opened at that attempt would carry,
+  `max_flush_lifetime` later. A drain that has already re-read the tenant
+  does not read again, and inside the read backoff after a failed read (at
+  most 30 s) the re-read answers as failed without a GET. If the re-read
+  installs a trusted view, the flush opens on it like any other. Otherwise
+  the attempt drops the buffer: any strict waiter is acked with the retryable `Abandoned` (503), the buffer's ADR-0069 byte
   charges are refunded, the drop is logged at ERROR, and
   `ravel_ingest_abandoned_stale_provisioning_total`, labelled by signal,
   counts it once per buffer. A teardown drain inside that bound still writes
   the buffer in place (the first exception under "Online resharding" below). Like case one this
   is a store that cannot be read for an hour: no provisioning read succeeded
-  for `max_flush_lifetime`, deferred flushes included; the alternative, holding the
+  for `max_flush_lifetime`, deferred flushes included, and the re-read at the
+  drop did not succeed either; the alternative, holding the
   rows and their budget charge without limit, turns a lasting outage into an
   unbounded memory and budget hold on every router. The
   ADR-1685 store-clock lag check is not a case of its own: a teardown drain's
@@ -724,8 +734,9 @@ onward routes with the new count. Guarantees:
   for that hour, on the tenant's generation view trusted only as long as
   routing trusts it; outside the scan set it hands the rows to the tenant's
   current generation, and on a view it cannot trust it does not open the
-  flush and keeps the rows, for at most `max_flush_lifetime` from the first
-  enforced attempt that found no trusted view, after which it drops them
+  flush and keeps the rows until `max_flush_lifetime` has passed with no
+  provisioning read succeeding since the hold began (a successful read
+  restarts it), after which a last re-read that also fails drops them
   unwritten (acknowledgement case nine). A strict write still waiting on handed-back rows
   is answered `Abandoned` (503, outcome unknown) before the rows are sent:
   they are written by a target shard or, if none can take them, by the shard
@@ -754,7 +765,8 @@ onward routes with the new count. Guarantees:
     re-reading the provisioning record, or cannot reach a live shard of the
     current generation, writes the rows in place rather than drop them,
     unless a flush of theirs has already been held on an untrusted view for
-    `max_flush_lifetime`, which drops them (acknowledgement case nine). When
+    `max_flush_lifetime` with no provisioning read succeeding, in which case
+    the drain's failed re-read drops them (acknowledgement case nine). When
     the target was not live the rows are known to be outside the scan set:
     stored but returned by no query, logged at ERROR with the tenant, shard
     and hour, and counted on `ravel_ingest_teardown_unscanned_writes_total`.
