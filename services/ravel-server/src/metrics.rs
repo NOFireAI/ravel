@@ -5744,7 +5744,7 @@ pub(crate) fn render_compat_family(out: &mut String, mode: Mode, snapshot: &Comp
     write_header(
         out,
         "ravel_compat_late_write_watermark_seconds",
-        "Unix time in seconds through which the daily late-write pass has verified that no record below the certified version was written, per certified format family (ADR-4233 decision 7). More than a day behind the clock means the pass is not running; a value at or below the certificate's certified time means no pass has run since certify.",
+        "Unix time in seconds through which the daily late-write pass has verified that no record below the certified version was written, per certified format family (ADR-4233 decision 7). The pass runs when the watermark is a day old, checked on an hourly tick, so more than 25 hours behind the clock means passes are not completing; a value at or below the certificate's certified time means no pass that started after certify has completed.",
         "gauge",
     );
     for certificate in &snapshot.certificates {
