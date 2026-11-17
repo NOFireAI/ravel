@@ -217,10 +217,12 @@ which fails if a new versioned message lands unclassified):
 |---|---|---|---|
 | `TenancyMarker` | never rewritten (write-once) | `sys/tenancy`, CreateIfAbsent | {1} |
 | `TenantRecoveryManifest` | never rewritten (write-once) | `sys/t/<h>`, CreateIfAbsent | {1} |
+| `IpcryptPolicyMarker` | never rewritten (CreateIfAbsent; `set-policy` replaces it under CAS with a body built from the local policy file, never from the stored bytes) | `sys/ipcrypt/policy` | {1} (row added by the ADR-4233 R1 rows amendment below) |
 | `AdmissionUsageSnapshot` | never rewritten (sole-writer Overwrite, fresh dump) | ADR-0057 snapshot, `PutMode::Overwrite` | {1} |
 | `WorkerHeartbeat` | never rewritten (sole-writer Overwrite, fresh dump) | ADR-0065 heartbeat, `PutMode::Overwrite` | **{2}** (version 2 adds the record MAC and version 1 is refused as `missing_mac`: ADR-3130 decision 2) |
-| `ProvisioningRecord` | **CAS-mutable** | `provisioning::append_generation`, `raise_format_floor` | **{1, 2, 3}** (3 read, not written: ADR-1746 Release A; 3 is written since the Release B amendment below) |
-| `TenantConfigRecord` | **CAS-mutable** | `tenant_config::set_tenant_config` | **{1, 2, 3}** (3 read, and written only behind the `StorageLayoutWrite` opt-in: ADR-2135's rollout opt-in amendment) |
+| `ProvisioningRecord` | **CAS-mutable** | `provisioning::append_generation`, `raise_format_floor` | **{1, 2, 3}** (3 read, not written: ADR-1746 Release A; 3 is written since the Release B amendment below; {1, 2, 3, 4} since the ADR-4233 R1 rows amendment below) |
+| `CompatRecord` | **CAS-mutable** | `sys/compat`, `compat::create_compat` then `update_compat` | {1} (row added by the ADR-4233 R1 rows amendment below) |
+| `TenantConfigRecord` | **CAS-mutable** | `tenant_config::set_tenant_config` | **{1, 2, 3}** (3 read, and written only behind the `StorageLayoutWrite` opt-in: ADR-2135's rollout opt-in amendment; {1, 2, 3, 4} since the ADR-4233 R1 rows amendment below) |
 | `MetricMetadataRecord` | **CAS-mutable** | ingest metadata sink read→`merge_entries`→write | **{1, 2}** |
 | `AuthTokenMap` | **CAS-mutable** | `sys/auth` CAS-replace | {1, 2} (managed_by; floor added in R2) |
 | `GcConfig` | **CAS-mutable** | `ravel-maintain::gc_config::set_gc_config` | {1}, ceiling-only gate |
@@ -235,7 +237,8 @@ names one the proto lacks, and asserts the copy's read sets for
 `AuthTokenMap` and `KeyEpochRecord` against each reader's own
 `MIN_READ_VERSION..=MAX_READ_VERSION` constants, so a widened gate that does
 not update the test's copy fails. This table, and the test's entries for the
-other six messages, are maintained by hand.
+other six messages, are maintained by hand (counts updated by the ADR-4233 R1
+rows amendment below).
 
 "Never rewritten" covers the write-once markers AND the sole-writer
 `PutMode::Overwrite` snapshots (`AdmissionUsageSnapshot`, `WorkerHeartbeat`): each
@@ -762,3 +765,42 @@ families. The window opens at the baseline release, not at v1.0. The
 `compat_epoch` and `compat_fenced_unix_ns` and is written only by an
 activation's fence, so the R1 table row for `ProvisioningRecord` changes
 with the code that adds the reader.
+
+## Amendment (2026-11-17, #4250): the ADR-4233 R1 rows
+
+<!-- amendment-applies: sections="Amendment (R1, #1300): the CAS-mutable sys/* records version on every additive change" pointer="ADR-4233 R1 rows amendment" -->
+<!-- amendment-supersedes: phrase="the test's entries for the other six messages" pointer="ADR-4233 R1 rows amendment" -->
+
+The R1 table rows below now match `classification_table()` in
+`crates/ravel-catalog/tests/sys_proto_format_version_classification.rs`.
+This amendment does not reconcile the `GcConfig` row: the table and the
+test both give it {1}, while `GcConfigValues::from_proto`
+(`crates/ravel-maintain/src/gc_config.rs`, around lines 246-257) reads 1
+and 2. That difference is tracked in issue #4399.
+
+- `ProvisioningRecord` reads {1, 2, 3, 4}. Its writers stamp 3, and stamp
+  4 when the record carries `compat_epoch` (field 8) or
+  `compat_fenced_unix_ns` (field 9), or was already at 4 (`stamp_for` in
+  `crates/ravel-catalog/src/provisioning.rs`): an activation's fence, a
+  raise before a writer's first publish above a family's baseline, or a
+  first touch after an activation. The two rewrite paths keep a version-4
+  record at 4 and refuse a record above 4 (ADR-4233 decision 4).
+- `CompatRecord` (`sys/compat`, ADR-4233 decision 3) is a new CAS-mutable
+  row at {1}. It is created with `CreateIfAbsent` and replaced whole under
+  CAS, and a record above version 1 is read as `CompatRecordNewer` and
+  never overwritten.
+- `TenantConfigRecord` reads {1, 2, 3, 4}: ADR-2707 added version 4
+  (`key_index` and `index_trace_id`), stamped behind the same storage-layout
+  opt-in as 3. The writer's default stamp stays 2.
+- `IpcryptPolicyMarker` (`sys/ipcrypt/policy`) is added as a never-rewritten
+  row at {1}: it is created with `CreateIfAbsent`, and `set-policy`
+  replaces it under CAS with a body built from the operator's policy file,
+  never from a decoded view of the stored bytes, so no writer can strip a
+  field.
+
+The test now asserts the read sets of six records against their readers'
+constants (`ProvisioningRecord`, `CompatRecord`, `TenantConfigRecord`,
+`MetricMetadataRecord`, `AuthTokenMap` and `KeyEpochRecord`), and its
+entries for the other seven messages are maintained by hand; the R1 text
+counting "the other six messages" predates the two added rows (see the
+ADR-4233 R1 rows amendment).

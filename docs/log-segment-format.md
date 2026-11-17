@@ -1897,9 +1897,20 @@ proves absent.
 
 ## Validation summary
 
-All violations are `Corrupted`, never panics:
+Every violation is a typed error, never a panic. Two are not `Corrupted`,
+because they mean a newer or older build wrote the object rather than that
+it is damaged (ADR-4233 decision 4, hazard H5):
 
-- object smaller than 16 bytes; bad magic; unsupported version or signal;
+- a trailer version outside the reader window is `UnsupportedVersion`;
+- a POSTINGS or KEY_IDX section whose grammar version this build does not
+  read is `UnsupportedSectionVersion`, from the section's own parser. The
+  scan path treats a POSTINGS section that fails to parse, this error
+  included, as it treats a corrupt one: no postings pruning, never a wrong
+  result.
+
+All other violations are `Corrupted`:
+
+- object smaller than 16 bytes; bad magic; unsupported signal;
   non-zero reserved byte; `footer_len` zero or past the trailer; footer
   crc mismatch; footer proto decode failure.
 - duplicate section kind; missing mandatory section; section range out of
