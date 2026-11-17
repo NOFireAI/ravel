@@ -1538,14 +1538,13 @@ render on the maintain process's `/metrics` as
 ([observability guide](../observability.md#format-write-policy-ravel_compat_)).
 
 With `--background-migrate`, each tick also runs `background_migrate_unit`
-for the metrics, logs and spans buckets of every discovered tenant whose
-fold unit this process owns, with a budget of 10,000 L0 records per tenant
-and signal. A walk the budget stops resumes from its cursor on the next
-tick. Each walk logs one `INFO` line, or a `WARN` line naming the held
-buckets when some were held; a unit already at the active version logs
-nothing. The flag is refused
-outside `--mode maintain` and without `--tenant-hash-key-file`. It is off
-by default.
+for each provisioned metrics, logs and spans signal of every discovered
+tenant whose fold unit this process owns, with a budget of 10,000 L0
+records per tenant and signal. A walk the budget stops resumes from its
+cursor on the next tick. Each walk logs one `INFO` line, or a `WARN` line
+naming the held buckets when some were held; a unit already at the active
+version logs nothing. The flag is refused outside `--mode maintain` and
+without `--tenant-hash-key-file`. It is off by default.
 
 ## Format migration
 
