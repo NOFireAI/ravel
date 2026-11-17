@@ -64,7 +64,9 @@ pub const DEFAULT_COMPAT_MAINTAIN_INTERVAL: Duration = Duration::from_secs(3_600
 
 /// L0 records one background migrate unit rewrites per `(tenant, signal)` per
 /// tick before it yields; the cursor resumes the walk next tick.
-pub const BACKGROUND_MIGRATE_BUDGET: MigrateBudget = MigrateBudget { max_records: 10_000 };
+pub const BACKGROUND_MIGRATE_BUDGET: MigrateBudget = MigrateBudget {
+    max_records: 10_000,
+};
 
 /// The signals with a provisioning record, so a format floor the background
 /// unit can rest on. Alerts and audit have none.
@@ -242,16 +244,15 @@ pub async fn run_tick(ctx: &CompatMaintainContext, live_set: &[Uuid]) -> CompatM
                 let Some(state) = CertificateState::of(entry) else {
                     continue;
                 };
-                if !owns(
-                    late_write_unit_key(family).as_bytes(),
-                    process_id,
-                    live_set,
-                ) {
+                if !owns(late_write_unit_key(family).as_bytes(), process_id, live_set) {
                     continue;
                 }
                 let unit = run_family(ctx, family, state).await;
                 wrote |= matches!(&unit.late_write, LateWriteStep::Ran(pass) if pass.certified)
-                    || matches!(&unit.finalize, FinalizeStep::Ran(CertifyReport::Certified { .. }));
+                    || matches!(
+                        &unit.finalize,
+                        FinalizeStep::Ran(CertifyReport::Certified { .. })
+                    );
                 report.families.push(unit);
             }
         }
@@ -800,10 +801,8 @@ mod tests {
         let clock = FixedClock::new(NOW1 + 2 * HOUR);
         let ctx = context(store.clone(), &clock);
         crate::compat::refresh_once(&ctx.view).await;
-        let pending = CertificateState::of(
-            &ctx.view.last_record().expect("read").families[0],
-        )
-        .expect("certified");
+        let pending = CertificateState::of(&ctx.view.last_record().expect("read").families[0])
+            .expect("certified");
         assert!(pending.finalization_pending, "{pending:?}");
 
         let report = run_tick(&ctx, &[ctx.worker.process_id()]).await;
@@ -837,11 +836,12 @@ mod tests {
         );
         assert_eq!(floor(store.as_ref()).await, Some(V_SEG));
         assert!(!cursor_present(store.as_ref()).await);
-        let viewed = CertificateState::of(
-            &ctx.view.last_record().expect("read").families[0],
-        )
-        .expect("certified");
-        assert_eq!(viewed, unit.state, "the view was refreshed after the writes");
+        let viewed = CertificateState::of(&ctx.view.last_record().expect("read").families[0])
+            .expect("certified");
+        assert_eq!(
+            viewed, unit.state,
+            "the view was refreshed after the writes"
+        );
     }
 
     /// The pass runs once a day: a tick inside a day of the last pass leaves
@@ -862,7 +862,12 @@ mod tests {
         let ctx = context(store.clone(), &clock);
         let live = [ctx.worker.process_id()];
         run_tick(&ctx, &live).await;
-        assert_eq!(rseg_entry(store.as_ref()).await.late_writes_verified_through_unix_ns, first);
+        assert_eq!(
+            rseg_entry(store.as_ref())
+                .await
+                .late_writes_verified_through_unix_ns,
+            first
+        );
 
         clock.set(first + HOUR);
         let report = run_tick(&ctx, &live).await;
@@ -877,8 +882,16 @@ mod tests {
             ),
             "{unit:?}"
         );
-        assert!(!cursor_present(store.as_ref()).await, "the probe started no census");
-        assert_eq!(rseg_entry(store.as_ref()).await.late_writes_verified_through_unix_ns, first);
+        assert!(
+            !cursor_present(store.as_ref()).await,
+            "the probe started no census"
+        );
+        assert_eq!(
+            rseg_entry(store.as_ref())
+                .await
+                .late_writes_verified_through_unix_ns,
+            first
+        );
 
         let day_later = first + LATE_WRITE_PASS_PERIOD_NS;
         clock.set(day_later);
@@ -888,7 +901,9 @@ mod tests {
             "{report:?}"
         );
         assert_eq!(
-            rseg_entry(store.as_ref()).await.late_writes_verified_through_unix_ns,
+            rseg_entry(store.as_ref())
+                .await
+                .late_writes_verified_through_unix_ns,
             day_later
         );
     }
@@ -923,7 +938,10 @@ mod tests {
             ),
             other => panic!("{other:?}"),
         }
-        assert!(matches!(unit.finalize, FinalizeStep::Contradicted), "{unit:?}");
+        assert!(
+            matches!(unit.finalize, FinalizeStep::Contradicted),
+            "{unit:?}"
+        );
         assert!(unit.state.contradicted && !unit.state.finalization_pending);
         assert!(rseg_entry(store.as_ref()).await.contradicted);
         assert_eq!(floor(store.as_ref()).await, None);
@@ -948,7 +966,12 @@ mod tests {
         let report = run_tick(&ctx, &[other]).await;
 
         assert!(report.families.is_empty(), "{report:?}");
-        assert_eq!(rseg_entry(store.as_ref()).await.late_writes_verified_through_unix_ns, NOW1);
+        assert_eq!(
+            rseg_entry(store.as_ref())
+                .await
+                .late_writes_verified_through_unix_ns,
+            NOW1
+        );
         assert_eq!(floor(store.as_ref()).await, None);
     }
 
@@ -1035,5 +1058,4 @@ mod tests {
         let printed = format!("{config:?}");
         assert!(printed.contains("<redacted>"), "{printed}");
     }
-
 }
