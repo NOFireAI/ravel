@@ -40,8 +40,13 @@ if [ -n "$MUTANT" ]; then
         exit 1
     fi
     tmp=$(mktemp -d)
+    trap 'rm -rf "${tmp:-}"' EXIT
     cp -R "$CONFIG/." "$tmp/"
-    sed -i "s|\${RAVEL_ANTITHESIS_MUTANT:-}|\"$MUTANT\"|" "$tmp/docker-compose.yaml"
+    # sed -i's in-place form is not portable (GNU takes no suffix, BSD/macOS
+    # requires one), so write to a temp file and move it over.
+    sed "s|\${RAVEL_ANTITHESIS_MUTANT:-}|\"$MUTANT\"|" "$tmp/docker-compose.yaml" \
+        > "$tmp/docker-compose.yaml.tmp"
+    mv "$tmp/docker-compose.yaml.tmp" "$tmp/docker-compose.yaml"
     if ! grep -qF "RAVEL_ANTITHESIS_MUTANT: \"$MUTANT\"" "$tmp/docker-compose.yaml"; then
         echo "refused: could not select $MUTANT in the copied config" >&2
         exit 1

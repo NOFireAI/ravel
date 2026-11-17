@@ -46,13 +46,20 @@ until docker compose exec -T driver grep -qs antithesis_setup /tmp/sdk.jsonl; do
 done
 echo "setup complete after $(( $(date +%s) - start ))s"
 
+# The driver's self-exit code, gated below. Only meaningful when the driver
+# exits on its own (WORKLOAD_MAX_ACTIONS); in the sleep branch it is still
+# running and `docker compose stop` would set a signal code, so leave it empty.
+driver_exit=""
 if [ -n "${WORKLOAD_MAX_ACTIONS:-}" ]; then
     deadline=$(( $(date +%s) + SECS ))
     while [ "$(docker inspect -f '{{.State.Running}}' driver)" = true ]; do
         [ "$(date +%s)" -lt "$deadline" ] || { echo "driver still running after ${SECS}s"; break; }
         sleep 5
     done
-    docker inspect -f 'driver exit code {{.State.ExitCode}}' driver
+    if [ "$(docker inspect -f '{{.State.Running}}' driver)" = false ]; then
+        driver_exit=$(docker inspect -f '{{.State.ExitCode}}' driver)
+    fi
+    echo "driver exit code ${driver_exit:-still running}"
 else
     sleep "$SECS"
 fi
@@ -77,14 +84,29 @@ echo "assertions: $(wc -l < "$OUT/assertions.tsv"), would fail: $(wc -l < "$OUT/
 cat "$OUT/would-fail.tsv"
 
 # The gate. A fault-free local run cannot reach the assertions that need
-# faults, so an unreached or never-true assertion is reported above and not
-# gated. What is gated: no SDK output at all, and any always-type assertion
-# that was hit with its condition false.
+# faults (an assert_always_or_unreachable or an assert_reachable), so those
+# are reported above and not gated. What is gated: no SDK output at all, and
+# any always-type assertion that was hit with its condition false.
 jq -rs '[.[].antithesis_assert // empty] | group_by(.message)[]
     | select(.[0].assert_type != "sometimes" and any(.hit and (.condition | not)))
     | .[0].message' "$OUT"/sdk-*.jsonl | sort > "$OUT/violated.tsv"
+# An assert_always (assert_type "always" with must_hit) that the run never hit.
+# In a fault-free plain run every always property is reached, so a never-hit
+# assert_always is a dead rule, not a fault-gated one. must_hit is false for an
+# assert_always_or_unreachable and the type is "reachability" for an
+# assert_reachable, so both of those, which legitimately go unhit without a
+# fault, are excluded.
+jq -rs '[.[].antithesis_assert // empty] | group_by(.message)[]
+    | select(.[0].assert_type == "always" and .[0].must_hit and (any(.hit) | not))
+    | .[0].message' "$OUT"/sdk-*.jsonl | sort > "$OUT/unhit-always.tsv"
 if [ ! -s "$OUT/assertions.tsv" ]; then
     echo "FAIL: no assertions collected (see $OUT/missing-sdk.txt)"
+    exit 1
+fi
+# A driver that crashed or misconfigured (non-zero self-exit) invalidates the
+# run whether or not any assertion was collected; gate it for both run kinds.
+if [ -n "$driver_exit" ] && [ "$driver_exit" != 0 ]; then
+    echo "FAIL: driver exited $driver_exit"
     exit 1
 fi
 if [ -n "$MUTANT" ]; then
@@ -98,6 +120,11 @@ fi
 if [ -s "$OUT/violated.tsv" ]; then
     echo "FAIL: always-type assertions violated:"
     cat "$OUT/violated.tsv"
+    exit 1
+fi
+if [ -s "$OUT/unhit-always.tsv" ]; then
+    echo "FAIL: assert_always assertions never hit in a fault-free run:"
+    cat "$OUT/unhit-always.tsv"
     exit 1
 fi
 echo "OK: no always-type assertion violated"
