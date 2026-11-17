@@ -1089,18 +1089,36 @@ pipelines apply it the same way (crates/ravel-ingest/src/compat.rs):
   shard buffers it. Its byte-budget charge, taken earlier in admission, is
   refunded when the refused write returns. A stale view (`view_stale`, under
   the same staleness rule as below) is refused at admission too, so no row
-  is acknowledged that the view cannot vouch for.
+  is acknowledged that the view cannot vouch for. So is a write whose
+  router's `max_flush_lifetime` is above the record's
+  `max_publish_lifetime_ns` (`publish_lifetime_above_compat`, ADR-4233
+  decision 7). The decision only ever raises that bound, and construction
+  refuses a router above it, so admission refuses only after
+  `compat init` records one below the lifetime of a router that is already
+  running.
 - The flush picks its version at permit grant, not at flush open, from the
-  view as it stands then. An active version this build cannot write, a
-  missing record, or a record whose `max_publish_lifetime_ns` is now below
-  the router's `max_flush_lifetime` (`publish_lifetime_above_compat`)
-  refuses the flush with no PUT: its rows are dropped, its byte charges
-  released, and its strict waiters get a retryable `CompatRefused` error. A
-  stale view is waited out instead: the grant asks again every second and
-  refuses `view_stale` only once `max_flush_lifetime` has passed since the
-  flush's first grant. A router dropped without `shutdown()` flushes under
-  the same rules, because its shards hold the per-tenant provisioning cache
-  by `Arc`; `no_bucket_view` is reserved and no ingest path raises it.
+  view as it stands then. An active version this build cannot write or a
+  missing record refuses the flush with no PUT: its rows are dropped, its
+  byte charges released, and its strict waiters get a retryable
+  `CompatRefused` error. The publish bound is not checked again at grant:
+  rows admitted before `compat init` recorded it publish inside the
+  router's own `max_flush_lifetime`. A stale view is waited out instead:
+  the grant asks again every second, and once more at the flush's deadline,
+  and refuses `view_stale` only once `max_flush_lifetime` has passed since
+  the flush's first grant. The teardown flush (`shutdown()`, or a router
+  dropped without it, the drain's bypass passes included) is granted and
+  checked under the same rules, because its shards hold the per-tenant
+  provisioning cache by `Arc`; `no_bucket_view` is reserved and no ingest
+  path raises it.
+- Every `view_stale` answer, at admission, at grant or before an attempt,
+  notifies the policy's refresh wake (`IngestCompatPolicy::with_refresh_wake`).
+  ravel-server's `sys/compat` refresh loop re-reads the record on that
+  wake, at most once a second beyond its 60 second tick, so ingest recovers
+  within about a second of `sys/compat` becoming readable. A first touch
+  refused for a stale view wakes it the same way, and a first touch refuses
+  to create a provisioning record while `sys/compat` bounds publishes below
+  the routers' lifetime, so the write admission would refuse leaves no
+  record behind.
 - The format-floor checks at admission and at flush open compare the
   tenant's floor with the version the policy names for the family
   (`FormatFamily::writable_version_under`), not the writer's `CURRENT`; a
@@ -1119,11 +1137,12 @@ pipelines apply it the same way (crates/ravel-ingest/src/compat.rs):
   provisioning record. The attempt is refused when that call refuses, or
   when it answers a version other than the granted one
   (`active_version_moved`). For staleness the call refuses once
-  `COMPAT_VIEW_HORIZON_NS` has passed since the view's last successful read
-  only if the view has seen a record or the bucket carries a
-  `compat_epoch`: a view that has never seen a record, on a bucket at epoch
-  0, keeps publishing at the baseline, including while its `sys/compat`
-  read fails. A stale view before an attempt is waited out within the
+  `COMPAT_VIEW_HORIZON_NS` has passed since the view's last successful
+  read, or when no read has succeeded, unless the view is blind: no read
+  has succeeded or found an object, the latest failed read, if any, was an
+  `AccessDenied`, and the bucket carries no `compat_epoch`. A blind view keeps publishing at the
+  baseline, past the horizon too, until one read fails with another error.
+  A stale view before an attempt is waited out within the
   flush's `max_flush_lifetime`, as at grant. A data object already stored
   when its commit-record attempt is refused is never committed.
 - Construction refuses a `max_flush_lifetime` above the record's

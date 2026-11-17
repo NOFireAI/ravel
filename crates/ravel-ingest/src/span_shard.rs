@@ -60,7 +60,7 @@ use uuid::Uuid;
 use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
 use crate::compat::{
-    CompatPublishRefusal, PublishGrant, PutAbort, STALE_VIEW_RETRY, warn_publish_refused,
+    CompatPublishRefusal, PublishGrant, PutAbort, stale_view_wait, warn_publish_refused,
 };
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LagCheck, MAX_FLUSH_ALL_PASSES,
@@ -2202,12 +2202,7 @@ impl SpanShardActor {
                     Ok(grant) => break (permit, grant),
                     Err(refused) if refused.is_view_stale() => {
                         drop(permit);
-                        let wait = ctx.clock.sleep(STALE_VIEW_RETRY);
-                        if ctx
-                            .bound_to_deadline(pinned.deadline_ns, wait)
-                            .await
-                            .is_none()
-                        {
+                        if !stale_view_wait(ctx.clock.as_ref(), pinned.deadline_ns).await {
                             ctx.abandon_compat(pinned, refused);
                             return;
                         }
