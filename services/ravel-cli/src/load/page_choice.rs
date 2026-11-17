@@ -16,7 +16,8 @@ pub enum LoadPageChoice {
     #[default]
     Exhaustive,
     /// Seal one candidate per page, picked from the page's statistics:
-    /// cheaper to write, slightly larger objects.
+    /// cheaper to write, slightly larger objects, and slower hot reads of
+    /// long string columns (#4388).
     Estimated,
 }
 
