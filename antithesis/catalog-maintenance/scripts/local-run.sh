@@ -35,7 +35,7 @@ UPPER="catalog: no scan shows a phantom or an excess copy"
 # for, and the compaction the sealing enables (ADR-4326 decision 5).
 REQUIRED=(
     "catalog: the workload starts"
-    "clock: the driver jumped every clock forward"
+    "clock: the driver's clock jumped forward"
     "catalog: a sealed seeded hour was folded into HEAD"
     "clock: an hour ingested live was sealed by a fold"
     "catalog: a compaction record was published"
@@ -100,7 +100,9 @@ read -r _ st code <<< "$(container_state driver)"
 if [ "${st:-}" = exited ]; then
     if [ "${code:-}" != 0 ]; then
         fail "the driver died after setup (exit ${code:-unknown})"
-    elif ! docker compose logs --no-color driver 2>&1 | grep -q 'eventually: ending the timeline'; then
+    elif ! docker compose logs --no-color driver > "$OUT/driver.log" 2>&1; then
+        fail "could not read the driver's logs"
+    elif ! grep -q 'eventually: ending the timeline' "$OUT/driver.log"; then
         fail "the driver exited 0 without ending the timeline through the eventually"
     fi
 elif [ "${st:-}" != running ]; then

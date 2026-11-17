@@ -11,7 +11,7 @@ written.
 | Service | Role |
 |---|---|
 | `faketime` | Copies libfaketime, the run wrapper and the clock offset file (`+0`) onto the shared `faketime` volume, then exits. |
-| `rustfs` | The object store, and the only durable component. RustFS 1.0.0, the release ingest-durability runs, in its glibc build (`1.0.0-glibc`, pinned by digest): the default build is static-pie musl, which no `LD_PRELOAD` reaches. |
+| `rustfs` | The object store, and the only durable component. RustFS 1.0.0, the release ingest-durability runs, as the pinned `1.0.0-glibc` image (pinned by digest), under the same glibc libfaketime as every other container. There is no musl build of libfaketime here, and RustFS's default image is static-pie musl, which no `LD_PRELOAD` reaches. |
 | `init` | Creates the bucket and runs `ravel-cli store qualify`, then exits. |
 | `ravel1`, `ravel2` | `ravel-server --mode all`: ingest, SQL, and the scheduled fold every 15 s. |
 | `maint1`, `maint2` | `ravel-server --mode maintain`: the scheduled fold every 15 s, and compaction, retention and the sweep every 20 s. |
@@ -112,9 +112,12 @@ that fails for two minutes counts as a violation, not as a pass.
    and decodes every part. A part it cannot fetch fails the command with
    `failed to fetch part <key>`, and the audit counts that key as named.
 3. `ravel-cli rlog footprint --tenant cm-tenant --shards 4 --json` lists
-   every data object the catalog resolves for the tenant and fetches each. An
-   object it cannot fetch fails the command with `failed to fetch <key>`, and
-   the audit counts that key as resolved.
+   every data object the catalog resolves for the tenant and fetches each. A
+   data object the store does not hold fails the command with `failed to
+   fetch <key>: object not found`; the audit counts that key as resolved only
+   when it is an `.rlog` under `t/<tenant hash>/l/`. Any other failure (a
+   transient or skew error, a fetch of `sys/tenancy` or of a HEAD) gives no
+   verdict on resolved data objects for that pass.
 4. LIST the tenant prefix (`t/<tenant hash>/`). A page counts only when curl
    exited 0 and the body ends with `</ListBucketResult>`; a page that does
    not is requested again, and a listing that still fails gives no verdict,
@@ -154,7 +157,7 @@ Every literal starts with `catalog: ` or `clock: `.
 | `catalog: a compaction record was published` | sometimes | `audit` | A listed `l1.*.cmt` record decoded through `commit decode-compaction`. |
 | `catalog: the audit checked the data objects the catalog resolves` | sometimes | `audit` | `rlog footprint` reported at least one data object. |
 | `catalog: a listed commit record decoded through ravel-cli` | sometimes | `audit` | A listed level-0 commit record decoded through `commit decode`. |
-| `clock: the driver jumped every clock forward` | reachable | `jump_clock`, `eventually` | The jump reached the driver's own clock. |
+| `clock: the driver's clock jumped forward` | reachable | `jump_clock`, `eventually` | The jump reached the driver's own clock. |
 | `catalog: the workload starts` | reachable | startup | |
 | `catalog: an on-demand fold succeeded` | reachable | `fold` | |
 | `catalog: HEAD was overwritten with garbage through raw S3` | reachable | `corrupt_head` | |
@@ -186,14 +189,18 @@ driver moves it forward once per timeline (ADR-4326, clock-jump amendment).
   for an hour acked at its first second, plus the sealing delay above) or
   the offset file does not hold `+0`. The config jumps 9000 s.
 - `jump_clock` writes the new offset by replacing the file whole. libfaketime
-  rereads it at most every `FAKETIME_CACHE_DURATION` (2 s) per process; the
-  driver waits until its own clock moved, then one more reread for the rest.
+  rereads it at most every `FAKETIME_CACHE_DURATION` (2 s) per process, so
+  the jump lands in every process within about 2 s. Inside that window a
+  process that has not reread is 9000 s behind one that has, beyond SigV4's
+  900 s skew limit, so a request between them (a server's background request
+  to rustfs included) may fail. The driver holds its write gate from before
+  the offset write until its own clock moved and one more reread passed.
 - Monotonic clocks are not faked, so timeouts and leases measured on them
   are untouched. Shell waits in the entrypoints use `/proc/uptime`.
 
 `scripts/clock-spike.sh <out-dir> [seconds]` runs the local loop and reports
 on the jump alone. It writes `<out-dir>/clock-spike-result.txt` and exits 0
-only if `local-run.sh` passed; `clock: the driver jumped every clock
+only if `local-run.sh` passed; `clock: the driver's clock jumped
 forward`, `clock: an hour ingested live was sealed by a fold` and `catalog: a
 compaction record was published` held; and all six clock probes (`date` in
 rustfs, ravel1, ravel2, maint1 and maint2, and the `Last-Modified` rustfs
@@ -219,7 +226,7 @@ The same steps as ingest-durability, from this directory's `scripts/`:
   - every container's SDK output was collected;
   - no always-type assertion was violated (`violated.tsv`), and none that
     must be hit was never hit (`never-hit.tsv`);
-  - `catalog: the workload starts`, `clock: the driver jumped every clock
+  - `catalog: the workload starts`, `clock: the driver's clock jumped
     forward`, `catalog: a sealed seeded hour was folded into HEAD`, `clock:
     an hour ingested live was sealed by a fold` and `catalog: a compaction
     record was published` each held.

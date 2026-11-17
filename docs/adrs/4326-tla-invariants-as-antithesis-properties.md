@@ -288,9 +288,14 @@ the local loop:
 
 - Every container, the object store included, runs under libfaketime and
   reads one offset file on a shared volume. The offset starts at `+0`; each
-  process rereads it at most every `FAKETIME_CACHE_DURATION` (2 s), so once
-  a jump has landed the clocks agree to within that. Monotonic clocks are
-  not faked.
+  process rereads it at most every `FAKETIME_CACHE_DURATION` (2 s), so a
+  jump lands in every process within about 2 s of the offset write. Inside
+  that window a process that has not reread is a whole jump behind one that
+  has, far beyond SigV4's 900 s skew limit, so a request between two such
+  processes (a server's background request to the store included) may be
+  refused or fail. The driver holds its write gate from before the offset
+  write until the reread interval has passed, so none of its own writes or
+  checks falls in the window. Monotonic clocks are not faked.
 - After seeding and some acknowledged live writes, the driver moves every
   clock forward once per timeline, as one of its actions, and records the
   jump in its assertions. The jump is at least one hour plus
