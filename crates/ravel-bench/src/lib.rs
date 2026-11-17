@@ -38,6 +38,7 @@ pub mod groupby_scaling;
 pub mod harness;
 pub mod ingest;
 pub mod ingest_query_trial;
+pub mod l1_listing_charge;
 pub mod logbody;
 pub mod logbody_report;
 #[cfg(feature = "sql-latency")]

@@ -117,10 +117,11 @@ ravel-sql = { path = "../ravel-sql", version = "0.33.0", optional = true, featur
 # `tests/parquet_ddl.rs` does, so it needs the grant and injected-clock types
 # `ravel-sql` does not re-export. Workspace-pinned, not a new external crate.
 ravel-pqtable = { workspace = true, optional = true }
-# Gated behind `sql-latency`. The same in-process engine builds its
-# `SqlExecutor` with `.with_process_memory_budget`, which takes this crate's
+# The `sql-latency` in-process engine builds its `SqlExecutor` with
+# `.with_process_memory_budget`, and `l1_listing_charge` (issue #4393) lists
+# under a fresh `MemoryBudget` per probe; both take this crate's
 # `MemoryBudget`. Workspace-pinned, not a new external crate.
-ravel-memory = { workspace = true, optional = true }
+ravel-memory = { workspace = true }
 # Gated behind `sql-latency`. The spans-scan bench lane (`src/spans_scan.rs`)
 # writes its RSPAN corpus with the real span writer and drives `SpansScanExec`
 # directly, so it needs the writer/record types (`RspanWriter`, `SpanRecord`,
@@ -241,7 +242,7 @@ stage-timing = ["ravel-ingest/stage-timing"]
 # corpus gate reads `ravel_sql::conformance::registry()`, so it activates the
 # same optional `ravel-sql` entry `flight-egress` uses (no second entry, so no
 # second datafusion/arrow activation) and the plain gates never compile it.
-sql-latency = ["dep:ravel-sql", "dep:datafusion", "dep:ravel-cache", "dep:ravel-rspan", "dep:futures", "dep:parquet", "dep:ravel-pqtable", "dep:ravel-memory", "dep:datafusion-datasource-parquet"]
+sql-latency = ["dep:ravel-sql", "dep:datafusion", "dep:ravel-cache", "dep:ravel-rspan", "dep:futures", "dep:parquet", "dep:ravel-pqtable", "dep:datafusion-datasource-parquet"]
 # The `sql_latency_bench --flight` lane (issue #680): the same corpus executed
 # through a running `ravel-server`'s Flight SQL endpoint instead of an
 # in-process executor. Off by default. No new external crate: `arrow-flight`
@@ -253,7 +254,7 @@ flight-lane = ["sql-latency", "dep:arrow-flight", "dep:futures"]
 # The ADR-1702 task 11 saturation bins (`liveness_under_decode`,
 # `heartbeat_under_query_load`, issue #2670). Off by default: they link
 # ravel-server and its SQL surface. Advisory lanes, run by hand.
-saturation = ["dep:ravel-server", "dep:ravel-cpu-gate", "dep:ravel-memory", "dep:anyhow", "dep:tikv-jemallocator"]
+saturation = ["dep:ravel-server", "dep:ravel-cpu-gate", "dep:anyhow", "dep:tikv-jemallocator"]
 # The pinned-walk expiry probe (`mcp_walk_expiry`, issue #3779 item 1). Off by
 # default: it links ravel-server with its `mcp` feature (which implies `sql`),
 # so the probe calls the query service the MCP adapter calls and the
@@ -737,6 +738,13 @@ bench = false
 [[bin]]
 name = "rlog_compaction_profile"
 path = "src/bin/rlog_compaction_profile.rs"
+bench = false
+
+# Memory-budget charge of a series listing over one L1 metrics part, by part
+# cap (issue #4393).
+[[bin]]
+name = "l1_listing_charge"
+path = "src/bin/l1_listing_charge.rs"
 bench = false
 
 [lints]
