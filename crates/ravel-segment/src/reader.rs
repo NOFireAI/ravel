@@ -1904,9 +1904,12 @@ fn parse_series_meta_tail_v4(
     // runs. Present, five more block_len-prefixed blocks (presence plus four
     // `encode_i64` columns) follow, consumed here so the trailing-bytes check
     // below still catches genuine garbage past the extension.
-    let per_sample_provenance = if *pos < meta_bytes.len() {
+    let per_sample_provenance = if *pos >= meta_bytes.len() {
+        Vec::new()
+    } else if charge.decodes_provenance() {
         parse_provenance_extension(meta_bytes, pos, footer, &sample_count, limits, charge)?
     } else {
+        skip_provenance_extension(meta_bytes, pos, sample_count.iter().map(|&n| u64::from(n)))?;
         Vec::new()
     };
 
@@ -2086,6 +2089,54 @@ fn parse_provenance_extension(
     drop((created_delta, epoch, seq, in_page_index));
     charge.release(column_bytes);
     Ok(out)
+}
+
+/// Steps `pos` over the per-sample provenance extension without decoding its
+/// four sample-major columns, for a decode whose [`CatalogCharge`] does not
+/// [decode provenance](CatalogCharge::decodes_provenance). Each column is a
+/// `block_len`-prefixed block, so it is passed over by its prefix and only its
+/// leading `Enc` tag is checked. The run-major presence column is decoded and
+/// validated as [`parse_provenance_extension`] does; it is one value per run,
+/// like the run columns before it. What is not checked is what only a column
+/// decode can find: a codec payload that does not hold its stated count, a
+/// `created_unix_ns` or in-page index out of range, and the live-footprint cap
+/// on a decode that does not run.
+pub(crate) fn skip_provenance_extension(
+    bytes: &[u8],
+    pos: &mut usize,
+    sample_count: impl ExactSizeIterator<Item = u64>,
+) -> Result<(), SegmentError> {
+    let presence = take_encoded_i64_block(bytes, pos, sample_count.len())?;
+    let mut prov_sample_total: u64 = 0;
+    let mut any_present = false;
+    for (&flag, sc) in presence.iter().zip(sample_count) {
+        match flag {
+            0 => {}
+            1 => {
+                any_present = true;
+                prov_sample_total = prov_sample_total
+                    .checked_add(sc)
+                    .ok_or(SegmentError::FieldOverflow)?;
+            }
+            other => {
+                return Err(SegmentError::InvalidProvenancePresence(
+                    u64::try_from(other).unwrap_or(u64::MAX),
+                ));
+            }
+        }
+    }
+    if !any_present {
+        return Err(SegmentError::EmptyProvenanceExtension);
+    }
+    for _ in 0..4 {
+        let block = take_block(bytes, pos)?;
+        let (&enc_byte, _) = block
+            .split_first()
+            .ok_or_else(|| SegmentError::ProvenanceColumnCodec("empty column block".into()))?;
+        ravel_codec::encoding::Enc::from_u8(enc_byte)
+            .map_err(|e| SegmentError::ProvenanceColumnCodec(e.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Defensive pre-allocation cap for one run's provenance column, mirroring the

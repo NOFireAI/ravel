@@ -32,6 +32,17 @@ pub trait CatalogCharge {
     /// Called once the decode has freed `bytes` that one earlier
     /// [`admit`](Self::admit) call of exactly that figure admitted.
     fn release(&mut self, bytes: u64);
+
+    /// Whether the decode materializes the per-sample provenance extension.
+    /// `false` passes over its four sample-major columns by their block
+    /// prefixes without decoding them, so it neither allocates nor admits
+    /// them, and every returned entry's `per_sample_provenance` is empty, the
+    /// shape of an object without the extension. Only a caller that reads
+    /// series ids and labels, never samples, may return `false`: the runs it
+    /// gets back no longer carry the per-sample dedup keys their samples need.
+    fn decodes_provenance(&self) -> bool {
+        true
+    }
 }
 
 /// A [`CatalogCharge`] that admits everything: the plain catalog decoders.
