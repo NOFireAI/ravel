@@ -726,3 +726,199 @@ async fn a_span_view_stale_after_grant_waits_for_a_refresh_then_publishes() {
 async fn a_span_view_stale_after_grant_is_refused_only_past_the_lifetime() {
     span_stale_after_grant(false).await;
 }
+
+/// One write of `acme` through a router under test, and its router's
+/// refusal counters.
+type OutageWrite<E> =
+    Box<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), E>> + Send>>>;
+type OutageRefused = Box<dyn Fn() -> crate::compat::CompatRefusalSnapshot>;
+
+/// ADR-4233 decisions 1 and 3 on `signal`'s grant path: on a store with no
+/// `sys/compat`, a read finds it absent, a buffered write is acknowledged,
+/// and then every `sys/compat` GET fails with a 503 past the horizon.
+/// Admission refuses the next write `view_stale`. The acknowledged rows'
+/// flush is not dropped at grant: it waits out the stale view and, with
+/// `recover`, publishes once a refresh succeeds inside its
+/// `max_flush_lifetime`; without one it is refused `view_stale`, counted and
+/// with nothing stored, only once that lifetime from its grant elapses. A
+/// grant that refuses a stale view at once drops the rows either way; an
+/// admission that lets a stale view through acknowledges the second write.
+async fn outage_after_an_absent_read<E: std::fmt::Debug>(
+    signal: Signal,
+    recover: bool,
+    build: impl FnOnce(
+        Arc<dyn ObjectStoreBackend>,
+        Arc<ManualClock>,
+        Arc<IngestCompatPolicy>,
+    ) -> (OutageWrite<E>, OutageRefused),
+    refused_view_stale: impl Fn(&E) -> bool,
+) {
+    let acme = TenantId::new("acme");
+    let compat_store = Arc::new(CompatGetStore::new(CompatGet::Passthrough));
+    let store: Arc<dyn ObjectStoreBackend> = compat_store.clone();
+    ravel_catalog::validate_or_adopt(
+        store.as_ref(),
+        &acme.hash(),
+        signal,
+        1,
+        BASE_NS,
+        AbsentPolicy::CreateFromConfig,
+    )
+    .await
+    .expect("provision");
+    let compat_keys = CompatKeys::from_file_keys(&[[4; 32]]).expect("one key");
+    let compat_clock = Arc::new(CompatTestClock(AtomicI64::new(BASE_NS)));
+    let view = CompatView::new(Arc::clone(&store), compat_keys, compat_clock.clone());
+    assert!(!view.refresh().await.expect("absent reads").present);
+    let clock = ManualClock::new();
+    let policy = Arc::new(IngestCompatPolicy::new(view.clone(), compat_clock.clone()));
+    let (write, refused) = build(Arc::clone(&store), Arc::clone(&clock), policy);
+
+    write().await.expect("acknowledged while the view is fresh");
+    compat_store.set_get(CompatGet::ServerError);
+    compat_clock
+        .0
+        .fetch_add(COMPAT_VIEW_HORIZON_NS, Ordering::SeqCst);
+    assert!(view.refresh().await.is_err(), "the outage fails the read");
+    assert_eq!(compat_store.failed(), 1);
+
+    let err = write()
+        .await
+        .expect_err("admission refuses past the horizon");
+    assert!(refused_view_stale(&err), "{err:?}");
+    assert_eq!(refused().view_stale, 1);
+
+    clock.step(15).await;
+    assert_eq!(
+        objects(&keys(store.as_ref(), &acme, signal).await),
+        0,
+        "no PUT while the view is stale"
+    );
+    assert_eq!(refused().view_stale, 1, "the flush is not dropped");
+
+    if recover {
+        compat_store.set_get(CompatGet::Passthrough);
+        assert!(!view.refresh().await.expect("the outage ends").present);
+        for _ in 0..5 {
+            if objects(&keys(store.as_ref(), &acme, signal).await) == 2 {
+                break;
+            }
+            clock.step(1).await;
+        }
+        assert_eq!(objects(&keys(store.as_ref(), &acme, signal).await), 2);
+        assert_eq!(bucket_compat_epoch(store.as_ref(), &acme, signal).await, 0);
+        assert_eq!(refused().total(), 1);
+    } else {
+        clock.step(STALE_LIFETIME.as_secs() as usize + 1).await;
+        assert_eq!(refused().view_stale, 2, "abandoned past the lifetime");
+        assert_eq!(refused().total(), 2);
+        assert_eq!(objects(&keys(store.as_ref(), &acme, signal).await), 0);
+    }
+}
+
+async fn log_outage_after_an_absent_read(recover: bool) {
+    outage_after_an_absent_read(
+        Signal::Logs,
+        recover,
+        |store, clock, policy| {
+            let router = Arc::new(
+                LogIngestRouter::with_rng(
+                    stale_config(),
+                    store,
+                    clock,
+                    Arc::new(IndexedFieldsOverlay::new(Arc::new(NoIndexedFields))),
+                    Arc::new(SeededRng::new(4244)),
+                    Arc::new(PendingAckBudget::new(0)),
+                )
+                .with_compat_policy(Some(policy))
+                .expect("no publish bound"),
+            );
+            let writer = Arc::clone(&router);
+            (
+                Box::new(move || {
+                    let router = Arc::clone(&writer);
+                    Box::pin(async move {
+                        router
+                            .write(
+                                TenantId::new("acme"),
+                                vec![log_record()],
+                                WriteMode::Buffered,
+                                ACK_DEADLINE,
+                            )
+                            .await
+                            .map(drop)
+                    })
+                }),
+                Box::new(move || router.metrics_snapshot().compat_publish_refused),
+            )
+        },
+        |err| {
+            matches!(err, LogWriteError::CompatRefused(r)
+                if policy_refusal(r, FormatFamily::Rlog, |r| matches!(r, CompatRefusal::ViewStale { .. })))
+        },
+    )
+    .await;
+}
+
+async fn span_outage_after_an_absent_read(recover: bool) {
+    outage_after_an_absent_read(
+        Signal::Spans,
+        recover,
+        |store, clock, policy| {
+            let router = Arc::new(
+                SpanIngestRouter::with_rng(
+                    stale_config(),
+                    store,
+                    clock,
+                    Arc::new(SeededRng::new(4244)),
+                    Arc::new(PendingAckBudget::new(0)),
+                )
+                .with_compat_policy(Some(policy))
+                .expect("no publish bound"),
+            );
+            let writer = Arc::clone(&router);
+            (
+                Box::new(move || {
+                    let router = Arc::clone(&writer);
+                    Box::pin(async move {
+                        router
+                            .write(
+                                TenantId::new("acme"),
+                                vec![span()],
+                                WriteMode::Buffered,
+                                ACK_DEADLINE,
+                            )
+                            .await
+                            .map(drop)
+                    })
+                }),
+                Box::new(move || router.metrics_snapshot().compat_publish_refused),
+            )
+        },
+        |err| {
+            matches!(err, SpanWriteError::CompatRefused(r)
+                if policy_refusal(r, FormatFamily::Rspan, |r| matches!(r, CompatRefusal::ViewStale { .. })))
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_log_outage_after_an_absent_read_publishes_acknowledged_rows_once_the_view_recovers() {
+    log_outage_after_an_absent_read(true).await;
+}
+
+#[tokio::test]
+async fn a_log_outage_after_an_absent_read_abandons_acknowledged_rows_only_past_the_lifetime() {
+    log_outage_after_an_absent_read(false).await;
+}
+
+#[tokio::test]
+async fn a_span_outage_after_an_absent_read_publishes_acknowledged_rows_once_the_view_recovers() {
+    span_outage_after_an_absent_read(true).await;
+}
+
+#[tokio::test]
+async fn a_span_outage_after_an_absent_read_abandons_acknowledged_rows_only_past_the_lifetime() {
+    span_outage_after_an_absent_read(false).await;
+}
