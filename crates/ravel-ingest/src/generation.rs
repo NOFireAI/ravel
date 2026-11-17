@@ -1075,7 +1075,10 @@ impl<M> ScriptedScope<M> {
         match read {
             ScriptedRead::BackedOff => return None,
             ScriptedRead::Hangs => {
-                let mut hanging = self.hanging_since_ns.lock().unwrap_or_else(|p| p.into_inner());
+                let mut hanging = self
+                    .hanging_since_ns
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 if let Some(since) = *hanging {
                     return Some((since, false));
                 }
@@ -1147,7 +1150,8 @@ impl<M: Send + 'static> FlushScope<M> for ScriptedScope<M> {
     }
 
     fn request_read(&self, tenant: TenantHash) -> Option<i64> {
-        self.issue_read(tenant, true).map(|(issued_ns, _)| issued_ns)
+        self.issue_read(tenant, true)
+            .map(|(issued_ns, _)| issued_ns)
     }
 
     fn failed_read_at(&self, _tenant: TenantHash) -> Option<i64> {
@@ -2000,7 +2004,9 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
                 return Some(RefreshStart::BackedOff);
             }
             let (done_tx, done_rx) = watch::channel(None);
-            inner.refreshing.insert(tenant, (issued_ns, done_rx.clone()));
+            inner
+                .refreshing
+                .insert(tenant, (issued_ns, done_rx.clone()));
             (inner.default_count, issued_ns, done_tx, done_rx)
         };
         let store = Arc::clone(&source.store);
@@ -2798,10 +2804,20 @@ mod tests {
         assert_eq!(hold.read_issued_ns(), Some(spent));
 
         assert_eq!(
-            hold_step(&mut hold, &requests, spent + 5, Some(spent - 1), Some(spent + 5)),
+            hold_step(
+                &mut hold,
+                &requests,
+                spent + 5,
+                Some(spent - 1),
+                Some(spent + 5)
+            ),
             HoldState::Spent
         );
-        assert_eq!(requests.get(), 1, "the recorded read is not requested again");
+        assert_eq!(
+            requests.get(),
+            1,
+            "the recorded read is not requested again"
+        );
 
         assert_eq!(
             hold_step(&mut hold, &requests, spent + 6, Some(spent), None),
@@ -2861,17 +2877,33 @@ mod tests {
         );
         assert_eq!(hold.read_issued_ns(), None);
         assert_eq!(
-            hold_step(&mut hold, &requests, spent + 1, Some(spent - 1), Some(spent - 7)),
+            hold_step(
+                &mut hold,
+                &requests,
+                spent + 1,
+                Some(spent - 1),
+                Some(spent - 7)
+            ),
             HoldState::Spent,
             "a joined read issued before the spend"
         );
         assert_eq!(hold.read_issued_ns(), None);
         assert_eq!(
-            hold_step(&mut hold, &requests, spent + 2, Some(spent - 7), Some(spent + 2)),
+            hold_step(
+                &mut hold,
+                &requests,
+                spent + 2,
+                Some(spent - 7),
+                Some(spent + 2)
+            ),
             HoldState::Spent
         );
         assert_eq!(hold.read_issued_ns(), Some(spent + 2));
-        assert_eq!(requests.get(), 3, "one request per trigger until one issues");
+        assert_eq!(
+            requests.get(),
+            3,
+            "one request per trigger until one issues"
+        );
         assert_eq!(
             hold_step(&mut hold, &requests, spent + 3, Some(spent + 2), None),
             HoldState::Drop

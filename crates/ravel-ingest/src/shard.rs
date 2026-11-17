@@ -64,8 +64,9 @@ use crate::format_floor::{
     BelowFormatFloor, FormatFamily, warn_flush_refused, warn_flush_written_below,
 };
 use crate::generation::{
-    FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, STALE_VIEW_ABANDONED,
-    HoldState, ScanCheck, StaleViewHold, mismatch_retry_spent, reread_and_check, send_hand_back,
+    FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, HoldState,
+    STALE_VIEW_ABANDONED, ScanCheck, StaleViewHold, mismatch_retry_spent, reread_and_check,
+    send_hand_back,
 };
 use crate::metrics::{FlushTrigger, IngestMetrics};
 #[cfg(feature = "stage-timing")]
@@ -5570,7 +5571,11 @@ mod tests {
             .await,
             "the age trigger holds the flush"
         );
-        assert_eq!(rig.scope.reads(), 0, "no read is requested inside the bound");
+        assert_eq!(
+            rig.scope.reads(),
+            0,
+            "no read is requested inside the bound"
+        );
         rig.clock.advance_ns(STALE_BOUND_NS);
         yield_rounds().await;
         rig
@@ -5605,9 +5610,8 @@ mod tests {
     ///
     /// Guard: the actor only requesting the read (`StaleViewHold::advance`)
     /// outside a drain, never awaiting it. Awaiting the re-read on the
-    /// trigger that finds the hold spent, bounded by `max_flush_lifetime`
-    /// (the pre-fix `held_view_check`) or unbounded, or awaiting the spawned
-    /// read's answer, stops every tick behind it, so `beta` is still charged.
+    /// trigger that finds the hold spent, bounded by `max_flush_lifetime` or
+    /// unbounded, or awaiting the spawned read's answer, stops every tick behind it, so `beta` is still charged.
     #[tokio::test]
     async fn a_hanging_read_on_a_spent_hold_does_not_delay_another_tenant() {
         let rig = spent_age_hold(ScriptedRead::Hangs).await;
@@ -5682,7 +5686,8 @@ mod tests {
         let acme = TenantId::new("acme").hash();
         assert!(rig.scope.request_read(acme).is_some(), "a read fails early");
         assert!(rig.scope.failed_read_at(acme).is_some());
-        rig.scope.set_read(ScriptedRead::Installs(ScanCheck::InScanSet));
+        rig.scope
+            .set_read(ScriptedRead::Installs(ScanCheck::InScanSet));
         rig.clock.advance_ns(STALE_BOUND_NS);
         yield_rounds().await;
         assert!(
@@ -5745,7 +5750,14 @@ mod tests {
             other => panic!("expected the stale-view Abandoned, got {other:?}"),
         }
         assert_eq!(rig.budget.in_flight_bytes(), 0, "the bytes are refunded");
-        assert!(!tick_until(&rig.clock, || rig.metrics.snapshot().abandoned_stale_provisioning > 1).await);
+        assert!(
+            !tick_until(&rig.clock, || rig
+                .metrics
+                .snapshot()
+                .abandoned_stale_provisioning
+                > 1)
+            .await
+        );
         assert_eq!(rig.scope.reads(), 1);
         assert_eq!(rig.own_commits().await, 0, "nothing is written");
         drop(rig.tx);

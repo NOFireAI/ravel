@@ -74,8 +74,9 @@ use crate::format_floor::{
     BelowFormatFloor, FormatFamily, warn_flush_refused, warn_flush_written_below,
 };
 use crate::generation::{
-    FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, STALE_VIEW_ABANDONED,
-    HoldState, ScanCheck, StaleViewHold, mismatch_retry_spent, reread_and_check, send_hand_back,
+    FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, HoldState,
+    STALE_VIEW_ABANDONED, ScanCheck, StaleViewHold, mismatch_retry_spent, reread_and_check,
+    send_hand_back,
 };
 use crate::metrics::FlushTrigger;
 use crate::shard::{InPlaceCause, InPlaceWarnings};
@@ -3806,8 +3807,7 @@ mod tests {
     /// Guard: the actor only requesting the read outside a drain
     /// (`StaleViewHold::advance`), never awaiting it. Awaiting the re-read on
     /// the trigger that finds the hold spent, bounded by `max_flush_lifetime`
-    /// (the pre-fix `held_view_check`) or unbounded, parks the actor: the
-    /// 65th write finds the mailbox full and `beta` is never published.
+    /// or unbounded, parks the actor: the 65th write finds the mailbox full and `beta` is never published.
     #[tokio::test]
     async fn a_hanging_read_on_a_spent_hold_does_not_stop_the_actor() {
         let config = IngestConfig {

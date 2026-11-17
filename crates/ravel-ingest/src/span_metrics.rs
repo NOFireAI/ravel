@@ -81,7 +81,9 @@ pub struct SpanIngestMetrics {
     /// ADR-2708 D3), where publishing could land spans in a sealed hour.
     abandoned_hour_bound: AtomicU64,
     /// Buffers dropped at flush open because their provisioning view stayed
-    /// untrusted for `max_flush_lifetime` (issue #4363): strict waiters get
+    /// untrusted for `max_flush_lifetime` with no provisioning read
+    /// succeeding, and a read issued after the hold was spent did not confirm
+    /// the view (issue #4363): strict waiters get
     /// [`crate::SpanWriteError::Abandoned`], charges are refunded, nothing is
     /// written. Counted once per dropped buffer.
     abandoned_stale_provisioning: AtomicU64,
@@ -281,7 +283,8 @@ pub struct SpanIngestMetricsSnapshot {
     /// their pinned hour's end plus `max_flush_lifetime` (ADR-2708 D3).
     pub abandoned_hour_bound: u64,
     /// Buffers dropped because their provisioning view stayed untrusted for
-    /// `max_flush_lifetime` from their first refused flush open (issue #4363).
+    /// `max_flush_lifetime` with no provisioning read succeeding, and a read
+    /// issued after the hold was spent did not confirm the view (issue #4363).
     pub abandoned_stale_provisioning: u64,
     /// Publishes the `sys/compat` activation policy refused, by reason.
     pub compat_publish_refused: CompatRefusalSnapshot,
@@ -579,7 +582,8 @@ impl SpanIngestMetrics {
     }
 
     /// One buffer dropped because its provisioning view stayed untrusted for
-    /// `max_flush_lifetime` (issue #4363).
+    /// `max_flush_lifetime` and a read issued after the hold was spent did not
+    /// confirm the view (issue #4363).
     pub(crate) fn record_abandoned_stale_provisioning(&self) {
         self.abandoned_stale_provisioning
             .fetch_add(1, Ordering::Relaxed);
