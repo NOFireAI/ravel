@@ -1,32 +1,177 @@
-//! The executable compatibility matrix (ADR-4233 decision 9).
+//! The compatibility matrix (ADR-4233 decision 9 and decision 5's rollback
+//! table): which test pins each row.
 //!
-//! Each `#[tokio::test]` below pins one row of the ADR's matrix (decision 9's
-//! table and decision 5's rollback table) with the real library write/read
-//! paths against a `MemoryStore` (or a `FaultStore` where a row needs a
-//! failure). A row the current build cannot express end to end is written as a
-//! test that asserts the typed refusal the ADR names, never a skipped test.
+//! The tests in this file run the library write paths against a `MemoryStore`
+//! with two-key listing pages. Rows another crate already pins are cited by
+//! `file::test`, not duplicated. `every_cited_test_exists` below fails when a
+//! cited name is not a test function in the named file.
 //!
-//! Rows pinned elsewhere, not duplicated here:
-//!   - the two-version compaction/migrate rows ("corpus at N, drill activation,
-//!     migrate"; a run writing N+1 compacts an input at N+1; force-2 lifts
-//!     parts) are pinned by `crates/ravel-maintain/tests/format_drill.rs`,
-//!     which the compat-tests CI lane runs under `--features format-drill`;
-//!   - the teardown-flush census and late-write rows are pinned by
-//!     `tests/certify_flags_teardown_pair.rs` in this crate;
-//!   - the frozen-corpus "written by R, read by HEAD" row is pinned by the
-//!     corpus test in this crate (`tests/corpus.rs`).
+//! Status words: `pinned` means the cited tests assert the row's outcome;
+//! `partial` means they assert part of it and the rest has no test; `deferred`
+//! means no test in the tree asserts the row. The reader window is fixed at
+//! compile time (`SUPPORTED_VERSIONS`), and this crate builds the segment crates
+//! with `format-drill`, so an N-only reader cannot run here: its refusal is
+//! cited from the default-feature `ravel-segment` tests.
 //!
-//! Reader fail-closed on an out-of-window version (decision 4, and the Flight
-//! SQL scan row) is pinned by `ravel-segment`'s `reader_version_window` tests
-//! and the end-to-end test; the product query/Flight surfaces are out of this
-//! crate's scope. See the task report for the rows deferred to product-crate
-//! coverage and the product gaps that block them (no `ravel-cli compat`
-//! subcommand yet; the attestation flag ships as `writer_roles_can_read_compat`
-//! rather than `--pre-baseline-processes-terminated`; the fold postings build
-//! still refuses a drill-version segment).
+//! Row-to-test map:
+//!
+//! - mixed nodes N-only and N+1, before activation; rollback "B+1 installed, F
+//!   not activated, roll back to B" [pinned]
+//!   - crates/ravel-compat-tests/tests/matrix.rs::mixed_nodes_before_activation_both_write_n
+//!   - crates/ravel-segment/src/format.rs::todays_window_accepts_only_the_current_version
+//!   - crates/ravel-segment/tests/reader_version_window.rs::a_version_inside_the_window_reads_normally
+//! - mixed nodes, after activation; rollback "F activated and N+1 objects exist,
+//!   roll back to B" [pinned]
+//!   - crates/ravel-compat-tests/tests/matrix.rs::n_plus_one_node_writes_active_after_activation
+//!   - crates/ravel-compat-tests/tests/matrix.rs::n_only_node_refuses_the_family_after_activation
+//!   - crates/ravel-maintain/tests/compat_write_policy.rs::compaction_refuses_an_unwritable_active_version_before_any_claim_or_put
+//!   - crates/ravel-ingest/tests/compat_policy.rs::a_log_write_under_an_rlog_version_this_build_cannot_write_is_refused_at_admission
+//!   - crates/ravel-segment/tests/reader_version_window.rs::a_version_outside_the_window_fails_with_unsupported_version
+//! - reader window and fail-closed out-of-window read (decision 4) [pinned]
+//!   - crates/ravel-segment/tests/reader_version_window.rs::a_version_inside_the_window_reads_normally
+//!   - crates/ravel-segment/tests/reader_version_window.rs::a_version_outside_the_window_fails_with_unsupported_version
+//!   - crates/ravel-segment/tests/reader_version_window.rs::the_trailer_gate_and_the_validator_admit_the_same_versions
+//!   - crates/ravel-segment/src/format.rs::drill_window_is_the_drill_version_and_v7
+//!   - crates/ravel-logseg/src/footer.rs::rejects_newer_trailer_as_unsupported_version
+//!   - crates/ravel-rspan/src/footer.rs::rejects_newer_trailer_as_unsupported_version
+//! - stale `sys/compat` view: the stale writer stops past H [pinned]
+//!   - crates/ravel-compat-tests/tests/matrix.rs::a_stale_view_refuses_to_publish_past_the_horizon
+//! - `sys/compat` deleted after activation: publishes refused, init refuses
+//!   [pinned]
+//!   - crates/ravel-compat-tests/tests/matrix.rs::absent_compat_with_a_fenced_bucket_refuses_record_missing
+//!   - crates/ravel-compat-tests/tests/matrix.rs::init_refuses_a_fenced_store_missing_compat
+//! - a newer peer's `sys/compat` is refused, never overwritten [pinned]
+//!   - crates/ravel-catalog/src/compat.rs::newer_compat_record_is_typed_and_never_overwritten
+//! - activation preconditions: init first, one version up, attestation; the
+//!   fence walk completes [pinned]
+//!   - crates/ravel-compat-tests/tests/matrix.rs::activate_refuses_without_init
+//!   - crates/ravel-compat-tests/tests/matrix.rs::activate_refuses_a_target_not_above_active
+//!   - crates/ravel-compat-tests/tests/matrix.rs::activate_refuses_a_version_jump
+//!   - crates/ravel-compat-tests/tests/matrix.rs::activate_refuses_without_the_attestation
+//!   - crates/ravel-compat-tests/tests/matrix.rs::activate_completes_the_fence_walk
+//! - `compat init` over a clean store, idempotent, incomplete listing [pinned]
+//!   - crates/ravel-compat-tests/tests/matrix.rs::init_adopts_a_clean_store
+//!   - crates/ravel-compat-tests/tests/matrix.rs::init_is_idempotent
+//!   - crates/ravel-compat-tests/tests/matrix.rs::init_refuses_on_an_incomplete_listing
+//! - `compat init` over an object outside the read set [pinned]
+//!   - crates/ravel-maintain/src/compat_init.rs::init_refuses_an_out_of_window_object
+//!   - crates/ravel-maintain/src/compat_init.rs::init_refuses_an_out_of_window_commit_record_stamp
+//!   - crates/ravel-maintain/src/compat_init/census_tests.rs::every_census_kind_adopts_in_window_and_refuses_out_of_window
+//! - provisioning fence: born fenced, v4 and v3 records through reshard and
+//!   floor raise, a record above 4 refused and left unchanged [pinned]
+//!   - crates/ravel-compat-tests/tests/matrix.rs::a_tenant_onboarded_after_activation_is_born_fenced
+//!   - crates/ravel-compat-tests/tests/matrix.rs::a_fenced_v4_record_survives_a_reshard
+//!   - crates/ravel-compat-tests/tests/matrix.rs::an_unfenced_v3_record_reshards_at_v3
+//!   - crates/ravel-compat-tests/tests/matrix.rs::a_provisioning_record_above_v4_is_refused
+//!   - crates/ravel-catalog/src/provisioning.rs::reshard_and_floor_raise_on_a_fenced_record_keep_the_fields
+//!   - crates/ravel-catalog/src/provisioning.rs::an_unfenced_record_is_written_at_3_by_every_path
+//!   - crates/ravel-catalog/src/provisioning.rs::a_version_4_record_without_fields_is_never_restamped_3
+//! - a bucket provisioned at v3 after the fence walk [pinned]
+//!   - crates/ravel-maintain/tests/compat_write_policy.rs::the_first_activated_publish_raises_the_fence_before_the_part_put
+//!   - crates/ravel-ingest/src/compat_signal_tests.rs::a_log_flush_above_the_baseline_fences_the_bucket_before_its_first_put
+//!   - crates/ravel-maintain/src/compat_certify.rs::a_bucket_provisioned_unfenced_between_runs_refuses
+//!   - crates/ravel-maintain/src/compat_certify.rs::the_per_bucket_g_pre_recheck_refuses_a_recently_fenced_bucket
+//! - `certify` preconditions: class A family, target at or below active,
+//!   `sys/compat` present, time gate [pinned]
+//!   - crates/ravel-compat-tests/tests/matrix.rs::certify_refuses_a_non_class_a_family
+//!   - crates/ravel-compat-tests/tests/matrix.rs::certify_refuses_a_target_above_active
+//!   - crates/ravel-compat-tests/tests/matrix.rs::certify_refuses_without_a_compat_record
+//!   - crates/ravel-compat-tests/tests/e2e.rs::compat_init_activate_migrate_certify_verify
+//! - migrate and certify on an incomplete listing [pinned]
+//!   - crates/ravel-maintain/src/compat_certify.rs::an_incomplete_listing_blocks
+//!   - crates/ravel-maintain/src/compat_certify.rs::a_faulted_listing_blocks_certification
+//!   - crates/ravel-maintain/src/migrate.rs::unaddressable_key_fails_the_census
+//!   - crates/ravel-maintain/src/migrate.rs::a_failed_census_page_propagates
+//! - two late-write passes out of order, and re-certify at the same version
+//!   [pinned]
+//!   - crates/ravel-maintain/src/compat_certify.rs::the_watermark_never_moves_backward
+//!   - crates/ravel-maintain/src/compat_certify.rs::a_certificate_is_replaced_only_upward_or_after_a_late_write
+//!   - crates/ravel-maintain/src/compat_certify.rs::a_new_certificate_sets_the_watermark_to_its_s
+//! - a late record between two resumed certify runs [pinned]
+//!   - crates/ravel-maintain/src/compat_certify.rs::late_write_between_resumed_runs_is_found_by_the_late_write_pass
+//! - teardown flush and late write after the certificate [pinned]
+//!   - crates/ravel-compat-tests/tests/certify_flags_teardown_pair.rs::certify_does_not_certify_over_a_teardown_pair
+//!   - crates/ravel-compat-tests/tests/certify_flags_teardown_pair.rs::certify_does_not_certify_over_an_unrecorded_teardown_object
+//!   - crates/ravel-compat-tests/tests/certify_flags_teardown_pair.rs::certify_certifies_the_bucket_without_the_pair
+//!   - crates/ravel-compat-tests/tests/certify_flags_teardown_pair.rs::a_teardown_pair_after_the_certificate_sets_contradicted
+//! - corpus at N, activation, migrate, certify, verify [pinned]
+//!   - crates/ravel-compat-tests/tests/e2e.rs::compat_init_activate_migrate_certify_verify
+//!   - crates/ravel-maintain/tests/format_drill.rs::a_run_writing_8_compacts_an_input_recorded_at_8
+//!   - crates/ravel-maintain/tests/format_drill.rs::a_run_writing_7_refuses_an_input_recorded_at_8
+//!   - crates/ravel-maintain/tests/format_drill.rs::force2_lifts_parts_to_the_runs_version
+//! - written by release R, read by HEAD [pinned]
+//!   - crates/ravel-compat-tests/tests/corpus.rs::reads_every_frozen_corpus
+//! - lease parking: absent, live, stale view, incapable holder [partial: no
+//!   test shows a displaced holder stop writing]
+//!   - crates/ravel-alerting/src/lease.rs::park_lease_creates_an_absent_lease
+//!   - crates/ravel-alerting/src/lease.rs::park_lease_replaces_a_live_lease_whoever_holds_it
+//!   - services/ravel-server/src/alerting.rs::a_stale_view_meeting_a_parked_lease_refreshes_and_keeps_it_parked
+//!   - services/ravel-server/src/alerting.rs::an_incapable_holder_reparks_its_lease_and_writes_nothing
+//!   - services/ravel-server/src/alerting.rs::an_incapable_evaluator_takes_no_lease
+//!   - crates/ravel-maintain/src/compat_activate.rs::activation_walk_fences_every_bucket_parks_absent_leases_then_sets_fence_complete
+//! - hazards H1, H3, H5 to H11 [pinned, one or more per hazard, in order]
+//!   - crates/ravel-catalog/src/fold.rs::newer_previous_part_fails_cycle_without_rebuild
+//!   - services/ravel-server/src/alerting.rs::a_newer_version_object_refuses_the_tick_and_writes_nothing
+//!   - services/ravel-server/tests/alerting_newer_version_history.rs::a_newer_version_alert_object_refuses_the_tick
+//!   - crates/ravel-maintain/src/compat_certify.rs::an_unreadable_postings_version_is_held
+//!   - crates/ravel-maintain/src/retention.rs::held_out_of_window_holds_an_unreadable_rlog_section
+//!   - crates/ravel-logseg/src/postings.rs::newer_postings_version_is_typed_unsupported
+//!   - crates/ravel-maintain/tests/compat_write_policy.rs::an_unknown_section_kind_holds_the_bucket_in_compaction
+//!   - crates/ravel-maintain/tests/compat_write_policy.rs::an_unknown_section_kind_holds_the_bucket_in_migrate
+//!   - crates/ravel-maintain/tests/unknown_section_versions.rs::an_rlog_hold_names_the_inputs_trailer_version
+//!   - crates/ravel-maintain/src/audit_retention.rs::unreadable_version_audit_object_is_held
+//!   - crates/ravel-maintain/src/alert_retention.rs::unreadable_version_alert_object_is_held
+//!   - crates/ravel-fleet/src/claim.rs::claim_above_known_version_or_zero_is_never_stolen
+//!   - crates/ravel-maintain/src/claim_guard.rs::a_version_protected_claim_is_never_stolen
+//!   - crates/ravel-maintain/src/migrate.rs::unknown_cursor_tag_is_left_in_place
+//!   - crates/ravel-maintain/tests/scan.rs::unknown_scan_cursor_tag_is_left_in_place
+//!   - crates/ravel-ingest/src/idempotency.rs::newer_marker_refuses_retryably_and_ingests_nothing
+//!   - crates/ravel-catalog/src/fold.rs::newer_tenant_config_fails_cycle
+//! - retired-reader startup with no, stale, contradicted or current
+//!   certificate [pinned]
+//!   - services/ravel-server/src/compat_gate.rs::retired_reader_refuses_without_current_certificate
+//! - crash after each publish step [partial: no test injects a crash after each
+//!   step of one publish and checks FaultStore counters]
+//!   - crates/ravel-maintain/src/compat_activate.rs::crash_mid_walk_resumes_from_the_cursor_and_only_then_sets_fence_complete
+//!   - crates/ravel-maintain/src/compat_activate.rs::lost_cursor_resume_rewalks_everything_idempotently
+//!   - crates/ravel-maintain/src/compat_certify.rs::a_cursor_left_by_a_failed_delete_is_not_resumed
+//!   - crates/ravel-maintain/tests/compat_write_policy.rs::a_failed_fence_cas_leaves_nothing_written
+//! - concurrent migrate, ingest, compaction and a late write inside H
+//!   [partial: no concurrent run]
+//!   - crates/ravel-maintain/src/migrate.rs::a_straggler_landing_after_the_walk_refuses_the_floor_raise
+//!   - crates/ravel-maintain/src/migrate.rs::floor_raise_refuses_when_a_fresh_straggler_survives_the_walk
+//!   - crates/ravel-maintain/src/compat_certify.rs::a_lower_version_stamp_yields_contradicted
+//! - stale floor [partial: the audit reports it; no certify-path test]
+//!   - services/ravel-cli/src/maintain.rs::audit_versions_reports_a_stale_floor_for_a_record_at_the_floor
+//!   - crates/ravel-maintain/src/compat_certify.rs::a_lower_version_stamp_yields_contradicted
+//! - a publish straddling activation; a permit granted after activated + H
+//!   encodes N+1 [partial: the ingest permit test fixes the version at grant;
+//!   no test spans the horizon]
+//!   - crates/ravel-ingest/src/shard.rs::version_chosen_at_permit_grant_and_first_activated_publish_fences_the_bucket
+//!   - crates/ravel-maintain/tests/compat_write_policy.rs::the_version_is_chosen_once_per_run_not_per_put
+//!   - crates/ravel-maintain/src/compat_certify.rs::certify_refuses_before_the_time_gate
+//! - certify cursor lost mid-run [partial: foreign cursors only]
+//!   - crates/ravel-maintain/src/compat_certify.rs::a_cursor_for_another_target_starts_a_fresh_census
+//!   - crates/ravel-maintain/src/compat_certify.rs::a_cursor_from_another_epoch_starts_a_fresh_census
+//! - Flight SQL scan of an out-of-window object answers a typed error
+//!   [partial: HTTP only; no Flight SQL test]
+//!   - crates/ravel-query/tests/e2e.rs::an_out_of_window_rseg_answers_422
+//!   - services/ravel-server/tests/sql_endpoint.rs::an_out_of_window_rlog_answers_422_not_500
+//! - inventory completeness [partial: the sys-proto classification only;
+//!   `docs/compatibility.md` does not exist]
+//!   - crates/ravel-catalog/tests/sys_proto_format_version_classification.rs::classification_is_complete
+//! - retention, erasure, legal hold and a pinned query during migrate
+//!   [partial: each alone, none during a migrate run]
+//!   - crates/ravel-maintain/tests/retention_version_window.rs::an_out_of_window_object_holds_the_bucket
+//!   - crates/ravel-maintain/tests/erasure_compaction_fence.rs::an_erasure_rewrite_that_publishes_mid_migration_cancels_the_migration
+//!   - crates/ravel-maintain/tests/compat_write_policy.rs::erasure_refuses_an_unwritable_active_version_and_leaves_the_request_pending
+//! - rollback "F certified, B+2 installed, roll back to B+1" [deferred]
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+mod common;
+
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -37,18 +182,29 @@ use ravel_catalog::compat::{
 };
 use ravel_catalog::{
     AbsentPolicy, CompatRefusal, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_MAX_FLUSH_LIFETIME_NS,
-    ProvisioningError, provisioning_key, raise_compat_fence, validate_or_adopt,
-    validate_or_adopt_fenced,
+    FloorBasis, ProvisioningError, provisioning_key, raise_compat_fence, raise_format_floor,
+    read_floors, validate_or_adopt, validate_or_adopt_fenced,
 };
+use ravel_commit::keys;
+use ravel_commit::record::{self, NewCommitRecord};
 use ravel_maintain::{
-    ActivateError, ActivateRequest, CertifyRefusal, CertifyReport, CertifyTimings, CompatInitError,
-    InitConfig, InitOutcome, WritableVersions, activate, certify, init_compat,
+    ActivateError, ActivateRequest, Bucket, CertifyRefusal, CertifyReport, CertifyTimings,
+    CompactionOutcome, CompactorConfig, CompatInitError, CompatRunRefusal, FamilyVersions,
+    FixedClock, InitConfig, InitOutcome, MaintainCompatPolicy, MaintainError, WritableVersions,
+    activate, certify, compact_bucket, init_compat,
 };
 use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{GetRange, ObjectStoreBackend};
+use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
 use ravel_proto::sys::v1 as sysproto;
-use ravel_types::{Signal, TenantHash, TenantId};
+use ravel_segment::{
+    IngestBounds, ReaderLimits, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7,
+    open_from_full,
+};
+use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId};
+use uuid::Uuid;
+
+use common::DecodedSeries;
 
 const SECOND_NS: i64 = 1_000_000_000;
 const HOUR_NS: i64 = 3_600 * SECOND_NS;
@@ -57,6 +213,9 @@ const T0: i64 = 1_800_000_000 * SECOND_NS;
 /// RSEG's baseline version; the drill version is one above it.
 const N: u32 = 7;
 const N_PLUS_1: u32 = 8;
+/// The ingest hour of the seeded L0 inputs; sealed under [`sealed_now_ns`].
+const HOUR: u32 = 495_000;
+const SHARD: u32 = 0;
 
 #[derive(Debug)]
 struct ManualClock(AtomicI64);
@@ -165,18 +324,206 @@ fn writable_n_and_n1() -> WritableVersions {
     WritableVersions::current().with_family(FAMILY_RSEG, vec![N, N_PLUS_1])
 }
 
+fn hour_start_ns() -> i64 {
+    i64::from(HOUR) * HOUR_NS
+}
+
+/// A compaction clock past the seal margin for [`HOUR`].
+fn sealed_now_ns() -> i64 {
+    hour_start_ns() + 4 * HOUR_NS
+}
+
+fn bucket() -> Bucket {
+    Bucket::new(hash(), Signal::Metrics, SHARD, HOUR)
+}
+
+fn gauge(name: &str, value: f64, ts_ns: i64) -> SeriesInput {
+    let labels = LabelSet::new(vec![Label {
+        name: "__name__".to_string(),
+        value: name.to_string(),
+    }])
+    .expect("labels");
+    SeriesInput {
+        series_id: SeriesId::compute(&tenant(), name, &labels).expect("series id"),
+        labels,
+        samples: vec![Sample { ts_ns, value }],
+    }
+}
+
+/// The two L0 inputs a compaction of [`bucket`] merges.
+fn l0_inputs() -> Vec<(u64, SeriesInput)> {
+    vec![
+        (1, gauge("matrix_a", 1.5, hour_start_ns() + 1_000)),
+        (2, gauge("matrix_b", -0.0, hour_start_ns() + 2_000)),
+    ]
+}
+
+/// The bucket's provisioning record and its two RSEG v7 L0 inputs, written as
+/// an ingest flush writes them: the data object, then its commit record.
+async fn seed_l0_bucket(store: &dyn ObjectStoreBackend) {
+    validate_or_adopt(
+        store,
+        &hash(),
+        Signal::Metrics,
+        SHARD + 1,
+        hour_start_ns(),
+        AbsentPolicy::CreateFromConfig,
+    )
+    .await
+    .expect("provision");
+    for (seq, input) in l0_inputs() {
+        let writer_id = Uuid::from_u128(0x3A7_0000 + u128::from(seq));
+        let ingest_ns = hour_start_ns() + i64::try_from(seq).unwrap() * SECOND_NS;
+        let written = SegmentWriter::write(
+            vec![input],
+            SegmentIdentity {
+                tenant_hash: hash().0,
+                shard: SHARD,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq: seq,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: ingest_ns,
+                max_ingest_ts_ns: ingest_ns,
+            },
+        )
+        .expect("write RSEG v7");
+        let data_key = keys::data_key(
+            &hash(),
+            Signal::Metrics,
+            SHARD,
+            writer_id,
+            1,
+            seq,
+            &written.summary.blake3,
+        )
+        .expect("data key");
+        let commit = record::build(NewCommitRecord {
+            tenant_hash: hash(),
+            signal: Signal::Metrics,
+            shard: SHARD,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: ingest_ns,
+            max_ingest_ts_ns: ingest_ns,
+            segment_format_version: u32::from(VERSION_V7),
+            created_unix_ns: ingest_ns,
+            ingest_hour_bucket: HOUR,
+        })
+        .expect("build commit record");
+        store
+            .put(&data_key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put data object");
+        store
+            .put(
+                &keys::commit_key_for_record(&commit).expect("commit key"),
+                record::encode(&commit),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put commit record");
+    }
+}
+
+/// A compactor config whose compat policy reads `store` and whose RSEG table is
+/// `writable` with baseline N: `[N]` is an N-only build, `[N, N+1]` a capable
+/// one.
+async fn compactor_config(store: Arc<dyn ObjectStoreBackend>, writable: &[u32]) -> CompactorConfig {
+    let clock = Arc::new(ManualClock::new(T0));
+    let view = CompatView::new(store, keys(), clock.clone());
+    view.refresh().await.expect("refresh");
+    let policy = MaintainCompatPolicy::new(view, clock).with_family(
+        FAMILY_RSEG,
+        FamilyVersions {
+            writable: writable.iter().map(|v| *v as u16).collect(),
+            baseline: N as u16,
+        },
+    );
+    CompactorConfig {
+        compat_policy: Some(policy),
+        ..CompactorConfig::default()
+    }
+}
+
+/// Compact [`bucket`] under the RSEG table `writable`.
+async fn compact_under(
+    store: Arc<MemoryStore>,
+    writable: &[u32],
+) -> ravel_maintain::Result<CompactionOutcome> {
+    let config = compactor_config(store.clone(), writable).await;
+    compact_bucket(
+        store.as_ref(),
+        &FixedClock::new(sealed_now_ns()),
+        &config,
+        &bucket(),
+    )
+    .await
+}
+
+/// The RSEG L1 parts on the store: key, trailer version and decoded series.
+async fn l1_parts(store: &dyn ObjectStoreBackend) -> Vec<(String, u16, Vec<DecodedSeries>)> {
+    let mut parts = Vec::new();
+    for key in common::data_keys(store).await {
+        if !key.contains("/l1/") {
+            continue;
+        }
+        let bytes = store.get(&key, GetRange::Full).await.expect("get").data;
+        let version = open_from_full(&bytes, ReaderLimits::default())
+            .expect("open the part")
+            .version;
+        let series = common::decode_rseg(&bytes).expect("decode the part");
+        parts.push((key, version, series));
+    }
+    parts
+}
+
+/// The series every L1 part over [`l0_inputs`] must decode to, in `SeriesId`
+/// order with exact value bits.
+fn merged_model() -> Vec<DecodedSeries> {
+    let mut out: Vec<DecodedSeries> = l0_inputs()
+        .into_iter()
+        .map(|(_, s)| DecodedSeries {
+            labels: s
+                .labels
+                .iter()
+                .map(|l| (l.name.clone(), l.value.clone()))
+                .collect(),
+            series_id: s.series_id.0,
+            samples: s
+                .samples
+                .iter()
+                .map(|x| (x.ts_ns, x.value.to_bits()))
+                .collect(),
+        })
+        .collect();
+    out.sort_by_key(|s| s.series_id);
+    out
+}
+
 // === Version resolution: mixed nodes and rollback (decision 5; matrix rows
 // "mixed nodes before/after activation", "rollback before activation") ========
 
 /// Before activation, both an N+1-capable build and an N-only build resolve to
-/// N for the family: every object written is version N (matrix row "mixed nodes
-/// N-only and N+1, before activation", and decision 5 row "B+1 installed, F not
-/// activated, roll back to B").
+/// N for the family, and a real compaction under each writes one L1 part whose
+/// trailer is N and which decodes to the inputs' exact samples, without raising
+/// the bucket's fence (matrix row "mixed nodes N-only and N+1, before
+/// activation", and decision 5 row "B+1 installed, F not activated, roll back
+/// to B"). This crate's reader admits {N, N+1}; that an N-only reader admits N
+/// is `todays_window_accepts_only_the_current_version`, cited in the header.
 #[tokio::test]
 async fn mixed_nodes_before_activation_both_write_n() {
-    let store = store();
-    write_compat(store.as_ref(), N).await;
-    let view = fresh_view(store.clone()).await;
+    let view_store = store();
+    write_compat(view_store.as_ref(), N).await;
+    let view = fresh_view(view_store).await;
 
     let capable = view
         .write_policy(
@@ -193,6 +540,32 @@ async fn mixed_nodes_before_activation_both_write_n() {
 
     assert_eq!(capable, N as u16, "capable build emits N before activation");
     assert_eq!(n_only, N as u16, "N-only build emits N before activation");
+
+    for writable in [&[N, N_PLUS_1][..], &[N][..]] {
+        let store = store();
+        seed_l0_bucket(store.as_ref()).await;
+        write_compat(store.as_ref(), N).await;
+
+        let outcome = compact_under(store.clone(), writable)
+            .await
+            .unwrap_or_else(|e| panic!("compaction under {writable:?}: {e:?}"));
+        assert!(
+            matches!(outcome, CompactionOutcome::Compacted { .. }),
+            "{writable:?}: {outcome:?}"
+        );
+
+        let parts = l1_parts(store.as_ref()).await;
+        assert_eq!(parts.len(), 1, "{writable:?}: one L1 part: {parts:?}");
+        let (key, version, series) = &parts[0];
+        assert_eq!(*version, VERSION_V7, "{writable:?}: {key} trailer is N");
+        assert_eq!(series, &merged_model(), "{writable:?}: {key} decodes");
+        let prov = read_prov(store.as_ref()).await;
+        assert_eq!(
+            (prov.format_version, prov.compat_epoch),
+            (3, 0),
+            "{writable:?}: no fence before activation: {prov:?}"
+        );
+    }
 }
 
 /// After activation, the N+1-capable build resolves to the active version N+1.
@@ -218,9 +591,13 @@ async fn n_plus_one_node_writes_active_after_activation() {
 }
 
 /// After activation, an N-only build refuses the family's publishes with the
-/// typed `ActiveVersionNotWritable`, and writes nothing (matrix row "mixed
-/// nodes, after activation"; decision 5 row "F activated and N+1 objects exist,
-/// roll back to B").
+/// typed `ActiveVersionNotWritable`: a real compaction under its RSEG table
+/// returns that refusal and leaves every key and byte on the store as it was
+/// (matrix row "mixed nodes, after activation"; decision 5 row "F activated
+/// and N+1 objects exist, roll back to B"). That such a build's reader refuses
+/// an N+1 object with `UnsupportedVersion` is
+/// `a_version_outside_the_window_fails_with_unsupported_version`, cited in the
+/// header: the window is compile-time and this crate builds with N+1 in it.
 #[tokio::test]
 async fn n_only_node_refuses_the_family_after_activation() {
     let store = store();
@@ -240,6 +617,31 @@ async fn n_only_node_refuses_the_family_after_activation() {
                 if family == FAMILY_RSEG
         ),
         "{refusal:?}"
+    );
+
+    seed_l0_bucket(store.as_ref()).await;
+    let before = common::snapshot(store.as_ref()).await;
+    let err = compact_under(store.clone(), &[N])
+        .await
+        .expect_err("the N-only compaction refuses");
+    assert!(
+        matches!(
+            &err,
+            MaintainError::CompatRefused {
+                family,
+                refusal: CompatRunRefusal::Compat(CompatRefusal::ActiveVersionNotWritable {
+                    active: 8,
+                    ..
+                }),
+                ..
+            } if family == FAMILY_RSEG
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        common::snapshot(store.as_ref()).await,
+        before,
+        "the refused compaction writes nothing"
     );
 }
 
@@ -595,6 +997,51 @@ async fn a_fenced_v4_record_survives_a_reshard() {
         after.compat_fenced_unix_ns, fenced_at,
         "keeps the fence time: {after:?}"
     );
+
+    raise_rseg_floor(store.as_ref(), T0 + 2 * HOUR_NS).await;
+    let floored = read_prov(store.as_ref()).await;
+    assert_eq!(
+        (
+            floored.format_version,
+            floored.compat_epoch,
+            floored.compat_fenced_unix_ns
+        ),
+        (4, 2, fenced_at),
+        "a floor raise keeps version 4 and both fence fields: {floored:?}"
+    );
+    assert_eq!(rseg_floor(&floored), Some(N), "{floored:?}");
+}
+
+const FLOOR_BASIS: FloorBasis = FloorBasis {
+    observed_entries: 1,
+    observed_newest_created_unix_ns: T0,
+    observed_shards: 1,
+};
+
+/// Raise the bucket's RSEG floor to N, as `migrate` does after its census.
+async fn raise_rseg_floor(store: &dyn ObjectStoreBackend, now_ns: i64) {
+    raise_format_floor(
+        store,
+        &hash(),
+        Signal::Metrics,
+        FAMILY_RSEG,
+        N,
+        FLOOR_BASIS,
+        "matrix test",
+        now_ns,
+    )
+    .await
+    .expect("raise the floor");
+}
+
+/// The record's current RSEG floor.
+fn rseg_floor(rec: &sysproto::ProvisioningRecord) -> Option<u32> {
+    read_floors(rec, &provisioning_key(&hash(), Signal::Metrics))
+        .expect("floors")
+        .into_iter()
+        .rev()
+        .find(|f| f.family == FAMILY_RSEG)
+        .map(|f| f.floor_version)
 }
 
 /// An unfenced (version 3) provisioning record reshards and stays at version 3,
@@ -624,6 +1071,19 @@ async fn an_unfenced_v3_record_reshards_at_v3() {
     assert_eq!(after.format_version, 3, "stays version 3: {after:?}");
     assert_eq!(after.compat_epoch, 0, "no epoch: {after:?}");
     assert_eq!(after.compat_fenced_unix_ns, 0, "no fence time: {after:?}");
+
+    raise_rseg_floor(store.as_ref(), T0 + 2 * HOUR_NS).await;
+    let floored = read_prov(store.as_ref()).await;
+    assert_eq!(
+        (
+            floored.format_version,
+            floored.compat_epoch,
+            floored.compat_fenced_unix_ns
+        ),
+        (3, 0, 0),
+        "a floor raise keeps version 3 and adds no fence field: {floored:?}"
+    );
+    assert_eq!(rseg_floor(&floored), Some(N), "{floored:?}");
 }
 
 /// A provisioning record above the rewrite ceiling (version 4) is refused
@@ -647,6 +1107,7 @@ async fn a_provisioning_record_above_v4_is_refused() {
         )
         .await
         .expect("put forged v5");
+    let before = common::snapshot(store.as_ref()).await;
 
     let err = raise_compat_fence(store.as_ref(), &hash(), Signal::Metrics, 2, T0 + HOUR_NS)
         .await
@@ -657,6 +1118,11 @@ async fn a_provisioning_record_above_v4_is_refused() {
             ProvisioningError::RefusingToRewriteNewerRecord { got: 5, .. }
         ),
         "{err:?}"
+    );
+    assert_eq!(
+        common::snapshot(store.as_ref()).await,
+        before,
+        "the refused fence raise leaves the version-5 record's bytes unchanged"
     );
 }
 
@@ -741,4 +1207,81 @@ fn timings() -> CertifyTimings {
         max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
         clock_skew_allowance_ns: DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
     }
+}
+
+// === The row-to-test map is checked against the tree ==========================
+
+/// Citation lines in this file's header map. A changed count fails until the
+/// constant is updated, so a parse that silently finds fewer lines fails too.
+const CITED_TESTS: usize = 105;
+
+/// The `path::name` citations in this file's header map.
+fn header_citations(source: &str) -> Vec<(String, String)> {
+    source
+        .lines()
+        .take_while(|l| l.starts_with("//!"))
+        .filter_map(|l| l.strip_prefix("//!   - "))
+        .map(|cite| {
+            let (file, name) = cite
+                .rsplit_once("::")
+                .unwrap_or_else(|| panic!("a citation without `::`: {cite}"));
+            (file.to_string(), name.to_string())
+        })
+        .collect()
+}
+
+/// Whether `source` defines a function `name` carrying a `#[test]` or
+/// `#[tokio::test]` attribute among the attribute and doc lines above it.
+fn defines_test(source: &str, name: &str) -> bool {
+    let lines: Vec<&str> = source.lines().collect();
+    let sig = format!("fn {name}(");
+    lines.iter().enumerate().any(|(i, line)| {
+        line.contains(&sig)
+            && lines[..i]
+                .iter()
+                .rev()
+                .map(|l| l.trim())
+                .take_while(|l| l.starts_with("#[") || l.starts_with("//"))
+                .any(|l| l == "#[test]" || l.starts_with("#[tokio::test"))
+    })
+}
+
+/// Every test the header map cites is a test function in the file it names.
+#[test]
+fn every_cited_test_exists() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest.join("../..");
+    let own = std::fs::read_to_string(manifest.join("tests/matrix.rs")).expect("read matrix.rs");
+    let cited = header_citations(&own);
+    assert_eq!(cited.len(), CITED_TESTS, "{cited:?}");
+
+    let missing: Vec<String> = cited
+        .iter()
+        .filter(|(file, name)| {
+            std::fs::read_to_string(root.join(file))
+                .map(|source| !defines_test(&source, name))
+                .unwrap_or(true)
+        })
+        .map(|(file, name)| format!("{file}::{name}"))
+        .collect();
+    assert!(missing.is_empty(), "cited but not a test: {missing:#?}");
+}
+
+/// The check refuses a name that is only a prefix of a test, a helper that is
+/// not a test, and a test in another file.
+#[test]
+fn the_citation_check_refuses_near_misses() {
+    let source = "#[tokio::test]\nasync fn real_test() {}\n\nfn helper() {}\n";
+    assert!(defines_test(source, "real_test"));
+    assert!(!defines_test(source, "real"), "a prefix");
+    assert!(!defines_test(source, "helper"), "not a test");
+    assert!(!defines_test("", "real_test"), "another file");
+    let cites = header_citations("//! map\n//!   - a/b.rs::c\n//!   - d.rs::e\nfn x() {}\n");
+    assert_eq!(
+        cites,
+        vec![
+            ("a/b.rs".to_string(), "c".to_string()),
+            ("d.rs".to_string(), "e".to_string())
+        ]
+    );
 }
