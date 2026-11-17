@@ -4743,6 +4743,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "prost",
+ "ravel-alerting",
  "ravel-cache",
  "ravel-codec",
  "ravel-commit",
