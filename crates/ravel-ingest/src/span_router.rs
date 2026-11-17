@@ -383,14 +383,16 @@ impl SpanIngestRouter {
     /// Installs the `sys/compat` activation policy every flush of this
     /// router applies (ADR-4233), reaching every actor as
     /// [`Self::with_format_floor_policy`] does: the RSPAN version is chosen at
-    /// permit grant, every PUT attempt is refused once the policy's view is
-    /// stale, the bucket is fenced before the first object above the
-    /// baseline, and admission refuses what the cached view already refuses.
+    /// permit grant and every PUT attempt asks the policy again, waiting out
+    /// a stale view within the flush's `max_flush_lifetime`, the bucket is
+    /// fenced before the first object above the baseline, and admission
+    /// refuses what the cached view refuses now, a stale view included.
     /// `None` installs nothing: every flush writes `WriteVersion::CURRENT` with
     /// none of these checks, exactly as a router never given a policy.
     ///
     /// Refuses a `max_flush_lifetime` above the `max_publish_lifetime_ns` of
-    /// the record the policy's view holds (ADR-4233 decision 7).
+    /// the record the policy's view holds (ADR-4233 decision 7). Admission and
+    /// every grant check it again against the record as it stands then.
     pub fn with_compat_policy(
         self,
         policy: Option<Arc<IngestCompatPolicy>>,
@@ -398,7 +400,8 @@ impl SpanIngestRouter {
         if let Some(policy) = &policy {
             policy.check_publish_lifetime(self.config.max_flush_lifetime)?;
         }
-        self.switch.set_compat_policy(policy);
+        self.switch
+            .set_compat_policy(policy, self.config.max_flush_lifetime);
         Ok(self)
     }
 

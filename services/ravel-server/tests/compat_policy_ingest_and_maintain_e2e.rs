@@ -9,8 +9,9 @@
 //! of a sealed-hour bucket, each counted on `/metrics` under
 //! `ravel_compat_publish_refused_total{family,reason="active_version_not_writable"}`.
 //!
-//! The counters are process-wide and only ever rise, so the two servers may
-//! run concurrently and every assertion is `>= 1`.
+//! The maintenance counters are process-wide and every `/metrics` body sums
+//! them in, so the two tests run one at a time under [`SERIAL`] and the
+//! gateway test asserts the exact rise its own writes cause.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -49,6 +50,10 @@ const TOKEN: &str = "testtoken";
 const TENANT: &str = "acme";
 const DEPLOYMENT_KEY: [u8; 32] = [0x4d; 32];
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+/// Held by each test for its whole run: a maintenance refusal counted while
+/// the gateway test runs would land in the gateway's `/metrics` body too.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn now_ns() -> i64 {
     SystemTime::now()
@@ -310,15 +315,18 @@ fn refused(body: &str, mode: &str, family: &str) -> u64 {
 /// The ingest path installs the policy (#4244): a metrics, log and span write
 /// into a keyed bucket whose `sys/compat` names an unwritable version for each
 /// family is refused 503 at admission, and each is counted on `/metrics` under
-/// its family. A server that passed `None` to `with_compat_policy` would
-/// accept all three (200) and leave every counter at 0.
+/// its family, exactly once. A server that passed `None` to
+/// `with_compat_policy` would accept all three (200) and leave every counter
+/// where it was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingest_is_refused_at_admission_and_counted_on_metrics() {
+    let _serial = SERIAL.lock().await;
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     write_unwritable_compat(store.as_ref()).await;
     let running = start(Arc::clone(&store), base_config(Mode::Gateway, false)).await;
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
+    let before = scrape(running.http_addr).await;
 
     for (path, body) in [
         ("/v1/metrics", metrics_body()),
@@ -334,9 +342,10 @@ async fn ingest_is_refused_at_admission_and_counted_on_metrics() {
 
     let body = scrape(running.http_addr).await;
     for family in [FAMILY_RSEG, FAMILY_RLOG, FAMILY_RSPAN] {
-        assert!(
-            refused(&body, "gateway", family) >= 1,
-            "ingest refusal counted for {family}:\n{body}"
+        assert_eq!(
+            refused(&body, "gateway", family),
+            refused(&before, "gateway", family) + 1,
+            "one ingest refusal counted for {family}:\n{body}"
         );
     }
     running.shutdown().await.expect("graceful shutdown");
@@ -429,6 +438,7 @@ fn sealed_hour() -> u32 {
 /// `compat_policy: None` would compact the bucket and leave the counter at 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_maintenance_run_is_refused_and_counted_on_metrics() {
+    let _serial = SERIAL.lock().await;
     let store = Arc::new(MemoryStore::new());
     write_unwritable_compat(store.as_ref()).await;
     let tenant = TenantId::new(TENANT);

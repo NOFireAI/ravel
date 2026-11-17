@@ -602,7 +602,7 @@ where
             Some(switch) => switch,
             None => Arc::new(self.bucket.clone()),
         };
-        PublishGrant::at_grant(self.compat.get(), family, tenant, Some(bucket))
+        PublishGrant::at_grant(self.compat.installed(), family, tenant, Some(bucket))
     }
 }
 
@@ -1045,27 +1045,33 @@ impl<H> GenerationSwitch<H> {
     }
 
     /// Install (or with `None` remove) the activation policy every flush of
-    /// this router's shards applies, existing actors included.
-    pub(crate) fn set_compat_policy(&self, policy: Option<Arc<crate::compat::IngestCompatPolicy>>) {
-        self.compat.set(policy);
+    /// this router's shards applies, existing actors included, with the
+    /// router's `max_flush_lifetime` each grant checks against the record.
+    pub(crate) fn set_compat_policy(
+        &self,
+        policy: Option<Arc<crate::compat::IngestCompatPolicy>>,
+        max_flush_lifetime: std::time::Duration,
+    ) {
+        self.compat.set(policy, max_flush_lifetime);
     }
 
     /// The activation-policy check of a write at admission, before anything
     /// is buffered (ADR-4233 decision 2): refuses a write whose flush the
-    /// policy would refuse for a reason a refresh before grant cannot clear
-    /// on its own. A stale view admits; the flush decides at grant. Passes
-    /// with no policy installed.
+    /// policy would refuse at grant now, a stale view included. Passes with
+    /// no policy installed.
     pub(crate) fn admit_compat(
         &self,
         tenant: TenantHash,
         family: FormatFamily,
     ) -> Result<(), CompatPublishRefusal> {
-        let Some(policy) = self.compat.get() else {
+        let Some(installed) = self.compat.installed() else {
             return Ok(());
         };
-        policy
-            .admit(family, self.cached_compat_epoch(tenant))
-            .map_err(|refusal| CompatPublishRefusal::Policy { family, refusal })
+        installed.policy.admit(
+            family,
+            self.cached_compat_epoch(tenant),
+            installed.max_flush_lifetime,
+        )
     }
 
     /// The version a `family` write admitted now is checked against the
