@@ -80,9 +80,9 @@ use crate::format_floor::{
     BelowFormatFloor, FormatFamily, warn_flush_refused, warn_flush_written_below,
 };
 use crate::generation::{
-    FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, STALE_VIEW_ABANDONED,
-    ScanCheck, held_view_check, mismatch_retry_spent, reread_and_check, send_hand_back,
-    stale_view_hold_spent,
+    FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, HoldState,
+    STALE_VIEW_ABANDONED, ScanCheck, StaleViewHold, mismatch_retry_spent, reread_and_check,
+    send_hand_back,
 };
 use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
 use crate::log_error::LogWriteError;
@@ -571,8 +571,8 @@ struct LogTenantBuf {
     deferred_since_ns: Option<i64>,
     /// See [`crate::shard`]'s `TenantBuf::stale_view_counted`.
     stale_view_counted: bool,
-    /// See [`crate::shard`]'s `TenantBuf::stale_view_since_ns`.
-    stale_view_since_ns: Option<i64>,
+    /// See [`crate::shard`]'s `TenantBuf::stale_view_hold`.
+    stale_view_hold: StaleViewHold,
     /// See [`crate::shard`]'s `TenantBuf::hand_back_blocked`.
     hand_back_blocked: bool,
     /// See [`crate::shard`]'s `TenantBuf::mismatch_held_since_ns`.
@@ -2112,38 +2112,33 @@ impl LogShardActor {
     }
 
     /// The scan-set check at flush open, re-reading an untrusted view once per
-    /// drain and once more before a spent stale-view hold drops the buffer;
-    /// see `shard::ShardActor::scan_check`.
+    /// drain and never waiting on the store outside one; see
+    /// `shard::ShardActor::scan_check`.
     async fn scan_check(
         &mut self,
         tenant: TenantHash,
         hour: u32,
         now_ns: i64,
-        hold_since_ns: &mut Option<i64>,
+        hold: &mut StaleViewHold,
         lag_check: LagCheck,
     ) -> ScanCheck {
-        let mut verdict = self.scope.check(tenant, self.shard, hour, now_ns);
-        if verdict == ScanCheck::Unknown
-            && self
+        let verdict = self.scope.check(tenant, self.shard, hour, now_ns);
+        if verdict != ScanCheck::Unknown
+            || !self
                 .drain_rereads
                 .as_mut()
                 .is_some_and(|reread| reread.insert(tenant))
-        {
-            verdict = reread_and_check(
+            || hold.advance(
                 self.scope.as_ref(),
-                self.clock.as_ref(),
-                self.config.max_flush_lifetime,
                 tenant,
-                self.shard,
-                hour,
                 now_ns,
-            )
-            .await;
-        }
-        if verdict != ScanCheck::Unknown {
+                self.config.max_flush_lifetime,
+                matches!(lag_check, LagCheck::Enforced),
+            ) == HoldState::Drop
+        {
             return verdict;
         }
-        held_view_check(
+        reread_and_check(
             self.scope.as_ref(),
             self.clock.as_ref(),
             self.config.max_flush_lifetime,
@@ -2151,9 +2146,6 @@ impl LogShardActor {
             self.shard,
             hour,
             now_ns,
-            hold_since_ns,
-            matches!(lag_check, LagCheck::Enforced),
-            self.drain_rereads.is_some(),
         )
         .await
     }
@@ -2176,7 +2168,8 @@ impl LogShardActor {
     }
 
     /// Drops a buffer held closed on an untrusted generation view for
-    /// `max_flush_lifetime`; see `shard::ShardActor::drop_stale_view_flush`.
+    /// `max_flush_lifetime` once a read issued after that did not confirm the
+    /// view; see `shard::ShardActor::drop_stale_view_flush`.
     fn drop_stale_view_flush(
         &self,
         tenant_hash: TenantHash,
@@ -2192,7 +2185,8 @@ impl LogShardActor {
             bytes = buf.est_bytes,
             teardown = !matches!(lag_check, LagCheck::Enforced),
             "ravel-ingest: dropping a flush held closed for max_flush_lifetime on a provisioning \
-             view this router cannot trust; its records are not written"
+             view this router cannot trust: a read issued after the hold was spent did not \
+             confirm the view; its records are not written"
         );
         self.ctx.ack_waiters(
             buf.waiters,
@@ -2889,7 +2883,7 @@ impl LogShardActor {
                 tenant_hash,
                 ingest_hour_bucket,
                 raw_ns,
-                &mut buf.stale_view_since_ns,
+                &mut buf.stale_view_hold,
                 lag_check,
             )
             .await;
@@ -2897,7 +2891,7 @@ impl LogShardActor {
             ScanCheck::InScanSet => {
                 self.handing_back = false;
                 self.in_place_warnings.rearm(tenant_hash);
-                buf.stale_view_since_ns = None;
+                buf.stale_view_hold.clear();
                 buf
             }
             ScanCheck::HandBack {
@@ -2913,7 +2907,7 @@ impl LogShardActor {
             {
                 // This flush opens at or past the cap, so, as on the deferral
                 // path, no strict waiter is acknowledged from it.
-                buf.stale_view_since_ns = None;
+                buf.stale_view_hold.clear();
                 let waiters = buf.take_waiters();
                 self.ctx.ack_waiters(
                     waiters,
@@ -2969,7 +2963,7 @@ impl LogShardActor {
                     return;
                 };
                 buf.stale_view_counted = false;
-                buf.stale_view_since_ns = None;
+                buf.stale_view_hold.clear();
                 let enforced = matches!(lag_check, LagCheck::Enforced);
                 // A target that is not live cannot take the records on a
                 // later flush, so only a full mailbox is retried.
@@ -3041,11 +3035,18 @@ impl LogShardActor {
                 if !std::mem::replace(&mut buf.stale_view_counted, true) {
                     self.metrics.record_stale_provisioning_flush();
                 }
-                if stale_view_hold_spent(
-                    buf.stale_view_since_ns,
-                    raw_ns,
-                    self.config.max_flush_lifetime,
-                ) {
+                let enforced = matches!(lag_check, LagCheck::Enforced);
+                if buf
+                    .stale_view_hold
+                    .advance(
+                        self.scope.as_ref(),
+                        tenant_hash,
+                        raw_ns,
+                        self.config.max_flush_lifetime,
+                        enforced,
+                    )
+                    .drops(enforced)
+                {
                     self.drop_stale_view_flush(tenant_hash, buf, lag_check);
                     return;
                 }
@@ -3362,6 +3363,7 @@ mod tests {
 
     use super::*;
     use crate::budget::{IngestByteBudget, IngestByteBudgetLimit};
+    use crate::generation::ScriptedRead;
     use crate::log_metrics::FlushTriggerMix;
 
     const BASE_NS: i64 = 1_700_000_000_000_000_000;
@@ -5699,6 +5701,7 @@ mod tests {
             let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
             let metrics = Arc::new(LogIngestMetrics::default());
             let clock = TestClock::new(BASE_NS);
+            scope.set_clock(clock.clone());
             let (tx, rx) = mpsc::channel(64);
             let actor = Self::actor(
                 config,
@@ -6180,6 +6183,79 @@ mod tests {
         assert_eq!(rig.own_commits().await, 0, "nothing is written");
         drop(rig.tx);
         rig.task.await.expect("actor ends");
+    }
+
+    /// A spent stale-view hold whose provisioning read never answers does not
+    /// stop the actor: twice its mailbox's capacity of `beta` writes is queued
+    /// without waiting, and `beta`'s buffer is published on its age trigger
+    /// while `acme`'s stays held (issue #4363).
+    ///
+    /// Guard: the actor only requesting the read outside a drain
+    /// (`StaleViewHold::advance`), never awaiting it. Awaiting the re-read on
+    /// the trigger that finds the hold spent, bounded by `max_flush_lifetime`
+    /// or unbounded, parks the actor: the 65th write finds the mailbox full and `beta` is never published.
+    #[tokio::test]
+    async fn a_hanging_read_on_a_spent_hold_does_not_stop_the_actor() {
+        let config = IngestConfig {
+            max_flush_lifetime: Duration::from_secs(60),
+            ..ticking_config()
+        };
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, config);
+        rig.scope.set_read(ScriptedRead::Hangs);
+        drop(rig.write(4_096).await);
+        assert!(
+            tick_until(&rig.clock, || rig
+                .metrics
+                .snapshot()
+                .stale_provisioning_flushes
+                == 1)
+            .await,
+            "the age trigger holds the flush"
+        );
+        rig.clock.advance_ns(STALE_BOUND_NS);
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rig.scope.reads(), 1, "the spent hold requested a read");
+
+        rig.scope
+            .set_tenant_verdict(TenantId::new("beta").hash(), ScanCheck::InScanSet);
+        for i in 0..2 * rig.tx.max_capacity() {
+            let sent = rig.tx.try_send(LogShardMsg::Write {
+                arrival: false,
+                tenant: TenantId::new("beta"),
+                records: HandBackRig::six_records().into(),
+                ack: None,
+                charge: None,
+            });
+            assert!(sent.is_ok(), "write {i} found room");
+            rig.clock.advance_ns(1_000_000);
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+        drop(rig.write_tenant("beta", 8_192).await);
+        assert!(
+            tick_until(&rig.clock, || rig.budget.in_flight_bytes() == 4_096).await,
+            "beta is published; acme is held"
+        );
+        assert_eq!(rig.metrics.snapshot().abandoned_stale_provisioning, 0);
+        assert_eq!(rig.scope.reads(), 1, "the later triggers joined the read");
+
+        let HandBackRig {
+            tx, clock, task, ..
+        } = rig;
+        drop(tx);
+        for _ in 0..10 {
+            if task.is_finished() {
+                break;
+            }
+            clock.advance_ns(STALE_BOUND_NS);
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+            }
+        }
+        task.await.expect("actor ends");
     }
 
     /// The stale-view bound of [`stale_view_config`].

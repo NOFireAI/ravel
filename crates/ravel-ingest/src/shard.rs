@@ -64,9 +64,9 @@ use crate::format_floor::{
     BelowFormatFloor, FormatFamily, warn_flush_refused, warn_flush_written_below,
 };
 use crate::generation::{
-    FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, STALE_VIEW_ABANDONED,
-    ScanCheck, held_view_check, mismatch_retry_spent, reread_and_check, send_hand_back,
-    stale_view_hold_spent,
+    FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, HoldState,
+    STALE_VIEW_ABANDONED, ScanCheck, StaleViewHold, mismatch_retry_spent, reread_and_check,
+    send_hand_back,
 };
 use crate::metrics::{FlushTrigger, IngestMetrics};
 #[cfg(feature = "stage-timing")]
@@ -236,13 +236,13 @@ struct TenantBuf {
     /// router cannot trust, so the episode counts once on
     /// `stale_provisioning_flushes` however many triggers retry it.
     stale_view_counted: bool,
-    /// When an enforced flush open first found no trusted generation view for
-    /// this buffer. Once `max_flush_lifetime` has passed since, a last re-read
-    /// that does not confirm the view drops and counts the buffer instead of
-    /// holding it again (issue #4363). Cleared when a flush open gets a
-    /// scan-set or hand-back verdict, or finds the tenant's view refreshed by a
-    /// read issued since.
-    stale_view_since_ns: Option<i64>,
+    /// This buffer's hold on a generation view the router cannot trust (issue
+    /// #4363): when it started, and, once `max_flush_lifetime` has passed,
+    /// the background read requested to confirm the view, whose failure drops
+    /// and counts the buffer. Cleared when a flush open gets a scan-set or
+    /// hand-back verdict, or finds the tenant's view refreshed by a read
+    /// issued since the hold started.
+    stale_view_hold: StaleViewHold,
     /// Set once a hand-back from this buffer found a target shard not live, so
     /// the episode counts and logs once however many triggers retry it.
     hand_back_blocked: bool,
@@ -2341,39 +2341,35 @@ impl ShardActor {
     /// a drain, a tenant whose view cannot be trusted is re-read once, waiting
     /// at most `max_flush_lifetime`, and checked again, so one drain flushes
     /// what the re-read confirms; elsewhere an untrusted view only starts a
-    /// background re-read and the next trigger retries. An `Unknown` verdict
-    /// moves the buffer's stale-view hold (`hold_since_ns`), and a spent hold
-    /// re-reads once more before it is dropped ([`held_view_check`]).
+    /// background re-read and the next trigger retries, and the actor never
+    /// waits on the store. The drain first moves the buffer's stale-view hold
+    /// (`hold`), so the read it waits on is the one a spent hold requested,
+    /// and skips the wait when the hold already drops the buffer.
     async fn scan_check(
         &mut self,
         tenant: TenantHash,
         hour: u32,
         now_ns: i64,
-        hold_since_ns: &mut Option<i64>,
+        hold: &mut StaleViewHold,
         lag_check: LagCheck,
     ) -> ScanCheck {
-        let mut verdict = self.scope.check(tenant, self.shard, hour, now_ns);
-        if verdict == ScanCheck::Unknown
-            && self
+        let verdict = self.scope.check(tenant, self.shard, hour, now_ns);
+        if verdict != ScanCheck::Unknown
+            || !self
                 .drain_rereads
                 .as_mut()
                 .is_some_and(|reread| reread.insert(tenant))
-        {
-            verdict = reread_and_check(
+            || hold.advance(
                 self.scope.as_ref(),
-                self.clock.as_ref(),
-                self.config.max_flush_lifetime,
                 tenant,
-                self.shard,
-                hour,
                 now_ns,
-            )
-            .await;
-        }
-        if verdict != ScanCheck::Unknown {
+                self.config.max_flush_lifetime,
+                matches!(lag_check, LagCheck::Enforced),
+            ) == HoldState::Drop
+        {
             return verdict;
         }
-        held_view_check(
+        reread_and_check(
             self.scope.as_ref(),
             self.clock.as_ref(),
             self.config.max_flush_lifetime,
@@ -2381,9 +2377,6 @@ impl ShardActor {
             self.shard,
             hour,
             now_ns,
-            hold_since_ns,
-            matches!(lag_check, LagCheck::Enforced),
-            self.drain_rereads.is_some(),
         )
         .await
     }
@@ -2411,9 +2404,10 @@ impl ShardActor {
 
     /// Drops a buffer whose flush was held closed on an untrusted generation
     /// view for `max_flush_lifetime` with no provisioning read succeeding, and
-    /// whose last re-read did not confirm the view (issue #4363). Nothing is written: strict
-    /// waiters get `Abandoned`, and dropping `charges` refunds the byte budget.
-    /// A teardown pass drops it too, rather than writing it in place.
+    /// for which a read issued after that did not confirm the view (issue
+    /// #4363, [`StaleViewHold`]). Nothing is written: strict waiters get
+    /// `Abandoned`, and dropping `charges` refunds the byte budget. A teardown
+    /// pass drops a spent hold too, rather than writing it in place.
     fn drop_stale_view_flush(&self, tenant_hash: TenantHash, buf: TenantBuf, lag_check: LagCheck) {
         let rows: usize = buf.series.values().map(|accum| accum.values.len()).sum();
         self.metrics.record_abandoned_stale_provisioning();
@@ -2428,7 +2422,8 @@ impl ShardActor {
             bytes = buf.est_bytes,
             teardown = !matches!(lag_check, LagCheck::Enforced),
             "ravel-ingest: dropping a flush held closed for max_flush_lifetime on a provisioning \
-             view this router cannot trust; its rows are not written"
+             view this router cannot trust: a read issued after the hold was spent did not \
+             confirm the view; its rows are not written"
         );
         self.ctx.ack_waiters(
             buf.waiters,
@@ -2627,7 +2622,7 @@ impl ShardActor {
                 tenant_hash,
                 ingest_hour_bucket,
                 raw_ns,
-                &mut buf.stale_view_since_ns,
+                &mut buf.stale_view_hold,
                 lag_check,
             )
             .await;
@@ -2635,7 +2630,7 @@ impl ShardActor {
             ScanCheck::InScanSet => {
                 self.handing_back = false;
                 self.in_place_warnings.rearm(tenant_hash);
-                buf.stale_view_since_ns = None;
+                buf.stale_view_hold.clear();
                 buf
             }
             ScanCheck::HandBack {
@@ -2651,7 +2646,7 @@ impl ShardActor {
             {
                 // This flush opens at or past the cap, so, as on the deferral
                 // path, no strict waiter is acknowledged from it.
-                buf.stale_view_since_ns = None;
+                buf.stale_view_hold.clear();
                 let waiters = std::mem::take(&mut buf.waiters);
                 self.ctx.ack_waiters(
                     waiters,
@@ -2706,7 +2701,7 @@ impl ShardActor {
                     return;
                 };
                 buf.stale_view_counted = false;
-                buf.stale_view_since_ns = None;
+                buf.stale_view_hold.clear();
                 let enforced = matches!(lag_check, LagCheck::Enforced);
                 // A target that is not live cannot take the rows on a later
                 // flush, so only a full mailbox is retried.
@@ -2779,11 +2774,18 @@ impl ShardActor {
                 if !std::mem::replace(&mut buf.stale_view_counted, true) {
                     self.metrics.record_stale_provisioning_flush();
                 }
-                if stale_view_hold_spent(
-                    buf.stale_view_since_ns,
-                    raw_ns,
-                    self.config.max_flush_lifetime,
-                ) {
+                let enforced = matches!(lag_check, LagCheck::Enforced);
+                if buf
+                    .stale_view_hold
+                    .advance(
+                        self.scope.as_ref(),
+                        tenant_hash,
+                        raw_ns,
+                        self.config.max_flush_lifetime,
+                        enforced,
+                    )
+                    .drops(enforced)
+                {
                     self.drop_stale_view_flush(tenant_hash, buf, lag_check);
                     return;
                 }
@@ -3395,6 +3397,7 @@ mod tests {
     use super::*;
     use crate::budget::{IngestByteBudget, IngestByteBudgetLimit};
     use crate::config::NS_PER_HOUR;
+    use crate::generation::ScriptedRead;
     use crate::router::{IngestRouter, WriteMode};
     use ravel_catalog::{
         DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
@@ -4567,6 +4570,7 @@ mod tests {
             let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
             let metrics = Arc::new(IngestMetrics::new(4));
             let clock = TestClock::new(BASE_NS);
+            scope.set_clock(clock.clone());
             let (tx, rx) = mpsc::channel(64);
             let actor = Self::actor(
                 config,
@@ -4718,16 +4722,7 @@ mod tests {
         /// Buffers six points of `tenant`, under one charge of `bytes`.
         async fn write_tenant(&self, tenant: &str, bytes: u64) -> Arc<IngestByteCharge> {
             let tenant = TenantId::new(tenant);
-            let points = (0..6)
-                .map(|i| {
-                    let p = point(&tenant, &format!("host-{i}"));
-                    IngestPoint {
-                        series_id: p.series_id,
-                        labels: p.labels,
-                        value: IngestValue::Scalar(p.sample),
-                    }
-                })
-                .collect();
+            let points = Self::points_of(&tenant);
             let charge = Arc::new(self.budget.try_charge(bytes).expect("charge"));
             self.tx
                 .send(ShardMsg::Write {
@@ -4741,6 +4736,36 @@ mod tests {
                 .await
                 .expect("send write");
             charge
+        }
+
+        fn points_of(tenant: &TenantId) -> Vec<IngestPoint> {
+            (0..6)
+                .map(|i| {
+                    let p = point(tenant, &format!("host-{i}"));
+                    IngestPoint {
+                        series_id: p.series_id,
+                        labels: p.labels,
+                        value: IngestValue::Scalar(p.sample),
+                    }
+                })
+                .collect()
+        }
+
+        /// Queues six uncharged points of `tenant` without waiting for room in
+        /// the mailbox.
+        fn try_write_tenant(&self, tenant: &str) -> bool {
+            let tenant = TenantId::new(tenant);
+            let points = Self::points_of(&tenant);
+            self.tx
+                .try_send(ShardMsg::Write {
+                    arrival: false,
+                    tenant,
+                    points,
+                    exemplars: Vec::new(),
+                    ack: None,
+                    charge: None,
+                })
+                .is_ok()
         }
 
         async fn flush_now(&self) {
@@ -5387,7 +5412,7 @@ mod tests {
     /// with no flush attempt in between (as when its flushes are deferred);
     /// the hold starts over there and is spent one bound later.
     ///
-    /// Guard: the `refreshed_at_ns` filter in `stale_view_hold_since`.
+    /// Guard: the `refreshed_at_ns` restart at the top of `StaleViewHold::step`.
     /// Without it, and with a hold restarted at the refresh time instead of
     /// the flush, the flush at t0 + 2 bounds drops the buffer; a hold cleared
     /// whenever any view is cached never drops it.
@@ -5406,7 +5431,7 @@ mod tests {
     /// A view refreshed before the hold began does not restart it: the buffer
     /// is dropped one bound after its first hold.
     ///
-    /// Guard: the `at < since` comparison in `stale_view_hold_since`. A hold
+    /// Guard: the `at >= since` comparison in `StaleViewHold::step`. A hold
     /// cleared whenever any view is cached is still held at the bound.
     #[tokio::test]
     async fn a_read_from_before_a_stale_view_hold_does_not_restart_it() {
@@ -5443,7 +5468,7 @@ mod tests {
         assert_dropped_one_bound_later(rig).await;
     }
 
-    /// Guard: `buf.stale_view_since_ns = None` where `hand_back` returns kept
+    /// Guard: `buf.stale_view_hold.clear()` where `hand_back` returns kept
     /// rows. Without it the flush at the first hold's bound drops the buffer.
     #[tokio::test]
     async fn a_hand_back_to_a_dead_target_restarts_the_stale_view_hold() {
@@ -5451,7 +5476,7 @@ mod tests {
     }
 
     /// Guard: the refused rows return in a new `TenantBuf` that carries no
-    /// hold, and the clear above. Carrying `stale_view_since_ns` into that
+    /// hold, and the clear above. Carrying `stale_view_hold` into that
     /// buffer with the clear removed drops it at the first hold's bound.
     #[tokio::test]
     async fn a_hand_back_to_a_full_mailbox_restarts_the_stale_view_hold() {
@@ -5462,7 +5487,7 @@ mod tests {
     /// A held buffer whose flush opens on a scan-set verdict, and is then
     /// held by the format-floor check, restarts its stale-view hold.
     ///
-    /// Guard: `buf.stale_view_since_ns = None` in the `InScanSet` arm.
+    /// Guard: `buf.stale_view_hold.clear()` in the `InScanSet` arm.
     /// Without it the flush at the first hold's bound drops the buffer.
     #[tokio::test]
     async fn a_scan_set_verdict_restarts_the_stale_view_hold() {
@@ -5483,7 +5508,7 @@ mod tests {
     /// opens in place (and is then held by the format-floor check), restarts
     /// its stale-view hold.
     ///
-    /// Guard: `buf.stale_view_since_ns = None` in the retry-spent arm.
+    /// Guard: `buf.stale_view_hold.clear()` in the retry-spent arm.
     /// Without it the flush one second after it drops the buffer, a deferral
     /// cap after the hold began.
     #[tokio::test]
@@ -5510,6 +5535,425 @@ mod tests {
         rig.clock.advance_ns(1_000_000_000);
         assert_eq!(unknown_flush(&rig).await, 0, "the hold restarted");
         assert_dropped_one_bound_later(rig).await;
+    }
+
+    /// [`stale_view_config`] on [`ticking_config`]'s 10 ms tick, so the age
+    /// trigger, not a drain, opens every flush.
+    fn stale_ticking_config() -> IngestConfig {
+        IngestConfig {
+            max_flush_lifetime: Duration::from_secs(60),
+            ..ticking_config()
+        }
+    }
+
+    /// Polls without moving the clock, so the tick the last clock move
+    /// released runs and no later one does.
+    async fn yield_rounds() {
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A rig whose `acme` buffer the age trigger has held on an untrusted view
+    /// up to its bound, with every provisioning read doing as `read` says.
+    /// Returns once the tick at the bound, which spends the hold, has run,
+    /// with no tick after it.
+    async fn spent_age_hold(read: ScriptedRead) -> HandBackRig {
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, stale_ticking_config());
+        rig.scope.set_read(read);
+        drop(rig.write(4_096).await);
+        assert!(
+            tick_until(&rig.clock, || rig
+                .metrics
+                .snapshot()
+                .stale_provisioning_flushes
+                == 1)
+            .await,
+            "the age trigger holds the flush"
+        );
+        assert_eq!(
+            rig.scope.reads(),
+            0,
+            "no read is requested inside the bound"
+        );
+        rig.clock.advance_ns(STALE_BOUND_NS);
+        yield_rounds().await;
+        rig
+    }
+
+    /// Ends a rig whose provisioning read hangs: the teardown drain waits out
+    /// its bounded re-read, so the clock moves until the actor ends.
+    async fn end_past_hanging_reads(rig: HandBackRig) {
+        let HandBackRig {
+            tx, clock, task, ..
+        } = rig;
+        drop(tx);
+        for _ in 0..10 {
+            if task.is_finished() {
+                break;
+            }
+            clock.advance_ns(STALE_BOUND_NS);
+            yield_rounds().await;
+        }
+        task.await.expect("actor ends");
+    }
+
+    /// The hash of the tenant `beta`, which [`HandBackRig::write_tenant`]
+    /// writes.
+    fn beta() -> TenantHash {
+        TenantId::new("beta").hash()
+    }
+
+    /// A spent stale-view hold whose provisioning read never answers does not
+    /// delay another tenant: `beta`'s buffer is published on the age tick it
+    /// is due at, while `acme`'s stays held (issue #4363).
+    ///
+    /// Guard: the actor only requesting the read (`StaleViewHold::advance`)
+    /// outside a drain, never awaiting it. Awaiting the re-read on the
+    /// trigger that finds the hold spent, bounded by `max_flush_lifetime` or
+    /// unbounded, or awaiting the spawned read's answer, stops every tick behind it, so `beta` is still charged.
+    #[tokio::test]
+    async fn a_hanging_read_on_a_spent_hold_does_not_delay_another_tenant() {
+        let rig = spent_age_hold(ScriptedRead::Hangs).await;
+        assert_eq!(rig.scope.reads(), 1, "the spent hold requested a read");
+        rig.scope.set_tenant_verdict(beta(), ScanCheck::InScanSet);
+        drop(rig.write_tenant("beta", 8_192).await);
+        yield_rounds().await;
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096 + 8_192);
+
+        rig.clock.advance_ns(50_000_000);
+        yield_rounds().await;
+        rig.clock.advance_ns(10_000_000);
+        yield_rounds().await;
+        assert_eq!(
+            rig.budget.in_flight_bytes(),
+            4_096,
+            "beta is published within one tick of being due; acme is held"
+        );
+        assert_eq!(rig.own_commits().await, 1);
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.abandoned_stale_provisioning, 0);
+        assert_eq!(rig.scope.reads(), 1, "the later triggers joined the read");
+        end_past_hanging_reads(rig).await;
+    }
+
+    /// A spent stale-view hold whose provisioning read never answers does not
+    /// stop the actor taking its mailbox: twice its capacity of writes is
+    /// queued without waiting while the age trigger keeps finding the hold
+    /// spent.
+    ///
+    /// Guard: as for
+    /// [`a_hanging_read_on_a_spent_hold_does_not_delay_another_tenant`].
+    /// An actor parked on the read stops draining the mailbox, and the 65th
+    /// write finds it full.
+    #[tokio::test]
+    async fn a_hanging_read_on_a_spent_hold_does_not_fill_the_mailbox() {
+        let rig = spent_age_hold(ScriptedRead::Hangs).await;
+        rig.scope.set_tenant_verdict(beta(), ScanCheck::InScanSet);
+        for i in 0..2 * rig.tx.max_capacity() {
+            assert!(rig.try_write_tenant("beta"), "write {i} found room");
+            rig.clock.advance_ns(1_000_000);
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert_eq!(rig.metrics.snapshot().abandoned_stale_provisioning, 0);
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096, "acme is still held");
+        end_past_hanging_reads(rig).await;
+    }
+
+    /// A read requested once the hold is spent that confirms the view opens
+    /// the held flush on the next trigger, and nothing is dropped, though a
+    /// read issued before the spend had failed.
+    ///
+    /// Guard: the rule that only a failed read issued at or after the spend
+    /// drops the buffer. Dropping at the spend (the rule before #4363's
+    /// re-read), or on any failed read of the tenant including the earlier
+    /// one, drops the buffer the store now vouches for.
+    #[tokio::test]
+    async fn a_read_after_the_spend_that_confirms_the_view_publishes() {
+        use crate::generation::FlushScope;
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, stale_ticking_config());
+        drop(rig.write(4_096).await);
+        assert!(
+            tick_until(&rig.clock, || rig
+                .metrics
+                .snapshot()
+                .stale_provisioning_flushes
+                == 1)
+            .await
+        );
+        let acme = TenantId::new("acme").hash();
+        assert!(rig.scope.request_read(acme).is_some(), "a read fails early");
+        assert!(rig.scope.failed_read_at(acme).is_some());
+        rig.scope
+            .set_read(ScriptedRead::Installs(ScanCheck::InScanSet));
+        rig.clock.advance_ns(STALE_BOUND_NS);
+        yield_rounds().await;
+        assert!(
+            tick_until(&rig.clock, || rig.budget.in_flight_bytes() == 0).await,
+            "the held flush lands"
+        );
+        assert_eq!(rig.scope.reads(), 2, "one read after the spend");
+        assert_eq!(rig.metrics.snapshot().abandoned_stale_provisioning, 0);
+        assert_eq!(rig.own_commits().await, 1);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A spent hold is dropped on the first trigger after a read issued at
+    /// the spend failed, once: the strict waiter gets the stale-view
+    /// `Abandoned`, every byte is refunded, nothing is written, and the
+    /// counter stays at 1 on later ticks.
+    ///
+    /// Guard: the `failed >= issued` drop in `StaleViewHold::step`. Never
+    /// dropping on it holds the buffer until the deadline a bound later;
+    /// dropping at the spend without a read requests none, so `reads` is 0 at
+    /// the drop; checking for the failure only after requesting the read, on
+    /// the same trigger, drops at the spend.
+    #[tokio::test]
+    async fn a_spent_hold_drops_once_a_read_after_the_spend_fails() {
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, stale_ticking_config());
+        rig.scope.set_read(ScriptedRead::Fails);
+        let (charge, mut answer) = rig.write_strict(4_096).await;
+        drop(charge);
+        assert!(
+            tick_until(&rig.clock, || rig
+                .metrics
+                .snapshot()
+                .stale_provisioning_flushes
+                == 1)
+            .await
+        );
+        rig.clock.advance_ns(STALE_BOUND_NS);
+        yield_rounds().await;
+        assert_eq!(rig.scope.reads(), 1, "the spend requested one read");
+        assert_eq!(
+            rig.metrics.snapshot().abandoned_stale_provisioning,
+            0,
+            "the spending trigger keeps the buffer"
+        );
+        assert!(matches!(
+            answer.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        rig.clock.advance_ns(10_000_000);
+        yield_rounds().await;
+        assert_eq!(
+            rig.metrics.snapshot().abandoned_stale_provisioning,
+            1,
+            "the next trigger finds the read failed"
+        );
+        match answer.try_recv() {
+            Ok(Err(WriteError::Abandoned(msg))) => assert_eq!(msg, STALE_VIEW_ABANDONED),
+            other => panic!("expected the stale-view Abandoned, got {other:?}"),
+        }
+        assert_eq!(rig.budget.in_flight_bytes(), 0, "the bytes are refunded");
+        assert!(
+            !tick_until(&rig.clock, || rig
+                .metrics
+                .snapshot()
+                .abandoned_stale_provisioning
+                > 1)
+            .await
+        );
+        assert_eq!(rig.scope.reads(), 1);
+        assert_eq!(rig.own_commits().await, 0, "nothing is written");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A read requested inside the read backoff window counts as not yet
+    /// issued: the spent hold is kept across every trigger in the window,
+    /// though an earlier read had failed, and is dropped only after the
+    /// window ends and the read issued then fails.
+    ///
+    /// Guard: `request_read` returning `None` in the backoff window and the
+    /// hold asking again on the next trigger. Treating a backed-off request
+    /// as a failed read, or counting the failure from before the spend,
+    /// drops the buffer inside the window; asking only once, at the spend,
+    /// never drops it before the deadline.
+    #[tokio::test]
+    async fn a_backed_off_read_drops_nothing_until_a_later_read_fails() {
+        use crate::generation::FlushScope;
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, stale_ticking_config());
+        drop(rig.write(4_096).await);
+        assert!(
+            tick_until(&rig.clock, || rig
+                .metrics
+                .snapshot()
+                .stale_provisioning_flushes
+                == 1)
+            .await
+        );
+        let acme = TenantId::new("acme").hash();
+        assert!(rig.scope.request_read(acme).is_some(), "a read fails early");
+        rig.scope.set_read(ScriptedRead::BackedOff);
+        rig.clock.advance_ns(STALE_BOUND_NS);
+        yield_rounds().await;
+        assert!(
+            !tick_until(&rig.clock, || rig
+                .metrics
+                .snapshot()
+                .abandoned_stale_provisioning
+                > 0)
+            .await,
+            "held through the backoff window"
+        );
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096);
+        assert_eq!(rig.scope.reads(), 1, "only the early read was issued");
+
+        rig.scope.set_read(ScriptedRead::Fails);
+        assert!(
+            tick_until(&rig.clock, || rig
+                .metrics
+                .snapshot()
+                .abandoned_stale_provisioning
+                == 1)
+            .await,
+            "dropped once the read after the window fails"
+        );
+        assert_eq!(rig.scope.reads(), 2);
+        assert_eq!(rig.budget.in_flight_bytes(), 0);
+        assert_eq!(rig.own_commits().await, 0);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A spent hold whose read never answers is kept until one bound after
+    /// the spend, then dropped.
+    ///
+    /// Guard: the `now - spent_at >= bound` deadline in
+    /// `StaleViewHold::step`. Without it the buffer is held for as long as
+    /// the read hangs; counting the deadline from the hold's start instead of
+    /// the spend drops it at the spend.
+    #[tokio::test]
+    async fn a_spent_hold_with_a_hanging_read_drops_at_its_deadline() {
+        let rig = spent_age_hold(ScriptedRead::Hangs).await;
+        assert_eq!(rig.metrics.snapshot().abandoned_stale_provisioning, 0);
+        rig.clock.advance_ns(STALE_BOUND_NS - 10_000_000);
+        yield_rounds().await;
+        assert_eq!(
+            rig.metrics.snapshot().abandoned_stale_provisioning,
+            0,
+            "held one tick inside the deadline"
+        );
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096);
+        rig.clock.advance_ns(10_000_000);
+        yield_rounds().await;
+        assert_eq!(
+            rig.metrics.snapshot().abandoned_stale_provisioning,
+            1,
+            "dropped at the deadline"
+        );
+        assert_eq!(rig.budget.in_flight_bytes(), 0);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A rig with no age trigger inside the test, so only drains open
+    /// flushes, whose `acme` buffer a drain has started holding on an
+    /// untrusted view.
+    async fn drain_hold() -> HandBackRig {
+        let config = IngestConfig {
+            max_flush_delay: Duration::from_secs(3600),
+            max_flush_delay_idle: Duration::from_secs(3600),
+            ..stale_view_config()
+        };
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, config);
+        drop(rig.write(4_096).await);
+        assert_eq!(unknown_flush(&rig).await, 0, "the hold begins");
+        rig
+    }
+
+    /// Sends a drain and returns its answer, without waiting for it.
+    async fn send_drain(rig: &HandBackRig) -> oneshot::Receiver<()> {
+        let (done, answered) = oneshot::channel();
+        rig.tx
+            .send(ShardMsg::FlushNow { done })
+            .await
+            .expect("send FlushNow");
+        answered
+    }
+
+    fn unanswered(answered: &mut oneshot::Receiver<()>) -> bool {
+        matches!(
+            answered.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        )
+    }
+
+    /// A drain still waits on the store for a spent hold, for exactly
+    /// `max_flush_lifetime`. A read that hangs through that whole wait leaves
+    /// no time before the spend's deadline, so the drain then drops the
+    /// buffer, once.
+    ///
+    /// Guard: the drain-only `reread_and_check` in `scan_check`, reached
+    /// while the hold is inside its deadline. Skipping the drain's wait keeps
+    /// the buffer and answers the drain before the clock moves; waiting with
+    /// no bound, or past the bound, leaves it unanswered at the bound; a
+    /// shorter wait answers it a nanosecond early.
+    #[tokio::test]
+    async fn a_drain_waits_its_bound_on_a_spent_hold_with_a_hanging_read() {
+        let rig = drain_hold().await;
+        rig.scope.set_read(ScriptedRead::Hangs);
+        let rereads = rig.scope.rereads();
+        rig.clock.advance_ns(STALE_BOUND_NS);
+
+        let mut answered = send_drain(&rig).await;
+        assert!(
+            settles(|| rig.scope.rereads() > rereads).await,
+            "the drain re-reads"
+        );
+        yield_rounds().await;
+        assert!(unanswered(&mut answered), "the drain waits on its re-read");
+        rig.clock.advance_ns(STALE_BOUND_NS - 1);
+        yield_rounds().await;
+        assert!(unanswered(&mut answered), "a nanosecond inside its bound");
+        assert_eq!(rig.metrics.snapshot().abandoned_stale_provisioning, 0);
+
+        rig.clock.advance_ns(1);
+        assert!(
+            settles(|| !unanswered(&mut answered)).await,
+            "the wait ends at its bound"
+        );
+        assert_eq!(rig.scope.rereads(), rereads + 1, "one wait");
+        assert_eq!(rig.metrics.snapshot().abandoned_stale_provisioning, 1);
+        assert_eq!(rig.budget.in_flight_bytes(), 0);
+        assert_eq!(rig.own_commits().await, 0);
+        end_past_hanging_reads(rig).await;
+    }
+
+    /// A drain that finds a spent hold whose read is backed off keeps the
+    /// buffer, and a drain once the spend's deadline is gone drops it without
+    /// waiting on the store again.
+    ///
+    /// Guard: the `HoldState::Drop` short-cut before `reread_and_check` in
+    /// `scan_check`. Waiting on the re-read past the deadline leaves the
+    /// second drain unanswered while the read hangs. Treating the backed-off
+    /// request as a failed read drops the buffer at the first drain.
+    #[tokio::test]
+    async fn a_drain_past_a_spent_holds_deadline_drops_without_waiting() {
+        let rig = drain_hold().await;
+        rig.scope.set_read(ScriptedRead::BackedOff);
+        rig.clock.advance_ns(STALE_BOUND_NS);
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().abandoned_stale_provisioning, 0);
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096, "the drain kept it");
+
+        rig.scope.set_read(ScriptedRead::Hangs);
+        rig.clock.advance_ns(STALE_BOUND_NS);
+        let rereads = rig.scope.rereads();
+        let mut answered = send_drain(&rig).await;
+        assert!(
+            settles(|| !unanswered(&mut answered)).await,
+            "the drain is answered without the clock moving"
+        );
+        assert_eq!(rig.scope.rereads(), rereads, "no wait");
+        assert_eq!(rig.metrics.snapshot().abandoned_stale_provisioning, 1);
+        assert_eq!(rig.budget.in_flight_bytes(), 0);
+        end_past_hanging_reads(rig).await;
     }
 
     /// One tenant's in-place WARN does not silence another's: two tenants
