@@ -129,16 +129,8 @@ that fails for two minutes counts as a violation, not as a pass.
    exited 0 and the body ends with `</ListBucketResult>`; a page that does
    not is requested again, and a listing that still fails gives no verdict,
    never an empty bucket.
-   Then the sweep check: decode up to 16 listed compaction records not
-   decoded before (`ravel-cli commit decode-compaction <key>`; records are
-   immutable, so each is decoded once) for their inputs. Each input names
-   its level-0 commit record (in the record's own directory) and its data
-   object (`t/<tenant hash>/l/l0/<shard>/<writer>.<epoch>.<seq>.*.rseg`).
-   An input key that an earlier LIST held, that this LIST lacks, and that a
-   GET then finds absent is a swept input. This LIST then joins the keys
-   seen.
 5. `catalog inspect --json` again. If HEAD changed during steps 1 to 5, or
-   is corrupt or absent, the audit skips this pass.
+   is corrupt or absent, the audit skips steps 6 and 7.
 6. Cross-check the text parse against the JSON form of the same HEAD: the
    same part keys in the same order and the same number of key-index leaves.
    A parse that found nothing or a different set fails the audit, since it
@@ -146,6 +138,19 @@ that fails for two minutes counts as a violation, not as a pass.
 7. Decode one listed compaction record (`l1.<hash>.cmt`) with `ravel-cli
    commit decode-compaction <key>`, and one level-0 commit record with
    `ravel-cli commit decode <key>`.
+8. The sweep check, over the LIST of step 4, whether or not step 5 skipped
+   steps 6 and 7. It runs after step 5, so its decodes do not widen the window
+   HEAD must hold still in, and the `audit` rule runs it after releasing its
+   read gate, since it touches only the store and the driver's own record of
+   listed keys: a decode or GET that a clock jump's skew window fails
+   confirms nothing, and the decode is retried by a later pass. Decode up to 16 listed compaction records not decoded before
+   (`ravel-cli commit decode-compaction <key>`; records are immutable, so
+   each is decoded once) for their inputs. Each input names its level-0
+   commit record (in the record's own directory) and its data object
+   (`t/<tenant hash>/l/l0/<shard>/<writer>.<epoch>.<seq>.*.rseg`). An input
+   key that an earlier LIST held, that this LIST lacks, and that a GET then
+   finds absent is a swept input, counted once across audits. This LIST
+   then joins the keys seen.
 
 Missing decoder: no `ravel-cli` command prints the commit-record entries of
 a snapshot part. `catalog inspect` decodes each part but prints only its
@@ -170,7 +175,7 @@ Every literal starts with `catalog: ` or `clock: `.
 | `catalog: a sealed seeded hour was folded into HEAD` | sometimes | every `catalog inspect --json` | A part of HEAD with entries covers some seeded hour (inside its `min_hour..=watermark_hour`, not retired). |
 | `clock: an hour ingested live was sealed by a fold` | sometimes | every `catalog inspect --json` | A part of HEAD with entries covers the hour of some acked live write. |
 | `catalog: a compaction record was published` | sometimes | `audit` | A listed `l1.*.cmt` record decoded through `commit decode-compaction`. |
-| `catalog: sweep deleted a superseded compaction input` | sometimes | `audit` | Evaluated once an audit holds a decoded compaction record: a commit record or data object of one of its inputs was in an earlier LIST, is absent from this one, and a GET finds it absent. |
+| `catalog: sweep deleted a superseded compaction input` | sometimes | `audit` | Evaluated once an audit holds a decoded compaction record: a commit record or data object of one of its inputs was in an earlier LIST, is absent from this one, a GET finds it absent, and no earlier audit counted it. |
 | `catalog: the audit checked the data objects the catalog resolves` | sometimes | `audit` | `rlog footprint` reported at least one data object. |
 | `catalog: a listed commit record decoded through ravel-cli` | sometimes | `audit` | A listed level-0 commit record decoded through `commit decode`. |
 | `clock: the driver's clock jumped forward` | reachable | `jump_clock`, `eventually` | The jump reached the driver's own clock. |
