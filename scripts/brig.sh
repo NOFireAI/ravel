@@ -97,7 +97,7 @@ need_alone() {
   real_clones=$(cd "$clones" && pwd -P)
   real_dir=$(cd "$dir" && pwd -P)
   others=$(printf '%s\n' "$listing" | jq -r --arg c "$clones/" --arg rc "$real_clones/" --arg me "$dir" --arg rme "$real_dir" '
-    .data.sandboxes[]
+    (.data.sandboxes // [])[]
     | select(.state == "running")
     | .project.root // empty
     | select((startswith($c) or startswith($rc)) and . != $me and . != $rme)') ||
