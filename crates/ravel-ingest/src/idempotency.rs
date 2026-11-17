@@ -412,7 +412,22 @@ pub async fn write_marker(
         )
         .await
     {
-        Ok(_) => Ok(WriteOutcome::Written),
+        Ok(_) => {
+            ravel_invariant::inv_reachable!(
+                "commit: idempotency marker written",
+                std::collections::BTreeMap::from([("marker_key", key.clone())])
+            );
+            ravel_invariant::inv_always!(
+                receipt_commits_are_durable(store, tenant_id, signal, receipt).await,
+                "commit: an idempotency marker implies every shard's commit is durable",
+                std::collections::BTreeMap::from([
+                    ("marker_key", key.clone()),
+                    ("commit_token", receipt.commit_token.clone()),
+                    ("written_count", receipt.written_count.to_string()),
+                ])
+            );
+            Ok(WriteOutcome::Written)
+        }
         Err(StoreError::AlreadyExists) => {
             // The data is already durable here, so a newer marker cannot
             // refuse anything; it replays as an unreadable marker.
@@ -428,6 +443,40 @@ pub async fn write_marker(
         }
         Err(other) => Err(other.into()),
     }
+}
+
+/// Whether the commit records `receipt` names are all in `store` and together
+/// carry at least `written_count` rows: a marker for a request whose rows
+/// some shard has not committed fails one or the other. Read from the store,
+/// not from the receipt's own claim. A read error other than NotFound is no
+/// evidence of absence and passes. Only an invariant condition calls this,
+/// and the default build compiles it out.
+#[allow(dead_code)]
+async fn receipt_commits_are_durable(
+    store: &dyn ObjectStoreBackend,
+    tenant_id: &TenantId,
+    signal: Signal,
+    receipt: &IdempotencyReceipt,
+) -> bool {
+    let mut committed: u64 = 0;
+    for encoded in receipt.commit_token.split(',').filter(|t| !t.is_empty()) {
+        let Ok(token) = ravel_types::CommitToken::decode(encoded) else {
+            return false;
+        };
+        let Ok(key) = ravel_commit::keys::commit_key_for_token(&tenant_id.hash(), signal, &token)
+        else {
+            return false;
+        };
+        match store.get(&key, ravel_object_store::GetRange::Full).await {
+            Ok(object) => match ravel_commit::record::decode(&object.data) {
+                Ok(record) => committed = committed.saturating_add(record.sample_count),
+                Err(_) => return false,
+            },
+            Err(StoreError::NotFound) => return false,
+            Err(_) => return true,
+        }
+    }
+    committed >= receipt.written_count
 }
 
 /// Look up a marker for a retried request by probing the exact marker key
@@ -569,6 +618,7 @@ mod tests {
     use proptest::prelude::*;
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{GetRange, PutMode};
+    use std::sync::Arc;
 
     fn tenant(id: &str) -> TenantId {
         TenantId::new(id)
@@ -1641,6 +1691,173 @@ mod tests {
             1,
             "the fault must actually have fired, not passed through"
         );
+    }
+
+    const MARKER_DURABLE: &str =
+        "commit: an idempotency marker implies every shard's commit is durable";
+    const STRICT_LOGS_ACK: &str = "commit: a strict logs ack names a durable commit record";
+
+    /// One log record on each of `streams` distinct streams.
+    fn log_records(streams: u32) -> Vec<ravel_otlp::logs_normalize::NormalizedLogRecord> {
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+        (0..streams)
+            .map(|i| {
+                let res = vec![("host".to_string(), AttrValue::Str(format!("h{i}")))];
+                ravel_otlp::logs_normalize::NormalizedLogRecord {
+                    stream_id: log_stream_id(&res, "scope", "", &[]),
+                    stream_attrs: ravel_logseg::stream_attrs_bytes(&res, "scope", "", &[]).into(),
+                    ts_ns: 1_000 + i64::from(i),
+                    observed_ts_ns: 1_000 + i64::from(i),
+                    severity_num: 9,
+                    severity_text: "INFO".to_string(),
+                    body: format!("body {i}"),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs: Vec::new(),
+                }
+            })
+            .collect()
+    }
+
+    /// A two-shard strict log router that flushes on every write.
+    fn two_shard_logs(store: Arc<dyn ObjectStoreBackend>) -> crate::LogIngestRouter {
+        crate::LogIngestRouter::new(
+            crate::IngestConfig {
+                shard_count: 2,
+                target_bytes: 1,
+                max_flush_delay: std::time::Duration::from_secs(3600),
+                ..crate::IngestConfig::default()
+            },
+            store,
+            Arc::new(crate::SystemClock),
+            Arc::new(crate::PendingAckBudget::new(0)),
+        )
+    }
+
+    /// Records that `two_shard_logs` spreads over both of its shards.
+    fn records_on_both_shards() -> Vec<ravel_otlp::logs_normalize::NormalizedLogRecord> {
+        let records = log_records(16);
+        let shards: std::collections::BTreeSet<u32> = records
+            .iter()
+            .map(|r| ravel_types::shard_for_log(&r.stream_id, 2))
+            .collect();
+        assert_eq!(shards, std::collections::BTreeSet::from([0, 1]));
+        records
+    }
+
+    /// What ravel-server does after a keyed strict logs write: a marker
+    /// naming every token of the receipt and every row of the request.
+    async fn write_server_marker(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        client_key: &[u8],
+        written_count: usize,
+        tokens: &[ravel_types::CommitToken],
+    ) -> String {
+        let hour = tokens.first().expect("a token").ingest_hour_bucket;
+        let marker = IdempotencyReceipt {
+            written_count: written_count as u64,
+            commit_token: crate::router::encode_tokens(tokens),
+        };
+        let outcome = write_marker(store, tenant, Signal::Logs, client_key, hour, &marker)
+            .await
+            .expect("marker write");
+        assert!(matches!(outcome, WriteOutcome::Written), "{outcome:?}");
+        marker_key(tenant, Signal::Logs, client_key, hour)
+    }
+
+    #[tokio::test]
+    async fn marker_implies_all_shards_durable_holds_after_a_strict_logs_write() {
+        if !crate::router::invariant_capture::capturing() {
+            return;
+        }
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router = two_shard_logs(Arc::clone(&store));
+        let tenant = tenant("marker-durable-holds");
+        let records = records_on_both_shards();
+        let written = records.len();
+        let receipt = router
+            .write(
+                tenant.clone(),
+                records,
+                crate::WriteMode::Strict,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .expect("strict write");
+        assert_eq!(receipt.tokens.len(), 2, "one commit per shard");
+
+        let acks =
+            crate::router::invariant_capture::evaluations(STRICT_LOGS_ACK, &tenant.hash().to_hex());
+        assert_eq!(acks.len(), 1, "{acks:?}");
+        assert!(acks[0].0, "{acks:?}");
+
+        let key =
+            write_server_marker(store.as_ref(), &tenant, b"holds", written, &receipt.tokens).await;
+        let markers = crate::router::invariant_capture::evaluations(MARKER_DURABLE, &key);
+        assert_eq!(markers.len(), 1, "{markers:?}");
+        assert!(markers[0].0, "{markers:?}");
+        router.shutdown().await;
+    }
+
+    /// `commit/marker-before-all-shards`: the strict receipt waits for the
+    /// first shard only, so the marker is written while the second shard's
+    /// commit PUT is held. The commit records the marker's tokens name carry
+    /// fewer rows than the marker's `written_count`.
+    #[tokio::test]
+    async fn mutant_marker_after_first_shard_breaks_marker_property() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+
+        let Some(_mutant) =
+            crate::router::invariant_capture::scoped_mutant("commit/marker-before-all-shards")
+        else {
+            return;
+        };
+        let tenant = tenant("marker-durable-mutant");
+        let second_shard = ravel_commit::keys::commit_shard_prefix(&tenant.hash(), Signal::Logs, 1)
+            .expect("commit prefix");
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = fault_store.hold(Op::Put, Some(second_shard), Occurrence::Nth(1));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let router = two_shard_logs(Arc::clone(&store));
+        let records = records_on_both_shards();
+        let written = records.len();
+        let outcome = router
+            .write(
+                tenant.clone(),
+                records,
+                crate::WriteMode::Strict,
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+        if let Ok(receipt) = &outcome {
+            write_server_marker(store.as_ref(), &tenant, b"mutant", written, &receipt.tokens).await;
+        }
+
+        let markers = crate::router::invariant_capture::evaluations(
+            MARKER_DURABLE,
+            &keyhash32(&tenant, b"mutant"),
+        );
+        assert!(
+            markers.iter().any(|(held, _)| !held),
+            "MarkerImpliesAllShardsDurable never evaluated false under the mutant: {markers:?}"
+        );
+        let receipt = outcome.expect("the mutant acks once the first shard commits");
+        assert_eq!(
+            receipt.tokens.len(),
+            1,
+            "the receipt names the first shard only"
+        );
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the second shard's commit PUT is still held"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        router.shutdown().await;
     }
 
     proptest! {

@@ -96,14 +96,18 @@ pub async fn publish_with_rng(
     let opts = PutOptions::create_if_absent().with_checksum(checksum);
 
     let mut attempt: u32 = 0;
-    loop {
+    let token = loop {
         match store.put(&commit_key, payload.clone(), opts.clone()).await {
             Ok(_) => {
                 tracing::info!(attempt, "commit record published");
-                return Ok(record::token_for(record)?);
+                ravel_invariant::inv_reachable!(
+                    "commit: commit record put",
+                    std::collections::BTreeMap::from([("commit_key", commit_key.clone())])
+                );
+                break record::token_for(record)?;
             }
             Err(StoreError::AlreadyExists) => {
-                return resolve_already_exists(store, &commit_key, record).await;
+                break resolve_already_exists(store, &commit_key, record).await?;
             }
             Err(e) if e.is_retryable() && attempt < retry_policy.max_attempts => {
                 tracing::warn!(attempt, error = %e, "retrying commit publish after store error");
@@ -118,7 +122,24 @@ pub async fn publish_with_rng(
                 });
             }
         }
-    }
+    };
+    // The record now exists at its key; its data object must already be in
+    // the store. Only a HEAD answering NotFound is evidence of absence.
+    ravel_invariant::inv_always!(
+        match keys::reconstruct_data_key(record) {
+            Ok(data_key) => !matches!(store.head(&data_key).await, Err(StoreError::NotFound)),
+            Err(_) => false,
+        },
+        "commit: a commit record never exists without its data object",
+        std::collections::BTreeMap::from([
+            ("commit_key", commit_key.clone()),
+            (
+                "data_key",
+                keys::reconstruct_data_key(record).unwrap_or_default()
+            ),
+        ])
+    );
+    Ok(token)
 }
 
 async fn resolve_already_exists(
@@ -135,7 +156,19 @@ async fn resolve_already_exists(
                 source: e,
             })?;
     let existing_record = record::decode(&existing.data)?;
-    if existing_record.content_hash == record.content_hash {
+    if ravel_invariant::inv_mutant!("commit/mismatched-identity-idempotent")
+        || existing_record.content_hash == record.content_hash
+    {
+        // Compares the record the GET returned, not the decision above.
+        ravel_invariant::inv_always!(
+            existing_record.content_hash == record.content_hash,
+            "commit: one commit identity holds one content hash",
+            std::collections::BTreeMap::from([
+                ("commit_key", commit_key.to_owned()),
+                ("this", hex::encode(&record.content_hash)),
+                ("stored", hex::encode(&existing_record.content_hash)),
+            ])
+        );
         tracing::info!("commit publish idempotent: matching record already landed");
         Ok(record::token_for(record)?)
     } else {
@@ -159,6 +192,9 @@ pub async fn put_data_object(
     key: &str,
     bytes: Bytes,
 ) -> Result<(), PublishError> {
+    if ravel_invariant::inv_mutant!("commit/commit-before-data") {
+        return Ok(());
+    }
     let checksum = UploadChecksum::Crc32c(crc32c::crc32c(&bytes));
     match store
         .put(
@@ -170,6 +206,10 @@ pub async fn put_data_object(
     {
         Ok(_) => {
             tracing::info!("data object put");
+            ravel_invariant::inv_reachable!(
+                "commit: data object put",
+                std::collections::BTreeMap::from([("data_key", key.to_owned())])
+            );
             Ok(())
         }
         Err(StoreError::AlreadyExists) => {
@@ -197,11 +237,15 @@ mod tests {
     use crate::record::NewCommitRecord;
 
     fn sample_record(content_hash: [u8; 32]) -> CommitRecord {
+        record_with_writer(Uuid::new_v4(), content_hash)
+    }
+
+    fn record_with_writer(writer_id: Uuid, content_hash: [u8; 32]) -> CommitRecord {
         record::build(NewCommitRecord {
             tenant_hash: TenantHash([0x33; 16]),
             signal: Signal::Metrics,
             shard: 0,
-            writer_id: Uuid::new_v4(),
+            writer_id,
             writer_epoch: 1,
             writer_seq: 1,
             object_size: 100,
@@ -375,5 +419,182 @@ mod tests {
             .expect("second put is idempotent");
         let got = store.get(key, GetRange::Full).await.expect("get");
         assert_eq!(&got.data[..], b"payload");
+    }
+
+    const NO_COMMIT_WITHOUT_DATA: &str =
+        "commit: a commit record never exists without its data object";
+    const ONE_IDENTITY_ONE_CONTENT: &str = "commit: one commit identity holds one content hash";
+
+    /// True in a build where ravel-invariant records evaluations: the
+    /// invariants lane (`ravel-invariant/capture`). This crate has no feature
+    /// of its own that forwards `capture`, so the gate is an assertion macro,
+    /// which evaluates its condition only when `capture` (or `antithesis`) is
+    /// on and expands to nothing otherwise.
+    fn capturing() -> bool {
+        let on = std::cell::Cell::new(false);
+        ravel_invariant::inv_sometimes!(
+            {
+                on.set(true);
+                true
+            },
+            "ravel-commit test: evaluations are captured",
+            ""
+        );
+        on.get()
+    }
+
+    /// Selects mutant `name` on this thread until the returned guard drops;
+    /// `None` outside the invariants lane, where no mutant is compiled in.
+    fn scoped_mutant(name: &'static str) -> Option<Box<dyn std::any::Any>> {
+        let guard: std::cell::RefCell<Option<Box<dyn std::any::Any>>> = Default::default();
+        let _ = name;
+        ravel_invariant::inv_sometimes!(
+            {
+                let scoped = ravel_invariant::mutant::scoped(name).expect("a registered mutant");
+                *guard.borrow_mut() = Some(Box::new(scoped));
+                true
+            },
+            "ravel-commit test: a mutant is scoped",
+            ""
+        );
+        guard.into_inner()
+    }
+
+    /// `(condition, details)` of every captured evaluation of `message` whose
+    /// details mention `needle`; empty outside the invariants lane.
+    fn evaluations(message: &'static str, needle: &str) -> Vec<(bool, String)> {
+        let found = std::cell::RefCell::new(Vec::new());
+        let _ = (message, needle);
+        ravel_invariant::inv_sometimes!(
+            {
+                found.borrow_mut().extend(
+                    ravel_invariant::capture::evaluations_of(message)
+                        .into_iter()
+                        .filter(|e| e.details.contains(needle))
+                        .map(|e| (e.condition, e.details)),
+                );
+                true
+            },
+            "ravel-commit test: evaluations are read",
+            ""
+        );
+        found.into_inner()
+    }
+
+    /// Puts `record`'s data object, then publishes `record`.
+    async fn put_then_publish(store: &MemoryStore, record: &CommitRecord) -> String {
+        let data_key = keys::reconstruct_data_key(record).expect("data key");
+        put_data_object(store, &data_key, Bytes::from_static(b"segment"))
+            .await
+            .expect("data put");
+        publish(store, record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        data_key
+    }
+
+    #[tokio::test]
+    async fn no_commit_without_data_holds_when_the_data_put_precedes_the_commit() {
+        if !capturing() {
+            return;
+        }
+        let store = MemoryStore::new();
+        let record = sample_record([0x40; 32]);
+        let data_key = put_then_publish(&store, &record).await;
+        // The idempotent republish reaches the same site through the
+        // AlreadyExists branch.
+        publish(&store, &record, &RetryPolicy::default())
+            .await
+            .expect("republish");
+
+        let evaluations = evaluations(NO_COMMIT_WITHOUT_DATA, &data_key);
+        assert_eq!(evaluations.len(), 2, "{evaluations:?}");
+        assert!(evaluations.iter().all(|(held, _)| *held), "{evaluations:?}");
+    }
+
+    /// `commit/commit-before-data`: the data PUT reports success without
+    /// storing anything, so the commit record lands with no data object. The
+    /// property's HEAD of the data key answers NotFound.
+    #[tokio::test]
+    async fn mutant_commit_before_data_breaks_no_commit_without_data() {
+        let Some(_mutant) = scoped_mutant("commit/commit-before-data") else {
+            return;
+        };
+        let store = MemoryStore::new();
+        let record = sample_record([0x41; 32]);
+        let data_key = put_then_publish(&store, &record).await;
+
+        let evaluations = evaluations(NO_COMMIT_WITHOUT_DATA, &data_key);
+        assert!(
+            evaluations.iter().any(|(held, _)| !held),
+            "NoCommitWithoutData never evaluated false under the mutant: {evaluations:?}"
+        );
+        assert!(
+            matches!(store.head(&data_key).await, Err(StoreError::NotFound)),
+            "the mutant stored no data object"
+        );
+    }
+
+    /// Two records under one identity: the writer id is the first draw of a
+    /// seeded identity source, the same draw for both, so the commit keys are
+    /// equal by construction and only the content hashes differ.
+    fn one_identity_two_contents(seed: u64) -> (CommitRecord, CommitRecord, String) {
+        use crate::rng::SeededRng;
+        let first = record_with_writer(SeededRng::new(seed).new_uuid(), [0x50; 32]);
+        let second = record_with_writer(SeededRng::new(seed).new_uuid(), [0x51; 32]);
+        let key = keys::commit_key_for_record(&first).expect("key");
+        assert_eq!(
+            key,
+            keys::commit_key_for_record(&second).expect("key"),
+            "the pinned identity source gives both records one commit key"
+        );
+        assert_ne!(first.content_hash, second.content_hash);
+        (first, second, key)
+    }
+
+    #[tokio::test]
+    async fn one_identity_one_content_holds_on_an_idempotent_republish() {
+        if !capturing() {
+            return;
+        }
+        let store = MemoryStore::new();
+        let (first, second, key) = one_identity_two_contents(0x4331_0001);
+        put_then_publish(&store, &first).await;
+        publish(&store, &first, &RetryPolicy::default())
+            .await
+            .expect("an identical republish is idempotent");
+        let err = publish(&store, &second, &RetryPolicy::default())
+            .await
+            .expect_err("a second content under the identity is split-brain");
+        assert!(matches!(err, PublishError::SplitBrain { .. }), "{err:?}");
+
+        // One evaluation, the identical republish's; the split-brain arm
+        // never reaches the site.
+        let evaluations = evaluations(ONE_IDENTITY_ONE_CONTENT, &key);
+        assert_eq!(evaluations.len(), 1, "{evaluations:?}");
+        assert!(evaluations[0].0, "{evaluations:?}");
+    }
+
+    /// `commit/mismatched-identity-idempotent`: the AlreadyExists branch
+    /// accepts the stored record without comparing hashes, so a second
+    /// content under one identity is reported published. The property
+    /// compares the hash the GET returned.
+    #[tokio::test]
+    async fn mutant_skip_hash_compare_breaks_one_identity_one_content() {
+        let Some(_mutant) = scoped_mutant("commit/mismatched-identity-idempotent") else {
+            return;
+        };
+        let store = MemoryStore::new();
+        let (first, second, key) = one_identity_two_contents(0x4331_0002);
+        put_then_publish(&store, &first).await;
+        let outcome = publish(&store, &second, &RetryPolicy::default()).await;
+
+        let evaluations = evaluations(ONE_IDENTITY_ONE_CONTENT, &key);
+        assert!(
+            evaluations.iter().any(|(held, _)| !held),
+            "OneIdentityOneContent never evaluated false under the mutant: {evaluations:?}"
+        );
+        let token = outcome.expect("the mutant accepts the mismatched record");
+        assert_eq!(token, record::token_for(&first).expect("token"));
     }
 }

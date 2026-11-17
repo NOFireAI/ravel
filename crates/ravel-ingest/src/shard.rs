@@ -601,6 +601,20 @@ impl FlushCtx {
             charges,
         } = pinned;
 
+        let waiters = if ravel_invariant::inv_mutant!("commit/ack-before-commit") {
+            let token = CommitToken {
+                shard: self.shard,
+                writer_id: self.writer_id,
+                epoch: self.epoch,
+                seq,
+                ingest_hour_bucket,
+            };
+            self.ack_waiters(waiters, Ok(token));
+            Vec::new()
+        } else {
+            waiters
+        };
+
         let exemplar_inputs = self.admit_exemplars(exemplars, &series);
 
         // The version was chosen at permit grant (ADR-4233 decision 2); with
@@ -672,6 +686,10 @@ impl FlushCtx {
             None => {
                 // Deadline: see `GATE_DEADLINE_MESSAGE`.
                 self.metrics.record_abandoned_queue_deadline();
+                ravel_invariant::inv_reachable!(
+                    "commit: flush abandoned",
+                    std::collections::BTreeMap::from([("at", "encode")])
+                );
                 self.ack_waiters(
                     waiters,
                     Err(WriteError::Abandoned(GATE_DEADLINE_MESSAGE.into())),
@@ -739,6 +757,10 @@ impl FlushCtx {
             }
             Err(PutAbort::Exhausted) => {
                 self.metrics.record_abandoned_retry_exhausted();
+                ravel_invariant::inv_reachable!(
+                    "commit: flush abandoned",
+                    std::collections::BTreeMap::from([("at", "data put")])
+                );
                 self.ack_waiters(
                     waiters,
                     Err(WriteError::Abandoned(
@@ -783,6 +805,10 @@ impl FlushCtx {
                 // tenant (ADR-0076 decision 2, success-time). `tenant_hash` is
                 // `Copy` and untouched by the commit-record build above.
                 self.metrics.record_flush_puts(tenant_hash);
+                ravel_invariant::inv_reachable!(
+                    "commit: strict ack sent",
+                    std::collections::BTreeMap::from([("signal", "metrics")])
+                );
                 self.ack_waiters(waiters, Ok(token));
             }
             Err(PutAbort::Refused(refused)) => {
@@ -790,6 +816,10 @@ impl FlushCtx {
             }
             Err(PutAbort::Exhausted) => {
                 self.metrics.record_abandoned_retry_exhausted();
+                ravel_invariant::inv_reachable!(
+                    "commit: flush abandoned",
+                    std::collections::BTreeMap::from([("at", "commit put")])
+                );
                 self.ack_waiters(
                     waiters,
                     Err(WriteError::Abandoned(
@@ -875,6 +905,10 @@ impl FlushCtx {
             waiters, charges, ..
         } = pinned;
         self.metrics.record_abandoned_queue_deadline();
+        ravel_invariant::inv_reachable!(
+            "commit: flush abandoned",
+            std::collections::BTreeMap::from([("at", "permit queue")])
+        );
         self.ack_waiters(
             waiters,
             Err(WriteError::Abandoned(
@@ -893,6 +927,10 @@ impl FlushCtx {
             waiters, charges, ..
         } = pinned;
         self.metrics.record_abandoned_hour_bound();
+        ravel_invariant::inv_reachable!(
+            "commit: flush abandoned",
+            std::collections::BTreeMap::from([("at", "hour bound")])
+        );
         self.ack_waiters(
             waiters,
             Err(WriteError::Abandoned(
@@ -1030,6 +1068,10 @@ impl FlushCtx {
                         return Err(PutAbort::Exhausted);
                     }
                     self.metrics.record_put_retry();
+                    ravel_invariant::inv_reachable!(
+                        "commit: put retried",
+                        std::collections::BTreeMap::from([("object", "data")])
+                    );
                     self.backoff_sleep(attempt).await;
                     attempt += 1;
                 }
@@ -1070,7 +1112,25 @@ impl FlushCtx {
                     .record(self.clock.now_ns().saturating_sub(started_ns));
             }
             match outcome {
-                Some(Ok(token)) => return Ok(token),
+                Some(Ok(token)) => {
+                    // `started_ns` is this loop's own clock read, taken before
+                    // the attempt; `bound_to_deadline` decides on its own.
+                    ravel_invariant::inv_always!(
+                        started_ns < deadline_ns,
+                        "commit: no commit record is published after its flush's deadline",
+                        std::collections::BTreeMap::from([
+                            ("commit_token", token.encode()),
+                            (
+                                "commit_key",
+                                ravel_commit::keys::commit_key_for_record(record)
+                                    .unwrap_or_default(),
+                            ),
+                            ("attempt_started_ns", started_ns.to_string()),
+                            ("deadline_ns", deadline_ns.to_string()),
+                        ])
+                    );
+                    return Ok(token);
+                }
                 Some(Err(PublishError::SplitBrain { this, stored })) => {
                     // Identity is pinned at flush open, so this cannot fire
                     // on a benign retry (docs/catalog-and-mvcc.md "Commit
@@ -1089,6 +1149,10 @@ impl FlushCtx {
                         return Err(PutAbort::Exhausted);
                     }
                     self.metrics.record_put_retry();
+                    ravel_invariant::inv_reachable!(
+                        "commit: put retried",
+                        std::collections::BTreeMap::from([("object", "commit record")])
+                    );
                     self.backoff_sleep(attempt).await;
                     attempt += 1;
                 }
@@ -7700,5 +7764,147 @@ mod tests {
                 "bound {bound}"
             );
         }
+    }
+
+    const NO_PUBLISH_AFTER_ABANDON: &str =
+        "commit: no commit record is published after its flush's deadline";
+
+    /// Drives the injected clock in backoff-sized steps until `write` ends.
+    async fn retry_until_finished<T>(clock: &TestClock, write: &tokio::task::JoinHandle<T>) {
+        while !write.is_finished() {
+            clock.advance_ns(5_000_000);
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    /// NoPublishAfterAbandon over two flushes on one shard. The first
+    /// flush's commit PUT is throttled once and its retry publishes inside
+    /// the lifetime; the property is evaluated on that publish and holds. The
+    /// second flush's commit PUT is throttled on every attempt, so the flush
+    /// is abandoned at its deadline: no commit record of it exists and no
+    /// evaluation names it.
+    #[tokio::test]
+    async fn no_publish_after_abandon_holds_under_fault_store() {
+        use ravel_object_store::fault::{FaultKind, Rule, ScriptedFault};
+
+        if !crate::router::invariant_capture::capturing() {
+            return;
+        }
+        let retried = TenantId::new("no-publish-after-abandon-retried");
+        let abandoned = TenantId::new("no-publish-after-abandon-abandoned");
+        let commits = |tenant: &TenantId| {
+            format!(
+                "t/{}/{}/c/",
+                tenant.hash().to_hex(),
+                Signal::Metrics.key_prefix()
+            )
+        };
+        let throttled = || ScriptedFault::Throttled { retry_after_ms: 0 };
+        let plan = FaultPlan::empty()
+            .with_rule(
+                Rule::new(Op::Put, throttled())
+                    .with_key_contains(commits(&retried))
+                    .with_occurrence(Occurrence::Nth(1)),
+            )
+            .with_rule(
+                Rule::new(Op::Put, throttled())
+                    .with_key_contains(commits(&abandoned))
+                    .with_occurrence(Occurrence::Always),
+            );
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        provision(store.as_ref(), &retried).await;
+        provision(store.as_ref(), &abandoned).await;
+        let lifetime = Duration::from_secs(1);
+        let clock = TestClock::new(BASE_NS);
+        let router = Arc::new(
+            IngestRouter::with_rng(
+                IngestConfig {
+                    // The deadline, not the attempt budget, ends the second
+                    // flush.
+                    put_retry_max_attempts: u32::MAX,
+                    ..one_permit_one_queue(lifetime)
+                },
+                Arc::clone(&store),
+                Signal::Metrics,
+                clock.clone(),
+                Arc::new(FullJitter),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+            )
+            .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+        );
+
+        let write = spawn_write(&router, &retried, "h0", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        until(|| router.metrics().snapshot().put_retries >= 1).await;
+        retry_until_finished(&clock, &write).await;
+        let receipt = write
+            .await
+            .expect("write task")
+            .expect("the retried commit publishes inside the lifetime");
+        assert_eq!(
+            fault_store.fault_count(Op::Put, FaultKind::Throttled),
+            1,
+            "the first flush's commit PUT was throttled once"
+        );
+        assert_eq!(router.metrics().snapshot().put_retries, 1);
+        let evaluations = crate::router::invariant_capture::evaluations(
+            NO_PUBLISH_AFTER_ABANDON,
+            &commits(&retried),
+        );
+        assert_eq!(evaluations.len(), 1, "{evaluations:?}");
+        assert!(evaluations[0].0, "{evaluations:?}");
+        assert!(
+            evaluations[0].1.contains(&receipt.tokens[0].encode()),
+            "{evaluations:?}"
+        );
+
+        let opened_ns = clock.now_ns();
+        let write = spawn_write(&router, &abandoned, "h1", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 2).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        until(|| router.metrics().snapshot().put_retries >= 2).await;
+        retry_until_finished(&clock, &write).await;
+        let err = write
+            .await
+            .expect("write task")
+            .expect_err("every commit PUT is throttled until the deadline");
+        assert!(matches!(err, WriteError::Abandoned(_)), "{err:?}");
+        let lifetime_ns = i64::try_from(lifetime.as_nanos()).expect("fits");
+        assert!(
+            clock.now_ns() - opened_ns >= lifetime_ns,
+            "the flush was abandoned at its deadline, not by an attempt budget"
+        );
+        let throttles = fault_store.fault_count(Op::Put, FaultKind::Throttled);
+        assert!(
+            throttles >= 3,
+            "the second flush's commit PUT was throttled on every attempt: {throttles}"
+        );
+        assert_eq!(router.metrics().snapshot().abandoned_retry_exhausted, 1);
+        let keys = tenant_keys(store.as_ref(), &abandoned).await;
+        assert!(
+            !keys.iter().any(|k| k.contains("/c/")),
+            "no commit record of the abandoned flush exists: {keys:?}"
+        );
+
+        let none = crate::router::invariant_capture::evaluations(
+            NO_PUBLISH_AFTER_ABANDON,
+            &commits(&abandoned),
+        );
+        assert!(none.is_empty(), "the abandoned flush published: {none:?}");
+        let retried_again = crate::router::invariant_capture::evaluations(
+            NO_PUBLISH_AFTER_ABANDON,
+            &commits(&retried),
+        );
+        assert_eq!(retried_again, evaluations);
+        assert!(
+            !crate::router::invariant_capture::evaluations("commit: flush abandoned", "commit put")
+                .is_empty(),
+            "the abandon site was reached"
+        );
+        router.flush_all().await;
     }
 }

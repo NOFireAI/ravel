@@ -4542,6 +4542,11 @@ impl Catalog {
                     let bytes = got.data.len() as u64;
                     let record = record::decode(&got.data)?;
                     validate_expected_fields(self, &record, tenant, signal, token.shard, &key)?;
+                    ravel_invariant::inv_always!(
+                        record::token_for(&record).is_ok_and(|stored| stored == *token),
+                        "commit: a commit token never resolves to a stale answer",
+                        token_answer_details(tenant, signal, token, "served")
+                    );
                     let record = Arc::new(record);
                     self.cache.insert(
                         *tenant,
@@ -4631,6 +4636,11 @@ impl Catalog {
                     // observing the tombstone invalidates this bucket's cached
                     // records (ADR-0010 §10), same as the listing path.
                     self.invalidate_bucket_cache(tenant, &prefix);
+                    ravel_invariant::inv_always!(
+                        self.token_record_absent(tenant, signal, token, false).await,
+                        "commit: a commit token never resolves to a stale answer",
+                        token_answer_details(tenant, signal, token, "tombstoned")
+                    );
                     return Ok(());
                 }
                 BucketEntry::CompactionRecord(_) => compaction_keys.push(meta.key),
@@ -4731,6 +4741,11 @@ impl Catalog {
                 ) == token_identity
             });
             if covers {
+                ravel_invariant::inv_always!(
+                    self.token_record_absent(tenant, signal, token, false).await,
+                    "commit: a commit token never resolves to a stale answer",
+                    token_answer_details(tenant, signal, token, "superseded by compaction")
+                );
                 for part in &record.parts {
                     let segment_ref = build_l1_segment_ref(record, part, ckey)?;
                     if !out.contains_key(&segment_ref.data_object_key) {
@@ -4766,6 +4781,11 @@ impl Catalog {
                 &mut discard_superseded,
             )?;
             if effective_inputs.contains(&token_identity) {
+                ravel_invariant::inv_always!(
+                    self.token_record_absent(tenant, signal, token, false).await,
+                    "commit: a commit token never resolves to a stale answer",
+                    token_answer_details(tenant, signal, token, "superseded by rewrite")
+                );
                 for part in &record.parts {
                     let segment_ref = build_rewrite_l1_segment_ref(record, part, rkey)?;
                     if !out.contains_key(&segment_ref.data_object_key) {
@@ -4781,7 +4801,43 @@ impl Catalog {
             }
         }
 
+        ravel_invariant::inv_always!(
+            self.token_record_absent(tenant, signal, token, true).await,
+            "commit: a commit token never resolves to a stale answer",
+            token_answer_details(tenant, signal, token, "unsatisfiable")
+        );
         Err(unsatisfiable_token(token))
+    }
+
+    /// Whether the commit record `token` names is absent from the store,
+    /// and, with `nor_tombstone`, its bucket's retention tombstone too: what
+    /// a tombstoned, superseded or unsatisfiable token answer claims. Raw
+    /// HEADs, outside the query's accounting; a read error other than
+    /// NotFound is no evidence of presence and passes. Only an invariant
+    /// condition calls this, and the default build compiles it out.
+    #[allow(dead_code)]
+    async fn token_record_absent(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        token: &CommitToken,
+        nor_tombstone: bool,
+    ) -> bool {
+        let Ok(commit_key) = keys::commit_key_for_token(tenant, signal, token) else {
+            return false;
+        };
+        if self.store.head(&commit_key).await.is_ok() {
+            return false;
+        }
+        if !nor_tombstone {
+            return true;
+        }
+        let Ok(tombstone_key) =
+            keys::retention_tombstone_key(tenant, signal, token.shard, token.ingest_hour_bucket)
+        else {
+            return false;
+        };
+        self.store.head(&tombstone_key).await.is_err()
     }
 
     /// `pub(crate)`: also called by `fold` to load and validate commit records found by bucket
@@ -4877,6 +4933,25 @@ fn segment_sort_key(s: &SegmentRef) -> (i64, u64, u64, u32, Uuid, u8, [u8; 32], 
         input_set_hash,
         part_index,
     )
+}
+
+/// Details of a TokenNeverServesStale evaluation; only an invariant
+/// assertion reads them.
+#[allow(dead_code)]
+fn token_answer_details(
+    tenant: &TenantHash,
+    signal: Signal,
+    token: &CommitToken,
+    answer: &str,
+) -> std::collections::BTreeMap<&'static str, String> {
+    std::collections::BTreeMap::from([
+        (
+            "commit_key",
+            keys::commit_key_for_token(tenant, signal, token).unwrap_or_default(),
+        ),
+        ("token", token.encode()),
+        ("answer", answer.to_owned()),
+    ])
 }
 
 fn unsatisfiable_token(token: &CommitToken) -> CatalogError {
@@ -9664,6 +9739,182 @@ mod tests {
             .await
             .expect("tombstoned token is satisfied, not unsatisfiable");
         assert!(snapshot.segments.is_empty(), "satisfied with zero segments");
+    }
+
+    /// `(condition, details)` of every captured TokenNeverServesStale
+    /// evaluation whose details mention `needle`, or `None` outside the
+    /// invariants lane. This crate forwards no `ravel-invariant/capture`
+    /// feature, so the gate is an assertion macro, whose condition runs only
+    /// when ravel-invariant records evaluations.
+    fn token_answers(needle: &str) -> Option<Vec<(bool, String)>> {
+        let found = std::cell::RefCell::new(None);
+        let _ = needle;
+        ravel_invariant::inv_sometimes!(
+            {
+                *found.borrow_mut() = Some(
+                    ravel_invariant::capture::evaluations_of(
+                        "commit: a commit token never resolves to a stale answer",
+                    )
+                    .into_iter()
+                    .filter(|e| e.details.contains(needle))
+                    .map(|e| (e.condition, e.details))
+                    .collect(),
+                );
+                true
+            },
+            "ravel-catalog test: evaluations are read",
+            ""
+        );
+        found.into_inner()
+    }
+
+    /// TokenNeverServesStale is evaluated on the served, tombstoned and
+    /// unsatisfiable answers of the exact-token path and holds on each.
+    #[tokio::test]
+    async fn token_never_serves_stale_is_evaluated_on_resolve() {
+        if token_answers("").is_none() {
+            return;
+        }
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
+        let range = TimeRange {
+            start_ns: now - NS_PER_HOUR,
+            end_ns: now,
+        };
+        let resolve = |token: CommitToken| {
+            let catalog = &catalog;
+            async move {
+                catalog
+                    .resolve(&tenant(), Signal::Metrics, range, &[token], now)
+                    .await
+            }
+        };
+        let skewed = |bucket: u32| i64::from(bucket) * NS_PER_HOUR + 10 * 60_000_000_000;
+
+        let served_bucket = 500_000 - 10;
+        let served = publish_segment(
+            &store,
+            0,
+            1,
+            served_bucket,
+            skewed(served_bucket),
+            skewed(served_bucket),
+            skewed(served_bucket) + 1_000,
+        )
+        .await;
+        let served_token = record::token_for(&served).expect("token");
+        let snapshot = resolve(served_token.clone()).await.expect("served");
+        assert_eq!(snapshot.segments.len(), 1);
+
+        let tombstoned_bucket = 500_000 - 11;
+        let tombstoned = publish_segment(
+            &store,
+            0,
+            1,
+            tombstoned_bucket,
+            skewed(tombstoned_bucket),
+            skewed(tombstoned_bucket),
+            skewed(tombstoned_bucket) + 1_000,
+        )
+        .await;
+        let tombstoned_token = record::token_for(&tombstoned).expect("token");
+        write_tombstone(&store, 0, tombstoned_bucket).await;
+        store
+            .delete(
+                &keys::commit_key_for_token(&tenant(), Signal::Metrics, &tombstoned_token)
+                    .expect("commit key"),
+            )
+            .await
+            .expect("delete commit record");
+        let snapshot = resolve(tombstoned_token.clone()).await.expect("tombstoned");
+        assert!(snapshot.segments.is_empty());
+
+        let missing_token = CommitToken {
+            shard: 0,
+            writer_id: Uuid::new_v4(),
+            epoch: 1,
+            seq: 1,
+            ingest_hour_bucket: 500_000 - 12,
+        };
+        let err = resolve(missing_token.clone())
+            .await
+            .expect_err("unsatisfiable");
+        assert!(matches!(err, CatalogError::UnsatisfiableToken { .. }));
+
+        for (token, answer) in [
+            (&served_token, "served"),
+            (&tombstoned_token, "tombstoned"),
+            (&missing_token, "unsatisfiable"),
+        ] {
+            let evaluations = token_answers(&token.encode()).expect("capturing");
+            assert_eq!(evaluations.len(), 1, "{answer}: {evaluations:?}");
+            assert!(evaluations[0].0, "{answer}: {evaluations:?}");
+            assert!(
+                evaluations[0].1.contains(&format!("\"{answer}\"")),
+                "{answer}: {evaluations:?}"
+            );
+        }
+    }
+
+    /// The unsatisfiable answer's evidence is the store, not the GETs that
+    /// produced the answer: two NotFound blips over a present record make
+    /// the resolve answer unsatisfiable, and the property's HEAD finds the
+    /// record.
+    #[tokio::test]
+    async fn token_never_serves_stale_reads_the_store_behind_an_unsatisfiable_answer() {
+        if token_answers("").is_none() {
+            return;
+        }
+        let inner = MemoryStore::new();
+        let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
+        let range = TimeRange {
+            start_ns: now - NS_PER_HOUR,
+            end_ns: now,
+        };
+        let skewed_bucket = 500_000 - 10;
+        let skewed_created = i64::from(skewed_bucket) * NS_PER_HOUR + 10 * 60_000_000_000;
+        let record = publish_segment(
+            &inner,
+            0,
+            1,
+            skewed_bucket,
+            skewed_created,
+            skewed_created,
+            skewed_created + 1_000,
+        )
+        .await;
+        let token = record::token_for(&record).expect("token");
+        let key = keys::commit_key_for_token(&tenant(), Signal::Metrics, &token).expect("key");
+        let plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Get)
+                .with_key_contains(key)
+                .then_fault(ScriptedFault::NotFoundBlip)
+                .then_fault(ScriptedFault::NotFoundBlip),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let err = catalog
+            .resolve(
+                &tenant(),
+                Signal::Metrics,
+                range,
+                std::slice::from_ref(&token),
+                now,
+            )
+            .await
+            .expect_err("two NotFound probes surface UnsatisfiableToken");
+        assert!(matches!(err, CatalogError::UnsatisfiableToken { .. }));
+        assert_eq!(store.fault_count(Op::Get, FaultKind::NotFoundBlip), 2);
+
+        let evaluations = token_answers(&token.encode()).expect("capturing");
+        assert_eq!(evaluations.len(), 1, "{evaluations:?}");
+        assert!(!evaluations[0].0, "{evaluations:?}");
+        assert!(
+            evaluations[0].1.contains("\"unsatisfiable\""),
+            "{evaluations:?}"
+        );
     }
 
     /// Observing a tombstone during resolution invalidates that bucket's

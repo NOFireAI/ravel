@@ -105,6 +105,9 @@ enum LogSubmittedState {
         /// The router clock's reading when submit began, the start of the
         /// request's `request` span (issue #3533).
         submitted_ns: i64,
+        /// The written tenant, which names the commit records the acks'
+        /// tokens point at.
+        tenant_hash: TenantHash,
         /// Held until `acks()` resolves, its deadline elapses, or this value
         /// is dropped; never read directly.
         _permit: Option<PendingAckPermit>,
@@ -129,10 +132,18 @@ impl LogSubmitted<'_> {
                 ack_rxs,
                 ack_deadline,
                 submitted_ns,
+                tenant_hash,
                 _permit,
             } => {
                 router
-                    .await_strict_acks(&set, ack_shards, ack_rxs, ack_deadline, submitted_ns)
+                    .await_strict_acks(
+                        &set,
+                        tenant_hash,
+                        ack_shards,
+                        ack_rxs,
+                        ack_deadline,
+                        submitted_ns,
+                    )
                     .await
             }
         }
@@ -667,7 +678,8 @@ impl LogIngestRouter {
         // closed if that read cannot complete (ADR-0052 section 3).
         #[cfg(feature = "stage-timing")]
         let route_start = std::time::Instant::now();
-        let set = self.active_set(tenant.hash(), self.clock.now_ns()).await?;
+        let tenant_hash = tenant.hash();
+        let set = self.active_set(tenant_hash, self.clock.now_ns()).await?;
         // ADR-1746 decision 4, as in `IngestRouter`: refused against the RLOG
         // floor of the view just routed with, before any shard buffers it.
         self.admit_floor(tenant.hash())?;
@@ -746,6 +758,7 @@ impl LogIngestRouter {
                 ack_rxs,
                 ack_deadline,
                 submitted_ns,
+                tenant_hash,
                 _permit: permit,
             },
         })
@@ -759,11 +772,18 @@ impl LogIngestRouter {
     async fn await_strict_acks(
         &self,
         set: &Arc<Vec<LogShardHandle>>,
+        tenant_hash: TenantHash,
         ack_shards: Vec<u32>,
-        ack_rxs: Vec<oneshot::Receiver<Result<CommitToken, LogWriteError>>>,
+        mut ack_rxs: Vec<oneshot::Receiver<Result<CommitToken, LogWriteError>>>,
         ack_deadline: Duration,
         submitted_ns: i64,
     ) -> Result<LogWriteReceipt, LogWriteError> {
+        // The idempotency marker is written on this receipt, so a receipt
+        // that waits for the first shard only puts the marker ahead of the
+        // other shards' commits.
+        if ravel_invariant::inv_mutant!("commit/marker-before-all-shards") {
+            ack_rxs.truncate(1);
+        }
         // `join_all` preserves input order, so `joined[i]` is `ack_shards[i]`.
         // On a deadline elapse the whole `join_all` future is dropped, so no
         // per-shard ack is observed: `AckTimeout` carries no recovered tokens
@@ -828,6 +848,25 @@ impl LogIngestRouter {
                 }
             }
         }
+
+        // As in `Submitted::acks`: a HEAD of every token's commit key, not
+        // the shards' acks, is the evidence. The default build compiles the
+        // assertion out, leaving `tenant_hash` unread.
+        let _ = tenant_hash;
+        ravel_invariant::inv_always!(
+            crate::router::commit_records_exist(
+                self.store.as_ref(),
+                &tenant_hash,
+                ravel_types::Signal::Logs,
+                &durable
+            )
+            .await,
+            "commit: a strict logs ack names a durable commit record",
+            std::collections::BTreeMap::from([
+                ("tenant", tenant_hash.to_hex()),
+                ("tokens", crate::router::encode_tokens(&durable)),
+            ])
+        );
 
         if let Some(inner) = first_error {
             // Preserve the exact failure semantics: the death is counted once,
@@ -1027,7 +1066,8 @@ impl LogIngestRouter {
 
         // Route against the tenant's current generation view, and check its
         // format floor, exactly as `submit`.
-        let set = self.active_set(tenant.hash(), self.clock.now_ns()).await?;
+        let tenant_hash = tenant.hash();
+        let set = self.active_set(tenant_hash, self.clock.now_ns()).await?;
         self.admit_floor(tenant.hash())?;
         self.admit_compat(tenant.hash())?;
         let shard_count = set.len() as u32;
@@ -1095,6 +1135,7 @@ impl LogIngestRouter {
                 ack_rxs,
                 ack_deadline,
                 submitted_ns,
+                tenant_hash,
                 _permit: permit,
             },
         })
