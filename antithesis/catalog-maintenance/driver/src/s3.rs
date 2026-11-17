@@ -241,12 +241,15 @@ mod tests {
     #[test]
     fn list_page_keys_and_token_are_parsed() {
         let xml = "<ListBucketResult><IsTruncated>true</IsTruncated>\
-                   <Contents><Key>t/ab/l/c/0/1/w.1.2.cmt</Key></Contents>\
+                   <Contents><Key>t/ab/l/l1/0001/20261117T16/0f6eeb04e9886d29.0000.592aa104ca6bae9c.rseg</Key></Contents>\
                    <Contents><Key>a&amp;b</Key></Contents>\
                    <NextContinuationToken>tok/1=</NextContinuationToken></ListBucketResult>";
         assert_eq!(
             tag_values(xml, "Key"),
-            vec!["t/ab/l/c/0/1/w.1.2.cmt", "a&b"]
+            vec![
+                "t/ab/l/l1/0001/20261117T16/0f6eeb04e9886d29.0000.592aa104ca6bae9c.rseg",
+                "a&b"
+            ]
         );
         assert_eq!(tag_values(xml, "IsTruncated"), vec!["true"]);
         assert_eq!(encode("tok/1="), "tok%2F1%3D");
