@@ -166,17 +166,24 @@ Buffered mode (opt-in per request, named "buffered"):
   or before a PUT attempt of its retry loop. A stale view (the last
   successful read of `sys/compat` is 10 minutes old, or there has been none
   and the view is not blind) is waited out, not refused: the flush asks again
-  every second and is refused `view_stale` only once its `max_flush_lifetime`,
-  counted from the first grant, has passed. Every other refusal is immediate:
-  `active_version_not_writable` (the active write version for the family is
-  one this build does not write), `compat_record_missing` (the record is
-  absent under a bucket or a view that has seen an activation),
-  `publish_lifetime_above_compat` at grant (the record's
-  `max_publish_lifetime_ns`, ADR-4233 decision 7, was lowered below this
-  router's `max_flush_lifetime` after the rows were admitted),
-  `fence_failed` (the bucket fence a write above the baseline needs was not
-  established), and `active_version_moved` before a PUT attempt (the active
-  version moved off the one granted). The flush is dropped, any strict
+  every second, and once more at its deadline, and is refused `view_stale`
+  only once its `max_flush_lifetime`, counted from the first grant, has
+  passed. Every other refusal is immediate: `active_version_not_writable`
+  (the active write version for the family is one this build does not
+  write), `compat_record_missing` (the record is absent under a bucket or a
+  view that has seen an activation), `fence_failed` (the bucket fence a
+  write above the baseline needs was not established), and
+  `active_version_moved` before a PUT attempt (the active version moved off
+  the one granted). `publish_lifetime_above_compat` is not among them: the
+  record's `max_publish_lifetime_ns` (ADR-4233 decision 7) is never lowered,
+  so the only way it falls below a router's `max_flush_lifetime` is
+  `compat init` recording a bound below the lifetime of a fleet that is
+  already running. Admission refuses every write after that, and rows
+  acknowledged before it publish inside the router's own
+  `max_flush_lifetime`. The teardown flush of `shutdown()` and of a dropped
+  router, the drain's bypass passes included, takes the same grant and the
+  same checks before every attempt, so after an activation a teardown under
+  a stale view writes nothing. The flush is dropped, any strict
   waiter is acked with the retryable `CompatRefused` (503), and
   `ravel_compat_publish_refused_total{family,reason}` counts it; no commit
   record is published by the refused attempt, and a data object already
@@ -190,9 +197,20 @@ Buffered mode (opt-in per request, named "buffered"):
   and no `compat_epoch` on any bucket) none of the immediate refusals can
   fire: there is no activation, no lifetime bound and no fence, and every
   family writes its baseline. Only `view_stale` can, and only for rows
-  acknowledged before the view went stale, when reads of `sys/compat` keep
-  failing past the 10 minute horizon until the flush's `max_flush_lifetime`
-  runs out. A
+  acknowledged before the view went stale, in two ways. A view that has read
+  `sys/compat` goes stale once reads keep failing past the 10 minute
+  horizon. A blind view (no read has succeeded, and the latest failed read,
+  if any, was an `AccessDenied`) goes stale at once on one failed read of
+  another kind, such as a 5xx, so rows acknowledged while it was blind enter
+  the wait with no 10 minute delay. Either way they are dropped only if no
+  read succeeds before the flush's `max_flush_lifetime` runs out. In
+  `ravel-server` every `view_stale` answer, to an admission or to a waiting
+  flush, wakes the `sys/compat` refresh, at most one extra read a second per
+  process, so the view recovers within about a second of `sys/compat`
+  becoming readable. A graceful shutdown ends sooner than that lifetime:
+  `--shutdown-timeout` (25 s by default) bounds the whole drain, and a flush
+  still waiting when it expires is lost with the process, as buffered rows
+  are in a crash. A
   router dropped without `shutdown()` adds no case: its teardown flush reads
   the per-tenant compat-epoch cache its shards hold by `Arc` even after the
   router's switch is gone, so it is granted, fenced and refused exactly as
