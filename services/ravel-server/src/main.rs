@@ -184,8 +184,9 @@ async fn main() -> anyhow::Result<()> {
     // The startup store checks, in this order, all before any listener binds
     // (`run_startup_store_checks`). Each read except the bucket-protection
     // gate retries a transient store error until --startup-store-deadline,
-    // each attempt bounded by the time left, and refuses at once on any
-    // other error (issue #4325).
+    // each attempt bounded by the time left or `MIN_STARTUP_ATTEMPT`,
+    // whichever is longer, and refuses at once on any other error (issue
+    // #4325).
     //
     // 1. Store-backend qualification (ADR-0050 section 6, EC7). On any
     //    production store kind, refuse to start unless a `sys/qualification`
@@ -1094,6 +1095,34 @@ mod tests {
             ))
             .expect("main starts the server");
         assert!(main_src.find(combined).expect("call present") < start_at);
+        // The checks and `start` both get the one policy built from
+        // --startup-store-deadline, not a policy with retry off.
+        assert_eq!(
+            main_src
+                .matches(concat!("StartupRetry::", "disabled"))
+                .count(),
+            0
+        );
+        let policy = concat!(
+            "let startup_retry = ravel_server::startup_retry::StartupRetry::",
+            "new(\n        Arc::new(ravel_server::startup_retry::TokioStartupClock::",
+            "starting_now()),\n        cli.startup_checks.startup_store_",
+            "deadline,\n"
+        );
+        assert_eq!(main_src.matches(policy).count(), 1);
+        assert_eq!(main_src.matches("let startup_retry").count(), 1);
+        assert_eq!(
+            main_src
+                .matches(format!("{combined}\n        &startup_retry,\n").as_str())
+                .count(),
+            1
+        );
+        let start_args = &main_src[start_at..];
+        let start_args = &start_args[..start_args.find("\n    )").expect("start call closes")];
+        assert!(
+            start_args.ends_with(concat!("\n        startup_", "retry,")),
+            "{start_args}"
+        );
         for direct in [
             concat!("qualification::", "enforce("),
             concat!("startup_retry::enforce_", "qualification("),
