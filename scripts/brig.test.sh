@@ -137,5 +137,36 @@ expect_code "a copy inside a sandbox clone refuses" 1
 expect_out "the refusal names the sandbox clone" "is a sandbox clone"
 expect_no_log "nothing runs from inside a sandbox clone" "plan"
 
+# --- brig-dev.sh, the guest side ---------------------------------------------
+# Runs the guest script on the host with BRIG_PROJECT set, as Brig would, and
+# HOME in $TMP so no global git config is touched. --shell -c stops right
+# after the git and environment setup.
+dev="${HERE}/brig-dev.sh"
+mkdir -p "${TMP}/home"
+brig_dev() { # brig_dev PROJECT <args...>; sets $code, $out
+  local project="$1"
+  shift
+  out=$(HOME="${TMP}/home" BRIG_PROJECT="${project}" bash "${dev}" "$@" 2>&1)
+  code=$?
+}
+
+out=$(env -u BRIG_PROJECT HOME="${TMP}/home" bash "${dev}" --shell -c true 2>&1); code=$?
+expect_code "brig-dev refuses outside a sandbox" 1
+expect_out "the refusal says where it runs" "runs inside a Brig sandbox only"
+
+linked="${TMP}/linked"
+mkdir -p "${linked}"
+printf 'gitdir: %s/missing/.git/worktrees/x\n' "${TMP}" > "${linked}/.git"
+brig_dev "${linked}" --shell -c 'echo past-git'
+expect_code "brig-dev refuses a linked worktree with exit 1" 1
+expect_out "the refusal names make brig-new" "make brig-new"
+if [[ "${out}" != *past-git* && "${out}" != *"fatal:"* ]]; then ok "no git fatal and nothing runs in a linked worktree"; else bad "no git fatal and nothing runs in a linked worktree" "${out}"; fi
+
+: > "${clone}/rust-toolchain.toml"
+# shellcheck disable=SC2016 # expanded by the shell brig-dev.sh starts
+brig_dev "${clone}" --shell -c 'echo "past-git target=${CARGO_TARGET_DIR} jobs=${CARGO_BUILD_JOBS}"'
+expect_code "brig-dev gets past git in a sandbox clone" 0
+expect_out "build output goes to the clone's target/brig" "past-git target=${clone}/target/brig jobs=4"
+
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
