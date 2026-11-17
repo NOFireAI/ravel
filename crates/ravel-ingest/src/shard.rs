@@ -65,7 +65,8 @@ use crate::format_floor::{
 };
 use crate::generation::{
     FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, STALE_VIEW_ABANDONED,
-    ScanCheck, mismatch_retry_spent, reread_and_check, send_hand_back, stale_view_hold_spent,
+    ScanCheck, mismatch_retry_spent, reread_and_check, send_hand_back, stale_view_hold_since,
+    stale_view_hold_spent,
 };
 use crate::metrics::{FlushTrigger, IngestMetrics};
 #[cfg(feature = "stage-timing")]
@@ -238,7 +239,8 @@ struct TenantBuf {
     /// When an enforced flush open first found no trusted generation view for
     /// this buffer. Once `max_flush_lifetime` has passed since, the buffer is
     /// dropped and counted instead of held again (issue #4363). Cleared when a
-    /// flush open gets a scan-set verdict.
+    /// flush open gets a scan-set or hand-back verdict, or finds the tenant's
+    /// view refreshed by a read issued since.
     stale_view_since_ns: Option<i64>,
     /// Set once a hand-back from this buffer found a target shard not live, so
     /// the episode counts and logs once however many triggers retry it.
@@ -2745,9 +2747,12 @@ impl ShardActor {
                 if !std::mem::replace(&mut buf.stale_view_counted, true) {
                     self.metrics.record_stale_provisioning_flush();
                 }
-                if matches!(lag_check, LagCheck::Enforced) {
-                    buf.stale_view_since_ns.get_or_insert(raw_ns);
-                }
+                buf.stale_view_since_ns = stale_view_hold_since(
+                    buf.stale_view_since_ns,
+                    self.scope.view_refreshed_at(tenant_hash),
+                    raw_ns,
+                    matches!(lag_check, LagCheck::Enforced),
+                );
                 if stale_view_hold_spent(
                     buf.stale_view_since_ns,
                     raw_ns,
@@ -5315,6 +5320,170 @@ mod tests {
         assert_eq!(rig.own_commits().await, 0, "nothing is written");
         drop(rig.tx);
         rig.task.await.expect("actor ends");
+    }
+
+    /// The stale-view bound of [`stale_view_config`].
+    const STALE_BOUND_NS: i64 = 60_000_000_000;
+
+    fn stale_view_config() -> IngestConfig {
+        IngestConfig {
+            shard_count: 4,
+            max_flush_lifetime: Duration::from_secs(60),
+            ..IngestConfig::default()
+        }
+    }
+
+    /// Drains the rig under an untrusted view and returns how many flushes it
+    /// has dropped on a spent stale-view hold so far.
+    async fn unknown_flush(rig: &HandBackRig) -> u64 {
+        rig.scope.set(ScanCheck::Unknown, None);
+        rig.flush_now().await;
+        rig.metrics.snapshot().abandoned_stale_provisioning
+    }
+
+    /// Asserts one more bound after the hold restarted drops the buffer, and
+    /// ends the rig.
+    async fn assert_dropped_one_bound_later(rig: HandBackRig) {
+        rig.clock.advance_ns(STALE_BOUND_NS - 1);
+        assert_eq!(unknown_flush(&rig).await, 0, "inside the restarted hold");
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096);
+        rig.clock.advance_ns(1);
+        assert_eq!(unknown_flush(&rig).await, 1, "the restarted hold is spent");
+        assert_eq!(rig.budget.in_flight_bytes(), 0);
+        assert_eq!(rig.own_commits().await, 0);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A provisioning read that succeeds during a stale-view hold restarts it.
+    /// A buffer first held at t0 whose tenant view a read then refreshed is
+    /// not dropped by a flush that finds no trusted view at t0 + 2 bounds,
+    /// with no flush attempt in between (as when its flushes are deferred);
+    /// the hold starts over there and is spent one bound later.
+    ///
+    /// Guard: the `refreshed_at_ns` filter in `stale_view_hold_since`.
+    /// Without it, and with a hold restarted at the refresh time instead of
+    /// the flush, the flush at t0 + 2 bounds drops the buffer; a hold cleared
+    /// whenever any view is cached never drops it.
+    #[tokio::test]
+    async fn a_successful_read_during_a_stale_view_hold_restarts_it() {
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, stale_view_config());
+        drop(rig.write(4_096).await);
+        assert_eq!(unknown_flush(&rig).await, 0);
+        rig.scope.set_refreshed_at(Some(BASE_NS + 1_000_000));
+        rig.clock.advance_ns(2 * STALE_BOUND_NS);
+        assert_eq!(unknown_flush(&rig).await, 0, "the read restarted the hold");
+        assert_eq!(rig.metrics.snapshot().stale_provisioning_flushes, 1);
+        assert_dropped_one_bound_later(rig).await;
+    }
+
+    /// A view refreshed before the hold began does not restart it: the buffer
+    /// is dropped one bound after its first hold.
+    ///
+    /// Guard: the `at < since` comparison in `stale_view_hold_since`. A hold
+    /// cleared whenever any view is cached is still held at the bound.
+    #[tokio::test]
+    async fn a_read_from_before_a_stale_view_hold_does_not_restart_it() {
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, stale_view_config());
+        rig.scope.set_refreshed_at(Some(BASE_NS - 1));
+        drop(rig.write(4_096).await);
+        assert_eq!(unknown_flush(&rig).await, 0);
+        rig.clock.advance_ns(STALE_BOUND_NS - 1);
+        assert_eq!(unknown_flush(&rig).await, 0);
+        rig.clock.advance_ns(1);
+        assert_eq!(unknown_flush(&rig).await, 1, "no read since the hold began");
+        assert_eq!(rig.budget.in_flight_bytes(), 0);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A held buffer whose hand-back is attempted and keeps its rows restarts
+    /// its stale-view hold: a later flush on an untrusted view at the first
+    /// hold's bound does not drop it. `target` is the hand-back target: `None`
+    /// for a dead one, which returns the buffer itself, or a full mailbox,
+    /// which returns the refused rows in a new buffer.
+    async fn assert_kept_hand_back_restarts_the_hold(target: Option<mpsc::Sender<ShardMsg>>) {
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, stale_view_config());
+        rig.scope.set_wait(false);
+        drop(rig.write(4_096).await);
+        assert_eq!(unknown_flush(&rig).await, 0);
+        rig.scope.set(HAND_BACK, target);
+        rig.clock.advance_ns(1_000_000_000);
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().hand_back_failures, 1);
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096, "the rows were kept");
+        rig.clock.advance_ns(STALE_BOUND_NS - 1_000_000_000);
+        assert_eq!(unknown_flush(&rig).await, 0, "the hold restarted here");
+        assert_dropped_one_bound_later(rig).await;
+    }
+
+    /// Guard: `buf.stale_view_since_ns = None` where `hand_back` returns kept
+    /// rows. Without it the flush at the first hold's bound drops the buffer.
+    #[tokio::test]
+    async fn a_hand_back_to_a_dead_target_restarts_the_stale_view_hold() {
+        assert_kept_hand_back_restarts_the_hold(None).await;
+    }
+
+    /// Guard: the refused rows return in a new `TenantBuf` that carries no
+    /// hold, and the clear above. Carrying `stale_view_since_ns` into that
+    /// buffer with the clear removed drops it at the first hold's bound.
+    #[tokio::test]
+    async fn a_hand_back_to_a_full_mailbox_restarts_the_stale_view_hold() {
+        let (target, _inbox) = full_target();
+        assert_kept_hand_back_restarts_the_hold(Some(target)).await;
+    }
+
+    /// A held buffer whose flush opens on a scan-set verdict, and is then
+    /// held by the format-floor check, restarts its stale-view hold.
+    ///
+    /// Guard: `buf.stale_view_since_ns = None` in the `InScanSet` arm.
+    /// Without it the flush at the first hold's bound drops the buffer.
+    #[tokio::test]
+    async fn a_scan_set_verdict_restarts_the_stale_view_hold() {
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, stale_view_config());
+        rig.scope.set_floor(FloorCheck::NoView);
+        drop(rig.write(4_096).await);
+        assert_eq!(unknown_flush(&rig).await, 0);
+        rig.scope.set(ScanCheck::InScanSet, None);
+        rig.clock.advance_ns(1_000_000_000);
+        rig.flush_now().await;
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096, "the floor held it");
+        rig.clock.advance_ns(STALE_BOUND_NS - 1_000_000_000);
+        assert_eq!(unknown_flush(&rig).await, 0, "the hold restarted here");
+        assert_dropped_one_bound_later(rig).await;
+    }
+
+    /// A held buffer whose generation-mismatch retry is spent, so its flush
+    /// opens in place (and is then held by the format-floor check), restarts
+    /// its stale-view hold.
+    ///
+    /// Guard: `buf.stale_view_since_ns = None` in the retry-spent arm.
+    /// Without it the flush one second after it drops the buffer, a deferral
+    /// cap after the hold began.
+    #[tokio::test]
+    async fn a_spent_mismatch_retry_restarts_the_stale_view_hold() {
+        let config = stale_view_config();
+        let cap_ns = config.flush_deferral_cap_ns();
+        assert!(cap_ns > STALE_BOUND_NS);
+        let rig = HandBackRig::with(MISMATCH, None, config);
+        rig.scope.set_wait(false);
+        rig.scope.set_floor(FloorCheck::NoView);
+        let (target, _inbox) = full_target();
+        rig.scope.set(MISMATCH, Some(target.clone()));
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().hand_back_failures, 1);
+        rig.clock.advance_ns(1_000_000_000);
+        assert_eq!(unknown_flush(&rig).await, 0, "the hold begins");
+        rig.clock.advance_ns(cap_ns);
+        rig.scope.set(MISMATCH, Some(target));
+        let in_place = rig.metrics.snapshot().generation_mismatch_written_in_place;
+        rig.flush_now().await;
+        assert!(rig.metrics.snapshot().generation_mismatch_written_in_place > in_place);
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096, "the floor held it");
+        rig.clock.advance_ns(1_000_000_000);
+        assert_eq!(unknown_flush(&rig).await, 0, "the hold restarted");
+        assert_dropped_one_bound_later(rig).await;
     }
 
     /// One tenant's in-place WARN does not silence another's: two tenants

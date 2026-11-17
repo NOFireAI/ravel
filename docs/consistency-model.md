@@ -222,15 +222,20 @@ Buffered mode (opt-in per request, named "buffered"):
   `hour(refreshed_at) + ceil(C) + 1` cannot confirm its shard index is in the
   read side's scan set, so it does not open and its buffer is kept while the
   provisioning record is re-read. The hold starts at the first enforced flush
-  attempt that finds no trusted view and ends when a re-read succeeds. Once it
-  has lasted `max_flush_lifetime` (3600 s by default), the next flush attempt,
-  enforced or teardown, drops the buffer with no store call: any strict waiter
+  attempt that finds no trusted view and ends when a flush attempt opens on a
+  trusted view (a scan-set or hand-back verdict). A provisioning read issued
+  after the hold began that succeeds restarts it at the next flush attempt
+  that still finds no trusted view, whether or not flush attempts were made
+  in between (a deferred flush makes none). Once it has lasted
+  `max_flush_lifetime` (3600 s by default) with no such read, the next flush
+  attempt, enforced or teardown, drops the buffer with no store call: any strict waiter
   is acked with the retryable `Abandoned` (503), the buffer's ADR-0069 byte
   charges are refunded, the drop is logged at ERROR, and
   `ravel_ingest_abandoned_stale_provisioning_total`, labelled by signal,
   counts it once per buffer. A teardown drain inside that bound still writes
   the buffer in place (the first exception under "Online resharding" below). Like case one this
-  is a store that cannot be read for an hour; the alternative, holding the
+  is a store that cannot be read for an hour: no provisioning read succeeded
+  for `max_flush_lifetime`, deferred flushes included; the alternative, holding the
   rows and their budget charge without limit, turns a lasting outage into an
   unbounded memory and budget hold on every router. The
   ADR-1685 store-clock lag check is not a case of its own: a teardown drain's

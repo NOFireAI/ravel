@@ -75,7 +75,8 @@ use crate::format_floor::{
 };
 use crate::generation::{
     FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, STALE_VIEW_ABANDONED,
-    ScanCheck, mismatch_retry_spent, reread_and_check, send_hand_back, stale_view_hold_spent,
+    ScanCheck, mismatch_retry_spent, reread_and_check, send_hand_back, stale_view_hold_since,
+    stale_view_hold_spent,
 };
 use crate::metrics::FlushTrigger;
 use crate::shard::{InPlaceCause, InPlaceWarnings};
@@ -2046,9 +2047,12 @@ impl SpanShardActor {
                 if !std::mem::replace(&mut buf.stale_view_counted, true) {
                     self.metrics.record_stale_provisioning_flush();
                 }
-                if matches!(lag_check, LagCheck::Enforced) {
-                    buf.stale_view_since_ns.get_or_insert(raw_ns);
-                }
+                buf.stale_view_since_ns = stale_view_hold_since(
+                    buf.stale_view_since_ns,
+                    self.scope.view_refreshed_at(tenant_hash),
+                    raw_ns,
+                    matches!(lag_check, LagCheck::Enforced),
+                );
                 if stale_view_hold_spent(
                     buf.stale_view_since_ns,
                     raw_ns,
@@ -3767,6 +3771,147 @@ mod tests {
         assert_eq!(rig.own_commits().await, 0, "nothing is written");
         drop(rig.tx);
         rig.task.await.expect("actor ends");
+    }
+
+    /// The stale-view bound of [`stale_view_config`].
+    const STALE_BOUND_NS: i64 = 60_000_000_000;
+
+    fn stale_view_config() -> IngestConfig {
+        IngestConfig {
+            shard_count: 4,
+            max_flush_lifetime: Duration::from_secs(60),
+            ..IngestConfig::default()
+        }
+    }
+
+    /// Drains the rig under an untrusted view and returns how many flushes it
+    /// has dropped on a spent stale-view hold so far.
+    async fn unknown_flush(rig: &HandBackRig) -> u64 {
+        rig.scope.set(ScanCheck::Unknown, None);
+        rig.flush_now().await;
+        rig.metrics.snapshot().abandoned_stale_provisioning
+    }
+
+    /// Asserts one more bound after the hold restarted drops the buffer, and
+    /// ends the rig.
+    async fn assert_dropped_one_bound_later(rig: HandBackRig) {
+        rig.clock.advance_ns(STALE_BOUND_NS - 1);
+        assert_eq!(unknown_flush(&rig).await, 0, "inside the restarted hold");
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096);
+        rig.clock.advance_ns(1);
+        assert_eq!(unknown_flush(&rig).await, 1, "the restarted hold is spent");
+        assert_eq!(rig.budget.in_flight_bytes(), 0);
+        assert_eq!(rig.own_commits().await, 0);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_successful_read_during_a_stale_view_hold_restarts_it`.
+    #[tokio::test]
+    async fn a_successful_read_during_a_stale_view_hold_restarts_it() {
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, stale_view_config());
+        drop(rig.write(4_096).await);
+        assert_eq!(unknown_flush(&rig).await, 0);
+        rig.scope.set_refreshed_at(Some(BASE_NS + 1_000_000));
+        rig.clock.advance_ns(2 * STALE_BOUND_NS);
+        assert_eq!(unknown_flush(&rig).await, 0, "the read restarted the hold");
+        assert_eq!(rig.metrics.snapshot().stale_provisioning_flushes, 1);
+        assert_dropped_one_bound_later(rig).await;
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_read_from_before_a_stale_view_hold_does_not_restart_it`.
+    #[tokio::test]
+    async fn a_read_from_before_a_stale_view_hold_does_not_restart_it() {
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, stale_view_config());
+        rig.scope.set_refreshed_at(Some(BASE_NS - 1));
+        drop(rig.write(4_096).await);
+        assert_eq!(unknown_flush(&rig).await, 0);
+        rig.clock.advance_ns(STALE_BOUND_NS - 1);
+        assert_eq!(unknown_flush(&rig).await, 0);
+        rig.clock.advance_ns(1);
+        assert_eq!(unknown_flush(&rig).await, 1, "no read since the hold began");
+        assert_eq!(rig.budget.in_flight_bytes(), 0);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `assert_kept_hand_back_restarts_the_hold`.
+    async fn assert_kept_hand_back_restarts_the_hold(target: Option<mpsc::Sender<SpanShardMsg>>) {
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, stale_view_config());
+        rig.scope.set_wait(false);
+        drop(rig.write(4_096).await);
+        assert_eq!(unknown_flush(&rig).await, 0);
+        rig.scope.set(HAND_BACK, target);
+        rig.clock.advance_ns(1_000_000_000);
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().hand_back_failures, 1);
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096, "the rows were kept");
+        rig.clock.advance_ns(STALE_BOUND_NS - 1_000_000_000);
+        assert_eq!(unknown_flush(&rig).await, 0, "the hold restarted here");
+        assert_dropped_one_bound_later(rig).await;
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_hand_back_to_a_dead_target_restarts_the_stale_view_hold`.
+    #[tokio::test]
+    async fn a_hand_back_to_a_dead_target_restarts_the_stale_view_hold() {
+        assert_kept_hand_back_restarts_the_hold(None).await;
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_hand_back_to_a_full_mailbox_restarts_the_stale_view_hold`.
+    #[tokio::test]
+    async fn a_hand_back_to_a_full_mailbox_restarts_the_stale_view_hold() {
+        let (target, _inbox) = full_target();
+        assert_kept_hand_back_restarts_the_hold(Some(target)).await;
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_scan_set_verdict_restarts_the_stale_view_hold`.
+    #[tokio::test]
+    async fn a_scan_set_verdict_restarts_the_stale_view_hold() {
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, stale_view_config());
+        rig.scope.set_floor(FloorCheck::NoView);
+        drop(rig.write(4_096).await);
+        assert_eq!(unknown_flush(&rig).await, 0);
+        rig.scope.set(ScanCheck::InScanSet, None);
+        rig.clock.advance_ns(1_000_000_000);
+        rig.flush_now().await;
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096, "the floor held it");
+        rig.clock.advance_ns(STALE_BOUND_NS - 1_000_000_000);
+        assert_eq!(unknown_flush(&rig).await, 0, "the hold restarted here");
+        assert_dropped_one_bound_later(rig).await;
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_spent_mismatch_retry_restarts_the_stale_view_hold`.
+    #[tokio::test]
+    async fn a_spent_mismatch_retry_restarts_the_stale_view_hold() {
+        let config = stale_view_config();
+        let cap_ns = config.flush_deferral_cap_ns();
+        assert!(cap_ns > STALE_BOUND_NS);
+        let rig = HandBackRig::with(MISMATCH, None, config);
+        rig.scope.set_wait(false);
+        rig.scope.set_floor(FloorCheck::NoView);
+        let (target, _inbox) = full_target();
+        rig.scope.set(MISMATCH, Some(target.clone()));
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().hand_back_failures, 1);
+        rig.clock.advance_ns(1_000_000_000);
+        assert_eq!(unknown_flush(&rig).await, 0, "the hold begins");
+        rig.clock.advance_ns(cap_ns);
+        rig.scope.set(MISMATCH, Some(target));
+        let in_place = rig.metrics.snapshot().generation_mismatch_written_in_place;
+        rig.flush_now().await;
+        assert!(rig.metrics.snapshot().generation_mismatch_written_in_place > in_place);
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096, "the floor held it");
+        rig.clock.advance_ns(1_000_000_000);
+        assert_eq!(unknown_flush(&rig).await, 0, "the hold restarted");
+        assert_dropped_one_bound_later(rig).await;
     }
 
     /// The span counterpart of `crate::shard`'s
