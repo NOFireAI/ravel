@@ -159,59 +159,107 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to build object store backend")?;
 
-    // Store-backend qualification gate (ADR-0050 section 6, EC7). On any
-    // production store kind, refuse to start unless a `sys/qualification` record
-    // written by `ravel-cli store qualify` is present and at least this binary's
-    // suite-version floor. Read-only, runs once before any listener binds, in
-    // every mode; `StoreKind::Memory` (the semantics oracle) is exempt. Unlike
-    // the tenancy marker and GC config, an absent record is NOT a
-    // bootstrap-and-continue case: a fresh production deployment must run `store
-    // qualify` first, by design (see `qualification` and the operations guide).
-    // This and the other startup store reads through `startup_retry` retry a
-    // transient store error until --startup-store-deadline and refuse at once
-    // on any other error (issue #4325).
-    ravel_server::startup_retry::enforce_qualification(
-        &startup_retry,
-        store.as_ref(),
-        cli.store,
-        cli.backend_identity().as_deref(),
-    )
-    .await?;
-
-    // Bucket-protection contract gate (ADR-0072 decision 3, ADR-1727 decision
-    // 5), off by default: see docs/object-store-contract.md's "Required bucket
-    // configuration" section. `--require-bucket-protection` unset leaves this
-    // call a no-op that sends no request. When set, on `--store s3` it reads
-    // the bucket's protection report through the concrete base `S3Store`
-    // (three read-only GETs) and refuses to start on a fatal failed condition;
-    // an unknown condition, which is every condition on a backend other than
-    // S3, logs one warning and raises `ravel_bucket_protection_unknown`
-    // instead of blocking. `--store gcs` and `--store azure` never reach this
-    // with the flag set: argument parsing refuses it there (ADR-3456 decision
-    // D6, ADR-4158 decision D7).
-    ravel_server::bucket_protection::enforce_at_startup_on(
-        cli.startup_checks.require_bucket_protection,
-        store_s3.as_deref(),
-        store.as_ref(),
-    )
-    .await?;
-
-    // Tenant-hash scheme pinning (ADR-0050 section 3). Resolve the bucket's
-    // scheme from `sys/tenancy` (writing the marker for a fresh or pre-ADR
-    // bucket) and install it process-wide. A configured scheme or key that
-    // disagrees with an existing marker is a startup refusal here, before any
-    // listener binds, so a wrong key is a failed deploy rather than a silent
-    // parallel namespace.
+    // Inputs of the startup store checks below, parsed first so a flag error
+    // refuses before any store request. None of these hash a tenant: the
+    // tenant-hash scheme is installed inside the checks.
     let tenancy_config = cli.resolve_tenancy_config()?;
-    let resolved_tenancy = ravel_server::startup_retry::resolve_tenancy(
+    let tenant_kms_config = cli.parse_tenant_kms_config()?;
+    // Parsed once: the fold tenants, the federation mapping check, shard-count
+    // validation and the resolver all read this one result, so a token file
+    // rotated during startup cannot make the resolver serve a tenant the
+    // other checks never saw.
+    let tenant_principals = cli.parse_tenant_principals()?;
+    let tenant_tokens = ravel_server::config::tenant_map(&tenant_principals);
+    // Fold and maintenance derive their tenant set from storage each cycle
+    // (ADR-0048 decision 3), not from these flags. This is now
+    // only an optional restriction: the union of the statically mapped bearer
+    // tenants and whatever `--maintain-tenant` names. Empty (the default, and
+    // the common case for a deployment authenticating tenants through OIDC or
+    // mTLS, which has no `--tenant-token` entries) means no restriction is
+    // configured, so every tenant storage discovers data for is maintained --
+    // not, as an empty discovered set could be misread, that nothing is.
+    let maintain_tenants = cli.parse_maintain_tenants()?;
+
+    // The startup store checks, in this order, all before any listener binds
+    // (`run_startup_store_checks`). Each read except the bucket-protection
+    // gate retries a transient store error until --startup-store-deadline,
+    // each attempt bounded by the time left, and refuses at once on any
+    // other error (issue #4325).
+    //
+    // 1. Store-backend qualification (ADR-0050 section 6, EC7). On any
+    //    production store kind, refuse to start unless a `sys/qualification`
+    //    record written by `ravel-cli store qualify` is present and at least
+    //    this binary's suite-version floor. Read-only, in every mode;
+    //    `StoreKind::Memory` (the semantics oracle) is exempt. Unlike the
+    //    tenancy marker and GC config, an absent record is NOT a
+    //    bootstrap-and-continue case: a fresh production deployment must run
+    //    `store qualify` first, by design (see `qualification` and the
+    //    operations guide).
+    // 2. Bucket protection (ADR-0072 decision 3, ADR-1727 decision 5), off by
+    //    default: see docs/object-store-contract.md's "Required bucket
+    //    configuration" section. `--require-bucket-protection` unset leaves
+    //    this a no-op that sends no request. When set, on `--store s3` it
+    //    reads the bucket's protection report through the concrete base
+    //    `S3Store` (three read-only GETs) and refuses to start on a fatal
+    //    failed condition; an unknown condition, which is every condition on
+    //    a backend other than S3, logs one warning and raises
+    //    `ravel_bucket_protection_unknown` instead of blocking. `--store gcs`
+    //    and `--store azure` never reach this with the flag set: argument
+    //    parsing refuses it there (ADR-3456 decision D6, ADR-4158 decision
+    //    D7).
+    // 3. Tenant-hash scheme pinning (ADR-0050 section 3). Resolve the
+    //    bucket's scheme from `sys/tenancy` (writing the marker for a fresh or
+    //    pre-ADR bucket) and install it process-wide. A configured scheme or
+    //    key that disagrees with an existing marker refuses, so a wrong key is
+    //    a failed deploy rather than a silent parallel namespace.
+    // 4. Per-tenant SSE-KMS routing (ADR-0062 decision 1, ADR-0072 decision
+    //    2), after the scheme install because registering a tenant's key
+    //    needs `TenantId::hash()`. `tenant_kms` is `None` unless
+    //    `--tenant-kms-config` was set (and `Cli::validate` already refused
+    //    that combined with `--store memory`), so this is a no-op on every
+    //    deployment that has not opted in.
+    // 5. Durable shard_count validation for statically-known tenants
+    //    (ADR-0050 section 5, EC5). The static set is exactly `fold_tenants`,
+    //    the union of `--tenant-token` and `--maintain-tenant`, hashed under
+    //    the pinned scheme. An unreadable provisioning record, or pre-ADR data
+    //    the configured `--shards` would hide, refuses; a recorded shard_count
+    //    that merely differs from `--shards` is tolerated (ADR-0082). A
+    //    brand-new tenant with no prior writes and no record passes through
+    //    cleanly, so a fresh, operator-managed cluster with configured tenants
+    //    and zero data starts normally. `query` mode never adopts and lists
+    //    committed data only (`static_absent_policy`): it validates a present
+    //    record and, for an absent one, still refuses when `--shards` would
+    //    hide committed data. Every other mode adopts pre-ADR data. An
+    //    OIDC/mTLS deployment with no static tenants validates nothing here
+    //    and checks each tenant at first touch.
+    // 6. Durable GC configuration (ADR-0050 section 4, EC4). Bootstrap
+    //    `sys/gc` from this process's maintain defaults on a fresh bucket, or
+    //    read the durable object on a bootstrapped one; this mode is validated
+    //    against it below. A fresh, never-bootstrapped bucket never fails
+    //    startup here, and a concurrent bootstrap loser re-reads the winner's
+    //    object rather than refusing. A credential the store refuses fails
+    //    naming the fix that fits this mode and the refused request.
+    let ravel_server::startup_retry::StartupStoreState {
+        tenancy: resolved_tenancy,
+        static_tenants: fold_tenants,
+        gc,
+    } = ravel_server::startup_retry::run_startup_store_checks(
         &startup_retry,
-        store.as_ref(),
-        tenancy_config,
-        now_unix_ns(),
+        ravel_server::startup_retry::StartupStoreInputs {
+            store: &store,
+            store_kind: cli.store,
+            backend_identity: cli.backend_identity().as_deref(),
+            require_bucket_protection: cli.startup_checks.require_bucket_protection,
+            store_s3: store_s3.as_deref(),
+            tenancy: tenancy_config,
+            tenant_kms: tenant_kms.as_deref().map(|kms| (kms, &tenant_kms_config)),
+            shard_count: cli.shards,
+            mode: cli.mode,
+        },
+        || ravel_server::config::merge_fold_tenants(tenant_tokens.values(), &maintain_tenants),
+        now_unix_ns,
     )
     .await?;
-    ravel_types::install_tenant_hash_scheme(resolved_tenancy.scheme.clone())
-        .map_err(|_| anyhow::anyhow!("tenant-hash scheme was already installed"))?;
     // Retained for the recovery-manifest writer (ADR-0050 section 3): `Some`
     // only on a keyed bucket. `start` builds the writer from it and wires it
     // into every ingest path.
@@ -242,25 +290,6 @@ async fn main() -> anyhow::Result<()> {
         .resolve_audit_text_policy(deployment_key.as_deref())
         .context("failed to resolve --audit-text")?;
 
-    // Per-tenant SSE-KMS routing (ADR-0062 decision 1,
-    // ADR-0072 decision 2). Deferred to here, not folded into `build_store`
-    // above: registering a tenant's key needs `TenantId::hash()`, which is
-    // not valid to call until the tenant-hash scheme installed just above is
-    // in place. `tenant_kms` is `None` unless `--tenant-kms-config` was set
-    // (and `Cli::validate` already refused that combined with `--store
-    // memory`), so this is a no-op on every deployment that has not opted in.
-    let tenant_kms_config = cli.parse_tenant_kms_config()?;
-    if let Some(kms) = tenant_kms.as_deref() {
-        ravel_server::startup_retry::configure_tenant_kms(
-            &startup_retry,
-            kms,
-            store.as_ref(),
-            &tenant_kms_config,
-            now_unix_ns(),
-        )
-        .await?;
-    }
-
     let parquet_profiles = cli.parse_parquet_profiles()?;
     if let Some(profiles) = &parquet_profiles {
         let names: Vec<&str> = profiles
@@ -270,49 +299,6 @@ async fn main() -> anyhow::Result<()> {
             .collect();
         tracing::info!(profiles = ?names, "Parquet table credential profiles loaded");
     }
-
-    // Parsed once: the fold tenants, the federation mapping check, shard-count
-    // validation and the resolver all read this one result, so a token file
-    // rotated during startup cannot make the resolver serve a tenant the
-    // other checks never saw.
-    let tenant_principals = cli.parse_tenant_principals()?;
-    let tenant_tokens = ravel_server::config::tenant_map(&tenant_principals);
-    // Fold and maintenance derive their tenant set from storage each cycle
-    // (ADR-0048 decision 3), not from these flags. This is now
-    // only an optional restriction: the union of the statically mapped bearer
-    // tenants and whatever `--maintain-tenant` names. Empty (the default, and
-    // the common case for a deployment authenticating tenants through OIDC or
-    // mTLS, which has no `--tenant-token` entries) means no restriction is
-    // configured, so every tenant storage discovers data for is maintained --
-    // not, as an empty discovered set could be misread, that nothing is.
-    let maintain_tenants = cli.parse_maintain_tenants()?;
-    let fold_tenants =
-        ravel_server::config::merge_fold_tenants(tenant_tokens.values(), &maintain_tenants);
-
-    // Durable shard_count validation for statically-known tenants (ADR-0050
-    // section 5, EC5). The static set is exactly `fold_tenants`, the union of
-    // `--tenant-token` and `--maintain-tenant` (already hashed under the pinned
-    // scheme). An unreadable provisioning record, or pre-ADR data the
-    // configured `--shards` would hide, refuses startup here, before any
-    // listener binds; a recorded shard_count that merely differs from
-    // `--shards` is tolerated (ADR-0082). A brand-new tenant with no prior
-    // writes and no record passes through cleanly (nothing to validate yet), so
-    // a fresh, operator-managed cluster with configured tenants and zero data
-    // starts normally. `query` mode never adopts and lists committed data only
-    // (`static_absent_policy`): it validates a present record and, for an
-    // absent one, still refuses when `--shards` would hide committed data.
-    // Every other mode adopts pre-ADR data. An
-    // OIDC/mTLS deployment with no static tenants validates nothing here and
-    // checks each tenant at first touch.
-    ravel_server::startup_retry::validate_static_provisioning(
-        &startup_retry,
-        store.as_ref(),
-        &fold_tenants,
-        cli.shards,
-        cli.mode,
-        now_unix_ns(),
-    )
-    .await?;
     // Real authn (ADR-0042 decision 6): the OIDC and mTLS resolvers join the
     // FallbackResolver chain alongside the static bearer resolver when their
     // flags are set. Validation of dependent-flag misuse happens in
@@ -470,25 +456,10 @@ async fn main() -> anyhow::Result<()> {
         RetentionConfig::from_policy(retention_policy, &compactor, catalog_max_ingest_lag_ns)
             .map_err(|e| anyhow::anyhow!("invalid retention configuration: {e}"))?;
 
-    // Durable GC configuration (ADR-0050 section 4, EC4). Bootstrap `sys/gc`
-    // from this process's maintain defaults on a fresh bucket, or read the
-    // durable object on a bootstrapped one, then validate this mode against it,
-    // before any listener binds. A fresh, never-bootstrapped bucket never fails
-    // startup here: the object is written from the maintain defaults (which
-    // satisfy the constraint) and validated against what was just written, and a
-    // concurrent bootstrap loser re-reads the winner's object rather than
-    // refusing. Only a *present* object this mode really violates refuses to
-    // start, or a credential the store refuses, which fails naming the fix
-    // that fits this mode and the refused request. The Flight SQL ceiling is
-    // sourced and validated in `ravel_server::start` (it is
-    // `flight-sql`-feature-gated).
-    let gc = ravel_server::gc_config::bootstrap_at_startup(
-        store.clone(),
-        now_unix_ns(),
-        cli.mode,
-        &startup_retry,
-    )
-    .await?;
+    // Validate this mode against the `sys/gc` the startup store checks read
+    // (ADR-0050 section 4, EC4). Only a present object this mode really
+    // violates refuses here. The Flight SQL ceiling is sourced and validated
+    // in `ravel_server::start` (it is `flight-sql`-feature-gated).
     if matches!(cli.mode, Mode::Maintain) {
         ravel_server::gc_config::validate_maintain(&gc, &compactor).map_err(|e| {
             anyhow::anyhow!("maintain GC-config validation failed against sys/gc: {e}")

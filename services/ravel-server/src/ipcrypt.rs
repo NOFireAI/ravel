@@ -591,12 +591,14 @@ mod tests {
         let clock = Arc::new(ManualClock::default());
         let store = FaultStore::new(MemoryStore::new(), ack_lost_then_ok(IPCRYPT_POLICY_KEY));
         let policy = IpcryptPolicy::new(defaults_policy(&["client.ip"]), Some(&KEY)).expect("a");
-        let outcome = check_startup_marker(&store, Mode::All, &policy, &retry_on(clock))
+        let outcome = check_startup_marker(&store, Mode::All, &policy, &retry_on(clock.clone()))
             .await
             .expect("the retry finds the landed marker");
         assert_eq!(outcome, Some(CheckOutcome::Matched));
         assert_eq!(store.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
         assert_eq!(store.sequence_progress(0), 1);
+        // One retry: the read that found the landed marker.
+        assert_eq!(clock.sleeps().len(), 1);
     }
 
     #[tokio::test]
@@ -619,7 +621,7 @@ mod tests {
         .expect_err("refuses once the deadline passes");
         let attempts = store.fault_count(Op::Get, FaultKind::Transient);
         assert_deadline_refusal(&err, SITE_IPCRYPT_MARKER, attempts);
-        assert_eq!(clock.virtual_now(), DEADLINE);
+        assert!(clock.virtual_now() < DEADLINE);
         assert!(format!("{err:#}").contains("IPCrypt policy marker check failed"));
     }
 

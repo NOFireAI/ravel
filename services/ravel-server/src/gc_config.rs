@@ -94,7 +94,7 @@ pub async fn bootstrap_at_startup(
 }
 
 /// One failed [`bootstrap`] attempt and whether the store call behind it
-/// failed with [`StoreError::Transient`].
+/// failed with a transient store error ([`store_error_is_transient`]).
 struct GcAttemptError {
     error: GcConfigError,
     transient: bool,
@@ -107,7 +107,7 @@ impl fmt::Display for GcAttemptError {
 }
 
 /// Delegates every call and remembers whether the most recent failing one
-/// returned [`StoreError::Transient`].
+/// returned a transient store error ([`store_error_is_transient`]).
 struct LastErrorStore {
     inner: Arc<dyn ObjectStoreBackend>,
     last_failure_transient: AtomicBool,
@@ -465,6 +465,27 @@ mod tests {
             assert_eq!(store.sequence_progress(0), 4);
         }
 
+        /// `GcConfigError::Store` carries text only; the recording store still
+        /// sees the throttled answer by type and the read retries.
+        #[tokio::test]
+        async fn retries_a_throttled_read_then_starts() {
+            let clock = Arc::new(ManualClock::default());
+            let store = faulted(fault_then_ok(
+                Op::Get,
+                GC_KEY,
+                ravel_object_store::fault::ScriptedFault::Throttled {
+                    retry_after_ms: 1000,
+                },
+                2,
+            ));
+            bootstrap_at_startup(store.clone(), 1, Mode::All, &retry_on(clock.clone()))
+                .await
+                .expect("starts once the store answers");
+            assert_eq!(store.fault_count(Op::Get, FaultKind::Throttled), 2);
+            assert_eq!(store.sequence_progress(0), 3);
+            assert_eq!(clock.sleeps().len(), 2);
+        }
+
         #[tokio::test]
         async fn retries_a_transient_create_then_starts() {
             let clock = Arc::new(ManualClock::default());
@@ -499,7 +520,7 @@ mod tests {
                 .expect_err("refuses once the deadline passes");
             let attempts = store.fault_count(Op::Get, FaultKind::Transient);
             assert_deadline_refusal(&err, SITE_GC_CONFIG, attempts);
-            assert_eq!(clock.virtual_now(), DEADLINE);
+            assert!(clock.virtual_now() < DEADLINE);
             assert!(
                 format!("{err:#}")
                     .contains("failed to bootstrap or read the durable GC config (sys/gc)")
