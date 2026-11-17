@@ -1154,6 +1154,29 @@ impl IngestConfig {
 mod tests {
     use super::*;
 
+    /// A fold seal margin built from a `CatalogConfig` carries that
+    /// config's three values, not the defaults, and seals hour H at
+    /// `end(H)` plus their sum.
+    #[test]
+    fn the_fold_seal_margin_is_the_catalog_configs() {
+        let catalog = ravel_catalog::CatalogConfig {
+            max_flush_lifetime_ns: 7,
+            clock_skew_allowance_ns: 300,
+            fold_safety_margin_ns: 11_000,
+            ..ravel_catalog::CatalogConfig::default()
+        };
+        let seal = FoldSealMargin::from(&catalog);
+        assert_ne!(seal, FoldSealMargin::default());
+        assert_eq!(seal.sealed_at_ns(41), 42 * NS_PER_HOUR + 11_307);
+        assert_eq!(
+            FoldSealMargin::default().sealed_at_ns(41),
+            42 * NS_PER_HOUR
+                + ravel_catalog::DEFAULT_MAX_FLUSH_LIFETIME_NS
+                + ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+                + ravel_catalog::DEFAULT_FOLD_SAFETY_MARGIN_NS
+        );
+    }
+
     /// The ADR-1685 lag check is one-sided and inclusive at the allowance, and
     /// an extreme observation saturates rather than overflowing into a pass.
     #[test]
