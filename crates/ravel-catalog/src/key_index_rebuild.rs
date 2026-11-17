@@ -68,8 +68,12 @@ impl Default for KeyIndexRebuildOptions {
 }
 
 /// One batch's publish, its HEAD CAS retries included. A batch that stopped
-/// the run before its publish step is listed last, with `head_cas_tries` 0,
-/// so the attempts' GETs and PUTs sum to the report's totals.
+/// the run before its publish step is listed last, after the
+/// `attempt_count` batches that reached it, so the attempts' GETs and PUTs
+/// sum to the report's totals. It is the trailing attempt when
+/// `attempts.len()` exceeds `attempt_count`; `head_cas_tries` 0 does not mark
+/// it, since a batch that reached publish with every part deferred also
+/// writes no HEAD.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct KeyIndexRebuildAttempt {
     /// Parts the batch read.
@@ -166,9 +170,10 @@ pub struct KeyIndexRebuildReport {
     pub passes: u64,
     /// For each field built, the passes that started with it still building,
     /// summed over the same parts. Every field of a part starts building at
-    /// its first pass, so a part's passes are the largest of its fields'
-    /// counts, not their sum. A part whose build failed and stopped the run is
-    /// in `passes` but not here.
+    /// its first pass and, because the repair carries no previous leaf, the
+    /// build never restarts a field, so a part's passes are the largest of
+    /// its fields' counts, not their sum. A part whose build failed and
+    /// stopped the run is in `passes` but not here.
     pub passes_per_field: BTreeMap<String, u64>,
     /// KEY_IDX (LABEL_DICT on metrics) section reads, one per (entry, pass),
     /// whatever GETs each cost; a read that failed at its footer counts too.

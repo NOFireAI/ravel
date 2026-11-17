@@ -374,6 +374,9 @@ async fn rebuild_stopped_before_publish_marks_its_attempt() {
         matches!(err, ravel_catalog::KeyIndexRebuildError::Interrupted { .. }),
         "{err:?}"
     );
+    // The failed build is in `passes` but in no field's count.
+    assert!(printed.contains("\npasses: 1\n"), "{printed}");
+    assert!(printed.contains("\npasses_per_field: none\n"), "{printed}");
     assert!(
         printed.ends_with(
             "attempt_count: 0\n\
@@ -409,6 +412,8 @@ async fn rebuild_prints_a_deferred_part_and_a_rerun_attaches_it() {
     assert_eq!((report.parts_rebuilt, report.parts_deferred), (0, 1));
     assert!(printed.contains("parts_rebuilt: 0\n"), "{printed}");
     assert!(printed.contains("parts_deferred: 1\n"), "{printed}");
+    // A deferred part's passes count; its pairs do not.
+    assert!(printed.contains("\nfield_pairs: none\n"), "{printed}");
     assert!(read_head(&store).await.parts[0].key_index.is_empty());
 
     let (rerun, printed) = rebuild(&store, None, false).await.expect("rerun");
