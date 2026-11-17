@@ -433,7 +433,10 @@ enum Command {
     /// (ADR-4233): adopt a store at the baseline, activate a version, certify a
     /// reader retirement, and report the contract state. Every subcommand
     /// signs and verifies `sys/compat` under the global `--tenant-hash-key-file`
-    /// deployment key.
+    /// deployment key. Exit codes: 0 done, 1 an error (a store fault, an
+    /// exhausted CAS retry, a malformed value), 2 a usage error from argument
+    /// parsing, 3 contradicted, 4 resumable but unfinished, 5 refused by a
+    /// precondition.
     Compat {
         #[command(subcommand)]
         command: CompatCommand,
@@ -2403,15 +2406,22 @@ enum CompatCommand {
     /// bucket. The irreversible step is the first activation of a version some
     /// deployed binary cannot read, not the binary install.
     ///
-    /// REFUSES unless --pre-baseline-processes-terminated is given: ADR-4233
-    /// decision 4 rests the guarantee for pre-baseline (v0.33.x) processes on
-    /// terminating every one before the first activation above the baseline.
-    /// The flag attests that and is recorded in the family entry's
-    /// `activated_by`. RESIDUAL even with the flag: a pre-baseline maintain
-    /// process that outlives the rollout still deletes alert history and audit
-    /// objects by age with no version hold, and no fence and no late-write pass
-    /// detects that deletion, so terminating every pre-baseline process is the
-    /// only control over it.
+    /// REFUSES unless both attestations are given; each is recorded in the
+    /// family entry's `activated_by`.
+    ///
+    /// --pre-baseline-processes-terminated: ADR-4233 decision 4 rests the
+    /// guarantee for pre-baseline (v0.33.x) processes on terminating every one
+    /// before the first activation above the baseline. RESIDUAL even with the
+    /// flag: a pre-baseline maintain process that outlives the rollout still
+    /// deletes alert history and audit objects by age with no version hold,
+    /// and no fence and no late-write pass detects that deletion, so
+    /// terminating every pre-baseline process is the only control over it.
+    ///
+    /// --writer-roles-can-read-compat: every writer role can read `sys/compat`,
+    /// an IAM grant that must hold at every activation. RESIDUAL: the CLI
+    /// cannot check the grant, and a writer role not granted read on
+    /// `sys/compat` keeps writing the baseline version to unprovisioned paths
+    /// and to buckets it first touches after the activation.
     Activate {
         /// The family to activate: rseg, rlog, rspan, a catalog family, or a
         /// record family.
@@ -2424,6 +2434,13 @@ enum CompatCommand {
         /// (ADR-4233 decision 4). Required; recorded in `activated_by`.
         #[arg(long)]
         pre_baseline_processes_terminated: bool,
+        /// Attest that every writer role can read `sys/compat`, an IAM grant
+        /// that must hold at every activation. Required; recorded in
+        /// `activated_by`. Residual: a role not granted it keeps writing the
+        /// baseline version to unprovisioned paths and to buckets it first
+        /// touches after the activation.
+        #[arg(long)]
+        writer_roles_can_read_compat: bool,
         /// The operator identity recorded in `activated_by`.
         #[arg(long, default_value = "operator")]
         activated_by: String,
@@ -3840,6 +3857,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     family,
                     version,
                     pre_baseline_processes_terminated,
+                    writer_roles_can_read_compat,
                     activated_by,
                     alert_rule_tenant,
                     clock_skew_allowance,
@@ -3857,6 +3875,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                         family,
                         version,
                         pre_baseline_processes_terminated,
+                        writer_roles_can_read_compat,
                         activated_by,
                         alert_rule_tenants,
                         clock_skew_allowance_ns: clock_skew_allowance,
@@ -8485,6 +8504,83 @@ mod tests {
             ..seg
         };
         assert_eq!(super::catalog_list_json_line(&l0)["level"], "L0");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod compat_cli_tests {
+    use ravel_cli::compat::{EXIT_CONTRADICTED, EXIT_OK, EXIT_PENDING, EXIT_REFUSED};
+
+    use super::{Command, CompatCommand, parse_cli};
+
+    const ACTIVATE: [&str; 7] = [
+        "ravel-cli",
+        "compat",
+        "activate",
+        "--family",
+        "rseg",
+        "--version",
+        "8",
+    ];
+
+    fn activate_flags(extra: &[&str]) -> (bool, bool) {
+        let cli = parse_cli(ACTIVATE.iter().chain(extra)).expect("parses");
+        let Command::Compat {
+            command:
+                CompatCommand::Activate {
+                    pre_baseline_processes_terminated,
+                    writer_roles_can_read_compat,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected compat activate");
+        };
+        (
+            pre_baseline_processes_terminated,
+            writer_roles_can_read_compat,
+        )
+    }
+
+    /// Each attestation is its own flag: one does not set the other.
+    #[test]
+    fn activate_takes_each_attestation_from_its_own_flag() {
+        assert_eq!(activate_flags(&[]), (false, false));
+        assert_eq!(
+            activate_flags(&["--pre-baseline-processes-terminated"]),
+            (true, false)
+        );
+        assert_eq!(
+            activate_flags(&["--writer-roles-can-read-compat"]),
+            (false, true)
+        );
+        assert_eq!(
+            activate_flags(&[
+                "--pre-baseline-processes-terminated",
+                "--writer-roles-can-read-compat"
+            ]),
+            (true, true)
+        );
+    }
+
+    /// A mistyped flag exits with clap's usage code, which no compat outcome
+    /// uses, and the outcome codes keep their numbers.
+    #[test]
+    fn a_usage_error_exit_code_is_not_a_compat_outcome() {
+        let err = parse_cli(ACTIVATE.iter().chain(&["--no-such-flag"]))
+            .err()
+            .expect("a usage error");
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(
+            [EXIT_OK, EXIT_CONTRADICTED, EXIT_PENDING, EXIT_REFUSED],
+            [0, 3, 4, 5]
+        );
+        assert!(
+            ![EXIT_OK, EXIT_CONTRADICTED, EXIT_PENDING, EXIT_REFUSED, 1].contains(&err.exit_code()),
+            "clap's usage exit {} collides with a compat exit code",
+            err.exit_code()
+        );
     }
 }
 

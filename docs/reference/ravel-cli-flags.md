@@ -321,7 +321,7 @@ Re-verify the content-addressed chain for a tenant at rest (both signals): every
 
 ## compat
 
-Operate the retained-data compatibility contract `sys/compat` (ADR-4233): adopt a store at the baseline, activate a version, certify a reader retirement, and report the contract state. Every subcommand signs and verifies `sys/compat` under the global `--tenant-hash-key-file` deployment key
+Operate the retained-data compatibility contract `sys/compat` (ADR-4233): adopt a store at the baseline, activate a version, certify a reader retirement, and report the contract state. Every subcommand signs and verifies `sys/compat` under the global `--tenant-hash-key-file` deployment key. Exit codes: 0 done, 1 an error (a store fault, an exhausted CAS retry, a malformed value), 2 a usage error from argument parsing, 3 contradicted, 4 resumable but unfinished, 5 refused by a precondition
 
 _No flags._
 
@@ -348,6 +348,8 @@ Activate a family's next write version (ADR-4233 decision 3), CASing the active 
 | `--family` |  |  | The family to activate: rseg, rlog, rspan, a catalog family, or a record family |
 | `--json` |  |  | Emit the report as JSON |
 | `--pre-baseline-processes-terminated` |  |  | Attest that every pre-baseline (v0.33.x) process is terminated (ADR-4233 decision 4). Required; recorded in `activated_by` |
+| `--version` |  |  | The version to activate, exactly one above the current active one |
+| `--writer-roles-can-read-compat` |  |  | Attest that every writer role can read `sys/compat`, an IAM grant that must hold at every activation. Required; recorded in `activated_by`. Residual: a role not granted it keeps writing the baseline version to unprovisioned paths and to buckets it first touches after the activation |
 
 ### compat certify
 
@@ -361,6 +363,7 @@ Certify a class-A family's reader retirement (ADR-4233 decision 7): after the ti
 | `--json` |  |  | Emit the report as JSON |
 | `--max-flush-lifetime` |  | `1h` | `max_flush_lifetime` for the G_pre bound, a humantime duration |
 | `--t-req` |  | `30s` | The store request timeout `T_req`, a humantime duration |
+| `--version` |  |  | The version to certify; every member must be at or above it |
 
 ### compat verify
 
