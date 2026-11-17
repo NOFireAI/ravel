@@ -1048,6 +1048,39 @@ mod tests {
         }
     }
 
+    /// A contradicted certificate is never finalization-pending, even with its
+    /// watermark at the certified time: certify starts a census on it rather
+    /// than finishing floor raises. A state that dropped the `contradicted`
+    /// term reports 1 on the gauge here.
+    #[test]
+    fn a_contradicted_certificate_is_not_finalization_pending() {
+        let entry = |contradicted| sysproto::CompatFamily {
+            family: FAMILY_RSEG.to_string(),
+            active_write_version: V_SEG,
+            certificate: Some(sysproto::Certificate {
+                version: V_SEG,
+                certified_unix_ns: NOW1,
+                ..Default::default()
+            }),
+            late_writes_verified_through_unix_ns: NOW1,
+            contradicted,
+            ..Default::default()
+        };
+        let state = |contradicted| CertificateState::of(&entry(contradicted)).expect("certified");
+
+        assert!(state(false).finalization_pending, "{:?}", state(false));
+        assert_eq!(
+            state(true),
+            CertificateState {
+                certificate_version: V_SEG,
+                certified_unix_ns: NOW1,
+                watermark_unix_ns: NOW1,
+                contradicted: true,
+                finalization_pending: false,
+            }
+        );
+    }
+
     /// The configuration's `Debug` never prints the MAC keys.
     #[test]
     fn the_config_debug_redacts_the_keys() {
