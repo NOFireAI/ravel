@@ -2328,6 +2328,7 @@ mod tests {
 
     use super::*;
     use crate::budget::{IngestByteBudget, IngestByteBudgetLimit};
+    use crate::generation::ScriptedRead;
 
     const BASE_NS: i64 = 1_700_000_000_000_000_000;
 
@@ -3795,6 +3796,80 @@ mod tests {
         assert_eq!(rig.own_commits().await, 0, "nothing is written");
         drop(rig.tx);
         rig.task.await.expect("actor ends");
+    }
+
+    /// A spent stale-view hold whose provisioning read never answers does not
+    /// stop the actor: twice its mailbox's capacity of `beta` writes is queued
+    /// without waiting, and `beta`'s buffer is published on its age trigger
+    /// while `acme`'s stays held (issue #4363).
+    ///
+    /// Guard: the actor only requesting the read outside a drain
+    /// (`StaleViewHold::advance`), never awaiting it. Awaiting the re-read on
+    /// the trigger that finds the hold spent, bounded by `max_flush_lifetime`
+    /// (the pre-fix `held_view_check`) or unbounded, parks the actor: the
+    /// 65th write finds the mailbox full and `beta` is never published.
+    #[tokio::test]
+    async fn a_hanging_read_on_a_spent_hold_does_not_stop_the_actor() {
+        let config = IngestConfig {
+            max_flush_lifetime: Duration::from_secs(60),
+            ..ticking_config()
+        };
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, config);
+        rig.scope.set_read(ScriptedRead::Hangs);
+        drop(rig.write(4_096).await);
+        assert!(
+            tick_until(&rig.clock, || rig
+                .metrics
+                .snapshot()
+                .stale_provisioning_flushes
+                == 1)
+            .await,
+            "the age trigger holds the flush"
+        );
+        rig.clock.advance_ns(STALE_BOUND_NS);
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rig.scope.reads(), 1, "the spent hold requested a read");
+
+        rig.scope
+            .set_tenant_verdict(TenantId::new("beta").hash(), ScanCheck::InScanSet);
+        for i in 0..2 * rig.tx.max_capacity() {
+            let sent = rig.tx.try_send(SpanShardMsg::Write {
+                arrival: false,
+                tenant: TenantId::new("beta"),
+                spans: HandBackRig::six_spans(),
+                ack: None,
+                charge: None,
+            });
+            assert!(sent.is_ok(), "write {i} found room");
+            rig.clock.advance_ns(1_000_000);
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+        drop(rig.write_tenant("beta", 8_192).await);
+        assert!(
+            tick_until(&rig.clock, || rig.budget.in_flight_bytes() == 4_096).await,
+            "beta is published; acme is held"
+        );
+        assert_eq!(rig.metrics.snapshot().abandoned_stale_provisioning, 0);
+        assert_eq!(rig.scope.reads(), 1, "the later triggers joined the read");
+
+        let HandBackRig {
+            tx, clock, task, ..
+        } = rig;
+        drop(tx);
+        for _ in 0..10 {
+            if task.is_finished() {
+                break;
+            }
+            clock.advance_ns(STALE_BOUND_NS);
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+            }
+        }
+        task.await.expect("actor ends");
     }
 
     /// The stale-view bound of [`stale_view_config`].
