@@ -4648,22 +4648,22 @@ impl Catalog {
         Ok(())
     }
 
-    /// Whether the rows of the token's L0 input, whose commit record is still
-    /// present, must not be added beside what `out` already holds
-    /// (docs/catalog-and-mvcc.md step 5):
+    /// Whether the token's L0 input, whose commit record is still present,
+    /// must stay out of `out` (docs/catalog-and-mvcc.md step 5). For logs,
+    /// spans and every other signal without query-time dedup it must when:
     ///
     /// - a compaction or rewrite record of the token's bucket, live or not,
     ///   names the input (a rewrite through its effective inputs) and `out`
-    ///   holds one of that record's output parts: the input's rows are served
-    ///   from there, and logs and spans have no query-time dedup;
-    /// - a live rewrite names the input: adding it would serve the rows the
-    ///   rewrite erased.
+    ///   holds one of that record's output parts, which serves the input's
+    ///   rows already;
+    /// - a live rewrite names the input, whose rows it erased.
     ///
     /// Either needs an output part of the bucket in `out` or a pending
-    /// erasure request (a live rewrite's `.dreq` outlives its inputs'
-    /// commit records), so without both the answer is `false` at no store
-    /// read. Otherwise the bucket is LISTed and its compaction (cached) and
-    /// rewrite records loaded, as the missing-record fallback does.
+    /// erasure request (a live rewrite's `.dreq` outlives its inputs' commit
+    /// records), so with neither the answer is `false` at no store read.
+    /// Otherwise the bucket is LISTed and its compaction (cached) and rewrite
+    /// records loaded, as the missing-record fallback does. Metrics dedup at
+    /// query time and always get `false`.
     async fn token_input_replaced(
         &self,
         tenant: &TenantHash,
@@ -4678,7 +4678,9 @@ impl Catalog {
                 && segment.shard == token.shard
                 && segment.ingest_hour_bucket == token.ingest_hour_bucket
         });
-        if !bucket_output_in_out && !erasure_pending {
+        // Metrics dedup on (series_id, ts) at query time, so the input beside
+        // its replacement is harmless there and the step stays as it was.
+        if signal == Signal::Metrics || (!bucket_output_in_out && !erasure_pending) {
             return Ok(false);
         }
         // A tombstoned bucket keeps the present-record answer.
