@@ -1,0 +1,40 @@
+# The GitHub routes for the Ravel dev target.
+# See docs/internal/dev-in-brig.md.
+#
+# git in the guest rewrites https://github.com/ and git@github.com: to the
+# github route, so git fetch and git push on origin work as they are.
+#
+# The github-api route's GraphQL rule limits gh to NOFireAI repositories and
+# makes REST read-only on that route (GET and HEAD). The token is a person's,
+# so the agent may reply to review threads and resolve them, and nothing
+# more. Left out:
+# - addComment: a comment would come from your account;
+# - addPullRequestReview: an approval from your token counts toward main's
+#   required review;
+# - createPullRequest, updatePullRequest, mergePullRequest: opening,
+#   closing, retargeting and merging a pull request stay on the host.
+#
+# gh sees the github-api route as an Enterprise host, so name the repository:
+#   gh pr view 123 -R github-api.brig.internal/NOFireAI/ravel
+apiVersion: brig.sh/v1alpha1
+kind: Policy
+metadata:
+  name: ravel-github
+  description: git over HTTPS to github.com and a read-mostly GitHub API, NOFireAI repositories only
+spec:
+  routes:
+    - name: github
+      preset: github-token
+      credential: { secretRef: { name: ravel-gh-token } }
+      request:
+        allow:
+          repos: ['NOFireAI/*']
+    - name: github-api
+      preset: github-api
+      credential: { secretRef: { name: ravel-gh-token } }
+      request:
+        allow:
+          graphql:
+            queries: [repository, rateLimit]
+            mutations: [addPullRequestReviewThreadReply, resolveReviewThread]
+            repos: ['NOFireAI/*']

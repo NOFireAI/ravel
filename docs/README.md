@@ -212,6 +212,8 @@ rule as every other page.
 
 - [internal/development.md](internal/development.md): the local iteration
   loop, the gate list, and how CI shares build work.
+- [internal/dev-in-brig.md](internal/dev-in-brig.md): Claude Code on Ravel
+  inside a Brig sandbox, with credentials kept on the host.
 - [internal/clickbench.md](internal/clickbench.md): running the public
   ClickBench workload against Ravel and reading its report.
 - [internal/clickbench-aws-runbook.md](internal/clickbench-aws-runbook.md):
