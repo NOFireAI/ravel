@@ -160,6 +160,19 @@ r2_sha = "e7325ae0f5d7b1864cbfe42a0a8723d245563f4f"
 maintain_interval_secs = 30
 wait_minutes = 20
 
+[repair]
+# Read only when run.states lists repair_arms: issue #4347's key-index repair
+# (catalog fold --rebuild-key-index) at several pair budgets (README.md
+# "repair_arms"). One arm per entry, in this order: each loads the base corpus
+# into its own tenant (server.tenant and the budget run together, so
+# invr8000000 and invr16000000), folds it with no key-index leaf, and repairs
+# it at --key-index-build-max-pairs set to the entry. Distinct positive whole
+# numbers; run.sh and evaluate.py refuse a run listing repair_arms with this
+# absent or empty. A run not listing repair_arms never reads it and runs the
+# same commands with or without it. #4347's launch appends "repair_arms" to
+# run.states (the default list above does not hold it).
+budgets = [8000000, 16000000]
+
 # Before each load, fold, leaf rebuild and compaction run.sh checks that the
 # run deadline (run.max_minutes) leaves this many minutes for it, and records
 # the state not-run otherwise, so evaluate and the upload always happen. The
@@ -171,6 +184,13 @@ default = 30
 # Each retired_hour step's tail load and retention fold; its two waits
 # (retired_hour.wait_minutes, then the next ingest hour) are bounded apart.
 retired_hour = 10
+# Each repair_arms arm, checked once before the arm starts, since part of an
+# arm measures nothing. From issue #4347's pre-registration: the arm's two
+# loads take about 6 minutes, the leaf-off folds about 25 minutes for the two
+# arms' tenants (13 for one), and the repair at most 620 s on logs at
+# 8,000,000 pairs and 300 s on spans: 6 + 13 + 10.3 + 5 = 34.3, rounded up to
+# 35. Two arms take 70 minutes of run.max_minutes.
+repair_arms = 35
 
 # Every price evaluate.py multiplies by, with the source it was read from.
 # A price without a source is reported missing.

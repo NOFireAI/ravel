@@ -422,6 +422,9 @@ load_config() {
   RH_R2="$(cfg retired_hour.r2_sha --default "")"
   RH_INTERVAL="$(cfg retired_hour.maintain_interval_secs --default 30)"
   RH_WAIT="$(cfg retired_hour.wait_minutes --default 20)"
+  # The repair_arms state's pair budgets, one arm each in this order (README
+  # "repair_arms"); read only when run.states lists repair_arms.
+  REPAIR_BUDGETS=""
   # The day_parts_N states listed, as "7 30"; DP7_OK is set once day_parts_7
   # built its tenant, which retired_hour runs on.
   DP_DAYS=""
@@ -510,6 +513,16 @@ EOF
         [[ "$RH_INTERVAL" =~ ^[1-9][0-9]*$ ]] || fail "run.toml retired_hour.maintain_interval_secs = $RH_INTERVAL: not a positive whole number"
         [[ "$RH_WAIT" =~ ^[1-9][0-9]*$ ]] || fail "run.toml retired_hour.wait_minutes = $RH_WAIT: not a positive whole number"
         rh_seen=1 ;;
+      repair_arms)
+        REPAIR_BUDGETS="$(cfg repair.budgets --default "")" || fail "run.toml repair.budgets"
+        [ -n "$REPAIR_BUDGETS" ] || fail "run.toml run.states lists repair_arms and repair.budgets is absent or empty"
+        local b seen=" "
+        for b in $REPAIR_BUDGETS; do
+          [[ "$b" =~ ^[1-9][0-9]*$ ]] || fail "run.toml repair.budgets: $b is not a positive whole number"
+          case "$seen" in *" $b "*) fail "run.toml repair.budgets: $b is listed twice, and each arm needs its own tenant" ;; esac
+          seen="$seen$b "
+          TENANTS="$TENANTS $(repair_tenant "$b")"
+        done ;;
       unfolded | folded_no_leaves | folded_leaves | mixed | advanced_leaves | compaction_in_flight | erasure_in_flight) ;;
       *) fail "run.toml run.states: unknown state $s" ;;
     esac
@@ -821,6 +834,14 @@ step_declare() {
       || fail_log "typed-attr-column set dp$n" "$WORK/declare.out"
     dp_tenants="${dp_tenants:+$dp_tenants }dp$n"
   done
+  # So does each repair_arms tenant: its repair then builds both fields.
+  local b repair_tenants=""
+  for b in $REPAIR_BUDGETS; do
+    run "${CLI[@]}" typed-attr-column set "$(repair_tenant "$b")" --from-mapping "$WORK/corpus/logs.mapping.toml" \
+      --key-index request_id --index-trace-id true --readers-rolled-out >>"$WORK/declare.out" 2>&1 \
+      || fail_log "typed-attr-column set $(repair_tenant "$b")" "$WORK/declare.out"
+    repair_tenants="${repair_tenants:+$repair_tenants }$(repair_tenant "$b")"
+  done
   local hits_show=""
   if [ "$HITS" = true ]; then
     run "${CLI[@]}" typed-attr-column set hits --from-mapping "$HITS_MAPPING" --key-index UserID \
@@ -831,7 +852,8 @@ step_declare() {
   fi
   stamp declare.json tenant="$TENANT" key_index=request_id index_trace_id:=true \
     from_mapping=logs.mapping.toml show="$( [ "$DRY_RUN" = 1 ] || cat "$WORK/declare-show.out")" \
-    hits_key_index="$([ "$HITS" = true ] && echo UserID)" hits_show="$hits_show" day_parts_tenants="$dp_tenants"
+    hits_key_index="$([ "$HITS" = true ] && echo UserID)" hits_show="$hits_show" day_parts_tenants="$dp_tenants" \
+    ${repair_tenants:+repair_tenants="$repair_tenants"}
 }
 
 # load_signal LABEL SIGNAL CORPUS_DIR TENANT [LOAD_FLAG...]: one measured
@@ -920,7 +942,8 @@ leaf_off_flag() {
     "$BIN" catalog fold --help >"$help" 2>&1 || code=$?
     [ "$code" = 0 ] || { failed_at "catalog fold --help" "$code" "$help"; return 1; }
   fi
-  local option='^ {0,6}(-[[:alnum:]], )?' lists="" spelling=opt-in
+  local option='^ {0,6}(-[[:alnum:]], )?' lists="" spelling=opt-in folds='"folded_no_leaves", "many_parts_N"'
+  [ -z "$REPAIR_BUDGETS" ] || folds="$folds, \"repair_arms_B\""
   LEAF_OFF=""
   if grep -Eq -e "${option}--key-index-leaves([ =]|\$)" "$help"; then lists='"--key-index-leaves"'; fi
   if grep -Eq -e "${option}--no-key-index-leaves([ =]|\$)" "$help"; then
@@ -931,15 +954,18 @@ leaf_off_flag() {
   LEAF_OFF_READ=1
   printf 'LEAF-OFF %s\n' "${LEAF_OFF:-<none>}"
   stamp fold_flags.json leaf_off="$LEAF_OFF" spelling="$spelling" lists:="[$lists]" \
-    command="ravel-cli catalog fold --help" folds:='["folded_no_leaves", "many_parts_N"]'
+    command="ravel-cli catalog fold --help" folds:="[$folds]"
 }
 
-# rebuild_leaves TRANSITION: attach key-index leaves to the parts already in
-# HEAD, per $TRIPLES entry. A --key-index-leaves fold right after a plain one
-# has no hour left to seal, so it re-encodes nothing and writes no leaf (its
-# report says no_op). Non-zero (failed_at set) at the first that failed.
+# rebuild_leaves TRANSITION [BUDGET]: attach key-index leaves to the parts
+# already in HEAD, per $TRIPLES entry, one ravel-cli process each; BUDGET,
+# when given, is the repair's --key-index-build-max-pairs. A
+# --key-index-leaves fold right after a plain one has no hour left to seal,
+# so it re-encodes nothing and writes no leaf (its report says no_op).
+# Non-zero (failed_at set) at the first that failed.
 rebuild_leaves() {
-  local transition="$1" triple tenant sig label code log m
+  local transition="$1" triple tenant sig label code log m budget=()
+  [ -z "${2:-}" ] || budget=(--key-index-build-max-pairs "$2")
   stop_server
   for triple in $TRIPLES; do
     IFS=: read -r tenant sig label <<<"$triple"
@@ -947,9 +973,10 @@ rebuild_leaves() {
     m="$WORK/fold-$transition-$label.measure.json"
     code=0
     run "$PY" "$LIB" measure --out "$m" --stdout "$log" -- "${CLI[@]}" catalog fold --tenant "$tenant" \
-      --shards "$SHARDS" --signal "$sig" --rebuild-key-index --json || code=$?
-    stamp folds.jsonl transition="$transition" tenant="$tenant" signal="$label" kind=rebuild-key-index \
-      exit:="$code" hour:="$(now_hour)" measure@="$m" report%="$log"
+      --shards "$SHARDS" --signal "$sig" --rebuild-key-index --json ${budget[@]+"${budget[@]}"} || code=$?
+    stamp folds.jsonl transition="$transition" tenant="$tenant" signal="$label" \
+      kind="rebuild-key-index${budget[*]+ ${budget[*]}}" exit:="$code" hour:="$(now_hour)" measure@="$m" \
+      report%="$log"
     [ "$code" = 0 ] || { failed_at "rebuild-key-index $transition/$label" "$code" "$log"; return 1; }
   done
 }
@@ -1305,6 +1332,67 @@ state_many_parts() {
   census "many_parts_$n"
   statements "many_parts_$n" --tenant "$t" --sub "many_parts_$n"
   TRIPLES="$saved"
+  return 0
+}
+
+# repair_tenant BUDGET: the repair_arms tenant of one arm, the run's tenant
+# and the arm's pair budget run together (inv and 8000000 give invr8000000).
+repair_tenant() { printf '%sr%s\n' "$TENANT" "$1"; }
+
+# repair_preconditions STATE BUDGET: per $TRIPLES entry,
+# stamps/STATE.LABEL.preconditions.json (inv.py repair-preconditions) from the
+# state's catalog stamp: each declared field's leaf refs, the parts lacking a
+# leaf of one and the largest such part's entries (E), beside the ravel-cli
+# path, its SHA-256 and the build SHA the repair runs on. Non-zero (failed_at
+# set) when one could not be written.
+repair_preconditions() {
+  local state="$1" triple tenant sig label fields log code
+  for triple in $TRIPLES; do
+    IFS=: read -r tenant sig label <<<"$triple"
+    fields=trace_id
+    [ "$sig" != logs ] || fields=request_id,trace_id
+    log="$WORK/preconditions-$state-$label.out"
+    code=0
+    printf 'STAMP stamps/%s.%s.preconditions.json\n' "$state" "$label"
+    run "$PY" "$LIB" repair-preconditions --catalog "$STAMPS/$state.$label.catalog.json" --fields "$fields" \
+      --budget "$2" --cli-bin "$BIN" --cli-sha256 "$(sha256 "$BIN")" \
+      --sha "${SHA:-$(git -C "$INV_DIR" rev-parse HEAD 2>/dev/null)}" \
+      --out "$STAMPS/$state.$label.preconditions.json" >"$log" 2>&1 || code=$?
+    [ "$code" = 0 ] || { failed_at "repair-preconditions $state/$label" "$code" "$log"; return 1; }
+  done
+}
+
+# state_repair_arms: issue #4347's key-index repair at each run.toml
+# repair.budgets pair budget, one arm per budget in that order. An arm loads
+# the base corpus into its own tenant (repair_tenant; a repair leaves its
+# tenant indexed, so no two arms share one), folds it on folded_no_leaves's
+# leaf-off path as transition repair_arms_B, stamps what the repair starts
+# from (census repair_arms_B, repair_preconditions), then repairs it in a
+# fresh ravel-cli process per signal at --key-index-build-max-pairs B as
+# transition leaf_rebuild_B. No statement runs. The deadline check covers a
+# whole arm, since a part of one measures nothing.
+state_repair_arms() {
+  local b t saved="$TRIPLES" est
+  # One arm's loads, leaf-off fold and repair (run.example.toml derives 35
+  # minutes from #4347's pre-registered figures).
+  est="$(estimate_s repair_arms)" || fail "run.toml step_estimate_minutes.repair_arms"
+  for b in $REPAIR_BUDGETS; do
+    t="$(repair_tenant "$b")"
+    fits repair_arms "arm $b (the load, fold and repair of tenant $t)" "$est" || return 0
+    stop_server
+    load_signal "repair_arms_$b" spans "$WORK/corpus" "$t" || return 1
+    load_signal "repair_arms_$b" logs "$WORK/corpus" "$t" || return 1
+    TRIPLES="$t:spans:spans $t:logs:logs"
+    leaf_off_flag || { TRIPLES="$saved"; return 1; }
+    fold "repair_arms_$b" ${LEAF_OFF:+"$LEAF_OFF"} || { TRIPLES="$saved"; return 1; }
+    transition "repair_arms_$b" "tenant $t: the base corpus, catalog fold --writers-stopped${LEAF_OFF:+ $LEAF_OFF}, no leaves"
+    census "repair_arms_$b"
+    repair_preconditions "repair_arms_$b" "$b" || { TRIPLES="$saved"; return 1; }
+    rebuild_leaves "leaf_rebuild_$b" "$b" || { TRIPLES="$saved"; return 1; }
+    transition "leaf_rebuild_$b" "tenant $t: catalog fold --rebuild-key-index --key-index-build-max-pairs $b"
+    TRIPLES="$saved"
+  done
+  transition repair_arms "arms at budgets $REPAIR_BUDGETS, each on its own tenant"
   return 0
 }
 
@@ -1766,6 +1854,7 @@ run_state() {
     many_parts_*) state_many_parts "${state#many_parts_}" ;;
     day_parts_7 | day_parts_30) state_day_parts "${state#day_parts_}" ;;
     retired_hour) state_retired_hour ;;
+    repair_arms) state_repair_arms ;;
     *) fail "unknown state $state" ;;
   esac || code=$?
   keep_state_log "$state"

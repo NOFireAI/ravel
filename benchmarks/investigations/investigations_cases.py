@@ -1277,8 +1277,9 @@ class Statements(unittest.TestCase):
         # Rows 2, 5, 15 and 18 time statements; row 16's slowdown is a timing
         # figure of a control run this harness does not perform. ADR-3939's A6,
         # W4, F1 and F2 time theirs against the same statements' prefold calls.
-        self.assertEqual(timed, ["adr3939_a6", "adr3939_f1", "adr3939_f2", "adr3939_w4", "row_02", "row_05",
-                                 "row_15", "row_16", "row_18"])
+        # Issue #4347's repair arms report each repair's peak RSS and wall.
+        self.assertEqual(timed, ["adr3939_a6", "adr3939_f1", "adr3939_f2", "adr3939_w4", "issue4347_repair",
+                                 "row_02", "row_05", "row_15", "row_16", "row_18"])
         r16 = next(r for r in rows if r["key"] == "row_16")
         self.assertEqual({f["statement"] for f in r16["figure"] if f["lane"] == "timing"}, {"control"})
         for r in rows:
@@ -1353,7 +1354,7 @@ class LocalSmoke(Workdir):
         want = {s: ("run", None) for s in SMOKE_STATES + ("fold_advance", "compaction_done")}
         want.update({s: ("not-run", "not in run.toml states")
                      for s in ("advanced_leaves", "many_parts_744", "many_parts_2160") + MULTI_DAY_STATES
-                     + MULTI_DAY_DERIVED})
+                     + MULTI_DAY_DERIVED + ("repair_arms",)})
         self.assertEqual(got, want)
 
     def test_in_1000_is_sent_and_refused_by_the_complexity_guard(self):
@@ -1394,7 +1395,10 @@ class LocalSmoke(Workdir):
             {"row": 12, "key": "row_12", "reason": "run.toml scales lacks [10, 100]"},
             {"row": 16, "key": "row_16", "reason": "run.toml hits = false, baseline = false"},
             {"row": 18, "key": "row_18", "reason": "run.toml states lacks ['advanced_leaves']"},
-        ] + adr3939_not_requested())
+        ] + adr3939_not_requested() + [
+            {"row": "R1", "key": "issue4347_repair", "reason": "run.toml states lacks ['repair_arms']",
+             "adr": "issue #4347"},
+        ])
         self.assertEqual(text.splitlines()[:3], [
             "selective investigations, lane local: fail",
             "not requested: row 5 (run.toml hits = false); row 6 (run.toml hits = false); row 9 figures "
@@ -1403,7 +1407,8 @@ class LocalSmoke(Workdir):
             "states lacks ['many_parts_2160']); row 12 (run.toml scales lacks [10, 100]); row 16 (run.toml "
             "hits = false, baseline = false); row 18 (run.toml states lacks ['advanced_leaves']); "
             + "; ".join(f"ADR-3939 row {row}" + (f" figures {', '.join(names)}" if names else "") + f" ({why})"
-                        for row, _, names, why in ADR3939_NOT_REQUESTED),
+                        for row, _, names, why in ADR3939_NOT_REQUESTED)
+            + "; issue #4347 row R1 (run.toml states lacks ['repair_arms'])",
             "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 29 figure(s), "
             "0 call(s)",
         ])
@@ -3463,6 +3468,7 @@ class Evaluate(Workdir):
                 (9, "run.toml states lacks ['many_parts_744']"), (10, "run.toml states lacks ['many_parts_2160']"), (12, "run.toml scales lacks [10, 100]"),
                 (16, "run.toml hits = false, baseline = false"), (18, "run.toml states lacks ['advanced_leaves']")]
         want += [(row, why) for row, _, _, why in ADR3939_NOT_REQUESTED]
+        want.append(("R1", "run.toml states lacks ['repair_arms']"))
         out = [] if got == want else [f"not_requested {got}"]
         if "not requested: row 5 (run.toml hits = false); row 6 " not in text:
             out.append("summary carries no not-requested line")
@@ -3480,7 +3486,7 @@ class Evaluate(Workdir):
         character."""
         tables, out = adr3939_tables(ADR3939)
         with open(bands, "rb") as f:
-            rows = [r for r in tomllib.load(f)["row"] if r.get("adr")]
+            rows = [r for r in tomllib.load(f)["row"] if r.get("adr") == "ADR-3939"]
         if [r["adr_row"] for r in rows] != list(tables):
             out.append(f"labels {[r['adr_row'] for r in rows]}, want {list(tables)}")
         for r in rows:
@@ -3510,7 +3516,7 @@ class Evaluate(Workdir):
                     else f"states ['{state}'] not run: {state}: not in run.toml states")
             if (f["status"], f["verdict"], f["reason"]) != ("not-run", "not-run", want):
                 out.append(f"{f['id']} {f['status']} {f['verdict']} {f['reason']}")
-        got = [r for r in res["not_requested"] if r.get("adr")]
+        got = [r for r in res["not_requested"] if r.get("adr") == "ADR-3939"]
         if got != adr3939_not_requested():
             out.append(f"not_requested {got}")
         stray = [line for line in res["incomplete"] if "adr3939_" in line or "day_parts" in line
@@ -4175,7 +4181,7 @@ class Evaluate(Workdir):
         """Each ADR-3939 row needs its multi-day state (F3 each half its own), and every statement it
         names lists that state in statements.toml."""
         with open(bands, "rb") as f:
-            rows = [r for r in tomllib.load(f)["row"] if r.get("adr")]
+            rows = [r for r in tomllib.load(f)["row"] if r.get("adr") == "ADR-3939"]
         with open(STATEMENTS, "rb") as f:
             st = {s["id"]: s for s in tomllib.load(f)["statement"]}
         out = []
@@ -4404,10 +4410,263 @@ class Evaluate(Workdir):
         self.assertIn("wrong_answer logs_erasure_victim/erasure_in_flight/cold try 0: rows 1 expected 0",
                       res["problems"])
 
+    # Issue #4347's repair_arms: arm a at 8,000,000 pairs, arm b at
+    # 16,000,000. Each repair's --json report is a fixture under
+    # fixtures/repair-arms/ (key_index_rebuild.rs's field names); its measure
+    # is (peak RSS bytes, wall s), inside the s3 lane's bands.
+    REPAIR_ARMS = os.path.join(HERE, "fixtures", "repair-arms")
+    REPAIR_BUDGETS = {"a": 8000000, "b": 16000000}
+    REPAIR_ENTRIES = {"logs": 60, "spans": 40}
+    REPAIR_MEASURES = {("a", "logs"): (1600000000, 610.0), ("b", "logs"): (1900000000, 350.0),
+                       ("a", "spans"): (1000000000, 250.0), ("b", "spans"): (1100000000, 200.0)}
+    REPAIR_CLI_SHA256 = "ab" * 32
+
+    def set_repair_arms(self, edit=None, twice=None, budgets="[8000000, 16000000]"):
+        """An s3-lane run with repair_arms listed and run.toml repair.budgets BUDGETS (None: no repair
+        section). Per arm and signal: the base load and the folded_no_leaves fold copied onto the arm's
+        tenant and transition repair_arms_B, a catalog stamp of one leafless part of E entries (logs 60,
+        spans 40), its preconditions stamp (inv.py repair-preconditions) and the repair's fold line (inv.py
+        stamp, the report extracted from the fixture printed after a line of log text). edit(arm, signal,
+        report) changes a report before it is stamped; twice=(arm, signal) stamps that repair twice."""
+        inv = os.path.join(BOX, "lib", "inv.py")
+        self.to_s3_lane()
+        toml = os.path.join(self.run_dir, "run.toml")
+        with open(toml) as f:
+            text = f.read()
+        text = text.replace('"many_parts_24"]', '"many_parts_24", "repair_arms"]')
+        with open(toml, "w") as f:
+            f.write(text + (f"\n[repair]\nbudgets = {budgets}\n" if budgets is not None else ""))
+        loads, folds = read_jsonl(self.stamp_path("loads.jsonl")), read_jsonl(self.stamp_path("folds.jsonl"))
+        census, transitions = read_jsonl(self.stamp_path("census.jsonl")), read_jsonl(self.stamp_path("transitions.jsonl"))
+        for arm, b in self.REPAIR_BUDGETS.items():
+            t, state = f"invr{b}", f"repair_arms_{b}"
+            for sig in ("spans", "logs"):
+                loads.append(dict(next(x for x in loads if (x["hour"], x["tenant"], x["signal"]) == ("base", "inv", sig)),
+                                  hour=state, tenant=t))
+                folds.append(dict(next(x for x in folds if (x["transition"], x["signal"]) == ("folded_no_leaves", sig)),
+                                  transition=state, tenant=t))
+            census.append(dict(next(x for x in census if x["state"] == "folded_no_leaves"), state=state))
+            transitions += [dict(transitions[-1], state=state, note=f"tenant {t}: leaf-off fold"),
+                            dict(transitions[-1], state=f"leaf_rebuild_{b}", note=f"tenant {t}: repair at {b}")]
+        transitions.append(dict(transitions[-1], state="repair_arms", note="arms"))
+        write_jsonl(self.stamp_path("loads.jsonl"), loads)
+        write_jsonl(self.stamp_path("folds.jsonl"), folds)
+        write_jsonl(self.stamp_path("census.jsonl"), census)
+        write_jsonl(self.stamp_path("transitions.jsonl"), transitions)
+        measure = next(x for x in folds if x["transition"] == "leaf_rebuild")["measure"]
+        for arm, b in self.REPAIR_BUDGETS.items():
+            t, state = f"invr{b}", f"repair_arms_{b}"
+            shutil.copy(self.stamp_path("folded_no_leaves.server.json"), self.stamp_path(f"{state}.server.json"))
+            for sig in ("spans", "logs"):
+                with open(self.stamp_path(f"folded_no_leaves.{sig}.catalog.json")) as f:
+                    doc = json.load(f)
+                doc.update(state=state, tenant=t, parts=[dict(doc["parts"][0], entry_count=self.REPAIR_ENTRIES[sig],
+                                                              leaves=[])])
+                catalog = self.stamp_path(f"{state}.{sig}.catalog.json")
+                with open(catalog, "w") as f:
+                    json.dump(doc, f)
+                subprocess.run([PY, inv, "repair-preconditions", "--catalog", catalog,
+                                "--fields", "request_id,trace_id" if sig == "logs" else "trace_id", "--budget", str(b),
+                                "--cli-bin", "/opt/inv/ravel/target/release/ravel-cli",
+                                "--cli-sha256", self.REPAIR_CLI_SHA256, "--sha", "c" * 40,
+                                "--out", self.stamp_path(f"{state}.{sig}.preconditions.json")], check=True)
+                with open(os.path.join(self.REPAIR_ARMS, f"{arm}-{sig}.json")) as f:
+                    report = json.load(f)
+                if edit:
+                    edit(arm, sig, report)
+                log, m = self.path(f"repair-{arm}-{sig}.out"), self.path(f"repair-{arm}-{sig}.measure.json")
+                with open(log, "w") as f:
+                    f.write(f"rebuilding the key index of {t}/{sig}\n" + json.dumps(report, indent=2) + "\n")
+                rss, wall = self.REPAIR_MEASURES[(arm, sig)]
+                with open(m, "w") as f:
+                    json.dump(dict(measure, peak_rss_bytes=rss, wall_s=wall), f)
+                for _ in range(2 if twice == (arm, sig) else 1):
+                    subprocess.run([PY, inv, "stamp", "--file", self.stamp_path("folds.jsonl"), "--append",
+                                    f"transition=leaf_rebuild_{b}", f"tenant={t}", f"signal={sig}",
+                                    f"kind=rebuild-key-index --key-index-build-max-pairs {b}", "exit:=0",
+                                    "hour:=498259", f"measure@={m}", f"report%={log}"], check=True)
+
+    def repair_row(self, res):
+        return {f["id"][len("issue4347_repair."):]: f for f in res["figures"] if f["id"].startswith("issue4347_repair.")}
+
+    def check_repair_arms_pass(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Both arms in band on the s3 lane: every figure passes, nested report keys
+        (passes_per_field.request_id, field_pairs.trace_id) and the measure stamp's peak RSS and wall read
+        through, and the cross-arm ratios are B's over A's."""
+        self.set_repair_arms()
+        _, res, _ = self.go(bands, evaluate_py)
+        got = self.repair_row(res)
+        out = [p for p in res["problems"] if "repair" in p or "invr" in p]
+        out += [f"{k} {f['value']} {f['verdict']} {f['reason']}" for k, f in got.items() if f["verdict"] != "pass"]
+        if len(got) != 74:
+            out.append(f"{len(got)} figures")
+        want = {"a_logs_passes_request_id": 26, "b_logs_passes_request_id": 13, "a_logs_passes_trace_id": 6,
+                "b_logs_passes_trace_id": 3, "a_logs_pairs_request_id": 100000000, "b_logs_pairs_trace_id": 20000000,
+                "a_logs_rss": 1600000000, "b_logs_wall": 350.0, "a_spans_wall": 250.0, "b_spans_rss": 1100000000,
+                "a_logs_entries": 60, "b_spans_entries": 40, "a_logs_leaf_refs": 0, "b_logs_budget": 16000000,
+                "b_logs_cli_sha256": self.REPAIR_CLI_SHA256, "logs_section_bytes_per_pass_ratio": 1.0,
+                "logs_leaf_bytes_ratio": round(1310000000 / 1300000000, 9)}
+        out += [f"{k} {got[k]['value']}, want {v}" for k, v in want.items() if got.get(k, {}).get("value") != v]
+        return out
+
+    def test_repair_arms_pass(self):
+        self.assertEqual(self.check_repair_arms_pass(), [])
+
+    def check_repair_arms_out_of_band(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Arm b's request_id at 15 passes, outside 13 or 14, is a miss the run fails on."""
+        def edit(arm, sig, report):
+            if (arm, sig) == ("b", "logs"):
+                report["passes_per_field"]["request_id"] = 15
+        self.set_repair_arms(edit)
+        code, res, _ = self.go(bands, evaluate_py)
+        f = self.repair_row(res)["b_logs_passes_request_id"]
+        out = [] if (f["value"], f["verdict"]) == (15, "miss") else [f"{f['value']} {f['verdict']}"]
+        if "miss issue4347_repair.b_logs_passes_request_id" not in res["problems"] or code != 1:
+            out.append(f"exit {code} problems {res['problems']}")
+        return out
+
+    def test_repair_arms_out_of_band(self):
+        self.assertEqual(self.check_repair_arms_out_of_band(), [])
+
+    def check_repair_arms_absent(self, evaluate_py=EVALUATE):
+        """A figure absent from the repair's report (arm a's passes_per_field without request_id, a
+        report without attempt_count) is missing, never 0, and the run fails."""
+        def edit(arm, sig, report):
+            if (arm, sig) == ("a", "logs"):
+                del report["passes_per_field"]["request_id"]
+                del report["attempt_count"]
+        self.set_repair_arms(edit)
+        code, res, _ = self.go(BANDS, evaluate_py)
+        got = self.repair_row(res)
+        out = [] if code == 1 else [f"exit {code}"]
+        for name, field in (("a_logs_passes_request_id", "passes_per_field.request_id"),
+                            ("a_logs_attempts", "attempt_count")):
+            want = ("missing", None, f"fold report leaf_rebuild_8000000/invr8000000/logs has no {field}")
+            if (got[name]["verdict"], got[name]["value"], got[name]["reason"]) != want:
+                out.append(f"{name} {got[name]['verdict']} {got[name]['value']} {got[name]['reason']}")
+            if not any(p.startswith(f"missing issue4347_repair.{name}") for p in res["problems"]):
+                out.append(f"no missing {name} in {res['problems']}")
+        return out
+
+    def test_repair_arms_absent(self):
+        self.assertEqual(self.check_repair_arms_absent(), [])
+
+    def check_repair_arms_twice(self, evaluate_py=EVALUATE):
+        """Arm b's spans repair stamped twice: each of its fold figures is duplicate, not either line's
+        value, and the run fails."""
+        self.set_repair_arms(twice=("b", "spans"))
+        code, res, _ = self.go(BANDS, evaluate_py)
+        got = self.repair_row(res)
+        out = [] if code == 1 else [f"exit {code}"]
+        if "duplicate stamps/folds.jsonl leaf_rebuild_16000000/invr16000000/spans" not in res["problems"]:
+            out.append(f"problems {res['problems']}")
+        for name in ("b_spans_passes", "b_spans_section_bytes", "b_spans_wall"):
+            if (got[name]["verdict"], got[name]["value"]) != ("duplicate", None):
+                out.append(f"{name} {got[name]['verdict']} {got[name]['value']}")
+            if not any(p.startswith(f"duplicate issue4347_repair.{name}") for p in res["problems"]):
+                out.append(f"no duplicate {name} in {res['problems']}")
+        if got["a_spans_passes"]["verdict"] != "pass":
+            out.append(f"a_spans_passes {got['a_spans_passes']['verdict']}")
+        return out
+
+    def test_repair_arms_twice(self):
+        self.assertEqual(self.check_repair_arms_twice(), [])
+
+    def check_repair_arms_cross_arm(self, evaluate_py=EVALUATE, bands=BANDS):
+        """The cross-arm figures at their edges: B's section bytes per pass 1.5% over A's (each arm in its
+        own 10% band) and B's leaf bytes 3% over A's (each in 1.2 to 1.4 GB) both miss; 0.5% and 1.5% pass."""
+        out = []
+        for i, (sec, leaf, verdicts) in enumerate(((1.005, 1.015, ("pass", "pass")), (1.015, 1.03, ("miss", "miss")))):
+            def edit(arm, sig, report, sec=sec, leaf=leaf):
+                if (arm, sig) == ("b", "logs"):
+                    report["section_phase_bytes_read"] = round(1700000000 * sec)
+                    report["leaf_bytes_written"] = round(1300000000 * leaf)
+            if i:
+                self.tearDown()
+                self.setUp()
+            self.set_repair_arms(edit)
+            _, res, _ = self.go(bands, evaluate_py)
+            got = self.repair_row(res)
+            for name, verdict in zip(("logs_section_bytes_per_pass_ratio", "logs_leaf_bytes_ratio"), verdicts):
+                if got[name]["verdict"] != verdict:
+                    out.append(f"{sec} {leaf}: {name} {got[name]['value']} {got[name]['verdict']}, want {verdict}")
+            for name in ("b_logs_section_bytes", "b_logs_leaf_bytes", "a_logs_section_bytes", "a_logs_leaf_bytes"):
+                if got[name]["verdict"] != "pass":
+                    out.append(f"{sec} {leaf}: {name} {got[name]['value']} {got[name]['verdict']}")
+        return out
+
+    def test_repair_arms_cross_arm(self):
+        self.assertEqual(self.check_repair_arms_cross_arm(), [])
+
+    def test_repair_arms_timing_judged_on_s3_only(self):
+        self.set_repair_arms()
+        _, res, _ = self.go(BANDS)
+        self.assertEqual(self.repair_row(res)["a_logs_wall"]["verdict"], "pass")
+        toml = os.path.join(self.run_dir, "run.toml")
+        with open(toml) as f:
+            text = f.read()
+        with open(toml, "w") as f:
+            f.write(text.replace('lane = "s3"', 'lane = "local"'))
+        _, res, _ = self.go(BANDS)
+        for name in ("a_logs_wall", "b_spans_rss"):
+            self.assertEqual(self.repair_row(res)[name]["verdict"], "reported (timing is judged on the s3 lane only)")
+
+    def test_repair_arms_slow_arm_misses(self):
+        self.REPAIR_MEASURES = dict(self.REPAIR_MEASURES)
+        self.REPAIR_MEASURES[("a", "logs")] = (2100000000, 701.0)
+        self.set_repair_arms()
+        code, res, _ = self.go(BANDS)
+        got = self.repair_row(res)
+        self.assertEqual(code, 1)
+        self.assertEqual([(got[n]["value"], got[n]["verdict"]) for n in ("a_logs_rss", "a_logs_wall")],
+                         [(2100000000, "miss"), (701.0, "miss")])
+
+    def test_repair_arms_budgets_required(self):
+        """repair_arms listed with no or an empty repair.budgets is a problem, and no arm's stamp is asked
+        for."""
+        for i, budgets in enumerate((None, "[]", "[8000000, 8000000]")):
+            with self.subTest(budgets=budgets):
+                if i:
+                    self.tearDown()
+                    self.setUp()
+                self.set_repair_arms(budgets=budgets)
+                code, res, _ = self.go(BANDS)
+                self.assertEqual(code, 1)
+                self.assertIn("missing run.toml repair.budgets (distinct positive pair budgets, one per repair_arms "
+                              "arm)", res["problems"])
+                self.assertEqual([p for p in res["problems"] if "invr" in p or "repair_arms_" in p], [])
+
+    def test_repair_arms_not_listed(self):
+        """Without repair_arms in run.toml states the row is not requested and no arm's stamp is asked for."""
+        _, res, _ = self.go(BANDS)
+        self.assertEqual({f["verdict"] for f in self.repair_row(res).values()}, {"not-run"})
+        self.assertIn("issue4347_repair", [r["key"] for r in res["not_requested"]])
+        self.assertEqual([p for p in res["problems"] if "repair" in p], [])
+
 
 # --- wrong evaluators the cases rule out --------------------------------------------
 
 FLIPS = {
+    "an absent nested report key read as 0": (
+        "        return report[head].get(key)\n",
+        "        return report[head].get(key, 0)\n",
+        "check_repair_arms_absent",
+    ),
+    "an absent report field read as 0": (
+        '        return "missing", None, f"fold report {transition}/{tenant}/{label} has no {field}"\n',
+        '        return "value", 0, ""\n',
+        "check_repair_arms_absent",
+    ),
+    "a fold stamped twice read as 0": (
+        '        return "duplicate", None, f"two fold stamps for {transition}/{tenant}/{label}"\n',
+        '        return "value", 0, ""\n',
+        "check_repair_arms_twice",
+    ),
+    "the measure stamp's wall read from the report": (
+        '    if field in ("peak_rss_bytes", "wall_s"):\n',
+        '    if False:\n',
+        "check_repair_arms_pass",
+    ),
     "missing treated as pass": (
         '        if entry["status"] != "value":\n            entry["verdict"] = entry["status"]\n',
         '        if entry["status"] != "value":\n'
@@ -4830,8 +5089,8 @@ FLIPS = {
         "check_server_died_everywhere",
     ),
     "ADR-3939's multi-day states not registered": (
-        "set(DERIVED) | set(MULTI_DAY_STATES) | set(cfg[\"states\"])",
-        "set(DERIVED) | set(cfg[\"states\"])",
+        "set(DERIVED) | set(MULTI_DAY_STATES) | {REPAIR_STATE}",
+        "set(DERIVED) | {REPAIR_STATE}",
         "check_multi_day_rows_report_not_run_without_their_state",
     ),
     "a figure's not_run_unless never consulted, so S under 3 is judged": (
@@ -4959,6 +5218,21 @@ DP7_R2_GATE = ("not_run_unless = \"m['adr3939_{0}.fold_binary_carries_r2'] == 1\
                "and the run stamps that binary's SHA\"\ngate_not_requested = true\n")
 A3_GATE, A4_GATE = DP7_R2_GATE.format("a3", "A3"), DP7_R2_GATE.format("a4", "A4")
 BAND_FLIPS = {
+    "issue #4347's per-pass section bytes compared at 2%, not 1%": (
+        'target_if = "0.99 <= v <= 1.01"\n',
+        'target_if = "0.98 <= v <= 1.02"\n',
+        "check_repair_arms_cross_arm",
+    ),
+    "issue #4347's leaf bytes compared at 5%, not 2%": (
+        'target_if = "0.98 <= v <= 1.02"\n',
+        'target_if = "0.95 <= v <= 1.05"\n',
+        "check_repair_arms_cross_arm",
+    ),
+    "issue #4347's arm B request_id passes allowed 15": (
+        'target_if = "v in (13, 14)"\nmiss_if = "v not in (13, 14)"\n',
+        'target_if = "v in (13, 14, 15)"\nmiss_if = "v not in (13, 14, 15)"\n',
+        "check_repair_arms_out_of_band",
+    ),
     "row 7's logs section GETs missed against 2 x tail entries, not per pass": (
         "miss_if = \"v >= 2 * m['row_07.logs_tail_entries'] * m['row_07.logs_build_passes']\"\n",
         "miss_if = \"v >= 2 * m['row_07.logs_tail_entries']\"\n",
@@ -7477,6 +7751,208 @@ echo "STATE-RC=$rc"
         # the state with the stderr log.
         self.assertIn('    1) not_run "many_parts_$n" "$why"; return 0 ;;\n'
                       '    *) failed_at "stride-check many_parts_$n" "$code" "$stride_log"; return 1 ;;\n', run_sh)
+
+    # --- issue #4347's repair_arms state (#4349) -----------------------------
+
+    EXAMPLE_BUDGETS = "budgets = [8000000, 16000000]\n"
+
+    def repair_toml(self, budgets=EXAMPLE_BUDGETS, listed=True, lane="s3", name="run-repair.toml"):
+        """run.example.toml with its [repair] budgets line replaced by BUDGETS
+        ("" drops it) and, when LISTED, repair_arms in run.states after
+        erasure_in_flight in place of the many_parts states."""
+        with open(os.path.join(BOX, "run.example.toml")) as f:
+            text = f.read()
+        swaps = [(self.EXAMPLE_BUDGETS, budgets), ('lane = "s3"', f'lane = "{lane}"')]
+        if listed:
+            swaps.append(('"erasure_in_flight", "many_parts_744", "many_parts_2160"]',
+                          '"erasure_in_flight", "repair_arms"]'))
+        for old, new in swaps:
+            self.assertEqual(text.count(old), 1, old)
+            text = text.replace(old, new)
+        p = self.path(name)
+        with open(p, "w") as f:
+            f.write(text)
+        return p
+
+    def repair_dry_run(self, script, toml):
+        out = self.path("out-repair")
+        shutil.rmtree(out, ignore_errors=True)
+        p = subprocess.run([BASH, script, "--dry-run", "--lane", "s3", "--run-toml", toml, "--out", out],
+                           capture_output=True, text=True)
+        return p.returncode, (p.stdout + p.stderr).replace(out, "OUT").replace(os.path.dirname(script), "BOX")
+
+    def check_repair_budgets_unread(self, script):
+        """A run not listing repair_arms: the same dry run with [repair]
+        budgets as in run.example.toml, absent, or empty, and every repair
+        command line as before the budget existed."""
+        texts = {}
+        for name, budgets in (("example", self.EXAMPLE_BUDGETS), ("absent", ""), ("empty", "budgets = []\n")):
+            code, texts[name] = self.repair_dry_run(script, self.repair_toml(budgets, listed=False))
+            if code:
+                return [f"{name}: dry run exit {code}"]
+        out = [f"{name}: plan differs from the example's" for name in ("absent", "empty")
+               if texts[name] != texts["example"]]
+        text = texts["example"]
+        rebuilds = [x for x in text.splitlines() if "--rebuild-key-index" in x]
+        if len(rebuilds) != 4:
+            out.append(f"{len(rebuilds)} rebuild-key-index lines, want 4 (folded_leaves 2, many_parts 2)")
+        out += [f"rebuild line changed: {x}" for x in rebuilds if not x.endswith(" --rebuild-key-index --json")]
+        for frag in ("--key-index-build-max-pairs", "invr", "repair_arms", "repair-preconditions"):
+            if frag in text:
+                out.append(f"{frag!r} in a plan not listing repair_arms")
+        return out
+
+    def test_repair_budgets_unread_without_repair_arms(self):
+        # [repair] budgets absent or empty keeps today's run exactly: the plan
+        # is the same with either, and with run.example.toml's budgets, as
+        # long as run.states does not list repair_arms.
+        self.assertEqual(self.check_repair_budgets_unread(os.path.join(BOX, "run.sh")), [])
+        self.flip_check('  [ -z "${2:-}" ] || budget=(--key-index-build-max-pairs "$2")\n',
+                        '  budget=(--key-index-build-max-pairs "${2:-8000000}")\n', "run.sh",
+                        self.check_repair_budgets_unread, "every leaf rebuild given a pair budget",
+                        "test_repair_budgets_unread_without_repair_arms")
+
+    REPAIR_ARM_PLAN = (
+        "load-repair_arms_{b}-spans", "--tenant invr{b} --mapping OUT/work/corpus/spans.mapping.toml",
+        "load-repair_arms_{b}-logs", "--tenant invr{b} --mapping OUT/work/corpus/logs.mapping.toml",
+        "catalog fold --tenant invr{b} --shards 8 --signal spans --writers-stopped --json\n",
+        "catalog fold --tenant invr{b} --shards 8 --signal logs --writers-stopped --json\n",
+        "STAMP stamps/transitions.jsonl", "listing-repair_arms_{b}.json", "STAMP stamps/census.jsonl",
+        "--tenant invr{b} --signal spans --label spans --state repair_arms_{b} ",
+        "--tenant invr{b} --signal logs --label logs --state repair_arms_{b} ",
+        "STAMP stamps/repair_arms_{b}.server.json",
+        "STAMP stamps/repair_arms_{b}.spans.preconditions.json",
+        "--catalog OUT/stamps/repair_arms_{b}.spans.catalog.json --fields trace_id --budget {b} ",
+        "STAMP stamps/repair_arms_{b}.logs.preconditions.json",
+        "--catalog OUT/stamps/repair_arms_{b}.logs.catalog.json --fields request_id\\,trace_id --budget {b} ",
+        "fold-leaf_rebuild_{b}-spans.measure.json",
+        "catalog fold --tenant invr{b} --shards 8 --signal spans --rebuild-key-index --json "
+        "--key-index-build-max-pairs {b}\n",
+        "STAMP stamps/folds.jsonl",
+        "catalog fold --tenant invr{b} --shards 8 --signal logs --rebuild-key-index --json "
+        "--key-index-build-max-pairs {b}\n",
+        "STAMP stamps/folds.jsonl", "STAMP stamps/transitions.jsonl")
+
+    def check_repair_arms_plan(self, script):
+        """The s3 dry run listing repair_arms at run.example.toml's budgets:
+        both arms in budget order, each on its own tenant, the budget only on
+        its own repair's command line."""
+        code, text = self.repair_dry_run(script, self.repair_toml())
+        if code:
+            return [f"dry run exit {code}: {text[-300:]}"]
+        out = []
+        states = [s for s in self.steps(text) if s.startswith("state:")]
+        if states[-2:] != ["state:erasure_in_flight", "state:repair_arms"]:
+            out.append(f"states {states}")
+        if "NOT-RUN" in text or "STATE-FAILED" in text:
+            out.append("a state not run or failed in the dry run")
+        j, at = "\n".join(self.blocks(text).get("state:repair_arms", [])) + "\n", 0
+        for b in (8000000, 16000000):
+            for frag in self.REPAIR_ARM_PLAN:
+                i = j.find(frag.format(b=b), at)
+                if i < 0:
+                    out.append(f"arm {b}: {frag.format(b=b)!r} missing after offset {at}")
+                    break
+                at = i + len(frag.format(b=b))
+        if "STAMP stamps/transitions.jsonl" not in j[at:]:
+            out.append("no repair_arms transition after the arms")
+        flagged = [x for x in text.splitlines() if "--key-index-build-max-pairs" in x]
+        if len(flagged) != 4 or any("fold-leaf_rebuild_" not in x for x in flagged):
+            out.append(f"{len(flagged)} lines carry a pair budget, want the 4 repairs: {flagged}")
+        other = [x for x in j.splitlines() if re.search(r"--tenant (?!invr(8|16)000000 )", x)]
+        if other:
+            out.append(f"a repair_arms command off the arms' tenants: {other[0][-200:]}")
+        declare = "\n".join(self.blocks(text).get("declare", []))
+        for b in (8000000, 16000000):
+            if f"typed-attr-column set invr{b} --from-mapping" not in declare:
+                out.append(f"invr{b} not declared")
+        return out
+
+    def test_repair_arms_dry_run_plan(self):
+        # Each arm loads the base corpus into its own tenant, folds it on the
+        # leaf-off path, stamps census and preconditions, then repairs it in
+        # one ravel-cli process per signal at its budget, and only there.
+        self.assertEqual(self.check_repair_arms_plan(os.path.join(BOX, "run.sh")), [])
+        for old, new, label in (
+                ('    rebuild_leaves "leaf_rebuild_$b" "$b" ||', '    rebuild_leaves "leaf_rebuild_$b" ||',
+                 "the repair run at the default budget"),
+                ('    t="$(repair_tenant "$b")"\n', '    t="$TENANT"\n', "both arms on the run's tenant"),
+                ('    TRIPLES="$t:spans:spans $t:logs:logs"\n', "", "the arm's fold and repair on the base tenant"),
+                ('    repair_preconditions "repair_arms_$b" "$b" || { TRIPLES="$saved"; return 1; }\n'
+                 '    rebuild_leaves "leaf_rebuild_$b" "$b" || { TRIPLES="$saved"; return 1; }\n',
+                 '    rebuild_leaves "leaf_rebuild_$b" "$b" || { TRIPLES="$saved"; return 1; }\n'
+                 '    repair_preconditions "repair_arms_$b" "$b" || { TRIPLES="$saved"; return 1; }\n',
+                 "the preconditions stamped after the repair"),
+                ('    fold "repair_arms_$b" ${LEAF_OFF:+"$LEAF_OFF"}', '    fold "repair_arms_$b" --key-index-leaves',
+                 "the arm folded with leaves")):
+            self.flip_check(old, new, "run.sh", self.check_repair_arms_plan, label, "test_repair_arms_dry_run_plan")
+
+    def test_repair_budgets_refused_by_load_config(self):
+        # A run listing repair_arms needs distinct positive budgets; each
+        # refusal ends the run before any step and names the key.
+        cases = (("ok", self.EXAMPLE_BUDGETS, None),
+                 ("absent", "", "run.toml run.states lists repair_arms and repair.budgets is absent or empty"),
+                 ("empty", "budgets = []\n",
+                  "run.toml run.states lists repair_arms and repair.budgets is absent or empty"),
+                 ("twice", "budgets = [8000000, 8000000]\n",
+                  "run.toml repair.budgets: 8000000 is listed twice, and each arm needs its own tenant"),
+                 ("zero", "budgets = [0]\n", "run.toml repair.budgets: 0 is not a positive whole number"),
+                 ("text", 'budgets = ["8e6"]\n', "run.toml repair.budgets: 8e6 is not a positive whole number"))
+        for name, budgets, refusal in cases:
+            code, text = self.sourced_load_config(self.repair_toml(budgets, lane="local", name=f"repair-{name}.toml"))
+            if refusal is None:
+                self.assertEqual(code, 0, text)
+            else:
+                self.assertNotEqual(code, 0, name)
+                self.assertIn(refusal, text, name)
+
+    @staticmethod
+    def check_repair_preconditions(inv_path):
+        inv = load_module(inv_path, "inv_repair_preconditions")
+        out = []
+        both = [{"field": "request_id"}, {"field": "trace_id"}]
+        catalog = {"parts": [{"entry_count": 60, "leaves": []}, {"entry_count": 90, "leaves": both},
+                             {"entry_count": 70, "leaves": [{"field": "trace_id"}]}]}
+        got = inv.repair_preconditions(catalog, ["request_id", "trace_id"])
+        want = {"fields": ["request_id", "trace_id"], "leaf_refs": {"request_id": 1, "trace_id": 2},
+                "declared_leaf_refs": 3, "parts": 3, "parts_unindexed": 2, "largest_unindexed_part_entries": 70}
+        if got != want:
+            out.append(f"logs: {got}")
+        got = inv.repair_preconditions(catalog, ["trace_id"])
+        if (got["parts_unindexed"], got["largest_unindexed_part_entries"]) != (1, 60):
+            out.append(f"spans: {got}")
+        catalog["parts"][2]["entry_count"] = None
+        try:
+            got = inv.repair_preconditions(catalog, ["request_id", "trace_id"])
+            if got["largest_unindexed_part_entries"] is not None:
+                out.append(f"an unindexed part without an entry count: E {got['largest_unindexed_part_entries']}")
+        except TypeError as e:
+            out.append(f"an unindexed part without an entry count: {e!r}")
+        try:
+            inv.repair_preconditions({"state": "x"}, ["trace_id"])
+            out.append("a catalog stamp listing no parts accepted")
+        except ValueError:
+            pass
+        return out
+
+    def test_repair_preconditions(self):
+        # E is the largest entry count over the parts lacking a leaf of any
+        # declared field, a part carrying one field's leaf among them.
+        inv_py = os.path.join(BOX, "lib", "inv.py")
+        self.assertEqual(self.check_repair_preconditions(inv_py), [])
+        p = subprocess.run([PY, inv_py, "repair-preconditions", "--catalog", self.path("absent.json"), "--fields",
+                            "trace_id", "--budget", "8000000", "--cli-bin", "x", "--cli-sha256", "y", "--sha", "z",
+                            "--out", self.path("pre.json")], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertFalse(os.path.exists(self.path("pre.json")))
+        for old, new, label in (
+                ("    unindexed = [p for p in parts if not set(fields) <= {",
+                 "    unindexed = [p for p in parts if not set(fields) & {",
+                 "a part with one declared field's leaf taken as indexed"),
+                ("    exact = all(isinstance(c, int) and not isinstance(c, bool) for c in counts)\n",
+                 "    exact = True\n", "a part without an entry count left out of E")):
+            self.flip_check(old, new, "lib/inv.py", self.check_repair_preconditions, label,
+                            "test_repair_preconditions")
 
     def local_smoke_toml_with(self, extra_lines, suffix="run"):
         """A copy of run.local-smoke.toml with EXTRA_LINES appended to its

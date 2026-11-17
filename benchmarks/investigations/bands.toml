@@ -15,9 +15,10 @@
 #               for a whole-run figure; "control" for row 16's paired run
 #   state       the state the figure is measured in (for a fold figure, the
 #               transition whose report it reads, unless transition says)
-#   transition  optional, fold figures only: the fold stamp to read when it is
-#               not the state's own ("leaf_rebuild", the folded_leaves
-#               state's --rebuild-key-index step)
+#   transition  optional, fold and stamp figures: the fold stamp to read when
+#               it is not the state's own ("leaf_rebuild", the folded_leaves
+#               state's --rebuild-key-index step), or the stamps' STATE
+#               ("repair_arms_8000000", a repair_arms arm's)
 #   metric      what evaluate.py extracts (README.md "Evaluation"):
 #                 <temp>.max|min.<name>       a statement's call counters
 #                 (temp cold or warm, or prefold: the cold calls a
@@ -44,7 +45,14 @@
 #                                             label's census data bytes, in %
 #                 census.<tenant>.<signal>.objects|bytes|objects_over_512k
 #                 truth.<path>                an integer truth.json holds
-#                 fold.<tenant>.<label>.<field>
+#                 stamp.preconditions.<label>.<field>  a repair_arms arm's
+#                                             preconditions stamp field
+#                 fold.<tenant>.<label>.<field>  a fold report field; a
+#                                             dotted field is a key of the
+#                                             report's map
+#                                             (passes_per_field.request_id);
+#                                             peak_rss_bytes and wall_s are
+#                                             the fold stamp's measure
 #                 derived (with expr, over m: the run's figures)
 #   expr        derived figures only: a Python expression over m
 #   lane        "counter": judged on every lane; "timing": judged on the s3
@@ -3308,3 +3316,770 @@ not_run_reason = "the harness-state amendment needs S of at least 3 slices per d
 target_if = "v == 0"
 miss_if = "v > 0"
 miss_reason = "a SlowDown: re-derive before deciding"
+
+# Issue #4347's key-index repair at two pair budgets, pre-registered in
+# issue #4347 comment 6931731499: one launch, one binary, arm A at
+# --key-index-build-max-pairs 8000000 and arm B at 16000000, each on its own
+# leafless tenant loaded from the same corpus (box/run.sh state_repair_arms;
+# run.toml repair.budgets = [8000000, 16000000], so the tenants are
+# invr8000000 and invr16000000). Each arm's figures read the repair's --json
+# report and measure stamp (transition leaf_rebuild_B) and the preconditions
+# stamp written before it (transition repair_arms_B, metric
+# stamp.preconditions). E is the stamp's largest_unindexed_part_entries and P
+# the arm's passes on that signal. Sizes are decimal: 1 GB = 1e9 bytes,
+# 1 MB = 1e6, 1 KB = 1e3, so 2.19 MB per section read is 2,190,000 bytes and
+# 212 KB is 212,000. A figure absent from the report, or whose fold stamp is
+# present twice, is missing or duplicate, and the run fails.
+
+[[row]]
+key = "issue4347_repair"
+adr = "issue #4347"
+adr_row = "R1"
+check = "key-index repair of a leafless tenant, logs and spans, at pair budgets 8,000,000 (arm A) and 16,000,000 (arm B), one binary, each arm on its own tenant loaded from the same corpus"
+target = "logs: request_id passes A 25 or 26, B 13 or 14; trace_id passes A 5 or 6, B 3; sections read and footer and section phase ranged GETs each E x P; footer bytes within 1% of 8192 x E x P; section bytes within 10% of P x E x 2.19 MB, per pass within 1% between arms; field pairs request_id 100,000,000 and trace_id 20,000,000; leaves written at least the sum of passes per field and at most 2 more; leaf bytes 1.2 to 1.4 GB, arms within 2%; peak RSS at most 2.0 GB; wall at most 700 s; no uncovered entry or deferred part; one attempt, one part rebuilt. spans: passes A 3, B 2; footer and section phase GETs each E x P; section bytes within 10% of P x E x 212 KB; leaf bytes at most 0.25 GB; peak RSS at most 2.0 GB; wall at most 300 s"
+miss = "any figure outside its band; a figure absent from the report or present twice"
+source = "issue #4347 comment 6931731499 (pre-registration)"
+requires_states = ["repair_arms"]
+
+# What each arm starts from: zero leaf refs for the declared fields, at
+# least one unindexed part, E, and the binary's SHA-256 (one binary: B's
+# equals A's).
+
+[[row.figure]]
+name = "a_logs_entries"
+statement = "stamp"
+state = "repair_arms"
+transition = "repair_arms_8000000"
+metric = "stamp.preconditions.logs.largest_unindexed_part_entries"
+lane = "counter"
+target_if = "isinstance(v, int) and v >= 1"
+
+[[row.figure]]
+name = "a_logs_leaf_refs"
+statement = "stamp"
+state = "repair_arms"
+transition = "repair_arms_8000000"
+metric = "stamp.preconditions.logs.declared_leaf_refs"
+lane = "counter"
+target_if = "v == 0"
+miss_if = "v != 0"
+miss_reason = "the tenant held leaves of a declared field before the repair"
+
+[[row.figure]]
+name = "a_logs_parts_unindexed"
+statement = "stamp"
+state = "repair_arms"
+transition = "repair_arms_8000000"
+metric = "stamp.preconditions.logs.parts_unindexed"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "a_logs_cli_sha256"
+statement = "stamp"
+state = "repair_arms"
+transition = "repair_arms_8000000"
+metric = "stamp.preconditions.logs.ravel_cli_sha256"
+lane = "counter"
+target_if = "isinstance(v, str) and len(v) == 64"
+
+[[row.figure]]
+name = "a_spans_entries"
+statement = "stamp"
+state = "repair_arms"
+transition = "repair_arms_8000000"
+metric = "stamp.preconditions.spans.largest_unindexed_part_entries"
+lane = "counter"
+target_if = "isinstance(v, int) and v >= 1"
+
+[[row.figure]]
+name = "a_spans_leaf_refs"
+statement = "stamp"
+state = "repair_arms"
+transition = "repair_arms_8000000"
+metric = "stamp.preconditions.spans.declared_leaf_refs"
+lane = "counter"
+target_if = "v == 0"
+miss_if = "v != 0"
+miss_reason = "the tenant held leaves of a declared field before the repair"
+
+[[row.figure]]
+name = "a_spans_parts_unindexed"
+statement = "stamp"
+state = "repair_arms"
+transition = "repair_arms_8000000"
+metric = "stamp.preconditions.spans.parts_unindexed"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "b_logs_entries"
+statement = "stamp"
+state = "repair_arms"
+transition = "repair_arms_16000000"
+metric = "stamp.preconditions.logs.largest_unindexed_part_entries"
+lane = "counter"
+target_if = "isinstance(v, int) and v >= 1"
+
+[[row.figure]]
+name = "b_logs_leaf_refs"
+statement = "stamp"
+state = "repair_arms"
+transition = "repair_arms_16000000"
+metric = "stamp.preconditions.logs.declared_leaf_refs"
+lane = "counter"
+target_if = "v == 0"
+miss_if = "v != 0"
+miss_reason = "the tenant held leaves of a declared field before the repair"
+
+[[row.figure]]
+name = "b_logs_parts_unindexed"
+statement = "stamp"
+state = "repair_arms"
+transition = "repair_arms_16000000"
+metric = "stamp.preconditions.logs.parts_unindexed"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "b_logs_cli_sha256"
+statement = "stamp"
+state = "repair_arms"
+transition = "repair_arms_16000000"
+metric = "stamp.preconditions.logs.ravel_cli_sha256"
+lane = "counter"
+target_if = "v == m['issue4347_repair.a_logs_cli_sha256']"
+miss_if = "v != m['issue4347_repair.a_logs_cli_sha256']"
+miss_reason = "the arms ran on two binaries"
+
+[[row.figure]]
+name = "b_spans_entries"
+statement = "stamp"
+state = "repair_arms"
+transition = "repair_arms_16000000"
+metric = "stamp.preconditions.spans.largest_unindexed_part_entries"
+lane = "counter"
+target_if = "isinstance(v, int) and v >= 1"
+
+[[row.figure]]
+name = "b_spans_leaf_refs"
+statement = "stamp"
+state = "repair_arms"
+transition = "repair_arms_16000000"
+metric = "stamp.preconditions.spans.declared_leaf_refs"
+lane = "counter"
+target_if = "v == 0"
+miss_if = "v != 0"
+miss_reason = "the tenant held leaves of a declared field before the repair"
+
+[[row.figure]]
+name = "b_spans_parts_unindexed"
+statement = "stamp"
+state = "repair_arms"
+transition = "repair_arms_16000000"
+metric = "stamp.preconditions.spans.parts_unindexed"
+lane = "counter"
+target_if = "v >= 1"
+
+# Arm A, logs: the repair at 8,000,000 pairs on invr8000000.
+
+[[row.figure]]
+name = "a_logs_budget"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.key_index_build_max_pairs"
+lane = "counter"
+target_if = "v == 8000000"
+miss_if = "v != 8000000"
+
+[[row.figure]]
+name = "a_logs_report_entries"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.largest_unindexed_part_entries"
+lane = "counter"
+target_if = "v == m['issue4347_repair.a_logs_entries']"
+miss_if = "v != m['issue4347_repair.a_logs_entries']"
+miss_reason = "the repair read a different largest unindexed part than the stamp"
+
+[[row.figure]]
+name = "a_logs_passes_request_id"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.passes_per_field.request_id"
+lane = "counter"
+target_if = "v in (25, 26)"
+miss_if = "v not in (25, 26)"
+
+[[row.figure]]
+name = "a_logs_passes_trace_id"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.passes_per_field.trace_id"
+lane = "counter"
+target_if = "v in (5, 6)"
+miss_if = "v not in (5, 6)"
+
+[[row.figure]]
+name = "a_logs_passes"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.passes"
+lane = "counter"
+target_if = "v == max(m['issue4347_repair.a_logs_passes_request_id'], m['issue4347_repair.a_logs_passes_trace_id'])"
+miss_if = "v != max(m['issue4347_repair.a_logs_passes_request_id'], m['issue4347_repair.a_logs_passes_trace_id'])"
+
+[[row.figure]]
+name = "a_logs_sections_read"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.sections_read"
+lane = "counter"
+target_if = "v == m['issue4347_repair.a_logs_entries'] * m['issue4347_repair.a_logs_passes']"
+miss_if = "v != m['issue4347_repair.a_logs_entries'] * m['issue4347_repair.a_logs_passes']"
+
+[[row.figure]]
+name = "a_logs_footer_gets"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.footer_phase_ranged_gets"
+lane = "counter"
+target_if = "v == m['issue4347_repair.a_logs_entries'] * m['issue4347_repair.a_logs_passes']"
+miss_if = "v != m['issue4347_repair.a_logs_entries'] * m['issue4347_repair.a_logs_passes']"
+
+[[row.figure]]
+name = "a_logs_section_gets"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.section_phase_ranged_gets"
+lane = "counter"
+target_if = "v == m['issue4347_repair.a_logs_entries'] * m['issue4347_repair.a_logs_passes']"
+miss_if = "v != m['issue4347_repair.a_logs_entries'] * m['issue4347_repair.a_logs_passes']"
+
+[[row.figure]]
+name = "a_logs_ranged_gets"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.ranged_gets"
+lane = "counter"
+target_if = "v == m['issue4347_repair.a_logs_footer_gets'] + m['issue4347_repair.a_logs_section_gets']"
+miss_if = "v != m['issue4347_repair.a_logs_footer_gets'] + m['issue4347_repair.a_logs_section_gets']"
+
+[[row.figure]]
+name = "a_logs_footer_bytes"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.footer_phase_bytes_read"
+lane = "counter"
+target_if = "0.99 * 8192 * m['issue4347_repair.a_logs_entries'] * m['issue4347_repair.a_logs_passes'] <= v <= 1.01 * 8192 * m['issue4347_repair.a_logs_entries'] * m['issue4347_repair.a_logs_passes']"
+
+[[row.figure]]
+name = "a_logs_section_bytes"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.section_phase_bytes_read"
+lane = "counter"
+target_if = "0.9 * 2190000 * m['issue4347_repair.a_logs_entries'] * m['issue4347_repair.a_logs_passes'] <= v <= 1.1 * 2190000 * m['issue4347_repair.a_logs_entries'] * m['issue4347_repair.a_logs_passes']"
+
+[[row.figure]]
+name = "a_logs_pairs_request_id"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.field_pairs.request_id"
+lane = "counter"
+target_if = "v == 100000000"
+miss_if = "v != 100000000"
+
+[[row.figure]]
+name = "a_logs_pairs_trace_id"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.field_pairs.trace_id"
+lane = "counter"
+target_if = "v == 20000000"
+miss_if = "v != 20000000"
+
+[[row.figure]]
+name = "a_logs_leaves"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.leaves_written"
+lane = "counter"
+target_if = "m['issue4347_repair.a_logs_passes_request_id'] + m['issue4347_repair.a_logs_passes_trace_id'] <= v <= m['issue4347_repair.a_logs_passes_request_id'] + m['issue4347_repair.a_logs_passes_trace_id'] + 2"
+
+[[row.figure]]
+name = "a_logs_leaf_bytes"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.leaf_bytes_written"
+lane = "counter"
+target_if = "1.2e9 <= v <= 1.4e9"
+
+[[row.figure]]
+name = "a_logs_uncovered"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.uncovered_entries"
+lane = "counter"
+target_if = "v == 0"
+miss_if = "v != 0"
+
+[[row.figure]]
+name = "a_logs_deferred"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.parts_deferred"
+lane = "counter"
+target_if = "v == 0"
+miss_if = "v != 0"
+
+[[row.figure]]
+name = "a_logs_attempts"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.attempt_count"
+lane = "counter"
+target_if = "v == 1"
+miss_if = "v != 1"
+
+[[row.figure]]
+name = "a_logs_parts_rebuilt"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.parts_rebuilt"
+lane = "counter"
+target_if = "v == 1"
+miss_if = "v != 1"
+
+[[row.figure]]
+name = "a_logs_rss"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.peak_rss_bytes"
+lane = "timing"
+target_if = "v <= 2.0e9"
+miss_if = "v > 2.0e9"
+
+[[row.figure]]
+name = "a_logs_wall"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.logs.wall_s"
+lane = "timing"
+target_if = "v <= 700"
+miss_if = "v > 700"
+
+# Arm A, spans: trace_id only.
+
+[[row.figure]]
+name = "a_spans_budget"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.spans.key_index_build_max_pairs"
+lane = "counter"
+target_if = "v == 8000000"
+miss_if = "v != 8000000"
+
+[[row.figure]]
+name = "a_spans_passes"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.spans.passes"
+lane = "counter"
+target_if = "v == 3"
+miss_if = "v != 3"
+
+[[row.figure]]
+name = "a_spans_footer_gets"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.spans.footer_phase_ranged_gets"
+lane = "counter"
+target_if = "v == m['issue4347_repair.a_spans_entries'] * m['issue4347_repair.a_spans_passes']"
+miss_if = "v != m['issue4347_repair.a_spans_entries'] * m['issue4347_repair.a_spans_passes']"
+
+[[row.figure]]
+name = "a_spans_section_gets"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.spans.section_phase_ranged_gets"
+lane = "counter"
+target_if = "v == m['issue4347_repair.a_spans_entries'] * m['issue4347_repair.a_spans_passes']"
+miss_if = "v != m['issue4347_repair.a_spans_entries'] * m['issue4347_repair.a_spans_passes']"
+
+[[row.figure]]
+name = "a_spans_section_bytes"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.spans.section_phase_bytes_read"
+lane = "counter"
+target_if = "0.9 * 212000 * m['issue4347_repair.a_spans_entries'] * m['issue4347_repair.a_spans_passes'] <= v <= 1.1 * 212000 * m['issue4347_repair.a_spans_entries'] * m['issue4347_repair.a_spans_passes']"
+
+[[row.figure]]
+name = "a_spans_leaf_bytes"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.spans.leaf_bytes_written"
+lane = "counter"
+target_if = "v <= 0.25e9"
+miss_if = "v > 0.25e9"
+
+[[row.figure]]
+name = "a_spans_rss"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.spans.peak_rss_bytes"
+lane = "timing"
+target_if = "v <= 2.0e9"
+miss_if = "v > 2.0e9"
+
+[[row.figure]]
+name = "a_spans_wall"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_8000000"
+metric = "fold.invr8000000.spans.wall_s"
+lane = "timing"
+target_if = "v <= 300"
+miss_if = "v > 300"
+
+# Arm B, logs: the repair at 16,000,000 pairs on invr16000000.
+
+[[row.figure]]
+name = "b_logs_budget"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.key_index_build_max_pairs"
+lane = "counter"
+target_if = "v == 16000000"
+miss_if = "v != 16000000"
+
+[[row.figure]]
+name = "b_logs_report_entries"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.largest_unindexed_part_entries"
+lane = "counter"
+target_if = "v == m['issue4347_repair.b_logs_entries']"
+miss_if = "v != m['issue4347_repair.b_logs_entries']"
+miss_reason = "the repair read a different largest unindexed part than the stamp"
+
+[[row.figure]]
+name = "b_logs_passes_request_id"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.passes_per_field.request_id"
+lane = "counter"
+target_if = "v in (13, 14)"
+miss_if = "v not in (13, 14)"
+
+[[row.figure]]
+name = "b_logs_passes_trace_id"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.passes_per_field.trace_id"
+lane = "counter"
+target_if = "v == 3"
+miss_if = "v != 3"
+
+[[row.figure]]
+name = "b_logs_passes"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.passes"
+lane = "counter"
+target_if = "v == max(m['issue4347_repair.b_logs_passes_request_id'], m['issue4347_repair.b_logs_passes_trace_id'])"
+miss_if = "v != max(m['issue4347_repair.b_logs_passes_request_id'], m['issue4347_repair.b_logs_passes_trace_id'])"
+
+[[row.figure]]
+name = "b_logs_sections_read"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.sections_read"
+lane = "counter"
+target_if = "v == m['issue4347_repair.b_logs_entries'] * m['issue4347_repair.b_logs_passes']"
+miss_if = "v != m['issue4347_repair.b_logs_entries'] * m['issue4347_repair.b_logs_passes']"
+
+[[row.figure]]
+name = "b_logs_footer_gets"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.footer_phase_ranged_gets"
+lane = "counter"
+target_if = "v == m['issue4347_repair.b_logs_entries'] * m['issue4347_repair.b_logs_passes']"
+miss_if = "v != m['issue4347_repair.b_logs_entries'] * m['issue4347_repair.b_logs_passes']"
+
+[[row.figure]]
+name = "b_logs_section_gets"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.section_phase_ranged_gets"
+lane = "counter"
+target_if = "v == m['issue4347_repair.b_logs_entries'] * m['issue4347_repair.b_logs_passes']"
+miss_if = "v != m['issue4347_repair.b_logs_entries'] * m['issue4347_repair.b_logs_passes']"
+
+[[row.figure]]
+name = "b_logs_ranged_gets"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.ranged_gets"
+lane = "counter"
+target_if = "v == m['issue4347_repair.b_logs_footer_gets'] + m['issue4347_repair.b_logs_section_gets']"
+miss_if = "v != m['issue4347_repair.b_logs_footer_gets'] + m['issue4347_repair.b_logs_section_gets']"
+
+[[row.figure]]
+name = "b_logs_footer_bytes"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.footer_phase_bytes_read"
+lane = "counter"
+target_if = "0.99 * 8192 * m['issue4347_repair.b_logs_entries'] * m['issue4347_repair.b_logs_passes'] <= v <= 1.01 * 8192 * m['issue4347_repair.b_logs_entries'] * m['issue4347_repair.b_logs_passes']"
+
+[[row.figure]]
+name = "b_logs_section_bytes"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.section_phase_bytes_read"
+lane = "counter"
+target_if = "0.9 * 2190000 * m['issue4347_repair.b_logs_entries'] * m['issue4347_repair.b_logs_passes'] <= v <= 1.1 * 2190000 * m['issue4347_repair.b_logs_entries'] * m['issue4347_repair.b_logs_passes']"
+
+[[row.figure]]
+name = "b_logs_pairs_request_id"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.field_pairs.request_id"
+lane = "counter"
+target_if = "v == 100000000"
+miss_if = "v != 100000000"
+
+[[row.figure]]
+name = "b_logs_pairs_trace_id"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.field_pairs.trace_id"
+lane = "counter"
+target_if = "v == 20000000"
+miss_if = "v != 20000000"
+
+[[row.figure]]
+name = "b_logs_leaves"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.leaves_written"
+lane = "counter"
+target_if = "m['issue4347_repair.b_logs_passes_request_id'] + m['issue4347_repair.b_logs_passes_trace_id'] <= v <= m['issue4347_repair.b_logs_passes_request_id'] + m['issue4347_repair.b_logs_passes_trace_id'] + 2"
+
+[[row.figure]]
+name = "b_logs_leaf_bytes"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.leaf_bytes_written"
+lane = "counter"
+target_if = "1.2e9 <= v <= 1.4e9"
+
+[[row.figure]]
+name = "b_logs_uncovered"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.uncovered_entries"
+lane = "counter"
+target_if = "v == 0"
+miss_if = "v != 0"
+
+[[row.figure]]
+name = "b_logs_deferred"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.parts_deferred"
+lane = "counter"
+target_if = "v == 0"
+miss_if = "v != 0"
+
+[[row.figure]]
+name = "b_logs_attempts"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.attempt_count"
+lane = "counter"
+target_if = "v == 1"
+miss_if = "v != 1"
+
+[[row.figure]]
+name = "b_logs_parts_rebuilt"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.parts_rebuilt"
+lane = "counter"
+target_if = "v == 1"
+miss_if = "v != 1"
+
+[[row.figure]]
+name = "b_logs_rss"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.peak_rss_bytes"
+lane = "timing"
+target_if = "v <= 2.0e9"
+miss_if = "v > 2.0e9"
+
+[[row.figure]]
+name = "b_logs_wall"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.logs.wall_s"
+lane = "timing"
+target_if = "v <= 700"
+miss_if = "v > 700"
+
+# Arm B, spans: trace_id only.
+
+[[row.figure]]
+name = "b_spans_budget"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.spans.key_index_build_max_pairs"
+lane = "counter"
+target_if = "v == 16000000"
+miss_if = "v != 16000000"
+
+[[row.figure]]
+name = "b_spans_passes"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.spans.passes"
+lane = "counter"
+target_if = "v == 2"
+miss_if = "v != 2"
+
+[[row.figure]]
+name = "b_spans_footer_gets"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.spans.footer_phase_ranged_gets"
+lane = "counter"
+target_if = "v == m['issue4347_repair.b_spans_entries'] * m['issue4347_repair.b_spans_passes']"
+miss_if = "v != m['issue4347_repair.b_spans_entries'] * m['issue4347_repair.b_spans_passes']"
+
+[[row.figure]]
+name = "b_spans_section_gets"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.spans.section_phase_ranged_gets"
+lane = "counter"
+target_if = "v == m['issue4347_repair.b_spans_entries'] * m['issue4347_repair.b_spans_passes']"
+miss_if = "v != m['issue4347_repair.b_spans_entries'] * m['issue4347_repair.b_spans_passes']"
+
+[[row.figure]]
+name = "b_spans_section_bytes"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.spans.section_phase_bytes_read"
+lane = "counter"
+target_if = "0.9 * 212000 * m['issue4347_repair.b_spans_entries'] * m['issue4347_repair.b_spans_passes'] <= v <= 1.1 * 212000 * m['issue4347_repair.b_spans_entries'] * m['issue4347_repair.b_spans_passes']"
+
+[[row.figure]]
+name = "b_spans_leaf_bytes"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.spans.leaf_bytes_written"
+lane = "counter"
+target_if = "v <= 0.25e9"
+miss_if = "v > 0.25e9"
+
+[[row.figure]]
+name = "b_spans_rss"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.spans.peak_rss_bytes"
+lane = "timing"
+target_if = "v <= 2.0e9"
+miss_if = "v > 2.0e9"
+
+[[row.figure]]
+name = "b_spans_wall"
+statement = "fold"
+state = "repair_arms"
+transition = "leaf_rebuild_16000000"
+metric = "fold.invr16000000.spans.wall_s"
+lane = "timing"
+target_if = "v <= 300"
+miss_if = "v > 300"
+
+# Between the arms, logs: the section bytes each pass reads (one pass reads
+# every entry's section once, whatever the budget) within 1%, and the leaf
+# bytes written (the same leaves, cut at other pass ends) within 2%; each
+# is B's over A's.
+
+[[row.figure]]
+name = "logs_section_bytes_per_pass_ratio"
+statement = "derived"
+state = "repair_arms"
+metric = "derived"
+expr = "(m['issue4347_repair.b_logs_section_bytes'] / m['issue4347_repair.b_logs_passes']) / (m['issue4347_repair.a_logs_section_bytes'] / m['issue4347_repair.a_logs_passes'])"
+lane = "counter"
+target_if = "0.99 <= v <= 1.01"
+
+[[row.figure]]
+name = "logs_leaf_bytes_ratio"
+statement = "derived"
+state = "repair_arms"
+metric = "derived"
+expr = "m['issue4347_repair.b_logs_leaf_bytes'] / m['issue4347_repair.a_logs_leaf_bytes']"
+lane = "counter"
+target_if = "0.98 <= v <= 1.02"
