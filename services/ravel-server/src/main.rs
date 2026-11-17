@@ -183,9 +183,9 @@ async fn main() -> anyhow::Result<()> {
     // The startup store checks, in this order, all before any listener binds
     // (`run_startup_store_checks`). Each read except the bucket-protection
     // gate retries a transient store error until --startup-store-deadline,
-    // each attempt bounded by the time left or `MIN_STARTUP_ATTEMPT`,
-    // whichever is longer, and refuses at once on any other error (issue
-    // #4325).
+    // each retry (not the first attempt) bounded by the time left or
+    // `MIN_STARTUP_ATTEMPT`, whichever is longer, and refuses at once on any
+    // other error (issue #4325).
     //
     // 1. Store-backend qualification (ADR-0050 section 6, EC7). On any
     //    production store kind, refuse to start unless a `sys/qualification`
