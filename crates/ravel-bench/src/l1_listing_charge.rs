@@ -218,6 +218,17 @@ impl RunConfig {
                 self.history_hours, self.flush_hours
             ));
         }
+        // A flush shorter than one scrape step holds no step, so `build_bucket`'s
+        // `step_by(steps_per_flush())` would panic on a zero step. This also
+        // covers `steps()`, which `history_hours >= 2 * flush_hours` keeps at
+        // least twice `steps_per_flush()`.
+        if self.steps_per_flush() == 0 {
+            return fail(format!(
+                "--flush-hours ({}) is shorter than one --scrape-secs ({}) step, so a flush \
+                 holds no scrape",
+                self.flush_hours, self.scrape_secs
+            ));
+        }
         if self.caps.is_empty() || self.caps.contains(&0) {
             return fail("--caps must name at least one positive cap".to_string());
         }
@@ -826,7 +837,9 @@ where
             ListingChargeError::Setup("no budget limit up to u64::MAX succeeds".to_string())
         })?;
     }
-    while hi - lo > hi / 100 {
+    // The 1 % step floors to zero once `hi` drops below 100 bytes, which would
+    // leave `mid == lo` and loop forever; keep it at least one byte.
+    while hi - lo > (hi / 100).max(1) {
         let mid = lo + (hi - lo) / 2;
         probes += 1;
         if listing(mid).await? {
@@ -1064,8 +1077,9 @@ pub fn report_table(report: &RunReport) -> String {
 ///
 /// - peak per sample in [`PEAK_PER_SAMPLE_BAND`];
 /// - the largest refused limit below the peak and within 1 % of it;
-/// - the peak at or below [`listing_bound`]: a listing under exactly that
-///   limit succeeded, and no limit the search refused reaches it;
+/// - the peak at or below [`listing_bound`]: compared to it directly, and
+///   cross-checked that a listing under exactly that limit succeeded and that
+///   no limit the search refused reaches it;
 /// - the peak non-decreasing as samples per part grow.
 ///
 /// Returns every violation.
@@ -1146,6 +1160,15 @@ pub fn check_report(text: &str, caps: &[u64]) -> Result<(), Vec<String>> {
                     failures.push(format!(
                         "cap {cap}: a {refused} B budget was refused, at or above the listing \
                          bound {bound} B"
+                    ));
+                }
+                // The two checks above are proxies for "the peak sits at or
+                // below the bound"; compare the peak to the bound directly so a
+                // violation narrower than the 1 % search bracket cannot slip
+                // through them.
+                if peak > bound {
+                    failures.push(format!(
+                        "cap {cap}: the peak {peak} B is above the listing bound {bound} B"
                     ));
                 }
                 rows.push((cap, samples, peak));
