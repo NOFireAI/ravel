@@ -406,6 +406,19 @@ jobs:
         run: bash scripts/guards/check-workflow-permissions.test.sh
       - name: Workflow-permissions guard (issue #1717)
         run: scripts/guards/check-workflow-permissions.sh
+      # The compat corpus is append-only (ADR-4233 decision 9, issue #4249):
+      # a published fixture under crates/ravel-compat-tests/corpus/ may be
+      # added, never edited or removed. This job checks out full history
+      # (fetch-depth 0 above), so the merge-base range the guard needs
+      # resolves here. Cases first, same reason as the guards above.
+      - name: Compat corpus append-only guard cases (issue #4249)
+        run: bash scripts/guards/check-compat-corpus-append-only.test.sh
+      # head.sha, NOT github.sha, for the same reason the changelog guard
+      # below records: on a pull_request event github.sha is the merge commit,
+      # whose first parent is the base branch tip.
+      - name: Compat corpus is append-only (issue #4249)
+        if: github.event_name == 'pull_request'
+        run: scripts/guards/check-compat-corpus-append-only.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
       - name: Doc-figure guard cases
         run: bash scripts/guards/check-doc-figures.test.sh
       - name: Operator-facing figures match the record-cache constants
