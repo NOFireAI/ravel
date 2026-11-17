@@ -257,8 +257,10 @@ connection, a pushed-but-broken main).
   <clone>/Brigfile`. It exits 1 when run from inside a sandbox clone,
   when brig has no `run --target` (it names `brew install --cask
   brig-sh/brig/brig@main`), or when NAME has no clone; 64 on bad usage.
-  `IMAGE=<ref>` runs another build of the guest image. It sets
-  `BRIG_HYPERVISOR=hvi` on macOS, which the routes need.
+  `update` passes on brig's exit code when `brig rm` fails with anything
+  but 3 (no sandbox). `IMAGE=<ref>` runs another build of the guest
+  image. It sets `BRIG_HYPERVISOR=hvi` on macOS, which the routes need.
+  `scripts/brig.test.sh` holds the cases, against a stub brig.
 - `scripts/brig-dev.sh [--shell [bash args]] [claude args]`: the guest
   side, which the target runs inside the sandbox. It trusts the project
   share for git, sets the toolchain environment, sends cargo output to
