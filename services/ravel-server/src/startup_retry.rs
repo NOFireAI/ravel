@@ -15,10 +15,9 @@
 //! this module existed. Time and sleep come from a [`StartupClock`], so tests
 //! drive the deadline without waiting.
 //!
-//! No listener is bound while these reads run, so `/readyz` cannot report
-//! ready during a retry: the main HTTP listener binds only after every site
-//! here has passed, and the `--listen-health` listener, which binds earlier,
-//! answers 503 until `start` returns.
+//! `/readyz` cannot report ready during a retry: the main HTTP listener binds
+//! only after every site here has passed, and the `--listen-health` listener,
+//! which binds after `sys/gc`, answers 503 until `start` returns.
 
 use std::error::Error as StdError;
 use std::fmt::Display;

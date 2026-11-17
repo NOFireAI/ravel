@@ -86,6 +86,18 @@ two cases, and each case has its own named error:
 No server process creates the qualification record, and no option skips the
 check. `--store memory` is exempt and never needs qualification.
 
+A transient store error on this read is not a refusal. The server retries it,
+like every other store read that startup refuses on, until
+`--startup-store-deadline` (default `15s`, measured from process start) has
+passed, and logs one warning per retry. Only then does it refuse, naming the
+read and the number of attempts. The default ends 10 s before the operator's
+liveness probe can first restart the pod, at 25 s. Outside the operator, keep
+it below the earliest restart your own liveness or startup probe allows.
+`0s` turns retry off. Any other error, such as an absent or stale record,
+refuses at once.
+[Startup store reads](../../architecture.md#startup-store-reads) lists the
+reads.
+
 While the suite runs, `store qualify` also writes scratch objects under
 `sys/qualify/<run-id>/`. The suite leaves them in place. Each of the two
 listing probes writes two keys more than the declared page size. A run at the
@@ -304,7 +316,9 @@ The bucket-configuration read is bounded to 10 seconds:
   which warns and starts.
 - The bound covers the bucket-configuration read only. The
   `sys/qualification` read runs before it, on the store's ordinary retrying
-  path. Only the store's own request timeout and retries bound that read.
+  path. The store's own request timeout and retries bound each attempt of
+  that read. A transient failure starts another attempt only until
+  `--startup-store-deadline` has passed.
 - An endpoint that stalls every request holds startup at the
   `sys/qualification` read, where the liveness probe can restart the pod. The
   bound helps when only the three configuration GETs stall.

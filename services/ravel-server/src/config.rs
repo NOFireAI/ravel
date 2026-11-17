@@ -1448,8 +1448,8 @@ pub struct StartupCheckArgs {
     /// sys/qualification, sys/tenancy, the --tenant-kms-config key-epoch
     /// records, the shard_count provisioning records, sys/gc and the
     /// sys/ipcrypt/policy marker. Retries back off exponentially from 100 ms
-    /// to 2 s with jitter, each logs one warning naming the read, and no
-    /// listener is bound while they run, so /readyz is not ready. Once the
+    /// to 2 s with jitter, each logs one warning naming the read, and /readyz
+    /// is not ready while they run. Once the
     /// deadline has passed, a transient failure refuses to start naming the
     /// read and the attempt count. Any other error refuses at once, as
     /// before. The default 15s ends 10 s before the operator's liveness
