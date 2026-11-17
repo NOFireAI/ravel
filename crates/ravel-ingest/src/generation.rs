@@ -506,6 +506,43 @@ pub(crate) fn stale_view_hold_spent(since_ns: Option<i64>, now_ns: i64, bound: D
     })
 }
 
+/// The verdict a flush opened at `now_ns` acts on after its scan-set check
+/// found no trusted view (issue #4363). Moves the buffer's hold
+/// (`hold_since_ns`, [`stale_view_hold_since`]); once the hold is spent the
+/// record is re-read once more ([`reread_and_check`]) before the caller drops
+/// the buffer, since nothing reads it while a flush is deferred. That read
+/// waits at most until the deadline of a flush opened at `now_ns`
+/// (`now_ns + bound`). `drain_reread` skips it for a drain that already
+/// re-read the tenant. [`ScanCheck::Unknown`] means drop when the hold is
+/// spent and hold otherwise.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn held_view_check<M>(
+    scope: &dyn FlushScope<M>,
+    clock: &dyn Clock,
+    bound: Duration,
+    tenant: TenantHash,
+    shard: u32,
+    hour: u32,
+    now_ns: i64,
+    hold_since_ns: &mut Option<i64>,
+    enforced: bool,
+    drain_reread: bool,
+) -> ScanCheck {
+    *hold_since_ns =
+        stale_view_hold_since(*hold_since_ns, scope.view_refreshed_at(tenant), now_ns, enforced);
+    if drain_reread || !stale_view_hold_spent(*hold_since_ns, now_ns, bound) {
+        return ScanCheck::Unknown;
+    }
+    let deadline_ns = now_ns.saturating_add(crate::config::duration_nanos_saturating(bound));
+    let remaining = Duration::from_nanos(
+        u64::try_from(deadline_ns.saturating_sub(clock.now_ns())).unwrap_or(0),
+    );
+    tokio::select! {
+        verdict = reread_and_check(scope, clock, remaining, tenant, shard, hour, now_ns) => verdict,
+        () = clock.sleep(remaining) => ScanCheck::Unknown,
+    }
+}
+
 /// The per-tenant `compat_epoch` a switch caches from provisioning records,
 /// in its own `Arc` so a shard's [`SwitchScope`] keeps reading it after the
 /// router's switch is dropped. A teardown flush (ADR-1685 teardown bypass)
@@ -819,6 +856,9 @@ pub(crate) struct ScriptedScope<M> {
     wait: Mutex<bool>,
     floor: Mutex<FloorCheck>,
     refreshed_at_ns: Mutex<Option<i64>>,
+    /// The verdict a re-read installs, or `None` for a re-read that fails.
+    reread: Mutex<Option<ScanCheck>>,
+    rereads: Mutex<usize>,
 }
 
 #[cfg(test)]
@@ -831,6 +871,8 @@ impl<M> ScriptedScope<M> {
             wait: Mutex::new(true),
             floor: Mutex::new(FloorCheck::Write),
             refreshed_at_ns: Mutex::new(None),
+            reread: Mutex::new(None),
+            rereads: Mutex::new(0),
         })
     }
 
@@ -867,6 +909,17 @@ impl<M> ScriptedScope<M> {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = refreshed_at_ns;
     }
+
+    /// Every later re-read succeeds and installs `verdict`; `None` (the
+    /// default) fails every re-read.
+    pub(crate) fn set_reread(&self, verdict: Option<ScanCheck>) {
+        *self.reread.lock().unwrap_or_else(|p| p.into_inner()) = verdict;
+    }
+
+    /// How many re-reads were asked for.
+    pub(crate) fn rereads(&self) -> usize {
+        *self.rereads.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 #[cfg(test)]
@@ -894,7 +947,12 @@ impl<M: Send + 'static> FlushScope<M> for ScriptedScope<M> {
     }
 
     fn reread(&self, _tenant: TenantHash) -> Reread {
-        Box::pin(std::future::ready(false))
+        *self.rereads.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+        let installed = *self.reread.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(verdict) = installed {
+            *self.verdict.lock().unwrap_or_else(|p| p.into_inner()) = verdict;
+        }
+        Box::pin(std::future::ready(installed.is_some()))
     }
 
     fn view_refreshed_at(&self, _tenant: TenantHash) -> Option<i64> {
@@ -1347,11 +1405,12 @@ impl<H> GenerationSwitch<H> {
     /// The horizon is tested at `now_ns` plus the switch's grace lead, not at
     /// `now_ns`: a row routed here is acknowledged in buffered mode before its
     /// flush opens, and a flush that opens past the horizon finds no trusted
-    /// view at its scan-set check and is held, then dropped. A row is refused
+    /// view at its scan-set check and is held, and dropped if no provisioning
+    /// read succeeds within the bounded stale-view hold. A row is refused
     /// when its undeferred flush trigger would open past the horizon, before
     /// it is buffered. A buffer held below the idle byte floor or whose flush
-    /// is deferred can still open past the horizon and is then dropped under
-    /// the bounded stale-view hold (consistency model, case nine).
+    /// is deferred can still open past the horizon and is then held under the
+    /// same bound (consistency model, case nine).
     pub fn try_grace_extend(&self, tenant: TenantHash, now_ns: i64) -> Option<Arc<Vec<H>>> {
         let mut inner = self.lock();
         let refreshed_at_ns = inner.views.get(&tenant)?.refreshed_at_ns;
@@ -1368,7 +1427,9 @@ impl<H> GenerationSwitch<H> {
     }
 
     /// Install a generation history for a tenant, stamp the refresh time to
-    /// `now_ns`, and return the active shard-actor set. An empty history is
+    /// `now_ns` (unless a view refreshed later is cached, see
+    /// [`Self::refresh_view`]), and return the active shard-actor set. An
+    /// empty history is
     /// ignored (the caller passes the normalized, never-empty history
     /// [`ravel_catalog::read_generations`] returns) and falls back to the
     /// default view.
@@ -1398,7 +1459,9 @@ impl<H> GenerationSwitch<H> {
     }
 
     /// [`Self::refresh`] with the format floor read from the same record. The
-    /// cached floor becomes the higher of the cached and the read one.
+    /// cached floor becomes the higher of the cached and the read one. A
+    /// cached view refreshed after `now_ns` (a read issued later that
+    /// installed first) keeps its history and stamp.
     pub(crate) fn refresh_view(
         &self,
         tenant: TenantHash,
@@ -1421,6 +1484,17 @@ impl<H> GenerationSwitch<H> {
                         cached.compat_epoch.max(compat_epoch),
                     )
                 });
+        // A background read issued after this one may have installed first;
+        // its view and stamp are the newer ones, as in `install_if_newer`.
+        let newer = inner
+            .views
+            .get(&tenant)
+            .filter(|cached| cached.refreshed_at_ns > now_ns)
+            .map(|cached| (cached.generations.clone(), cached.refreshed_at_ns));
+        let (generations, refreshed_at_ns) = match newer {
+            Some(newer) => newer,
+            None => (generations, now_ns),
+        };
         let generations = if generations.is_empty() {
             vec![ShardGeneration {
                 generation: 0,
@@ -1439,8 +1513,8 @@ impl<H> GenerationSwitch<H> {
                 generations,
                 format_floor,
                 compat_epoch,
-                refreshed_at_ns: now_ns,
-                last_touched_ns: now_ns,
+                refreshed_at_ns,
+                last_touched_ns: refreshed_at_ns.max(now_ns),
             },
         );
         self.bucket_cache.raise(tenant, compat_epoch);
