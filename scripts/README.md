@@ -229,15 +229,19 @@ connection, a pushed-but-broken main).
   figure: `alerts-late`, `l0c-after-horizon`, `maintenance` and
   `unclassified` must be zero; `root`, `exempt-advisory` (keys matching
   `EXEMPT_PATTERNS` at the top of the script, and admission snapshot
-  removals), `prerequisite-only`, `alerts-grace`, `ingest-grace`,
-  `teardown-data` and `idem` are recorded. Every teardown data write and
-  idem write must carry the trailer v0.33.0 writes (RSEG 7, RLOG 5,
-  RSPAN 5; an idem object has no trailer rule and fails), and must be
-  flagged by main's `certify` census or late-write pass, run by the
-  `drill_census` example of `crates/ravel-compat-tests` (`DRILL_CENSUS`).
-  `verdict` also exits 1 on an ingest 2xx requested after the trust limit
-  (the fence's hour plus 2 h for a warm process, the fence for a cold
-  restart), a query 2xx requested after the fence, a zero
+  removals), `audit-unfenced` (per-query audit records written under
+  `u/l0/` and `u/c/`), `prerequisite-only`, `alerts-grace`,
+  `ingest-grace`, `teardown-data` and `idem` are recorded. Every teardown
+  data write and idem write must carry the trailer v0.33.0 writes (RSEG 7,
+  RLOG 5, RSPAN 5; an idem object has no trailer rule and fails). Whether
+  main's `certify` census and late-write pass flag such a pair is tested
+  by `crates/ravel-compat-tests/tests/certify_flags_teardown_pair.rs`,
+  not by the drill. `verdict` also exits 1 on an ingest 2xx requested
+  after its router's trust limit (for a warm process the hour of the
+  router's last provisioning refresh before the fence plus 2 h, that
+  refresh bounded from below by the last 2xx write ending before the
+  fence began minus the 60 s refresh interval and the 30 s request bound;
+  the fence for a cold restart), a query 2xx requested after the fence, a zero
   positive-control prefix, a read diff between v0.33.0 and main, a read
   figure outside its band, or a missing phase verdict. State goes to
   `DRILL_RUN` (default `.dd-tools/drill-run`); the script header lists
