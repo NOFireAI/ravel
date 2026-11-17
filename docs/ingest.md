@@ -1087,15 +1087,20 @@ pipelines apply it the same way (crates/ravel-ingest/src/compat.rs):
 - Admission refuses a write the cached view already rejects (active version
   not in this build's writable set, or `CompatRecordMissing`) before any
   shard buffers it. Its byte-budget charge, taken earlier in admission, is
-  refunded when the refused write returns. A stale view is not refused at
-  admission.
+  refunded when the refused write returns. A stale view (`view_stale`, under
+  the same staleness rule as below) is refused at admission too, so no row
+  is acknowledged that the view cannot vouch for.
 - The flush picks its version at permit grant, not at flush open, from the
-  view as it stands then. A stale view, an active version this build cannot
-  write, or a missing record refuses the flush with no PUT: its rows are
-  dropped, its byte charges released, and its strict waiters get a
-  retryable `CompatRefused` error. A flush whose router has been dropped
-  has no cached provisioning record to ask with and is refused the same way
-  (`no_bucket_view`).
+  view as it stands then. An active version this build cannot write, a
+  missing record, or a record whose `max_publish_lifetime_ns` is now below
+  the router's `max_flush_lifetime` (`publish_lifetime_above_compat`)
+  refuses the flush with no PUT: its rows are dropped, its byte charges
+  released, and its strict waiters get a retryable `CompatRefused` error. A
+  stale view is waited out instead: the grant asks again every second and
+  refuses `view_stale` only once `max_flush_lifetime` has passed since the
+  flush's first grant. A router dropped without `shutdown()` flushes under
+  the same rules, because its shards hold the per-tenant provisioning cache
+  by `Arc`; `no_bucket_view` is reserved and no ingest path raises it.
 - The format-floor checks at admission and at flush open compare the
   tenant's floor with the version the policy names for the family
   (`FormatFamily::writable_version_under`), not the writer's `CURRENT`; a
@@ -1118,18 +1123,21 @@ pipelines apply it the same way (crates/ravel-ingest/src/compat.rs):
   only if the view has seen a record or the bucket carries a
   `compat_epoch`: a view that has never seen a record, on a bucket at epoch
   0, keeps publishing at the baseline, including while its `sys/compat`
-  read fails. A data object already stored when its commit-record attempt
-  is refused is never committed.
+  read fails. A stale view before an attempt is waited out within the
+  flush's `max_flush_lifetime`, as at grant. A data object already stored
+  when its commit-record attempt is refused is never committed.
 - Construction refuses a `max_flush_lifetime` above the record's
   `max_publish_lifetime_ns` (`PublishLifetimeAboveCompat`).
 
 Every refusal counts once under its reason (`view_stale`,
 `active_version_not_writable`, `compat_record_missing`, `fence_failed`,
-`active_version_moved`, `no_bucket_view`) in the signal's metrics snapshot,
-`compat_publish_refused`, which ravel-server does not yet render on
-`/metrics`. With no policy installed, the default and every shipping
-path until ravel-server installs one, each pipeline writes its writer's
-`CURRENT` version with none of these checks, byte for byte as before.
+`publish_lifetime_above_compat`, `active_version_moved`, `no_bucket_view`)
+in the signal's metrics snapshot, `compat_publish_refused`, which
+ravel-server renders on `/metrics` as
+`ravel_compat_publish_refused_total{family,reason}`. ravel-server installs
+the policy on every router of a keyed bucket. With no policy installed
+each pipeline writes its writer's `CURRENT` version with none of these
+checks, byte for byte as before.
 
 ## Log pipeline
 
