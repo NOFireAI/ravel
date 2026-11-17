@@ -788,7 +788,7 @@ const STRIPED: (&str, usize) = ("SELECT count(*) FROM logs WHERE svc LIKE '%7%'"
 /// Seen failing against three alternative warms: the 4-part cap kept on the
 /// metadata pass (4 first-open cache hits, not 6), a probe of another length
 /// (0, not 6), and a whole-part warm that reads objects above the bound whole
-/// (whole reads during startup, not 0).
+/// (4 whole reads during startup, not 0).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_server_serves_the_first_scan_footers_from_the_warmed_cache() {
     let tenant = ingest_tenant().await;
@@ -1111,8 +1111,8 @@ async fn capture_log<T>(body: impl std::future::Future<Output = T>) -> (T, Vec<S
 /// Seen failing against the event-time window the warm-up resolved before
 /// (the result log reads `parts_warmed=0 metadata_objects_warmed=0`), and
 /// against a selection that takes the oldest ingest hour first or orders by
-/// event time alone (the budgeted statement then reads the footers of the
-/// newest hour's first 2 objects instead of the older hour's).
+/// event time alone (the budget admits other objects than the newest ingest
+/// hour's first 2, so the budgeted statement's footer reads are not the rest).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_whose_event_times_predate_its_ingest_window_is_warmed() {
     let (tenant, warm_order) = backdated_tenant().await;

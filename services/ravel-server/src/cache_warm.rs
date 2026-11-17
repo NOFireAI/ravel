@@ -46,8 +46,8 @@
 //! whole at or under [`LogSegmentFetcher::plan_whole_object_bound`], and not at
 //! all above it. Above the bound the query path plans the part from its
 //! directories, which the metadata pass below warms, and then reads only the
-//! blocks a statement's plan keeps, so a whole read here would fetch and decode
-//! blocks no plan reads. A part above the bound is dropped from the whole-part
+//! blocks a statement's plan keeps, so a whole read here would fetch blocks a
+//! statement may never read. A part above the bound is dropped from the whole-part
 //! set before the [`MAX_PARTS_PER_TENANT_PER_SIGNAL`] cap and counted in
 //! `parts_above_plan_bound`, so the cap takes the most recent parts at or under
 //! the bound. A part at or under the bound past the cap is counted in
@@ -143,7 +143,8 @@
 //! [`SegmentFetcher::fetch_series`] with no matchers (footer + catalog
 //! sections only, no page data: see its own doc, "labels only, no
 //! samples") and [`LogSegmentFetcher::fetch_accounted_with_tenant`] (RLOG's
-//! only funnel, always a whole-object fetch) -- so warming a part costs
+//! only funnel, which ends in a whole-object GET for every part the
+//! whole-part warm takes) -- so warming a part costs
 //! exactly what a real query resolving that part would cost, and nothing
 //! here reimplements or changes either fetcher's cache behavior. The
 //! metadata pass calls the plan phase's directory read the same way.
@@ -272,9 +273,9 @@ impl WarmStep {
 struct WarmProgress {
     parts_warmed: AtomicU64,
     /// Logs parts the whole-part step skipped for being above the query path's
-    /// `plan_whole_object_bound` (#4307): the query path reads only their
-    /// directories, which the metadata pass warms, so a whole read here would
-    /// fetch and decode blocks no plan needs. Not a warm and not over budget.
+    /// `plan_whole_object_bound` (#4307): the query path plans them from their
+    /// directories, which the metadata pass warms, and reads by range only the
+    /// blocks a statement keeps. Not a warm and not over budget.
     parts_above_plan_bound: AtomicU64,
     /// Parts of either signal the whole-part step left past the per-(tenant,
     /// signal) cap. For logs these are parts at or under the plan bound, which
@@ -495,11 +496,11 @@ async fn warm_cache_inner(
         .with_memory_budget(memory_budget.clone())
         .with_read_gate(read_gate.clone());
     // #4307: the whole-part warm reads a logs part the way the query path does,
-    // whole at or under `plan_whole_object_bound` and not at all above it (the
-    // query path reads only the directories the metadata pass warms there).
+    // whole at or under `plan_whole_object_bound` and not at all above it (there
+    // the query path plans from the directories the metadata pass warms).
     // Build this fetcher with the same block-range threshold, request cost and
     // projection break-even the metadata pass uses, so both agree on that bound
-    // and `warm_log_parts` can partition the warm set against it.
+    // and `warm_log_parts` splits the warm set against it.
     let logs_fetcher = LogSegmentFetcher::new(store)
         .with_block_range_threshold(logs_metadata.block_range_threshold)
         .with_request_cost_bytes(logs_metadata.request_cost_bytes)
@@ -687,8 +688,8 @@ impl LogsMetadataPass {
         let concurrency = get_limiter.permits().saturating_sub(1).max(1);
         // Built like the query path's logs fetchers (`QueryEngine::new` and
         // `build_sql_state`): the request cost sets the coalescing gap and the
-        // two thresholds set the plan bound, so any other value here would
-        // read the directories under keys no statement looks up.
+        // two thresholds set the plan bound, so any other value here could
+        // read the directories under keys the query path does not look up.
         let mut fetcher = LogSegmentFetcher::new(store)
             .with_block_range_threshold(shape.block_range_threshold)
             .with_request_cost_bytes(shape.request_cost_bytes)
@@ -3169,8 +3170,7 @@ mod tests {
     /// finishes while the 2 small whole reads hang. It also reports the 7 GET
     /// permits the pass reads on, the bytes the 2 hung reads reserved, and the
     /// count of parts above the bound. Each field is matched whole and appears
-    /// exactly once. Seen failing against a warning without the GET permits and
-    /// the bytes reserved, and against one that carries the GET permits twice.
+    /// exactly once.
     #[tokio::test(start_paused = true)]
     async fn a_timed_out_pass_reports_what_it_warmed_and_the_running_step() {
         let (capture, _, parts) = warm_large_tenant(None, Duration::from_secs(2)).await;
@@ -3973,7 +3973,11 @@ mod tests {
     /// directory extents); any other read of the large part is delayed 5 s,
     /// past the 1 s deadline. After the warm the large part's GETs are exactly
     /// the reference reads, the small part's one whole GET, and the pass
-    /// completes inside the deadline.
+    /// completes inside the deadline. Seen failing against a whole-part warm
+    /// whose logs fetcher lacks the query path's thresholds and that warms
+    /// every part whole: the large part's GETs are
+    /// `[Full, Suffix(131072)]`, not `[Suffix(131072)]` (the whole-part read
+    /// probes, finds every block a candidate and falls back to one whole GET).
     #[tokio::test(start_paused = true)]
     async fn the_whole_part_warm_issues_no_block_get_for_a_part_above_the_bound() {
         use tracing_subscriber::layer::SubscriberExt as _;
@@ -4094,7 +4098,9 @@ mod tests {
     /// warmed whole, not skipped. The engine's bound is set to the one object's
     /// size, so `plan_whole_object_bound` equals it. The whole-part step warms
     /// it (its skip is `object_size > bound`, false at the bound) and the
-    /// metadata pass leaves it alone (same test).
+    /// metadata pass leaves it alone (same test). Seen failing against an
+    /// off-by-one that skips at the bound (`object_size >= bound`): the cache
+    /// holds 0 entries, not 1.
     #[tokio::test(start_paused = true)]
     async fn a_logs_part_exactly_at_the_plan_bound_is_warmed_whole() {
         use tracing_subscriber::layer::SubscriberExt as _;
@@ -4161,7 +4167,9 @@ mod tests {
     /// are dropped before the cap, the cap takes four of the five small parts,
     /// and the fifth is counted in `parts_beyond_cap`, exactly once on the
     /// per-signal line and on the pass-complete line. Every part is counted in
-    /// exactly one of the per-signal line's four counts.
+    /// exactly one of the per-signal line's four counts. Seen failing against a
+    /// cap counted on every logs part, above-bound ones included:
+    /// `parts_beyond_cap` is 3, not 1.
     #[tokio::test(start_paused = true)]
     async fn logs_parts_past_the_cap_are_counted_beyond_it() {
         use tracing_subscriber::layer::SubscriberExt as _;
@@ -4244,7 +4252,9 @@ mod tests {
 
     /// Issue #4307: a tenant whose one logs part at or under the plan bound
     /// fails its whole fetch still warns that nothing warmed, although it also
-    /// has a part above the bound for the metadata pass.
+    /// has a part above the bound for the metadata pass. Seen failing against
+    /// the condition that warned only with no part above the bound: 0 warnings,
+    /// not 1.
     #[tokio::test(start_paused = true)]
     async fn a_failed_whole_warm_warns_beside_a_part_above_the_bound() {
         use tracing_subscriber::layer::SubscriberExt as _;
@@ -4322,7 +4332,8 @@ mod tests {
 
     /// Issue #4307: without the metadata pass, logs parts above the plan bound
     /// get no warm at all, and the pass says so in one warning, not one per
-    /// tenant.
+    /// tenant. Seen failing with the warning removed (0 warnings, not 1) and
+    /// with it logged for every tenant (2, not 1).
     #[tokio::test(start_paused = true)]
     async fn a_pass_without_the_metadata_step_warns_once_about_parts_above_the_bound() {
         use tracing_subscriber::layer::SubscriberExt as _;

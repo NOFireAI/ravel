@@ -7426,16 +7426,20 @@ deadline.
 The whole-part warm reads a logs part the way the query path does
 (ADR-0046 amendment 2026-11-16): whole only when its object size is at or under
 `LogSegmentFetcher::plan_whole_object_bound`, and not at all above it. Above
-the bound the query path reads only the part's directories, which the metadata
-pass below warms; a whole read here would fetch and decode blocks no plan
-needs. A logs part above the bound is dropped from the whole-part set, before
-the 4-part cap, and counted in `parts_above_plan_bound`; the cap then takes the
-most recent parts at or under the bound. The whole-part warm's logs fetcher is
-built with the same block-range threshold, request cost and projection
-break-even as the metadata pass, so the two steps agree on the bound and split
-a tenant's logs set between them: a logs part is warmed whole here or has its
-metadata warmed below, never both. The metric side is unchanged: a metric part
-above `DEFAULT_WHOLE_OBJECT_THRESHOLD` is still warmed, on its footer tail.
+the bound the query path plans the part from its directories, which the
+metadata pass below warms, and then reads by range only the blocks a
+statement's plan keeps; a whole read here would fetch blocks a statement may
+never read. A logs part above the bound is dropped from the whole-part set,
+before the 4-part cap, and counted in `parts_above_plan_bound`; the cap then
+takes the most recent parts at or under the bound, and a part at or under the
+bound past the cap is counted in `parts_beyond_cap` and warmed by neither
+step. The whole-part warm's logs fetcher is built with the same block-range
+threshold, request cost and projection break-even as the metadata pass, so the
+two steps agree on the bound and never both read one logs part. When the
+metadata pass does not run (its fetcher refuses the configured fetch bound), a
+logs part above the bound gets no warm at all, and the warm-up logs one
+`warn!` per pass saying so. The metric side is unchanged: a metric part above
+`DEFAULT_WHOLE_OBJECT_THRESHOLD` is still warmed, on its footer tail.
 
 The whole-part warm holds to the cache budget minus the pass's ceiling
 (below), or to the whole budget when the pass does not run. Each part
