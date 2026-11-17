@@ -341,6 +341,7 @@ impl SpanIngestRouter {
                     .collect()
             };
             GenerationSwitch::new(config.shard_count, DEFAULT_REFRESH_INTERVAL_NS, factory)
+                .with_grace_lead(config.flush_trigger_age_bound_ns())
                 .with_refresh_source(refresh_store, ravel_types::Signal::Spans, refresh_clock)
                 .with_read_failures(read_failures)
                 .with_compat_slot(compat.clone())
@@ -1391,6 +1392,50 @@ mod tests {
             )
             .await
             .expect("after a refresh the write routes again");
+        router.shutdown().await;
+    }
+
+    /// Issue #4363: the grace window refuses a span whose flush can open past
+    /// the horizon, from `flush_trigger_age_bound_ns` before it on, and routes
+    /// one a nanosecond earlier.
+    #[tokio::test]
+    async fn grace_routing_refuses_a_write_whose_flush_opens_past_the_horizon() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Transient("prov unavailable".into()))
+                .with_key_contains("/prov"),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let t0 = BASE_NS + 10 * NS_PER_HOUR;
+        let router = SpanIngestRouter::new(
+            IngestConfig {
+                shard_count: 4,
+                ..IngestConfig::default()
+            },
+            store,
+            Arc::new(ManualClock::new(t0)),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+        );
+        let tenant = TenantId::new("acme");
+        router.refresh_generations(tenant.hash(), vec![sg(0, 4, BASE_HOUR)], t0);
+        let lead = router.config.flush_trigger_age_bound_ns();
+        let last_window = BASE_NS + 12 * NS_PER_HOUR - lead;
+
+        match router.active_set(tenant.hash(), last_window).await {
+            Err(SpanWriteError::StaleProvisioningView) => {}
+            other => panic!(
+                "a flush that can open past the horizon must be refused: {:?}",
+                other.map(|set| set.len())
+            ),
+        }
+        router
+            .active_set(tenant.hash(), last_window - 1)
+            .await
+            .expect("a flush that opens inside the horizon routes on grace");
+        let snapshot = router.metrics().snapshot();
+        assert_eq!(snapshot.stale_provisioning_flushes, 1);
+        assert_eq!(snapshot.grace_extended_stale_flushes, 1);
         router.shutdown().await;
     }
 

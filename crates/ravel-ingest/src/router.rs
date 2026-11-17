@@ -476,6 +476,7 @@ impl IngestRouter {
                     .collect()
             };
             GenerationSwitch::new(config.shard_count, DEFAULT_REFRESH_INTERVAL_NS, factory)
+                .with_grace_lead(config.flush_trigger_age_bound_ns())
                 .with_refresh_source(refresh_store, signal, refresh_clock)
                 .with_read_failures(read_failures)
                 .with_compat_slot(compat.clone())
@@ -1605,6 +1606,77 @@ mod tests {
             None,
             "idle eviction removes the backoff entry"
         );
+    }
+
+    /// Issue #4363: the grace window routes a row only when its flush opens
+    /// inside the horizon. A buffered write whose flush trigger can fire past
+    /// the horizon is refused with the retryable `StaleProvisioningView` and
+    /// charges nothing, from `flush_trigger_age_bound_ns` before the horizon
+    /// on; one nanosecond earlier the write routes on grace and is buffered.
+    #[tokio::test]
+    async fn grace_routing_refuses_a_write_whose_flush_opens_past_the_horizon() {
+        use crate::budget::{IngestByteBudget, IngestByteBudgetLimit};
+
+        let tenant = TenantId::new("acme");
+        let key = ravel_catalog::provisioning_key(&tenant.hash(), Signal::Metrics);
+        let store = crate::read_backoff::failing_then_passing_get_store(&key, 8);
+        let base_hour = crate::config::MIN_PLAUSIBLE_INGEST_CLOCK_NS / NS_PER_HOUR + 10;
+        let t0 = base_hour * NS_PER_HOUR;
+        let clock = Arc::new(FrozenClock(AtomicI64::new(t0)));
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let lead = config.flush_trigger_age_bound_ns();
+        assert!(lead > 0 && lead < NS_PER_HOUR, "{lead}");
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited);
+        let router = IngestRouter::new(
+            config,
+            store.clone(),
+            Signal::Metrics,
+            clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
+        )
+        .with_budget(Arc::clone(&budget));
+        router.refresh_generations(
+            tenant.hash(),
+            vec![ShardGeneration {
+                generation: 0,
+                shard_count: 4,
+                activation_hour: 0,
+                appended_unix_ns: 0,
+            }],
+            t0,
+        );
+        // Refreshed in hour `base_hour`, the view is trusted before hour
+        // `base_hour + 2` (min_lead_hours of the default C).
+        let horizon_ns = (base_hour + 2) * NS_PER_HOUR;
+
+        let last_window = horizon_ns - lead;
+        clock.0.store(last_window, Ordering::SeqCst);
+        let err = buffered_write(&router, &tenant, last_window)
+            .await
+            .expect_err("a flush that can open past the horizon is refused");
+        assert!(matches!(err, WriteError::StaleProvisioningView), "{err:?}");
+        assert!(err.is_retryable());
+        assert_eq!(
+            budget.in_flight_bytes(),
+            0,
+            "the refused write buffers nothing"
+        );
+        let snapshot = router.metrics_snapshot();
+        assert_eq!(snapshot.stale_provisioning_flushes, 1);
+        assert_eq!(snapshot.grace_extended_stale_flushes, 0);
+
+        let earlier = last_window - 1;
+        clock.0.store(earlier, Ordering::SeqCst);
+        buffered_write(&router, &tenant, earlier)
+            .await
+            .expect("a flush that opens inside the horizon routes on grace");
+        assert!(budget.in_flight_bytes() > 0, "the routed write is buffered");
+        let snapshot = router.metrics_snapshot();
+        assert_eq!(snapshot.stale_provisioning_flushes, 1);
+        assert_eq!(snapshot.grace_extended_stale_flushes, 1);
     }
 
     /// ADR-1702 task 9: a gated encode that panics, or that the gate cancels,
