@@ -137,6 +137,39 @@ The cost of disposability is that every durable step is a network round trip.
 The floor on visibility latency is object-store latency, and request count is
 a bill ([guides/cost-model.md](guides/cost-model.md)).
 
+### Startup store reads
+
+Before any listener binds, a server reads the store to check that it may
+start: `sys/qualification`, `sys/tenancy`, the key-epoch records of the
+tenants in `--tenant-kms-config`, the `shard_count` provisioning records of
+the statically known tenants, and `sys/gc`. `start` then reads the
+`sys/ipcrypt/policy` marker in the `all` and `gateway` modes. Each of these
+reads refuses to start when its answer is wrong.
+
+A store that is still coming up does not count as a wrong answer. A read that
+fails with a transient store error is retried. The wait between attempts
+doubles from 100 ms to a 2 s cap, and jitter draws each wait between half and
+all of that step. Each retry logs one warning that names the read,
+the attempt number and the error. Retrying stops at `--startup-store-deadline`
+(default `15s`), which is measured from process start and shared by every
+read. Once it has passed, a transient failure refuses to start, and the error
+names the read and the number of attempts. The default ends 10 s before the
+earliest restart by the operator's liveness probe, at 25 s. `0s` turns retry
+off.
+
+Any other error refuses at once, with the same message as before retry
+existed. Examples are an absent or stale qualification record, a corrupt
+marker, a scheme, key or policy mismatch, pre-ADR data that the configured
+`--shards` would hide, and a refused credential. A marker or record that the
+server creates during these reads is written create-if-absent or under
+compare-and-swap, and every retry starts again from the read. So a write
+that landed before an ambiguous failure reads back as present on the next
+attempt.
+
+`/readyz` is never ready during a retry. The main listener binds only after
+every read has passed. The `--listen-health` listener, when it is set, binds
+after `sys/gc` and answers 503 until `start` returns.
+
 ### Health and readiness routes
 
 Two HTTP routes exist on every mode so that an orchestrator can act on this

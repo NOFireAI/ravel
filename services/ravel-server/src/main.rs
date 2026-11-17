@@ -58,6 +58,15 @@ async fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let trace_guard = ravel_tracing_export::init(filter, cli.otlp_export_config());
 
+    // Issue #4325: the startup store reads below retry a transient store
+    // error until --startup-store-deadline, measured on this clock from here,
+    // the top of the process.
+    let startup_retry = ravel_server::startup_retry::StartupRetry::new(
+        Arc::new(ravel_server::startup_retry::TokioStartupClock::starting_now()),
+        cli.startup_checks.startup_store_deadline,
+        rand::random(),
+    );
+
     // Cross-flag startup invariants (ADR-0050 section 1): the dev-header
     // loopback rule plus every --mtls-listener misconfiguration. Every case
     // refuses startup outright; see `Cli::validate`.
@@ -158,13 +167,16 @@ async fn main() -> anyhow::Result<()> {
     // the tenancy marker and GC config, an absent record is NOT a
     // bootstrap-and-continue case: a fresh production deployment must run `store
     // qualify` first, by design (see `qualification` and the operations guide).
-    ravel_server::qualification::enforce(
+    // This and the other startup store reads through `startup_retry` retry a
+    // transient store error until --startup-store-deadline and refuse at once
+    // on any other error (issue #4325).
+    ravel_server::startup_retry::enforce_qualification(
+        &startup_retry,
         store.as_ref(),
         cli.store,
         cli.backend_identity().as_deref(),
     )
-    .await
-    .context("store backend is not qualified (sys/qualification); refusing to start")?;
+    .await?;
 
     // Bucket-protection contract gate (ADR-0072 decision 3, ADR-1727 decision
     // 5), off by default: see docs/object-store-contract.md's "Required bucket
@@ -191,10 +203,13 @@ async fn main() -> anyhow::Result<()> {
     // listener binds, so a wrong key is a failed deploy rather than a silent
     // parallel namespace.
     let tenancy_config = cli.resolve_tenancy_config()?;
-    let resolved_tenancy =
-        ravel_server::tenancy::resolve_and_pin(store.as_ref(), tenancy_config, now_unix_ns())
-            .await
-            .context("failed to resolve the bucket's tenant-hash scheme (sys/tenancy)")?;
+    let resolved_tenancy = ravel_server::startup_retry::resolve_tenancy(
+        &startup_retry,
+        store.as_ref(),
+        tenancy_config,
+        now_unix_ns(),
+    )
+    .await?;
     ravel_types::install_tenant_hash_scheme(resolved_tenancy.scheme.clone())
         .map_err(|_| anyhow::anyhow!("tenant-hash scheme was already installed"))?;
     // Retained for the recovery-manifest writer (ADR-0050 section 3): `Some`
@@ -236,14 +251,14 @@ async fn main() -> anyhow::Result<()> {
     // memory`), so this is a no-op on every deployment that has not opted in.
     let tenant_kms_config = cli.parse_tenant_kms_config()?;
     if let Some(kms) = tenant_kms.as_deref() {
-        ravel_server::tenant_kms::configure_tenant_kms(
+        ravel_server::startup_retry::configure_tenant_kms(
+            &startup_retry,
             kms,
             store.as_ref(),
             &tenant_kms_config,
             now_unix_ns(),
         )
-        .await
-        .context("failed to configure per-tenant SSE-KMS routing (--tenant-kms-config)")?;
+        .await?;
     }
 
     let parquet_profiles = cli.parse_parquet_profiles()?;
@@ -289,15 +304,15 @@ async fn main() -> anyhow::Result<()> {
     // Every other mode adopts pre-ADR data. An
     // OIDC/mTLS deployment with no static tenants validates nothing here and
     // checks each tenant at first touch.
-    ravel_server::provisioning::validate_static_provisioning(
+    ravel_server::startup_retry::validate_static_provisioning(
+        &startup_retry,
         store.as_ref(),
         &fold_tenants,
         cli.shards,
         cli.mode,
         now_unix_ns(),
     )
-    .await
-    .context("shard_count provisioning validation failed for a statically-known tenant")?;
+    .await?;
     // Real authn (ADR-0042 decision 6): the OIDC and mTLS resolvers join the
     // FallbackResolver chain alongside the static bearer resolver when their
     // flags are set. Validation of dependent-flag misuse happens in
@@ -467,12 +482,13 @@ async fn main() -> anyhow::Result<()> {
     // that fits this mode and the refused request. The Flight SQL ceiling is
     // sourced and validated in `ravel_server::start` (it is
     // `flight-sql`-feature-gated).
-    let gc = ravel_server::gc_config::bootstrap(store.as_ref(), now_unix_ns())
-        .await
-        .map_err(|e| {
-            let context = ravel_server::gc_config::bootstrap_failure_context(&e, cli.mode);
-            anyhow::Error::new(e).context(context)
-        })?;
+    let gc = ravel_server::gc_config::bootstrap_at_startup(
+        store.clone(),
+        now_unix_ns(),
+        cli.mode,
+        &startup_retry,
+    )
+    .await?;
     if matches!(cli.mode, Mode::Maintain) {
         ravel_server::gc_config::validate_maintain(&gc, &compactor).map_err(|e| {
             anyhow::anyhow!("maintain GC-config validation failed against sys/gc: {e}")
@@ -762,6 +778,7 @@ async fn main() -> anyhow::Result<()> {
         cache,
         heartbeat,
         ipcrypt_policy,
+        startup_retry,
     )
     .await?;
     ravel_server::memory_gate::start_sampler(&memory_gate, running.process_memory_budget())
