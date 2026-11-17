@@ -14,8 +14,8 @@
 //! sit at its ingest hours. The set is ordered newest ingest hour first and,
 //! within an hour, by greatest `max_event_ts_ns` first; the whole-part warm
 //! and the metadata pass below both take parts in that order, the whole-part
-//! warm taking the parts at or under the plan bound and the metadata pass the
-//! parts above it (#4307). "Ingest hour"
+//! warm taking the most recent parts at or under the plan bound, up to its
+//! cap, and the metadata pass the parts above it (#4307). "Ingest hour"
 //! here means any hour holding a commit-record-shaped key of any kind (a raw
 //! commit record, a compaction record, a rewrite record, or a tombstone): a
 //! tombstone-only or rewrite-only hour can anchor the window exactly as a
@@ -44,18 +44,23 @@
 //!
 //! The whole-part warm reads a logs part the way the query path does (#4307):
 //! whole at or under [`LogSegmentFetcher::plan_whole_object_bound`], and not at
-//! all above it. Above the bound the query path reads only the part's
-//! directories, which the metadata pass below warms; a whole read here would
-//! fetch and decode blocks no plan needs. A part above the bound is dropped
-//! from the whole-part set before the [`MAX_PARTS_PER_TENANT_PER_SIGNAL`] cap
-//! and counted in `parts_above_plan_bound`, so the cap takes the most recent
-//! parts at or under the bound. The whole-part fetcher is built with the same
+//! all above it. Above the bound the query path plans the part from its
+//! directories, which the metadata pass below warms, and then reads only the
+//! blocks a statement's plan keeps, so a whole read here would fetch and decode
+//! blocks no plan reads. A part above the bound is dropped from the whole-part
+//! set before the [`MAX_PARTS_PER_TENANT_PER_SIGNAL`] cap and counted in
+//! `parts_above_plan_bound`, so the cap takes the most recent parts at or under
+//! the bound. A part at or under the bound past the cap is counted in
+//! `parts_beyond_cap` and warmed by neither step: the metadata pass reads only
+//! parts above the bound. The whole-part fetcher is built with the same
 //! block-range threshold, request cost and projection break-even the metadata
-//! pass uses, so the two steps agree on the bound and partition the warm set:
-//! a logs part is warmed whole here or has its metadata warmed below, never
-//! both and (budget permitting) never neither. (The metric side is unchanged:
-//! a metric part above [`DEFAULT_WHOLE_OBJECT_THRESHOLD`] is still warmed, on
-//! its footer tail, never skipped.)
+//! pass uses, so the two steps agree on the bound and never both read one part.
+//! When the metadata pass does not run ([`LogsMetadataPass::new`] refuses the
+//! query path's fetch bound), a part above the bound gets no warm at all, and
+//! the first tenant that has one logs that at `warn!`, once per pass. (The
+//! metric side is unchanged: a metric part above
+//! [`DEFAULT_WHOLE_OBJECT_THRESHOLD`] is still warmed, on its footer tail, never
+//! skipped.)
 //!
 //! The whole-part warm holds to the cache budget minus the metadata pass's
 //! ceiling (below), or to the whole budget when the pass does not run. Each
@@ -114,11 +119,18 @@
 //! each fetch updates as it completes, and the steps still running (`step`).
 //! Both lines carry the metadata pass's concurrency
 //! (`metadata_get_permits`), the bytes the whole-part warm holds against
-//! its share (`whole_part_bytes_reserved`), and the count of logs parts the
+//! its share (`whole_part_bytes_reserved`), the count of logs parts the
 //! whole-part step skipped for being above the plan bound
-//! (`parts_above_plan_bound`); the per-(tenant, signal) line carries that
-//! count too, so whole-part plus metadata objects can be read against a
-//! tenant's object count (#4307).
+//! (`parts_above_plan_bound`), and the count of parts of either signal past
+//! the per-(tenant, signal) cap (`parts_beyond_cap`). The per-(tenant, signal)
+//! line carries those two counts as well, so its parts reconcile with the
+//! tenant's warm set: every part in it is counted in exactly one of
+//! `parts_warmed`, `parts_over_budget`, `parts_above_plan_bound` and
+//! `parts_beyond_cap`, except a part whose whole fetch failed, which is logged
+//! at `debug!` and counted in none. A logs part counted in
+//! `parts_above_plan_bound` has its metadata warmed only if the metadata pass
+//! reaches it before its ceiling or the deadline and its read succeeds, so
+//! `metadata_objects_warmed` is at most `parts_above_plan_bound` (#4307).
 //!
 //! Every failure degrades to "warm less than planned," never to a startup
 //! failure: tenant discovery erroring, a resolve erroring, a fetch erroring,
@@ -264,6 +276,10 @@ struct WarmProgress {
     /// directories, which the metadata pass warms, so a whole read here would
     /// fetch and decode blocks no plan needs. Not a warm and not over budget.
     parts_above_plan_bound: AtomicU64,
+    /// Parts of either signal the whole-part step left past the per-(tenant,
+    /// signal) cap. For logs these are parts at or under the plan bound, which
+    /// the metadata pass does not read either.
+    parts_beyond_cap: AtomicU64,
     metadata_objects_warmed: AtomicU64,
     metadata_bytes_warmed: AtomicU64,
     /// The bytes the whole-part warm holds against its share of the cache:
@@ -291,6 +307,11 @@ impl WarmProgress {
 
     fn part_above_plan_bound(&self) {
         self.parts_above_plan_bound.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn parts_beyond_cap(&self, parts: usize) {
+        self.parts_beyond_cap
+            .fetch_add(parts as u64, Ordering::Relaxed);
     }
 
     fn metadata_object_warmed(&self, bytes: u64) {
@@ -386,6 +407,14 @@ async fn warm_cache_within(
 ) {
     let now_ns = clock.now_ns();
     let progress = WarmProgress::default();
+    let metadata_pass = LogsMetadataPass::new(
+        store.clone(),
+        cache.clone(),
+        get_limiter.clone(),
+        memory_budget.clone(),
+        read_gate.clone(),
+        logs_metadata,
+    );
     let outcome = tokio::time::timeout(
         deadline,
         warm_cache_inner(
@@ -397,6 +426,7 @@ async fn warm_cache_within(
             memory_budget,
             read_gate,
             logs_metadata,
+            metadata_pass,
             &progress,
         ),
     )
@@ -407,6 +437,7 @@ async fn warm_cache_within(
             deadline_secs = deadline.as_secs(),
             parts_warmed = progress.parts_warmed.load(Ordering::Relaxed),
             parts_above_plan_bound = progress.parts_above_plan_bound.load(Ordering::Relaxed),
+            parts_beyond_cap = progress.parts_beyond_cap.load(Ordering::Relaxed),
             metadata_objects_warmed = progress.metadata_objects_warmed.load(Ordering::Relaxed),
             metadata_bytes_warmed = progress.metadata_bytes_warmed.load(Ordering::Relaxed),
             metadata_get_permits = progress.metadata_get_permits.load(Ordering::Relaxed),
@@ -435,6 +466,7 @@ async fn warm_cache_inner(
     memory_budget: Arc<ravel_memory::MemoryBudget>,
     read_gate: Arc<ravel_cpu_gate::ReadGate>,
     logs_metadata: LogsMetadataWarm,
+    mut metadata_pass: Option<LogsMetadataPass>,
     progress: &WarmProgress,
 ) {
     let started = tokio::time::Instant::now();
@@ -468,22 +500,14 @@ async fn warm_cache_inner(
     // Build this fetcher with the same block-range threshold, request cost and
     // projection break-even the metadata pass uses, so both agree on that bound
     // and `warm_log_parts` can partition the warm set against it.
-    let logs_fetcher = LogSegmentFetcher::new(store.clone())
+    let logs_fetcher = LogSegmentFetcher::new(store)
         .with_block_range_threshold(logs_metadata.block_range_threshold)
         .with_request_cost_bytes(logs_metadata.request_cost_bytes)
         .with_projection_break_even_bytes(logs_metadata.projection_break_even_bytes)
-        .with_cache(cache.clone())
+        .with_cache(cache)
         .with_get_limiter(get_limiter.clone())
-        .with_memory_budget(memory_budget.clone())
-        .with_read_gate(read_gate.clone());
-    let mut metadata_pass = LogsMetadataPass::new(
-        store,
-        cache,
-        get_limiter.clone(),
-        memory_budget,
-        read_gate,
-        logs_metadata,
-    );
+        .with_memory_budget(memory_budget)
+        .with_read_gate(read_gate);
     // The whole-part warm and the metadata pass insert beside each other, so
     // each holds to its own share and together they never pass the cache's
     // budget: an eviction would drop entries the pass has already counted.
@@ -526,10 +550,12 @@ async fn warm_cache_inner(
         elapsed_ms(step_started)
     };
 
+    let metadata_pass_absent = metadata_pass.is_none();
     let whole_part_warm = async {
         let step_started = tokio::time::Instant::now();
         progress.begin(WarmStep::WholePartWarm);
         let mut warmed = 0usize;
+        let mut unwarmed_above_bound_logged = false;
         while let Some(set) = whole_part_rx.next().await {
             let (metrics, logs) = futures::join!(
                 warm_metric_parts(
@@ -550,6 +576,16 @@ async fn warm_cache_inner(
                 ),
             );
             warmed += metrics + logs;
+            let above_plan_bound = progress.parts_above_plan_bound.load(Ordering::Relaxed);
+            if metadata_pass_absent && above_plan_bound > 0 && !unwarmed_above_bound_logged {
+                unwarmed_above_bound_logged = true;
+                tracing::warn!(
+                    tenant_hash = %set.tenant.to_hex(),
+                    parts_above_plan_bound = above_plan_bound,
+                    "cache warmup: the logs metadata pass is not running, so logs parts above \
+                     the plan bound get no warm at all"
+                );
+            }
         }
         progress.end(WarmStep::WholePartWarm);
         (warmed, elapsed_ms(step_started))
@@ -595,6 +631,7 @@ async fn warm_cache_inner(
     tracing::info!(
         parts_warmed = total_parts_warmed,
         parts_above_plan_bound = progress.parts_above_plan_bound.load(Ordering::Relaxed),
+        parts_beyond_cap = progress.parts_beyond_cap.load(Ordering::Relaxed),
         metadata_objects_warmed = metadata.objects,
         metadata_bytes_warmed = metadata.bytes,
         metadata_budget_reached = metadata_pass
@@ -876,10 +913,10 @@ async fn most_recent_parts(
 /// so this logs at `info!` instead of `warn!` for that case. A signal whose
 /// parts were skipped because they did not fit the whole-part warm's cache
 /// share (`parts_over_budget` above zero) logs at `info!` too: nothing failed.
-/// A logs signal whose parts were all above the plan bound
-/// (`parts_above_plan_bound` above zero) logs at `info!` too: those parts are
-/// warmed by the metadata pass, not here, so none warming whole is expected
-/// (#4307).
+/// A logs signal whose parts were all above the plan bound (none left for the
+/// whole-part step, `parts_above_plan_bound` above zero) logs at `info!` too:
+/// none warming whole is expected (#4307). One with parts at or under the bound
+/// still warns when none of those warmed, whatever its parts above the bound.
 fn log_warm_result(
     tenant: TenantHash,
     signal: Signal,
@@ -889,14 +926,15 @@ fn log_warm_result(
     let latest_ingest_hour =
         latest_hour.map_or_else(|| "none".to_string(), |(hour, _)| hour.to_string());
     let has_ingest_part = latest_hour.is_some_and(|(_, has_ingest_part)| has_ingest_part);
-    if parts.warmed == 0 && parts.over_budget == 0 && parts.above_plan_bound == 0 && has_ingest_part
-    {
+    let only_above_plan_bound = parts.whole_set == 0 && parts.above_plan_bound > 0;
+    if parts.warmed == 0 && parts.over_budget == 0 && !only_above_plan_bound && has_ingest_part {
         tracing::warn!(
             tenant_hash = %tenant.to_hex(),
             signal = ?signal,
             parts_warmed = parts.warmed,
             parts_over_budget = parts.over_budget,
             parts_above_plan_bound = parts.above_plan_bound,
+            parts_beyond_cap = parts.beyond_cap,
             latest_ingest_hour,
             "cache warmup: tenant has parts for this signal but none were warmed"
         );
@@ -907,6 +945,7 @@ fn log_warm_result(
             parts_warmed = parts.warmed,
             parts_over_budget = parts.over_budget,
             parts_above_plan_bound = parts.above_plan_bound,
+            parts_beyond_cap = parts.beyond_cap,
             latest_ingest_hour,
             "cache warmup: warmed tenant signal"
         );
@@ -981,6 +1020,12 @@ struct WholePartsWarmed {
     /// 0 for metrics, whose large parts read only a footer tail rather than
     /// being skipped.
     above_plan_bound: usize,
+    /// Parts left past [`MAX_PARTS_PER_TENANT_PER_SIGNAL`]; for logs, parts at
+    /// or under the plan bound, which no step warms.
+    beyond_cap: usize,
+    /// The parts the whole-part step took before the cap: every part for
+    /// metrics, the parts at or under the plan bound for logs.
+    whole_set: usize,
 }
 
 /// The fetcher one signal's whole-part warm reads through.
@@ -1052,7 +1097,8 @@ fn whole_part_reservation(fetcher: WholePartFetcher<'_>, part: &SegmentRef) -> u
 /// fetch starts. A part that does not fit waits for the next fetch in flight
 /// to complete, whose reservation is then replaced by the bytes it read from
 /// the store (none on a cache hit), and is tested again; one that does not
-/// fit with no fetch of its own in flight is skipped.
+/// fit with no fetch of its own in flight is skipped. The parts past the cap
+/// are counted in `beyond_cap`.
 async fn warm_whole_parts(
     fetcher: WholePartFetcher<'_>,
     tenant: TenantHash,
@@ -1060,7 +1106,12 @@ async fn warm_whole_parts(
     budget: u64,
     progress: &WarmProgress,
 ) -> WholePartsWarmed {
-    let mut outcome = WholePartsWarmed::default();
+    let mut outcome = WholePartsWarmed {
+        beyond_cap: parts.len().saturating_sub(MAX_PARTS_PER_TENANT_PER_SIGNAL),
+        whole_set: parts.len(),
+        ..WholePartsWarmed::default()
+    };
+    progress.parts_beyond_cap(outcome.beyond_cap);
     let mut pending = parts
         .iter()
         .take(MAX_PARTS_PER_TENANT_PER_SIGNAL)
@@ -1151,9 +1202,10 @@ async fn warm_metric_parts(
 /// by the directories the metadata pass warms, so it is dropped from the
 /// whole-part set here, before the [`MAX_PARTS_PER_TENANT_PER_SIGNAL`] cap, and
 /// counted in `parts_above_plan_bound`. The cap then takes the most recent
-/// parts at or under the bound, the ones the query path opens whole. `fetcher`
-/// carries the same bound the metadata pass's fetcher does (see
-/// `warm_cache_inner`), so the two steps partition the warm set.
+/// parts at or under the bound, the ones the query path opens whole, and the
+/// rest of them are counted in `parts_beyond_cap`. `fetcher` carries the same
+/// bound the metadata pass's fetcher does (see `warm_cache_inner`), so the two
+/// steps never both read one part.
 async fn warm_log_parts(
     fetcher: &LogSegmentFetcher,
     tenant: TenantHash,
