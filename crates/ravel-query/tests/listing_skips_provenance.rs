@@ -371,6 +371,13 @@ async fn put_dreq(store: &MemoryStore, window_start_ns: i64, window_end_ns: i64)
         .expect("put dreq");
 }
 
+type ErasureCase = (
+    &'static str,
+    Option<(i64, i64)>,
+    Vec<ErasurePredicate>,
+    usize,
+);
+
 fn predicate(window_start_ns: i64, window_end_ns: i64) -> ErasurePredicate {
     ErasurePredicate::new(
         vec![("user_id".to_string(), ERASED_USER.to_string())],
@@ -405,7 +412,10 @@ async fn the_listing_matches_the_provenance_decode_over_l0_and_l1_with_erasure()
         assert_eq!(objects, objects_want, "{what}: the objects");
         // The series `i` with `i % 3 == 1`.
         let erased = (shape.series + 1) / 3;
-        let cases: [(&str, Option<(i64, i64)>, Vec<ErasurePredicate>, usize); 3] = [
+        // Each case: the erasure request it adds (start and end of its
+        // window, both 0 for a windowless one), the predicates the reference
+        // applies, and the series it keeps.
+        let cases: [ErasureCase; 3] = [
             ("no erasure", None, vec![], shape.series),
             (
                 "windowed",
