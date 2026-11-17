@@ -2284,7 +2284,8 @@ build uses (see "Key-index leaf build budget" above and
 [the catalog spec's pair budget](../../catalog-and-mvcc.md#per-part-key-index-leaves-adr-2707)).
 
 **What drives the cost.** Each build pass re-reads every entry's KEY_IDX
-section. A field's share is the budget divided by the fields the repair
+section that the repair does not hold (see "Section hold" below). A
+field's share is the budget divided by the fields the repair
 builds for that part: the declared fields the part has no leaf for, plus
 any whose leaf version the reader refuses. `--field` narrows that to one
 field. Fields that already have leaves on the part do not count, so one
@@ -2323,6 +2324,30 @@ once (two fields at 8,000,000 each for logs, one field at 16,000,000 for
 spans), so the split of the budget does not explain the higher spans
 peak, and the measurements do not show what does. Keep the default
 8,000,000 on a host without that headroom.
+
+**Section hold.** The figures and the advice above were measured before
+the repair held sections across passes, which it now does by default:
+each entry's KEY_IDX section is kept after its first read and decoded
+from memory in the part's later passes, in part order while the part's
+held bytes stay within `--key-index-repair-hold-bytes`. Each held section
+is charged to the catalog's memory budget, which `ravel-cli` leaves
+unlimited, so for the CLI the cap alone bounds what is held. An entry past
+the cap and every later entry of the part are read in every pass as
+before; a part's sections are released when its build ends.
+The default cap is 2,000,000,000 bytes less 88 bytes for each pair of
+`--key-index-build-max-pairs`: 1,296,000,000 at 8,000,000 and 592,000,000
+at 16,000,000. One read of every section of the measured logs day is
+1,152,815,088 bytes, under the 8,000,000 cap, so at the default budget
+that day is predicted, not measured, to cost 1,096 ranged GETs and about
+1.15 GB of section reads instead of 27,400 and 28.8 GB, with peak RSS
+about 1.8 GB (the measured 0.66 GB plus the 1.15 GB held). At 16,000,000
+the cap is about half of that day's section bytes, so about half its
+sections are held and the rest are read in each of the 13 passes. On a
+host without about 1.8 GB of headroom, pass
+`--key-index-repair-hold-bytes 0` to repair exactly as measured above, or
+a smaller cap. The report gives the cap (`section_hold_cap_bytes`), the
+entries held (`section_hold_entries`) and the most bytes held at once
+(`section_hold_peak_bytes`).
 
 **Thirty retained days.** Derived from the one measured logs day above, not
 separately measured, and only for days whose entries hold the field: 30

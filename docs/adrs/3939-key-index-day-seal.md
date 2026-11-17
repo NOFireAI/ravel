@@ -788,7 +788,8 @@ one day's bound. Peak RSS is predicted, not measured.
 The pass count moves the cost to reads. A logs day's 100,000,000
 `request_id` pairs take at least 25 passes, the count the D3' results
 amendment gives a refold's logs build, and every pass reads every section
-again: at least 2 x 552 x 25 = 27,600 ranged GETs and 25 x 552 x 2.19 MB,
+again (no longer so for a section the repair holds, see the section hold
+amendment below): at least 2 x 552 x 25 = 27,600 ranged GETs and 25 x 552 x 2.19 MB,
 about 30.2 GB of section bytes per logs day ("Two costs the decision did
 not count" gives the 552 entries and the 2.19 MB a read). The repair is
 explicit and operator-driven, not a fold, so A3, which bounds the fold,
@@ -838,3 +839,45 @@ a 7-day logs state at box D's rate took 4,344 s (#3692 comment
 reason for the reduced 30-day rate stands.
 
 Refs: #4350, #4347
+
+## Amendment (issue #4376): the repair holds sections across passes
+
+<!-- amendment-applies: sections="Amendment (issues #4018 and #4297): the repair builds under the pair budget" pointer="section hold amendment" -->
+
+Date: 2026-11-17. The pair-budget repair amendment says every pass of the
+repair reads every section again. That is narrowed. The repair
+(`Catalog::rebuild_key_index`) keeps each entry's KEY_IDX section from
+its first read for the part's later passes, which decode it from memory
+at no GET, in part order while the bytes held for the part stay at or
+under a cap. The first entry that would take them past the cap is not
+held, nor is any later entry of the part; those are read in every pass as
+before. Each held section is reserved against the catalog's memory
+budget, a refused reservation ending the holding the same way rather
+than failing the repair, and everything held is released when the part's
+build ends, on success and on error. The leaves are unchanged.
+
+The cap defaults to `max(0, 2,000,000,000 - 88 x key_index_build_max_pairs)`
+bytes: A1's 2 GB RSS band less ADR-3692's 88 B upper-bound estimate for
+each pair a pass may hold, so the held sections and the pairs at that
+estimate fit the band together. That is 2,000,000,000 - 88 x 8,000,000 =
+1,296,000,000 B at the default budget and 2,000,000,000 - 88 x 16,000,000
+= 592,000,000 B at 16,000,000. `ravel-cli catalog fold --rebuild-key-index
+--key-index-repair-hold-bytes` sets it explicitly; 0 holds nothing and is
+the repair the measured repair amendment measured. What the pair budget
+does not bound (the sections in flight, the encoded leaves of one pass,
+per-entry bookkeeping, allocator overhead) is outside the cap too.
+
+Basis: the measured repair amendment (#4347 comment 6942022692). At the
+default budget the logs day of E = 548 entries took 25 passes and
+13,700 section GETs for 28,820,377,200 B of section reads, so one read of
+every section is 28,820,377,200 / 25 = 1,152,815,088 B, under the
+1,296,000,000 B cap.
+
+Predicted effect, not measured: at the default budget the repair reads
+each of that day's sections once, 548 footer and 548 section GETs, 1,096
+ranged GETs and about 1.15 GB of section bytes, against the 27,400 GETs
+and 28.8 GB measured. Its peak RSS is predicted at about 1.8 GB, the
+measured 0.66 GB plus the 1.15 GB held, under the 2 GB band. The 25
+passes stay.
+
+Refs: #4376, #4347

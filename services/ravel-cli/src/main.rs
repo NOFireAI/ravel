@@ -2856,7 +2856,9 @@ enum CatalogCommand {
         /// reads (two GETs, three when the footer is larger than the 8 KiB
         /// suffix) in every pass of the part's build: one pass unless a
         /// field's pairs pass its share of `--key-index-build-max-pairs`,
-        /// as in a fold's build. No part is re-encoded and no part, `.csnap`
+        /// as in a fold's build. An entry whose section the repair keeps
+        /// (`--key-index-repair-hold-bytes`) is read in the first pass
+        /// only. No part is re-encoded and no part, `.csnap`
         /// or `.cstat` is written. Publishes HEAD once per batch (`--batch-entries`), so an
         /// interrupted run keeps every earlier batch and a rerun skips the
         /// parts they indexed; a part with an entry whose ranged GET failed
@@ -2884,6 +2886,22 @@ enum CatalogCommand {
               default_value_t = ravel_catalog::DEFAULT_KEY_INDEX_REBUILD_BATCH_ENTRIES,
               value_parser = clap::value_parser!(u64).range(1..))]
         batch_entries: u64,
+        /// With `--rebuild-key-index`, the most KEY_IDX section bytes the
+        /// repair keeps for one part across that part's passes, so a kept
+        /// entry costs its footer and section GETs once instead of once per
+        /// pass. Entries are kept in part order until the next one would
+        /// pass this; the rest are read in every pass. (Each kept section is
+        /// also charged to the catalog's memory budget, which this command
+        /// leaves unlimited, so the cap alone bounds what is kept.) A part's
+        /// sections are released when
+        /// its build ends. 0 keeps none. Default: 2,000,000,000 less 88 B for
+        /// each pair of `--key-index-build-max-pairs` (1,296,000,000 at the
+        /// default 8,000,000; 0 from 22,727,273), so the kept sections and
+        /// the pairs at the 88 B upper-bound estimate fit 2 GB together.
+        /// Metrics LABEL_DICT sections are never kept. The report gives the
+        /// cap, the entries kept and the peak bytes kept.
+        #[arg(long, value_name = "BYTES", requires = "rebuild_key_index")]
+        key_index_repair_hold_bytes: Option<u64>,
         /// Print the full `FoldReport` (with `--rebuild-key-index`, the
         /// `KeyIndexRebuildReport`) as JSON instead of the human-readable
         /// text report. Either form carries every counter on the report.
@@ -3370,6 +3388,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     field,
                     batch_entries,
                     key_index_build_max_pairs,
+                    key_index_repair_hold_bytes,
                     no_metrics_label_index,
                     json,
                     tenant_kms,
@@ -3385,6 +3404,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             field,
             batch_entries,
             key_index_build_max_pairs,
+            key_index_repair_hold_bytes,
             !no_metrics_label_index,
             json,
         )
@@ -5952,6 +5972,58 @@ mod tests {
             };
             assert_eq!(err.kind(), kind, "{extra:?}: {err}");
         }
+    }
+
+    /// Issue #4376: `--key-index-repair-hold-bytes` is unset by default (the
+    /// catalog derives the cap from the pair budget), takes any byte count
+    /// with `--rebuild-key-index`, 0 included, and is refused without it.
+    #[test]
+    fn catalog_fold_key_index_repair_hold_bytes_flag() {
+        let try_parse = |extra: &[&str]| {
+            let argv = ["ravel", "catalog", "fold", "--tenant", "acme"]
+                .iter()
+                .chain(extra)
+                .copied()
+                .collect::<Vec<_>>();
+            Cli::try_parse_from(argv)
+        };
+        let hold = |extra: &[&str]| {
+            let Command::Catalog {
+                command:
+                    super::CatalogCommand::Fold {
+                        key_index_repair_hold_bytes,
+                        ..
+                    },
+            } = try_parse(extra)
+                .expect("a catalog fold invocation parses")
+                .command
+            else {
+                panic!("expected the catalog fold subcommand");
+            };
+            key_index_repair_hold_bytes
+        };
+        assert_eq!(hold(&["--rebuild-key-index"]), None);
+        assert_eq!(
+            hold(&["--rebuild-key-index", "--key-index-repair-hold-bytes", "0"]),
+            Some(0)
+        );
+        assert_eq!(
+            hold(&[
+                "--rebuild-key-index",
+                "--key-index-repair-hold-bytes",
+                "592000000"
+            ]),
+            Some(592_000_000)
+        );
+        let err = match try_parse(&["--key-index-repair-hold-bytes", "0"]) {
+            Ok(_) => panic!("the hold flag must be refused without --rebuild-key-index"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "{err}"
+        );
     }
 
     /// The shipped write-concurrency and object-size defaults, read where an
@@ -9038,6 +9110,49 @@ mod rebuild_key_index_dispatch_tests {
     /// the `rebuild_key_index_at_budget` call in `run_logged` and the budget
     /// of 1 becomes the batch size, the pair budget the 250,000 default
     /// batch size, and the run PUTs one leaf.
+    /// Data object GETs of a rebuild run at a budget of one pair with `extra`
+    /// flags.
+    async fn rebuild_data_gets(extra: &[&str]) -> usize {
+        let (endpoint, fake) = folded_without_leaves().await;
+        let before = fake.gets().len();
+        let mut command = vec![
+            "catalog",
+            "fold",
+            "--tenant",
+            TENANT,
+            "--shards",
+            "1",
+            "--signal",
+            "spans",
+            "--rebuild-key-index",
+            "--key-index-build-max-pairs",
+            "1",
+        ];
+        command.extend_from_slice(extra);
+        run_command(&endpoint, &command).await;
+        fake.gets()[before..]
+            .iter()
+            .filter(|key| key.contains("/l0/"))
+            .count()
+    }
+
+    /// Issue #4376: `--key-index-repair-hold-bytes` reaches the repair. At a
+    /// budget of one pair the part's one object takes three passes: with the
+    /// flag at 0 each pass GETs its footer and section (6), and by default
+    /// the section is kept after the first pass (2).
+    ///
+    /// Non-vacuity: pass `None` instead of `key_index_repair_hold_bytes` at
+    /// the `rebuild_key_index_at_budget` call in `run_logged` and the run with
+    /// the flag at 0 issues 2.
+    #[tokio::test]
+    async fn the_hold_flag_reaches_the_rebuild_dispatch() {
+        assert_eq!(
+            rebuild_data_gets(&["--key-index-repair-hold-bytes", "0"]).await,
+            6
+        );
+        assert_eq!(rebuild_data_gets(&[]).await, 2);
+    }
+
     #[tokio::test]
     async fn the_pair_budget_reaches_the_rebuild_dispatch() {
         assert_eq!(rebuild_leaf_puts("1").await, usize::from(TRACES));

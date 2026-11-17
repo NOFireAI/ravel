@@ -717,15 +717,19 @@ pub async fn rebuild_key_index(
         field,
         batch_entries,
         ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+        None,
         metrics_label_index,
         json,
     )
     .await
 }
 
-/// [`rebuild_key_index`], plus `--key-index-build-max-pairs`: sets
+/// [`rebuild_key_index`], plus `--key-index-build-max-pairs`, which sets
 /// [`CatalogConfig::key_index_build_max_pairs`], the pair budget the repair
-/// builds each part under.
+/// builds each part under, and `--key-index-repair-hold-bytes`, which sets
+/// [`CatalogConfig::key_index_repair_hold_bytes`], the section bytes the
+/// repair keeps for one part across its passes (`None` derives it from the
+/// pair budget).
 #[allow(clippy::too_many_arguments)]
 pub async fn rebuild_key_index_at_budget(
     store: Arc<dyn ObjectStoreBackend>,
@@ -736,6 +740,7 @@ pub async fn rebuild_key_index_at_budget(
     field: Option<String>,
     batch_entries: u64,
     key_index_build_max_pairs: u64,
+    key_index_repair_hold_bytes: Option<u64>,
     metrics_label_index: bool,
     json: bool,
 ) -> anyhow::Result<(KeyIndexRebuildReport, String)> {
@@ -748,6 +753,7 @@ pub async fn rebuild_key_index_at_budget(
         field,
         batch_entries,
         key_index_build_max_pairs,
+        key_index_repair_hold_bytes,
         metrics_label_index,
         json,
     )
@@ -784,6 +790,7 @@ pub async fn rebuild_key_index_outcome(
         field,
         batch_entries,
         ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+        None,
         metrics_label_index,
         json,
     )
@@ -792,7 +799,9 @@ pub async fn rebuild_key_index_outcome(
 
 /// [`rebuild_key_index_outcome`] at the pair budget
 /// `key_index_build_max_pairs`, which sets
-/// [`CatalogConfig::key_index_build_max_pairs`].
+/// [`CatalogConfig::key_index_build_max_pairs`], and the section hold cap
+/// `key_index_repair_hold_bytes`, which sets
+/// [`CatalogConfig::key_index_repair_hold_bytes`].
 #[allow(clippy::too_many_arguments)]
 pub async fn rebuild_key_index_outcome_at_budget(
     store: Arc<dyn ObjectStoreBackend>,
@@ -803,6 +812,7 @@ pub async fn rebuild_key_index_outcome_at_budget(
     field: Option<String>,
     batch_entries: u64,
     key_index_build_max_pairs: u64,
+    key_index_repair_hold_bytes: Option<u64>,
     metrics_label_index: bool,
     json: bool,
 ) -> anyhow::Result<(Result<KeyIndexRebuildReport, KeyIndexRebuildError>, String)> {
@@ -820,6 +830,7 @@ pub async fn rebuild_key_index_outcome_at_budget(
         CatalogConfig {
             shard_count,
             key_index_build_max_pairs,
+            key_index_repair_hold_bytes,
             metrics_label_index,
             ..CatalogConfig::default()
         },
@@ -922,6 +933,18 @@ pub fn render_rebuild_report(
     out.push_str(&format!(
         "key_index_build_max_pairs: {}\n",
         report.key_index_build_max_pairs
+    ));
+    out.push_str(&format!(
+        "section_hold_cap_bytes: {}\n",
+        report.section_hold_cap_bytes
+    ));
+    out.push_str(&format!(
+        "section_hold_entries: {}\n",
+        report.section_hold_entries
+    ));
+    out.push_str(&format!(
+        "section_hold_peak_bytes: {}\n",
+        report.section_hold_peak_bytes
     ));
     out.push_str(&format!("passes: {}\n", report.passes));
     out.push_str(&format!(
@@ -2053,13 +2076,25 @@ mod tests {
             (store, bytes)
         }
 
+        /// The rebuild at `budget` with the section hold off.
         async fn rebuild_at(budget: u64) -> KeyIndexRebuildReport {
-            rebuild_json_at(budget).await.0
+            rebuild_json_at(budget, Some(0)).await.0
         }
 
-        /// The rebuild at `budget` with `--json`: the report, the printed
-        /// JSON, and the RSPAN object's bytes.
-        async fn rebuild_json_at(budget: u64) -> (KeyIndexRebuildReport, String, Bytes) {
+        /// The rebuild at `budget` and section hold cap `hold` with `--json`:
+        /// the report, the printed JSON, and the RSPAN object's bytes.
+        async fn rebuild_json_at(
+            budget: u64,
+            hold: Option<u64>,
+        ) -> (KeyIndexRebuildReport, String, Bytes) {
+            rebuild_printed_at(budget, hold, true).await
+        }
+
+        async fn rebuild_printed_at(
+            budget: u64,
+            hold: Option<u64>,
+            json: bool,
+        ) -> (KeyIndexRebuildReport, String, Bytes) {
             let (store, object) = folded_without_leaves().await;
             let (report, printed) = rebuild_key_index_at_budget(
                 store as Arc<dyn ObjectStoreBackend>,
@@ -2070,37 +2105,43 @@ mod tests {
                 None,
                 ravel_catalog::DEFAULT_KEY_INDEX_REBUILD_BATCH_ENTRIES,
                 budget,
+                hold,
                 false,
-                true,
+                json,
             )
             .await
             .expect("rebuild");
             (report, printed, object)
         }
 
+        /// The KEY_IDX section length of the fixture's RSPAN object.
+        fn key_idx_len(object: &Bytes) -> u64 {
+            match ravel_rspan::footer::open_from_suffix(object, object.len() as u64)
+                .expect("footer")
+            {
+                ravel_rspan::footer::SuffixOutcome::Ready(footer) => {
+                    footer
+                        .section(ravel_rspan::footer::kind::KEY_IDX)
+                        .expect("a KEY_IDX section")
+                        .len
+                }
+                ravel_rspan::footer::SuffixOutcome::NeedRange { .. } => {
+                    panic!("the whole object holds its footer")
+                }
+            }
+        }
+
         /// Issue #4348: `--json` carries the budget, the passes, the pairs
-        /// and the ranged reads split by phase. At a budget of one pair the
-        /// part's three trace ids take three passes; each reads the object's
-        /// footer with one suffix GET, which returns the whole object since
-        /// it is under the 8 KiB suffix, and its KEY_IDX section with one
-        /// range GET of exactly the section's length.
+        /// and the ranged reads split by phase. At a budget of one pair, with
+        /// the section hold off, the part's three trace ids take three
+        /// passes; each reads the object's footer with one suffix GET, which
+        /// returns the whole object since it is under the 8 KiB suffix, and
+        /// its KEY_IDX section with one range GET of exactly the section's
+        /// length.
         #[tokio::test]
         async fn the_json_report_carries_the_passes_and_phase_costs() {
-            let (report, printed, object) = rebuild_json_at(1).await;
-            let key_idx_len =
-                match ravel_rspan::footer::open_from_suffix(&object, object.len() as u64)
-                    .expect("footer")
-                {
-                    ravel_rspan::footer::SuffixOutcome::Ready(footer) => {
-                        footer
-                            .section(ravel_rspan::footer::kind::KEY_IDX)
-                            .expect("a KEY_IDX section")
-                            .len
-                    }
-                    ravel_rspan::footer::SuffixOutcome::NeedRange { .. } => {
-                        panic!("the whole object holds its footer")
-                    }
-                };
+            let (report, printed, object) = rebuild_json_at(1, Some(0)).await;
+            let key_idx_len = key_idx_len(&object);
             let object_len = object.len() as u64;
             assert!(object_len < 8 * 1024, "{object_len}");
             assert_ne!(object_len, key_idx_len);
@@ -2171,6 +2212,61 @@ mod tests {
                 ),
                 (1, 6, 3)
             );
+        }
+
+        /// Issue #4376: under the default section hold cap, derived from a
+        /// budget of one pair as 2,000,000,000 - 88 = 1,999,999,912 bytes,
+        /// the three passes read the object's footer and KEY_IDX section
+        /// once, and the JSON and text reports carry the cap, the one entry
+        /// held and the section's length as the peak held. The leaves are
+        /// the three the unheld run writes.
+        #[tokio::test]
+        async fn the_reports_carry_the_section_hold() {
+            let (report, printed, object) = rebuild_json_at(1, None).await;
+            let key_idx_len = key_idx_len(&object);
+            let object_len = object.len() as u64;
+            let value: serde_json::Value =
+                serde_json::from_str(&printed).expect("one JSON document");
+            assert_eq!(value["passes"], u64::from(TRACES), "{printed}");
+            assert_eq!(
+                value["section_hold_cap_bytes"], 1_999_999_912u64,
+                "{printed}"
+            );
+            assert_eq!(value["section_hold_entries"], 1, "{printed}");
+            assert_eq!(value["section_hold_peak_bytes"], key_idx_len, "{printed}");
+            assert_eq!(value["footer_phase_ranged_gets"], 1, "{printed}");
+            assert_eq!(value["section_phase_ranged_gets"], 1, "{printed}");
+            assert_eq!(value["footer_phase_bytes_read"], object_len, "{printed}");
+            assert_eq!(value["section_phase_bytes_read"], key_idx_len, "{printed}");
+            assert_eq!(report.leaves_written, u64::from(TRACES));
+
+            let (_, text, _) = rebuild_printed_at(1, None, false).await;
+            for line in [
+                "section_hold_cap_bytes: 1999999912".to_string(),
+                "section_hold_entries: 1".to_string(),
+                format!("section_hold_peak_bytes: {key_idx_len}"),
+                "footer_phase_ranged_gets: 1".to_string(),
+                "section_phase_ranged_gets: 1".to_string(),
+            ] {
+                assert_eq!(
+                    text.lines().filter(|l| *l == line).count(),
+                    1,
+                    "{line:?} in {text}"
+                );
+            }
+            let (_, unheld, _) = rebuild_printed_at(1, Some(0), false).await;
+            for line in [
+                "section_hold_cap_bytes: 0",
+                "section_hold_entries: 0",
+                "section_hold_peak_bytes: 0",
+                "footer_phase_ranged_gets: 3",
+            ] {
+                assert_eq!(
+                    unheld.lines().filter(|l| *l == line).count(),
+                    1,
+                    "{line:?} in {unheld}"
+                );
+            }
         }
     }
 }
