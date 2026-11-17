@@ -552,9 +552,11 @@ now keys on the parts at or under the bound: it fires when there were some
 and none warmed or was skipped over budget, whatever the parts above the
 bound. Because that per-(tenant, signal) `warn!` is suppressed for a signal
 whose parts are all above the bound, the metadata pass carries the warning
-for those parts: when it warms none of a tenant's non-empty planned set --
-every footer or directory read failed -- it logs its own `warn!` for that
-tenant, so a run where every metadata read failed is not silent. The whole-part cap
+for those parts: when every footer or directory read it started for a tenant
+failed (at least one started, none warmed), it logs its own `warn!` for that
+tenant, so a run where every metadata read failed is not silent. A tenant the
+pass's cache ceiling stopped before any read started gets no such `warn!`:
+nothing failed, and the pass-complete line reports `metadata_budget_reached`. The whole-part cap
 (`MAX_PARTS_PER_TENANT_PER_SIGNAL`), the parts-in-flight and whole-part byte
 budgets, the metadata share of the cache, the warm deadline and `/readyz`
 behaviour are all unchanged. The metric side is unchanged too: a metric part

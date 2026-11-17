@@ -555,16 +555,17 @@ warning.
 Do not expect a `warn!` from this path on a normal warmup pass. A
 tenant/signal combination can produce three `warn!` lines: the `"error"`
 case, the "has parts but none warmed" line of `cache_warm`, and, for a logs
-signal whose segments above the bound were all left to the metadata pass and
-the pass warmed none of them, the "metadata pass warmed none" line.
+signal whose segments above the bound were left to the metadata pass and
+every read the pass started for them failed, the "metadata pass warmed none"
+line.
 
 When the metadata pass runs, it logs one line per tenant that has a log
-segment it plans to read. When it warmed at least one of them it logs `cache
-warmup: warmed tenant logs metadata` at `info!`, carrying
+segment it plans to read. Unless every read it started for that tenant failed,
+it logs `cache warmup: warmed tenant logs metadata` at `info!`, carrying
 `metadata_objects_warmed` and `metadata_bytes_warmed`: the log segments whose
 footer and directories the pass read for that tenant, and the bytes it fetched
-from storage for them. When it warmed none of them because every read failed,
-it logs a `warn!` instead (`cache warmup: tenant has logs parts above the plan
+from storage for them. When it started at least one read for the tenant and
+every one failed, it logs a `warn!` instead (`cache warmup: tenant has logs parts above the plan
 bound but the metadata pass warmed none`). That `warn!` carries the failure a
 tenant whose segments are all above the bound would otherwise hide, because the
 per-(tenant, signal) line stays at `info!` for segments above the bound and the

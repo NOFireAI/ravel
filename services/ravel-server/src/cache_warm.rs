@@ -57,12 +57,11 @@
 //! ([`LogSegmentFetcher::with_max_fetch_run_bytes`]) the metadata pass uses, so
 //! the two steps agree on the bound, warm a part at or under it under the same
 //! extent keys the query path reads, and never both read one part.
-//! When the metadata pass does run but warms none of a tenant's non-empty
-//! planned set -- every footer or directory read failed -- it warns once for
-//! that tenant, since the whole-part step's `warn!` is suppressed for parts
+//! When the metadata pass runs and every footer or directory read it started
+//! for a tenant failed (at least one started, none warmed), it warns once for
+//! that tenant, since the whole-part step's `warn!` stays at `info!` for parts
 //! above the bound. When the metadata pass does not run
-//! ([`LogsMetadataPass::new`] refuses the
-//! query path's fetch bound), a part above the bound gets no warm at all, and
+//! ([`LogsMetadataPass::new`] refuses the query path's fetch bound), a part above the bound gets no warm at all, and
 //! the pass logs one `warn!` saying so, naming the first tenant found with
 //! such a part. (The
 //! metric side is unchanged: a metric part above
@@ -640,19 +639,18 @@ async fn warm_cache_inner(
                 continue;
             }
             let warmed = pass.warm(set.tenant, &planned, progress).await;
-            if warmed.objects == 0 {
-                // #4307: the whole-part step leaves parts above the plan bound
-                // to this pass, and `log_warm_result` does not warn for a
-                // (tenant, signal) whose whole set was empty because every part
-                // was above the bound. So a tenant whose planned metadata set is
-                // non-empty (checked above) but warmed nothing -- every footer
-                // or directory read failed -- would otherwise go unwarned, its
-                // per-read failures logged only at `debug!` in `pass.warm`. Warn
-                // here instead, so that fault is not silent.
+            if warmed.objects == 0 && warmed.failed > 0 {
+                // `log_warm_result` stays at `info!` for a logs signal whose
+                // parts are all above the plan bound, and the per-read failures
+                // are at `debug!`, so this is the only warning when every read
+                // this pass started for the tenant failed. A tenant the ceiling
+                // stopped before any read started is not a fault: the
+                // pass-complete line reports `metadata_budget_reached`.
                 tracing::warn!(
                     tenant_hash = %set.tenant.to_hex(),
                     signal = ?Signal::Logs,
                     metadata_parts_planned = planned.len() as u64,
+                    metadata_reads_failed = warmed.failed as u64,
                     metadata_objects_warmed = warmed.objects as u64,
                     metadata_bytes_warmed = warmed.bytes,
                     "cache warmup: tenant has logs parts above the plan bound but the metadata \
@@ -702,11 +700,12 @@ async fn warm_cache_inner(
 
 /// What the logs metadata pass warmed: objects whose footer and four
 /// directories it read into the cache, and the wire bytes it fetched for them
-/// (cache hits fetch none).
+/// (cache hits fetch none), and the objects whose read failed.
 #[derive(Clone, Copy, Debug, Default)]
 struct MetadataWarmed {
     objects: usize,
     bytes: u64,
+    failed: usize,
 }
 
 /// The logs metadata pass's fetcher and budget, kept across tenants: the
@@ -832,6 +831,7 @@ impl LogsMetadataPass {
                     progress.metadata_object_warmed(fetched);
                 }
                 Err(err) => {
+                    warmed.failed += 1;
                     tracing::debug!(
                         tenant_hash = %tenant.to_hex(),
                         key = %part.data_object_key,
@@ -967,10 +967,10 @@ async fn most_recent_parts(
 /// share (`parts_over_budget` above zero) logs at `info!` too: nothing failed.
 /// A logs signal whose parts were all above the plan bound (none left for the
 /// whole-part step, `parts_above_plan_bound` above zero) logs at `info!` too:
-/// none warming whole is expected (#4307), and the metadata pass that warms
-/// those parts warns on its own future if it warmed none of them (see the
-/// metadata step in [`warm_cache_inner`]), so a run where every metadata read
-/// failed is not silenced here. One with parts at or under the bound still
+/// none warming whole is expected (#4307). The metadata pass that warms those
+/// parts warns for itself when every read it started for the tenant failed
+/// (see the metadata step in [`warm_cache_inner`]), so a run where every
+/// metadata read failed still warns. One with parts at or under the bound still
 /// warns when none of those warmed, whatever its parts above the bound.
 fn log_warm_result(
     tenant: TenantHash,
@@ -4611,6 +4611,90 @@ mod tests {
             ["1"],
             "{}",
             info[0]
+        );
+    }
+
+    /// Issue #4307 (review round 1): a tenant whose parts above the plan bound
+    /// the metadata pass never started a read for, because its cache ceiling
+    /// holds no probe, is not a fault: nothing failed, so the pass logs its
+    /// `info!` line with zero objects and no `warn!`, and the pass-complete line
+    /// reports `metadata_budget_reached`.
+    #[tokio::test(start_paused = true)]
+    async fn a_metadata_pass_stopped_by_its_ceiling_does_not_warn() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let memory = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let now = now_ns();
+        let at = now - NS_PER_MIN;
+        publish_log_segment_sized(
+            &memory,
+            tenant,
+            at,
+            at / NS_PER_HOUR,
+            [1; 32],
+            LARGE_FILLER_BYTES,
+        )
+        .await;
+        let store = Arc::new(RecordsGets::new(memory, Duration::from_secs(0)));
+        let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
+        let (parts, _) =
+            most_recent_parts(&catalog_for(dyn_store.clone()), tenant, Signal::Logs, now).await;
+        assert_eq!(parts.len(), 1);
+        assert!(
+            parts[0].object_size > SPLIT_PLAN_BOUND,
+            "the part is above the bound"
+        );
+        let key = parts[0].data_object_key.clone();
+        let cache = Arc::new(Cache::new(CacheLimits::new(
+            16 * 1024 * 1024,
+            1024,
+            1024 * 1024,
+        )));
+        let warns: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let events = EventCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(WarnEventCapture(warns.clone()))
+            .with(events.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // A one-byte ceiling: no part's probe fits, so no read starts.
+        warm_cache(
+            dyn_store.clone(),
+            catalog_for(dyn_store),
+            ReadCache::Ram(cache.clone()),
+            &FixedClock(now),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            crate::cpu_gates::CpuGates::new(Default::default()).read,
+            LogsMetadataWarm::new(&split_engine(), METADATA_CACHE_SHARE_DIVISOR),
+        )
+        .await;
+
+        assert_eq!(
+            store.ranges(&key),
+            Vec::<GetRange>::new(),
+            "the pass started no read of the part above the bound"
+        );
+        assert!(
+            warns.lock().is_empty(),
+            "a pass its ceiling stopped before any read produces no warn: {:?}",
+            warns.lock()
+        );
+        let info = events.events("cache warmup: warmed tenant logs metadata");
+        assert_eq!(info.len(), 1, "one logs metadata info line: {info:?}");
+        assert_eq!(
+            field_values(&info[0], "metadata_objects_warmed"),
+            ["0"],
+            "{}",
+            info[0]
+        );
+        let complete = events.events(PASS_COMPLETE);
+        assert_eq!(complete.len(), 1, "one pass-complete line: {complete:?}");
+        assert_eq!(
+            field_values(&complete[0], "metadata_budget_reached"),
+            ["true"],
+            "{}",
+            complete[0]
         );
     }
 

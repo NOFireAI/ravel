@@ -7565,12 +7565,12 @@ deadline fires first, the deadline warning reports `parts_warmed`,
 share. Each per-(tenant, signal) `cache warmup: warmed tenant signal` line
 reports `parts_over_budget`, the parts skipped because they did not fit that
 share. When the pass runs, each tenant that has an object above the bound gets
-one of two lines: `cache warmup: warmed tenant logs metadata` at `info!`,
-reporting the first two, when it warmed at least one object; or, when it warmed
-none of its non-empty planned set because every read failed, a `warn!` (`cache
-warmup: tenant has logs parts above the plan bound but the metadata pass warmed
-none`), since the per-(tenant, signal) line stays at `info!` for parts above
-the bound and the per-read failures are logged only at `debug!`.
+one of two lines: a `warn!` when the pass started at least one read for it and
+every one failed, or otherwise `cache warmup: warmed tenant logs metadata` at
+`info!`, reporting the first two. The `warn!` (`cache warmup: tenant has logs
+parts above the plan bound but the metadata pass warmed none`) exists because
+the per-(tenant, signal) line stays at `info!` for parts above the bound and
+the per-read failures are logged only at `debug!`.
 
 `services/ravel-server/tests/cache_warm_footers_e2e.rs` pins this on a
 restarted server. Over six objects whose directories fit in the probe
