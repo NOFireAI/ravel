@@ -235,6 +235,9 @@ async fn rebuild_attaches_a_leaf_and_prints_every_report_field() {
          section_phase_ranged_gets: 1\n\
          section_phase_bytes_read: {}\n\
          key_index_build_max_pairs: {}\n\
+         section_hold_cap_bytes: 1296000000\n\
+         section_hold_entries: 1\n\
+         section_hold_peak_bytes: {}\n\
          passes: 1\n\
          passes_per_field: trace_id=1\n\
          sections_read: 1\n\
@@ -253,7 +256,9 @@ async fn rebuild_attaches_a_leaf_and_prints_every_report_field() {
         leaf.size,
         report.section_bytes_read,
         report.section_bytes_read - object_size,
-        ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS
+        ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+        // The one section, kept after its one read.
+        report.section_bytes_read - object_size,
     );
     assert_eq!(printed, expected);
 
@@ -413,6 +418,10 @@ async fn rebuild_prints_a_deferred_part_and_a_rerun_attaches_it() {
     assert!(printed.contains("parts_rebuilt: 0\n"), "{printed}");
     assert!(printed.contains("parts_deferred: 1\n"), "{printed}");
     // A deferred part's passes count; its pairs do not.
+    assert!(
+        printed.contains("\npasses_per_field: trace_id=1\n"),
+        "{printed}"
+    );
     assert!(printed.contains("\nfield_pairs: none\n"), "{printed}");
     assert!(read_head(&store).await.parts[0].key_index.is_empty());
 

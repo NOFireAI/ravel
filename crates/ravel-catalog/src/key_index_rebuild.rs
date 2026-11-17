@@ -9,8 +9,12 @@
 //! Each field holds at most `max(share, R) + 1` pairs at a time, where
 //! `share = max(1, key_index_build_max_pairs / fields)` and `R` is the
 //! field's largest key8 run, so with no run over the share the part holds at
-//! most `key_index_build_max_pairs + fields` pairs, whatever its size. Each
-//! pass reads every entry's section again. The share divides the budget by
+//! most `key_index_build_max_pairs + fields` pairs, whatever its size. The
+//! repair keeps each entry's KEY_IDX section from its first read for the
+//! part's later passes, in part order while the kept bytes stay within
+//! `CatalogConfig::key_index_repair_hold_cap` and the memory budget grants
+//! them; each later pass reads every other entry's section again (issue
+//! #4376). The share divides the budget by
 //! the fields built, so a rebuilt leaf is byte-identical to the one a fold
 //! with `build_key_index_leaves` on writes for the same part at the same
 //! budget only when the rebuild builds the same fields the fold built. It
@@ -33,9 +37,9 @@ use crate::catalog::Catalog;
 use crate::config::DEFAULT_SNAPSHOT_PART_MAX_ENTRIES;
 use crate::error::CatalogError;
 use crate::fold::{
-    HeadState, HeldLabelDicts, KeyIndexBuildCaller, KeyIndexBuildLimits, MAX_HEAD_CAS_ATTEMPTS,
-    RequestCounters, build_part_key_index, declared_key_index_fields, head_object_key,
-    key_index_leaf_limits, metrics_label_index_leaf_bytes_cap, newer_leaf_refusal,
+    HeadState, HeldLabelDicts, KeyIndexBuildCaller, KeyIndexBuildLimits, KeyIndexSectionHold,
+    MAX_HEAD_CAS_ATTEMPTS, RequestCounters, build_part_key_index, declared_key_index_fields,
+    head_object_key, key_index_leaf_limits, metrics_label_index_leaf_bytes_cap, newer_leaf_refusal,
 };
 use crate::snapshot_format::{
     self, key_index_leaf_format_version, key_index_leaf_prefix_range,
@@ -162,6 +166,21 @@ pub struct KeyIndexRebuildReport {
     /// at least 1. Set once the requested fields are known, before HEAD is
     /// read.
     pub key_index_build_max_pairs: u64,
+    /// The most KEY_IDX section bytes the run kept for one part across the
+    /// part's passes:
+    /// [`CatalogConfig::key_index_repair_hold_cap`](crate::CatalogConfig::key_index_repair_hold_cap).
+    /// 0 keeps none, so every pass reads every section by range. Set with
+    /// `key_index_build_max_pairs`.
+    pub section_hold_cap_bytes: u64,
+    /// Entries whose section was kept after its first read, summed over the
+    /// parts read, a deferred part's and a failed build's included. Each
+    /// costs its footer and section GETs once rather than once per pass.
+    /// Always 0 on metrics, whose LABEL_DICT sections are not kept.
+    pub section_hold_entries: u64,
+    /// The most section bytes kept at once, as read: the largest part's
+    /// kept total, since a part's sections are released when its build
+    /// ends. At most `section_hold_cap_bytes`.
+    pub section_hold_peak_bytes: u64,
     /// Build passes, summed over the parts read, a deferred part's and a
     /// failed build's included. One pass serves every field the part builds
     /// and reads each of the part's entries' sections once, so when every
@@ -394,7 +413,9 @@ impl Catalog {
     /// undeclared `options.field`, before HEAD is read.
     ///
     /// Each part is read once and verified against its `blake3`; each of its
-    /// entries costs the fold's ranged KEY_IDX reads once per pass. The leaves
+    /// entries costs the fold's ranged KEY_IDX reads once per pass, or once
+    /// for the part when its section is held
+    /// ([`crate::CatalogConfig::key_index_repair_hold_bytes`]). The leaves
     /// are built and PUT by the fold's own build under the fold's key layout
     /// and pair budget, [`crate::CatalogConfig::key_index_build_max_pairs`]
     /// (see the module doc for the bound), then HEAD is CAS-published with
@@ -468,6 +489,7 @@ impl Catalog {
         let mut report = KeyIndexRebuildReport {
             fields: requested.iter().map(|(name, _)| name.clone()).collect(),
             key_index_build_max_pairs: self.config().key_index_build_max_pairs.max(1),
+            section_hold_cap_bytes: self.config().key_index_repair_hold_cap(),
             ..KeyIndexRebuildReport::default()
         };
 
@@ -724,6 +746,11 @@ impl Catalog {
         // A part the rebuild visits has no leaf for these fields, or only a
         // refused one, so there is nothing to carry and no held dictionary.
         let no_held = HeldLabelDicts::new(Vec::new(), 0);
+        // Charged to the catalog's memory budget like the part decode above
+        // each build; a cap of 0 holds nothing and builds exactly as with no
+        // hold.
+        let mut section_hold = (report.section_hold_cap_bytes > 0)
+            .then(|| KeyIndexSectionHold::new(report.section_hold_cap_bytes, self));
         for target in batch {
             // A part an earlier batch's CAS loss showed replaced, or already
             // given the refs by someone else, costs nothing.
@@ -765,6 +792,9 @@ impl Catalog {
             // The fold's own passes under the pair budget: each field holds at
             // most its share of `key_index_build_max_pairs` at a time.
             let before = counters;
+            let entries_held_before = section_hold
+                .as_ref()
+                .map_or(0, KeyIndexSectionHold::entries_held);
             let built_part = build_part_key_index(
                 self.store(),
                 tenant,
@@ -775,6 +805,7 @@ impl Catalog {
                 &missing,
                 &[],
                 no_held.part(0),
+                section_hold.as_mut(),
                 &KeyIndexBuildLimits {
                     leaf: key_index_leaf_limits(),
                     max_pairs: self.config().key_index_build_max_pairs,
@@ -813,6 +844,11 @@ impl Catalog {
             report.leaves_written += leaf_puts;
             report.leaf_bytes_written +=
                 counters.key_index_leaf_bytes_put - before.key_index_leaf_bytes_put;
+            if let Some(hold) = &section_hold {
+                report.section_hold_entries += hold.entries_held() - entries_held_before;
+                report.section_hold_peak_bytes =
+                    report.section_hold_peak_bytes.max(hold.peak_held_bytes());
+            }
             let leaves = built_part?;
             for (field, passes) in &leaves.field_passes {
                 *report.passes_per_field.entry(field.clone()).or_insert(0) += passes;
@@ -1160,6 +1196,11 @@ mod tests {
                 section_phase_ranged_gets: 3,
                 section_phase_bytes_read: report.section_phase_bytes_read,
                 key_index_build_max_pairs: crate::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+                // One part of three sections, every one kept under the
+                // default cap.
+                section_hold_cap_bytes: 1_296_000_000,
+                section_hold_entries: 3,
+                section_hold_peak_bytes: report.section_phase_bytes_read,
                 passes: 1,
                 passes_per_field: BTreeMap::from([(USER_ID.to_string(), 1)]),
                 sections_read: 3,
@@ -1562,6 +1603,9 @@ mod tests {
                 section_phase_ranged_gets: 4,
                 section_phase_bytes_read: report.section_phase_bytes_read,
                 key_index_build_max_pairs: crate::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+                section_hold_cap_bytes: 1_296_000_000,
+                section_hold_entries: 4,
+                section_hold_peak_bytes: report.section_hold_peak_bytes,
                 passes: 2,
                 passes_per_field: BTreeMap::from([(USER_ID.to_string(), 2)]),
                 sections_read: 4,
@@ -1741,6 +1785,10 @@ mod tests {
                     section_phase_ranged_gets: 0,
                     section_phase_bytes_read: 0,
                     key_index_build_max_pairs: crate::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+                    // No section was read, so none is kept.
+                    section_hold_cap_bytes: 1_296_000_000,
+                    section_hold_entries: 0,
+                    section_hold_peak_bytes: 0,
                     passes: 1,
                     passes_per_field: BTreeMap::from([(USER_ID.to_string(), 1)]),
                     sections_read: 2,
@@ -2029,11 +2077,12 @@ mod tests {
     /// `key_index_build_max_pairs` 8 (one field, a share of 8): the passes
     /// hold exactly the 40 pairs between them, in 5 passes, each pass's heap
     /// peaking at most at the share plus the one pair placed before a cut,
-    /// 9, and ending holding none. Every pass reads the part's sections
-    /// again, so the run issues 5 x 2 ranged GETs for each of the 4 entries.
-    /// Every one of the 40 keys then probes to its (entry, block), and the
-    /// leaves equal, byte for byte, the ones a fold with the leaf build on
-    /// writes for the same part at the same budget.
+    /// 9, and ending holding none. With the section hold off
+    /// (`key_index_repair_hold_bytes` 0), every pass reads the part's
+    /// sections again, so the run issues 5 x 2 ranged GETs for each of the 4
+    /// entries. Every one of the 40 keys then probes to its (entry, block),
+    /// and the leaves equal, byte for byte, the ones a fold with the leaf
+    /// build on writes for the same part at the same budget.
     ///
     /// A repair that collects every entry's reads before building, budgeted
     /// tiling or not, records no pass and issues 8 ranged GETs.
@@ -2046,6 +2095,7 @@ mod tests {
             rebuilt.clone(),
             CatalogConfig {
                 key_index_build_max_pairs: MAX_PAIRS,
+                key_index_repair_hold_bytes: Some(0),
                 ..config(1)
             },
         )
@@ -2206,8 +2256,9 @@ mod tests {
     /// the fields' passes summed. The 40-pair part with `trace_id` declared
     /// beside `user_id` at a budget of 8: each field's share is 4, so
     /// `user_id` takes 10 passes; no section names `trace_id`, so it leaves
-    /// every entry uncovered and stops building after the first pass. Each
-    /// of the 10 passes reads the 4 sections once.
+    /// every entry uncovered and stops building after the first pass. With
+    /// the section hold off, each of the 10 passes reads the 4 sections once
+    /// by range.
     #[tokio::test]
     async fn the_repair_reports_the_parts_passes_and_each_fields_own() {
         use crate::tenant_config::StorageLayoutWrite;
@@ -2226,6 +2277,7 @@ mod tests {
             store.clone(),
             CatalogConfig {
                 key_index_build_max_pairs: 8,
+                key_index_repair_hold_bytes: Some(0),
                 ..config(1)
             },
         )
@@ -2254,9 +2306,9 @@ mod tests {
         assert_eq!(report.attempts[0].passes, 10, "{report:?}");
     }
 
-    /// The 40-pair part at a budget of 8, rebuilt clean: the leaf keys in PUT
-    /// order with their sizes. Pins the five passes of one leaf each that the
-    /// interrupted-run tests count on.
+    /// The 40-pair part at a budget of 8, rebuilt clean with the section hold
+    /// off: the leaf keys in PUT order with their sizes. Pins the five passes
+    /// of one leaf each that the interrupted-run tests count on.
     async fn forty_pair_leaves_in_put_order() -> Vec<(String, u64)> {
         let store = recording_store();
         forty_pair_part(&store).await;
@@ -2264,6 +2316,7 @@ mod tests {
             store.clone(),
             CatalogConfig {
                 key_index_build_max_pairs: 8,
+                key_index_repair_hold_bytes: Some(0),
                 ..config(1)
             },
         )
@@ -2299,16 +2352,25 @@ mod tests {
         leaves
     }
 
-    /// The same part and budget rebuilt over a store whose `nth` leaf PUT (1
-    /// based) times out before it reaches the store. Returns the run's
-    /// report, the recording store under the faults and the fault count.
+    /// The same part and budget rebuilt, with the section hold cap `hold`
+    /// (`None` the derived default), over a store whose `nth` leaf PUT (1
+    /// based) times out before it reaches the store, under a 1 GiB memory
+    /// budget. Returns the run's report, the recording store under the
+    /// faults, the fault count and the memory budget.
     async fn forty_pair_rebuild_failing_leaf_put(
         nth: usize,
-    ) -> (KeyIndexRebuildReport, Arc<RecordingStore>, u64) {
+        hold: Option<u64>,
+    ) -> (
+        KeyIndexRebuildReport,
+        Arc<RecordingStore>,
+        u64,
+        Arc<ravel_memory::MemoryBudget>,
+    ) {
         let inner = recording_store();
         forty_pair_part(&inner).await;
         let cfg = CatalogConfig {
             key_index_build_max_pairs: 8,
+            key_index_repair_hold_bytes: hold,
             ..config(1)
         };
         let clean = Catalog::new(inner.clone(), cfg).expect("catalog");
@@ -2322,7 +2384,10 @@ mod tests {
                 .then_fault(ScriptedFault::Timeout),
         );
         let faulty = Arc::new(FaultStore::new(Arc::clone(&inner), plan));
-        let catalog = Catalog::new(faulty.clone(), cfg).expect("catalog");
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 30));
+        let catalog = Catalog::new(faulty.clone(), cfg)
+            .expect("catalog")
+            .with_memory_budget(Arc::clone(&budget));
         inner.clear();
         let err = catalog
             .rebuild_key_index(&tenant(), Signal::Logs, &KeyIndexRebuildOptions::default())
@@ -2348,6 +2413,7 @@ mod tests {
             *report,
             inner,
             faulty.fault_count(Op::Put, FaultKind::Timeout),
+            budget,
         )
     }
 
@@ -2362,7 +2428,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_leaf_put_is_counted_as_issued_in_the_interrupted_report() {
         let clean = forty_pair_leaves_in_put_order().await;
-        let (report, inner, faults) = forty_pair_rebuild_failing_leaf_put(2).await;
+        let (report, inner, faults, _) = forty_pair_rebuild_failing_leaf_put(2, Some(0)).await;
         assert_eq!(faults, 1);
         assert_eq!(
             (report.leaves_written, report.leaf_bytes_written),
@@ -2377,8 +2443,9 @@ mod tests {
     }
 
     /// Issue #4297, item 4: a build that fails still reports its reads and
-    /// its leaf PUTs. The fourth of five leaf PUTs times out, after the
-    /// fourth pass's reads: the report counts 4 passes x 2 ranged GETs x 4
+    /// its leaf PUTs. With the section hold off, the fourth of five leaf PUTs
+    /// times out, after the fourth pass's reads: the report counts 4 passes x
+    /// 2 ranged GETs x 4
     /// entries, exactly the bytes the store served for them, 4 leaf PUTs and
     /// the bytes of the first four leaves a clean run PUTs. The stopped batch
     /// is listed as the one attempt, with its one part GET, those ranged GETs
@@ -2392,7 +2459,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_build_reports_its_gets_bytes_and_leaf_puts() {
         let clean = forty_pair_leaves_in_put_order().await;
-        let (report, inner, faults) = forty_pair_rebuild_failing_leaf_put(4).await;
+        let (report, inner, faults, _) = forty_pair_rebuild_failing_leaf_put(4, Some(0)).await;
         assert_eq!(faults, 1);
         let served = inner.data_ranged_gets();
         assert_eq!(served.len(), 4 * 2 * 4);
@@ -2447,6 +2514,303 @@ mod tests {
         assert!(report.field_pairs.is_empty(), "{report:?}");
     }
 
+    /// The 40-pair part's entries in part order, each with the footer bytes
+    /// and the KEY_IDX section bytes one ranged read of it returns, read off
+    /// the part and each object's own footer.
+    async fn forty_pair_read_sizes(
+        store: &RecordingStore,
+        part: &SnapshotPartRef,
+    ) -> Vec<(u64, u64)> {
+        use ravel_logseg::footer::{SuffixOutcome, kind, open_from_suffix};
+        let got = store.get(&part.key, GetRange::Full).await.expect("part");
+        let entries =
+            snapshot_format::decode_part(&got.data, &snapshot_format::PartLimits::default())
+                .expect("part decodes")
+                .entries;
+        let mut sizes = Vec::new();
+        for entry in &entries {
+            let key = crate::column_stats_build::segment_data_key(&tenant(), Signal::Logs, entry)
+                .expect("data key");
+            let object = store.get(&key, GetRange::Full).await.expect("object");
+            let SuffixOutcome::Ready(footer) =
+                open_from_suffix(&object.data, object.data.len() as u64).expect("footer")
+            else {
+                panic!("the whole object covers its footer");
+            };
+            let section = footer.section(kind::KEY_IDX).expect("KEY_IDX section");
+            sizes.push((
+                entry.object_size.min(KEY_INDEX_FOOTER_SUFFIX_LEN),
+                section.len,
+            ));
+        }
+        assert_eq!(sizes.len(), 4);
+        sizes
+    }
+
+    /// One repair of the 40-pair part at a budget of 8 (5 passes) under the
+    /// section hold cap `hold`, with the catalog's memory budget limited to
+    /// `memory_limit` for the repair alone.
+    struct HoldRun {
+        report: KeyIndexRebuildReport,
+        /// Footer suffix and section range GETs the store served.
+        footer_gets: u64,
+        section_gets: u64,
+        /// `(footer, section)` bytes of one read of each entry, in part order.
+        sizes: Vec<(u64, u64)>,
+        /// Every leaf the published HEAD names, with its bytes.
+        leaves: Vec<(String, Bytes)>,
+        /// `take_section_hold_log_for_test` after the run.
+        hold_log: Vec<(u64, u64, usize)>,
+        budget: Arc<ravel_memory::MemoryBudget>,
+        /// The repair's reservation for decoding the part.
+        part_charge: u64,
+    }
+
+    async fn forty_pair_rebuild_holding(hold: Option<u64>, memory_limit: u64) -> HoldRun {
+        let store = recording_store();
+        forty_pair_part(&store).await;
+        let cfg = CatalogConfig {
+            key_index_build_max_pairs: 8,
+            key_index_repair_hold_bytes: hold,
+            ..config(1)
+        };
+        fold_through(
+            &Catalog::new(store.clone(), cfg).expect("catalog"),
+            Signal::Logs,
+            KIDX_HOUR,
+        )
+        .await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(memory_limit));
+        let catalog = Catalog::new(store.clone(), cfg)
+            .expect("catalog")
+            .with_memory_budget(Arc::clone(&budget));
+        store.clear();
+        crate::fold::take_section_hold_log_for_test();
+        let report = rebuild(&catalog, Signal::Logs).await;
+        let hold_log = crate::fold::take_section_hold_log_for_test();
+        let (footer, section): (Vec<_>, Vec<_>) = store
+            .data_ranged_gets()
+            .into_iter()
+            .partition(|(_, range, _)| matches!(range, GetRange::Suffix(_)));
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let part = &head.parts[0];
+        let mut leaves = Vec::new();
+        for leaf in &part.key_index {
+            let got = store.get(&leaf.key, GetRange::Full).await.expect("leaf");
+            leaves.push((leaf.key.clone(), got.data));
+        }
+        let header = store.get(&part.key, GetRange::Full).await.expect("part");
+        let part_charge = snapshot_format::decode_part_header(&header.data)
+            .expect("part header")
+            .entries_uncompressed_len;
+        HoldRun {
+            report,
+            footer_gets: footer.len() as u64,
+            section_gets: section.len() as u64,
+            sizes: forty_pair_read_sizes(&store, part).await,
+            leaves,
+            hold_log,
+            budget,
+            part_charge,
+        }
+    }
+
+    /// Issue #4376: a section hold cap of 0 is the repair as it was before
+    /// the hold. The 40-pair part's 5 passes read each of its 4 entries'
+    /// footer and section in every pass: 20 footer GETs and 20 section GETs,
+    /// 5 times each entry's footer and section bytes, nothing held and no
+    /// hold to release.
+    #[tokio::test]
+    async fn a_hold_cap_of_zero_reads_every_section_in_every_pass() {
+        let run = forty_pair_rebuild_holding(Some(0), u64::MAX).await;
+        let footer: u64 = run.sizes.iter().map(|(f, _)| f).sum();
+        let section: u64 = run.sizes.iter().map(|(_, s)| s).sum();
+        let report = &run.report;
+        assert_eq!((run.footer_gets, run.section_gets), (20, 20));
+        assert_eq!(
+            (
+                report.passes,
+                report.footer_phase_ranged_gets,
+                report.section_phase_ranged_gets,
+                report.footer_phase_bytes_read,
+                report.section_phase_bytes_read,
+            ),
+            (5, 20, 20, 5 * footer, 5 * section),
+            "{report:?}"
+        );
+        assert_eq!(
+            (
+                report.section_hold_cap_bytes,
+                report.section_hold_entries,
+                report.section_hold_peak_bytes,
+            ),
+            (0, 0, 0),
+            "{report:?}"
+        );
+        assert_eq!(run.hold_log, Vec::new());
+        assert_eq!(run.leaves.len(), 5);
+    }
+
+    /// Issue #4376: a cap of exactly the 4 sections' bytes holds all of them
+    /// after their first read, so the 5 passes cost one footer and one
+    /// section GET per entry, 4 + 4, and one read's bytes of each. The held
+    /// bytes peak at the 4 sections' sum, are 0 once the part's build ends,
+    /// and the leaves are byte for byte the cap-0 run's.
+    ///
+    /// FLIP: drop the `hold.0.offer(ordinal, section)` call in
+    /// `build_part_key_index` and the run reads 20 + 20 with nothing held.
+    #[tokio::test]
+    async fn a_cap_for_every_section_reads_each_section_once() {
+        let unheld = forty_pair_rebuild_holding(Some(0), u64::MAX).await;
+        let sum: u64 = unheld.sizes.iter().map(|(_, s)| s).sum();
+        let footer: u64 = unheld.sizes.iter().map(|(f, _)| f).sum();
+        let run = forty_pair_rebuild_holding(Some(sum), u64::MAX).await;
+        assert_eq!(run.sizes, unheld.sizes);
+        let report = &run.report;
+        assert_eq!((run.footer_gets, run.section_gets), (4, 4));
+        assert_eq!(
+            (
+                report.passes,
+                report.sections_read,
+                report.footer_phase_ranged_gets,
+                report.section_phase_ranged_gets,
+                report.footer_phase_bytes_read,
+                report.section_phase_bytes_read,
+            ),
+            (5, 20, 4, 4, footer, sum),
+            "{report:?}"
+        );
+        assert_eq!(
+            (
+                report.section_hold_cap_bytes,
+                report.section_hold_entries,
+                report.section_hold_peak_bytes,
+            ),
+            (sum, 4, sum),
+            "{report:?}"
+        );
+        assert_eq!(run.hold_log, vec![(sum, 0, 0)]);
+        assert_eq!(run.budget.reserved(), 0);
+        assert_eq!(run.leaves, unheld.leaves);
+    }
+
+    /// Issue #4376, the partial hold: a cap of exactly the first 2 entries'
+    /// sections holds those 2 (one footer and one section GET each) and
+    /// reads the other 2 by range in all 5 passes (10 + 10), so 12 footer
+    /// and 12 section GETs. The held bytes peak at the 2 sections' sum, at
+    /// the cap, and the leaves are byte for byte the cap-0 run's.
+    ///
+    /// DISTINGUISHING: an all-or-nothing hold, which also drops the entries
+    /// already held once one does not fit (clearing `by_ordinal` and
+    /// `held_bytes` in `KeyIndexSectionHold::offer`'s over-cap branch),
+    /// reads 20 + 20; a hold that ignores the cap (the `total <= self.cap`
+    /// filter removed) holds all 4 and reads 4 + 4.
+    #[tokio::test]
+    async fn a_cap_for_two_sections_holds_the_first_two_and_rereads_the_rest() {
+        let unheld = forty_pair_rebuild_holding(Some(0), u64::MAX).await;
+        let s = &unheld.sizes;
+        let cap = s[0].1 + s[1].1;
+        let run = forty_pair_rebuild_holding(Some(cap), u64::MAX).await;
+        assert_eq!(run.sizes, unheld.sizes);
+        assert_partial_hold(&run, cap);
+        assert_eq!(run.report.section_hold_cap_bytes, cap);
+        assert_eq!(run.leaves, unheld.leaves);
+    }
+
+    /// The 2-of-4 hold's figures: entries 0 and 1 held, 2 and 3 read in all
+    /// 5 passes.
+    fn assert_partial_hold(run: &HoldRun, held: u64) {
+        let s = &run.sizes;
+        let report = &run.report;
+        assert_eq!((run.footer_gets, run.section_gets), (12, 12));
+        assert_eq!(
+            (
+                report.passes,
+                report.footer_phase_ranged_gets,
+                report.section_phase_ranged_gets,
+                report.footer_phase_bytes_read,
+                report.section_phase_bytes_read,
+            ),
+            (
+                5,
+                12,
+                12,
+                s[0].0 + s[1].0 + 5 * (s[2].0 + s[3].0),
+                s[0].1 + s[1].1 + 5 * (s[2].1 + s[3].1),
+            ),
+            "{report:?}"
+        );
+        assert_eq!(held, s[0].1 + s[1].1);
+        assert_eq!(
+            (report.section_hold_entries, report.section_hold_peak_bytes),
+            (2, held),
+            "{report:?}"
+        );
+        assert!(report.section_hold_peak_bytes <= report.section_hold_cap_bytes);
+        assert_eq!(run.hold_log, vec![(held, 0, 0)]);
+        assert_eq!(run.budget.reserved(), 0);
+    }
+
+    /// Issue #4376, item 4: each held section is reserved against the
+    /// catalog's memory budget, and a refused reservation ends the holding
+    /// rather than the repair. Under the default cap, with the budget limited
+    /// to the part's decode charge plus the first 2 entries' sections, the
+    /// third entry's reservation is refused: the run holds the first 2 and
+    /// reads the other 2 in every pass, exactly as under a cap of those 2,
+    /// publishes the same leaves, and leaves nothing reserved.
+    ///
+    /// FLIP: hold a section without charging it (reserve 0 bytes rather than
+    /// its length in `KeyIndexSectionHold::offer`) and all 4 are held: 4 + 4
+    /// GETs.
+    #[tokio::test]
+    async fn a_refused_hold_reservation_falls_back_to_rereading() {
+        let unheld = forty_pair_rebuild_holding(Some(0), u64::MAX).await;
+        let s = &unheld.sizes;
+        let limit = unheld.part_charge + s[0].1 + s[1].1;
+        let run = forty_pair_rebuild_holding(None, limit).await;
+        assert_eq!(run.sizes, unheld.sizes);
+        // The cap derived at a budget of 8 pairs: 2,000,000,000 - 88 x 8.
+        assert_eq!(run.report.section_hold_cap_bytes, 1_999_999_296);
+        assert_partial_hold(&run, s[0].1 + s[1].1);
+        assert_eq!(run.report.parts_rebuilt, 1);
+        assert_eq!(run.leaves, unheld.leaves);
+    }
+
+    /// Issue #4376: a build that fails mid-part releases what the hold
+    /// keeps. At the default cap all 4 sections are held from the first
+    /// pass; the fourth of five leaf PUTs times out after the fourth pass,
+    /// and the build ends holding the 4 sections and releases them all: the
+    /// hold log reads (held, 0 after, 0 sections after) and the memory
+    /// budget is back to 0. The reads are one per entry, 4 + 4.
+    ///
+    /// FLIP: drop `self.0.release()` from `ReleaseSectionHold::drop` and the
+    /// log reads the 4 sections' bytes and 4 sections still held after the
+    /// build. The same flip fails the lost-CAS test's two-part batch, whose
+    /// second part then decodes the first part's held sections.
+    #[tokio::test]
+    async fn a_failed_build_releases_the_held_sections() {
+        let unheld = forty_pair_rebuild_holding(Some(0), u64::MAX).await;
+        let sum: u64 = unheld.sizes.iter().map(|(_, s)| s).sum();
+        crate::fold::take_section_hold_log_for_test();
+        let (report, inner, faults, budget) = forty_pair_rebuild_failing_leaf_put(4, None).await;
+        let log = crate::fold::take_section_hold_log_for_test();
+        assert_eq!(faults, 1);
+        assert_eq!(log, vec![(sum, 0, 0)]);
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(
+            (
+                report.passes,
+                report.footer_phase_ranged_gets,
+                report.section_phase_ranged_gets,
+                report.section_hold_entries,
+                report.section_hold_peak_bytes,
+            ),
+            (4, 4, 4, 4, sum),
+            "{report:?}"
+        );
+        assert_eq!(inner.data_ranged_gets().len(), 4 + 4);
+    }
+
     /// A ranged GET that fails with a store error for one entry defers its
     /// part: no leaf is built for it and it gains no ref this run, the report
     /// counts it in `parts_deferred`, and the other part of the batch
@@ -2470,8 +2834,28 @@ mod tests {
         ));
         let catalog = off_catalog(faulty.clone(), 2);
         inner.clear();
+        crate::fold::take_section_hold_log_for_test();
         let report = rebuild(&catalog, Signal::Logs).await;
         assert_eq!(faulty.fault_count(Op::Get, FaultKind::Timeout), 1);
+        // Issue #4376: the deferred part releases the section it held, the
+        // one its other entry's read returned, like the built part before it.
+        let other_section: u64 = inner
+            .data_ranged_gets()
+            .iter()
+            .filter(|(key, range, _)| {
+                part_keys[1].contains(key)
+                    && *key != failing
+                    && matches!(range, GetRange::Range(..))
+            })
+            .map(|(_, _, bytes)| bytes)
+            .sum();
+        assert_eq!(
+            crate::fold::take_section_hold_log_for_test(),
+            vec![
+                (report.section_hold_peak_bytes, 0, 0),
+                (other_section, 0, 0)
+            ]
+        );
         assert_eq!(
             report,
             KeyIndexRebuildReport {
@@ -2493,6 +2877,11 @@ mod tests {
                 section_phase_ranged_gets: 3,
                 section_phase_bytes_read: report.section_phase_bytes_read,
                 key_index_build_max_pairs: crate::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+                // Both entries of the built part and the deferred part's
+                // entry whose GETs succeeded.
+                section_hold_cap_bytes: 1_296_000_000,
+                section_hold_entries: 3,
+                section_hold_peak_bytes: report.section_hold_peak_bytes,
                 // The deferred part's one pass counts; its pairs do not.
                 passes: 2,
                 passes_per_field: BTreeMap::from([(USER_ID.to_string(), 2)]),
@@ -2724,6 +3113,7 @@ mod tests {
             KeyIndexRebuildReport {
                 fields: vec!["label_value".to_string()],
                 key_index_build_max_pairs: crate::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+                section_hold_cap_bytes: 1_296_000_000,
                 ..KeyIndexRebuildReport::default()
             }
         );
@@ -2766,6 +3156,7 @@ mod tests {
                 leaf_prefix_gets: 2,
                 leaf_prefix_bytes_read: leaves.iter().map(|l| u64::from(l.prefix_len)).sum(),
                 key_index_build_max_pairs: crate::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+                section_hold_cap_bytes: 1_296_000_000,
                 ..KeyIndexRebuildReport::default()
             }
         );
@@ -3253,6 +3644,14 @@ mod tests {
         assert_eq!(rebuilt.lists(), 1, "the pending erasure listing only");
         assert_eq!(report.ranged_gets, 2 * 6, "{report:?}");
         assert_eq!(rebuilt.data_ranged_gets().len(), 2 * 6);
+        // Issue #4376: no LABEL_DICT section is held, even under the default
+        // cap, which has room for all six.
+        assert_eq!(report.section_hold_cap_bytes, 1_296_000_000, "{report:?}");
+        assert_eq!(
+            (report.section_hold_entries, report.section_hold_peak_bytes),
+            (0, 0),
+            "{report:?}"
+        );
         assert_eq!(report.uncovered_entries, 0, "{report:?}");
 
         let fold_head = read_signal_head(folded.as_ref(), Signal::Metrics).await;

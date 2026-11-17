@@ -1951,12 +1951,14 @@ budget, `key_index_build_max_pairs` from its catalog config, which
 the default and in three at a budget of 1). A part it visits has no previous leaf to carry and holds no
 LABEL_DICT pairs from a postings build, so the per-field bound above is
 the whole of what it holds in pairs: at most `max(share, R) + 1` per field,
-at most `budget + F` for the part when no key8 run exceeds a share, read
-again from the sections on every pass, and released before the next part.
+at most `budget + F` for the part when no key8 run exceeds a share,
+decoded again from the sections on every pass (a held section from
+memory, see the section hold below), and released before the next part.
 Test `the_repair_holds_at_most_the_pair_budget_and_matches_the_fold_at_that_budget`
 pins it: 40 pairs of one field under a budget of 8 build in 5 passes, each
-holding 8 pairs, a peak of 9 with the pair placed before a cut, every
-section read in each pass (40 ranged GETs for 4 entries), and leaves byte
+holding 8 pairs, a peak of 9 with the pair placed before a cut, with the
+section hold off every section read in each pass (40 ranged GETs for 4
+entries), and leaves byte
 for byte a fold's at the same budget. A repair that built in one pass with
 no budget, holding every section read of its batch whole, was predicted to
 hold about 6.8 GB of pairs for a logs day (ADR-3939, "Decision 2,
@@ -1972,8 +1974,44 @@ does not bound: the sections in flight, up to `fold_bucket_concurrency`,
 the encoded leaves of one pass until their PUTs, and per-entry
 bookkeeping. Its 100,000,000 `request_id` pairs take at least
 `ceil(100,000,000 / 4,000,000) = 25` passes (ADR-3939, "Two costs the
-decision did not count"), so the repair reads every section of the part
-25 times or more.
+decision did not count"), so with the section hold off the repair reads
+every section of the part 25 times or more.
+
+The repair holds sections across passes. The first pass
+that reads an entry's KEY_IDX section keeps its bytes for the part's later
+passes, which decode it from memory at no GET, in part order while the
+bytes held for the part stay at or under a cap; the first entry that would
+take them past it is not held, and neither is any later entry of the
+part, so those are read by range in every pass. Each held section is also
+reserved against the catalog's memory budget (`memory_budget()`, the same
+budget the part decode before the build reserves against), and a refused
+reservation ends the holding the same way rather than failing the repair.
+Everything held is released when the part's build ends, on success, on a
+deferred part and on an error. Metrics LABEL_DICT sections are never held.
+The leaves are the same with or without the hold. The cap is
+`key_index_repair_hold_bytes` (`ravel-cli catalog fold --rebuild-key-index
+--key-index-repair-hold-bytes`, refused without `--rebuild-key-index`); 0
+holds nothing and reads as above. Its default is derived from the budget,
+`max(0, 2,000,000,000 - 88 x key_index_build_max_pairs)` bytes, the fold's
+2 GB RSS band less the 88 B upper-bound estimate above for each pair a
+pass may hold, so the held sections and the pairs at that estimate fit the
+band together: 1,296,000,000 B at the default 8,000,000 pairs,
+592,000,000 B at 16,000,000, and 0 from 22,727,273 pairs up
+(`CatalogConfig::key_index_repair_hold_cap`; test
+`the_repair_hold_cap_derives_from_the_pair_budget`). What the budget does
+not bound, listed above, is outside the cap too. On the 40-pair part at a
+budget of 8, a cap of the 4 sections' bytes reads 4 footer and 4 section
+GETs and peaks at those bytes (test
+`a_cap_for_every_section_reads_each_section_once`), a cap of the first 2
+entries' sections reads 12 and 12 (test
+`a_cap_for_two_sections_holds_the_first_two_and_rereads_the_rest`), and a
+memory budget with room for only those 2 reads the same 12 and 12 (test
+`a_refused_hold_reservation_falls_back_to_rereading`). For the measured
+logs day (ADR-3939, the measured repair amendment) one read of every
+section is 1,152,815,088 B, under the default cap, so the repair is
+predicted to read each section once at the default budget: 1,096 ranged
+GETs and about 1.15 GB of section bytes, where it read 27,400 and 28.8 GB.
+Predicted, not measured.
 
 The fold report carries four figures for this build, each also a
 `/metrics` counter in the `mode` label set the other fold counters use,
@@ -2147,7 +2185,9 @@ which is refused unless the tenant declares it, it reads the part object
 once, reads each entry's footer suffix and KEY_IDX section (the ranged
 GETs of the fold's own leaf build: two per entry in every pass of the
 build under the pair budget, see "Pair budget", and a third when the
-footer is larger than the 8 KiB suffix), writes the leaves for the
+footer is larger than the 8 KiB suffix; in the first pass only for an
+entry whose section the repair holds, see the section hold under "Pair
+budget"), writes the leaves for the
 declared fields under the fold's key layout (at the same budget, for a
 declared field the leaf is byte-identical to the one a fold with
 `build_key_index_leaves` on writes for the same part only when the repair
@@ -2200,7 +2240,12 @@ footer range, `section_phase_ranged_gets` and `section_phase_bytes_read`
 for its KEY_IDX section, LABEL_DICT on metrics; bytes as transferred,
 retries excluded; `ranged_gets` and `section_bytes_read` are the sums of
 the two phases), the pair budget it built under
-(`key_index_build_max_pairs`), build passes summed over the parts read
+(`key_index_build_max_pairs`), the section hold cap it ran with
+(`section_hold_cap_bytes`), the entries whose section it held, summed
+over the parts read (`section_hold_entries`), the most section bytes it
+held at once (`section_hold_peak_bytes`; test
+`the_reports_carry_the_section_hold` pins all three in the JSON and text
+reports), build passes summed over the parts read
 (`passes`; one pass serves every field of a part, so with two fields a
 part's passes are the larger field's count, not the sum), the passes each
 field was building for (`passes_per_field`), section reads, one per entry
@@ -2211,8 +2256,9 @@ reads, leaf PUTs, HEAD CAS tries and parts published (an
 attempt is one batch's publish including its retries, at most
 `MAX_HEAD_CAS_ATTEMPTS` tries, so a lost CAS adds a try, not an attempt).
 Tests `the_repair_holds_at_most_the_pair_budget_and_matches_the_fold_at_that_budget`
-(40 pairs at a budget of 8: 5 passes, 20 section reads, 20 footer and 20
-section GETs), `the_repair_reports_the_parts_passes_and_each_fields_own`
+(40 pairs at a budget of 8 with the section hold off: 5 passes, 20
+section reads, 20 footer and 20 section GETs),
+`the_repair_reports_the_parts_passes_and_each_fields_own`
 (two fields at the same budget: 10 passes, `user_id` 10 and `trace_id` 1)
 and `the_json_report_carries_the_passes_and_phase_costs` pin these.
 A run that stops or exhausts the CAS retries on one batch has therefore

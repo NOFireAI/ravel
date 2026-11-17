@@ -1677,8 +1677,10 @@ to it: sections in flight, the encoded leaves of one pass, per-entry
 bookkeeping, and a key8 run over its share. Parts are built one at a time,
 so a batch of parts holds no more than its largest part.
 
-The price is reads. Every pass reads every section of the part again: two
-ranged GETs per entry per pass while the footer fits the 8 KiB suffix.
+The price is reads. Every pass reads every section of the part again (no
+longer so for a section the repair holds, see the section hold amendment
+below): two ranged GETs per entry per pass while the footer fits the
+8 KiB suffix.
 100,000,000 `request_id` pairs at a share of 4,000,000 take at least
 `ceil(100,000,000 / 4,000,000) = 25` passes, so a logs day of 552 entries
 costs at least 2 x 552 x 25 = 27,600 ranged GETs and 25 x 552 x 2.19 MB,
@@ -1725,3 +1727,38 @@ sections in flight, the encoded leaves and allocator overhead, so it
 neither confirms nor refutes the 6.8 GB pairs figure.
 
 Refs: #4350, #4347
+
+## Amendment (issue #4376): the key-index repair holds sections across passes
+
+<!-- amendment-applies: sections="Amendment (issues #4018 and #4297): the key-index repair builds under the pair budget" pointer="section hold amendment" -->
+
+Date: 2026-11-17. The pair-budget repair amendment's "every pass reads
+every section of the part again" is narrowed for the repair alone; the
+fold's own build is unchanged. `Catalog::rebuild_key_index` keeps each
+entry's KEY_IDX section from its first read for the part's later passes,
+decoded from memory at no GET, in part order while the bytes held for the
+part stay at or under a cap; the first entry that would pass it and every
+later entry of the part are read in every pass. Each held section is
+reserved against the catalog's memory budget (a refusal ends the holding,
+not the repair), and the part's held sections are released when its build
+ends, on success and on error. The leaves are byte for byte the same
+(test `a_cap_for_every_section_reads_each_section_once` in
+crates/ravel-catalog/src/key_index_rebuild.rs).
+
+The held bytes join decision 5's list of what the pair budget does not
+bound, under their own cap, `key_index_repair_hold_bytes`, which defaults
+to `max(0, 2,000,000,000 - 88 x key_index_build_max_pairs)` bytes: the
+2 GB RSS band less the 88 B upper-bound estimate for each pair. That is
+1,296,000,000 B at the default 8,000,000 pairs and 592,000,000 B at
+16,000,000. `ravel-cli catalog fold --rebuild-key-index
+--key-index-repair-hold-bytes` sets it; 0 is the repair as measured.
+
+Measured basis: the measured repair amendment above (#4347 comment
+6942022692), whose logs day read 28,820,377,200 B of sections over 25
+passes, 1,152,815,088 B for one read of each of its 548 sections, under
+the default cap. Predicted, not measured: at the default budget that day
+costs 1,096 ranged GETs and about 1.15 GB of section bytes, one read per
+section, instead of 27,400 GETs and 28.8 GB; ADR-3939's section hold
+amendment carries the same figures and the predicted peak RSS.
+
+Refs: #4376, #4347
