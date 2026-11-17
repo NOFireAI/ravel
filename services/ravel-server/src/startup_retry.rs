@@ -1,9 +1,9 @@
 //! Bounded retry of the store reads startup refuses on (issue #4325).
 //!
 //! Every gate that reads the store before a listener binds (qualification,
-//! tenancy pinning, tenant key epochs, provisioning validation, `sys/gc`, the
-//! IPCrypt policy marker) used to refuse to start on the first store error,
-//! even one the store contract marks retryable.
+//! the retired-reader gate, tenancy pinning, tenant key epochs, provisioning
+//! validation, `sys/gc`, the IPCrypt policy marker) used to refuse to start on
+//! the first store error, even one the store contract marks retryable.
 //!
 //! [`StartupRetry::run`] runs one such read and retries it only while it fails
 //! with a transient store error: a [`StoreError`] that
@@ -38,6 +38,7 @@ use ravel_object_store::s3::S3Store;
 use ravel_object_store::{KmsRoutingStore, ObjectStoreBackend, StoreError};
 use ravel_types::{ConfiguredScheme, TenantHash};
 
+use crate::compat_gate::{CompatGateError, GateOutcome, RetiredReader};
 use crate::config::{Mode, StoreKind};
 use crate::tenancy::{ResolvedTenancy, TenancyError};
 use crate::tenant_kms::{TenantKmsConfig, TenantKmsError};
@@ -65,6 +66,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Site names, as they appear in the retry log line and the deadline error.
 pub const SITE_QUALIFICATION: &str = "sys/qualification";
+pub const SITE_RETIRED_READER_GATE: &str = "the retired-reader gate (sys/compat, sys/tenancy)";
 pub const SITE_TENANCY: &str = "sys/tenancy";
 pub const SITE_TENANT_KMS: &str = "tenant key-epoch records (t/<tenant_hash>/enc)";
 pub const SITE_PROVISIONING: &str = "shard_count provisioning records";
@@ -426,6 +428,40 @@ pub async fn enforce_qualification(
         })
 }
 
+/// The retired-reader gate (ADR-4233 decision 7), retried. The gate is
+/// read-only, so a retry repeats its reads from the start. A store error the
+/// gate wraps, in [`CompatGateError::Store`] or through
+/// [`CompatGateError::CompatUnreadable`], retries when it is transient; every
+/// refusal the gate decides from what it read refuses on the first attempt.
+/// It sends no request while `retired` is empty. The deployment key comes
+/// from the configured scheme, as `--tenant-hash-key-file` gives it.
+pub async fn enforce_retired_reader_gate(
+    retry: &StartupRetry,
+    store: &dyn ObjectStoreBackend,
+    configured: &ConfiguredScheme,
+    retired: &[RetiredReader],
+    now_ns: i64,
+) -> anyhow::Result<GateOutcome> {
+    let deployment_key = match configured {
+        ConfiguredScheme::Keyed(key) => Some(key.as_ref()),
+        ConfiguredScheme::Unkeyed | ConfiguredScheme::Unspecified => None,
+    };
+    let outcome = retry
+        .run(
+            SITE_RETIRED_READER_GATE,
+            || crate::compat_gate::enforce(store, deployment_key, retired, now_ns),
+            |err: &CompatGateError| chain_is_transient(err),
+        )
+        .await
+        .map_err(|failure| {
+            failure.into_anyhow(|err| {
+                anyhow::Error::new(err).context("retired-reader gate (sys/compat) refused startup")
+            })
+        })?;
+    tracing::debug!(outcome = ?outcome, "retired-reader gate passed");
+    Ok(outcome)
+}
+
 /// Tenant-hash scheme resolution and marker bootstrap (ADR-0050 section 3),
 /// retried. The marker write is create-if-absent and a retry starts from the
 /// read, so a write that landed before an ambiguous failure is found by the
@@ -534,6 +570,9 @@ pub struct StartupStoreInputs<'a> {
     /// The concrete S3 store the bucket-protection read goes through.
     pub store_s3: Option<&'a S3Store>,
     pub tenancy: ConfiguredScheme,
+    /// The readers this build retired, which the retired-reader gate checks:
+    /// `compat_gate::RETIRED_READERS` in `main`.
+    pub retired_readers: &'a [RetiredReader],
     /// The KMS routing store and `--tenant-kms-config`, when that flag set
     /// up per-tenant SSE-KMS routing.
     pub tenant_kms: Option<(&'a KmsRoutingStore, &'a TenantKmsConfig)>,
@@ -544,6 +583,8 @@ pub struct StartupStoreInputs<'a> {
 
 /// What the startup store checks resolved.
 pub struct StartupStoreState {
+    /// Why the retired-reader gate let the process start.
+    pub retired_reader_gate: GateOutcome,
     pub tenancy: ResolvedTenancy,
     /// The statically known tenants, hashed under the installed scheme.
     pub static_tenants: Vec<TenantHash>,
@@ -551,10 +592,12 @@ pub struct StartupStoreState {
 }
 
 /// Every startup store check `main` makes before a listener binds, in order:
-/// qualification, the bucket-protection gate, tenancy pinning (and the scheme
-/// install), tenant key epochs, provisioning validation for the tenants
-/// `static_tenants` returns once the scheme is installed, and the `sys/gc`
-/// bootstrap. Every check but the bucket-protection gate, which has its own
+/// qualification, the bucket-protection gate, the retired-reader gate (before
+/// tenancy pinning, which writes `sys/tenancy` on a fresh store, because the
+/// gate tells a fresh store from an unadopted one by that marker's absence),
+/// tenancy pinning (and the scheme install), tenant key epochs, provisioning
+/// validation for the tenants `static_tenants` returns once the scheme is
+/// installed, and the `sys/gc` bootstrap. Every check but the bucket-protection gate, which has its own
 /// bound, runs under `retry`. The IPCrypt marker check is the one site left,
 /// inside `start`. `now_unix_ns` stamps the records the checks write.
 pub async fn run_startup_store_checks(
@@ -575,6 +618,14 @@ pub async fn run_startup_store_checks(
         inputs.require_bucket_protection,
         inputs.store_s3,
         store.as_ref(),
+    )
+    .await?;
+    let retired_reader_gate = enforce_retired_reader_gate(
+        retry,
+        store.as_ref(),
+        &inputs.tenancy,
+        inputs.retired_readers,
+        now_unix_ns(),
     )
     .await?;
     let tenancy = resolve_tenancy(retry, store.as_ref(), inputs.tenancy, now_unix_ns()).await?;
@@ -601,6 +652,7 @@ pub async fn run_startup_store_checks(
     )
     .await?;
     Ok(StartupStoreState {
+        retired_reader_gate,
         tenancy,
         static_tenants,
         gc,
@@ -1300,6 +1352,289 @@ mod tests {
             err.downcast_ref::<crate::qualification::QualificationError>(),
             Some(crate::qualification::QualificationError::Absent)
         ));
+        assert!(clock.sleeps().is_empty());
+    }
+
+    // --- retired-reader gate ---
+
+    const GATE_KEY: [u8; 32] = [0x2A; 32];
+    const CERTIFIED_NS: i64 = 1_000_000_000_000;
+    const GATE_NOW_NS: i64 = CERTIFIED_NS + 3_600_000_000_000;
+    const RSEG_8: RetiredReader = RetiredReader {
+        family: ravel_catalog::compat::FAMILY_RSEG,
+        oldest_readable: 8,
+    };
+    const GATE_REFUSAL: &str = "retired-reader gate (sys/compat) refused startup";
+
+    fn keyed() -> ConfiguredScheme {
+        ConfiguredScheme::Keyed(Box::new(GATE_KEY))
+    }
+
+    /// An `rseg` entry with an optional version-8 certificate.
+    fn rseg_entry(
+        certified: bool,
+        watermark_unix_ns: i64,
+        contradicted: bool,
+    ) -> ravel_proto::sys::v1::CompatFamily {
+        ravel_proto::sys::v1::CompatFamily {
+            family: ravel_catalog::compat::FAMILY_RSEG.to_string(),
+            active_write_version: 8,
+            certificate: certified.then(|| ravel_proto::sys::v1::Certificate {
+                version: 8,
+                certified_unix_ns: CERTIFIED_NS,
+                member_count: 3,
+                ..Default::default()
+            }),
+            late_writes_verified_through_unix_ns: watermark_unix_ns,
+            contradicted,
+            ..Default::default()
+        }
+    }
+
+    async fn put_tenancy_marker(store: &dyn ObjectStoreBackend) {
+        store
+            .put(
+                crate::tenancy::TENANCY_MARKER_KEY,
+                Bytes::from_static(b"marker"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put sys/tenancy");
+    }
+
+    /// An adopted store: `sys/compat` holding `entry`, and `sys/tenancy`.
+    async fn seed_compat(
+        store: &dyn ObjectStoreBackend,
+        entry: ravel_proto::sys::v1::CompatFamily,
+    ) {
+        ravel_catalog::compat::create_compat(
+            store,
+            &ravel_catalog::compat::CompatKeys::from_file_keys(&[GATE_KEY]).expect("key"),
+            ravel_proto::sys::v1::CompatRecord {
+                format_version: ravel_catalog::compat::COMPAT_FORMAT_VERSION,
+                families: vec![entry],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create sys/compat");
+        put_tenancy_marker(store).await;
+    }
+
+    #[tokio::test]
+    async fn retired_reader_gate_retries_a_transient_compat_head_then_starts() {
+        let clock = Arc::new(ManualClock::default());
+        let store = faulted(transient_then_ok(
+            Op::Head,
+            ravel_catalog::compat::COMPAT_KEY,
+            2,
+        ));
+        let outcome = enforce_retired_reader_gate(
+            &retry_on(clock.clone()),
+            &store,
+            &keyed(),
+            &[RSEG_8],
+            GATE_NOW_NS,
+        )
+        .await
+        .expect("starts once the store answers");
+        assert_eq!(outcome, crate::compat_gate::GateOutcome::Fresh);
+        assert_eq!(store.fault_count(Op::Head, FaultKind::Transient), 2);
+        assert_eq!(store.sequence_progress(0), 3);
+        assert_eq!(clock.sleeps().len(), 2);
+    }
+
+    /// A transient error on the `sys/compat` GET reaches the gate as
+    /// `CompatUnreadable(CompatError::Store { .. })`; the source-chain walk
+    /// finds the store error under both and retries.
+    #[tokio::test]
+    async fn retired_reader_gate_retries_a_transient_compat_read_then_starts() {
+        let clock = Arc::new(ManualClock::default());
+        let store = faulted(transient_then_ok(
+            Op::Get,
+            ravel_catalog::compat::COMPAT_KEY,
+            2,
+        ));
+        seed_compat(store.inner(), rseg_entry(true, CERTIFIED_NS + 1, false)).await;
+        let outcome = enforce_retired_reader_gate(
+            &retry_on(clock.clone()),
+            &store,
+            &keyed(),
+            &[RSEG_8],
+            GATE_NOW_NS,
+        )
+        .await
+        .expect("starts once the store answers");
+        assert!(
+            matches!(outcome, crate::compat_gate::GateOutcome::Certified { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 2);
+        assert_eq!(store.sequence_progress(0), 3);
+        assert_eq!(clock.sleeps().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn retired_reader_gate_transient_past_the_deadline_refuses_naming_the_site() {
+        let clock = Arc::new(ManualClock::default());
+        let store = faulted(always_transient(
+            Op::Head,
+            ravel_catalog::compat::COMPAT_KEY,
+        ));
+        let err = enforce_retired_reader_gate(
+            &retry_on(clock.clone()),
+            &store,
+            &keyed(),
+            &[RSEG_8],
+            GATE_NOW_NS,
+        )
+        .await
+        .expect_err("refuses once the deadline passes");
+        let attempts = store.fault_count(Op::Head, FaultKind::Transient);
+        assert_deadline_refusal(&err, SITE_RETIRED_READER_GATE, attempts);
+        assert!(format!("{err:#}").contains(GATE_REFUSAL));
+    }
+
+    #[tokio::test]
+    async fn retired_reader_gate_non_transient_store_error_refuses_on_the_first_attempt() {
+        let clock = Arc::new(ManualClock::default());
+        let store = faulted(always_permanent(
+            Op::Head,
+            ravel_catalog::compat::COMPAT_KEY,
+        ));
+        let err = enforce_retired_reader_gate(
+            &retry_on(clock.clone()),
+            &store,
+            &keyed(),
+            &[RSEG_8],
+            GATE_NOW_NS,
+        )
+        .await
+        .expect_err("refuses at once");
+        assert_eq!(store.fault_count(Op::Head, FaultKind::Permanent), 1);
+        assert_eq!(err.to_string(), GATE_REFUSAL);
+        assert!(matches!(
+            err.downcast_ref::<CompatGateError>(),
+            Some(CompatGateError::Store { .. })
+        ));
+        assert!(clock.sleeps().is_empty());
+    }
+
+    /// Every refusal the gate decides from what it read refuses on the first
+    /// attempt, with the context `main` gave it before the retry existed.
+    #[tokio::test]
+    async fn retired_reader_gate_refusals_refuse_on_the_first_attempt() {
+        type Check = fn(&CompatGateError) -> bool;
+        let cases: [(
+            &str,
+            Option<ravel_proto::sys::v1::CompatFamily>,
+            ConfiguredScheme,
+            Check,
+        ); 7] = [
+            ("sys/tenancy without sys/compat", None, keyed(), |err| {
+                matches!(err, CompatGateError::TenancyWithoutCompat)
+            }),
+            (
+                "no certificate",
+                Some(rseg_entry(false, CERTIFIED_NS + 1, false)),
+                keyed(),
+                |err| matches!(err, CompatGateError::CertificateAbsent { .. }),
+            ),
+            (
+                "contradicted",
+                Some(rseg_entry(true, CERTIFIED_NS + 1, true)),
+                keyed(),
+                |err| matches!(err, CompatGateError::Contradicted { .. }),
+            ),
+            (
+                "watermark not past the census",
+                Some(rseg_entry(true, CERTIFIED_NS, false)),
+                keyed(),
+                |err| matches!(err, CompatGateError::WatermarkNotPastCensus { .. }),
+            ),
+            (
+                "unkeyed process",
+                Some(rseg_entry(true, CERTIFIED_NS + 1, false)),
+                ConfiguredScheme::Unkeyed,
+                |err| matches!(err, CompatGateError::Unkeyed),
+            ),
+            (
+                "no entry for the family",
+                Some(ravel_proto::sys::v1::CompatFamily {
+                    family: ravel_catalog::compat::FAMILY_RLOG.to_string(),
+                    ..rseg_entry(true, CERTIFIED_NS + 1, false)
+                }),
+                keyed(),
+                |err| matches!(err, CompatGateError::FamilyAbsent { .. }),
+            ),
+            (
+                "certificate below the oldest readable version",
+                Some(ravel_proto::sys::v1::CompatFamily {
+                    certificate: Some(ravel_proto::sys::v1::Certificate {
+                        version: 7,
+                        certified_unix_ns: CERTIFIED_NS,
+                        member_count: 3,
+                        ..Default::default()
+                    }),
+                    ..rseg_entry(true, CERTIFIED_NS + 1, false)
+                }),
+                keyed(),
+                |err| matches!(err, CompatGateError::CertificateBelow { .. }),
+            ),
+        ];
+        for (name, entry, configured, check) in cases {
+            let clock = Arc::new(ManualClock::default());
+            let store = MemoryStore::new();
+            match entry {
+                Some(entry) => seed_compat(&store, entry).await,
+                None => put_tenancy_marker(&store).await,
+            }
+            let err = enforce_retired_reader_gate(
+                &retry_on(clock.clone()),
+                &store,
+                &configured,
+                &[RSEG_8],
+                GATE_NOW_NS,
+            )
+            .await
+            .expect_err(name);
+            assert_eq!(err.to_string(), GATE_REFUSAL, "{name}");
+            let gate_err = err
+                .downcast_ref::<CompatGateError>()
+                .unwrap_or_else(|| panic!("{name}: {err:#}"));
+            assert!(check(gate_err), "{name}: {gate_err:?}");
+            assert!(clock.sleeps().is_empty(), "{name}: retried");
+        }
+    }
+
+    /// With this build's empty retired set the gate sends no request, so a
+    /// store that would fail every gate read is never asked.
+    #[tokio::test]
+    async fn retired_reader_gate_sends_no_request_for_an_empty_set() {
+        let clock = Arc::new(ManualClock::default());
+        let store = faulted(
+            always_permanent(Op::Head, "sys/").with_rule(
+                ravel_object_store::fault::Rule::new(
+                    Op::Get,
+                    ScriptedFault::Permanent("bad request".into()),
+                )
+                .with_key_contains("sys/")
+                .with_occurrence(ravel_object_store::fault::Occurrence::Always),
+            ),
+        );
+        assert!(crate::compat_gate::RETIRED_READERS.is_empty());
+        let outcome = enforce_retired_reader_gate(
+            &retry_on(clock.clone()),
+            &store,
+            &keyed(),
+            crate::compat_gate::RETIRED_READERS,
+            GATE_NOW_NS,
+        )
+        .await
+        .expect("no retired reader, nothing read");
+        assert_eq!(outcome, crate::compat_gate::GateOutcome::NoRetiredReader);
+        assert_eq!(store.fault_count(Op::Head, FaultKind::Permanent), 0);
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 0);
         assert!(clock.sleeps().is_empty());
     }
 

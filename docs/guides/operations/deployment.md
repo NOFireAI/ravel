@@ -110,9 +110,17 @@ refuses at once.
 
 The retry covers the reads that
 [Startup store reads](../../architecture.md#startup-store-reads) lists:
-`sys/qualification`, `sys/tenancy`, the `--tenant-kms-config` key-epoch
-records, the `shard_count` provisioning records, `sys/gc` and the
-`sys/ipcrypt/policy` marker. It does not cover the Azure store construction
+`sys/qualification`, the retired-reader gate's reads of `sys/compat` and
+`sys/tenancy` (see
+[Retired-reader startup gate](maintenance.md#retired-reader-startup-gate); a
+build that retires no reader, which is every build today, sends none),
+`sys/tenancy`, the `--tenant-kms-config`
+key-epoch records, the `shard_count` provisioning records, `sys/gc` and the
+`sys/ipcrypt/policy` marker. A retired-reader gate refusal, such as a family
+with no current certificate, a contradicted certificate, a late-write
+watermark not past the census, or `sys/tenancy` present without
+`sys/compat`, refuses on the first attempt; only a transient store error
+inside the gate retries. It does not cover the Azure store construction
 request, the `--require-bucket-protection` read or the
 `--format-window-check` reads, and none of those retries. The Azure request
 refuses on its first error. The bucket-protection read never refuses on a
@@ -346,7 +354,7 @@ another before a listener binds:
 
 | Phase | Bound | Before `--listen-health` binds |
 |---|---|---|
-| The startup store reads `sys/qualification`, `sys/tenancy`, the key-epoch records, the provisioning records and `sys/gc` | A first attempt is not bounded by the server; the store's own request timeout (20 s by default) and retries end it. Once a read has failed transiently, its retries end by the `--startup-store-deadline` plus 5 s, 20 s from process start with the default. | Yes |
+| The startup store reads `sys/qualification`, the retired-reader gate's reads (none while the build retires no reader), `sys/tenancy`, the key-epoch records, the provisioning records and `sys/gc` | A first attempt is not bounded by the server; the store's own request timeout (20 s by default) and retries end it. Once a read has failed transiently, its retries end by the `--startup-store-deadline` plus 5 s, 20 s from process start with the default. | Yes |
 | The bucket-protection read (`--require-bucket-protection`, off by default), right after `sys/qualification` | 10 s, not retried. The deadline is measured from process start, so this time also uses up the deadline left for the reads after it. | Yes |
 | The format-window check (`--format-window-check`, off by default) | `--format-window-check-timeout`, 20 s by default. | Yes |
 | The `sys/ipcrypt/policy` read | As the other startup store reads. | No |
