@@ -407,8 +407,9 @@ impl LogIngestRouter {
     /// none of these checks, exactly as a router never given a policy.
     ///
     /// Refuses a `max_flush_lifetime` above the `max_publish_lifetime_ns` of
-    /// the record the policy's view holds (ADR-4233 decision 7). Admission and
-    /// every grant check it again against the record as it stands then.
+    /// the record the policy's view holds (ADR-4233 decision 7). Admission
+    /// checks it again against the record as it stands then; a flush already
+    /// admitted is not refused for it.
     pub fn with_compat_policy(
         self,
         policy: Option<Arc<IngestCompatPolicy>>,

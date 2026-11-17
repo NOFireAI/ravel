@@ -15,14 +15,18 @@
 //! - Permit grant picks the version a flush encodes at
 //!   ([`CompatView::write_policy`]). A stale view at grant does not drop the
 //!   flush: it hands its permit back and asks again every
-//!   [`STALE_VIEW_RETRY`] until the view answers or the flush's
-//!   `max_flush_lifetime` from its first grant elapses, and only then is the
-//!   flush refused `view_stale`. Any other refusal at grant (a version not
-//!   writable, a missing record after an activation, a lifetime above the
-//!   record's bound, or a router gone with no cached provisioning record left
-//!   to ask with) refuses the flush closed: no PUT, its rows dropped, its byte
+//!   [`STALE_VIEW_RETRY`], the last time at the deadline itself, until the
+//!   view answers or the flush's `max_flush_lifetime` from its first grant
+//!   elapses, and only then is the flush refused `view_stale`. Any other
+//!   refusal at grant (a version not writable, a missing record after an
+//!   activation, or a router gone with no cached provisioning record left to
+//!   ask with) refuses the flush closed: no PUT, its rows dropped, its byte
 //!   charges released, its strict waiters acked with a retryable
-//!   [`CompatPublishRefusal`].
+//!   [`CompatPublishRefusal`]. The record's `max_publish_lifetime_ns` is not
+//!   checked at grant: it is never lowered (ADR-4233 decision 7), so a record
+//!   whose bound is below the router's lifetime is one `compat init` wrote
+//!   while the rows were buffered, and they publish inside the router's own
+//!   `max_flush_lifetime`.
 //! - Every data-object, commit-record and fence attempt, retries included,
 //!   asks [`CompatView::write_policy`] again with the bucket's cached
 //!   provisioning record. A stale view waits for a fresh one within the same
@@ -30,6 +34,10 @@
 //!   granted version, refuses the attempt. Before the first PUT of an object
 //!   above the family's baseline, the bucket's provisioning record is fenced
 //!   at the view's epoch ([`ravel_catalog::raise_compat_fence`]).
+//!
+//! Every `view_stale` answer the policy gives wakes its refresh notifier
+//! ([`IngestCompatPolicy::with_refresh_wake`]), so the process that owns the
+//! view can re-read `sys/compat` before its next scheduled refresh.
 //!
 //! None of these refusals can fire on a store with no `sys/compat` record
 //! whose view is blind or fresh: the view answers each family's baseline, and
@@ -58,6 +66,7 @@ use ravel_commit::rng::RngSource;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_proto::sys::v1 as sysproto;
 use ravel_types::{Signal, TenantHash};
+use tokio::sync::Notify;
 
 use crate::clock::Clock;
 use crate::format_floor::FormatFamily;
@@ -135,6 +144,7 @@ pub struct IngestCompatPolicy {
     view: CompatView,
     clock: Arc<dyn CompatClock>,
     families: [FamilyVersions; 3],
+    refresh_wake: Option<Arc<Notify>>,
 }
 
 impl std::fmt::Debug for IngestCompatPolicy {
@@ -177,7 +187,18 @@ impl IngestCompatPolicy {
             view,
             clock,
             families: FormatFamily::ALL.map(FamilyVersions::of),
+            refresh_wake: None,
         }
+    }
+
+    /// Notify `wake` (one stored permit, `Notify::notify_one`) each time the
+    /// policy answers `view_stale`, at admission, at grant or before an
+    /// attempt, so the owner of the view can refresh it early instead of on
+    /// its next scheduled tick. Rate limiting is the owner's.
+    #[must_use]
+    pub fn with_refresh_wake(mut self, wake: Arc<Notify>) -> Self {
+        self.refresh_wake = Some(wake);
+        self
     }
 
     /// Replace one family's writable set and baseline, so a test can build a
@@ -225,13 +246,17 @@ impl IngestCompatPolicy {
             compat_epoch,
             ..Default::default()
         });
-        self.view.write_policy(
+        let answer = self.view.write_policy(
             self.now_unix_ns(),
             compat_family(family),
             &versions.writable,
             versions.baseline,
             bucket.as_ref(),
-        )
+        );
+        if let (Err(CompatRefusal::ViewStale { .. }), Some(wake)) = (&answer, &self.refresh_wake) {
+            wake.notify_one();
+        }
+        answer
     }
 
     /// The version the view names for `family`: its active version when this
@@ -301,7 +326,7 @@ impl IngestCompatPolicy {
 pub(crate) struct CompatSlot(Arc<RwLock<Option<InstalledPolicy>>>);
 
 /// A policy as one router installed it: with the router's
-/// `max_flush_lifetime`, which every grant checks against the record's
+/// `max_flush_lifetime`, which admission checks against the record's
 /// `max_publish_lifetime_ns` as it stands then.
 #[derive(Debug, Clone)]
 pub(crate) struct InstalledPolicy {
@@ -431,7 +456,7 @@ pub enum CompatPublishRefusal {
     NoBucketView { family: FormatFamily },
     /// The router's `max_flush_lifetime` is above the `max_publish_lifetime_ns`
     /// of the record the view holds now (ADR-4233 decision 7), checked at
-    /// admission and again at every grant.
+    /// admission only.
     #[error(
         "refusing to publish a {family} object: max_flush_lifetime is {max_flush_lifetime_ns} \
          ns, above the {max_publish_lifetime_ns} ns max_publish_lifetime_ns in sys/compat \
@@ -573,20 +598,18 @@ impl PublishGrant {
 
     /// Ask `installed` at permit grant. `None` is [`Self::unmanaged`]. With a
     /// policy and no `bucket` (the router is gone), refused
-    /// [`CompatPublishRefusal::NoBucketView`]; with a `max_flush_lifetime`
-    /// above the current record's bound, refused
-    /// [`CompatPublishRefusal::PublishLifetimeAboveCompat`].
+    /// [`CompatPublishRefusal::NoBucketView`]. The record's
+    /// `max_publish_lifetime_ns` is admission's check only: rows admitted
+    /// before `compat init` recorded a bound below the router's
+    /// `max_flush_lifetime` are acknowledged, and publish inside that
+    /// lifetime instead of being dropped here.
     pub(crate) fn at_grant(
         installed: Option<InstalledPolicy>,
         family: FormatFamily,
         tenant: TenantHash,
         bucket: Option<Arc<dyn BucketCompat>>,
     ) -> Result<Self, CompatPublishRefusal> {
-        let Some(InstalledPolicy {
-            policy,
-            max_flush_lifetime,
-        }) = installed
-        else {
+        let Some(InstalledPolicy { policy, .. }) = installed else {
             return Ok(PublishGrant::unmanaged(family));
         };
         let Some(bucket) = bucket else {
@@ -595,9 +618,6 @@ impl PublishGrant {
         let version = policy
             .write_version(family, bucket.bucket_compat_epoch(tenant))
             .map_err(|refusal| CompatPublishRefusal::Policy { family, refusal })?;
-        policy
-            .check_publish_lifetime(max_flush_lifetime)
-            .map_err(|above| above.refusal(family))?;
         let fence = version > policy.baseline(family);
         Ok(PublishGrant {
             family,
@@ -661,9 +681,10 @@ impl PublishGrant {
     }
 
     /// [`Self::check_attempt`], waiting out a stale view: asked again every
-    /// [`STALE_VIEW_RETRY`] on `clock` until the view answers, and refused
-    /// `view_stale` only once `deadline_ns` passes. Any other refusal returns
-    /// at once.
+    /// [`STALE_VIEW_RETRY`] on `clock`, the last time at `deadline_ns`
+    /// ([`stale_view_wait`]), until the view answers, and refused
+    /// `view_stale` only when it is still stale at that last ask. Any other
+    /// refusal returns at once.
     pub(crate) async fn attempt_when_fresh(
         &self,
         clock: &dyn Clock,
@@ -672,10 +693,7 @@ impl PublishGrant {
         loop {
             match self.check_attempt() {
                 Err(refused) if refused.is_view_stale() => {
-                    if bounded(clock, deadline_ns, clock.sleep(STALE_VIEW_RETRY))
-                        .await
-                        .is_none()
-                    {
+                    if !stale_view_wait(clock, deadline_ns).await {
                         return Err(refused);
                     }
                 }
@@ -756,6 +774,20 @@ pub(crate) enum PutAbort {
     Exhausted,
     /// The activation policy refused the next attempt.
     Refused(CompatPublishRefusal),
+}
+
+/// The wait between two asks of a stale view: [`STALE_VIEW_RETRY`], cut short
+/// at `deadline_ns` on `clock` so the view is asked once more at the deadline
+/// itself. `false`, with no wait, once `deadline_ns` has passed: the caller
+/// refuses `view_stale`.
+pub(crate) async fn stale_view_wait(clock: &dyn Clock, deadline_ns: i64) -> bool {
+    let remaining_ns = deadline_ns.saturating_sub(clock.now_ns());
+    if remaining_ns <= 0 {
+        return false;
+    }
+    let remaining = Duration::from_nanos(u64::try_from(remaining_ns).unwrap_or(u64::MAX));
+    clock.sleep(STALE_VIEW_RETRY.min(remaining)).await;
+    true
 }
 
 /// `fut` raced against `deadline_ns` on `clock`, as the shards bound their
