@@ -57,7 +57,8 @@
 //! pass uses, so the two steps agree on the bound and never both read one part.
 //! When the metadata pass does not run ([`LogsMetadataPass::new`] refuses the
 //! query path's fetch bound), a part above the bound gets no warm at all, and
-//! the first tenant that has one logs that at `warn!`, once per pass. (The
+//! the pass logs one `warn!` saying so, naming the first tenant found with
+//! such a part. (The
 //! metric side is unchanged: a metric part above
 //! [`DEFAULT_WHOLE_OBJECT_THRESHOLD`] is still warmed, on its footer tail, never
 //! skipped.)
@@ -129,8 +130,11 @@
 //! `parts_beyond_cap`, except a part whose whole fetch failed, which is logged
 //! at `debug!` and counted in none. A logs part counted in
 //! `parts_above_plan_bound` has its metadata warmed only if the metadata pass
-//! reaches it before its ceiling or the deadline and its read succeeds, so
-//! `metadata_objects_warmed` is at most `parts_above_plan_bound` (#4307).
+//! reaches it before its ceiling or the deadline and its read succeeds, so on
+//! the pass-complete line `metadata_objects_warmed` is at most
+//! `parts_above_plan_bound` (#4307). The deadline warning gives no such bound:
+//! the metadata pass can read a tenant's parts before the whole-part step has
+//! counted them.
 //!
 //! Every failure degrades to "warm less than planned," never to a startup
 //! failure: tenant discovery erroring, a resolve erroring, a fetch erroring,
@@ -3091,9 +3095,9 @@ mod tests {
     /// bound, metadata only, each range read 200 ms). The metadata pass runs
     /// beside the whole-part warm and reads all 8 large objects' metadata before
     /// the deadline, while the 2 small parts load. Seen failing against a
-    /// whole-parts-first order: the 2 whole reads spend 1.9 s and the 8 metadata
-    /// reads then spend 2 waves of 200 ms after them, 2.3 s in all, so the
-    /// deadline fires and no pass-complete line is logged.
+    /// whole-parts-first order: the 2 whole reads spend 1.9 s and the metadata
+    /// reads after them do not finish by 2 s, so the deadline warning fires
+    /// with `metadata_objects_warmed=0 step="metadata_pass"`.
     #[tokio::test(start_paused = true)]
     async fn the_metadata_pass_warms_a_large_tenant_while_its_whole_parts_load() {
         let (capture, cached, _) =
@@ -3973,11 +3977,13 @@ mod tests {
     /// directory extents); any other read of the large part is delayed 5 s,
     /// past the 1 s deadline. After the warm the large part's GETs are exactly
     /// the reference reads, the small part's one whole GET, and the pass
-    /// completes inside the deadline. Seen failing against a whole-part warm
-    /// whose logs fetcher lacks the query path's thresholds and that warms
-    /// every part whole: the large part's GETs are
-    /// `[Full, Suffix(131072)]`, not `[Suffix(131072)]` (the whole-part read
-    /// probes, finds every block a candidate and falls back to one whole GET).
+    /// completes inside the deadline. Seen failing against the warm before
+    /// #4307 (a logs fetcher without the query path's thresholds, and no skip
+    /// above the bound): the large part's GETs are `[Full, Suffix(131072)]`,
+    /// not `[Suffix(131072)]`. That warm's read of the large part issues no
+    /// block-range GET, only the extra whole-object one, but the assertion
+    /// compares every GET of the part, so a block-range read would fail it the
+    /// same way.
     #[tokio::test(start_paused = true)]
     async fn the_whole_part_warm_issues_no_block_get_for_a_part_above_the_bound() {
         use tracing_subscriber::layer::SubscriberExt as _;
