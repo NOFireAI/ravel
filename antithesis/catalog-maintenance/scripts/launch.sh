@@ -35,8 +35,11 @@ REF="$SERVER_REF"
 # SKIP_VALIDATE=1 skips the local validation on a host that cannot run the
 # amd64 images (an Apple Silicon Mac without Rosetta emulation), once the same
 # config was validated on an amd64 host.
+#
+# Both setup bounds are 15 minutes, local-run.sh's 900 s: the driver's own
+# setup budget is 600 s, and the containers start around it.
 if [ "${SKIP_VALIDATE:-}" != 1 ]; then
-    snouty validate "$CONFIG" --timeout 10m
+    snouty validate "$CONFIG" --timeout 15m
 fi
 snouty launch --launcher basic_test --config "$CONFIG" \
     --test-name ravel-catalog-maintenance \
@@ -44,7 +47,7 @@ snouty launch --launcher basic_test --config "$CONFIG" \
     --max-compute-hours "$HOURS" \
     --fault-tolerance high_availability \
     --fault-exclusions '^driver$' \
-    --setup-timeout 10m \
+    --setup-timeout 15m \
     --param attrs.workload=catalog-maintenance \
     --param attrs.ravel_ref="$REF" \
     --param attrs.plugin_version=0.1.1
