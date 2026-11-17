@@ -7,9 +7,11 @@
 use std::cell::Cell;
 
 use ravel_bench::l1_listing_charge::{
-    CAP_FIGURES, RunConfig, build_bucket, check_report, compact_at, engine_listing_succeeds,
-    listing_bound, listing_succeeds, minimal_budget, part_shape, report_json, run, upper_bound,
+    CAP_FIGURES, ListingChargeError, RunConfig, build_bucket, check_report, compact_at,
+    engine_listing_succeeds, held_fetch_bound, listing_bound, listing_succeeds, minimal_budget,
+    part_shape, report_json, run, upper_bound,
 };
+use ravel_query::{DEFAULT_SUFFIX_LEN, DEFAULT_WHOLE_OBJECT_THRESHOLD};
 
 const CAPS: [u64; 2] = [64 << 10, 256 << 10];
 
@@ -223,4 +225,273 @@ async fn check_report_rejects_missing_duplicate_and_out_of_band_figures() {
         failures.iter().any(|f| f.contains("peak fell")),
         "{failures:?}"
     );
+}
+
+/// The budget limit at which listing `part` starts to succeed, to the byte:
+/// refused at `refused`, succeeding at `succeeds`.
+async fn exact_threshold(
+    store: &std::sync::Arc<ravel_object_store::memory::MemoryStore>,
+    part: &ravel_catalog::SegmentRef,
+    series: u64,
+    mut refused: u64,
+    mut succeeds: u64,
+) -> u64 {
+    assert!(
+        !listing_succeeds(store, part, series, refused)
+            .await
+            .expect("list")
+    );
+    assert!(
+        listing_succeeds(store, part, series, succeeds)
+            .await
+            .expect("list")
+    );
+    while succeeds - refused > 1 {
+        let mid = refused + (succeeds - refused) / 2;
+        if listing_succeeds(store, part, series, mid)
+            .await
+            .expect("list")
+        {
+            succeeds = mid;
+        } else {
+            refused = mid;
+        }
+    }
+    succeeds
+}
+
+/// `held_fetch_bound` equals, to the byte, what the fetcher holds on a real
+/// part on each side of the whole-object threshold: the listing's exact
+/// threshold minus the `(64 + 32) * samples + catalog` formula. At 72 h of
+/// history the compactor's one-series overshoot closes the first part of a
+/// 256 KiB cap above 512 KiB (853,172 B, measured 2026-11-17), where the open
+/// GET holds only the 64 KiB footer tail plus the catalog run; the last part
+/// stays below the threshold and is held whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_fetch_bound_matches_the_bytes_a_real_part_holds() {
+    let config = RunConfig {
+        series: 24,
+        scrape_secs: 15,
+        history_hours: 72,
+        flush_hours: 2,
+        caps: vec![256 << 10],
+    };
+    let bucket = build_bucket(&config).expect("bucket");
+    let compacted = compact_at(&bucket, &config, 256 << 10)
+        .await
+        .expect("compact");
+    let store = &compacted.store;
+    let mut large = 0;
+    let mut small = 0;
+    for part in [&compacted.parts[0], compacted.parts.last().expect("a part")] {
+        let shape = part_shape(store, part).await.expect("shape");
+        if shape.wire_bytes > DEFAULT_WHOLE_OBJECT_THRESHOLD {
+            large += 1;
+            assert!(
+                shape.held_fetch_bytes < DEFAULT_SUFFIX_LEN + (4 << 10),
+                "a {} B part holds the footer tail and a small catalog run, not {} B",
+                shape.wire_bytes,
+                shape.held_fetch_bytes
+            );
+        } else {
+            small += 1;
+            assert_eq!(shape.held_fetch_bytes, shape.wire_bytes);
+        }
+        let threshold = exact_threshold(
+            store,
+            part,
+            shape.series,
+            upper_bound(&shape),
+            listing_bound(&shape),
+        )
+        .await;
+        assert_eq!(
+            threshold - upper_bound(&shape),
+            shape.held_fetch_bytes,
+            "a {} B part: the fetcher holds {} B, held_fetch_bound says {} B",
+            shape.wire_bytes,
+            threshold - upper_bound(&shape),
+            shape.held_fetch_bytes
+        );
+    }
+    assert_eq!(
+        (large, small),
+        (1, 1),
+        "one part on each side of the threshold"
+    );
+}
+
+/// `held_fetch_bound` term by term on synthetic layouts, including the two the
+/// bench's parts do not reach: a footer that starts before the 64 KiB tail
+/// (the fetcher's second GET runs from the footer's start to the object's
+/// end) and catalog sections the tail already covers (not fetched again).
+#[test]
+fn held_fetch_bound_charges_the_tail_the_footer_chase_and_the_uncovered_catalog() {
+    let threshold = DEFAULT_WHOLE_OBJECT_THRESHOLD;
+    let tail = DEFAULT_SUFFIX_LEN;
+    // At or below the threshold the whole object is held, whatever the layout.
+    assert_eq!(
+        held_fetch_bound(threshold, threshold - 4_096, &[(1_000, 5_000)]),
+        threshold
+    );
+
+    let object_size = 614_400u64;
+    assert!(object_size > threshold);
+    let sections = [(2_048u64, 6_144u64), (6_144u64, 70_000u64)];
+    // Footer inside the tail: the tail and the catalog run, nothing more.
+    assert_eq!(
+        held_fetch_bound(object_size, object_size - 1_000, &sections),
+        tail + (70_000 - 2_048)
+    );
+    assert_eq!(
+        held_fetch_bound(object_size, object_size - 1_000, &sections),
+        133_488
+    );
+    // Footer at 500_000, before the tail at 548_864: the chase GET holds
+    // 500_000..614_400 on top of the tail.
+    assert_eq!(
+        held_fetch_bound(object_size, 500_000, &sections),
+        tail + (object_size - 500_000) + (70_000 - 2_048)
+    );
+    assert_eq!(held_fetch_bound(object_size, 500_000, &sections), 247_888);
+    // A section inside the tail is already held; only the other is fetched.
+    let tail_start = object_size - tail;
+    assert_eq!(
+        held_fetch_bound(
+            object_size,
+            object_size - 1_000,
+            &[(2_048, 6_144), (tail_start + 10, tail_start + 500)]
+        ),
+        tail + 4_096
+    );
+    // A section the chase covers is held too, and none left means no run.
+    assert_eq!(
+        held_fetch_bound(object_size, 500_000, &[(500_100, 500_200)]),
+        tail + (object_size - 500_000)
+    );
+}
+
+/// The peak-per-sample band fails when the full 96 B of per-sample provenance
+/// is not charged, or is charged twice. The old [1, 200] B band admitted both.
+/// The wrong figures are the real run's own figure, and the default caps'
+/// measured 97.03 and 98.30 B, with the 64 B of columns dropped (the 32 B
+/// record only) or with another 96 B on top.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peak_per_sample_band_rejects_missing_and_doubled_provenance() {
+    let caps = [CAPS[0]];
+    let report = run(small_config(caps.to_vec())).await.expect("run");
+    let json = report_json(&report);
+    let text = serde_json::to_string_pretty(&json).expect("render");
+    check_report(&text, &caps).expect("the real per-sample charge is inside the band");
+    let real = report.caps[0].peak_per_sample();
+
+    let check_per_sample = |value: f64| {
+        let mut doc = json.clone();
+        doc["caps"][0]
+            .as_object_mut()
+            .expect("cap entry")
+            .insert("peak_per_sample_bytes".into(), value.into());
+        check_report(&serde_json::to_string_pretty(&doc).expect("render"), &caps)
+    };
+    for measured in [real, 97.03, 98.30] {
+        check_per_sample(measured).expect("a measured figure is inside the band");
+        for wrong in [measured - 64.0, measured + 96.0] {
+            let failures = check_per_sample(wrong).expect_err("outside the band");
+            assert!(
+                matches!(failures.as_slice(), [only] if only.starts_with(&format!(
+                    "cap {}: peak per sample {}",
+                    caps[0],
+                    wrong.trunc()
+                )) && only.ends_with("B outside [96, 130]")),
+                "{wrong} B a sample (from {measured} B) must fail the band alone: {failures:?}"
+            );
+        }
+    }
+}
+
+/// The reported peak sits at or below the listing bound on a real run, and
+/// `check_report` compares the two directly: a peak one byte above the bound
+/// fails even when the refused limit stays below the bound, the 1 % bracket
+/// holds and the listing under the bound succeeded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peak_above_the_listing_bound_fails_the_direct_check() {
+    let report = run(small_config(CAPS.to_vec())).await.expect("run");
+    for entry in &report.caps {
+        assert!(
+            entry.search.succeeds_at <= entry.listing_bound_bytes,
+            "cap {}: the reported peak {} B is above the listing bound {} B",
+            entry.cap_bytes,
+            entry.search.succeeds_at,
+            entry.listing_bound_bytes
+        );
+    }
+
+    let caps = [CAPS[0]];
+    let report = run(small_config(caps.to_vec())).await.expect("run");
+    let json = report_json(&report);
+    let text = serde_json::to_string_pretty(&json).expect("render");
+    check_report(&text, &caps).expect("the real report holds every band");
+
+    let bound = json["caps"][0]["listing_bound_bytes"]
+        .as_u64()
+        .expect("bound");
+    let mut doc = json.clone();
+    let entry = doc["caps"][0].as_object_mut().expect("cap entry");
+    entry.insert("peak_charge_bytes".into(), (bound + 1).into());
+    entry.insert("refused_at_bytes".into(), (bound - 1).into());
+    entry.insert("listing_bound_succeeds".into(), true.into());
+    let violated = serde_json::to_string_pretty(&doc).expect("render");
+    assert_eq!(
+        check_report(&violated, &caps),
+        Err(vec![format!(
+            "cap {}: the peak {} B is above the listing bound {bound} B",
+            caps[0],
+            bound + 1
+        )])
+    );
+}
+
+/// `minimal_budget` terminates when the threshold is below 100 bytes, where the
+/// 1 % step floors to zero, and lands on it to the byte. A ready future never
+/// yields, so a hang is caught by capping the probes rather than by a timeout.
+#[tokio::test]
+async fn minimal_budget_terminates_below_a_hundred_byte_threshold() {
+    let probes = Cell::new(0u32);
+    let outcome = minimal_budget(1, |limit| {
+        probes.set(probes.get() + 1);
+        let calls = probes.get();
+        async move {
+            if calls > 1_000 {
+                return Err(ListingChargeError::Setup(
+                    "minimal_budget spun past 1,000 probes".to_string(),
+                ));
+            }
+            Ok(limit >= 50)
+        }
+    })
+    .await
+    .expect("search");
+    assert_eq!((outcome.succeeds_at, outcome.refused_at), (50, 49));
+    assert_eq!(outcome.probes, probes.get());
+}
+
+/// A flush shorter than one scrape step holds no step, so `validate` returns
+/// the typed setup error instead of letting `build_bucket` panic on a zero
+/// `step_by`.
+#[test]
+fn build_bucket_rejects_a_flush_shorter_than_one_scrape_step() {
+    let config = RunConfig {
+        series: 120,
+        scrape_secs: 7_200,
+        history_hours: 2,
+        flush_hours: 1,
+        caps: vec![1 << 20],
+    };
+    match build_bucket(&config) {
+        Err(ListingChargeError::Setup(msg)) => {
+            assert!(msg.contains("holds no scrape"), "{msg}")
+        }
+        Err(other) => panic!("expected a setup error for a zero-step flush, got {other}"),
+        Ok(_) => panic!("expected a setup error for a zero-step flush, got a bucket"),
+    }
 }
