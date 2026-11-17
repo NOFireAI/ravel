@@ -1195,13 +1195,13 @@ async fn chunk_order_string_resource_warning_matches_the_written_columns() {
     );
 }
 
-/// `run_load_reporting` writes the `--page-choice exhaustive` warning to the
+/// `run_load_reporting` writes the `--page-choice estimated` warning to the
 /// warning stream of a metrics or spans load, and writes none for the
 /// default. The warning goes out before the mapping is read, so a missing
 /// mapping ends each load right after it.
 ///
 /// Prove-the-test: delete the `unused_page_choice_warning` emit block in
-/// `run_load_reporting` and the exhaustive assertion fails.
+/// `run_load_reporting` and the estimated assertion fails.
 #[tokio::test]
 async fn the_entry_point_warns_that_metrics_and_spans_ignore_the_page_choice() {
     use ravel_object_store::memory::MemoryStore;
@@ -1257,17 +1257,17 @@ async fn the_entry_point_warns_that_metrics_and_spans_ignore_the_page_choice() {
             );
             let emitted = String::from_utf8(sink).expect("warnings are utf-8");
             let warning = format!(
-                "warning: a {noun} load ignores --page-choice exhaustive. The page choice \
+                "warning: a {noun} load ignores --page-choice estimated. The page choice \
                  applies only to the RLOG objects a logs load writes.\n"
             );
-            let want = usize::from(choice == LoadPageChoice::Exhaustive);
+            let want = usize::from(choice == LoadPageChoice::Estimated);
             assert_eq!(
                 emitted.matches(&warning).count(),
                 want,
                 "{signal:?} {choice:?}: the page choice warning {want} time(s) in:\n{emitted}"
             );
             assert!(
-                !emitted.contains("--page-choice estimated"),
+                !emitted.contains("--page-choice exhaustive"),
                 "{signal:?} {choice:?}: the default is not named:\n{emitted}"
             );
         }

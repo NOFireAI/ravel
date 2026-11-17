@@ -951,17 +951,19 @@ enum Command {
         )]
         chunk_order: Option<ravel_ingest::RlogChunkOrder>,
         /// How the RLOG writer of every flush a logs load runs picks each
-        /// page's encoding. `exhaustive` seals every candidate encoding and
-        /// keeps the one with the fewest stored bytes. `estimated` seals one
-        /// candidate, picked from the page's statistics: it spends less CPU
-        /// writing and stores slightly more bytes, about 2 to 3% on the
-        /// ClickBench corpus. Both write encodings the format defines, and
-        /// readers decode either the same way.
+        /// page's encoding. `exhaustive`, the default, seals every candidate
+        /// encoding and keeps the one with the fewest stored bytes.
+        /// `estimated` seals one candidate, picked from the page's
+        /// statistics: the load is faster and stores slightly more bytes,
+        /// about 2 to 3% on the ClickBench corpus, and queries over long
+        /// URL-like string columns may read slower (issue #4388). Both write
+        /// encodings the format defines, and readers decode either the same
+        /// way.
         ///
         /// The summary's `page choice` line and the report JSON's
         /// `page_choice` field name the choice the load wrote with. A metrics
         /// or spans load ignores this flag and warns when it is set to
-        /// anything but estimated.
+        /// anything but exhaustive.
         #[arg(long, value_enum, value_name = "CHOICE", default_value_t)]
         page_choice: ravel_cli::load::LoadPageChoice,
         /// The bytes of built batches a logs load may hold at once (issue
@@ -6228,13 +6230,13 @@ mod tests {
         }
     }
 
-    /// Issue #4212: `load` with no `--page-choice` writes the pages an
-    /// explicit `--page-choice estimated` load writes, byte for byte, on a
-    /// file where the exhaustive load's pages differ. The value clap resolves
+    /// Issue #4409: `load` with no `--page-choice` writes the pages an
+    /// explicit `--page-choice exhaustive` load writes, byte for byte, on a
+    /// file where the estimated load's pages differ. The value clap resolves
     /// with no flag is handed to `ravel_cli::load::run`, the function `main`
     /// dispatches `load` to; an unknown value is refused at parse time.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn load_without_page_choice_writes_the_estimated_loads_pages() {
+    async fn load_without_page_choice_writes_the_exhaustive_loads_pages() {
         use std::sync::Arc;
 
         use arrow::array::{ArrayRef, Int64Array, StringArray};
@@ -6303,8 +6305,8 @@ mod tests {
             Err(e) => Err(e.to_string()),
         };
         assert_eq!(
-            choice_of(&["--page-choice", "exhaustive"]),
-            Ok(LoadPageChoice::Exhaustive)
+            choice_of(&["--page-choice", "estimated"]),
+            Ok(LoadPageChoice::Estimated)
         );
         let err = choice_of(&["--page-choice", "fastest"]).expect_err("an unknown choice");
         assert!(err.contains("invalid value 'fastest'"), "{err}");
@@ -6370,8 +6372,8 @@ mod tests {
             "the file must make the two choices write different pages"
         );
         assert!(
-            default_pages == estimated,
-            "with no --page-choice the load writes {no_flag:?} pages, not the estimated load's"
+            default_pages == exhaustive,
+            "with no --page-choice the load writes {no_flag:?} pages, not the exhaustive load's"
         );
     }
 

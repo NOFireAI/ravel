@@ -472,8 +472,8 @@ fn run_binary(input: &Input, extra: &[&str]) -> String {
 }
 
 /// The built binary's summary names the page choice on exactly one line and
-/// its report JSON in exactly one field, as estimated with no flag and as
-/// exhaustive with `--page-choice exhaustive`.
+/// its report JSON in exactly one field, as exhaustive with no flag or with
+/// `--page-choice exhaustive`, and as estimated with `--page-choice estimated`.
 #[test]
 fn the_summary_and_report_name_the_page_choice_once() {
     let now_ns = std::time::SystemTime::now()
@@ -482,7 +482,7 @@ fn the_summary_and_report_name_the_page_choice_once() {
         .as_nanos() as i64;
     let input = input(now_ns - 60_000_000_000);
     for (extra, name) in [
-        (&[][..], "estimated"),
+        (&[][..], "exhaustive"),
         (&["--page-choice", "estimated"][..], "estimated"),
         (&["--page-choice", "exhaustive"][..], "exhaustive"),
     ] {
