@@ -56,9 +56,12 @@ unattributable.
 | `ci` | 1,000 | 120 | 15 s | 30 m | none | 120,000 |
 
 Total points counts scalar samples and native histograms together, as the
-manifest's `total_samples` field does; the ingest report splits them into
-`accepted_samples` and `accepted_histograms` (see "Compare a profile's ingest
-volume" below).
+manifest's `total_samples` field and the artifact's
+`run.total_samples_generated` do. The ingest report keeps the classes apart:
+a row that stores native histograms reports them as `accepted_histograms`,
+and a row that cannot store them (VictoriaMetrics) reports them as
+`unsupported_histograms`; see the paragraph on comparing ingest volume across
+runs, under "Rows and receivers".
 
 The `ci` profile is marked non-comparable **in the artifact**, as a typed
 `comparability` field carrying the reason:
@@ -126,7 +129,8 @@ never mistakes a non-comparable or unbilled run for a publishable result.
   `series_per_instance`.
 - `run`: figures scoped to `steps_run`, never the declared full profile:
   `steps`, `total_series_created`, `logical_input_bytes`,
-  `total_samples_generated`, `scaling_label_cardinality` (distinct
+  `total_samples_generated` (scalar samples plus native histograms),
+  `scaling_label_cardinality` (distinct
   scaling-label values this run actually emitted), all the generator's exact
   counts for this run; plus `anchor_ms`, the first step's timestamp (see
   below), and the provenance fields `workload_version`, `workload_digest`,
@@ -306,8 +310,8 @@ classes are separate, and `logical_points_per_sec` is their sum divided by
 `elapsed_secs`, so on a row that stores both classes a figure derived from
 the rate is samples plus histograms, while `accepted_samples` alone leaves the
 histograms out. Where `unsupported_classes` names native histograms
-(VictoriaMetrics, in the unsupported-class table below), the rate carries
-scalars only and equals `accepted_samples`. For `history` the
+(VictoriaMetrics, in the unsupported-class table below), the rate counts
+scalars only, so rate times `elapsed_secs` equals `accepted_samples`. For `history` the
 native histogram family is 100 per mille of the series, so `accepted_samples`
 is 90 % of the points. From the manifest, `history` generates 1,728,000,000
 points, 1,555,200,000 scalar and 172,800,000 native histogram. The one-in-500
@@ -317,8 +321,9 @@ wrote `accepted_samples` 1,552,087,844 on all four rows and
 `accepted_histograms` 172,454,101 on the Prometheus, Mimir and Ravel rows,
 which sum to 1,724,541,945; VictoriaMetrics acknowledges histograms it cannot
 store, so its row holds none. The 2026-10-28 Prometheus-only run (harness
-`e56c5209b`) accepted the same 1,724,541,945 points. The stream did not
-change between those harness commits.
+`e56c5209b`) accepted the same 1,724,541,945 points. The generator
+(`metrics_gen.rs`), `metrics_workload.rs` and `workload.json` are
+byte-identical between those harness commits, so the stream did not change.
 
 `endpoint` on an HTTP row is the URL passed. The portable Ravel row writes to
 `ravel-server`'s `/api/v1/write`. With `--ravel-bearer-token-env <VAR>` it

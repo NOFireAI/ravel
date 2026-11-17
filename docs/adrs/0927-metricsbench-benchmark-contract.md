@@ -303,7 +303,7 @@ Cardinality, history and churn move independently. Collapsing them into one
 scale factor makes a regression unattributable, so each profile varies one
 axis and pins the others.
 
-| profile | active series | samples/series | scrape | duration | churn | total samples |
+| profile | active series | samples/series | scrape | duration | churn | total points |
 |---|---|---|---|---|---|---|
 | `cardinality` | 1,000,000 | 360 | 15 s | 90 m | none | 360,000,000 |
 | `history` | 10,000 | 172,800 | 15 s | 30 d | none | 1,728,000,000 |
