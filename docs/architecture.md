@@ -156,21 +156,26 @@ all of that step. Each retry logs one warning that names the read, the
 attempt number and the error.
 
 `--startup-store-deadline` (default `15s`) is measured from process start and
-shared by every read. It bounds each attempt as well as the retries. Each
-attempt runs for at most the time left before the deadline or 5 s
-(`MIN_STARTUP_ATTEMPT`), whichever is longer, so a healthy read that starts
-just before the deadline is not cut off. An attempt still running at the end
-of its bound is cut off, counts as one attempt, and refuses to start with an
+shared by every read. It bounds the retries and each retry, not a read's
+first attempt. A first attempt runs until it answers or the store's own
+request timeout and retries give up, so a slow but healthy store still
+starts. Each retry runs for at most the time left before the deadline or 5 s
+(`MIN_STARTUP_ATTEMPT`), whichever is longer, so a healthy retry that starts
+just before the deadline is not cut off. A retry still running at the end of
+its bound is cut off, counts as one attempt, and refuses to start with an
 error that names the read and the bound. No retry starts once its wait would
 reach the deadline; the transient failure then refuses to start, and the
-error names the read and the number of attempts. A read first reached after
-the deadline has passed gets one attempt, bounded by 5 s, and no retry, so a
-transient failure there refuses. A read whose attempt starts by the deadline
-therefore refuses by the deadline plus 5 s, and a read first reached later
-refuses within 5 s of being reached. With the default, a read that starts by
-the deadline refuses by 20 s, 5 s before the earliest restart by the
-operator's liveness probe at 25 s. `0s` turns retry and the attempt bound
-off.
+error names the read and the number of attempts. A first attempt that fails
+transiently after the deadline has passed therefore refuses at once. A read
+whose first attempt fails transiently before the deadline refuses by the
+deadline plus 5 s, 20 s with the default; a first attempt that hangs ends
+only when the store gives up on it. The other work before a listener binds
+(the bucket-protection read, the format-window check, the read-cache
+warm-up) has its own bounds, and the sum can outlast the operator's liveness
+probe;
+[the deployment guide](guides/operations/deployment.md#startup-time-before-the-listener-binds)
+gives the budget and the probe settings it needs. `0s` turns retry and the
+retry bound off.
 
 Any other error refuses at once, with the same message as before retry
 existed. Examples are an absent or stale qualification record, a corrupt

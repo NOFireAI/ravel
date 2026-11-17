@@ -843,11 +843,15 @@ mod tests {
         assert!(clock.cut_offs().is_empty());
     }
 
-    /// A store call that never answers is cut off at the deadline on the
-    /// injected clock: one attempt, refused naming the site and the deadline.
-    #[tokio::test]
-    async fn a_hung_first_attempt_is_cut_off_at_the_deadline() {
-        let clock = Arc::new(ManualClock::default());
+    /// A healthy first attempt is not bounded: a store that answers 21 s
+    /// after the read starts, past the deadline plus `MIN_STARTUP_ATTEMPT`,
+    /// starts. On tokio's paused clock, so the store delay and any bound race
+    /// in virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_healthy_first_attempt_is_not_cut_off() {
+        let retry = StartupRetry::new(Arc::new(TokioStartupClock::starting_now()), DEADLINE, 7);
+        let started = tokio::time::Instant::now();
+        let answer_after = DEADLINE + MIN_STARTUP_ATTEMPT + Duration::from_secs(1);
         let store = faulted(FaultPlan::empty());
         seed_qualification(store.inner()).await;
         let gate = store.hold(
@@ -855,14 +859,17 @@ mod tests {
             Some(QUALIFICATION_KEY.to_string()),
             ravel_object_store::fault::Occurrence::Always,
         );
-        let err = enforce_qualification(&retry_on(clock.clone()), &store, StoreKind::S3, None)
+        let releaser = release_after(gate.clone(), answer_after);
+        enforce_qualification(&retry, &store, StoreKind::S3, None)
             .await
-            .expect_err("a hung read refuses at the deadline");
-        assert_eq!(gate.held_count(), 1, "the one attempt reached the store");
-        assert_cut_off_refusal(&err, SITE_QUALIFICATION, 1, DEADLINE);
-        assert_eq!(clock.cut_offs(), vec![DEADLINE]);
-        assert_eq!(clock.virtual_now(), DEADLINE);
-        assert!(clock.sleeps().is_empty());
+            .expect("a first attempt answering 21 s after it starts is not cut off");
+        releaser.await.expect("releaser task");
+        assert_eq!(gate.held_count(), 0);
+        assert_eq!(
+            started.elapsed(),
+            answer_after,
+            "the read ran its full 21 s"
+        );
     }
 
     /// A transient failure, then a retry that hangs: the retry is bounded by
@@ -942,9 +949,8 @@ mod tests {
     }
 
     /// A healthy read that starts 1 s before the deadline and takes 3 s is
-    /// bounded by `MIN_STARTUP_ATTEMPT`, not by the 1 s left, and starts. On
-    /// tokio's paused clock, so the store delay and the attempt bound race in
-    /// virtual time.
+    /// not cut off when the 1 s left runs out, and starts. On tokio's paused
+    /// clock, so the store delay and any bound race in virtual time.
     #[tokio::test(start_paused = true)]
     async fn a_healthy_read_started_just_before_the_deadline_is_not_cut_off() {
         let retry = StartupRetry::new(Arc::new(TokioStartupClock::starting_now()), DEADLINE, 7);
@@ -979,15 +985,16 @@ mod tests {
         );
     }
 
-    /// A site first reached after the deadline gets one attempt bounded by
-    /// `MIN_STARTUP_ATTEMPT`: a store that never answers is cut off 5 s after
-    /// the attempt starts and refuses, instead of holding startup.
+    /// A site first reached after the deadline runs its first attempt
+    /// unbounded: a store that answers 10 s after the attempt starts, past
+    /// `MIN_STARTUP_ATTEMPT`, starts.
     #[tokio::test(start_paused = true)]
-    async fn a_hung_first_attempt_after_the_deadline_is_cut_off_after_the_minimum() {
+    async fn a_slow_healthy_first_attempt_after_the_deadline_is_not_cut_off() {
         let retry = StartupRetry::new(Arc::new(TokioStartupClock::starting_now()), DEADLINE, 7);
         let started = tokio::time::Instant::now();
         let reached = DEADLINE + Duration::from_secs(1);
         tokio::time::advance(reached).await;
+        let answer_after = MIN_STARTUP_ATTEMPT * 2;
         let store = faulted(FaultPlan::empty());
         seed_qualification(store.inner()).await;
         let gate = store.hold(
@@ -995,16 +1002,66 @@ mod tests {
             Some(QUALIFICATION_KEY.to_string()),
             ravel_object_store::fault::Occurrence::Always,
         );
+        let releaser = release_after(gate.clone(), answer_after);
+        enforce_qualification(&retry, &store, StoreKind::S3, None)
+            .await
+            .expect("a first attempt after the deadline is not cut off");
+        releaser.await.expect("releaser task");
+        assert_eq!(gate.held_count(), 0);
+        assert_eq!(started.elapsed(), reached + answer_after);
+    }
+
+    /// A read that fails transiently 1 s before the deadline and whose retry
+    /// never answers: the retry is bounded by `MIN_STARTUP_ATTEMPT`, not by
+    /// the time left, and refuses 5 s after it starts, carrying the first
+    /// attempt's error.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_retry_near_the_deadline_is_cut_off_after_the_minimum() {
+        let retry = StartupRetry::new(Arc::new(TokioStartupClock::starting_now()), DEADLINE, 7);
+        let started = tokio::time::Instant::now();
+        let reached = DEADLINE - Duration::from_secs(1);
+        tokio::time::advance(reached).await;
+        let store = faulted(transient_then_ok(Op::Get, QUALIFICATION_KEY, 1));
+        seed_qualification(store.inner()).await;
+        let gate = store.hold(
+            Op::Get,
+            Some(QUALIFICATION_KEY.to_string()),
+            ravel_object_store::fault::Occurrence::Nth(2),
+        );
         let err = tokio::time::timeout(
             Duration::from_secs(600),
             enforce_qualification(&retry, &store, StoreKind::S3, None),
         )
         .await
-        .expect("an attempt after the deadline is bounded")
-        .expect_err("a hung read refuses");
-        assert_eq!(gate.held_count(), 1, "the one attempt reached the store");
-        assert_cut_off_refusal(&err, SITE_QUALIFICATION, 1, MIN_STARTUP_ATTEMPT);
-        assert_eq!(started.elapsed(), reached + MIN_STARTUP_ATTEMPT);
+        .expect("a retry is bounded")
+        .expect_err("a hung retry refuses");
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 1);
+        assert_eq!(gate.held_count(), 1, "the retry reached the store");
+        assert_cut_off_refusal(&err, SITE_QUALIFICATION, 2, MIN_STARTUP_ATTEMPT);
+        assert!(
+            format!("{err:#}").contains("store backend is not qualified"),
+            "{err:#}"
+        );
+        // The one wait is the first backoff step, jittered into [50, 100] ms.
+        let waited = started.elapsed() - reached - MIN_STARTUP_ATTEMPT;
+        assert!(
+            waited >= INITIAL_BACKOFF / 2 && waited <= INITIAL_BACKOFF,
+            "{waited:?}"
+        );
+    }
+
+    /// Releases the one read `gate` holds `after` it is first held.
+    fn release_after(
+        gate: ravel_object_store::fault::GateHandle,
+        after: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            gate.wait_until_held(1).await;
+            tokio::time::sleep(after).await;
+            let held = gate.held();
+            assert_eq!(held.len(), 1);
+            assert!(gate.release(held[0]));
+        })
     }
 
     #[tokio::test]
