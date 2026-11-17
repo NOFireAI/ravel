@@ -45,7 +45,9 @@ The driver uses two stores over one bucket:
 
 Every message starts with `store: `. Every property is an `assert_always`
 except the transient one. Antithesis also fails an `assert_always` that is
-never reached, so each assertion also proves that its action ran.
+never reached, so each assertion also proves that its action ran. The versions
+action carries two further asserts for a same-bytes recreate, described under
+"Versions on S3".
 
 | TLA+ property | Message | What the action does and asserts |
 |---|---|---|
@@ -53,7 +55,7 @@ never reached, so each assertion also proves that its action ran.
 | CasOutcomeMatchesEffect | `store: a CAS outcome matches its effect` | Write A, then CAS B with A's version. `Ok` means the key holds B under the returned version. `PreconditionFailed` means it still holds A under A's version. Any other failure means it holds A or B. Once B is stored, a CAS of C with A's stale version is not `Ok` and does not store C. A CAS on an absent key is not `Ok` and leaves the key absent. |
 | ReadAfterWrite | `store: a successful write is immediately readable with its version` | 1 to 3 overwrites. After each `Ok`, a read returns its bytes and the version the put returned. |
 | DeleteIdempotent | `store: a delete is idempotent and touches only its key` | Delete a written key twice, and delete a key that was never written. Each delete is answered `Ok` or a retryable error. A key whose delete succeeded is absent, and so is the never-written key. A sibling key keeps its bytes. When the listing completes, the prefix lists only the sibling. |
-| VersionsNeverReused | `store: a version is never reused after a delete` | Create, delete, then create again with different bytes. The second version differs from the first. A CAS holding the first version is not `Ok`, and the key keeps the second write's bytes. |
+| VersionsNeverReused | `store: a version is never reused after a delete` | Create, delete, then create again with different bytes. The second version differs from the first. A CAS holding the first version is not `Ok`, and the key keeps the second write's bytes. A same-bytes recreate (create X, delete, create X again) is then checked separately: see "Versions on S3". |
 | MultipartInvisibleUntilComplete | `store: a multipart upload is invisible until complete` | Upload one small part, or one 5 MiB part and a small last part. After each staged part, a read finds the key absent, and when the listing completes the key is not listed. After `complete` answers `Ok`, the key holds every part in order. After a failed `complete`, the key holds nothing or the whole object. After `abort`, it holds nothing. |
 | ListEventuallyComplete | `store: a paged list ends complete within its page bound` | Write 3 to 9 keys, then list them page by page. The listing ends within one page per page-size keys, plus one. It returns every key whose write was answered `Ok`, and no key outside the prefix's writes. A page answered with a retryable error is retried up to 7 more times. |
 | LostResponseEffectApplied | `store: a lost-response overwrite took effect` | An overwrite whose response the caller drops. The caller learns only that it did not fail before an acknowledgement. The key holds its bytes afterwards. |
@@ -96,20 +98,41 @@ each mutant must make false.
 - `model::tests::broken_cas_store_is_caught`
 - `model::tests::dropped_lost_response_is_caught`
 - `model::tests::stalled_listing_is_caught`
-- `model::tests::each_mutant_breaks_only_its_own_property`: each mutant
-  leaves the other two mutants' properties holding.
+- `model::tests::versions_same_bytes_recreate_sub_check`: the same-bytes
+  recreate observes the ETag reuse without a false red, and the
+  `cas-accepts-stale-version` mutant breaks its sub-check.
+- `model::tests::each_mutant_breaks_only_its_own_property`: each mutant is run
+  against all nine properties; it breaks only its own, except that
+  `cas-accepts-stale-version` breaks both the CAS and the versions property
+  (it drives a stale CAS in each).
 
 `model::tests::every_property_holds_against_memory_store` shows every
-property holding with no mutant.
+property holding with no mutant. `cas_applied_then_retried_precondition_failed_is_not_a_false_red`
+shows a CAS that applied but was answered `PreconditionFailed` (object_store's
+retry of a landed CAS) is not judged a violation.
 
 ## Versions on S3
 
 On S3, and on RustFS, the version `S3Store` returns is the object's ETag,
 which is derived from its content. Create, delete and create again with the
-same bytes would therefore get the same version back. The driver writes
-unique bodies, so the property above checks the contract as Ravel uses it,
-where no two writes carry the same bytes. It does not check the TLA+ model's
-global version counter.
+same bytes therefore gets the same version back. The different-bytes property
+above checks the contract as Ravel uses it, where no two writes carry the same
+bytes, and does not check the TLA+ model's global version counter, which the
+ETag does not implement.
+
+So the versions action also runs a same-bytes recreate to exercise the case
+the different bodies hide: create X, read its version V1, delete the key,
+create X again, then a CAS holding V1 with new bytes Y. The driver does not
+require the recreate's version to differ from V1 (on RustFS it does not); it
+records the reuse with `assert_sometimes` "store: a same-bytes recreate reuses
+the version". What it does require, as `assert_always` "store: a CAS holding a
+pre-delete version fails after a same-bytes recreate", is that the CAS outcome
+matches its effect: a CAS answered `Ok` is conformant only when the version
+was reused (so V1 is the current version) and the key then holds Y; a CAS
+answered otherwise leaves the recreate's bytes X in place. The
+`common/cas-accepts-stale-version` mutant, which sends a CAS as an overwrite,
+breaks this too: it applies against a version that was not reused. Issue #4389
+tracks whether Ravel's own CAS targets can collide a version this way.
 
 ## Build, run locally, launch
 
