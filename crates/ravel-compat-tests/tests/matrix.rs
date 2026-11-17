@@ -77,6 +77,7 @@
 //!   - crates/ravel-compat-tests/tests/matrix.rs::certify_refuses_a_target_above_active
 //!   - crates/ravel-compat-tests/tests/matrix.rs::certify_refuses_without_a_compat_record
 //!   - crates/ravel-compat-tests/tests/e2e.rs::compat_init_activate_migrate_certify_verify
+//!   - crates/ravel-compat-tests/tests/e2e.rs::with_only_born_fenced_buckets_the_activation_term_sets_the_time_gate
 //! - migrate and certify on an incomplete listing [pinned]
 //!   - crates/ravel-maintain/src/compat_certify.rs::an_incomplete_listing_blocks
 //!   - crates/ravel-maintain/src/compat_certify.rs::a_faulted_listing_blocks_certification
@@ -109,15 +110,19 @@
 //!   - services/ravel-server/src/alerting.rs::an_incapable_holder_reparks_its_lease_and_writes_nothing
 //!   - services/ravel-server/src/alerting.rs::an_incapable_evaluator_takes_no_lease
 //!   - crates/ravel-maintain/src/compat_activate.rs::activation_walk_fences_every_bucket_parks_absent_leases_then_sets_fence_complete
-//! - hazards H1, H3, H5 to H11 [pinned, one or more per hazard, in order]
+//! - hazards H1, H3, H5 to H11, one or more per hazard, in order [partial: no
+//!   test shows an erasure re-encode refuse an unknown section (H6); every
+//!   other hazard is pinned]
 //!   - crates/ravel-catalog/src/fold.rs::newer_previous_part_fails_cycle_without_rebuild
 //!   - services/ravel-server/src/alerting.rs::a_newer_version_object_refuses_the_tick_and_writes_nothing
 //!   - services/ravel-server/tests/alerting_newer_version_history.rs::a_newer_version_alert_object_refuses_the_tick
 //!   - crates/ravel-maintain/src/compat_certify.rs::an_unreadable_postings_version_is_held
 //!   - crates/ravel-maintain/src/retention.rs::held_out_of_window_holds_an_unreadable_rlog_section
 //!   - crates/ravel-logseg/src/postings.rs::newer_postings_version_is_typed_unsupported
+//!   - crates/ravel-maintain/src/compat_certify.rs::an_unreadable_rspan_key_idx_version_is_held
 //!   - crates/ravel-maintain/tests/compat_write_policy.rs::an_unknown_section_kind_holds_the_bucket_in_compaction
 //!   - crates/ravel-maintain/tests/compat_write_policy.rs::an_unknown_section_kind_holds_the_bucket_in_migrate
+//!   - crates/ravel-maintain/tests/migrate_force2.rs::an_unknown_section_in_a_compacted_part_holds_the_bucket
 //!   - crates/ravel-maintain/tests/unknown_section_versions.rs::an_rlog_hold_names_the_inputs_trailer_version
 //!   - crates/ravel-maintain/src/audit_retention.rs::unreadable_version_audit_object_is_held
 //!   - crates/ravel-maintain/src/alert_retention.rs::unreadable_version_alert_object_is_held
@@ -1213,7 +1218,7 @@ fn timings() -> CertifyTimings {
 
 /// Citation lines in this file's header map. A changed count fails until the
 /// constant is updated, so a parse that silently finds fewer lines fails too.
-const CITED_TESTS: usize = 105;
+const CITED_TESTS: usize = 108;
 
 /// The `path::name` citations in this file's header map.
 fn header_citations(source: &str) -> Vec<(String, String)> {
@@ -1231,18 +1236,25 @@ fn header_citations(source: &str) -> Vec<(String, String)> {
 }
 
 /// Whether `source` defines a function `name` carrying a `#[test]` or
-/// `#[tokio::test]` attribute among the attribute and doc lines above it.
+/// `#[tokio::test]` attribute, and no `#[ignore`, among the attribute and doc
+/// lines above it.
 fn defines_test(source: &str, name: &str) -> bool {
     let lines: Vec<&str> = source.lines().collect();
     let sig = format!("fn {name}(");
     lines.iter().enumerate().any(|(i, line)| {
-        line.contains(&sig)
-            && lines[..i]
-                .iter()
-                .rev()
-                .map(|l| l.trim())
-                .take_while(|l| l.starts_with("#[") || l.starts_with("//"))
-                .any(|l| l == "#[test]" || l.starts_with("#[tokio::test"))
+        if !line.contains(&sig) {
+            return false;
+        }
+        let block: Vec<&str> = lines[..i]
+            .iter()
+            .rev()
+            .map(|l| l.trim())
+            .take_while(|l| l.starts_with("#[") || l.starts_with("//"))
+            .collect();
+        block
+            .iter()
+            .any(|l| *l == "#[test]" || l.starts_with("#[tokio::test"))
+            && !block.iter().any(|l| l.starts_with("#[ignore"))
     })
 }
 
@@ -1268,13 +1280,23 @@ fn every_cited_test_exists() {
 }
 
 /// The check refuses a name that is only a prefix of a test, a helper that is
-/// not a test, and a test in another file.
+/// not a test, an ignored test, and a test in another file.
 #[test]
 fn the_citation_check_refuses_near_misses() {
-    let source = "#[tokio::test]\nasync fn real_test() {}\n\nfn helper() {}\n";
+    let source = "#[tokio::test]\nasync fn real_test() {}\n\nfn helper() {}\n\n\
+                  #[test]\n#[ignore = \"slow\"]\nfn ignored_test() {}\n\n\
+                  #[ignore]\n#[tokio::test]\nasync fn ignored_first() {}\n";
     assert!(defines_test(source, "real_test"));
     assert!(!defines_test(source, "real"), "a prefix");
     assert!(!defines_test(source, "helper"), "not a test");
+    assert!(
+        !defines_test(source, "ignored_test"),
+        "ignored after #[test]"
+    );
+    assert!(
+        !defines_test(source, "ignored_first"),
+        "ignored before the test"
+    );
     assert!(!defines_test("", "real_test"), "another file");
     let cites = header_citations("//! map\n//!   - a/b.rs::c\n//!   - d.rs::e\nfn x() {}\n");
     assert_eq!(

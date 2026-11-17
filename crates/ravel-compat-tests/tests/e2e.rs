@@ -25,6 +25,7 @@
 
 mod common;
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -34,7 +35,7 @@ use ravel_catalog::compat::{
 };
 use ravel_catalog::{
     AbsentPolicy, Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
-    DEFAULT_MAX_FLUSH_LIFETIME_NS, provisioning_key, validate_or_adopt,
+    DEFAULT_MAX_FLUSH_LIFETIME_NS, provisioning_key, validate_or_adopt, validate_or_adopt_fenced,
 };
 use ravel_commit::keys;
 use ravel_commit::record::{self, NewCommitRecord};
@@ -575,5 +576,108 @@ async fn compat_init_activate_migrate_certify_verify() {
     assert!(
         rseg_entry(store.as_ref()).await.contradicted,
         "the certificate is contradicted after the late write"
+    );
+}
+
+/// The ADR's view horizon, written out from decision 1 (`H = 10 min`) rather
+/// than read from the build.
+const ADR_H_NS: i64 = 10 * 60 * SECOND_NS;
+
+/// When every provisioned bucket is born fenced (`compat_fenced_unix_ns` 0),
+/// the `G_pre` term drops out and certify's time gate is the activation term
+/// alone: `activated + H + P + T_req`, plus the clock-skew allowance
+/// (decision 7). In the end-to-end test the bucket is fenced at activation,
+/// where `G_pre` outweighs the activation term, so only this case pins `H`.
+#[tokio::test]
+async fn with_only_born_fenced_buckets_the_activation_term_sets_the_time_gate() {
+    assert_eq!(COMPAT_VIEW_HORIZON_NS, ADR_H_NS, "ADR-4233: H = 10 min");
+
+    let store = Arc::new(MemoryStore::with_page_size(2));
+    let activation_ns = sealed_now_ns();
+    let clock = Arc::new(ManualClock::new(activation_ns));
+    let init = init_compat(
+        store.as_ref(),
+        Some(&compat_keys()),
+        clock.as_ref(),
+        &InitConfig {
+            baseline_release_major: 0,
+            baseline_release_minor: 34,
+            max_publish_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
+        },
+    )
+    .await
+    .expect("init");
+    assert_eq!(init.outcome, InitOutcome::Created);
+    let report = activate(
+        store.as_ref(),
+        Some(&compat_keys()),
+        clock.as_ref(),
+        &WritableVersions::current().with_family(FAMILY_RSEG, vec![u32::from(VERSION_V7), drill()]),
+        &ActivateRequest {
+            family: FAMILY_RSEG.to_string(),
+            version: drill(),
+            activated_by: "e2e".to_string(),
+            writer_roles_can_read_compat: true,
+            alert_rule_tenants: Vec::new(),
+            clock_skew_allowance_ns: DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+            resume_from: None,
+        },
+    )
+    .await
+    .expect("activate");
+    assert!(report.walk.complete, "{:?}", report.walk);
+
+    // A tenant onboarded after activation: its first touch knows the epoch,
+    // so the record is born fenced.
+    validate_or_adopt_fenced(
+        store.as_ref(),
+        &hash(),
+        Signal::Metrics,
+        SHARD + 1,
+        activation_ns + SECOND_NS,
+        AbsentPolicy::CreateFromConfig,
+        NonZeroU64::new(report.walk.compat_epoch),
+    )
+    .await
+    .expect("born-fenced provisioning");
+    let prov = sysproto::ProvisioningRecord::decode(
+        store
+            .get(&provisioning_key(&hash(), Signal::Metrics), GetRange::Full)
+            .await
+            .expect("get provisioning")
+            .data
+            .as_ref(),
+    )
+    .expect("decode provisioning");
+    assert_eq!(
+        (prov.compat_epoch, prov.compat_fenced_unix_ns),
+        (report.walk.compat_epoch, 0),
+        "born fenced"
+    );
+    assert_eq!(
+        rseg_entry(store.as_ref()).await.activated_unix_ns,
+        activation_ns
+    );
+
+    let not_before = activation_ns
+        + ADR_H_NS
+        + DEFAULT_MAX_FLUSH_LIFETIME_NS
+        + T_REQ_NS
+        + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
+    assert_eq!(
+        certify_at(store.as_ref(), not_before).await,
+        CertifyReport::Refused(CertifyRefusal::TimeGate {
+            now_ns: not_before,
+            not_before_ns: not_before,
+        }),
+        "certify refuses at exactly activated + H + P + T_req + skew"
+    );
+    let past = certify_at(store.as_ref(), not_before + 1).await;
+    assert!(
+        !matches!(
+            past,
+            CertifyReport::Refused(CertifyRefusal::TimeGate { .. })
+        ),
+        "the gate opens one nanosecond later: {past:?}"
     );
 }
