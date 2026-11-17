@@ -9,6 +9,30 @@ on the host: Brig's broker adds them to requests on the way out.
 Each piece of work gets its own clone and its own sandbox, with 8 vCPUs and
 12 GB of memory.
 
+## Run one sandbox at a time
+
+Each ticket's clone builds into its own `target/brig/` on your Mac's disk,
+and nothing is shared between clones. A first build writes 54 to 70 GB. A
+full disk stops commands in every session on the Mac, not only the
+sandbox.
+
+So `make brig-new`, `make brig`, `make brig-shell` and `make brig-update`
+refuse in these cases:
+
+| Check | Refuses when | To run anyway |
+| --- | --- | --- |
+| Free disk, clone not built yet | less than 70 GB free | `RAVEL_BRIG_MIN_FREE_GB=<n>` |
+| Free disk, clone built before | less than 20 GB free | `RAVEL_BRIG_WARM_FREE_GB=<n>` |
+| Another Ravel sandbox | one is running, or `brig --json ls` fails | `RAVEL_BRIG_ALLOW_PARALLEL=1` |
+
+Nothing removes a clone for you. When a ticket merges, remove its sandbox and
+its clone:
+
+```sh
+make brig-rm NAME=4405-brig
+rm -rf ../store-brig/4405-brig
+```
+
 ## Set up once
 
 1. Install brig from the main channel. The released v0.5.2 cannot run a
@@ -62,17 +86,15 @@ make brig NAME=4405-brig           # Claude Code in that clone's sandbox
 build of the image. Set `RAVEL_BRIG_CLONES` to keep clones somewhere other
 than `../store-brig`.
 
-When the branch is merged, remove the sandbox with `make brig-rm`, then
-delete the clone directory.
-
 ## Inside the sandbox
 
 - Gates run as on the host: `scripts/gates.sh -p <crate>`, `cargo nextest
   run -p <crate>`. Scoped gates diff against `origin/main`, so fetch it
   first when the clone is old.
-- Build output goes to `target/brig/` in the clone, on host disk. A cold
-  build there writes 54 GB or more. The full merge-tier gate, with its
-  feature lanes, can need 188 GB per clone, so leave it to the host or CI.
+- Build output goes to `target/brig/` in the clone, on host disk (see
+  [Run one sandbox at a time](#run-one-sandbox-at-a-time)). The full
+  merge-tier gate, with its feature lanes, can need 188 GB per clone, so
+  leave it to CI.
 - `CARGO_BUILD_JOBS` is 4, because the guest has no swap and several
   large test binaries linking at once can run it out of memory. Try
   `CARGO_BUILD_JOBS=8` for a lighter build. If a link is killed with
@@ -87,6 +109,26 @@ delete the clone directory.
 The sandbox reaches crates.io, `static.rust-lang.org` and the npm registry
 directly. Everything else is refused, apart from GitHub and Anthropic
 through the routes.
+
+## When Claude Code hangs
+
+If `claude` in the sandbox prints nothing and never answers, check the
+broker on the host:
+
+```sh
+brig doctor
+```
+
+`refresh failing: claude-credentials` means brig's copy of your Claude login
+is stale. Claude Code sessions on the host refresh the same login, and the
+refresh can leave brig's copy unusable. Import the current login, then stop
+the sandbox so the next run starts a new broker:
+
+```sh
+brig secret import claude-code
+make brig-stop NAME=4405-brig
+make brig NAME=4405-brig
+```
 
 ## Limits
 

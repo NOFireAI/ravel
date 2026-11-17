@@ -114,6 +114,9 @@ difftest:
 # the Claude login and the GitHub token kept on the host. Run these from your
 # primary checkout or a worktree, never from inside a sandbox clone. Needs brig
 # from the main channel: brew install --cask brig-sh/brig/brig@main.
+# One Ravel sandbox at a time: each clone's first build writes 54 to 70 GB,
+# so these refuse below 70 GB free or beside another running Ravel sandbox.
+# When a ticket merges, make brig-rm NAME=x and delete ../store-brig/x.
 # See docs/internal/dev-in-brig.md.
 #
 #   make brig-login                  store the secrets the routes send, once
