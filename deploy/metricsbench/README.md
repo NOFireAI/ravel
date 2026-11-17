@@ -710,7 +710,8 @@ verification (step 6), after which the run goes on as a diagnostic.
    The listing is kept as `ravel-objects-listing.json`, and its keys are
    counted, and their sizes summed, by kind into `ravel-objects.json`, the
    same figures stamped as `ravel_objects`:
-   `data` (`t/<tenant>/m/l0/*.rseg`), `commit` (`t/<tenant>/m/c/`),
+   `data` (`t/<tenant>/m/l0/*.rseg`), `l1` (`t/<tenant>/m/l1/*.rseg`, the
+   parts a compaction wrote), `commit` (`t/<tenant>/m/c/`),
    `qualify` (`sys/qualify/`, the store-qualify probes), `other` (the
    catalog and bookkeeping keys) and `total`, every key once (case v). The
    step fails when the kinds do not sum to the total; no listing can make
@@ -1960,7 +1961,10 @@ Steps, in order, stopping at the first failure (case ro1):
    `fold-flags` records no step of its own in `steps_completed`.
 2. `up`: `docker compose ... up -d ravel-server`. This starts ravel-server
    and what it depends on (s3s, `createbuckets` and `ravel-qualify`). It
-   starts no comparator.
+   starts no comparator. Unlike a Stage 1 run, ravel-server starts with the
+   metrics label index on (`--fold-key-index-leaves` plus the label index's
+   on flag, stamped as `stage1.server_flags_up`), so the background fold
+   builds the same index as every later fold (case ro1).
 3. `qualify`, `image` and `ready`, as in a full run. `ready` checks Ravel's
    `/api/v1/status/buildinfo` alone.
 4. `ingest`: `metricsbench_ingest` with the Ravel row alone, passing
@@ -1968,29 +1972,57 @@ Steps, in order, stopping at the first failure (case ro1):
    endpoint, into `ingest.json`. A Ravel read-back that answered 422 is
    stamped `refused (budget)` in `ravel_only.ingest_readback` and the run
    goes on (case ro4). Any other failed or extra row fails the step.
-5. `readback-l0`: Ravel's `/metrics` scraped into
-   `ravel-metrics-before-readback-l0.txt`, then `metricsbench_ingest
-   --readback-only --readback-system ravel` into `readback-l0.json`, then
-   `/metrics` scraped again into `ravel-metrics-after-readback-l0.txt`. This
-   reads the catalog that the background fold built over L0.
-6. `objects-l0`: `ravel-cli catalog list` into
+5. `stage1-l0-fold`: ravel-server stopped (the writers), then a wait
+   through `METRICSBENCH_SLEEP` until the last ingest hour seals (its end
+   plus the 5 minute clock-skew allowance and a minute, the same wait
+   `stage1-l1-compact` takes), then the fold `stage1-l1-fold` runs:
+   `ravel-cli catalog fold --signal metrics --writers-stopped
+   --key-index-leaves` with the label index on, into `stage1-l0-fold.json`,
+   stamped as `stage1.l0_fold` (case ro1).
+6. `stage1-l0`: ravel-server recreated with the flags `stage1-l1` uses
+   (`--disable-fold`, the label index on; `stage1.l0_restart`), then
+   `ravel-cli catalog inspect` into `stage1-l0.inspect.txt`
+   (`stage1.l0_catalog`) and the catalog state stamped as
+   `ravel_only.l0.catalog`. A snapshot whose watermark hour is before the
+   hour the ingest ended, or that holds no part or entry, refuses the
+   read-back with exit 70: `ravel_only.l0.catalog.uncovered` and
+   `ravel_only.l0.readback` name what is missing (case ro6).
+7. `objects-l0`: `ravel-cli catalog list` into
    `ravel-only-l0.objects.jsonl`, and its L0 and L1 data object counts are
    stamped as `ravel_only.l0.catalog_objects`. The bucket is then counted
    by kind, as in the `objects` step, into `ravel-objects-l0.json`
-   (`ravel_only.l0.objects`). `--ravel-objects-band` applies here only.
-7. `stage1-l1-compact`, `stage1-l1-fold` and `stage1-l1`: Stage 1 steps 14
+   (`ravel_only.l0.objects`). `--ravel-objects-band` applies here only, and
+   bounds the `data` (L0) count.
+8. `readback-l0`: Ravel's `/metrics` scraped into
+   `ravel-metrics-before-readback-l0.txt`, then `metricsbench_ingest
+   --readback-only --readback-system ravel` into `readback-l0.json`, then
+   `/metrics` scraped again into `ravel-metrics-after-readback-l0.txt`. This
+   reads the L0 catalog `stage1-l0-fold` published, with no fold running.
+9. `stage1-l1-compact`, `stage1-l1-fold` and `stage1-l1`: Stage 1 steps 14
    to 16, with these differences in `stage1-l1`:
-   - it reads the snapshot state into `stage1.l1_catalog`;
+   - it reads the snapshot state into `stage1.l1_catalog` and stamps
+     `ravel_only.l1.catalog`, refusing the read-back as `stage1-l0` does;
    - it runs no pass;
    - `stage1.l1` and `stage1.l1_compare` say why they were skipped.
-8. `objects-l1`: as `objects-l0`, after the compaction.
-9. `readback-l1`: as `readback-l0`, on the L1 catalog, with `-l1` in each
-   file name.
+   `ravel_only.differences` is then stamped (see below).
+10. `objects-l1`: as `objects-l0`, after the compaction. The L1 parts
+    compaction wrote (`t/<tenant>/m/l1/*.rseg`) are counted under `l1`, so
+    `data` still counts the L0 objects left in the bucket (case ro1).
+11. `readback-l1`: as `readback-l0`, on the L1 catalog, with `-l1` in each
+    file name.
 
 For each catalog state (`l0` and `l1`), `stamps.json` holds these keys under
 `ravel_only.STATE` (case ro1):
 
-- `objects`: the object counts by kind.
+- `catalog`: the snapshot the read-back reads, stamped once before it:
+  `watermark_hour`, `parts`, `entry_count` (summed over the parts),
+  `key_index_leaf_refs`, `label_value_leaf_parts` and `label_value_leaf_refs`
+  from the inspect; `fold_watermark_hour` and `fold_key_index_leaves_written`
+  from the fold that built it (`fold` names its stamp); `server`, the
+  recreate before the read-back; `ingest_end_hour`, `covers_ingest` and
+  `uncovered` (null when it covers).
+- `objects`: the object counts by kind: `data` (L0), `l1`, `commit`,
+  `qualify`, `other` and `total`.
 - `catalog_objects`: the catalog's L0 and L1 data object counts.
 - `readback`: what the read-back produced:
   - `verdict`;
@@ -2015,6 +2047,34 @@ A figure that was expected and not produced is a miss. A miss fails its
 step with exit 70 and the message names the missing key, for example no
 listing time on the L1 catalog (case ro3) or no GET byte counter in the
 scrape (case ro3b).
+
+#### What the L1-minus-L0 figures measure
+
+The two read-backs are meant to differ in catalog level alone: the same
+tenant, binary and box, each snapshot built by the same writers-stopped fold
+with the label index on, each read with ravel-server freshly recreated with
+the same flags and no fold running. `ravel_only.differences` checks the
+conditions that could still differ, each with the `l0` and `l1` value and a
+`verdict` of `same` or `differs` (case ro1):
+
+- `label_index`: how many snapshot parts carry a `label_value` leaf. `same`
+  only when every part does in both states. The series route prunes objects
+  by that index, so a part without it changes the listing's cost apart from
+  the object count.
+- `server`: the recreate before each read-back (`stage1.l0_restart`,
+  `stage1.l1_restart`), whose flags carry `--disable-fold`.
+- `covers_ingest`: both snapshots reach the hour the ingest ended.
+
+`fold` restates that both folds are the same command, and `catalog_level`
+names the variable measured. `differs` lists the conditions marked
+`differs`, and `attributable_to_compaction` is true only when it is empty.
+When it is true, the L1-minus-L0 deltas of `series_query_ms`,
+`readback.store_get_calls.delta` and `readback.store_get_bytes.delta` are
+attributable to the compaction: the GET counters are process-wide, and no
+background fold runs in either read-back to add its own GETs. When it is
+false, the run says which condition differs on stderr and the deltas are not
+attributable to compaction alone. The object counts (`catalog_objects`,
+`objects`) describe each state and are not timed figures.
 
 These steps do not run: the sampler, `mimir-readiness`, `objects`, `query`,
 `capture`, `provenance`, `validate`, `memory`, the object-spans step and the

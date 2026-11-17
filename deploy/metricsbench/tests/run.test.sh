@@ -401,8 +401,11 @@
 #                                       with another arm or the control arm
 #                                       refused 65; ro1: --ravel-only on
 #                                       history, its steps in order, Ravel
-#                                       alone, no query step, each catalog
-#                                       state stamped; mp1:
+#                                       alone, no query step, the L0
+#                                       catalog stopped, sealed and folded
+#                                       as the L1 one before readback-l0,
+#                                       each catalog state stamped once,
+#                                       the L1 parts counted; mp1:
 #                                       MB_L1_MAX_PART_BYTES on the
 #                                       compact-tenant argv, 0 and no l1 arm
 #                                       64; ro2: --ravel-only on cardinality
@@ -415,7 +418,9 @@
 #                                       are misses (70); ro4: a 422 stamped
 #                                       refused (budget), exit 0; ro5: a
 #                                       mismatch and ro5b: an error other
-#                                       than a 422 exit 70.
+#                                       than a 422 exit 70; ro6: an L0
+#                                       catalog that does not cover the
+#                                       ingest refused 70.
 #                                       stage1-check.sh: the ci band file
 #                                       clean on z1 (arm figures n/a), za
 #                                       (the reference prune band n/a),
@@ -774,12 +779,15 @@ JSON
           *" list-objects-v2 "*)
             # The objects step's listing of Ravel's bucket: STUB_LISTING's
             # file, else STUB_LIST_DATA (default 300) data objects and one
-            # key of every other kind; exit STUB_LIST_EXIT.
+            # key of every other kind, and once compact-tenant ran the two L1
+            # parts it wrote, 400 bytes each; exit STUB_LIST_EXIT.
             [ "${STUB_LIST_EXIT:-0}" -eq 0 ] || exit "${STUB_LIST_EXIT}"
             if [ -n "${STUB_LISTING:-}" ]; then
               cat "${STUB_LISTING}"
             else
-              python3 -I -c 'import json,sys; n=int(sys.argv[1]); print(json.dumps({"Contents": [{"Key": f"t/h1/m/l0/{i:06d}.rseg", "Size": 100} for i in range(n)] + [{"Key": "t/h1/m/c/a", "Size": 10}, {"Key": "sys/qualify/p", "Size": 1}, {"Key": "t/h1/catalog/x", "Size": 5}]}))' "${STUB_LIST_DATA:-300}"
+              l1=0
+              [ ! -e "${STUB_STATE}.compacted" ] || l1=2
+              python3 -I -c 'import json,sys; n=int(sys.argv[1]); l1=int(sys.argv[2]); print(json.dumps({"Contents": [{"Key": f"t/h1/m/l0/{i:06d}.rseg", "Size": 100} for i in range(n)] + [{"Key": f"t/h1/m/l1/0000/{490000+h}/{0xe0+h:016x}.0000.{0xe1+h:016x}.rseg", "Size": 400} for h in range(l1)] + [{"Key": "t/h1/m/c/a", "Size": 10}, {"Key": "sys/qualify/p", "Size": 1}, {"Key": "t/h1/catalog/x", "Size": 5}]}))' "${STUB_LIST_DATA:-300}" "$l1"
             fi
             ;;
           # stage1-holders' download: the STUB_LIST_DATA (default 300) data
@@ -1187,11 +1195,15 @@ STUB
 # date: the host's own, except `date -u +%s` once $STUB_STATE.clock exists
 # (the erase submit stub writes STUB_CLOCK_AT_SUBMIT there, the
 # metricsbench_query stub STUB_CLOCK_AFTER_PENDING), which prints that
-# instant.
+# instant, or STUB_CLOCK when it is set and the file is not.
 cat >"${BIN}/date" <<'STUB'
 #!/usr/bin/env bash
 if [ "$*" = "-u +%s" ] && [ -s "${STUB_STATE}.clock" ]; then
   cat "${STUB_STATE}.clock"
+  exit 0
+fi
+if [ "$*" = "-u +%s" ] && [ -n "${STUB_CLOCK:-}" ]; then
+  echo "${STUB_CLOCK}"
   exit 0
 fi
 exec "${STUB_REAL_DATE}" "$@"
@@ -3728,9 +3740,67 @@ expect_err "hl2-control: the control arm is refused on history" "MB_STAGE1=1 wit
 
 # ro1: the Ravel-only shape on history: Ravel alone, its steps in order, the
 # listing read back on the L0 catalog and again on the L1 one, no query step.
-MB_STAGE1=1 MB_STAGE1_ARMS=l1 run_stage1 ro1 history --ravel-only
+# RO_CLOCK puts the run in hour 490001, the watermark hour the stub's catalog
+# inspect prints, so the ingest ends in an hour that snapshot covers.
+RO_CLOCK=$((490001 * 3600 + 600))
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 run_stage1 ro1 history --ravel-only
 expect_rc ro1 0
-check "ro1: the Ravel-only steps in order" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","stage1-flags","up","qualify","image","ready","ingest","readback-l0","objects-l0","stage1-l1-compact","stage1-l1-fold","stage1-l1","objects-l1","readback-l1"] and j("stamps.json")["status"] == "passed"'
+check "ro1: the Ravel-only steps in order" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","stage1-flags","up","qualify","image","ready","ingest","stage1-l0-fold","stage1-l0","objects-l0","readback-l0","stage1-l1-compact","stage1-l1-fold","stage1-l1","objects-l1","readback-l1"] and j("stamps.json")["status"] == "passed"'
+# The L0 catalog is brought to the state the L1 one is read in before
+# readback-l0: ravel-server stopped, the wait until the last ingest hour
+# (490001) seals at 490002h + 6 min (3360 s after RO_CLOCK), the same
+# writers-stopped fold with the label index on as stage1-l1-fold, and the
+# same recreate with --disable-fold.
+if python3 -I - "${LOG}" "${OUT}" <<'PY'; then
+import sys
+lines, out = open(sys.argv[1]).read().splitlines(), sys.argv[2]
+def at(pred):
+    return [i for i, l in enumerate(lines) if pred(l)]
+ingest = at(lambda l: l.startswith("metricsbench_ingest --workload "))
+readback = at(lambda l: l.startswith(f"metricsbench_ingest --readback-only --ingest-report {out}/ingest.json --readback-system ravel "))
+stop = at(lambda l: l.startswith("docker compose ") and l.endswith(" stop ravel-server"))
+sleep = at(lambda l: l.startswith("stubsleep "))
+fold = at(lambda l: l.startswith("docker compose ") and " catalog fold " in l)
+recreate = at(lambda l: l == "docker-compose-up -d --no-deps --force-recreate ravel-server")
+compact = at(lambda l: l.startswith("docker compose ") and " compact-tenant " in l)
+flags = [l.split(" catalog fold ", 1)[1] for l in (lines[i] for i in fold)]
+ok = (len(ingest) == 1 and len(readback) == 2 and len(stop) == 2 and len(fold) == 2 and len(recreate) == 2
+      and len(compact) == 1 and lines[sleep[0]] == "stubsleep 3360"
+      and ingest[0] < stop[0] < sleep[0] < fold[0] < recreate[0] < readback[0]
+      and readback[0] < stop[1] < compact[0] < fold[1] < recreate[1] < readback[1]
+      and flags[0] == flags[1] and " --writers-stopped --key-index-leaves " in flags[0]
+      and " --no-metrics-label-index" not in flags[0])
+sys.exit(0 if ok else 1)
+PY
+  pass "ro1: readback-l0 follows the stop, the seal wait, the writers-stopped fold stage1-l1-fold runs and the recreate, in order"
+else
+  fail "ro1: readback-l0 is not preceded by the stop, the seal wait and the fold in order ($(grep -nE ' stop ravel-server$|^stubsleep |catalog fold|force-recreate|--readback-only' "${LOG}" | tr '\n' '|'))"
+fi
+check "ro1: each read-back's server and fold stamped, the same flags, --disable-fold in both" 'j("stamps.json")["stage1"]["l0_restart"] == j("stamps.json")["stage1"]["l1_restart"] == "recreated: docker compose up -d --no-deps --force-recreate ravel-server with RAVEL_SERVER_EXTRA_FLAGS='"'${ROUTED_FLAGS}'"', then ravel answered 200 on /api/v1/status/buildinfo" and j("stamps.json")["stage1"]["l0_fold"]["file"] == "stage1-l0-fold.json" and j("stamps.json")["stage1"]["l1_fold"]["file"] == "stage1-l1-fold.json"'
+if grep -qx "docker-env up RAVEL_SERVER_EXTRA_FLAGS=--fold-key-index-leaves" "${LOG}"; then
+  pass "ro1: compose up runs ravel-server with the label index on, so the background fold builds it too"
+else
+  fail "ro1: compose up's RAVEL_SERVER_EXTRA_FLAGS is $(grep '^docker-env up RAVEL_SERVER_EXTRA_FLAGS=' "${LOG}")"
+fi
+check "ro1: stage1.server_flags_up stamps the label-index-on up flags" 'j("stamps.json")["stage1"]["server_flags_up"] == "--fold-key-index-leaves"'
+# Both catalog states are read once each, after their fold and before their
+# read-back, and stamped with the same fields.
+RO_CATALOG='{"state": S, "inspect": f"stage1-{S}.inspect.txt", "fold": f"stage1.{S}_fold", "watermark_hour": 490001, "parts": 3, "entry_count": 30, "key_index_leaf_refs": 3, "label_value_leaf_parts": 3, "label_value_leaf_refs": 3, "fold_watermark_hour": 490001, "fold_key_index_leaves_written": 0, "server": j("stamps.json")["stage1"]["l1_restart"], "ingest_end_hour": 490001, "covers_ingest": True, "uncovered": None}'
+check "ro1: ravel_only.l0.catalog and ravel_only.l1.catalog stamp each state" 'all(j("stamps.json")["ravel_only"][S]["catalog"] == '"${RO_CATALOG}"' for S in ("l0", "l1"))'
+if python3 -I - "${LOG}" "${OUT}" <<'PY'; then
+import sys
+lines, out = open(sys.argv[1]).read().splitlines(), sys.argv[2]
+inspect = [i for i, l in enumerate(lines) if l.startswith("docker compose ") and " catalog inspect " in l]
+readback = [i for i, l in enumerate(lines) if l.startswith(f"metricsbench_ingest --readback-only --ingest-report {out}/ingest.json ")]
+sys.exit(0 if len(inspect) == 2 and len(readback) == 2 and inspect[0] < readback[0] < inspect[1] < readback[1] else 1)
+PY
+  pass "ro1: one catalog inspect per state, each before its read-back"
+else
+  fail "ro1: the catalog inspects are not one per state before its read-back ($(grep -cE 'catalog inspect' "${LOG}"))"
+fi
+check "ro1: stage1.l0_catalog and stage1.l1_catalog each name their own inspect file, both written" 'all(j("stamps.json")["stage1"][f"{S}_catalog"]["file"] == f"stage1-{S}.inspect.txt" and os.path.getsize(os.path.join(out, f"stage1-{S}.inspect.txt")) > 0 for S in ("l0", "l1"))'
+check "ro1: ravel_only.differences names every condition, all the same, the delta attributable to compaction" 'j("stamps.json")["ravel_only"]["differences"]["differs"] == [] and j("stamps.json")["ravel_only"]["differences"]["attributable_to_compaction"] is True and all(j("stamps.json")["ravel_only"]["differences"][k]["verdict"] == "same" for k in ("label_index", "server", "covers_ingest")) and j("stamps.json")["ravel_only"]["differences"]["label_index"]["l0"] == "3 of 3 parts carry a label_value leaf"'
+check "ro1: the L1 bucket count holds the two L1 parts compact-tenant wrote, the L0 one none" 'j("stamps.json")["ravel_only"]["l1"]["objects"]["l1"] == {"count": 2, "bytes": 800} and j("stamps.json")["ravel_only"]["l0"]["objects"]["l1"] == {"count": 0, "bytes": 0} and j("stamps.json")["ravel_only"]["l1"]["objects"]["data"]["count"] == 300 and j("stamps.json")["ravel_only"]["l1"]["objects"]["other"] == {"count": 1, "bytes": 5} and j("stamps.json")["ravel_only"]["l1"]["objects"]["total"]["count"] == 305'
 expect_no_log "ro1: no query step" "metricsbench_query"
 expect_no_log "ro1: no Prometheus call" "127.0.0.1:9090"
 expect_no_log "ro1: no VictoriaMetrics call" "127.0.0.1:8428"
@@ -3739,10 +3809,10 @@ if python3 -I - "${LOG}" <<'PY'; then
 import sys
 lines = open(sys.argv[1]).read().splitlines()
 ups = [l for l in lines if l.startswith("docker-compose-up ")]
-want = ["docker-compose-up -d ravel-server", "docker-compose-up -d --no-deps --force-recreate ravel-server"]
+want = ["docker-compose-up -d ravel-server"] + ["docker-compose-up -d --no-deps --force-recreate ravel-server"] * 2
 sys.exit(0 if ups == want else 1)
 PY
-  pass "ro1: compose brings up ravel-server alone, and recreates it once for stage1-l1"
+  pass "ro1: compose brings up ravel-server alone, and recreates it once for stage1-l0 and once for stage1-l1"
 else
   fail "ro1: compose up lines are $(grep '^docker-compose-up ' "${LOG}" | tr '\n' '|')"
 fi
@@ -3756,12 +3826,12 @@ readback = at(lambda l: l.startswith(f"metricsbench_ingest --readback-only --ing
 listing = at(lambda l: l.startswith("docker compose ") and " list-objects-v2 " in l)
 compact = at(lambda l: l.startswith("docker compose ") and " compact-tenant " in l)
 ok = (len(ingest) == 1 and len(readback) == 2 and len(listing) == 2 and len(compact) == 1
-      and ingest[0] < readback[0] < listing[0] < compact[0] < listing[1] < readback[1]
+      and ingest[0] < listing[0] < readback[0] < compact[0] < listing[1] < readback[1]
       and " --ravel-endpoint " in lines[ingest[0]] and " --no-in-process-row " in lines[ingest[0]]
       and not any(f" --{s}-endpoint " in lines[ingest[0]] for s in ("prometheus", "victoriametrics", "mimir")))
 sys.exit(0 if ok else 1)
 PY
-  pass "ro1: ingest of the Ravel row alone, read-back, objects, compact-tenant, objects, read-back"
+  pass "ro1: ingest of the Ravel row alone, objects, read-back, compact-tenant, objects, read-back"
 else
   fail "ro1: the calls are out of order or the ingest names another row"
 fi
@@ -3823,30 +3893,37 @@ expect_rc ro2-nostage1 64
 expect_err "ro2-nostage1: --ravel-only names what it needs" "--ravel-only runs the Stage 1 l1 arm alone and needs MB_STAGE1=1 MB_STAGE1_ARMS=l1"
 
 # ro3: a read-back that produced no listing time on the L1 catalog is a miss.
-MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_READBACK_ONLY_SEQ="0 noms" run_stage1 ro3 history --ravel-only
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_READBACK_ONLY_SEQ="0 noms" run_stage1 ro3 history --ravel-only
 expect_rc ro3 70
 expect_err "ro3: the miss names the step and the figure" "step readback-l1 failed: miss: the read-back on the l1 catalog produced no ['series_query_ms']"
 check "ro3: the l1 listing stamp is null, the run failed at readback-l1" 'j("stamps.json")["ravel_only"]["l1"]["series_query_ms"] is None and j("stamps.json")["ravel_only"]["l0"]["series_query_ms"] == 12 and j("stamps.json")["failed_step"] == "readback-l1" and j("stamps.json")["status"] == "failed"'
 # ro3b: a scrape without the GET byte counter is a miss on the first read-back.
-MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_NO_GET_BYTES=1 run_stage1 ro3b history --ravel-only
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_NO_GET_BYTES=1 run_stage1 ro3b history --ravel-only
 expect_rc ro3b 70
 expect_err "ro3b: the miss names both byte figures" "step readback-l0 failed: miss: the read-back on the l0 catalog produced no ['store_get_bytes.before', 'store_get_bytes.after']"
 expect_no_log "ro3b: no compaction after the miss" "compact-tenant"
 
 # ro4: a 422 on the ingest read-back and on the L1 listing is stamped refused
 # (budget) with the time the error names, and the run passes.
-MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_INGEST_READBACK_422=ravel STUB_READBACK_ONLY_SEQ="0 422" run_stage1 ro4 history --ravel-only
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_INGEST_READBACK_422=ravel STUB_READBACK_ONLY_SEQ="0 422" run_stage1 ro4 history --ravel-only
 expect_rc ro4 0
 check "ro4: refused (budget) at ingest and on L1, matched on L0" 'j("stamps.json")["ravel_only"]["ingest_readback"]["verdict"] == "refused (budget)" and j("stamps.json")["ravel_only"]["l0"]["verdict"] == "matched" and j("stamps.json")["ravel_only"]["l1"]["verdict"] == "refused (budget)" and j("stamps.json")["ravel_only"]["l1"]["series_query_ms"] == 4321 and j("stamps.json")["status"] == "passed"'
 # ro5: a read-back that does not match fails its step.
-MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_READBACK_ONLY_SEQ="mismatch" run_stage1 ro5 ci --ravel-only
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_READBACK_ONLY_SEQ="mismatch" run_stage1 ro5 ci --ravel-only
 expect_rc ro5 70
 expect_err "ro5: the mismatch names the step and the verdict" "step readback-l0 failed: metricsbench_ingest --readback-only exited 1, verdict mismatch: series_count 999, want 1000"
 check "ro5: the mismatch is stamped with its listing time" 'j("stamps.json")["ravel_only"]["l0"]["verdict"] == "mismatch" and j("stamps.json")["ravel_only"]["l0"]["series_query_ms"] == 14'
 # ro5b: a read-back error that is not a 422 fails its step.
-MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_READBACK_ONLY_SEQ="1" run_stage1 ro5b ci --ravel-only
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_READBACK_ONLY_SEQ="1" run_stage1 ro5b ci --ravel-only
 expect_rc ro5b 70
 check "ro5b: a read-back error other than a 422 is stamped error and fails readback-l0" 'j("stamps.json")["ravel_only"]["l0"]["verdict"] == "error" and j("stamps.json")["failed_step"] == "readback-l0"'
+# ro6: an ingest that ends in hour 490002, past the folded L0 snapshot's
+# watermark 490001, refuses readback-l0 with the stamp naming the hour.
+STUB_CLOCK=$((490002 * 3600 + 600)) MB_STAGE1=1 MB_STAGE1_ARMS=l1 run_stage1 ro6 history --ravel-only
+expect_rc ro6 70
+expect_err "ro6: the refusal names the step, the watermark and the uncovered hour" "step stage1-l0 failed: refused: readback-l0 would read a catalog that does not cover the ingest: watermark_hour 490001 is before hour 490002, in which the ingest step ended, so ingest hours 490002..=490002 are not in the snapshot"
+check "ro6: the L0 catalog is stamped as not covering the ingest, the read-back refused" 'j("stamps.json")["failed_step"] == "stage1-l0" and j("stamps.json")["ravel_only"]["l0"]["catalog"]["covers_ingest"] is False and j("stamps.json")["ravel_only"]["l0"]["catalog"]["watermark_hour"] == 490001 and j("stamps.json")["ravel_only"]["l0"]["catalog"]["ingest_end_hour"] == 490002 and j("stamps.json")["ravel_only"]["l0"]["readback"].startswith("refused: the l0 catalog does not cover the ingest: watermark_hour 490001 ") and j("stamps.json")["ravel_only"]["l0"]["series_query_ms"] is None'
+expect_no_log "ro6: no read-back on the uncovered catalog" "--readback-only"
 
 # zg: a routed HEAD that does not read back as saved refuses the leaf-on fold.
 MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour STUB_HEAD_RESTORE_BROKEN=1 run_stage1 zg ci
