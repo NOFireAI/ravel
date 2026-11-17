@@ -66,7 +66,9 @@ Seven decisions, ordered by leverage.
 Enable the GitHub merge queue for `main`; add a `merge_group` trigger to
 ci.yml so required checks run on the queued merge result. This tests the
 exact tree that will become main, closing the green+green=red class
-structurally instead of procedurally.
+structurally instead of procedurally. The queue run narrows its lanes by
+the queued change the way a pull request does (see the queue narrowing
+amendment below).
 
 ### D2. Correct the required-check set
 
@@ -448,3 +450,40 @@ workflow does not run on a label event.
 The first labelled run (41456540729) built cold, kept at least 54,757 MiB
 free, and finished in 54 minutes. The job's timeout rises from 60 to 75
 minutes so a cold run can finish and save its cache.
+
+## Amendment: queue narrowing
+
+<!-- amendment-applies: sections="D1. Merge queue on main" pointer="queue narrowing amendment" -->
+
+Dated 2026-11-17. Tracked in issue #4415.
+
+The `changes` job forced every lane on in a `merge_group` run, so a queued
+docs-only change paid the same 53-job run as a change to `ravel-query`. The
+NOFireAI organisation shares one pool of 60 concurrent hosted jobs across all
+its repositories, and ravel's queue and main-push runs held most of it. Of the
+150 pull requests merged from 2026-11-09 to 2026-11-17, 19 were docs-only and
+each still paid a full queue run.
+
+A `merge_group` run now classifies its change the way a pull request run does,
+diffing `merge_group.base_sha` against the queued head. The queued head holds
+every entry ahead of it in the group, so the diff is the union of their
+changes. A base the job cannot find still forces the full run.
+
+D1's guarantee, that the queue tests the exact tree that becomes main, is
+narrowed to the lanes the change reaches. What that keeps:
+
+- A change with any non-docs file still runs `lint`, every `check` shard,
+  `features`, `all-features`, `supply-chain`, `fuzz` and `invariants`, so two
+  entries that compile apart and break together are still caught.
+- The area lanes (`sql`, `flight-sql`, `features-agents`, `features-mcp`,
+  `object-store-contract`, `bench-smoke`, `promql-difftest`, the kind lanes)
+  run when the change reaches them through `scripts/ci-lane-areas.tsv`, the
+  reverse-dependency map the pull request run already uses.
+- A docs-only change compiles nothing in the queue, as on its pull request.
+
+What it gives up: no run tests every lane against each landed tree. The push
+to `main` narrows against `github.event.before` in the same way, so a lane
+runs on main only when a change reaches it. A failure that the area map does
+not route to its lane is found later, by the next change that reaches that
+lane or by a nightly workflow, and not at the queue. The pull request run had
+the same exposure already; the queue no longer adds a second, wider check.

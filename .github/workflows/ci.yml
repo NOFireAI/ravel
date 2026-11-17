@@ -59,8 +59,8 @@ jobs:
       # non-docs change: a lane runs only when docs_only is false AND its own
       # area output is true. Mappings are conservative -- when a change cannot
       # be proven irrelevant to a lane, the area is forced true so the lane
-      # runs (see the workspace-level rule and the merge_group/no-base full-run
-      # branches below).
+      # runs (see the workspace-level rule and the no-base full-run branch
+      # below).
       docs_only: ${{ steps.check.outputs.docs_only }}
       server_or_operator: ${{ steps.check.outputs.server_or_operator }}
       sql_area: ${{ steps.check.outputs.sql_area }}
@@ -113,19 +113,14 @@ jobs:
               echo "mcp_area=${10}"
             } >> "$GITHUB_OUTPUT"
           }
-          # merge_group events (the GitHub merge queue, ADR-0053 D1) carry no
-          # base SHA to diff against: the payload has merge_group.base_sha but
-          # no github.event.before, and the queued tree must exercise every
-          # lane the way main will. Force the full run (docs_only false, every
-          # area true) rather than fall through to the empty-base heuristic
-          # below, so a queued merge can never silently skip compiling lanes as
-          # if it were docs-only or a narrow single-area change.
+          # A merge_group run (the GitHub merge queue, ADR-0053 D1) narrows
+          # like a pull request, against merge_group.base_sha (ADR-0053 queue
+          # narrowing amendment). The queued head carries every entry ahead of
+          # it in the group, so the diff is the union of their changes. A
+          # missing or unknown base still falls to the full run below.
           if [ "${{ github.event_name }}" = "merge_group" ]; then
-            echo "::notice::merge_group event, running full CI"
-            emit false true true true true true true true true true
-            exit 0
-          fi
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.merge_group.base_sha }}"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
             base="${{ github.event.pull_request.base.sha }}"
           else
             base="${{ github.event.before }}"
