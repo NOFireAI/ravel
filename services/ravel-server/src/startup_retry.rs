@@ -265,13 +265,6 @@ pub fn chain_is_transient(err: &(dyn StdError + 'static)) -> bool {
     false
 }
 
-/// [`chain_is_transient`] over an `anyhow` chain, contexts included.
-pub fn anyhow_is_transient(err: &anyhow::Error) -> bool {
-    err.chain()
-        .find_map(|e| e.downcast_ref::<StoreError>())
-        .is_some_and(store_error_is_transient)
-}
-
 /// `TenantKmsError` holds its `KeyEpochError` in a field that is not a
 /// source, so the chain walk starts there.
 fn tenant_kms_is_transient(err: &TenantKmsError) -> bool {
@@ -572,17 +565,41 @@ mod tests {
     }
 
     #[test]
-    fn classification_is_by_type_through_contexts_and_sources() {
-        let transient = anyhow::Error::new(StoreError::Transient("x".into())).context("outer");
-        assert!(anyhow_is_transient(&transient));
-        let throttled = anyhow::Error::new(StoreError::Throttled { retry_after_ms: 1 });
-        assert!(!anyhow_is_transient(&throttled));
-        // The text names the variant; only the type counts.
-        let text = anyhow::anyhow!("transient error: x");
-        assert!(!anyhow_is_transient(&text));
+    fn the_deadline_flag_defaults_to_15s_and_accepts_zero() {
+        use crate::config::Cli;
+        let cli = Cli::parse_validated_from(["ravel-server"]).expect("default config validates");
+        assert_eq!(
+            cli.startup_checks.startup_store_deadline,
+            DEFAULT_STARTUP_STORE_DEADLINE
+        );
+        assert_eq!(DEFAULT_STARTUP_STORE_DEADLINE, Duration::from_secs(15));
+        let cli = Cli::parse_validated_from(["ravel-server", "--startup-store-deadline", "0s"])
+            .expect("zero turns retry off");
+        assert_eq!(cli.startup_checks.startup_store_deadline, Duration::ZERO);
+        let err = Cli::parse_validated_from(["ravel-server", "--startup-store-deadline", "soon"])
+            .expect_err("an unparseable duration is rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn classification_is_by_type_through_sources() {
         let tenancy = TenancyError::Store(StoreError::Transient("x".into()));
         assert!(chain_is_transient(&tenancy));
         assert!(!chain_is_transient(&TenancyError::CorruptMarker));
+        let throttled = TenancyError::Store(StoreError::Throttled { retry_after_ms: 1 });
+        assert!(!chain_is_transient(&throttled));
+        // The text names the variant; only the type counts.
+        let text = std::io::Error::other("transient error: x");
+        assert!(!chain_is_transient(&text));
+        let kms = TenantKmsError::ReadEpochs {
+            tenant: "acme".into(),
+            error: ravel_catalog::KeyEpochError::Store {
+                key: "t/x/enc".into(),
+                source: StoreError::Transient("x".into()),
+            },
+        };
+        assert!(tenant_kms_is_transient(&kms));
+        assert!(!tenant_kms_is_transient(&TenantKmsError::EmptyTenantId));
     }
 
     // --- qualification ---
