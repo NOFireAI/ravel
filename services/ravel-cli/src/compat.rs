@@ -1222,29 +1222,35 @@ mod tests {
         assert_eq!(out.json()["outcome"], "certified");
         assert_eq!(out.json()["version"], 8);
 
-        // verify runs the late-write pass and reports the certificate.
-        let out = verify(
-            store.clone(),
-            Some(keys()),
-            now_certify,
-            Some(FAMILY_RSEG.to_string()),
-            60 * 1_000_000_000,
-        )
-        .await
-        .expect("verify runs");
-        assert_eq!(out.exit_code, EXIT_OK, "json: {}", out.json());
-        let rseg = out.json()["families"]
-            .as_array()
-            .expect("families")
-            .iter()
-            .find(|f| f["family"] == FAMILY_RSEG)
-            .expect("rseg")
-            .clone();
-        assert_eq!(rseg["certificate"]["version"], 8);
-        assert_eq!(rseg["contradicted"], false);
-        // The pass advanced the watermark to its start, clearing the pending
-        // finalization the bare certificate CAS leaves.
-        assert_eq!(rseg["finalization_pending"], false, "rseg: {rseg}");
+        // verify runs the late-write pass and reports the certificate. A pass
+        // that starts at the certificate's own instant leaves the watermark
+        // equal to `certified_unix_ns`, which the retired-reader gate does not
+        // accept, so finalization is still pending; one that starts later
+        // advances the watermark past it and clears it.
+        for (now_verify, pending) in [(now_certify, true), (now_certify + 1, false)] {
+            let out = verify(
+                store.clone(),
+                Some(keys()),
+                now_verify,
+                Some(FAMILY_RSEG.to_string()),
+                60 * 1_000_000_000,
+            )
+            .await
+            .expect("verify runs");
+            assert_eq!(out.exit_code, EXIT_OK, "json: {}", out.json());
+            let rseg = out.json()["families"]
+                .as_array()
+                .expect("families")
+                .iter()
+                .find(|f| f["family"] == FAMILY_RSEG)
+                .expect("rseg")
+                .clone();
+            assert_eq!(rseg["certificate"]["version"], 8);
+            assert_eq!(rseg["certificate"]["certified_unix_ns"], now_certify);
+            assert_eq!(rseg["watermark_unix_ns"], now_verify);
+            assert_eq!(rseg["contradicted"], false);
+            assert_eq!(rseg["finalization_pending"], pending, "rseg: {rseg}");
+        }
     }
 
     // ---- verify / status ----
