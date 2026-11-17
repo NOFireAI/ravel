@@ -1154,6 +1154,17 @@ pub struct Cli {
     #[arg(long, default_value_t = 3)]
     pub maintain_stalled_after_intervals: u32,
 
+    /// Run the background `migrate` unit in `--mode maintain` (ADR-4233
+    /// decision 6): every compat maintenance tick, walk each owned tenant's
+    /// metrics, logs and spans buckets toward the family's active write
+    /// version under a fixed record budget, and raise the format floor when
+    /// none is left below it. The walk also runs, despite a raised floor,
+    /// while `sys/compat` marks the family's certificate contradicted.
+    /// Requires `--tenant-hash-key-file`, the deployment key `sys/compat` is
+    /// authenticated with.
+    #[arg(long, default_value_t = false)]
+    pub background_migrate: bool,
+
     #[command(flatten)]
     pub maintenance: MaintenanceArgs,
 
@@ -10023,6 +10034,21 @@ impl Cli {
                  admits a sibling into its live set only when the sibling's registry record is \
                  signed under a maintain key. Provide the key file every maintain process in \
                  the cluster shares."
+            );
+        }
+        if self.background_migrate && !matches!(self.mode, Mode::Maintain) {
+            anyhow::bail!(
+                "--background-migrate was set with --mode {:?}: only --mode maintain runs \
+                 maintenance units, so the flag would be inert. Drop --background-migrate, or \
+                 run --mode maintain.",
+                self.mode
+            );
+        }
+        if self.background_migrate && self.tenant_hash.tenant_hash_key_file.is_none() {
+            anyhow::bail!(
+                "--background-migrate requires --tenant-hash-key-file (ADR-4233): the unit \
+                 walks toward the active write version recorded in sys/compat, which only a \
+                 process holding the deployment key can authenticate."
             );
         }
         if self.distrib.maintain_key_file.is_some() && !matches!(self.mode, Mode::Maintain) {
@@ -21490,6 +21516,44 @@ mod tests {
                 "{mode}: names the flag: {err}"
             );
         }
+    }
+
+    /// `--background-migrate` runs only in `--mode maintain` and only with the
+    /// deployment key that authenticates `sys/compat`.
+    #[test]
+    fn background_migrate_is_refused_outside_keyed_maintain() {
+        let key = fragment_key_tmp();
+        let key_path = key.path().to_str().expect("utf8");
+
+        let err = cli(&[
+            "--mode",
+            "maintain",
+            "--maintain-key-file",
+            key_path,
+            "--background-migrate",
+        ])
+        .validate()
+        .expect_err("--background-migrate without a deployment key must refuse startup");
+        assert!(
+            err.to_string()
+                .starts_with("--background-migrate requires --tenant-hash-key-file"),
+            "names the missing flag: {err}"
+        );
+
+        for mode in ["all", "query", "gateway"] {
+            let err = cli(&["--mode", mode, "--background-migrate"])
+                .validate()
+                .expect_err("--background-migrate outside --mode maintain must refuse startup");
+            assert!(
+                err.to_string()
+                    .starts_with("--background-migrate was set with --mode"),
+                "{mode}: names the flag: {err}"
+            );
+        }
+        assert!(
+            !cli(&["--mode", "maintain"]).background_migrate,
+            "the unit is off by default"
+        );
     }
 
     /// The maintain key file is read with the fragment key file's parser, in
