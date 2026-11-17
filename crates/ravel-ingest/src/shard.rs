@@ -925,7 +925,7 @@ impl FlushCtx {
         let mut kept = Vec::with_capacity(pending.len());
         for abandoned in pending {
             ravel_invariant::inv_always_or_unreachable!(
-                !matches!(self.store.head(&abandoned.commit_key).await, Ok(_)),
+                self.store.head(&abandoned.commit_key).await.is_err(),
                 "commit: no commit record is published after its flush was abandoned",
                 std::collections::BTreeMap::from([
                     ("tenant", abandoned.tenant_hash.to_hex()),
