@@ -1,0 +1,139 @@
+name: brig-image
+
+# Builds the guest image of the Brigfile's targets (.brig/Dockerfile), checks
+# it with .brig/check-image.sh, and on main publishes it as
+# ghcr.io/nofireai/ravel-dev. It holds the toolchain rust-toolchain.toml
+# names and a registry filled for Cargo.lock, so it is rebuilt when either
+# changes. Each platform builds on its native runner, so no step runs under
+# emulation. A pull request builds and checks both and pushes nothing.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .brig/Dockerfile
+      - .brig/check-image.sh
+      - .dockerignore
+      - Cargo.lock
+      - rust-toolchain.toml
+      - sdk/typescript/.node-version
+      - sdk/typescript/package-lock.json
+      - .github/workflows/brig-image.yml
+  pull_request:
+    paths:
+      - .brig/Dockerfile
+      - .brig/check-image.sh
+      - .dockerignore
+      - Cargo.lock
+      - rust-toolchain.toml
+      - sdk/typescript/.node-version
+      - sdk/typescript/package-lock.json
+      - .github/workflows/brig-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/nofireai/ravel-dev
+
+jobs:
+  # A pull request runs the PR's Dockerfile, so this job gets no token that
+  # can write packages.
+  check:
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Build
+        run: docker build -f .brig/Dockerfile -t ravel-dev:check .
+
+      - name: Check
+        run: .brig/check-image.sh ravel-dev:check
+
+  # Builds, checks and pushes one image per platform under a sha tag. The
+  # manifest job joins them.
+  publish:
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Build
+        run: docker build -f .brig/Dockerfile -t ravel-dev:check .
+
+      - name: Check
+        run: .brig/check-image.sh ravel-dev:check
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          tag="$IMAGE:sha-${GITHUB_SHA::7}-$ARCH"
+          docker tag ravel-dev:check "$tag"
+          docker push "$tag"
+
+  # :latest is what the Brig profile names, so only main moves it. A manual
+  # run on another branch publishes sha-<sha7> only, to try with
+  # make brig IMAGE=ghcr.io/nofireai/ravel-dev:sha-<sha7>.
+  manifest:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Join the platform images
+        run: |
+          set -euo pipefail
+          sha="sha-${GITHUB_SHA::7}"
+          tags=(-t "$IMAGE:$sha")
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
+            tags+=(-t "$IMAGE:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" \
+            "$IMAGE:$sha-amd64" "$IMAGE:$sha-arm64"
+          docker buildx imagetools inspect "$IMAGE:$sha"
