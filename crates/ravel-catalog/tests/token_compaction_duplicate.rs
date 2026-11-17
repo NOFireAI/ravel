@@ -6,9 +6,11 @@
 //! resolve with T finds that record present. Logs and spans have no
 //! query-time dedup, so a snapshot holding both P and L counts L's records
 //! twice. The step now LISTs the token's bucket when the snapshot already
-//! holds a level-1 part of it (or an erasure is pending) and skips L when a
-//! record naming L has an output part in the snapshot, or when a live rewrite
-//! names L.
+//! holds a level-1 part of it (or an erasure is pending) and leaves L out
+//! when the bucket is tombstoned, when a record naming L has an output part
+//! in the snapshot, or when a live rewrite names L, whose parts it adds
+//! instead. Tokens whose commit record is absent run first, so the answer
+//! does not depend on token order.
 //!
 //! Rows are counted as the sum of `sample_count` over the snapshot: a logs
 //! or spans compaction concatenates its inputs, so a part carries the sum of
@@ -21,16 +23,17 @@
 use std::sync::Arc;
 
 use ravel_catalog::{
-    Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
-    DEFAULT_MAX_FLUSH_LIFETIME_NS, Snapshot,
+    Catalog, CatalogConfig, CatalogError, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+    DEFAULT_FOLD_SAFETY_MARGIN_NS, DEFAULT_MAX_FLUSH_LIFETIME_NS, Snapshot,
 };
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_commit::{erasure, keys, signal};
+use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError};
 use ravel_proto::commit::v1::{
     CommitRecord, CompactionInputIdentity, CompactionPart, CompactionRecord,
-    ErasurePredicateMatcher, ErasureRequest, RewriteDrop, RewriteRecord,
+    ErasurePredicateMatcher, ErasureRequest, RetentionTombstone, RewriteDrop, RewriteRecord,
 };
 use ravel_segment::VERSION_V7;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
@@ -51,10 +54,14 @@ fn tenant() -> TenantHash {
 }
 
 fn catalog(store: &Arc<MemoryStore>) -> Catalog {
+    catalog_on(store.clone(), 1)
+}
+
+fn catalog_on(store: Arc<dyn ObjectStoreBackend>, shard_count: u32) -> Catalog {
     Catalog::new(
-        store.clone(),
+        store,
         CatalogConfig {
-            shard_count: 1,
+            shard_count,
             ..Default::default()
         },
     )
@@ -92,10 +99,21 @@ fn sealed_window() -> (TimeRange, i64) {
 
 /// An L0 commit record in `hour` whose events start at `event_start`.
 fn l0(signal: Signal, seq: u64, hour: u32, event_start: i64, rows: u64) -> CommitRecord {
+    l0_on(signal, 0, seq, hour, event_start, rows)
+}
+
+fn l0_on(
+    signal: Signal,
+    shard: u32,
+    seq: u64,
+    hour: u32,
+    event_start: i64,
+    rows: u64,
+) -> CommitRecord {
     record::build(NewCommitRecord {
         tenant_hash: tenant(),
         signal,
-        shard: 0,
+        shard,
         writer_id: Uuid::from_u128(0x4418_0000 + u128::from(seq)),
         writer_epoch: 1,
         writer_seq: seq,
@@ -323,8 +341,17 @@ async fn resolve_counted(
     window: (TimeRange, i64),
     tokens: &[CommitToken],
 ) -> (Snapshot, Reads) {
+    resolve_counted_on(&catalog(store), signal, window, tokens).await
+}
+
+async fn resolve_counted_on(
+    catalog: &Catalog,
+    signal: Signal,
+    window: (TimeRange, i64),
+    tokens: &[CommitToken],
+) -> (Snapshot, Reads) {
     let accounting = QueryAccounting::new();
-    let snapshot = catalog(store)
+    let snapshot = catalog
         .resolve_with_accounting(&tenant(), signal, window.0, tokens, window.1, &accounting)
         .await
         .expect("resolve");
@@ -573,18 +600,33 @@ async fn spans_token_after_rewrite_is_not_brought_back() {
     token_after_rewrite_is_not_brought_back(Signal::Spans).await;
 }
 
+/// A query range that starts after every event the helpers write by
+/// default, so `part()` and `l0(.., hour_start(HOUR), ..)` lie outside it.
+fn late_window() -> (TimeRange, i64) {
+    let start = hour_start(HOUR);
+    (
+        TimeRange {
+            start_ns: start + 1_000_000,
+            end_ns: start + NS_PER_HOUR,
+        },
+        live_window().1,
+    )
+}
+
 /// The rewrite's part lies outside the query range, so the snapshot holds no
 /// level-1 part of the bucket; the pending `.dreq` alone sends the step to
-/// the bucket, and the live rewrite keeps L out.
+/// the bucket. The live rewrite keeps L out and its part is added in L's
+/// place, the same answer the token gets once the sweep has deleted L's
+/// commit record.
 #[tokio::test]
-async fn token_after_rewrite_out_of_range_is_not_brought_back() {
+async fn token_after_rewrite_out_of_range_is_served_by_the_rewrite() {
     let store = Arc::new(MemoryStore::new());
     let start = hour_start(HOUR);
     let l = l0(Signal::Logs, 1, HOUR, start, L_ROWS);
     put_l0(store.as_ref(), &l).await;
     let request_id = Uuid::from_u128(0xd4418);
     put_dreq(store.as_ref(), Signal::Logs, request_id).await;
-    put_rewrite(
+    let rw = put_rewrite(
         store.as_ref(),
         Signal::Logs,
         &[&l],
@@ -593,25 +635,43 @@ async fn token_after_rewrite_out_of_range_is_not_brought_back() {
         L_ROWS - 1,
     )
     .await;
-    let (_, now) = live_window();
-    let range = TimeRange {
-        start_ns: start + 1_000_000,
-        end_ns: start + NS_PER_HOUR,
-    };
 
-    let (plain, plain_reads) = resolve_counted(&store, Signal::Logs, (range, now), &[]).await;
+    let (plain, plain_reads) = resolve_counted(&store, Signal::Logs, late_window(), &[]).await;
     assert!(plain.segments.is_empty());
-    let (snapshot, reads) = resolve_counted(&store, Signal::Logs, (range, now), &[token(&l)]).await;
-    assert!(
-        snapshot.segments.is_empty(),
-        "a live rewrite's input is never added back"
+    let (snapshot, reads) =
+        resolve_counted(&store, Signal::Logs, late_window(), &[token(&l)]).await;
+    assert_eq!(
+        sorted_keys(&snapshot),
+        vec![rewrite_part_key(&rw)],
+        "a live rewrite's input is never added back; its part serves the token"
     );
+    assert_eq!(rows(&snapshot), L_ROWS - 1);
+    // One LIST and one GET of the rewrite, which no cache holds.
     assert_eq!(
         reads,
         Reads {
             lists: plain_reads.lists + 1,
             gets: plain_reads.gets + 1,
             total: plain_reads.total + 2,
+        }
+    );
+
+    store
+        .delete(&keys::commit_key_for_record(&l).expect("commit key"))
+        .await
+        .expect("sweep L's commit record");
+    let (_, swept_plain_reads) = resolve_counted(&store, Signal::Logs, late_window(), &[]).await;
+    let (swept, swept_reads) =
+        resolve_counted(&store, Signal::Logs, late_window(), &[token(&l)]).await;
+    assert_eq!(sorted_keys(&swept), sorted_keys(&snapshot));
+    // Two NotFound probes of L's commit record, then the fallback's LIST and
+    // rewrite GET.
+    assert_eq!(
+        swept_reads,
+        Reads {
+            lists: swept_plain_reads.lists + 1,
+            gets: swept_plain_reads.gets + 3,
+            total: swept_plain_reads.total + 4,
         }
     );
 }
@@ -669,4 +729,410 @@ async fn superseded_compaction_part_in_a_stale_head_keeps_the_input_out() {
     let (snapshot, _) = resolve_counted(&store, Signal::Logs, sealed_window(), &[token(&l)]).await;
     assert_eq!(sorted_keys(&snapshot), vec![part_key(&c1)]);
     assert_eq!(rows(&snapshot), L_ROWS + M_ROWS, "each record counted once");
+}
+
+async fn fold_hour(store: &Arc<MemoryStore>, signal: Signal) {
+    let report = catalog(store)
+        .fold(
+            &tenant(),
+            signal,
+            Uuid::new_v4(),
+            sealed_window().1,
+            &[],
+            None,
+        )
+        .await
+        .expect("fold");
+    assert_eq!(report.watermark_hour, Some(HOUR));
+}
+
+async fn put_tombstone(store: &dyn ObjectStoreBackend, signal: Signal, shard: u32, hour: u32) {
+    let tombstone = RetentionTombstone {
+        format_version: 1,
+        tenant_hash: tenant().0.to_vec(),
+        signal: signal::to_proto(signal) as i32,
+        shard,
+        ingest_hour_bucket: hour,
+        retired_at_ns: 0,
+        retention_window_ns: 0,
+        record_count_observed: 0,
+    };
+    let key = keys::retention_tombstone_key_for(&tombstone).expect("tombstone key");
+    store
+        .put(
+            &key,
+            record::encode_tombstone(&tombstone),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("put tombstone");
+}
+
+/// A live rewrite that supersedes the record at `predecessor_key` as a
+/// whole, applying `request_id`, with one part of `rows` rows.
+async fn put_superseding_rewrite(
+    store: &dyn ObjectStoreBackend,
+    signal: Signal,
+    predecessor_key: &str,
+    request_id: Uuid,
+    rows: u64,
+) -> RewriteRecord {
+    let request_id = request_id.to_string();
+    let record = RewriteRecord {
+        format_version: 1,
+        tenant_hash: tenant().0.to_vec(),
+        signal: signal::to_proto(signal) as i32,
+        shard: 0,
+        ingest_hour_bucket: HOUR,
+        input_set_hash: erasure::compute_rewrite_input_set_hash(
+            &[],
+            Some(predecessor_key),
+            std::slice::from_ref(&request_id),
+        )
+        .to_vec(),
+        inputs: Vec::new(),
+        parts: vec![part(0xe1, rows)],
+        drops: vec![RewriteDrop {
+            request_id,
+            dropped_count: 1,
+        }],
+        created_unix_ns: hour_start(HOUR) + 9_000,
+        superseded_record_key: predecessor_key.to_string(),
+    };
+    let key = keys::rewrite_record_key_for(&record).expect("rewrite key");
+    store
+        .put(
+            &key,
+            erasure::encode_rewrite(&record),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("put rewrite record");
+    record
+}
+
+/// HEAD still names a bucket retention has tombstoned, and L's commit record
+/// survives until the sweep deletes the bucket. A token whose bucket is
+/// tombstoned is satisfied with zero segments (docs/deletion-and-gc.md), so
+/// it adds nothing beside the part HEAD serves.
+#[tokio::test]
+async fn token_in_a_tombstoned_bucket_head_still_names_adds_nothing() {
+    let store = Arc::new(MemoryStore::new());
+    let (l, c) = compacted_bucket(store.as_ref(), Signal::Logs).await;
+    fold_hour(&store, Signal::Logs).await;
+    put_tombstone(store.as_ref(), Signal::Logs, 0, HOUR).await;
+
+    let (plain, _) = resolve_counted(&store, Signal::Logs, sealed_window(), &[]).await;
+    assert_eq!(
+        sorted_keys(&plain),
+        vec![part_key(&c)],
+        "HEAD still names the bucket"
+    );
+    let (snapshot, _) = resolve_counted(&store, Signal::Logs, sealed_window(), &[token(&l)]).await;
+    assert_eq!(
+        sorted_keys(&snapshot),
+        vec![part_key(&c)],
+        "L is not added beside P"
+    );
+    assert_eq!(rows(&snapshot), L_ROWS + M_ROWS, "each record counted once");
+}
+
+/// Two tokens of one bucket: T1's commit record is swept, T2's is not. C
+/// names both inputs and its part lies outside the query range, so only
+/// T1's fallback adds it. In either token order the set holds C's part
+/// once and never T2's input beside it.
+#[tokio::test]
+async fn swept_and_present_tokens_of_one_bucket_answer_alike_in_either_order() {
+    let store = Arc::new(MemoryStore::new());
+    let start = hour_start(HOUR);
+    let l1 = l0(Signal::Logs, 1, HOUR, start, L_ROWS);
+    let l2 = l0(Signal::Logs, 2, HOUR, start, M_ROWS);
+    put_l0(store.as_ref(), &l1).await;
+    put_l0(store.as_ref(), &l2).await;
+    let c = compaction(Signal::Logs, &[&l1, &l2], 0x11, 0xc1, L_ROWS + M_ROWS);
+    put_compaction(store.as_ref(), &c).await;
+    store
+        .delete(&keys::commit_key_for_record(&l1).expect("commit key"))
+        .await
+        .expect("sweep L1's commit record");
+
+    let (plain, _) = resolve_counted(&store, Signal::Logs, late_window(), &[]).await;
+    assert!(plain.segments.is_empty());
+    for (order, tokens) in [
+        ("present first", [token(&l2), token(&l1)]),
+        ("swept first", [token(&l1), token(&l2)]),
+    ] {
+        let (snapshot, _) = resolve_counted(&store, Signal::Logs, late_window(), &tokens).await;
+        assert_eq!(sorted_keys(&snapshot), vec![part_key(&c)], "{order}");
+        assert_eq!(rows(&snapshot), L_ROWS + M_ROWS, "{order}: L2 counted once");
+    }
+}
+
+/// C names L, but C's part lies outside the query range; a sibling record
+/// over M has its part in range, so the step lists the bucket. A record
+/// naming L keeps L out only when one of that record's own parts is in the
+/// set, so L is added and read-your-write holds.
+#[tokio::test]
+async fn token_named_by_a_record_whose_part_is_not_in_the_set_is_added() {
+    let store = Arc::new(MemoryStore::new());
+    let start = hour_start(HOUR);
+    let l = l0(Signal::Logs, 1, HOUR, start, L_ROWS);
+    let m = l0(Signal::Logs, 2, HOUR, start, M_ROWS);
+    put_l0(store.as_ref(), &l).await;
+    put_l0(store.as_ref(), &m).await;
+    let c = compaction(Signal::Logs, &[&l], 0x11, 0xc1, L_ROWS);
+    put_compaction(store.as_ref(), &c).await;
+    let mut sibling = compaction(Signal::Logs, &[&m], 0x22, 0xc2, M_ROWS);
+    sibling.parts[0].min_event_ts_ns = start + 2_000_000;
+    sibling.parts[0].max_event_ts_ns = start + 2_000_100;
+    put_compaction(store.as_ref(), &sibling).await;
+
+    let (plain, plain_reads) = resolve_counted(&store, Signal::Logs, late_window(), &[]).await;
+    assert_eq!(sorted_keys(&plain), vec![part_key(&sibling)]);
+    let (snapshot, reads) =
+        resolve_counted(&store, Signal::Logs, late_window(), &[token(&l)]).await;
+    let mut expected = vec![part_key(&sibling), l0_key(&l)];
+    expected.sort();
+    assert_eq!(sorted_keys(&snapshot), expected, "read-your-write holds");
+    assert_eq!(rows(&snapshot), L_ROWS + M_ROWS);
+    assert_eq!(
+        reads,
+        Reads {
+            lists: plain_reads.lists + 1,
+            gets: plain_reads.gets,
+            total: plain_reads.total + 1,
+        }
+    );
+}
+
+/// HEAD folded W1's part; a later rewrite W2 superseded W1 for a second
+/// erasure request. W1's part already serves L's rows, so the token adds
+/// neither L nor W2's part beside it.
+#[tokio::test]
+async fn superseded_rewrite_part_in_a_stale_head_keeps_the_input_out() {
+    let store = Arc::new(MemoryStore::new());
+    let start = hour_start(HOUR);
+    let l = l0(Signal::Logs, 1, HOUR, start, L_ROWS);
+    put_l0(store.as_ref(), &l).await;
+    let first = Uuid::from_u128(0xd4418);
+    put_dreq(store.as_ref(), Signal::Logs, first).await;
+    let w1 = put_rewrite(store.as_ref(), Signal::Logs, &[&l], first, start, L_ROWS - 1).await;
+    fold_hour(&store, Signal::Logs).await;
+    let second = Uuid::from_u128(0xd4419);
+    put_dreq(store.as_ref(), Signal::Logs, second).await;
+    let w1_key = keys::rewrite_record_key_for(&w1).expect("rewrite key");
+    put_superseding_rewrite(store.as_ref(), Signal::Logs, &w1_key, second, L_ROWS - 2).await;
+
+    let (plain, _) = resolve_counted(&store, Signal::Logs, sealed_window(), &[]).await;
+    assert_eq!(
+        sorted_keys(&plain),
+        vec![rewrite_part_key(&w1)],
+        "HEAD is stale"
+    );
+    let (snapshot, _) = resolve_counted(&store, Signal::Logs, sealed_window(), &[token(&l)]).await;
+    assert_eq!(sorted_keys(&snapshot), vec![rewrite_part_key(&w1)]);
+    assert_eq!(rows(&snapshot), L_ROWS - 1);
+}
+
+/// The issue's write 9: one compacted token on each of two shards. Each
+/// token lists its own bucket once and adds nothing beside the parts.
+#[tokio::test]
+async fn tokens_on_two_shards_each_serve_their_part_once() {
+    let store = Arc::new(MemoryStore::new());
+    let start = hour_start(HOUR);
+    let mut parts = Vec::new();
+    let mut tokens = Vec::new();
+    for shard in 0..2u32 {
+        let seq = 10 * u64::from(shard);
+        let l = l0_on(Signal::Logs, shard, seq + 1, HOUR, start, L_ROWS);
+        let m = l0_on(Signal::Logs, shard, seq + 2, HOUR, start, M_ROWS);
+        put_l0(store.as_ref(), &l).await;
+        put_l0(store.as_ref(), &m).await;
+        let c = CompactionRecord {
+            shard,
+            ..compaction(
+                Signal::Logs,
+                &[&l, &m],
+                0x11,
+                0xc1 + shard as u8,
+                L_ROWS + M_ROWS,
+            )
+        };
+        put_compaction(store.as_ref(), &c).await;
+        parts.push(part_key(&c));
+        tokens.push(token(&l));
+    }
+    parts.sort();
+
+    let (plain, plain_reads) = resolve_counted_on(
+        &catalog_on(store.clone(), 2),
+        Signal::Logs,
+        live_window(),
+        &[],
+    )
+    .await;
+    assert_eq!(sorted_keys(&plain), parts);
+    let (snapshot, reads) = resolve_counted_on(
+        &catalog_on(store.clone(), 2),
+        Signal::Logs,
+        live_window(),
+        &tokens,
+    )
+    .await;
+    assert_eq!(sorted_keys(&snapshot), parts);
+    assert_eq!(rows(&snapshot), 2 * (L_ROWS + M_ROWS));
+    assert_eq!(
+        reads,
+        Reads {
+            lists: plain_reads.lists + 2,
+            gets: plain_reads.gets,
+            total: plain_reads.total + 2,
+        }
+    );
+}
+
+/// Both of C's inputs carry a token. The check runs per token, so the
+/// bucket is listed once for each.
+#[tokio::test]
+async fn two_tokens_of_one_bucket_list_it_once_each() {
+    let store = Arc::new(MemoryStore::new());
+    let start = hour_start(HOUR);
+    let l = l0(Signal::Logs, 1, HOUR, start, L_ROWS);
+    let m = l0(Signal::Logs, 2, HOUR, start, M_ROWS);
+    put_l0(store.as_ref(), &l).await;
+    put_l0(store.as_ref(), &m).await;
+    let c = compaction(Signal::Logs, &[&l, &m], 0x11, 0xc1, L_ROWS + M_ROWS);
+    put_compaction(store.as_ref(), &c).await;
+
+    let (_, plain_reads) = resolve_counted(&store, Signal::Logs, live_window(), &[]).await;
+    let (snapshot, reads) =
+        resolve_counted(&store, Signal::Logs, live_window(), &[token(&l), token(&m)]).await;
+    assert_eq!(sorted_keys(&snapshot), vec![part_key(&c)]);
+    assert_eq!(
+        reads,
+        Reads {
+            lists: plain_reads.lists + 2,
+            gets: plain_reads.gets,
+            total: plain_reads.total + 2,
+        }
+    );
+}
+
+/// The issue's bucket folded into HEAD, read through a FaultStore whose rule
+/// (built from the bucket prefix and C's key) matches only a read of the
+/// token step: the resolve without the token passes and fires nothing, the
+/// resolve with it fails with the returned error, never by leaving L out or
+/// adding it.
+async fn token_step_error(
+    rule: impl FnOnce(&str, &str) -> Rule,
+    op: Op,
+    kind: FaultKind,
+) -> CatalogError {
+    let inner = Arc::new(MemoryStore::new());
+    let (l, c) = compacted_bucket(inner.as_ref(), Signal::Logs).await;
+    fold_hour(&inner, Signal::Logs).await;
+    let prefix = keys::commit_shard_hour_prefix(&tenant(), Signal::Logs, 0, HOUR).expect("prefix");
+    let ckey = keys::compaction_record_key_for(&c).expect("record key");
+    let store = Arc::new(FaultStore::new(
+        inner,
+        FaultPlan::empty().with_rule(rule(&prefix, &ckey)),
+    ));
+    let catalog = catalog_on(store.clone(), 1);
+    let (range, now) = sealed_window();
+
+    let plain = catalog
+        .resolve(&tenant(), Signal::Logs, range, &[], now)
+        .await
+        .expect("resolve without the token");
+    assert_eq!(sorted_keys(&plain), vec![part_key(&c)]);
+    assert_eq!(store.fault_count(op, kind), 0, "only the token step reads it");
+    let err = catalog
+        .resolve(&tenant(), Signal::Logs, range, &[token(&l)], now)
+        .await
+        .expect_err("the token step's failed read fails the resolve");
+    assert_eq!(store.fault_count(op, kind), 1);
+    err
+}
+
+#[tokio::test]
+async fn token_step_bucket_list_error_fails_the_resolve() {
+    let err = token_step_error(
+        |prefix, _| {
+            Rule::new(Op::List, ScriptedFault::Permanent("list".into())).with_key_contains(prefix)
+        },
+        Op::List,
+        FaultKind::Permanent,
+    )
+    .await;
+    assert!(
+        matches!(err, CatalogError::Store(StoreError::Permanent(_))),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn token_step_compaction_get_error_fails_the_resolve() {
+    let err = token_step_error(
+        |_, ckey| Rule::new(Op::Get, ScriptedFault::Permanent("get".into())).with_key_contains(ckey),
+        Op::Get,
+        FaultKind::Permanent,
+    )
+    .await;
+    assert!(
+        matches!(err, CatalogError::Store(StoreError::Permanent(_))),
+        "{err:?}"
+    );
+}
+
+/// C is gone between the bucket LIST and its GET.
+#[tokio::test]
+async fn token_step_compaction_record_gone_after_list_fails_the_resolve() {
+    let err = token_step_error(
+        |_, ckey| Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(ckey),
+        Op::Get,
+        FaultKind::NotFoundBlip,
+    )
+    .await;
+    assert!(
+        matches!(err, CatalogError::Store(StoreError::NotFound)),
+        "{err:?}"
+    );
+}
+
+/// A live rewrite's GET fails on the token step: the resolve fails rather
+/// than adding L or leaving it out.
+#[tokio::test]
+async fn token_step_rewrite_get_error_fails_the_resolve() {
+    let inner = Arc::new(MemoryStore::new());
+    let start = hour_start(HOUR);
+    let l = l0(Signal::Logs, 1, HOUR, start, L_ROWS);
+    put_l0(inner.as_ref(), &l).await;
+    let request_id = Uuid::from_u128(0xd4418);
+    put_dreq(inner.as_ref(), Signal::Logs, request_id).await;
+    let rw = put_rewrite(inner.as_ref(), Signal::Logs, &[&l], request_id, start, L_ROWS - 1).await;
+    fold_hour(&inner, Signal::Logs).await;
+    let rkey = keys::rewrite_record_key_for(&rw).expect("rewrite key");
+    let store = Arc::new(FaultStore::new(
+        inner,
+        FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::Permanent("get".into())).with_key_contains(rkey)),
+    ));
+    let catalog = catalog_on(store.clone(), 1);
+    let (range, now) = sealed_window();
+
+    let plain = catalog
+        .resolve(&tenant(), Signal::Logs, range, &[], now)
+        .await
+        .expect("resolve without the token");
+    assert_eq!(sorted_keys(&plain), vec![rewrite_part_key(&rw)]);
+    assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 0);
+    let err = catalog
+        .resolve(&tenant(), Signal::Logs, range, &[token(&l)], now)
+        .await
+        .expect_err("the token step's failed read fails the resolve");
+    assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
+    assert!(
+        matches!(err, CatalogError::Store(StoreError::Permanent(_))),
+        "{err:?}"
+    );
 }
