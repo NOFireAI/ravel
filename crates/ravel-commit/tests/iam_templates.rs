@@ -2673,6 +2673,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/maint/*",
             "t/*/*/del/*.done",
             "sys/gc",
+            "sys/compat",
             "sys/tenancy",
             "sys/maintain/*",
             "quarantine/t/*/*/l0/*",
@@ -2746,6 +2747,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/qualification",
             "sys/qualify/*",
             "sys/gc",
+            "sys/compat",
             "sys/auth",
             IPCRYPT_MARKER_KEY,
             "t/*/*/c/*",
@@ -4824,6 +4826,33 @@ fn every_server_role_reads_the_compat_record() {
             lists.iter().any(|p| glob_matches(p, COMPAT_KEY)),
             "{role}: no ListBucket s3:prefix admits {COMPAT_KEY:?}, so an absent \
              record reads as AccessDenied. s3:prefix values: {lists:?}"
+        );
+    }
+}
+
+/// Two shipped paths write `sys/compat`: the maintain late-write pass
+/// (`update_compat` in `crates/ravel-maintain/src/late_writes.rs`, run by
+/// `ravel-server --mode maintain`) and the `ravel-cli compat init`, `activate`
+/// and `certify` commands (`create_compat`, `activate_family`, `update_compat`
+/// in `crates/ravel-catalog/src/compat.rs`) under the admin role. Ingest
+/// (gateway) and query processes only read the record.
+#[test]
+fn only_admin_and_maintain_write_the_compat_record() {
+    for role in ["admin", "maintain"] {
+        let puts = key_patterns_for(&load_policy(role), &["s3:PutObject"], Some("Allow"));
+        assert!(
+            puts.iter().any(|p| glob_matches(p, COMPAT_KEY)),
+            "{role}: no PutObject Allow reaches {COMPAT_KEY:?}, which this role's \
+             compat writes PUT. Grants: {puts:?}"
+        );
+        assert_reaches_nothing_outside(role, "s3:PutObject Allow", &puts, COMPAT_KEY, COMPAT_KEY);
+    }
+    for role in ["gateway", "query"] {
+        let puts = key_patterns_for(&load_policy(role), &["s3:PutObject"], Some("Allow"));
+        assert!(
+            !puts.iter().any(|p| glob_matches(p, COMPAT_KEY)),
+            "{role}: a PutObject Allow reaches {COMPAT_KEY:?}; this role only reads \
+             the record. Grants: {puts:?}"
         );
     }
 }
