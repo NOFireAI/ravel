@@ -5588,6 +5588,16 @@ pub struct CompatSnapshot {
         u64,
     )>,
     pub refresh_failures: u64,
+    /// Each class-A family whose `sys/compat` entry carries a certificate, in
+    /// record order, as the view last read it (ADR-4233 decision 7).
+    pub certificates: Vec<CompatCertificateGauges>,
+}
+
+/// One certified family's late-write and finalization state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompatCertificateGauges {
+    pub family: crate::compat::CompatFamilyLabel,
+    pub state: crate::compat_maintain::CertificateState,
 }
 
 impl CompatSnapshot {
@@ -5601,7 +5611,21 @@ impl CompatSnapshot {
             .iter()
             .map(|f| (*f).to_string())
             .collect();
+        let mut certificates = Vec::new();
         if let Some(record) = view.last_record() {
+            certificates = record
+                .families
+                .iter()
+                .filter(|f| crate::compat_maintain::CERTIFIED_FAMILIES.contains(&f.family.as_str()))
+                .filter_map(|f| {
+                    crate::compat_maintain::CertificateState::of(f).map(|state| {
+                        CompatCertificateGauges {
+                            family: crate::compat::CompatFamilyLabel::of(&f.family),
+                            state,
+                        }
+                    })
+                })
+                .collect();
             seen_names.extend(record.families.into_iter().map(|f| f.family));
         }
         for name in seen_names {
@@ -5625,6 +5649,7 @@ impl CompatSnapshot {
             active_write_versions,
             refusals: crate::compat::publish_refusals_snapshot(),
             refresh_failures: crate::compat::refresh_failures_total(),
+            certificates,
         }
     }
 }
@@ -5709,6 +5734,53 @@ pub(crate) fn render_compat_family(out: &mut String, mode: Mode, snapshot: &Comp
             "ravel_compat_active_write_version",
             &[Label::Mode(mode), Label::CompatFamily(*family)],
             u64::from(*version),
+        );
+    }
+
+    // The late-write and finalization units run only in `--mode maintain`.
+    if mode != Mode::Maintain {
+        return;
+    }
+    write_header(
+        out,
+        "ravel_compat_late_write_watermark_seconds",
+        "Unix time in seconds through which the daily late-write pass has verified that no record below the certified version was written, per certified format family (ADR-4233 decision 7). More than a day behind the clock means the pass is not running; a value at or below the certificate's certified time means no pass has run since certify.",
+        "gauge",
+    );
+    for certificate in &snapshot.certificates {
+        write_sample_f64(
+            out,
+            "ravel_compat_late_write_watermark_seconds",
+            &[Label::Mode(mode), Label::CompatFamily(certificate.family)],
+            certificate.state.watermark_unix_ns as f64 / 1e9,
+        );
+    }
+    write_header(
+        out,
+        "ravel_compat_certificate_contradicted",
+        "1 when the late-write pass found a record below the certified version after certify, so the certificate no longer holds and a reader that drops the old version must not start; 0 otherwise, per certified format family (ADR-4233 decision 7).",
+        "gauge",
+    );
+    for certificate in &snapshot.certificates {
+        write_sample(
+            out,
+            "ravel_compat_certificate_contradicted",
+            &[Label::Mode(mode), Label::CompatFamily(certificate.family)],
+            u64::from(certificate.state.contradicted),
+        );
+    }
+    write_header(
+        out,
+        "ravel_compat_certify_finalization_pending",
+        "1 when an uncontradicted certificate's watermark is not yet past its certified time, so certify's floor raises wait on a late-write pass; 0 otherwise, per certified format family (ADR-4233 decision 7).",
+        "gauge",
+    );
+    for certificate in &snapshot.certificates {
+        write_sample(
+            out,
+            "ravel_compat_certify_finalization_pending",
+            &[Label::Mode(mode), Label::CompatFamily(certificate.family)],
+            u64::from(certificate.state.finalization_pending),
         );
     }
 }

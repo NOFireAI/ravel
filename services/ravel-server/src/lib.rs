@@ -39,6 +39,7 @@ pub mod cache_warm;
 pub mod cli_reference;
 pub mod compat;
 pub mod compat_gate;
+pub mod compat_maintain;
 pub mod config;
 pub mod cpu_gates;
 #[cfg(feature = "sql")]
@@ -3429,6 +3430,12 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             view,
             compat_clock.clone(),
         ));
+        // The late-write pass and certify finalization write sys/compat, so
+        // they take the same deployment key the view authenticates with.
+        if let Some(key) = config.deployment_key.as_deref() {
+            config.maintain.compat.keys =
+                Some(ravel_catalog::compat::CompatKeys::from_file_keys(&[*key])?);
+        }
     }
     // ADR-1702 task 10: compaction's decode and re-encode, and the snapshot
     // reachability reads of retention and the sweep, run on the read gate.

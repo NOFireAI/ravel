@@ -670,6 +670,12 @@ async fn main() -> anyhow::Result<()> {
             stalled_after_intervals: cli.maintain_stalled_after_intervals,
             heartbeat_interval: ravel_maintain::worker_set::DEFAULT_HEARTBEAT_INTERVAL,
             worker_record_keys: cli.parse_maintain_record_keys()?,
+            compat: ravel_server::compat_maintain::CompatMaintainConfig {
+                background_migrate: cli
+                    .background_migrate
+                    .then_some(ravel_server::compat_maintain::BACKGROUND_MIGRATE_BUDGET),
+                ..Default::default()
+            },
         },
         alerting: AlertEvalConfig {
             enabled: !alert_rules.is_empty(),
