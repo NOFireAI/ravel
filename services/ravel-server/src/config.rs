@@ -1452,6 +1452,39 @@ pub struct StartupCheckArgs {
         env = "RAVEL_FORMAT_WINDOW_CHECK_TIMEOUT"
     )]
     pub format_window_check_timeout: Duration,
+
+    /// How long, from process start, startup keeps retrying a store read that
+    /// fails with a transient store error (a store error of kind Transient,
+    /// Timeout or Throttled), as a humantime duration (issue #4325). Covers
+    /// sys/qualification, sys/tenancy, the --tenant-kms-config key-epoch
+    /// records, the shard_count provisioning records, sys/gc and the
+    /// sys/ipcrypt/policy marker. Not covered, and refusing on their first
+    /// error as before: the Azure store construction request, the
+    /// --require-bucket-protection read and the --format-window-check reads,
+    /// which have their own bounds. The wait between attempts doubles from
+    /// 100 ms to a 2 s cap and is jittered down to half of that, each retry
+    /// logs one warning naming the read, and /readyz is not ready while they
+    /// run. Each attempt is also bounded by the time left: one still running
+    /// at the deadline is cut off and refuses naming the read and the
+    /// deadline. No retry starts once its wait would reach the deadline; the
+    /// transient failure then refuses naming the read and the attempt count.
+    /// A read first reached after the deadline gets one unbounded attempt and
+    /// no retry. Any other error refuses at once, as before. The default 15s
+    /// ends every bounded attempt 10 s before the operator's liveness probe
+    /// (initial delay 5 s, period 10 s, failure threshold 3) can first
+    /// restart the pod at 25 s. `0s` turns retry and the attempt bound off.
+    #[arg(
+        long = "startup-store-deadline",
+        value_name = "DURATION",
+        default_value = "15s",
+        value_parser = parse_startup_store_deadline,
+        env = "RAVEL_STARTUP_STORE_DEADLINE"
+    )]
+    pub startup_store_deadline: Duration,
+}
+
+fn parse_startup_store_deadline(value: &str) -> Result<Duration, String> {
+    humantime::parse_duration(value).map_err(|err| err.to_string())
 }
 
 /// The query-audit pipeline (ADR-0062).
