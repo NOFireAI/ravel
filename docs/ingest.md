@@ -430,6 +430,18 @@ tenant's cached generation history. That view is trusted for `h` only before
   flight, for at most `max_flush_lifetime`, and then applies the check, so one
   drain flushes every buffer the re-read confirms. Only a re-read that fails
   keeps the buffer.
+  The hold is bounded (ADR-1642 stale-view hold amendment). The
+  buffer records the clock reading of the first enforced attempt that found
+  no trusted view, and a flush that opens on a trusted view clears it. Once
+  the buffer has been held for `max_flush_lifetime` from that reading, the
+  next flush attempt drops it unwritten instead of holding it again: strict
+  waiters are answered the retryable `Abandoned` (503), dropping the buffer
+  refunds its ADR-0069 byte charges, the drop is logged at ERROR, and
+  `ravel_ingest_abandoned_stale_provisioning_total` counts it once per
+  buffer. A teardown drain (shutdown, channel close) that still finds no
+  trusted view writes the buffer in place inside that bound, as the
+  first exception in docs/consistency-model.md's "Online resharding" states,
+  and drops and counts it past the bound.
 
 A late flush also never writes under an hour its routing generation does not
 own (ADR-1642 generation-mismatch amendment). Inside the scan set, the same check asks

@@ -80,8 +80,8 @@ use crate::format_floor::{
     BelowFormatFloor, FormatFamily, warn_flush_refused, warn_flush_written_below,
 };
 use crate::generation::{
-    FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, ScanCheck,
-    mismatch_retry_spent, reread_and_check, send_hand_back,
+    FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, STALE_VIEW_ABANDONED,
+    ScanCheck, mismatch_retry_spent, reread_and_check, send_hand_back, stale_view_hold_spent,
 };
 use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
 use crate::log_error::LogWriteError;
@@ -570,6 +570,8 @@ struct LogTenantBuf {
     deferred_since_ns: Option<i64>,
     /// See [`crate::shard`]'s `TenantBuf::stale_view_counted`.
     stale_view_counted: bool,
+    /// See [`crate::shard`]'s `TenantBuf::stale_view_since_ns`.
+    stale_view_since_ns: Option<i64>,
     /// See [`crate::shard`]'s `TenantBuf::hand_back_blocked`.
     hand_back_blocked: bool,
     /// See [`crate::shard`]'s `TenantBuf::mismatch_held_since_ns`.
@@ -2149,6 +2151,31 @@ impl LogShardActor {
         false
     }
 
+    /// Drops a buffer held closed on an untrusted generation view for
+    /// `max_flush_lifetime`; see `shard::ShardActor::drop_stale_view_flush`.
+    fn drop_stale_view_flush(
+        &self,
+        tenant_hash: TenantHash,
+        buf: LogTenantBuf,
+        lag_check: LagCheck,
+    ) {
+        self.metrics.record_abandoned_stale_provisioning();
+        tracing::error!(
+            signal = ?Signal::Logs,
+            shard = self.shard,
+            tenant_hash = %tenant_hash.to_hex(),
+            rows = buf.record_count(),
+            bytes = buf.est_bytes,
+            teardown = !matches!(lag_check, LagCheck::Enforced),
+            "ravel-ingest: dropping a flush held closed for max_flush_lifetime on a provisioning \
+             view this router cannot trust; its records are not written"
+        );
+        self.ctx.ack_waiters(
+            buf.waiters,
+            Err(LogWriteError::Abandoned(STALE_VIEW_ABANDONED.into())),
+        );
+    }
+
     /// The columnar counterpart of [`Self::handle_write`] (ADR-0109 decision 5):
     /// buffers one already-partitioned [`ColumnarLogBatch`] for `tenant`,
     /// refusing fail-loud if the buffer already holds row-major records. The
@@ -2840,6 +2867,7 @@ impl LogShardActor {
             ScanCheck::InScanSet => {
                 self.handing_back = false;
                 self.in_place_warnings.rearm(tenant_hash);
+                buf.stale_view_since_ns = None;
                 buf
             }
             ScanCheck::HandBack {
@@ -2855,6 +2883,7 @@ impl LogShardActor {
             {
                 // This flush opens at or past the cap, so, as on the deferral
                 // path, no strict waiter is acknowledged from it.
+                buf.stale_view_since_ns = None;
                 let waiters = buf.take_waiters();
                 self.ctx.ack_waiters(
                     waiters,
@@ -2910,6 +2939,7 @@ impl LogShardActor {
                     return;
                 };
                 buf.stale_view_counted = false;
+                buf.stale_view_since_ns = None;
                 let enforced = matches!(lag_check, LagCheck::Enforced);
                 // A target that is not live cannot take the records on a
                 // later flush, so only a full mailbox is retried.
@@ -2980,6 +3010,17 @@ impl LogShardActor {
                 let mut buf = buf;
                 if !std::mem::replace(&mut buf.stale_view_counted, true) {
                     self.metrics.record_stale_provisioning_flush();
+                }
+                if matches!(lag_check, LagCheck::Enforced) {
+                    buf.stale_view_since_ns.get_or_insert(raw_ns);
+                }
+                if stale_view_hold_spent(
+                    buf.stale_view_since_ns,
+                    raw_ns,
+                    self.config.max_flush_lifetime,
+                ) {
+                    self.drop_stale_view_flush(tenant_hash, buf, lag_check);
+                    return;
                 }
                 if self.keeps_unconfirmed_flush(lag_check, "no trusted generation view") {
                     self.tenants.insert(tenant, buf);
@@ -6076,6 +6117,42 @@ mod tests {
             yields_until(|| false).await;
         }
         rig.metrics.snapshot()
+    }
+
+    /// The log counterpart of `crate::shard`'s
+    /// `a_strict_waiter_on_a_spent_stale_view_hold_is_abandoned`.
+    #[tokio::test]
+    async fn a_strict_waiter_on_a_spent_stale_view_hold_is_abandoned() {
+        let config = IngestConfig {
+            shard_count: 4,
+            max_flush_lifetime: Duration::from_secs(60),
+            ..IngestConfig::default()
+        };
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, config);
+        let (charge, mut answer) = rig.write_strict(4_096).await;
+        drop(charge);
+        rig.flush_now().await;
+        rig.clock.advance_ns(60_000_000_000 - 1);
+        rig.flush_now().await;
+        assert!(
+            matches!(answer.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "held one nanosecond inside the bound"
+        );
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096);
+
+        rig.clock.advance_ns(1);
+        rig.flush_now().await;
+        match answer.try_recv() {
+            Ok(Err(LogWriteError::Abandoned(msg))) => assert_eq!(msg, STALE_VIEW_ABANDONED),
+            other => panic!("expected the stale-view Abandoned, got {other:?}"),
+        }
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.abandoned_stale_provisioning, 1);
+        assert_eq!(snap.stale_provisioning_flushes, 1);
+        assert_eq!(rig.budget.in_flight_bytes(), 0, "the bytes are refunded");
+        assert_eq!(rig.own_commits().await, 0, "nothing is written");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
     }
 
     /// The log counterpart of `crate::shard`'s
