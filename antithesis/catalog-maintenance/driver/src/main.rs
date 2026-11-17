@@ -4,10 +4,12 @@
 //! --ingest-hour-stride`, records every seeded record in the model, and then
 //! writes the seed marker the ravel-server entrypoints wait on. Rules write
 //! strict OTLP logs into the same tenant, run `ravel-cli` fold, compaction and
-//! sweep on demand, jump every container's clock forward once, overwrite HEAD
-//! with garbage through raw S3, audit the store against what HEAD names, and
-//! check that no scan exceeds the stored multiset of seeded and live records.
-//! The eventually stops faults and checks the whole multiset. See
+//! sweep on demand, jump every container's clock forward to seal the live
+//! hours and later past the sweep's protection horizon, overwrite HEAD with
+//! garbage through raw S3, audit the store against what HEAD names and for
+//! swept compaction inputs, and check that no scan exceeds the stored
+//! multiset of seeded and live records. The eventually stops faults, sweeps
+//! every shard and checks the whole multiset. See
 //! antithesis/catalog-maintenance/README.md for the properties.
 
 mod audit;
@@ -17,9 +19,9 @@ mod multiset;
 mod s3;
 mod seed;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,7 +37,7 @@ use ravel_antithesis_driver::model::{self, Attempt, Mode, Model, Signal, Write};
 use ravel_antithesis_driver::otlp::{self, PartialSuccess};
 use ravel_antithesis_driver::ravel::{self, Ravel, Reply, SqlFailure};
 
-use audit::JsonPart;
+use audit::{InputKeys, JsonPart};
 use cli::Cli;
 use s3::Store;
 use seed::Plan;
@@ -49,6 +51,10 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const WINDOW_SLACK_NS: u64 = 600 * 1_000_000_000;
 const NS_PER_HOUR: u64 = 3_600_000_000_000;
 const CLI_TIMEOUT_S: u32 = 300;
+/// The shard count the servers and every `ravel-cli` call use.
+const SHARDS: u32 = 4;
+/// Compaction records one audit decodes for their inputs, at most.
+const DECODES_PER_AUDIT: usize = 16;
 /// Everything setup waits on, the seeded load included, finishes within
 /// this or the driver exits non-zero without reporting setup complete. It
 /// is below the local loop's and `launch.sh`'s 900-second setup timeouts.
@@ -91,6 +97,10 @@ struct ClockPlan {
     /// The libfaketime timestamp file every container reads.
     file: PathBuf,
     jump_s: u64,
+    /// The first sweep jump, past the protection horizon.
+    horizon_jump_s: u64,
+    /// The second sweep jump, past the pinned-query window.
+    window_jump_s: u64,
     /// libfaketime's reread interval (`FAKETIME_CACHE_DURATION`).
     reread_s: u64,
     /// Acked live writes the jump rule waits for, so the jump has live hours
@@ -141,6 +151,11 @@ impl Config {
                         .unwrap_or_else(|_| "/faketime/offset".to_string()),
                 ),
                 jump_s: env_u64("CLOCK_JUMP_SECS", clock::DEFAULT_JUMP_S),
+                horizon_jump_s: env_u64(
+                    "CLOCK_SWEEP_HORIZON_JUMP_SECS",
+                    clock::DEFAULT_HORIZON_JUMP_S,
+                ),
+                window_jump_s: env_u64("CLOCK_SWEEP_WINDOW_JUMP_SECS", clock::DEFAULT_WINDOW_JUMP_S),
                 reread_s: env_u64("FAKETIME_CACHE_DURATION", 2),
                 min_acked: usize::try_from(env_u32("CLOCK_JUMP_MIN_ACKED", 20)).unwrap_or(20),
             },
@@ -148,7 +163,7 @@ impl Config {
     }
 }
 
-/// The one clock jump of a timeline.
+/// One move of every clock.
 #[derive(Clone, Copy, Debug)]
 struct Jump {
     before_ns: u64,
@@ -179,7 +194,20 @@ struct Shared {
     /// check's details.
     compacted: AtomicBool,
     clock: ClockPlan,
+    /// The jump that seals the live hours.
     jump: Mutex<Option<Jump>>,
+    /// Set when the sweep jumps start; once per timeline.
+    sweep_jump_started: AtomicBool,
+    /// The horizon and window jumps, once both reached the driver.
+    sweep_jump: Mutex<Option<(Jump, Jump)>>,
+    /// Every key an audit or the sweep jump has listed. Keys are never
+    /// reused, so one listed here and absent from a later LIST was deleted.
+    seen: Mutex<BTreeSet<String>>,
+    /// The inputs of each compaction record decoded so far; records are
+    /// immutable, so each is decoded once.
+    inputs_of: Mutex<BTreeMap<String, Vec<InputKeys>>>,
+    /// Swept compaction inputs the audits confirmed gone.
+    swept: AtomicUsize,
     /// Every rule holds a read guard while it acts; the clock jump and the
     /// eventually take the write guard.
     gate: RwLock<()>,
@@ -505,47 +533,219 @@ impl Shared {
             return;
         }
         let acked = lock(&self.model).acked_logs.len();
+        let jump = self.shift_clock(self.clock.jump_s, self.clock.jump_s, reason);
+        *slot = Some(jump);
+        drop(slot);
+        if !jump.reached_driver {
+            return;
+        }
+        assert_reachable!(
+            "clock: the driver's clock jumped forward",
+            &json!({
+                "reason": reason,
+                "offset_s": self.clock.jump_s,
+                "min_jump_s": clock::min_jump_s(),
+                "before_ns": jump.before_ns,
+                "after_ns": jump.after_ns,
+                "acked_log_writes": acked,
+            })
+        );
+        self.settle("clock jump");
+    }
+
+    /// Once a compaction record was seen after the sealing jump: move every
+    /// clock past the record's protection horizon, fold so HEAD stops naming
+    /// its inputs, sweep every shard so each input gets its unnamed-since
+    /// marker, then move every clock past the marker's pinned-query window.
+    /// The next sweep deletes the inputs. The caller holds the gate's write
+    /// guard for all of it, as for the sealing jump.
+    fn sweep_jump(&self, reason: &str) {
+        if lock(&self.jump).is_none_or(|j| !j.reached_driver)
+            || !self.compacted.load(Ordering::SeqCst)
+            || self.sweep_jump_started.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        // A deleted input counts only if a LIST held it before the delete.
+        match self.tenant_prefix() {
+            Some(prefix) => match self.store.list(&prefix) {
+                Ok(keys) => lock(&self.seen).extend(keys),
+                Err(e) => println!("sweep jump: the listing before the jump failed: {e}"),
+            },
+            None => println!("sweep jump: no HEAD key known, so nothing listed before the jump"),
+        }
+        let horizon_offset = self.clock.jump_s + self.clock.horizon_jump_s;
+        let horizon = self.shift_clock(horizon_offset, self.clock.horizon_jump_s, reason);
+        if !horizon.reached_driver {
+            return;
+        }
+        self.settle("protection-horizon jump");
+        if !self.fold() {
+            println!("sweep jump: the fold after the horizon jump failed");
+        }
+        let marked = (0..SHARDS).filter(|&shard| self.sweep(shard)).count();
+        let window_offset = horizon_offset + self.clock.window_jump_s;
+        let window = self.shift_clock(window_offset, self.clock.window_jump_s, reason);
+        if !window.reached_driver {
+            return;
+        }
+        *lock(&self.sweep_jump) = Some((horizon, window));
+        assert_reachable!(
+            "clock: the clocks jumped past the sweep's protection horizon and pinned-query window",
+            &json!({
+                "reason": reason,
+                "offset_s": window_offset,
+                "horizon_jump_s": self.clock.horizon_jump_s,
+                "protection_horizon_s": clock::protection_horizon_s(),
+                "window_jump_s": self.clock.window_jump_s,
+                "pinned_window_s": clock::pinned_window_s(),
+                "shards_swept_between": marked,
+            })
+        );
+        self.settle("pinned-window jump");
+    }
+
+    /// Write `offset_s`, the total offset, and wait for the driver's own
+    /// clock to move by `by_s`. libfaketime rereads the file every
+    /// `reread_s` seconds; the driver runs under it like every other
+    /// container.
+    fn shift_clock(&self, offset_s: u64, by_s: u64, reason: &str) -> Jump {
         let before_ns = now_ns();
-        if let Err(e) = clock::write_offset(&self.clock.file, self.clock.jump_s) {
+        if let Err(e) = clock::write_offset(&self.clock.file, offset_s) {
             assert_unreachable!(
                 "clock: the driver could not write the clock offset",
                 &json!({ "file": self.clock.file.display().to_string(), "detail": e })
             );
-            return;
+            return Jump {
+                before_ns,
+                after_ns: before_ns,
+                reached_driver: false,
+            };
         }
-        // libfaketime rereads the file every `reread_s` seconds; the driver
-        // runs under it like every other container.
         let deadline = Instant::now() + Duration::from_secs(self.clock.reread_s + 30);
         let mut after_ns = now_ns();
-        while !clock::moved(before_ns, after_ns, self.clock.jump_s) && Instant::now() < deadline {
+        while !clock::moved(before_ns, after_ns, by_s) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(500));
             after_ns = now_ns();
         }
-        let reached_driver = clock::moved(before_ns, after_ns, self.clock.jump_s);
-        *slot = Some(Jump {
-            before_ns,
-            after_ns,
-            reached_driver,
-        });
-        drop(slot);
+        let reached_driver = clock::moved(before_ns, after_ns, by_s);
         let details = json!({
             "reason": reason,
-            "offset_s": self.clock.jump_s,
-            "min_jump_s": clock::min_jump_s(),
+            "offset_s": offset_s,
+            "by_s": by_s,
             "before_ns": before_ns,
             "after_ns": after_ns,
-            "acked_log_writes": acked,
         });
         println!("clock: jumped ({details})");
         if !reached_driver {
             assert_unreachable!("clock: the clock jump did not reach the driver", &details);
-            return;
         }
-        assert_reachable!("clock: the driver's clock jumped forward", &details);
-        // Every other process picks the offset up within one reread too.
+        Jump {
+            before_ns,
+            after_ns,
+            reached_driver,
+        }
+    }
+
+    /// After a jump reached the driver: wait one more reread, within which
+    /// every other process picks the offset up too, then for every node.
+    fn settle(&self, what: &str) {
         std::thread::sleep(Duration::from_secs(self.clock.reread_s + 1));
-        if let Err(e) = self.wait_serving(Duration::from_secs(120), "clock jump") {
-            println!("clock: a node is not serving two minutes after the jump: {e}");
+        if let Err(e) = self.wait_serving(Duration::from_secs(120), what) {
+            println!("clock: a node is not serving two minutes after the {what}: {e}");
+        }
+    }
+
+    /// `t/<tenant hash>/`, once an inspect has shown the HEAD key.
+    fn tenant_prefix(&self) -> Option<String> {
+        lock(&self.head_key)
+            .as_deref()
+            .and_then(audit::tenant_prefix)
+    }
+
+    /// `ravel-cli maintain sweep` over one shard: every GC rule, deleting.
+    fn sweep(&self, shard: u32) -> bool {
+        let shard = shard.to_string();
+        let out = self.cli.run(
+            &self.args(&["maintain", "sweep", "--shard", &shard]),
+            CLI_TIMEOUT_S,
+        );
+        if !out.ok() {
+            println!("maintain sweep --shard {shard}: {}", out.summary());
+            return false;
+        }
+        assert_reachable!(
+            "catalog: an on-demand sweep succeeded",
+            &json!({ "shard": shard })
+        );
+        true
+    }
+
+    /// The sweep property, over one LIST of the tenant prefix: an input of a
+    /// listed compaction record that an earlier LIST held is gone, and a GET
+    /// of it finds nothing. Then the LIST joins `seen`.
+    fn check_swept(&self, prefix: &str, listed: &BTreeSet<String>) {
+        let records = audit::compaction_records(prefix, listed);
+        let todo: Vec<String> = {
+            let known = lock(&self.inputs_of);
+            records
+                .iter()
+                .filter(|k| !known.contains_key(*k))
+                .take(DECODES_PER_AUDIT)
+                .cloned()
+                .collect()
+        };
+        for key in todo {
+            let out = self
+                .cli
+                .run(&["commit", "decode-compaction", &key], CLI_TIMEOUT_S);
+            if !out.ok() {
+                println!("audit: commit decode-compaction {key}: {}", out.summary());
+                continue;
+            }
+            match audit::compaction_inputs(prefix, &key, &out.stdout) {
+                Some(inputs) => {
+                    lock(&self.inputs_of).insert(key, inputs);
+                }
+                None => println!("audit: commit decode-compaction {key} printed no input list"),
+            }
+        }
+        let mut gone = Vec::new();
+        let mut decoded = 0;
+        {
+            let known = lock(&self.inputs_of);
+            let seen = lock(&self.seen);
+            for record in &records {
+                if let Some(inputs) = known.get(record) {
+                    decoded += 1;
+                    gone.extend(
+                        audit::swept_inputs(inputs, &seen, listed)
+                            .into_iter()
+                            .map(|key| (record.clone(), key)),
+                    );
+                }
+            }
+        }
+        // A LIST can miss a key; only a GET that finds nothing confirms it.
+        let confirmed: Vec<String> = gone
+            .iter()
+            .filter(|(_, key)| matches!(self.store.get(key), Ok(None)))
+            .take(5)
+            .map(|(record, key)| format!("{key} (input of {record})"))
+            .collect();
+        self.swept.fetch_add(confirmed.len(), Ordering::SeqCst);
+        lock(&self.seen).extend(listed.iter().cloned());
+        if decoded > 0 {
+            assert_sometimes!(
+                !confirmed.is_empty(),
+                "catalog: sweep deleted a superseded compaction input",
+                &json!({
+                    "compaction_records_decoded": decoded,
+                    "absent_from_list": gone.len(),
+                    "confirmed_by_get": confirmed,
+                    "sweep_jumped": lock(&self.sweep_jump).is_some(),
+                })
+            );
         }
     }
 
@@ -641,6 +841,7 @@ impl Shared {
                 return;
             }
         };
+        self.check_swept(&prefix, &listed);
         let Some(after) = self.inspect_json() else {
             return;
         };
@@ -821,25 +1022,23 @@ impl Workload {
         let Some(_g) = s.enter() else {
             return;
         };
-        let shard = tc
-            .draw(gs::integers::<u32>().min_value(0).max_value(3))
-            .to_string();
-        let out = s.cli.run(
-            &s.args(&["maintain", "sweep", "--shard", &shard]),
-            CLI_TIMEOUT_S,
-        );
-        if !out.ok() {
-            println!("maintain sweep --shard {shard}: {}", out.summary());
-        }
+        let shard = tc.draw(gs::integers::<u32>().min_value(0).max_value(SHARDS - 1));
+        s.sweep(shard);
     }
 
     #[rule(groups = ["main"], weight = 1)]
     fn jump_clock(&self, tc: TestCase) {
         let s = &self.0;
-        if s.stopping.load(Ordering::SeqCst) || lock(&s.jump).is_some() {
+        if s.stopping.load(Ordering::SeqCst) {
             return;
         }
-        if lock(&s.model).acked_logs.len() < s.clock.min_acked {
+        let sealed = lock(&s.jump).is_some();
+        if sealed
+            && (!s.compacted.load(Ordering::SeqCst) || s.sweep_jump_started.load(Ordering::SeqCst))
+        {
+            return;
+        }
+        if !sealed && lock(&s.model).acked_logs.len() < s.clock.min_acked {
             return;
         }
         if !tc.draw(gs::weighted_booleans(0.05)) {
@@ -849,7 +1048,11 @@ impl Workload {
         if s.stopping.load(Ordering::SeqCst) {
             return;
         }
-        s.jump_clock("drawn");
+        if sealed {
+            s.sweep_jump("drawn");
+        } else {
+            s.jump_clock("drawn");
+        }
     }
 
     #[rule(groups = ["main"], weight = 1)]
@@ -906,8 +1109,9 @@ impl Workload {
 }
 
 /// Stop faults for good, wait for every node, jump the clocks if no rule
-/// did, fold, compact and audit, then check the whole multiset and end the
-/// timeline.
+/// did, fold, compact and audit, take the sweep jumps if no rule did, sweep
+/// every shard, fold and audit again, then check the whole multiset and end
+/// the timeline.
 fn run_eventually(s: &Shared, reason: &str) -> ! {
     s.stopping.store(true, Ordering::SeqCst);
     let _only = lock(&s.eventually_lock);
@@ -954,6 +1158,20 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
         if !done {
             println!("eventually: the on-demand {what} failed three times");
         }
+    }
+    s.audit(&|_| 0);
+    if s.compacted.load(Ordering::SeqCst) {
+        s.sweep_jump("eventually");
+    } else {
+        println!("eventually: no compaction record seen, so no sweep jump");
+    }
+    // Past the pinned-query window this sweep deletes the superseded inputs;
+    // the audit and the multiset below then run after the deletion.
+    for shard in 0..SHARDS {
+        s.sweep(shard);
+    }
+    if !s.fold() {
+        println!("eventually: the fold after the sweep failed");
     }
     s.audit(&|_| 0);
 
@@ -1005,6 +1223,7 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
         }
     }
     let jump = *lock(&s.jump);
+    let sweep_jump = *lock(&s.sweep_jump);
     assert_always!(
         seeded_missing.is_empty()
             && seeded_over.is_empty()
@@ -1020,6 +1239,8 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
                 "after_ns": j.after_ns,
                 "reached_driver": j.reached_driver,
             })),
+            "sweep_jump_after_ns": sweep_jump.map(|(_, w)| w.after_ns),
+            "sweep_deleted_inputs": s.swept.load(Ordering::SeqCst),
             "rows_per_node": rows,
             "acked_live_writes": acked.len(),
             "seeded_missing": first(&seeded_missing),
@@ -1160,6 +1381,9 @@ fn seed(cfg: &Config, store: &Store, cli: &Cli, deadline: Instant) -> Plan {
 /// Refuse to start unless the offset file every container reads holds the
 /// starting offset and the planned jump seals the live hours.
 fn check_clock(plan: &ClockPlan) {
+    if let Err(e) = clock::check_sweep_jumps(plan.horizon_jump_s, plan.window_jump_s) {
+        die(&e);
+    }
     if plan.jump_s < clock::min_jump_s() {
         die(&format!(
             "CLOCK_JUMP_SECS={} is below {}, the jump that seals an hour acknowledged \
@@ -1222,6 +1446,11 @@ fn main(tc: TestCase) {
         compacted: AtomicBool::new(false),
         clock,
         jump: Mutex::new(None),
+        sweep_jump_started: AtomicBool::new(false),
+        sweep_jump: Mutex::new(None),
+        seen: Mutex::new(BTreeSet::new()),
+        inputs_of: Mutex::new(BTreeMap::new()),
+        swept: AtomicUsize::new(0),
         gate: RwLock::new(()),
         stopping: AtomicBool::new(false),
         eventually_lock: Mutex::new(()),
@@ -1251,6 +1480,8 @@ fn main(tc: TestCase) {
         "seed_start_hour": shared.plan.start_hour,
         "seeded_records": shared.seeded.len(),
         "clock_jump_s": shared.clock.jump_s,
+        "sweep_horizon_jump_s": shared.clock.horizon_jump_s,
+        "sweep_window_jump_s": shared.clock.window_jump_s,
     }));
     println!("startup: setup complete; waiting for /workload-active");
     while !Path::new("/workload-active").exists() {
