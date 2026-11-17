@@ -1,0 +1,7 @@
+rseg_data_objects=3
+l0_commit_records=2
+l0_sample_count=3
+l0_series_count=3
+compaction_records=1
+l1_sample_count=3
+l1_series_count=2
