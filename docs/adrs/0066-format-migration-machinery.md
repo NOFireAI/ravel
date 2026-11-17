@@ -771,15 +771,20 @@ with the code that adds the reader.
 <!-- amendment-applies: sections="Amendment (R1, #1300): the CAS-mutable sys/* records version on every additive change" pointer="ADR-4233 R1 rows amendment" -->
 <!-- amendment-supersedes: phrase="the test's entries for the other six messages" pointer="ADR-4233 R1 rows amendment" -->
 
-The R1 table now matches `classification_table()` in
-`crates/ravel-catalog/tests/sys_proto_format_version_classification.rs`:
+The R1 table rows below now match `classification_table()` in
+`crates/ravel-catalog/tests/sys_proto_format_version_classification.rs`.
+This amendment does not reconcile the `GcConfig` row: the table and the
+test both give it {1}, while `GcConfigValues::from_proto`
+(`crates/ravel-maintain/src/gc_config.rs`, around lines 246-257) reads 1
+and 2. That difference is tracked separately.
 
 - `ProvisioningRecord` reads {1, 2, 3, 4}. Its writers stamp 3, and stamp
-  4 only on a record that carries `compat_epoch` (field 8) and
-  `compat_fenced_unix_ns` (field 9): an activation's fence, a raise before
-  a writer's first publish above a family's baseline, or a first touch
-  after an activation. The two rewrite paths keep a version-4 record at 4
-  with both fields and refuse a record above 4 (ADR-4233 decision 4).
+  4 when the record carries `compat_epoch` (field 8) or
+  `compat_fenced_unix_ns` (field 9), or was already at 4 (`stamp_for` in
+  `crates/ravel-catalog/src/provisioning.rs`): an activation's fence, a
+  raise before a writer's first publish above a family's baseline, or a
+  first touch after an activation. The two rewrite paths keep a version-4
+  record at 4 and refuse a record above 4 (ADR-4233 decision 4).
 - `CompatRecord` (`sys/compat`, ADR-4233 decision 3) is a new CAS-mutable
   row at {1}. It is created with `CreateIfAbsent` and replaced whole under
   CAS, and a record above version 1 is read as `CompatRecordNewer` and

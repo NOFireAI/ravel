@@ -1008,11 +1008,33 @@ a fenced bucket (one whose provisioning record carries a `compat_epoch`)
 its writers refuse as stale. On a write path with no provisioning record
 (the audit and legal-hold writers) no fence ever ends the exemption, so
 such a writer keeps writing the baseline version after an activation, and
-only the late-write pass finds what it wrote. That is why `compat activate`
-refuses (`WriterRolesCannotReadCompat`) unless the operator attests that
-every writer role's credentials can read `sys/compat`. The shipped roles in
-`deploy/iam` grant `s3:GetObject` on `sys/compat` to the gateway, query and
-maintain roles.
+only the certify census or the late-write pass finds what it wrote. A blind
+gateway's first write to a bucket that has no provisioning record yet, made
+after the activation's fence walk, passes `check_fresh` (the bucket carries
+no `compat_epoch`), and `born_fenced_epoch` returns no epoch for a view
+whose `seen_epoch` is 0 (`services/ravel-server/src/provisioning.rs`,
+around lines 324-342), so the gateway creates an unfenced provisioning
+record and keeps writing the baseline version to that bucket until
+`compat certify`'s census fences buckets provisioned after the walk
+(`fence_bucket`, `crates/ravel-maintain/src/compat_certify.rs` around line
+981); from then on its writes there refuse as stale. A blind alert
+evaluator's `rlog_policy` calls `write_policy` with no bucket
+(`services/ravel-server/src/alerting.rs`, around lines 1265-1295), so it
+answers the baseline, unparked, at epoch 0. On a tenant whose lease the
+walk parked, the evaluator refreshes, still sees epoch 0, and does not act
+on the lease that tick, every tick. On a tenant with no lease it creates an
+unparked lease at epoch 0 and writes alert history at the baseline
+version, which only the certify census or the late-write pass finds.
+
+The exemption, this residual and the attestation requirement change decision 3 by owner decision (delegated), ruled on 2026-11-17 by the approver the owner delegated ADR-4233 and its amendments to; the behaviour shipped earlier under issue #4287, and this amendment is its decision record.
+
+That is why `compat activate` requires the operator to attest that every
+writer role's credentials can read `sys/compat`, and refuses
+(`WriterRolesCannotReadCompat`) without the attestation. `ravel-cli compat
+activate` takes it from `--pre-baseline-processes-terminated`, the flag
+that also attests the termination prerequisite; it has no separate flag
+for it. The shipped roles in `deploy/iam` grant `s3:GetObject` on
+`sys/compat` to the gateway, query and maintain roles.
 
 ## Amendment (2026-11-17): the kidx read set is {1,2,3} (issue #4250)
 
@@ -1037,8 +1059,9 @@ is the first release that ships decisions 2 to 5 together with the
 `ravel-cli compat` commands that create and activate `sys/compat`; without
 the commands no store can be adopted or activated. As of this amendment no
 release is the baseline: v0.33.0 (2026-11-13) is the newest release, and
-`main` carries `init`, `activate`, `certify` and the late-write pass as
-`ravel-maintain` library entry points with no `ravel-cli` subcommand. The
-baseline release a store records is whatever `compat init` is told
+the commands, `ravel-cli compat init`, `activate`, `certify`, `verify` and
+`status`, wrap the `ravel-maintain` entry points (`init_compat`,
+`activate`, `certify` and the late-write pass) and ship in no release yet.
+The baseline release a store records is whatever `compat init` is told
 (`InitConfig::baseline_release_major` and `baseline_release_minor`), so the
 release that ships the commands is the one on record, whatever its number.
