@@ -117,17 +117,19 @@ pub const MIN_FULL_PARTS: usize = 2;
 /// The bench exists to show that every sample's provenance is charged in full:
 /// [`PROVENANCE_COLUMN_BYTES_PER_SAMPLE`] (64 B) of decoded columns plus a
 /// [`SAMPLE_PROVENANCE_BYTES`] (32 B) record, 96 B a sample, on top of the
-/// catalog decode and the wire bytes the GETs hold. The floor is that 96 B: a
-/// part that dropped the 64 B columns and charged only the 32 B record would
-/// peak near 34 B a sample (measured 97.8 B minus 64 B), and one carrying no
-/// per-sample provenance at all near the catalog decode length alone (~20 B a
-/// sample), both below 96. The ceiling catches a provenance charged twice,
-/// which would peak near 193 B a sample (96 B above the real figure). Measured
-/// 2026-11-17 on this tree: 97.8 B a sample at the default 1-64 MiB caps (97.81
-/// at the 1 MiB cap, 2,500 series over 8 h) and up to 108.5 B at the 64 KiB
-/// smoke cap (120 series over 8 h), where the catalog decode and the
-/// whole-object hold amortise over far fewer samples; the ceiling of 130 B
-/// clears that spread while staying well below the doubled 193 B.
+/// catalog decode and the wire bytes the GETs hold. A listing under exactly
+/// [`upper_bound`] is refused, so with the provenance charged the peak is above
+/// 96 B a sample, and the floor is that 96 B. Measured 2026-11-17 with this
+/// bin: 98.30 B a sample at the
+/// 1 MiB cap and 97.25, 97.06 and 97.03 B at 4, 16 and 64 MiB (the default
+/// caps, 2,500 series over 72 h), and 107.98 and 104.91 B at the smoke test's
+/// 64 and 256 KiB caps (120 series over 8 h), where the catalog decode and the
+/// held fetch bytes amortise over fewer samples. Charging only the 32 B record
+/// would drop those by 64 B, to 33.0 to 44.0 B, under the floor; charging no
+/// provenance would leave the catalog and fetch bytes alone, at most 12 B. The
+/// ceiling catches the provenance charged twice, which would add 96 B, to
+/// 193.0 to 204.0 B; 130 B clears the measured 107.98 B and stays well below
+/// that.
 pub const PEAK_PER_SAMPLE_BAND: (f64, f64) = (96.0, 130.0);
 
 /// The figures every cap entry of the report carries, each exactly once.

@@ -373,6 +373,9 @@ fn held_fetch_bound_charges_the_tail_the_footer_chase_and_the_uncovered_catalog(
 
 /// The peak-per-sample band fails when the full 96 B of per-sample provenance
 /// is not charged, or is charged twice. The old [1, 200] B band admitted both.
+/// The wrong figures are the real run's own figure, and the default caps'
+/// measured 97.03 and 98.30 B, with the 64 B of columns dropped (the 32 B
+/// record only) or with another 96 B on top.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peak_per_sample_band_rejects_missing_and_doubled_provenance() {
     let caps = [CAPS[0]];
@@ -380,28 +383,30 @@ async fn peak_per_sample_band_rejects_missing_and_doubled_provenance() {
     let json = report_json(&report);
     let text = serde_json::to_string_pretty(&json).expect("render");
     check_report(&text, &caps).expect("the real per-sample charge is inside the band");
+    let real = report.caps[0].peak_per_sample();
 
-    let with_per_sample = |value: f64| {
+    let check_per_sample = |value: f64| {
         let mut doc = json.clone();
         doc["caps"][0]
             .as_object_mut()
             .expect("cap entry")
             .insert("peak_per_sample_bytes".into(), value.into());
-        serde_json::to_string_pretty(&doc).expect("render")
+        check_report(&serde_json::to_string_pretty(&doc).expect("render"), &caps)
     };
-    // Only the 32 B record charged, the 64 B provenance columns dropped: about
-    // 34 B a sample (the measured 97.8 B minus 64 B), below the 96 B floor.
-    assert!(
-        check_report(&with_per_sample(33.8), &caps).is_err(),
-        "a 34 B/sample charge (record only, columns dropped) must fail the floor"
-    );
-    // Provenance charged twice: about 194 B a sample, above the 130 B ceiling.
-    assert!(
-        check_report(&with_per_sample(193.8), &caps).is_err(),
-        "a 194 B/sample charge (provenance doubled) must fail the ceiling"
-    );
-    // The real figure restamped still holds.
-    check_report(&with_per_sample(97.8), &caps).expect("97.8 B a sample is inside the band");
+    for measured in [real, 97.03, 98.30] {
+        check_per_sample(measured).expect("a measured figure is inside the band");
+        for wrong in [measured - 64.0, measured + 96.0] {
+            let failures = check_per_sample(wrong).expect_err("outside the band");
+            assert!(
+                matches!(failures.as_slice(), [only] if only.starts_with(&format!(
+                    "cap {}: peak per sample {}",
+                    caps[0],
+                    wrong.trunc()
+                )) && only.ends_with("B outside [96, 130]")),
+                "{wrong} B a sample (from {measured} B) must fail the band alone: {failures:?}"
+            );
+        }
+    }
 }
 
 /// The reported peak sits at or below the listing bound on a real run, and
