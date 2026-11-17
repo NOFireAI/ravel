@@ -323,8 +323,10 @@ jobs:
     # 20 was crossed on the first run that carried them. On 2026-11-09, ten
     # consecutive runs took 23.7 to 30.3 minutes, and two (one on main) were
     # cancelled at 30. On 2026-11-17 it took 34 to 39 minutes on merge-queue
-    # runs, 41 on a pull request that adds guard cases, and two merge-queue
-    # runs were cancelled at 45 (#4375). Splitting the job is tracked there.
+    # runs and 41 on the pull request run of #4366, and the merge-queue
+    # entries of #4359 and #4366 were cancelled at 45. Splitting the job is
+    # tracked on #4375.
+    # budget: p90 39 min on 2026-11-17
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
