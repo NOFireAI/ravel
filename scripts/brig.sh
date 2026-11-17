@@ -138,7 +138,9 @@ case $cmd in
     # Brig pulls a tag only when the host lacks the image, and a sandbox keeps
     # the image it booted, so a new :latest needs both gone. Exit 3 is no
     # sandbox to remove.
-    "$BRIG" rm --target "$target" -f "$brigfile" || [ $? -eq 3 ]
+    rm_code=0
+    "$BRIG" rm --target "$target" -f "$brigfile" || rm_code=$?
+    [ "$rm_code" -eq 0 ] || [ "$rm_code" -eq 3 ] || exit "$rm_code"
     BRIG_PULL=always
     export BRIG_PULL
     cmd=run

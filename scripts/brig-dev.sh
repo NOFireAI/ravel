@@ -17,18 +17,20 @@ fail() {
 [ -n "${BRIG_PROJECT:-}" ] || fail "runs inside a Brig sandbox only. On the host, run: make brig NAME=<name>"
 cd "$BRIG_PROJECT"
 
+if [ -f .git ]; then
+  fail "$BRIG_PROJECT is a linked git worktree, and its .git file names a directory the sandbox does not mount. Make a sandbox clone with: make brig-new NAME=<name>"
+fi
+
 # The project arrives on a share owned by the host user, so git reports
 # dubious ownership until the guest trusts it. The guest home survives
-# brig stop, so the entry is added once.
+# brig stop, so the entry is added once. Run from $HOME: inside a project git
+# cannot read, git stops before it reaches the global config.
 if ! git rev-parse --git-dir > /dev/null 2>&1; then
-  if ! git config --global --get-all safe.directory 2> /dev/null | grep -qxF "$BRIG_PROJECT"; then
-    git config --global --add safe.directory "$BRIG_PROJECT"
+  if ! git -C "$HOME" config --global --get-all safe.directory 2> /dev/null | grep -qxF "$BRIG_PROJECT"; then
+    git -C "$HOME" config --global --add safe.directory "$BRIG_PROJECT"
   fi
 fi
 if ! err=$(git rev-parse --git-dir 2>&1 > /dev/null); then
-  if [ -f .git ]; then
-    fail "$BRIG_PROJECT is a linked git worktree, and its .git file names a directory the sandbox does not mount. Make a sandbox clone with: make brig-new NAME=<name>"
-  fi
   fail "git rev-parse --git-dir failed: $err"
 fi
 if ! git rev-parse --verify -q origin/main > /dev/null; then

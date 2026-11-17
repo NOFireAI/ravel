@@ -651,6 +651,9 @@ jobs:
         run: bash .claude/guards/epic-status-nudge.test.sh
       - name: Disk-reap cases
         run: bash scripts/disk-reap.test.sh
+      # A stub brig and fixture repositories; git only, no network.
+      - name: Brig host script cases
+        run: bash scripts/brig.test.sh
       - name: Make-reference cases
         run: bash benchmarks/clickbench/parquet/make-reference.test.sh
       - name: Reproduce-figure cases

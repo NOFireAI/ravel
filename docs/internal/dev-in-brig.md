@@ -102,9 +102,17 @@ through the routes.
 - Any guest process can push to any branch the token can write, force-push
   included, for the 12 hours a route token lasts. Branch protection covers
   `main` only. The token's scope is the limit.
-- The guest can write `.git/hooks` and `.git/config` in the clone. Do not
-  run host git or `make` inside a sandbox clone. `scripts/brig.sh` refuses
-  to run from one.
+- The guest can write anything in the clone, including `.git/hooks`,
+  `.git/config`, `Makefile`, `scripts/`, `Brigfile` and `.brig/*.yaml`.
+  - Do not run host git or `make` inside a sandbox clone. `scripts/brig.sh`
+    refuses to run from one, so the host side always comes from your own
+    checkout.
+  - The next `make brig` boots the clone's `Brigfile` and the profile and
+    policies it names. Brig's approval covers those files by sha256, with
+    the egress rules and the routes they resolve to, so a run after the
+    guest has changed any of them asks you to approve again. Read the plan
+    before you approve: a wider egress list or route rule shows up there.
+    The approval does not cover the bytes behind the image tag.
 - The Brigfile format is `v1alpha1`, with no compatibility promise. After
   you update brig, run `brig config --target dev -f <clone>/Brigfile`.
 
