@@ -74,8 +74,8 @@ use crate::format_floor::{
     BelowFormatFloor, FormatFamily, warn_flush_refused, warn_flush_written_below,
 };
 use crate::generation::{
-    FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, ScanCheck,
-    mismatch_retry_spent, reread_and_check, send_hand_back,
+    FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, STALE_VIEW_ABANDONED,
+    ScanCheck, mismatch_retry_spent, reread_and_check, send_hand_back, stale_view_hold_spent,
 };
 use crate::metrics::FlushTrigger;
 use crate::shard::{InPlaceCause, InPlaceWarnings};
@@ -223,6 +223,8 @@ struct SpanTenantBuf {
     deferred_since_ns: Option<i64>,
     /// See [`crate::shard`]'s `TenantBuf::stale_view_counted`.
     stale_view_counted: bool,
+    /// See [`crate::shard`]'s `TenantBuf::stale_view_since_ns`.
+    stale_view_since_ns: Option<i64>,
     /// See [`crate::shard`]'s `TenantBuf::hand_back_blocked`.
     hand_back_blocked: bool,
     /// See [`crate::shard`]'s `TenantBuf::mismatch_held_since_ns`.
@@ -1274,6 +1276,31 @@ impl SpanShardActor {
         false
     }
 
+    /// Drops a buffer held closed on an untrusted generation view for
+    /// `max_flush_lifetime`; see `shard::ShardActor::drop_stale_view_flush`.
+    fn drop_stale_view_flush(
+        &self,
+        tenant_hash: TenantHash,
+        buf: SpanTenantBuf,
+        lag_check: LagCheck,
+    ) {
+        self.metrics.record_abandoned_stale_provisioning();
+        tracing::error!(
+            signal = ?Signal::Spans,
+            shard = self.shard,
+            tenant_hash = %tenant_hash.to_hex(),
+            rows = buf.spans.len(),
+            bytes = buf.est_bytes,
+            teardown = !matches!(lag_check, LagCheck::Enforced),
+            "ravel-ingest: dropping a flush held closed for max_flush_lifetime on a provisioning \
+             view this router cannot trust; its spans are not written"
+        );
+        self.ctx.ack_waiters(
+            buf.waiters,
+            Err(SpanWriteError::Abandoned(STALE_VIEW_ABANDONED.into())),
+        );
+    }
+
     /// A buffer with a strict-mode waiter, or one whose flush would write at
     /// least `min_flush_bytes` of object,
     /// already justifies a PUT on the fast `max_flush_delay` clock; anything
@@ -1875,6 +1902,7 @@ impl SpanShardActor {
             ScanCheck::InScanSet => {
                 self.handing_back = false;
                 self.in_place_warnings.rearm(tenant_hash);
+                buf.stale_view_since_ns = None;
                 buf
             }
             ScanCheck::HandBack {
@@ -1890,6 +1918,7 @@ impl SpanShardActor {
             {
                 // This flush opens at or past the cap, so, as on the deferral
                 // path, no strict waiter is acknowledged from it.
+                buf.stale_view_since_ns = None;
                 let waiters = std::mem::take(&mut buf.waiters);
                 self.ctx.ack_waiters(
                     waiters,
@@ -1945,6 +1974,7 @@ impl SpanShardActor {
                     return;
                 };
                 buf.stale_view_counted = false;
+                buf.stale_view_since_ns = None;
                 let enforced = matches!(lag_check, LagCheck::Enforced);
                 // A target that is not live cannot take the spans on a later
                 // flush, so only a full mailbox is retried.
@@ -2015,6 +2045,17 @@ impl SpanShardActor {
                 let mut buf = buf;
                 if !std::mem::replace(&mut buf.stale_view_counted, true) {
                     self.metrics.record_stale_provisioning_flush();
+                }
+                if matches!(lag_check, LagCheck::Enforced) {
+                    buf.stale_view_since_ns.get_or_insert(raw_ns);
+                }
+                if stale_view_hold_spent(
+                    buf.stale_view_since_ns,
+                    raw_ns,
+                    self.config.max_flush_lifetime,
+                ) {
+                    self.drop_stale_view_flush(tenant_hash, buf, lag_check);
+                    return;
                 }
                 if self.keeps_unconfirmed_flush(lag_check, "no trusted generation view") {
                     self.tenants.insert(tenant, buf);
@@ -3690,6 +3731,42 @@ mod tests {
             yields_until(|| false).await;
         }
         rig.metrics.snapshot()
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_strict_waiter_on_a_spent_stale_view_hold_is_abandoned`.
+    #[tokio::test]
+    async fn a_strict_waiter_on_a_spent_stale_view_hold_is_abandoned() {
+        let config = IngestConfig {
+            shard_count: 4,
+            max_flush_lifetime: Duration::from_secs(60),
+            ..IngestConfig::default()
+        };
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, config);
+        let (charge, mut answer) = rig.write_strict(4_096).await;
+        drop(charge);
+        rig.flush_now().await;
+        rig.clock.advance_ns(60_000_000_000 - 1);
+        rig.flush_now().await;
+        assert!(
+            matches!(answer.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "held one nanosecond inside the bound"
+        );
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096);
+
+        rig.clock.advance_ns(1);
+        rig.flush_now().await;
+        match answer.try_recv() {
+            Ok(Err(SpanWriteError::Abandoned(msg))) => assert_eq!(msg, STALE_VIEW_ABANDONED),
+            other => panic!("expected the stale-view Abandoned, got {other:?}"),
+        }
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.abandoned_stale_provisioning, 1);
+        assert_eq!(snap.stale_provisioning_flushes, 1);
+        assert_eq!(rig.budget.in_flight_bytes(), 0, "the bytes are refunded");
+        assert_eq!(rig.own_commits().await, 0, "nothing is written");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
     }
 
     /// The span counterpart of `crate::shard`'s
