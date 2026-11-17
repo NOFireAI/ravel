@@ -17,7 +17,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use antithesis_sdk::{assert_always, assert_always_or_unreachable, assert_reachable};
+use antithesis_sdk::{
+    assert_always, assert_always_or_unreachable, assert_reachable, assert_sometimes,
+};
 use bytes::Bytes;
 use hegel::TestCase;
 use hegel::generators as gs;
@@ -211,6 +213,20 @@ impl Workload {
         assert_always!(
             v.holds,
             "store: a version is never reused after a delete",
+            &v.details
+        );
+        assert_always!(
+            v.same_bytes_ok,
+            "store: a CAS holding a pre-delete version fails after a same-bytes recreate",
+            &v.details
+        );
+        // On RustFS the ETag is content-derived, so the recreate reuses the
+        // pre-delete version; record that reuse rather than requiring the
+        // version to differ, which the TLA+ global counter would but S3Store
+        // as Ravel uses it does not (README "Versions on S3").
+        assert_sometimes!(
+            v.same_bytes_reused,
+            "store: a same-bytes recreate reuses the version",
             &v.details
         );
     }
