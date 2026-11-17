@@ -416,6 +416,11 @@ jobs:
       # head.sha, NOT github.sha, for the same reason the changelog guard
       # below records: on a pull_request event github.sha is the merge commit,
       # whose first parent is the base branch tip.
+      # Runs on pull_request only, not merge_group, like the changelog guard:
+      # a merge_group run has no single base..head range. A corpus edit that
+      # lands on main between this check and the queue merge does not slip
+      # through: the corpus is add-only, so two pull requests touching the
+      # same fixture meet as an add/add conflict, which blocks the queue.
       - name: Compat corpus is append-only (issue #4249)
         if: github.event_name == 'pull_request'
         run: scripts/guards/check-compat-corpus-append-only.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"

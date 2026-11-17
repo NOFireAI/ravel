@@ -11,10 +11,11 @@
 # DELETED, relative to the merge base.
 #
 # This is a text/history scan: it compares the working range against the merge
-# base and never builds. It is deliberately strict about the corpus tree only;
-# everything else under crates/ravel-compat-tests/ (the Rust tests, Cargo.toml,
-# the recorded expected-results files that live OUTSIDE corpus/) is free to
-# change.
+# base and never builds. It is deliberately strict about the corpus tree only,
+# and that tree includes each release's recorded results (expected.txt,
+# samples.txt, versions.txt, logs/expected.txt, spans/expected.txt) and its
+# PROVENANCE, which are frozen with the objects they describe. Everything else under crates/ravel-compat-tests/
+# (the Rust tests, Cargo.toml) is free to change.
 #
 # Usage:
 #   scripts/guards/check-compat-corpus-append-only.sh <base-ref> [<head-ref>]

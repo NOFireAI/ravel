@@ -1738,9 +1738,11 @@ dependencies = [
 name = "ravel-compat-tests"
 version = "0.33.0"
 dependencies = [
+ "blake3",
  "prost",
  "ravel-catalog",
  "ravel-commit",
+ "ravel-ingest",
  "ravel-logseg",
  "ravel-maintain",
  "ravel-object-store",
