@@ -296,16 +296,17 @@ trigger fires when the flush is not deferred and the buffer is not held below
 the idle byte floor (the largest of the flush delays, plus one flush tick;
 about 40 s at the defaults). A row routed later would be acknowledged in
 buffered mode although its undeferred flush trigger would open past the
-horizon, where the scan-set check below holds the flush and finally drops it,
-so in the last `flush_trigger_age_bound` before the horizon a write is refused
+horizon, where the scan-set check below holds the flush, and drops it if no
+provisioning read succeeds within the bound of that hold, so in the last `flush_trigger_age_bound` before the horizon a write is refused
 with the retryable `StaleProvisioningView` (503) and nothing is buffered. That
 refusal covers only the undeferred trigger. A buffer held below
 `--idle-flush-byte-floor` (the ADR-1737 sub-floor hold, about
 `max_flush_lifetime`, 1 h by default) or whose flush is deferred (by the
 tenant flush share or the queued-flush cap, for the flush deferral cap,
 3,559.8 s at the defaults, or longer) can still open past the horizon after its rows
-were acknowledged; it is then held and dropped under the bounded stale-view
-hold (docs/consistency-model.md, acknowledgement case nine). The grace
+were acknowledged; it is then held under the bounded stale-view hold, and
+dropped if no provisioning read succeeds within the bound
+(docs/consistency-model.md, acknowledgement case nine). The grace
 window degrades cost under
 store latency, it never converts a genuine shard-count change into silent
 wrong-routing. A router routing through this window increments
@@ -450,9 +451,19 @@ tenant's cached generation history. That view is trusted for `h` only before
   keeps the buffer.
   The hold is bounded (ADR-1642 stale-view hold amendment). The
   buffer records the clock reading of the first enforced attempt that found
-  no trusted view, and a flush that opens on a trusted view clears it. Once
-  the buffer has been held for `max_flush_lifetime` from that reading, the
-  next flush attempt drops it unwritten instead of holding it again: strict
+  no trusted view. A flush attempt that gets a scan-set or hand-back verdict
+  clears it, including a hand-back that keeps the rows because a target is
+  not live or its mailbox is full. A provisioning read issued at or after
+  that reading that succeeds restarts the hold at the next attempt that still
+  finds no trusted view, whether or not attempts were made in between (a
+  deferred flush makes none). Once `max_flush_lifetime` has passed with no
+  provisioning read succeeding since the hold began, the next flush attempt
+  re-reads the record before it drops anything, joining a read already in
+  flight, and the shard actor waits for that read at most until the
+  deadline a flush opened at that attempt would carry (`max_flush_lifetime`
+  later); a drain that has already re-read the tenant does not read again.
+  A re-read that installs a trusted view opens the flush. Otherwise the
+  attempt drops the buffer unwritten instead of holding it again: strict
   waiters are answered the retryable `Abandoned` (503), dropping the buffer
   refunds its ADR-0069 byte charges, the drop is logged at ERROR, and
   `ravel_ingest_abandoned_stale_provisioning_total` counts it once per
