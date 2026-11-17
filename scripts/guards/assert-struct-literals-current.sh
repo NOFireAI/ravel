@@ -24,6 +24,8 @@
 #   - a function or method (`fn name(`, any visibility) whose parameter count,
 #     `self` receiver, or any parameter's type differs. Renaming a parameter
 #     is not a change.
+# A fn inside an `impl Trait for Type` block is skipped: the trait's own `trait`
+# block carries the method shape, and an impl only follows it.
 # Out of scope: renaming an item, a struct, variant or function that exists on
 # only one side, a tuple struct, and a tuple or unit enum variant.
 # Same-named items are pooled across the changed files, so moving an item
@@ -185,7 +187,7 @@ function emit_fn(   recv, r, i, t, types) {
   }
   printf "F\t%s\t%d|%s|%s\n", name, n_items, recv, types
 }
-function find_header(   ss, fs, es, m, best) {
+function find_header(   ss, fs, es, im, m, best) {
   best = 0
   ss = match(rest, /(^|[^A-Za-z0-9_])struct[ \t]+[A-Za-z_][A-Za-z0-9_]*/)
   if (ss) { best = RSTART; b_len = RLENGTH; mode = "spre" }
@@ -193,7 +195,17 @@ function find_header(   ss, fs, es, m, best) {
   if (fs && (!best || RSTART < best)) { best = RSTART; b_len = RLENGTH; mode = "fpre" }
   es = match(rest, /(^|[^A-Za-z0-9_])enum[ \t]+[A-Za-z_][A-Za-z0-9_]*/)
   if (es && (!best || RSTART < best)) { best = RSTART; b_len = RLENGTH; mode = "epre" }
+  im = match(rest, /(^|[^A-Za-z0-9_])impl([^A-Za-z0-9_]|$)/)
+  if (im && (!best || RSTART < best)) {
+    best = RSTART; b_len = RLENGTH; mode = "ipre"
+    if (substr(rest, best + b_len - 1, 1) != "l") b_len--
+  }
   if (!best) return 0
+  if (mode == "ipre") {
+    rest = substr(rest, best + b_len)
+    angle = 0; brk = 0; ihdr = ""
+    return 1
+  }
   m = substr(rest, best, b_len); rest = substr(rest, best + b_len)
   sub(/.*(struct|fn|enum)[ \t]+/, "", m)
   name = m; angle = 0; paren = 0; depth = 0; n_items = 0; item = ""
@@ -237,9 +249,36 @@ function step_enum(c,   v) {
   }
   return 0
 }
+# A trait impl has a `for` token in its header outside `<..>` and before any
+# `where` clause, so `for<'a>` in generics or a bound does not count.
+function is_trait_impl(   h) {
+  h = " " ihdr " "
+  if (match(h, /[^A-Za-z0-9_]where[^A-Za-z0-9_]/)) h = substr(h, 1, RSTART)
+  return match(h, /[^A-Za-z0-9_]for[^A-Za-z0-9_]/) > 0
+}
 # Returns 1 when the item is finished (or abandoned) and the scan is idle again.
 function step(c) {
   if (mode == "ebody") return step_enum(c)
+  if (mode == "ibody") {
+    if (c == "{") idepth++
+    else if (c == "}") { idepth--; if (idepth == 0) { mode = "idle"; return 1 } }
+    return 0
+  }
+  if (mode == "ipre") {
+    if (c == "<") { angle++; return 0 }
+    if (c == ">") { if (angle > 0) angle--; return 0 }
+    if (angle > 0) return 0
+    if (c == "[") brk++
+    else if (c == "]") { if (brk > 0) brk-- }
+    else if (c == ";" && brk == 0) { mode = "idle"; return 1 }
+    else if (c == "{") {
+      if (is_trait_impl()) { mode = "ibody"; idepth = 1; return 0 }
+      mode = "idle"
+      return 1
+    }
+    ihdr = ihdr c
+    return 0
+  }
   if (mode == "spre" || mode == "fpre" || mode == "epre") {
     if (c == "<") { angle++; return 0 }
     if (c == ">") { if (angle > 0) angle--; return 0 }
@@ -279,7 +318,7 @@ function step(c) {
   item = item c
   return 0
 }
-BEGIN { mode = "idle"; q = "'"; in_enum = 0 }
+BEGIN { mode = "idle"; q = "'"; in_enum = 0; idepth = 0 }
 {
   line = $0
   gsub(q "[^" q "\\\\]" q, "", line)
@@ -299,6 +338,7 @@ BEGIN { mode = "idle"; q = "'"; in_enum = 0 }
     }
     if (!done) {
       if (mode == "sbody" || mode == "fparams") item = item " "
+      else if (mode == "ipre") ihdr = ihdr " "
       else if (mode == "ebody") vtok = vtok " "
       break
     }
