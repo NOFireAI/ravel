@@ -3,30 +3,33 @@
 #
 # Runs the published v0.33.0 ravel-server against isolated buckets on a local
 # RustFS process, fences each tenant/signal bucket the way `compat activate`
-# does (crates/ravel-catalog/examples/compat_fence_bucket.rs), and checks that
-# no v0.33.0 process writes a key outside EXEMPT_PATTERNS into a fenced bucket
-# after its grace horizon while it runs, or after the fence once restarted.
-# Exempt keys are recorded with their LastModified. Writes at process stop
-# (teardown) are recorded and each data object is checked at the trailer
-# version v0.33.0 writes (RSEG 7, RLOG 5, RSPAN 5). Never point it at a
-# shared or production bucket: it creates its own RustFS data directory and
-# buckets under $DRILL_RUN.
+# does (crates/ravel-catalog/examples/compat_fence_bucket.rs), and judges
+# every key written or removed under the tenant after the fence against the
+# revised pre-registration on issue #4243: each event falls in exactly one
+# class of drill_post_fence_class (scripts/compat/drill-lib.sh), the
+# fail-row classes stay at zero, no ingest is accepted after the trust limit,
+# no query is answered after the fence, and every data-bearing write (teardown
+# l0/c, idem) is at the version v0.33.0 writes (RSEG 7, RLOG 5, RSPAN 5) and
+# flagged by main's certify census or late-write pass (drill_census, an
+# example of crates/ravel-compat-tests). Never point it at a shared or
+# production bucket: it creates its own RustFS data directory and buckets
+# under $DRILL_RUN.
 #
 # usage: released-binary-drill.sh PHASE
 #   preflight    verify the assets (sha256, cosign) and print the stamps
 #   start        start RustFS and create the buckets
 #   warm-start   (a) for the warm bucket: v0.33.0 all + maintain, the driver
 #   warm-fence   (b)+(d) fence the warm bucket while the driver runs
+#   warm-snap    list the warm bucket while it runs (repeat at will)
 #   warm-finish  (d) after the horizon plus one scrub rotation: listings,
-#                graceful stop, verdict
+#                graceful stop, verdict, census. DRILL_WARM_EARLY=1 stops
+#                sooner and fails the warm observation row
 #   cold         (a)+(b)+(c) a second bucket, fenced, then a cold restart
+#   cold-judge   the cold restart's verdict and census from its listings
 #   read         (e) v0.33.0 and main read the unfenced v0.33.0 copy
 #   all          every phase above in order, waiting out the warm horizon
-#   verdict      fold every phase's verdict into the report; exit non-zero on
-#                a non-exempt post-horizon fenced write, a teardown write at
-#                another version or with no version rule, no scrub cursor
-#                write after the horizon, a zero positive control or a read
-#                diff
+#   verdict      print the horizon, every figure and every verdict row; exit
+#                non-zero when any row failed or is missing
 #   stop         stop every process this drill started
 #   drive DIR PORT   (internal) the request loop the warm and cold phases run
 #
@@ -35,6 +38,8 @@
 #   DRILL_V033      v0.33.0 asset directory [.dd-tools/v033]
 #   DRILL_RUSTFS    RustFS binary [.dd-tools/rustfs/rustfs]
 #   DRILL_FENCE     compat_fence_bucket example binary
+#   DRILL_CENSUS    drill_census example binary (cargo build --manifest-path
+#                   crates/ravel-compat-tests/Cargo.toml --example drill_census)
 #   DRILL_MAIN      main ravel-server binary (cargo build --release -p ravel-server --features sql)
 #   DRILL_MAIN_SHA  the commit DRILL_MAIN was built from [HEAD]
 #   DRILL_PORT      first of the local ports the drill binds [39410]
@@ -70,6 +75,7 @@ RUSTFS=${DRILL_RUSTFS:-$ROOT/.dd-tools/rustfs/rustfs}
 TARGET=${CARGO_TARGET_DIR:-$ROOT/target}
 FENCE=${DRILL_FENCE:-$TARGET/debug/examples/compat_fence_bucket}
 MAIN=${DRILL_MAIN:-$TARGET/release/ravel-server}
+CENSUS=${DRILL_CENSUS:-$ROOT/crates/ravel-compat-tests/target/debug/examples/drill_census}
 PORT=${DRILL_PORT:-39410}
 COLD_SECS=${DRILL_COLD_SECS:-240}
 # The cold and read phases each need a bucket nothing wrote before; a rerun
@@ -136,13 +142,17 @@ spawn() {
   echo $! > "$name.pid"
 }
 
+# Stops the process in $1 and records how in ${1%.pid}.stop: "graceful" (it
+# exited within 120 s of SIGTERM), "killed", or "absent" (it was no longer
+# running, so this stop observed nothing).
 stop_pid() {
-  local pidfile=$1 pid i
+  local pidfile=$1 pid i how=absent
   [ -f "$pidfile" ] || return 0
   pid=$(cat "$pidfile")
   if kill -0 "$pid" 2> /dev/null; then
     # timeout forwards SIGTERM to the server: a graceful stop.
     kill -TERM "$pid" 2> /dev/null || true
+    how=graceful
     for i in $(seq 1 120); do
       kill -0 "$pid" 2> /dev/null || break
       sleep 1
@@ -150,8 +160,10 @@ stop_pid() {
     if kill -0 "$pid" 2> /dev/null; then
       say "$pidfile did not stop in 120 s, killing"
       kill -KILL "$pid" 2> /dev/null || true
+      how=killed
     fi
   fi
+  echo "$how $(date -u +%s)" > "${pidfile%.pid}.stop"
   rm -f "$pidfile"
 }
 
@@ -253,53 +265,98 @@ fence_bucket() {
   grep -q '^tenant=' "$dir/fence.log" && sed -n 's/^tenant=[^ ]* tenant_hash=//p' "$dir/fence.log" | head -n 1 > "$RUN/tenant.hash"
 }
 
-# Late-write check over a before/after listing pair. Records every key the
-# pair shows written, with LastModified, the exempt subset and the late
-# subset (non-exempt fenced or alerts keys past the horizon).
-judge() {
-  local dir=$1 before=$2 after=$3 fenced_after=$4 alerts_after=$5 tag=$6 h code=0
-  h=$(cat "$RUN/tenant.hash")
-  drill_written_keys "$before" "$after" > "$dir/written.$tag"
-  drill_removed_keys "$before" "$after" > "$dir/removed.$tag"
-  drill_late_writes "$dir/written.$tag" "$h" "$fenced_after" "$alerts_after" "$EXEMPT_PATTERNS" \
-    > "$dir/events.$tag" || code=$?
-  grep '^late ' "$dir/events.$tag" > "$dir/late.$tag" || true
-  grep '^exempt ' "$dir/events.$tag" > "$dir/exempt.$tag" || true
-  sed 's/^/  /' "$dir/exempt.$tag" "$dir/late.$tag"
-  if [ "$code" -eq 0 ]; then
-    echo "verdict $tag pass late=0 exempt=$(grep -c . "$dir/exempt.$tag" || true) written=$(grep -c . "$dir/written.$tag" || true)"
-  else
-    echo "verdict $tag FAIL late=$(grep -c . "$dir/late.$tag" || true) exempt=$(grep -c . "$dir/exempt.$tag" || true) written=$(grep -c . "$dir/written.$tag" || true)"
-  fi
+# One verdict row: "verdict <row>-<tag> pass|FAIL <detail>" from the exit
+# code of the check that ran before it.
+row() {
+  local code=$1 name=$2
+  shift 2
+  if [ "$code" -eq 0 ]; then echo "verdict $name pass $*"; else echo "verdict $name FAIL $*"; fi
 }
 
-# Teardown writes between a running listing and the post-stop listing: each
-# recorded, each data object (and each commit record's data object) checked
-# at the release's trailer version.
-judge_teardown() {
-  local dir=$1 bucket=$2 running=$3 stopped=$4 tag=$5 h key lm size data code=0
+# The revised pre-registration's rows for one fenced run, after its
+# processes stopped. Arguments: dir, bucket, tag, the second the fence began
+# (the drill activation time the census records), the fence second, ingest
+# horizon, alerts horizon, ingest trust limit, the post-stop listing, then the
+# running listings in time order (the first is the listing taken right after
+# the fence, the last the one taken after the driver stopped).
+#   classes      every post-fence t/<h>/ event in one class, each class's
+#                count present once and in its band (unclassified,
+#                l0c-after-horizon, maintenance and alerts-late at 0)
+#   ingest       2xx ingest responses requested after the trust limit: 0
+#   queries      2xx queries requested after the fence: 0
+#   data-version teardown-data and idem keys at the release's versions
+#   census       the same keys each flagged by main's certify census or
+#                late-write pass (examples/drill_census.rs in
+#                crates/ravel-compat-tests); the ingest-grace keys are judged
+#                too and recorded, not failed
+judge_run() {
+  local dir=$1 bucket=$2 tag=$3 fence_start=$4 fence=$5 ingest_h=$6 alerts_h=$7 trust=$8 stopped=$9
+  shift 9
+  local h report=$dir/report.$tag c n key lm data last
   h=$(cat "$RUN/tenant.hash")
-  drill_written_keys "$running" "$stopped" > "$dir/written.$tag"
-  drill_removed_keys "$running" "$stopped" > "$dir/removed.$tag"
+  last=${*: -1}
+  : > "$report"
+  drill_post_fence_events running "$fence" "$@" > "$dir/events.$tag"
+  drill_post_fence_events teardown "$fence" "$last" "$stopped" >> "$dir/events.$tag"
+  c=0
+  drill_classify_events "$dir/events.$tag" "$dir/classes.$tag" "$report" "$tag" "$h" "$ingest_h" "$alerts_h" \
+    "$EXEMPT_PATTERNS" > "$dir/classes-check.$tag" || c=$?
+  sed 's/^/  /' "$dir/classes-check.$tag"
+  row "$c" "classes-$tag" "events=$(grep -c . "$dir/classes.$tag" || true)"
+
+  echo "figure ingest_2xx_after_trust_$tag $(drill_count_2xx_after "$dir/drive.log" "$trust" 'otlp-metrics|otlp-logs|otlp-traces|remote-write' 30)" >> "$report"
+  c=0
+  drill_check_figure "$report" "ingest_2xx_after_trust_$tag" 0 0 || c=$?
+  row "$c" "ingest-$tag" "trust_limit=$(date -u -d "@$trust" +%FT%TZ)"
+  echo "figure query_2xx_after_fence_$tag $(drill_count_2xx_after "$dir/drive.log" "$fence" promql 30)" >> "$report"
+  c=0
+  drill_check_figure "$report" "query_2xx_after_fence_$tag" 0 0 || c=$?
+  row "$c" "queries-$tag" "fence=$(date -u -d "@$fence" +%FT%TZ)"
+
+  awk -F'\t' '$1 == "teardown-data" || $1 == "idem" { print $3 }' "$dir/classes.$tag" > "$dir/data-keys.$tag"
+  awk -F'\t' '$1 == "ingest-grace" { print $3 }' "$dir/classes.$tag" > "$dir/grace-keys.$tag"
   : > "$dir/trailers.$tag"
-  while IFS=$'\t' read -r key lm size; do
+  : > "$dir/versions.$tag"
+  while IFS= read -r key; do
     case "$key" in
-      "t/$h/"*/l0/*.rseg) data=$key ;;
-      "t/$h/"*/c/*.cmt) data=$(drill_commit_data_key "$key" "$stopped") || continue ;;
-      *) continue ;;
+      */l0/*.rseg) data=$key ;;
+      */c/*.cmt) data=$(drill_commit_data_key "$key" "$stopped") || data="" ;;
+      *) data="" ;;
     esac
-    grep -qF "$data"$'\t' "$dir/trailers.$tag" \
-      || python3 "$HERE/drill_s3.py" trailer "$bucket" "$data" >> "$dir/trailers.$tag" \
-      || say "trailer of $data not read"
-  done < "$dir/written.$tag"
-  drill_teardown_check "$dir/written.$tag" "$h" "$stopped" "$dir/trailers.$tag" "$EXEMPT_PATTERNS" \
-    > "$dir/teardown.$tag" || code=$?
-  sed 's/^/  /' "$dir/teardown.$tag"
-  if [ "$code" -eq 0 ]; then
-    echo "verdict $tag pass bad=0 checked=$(grep -c '^teardown-ok' "$dir/teardown.$tag" || true) exempt=$(grep -c '^teardown-exempt' "$dir/teardown.$tag" || true)"
+    if [ -n "$data" ] && ! grep -qF "$data"$'\t' "$dir/trailers.$tag"; then
+      python3 "$HERE/drill_s3.py" trailer "$bucket" "$data" >> "$dir/trailers.$tag" || say "trailer of $data not read"
+    fi
+    lm=$(awk -F'\t' -v k="$key" '$3 == k { print $4; exit }' "$dir/classes.$tag")
+    drill_data_version "$key" "$lm" "$h" "$stopped" "$dir/trailers.$tag" >> "$dir/versions.$tag" || true
+  done < "$dir/data-keys.$tag"
+  sed 's/^/  /' "$dir/versions.$tag"
+  echo "figure data_bad_version_$tag $(grep -c '^bad ' "$dir/versions.$tag" || true)" >> "$report"
+  c=0
+  drill_check_figure "$report" "data_bad_version_$tag" 0 0 || c=$?
+  row "$c" "data-version-$tag" "keys=$(grep -c . "$dir/data-keys.$tag" || true)"
+
+  cat "$dir/data-keys.$tag" "$dir/grace-keys.$tag" > "$dir/census-keys.$tag"
+  c=0
+  if [ -x "$CENSUS" ]; then
+    "$CENSUS" --endpoint "$S3_ENDPOINT" --bucket "$bucket" --tenant-hash-key-file "$RUN/tenant.key" \
+      --activated-unix-s "$fence_start" --fence-complete-unix-s "$fence" \
+      --keys "$dir/census-keys.$tag" > "$dir/census.$tag" 2>&1 || say "drill_census on $bucket exited non-zero (see $dir/census.$tag)"
+    grep -v '^key ' "$dir/census.$tag" | sed 's/^/  /'
+    drill_census_check "$dir/data-keys.$tag" "$dir/census.$tag" > "$dir/census-check.$tag" || true
+    drill_census_check "$dir/grace-keys.$tag" "$dir/census.$tag" > "$dir/census-grace.$tag" || true
+    n=$(grep -vc '^flagged ' "$dir/census-check.$tag" || true)
   else
-    echo "verdict $tag FAIL bad=$(grep -c '^teardown-bad' "$dir/teardown.$tag" || true) checked=$(grep -c '^teardown-ok' "$dir/teardown.$tag" || true)"
+    say "no drill_census binary at $CENSUS"
+    : > "$dir/census-check.$tag"
+    : > "$dir/census-grace.$tag"
+    n=$(grep -c . "$dir/data-keys.$tag" || true)
+    [ "$n" -gt 0 ] || n=missing
   fi
+  echo "figure data_not_flagged_$tag $n" >> "$report"
+  echo "figure grace_not_flagged_$tag $(grep -vc '^flagged ' "$dir/census-grace.$tag" || true)" >> "$report"
+  drill_check_figure "$report" "data_not_flagged_$tag" 0 0 || c=$?
+  drill_check_figure "$report" "grace_not_flagged_$tag" 0 1000000 > /dev/null || c=1
+  row "$c" "census-$tag" "data_keys=$(grep -c . "$dir/data-keys.$tag" || true) grace_keys=$(grep -c . "$dir/grace-keys.$tag" || true)"
 }
 
 phase_preflight() {
@@ -314,6 +371,8 @@ phase_preflight() {
     # The commit the main binary was built from: DRILL_MAIN_SHA when the
     # binary predates this checkout's HEAD.
     echo "stamp main_sha ${DRILL_MAIN_SHA:-$(git -C "$ROOT" rev-parse HEAD)}"
+    echo "stamp exempt $EXEMPT_PATTERNS"
+    echo "stamp classes $DRILL_CLASS_BANDS"
     if [ -x "$MAIN" ]; then
       sha256sum "$MAIN" | sed 's/^/stamp main_binary_sha256 /'
     else
@@ -404,14 +463,28 @@ phase_warm_fence() {
   fi
 }
 
+# A listing of the warm bucket while it runs, named by its Unix second; the
+# verdict chains every one of them, so a key written and then removed
+# between the fence listing and the stop is still seen if a snapshot fell
+# between the two.
+phase_warm_snap() {
+  load_creds
+  ls_bucket drill-warm "$RUN/warm/snap-$(date -u +%s).list"
+}
+
+# DRILL_WARM_EARLY=1 stops before horizon plus the scrub tail; the warm
+# observation row then fails on its own figures rather than being skipped.
 phase_warm_finish() {
   load_creds
-  local d=$RUN/warm horizon alerts_h finish now n
+  local d=$RUN/warm w horizon alerts_h finish now n c stopped
+  w=$(cat "$d/fence.epoch")
   horizon=$(cat "$d/horizon.ingest")
   alerts_h=$(cat "$d/horizon.alerts")
   finish=$(cat "$d/horizon.finish")
   now=$(date -u +%s)
-  [ "$now" -gt "$finish" ] || die "warm: horizon plus the scrub tail $(date -u -d "@$finish" +%T) not passed yet ($((finish - now)) s left)"
+  if [ "$now" -le "$finish" ] && [ "${DRILL_WARM_EARLY:-0}" != 1 ]; then
+    die "warm: horizon plus the scrub tail $(date -u -d "@$finish" +%T) not passed yet ($((finish - now)) s left)"
+  fi
   ls_bucket drill-warm "$d/after.list"
   # The driver stops first; the servers' own listing after that is the
   # running state their teardown is measured from.
@@ -421,20 +494,29 @@ phase_warm_finish() {
   stop_pid "$d/maintain.pid"
   sleep 5
   ls_bucket drill-warm "$d/teardown.list"
+  # Unix seconds of one width, so the glob's order is time order.
+  local snaps=("$d"/snap-*.list)
+  [ -e "${snaps[0]}" ] || snaps=()
   {
-    judge "$d" "$d/fenced.list" "$d/running.list" "$horizon" "$alerts_h" warm
-    # One full scrub rotation after the horizon must be observed, or the run
-    # did not exercise the exempt cursor path it claims to.
-    n=$(grep -c '^exempt fenced t/[^ ]*/maint/scrub/[^ ]* [^ ]* after$' "$d/exempt.warm" || true)
-    echo "figure warm_scrub_cursor_after_horizon $n" >> "$d/report"
-    if drill_check_figure "$d/report" warm_scrub_cursor_after_horizon 1 1000000; then
-      echo "verdict warm-scrub-rotation pass observed=$n"
-    else
-      echo "verdict warm-scrub-rotation FAIL observed=$n"
-    fi
-    judge_teardown "$d" drill-warm "$d/running.list" "$d/teardown.list" teardown
+    judge_run "$d" drill-warm warm "$(cat "$d/fence.start")" "$w" "$horizon" "$alerts_h" \
+      "$(drill_trust_limit "$w")" "$d/teardown.list" "$d/fenced.list" \
+      "${snaps[@]}" "$d/after.list" "$d/running.list"
+    stopped=$(cut -d' ' -f2 "$d/server.stop")
+    c=0
+    drill_warm_observation "$d/report.warm" "$d/classes.warm" "$horizon" "$WARM_TAIL_S" \
+      "$d/server.stop" "$d/maintain.stop" || c=1
+    row "$c" warm-observation "stop=$(date -u -d "@$stopped" +%FT%TZ) horizon=$(date -u -d "@$horizon" +%FT%TZ)"
   } | tee "$d/verdict"
   echo "DONE" > "$d/status"
+}
+
+# The cold restart's rows from its recorded listings. A process started after
+# the fence has no cached view, so the fence is its horizon and trust limit.
+judge_cold() {
+  local d=$RUN/cold c=$RUN/cold/restart w
+  w=$(cat "$d/fence.epoch")
+  judge_run "$c" "$COLD_BUCKET" cold "$(cat "$d/fence.start")" "$w" "$w" "$w" "$w" \
+    "$c/after.list" "$d/fenced.list" "$c/mid.list" "$c/running.list" | tee "$c/verdict"
 }
 
 phase_cold() {
@@ -471,14 +553,11 @@ phase_cold() {
   ls_bucket "$COLD_BUCKET" "$c/mid.list"
   sleep $((COLD_SECS - COLD_SECS / 2))
   stop_pid "$c/drive.pid"
+  ls_bucket "$COLD_BUCKET" "$c/running.list"
   stop_pid "$c/server.pid"
   stop_pid "$c/maintain.pid"
   ls_bucket "$COLD_BUCKET" "$c/after.list"
-  # A cold process has no cached view to trust, so its horizon is the fence.
-  {
-    judge "$c" "$d/fenced.list" "$c/mid.list" "$w" "$w" cold-mid
-    judge "$c" "$d/fenced.list" "$c/after.list" "$w" "$w" cold
-  } | tee "$c/verdict"
+  judge_cold
 }
 
 # One read-only query against a server, its JSON normalized (keys sorted,
@@ -597,7 +676,12 @@ phase_read() {
   for name in samples logs spans; do
     echo "figure read_rows_$name $(python3 -c 'import json,sys; t=open(sys.argv[1]).read().split("\n",1)[1]; print(json.loads(t)["data"]["rows"][0][0])' "$d/v033/sql_${name}_count")" >> "$d/report"
   done
+  # The pre-registered bands (samples 13, logs 6, spans 6 for a 60 s drive),
+  # then the same counts against what the driver saw accepted.
   {
+    drill_check_figure "$d/report" read_rows_samples 12 14 || echo "verdict read FAIL samples band"
+    drill_check_figure "$d/report" read_rows_logs 6 7 || echo "verdict read FAIL logs band"
+    drill_check_figure "$d/report" read_rows_spans 6 7 || echo "verdict read FAIL spans band"
     drill_check_figure "$d/report" read_rows_samples "$acc_m" $((acc_m + 2)) || echo "verdict read FAIL samples"
     drill_check_figure "$d/report" read_rows_logs "$acc_l" $((acc_l + 1)) || echo "verdict read FAIL logs"
     drill_check_figure "$d/report" read_rows_spans "$acc_s" $((acc_s + 1)) || echo "verdict read FAIL spans"
@@ -619,6 +703,9 @@ phase_verdict() {
   if [ "$(cat "$RUN/warm/status" 2> /dev/null)" = "NOT RUN" ]; then
     echo "verdict warm NOT RUN ($(grep ingest_utc "$RUN/warm/horizon"))"
   fi
+  for f in "$RUN/warm/horizon" "$RUN/warm/report.warm" "$RUN/cold/restart/report.cold" "$RUN/read/report"; do
+    [ -s "$f" ] && sed "s|^|$(basename "$(dirname "$f")")/$(basename "$f") |" "$f"
+  done
   for f in "$RUN/warm/verdict" "$RUN/cold/restart/verdict" "$RUN/read/verdict"; do
     if [ ! -s "$f" ]; then
       echo "verdict missing $f"
@@ -645,7 +732,10 @@ case "${1:-}" in
     phase_cold
     phase_read
     if [ "$(cat "$RUN/warm/status")" = RUNNING ]; then
+      tick=0
       while [ "$(date -u +%s)" -le "$(cat "$RUN/warm/horizon.finish")" ]; do
+        if [ $((tick % 10)) -eq 0 ]; then phase_warm_snap; fi
+        tick=$((tick + 1))
         sleep 60
       done
       phase_warm_finish
@@ -656,8 +746,13 @@ case "${1:-}" in
   start) phase_start ;;
   warm-start) phase_warm_start ;;
   warm-fence) phase_warm_fence ;;
+  warm-snap) phase_warm_snap ;;
   warm-finish) phase_warm_finish ;;
   cold) phase_cold ;;
+  cold-judge)
+    load_creds
+    judge_cold
+    ;;
   drive) drive "$2" "$3" ;;
   stop)
     for f in "$RUN"/*/drive.pid "$RUN"/*/*/drive.pid "$RUN"/*/server.pid "$RUN"/*/*/server.pid \

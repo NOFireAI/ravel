@@ -214,25 +214,33 @@ connection, a pushed-but-broken main).
   v0.33.0 server against isolated buckets on a local RustFS process (never
   a shared bucket), raises the compat fence with the
   `compat_fence_bucket` example of ravel-catalog, and lists the bucket
-  before and after to find every key a v0.33.0 process wrote into a
-  fenced prefix after its grace horizon. Phases: `preflight` (asset
-  sha256 and cosign check, stamps), `start`, `warm-start`, `warm-fence`,
-  `warm-finish` (refused until the horizon, which is the fence's hour
-  plus 3 h plus a 60 s request margin, and then one 61 min scrub rotation
-  have passed), `cold`, `read`, `all`, `verdict` and
-  `stop`. Every figure is checked present exactly once and inside its
-  band. Keys matching `EXEMPT_PATTERNS` at the top of the script
-  (admission snapshots and scrub cursors, which carry no data and which a
-  newer build reaps or overwrites) are recorded with their LastModified and never fail the
-  drill. Writes at process stop are recorded, and each data object, and
-  each commit record's data object, must carry the trailer v0.33.0 writes
-  (RSEG 7, RLOG 5, RSPAN 5). `verdict` exits 1 on a post-horizon fenced
-  write outside `EXEMPT_PATTERNS` by a running process, any such write
-  after the fence by a restarted process, a teardown write at another
-  version or with no version rule, no scrub cursor write after the
-  horizon, a zero positive-control prefix, a read diff between v0.33.0
-  and main, or a missing phase verdict. State goes to `DRILL_RUN` (default
-  `.dd-tools/drill-run`); the script header lists the other variables.
-  `scripts/compat/released-binary-drill.test.sh` runs the decision logic
-  (`drill-lib.sh`) on recorded listings in CI.
+  over time to find every key a v0.33.0 process wrote or removed under
+  the tenant after the fence. Phases: `preflight` (asset sha256 and
+  cosign check, stamps), `start`, `warm-start`, `warm-fence`, `warm-snap`
+  (one listing while the warm bucket runs; a key written and removed
+  between two listings is otherwise unseen, and `all` takes one every
+  10 min), `warm-finish` (refused until the ingest horizon, which is the
+  fence's hour plus 3 h plus a 60 s request margin, and then one 61 min
+  scrub rotation have passed; `DRILL_WARM_EARLY=1` stops sooner and fails
+  the warm observation row), `cold`, `cold-judge`, `read`, `all`,
+  `verdict` and `stop`. Every figure is checked present exactly once and
+  inside its band. Each post-fence event falls in exactly one class of
+  `drill_post_fence_class` in `drill-lib.sh`, and each class count is a
+  figure: `alerts-late`, `l0c-after-horizon`, `maintenance` and
+  `unclassified` must be zero; `root`, `exempt-advisory` (keys matching
+  `EXEMPT_PATTERNS` at the top of the script, and admission snapshot
+  removals), `prerequisite-only`, `alerts-grace`, `ingest-grace`,
+  `teardown-data` and `idem` are recorded. Every teardown data write and
+  idem write must carry the trailer v0.33.0 writes (RSEG 7, RLOG 5,
+  RSPAN 5; an idem object has no trailer rule and fails), and must be
+  flagged by main's `certify` census or late-write pass, run by the
+  `drill_census` example of `crates/ravel-compat-tests` (`DRILL_CENSUS`).
+  `verdict` also exits 1 on an ingest 2xx requested after the trust limit
+  (the fence's hour plus 2 h for a warm process, the fence for a cold
+  restart), a query 2xx requested after the fence, a zero
+  positive-control prefix, a read diff between v0.33.0 and main, a read
+  figure outside its band, or a missing phase verdict. State goes to
+  `DRILL_RUN` (default `.dd-tools/drill-run`); the script header lists
+  the other variables. `scripts/compat/released-binary-drill.test.sh`
+  runs the decision logic (`drill-lib.sh`) on recorded listings in CI.
 
