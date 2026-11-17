@@ -56,11 +56,13 @@
 //! length` ([`upper_bound`]). That formula leaves out the wire bytes the
 //! listing's own GETs hold while the catalog decodes: the open GET (the whole
 //! object up to 512 KiB, the 64 KiB footer tail above it) and the catalog
-//! sections' run. The report carries a bound on those ([`held_fetch_bound`])
-//! and their sum with the formula ([`listing_bound`]), and how far the peak
-//! lies above the formula. A listing under exactly the formula's figure is
-//! refused (the smoke test pins it), so the bound band is checked against
-//! [`listing_bound`]. [`check_report`] holds the bands: peak per sample in
+//! sections' run. The report carries those bytes ([`held_fetch_bound`]) and
+//! their sum with the formula ([`listing_bound`]), and how far the peak lies
+//! above the formula. A listing under exactly the formula's figure is refused
+//! (the smoke test pins it), so the bound band is checked against
+//! [`listing_bound`]; the search starts there, so the peak it reports is at or
+//! below that bound whenever a listing under it succeeds. [`check_report`]
+//! holds the bands: peak per sample in
 //! [`PEAK_PER_SAMPLE_BAND`], the peak at or below the listing bound, and the
 //! peak non-decreasing as samples per part grow across the caps. A figure
 //! outside its band, missing, or emitted twice is a failure.
@@ -113,7 +115,24 @@ pub const DEFAULT_SCRAPE_SECS: i64 = 15;
 pub const MIN_FULL_PARTS: usize = 2;
 
 /// The band the peak charge per sample must fall in, in bytes.
-pub const PEAK_PER_SAMPLE_BAND: (f64, f64) = (1.0, 200.0);
+///
+/// The bench exists to show that every sample's provenance is charged in full:
+/// [`PROVENANCE_COLUMN_BYTES_PER_SAMPLE`] (64 B) of decoded columns plus a
+/// [`SAMPLE_PROVENANCE_BYTES`] (32 B) record, 96 B a sample, on top of the
+/// catalog decode and the wire bytes the GETs hold. A listing under exactly
+/// [`upper_bound`] is refused, so with the provenance charged the peak is above
+/// 96 B a sample, and the floor is that 96 B. Measured 2026-11-17 with this
+/// bin: 98.30 B a sample at the
+/// 1 MiB cap and 97.25, 97.06 and 97.03 B at 4, 16 and 64 MiB (the default
+/// caps, 2,500 series over 72 h), and 107.98 and 104.91 B at the smoke test's
+/// 64 and 256 KiB caps (120 series over 8 h), where the catalog decode and the
+/// held fetch bytes amortise over fewer samples. Charging only the 32 B record
+/// would drop those by 64 B, to 33.0 to 44.0 B, under the floor; charging no
+/// provenance would leave the catalog and fetch bytes alone, at most 12 B. The
+/// ceiling catches the provenance charged twice, which would add 96 B, to
+/// 193.0 to 204.0 B; 130 B clears the measured 107.98 B and stays well below
+/// that.
+pub const PEAK_PER_SAMPLE_BAND: (f64, f64) = (96.0, 130.0);
 
 /// The figures every cap entry of the report carries, each exactly once.
 pub const CAP_FIGURES: [&str; 12] = [
@@ -216,6 +235,17 @@ impl RunConfig {
             return fail(format!(
                 "--history-hours ({}) must be a multiple of --flush-hours ({})",
                 self.history_hours, self.flush_hours
+            ));
+        }
+        // A flush shorter than one scrape step holds no step, so `build_bucket`'s
+        // `step_by(steps_per_flush())` would panic on a zero step. This also
+        // covers `steps()`, which `history_hours >= 2 * flush_hours` keeps at
+        // least twice `steps_per_flush()`.
+        if self.steps_per_flush() == 0 {
+            return fail(format!(
+                "--flush-hours ({}) is shorter than one --scrape-secs ({}) step, so a flush \
+                 holds no scrape",
+                self.flush_hours, self.scrape_secs
             ));
         }
         if self.caps.is_empty() || self.caps.contains(&0) {
@@ -621,7 +651,7 @@ pub struct PartShape {
     /// The decoded length of the catalog sections `SegmentFetcher` reserves
     /// before a catalog decode, each clamped to the reader's section ceiling.
     pub catalog_decode_bytes: u64,
-    /// An upper bound on the wire bytes the listing's GETs hold while the
+    /// The wire bytes the listing's GETs hold while the
     /// catalog decodes ([`held_fetch_bound`]).
     pub held_fetch_bytes: u64,
     pub samples: u64,
@@ -692,15 +722,16 @@ pub async fn part_shape(
     })
 }
 
-/// An upper bound on the wire bytes `SegmentFetcher` holds reserved while it
-/// decodes a whole-SERIES_META catalog, from the object's layout and the
-/// fetcher's default read shape. `open_segment` reads an object of at most
-/// [`DEFAULT_WHOLE_OBJECT_THRESHOLD`] whole, and otherwise its last
-/// [`DEFAULT_SUFFIX_LEN`] bytes plus the footer when the footer starts before
-/// that tail. `decode_selected` then fetches LABEL_DICT, SERIES_IDS and
-/// SERIES_META as one coalesced run, which lies inside the span from the first
-/// section's start to the last one's end (`catalog_sections`, as
-/// `(start, end)`). Both stay held until the decode returns.
+/// The wire bytes `SegmentFetcher` holds reserved while it decodes a
+/// whole-SERIES_META catalog, from the object's layout and the fetcher's
+/// default read shape. `open_segment` reads an object of at most
+/// [`DEFAULT_WHOLE_OBJECT_THRESHOLD`] whole. A larger one it reads as its last
+/// [`DEFAULT_SUFFIX_LEN`] bytes, plus a second GET from the footer's start to
+/// the object's end when the footer starts before that tail. `decode_selected`
+/// then fetches whichever of LABEL_DICT, SERIES_IDS and SERIES_META
+/// (`catalog_sections`, as `(start, end)`) those reads do not already cover,
+/// as one run from the first such section's start to the last one's end. All
+/// of it stays held until the decode returns.
 pub fn held_fetch_bound(
     object_size: u64,
     footer_offset: u64,
@@ -709,14 +740,24 @@ pub fn held_fetch_bound(
     if object_size <= DEFAULT_WHOLE_OBJECT_THRESHOLD {
         return object_size;
     }
-    let tail = DEFAULT_SUFFIX_LEN.min(object_size);
-    let chase = object_size
-        .saturating_sub(footer_offset)
-        .saturating_sub(tail);
-    let start = catalog_sections.iter().map(|r| r.0).min().unwrap_or(0);
-    let end = catalog_sections.iter().map(|r| r.1).max().unwrap_or(0);
-    tail.saturating_add(chase)
-        .saturating_add(end.saturating_sub(start))
+    let tail_start = object_size.saturating_sub(DEFAULT_SUFFIX_LEN);
+    let (held_from, chase) = if footer_offset < tail_start {
+        (footer_offset, object_size - footer_offset)
+    } else {
+        (tail_start, 0)
+    };
+    let missing = || {
+        catalog_sections
+            .iter()
+            .filter(|&&(start, end)| !(held_from <= start && end <= object_size))
+    };
+    let run = match (missing().map(|r| r.0).min(), missing().map(|r| r.1).max()) {
+        (Some(start), Some(end)) => end.saturating_sub(start),
+        _ => 0,
+    };
+    (object_size - tail_start)
+        .saturating_add(chase)
+        .saturating_add(run)
 }
 
 /// The upper bound issue #4393 states for a listing's charge over one part:
@@ -826,7 +867,9 @@ where
             ListingChargeError::Setup("no budget limit up to u64::MAX succeeds".to_string())
         })?;
     }
-    while hi - lo > hi / 100 {
+    // The 1 % step floors to zero once `hi` drops below 100 bytes, which would
+    // leave `mid == lo` and loop forever; keep it at least one byte.
+    while hi - lo > (hi / 100).max(1) {
         let mid = lo + (hi - lo) / 2;
         probes += 1;
         if listing(mid).await? {
@@ -896,7 +939,10 @@ pub async fn measure_cap(
     let upper = upper_bound(&shape);
     let bound = listing_bound(&shape);
     let store = &compacted.store;
-    let search = minimal_budget(upper, |limit| {
+    // Starting at the listing bound makes it the search's first probe, so when
+    // it succeeds the reported peak is at or below it, and `check_report` can
+    // compare the two directly.
+    let search = minimal_budget(bound, |limit| {
         listing_succeeds(store, part, shape.series, limit)
     })
     .await?;
@@ -1064,8 +1110,9 @@ pub fn report_table(report: &RunReport) -> String {
 ///
 /// - peak per sample in [`PEAK_PER_SAMPLE_BAND`];
 /// - the largest refused limit below the peak and within 1 % of it;
-/// - the peak at or below [`listing_bound`]: a listing under exactly that
-///   limit succeeded, and no limit the search refused reaches it;
+/// - the peak at or below [`listing_bound`], compared directly, beside a
+///   listing under exactly that bound succeeding and no refused limit
+///   reaching it;
 /// - the peak non-decreasing as samples per part grow.
 ///
 /// Returns every violation.
@@ -1140,6 +1187,11 @@ pub fn check_report(text: &str, caps: &[u64]) -> Result<(), Vec<String>> {
                     failures.push(format!(
                         "cap {cap}: refused at {refused} B and succeeded at {peak} B is not a \
                          1 % bracket"
+                    ));
+                }
+                if peak > bound {
+                    failures.push(format!(
+                        "cap {cap}: the peak {peak} B is above the listing bound {bound} B"
                     ));
                 }
                 if refused >= bound {

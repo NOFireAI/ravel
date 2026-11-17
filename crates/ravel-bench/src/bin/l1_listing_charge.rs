@@ -22,7 +22,8 @@
 //! - the wire bytes the listing's GETs hold during the decode, which that
 //!   formula leaves out, and the listing bound, the formula plus those bytes.
 //!
-//! The bands are peak per sample in [1, 200] B, the peak at or below the
+//! The bands are peak per sample in [96, 130] B (the full 96 B of per-sample
+//! provenance must be charged, and not doubled), the peak at or below the
 //! listing bound, and the peak non-decreasing as samples per part grow. A cap
 //! that closes fewer than two full parts is refused; raise `--history-hours`.
 //!
