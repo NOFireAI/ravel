@@ -2611,6 +2611,15 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // sweep`, which runs under this credential: it lists a tenant's Parquet
     // table manifests and deletes the superseded ones, and reads none of them.
     // Asserted by maintain_template_covers_every_parquet_sweep_call.
+    //
+    // sys/maintain/certify/* appears on the delete axis because the maintain
+    // process's own scheduled compat job also finishes a certify run
+    // (`services/ravel-server/src/compat_maintain.rs`, which calls
+    // `ravel_maintain::certify`), and certify's finalization deletes the
+    // store-wide census cursor (`delete_cursor`,
+    // `crates/ravel-maintain/src/compat_certify.rs`). The get and put are
+    // already covered by the wider `sys/maintain/*` read and write grants.
+    // Asserted by maintain_template_covers_the_certify_cursor.
     ExpectedRolePatterns {
         role: "maintain",
         list_prefixes: &[
@@ -2720,6 +2729,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/query/workers/*",
             "quarantine/t/*/*/l0/*",
             "t/*/pq/t/*",
+            "sys/maintain/certify/*",
         ],
         // Both delete operations, and the same two the Deny names. Maintain is
         // the only role where that identity is load-bearing rather than
@@ -2742,7 +2752,10 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // parquet-grant's record write and bucket probe
     // (admin_template_covers_every_parquet_grant_call), and the
     // sys/maintain/certify/* put and delete are `compat certify`'s store-wide
-    // census cursor (admin_template_covers_the_certify_cursor).
+    // census cursor (admin_template_covers_the_certify_cursor), and
+    // t/*/a/alert-lease is the one grant `compat activate`'s fence walk needs
+    // for `ravel_alerting::park_lease` to park every tenant's alert lease
+    // under the admin credential (admin_template_covers_the_parked_lease_write).
     ExpectedRolePatterns {
         role: "admin",
         list_prefixes: &["t/*", "sys/*"],
@@ -2763,6 +2776,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/config",
             "t/*/pq/grants",
             "sys/pq-probe/*",
+            "t/*/a/alert-lease",
             PROV_M_PATTERN,
             PROV_L_PATTERN,
             PROV_S_PATTERN,
@@ -5803,17 +5817,86 @@ fn admin_template_covers_the_certify_cursor() {
              Put: {puts:?}; delete: {deletes:?}"
         );
     }
-    // Maintain cannot delete the cursor (its delete grants stop at
-    // `sys/maintain/workers/*` and `sys/query/workers/*`); its PutObject
-    // grant already covers the whole `sys/maintain/*` tree (`MaintainWrite`,
-    // deploy/iam/maintain.json) for unrelated reasons predating this fix, so
-    // the put axis is not checked here.
+    // Maintain also deletes the cursor: its own scheduled compat job finishes
+    // a certify run too (`services/ravel-server/src/compat_maintain.rs:304-307`
+    // calls `ravel_maintain::certify`, not just `ravel-cli compat certify`
+    // under Admin), and certify's finalization deletes the cursor
+    // unconditionally on both paths. Its PutObject grant already covers the
+    // whole `sys/maintain/*` tree (`MaintainWrite`, deploy/iam/maintain.json)
+    // for unrelated reasons predating this fix, so the put axis is not
+    // checked here.
     let maintain = load_policy("maintain");
     let maintain_deletes = delete_key_patterns(&maintain, "Allow");
     assert!(
-        !maintain_deletes.iter().any(|p| glob_matches(p, &cursor)),
-        "maintain: a delete Allow reaches the certify cursor {cursor:?}; only \
-         ravel-cli under Admin runs compat certify. Delete: {maintain_deletes:?}"
+        maintain_deletes.iter().any(|p| glob_matches(p, &cursor)),
+        "maintain: no delete Allow reaches the certify cursor {cursor:?}; the \
+         maintain process's own scheduled compat job finishes a certify run \
+         too (compat_maintain.rs calls ravel_maintain::certify), and a \
+         finalization that cannot delete the cursor leaves it behind for \
+         every later pass to read as its own stale start. Delete: \
+         {maintain_deletes:?}"
+    );
+    assert_reaches_nothing_outside(
+        "maintain",
+        "delete Allow",
+        &maintain_deletes,
+        &cursor,
+        "sys/maintain/certify/",
+    );
+}
+
+/// `compat activate`'s fence walk parks every tenant's alert lease when
+/// `rlog` is activated above the baseline (`crates/ravel-maintain/src/compat_activate.rs`,
+/// the `lease_tenants` loop that calls `ravel_alerting::park_lease`). It runs
+/// under the admin credential (`ravel-cli compat activate`), and
+/// `park_lease` (`crates/ravel-alerting/src/lease.rs`) makes exactly two kinds
+/// of store call on the lease key: a GET, then a PUT, either `CreateIfAbsent`
+/// on a `NotFound` lease or `CasVersion` to replace an unparked or
+/// insufficiently-parked one. It never deletes the lease.
+#[test]
+fn admin_template_covers_the_parked_lease_write() {
+    let admin = load_policy("admin");
+    let gets = key_patterns_for(&admin, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&admin, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&admin, "Allow");
+    let lease = alert_lease_key();
+
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &lease)),
+        "admin: no GetObject Allow reaches the alert lease {lease:?}, which \
+         park_lease reads before every park attempt. Grants: {gets:?}"
+    );
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &lease)),
+        "admin: no PutObject Allow reaches the alert lease {lease:?}, which \
+         park_lease writes on a NotFound create or a CasVersion replace. \
+         Every compat activate fence walk over rlog is refused there. \
+         Grants: {puts:?}"
+    );
+    assert!(
+        !deletes.iter().any(|p| glob_matches(p, &lease)),
+        "admin: a delete Allow reaches the alert lease {lease:?}; park_lease \
+         never deletes it. Grants: {deletes:?}"
+    );
+    // No narrowness check on the GET side: AdminRead already grants
+    // s3:GetObject on the whole "t/*" tree, predating this fix, so the lease
+    // key is reached as part of that existing broad read grant rather than a
+    // key-specific one.
+    assert_reaches_nothing_outside("admin", "s3:PutObject Allow", &puts, &lease, &lease);
+
+    // Gateway never runs compat activate and must gain nothing from this fix.
+    // Query already reads and writes the lease for its own alert evaluator
+    // (query_template_covers_every_alert_evaluator_call), which predates this
+    // change and is not what is being checked here.
+    let gateway = load_policy("gateway");
+    let gateway_gets = key_patterns_for(&gateway, &["s3:GetObject"], Some("Allow"));
+    let gateway_puts = key_patterns_for(&gateway, &["s3:PutObject"], Some("Allow"));
+    assert!(
+        !gateway_gets.iter().any(|p| glob_matches(p, &lease))
+            && !gateway_puts.iter().any(|p| glob_matches(p, &lease)),
+        "gateway: a GetObject or PutObject Allow reaches the alert lease \
+         {lease:?}; gateway runs no compat activate and no alert evaluator. \
+         Get: {gateway_gets:?}; put: {gateway_puts:?}"
     );
 }
 
@@ -7133,11 +7216,14 @@ fn deletable_reads_without_a_list_grant_per_server_role() {
     for (reader, expected) in [
         ("gateway", idem_witnesses),
         ("query", Vec::new()),
-        // `AdminCertifyCursor` (deploy/iam/admin.json) is a new deleter of
+        // `AdminCertifyCursor` (deploy/iam/admin.json) is a deleter of
         // `sys/maintain/certify/*`; maintain already reads the whole
         // `sys/maintain/*` tree (`MaintainRead`) but its list grants cover
         // only `sys/maintain/workers/*` and `sys/maintain/memo/*`, not the
-        // certify cursor, so the cursor now joins this role's existing gap.
+        // certify cursor, so the cursor joins this role's existing gap. This
+        // holds even now that `MaintainDelete` also deletes the cursor
+        // itself: `others` below excludes the reader, so maintain's own new
+        // grant does not remove the entry, only admin's does.
         (
             "maintain",
             vec![
