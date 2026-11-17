@@ -459,7 +459,9 @@ and 31.4 GB for a logs day, which A3 forbids. Declaring a key-index field
 for a tenant with the switch on is therefore followed by the repair over
 its sealed days. The repair builds in one pass today, about 6.8 GB of
 pairs for a logs day, over the 2 GB band; #4018 gives it the pair budget
-(done: see the repair pair-budget amendment at the end).
+(done: see the repair pair-budget amendment at the end; the 6.8 GB figure
+was a prediction, never measured, see the measured repair amendment at
+the end).
 
 ### Acceptance (added rows; predicted, a figure outside its band is a miss)
 
@@ -764,7 +766,9 @@ Date: 2026-11-16. "Decision 2, clarified", in the multi-day lookups
 amendment, says the `--rebuild-key-index`
 repair that follows a new key-index field's declaration builds a sealed
 day in one pass, about 6.8 GB of pairs for a logs day, over the 2 GB RSS
-band. That is retired. The repair (`Catalog::rebuild_key_index`) runs the
+band. That is retired; the 6.8 GB figure was itself a prediction, see the
+measured repair amendment at the end for the measured one-pass RSS. The
+repair (`Catalog::rebuild_key_index`) runs the
 fold's leaf build under `key_index_build_max_pairs`, in the same passes,
 one part at a time, and `ravel-cli catalog fold --rebuild-key-index` takes
 that budget from `--key-index-build-max-pairs` (default 8,000,000).
@@ -786,6 +790,37 @@ about 30.2 GB of section bytes per logs day ("Two costs the decision did
 not count" gives the 552 entries and the 2.19 MB a read). The repair is
 explicit and operator-driven, not a fold, so A3, which bounds the fold,
 does not apply to it. ADR-3692's pair-budget repair amendment states
-the same bound.
+the same bound. The measured repair amendment at the end restates the
+pass count, GET count and section bytes above as measured against real
+S3.
 
 Refs: #4018, #4297
+
+## Amendment (issue #4350): the pair-budget repair measured, and the superseded one-pass RSS corrected
+
+<!-- amendment-applies: sections="Amendment (issue #3939, multi-day lookups): the carry source, retention under leaf-bearing parts, and the week merge gate|Amendment (issues #4018 and #4297): the repair builds under the pair budget" pointer="measured repair amendment" -->
+
+Date: 2026-11-17. Real S3, c6a.4xlarge, main a8a3be09d. One sealed logs
+part, E = 548 entries, request_id 100,000,000 and trace_id 20,000,000
+pairs, both fields missing (#4347 comment 6942022692).
+
+At the default budget (8,000,000): 25 passes (request_id 25, trace_id
+5), 27,400 ranged GETs (13,700 footer + 13,700 section), 28,820,377,200 B
+of section reads (2,103,677 B a read), 30 leaf PUTs, 1,309,552,455 B of
+leaves, peak RSS 664,260,608 B, wall 589.4 s. At 16,000,000: 13 passes,
+14,248 GETs, 14,986,596,144 B, 16 leaf PUTs, peak RSS 1,238,745,088 B,
+wall 426.4 s. This measures the pair-budget repair amendment's predicted
+25 passes, 27,600 GETs and 30.2 GB of section bytes at E = 552; the
+measured entry count and per-read size differ slightly from that
+prediction's basis.
+
+Spans, E = 800, trace_id only: 3 passes at 8,000,000 (581,789,508 B of
+section reads, peak RSS 864,022,528 B, wall 70.4 s) and 2 passes at
+16,000,000 (387,859,672 B, peak RSS 1,685,831,680 B, wall 52.5 s).
+
+"Decision 2, clarified"'s "about 6.8 GB of pairs" for the retired
+one-pass repair was itself a prediction, never measured. The real
+one-pass repair (pre-#4018/#4297) measured 8.83 GB RSS for logs and
+2.21 GB for spans (#3692 comment 6700944105).
+
+Refs: #4350, #4347

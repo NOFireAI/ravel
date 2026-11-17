@@ -1954,8 +1954,10 @@ pins it: 40 pairs of one field under a budget of 8 build in 5 passes, each
 holding 8 pairs, a peak of 9 with the pair placed before a cut, every
 section read in each pass (40 ranged GETs for 4 entries), and leaves byte
 for byte a fold's at the same budget. A repair that built in one pass with
-no budget, holding every section read of its batch whole, would hold about
-6.8 GB of pairs for a logs day (ADR-3939, "Decision 2, clarified").
+no budget, holding every section read of its batch whole, was predicted to
+hold about 6.8 GB of pairs for a logs day (ADR-3939, "Decision 2,
+clarified"); the real one-pass repair measured 8.83 GB RSS for logs and
+2.21 GB for spans (ADR-3692, the measured repair amendment).
 At the default budget the same day part, two fields at a share of
 4,000,000, holds at most 8,000,002 pairs when no key8 run exceeds a share,
 about 704 MB at the 88 B upper-bound estimate above, plus what the budget
