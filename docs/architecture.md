@@ -147,8 +147,9 @@ the statically known tenants, and `sys/gc`. `start` then reads the
 reads refuses to start when its answer is wrong.
 
 A store that is still coming up does not count as a wrong answer. A read that
-fails with a transient store error is retried with exponential backoff from
-100 ms to 2 s, with jitter. Each retry logs one warning that names the read,
+fails with a transient store error is retried. The wait between attempts
+doubles from 100 ms to a 2 s cap, and jitter draws each wait between half and
+all of that step. Each retry logs one warning that names the read,
 the attempt number and the error. Retrying stops at `--startup-store-deadline`
 (default `15s`), which is measured from process start and shared by every
 read. Once it has passed, a transient failure refuses to start, and the error

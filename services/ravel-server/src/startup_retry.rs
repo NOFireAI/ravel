@@ -563,6 +563,67 @@ mod tests {
         assert!(clock.sleeps().is_empty());
     }
 
+    #[derive(Clone)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn each_retry_logs_one_warning_with_site_attempt_and_error() {
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = CapturedLog(buffer.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let clock = Arc::new(ManualClock::default());
+        let mut calls = 0u32;
+        retry_on(clock)
+            .run(
+                "sys/example",
+                || {
+                    calls += 1;
+                    let failing = calls <= 2;
+                    let call = calls;
+                    async move {
+                        if failing {
+                            Err(StoreError::Transient(format!("blip {call}")))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+                store_error_is_transient,
+            )
+            .await
+            .expect("succeeds on the third attempt");
+
+        let logged = String::from_utf8(buffer.lock().expect("log lock").clone()).expect("utf-8");
+        let warnings: Vec<&str> = logged.lines().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 2, "{logged}");
+        for (i, line) in warnings.iter().enumerate() {
+            let attempt = i + 1;
+            assert!(line.contains("site=\"sys/example\""), "{line}");
+            assert!(line.contains(&format!("attempt={attempt}")), "{line}");
+            assert!(
+                line.contains(&format!("error=transient error: blip {attempt}")),
+                "{line}"
+            );
+        }
+    }
+
     #[test]
     fn the_deadline_flag_defaults_to_15s_and_accepts_zero() {
         use crate::config::Cli;
