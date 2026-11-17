@@ -79,6 +79,17 @@
 #     -> 0 (pins: both out of scope)
 #   a struct with `where T: Fn(u64) -> u64` gains a field -> 1
 #     (catches: a `(` in the header abandoning the struct)
+#   a trait impl added beside a pre-fork inherent fn of the same name, trait
+#     unchanged, on a one-line and on a multi-line header with a where
+#     clause -> 0 (catches: trait-impl methods read as changed functions; a
+#     trait impl recognised only on a one-line header)
+#   an inherent impl with `for<'a>` in its generics or its where clause whose
+#     method gains a parameter -> 1 (catches: a higher-ranked `for` read as
+#     a trait impl; every impl body skipped)
+#   the trait declaration's method gains a parameter -> 1 (catches: the
+#     trait block skipped along with its impls)
+#   an inherent change after a trait impl in the same file -> 1 (catches:
+#     the body skip running past the impl's closing brace)
 #   no `.rs` change on the branch -> 0 with the "checked" line
 #   base defaulted (no second argument) -> origin/main is used
 #   base `main`, not <remote>/<branch> -> resolved locally and checked
