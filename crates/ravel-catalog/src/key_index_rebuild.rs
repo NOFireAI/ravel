@@ -9,8 +9,12 @@
 //! Each field holds at most `max(share, R) + 1` pairs at a time, where
 //! `share = max(1, key_index_build_max_pairs / fields)` and `R` is the
 //! field's largest key8 run, so with no run over the share the part holds at
-//! most `key_index_build_max_pairs + fields` pairs, whatever its size. Each
-//! pass reads every entry's section again. The share divides the budget by
+//! most `key_index_build_max_pairs + fields` pairs, whatever its size. The
+//! repair keeps each entry's KEY_IDX section from its first read for the
+//! part's later passes, in part order while the kept bytes stay within
+//! `CatalogConfig::key_index_repair_hold_cap` and the memory budget grants
+//! them; each later pass reads every other entry's section again (issue
+//! #4376). The share divides the budget by
 //! the fields built, so a rebuilt leaf is byte-identical to the one a fold
 //! with `build_key_index_leaves` on writes for the same part at the same
 //! budget only when the rebuild builds the same fields the fold built. It
@@ -409,7 +413,9 @@ impl Catalog {
     /// undeclared `options.field`, before HEAD is read.
     ///
     /// Each part is read once and verified against its `blake3`; each of its
-    /// entries costs the fold's ranged KEY_IDX reads once per pass. The leaves
+    /// entries costs the fold's ranged KEY_IDX reads once per pass, or once
+    /// for the part when its section is held
+    /// ([`crate::CatalogConfig::key_index_repair_hold_bytes`]). The leaves
     /// are built and PUT by the fold's own build under the fold's key layout
     /// and pair budget, [`crate::CatalogConfig::key_index_build_max_pairs`]
     /// (see the module doc for the bound), then HEAD is CAS-published with
@@ -2694,10 +2700,11 @@ mod tests {
     /// and 12 section GETs. The held bytes peak at the 2 sections' sum, at
     /// the cap, and the leaves are byte for byte the cap-0 run's.
     ///
-    /// DISTINGUISHING: an all-or-nothing hold, which drops the entries
-    /// already held once one does not fit, reads 20 + 20 and peaks at 0
-    /// after the first pass; a hold that ignores the cap holds all 4 and
-    /// reads 4 + 4.
+    /// DISTINGUISHING: an all-or-nothing hold, which also drops the entries
+    /// already held once one does not fit (clearing `by_ordinal` and
+    /// `held_bytes` in `KeyIndexSectionHold::offer`'s over-cap branch),
+    /// reads 20 + 20; a hold that ignores the cap (the `total <= self.cap`
+    /// filter removed) holds all 4 and reads 4 + 4.
     #[tokio::test]
     async fn a_cap_for_two_sections_holds_the_first_two_and_rereads_the_rest() {
         let unheld = forty_pair_rebuild_holding(Some(0), u64::MAX).await;
@@ -2752,8 +2759,9 @@ mod tests {
     /// reads the other 2 in every pass, exactly as under a cap of those 2,
     /// publishes the same leaves, and leaves nothing reserved.
     ///
-    /// FLIP: hold a section without reserving it (skip the `reserve_decoded`
-    /// call in `KeyIndexSectionHold::offer`) and all 4 are held: 4 + 4 GETs.
+    /// FLIP: hold a section without charging it (reserve 0 bytes rather than
+    /// its length in `KeyIndexSectionHold::offer`) and all 4 are held: 4 + 4
+    /// GETs.
     #[tokio::test]
     async fn a_refused_hold_reservation_falls_back_to_rereading() {
         let unheld = forty_pair_rebuild_holding(Some(0), u64::MAX).await;
@@ -2777,7 +2785,8 @@ mod tests {
     ///
     /// FLIP: drop `self.0.release()` from `ReleaseSectionHold::drop` and the
     /// log reads the 4 sections' bytes and 4 sections still held after the
-    /// build.
+    /// build. The same flip fails the lost-CAS test's two-part batch, whose
+    /// second part then decodes the first part's held sections.
     #[tokio::test]
     async fn a_failed_build_releases_the_held_sections() {
         let unheld = forty_pair_rebuild_holding(Some(0), u64::MAX).await;
