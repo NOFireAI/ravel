@@ -454,13 +454,13 @@ grant names the one key or prefix the calls use:
 | `sys/maintain/workers/*` | | | list, get, put, delete | |
 | `sys/maintain/memo/*` | | | list, get, put | |
 | `sys/maintain/claims/compaction/*` | | | get, put | |
-| `sys/maintain/certify/*` | | | | put, delete |
+| `sys/maintain/certify/*` | | | get, delete | put, delete |
 | `sys/query/workers/*` | | list, get, put | list, delete | |
 | `admission/query/*` | | list, get, put | | |
 | `t/*/config` | get | get | get | put |
 | `t/*/enc` | get, put | get, put | get, put | |
 | `t/*/m/meta` | get, put | get | | |
-| `t/*/a/alert-lease` | | get, put | | |
+| `t/*/a/alert-lease` | | get, put | | put |
 | `t/*/a/state/latest` | | get, put | get | |
 | `t/*/*/admission/*` | list, get, put | | | |
 | `t/????????????????????????????????/?/admission/*` | delete | | | |
@@ -494,6 +494,8 @@ the call groups below:
 | `ravel-cli parquet repair` (`crates/ravel-pqtable/src/repair.rs`): lists one table's `t/<tenant_hash>/pq/t/<table>/v/` keys, or with `--stray` the tenant's `t/<tenant_hash>/pq/t/` keys under no valid table name, and with `--delete` or `--delete-version` deletes the flagged, stray or named manifest key, then with `--stray` lists again; it never reads a manifest, since Maintain cannot | Maintain credential | `s3:ListBucket`, `s3:DeleteObject` | `MaintainList` `s3:prefix` `t/*/pq/t/*`; `MaintainDelete` `t/*/pq/t/*` |
 | The admission reconcile's `reap_keys` (`crates/ravel-ingest/src/reconcile.rs`) deletes the snapshots `t/<tenant_hash>/<signal>/admission/<process_id>.snapshot` of processes past the reap horizon | `gateway`, `all` | `s3:DeleteObject` | `GatewayAdmissionDelete` `t/????????????????????????????????/?/admission/*` |
 | `ravel-cli compat certify` keeps a store-wide census cursor at `sys/maintain/certify/<family>/cursor` (`certify_cursor_key`, `crates/ravel-maintain/src/compat_certify.rs`): `put_certify_cursor` PUTs it every pass (`CreateIfAbsent` for a fresh census, else `CasVersion`), and `delete_cursor` GETs and DELETEs it once the certificate and floor raises are written | Admin | `s3:PutObject`, `s3:DeleteObject` | `AdminCertifyCursor` `sys/maintain/certify/*` (the read is `AdminRead` `sys/*`) |
+| The maintain process's own scheduled compat job also finishes a certify run (`services/ravel-server/src/compat_maintain.rs:304-307` calls `ravel_maintain::certify`), whose finalization runs the same `delete_cursor` GET and DELETE as the CLI path | `maintain`, `all` | `s3:GetObject`, `s3:DeleteObject` | `MaintainDelete` `sys/maintain/certify/*` (the read is already in `MaintainRead` `sys/maintain/*`) |
+| `compat activate`'s fence walk parks every tenant's alert lease when `rlog` is activated above the baseline (`ravel_alerting::park_lease`, called from `crates/ravel-maintain/src/compat_activate.rs` around line 485), under the admin credential (`ravel-cli compat activate`): a GET, then a PUT, either `CreateIfAbsent` on a `NotFound` lease or `CasVersion` to replace one; it never deletes the lease | Admin | `s3:GetObject`, `s3:PutObject` | `AdminRead` `t/*` (the get); `AdminWrite` `t/*/a/alert-lease` (the put) |
 
 The last row lists only prefixes; nothing below `t/*/a/` but the memo is a
 control-plane key, and the alert data objects and commit records the evaluator
@@ -538,7 +540,13 @@ Without the certify cursor write, `compat certify` is refused at its first
 pass on a census that does not finish in one run. Without the delete,
 `delete_cursor` logs a warning rather than failing the run, but the cursor
 it could not remove stays behind for the next run to read as its own stale
-start, instead of a fresh census.
+start, instead of a fresh census. Without the maintain role's own delete on
+the certify cursor, the scheduled compat job's own finalization hits the
+same stale-cursor warning every pass the CLI path's fix did not cover.
+Without the admin alert-lease grants, `compat activate`'s fence walk is
+refused at its first `park_lease` call and no tenant's alert lease is parked,
+so a pre-baseline evaluator keeps evaluating against a fence the activation
+was meant to park it behind.
 
 No server role may write `sys/auth`: the only production writers are
 `ravel-cli` under Admin and the operator, which uses the shared credential
