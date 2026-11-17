@@ -6157,7 +6157,9 @@ impl Catalog {
                                     .ok()
                                     .and_then(|stored| canonical_head_digest(&stored).ok())
                                     .is_some_and(|stored| stored == head_digest),
-                                Err(_) => false,
+                                Err(StoreError::NotFound) => false,
+                                // A failed read cannot tell.
+                                Err(_) => true,
                             },
                         "catalog: a fold reports as folded only a HEAD the store holds",
                         std::collections::BTreeMap::from([

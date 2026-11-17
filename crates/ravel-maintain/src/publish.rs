@@ -422,14 +422,28 @@ async fn resolve_already_exists(
             .put(record_key, our_payload.clone(), PutOptions::default())
             .await?;
     }
-    let outcome =
-        resolve_against_winner(store, record_key, &existing.data, our_hash, our_parts, ledger, compat)
-            .await;
-    // The record the store holds after this attempt, not the one it fetched.
+    let outcome = resolve_against_winner(
+        store,
+        record_key,
+        &existing.data,
+        our_hash,
+        our_parts,
+        ledger,
+        compat,
+    )
+    .await;
+    // The record the store holds after this attempt, not the one it fetched,
+    // unless the fetched record is byte-equal to ours: nothing this attempt
+    // writes can then change it. A record a later sweep removed was not
+    // replaced, and a failed read cannot tell.
     ravel_invariant::inv_always!(
-        match store.get(record_key, GetRange::Full).await {
-            Ok(after) => after.data == existing.data,
-            Err(_) => false,
+        existing.data == *our_payload || {
+            let after = store.get(record_key, GetRange::Full).await;
+            note_get(ledger, RequestPhase::Publish, &after);
+            match after {
+                Ok(after) => after.data == existing.data,
+                Err(_) => true,
+            }
         },
         "catalog: a published compaction record is never replaced",
         std::collections::BTreeMap::from([
@@ -843,7 +857,11 @@ pub(crate) mod tests {
             found.iter().any(|(held, _)| !held),
             "the property is evaluated false for the overwrite: {found:?}"
         );
-        assert_ne!(record_bytes(&store, &key).await, winner, "the mutant replaced it");
+        assert_ne!(
+            record_bytes(&store, &key).await,
+            winner,
+            "the mutant replaced it"
+        );
     }
 
     #[tokio::test]

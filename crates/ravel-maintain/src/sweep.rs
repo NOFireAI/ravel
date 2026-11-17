@@ -1634,15 +1634,19 @@ async fn sweep_superseded_impl(
     // Per marker key: the combined HEAD answer of every group sharing it.
     let mut combined: HashMap<String, SnapshotGate> = HashMap::new();
     for (group, entry_key) in groups.iter().zip(&entered_from) {
-        let head_gate = reach
-            .object_gate(
-                store,
-                tenant,
-                signal,
-                group.ingest_hour_bucket,
-                &group.objects,
-            )
-            .await?;
+        let head_gate = if ravel_invariant::inv_mutant!("catalog/sweep-superseded-no-head-gate") {
+            SnapshotGate::Clear
+        } else {
+            reach
+                .object_gate(
+                    store,
+                    tenant,
+                    signal,
+                    group.ingest_hour_bucket,
+                    &group.objects,
+                )
+                .await?
+        };
         head_gates.push(head_gate);
         if group.objects.is_empty() {
             marker_keys.push(None);
@@ -1825,8 +1829,37 @@ async fn sweep_superseded_impl(
                     continue;
                 }
                 if !config.dry_run {
+                    // The HEAD as it stands now, read afresh, not the one the
+                    // gate above planned from. A HEAD that cannot be read
+                    // here proves nothing either way.
+                    ravel_invariant::inv_always!(
+                        !matches!(
+                            SnapshotReachability::new()
+                                .with_read_gate(config.read_gate.clone())
+                                .object_gate(
+                                    store,
+                                    tenant,
+                                    signal,
+                                    group.ingest_hour_bucket,
+                                    &group.objects,
+                                )
+                                .await,
+                            Ok(SnapshotGate::Blocked(SnapshotBlock::Named))
+                        ),
+                        "catalog: a sweep never deletes an object the current HEAD names",
+                        std::collections::BTreeMap::from([
+                            ("key", k.clone()),
+                            ("ingest_hour_bucket", group.ingest_hour_bucket.to_string()),
+                        ])
+                    );
                     match store.delete(k).await {
-                        Ok(()) => deletes_succeeded += 1,
+                        Ok(()) => {
+                            ravel_invariant::inv_reachable!(
+                                "catalog: superseded sweep delete",
+                                std::collections::BTreeMap::from([("key", k.clone())])
+                            );
+                            deletes_succeeded += 1;
+                        }
                         Err(e) if delete_refused(&e) => {
                             tracing::warn!(
                                 tenant_hash = %tenant.to_hex(),
@@ -3813,6 +3846,20 @@ pub async fn sweep_unreferenced_catalog_objects(
     };
     for meta in &candidates {
         if !config.dry_run {
+            // Judged from a HEAD read here, not from the reference set: a HEAD
+            // that does not decode proves nothing unreferenced. An absent HEAD
+            // or a failed read is not a corrupt one.
+            ravel_invariant::inv_always!(
+                !matches!(
+                    store.get(&catalog_head_key(tenant, signal), GetRange::Full).await,
+                    Ok(got) if ravel_catalog::decode_head(got.data.as_ref()).is_err()
+                ),
+                "catalog: a catalog sweep never deletes under an unreadable HEAD",
+                std::collections::BTreeMap::from([
+                    ("head_key", catalog_head_key(tenant, signal)),
+                    ("key", meta.key.clone()),
+                ])
+            );
             store.delete(&meta.key).await?;
         }
         outcome.count_deleted(&meta.key);
@@ -3849,12 +3896,24 @@ async fn read_head_reference(
     let head_key = catalog_head_key(tenant, signal);
     match store.get(&head_key, GetRange::Full).await {
         Ok(got) => {
-            let head = ravel_catalog::decode_head(got.data.as_ref()).map_err(|e| {
-                MaintainError::Invariant(format!(
-                    "catalog sweep: HEAD at {head_key} failed to decode ({e}); deleting \
-                     nothing this pass rather than treating a live snapshot as unreferenced"
-                ))
-            })?;
+            let head = match ravel_catalog::decode_head(got.data.as_ref()) {
+                Ok(head) => head,
+                Err(_)
+                    if ravel_invariant::inv_mutant!("catalog/corrupt-head-ignores-delete-gate") =>
+                {
+                    return Ok(HeadReference::Present(HashSet::new()));
+                }
+                Err(e) => {
+                    ravel_invariant::inv_reachable!(
+                        "catalog: delete pass refused on an unreadable HEAD",
+                        std::collections::BTreeMap::from([("head_key", head_key.clone())])
+                    );
+                    return Err(MaintainError::Invariant(format!(
+                        "catalog sweep: HEAD at {head_key} failed to decode ({e}); deleting \
+                         nothing this pass rather than treating a live snapshot as unreferenced"
+                    )));
+                }
+            };
             let mut referenced =
                 HashSet::with_capacity(head.parts.len() * 2 + usize::from(head.postings.is_some()));
             for part in &head.parts {
@@ -7209,6 +7268,106 @@ mod tests {
         );
     }
 
+    const CATALOG_SWEEP_FAILS_CLOSED: &str =
+        "catalog: a catalog sweep never deletes under an unreadable HEAD";
+
+    /// One catalog sweep for `tenant`'s metrics catalog over an orphan part
+    /// past the horizon and a HEAD holding `head`. Returns the store, the
+    /// orphan's key and the pass result.
+    async fn catalog_sweep_with_head(
+        tenant: TenantHash,
+        head: Option<Bytes>,
+    ) -> (MemoryStore, String, Result<CatalogSweepOutcome>) {
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let orphan = format!(
+            "{}20251231T00.dddd.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &orphan).await;
+        match head {
+            Some(bytes) => store
+                .put(
+                    &catalog_head_key(&tenant, signal),
+                    bytes,
+                    PutOptions::default(),
+                )
+                .await
+                .map(|_| ())
+                .expect("seed HEAD"),
+            None => {
+                let named = format!(
+                    "{}20251231T00.eeee.csnap",
+                    catalog_snap_prefix(&tenant, signal)
+                );
+                put_head(
+                    &store,
+                    &tenant,
+                    signal,
+                    vec![part_ref(&named, [0; 32])],
+                    None,
+                )
+                .await
+            }
+        }
+        let clock = FixedClock::new(config.protection_horizon_ns.saturating_mul(2));
+        let result =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await;
+        (store, orphan, result)
+    }
+
+    #[tokio::test]
+    async fn mutant_corrupt_head_ignored_breaks_catalog_sweep_fail_closed() {
+        let Some(_mutant) =
+            crate::publish::tests::scoped_mutant("catalog/corrupt-head-ignores-delete-gate")
+        else {
+            return;
+        };
+        let (store, orphan, result) = catalog_sweep_with_head(
+            TenantHash([0x61; 16]),
+            Some(Bytes::from_static(b"not a valid HEAD")),
+        )
+        .await;
+        let found = crate::publish::tests::evaluations(CATALOG_SWEEP_FAILS_CLOSED, &orphan);
+        assert!(
+            found.iter().any(|(held, _)| !held),
+            "the property is evaluated false for the corrupt HEAD: {found:?}"
+        );
+        assert_eq!(result.expect("the mutant proceeds").deleted, 1);
+        assert!(!present(&store, &orphan).await);
+    }
+
+    #[tokio::test]
+    async fn a_catalog_sweep_deletes_only_under_a_head_that_decodes() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let (store, orphan, result) = catalog_sweep_with_head(TenantHash([0x62; 16]), None).await;
+        assert_eq!(result.expect("pass").deleted, 1);
+        assert!(!present(&store, &orphan).await);
+        let found = crate::publish::tests::evaluations(CATALOG_SWEEP_FAILS_CLOSED, &orphan);
+        assert_eq!(found.len(), 1, "one evaluation per delete: {found:?}");
+        assert!(found[0].0, "{found:?}");
+
+        let corrupt = TenantHash([0x63; 16]);
+        let (store, orphan, result) =
+            catalog_sweep_with_head(corrupt, Some(Bytes::from_static(b"not a valid HEAD"))).await;
+        assert!(matches!(result, Err(MaintainError::Invariant(_))));
+        assert!(present(&store, &orphan).await);
+        let head_key = catalog_head_key(&corrupt, Signal::Metrics);
+        let refused = crate::publish::tests::evaluations(
+            "catalog: delete pass refused on an unreadable HEAD",
+            &head_key,
+        );
+        assert_eq!(
+            refused.len(),
+            1,
+            "the first HEAD read ends the pass: {refused:?}"
+        );
+    }
+
     /// A compaction record stamped a future `format_version` in a bucket is
     /// refused by the superseded sweep's bucket read (ADR-0066 decision 2), not
     /// read as version 1: the pass fails before it deletes anything, so the
@@ -7439,6 +7598,15 @@ mod tests {
     /// an object at each part key, and one rewrite over the record. Returns
     /// the compaction record's key and the part keys.
     async fn put_sized_part_chain(store: &MemoryStore) -> (String, Vec<String>) {
+        put_sized_part_chain_at(store, [0x11; 32]).await
+    }
+
+    /// [`put_sized_part_chain`] under the compaction input set hash
+    /// `input_set_hash`, which every key the chain deletes depends on.
+    async fn put_sized_part_chain_at(
+        store: &MemoryStore,
+        input_set_hash: [u8; 32],
+    ) -> (String, Vec<String>) {
         let record = CompactionRecord {
             format_version: 1,
             tenant_hash: tenant().0.to_vec(),
@@ -7451,7 +7619,7 @@ mod tests {
                 writer_epoch: 1,
                 writer_seq: 1,
             }],
-            input_set_hash: vec![0x11; 32],
+            input_set_hash: input_set_hash.to_vec(),
             parts: PART_SIZES
                 .iter()
                 .zip(0u8..)
@@ -7536,6 +7704,123 @@ mod tests {
         assert_eq!(bytes, 21_313, "each part at its recorded size");
         for key in part_keys.iter().chain([&record_key]) {
             assert!(!present(&store, key).await, "{key} deleted");
+        }
+    }
+
+    const HEAD_NAMED_NEVER_DELETED: &str =
+        "catalog: a sweep never deletes an object the current HEAD names";
+
+    /// Puts a logs HEAD for [`tenant`] whose one snapshot part holds `entry`.
+    async fn put_head_naming(store: &MemoryStore, entry: ravel_proto::catalog::v1::SnapshotEntry) {
+        let signal = ravel_commit::signal::to_proto(Signal::Logs) as u32;
+        let part_bytes =
+            ravel_catalog::encode_part(tenant().0, signal, DEPTH_SHARD + 1, 1, &[entry])
+                .expect("encode part");
+        let part_key = format!("{}/catalog/l/snap/named.csnap", tenant().to_hex());
+        store
+            .put(
+                &part_key,
+                Bytes::from(part_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed part");
+        let head = SnapshotHead {
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION_1,
+            tenant_hash: tenant().0.to_vec(),
+            signal,
+            shard_count: DEPTH_SHARD + 1,
+            watermark_hour: 1,
+            parts: vec![SnapshotPartRef {
+                key: part_key,
+                blake3: blake3::hash(&part_bytes).as_bytes().to_vec(),
+                size: part_bytes.len() as u64,
+                entry_count: 1,
+                watermark_hour: 1,
+                min_hour: 0,
+                column_stats: None,
+                key_index: Vec::new(),
+                retired_hours: Vec::new(),
+            }],
+            folder_id: vec![0u8; 16],
+            created_unix_ns: 1,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        store
+            .put(
+                &catalog_head_key(&tenant(), Signal::Logs),
+                Bytes::from(ravel_catalog::encode_head(&head).expect("encode HEAD")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed HEAD");
+    }
+
+    /// A snapshot entry at [`put_sized_part_chain_at`]'s shard and hour: the
+    /// chain's part 0 when `writer_id` is its input set hash, an unrelated L0
+    /// flush when it is 16 bytes.
+    fn chain_hour_entry(writer_id: Vec<u8>) -> ravel_proto::catalog::v1::SnapshotEntry {
+        ravel_proto::catalog::v1::SnapshotEntry {
+            level: if writer_id.len() == 32 { 1 } else { 0 },
+            shard: DEPTH_SHARD,
+            ingest_hour_bucket: 1,
+            writer_id,
+            writer_epoch: 0,
+            writer_seq: 0,
+            content_hash: vec![0x40; 32],
+            object_size: PART_SIZES[0],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn mutant_no_head_gate_breaks_head_named_never_deleted() {
+        let Some(_mutant) =
+            crate::publish::tests::scoped_mutant("catalog/sweep-superseded-no-head-gate")
+        else {
+            return;
+        };
+        let hash = [0x51; 32];
+        let store = MemoryStore::new();
+        let (_, part_keys) = put_sized_part_chain_at(&store, hash).await;
+        put_head_naming(&store, chain_hour_entry(hash.to_vec())).await;
+
+        let (outcome, _) = sized_chain_pass(&store).await.expect("pass");
+
+        let found = crate::publish::tests::evaluations(HEAD_NAMED_NEVER_DELETED, &part_keys[0]);
+        assert!(
+            found.iter().any(|(held, _)| !held),
+            "the property is evaluated false for the HEAD-named part: {found:?}"
+        );
+        assert_eq!(
+            outcome.data_deleted, 2,
+            "the mutant let the deletes through"
+        );
+        assert!(!present(&store, &part_keys[0]).await);
+    }
+
+    #[tokio::test]
+    async fn a_superseded_sweep_deletes_only_what_the_current_head_does_not_name() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let hash = [0x52; 32];
+        let store = MemoryStore::new();
+        let (record_key, part_keys) = put_sized_part_chain_at(&store, hash).await;
+        put_head_naming(&store, chain_hour_entry(vec![0xEE; 16])).await;
+
+        let (outcome, _) = sized_chain_pass(&store).await.expect("pass");
+
+        assert_eq!((outcome.data_deleted, outcome.records_deleted), (2, 1));
+        for key in part_keys.iter().chain([&record_key]) {
+            assert!(!present(&store, key).await, "{key} deleted");
+            let found = crate::publish::tests::evaluations(HEAD_NAMED_NEVER_DELETED, key);
+            assert_eq!(found.len(), 1, "one evaluation per delete: {found:?}");
+            assert!(found[0].0, "{found:?}");
+            let deleted =
+                crate::publish::tests::evaluations("catalog: superseded sweep delete", key);
+            assert_eq!(deleted.len(), 1, "{deleted:?}");
         }
     }
 

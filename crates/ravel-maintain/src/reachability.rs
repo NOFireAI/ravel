@@ -693,6 +693,28 @@ impl SnapshotReachability {
         store: &dyn ObjectStoreBackend,
         bucket: &Bucket,
     ) -> Result<SnapshotGate> {
+        let gate = self.bucket_decision(store, bucket).await?;
+        // Judged from the HEAD read, not from the path that decided the gate:
+        // a HEAD that did not decode or validate proves nothing unreachable.
+        ravel_invariant::inv_always!(
+            gate != SnapshotGate::Clear || !matches!(self.head, Some(HeadLoad::Unreadable)),
+            "catalog: a delete gate never clears under an unreadable HEAD",
+            std::collections::BTreeMap::from([
+                (
+                    "head_key",
+                    catalog_head_key(&bucket.tenant_hash, bucket.signal)
+                ),
+                ("gate", format!("{gate:?}")),
+            ])
+        );
+        Ok(gate)
+    }
+
+    async fn bucket_decision(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        bucket: &Bucket,
+    ) -> Result<SnapshotGate> {
         let (covering, skipped) = match self
             .covering_parts(
                 store,
@@ -758,6 +780,28 @@ impl SnapshotReachability {
         if objects.is_empty() {
             return Ok(SnapshotGate::Clear);
         }
+        let gate = self
+            .object_decision(store, tenant, signal, ingest_hour_bucket, objects)
+            .await?;
+        ravel_invariant::inv_always!(
+            gate != SnapshotGate::Clear || !matches!(self.head, Some(HeadLoad::Unreadable)),
+            "catalog: a delete gate never clears under an unreadable HEAD",
+            std::collections::BTreeMap::from([
+                ("head_key", catalog_head_key(tenant, signal)),
+                ("gate", format!("{gate:?}")),
+            ])
+        );
+        Ok(gate)
+    }
+
+    async fn object_decision(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        ingest_hour_bucket: u32,
+        objects: &[SnapshotObject],
+    ) -> Result<SnapshotGate> {
         let wanted: HashSet<SnapshotObject> = objects.iter().copied().collect();
         let (covering, skipped) = match self
             .covering_parts(store, tenant, signal, ingest_hour_bucket)
@@ -829,7 +873,21 @@ impl SnapshotReachability {
     ) -> Result<Covering> {
         match self.ensure_head(store, tenant, signal).await? {
             HeadStatus::Absent => Ok(Covering::Clear),
-            HeadStatus::Unreadable => Ok(Covering::Blocked(SnapshotBlock::Unreadable)),
+            HeadStatus::Unreadable
+                if ravel_invariant::inv_mutant!("catalog/corrupt-head-ignores-delete-gate") =>
+            {
+                Ok(Covering::Clear)
+            }
+            HeadStatus::Unreadable => {
+                ravel_invariant::inv_reachable!(
+                    "catalog: delete pass refused on an unreadable HEAD",
+                    std::collections::BTreeMap::from([(
+                        "head_key",
+                        catalog_head_key(tenant, signal)
+                    )])
+                );
+                Ok(Covering::Blocked(SnapshotBlock::Unreadable))
+            }
             HeadStatus::Present => match &self.head {
                 Some(HeadLoad::Present(head)) => {
                     let (covering, skipped) = head.parts.iter().cloned().partition(|p| {
@@ -1432,6 +1490,78 @@ mod tests {
             "no part of an other-signal HEAD is read"
         );
         assert_eq!(store.delete_count(), 0, "nothing is deleted");
+    }
+
+    const GATE_FAILS_CLOSED: &str = "catalog: a delete gate never clears under an unreadable HEAD";
+
+    /// Puts bytes that do not decode as a HEAD at `tenant`'s metrics HEAD key,
+    /// asks both gates about the candidate, and returns the two answers and
+    /// the HEAD key.
+    async fn gate_under_corrupt_head(
+        tenant: TenantHash,
+    ) -> (CountingStore, SnapshotGate, SnapshotGate, String) {
+        let store = CountingStore::new();
+        let head_key = catalog_head_key(&tenant, Signal::Metrics);
+        store
+            .put(
+                &head_key,
+                bytes::Bytes::from_static(b"not a HEAD"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put HEAD");
+        let mut reach = SnapshotReachability::new();
+        let bucket = Bucket {
+            tenant_hash: tenant,
+            ..candidate_bucket()
+        };
+        let by_bucket = reach.bucket_gate(&store, &bucket).await.expect("gate");
+        let objects = [snapshot_object(&candidate_entry()).expect("candidate identity")];
+        let by_object = reach
+            .object_gate(&store, &tenant, Signal::Metrics, TEST_HOUR, &objects)
+            .await
+            .expect("object gate");
+        (store, by_bucket, by_object, head_key)
+    }
+
+    #[tokio::test]
+    async fn mutant_ignore_unreadable_head_breaks_fail_closed() {
+        let Some(_mutant) =
+            crate::publish::tests::scoped_mutant("catalog/corrupt-head-ignores-delete-gate")
+        else {
+            return;
+        };
+        let (_, by_bucket, by_object, head_key) =
+            gate_under_corrupt_head(TenantHash([0xA1; 16])).await;
+        let found = crate::publish::tests::evaluations(GATE_FAILS_CLOSED, &head_key);
+        assert!(
+            found.iter().any(|(held, _)| !held),
+            "the property is evaluated false for the corrupt HEAD: {found:?}"
+        );
+        assert_eq!(
+            (by_bucket, by_object),
+            (SnapshotGate::Clear, SnapshotGate::Clear)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_head_blocks_both_gates_fail_closed() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let (store, by_bucket, by_object, head_key) =
+            gate_under_corrupt_head(TenantHash([0xA2; 16])).await;
+        assert_eq!(by_bucket, SnapshotGate::Blocked(SnapshotBlock::Unreadable));
+        assert_eq!(by_object, SnapshotGate::Blocked(SnapshotBlock::Unreadable));
+        assert_eq!(store.get_count(&head_key), 1, "HEAD is read once per pass");
+        let found = crate::publish::tests::evaluations(GATE_FAILS_CLOSED, &head_key);
+        assert_eq!(found.len(), 2, "one per gate answer: {found:?}");
+        assert!(found.iter().all(|(held, _)| *held), "{found:?}");
+        let refused = crate::publish::tests::evaluations(
+            "catalog: delete pass refused on an unreadable HEAD",
+            &head_key,
+        );
+        assert_eq!(refused.len(), 2, "{refused:?}");
     }
 
     /// No marker for the alerts signal (ADR-1133 decision 6): a clear HEAD
