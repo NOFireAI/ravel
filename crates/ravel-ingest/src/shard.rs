@@ -65,8 +65,7 @@ use crate::format_floor::{
 };
 use crate::generation::{
     FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, STALE_VIEW_ABANDONED,
-    ScanCheck, held_view_check, mismatch_retry_spent, reread_and_check, send_hand_back,
-    stale_view_hold_spent,
+    HoldState, ScanCheck, StaleViewHold, mismatch_retry_spent, reread_and_check, send_hand_back,
 };
 use crate::metrics::{FlushTrigger, IngestMetrics};
 #[cfg(feature = "stage-timing")]
@@ -236,13 +235,13 @@ struct TenantBuf {
     /// router cannot trust, so the episode counts once on
     /// `stale_provisioning_flushes` however many triggers retry it.
     stale_view_counted: bool,
-    /// When an enforced flush open first found no trusted generation view for
-    /// this buffer. Once `max_flush_lifetime` has passed since, a last re-read
-    /// that does not confirm the view drops and counts the buffer instead of
-    /// holding it again (issue #4363). Cleared when a flush open gets a
-    /// scan-set or hand-back verdict, or finds the tenant's view refreshed by a
-    /// read issued since.
-    stale_view_since_ns: Option<i64>,
+    /// This buffer's hold on a generation view the router cannot trust (issue
+    /// #4363): when it started, and, once `max_flush_lifetime` has passed,
+    /// the background read requested to confirm the view, whose failure drops
+    /// and counts the buffer. Cleared when a flush open gets a scan-set or
+    /// hand-back verdict, or finds the tenant's view refreshed by a read
+    /// issued since the hold started.
+    stale_view_hold: StaleViewHold,
     /// Set once a hand-back from this buffer found a target shard not live, so
     /// the episode counts and logs once however many triggers retry it.
     hand_back_blocked: bool,
@@ -2341,39 +2340,35 @@ impl ShardActor {
     /// a drain, a tenant whose view cannot be trusted is re-read once, waiting
     /// at most `max_flush_lifetime`, and checked again, so one drain flushes
     /// what the re-read confirms; elsewhere an untrusted view only starts a
-    /// background re-read and the next trigger retries. An `Unknown` verdict
-    /// moves the buffer's stale-view hold (`hold_since_ns`), and a spent hold
-    /// re-reads once more before it is dropped ([`held_view_check`]).
+    /// background re-read and the next trigger retries, and the actor never
+    /// waits on the store. The drain first moves the buffer's stale-view hold
+    /// (`hold`), so the read it waits on is the one a spent hold requested,
+    /// and skips the wait when the hold already drops the buffer.
     async fn scan_check(
         &mut self,
         tenant: TenantHash,
         hour: u32,
         now_ns: i64,
-        hold_since_ns: &mut Option<i64>,
+        hold: &mut StaleViewHold,
         lag_check: LagCheck,
     ) -> ScanCheck {
-        let mut verdict = self.scope.check(tenant, self.shard, hour, now_ns);
-        if verdict == ScanCheck::Unknown
-            && self
+        let verdict = self.scope.check(tenant, self.shard, hour, now_ns);
+        if verdict != ScanCheck::Unknown
+            || !self
                 .drain_rereads
                 .as_mut()
                 .is_some_and(|reread| reread.insert(tenant))
-        {
-            verdict = reread_and_check(
+            || hold.advance(
                 self.scope.as_ref(),
-                self.clock.as_ref(),
-                self.config.max_flush_lifetime,
                 tenant,
-                self.shard,
-                hour,
                 now_ns,
-            )
-            .await;
-        }
-        if verdict != ScanCheck::Unknown {
+                self.config.max_flush_lifetime,
+                matches!(lag_check, LagCheck::Enforced),
+            ) == HoldState::Drop
+        {
             return verdict;
         }
-        held_view_check(
+        reread_and_check(
             self.scope.as_ref(),
             self.clock.as_ref(),
             self.config.max_flush_lifetime,
@@ -2381,9 +2376,6 @@ impl ShardActor {
             self.shard,
             hour,
             now_ns,
-            hold_since_ns,
-            matches!(lag_check, LagCheck::Enforced),
-            self.drain_rereads.is_some(),
         )
         .await
     }
@@ -2411,9 +2403,10 @@ impl ShardActor {
 
     /// Drops a buffer whose flush was held closed on an untrusted generation
     /// view for `max_flush_lifetime` with no provisioning read succeeding, and
-    /// whose last re-read did not confirm the view (issue #4363). Nothing is written: strict
-    /// waiters get `Abandoned`, and dropping `charges` refunds the byte budget.
-    /// A teardown pass drops it too, rather than writing it in place.
+    /// for which a read issued after that did not confirm the view (issue
+    /// #4363, [`StaleViewHold`]). Nothing is written: strict waiters get
+    /// `Abandoned`, and dropping `charges` refunds the byte budget. A teardown
+    /// pass drops a spent hold too, rather than writing it in place.
     fn drop_stale_view_flush(&self, tenant_hash: TenantHash, buf: TenantBuf, lag_check: LagCheck) {
         let rows: usize = buf.series.values().map(|accum| accum.values.len()).sum();
         self.metrics.record_abandoned_stale_provisioning();
@@ -2428,7 +2421,8 @@ impl ShardActor {
             bytes = buf.est_bytes,
             teardown = !matches!(lag_check, LagCheck::Enforced),
             "ravel-ingest: dropping a flush held closed for max_flush_lifetime on a provisioning \
-             view this router cannot trust; its rows are not written"
+             view this router cannot trust: a read issued after the hold was spent did not \
+             confirm the view; its rows are not written"
         );
         self.ctx.ack_waiters(
             buf.waiters,
@@ -2627,7 +2621,7 @@ impl ShardActor {
                 tenant_hash,
                 ingest_hour_bucket,
                 raw_ns,
-                &mut buf.stale_view_since_ns,
+                &mut buf.stale_view_hold,
                 lag_check,
             )
             .await;
@@ -2635,7 +2629,7 @@ impl ShardActor {
             ScanCheck::InScanSet => {
                 self.handing_back = false;
                 self.in_place_warnings.rearm(tenant_hash);
-                buf.stale_view_since_ns = None;
+                buf.stale_view_hold.clear();
                 buf
             }
             ScanCheck::HandBack {
@@ -2651,7 +2645,7 @@ impl ShardActor {
             {
                 // This flush opens at or past the cap, so, as on the deferral
                 // path, no strict waiter is acknowledged from it.
-                buf.stale_view_since_ns = None;
+                buf.stale_view_hold.clear();
                 let waiters = std::mem::take(&mut buf.waiters);
                 self.ctx.ack_waiters(
                     waiters,
@@ -2706,7 +2700,7 @@ impl ShardActor {
                     return;
                 };
                 buf.stale_view_counted = false;
-                buf.stale_view_since_ns = None;
+                buf.stale_view_hold.clear();
                 let enforced = matches!(lag_check, LagCheck::Enforced);
                 // A target that is not live cannot take the rows on a later
                 // flush, so only a full mailbox is retried.
@@ -2779,11 +2773,18 @@ impl ShardActor {
                 if !std::mem::replace(&mut buf.stale_view_counted, true) {
                     self.metrics.record_stale_provisioning_flush();
                 }
-                if stale_view_hold_spent(
-                    buf.stale_view_since_ns,
-                    raw_ns,
-                    self.config.max_flush_lifetime,
-                ) {
+                let enforced = matches!(lag_check, LagCheck::Enforced);
+                if buf
+                    .stale_view_hold
+                    .advance(
+                        self.scope.as_ref(),
+                        tenant_hash,
+                        raw_ns,
+                        self.config.max_flush_lifetime,
+                        enforced,
+                    )
+                    .drops(enforced)
+                {
                     self.drop_stale_view_flush(tenant_hash, buf, lag_check);
                     return;
                 }
@@ -4567,6 +4568,7 @@ mod tests {
             let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
             let metrics = Arc::new(IngestMetrics::new(4));
             let clock = TestClock::new(BASE_NS);
+            scope.set_clock(clock.clone());
             let (tx, rx) = mpsc::channel(64);
             let actor = Self::actor(
                 config,

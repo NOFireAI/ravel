@@ -343,6 +343,14 @@ pub(crate) trait FlushScope<M>: Send + Sync {
     /// Re-read the tenant's provisioning record, joining a read already in
     /// flight. Resolves `true` once a read succeeded and its view is installed.
     fn reread(&self, tenant: TenantHash) -> Reread;
+    /// Start a background read of the tenant's provisioning record, or join
+    /// the one in flight, without waiting for it, and return its issue time.
+    /// `None` when no read is issued: inside the tenant's read backoff window,
+    /// or with no switch or refresh source to read through.
+    fn request_read(&self, tenant: TenantHash) -> Option<i64>;
+    /// The issue time of the latest provisioning read of the tenant that
+    /// failed, or `None` when none is remembered.
+    fn failed_read_at(&self, tenant: TenantHash) -> Option<i64>;
     /// The issue time of the read behind the tenant's cached view, or `None`
     /// when no view is cached.
     fn view_refreshed_at(&self, tenant: TenantHash) -> Option<i64>;
@@ -471,80 +479,134 @@ pub(crate) async fn reread_and_check<M>(
 }
 
 /// The `Abandoned` message a strict waiter gets when its buffer is dropped
-/// because no provisioning read succeeded for `max_flush_lifetime` while its
-/// flush was held on an untrusted view (issue #4363). Nothing from the buffer
-/// is written, so a retry stores one copy.
-pub(crate) const STALE_VIEW_ABANDONED: &str = "flush dropped: no provisioning read succeeded for \
-     max_flush_lifetime while the flush was held on an untrusted view; the rows were not written";
+/// because its flush was held on an untrusted view for `max_flush_lifetime`
+/// and a provisioning read issued after that did not confirm the view (issue
+/// #4363). Nothing from the buffer is written, so a retry stores one copy.
+pub(crate) const STALE_VIEW_ABANDONED: &str = "flush dropped: the flush was held on an untrusted \
+     view for max_flush_lifetime and a provisioning read issued after that did not confirm the \
+     view; the rows were not written";
 
-/// The start of a buffer's untrusted-view hold after a flush attempt at
-/// `now_ns` found no trusted view (issue #4363). A hold whose tenant view was
-/// refreshed at or after its start (`refreshed_at_ns`) is cleared, since a
-/// read succeeded during it, so the bound counts only time with no successful
-/// read; `enforced` then starts a new one at `now_ns`. A teardown pass starts
-/// none.
-pub(crate) fn stale_view_hold_since(
+/// A buffer's hold on a generation view the router cannot trust (issue
+/// #4363). The hold starts at the first enforced flush open that finds no
+/// trusted view, and restarts whenever the tenant's view is refreshed by a
+/// read issued at or after its start, so `max_flush_lifetime` counts only
+/// time with no successful read. Once that bound has passed the hold is
+/// spent: the actor starts or joins a background provisioning read without
+/// waiting for it and records the read's issue time. A read the backoff
+/// window refuses is not issued, and is asked for again on a later trigger.
+/// The buffer is dropped only once a read issued at or after that time has
+/// failed, or one more `max_flush_lifetime` has passed since the hold was
+/// spent with no read confirming the view.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StaleViewHold {
     since_ns: Option<i64>,
-    refreshed_at_ns: Option<i64>,
-    now_ns: i64,
-    enforced: bool,
-) -> Option<i64> {
-    let since_ns = since_ns.filter(|&since| refreshed_at_ns.is_none_or(|at| at < since));
-    if enforced {
-        Some(since_ns.unwrap_or(now_ns))
-    } else {
-        since_ns
+    spent_at_ns: Option<i64>,
+    read_issued_ns: Option<i64>,
+}
+
+impl StaleViewHold {
+    /// Ends the hold: a flush open got a scan-set or hand-back verdict.
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The issue time of the read requested after the hold was spent, once
+    /// one was issued.
+    #[cfg(test)]
+    pub(crate) fn read_issued_ns(&self) -> Option<i64> {
+        self.read_issued_ns
+    }
+
+    /// Moves the hold for a flush attempt at `now_ns` whose scan-set check
+    /// found no trusted view of `tenant`, requesting the read a spent hold
+    /// needs, and returns where the hold stands. Never waits on the store.
+    /// `enforced` is false on a teardown pass, which starts no hold.
+    pub(crate) fn advance<M>(
+        &mut self,
+        scope: &dyn FlushScope<M>,
+        tenant: TenantHash,
+        now_ns: i64,
+        bound: Duration,
+        enforced: bool,
+    ) -> HoldState {
+        self.step(
+            scope.view_refreshed_at(tenant),
+            scope.failed_read_at(tenant),
+            || scope.request_read(tenant),
+            now_ns,
+            bound,
+            enforced,
+        )
+    }
+
+    /// [`Self::advance`] over the scope's answers: the tenant view's refresh
+    /// stamp, the issue time of its latest failed read, and the read request.
+    fn step(
+        &mut self,
+        refreshed_at_ns: Option<i64>,
+        failed_read_at_ns: Option<i64>,
+        request_read: impl FnOnce() -> Option<i64>,
+        now_ns: i64,
+        bound: Duration,
+        enforced: bool,
+    ) -> HoldState {
+        if self
+            .since_ns
+            .is_some_and(|since| refreshed_at_ns.is_some_and(|at| at >= since))
+        {
+            self.clear();
+        }
+        if enforced && self.since_ns.is_none() {
+            self.since_ns = Some(now_ns);
+        }
+        let Some(since) = self.since_ns else {
+            return HoldState::Inside;
+        };
+        let bound_ns = crate::config::duration_nanos_saturating(bound);
+        if now_ns.saturating_sub(since) < bound_ns {
+            return HoldState::Inside;
+        }
+        let spent_at = *self.spent_at_ns.get_or_insert(now_ns);
+        if self
+            .read_issued_ns
+            .is_some_and(|issued| failed_read_at_ns.is_some_and(|failed| failed >= issued))
+        {
+            return HoldState::Drop;
+        }
+        if now_ns.saturating_sub(spent_at) >= bound_ns {
+            return HoldState::Drop;
+        }
+        if self.read_issued_ns.is_none() {
+            // A joined read issued before the hold was spent does not count:
+            // the next trigger asks again once it has ended.
+            self.read_issued_ns = request_read().filter(|&issued| issued >= spent_at);
+        }
+        HoldState::Spent
     }
 }
 
-/// Whether a buffer first held closed on an untrusted view at `since_ns` has
-/// been held for `bound` at `now_ns`, so its flush is dropped rather than held
-/// again (issue #4363). `None` (never held) is never spent.
-pub(crate) fn stale_view_hold_spent(since_ns: Option<i64>, now_ns: i64, bound: Duration) -> bool {
-    since_ns.is_some_and(|since| {
-        now_ns.saturating_sub(since) >= crate::config::duration_nanos_saturating(bound)
-    })
+/// Where a [`StaleViewHold`] stands after [`StaleViewHold::advance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoldState {
+    /// No hold, or one held for less than `max_flush_lifetime`.
+    Inside,
+    /// Spent, with the read that would confirm the view requested or in
+    /// flight: an enforced flush keeps the buffer.
+    Spent,
+    /// Spent, and a read issued after it was spent failed, or the deadline
+    /// passed with no read confirming the view: the buffer is dropped.
+    Drop,
 }
 
-/// The verdict a flush opened at `now_ns` acts on after its scan-set check
-/// found no trusted view (issue #4363). Moves the buffer's hold
-/// (`hold_since_ns`, [`stale_view_hold_since`]); once the hold is spent the
-/// record is re-read once more ([`reread_and_check`]) before the caller drops
-/// the buffer, since nothing reads it while a flush is deferred. That read
-/// waits at most until the deadline of a flush opened at `now_ns`
-/// (`now_ns + bound`). `drain_reread` skips it for a drain that already
-/// re-read the tenant. [`ScanCheck::Unknown`] means drop when the hold is
-/// spent and hold otherwise.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn held_view_check<M>(
-    scope: &dyn FlushScope<M>,
-    clock: &dyn Clock,
-    bound: Duration,
-    tenant: TenantHash,
-    shard: u32,
-    hour: u32,
-    now_ns: i64,
-    hold_since_ns: &mut Option<i64>,
-    enforced: bool,
-    drain_reread: bool,
-) -> ScanCheck {
-    *hold_since_ns = stale_view_hold_since(
-        *hold_since_ns,
-        scope.view_refreshed_at(tenant),
-        now_ns,
-        enforced,
-    );
-    if drain_reread || !stale_view_hold_spent(*hold_since_ns, now_ns, bound) {
-        return ScanCheck::Unknown;
-    }
-    let deadline_ns = now_ns.saturating_add(crate::config::duration_nanos_saturating(bound));
-    let remaining = Duration::from_nanos(
-        u64::try_from(deadline_ns.saturating_sub(clock.now_ns())).unwrap_or(0),
-    );
-    tokio::select! {
-        biased;
-        verdict = reread_and_check(scope, clock, remaining, tenant, shard, hour, now_ns) => verdict,
-        () = clock.sleep(remaining) => ScanCheck::Unknown,
+impl HoldState {
+    /// Whether the buffer is dropped. A teardown pass (`enforced` false)
+    /// cannot keep a spent hold for a later read, since the actor is ending.
+    pub(crate) fn drops(self, enforced: bool) -> bool {
+        match self {
+            HoldState::Inside => false,
+            HoldState::Spent => !enforced,
+            HoldState::Drop => true,
+        }
     }
 }
 
@@ -658,6 +720,14 @@ where
         }
     }
 
+    fn request_read(&self, tenant: TenantHash) -> Option<i64> {
+        self.switch.upgrade()?.request_read(tenant)
+    }
+
+    fn failed_read_at(&self, tenant: TenantHash) -> Option<i64> {
+        self.switch.upgrade()?.failed_read_at(tenant)
+    }
+
     fn view_refreshed_at(&self, tenant: TenantHash) -> Option<i64> {
         self.switch.upgrade()?.view_refreshed_at(tenant)
     }
@@ -712,6 +782,14 @@ impl<M> FlushScope<M> for AlwaysInScope {
 
     fn reread(&self, _tenant: TenantHash) -> Reread {
         Box::pin(std::future::ready(true))
+    }
+
+    fn request_read(&self, _tenant: TenantHash) -> Option<i64> {
+        None
+    }
+
+    fn failed_read_at(&self, _tenant: TenantHash) -> Option<i64> {
+        None
     }
 
     fn view_refreshed_at(&self, _tenant: TenantHash) -> Option<i64> {
@@ -861,9 +939,34 @@ pub(crate) struct ScriptedScope<M> {
     wait: Mutex<bool>,
     floor: Mutex<FloorCheck>,
     refreshed_at_ns: Mutex<Option<i64>>,
-    /// The verdict a re-read installs, or `None` for a re-read that fails.
-    reread: Mutex<Option<ScanCheck>>,
+    /// Per-tenant verdicts, used in place of `verdict` for a tenant listed.
+    tenant_verdicts: Mutex<HashMap<TenantHash, ScanCheck>>,
+    /// What every later provisioning read does.
+    read: Mutex<ScriptedRead>,
+    /// The issue time of the latest failed read.
+    failed_read_at_ns: Mutex<Option<i64>>,
+    /// The issue time of the read a [`ScriptedRead::Hangs`] script holds in
+    /// flight, which later requests join.
+    hanging_since_ns: Mutex<Option<i64>>,
+    /// The clock a read's issue time is taken from; reads at 0 until set.
+    clock: Mutex<Option<Arc<dyn Clock>>>,
     rereads: Mutex<usize>,
+    reads: Mutex<usize>,
+}
+
+/// What a [`ScriptedScope`]'s provisioning reads do.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScriptedRead {
+    /// Every read is issued and fails at once.
+    Fails,
+    /// Every read is issued, succeeds at once, and installs this verdict for
+    /// the tenant, stamped with its issue time.
+    Installs(ScanCheck),
+    /// A read is issued and never resolves; later requests join it.
+    Hangs,
+    /// Every request falls inside a read backoff window: nothing is issued.
+    BackedOff,
 }
 
 #[cfg(test)]
@@ -876,12 +979,22 @@ impl<M> ScriptedScope<M> {
             wait: Mutex::new(true),
             floor: Mutex::new(FloorCheck::Write),
             refreshed_at_ns: Mutex::new(None),
-            reread: Mutex::new(None),
+            tenant_verdicts: Mutex::new(HashMap::new()),
+            read: Mutex::new(ScriptedRead::Fails),
+            failed_read_at_ns: Mutex::new(None),
+            hanging_since_ns: Mutex::new(None),
+            clock: Mutex::new(None),
             rereads: Mutex::new(0),
+            reads: Mutex::new(0),
         })
     }
 
+    /// Clears every per-tenant verdict.
     pub(crate) fn set(&self, verdict: ScanCheck, target: Option<mpsc::Sender<M>>) {
+        self.tenant_verdicts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         *self.verdict.lock().unwrap_or_else(|p| p.into_inner()) = verdict;
         *self.target.lock().unwrap_or_else(|p| p.into_inner()) = target;
         self.split.lock().unwrap_or_else(|p| p.into_inner()).clear();
@@ -915,21 +1028,88 @@ impl<M> ScriptedScope<M> {
             .unwrap_or_else(|p| p.into_inner()) = refreshed_at_ns;
     }
 
-    /// Every later re-read succeeds and installs `verdict`; `None` (the
-    /// default) fails every re-read.
-    pub(crate) fn set_reread(&self, verdict: Option<ScanCheck>) {
-        *self.reread.lock().unwrap_or_else(|p| p.into_inner()) = verdict;
+    /// `tenant`'s verdict, in place of the one [`Self::set`] gives every
+    /// tenant.
+    pub(crate) fn set_tenant_verdict(&self, tenant: TenantHash, verdict: ScanCheck) {
+        self.tenant_verdicts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(tenant, verdict);
     }
 
-    /// How many re-reads were asked for.
+    /// What every later read does; [`ScriptedRead::Fails`] until set.
+    pub(crate) fn set_read(&self, read: ScriptedRead) {
+        *self.read.lock().unwrap_or_else(|p| p.into_inner()) = read;
+    }
+
+    /// The clock reads are issued at.
+    pub(crate) fn set_clock(&self, clock: Arc<dyn Clock>) {
+        *self.clock.lock().unwrap_or_else(|p| p.into_inner()) = Some(clock);
+    }
+
+    /// How many drain re-reads were asked for.
     pub(crate) fn rereads(&self) -> usize {
         *self.rereads.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// How many background reads [`FlushScope::request_read`] issued, not
+    /// counting requests that joined a hanging read or were backed off.
+    pub(crate) fn reads(&self) -> usize {
+        *self.reads.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn now_ns(&self) -> i64 {
+        self.clock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map_or(0, |clock| clock.now_ns())
+    }
+
+    /// Issues one read of `tenant` at the scope's clock, as the script says:
+    /// `None` when nothing is issued, else the read's issue time and whether
+    /// it has resolved. `counted` adds it to [`Self::reads`].
+    fn issue_read(&self, tenant: TenantHash, counted: bool) -> Option<(i64, bool)> {
+        let now_ns = self.now_ns();
+        let read = *self.read.lock().unwrap_or_else(|p| p.into_inner());
+        match read {
+            ScriptedRead::BackedOff => return None,
+            ScriptedRead::Hangs => {
+                let mut hanging = self.hanging_since_ns.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(since) = *hanging {
+                    return Some((since, false));
+                }
+                *hanging = Some(now_ns);
+            }
+            ScriptedRead::Fails => {
+                *self
+                    .failed_read_at_ns
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(now_ns);
+            }
+            ScriptedRead::Installs(verdict) => {
+                self.set_tenant_verdict(tenant, verdict);
+                self.set_refreshed_at(Some(now_ns));
+            }
+        }
+        if counted {
+            *self.reads.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+        }
+        Some((now_ns, read != ScriptedRead::Hangs))
     }
 }
 
 #[cfg(test)]
 impl<M: Send + 'static> FlushScope<M> for ScriptedScope<M> {
-    fn check(&self, _tenant: TenantHash, _shard: u32, _hour: u32, _now_ns: i64) -> ScanCheck {
+    fn check(&self, tenant: TenantHash, _shard: u32, _hour: u32, _now_ns: i64) -> ScanCheck {
+        if let Some(verdict) = self
+            .tenant_verdicts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&tenant)
+        {
+            return *verdict;
+        }
         *self.verdict.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -951,13 +1131,30 @@ impl<M: Send + 'static> FlushScope<M> for ScriptedScope<M> {
         *self.wait.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn reread(&self, _tenant: TenantHash) -> Reread {
+    /// Joins the script's read: a hanging read never resolves.
+    fn reread(&self, tenant: TenantHash) -> Reread {
         *self.rereads.lock().unwrap_or_else(|p| p.into_inner()) += 1;
-        let installed = *self.reread.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(verdict) = installed {
-            *self.verdict.lock().unwrap_or_else(|p| p.into_inner()) = verdict;
+        match self.issue_read(tenant, false) {
+            Some((_, false)) => Box::pin(std::future::pending()),
+            _ => {
+                let installed = matches!(
+                    *self.read.lock().unwrap_or_else(|p| p.into_inner()),
+                    ScriptedRead::Installs(_)
+                );
+                Box::pin(std::future::ready(installed))
+            }
         }
-        Box::pin(std::future::ready(installed.is_some()))
+    }
+
+    fn request_read(&self, tenant: TenantHash) -> Option<i64> {
+        self.issue_read(tenant, true).map(|(issued_ns, _)| issued_ns)
+    }
+
+    fn failed_read_at(&self, _tenant: TenantHash) -> Option<i64> {
+        *self
+            .failed_read_at_ns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     fn view_refreshed_at(&self, _tenant: TenantHash) -> Option<i64> {
@@ -982,6 +1179,18 @@ impl<M: Send + 'static> FlushScope<M> for ScriptedScope<M> {
     ) -> Result<PublishGrant, CompatPublishRefusal> {
         Ok(PublishGrant::unmanaged(family))
     }
+}
+
+/// What asking the switch for a background re-read of a tenant's record did.
+enum RefreshStart {
+    /// A read is in flight, issued at `issued_ns`; `done` reads
+    /// `Some(installed)` once it ends.
+    InFlight {
+        issued_ns: i64,
+        done: watch::Receiver<Option<bool>>,
+    },
+    /// The tenant's read backoff window has not passed: nothing was issued.
+    BackedOff,
 }
 
 /// Where the switch re-reads a tenant's provisioning record when a flush finds
@@ -1013,9 +1222,14 @@ struct Inner<H> {
     views: HashMap<TenantHash, TenantView>,
     /// Tenants with a flush-open re-read in flight, so a flush retried every
     /// tick against a stalled store starts one read, not one per tick, and a
-    /// drain waiting for a re-read joins the one in flight. The receiver
-    /// reads `Some(installed)` once the read ends.
-    refreshing: HashMap<TenantHash, watch::Receiver<Option<bool>>>,
+    /// drain waiting for a re-read joins the one in flight. Each holds the
+    /// read's issue time and a receiver that reads `Some(installed)` once the
+    /// read ends.
+    refreshing: HashMap<TenantHash, (i64, watch::Receiver<Option<bool>>)>,
+    /// The issue time of each tenant's latest failed provisioning read, from
+    /// either path, which a spent stale-view hold compares with the read it
+    /// requested ([`StaleViewHold`]). Swept with idle eviction.
+    failed_reads: HashMap<TenantHash, i64>,
     /// Tenants whose last provisioning read failed, and when the next read is
     /// allowed (issue #3653). Holds an entry only while the last read failed:
     /// a successful read removes it, and so does idle eviction once the last
@@ -1075,6 +1289,7 @@ impl<H> GenerationSwitch<H> {
                 sets,
                 views: HashMap::new(),
                 refreshing: HashMap::new(),
+                failed_reads: HashMap::new(),
                 read_backoff: ReadBackoff::new(),
             }),
             factory: Box::new(factory),
@@ -1145,6 +1360,8 @@ impl<H> GenerationSwitch<H> {
         now_ns: i64,
     ) {
         let delay_ns = inner.read_backoff.record_failure(tenant, now_ns);
+        let failed_at = inner.failed_reads.entry(tenant).or_insert(now_ns);
+        *failed_at = (*failed_at).max(now_ns);
         self.read_failures.record(err.cause());
         tracing::error!(
             tenant_hash = %tenant.to_hex(),
@@ -1556,6 +1773,9 @@ impl<H> GenerationSwitch<H> {
             keep
         });
         inner.read_backoff.evict_idle(now_ns, ttl_ns);
+        inner
+            .failed_reads
+            .retain(|_, failed_at| now_ns.saturating_sub(*failed_at) <= ttl_ns);
         drop(inner);
         for tenant in &evicted {
             self.bucket_cache.forget(tenant);
@@ -1719,7 +1939,7 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
     /// flight, and resolve `true` once a read succeeded and its view is
     /// installed. A switch with no refresh source resolves `false`.
     pub(crate) fn reread(self: &Arc<Self>, tenant: TenantHash) -> Reread {
-        let Some(mut done) = self.start_refresh(tenant) else {
+        let Some(RefreshStart::InFlight { mut done, .. }) = self.start_refresh(tenant) else {
             return Box::pin(std::future::ready(false));
         };
         Box::pin(async move {
@@ -1728,6 +1948,21 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
                 Err(_) => false,
             }
         })
+    }
+
+    /// Start a background re-read of `tenant`'s record, or join the one in
+    /// flight, without waiting, and return its issue time. `None` inside the
+    /// tenant's read backoff window or with no refresh source.
+    pub(crate) fn request_read(self: &Arc<Self>, tenant: TenantHash) -> Option<i64> {
+        match self.start_refresh(tenant)? {
+            RefreshStart::InFlight { issued_ns, .. } => Some(issued_ns),
+            RefreshStart::BackedOff => None,
+        }
+    }
+
+    /// The issue time of `tenant`'s latest failed provisioning read.
+    pub(crate) fn failed_read_at(&self, tenant: TenantHash) -> Option<i64> {
+        self.lock().failed_reads.get(&tenant).copied()
     }
 
     /// The issue time of the read behind `tenant`'s cached view, or `None`
@@ -1739,42 +1974,39 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
             .map(|view| view.refreshed_at_ns)
     }
 
-    /// The in-flight re-read of `tenant`'s record, started here if none is. A
-    /// successful read is installed stamped with the time the read was issued,
-    /// not when it returned, since the record may have been appended to while
-    /// the read was in flight. The task holds only a weak reference, so a
-    /// store that never answers cannot keep the router's shard sets alive
-    /// after the router is dropped.
-    fn start_refresh(
-        self: &Arc<Self>,
-        tenant: TenantHash,
-    ) -> Option<watch::Receiver<Option<bool>>> {
+    /// The in-flight re-read of `tenant`'s record, started here if none is and
+    /// the read backoff allows one. The issue time is read before the read
+    /// starts. A successful read is installed stamped with that time, not
+    /// when it returned, since the record may have been appended to while the
+    /// read was in flight. The task holds only a weak reference, so a store
+    /// that never answers cannot keep the router's shard sets alive after the
+    /// router is dropped. `None` with no refresh source.
+    fn start_refresh(self: &Arc<Self>, tenant: TenantHash) -> Option<RefreshStart> {
         let source = self.refresh_source.as_ref()?;
-        let (default_count, done_tx, done_rx) = {
+        let (default_count, issued_ns, done_tx, done_rx) = {
             let mut inner = self.lock();
-            if let Some(in_flight) = inner.refreshing.get(&tenant) {
-                return Some(in_flight.clone());
+            if let Some((issued_ns, done)) = inner.refreshing.get(&tenant) {
+                return Some(RefreshStart::InFlight {
+                    issued_ns: *issued_ns,
+                    done: done.clone(),
+                });
             }
+            let issued_ns = source.clock.now_ns();
             if inner
                 .read_backoff
-                .blocked_until(&tenant, source.clock.now_ns())
+                .blocked_until(&tenant, issued_ns)
                 .is_some()
             {
-                // Inside the read backoff window: resolve as a failed read
-                // without issuing one.
-                let (_, backed_off) = watch::channel(Some(false));
-                return Some(backed_off);
+                return Some(RefreshStart::BackedOff);
             }
             let (done_tx, done_rx) = watch::channel(None);
-            inner.refreshing.insert(tenant, done_rx.clone());
-            (inner.default_count, done_tx, done_rx)
+            inner.refreshing.insert(tenant, (issued_ns, done_rx.clone()));
+            (inner.default_count, issued_ns, done_tx, done_rx)
         };
         let store = Arc::clone(&source.store);
-        let clock = Arc::clone(&source.clock);
         let signal = source.signal;
         let switch = Arc::downgrade(self);
         tokio::spawn(async move {
-            let issued_ns = clock.now_ns();
             let loaded = load_view(store.as_ref(), signal, &tenant, default_count).await;
             let installed = loaded.is_ok();
             if let Some(switch) = switch.upgrade() {
@@ -1798,7 +2030,10 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
             }
             done_tx.send_replace(Some(installed));
         });
-        Some(done_rx)
+        Some(RefreshStart::InFlight {
+            issued_ns,
+            done: done_rx,
+        })
     }
 }
 
@@ -2499,75 +2734,265 @@ mod tests {
         assert_eq!(set.len(), 8, "a read issued at the same instant installs");
     }
 
-    /// The hold check of a flush that found no trusted view (issue #4363):
-    /// inside the bound it re-reads nothing; once spent it re-reads the record
-    /// once, and a read that installs a trusted view returns its verdict
-    /// instead of a drop. A drain that already re-read the tenant does not
-    /// read again.
+    const HOLD_BOUND: Duration = Duration::from_secs(60);
+    const HOLD_BOUND_NS: i64 = 60_000_000_000;
+
+    /// One enforced [`StaleViewHold::step`] at `now_ns`, with no refreshed
+    /// view, a latest failed read issued at `failed`, and a read request that
+    /// answers `issue` and is counted in `requests`.
+    fn hold_step(
+        hold: &mut StaleViewHold,
+        requests: &std::cell::Cell<usize>,
+        now_ns: i64,
+        failed: Option<i64>,
+        issue: Option<i64>,
+    ) -> HoldState {
+        hold.step(
+            None,
+            failed,
+            || {
+                requests.set(requests.get() + 1);
+                issue
+            },
+            now_ns,
+            HOLD_BOUND,
+            true,
+        )
+    }
+
+    /// A spent hold requests one read without waiting, keeps the buffer while
+    /// that read is outstanding, and drops it only once a read issued at or
+    /// after that request has failed (issue #4363). No read is requested
+    /// inside the bound, and a failure of a read issued before the hold was
+    /// spent does not drop.
     ///
-    /// Guard: the re-read in `held_view_check`. Without it the spent hold
-    /// returns `Unknown` (a drop) though the store answers.
-    #[tokio::test]
-    async fn a_spent_stale_view_hold_reads_once_more_before_the_drop() {
-        const BOUND: Duration = Duration::from_secs(60);
-        let bound_ns = 60_000_000_000;
+    /// Guards, each shown failing: dropping on any failure since the hold
+    /// started (drops at `spent`, where a pre-spend failure exists); dropping
+    /// once the hold is spent without a read (drops at `spent`); requesting a
+    /// read on every trigger (`requests` reaches 2); never dropping on a
+    /// failed read (still `Spent` at `spent + 6`).
+    #[test]
+    fn a_spent_hold_drops_only_once_a_read_issued_since_fails() {
         let t0 = 10 * NS_PER_HOUR;
-        let scope = ScriptedScope::<()>::new(ScanCheck::Unknown, None);
-        let clock = SetClock(std::sync::atomic::AtomicI64::new(t0));
-        async fn check_at(
-            scope: &ScriptedScope<()>,
-            clock: &SetClock,
-            now_ns: i64,
-            since: &mut Option<i64>,
-            drain: bool,
-        ) -> ScanCheck {
-            clock.0.store(now_ns, std::sync::atomic::Ordering::SeqCst);
-            held_view_check(
-                scope,
-                clock,
-                BOUND,
-                tenant(1),
-                0,
-                10,
-                now_ns,
-                since,
-                true,
-                drain,
+        let spent = t0 + HOLD_BOUND_NS;
+        let requests = std::cell::Cell::new(0);
+        let mut hold = StaleViewHold::default();
+
+        assert_eq!(
+            hold_step(&mut hold, &requests, t0, None, None),
+            HoldState::Inside
+        );
+        assert_eq!(
+            hold_step(&mut hold, &requests, spent - 1, Some(t0), Some(spent - 1)),
+            HoldState::Inside,
+            "a failure inside the bound does not drop"
+        );
+        assert_eq!(requests.get(), 0, "no read is requested inside the bound");
+
+        assert_eq!(
+            hold_step(&mut hold, &requests, spent, Some(spent - 1), Some(spent)),
+            HoldState::Spent,
+            "a failure of a read issued before the spend does not drop"
+        );
+        assert_eq!(requests.get(), 1);
+        assert_eq!(hold.read_issued_ns(), Some(spent));
+
+        assert_eq!(
+            hold_step(&mut hold, &requests, spent + 5, Some(spent - 1), Some(spent + 5)),
+            HoldState::Spent
+        );
+        assert_eq!(requests.get(), 1, "the recorded read is not requested again");
+
+        assert_eq!(
+            hold_step(&mut hold, &requests, spent + 6, Some(spent), None),
+            HoldState::Drop,
+            "the read issued after the spend failed"
+        );
+    }
+
+    /// A spent hold whose read never resolves drops one `max_flush_lifetime`
+    /// after it was spent, and not one nanosecond earlier.
+    ///
+    /// Guards, each shown failing: no deadline (still `Spent` at
+    /// `spent + bound`); a deadline counted from the hold's start (drops at
+    /// `spent`).
+    #[test]
+    fn a_spent_hold_with_no_answer_drops_at_its_deadline() {
+        let t0 = 10 * NS_PER_HOUR;
+        let spent = t0 + HOLD_BOUND_NS;
+        let requests = std::cell::Cell::new(0);
+        let mut hold = StaleViewHold::default();
+        hold_step(&mut hold, &requests, t0, None, None);
+        assert_eq!(
+            hold_step(&mut hold, &requests, spent, None, Some(spent)),
+            HoldState::Spent
+        );
+        assert_eq!(
+            hold_step(&mut hold, &requests, spent + HOLD_BOUND_NS - 1, None, None),
+            HoldState::Spent
+        );
+        assert_eq!(
+            hold_step(&mut hold, &requests, spent + HOLD_BOUND_NS, None, None),
+            HoldState::Drop
+        );
+    }
+
+    /// A read the backoff window refuses counts as not issued: the hold stays
+    /// spent, asks again on each trigger, and drops only once a read issued
+    /// after the window has failed (finding 2 of the #4363 review). A joined
+    /// read issued before the spend is not recorded either.
+    ///
+    /// Guards, each shown failing: treating a backed-off request as a failed
+    /// read (drops at `spent`); recording the joined older read (drops at
+    /// `spent + 1` on its failure); requesting only once after the spend (no
+    /// read recorded at `spent + 2`, still `Spent` at `spent + 3`).
+    #[test]
+    fn a_backed_off_read_is_requested_again_before_any_drop() {
+        let t0 = 10 * NS_PER_HOUR;
+        let spent = t0 + HOLD_BOUND_NS;
+        let requests = std::cell::Cell::new(0);
+        let mut hold = StaleViewHold::default();
+        hold_step(&mut hold, &requests, t0, None, None);
+
+        assert_eq!(
+            hold_step(&mut hold, &requests, spent, Some(spent - 1), None),
+            HoldState::Spent,
+            "backed off: nothing issued"
+        );
+        assert_eq!(hold.read_issued_ns(), None);
+        assert_eq!(
+            hold_step(&mut hold, &requests, spent + 1, Some(spent - 1), Some(spent - 7)),
+            HoldState::Spent,
+            "a joined read issued before the spend"
+        );
+        assert_eq!(hold.read_issued_ns(), None);
+        assert_eq!(
+            hold_step(&mut hold, &requests, spent + 2, Some(spent - 7), Some(spent + 2)),
+            HoldState::Spent
+        );
+        assert_eq!(hold.read_issued_ns(), Some(spent + 2));
+        assert_eq!(requests.get(), 3, "one request per trigger until one issues");
+        assert_eq!(
+            hold_step(&mut hold, &requests, spent + 3, Some(spent + 2), None),
+            HoldState::Drop
+        );
+    }
+
+    /// A read issued at or after the hold's start that installs a view ends
+    /// the hold, spent or not, and a new one starts at the attempt; a
+    /// teardown pass starts no hold and drops a spent one.
+    #[test]
+    fn a_refreshed_view_restarts_the_hold_and_teardown_starts_none() {
+        let t0 = 10 * NS_PER_HOUR;
+        let spent = t0 + HOLD_BOUND_NS;
+        let requests = std::cell::Cell::new(0);
+        let mut hold = StaleViewHold::default();
+        hold_step(&mut hold, &requests, t0, None, None);
+        hold_step(&mut hold, &requests, spent, None, Some(spent));
+        let state = hold.step(
+            Some(spent),
+            Some(spent - 1),
+            || Some(spent + 1),
+            spent + 1,
+            HOLD_BOUND,
+            true,
+        );
+        assert_eq!(state, HoldState::Inside);
+        assert_eq!(hold.read_issued_ns(), None);
+        assert_eq!(
+            hold_step(&mut hold, &requests, spent + HOLD_BOUND_NS, None, None),
+            HoldState::Inside,
+            "the restarted hold counts from spent + 1"
+        );
+
+        let mut teardown = StaleViewHold::default();
+        assert_eq!(
+            teardown.step(None, None, || None, t0, HOLD_BOUND, false),
+            HoldState::Inside
+        );
+        assert_eq!(teardown, StaleViewHold::default(), "no hold starts");
+        assert!(!HoldState::Inside.drops(false));
+        assert!(HoldState::Spent.drops(false));
+        assert!(!HoldState::Spent.drops(true));
+        assert!(HoldState::Drop.drops(true));
+    }
+
+    /// Against a real switch (issue #4363, finding 2): a hold spent inside the
+    /// read backoff window issues no GET and does not drop although a read
+    /// failed just before the spend; once the window ends the next trigger
+    /// issues a read, and the hold drops after that read fails, or restarts
+    /// when it installs the view. The actor side never awaits the read: the
+    /// test joins it with [`GenerationSwitch::reread`].
+    ///
+    /// Guards, each shown failing: `request_read` answering a backed-off
+    /// request with the clock reading (records a read no GET backs, which the
+    /// pre-spend failure never matches, so `read_issued_ns` is not `None`);
+    /// `failed_reads` not recorded in `note_read_failure` (`Spent`, not
+    /// `Drop`, at the end).
+    #[tokio::test]
+    async fn a_spent_hold_waits_out_the_read_backoff_on_the_switch() {
+        const BOUND: Duration = Duration::from_secs(2);
+        const MS: i64 = 1_000_000;
+        for (faults, recovers) in [(2, false), (1, true)] {
+            let t = tenant(7);
+            let key = provisioning_key(&t, Signal::Metrics);
+            let store = crate::read_backoff::failing_then_passing_get_store(&key, faults);
+            ravel_catalog::validate_or_adopt(
+                store.inner(),
+                &t,
+                Signal::Metrics,
+                1,
+                1,
+                ravel_catalog::AbsentPolicy::CreateFromConfig,
             )
             .await
+            .expect("provision");
+            let t0 = 10 * NS_PER_HOUR;
+            let clock = Arc::new(SetClock(std::sync::atomic::AtomicI64::new(t0)));
+            let set = |now: i64| clock.0.store(now, std::sync::atomic::Ordering::SeqCst);
+            let sw = Arc::new(
+                index_switch(1, DEFAULT_REFRESH_INTERVAL_NS).with_refresh_source(
+                    store.clone(),
+                    Signal::Metrics,
+                    clock.clone(),
+                ),
+            );
+            let step = |hold: &mut StaleViewHold, now: i64| {
+                set(now);
+                hold.step(
+                    sw.view_refreshed_at(t),
+                    sw.failed_read_at(t),
+                    || sw.request_read(t),
+                    now,
+                    BOUND,
+                    true,
+                )
+            };
+
+            let mut hold = StaleViewHold::default();
+            assert_eq!(step(&mut hold, t0), HoldState::Inside);
+            set(t0 + 1_900 * MS);
+            assert!(!sw.reread(t).await, "a read just before the spend fails");
+            assert_eq!(sw.failed_read_at(t), Some(t0 + 1_900 * MS));
+            assert_eq!(store.sequence_progress(0), 1);
+
+            assert_eq!(step(&mut hold, t0 + 2_000 * MS), HoldState::Spent);
+            assert_eq!(step(&mut hold, t0 + 2_899 * MS), HoldState::Spent);
+            assert_eq!(hold.read_issued_ns(), None);
+            assert_eq!(store.sequence_progress(0), 1, "no GET inside the window");
+
+            assert_eq!(step(&mut hold, t0 + 2_900 * MS), HoldState::Spent);
+            assert_eq!(hold.read_issued_ns(), Some(t0 + 2_900 * MS));
+            assert_eq!(sw.reread(t).await, recovers, "the test joins the read");
+            assert_eq!(store.sequence_progress(0), 2, "one GET after the window");
+
+            let expected = if recovers {
+                HoldState::Inside
+            } else {
+                HoldState::Drop
+            };
+            assert_eq!(step(&mut hold, t0 + 2_901 * MS), expected);
         }
-
-        let mut since = None;
-        assert_eq!(
-            check_at(&scope, &clock, t0, &mut since, false).await,
-            ScanCheck::Unknown
-        );
-        assert_eq!(since, Some(t0), "the hold starts");
-        assert_eq!(
-            check_at(&scope, &clock, t0 + bound_ns - 1, &mut since, false).await,
-            ScanCheck::Unknown
-        );
-        assert_eq!(scope.rereads(), 0, "no re-read inside the bound");
-
-        assert_eq!(
-            check_at(&scope, &clock, t0 + bound_ns, &mut since, true).await,
-            ScanCheck::Unknown
-        );
-        assert_eq!(scope.rereads(), 0, "the drain already re-read");
-
-        assert_eq!(
-            check_at(&scope, &clock, t0 + bound_ns, &mut since, false).await,
-            ScanCheck::Unknown
-        );
-        assert_eq!(scope.rereads(), 1, "a failed last read");
-
-        scope.set_reread(Some(ScanCheck::InScanSet));
-        assert_eq!(
-            check_at(&scope, &clock, t0 + 2 * bound_ns, &mut since, false).await,
-            ScanCheck::InScanSet
-        );
-        assert_eq!(scope.rereads(), 2);
-        assert_eq!(since, Some(t0), "the caller ends the hold");
     }
 
     /// The flush-open background re-read ([`GenerationSwitch::reread`]) merges
