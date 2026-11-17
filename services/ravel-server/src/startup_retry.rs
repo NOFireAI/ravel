@@ -12,7 +12,9 @@
 //! The wait between attempts is capped exponential backoff with jitter, and
 //! one deadline shared by every site and measured from process start
 //! (`--startup-store-deadline`) bounds both the retries and each attempt: an
-//! attempt still running when the deadline passes is cut off. Every other
+//! attempt runs for at most the time left before the deadline or
+//! [`MIN_STARTUP_ATTEMPT`], whichever is longer, and is cut off if it is still
+//! running then. Every other
 //! error refuses on the attempt that returned it, with the message it had
 //! before this module existed. Time, sleep and the attempt bound come from a
 //! [`StartupClock`], so tests drive the deadline without waiting.
@@ -42,9 +44,16 @@ use crate::tenant_kms::{TenantKmsConfig, TenantKmsError};
 /// ravel-server pod no startup probe and a liveness probe of
 /// `initialDelaySeconds: 5`, `periodSeconds: 10`, `failureThreshold: 3`, so
 /// the earliest restart lands 25 s after the container starts. Every attempt
-/// that starts before the deadline ends by it, so a refusal is reported by
-/// 15 s, 10 s before that restart.
+/// that starts by the deadline ends by the deadline plus
+/// [`MIN_STARTUP_ATTEMPT`], so such a read refuses by 20 s, 5 s before that
+/// restart.
 pub const DEFAULT_STARTUP_STORE_DEADLINE: Duration = Duration::from_secs(15);
+
+/// The shortest bound any attempt gets. An attempt runs for the time left
+/// before the deadline or this, whichever is longer, so a healthy read that
+/// starts just before the deadline is not cut off, and a read first reached
+/// after it still has a bound.
+pub const MIN_STARTUP_ATTEMPT: Duration = Duration::from_secs(5);
 
 /// First backoff before jitter; doubles per attempt up to [`MAX_BACKOFF`].
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
@@ -114,12 +123,14 @@ pub enum StartupReadFailure<E> {
         deadline: Duration,
         last: E,
     },
-    /// Attempt `attempts` was still running when the deadline passed. `last`
-    /// is the transient error of the attempt before it, if there was one.
+    /// Attempt `attempts` was still running when its bound, `bound`, ran
+    /// out. `last` is the transient error of the attempt before it, if there
+    /// was one.
     CutOff {
         site: &'static str,
         attempts: u32,
         deadline: Duration,
+        bound: Duration,
         last: Option<E>,
     },
 }
@@ -156,13 +167,16 @@ impl<E> StartupReadFailure<E> {
                 site,
                 attempts,
                 deadline,
+                bound,
                 last,
             } => {
                 let message = format!(
-                    "startup store read of {site} was cut off when the startup deadline of {} \
-                     (--startup-store-deadline) passed during attempt {attempts}; refusing to \
-                     start",
-                    humantime::format_duration(deadline)
+                    "startup store read of {site} was cut off after attempt {attempts} ran for \
+                     {}, its bound under the startup deadline of {} (--startup-store-deadline): \
+                     the time left before the deadline, and never less than {}; refusing to start",
+                    humantime::format_duration(bound),
+                    humantime::format_duration(deadline),
+                    humantime::format_duration(MIN_STARTUP_ATTEMPT)
                 );
                 match last {
                     Some(err) => refuse(err).context(message),
@@ -216,15 +230,27 @@ impl StartupRetry {
             .filter(|remaining| !remaining.is_zero())
     }
 
+    /// The bound on an attempt starting now: the time left before the
+    /// deadline or [`MIN_STARTUP_ATTEMPT`], whichever is longer.
+    fn attempt_bound(&self) -> Duration {
+        self.remaining()
+            .unwrap_or(Duration::ZERO)
+            .max(MIN_STARTUP_ATTEMPT)
+    }
+
     /// Run `op` until it succeeds, fails with an error `is_transient` rejects,
     /// or the deadline ends it. Each retry logs one warning naming `site`, the
     /// attempt number and the error.
     ///
-    /// An attempt that starts before the deadline is cut off if it is still
-    /// running when the deadline passes; it counts as one attempt. A retry
-    /// starts only when its wait ends before the deadline, so every retry
-    /// starts with time left. A site whose first attempt starts after the
-    /// deadline has passed gets that one attempt, unbounded, and no retry.
+    /// Every attempt is bounded by the time left before the deadline or
+    /// [`MIN_STARTUP_ATTEMPT`], whichever is longer, and is cut off if it is
+    /// still running then; a cut-off attempt counts as one attempt. A retry
+    /// starts only when its wait ends before the deadline, so an attempt that
+    /// starts by the deadline ends by the deadline plus
+    /// [`MIN_STARTUP_ATTEMPT`]. A site whose first attempt starts after the
+    /// deadline has passed gets that one attempt, bounded by
+    /// [`MIN_STARTUP_ATTEMPT`], and no retry: a transient failure there
+    /// refuses.
     pub async fn run<T, E, F, Fut>(
         &self,
         site: &'static str,
@@ -243,11 +269,11 @@ impl StartupRetry {
             let bound = if self.deadline.is_zero() {
                 None
             } else {
-                self.remaining()
+                Some(self.attempt_bound())
             };
             // A wait that overran the deadline: the retry does not start.
-            if bound.is_none()
-                && !self.deadline.is_zero()
+            if bound.is_some()
+                && self.remaining().is_none()
                 && let Some(err) = last.take()
             {
                 return Err(StartupReadFailure::DeadlinePassed {
@@ -259,10 +285,10 @@ impl StartupRetry {
             }
             let outcome = match bound {
                 None => op().await,
-                Some(remaining) => {
+                Some(bound) => {
                     let attempt_future = op();
                     tokio::pin!(attempt_future);
-                    let timer = self.clock.attempt_timer(remaining);
+                    let timer = self.clock.attempt_timer(bound);
                     tokio::select! {
                         biased;
                         outcome = &mut attempt_future => outcome,
@@ -270,14 +296,16 @@ impl StartupRetry {
                             tracing::warn!(
                                 site,
                                 attempt,
+                                bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
                                 deadline_ms = u64::try_from(self.deadline.as_millis())
                                     .unwrap_or(u64::MAX),
-                                "startup store read cut off at the startup deadline"
+                                "startup store read cut off at the end of its attempt bound"
                             );
                             return Err(StartupReadFailure::CutOff {
                                 site,
                                 attempts: attempt,
                                 deadline: self.deadline,
+                                bound,
                                 last,
                             });
                         }
@@ -732,13 +760,20 @@ pub(crate) mod test_support {
         );
     }
 
-    /// The text `into_anyhow` gives an attempt cut off at the deadline.
-    pub(crate) fn assert_cut_off_refusal(err: &anyhow::Error, site: &str, attempts: u64) {
+    /// The text `into_anyhow` gives an attempt cut off after `bound`.
+    pub(crate) fn assert_cut_off_refusal(
+        err: &anyhow::Error,
+        site: &str,
+        attempts: u64,
+        bound: Duration,
+    ) {
         assert_eq!(
             err.to_string(),
             format!(
-                "startup store read of {site} was cut off when the startup deadline of 15s \
-                 (--startup-store-deadline) passed during attempt {attempts}; refusing to start"
+                "startup store read of {site} was cut off after attempt {attempts} ran for {}, \
+                 its bound under the startup deadline of 15s (--startup-store-deadline): the \
+                 time left before the deadline, and never less than 5s; refusing to start",
+                humantime::format_duration(bound)
             )
         );
     }
@@ -834,7 +869,7 @@ mod tests {
             .await
             .expect_err("a hung read refuses at the deadline");
         assert_eq!(gate.held_count(), 1, "the one attempt reached the store");
-        assert_cut_off_refusal(&err, SITE_QUALIFICATION, 1);
+        assert_cut_off_refusal(&err, SITE_QUALIFICATION, 1, DEADLINE);
         assert_eq!(clock.cut_offs(), vec![DEADLINE]);
         assert_eq!(clock.virtual_now(), DEADLINE);
         assert!(clock.sleeps().is_empty());
@@ -858,7 +893,7 @@ mod tests {
             .expect_err("the hung retry refuses at the deadline");
         assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 1);
         assert_eq!(gate.held_count(), 1);
-        assert_cut_off_refusal(&err, SITE_QUALIFICATION, 2);
+        assert_cut_off_refusal(&err, SITE_QUALIFICATION, 2, DEADLINE - clock.sleeps()[0]);
         assert!(
             format!("{err:#}").contains("store backend is not qualified"),
             "{err:#}"
@@ -914,6 +949,72 @@ mod tests {
         );
         assert!(clock.sleeps().is_empty());
         assert!(clock.cut_offs().is_empty());
+    }
+
+    /// A healthy read that starts 1 s before the deadline and takes 3 s is
+    /// bounded by `MIN_STARTUP_ATTEMPT`, not by the 1 s left, and starts. On
+    /// tokio's paused clock, so the store delay and the attempt bound race in
+    /// virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn a_healthy_read_started_just_before_the_deadline_is_not_cut_off() {
+        let retry = StartupRetry::new(Arc::new(TokioStartupClock::starting_now()), DEADLINE, 7);
+        let started = tokio::time::Instant::now();
+        tokio::time::advance(DEADLINE - Duration::from_secs(1)).await;
+        let store = faulted(FaultPlan::empty());
+        seed_qualification(store.inner()).await;
+        let gate = store.hold(
+            Op::Get,
+            Some(QUALIFICATION_KEY.to_string()),
+            ravel_object_store::fault::Occurrence::Always,
+        );
+        let releaser = {
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                gate.wait_until_held(1).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let held = gate.held();
+                assert_eq!(held.len(), 1);
+                assert!(gate.release(held[0]));
+            })
+        };
+        enforce_qualification(&retry, &store, StoreKind::S3, None)
+            .await
+            .expect("a read answering 3 s after it starts is not cut off");
+        releaser.await.expect("releaser task");
+        assert_eq!(gate.held_count(), 0);
+        assert_eq!(
+            started.elapsed(),
+            DEADLINE + Duration::from_secs(2),
+            "the read ran its full 3 s"
+        );
+    }
+
+    /// A site first reached after the deadline gets one attempt bounded by
+    /// `MIN_STARTUP_ATTEMPT`: a store that never answers is cut off 5 s after
+    /// the attempt starts and refuses, instead of holding startup.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_first_attempt_after_the_deadline_is_cut_off_after_the_minimum() {
+        let retry = StartupRetry::new(Arc::new(TokioStartupClock::starting_now()), DEADLINE, 7);
+        let started = tokio::time::Instant::now();
+        let reached = DEADLINE + Duration::from_secs(1);
+        tokio::time::advance(reached).await;
+        let store = faulted(FaultPlan::empty());
+        seed_qualification(store.inner()).await;
+        let gate = store.hold(
+            Op::Get,
+            Some(QUALIFICATION_KEY.to_string()),
+            ravel_object_store::fault::Occurrence::Always,
+        );
+        let err = tokio::time::timeout(
+            Duration::from_secs(600),
+            enforce_qualification(&retry, &store, StoreKind::S3, None),
+        )
+        .await
+        .expect("an attempt after the deadline is bounded")
+        .expect_err("a hung read refuses");
+        assert_eq!(gate.held_count(), 1, "the one attempt reached the store");
+        assert_cut_off_refusal(&err, SITE_QUALIFICATION, 1, MIN_STARTUP_ATTEMPT);
+        assert_eq!(started.elapsed(), reached + MIN_STARTUP_ATTEMPT);
     }
 
     #[tokio::test]
