@@ -715,9 +715,15 @@ impl SpanFlushCtx {
                 .attempt_when_fresh(self.clock.as_ref(), deadline_ns)
                 .await
                 .map_err(PutAbort::Refused)?;
-            let call = publish::publish(self.store.as_ref(), record, &single_attempt);
+            let call =
+                publish::publish_deferring_evidence(self.store.as_ref(), record, &single_attempt);
             match self.bound_to_deadline(deadline_ns, call).await {
-                Some(Ok(token)) => return Ok(token),
+                Some(Ok(token)) => {
+                    // After the race, so the instrumented build's evidence
+                    // read cannot abandon a landed commit.
+                    publish::assert_commit_has_data(self.store.as_ref(), record).await;
+                    return Ok(token);
+                }
                 Some(Err(PublishError::SplitBrain { this, stored })) => {
                     panic!(
                         "ravel-ingest: fatal split-brain on pinned span flush identity: this={this} stored={stored}"

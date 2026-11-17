@@ -849,19 +849,22 @@ impl LogIngestRouter {
         }
 
         // As in `Submitted::acks`: a HEAD of every token's commit key, not
-        // the shards' acks, is the evidence. The condition also notes the
-        // shards this request was dispatched to, for the marker property
-        // (`idempotency::receipt_commits_are_durable`). The default build
-        // compiles the assertion out, leaving `tenant_hash` unread.
+        // the shards' acks, is the evidence. For a request that acks, the
+        // condition also notes the shards it was dispatched to, for the marker
+        // property (`idempotency::receipt_commits_are_durable`); a failed
+        // request writes no marker. The default build compiles the assertion
+        // out, leaving `tenant_hash` unread.
         let _ = tenant_hash;
         ravel_invariant::inv_always!(
             {
-                crate::idempotency::note_request_shards(
-                    tenant_hash,
-                    ravel_types::Signal::Logs,
-                    &durable,
-                    &ack_shards,
-                );
+                if first_error.is_none() {
+                    crate::idempotency::note_request_shards(
+                        tenant_hash,
+                        ravel_types::Signal::Logs,
+                        &durable,
+                        &ack_shards,
+                    );
+                }
                 crate::router::commit_records_exist(
                     self.store.as_ref(),
                     &tenant_hash,

@@ -445,12 +445,13 @@ pub async fn write_marker(
     }
 }
 
-/// The shards each recent strict logs request was dispatched to, keyed by its
-/// tenant, signal and receipt tokens as the marker stores them. Only the
-/// instrumented build fills it (the logs router calls [`note_request_shards`]
-/// from an assertion condition); the oldest entry is dropped past
-/// [`MAX_NOTED_REQUESTS`]. A spans receipt finds no entry and is checked
-/// against the shards its own tokens name.
+/// The shards each recent acked strict logs request was dispatched to, keyed
+/// per request: the tokio task that awaited its acks, which is the task that
+/// writes its marker, plus its tenant, signal and receipt tokens as the
+/// marker stores them. Only the instrumented build fills it (the logs router
+/// calls [`note_request_shards`] from an assertion condition); the oldest
+/// entry is dropped past [`MAX_NOTED_REQUESTS`]. A spans receipt finds no
+/// entry and is checked against the shards its own tokens name.
 #[allow(dead_code)]
 static REQUEST_SHARDS: std::sync::Mutex<std::collections::VecDeque<NotedRequest>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
@@ -460,6 +461,7 @@ const MAX_NOTED_REQUESTS: usize = 4096;
 
 #[allow(dead_code)]
 struct NotedRequest {
+    task: Option<tokio::task::Id>,
     tenant_hash: TenantHash,
     signal: Signal,
     commit_token: String,
@@ -473,9 +475,10 @@ fn noted_requests() -> std::sync::MutexGuard<'static, std::collections::VecDeque
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Records that the strict request whose receipt is `tokens` was dispatched
-/// to `shards`: the routing, which decides which shards must commit before
-/// the request is complete. Only an invariant condition calls this.
+/// Records that the acked strict request whose receipt is `tokens`, awaited
+/// on the current task, was dispatched to `shards`: the routing, which
+/// decides which shards must commit before the request is complete. Only an
+/// invariant condition calls this.
 #[allow(dead_code)]
 pub(crate) fn note_request_shards(
     tenant_hash: TenantHash,
@@ -491,6 +494,7 @@ pub(crate) fn note_request_shards(
         noted.pop_front();
     }
     noted.push_back(NotedRequest {
+        task: tokio::task::try_id(),
         tenant_hash,
         signal,
         commit_token: crate::router::encode_tokens(tokens),
@@ -498,8 +502,10 @@ pub(crate) fn note_request_shards(
     });
 }
 
-/// The shards the request behind `receipt` was dispatched to: every shard a
-/// router noted for this receipt, else the shards its tokens name.
+/// The shards the request behind `receipt` was dispatched to: the newest
+/// record this task noted for this receipt, which it consumes, else the
+/// shards the receipt's tokens name. Another request's record never counts,
+/// even when a shared flush gave both requests the same receipt tokens.
 #[allow(dead_code)]
 fn request_shards(
     tenant_hash: &TenantHash,
@@ -507,19 +513,17 @@ fn request_shards(
     receipt: &IdempotencyReceipt,
     tokens: &[ravel_types::CommitToken],
 ) -> std::collections::BTreeSet<u32> {
-    let noted: std::collections::BTreeSet<u32> = noted_requests()
-        .iter()
-        .filter(|n| {
-            n.tenant_hash == *tenant_hash
-                && n.signal == signal
-                && n.commit_token == receipt.commit_token
-        })
-        .flat_map(|n| n.shards.iter().copied())
-        .collect();
-    if noted.is_empty() {
-        tokens.iter().map(|t| t.shard).collect()
-    } else {
-        noted
+    let task = tokio::task::try_id();
+    let mut noted = noted_requests();
+    let newest = noted.iter().rposition(|n| {
+        n.task == task
+            && n.tenant_hash == *tenant_hash
+            && n.signal == signal
+            && n.commit_token == receipt.commit_token
+    });
+    match newest.and_then(|i| noted.remove(i)) {
+        Some(request) => request.shards.into_iter().collect(),
+        None => tokens.iter().map(|t| t.shard).collect(),
     }
 }
 
@@ -1824,7 +1828,8 @@ mod tests {
     }
 
     /// A two-shard strict log router whose shards flush only on age, so
-    /// writes that arrive before `clock` moves share one flush per shard.
+    /// writes that arrive before `clock` moves share one flush per shard. A
+    /// failed PUT is not retried, so it abandons its flush at once.
     fn batching_two_shard_logs(
         store: Arc<dyn ObjectStoreBackend>,
         clock: Arc<crate::compat_signal_tests::ManualClock>,
@@ -1835,6 +1840,7 @@ mod tests {
                 target_bytes: 64 * 1024 * 1024,
                 max_flush_delay: std::time::Duration::from_millis(50),
                 flush_tick: std::time::Duration::from_millis(10),
+                put_retry_max_attempts: 0,
                 ..crate::IngestConfig::default()
             },
             store,
@@ -1865,30 +1871,53 @@ mod tests {
         records
     }
 
-    /// Spawns a strict logs write of `records` for `tenant`.
+    /// Spawns a strict logs write of `records` for `tenant`. When it acks,
+    /// the same task writes its marker under `client_key`, as ravel-server
+    /// does after a keyed write.
     fn spawn_logs_write(
         router: &Arc<crate::LogIngestRouter>,
+        store: &Arc<dyn ObjectStoreBackend>,
         tenant: &TenantId,
         records: Vec<ravel_otlp::logs_normalize::NormalizedLogRecord>,
+        client_key: &'static [u8],
     ) -> tokio::task::JoinHandle<Result<crate::LogWriteReceipt, crate::LogWriteError>> {
         let router = Arc::clone(router);
+        let store = Arc::clone(store);
         let tenant = tenant.clone();
         tokio::spawn(async move {
-            router
+            let written = records.len();
+            let outcome = router
                 .write(
-                    tenant,
+                    tenant.clone(),
                     records,
                     crate::WriteMode::Strict,
                     HELD_COMMIT_ACK_BOUND,
                 )
-                .await
+                .await;
+            if let Ok(receipt) = &outcome {
+                write_server_marker(
+                    store.as_ref(),
+                    &tenant,
+                    client_key,
+                    written,
+                    &receipt.tokens,
+                )
+                .await;
+            }
+            outcome
         })
     }
 
+    /// The marker client keys of [`batched_writes`]' two requests.
+    const SPANNING_KEY: &[u8] = b"batched-spanning";
+    const FIRST_SHARD_KEY: &[u8] = b"batched-first-shard";
+
     /// Two concurrent strict writes of one tenant, buffered before either
     /// shard flushes: the first spans both shards, the second only shard 0
-    /// and carries at least as many rows as the first. Returns both receipts
-    /// and the first request's row count.
+    /// and carries at least as many rows as the first. Each writes its
+    /// marker in its own task when it acks ([`SPANNING_KEY`],
+    /// [`FIRST_SHARD_KEY`]). Returns both receipts and the first request's
+    /// row count.
     async fn batched_writes(
         store: Arc<dyn ObjectStoreBackend>,
         tenant: &TenantId,
@@ -1899,13 +1928,13 @@ mod tests {
         usize,
     ) {
         let clock = crate::compat_signal_tests::ManualClock::new();
-        let router = batching_two_shard_logs(store, Arc::clone(&clock));
+        let router = batching_two_shard_logs(Arc::clone(&store), Arc::clone(&clock));
         let both = records_on_both_shards();
         let written = both.len();
         let first_only = records_on_shard(0, written);
         let buffered = (written + first_only.len()) as u64;
-        let spanning = spawn_logs_write(&router, tenant, both);
-        let first_shard = spawn_logs_write(&router, tenant, first_only);
+        let spanning = spawn_logs_write(&router, &store, tenant, both, SPANNING_KEY);
+        let first_shard = spawn_logs_write(&router, &store, tenant, first_only, FIRST_SHARD_KEY);
         while router.metrics_snapshot().buffered_records_total < buffered {
             tokio::task::yield_now().await;
         }
@@ -1955,27 +1984,13 @@ mod tests {
             vec![spanning.tokens[0].clone()],
             "one shard-0 flush carried both requests"
         );
+        let shared = stored_record(store.as_ref(), &tenant, &spanning.tokens[0]).await;
+        assert!(
+            shared.sample_count > written as u64,
+            "the shared shard-0 record carries both requests' rows"
+        );
 
-        write_server_marker(
-            store.as_ref(),
-            &tenant,
-            b"batched-spanning",
-            written,
-            &spanning.tokens,
-        )
-        .await;
-        let shard_zero_rows = stored_record(store.as_ref(), &tenant, &first_shard.tokens[0])
-            .await
-            .sample_count;
-        write_server_marker(
-            store.as_ref(),
-            &tenant,
-            b"batched-first-shard",
-            usize::try_from(shard_zero_rows).expect("fits"),
-            &first_shard.tokens,
-        )
-        .await;
-        for client_key in [&b"batched-spanning"[..], &b"batched-first-shard"[..]] {
+        for client_key in [SPANNING_KEY, FIRST_SHARD_KEY] {
             let markers = crate::router::invariant_capture::evaluations(
                 MARKER_DURABLE,
                 &keyhash32(&tenant, client_key),
@@ -1983,6 +1998,66 @@ mod tests {
             assert_eq!(markers.len(), 1, "{markers:?}");
             assert!(markers[0].0, "{markers:?}");
         }
+        Arc::into_inner(router)
+            .expect("the write tasks released the router")
+            .shutdown()
+            .await;
+    }
+
+    /// A partial request does not decide another request's marker. The
+    /// spanning request's shard-1 commit PUT is throttled with no retry left,
+    /// so shard 1 abandons and the spanning request fails with shard 0's
+    /// token durable; the shard-0 request acks from the same shard-0 flush,
+    /// with the same receipt tokens. Its marker, dispatched to shard 0 only,
+    /// holds MarkerImpliesAllShardsDurable.
+    #[tokio::test]
+    async fn a_partial_request_sharing_a_flush_does_not_break_another_requests_marker() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        };
+
+        if !crate::router::invariant_capture::capturing() {
+            return;
+        }
+        let tenant = tenant("marker-durable-batched-partial");
+        let second_shard = ravel_commit::keys::commit_shard_prefix(&tenant.hash(), Signal::Logs, 1)
+            .expect("commit prefix");
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Throttled { retry_after_ms: 0 })
+                .with_key_contains(second_shard)
+                .with_occurrence(Occurrence::Always),
+        );
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let (router, spanning, first_shard, _) = batched_writes(Arc::clone(&store), &tenant).await;
+        assert_eq!(
+            fault_store.fault_count(Op::Put, FaultKind::Throttled),
+            1,
+            "shard 1's one commit PUT was throttled"
+        );
+        let durable = match spanning {
+            Err(crate::LogWriteError::PartialWrite { durable, .. }) => durable,
+            other => panic!("the spanning write is partial: {other:?}"),
+        };
+        assert_eq!(durable.len(), 1, "{durable:?}");
+        assert_eq!(durable[0].shard, 0);
+        let first_shard = first_shard.expect("the shard-0 write commits");
+        assert_eq!(
+            first_shard.tokens, durable,
+            "one shard-0 flush carried both"
+        );
+
+        let partial = crate::router::invariant_capture::evaluations(
+            MARKER_DURABLE,
+            &keyhash32(&tenant, SPANNING_KEY),
+        );
+        assert!(partial.is_empty(), "a failed request writes no marker");
+        let markers = crate::router::invariant_capture::evaluations(
+            MARKER_DURABLE,
+            &keyhash32(&tenant, FIRST_SHARD_KEY),
+        );
+        assert_eq!(markers.len(), 1, "{markers:?}");
+        assert!(markers[0].0, "{markers:?}");
         Arc::into_inner(router)
             .expect("the write tasks released the router")
             .shutdown()
@@ -2025,17 +2100,9 @@ mod tests {
             shared.sample_count
         );
 
-        write_server_marker(
-            store.as_ref(),
-            &tenant,
-            b"batched-mutant",
-            written,
-            &spanning.tokens,
-        )
-        .await;
         let markers = crate::router::invariant_capture::evaluations(
             MARKER_DURABLE,
-            &keyhash32(&tenant, b"batched-mutant"),
+            &keyhash32(&tenant, SPANNING_KEY),
         );
         assert!(
             markers.iter().any(|(held, _)| !held),

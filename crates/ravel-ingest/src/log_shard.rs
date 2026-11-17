@@ -1469,9 +1469,15 @@ impl LogFlushCtx {
                 .attempt_when_fresh(self.clock.as_ref(), deadline_ns)
                 .await
                 .map_err(PutAbort::Refused)?;
-            let call = publish::publish(self.store.as_ref(), record, &single_attempt);
+            let call =
+                publish::publish_deferring_evidence(self.store.as_ref(), record, &single_attempt);
             match self.bound_to_deadline(deadline_ns, call).await {
-                Some(Ok(token)) => return Ok(token),
+                Some(Ok(token)) => {
+                    // After the race, so the instrumented build's evidence
+                    // read cannot abandon a landed commit.
+                    publish::assert_commit_has_data(self.store.as_ref(), record).await;
+                    return Ok(token);
+                }
                 Some(Err(PublishError::SplitBrain { this, stored })) => {
                     panic!(
                         "ravel-ingest: fatal split-brain on pinned log flush identity: this={this} stored={stored}"
@@ -4501,6 +4507,74 @@ mod tests {
             !objects.iter().any(|o| o.key.contains("/c/")),
             "no commit record ever lands"
         );
+        h.shutdown().await;
+    }
+
+    /// The NoCommitWithoutData evidence read runs after the commit PUT's
+    /// deadline race: a HEAD held past the flush deadline delays the ack of a
+    /// landed log commit but does not abandon it.
+    #[tokio::test]
+    async fn a_slow_evidence_read_does_not_abandon_a_landed_log_commit() {
+        if !crate::router::invariant_capture::capturing() {
+            return;
+        }
+        let tenant = TenantId::new("no-commit-without-data-slow-log-head");
+        let data_prefix = format!(
+            "t/{}/{}/l0/",
+            tenant.hash().to_hex(),
+            Signal::Logs.key_prefix()
+        );
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = fault.hold(Op::Head, Some(data_prefix.clone()), Occurrence::Nth(1));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let lifetime = Duration::from_secs(1);
+        let h = Harness::spawn_with_store(
+            IngestConfig {
+                max_flush_lifetime: lifetime,
+                ..flush_on_first()
+            },
+            Arc::clone(&store),
+        );
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::Write {
+            arrival: false,
+            tenant: tenant.clone(),
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")].into(),
+            ack: Some(ack_tx),
+            charge: None,
+        })
+        .await
+        .expect("send write");
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_until_held(1))
+            .await
+            .expect("the commit's evidence read reached the store");
+        let objects = list_all(store.as_ref(), &format!("t/{}/", tenant.hash().to_hex()))
+            .await
+            .expect("list");
+        assert!(
+            objects.iter().any(|o| o.key.contains("/c/")),
+            "the commit record landed before the evidence read"
+        );
+        h.clock
+            .advance_ns(2 * i64::try_from(lifetime.as_nanos()).expect("fits"));
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        ack_rx
+            .await
+            .expect("ack sender not dropped")
+            .expect("the landed commit is acked although its evidence read outlived the deadline");
+        assert_eq!(h.metrics.snapshot().abandoned_retry_exhausted, 0);
+        let evaluations = crate::router::invariant_capture::evaluations(
+            "commit: a commit record never exists without its data object",
+            &data_prefix,
+        );
+        assert_eq!(evaluations.len(), 1, "{evaluations:?}");
+        assert!(evaluations[0].0, "{evaluations:?}");
         h.shutdown().await;
     }
 
