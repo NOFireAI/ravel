@@ -2150,10 +2150,12 @@ The procedure, for family F from version N to N+1:
 
    `--pre-baseline-processes-terminated` attests step 5, and without it the
    command exits 2 before reading anything. The flag does not close the
-   residual ADR-4233 names for step 5: "The irreversible residual is a
-   pre-baseline maintain process deleting alert history, and audit
-   objects, by age with no version hold after an activation; no fence and
-   no pass detects a deletion, so the prerequisite is its only control."
+   residual the contract's decision record names for step 5 (see
+   [Residuals](../../compatibility.md#residuals)): "The irreversible
+   residual is a pre-baseline maintain process deleting alert history,
+   and audit objects, by age with no version hold after an activation; no
+   fence and no pass detects a deletion, so the prerequisite is its only
+   control."
    The same flag also stands for step 1's attestation that every writer
    role can read `sys/compat`; there is no separate flag for it. The
    record's `activated_by` keeps the attestation as
