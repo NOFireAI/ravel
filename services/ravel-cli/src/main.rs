@@ -184,6 +184,12 @@ fn command_hashes_tenant(command: &Command) -> bool {
         // the same shape: deployment-wide, at the bucket root, never under a
         // tenant prefix, so `tenant token` never hashes a tenant either.
         | Command::GcConfig { .. }
+        // sys/compat is a bucket-root object (ADR-4233 decision 3). The compat
+        // commands discover existing tenant hashes by strict listing of `t/`
+        // inside the library; they never hash a `--tenant` into a prefix, so
+        // no scheme need be installed. Keying is their own MAC concern, carried
+        // by the deployment key as `CompatKeys`, not a tenant-hash derivation.
+        | Command::Compat { .. }
         // `cache reclaim-legacy` operates on a local directory, not object
         // storage: no tenant prefix, no store built.
         | Command::Cache { .. } => false,
@@ -349,6 +355,15 @@ fn command_is_write(command: &Command) -> bool {
         // marker directly (`tenancy show`/`resolve` resolve the scheme
         // inline rather than through this gate, per `command_hashes_tenant`),
         // plus `cache reclaim-legacy`, which never touches object storage.
+        // compat writes `sys/compat`, a bucket-root object never under
+        // `t/<tenant_hash>/` (ADR-4233 decision 3), like `store qualify`
+        // above: its write gate is its own deployment-key MAC, not the
+        // tenant-hash scheme. init/activate raise the library's typed
+        // `Unkeyed` refusal on an unkeyed store, and compat init is itself a
+        // bootstrap-order step, so routing it through the tenancy write gate
+        // (which needs a `sys/tenancy` marker) would be wrong. verify/status
+        // only read.
+        Command::Compat { .. } => false,
         Command::Segment { .. }
         | Command::Rlog { .. }
         | Command::Rspan { .. }
@@ -413,6 +428,15 @@ enum Command {
     Maintain {
         #[command(subcommand)]
         command: MaintainCommand,
+    },
+    /// Operate the retained-data compatibility contract `sys/compat`
+    /// (ADR-4233): adopt a store at the baseline, activate a version, certify a
+    /// reader retirement, and report the contract state. Every subcommand
+    /// signs and verifies `sys/compat` under the global `--tenant-hash-key-file`
+    /// deployment key.
+    Compat {
+        #[command(subcommand)]
+        command: CompatCommand,
     },
     /// Object store backend qualification (ADR-0050 section 6).
     Store {
@@ -2355,6 +2379,122 @@ impl ScratchArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum CompatCommand {
+    /// Adopt the store at the baseline (ADR-4233 decision 1): run the census
+    /// over every tenant and signal and, only on a clean result, create
+    /// `sys/compat`. Refuses an unkeyed store, any object outside the baseline
+    /// read set, and a store whose `sys/compat` already differs.
+    Init {
+        /// The baseline release the store is adopted at (expected v0.34.0).
+        #[arg(long, default_value_t = 0)]
+        baseline_major: u32,
+        #[arg(long, default_value_t = 34)]
+        baseline_minor: u32,
+        /// `P`, the longest a publish may run, recorded in `sys/compat` and
+        /// only ever raised later (ADR-4233 decision 7). A humantime duration.
+        #[arg(long, value_parser = ravel_cli::parse_max_flush_lifetime_ns, default_value = "1h")]
+        max_publish_lifetime: i64,
+        /// Emit the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Activate a family's next write version (ADR-4233 decision 3), CASing the
+    /// active version and the store-wide epoch up and fencing every provisioned
+    /// bucket. The irreversible step is the first activation of a version some
+    /// deployed binary cannot read, not the binary install.
+    ///
+    /// REFUSES unless --pre-baseline-processes-terminated is given: ADR-4233
+    /// decision 4 rests the guarantee for pre-baseline (v0.33.x) processes on
+    /// terminating every one before the first activation above the baseline.
+    /// The flag attests that and is recorded in the family entry's
+    /// `activated_by`. RESIDUAL even with the flag: a pre-baseline maintain
+    /// process that outlives the rollout still deletes alert history and audit
+    /// objects by age with no version hold, and no fence and no late-write pass
+    /// detects that deletion, so terminating every pre-baseline process is the
+    /// only control over it.
+    Activate {
+        /// The family to activate: rseg, rlog, rspan, a catalog family, or a
+        /// record family.
+        #[arg(long)]
+        family: String,
+        /// The version to activate, exactly one above the current active one.
+        #[arg(long)]
+        version: u32,
+        /// Attest that every pre-baseline (v0.33.x) process is terminated
+        /// (ADR-4233 decision 4). Required; recorded in `activated_by`.
+        #[arg(long)]
+        pre_baseline_processes_terminated: bool,
+        /// The operator identity recorded in `activated_by`.
+        #[arg(long, default_value = "operator")]
+        activated_by: String,
+        /// A tenant hash named by the alert rules file whose lease is parked on
+        /// an rlog activation even before it holds an alert key. Repeatable.
+        #[arg(long = "alert-rule-tenant")]
+        alert_rule_tenant: Vec<String>,
+        /// The deployment's clock skew allowance. A humantime duration.
+        #[arg(long, value_parser = ravel_cli::parse_max_flush_lifetime_ns, default_value = "1m")]
+        clock_skew_allowance: i64,
+        /// Emit the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Certify a class-A family's reader retirement (ADR-4233 decision 7):
+    /// after the time gate and a strict census with trailer checks, write the
+    /// certificate a reader-retiring release accepts. Refuses before the time
+    /// precondition, reports a contradiction or a held member, and resumes a
+    /// budget-stopped run from its cursor.
+    Certify {
+        /// A class-A family: rseg, rlog or rspan.
+        #[arg(long)]
+        family: String,
+        /// The version to certify; every member must be at or above it.
+        #[arg(long)]
+        version: u32,
+        /// Cap the (tenant, signal, shard) units one run covers; the run
+        /// resumes from its cursor. Unset is no cap.
+        #[arg(long)]
+        budget_records: Option<usize>,
+        /// `max_flush_lifetime` for the G_pre bound, a humantime duration.
+        #[arg(long, value_parser = ravel_cli::parse_max_flush_lifetime_ns, default_value = "1h")]
+        max_flush_lifetime: i64,
+        /// The store request timeout `T_req`, a humantime duration.
+        #[arg(long, value_parser = ravel_cli::parse_max_flush_lifetime_ns, default_value = "30s")]
+        t_req: i64,
+        /// The deployment's clock skew allowance, a humantime duration.
+        #[arg(long, value_parser = ravel_cli::parse_max_flush_lifetime_ns, default_value = "1m")]
+        clock_skew_allowance: i64,
+        /// Emit the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the late-write pass and report the contract state (ADR-4233
+    /// decision 7): for each class-A family with a certificate, GET the records
+    /// landed since the watermark and set `contradicted` on a late write, then
+    /// print every family's active version, epoch, fence-complete time,
+    /// certificate, contradicted flag and watermark.
+    Verify {
+        /// Limit the late-write pass to one class-A family. Unset runs it for
+        /// every class-A family that carries a certificate.
+        #[arg(long)]
+        family: Option<String>,
+        /// The deployment's clock skew allowance, a humantime duration.
+        #[arg(long, value_parser = ravel_cli::parse_max_flush_lifetime_ns, default_value = "1m")]
+        clock_skew_allowance: i64,
+        /// Emit the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the contract state from `sys/compat` without running a pass: every
+    /// family's active version, epoch, fence-complete time, certificate,
+    /// contradicted flag and watermark.
+    Status {
+        /// Emit the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum MaintainCommand {
     /// Run one compaction pass over a single sealed bucket. A bucket with at
     /// least 64 MiB of input is first claimed (ADR-1029); if another process
@@ -3676,6 +3816,97 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 &maintain::ClaimOptions::for_invocation(no_claim),
             )
             .await
+        }
+        Command::Compat { command } => {
+            use ravel_cli::compat;
+            let keys = compat::load_compat_keys(cli.tenancy.tenant_hash_key_file.as_deref())?;
+            let store = store::build_store(&cli.store)?;
+            let now = now_ns()?;
+            let (outcome, json) = match command {
+                CompatCommand::Init {
+                    baseline_major,
+                    baseline_minor,
+                    max_publish_lifetime,
+                    json,
+                } => {
+                    let config = ravel_maintain::InitConfig {
+                        baseline_release_major: baseline_major,
+                        baseline_release_minor: baseline_minor,
+                        max_publish_lifetime_ns: max_publish_lifetime,
+                    };
+                    (compat::init(store, keys, now, config).await?, json)
+                }
+                CompatCommand::Activate {
+                    family,
+                    version,
+                    pre_baseline_processes_terminated,
+                    activated_by,
+                    alert_rule_tenant,
+                    clock_skew_allowance,
+                    json,
+                } => {
+                    let alert_rule_tenants = alert_rule_tenant
+                        .iter()
+                        .map(|hex| {
+                            ravel_types::TenantHash::from_hex(hex).map_err(|e| {
+                                anyhow::anyhow!("invalid --alert-rule-tenant {hex:?}: {e}")
+                            })
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    let args = compat::ActivateArgs {
+                        family,
+                        version,
+                        pre_baseline_processes_terminated,
+                        activated_by,
+                        alert_rule_tenants,
+                        clock_skew_allowance_ns: clock_skew_allowance,
+                    };
+                    (
+                        compat::activate(
+                            store,
+                            keys,
+                            now,
+                            ravel_maintain::WritableVersions::current(),
+                            args,
+                        )
+                        .await?,
+                        json,
+                    )
+                }
+                CompatCommand::Certify {
+                    family,
+                    version,
+                    budget_records,
+                    max_flush_lifetime,
+                    t_req,
+                    clock_skew_allowance,
+                    json,
+                } => {
+                    let args = compat::CertifyArgs {
+                        family,
+                        version,
+                        budget_records,
+                        max_flush_lifetime_ns: max_flush_lifetime,
+                        t_req_ns: t_req,
+                        clock_skew_allowance_ns: clock_skew_allowance,
+                    };
+                    (compat::certify(store, keys, now, args).await?, json)
+                }
+                CompatCommand::Verify {
+                    family,
+                    clock_skew_allowance,
+                    json,
+                } => (
+                    compat::verify(store, keys, now, family, clock_skew_allowance).await?,
+                    json,
+                ),
+                CompatCommand::Status { json } => (compat::status(store, keys).await?, json),
+            };
+            outcome.emit(json);
+            if outcome.exit_code != compat::EXIT_OK {
+                std::process::exit(outcome.exit_code);
+            }
+            Ok(())
         }
         Command::Store {
             command: StoreCommand::Qualify { list_page_size },
