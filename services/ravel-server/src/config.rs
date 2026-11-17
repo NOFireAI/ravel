@@ -1467,19 +1467,23 @@ pub struct StartupCheckArgs {
     /// warn. The last two have their own bounds. The wait between attempts
     /// doubles from 100 ms to a 2 s cap and is jittered down to half of that,
     /// each retry logs one warning naming the read, and /readyz is not ready
-    /// while they run. Each attempt is also bounded by the time left before
-    /// the deadline or 5 s, whichever is longer: one still running then is
-    /// cut off and refuses naming the read and the bound. No retry starts
-    /// once its wait would reach the deadline; the transient failure then
-    /// refuses naming the read and the attempt count. A read first reached
-    /// after the deadline gets one attempt bounded by 5 s and no retry, so a
-    /// transient failure there refuses. A read whose attempt starts by the
-    /// deadline therefore refuses by the deadline plus 5 s; a read first
-    /// reached later refuses within 5 s of being reached. Any other error
-    /// refuses at once, as before. With the default 15s, a read that starts
-    /// by the deadline refuses by 20 s, 5 s before the operator's liveness
-    /// probe (initial delay 5 s, period 10 s, failure threshold 3) can first
-    /// restart the pod at 25 s. `0s` turns retry and the attempt bound off.
+    /// while they run. A read's first attempt is not bounded by this flag:
+    /// the store's own request timeout and retries end it, so a slow but
+    /// healthy store still starts. Each retry is bounded by the time left
+    /// before the deadline or 5 s, whichever is longer: one still running
+    /// then is cut off and refuses naming the read and the bound. No retry
+    /// starts once its wait would reach the deadline; the transient failure
+    /// then refuses naming the read and the attempt count, so a first
+    /// attempt that fails transiently after the deadline refuses at once. A
+    /// read whose first attempt fails transiently before the deadline
+    /// therefore refuses by the deadline plus 5 s, 20 s with the default
+    /// 15s; a first attempt that hangs ends when the store's own request
+    /// timeout and retries give up. Any other error refuses at once, as
+    /// before. The whole
+    /// startup before the listener binds can outlast the operator's
+    /// liveness probe (earliest restart 25 s); the operations guide's
+    /// deployment page says what to set. `0s` turns retry and the retry
+    /// bound off.
     #[arg(
         long = "startup-store-deadline",
         value_name = "DURATION",
