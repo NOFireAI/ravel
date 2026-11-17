@@ -1,53 +1,63 @@
 //! End-to-end reachability for the retained-data contract (ADR-4233 decision
-//! 9, "End-to-end reachability").
+//! 9, "End-to-end reachability"), through the compat library functions on ONE
+//! store with an injected clock:
 //!
-//! One test drives the whole sequence through the real compat library
-//! functions on ONE store with an injected clock: `init` (clean census adopts
-//! the baseline), `activate` (durable, monotone, with the operator attestation
-//! and a completed fence walk), `migrate` (re-encode an N object to the active
-//! N+1 with exact conservation and the old object superseded), `certify` (after
-//! the time gate, a strict census and trailer check writes the certificate),
-//! and the late-write pass (`compat verify`) finding an injected late N write
-//! and setting `contradicted`. It asserts the exact reads before and after and
-//! the documented refusal paths (the time gate before it opens; the contradicted
-//! certificate after a late write).
+//!   - `init` adopts the one RSEG 7 object at the baseline;
+//!   - `activate` moves RSEG to the drill version N+1 with the attestation and a
+//!     completed fence walk;
+//!   - `migrate` re-encodes the object at N+1. The query snapshot over the hour
+//!     (`Catalog::resolve`) then names only the N+1 part, which decodes to the
+//!     seed's exact series, `SeriesId`, timestamp and value bits, while the v7
+//!     object is still on the store;
+//!   - `certify` refuses with the time gate up to `not_before_ns`, which the
+//!     test computes from the ADR's terms, and returns `Contradicted` at the v7
+//!     member one nanosecond later;
+//!   - the superseded-input sweep (`sweep_superseded`) deletes the v7 object and
+//!     its record once its horizon and pinned window pass;
+//!   - `certify` then writes an uncontradicted certificate at N+1;
+//!   - the late-write pass finds a later v7 write and sets `contradicted`.
 //!
-//! Scope note: the ADR's end-to-end test also drives these through a real
-//! `ravel-server` over HTTP and Flight SQL and through the `ravel-cli compat`
-//! commands. On this HEAD there is no `ravel-cli compat` subcommand and the
-//! server has no compat CLI surface (the verbs exist only as these library
-//! functions, which the CLI handlers would call), and the attestation ships as
-//! the `writer_roles_can_read_compat` field rather than the amendment's
-//! `--pre-baseline-processes-terminated` flag. This test therefore drives the
-//! same library entry points the shipping handlers wrap; the HTTP/Flight/CLI
-//! reachability is reported as blocked on that missing product surface.
+//! The ADR's test also drives these through a running `ravel-server` (HTTP and
+//! Flight SQL) and the `ravel-cli compat` commands. This tree has no `ravel-cli
+//! compat` subcommand, so this test calls the library entry points directly.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+mod common;
+
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use ravel_catalog::compat::{CompatClock, CompatKeys, CompatView, FAMILY_RSEG, read_compat};
+use prost::Message;
+use ravel_catalog::compat::{
+    COMPAT_VIEW_HORIZON_NS, CompatClock, CompatKeys, CompatView, FAMILY_RSEG, read_compat,
+};
 use ravel_catalog::{
-    AbsentPolicy, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_MAX_FLUSH_LIFETIME_NS, validate_or_adopt,
+    AbsentPolicy, Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+    DEFAULT_MAX_FLUSH_LIFETIME_NS, provisioning_key, validate_or_adopt, validate_or_adopt_fenced,
 };
 use ravel_commit::keys;
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_maintain::{
     ActivateRequest, CertifyRefusal, CertifyReport, CertifyTimings, CompactorConfig, FixedClock,
-    InitConfig, InitOutcome, LateWrite, MaintainCompatPolicy, MigrateBudget, WritableVersions,
-    activate, certify, init_compat, late_write_pass, migrate_family, read,
+    InitConfig, InitOutcome, LateWrite, MaintainCompatPolicy, MigrateBudget, NoLeases,
+    WritableVersions, activate, certify, init_compat, late_write_pass, migrate_family, read,
+    sweep_superseded,
 };
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_proto::sys::v1::CompatFamily;
+use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
+use ravel_proto::sys::v1::{self as sysproto, CompatFamily};
 use ravel_segment::{
-    IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_DRILL, VERSION_V7,
+    IngestBounds, ReaderLimits, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_DRILL,
+    VERSION_V7, open_from_full,
 };
 use ravel_types::{
-    Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TenantId,
+    Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TenantId, TimeRange,
 };
 use uuid::Uuid;
+
+use common::DecodedSeries;
 
 const SECOND_NS: i64 = 1_000_000_000;
 const HOUR_NS: i64 = 3_600 * SECOND_NS;
@@ -57,6 +67,7 @@ const T_REQ_NS: i64 = 60 * SECOND_NS;
 /// the migrate clock.
 const HOUR: u32 = 495_000;
 const SHARD: u32 = 0;
+const SEED_VALUE: f64 = 42.0;
 
 #[derive(Debug)]
 struct ManualClock(AtomicI64);
@@ -105,6 +116,7 @@ fn sealed_now_ns() -> i64 {
 struct Seed {
     data_key: String,
     record_key: String,
+    series_id: SeriesId,
     sample_count: u64,
     series_count: u64,
 }
@@ -119,12 +131,13 @@ async fn seed_v7_metrics(store: &MemoryStore) -> Seed {
         value: "e2e_gauge".to_string(),
     }])
     .expect("labels");
+    let series_id = SeriesId::compute(&tenant(), "e2e_gauge", &labels).expect("series id");
     let series = vec![SeriesInput {
-        series_id: SeriesId::compute(&tenant(), "e2e_gauge", &labels).expect("series id"),
+        series_id,
         labels,
         samples: vec![Sample {
             ts_ns: event_ns(),
-            value: 42.0,
+            value: SEED_VALUE,
         }],
     }];
     let written = SegmentWriter::write(
@@ -189,6 +202,7 @@ async fn seed_v7_metrics(store: &MemoryStore) -> Seed {
     Seed {
         data_key,
         record_key,
+        series_id,
         sample_count: written.summary.sample_count,
         series_count: written.summary.series_count,
     }
@@ -223,25 +237,50 @@ async fn rseg_entry(store: &dyn ObjectStoreBackend) -> CompatFamily {
         .expect("rseg entry")
 }
 
-/// The first instant certify's time gate admits, read from its refusal.
-async fn past_time_gate(store: &dyn ObjectStoreBackend, probe_ns: i64) -> i64 {
-    match certify(
+async fn certify_at(store: &dyn ObjectStoreBackend, now_ns: i64) -> CertifyReport {
+    certify(
         store,
         &compat_keys(),
-        probe_ns,
+        now_ns,
         FAMILY_RSEG,
         drill(),
         timings(),
         None,
     )
     .await
-    .expect("certify probe")
-    {
-        CertifyReport::Refused(CertifyRefusal::TimeGate { not_before_ns, .. }) => {
-            not_before_ns + SECOND_NS
-        }
-        other => panic!("expected a time-gate refusal at the probe, got {other:?}"),
-    }
+    .expect("certify")
+}
+
+/// The data objects a query over [`HOUR`] reads: the catalog snapshot the
+/// query engine resolves.
+async fn query_snapshot_keys(store: Arc<dyn ObjectStoreBackend>, now_ns: i64) -> Vec<String> {
+    let catalog = Catalog::new(
+        store,
+        CatalogConfig {
+            shard_count: SHARD + 1,
+            ..CatalogConfig::default()
+        },
+    )
+    .expect("catalog");
+    let start = i64::from(HOUR) * NS_PER_HOUR;
+    let snapshot = catalog
+        .resolve(
+            &hash(),
+            Signal::Metrics,
+            TimeRange {
+                start_ns: start,
+                end_ns: start + NS_PER_HOUR,
+            },
+            &[],
+            now_ns,
+        )
+        .await
+        .expect("resolve the query snapshot");
+    snapshot
+        .segments
+        .into_iter()
+        .map(|s| s.data_object_key)
+        .collect()
 }
 
 /// init -> activate -> migrate -> certify -> verify, end to end.
@@ -279,7 +318,6 @@ async fn compat_init_activate_migrate_certify_verify() {
     .await
     .expect("init");
     assert_eq!(init.outcome, InitOutcome::Created);
-    // The RSEG 7 object is in the adopted histogram.
     let adopted_rseg = init
         .census
         .as_ref()
@@ -288,9 +326,9 @@ async fn compat_init_activate_migrate_certify_verify() {
         .get(&(FAMILY_RSEG.to_string(), u32::from(VERSION_V7)))
         .copied()
         .unwrap_or(0);
-    assert!(
-        adopted_rseg >= 1,
-        "the v7 object is adopted: {:?}",
+    assert_eq!(
+        adopted_rseg, 1,
+        "the one v7 object is adopted: {:?}",
         init.census
     );
 
@@ -340,7 +378,6 @@ async fn compat_init_activate_migrate_certify_verify() {
     assert_eq!(migrate.buckets_migrated, 1, "{migrate:?}");
     assert!(migrate.walk_complete, "{migrate:?}");
 
-    // Read the superseding compaction record and assert conservation + version.
     let listing = read::list_bucket(
         store.as_ref(),
         &ravel_maintain::Bucket::new(hash(), Signal::Metrics, SHARD, HOUR),
@@ -352,7 +389,7 @@ async fn compat_init_activate_migrate_certify_verify() {
     let mut found = false;
     for key in &listing.compaction_record_keys {
         let bytes = store
-            .get(key, ravel_object_store::GetRange::Full)
+            .get(key, GetRange::Full)
             .await
             .expect("get record")
             .data;
@@ -378,41 +415,143 @@ async fn compat_init_activate_migrate_certify_verify() {
         "series conserved across migrate"
     );
 
-    // The old v7 object is superseded; drop it and its record (GC past the
-    // protection horizon) so the live set is the N+1 parts only, as it would be
-    // by the time certify runs.
-    store.delete(&seed.data_key).await.expect("gc old data");
-    store.delete(&seed.record_key).await.expect("gc old record");
+    // The read path after migrate: the query snapshot names exactly the N+1
+    // part, never the v7 object, which is still on the store. The part decodes
+    // to the seed's series and sample exactly.
+    let live = query_snapshot_keys(dyn_store.clone(), sealed_now_ns()).await;
+    assert_eq!(live.len(), 1, "one live object: {live:?}");
+    assert_ne!(live[0], seed.data_key, "the v7 object is not read");
+    assert!(
+        store.head(&seed.data_key).await.is_ok(),
+        "the v7 object is unreachable while still stored"
+    );
+    let part = store.get(&live[0], GetRange::Full).await.expect("get").data;
+    assert_eq!(
+        open_from_full(&part, ReaderLimits::default())
+            .expect("open part")
+            .version,
+        VERSION_DRILL,
+        "the live part's trailer is N+1"
+    );
+    assert_eq!(
+        common::decode_rseg(&part).expect("decode the part"),
+        vec![DecodedSeries {
+            labels: vec![(METRIC_NAME_LABEL.to_string(), "e2e_gauge".to_string())],
+            series_id: seed.series_id.0,
+            samples: vec![(event_ns(), SEED_VALUE.to_bits())],
+        }],
+        "the N+1 part holds 42.0 at event_ns() bit for bit"
+    );
 
-    // Stage 4: certify. Before the time gate opens it refuses; after, a strict
-    // census and trailer check writes the certificate at N+1.
-    let now = past_time_gate(store.as_ref(), activation_ns + 2 * HOUR_NS).await;
-    clock.set(now);
-    let report = certify(
-        store.as_ref(),
-        &compat_keys(),
-        now,
-        FAMILY_RSEG,
-        drill(),
-        timings(),
-        None,
+    // Stage 4: the time gate. `not_before_ns` from the ADR's terms (decision
+    // 7): the later of activation + H + P + T_req and the bucket's fence time +
+    // G_pre, where G_pre = 3 h + 2 x max_flush_lifetime + P + T_req, plus the
+    // clock-skew allowance.
+    let entry = rseg_entry(store.as_ref()).await;
+    assert_eq!(entry.activated_unix_ns, activation_ns);
+    let prov = sysproto::ProvisioningRecord::decode(
+        store
+            .get(&provisioning_key(&hash(), Signal::Metrics), GetRange::Full)
+            .await
+            .expect("get provisioning")
+            .data
+            .as_ref(),
     )
-    .await
-    .expect("certify");
+    .expect("decode provisioning");
+    assert_eq!(
+        prov.compat_fenced_unix_ns, activation_ns,
+        "the walk fenced the bucket at activation"
+    );
+    let p_ns = DEFAULT_MAX_FLUSH_LIFETIME_NS;
+    let activation_term = activation_ns + COMPAT_VIEW_HORIZON_NS + p_ns + T_REQ_NS;
+    let g_pre = 3 * HOUR_NS + 2 * DEFAULT_MAX_FLUSH_LIFETIME_NS + p_ns + T_REQ_NS;
+    let not_before =
+        activation_term.max(prov.compat_fenced_unix_ns + g_pre) + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
+    assert_eq!(
+        certify_at(store.as_ref(), not_before).await,
+        CertifyReport::Refused(CertifyRefusal::TimeGate {
+            now_ns: not_before,
+            not_before_ns: not_before,
+        }),
+        "certify refuses at exactly not_before_ns"
+    );
+
+    // One nanosecond past the gate, with the v7 object still stored, the census
+    // finds it: contradicted, and no certificate.
+    let gate_open = not_before + 1;
+    match certify_at(store.as_ref(), gate_open).await {
+        CertifyReport::Contradicted {
+            member_key,
+            found_version,
+        } => {
+            assert_eq!(member_key, seed.data_key, "the v7 member");
+            assert_eq!(found_version, u32::from(VERSION_V7));
+        }
+        other => panic!("certify over the v7 object must be Contradicted: {other:?}"),
+    }
+    assert!(rseg_entry(store.as_ref()).await.certificate.is_none());
+
+    // GC through the superseded-input sweep: the first pass after the
+    // protection horizon stamps the pinned-window marker and holds the record
+    // and object; the pass once the window has aged deletes both.
+    let t1 = gate_open.max(sealed_now_ns() + config.protection_horizon_ns + 1);
+    let sweep = |now: i64| {
+        let store = store.clone();
+        let config = config.clone();
+        async move {
+            sweep_superseded(
+                store.as_ref(),
+                &FixedClock::new(now),
+                &config,
+                &NoLeases,
+                &hash(),
+                Signal::Metrics,
+                SHARD,
+            )
+            .await
+            .expect("sweep superseded")
+        }
+    };
+    let held = sweep(t1).await;
+    assert_eq!(
+        (held.records_deleted, held.data_deleted),
+        (0, 0),
+        "{held:?}"
+    );
+    assert_eq!(held.held_by_pinned_window, 2, "{held:?}");
+    let window = config.max_query_duration_ns
+        + config.head_cache_ttl_ns
+        + 4 * config.clock_skew_allowance_ns;
+    let now = t1 + window;
+    let swept = sweep(now).await;
+    assert_eq!(
+        (swept.records_deleted, swept.data_deleted),
+        (1, 1),
+        "{swept:?}"
+    );
+    assert!(store.head(&seed.data_key).await.is_err(), "v7 object gone");
+    assert!(
+        store.head(&seed.record_key).await.is_err(),
+        "v7 record gone"
+    );
+
+    // Stage 5: certify writes the certificate at N+1.
+    clock.set(now);
+    let report = certify_at(store.as_ref(), now).await;
     assert!(
         matches!(
             report,
-            CertifyReport::Certified { version, .. } if version == drill()
+            CertifyReport::Certified { version, member_count: 1, .. } if version == drill()
         ),
-        "certify writes the certificate at N+1: {report:?}"
+        "certify writes the certificate at N+1 over the one part: {report:?}"
     );
-    assert!(
-        rseg_entry(store.as_ref()).await.certificate.is_some(),
-        "the certificate is recorded"
-    );
-    assert!(!rseg_entry(store.as_ref()).await.contradicted);
+    let entry = rseg_entry(store.as_ref()).await;
+    let certificate = entry.certificate.as_ref().expect("certificate recorded");
+    assert_eq!(certificate.version, drill());
+    assert_eq!(certificate.certified_unix_ns, now);
+    assert!(!entry.contradicted);
 
-    // Stage 5: a late N write after the certificate. The store clock is
+    // Stage 6: a late N write after the certificate. The store clock is
     // advanced first so the late record's LastModified lands after the
     // watermark; compat verify (the late-write pass) then finds it by
     // LastModified and sets contradicted.
@@ -437,5 +576,108 @@ async fn compat_init_activate_migrate_certify_verify() {
     assert!(
         rseg_entry(store.as_ref()).await.contradicted,
         "the certificate is contradicted after the late write"
+    );
+}
+
+/// The ADR's view horizon, written out from decision 1 (`H = 10 min`) rather
+/// than read from the build.
+const ADR_H_NS: i64 = 10 * 60 * SECOND_NS;
+
+/// When every provisioned bucket is born fenced (`compat_fenced_unix_ns` 0),
+/// the `G_pre` term drops out and certify's time gate is the activation term
+/// alone: `activated + H + P + T_req`, plus the clock-skew allowance
+/// (decision 7). In the end-to-end test the bucket is fenced at activation,
+/// where `G_pre` outweighs the activation term, so only this case pins `H`.
+#[tokio::test]
+async fn with_only_born_fenced_buckets_the_activation_term_sets_the_time_gate() {
+    assert_eq!(COMPAT_VIEW_HORIZON_NS, ADR_H_NS, "ADR-4233: H = 10 min");
+
+    let store = Arc::new(MemoryStore::with_page_size(2));
+    let activation_ns = sealed_now_ns();
+    let clock = Arc::new(ManualClock::new(activation_ns));
+    let init = init_compat(
+        store.as_ref(),
+        Some(&compat_keys()),
+        clock.as_ref(),
+        &InitConfig {
+            baseline_release_major: 0,
+            baseline_release_minor: 34,
+            max_publish_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
+        },
+    )
+    .await
+    .expect("init");
+    assert_eq!(init.outcome, InitOutcome::Created);
+    let report = activate(
+        store.as_ref(),
+        Some(&compat_keys()),
+        clock.as_ref(),
+        &WritableVersions::current().with_family(FAMILY_RSEG, vec![u32::from(VERSION_V7), drill()]),
+        &ActivateRequest {
+            family: FAMILY_RSEG.to_string(),
+            version: drill(),
+            activated_by: "e2e".to_string(),
+            writer_roles_can_read_compat: true,
+            alert_rule_tenants: Vec::new(),
+            clock_skew_allowance_ns: DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+            resume_from: None,
+        },
+    )
+    .await
+    .expect("activate");
+    assert!(report.walk.complete, "{:?}", report.walk);
+
+    // A tenant onboarded after activation: its first touch knows the epoch,
+    // so the record is born fenced.
+    validate_or_adopt_fenced(
+        store.as_ref(),
+        &hash(),
+        Signal::Metrics,
+        SHARD + 1,
+        activation_ns + SECOND_NS,
+        AbsentPolicy::CreateFromConfig,
+        NonZeroU64::new(report.walk.compat_epoch),
+    )
+    .await
+    .expect("born-fenced provisioning");
+    let prov = sysproto::ProvisioningRecord::decode(
+        store
+            .get(&provisioning_key(&hash(), Signal::Metrics), GetRange::Full)
+            .await
+            .expect("get provisioning")
+            .data
+            .as_ref(),
+    )
+    .expect("decode provisioning");
+    assert_eq!(
+        (prov.compat_epoch, prov.compat_fenced_unix_ns),
+        (report.walk.compat_epoch, 0),
+        "born fenced"
+    );
+    assert_eq!(
+        rseg_entry(store.as_ref()).await.activated_unix_ns,
+        activation_ns
+    );
+
+    let not_before = activation_ns
+        + ADR_H_NS
+        + DEFAULT_MAX_FLUSH_LIFETIME_NS
+        + T_REQ_NS
+        + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
+    assert_eq!(
+        certify_at(store.as_ref(), not_before).await,
+        CertifyReport::Refused(CertifyRefusal::TimeGate {
+            now_ns: not_before,
+            not_before_ns: not_before,
+        }),
+        "certify refuses at exactly activated + H + P + T_req + skew"
+    );
+    let past = certify_at(store.as_ref(), not_before + 1).await;
+    assert!(
+        !matches!(
+            past,
+            CertifyReport::Refused(CertifyRefusal::TimeGate { .. })
+        ),
+        "the gate opens one nanosecond later: {past:?}"
     );
 }

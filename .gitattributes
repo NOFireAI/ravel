@@ -1,0 +1,3 @@
+# Frozen compat corpus: byte-exact fixtures, never line-ending converted or
+# text-merged (ADR-4233 decision 9).
+crates/ravel-compat-tests/corpus/** binary
