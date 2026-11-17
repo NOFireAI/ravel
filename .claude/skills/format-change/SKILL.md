@@ -48,9 +48,11 @@ The frozen contracts:
    below instead, as ADR-0873's `SnapshotEntry` field 15 did.
    Identity encodings get a new domain string (ravel-series-v2, not an
    edit to v1); key layouts add new prefixes. Protos add fields with new
-   numbers and never renumber or reuse one. A catalog HEAD change always
-   bumps the HEAD version (ADR-4233, H2), because an older build's HEAD
-   rebuild strips a field it does not know. Any other record may add a
+   numbers and never renumber or reuse one. A catalog HEAD change raises
+   the HEAD version for a HEAD that carries the new field (ADR-4233, H2;
+   the version is a function of content, `head_format_version_for`, as
+   `retired_hours` does), because an older build's HEAD rebuild strips a
+   field it does not know. Any other record may add a
    field with no bump only when an older reader that ignores the field and
    an older writer that rewrites the record without it (a CAS replace or a
    rebuild) both leave query answers, durability, retention and fencing

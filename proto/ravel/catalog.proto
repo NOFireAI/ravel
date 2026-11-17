@@ -159,7 +159,8 @@ message SnapshotPartRef {
   // docs/catalog-and-mvcc.md "Per-part key-index leaves"). Absent means the
   // part is uncovered for every field and is scanned; absence is never an
   // error. Added with no HEAD format version bump, as were fields 6 and 7,
-  // before ADR-4233; from ADR-4233 on a HEAD change bumps the HEAD version.
+  // before ADR-4233; from ADR-4233 on a HEAD carrying a new field is stamped
+  // a higher HEAD version (head_format_version_for).
   repeated SnapshotKeyIndexLeafRef key_index = 8;
   // Additive, ADR-3939 decision 6. Ingest hours of this part a retention
   // tombstone has retired without re-encoding it: the part bytes and leaves
