@@ -580,3 +580,460 @@ pub fn spawn(
         }
     })
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use ravel_catalog::compat::{COMPAT_FORMAT_VERSION, CompatClock, create_compat};
+    use ravel_catalog::{
+        AbsentPolicy, current_floor_from_store, provisioning_key, raise_compat_fence,
+        validate_or_adopt,
+    };
+    use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_maintain::FixedClock;
+    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{GetRange, PutOptions};
+    use ravel_proto::sys::v1 as sysproto;
+
+    use super::*;
+
+    const HOUR: i64 = 3_600_000_000_000;
+    const ACTIVATED: i64 = 1_000;
+    /// Far enough past `ACTIVATED` to clear certify's activation and `G_pre`
+    /// terms.
+    const NOW1: i64 = 400_000 * HOUR;
+    /// The RSEG writer's version.
+    const V_SEG: u32 = 7;
+    const CERTIFY_CURSOR: &str = "sys/maintain/certify/rseg/cursor";
+
+    fn ckeys() -> CompatKeys {
+        CompatKeys::from_file_keys(&[[7; 32]]).expect("one key")
+    }
+
+    fn tenant() -> TenantHash {
+        TenantHash([5; 16])
+    }
+
+    struct ViewClock(FixedClock);
+
+    impl CompatClock for ViewClock {
+        fn now_unix_ns(&self) -> i64 {
+            self.0.now_ns()
+        }
+    }
+
+    fn timings() -> CertifyTimings {
+        CertifyTimings {
+            t_req_ns: 30 * 1_000_000_000,
+            max_flush_lifetime_ns: HOUR,
+            clock_skew_allowance_ns: CompactorConfig::default().clock_skew_allowance_ns,
+        }
+    }
+
+    fn context(store: Arc<MemoryStore>, clock: &FixedClock) -> CompatMaintainContext {
+        let store: Arc<dyn ObjectStoreBackend> = store;
+        CompatMaintainContext {
+            store: store.clone(),
+            keys: ckeys(),
+            view: CompatView::new(store, ckeys(), Arc::new(ViewClock(clock.clone()))),
+            compactor: Arc::new(CompactorConfig::default()),
+            worker: Arc::new(WorkerSet::new(0, Duration::from_secs(60), 3, 1)),
+            clock: Arc::new(clock.clone()),
+            shard_count: 1,
+            fallback_allow: None,
+            background_migrate: None,
+            interval: DEFAULT_COMPAT_MAINTAIN_INTERVAL,
+        }
+    }
+
+    /// `sys/compat` with `rseg` active at `V_SEG` since `ACTIVATED`, its fence
+    /// walk complete and `P` one hour, and a fenced one-shard metrics tenant.
+    async fn seed_rseg(store: &MemoryStore) {
+        create_compat(
+            store,
+            &ckeys(),
+            sysproto::CompatRecord {
+                format_version: COMPAT_FORMAT_VERSION,
+                baseline_release_major: 0,
+                baseline_release_minor: 34,
+                families: vec![sysproto::CompatFamily {
+                    family: FAMILY_RSEG.to_string(),
+                    active_write_version: V_SEG,
+                    activated_epoch: 1,
+                    activated_unix_ns: ACTIVATED,
+                    activated_by: "test".to_string(),
+                    certificate: None,
+                    fence_complete_unix_ns: ACTIVATED,
+                    late_writes_verified_through_unix_ns: 0,
+                    contradicted: false,
+                }],
+                compat_epoch: 1,
+                max_publish_lifetime_ns: HOUR,
+                adopted: Vec::new(),
+                mac: Vec::new(),
+            },
+        )
+        .await
+        .expect("create sys/compat");
+        validate_or_adopt(
+            store,
+            &tenant(),
+            Signal::Metrics,
+            1,
+            ACTIVATED,
+            AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("provision");
+        raise_compat_fence(store, &tenant(), Signal::Metrics, 1, ACTIVATED)
+            .await
+            .expect("fence");
+    }
+
+    /// Certify `rseg` at `NOW1` with the provisioning-record PUT faulted, so
+    /// the certificate CAS lands and its floor raise does not: the state a
+    /// crashed certify leaves, which only a late-write pass can finalize.
+    async fn certify_unfinalized(store: &Arc<MemoryStore>) {
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("put down".to_string()))
+                .with_key_contains(provisioning_key(&tenant(), Signal::Metrics)),
+        );
+        let faulted = FaultStore::new(store.clone(), plan);
+        let result = certify(
+            &faulted,
+            &ckeys(),
+            NOW1,
+            FAMILY_RSEG,
+            V_SEG,
+            timings(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(faulted.fault_count(Op::Put, FaultKind::Permanent), 1);
+        let entry = rseg_entry(store.as_ref()).await;
+        let certificate = entry.certificate.expect("the CAS landed");
+        assert_eq!(certificate.certified_unix_ns, NOW1);
+        assert!(entry.late_writes_verified_through_unix_ns <= NOW1);
+        assert_eq!(floor(store.as_ref()).await, None);
+        assert!(cursor_present(store.as_ref()).await);
+    }
+
+    async fn rseg_entry(store: &dyn ObjectStoreBackend) -> sysproto::CompatFamily {
+        read_compat(store, &ckeys())
+            .await
+            .expect("read")
+            .expect("present")
+            .0
+            .families
+            .into_iter()
+            .find(|f| f.family == FAMILY_RSEG)
+            .expect("rseg entry")
+    }
+
+    async fn floor(store: &dyn ObjectStoreBackend) -> Option<u32> {
+        current_floor_from_store(store, &tenant(), Signal::Metrics, FAMILY_RSEG)
+            .await
+            .expect("floor")
+    }
+
+    async fn cursor_present(store: &dyn ObjectStoreBackend) -> bool {
+        store.get(CERTIFY_CURSOR, GetRange::Full).await.is_ok()
+    }
+
+    /// A metrics commit record stamped `stamp`, landed at `modified_ns`.
+    async fn seed_commit(store: &MemoryStore, stamp: u32, modified_ns: i64) -> String {
+        store.set_clock_ms(u64::try_from(modified_ns / 1_000_000).expect("ms"));
+        let ts_ns = NOW1;
+        let commit = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: 1,
+            content_hash: [1; 32],
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: ts_ns,
+            max_event_ts_ns: ts_ns,
+            min_ingest_ts_ns: ts_ns,
+            max_ingest_ts_ns: ts_ns,
+            segment_format_version: stamp,
+            created_unix_ns: ts_ns,
+            ingest_hour_bucket: u32::try_from(ts_ns.div_euclid(HOUR)).expect("hour"),
+        })
+        .expect("build commit");
+        let key = ravel_commit::keys::commit_key_for_record(&commit).expect("commit key");
+        store
+            .put(&key, record::encode(&commit), PutOptions::default())
+            .await
+            .expect("put commit");
+        key
+    }
+
+    fn only_family(report: &CompatMaintainReport) -> &FamilyUnitReport {
+        assert_eq!(report.families.len(), 1, "{report:?}");
+        &report.families[0]
+    }
+
+    /// ACCEPTANCE: one tick of the unit runs the late-write pass on a
+    /// certificate whose floor raises a crashed certify left pending, and then
+    /// finishes those raises, so the floor reaches the certified version
+    /// without an operator re-running certify.
+    ///
+    /// DISTINGUISHING, wrong implementations this rules out:
+    ///  1. a unit that runs the late-write pass and never calls certify leaves
+    ///     the floor unraised: the `Some(V_SEG)` floor assertion fails.
+    ///  2. a unit that calls certify before the pass gets `FinalizationPending`
+    ///     (the watermark is not yet past the certificate) and raises nothing
+    ///     this tick: the `Certified` and floor assertions fail.
+    ///  3. a unit that does not refresh the process's view leaves `/metrics`
+    ///     reporting the finalization as pending: the view assertion fails.
+    #[tokio::test]
+    async fn a_tick_runs_the_late_write_pass_then_finishes_pending_floor_raises() {
+        let store = Arc::new(MemoryStore::with_page_size(2));
+        seed_rseg(&store).await;
+        certify_unfinalized(&store).await;
+        let clock = FixedClock::new(NOW1 + 2 * HOUR);
+        let ctx = context(store.clone(), &clock);
+        crate::compat::refresh_once(&ctx.view).await;
+        let pending = CertificateState::of(
+            &ctx.view.last_record().expect("read").families[0],
+        )
+        .expect("certified");
+        assert!(pending.finalization_pending, "{pending:?}");
+
+        let report = run_tick(&ctx, &[ctx.worker.process_id()]).await;
+
+        let unit = only_family(&report);
+        assert_eq!(unit.family, FAMILY_RSEG);
+        match &unit.late_write {
+            LateWriteStep::Ran(pass) => {
+                assert!(pass.late_writes.is_empty(), "{pass:?}");
+                assert_eq!(pass.watermark_unix_ns, NOW1 + 2 * HOUR);
+            }
+            other => panic!("the pass is due on an unverified certificate: {other:?}"),
+        }
+        assert!(
+            matches!(
+                unit.finalize,
+                FinalizeStep::Ran(CertifyReport::Certified { version: V_SEG, .. })
+            ),
+            "{:?}",
+            unit.finalize
+        );
+        assert_eq!(
+            unit.state,
+            CertificateState {
+                certificate_version: V_SEG,
+                certified_unix_ns: NOW1,
+                watermark_unix_ns: NOW1 + 2 * HOUR,
+                contradicted: false,
+                finalization_pending: false,
+            }
+        );
+        assert_eq!(floor(store.as_ref()).await, Some(V_SEG));
+        assert!(!cursor_present(store.as_ref()).await);
+        let viewed = CertificateState::of(
+            &ctx.view.last_record().expect("read").families[0],
+        )
+        .expect("certified");
+        assert_eq!(viewed, unit.state, "the view was refreshed after the writes");
+    }
+
+    /// The pass runs once a day: a tick inside a day of the last pass leaves
+    /// the watermark alone, and the first tick a day after it advances it.
+    /// The finalization call that follows a finished certificate is refused
+    /// as already certified and writes nothing.
+    ///
+    /// DISTINGUISHING: a unit that runs the pass every tick advances the
+    /// watermark at `+1h`; a unit gated on `>` a day rather than `>=` skips
+    /// the tick exactly a day later.
+    #[tokio::test]
+    async fn the_late_write_pass_runs_once_a_day() {
+        let store = Arc::new(MemoryStore::with_page_size(2));
+        seed_rseg(&store).await;
+        certify_unfinalized(&store).await;
+        let first = NOW1 + 2 * HOUR;
+        let clock = FixedClock::new(first);
+        let ctx = context(store.clone(), &clock);
+        let live = [ctx.worker.process_id()];
+        run_tick(&ctx, &live).await;
+        assert_eq!(rseg_entry(store.as_ref()).await.late_writes_verified_through_unix_ns, first);
+
+        clock.set(first + HOUR);
+        let report = run_tick(&ctx, &live).await;
+        let unit = only_family(&report);
+        assert!(matches!(unit.late_write, LateWriteStep::NotDue), "{unit:?}");
+        assert!(
+            matches!(
+                unit.finalize,
+                FinalizeStep::Ran(CertifyReport::Refused(
+                    CertifyRefusal::AlreadyCertified { .. }
+                ))
+            ),
+            "{unit:?}"
+        );
+        assert!(!cursor_present(store.as_ref()).await, "the probe started no census");
+        assert_eq!(rseg_entry(store.as_ref()).await.late_writes_verified_through_unix_ns, first);
+
+        let day_later = first + LATE_WRITE_PASS_PERIOD_NS;
+        clock.set(day_later);
+        let report = run_tick(&ctx, &live).await;
+        assert!(
+            matches!(only_family(&report).late_write, LateWriteStep::Ran(_)),
+            "{report:?}"
+        );
+        assert_eq!(
+            rseg_entry(store.as_ref()).await.late_writes_verified_through_unix_ns,
+            day_later
+        );
+    }
+
+    /// A late write below the certified version contradicts the certificate,
+    /// and the unit then skips finalization: the floor stays unraised so
+    /// background migrate still rewrites the bucket holding it.
+    ///
+    /// DISTINGUISHING: a unit that finalizes regardless finishes the raises
+    /// the crashed certify left (certify itself drops the finalizing cursor of
+    /// a contradicted certificate, so the cursor assertion catches a unit that
+    /// calls it at all).
+    #[tokio::test]
+    async fn a_late_write_contradicts_and_skips_finalization() {
+        let store = Arc::new(MemoryStore::with_page_size(2));
+        seed_rseg(&store).await;
+        certify_unfinalized(&store).await;
+        let late = seed_commit(&store, V_SEG - 1, NOW1 + HOUR).await;
+        let clock = FixedClock::new(NOW1 + 2 * HOUR);
+        let ctx = context(store.clone(), &clock);
+
+        let report = run_tick(&ctx, &[ctx.worker.process_id()]).await;
+
+        let unit = only_family(&report);
+        match &unit.late_write {
+            LateWriteStep::Ran(pass) => assert_eq!(
+                pass.late_writes,
+                vec![ravel_maintain::LateWrite {
+                    record_key: late,
+                    version: V_SEG - 1,
+                }]
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(unit.finalize, FinalizeStep::Contradicted), "{unit:?}");
+        assert!(unit.state.contradicted && !unit.state.finalization_pending);
+        assert!(rseg_entry(store.as_ref()).await.contradicted);
+        assert_eq!(floor(store.as_ref()).await, None);
+        assert!(cursor_present(store.as_ref()).await, "no certify call");
+    }
+
+    /// Only the live-set owner of `compat-late-write/rseg` runs the unit.
+    #[tokio::test]
+    async fn a_process_that_does_not_own_the_family_runs_nothing() {
+        let store = Arc::new(MemoryStore::with_page_size(2));
+        seed_rseg(&store).await;
+        certify_unfinalized(&store).await;
+        let clock = FixedClock::new(NOW1 + 2 * HOUR);
+        let ctx = context(store.clone(), &clock);
+        let other = Uuid::from_u128(42);
+        assert!(!owns(
+            late_write_unit_key(FAMILY_RSEG).as_bytes(),
+            ctx.worker.process_id(),
+            &[other]
+        ));
+
+        let report = run_tick(&ctx, &[other]).await;
+
+        assert!(report.families.is_empty(), "{report:?}");
+        assert_eq!(rseg_entry(store.as_ref()).await.late_writes_verified_through_unix_ns, NOW1);
+        assert_eq!(floor(store.as_ref()).await, None);
+    }
+
+    /// OBSERVABILITY: a maintain scrape renders the watermark in seconds and
+    /// the contradicted and finalization-pending flags for each certified
+    /// family, from the view, and no other mode renders them.
+    #[tokio::test]
+    async fn a_maintain_scrape_renders_the_certificate_gauges() {
+        let store = Arc::new(MemoryStore::with_page_size(2));
+        seed_rseg(&store).await;
+        certify_unfinalized(&store).await;
+        let clock = FixedClock::new(NOW1 + 2 * HOUR);
+        let ctx = context(store.clone(), &clock);
+        crate::compat::refresh_once(&ctx.view).await;
+        let render = |mode| {
+            let mut body = String::new();
+            crate::metrics::render_compat_family(
+                &mut body,
+                mode,
+                &crate::metrics::CompatSnapshot::of(&ctx.view, clock.now_ns()),
+            );
+            body
+        };
+        let sample = |body: &str, name: &str| -> Vec<String> {
+            body.lines()
+                .filter(|line| line.starts_with(&format!("{name}{{")))
+                .map(str::to_string)
+                .collect()
+        };
+        let certified_seconds = NOW1 / 1_000_000_000;
+
+        let body = render(crate::config::Mode::Maintain);
+        assert_eq!(
+            sample(&body, "ravel_compat_late_write_watermark_seconds"),
+            vec![format!(
+                "ravel_compat_late_write_watermark_seconds{{mode=\"maintain\",family=\"rseg\"}} {certified_seconds}"
+            )]
+        );
+        assert_eq!(
+            sample(&body, "ravel_compat_certificate_contradicted"),
+            vec!["ravel_compat_certificate_contradicted{mode=\"maintain\",family=\"rseg\"} 0"]
+        );
+        assert_eq!(
+            sample(&body, "ravel_compat_certify_finalization_pending"),
+            vec!["ravel_compat_certify_finalization_pending{mode=\"maintain\",family=\"rseg\"} 1"]
+        );
+
+        seed_commit(&store, V_SEG - 1, NOW1 + HOUR).await;
+        run_tick(&ctx, &[ctx.worker.process_id()]).await;
+        let body = render(crate::config::Mode::Maintain);
+        assert_eq!(
+            sample(&body, "ravel_compat_late_write_watermark_seconds"),
+            vec![format!(
+                "ravel_compat_late_write_watermark_seconds{{mode=\"maintain\",family=\"rseg\"}} {}",
+                certified_seconds + 2 * 3_600
+            )]
+        );
+        assert_eq!(
+            sample(&body, "ravel_compat_certificate_contradicted"),
+            vec!["ravel_compat_certificate_contradicted{mode=\"maintain\",family=\"rseg\"} 1"]
+        );
+        assert_eq!(
+            sample(&body, "ravel_compat_certify_finalization_pending"),
+            vec!["ravel_compat_certify_finalization_pending{mode=\"maintain\",family=\"rseg\"} 0"]
+        );
+
+        let body = render(crate::config::Mode::All);
+        for name in [
+            "ravel_compat_late_write_watermark_seconds",
+            "ravel_compat_certificate_contradicted",
+            "ravel_compat_certify_finalization_pending",
+        ] {
+            assert!(!body.contains(name), "{name} rendered outside maintain");
+        }
+    }
+
+    /// The configuration's `Debug` never prints the MAC keys.
+    #[test]
+    fn the_config_debug_redacts_the_keys() {
+        let config = CompatMaintainConfig {
+            keys: Some(ckeys()),
+            ..Default::default()
+        };
+        let printed = format!("{config:?}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+    }
+
+}
