@@ -318,7 +318,20 @@ async fn metrics_render_queued_flush_families_named_by_the_flag_help() {
 /// wherever an ingest router exists, none elsewhere.
 #[tokio::test]
 async fn metrics_render_abandoned_hour_bound_family_per_signal() {
-    let family = "ravel_ingest_abandoned_hour_bound_total";
+    assert_zero_per_ingest_signal("ravel_ingest_abandoned_hour_bound_total").await;
+}
+
+/// Issue #4363: a buffer dropped on a spent untrusted-view hold loses
+/// acknowledged rows, so its counter reaches a scrape for every ingest signal
+/// wherever an ingest router exists, none elsewhere.
+#[tokio::test]
+async fn metrics_render_abandoned_stale_provisioning_family_per_signal() {
+    assert_zero_per_ingest_signal("ravel_ingest_abandoned_stale_provisioning_total").await;
+}
+
+/// One declaration of counter `family` and one zero sample per ingest signal
+/// in the modes that run an ingest router, none in query mode.
+async fn assert_zero_per_ingest_signal(family: &str) {
     for (mode, mode_label, expect_ingest) in [
         (Mode::All, "all", true),
         (Mode::Gateway, "gateway", true),

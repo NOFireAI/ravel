@@ -1162,10 +1162,16 @@ never came.
 **The bound.** Each buffer records `stale_view_since_ns`, the flush-open clock
 reading of the first enforced attempt whose scan-set check returned no
 trusted view. A flush that opens on a trusted view (in place or handed back)
-clears it, so a later outage starts a new hold. A teardown bypass pass never
-starts the clock: only an enforced pass, whose clock reading the lag check
-accepted, does. Once `now - stale_view_since_ns >= max_flush_lifetime` at a
-flush attempt, the buffer is dropped instead of held again.
+clears it, so a later outage starts a new hold. So does a provisioning read
+that succeeded after the hold began: an attempt that finds the tenant's view
+refreshed at or after `stale_view_since_ns` (the view is stamped with the
+time its read was issued) restarts the hold at its own reading, even when no
+attempt was made in between, as when the buffer's flushes were deferred. The
+bound therefore counts time with no successful read, not time since the first
+hold. A teardown bypass pass never starts the clock: only an enforced pass,
+whose clock reading the lag check accepted, does. Once `now -
+stale_view_since_ns >= max_flush_lifetime` at a flush attempt, the buffer is
+dropped instead of held again.
 
 **The drop.** No `seq` is pinned and no store call is made. Every strict
 waiter on the buffer is answered the retryable `Abandoned` (503) with a
@@ -1182,8 +1188,10 @@ cannot be read for `max_flush_lifetime`.
 **Teardown.** A shutdown or channel-close drain that still cannot confirm the
 view keeps the scan-set amendment's choice inside the bound and writes the
 buffer in place. Past the bound it drops and counts it like any other flush
-attempt. In practice that happens on the drain's enforced pass, since the
-bypass passes come after it, so the check on the bypass path is defensive.
+attempt. The drain's enforced pass reads its clock before the drain's
+re-read, which waits up to `max_flush_lifetime` for each read, so a bound that passes
+during that wait is first seen by a bypass pass, which reads the clock again
+and drops the buffer.
 
 **Rejected: hold without bound.** That is the defect. **Rejected: write in
 place at the bound.** The rows are past the horizon the view is trusted for,
@@ -1198,4 +1206,11 @@ and counted once at the bound with the budget refunded, never counted again),
 `a_teardown_inside_the_bound_writes_the_held_flush` and
 `a_teardown_past_the_bound_drops_the_held_flush`; each shard module's
 `a_strict_waiter_on_a_spent_stale_view_hold_is_abandoned` pins the strict
-waiter's answer.
+waiter's answer. Each shard module's
+`a_successful_read_during_a_stale_view_hold_restarts_it` and
+`a_read_from_before_a_stale_view_hold_does_not_restart_it` pin the restart on
+a successful read, and `a_scan_set_verdict_restarts_the_stale_view_hold`,
+`a_spent_mismatch_retry_restarts_the_stale_view_hold`,
+`a_hand_back_to_a_dead_target_restarts_the_stale_view_hold` and
+`a_hand_back_to_a_full_mailbox_restarts_the_stale_view_hold` pin each verdict
+that clears the hold.
