@@ -454,6 +454,7 @@ grant names the one key or prefix the calls use:
 | `sys/maintain/workers/*` | | | list, get, put, delete | |
 | `sys/maintain/memo/*` | | | list, get, put | |
 | `sys/maintain/claims/compaction/*` | | | get, put | |
+| `sys/maintain/certify/*` | | | | put, delete |
 | `sys/query/workers/*` | | list, get, put | list, delete | |
 | `admission/query/*` | | list, get, put | | |
 | `t/*/config` | get | get | get | put |
@@ -492,6 +493,7 @@ the call groups below:
 | `ravel-cli parquet sweep` (`crates/ravel-pqtable/src/sweep.rs`): `plan` lists `t/<tenant_hash>/pq/t/`, the CLI wrapper reads `sys/gc` for the deployment's grace floor, and `execute` deletes each superseded manifest | Maintain credential | `s3:ListBucket`, `s3:GetObject`, `s3:DeleteObject` | `MaintainList` `s3:prefix` `t/*/pq/t/*`; `MaintainDelete` `t/*/pq/t/*`; `sys/gc` is already in `MaintainRead` |
 | `ravel-cli parquet repair` (`crates/ravel-pqtable/src/repair.rs`): lists one table's `t/<tenant_hash>/pq/t/<table>/v/` keys, or with `--stray` the tenant's `t/<tenant_hash>/pq/t/` keys under no valid table name, and with `--delete` or `--delete-version` deletes the flagged, stray or named manifest key, then with `--stray` lists again; it never reads a manifest, since Maintain cannot | Maintain credential | `s3:ListBucket`, `s3:DeleteObject` | `MaintainList` `s3:prefix` `t/*/pq/t/*`; `MaintainDelete` `t/*/pq/t/*` |
 | The admission reconcile's `reap_keys` (`crates/ravel-ingest/src/reconcile.rs`) deletes the snapshots `t/<tenant_hash>/<signal>/admission/<process_id>.snapshot` of processes past the reap horizon | `gateway`, `all` | `s3:DeleteObject` | `GatewayAdmissionDelete` `t/????????????????????????????????/?/admission/*` |
+| `ravel-cli compat certify` keeps a store-wide census cursor at `sys/maintain/certify/<family>/cursor` (`certify_cursor_key`, `crates/ravel-maintain/src/compat_certify.rs`): `put_certify_cursor` PUTs it every pass (`CreateIfAbsent` for a fresh census, else `CasVersion`), and `delete_cursor` GETs and DELETEs it once the certificate and floor raises are written | Admin | `s3:PutObject`, `s3:DeleteObject` | `AdminCertifyCursor` `sys/maintain/certify/*` (the read is `AdminRead` `sys/*`) |
 
 The last row lists only prefixes; nothing below `t/*/a/` but the memo is a
 control-plane key, and the alert data objects and commit records the evaluator
@@ -532,6 +534,11 @@ query is refused. Without the Query manifest create, every HTTP `CREATE` and
 every superseded manifest stays.
 Without the gateway's admission delete, each reap is refused and logged, and
 dead processes' snapshots accumulate under the prefix every reconcile lists.
+Without the certify cursor write, `compat certify` is refused at its first
+pass on a census that does not finish in one run. Without the delete,
+`delete_cursor` logs a warning rather than failing the run, but the cursor
+it could not remove stays behind for the next run to read as its own stale
+start, instead of a fresh census.
 
 No server role may write `sys/auth`: the only production writers are
 `ravel-cli` under Admin and the operator, which uses the shared credential
