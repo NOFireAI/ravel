@@ -56,11 +56,13 @@
 //! length` ([`upper_bound`]). That formula leaves out the wire bytes the
 //! listing's own GETs hold while the catalog decodes: the open GET (the whole
 //! object up to 512 KiB, the 64 KiB footer tail above it) and the catalog
-//! sections' run. The report carries a bound on those ([`held_fetch_bound`])
-//! and their sum with the formula ([`listing_bound`]), and how far the peak
-//! lies above the formula. A listing under exactly the formula's figure is
-//! refused (the smoke test pins it), so the bound band is checked against
-//! [`listing_bound`]. [`check_report`] holds the bands: peak per sample in
+//! sections' run. The report carries those bytes ([`held_fetch_bound`]) and
+//! their sum with the formula ([`listing_bound`]), and how far the peak lies
+//! above the formula. A listing under exactly the formula's figure is refused
+//! (the smoke test pins it), so the bound band is checked against
+//! [`listing_bound`]; the search starts there, so the peak it reports is at or
+//! below that bound whenever a listing under it succeeds. [`check_report`]
+//! holds the bands: peak per sample in
 //! [`PEAK_PER_SAMPLE_BAND`], the peak at or below the listing bound, and the
 //! peak non-decreasing as samples per part grow across the caps. A figure
 //! outside its band, missing, or emitted twice is a failure.
