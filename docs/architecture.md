@@ -380,6 +380,13 @@ record. A deployment runs `ravel-cli store qualify` once before its first
 server starts. That run proves that the backend honours the semantics that
 the commit protocol depends on, before any data depends on them.
 
+A release that retires the reader for an older on-object format version is
+also gated on `sys/compat`: it starts only when each retired family carries
+an uncontradicted certificate at or above the oldest version it reads, with
+the late-write watermark past the certified time (ADR-4233 decision 7;
+[retired-reader startup gate](guides/operations/maintenance.md#retired-reader-startup-gate)).
+No current release retires a reader, so the gate makes no request today.
+
 The durable backends are an S3-compatible bucket (`--store s3`), a Google
 Cloud Storage bucket (`--store gcs`, ADR-3456) and an Azure Blob Storage
 container (`--store azure`, ADR-4158). All three are gated the same way: the

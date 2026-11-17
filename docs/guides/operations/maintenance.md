@@ -1494,7 +1494,57 @@ Two more refusals apply to migration:
 `migrate`: one budgeted walk toward the family's active version, for one
 tenant, signal and family. It does nothing without a policy, reads only the
 provisioning record once the family's floor has reached the active version,
-and reports a refused run as an outcome rather than an error.
+and reports a refused run as an outcome rather than an error. While
+`sys/compat` marks the family's certificate `contradicted`, it walks the
+bucket even when the floor has reached the active version: a late write
+landed below the floor, so the floor no longer proves the bucket clean.
+
+### Compat maintenance units
+
+A `--mode maintain` process started with `--tenant-hash-key-file` runs one
+`sys/compat` maintenance task beside the maintenance loop. The task waits
+until the process is in the maintain live set, then ticks once an hour,
+starting at once. Each tick reads
+`sys/compat` and, for each of `rseg`, `rlog` and `rspan` whose entry
+carries a certificate, runs two steps. One live maintain process owns each
+family, through the unit key `compat-late-write/<family>`:
+
+1. **The late-write pass**, when the watermark
+   (`late_writes_verified_through_unix_ns`) is at or below the
+   certificate's certified time, or is a day old. The pass
+   (`ravel_maintain::late_write_pass`) lists the commit, compaction and
+   rewrite records of every signal of the family, GETs those whose
+   `LastModified` is after the watermark minus the clock-skew allowance,
+   and on a clean result CAS-advances the watermark to its own start. A
+   record below the
+   certified version sets `contradicted` on the family entry and logs an
+   `ERROR` line naming up to five record keys. The remedy: roll back to
+   the release that reads both versions, `migrate`, and re-certify.
+2. **Certify finalization**, on an uncontradicted family. A `certify` run
+   whose certificate CAS landed but whose format-floor raises did not
+   finish reports `FinalizationPending` until a late-write pass that
+   started after the certificate has completed. The first tick after that
+   pass finishes the raises. With no raises pending, the step is refused as
+   already certified and writes nothing. It never starts a census.
+
+The tick logs each step: one `INFO` line per completed pass (records
+examined, new watermark) and per finished or pending finalization, and one
+`WARN` line per failed step, which the next tick retries. The watermark,
+`contradicted` and finalization-pending state of each certified family also
+render on the maintain process's `/metrics` as
+`ravel_compat_late_write_watermark_seconds`,
+`ravel_compat_certificate_contradicted` and
+`ravel_compat_certify_finalization_pending`
+([observability guide](../observability.md#format-write-policy-ravel_compat_)).
+
+With `--background-migrate`, each tick also runs `background_migrate_unit`
+for each provisioned metrics, logs and spans signal of every discovered
+tenant whose fold unit this process owns, with a budget of 10,000 L0
+records per tenant and signal. A walk the budget stops resumes from its
+cursor on the next tick. Each walk logs one `INFO` line, or a `WARN` line
+naming the held buckets when some were held; a unit already at the active
+version logs nothing. The flag is refused outside `--mode maintain` and
+without `--tenant-hash-key-file`. It is off by default.
 
 ## Format migration
 
@@ -2166,6 +2216,26 @@ On a pre-v1.0 build a crossing found here has one remedy, as described
 above: re-ingest or discard the objects at the retired version. Start with
 `warn` to see the counts, and use `refuse` on a deployment that must not
 serve with part of its catalog unreadable.
+
+### Retired-reader startup gate
+
+A release that drops the reader for an older version of `rseg`, `rlog` or
+`rspan` checks `sys/compat` before it resolves the tenancy marker, in every
+mode. For each family whose reader it retired, it starts only when the
+family entry carries a certificate at or above the
+oldest version it reads, the certificate is not `contradicted`, and the
+late-write watermark is past the certified time. Otherwise the process
+exits before serving, with an error naming the family and the remedy. A
+bucket with neither `sys/compat` nor `sys/tenancy` is a fresh store and
+starts. A bucket with `sys/tenancy` and no `sys/compat` is refused with an
+error naming `ravel-cli compat init`, which adopts the store from the
+release that reads both versions. `sys/compat` without a configured
+`--tenant-hash-key-file` is refused too, because the certificates cannot be
+authenticated. A watermark more than 7 days old logs a `WARN` line and
+still starts.
+
+No current release has retired a reader: the gate's reader set is empty,
+and it returns without a request to the store.
 
 ## Legal hold
 

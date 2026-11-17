@@ -505,6 +505,7 @@ mod tests {
                 active_write_versions: Vec::new(),
                 refusals: Vec::new(),
                 refresh_failures: 0,
+                certificates: Vec::new(),
             },
         );
         let help = body
