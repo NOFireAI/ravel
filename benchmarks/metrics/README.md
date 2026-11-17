@@ -305,11 +305,12 @@ is 90 % of the points. From the manifest, `history` generates 1,728,000,000
 points, 1,555,200,000 scalar and 172,800,000 native histogram. The one-in-500
 missing-sample anomaly lowers the scalars to about 1,552,089,600 and the
 histograms to about 172,454,400. The 2026-11-06 run (harness `78d8e8fa3`)
-reported 1,552,087,844 as `accepted_samples` on all four engines. The
-2026-10-28 Prometheus-only run (harness `e56c5209b`) reported 1,724,541,945
-accepted points, which is samples plus histograms. The 172,454,101 between
-the two is the histogram class: the stream did not change between those
-harness commits.
+wrote `accepted_samples` 1,552,087,844 on all four rows and
+`accepted_histograms` 172,454,101 on the Prometheus, Mimir and Ravel rows,
+which sum to 1,724,541,945; VictoriaMetrics acknowledges histograms it cannot
+store, so its row holds none. The 2026-10-28 Prometheus-only run (harness
+`e56c5209b`) accepted the same 1,724,541,945 points. The stream did not
+change between those harness commits.
 
 `endpoint` on an HTTP row is the URL passed. The portable Ravel row writes to
 `ravel-server`'s `/api/v1/write`. With `--ravel-bearer-token-env <VAR>` it
