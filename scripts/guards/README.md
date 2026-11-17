@@ -377,7 +377,12 @@ than passing for "no pull request open".
   purpose: a pattern match on `Name {` or a different function sharing the
   identifier and an old argument count is reported too, which costs one
   grep, while a miss costs a queue cycle; renames, tuple structs, and tuple
-  or unit enum variants are out of scope. `scripts/pr-review-status.sh`
+  or unit enum variants are out of scope. So is the body of an `impl Trait
+  for Type` block: its methods follow the trait, and a change to a trait
+  method's shape is read from the `trait` block, but only when the branch
+  changes the file that declares it. A trait from a dependency is never
+  read, so a dependency upgrade that changes a trait method's parameters is
+  not caught. `scripts/pr-review-status.sh`
   runs it for the pull request head before the merge line: exit 1 withholds
   the line, and `ALLOW_STALE_SHAPE_SITES=1` (for hits verified by hand as
   false positives) prints them with a note that the guard was overridden,

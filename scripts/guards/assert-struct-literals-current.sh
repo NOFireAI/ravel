@@ -24,8 +24,10 @@
 #   - a function or method (`fn name(`, any visibility) whose parameter count,
 #     `self` receiver, or any parameter's type differs. Renaming a parameter
 #     is not a change.
-# A fn inside an `impl Trait for Type` block is skipped: the trait's own `trait`
-# block carries the method shape, and an impl only follows it.
+# The body of an `impl Trait for Type` block is skipped, items declared inside
+# its methods included: a trait method's shape is read from its `trait` block,
+# which is only seen when the branch changes the file declaring it. A trait
+# from a dependency is not read at all.
 # Out of scope: renaming an item, a struct, variant or function that exists on
 # only one side, a tuple struct, and a tuple or unit enum variant.
 # Same-named items are pooled across the changed files, so moving an item
