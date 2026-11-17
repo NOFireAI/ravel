@@ -311,9 +311,8 @@ impl LogIngestRouter {
                     scope_compat.clone(),
                     scope_bucket.clone(),
                 ));
-                let writer_id = rng.new_uuid();
-                let epoch =
-                    u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
+                let (writer_id, epoch) =
+                    crate::router::draw_writer_identity(rng.as_ref(), clock.as_ref());
                 (0..shard_count)
                     .map(|shard| {
                         let (tx, rx) = mpsc::channel(config.channel_depth);
@@ -832,7 +831,7 @@ impl LogIngestRouter {
         let mut durable = Vec::with_capacity(ack_shards.len());
         let mut first_error: Option<LogWriteError> = None;
         let mut dead_shard: Option<u32> = None;
-        for (shard, result) in ack_shards.into_iter().zip(joined) {
+        for (&shard, result) in ack_shards.iter().zip(joined) {
             match result {
                 Ok(Ok(token)) => durable.push(token),
                 Ok(Err(shard_error)) => {
@@ -850,17 +849,27 @@ impl LogIngestRouter {
         }
 
         // As in `Submitted::acks`: a HEAD of every token's commit key, not
-        // the shards' acks, is the evidence. The default build compiles the
-        // assertion out, leaving `tenant_hash` unread.
+        // the shards' acks, is the evidence. The condition also notes the
+        // shards this request was dispatched to, for the marker property
+        // (`idempotency::receipt_commits_are_durable`). The default build
+        // compiles the assertion out, leaving `tenant_hash` unread.
         let _ = tenant_hash;
         ravel_invariant::inv_always!(
-            crate::router::commit_records_exist(
-                self.store.as_ref(),
-                &tenant_hash,
-                ravel_types::Signal::Logs,
-                &durable
-            )
-            .await,
+            {
+                crate::idempotency::note_request_shards(
+                    tenant_hash,
+                    ravel_types::Signal::Logs,
+                    &durable,
+                    &ack_shards,
+                );
+                crate::router::commit_records_exist(
+                    self.store.as_ref(),
+                    &tenant_hash,
+                    ravel_types::Signal::Logs,
+                    &durable,
+                )
+                .await
+            },
             "commit: a strict logs ack names a durable commit record",
             std::collections::BTreeMap::from([
                 ("tenant", tenant_hash.to_hex()),

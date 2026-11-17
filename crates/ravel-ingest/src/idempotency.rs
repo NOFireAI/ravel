@@ -40,7 +40,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use ravel_commit::keys::ingest_hour_string;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError, UploadChecksum};
-use ravel_types::{Signal, TenantId};
+use ravel_types::{Signal, TenantHash, TenantId};
 
 /// Domain-separation prefix for the keyhash, distinct from `TenantId::hash`'s
 /// own domain string (`ravel-tenant-v1`) so the two blake3 uses can never
@@ -445,10 +445,87 @@ pub async fn write_marker(
     }
 }
 
-/// Whether the commit records `receipt` names are all in `store` and together
-/// carry at least `written_count` rows: a marker for a request whose rows
-/// some shard has not committed fails one or the other. Read from the store,
-/// not from the receipt's own claim. A read error other than NotFound is no
+/// The shards each recent strict request was dispatched to, keyed by its
+/// tenant, signal and receipt tokens as the marker stores them. Only the
+/// instrumented build fills it (the routers call [`note_request_shards`] from
+/// an assertion condition); the oldest entry is dropped past
+/// [`MAX_NOTED_REQUESTS`].
+#[allow(dead_code)]
+static REQUEST_SHARDS: std::sync::Mutex<std::collections::VecDeque<NotedRequest>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+#[allow(dead_code)]
+const MAX_NOTED_REQUESTS: usize = 4096;
+
+#[allow(dead_code)]
+struct NotedRequest {
+    tenant_hash: TenantHash,
+    signal: Signal,
+    commit_token: String,
+    shards: Vec<u32>,
+}
+
+#[allow(dead_code)]
+fn noted_requests() -> std::sync::MutexGuard<'static, std::collections::VecDeque<NotedRequest>> {
+    REQUEST_SHARDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Records that the strict request whose receipt is `tokens` was dispatched
+/// to `shards`: the routing, which decides which shards must commit before
+/// the request is complete. Only an invariant condition calls this.
+#[allow(dead_code)]
+pub(crate) fn note_request_shards(
+    tenant_hash: TenantHash,
+    signal: Signal,
+    tokens: &[ravel_types::CommitToken],
+    shards: &[u32],
+) {
+    if tokens.is_empty() {
+        return;
+    }
+    let mut noted = noted_requests();
+    if noted.len() >= MAX_NOTED_REQUESTS {
+        noted.pop_front();
+    }
+    noted.push_back(NotedRequest {
+        tenant_hash,
+        signal,
+        commit_token: crate::router::encode_tokens(tokens),
+        shards: shards.to_vec(),
+    });
+}
+
+/// The shards the request behind `receipt` was dispatched to: every shard a
+/// router noted for this receipt, else the shards its tokens name.
+#[allow(dead_code)]
+fn request_shards(
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    receipt: &IdempotencyReceipt,
+    tokens: &[ravel_types::CommitToken],
+) -> std::collections::BTreeSet<u32> {
+    let noted: std::collections::BTreeSet<u32> = noted_requests()
+        .iter()
+        .filter(|n| {
+            n.tenant_hash == *tenant_hash
+                && n.signal == signal
+                && n.commit_token == receipt.commit_token
+        })
+        .flat_map(|n| n.shards.iter().copied())
+        .collect();
+    if noted.is_empty() {
+        tokens.iter().map(|t| t.shard).collect()
+    } else {
+        noted
+    }
+}
+
+/// MarkerImpliesAllShardsDurable, read from the store: every shard the
+/// request was dispatched to has a token in `receipt` whose commit record is
+/// in `store` and was written by that shard, and the records together carry
+/// at least `written_count` rows. A read error other than NotFound is no
 /// evidence of absence and passes. Only an invariant condition calls this,
 /// and the default build compiles it out.
 #[allow(dead_code)]
@@ -458,19 +535,28 @@ async fn receipt_commits_are_durable(
     signal: Signal,
     receipt: &IdempotencyReceipt,
 ) -> bool {
-    let mut committed: u64 = 0;
+    let tenant_hash = tenant_id.hash();
+    let mut tokens = Vec::new();
     for encoded in receipt.commit_token.split(',').filter(|t| !t.is_empty()) {
         let Ok(token) = ravel_types::CommitToken::decode(encoded) else {
             return false;
         };
-        let Ok(key) = ravel_commit::keys::commit_key_for_token(&tenant_id.hash(), signal, &token)
-        else {
+        tokens.push(token);
+    }
+    let mut committed: u64 = 0;
+    for shard in request_shards(&tenant_hash, signal, receipt, &tokens) {
+        let Some(token) = tokens.iter().find(|t| t.shard == shard) else {
+            return false;
+        };
+        let Ok(key) = ravel_commit::keys::commit_key_for_token(&tenant_hash, signal, token) else {
             return false;
         };
         match store.get(&key, ravel_object_store::GetRange::Full).await {
             Ok(object) => match ravel_commit::record::decode(&object.data) {
-                Ok(record) => committed = committed.saturating_add(record.sample_count),
-                Err(_) => return false,
+                Ok(record) if record.shard == shard => {
+                    committed = committed.saturating_add(record.sample_count);
+                }
+                Ok(_) | Err(_) => return false,
             },
             Err(StoreError::NotFound) => return false,
             Err(_) => return true,

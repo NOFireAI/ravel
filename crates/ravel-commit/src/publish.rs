@@ -81,8 +81,32 @@ pub async fn publish(
 /// harness injects a seeded [`crate::rng::SeededRng`] so retry timing is
 /// reproducible from the master seed. Behavior with the default source is
 /// identical to the pre-seam code.
-#[tracing::instrument(skip(store, record, retry_policy, rng), fields(commit_key))]
 pub async fn publish_with_rng(
+    store: &dyn ObjectStoreBackend,
+    record: &CommitRecord,
+    retry_policy: &RetryPolicy,
+    rng: &dyn RngSource,
+) -> Result<CommitToken, PublishError> {
+    let token = put_commit_record(store, record, retry_policy, rng).await?;
+    assert_commit_has_data(store, record).await;
+    Ok(token)
+}
+
+/// [`publish`] without the instrumented build's data-object evidence read: a
+/// caller that races the publish against a deadline or times it calls this
+/// inside the race and [`assert_commit_has_data`] after the race completes,
+/// so the evidence read can neither delay nor change the outcome. In the
+/// default build the two are the same as [`publish`].
+pub async fn publish_deferring_evidence(
+    store: &dyn ObjectStoreBackend,
+    record: &CommitRecord,
+    retry_policy: &RetryPolicy,
+) -> Result<CommitToken, PublishError> {
+    put_commit_record(store, record, retry_policy, &SystemRng).await
+}
+
+#[tracing::instrument(skip(store, record, retry_policy, rng), fields(commit_key))]
+async fn put_commit_record(
     store: &dyn ObjectStoreBackend,
     record: &CommitRecord,
     retry_policy: &RetryPolicy,
@@ -96,7 +120,7 @@ pub async fn publish_with_rng(
     let opts = PutOptions::create_if_absent().with_checksum(checksum);
 
     let mut attempt: u32 = 0;
-    let token = loop {
+    loop {
         match store.put(&commit_key, payload.clone(), opts.clone()).await {
             Ok(_) => {
                 tracing::info!(attempt, "commit record published");
@@ -104,10 +128,10 @@ pub async fn publish_with_rng(
                     "commit: commit record put",
                     std::collections::BTreeMap::from([("commit_key", commit_key.clone())])
                 );
-                break record::token_for(record)?;
+                return Ok(record::token_for(record)?);
             }
             Err(StoreError::AlreadyExists) => {
-                break resolve_already_exists(store, &commit_key, record).await?;
+                return resolve_already_exists(store, &commit_key, record).await;
             }
             Err(e) if e.is_retryable() && attempt < retry_policy.max_attempts => {
                 tracing::warn!(attempt, error = %e, "retrying commit publish after store error");
@@ -122,9 +146,15 @@ pub async fn publish_with_rng(
                 });
             }
         }
-    };
-    // The record now exists at its key; its data object must already be in
-    // the store. Only a HEAD answering NotFound is evidence of absence.
+    }
+}
+
+/// NoCommitWithoutData, for a record that [`publish_deferring_evidence`] (or
+/// [`publish`]) just reported published: the record exists at its key, so
+/// its data object must already be in the store. Only a HEAD answering
+/// NotFound is evidence of absence. The default build compiles the HEAD out.
+pub async fn assert_commit_has_data(store: &dyn ObjectStoreBackend, record: &CommitRecord) {
+    let _ = (store, record);
     ravel_invariant::inv_always!(
         match keys::reconstruct_data_key(record) {
             Ok(data_key) => !matches!(store.head(&data_key).await, Err(StoreError::NotFound)),
@@ -132,14 +162,16 @@ pub async fn publish_with_rng(
         },
         "commit: a commit record never exists without its data object",
         std::collections::BTreeMap::from([
-            ("commit_key", commit_key.clone()),
+            (
+                "commit_key",
+                keys::commit_key_for_record(record).unwrap_or_default()
+            ),
             (
                 "data_key",
                 keys::reconstruct_data_key(record).unwrap_or_default()
             ),
         ])
     );
-    Ok(token)
 }
 
 async fn resolve_already_exists(
@@ -156,19 +188,20 @@ async fn resolve_already_exists(
                 source: e,
             })?;
     let existing_record = record::decode(&existing.data)?;
+    // Every AlreadyExists, the split-brain arm included: the record the GET
+    // returned carries this writer's content hash.
+    ravel_invariant::inv_always!(
+        existing_record.content_hash == record.content_hash,
+        "commit: one commit identity holds one content hash",
+        std::collections::BTreeMap::from([
+            ("commit_key", commit_key.to_owned()),
+            ("this", hex::encode(&record.content_hash)),
+            ("stored", hex::encode(&existing_record.content_hash)),
+        ])
+    );
     if ravel_invariant::inv_mutant!("commit/mismatched-identity-idempotent")
         || existing_record.content_hash == record.content_hash
     {
-        // Compares the record the GET returned, not the decision above.
-        ravel_invariant::inv_always!(
-            existing_record.content_hash == record.content_hash,
-            "commit: one commit identity holds one content hash",
-            std::collections::BTreeMap::from([
-                ("commit_key", commit_key.to_owned()),
-                ("this", hex::encode(&record.content_hash)),
-                ("stored", hex::encode(&existing_record.content_hash)),
-            ])
-        );
         tracing::info!("commit publish idempotent: matching record already landed");
         Ok(record::token_for(record)?)
     } else {
@@ -552,8 +585,11 @@ mod tests {
         (first, second, key)
     }
 
+    /// The property is evaluated on every AlreadyExists, before the hash
+    /// compare decides: it holds on the identical republish and is false on
+    /// the split-brain arm, whose stored hash is the first record's.
     #[tokio::test]
-    async fn one_identity_one_content_holds_on_an_idempotent_republish() {
+    async fn one_identity_one_content_is_evaluated_on_every_already_exists() {
         if !capturing() {
             return;
         }
@@ -568,9 +604,42 @@ mod tests {
             .expect_err("a second content under the identity is split-brain");
         assert!(matches!(err, PublishError::SplitBrain { .. }), "{err:?}");
 
-        // One evaluation, the identical republish's; the split-brain arm
-        // never reaches the site.
         let evaluations = evaluations(ONE_IDENTITY_ONE_CONTENT, &key);
+        assert_eq!(evaluations.len(), 2, "{evaluations:?}");
+        assert!(evaluations[0].0, "{evaluations:?}");
+        assert!(!evaluations[1].0, "{evaluations:?}");
+        assert!(
+            evaluations[1]
+                .1
+                .contains(&format!("\"stored\": \"{}\"", hex::encode(first.content_hash))),
+            "the split-brain evaluation names the stored record's hash: {evaluations:?}"
+        );
+    }
+
+    /// `publish_deferring_evidence` publishes with no evidence read, and
+    /// `assert_commit_has_data` is the one site that reads it: a caller can
+    /// run the read after a deadline race completes.
+    #[tokio::test]
+    async fn the_deferred_publish_reads_no_evidence_until_asked() {
+        if !capturing() {
+            return;
+        }
+        let store = MemoryStore::new();
+        let record = sample_record([0x42; 32]);
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        put_data_object(&store, &data_key, Bytes::from_static(b"segment"))
+            .await
+            .expect("data put");
+        publish_deferring_evidence(&store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        assert!(
+            evaluations(NO_COMMIT_WITHOUT_DATA, &data_key).is_empty(),
+            "the deferred publish read the evidence"
+        );
+
+        assert_commit_has_data(&store, &record).await;
+        let evaluations = evaluations(NO_COMMIT_WITHOUT_DATA, &data_key);
         assert_eq!(evaluations.len(), 1, "{evaluations:?}");
         assert!(evaluations[0].0, "{evaluations:?}");
     }

@@ -536,7 +536,26 @@ struct FlushCtx {
     stage_timings: Arc<MetricStageTimings>,
     /// The ADR-1702 write gate the encode runs on, shared with the router.
     write_gate: WriteGateSlot,
+    /// NoPublishAfterAbandon evidence: commit keys of flushes abandoned at the
+    /// commit PUT whose record a HEAD found absent at the abandon. Only the
+    /// instrumented build fills it; every later flush on this shard re-reads
+    /// each key.
+    abandoned_commits: Mutex<Vec<AbandonedCommit>>,
 }
+
+/// A flush abandoned at its commit PUT with no commit record in the store at
+/// the abandon. The default build never builds one, and only assertions read
+/// the key and tenant.
+#[allow(dead_code)]
+struct AbandonedCommit {
+    tenant_hash: TenantHash,
+    commit_key: String,
+    abandoned_ns: i64,
+}
+
+/// The most abandoned commit keys a shard keeps for re-reading; the oldest is
+/// dropped past it.
+const MAX_ABANDONED_COMMITS: usize = 64;
 
 /// What a flush's encode job hands back to the flush task: the segment, and
 /// the byte charges the job held while it waited and ran.
@@ -600,6 +619,8 @@ impl FlushCtx {
             waiters,
             charges,
         } = pinned;
+
+        self.recheck_abandoned_commits().await;
 
         let waiters = if ravel_invariant::inv_mutant!("commit/ack-before-commit") {
             let token = CommitToken {
@@ -688,7 +709,10 @@ impl FlushCtx {
                 self.metrics.record_abandoned_queue_deadline();
                 ravel_invariant::inv_reachable!(
                     "commit: flush abandoned",
-                    std::collections::BTreeMap::from([("at", "encode")])
+                    std::collections::BTreeMap::from([
+                        ("at", "encode".to_owned()),
+                        ("tenant", tenant_hash.to_hex()),
+                    ])
                 );
                 self.ack_waiters(
                     waiters,
@@ -759,7 +783,10 @@ impl FlushCtx {
                 self.metrics.record_abandoned_retry_exhausted();
                 ravel_invariant::inv_reachable!(
                     "commit: flush abandoned",
-                    std::collections::BTreeMap::from([("at", "data put")])
+                    std::collections::BTreeMap::from([
+                        ("at", "data put".to_owned()),
+                        ("tenant", tenant_hash.to_hex()),
+                    ])
                 );
                 self.ack_waiters(
                     waiters,
@@ -818,7 +845,10 @@ impl FlushCtx {
                 self.metrics.record_abandoned_retry_exhausted();
                 ravel_invariant::inv_reachable!(
                     "commit: flush abandoned",
-                    std::collections::BTreeMap::from([("at", "commit put")])
+                    std::collections::BTreeMap::from([
+                        ("at", "commit put".to_owned()),
+                        ("tenant", tenant_hash.to_hex()),
+                    ])
                 );
                 self.ack_waiters(
                     waiters,
@@ -827,7 +857,96 @@ impl FlushCtx {
                             .into(),
                     )),
                 );
+                // The HEAD runs in the condition, so the default build never
+                // issues it and records nothing.
+                ravel_invariant::inv_sometimes!(
+                    self.note_abandoned_commit(tenant_hash, &record).await,
+                    "commit: an abandoned flush's commit record is absent at the abandon",
+                    std::collections::BTreeMap::from([
+                        ("tenant", tenant_hash.to_hex()),
+                        (
+                            "commit_key",
+                            keys::commit_key_for_record(&record).unwrap_or_default(),
+                        ),
+                    ])
+                );
             }
+        }
+    }
+
+    /// Remembers an abandoned flush's commit key for
+    /// [`Self::recheck_abandoned_commits`] when a HEAD finds no record there,
+    /// and returns whether it did. A record found present landed before the
+    /// abandon (a lost PUT response), which is the documented ambiguity and
+    /// not a violation; a HEAD error is no evidence either way. Only an
+    /// invariant condition calls this.
+    #[allow(dead_code)]
+    async fn note_abandoned_commit(&self, tenant_hash: TenantHash, record: &CommitRecord) -> bool {
+        let Ok(commit_key) = keys::commit_key_for_record(record) else {
+            return false;
+        };
+        match self.store.head(&commit_key).await {
+            Err(ravel_object_store::StoreError::NotFound) => {}
+            Ok(_) | Err(_) => return false,
+        }
+        let mut abandoned = self
+            .abandoned_commits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if abandoned.len() >= MAX_ABANDONED_COMMITS {
+            abandoned.remove(0);
+        }
+        abandoned.push(AbandonedCommit {
+            tenant_hash,
+            commit_key,
+            abandoned_ns: self.clock.now_ns(),
+        });
+        true
+    }
+
+    /// NoPublishAfterAbandon (formal/tla/commit): a commit record a HEAD found
+    /// absent when its flush was abandoned is still absent on every later
+    /// flush of this shard, for `max_flush_lifetime` after the abandon. A
+    /// record found now landed after the abandon. Only the instrumented build
+    /// remembers abandoned keys, so the default build finds none here.
+    async fn recheck_abandoned_commits(&self) {
+        let pending = {
+            let mut abandoned = self
+                .abandoned_commits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if abandoned.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *abandoned)
+        };
+        let now_ns = self.clock.now_ns();
+        let window_ns = duration_nanos_saturating(self.config.max_flush_lifetime);
+        let mut kept = Vec::with_capacity(pending.len());
+        for abandoned in pending {
+            ravel_invariant::inv_always_or_unreachable!(
+                !matches!(self.store.head(&abandoned.commit_key).await, Ok(_)),
+                "commit: no commit record is published after its flush was abandoned",
+                std::collections::BTreeMap::from([
+                    ("tenant", abandoned.tenant_hash.to_hex()),
+                    ("commit_key", abandoned.commit_key.clone()),
+                    ("abandoned_ns", abandoned.abandoned_ns.to_string()),
+                    ("checked_ns", now_ns.to_string()),
+                ])
+            );
+            if now_ns.saturating_sub(abandoned.abandoned_ns) < window_ns {
+                kept.push(abandoned);
+            }
+        }
+        if !kept.is_empty() {
+            let mut abandoned = self
+                .abandoned_commits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            kept.append(&mut abandoned);
+            let excess = kept.len().saturating_sub(MAX_ABANDONED_COMMITS);
+            kept.drain(..excess);
+            *abandoned = kept;
         }
     }
 
@@ -1104,7 +1223,8 @@ impl FlushCtx {
                 .attempt_when_fresh(self.clock.as_ref(), deadline_ns)
                 .await
                 .map_err(PutAbort::Refused)?;
-            let call = publish::publish(self.store.as_ref(), record, &single_attempt);
+            let call =
+                publish::publish_deferring_evidence(self.store.as_ref(), record, &single_attempt);
             let started_ns = self.clock.now_ns();
             let outcome = self.bound_to_deadline(deadline_ns, call).await;
             if outcome.is_some() {
@@ -1113,22 +1233,9 @@ impl FlushCtx {
             }
             match outcome {
                 Some(Ok(token)) => {
-                    // `started_ns` is this loop's own clock read, taken before
-                    // the attempt; `bound_to_deadline` decides on its own.
-                    ravel_invariant::inv_always!(
-                        started_ns < deadline_ns,
-                        "commit: no commit record is published after its flush's deadline",
-                        std::collections::BTreeMap::from([
-                            ("commit_token", token.encode()),
-                            (
-                                "commit_key",
-                                ravel_commit::keys::commit_key_for_record(record)
-                                    .unwrap_or_default(),
-                            ),
-                            ("attempt_started_ns", started_ns.to_string()),
-                            ("deadline_ns", deadline_ns.to_string()),
-                        ])
-                    );
+                    // After the race and the RTT sample, so the instrumented
+                    // build's evidence read cannot abandon a landed commit.
+                    publish::assert_commit_has_data(self.store.as_ref(), record).await;
                     return Ok(token);
                 }
                 Some(Err(PublishError::SplitBrain { this, stored })) => {
@@ -1425,6 +1532,7 @@ impl ShardActor {
             #[cfg(feature = "stage-timing")]
             stage_timings,
             write_gate,
+            abandoned_commits: Mutex::new(Vec::new()),
         });
         ShardActor {
             shard,
