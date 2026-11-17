@@ -3019,6 +3019,64 @@ mod provenance_extension_tests {
             .expect_err("an empty column block has no Enc tag");
         assert!(matches!(err, SegmentError::ProvenanceColumnCodec(_)));
     }
+
+    fn skip(meta: &[u8], sample_count: &[u64]) -> (Result<(), SegmentError>, usize, u64) {
+        super::decode_counter::reset();
+        let mut pos = 0usize;
+        let result = super::skip_provenance_extension(meta, &mut pos, sample_count.iter().copied());
+        (result, pos, super::decode_counter::i64_block_decodes())
+    }
+
+    /// The skip consumes exactly the extension the parser consumes, decoding
+    /// the presence column and none of the four sample-major columns.
+    ///
+    /// FLIP: decoding the columns in the skip (`take_encoded_i64_block` in
+    /// place of `take_block` in its column loop) reads 5 blocks here.
+    #[test]
+    fn the_skip_passes_over_the_columns_without_decoding_them() {
+        let (meta, _) = two_flagged_samples();
+        let (result, pos, decoded) = skip(&meta, &[2, 1]);
+        assert_eq!(result, Ok(()));
+        assert_eq!(pos, meta.len(), "the skip ends where the extension ends");
+        assert_eq!(decoded, 1, "only the presence column is decoded");
+    }
+
+    /// What the skip can see without a column decode is rejected with the
+    /// parser's own typed error: a bad presence value, an all-zero presence
+    /// column, a missing column and a bad `Enc` tag.
+    #[test]
+    fn the_skip_rejects_what_it_can_see_with_the_parsers_errors() {
+        let (result, ..) = skip(&encoded_block(&[2]), &[3]);
+        assert_eq!(result, Err(SegmentError::InvalidProvenancePresence(2)));
+
+        let (result, ..) = skip(&encoded_block(&[0]), &[3]);
+        assert_eq!(result, Err(SegmentError::EmptyProvenanceExtension));
+
+        let mut truncated = encoded_block(&[1]);
+        for _ in 0..3 {
+            truncated.extend(encoded_block(&[0, 0, 0]));
+        }
+        let (result, ..) = skip(&truncated, &[3]);
+        assert!(
+            matches!(
+                result,
+                Err(SegmentError::Truncated
+                    | SegmentError::SectionOutOfBounds
+                    | SegmentError::BadBlockLen)
+            ),
+            "{result:?}"
+        );
+
+        for tag_block in [vec![1u8, 0u8], vec![0u8]] {
+            let mut bad_tag = encoded_block(&[1]);
+            bad_tag.extend(tag_block);
+            let (result, ..) = skip(&bad_tag, &[1]);
+            assert!(
+                matches!(result, Err(SegmentError::ProvenanceColumnCodec(_))),
+                "{result:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
