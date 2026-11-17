@@ -30,6 +30,9 @@ ravel-rspan = { path = "../ravel-rspan", version = "0.33.0", features = ["format
 # to assert format_version and the compat fence fields. Already a transitive
 # dependency through ravel-proto; pinned here for the test's direct use.
 prost = "0.14"
+# The content hash of the corpus's RLOG and RSPAN objects, as the ingest log
+# and span flushes compute it. Already a transitive dependency.
+blake3 = "1.8"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }
 uuid = "1.24"
 
