@@ -1708,6 +1708,69 @@ mod tests {
         assert_eq!(clock.sleeps().len(), 2);
     }
 
+    /// `sys/compat` deleted between the gate's HEAD and its GET: the gate
+    /// HEADs `sys/tenancy` once and decides from it, without a retry.
+    #[tokio::test]
+    async fn retired_reader_gate_compat_deleted_before_the_get_decides_by_tenancy() {
+        for with_tenancy in [true, false] {
+            let clock = Arc::new(ManualClock::default());
+            let store = faulted(
+                FaultPlan::empty()
+                    .with_sequence(
+                        ravel_object_store::fault::Sequence::new(Op::Get)
+                            .with_key_contains(ravel_catalog::compat::COMPAT_KEY)
+                            .then_fault(ScriptedFault::NotFoundBlip)
+                            .then_passthrough(),
+                    )
+                    .with_sequence(
+                        ravel_object_store::fault::Sequence::new(Op::Head)
+                            .with_key_contains(crate::tenancy::TENANCY_MARKER_KEY)
+                            .then_passthrough()
+                            .then_passthrough(),
+                    ),
+            );
+            ravel_catalog::compat::create_compat(
+                store.inner(),
+                &ravel_catalog::compat::CompatKeys::from_file_keys(&[GATE_KEY]).expect("key"),
+                ravel_proto::sys::v1::CompatRecord {
+                    format_version: ravel_catalog::compat::COMPAT_FORMAT_VERSION,
+                    families: vec![rseg_entry(true, CERTIFIED_NS + 1, false)],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create sys/compat");
+            if with_tenancy {
+                put_tenancy_marker(store.inner()).await;
+            }
+            let result = enforce_retired_reader_gate(
+                &retry_on(clock.clone()),
+                &store,
+                &keyed(),
+                &[RSEG_8],
+                GATE_NOW_NS,
+            )
+            .await;
+            if with_tenancy {
+                let err = result.expect_err("sys/tenancy without sys/compat");
+                assert_eq!(err.to_string(), GATE_REFUSAL);
+                assert!(matches!(
+                    err.downcast_ref::<CompatGateError>(),
+                    Some(CompatGateError::TenancyWithoutCompat)
+                ));
+            } else {
+                assert_eq!(
+                    result.expect("fresh"),
+                    crate::compat_gate::GateOutcome::Fresh
+                );
+            }
+            assert_eq!(store.fault_count(Op::Get, FaultKind::NotFoundBlip), 1);
+            assert_eq!(store.sequence_progress(0), 1, "GETs of sys/compat");
+            assert_eq!(store.sequence_progress(1), 1, "HEADs of sys/tenancy");
+            assert!(clock.sleeps().is_empty(), "retried");
+        }
+    }
+
     /// With this build's empty retired set the gate sends no request, so a
     /// store that would fail every gate read is never asked.
     #[tokio::test]
