@@ -3378,9 +3378,27 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
 5. For each `min_token`: reconstruct its commit key and GET it directly
    (never by re-listing). Present: ensure it is in the snapshot set (its
    event range might not overlap; include it anyway so read-your-write
-   holds). Absent: fall back to GETting the bucket's compaction record(s)
-   (cacheable, same as step 2) and check the token's writer identity
-   against each record's input list. Found in an input list: satisfied via
+   holds), with one exception for every signal but metrics: the input is
+   left out when the set already serves its rows from a replacement, or
+   when a live rewrite erased them. A compacted input's commit
+   record stays present until the sweep, and logs and spans have no
+   query-time dedup, so adding it beside the part that holds its rows would
+   count each of its records twice. The step checks only when the set holds
+   a level-1 part of the token's (shard, ingest_hour) bucket or step 6
+   found a pending erasure request (that LIST therefore completes before
+   this step). It then LISTs the bucket, loads its compaction records
+   (cached, as in step 2) and rewrite records, and leaves the input out when
+   a compaction or rewrite record of any status names it (a rewrite through
+   its effective inputs) and one of that record's output parts is in the
+   set, or when a live rewrite names it. Records are matched by the input
+   identities they hold, never by object key. Otherwise the input is added
+   as before. The check costs nothing beyond the commit-record GET when it
+   does not run, and otherwise one bucket LIST (more pages only past the
+   page size), one GET per compaction record the cache does not hold and
+   one GET per rewrite record. Metrics keep adding the input, since
+   query-time dedup collapses the overlap. Absent: fall back to GETting the
+   bucket's compaction record(s) (cacheable, same as step 2) and check the
+   token's writer identity against each record's input list. Found in an input list: satisfied via
    that record's parts. A rewrite record (ADR-0064) is treated the same:
    if the token's identity is among a live (non-superseded) rewrite's
    effective inputs, it is satisfied via that rewrite's erased output parts,
@@ -3392,8 +3410,9 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    per resolve -- independent of whether any physical rewrite has run -- LIST
    `t/<th>/<sig>/del/` one time only. This LIST is started before the shard
    fan-out and joined with it, so its round trip overlaps the bucket LISTs in
-   one wave rather than following them; it still completes before
-   the snapshot is constructed, so the visibility bound below is unchanged. For
+   one wave rather than following them; it still completes before step 5's
+   token check and the snapshot construction, so the visibility bound below
+   is unchanged. For
    every `.dreq` erasure request found, decode and structurally validate it
    and verify its observed key against its own identity fields (ADR-0010 §7),
    then attach it to the snapshot's `pending_erasure`. `.done` completion
@@ -3591,7 +3610,10 @@ pinning are unchanged:
    listing path does. For window buckets with `hour > W`, LIST and
    GET-decode as that path does.
 4. min-token resolution: unchanged, exact commit-key GETs, never through
-   the snapshot.
+   the snapshot. A present input of any signal but metrics whose bucket
+   has a level-1 part in the result set is checked against that bucket's
+   records by the same LIST as on the listing path (step 5 above), so an
+   input compacted into a part the snapshot serves is not added beside it.
 5. Build `SegmentRef`s from snapshot entries by reconstructing the data key
    from identity fields, the same reconstruct-don't-trust rule as commit
    records (ADR-0010 §7); dedup by data key across the snapshot/listing/
@@ -3840,8 +3862,12 @@ of every input it names, a resolved snapshot holding both the record's segments
 and some or all of its listed inputs answers a query exactly as one holding
 only the segments does, because query-time dedup ("Cross-segment duplicate
 samples" below) collapses the duplicate candidates. So no dedup runs at
-compaction time, and a reader may transiently see an L0 input and its L1
-replacement together and still get exact answers.
+compaction time, and a metrics reader may transiently see an L0 input and its
+L1 replacement together and still get exact answers. That dedup runs for
+metrics only. Logs and spans have none, so the resolver never serves one of
+their inputs beside a replacement it holds: the listing excludes the inputs a
+served record names, and the `min_token` step leaves out an input whose rows
+the snapshot already serves from a replacement (step 5 of the resolve).
 
 Record-count conservation is enforced, not assumed (ADR-0048). Before the
 record PUT, the run checks that the sum of `sample_count` over its input set
