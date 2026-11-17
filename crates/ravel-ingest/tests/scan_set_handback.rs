@@ -37,7 +37,9 @@ use ravel_ingest::{
     PendingAckBudget, SpanIngestRouter, WriteMode, shard_for_span,
 };
 use ravel_logseg::{Predicate, RlogConfig, RlogReader, stream_attrs_bytes};
-use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, GateHandle, Occurrence, Op, ScriptedFault, Sequence,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
@@ -107,6 +109,7 @@ struct Counters {
     hand_back_failures: u64,
     unscanned: u64,
     mismatch_in_place: u64,
+    abandoned_stale: u64,
 }
 
 /// Reads a router's counters through a shared metrics handle, so a case can
@@ -213,6 +216,7 @@ impl Pipe for IngestRouter {
                 hand_back_failures: snap.hand_back_failures,
                 unscanned: snap.teardown_unscanned_writes,
                 mismatch_in_place: snap.generation_mismatch_written_in_place,
+                abandoned_stale: snap.abandoned_stale_provisioning,
             }
         })
     }
@@ -320,6 +324,7 @@ impl Pipe for LogIngestRouter {
                 hand_back_failures: snap.hand_back_failures,
                 unscanned: snap.teardown_unscanned_writes,
                 mismatch_in_place: snap.generation_mismatch_written_in_place,
+                abandoned_stale: snap.abandoned_stale_provisioning,
             }
         })
     }
@@ -397,6 +402,7 @@ impl Pipe for SpanIngestRouter {
                 hand_back_failures: snap.hand_back_failures,
                 unscanned: snap.teardown_unscanned_writes,
                 mismatch_in_place: snap.generation_mismatch_written_in_place,
+                abandoned_stale: snap.abandoned_stale_provisioning,
             }
         })
     }
@@ -657,8 +663,14 @@ impl<P: Pipe> World<P> {
     }
 
     async fn with_config(config: IngestConfig) -> Self {
+        Self::with_plan(config, FaultPlan::empty()).await
+    }
+
+    /// [`Self::with_config`] over a store scripted by `plan`. The records are
+    /// created on the wrapped store, so setup consumes none of the plan.
+    async fn with_plan(config: IngestConfig, plan: FaultPlan) -> Self {
         let initial = config.shard_count;
-        let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
         let store: Arc<dyn ObjectStoreBackend> = fault.clone();
         let clock = TestClock::new(T0_NS);
         let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1 << 30));
@@ -666,7 +678,7 @@ impl<P: Pipe> World<P> {
         let deferred = tenant("globex");
         for t in [&parked, &deferred] {
             validate_or_adopt(
-                store.as_ref(),
+                fault.inner(),
                 &t.hash(),
                 P::SIGNAL,
                 initial,
@@ -1116,6 +1128,299 @@ async fn unrefreshable_view_keeps_the_flush_closed<P: Pipe>() {
         scanned_rows::<P>(store, &world.deferred, H0..=pin_hour + 1).await,
         expected(&keys),
         "nothing was lost"
+    );
+}
+
+/// The flush lifetime the stale-view bound cases run with (issue #4363).
+const STALE_LIFETIME_NS: i64 = 60_000_000_000;
+/// Provisioning GETs that never recover inside a case.
+const NEVER: usize = 100_000;
+/// The deferred tenant's provisioning reads before the clock jump: the
+/// router's first resolve of the tenant.
+const PROV_READS_BEFORE: u64 = 1;
+/// The index the stale-view bound cases buffer on. There is no reshard, so
+/// every index is in the scan set and only the view's age closes the flush.
+const HELD_VIEW_SHARD: u32 = 0;
+
+fn stale_view_config() -> IngestConfig {
+    IngestConfig {
+        max_flush_lifetime: Duration::from_nanos(STALE_LIFETIME_NS as u64),
+        ..config()
+    }
+}
+
+/// The deferred tenant's provisioning GETs pass `PROV_READS_BEFORE` times,
+/// then fail `failures` times, then pass again.
+fn provisioning_outage<P: Pipe>(failures: usize) -> FaultPlan {
+    let key = ravel_catalog::provisioning_key(&tenant("globex").hash(), P::SIGNAL);
+    let mut reads = Sequence::new(Op::Get).with_key_contains(key);
+    for _ in 0..PROV_READS_BEFORE {
+        reads = reads.then_passthrough();
+    }
+    for _ in 0..failures {
+        reads = reads.then_fault(ScriptedFault::Transient("provisioning read down".into()));
+    }
+    FaultPlan::empty().with_sequence(reads)
+}
+
+/// A buffer of acknowledged buffered-mode rows held closed on an untrusted
+/// view. A strict waiter on a deferred buffer is answered by the deferral cap
+/// at the clock jump, before the hold starts, so the waiter's answer at the
+/// bound is pinned by each shard module's
+/// `a_strict_waiter_on_a_spent_stale_view_hold_is_abandoned` instead.
+struct HeldView<P> {
+    world: World<P>,
+    keys: Vec<usize>,
+    /// The clock reading at the first enforced flush that found no trusted
+    /// view, where the hold's bound starts.
+    since_ns: i64,
+}
+
+/// Acknowledges rows before the view's trust horizon with the deferred
+/// tenant's flush deferred, then moves the clock past the horizon while the
+/// provisioning GETs fail `failures` times, and returns once the flush has
+/// been held closed and a re-read has failed.
+async fn hold_on_an_untrusted_view<P: Pipe>(failures: usize) -> HeldView<P> {
+    let world =
+        World::<P>::with_plan(stale_view_config(), provisioning_outage::<P>(failures)).await;
+    let keys = rows_on::<P>(&world.deferred, HELD_VIEW_SHARD, 1, 3);
+    world.defer(HELD_VIEW_SHARD, &keys).await;
+    let horizon = start_of(H0 + 2);
+    assert!(
+        world.clock.now() < horizon,
+        "the rows are acknowledged before the view's trust horizon"
+    );
+    assert_eq!(
+        world.fault.sequence_progress(0),
+        PROV_READS_BEFORE,
+        "the router resolved the tenant from the store before the outage"
+    );
+    assert_eq!(world.fault.fault_count(Op::Get, FaultKind::Transient), 0);
+
+    let stale_before = world.router.counters().stale;
+    world.clock.set_ns(horizon + 1_000_000_000);
+    assert!(
+        drive(&world.clock, || world.router.counters().stale
+            > stale_before)
+        .await,
+        "the flush fails closed past the horizon, counters {:?}",
+        world.router.counters()
+    );
+    let since_ns = world.clock.now();
+    assert!(
+        drive(&world.clock, || world
+            .fault
+            .fault_count(Op::Get, FaultKind::Transient)
+            >= 1)
+        .await,
+        "the re-read of the provisioning record fails"
+    );
+    assert!(
+        world.clock.now() - since_ns < STALE_LIFETIME_NS / 2,
+        "the hold is still well inside its bound"
+    );
+    HeldView {
+        world,
+        keys,
+        since_ns,
+    }
+}
+
+/// Polls without moving the clock, so an actor tick the last clock move
+/// released runs before the next assertion.
+async fn yield_rounds() {
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A flush held closed because no trusted provisioning view arrives is held
+/// for exactly `max_flush_lifetime` from the first enforced hold, then dropped
+/// unwritten: every byte is refunded, the drop is counted once, and shutdown
+/// writes nothing (issue #4363).
+///
+/// Guards: `stale_view_hold_spent` and its call in each actor's
+/// `ScanCheck::Unknown` arm. Never dropping leaves the counter at 0 and the
+/// bytes charged one tick past the bound, and shutdown then writes the rows
+/// in place on its bypass pass. Dropping one tick early (`>` for `>=` read the
+/// other way, or a bound short by a tick) counts at the
+/// `since + lifetime - tick` step. Counting the drop per tick instead of once
+/// moves the counter past 1 on the ticks after the drop, and resetting
+/// `stale_view_since_ns` on each hold never drops.
+async fn an_untrusted_view_hold_is_dropped_at_the_flush_lifetime<P: Pipe>() {
+    let HeldView {
+        world,
+        keys: _,
+        since_ns,
+    } = hold_on_an_untrusted_view::<P>(NEVER).await;
+    let inner = world.fault.inner();
+
+    world.clock.set_ns(since_ns + STALE_LIFETIME_NS - TICK_NS);
+    yield_rounds().await;
+    assert_eq!(
+        world.router.counters().abandoned_stale,
+        0,
+        "held, not dropped, one tick inside the bound"
+    );
+    assert!(
+        world.budget.in_flight_bytes() > 0,
+        "the rows are still charged"
+    );
+    assert_eq!(
+        keys_under_shard(inner, &world.deferred, P::SIGNAL, HELD_VIEW_SHARD).await,
+        Vec::<String>::new(),
+        "nothing is written while the view is untrusted"
+    );
+
+    ticks(&world.clock, 1).await;
+    assert_eq!(
+        world.router.counters().abandoned_stale,
+        1,
+        "dropped and counted at the bound, counters {:?}",
+        world.router.counters()
+    );
+    assert_eq!(world.budget.in_flight_bytes(), 0, "every byte is refunded");
+    assert!(
+        world.fault.fault_count(Op::Get, FaultKind::Transient) >= 2,
+        "the router kept re-reading through the hold"
+    );
+
+    ticks(&world.clock, 50).await;
+    assert_eq!(
+        world.router.counters().abandoned_stale,
+        1,
+        "the drop is counted once"
+    );
+
+    let World {
+        router,
+        fault,
+        deferred,
+        ..
+    } = world;
+    let router = Arc::into_inner(router).expect("sole router owner");
+    let counters = router.counter_source();
+    router.shutdown().await;
+    assert_eq!(counters().abandoned_stale, 1);
+    assert_eq!(
+        keys_under_shard(fault.inner(), &deferred, P::SIGNAL, HELD_VIEW_SHARD).await,
+        Vec::<String>::new(),
+        "shutdown writes nothing of the dropped buffer"
+    );
+}
+
+/// The provisioning GETs recover inside the bound: the held flush opens on
+/// the re-read view and every acknowledged row is published once, with
+/// nothing dropped.
+///
+/// Guards: the `stale_view_since_ns` start at the first enforced hold rather
+/// than at buffer creation or the ack (either is past the bound once the
+/// clock jumps two hours, so the buffer is dropped at the first hold), and
+/// the recovery path through the `InScanSet` arm.
+async fn an_untrusted_view_that_recovers_inside_the_bound_publishes<P: Pipe>() {
+    let HeldView {
+        world,
+        keys,
+        since_ns,
+    } = hold_on_an_untrusted_view::<P>(2).await;
+    for _ in 0..(STALE_LIFETIME_NS / 100_000_000) {
+        if world.budget.in_flight_bytes() == 0 {
+            break;
+        }
+        world.clock.advance_ns(100_000_000);
+        yield_rounds().await;
+    }
+    assert_eq!(world.budget.in_flight_bytes(), 0, "the held flush landed");
+    assert!(
+        world.clock.now() - since_ns < STALE_LIFETIME_NS,
+        "it landed inside the bound"
+    );
+    assert_eq!(world.fault.fault_count(Op::Get, FaultKind::Transient), 2);
+    assert_eq!(
+        world.fault.sequence_progress(0),
+        PROV_READS_BEFORE + 2,
+        "both scripted failures fired"
+    );
+    assert_eq!(world.router.counters().abandoned_stale, 0);
+    assert_eq!(
+        scanned_rows::<P>(world.fault.inner(), &world.deferred, H0..=H0 + 3).await,
+        expected(&keys),
+        "every acknowledged row is published once"
+    );
+}
+
+/// Shutdown inside the bound keeps today's behavior: the enforced passes
+/// leave the held buffer and the teardown bypass pass writes it in place,
+/// so nothing acknowledged is dropped by a drain.
+///
+/// Guard: the bound check in each actor's `ScanCheck::Unknown` arm being
+/// reached with `stale_view_since_ns` set only by enforced holds. Dropping at
+/// teardown regardless of the bound, or counting the teardown's first
+/// sighting as the start and the drain's age as spent, counts a drop and
+/// leaves the rows unwritten.
+async fn a_teardown_inside_the_bound_writes_the_held_flush<P: Pipe>() {
+    let HeldView {
+        world,
+        keys,
+        since_ns,
+    } = hold_on_an_untrusted_view::<P>(NEVER).await;
+    let World {
+        router,
+        fault,
+        clock,
+        deferred,
+        ..
+    } = world;
+    let router = Arc::into_inner(router).expect("sole router owner");
+    let counters = router.counter_source();
+    let shutdown = tokio::spawn(router.shutdown());
+    assert!(
+        drive(&clock, || shutdown.is_finished()).await,
+        "shutdown finishes"
+    );
+    assert!(clock.now() - since_ns < STALE_LIFETIME_NS);
+    assert_eq!(counters().abandoned_stale, 0);
+    assert_eq!(
+        scanned_rows::<P>(fault.inner(), &deferred, H0..=H0 + 3).await,
+        expected(&keys),
+        "the bypass pass wrote the held buffer in place"
+    );
+}
+
+/// Shutdown that starts with the hold already spent drops the buffer rather
+/// than writing it in place on the bypass pass, and counts it once.
+///
+/// Guard: the bound check in each actor's `ScanCheck::Unknown` arm on a
+/// teardown flush. A drain that wrote a spent hold in place would publish the
+/// rows.
+async fn a_teardown_past_the_bound_drops_the_held_flush<P: Pipe>() {
+    let HeldView {
+        world,
+        keys: _,
+        since_ns,
+    } = hold_on_an_untrusted_view::<P>(NEVER).await;
+    let World {
+        router,
+        fault,
+        clock,
+        deferred,
+        budget,
+        ..
+    } = world;
+    clock.set_ns(since_ns + STALE_LIFETIME_NS);
+    let router = Arc::into_inner(router).expect("sole router owner");
+    let counters = router.counter_source();
+    let shutdown = tokio::spawn(router.shutdown());
+    assert!(
+        drive(&clock, || shutdown.is_finished()).await,
+        "shutdown finishes"
+    );
+    assert_eq!(counters().abandoned_stale, 1);
+    assert_eq!(budget.in_flight_bytes(), 0);
+    assert_eq!(
+        keys_under_shard(fault.inner(), &deferred, P::SIGNAL, HELD_VIEW_SHARD).await,
+        Vec::<String>::new(),
+        "nothing is written"
     );
 }
 
@@ -1842,6 +2147,10 @@ scan_set_cases!(
     metrics_an_increase_hands_a_late_buffer_up_to_the_owner => an_increase_hands_a_late_buffer_up_to_the_owner,
     metrics_strict_waiter_on_a_mismatched_buffer_is_abandoned => strict_waiter_on_a_mismatched_buffer_is_abandoned,
     metrics_a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone => a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone,
+    metrics_an_untrusted_view_hold_is_dropped_at_the_flush_lifetime => an_untrusted_view_hold_is_dropped_at_the_flush_lifetime,
+    metrics_an_untrusted_view_that_recovers_inside_the_bound_publishes => an_untrusted_view_that_recovers_inside_the_bound_publishes,
+    metrics_a_teardown_inside_the_bound_writes_the_held_flush => a_teardown_inside_the_bound_writes_the_held_flush,
+    metrics_a_teardown_past_the_bound_drops_the_held_flush => a_teardown_past_the_bound_drops_the_held_flush,
 );
 
 scan_set_cases!(
@@ -1860,6 +2169,10 @@ scan_set_cases!(
     logs_an_increase_hands_a_late_buffer_up_to_the_owner => an_increase_hands_a_late_buffer_up_to_the_owner,
     logs_strict_waiter_on_a_mismatched_buffer_is_abandoned => strict_waiter_on_a_mismatched_buffer_is_abandoned,
     logs_a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone => a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone,
+    logs_an_untrusted_view_hold_is_dropped_at_the_flush_lifetime => an_untrusted_view_hold_is_dropped_at_the_flush_lifetime,
+    logs_an_untrusted_view_that_recovers_inside_the_bound_publishes => an_untrusted_view_that_recovers_inside_the_bound_publishes,
+    logs_a_teardown_inside_the_bound_writes_the_held_flush => a_teardown_inside_the_bound_writes_the_held_flush,
+    logs_a_teardown_past_the_bound_drops_the_held_flush => a_teardown_past_the_bound_drops_the_held_flush,
 );
 
 scan_set_cases!(
@@ -1878,4 +2191,8 @@ scan_set_cases!(
     spans_an_increase_hands_a_late_buffer_up_to_the_owner => an_increase_hands_a_late_buffer_up_to_the_owner,
     spans_strict_waiter_on_a_mismatched_buffer_is_abandoned => strict_waiter_on_a_mismatched_buffer_is_abandoned,
     spans_a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone => a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone,
+    spans_an_untrusted_view_hold_is_dropped_at_the_flush_lifetime => an_untrusted_view_hold_is_dropped_at_the_flush_lifetime,
+    spans_an_untrusted_view_that_recovers_inside_the_bound_publishes => an_untrusted_view_that_recovers_inside_the_bound_publishes,
+    spans_a_teardown_inside_the_bound_writes_the_held_flush => a_teardown_inside_the_bound_writes_the_held_flush,
+    spans_a_teardown_past_the_bound_drops_the_held_flush => a_teardown_past_the_bound_drops_the_held_flush,
 );

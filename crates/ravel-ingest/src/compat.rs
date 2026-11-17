@@ -15,9 +15,11 @@
 //! - Permit grant picks the version a flush encodes at
 //!   ([`CompatView::write_policy`]). A stale view at grant does not drop the
 //!   flush: it hands its permit back and asks again every
-//!   [`STALE_VIEW_RETRY`], the last time at the deadline itself, until the
-//!   view answers or the flush's `max_flush_lifetime` from its first grant
-//!   elapses, and only then is the flush refused `view_stale`. Any other
+//!   [`STALE_VIEW_RETRY`], the last time [`STALE_VIEW_PUBLISH_RESERVE`]
+//!   before the deadline so an answer still leaves the flush time to publish,
+//!   until the view answers or that last ask before its `max_flush_lifetime`
+//!   from its first grant passes, and only then is the flush refused
+//!   `view_stale`. Any other
 //!   refusal at grant (a version not writable, a missing record after an
 //!   activation, or a router gone with no cached provisioning record left to
 //!   ask with) refuses the flush closed: no PUT, its rows dropped, its byte
@@ -79,6 +81,13 @@ const FENCE_BACKOFF_MAX: Duration = Duration::from_millis(50);
 
 /// How long a flush that met a stale view waits before asking it again.
 pub(crate) const STALE_VIEW_RETRY: Duration = Duration::from_secs(1);
+
+/// How much of a flush's deadline a stale-view wait leaves unspent: the view is
+/// asked for the last time this long before the deadline, so an answer then
+/// still leaves the attempt this budget, and a view that recovers only inside
+/// it refuses the flush `view_stale` rather than letting it fail later under
+/// another reason (issue #4363).
+pub(crate) const STALE_VIEW_PUBLISH_RESERVE: Duration = STALE_VIEW_RETRY;
 
 /// The versions a build writes for one family and the family's baseline.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -681,7 +690,8 @@ impl PublishGrant {
     }
 
     /// [`Self::check_attempt`], waiting out a stale view: asked again every
-    /// [`STALE_VIEW_RETRY`] on `clock`, the last time at `deadline_ns`
+    /// [`STALE_VIEW_RETRY`] on `clock`, the last time
+    /// [`STALE_VIEW_PUBLISH_RESERVE`] before `deadline_ns`
     /// ([`stale_view_wait`]), until the view answers, and refused
     /// `view_stale` only when it is still stale at that last ask. Any other
     /// refusal returns at once.
@@ -777,11 +787,14 @@ pub(crate) enum PutAbort {
 }
 
 /// The wait between two asks of a stale view: [`STALE_VIEW_RETRY`], cut short
-/// at `deadline_ns` on `clock` so the view is asked once more at the deadline
-/// itself. `false`, with no wait, once `deadline_ns` has passed: the caller
-/// refuses `view_stale`.
+/// at the last ask, [`STALE_VIEW_PUBLISH_RESERVE`] before `deadline_ns` on
+/// `clock`, so the view is asked once more there. `false`, with no wait, once
+/// the last ask has passed: the caller refuses `view_stale`.
 pub(crate) async fn stale_view_wait(clock: &dyn Clock, deadline_ns: i64) -> bool {
-    let remaining_ns = deadline_ns.saturating_sub(clock.now_ns());
+    let last_ask_ns = deadline_ns.saturating_sub(crate::config::duration_nanos_saturating(
+        STALE_VIEW_PUBLISH_RESERVE,
+    ));
+    let remaining_ns = last_ask_ns.saturating_sub(clock.now_ns());
     if remaining_ns <= 0 {
         return false;
     }
@@ -901,16 +914,30 @@ mod tests {
         futures::FutureExt::now_or_never(wake.notified()).is_some()
     }
 
-    /// A flush waiting out a stale view before an attempt asks the view once
-    /// more at its deadline, not one whole [`STALE_VIEW_RETRY`] before it:
-    /// with 1.5 s left, the view is stale at 0 s and at 1 s and fresh again
-    /// at 1.5 s, and the attempt goes ahead. A wait that ends at the deadline
-    /// without asking refuses it `view_stale` at 1.5 s. With the view still
-    /// stale at the deadline the attempt is refused `view_stale` then, and
-    /// not before.
+    /// A flush waiting out a stale view before an attempt asks the view for
+    /// the last time [`STALE_VIEW_PUBLISH_RESERVE`] before its deadline, so
+    /// the attempt still has that budget, and a drop for a stale view is
+    /// counted `view_stale` and nothing else (issue #4363). With 2.5 s left
+    /// the asks fall at 0 s, 1 s and 1.5 s. A view fresh again before 1.5 s
+    /// lets the attempt go ahead at 1.5 s with 1 s left. A view that recovers
+    /// only inside the reserve, at 2 s, or never, is refused `view_stale` at
+    /// 1.5 s; a wait that asked at the deadline itself would let the first of
+    /// those through with no time left to publish.
     #[tokio::test]
-    async fn a_stale_view_wait_asks_once_more_at_the_deadline() {
-        for recover in [true, false] {
+    async fn a_stale_view_wait_leaves_the_attempt_a_reserve() {
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Recovery {
+            BeforeLastAsk,
+            InsideReserve,
+            Never,
+        }
+        let reserve_ns = crate::config::duration_nanos_saturating(STALE_VIEW_PUBLISH_RESERVE);
+        assert_eq!(reserve_ns, 1_000_000_000);
+        for recovery in [
+            Recovery::BeforeLastAsk,
+            Recovery::InsideReserve,
+            Recovery::Never,
+        ] {
             let (policy, compat_clock) = policy_and_clock(7).await;
             let view = policy.view().clone();
             let tenant = ravel_types::TenantId::new("acme").hash();
@@ -932,28 +959,38 @@ mod tests {
             assert!(grant.check_attempt().is_err_and(|r| r.is_view_stale()));
 
             let clock = crate::compat_signal_tests::ManualClock::new();
-            let deadline_ns = clock.now_ns() + 1_500_000_000;
+            let deadline_ns = clock.now_ns() + 2_500_000_000;
             let attempt = tokio::spawn({
                 let clock = Arc::clone(&clock);
                 async move { grant.attempt_when_fresh(clock.as_ref(), deadline_ns).await }
             });
             clock.advance_ns(1_000_000_000).await;
-            assert!(!attempt.is_finished(), "recover={recover}: 1 s in");
-            if recover {
+            assert!(!attempt.is_finished(), "{recovery:?}: 1 s in");
+            if recovery == Recovery::BeforeLastAsk {
                 view.refresh().await.expect("read sys/compat");
             }
             clock.advance_ns(500_000_000).await;
+            assert!(
+                attempt.is_finished(),
+                "{recovery:?}: the last ask falls one reserve before the deadline"
+            );
+            assert_eq!(deadline_ns - clock.now_ns(), reserve_ns);
+            if recovery == Recovery::InsideReserve {
+                view.refresh().await.expect("read sys/compat");
+            }
+            clock.advance_ns(500_000_000).await;
+            clock.advance_ns(500_000_000).await;
             let outcome = tokio::time::timeout(Duration::from_secs(30), attempt)
                 .await
-                .expect("the attempt ends at the deadline")
+                .expect("the attempt ends")
                 .expect("attempt task");
-            if recover {
-                assert_eq!(outcome, Ok(()));
-            } else {
-                assert!(
-                    outcome.as_ref().is_err_and(|r| r.is_view_stale()),
-                    "{outcome:?}"
-                );
+            match recovery {
+                Recovery::BeforeLastAsk => assert_eq!(outcome, Ok(())),
+                Recovery::InsideReserve | Recovery::Never => assert_eq!(
+                    outcome.as_ref().map_err(|r| r.reason().as_str()),
+                    Err("view_stale"),
+                    "{recovery:?}"
+                ),
             }
         }
     }

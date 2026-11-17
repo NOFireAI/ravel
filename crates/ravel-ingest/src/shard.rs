@@ -64,8 +64,8 @@ use crate::format_floor::{
     BelowFormatFloor, FormatFamily, warn_flush_refused, warn_flush_written_below,
 };
 use crate::generation::{
-    FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, ScanCheck,
-    mismatch_retry_spent, reread_and_check, send_hand_back,
+    FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, STALE_VIEW_ABANDONED,
+    ScanCheck, mismatch_retry_spent, reread_and_check, send_hand_back, stale_view_hold_spent,
 };
 use crate::metrics::{FlushTrigger, IngestMetrics};
 #[cfg(feature = "stage-timing")]
@@ -235,6 +235,11 @@ struct TenantBuf {
     /// router cannot trust, so the episode counts once on
     /// `stale_provisioning_flushes` however many triggers retry it.
     stale_view_counted: bool,
+    /// When an enforced flush open first found no trusted generation view for
+    /// this buffer. Once `max_flush_lifetime` has passed since, the buffer is
+    /// dropped and counted instead of held again (issue #4363). Cleared when a
+    /// flush open gets a scan-set verdict.
+    stale_view_since_ns: Option<i64>,
     /// Set once a hand-back from this buffer found a target shard not live, so
     /// the episode counts and logs once however many triggers retry it.
     hand_back_blocked: bool,
@@ -2377,6 +2382,32 @@ impl ShardActor {
         false
     }
 
+    /// Drops a buffer whose flush was held closed on an untrusted generation
+    /// view for `max_flush_lifetime` (issue #4363). Nothing is written: strict
+    /// waiters get `Abandoned`, and dropping `charges` refunds the byte budget.
+    /// A teardown pass drops it too, rather than writing it in place.
+    fn drop_stale_view_flush(&self, tenant_hash: TenantHash, buf: TenantBuf, lag_check: LagCheck) {
+        let rows: usize = buf.series.values().map(|accum| accum.values.len()).sum();
+        self.metrics.record_abandoned_stale_provisioning();
+        if !buf.exemplars.is_empty() {
+            self.metrics.record_exemplars(0, buf.exemplars.len() as u64);
+        }
+        tracing::error!(
+            signal = ?self.ctx.signal,
+            shard = self.shard,
+            tenant_hash = %tenant_hash.to_hex(),
+            rows,
+            bytes = buf.est_bytes,
+            teardown = !matches!(lag_check, LagCheck::Enforced),
+            "ravel-ingest: dropping a flush held closed for max_flush_lifetime on a provisioning \
+             view this router cannot trust; its rows are not written"
+        );
+        self.ctx.ack_waiters(
+            buf.waiters,
+            Err(WriteError::Abandoned(STALE_VIEW_ABANDONED.into())),
+        );
+    }
+
     /// Publishes this shard's spawned-but-unreaped flush-task count (issue
     /// #1740). Called wherever `flushes` changes length, so the gauge always
     /// reads the value the next trigger will be tested against.
@@ -2570,6 +2601,7 @@ impl ShardActor {
             ScanCheck::InScanSet => {
                 self.handing_back = false;
                 self.in_place_warnings.rearm(tenant_hash);
+                buf.stale_view_since_ns = None;
                 buf
             }
             ScanCheck::HandBack {
@@ -2585,6 +2617,7 @@ impl ShardActor {
             {
                 // This flush opens at or past the cap, so, as on the deferral
                 // path, no strict waiter is acknowledged from it.
+                buf.stale_view_since_ns = None;
                 let waiters = std::mem::take(&mut buf.waiters);
                 self.ctx.ack_waiters(
                     waiters,
@@ -2639,6 +2672,7 @@ impl ShardActor {
                     return;
                 };
                 buf.stale_view_counted = false;
+                buf.stale_view_since_ns = None;
                 let enforced = matches!(lag_check, LagCheck::Enforced);
                 // A target that is not live cannot take the rows on a later
                 // flush, so only a full mailbox is retried.
@@ -2710,6 +2744,17 @@ impl ShardActor {
                 let mut buf = buf;
                 if !std::mem::replace(&mut buf.stale_view_counted, true) {
                     self.metrics.record_stale_provisioning_flush();
+                }
+                if matches!(lag_check, LagCheck::Enforced) {
+                    buf.stale_view_since_ns.get_or_insert(raw_ns);
+                }
+                if stale_view_hold_spent(
+                    buf.stale_view_since_ns,
+                    raw_ns,
+                    self.config.max_flush_lifetime,
+                ) {
+                    self.drop_stale_view_flush(tenant_hash, buf, lag_check);
+                    return;
                 }
                 if self.keeps_unconfirmed_flush(lag_check, "no trusted generation view") {
                     self.tenants.insert(tenant, buf);
@@ -5228,6 +5273,48 @@ mod tests {
         };
         assert_eq!(config.flush_deferral_cap_ns(), 0);
         config
+    }
+
+    /// A strict waiter on a buffer held closed because no trusted provisioning
+    /// view arrives is held until `max_flush_lifetime` after the first hold,
+    /// then answered the retryable `Abandoned`, its bytes refunded and nothing
+    /// written (issue #4363).
+    ///
+    /// Guard: `ack_waiters` in `drop_stale_view_flush`. Dropping the waiters
+    /// with the buffer instead of answering them closes the receiver without
+    /// an answer, and holding past the bound leaves it waiting.
+    #[tokio::test]
+    async fn a_strict_waiter_on_a_spent_stale_view_hold_is_abandoned() {
+        let config = IngestConfig {
+            shard_count: 4,
+            max_flush_lifetime: Duration::from_secs(60),
+            ..IngestConfig::default()
+        };
+        let rig = HandBackRig::with(ScanCheck::Unknown, None, config);
+        let (charge, mut answer) = rig.write_strict(4_096).await;
+        drop(charge);
+        rig.flush_now().await;
+        rig.clock.advance_ns(60_000_000_000 - 1);
+        rig.flush_now().await;
+        assert!(
+            matches!(answer.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "held one nanosecond inside the bound"
+        );
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096);
+
+        rig.clock.advance_ns(1);
+        rig.flush_now().await;
+        match answer.try_recv() {
+            Ok(Err(WriteError::Abandoned(msg))) => assert_eq!(msg, STALE_VIEW_ABANDONED),
+            other => panic!("expected the stale-view Abandoned, got {other:?}"),
+        }
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.abandoned_stale_provisioning, 1);
+        assert_eq!(snap.stale_provisioning_flushes, 1);
+        assert_eq!(rig.budget.in_flight_bytes(), 0, "the bytes are refunded");
+        assert_eq!(rig.own_commits().await, 0, "nothing is written");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
     }
 
     /// One tenant's in-place WARN does not silence another's: two tenants

@@ -90,6 +90,11 @@ pub struct LogIngestMetrics {
     /// plus `max_flush_lifetime` ([`crate::LogWriteError::Abandoned`],
     /// ADR-2708 D3), where publishing could land rows in a sealed hour.
     abandoned_hour_bound: AtomicU64,
+    /// Buffers dropped at flush open because their provisioning view stayed
+    /// untrusted for `max_flush_lifetime` (issue #4363): strict waiters get
+    /// [`crate::LogWriteError::Abandoned`], charges are refunded, nothing is
+    /// written. Counted once per dropped buffer.
+    abandoned_stale_provisioning: AtomicU64,
     /// Writes and flushes the `sys/compat` activation policy refused, by
     /// reason (ADR-4233): at admission, at permit grant, before a PUT
     /// attempt, or at the bucket fence. A refused attempt publishes no commit
@@ -370,6 +375,9 @@ pub struct LogIngestMetricsSnapshot {
     /// Flushes abandoned without a PUT because their permit was granted past
     /// their pinned hour's end plus `max_flush_lifetime` (ADR-2708 D3).
     pub abandoned_hour_bound: u64,
+    /// Buffers dropped because their provisioning view stayed untrusted for
+    /// `max_flush_lifetime` from their first refused flush open (issue #4363).
+    pub abandoned_stale_provisioning: u64,
     /// Publishes the `sys/compat` activation policy refused, by reason.
     pub compat_publish_refused: CompatRefusalSnapshot,
     pub abandoned_input_rejected: u64,
@@ -729,6 +737,13 @@ impl LogIngestMetrics {
         self.abandoned_hour_bound.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One buffer dropped because its provisioning view stayed untrusted for
+    /// `max_flush_lifetime` (issue #4363).
+    pub(crate) fn record_abandoned_stale_provisioning(&self) {
+        self.abandoned_stale_provisioning
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A flush abandoned because the input could not be built into a durable
     /// object ([`crate::LogWriteError::SegmentBuild`]): a client signal, not
     /// retryable.
@@ -1004,6 +1019,7 @@ impl LogIngestMetrics {
             abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
             abandoned_queue_deadline: self.abandoned_queue_deadline.load(Ordering::Relaxed),
             abandoned_hour_bound: self.abandoned_hour_bound.load(Ordering::Relaxed),
+            abandoned_stale_provisioning: self.abandoned_stale_provisioning.load(Ordering::Relaxed),
             compat_publish_refused: self.compat_publish_refused.snapshot(),
             abandoned_input_rejected: self.abandoned_input_rejected.load(Ordering::Relaxed),
             flush_gate_faults: self.flush_gate_faults.load(Ordering::Relaxed),
@@ -1196,6 +1212,13 @@ mod tests {
             LogIngestMetrics::record_abandoned_hour_bound,
             LogIngestMetricsSnapshot {
                 abandoned_hour_bound: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_abandoned_stale_provisioning,
+            LogIngestMetricsSnapshot {
+                abandoned_stale_provisioning: 1,
                 ..Default::default()
             },
         );

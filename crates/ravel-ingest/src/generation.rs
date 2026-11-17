@@ -467,6 +467,22 @@ pub(crate) async fn reread_and_check<M>(
     verdict
 }
 
+/// The `Abandoned` message a strict waiter gets when its buffer is dropped
+/// because no trusted provisioning view arrived for `max_flush_lifetime`
+/// (issue #4363). Nothing from the buffer is written, so a retry stores one
+/// copy.
+pub(crate) const STALE_VIEW_ABANDONED: &str = "flush dropped: no trusted provisioning view for \
+     max_flush_lifetime since the flush was first held; the rows were not written";
+
+/// Whether a buffer first held closed on an untrusted view at `since_ns` has
+/// been held for `bound` at `now_ns`, so its flush is dropped rather than held
+/// again (issue #4363). `None` (never held) is never spent.
+pub(crate) fn stale_view_hold_spent(since_ns: Option<i64>, now_ns: i64, bound: Duration) -> bool {
+    since_ns.is_some_and(|since| {
+        now_ns.saturating_sub(since) >= crate::config::duration_nanos_saturating(bound)
+    })
+}
+
 /// The per-tenant `compat_epoch` a switch caches from provisioning records,
 /// in its own `Arc` so a shard's [`SwitchScope`] keeps reading it after the
 /// router's switch is dropped. A teardown flush (ADR-1685 teardown bypass)

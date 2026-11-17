@@ -1307,6 +1307,9 @@ pub struct IngestPipelineSnapshot {
     /// Flushes abandoned without a PUT because their permit was granted past
     /// `end(pinned hour) + max_flush_lifetime` (ADR-2708 D3).
     pub abandoned_hour_bound: u64,
+    /// Buffers dropped because their provisioning view stayed untrusted for
+    /// `max_flush_lifetime` from their first refused flush open (issue #4363).
+    pub abandoned_stale_provisioning: u64,
     pub abandoned_input_rejected: u64,
     /// Flushes whose ADR-1702 write gate encode returned no result (the job
     /// panicked or was cancelled), answered `ShardUnavailable`. Not an
@@ -1543,6 +1546,7 @@ impl IngestPipelineSnapshot {
             abandoned_retry_exhausted: snapshot.abandoned_retry_exhausted,
             abandoned_queue_deadline: snapshot.abandoned_queue_deadline,
             abandoned_hour_bound: snapshot.abandoned_hour_bound,
+            abandoned_stale_provisioning: snapshot.abandoned_stale_provisioning,
             abandoned_input_rejected: snapshot.abandoned_input_rejected,
             flush_gate_faults: snapshot.flush_gate_faults,
             buffered_bytes_total: snapshot.buffered_bytes_total,
@@ -1605,6 +1609,7 @@ impl IngestPipelineSnapshot {
             abandoned_retry_exhausted: snapshot.abandoned_retry_exhausted,
             abandoned_queue_deadline: snapshot.abandoned_queue_deadline,
             abandoned_hour_bound: snapshot.abandoned_hour_bound,
+            abandoned_stale_provisioning: snapshot.abandoned_stale_provisioning,
             abandoned_input_rejected: snapshot.abandoned_input_rejected,
             flush_gate_faults: snapshot.flush_gate_faults,
             buffered_bytes_total: snapshot.buffered_bytes_total,
@@ -1666,6 +1671,7 @@ impl IngestPipelineSnapshot {
             abandoned_retry_exhausted: snapshot.abandoned_retry_exhausted,
             abandoned_queue_deadline: snapshot.abandoned_queue_deadline,
             abandoned_hour_bound: snapshot.abandoned_hour_bound,
+            abandoned_stale_provisioning: snapshot.abandoned_stale_provisioning,
             abandoned_input_rejected: snapshot.abandoned_input_rejected,
             flush_gate_faults: snapshot.flush_gate_faults,
             buffered_bytes_total: snapshot.buffered_bytes_total,
@@ -1895,6 +1901,23 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             "ravel_ingest_abandoned_hour_bound_total",
             &labels(mode, pipeline.signal),
             pipeline.abandoned_hour_bound,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_abandoned_stale_provisioning_total",
+        "Buffers dropped unwritten because their flush stayed closed on a shard-generation \
+         view the router cannot trust for the flush lifetime, by signal. Strict writers were \
+         answered 503 and their bytes refunded; buffered-mode rows in them are lost.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_abandoned_stale_provisioning_total",
+            &labels(mode, pipeline.signal),
+            pipeline.abandoned_stale_provisioning,
         );
     }
 
@@ -13104,6 +13127,85 @@ mod tests {
             "the floor family must carry one sample per signal and no other \
              label set:\n{body}"
         );
+    }
+
+    /// Issue #4363: a buffer dropped after `max_flush_lifetime` on an
+    /// untrusted provisioning view renders on its own counter for every
+    /// signal, with HELP text and distinct per-signal figures taken from the
+    /// ingest crate's snapshots, so a conversion that dropped the field or
+    /// swapped two signals fails here.
+    #[test]
+    fn abandoned_stale_provisioning_counter_renders_for_every_signal() {
+        let ingest = vec![
+            IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot {
+                abandoned_stale_provisioning: 7,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot {
+                abandoned_stale_provisioning: 4,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot {
+                abandoned_stale_provisioning: 1,
+                ..Default::default()
+            }),
+        ];
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+            true,
+        );
+
+        let family = "ravel_ingest_abandoned_stale_provisioning_total";
+        assert_eq!(
+            body.matches(&format!("# HELP {family} Buffers dropped unwritten"))
+                .count(),
+            1,
+            "{body}"
+        );
+        assert_eq!(
+            body.matches(&format!("# TYPE {family} counter\n")).count(),
+            1,
+            "{body}"
+        );
+        for (signal, value) in [("metrics", 7), ("logs", 4), ("spans", 1)] {
+            let sample = format!("{family}{{mode=\"gateway\",signal=\"{signal}\"}} {value}\n");
+            assert_eq!(
+                body.matches(&sample).count(),
+                1,
+                "the {signal} pipeline must render {sample:?} exactly once:\n{body}"
+            );
+        }
+        assert_eq!(body.matches(&format!("{family}{{")).count(), 3, "{body}");
     }
 
     /// The values travel from the ingest crate's counters to the rendered text:

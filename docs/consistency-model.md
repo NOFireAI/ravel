@@ -166,9 +166,10 @@ Buffered mode (opt-in per request, named "buffered"):
   or before a PUT attempt of its retry loop. A stale view (the last
   successful read of `sys/compat` is 10 minutes old, or there has been none
   and the view is not blind) is waited out, not refused: the flush asks again
-  every second, and once more at its deadline, and is refused `view_stale`
-  only once its `max_flush_lifetime`, counted from the first grant, has
-  passed. Every other refusal is immediate: `active_version_not_writable`
+  every second, and a last time one second before its deadline, so a view
+  that answers then still leaves the attempt that second to publish, and is
+  refused `view_stale` once that last ask, inside its `max_flush_lifetime`
+  counted from the first grant, has passed. Every other refusal is immediate: `active_version_not_writable`
   (the active write version for the family is one this build does not
   write), `compat_record_missing` (the record is absent under a bucket or a
   view that has seen an activation), `fence_failed` (the bucket fence a
@@ -214,7 +215,24 @@ Buffered mode (opt-in per request, named "buffered"):
   router dropped without `shutdown()` adds no case: its teardown flush reads
   the per-tenant compat-epoch cache its shards hold by `Arc` even after the
   router's switch is gone, so it is granted, fenced and refused exactly as
-  above, and the `no_bucket_view` reason is never raised. The
+  above, and the `no_bucket_view` reason is never raised. Nine: the
+  flush is held closed on a provisioning view its router cannot trust for
+  `max_flush_lifetime` (ADR-1642 scan-set amendment, bounded by its
+  stale-view hold amendment). A flush whose ingest hour is at or past
+  `hour(refreshed_at) + ceil(C) + 1` cannot confirm its shard index is in the
+  read side's scan set, so it does not open and its buffer is kept while the
+  provisioning record is re-read. The hold starts at the first enforced flush
+  attempt that finds no trusted view and ends when a re-read succeeds. Once it
+  has lasted `max_flush_lifetime` (3600 s by default), the next flush attempt,
+  enforced or teardown, drops the buffer with no store call: any strict waiter
+  is acked with the retryable `Abandoned` (503), the buffer's ADR-0069 byte
+  charges are refunded, the drop is logged at ERROR, and
+  `ravel_ingest_abandoned_stale_provisioning_total`, labelled by signal,
+  counts it once per buffer. A teardown drain inside that bound still writes
+  the buffer in place (the first exception under "Online resharding" below). Like case one this
+  is a store that cannot be read for an hour; the alternative, holding the
+  rows and their budget charge without limit, turns a lasting outage into an
+  unbounded memory and budget hold on every router. The
   ADR-1685 store-clock lag check is not a case of its own: a teardown drain's
   bypass passes disable that check precisely so it cannot drop acknowledged
   rows, and what it costs instead is visibility until a HEAD rebuild (see
@@ -701,7 +719,9 @@ onward routes with the new count. Guarantees:
   for that hour, on the tenant's generation view trusted only as long as
   routing trusts it; outside the scan set it hands the rows to the tenant's
   current generation, and on a view it cannot trust it does not open the
-  flush and keeps the rows. A strict write still waiting on handed-back rows
+  flush and keeps the rows, for at most `max_flush_lifetime` from the first
+  enforced attempt that found no trusted view, after which it drops them
+  unwritten (acknowledgement case nine). A strict write still waiting on handed-back rows
   is answered `Abandoned` (503, outcome unknown) before the rows are sent:
   they are written by a target shard or, if none can take them, by the shard
   that held them. A target shard that is dead or condemned, or whose mailbox
@@ -727,7 +747,9 @@ onward routes with the new count. Guarantees:
   Three exceptions remain:
   - A shutdown or channel-close drain that still cannot confirm the view after
     re-reading the provisioning record, or cannot reach a live shard of the
-    current generation, writes the rows in place rather than drop them. When
+    current generation, writes the rows in place rather than drop them,
+    unless a flush of theirs has already been held on an untrusted view for
+    `max_flush_lifetime`, which drops them (acknowledgement case nine). When
     the target was not live the rows are known to be outside the scan set:
     stored but returned by no query, logged at ERROR with the tenant, shard
     and hour, and counted on `ravel_ingest_teardown_unscanned_writes_total`.

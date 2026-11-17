@@ -12,8 +12,10 @@ startup cadence check binds the library entry" below), 2026-10-05 (issue
 #2600, see "Amendment (2026-10-05): the hand-back counts are exported"
 below), and 2026-10-10 (issue #1921, ADR-2708 D3, see "Amendment
 (2026-10-10): a per-tenant flush share and an hour-bounded grant deadline"
-below). Supersedes ADR-0067 decision 2. Issues #1292, #1641, #1740, #1916,
-#2410, #2438, #2429, #2465, #2600, and #1921.
+below), and 2026-11-17 (issue #4363, see "Amendment (2026-11-17): the
+stale-view hold is bounded by the flush lifetime" below). Supersedes ADR-0067
+decision 2. Issues #1292, #1641, #1740, #1916, #2410, #2438, #2429, #2465,
+#2600, #1921, and #4363.
 
 ## Context
 
@@ -630,7 +632,9 @@ it to the next trigger: once per tenant per drain it joins the read in flight
 or starts one, waits at most `max_flush_lifetime`, and applies the check again
 on what it installed, so one drain flushes every buffer the re-read confirms.
 Only a re-read that fails or times out keeps the buffer. Nothing is written on
-an unknown view, except at teardown (below).
+an unknown view, except at teardown (below). The hold is bounded by
+`max_flush_lifetime` and the buffer then dropped (see the stale-view hold
+amendment below).
 
 **What happens to the rows.** When the check fails, nothing is written under
 that shard index. The actor routes the buffer's rows under the tenant's
@@ -696,7 +700,9 @@ for the clock-lag check, since a row written where the read side may not scan
 it can still be found, and a row dropped at shutdown cannot. One whose view
 puts the rows outside the scan set but finds no live target writes rows known
 to be invisible: that write logs an ERROR with the tenant, shard and hour and
-counts on `teardown_unscanned_writes`.
+counts on `teardown_unscanned_writes`. A teardown on a buffer already held on
+an unknown view for `max_flush_lifetime` drops it instead (see the stale-view
+hold amendment below).
 
 **Observability.** Each pipeline's metrics (`IngestMetrics`,
 `LogIngestMetrics`, `SpanIngestMetrics`) count handed-back flushes as
@@ -1137,3 +1143,59 @@ and native-histogram cases; and
 `services/ravel-server/tests/tenant_flush_isolation_e2e.rs` shows a strict
 write from a second tenant acknowledged while three flushes of the first are
 held at the store.
+
+## Amendment (2026-11-17): the stale-view hold is bounded by the flush lifetime (issue #4363)
+
+<!-- amendment-applies: sections="Amendment (2026-10-03): the scan-set check at flush open (issue #2410)" pointer="stale-view hold amendment" -->
+
+A fail-closed hold is now bounded by `max_flush_lifetime` and then dropped
+and counted, by owner decision on #4363.
+
+The scan-set amendment kept a buffer whose flush found no trusted generation
+view exactly as it was, for as long as the provisioning record stayed
+unreadable. Nothing bounded that: a store outage longer than the grace-window
+horizon held every affected buffer's rows, strict waiters and ADR-0069 byte
+charges for the whole outage, so a lasting outage became an unbounded memory
+and budget hold on every router, and a strict writer waited on an answer that
+never came.
+
+**The bound.** Each buffer records `stale_view_since_ns`, the flush-open clock
+reading of the first enforced attempt whose scan-set check returned no
+trusted view. A flush that opens on a trusted view (in place or handed back)
+clears it, so a later outage starts a new hold. A teardown bypass pass never
+starts the clock: only an enforced pass, whose clock reading the lag check
+accepted, does. Once `now - stale_view_since_ns >= max_flush_lifetime` at a
+flush attempt, the buffer is dropped instead of held again.
+
+**The drop.** No `seq` is pinned and no store call is made. Every strict
+waiter on the buffer is answered the retryable `Abandoned` (503) with a
+message saying the rows were not written, so a retry stores one copy. Dropping
+the buffer drops its charges, which refunds the byte budget. The drop logs at
+ERROR with the signal, shard, tenant hash, rows and bytes, and counts once per
+buffer on the pipeline's `abandoned_stale_provisioning`, exported by
+`ravel-server` as `ravel_ingest_abandoned_stale_provisioning_total` by signal.
+A buffered-mode row in the buffer was already acknowledged, so this is a
+counted drop of acknowledged rows (docs/consistency-model.md, acknowledgement
+case nine), on the same terms as the retry-exhausted abandon: a store that
+cannot be read for `max_flush_lifetime`.
+
+**Teardown.** A shutdown or channel-close drain that still cannot confirm the
+view keeps the scan-set amendment's choice inside the bound and writes the
+buffer in place. Past the bound it drops and counts it like any other flush
+attempt. In practice that happens on the drain's enforced pass, since the
+bypass passes come after it, so the check on the bypass path is defensive.
+
+**Rejected: hold without bound.** That is the defect. **Rejected: write in
+place at the bound.** The rows are past the horizon the view is trusted for,
+so a write may land under an index no reader scans, stored and invisible;
+the owner chose a counted drop over an invisible write.
+
+Tests: `crates/ravel-ingest/tests/scan_set_handback.rs` runs, on all three
+pipelines, `an_untrusted_view_hold_is_dropped_at_the_flush_lifetime` (held
+one tick short of the bound with nothing written and nothing counted, dropped
+and counted once at the bound with the budget refunded, never counted again),
+`an_untrusted_view_that_recovers_inside_the_bound_publishes`,
+`a_teardown_inside_the_bound_writes_the_held_flush` and
+`a_teardown_past_the_bound_drops_the_held_flush`; each shard module's
+`a_strict_waiter_on_a_spent_stale_view_hold_is_abandoned` pins the strict
+waiter's answer.
