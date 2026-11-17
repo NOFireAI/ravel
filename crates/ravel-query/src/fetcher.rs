@@ -231,14 +231,28 @@ struct BudgetCatalogCharge {
     budget: std::sync::Arc<ravel_memory::MemoryBudget>,
     held: Vec<ravel_memory::Reservation>,
     refused: Option<ravel_memory::MemoryExhausted>,
+    catalog_use: CatalogUse,
+}
+
+/// What the caller of a catalog decode reads from the entries it returns,
+/// which decides whether the decode materializes per-sample provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogUse {
+    /// The runs' samples: the provenance extension is decoded and charged.
+    Samples,
+    /// Series ids and labels only (a series listing): the extension's
+    /// sample-major columns are skipped, so they are neither allocated nor
+    /// charged, and the entries carry no per-sample provenance.
+    Listing,
 }
 
 impl BudgetCatalogCharge {
-    fn new(budget: &std::sync::Arc<ravel_memory::MemoryBudget>) -> Self {
+    fn new(budget: &std::sync::Arc<ravel_memory::MemoryBudget>, catalog_use: CatalogUse) -> Self {
         Self {
             budget: std::sync::Arc::clone(budget),
             held: Vec::new(),
             refused: None,
+            catalog_use,
         }
     }
 
@@ -290,6 +304,10 @@ impl CatalogCharge for BudgetCatalogCharge {
         if let Some(i) = self.held.iter().rposition(|r| r.size() == bytes) {
             self.held.swap_remove(i);
         }
+    }
+
+    fn decodes_provenance(&self) -> bool {
+        self.catalog_use == CatalogUse::Samples
     }
 }
 
@@ -2393,6 +2411,10 @@ impl SegmentFetcher {
     /// Page bytes are fetched afterwards by the caller from `regions`; the run
     /// page ranges are absolute-in-object on every path, so that step is
     /// identical regardless of which catalog path ran here.
+    ///
+    /// The entries carry their runs' per-sample provenance
+    /// ([`CatalogUse::Samples`]); a series listing decodes through
+    /// [`decode_catalog`](Self::decode_catalog) without it.
     #[allow(clippy::too_many_arguments)]
     async fn decode_selected(
         &self,
@@ -2405,6 +2427,38 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
         probe_gates: &DictionaryProbeGates,
+    ) -> Result<DecodedCatalog, FetchError> {
+        self.decode_catalog(
+            seg_ref,
+            tenant_hash,
+            footer,
+            total_size,
+            suffix_etag,
+            regions,
+            matchers,
+            accounting,
+            probe_gates,
+            CatalogUse::Samples,
+        )
+        .await
+    }
+
+    /// [`decode_selected`](Self::decode_selected) for `catalog_use`: with
+    /// [`CatalogUse::Listing`] every branch's decode skips the per-sample
+    /// provenance extension, and the entries it returns carry none.
+    #[allow(clippy::too_many_arguments)]
+    async fn decode_catalog(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        footer: &Footer,
+        total_size: u64,
+        suffix_etag: &Etag,
+        regions: &mut FetchedRegions,
+        matchers: &[LabelMatcher],
+        accounting: &QueryAccounting,
+        probe_gates: &DictionaryProbeGates,
+        catalog_use: CatalogUse,
     ) -> Result<DecodedCatalog, FetchError> {
         // See `open_segment`'s comment: recorded on this handle directly,
         // never through `tracing::Span::current()`.
@@ -2464,7 +2518,7 @@ impl SegmentFetcher {
                 // filter it.
                 let reservation = self.reserve_catalog_decode(footer, regions)?;
                 let limits = self.limits;
-                let mut charge = BudgetCatalogCharge::new(&self.memory_budget);
+                let mut charge = BudgetCatalogCharge::new(&self.memory_budget, catalog_use);
                 let (decoded, reservation, charge) = match &self.read_gate {
                     None => {
                         let decoded = decode_series_meta_catalog(
@@ -2517,6 +2571,7 @@ impl SegmentFetcher {
                         matchers,
                         accounting,
                         probe_gates,
+                        catalog_use,
                     )
                     .await?
                     .into_parts();
@@ -2543,7 +2598,7 @@ impl SegmentFetcher {
                     .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
                 let reservation = self.reserve_catalog_decode(footer, regions)?;
                 let limits = self.limits;
-                let mut charge = BudgetCatalogCharge::new(&self.memory_budget);
+                let mut charge = BudgetCatalogCharge::new(&self.memory_budget, catalog_use);
                 let (decoded, reservation, charge) = match &self.read_gate {
                     None => {
                         let decoded = decode_whole_object_catalog(
@@ -2701,6 +2756,7 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
         probe_gates: &DictionaryProbeGates,
+        catalog_use: CatalogUse,
     ) -> Result<DecodedCatalog, FetchError> {
         let key = seg_ref.data_object_key.as_str();
         let dict_range = (
@@ -2783,7 +2839,7 @@ impl SegmentFetcher {
             .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
         let reservation = self.reserve_catalog_decode(footer, regions)?;
         let limits = self.limits;
-        let mut charge = BudgetCatalogCharge::new(&self.memory_budget);
+        let mut charge = BudgetCatalogCharge::new(&self.memory_budget, catalog_use);
         let (decoded, reservation, charge) = match &self.read_gate {
             None => {
                 let decoded = decode_chunked_catalog(
@@ -3690,9 +3746,11 @@ impl SegmentFetcher {
     /// first. When `all_seen` holds for the object's ids, the rest of the
     /// catalog is not decoded and the object adds nothing to the listing: the
     /// skip saves decode CPU, not requests or bytes. Otherwise the catalog is
-    /// decoded exactly as
+    /// decoded as
     /// [`fetch_series_phase_accounted`](Self::fetch_series_phase_accounted)
-    /// decodes it.
+    /// decodes it, except that the per-sample provenance extension is skipped
+    /// ([`CatalogUse::Listing`]): a listing reads ids and labels, so the
+    /// provenance is neither decoded nor charged to the memory budget.
     pub(crate) async fn list_series_phase_accounted(
         &self,
         tenant_hash: TenantHash,
@@ -3733,7 +3791,7 @@ impl SegmentFetcher {
             return Ok(ListedObject::AllSeen);
         }
         let selected = self
-            .decode_selected(
+            .decode_catalog(
                 seg_ref,
                 tenant_hash,
                 &footer,
@@ -3743,6 +3801,7 @@ impl SegmentFetcher {
                 matchers,
                 accounting.probe(),
                 accounting.dictionary_probe(),
+                CatalogUse::Listing,
             )
             .await?;
         let (entries, _reservation) = selected.into_parts();
@@ -6936,6 +6995,7 @@ mod tests {
                 &[],
                 &accounting,
                 &DictionaryProbeGates::default(),
+                CatalogUse::Samples,
             )
             .await
             .expect("decode sparse catalog");
@@ -7112,6 +7172,7 @@ mod tests {
                 &matchers,
                 &accounting,
                 &gates,
+                CatalogUse::Samples,
             )
             .await
             .expect("decode sparse catalog");

@@ -44,8 +44,8 @@ use crate::reader::{
     DictResolver, RUN_LIVE_BYTES_CHUNK, RunEntry, SampleProvenance, SeriesEntry, SeriesEntryV4,
     ValueKind, check_run_total_live_budget, check_series_counts_v2, decode_section_bytes,
     find_section, index_label_dict, parse_schema_list_v2, parse_schema_ref_block_v2,
-    parse_series_ids_v2, parse_value_ord_block_all_v2, take_block, take_encoded_i64_block,
-    take_u32_le,
+    parse_series_ids_v2, parse_value_ord_block_all_v2, skip_provenance_extension, take_block,
+    take_encoded_i64_block, take_u32_le,
 };
 use crate::varint::{read_uvarint, write_uvarint};
 use crate::writer::WrittenSegment;
@@ -616,9 +616,12 @@ fn decode_chunk_frame(
     // over the flagged runs' samples, deltas relative to
     // `footer.base_created_unix_ns`. Absent for a provenance-free frame, in
     // which case the trailing-bytes check below still fires on real garbage.
-    let provenance = if pos < frame_raw.len() {
+    let provenance = if pos >= frame_raw.len() {
+        Vec::new()
+    } else if charge.decodes_provenance() {
         parse_chunk_provenance(frame_raw, &mut pos, footer, &sample_count, limits, charge)?
     } else {
+        skip_provenance_extension(frame_raw, &mut pos, sample_count.iter().copied())?;
         Vec::new()
     };
 
