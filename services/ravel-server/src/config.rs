@@ -1441,6 +1441,33 @@ pub struct StartupCheckArgs {
         env = "RAVEL_FORMAT_WINDOW_CHECK_TIMEOUT"
     )]
     pub format_window_check_timeout: Duration,
+
+    /// How long, from process start, startup keeps retrying a store read that
+    /// fails with a transient store error, as a humantime duration (issue
+    /// #4325). Covers the reads that refuse to start on a store error:
+    /// sys/qualification, sys/tenancy, the --tenant-kms-config key-epoch
+    /// records, the shard_count provisioning records, sys/gc and the
+    /// sys/ipcrypt/policy marker. The wait between attempts doubles from
+    /// 100 ms to a 2 s cap and is jittered down to half of that, each retry
+    /// logs one warning naming the read, and /readyz
+    /// is not ready while they run. Once the deadline has passed, a transient
+    /// failure refuses to start naming the read and the attempt count. Any
+    /// other error refuses at once, as before. The default 15s ends 10 s
+    /// before the operator's liveness probe (initial delay 5 s, period 10 s,
+    /// failure threshold 3) can first restart the pod at 25 s. `0s` turns
+    /// retry off.
+    #[arg(
+        long = "startup-store-deadline",
+        value_name = "DURATION",
+        default_value = "15s",
+        value_parser = parse_startup_store_deadline,
+        env = "RAVEL_STARTUP_STORE_DEADLINE"
+    )]
+    pub startup_store_deadline: Duration,
+}
+
+fn parse_startup_store_deadline(value: &str) -> Result<Duration, String> {
+    humantime::parse_duration(value).map_err(|err| err.to_string())
 }
 
 /// The query-audit pipeline (ADR-0062).
