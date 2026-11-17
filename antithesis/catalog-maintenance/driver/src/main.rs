@@ -210,8 +210,9 @@ struct Shared {
     /// The inputs of each compaction record decoded so far; records are
     /// immutable, so each is decoded once.
     inputs_of: Mutex<BTreeMap<String, Vec<InputKeys>>>,
-    /// Every rule holds a read guard while it acts; the clock jump and the
-    /// eventually take the write guard.
+    /// Every rule holds a read guard while it acts, except for the audit
+    /// rule's sweep check; the clock jump and the eventually take the write
+    /// guard.
     gate: RwLock<()>,
     stopping: AtomicBool,
     eventually_lock: Mutex<()>,
@@ -791,9 +792,7 @@ impl Shared {
     /// the LIST for [`Shared::check_swept`], which runs after the second
     /// inspect so that it does not widen the window HEAD must hold still in.
     fn audit_head(&self, choose: &dyn Fn(usize) -> usize) -> Option<(String, BTreeSet<String>)> {
-        let Some(before) = self.inspect_json() else {
-            return None;
-        };
+        let before = self.inspect_json()?;
         if before.created_unix_ns.is_none() {
             println!("audit: no HEAD yet");
             return None;
