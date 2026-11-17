@@ -29,10 +29,11 @@ fi
 
 # A Brig sandbox clone (docs/internal/dev-in-brig.md) is a standalone clone,
 # so it is its own main working tree. It is accepted only inside its own
-# guest: marked by scripts/brig.sh new, and the project Brig mounted. The
-# same clone on the host is refused like any primary checkout.
+# guest: marked by scripts/brig.sh new in the clone's own config, and the
+# project Brig mounted. The same clone on the host is refused like any
+# primary checkout.
 if [ "$toplevel" = "$main_wt" ] && [ -n "${BRIG_PROJECT:-}" ] &&
-  [ "$(git config --bool ravel.sandboxCheckout 2>/dev/null)" = true ]; then
+  [ "$(git config --local --bool ravel.sandboxCheckout 2>/dev/null)" = true ]; then
   project=$(cd "$BRIG_PROJECT" 2>/dev/null && pwd -P) || project=''
   if [ -n "$project" ] && [ "$project" = "$(cd "$toplevel" && pwd -P)" ]; then
     exit 0
