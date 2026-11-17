@@ -5,7 +5,9 @@
 //! keyed by the deployment key (`--tenant-hash-key-file`), the one key every
 //! mode accepts. [`start`](crate::start) reads the record once before any
 //! writer starts and then spawns one [`spawn_refresh_loop`] task that re-reads
-//! it every [`DEFAULT_COMPAT_REFRESH_INTERVAL`]. The alert evaluator also calls
+//! it every [`DEFAULT_COMPAT_REFRESH_INTERVAL`], and early, at most once per
+//! [`COMPAT_WAKE_MIN_GAP`], when an ingest writer or a first touch is refused
+//! `view_stale`. The alert evaluator also calls
 //! [`refresh_once`] when it meets a lease from an epoch its view has not seen,
 //! so two refreshes can overlap; [`CompatView`] keeps every monotone value
 //! either read saw and the record from the read that started last. An unkeyed
@@ -584,12 +586,10 @@ mod tests {
 
         let fault_store = Arc::new(FaultStore::new(
             MemoryStore::new(),
-            FaultPlan::empty().with_sequence(
-                (0..100).fold(
-                    Sequence::new(Op::Get).with_key_contains(ravel_catalog::compat::COMPAT_KEY),
-                    |sequence, _| sequence.then_passthrough(),
-                ),
-            ),
+            FaultPlan::empty().with_sequence((0..100).fold(
+                Sequence::new(Op::Get).with_key_contains(ravel_catalog::compat::COMPAT_KEY),
+                |sequence, _| sequence.then_passthrough(),
+            )),
         ));
         let reads = || fault_store.sequence_progress(0);
         let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();

@@ -1003,9 +1003,14 @@ impl TeardownRouter for LogIngestRouter {
 
     fn write_one(&self, tenant: TenantId) -> impl std::future::Future<Output = ()> + Send + '_ {
         async move {
-            self.write(tenant, vec![log_record()], WriteMode::Buffered, ACK_DEADLINE)
-                .await
-                .expect("acknowledged");
+            self.write(
+                tenant,
+                vec![log_record()],
+                WriteMode::Buffered,
+                ACK_DEADLINE,
+            )
+            .await
+            .expect("acknowledged");
         }
     }
 
@@ -1073,10 +1078,7 @@ impl TeardownRouter for SpanIngestRouter {
 
 /// Tears `router` down as `teardown` says, in a task that ends once the
 /// teardown call returns.
-fn spawn_teardown<R: TeardownRouter>(
-    router: R,
-    teardown: Teardown,
-) -> tokio::task::JoinHandle<()> {
+fn spawn_teardown<R: TeardownRouter>(router: R, teardown: Teardown) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         match teardown {
             Teardown::Shutdown => router.teardown_shutdown().await,

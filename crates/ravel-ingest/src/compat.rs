@@ -925,9 +925,10 @@ mod tests {
             )
             .ok()
             .expect("granted on a fresh view");
-            compat_clock
-                .0
-                .fetch_add(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS, Ordering::SeqCst);
+            compat_clock.0.fetch_add(
+                ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS,
+                Ordering::SeqCst,
+            );
             assert!(grant.check_attempt().is_err_and(|r| r.is_view_stale()));
 
             let clock = crate::compat_signal_tests::ManualClock::new();
@@ -969,9 +970,10 @@ mod tests {
         assert_eq!(policy.admit(FormatFamily::Rseg, Some(1), lifetime), Ok(()));
         assert!(!woken(&wake), "a fresh view does not wake the refresh");
 
-        compat_clock
-            .0
-            .fetch_add(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS, Ordering::SeqCst);
+        compat_clock.0.fetch_add(
+            ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS,
+            Ordering::SeqCst,
+        );
         let refused = policy
             .admit(FormatFamily::Rseg, Some(1), lifetime)
             .expect_err("stale");

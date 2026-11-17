@@ -6970,7 +6970,11 @@ mod tests {
                 let snapshot = metrics.snapshot();
                 assert_eq!(snapshot.compat_publish_refused.total(), 0, "{case}");
                 assert_eq!(snapshot.flushes_manual, 1, "{case}");
-                assert_eq!(bucket_compat_epoch(store.as_ref(), &acme).await, 0, "{case}");
+                assert_eq!(
+                    bucket_compat_epoch(store.as_ref(), &acme).await,
+                    0,
+                    "{case}"
+                );
                 assert!(
                     list_all(store.as_ref(), "sys/")
                         .await
