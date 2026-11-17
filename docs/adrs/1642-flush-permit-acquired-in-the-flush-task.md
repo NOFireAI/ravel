@@ -633,8 +633,9 @@ or starts one, waits at most `max_flush_lifetime`, and applies the check again
 on what it installed, so one drain flushes every buffer the re-read confirms.
 Only a re-read that fails or times out keeps the buffer. Nothing is written on
 an unknown view, except at teardown (below). The hold is bounded by
-`max_flush_lifetime` and the buffer then dropped (see the stale-view hold
-amendment below).
+`max_flush_lifetime` with no provisioning read succeeding, and the buffer is
+then dropped if a last re-read does not confirm the view either (see the
+stale-view hold amendment below).
 
 **What happens to the rows.** When the check fails, nothing is written under
 that shard index. The actor routes the buffer's rows under the tenant's
@@ -1148,8 +1149,9 @@ held at the store.
 
 <!-- amendment-applies: sections="Amendment (2026-10-03): the scan-set check at flush open (issue #2410)" pointer="stale-view hold amendment" -->
 
-A fail-closed hold is now bounded by `max_flush_lifetime` and then dropped
-and counted, by owner decision on #4363.
+A fail-closed hold is now bounded by `max_flush_lifetime` with no successful
+provisioning read, and then, if a last re-read does not confirm the view
+either, dropped and counted, by owner decision on #4363.
 
 The scan-set amendment kept a buffer whose flush found no trusted generation
 view exactly as it was, for as long as the provisioning record stayed
@@ -1161,19 +1163,37 @@ never came.
 
 **The bound.** Each buffer records `stale_view_since_ns`, the flush-open clock
 reading of the first enforced attempt whose scan-set check returned no
-trusted view. A flush that opens on a trusted view (in place or handed back)
-clears it, so a later outage starts a new hold. So does a provisioning read
+trusted view. A flush attempt that gets a scan-set or hand-back verdict
+clears it (in place, handed back, or a hand-back that keeps its rows because a
+target is not live or its mailbox is full), so a later outage starts a new
+hold. So does a provisioning read
 that succeeded after the hold began: an attempt that finds the tenant's view
 refreshed at or after `stale_view_since_ns` (the view is stamped with the
-time its read was issued) restarts the hold at its own reading, even when no
+time its read was issued, and a read issued earlier that installs later never
+moves the stamp back) restarts the hold at its own reading, even when no
 attempt was made in between, as when the buffer's flushes were deferred. The
 bound therefore counts time with no successful read, not time since the first
 hold. A teardown bypass pass never starts the clock: only an enforced pass,
 whose clock reading the lag check accepted, does. Once `now -
-stale_view_since_ns >= max_flush_lifetime` at a flush attempt, the buffer is
-dropped instead of held again.
+stale_view_since_ns >= max_flush_lifetime` at a flush attempt, the attempt
+makes a last re-read before it drops the buffer instead of holding it again.
 
-**The drop.** No `seq` is pinned and no store call is made. Every strict
+**The last read.** A deferred trigger returns before the scan-set check, so
+nothing reads the record while a flush is deferred, and a hold can run out on
+a store that has since recovered. So the attempt that finds the hold spent
+re-reads the tenant's record (`held_view_check`, through `reread_and_check`,
+joining a read already in flight) and applies the check again on what it
+installed. The shard actor waits for it at most until the deadline a flush
+opened at that attempt would carry, `max_flush_lifetime` from the attempt's
+clock reading. A re-read that installs a trusted view opens the flush like
+any other verdict and clears the hold. A drain that already re-read the
+tenant reads nothing more, and inside the read backoff after a failed read
+the re-read answers as failed without a GET. Nothing extra is counted for the
+last read; its GET, when one is issued, is an ordinary provisioning read.
+
+**The drop.** When the last read fails, times out, or still leaves no trusted
+view, the buffer is dropped. No `seq` is pinned and no data or commit store
+call is made. Every strict
 waiter on the buffer is answered the retryable `Abandoned` (503) with a
 message saying the rows were not written, so a retry stores one copy. Dropping
 the buffer drops its charges, which refunds the byte budget. The drop logs at
@@ -1196,15 +1216,26 @@ and drops the buffer.
 **Rejected: hold without bound.** That is the defect. **Rejected: write in
 place at the bound.** The rows are past the horizon the view is trusted for,
 so a write may land under an index no reader scans, stored and invisible;
-the owner chose a counted drop over an invisible write.
+the owner chose a counted drop over an invisible write. **Rejected: drop
+without asking the store.** A hold that ran out while its flush was deferred
+was then dropped on a store that may already answer; a bounded re-read per
+spent hold is the price of not doing that.
 
 Tests: `crates/ravel-ingest/tests/scan_set_handback.rs` runs, on all three
 pipelines, `an_untrusted_view_hold_is_dropped_at_the_flush_lifetime` (held
 one tick short of the bound with nothing written and nothing counted, dropped
 and counted once at the bound with the budget refunded, never counted again),
 `an_untrusted_view_that_recovers_inside_the_bound_publishes`,
-`a_teardown_inside_the_bound_writes_the_held_flush` and
-`a_teardown_past_the_bound_drops_the_held_flush`; each shard module's
+`a_teardown_inside_the_bound_writes_the_held_flush`,
+`a_teardown_past_the_bound_drops_the_held_flush`,
+`a_store_that_recovers_with_no_attempt_publishes_past_the_bound` (the last
+read publishes a hold that ran out with no attempt and no read) and
+`a_read_that_succeeds_mid_hold_restarts_it` (the restart through the real
+router's view stamp: no drop at the first attempt past the first hold's bound,
+a drop exactly one bound after the restart); `ravel_ingest::generation`'s
+`a_spent_stale_view_hold_reads_once_more_before_the_drop` pins when the last
+read is made, and `an_older_read_does_not_replace_a_newer_view` pins that a
+slow write-path read does not set the view's stamp back; each shard module's
 `a_strict_waiter_on_a_spent_stale_view_hold_is_abandoned` pins the strict
 waiter's answer. Each shard module's
 `a_successful_read_during_a_stale_view_hold_restarts_it` and

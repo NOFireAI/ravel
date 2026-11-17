@@ -237,10 +237,11 @@ struct TenantBuf {
     /// `stale_provisioning_flushes` however many triggers retry it.
     stale_view_counted: bool,
     /// When an enforced flush open first found no trusted generation view for
-    /// this buffer. Once `max_flush_lifetime` has passed since, the buffer is
-    /// dropped and counted instead of held again (issue #4363). Cleared when a
-    /// flush open gets a scan-set or hand-back verdict, or finds the tenant's
-    /// view refreshed by a read issued since.
+    /// this buffer. Once `max_flush_lifetime` has passed since, a last re-read
+    /// that does not confirm the view drops and counts the buffer instead of
+    /// holding it again (issue #4363). Cleared when a flush open gets a
+    /// scan-set or hand-back verdict, or finds the tenant's view refreshed by a
+    /// read issued since.
     stale_view_since_ns: Option<i64>,
     /// Set once a hand-back from this buffer found a target shard not live, so
     /// the episode counts and logs once however many triggers retry it.
@@ -2409,7 +2410,8 @@ impl ShardActor {
     }
 
     /// Drops a buffer whose flush was held closed on an untrusted generation
-    /// view for `max_flush_lifetime` (issue #4363). Nothing is written: strict
+    /// view for `max_flush_lifetime` with no provisioning read succeeding, and
+    /// whose last re-read did not confirm the view (issue #4363). Nothing is written: strict
     /// waiters get `Abandoned`, and dropping `charges` refunds the byte budget.
     /// A teardown pass drops it too, rather than writing it in place.
     fn drop_stale_view_flush(&self, tenant_hash: TenantHash, buf: TenantBuf, lag_check: LagCheck) {

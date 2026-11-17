@@ -471,11 +471,11 @@ pub(crate) async fn reread_and_check<M>(
 }
 
 /// The `Abandoned` message a strict waiter gets when its buffer is dropped
-/// because no trusted provisioning view arrived for `max_flush_lifetime`
-/// (issue #4363). Nothing from the buffer is written, so a retry stores one
-/// copy.
-pub(crate) const STALE_VIEW_ABANDONED: &str = "flush dropped: no trusted provisioning view for \
-     max_flush_lifetime since the flush was first held; the rows were not written";
+/// because no provisioning read succeeded for `max_flush_lifetime` while its
+/// flush was held on an untrusted view (issue #4363). Nothing from the buffer
+/// is written, so a retry stores one copy.
+pub(crate) const STALE_VIEW_ABANDONED: &str = "flush dropped: no provisioning read succeeded for \
+     max_flush_lifetime while the flush was held on an untrusted view; the rows were not written";
 
 /// The start of a buffer's untrusted-view hold after a flush attempt at
 /// `now_ns` found no trusted view (issue #4363). A hold whose tenant view was
@@ -528,8 +528,12 @@ pub(crate) async fn held_view_check<M>(
     enforced: bool,
     drain_reread: bool,
 ) -> ScanCheck {
-    *hold_since_ns =
-        stale_view_hold_since(*hold_since_ns, scope.view_refreshed_at(tenant), now_ns, enforced);
+    *hold_since_ns = stale_view_hold_since(
+        *hold_since_ns,
+        scope.view_refreshed_at(tenant),
+        now_ns,
+        enforced,
+    );
     if drain_reread || !stale_view_hold_spent(*hold_since_ns, now_ns, bound) {
         return ScanCheck::Unknown;
     }
@@ -2519,13 +2523,25 @@ mod tests {
         ) -> ScanCheck {
             clock.0.store(now_ns, std::sync::atomic::Ordering::SeqCst);
             held_view_check(
-                scope, clock, BOUND, tenant(1), 0, 10, now_ns, since, true, drain,
+                scope,
+                clock,
+                BOUND,
+                tenant(1),
+                0,
+                10,
+                now_ns,
+                since,
+                true,
+                drain,
             )
             .await
         }
 
         let mut since = None;
-        assert_eq!(check_at(&scope, &clock, t0, &mut since, false).await, ScanCheck::Unknown);
+        assert_eq!(
+            check_at(&scope, &clock, t0, &mut since, false).await,
+            ScanCheck::Unknown
+        );
         assert_eq!(since, Some(t0), "the hold starts");
         assert_eq!(
             check_at(&scope, &clock, t0 + bound_ns - 1, &mut since, false).await,
