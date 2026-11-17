@@ -24,21 +24,11 @@ x-ravel-store: &ravel-store
 x-ravel-server: &ravel-server
   image: ravel-antithesis-server:ingest-durability
   platform: linux/amd64
-  # ravel-server exits within seconds when the store does not answer its
-  # startup read of sys/qualification, and nothing would start it again. A
-  # node Antithesis restarts during a store outage would then stay down for
-  # the rest of the timeline. So wait until the store answers, then exec the
-  # server as the container's main process.
-  entrypoint:
-    - /bin/sh
-    - -c
-    - |
-      trap 'exit 143' TERM INT
-      until [ "$$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 "aws:amz:$$RAVEL_S3_REGION:s3" --user "$$RAVEL_S3_ACCESS_KEY:$$RAVEL_S3_SECRET_KEY" "$$RAVEL_S3_ENDPOINT/$$RAVEL_S3_BUCKET?max-keys=1")" = 200 ]; do
-        sleep 1
-      done
-      exec /usr/local/bin/ravel-server "$$@"
-    - ravel-server
+  # ravel-server retries its startup store reads while the store returns a
+  # retryable error, up to --startup-store-deadline (#4325). Nothing restarts a
+  # container that exits here, so the deadline below is far longer than the
+  # 15 s default, which is sized for a Kubernetes liveness probe.
+  entrypoint: ["/usr/local/bin/ravel-server"]
   command:
     - "--mode"
     - "all"
@@ -53,6 +43,8 @@ x-ravel-server: &ravel-server
     - "--tenant-token"
     - "wl-token=wl-tenant"
     - "--tenant-hash-unkeyed"
+    - "--startup-store-deadline"
+    - "300s"
     # The three flush knobs move as a set (ADR-0076 decision 4). A shorter
     # cadence than the defaults (2 s, 40 s, 256 KiB) puts more flushes, and so
     # more commit races, into each timeline.
