@@ -5799,6 +5799,8 @@ mod tests {
     /// one of which the writer refuses (charged to the budget as
     /// `unwritable_skipped`), hour 102 one migratable record; the budget is two
     /// records. The first run persists hour 101 and the second migrates 102.
+    /// The second run returns `Ok` without the hold, and its re-audit counts
+    /// the held bucket's record, so it raises no floor.
     ///
     /// With the `buckets_migrated == 0` fallback removed, the first run
     /// persists no cursor and the second repeats it, holding 100, skipping 101
@@ -5858,6 +5860,24 @@ mod tests {
             .expect("the resume past the hold sees no hold and drains");
         assert_eq!(report.buckets_migrated, 1, "{report:?}");
         assert!(report.walk_complete, "{report:?}");
+        // The resume reports no hold, but its re-audit still counts the held
+        // hour 100 record beside hour 101's two, so no floor is raised.
+        assert_eq!(
+            report.verification,
+            Some(Verification::Stragglers {
+                l0: 3,
+                l1: 0,
+                rewrite_parts: 0,
+                blocked: Vec::new(),
+            }),
+            "{report:?}"
+        );
+        assert_eq!(
+            current_floor_from_store(&store, &tenant_hash(), Signal::Logs, "rlog")
+                .await
+                .expect("read floor"),
+            None
+        );
     }
 
     /// ADR-4233 decision 6: an input object whose bytes no build can decode
@@ -6308,6 +6328,85 @@ mod tests {
             message.contains("corrupt_input") && message.contains("shard 0 hour 100"),
             "{message}"
         );
+    }
+
+    /// A hash-mismatch hold marks its bucket claim completed, as every other
+    /// hold does, and the next run of the same process re-examines the bucket
+    /// and reports the same hold.
+    ///
+    /// Distinguishing: leave `PartContentHashMismatch` out of the re-encode's
+    /// claim-release arm and the claim is left `Running`, which fails the state
+    /// assertion. The rerun assertion does not tell the two apart: a process
+    /// reclaims its own claim whatever its state. It fails if the hold stops
+    /// being re-examined, for instance if a hold advanced the persisted cursor.
+    #[tokio::test]
+    async fn a_reencode_hash_mismatch_hold_completes_its_claim_and_is_reported_again() {
+        use prost::Message;
+        use ravel_fleet::claim::COMPACTION_CLAIMS_PREFIX;
+        use ravel_proto::sys::v1::{ClaimState, CompactionClaim};
+
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        let target = VERSION_V7 as u32;
+        seed_reencode_with_broken_part(&store, target, false, |bytes| {
+            let at = bytes.len() - ravel_segment::TRAILER_LEN as usize + 8;
+            bytes[at..at + 2].copy_from_slice(&out_of_window_rseg_version().to_le_bytes());
+        })
+        .await;
+        let clock = FixedClock::new(sealed_now_ns_for(100));
+        // The claim's expiry counts from the store's timestamp; without this a
+        // zero store clock would read every claim as expired.
+        store.set_clock_ms(
+            u64::try_from(sealed_now_ns_for(100) / 1_000_000).expect("non-negative now"),
+        );
+        let config = CompactorConfig {
+            reencode_writer_enabled: true,
+            claim_participant: Some(crate::ClaimParticipant::new(
+                Uuid::from_u128(7),
+                Arc::new(clock.clone()) as Arc<dyn crate::Clock>,
+            )),
+            ..CompactorConfig::default()
+        };
+        for run_no in 1..=2 {
+            let run = migrate_family(
+                &store,
+                &clock,
+                &config,
+                tenant_hash(),
+                Signal::Metrics,
+                FAMILY,
+                target,
+                1,
+                MigrateBudget::unlimited(),
+                "test",
+            )
+            .await;
+            let Err(MaintainError::MigrateHeld { held, report }) = run else {
+                panic!("run {run_no} reports the hold: {run:?}");
+            };
+            assert_eq!(
+                held.iter()
+                    .map(|h| (h.shard, h.ingest_hour, h.reason.name()))
+                    .collect::<Vec<_>>(),
+                vec![(0, 100, "corrupt_input")],
+                "run {run_no}: {held:?}"
+            );
+            assert!(report.not_migrated.is_empty(), "run {run_no}: {report:?}");
+
+            let mut states = Vec::new();
+            for meta in ravel_object_store::list_all(&store, COMPACTION_CLAIMS_PREFIX)
+                .await
+                .expect("list claims")
+            {
+                let got = store
+                    .get(&meta.key, GetRange::Full)
+                    .await
+                    .expect("get claim");
+                let claim = CompactionClaim::decode(got.data.as_ref()).expect("claim decodes");
+                states.push(ClaimState::try_from(claim.state).expect("known state"));
+            }
+            assert_eq!(states, vec![ClaimState::Completed], "run {run_no}");
+        }
     }
 
     fn foreign_key_in(shard: u32, hour: u32) -> String {

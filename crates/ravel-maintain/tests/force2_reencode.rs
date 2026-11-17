@@ -1346,18 +1346,41 @@ async fn an_erasure_rewrite_that_publishes_mid_reencode_stops_it_at_the_relist()
 }
 
 /// Compact `signal`'s fixture, record its one part below the target, replace
-/// the part object with `rewrite(bytes)`, and run the re-encode. Returns its
-/// error, the part's key and the record's content hash for the part.
+/// the part object with `rewrite(bytes)`, and run the re-encode. With
+/// `realign_hash` the record's content hash is rewritten to match the new
+/// bytes, as a newer writer would have recorded them; without it the part no
+/// longer matches its record. Returns the error, the part's key and the
+/// record's content hash for the part.
 async fn reencode_rewritten_part(
     signal: Signal,
+    realign_hash: bool,
     rewrite: impl Fn(Vec<u8>) -> Vec<u8>,
 ) -> (ravel_maintain::MaintainError, String, Vec<u8>) {
     let store = MemoryStore::new();
     let b = seed_compacted(&store, signal).await;
-    let (_, rec) = stamp_parts_below_target(&store, &b).await;
+    let (record_key, mut rec) = stamp_parts_below_target(&store, &b).await;
     assert_eq!(rec.parts.len(), 1, "one part to rewrite: {rec:?}");
-    let part_key = keys::reconstruct_l1_part_key(&rec, &rec.parts[0]).expect("part key");
+    let mut part_key = keys::reconstruct_l1_part_key(&rec, &rec.parts[0]).expect("part key");
     let bytes = rewrite(get_full(&store, &part_key).await.to_vec());
+    let new_hash = blake3::hash(&bytes).as_bytes().to_vec();
+    assert_ne!(
+        new_hash, rec.parts[0].content_hash,
+        "the rewrite changes the part"
+    );
+    if realign_hash {
+        // The part key carries the content hash, so the realigned part moves.
+        store.delete(&part_key).await.expect("drop the old part");
+        rec.parts[0].content_hash = new_hash;
+        part_key = keys::reconstruct_l1_part_key(&rec, &rec.parts[0]).expect("part key");
+        store
+            .put(
+                &record_key,
+                record::encode_compaction(&rec),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite the fixture record");
+    }
     store
         .put(&part_key, bytes.into(), PutOptions::default())
         .await
@@ -1386,23 +1409,31 @@ fn with_trailer_version(mut bytes: Vec<u8>, version: u16) -> Vec<u8> {
     bytes
 }
 
-/// ADR-4233 decision 6 on the RLOG and RSPAN re-encodes: a part whose trailer
-/// version this build cannot read is refused as `InputOutOfWindow` naming the
-/// part, its trailer version and its recorded content hash, as the RSEG
-/// re-encode does, so the migrate walk holds it as `input_out_of_window`
-/// rather than `corrupt_input`.
+/// The out-of-window trailer versions the logs and spans tests write.
+fn out_of_window_trailers() -> [(Signal, u16); 2] {
+    [
+        (Signal::Logs, ravel_logseg::footer::VERSION + 7),
+        (Signal::Spans, ravel_rspan::footer::VERSION + 7),
+    ]
+}
+
+/// ADR-4233 decision 6 on the RLOG and RSPAN re-encodes: an intact part (its
+/// bytes match its recorded content hash) whose trailer version this build
+/// cannot read is refused as `InputOutOfWindow` naming the part, its trailer
+/// version and its recorded content hash, as the RSEG re-encode does, so the
+/// migrate walk holds it as `input_out_of_window` rather than `corrupt_input`.
 ///
 /// Dropping the `noting_version` wrap from either loader in
 /// `reencode_and_publish` returns the reader's bare `UnsupportedVersion` and
-/// fails the match for that signal.
+/// fails the match for that signal. A hash check that compares against the
+/// wrong bytes refuses the intact part as `PartContentHashMismatch` and fails
+/// it too.
 #[tokio::test]
 async fn an_out_of_window_logs_or_spans_part_is_refused_as_out_of_window() {
-    for (signal, version) in [
-        (Signal::Logs, ravel_logseg::footer::VERSION + 7),
-        (Signal::Spans, ravel_rspan::footer::VERSION + 7),
-    ] {
+    for (signal, version) in out_of_window_trailers() {
         let (err, part_key, hash) =
-            reencode_rewritten_part(signal, |bytes| with_trailer_version(bytes, version)).await;
+            reencode_rewritten_part(signal, true, |bytes| with_trailer_version(bytes, version))
+                .await;
         match err {
             ravel_maintain::MaintainError::InputOutOfWindow {
                 object_key,
@@ -1417,6 +1448,29 @@ async fn an_out_of_window_logs_or_spans_part_is_refused_as_out_of_window() {
                 assert_eq!(content_hash, hash, "{signal:?}");
             }
             other => panic!("{signal:?}: expected InputOutOfWindow, got {other:?}"),
+        }
+    }
+}
+
+/// A logs or spans part whose trailer version reads as out of window but whose
+/// bytes no longer match its recorded content hash is corrupt, not out of
+/// window: the re-encode refuses it as `PartContentHashMismatch`, which the
+/// migrate walk holds as `corrupt_input`, the same rule compaction and the
+/// RSEG re-encode apply.
+///
+/// Dropping the full-GET hash check from either loader returns
+/// `InputOutOfWindow` for that signal and fails the match.
+#[tokio::test]
+async fn a_logs_or_spans_part_not_matching_its_hash_is_a_hash_mismatch() {
+    for (signal, version) in out_of_window_trailers() {
+        let (err, part_key, _) =
+            reencode_rewritten_part(signal, false, |bytes| with_trailer_version(bytes, version))
+                .await;
+        match err {
+            ravel_maintain::MaintainError::PartContentHashMismatch { object_key } => {
+                assert_eq!(object_key, part_key, "{signal:?}");
+            }
+            other => panic!("{signal:?}: expected PartContentHashMismatch, got {other:?}"),
         }
     }
 }
@@ -1468,17 +1522,29 @@ fn rlog_with_unreadable_postings() -> Vec<u8> {
     bytes
 }
 
-/// The H5 case on the logs re-encode: an RLOG part whose POSTINGS section
-/// version this build cannot read is refused as `InputOutOfWindow` carrying
-/// the section's name and its version, not the trailer's.
+/// The H5 case on the logs re-encode: an intact RLOG part whose POSTINGS
+/// section version this build cannot read is refused as `InputOutOfWindow`
+/// carrying the section's name and its version, not the trailer's. The same
+/// bytes under the record's old content hash are refused as
+/// `PartContentHashMismatch`.
 ///
 /// Dropping the logs loader's `noting_version` wrap returns the bare
-/// `UnsupportedSectionVersion` and fails the match; reporting the section
-/// version without its name fails the `section` assertion.
+/// `UnsupportedSectionVersion` and fails the first match; reporting the
+/// section version without its name fails the `section` assertion; dropping
+/// the full-GET hash check fails the second match.
 #[tokio::test]
 async fn a_logs_part_with_an_unreadable_postings_section_is_refused_as_out_of_window() {
+    let (err, part_key, _) =
+        reencode_rewritten_part(Signal::Logs, false, |_| rlog_with_unreadable_postings()).await;
+    match err {
+        ravel_maintain::MaintainError::PartContentHashMismatch { object_key } => {
+            assert_eq!(object_key, part_key);
+        }
+        other => panic!("expected PartContentHashMismatch, got {other:?}"),
+    }
+
     let (err, part_key, hash) =
-        reencode_rewritten_part(Signal::Logs, |_| rlog_with_unreadable_postings()).await;
+        reencode_rewritten_part(Signal::Logs, true, |_| rlog_with_unreadable_postings()).await;
     match err {
         ravel_maintain::MaintainError::InputOutOfWindow {
             object_key,
