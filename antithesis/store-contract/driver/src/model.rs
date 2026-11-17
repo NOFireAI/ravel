@@ -691,7 +691,7 @@ mod tests {
     }
 
     impl QuirkStore {
-        fn new(quirk: PutQuirk) -> Arc<BrokenStore> {
+        fn wrapped(quirk: PutQuirk) -> Arc<BrokenStore> {
             Arc::new(BrokenStore::new(
                 Arc::new(QuirkStore {
                     inner: Arc::new(MemoryStore::new()),
@@ -964,7 +964,7 @@ mod tests {
         // does not red: a CAS holding the pre-delete version is answered
         // against the current (equal) version, and the sub-check matches the
         // outcome to the effect.
-        let cv = QuirkStore::new(PutQuirk::ContentVersion);
+        let cv = QuirkStore::wrapped(PutQuirk::ContentVersion);
         let v = rt.block_on(versions_never_reused(&cv, "ver")).expect("ver");
         assert!(v.same_bytes_reused, "reuse not observed: {}", v.details);
         assert!(v.same_bytes_ok, "false red on reuse: {}", v.details);
@@ -988,7 +988,7 @@ mod tests {
         // as object_store's retry of a CAS that already landed is. A re-read
         // shows the CAS's own bytes, so the outcome matches the effect and the
         // property must hold rather than red.
-        let s = QuirkStore::new(PutQuirk::AppliesThenRefusesFirstCas(AtomicUsize::new(0)));
+        let s = QuirkStore::wrapped(PutQuirk::AppliesThenRefusesFirstCas(AtomicUsize::new(0)));
         let v = rt.block_on(cas(&s, "cas")).expect("cas");
         assert!(
             v.holds,
