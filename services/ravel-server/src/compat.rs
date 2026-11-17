@@ -223,6 +223,15 @@ pub fn record_publish_refusal(family: &str, refusal: &CompatRefusal) {
         .or_insert(0) += 1;
 }
 
+/// Count one publish refused under `reason`, for a refusal no
+/// [`CompatRefusal`] variant carries.
+pub fn record_publish_refusal_reason(family: &str, reason: CompatRefusalReason) {
+    *publish_refusals()
+        .lock()
+        .entry((CompatFamilyLabel::of(family), reason))
+        .or_insert(0) += 1;
+}
+
 /// Every `(family, reason)` series of `ravel_compat_publish_refused_total`:
 /// each known family under each [`CompatRefusalReason::ALL`] reason, zero
 /// until a refusal, plus every series a refusal counted, including a family
@@ -326,15 +335,40 @@ pub async fn refresh_once(view: &CompatView) {
     }
 }
 
+/// The shortest gap between two refreshes `wake` asks for, so a burst of
+/// refused writes costs at most one extra `sys/compat` read per second.
+pub const COMPAT_WAKE_MIN_GAP: Duration = Duration::from_secs(1);
+
 /// Re-read `sys/compat` into `view` every `interval`, starting one interval
-/// from now. One task per process.
-pub fn spawn_refresh_loop(view: CompatView, interval: Duration) -> JoinHandle<()> {
+/// from now, and once more whenever `wake` is notified: a writer refused
+/// `view_stale` notifies it, so the view recovers within about a second of
+/// `sys/compat` becoming readable instead of on the next tick. A woken
+/// refresh starts at least [`COMPAT_WAKE_MIN_GAP`] after the previous woken
+/// one, and the notifications that arrive meanwhile collapse into it. One
+/// task per process.
+pub fn spawn_refresh_loop(
+    view: CompatView,
+    interval: Duration,
+    wake: Arc<tokio::sync::Notify>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
+        let mut last_woken: Option<tokio::time::Instant> = None;
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                () = wake.notified() => {
+                    if let Some(last) = last_woken {
+                        tokio::time::sleep_until(last + COMPAT_WAKE_MIN_GAP).await;
+                    }
+                    // The refresh below serves a notification stored during
+                    // the gap too.
+                    let _ = futures::FutureExt::now_or_never(wake.notified());
+                    last_woken = Some(tokio::time::Instant::now());
+                }
+            }
             refresh_once(&view).await;
         }
     })
@@ -528,6 +562,68 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// Lets every task the paused runtime can run make progress.
+    async fn settle() {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A refused write's wake refreshes the view at once instead of on the
+    /// next tick, and a burst of wakes costs at most one more read per
+    /// [`COMPAT_WAKE_MIN_GAP`]: ten wakes right after a woken refresh start
+    /// one read a second later, and no other before the tick. A loop that
+    /// ignores the wake reads nothing until the tick; one with no gap reads
+    /// once per wake.
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_refreshes_at_once_and_a_burst_costs_one_read_a_second() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Sequence};
+        use ravel_object_store::memory::MemoryStore;
+
+        let fault_store = Arc::new(FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_sequence(
+                (0..100).fold(
+                    Sequence::new(Op::Get).with_key_contains(ravel_catalog::compat::COMPAT_KEY),
+                    |sequence, _| sequence.then_passthrough(),
+                ),
+            ),
+        ));
+        let reads = || fault_store.sequence_progress(0);
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let view = build_compat_view(store, Some(&[7; 32]), Arc::new(SystemCompatClock))
+            .expect("view")
+            .expect("keyed");
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let refresh = spawn_refresh_loop(view, Duration::from_secs(60), Arc::clone(&wake));
+        settle().await;
+        assert_eq!(reads(), 0, "no read before the first tick or wake");
+
+        wake.notify_one();
+        settle().await;
+        assert_eq!(reads(), 1, "the first wake reads at once");
+
+        for _ in 0..10 {
+            wake.notify_one();
+            settle().await;
+        }
+        assert_eq!(reads(), 1, "a burst inside the gap waits for it");
+        tokio::time::advance(COMPAT_WAKE_MIN_GAP - Duration::from_millis(1)).await;
+        settle().await;
+        assert_eq!(reads(), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        settle().await;
+        assert_eq!(reads(), 2, "the burst's one read, a gap after the last");
+        tokio::time::advance(Duration::from_secs(5)).await;
+        settle().await;
+        assert_eq!(reads(), 2, "the burst cost one read");
+
+        tokio::time::advance(Duration::from_secs(54)).await;
+        settle().await;
+        assert_eq!(reads(), 3, "the tick still reads");
+        refresh.abort();
     }
 
     #[test]
