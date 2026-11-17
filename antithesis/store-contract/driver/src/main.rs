@@ -75,7 +75,10 @@ impl Config {
                 .map_err(|e| e.to_string())?,
             hurried_timeout: Duration::from_millis(env_num("STORE_HURRIED_TIMEOUT_MS", 5)?),
             max_actions: env("WORKLOAD_MAX_ACTIONS")
-                .map(|v| v.parse().map_err(|e| format!("WORKLOAD_MAX_ACTIONS={v}: {e}")))
+                .map(|v| {
+                    v.parse()
+                        .map_err(|e| format!("WORKLOAD_MAX_ACTIONS={v}: {e}"))
+                })
                 .transpose()?,
             mutant,
         })
@@ -150,7 +153,11 @@ impl Workload {
         let Some(v) = inconclusive(&base, s.rt.block_on(model::cas(&s.store, &base))) else {
             return;
         };
-        assert_always!(v.holds, "store: a CAS outcome matches its effect", &v.details);
+        assert_always!(
+            v.holds,
+            "store: a CAS outcome matches its effect",
+            &v.details
+        );
         if v.stale_refused {
             assert_reachable!("store: a stale CAS was refused", &v.details);
         }
@@ -178,8 +185,10 @@ impl Workload {
     fn delete(&self, _tc: TestCase) {
         let s = &self.0;
         let base = s.base("delete");
-        let Some(v) = inconclusive(&base, s.rt.block_on(model::delete_idempotent(&s.store, &base)))
-        else {
+        let Some(v) = inconclusive(
+            &base,
+            s.rt.block_on(model::delete_idempotent(&s.store, &base)),
+        ) else {
             return;
         };
         assert_always!(

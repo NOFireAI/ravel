@@ -146,9 +146,7 @@ pub async fn create_race(store: &Arc<BrokenStore>, base: &str, contenders: usize
         let key = key.clone();
         let data = body(base, &format!("c{i}"));
         tasks.spawn(async move {
-            let r = store
-                .put(&key, data, PutOptions::create_if_absent())
-                .await;
+            let r = store.put(&key, data, PutOptions::create_if_absent()).await;
             (i, Put::of(r))
         });
     }
@@ -224,7 +222,9 @@ pub async fn cas(store: &BrokenStore, base: &str) -> Judged {
             matches!(&after_fresh, Read::Present { data, version } if *data == b && version == v)
         }
         Put::Failed { .. } => after_fresh.holds(&a) || after_fresh.holds(&b),
-        _ => matches!(&after_fresh, Read::Present { data, version } if *data == a && *version == va),
+        _ => {
+            matches!(&after_fresh, Read::Present { data, version } if *data == a && *version == va)
+        }
     };
 
     // The stale CAS needs the key to have moved past `va`.
@@ -237,7 +237,9 @@ pub async fn cas(store: &BrokenStore, base: &str) -> Judged {
     let stale_ok = match &stale {
         None => true,
         Some((put, read)) => {
-            !matches!(put, Put::Ok(_)) && !read.holds(&c) && (put != &Put::PreconditionFailed || read.holds(&b))
+            !matches!(put, Put::Ok(_))
+                && !read.holds(&c)
+                && (put != &Put::PreconditionFailed || read.holds(&b))
         }
     };
 
@@ -274,7 +276,8 @@ pub async fn read_after_write(store: &BrokenStore, base: &str, writes: usize) ->
             break;
         };
         let read = read_settled(store, &key).await?;
-        let ok = matches!(&read, Read::Present { data: d, version: v } if *d == data && v == version);
+        let ok =
+            matches!(&read, Read::Present { data: d, version: v } if *d == data && v == version);
         holds &= ok;
         checked.push(json!({ "put": put.describe(), "read": read.describe() }));
     }
@@ -305,7 +308,10 @@ pub async fn delete_idempotent(store: &BrokenStore, base: &str) -> Judged {
         format!("{base}/never"),
     );
     let sibling_body = body(base, "sibling");
-    for (key, data) in [(&gone, body(base, "gone")), (&sibling, sibling_body.clone())] {
+    for (key, data) in [
+        (&gone, body(base, "gone")),
+        (&sibling, sibling_body.clone()),
+    ] {
         if let Err(e) = store.put(key, data, PutOptions::default()).await {
             return Err(format!("setup put of {key}: {e}"));
         }
@@ -359,7 +365,10 @@ pub async fn versions_never_reused(store: &BrokenStore, base: &str) -> Judged {
         .delete(&key)
         .await
         .map_err(|e| format!("delete: {e}"))?;
-    let second = match store.put(&key, b.clone(), PutOptions::create_if_absent()).await {
+    let second = match store
+        .put(&key, b.clone(), PutOptions::create_if_absent())
+        .await
+    {
         Ok(o) => o.version.0,
         Err(e) => return Err(format!("second create: {e}")),
     };
@@ -418,7 +427,10 @@ pub async fn multipart(store: &BrokenStore, base: &str, parts: &[Bytes], complet
             Ok(_) => read.holds(&whole),
             Err(_) => read == Read::Absent || read.holds(&whole),
         };
-        (json!({ "complete": format!("{:?}", r.map(|o| o.version.0)), "ok": ok }), read)
+        (
+            json!({ "complete": format!("{:?}", r.map(|o| o.version.0)), "ok": ok }),
+            read,
+        )
     } else {
         let r = upload.abort().await;
         let read = read_settled(store, &key).await?;
@@ -534,10 +546,20 @@ pub async fn transient(
     data.resize(len.max(data.len()), b'.');
     let put = Put::of(
         hurried
-            .put(&key, Bytes::from(data.clone()), PutOptions::create_if_absent())
+            .put(
+                &key,
+                Bytes::from(data.clone()),
+                PutOptions::create_if_absent(),
+            )
             .await,
     );
-    let failed = matches!(put, Put::Failed { retryable: true, .. });
+    let failed = matches!(
+        put,
+        Put::Failed {
+            retryable: true,
+            ..
+        }
+    );
     if !failed {
         return Ok(Verdict {
             holds: true,
@@ -560,7 +582,9 @@ pub async fn transient(
 mod tests {
     use super::*;
     use crate::mutant::Mutant;
-    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
     use ravel_object_store::memory::MemoryStore;
 
     fn rt() -> tokio::runtime::Runtime {
@@ -613,7 +637,9 @@ mod tests {
             ];
             assert!(holds(multipart(&s, "mp3", &two, true).await));
             for keys in [1, 2, 5, 9] {
-                let v = list_paged(&s, &format!("list{keys}"), keys, 2).await.expect("list");
+                let v = list_paged(&s, &format!("list{keys}"), keys, 2)
+                    .await
+                    .expect("list");
                 assert!(v.holds, "{}", v.details);
             }
             assert!(holds(lost_response(&s, "lost").await));
@@ -627,7 +653,11 @@ mod tests {
         let rt = rt();
         let s = memory(2, Some(inv_mutant!("common/cas-accepts-stale-version")));
         let v = rt.block_on(cas(&s, "cas")).expect("cas");
-        assert!(!v.holds, "the CAS property held under the mutant: {}", v.details);
+        assert!(
+            !v.holds,
+            "the CAS property held under the mutant: {}",
+            v.details
+        );
         assert_eq!(v.details["stale_ok"], json!(false));
         assert!(!v.stale_refused);
     }
@@ -691,10 +721,16 @@ mod tests {
         let reader = BrokenStore::new(inner.clone(), None);
         rt.block_on(async {
             inner
-                .put("tr/k", Bytes::from_static(b"tr/t trunc"), PutOptions::default())
+                .put(
+                    "tr/k",
+                    Bytes::from_static(b"tr/t trunc"),
+                    PutOptions::default(),
+                )
                 .await
                 .expect("plant");
-            let v = transient(&hurried, &reader, "tr", 64).await.expect("transient");
+            let v = transient(&hurried, &reader, "tr", 64)
+                .await
+                .expect("transient");
             assert!(v.failed && !v.holds, "{}", v.details);
         });
     }
