@@ -1,9 +1,11 @@
 #!/bin/bash
 # The clock-jump check (README.md, "The clock jump"): run the local loop,
 # whose compose file is the run's (every container under libfaketime, the
-# driver jumping every clock once), and report on the jump alone: that it
-# happened, that every probed clock moved by it, that a fold sealed an hour
-# ingested live, and that a compaction record was published. The verdict is
+# driver jumping every clock to seal the live hours and then twice more for
+# the sweep), and report on the jumps alone: that they happened, that every
+# probed clock moved by their total, that a fold sealed an hour ingested
+# live, that a compaction record was published, and that a sweep past the
+# jumps deleted one of its inputs. The verdict is
 # written to <out-dir>/clock-spike-result.txt as well as printed.
 #
 # Usage: scripts/clock-spike.sh <out-dir> [seconds]
@@ -43,12 +45,14 @@ held() {
 }
 for m in "clock: the driver's clock jumped forward" \
     "clock: an hour ingested live was sealed by a fold" \
-    "catalog: a compaction record was published"; do
+    "catalog: a compaction record was published" \
+    "clock: the clocks jumped past the sweep's protection horizon and pinned-query window" \
+    "catalog: sweep deleted a superseded compaction input"; do
     check "held at least once: $m" held "$m"
 done
 
 # Every line of the probe local-run.sh wrote: the clock read, and ahead of the
-# host by the jump less 60 s.
+# host by the jumps' total less 60 s.
 probe_ok() {
     local name reading jump host n=0
     read -r _ host _ jump < <(grep '^host ' "$OUT/clock-probe.txt" 2>/dev/null) || return 1

@@ -18,7 +18,7 @@ written.
 | `driver` | The workload. The only container excluded from faults, and the only writer of the clock offset file. |
 
 Every container except `faketime` starts through `/faketime/run`, under
-libfaketime; see "The clock jump" below.
+libfaketime; see "The clock jump" and "The sweep jumps" below.
 
 Does `--mode all` run maintenance? Only the fold. `Mode::runs_scheduled_fold`
 is true for `all` and `maintain`. Compaction, retention and the sweep
@@ -73,7 +73,9 @@ gives each live hour many level-0 objects. A live hour seals only once its
 end plus the one-hour maximum flush lifetime, the skew allowance and the
 fold safety margin have passed. So a run that must see a compaction either
 runs for hours or jumps the clock, which this workload does once per
-timeline (below).
+timeline (below). A superseded compaction input becomes deletable only a
+protection horizon and a pinned-query window later still, so once a
+compaction record is seen the workload jumps the clock twice more.
 
 ## Driver rules
 
@@ -82,12 +84,12 @@ timeline (below).
 | `write_logs` | A strict OTLP log write to `ravel1` or `ravel2`, retried on no response, 429 or 503. |
 | `fold` | `ravel-cli catalog fold --tenant cm-tenant --signal logs --shards 4`, then `catalog inspect --json`. |
 | `compact` | `ravel-cli maintain compact-tenant --tenant cm-tenant --signal logs --shards 4`, then the upper-bound check on one node. |
-| `sweep` | `ravel-cli maintain sweep --tenant cm-tenant --signal logs --shard <0..3>`. |
-| `jump_clock` | Rarely, once at least `CLOCK_JUMP_MIN_ACKED` (20) live writes are acked and no write is in flight, moves every clock forward by `CLOCK_JUMP_SECS`. Once per timeline. |
+| `sweep` | `ravel-cli maintain sweep --tenant cm-tenant --signal logs --shard <0..3>`, which deletes what the GC rules allow. |
+| `jump_clock` | Rarely, once at least `CLOCK_JUMP_MIN_ACKED` (20) live writes are acked and no write is in flight, moves every clock forward by `CLOCK_JUMP_SECS`. Once per timeline. After that jump and once an audit decoded a compaction record, the same rule instead takes the sweep jumps below, also once per timeline. |
 | `corrupt_head` | Rarely, PUTs garbage over the HEAD through raw S3. A read then falls back to listing and the next fold rebuilds HEAD. |
 | `audit` | The store audit below. |
 | `check_bounds` | The upper-bound check below, on one node. |
-| `eventually` | Rarely (and always after `WORKLOAD_EVENTUALLY_AFTER_SECS` when that is set): stops faults, waits up to 300 s for every node to serve, jumps the clocks if no rule did, folds, compacts, audits, runs the full multiset check and ends the timeline. |
+| `eventually` | Rarely (and always after `WORKLOAD_EVENTUALLY_AFTER_SECS` when that is set): stops faults, waits up to 300 s for every node to serve, jumps the clocks if no rule did, folds, compacts, audits, takes the sweep jumps if a compaction record was seen and no rule took them, sweeps every shard, folds and audits again, runs the full multiset check and ends the timeline. |
 
 ### The multiset checks
 
@@ -110,21 +112,31 @@ that fails for two minutes counts as a violation, not as a pass.
    (`part[i] ... key=`), its column statistics object (`column_stats (field
    7): key=`) and each key-index leaf (`field=... key=`). It then fetches
    and decodes every part. A part it cannot fetch fails the command with
-   `failed to fetch part <key>`, and the audit counts that key as named.
+   `failed to fetch part <key>: object not found`, and the audit counts
+   that key as named. A part fetch failing for any other cause gives no
+   verdict for that pass.
 3. `ravel-cli rlog footprint --tenant cm-tenant --shards 4 --json` lists
    every data object the catalog resolves for the tenant and fetches each. A
    data object the store does not hold fails the command with `failed to
    fetch <key>: object not found`; the audit counts that key as resolved only
    when it is a data object key under `t/<tenant hash>/l/l0/` or
-   `t/<tenant hash>/l/l1/` ending in `.rseg`, the suffix Ravel gives every
-   data object, logs included (`DATA_SUFFIX` in
-   `crates/ravel-commit/src/keys.rs`). Any other failure (a
+   `t/<tenant hash>/l/l1/` ending in `.` followed by `DATA_SUFFIX` (`rseg`,
+   in `crates/ravel-commit/src/keys.rs`), the suffix Ravel gives every data
+   object, logs included. Any other failure (a
    transient or skew error, a fetch of `sys/tenancy` or of a HEAD) gives no
    verdict on resolved data objects for that pass.
 4. LIST the tenant prefix (`t/<tenant hash>/`). A page counts only when curl
    exited 0 and the body ends with `</ListBucketResult>`; a page that does
    not is requested again, and a listing that still fails gives no verdict,
    never an empty bucket.
+   Then the sweep check: decode up to 16 listed compaction records not
+   decoded before (`ravel-cli commit decode-compaction <key>`; records are
+   immutable, so each is decoded once) for their inputs. Each input names
+   its level-0 commit record (in the record's own directory) and its data
+   object (`t/<tenant hash>/l/l0/<shard>/<writer>.<epoch>.<seq>.*.rseg`).
+   An input key that an earlier LIST held, that this LIST lacks, and that a
+   GET then finds absent is a swept input. This LIST then joins the keys
+   seen.
 5. `catalog inspect --json` again. If HEAD changed during steps 1 to 5, or
    is corrupt or absent, the audit skips this pass.
 6. Cross-check the text parse against the JSON form of the same HEAD: the
@@ -158,15 +170,18 @@ Every literal starts with `catalog: ` or `clock: `.
 | `catalog: a sealed seeded hour was folded into HEAD` | sometimes | every `catalog inspect --json` | A part of HEAD with entries covers some seeded hour (inside its `min_hour..=watermark_hour`, not retired). |
 | `clock: an hour ingested live was sealed by a fold` | sometimes | every `catalog inspect --json` | A part of HEAD with entries covers the hour of some acked live write. |
 | `catalog: a compaction record was published` | sometimes | `audit` | A listed `l1.*.cmt` record decoded through `commit decode-compaction`. |
+| `catalog: sweep deleted a superseded compaction input` | sometimes | `audit` | Evaluated once an audit holds a decoded compaction record: a commit record or data object of one of its inputs was in an earlier LIST, is absent from this one, and a GET finds it absent. |
 | `catalog: the audit checked the data objects the catalog resolves` | sometimes | `audit` | `rlog footprint` reported at least one data object. |
 | `catalog: a listed commit record decoded through ravel-cli` | sometimes | `audit` | A listed level-0 commit record decoded through `commit decode`. |
 | `clock: the driver's clock jumped forward` | reachable | `jump_clock`, `eventually` | The jump reached the driver's own clock. |
+| `clock: the clocks jumped past the sweep's protection horizon and pinned-query window` | reachable | `jump_clock`, `eventually` | Both sweep jumps reached the driver's own clock. |
+| `catalog: an on-demand sweep succeeded` | reachable | `sweep`, the sweep jumps, `eventually` | `maintain sweep` exited 0. |
 | `catalog: the workload starts` | reachable | startup | |
 | `catalog: an on-demand fold succeeded` | reachable | `fold` | |
 | `catalog: HEAD was overwritten with garbage through raw S3` | reachable | `corrupt_head` | |
 | `catalog: inspect reported a corrupt HEAD` | reachable | every `catalog inspect --json` | |
-| `clock: the driver could not write the clock offset` | unreachable | `jump_clock` | |
-| `clock: the clock jump did not reach the driver` | unreachable | `jump_clock` | The driver's clock did not move by the jump within one reread plus 30 s. |
+| `clock: the driver could not write the clock offset` | unreachable | `jump_clock`, the sweep jumps | |
+| `clock: the clock jump did not reach the driver` | unreachable | `jump_clock`, the sweep jumps | The driver's clock did not move by the jump within one reread plus 30 s. |
 | `catalog: the seeded load was refused` | unreachable | setup | |
 | `catalog: the seeded load reported other rows than planned` | unreachable | setup | |
 
@@ -201,13 +216,54 @@ driver moves it forward once per timeline (ADR-4326, clock-jump amendment).
 - Monotonic clocks are not faked, so timeouts and leases measured on them
   are untouched. Shell waits in the entrypoints use `/proc/uptime`.
 
+## The sweep jumps
+
+The sweep deletes a superseded compaction input (GC rule 2,
+`crates/ravel-maintain/src/sweep.rs`) only when all of these hold:
+
+- HEAD no longer names it, which needs a fold after the compaction;
+- `now >= created_unix_ns + protection_horizon` of the compaction record.
+  The default horizon is `max_query_duration + grace + clock_skew_allowance`
+  (3600 + 86400 + 300 = 90300 s, `DEFAULT_PROTECTION_HORIZON_NS`);
+- an unnamed-since marker (ADR-1133) exists that an earlier sweep past the
+  horizon wrote, and `max_query_duration + head_cache_ttl + 4 *
+  clock_skew_allowance` (3600 + 30 + 1200 = 4830 s) has passed since it.
+
+One jump cannot satisfy the third condition: the marker is written by the
+first deleting pass past the horizon, with the time of that pass. So once the
+sealing jump reached the driver and an audit decoded a compaction record,
+the driver, holding its write gate throughout:
+
+1. LISTs the tenant prefix, so every input key a later deletion removes was
+   seen;
+2. moves every clock forward by `CLOCK_SWEEP_HORIZON_JUMP_SECS` (config
+   91200 s), with the same offset write, checks and reread wait as the
+   sealing jump;
+3. folds, then sweeps all four shards, which writes the markers;
+4. moves every clock forward by `CLOCK_SWEEP_WINDOW_JUMP_SECS` (config
+   5400 s), the same way.
+
+The next sweep, from `maint1`/`maint2`, the `sweep` rule or the
+`eventually`, deletes the inputs. The driver refuses to start if either
+sweep jump is below its term (90300 s and 4830 s), computed from the shipped
+defaults; no grace or horizon flag is passed anywhere, so the run deletes
+under the shipped `sys/gc` defaults. Each jump is as far beyond SigV4's 900 s
+skew limit as the sealing jump is, and the gate hold across each reread
+window is the same mitigation. A token read after the sweep resolves a
+deleted level-0 commit record through the compaction record's input list
+(docs/catalog-and-mvcc.md), so the `eventually` checks the multiset and the
+HEAD audit after the deletion.
+
 `scripts/clock-spike.sh <out-dir> [seconds]` runs the local loop and reports
-on the jump alone. It writes `<out-dir>/clock-spike-result.txt` and exits 0
+on the jumps alone. It writes `<out-dir>/clock-spike-result.txt` and exits 0
 only if `local-run.sh` passed; `clock: the driver's clock jumped
-forward`, `clock: an hour ingested live was sealed by a fold` and `catalog: a
-compaction record was published` held; and all six clock probes (`date` in
+forward`, `clock: an hour ingested live was sealed by a fold`, `catalog: a
+compaction record was published`, `clock: the clocks jumped past the sweep's
+protection horizon and pinned-query window` and `catalog: sweep deleted a
+superseded compaction input` held; and all six clock probes (`date` in
 rustfs, ravel1, ravel2, maint1 and maint2, and the `Last-Modified` rustfs
-stamps on a probe PUT) read at least the jump minus 60 s ahead of the host.
+stamps on a probe PUT) read at least the three jumps' total minus 60 s ahead
+of the host.
 The last line is `clock jump: PASS` or `clock jump: FAIL`.
 
 ## Build, run locally, launch
@@ -224,15 +280,19 @@ The same steps as ingest-durability, from this directory's `scripts/`:
   - the driver was still running after setup, then exited 0 having logged
     `eventually: ending the timeline`;
   - every other container is running or exited 0;
-  - every clock probe read a number at least the jump minus 60 s ahead of
-    the host (`clock-probe.txt`);
+  - the offset file holds the three jumps' total, and every clock probe read
+    a number at least that total minus 60 s ahead of the host
+    (`clock-probe.txt`);
   - every container's SDK output was collected;
   - no always-type assertion was violated (`violated.tsv`), and none that
     must be hit was never hit (`never-hit.tsv`);
   - `catalog: the workload starts`, `clock: the driver's clock jumped
     forward`, `catalog: a sealed seeded hour was folded into HEAD`, `clock:
-    an hour ingested live was sealed by a fold` and `catalog: a compaction
-    record was published` each held.
+    an hour ingested live was sealed by a fold`, `catalog: a compaction
+    record was published`, `clock: the clocks jumped past the sweep's
+    protection horizon and pinned-query window`, `catalog: an on-demand
+    sweep succeeded` and `catalog: sweep deleted a superseded compaction
+    input` each held.
 - `WORKLOAD_INJECT_SWAPPED_RECORD=1 scripts/local-run.sh <out-dir>` is the
   self-check. The model expects one seeded record moved to another write, so
   `catalog: compaction preserves the acked multiset` must appear in

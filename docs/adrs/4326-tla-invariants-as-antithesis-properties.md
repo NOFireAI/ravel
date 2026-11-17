@@ -298,7 +298,7 @@ the local loop:
   checks falls in the window. Monotonic clocks are not faked.
 - After seeding and some acknowledged live writes, the driver moves every
   clock forward once per timeline, as one of its actions, and records the
-  jump in its assertions. The jump is at least one hour plus
+  jump in its assertions. This sealing jump is at least one hour plus
   `max_flush_lifetime + clock_skew_allowance + fold_safety_margin`, 8400 s
   with the defaults, which seals the ingest hour of every write acknowledged
   before it, wherever in its hour the write landed. The config uses 9000 s.
@@ -308,9 +308,22 @@ the local loop:
   row that needs the clock fails instead of being recorded as `none: needs
   clock control`. The store therefore runs RustFS's glibc build; its default
   build is a static-pie musl binary that no preload reaches.
-- `clock: an hour ingested live was sealed by a fold` and `catalog: a
-  compaction record was published` are reachable in a plain run, and the
-  local loop gates on both.
+- Once that jump has landed and a compaction record has been seen, the
+  driver moves every clock forward twice more, the same way and under the
+  same write-gate hold, so the sweep can delete a superseded compaction
+  input. The first sweep jump passes the record's protection horizon
+  (`max_query_duration + grace + clock_skew_allowance`, 90300 s with the
+  defaults); the driver then folds and sweeps, which writes each input's
+  unnamed-since marker (ADR-1133). The second passes the marker's
+  pinned-query window (`max_query_duration + head_cache_ttl + 4 *
+  clock_skew_allowance`, 4830 s), after which a sweep deletes the input.
+  One jump cannot do both, since the marker records the time of the pass
+  that wrote it. Both minimums come from the shipped defaults, which the
+  run keeps; the config uses 91200 s and 5400 s.
+- `clock: an hour ingested live was sealed by a fold`, `catalog: a
+  compaction record was published` and `catalog: sweep deleted a
+  superseded compaction input` are reachable in a plain run, and the local
+  loop gates on all three.
 
 Production code still has no clock seam: the jump is test infrastructure
 around unmodified binaries.

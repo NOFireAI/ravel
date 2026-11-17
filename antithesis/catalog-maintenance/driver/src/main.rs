@@ -155,7 +155,10 @@ impl Config {
                     "CLOCK_SWEEP_HORIZON_JUMP_SECS",
                     clock::DEFAULT_HORIZON_JUMP_S,
                 ),
-                window_jump_s: env_u64("CLOCK_SWEEP_WINDOW_JUMP_SECS", clock::DEFAULT_WINDOW_JUMP_S),
+                window_jump_s: env_u64(
+                    "CLOCK_SWEEP_WINDOW_JUMP_SECS",
+                    clock::DEFAULT_WINDOW_JUMP_S,
+                ),
                 reread_s: env_u64("FAKETIME_CACHE_DURATION", 2),
                 min_acked: usize::try_from(env_u32("CLOCK_JUMP_MIN_ACKED", 20)).unwrap_or(20),
             },

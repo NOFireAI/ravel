@@ -209,7 +209,9 @@ pub fn compaction_inputs(
     record_key: &str,
     decoded: &str,
 ) -> Option<Vec<InputKeys>> {
-    let rest = record_key.strip_prefix(tenant_prefix)?.strip_prefix("l/c/")?;
+    let rest = record_key
+        .strip_prefix(tenant_prefix)?
+        .strip_prefix("l/c/")?;
     let (dir, name) = record_key.rsplit_once('/')?;
     if !(name.starts_with("l1.") && name.ends_with(".cmt")) {
         return None;
@@ -505,7 +507,8 @@ parts: 1
 
     #[test]
     fn a_part_not_found_is_named() {
-        let err = "Error: failed to fetch part t/0a0b/catalog/l/snap/1.aa.csnap: object not found\n";
+        let err =
+            "Error: failed to fetch part t/0a0b/catalog/l/snap/1.aa.csnap: object not found\n";
         assert_eq!(
             unfetched_part(err).as_deref(),
             Some("t/0a0b/catalog/l/snap/1.aa.csnap")
@@ -528,8 +531,7 @@ parts: 1
         }
     }
 
-    const RECORD_KEY: &str =
-        "t/0a0b/l/c/0002/20261117T16/l1.00112233aabbccdd.cmt";
+    const RECORD_KEY: &str = "t/0a0b/l/c/0002/20261117T16/l1.00112233aabbccdd.cmt";
     const DECODED: &str = "\
 format_version: 1
 tenant_hash: 0a0b
@@ -616,7 +618,10 @@ parts: 1
             .into_iter()
             .cloned()
             .collect();
-        assert_eq!(swept_inputs(&inputs, &seen, &listed), vec![commit7.clone(), data7]);
+        assert_eq!(
+            swept_inputs(&inputs, &seen, &listed),
+            vec![commit7.clone(), data7]
+        );
         // A key never listed before is no evidence of a delete.
         assert!(swept_inputs(&inputs, &BTreeSet::new(), &listed).is_empty());
     }
