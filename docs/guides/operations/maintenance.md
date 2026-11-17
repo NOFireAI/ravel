@@ -2014,29 +2014,35 @@ that order. The [compatibility contract](../../compatibility.md) states which
 releases may run beside each other, which families follow which regime, and
 which upgrade and downgrade paths are supported.
 
-**What this release can run.** `ravel-cli` in this release has no `compat`
-subcommand. The steps that create, activate and certify `sys/compat` exist
-only as `ravel-maintain` library entry points (`init_compat`, `activate`,
-`certify` and `late_write_pass`), and no shipped binary calls `init_compat`,
-`activate` or `certify`. Until a release ships those commands, steps 3, 5
-and 7 below cannot be run from a shipped binary, no store can be adopted or
-activated, and every family stays at its baseline version. Because no
-`compat` command ships, there are no command exit codes to document; each
-step below lists the typed refusals the library returns. What does run in
-shipped binaries:
+Two things run the procedure. Five `ravel-cli compat` subcommands make the
+operator's steps: `init` adopts the store, `activate` raises a family's
+version, `certify` writes the certificate a reader-retiring release needs,
+`verify` runs the late-write pass on demand, and `status` prints
+`sys/compat`. A `ravel-server --mode maintain` process does the rest: the
+background migration, the daily late-write pass and certify finalization
+(see [Compat maintenance units](#compat-maintenance-units)). No `compat`
+subcommand migrates anything.
 
-- the `sys/compat` write policy, in every `ravel-server` mode on a keyed
-  bucket (see [Writer versions under `sys/compat`](#writer-versions-under-syscompat));
-- the hourly compat maintenance task of a `--mode maintain` process, which
-  acts only on a family that already carries a certificate (see
-  [Compat maintenance units](#compat-maintenance-units));
-- `--background-migrate`, and the
-  [retired-reader startup gate](#retired-reader-startup-gate), whose reader
-  set is empty in this release.
+Every `compat` subcommand takes the global `--tenant-hash-key-file`, given
+before the subcommand (`ravel-cli --tenant-hash-key-file <key> compat
+status`), next to the usual store flags. `sys/compat` is MAC-signed under
+that deployment key, so without it every subcommand refuses. Each one runs
+under the Admin credential, the `ravel-cli` default. Every subcommand takes
+`--json`, which prints its report as one JSON object; a refusal prints
+`{"outcome": "refused", "reason": ...}`. They share these exit codes:
+
+| Exit | Meaning |
+|---|---|
+| 0 | The command ran and nothing refused it. |
+| 1 | An error, not a refusal: a store, listing or GET fault, a `sys/compat` MAC or decode fault, an unreadable key file, or an `activate` whose 8 conditional-write attempts all lost a race. The message goes to stderr as `Error: ...` and `--json` prints nothing. Rerun once the cause is fixed. |
+| 2 | Refused: a precondition the operator must fix, and `sys/compat` was not changed. The reason is printed. A command-line error (a missing `--family`, an unknown flag) also exits 2, from the argument parser. |
+| 3 | Contradicted: `certify` found a member below the target version, or `verify` found a late write or a family whose certificate is `contradicted`. |
+| 4 | Pending: resumable work is unfinished. `activate`'s fence walk stopped, or `certify` stopped on its budget or has a finalization waiting for a late-write pass. Rerun the same command. |
 
 On this release only `compaction-record` has a writable version above its
 baseline (2, for `--reencode-compaction-parts`); `rseg`, `rlog` and `rspan`
-each write one version.
+each write one version, so `compat activate` refuses each of them with
+`NotWritable` (exit 2).
 
 The procedure, for family F from version N to N+1:
 
@@ -2046,28 +2052,56 @@ The procedure, for family F from version N to N+1:
    roles. A process whose role lacks it never sees an activation: on a
    fenced bucket its writers refuse as stale, and the audit and legal-hold
    writers, which write to no provisioned bucket, keep writing version N.
-   Whatever runs the `sys/compat` steps needs `s3:PutObject` on
-   `sys/compat` too, and so does a maintain role whose process runs the
-   late-write pass and certify finalization, since both write the record.
-   The shipped roles grant no role `s3:PutObject` on `sys/compat`. Every
-   process also needs `--tenant-hash-key-file`: on an unkeyed bucket a
-   process builds no view of `sys/compat` and every writer emits its
-   built-in version.
+   The Admin and maintain roles also grant `s3:PutObject` on
+   `sys/compat`, because both write the record. The Admin role runs
+   `compat init`, `activate`, `certify`, `verify` and `status`; it also
+   writes the provisioning records the fence walk raises and puts and
+   deletes the certify cursor under `sys/maintain/certify/`. An `rlog`
+   activation's walk also writes each tenant's `t/<tenant>/a/alert-lease`,
+   which the shipped Admin role does not grant: add that grant to the
+   credential that runs an `rlog` activation, or its walk stops at the
+   first lease and exits 4. The maintain role runs the late-write pass,
+   certify finalization and the background migration. The
+   credential each `ravel-cli` command takes, and the `sys/compat` and
+   `sys/maintain/certify/*` rows, are in
+   [the IAM templates' README](../../../deploy/iam/README.md), sections
+   "Which credential each `ravel-cli` command takes" and "Control-plane
+   keys outside the data path". Every process also needs
+   `--tenant-hash-key-file`: on an unkeyed bucket a process builds no view
+   of `sys/compat` and every writer emits its built-in version.
 2. **Roll out the baseline release** with a plain rolling update. No
    activation is needed, and v0.33.x processes may run beside it until step
    5.
-3. **Adopt the store** with `init_compat`, once. It runs a census of every
-   tenant's config, provisioning records, catalog objects, bucket records
-   and data trailers, and on a clean result creates `sys/compat` at this
-   build's baseline versions with `compat_epoch` 0, the configured publish
-   lifetime `P` (default 1 hour), and the version histogram it found. It
+3. **Adopt the store**, once:
+
+   ```sh
+   ravel-cli --tenant-hash-key-file <key> compat init \
+     --baseline-major 0 --baseline-minor 34 --max-publish-lifetime 1h --json
+   ```
+
+   `--baseline-major` and `--baseline-minor` name the baseline release
+   recorded in `sys/compat` (defaults 0 and 34), and
+   `--max-publish-lifetime` is the publish lifetime `P` (default `1h`).
+   The command runs a census of every tenant's config, provisioning
+   records, catalog objects, bucket records and data trailers, and on a
+   clean result creates `sys/compat` at this build's baseline versions
+   with `compat_epoch` 0, `P`, and the version histogram it found. It
    lists only `t/<tenant>/`, so objects under `quarantine/` are not
-   checked. An identical existing record is a no-op. It refuses, writing
-   nothing, with:
-   - `Unkeyed`: no file key is configured;
-   - `List`: a listing failed, or a key under a census prefix cannot be
-     addressed;
-   - `Get` or `Unreadable`: an object could not be read;
+   checked. An identical existing record is a no-op.
+
+   It exits 0 with `outcome` `created`, or `already-initialized` for the
+   no-op. The JSON report carries `families` (each `family` with its
+   `active_write_version`), `adopted` (`family`, `version`, `count` for
+   every version the census found) and `census` (`tenants`,
+   `objects_checked`, `objects_ignored`, `objects_vanished`; `null` when
+   the record already existed). Check `adopted` against what you expect the
+   store to hold. It exits 2, writing nothing, on these refusals:
+   - `Unkeyed`: no `--tenant-hash-key-file`;
+   - `InvalidPublishLifetime`: `--max-publish-lifetime` is not positive;
+   - `NoBaselineVersion`: this build has no single baseline version for a
+     family;
+   - `Unreadable`, `UnknownBucketEntry` or `NoFamilyForSignal`: an object
+     the census found cannot be read or classified;
    - `OutsideReadSet`: objects at a version this build does not read,
      grouped by tenant, signal, family and version. Re-ingest or discard
      them; the retention version hold keeps them meanwhile;
@@ -2075,7 +2109,10 @@ The procedure, for family F from version N to N+1:
      `compat_epoch`, so `sys/compat` existed and was lost. Restore it from
      bucket versioning instead;
    - `RecordDiffers`: `sys/compat` exists and differs from the record
-     `init_compat` would write.
+     `init` would write.
+
+   A failed listing or GET, or a key under a census prefix that cannot be
+   addressed, exits 1; rerun once the store is reachable.
 4. **Roll out the release that introduces N+1** everywhere, with a plain
    rolling update. It writes N until step 6, so rolling back to the
    baseline is still safe.
@@ -2100,30 +2137,64 @@ The procedure, for family F from version N to N+1:
      writes is at a version the baseline reads, and once the older reader
      is retired such an object fails closed with a typed error.
 
-   The attestation flag `--pre-baseline-processes-terminated`, which the
-   activation is specified to require next to this deletion residual, does
-   not exist in this release: no shipped command takes it, and `activate`
-   checks only the writer-role attestation of step 6. Do this step
-   regardless.
-6. **Activate N+1** with `activate`, giving the family, the version, who
-   activates it, the alert-rule tenants, the clock-skew allowance, and the
-   attestation that every writer role can read `sys/compat` (step 1). It
-   raises the family's active version and the store-wide `compat_epoch`
-   together in one conditional write, retrying a lost race up to 8 times.
-   Then it walks every tenant: it fences each provisioning record at the
-   family's activation epoch and, for `rlog`, parks every discoverable
-   tenant's alert lease. It records `fence_complete_unix_ns` only after a
-   walk with no failure; a failed walk returns a cursor to resume from, and
-   calling `activate` again for a family whose walk is pending resumes that
-   walk instead of activating again. It refuses before any write with:
-   - `Unkeyed`: no file key is configured;
-   - `WriterRolesCannotReadCompat`: the writer-role attestation is absent;
-   - `RecordAbsent`: run step 3 first;
-   - `FamilyNotInRecord`: `sys/compat` has no entry for the family;
-   - `NotWritable`: this build does not write the requested version;
-   - `NotAboveActive` or `VersionJump`: the version is not exactly one above
-     the active version. No step lowers a version;
-   - `Contended`: every one of the 8 attempts lost the conditional write.
+   Step 6's `--pre-baseline-processes-terminated` flag is the attestation
+   that this step is done.
+6. **Activate N+1**:
+
+   ```sh
+   ravel-cli --tenant-hash-key-file <key> compat activate \
+     --family <family> --version <N+1> \
+     --pre-baseline-processes-terminated \
+     --activated-by <operator> --clock-skew-allowance 1m --json
+   ```
+
+   `--pre-baseline-processes-terminated` attests step 5, and without it the
+   command exits 2 before reading anything. The flag does not close the
+   residual ADR-4233 names for step 5: "The irreversible residual is a
+   pre-baseline maintain process deleting alert history, and audit
+   objects, by age with no version hold after an activation; no fence and
+   no pass detects a deletion, so the prerequisite is its only control."
+   The same flag also stands for step 1's attestation that every writer
+   role can read `sys/compat`; there is no separate flag for it. The
+   record's `activated_by` keeps the attestation as
+   `<operator>; attests: pre-baseline-processes-terminated`, where
+   `<operator>` is `--activated-by` (default `operator`). For `rlog`, give
+   `--alert-rule-tenant <tenant-hash-hex>` once for every tenant the alert
+   rules file names, so its lease is parked even before it holds an alert
+   key.
+
+   The command raises the family's active version and the store-wide
+   `compat_epoch` together in one conditional write, retrying a lost race
+   up to 8 times. Then it walks every tenant: it fences each provisioning
+   record at the family's activation epoch and, for `rlog`, parks every
+   discoverable tenant's alert lease. It records `fence_complete_unix_ns`
+   only after a walk with no failure. Exit codes:
+   - 0, `outcome` `activated`, `fence_walk.complete` `true`: done.
+   - 4, `fence_walk.complete` `false`: the version is active but the walk
+     stopped; `fence_walk.failure` says where. Fix the cause and rerun the
+     same command. A family whose walk is pending is resumed, not
+     activated again (`outcome` `resumed-pending-walk`), and the rerun
+     walks every tenant, counting the finished ones under
+     `buckets_already_fenced` and `leases_already_parked`. Do not
+     certify until a run exits 0: certify refuses `FenceWalkIncomplete`.
+   - 2, refused before any write: `Unkeyed` (no `--tenant-hash-key-file`),
+     the missing attestation flag, `RecordAbsent` (run step 3 first),
+     `FamilyNotInRecord` (`sys/compat` has no entry for the family),
+     `NotWritable` (this build does not write the requested version), or
+     `NotAboveActive` or `VersionJump` (the version is not exactly one
+     above the active version; no step lowers a version).
+   - 1: a store or `sys/compat` fault, or `Contended`, every one of the 8
+     attempts lost the conditional write. Rerun.
+
+   The JSON report carries `family`, `active_write_version`,
+   `stamp_ahead_of_clock_ns` and `fence_walk` (`tenants`,
+   `buckets_raised`, `buckets_already_fenced`, `buckets_unprovisioned`,
+   `leases_created`, `leases_replaced`, `leases_already_parked`,
+   `complete`, `fence_complete_unix_ns`, `failure`). A non-null
+   `stamp_ahead_of_clock_ns` means the activation was stamped further past
+   this host's clock than `--clock-skew-allowance`, because the process
+   that stamped the family's previous `fence_complete_unix_ns` ran on a
+   clock that far ahead. Find that clock before certifying.
 
    Writers pick the activation up on their next `sys/compat` read, within
    60 seconds, and a writer whose last successful read is 10 minutes old
@@ -2132,34 +2203,134 @@ The procedure, for family F from version N to N+1:
    writes; once an N+1 object exists, that rollback is a downgrade. See
    [Rollback versus downgrade](../../compatibility.md#rollback-versus-downgrade).
 7. **Migrate** the objects still at N. Retention ages some out at no cost.
-   Run `ravel-server --mode maintain --background-migrate` to walk every
-   owned tenant's metrics, logs and spans buckets toward the active version
-   under the policy, or see [Format migration](#format-migration) for
-   `ravel-cli maintain migrate`, its holds and its exit codes. That command
-   installs no `sys/compat` policy and writes this build's current version.
-   A held bucket blocks certification.
-8. **Certify** with `certify`, for `rseg`, `rlog` or `rspan` only. It
-   refuses to start its census before the activation plus `H + P + T_req`
-   and before every provisioned bucket's own fence time plus `G_pre`, each
-   plus the clock-skew allowance; `H` is 10 minutes and `G_pre` is
-   `3 h + 2 × max_flush_lifetime + P + T_req`. The census reads every live
-   member object's trailer and refuses on any member below N+1, any member
+   Start the migration by restarting the maintain processes with the flag
+   added, under the maintain credential:
+
+   ```sh
+   ravel-server --mode maintain --tenant-hash-key-file <key> --background-migrate ...
+   ```
+
+   The flag is off by default, has no environment variable, and the
+   process refuses to start with it outside `--mode maintain` or without
+   `--tenant-hash-key-file`. Each hourly tick of the compat maintenance
+   task, the first as soon as the process joins the maintain live set,
+   walks every owned tenant's provisioned metrics, logs and spans signals
+   toward the active version under the policy, 10,000 L0 records per
+   tenant and signal per tick, resuming from a cursor (see
+   [Compat maintenance units](#compat-maintenance-units)).
+   Watch the maintain process's log:
+   - `INFO` `background migrate: walked toward the active version`, with
+     `tenant`, `signal`, `family`, `active_version`, `buckets_examined`,
+     `buckets_migrated` and `records_migrated`: progress. A unit already
+     at the active version logs nothing, so the lines stop once every
+     unit is done.
+   - `WARN` `background migrate: walked with held buckets; the floor stays
+     unraised`, with `holds`: a held bucket blocks certification. The hold
+     reasons are under [Format migration](#format-migration).
+   - `WARN` `background migrate: refused by the compat policy`, with
+     `reason`.
+   - `WARN` `background migrate: unit failed; retried next tick` and
+     `background migrate: no unit ran this tick; retried next tick`.
+
+   Confirm the result per tenant with `ravel-cli maintain audit-versions
+   --tenant <t>` (see [Auditing live versions](#auditing-live-versions)).
+   Alternatively run `ravel-cli maintain migrate` under the Maintain
+   credential; see [Format migration](#format-migration) for its holds and
+   exit codes. That command installs no `sys/compat` policy and writes this
+   build's current version.
+8. **Certify**, for `rseg`, `rlog` or `rspan` only, once migration is
+   done:
+
+   ```sh
+   ravel-cli --tenant-hash-key-file <key> compat certify \
+     --family <family> --version <N+1> \
+     --max-flush-lifetime 1h --t-req 30s --clock-skew-allowance 1m \
+     [--budget-records <units>] --json
+   ```
+
+   It refuses to start its census before the activation plus
+   `H + P + T_req` and before every provisioned bucket's own fence time
+   plus `G_pre`, each plus the clock-skew allowance; `H` is 10 minutes and
+   `G_pre` is `3 h + 2 × max_flush_lifetime + P + T_req`.
+   `--max-flush-lifetime` (default `1h`) is raised to the value `sys/gc`
+   records when that is larger, and `--t-req` (default `30s`) is the store
+   request timeout. With the defaults and `P` of 1 hour, `G_pre` is
+   6 h 0 m 30 s, so the earliest certify is 6 h 1 m 30 s after the last
+   bucket was fenced. The census reads every live member object's trailer
+   and stops, writing no certificate, on any member below N+1, any member
    it cannot read, any trailer that disagrees with its record's stamp, and
-   any incomplete listing. It resumes from the cursor
+   any incomplete listing. `--budget-records` caps the `(tenant, signal, shard)` units one
+   run covers (unset is no cap); the next run resumes from the cursor
    `sys/maintain/certify/<family>/cursor`. On a clean census it writes the
-   certificate, sets the late-write watermark to the census start, and then
-   raises the format floors.
-9. **Verify late writes.** A `--mode maintain` process runs the late-write
-   pass for every certified family once a day, and the retired-reader
-   release starts only once the watermark is past the certified time. See
-   [Compat maintenance units](#compat-maintenance-units) for the pass and
-   its gauges. A late write below N+1 marks the certificate contradicted:
-   roll back to the release that reads both versions, migrate, and certify
-   again.
-10. **Retire** the N reader in a later release. That release starts only on
-    an uncontradicted certificate at or above N+1 with the watermark past
-    the certified time, and refuses a store that has `sys/tenancy` but no
-    `sys/compat` (see [Retired-reader startup gate](#retired-reader-startup-gate)).
+   certificate, sets the late-write watermark to the census start, raises
+   the format floors, and deletes the cursor. Exit codes, by `outcome`:
+   - 0, `certified`: the certificate is written. The report carries
+     `version`, `member_count`, `buckets_scanned` and
+     `newest_created_unix_ns`. Go to step 9.
+   - 3, `contradicted`: `member_key` is a live member at `found_version`,
+     below N+1. Migrate it (step 7) and certify again.
+   - 2, `held-member`: `member_key` is at a `version` this build cannot
+     read. Re-ingest or discard it.
+   - 4, `incomplete`: `--budget-records` stopped the run after
+     `units_examined` units. Rerun the same command.
+   - 4, `finalization-pending`: an earlier run wrote the certificate
+     (`version`, `certified_unix_ns`) but did not finish raising the
+     floors, and no late-write pass has run since (`watermark_unix_ns`).
+     The maintain process finishes the raises on its first tick after that
+     pass (step 9); a rerun after that pass finishes them too and exits 0.
+   - 2, refused: the reason is printed. The ones an operator meets are the
+     time gate (`now` and `not_before`, in Unix nanoseconds; rerun after
+     `not_before`), a bucket fenced too recently for its `G_pre`,
+     `FenceWalkIncomplete` (rerun `compat activate`), a bucket fenced below
+     the activation epoch, a tenant set that changed during the census, an
+     incomplete listing, a member absent, corrupt or whose trailer
+     disagrees with its stamp, `sys/compat` changed or replaced during the
+     run (rerun), another certify run holding the cursor, a family that
+     is not class A, and a family already certified at or above the
+     target.
+   - 1: a store or decode fault. Rerun; the cursor keeps the progress.
+9. **Verify late writes.** A `--mode maintain` process started with
+   `--tenant-hash-key-file` runs the late-write pass for every certified
+   family under the maintain credential: on its first tick after the
+   certificate, and then once a day. It needs no `--background-migrate`.
+   See [Compat maintenance units](#compat-maintenance-units) for the pass,
+   its log lines and its gauges. To run the pass now, or to read the
+   state:
+
+   ```sh
+   ravel-cli --tenant-hash-key-file <key> compat verify [--family <family>] \
+     --clock-skew-allowance 1m --json
+   ravel-cli --tenant-hash-key-file <key> compat status --json
+   ```
+
+   `verify` runs the pass for `--family`, or for every class-A family that
+   carries a certificate; a `--family` that is not `rseg`, `rlog` or
+   `rspan` runs no pass. It exits 3 when a pass found a late write or any
+   family is `contradicted`, and 0 otherwise. Its report adds
+   `late_write_passes`, one per family the pass ran for (`family`,
+   `examined`, `certified`, `certificate_replaced`, `watermark_unix_ns`,
+   and `late_writes`, each a `record_key` and `version`). `status` runs no
+   pass and exits 0. Both print, per family, `active_write_version`,
+   `activated_epoch`, `activated_unix_ns`, `activated_by`,
+   `fence_complete_unix_ns`, `contradicted`, `watermark_unix_ns`,
+   `finalization_pending` and `certificate` (`version`,
+   `certified_unix_ns`, `member_count`, `newest_created_unix_ns`,
+   `buckets_scanned`, or `null`), beside the record's
+   `baseline_release_major`, `baseline_release_minor`, `compat_epoch` and
+   `max_publish_lifetime_ns`. A store with no `sys/compat` prints
+   `outcome` `absent` and exits 0; an unkeyed run exits 2, and a fault
+   exits 1. `finalization_pending` is `true` from the certify run until
+   the first late-write pass after it, while the watermark is below
+   `certificate.certified_unix_ns`.
+
+   A late write below N+1 marks the certificate contradicted: roll back to
+   the release that reads both versions, migrate, and certify again.
+10. **Retire** the N reader in a later release, once `compat status`
+    shows the family with `contradicted` `false`, `certificate.version` at
+    or above N+1 and `watermark_unix_ns` greater than
+    `certificate.certified_unix_ns`. That release starts only on that
+    state, and refuses a store that has `sys/tenancy` but no `sys/compat`
+    (see [Retired-reader startup gate](#retired-reader-startup-gate)).
     Rolling back from it to the release that reads both versions is safe.
 
 ### A writer below a recorded format floor
