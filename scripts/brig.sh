@@ -13,7 +13,9 @@
 #   brig.sh path NAME             print the clone's path
 #
 # Sandbox clones live in $RAVEL_BRIG_CLONES, by default a store-brig
-# directory beside the primary checkout.
+# directory beside the primary checkout. new, run, shell and update refuse
+# when the disk is short or another Ravel sandbox is running: see need_disk
+# and need_alone below for the limits and the variables that lift them.
 set -eu
 
 BRIG=${BRIG:-brig}
@@ -69,11 +71,39 @@ need_clone() {
     fail "$dir is not a sandbox clone"
 }
 
-warn_disk() {
-  free_gb=$(df -Pk "$1" | awk 'NR == 2 { print int($4 / 1048576) }')
-  if [ -n "$free_gb" ] && [ "$free_gb" -lt 70 ]; then
-    echo "brig: $free_gb GB free under $1. A cold build in the sandbox writes 54 GB or more to the clone's target/brig/." >&2
-  fi
+# Each clone builds into its own target/brig/ on the host disk, and nothing is
+# shared between clones. A cold build writes 54 to 70 GB, and a full disk
+# stops every session on the host, not only the sandbox. So a clone with no
+# build yet needs RAVEL_BRIG_MIN_FREE_GB free, and one that has built needs
+# RAVEL_BRIG_WARM_FREE_GB for what it adds.
+min_free_gb=${RAVEL_BRIG_MIN_FREE_GB:-70}
+warm_free_gb=${RAVEL_BRIG_WARM_FREE_GB:-20}
+
+need_disk() { # need_disk DIR GB WHAT
+  free_gb=$(df -Pk "$1" 2> /dev/null | awk 'NR == 2 { print int($4 / 1048576) }')
+  [ -n "$free_gb" ] || fail "could not read the free space under $1"
+  [ "$free_gb" -ge "$2" ] && return 0
+  fail "$free_gb GB free under $1, and $3 needs $2 GB. Each clone builds into its own target/brig/, and a cold build writes 54 to 70 GB. Remove the clones of merged tickets (make brig-rm NAME=<name>, then delete $clones/<name>), or set RAVEL_BRIG_MIN_FREE_GB and RAVEL_BRIG_WARM_FREE_GB to run anyway."
+}
+
+# One Ravel sandbox runs at a time: each takes 8 vCPUs and 12 GB of memory,
+# and each builds into its own target/brig/. "Could not check" refuses too.
+need_alone() {
+  [ "${RAVEL_BRIG_ALLOW_PARALLEL:-}" = 1 ] && return 0
+  command -v jq > /dev/null 2>&1 ||
+    fail "jq is needed to check for another running Ravel sandbox. Install it, or set RAVEL_BRIG_ALLOW_PARALLEL=1."
+  listing=$("$BRIG" --json ls) ||
+    fail "could not list sandboxes with brig --json ls, so could not check for another running Ravel sandbox. Set RAVEL_BRIG_ALLOW_PARALLEL=1 to skip the check."
+  real_clones=$(cd "$clones" && pwd -P)
+  real_dir=$(cd "$dir" && pwd -P)
+  others=$(printf '%s\n' "$listing" | jq -r --arg c "$clones/" --arg rc "$real_clones/" --arg me "$dir" --arg rme "$real_dir" '
+    .data.sandboxes[]
+    | select(.state == "running")
+    | .project.root // empty
+    | select((startswith($c) or startswith($rc)) and . != $me and . != $rme)') ||
+    fail "could not read the output of brig --json ls. Set RAVEL_BRIG_ALLOW_PARALLEL=1 to skip the check."
+  [ -z "$others" ] && return 0
+  fail "another Ravel sandbox is running: $others. Run one at a time: each takes 8 vCPUs, 12 GB of memory and its own target/brig/. Stop it with make brig-stop NAME=<name>, or set RAVEL_BRIG_ALLOW_PARALLEL=1."
 }
 
 cmd=${1:-}
@@ -90,13 +120,14 @@ case $cmd in
     [ ! -e "$dir" ] || fail "$dir already exists"
     url=$(git -C "$here" remote get-url origin)
     mkdir -p "$clones"
+    need_disk "$clones" "$min_free_gb" "a new clone's first build"
     # Objects come from the primary's store and are then copied, so the
     # clone shares nothing with it and the guest cannot reach it.
     git clone --quiet --reference-if-able "$common" --dissociate --no-checkout "$url" "$dir"
     git -C "$dir" switch --quiet -c "$1" origin/main
     git -C "$dir" config ravel.sandboxCheckout true
     echo "brig: sandbox clone $dir on branch $1. Start it with: make brig NAME=$1" >&2
-    warn_disk "$clones"
+    echo "brig: its first build writes 54 to 70 GB to $dir/target/brig/. When the ticket merges, run make brig-rm NAME=$1 and delete $dir." >&2
     exit 0
     ;;
   path)
@@ -124,6 +155,19 @@ brigfile="$dir/Brigfile"
 image_flag=
 if [ -n "${IMAGE:-}" ]; then image_flag="--image=$IMAGE"; fi
 
+# Checked before update removes anything, so a refused update leaves the
+# sandbox as it was.
+case $cmd in
+  run | shell | update)
+    if [ -d "$dir/target/brig" ]; then
+      need_disk "$dir" "$warm_free_gb" "a build in a clone that has built before"
+    else
+      need_disk "$dir" "$min_free_gb" "a clone's first build"
+    fi
+    need_alone
+    ;;
+esac
+
 case $cmd in
   plan)
     exec "$BRIG" plan --target "$target" -f "$brigfile" ${image_flag:+"$image_flag"}
@@ -149,7 +193,6 @@ case $cmd in
   *) usage ;;
 esac
 
-warn_disk "$dir"
 case $cmd in
   shell) set -- -- scripts/brig-dev.sh --shell "$@" ;;
   # With no Claude arguments, the target's own args, so the approval of a

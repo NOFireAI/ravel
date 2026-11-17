@@ -20,8 +20,9 @@ bad() { printf 'FAIL  %-52s %s\n' "$1" "$2"; fails=$((fails + 1)); }
 git_q() { git -c init.defaultBranch=main -c user.email=t@example.test -c user.name=t "$@" >/dev/null 2>&1; }
 
 # The stub: `run --help` lists --target unless STUB_OLD is set, `rm` exits
-# with STUB_RM_EXIT, and every call appends its arguments and the
-# environment brig.sh sets to STUB_LOG.
+# with STUB_RM_EXIT, `--json ls` prints STUB_LS (an empty list by default) or
+# fails when STUB_LS_FAIL is set, and every call appends its arguments and
+# the environment brig.sh sets to STUB_LOG.
 stub="${TMP}/bin/brig"
 mkdir -p "${TMP}/bin"
 cat > "${stub}" <<'EOF'
@@ -31,6 +32,13 @@ case "$1 ${2:-}" in
   'version '*) echo "brig v0.0.0-stub" ;;
   'run --help') [ -n "${STUB_OLD:-}" ] || echo '  --target string' ;;
   'rm '*) exit "${STUB_RM_EXIT:-0}" ;;
+  '--json ls')
+    [ -z "${STUB_LS_FAIL:-}" ] || exit 1
+    if [ -n "${STUB_LS:-}" ]; then
+      printf '%s\n' "$STUB_LS"
+    else
+      echo '{"data":{"sandboxes":[]}}'
+    fi ;;
 esac
 exit 0
 EOF
@@ -51,10 +59,14 @@ clones="${TMP}/clones"
 log="${TMP}/stub.log"
 
 # brig_sh <args...>: runs the host's copy; sets $code, $out (stdout+stderr).
+# The disk floors default to 0 so the cases run on any runner; the disk
+# cases set them.
 brig_sh() {
   : > "${log}"
   out=$(cd "${host}" && env -u BRIG_HYPERVISOR -u BRIG_PULL \
     BRIG="${stub}" RAVEL_BRIG_CLONES="${clones}" STUB_LOG="${log}" \
+    RAVEL_BRIG_MIN_FREE_GB="${RAVEL_BRIG_MIN_FREE_GB:-0}" \
+    RAVEL_BRIG_WARM_FREE_GB="${RAVEL_BRIG_WARM_FREE_GB:-0}" \
     scripts/brig.sh "$@" 2>&1)
   code=$?
 }
@@ -127,6 +139,47 @@ expect_log "update pulls again" "pull=always"
 STUB_RM_EXIT=5 brig_sh update t1
 expect_code "update stops on a failed rm" 5
 expect_no_log "nothing runs after a failed rm" "run --target"
+
+# --- the disk floor ----------------------------------------------------------
+huge=99999999
+RAVEL_BRIG_MIN_FREE_GB=${huge} brig_sh new t2
+expect_code "new refuses when the disk is short" 1
+expect_out "the disk refusal names the floor" "needs ${huge} GB"
+if [[ ! -e "${clones}/t2" ]]; then ok "a refused new makes no clone"; else bad "a refused new makes no clone" "${clones}/t2 exists"; fi
+RAVEL_BRIG_MIN_FREE_GB=${huge} brig_sh run t1
+expect_code "a cold clone needs the cold floor" 1
+expect_no_log "nothing runs when the disk is short" "run --target"
+RAVEL_BRIG_MIN_FREE_GB=${huge} STUB_RM_EXIT=0 brig_sh update t1
+expect_code "update refuses before it removes anything" 1
+expect_no_log "a refused update removes nothing" "rm --target"
+mkdir -p "${clone}/target/brig"
+RAVEL_BRIG_MIN_FREE_GB=${huge} brig_sh run t1
+expect_code "a clone that has built needs the warm floor only" 0
+RAVEL_BRIG_WARM_FREE_GB=${huge} brig_sh shell t1
+expect_code "the warm floor refuses too" 1
+rmdir "${clone}/target/brig" "${clone}/target"
+brig_sh plan t1;        expect_code "plan has no disk floor" 0
+
+# --- one Ravel sandbox at a time ---------------------------------------------
+ls_json() { # ls_json STATE ROOT
+  printf '{"data":{"sandboxes":[{"sandbox":"s","state":"%s","project":{"recorded":true,"target":"dev","root":"%s"}}]}}' "$1" "$2"
+}
+STUB_LS=$(ls_json running "${clones}/other") brig_sh run t1
+expect_code "another running Ravel sandbox refuses" 1
+expect_out "the refusal names it" "${clones}/other"
+expect_no_log "nothing runs beside another Ravel sandbox" "run --target"
+STUB_LS=$(ls_json running "${clones}/other") RAVEL_BRIG_ALLOW_PARALLEL=1 brig_sh run t1
+expect_code "RAVEL_BRIG_ALLOW_PARALLEL=1 lifts it" 0
+STUB_LS=$(ls_json stopped "${clones}/other") brig_sh run t1
+expect_code "a stopped Ravel sandbox does not count" 0
+STUB_LS=$(ls_json running "${clone}") brig_sh run t1
+expect_code "this clone's own sandbox does not count" 0
+STUB_LS=$(ls_json running "${TMP}/elsewhere/project") brig_sh run t1
+expect_code "a sandbox of another project does not count" 0
+STUB_LS_FAIL=1 brig_sh run t1
+expect_code "a failed listing refuses" 1
+expect_out "the listing refusal says it could not check" "could not list sandboxes"
+brig_sh stop t1;        expect_code "stop has no sandbox check" 0
 
 # --- the trust boundary ------------------------------------------------------
 mkdir -p "${clone}/scripts"
