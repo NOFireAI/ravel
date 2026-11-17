@@ -365,10 +365,6 @@ jobs:
       # itself runs only in k8s-nightly.yml's agents-chaos job.
       - name: Agents chaos assertion cases (issue #3363)
         run: bash scripts/chaos/agents-replace-worker.test.sh
-      # The released-binary fence drill's decision logic on recorded key
-      # lists; the drill itself needs the v0.33.0 assets and runs by hand.
-      - name: Released-binary fence drill decision cases (issue #4243)
-        run: bash scripts/compat/released-binary-drill.test.sh
       # Documentation gate (ADR-1040 D3). Run UNPIPED: a pipeline's exit code is
       # the last stage's, so a real failure piped through tail/grep would report
       # as a pass. No cargo toolchain, matching this job.
@@ -1071,6 +1067,40 @@ jobs:
       # without it, which is the configuration that ships.
       - name: Clippy (ravel-ingest, shipping features)
         run: cargo clippy --locked -p ravel-ingest --all-targets -- -D warnings
+
+  # The compatibility drills of ADR-4233 decision 9. crates/ravel-compat-tests
+  # is excluded from the workspace so the format-drill window never reaches a
+  # workspace build, which also means no other job compiles, lints or tests
+  # it. The released-binary fence drill needs the v0.33.0 assets and runs by
+  # hand; its decision logic runs here on recorded key lists. No `if:` and no
+  # `needs:`, so the job reports on every pull request and merge-queue entry
+  # and can be a required check.
+  compat-tests:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    # 20m (provisional): not a measurement; the crate builds a slice of the
+    # workspace (ravel-maintain and its dependencies) in its own target dir.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: "Released-binary fence drill decision cases (issue #4243)"
+        run: bash scripts/compat/released-binary-drill.test.sh
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main, as in `lint` (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: crates/ravel-compat-tests -> target
+      - name: Format (ravel-compat-tests)
+        run: cargo fmt --manifest-path crates/ravel-compat-tests/Cargo.toml --check
+      - name: Clippy (ravel-compat-tests)
+        run: cargo clippy --color never --locked --manifest-path crates/ravel-compat-tests/Cargo.toml --all-targets -- -D warnings
+      - name: Test (ravel-compat-tests)
+        run: cargo test --color never --locked --manifest-path crates/ravel-compat-tests/Cargo.toml
 
   # The workspace test run, split across four runners (issue #2518). The test
   # phase is CPU-bound: 9,483 tests summed to 2,374 CPU-seconds and took 641 s
