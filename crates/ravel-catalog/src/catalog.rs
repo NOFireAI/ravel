@@ -4563,6 +4563,11 @@ impl Catalog {
                     let bytes = got.data.len() as u64;
                     let record = record::decode(&got.data)?;
                     validate_expected_fields(self, &record, tenant, signal, token.shard, &key)?;
+                    ravel_invariant::inv_always!(
+                        record::token_for(&record).is_ok_and(|stored| stored == *token),
+                        "commit: a commit token never resolves to a stale answer",
+                        token_answer_details(tenant, signal, token, "served")
+                    );
                     let record = Arc::new(record);
                     self.cache.insert(
                         *tenant,
@@ -4636,6 +4641,11 @@ impl Catalog {
             out.entry(segment_ref.data_object_key.clone())
                 .or_insert(segment_ref);
         }
+        ravel_invariant::inv_always!(
+            self.token_rows_served(tenant, signal, token, out).await,
+            "commit: a commit token never resolves to a stale answer",
+            token_answer_details(tenant, signal, token, "present record")
+        );
         Ok(())
     }
 
@@ -4818,6 +4828,11 @@ impl Catalog {
             .await?
         else {
             // Satisfied with zero segments (ADR-0019 decision 3).
+            ravel_invariant::inv_always!(
+                self.token_record_absent(tenant, signal, token, false).await,
+                "commit: a commit token never resolves to a stale answer",
+                token_answer_details(tenant, signal, token, "tombstoned")
+            );
             return Ok(());
         };
         let token_identity = token_identity(token);
@@ -4841,6 +4856,11 @@ impl Catalog {
                 continue;
             }
             if names_input(&record.inputs, &token_identity) {
+                ravel_invariant::inv_always!(
+                    self.token_record_absent(tenant, signal, token, false).await,
+                    "commit: a commit token never resolves to a stale answer",
+                    token_answer_details(tenant, signal, token, "superseded by compaction")
+                );
                 for part in &record.parts {
                     let segment_ref = build_l1_segment_ref(record, part, ckey)?;
                     if !out.contains_key(&segment_ref.data_object_key) {
@@ -4863,6 +4883,11 @@ impl Catalog {
         if let Some((rkey, record)) =
             bucket.live_rewrite_naming(&superseded_records, &token_identity)?
         {
+            ravel_invariant::inv_always!(
+                self.token_record_absent(tenant, signal, token, false).await,
+                "commit: a commit token never resolves to a stale answer",
+                token_answer_details(tenant, signal, token, "superseded by rewrite")
+            );
             for part in &record.parts {
                 let segment_ref = build_rewrite_l1_segment_ref(record, part, rkey)?;
                 if !out.contains_key(&segment_ref.data_object_key) {
@@ -4877,7 +4902,188 @@ impl Catalog {
             return Ok(());
         }
 
+        ravel_invariant::inv_always!(
+            self.token_record_absent(tenant, signal, token, true).await,
+            "commit: a commit token never resolves to a stale answer",
+            token_answer_details(tenant, signal, token, "unsatisfiable")
+        );
         Err(unsatisfiable_token(token))
+    }
+
+    /// Whether the commit record `token` names is absent from the store,
+    /// and, with `nor_tombstone`, its bucket's retention tombstone too: what
+    /// a tombstoned, superseded or unsatisfiable answer for a token whose
+    /// record was not found claims. Raw HEADs, outside the query's
+    /// accounting; a read error other than NotFound is no evidence of
+    /// presence and passes. Only an invariant condition calls this, and the
+    /// default build compiles it out.
+    #[allow(dead_code)]
+    async fn token_record_absent(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        token: &CommitToken,
+        nor_tombstone: bool,
+    ) -> bool {
+        let Ok(commit_key) = keys::commit_key_for_token(tenant, signal, token) else {
+            return false;
+        };
+        if self.store.head(&commit_key).await.is_ok() {
+            return false;
+        }
+        if !nor_tombstone {
+            return true;
+        }
+        let Ok(tombstone_key) =
+            keys::retention_tombstone_key(tenant, signal, token.shard, token.ingest_hour_bucket)
+        else {
+            return false;
+        };
+        self.store.head(&tombstone_key).await.is_err()
+    }
+
+    /// Whether `out` serves the rows of a token whose commit record is
+    /// present, once the token step has run for it: `out` holds the token's
+    /// own level-0 object, or the bucket's fresh reads
+    /// ([`token_rows_served_in_bucket`](Self::token_rows_served_in_bucket))
+    /// show the rows served or the step's evidence gone. Those reads race
+    /// [`EVIDENCE_HEAD_TIMEOUT`](ravel_commit::publish::EVIDENCE_HEAD_TIMEOUT)
+    /// and pass on expiry: a slow store is no evidence of a stale answer.
+    /// Only an invariant condition calls this, and the default build compiles
+    /// it out.
+    #[allow(dead_code)]
+    async fn token_rows_served(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        token: &CommitToken,
+        out: &HashMap<String, SegmentRef>,
+    ) -> bool {
+        let own_object = out.values().any(|segment| {
+            segment.level == SegmentLevel::L0
+                && segment.shard == token.shard
+                && segment.ingest_hour_bucket == token.ingest_hour_bucket
+                && segment.writer_id == token.writer_id
+                && segment.writer_epoch == token.epoch
+                && segment.writer_seq == token.seq
+        });
+        if own_object {
+            return true;
+        }
+        tokio::time::timeout(
+            ravel_commit::publish::EVIDENCE_HEAD_TIMEOUT,
+            self.token_rows_served_in_bucket(tenant, signal, token, out),
+        )
+        .await
+        .unwrap_or(true)
+    }
+
+    /// The bucket half of [`token_rows_served`](Self::token_rows_served),
+    /// from one fresh LIST of the token's bucket and a GET of each
+    /// compaction and rewrite record in it, read raw from the store outside
+    /// the query's accounting and its record caches. It holds when the bucket
+    /// is tombstoned and serves no rows, or a compaction or rewrite record
+    /// whose inputs (a rewrite's effective inputs) name the token has an
+    /// output part in `out` or has no parts at all (an erasure that removed
+    /// every row). A sweep may have deleted what the step decided from
+    /// since, so it also holds when the token's own commit record is no
+    /// longer listed (retention deletes the tombstone last, once the bucket
+    /// is empty), when a listed record is gone by its GET, and when a
+    /// rewrite's chain ends at a predecessor no longer listed. A read or
+    /// decode error is no evidence of a stale answer and passes.
+    #[allow(dead_code)]
+    async fn token_rows_served_in_bucket(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        token: &CommitToken,
+        out: &HashMap<String, SegmentRef>,
+    ) -> bool {
+        let Ok(prefix) =
+            keys::commit_shard_hour_prefix(tenant, signal, token.shard, token.ingest_hour_bucket)
+        else {
+            return false;
+        };
+        let Ok(commit_key) = keys::commit_key_for_token(tenant, signal, token) else {
+            return false;
+        };
+        let Ok(objects) = ravel_object_store::list_all(self.store.as_ref(), &prefix).await else {
+            return true;
+        };
+        let mut bucket = TokenBucketRecords {
+            prefix,
+            compaction_records: Vec::new(),
+            rewrite_records: Vec::new(),
+        };
+        let mut own_record_listed = false;
+        for meta in objects {
+            let is_compaction = match keys::partition_bucket_entry(&meta.key) {
+                Ok(BucketEntry::Tombstone(_)) => return true,
+                Ok(BucketEntry::CompactionRecord(_)) => true,
+                Ok(BucketEntry::RewriteRecord(_)) => false,
+                Ok(BucketEntry::CommitRecord(_)) => {
+                    own_record_listed |= meta.key == commit_key;
+                    continue;
+                }
+                Err(_) => return true,
+            };
+            let Ok(got) = self.store.get(&meta.key, GetRange::Full).await else {
+                return true;
+            };
+            let data = got.data;
+            if is_compaction {
+                let Ok(record) = record::decode_compaction(data.as_ref()) else {
+                    return true;
+                };
+                bucket.compaction_records.push((meta.key, Arc::new(record)));
+            } else {
+                let Ok(record) = erasure::decode_rewrite(data.as_ref()) else {
+                    return true;
+                };
+                bucket.rewrite_records.push((meta.key, Arc::new(record)));
+            }
+        }
+        if !own_record_listed {
+            return true;
+        }
+        let identity = token_identity(token);
+        let held =
+            |key: Result<String, keys::KeyError>| key.is_ok_and(|key| out.contains_key(&key));
+        for (_, record) in &bucket.compaction_records {
+            if names_input(&record.inputs, &identity)
+                && (record.parts.is_empty()
+                    || record
+                        .parts
+                        .iter()
+                        .any(|part| held(keys::reconstruct_l1_part_key(record, part))))
+            {
+                return true;
+            }
+        }
+        let listed: HashSet<&str> = bucket
+            .compaction_records
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .chain(bucket.rewrite_records.iter().map(|(key, _)| key.as_str()))
+            .collect();
+        for (rkey, record) in &bucket.rewrite_records {
+            let Ok((effective_inputs, chain)) = bucket.rewrite_chain(rkey, record) else {
+                return true;
+            };
+            if chain.iter().any(|key| !listed.contains(key.as_str())) {
+                return true;
+            }
+            if effective_inputs.contains(&identity)
+                && (record.parts.is_empty()
+                    || record
+                        .parts
+                        .iter()
+                        .any(|part| held(keys::reconstruct_rewrite_part_key(record, part))))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// `pub(crate)`: also called by `fold` to load and validate commit records found by bucket
@@ -5194,6 +5400,25 @@ fn names_input(inputs: &[CompactionInputIdentity], identity: &(String, u64, u64)
             && input.writer_epoch == identity.1
             && input.writer_seq == identity.2
     })
+}
+
+/// Details of a TokenNeverServesStale evaluation; only an invariant
+/// assertion reads them.
+#[allow(dead_code)]
+fn token_answer_details(
+    tenant: &TenantHash,
+    signal: Signal,
+    token: &CommitToken,
+    answer: &str,
+) -> std::collections::BTreeMap<&'static str, String> {
+    std::collections::BTreeMap::from([
+        (
+            "commit_key",
+            keys::commit_key_for_token(tenant, signal, token).unwrap_or_default(),
+        ),
+        ("token", token.encode()),
+        ("answer", answer.to_owned()),
+    ])
 }
 
 fn unsatisfiable_token(token: &CommitToken) -> CatalogError {
@@ -9981,6 +10206,830 @@ mod tests {
             .await
             .expect("tombstoned token is satisfied, not unsatisfiable");
         assert!(snapshot.segments.is_empty(), "satisfied with zero segments");
+    }
+
+    /// `(condition, details)` of every captured TokenNeverServesStale
+    /// evaluation whose details mention `needle`, or `None` outside the
+    /// invariants lane. This crate forwards no `ravel-invariant/capture`
+    /// feature, so the gate is an assertion macro, whose condition runs only
+    /// when ravel-invariant records evaluations.
+    fn token_answers(needle: &str) -> Option<Vec<(bool, String)>> {
+        let found = std::cell::RefCell::new(None);
+        let _ = needle;
+        ravel_invariant::inv_sometimes!(
+            {
+                *found.borrow_mut() = Some(
+                    ravel_invariant::capture::evaluations_of(
+                        "commit: a commit token never resolves to a stale answer",
+                    )
+                    .into_iter()
+                    .filter(|e| e.details.contains(needle))
+                    .map(|e| (e.condition, e.details))
+                    .collect(),
+                );
+                true
+            },
+            "ravel-catalog test: evaluations are read",
+            ""
+        );
+        found.into_inner()
+    }
+
+    /// Asserts `evaluations` are exactly one holding evaluation per answer in
+    /// `answers`, in that order.
+    fn assert_answers_hold(evaluations: &[(bool, String)], answers: &[&str]) {
+        assert_eq!(evaluations.len(), answers.len(), "{evaluations:?}");
+        for ((condition, details), answer) in evaluations.iter().zip(answers) {
+            assert!(*condition, "{answer}: {evaluations:?}");
+            assert!(
+                details.contains(&format!("\"{answer}\"")),
+                "{answer}: {evaluations:?}"
+            );
+        }
+    }
+
+    /// TokenNeverServesStale is evaluated on the served, tombstoned and
+    /// unsatisfiable answers of the exact-token path and holds on each. A
+    /// served token is evaluated twice: on its record at the probe, and on
+    /// the snapshot once the token step has included it.
+    #[tokio::test]
+    async fn token_never_serves_stale_is_evaluated_on_resolve() {
+        if token_answers("").is_none() {
+            return;
+        }
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
+        let range = TimeRange {
+            start_ns: now - NS_PER_HOUR,
+            end_ns: now,
+        };
+        let resolve = |token: CommitToken| {
+            let catalog = &catalog;
+            async move {
+                catalog
+                    .resolve(&tenant(), Signal::Metrics, range, &[token], now)
+                    .await
+            }
+        };
+        let skewed = |bucket: u32| i64::from(bucket) * NS_PER_HOUR + 10 * 60_000_000_000;
+
+        let served_bucket = 500_000 - 10;
+        let served = publish_segment(
+            &store,
+            0,
+            1,
+            served_bucket,
+            skewed(served_bucket),
+            skewed(served_bucket),
+            skewed(served_bucket) + 1_000,
+        )
+        .await;
+        let served_token = record::token_for(&served).expect("token");
+        let snapshot = resolve(served_token.clone()).await.expect("served");
+        assert_eq!(snapshot.segments.len(), 1);
+
+        let tombstoned_bucket = 500_000 - 11;
+        let tombstoned = publish_segment(
+            &store,
+            0,
+            1,
+            tombstoned_bucket,
+            skewed(tombstoned_bucket),
+            skewed(tombstoned_bucket),
+            skewed(tombstoned_bucket) + 1_000,
+        )
+        .await;
+        let tombstoned_token = record::token_for(&tombstoned).expect("token");
+        write_tombstone(&store, 0, tombstoned_bucket).await;
+        store
+            .delete(
+                &keys::commit_key_for_token(&tenant(), Signal::Metrics, &tombstoned_token)
+                    .expect("commit key"),
+            )
+            .await
+            .expect("delete commit record");
+        let snapshot = resolve(tombstoned_token.clone()).await.expect("tombstoned");
+        assert!(snapshot.segments.is_empty());
+
+        let missing_token = CommitToken {
+            shard: 0,
+            writer_id: Uuid::new_v4(),
+            epoch: 1,
+            seq: 1,
+            ingest_hour_bucket: 500_000 - 12,
+        };
+        let err = resolve(missing_token.clone())
+            .await
+            .expect_err("unsatisfiable");
+        assert!(matches!(err, CatalogError::UnsatisfiableToken { .. }));
+
+        for (token, answers) in [
+            (&served_token, &["served", "present record"][..]),
+            (&tombstoned_token, &["tombstoned"][..]),
+            (&missing_token, &["unsatisfiable"][..]),
+        ] {
+            let evaluations = token_answers(&token.encode()).expect("capturing");
+            assert_answers_hold(&evaluations, answers);
+        }
+    }
+
+    /// The unsatisfiable answer's evidence is the store, not the GETs that
+    /// produced the answer: two NotFound blips over a present record make
+    /// the resolve answer unsatisfiable, and the property's HEAD finds the
+    /// record.
+    #[tokio::test]
+    async fn token_never_serves_stale_reads_the_store_behind_an_unsatisfiable_answer() {
+        if token_answers("").is_none() {
+            return;
+        }
+        let inner = MemoryStore::new();
+        let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
+        let range = TimeRange {
+            start_ns: now - NS_PER_HOUR,
+            end_ns: now,
+        };
+        let skewed_bucket = 500_000 - 10;
+        let skewed_created = i64::from(skewed_bucket) * NS_PER_HOUR + 10 * 60_000_000_000;
+        let record = publish_segment(
+            &inner,
+            0,
+            1,
+            skewed_bucket,
+            skewed_created,
+            skewed_created,
+            skewed_created + 1_000,
+        )
+        .await;
+        let token = record::token_for(&record).expect("token");
+        let key = keys::commit_key_for_token(&tenant(), Signal::Metrics, &token).expect("key");
+        let plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Get)
+                .with_key_contains(key)
+                .then_fault(ScriptedFault::NotFoundBlip)
+                .then_fault(ScriptedFault::NotFoundBlip),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let err = catalog
+            .resolve(
+                &tenant(),
+                Signal::Metrics,
+                range,
+                std::slice::from_ref(&token),
+                now,
+            )
+            .await
+            .expect_err("two NotFound probes surface UnsatisfiableToken");
+        assert!(matches!(err, CatalogError::UnsatisfiableToken { .. }));
+        assert_eq!(store.fault_count(Op::Get, FaultKind::NotFoundBlip), 2);
+
+        let evaluations = token_answers(&token.encode()).expect("capturing");
+        assert_eq!(evaluations.len(), 1, "{evaluations:?}");
+        assert!(!evaluations[0].0, "{evaluations:?}");
+        assert!(
+            evaluations[0].1.contains("\"unsatisfiable\""),
+            "{evaluations:?}"
+        );
+    }
+
+    /// A logs flush L, its commit record still present, and a compaction
+    /// record of L's bucket naming L (plus `other_inputs`) with one part, in
+    /// the current hour so a resolve lists the bucket. Returns L and the
+    /// part's key.
+    async fn present_compacted_logs_token(
+        store: &MemoryStore,
+        names_l: bool,
+    ) -> (CommitRecord, String) {
+        let hour = 500_000;
+        let start = i64::from(hour) * NS_PER_HOUR;
+        let l = publish_segment_for(
+            store,
+            Signal::Logs,
+            0,
+            1,
+            hour,
+            start + 1_000,
+            start + 1_000,
+            start + 2_000,
+        )
+        .await;
+        let other = publish_segment_for(
+            store,
+            Signal::Logs,
+            0,
+            2,
+            hour,
+            start + 1_000,
+            start + 1_000,
+            start + 2_000,
+        )
+        .await;
+        let identity = |record: &CommitRecord| ravel_proto::commit::v1::CompactionInputIdentity {
+            writer_id: record.writer_id.clone(),
+            writer_epoch: record.writer_epoch,
+            writer_seq: record.writer_seq,
+        };
+        let inputs = if names_l {
+            vec![identity(&l), identity(&other)]
+        } else {
+            vec![identity(&other)]
+        };
+        let compaction = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Logs) as i32,
+            shard: 0,
+            ingest_hour_bucket: hour,
+            level: 1,
+            inputs,
+            input_set_hash: vec![0x3c; 32],
+            parts: vec![present_compacted_logs_part()],
+            created_unix_ns: start + 3_000,
+            superseded_record_key: String::new(),
+        };
+        let compaction_key = keys::compaction_record_key_for(&compaction).expect("key");
+        store
+            .put(
+                &compaction_key,
+                compaction.encode_to_vec().into(),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put compaction record");
+        let part_key =
+            keys::reconstruct_l1_part_key(&compaction, &compaction.parts[0]).expect("part key");
+        (l, part_key)
+    }
+
+    /// TokenNeverServesStale holds for a token whose commit record is present
+    /// and whose rows a compaction part serves (issue #4418): the snapshot
+    /// holds the part and not the token's own object, and the property
+    /// evaluated on the present-record answer finds the part covering it.
+    /// The listing cached L's record, so the probe reads no record and the
+    /// present-record answer is the only evaluation.
+    #[tokio::test]
+    async fn token_never_serves_stale_holds_for_a_compacted_present_token() {
+        if token_answers("").is_none() {
+            return;
+        }
+        let store = Arc::new(MemoryStore::new());
+        let (l, part_key) = present_compacted_logs_token(&store, true).await;
+        let token = record::token_for(&l).expect("token");
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let start = 500_000 * NS_PER_HOUR;
+        let snapshot = catalog
+            .resolve(
+                &tenant(),
+                Signal::Logs,
+                TimeRange {
+                    start_ns: start,
+                    end_ns: start + NS_PER_HOUR,
+                },
+                std::slice::from_ref(&token),
+                start + 30 * 60_000_000_000,
+            )
+            .await
+            .expect("resolve");
+        let keys: Vec<&str> = snapshot
+            .segments
+            .iter()
+            .map(|s| s.data_object_key.as_str())
+            .collect();
+        assert_eq!(keys, vec![part_key.as_str()], "the part alone serves L");
+
+        let evaluations = token_answers(&token.encode()).expect("capturing");
+        assert_answers_hold(&evaluations, &["present record"]);
+    }
+
+    /// The present-record predicate is false on a snapshot that serves the
+    /// token's rows from nowhere: it holds the token's own object, or a part
+    /// of a record naming the token, or the bucket is tombstoned, and nothing
+    /// else satisfies it.
+    #[tokio::test]
+    async fn token_rows_served_is_false_without_the_object_or_a_covering_part() {
+        let start = 500_000 * NS_PER_HOUR;
+        let range = TimeRange {
+            start_ns: start,
+            end_ns: start + NS_PER_HOUR,
+        };
+        let now = start + 30 * 60_000_000_000;
+        let store = Arc::new(MemoryStore::new());
+        let (l, part_key) = present_compacted_logs_token(&store, true).await;
+        let token = record::token_for(&l).expect("token");
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let part = catalog
+            .resolve(&tenant(), Signal::Logs, range, &[], now)
+            .await
+            .expect("resolve")
+            .segments
+            .into_iter()
+            .find(|s| s.data_object_key == part_key)
+            .expect("the listing serves the part");
+        let snapshot_of = |key: &str, level: SegmentLevel| {
+            HashMap::from([(
+                key.to_owned(),
+                SegmentRef {
+                    data_object_key: key.to_owned(),
+                    level,
+                    writer_id: token.writer_id,
+                    writer_epoch: token.epoch,
+                    writer_seq: token.seq,
+                    ..part.clone()
+                },
+            )])
+        };
+        let l1 = part.level.clone();
+
+        assert!(
+            !catalog
+                .token_rows_served(&tenant(), Signal::Logs, &token, &HashMap::new())
+                .await,
+            "an empty snapshot"
+        );
+        assert!(
+            !catalog
+                .token_rows_served(
+                    &tenant(),
+                    Signal::Logs,
+                    &token,
+                    &snapshot_of("t/unrelated/part", l1.clone())
+                )
+                .await,
+            "a part no record naming L published"
+        );
+        assert!(
+            catalog
+                .token_rows_served(
+                    &tenant(),
+                    Signal::Logs,
+                    &token,
+                    &snapshot_of(&part_key, l1.clone())
+                )
+                .await,
+            "the covering part"
+        );
+        assert!(
+            catalog
+                .token_rows_served(
+                    &tenant(),
+                    Signal::Logs,
+                    &token,
+                    &snapshot_of("t/own/object", SegmentLevel::L0)
+                )
+                .await,
+            "L's own object"
+        );
+
+        let uncovered = Arc::new(MemoryStore::new());
+        let (l, part_key) = present_compacted_logs_token(&uncovered, false).await;
+        let token = record::token_for(&l).expect("token");
+        let catalog = Catalog::new(uncovered.clone(), config(1)).expect("catalog");
+        let out = HashMap::from([(
+            part_key.clone(),
+            SegmentRef {
+                data_object_key: part_key.clone(),
+                ..part.clone()
+            },
+        )]);
+        assert!(
+            !catalog
+                .token_rows_served(&tenant(), Signal::Logs, &token, &out)
+                .await,
+            "a part of a record that does not name L"
+        );
+
+        let tombstone = ravel_proto::commit::v1::RetentionTombstone {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Logs) as i32,
+            shard: 0,
+            ingest_hour_bucket: 500_000,
+            retired_at_ns: 0,
+            retention_window_ns: 0,
+            record_count_observed: 0,
+        };
+        uncovered
+            .put(
+                &keys::retention_tombstone_key_for(&tombstone).expect("tombstone key"),
+                tombstone.encode_to_vec().into(),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put tombstone");
+        assert!(
+            catalog
+                .token_rows_served(&tenant(), Signal::Logs, &token, &HashMap::new())
+                .await,
+            "a tombstoned bucket serves no rows"
+        );
+    }
+
+    fn input_identity(record: &CommitRecord) -> CompactionInputIdentity {
+        CompactionInputIdentity {
+            writer_id: record.writer_id.clone(),
+            writer_epoch: record.writer_epoch,
+            writer_seq: record.writer_seq,
+        }
+    }
+
+    /// A logs rewrite record of shard 0, hour 500,000 applying `request_id`,
+    /// over `inputs` or superseding `superseded_record_key`, PUT at its key.
+    /// Returns its key.
+    async fn put_logs_rewrite(
+        store: &MemoryStore,
+        inputs: Vec<CompactionInputIdentity>,
+        superseded_record_key: &str,
+        parts: Vec<CompactionPart>,
+        request_id: Uuid,
+    ) -> (String, RewriteRecord) {
+        let request_id = request_id.to_string();
+        let record = RewriteRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Logs) as i32,
+            shard: 0,
+            ingest_hour_bucket: 500_000,
+            input_set_hash: erasure::compute_rewrite_input_set_hash(
+                &inputs,
+                (!superseded_record_key.is_empty()).then_some(superseded_record_key),
+                std::slice::from_ref(&request_id),
+            )
+            .to_vec(),
+            inputs,
+            parts,
+            drops: vec![ravel_proto::commit::v1::RewriteDrop {
+                request_id,
+                dropped_count: 1,
+            }],
+            created_unix_ns: 500_000 * NS_PER_HOUR + 5_000,
+            superseded_record_key: superseded_record_key.to_owned(),
+        };
+        let key = keys::rewrite_record_key_for(&record).expect("rewrite key");
+        store
+            .put(
+                &key,
+                erasure::encode_rewrite(&record),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put rewrite record");
+        (key, record)
+    }
+
+    /// The pending logs `.dreq` a rewrite applied.
+    async fn put_logs_dreq(store: &MemoryStore, request_id: Uuid) {
+        let request = ErasureRequest {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Logs) as i32,
+            request_id: request_id.to_string(),
+            created_unix_ns: 500_000 * NS_PER_HOUR + 4_000,
+            predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+                key: "user".to_string(),
+                value: "u-4331".to_string(),
+            }],
+            window_start_ns: 0,
+            window_end_ns: 0,
+            reason: String::new(),
+        };
+        store
+            .put(
+                &keys::erasure_request_key(&tenant(), Signal::Logs, request_id).expect("dreq key"),
+                erasure::encode_request(&request),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put dreq");
+    }
+
+    fn snapshot_set(snapshot: &Snapshot) -> HashMap<String, SegmentRef> {
+        snapshot
+            .segments
+            .iter()
+            .map(|segment| (segment.data_object_key.clone(), segment.clone()))
+            .collect()
+    }
+
+    /// Resolves `token` over hour 500,000 at its half hour, so the bucket is
+    /// listed.
+    async fn resolve_logs_token(catalog: &Catalog, token: &CommitToken) -> Snapshot {
+        let start = 500_000 * NS_PER_HOUR;
+        catalog
+            .resolve(
+                &tenant(),
+                Signal::Logs,
+                TimeRange {
+                    start_ns: start,
+                    end_ns: start + NS_PER_HOUR,
+                },
+                std::slice::from_ref(token),
+                start + 30 * 60_000_000_000,
+            )
+            .await
+            .expect("resolve")
+    }
+
+    /// An erasure that removed every row of L publishes a rewrite with no
+    /// parts. With L's commit record present and the `.dreq` pending, the
+    /// token step serves those parts, none, in L's place; the property holds
+    /// on that empty answer, since the rewrite naming L serves all of its
+    /// surviving rows.
+    #[tokio::test]
+    async fn token_rows_served_holds_for_a_rewrite_that_erased_every_row() {
+        let store = Arc::new(MemoryStore::new());
+        let start = 500_000 * NS_PER_HOUR;
+        let l = publish_segment_for(
+            &store,
+            Signal::Logs,
+            0,
+            1,
+            500_000,
+            start + 1_000,
+            start + 1_000,
+            start + 2_000,
+        )
+        .await;
+        let request_id = Uuid::from_u128(0xd4331);
+        put_logs_dreq(&store, request_id).await;
+        put_logs_rewrite(&store, vec![input_identity(&l)], "", Vec::new(), request_id).await;
+        let token = record::token_for(&l).expect("token");
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let snapshot = resolve_logs_token(&catalog, &token).await;
+        assert!(
+            snapshot.segments.is_empty(),
+            "the rewrite erased every row of L: {:?}",
+            snapshot.segments
+        );
+        assert!(
+            catalog
+                .token_rows_served(&tenant(), Signal::Logs, &token, &snapshot_set(&snapshot))
+                .await,
+            "a rewrite naming L with no parts serves L's rows"
+        );
+        if let Some(evaluations) = token_answers(&token.encode()) {
+            assert_answers_hold(&evaluations, &["present record"]);
+        }
+    }
+
+    /// C compacted L and another input, and rewrite R superseded C as a
+    /// whole; the token step serves R's part for L. The superseded sweep then
+    /// deletes C after its parts, so R's chain ends at a predecessor no
+    /// longer listed and names no inputs: the property holds, since the
+    /// record that named L was there for the step.
+    #[tokio::test]
+    async fn token_rows_served_holds_once_a_rewrite_predecessor_is_swept() {
+        let store = Arc::new(MemoryStore::new());
+        let (l, _) = present_compacted_logs_token(&store, true).await;
+        let prefix =
+            keys::commit_shard_hour_prefix(&tenant(), Signal::Logs, 0, 500_000).expect("prefix");
+        let c_key = ravel_object_store::list_all(store.as_ref(), &prefix)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|meta| meta.key)
+            .find(|key| {
+                matches!(
+                    keys::partition_bucket_entry(key),
+                    Ok(BucketEntry::CompactionRecord(_))
+                )
+            })
+            .expect("C is listed");
+        let request_id = Uuid::from_u128(0xd4332);
+        put_logs_dreq(&store, request_id).await;
+        let mut r_part = present_compacted_logs_part();
+        r_part.content_hash = vec![0xe1; 32];
+        let (_, r) = put_logs_rewrite(&store, Vec::new(), &c_key, vec![r_part], request_id).await;
+        let r_part_key = keys::reconstruct_rewrite_part_key(&r, &r.parts[0]).expect("part key");
+        let token = record::token_for(&l).expect("token");
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let snapshot = resolve_logs_token(&catalog, &token).await;
+        let out = snapshot_set(&snapshot);
+        let served: Vec<&str> = out.keys().map(String::as_str).collect();
+        assert_eq!(served, vec![r_part_key.as_str()], "R's part alone serves L");
+        assert!(
+            catalog
+                .token_rows_served(&tenant(), Signal::Logs, &token, &out)
+                .await,
+            "R's chain names L through C"
+        );
+
+        store.delete(&c_key).await.expect("sweep C");
+        assert!(
+            catalog
+                .token_rows_served(&tenant(), Signal::Logs, &token, &out)
+                .await,
+            "R's chain ends at the swept C"
+        );
+    }
+
+    /// The part `present_compacted_logs_token` gives its compaction record.
+    fn present_compacted_logs_part() -> CompactionPart {
+        let start = 500_000 * NS_PER_HOUR;
+        CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xff; 16],
+            content_hash: vec![0x5d; 32],
+            object_size: 4096,
+            sample_count: 2,
+            series_count: 2,
+            run_count: 2,
+            min_event_ts_ns: start + 1_000,
+            max_event_ts_ns: start + 2_000,
+            segment_format_version: 1,
+            declared_column_stats: Vec::new(),
+        }
+    }
+
+    /// The step saw L's bucket tombstoned and served no rows, and retention
+    /// then swept the bucket: L's commit record first, the tombstone last
+    /// once the bucket is empty. The property holds at each stage, from the
+    /// listed tombstone and then from L's commit record being gone.
+    #[tokio::test]
+    async fn token_rows_served_holds_while_retention_sweeps_the_bucket() {
+        let store = Arc::new(MemoryStore::new());
+        let start = 500_000 * NS_PER_HOUR;
+        let l = publish_segment_for(
+            &store,
+            Signal::Logs,
+            0,
+            1,
+            500_000,
+            start + 1_000,
+            start + 1_000,
+            start + 2_000,
+        )
+        .await;
+        let tombstone = ravel_proto::commit::v1::RetentionTombstone {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Logs) as i32,
+            shard: 0,
+            ingest_hour_bucket: 500_000,
+            retired_at_ns: 0,
+            retention_window_ns: 0,
+            record_count_observed: 1,
+        };
+        let tombstone_key = keys::retention_tombstone_key_for(&tombstone).expect("tombstone key");
+        store
+            .put(
+                &tombstone_key,
+                tombstone.encode_to_vec().into(),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put tombstone");
+        let token = record::token_for(&l).expect("token");
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let served = || async {
+            catalog
+                .token_rows_served(&tenant(), Signal::Logs, &token, &HashMap::new())
+                .await
+        };
+
+        assert!(served().await, "the tombstoned bucket");
+        store
+            .delete(&keys::commit_key_for_record(&l).expect("commit key"))
+            .await
+            .expect("sweep L's commit record");
+        assert!(served().await, "the tombstone outlives L's record");
+        store
+            .delete(&tombstone_key)
+            .await
+            .expect("sweep the tombstone");
+        assert!(served().await, "the swept bucket");
+    }
+
+    /// The LIST shows compaction record C, which names L, and C is gone by
+    /// its GET: the sweep deleted it after the step read it. The property
+    /// holds on the snapshot holding C's part, and the fault proves the GET
+    /// answered NotFound.
+    #[tokio::test]
+    async fn token_rows_served_holds_for_a_record_gone_by_its_get() {
+        let inner = Arc::new(MemoryStore::new());
+        let (l, part_key) = present_compacted_logs_token(&inner, true).await;
+        let token = record::token_for(&l).expect("token");
+        let start = 500_000 * NS_PER_HOUR;
+        let part = Catalog::new(inner.clone(), config(1))
+            .expect("catalog")
+            .resolve(
+                &tenant(),
+                Signal::Logs,
+                TimeRange {
+                    start_ns: start,
+                    end_ns: start + NS_PER_HOUR,
+                },
+                &[],
+                start + 30 * 60_000_000_000,
+            )
+            .await
+            .expect("resolve")
+            .segments
+            .into_iter()
+            .find(|s| s.data_object_key == part_key)
+            .expect("the listing serves the part");
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains("/l1."));
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        assert!(
+            catalog
+                .token_rows_served(
+                    &tenant(),
+                    Signal::Logs,
+                    &token,
+                    &HashMap::from([(part_key.clone(), part)])
+                )
+                .await,
+            "C, gone by its GET, served L"
+        );
+        assert_eq!(store.fault_count(Op::Get, FaultKind::NotFoundBlip), 1);
+    }
+
+    /// Delegates to a [`MemoryStore`] and never answers a LIST.
+    struct StalledListStore {
+        inner: Arc<MemoryStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for StalledListStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            _prefix: &str,
+            _page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            std::future::pending().await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The fresh reads race `EVIDENCE_HEAD_TIMEOUT` and pass on expiry: a
+    /// bucket LIST that never answers leaves the property holding, on a
+    /// snapshot that would otherwise be false, once the timeout has elapsed.
+    #[tokio::test]
+    async fn token_rows_served_passes_when_the_fresh_reads_time_out() {
+        let inner = Arc::new(MemoryStore::new());
+        let (l, _) = present_compacted_logs_token(&inner, true).await;
+        let token = record::token_for(&l).expect("token");
+        let catalog = Catalog::new(
+            Arc::new(StalledListStore {
+                inner: inner.clone(),
+            }),
+            config(1),
+        )
+        .expect("catalog");
+        let unstalled = Catalog::new(inner, config(1)).expect("catalog");
+        assert!(
+            !unstalled
+                .token_rows_served(&tenant(), Signal::Logs, &token, &HashMap::new())
+                .await,
+            "an empty snapshot"
+        );
+
+        let started = std::time::Instant::now();
+        assert!(
+            catalog
+                .token_rows_served(&tenant(), Signal::Logs, &token, &HashMap::new())
+                .await,
+            "the stalled LIST passes"
+        );
+        assert!(started.elapsed() >= publish::EVIDENCE_HEAD_TIMEOUT);
     }
 
     /// Observing a tombstone during resolution invalidates that bucket's
