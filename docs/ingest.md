@@ -1193,8 +1193,9 @@ exactly five places:
   entry load (c6a.4xlarge, ADR-4203's Stage 0 amendment), `estimated` wrote
   2.43% more l0 bytes, and cold Q21, Q28 and Q29 on that tenant were 0.1 to
   2.6% slower than on the exhaustive one, but hot Q24 and Q28, which decode
-  the long `URL` column, took about twice as long (#4388; Q24 0.955 s against
-  0.476 s on the same binary loaded exhaustive). That hot-read cost is why
+  the long `URL` column, took about twice as long (ADR-4203, page choice
+  reversal amendment: Q24 0.955 s against 0.476 s on the same binary loaded
+  exhaustive). That hot-read cost is why
   the load default is `exhaustive`. Both choices write encodings the
   format defines, and readers decode either the same way. The flush hands a
   row-major buffer to the writer as one `ColumnarLogBatch` through
