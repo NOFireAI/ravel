@@ -774,7 +774,8 @@ holding versions outside B's read set (decision 1).
   parked, and a process paused between its staleness check and a PUT can
   land a late write. All are readable until retirement, and after
   retirement the late-write pass (decision 7) finds them; none is a silent
-  wrong answer or a deletion.
+  wrong answer or a deletion (narrowed by the audit retention amendment
+  below).
 - **Cost of the late-write pass.** One LIST of every commit page of the
   retired family's signals per daily pass, plus one GET per record whose
   `LastModified` is after the persisted watermark. Startup reads only
@@ -796,3 +797,27 @@ holding versions outside B's read set (decision 1).
 - **Not done here.** Rewrite-record supersession for below-version erasure
   parts (certification refuses and names them; ADR-1331's blocked buckets);
   moving `ReadersRolledOut` opt-ins onto activation; H12.
+
+## Amendment (2026-11-17): audit under the released-binary drill, and the audit retention residual (issue #4243)
+
+<!-- amendment-applies: sections="Consequences" pointer="audit retention amendment" -->
+<!-- amendment-supersedes: phrase="none is a silent wrong answer or a deletion" pointer="audit retention amendment" -->
+
+Decision 4 does not fence audit. The released-binary fence drill
+(decision 9, wave 0) therefore puts post-fence writes of per-query audit
+records, `u/l0/` and `u/c/`, in their own class, "audit: unfenced by
+design". The drill records them and does not judge them. Every other audit
+event the drill sees (`u/l1/` and `u/maint/` writes, and audit removals)
+stays in the prerequisite-only class, which the drill also records and does
+not judge.
+
+The audit retention residual. Hazard H7 is that audit retention deletes by
+age with no version hold, and decision 4's remedy for it ships from the
+baseline on. A pre-baseline process that outlives the rollout, against the
+prerequisite in decision 4, still runs audit retention without the hold
+after an activation above the baseline, so it can delete an audit object
+the hold would keep. The late-write pass does not see a deletion. The
+Consequences sentence that no residual is a deletion therefore holds for
+the other residuals it lists and for the audit records such a process
+writes, not for its audit retention. The prerequisite is the only control
+over this residual; no fence and no pass detects it.
