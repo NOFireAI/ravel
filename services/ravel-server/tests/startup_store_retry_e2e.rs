@@ -5,7 +5,8 @@
 //! `startup_retry::run_startup_store_checks`, then
 //! `start_with_heartbeat_and_ipcrypt`, which reads the IPCrypt marker. One
 //! `FaultStore` fails every retried site a few times: `sys/qualification`
-//! (with a transient error, a timeout and a throttle), `sys/tenancy`, the
+//! (with a transient error, a timeout and a throttle), the retired-reader
+//! gate's HEAD of `sys/compat`, `sys/tenancy`, the
 //! tenant key-epoch record, the spans `s/l0/` listing of provisioning
 //! validation, `sys/gc` and `sys/ipcrypt/policy`. A site that stopped
 //! retrying would refuse on its first fault and fail the test.
@@ -29,6 +30,7 @@ use ravel_object_store::conformance::{
 use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, ScriptedFault, Sequence};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{KmsRoutingStore, ObjectStoreBackend, PutOptions, StoreMetrics};
+use ravel_server::compat_gate::{CompatGateError, GateOutcome, RetiredReader};
 use ravel_server::config::StoreKind;
 use ravel_server::health_listener::{HealthListener, Heartbeat};
 use ravel_server::startup_retry::{
@@ -39,6 +41,7 @@ use ravel_types::{ConfiguredScheme, TenantHash, TenantId};
 use tokio::sync::{Semaphore, mpsc};
 
 const IPCRYPT_MARKER_KEY: &str = "sys/ipcrypt/policy";
+const COMPAT_KEY: &str = "sys/compat";
 const TENANCY_KEY: &str = "sys/tenancy";
 const GC_KEY: &str = "sys/gc";
 const EPOCH_KEY: &str = "/enc";
@@ -48,6 +51,13 @@ const EPOCH_FAILURES: usize = 1;
 const LISTING_FAILURES: usize = 2;
 const GC_FAILURES: usize = 1;
 const MARKER_FAILURES: usize = 2;
+const COMPAT_FAILURES: usize = 1;
+/// A retired set, so the gate reads the store: `RETIRED_READERS` is empty in
+/// this build and sends no request.
+const RETIRED: &[RetiredReader] = &[RetiredReader {
+    family: "rseg",
+    oldest_readable: 8,
+}];
 /// The qualification read fails once with each retryable kind.
 fn qualification_faults() -> Vec<ScriptedFault> {
     vec![
@@ -268,7 +278,10 @@ async fn transient_store_failures_at_startup_delay_it_and_the_server_then_serves
             .with_sequence(transient(Op::Get, EPOCH_KEY, EPOCH_FAILURES))
             .with_sequence(transient(Op::List, LISTING_KEY, LISTING_FAILURES))
             .with_sequence(transient(Op::Get, GC_KEY, GC_FAILURES))
-            .with_sequence(transient(Op::Get, IPCRYPT_MARKER_KEY, MARKER_FAILURES)),
+            .with_sequence(transient(Op::Get, IPCRYPT_MARKER_KEY, MARKER_FAILURES))
+            // A second passthrough step, so a second run of the gate would
+            // show as progress 3.
+            .with_sequence(transient(Op::Head, COMPAT_KEY, COMPAT_FAILURES).then_passthrough()),
     ));
     seed_qualification(fault.inner()).await;
     let store: Arc<dyn ObjectStoreBackend> = fault.clone();
@@ -295,6 +308,7 @@ async fn transient_store_failures_at_startup_delay_it_and_the_server_then_serves
             require_bucket_protection: false,
             store_s3: None,
             tenancy: ConfiguredScheme::Unkeyed,
+            retired_readers: RETIRED,
             tenant_kms: Some((&kms, &kms_config)),
             shard_count: 1,
             mode: Mode::All,
@@ -304,11 +318,24 @@ async fn transient_store_failures_at_startup_delay_it_and_the_server_then_serves
     );
     let (checked, check_retries) = drive(checks, &clock, &mut slept_rx, async |_| {}).await;
     let StartupStoreState {
-        static_tenants, gc, ..
+        retired_reader_gate,
+        static_tenants,
+        gc,
+        ..
     } = checked.expect("the startup store checks pass once the store recovers");
+    // The gate read the store as fresh, with no `sys/tenancy`: it ran before
+    // tenancy pinning wrote the marker, which would have made it refuse.
+    assert_eq!(retired_reader_gate, GateOutcome::Fresh);
+    // One gate run: the faulted HEAD and its one retry, no third HEAD.
+    assert_eq!(fault.sequence_progress(6) as usize, COMPAT_FAILURES + 1);
+    assert_eq!(
+        fault.fault_count(Op::Head, FaultKind::Transient) as usize,
+        COMPAT_FAILURES
+    );
     assert_eq!(
         check_retries,
         qualification_faults().len()
+            + COMPAT_FAILURES
             + TENANCY_FAILURES
             + EPOCH_FAILURES
             + LISTING_FAILURES
@@ -382,4 +409,74 @@ async fn transient_store_failures_at_startup_delay_it_and_the_server_then_serves
         .await
         .expect("join")
         .expect("health listener stops");
+}
+
+/// A gate refusal ends the checks on its first attempt, before tenancy
+/// pinning or any later check runs: no retry sleep, `sys/tenancy` is the one
+/// seeded, and no `sys/gc` is written.
+#[tokio::test]
+async fn a_retired_reader_gate_refusal_refuses_at_once_before_tenancy() {
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    seed_qualification(fault.inner()).await;
+    fault
+        .inner()
+        .put(
+            TENANCY_KEY,
+            Bytes::from_static(b"marker"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("seed sys/tenancy");
+    let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+
+    let (slept_tx, mut slept_rx) = mpsc::unbounded_channel();
+    let clock = Arc::new(GatedClock {
+        now: Mutex::new(Duration::ZERO),
+        slept: slept_tx,
+        release: Semaphore::new(0),
+    });
+    let retry = StartupRetry::new(clock.clone(), Duration::from_secs(15), 1);
+    let checks = run_startup_store_checks(
+        &retry,
+        StartupStoreInputs {
+            store: &store,
+            store_kind: StoreKind::S3,
+            backend_identity: None,
+            require_bucket_protection: false,
+            store_s3: None,
+            tenancy: ConfiguredScheme::Unkeyed,
+            retired_readers: RETIRED,
+            tenant_kms: None,
+            shard_count: 1,
+            mode: Mode::All,
+        },
+        Vec::new,
+        || 1,
+    );
+    let (checked, retries) = drive(checks, &clock, &mut slept_rx, async |_| {}).await;
+    let Err(err) = checked else {
+        panic!("sys/tenancy without sys/compat refuses");
+    };
+    assert_eq!(
+        err.to_string(),
+        "retired-reader gate (sys/compat) refused startup"
+    );
+    assert!(matches!(
+        err.downcast_ref::<CompatGateError>(),
+        Some(CompatGateError::TenancyWithoutCompat)
+    ));
+    assert_eq!(retries, 0);
+    assert_eq!(
+        fault
+            .inner()
+            .get(TENANCY_KEY, ravel_object_store::GetRange::Full)
+            .await
+            .expect("the seeded marker")
+            .data,
+        Bytes::from_static(b"marker")
+    );
+    assert!(matches!(
+        fault.inner().head(GC_KEY).await,
+        Err(ravel_object_store::StoreError::NotFound)
+    ));
 }

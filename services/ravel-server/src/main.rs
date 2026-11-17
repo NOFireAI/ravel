@@ -212,9 +212,9 @@ async fn main() -> anyhow::Result<()> {
     // 3. Retired-reader gate (ADR-4233 decision 7). Before tenancy pinning,
     //    which writes `sys/tenancy` on a fresh store: a release that retired
     //    a reader tells a fresh store from an unadopted one by that marker's
-    //    absence. Read-only, and sends no request while
-    //    `compat_gate::RETIRED_READERS` is empty. A transient store error on
-    //    its reads retries; every refusal it decides refuses at once.
+    //    absence. Read-only, and sends no request while this build retires
+    //    no reader. A transient store error on its reads retries; every
+    //    refusal it decides refuses at once.
     // 4. Tenant-hash scheme pinning (ADR-0050 section 3). Resolve the
     //    bucket's scheme from `sys/tenancy` (writing the marker for a fresh or
     //    pre-ADR bucket) and install it process-wide. A configured scheme or
@@ -1144,6 +1144,8 @@ mod tests {
             concat!("startup_retry::validate_", "static_provisioning("),
             concat!("gc_config::", "bootstrap("),
             concat!("gc_config::bootstrap_", "at_startup("),
+            concat!("compat_gate::", "enforce("),
+            concat!("startup_retry::enforce_", "retired_reader_gate("),
         ] {
             assert_eq!(main_src.matches(direct).count(), 0, "{direct}");
         }
@@ -1225,33 +1227,78 @@ mod tests {
     }
 
     /// ADR-4233 decision 7: the retired-reader gate runs on this build's
-    /// retired set, in every mode, before `resolve_and_pin` writes
-    /// `sys/tenancy` on a fresh store (after it, a fresh store would read as
-    /// one with `sys/tenancy` and no `sys/compat`) and before the server
-    /// starts. Asserted over this file's source, like the tests above: `main`
-    /// cannot be called from a test. Needles built with `concat!` so this
-    /// test's own source cannot match itself.
+    /// retired set, in every mode, once per start, before tenancy pinning
+    /// writes `sys/tenancy` on a fresh store (after it, a fresh store would
+    /// read as one with `sys/tenancy` and no `sys/compat`) and before the
+    /// server starts. `main` hands `RETIRED_READERS` to the one
+    /// `run_startup_store_checks` call, which runs the gate once, after the
+    /// bucket-protection gate and before `resolve_tenancy`. Asserted over the
+    /// source, like the tests above: `main` cannot be called from a test.
+    /// Needles built with `concat!` so this test's own source cannot match
+    /// itself.
     #[test]
     fn the_retired_reader_gate_runs_before_the_tenancy_marker_is_written() {
         const SRC: &str = include_str!("main.rs");
-        let gate = concat!("compat_gate::", "enforce(");
-        assert_eq!(SRC.matches(gate).count(), 1);
-        let at = SRC.find(gate).expect("main runs the gate");
-        let call = &SRC[at..at + 200];
-        assert!(
-            call.contains(concat!("compat_gate::", "RETIRED_READERS,")),
-            "the gate checks this build's retired set: {call}"
+        let main_src = &SRC[..SRC.find("\n#[cfg(test)]").expect("test module present")];
+        let retired = concat!(
+            "retired_readers: ravel_server::compat_gate::",
+            "RETIRED_READERS,"
         );
-        let pin = SRC
-            .find(concat!("tenancy::", "resolve_and_pin("))
-            .expect("main pins the tenancy scheme");
-        let start = SRC
+        assert_eq!(main_src.matches(retired).count(), 1);
+        assert_eq!(
+            main_src
+                .matches(concat!("compat_gate::", "RETIRED_READERS"))
+                .count(),
+            1
+        );
+        let call = main_src
+            .find(concat!("startup_retry::run_startup_", "store_checks("))
+            .expect("main runs the startup store checks");
+        let call_end = call
+            + main_src[call..]
+                .find("\n    .await?;")
+                .expect("the call is awaited");
+        let at = main_src.find(retired).expect("checked above");
+        assert!(
+            call < at && at < call_end,
+            "the retired set is a check input"
+        );
+        let start = main_src
             .find(concat!(
                 "ravel_server::",
                 "start_with_heartbeat_and_ipcrypt("
             ))
             .expect("main starts the server");
-        assert!(at < pin && at < start);
+        assert!(call_end < start);
+
+        const CHECKS: &str = include_str!("startup_retry.rs");
+        let body = &CHECKS[CHECKS
+            .find(concat!("pub async fn run_startup_", "store_checks("))
+            .expect("the checks function")..];
+        let body = &body[..body.find("\n}\n").expect("function closes")];
+        let gate = concat!("enforce_retired_", "reader_gate(");
+        assert_eq!(body.matches(gate).count(), 1);
+        let gate_at = body.find(gate).expect("checked above");
+        assert!(body[gate_at..].contains(concat!("inputs.retired_", "readers,")));
+        let protection = body
+            .find(concat!("bucket_protection::enforce_", "at_startup_on("))
+            .expect("the bucket-protection gate");
+        let tenancy = body
+            .find(concat!("resolve_", "tenancy(retry"))
+            .expect("tenancy pinning");
+        let install = body
+            .find(concat!("install_tenant_", "hash_scheme("))
+            .expect("the scheme install");
+        assert!(protection < gate_at && gate_at < tenancy && tenancy < install);
+        // The gate's one call outside its own definition is that one.
+        let non_test = &CHECKS[..CHECKS.find("\n#[cfg(test)]").expect("test module")];
+        assert_eq!(non_test.matches(gate).count(), 2, "definition and one call");
+        assert_eq!(
+            non_test
+                .matches(concat!("compat_gate::", "enforce("))
+                .count(),
+            1
+        );
     }
 
     /// `--background-migrate` reaches the maintenance config as the background
