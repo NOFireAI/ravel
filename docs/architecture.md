@@ -156,14 +156,19 @@ all of that step. Each retry logs one warning that names the read, the
 attempt number and the error.
 
 `--startup-store-deadline` (default `15s`) is measured from process start and
-shared by every read. It bounds each attempt as well as the retries:
-an attempt still running when the deadline passes is cut off, counts as one
-attempt, and refuses to start with an error that names the read and says the
-deadline passed. No retry starts once its wait would reach the deadline;
-the transient failure then refuses to start, and the error names the read
-and the number of attempts. A read first reached after the deadline has
-passed gets one attempt, unbounded, and no retry. With the default, every
-bounded attempt ends by 15 s, 10 s before the earliest restart by the
+shared by every read. It bounds each attempt as well as the retries. Each
+attempt runs for at most the time left before the deadline or 5 s
+(`MIN_STARTUP_ATTEMPT`), whichever is longer, so a healthy read that starts
+just before the deadline is not cut off. An attempt still running at the end
+of its bound is cut off, counts as one attempt, and refuses to start with an
+error that names the read and the bound. No retry starts once its wait would
+reach the deadline; the transient failure then refuses to start, and the
+error names the read and the number of attempts. A read first reached after
+the deadline has passed gets one attempt, bounded by 5 s, and no retry, so a
+transient failure there refuses. A read whose attempt starts by the deadline
+therefore refuses by the deadline plus 5 s, and a read first reached later
+refuses within 5 s of being reached. With the default, a read that starts by
+the deadline refuses by 20 s, 5 s before the earliest restart by the
 operator's liveness probe at 25 s. `0s` turns retry and the attempt bound
 off.
 
@@ -177,10 +182,13 @@ that landed before an ambiguous failure reads back as present on the next
 attempt. That read does not repeat the log line or counter of an adoption,
 because it cannot tell its own write from a concurrent process's.
 
-Other store requests made before a listener binds do not retry and refuse on
-their first error, as before: the Azure store construction request, the
-`--require-bucket-protection` read and the `--format-window-check` reads. The
-last two have bounds of their own.
+Other store requests made before a listener binds do not retry. The Azure
+store construction request refuses on its first error, as before. The
+`--require-bucket-protection` read never refuses on a read error: a failed or
+timed-out read leaves its conditions unknown, which warns and starts. A
+failed `--format-window-check` read refuses under `--format-window-check
+refuse` and warns and starts under `warn`. The last two have bounds of their
+own.
 
 `/readyz` is never ready during a retry. The main listener binds only after
 every read has passed. The `--listen-health` listener, when it is set, binds

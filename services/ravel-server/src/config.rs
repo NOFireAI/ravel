@@ -1447,20 +1447,27 @@ pub struct StartupCheckArgs {
     /// Timeout or Throttled), as a humantime duration (issue #4325). Covers
     /// sys/qualification, sys/tenancy, the --tenant-kms-config key-epoch
     /// records, the shard_count provisioning records, sys/gc and the
-    /// sys/ipcrypt/policy marker. Not covered, and refusing on their first
-    /// error as before: the Azure store construction request, the
-    /// --require-bucket-protection read and the --format-window-check reads,
-    /// which have their own bounds. The wait between attempts doubles from
-    /// 100 ms to a 2 s cap and is jittered down to half of that, each retry
-    /// logs one warning naming the read, and /readyz is not ready while they
-    /// run. Each attempt is also bounded by the time left: one still running
-    /// at the deadline is cut off and refuses naming the read and the
-    /// deadline. No retry starts once its wait would reach the deadline; the
-    /// transient failure then refuses naming the read and the attempt count.
-    /// A read first reached after the deadline gets one unbounded attempt and
-    /// no retry. Any other error refuses at once, as before. The default 15s
-    /// ends every bounded attempt 10 s before the operator's liveness probe
-    /// (initial delay 5 s, period 10 s, failure threshold 3) can first
+    /// sys/ipcrypt/policy marker. Not covered, and not retried: the Azure
+    /// store construction request, which refuses on its first error; the
+    /// --require-bucket-protection read, which never refuses on a read error
+    /// (a failed or timed-out read leaves the conditions unknown, which warns
+    /// and starts); and the --format-window-check reads, where a failed read
+    /// refuses under --format-window-check refuse and warns and starts under
+    /// warn. The last two have their own bounds. The wait between attempts
+    /// doubles from 100 ms to a 2 s cap and is jittered down to half of that,
+    /// each retry logs one warning naming the read, and /readyz is not ready
+    /// while they run. Each attempt is also bounded by the time left before
+    /// the deadline or 5 s, whichever is longer: one still running then is
+    /// cut off and refuses naming the read and the bound. No retry starts
+    /// once its wait would reach the deadline; the transient failure then
+    /// refuses naming the read and the attempt count. A read first reached
+    /// after the deadline gets one attempt bounded by 5 s and no retry, so a
+    /// transient failure there refuses. A read whose attempt starts by the
+    /// deadline therefore refuses by the deadline plus 5 s; a read first
+    /// reached later refuses within 5 s of being reached. Any other error
+    /// refuses at once, as before. With the default 15s, a read that starts
+    /// by the deadline refuses by 20 s, 5 s before the operator's liveness
+    /// probe (initial delay 5 s, period 10 s, failure threshold 3) can first
     /// restart the pod at 25 s. `0s` turns retry and the attempt bound off.
     #[arg(
         long = "startup-store-deadline",
