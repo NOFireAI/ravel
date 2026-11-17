@@ -115,7 +115,10 @@ that fails for two minutes counts as a violation, not as a pass.
    every data object the catalog resolves for the tenant and fetches each. A
    data object the store does not hold fails the command with `failed to
    fetch <key>: object not found`; the audit counts that key as resolved only
-   when it is an `.rlog` under `t/<tenant hash>/l/`. Any other failure (a
+   when it is a data object key under `t/<tenant hash>/l/l0/` or
+   `t/<tenant hash>/l/l1/` ending in `.rseg`, the suffix Ravel gives every
+   data object, logs included (`DATA_SUFFIX` in
+   `crates/ravel-commit/src/keys.rs`). Any other failure (a
    transient or skew error, a fetch of `sys/tenancy` or of a HEAD) gives no
    verdict on resolved data objects for that pass.
 4. LIST the tenant prefix (`t/<tenant hash>/`). A page counts only when curl
