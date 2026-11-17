@@ -2732,6 +2732,11 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         .clone()
         .unwrap_or_default();
 
+    // The seal margin of the catalog `query::build_catalog_for_server` builds
+    // below, so each ingest router judges an abandoned commit against the hour
+    // seal this process's fold applies.
+    let fold_seal = (&query::server_catalog_config_base()).into();
+
     // The `sys/compat` write policy every ingest router of this process applies
     // (ADR-4233 decisions 2 to 4, #4244): one policy over the process's view,
     // shared by `Arc` across the metrics, log and span routers so one
@@ -2771,6 +2776,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                     config.max_flush_delay,
                 )
                 .saturating_add(ravel_ingest::STRICT_VISIBILITY_RESERVE_NS),
+                fold_seal,
                 ..IngestConfig::default()
             },
             Signal::Metrics,
@@ -2857,6 +2863,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 max_flush_delay_idle: config.max_flush_delay_idle,
                 min_flush_bytes: config.min_flush_bytes,
                 idle_flush_byte_floor: config.idle_flush_byte_floor,
+                fold_seal,
                 ..IngestConfig::default()
             },
             Signal::Logs,
@@ -2895,6 +2902,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 max_flush_delay_idle: config.max_flush_delay_idle,
                 min_flush_bytes: config.min_flush_bytes,
                 idle_flush_byte_floor: config.idle_flush_byte_floor,
+                fold_seal,
                 ..IngestConfig::default()
             },
             Signal::Spans,
