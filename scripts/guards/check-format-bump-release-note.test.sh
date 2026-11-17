@@ -25,17 +25,22 @@ RSEG=crates/ravel-segment/src/format.rs
 
 # write_rlog <dir> <version> [<supported>]: the RLOG anchors; <supported>
 # defaults to SupportedVersions::single(VERSION).
+# write_rlog <dir> <version> [<supported>] [<current>]: the RLOG anchors;
+# <supported> defaults to SupportedVersions::single(VERSION) and <current> to
+# WriteVersion(VERSION).
 write_rlog() {
-  printf '/// RLOG trailer version.\npub const VERSION: u16 = %s;\npub const SUPPORTED_VERSIONS: SupportedVersions = %s;\n' \
-    "$2" "${3:-SupportedVersions::single(VERSION)}" >"$1/${RLOG}"
+  printf '/// RLOG trailer version.\npub const VERSION: u16 = %s;\npub const SUPPORTED_VERSIONS: SupportedVersions = %s;\npub const CURRENT: WriteVersion = %s;\n' \
+    "$2" "${3:-SupportedVersions::single(VERSION)}" "${4:-WriteVersion(VERSION)}" >"$1/${RLOG}"
 }
 write_rspan() {
-  printf '/// RSPAN trailer version.\npub const VERSION: u16 = %s;\npub const SUPPORTED_VERSIONS: SupportedVersions = %s;\n' \
-    "$2" "${3:-SupportedVersions::single(VERSION)}" >"$1/${RSPAN}"
+  printf '/// RSPAN trailer version.\npub const VERSION: u16 = %s;\npub const SUPPORTED_VERSIONS: SupportedVersions = %s;\npub const CURRENT: WriteVersion = %s;\n' \
+    "$2" "${3:-SupportedVersions::single(VERSION)}" "${4:-WriteVersion(VERSION)}" >"$1/${RSPAN}"
 }
+# write_rseg <dir> <window> [<current>]: <current> (the writer default) defaults
+# to SegmentVersion::V7.
 write_rseg() {
-  printf 'pub const VERSION: u16 = 1;\nimpl SegmentVersion {\n    pub const WINDOW: &'"'"'static [SegmentVersion] = &[%s];\n}\n' \
-    "$2" >"$1/${RSEG}"
+  printf 'pub const VERSION: u16 = 1;\nimpl SegmentVersion {\n    pub const WINDOW: &'"'"'static [SegmentVersion] = &[%s];\n    pub const CURRENT: SegmentVersion = %s;\n}\n' \
+    "$2" "${3:-SegmentVersion::V7}" >"$1/${RSEG}"
 }
 
 # new_repo <name>: a repo with a seed commit holding all three anchors
@@ -145,7 +150,7 @@ check "d_rspan_bump_without_fragment_fails" "${d}" "${base}" HEAD 1 \
 
 d="$(new_repo footer-edit)"
 base="$(git -C "${d}" rev-parse HEAD)"
-printf '/// Reworded doc comment.\npub const VERSION: u16 = 5;\npub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::single(VERSION);\npub const OTHER: u16 = 9;\n' \
+printf '/// Reworded doc comment.\npub const VERSION: u16 = 5;\npub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::single(VERSION);\npub const CURRENT: WriteVersion = WriteVersion(VERSION);\npub const OTHER: u16 = 9;\n' \
   >"${d}/${RLOG}"
 commit_all "${d}" "docs(logseg): reword footer docs"
 check "e_footer_edit_without_version_change_passes" "${d}" "${base}" HEAD 0 \
@@ -358,8 +363,8 @@ check "singular_log_names_the_logs_signal" "${d}" "${base}" HEAD 0 "fragments in
 
 d="$(new_repo format-drill)"
 base="$(git -C "${d}" rev-parse HEAD)"
-printf '/// RLOG trailer version.\npub const VERSION: u16 = 5;\n#[cfg(not(feature = "format-drill"))]\npub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::single(VERSION);\n#[cfg(feature = "format-drill")]\npub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::n_and_prev(VERSION_DRILL);\n' >"${d}/${RLOG}"
-printf 'pub const VERSION: u16 = 1;\nimpl SegmentVersion {\n    #[cfg(not(feature = "format-drill"))]\n    pub const WINDOW: &'"'"'static [SegmentVersion] = &[SegmentVersion::V7];\n    #[cfg(feature = "format-drill")]\n    pub const WINDOW: &'"'"'static [SegmentVersion] = &[SegmentVersion::Drill, SegmentVersion::V7];\n}\n' >"${d}/${RSEG}"
+printf '/// RLOG trailer version.\npub const VERSION: u16 = 5;\n#[cfg(not(feature = "format-drill"))]\npub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::single(VERSION);\n#[cfg(feature = "format-drill")]\npub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::n_and_prev(VERSION_DRILL);\npub const CURRENT: WriteVersion = WriteVersion(VERSION);\n' >"${d}/${RLOG}"
+printf 'pub const VERSION: u16 = 1;\nimpl SegmentVersion {\n    #[cfg(not(feature = "format-drill"))]\n    pub const WINDOW: &'"'"'static [SegmentVersion] = &[SegmentVersion::V7];\n    #[cfg(feature = "format-drill")]\n    pub const WINDOW: &'"'"'static [SegmentVersion] = &[SegmentVersion::Drill, SegmentVersion::V7];\n    pub const CURRENT: SegmentVersion = SegmentVersion::V7;\n}\n' >"${d}/${RSEG}"
 commit_all "${d}" "feat(segment,logseg): add the format-drill window"
 check "format_drill_definitions_are_not_anchors" "${d}" "${base}" HEAD 0 "clean"
 
@@ -367,9 +372,42 @@ check "format_drill_definitions_are_not_anchors" "${d}" "${base}" HEAD 0 "clean"
 
 d="$(new_repo drill-and-bump)"
 base="$(git -C "${d}" rev-parse HEAD)"
-printf '/// RLOG trailer version.\npub const VERSION: u16 = 5;\n#[cfg(not(feature = "format-drill"))]\npub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::n_and_prev(VERSION);\n#[cfg(feature = "format-drill")]\npub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::n_and_prev(VERSION_DRILL);\n' >"${d}/${RLOG}"
+printf '/// RLOG trailer version.\npub const VERSION: u16 = 5;\n#[cfg(not(feature = "format-drill"))]\npub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::n_and_prev(VERSION);\n#[cfg(feature = "format-drill")]\npub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::n_and_prev(VERSION_DRILL);\npub const CURRENT: WriteVersion = WriteVersion(VERSION);\n' >"${d}/${RLOG}"
 commit_all "${d}" "feat(logseg): widen the RLOG reader window"
 check "default_window_change_beside_a_drill_twin_is_still_a_bump" "${d}" "${base}" HEAD 1 "RLOG"
+
+# --- rseg_current_flip_without_metrics_fails ---------------------------------
+# A flip of SegmentVersion::CURRENT (the writer's default emitted version)
+# while the reader window is unchanged is a bump the window anchor does not
+# catch (ADR-4233), so it needs a release note too.
+
+d="$(new_repo rseg-current)"
+base="$(git -C "${d}" rev-parse HEAD)"
+write_rseg "${d}" "SegmentVersion::V8, SegmentVersion::V7" "SegmentVersion::V8"
+commit_all "${d}" "feat(segment): default to writing RSEG v8"
+check "rseg_current_flip_without_metrics_fails" "${d}" "${base}" HEAD 1 \
+  "RSEG format version changed" "signal 'metrics'"
+
+# --- rseg_current_flip_naming_metric_passes ----------------------------------
+
+d="$(new_repo rseg-current-ok)"
+base="$(git -C "${d}" rev-parse HEAD)"
+write_rseg "${d}" "SegmentVersion::V8, SegmentVersion::V7" "SegmentVersion::V8"
+printf -- '- **RSEG default.** Writers now emit metric segments at v8.\n' \
+  >"${d}/changelog.d/100.changed.md"
+commit_all "${d}" "feat(segment): default to writing RSEG v8"
+check "rseg_current_flip_naming_metric_passes" "${d}" "${base}" HEAD 0
+
+# --- rlog_current_literal_flip_fails -----------------------------------------
+# WriteVersion::CURRENT normally reads WriteVersion(VERSION) and moves only
+# with VERSION, but a literal flip (pinning a default below the newest) is a
+# writer-default change the VERSION anchor would miss.
+
+d="$(new_repo rlog-current)"
+base="$(git -C "${d}" rev-parse HEAD)"
+write_rlog "${d}" 5 "SupportedVersions::n_and_prev(VERSION)" "WriteVersion(4)"
+commit_all "${d}" "feat(logseg): pin the RLOG write default to 4"
+check "rlog_current_literal_flip_fails" "${d}" "${base}" HEAD 1 "RLOG"
 
 echo
 echo "check-format-bump-release-note.test.sh: ${passes} passed, ${fails} failed"
