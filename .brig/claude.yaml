@@ -1,0 +1,16 @@
+# The Claude Code route for the Ravel dev target.
+# See docs/internal/dev-in-brig.md.
+apiVersion: brig.sh/v1alpha1
+kind: Policy
+metadata:
+  name: ravel-claude
+  description: Claude Code on your subscription, with the login kept on the host
+spec:
+  routes:
+    # The guest gets ANTHROPIC_BASE_URL and a session token for this route.
+    # The broker adds the OAuth token on the host and refreshes it there.
+    # Store the login once with: brig secret import claude-code
+    - name: anthropic
+      preset: claude-code
+      credential:
+        secretRef: { name: claude-credentials }

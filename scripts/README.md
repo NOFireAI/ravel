@@ -248,3 +248,20 @@ connection, a pushed-but-broken main).
   the other variables. `scripts/compat/released-binary-drill.test.sh`
   runs the decision logic (`drill-lib.sh`) on recorded listings in CI.
 
+- `scripts/brig.sh new|run|shell|plan|stop|rm|update|path NAME`,
+  `scripts/brig.sh login`: the host side of the `make brig*` targets
+  (docs/internal/dev-in-brig.md). `new` clones origin/main into
+  `$RAVEL_BRIG_CLONES/NAME` (default `../store-brig/NAME`) on branch
+  NAME and marks it `ravel.sandboxCheckout=true`; the other commands run
+  the Brigfile's `dev` target on that clone with `brig ... -f
+  <clone>/Brigfile`. It exits 1 when run from inside a sandbox clone,
+  when brig has no `run --target` (it names `brew install --cask
+  brig-sh/brig/brig@main`), or when NAME has no clone; 64 on bad usage.
+  `IMAGE=<ref>` runs another build of the guest image. It sets
+  `BRIG_HYPERVISOR=hvi` on macOS, which the routes need.
+- `scripts/brig-dev.sh [--shell [bash args]] [claude args]`: the guest
+  side, which the target runs inside the sandbox. It trusts the project
+  share for git, sets the toolchain environment, sends cargo output to
+  `target/brig/`, defaults `CARGO_BUILD_JOBS` to 4, and execs
+  Claude Code or a login shell. It exits 1 outside a Brig sandbox or in a
+  linked worktree.

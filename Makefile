@@ -1,4 +1,4 @@
-.PHONY: check fmt clippy test test-python test-hygiene doc-drift check-docs build rustfs rustfs-down demo quickstart quickstart-down kind-up kind-demo kind-down bench audit difftest archmap test-sdk lint-sdk
+.PHONY: check fmt clippy test test-python test-hygiene doc-drift check-docs build rustfs rustfs-down demo quickstart quickstart-down kind-up kind-demo kind-down bench audit difftest archmap test-sdk lint-sdk brig brig-new brig-shell brig-plan brig-stop brig-rm brig-update brig-login
 
 check: fmt clippy test
 
@@ -109,3 +109,27 @@ difftest:
 	RAVEL_DIFFTEST_PROM_BIN="$$(scripts/fetch-prometheus.sh)" \
 		RAVEL_DIFFTEST=1 \
 		cargo test -p ravel-promql-difftest --test difftest_selectors -- --nocapture
+
+# Claude Code in a Brig sandbox (8 vCPUs, 12 GB) on a clone of its own, with
+# the Claude login and the GitHub token kept on the host. Run these from your
+# primary checkout or a worktree, never from inside a sandbox clone. Needs brig
+# from the main channel: brew install --cask brig-sh/brig/brig@main.
+# See docs/internal/dev-in-brig.md.
+#
+#   make brig-login                  store the secrets the routes send, once
+#   make brig-new NAME=4405-x        clone origin/main into a sandbox clone
+#   make brig NAME=4405-x            Claude Code in that clone's sandbox
+#   make brig NAME=4405-x ARGS=--continue
+#   make brig-shell NAME=4405-x      a login shell there instead
+#   make brig-plan NAME=4405-x       what a run gets, booting nothing
+#   make brig-stop NAME=4405-x       stop the sandbox
+#   make brig-rm NAME=4405-x         remove the sandbox and its guest home
+#   make brig-update NAME=4405-x     remove the sandbox, pull the newest image, run
+brig:
+	@scripts/brig.sh run "$(NAME)" $(ARGS)
+
+brig-new brig-shell brig-plan brig-stop brig-rm brig-update:
+	@scripts/brig.sh $(@:brig-%=%) "$(NAME)"
+
+brig-login:
+	@scripts/brig.sh login

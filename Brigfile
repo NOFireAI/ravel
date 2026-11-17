@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/brig-sh/brig/main/api/project/v1alpha1/brigfile.schema.json
+#
+# Work on Ravel inside a Brig sandbox: Claude Code with the pinned Rust
+# toolchain and the gate tools, with every credential kept on the host.
+# Start it with `make brig-new NAME=<ticket>` and `make brig NAME=<ticket>`.
+# See docs/internal/dev-in-brig.md.
+apiVersion: brig.sh/v1alpha1
+name: ravel
+defaultTarget: dev
+profiles:
+  ravel:
+    file: .brig/profile.yaml
+policies:
+  egress:
+    file: .brig/egress.yaml
+  claude:
+    file: .brig/claude.yaml
+  github:
+    file: .brig/github.yaml
+targets:
+  dev:
+    profile: ravel
+    policies: [egress, claude, github]
+    overrides:
+      cpus: 8
+      mem: 12288
+    args: [scripts/brig-dev.sh]

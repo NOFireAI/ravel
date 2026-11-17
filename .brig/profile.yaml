@@ -1,0 +1,54 @@
+# The guest the Brigfile's targets boot. See docs/internal/dev-in-brig.md.
+#
+# The image is .brig/Dockerfile, which CI publishes: Brig's stock Claude Code
+# image with the Rust toolchain rust-toolchain.toml names, cargo-nextest,
+# cargo-deny, a crates.io registry filled for Cargo.lock and an npm cache for
+# the TypeScript SDK. Named by tag, so a new build needs no change here.
+#
+# A repository profile may not name a hypervisor, so scripts/brig.sh sets
+# BRIG_HYPERVISOR=hvi on macOS: the routes in the policies need it.
+name: ravel
+desc: Ravel, with Claude Code, the pinned Rust toolchain and the gate tools
+image: ghcr.io/nofireai/ravel-dev:latest
+genericBoot: true
+network: isolated
+guestHome: /root
+
+# The program the target starts. The target's args name scripts/brig-dev.sh,
+# relative to the project.
+binary: bash
+headless: true
+
+# The Brigfile's target sets the size it runs at. A profile must declare one.
+mem: 12288
+cpus: 8
+
+env:
+  # Claude Code refuses --dangerously-skip-permissions as root unless this
+  # says the boundary is the VM.
+  - { name: IS_SANDBOX, value: '1' }
+  # A 12 GB guest reads as 11 GB in /proc/meminfo, and scripts/gates.sh caps
+  # cargo at 2 jobs at 11 GB or less. 4 is what the 30 GB executors run, and
+  # the guest has no swap to absorb several large links at once. Raise it
+  # once a measured gate shows the headroom.
+  - { name: CARGO_BUILD_JOBS, value: '4' }
+  - { name: RUSTUP_HOME, value: /usr/local/rustup }
+  - { name: CARGO_HOME, value: /usr/local/cargo }
+  - { name: npm_config_cache, value: /opt/npm-cache }
+
+# Keys that would move Claude Code or gh off the routes, or hand a guest
+# process a credential the routes exist to keep on the host. The names the
+# routes set themselves (ANTHROPIC_BASE_URL, CLAUDE_CODE_OAUTH_TOKEN, GH_HOST,
+# GH_ENTERPRISE_TOKEN) are not listed, so the list cannot hold one back.
+deny: [ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_CUSTOM_HEADERS,
+       CLAUDE_CODE_USE_BEDROCK, CLAUDE_CODE_USE_VERTEX, OPENAI_API_KEY,
+       AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
+       AWS_BEARER_TOKEN_BEDROCK, GH_TOKEN, GITHUB_TOKEN,
+       GITHUB_ENTERPRISE_TOKEN, CARGO_REGISTRY_TOKEN, RAVEL_REAL_STORE_URL]
+
+# A first-run screen the guest cannot complete: it opens a browser the
+# sandbox does not have. Not a credential.
+onboarding:
+  file: .claude.json
+  seed: { hasCompletedOnboarding: true, hasTrustDialogAccepted: true }
+  trustKey: [projects, hasTrustDialogAccepted]
