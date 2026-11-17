@@ -109,9 +109,11 @@ jobs:
           docker tag ravel-dev:check "$tag"
           docker push "$tag"
 
-  # :latest is what the Brig profile names, so only main moves it. A manual
-  # run on another branch publishes sha-<sha7> only, to try with
-  # make brig IMAGE=ghcr.io/nofireai/ravel-dev:sha-<sha7>.
+  # :latest is what the Brig profile names (the dev target #4405 adds), so
+  # only main moves it. A manual run on another branch publishes sha-<sha7>
+  # only. Try one with:
+  #   docker run --rm -it --entrypoint bash ghcr.io/nofireai/ravel-dev:sha-<sha7>
+  # or, once the dev target is on main, make brig NAME=<name> IMAGE=<that ref>.
   manifest:
     needs: publish
     runs-on: ubuntu-latest

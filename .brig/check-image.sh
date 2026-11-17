@@ -23,9 +23,10 @@ node_major=${node_major%%.*}
 [ -n "$node_major" ] || { echo "check-image: sdk/typescript/.node-version is empty" >&2; exit 1; }
 
 # Brig mounts the guest home over /root, so the checks run with an empty one
-# to prove nothing the image needs lives there.
+# to prove nothing the image needs lives there. pipefail makes a check's
+# status the first failing command's, not its last pipe stage's.
 run() {
-  docker run --rm --entrypoint bash --tmpfs /root -e HOME=/root "$image" -c "$1"
+  docker run --rm --entrypoint bash --tmpfs /root -e HOME=/root "$image" -c "set -o pipefail; $1"
 }
 
 fail=0
@@ -41,9 +42,9 @@ check() {
 
 check rustc "rustc --version | grep -F 'rustc $channel ' "
 check default-toolchain "rustup default | grep -F '$channel-'"
-check one-toolchain "test \$(rustup toolchain list | wc -l) -eq 1 && rustup toolchain list"
+check one-toolchain "test \$(rustup toolchain list | wc -l) -eq 1 && rustup toolchain list | grep -F '$channel-'"
 check components "rustup component list --installed | grep -E '^(rustfmt|clippy|llvm-tools)' | sort | tr '\n' ' ' | grep -E 'clippy.*llvm-tools.*rustfmt'"
-check nextest "cargo nextest --version | head -n 1"
+check nextest "cargo nextest --version | grep -E '^cargo-nextest '"
 check cargo-deny "cargo deny --version"
 check node "node --version | grep -E '^v$node_major\\.'"
 check npm-cache "test -d \"\$npm_config_cache/_cacache\" && echo \$npm_config_cache"

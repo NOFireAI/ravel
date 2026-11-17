@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 #
-# The guest image of the Brigfile's targets: a development environment for a
-# Claude Code session inside a Brig sandbox, not a deployable Ravel artifact.
+# The guest image of the Brig dev target that #4405 adds: a development
+# environment for a Claude Code session inside a Brig sandbox, not a
+# deployable Ravel artifact.
 # CI publishes it as ghcr.io/nofireai/ravel-dev (.github/workflows/brig-image.yml).
 #
 # On top of Brig's stock Claude Code image (Ubuntu 24.04, root, git, gh, jq,
