@@ -491,4 +491,80 @@ therefore means most recently ingested: a backfill filed in the latest
 hour outranks fresh-event parts filed an hour earlier. The whole-part
 cap, the metadata share of the cache budget and the warm deadline are
 unchanged, and a warm failure still warms less and never fails startup.
-`docs/catalog-and-mvcc.md` states the accessor's contract.
+`docs/catalog-and-mvcc.md` states the accessor's contract. Both steps take
+the parts in this order, the whole-part warm the parts at or under the plan
+bound, up to its cap, and the metadata pass the parts above it (2026-11-16
+amendment).
+
+## Amendment (2026-11-16): the whole-part warm skips logs parts above the plan bound (issue #4307)
+
+<!-- amendment-applies: sections="Amendment (2026-11-15): the startup warm-up selects parts by ingest hour, with no event-time filter (issue #4257)" pointer="2026-11-16 amendment" -->
+
+The startup warm-up ran two steps over each tenant's logs warm set: a
+whole-part warm that read the most recent parts whole, and a logs metadata
+pass that read the footer and directories of every part above
+`LogSegmentFetcher::plan_whole_object_bound` (the parts the query path plans
+from their directories). The two bounded the part by different fetchers, so a
+logs part above the plan bound was read both ways: the whole-part warm fetched
+it whole, blocks included, and the metadata pass read its directories. The query
+path never reads such a part's blocks at plan time, so the whole read spent
+the deadline on blocks a statement may never read. On the ClickBench tenant
+every start hit the deadline in the whole-part step, with the disk mostly idle
+after the first 3 s of the M4 start, and the metadata pass warmed 220 of the
+tenant's 222 RLOG objects (issue #4203, M4 and M5). Two explanations fit the 2 missing objects, and neither is
+established: 2 of the 222 parts are at or under the plan bound, so the
+metadata pass never takes them; or 2 whole-part reads were still in flight
+at the deadline and the metadata reads of the same objects waited on them.
+The M5 deadline warning named `step=whole_part_warm` alone, which says the
+metadata pass had already finished, and so argues against the second; the
+warm-up's own deadline test reports `whole_part_warm,metadata_pass` in that
+shape.
+The warm-up's deadline test showed the second shape before this amendment
+(the pass warmed 38 of 40 objects while 2 whole reads hung), on fixture
+objects no bigger than the suffix probe, whose probe shares the whole read's
+cache key; whether it applies to objects larger than the probe is not
+established either. The next box run decides between them with the counts
+this amendment adds: `parts_above_plan_bound`, `parts_beyond_cap`,
+`parts_warmed` and `metadata_objects_warmed`.
+
+The whole-part warm now reads a logs part the way the query path does: whole
+only at or under the plan bound, and not at all above it. A part above the
+bound is dropped from the whole-part set, before the per-(tenant, signal)
+cap, and left to the metadata pass, which warms its footer and four
+directories. The whole-part warm's fetcher is built with the same block-range
+threshold, request cost and projection break-even the metadata pass uses, so
+the two steps agree on the bound and never both read one logs part. They do
+not cover every part: a part at or under the bound past the cap is warmed by
+neither step, since the metadata pass reads only parts above the bound. A
+part skipped for being above the bound is counted in a new
+`parts_above_plan_bound` field and a part at or under it past the cap in a
+new `parts_beyond_cap` field, both on the per-(tenant, signal) warm line and
+the pass-complete line; neither counts as warmed nor as over budget. When the
+metadata pass does not run (its fetcher refuses the query path's fetch
+bound), a part above the bound gets no warm at all, and the warm-up says so
+in one `warn!` per pass. The per-(tenant, signal) `warn!` that nothing warmed
+now keys on the parts at or under the bound: it fires when there were some
+and none warmed or was skipped over budget, whatever the parts above the
+bound. The whole-part cap
+(`MAX_PARTS_PER_TENANT_PER_SIGNAL`), the parts-in-flight and whole-part byte
+budgets, the metadata share of the cache, the warm deadline and `/readyz`
+behaviour are all unchanged. The metric side is unchanged too: a metric part
+above `DEFAULT_WHOLE_OBJECT_THRESHOLD` is still warmed, on its footer tail.
+
+Why: the query path plans an above-bound logs part from its directories,
+which the metadata pass already warms, and reads its blocks only for the
+blocks a specific statement's plan keeps, by range. Warming the blocks whole
+fills the cache with pages no first statement is known to read and spends
+the warm deadline reading them, the cost #4203 set out to remove.
+
+The production case this leaves exposed: a tenant whose logs parts are all
+above the plan bound (a large-object workload such as ClickBench) now has only
+its metadata warmed. For the objects the metadata pass reached before its
+cache ceiling or the deadline, an unkeyed first query plans from the warmed
+footer and directories with no GET; a keyed plan still reads the KEY_IDX,
+BLOOM and POSTINGS sections it needs, and the column-page reads that follow
+are paid cold, where before the whole read had warmed some of them. This is
+the deliberate trade: the warm-up takes the edge off plan-phase reads for
+every tenant within the deadline, rather than paying to warm one large
+tenant's blocks and timing out before it reaches the rest (ADR-0046 consequences: a cold cache answers every query
+correctly, only more slowly).
