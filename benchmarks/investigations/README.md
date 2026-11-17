@@ -736,7 +736,7 @@ in the `declare` step. A repair leaves its tenant indexed, so no two arms
 share one. For each budget B, in order, `state_repair_arms`:
 
 1. checks that the deadline leaves `step_estimate_minutes.repair_arms`
-   (35 in `run.example.toml`, derived there) for the whole arm, and records
+   (37 in `run.example.toml`, derived there) for the whole arm, and records
    the state not-run otherwise;
 2. loads the base corpus's spans and logs into the arm's tenant (loads
    stamped under `repair_arms_B`);
@@ -881,7 +881,7 @@ reports `missing stamps/<name>` for any it needs and does not find;
 | `STATE.logs.fold_binary.json` | `retired_hour` and each `day_parts_N`: the fold binary's `sha`, run.toml's `c1_sha` and `r2_sha` resolved, and `carries_c1` and `carries_r2` by git ancestry |
 | `STATE.logs.fold_watermark.json` | `retired_hour` and `retired_hour_drop`: the retention fold's `previous_watermark_hour` and `watermark_hour` from its `--json` report, `no_op`, and `advanced`; the state fails when it is false |
 | `STATE.logs.tombstone.json` | `retired_hour` and `retired_hour_drop`: the tombstoned `hour` (D0) and `first_hour` to `last_hour` in unix hours, the retention window and the tombstone-check output |
-| `repair_arms_B.SIG.preconditions.json` | `repair_arms`, per arm and signal, before the repair: the declared `fields`, their `leaf_refs` and `declared_leaf_refs`, `parts`, `parts_missing_declared_leaves` (every part lacking a leaf of some declared field; not the repair report's own `parts_unindexed`, which skips empty parts and counts a refused-leaf-version part separately), `largest_unindexed_part_entries` (E), `key_index_build_max_pairs`, and the `ravel_cli` path, `ravel_cli_sha256` and `sha` the repair runs on |
+| `repair_arms_B.SIG.preconditions.json` | `repair_arms`, per arm and signal, before the repair: the declared `fields`, their `leaf_refs` and `declared_leaf_refs`, `parts`, `parts_missing_declared_leaves` (every part lacking a leaf of some declared field; not the repair report's own `parts_unindexed`, which skips empty parts and also counts a part whose leaf version the reader refuses, which this stamp does not), `largest_unindexed_part_entries` (E), `key_index_build_max_pairs`, and the `ravel_cli` path, `ravel_cli_sha256` and `sha` the repair runs on |
 | `needle_blocks.json` | the logs needles' block counts as `rlog inspect` reads them, beside the generator's |
 | `compaction.jsonl`, `erasure.jsonl`, `not_run.jsonl` | the compaction child's reports, the erase submit and status, and each state recorded not-run |
 | `failed_states.jsonl` | each state a failed command stopped: the step, the command's exit code and the `out/logs/` path of its log |
@@ -1901,6 +1901,11 @@ it), each with the wrong versions it must reject:
 - `test_repair_arms_absent`: a report without `passes_per_field.request_id`
   or `attempt_count` is `missing` naming the fold and field. Wrong
   versions: an absent nested key, or an absent field, read as 0.
+- `test_repair_arms_zero_pass`: arm A's logs repaired in zero passes; the
+  cross-arm `logs_section_bytes_per_pass_ratio` divides by that 0 and is
+  `missing` ("divides by a figure whose value is 0") with its problem
+  listed, and the run still writes results. Wrong version: a
+  divide-by-zero derived figure crashes instead of missing.
 - `test_repair_arms_twice`: arm B's spans repair stamped twice is the
   problem `duplicate stamps/folds.jsonl` and its figures `duplicate`, the
   other arm still judged. Wrong version: a fold stamped twice read as 0.

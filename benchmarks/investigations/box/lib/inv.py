@@ -1822,8 +1822,9 @@ def repair_preconditions(catalog, fields):
     stamp: each declared field's leaf refs over every part, the parts lacking
     a leaf of some declared field (parts_missing_declared_leaves; this counts
     every such part, unlike the repair's own report field of a similar name,
-    which skips empty parts and counts a part whose leaf version the reader
-    refuses separately), and the largest such part's entry count (E; null
+    which skips empty parts and also counts a part whose leaf version the
+    reader refuses, which this stamp does not), and the largest such part's
+    entry count (E; null
     when one of them has no integer entry count, 0 when no part is
     unindexed)."""
     parts = catalog.get("parts")
