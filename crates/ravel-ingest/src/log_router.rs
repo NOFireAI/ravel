@@ -335,6 +335,7 @@ impl LogIngestRouter {
                     .collect()
             };
             GenerationSwitch::new(config.shard_count, DEFAULT_REFRESH_INTERVAL_NS, factory)
+                .with_grace_lead(config.flush_trigger_age_bound_ns())
                 .with_refresh_source(refresh_store, ravel_types::Signal::Logs, refresh_clock)
                 .with_read_failures(read_failures)
                 .with_compat_slot(compat.clone())
@@ -1771,6 +1772,34 @@ mod tests {
             2,
             "the degraded counter does not move on the fail-closed call"
         );
+    }
+
+    /// Issue #4363: the grace window refuses a log write whose flush can open
+    /// past the horizon, from `flush_trigger_age_bound_ns` before it on, and
+    /// routes one a nanosecond earlier.
+    #[tokio::test]
+    async fn grace_routing_refuses_a_write_whose_flush_opens_past_the_horizon() {
+        let router = test_router(always_failing_get_store());
+        let t = tenant(10);
+        let t0 = 10 * NS_PER_HOUR;
+        router.refresh_generations(t, vec![], t0);
+        let lead = router.config.flush_trigger_age_bound_ns();
+        let last_window = 12 * NS_PER_HOUR - lead;
+
+        match router.active_set(t, last_window).await {
+            Err(LogWriteError::StaleProvisioningView) => {}
+            other => panic!(
+                "a flush that can open past the horizon must be refused: {:?}",
+                other.map(|set| set.len())
+            ),
+        }
+        router
+            .active_set(t, last_window - 1)
+            .await
+            .expect("a flush that opens inside the horizon routes on grace");
+        let snapshot = router.metrics.snapshot();
+        assert_eq!(snapshot.stale_provisioning_flushes, 1);
+        assert_eq!(snapshot.grace_extended_stale_flushes, 1);
     }
 
     /// Issue #389 regression, driven through the real charge path

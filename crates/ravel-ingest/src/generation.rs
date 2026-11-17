@@ -973,6 +973,8 @@ pub struct GenerationSwitch<H> {
     /// The refresh interval `C`: a cached tenant view older than this is
     /// re-read before routing.
     refresh_interval_ns: i64,
+    /// See [`Self::with_grace_lead`]. 0 unless a router sets it.
+    grace_lead_ns: i64,
     /// Where a flush-open check that found no trusted view re-reads the
     /// record. `None` only for a switch built without one (unit tests), whose
     /// untrusted views stay untrusted until the router refreshes them.
@@ -1014,6 +1016,7 @@ impl<H> GenerationSwitch<H> {
             }),
             factory: Box::new(factory),
             refresh_interval_ns,
+            grace_lead_ns: 0,
             refresh_source: None,
             floor_policy: RwLock::new(FormatFloorPolicy::default()),
             compat: CompatSlot::default(),
@@ -1114,6 +1117,16 @@ impl<H> GenerationSwitch<H> {
     #[must_use]
     pub(crate) fn with_bucket_cache(mut self, cache: BucketCompatCache) -> Self {
         self.bucket_cache = cache;
+        self
+    }
+
+    /// How long after routing a buffered row's flush may open:
+    /// [`crate::IngestConfig::flush_trigger_age_bound_ns`] for the router's
+    /// shards. [`Self::try_grace_extend`] routes only rows whose flush opens
+    /// inside the horizon by then (issue #4363).
+    #[must_use]
+    pub(crate) fn with_grace_lead(mut self, lead_ns: i64) -> Self {
+        self.grace_lead_ns = lead_ns.max(0);
         self
     }
 
@@ -1330,10 +1343,17 @@ impl<H> GenerationSwitch<H> {
     /// caller is responsible for emitting the "routing on grace-extended stale
     /// view" metric on `Some` and the ordinary stale-flush metric on `None`;
     /// this method only decides, it does not record.
+    ///
+    /// The horizon is tested at `now_ns` plus the switch's grace lead, not at
+    /// `now_ns`: a row routed here is acknowledged in buffered mode before its
+    /// flush opens, and a flush that opens past the horizon finds no trusted
+    /// view at its scan-set check and is held, then dropped. A row whose flush
+    /// can open past the horizon is refused instead, before it is buffered.
     pub fn try_grace_extend(&self, tenant: TenantHash, now_ns: i64) -> Option<Arc<Vec<H>>> {
         let mut inner = self.lock();
         let refreshed_at_ns = inner.views.get(&tenant)?.refreshed_at_ns;
-        if hour_of(now_ns) >= trust_horizon(refreshed_at_ns, self.refresh_interval_ns) {
+        let flush_opens_by_ns = now_ns.saturating_add(self.grace_lead_ns);
+        if hour_of(flush_opens_by_ns) >= trust_horizon(refreshed_at_ns, self.refresh_interval_ns) {
             return None;
         }
         let count = {
