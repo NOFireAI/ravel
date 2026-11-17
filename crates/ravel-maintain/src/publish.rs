@@ -286,7 +286,7 @@ async fn publish_compaction_record(
     };
 
     let record_key = keys::compaction_record_key_for(&record)?;
-    let payload = record.encode_to_vec();
+    let payload = bytes::Bytes::from(record.encode_to_vec());
     // Finish/publish phase (issue #977): the encoded record payload is the only
     // allocation this phase adds on top of the parts still retained in the
     // merge's `PartSink`. Recording it here lets a report show the publish phase
@@ -317,10 +317,14 @@ async fn publish_compaction_record(
     // the request it spent exactly like the winning arm.
     let payload_len = payload.len() as u64;
     crate::compat_policy::before_put(config.compat_run.as_ref(), store).await?;
-    let put = store.put(&record_key, payload.into(), opts).await;
+    let put = store.put(&record_key, payload.clone(), opts).await;
     note_put(ledger, RequestPhase::Publish, payload_len);
     match put {
         Ok(_) => {
+            ravel_invariant::inv_reachable!(
+                "catalog: compaction record published",
+                std::collections::BTreeMap::from([("record_key", record_key.clone())])
+            );
             // The tombstone race is closed by verification, not retention
             // (ADR-0979 decision 3): a part that answered `AlreadyExists` at PUT
             // carries an abandoned run's age and could have been swept between
@@ -336,6 +340,7 @@ async fn publish_compaction_record(
             resolve_already_exists(
                 store,
                 &record_key,
+                &payload,
                 input_set_hash,
                 parts,
                 ledger,
@@ -399,9 +404,11 @@ fn checked_sample_sum(counts: impl Iterator<Item = u64>) -> Result<u64> {
 /// the record would reference an absent object. Different `input_set_hash`:
 /// a sealed bucket cannot legitimately hold two input sets, so alarm and stop
 /// without deleting anything.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_already_exists(
     store: &dyn ObjectStoreBackend,
     record_key: &str,
+    our_payload: &bytes::Bytes,
     our_hash: &[u8; 32],
     our_parts: &[BuiltPart],
     ledger: Option<&RequestLedger>,
@@ -410,7 +417,40 @@ async fn resolve_already_exists(
     let existing = store.get(record_key, GetRange::Full).await;
     note_get(ledger, RequestPhase::Publish, &existing);
     let existing = existing?;
-    let winner = ravel_commit::record::decode_compaction(existing.data.as_ref())
+    if ravel_invariant::inv_mutant!("catalog/compaction-swaps-record") {
+        store
+            .put(record_key, our_payload.clone(), PutOptions::default())
+            .await?;
+    }
+    let outcome =
+        resolve_against_winner(store, record_key, &existing.data, our_hash, our_parts, ledger, compat)
+            .await;
+    // The record the store holds after this attempt, not the one it fetched.
+    ravel_invariant::inv_always!(
+        match store.get(record_key, GetRange::Full).await {
+            Ok(after) => after.data == existing.data,
+            Err(_) => false,
+        },
+        "catalog: a published compaction record is never replaced",
+        std::collections::BTreeMap::from([
+            ("record_key", record_key.to_string()),
+            ("our_input_set_hash", hex::encode(our_hash)),
+        ])
+    );
+    outcome
+}
+
+/// [`resolve_already_exists`] against the winner's record bytes `existing`.
+async fn resolve_against_winner(
+    store: &dyn ObjectStoreBackend,
+    record_key: &str,
+    existing: &[u8],
+    our_hash: &[u8; 32],
+    our_parts: &[BuiltPart],
+    ledger: Option<&RequestLedger>,
+    compat: Option<&crate::compat_policy::CompatRun>,
+) -> Result<PublishOutcome> {
+    let winner = ravel_commit::record::decode_compaction(existing)
         .map_err(|e| MaintainError::Invariant(format!("winner record decode failed: {e}")))?;
     // The winner's key must reconstruct to the key we fetched it at.
     keys::verify_compaction_record_key(&winner, record_key)?;
@@ -475,7 +515,7 @@ async fn resolve_already_exists(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use proptest::prelude::*;
@@ -671,6 +711,159 @@ mod tests {
             list_all(&store, "").await.expect("list").is_empty(),
             "aborted publish must write nothing"
         );
+    }
+
+    /// True in the invariants lane, where assertion sites record evaluations.
+    pub(crate) fn capturing() -> bool {
+        let on = std::cell::Cell::new(false);
+        ravel_invariant::inv_sometimes!(
+            {
+                on.set(true);
+                true
+            },
+            "ravel-maintain test: evaluations are captured",
+            ""
+        );
+        on.get()
+    }
+
+    /// Selects mutant `name` on this thread until the returned guard drops;
+    /// `None` outside the invariants lane, where no mutant is compiled in.
+    pub(crate) fn scoped_mutant(name: &'static str) -> Option<Box<dyn std::any::Any>> {
+        let guard: std::cell::RefCell<Option<Box<dyn std::any::Any>>> = Default::default();
+        let _ = name;
+        ravel_invariant::inv_sometimes!(
+            {
+                let scoped = ravel_invariant::mutant::scoped(name).expect("a registered mutant");
+                *guard.borrow_mut() = Some(Box::new(scoped));
+                true
+            },
+            "ravel-maintain test: a mutant is scoped",
+            ""
+        );
+        guard.into_inner()
+    }
+
+    /// `(condition, details)` of every captured evaluation of `message` whose
+    /// details mention `needle`; empty outside the invariants lane.
+    pub(crate) fn evaluations(message: &'static str, needle: &str) -> Vec<(bool, String)> {
+        let found = std::cell::RefCell::new(Vec::new());
+        let _ = (message, needle);
+        ravel_invariant::inv_sometimes!(
+            {
+                found.borrow_mut().extend(
+                    ravel_invariant::capture::evaluations_of(message)
+                        .into_iter()
+                        .filter(|e| e.details.contains(needle))
+                        .map(|e| (e.condition, e.details)),
+                );
+                true
+            },
+            "ravel-maintain test: evaluations are read",
+            ""
+        );
+        found.into_inner()
+    }
+
+    const RECORD_NEVER_REPLACED: &str = "catalog: a published compaction record is never replaced";
+
+    /// Publishes 17 input records as parts of 12 and 5 under `input_set_hash`
+    /// and puts the parts the record names, then publishes the same inputs as
+    /// one part of 17: the second attempt loses the create to a record whose
+    /// parts differ. Returns the first record's bytes and the second outcome.
+    async fn publish_then_lose_with_other_parts(
+        store: &MemoryStore,
+        input_set_hash: &[u8; 32],
+    ) -> (String, bytes::Bytes, Result<PublishOutcome>) {
+        let bucket = bucket(Signal::Metrics);
+        let inputs = vec![input(1, 10, &bucket), input(2, 7, &bucket)];
+        let clock = FixedClock::new(1);
+        let config = CompactorConfig::default();
+        let first = publish_record(
+            store,
+            &config,
+            &clock,
+            &bucket,
+            &inputs,
+            input_set_hash,
+            &[part(0, 12), part(1, 5)],
+            1,
+        )
+        .await
+        .expect("first publish");
+        assert_eq!(first, PublishOutcome::Published);
+        let listed = list_all(store, "").await.expect("list");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        let record_key = listed[0].key.clone();
+        let winner = store
+            .get(&record_key, GetRange::Full)
+            .await
+            .expect("record")
+            .data;
+        let record = ravel_commit::record::decode_compaction(&winner).expect("decode");
+        for p in &record.parts {
+            let key = keys::reconstruct_l1_part_key(&record, p).expect("part key");
+            store
+                .put(&key, bytes::Bytes::new(), PutOptions::create_if_absent())
+                .await
+                .expect("put part");
+        }
+        let second = publish_record(
+            store,
+            &config,
+            &clock,
+            &bucket,
+            &inputs,
+            input_set_hash,
+            &[part(0, 17)],
+            1,
+        )
+        .await;
+        (record_key, winner, second)
+    }
+
+    async fn record_bytes(store: &MemoryStore, record_key: &str) -> bytes::Bytes {
+        store
+            .get(record_key, GetRange::Full)
+            .await
+            .expect("record")
+            .data
+    }
+
+    #[tokio::test]
+    async fn mutant_compaction_swaps_record_breaks_conservation() {
+        let Some(_mutant) = scoped_mutant("catalog/compaction-swaps-record") else {
+            return;
+        };
+        let hash = [0x41; 32];
+        let store = MemoryStore::new();
+        let (key, winner, _) = publish_then_lose_with_other_parts(&store, &hash).await;
+        let found = evaluations(RECORD_NEVER_REPLACED, &hex::encode(hash));
+        assert!(
+            found.iter().any(|(held, _)| !held),
+            "the property is evaluated false for the overwrite: {found:?}"
+        );
+        assert_ne!(record_bytes(&store, &key).await, winner, "the mutant replaced it");
+    }
+
+    #[tokio::test]
+    async fn a_compaction_loser_converges_without_replacing_the_record() {
+        if !capturing() {
+            return;
+        }
+        let hash = [0x42; 32];
+        let store = MemoryStore::new();
+        let (key, winner, second) = publish_then_lose_with_other_parts(&store, &hash).await;
+        assert_eq!(
+            second.expect("the loser converges"),
+            PublishOutcome::Converged { parts_repaired: 0 }
+        );
+        assert_eq!(record_bytes(&store, &key).await, winner);
+        let found = evaluations(RECORD_NEVER_REPLACED, &hex::encode(hash));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].0, "{found:?}");
+        let published = evaluations("catalog: compaction record published", "");
+        assert!(!published.is_empty());
     }
 
     proptest! {
