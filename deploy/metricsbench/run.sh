@@ -93,8 +93,8 @@
 #               lane) listed by aws s3api list-objects-v2 in the createbuckets
 #               service with its entrypoint overridden, every page; the keys
 #               counted and summed by kind into <out>/ravel-objects.json and
-#               stamped (ravel_objects): data (t/*/m/l0/*.rseg), commit
-#               (t/*/m/c/), qualify (sys/qualify/), other, and total. A
+#               stamped (ravel_objects): data (t/*/m/l0/*.rseg), l1
+#               (t/*/m/l1/*.rseg), commit (t/*/m/c/), qualify (sys/qualify/), other, and total. A
 #               failed or truncated listing fails the step. With
 #               --ravel-objects-band MIN:MAX the data count, and only it,
 #               must lie in [MIN, MAX]; otherwise the step fails
@@ -394,30 +394,44 @@
 # not run. Only metricsbench_ingest is required in --bin-dir. Steps:
 # fetch-s3s-fs, fold-flags, stage1-flags, up (docker compose up -d
 # ravel-server, which starts its object store and one-shots and no
-# comparator), qualify, image, ready (Ravel alone), then
+# comparator; ravel-server runs with the label index on, stamped as
+# stage1.server_flags_up), qualify, image, ready (Ravel alone), then
 #
 #   ingest      metricsbench_ingest with the Ravel row alone
 #               (--no-in-process-row) into <out>/ingest.json. A Ravel row
 #               whose read-back answered 422 is stamped refused (budget) as
 #               ravel_only.ingest_readback and the run goes on; any other
 #               failure fails the step
-#   readback-l0  as readback-folded, on the background-folded L0 catalog:
-#               /metrics into <out>/ravel-metrics-before-readback-l0.txt,
-#               metricsbench_ingest --readback-only --readback-system ravel
-#               into <out>/readback-l0.json, /metrics again into
-#               <out>/ravel-metrics-after-readback-l0.txt; stamped as
-#               ravel_only.l0.readback
+#   stage1-l0-fold  ravel-server stopped, METRICSBENCH_SLEEP until the last
+#               ingest hour seals (as stage1-l1-compact waits), then the
+#               fold stage1-l1-fold runs, into <out>/stage1-l0-fold.json
+#               (stage1.l0_fold)
+#   stage1-l0   ravel-server recreated with the routed flags
+#               (stage1.l0_restart), the snapshot state read
+#               (stage1.l0_catalog) and stamped as ravel_only.l0.catalog;
+#               a snapshot that does not reach the hour the ingest ended
+#               refuses the read-back (ravel_only.l0.catalog.uncovered)
 #   objects-l0  as objects, into <out>/ravel-objects-l0.json
 #               (ravel_only.l0.objects; --ravel-objects-band applies here
 #               only), and ravel-cli catalog list into
 #               <out>/ravel-only-l0.objects.jsonl, its L0 and L1 counts
 #               stamped as ravel_only.l0.catalog_objects
+#   readback-l0  as readback-folded, on that L0 catalog:
+#               /metrics into <out>/ravel-metrics-before-readback-l0.txt,
+#               metricsbench_ingest --readback-only --readback-system ravel
+#               into <out>/readback-l0.json, /metrics again into
+#               <out>/ravel-metrics-after-readback-l0.txt; stamped as
+#               ravel_only.l0.readback
 #   stage1-l1-compact, stage1-l1-fold, stage1-l1  as above, except that
-#               stage1-l1 reads the snapshot state (stage1.l1_catalog) and
-#               runs no pass: stage1.l1 and stage1.l1_compare say skipped
+#               stage1-l1 reads the snapshot state (stage1.l1_catalog),
+#               stamps and checks it as stage1-l0 does
+#               (ravel_only.l1.catalog) and runs no pass: stage1.l1 and
+#               stage1.l1_compare say skipped. ravel_only.differences then
+#               names each condition other than catalog level that could
+#               differ between the two read-backs, same or differs
 #   objects-l1  as objects-l0, into <out>/ravel-objects-l1.json and
-#               <out>/ravel-only-l1.objects.jsonl (ravel_only.l1.objects and
-#               .catalog_objects)
+#               <out>/ravel-only-l1.objects.jsonl (ravel_only.l1.objects,
+#               the L1 parts under its l1 kind, and .catalog_objects)
 #   readback-l1  as readback-l0 on the L1 catalog, with -l1 in each file
 #               name (ravel_only.l1.readback)
 #
