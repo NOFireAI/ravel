@@ -117,11 +117,18 @@ never produce a too-old merge base), does the history clean above, runs the
 local pre-flight gates on the cleaned tree, and only then pushes the PR
 head and opens the PR (without auto-merge; see above).
 
+Fetch into a destination unique to this process, never `FETCH_HEAD`: it is
+shared by every git command in the checkout, so a concurrent fetch landing
+between the fetch and the read below resolves to someone else's ref
+(issue #4079).
+
 ```sh
 TASK=<task-id>
-git fetch origin refs/heads/task/$TASK/result
-git log --oneline origin/main..FETCH_HEAD   # exactly the expected commits?
-git diff --stat origin/main...FETCH_HEAD    # scope: only the task's dirs?
+DEST=refs/agent-cli/fetch/merge-skill-$$-$RANDOM
+git fetch origin "+refs/heads/task/$TASK/result:$DEST"
+git log --oneline origin/main..$DEST   # exactly the expected commits?
+git diff --stat origin/main...$DEST    # scope: only the task's dirs?
+git update-ref -d "$DEST"
 
 # Write the PR message: first line is the PR title, everything after the
 # blank line is the PR body (put Fixes: #<issue> / Refs: #<issue> here).

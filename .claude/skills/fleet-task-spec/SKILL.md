@@ -696,8 +696,14 @@ the same turn as the `fleet_dispatch` call, every time.
    carried a SHA whose first 8 hex digits were real and whose remaining
    32 were invented, and the task expired unclaimed. For any other ref
    shape (a short SHA, a remote-only branch name, another task's result
-   ref) run `git fetch origin <ref> --quiet && git rev-parse FETCH_HEAD`
-   first; dispatch only pushes objects the local repo already has.
+   ref) run `git fetch origin '+<ref>:refs/agent-cli/fetch/spec-<pid>-<rand>'
+   --quiet && git rev-parse refs/agent-cli/fetch/spec-<pid>-<rand>` first,
+   then `git update-ref -d` that ref; dispatch only pushes objects the
+   local repo already has. Never `git rev-parse FETCH_HEAD`: it is shared
+   by every git command in the checkout, so a concurrent fetch landing
+   between the two commands resolves to someone else's ref (issue #4079).
+   `bin/agent-cli dispatch --ref <ref>` does this itself; prefer it over
+   the hand-rolled fetch when dispatching through agent-cli.
 2. **A dirty tree does not block the push; it matters only when the
    dispatch takes local HEAD.** The dispatch push is ref-based: it pushes
    the objects behind the `ref` resolved in step 1, and it does not refuse

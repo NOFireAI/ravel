@@ -36,8 +36,15 @@ echo "==> Fetching origin/main"
 git fetch -q origin main
 
 echo "==> Fetching ${result_ref}"
-git fetch origin "${result_ref}"
-result_sha="$(git rev-parse FETCH_HEAD)"
+# A destination unique to this process, not FETCH_HEAD: FETCH_HEAD is shared
+# by every git command in the checkout, so a concurrent fetch elsewhere can
+# land between this fetch and the rev-parse below and resolve to its ref
+# instead (issue #4079). Deleted on every exit path, failures included.
+dest_ref="refs/agent-cli/fetch/result-inspect-$$-${RANDOM}"
+cleanup() { git update-ref -d "${dest_ref}" 2>/dev/null || true; }
+trap cleanup EXIT
+git fetch origin "+${result_ref}:${dest_ref}"
+result_sha="$(git rev-parse "${dest_ref}")"
 
 echo "==> Commits on the result branch not yet on ${base_ref}:"
 git log --oneline "${base_ref}..${result_sha}"
