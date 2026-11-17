@@ -83,8 +83,8 @@ impl CompatOutcome {
     /// Write the chosen rendering to stdout.
     pub fn emit(&self, as_json: bool) {
         if as_json {
-            let rendered = serde_json::to_string_pretty(&self.json)
-                .unwrap_or_else(|_| self.json.to_string());
+            let rendered =
+                serde_json::to_string_pretty(&self.json).unwrap_or_else(|_| self.json.to_string());
             println!("{rendered}");
         } else {
             print!("{}", self.text);
@@ -130,8 +130,7 @@ pub fn load_compat_keys(key_file: Option<&Path>) -> anyhow::Result<Option<Compat
 /// The unkeyed-store refusal `certify`/`verify`/`status` raise before touching
 /// the store, matching the wording of the library's own `Unkeyed` errors that
 /// `init`/`activate` raise.
-const UNKEYED_READ_REFUSAL: &str =
-    "no --tenant-hash-key-file configured: sys/compat is MAC-signed under the deployment key, so \
+const UNKEYED_READ_REFUSAL: &str = "no --tenant-hash-key-file configured: sys/compat is MAC-signed under the deployment key, so \
      an unkeyed store carries no compat record to read";
 
 fn is_class_a(family: &str) -> bool {
@@ -278,8 +277,7 @@ pub struct ActivateArgs {
 /// prerequisite amendments): a pre-baseline maintain process that outlives the
 /// rollout still deletes alert history and audit objects by age with no
 /// version hold, and no fence or pass detects that deletion.
-pub const PRE_BASELINE_RESIDUAL: &str =
-    "a pre-baseline (v0.33.x) maintain process that outlives the rollout still deletes alert \
+pub const PRE_BASELINE_RESIDUAL: &str = "a pre-baseline (v0.33.x) maintain process that outlives the rollout still deletes alert \
      history and audit objects by age with no version hold; no fence and no late-write pass \
      detects that deletion, so terminating every pre-baseline process is the only control";
 
@@ -380,11 +378,7 @@ fn render_activate(report: &ravel_maintain::ActivateReport) -> CompatOutcome {
 
     // An incomplete fence walk blocks certification until it is resumed; a
     // completed activation whose walk finished is success.
-    let exit_code = if walk.complete {
-        EXIT_OK
-    } else {
-        EXIT_PENDING
-    };
+    let exit_code = if walk.complete { EXIT_OK } else { EXIT_PENDING };
     let json = json!({
         "outcome": outcome,
         "family": report.family,
@@ -642,9 +636,7 @@ fn certify_refusal_reason(refusal: &CertifyRefusal) -> String {
             "sys/compat was replaced during the certificate CAS; rerun to resume the cursor"
                 .to_string()
         }
-        CertifyRefusal::ConcurrentCertify => {
-            "another certify run owns the cursor".to_string()
-        }
+        CertifyRefusal::ConcurrentCertify => "another certify run owns the cursor".to_string(),
     }
 }
 
@@ -687,8 +679,14 @@ pub async fn verify(
     let mut pass_findings: Vec<Value> = Vec::new();
     let mut found_late_write = false;
     for target in &targets {
-        let report =
-            late_write_pass(store.as_ref(), &keys, now_ns, target, clock_skew_allowance_ns).await?;
+        let report = late_write_pass(
+            store.as_ref(),
+            &keys,
+            now_ns,
+            target,
+            clock_skew_allowance_ns,
+        )
+        .await?;
         if !report.late_writes.is_empty() {
             found_late_write = true;
         }
