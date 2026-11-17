@@ -153,15 +153,15 @@ The scope is ingest durability only:
 
 ## Known findings the harness works around
 
-- ravel-server exits about 3 s after start when the store does not answer
-  its startup read of `sys/qualification`, even on a transient connect error
-  ("store backend is not qualified; refusing to start"). On Kubernetes the pod
-  restarts. Here nothing would restart it, so a node that Antithesis restarted
-  during a store outage would stay down for the rest of the timeline. Each node's
-  entrypoint therefore waits until the bucket answers a signed list, then
-  `exec`s ravel-server. The window between that check and the server's own
-  read remains. When "the system recovers once faults stop" fails, first
-  look for "refusing to start" in the down node's log.
+- ravel-server used to exit about 3 s after start when the store did not
+  answer a startup read, even on a transient connect error (#4325), and nothing
+  here restarts it. The server now retries its startup store reads while the
+  store returns a retryable error, up to `--startup-store-deadline`. The compose
+  file sets that to 300 s, far longer than the 15 s default, because no probe
+  or supervisor restarts a container that exits. The entrypoint no longer waits
+  for the store before starting the server, so runs exercise that retry. When
+  "the system recovers once faults stop" fails, look first for "refusing to
+  start" in the down node's log.
 - `snouty validate` on an Apple Silicon Mac needs Docker Desktop's Rosetta
   emulation. Under its QEMU fallback, the amd64 `ravel-cli` in `init` crashes
   with a segmentation fault, and setup never completes. Validate on an amd64 host,
