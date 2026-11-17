@@ -523,9 +523,9 @@ async fn warm_cache_inner(
     // whole read into. Without it here a part at or under the bound would be
     // warmed under an extent key the query path never asks for, so its first
     // read would miss the cache. Apply it under the same non-zero guard the
-    // pass uses. The only error the builder returns is for a zero bound, which
-    // the guard excludes; on the unreachable error keep the fetcher without it
-    // rather than unwrap, matching the pass's refuse-and-degrade shape.
+    // pass uses. The builder errs only on a zero bound, which the guard
+    // excludes; were it to err, keep the fetcher without the bound rather than
+    // fail the warm-up.
     if logs_metadata.max_fetch_run_bytes != 0 {
         match logs_fetcher
             .clone()
