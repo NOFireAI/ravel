@@ -4551,6 +4551,28 @@ class Evaluate(Workdir):
     def test_repair_arms_absent(self):
         self.assertEqual(self.check_repair_arms_absent(), [])
 
+    def check_repair_arms_zero_pass(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Arm a's logs repaired in zero passes: the cross-arm ratio divides by that 0 and is missing,
+        not a crash, and the run still writes results."""
+        def edit(arm, sig, report):
+            if (arm, sig) == ("a", "logs"):
+                report["passes"] = 0
+                report["passes_per_field"] = {k: 0 for k in report["passes_per_field"]}
+        self.set_repair_arms(edit)
+        code, res, text = self.go(bands, evaluate_py)
+        if res is None:
+            return [f"no results written, exit {code}: {text[-500:]}"]
+        got = self.repair_row(res)
+        f = got.get("logs_section_bytes_per_pass_ratio")
+        want = ("missing", None, "divides by a figure whose value is 0")
+        out = [] if f is not None and (f["status"], f["value"], f["reason"]) == want else [f"ratio {f}"]
+        if not any(p.startswith("missing issue4347_repair.logs_section_bytes_per_pass_ratio") for p in res["problems"]):
+            out.append(f"problems {res['problems']}")
+        return out
+
+    def test_repair_arms_zero_pass(self):
+        self.assertEqual(self.check_repair_arms_zero_pass(), [])
+
     def check_repair_arms_twice(self, evaluate_py=EVALUATE):
         """Arm b's spans repair stamped twice: each of its fold figures is duplicate, not either line's
         value, and the run fails."""
@@ -4661,6 +4683,11 @@ FLIPS = {
         '        return "duplicate", None, f"two fold stamps for {transition}/{tenant}/{label}"\n',
         '        return "value", 0, ""\n',
         "check_repair_arms_twice",
+    ),
+    "a divide-by-zero derived figure crashes instead of missing": (
+        '    except ZeroDivisionError:\n        return "missing", None, "divides by a figure whose value is 0"\n',
+        "",
+        "check_repair_arms_zero_pass",
     ),
     "the measure stamp's wall read from the report": (
         '    if field in ("peak_rss_bytes", "wall_s"):\n',
@@ -7915,11 +7942,12 @@ echo "STATE-RC=$rc"
                              {"entry_count": 70, "leaves": [{"field": "trace_id"}]}]}
         got = inv.repair_preconditions(catalog, ["request_id", "trace_id"])
         want = {"fields": ["request_id", "trace_id"], "leaf_refs": {"request_id": 1, "trace_id": 2},
-                "declared_leaf_refs": 3, "parts": 3, "parts_unindexed": 2, "largest_unindexed_part_entries": 70}
+                "declared_leaf_refs": 3, "parts": 3, "parts_missing_declared_leaves": 2,
+                "largest_unindexed_part_entries": 70}
         if got != want:
             out.append(f"logs: {got}")
         got = inv.repair_preconditions(catalog, ["trace_id"])
-        if (got["parts_unindexed"], got["largest_unindexed_part_entries"]) != (1, 60):
+        if (got["parts_missing_declared_leaves"], got["largest_unindexed_part_entries"]) != (1, 60):
             out.append(f"spans: {got}")
         catalog["parts"][2]["entry_count"] = None
         try:

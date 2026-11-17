@@ -345,6 +345,7 @@ want_bench=0
 want_stage_timing=0
 want_cli_sql_explain=0
 want_ingest_shipping=0
+want_invariants=0
 if [[ ${#crate_args[@]} -eq 0 ]]; then
   want_sql=1
   want_agents=1
@@ -356,6 +357,7 @@ if [[ ${#crate_args[@]} -eq 0 ]]; then
   want_stage_timing=1
   want_cli_sql_explain=1
   want_ingest_shipping=1
+  want_invariants=1
 else
   for c in "${gate_crates[@]}"; do
     case "${c}" in
@@ -391,6 +393,12 @@ else
     esac
     case "${c}" in
       ravel-ingest) want_ingest_shipping=1 ;;
+    esac
+    # The crates that carry ADR-4326 assertion sites and mutant switches.
+    case "${c}" in
+      ravel-invariant | ravel-commit | ravel-ingest | ravel-catalog | ravel-maintain | ravel-fleet)
+        want_invariants=1
+        ;;
     esac
   done
 fi
@@ -494,6 +502,15 @@ run_feature_lanes() {
     run_feature_lane stage-timing -p ravel-logseg -p ravel-ingest
   fi
 
+  # ADR-4326 assertion sites and mutant switches: each crate's tests with every
+  # evaluation recorded in process and every mutant compiled in, so a test can
+  # show a site holding and its mutant breaking it. No SDK. Mirrors CI's
+  # `invariants` job.
+  if [[ ${want_invariants} -eq 1 ]]; then
+    run_feature_lane ravel-invariant/capture,ravel-invariant/antithesis-mutants \
+      -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet
+  fi
+
   # ravel-cli's `sql explain` subcommand (issue #2881) and its tests compile
   # only under `sql-explain`, which no other lane selects. Mirrors CI's
   # `cli-sql-explain` features leg.
@@ -585,7 +602,7 @@ run_executor_gates() {
     dry_run=1
     want_sql=1 want_agents=1 want_agents_small_pages=1 want_mcp=1
     want_flight_sql=1 want_esql=1 want_bench=1 want_stage_timing=1
-    want_cli_sql_explain=1 want_ingest_shipping=1
+    want_cli_sql_explain=1 want_ingest_shipping=1 want_invariants=1
     run_feature_lanes
   )" || lanes_rc=$?
   if [[ ${lanes_rc} -ne 0 ]]; then
@@ -624,12 +641,14 @@ run_executor_gates() {
         if [[ -n "${feats}" && "${kind}" == "test" ]]; then
           lane_test_crates="$(add_word "${lane_test_crates}" "-p ${p}")"
           for f in ${feats//,/ }; do
-            lane_test_features="$(add_word "${lane_test_features}" "${p}/${f}")"
+            [[ "${f}" == */* ]] || f="${p}/${f}"
+            lane_test_features="$(add_word "${lane_test_features}" "${f}")"
           done
         fi
       elif [[ " ${rest} " == *" ${p} "* ]]; then
         for f in ${feats//,/ }; do
-          check_features="$(add_word "${check_features}" "${p}/${f}")"
+          [[ "${f}" == */* ]] || f="${p}/${f}"
+          check_features="$(add_word "${check_features}" "${f}")"
         done
       fi
     done

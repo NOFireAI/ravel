@@ -1290,6 +1290,10 @@ pub struct MaintenanceTaskConfig {
     /// `ravel_server::start` refuses `Mode::Maintain` when this is `None`;
     /// every other mode ignores it.
     pub worker_record_keys: Option<MaintainRecordKeys>,
+    /// The `sys/compat` late-write, finalization and background migrate
+    /// units ([`crate::compat_maintain`]). Spawned only with `keys` set and a
+    /// compat policy on [`compactor`](Self::compactor).
+    pub compat: crate::compat_maintain::CompatMaintainConfig,
 }
 
 impl Default for MaintenanceTaskConfig {
@@ -1304,6 +1308,7 @@ impl Default for MaintenanceTaskConfig {
             stalled_after_intervals: DEFAULT_STALLED_AFTER_INTERVALS,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             worker_record_keys: None,
+            compat: crate::compat_maintain::CompatMaintainConfig::default(),
         }
     }
 }
@@ -1478,6 +1483,15 @@ pub fn spawn(
     } else {
         Some(fallback_allow)
     };
+    let compat_ctx = compat_maintain_context(
+        &config,
+        &store,
+        &compactor,
+        &worker,
+        &clock,
+        &fallback_allow,
+    );
+    let compat_live_rx = live_tx.subscribe();
 
     let (tx, rx) = oneshot::channel();
     let ctx = LoopContext {
@@ -1509,9 +1523,52 @@ pub fn spawn(
         RESTART_BACKOFF_INITIAL,
         RESTART_BACKOFF_MAX,
     ));
-    Ok(MaintenanceTasks {
+    let mut tasks = MaintenanceTasks {
         shutdown: vec![tx],
         handles: vec![handle],
+    };
+    if let Some(compat_ctx) = compat_ctx {
+        let (compat_tx, compat_rx) = oneshot::channel();
+        tasks.handles.push(crate::compat_maintain::spawn(
+            compat_ctx,
+            compat_live_rx,
+            compat_rx,
+        ));
+        tasks.shutdown.push(compat_tx);
+    }
+    Ok(tasks)
+}
+
+/// The [`crate::compat_maintain`] context, or `None` when the process has no
+/// compat policy or no `sys/compat` keys (an unkeyed bucket).
+fn compat_maintain_context(
+    config: &MaintenanceTaskConfig,
+    store: &Arc<dyn ObjectStoreBackend>,
+    compactor: &Arc<CompactorConfig>,
+    worker: &Arc<WorkerSet>,
+    clock: &Arc<dyn Clock>,
+    fallback_allow: &Option<Vec<TenantHash>>,
+) -> Option<crate::compat_maintain::CompatMaintainContext> {
+    let (Some(keys), Some(policy)) = (&config.compat.keys, &compactor.compat_policy) else {
+        if config.compat.background_migrate.is_some() {
+            tracing::warn!(
+                "--background-migrate has no effect: this process has no sys/compat policy \
+                 (no deployment key)"
+            );
+        }
+        return None;
+    };
+    Some(crate::compat_maintain::CompatMaintainContext {
+        store: store.clone(),
+        keys: keys.clone(),
+        view: policy.view().clone(),
+        compactor: compactor.clone(),
+        worker: worker.clone(),
+        clock: clock.clone(),
+        shard_count: config.shard_count,
+        fallback_allow: fallback_allow.clone(),
+        background_migrate: config.compat.background_migrate,
+        interval: config.compat.interval,
     })
 }
 

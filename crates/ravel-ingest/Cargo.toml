@@ -31,7 +31,17 @@ stage-timing = ["ravel-logseg/stage-timing", "flush-input-bytes"]
 # encode makes; off, the flush path has no recorder field, lock, or call.
 flush-input-bytes = []
 
+# ADR-4326: the Antithesis assertions and the test-only mutant switches at
+# this crate's sites, forwarded so ravel-server and ravel-cli turn them on for
+# the whole build. Off by default and in no published build
+# (scripts/guards/check-release-profile.sh).
+antithesis = ["ravel-invariant/antithesis"]
+antithesis-mutants = ["ravel-invariant/antithesis-mutants"]
+
 [dependencies]
+# ADR-4326 assertion and mutant macros; with no feature on they expand to
+# nothing.
+ravel-invariant = { workspace = true }
 ravel-types = { workspace = true }
 ravel-segment = { workspace = true }
 ravel-commit = { workspace = true }

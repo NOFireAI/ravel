@@ -404,6 +404,23 @@ When the cache is on, `ravel-server` warms it before it reports ready
 bounded number of the most recent metric and log segments of that tenant. The
 first real query after a restart then does not pay the full cold cost.
 
+A log segment is warmed the way a query reads it: whole only when it is at or
+under the logs plan bound (`LogSegmentFetcher::plan_whole_object_bound`), and
+not at all above it. Above the bound a query plans from the segment's
+directories and then reads by range only the blocks its plan keeps, so warmup
+reads only the footer and directories (the metadata pass below), never the
+segment whole: a whole read there would fetch blocks a query may never read. A
+log segment above the bound is left out of the whole-segment warm and counted
+separately (`parts_above_plan_bound`), so the most recent segments warmed whole
+are the ones at or under the bound. A segment at or under the bound that falls
+past the whole-segment warm's limit of 4 per tenant and signal is counted in
+`parts_beyond_cap` and is warmed by neither step. If the metadata pass does not
+run (its fetcher refuses the configured logs fetch bound), log segments above
+the bound get no warm at all, and warmup logs at most one `warn!` per pass
+saying so (none when the deadline stops the pass first).
+(Metric segments are unchanged: a large one is still warmed, on its footer
+tail.)
+
 For logs it also reads the footer and directories of every log segment in the
 same warm set that a query plans from its directories, without the segment's
 column pages. Warmup finds each tenant's warm set, reads the most recent
@@ -452,6 +469,16 @@ it, whatever their event times, newest ingest hour first. A tenant loaded with
 old data, such as a benchmark set whose event times are years in the past, is
 warmed the same way as one ingesting live data.
 
+A tenant whose log segments are all above the plan bound (a large-object
+workload) has only their metadata warmed, and only for the segments the
+metadata pass reached before its share of the cache or the time budget ran
+out. For those segments a first query with no key predicate plans from the
+warmed footer and directories with no GET; a query that filters on keys still
+reads the key index, bloom and postings sections it needs, and the
+column-page reads that follow are paid cold. This is deliberate: warmup takes
+the edge off plan-phase reads for every tenant within the time budget, rather
+than spending it reading one large tenant's blocks.
+
 Warmup is best-effort:
 
 - It has an overall time budget of 10 seconds, covering every step. If
@@ -471,12 +498,24 @@ tenant does not use never produces a `warn!` by itself.
 
 The per-(tenant, signal) line carries `tenant_hash`, `signal`, `parts_warmed`,
 `parts_over_budget` (segments skipped because they did not fit the whole
-segments' share of the cache once no read of theirs was in flight) and `latest_ingest_hour`. Its level is:
+segments' share of the cache once no read of theirs was in flight),
+`parts_above_plan_bound` (log segments the whole-segment warm skipped for being
+above the plan bound, left to the metadata pass), `parts_beyond_cap` (segments
+past the whole-segment warm's limit of 4; for logs these are at or under the
+plan bound, so neither step warms them) and
+`latest_ingest_hour`. Every segment in the warm set is counted in exactly one
+of `parts_warmed`, `parts_over_budget`, `parts_above_plan_bound` and
+`parts_beyond_cap`, except one whose whole read failed, which is counted in
+none. Its level is:
 
 - `info!` normally.
-- `warn!` if the tenant has a live part for that signal but none of them
-  warmed and none was skipped for the cache share, which means that a resolve
-  or fetch failure lost the whole signal.
+- `warn!` if the tenant has a live part for that signal and segments the
+  whole-segment warm takes (for logs, those at or under the plan bound), but
+  none of them warmed and none was skipped for the cache share, which means
+  that a resolve or fetch failure lost them. It also warns when that set is
+  empty, no segment is above the bound, and the tenant has a live part for
+  the signal, which means the resolve lost the signal. A tenant whose
+  segments are all above the bound logs at `info!`.
 
 `latest_ingest_hour` takes one of three values:
 
@@ -514,17 +553,29 @@ produce the identical `Ok(None)`, and neither case alone is a failure worth a
 warning.
 
 Do not expect a `warn!` from this path on a normal warmup pass. A
-tenant/signal combination can produce only two `warn!` lines: the `"error"`
-case, and the "has parts but none warmed" line of `cache_warm`.
+tenant/signal combination can produce three `warn!` lines: the `"error"`
+case, the "has parts but none warmed" line of `cache_warm`, and, for a logs
+signal whose segments above the bound were left to the metadata pass and
+every read the pass started for them failed, the "metadata pass warmed none"
+line.
 
-When the metadata pass runs, it logs one `cache warmup: warmed tenant logs
-metadata` line per tenant that has a log segment it plans to read. The line
-carries `metadata_objects_warmed` and `metadata_bytes_warmed`: the log
-segments whose footer and directories the pass read for that tenant, and the
-bytes it fetched from storage for them.
+When the metadata pass runs, it logs one line per tenant that has a log
+segment it plans to read. Unless every read it started for that tenant failed,
+it logs `cache warmup: warmed tenant logs metadata` at `info!`, carrying
+`metadata_objects_warmed` and `metadata_bytes_warmed`: the log segments whose
+footer and directories the pass read for that tenant, and the bytes it fetched
+from storage for them. When it started at least one read for the tenant and
+every one failed, it logs a `warn!` instead (`cache warmup: tenant has logs parts above the plan
+bound but the metadata pass warmed none`). That `warn!` carries the failure a
+tenant whose segments are all above the bound would otherwise hide, because the
+per-(tenant, signal) line stays at `info!` for segments above the bound and the
+per-read failures are logged only at `debug!`.
 
 One final `info!`, `cache warmup: pass complete`, carries the total
-`parts_warmed` across every tenant and signal and the `elapsed_ms` of the
+`parts_warmed` across every tenant and signal, the total
+`parts_above_plan_bound` (log segments the whole-segment warm skipped as above
+the plan bound), the total `parts_beyond_cap` (segments past the limit of 4
+per tenant and signal that neither step warmed), and the `elapsed_ms` of the
 pass. It also carries the totals `metadata_objects_warmed` and
 `metadata_bytes_warmed`, and `metadata_budget_reached`, which is `true` when
 the metadata pass stopped at its share of the cache rather than at the end of

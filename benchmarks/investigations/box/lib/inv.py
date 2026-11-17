@@ -1820,9 +1820,13 @@ def cmd_advance_check(args):
 def repair_preconditions(catalog, fields):
     """What a key-index repair of one signal starts from, by its catalog
     stamp: each declared field's leaf refs over every part, the parts lacking
-    a leaf of some declared field (the repair's parts_unindexed), and the
-    largest such part's entry count (E; null when one of them has no integer
-    entry count, 0 when no part is unindexed)."""
+    a leaf of some declared field (parts_missing_declared_leaves; this counts
+    every such part, unlike the repair's own report field of a similar name,
+    which skips empty parts and also counts a part whose leaf version the
+    reader refuses, which this stamp does not), and the largest such part's
+    entry count (E; null
+    when one of them has no integer entry count, 0 when no part is
+    unindexed)."""
     parts = catalog.get("parts")
     if not isinstance(parts, list):
         raise ValueError("the catalog stamp lists no parts")
@@ -1831,7 +1835,7 @@ def repair_preconditions(catalog, fields):
     counts = [p.get("entry_count") for p in unindexed]
     exact = all(isinstance(c, int) and not isinstance(c, bool) for c in counts)
     return {"fields": list(fields), "leaf_refs": refs, "declared_leaf_refs": sum(refs.values()),
-            "parts": len(parts), "parts_unindexed": len(unindexed),
+            "parts": len(parts), "parts_missing_declared_leaves": len(unindexed),
             "largest_unindexed_part_entries": max(counts, default=0) if exact else None}
 
 

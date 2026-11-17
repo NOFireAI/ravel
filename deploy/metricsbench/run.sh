@@ -7,7 +7,7 @@
 #   run.sh --profile NAME
 #     (--ravel-image REF@sha256:DIGEST | --ravel-image REF --ravel-image-id sha256:ID)
 #     --ravel-source-commit SHA --bin-dir DIR --out-dir DIR
-#     [--anchor-ms N] [--passes N] [--reps N] [--keep]
+#     [--anchor-ms N] [--passes N] [--reps N] [--keep] [--ravel-only]
 #     [--rss-band CONTAINER:MIN_BYTES:MAX_BYTES]...
 #     [--ravel-objects-band MIN:MAX]
 #     [--diagnostic-prometheus-max-samples N] [--folded-catalog-get-max-fraction F]
@@ -93,8 +93,8 @@
 #               lane) listed by aws s3api list-objects-v2 in the createbuckets
 #               service with its entrypoint overridden, every page; the keys
 #               counted and summed by kind into <out>/ravel-objects.json and
-#               stamped (ravel_objects): data (t/*/m/l0/*.rseg), commit
-#               (t/*/m/c/), qualify (sys/qualify/), other, and total. A
+#               stamped (ravel_objects): data (t/*/m/l0/*.rseg), l1
+#               (t/*/m/l1/*.rseg), commit (t/*/m/c/), qualify (sys/qualify/), other, and total. A
 #               failed or truncated listing fails the step. With
 #               --ravel-objects-band MIN:MAX the data count, and only it,
 #               must lie in [MIN, MAX]; otherwise the step fails
@@ -170,8 +170,9 @@
 # instead, as without the memory failure.
 #
 # With MB_STAGE1=1 in the environment (ADR-3694 Stage 1, issue #3968; ci and
-# cardinality only, any other profile is refused with exit 65, and a
-# diagnostic run is a usage error) ravel-server runs with
+# cardinality, and history when MB_STAGE1_ARMS is exactly l1 and the control
+# arm is off; any other profile is refused with exit 65, and a diagnostic run
+# is a usage error) ravel-server runs with
 # --fold-key-index-leaves and the metrics label index off from up onward:
 # RAVEL_SERVER_EXTRA_FLAGS, which ravel.yml appends to the server's
 # entrypoint, is set to it (it is empty otherwise, so the default command line
@@ -338,7 +339,9 @@
 #   stage1-l1-compact  (row 6) once the newest ingest hour is sealed,
 #               ravel-server stopped and ravel-cli maintain compact-tenant
 #               --signal metrics --max-flush-lifetime 0s into
-#               <out>/stage1-l1-compact.txt (stage1.l1_compact)
+#               <out>/stage1-l1-compact.txt (stage1.l1_compact), with
+#               --max-l1-part-bytes N when MB_L1_MAX_PART_BYTES=N is set
+#               (stage1.l1_max_part_bytes: N, or default when it is not)
 #   stage1-l1-fold  catalog fold --writers-stopped --key-index-leaves with
 #               the label index on (stage1.l1_fold)
 #   stage1-l1   ravel-server recreated with the routed flags, the listing's
@@ -380,6 +383,72 @@
 #               inspect: the parts rewritten (key and blake3 gone) and the
 #               leaves of those parts the snapshot still references;
 #               stage1.erasure_sweep says the physical sweep was not checked
+#
+# With --ravel-only (MB_STAGE1=1 and MB_STAGE1_ARMS=l1 required, else a usage
+# error) the run is a Ravel-only diagnostic that times the read-back's series
+# listing on the L0 catalog and again on the L1 one (issue #4392). It is
+# refused with exit 65 for a profile other than history and ci, and with
+# --diagnostic-prometheus-max-samples, --passes, --reps, --rss-band,
+# --real-s3-bucket-prefix, --real-s3-region, --folded-catalog-get-max-fraction,
+# --folded-catalog-get-floor or MB_CONTROL_IMAGE, which act on steps it does
+# not run. Only metricsbench_ingest is required in --bin-dir. Steps:
+# fetch-s3s-fs, fold-flags, stage1-flags, up (docker compose up -d
+# ravel-server, which starts its object store and one-shots and no
+# comparator; ravel-server runs with the label index on, stamped as
+# stage1.server_flags_up), qualify, image, ready (Ravel alone), then
+#
+#   ingest      metricsbench_ingest with the Ravel row alone
+#               (--no-in-process-row) into <out>/ingest.json. A Ravel row
+#               whose read-back answered 422 is stamped refused (budget) as
+#               ravel_only.ingest_readback and the run goes on; any other
+#               failure fails the step
+#   stage1-l0-fold  ravel-server stopped, METRICSBENCH_SLEEP until the last
+#               ingest hour seals (as stage1-l1-compact waits), then the
+#               fold stage1-l1-fold runs, into <out>/stage1-l0-fold.json
+#               (stage1.l0_fold)
+#   stage1-l0   ravel-server recreated with the routed flags
+#               (stage1.l0_restart), the snapshot state read
+#               (stage1.l0_catalog) and stamped as ravel_only.l0.catalog;
+#               a snapshot that does not reach the hour the ingest ended
+#               refuses the read-back (ravel_only.l0.catalog.uncovered)
+#   objects-l0  as objects, into <out>/ravel-objects-l0.json
+#               (ravel_only.l0.objects; --ravel-objects-band applies here
+#               only), and ravel-cli catalog list into
+#               <out>/ravel-only-l0.objects.jsonl, its L0 and L1 counts
+#               stamped as ravel_only.l0.catalog_objects
+#   readback-l0  as readback-folded, on that L0 catalog:
+#               /metrics into <out>/ravel-metrics-before-readback-l0.txt,
+#               metricsbench_ingest --readback-only --readback-system ravel
+#               into <out>/readback-l0.json, /metrics again into
+#               <out>/ravel-metrics-after-readback-l0.txt; stamped as
+#               ravel_only.l0.readback
+#   stage1-l1-compact, stage1-l1-fold, stage1-l1  as above, except that
+#               stage1-l1 reads the snapshot state (stage1.l1_catalog),
+#               stamps and checks it as stage1-l0 does
+#               (ravel_only.l1.catalog) and runs no pass: stage1.l1 and
+#               stage1.l1_compare say skipped. ravel_only.differences then
+#               names each condition other than catalog level that could
+#               differ between the two read-backs, same or differs
+#   objects-l1  as objects-l0, into <out>/ravel-objects-l1.json and
+#               <out>/ravel-only-l1.objects.jsonl (ravel_only.l1.objects,
+#               the L1 parts under its l1 kind, and .catalog_objects)
+#   readback-l1  as readback-l0 on the L1 catalog, with -l1 in each file
+#               name (ravel_only.l1.readback)
+#
+# Each ravel_only.STATE.readback carries verdict (matched, mismatch, error,
+# or refused (budget) when the series listing answered 422), series_query_ms
+# (from the error's "query series failed after N ms" on a 422), and Ravel's
+# ravel_store_calls_total and ravel_store_bytes_total for op="get" before and
+# after the read-back with their deltas; ravel_only.l0.series_query_ms,
+# .verdict and the same under l1 repeat the two headline figures. A mismatch
+# or error fails the read-back step, and so does any of those figures missing
+# (a miss). The sampler, mimir-readiness, objects, query, capture,
+# provenance, validate, memory, object-spans and folded steps do not run, so
+# no report.json, memory.jsonl or memory-summary.json is written; the query,
+# query_scrapes, mimir_readiness, ravel_objects, object_spans and
+# readback_folded stamps say skipped or not applicable with the reason.
+# comparability is non-comparable with comparability_reason "Ravel-only
+# diagnostic".
 #
 # With or without MB_STAGE1, the query step's ravel_cost records carry
 # pass_label unfolded while ravel-server has published no fold gauge, else
@@ -439,7 +508,9 @@
 # METRICSBENCH_CORPUS (default benchmarks/metrics/metrics.corpus.json; the
 # path used is stamped as corpus). MB_STAGE1 (1, or 0 or unset for off) adds
 # the Stage 1 steps above; MB_STAGE1_ARMS, MB_CONTROL_IMAGE and
-# MB_CONTROL_SOURCE_COMMIT add its arms. METRICSBENCH_SLEEP (default sleep)
+# MB_CONTROL_SOURCE_COMMIT add its arms, and MB_L1_MAX_PART_BYTES (a positive
+# integer; the l1 arm only) sets compact-tenant's --max-l1-part-bytes.
+# METRICSBENCH_SLEEP (default sleep)
 # waits for an hour to pass or seal; METRICSBENCH_ERASURE_TRIES and
 # METRICSBENCH_ERASURE_INTERVAL (default 120 tries 15 s apart) bound the
 # erasure rewrite.
@@ -1096,6 +1167,178 @@ elif op == "readback-folded":
         print(json.dumps(stamp))
         sys.exit(3)
     print(json.dumps(stamp))
+elif op == "ravel-only-ingest":
+    # The Ravel-only ingest report and the bin's exit code. Prints the
+    # ingest read-back's stamp and exits 0 when it matched, or when the bin
+    # failed only because the Ravel row's read-back answered 422 (the server's
+    # budget refusal); otherwise exit 3 with why.
+    path, code = args
+    try:
+        doc = load(path)
+    except (OSError, ValueError) as e:
+        print(f"ingest.json is not readable ({type(e).__name__})")
+        sys.exit(3)
+    systems = doc.get("systems") if isinstance(doc, dict) else None
+    systems = systems if isinstance(systems, list) else []
+    names = [r.get("system") for r in systems]
+    if names != ["ravel"]:
+        print(f"the ingest report's rows are {names}, want the ravel row alone")
+        sys.exit(3)
+    row = systems[0]
+    rb = row.get("readback")
+    err = row.get("readback_error")
+    not_replayed = (doc.get("stalled") or []) + (doc.get("failed_replays") or [])
+    if not_replayed or row.get("row_failure"):
+        print(f"the ravel row did not replay ({row.get('row_failure') or not_replayed})")
+        sys.exit(3)
+    if int(code) == 0 and isinstance(rb, dict) and rb.get("matches_expected") is True:
+        print(json.dumps({"exit_code": 0, "verdict": "matched", "error": None}))
+    elif int(code) != 0 and isinstance(err, str) and re.search(r"\banswered 422\b", err):
+        print(json.dumps({"exit_code": int(code), "verdict": "refused (budget)", "error": err}))
+    else:
+        why = err or (("; ".join(rb.get("mismatches") or []) or "matches_expected not true")
+                      if isinstance(rb, dict) else "no read-back in the ravel row")
+        print(f"metricsbench_ingest exited {code}: {why}")
+        sys.exit(3)
+elif op == "ravel-only-readback":
+    # One Ravel-only read-back: the bin's stdout, its exit code, the two
+    # /metrics scrapes ("" when one failed). Prints the stamp; exit 3 when an
+    # expected figure is missing (the stamp's missing names each one).
+    out_path, code, before, after = args
+    def metric(path, name, labels):
+        if not path or not os.path.isfile(path):
+            return None
+        total, seen = 0, False
+        with open(path) as f:
+            for line in f:
+                m = re.match(r"^([A-Za-z_:][A-Za-z0-9_:]*)(\{([^}]*)\})?\s+(\S+)", line)
+                if not m or m.group(1) != name:
+                    continue
+                got = dict(re.findall(r'([A-Za-z_][A-Za-z0-9_]*)="([^"]*)"', m.group(3) or ""))
+                if all(got.get(k) == v for k, v in labels.items()):
+                    total += float(m.group(4))
+                    seen = True
+        return int(total) if seen else None
+    stamp = {"file": os.path.basename(out_path), "exit_code": int(code), "verdict": None,
+             "error": None, "series_query_ms": None}
+    for key, name in (("store_get_calls", "ravel_store_calls_total"),
+                      ("store_get_bytes", "ravel_store_bytes_total")):
+        a, b = metric(before, name, {"op": "get"}), metric(after, name, {"op": "get"})
+        stamp[key] = {"metric": f'{name}{{op="get"}}', "before": a, "after": b,
+                      "delta": None if a is None or b is None else b - a}
+    try:
+        doc = load(out_path)
+    except (OSError, ValueError) as e:
+        doc = None
+        stamp["verdict"] = "error"
+        stamp["error"] = f"{os.path.basename(out_path)} is not JSON ({type(e).__name__})"
+    rb = doc.get("readback") if isinstance(doc, dict) else None
+    if isinstance(rb, dict):
+        stamp["verdict"] = "matched" if rb.get("matches_expected") is True else "mismatch"
+        if stamp["verdict"] == "mismatch":
+            stamp["error"] = "; ".join(rb.get("mismatches") or []) or "matches_expected not true"
+        qms = rb.get("query_ms")
+        v = qms.get("series") if isinstance(qms, dict) else None
+        if isinstance(v, int) and not isinstance(v, bool):
+            stamp["series_query_ms"] = v
+    elif isinstance(doc, dict) and isinstance(doc.get("readback_error"), str):
+        err = doc["readback_error"]
+        stamp["error"] = err
+        stamp["verdict"] = "refused (budget)" if re.search(r"\banswered 422\b", err) else "error"
+        m = re.search(r"\bquery series failed after (\d+) ms\b", err)
+        if m:
+            stamp["series_query_ms"] = int(m.group(1))
+    elif stamp["verdict"] is None:
+        stamp["verdict"] = "error"
+        stamp["error"] = f"{os.path.basename(out_path)} carries neither readback nor readback_error"
+    missing = [k for k in ("series_query_ms",) if stamp[k] is None]
+    for key in ("store_get_calls", "store_get_bytes"):
+        missing += [f"{key}.{w}" for w in ("before", "after") if stamp[key][w] is None]
+    stamp["missing"] = missing
+    print(json.dumps(stamp))
+    if missing:
+        sys.exit(3)
+elif op == "ravel-only-catalog":
+    # stamps.json, the state (l0 or l1), the hour the ingest step ended and
+    # the inspect text stage1_catalog_state read for that state. Prints the
+    # catalog state the read-back is about to run on: the HEAD's watermark
+    # hour, parts, entries summed over the parts, key-index leaf refs, the
+    # fold that built it and how ravel-server was restarted after. Exit 3
+    # with the stamp when the snapshot does not cover the ingest (its
+    # uncovered names what is missing), 4 and why when an input cannot be
+    # read.
+    stamps_path, state, end_hour, inspect_path = args
+    try:
+        stamps = load(stamps_path)
+        stage1 = stamps.get("stage1") or {}
+        head, fold = stage1.get(f"{state}_catalog"), stage1.get(f"{state}_fold")
+        restart = stage1.get(f"{state}_restart")
+        assert isinstance(head, dict) and isinstance(fold, dict) and isinstance(restart, str)
+        with open(inspect_path) as f:
+            lines = f.read().splitlines()
+        end_hour = int(end_hour)
+    except (OSError, ValueError, AssertionError) as e:
+        print(f"the {state} catalog state could not be read: stage1.{state}_catalog, stage1.{state}_fold, "
+              f"stage1.{state}_restart or {os.path.basename(inspect_path)} ({type(e).__name__})")
+        sys.exit(4)
+    part_entries = [int(m.group(1)) for m in (re.match(r"^  part\[[0-9]+\] .* entry_count=([0-9]+)$", l)
+                                              for l in lines) if m]
+    leaf_refs = sum(1 for l in lines if re.match(r"^      field=\S+ slice=", l))
+    if len(part_entries) != head.get("parts"):
+        print(f"{os.path.basename(inspect_path)} carries {len(part_entries)} part lines with an entry_count, "
+              f"stage1.{state}_catalog.parts is {head.get('parts')}")
+        sys.exit(4)
+    uncovered = []
+    w = head.get("watermark_hour")
+    if not whole(w) or w < end_hour:
+        uncovered.append(f"watermark_hour {w} is before hour {end_hour}, in which the ingest step ended, "
+                         f"so ingest hours {w + 1 if whole(w) else '?'}..={end_hour} are not in the snapshot")
+    if head.get("parts") == 0 or sum(part_entries) == 0:
+        uncovered.append(f"the snapshot holds {head.get('parts')} parts and {sum(part_entries)} entries")
+    stamp = {"state": state, "inspect": head.get("file"), "fold": f"stage1.{state}_fold",
+             "watermark_hour": w, "parts": head.get("parts"), "entry_count": sum(part_entries),
+             "key_index_leaf_refs": leaf_refs,
+             "label_value_leaf_parts": head.get("label_value_leaf_parts"),
+             "label_value_leaf_refs": head.get("label_value_leaf_refs"),
+             "fold_watermark_hour": fold.get("watermark_hour"),
+             "fold_key_index_leaves_written": fold.get("key_index_leaves_written"),
+             "server": restart, "ingest_end_hour": end_hour,
+             "covers_ingest": not uncovered, "uncovered": "; ".join(uncovered) or None}
+    print(json.dumps(stamp))
+    if uncovered:
+        sys.exit(3)
+elif op == "ravel-only-differences":
+    # stamps.json after both catalog states are stamped: every condition
+    # other than catalog level that could differ between readback-l0 and
+    # readback-l1, each named and marked same or differs. Exit 4 when a
+    # state's stamp cannot be read.
+    (stamps_path,) = args
+    try:
+        ro = load(stamps_path)["ravel_only"]
+        a, b = ro["l0"]["catalog"], ro["l1"]["catalog"]
+        assert isinstance(a, dict) and isinstance(b, dict)
+    except (OSError, ValueError, KeyError, TypeError, AssertionError) as e:
+        print(f"ravel_only.l0.catalog or ravel_only.l1.catalog could not be read ({type(e).__name__})")
+        sys.exit(4)
+    def every_part_labelled(c):
+        return whole(c.get("parts")) and c["parts"] > 0 and c.get("label_value_leaf_parts") == c["parts"]
+    def field(l0, l1, same):
+        return {"l0": l0, "l1": l1, "verdict": "same" if same else "differs"}
+    label = lambda c: f"{c.get('label_value_leaf_parts')} of {c.get('parts')} parts carry a label_value leaf"
+    doc = {
+        "catalog_level": "the variable measured: readback-l0 reads the L0 catalog, readback-l1 the catalog after maintain compact-tenant",
+        "label_index": field(label(a), label(b), every_part_labelled(a) and every_part_labelled(b)),
+        "server": field(a.get("server"), b.get("server"), a.get("server") == b.get("server")),
+        "covers_ingest": field(a.get("covers_ingest"), b.get("covers_ingest"),
+                               a.get("covers_ingest") is True and b.get("covers_ingest") is True),
+        "fold": "the same in both states by construction: ravel-server stopped, then ravel-cli catalog fold --writers-stopped --key-index-leaves with the label index on (stage1.l0_fold, stage1.l1_fold)",
+    }
+    doc["server"]["basis"] = "the ravel-server recreate before each read-back (stage1.STATE_restart); its flags carry --disable-fold, so no background fold runs during either read-back"
+    doc["label_index"]["basis"] = "same when every snapshot part carries a label_value leaf in both states, as the series route reads it"
+    differs = [k for k in ("label_index", "server", "covers_ingest") if doc[k]["verdict"] != "same"]
+    doc["differs"] = differs
+    doc["attributable_to_compaction"] = not differs
+    print(json.dumps(doc))
 elif op == "override":
     # docker compose config --format json on stdin; Prometheus' command with
     # --query.max-samples replaced by N, as a compose override document.
@@ -1126,7 +1369,9 @@ elif op == "ravel-objects":
         print("the listing is truncated: it carries a continuation token")
         sys.exit(4)
     rows = listing.get("Contents") or []
-    kinds = {k: {"count": 0, "bytes": 0} for k in ("data", "commit", "qualify", "other")}
+    # data is the L0 data objects (the band counts them), l1 the L1 parts a
+    # compaction wrote under t/<tenant>/m/l1/.
+    kinds = {k: {"count": 0, "bytes": 0} for k in ("data", "l1", "commit", "qualify", "other")}
     total = {"count": 0, "bytes": 0}
     for row in rows:
         key, size = (row.get("Key"), row.get("Size")) if isinstance(row, dict) else (None, None)
@@ -1137,6 +1382,8 @@ elif op == "ravel-objects":
         total["bytes"] += size
         if re.match(r"t/[^/]+/m/l0/", key) and key.endswith(".rseg"):
             kind = "data"
+        elif re.match(r"t/[^/]+/m/l1/", key) and key.endswith(".rseg"):
+            kind = "l1"
         elif re.match(r"t/[^/]+/m/c/", key):
             kind = "commit"
         elif key.startswith("sys/qualify/"):
@@ -1161,6 +1408,7 @@ elif op == "ravel-objects":
         doc["band"] = "not set: no --ravel-objects-band given"
     dump(out_path, doc)
     line = (f"data {kinds['data']['count']} ({kinds['data']['bytes']} B), "
+            f"l1 {kinds['l1']['count']} ({kinds['l1']['bytes']} B), "
             f"commit {kinds['commit']['count']}, qualify {kinds['qualify']['count']}, "
             f"other {kinds['other']['count']}, total {total['count']} ({total['bytes']} B) in {bucket}")
     if verdict is None:
@@ -2327,6 +2575,9 @@ keep=0
 diag_max_samples=""
 folded_catalog_get_max_fraction="0.05"
 folded_catalog_get_floor="64"
+# Set when the flag is given: --ravel-only refuses them, defaults or not.
+folded_catalog_get_flags=""
+ravel_only=0
 real_s3_prefix=""
 real_s3_region=""
 objects_band=""
@@ -2338,6 +2589,11 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --keep)
       keep=1
+      shift
+      continue
+      ;;
+    --ravel-only)
+      ravel_only=1
       shift
       continue
       ;;
@@ -2369,8 +2625,14 @@ while [ $# -gt 0 ]; do
     --diagnostic-prometheus-max-samples) diag_max_samples="$2" ;;
     --real-s3-bucket-prefix) real_s3_prefix="$2" ;;
     --real-s3-region) real_s3_region="$2" ;;
-    --folded-catalog-get-max-fraction) folded_catalog_get_max_fraction="$2" ;;
-    --folded-catalog-get-floor) folded_catalog_get_floor="$2" ;;
+    --folded-catalog-get-max-fraction)
+      folded_catalog_get_max_fraction="$2"
+      folded_catalog_get_flags="${folded_catalog_get_flags} $1"
+      ;;
+    --folded-catalog-get-floor)
+      folded_catalog_get_floor="$2"
+      folded_catalog_get_flags="${folded_catalog_get_flags} $1"
+      ;;
     --ravel-objects-band) objects_band="$2" ;;
   esac
   shift 2
@@ -2378,6 +2640,26 @@ done
 
 diagnostic=0
 [ -n "$diag_max_samples" ] && diagnostic=1
+# The Ravel-only shape is checked first: each refusal below names a flag that
+# acts on a step it does not run, which the generic checks would misreport.
+if [ "$ravel_only" -eq 1 ]; then
+  case "$profile" in
+    history | ci | "") ;;
+    *) refuse "--ravel-only with --profile ${profile}: the Ravel-only diagnostic runs on history (the #3941 series-listing measurement) and ci (its rehearsal) only" ;;
+  esac
+  [ "$diagnostic" -eq 0 ] ||
+    refuse "--ravel-only with --diagnostic-prometheus-max-samples: the falsification run measures Prometheus, which the Ravel-only shape does not start"
+  [ -z "$passes" ] && [ -z "$reps" ] ||
+    refuse "--ravel-only with --passes or --reps: they size the query step's passes against the comparators, and the Ravel-only shape runs no query step"
+  [ "${#bands[@]}" -eq 0 ] ||
+    refuse "--ravel-only with --rss-band: the bands are checked by the memory step over the comparator stack, which the Ravel-only shape does not run"
+  [ -z "$real_s3_prefix" ] && [ -z "$real_s3_region" ] ||
+    refuse "--ravel-only with --real-s3-bucket-prefix or --real-s3-region: the real-S3 lane holds Ravel and Mimir buckets for a comparable run, and a Ravel-only run is not one"
+  [ -z "$folded_catalog_get_flags" ] ||
+    refuse "--ravel-only with${folded_catalog_get_flags}: the limit is checked by step readback-folded, which the Ravel-only shape does not run"
+  [ -z "${MB_CONTROL_IMAGE:-}" ] && [ -z "${MB_CONTROL_SOURCE_COMMIT:-}" ] ||
+    refuse "--ravel-only with MB_CONTROL_IMAGE: the control arm compares two Ravel builds over passes the Ravel-only shape does not run"
+fi
 case "$STAGE1" in
   "" | 0) stage1=0 ;;
   1) stage1=1 ;;
@@ -2406,6 +2688,16 @@ if [ -n "$control_image" ] || [ -n "$control_source_commit" ]; then
   [ -n "$control_image" ] && [ -n "$control_source_commit" ] ||
     usage_error "MB_CONTROL_IMAGE and MB_CONTROL_SOURCE_COMMIT are given together or not at all"
   arm_control=1
+fi
+if [ "$ravel_only" -eq 1 ]; then
+  [ "$stage1" -eq 1 ] && [ "${MB_STAGE1_ARMS:-}" = "l1" ] ||
+    usage_error "--ravel-only runs the Stage 1 l1 arm alone and needs MB_STAGE1=1 MB_STAGE1_ARMS=l1"
+fi
+l1_max_part_bytes="${MB_L1_MAX_PART_BYTES:-}"
+if [ -n "$l1_max_part_bytes" ]; then
+  [ "$arm_l1" -eq 1 ] || usage_error "MB_L1_MAX_PART_BYTES sets the l1 arm's compaction and needs MB_STAGE1=1 with l1 in MB_STAGE1_ARMS"
+  [[ "$l1_max_part_bytes" =~ ^[1-9][0-9]*$ ]] ||
+    usage_error "MB_L1_MAX_PART_BYTES takes a positive integer, got '$l1_max_part_bytes'"
 fi
 
 [ -n "$profile" ] || usage_error "--profile is required"
@@ -2493,7 +2785,13 @@ fi
 if [ "$stage1" -eq 1 ]; then
   case "$profile" in
     ci | cardinality) ;;
-    *) refuse "MB_STAGE1=1 with --profile ${profile}: the Stage 1 lanes run on cardinality (the pre-registered run) and ci (its rehearsal) only" ;;
+    # The l1 arm alone carries the #3941 series-listing measurement to
+    # history; the other lanes' figures are pre-registered on cardinality.
+    history)
+      [ "${MB_STAGE1_ARMS:-}" = "l1" ] && [ "$arm_control" -eq 0 ] ||
+        refuse "MB_STAGE1=1 with --profile history and MB_STAGE1_ARMS='${MB_STAGE1_ARMS:-}'${control_image:+ and MB_CONTROL_IMAGE}: history runs the l1 arm alone (MB_STAGE1_ARMS=l1, no control arm)"
+      ;;
+    *) refuse "MB_STAGE1=1 with --profile ${profile}: the Stage 1 lanes run on cardinality (the pre-registered run) and ci (its rehearsal) only; history runs the l1 arm alone (MB_STAGE1_ARMS=l1)" ;;
   esac
 fi
 if [ "$arm_control" -eq 1 ]; then
@@ -2504,6 +2802,7 @@ if [ "$arm_control" -eq 1 ]; then
 fi
 required_bins="metricsbench_ingest metricsbench_query metricsbench_report"
 [ "$stage1" -eq 0 ] || required_bins="${required_bins} metricsbench_holders"
+[ "$ravel_only" -eq 0 ] || required_bins="metricsbench_ingest"
 for bin in $required_bins; do
   [ -x "${bin_dir}/${bin}" ] || refuse "${bin_dir}/${bin} is missing or not executable"
 done
@@ -2741,8 +3040,19 @@ if [ "$stage1" -eq 1 ]; then
       fi
     done
   done
+  [ "$arm_l1" -eq 0 ] || stamp_str stage1.l1_max_part_bytes "${l1_max_part_bytes:-default}"
 else
   stamp_set stage1.enabled false
+fi
+if [ "$ravel_only" -eq 1 ]; then
+  stamp_set ravel_only.enabled true
+  stamp_str comparability non-comparable
+  stamp_str comparability_reason "Ravel-only diagnostic"
+  stamp_set ravel_only.ingest_readback null
+  for key in l0 l1; do
+    stamp_set "ravel_only.${key}" '{"catalog": null, "objects": null, "catalog_objects": null, "readback": null, "series_query_ms": null, "verdict": null}'
+  done
+  stamp_set ravel_only.differences null
 fi
 stamp_set steps_completed '[]'
 stamp_set failed_after_ingest '[]'
@@ -3264,12 +3574,17 @@ fetch_s3s_fs() {
   step_done fetch-s3s-fs
 }
 
-# count_ravel_objects: list Ravel's bucket through the createbuckets service,
-# so each lane uses its own endpoint and credentials, and split the keys by
-# kind into ravel-objects.json. The aws CLI follows every continuation token
-# itself unless told not to.
+# count_ravel_objects [STEP SUFFIX STAMP_KEY BAND]: list Ravel's bucket
+# through the createbuckets service, so each lane uses its own endpoint and
+# credentials, and split the keys by kind into ravel-objects.json. The aws CLI
+# follows every continuation token itself unless told not to. The Ravel-only
+# shape counts twice: STEP names the step, SUFFIX goes after ravel-objects in
+# both file names, STAMP_KEY takes the stamp and BAND replaces
+# --ravel-objects-band.
 count_ravel_objects() {
+  local step="${1:-objects}" suffix="${2:-}" key="${3:-ravel_objects}" band="${4-$objects_band}"
   local bucket endpoint code=0 line
+  local listing="${out_dir}/ravel-objects${suffix}-listing.json" counted="${out_dir}/ravel-objects${suffix}.json"
   local list_args=(s3api list-objects-v2 --output json)
   if [ "$real_s3" -eq 1 ]; then
     bucket="${real_s3_prefix}-ravel"
@@ -3280,20 +3595,19 @@ count_ravel_objects() {
     list_args=(--endpoint-url "$endpoint" "${list_args[@]}")
   fi
   compose run --rm --no-deps -T --entrypoint aws createbuckets "${list_args[@]}" --bucket "$bucket" \
-    >"${out_dir}/ravel-objects-listing.json" 2>"${out_dir}/objects.log" || code=$?
+    >"$listing" 2>"${out_dir}/objects${suffix}.log" || code=$?
   if [ "$code" -ne 0 ]; then
-    show_log "${out_dir}/objects.log"
-    fail_step objects "listing bucket $bucket exited $code; see ${out_dir}/objects.log"
+    show_log "${out_dir}/objects${suffix}.log"
+    fail_step "$step" "listing bucket $bucket exited $code; see ${out_dir}/objects${suffix}.log"
   fi
   code=0
-  line="$(py ravel-objects "${out_dir}/ravel-objects-listing.json" "${out_dir}/ravel-objects.json" \
-    "$bucket" "$endpoint" "$objects_band")" || code=$?
+  line="$(py ravel-objects "$listing" "$counted" "$bucket" "$endpoint" "$band")" || code=$?
   if [ "$code" -eq 0 ] || [ "$code" -eq 3 ]; then
-    stamp_set ravel_objects "$(cat "${out_dir}/ravel-objects.json")"
+    stamp_set "$key" "$(cat "$counted")"
   fi
-  [ "$code" -eq 0 ] || fail_step objects "$line"
-  say "objects: $line"
-  step_done objects
+  [ "$code" -eq 0 ] || fail_step "$step" "$line"
+  say "${step}: $line"
+  step_done "$step"
 }
 
 # object_spans_step: <out>/ravel-object-spans.json from the entries the
@@ -3924,6 +4238,13 @@ stage1_wait_until() {
   "$SLEEP" "$(($2 - now))" || fail_step "$1" "${SLEEP} $(($2 - now)) failed"
 }
 
+# stage1_seal_wait STEP WHY: stage1_wait_until the hour after
+# STAGE1_LAST_INGEST_HOUR plus the 5 minute clock-skew allowance and a
+# minute's margin, by when that hour is sealed.
+stage1_seal_wait() {
+  stage1_wait_until "$1" $(((STAGE1_LAST_INGEST_HOUR + 1) * 3600 + 360)) "$2"
+}
+
 # stage1_stop STEP: ravel-server stopped, so a --writers-stopped fold or a
 # compaction runs with no writer.
 stage1_stop() {
@@ -4092,14 +4413,14 @@ stage1_extra_hour_step() {
 # with stage1-routed's.
 stage1_l1_step() {
   local code=0 t0 t1 line
-  local cmd="ravel-cli maintain compact-tenant --tenant ${RAVEL_TENANT} --signal metrics --shards ${RAVEL_SHARDS} --max-flush-lifetime 0s"
-  stage1_wait_until stage1-l1-compact $(((STAGE1_LAST_INGEST_HOUR + 1) * 3600 + 360)) \
-    "compaction takes only hours sealed past the 5 minute clock-skew allowance"
+  local cmd="ravel-cli maintain compact-tenant --tenant ${RAVEL_TENANT} --signal metrics --shards ${RAVEL_SHARDS} --max-flush-lifetime 0s${l1_max_part_bytes:+ --max-l1-part-bytes ${l1_max_part_bytes}}"
+  stage1_seal_wait stage1-l1-compact "compaction takes only hours sealed past the 5 minute clock-skew allowance"
   stage1_stop stage1-l1-compact
   t0="$(now_ms)"
   RAVEL_IMAGE="$ravel_image" compose run --rm --no-deps -T ravel-qualify \
     --store s3 --tenant-hash-unkeyed maintain compact-tenant \
     --tenant "$RAVEL_TENANT" --signal metrics --shards "$RAVEL_SHARDS" --max-flush-lifetime 0s \
+    ${l1_max_part_bytes:+--max-l1-part-bytes "$l1_max_part_bytes"} \
     >"${out_dir}/stage1-l1-compact.txt" 2>"${out_dir}/stage1-l1-compact.log" || code=$?
   t1="$(now_ms)"
   if [ "$code" -ne 0 ]; then
@@ -4127,6 +4448,15 @@ stage1_l1_step() {
     fail_step stage1-l1 "$line"
   fi
   stamp_set stage1.l1_objects "$line"
+  if [ "$ravel_only" -eq 1 ]; then
+    stage1_catalog_state l1
+    ravel_only_catalog l1 stage1-l1
+    stamp_str stage1.l1 "skipped: Ravel-only diagnostic: no Prometheus oracle to pass against; readback-l1 times the listing instead"
+    stamp_str stage1.l1_compare "skipped: Ravel-only diagnostic: there is no routed pass to compare with"
+    step_done stage1-l1
+    stamp_str stage1.l1_not_measured "ADR-3694 row 6 bounds this run does not check: peak container memory under 8 GiB, scan GETs and scan wire bytes against the unbatched call's (the Ravel-only diagnostic runs no pass)"
+    return 0
+  fi
   stage1_pass l1
   stage1_note stage1.l1_compare stage1-hash-compare "${out_dir}/stage1-routed/diagnostics.json" \
     "${out_dir}/stage1-l1/diagnostics.json" "${out_dir}/stage1-l1-compare.json" routed l1
@@ -4346,6 +4676,210 @@ stage1_steps() {
   [ "$arm_erasure" -eq 0 ] || stage1_erasure_step
 }
 
+# image_step: the Ravel image as docker image inspect resolves it, stamped as
+# ravel_image.resolved.
+image_step() {
+  local code=0 resolved
+  if [ "$ravel_image_kind" = "local-build" ]; then
+    resolved="$("$DOCKER" image inspect "$ravel_image" 2>/dev/null |
+      py image-inspect-local "$ravel_image" "$ravel_image_id")" || code=$?
+    [ -n "$resolved" ] && stamp_set ravel_image.resolved "$resolved"
+    [ "$code" -eq 0 ] ||
+      fail_step image "docker image inspect of $ravel_image no longer reports Id $ravel_image_id"
+  else
+    resolved="$("$DOCKER" image inspect "$ravel_image" 2>/dev/null | py image-inspect "$ravel_image")" || code=$?
+    [ -n "$resolved" ] && stamp_set ravel_image.resolved "$resolved"
+    [ "$code" -eq 0 ] ||
+      fail_step image "docker image inspect of $ravel_image did not list the digest the reference names"
+  fi
+  step_done image
+}
+
+# ravel_only_ingest: step ingest of the Ravel-only shape, the Ravel row
+# alone. A read-back the server refused with 422 is stamped and the run goes
+# on, since the read-back steps after it time that same listing.
+ravel_only_ingest() {
+  local code=0 line
+  "${bin_dir}/metricsbench_ingest" --workload "$WORKLOAD" --profile "$profile" --anchor-ms "$anchor_ms" \
+    --no-in-process-row --tenant "$RAVEL_TENANT" \
+    --max-ingest-secs "$max_ingest_secs" --readback-timeout-secs "$readback_timeout_secs" \
+    --ravel-endpoint "${RAVEL_BASE}/api/v1/write" --ravel-tenant "$RAVEL_TENANT" \
+    --ravel-query-url "$RAVEL_BASE" --ravel-bearer-token-env "$RAVEL_TOKEN_ENV" \
+    >"${out_dir}/ingest.json" 2>"${out_dir}/ingest.log" || code=$?
+  INGEST_END_HOUR=$(($(date -u +%s) / 3600))
+  line="$(py ravel-only-ingest "${out_dir}/ingest.json" "$code")" || {
+    show_log "${out_dir}/ingest.log"
+    stamp_str ravel_only.ingest_readback "failed: ${line}"
+    fail_step ingest "$line"
+  }
+  stamp_set ravel_only.ingest_readback "$line"
+  step_done ingest
+}
+
+# ravel_only_readback STATE: step readback-STATE (l0 or l1), the Ravel row
+# read back alone between two scrapes of Ravel's /metrics, stamped as
+# ravel_only.STATE.readback with its verdict and series_query_ms repeated
+# beside it. Fails on a mismatch, an error, or a figure it did not produce.
+ravel_only_readback() {
+  local state="$1" step="readback-$1" code=0 stamp_code=0 stamp verdict ms
+  local before="${out_dir}/ravel-metrics-before-readback-${1}.txt" before_arg
+  local after="${out_dir}/ravel-metrics-after-readback-${1}.txt" after_arg
+  before_arg="$before"
+  scrape_ravel_metrics "$before" || before_arg=""
+  "${bin_dir}/metricsbench_ingest" --readback-only --ingest-report "${out_dir}/ingest.json" \
+    --readback-system ravel --workload "$WORKLOAD" --profile "$profile" --anchor-ms "$anchor_ms" \
+    --ravel-query-url "$RAVEL_BASE" --ravel-bearer-token-env "$RAVEL_TOKEN_ENV" \
+    --readback-timeout-secs "$readback_timeout_secs" --readback-settle-secs "$READBACK_SETTLE_SECS" \
+    --ravel-metrics-url "${RAVEL_BASE}/metrics" \
+    >"${out_dir}/readback-${state}.json" 2>"${out_dir}/readback-${state}.log" || code=$?
+  after_arg="$after"
+  scrape_ravel_metrics "$after" || after_arg=""
+  stamp="$(py ravel-only-readback "${out_dir}/readback-${state}.json" "$code" "$before_arg" "$after_arg")" ||
+    stamp_code=$?
+  [ -n "$stamp" ] || fail_step "$step" "the read-back on the ${state} catalog could not be stamped (ravel-only-readback exited ${stamp_code})"
+  stamp_set "ravel_only.${state}.readback" "$stamp"
+  verdict="$(py get "$STAMPS" "ravel_only.${state}.readback.verdict")"
+  stamp_str "ravel_only.${state}.verdict" "$verdict"
+  ms="$(py get "$STAMPS" "ravel_only.${state}.readback.series_query_ms")"
+  [ "$ms" != None ] || ms=null
+  stamp_set "ravel_only.${state}.series_query_ms" "$ms"
+  case "$verdict" in
+    matched)
+      [ "$code" -eq 0 ] ||
+        fail_step "$step" "metricsbench_ingest --readback-only exited $code with a matching read-back"
+      ;;
+    "refused (budget)") say "${step}: the series listing was refused (budget) after ${ms} ms" ;;
+    *)
+      show_log "${out_dir}/readback-${state}.log"
+      fail_step "$step" "metricsbench_ingest --readback-only exited $code, verdict ${verdict}: $(py get "$STAMPS" "ravel_only.${state}.readback.error")"
+      ;;
+  esac
+  [ "$stamp_code" -eq 0 ] ||
+    fail_step "$step" "miss: the read-back on the ${state} catalog produced no $(py get "$STAMPS" "ravel_only.${state}.readback.missing")"
+  step_done "$step"
+}
+
+# ravel_only_objects STATE: step objects-STATE, the catalog listing's L0 and
+# L1 data objects (ravel_only.STATE.catalog_objects), then the bucket counted
+# by kind (ravel_only.STATE.objects). --ravel-objects-band bounds the L0
+# count, before any compaction.
+ravel_only_objects() {
+  local state="$1" step="objects-$1" band="" code=0 line
+  [ "$state" != l0 ] || band="$objects_band"
+  stage1_list "$step" "ravel-only-${state}.objects.jsonl"
+  line="$(py stage1-l1 "${out_dir}/ravel-only-${state}.objects.jsonl")" || code=$?
+  [ "$code" -eq 0 ] || fail_step "$step" "$line"
+  stamp_set "ravel_only.${state}.catalog_objects" "$line"
+  count_ravel_objects "$step" "-${state}" "ravel_only.${state}.objects" "$band"
+}
+
+# ravel_only_catalog STATE STEP: the catalog state readback-STATE is about to
+# read, from the inspect stage1_catalog_state STATE wrote and the fold and
+# restart stamps before it, stamped as ravel_only.STATE.catalog. A snapshot
+# that does not cover the ingest refuses the read-back: STEP fails (exit 70)
+# and ravel_only.STATE.readback names what is missing.
+ravel_only_catalog() {
+  local state="$1" step="$2" code=0 line uncovered
+  line="$(py ravel-only-catalog "$STAMPS" "$state" "$INGEST_END_HOUR" "${out_dir}/stage1-${state}.inspect.txt")" ||
+    code=$?
+  case "$code" in
+    0) stamp_set "ravel_only.${state}.catalog" "$line" ;;
+    3)
+      stamp_set "ravel_only.${state}.catalog" "$line"
+      uncovered="$(py get "$STAMPS" "ravel_only.${state}.catalog.uncovered")"
+      stamp_str "ravel_only.${state}.readback" "refused: the ${state} catalog does not cover the ingest: ${uncovered}"
+      fail_step "$step" "refused: readback-${state} would read a catalog that does not cover the ingest: ${uncovered}"
+      ;;
+    *)
+      stamp_str "ravel_only.${state}.catalog" "failed: ${line:-ravel-only-catalog exited ${code}}"
+      fail_step "$step" "refused: ${line:-ravel-only-catalog exited ${code}}"
+      ;;
+  esac
+}
+
+# ravel_only_l0_catalog: steps stage1-l0-fold and stage1-l0, the L0 catalog
+# brought to the state stage1-l1-fold and stage1-l1 bring the L1 one to:
+# ravel-server stopped, the last ingest hour sealed, the same writers-stopped
+# fold with the label index on, ravel-server recreated with the same flags,
+# then the snapshot stamped and checked against the ingest.
+ravel_only_l0_catalog() {
+  stage1_stop stage1-l0-fold
+  stage1_seal_wait stage1-l0-fold "the fold seals the last ingest hour only past the 5 minute clock-skew allowance"
+  # shellcheck disable=SC2086 # STAGE1_CLI_LABEL_INDEX_ON is empty or one flag
+  stage1_catalog_fold stage1-l0-fold stage1.l0_fold stage1-fold stage1-l0-fold \
+    --signal metrics --writers-stopped --key-index-leaves $STAGE1_CLI_LABEL_INDEX_ON
+  stage1_recreate stage1-l0 stage1.l0_restart "$STAGE1_ROUTED_FLAGS"
+  stage1_catalog_state l0
+  ravel_only_catalog l0 stage1-l0
+  step_done stage1-l0
+}
+
+# run_ravel_only: the Ravel-only shape (--ravel-only). ravel-server and what
+# it depends on come up, never a comparator; the listing is timed on the L0
+# catalog, the tenant compacted to L1 and folded, and timed again.
+run_ravel_only() {
+  local code=0 key line why="not applicable: Ravel-only diagnostic"
+  local skip="skipped: Ravel-only diagnostic: the query step needs the Prometheus oracle"
+  stamp_str in_process_row skipped
+  stamp_str comparator_images "${why}: no comparator starts"
+  stamp_str mimir_readiness "${why}: no Mimir starts"
+  stamp_str ravel_catalog_fold "${why}: no query step reads the fold gauge"
+  stamp_str ravel_catalog_fold_writers_stopped "${why}: stage1-l0-fold and stage1-l1-fold are the run's writers-stopped folds (stage1.l0_fold, stage1.l1_fold)"
+  stamp_str ravel_restart "${why}: stage1-l0-fold and stage1-l1-compact stop ravel-server, stage1-l0 and stage1-l1 recreate it (stage1.l0_restart, stage1.l1_restart)"
+  stamp_str readback_folded "${why}: readback-l0 and readback-l1 read back instead (ravel_only.l0.readback, ravel_only.l1.readback)"
+  stamp_str ravel_objects "${why}: objects-l0 and objects-l1 count instead (ravel_only.l0.objects, ravel_only.l1.objects)"
+  stamp_str object_spans "${why}: the object spans step runs after the query step"
+  stamp_str cold_ravel_diagnostic "${why}: the cold pass runs the query corpus"
+  stamp_str query "$skip"
+  stamp_str query_scrapes "$skip"
+  for key in $STAGE1_KEYS; do
+    stamp_str "stage1.${key}" "skipped: Ravel-only diagnostic: the l1 arm runs alone"
+  done
+  stamp_str stage1.background_fold "on, with the label index, from up until stage1-l0-fold stops ravel-server; stage1-l0 and stage1-l1 recreate ravel-server with --disable-fold, so only stage1-l0-fold changes the snapshot readback-l0 reads and only stage1-l1-fold the one readback-l1 reads"
+
+  fetch_s3s_fs
+  fold_flags_step
+  stage1_label_index_flags
+  # Every fold of the run builds the metrics label index, the background one
+  # included, so the L0 parts carry it as the L1 parts do.
+  STAGE1_UP_FLAGS="${STAGE1_ROUTED_FLAGS#--disable-fold }"
+  export RAVEL_SERVER_EXTRA_FLAGS="$STAGE1_UP_FLAGS"
+  stamp_str stage1.server_flags_up "$STAGE1_UP_FLAGS"
+
+  STACK_UP=1
+  compose up -d ravel-server >"${out_dir}/compose-up.log" 2>&1 || code=$?
+  if [ "$code" -ne 0 ]; then
+    show_log "${out_dir}/compose-up.log"
+    fail_step up "docker compose up -d ravel-server exited $code"
+  fi
+  step_done up
+
+  check_one_shot createbuckets
+  check_one_shot ravel-qualify
+  step_done qualify
+
+  image_step
+
+  wait_ready ravel "${RAVEL_BASE}/api/v1/status/buildinfo"
+  step_done ready
+
+  export "${RAVEL_TOKEN_ENV}=${RAVEL_TOKEN_VALUE}"
+  ravel_only_ingest
+  STAGE1_LAST_INGEST_HOUR="$INGEST_END_HOUR"
+  ravel_only_l0_catalog
+  ravel_only_objects l0
+  ravel_only_readback l0
+  stage1_l1_step
+  code=0
+  line="$(py ravel-only-differences "$STAMPS")" || code=$?
+  [ "$code" -eq 0 ] || fail_step stage1-l1 "$line"
+  stamp_set ravel_only.differences "$line"
+  [ "$(py get "$STAMPS" ravel_only.differences.attributable_to_compaction)" = True ] ||
+    say "stage1-l1: readback-l0 and readback-l1 differ in more than catalog level: $(py get "$STAMPS" ravel_only.differences.differs)"
+  ravel_only_objects l1
+  ravel_only_readback l1
+}
+
 run_diagnostic() {
   local code=0 query at http
   compose_config="$("$DOCKER" compose -f "${here}/docker-compose.yml" config --format json 2>"${out_dir}/override.log")" ||
@@ -4411,7 +4945,7 @@ run_diagnostic() {
 }
 
 run_full() {
-  local code=0 resolved line fold
+  local code=0 line fold
   # Replaced when each capture runs, so a run that ends before one carries
   # why it is missing, never null.
   stamp_str object_spans "not taken: the run ended before the object spans step"
@@ -4437,20 +4971,7 @@ run_full() {
   check_one_shot ravel-qualify
   step_done qualify
 
-  code=0
-  if [ "$ravel_image_kind" = "local-build" ]; then
-    resolved="$("$DOCKER" image inspect "$ravel_image" 2>/dev/null |
-      py image-inspect-local "$ravel_image" "$ravel_image_id")" || code=$?
-    [ -n "$resolved" ] && stamp_set ravel_image.resolved "$resolved"
-    [ "$code" -eq 0 ] ||
-      fail_step image "docker image inspect of $ravel_image no longer reports Id $ravel_image_id"
-  else
-    resolved="$("$DOCKER" image inspect "$ravel_image" 2>/dev/null | py image-inspect "$ravel_image")" || code=$?
-    [ -n "$resolved" ] && stamp_set ravel_image.resolved "$resolved"
-    [ "$code" -eq 0 ] ||
-      fail_step image "docker image inspect of $ravel_image did not list the digest the reference names"
-  fi
-  step_done image
+  image_step
 
   wait_ready prometheus "${PROM_BASE}/-/ready"
   wait_ready victoriametrics "${VM_BASE}/health"
@@ -4637,6 +5158,8 @@ run_full() {
 
 if [ "$diagnostic" -eq 1 ]; then
   run_diagnostic
+elif [ "$ravel_only" -eq 1 ]; then
+  run_ravel_only
 else
   run_full
 fi

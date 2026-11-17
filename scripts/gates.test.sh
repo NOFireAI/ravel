@@ -75,7 +75,11 @@ pkg() {
   printf ','
   pkg ravel-agents-sim ravel-agents-core ravel-agents-store ravel-agents-runtime
   printf ','
-  pkg ravel-server ravel-sql ravel-query ravel-esql ravel-agents-core ravel-agents-store ravel-agents-runtime
+  pkg ravel-invariant
+  printf ','
+  pkg ravel-commit ravel-invariant ravel-types
+  printf ','
+  pkg ravel-server ravel-sql ravel-query ravel-esql ravel-agents-core ravel-agents-store ravel-agents-runtime ravel-commit
   printf ','
   pkg ravel-logseg ravel-types
   printf ','
@@ -83,7 +87,7 @@ pkg() {
   printf ','
   pkg ravel-bench ravel-server ravel-ingest
   printf ','
-  pkg ravel-cli ravel-sql ravel-query ravel-logseg ravel-ingest ravel-server
+  pkg ravel-cli ravel-sql ravel-query ravel-logseg ravel-ingest ravel-server ravel-commit
   printf ','
   pkg ravel-affinity
   printf ','
@@ -127,6 +131,8 @@ esql_test='==> cargo nextest run --locked -p ravel-server --features esql'
 stage_clippy='==> cargo clippy --locked -p ravel-logseg -p ravel-ingest --features stage-timing --all-targets -- -D warnings'
 cli_explain_clippy='==> cargo clippy --locked -p ravel-cli --features sql-explain --all-targets -- -D warnings'
 cli_explain_test='==> cargo nextest run --locked -p ravel-cli --features sql-explain'
+invariants_clippy='==> cargo clippy --locked -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/capture,ravel-invariant/antithesis-mutants --all-targets -- -D warnings'
+invariants_test='==> cargo nextest run --locked -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/capture,ravel-invariant/antithesis-mutants'
 ingest_shipping_clippy='==> cargo clippy --locked -p ravel-ingest --all-targets -- -D warnings'
 agents_clippy='==> cargo clippy --locked -p ravel-server --features agents --all-targets -- -D warnings'
 # The agents and mcp lanes select tests by binary: a test-name filter alone
@@ -211,6 +217,44 @@ check_eq "gates -p ravel-logseg: scoped clippy names ravel-ingest" "1" \
 check_eq "gates -p ravel-logseg: stage-timing lane" "1" "$(count "${out}" "${stage_clippy}")"
 check_eq "gates -p ravel-logseg: ravel-ingest shipping-features clippy" "1" \
   "$(count "${out}" "${ingest_shipping_clippy}")"
+
+# -p ravel-commit: the invariants lane (ADR-4326), once, after stage-timing.
+run_stubbed commit bash "${SCRIPTS}/gates.sh" -p ravel-commit --dry-run
+out="${tmp}/commit.out"
+check_eq "gates -p ravel-commit: exit 0" "0" "${rc}"
+check_eq "gates -p ravel-commit: invariants lane clippy" "1" "$(count "${out}" "${invariants_clippy}")"
+check_eq "gates -p ravel-commit: invariants lane tests" "1" "$(count "${out}" "${invariants_test}")"
+check_eq "gates -p ravel-commit: invariants lane directly after stage-timing" "1" \
+  "$(grep -A2 -xF -- "${stage_clippy}" "${out}" | grep -cxF -- "${invariants_clippy}")"
+check_eq "gates -p ravel-logseg: invariants lane (ravel-ingest in the closure)" "1" \
+  "$(count "${tmp}/logseg.out" "${invariants_clippy}")"
+check_eq "gates -p ravel-logseg: invariants lane directly after stage-timing" "1" \
+  "$(grep -A2 -xF -- "${stage_clippy}" "${tmp}/logseg.out" | grep -cxF -- "${invariants_clippy}")"
+
+# Each of the six crates selects the invariants lane by itself. In the graph
+# above most of them reach another through the closure, so these runs use a
+# graph where each is a leaf no other crate depends on: dropping any one from
+# gates.sh's case arm fails exactly its own check.
+{
+  printf '{"packages":['
+  pkg ravel-types
+  for c in ravel-invariant ravel-commit ravel-ingest ravel-catalog ravel-maintain ravel-fleet; do
+    printf ','
+    pkg "${c}"
+  done
+  printf ']}\n'
+} >"${tmp}/leaves.json"
+for c in ravel-invariant ravel-commit ravel-ingest ravel-catalog ravel-maintain ravel-fleet ravel-types; do
+  want=1
+  [[ "${c}" == ravel-types ]] && want=0
+  run_stubbed "leaf_${c}" env CARGO_STUB_METADATA="${tmp}/leaves.json" \
+    bash "${SCRIPTS}/gates.sh" -p "${c}" --dry-run
+  check_eq "gates -p ${c} (a leaf): exit 0" "0" "${rc}"
+  check_eq "gates -p ${c} (a leaf): invariants lane clippy" "${want}" \
+    "$(count "${tmp}/leaf_${c}.out" "${invariants_clippy}")"
+  check_eq "gates -p ${c} (a leaf): invariants lane tests" "${want}" \
+    "$(count "${tmp}/leaf_${c}.out" "${invariants_test}")"
+done
 
 # -p ravel-cli: the sql-explain lane, and no lane of a crate outside it.
 run_stubbed cli bash "${SCRIPTS}/gates.sh" -p ravel-cli --dry-run
@@ -322,9 +366,11 @@ check_eq "gates --dry-run: SDK gate" "1" "$(count_matching "${out}" "${sdk_gate_
 check_eq "gates --dry-run: no SDK skip line without the variable" "0" "$(count "${out}" "${sdk_skip}")"
 check_eq "gates --dry-run: walk-expiry lane" "1" \
   "$(count "${out}" '==> cargo clippy --locked -p ravel-bench --features walk-expiry --all-targets -- -D warnings')"
-check_eq "gates --dry-run: feature lane clippy runs" "11" \
+check_eq "gates --dry-run: invariants lane clippy" "1" "$(count "${out}" "${invariants_clippy}")"
+check_eq "gates --dry-run: invariants lane tests" "1" "$(count "${out}" "${invariants_test}")"
+check_eq "gates --dry-run: feature lane clippy runs" "12" \
   "$(count_matching "${out}" '^==> cargo clippy --locked .*--features ')"
-check_eq "gates --dry-run: feature lane nextest runs" "13" \
+check_eq "gates --dry-run: feature lane nextest runs" "14" \
   "$(count_matching "${out}" '^==> cargo nextest run --locked .*--features ')"
 
 # RAVEL_GATES_SKIP_SDK=1: the SDK step becomes one skip line, and nothing else
@@ -412,6 +458,19 @@ check_eq "tier executor -p ravel-server: one lane test run, features unified" "1
   "$(count "${out}" '==> cargo nextest run --locked -p ravel-server --features ravel-server/sql,ravel-server/agents,ravel-server/mcp,ravel-server/flight-sql,ravel-server/esql --cargo-profile ci')"
 check_eq "tier executor -p ravel-server: no test of a dependent" "0" \
   "$(count_matching "${out}" '^==> cargo (nextest run|test) .*-p ravel-(bench|cli|catalog)( |$)')"
+
+# -p ravel-commit: the invariants lane names its features as dependency
+# features already (ravel-invariant/capture), so they pass through as they are,
+# not prefixed with the edited crate.
+run_stubbed exec_commit bash "${SCRIPTS}/gates.sh" --tier executor -p ravel-commit --dry-run
+out="${tmp}/exec_commit.out"
+check_eq "tier executor -p ravel-commit: exit 0" "0" "${rc}"
+check_eq "tier executor -p ravel-commit: invariants lane clippy restricted to it" "1" \
+  "$(count "${out}" '==> cargo clippy --locked -p ravel-commit --features ravel-invariant/capture,ravel-invariant/antithesis-mutants --all-targets -- -D warnings')"
+check_eq "tier executor -p ravel-commit: invariants lane tests restricted to it" "1" \
+  "$(count "${out}" '==> cargo nextest run --locked -p ravel-commit --features ravel-invariant/capture,ravel-invariant/antithesis-mutants --cargo-profile ci')"
+check_eq "tier executor -p ravel-commit: no feature prefixed twice" "0" \
+  "$(count_matching "${out}" '[a-z-]+/ravel-invariant/')"
 
 # -p ravel-ingest: its shipping-features clippy is the edited crate's own
 # clippy, listed once; its stage-timing lane runs restricted to it.

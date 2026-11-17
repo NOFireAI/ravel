@@ -6,7 +6,7 @@
 //!
 //! The driver is a hegel concurrent state machine. Each rule sends one write
 //! or one query to a ravel-server node and records the outcome in the model
-//! (`model.rs`). See antithesis/README.md for the properties.
+//! (`model.rs`). See antithesis/ingest-durability/README.md for the properties.
 
 use ravel_antithesis_driver::{model, otlp, ravel};
 

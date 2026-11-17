@@ -3366,11 +3366,11 @@ miss_if = "v != 0"
 miss_reason = "the tenant held leaves of a declared field before the repair"
 
 [[row.figure]]
-name = "a_logs_parts_unindexed"
+name = "a_logs_parts_missing_declared_leaves"
 statement = "stamp"
 state = "repair_arms"
 transition = "repair_arms_8000000"
-metric = "stamp.preconditions.logs.parts_unindexed"
+metric = "stamp.preconditions.logs.parts_missing_declared_leaves"
 lane = "counter"
 target_if = "v >= 1"
 
@@ -3404,11 +3404,11 @@ miss_if = "v != 0"
 miss_reason = "the tenant held leaves of a declared field before the repair"
 
 [[row.figure]]
-name = "a_spans_parts_unindexed"
+name = "a_spans_parts_missing_declared_leaves"
 statement = "stamp"
 state = "repair_arms"
 transition = "repair_arms_8000000"
-metric = "stamp.preconditions.spans.parts_unindexed"
+metric = "stamp.preconditions.spans.parts_missing_declared_leaves"
 lane = "counter"
 target_if = "v >= 1"
 
@@ -3433,11 +3433,11 @@ miss_if = "v != 0"
 miss_reason = "the tenant held leaves of a declared field before the repair"
 
 [[row.figure]]
-name = "b_logs_parts_unindexed"
+name = "b_logs_parts_missing_declared_leaves"
 statement = "stamp"
 state = "repair_arms"
 transition = "repair_arms_16000000"
-metric = "stamp.preconditions.logs.parts_unindexed"
+metric = "stamp.preconditions.logs.parts_missing_declared_leaves"
 lane = "counter"
 target_if = "v >= 1"
 
@@ -3473,11 +3473,11 @@ miss_if = "v != 0"
 miss_reason = "the tenant held leaves of a declared field before the repair"
 
 [[row.figure]]
-name = "b_spans_parts_unindexed"
+name = "b_spans_parts_missing_declared_leaves"
 statement = "stamp"
 state = "repair_arms"
 transition = "repair_arms_16000000"
-metric = "stamp.preconditions.spans.parts_unindexed"
+metric = "stamp.preconditions.spans.parts_missing_declared_leaves"
 lane = "counter"
 target_if = "v >= 1"
 

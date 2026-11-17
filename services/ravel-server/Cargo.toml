@@ -224,12 +224,15 @@ ravel-agents-runtime = { path = "../../crates/ravel-agents-runtime", version = "
 # the same arrow major datafusion carries.
 arrow-flight = { workspace = true, optional = true }
 
-# Antithesis SDK assertions and the coverage-instrumentation runtime shim, for
-# the workload under antithesis/ (antithesis/README.md). A genuinely new
-# external dependency, linked only by the off-by-default `antithesis` feature,
-# which no published build enables. Pinned directly here rather than through
-# `[workspace.dependencies]`, matching `toml` and `reqwest` above.
-antithesis_sdk = { version = "0.4", optional = true }
+# ADR-4326 assertion and mutant macros. The Antithesis SDK pin lives in
+# ravel-invariant; the `antithesis` feature below reaches it through that crate.
+# With no feature on every macro expands to nothing.
+ravel-invariant = { workspace = true }
+# The coverage-instrumentation runtime shim, for the workloads under
+# antithesis/ (antithesis/README.md), linked only by the off-by-default
+# `antithesis` feature, which no published build enables. Pinned directly here
+# rather than through `[workspace.dependencies]`, matching `toml` and `reqwest`
+# above.
 antithesis-instrumentation = { version = "0.1", optional = true }
 
 # Global allocator, compiled into this binary (issue #972). Kept off the msvc
@@ -298,7 +301,27 @@ agents = [
 # Off by default and in no published build: only the Antithesis workload's
 # image builds it, together with the instrumentation flags. Without it every
 # assertion site compiles to nothing.
-antithesis = ["dep:antithesis_sdk", "dep:antithesis-instrumentation"]
+antithesis = [
+    "dep:antithesis-instrumentation",
+    "ravel-invariant/antithesis",
+    "ravel-catalog/antithesis",
+    "ravel-commit/antithesis",
+    "ravel-fleet/antithesis",
+    "ravel-ingest/antithesis",
+    "ravel-maintain/antithesis",
+]
+
+# Compiles the ADR-4326 mutant switches in; `ravel_invariant::init` refuses an
+# unknown RAVEL_ANTITHESIS_MUTANT. Only the `<workload>-mutants` Antithesis
+# images build it, never a published one.
+antithesis-mutants = [
+    "ravel-invariant/antithesis-mutants",
+    "ravel-catalog/antithesis-mutants",
+    "ravel-commit/antithesis-mutants",
+    "ravel-fleet/antithesis-mutants",
+    "ravel-ingest/antithesis-mutants",
+    "ravel-maintain/antithesis-mutants",
+]
 
 # jemalloc heap profiling, for attributing live memory to allocation sites
 # (docs/guides/operations/troubleshooting.md, "Attributing server memory with a

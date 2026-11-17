@@ -1,29 +1,21 @@
 //! ravel-server: gateway + ingest + query in one binary for development
 //! (`--mode all|gateway|query`). Crate boundaries keep the split honest.
 
-// Antithesis SDK assertions, compiled only with the off-by-default
-// `antithesis` feature (antithesis/README.md). Without it each macro expands
-// to nothing and its arguments are never evaluated. Defined before every
-// module so all of them are in textual scope.
-#[cfg(feature = "antithesis")]
+// Antithesis SDK assertions through ravel-invariant (ADR-4326), compiled only
+// with the off-by-default `antithesis` feature (antithesis/README.md), or with
+// `ravel-invariant/capture`, which records each evaluation in-process for
+// tests. Without either, each macro expands to nothing and its arguments are
+// never evaluated.
+// Defined before every module so all of them are in textual scope.
 macro_rules! antithesis_reachable {
     ($message:literal, $details:expr) => {
-        antithesis_sdk::assert_reachable!($message, &$details)
+        ravel_invariant::inv_reachable!($message, $details)
     };
 }
-#[cfg(not(feature = "antithesis"))]
-macro_rules! antithesis_reachable {
-    ($message:literal, $details:expr) => {};
-}
-#[cfg(feature = "antithesis")]
 macro_rules! antithesis_unreachable {
     ($message:literal, $details:expr) => {
-        antithesis_sdk::assert_unreachable!($message, &$details)
+        ravel_invariant::inv_unreachable!($message, $details)
     };
-}
-#[cfg(not(feature = "antithesis"))]
-macro_rules! antithesis_unreachable {
-    ($message:literal, $details:expr) => {};
 }
 
 pub mod admission_reconcile;
@@ -38,6 +30,8 @@ pub mod bucket_protection;
 pub mod cache_warm;
 pub mod cli_reference;
 pub mod compat;
+pub mod compat_gate;
+pub mod compat_maintain;
 pub mod config;
 pub mod cpu_gates;
 #[cfg(feature = "sql")]
@@ -3428,6 +3422,12 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             view,
             compat_clock.clone(),
         ));
+        // The late-write pass and certify finalization write sys/compat, so
+        // they take the same deployment key the view authenticates with.
+        if let Some(key) = config.deployment_key.as_deref() {
+            config.maintain.compat.keys =
+                Some(ravel_catalog::compat::CompatKeys::from_file_keys(&[*key])?);
+        }
     }
     // ADR-1702 task 10: compaction's decode and re-encode, and the snapshot
     // reachability reads of retention and the sweep, run on the read gate.

@@ -30,11 +30,22 @@
 #      dev-dependencies table or in the value of a feature itself named
 #      `format-drill`: never in `default`, a forward under another name (which
 #      the Dockerfile could enable without naming it), or a non-dev dependency.
+#   6. The test-only `antithesis`, `antithesis-mutants` and `capture` features
+#      of ravel-invariant (ADR-4326) cannot reach a published image. Neither
+#      the Dockerfile nor publish-images.yml names `antithesis`,
+#      `antithesis-mutants` or `ravel-invariant/capture` outside a comment, or
+#      `capture` in a features argument. In the workspace manifests a value
+#      naming `antithesis` or `antithesis-mutants`, in any quoting, is allowed
+#      only in a feature of the same name; a value naming
+#      `ravel-invariant/capture`, or `capture` in ravel-invariant's own
+#      features or on a ravel-invariant dependency edge, is allowed nowhere.
+#      Dev-dependencies get no exemption: test builds unify features.
 #
 # Exit 0 clean, 1 on a finding, 2 when an anchor is missing (no
 # `[profile.release]` table, no `cargo build` line, a file that is not there,
-# a drill crate that no longer declares the feature): a scan that found
-# nothing to check is not a pass.
+# a drill crate that no longer declares the feature, a ravel-invariant
+# manifest that is missing or no longer declares one of its three test-only
+# features): a scan that found nothing to check is not a pass.
 #
 # Run: scripts/guards/check-release-profile.sh
 # Cases: scripts/guards/check-release-profile.test.sh
@@ -65,6 +76,8 @@ done
 for c in "${drill_crates[@]}"; do
   [[ -f "${c}/Cargo.toml" ]] || missing "${c}/Cargo.toml does not exist"
 done
+invariant_crate=crates/ravel-invariant
+[[ -f "${invariant_crate}/Cargo.toml" ]] || missing "${invariant_crate}/Cargo.toml does not exist"
 
 # --- 1. the release profile --------------------------------------------------
 
@@ -251,9 +264,73 @@ for f in "${manifests[@]}"; do
   ' "${f}")
 done
 
+# --- 6. ravel-invariant's test-only features stay out of release builds -------
+
+# ADR-4326: the Antithesis SDK, the mutant switches and the in-process capture
+# are for the workload images under antithesis/ and the invariants test lane
+# only. Whole-word matches, so the antithesis-instrumentation crate name is
+# not one. `capture` is a common word, so outside a manifest only the
+# qualified `ravel-invariant/capture` or a features argument naming it counts.
+for f in "${dockerfile}" "${publish}"; do
+  while IFS= read -r hit; do
+    [[ -n "${hit}" ]] || continue
+    finding "${f}:${hit%%:*}: release build enables antithesis, antithesis-mutants or ravel-invariant/capture: ${hit#*:}"
+  done < <(awk '
+    { line = $0; sub(/(^|[[:space:]])#.*$/, "", line) }
+    line ~ /(^|[^A-Za-z0-9_-])antithesis(-mutants)?($|[^A-Za-z0-9_-])/ { print NR ":" $0; next }
+    line ~ /ravel-invariant\??\/capture($|[^A-Za-z0-9_-])/ { print NR ":" $0; next }
+    line ~ /(-F|--features|FEATURES)/ && line ~ /(^|[^A-Za-z0-9_-])capture($|[^A-Za-z0-9_-])/ { print NR ":" $0 }
+  ' "${f}")
+done
+
+for want in antithesis antithesis-mutants capture; do
+  awk -v want="${want}" '
+    /^[[:space:]]*\[/ { in_features = ($0 == "[features]"); next }
+    in_features && $0 ~ ("^[[:space:]]*" want "[[:space:]]*=") { found = 1 }
+    END { exit !found }
+  ' "${invariant_crate}/Cargo.toml" \
+    || missing "${invariant_crate}/Cargo.toml declares no ${want} feature"
+done
+
+# Each manifest line naming one of the features in a value (after the key's
+# `=`, or on a continuation line of a multi-line array), quoted, single-quoted
+# or bare, with the table and key it belongs to (as for format-drill above).
+# Allowed: antithesis or antithesis-mutants in the value of a feature of the
+# same name, which only forwards a feature something else must turn on.
+# Everything else is a finding, dev-dependencies included: the workspace's
+# test builds would unify it into every crate they compile. capture has no
+# allowed forward at all: the invariants lane turns it on from the command
+# line. A bare `capture` counts in ravel-invariant's own [features] and on a
+# ravel-invariant dependency edge, where it can only mean that feature.
+for f in "${manifests[@]}"; do
+  while IFS= read -r hit; do
+    [[ -n "${hit}" ]] || continue
+    finding "${f}:${hit}"
+  done < <(awk -v self="${invariant_crate}/Cargo.toml" '
+    function has(s, w) { return s ~ ("(^|[^A-Za-z0-9_-])" w "($|[^A-Za-z0-9_-])") }
+    /^[[:space:]]*\[/ { table = $0; gsub(/[[:space:]]/, "", table); key = ""; next }
+    { line = $0; sub(/(^|[[:space:]])#.*$/, "", line); value = line }
+    match(line, /^[[:space:]]*[A-Za-z0-9_.-]+[[:space:]]*=/) {
+      key = substr(line, RSTART, RLENGTH); sub(/=$/, "", key); gsub(/[[:space:]]/, "", key)
+      value = substr(line, RSTART + RLENGTH)
+    }
+    {
+      own = (FILENAME == self && table == "[features]")
+      edge = (table ~ /dependencies/ && (key == "ravel-invariant" || table ~ /dependencies\.ravel-invariant\]$/))
+      if (has(value, "ravel-invariant\\??/capture") || ((own || edge) && has(value, "capture"))) {
+        print FNR ": enables ravel-invariant/capture, which no manifest may turn on: " $0
+      } else if (has(value, "antithesis(-mutants)?") \
+          && !(table == "[features]" && (key == "antithesis" || key == "antithesis-mutants"))) {
+        print FNR ": enables antithesis outside its own same-name feature: " $0
+      }
+    }
+  ' "${f}")
+done
+
 if [[ "${findings}" -gt 0 ]]; then
   printf '%s finding(s): published binaries would not be built on the optimised release profile\n' "${findings}"
   exit 1
 fi
-printf 'release profile guard: clean (lto=%s, codegen-units=%s, debug=%s, %s cargo build(s) in %s; format-drill test-only: %s defining crate(s), %s manifest(s) scanned)\n' \
-  "${lto}" "${units}" "${debug}" "${builds}" "${dockerfile}" "${#drill_crates[@]}" "${#manifests[@]}"
+printf 'release profile guard: clean (lto=%s, codegen-units=%s, debug=%s, %s cargo build(s) in %s; format-drill test-only: %s defining crate(s), %s manifest(s) scanned; antithesis test-only: defined in %s, %s manifest(s) scanned)\n' \
+  "${lto}" "${units}" "${debug}" "${builds}" "${dockerfile}" "${#drill_crates[@]}" "${#manifests[@]}" \
+  "${invariant_crate}" "${#manifests[@]}"

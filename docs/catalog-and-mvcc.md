@@ -1958,8 +1958,13 @@ pins it: 40 pairs of one field under a budget of 8 build in 5 passes, each
 holding 8 pairs, a peak of 9 with the pair placed before a cut, every
 section read in each pass (40 ranged GETs for 4 entries), and leaves byte
 for byte a fold's at the same budget. A repair that built in one pass with
-no budget, holding every section read of its batch whole, would hold about
-6.8 GB of pairs for a logs day (ADR-3939, "Decision 2, clarified").
+no budget, holding every section read of its batch whole, was predicted to
+hold about 6.8 GB of pairs for a logs day (ADR-3939, "Decision 2,
+clarified"); no run measured the pairs it held. What was measured is its
+peak RSS, 8.83 GB for logs and 2.21 GB for spans (ADR-3939, the measured
+repair amendment). RSS also counts the sections in flight, the encoded
+leaves and allocator overhead, so it neither confirms nor refutes the
+pairs figure.
 At the default budget the same day part, two fields at a share of
 4,000,000, holds at most 8,000,002 pairs when no key8 run exceeds a share,
 about 704 MB at the 88 B upper-bound estimate above, plus what the budget
@@ -3373,9 +3378,64 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
 5. For each `min_token`: reconstruct its commit key and GET it directly
    (never by re-listing). Present: ensure it is in the snapshot set (its
    event range might not overlap; include it anyway so read-your-write
-   holds). Absent: fall back to GETting the bucket's compaction record(s)
-   (cacheable, same as step 2) and check the token's writer identity
-   against each record's input list. Found in an input list: satisfied via
+   holds), with one exception for every signal but metrics: when the check
+   below runs, the input is not added when the set already serves its rows
+   from a replacement, when a live rewrite replaced it and the set holds
+   nothing else that rewrite replaced, or when its bucket is tombstoned. A
+   compacted input's commit record stays present until the sweep, and logs
+   and spans have no query-time dedup, so adding it beside the part that
+   holds its rows would count each of its records twice. The step checks
+   only when the set holds a level-1 part of the token's (shard,
+   ingest_hour) bucket or step 6 found a pending erasure request (that LIST
+   therefore completes before this step). Without either, the input is
+   added as before, even when its bucket is tombstoned; its rows are not
+   counted twice there, because the set then holds no level-1 part of the
+   bucket that could also hold them. When the check runs, it LISTs the
+   bucket and, in this order:
+
+   - a tombstone in the bucket: the input is not added, the answer the
+     absent-record path below gives (satisfied with zero segments);
+   - a compaction or rewrite record of any status names the input (a
+     rewrite through its effective inputs) and one of that record's own
+     output parts is in the set: nothing is added, since that part serves
+     the input's rows; a record naming the input whose parts are not in the
+     set does not keep it out. A served part of a superseded rewrite (a
+     stale HEAD) is checked before any live successor is added;
+   - a live rewrite names the input (the first in listing order, the one
+     the absent-record path picks, after the same sibling-rewrite alarm
+     that path raises) and the set holds no object it replaced: no input
+     among its effective inputs, and no part of a record its supersession
+     chain replaced or of another compaction or rewrite record naming one
+     of those inputs. Its output parts are added in the input's place, the
+     same parts the absent-record path serves once the sweep deletes the
+     commit record;
+   - a live rewrite names the input but the set holds an object it
+     replaced (a stale HEAD still names another of its inputs, or a
+     compaction of one): the input itself is added, since the rewrite's
+     parts would serve that object's rows a second time. The sweep keeps
+     the rewrite's `.dreq` while an input it superseded is still
+     resolvable through HEAD (ADR-0064, `.dreq` release amendment), so the
+     request is pending here and its filter drops the input's erased rows;
+   - otherwise the input is added as before.
+
+   Records are matched by the input identities they hold, never by object
+   key. Tokens whose commit record is absent are resolved first and present
+   ones after them, so a present token sees every part an absent token's
+   fallback added and the answer does not depend on token order. Metrics
+   keep adding the input, since query-time dedup collapses the overlap.
+   Cost, per present token: nothing beyond the commit-record GET when the
+   check does not run; otherwise one LIST of its bucket (more pages only
+   past the page size), one GET per compaction record the cache does not
+   hold and one GET per rewrite record, which no cache holds. Nothing is
+   shared across tokens, so N tokens whose check runs pay N LISTs even in
+   one bucket, and each re-fetches that bucket's rewrite records. While an
+   erasure request is pending, the check runs for every present token of a
+   signal other than metrics whose input is not already in the set, so each
+   pays that LIST and the rewrite GETs whether or not its bucket was
+   compacted or rewritten. Absent: fall back to GETting the
+   bucket's compaction record(s) (cacheable, same as step 2) and check the
+   token's writer identity against each record's input list. Found in an
+   input list: satisfied via
    that record's parts. A rewrite record (ADR-0064) is treated the same:
    if the token's identity is among a live (non-superseded) rewrite's
    effective inputs, it is satisfied via that rewrite's erased output parts,
@@ -3387,8 +3447,9 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    per resolve -- independent of whether any physical rewrite has run -- LIST
    `t/<th>/<sig>/del/` one time only. This LIST is started before the shard
    fan-out and joined with it, so its round trip overlaps the bucket LISTs in
-   one wave rather than following them; it still completes before
-   the snapshot is constructed, so the visibility bound below is unchanged. For
+   one wave rather than following them; it still completes before step 5's
+   token check and the snapshot construction, so the visibility bound below
+   is unchanged. For
    every `.dreq` erasure request found, decode and structurally validate it
    and verify its observed key against its own identity fields (ADR-0010 §7),
    then attach it to the snapshot's `pending_erasure`. `.done` completion
@@ -3586,7 +3647,10 @@ pinning are unchanged:
    listing path does. For window buckets with `hour > W`, LIST and
    GET-decode as that path does.
 4. min-token resolution: unchanged, exact commit-key GETs, never through
-   the snapshot.
+   the snapshot. A present input of any signal but metrics whose bucket
+   has a level-1 part in the result set is checked against that bucket's
+   records by the same LIST as on the listing path (step 5 above), so an
+   input compacted into a part the snapshot serves is not added beside it.
 5. Build `SegmentRef`s from snapshot entries by reconstructing the data key
    from identity fields, the same reconstruct-don't-trust rule as commit
    records (ADR-0010 §7); dedup by data key across the snapshot/listing/
@@ -3835,8 +3899,12 @@ of every input it names, a resolved snapshot holding both the record's segments
 and some or all of its listed inputs answers a query exactly as one holding
 only the segments does, because query-time dedup ("Cross-segment duplicate
 samples" below) collapses the duplicate candidates. So no dedup runs at
-compaction time, and a reader may transiently see an L0 input and its L1
-replacement together and still get exact answers.
+compaction time, and a metrics reader may transiently see an L0 input and its
+L1 replacement together and still get exact answers. That dedup runs for
+metrics only. Logs and spans have none, so the resolver never serves one of
+their inputs beside a replacement it holds: the listing excludes the inputs a
+served record names, and the `min_token` step leaves out an input whose rows
+the snapshot already serves from a replacement (step 5 of the resolve).
 
 Record-count conservation is enforced, not assumed (ADR-0048). Before the
 record PUT, the run checks that the sum of `sample_count` over its input set
