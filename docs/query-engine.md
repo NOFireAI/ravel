@@ -7428,8 +7428,9 @@ flighted and corruption-gated per ADR-0046 decisions 3-5.
 Before `/readyz` latches, `cache_warm::warm_cache` discovers the tenants and
 then runs three steps concurrently: part resolution, which resolves each
 tenant's warm set for both signals; the whole-part warm, which reads the 4
-most recent parts of each (tenant, signal) whole; and a logs metadata pass
-(ADR-4203 decision 8). Resolution runs at most 4 tenants at once
+most recent parts of each (tenant, signal) whole, skipping logs parts above
+`LogSegmentFetcher::plan_whole_object_bound` (see below); and a
+logs metadata pass (ADR-4203 decision 8). Resolution runs at most 4 tenants at once
 (`PART_RESOLUTIONS_IN_FLIGHT`), each holding one permit of the shared store
 GET limiter while it runs, and hands each tenant's set on in discovery order
 as it completes, so the first tenants are warmed while later ones still
@@ -7445,6 +7446,24 @@ pass, so one tenant's pass does not hold back a later tenant's whole-part
 warm; with 1 permit the pass reads on the only permit, and a hung probe holds
 it, and with it every later resolution and whole-part GET, until the
 deadline.
+
+The whole-part warm reads a logs part the way the query path does
+(ADR-0046 amendment 2026-11-16): whole only when its object size is at or under
+`LogSegmentFetcher::plan_whole_object_bound`, and not at all above it. Above
+the bound the query path plans the part from its directories, which the
+metadata pass below warms, and then reads by range only the blocks a
+statement's plan keeps; a whole read here would fetch blocks a statement may
+never read. A logs part above the bound is dropped from the whole-part set,
+before the 4-part cap, and counted in `parts_above_plan_bound`; the cap then
+takes the most recent parts at or under the bound, and a part at or under the
+bound past the cap is counted in `parts_beyond_cap` and warmed by neither
+step. The whole-part warm's logs fetcher is built with the same block-range
+threshold, request cost and projection break-even as the metadata pass, so the
+two steps agree on the bound and never both read one logs part. When the
+metadata pass does not run (its fetcher refuses the configured fetch bound), a
+logs part above the bound gets no warm at all, and the warm-up logs one
+`warn!` per pass saying so. The metric side is unchanged: a metric part above
+`DEFAULT_WHOLE_OBJECT_THRESHOLD` is still warmed, on its footer tail.
 
 The whole-part warm holds to the cache budget minus the pass's ceiling
 (below), or to the whole budget when the pass does not run. Each part

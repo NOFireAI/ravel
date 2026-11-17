@@ -3,10 +3,13 @@
 //! directory reads for every logs object in the warm window from the read
 //! cache, on the fast path and on the striped route alike.
 //!
-//! One tenant holds [`OBJECTS`] logs objects, more than the whole-part warm's
-//! cap of 4, every one above the logs plan bound the server is configured
-//! with, so both SQL routes read each object's footer and directories
-//! through the suffix probe and then its column pages by range. A counting
+//! One tenant holds [`OBJECTS`] logs objects, every one above the logs plan
+//! bound the server is configured with, so both SQL routes read each object's
+//! footer and directories through the suffix probe and then its column pages by
+//! range. Because every object is above the bound, the whole-part warm reads
+//! none of them whole (issue #4307): the metadata pass warms each one's footer
+//! and directories, and the whole read the query path never issues at plan time
+//! is never issued at warm time either. A counting
 //! store classifies every GET of a data object against that object's own
 //! footer: a read reaching the last byte is a footer read, one overlapping
 //! STREAM_DIR, FIELD_DIR, SKIP_IDX or PAGE_DIR a directory read, anything
@@ -358,7 +361,7 @@ async fn ingest_tenant() -> Tenant {
         let probe = probe_len(layout.size);
         assert!(
             layout.size <= 512 * 1024,
-            "every object stays a whole-object read for the default-config whole-part warm: {}",
+            "each object is a few hundred KiB, its directories inside the suffix probe: {}",
             layout.size
         );
         assert!(
@@ -778,13 +781,14 @@ const STRIPED: (&str, usize) = ("SELECT count(*) FROM logs WHERE svc LIKE '%7%'"
 /// run's, and over the whole statement the read cache serves exactly one more
 /// hit and one fewer miss per object than unwarmed: the probe read the
 /// unwarmed run missed. While the server started, each object's probe was
-/// read once, no column page or lone directory was, and only the whole-part
-/// warm's 4 objects were read whole.
+/// read once, no column page or lone directory was, and no object was read
+/// whole: every object is above the plan bound, so the whole-part warm skips
+/// them all and the metadata pass warms them (issue #4307).
 ///
 /// Seen failing against three alternative warms: the 4-part cap kept on the
 /// metadata pass (4 first-open cache hits, not 6), a probe of another length
-/// (0, not 6), and a pass that also reads every object's columns (6 whole
-/// reads during startup, not 4).
+/// (0, not 6), and a whole-part warm that reads objects above the bound whole
+/// (4 whole reads during startup, not 0).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_server_serves_the_first_scan_footers_from_the_warmed_cache() {
     let tenant = ingest_tenant().await;
@@ -879,9 +883,9 @@ async fn a_restarted_server_serves_the_first_scan_footers_from_the_warmed_cache(
                 warm_gets.page_total(),
                 warm_gets.whole_total(),
             ),
-            (OBJECTS, OBJECTS, 0, 0, 4),
-            "{route}: the warm-up read one probe per object, no column page, and only the \
-             whole-part warm's 4 objects whole: {warm_gets:?}"
+            (OBJECTS, OBJECTS, 0, 0, 0),
+            "{route}: the warm-up read one probe per object, no column page, and no object \
+             whole: every object is above the plan bound: {warm_gets:?}"
         );
     }
 }
@@ -962,11 +966,10 @@ async fn the_warm_covers_directories_beyond_the_suffix_probe() {
 /// probe `P` per object here (every fixture object's directories fit in its
 /// probe), and admits objects most recent first while those stay within half
 /// of `--cache-max-bytes`. A budget of `2 * (2 * P) + P` admits exactly 2.
-/// The whole-part warm, running beside the pass, holds to the other half: of
-/// the 4 newest objects it reads, newest first, each one that still fits,
-/// `R` bytes, enough that a ceiling also charged with them would admit fewer
-/// than 2. The read cache itself is roomy, so no eviction decides which
-/// footers the statement finds.
+/// Every object is above the plan bound, so the whole-part warm reads none of
+/// them whole (issue #4307) and the cache holds only the admitted probes. The
+/// read cache itself is roomy, so no eviction decides which footers the
+/// statement finds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_metadata_warm_stops_at_the_cache_budget() {
     let tenant = ingest_tenant().await;
@@ -982,32 +985,20 @@ async fn the_metadata_warm_stops_at_the_cache_budget() {
     );
     let cache_max_bytes = 2 * (2 * probe) + probe;
     const ADMITTED: usize = 2;
-    let whole_part_share = cache_max_bytes - cache_max_bytes / 2;
-    let resident = tenant
-        .keys
-        .iter()
-        .take(4)
-        .map(|key| tenant.layouts[key].size)
-        .fold(0, |held, size| {
-            if held + size <= whole_part_share {
-                held + size
-            } else {
-                held
-            }
-        });
-    assert!(
-        resident > 0 && resident + ADMITTED as u64 * probe > cache_max_bytes / 2,
-        "the whole parts that fit would crowd the pass under a ceiling charged with them: \
-         {resident} vs {cache_max_bytes}"
-    );
 
     let server = tenant
         .restart_with_budget(FAST_PATH.1, ROOMY_CACHE_BYTES, cache_max_bytes, true)
         .await;
     assert_eq!(
+        server.warm_gets.whole_total(),
+        0,
+        "every object is above the plan bound, so the whole-part warm reads none whole: {:?}",
+        server.warm_gets
+    );
+    assert_eq!(
         server.cache.total_bytes(),
-        resident + ADMITTED as u64 * probe,
-        "the whole parts that fit their share and the admitted probes are resident"
+        ADMITTED as u64 * probe,
+        "only the metadata probes the pass admitted are resident"
     );
     let run = server.sql(&tenant, FAST_PATH.0).await;
     server.stop().await;
@@ -1110,26 +1101,21 @@ async fn capture_log<T>(body: impl std::future::Future<Output = T>) -> (T, Vec<S
 /// event times in the older one.
 ///
 /// With a roomy budget, the warm result log reports every object's metadata
-/// warmed and the whole-part warm's 4 parts, which are the newest ingest
-/// hour's 4 objects, and the first scanning statement over the whole event
-/// range issues no footer GET and no directory GET: the plan phase takes one
-/// cache hit per object. With a metadata budget that admits 2 objects, the
-/// admitted ones are the first 2 of the newest ingest hour, so the statement
-/// reads exactly the other objects' footers.
+/// warmed and all `OBJECTS` parts above the plan bound (so the whole-part warm
+/// reads none whole, issue #4307), and the first scanning statement over the
+/// whole event range issues no footer GET and no directory GET: the plan phase
+/// takes one cache hit per object. With a metadata budget that admits 2
+/// objects, the admitted ones are the first 2 of the newest ingest hour, so the
+/// statement reads exactly the other objects' footers.
 ///
 /// Seen failing against the event-time window the warm-up resolved before
-/// (the result log reads `parts_warmed=0 metadata_objects_warmed=0`),
-/// against a selection that takes the oldest ingest hour first (the whole-part
-/// warm reads the 2 older-hour objects, and the budgeted statement reads the
-/// footers of the newest hour's first 2), and against one ordered by event
-/// time alone, which fails the same two ways.
+/// (the result log reads `parts_warmed=0 metadata_objects_warmed=0`), and
+/// against a selection that takes the oldest ingest hour first or orders by
+/// event time alone (the budget admits other objects than the newest ingest
+/// hour's first 2, so the budgeted statement's footer reads are not the rest).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_whose_event_times_predate_its_ingest_window_is_warmed() {
     let (tenant, warm_order) = backdated_tenant().await;
-    let newest_hour: BTreeSet<String> = warm_order[..OBJECTS - OLDER_HOUR_OBJECTS]
-        .iter()
-        .cloned()
-        .collect();
 
     let (query, partitions) = STRIPED;
     let (mut server, log) = capture_log(tenant.restart(partitions, ROOMY_CACHE_BYTES, true)).await;
@@ -1140,19 +1126,16 @@ async fn a_tenant_whose_event_times_predate_its_ingest_window_is_warmed() {
     assert_eq!(pass_complete.len(), 1, "one warm result: {pass_complete:?}");
     assert!(
         pass_complete[0].contains(&format!("metadata_objects_warmed={OBJECTS} "))
-            && pass_complete[0].contains("parts_warmed=4 "),
-        "every object's metadata and 4 parts whole: {}",
+            && pass_complete[0].contains("parts_warmed=0 ")
+            && pass_complete[0].contains(&format!("parts_above_plan_bound={OBJECTS} ")),
+        "every object's metadata warmed and every part above the plan bound: {}",
         pass_complete[0]
     );
     let warm_gets = std::mem::take(&mut server.warm_gets);
     assert_eq!(
-        warm_gets
-            .whole
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<String>>(),
-        newest_hour,
-        "the whole-part warm reads the newest ingest hour's objects: {warm_gets:?}"
+        warm_gets.whole_total(),
+        0,
+        "every object is above the plan bound, so the whole-part warm reads none whole: {warm_gets:?}"
     );
     let run = server.sql(&tenant, query).await;
     server.stop().await;
