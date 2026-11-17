@@ -400,7 +400,14 @@ async fn folded_token_after_compaction_serves_the_part_once(signal: Signal) {
     let store = Arc::new(MemoryStore::new());
     let (l, c) = compacted_bucket(store.as_ref(), signal).await;
     let report = catalog(&store)
-        .fold(&tenant(), signal, Uuid::new_v4(), sealed_window().1, &[], None)
+        .fold(
+            &tenant(),
+            signal,
+            Uuid::new_v4(),
+            sealed_window().1,
+            &[],
+            None,
+        )
         .await
         .expect("fold");
     assert_eq!(report.watermark_hour, Some(HOUR));
@@ -460,7 +467,14 @@ async fn uncompacted_token_newer_than_head_is_added(signal: Signal) {
     let store = Arc::new(MemoryStore::new());
     let (_, c) = compacted_bucket(store.as_ref(), signal).await;
     let report = catalog(&store)
-        .fold(&tenant(), signal, Uuid::new_v4(), sealed_window().1, &[], None)
+        .fold(
+            &tenant(),
+            signal,
+            Uuid::new_v4(),
+            sealed_window().1,
+            &[],
+            None,
+        )
         .await
         .expect("fold");
     assert_eq!(report.watermark_hour, Some(HOUR));
@@ -587,8 +601,7 @@ async fn token_after_rewrite_out_of_range_is_not_brought_back() {
 
     let (plain, plain_reads) = resolve_counted(&store, Signal::Logs, (range, now), &[]).await;
     assert!(plain.segments.is_empty());
-    let (snapshot, reads) =
-        resolve_counted(&store, Signal::Logs, (range, now), &[token(&l)]).await;
+    let (snapshot, reads) = resolve_counted(&store, Signal::Logs, (range, now), &[token(&l)]).await;
     assert!(
         snapshot.segments.is_empty(),
         "a live rewrite's input is never added back"
@@ -653,8 +666,7 @@ async fn superseded_compaction_part_in_a_stale_head_keeps_the_input_out() {
 
     let (plain, _) = resolve_counted(&store, Signal::Logs, sealed_window(), &[]).await;
     assert_eq!(sorted_keys(&plain), vec![part_key(&c1)], "HEAD is stale");
-    let (snapshot, _) =
-        resolve_counted(&store, Signal::Logs, sealed_window(), &[token(&l)]).await;
+    let (snapshot, _) = resolve_counted(&store, Signal::Logs, sealed_window(), &[token(&l)]).await;
     assert_eq!(sorted_keys(&snapshot), vec![part_key(&c1)]);
     assert_eq!(rows(&snapshot), L_ROWS + M_ROWS, "each record counted once");
 }
