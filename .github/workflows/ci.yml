@@ -184,7 +184,7 @@ jobs:
           object_store_area=false
           agents_area=false
           sdk_area=false
-          if echo "$changed" | grep -qE '^services/ravel-server/|^services/ravel-operator/|^deploy/|^scripts/kind-up\.sh$|^scripts/kind-demo\.sh$|^scripts/kind-down\.sh$|^Dockerfile$|^Dockerfile\.prebuilt$|^\.dockerignore$'; then
+          if echo "$changed" | grep -qE '^services/ravel-server/|^services/ravel-operator/|^deploy/|^scripts/kind-up\.sh$|^scripts/kind-demo\.sh$|^scripts/kind-down\.sh$|^scripts/kind-autoscaling-check\.sh$|^Dockerfile$|^Dockerfile\.prebuilt$|^\.dockerignore$'; then
             server_or_operator=true
           fi
           if echo "$changed" | grep -qE '^crates/ravel-sql/|^services/ravel-server/|^crates/ravel-query/|^crates/ravel-esql/'; then
@@ -260,7 +260,7 @@ jobs:
           # which sets sql_area true) and an unlisted one (e.g. ravel-types)
           # in the same diff must still force every area true for the
           # unlisted crate's sake, even though sql_area is already true.
-          area_paths='^services/ravel-server/|^services/ravel-operator/|^deploy/|^scripts/kind-up\.sh$|^scripts/kind-demo\.sh$|^scripts/kind-down\.sh$|^Dockerfile$|^Dockerfile\.prebuilt$|^\.dockerignore$|^crates/ravel-sql/|^crates/ravel-query/|^crates/ravel-promql/|^crates/ravel-promql-difftest/|^crates/ravel-object-store/|^crates/ravel-bench/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/|^crates/ravel-agents-'
+          area_paths='^services/ravel-server/|^services/ravel-operator/|^deploy/|^scripts/kind-up\.sh$|^scripts/kind-demo\.sh$|^scripts/kind-down\.sh$|^scripts/kind-autoscaling-check\.sh$|^Dockerfile$|^Dockerfile\.prebuilt$|^\.dockerignore$|^crates/ravel-sql/|^crates/ravel-query/|^crates/ravel-promql/|^crates/ravel-promql-difftest/|^crates/ravel-object-store/|^crates/ravel-bench/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/|^crates/ravel-agents-'
           # Provably irrelevant to every Rust lane: prose, the TLA+ models, and
           # the TLA+ harness (all three already handled above, and listed again
           # here so this test can be read on its own).
@@ -365,6 +365,11 @@ jobs:
       # itself runs only in k8s-nightly.yml's agents-chaos job.
       - name: Agents chaos assertion cases (issue #3363)
         run: bash scripts/chaos/agents-replace-worker.test.sh
+      # The ADR-4314 replicas-handover check's own assertion logic, against a
+      # stubbed kubectl; the check itself runs only in k8s-integration and
+      # k8s-nightly against a real apiserver (issue #4324).
+      - name: ADR-4314 replicas-handover check cases (issue #4324)
+        run: bash scripts/kind-autoscaling-check.test.sh
       # Documentation gate (ADR-1040 D3). Run UNPIPED: a pipeline's exit code is
       # the last stage's, so a real failure piped through tail/grep would report
       # as a pass. No cargo toolchain, matching this job.
@@ -2987,6 +2992,8 @@ jobs:
           scripts/kind-up.sh
       - name: OTLP round trip through the gateway and query Services
         run: scripts/kind-demo.sh
+      - name: ADR-4314 replicas handover across autoscaling modes and turn-off
+        run: scripts/kind-autoscaling-check.sh
       # On any failure above (the readiness-timeout mode leaves only a
       # bare `kubectl wait` timeout otherwise), dump what a human would ask for
       # before the cluster is torn down. Ordered broad-to-specific: every pod's
