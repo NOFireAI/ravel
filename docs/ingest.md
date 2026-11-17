@@ -287,7 +287,17 @@ own reshard lead-time floor in reverse -- a generation appended after the
 router's last successful refresh cannot activate before that horizon, so a
 cached view is provably still exactly what a fresh read would return for any
 hour strictly before it. Once the horizon is crossed, an unseen append becomes
-possible and the switch returns no set, so the flush fails closed: the grace
+possible and the switch returns no set, so the flush fails closed. The
+horizon is tested where the routed rows' flush can open, not at routing time:
+the switch routes only when `hour_of(now_ns + flush_trigger_age_bound) <
+hour_of(view.refreshed_at_ns) + min_lead_hours(C)`, where
+`flush_trigger_age_bound` is the largest age a buffer reaches before its flush
+trigger fires (the largest of the flush delays, plus one flush tick; about 40 s
+at the defaults). A row routed later would be acknowledged in buffered mode
+and then reach a flush that opens past the horizon, where the scan-set check
+below holds it and finally drops it, so in the last
+`flush_trigger_age_bound` before the horizon a write is refused with the
+retryable `StaleProvisioningView` (503) and nothing is buffered. The grace
 window degrades cost under
 store latency, it never converts a genuine shard-count change into silent
 wrong-routing. A router routing through this window increments
