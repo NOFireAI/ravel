@@ -428,8 +428,12 @@ tenant's cached generation history. That view is trusted for `h` only before
   drain (`flush_all`, `FlushNow`, shutdown, channel close) does not leave it
   to the next trigger: it waits for that re-read, joining one already in
   flight, for at most `max_flush_lifetime`, and then applies the check, so one
-  drain flushes every buffer the re-read confirms. Only a re-read that fails
-  keeps the buffer.
+  drain flushes every buffer the re-read confirms. While the process runs, a
+  re-read that keeps failing keeps the buffer with no time bound: nothing
+  opens, drops or counts it again. At shutdown the teardown pass writes such
+  a buffer in place rather than keeping it, so a row acknowledged before the
+  horizon can first be stored when the process stops (a known issue; see the
+  consistency model).
 
 A late flush also never writes under an hour its routing generation does not
 own (ADR-1642 generation-mismatch amendment). Inside the scan set, the same check asks

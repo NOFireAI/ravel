@@ -95,6 +95,17 @@ Buffered mode (opt-in per request, named "buffered"):
   generation instead of writing them where no query scans (see Online
   resharding below). What stays unbounded is how long such a row waits before
   it is stored.
+- Known issue: a fourth kind of buffered row has no bound at all. If reads of
+  the tenant's provisioning record keep failing until the shard's generation
+  view passes its trust horizon (an object-store outage or an access-denied
+  answer on that key lasting one to two hours, or a record this build cannot
+  read), an acknowledged buffer whose flush opens after the horizon does not
+  open. It is held, charged and counted once as a stale-provisioning episode,
+  and it is neither published nor dropped while the process runs. The
+  teardown pass at shutdown writes it in place, and a crash before then loses
+  it. A bound on this hold is planned; until then the buffered-mode statement
+  above, that a crash between ack and flush loses the buffered window, is the
+  only guarantee for these rows.
 - The `max_flush_lifetime` abandonment budget is measured from the moment the
   flush's permit is granted, not from flush-open, so time spent queued behind
   a stalled prefix does not count against it: a flush that waited behind a
