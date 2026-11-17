@@ -368,6 +368,7 @@ pub fn fold_compat_gate(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use ravel_maintain::CompatRunRefusal;
