@@ -1100,9 +1100,13 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
-    # 20m (provisional): not a measurement; the crate builds a slice of the
-    # workspace (ravel-maintain and its dependencies) in its own target dir.
-    timeout-minutes: 20
+    # Provisional cap, PREDICTED not measured: it now also builds the three
+    # bulk format crates and ravel-maintain with --features format-drill in the
+    # main workspace target (ADR-4233 decision 9; issue #4249), on top of the
+    # ravel-compat-tests slice in its own target dir. Re-measure and set a real
+    # p90 from the first green runs that carry the drill steps.
+    # budget: p90 30 min on 2026-11-17
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -1115,13 +1119,65 @@ jobs:
         with:
           # Restore everywhere, save only on main, as in `lint` (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          workspaces: crates/ravel-compat-tests -> target
+          workspaces: |
+            crates/ravel-compat-tests -> target
+            . -> target
+      # The drill window tests of the three bulk format crates (issue #4249,
+      # T8 checkpoint): no other workflow, gates.sh lane or affected-tests.sh
+      # run these crates with --features format-drill, so their drill tests
+      # (bytes differ only in trailer version and crc; the reader admits both;
+      # identical decode) run nowhere until here. These build the main
+      # workspace target, not the ravel-compat-tests one.
+      - name: Drill window tests (ravel-segment, ravel-logseg, ravel-rspan)
+        run: cargo test --locked -p ravel-segment -p ravel-logseg -p ravel-rspan --features format-drill
+      # The maintain format-drill tests (crates/ravel-maintain/tests/format_drill.rs,
+      # ADR-4233 decision 3): a run's version checks compare against the version
+      # it writes, not SegmentVersion::CURRENT. Also required by the #4245
+      # re-review.
+      - name: Drill window tests (ravel-maintain)
+        run: cargo test --locked -p ravel-maintain --features format-drill --test format_drill
       - name: Format (ravel-compat-tests)
         run: cargo fmt --manifest-path crates/ravel-compat-tests/Cargo.toml --check
       - name: Clippy (ravel-compat-tests)
         run: cargo clippy --color never --locked --manifest-path crates/ravel-compat-tests/Cargo.toml --all-targets -- -D warnings
       - name: Test (ravel-compat-tests)
         run: cargo test --color never --locked --manifest-path crates/ravel-compat-tests/Cargo.toml
+
+  # The previous-release lane (ADR-4233 decision 9, "Previous-release lane";
+  # issue #4249). From the release after the baseline on, CI runs the previous
+  # release's published image (ghcr.io/nofireai/ravel-server:<previous>)
+  # against a store the release under test wrote with NOTHING activated, and
+  # asserts exact results, so rollback before activation is tested with the
+  # real older binary and not only with simulated capabilities.
+  #
+  # DISABLED until the first release after the baseline (B+1, expected v0.35)
+  # ships: at the baseline there is no bulk format boundary between v0.33.0 and
+  # v0.34.0 (both write RSEG 7, RLOG 5, RSPAN 5), so there is no older real
+  # binary to exercise a two-version boundary (decision 9, "Released
+  # binaries"). The `if: false` is flipped on when v0.35 ships; the step body
+  # is a documented placeholder until then, so the job reports green and can be
+  # wired as a required check without a published previous image existing yet.
+  compat-previous-release:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    # Predicted, not measured: the job is disabled (`if: false`) and never
+    # runs until v0.35, so there is no history. Re-measure when it is enabled.
+    # budget: p90 20 min on 2026-11-17
+    timeout-minutes: 20
+    if: false # enable when v0.35 (B+1) ships; ADR-4233 decision 9
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Previous-release rollback lane (disabled until v0.35)
+        run: |
+          echo "ADR-4233 decision 9 previous-release lane."
+          echo "Enable when v0.35 (B+1) ships: pull the previous release's"
+          echo "published image, have the release under test write a store with"
+          echo "nothing activated, run the previous image against it and assert"
+          echo "exact results (rollback-before-activation with the real binary)."
+          exit 0
 
   # The workspace test run, split across four runners (issue #2518). The test
   # phase is CPU-bound: 9,483 tests summed to 2,374 CPU-seconds and took 641 s
