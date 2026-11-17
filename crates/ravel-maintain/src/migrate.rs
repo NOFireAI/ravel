@@ -122,8 +122,9 @@ const MIGRATE_CURSOR_LEN: usize = 9;
 /// across many invocations without a lock or a long-lived process. It does not
 /// bound request cost: the walk reads the compaction and rewrite records of
 /// every sealed, untombstoned bucket it passes, one with no L0 commit record
-/// included, and a
-/// [`FamilyMigrateReport::reencode_blocked`] bucket spends no budget.
+/// included, and neither a
+/// [`FamilyMigrateReport::reencode_blocked`] bucket nor a held one
+/// ([`MaintainError::MigrateHeld`]) spends any budget.
 ///
 /// Because the underlying rewrite is bucket-atomic, the budget is a soft cap: an
 /// invocation always finishes the bucket it is in the middle of (it never
@@ -1907,11 +1908,13 @@ pub async fn migrate_family(
     let mut held: Vec<MigrateHeldBucket> = Vec::new();
     // The resume position as it stood just before the walk held its first
     // bucket this run, or `None` until a bucket is held. A budget stop persists
-    // at most this, never a position past the first held bucket: the cursor is
-    // advanced past a held bucket like any examined one (so a held claim never
-    // stalls the walk), but persisting that advanced position would let the
-    // next run resume past the hold and never report it. Capping at the
-    // position before the first held bucket makes the next run re-examine it.
+    // at most this, not a position past the first held bucket, unless the run
+    // migrated nothing and the cap equals `start_after` (see the budget stop
+    // below). The cursor is advanced past a held bucket like any examined one
+    // (so a held claim never stalls the walk), but persisting that advanced
+    // position would let the next run resume past the hold and not report it
+    // until the walk drains. Capping at the position before the first held
+    // bucket makes the next run re-examine it.
     let mut held_cursor_cap: Option<Option<(u32, u32)>> = None;
 
     let mut report = FamilyMigrateReport::default();
@@ -2026,7 +2029,10 @@ pub async fn migrate_family(
                             // An input the migration cannot carry forward holds
                             // the bucket (ADR-4233 decision 6): the walk goes
                             // on, and the run fails at its end without raising
-                            // the floor.
+                            // the floor. A hold spends no budget: the cursor cap
+                            // makes every resume re-examine it, so a charged
+                            // hold as large as the budget would stop each run
+                            // at the same bucket.
                             Err(err) => {
                                 let Some(reason) = MigrateHoldReason::from_refusal(&err) else {
                                     return Err(err);
@@ -2047,7 +2053,6 @@ pub async fn migrate_family(
                                     ingest_hour: hour,
                                     reason,
                                 });
-                                spent += l0_below;
                                 None
                             }
                         };
@@ -2228,7 +2233,18 @@ pub async fn migrate_family(
         // re-examines the hold and reports it again rather than resuming past
         // it. `held_cursor_cap` holds the position as it stood before the first
         // hold, which is always at or below `position`.
-        let to_persist = held_cursor_cap.unwrap_or(position);
+        //
+        // Holds spend no budget, but a skipped or unpublished bucket past the
+        // hold does. When the cap would hand the next run the cursor this run
+        // started from and this run migrated nothing, the next run would
+        // repeat it exactly, so persist the examined position instead: the
+        // hold is then re-examined once the walk drains and restarts.
+        let capped = held_cursor_cap.unwrap_or(position);
+        let to_persist = if capped == start_after && report.buckets_migrated == 0 {
+            position
+        } else {
+            capped
+        };
         report.cursor_advanced_to = to_persist;
         if let Some((shard, hour)) = to_persist.filter(|_| cursor_writable) {
             write_cursor(store, &cursor_key, shard, hour, cursor_version).await?;
@@ -5210,14 +5226,14 @@ mod tests {
     /// `segment_format_version`. With `refused` the record's scope name is not
     /// UTF-8, written past the writer's check, so the RLOG writer refuses to
     /// rewrite the object (issue #2580); its stream is one no healthy input
-    /// carries.
+    /// carries. Returns the data object's key.
     async fn seed_rlog_at(
         store: &dyn ObjectStoreBackend,
         hour: u32,
         seq: u64,
         refused: bool,
         segment_format_version: u32,
-    ) {
+    ) -> String {
         use ravel_logseg::writer::ObjectIdentity;
         use ravel_logseg::{LogRecord, RlogConfig, RlogWriter};
         use ravel_types::logstream::{AttrValue, log_stream_id};
@@ -5308,6 +5324,27 @@ mod tests {
             .put(&commit_key, record::encode(&rec), PutOptions::default())
             .await
             .expect("put commit record");
+        data_key
+    }
+
+    /// Corrupt one stored RLOG object's body, clear of its trailer, so the
+    /// version gate still admits it and the reader's refusal is a decode error.
+    async fn corrupt_rlog_body(store: &dyn ObjectStoreBackend, key: &str) {
+        let got = store
+            .get(key, GetRange::Full)
+            .await
+            .expect("object present");
+        let mut bytes = got.data.to_vec();
+        let trailer_start = bytes.len() - ravel_logseg::footer::TRAILER_LEN;
+        let at = bytes.len() / 2;
+        assert!(at + 8 <= trailer_start, "corruption must land before the trailer");
+        for b in &mut bytes[at..at + 8] {
+            *b ^= 0xFF;
+        }
+        store
+            .put(key, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("overwrite");
     }
 
     /// A bucket skipped for an unwritable input spends its L0 records against
@@ -5579,18 +5616,19 @@ mod tests {
         assert_eq!(floor, None, "a held bucket raises no floor");
     }
 
-    /// A budget stop never persists a cursor past a bucket the same run held
-    /// (ADR-4233 decision 6): the hold must still be reported by the next run,
-    /// which only happens if the cursor resumes at or before the held bucket.
-    /// Four single-record buckets, the second (hour 101) out of window, walked
-    /// with a three-record budget so the walk holds 101, migrates 102, and the
-    /// budget then stops it past the hold. The persisted cursor is capped at
-    /// hour 100, just before the hold, so the resume re-examines 101 and reports
-    /// it again.
+    /// A budget stop in a run that migrated a bucket does not persist a cursor
+    /// past a bucket the same run held (ADR-4233 decision 6): the hold must
+    /// still be reported by the next run, which only happens if the cursor
+    /// resumes at or before the held bucket. Four single-record buckets, the
+    /// second (hour 101) out of window, walked with a three-record budget so
+    /// the walk migrates 100, holds 101 without spending budget, migrates 102
+    /// and 103, and the budget then stops it past the hold. The persisted
+    /// cursor is capped at hour 100, just before the hold, so the resume
+    /// re-examines 101 and reports it again.
     ///
-    /// Against the old cursor (persist the last examined bucket, hour 102) this
-    /// fails at the `(0, 100)` assertion: hour 102 is past the held hour 101, so
-    /// the resume would skip 101 and the hold would go unreported forever. It
+    /// Against the uncapped cursor (persist the last examined bucket, hour 103)
+    /// this fails at the `(0, 100)` assertion: hour 103 is past the held hour
+    /// 101, so the resume would skip 101 and not report the hold. It
     /// also rules out an off-by-one that caps at the held bucket itself (hour
     /// 101): resuming at `(0, 101)` skips it under the `<=` resume predicate,
     /// and the `(0, 100)` assertion catches that too.
@@ -5605,7 +5643,7 @@ mod tests {
         seed_at(&store, 0, 103, 4, "delta", target - 1).await;
         stamp_rseg_version(&store, &held_key, out_of_window_rseg_version()).await;
 
-        // First run: budget 3 holds 101, migrates 100 and 102, then stops.
+        // First run: budget 3 holds 101, migrates 100, 102 and 103, then stops.
         let err = run_migrate(&store, 103, target, MigrateBudget::records(3))
             .await
             .expect_err("a held bucket fails the run");
@@ -5624,7 +5662,7 @@ mod tests {
         assert_eq!(
             report.cursor_advanced_to,
             Some((0, 100)),
-            "the cursor is capped just before the held bucket, not at hour 102: {report:?}"
+            "the cursor is capped just before the held bucket, not at hour 103: {report:?}"
         );
         let cursor_key = migrate_cursor_key(&tenant_hash(), Signal::Metrics, FAMILY);
         match read_cursor(&store, &cursor_key).await.expect("read cursor") {
@@ -5649,6 +5687,152 @@ mod tests {
             vec![101],
             "the resume re-examines and re-reports the held bucket: {held:?}"
         );
+    }
+
+    /// Issue #4304 item 1: a held bucket whose below-target records alone
+    /// reach the budget does not stall the walk. Hour 100 holds two
+    /// below-target records, one out of window, so it is held with two
+    /// records; hours 101 to 103 hold one migratable record each; the budget
+    /// is two records. The first run holds 100 and still migrates 101 and 102,
+    /// and the cursor stays before the hold; the second holds 100 again and
+    /// migrates 103, draining the walk.
+    ///
+    /// Wrong implementations it rules out: charging the hold to the budget
+    /// (the first run stops on hour 100 having migrated nothing, and every
+    /// later run does the same); charging it but persisting the examined
+    /// position when the cap equals the start (the first run migrates
+    /// nothing); and dropping the cursor cap (the first run persists hour 102,
+    /// so the second never re-examines hour 100 and reports no hold).
+    #[tokio::test]
+    async fn a_held_bucket_that_exhausts_the_budget_does_not_stall_the_walk() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        let target = VERSION_V7 as u32;
+        seed_at(&store, 0, 100, 1, "alpha", target - 1).await;
+        let held_key = seed_at(&store, 0, 100, 2, "beta", target - 1).await;
+        seed_at(&store, 0, 101, 3, "gamma", target - 1).await;
+        seed_at(&store, 0, 102, 4, "delta", target - 1).await;
+        seed_at(&store, 0, 103, 5, "epsilon", target - 1).await;
+        stamp_rseg_version(&store, &held_key, out_of_window_rseg_version()).await;
+        let cursor_key = migrate_cursor_key(&tenant_hash(), Signal::Metrics, FAMILY);
+
+        let err = run_migrate(&store, 103, target, MigrateBudget::records(2))
+            .await
+            .expect_err("a held bucket fails the run");
+        let MaintainError::MigrateHeld { held, report } = err else {
+            panic!("expected MigrateHeld");
+        };
+        assert_eq!(
+            held.iter().map(|h| h.ingest_hour).collect::<Vec<_>>(),
+            vec![100],
+            "{held:?}"
+        );
+        assert_eq!(report.buckets_migrated, 2, "{report:?}");
+        assert!(
+            report.budget_exhausted && !report.walk_complete,
+            "{report:?}"
+        );
+        assert_eq!(
+            report.cursor_advanced_to, None,
+            "the cursor stays before the held hour 100: {report:?}"
+        );
+        assert!(
+            matches!(
+                read_cursor(&store, &cursor_key).await.expect("read cursor"),
+                StoredCursor::Absent
+            ),
+            "no cursor past the hold is persisted"
+        );
+        for (hour, count) in [(100, 0), (101, 1), (102, 1), (103, 0)] {
+            assert_eq!(
+                compaction_record_count(&store, 0, hour).await,
+                count,
+                "hour {hour} after the first run"
+            );
+        }
+
+        let err = run_migrate(&store, 103, target, MigrateBudget::records(2))
+            .await
+            .expect_err("the hold is reported again");
+        let MaintainError::MigrateHeld { held, report } = err else {
+            panic!("expected MigrateHeld on resume");
+        };
+        assert_eq!(
+            held.iter().map(|h| h.ingest_hour).collect::<Vec<_>>(),
+            vec![100],
+            "the resume re-examines the held bucket: {held:?}"
+        );
+        assert_eq!(report.buckets_migrated, 1, "{report:?}");
+        assert!(report.walk_complete, "{report:?}");
+        assert_eq!(compaction_record_count(&store, 0, 103).await, 1);
+    }
+
+    /// A run that held a bucket and then spent its whole budget on buckets it
+    /// could not migrate persists the position it examined, not the cursor it
+    /// started from: the next run would otherwise repeat it exactly. Hour 100
+    /// is a held corrupt RLOG input, hour 101 holds two below-target records
+    /// one of which the writer refuses (charged to the budget as
+    /// `unwritable_skipped`), hour 102 one migratable record; the budget is two
+    /// records. The first run persists hour 101 and the second migrates 102.
+    ///
+    /// With the `buckets_migrated == 0` fallback removed, the first run
+    /// persists no cursor and the second repeats it, holding 100, skipping 101
+    /// and stopping before 102, so the second run's migrated count fails.
+    #[tokio::test]
+    async fn a_run_that_migrates_nothing_after_a_hold_persists_its_position() {
+        let store = MemoryStore::new();
+        let target = crate::rlog::OUTPUT_FORMAT_VERSION;
+        let held_key = seed_rlog_at(&store, 100, 1, false, target - 1).await;
+        corrupt_rlog_body(&store, &held_key).await;
+        seed_rlog_at(&store, 101, 2, false, target - 1).await;
+        seed_rlog_at(&store, 101, 3, true, target - 1).await;
+        seed_rlog_at(&store, 102, 4, false, target - 1).await;
+        let clock = FixedClock::new(sealed_now_ns_for(102));
+        let config = CompactorConfig::default();
+        let run = || {
+            migrate_family(
+                &store,
+                &clock,
+                &config,
+                tenant_hash(),
+                Signal::Logs,
+                "rlog",
+                target,
+                1,
+                MigrateBudget::records(2),
+                "migrate test",
+            )
+        };
+
+        let err = run().await.expect_err("a held bucket fails the run");
+        let MaintainError::MigrateHeld { held, report } = err else {
+            panic!("expected MigrateHeld");
+        };
+        assert_eq!(
+            held.iter()
+                .map(|h| (h.ingest_hour, h.reason.name()))
+                .collect::<Vec<_>>(),
+            vec![(100, "corrupt_input")],
+            "{held:?}"
+        );
+        assert_eq!(report.buckets_migrated, 0, "{report:?}");
+        assert_eq!(
+            report
+                .unwritable_skipped
+                .iter()
+                .map(|b| b.ingest_hour)
+                .collect::<Vec<_>>(),
+            vec![101],
+            "{report:?}"
+        );
+        assert!(report.budget_exhausted, "{report:?}");
+        assert_eq!(report.cursor_advanced_to, Some((0, 101)), "{report:?}");
+
+        let report = run()
+            .await
+            .expect("the resume past the hold sees no hold and drains");
+        assert_eq!(report.buckets_migrated, 1, "{report:?}");
+        assert!(report.walk_complete, "{report:?}");
     }
 
     /// ADR-4233 decision 6: an input object whose bytes no build can decode
