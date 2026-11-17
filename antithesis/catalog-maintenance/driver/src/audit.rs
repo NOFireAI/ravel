@@ -4,9 +4,10 @@
 //! The text form of `catalog inspect` prints every key HEAD names as a
 //! `key=<object key>` token: each snapshot part, each part's column
 //! statistics object and each key-index leaf. It then fetches and decodes
-//! every part. No `ravel-cli` command prints a part's entries, the commit
-//! records and data objects a part names, so the audit cannot check those;
-//! see the README's "Missing decoder" note.
+//! every part. `ravel-cli rlog footprint --tenant --json` lists and fetches
+//! every data object the catalog resolves for the tenant. No `ravel-cli`
+//! command prints a part's commit-record entries, so the audit cannot check
+//! those; see the README's "Missing decoder" note.
 
 use std::collections::BTreeSet;
 
@@ -19,6 +20,101 @@ pub struct Inspected {
     pub created_unix_ns: Option<u64>,
     /// Every object key the HEAD names, in print order, deduplicated.
     pub named: Vec<String>,
+    /// The snapshot part keys (`part[i] ... key=`), in print order.
+    pub parts: Vec<String>,
+    /// How many key-index leaf keys (`field=... key=`) were printed.
+    pub kidx_leaves: usize,
+}
+
+/// One snapshot part as `catalog inspect --json` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JsonPart {
+    pub key: String,
+    pub min_hour: u32,
+    pub watermark_hour: u32,
+    pub entry_count: u64,
+    pub key_index_leaves: usize,
+    pub retired_hours: Vec<u32>,
+}
+
+/// The parts of a `catalog inspect --json` HEAD, `None` when any part does
+/// not have the expected fields.
+pub fn json_parts(head: &serde_json::Value) -> Option<Vec<JsonPart>> {
+    let u32_of = |v: &serde_json::Value, k: &str| {
+        v.get(k)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    head.get("parts")?
+        .as_array()?
+        .iter()
+        .map(|p| {
+            Some(JsonPart {
+                key: p.get("key")?.as_str()?.to_string(),
+                min_hour: u32_of(p, "min_hour")?,
+                watermark_hour: u32_of(p, "watermark_hour")?,
+                entry_count: p.get("entry_count")?.as_u64()?,
+                key_index_leaves: usize::try_from(p.get("key_index_leaves")?.as_u64()?).ok()?,
+                retired_hours: p
+                    .get("retired_hours")?
+                    .as_array()?
+                    .iter()
+                    .map(|h| h.as_u64().and_then(|n| u32::try_from(n).ok()))
+                    .collect::<Option<Vec<u32>>>()?,
+            })
+        })
+        .collect()
+}
+
+/// Whether the text parse found exactly the parts and key-index leaves the
+/// JSON form lists for the same HEAD. An audit over a parse that found
+/// nothing, or found a different set, would pass without checking anything.
+pub fn cross_check(text: &Inspected, parts: &[JsonPart]) -> Result<(), String> {
+    if parts.is_empty() {
+        return Err("catalog inspect --json lists no parts".to_string());
+    }
+    let json_keys: Vec<&str> = parts.iter().map(|p| p.key.as_str()).collect();
+    let text_keys: Vec<&str> = text.parts.iter().map(String::as_str).collect();
+    if json_keys != text_keys {
+        return Err(format!(
+            "the text form names parts {text_keys:?}, the JSON form {json_keys:?}"
+        ));
+    }
+    let leaves: usize = parts.iter().map(|p| p.key_index_leaves).sum();
+    if leaves != text.kidx_leaves {
+        return Err(format!(
+            "the text form names {} key-index leaves, the JSON form counts {leaves}",
+            text.kidx_leaves
+        ));
+    }
+    Ok(())
+}
+
+/// The hours of `hours` that some part of HEAD covers: inside the part's
+/// `min_hour..=watermark_hour`, not among its retired hours, in a part with
+/// entries.
+pub fn covered_hours(parts: &[JsonPart], hours: impl IntoIterator<Item = u32>) -> Vec<u32> {
+    hours
+        .into_iter()
+        .filter(|h| {
+            parts.iter().any(|p| {
+                p.entry_count > 0
+                    && (p.min_hour..=p.watermark_hour).contains(h)
+                    && !p.retired_hours.contains(h)
+            })
+        })
+        .collect()
+}
+
+/// The data object keys of `ravel-cli rlog footprint --json`'s `objects`,
+/// `None` when the output is not that report.
+pub fn footprint_keys(json: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.get("objects")?
+        .as_array()?
+        .iter()
+        .map(|o| o.get("key").and_then(|k| k.as_str()).map(str::to_string))
+        .collect()
 }
 
 /// Parse the text form of `catalog inspect`. A HEAD that is absent prints
@@ -36,10 +132,15 @@ pub fn parse_inspect(text: &str) -> Inspected {
             out.created_unix_ns = v.trim().parse().ok();
         }
         for token in line.split_whitespace() {
-            if let Some(key) = token.strip_prefix("key=")
-                && !key.is_empty()
-                && seen.insert(key.to_string())
-            {
+            let Some(key) = token.strip_prefix("key=").filter(|k| !k.is_empty()) else {
+                continue;
+            };
+            if line.starts_with("part[") {
+                out.parts.push(key.to_string());
+            } else if line.starts_with("field=") {
+                out.kidx_leaves += 1;
+            }
+            if seen.insert(key.to_string()) {
                 out.named.push(key.to_string());
             }
         }
@@ -53,6 +154,14 @@ pub fn unfetched_part(stderr: &str) -> Option<String> {
     let rest = &stderr[stderr.find("failed to fetch part ")? + "failed to fetch part ".len()..];
     let key = rest.split([':', ' ', '\n']).next()?;
     (!key.is_empty()).then(|| key.to_string())
+}
+
+/// The object key from `rlog footprint`'s `failed to fetch <key>: ...` error:
+/// the catalog resolved a data object the store could not return.
+pub fn unfetched_object(stderr: &str) -> Option<String> {
+    let rest = &stderr[stderr.find("failed to fetch ")? + "failed to fetch ".len()..];
+    let key = rest.split([':', ' ', '\n']).next()?;
+    (!key.is_empty() && key != "part").then(|| key.to_string())
 }
 
 /// The keys HEAD names that the listing does not hold.
@@ -143,6 +252,90 @@ parts: 1
                 "t/0a0b/catalog/l/idx/490001.00cc.kidx",
             ]
         );
+    }
+
+    fn json_head(parts: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "watermark_hour": 490001, "parts": parts })
+    }
+
+    fn one_part() -> serde_json::Value {
+        serde_json::json!([{
+            "min_hour": 0,
+            "watermark_hour": 490001,
+            "key": "t/0a0b/catalog/l/snap/490001.00aa.csnap",
+            "blake3": "ff",
+            "size": 10,
+            "entry_count": 3,
+            "key_index_leaves": 1,
+            "retired_hours": [],
+        }])
+    }
+
+    #[test]
+    fn the_text_parse_matches_the_json_parts() {
+        let parts = json_parts(&json_head(one_part())).expect("parts");
+        let text = parse_inspect(INSPECT);
+        assert_eq!(text.parts, vec!["t/0a0b/catalog/l/snap/490001.00aa.csnap"]);
+        assert_eq!(text.kidx_leaves, 1);
+        assert_eq!(cross_check(&text, &parts), Ok(()));
+    }
+
+    #[test]
+    fn an_empty_or_mismatched_parse_fails_the_cross_check() {
+        let parts = json_parts(&json_head(one_part())).expect("parts");
+        // A text form the parser does not recognise names nothing.
+        let empty = parse_inspect("parts: 1\n  part[0]: t/0a0b/catalog/l/snap/x.csnap\n");
+        assert!(empty.named.is_empty());
+        assert!(cross_check(&empty, &parts).is_err());
+        // No parts at all in the JSON form.
+        let none = json_parts(&json_head(serde_json::json!([]))).expect("parts");
+        assert!(cross_check(&parse_inspect(INSPECT), &none).is_err());
+        // A part the text form missed.
+        let mut two = parts.clone();
+        two.push(JsonPart {
+            key: "t/0a0b/catalog/l/snap/490001.00dd.csnap".to_string(),
+            ..parts[0].clone()
+        });
+        assert!(cross_check(&parse_inspect(INSPECT), &two).is_err());
+        // A key-index leaf the text form missed.
+        let text = parse_inspect(&INSPECT.replace("      field=1 ", "      fld=1 "));
+        assert!(cross_check(&text, &parts).is_err());
+    }
+
+    #[test]
+    fn covered_hours_need_a_part_with_entries_over_the_hour() {
+        let mut parts = json_parts(&json_head(serde_json::json!([{
+            "min_hour": 100, "watermark_hour": 110, "key": "k", "blake3": "", "size": 1,
+            "entry_count": 4, "key_index_leaves": 0, "retired_hours": [104],
+        }])))
+        .expect("parts");
+        assert_eq!(
+            covered_hours(&parts, [99, 100, 104, 110, 111]),
+            vec![100, 110]
+        );
+        parts[0].entry_count = 0;
+        assert!(covered_hours(&parts, [100, 110]).is_empty());
+        assert!(covered_hours(&[], [100]).is_empty());
+    }
+
+    #[test]
+    fn footprint_objects_and_fetch_failures_are_parsed() {
+        let json = r#"{"total":{},"objects":[{"key":"t/0a0b/l/d/0/1/a.rlog","level":0},
+                       {"key":"t/0a0b/l/d/0/1/b.rlog","level":1}]}"#;
+        assert_eq!(
+            footprint_keys(json),
+            Some(vec![
+                "t/0a0b/l/d/0/1/a.rlog".to_string(),
+                "t/0a0b/l/d/0/1/b.rlog".to_string()
+            ])
+        );
+        assert_eq!(footprint_keys("object_count: 2"), None);
+        assert_eq!(
+            unfetched_object("Error: failed to fetch t/0a0b/l/d/0/1/a.rlog: not found\n")
+                .as_deref(),
+            Some("t/0a0b/l/d/0/1/a.rlog")
+        );
+        assert_eq!(unfetched_object("Error: failed to fetch part k: x"), None);
     }
 
     #[test]

@@ -66,7 +66,7 @@ pub struct Row {
 }
 
 impl Plan {
-    /// A plan whose last batch's hour lies `hours_back_floor` hours before
+    /// A plan whose last batch's hour lies `stride + 3` hours before
     /// `now_ns`'s hour, so `ravel-cli load` accepts it and the fold finds every
     /// seeded hour already sealed.
     pub fn new(now_ns: u64, hours: u32, stride: u32, per_hour: u32) -> Result<Plan, String> {
@@ -144,6 +144,42 @@ impl Plan {
     }
 }
 
+/// Check `ravel-cli load`'s completion summary against the plan: the
+/// `rows_written` and `rows_skipped` lines each appear exactly once, with
+/// `hours * per_hour` rows written and none skipped. A load that exits 0
+/// having written fewer rows would otherwise seed an expectation the store
+/// never held.
+pub fn check_load_report(stdout: &str, plan: &Plan) -> Result<(), String> {
+    let field = |name: &str| -> Result<u64, String> {
+        let values: Vec<&str> = stdout
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix(name))
+            .filter_map(|rest| rest.trim_start().strip_prefix(':'))
+            .map(str::trim)
+            .collect();
+        match values.as_slice() {
+            [v] => v
+                .parse()
+                .map_err(|_| format!("ravel-cli load printed {name} `{v}`, not a count")),
+            _ => Err(format!(
+                "ravel-cli load printed {} `{name}` lines, expected exactly one",
+                values.len()
+            )),
+        }
+    };
+    let expected = u64::from(plan.hours) * u64::from(plan.per_hour);
+    let written = field("rows_written")?;
+    let skipped = field("rows_skipped")?;
+    if written != expected || skipped != 0 {
+        return Err(format!(
+            "ravel-cli load wrote {written} rows and skipped {skipped}; the plan is \
+             {} hours of {} rows, {expected} rows",
+            plan.hours, plan.per_hour
+        ));
+    }
+    Ok(())
+}
+
 /// Write the seed file: one row group, `per_hour` rows per batch.
 pub fn write_parquet(rows: &[Row], path: &Path) -> Result<(), String> {
     let schema = Arc::new(Schema::new(vec![
@@ -214,6 +250,22 @@ mod tests {
         let added: Vec<_> = swapped.difference(&honest).collect();
         assert_eq!(gone, vec![&(SEED_WRITE_BASE, 0)]);
         assert_eq!(added, vec![&(SEED_WRITE_BASE + 1, 4)]);
+    }
+
+    const SUMMARY: &str = "bulk load complete\n  rows_skipped     : 0\n  \
+                           rows_written     : 12\n  rows/sec         : 900\n";
+
+    #[test]
+    fn the_load_report_must_match_the_plan() {
+        let plan = Plan::new(500_000 * NS_PER_HOUR, 4, 2, 3).expect("plan");
+        assert_eq!(check_load_report(SUMMARY, &plan), Ok(()));
+        let short = SUMMARY.replace(": 12", ": 11");
+        assert!(check_load_report(&short, &plan).is_err());
+        let skipped = SUMMARY.replace("rows_skipped     : 0", "rows_skipped     : 1");
+        assert!(check_load_report(&skipped, &plan).is_err());
+        assert!(check_load_report("bulk load complete\n", &plan).is_err());
+        let twice = format!("{SUMMARY}  rows_written     : 12\n");
+        assert!(check_load_report(&twice, &plan).is_err());
     }
 
     #[test]

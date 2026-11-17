@@ -30,9 +30,13 @@ impl Verdict {
             && self.missing.is_empty()
     }
 
-    /// Whether only absences are wrong, which a retried read may resolve
-    /// (a node that has not yet listed the newest commit).
-    pub fn only_missing(&self) -> bool {
+    /// Whether the rows stay under the multiset: no phantom and no record
+    /// stored more often than allowed. This is all a no-token scan proves
+    /// while faults run, since such a scan's freshness is bounded by
+    /// listing and a commit landing in an hour already sealed stays out of
+    /// it (docs/consistency-model.md). When only absences are wrong, a
+    /// retried read may resolve them.
+    pub fn upper_bounds_hold(&self) -> bool {
         self.seeded_over.is_empty() && self.phantoms.is_empty() && self.over.is_empty()
     }
 }
@@ -146,13 +150,37 @@ mod tests {
         rows.insert((SEED_WRITE_BASE, 1), 2);
         let v = judge(&expected, &Model::default(), &rows, &[]);
         assert_eq!(v.seeded_over.len(), 1);
-        assert!(!v.only_missing() && !v.holds());
+        assert!(!v.upper_bounds_hold() && !v.holds());
 
         let mut rows = stored(&plan);
         rows.remove(&(SEED_WRITE_BASE + 1, 0));
         let v = judge(&expected, &Model::default(), &rows, &[]);
         assert_eq!(v.seeded_missing.len(), 1);
-        assert!(v.only_missing() && !v.holds());
+        assert!(v.upper_bounds_hold() && !v.holds());
+    }
+
+    #[test]
+    fn absences_keep_the_upper_bounds_and_excess_breaks_them() {
+        let plan = Plan::new(500_000 * NS_PER_HOUR, 2, 1, 2).expect("plan");
+        let expected = plan.expected(false);
+        // A scan during faults that sees neither a seeded record nor the
+        // acked live write breaks no upper bound.
+        let mut rows = stored(&plan);
+        rows.remove(&(SEED_WRITE_BASE, 0));
+        let v = judge(&expected, &live_model(), &rows, &[]);
+        assert!(v.upper_bounds_hold() && !v.holds(), "{v:?}");
+        // A second copy of an acked live record does.
+        let mut rows = stored(&plan);
+        rows.insert((7, 0), 2);
+        let v = judge(&expected, &live_model(), &rows, &[]);
+        assert!(!v.upper_bounds_hold(), "{v:?}");
+        // So does a record the workload never sent.
+        let mut rows = stored(&plan);
+        rows.insert((7, 9), 1);
+        assert!(!judge(&expected, &live_model(), &rows, &[]).upper_bounds_hold());
+        // And the self-check's swap.
+        let v = judge(&plan.expected(true), &live_model(), &stored(&plan), &[]);
+        assert!(!v.upper_bounds_hold(), "{v:?}");
     }
 
     #[test]
