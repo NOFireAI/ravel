@@ -1823,7 +1823,7 @@ group, in the given order.
 
 ### Page encoding with `--page-choice`
 
-`--page-choice <CHOICE>` (default `estimated`) sets how the RLOG writer of
+`--page-choice <CHOICE>` (default `exhaustive`) sets how the RLOG writer of
 every flush a logs load runs picks each page's encoding. It takes one of two
 values.
 
@@ -1832,23 +1832,25 @@ values.
   statistics. For a string page it is the candidate the dictionary
   heuristic ranks first. A string column any of whose blocks in a row group
   chose a plain page stays on per-block pages for that row group.
-- `exhaustive` seals every candidate encoding of each page and keeps the one
-  with the fewest stored bytes. It was the loader's only behaviour before
-  the flag existed.
+- `exhaustive`, the default, seals every candidate encoding of each page and
+  keeps the one with the fewest stored bytes.
 - Under either value, a string chunk moves onto one row-group dictionary
   only when that stores strictly fewer bytes, PAGE_DIR entries included,
   than its per-block pages.
 - The trade, measured on the ClickBench hits corpus on one c6a.4xlarge:
   against `exhaustive`, an `estimated` load took 7.7% less wall time
   (452.4 s against 490.1 s) and 11.1% less CPU, and its objects stored
-  2.43% more bytes (8,530,539,390 against 8,328,210,617).
+  2.43% more bytes (8,530,539,390 against 8,328,210,617). On the same host,
+  hot ClickBench Q24 and Q28, which read long URL-like string columns,
+  took roughly twice as long on the `estimated` load. Choose `estimated` when
+  load time matters more than queries over such columns.
 - Both values write encodings the format defines, and readers decode
   objects from either one the same way. The choice changes object size and
   write cost, never the records read back.
 - The summary's `page choice` line and the report JSON's `page_choice`
   field name the choice the load wrote with, for a logs load only.
 - A metrics or spans load ignores the flag and prints a warning when it is
-  set to `exhaustive`.
+  set to `estimated`.
 
 ### Clustering key and bloom scope
 

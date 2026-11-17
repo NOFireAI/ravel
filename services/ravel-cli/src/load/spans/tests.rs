@@ -404,7 +404,7 @@ fn metrics_and_spans_warn_on_a_non_default_chunk_order_and_logs_does_not() {
     );
 }
 
-/// `--page-choice exhaustive` on a metrics or spans load is named as ignored;
+/// `--page-choice estimated` on a metrics or spans load is named as ignored;
 /// the default, or either choice on a logs load, is not.
 #[test]
 fn metrics_and_spans_warn_on_a_non_default_page_choice_and_logs_does_not() {
@@ -413,21 +413,21 @@ fn metrics_and_spans_warn_on_a_non_default_page_choice_and_logs_does_not() {
     }
     for signal in [SignalArg::Metrics, SignalArg::Spans] {
         assert_eq!(
-            unused_page_choice_warning(LoadPageChoice::Estimated, signal),
+            unused_page_choice_warning(LoadPageChoice::Exhaustive, signal),
             None
         );
     }
     assert_eq!(
-        unused_page_choice_warning(LoadPageChoice::Exhaustive, SignalArg::Metrics).as_deref(),
+        unused_page_choice_warning(LoadPageChoice::Estimated, SignalArg::Metrics).as_deref(),
         Some(
-            "warning: a metrics load ignores --page-choice exhaustive. The page choice applies \
+            "warning: a metrics load ignores --page-choice estimated. The page choice applies \
              only to the RLOG objects a logs load writes."
         )
     );
     assert_eq!(
-        unused_page_choice_warning(LoadPageChoice::Exhaustive, SignalArg::Spans).as_deref(),
+        unused_page_choice_warning(LoadPageChoice::Estimated, SignalArg::Spans).as_deref(),
         Some(
-            "warning: a spans load ignores --page-choice exhaustive. The page choice applies \
+            "warning: a spans load ignores --page-choice estimated. The page choice applies \
              only to the RLOG objects a logs load writes."
         )
     );
