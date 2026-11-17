@@ -2185,7 +2185,9 @@ which is refused unless the tenant declares it, it reads the part object
 once, reads each entry's footer suffix and KEY_IDX section (the ranged
 GETs of the fold's own leaf build: two per entry in every pass of the
 build under the pair budget, see "Pair budget", and a third when the
-footer is larger than the 8 KiB suffix), writes the leaves for the
+footer is larger than the 8 KiB suffix; in the first pass only for an
+entry whose section the repair holds, see the section hold under "Pair
+budget"), writes the leaves for the
 declared fields under the fold's key layout (at the same budget, for a
 declared field the leaf is byte-identical to the one a fold with
 `build_key_index_leaves` on writes for the same part only when the repair
@@ -2238,7 +2240,12 @@ footer range, `section_phase_ranged_gets` and `section_phase_bytes_read`
 for its KEY_IDX section, LABEL_DICT on metrics; bytes as transferred,
 retries excluded; `ranged_gets` and `section_bytes_read` are the sums of
 the two phases), the pair budget it built under
-(`key_index_build_max_pairs`), build passes summed over the parts read
+(`key_index_build_max_pairs`), the section hold cap it ran with
+(`section_hold_cap_bytes`), the entries whose section it held, summed
+over the parts read (`section_hold_entries`), the most section bytes it
+held at once (`section_hold_peak_bytes`; test
+`the_reports_carry_the_section_hold` pins all three in the JSON and text
+reports), build passes summed over the parts read
 (`passes`; one pass serves every field of a part, so with two fields a
 part's passes are the larger field's count, not the sum), the passes each
 field was building for (`passes_per_field`), section reads, one per entry
@@ -2249,8 +2256,9 @@ reads, leaf PUTs, HEAD CAS tries and parts published (an
 attempt is one batch's publish including its retries, at most
 `MAX_HEAD_CAS_ATTEMPTS` tries, so a lost CAS adds a try, not an attempt).
 Tests `the_repair_holds_at_most_the_pair_budget_and_matches_the_fold_at_that_budget`
-(40 pairs at a budget of 8: 5 passes, 20 section reads, 20 footer and 20
-section GETs), `the_repair_reports_the_parts_passes_and_each_fields_own`
+(40 pairs at a budget of 8 with the section hold off: 5 passes, 20
+section reads, 20 footer and 20 section GETs),
+`the_repair_reports_the_parts_passes_and_each_fields_own`
 (two fields at the same budget: 10 passes, `user_id` 10 and `trace_id` 1)
 and `the_json_report_carries_the_passes_and_phase_costs` pin these.
 A run that stops or exhausts the CAS retries on one batch has therefore

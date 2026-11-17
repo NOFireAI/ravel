@@ -2890,9 +2890,10 @@ enum CatalogCommand {
         /// repair keeps for one part across that part's passes, so a kept
         /// entry costs its footer and section GETs once instead of once per
         /// pass. Entries are kept in part order until the next one would
-        /// pass this, and each kept section is charged to the catalog's
-        /// memory budget, a refusal ending the keeping the same way; the
-        /// rest are read in every pass. A part's sections are released when
+        /// pass this; the rest are read in every pass. (Each kept section is
+        /// also charged to the catalog's memory budget, which this command
+        /// leaves unlimited, so the cap alone bounds what is kept.) A part's
+        /// sections are released when
         /// its build ends. 0 keeps none. Default: 2,000,000,000 less 88 B for
         /// each pair of `--key-index-build-max-pairs` (1,296,000,000 at the
         /// default 8,000,000; 0 from 22,727,273), so the kept sections and
