@@ -411,7 +411,9 @@ flowchart LR
     every part in HEAD that lacks a `key_index` ref for a declared field
     (every part, for spans) it reads the part object once, reads each
     entry's footer suffix and KEY_IDX section (the two ranged GETs per
-    entry of decision 4's leaf build), writes the leaves, and publishes a
+    entry of decision 4's leaf build; no longer one pass only, the repair
+    now runs under the pair budget in as many passes as the field needs,
+    see ADR-3692's pair-budget repair amendment), writes the leaves, and publishes a
     HEAD whose part refs are the current ones with `key_index` attached
     (`SnapshotHead.parts` carries the refs inline, so the publish is the
     HEAD CAS and nothing else). The part objects, their blake3 and their
@@ -1559,7 +1561,9 @@ rules are in docs/catalog-and-mvcc.md, "Per-part key-index leaves", under
   are pinned by tests, the size class is not. What the budget does not
   bound is listed in ADR-3692's #3704 amendment. The `--rebuild-key-index`
   repair is unchanged: one pass, no budget, no carry, so its leaves equal
-  a fold's only where the fold built the field in one pass.
+  a fold's only where the fold built the field in one pass (no longer so:
+  the repair now runs under the pair budget, in the fold's own passes,
+  see ADR-3692's pair-budget repair amendment).
 - **Reporting.** `FoldReport` gains `key_index_sections_read`,
   `key_index_entries_carried`, `key_index_build_passes` and
   `key_index_leaf_gets`, printed by `ravel-cli catalog fold` and exported
