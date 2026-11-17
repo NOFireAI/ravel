@@ -343,6 +343,9 @@ pub(crate) trait FlushScope<M>: Send + Sync {
     /// Re-read the tenant's provisioning record, joining a read already in
     /// flight. Resolves `true` once a read succeeded and its view is installed.
     fn reread(&self, tenant: TenantHash) -> Reread;
+    /// The issue time of the read behind the tenant's cached view, or `None`
+    /// when no view is cached.
+    fn view_refreshed_at(&self, tenant: TenantHash) -> Option<i64>;
     /// The format-floor check of a flush about to publish a `family` object at
     /// version `writing` for `tenant`, against the floor of the cached view
     /// (ADR-1746 decision 4). Counts a refusal or an overridden write.
@@ -474,6 +477,26 @@ pub(crate) async fn reread_and_check<M>(
 pub(crate) const STALE_VIEW_ABANDONED: &str = "flush dropped: no trusted provisioning view for \
      max_flush_lifetime since the flush was first held; the rows were not written";
 
+/// The start of a buffer's untrusted-view hold after a flush attempt at
+/// `now_ns` found no trusted view (issue #4363). A hold whose tenant view was
+/// refreshed at or after its start (`refreshed_at_ns`) is cleared, since a
+/// read succeeded during it, so the bound counts only time with no successful
+/// read; `enforced` then starts a new one at `now_ns`. A teardown pass starts
+/// none.
+pub(crate) fn stale_view_hold_since(
+    since_ns: Option<i64>,
+    refreshed_at_ns: Option<i64>,
+    now_ns: i64,
+    enforced: bool,
+) -> Option<i64> {
+    let since_ns = since_ns.filter(|&since| refreshed_at_ns.is_none_or(|at| at < since));
+    if enforced {
+        Some(since_ns.unwrap_or(now_ns))
+    } else {
+        since_ns
+    }
+}
+
 /// Whether a buffer first held closed on an untrusted view at `since_ns` has
 /// been held for `bound` at `now_ns`, so its flush is dropped rather than held
 /// again (issue #4363). `None` (never held) is never spent.
@@ -593,6 +616,10 @@ where
         }
     }
 
+    fn view_refreshed_at(&self, tenant: TenantHash) -> Option<i64> {
+        self.switch.upgrade()?.view_refreshed_at(tenant)
+    }
+
     fn floor_check(&self, tenant: TenantHash, family: FormatFamily, writing: u32) -> FloorCheck {
         match self.switch.upgrade() {
             Some(switch) => switch.floor_check(tenant, family, writing),
@@ -643,6 +670,10 @@ impl<M> FlushScope<M> for AlwaysInScope {
 
     fn reread(&self, _tenant: TenantHash) -> Reread {
         Box::pin(std::future::ready(true))
+    }
+
+    fn view_refreshed_at(&self, _tenant: TenantHash) -> Option<i64> {
+        None
     }
 
     fn floor_check(&self, _tenant: TenantHash, _family: FormatFamily, _writing: u32) -> FloorCheck {
@@ -786,6 +817,8 @@ pub(crate) struct ScriptedScope<M> {
     /// One target per shard index, used in place of `target` when non-empty.
     split: Mutex<Vec<mpsc::Sender<M>>>,
     wait: Mutex<bool>,
+    floor: Mutex<FloorCheck>,
+    refreshed_at_ns: Mutex<Option<i64>>,
 }
 
 #[cfg(test)]
@@ -796,6 +829,8 @@ impl<M> ScriptedScope<M> {
             target: Mutex::new(target),
             split: Mutex::new(Vec::new()),
             wait: Mutex::new(true),
+            floor: Mutex::new(FloorCheck::Write),
+            refreshed_at_ns: Mutex::new(None),
         })
     }
 
@@ -816,6 +851,21 @@ impl<M> ScriptedScope<M> {
     /// for a strictly smaller set; `false` scripts a larger one.
     pub(crate) fn set_wait(&self, wait: bool) {
         *self.wait.lock().unwrap_or_else(|p| p.into_inner()) = wait;
+    }
+
+    /// The format-floor verdict every flush gets; [`FloorCheck::Write`] until
+    /// set.
+    pub(crate) fn set_floor(&self, floor: FloorCheck) {
+        *self.floor.lock().unwrap_or_else(|p| p.into_inner()) = floor;
+    }
+
+    /// The refresh stamp of the tenant view, as a successful read installed
+    /// it; `None` (no view) until set.
+    pub(crate) fn set_refreshed_at(&self, refreshed_at_ns: Option<i64>) {
+        *self
+            .refreshed_at_ns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = refreshed_at_ns;
     }
 }
 
@@ -847,8 +897,15 @@ impl<M: Send + 'static> FlushScope<M> for ScriptedScope<M> {
         Box::pin(std::future::ready(false))
     }
 
+    fn view_refreshed_at(&self, _tenant: TenantHash) -> Option<i64> {
+        *self
+            .refreshed_at_ns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     fn floor_check(&self, _tenant: TenantHash, _family: FormatFamily, _writing: u32) -> FloorCheck {
-        FloorCheck::Write
+        *self.floor.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     fn writing_version(&self, family: FormatFamily) -> u32 {
@@ -1589,6 +1646,15 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
                 Err(_) => false,
             }
         })
+    }
+
+    /// The issue time of the read behind `tenant`'s cached view, or `None`
+    /// when none is cached.
+    pub(crate) fn view_refreshed_at(&self, tenant: TenantHash) -> Option<i64> {
+        self.lock()
+            .views
+            .get(&tenant)
+            .map(|view| view.refreshed_at_ns)
     }
 
     /// The in-flight re-read of `tenant`'s record, started here if none is. A
