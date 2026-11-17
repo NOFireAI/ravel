@@ -5,7 +5,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::cell::Cell;
-use std::time::Duration;
 
 use ravel_bench::l1_listing_charge::{
     CAP_FIGURES, ListingChargeError, RunConfig, build_bucket, check_report, compact_at,
@@ -448,22 +447,27 @@ async fn peak_above_the_listing_bound_fails_the_direct_check() {
 }
 
 /// `minimal_budget` terminates when the threshold is below 100 bytes, where the
-/// 1 % step would floor to zero and spin forever.
+/// 1 % step floors to zero, and lands on it to the byte. A ready future never
+/// yields, so a hang is caught by capping the probes rather than by a timeout.
 #[tokio::test]
 async fn minimal_budget_terminates_below_a_hundred_byte_threshold() {
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(5),
-        minimal_budget(1, |limit| async move { Ok(limit >= 50) }),
-    )
+    let probes = Cell::new(0u32);
+    let outcome = minimal_budget(1, |limit| {
+        probes.set(probes.get() + 1);
+        let calls = probes.get();
+        async move {
+            if calls > 1_000 {
+                return Err(ListingChargeError::Setup(
+                    "minimal_budget spun past 1,000 probes".to_string(),
+                ));
+            }
+            Ok(limit >= 50)
+        }
+    })
     .await
-    .expect("minimal_budget hung on a sub-100-byte threshold")
     .expect("search");
-    assert!(outcome.succeeds_at >= 50, "{outcome:?}");
-    assert!(outcome.refused_at < 50, "{outcome:?}");
-    assert!(
-        outcome.refused_at >= outcome.succeeds_at.saturating_sub(1),
-        "{outcome:?}"
-    );
+    assert_eq!((outcome.succeeds_at, outcome.refused_at), (50, 49));
+    assert_eq!(outcome.probes, probes.get());
 }
 
 /// A flush shorter than one scrape step holds no step, so `validate` returns
