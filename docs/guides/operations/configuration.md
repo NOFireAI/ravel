@@ -2341,8 +2341,9 @@ at 16,000,000. One read of every section of the measured logs day is
 that day is predicted, not measured, to cost 1,096 ranged GETs and about
 1.15 GB of section reads instead of 27,400 and 28.8 GB, with peak RSS
 about 1.8 GB (the measured 0.66 GB plus the 1.15 GB held). At 16,000,000
-the cap holds about half of that day's sections and the rest are read in
-each of the 13 passes. On a host without about 1.9 GB of headroom, pass
+the cap is about half of that day's section bytes, so about half its
+sections are held and the rest are read in each of the 13 passes. On a
+host without about 1.8 GB of headroom, pass
 `--key-index-repair-hold-bytes 0` to repair exactly as measured above, or
 a smaller cap. The report gives the cap (`section_hold_cap_bytes`), the
 entries held (`section_hold_entries`) and the most bytes held at once

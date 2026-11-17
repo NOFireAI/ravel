@@ -3644,6 +3644,14 @@ mod tests {
         assert_eq!(rebuilt.lists(), 1, "the pending erasure listing only");
         assert_eq!(report.ranged_gets, 2 * 6, "{report:?}");
         assert_eq!(rebuilt.data_ranged_gets().len(), 2 * 6);
+        // Issue #4376: no LABEL_DICT section is held, even under the default
+        // cap, which has room for all six.
+        assert_eq!(report.section_hold_cap_bytes, 1_296_000_000, "{report:?}");
+        assert_eq!(
+            (report.section_hold_entries, report.section_hold_peak_bytes),
+            (0, 0),
+            "{report:?}"
+        );
         assert_eq!(report.uncovered_entries, 0, "{report:?}");
 
         let fold_head = read_signal_head(folded.as_ref(), Signal::Metrics).await;

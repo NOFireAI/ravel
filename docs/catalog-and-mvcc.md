@@ -1977,7 +1977,7 @@ bookkeeping. Its 100,000,000 `request_id` pairs take at least
 decision did not count"), so with the section hold off the repair reads
 every section of the part 25 times or more.
 
-The repair holds sections across passes (issue #4376). The first pass
+The repair holds sections across passes. The first pass
 that reads an entry's KEY_IDX section keeps its bytes for the part's later
 passes, which decode it from memory at no GET, in part order while the
 bytes held for the part stay at or under a cap; the first entry that would
