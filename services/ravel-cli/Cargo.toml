@@ -44,6 +44,7 @@ antithesis = [
     "ravel-invariant/antithesis",
     "ravel-catalog/antithesis",
     "ravel-commit/antithesis",
+    "ravel-fleet/antithesis",
     "ravel-ingest/antithesis",
     "ravel-maintain/antithesis",
 ]
@@ -55,6 +56,7 @@ antithesis-mutants = [
     "ravel-invariant/antithesis-mutants",
     "ravel-catalog/antithesis-mutants",
     "ravel-commit/antithesis-mutants",
+    "ravel-fleet/antithesis-mutants",
     "ravel-ingest/antithesis-mutants",
     "ravel-maintain/antithesis-mutants",
 ]
@@ -82,9 +84,14 @@ ravel-commit = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-maintain = { workspace = true }
 ravel-ingest = { workspace = true }
+# A direct dependency so the `antithesis`/`antithesis-mutants` features can
+# forward `ravel-fleet/antithesis` (ADR-4326), matching ravel-server; the
+# compaction-claim tests also drive `ravel_fleet::claim::acquire` directly.
+# Already in the lock through ravel-maintain; no new external crate.
+ravel-fleet = { workspace = true }
 # ADR-4326 assertion and mutant macros and the `init` main() calls; with no
 # feature on they compile to nothing.
-ravel-invariant = { path = "../../crates/ravel-invariant", version = "0.33.0" }
+ravel-invariant = { workspace = true }
 # The coverage-instrumentation runtime shim an instrumented build links
 # against, as in ravel-server; only the off-by-default `antithesis` feature
 # links it. Already in the lock through ravel-server.
@@ -229,10 +236,6 @@ proptest = { workspace = true }
 # normalization helpers instead would assert nothing. Workspace pin, already
 # in the lock through ravel-otlp; test-only here.
 opentelemetry-proto = { workspace = true }
-# The compaction-claim tests write a foreign process's claim through the same
-# `ravel_fleet::claim::acquire` a supervisor uses. Workspace pin, already a
-# dependency of ravel-maintain; adds no new external crate.
-ravel-fleet = { workspace = true }
 # tests/load_zstd_level.rs checks `--zstd-level`'s accepted range against the
 # linked libzstd's own. Workspace pin, already in the lock through
 # ravel-logseg; test-only here.
