@@ -62,5 +62,11 @@ case_exit "sandbox clone under another project refused"  1 "${sandbox}"  "${unma
 case_exit "unmarked clone in a guest is refused"         1 "${unmarked}" "${unmarked}"
 case_exit "primary with BRIG_PROJECT but no mark refused" 1 "${primary}" "${primary}"
 
+# A mark in the global config is not the clone's own mark.
+global="${TMP}/global.gitconfig"
+printf '[ravel]\n\tsandboxCheckout = true\n' > "${global}"
+GIT_CONFIG_GLOBAL="${global}" case_exit "primary with a global mark is refused" 1 "${primary}" "${primary}"
+GIT_CONFIG_GLOBAL="${global}" case_exit "sandbox clone with a global mark passes" 0 "${sandbox}" "${sandbox}"
+
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
