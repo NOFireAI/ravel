@@ -577,6 +577,7 @@ script, and run in CI's `doc-scripts` job.
 | `--anchor-ms N` | The replay anchor, which must be on the profile's scrape grid (exit 65 otherwise, case h). Default: the profile's window ending at least 10 minutes before the run, on the grid, stamped `anchor_source` as from the clock. Ravel drops samples older than its 45-day `--max-ingest-lag`, so a fixed old anchor fails Ravel's read-back. |
 | `--passes N`, `--reps N` | Passed to `metricsbench_query` as `--passes` and `--reps-per-pass` and stamped (case g); its own defaults (5 and 3) otherwise. A timed pass stops repeating a statement for an engine once that engine's repetition times out, and lists the repetitions left out in the diagnostics sidecar's `skipped_reps` (ADR-0927, 2026-11-06 amendment). |
 | `--keep` | Leave the stack up; stamps say `kept (--keep)` and no `down -v` runs (case g). |
+| `--ravel-only` | The Ravel-only shape, below: Ravel alone, its series listing read back on the L0 catalog and again on the L1 one, no query step. Needs `MB_STAGE1=1 MB_STAGE1_ARMS=l1` (exit 64, case ro2); refused with exit 65 on any profile but `history` and `ci`, and with a flag that needs a comparator or a step it does not run (case ro2). |
 | `--rss-band CONTAINER:MIN:MAX` | Repeatable. The peak sampled memory of the container (matched by container name or compose service) must lie in `[MIN, MAX]` bytes; outside it, or with no samples, the `memory` step fails: a full run still runs steps 15 to 18 and then exits 75 (case d; step 14 lists the other exits), and the diagnostic mode exits 75 at once (case e3). |
 | `--ravel-objects-band MIN:MAX` | The band the `objects` step checks the count of Ravel's data objects (`t/<tenant>/m/l0/*.rseg` keys) against, inclusive (cases v1, v2). It counts data objects only, not commit records, probes or the whole bucket, so the same figure is comparable between s3s-fs and real S3. A value not of the form `MIN:MAX`, a minimum above the maximum (case v3), or the flag with the falsification run (case v4) exits 64. |
 | `--diagnostic-prometheus-max-samples N` | The falsification run, below. |
@@ -612,7 +613,8 @@ renamed or moved its opt-out would (cases kl5 to kl7; step 16, Stage 1 steps
 nothing and stamps `key_index_leaves_flag` not applicable (case u9).
 
 Steps, in order, stopping at the first failure, except a failed ingest
-verification (step 6), after which the run goes on as a diagnostic:
+verification (step 6), after which the run goes on as a diagnostic.
+`--ravel-only` runs its own list instead (see the Ravel-only shape below):
 
 1. `up`: `docker compose -f docker-compose.yml -f ravel.yml up -d` (case a).
 2. `qualify`: `createbuckets` and `ravel-qualify` exited 0; otherwise exit
@@ -1103,8 +1105,12 @@ buys a folded catalog: the same corpus read once with key-index leaves and
 no `label_value` leaf, and once with them, on one tenant, one binary and one
 box. `MB_STAGE1=1` in the environment adds those steps to a run; `0` or unset
 leaves the run as above, any other value exits 64 (cases z4, z6). It is
-accepted with `--profile cardinality` and `--profile ci` only (another
-profile exits 65 before anything starts, case z3) and not with
+accepted with `--profile cardinality` and `--profile ci`, and with
+`--profile history` when `MB_STAGE1_ARMS` is exactly `l1` and the control
+arm is off (case hl1): history carries the L1 lane alone, for the #3941
+series-listing measurement. History with no arms, another arm or the control
+arm exits 65 before anything starts (cases z3, hl2), as does any other
+profile (case z3b). It is not accepted with
 `--diagnostic-prometheus-max-samples` (exit 64, case z5).
 
 **Server flags.** `ravel.yml` sets the server's entrypoint to
@@ -1354,6 +1360,11 @@ name ARM)`. The switches:
   (exit 65 before anything starts, case zf1).
 - `MB_STAGE1_ARMS`, a comma list of `extra-hour`, `l1` and `erasure` (any
   other name exits 64, case zf4), turns on the arms that change the tenant.
+- `MB_L1_MAX_PART_BYTES=N`, a positive whole number, is passed to the l1
+  arm's compaction as `--max-l1-part-bytes N` and stamped as
+  `stage1.l1_max_part_bytes` (case mp1). Unset, the flag is omitted and the
+  stamp says `default` (case ro1). Zero or a value that is not a whole
+  number, or the variable without the l1 arm, exits 64 (case mp1).
 - Every switch needs `MB_STAGE1=1` (exit 64, case zf3).
 
 `METRICSBENCH_SLEEP` (default `sleep`) is the command that waits for an hour
@@ -1470,8 +1481,9 @@ own step, as the run records it; a request the run does not count says so.
 14. `stage1-l1-compact` (row 6, issue #3818): once the last ingest hour is
     sealed (its end plus 6 minutes), ravel-server stopped and `ravel-cli
     maintain compact-tenant --tenant metricsbench --signal metrics --shards
-    4 --max-flush-lifetime 0s` into `stage1-l1-compact.txt`;
-    `stage1.l1_compact` stamps the command, `wall_ms` and every counter it
+    4 --max-flush-lifetime 0s`, with `--max-l1-part-bytes N` appended when
+    `MB_L1_MAX_PART_BYTES=N` is set (case mp1), into
+    `stage1-l1-compact.txt`; `stage1.l1_compact` stamps the command, `wall_ms` and every counter it
     prints (`compacted`, `already`, `not_sealed`, `parts_written`,
     `failed` and the rest), each required exactly once.
     Cost: compact-tenant reports hours and parts, not requests or bytes; the
@@ -1921,6 +1933,99 @@ Stage 1 pass over the corpus takes about 3.4 h; a full Stage 1 with every
 arm on takes about 32 h, most of it the erasure arm's seal wait and rewrite;
 a rerun with `MB_STAGE1_ARMS=erasure` alone takes 22 to 24 h. Size
 `MB_CAP_MIN` from these (docs/internal/metricsbench-aws-runbook.md).
+
+### The Ravel-only shape
+
+`--ravel-only` times Ravel's read-back series listing on the L0 catalog and
+again on the L1 catalog in one run, for the #3941 series-listing
+measurement (issue #4392). It starts Ravel alone, so it measures no
+comparator and produces no comparable figure. It needs
+`MB_STAGE1=1 MB_STAGE1_ARMS=l1`; without them it exits 64 (case ro2). It
+exits 65 before anything starts in these cases (case ro2):
+
+- with any profile but `history` and `ci`;
+- with a flag for a step it does not run:
+  `--diagnostic-prometheus-max-samples`, `--passes`, `--reps`,
+  `--rss-band`, `--real-s3-bucket-prefix`, `--real-s3-region`,
+  `--folded-catalog-get-max-fraction` or `--folded-catalog-get-floor`. A
+  folded-catalog flag is refused even when its value is the default;
+- with `MB_CONTROL_IMAGE`.
+
+`--bin-dir` needs only `metricsbench_ingest`. `MB_L1_MAX_PART_BYTES` applies
+as in the l1 arm.
+
+Steps, in order, stopping at the first failure (case ro1):
+
+1. `fetch-s3s-fs`, `fold-flags` and `stage1-flags`, as in a Stage 1 run.
+   `fold-flags` records no step of its own in `steps_completed`.
+2. `up`: `docker compose ... up -d ravel-server`. This starts ravel-server
+   and what it depends on (s3s, `createbuckets` and `ravel-qualify`). It
+   starts no comparator.
+3. `qualify`, `image` and `ready`, as in a full run. `ready` checks Ravel's
+   `/api/v1/status/buildinfo` alone.
+4. `ingest`: `metricsbench_ingest` with the Ravel row alone, passing
+   `--ravel-endpoint` and `--no-in-process-row` and no other row's
+   endpoint, into `ingest.json`. A Ravel read-back that answered 422 is
+   stamped `refused (budget)` in `ravel_only.ingest_readback` and the run
+   goes on (case ro4). Any other failed or extra row fails the step.
+5. `readback-l0`: Ravel's `/metrics` scraped into
+   `ravel-metrics-before-readback-l0.txt`, then `metricsbench_ingest
+   --readback-only --readback-system ravel` into `readback-l0.json`, then
+   `/metrics` scraped again into `ravel-metrics-after-readback-l0.txt`. This
+   reads the catalog that the background fold built over L0.
+6. `objects-l0`: `ravel-cli catalog list` into
+   `ravel-only-l0.objects.jsonl`, and its L0 and L1 data object counts are
+   stamped as `ravel_only.l0.catalog_objects`. The bucket is then counted
+   by kind, as in the `objects` step, into `ravel-objects-l0.json`
+   (`ravel_only.l0.objects`). `--ravel-objects-band` applies here only.
+7. `stage1-l1-compact`, `stage1-l1-fold` and `stage1-l1`: Stage 1 steps 14
+   to 16, with these differences in `stage1-l1`:
+   - it reads the snapshot state into `stage1.l1_catalog`;
+   - it runs no pass;
+   - `stage1.l1` and `stage1.l1_compare` say why they were skipped.
+8. `objects-l1`: as `objects-l0`, after the compaction.
+9. `readback-l1`: as `readback-l0`, on the L1 catalog, with `-l1` in each
+   file name.
+
+For each catalog state (`l0` and `l1`), `stamps.json` holds these keys under
+`ravel_only.STATE` (case ro1):
+
+- `objects`: the object counts by kind.
+- `catalog_objects`: the catalog's L0 and L1 data object counts.
+- `readback`: what the read-back produced:
+  - `verdict`;
+  - `series_query_ms`;
+  - `store_get_calls` and `store_get_bytes`, from
+    `ravel_store_calls_total` and `ravel_store_bytes_total` with
+    `op="get"`, each with `before`, `after` and `delta`;
+  - `error`;
+  - `missing`.
+- `verdict` and `series_query_ms`, repeated from `readback`.
+
+The verdict is one of these:
+
+- `matched`;
+- `mismatch`, which fails the step (case ro5);
+- `error`, which fails the step;
+- `refused (budget)`, when the series listing answered 422. The run goes on,
+  and `series_query_ms` is the elapsed time that the error names (case
+  ro4).
+
+A figure that was expected and not produced is a miss. A miss fails its
+step with exit 70 and the message names the missing key, for example no
+listing time on the L1 catalog (case ro3) or no GET byte counter in the
+scrape (case ro3b).
+
+These steps do not run: the sampler, `mimir-readiness`, `objects`, `query`,
+`capture`, `provenance`, `validate`, `memory`, the object-spans step and the
+folded steps. So the shape writes no `report.json`, `memory.jsonl` or
+`memory-summary.json`, and runs no capture (case ro1). These stamps say
+skipped or not applicable, with the reason (case ro1): `query`,
+`query_scrapes`, `mimir_readiness`, `ravel_objects`, `object_spans` and
+`readback_folded`.
+
+`ravel_only.enabled` is true. `comparability` is `non-comparable`, and
+`comparability_reason` is `Ravel-only diagnostic` (case ro1).
 
 ### The real-S3 lane
 
