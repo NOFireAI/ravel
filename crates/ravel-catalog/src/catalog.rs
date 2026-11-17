@@ -10439,6 +10439,8 @@ mod tests {
     /// and whose rows a compaction part serves (issue #4418): the snapshot
     /// holds the part and not the token's own object, and the property
     /// evaluated on the present-record answer finds the part covering it.
+    /// The listing cached L's record, so the probe reads no record and the
+    /// present-record answer is the only evaluation.
     #[tokio::test]
     async fn token_never_serves_stale_holds_for_a_compacted_present_token() {
         if token_answers("").is_none() {
@@ -10470,7 +10472,7 @@ mod tests {
         assert_eq!(keys, vec![part_key.as_str()], "the part alone serves L");
 
         let evaluations = token_answers(&token.encode()).expect("capturing");
-        assert_answers_hold(&evaluations, &["served", "present record"]);
+        assert_answers_hold(&evaluations, &["present record"]);
     }
 
     /// The present-record predicate is false on a snapshot that serves the
