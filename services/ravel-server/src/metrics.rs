@@ -1308,7 +1308,8 @@ pub struct IngestPipelineSnapshot {
     /// `end(pinned hour) + max_flush_lifetime` (ADR-2708 D3).
     pub abandoned_hour_bound: u64,
     /// Buffers dropped because their provisioning view stayed untrusted for
-    /// `max_flush_lifetime` from their first refused flush open (issue #4363).
+    /// `max_flush_lifetime` with no provisioning read succeeding, and a read
+    /// issued after the hold was spent did not confirm the view (issue #4363).
     pub abandoned_stale_provisioning: u64,
     pub abandoned_input_rejected: u64,
     /// Flushes whose ADR-1702 write gate encode returned no result (the job
@@ -1908,8 +1909,10 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
         out,
         "ravel_ingest_abandoned_stale_provisioning_total",
         "Buffers dropped unwritten because their flush stayed closed on a shard-generation \
-         view the router cannot trust for the flush lifetime, by signal. Strict writers were \
-         answered 503 and their bytes refunded; buffered-mode rows in them are lost.",
+         view the router cannot trust for the flush lifetime with no provisioning read \
+         succeeding, and a read issued after the hold was spent did not confirm the view, by \
+         signal. Strict writers were answered 503 and their bytes refunded; buffered-mode rows \
+         in them are lost.",
         "counter",
     );
     for pipeline in pipelines {
@@ -13131,9 +13134,12 @@ mod tests {
 
     /// Issue #4363: a buffer dropped after `max_flush_lifetime` on an
     /// untrusted provisioning view renders on its own counter for every
-    /// signal, with HELP text and distinct per-signal figures taken from the
-    /// ingest crate's snapshots, so a conversion that dropped the field or
-    /// swapped two signals fails here.
+    /// signal, with distinct per-signal figures taken from the ingest crate's
+    /// snapshots, so a conversion that dropped the field or swapped two
+    /// signals fails here. The HELP text is pinned whole: one that still says
+    /// the drop follows the flush lifetime alone, without the read issued
+    /// after the hold was spent, or that drops the no-successful-read
+    /// condition, fails too.
     #[test]
     fn abandoned_stale_provisioning_counter_renders_for_every_signal() {
         let ingest = vec![
@@ -13186,9 +13192,13 @@ mod tests {
         );
 
         let family = "ravel_ingest_abandoned_stale_provisioning_total";
+        let help = "Buffers dropped unwritten because their flush stayed closed on a \
+                    shard-generation view the router cannot trust for the flush lifetime with \
+                    no provisioning read succeeding, and a read issued after the hold was \
+                    spent did not confirm the view, by signal. Strict writers were answered \
+                    503 and their bytes refunded; buffered-mode rows in them are lost.";
         assert_eq!(
-            body.matches(&format!("# HELP {family} Buffers dropped unwritten"))
-                .count(),
+            body.matches(&format!("# HELP {family} {help}\n")).count(),
             1,
             "{body}"
         );

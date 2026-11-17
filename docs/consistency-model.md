@@ -231,21 +231,25 @@ Buffered mode (opt-in per request, named "buffered"):
   that still finds no trusted view, whether or not flush attempts were made
   in between (a deferred flush makes none). Once it has lasted
   `max_flush_lifetime` (3600 s by default) with no such read, the next flush
-  attempt, enforced or teardown, re-reads the record before it drops anything
-  (joining a read already in flight), and the shard waits for that read at
-  most until the deadline a flush opened at that attempt would carry,
-  `max_flush_lifetime` later. A drain that has already re-read the tenant
-  does not read again, and inside the read backoff after a failed read (at
-  most 30 s) the re-read answers as failed without a GET. If the re-read
-  installs a trusted view, the flush opens on it like any other. Otherwise
-  the attempt drops the buffer: any strict waiter is acked with the retryable `Abandoned` (503), the buffer's ADR-0069 byte
+  attempt spends the hold: it starts a background re-read of the record, or
+  joins one in flight, records when that read was issued, and keeps the
+  buffer. The shard actor does not wait on the store for that read outside a
+  drain. A read joined that was issued before the spend does not count, and
+  a read the read backoff after a failed read (at most 30 s) refuses counts as
+  not yet issued; a later attempt asks again. If a read issued after the
+  spend installs a trusted view, the next attempt opens the flush on it like
+  any other. The buffer is dropped once a read issued at or after the spend
+  has failed, or `max_flush_lifetime` has passed since the spend with no read
+  confirming the view; a teardown pass past the bound drops it too, since no
+  later attempt can wait for the read. The drop answers any strict waiter
+  with the retryable `Abandoned` (503), the buffer's ADR-0069 byte
   charges are refunded, the drop is logged at ERROR, and
   `ravel_ingest_abandoned_stale_provisioning_total`, labelled by signal,
   counts it once per buffer. A teardown drain inside that bound still writes
   the buffer in place (the first exception under "Online resharding" below). Like case one this
   is a store that cannot be read for an hour: no provisioning read succeeded
-  for `max_flush_lifetime`, deferred flushes included, and the re-read at the
-  drop did not succeed either; the alternative, holding the
+  for `max_flush_lifetime`, deferred flushes included, and a read issued
+  after the hold was spent did not confirm the view; the alternative, holding the
   rows and their budget charge without limit, turns a lasting outage into an
   unbounded memory and budget hold on every router. The
   ADR-1685 store-clock lag check is not a case of its own: a teardown drain's
@@ -736,8 +740,8 @@ onward routes with the new count. Guarantees:
   current generation, and on a view it cannot trust it does not open the
   flush and keeps the rows until `max_flush_lifetime` has passed with no
   provisioning read succeeding since the hold began (a successful read
-  restarts it), after which a last re-read that also fails drops them
-  unwritten (acknowledgement case nine). A strict write still waiting on handed-back rows
+  restarts it), after which it drops them unwritten once a read issued after
+  the hold was spent did not confirm the view (acknowledgement case nine). A strict write still waiting on handed-back rows
   is answered `Abandoned` (503, outcome unknown) before the rows are sent:
   they are written by a target shard or, if none can take them, by the shard
   that held them. A target shard that is dead or condemned, or whose mailbox
@@ -766,7 +770,8 @@ onward routes with the new count. Guarantees:
     current generation, writes the rows in place rather than drop them,
     unless a flush of theirs has already been held on an untrusted view for
     `max_flush_lifetime` with no provisioning read succeeding, in which case
-    the drain's failed re-read drops them (acknowledgement case nine). When
+    the drain drops them once its own bounded re-read did not confirm the
+    view (acknowledgement case nine). When
     the target was not live the rows are known to be outside the scan set:
     stored but returned by no query, logged at ERROR with the tenant, shard
     and hour, and counted on `ravel_ingest_teardown_unscanned_writes_total`.
