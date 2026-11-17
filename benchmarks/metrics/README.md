@@ -48,7 +48,7 @@ ADR-0927 decision 11. Cardinality, history and churn vary one axis each and pin
 the others; collapsing them into a single scale factor would make a regression
 unattributable.
 
-| profile | active series | samples/series | scrape | duration | churn | total samples |
+| profile | active series | samples/series | scrape | duration | churn | total points |
 |---|---|---|---|---|---|---|
 | `cardinality` | 1,000,000 | 360 | 15 s | 90 m | none | 360,000,000 |
 | `history` | 10,000 | 172,800 | 15 s | 30 d | none | 1,728,000,000 |
@@ -298,8 +298,11 @@ not every dropped point.
 
 Compare a profile's ingest volume across runs on the same field. The two
 classes are separate, and `logical_points_per_sec` is their sum divided by
-`elapsed_secs`, so a figure derived from the rate is samples plus histograms,
-while `accepted_samples` alone leaves the histograms out. For `history` the
+`elapsed_secs`, so on a row that stores both classes a figure derived from
+the rate is samples plus histograms, while `accepted_samples` alone leaves the
+histograms out. Where `unsupported_classes` names native histograms
+(VictoriaMetrics, in the unsupported-class table below), the rate carries
+scalars only and equals `accepted_samples`. For `history` the
 native histogram family is 100 per mille of the series, so `accepted_samples`
 is 90 % of the points. From the manifest, `history` generates 1,728,000,000
 points, 1,555,200,000 scalar and 172,800,000 native histogram. The one-in-500
@@ -568,8 +571,8 @@ none (`check_band6_across_rows` in `src/bin/metricsbench_ingest.rs`;
 `metricsbench_ingest::tests::portable_rows_still_cross_check_without_the_in_process_row`,
 `metricsbench_ingest_smoke::without_the_in_process_row_the_portable_rows_still_close_band_6`).
 
-The large profiles run with it. On `cardinality` (360,000,000 samples) and
-`history` (1,728,000,000 samples) a memory store does not fit beside four
+The large profiles run with it. On `cardinality` (360,000,000 points) and
+`history` (1,728,000,000 points) a memory store does not fit beside four
 4 GB engine containers on a 32 GB host, and the stack's s3s-fs is the
 engines' own store, not a neutral place for a diagnostic row.
 
