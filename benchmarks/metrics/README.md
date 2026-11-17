@@ -296,6 +296,21 @@ checks them only in part: it counts series and reads one probe series per
 class, so it catches a dropped series, or a dropped point in a probe series,
 not every dropped point.
 
+Compare a profile's ingest volume across runs on the same field. The two
+classes are separate, and `logical_points_per_sec` is their sum divided by
+`elapsed_secs`, so a figure derived from the rate is samples plus histograms,
+while `accepted_samples` alone leaves the histograms out. For `history` the
+native histogram family is 100 per mille of the series, so `accepted_samples`
+is 90 % of the points. From the manifest, `history` generates 1,728,000,000
+points, 1,555,200,000 scalar and 172,800,000 native histogram. The one-in-500
+missing-sample anomaly lowers the scalars to about 1,552,089,600 and the
+histograms to about 172,454,400. The 2026-11-06 run (harness `78d8e8fa3`)
+reported 1,552,087,844 as `accepted_samples` on all four engines. The
+2026-10-28 Prometheus-only run (harness `e56c5209b`) reported 1,724,541,945
+accepted points, which is samples plus histograms. The 172,454,101 between
+the two is the histogram class: the stream did not change between those
+harness commits.
+
 `endpoint` on an HTTP row is the URL passed. The portable Ravel row writes to
 `ravel-server`'s `/api/v1/write`. With `--ravel-bearer-token-env <VAR>` it
 sends `Authorization: Bearer <token>`, the token read from the environment
