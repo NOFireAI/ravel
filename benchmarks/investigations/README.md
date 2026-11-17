@@ -820,8 +820,9 @@ the same count. The 30-day rate is 4,000,008, which is 24 x 166,667: a
 fifth of that rate, rounded the same way. The amendment calls for a reduced
 rate there but names no figure, so the fifth is this harness's choice. Its
 reason for reducing: 30 days at box D's rate cost about 5.2 hours of fold
-for logs alone (#3692 comment 6847040976) and about 20 hours of corpus
-generation.
+for logs alone, projected linearly from the 4,344 s first fold of the
+7-day logs state (#3692 comment 6847040976; no 30-day fold at that rate
+was measured), and about 20 hours of corpus generation.
 `[retired_hour]`'s `c1_sha` and `r2_sha` are read by every state that
 writes a fold binary stamp (`retired_hour` and each `day_parts_N`), the
 other two keys only when `run.states` lists `retired_hour`. Both are
