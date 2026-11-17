@@ -1347,8 +1347,11 @@ impl<H> GenerationSwitch<H> {
     /// The horizon is tested at `now_ns` plus the switch's grace lead, not at
     /// `now_ns`: a row routed here is acknowledged in buffered mode before its
     /// flush opens, and a flush that opens past the horizon finds no trusted
-    /// view at its scan-set check and is held, then dropped. A row whose flush
-    /// can open past the horizon is refused instead, before it is buffered.
+    /// view at its scan-set check and is held, then dropped. A row is refused
+    /// when its undeferred flush trigger would open past the horizon, before
+    /// it is buffered. A buffer held below the idle byte floor or whose flush
+    /// is deferred can still open past the horizon and is then dropped under
+    /// the bounded stale-view hold (consistency model, case nine).
     pub fn try_grace_extend(&self, tenant: TenantHash, now_ns: i64) -> Option<Arc<Vec<H>>> {
         let mut inner = self.lock();
         let refreshed_at_ns = inner.views.get(&tenant)?.refreshed_at_ns;
