@@ -46,8 +46,8 @@ The driver uses two stores over one bucket:
 Every message starts with `store: `. Every property is an `assert_always`
 except the transient one. Antithesis also fails an `assert_always` that is
 never reached, so each assertion also proves that its action ran. The versions
-action carries two further asserts for a same-bytes recreate, described under
-"Versions on S3".
+action carries a further `assert_always` and an `assert_reachable` for a
+same-bytes recreate, described under "Versions on S3".
 
 | TLA+ property | Message | What the action does and asserts |
 |---|---|---|
@@ -69,6 +69,8 @@ with `assert_reachable` "store: a write failed with a retryable error"
 - "store: the workload starts"
 - "store: a create race had a loser"
 - "store: a stale CAS was refused"
+- "store: a same-bytes recreate ran": reached on every conclusive same-bytes
+  recreate; its details carry `reused: true` or `reused: false`
 - "store: a failed write was later found applied": a lost response observed
   for real, a failed write whose effect landed.
 
@@ -90,7 +92,7 @@ each mutant must make false.
 | Mutant | Switch | Property it makes false |
 |---|---|---|
 | `common/lost-response-not-applied` | `put_dropping_response` reports success without writing | `store: a lost-response overwrite took effect` |
-| `common/cas-accepts-stale-version` | a CAS put is sent as an overwrite | `store: a CAS outcome matches its effect` (and, as a side effect, `store: a version is never reused after a delete`) |
+| `common/cas-accepts-stale-version` | a CAS put is sent as an overwrite | `store: a CAS outcome matches its effect` (and, as a side effect, `store: a version is never reused after a delete`; it refutes the same-bytes sub-check only when the recreate's version differs, see "Versions on S3") |
 | `common/list-never-progresses` | every listing page is empty, and its next token is the token it was given (a fixed one for the first page) | `store: a paged list ends complete within its page bound` |
 
 `cargo test` pins each switch against `MemoryStore`. The pinning tests are:
@@ -99,8 +101,9 @@ each mutant must make false.
 - `model::tests::dropped_lost_response_is_caught`
 - `model::tests::stalled_listing_is_caught`
 - `model::tests::versions_same_bytes_recreate_sub_check`: the same-bytes
-  recreate observes the ETag reuse without a false red, and the
-  `cas-accepts-stale-version` mutant breaks its sub-check.
+  recreate observes the ETag reuse without a false red; the
+  `cas-accepts-stale-version` mutant breaks its sub-check on a store that
+  mints a fresh version, and does not on one that reuses it.
 - `model::tests::each_mutant_breaks_only_its_own_property`: each mutant is run
   against all nine properties; it breaks only its own, except that
   `cas-accepts-stale-version` breaks both the CAS and the versions property
@@ -110,6 +113,14 @@ each mutant must make false.
 property holding with no mutant. `cas_applied_then_retried_precondition_failed_is_not_a_false_red`
 shows a CAS that applied but was answered `PreconditionFailed` (object_store's
 retry of a landed CAS) is not judged a violation.
+`same_bytes_cas_that_landed_but_was_not_answered_ok_is_judged_by_reuse` shows
+the same for the same-bytes CAS, answered `PreconditionFailed` or a retryable
+failure, when the version was reused, and a violation when it was not.
+`a_fault_in_the_same_bytes_setup_keeps_the_different_bytes_verdict` shows a
+fault in the same-bytes setup leaves only that sub-check inconclusive. The
+driver's own tests (`tests::*` in `main.rs`) pin that it carries no
+`assert_sometimes` and that the same-bytes messages are the ones this README
+and traceability.md name.
 
 ## Versions on S3
 
@@ -122,16 +133,33 @@ ETag does not implement.
 
 So the versions action also runs a same-bytes recreate to exercise the case
 the different bodies hide: create X, read its version V1, delete the key,
-create X again, then a CAS holding V1 with new bytes Y. The driver does not
-require the recreate's version to differ from V1 (on RustFS it does not); it
-records the reuse with `assert_sometimes` "store: a same-bytes recreate reuses
-the version". What it does require, as `assert_always` "store: a CAS holding a
-pre-delete version fails after a same-bytes recreate", is that the CAS outcome
-matches its effect: a CAS answered `Ok` is conformant only when the version
-was reused (so V1 is the current version) and the key then holds Y; a CAS
-answered otherwise leaves the recreate's bytes X in place. The
-`common/cas-accepts-stale-version` mutant, which sends a CAS as an overwrite,
-breaks this too: it applies against a version that was not reused. Issue #4389
+create X again (version V2), then a CAS holding V1 with new bytes Y. The
+driver does not require V2 to differ from V1 (on RustFS it does not). It
+records which happened with `assert_reachable` "store: a same-bytes recreate
+ran", reached on every same-bytes recreate whose setup completed, with
+`reused: true` or `reused: false` in its details; the run does not depend on
+the answer. What it does require, as this `assert_always`:
+
+`store: a CAS holding a pre-delete version matches its effect after a same-bytes recreate`
+
+is that the CAS outcome matches its effect:
+
+- answered `Ok`: V2 equals V1 (so V1 is the current version) and the key holds
+  Y;
+- answered anything else: the key holds X, or V2 equals V1 and the key holds
+  Y. With V1 current the CAS is valid, so one that applied but whose response
+  was lost or retried is answered a failure or `PreconditionFailed` while the
+  store holds Y. Y is unique to this CAS, so Y in place means it applied.
+
+The `common/cas-accepts-stale-version` mutant, which sends a CAS as an
+overwrite, refutes this sub-check only when V2 differs from V1: the overwrite
+then stores Y against a stale version. When V2 equals V1, as on RustFS, the
+mutant's overwrite is answered `Ok` and stores Y, exactly what a valid CAS
+does, and the sub-check passes; there the mutant is refuted by "store: a
+version is never reused after a delete" and "store: a CAS outcome matches its
+effect" instead. A fault during the same-bytes setup (its create, delete,
+recreate, or the read after its CAS) leaves only this sub-check inconclusive;
+the different-bytes verdict computed before it is still asserted. Issue #4389
 tracks whether Ravel's own CAS targets can collide a version this way.
 
 ## Build, run locally, launch
@@ -159,7 +187,11 @@ or the transient pair if no hurried write failed. The run fails on any
 violated always-type assertion, or when no SDK output was collected. A
 mutant run passes only when the property that mutant names was violated.
 `WORKLOAD_MAX_ACTIONS=N` makes the driver end its timeline after N actions,
-and the run then waits for the driver to exit.
+and the run then waits up to the given seconds for the driver to exit; a
+driver still running at that deadline, or one that exited non-zero, fails the
+run. Without it the run sleeps the given seconds, and a driver that is no
+longer running by then must have exited 0, else the run fails. A driver
+container whose state cannot be read also fails the run.
 
 To move the image and launch from the machine that holds the Antithesis and
 registry credentials:
