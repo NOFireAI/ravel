@@ -23,11 +23,20 @@
 //! surface as a refused read; that context names both readings, the missing
 //! read grant first. Every other refusal names the missing grant.
 
+use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::Mode;
+use bytes::Bytes;
 use ravel_maintain::{CompactorConfig, GcAccessOp, GcConfigError, GcConfigValues};
-use ravel_object_store::ObjectStoreBackend;
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
+    ObjectStoreBackend, PageToken, Pin, PinnedRead, PutOptions, PutOutcome, StoreError,
+};
+
+use crate::Mode;
+use crate::startup_retry::{SITE_GC_CONFIG, StartupRetry, store_error_is_transient};
 
 /// A `Duration` as saturating `i64` nanoseconds, matching how every ns knob in
 /// this workspace is compared. An absurd duration saturates to `i64::MAX`
@@ -44,6 +53,162 @@ pub async fn bootstrap(
     now_ns: i64,
 ) -> Result<GcConfigValues, GcConfigError> {
     ravel_maintain::bootstrap_gc_config(store, GcConfigValues::maintain_defaults(), now_ns).await
+}
+
+/// [`bootstrap`] as startup runs it: retried while it fails with a transient
+/// store error (issue #4325), and refused with [`bootstrap_failure_context`]
+/// otherwise. The create is create-if-absent and a retry starts from the read,
+/// so an object that landed before an ambiguous failure reads back as present.
+///
+/// `GcConfigError::Store` carries the store error as text, so the store is
+/// wrapped in [`LastErrorStore`] to learn the failing call's error by type.
+pub async fn bootstrap_at_startup(
+    store: Arc<dyn ObjectStoreBackend>,
+    now_ns: i64,
+    mode: Mode,
+    retry: &StartupRetry,
+) -> anyhow::Result<GcConfigValues> {
+    let recording = LastErrorStore::new(store);
+    retry
+        .run(
+            SITE_GC_CONFIG,
+            || async {
+                recording.forget();
+                bootstrap(&recording, now_ns)
+                    .await
+                    .map_err(|error| GcAttemptError {
+                        transient: matches!(error, GcConfigError::Store(_))
+                            && recording.last_failure_was_transient(),
+                        error,
+                    })
+            },
+            |err| err.transient,
+        )
+        .await
+        .map_err(|failure| {
+            failure.into_anyhow(|err| {
+                let context = bootstrap_failure_context(&err.error, mode);
+                anyhow::Error::new(err.error).context(context)
+            })
+        })
+}
+
+/// One failed [`bootstrap`] attempt and whether the store call behind it
+/// failed with [`StoreError::Transient`].
+struct GcAttemptError {
+    error: GcConfigError,
+    transient: bool,
+}
+
+impl fmt::Display for GcAttemptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+/// Delegates every call and remembers whether the most recent failing one
+/// returned [`StoreError::Transient`].
+struct LastErrorStore {
+    inner: Arc<dyn ObjectStoreBackend>,
+    last_failure_transient: AtomicBool,
+}
+
+impl LastErrorStore {
+    fn new(inner: Arc<dyn ObjectStoreBackend>) -> Self {
+        LastErrorStore {
+            inner,
+            last_failure_transient: AtomicBool::new(false),
+        }
+    }
+
+    fn forget(&self) {
+        self.last_failure_transient.store(false, Ordering::SeqCst);
+    }
+
+    fn last_failure_was_transient(&self) -> bool {
+        self.last_failure_transient.load(Ordering::SeqCst)
+    }
+
+    fn note<T>(&self, result: Result<T, StoreError>) -> Result<T, StoreError> {
+        if let Err(err) = &result {
+            self.last_failure_transient
+                .store(store_error_is_transient(err), Ordering::SeqCst);
+        }
+        result
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for LastErrorStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.note(self.inner.put(key, data, opts).await)
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.note(self.inner.get(key, range).await)
+    }
+
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &Pin,
+    ) -> Result<PinnedRead, StoreError> {
+        self.note(self.inner.get_pinned(key, range, pin).await)
+    }
+
+    async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+        self.note(self.inner.get_with_pin(key, range).await)
+    }
+
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+        self.note(self.inner.pin_of(key).await)
+    }
+
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+        self.note(self.inner.put_multipart(key).await)
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.note(self.inner.head(key).await)
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.note(self.inner.list(prefix, page).await)
+    }
+
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        self.note(self.inner.list_after(prefix, start_after, page).await)
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.note(self.inner.list_delimited(prefix).await)
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.note(self.inner.delete(key).await)
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        self.inner.observed_store_time_ns()
+    }
 }
 
 /// The context startup attaches to a failed [`bootstrap`] in `mode`. A refused
@@ -268,5 +433,100 @@ mod tests {
             msg,
             "failed to bootstrap or read the durable GC config (sys/gc)"
         );
+    }
+
+    mod startup {
+        #![allow(clippy::expect_used)]
+
+        use ravel_object_store::fault::{FaultKind, FaultStore, Op};
+        use ravel_object_store::memory::MemoryStore;
+
+        use super::super::*;
+        use crate::startup_retry::test_support::*;
+
+        const GC_KEY: &str = "sys/gc";
+
+        fn faulted(plan: ravel_object_store::fault::FaultPlan) -> Arc<FaultStore<MemoryStore>> {
+            Arc::new(FaultStore::new(MemoryStore::new(), plan))
+        }
+
+        #[tokio::test]
+        async fn retries_a_transient_read_then_starts() {
+            let clock = Arc::new(ManualClock::default());
+            let store = faulted(transient_then_ok(Op::Get, GC_KEY, 3));
+            let values = bootstrap_at_startup(store.clone(), 1, Mode::All, &retry_on(clock))
+                .await
+                .expect("starts once the store answers");
+            assert_eq!(
+                values.protection_horizon_ns,
+                GcConfigValues::maintain_defaults().protection_horizon_ns
+            );
+            assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 3);
+            assert_eq!(store.sequence_progress(0), 4);
+        }
+
+        #[tokio::test]
+        async fn retries_a_transient_create_then_starts() {
+            let clock = Arc::new(ManualClock::default());
+            let store = faulted(transient_then_ok(Op::Put, GC_KEY, 2));
+            bootstrap_at_startup(store.clone(), 1, Mode::Maintain, &retry_on(clock))
+                .await
+                .expect("starts once the create lands");
+            assert_eq!(store.fault_count(Op::Put, FaultKind::Transient), 2);
+            assert_eq!(store.sequence_progress(0), 3);
+        }
+
+        #[tokio::test]
+        async fn transient_past_the_deadline_refuses_naming_the_site() {
+            let clock = Arc::new(ManualClock::default());
+            let store = faulted(always_transient(Op::Get, GC_KEY));
+            let err = bootstrap_at_startup(store.clone(), 1, Mode::All, &retry_on(clock.clone()))
+                .await
+                .expect_err("refuses once the deadline passes");
+            let attempts = store.fault_count(Op::Get, FaultKind::Transient);
+            assert_deadline_refusal(&err, SITE_GC_CONFIG, attempts);
+            assert_eq!(clock.elapsed(), DEADLINE);
+            assert!(
+                format!("{err:#}")
+                    .contains("failed to bootstrap or read the durable GC config (sys/gc)")
+            );
+        }
+
+        #[tokio::test]
+        async fn non_transient_error_refuses_on_the_first_attempt() {
+            let clock = Arc::new(ManualClock::default());
+            let store = faulted(always_permanent(Op::Get, GC_KEY));
+            let err = bootstrap_at_startup(store.clone(), 1, Mode::All, &retry_on(clock.clone()))
+                .await
+                .expect_err("refuses at once");
+            assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
+            assert_eq!(
+                err.to_string(),
+                "failed to bootstrap or read the durable GC config (sys/gc)"
+            );
+            assert!(clock.sleeps().is_empty());
+        }
+
+        /// A transient failure on an earlier call does not make a later
+        /// non-transient one retryable: the attempt is judged by the call
+        /// that failed it.
+        #[tokio::test]
+        async fn a_permanent_create_after_a_transient_read_refuses_at_once() {
+            let clock = Arc::new(ManualClock::default());
+            let plan = transient_then_ok(Op::Get, GC_KEY, 1).with_rule(
+                ravel_object_store::fault::Rule::new(
+                    Op::Put,
+                    ravel_object_store::fault::ScriptedFault::Permanent("bad request".into()),
+                )
+                .with_key_contains(GC_KEY),
+            );
+            let store = faulted(plan);
+            bootstrap_at_startup(store.clone(), 1, Mode::All, &retry_on(clock.clone()))
+                .await
+                .expect_err("refuses on the permanent create");
+            assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 1);
+            assert_eq!(store.fault_count(Op::Put, FaultKind::Permanent), 1);
+            assert_eq!(clock.sleeps().len(), 1);
+        }
     }
 }
