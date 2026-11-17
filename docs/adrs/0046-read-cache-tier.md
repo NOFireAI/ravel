@@ -532,8 +532,13 @@ only at or under the plan bound, and not at all above it. A part above the
 bound is dropped from the whole-part set, before the per-(tenant, signal)
 cap, and left to the metadata pass, which warms its footer and four
 directories. The whole-part warm's fetcher is built with the same block-range
-threshold, request cost and projection break-even the metadata pass uses, so
-the two steps agree on the bound and never both read one logs part. They do
+threshold, request cost, projection break-even and fetch bound
+(`max_fetch_run_bytes`) the metadata pass uses, so the two steps agree on the
+bound, a part at or under it is warmed under the same extent keys the query
+path's `covering_read` later asks for (without the fetch bound a part at or
+under the bound but larger than it would be cached under one whole extent the
+query path never looks up), and the two steps never both read one logs part.
+They do
 not cover every part: a part at or under the bound past the cap is warmed by
 neither step, since the metadata pass reads only parts above the bound. A
 part skipped for being above the bound is counted in a new
@@ -545,7 +550,13 @@ bound), a part above the bound gets no warm at all, and the warm-up says so
 in one `warn!` per pass. The per-(tenant, signal) `warn!` that nothing warmed
 now keys on the parts at or under the bound: it fires when there were some
 and none warmed or was skipped over budget, whatever the parts above the
-bound. The whole-part cap
+bound. Because that per-(tenant, signal) `warn!` is suppressed for a signal
+whose parts are all above the bound, the metadata pass carries the warning
+for those parts: when every footer or directory read it started for a tenant
+failed (at least one started, none warmed), it logs its own `warn!` for that
+tenant, so a run where every metadata read failed is not silent. A tenant the
+pass's cache ceiling stopped before any read started gets no such `warn!`:
+nothing failed, and the pass-complete line reports `metadata_budget_reached`. The whole-part cap
 (`MAX_PARTS_PER_TENANT_PER_SIGNAL`), the parts-in-flight and whole-part byte
 budgets, the metadata share of the cache, the warm deadline and `/readyz`
 behaviour are all unchanged. The metric side is unchanged too: a metric part

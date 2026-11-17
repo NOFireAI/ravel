@@ -53,10 +53,15 @@
 //! the bound. A part at or under the bound past the cap is counted in
 //! `parts_beyond_cap` and warmed by neither step: the metadata pass reads only
 //! parts above the bound. The whole-part fetcher is built with the same
-//! block-range threshold, request cost and projection break-even the metadata
-//! pass uses, so the two steps agree on the bound and never both read one part.
-//! When the metadata pass does not run ([`LogsMetadataPass::new`] refuses the
-//! query path's fetch bound), a part above the bound gets no warm at all, and
+//! block-range threshold, request cost, projection break-even and fetch bound
+//! ([`LogSegmentFetcher::with_max_fetch_run_bytes`]) the metadata pass uses, so
+//! the two steps agree on the bound, warm a part at or under it under the same
+//! extent keys the query path reads, and never both read one part.
+//! When the metadata pass runs and every footer or directory read it started
+//! for a tenant failed (at least one started, none warmed), it warns once for
+//! that tenant, since the whole-part step's `warn!` stays at `info!` for parts
+//! above the bound. When the metadata pass does not run
+//! ([`LogsMetadataPass::new`] refuses the query path's fetch bound), a part above the bound gets no warm at all, and
 //! the pass logs one `warn!` saying so, naming the first tenant found with
 //! such a part. (The
 //! metric side is unchanged: a metric part above
@@ -502,10 +507,10 @@ async fn warm_cache_inner(
     // #4307: the whole-part warm reads a logs part the way the query path does,
     // whole at or under `plan_whole_object_bound` and not at all above it (there
     // the query path plans from the directories the metadata pass warms).
-    // Build this fetcher with the same block-range threshold, request cost and
-    // projection break-even the metadata pass uses, so both agree on that bound
-    // and `warm_log_parts` splits the warm set against it.
-    let logs_fetcher = LogSegmentFetcher::new(store)
+    // Build this fetcher with the same block-range threshold, request cost,
+    // projection break-even and fetch bound the metadata pass uses, so both
+    // agree on that bound and `warm_log_parts` splits the warm set against it.
+    let mut logs_fetcher = LogSegmentFetcher::new(store)
         .with_block_range_threshold(logs_metadata.block_range_threshold)
         .with_request_cost_bytes(logs_metadata.request_cost_bytes)
         .with_projection_break_even_bytes(logs_metadata.projection_break_even_bytes)
@@ -513,6 +518,27 @@ async fn warm_cache_inner(
         .with_get_limiter(get_limiter.clone())
         .with_memory_budget(memory_budget)
         .with_read_gate(read_gate);
+    // The query path's logs fetcher also applies `max_fetch_run_bytes`
+    // (`LogsMetadataPass::new`), which sets the extent `covering_read` splits a
+    // whole read into. Without it here a part at or under the bound would be
+    // warmed under an extent key the query path never asks for, so its first
+    // read would miss the cache. Apply it under the same non-zero guard the
+    // pass uses. The builder errs only on a zero bound, which the guard
+    // excludes; were it to err, keep the fetcher without the bound rather than
+    // fail the warm-up.
+    if logs_metadata.max_fetch_run_bytes != 0 {
+        match logs_fetcher
+            .clone()
+            .with_max_fetch_run_bytes(logs_metadata.max_fetch_run_bytes)
+        {
+            Ok(fetcher) => logs_fetcher = fetcher,
+            Err(err) => tracing::warn!(
+                error = %err,
+                "cache warmup: invalid logs fetch bound; the whole-part warm reads logs parts \
+                 without it"
+            ),
+        }
+    }
     // The whole-part warm and the metadata pass insert beside each other, so
     // each holds to its own share and together they never pass the cache's
     // budget: an eviction would drop entries the pass has already counted.
@@ -613,13 +639,32 @@ async fn warm_cache_inner(
                 continue;
             }
             let warmed = pass.warm(set.tenant, &planned, progress).await;
-            tracing::info!(
-                tenant_hash = %set.tenant.to_hex(),
-                signal = ?Signal::Logs,
-                metadata_objects_warmed = warmed.objects as u64,
-                metadata_bytes_warmed = warmed.bytes,
-                "cache warmup: warmed tenant logs metadata"
-            );
+            if warmed.objects == 0 && warmed.failed > 0 {
+                // `log_warm_result` stays at `info!` for a logs signal whose
+                // parts are all above the plan bound, and the per-read failures
+                // are at `debug!`, so this is the only warning when every read
+                // this pass started for the tenant failed. A tenant the ceiling
+                // stopped before any read started is not a fault: the
+                // pass-complete line reports `metadata_budget_reached`.
+                tracing::warn!(
+                    tenant_hash = %set.tenant.to_hex(),
+                    signal = ?Signal::Logs,
+                    metadata_parts_planned = planned.len() as u64,
+                    metadata_reads_failed = warmed.failed as u64,
+                    metadata_objects_warmed = warmed.objects as u64,
+                    metadata_bytes_warmed = warmed.bytes,
+                    "cache warmup: tenant has logs parts above the plan bound but the metadata \
+                     pass warmed none"
+                );
+            } else {
+                tracing::info!(
+                    tenant_hash = %set.tenant.to_hex(),
+                    signal = ?Signal::Logs,
+                    metadata_objects_warmed = warmed.objects as u64,
+                    metadata_bytes_warmed = warmed.bytes,
+                    "cache warmup: warmed tenant logs metadata"
+                );
+            }
         }
         progress.end(WarmStep::MetadataPass);
         elapsed_ms(step_started)
@@ -655,11 +700,12 @@ async fn warm_cache_inner(
 
 /// What the logs metadata pass warmed: objects whose footer and four
 /// directories it read into the cache, and the wire bytes it fetched for them
-/// (cache hits fetch none).
+/// (cache hits fetch none), and the objects whose read failed.
 #[derive(Clone, Copy, Debug, Default)]
 struct MetadataWarmed {
     objects: usize,
     bytes: u64,
+    failed: usize,
 }
 
 /// The logs metadata pass's fetcher and budget, kept across tenants: the
@@ -785,6 +831,7 @@ impl LogsMetadataPass {
                     progress.metadata_object_warmed(fetched);
                 }
                 Err(err) => {
+                    warmed.failed += 1;
                     tracing::debug!(
                         tenant_hash = %tenant.to_hex(),
                         key = %part.data_object_key,
@@ -920,8 +967,11 @@ async fn most_recent_parts(
 /// share (`parts_over_budget` above zero) logs at `info!` too: nothing failed.
 /// A logs signal whose parts were all above the plan bound (none left for the
 /// whole-part step, `parts_above_plan_bound` above zero) logs at `info!` too:
-/// none warming whole is expected (#4307). One with parts at or under the bound
-/// still warns when none of those warmed, whatever its parts above the bound.
+/// none warming whole is expected (#4307). The metadata pass that warms those
+/// parts warns for itself when every read it started for the tenant failed
+/// (see the metadata step in [`warm_cache_inner`]), so a run where every
+/// metadata read failed still warns. One with parts at or under the bound still
+/// warns when none of those warmed, whatever its parts above the bound.
 fn log_warm_result(
     tenant: TenantHash,
     signal: Signal,
@@ -4409,5 +4459,339 @@ mod tests {
                 complete[0]
             );
         }
+    }
+
+    /// Issue #4307 (review round 1): a tenant whose logs parts are all above the
+    /// plan bound (the ClickBench shape) and whose every metadata read fails
+    /// gets exactly one `warn!` -- from the metadata pass, which warmed none of
+    /// its non-empty planned set. The whole-part step warms nothing whole (all
+    /// parts are above the bound), so `log_warm_result` logs at `info!` for it,
+    /// and the per-read failures are at `debug!`, so without the pass's own warn
+    /// the fault is silent. Seen failing against the head: zero warns, not one.
+    #[tokio::test(start_paused = true)]
+    async fn all_logs_parts_above_the_bound_with_failing_metadata_reads_warn_once() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let memory = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let now = now_ns();
+        // Two logs parts, both above the split plan bound: the whole-part step
+        // warms neither and leaves both to the metadata pass.
+        for k in 1..=2u8 {
+            let at = now - i64::from(k) * NS_PER_MIN;
+            publish_log_segment_sized(
+                &memory,
+                tenant,
+                at,
+                at / NS_PER_HOUR,
+                [k; 32],
+                LARGE_FILLER_BYTES,
+            )
+            .await;
+        }
+        // Fail every GET of the tenant's logs data objects, so each part's
+        // footer and directory reads in the metadata pass fail. Commit-record
+        // listings (under `/c/`) and the generation-history GET are untouched,
+        // so discovery and resolution still find both parts.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Transient("boom".to_string()))
+                .with_key_contains(format!("t/{}/l/l0/", tenant.to_hex())),
+        );
+        let fault_store = Arc::new(FaultStore::new(memory, plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let cache = Arc::new(Cache::new(CacheLimits::new(
+            16 * 1024 * 1024,
+            1024,
+            1024 * 1024,
+        )));
+        let warns: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let events = EventCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(WarnEventCapture(warns.clone()))
+            .with(events.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        warm_cache(
+            store.clone(),
+            catalog_for(store),
+            ReadCache::Ram(cache.clone()),
+            &FixedClock(now),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            crate::cpu_gates::CpuGates::new(Default::default()).read,
+            LogsMetadataWarm::new(&split_engine(), 16 * 1024 * 1024),
+        )
+        .await;
+
+        assert_eq!(cache.len(), 0, "every metadata read failed, nothing warmed");
+        assert!(
+            fault_store.fault_count(Op::Get, FaultKind::Transient) >= 1,
+            "the metadata pass's reads failed on the injected fault"
+        );
+        let warns = warns.lock();
+        assert_eq!(
+            warns.len(),
+            1,
+            "exactly one warn across the whole pass: {warns:?}"
+        );
+        assert!(
+            warns[0].contains("the metadata pass warmed none") && warns[0].contains(" signal=Logs"),
+            "the one warn names the metadata pass warming none of this tenant's logs parts: {}",
+            warns[0]
+        );
+        let complete = events.events(PASS_COMPLETE);
+        assert_eq!(complete.len(), 1, "one pass-complete line: {complete:?}");
+        for (field, value) in [
+            ("parts_warmed", "0"),
+            ("parts_above_plan_bound", "2"),
+            ("metadata_objects_warmed", "0"),
+        ] {
+            assert_eq!(
+                field_values(&complete[0], field),
+                [value],
+                "{field}: {}",
+                complete[0]
+            );
+        }
+    }
+
+    /// Issue #4307 (review round 1): the passing counterpart. A tenant with one
+    /// logs part above the plan bound whose metadata read succeeds warms it and
+    /// logs at `info!` (`cache warmup: warmed tenant logs metadata`), with no
+    /// warn.
+    #[tokio::test(start_paused = true)]
+    async fn a_warmed_metadata_pass_logs_at_info_with_no_warn() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let memory = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let now = now_ns();
+        let at = now - NS_PER_MIN;
+        publish_log_segment_sized(
+            &memory,
+            tenant,
+            at,
+            at / NS_PER_HOUR,
+            [1; 32],
+            LARGE_FILLER_BYTES,
+        )
+        .await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(memory);
+        let cache = Arc::new(Cache::new(CacheLimits::new(
+            16 * 1024 * 1024,
+            1024,
+            1024 * 1024,
+        )));
+        let warns: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let events = EventCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(WarnEventCapture(warns.clone()))
+            .with(events.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        warm_cache(
+            store.clone(),
+            catalog_for(store),
+            ReadCache::Ram(cache),
+            &FixedClock(now),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            crate::cpu_gates::CpuGates::new(Default::default()).read,
+            LogsMetadataWarm::new(&split_engine(), 16 * 1024 * 1024),
+        )
+        .await;
+
+        assert!(
+            warns.lock().is_empty(),
+            "a warmed metadata pass produces no warn: {:?}",
+            warns.lock()
+        );
+        let info = events.events("cache warmup: warmed tenant logs metadata");
+        assert_eq!(info.len(), 1, "one logs metadata info line: {info:?}");
+        assert_eq!(
+            field_values(&info[0], "metadata_objects_warmed"),
+            ["1"],
+            "{}",
+            info[0]
+        );
+    }
+
+    /// Issue #4307 (review round 1): a tenant whose parts above the plan bound
+    /// the metadata pass never started a read for, because its cache ceiling
+    /// holds no probe, is not a fault: nothing failed, so the pass logs its
+    /// `info!` line with zero objects and no `warn!`, and the pass-complete line
+    /// reports `metadata_budget_reached`.
+    #[tokio::test(start_paused = true)]
+    async fn a_metadata_pass_stopped_by_its_ceiling_does_not_warn() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let memory = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let now = now_ns();
+        let at = now - NS_PER_MIN;
+        publish_log_segment_sized(
+            &memory,
+            tenant,
+            at,
+            at / NS_PER_HOUR,
+            [1; 32],
+            LARGE_FILLER_BYTES,
+        )
+        .await;
+        let store = Arc::new(RecordsGets::new(memory, Duration::from_secs(0)));
+        let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
+        let (parts, _) =
+            most_recent_parts(&catalog_for(dyn_store.clone()), tenant, Signal::Logs, now).await;
+        assert_eq!(parts.len(), 1);
+        assert!(
+            parts[0].object_size > SPLIT_PLAN_BOUND,
+            "the part is above the bound"
+        );
+        let key = parts[0].data_object_key.clone();
+        let cache = Arc::new(Cache::new(CacheLimits::new(
+            16 * 1024 * 1024,
+            1024,
+            1024 * 1024,
+        )));
+        let warns: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let events = EventCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(WarnEventCapture(warns.clone()))
+            .with(events.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // A one-byte ceiling: no part's probe fits, so no read starts.
+        warm_cache(
+            dyn_store.clone(),
+            catalog_for(dyn_store),
+            ReadCache::Ram(cache.clone()),
+            &FixedClock(now),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            crate::cpu_gates::CpuGates::new(Default::default()).read,
+            LogsMetadataWarm::new(&split_engine(), METADATA_CACHE_SHARE_DIVISOR),
+        )
+        .await;
+
+        assert_eq!(
+            store.ranges(&key),
+            Vec::<GetRange>::new(),
+            "the pass started no read of the part above the bound"
+        );
+        assert!(
+            warns.lock().is_empty(),
+            "a pass its ceiling stopped before any read produces no warn: {:?}",
+            warns.lock()
+        );
+        let info = events.events("cache warmup: warmed tenant logs metadata");
+        assert_eq!(info.len(), 1, "one logs metadata info line: {info:?}");
+        assert_eq!(
+            field_values(&info[0], "metadata_objects_warmed"),
+            ["0"],
+            "{}",
+            info[0]
+        );
+        let complete = events.events(PASS_COMPLETE);
+        assert_eq!(complete.len(), 1, "one pass-complete line: {complete:?}");
+        assert_eq!(
+            field_values(&complete[0], "metadata_budget_reached"),
+            ["true"],
+            "{}",
+            complete[0]
+        );
+    }
+
+    /// Issue #4307 (review round 1): a logs part at or under the plan bound but
+    /// larger than a small configured `max_fetch_run_bytes` is warmed whole, and
+    /// the query path's own fetcher, built with the same settings and sharing
+    /// the cache, then reads it with no store GET. The whole-part warm must
+    /// apply the query path's `max_fetch_run_bytes`, which sets the extent
+    /// `covering_read` splits a whole read into; without it the part is cached
+    /// under one whole extent the query path, splitting on the small bound,
+    /// never asks for. Seen failing against the head (the whole-part fetcher
+    /// built without the bound): the query read issues store GETs.
+    #[tokio::test(start_paused = true)]
+    async fn a_part_under_the_bound_warms_under_the_query_path_s_fetch_extent() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const MAX_FETCH_RUN_BYTES: u64 = 50_000;
+
+        let memory = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let now = now_ns();
+        let at = now - NS_PER_MIN;
+        // One logs part at or under the 100 KiB split plan bound but larger than
+        // MAX_FETCH_RUN_BYTES, so covering_read splits its whole read into more
+        // than one extent.
+        publish_log_segment_sized(&memory, tenant, at, at / NS_PER_HOUR, [1; 32], 60_000).await;
+
+        let store = Arc::new(RecordsGets::new(memory, Duration::from_secs(0)));
+        let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
+        let (parts, _) =
+            most_recent_parts(&catalog_for(dyn_store.clone()), tenant, Signal::Logs, now).await;
+        assert_eq!(parts.len(), 1);
+        let part = parts[0].clone();
+        assert!(
+            part.object_size > MAX_FETCH_RUN_BYTES && part.object_size <= SPLIT_PLAN_BOUND,
+            "the part is at or under the plan bound and larger than one fetch run: {} vs ({}, {}]",
+            part.object_size,
+            MAX_FETCH_RUN_BYTES,
+            SPLIT_PLAN_BOUND
+        );
+        let engine = EngineConfig {
+            logs_block_range_threshold: SPLIT_PLAN_BOUND,
+            logs_projection_break_even_bytes: Some(SPLIT_PLAN_BOUND),
+            logs_max_fetch_run_bytes: MAX_FETCH_RUN_BYTES,
+            ..EngineConfig::default()
+        };
+        let shape = LogsMetadataWarm::new(&engine, 16 * 1024 * 1024);
+        let cache = Arc::new(Cache::new(CacheLimits::new(
+            16 * 1024 * 1024,
+            1024,
+            1024 * 1024,
+        )));
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        warm_cache_within(
+            Duration::from_secs(30),
+            dyn_store.clone(),
+            catalog_for(dyn_store.clone()),
+            ReadCache::Ram(cache.clone()),
+            &FixedClock(now),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            crate::cpu_gates::CpuGates::new(Default::default()).read,
+            shape,
+        )
+        .await;
+
+        let complete = capture.events(PASS_COMPLETE);
+        assert_eq!(complete.len(), 1, "one pass-complete line: {complete:?}");
+        assert_eq!(
+            field_values(&complete[0], "parts_warmed"),
+            ["1"],
+            "the part at or under the bound is warmed whole: {}",
+            complete[0]
+        );
+
+        // The query path's own logs fetcher, same settings and same cache, reads
+        // the warmed part. Every store GET it issues is recorded; a warm under
+        // the query path's extent keys means zero.
+        store.clear();
+        let query_fetcher = LogSegmentFetcher::new(dyn_store)
+            .with_block_range_threshold(engine.logs_block_range_threshold)
+            .with_request_cost_bytes(engine.logs_request_cost_bytes)
+            .with_projection_break_even_bytes(engine.logs_projection_break_even_bytes)
+            .with_max_fetch_run_bytes(engine.logs_max_fetch_run_bytes)
+            .expect("nonzero fetch bound")
+            .with_cache(ReadCache::Ram(cache));
+        let query = LogQuery::new(part.min_event_ts_ns, part.max_event_ts_ns);
+        query_fetcher
+            .fetch_accounted_with_tenant(&part, tenant, &query, &warm_accounting())
+            .await
+            .expect("read the warmed part");
+        assert_eq!(
+            store.ranges(&part.data_object_key),
+            Vec::<GetRange>::new(),
+            "the query path reads the warmed part entirely from the cache, no store GET"
+        );
     }
 }

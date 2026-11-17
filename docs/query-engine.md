@@ -7458,8 +7458,13 @@ before the 4-part cap, and counted in `parts_above_plan_bound`; the cap then
 takes the most recent parts at or under the bound, and a part at or under the
 bound past the cap is counted in `parts_beyond_cap` and warmed by neither
 step. The whole-part warm's logs fetcher is built with the same block-range
-threshold, request cost and projection break-even as the metadata pass, so the
-two steps agree on the bound and never both read one logs part. When the
+threshold, request cost, projection break-even and fetch bound
+(`max_fetch_run_bytes`) as the metadata pass, so the two steps agree on the
+bound, warm a part at or under it under the same extent keys the query path's
+`covering_read` later asks for, and never both read one logs part. (Without the
+fetch bound, a part at or under the bound but larger than it would be warmed
+under one whole extent, while the query path, splitting the read on the bound,
+reads it under smaller sub-range extents and misses the cache.) When the
 metadata pass does not run (its fetcher refuses the configured fetch bound), a
 logs part above the bound gets no warm at all, and the warm-up logs one
 `warn!` per pass saying so. The metric side is unchanged: a metric part above
@@ -7559,9 +7564,13 @@ deadline fires first, the deadline warning reports `parts_warmed`,
 `whole_part_bytes_reserved`, the bytes the whole-part warm holds against its
 share. Each per-(tenant, signal) `cache warmup: warmed tenant signal` line
 reports `parts_over_budget`, the parts skipped because they did not fit that
-share. When the pass runs, a
-`cache warmup: warmed tenant logs metadata` line reports the first two for
-each tenant that has an object above the bound.
+share. When the pass runs, each tenant that has an object above the bound gets
+one of two lines: a `warn!` when the pass started at least one read for it and
+every one failed, or otherwise `cache warmup: warmed tenant logs metadata` at
+`info!`, reporting the first two. The `warn!` (`cache warmup: tenant has logs
+parts above the plan bound but the metadata pass warmed none`) exists because
+the per-(tenant, signal) line stays at `info!` for parts above the bound and
+the per-read failures are logged only at `debug!`.
 
 `services/ravel-server/tests/cache_warm_footers_e2e.rs` pins this on a
 restarted server. Over six objects whose directories fit in the probe
