@@ -113,6 +113,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use bytes::Bytes;
 use ravel_catalog::{
     erasure_dominated_compaction_records, select_authoritative_compaction_records,
 };
@@ -1814,6 +1815,11 @@ async fn sweep_superseded_impl(
     let mut deletes_succeeded = 0usize;
     let mut data_bytes = 0u64;
     let mut first_refusal: Option<StoreError> = None;
+    // Per cleared group, whether a fresh HEAD read names one of its objects:
+    // read once, before the group's first delete, by the assertion below,
+    // which compiles out of a default build.
+    #[allow(unused_mut, unused_variables)]
+    let mut head_names_group: Vec<Option<bool>> = vec![None; cleared.len()];
     for delete_loop in [
         DeleteLoop::InputRecords,
         DeleteLoop::Data,
@@ -1829,23 +1835,30 @@ async fn sweep_superseded_impl(
                     continue;
                 }
                 if !config.dry_run {
-                    // The HEAD as it stands now, read afresh, not the one the
-                    // gate above planned from. A HEAD that cannot be read
-                    // here proves nothing either way.
+                    // The HEAD as it stands at the group's first delete, read
+                    // afresh, not the one the gate above planned from. A HEAD
+                    // that cannot be read then proves nothing either way.
                     ravel_invariant::inv_always!(
-                        !matches!(
-                            SnapshotReachability::new()
-                                .with_read_gate(config.read_gate.clone())
-                                .object_gate(
-                                    store,
-                                    tenant,
-                                    signal,
-                                    group.ingest_hour_bucket,
-                                    &group.objects,
-                                )
-                                .await,
-                            Ok(SnapshotGate::Blocked(SnapshotBlock::Named))
-                        ),
+                        !match head_names_group[index] {
+                            Some(named) => named,
+                            None => {
+                                let named = matches!(
+                                    SnapshotReachability::new()
+                                        .with_read_gate(config.read_gate.clone())
+                                        .object_gate(
+                                            store,
+                                            tenant,
+                                            signal,
+                                            group.ingest_hour_bucket,
+                                            &group.objects,
+                                        )
+                                        .await,
+                                    Ok(SnapshotGate::Blocked(SnapshotBlock::Named))
+                                );
+                                head_names_group[index] = Some(named);
+                                named
+                            }
+                        },
                         "catalog: a sweep never deletes an object the current HEAD names",
                         std::collections::BTreeMap::from([
                             ("key", k.clone()),
@@ -3781,8 +3794,14 @@ pub async fn sweep_unreferenced_catalog_objects(
     // no-anchor case: sweep nothing (finding 2), never the old "collect every
     // orphan" behavior, because a recovery fold rebuilding from no HEAD adopts
     // surviving old keys via `AlreadyExists` and is about to name them.
+    // Every HEAD read the deletes below rest on, kept for the fail-closed
+    // assertion to decode on its own.
+    let mut gate_heads: Vec<Bytes> = Vec::with_capacity(2);
     let referenced = match read_head_reference(store, tenant, signal).await? {
-        HeadReference::Present(set) => set,
+        HeadReference::Present { referenced, head } => {
+            gate_heads.push(head);
+            referenced
+        }
         HeadReference::Absent => {
             return Ok(CatalogSweepOutcome {
                 kept: listed.len(),
@@ -3821,7 +3840,10 @@ pub async fn sweep_unreferenced_catalog_objects(
     // no-anchor case -- spare everything rather than delete without a HEAD.
     if !candidates.is_empty() {
         let fresh = match read_head_reference(store, tenant, signal).await? {
-            HeadReference::Present(set) => set,
+            HeadReference::Present { referenced, head } => {
+                gate_heads.push(head);
+                referenced
+            }
             HeadReference::Absent => {
                 return Ok(CatalogSweepOutcome {
                     kept: kept + candidates.len(),
@@ -3846,14 +3868,13 @@ pub async fn sweep_unreferenced_catalog_objects(
     };
     for meta in &candidates {
         if !config.dry_run {
-            // Judged from a HEAD read here, not from the reference set: a HEAD
-            // that does not decode proves nothing unreferenced. An absent HEAD
-            // or a failed read is not a corrupt one.
+            // Judged from the bytes of the HEAD reads the pass decided from,
+            // decoded here, not from the reference set built from them. A
+            // HEAD corrupted after those reads does not bear on this delete.
             ravel_invariant::inv_always!(
-                !matches!(
-                    store.get(&catalog_head_key(tenant, signal), GetRange::Full).await,
-                    Ok(got) if ravel_catalog::decode_head(got.data.as_ref()).is_err()
-                ),
+                gate_heads
+                    .iter()
+                    .all(|head| ravel_catalog::decode_head(head.as_ref()).is_ok()),
                 "catalog: a catalog sweep never deletes under an unreadable HEAD",
                 std::collections::BTreeMap::from([
                     ("head_key", catalog_head_key(tenant, signal)),
@@ -3876,8 +3897,12 @@ enum HeadReference {
     /// HEAD is present and decoded: the set of keys it names (every
     /// `parts[].key`, the optional `postings.key`, each part's optional
     /// per-part column-statistics key `parts[].column_stats.key`, and each
-    /// part's key-index leaf keys `parts[].key_index[].key`).
-    Present(HashSet<String>),
+    /// part's key-index leaf keys `parts[].key_index[].key`), and the bytes
+    /// read.
+    Present {
+        referenced: HashSet<String>,
+        head: Bytes,
+    },
     /// HEAD is absent. There is no anchor to compare against, so rule 5 sweeps
     /// nothing for this (tenant, signal) (a fold rebuilding from no HEAD adopts
     /// surviving old keys and is about to name them).
@@ -3901,7 +3926,10 @@ async fn read_head_reference(
                 Err(_)
                     if ravel_invariant::inv_mutant!("catalog/corrupt-head-ignores-delete-gate") =>
                 {
-                    return Ok(HeadReference::Present(HashSet::new()));
+                    return Ok(HeadReference::Present {
+                        referenced: HashSet::new(),
+                        head: got.data,
+                    });
                 }
                 Err(e) => {
                     ravel_invariant::inv_reachable!(
@@ -3938,7 +3966,10 @@ async fn read_head_reference(
             if let Some(postings) = &head.postings {
                 referenced.insert(postings.key.clone());
             }
-            Ok(HeadReference::Present(referenced))
+            Ok(HeadReference::Present {
+                referenced,
+                head: got.data,
+            })
         }
         Err(StoreError::NotFound) => Ok(HeadReference::Absent),
         Err(e) => Err(MaintainError::Store(e)),
@@ -6997,12 +7028,15 @@ mod tests {
     /// A minimal store wrapper that installs a replacement HEAD just before the
     /// Nth GET of the HEAD key, simulating a concurrent fold's HEAD CAS landing
     /// between the sweep's first HEAD read and its pre-delete re-verify read.
-    /// Every other operation delegates straight to the inner [`MemoryStore`].
+    /// [`Self::after_the_get`] installs it just after that GET has read the
+    /// old HEAD instead. Every other operation delegates straight to the inner
+    /// [`MemoryStore`].
     struct HeadSwapStore {
         inner: MemoryStore,
         head_key: String,
         new_head: Bytes,
         swap_on_get: usize,
+        swap_after_get: bool,
         head_gets: std::sync::atomic::AtomicUsize,
     }
 
@@ -7013,7 +7047,15 @@ mod tests {
                 head_key,
                 new_head,
                 swap_on_get,
+                swap_after_get: false,
                 head_gets: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn after_the_get(self) -> Self {
+            HeadSwapStore {
+                swap_after_get: true,
+                ..self
             }
         }
 
@@ -7044,6 +7086,14 @@ mod tests {
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                     + 1;
                 if n == self.swap_on_get {
+                    if self.swap_after_get {
+                        let got = self.inner.get(key, range).await;
+                        self.inner
+                            .put(&self.head_key, self.new_head.clone(), PutOptions::default())
+                            .await
+                            .expect("install swapped HEAD");
+                        return got;
+                    }
                     // The fold's CAS lands: install the new HEAD that names the
                     // adopted-old object, immediately before the sweep's
                     // re-verify GET reads it.
@@ -7366,6 +7416,76 @@ mod tests {
             1,
             "the first HEAD read ends the pass: {refused:?}"
         );
+    }
+
+    /// The driver corrupts HEAD just after the pass's re-verify read: the
+    /// deletes rest on the two reads that decoded, so every evaluation holds,
+    /// and the pass reads HEAD no more than those two times.
+    #[tokio::test]
+    async fn a_head_corrupted_after_the_gate_reads_does_not_fail_the_catalog_sweep() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let tenant = TenantHash([0x64; 16]);
+        let signal = Signal::Metrics;
+        let inner = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let orphans: Vec<String> = ["dddd", "ffff"]
+            .iter()
+            .map(|id| {
+                format!(
+                    "{}20251231T00.{id}.csnap",
+                    catalog_snap_prefix(&tenant, signal)
+                )
+            })
+            .collect();
+        for orphan in &orphans {
+            put_catalog_object(&inner, orphan).await;
+        }
+        let named = format!(
+            "{}20251231T00.eeee.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_head(
+            &inner,
+            &tenant,
+            signal,
+            vec![part_ref(&named, [0; 32])],
+            None,
+        )
+        .await;
+        let head_key = catalog_head_key(&tenant, signal);
+        let store = HeadSwapStore::new(
+            inner,
+            head_key.clone(),
+            Bytes::from_static(b"not a valid HEAD"),
+            2,
+        )
+        .after_the_get();
+        let clock = FixedClock::new(config.protection_horizon_ns.saturating_mul(2));
+
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("the pass decided from two HEADs that decoded");
+
+        assert_eq!(outcome.deleted, 2);
+        assert_eq!(store.head_get_count(), 2, "no HEAD read per delete");
+        let stored = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("HEAD")
+            .data;
+        assert!(
+            ravel_catalog::decode_head(stored.as_ref()).is_err(),
+            "the corruption landed before the deletes"
+        );
+        for orphan in &orphans {
+            assert!(!present(&store, orphan).await);
+            let found = crate::publish::tests::evaluations(CATALOG_SWEEP_FAILS_CLOSED, orphan);
+            assert_eq!(found.len(), 1, "one evaluation per delete: {found:?}");
+            assert!(found[0].0, "{found:?}");
+        }
     }
 
     /// A compaction record stamped a future `format_version` in a bucket is
@@ -7806,13 +7926,24 @@ mod tests {
             return;
         }
         let hash = [0x52; 32];
-        let store = MemoryStore::new();
-        let (record_key, part_keys) = put_sized_part_chain_at(&store, hash).await;
-        put_head_naming(&store, chain_hour_entry(vec![0xEE; 16])).await;
+        let inner = MemoryStore::new();
+        let (record_key, part_keys) = put_sized_part_chain_at(&inner, hash).await;
+        put_head_naming(&inner, chain_hour_entry(vec![0xEE; 16])).await;
+        let store = HeadSwapStore::new(
+            inner,
+            catalog_head_key(&tenant(), Signal::Logs),
+            Bytes::new(),
+            usize::MAX,
+        );
 
         let (outcome, _) = sized_chain_pass(&store).await.expect("pass");
 
         assert_eq!((outcome.data_deleted, outcome.records_deleted), (2, 1));
+        assert_eq!(
+            store.head_get_count(),
+            2,
+            "the pass's own HEAD read, then one re-read for the one group, not one per key"
+        );
         for key in part_keys.iter().chain([&record_key]) {
             assert!(!present(&store, key).await, "{key} deleted");
             let found = crate::publish::tests::evaluations(HEAD_NAMED_NEVER_DELETED, key);

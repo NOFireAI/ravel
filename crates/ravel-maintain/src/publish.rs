@@ -128,7 +128,7 @@ pub async fn publish_record_with_conservation(
     start_ns: i64,
     conservation: impl ConservationPredicate,
 ) -> Result<PublishOutcome> {
-    let identities: Vec<CompactionInputIdentity> = inputs
+    let mut identities: Vec<CompactionInputIdentity> = inputs
         .iter()
         .map(|i| CompactionInputIdentity {
             writer_id: i.record.writer_id.clone(),
@@ -136,6 +136,9 @@ pub async fn publish_record_with_conservation(
             writer_seq: i.record.writer_seq,
         })
         .collect();
+    if ravel_invariant::inv_mutant!("catalog/compaction-swaps-record") {
+        swap_one_identity(&mut identities);
+    }
     publish_compaction_record(
         store,
         config,
@@ -383,6 +386,21 @@ async fn verify_already_existed_parts(
     Ok(())
 }
 
+/// The `catalog/compaction-swaps-record` mutant: the last identity becomes one
+/// no input carries, under the same writer. The identity count and every
+/// sample count are unchanged, so the counts-only conservation gate passes.
+fn swap_one_identity(identities: &mut [CompactionInputIdentity]) {
+    let spare_seq = identities
+        .iter()
+        .map(|i| i.writer_seq)
+        .max()
+        .unwrap_or(0)
+        .wrapping_add(1);
+    if let Some(last) = identities.last_mut() {
+        last.writer_seq = spare_seq;
+    }
+}
+
 /// Sum `sample_count`s in u64 with checked addition; an overflowing sum is
 /// itself an invariant breach (real buckets are nowhere near 2^64 records),
 /// never a silent wrap that could fake or mask a conservation mismatch.
@@ -417,7 +435,7 @@ async fn resolve_already_exists(
     let existing = store.get(record_key, GetRange::Full).await;
     note_get(ledger, RequestPhase::Publish, &existing);
     let existing = existing?;
-    if ravel_invariant::inv_mutant!("catalog/compaction-swaps-record") {
+    if ravel_invariant::inv_mutant!("catalog/compaction-loser-overwrites") {
         store
             .put(record_key, our_payload.clone(), PutOptions::default())
             .await?;
@@ -845,8 +863,8 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn mutant_compaction_swaps_record_breaks_conservation() {
-        let Some(_mutant) = scoped_mutant("catalog/compaction-swaps-record") else {
+    async fn mutant_compaction_loser_overwrites_breaks_record_immutable() {
+        let Some(_mutant) = scoped_mutant("catalog/compaction-loser-overwrites") else {
             return;
         };
         let hash = [0x41; 32];
@@ -882,6 +900,65 @@ pub(crate) mod tests {
         assert!(found[0].0, "{found:?}");
         let published = evaluations("catalog: compaction record published", "");
         assert!(!published.is_empty());
+    }
+
+    /// Publishes inputs of 10 and 7 records as parts of 12 and 5 and returns
+    /// the inputs' identities with the published record.
+    async fn publish_and_read_record() -> (Vec<CompactionInputIdentity>, CompactionRecord) {
+        let store = MemoryStore::new();
+        let bucket = bucket(Signal::Metrics);
+        let inputs = vec![input(1, 10, &bucket), input(2, 7, &bucket)];
+        let outcome = publish(&store, &bucket, &inputs, &[part(0, 12), part(1, 5)])
+            .await
+            .expect("publish");
+        assert_eq!(outcome, PublishOutcome::Published);
+        let listed = list_all(&store, "").await.expect("list");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        let record = ravel_commit::record::decode_compaction(
+            &store
+                .get(&listed[0].key, GetRange::Full)
+                .await
+                .expect("record")
+                .data,
+        )
+        .expect("decode");
+        let identities = inputs
+            .iter()
+            .map(|i| CompactionInputIdentity {
+                writer_id: i.record.writer_id.clone(),
+                writer_epoch: i.record.writer_epoch,
+                writer_seq: i.record.writer_seq,
+            })
+            .collect();
+        (identities, record)
+    }
+
+    #[tokio::test]
+    async fn a_published_record_names_exactly_its_inputs() {
+        let (identities, record) = publish_and_read_record().await;
+        assert_eq!(record.inputs, identities);
+    }
+
+    /// The mutant passes the counts-only gate: the record names as many
+    /// identities as there are inputs and its parts carry the inputs' 17
+    /// records, but one identity is not an input's. The property it breaks,
+    /// that compaction preserves the acked multiset, is the
+    /// catalog-maintenance driver's.
+    #[tokio::test]
+    async fn mutant_compaction_swaps_record_keeps_counts_and_changes_identities() {
+        let Some(_mutant) = scoped_mutant("catalog/compaction-swaps-record") else {
+            return;
+        };
+        let (identities, record) = publish_and_read_record().await;
+        assert_eq!(record.inputs.len(), identities.len());
+        assert_eq!(record.parts.iter().map(|p| p.sample_count).sum::<u64>(), 17);
+        assert_eq!(record.inputs[0], identities[0]);
+        assert_ne!(record.inputs[1], identities[1]);
+        assert!(
+            !identities.contains(&record.inputs[1]),
+            "{:?} is no input's identity",
+            record.inputs[1]
+        );
     }
 
     proptest! {

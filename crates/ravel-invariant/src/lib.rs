@@ -352,6 +352,7 @@ pub mod mutant {
         "commit/marker-before-all-shards",
         "catalog/lost-cas-proceeds",
         "catalog/compaction-swaps-record",
+        "catalog/compaction-loser-overwrites",
         "catalog/sweep-superseded-no-head-gate",
         "catalog/corrupt-head-ignores-delete-gate",
         "lifecycle/refresh-failure-is-no-hold",

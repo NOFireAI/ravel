@@ -6148,19 +6148,24 @@ impl Catalog {
                     }
                 }
                 Ok(_) | Err(StoreError::PreconditionFailed) | Err(StoreError::AlreadyExists) => {
-                    // The store refused the CAS only under the mutant; then
-                    // the HEAD the store holds decides, read back here.
+                    // Judged from HEAD read back here. After an acked CAS the
+                    // stored watermark is at least ours, since a later fold
+                    // only raises it; a refused CAS, reached only under the
+                    // mutant, holds only if the store holds this very HEAD.
+                    // A HEAD that does not decode (the driver corrupts it),
+                    // an acked HEAD that is gone, or a failed read cannot
+                    // tell.
                     ravel_invariant::inv_always!(
-                        cas_acked
-                            || match self.store().get(&head_key, GetRange::Full).await {
-                                Ok(got) => snapshot_format::decode_head(&got.data)
-                                    .ok()
-                                    .and_then(|stored| canonical_head_digest(&stored).ok())
-                                    .is_some_and(|stored| stored == head_digest),
-                                Err(StoreError::NotFound) => false,
-                                // A failed read cannot tell.
+                        match self.store().get(&head_key, GetRange::Full).await {
+                            Ok(got) => match snapshot_format::decode_head(&got.data) {
+                                Ok(stored) if cas_acked => stored.watermark_hour >= watermark_hour,
+                                Ok(stored) => canonical_head_digest(&stored)
+                                    .is_ok_and(|stored| stored == head_digest),
                                 Err(_) => true,
                             },
+                            Err(StoreError::NotFound) => cas_acked,
+                            Err(_) => true,
+                        },
                         "catalog: a fold reports as folded only a HEAD the store holds",
                         std::collections::BTreeMap::from([
                             ("head_key", head_key.clone()),
@@ -12313,7 +12318,14 @@ pub(crate) mod tests {
 
             assert!(!report.no_op);
             assert!(report.rebuilt);
-            (report.get_requests, after.get.calls - before.get.calls)
+            // Where assertions are evaluated, the folded-HEAD property re-reads
+            // HEAD once after the CAS; that GET is the instrumentation's, not
+            // the fold's, so the report leaves it out.
+            let instrumentation = u64::from(capturing());
+            (
+                report.get_requests,
+                after.get.calls - before.get.calls - instrumentation,
+            )
         }
 
         // Enforcement off: the report must equal the store's real GET count.
@@ -13459,6 +13471,137 @@ pub(crate) mod tests {
             let hash = <[u8; 32]>::try_from(seg.content_hash.as_slice()).expect("32-byte hash");
             assert!(hashes.contains(&hash), "HEAD names every folded commit");
         }
+    }
+
+    /// Acknowledges the next HEAD PUT after [`Self::arm`] without applying
+    /// it, the store fault a predicate of the CAS result alone cannot see.
+    /// Every other call delegates.
+    struct AckWithoutApplyStore {
+        inner: Arc<MemoryStore>,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl AckWithoutApplyStore {
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for AckWithoutApplyStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            if key.contains("HEAD") && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Ok(ravel_object_store::PutOutcome {
+                    etag: ravel_object_store::Etag("dropped".to_string()),
+                    version: ravel_object_store::Version("dropped".to_string()),
+                });
+            }
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A HEAD CAS the store acknowledges but never applies leaves the stored
+    /// HEAD one hour behind the fold's report: the property, judged from the
+    /// re-read rather than from the acknowledgement, is false.
+    #[tokio::test]
+    async fn an_acked_head_cas_the_store_did_not_apply_breaks_no_live_commit_omitted() {
+        if !capturing() {
+            return;
+        }
+        let inner = Arc::new(MemoryStore::new());
+        let store = Arc::new(AckWithoutApplyStore {
+            inner: inner.clone(),
+            armed: Default::default(),
+        });
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        for hour in [10, 11] {
+            publish_segment(
+                &inner,
+                0,
+                Uuid::new_v4(),
+                1,
+                hour,
+                now_at_seal(hour) - NS_PER_HOUR,
+            )
+            .await;
+        }
+        let applied = Uuid::new_v4();
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                applied,
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("the first fold creates HEAD");
+        let found = evaluations(FOLDED_HEAD_HELD, &applied.to_string());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].0, "an applied CAS holds: {found:?}");
+
+        store.arm();
+        let dropped = Uuid::new_v4();
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                dropped,
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect("the fold believes the acknowledgement");
+        assert_eq!(report.watermark_hour, Some(11));
+        assert_eq!(read_head(inner.as_ref()).await.watermark_hour, 10);
+        let found = evaluations(FOLDED_HEAD_HELD, &dropped.to_string());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            !found[0].0,
+            "the stored HEAD is behind the reported fold: {found:?}"
+        );
     }
 
     /// Regression for issue #587: a fold used to skip postings entirely the
