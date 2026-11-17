@@ -25,6 +25,7 @@ import argparse
 import ast
 import json
 import os
+import random
 import re
 import shlex
 import select
@@ -935,6 +936,38 @@ def fresh_main():
     return sha.strip()
 
 
+def resolve_dispatch_ref(ref):
+    """The commit `--ref <ref>` names, read from a fetch destination unique
+    to this process rather than FETCH_HEAD (issue #4079): FETCH_HEAD is
+    shared by every git command in the checkout, so a concurrent fetch
+    landing between the fetch below and a `rev-parse FETCH_HEAD` can resolve
+    to someone else's ref. Also refuses a resolved commit that is already
+    behind origin's current tip for `ref`, naming both commits."""
+    dest_ref = f"refs/agent-cli/fetch/dispatch-{os.getpid()}-{random.getrandbits(32):08x}"
+    try:
+        run(["git", "fetch", "-q", "origin", f"+{ref}:{dest_ref}"], check=True)
+        _, ref_sha, _ = run(["git", "rev-parse", dest_ref], check=True)
+        ref_sha = ref_sha.strip()
+        rc, ls_out, ls_err = run(["git", "ls-remote", "origin", ref])
+        if rc != 0:
+            raise CliError(f"git ls-remote origin {ref} failed rc={rc}: {last_line(ls_err or ls_out)}")
+        # `git ls-remote origin <ref>` prints one "<sha>\t<name>" line per
+        # matching remote ref, and nothing when <ref> is a raw commit id that
+        # names no ref at all; only that empty case skips the tip check below.
+        pairs = [tuple(line.split("\t", 1)) for line in ls_out.splitlines() if line.strip()]
+        if not pairs:
+            print(f"--ref {ref} names no remote ref (looks like a commit id); skipping the tip check")
+            return ref_sha
+        by_name = {name: sha for sha, name in pairs}
+        remote_tip = by_name.get(f"refs/heads/{ref}") or by_name.get(ref) or pairs[0][0]
+        if remote_tip != ref_sha:
+            raise CliError(f"--ref {ref} resolved to {ref_sha} but origin's tip is now "
+                           f"{remote_tip}; refusing a dispatch that may race a concurrent push", 2)
+        return ref_sha
+    finally:
+        run(["git", "update-ref", "-d", dest_ref])
+
+
 GATE_TIERS = ("executor", "merge", "script-only")
 SPEC_HEAD = {"gate_tier": lambda v: v in GATE_TIERS,
              "disk_floor_gb": lambda v: re.fullmatch(r"[1-9][0-9]*", v) is not None}
@@ -1079,9 +1112,7 @@ def cmd_dispatch(a):
     ref_sha = fresh_main()
     env = {}
     if a.ref:
-        run(["git", "fetch", "-q", "origin", a.ref], check=True)
-        _, ref_sha, _ = run(["git", "rev-parse", "FETCH_HEAD"], check=True)
-        ref_sha = ref_sha.strip()
+        ref_sha = resolve_dispatch_ref(a.ref)
         # The intent records the ref actually dispatched; a deliberately older
         # ref (a result or PR branch) passes the fresh-ref guard by name.
         env["ALLOW_STALE_REF"] = "1"

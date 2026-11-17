@@ -648,6 +648,208 @@ esac
         self.assertEqual(len(self.mcp_calls), 1)
 
 
+class DispatchRefResolution(unittest.TestCase):
+    """cmd_dispatch --ref must resolve the commit from its own fetch
+    destination, never from FETCH_HEAD (issue #4079): FETCH_HEAD is shared
+    by every git command in the checkout, so a fetch that lands between the
+    dispatch's own fetch and a `rev-parse FETCH_HEAD` resolves to whatever
+    that other fetch named. Builds a real temporary origin with two
+    branches and a real clone, and runs cmd_dispatch's git calls for real
+    against that clone (cwd pinned there, regardless of the cwd the call
+    receives) while stubbing the intent script, the orchestrator, and the
+    MCP call so nothing is actually dispatched."""
+
+    REF = "feature-a"
+    OTHER_REF = "feature-b"
+
+    GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+
+    def _run_git(self, cwd, *args, check=True):
+        return subprocess.run(["git", *args], cwd=cwd, check=check,
+                               capture_output=True, text=True,
+                               env={**os.environ, **self.GIT_ENV})
+
+    def _commit(self, cwd, name, content):
+        (pathlib.Path(cwd) / name).write_text(content)
+        self._run_git(cwd, "add", "-A")
+        self._run_git(cwd, "commit", "-q", "-m", f"{name}={content}")
+        return self._run_git(cwd, "rev-parse", "HEAD").stdout.strip()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = pathlib.Path(self.tmp.name)
+        self.origin = str(root / "origin")
+        self.clone_dir = str(root / "clone")
+        self.pusher_dir = str(root / "pusher")
+
+        os.makedirs(self.origin)
+        self._run_git(self.origin, "init", "-q", "-b", "main")
+        self.commit_main = self._commit(self.origin, "root.txt", "root")
+        self._run_git(self.origin, "checkout", "-qb", self.REF)
+        self.commit_a = self._commit(self.origin, "a.txt", "A1")
+        self._run_git(self.origin, "checkout", "-qb", self.OTHER_REF, self.commit_main)
+        self.commit_b = self._commit(self.origin, "b.txt", "B1")
+        self._run_git(self.origin, "checkout", "-q", "main")
+
+        self._run_git(str(root), "clone", "-q", self.origin, self.clone_dir)
+        self._run_git(str(root), "clone", "-q", self.origin, self.pusher_dir)
+
+        self.calls = []
+        self.intent_calls = []
+        self.mcp_calls = []
+        self.dest_refs = []
+        self.real_run = cli.run
+        self.fetched_the_ref = False
+        # Set per test: (cmd, real_run) -> (rc, out, err). Matched on *any*
+        # "git fetch" naming self.REF, not on the new implementation's exact
+        # refspec shape, so the hook also fires (and the race/failure it
+        # injects actually lands) against the unfixed `git fetch -q origin
+        # <ref>` plus `rev-parse FETCH_HEAD` form.
+        self.on_ref_fetch = None
+
+        def fake_run(cmd, cwd=None, env=None, stdin=None, check=False):
+            self.calls.append(list(cmd))
+            if cmd and cmd[0] == "git":
+                if (self.on_ref_fetch is not None and cmd[:2] == ["git", "fetch"]
+                        and any(self.REF in part for part in cmd[2:]) and not self.fetched_the_ref):
+                    self.fetched_the_ref = True
+                    dest_ref = None
+                    for part in cmd[2:]:
+                        if self.REF in part and ":" in part:
+                            dest_ref = part.split(":", 1)[1]
+                    self.dest_refs.append(dest_ref)
+                    rc, out, err = self.on_ref_fetch(cmd, self.real_run)
+                    if check and rc != 0:
+                        raise cli.CliError(f"{' '.join(cmd[:3])} failed rc={rc}: "
+                                           f"{(err or out).strip()}")
+                    return rc, out, err
+                return self.real_run(cmd, cwd=self.clone_dir, env=env, stdin=stdin, check=check)
+            if cmd[0] == "scripts/epic-orchestrator.sh":
+                return 0, "", ""
+            if cmd[:2] == ["scripts/fleet-dispatch-intent.sh", "intent"]:
+                self.intent_calls.append(list(cmd))
+                return 0, "nonce-1\n", ""
+            if cmd[:2] == ["scripts/fleet-dispatch-intent.sh", "record"]:
+                return 0, "", ""
+            return 0, "", ""
+
+        def fake_mcp(tool, arguments, timeout=300):
+            self.mcp_calls.append((tool, arguments))
+            return f"Dispatched task {TASK_ID}"
+
+        saved = {"run": cli.run, "mcp_call": cli.mcp_call, "fresh_main": cli.fresh_main}
+        cli.run, cli.mcp_call, cli.fresh_main = fake_run, fake_mcp, lambda: "a" * 40
+
+        def restore():
+            for k, v in saved.items():
+                setattr(cli, k, v)
+
+        self.addCleanup(restore)
+
+    def dispatch(self):
+        self.fetched_the_ref = False
+        path = pathlib.Path(self.tmp.name) / "spec.txt"
+        path.write_text("Do the thing.\n" + SPEC_HEAD)
+        return capture_main(["dispatch", "--epic", "4034", "--ticket", "4043",
+                             "--spec", str(path), "--ref", self.REF])
+
+    def _ref_exists(self, ref):
+        return subprocess.run(["git", "show-ref", "--verify", "--quiet", ref],
+                              cwd=self.clone_dir).returncode == 0
+
+    def test_resolves_from_its_own_destination_not_fetch_head(self):
+        # Simulate a second session fetching feature-b in this same checkout
+        # between our fetch and the moment the resolved commit is read: a
+        # `rev-parse FETCH_HEAD` done at that point would read feature-b's
+        # commit, not feature-a's.
+        def race(cmd, real_run):
+            rc, out, err = real_run(cmd, cwd=self.clone_dir, check=False)
+            real_run(["git", "fetch", "-q", "origin", self.OTHER_REF],
+                     cwd=self.clone_dir, check=True)
+            return rc, out, err
+
+        self.on_ref_fetch = race
+        rc, out, err = self.dispatch()
+        # FLIP: a resolve_dispatch_ref that reads `git rev-parse FETCH_HEAD`
+        # after the fetch, instead of the destination ref this fetch just
+        # wrote, resolves to commit_b here and fails this assertion.
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(len(self.mcp_calls), 1)
+        self.assertEqual(self.mcp_calls[0][1]["ref"], self.commit_a)
+        self.assertNotEqual(self.mcp_calls[0][1]["ref"], self.commit_b)
+
+    def test_refuses_when_origin_tip_moved_past_the_resolved_commit(self):
+        # A concurrent push lands on feature-a after our fetch resolved it,
+        # before the tip check reads origin's current state.
+        def advance(cmd, real_run):
+            rc, out, err = real_run(cmd, cwd=self.clone_dir, check=False)
+            self._run_git(self.pusher_dir, "checkout", "-qB", self.REF, f"origin/{self.REF}")
+            new_sha = self._commit(self.pusher_dir, "a2.txt", "A2")
+            self._run_git(self.pusher_dir, "push", "-q", "origin", self.REF)
+            self.new_tip = new_sha
+            return rc, out, err
+
+        self.on_ref_fetch = advance
+        rc, out, err = self.dispatch()
+        # FLIP: a check that compares the resolved commit against anything
+        # other than a freshly read remote tip (a cached value, the clone's
+        # stale remote-tracking ref) never sees the race and dispatches the
+        # now-stale commit_a.
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn(self.commit_a, err)
+        self.assertIn(self.new_tip, err)
+        self.assertEqual((self.intent_calls, self.mcp_calls), ([], []))
+
+    def test_destination_ref_is_unique_per_call_and_gone_after_each_run(self):
+        def plain(cmd, real_run):
+            return real_run(cmd, cwd=self.clone_dir, check=False)
+
+        self.on_ref_fetch = plain
+        rc, out, err = self.dispatch()
+        self.assertEqual(rc, 0, out + err)
+        first_dest = self.dest_refs[-1]
+        # FLIP: a fix that fetches into one fixed shared destination (e.g.
+        # "refs/agent-cli/dispatch") races two concurrent runs against each
+        # other exactly as FETCH_HEAD did; a name containing this process's
+        # own pid, and a second call drawing a different name, catch it.
+        self.assertIsNotNone(first_dest, "fetch used no destination ref (reads FETCH_HEAD?)")
+        self.assertIn(str(os.getpid()), first_dest)
+        self.assertFalse(self._ref_exists(first_dest), "destination ref left behind after success")
+
+        def advance(cmd, real_run):
+            rc, out, err = real_run(cmd, cwd=self.clone_dir, check=False)
+            self._run_git(self.pusher_dir, "checkout", "-qB", self.REF, f"origin/{self.REF}")
+            self._commit(self.pusher_dir, "a3.txt", "A3")
+            self._run_git(self.pusher_dir, "push", "-q", "origin", self.REF)
+            return rc, out, err
+
+        self.on_ref_fetch = advance
+        rc, out, err = self.dispatch()
+        self.assertEqual(rc, 2, out + err)
+        second_dest = self.dest_refs[-1]
+        self.assertIsNotNone(second_dest, "fetch used no destination ref (reads FETCH_HEAD?)")
+        self.assertNotEqual(first_dest, second_dest)
+        self.assertFalse(self._ref_exists(second_dest), "destination ref left behind after refusal")
+
+    def test_does_not_fall_back_to_fetch_head_when_the_destination_fetch_fails(self):
+        # Pre-seed FETCH_HEAD with feature-b's commit, then make the fetch
+        # into our own destination fail outright (no ref ever created).
+        def fail(cmd, real_run):
+            real_run(["git", "fetch", "-q", "origin", self.OTHER_REF],
+                     cwd=self.clone_dir, check=True)
+            return 1, "", "simulated fetch failure"
+
+        self.on_ref_fetch = fail
+        rc, out, err = self.dispatch()
+        # FLIP: a resolve_dispatch_ref that catches the fetch failure and
+        # falls back to `git rev-parse FETCH_HEAD` resolves to commit_b
+        # (pre-seeded above) and dispatches it with rc=0.
+        self.assertEqual(rc, 2, out + err)
+        self.assertEqual((self.intent_calls, self.mcp_calls), ([], []))
+
+
 class Task(unittest.TestCase):
     """cmd_task against a stubbed cp_task: no control plane is reached."""
 

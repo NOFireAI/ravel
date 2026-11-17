@@ -10,6 +10,7 @@
 set -uo pipefail
 
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/fleet-result-merge.sh"
+INSPECT_SCRIPT="$(dirname "${SCRIPT}")/fleet-result-inspect.sh"
 # shellcheck source=../fleet-result-merge.sh
 source "${SCRIPT}"
 # The merge script turns on errexit for its own main body. Cases below capture
@@ -22,6 +23,25 @@ if [[ ! -d "${tmproot}" ]]; then
   exit 1
 fi
 trap 'rm -rf "${tmproot}"' EXIT
+
+# A git shim for the FETCH_HEAD race cases below (issue #4079): the real race
+# is a concurrent fetch landing, in another process, in the window between
+# "fetch the result ref" and "read what was fetched". This shim reproduces
+# that window deterministically: any "git rev-parse FETCH_HEAD" call first
+# runs a fetch of another ref (clobbering FETCH_HEAD), then answers for real.
+# A script reading its own destination ref instead of FETCH_HEAD never
+# triggers the clobber and is unaffected.
+real_git="$(command -v git)"
+shim_bin="${tmproot}/shim-bin"
+mkdir -p "${shim_bin}"
+cat >"${shim_bin}/git" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "rev-parse" && "\$2" == "FETCH_HEAD" ]]; then
+  "${real_git}" fetch -q origin main >/dev/null 2>&1 || true
+fi
+exec "${real_git}" "\$@"
+EOF
+chmod +x "${shim_bin}/git"
 
 pass=0
 fail=0
@@ -334,10 +354,11 @@ merge_run() {
   git -C "${dir}/work" checkout -q main
   git -C "${dir}/work" branch -q -D result
   : >"${dir}/calls.log"
+  local extra_path="${5:-}"
   e2e_rc=0
   (
     cd "${dir}/work" || exit 1
-    PATH="${e2e_tools}/bin:${PATH}" E2E_LOG="${dir}/calls.log" \
+    PATH="${extra_path:+${extra_path}:}${e2e_tools}/bin:${PATH}" E2E_LOG="${dir}/calls.log" \
       SHAPE_STUB_RC="$2" ALLOW_STALE_SHAPE_SITES="${3:-}" \
       bash "${e2e_tools}/scripts/fleet-result-merge.sh" t1 "${e2e_tools}/message.txt"
   ) >"${dir}/run.log" 2>&1 || e2e_rc=$?
@@ -395,6 +416,44 @@ check_eq "attribution: one sign-off, the merger's" \
   "Signed-off-by: $(git -C "${e2e_dir}/work" config user.name) <$(git -C "${e2e_dir}/work" config user.email)>" \
   "$(printf '%s\n' "${pushed_body}" | grep -i '^signed-off-by:')"
 check_eq "attribution: the tree is the result's tree" \
+  "$(git -C "${e2e_dir}/origin.git" rev-parse refs/heads/task/t1/result^{tree})" \
+  "$(git -C "${e2e_dir}/origin.git" rev-parse "$(merge_ref "${e2e_dir}")^{tree}")"
+if [[ ${e2e_rc} -ne 0 ]]; then
+  cat "${e2e_dir}/run.log"
+fi
+
+# (l) FETCH_HEAD race regression for fleet-result-inspect.sh (issue #4079):
+# with the shim above armed, a script that still reads FETCH_HEAD resolves
+# the result ref to origin/main's tip (what the shim's hidden fetch landed)
+# instead of the deliverable commit, so the "commits not yet on base" section
+# comes up empty instead of naming the deliverable.
+dir="${tmproot}/inspect-race"
+mkdir -p "${dir}"
+git init -q --bare "${dir}/origin.git"
+new_repo "${dir}/work"
+git -C "${dir}/work" remote add origin "${dir}/origin.git"
+git -C "${dir}/work" push -q origin main
+git -C "${dir}/work" checkout -q -b result
+commit_in "${dir}/work" deliverable.txt "feat(scratch): add the deliverable" "" "${DELIVERABLE_AUTHOR}"
+git -C "${dir}/work" push -q origin result:refs/heads/task/t2/result
+git -C "${dir}/work" checkout -q main
+git -C "${dir}/work" branch -q -D result
+inspect_out="$(cd "${dir}/work" && PATH="${shim_bin}:${PATH}" bash "${INSPECT_SCRIPT}" t2 origin/main 2>&1)"
+inspect_rc=$?
+check_eq "inspect race: script exits 0" "0" "${inspect_rc}"
+check_eq "inspect race: the deliverable commit is shown, not clobbered to the base" "1" \
+  "$(printf '%s\n' "${inspect_out}" | grep -c 'feat(scratch): add the deliverable')"
+if [[ ${inspect_rc} -ne 0 ]]; then
+  printf '%s\n' "${inspect_out}"
+fi
+
+# (m) FETCH_HEAD race regression for fleet-result-merge.sh (issue #4079):
+# same shim; a script still reading FETCH_HEAD rewrites an empty range
+# (base..base) instead of the deliverable commit, so the pushed merge ref's
+# tree ends up matching main's seed tree, not the result ref's tree.
+merge_run fetch-race 0 "" "" "${shim_bin}"
+check_eq "merge race: script exits 0" "0" "${e2e_rc}"
+check_eq "merge race: the pushed tree is the result's tree, not main's" \
   "$(git -C "${e2e_dir}/origin.git" rev-parse refs/heads/task/t1/result^{tree})" \
   "$(git -C "${e2e_dir}/origin.git" rev-parse "$(merge_ref "${e2e_dir}")^{tree}")"
 if [[ ${e2e_rc} -ne 0 ]]; then

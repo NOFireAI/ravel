@@ -325,6 +325,11 @@ if [[ ! -f "${message_file}" ]]; then
 fi
 
 result_ref="refs/heads/task/${task_id}/result"
+# A destination unique to this process, not FETCH_HEAD: FETCH_HEAD is shared
+# by every git command in the checkout, so a concurrent fetch elsewhere can
+# land between the fetch below and the rev-parse and resolve to its ref
+# instead (issue #4079). Deleted in cleanup() on every exit path.
+result_dest_ref="refs/agent-cli/fetch/result-merge-$$-${RANDOM}"
 start_ref="refs/heads/task/${task_id}/start"
 pr_branch="task/${task_id}/merge"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -356,6 +361,7 @@ cleanup() {
   if [[ -n "${start_checkout}" ]]; then git checkout -q "${start_checkout}" 2>/dev/null || true; fi
   if [[ -n "${rewrite_branch}" ]]; then git branch -D "${rewrite_branch}" 2>/dev/null || true; fi
   if [[ -n "${fold_branch}" ]]; then git branch -D "${fold_branch}" 2>/dev/null || true; fi
+  git update-ref -d "${result_dest_ref}" 2>/dev/null || true
 }
 trap cleanup EXIT
 trap cleanup ERR
@@ -389,8 +395,8 @@ if [[ "${start_checkout}" == "HEAD" ]]; then
 fi
 
 echo "==> Fetching ${result_ref}"
-git fetch origin "${result_ref}"
-result_sha="$(git rev-parse FETCH_HEAD)"
+git fetch origin "+${result_ref}:${result_dest_ref}"
+result_sha="$(git rev-parse "${result_dest_ref}")"
 
 base="$(git merge-base origin/main "${result_sha}")"
 
