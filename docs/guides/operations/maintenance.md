@@ -2261,9 +2261,11 @@ The procedure, for family F from version N to N+1:
    bucket was fenced. The census reads every live member object's trailer
    and stops, writing no certificate, on any member below N+1, any member
    it cannot read, any trailer that disagrees with its record's stamp, and
-   any incomplete listing. `--budget-records` caps the `(tenant, signal, shard)` units one
-   run covers (unset is no cap); the next run resumes from the cursor
-   `sys/maintain/certify/<family>/cursor`. On a clean census it writes the
+   any incomplete listing. `--budget-records` caps the
+   `(tenant, signal, shard)` units one run covers (unset is no cap); a run
+   saves its progress to the cursor `sys/maintain/certify/<family>/cursor`
+   when the budget stops it and when its census finishes, and the next run
+   resumes from there. On a clean census it writes the
    certificate, sets the late-write watermark to the census start, raises
    the format floors, and deletes the cursor. Exit codes, by `outcome`:
    - 0, `certified`: the certificate is written. The report carries
@@ -2290,7 +2292,9 @@ The procedure, for family F from version N to N+1:
      run (rerun), another certify run holding the cursor, a family that
      is not class A, and a family already certified at or above the
      target.
-   - 1: a store or decode fault. Rerun; the cursor keeps the progress.
+   - 1: a store or decode fault. Rerun; units examined since the last
+     saved cursor are examined again, so a large store is cheaper to
+     certify in `--budget-records` steps.
 9. **Verify late writes.** A `--mode maintain` process started with
    `--tenant-hash-key-file` runs the late-write pass for every certified
    family under the maintain credential: on its first tick after the
