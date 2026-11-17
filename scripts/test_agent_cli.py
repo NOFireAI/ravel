@@ -755,9 +755,36 @@ class DispatchRefResolution(unittest.TestCase):
         return capture_main(["dispatch", "--epic", "4034", "--ticket", "4043",
                              "--spec", str(path), "--ref", self.REF])
 
+    def dispatch_ref(self, ref, *extra):
+        path = pathlib.Path(self.tmp.name) / "spec.txt"
+        path.write_text("Do the thing.\n" + SPEC_HEAD)
+        return capture_main(["dispatch", *extra, "--epic", "4034", "--ticket", "4043",
+                             "--spec", str(path), "--ref", ref])
+
     def _ref_exists(self, ref):
         return subprocess.run(["git", "show-ref", "--verify", "--quiet", ref],
                               cwd=self.clone_dir).returncode == 0
+
+    def test_bare_commit_id_notice_keeps_json_output_parseable(self):
+        # A --ref that is a commit id names no remote ref, so the tip check
+        # is skipped with a notice. Under --json stdout must stay one object.
+        rc, out, err = self.dispatch_ref(self.commit_a, "--json")
+        self.assertEqual(rc, 0, out + err)
+        # FLIP: the notice printed to stdout puts a text line before the JSON
+        # object, and json.loads raises.
+        json.loads(out)
+        self.assertIn("names no remote ref", err)
+        self.assertEqual(self.mcp_calls[0][1]["ref"], self.commit_a)
+
+    def test_same_named_tag_and_branch_compares_the_ref_fetch_resolved(self):
+        # git fetch resolves a short name to refs/tags/<n> before
+        # refs/heads/<n>; the tip check must read the same ref.
+        self._run_git(self.origin, "tag", self.REF, self.commit_main)
+        rc, out, err = self.dispatch_ref(self.REF)
+        # FLIP: a tip check that prefers refs/heads/<n> compares the tag's
+        # commit (what the fetch wrote) with the branch tip and refuses with 2.
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.mcp_calls[0][1]["ref"], self.commit_main)
 
     def test_resolves_from_its_own_destination_not_fetch_head(self):
         # Simulate a second session fetching feature-b in this same checkout
