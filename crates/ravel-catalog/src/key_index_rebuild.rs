@@ -2834,8 +2834,28 @@ mod tests {
         ));
         let catalog = off_catalog(faulty.clone(), 2);
         inner.clear();
+        crate::fold::take_section_hold_log_for_test();
         let report = rebuild(&catalog, Signal::Logs).await;
         assert_eq!(faulty.fault_count(Op::Get, FaultKind::Timeout), 1);
+        // Issue #4376: the deferred part releases the section it held, the
+        // one its other entry's read returned, like the built part before it.
+        let other_section: u64 = inner
+            .data_ranged_gets()
+            .iter()
+            .filter(|(key, range, _)| {
+                part_keys[1].contains(key)
+                    && *key != failing
+                    && matches!(range, GetRange::Range(..))
+            })
+            .map(|(_, _, bytes)| bytes)
+            .sum();
+        assert_eq!(
+            crate::fold::take_section_hold_log_for_test(),
+            vec![
+                (report.section_hold_peak_bytes, 0, 0),
+                (other_section, 0, 0)
+            ]
+        );
         assert_eq!(
             report,
             KeyIndexRebuildReport {
