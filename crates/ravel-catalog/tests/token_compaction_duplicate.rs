@@ -916,7 +916,15 @@ async fn superseded_rewrite_part_in_a_stale_head_keeps_the_input_out() {
     put_l0(store.as_ref(), &l).await;
     let first = Uuid::from_u128(0xd4418);
     put_dreq(store.as_ref(), Signal::Logs, first).await;
-    let w1 = put_rewrite(store.as_ref(), Signal::Logs, &[&l], first, start, L_ROWS - 1).await;
+    let w1 = put_rewrite(
+        store.as_ref(),
+        Signal::Logs,
+        &[&l],
+        first,
+        start,
+        L_ROWS - 1,
+    )
+    .await;
     fold_hour(&store, Signal::Logs).await;
     let second = Uuid::from_u128(0xd4419);
     put_dreq(store.as_ref(), Signal::Logs, second).await;
@@ -1045,7 +1053,11 @@ async fn token_step_error(
         .await
         .expect("resolve without the token");
     assert_eq!(sorted_keys(&plain), vec![part_key(&c)]);
-    assert_eq!(store.fault_count(op, kind), 0, "only the token step reads it");
+    assert_eq!(
+        store.fault_count(op, kind),
+        0,
+        "only the token step reads it"
+    );
     let err = catalog
         .resolve(&tenant(), Signal::Logs, range, &[token(&l)], now)
         .await
@@ -1073,7 +1085,9 @@ async fn token_step_bucket_list_error_fails_the_resolve() {
 #[tokio::test]
 async fn token_step_compaction_get_error_fails_the_resolve() {
     let err = token_step_error(
-        |_, ckey| Rule::new(Op::Get, ScriptedFault::Permanent("get".into())).with_key_contains(ckey),
+        |_, ckey| {
+            Rule::new(Op::Get, ScriptedFault::Permanent("get".into())).with_key_contains(ckey)
+        },
         Op::Get,
         FaultKind::Permanent,
     )
@@ -1109,13 +1123,22 @@ async fn token_step_rewrite_get_error_fails_the_resolve() {
     put_l0(inner.as_ref(), &l).await;
     let request_id = Uuid::from_u128(0xd4418);
     put_dreq(inner.as_ref(), Signal::Logs, request_id).await;
-    let rw = put_rewrite(inner.as_ref(), Signal::Logs, &[&l], request_id, start, L_ROWS - 1).await;
+    let rw = put_rewrite(
+        inner.as_ref(),
+        Signal::Logs,
+        &[&l],
+        request_id,
+        start,
+        L_ROWS - 1,
+    )
+    .await;
     fold_hour(&inner, Signal::Logs).await;
     let rkey = keys::rewrite_record_key_for(&rw).expect("rewrite key");
     let store = Arc::new(FaultStore::new(
         inner,
-        FaultPlan::empty()
-            .with_rule(Rule::new(Op::Get, ScriptedFault::Permanent("get".into())).with_key_contains(rkey)),
+        FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Permanent("get".into())).with_key_contains(rkey),
+        ),
     ));
     let catalog = catalog_on(store.clone(), 1);
     let (range, now) = sealed_window();
@@ -1134,5 +1157,48 @@ async fn token_step_rewrite_get_error_fails_the_resolve() {
     assert!(
         matches!(err, CatalogError::Store(StoreError::Permanent(_))),
         "{err:?}"
+    );
+}
+
+/// While an erasure is pending, every present token whose input is not in
+/// the set pays the bucket LIST and a GET per rewrite record, even in a
+/// bucket nothing compacted and with inputs no rewrite names; nothing is
+/// shared between the two tokens.
+#[tokio::test]
+async fn pending_erasure_charges_each_token_a_list_and_the_rewrite_gets() {
+    let store = Arc::new(MemoryStore::new());
+    let start = hour_start(HOUR);
+    let l = l0(Signal::Logs, 1, HOUR, start, L_ROWS);
+    let m = l0(Signal::Logs, 2, HOUR, start, M_ROWS);
+    let n = l0(Signal::Logs, 3, HOUR, start, 5);
+    for record in [&l, &m, &n] {
+        put_l0(store.as_ref(), record).await;
+    }
+    let request_id = Uuid::from_u128(0xd4418);
+    put_dreq(store.as_ref(), Signal::Logs, request_id).await;
+    put_rewrite(
+        store.as_ref(),
+        Signal::Logs,
+        &[&m],
+        request_id,
+        start,
+        M_ROWS - 1,
+    )
+    .await;
+
+    let (plain, plain_reads) = resolve_counted(&store, Signal::Logs, late_window(), &[]).await;
+    assert!(plain.segments.is_empty());
+    let (snapshot, reads) =
+        resolve_counted(&store, Signal::Logs, late_window(), &[token(&l), token(&n)]).await;
+    let mut expected = vec![l0_key(&l), l0_key(&n)];
+    expected.sort();
+    assert_eq!(sorted_keys(&snapshot), expected, "read-your-write holds");
+    assert_eq!(
+        reads,
+        Reads {
+            lists: plain_reads.lists + 2,
+            gets: plain_reads.gets + 2,
+            total: plain_reads.total + 4,
+        }
     );
 }

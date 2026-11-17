@@ -3379,26 +3379,47 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    (never by re-listing). Present: ensure it is in the snapshot set (its
    event range might not overlap; include it anyway so read-your-write
    holds), with one exception for every signal but metrics: the input is
-   left out when the set already serves its rows from a replacement, or
-   when a live rewrite erased them. A compacted input's commit
-   record stays present until the sweep, and logs and spans have no
-   query-time dedup, so adding it beside the part that holds its rows would
-   count each of its records twice. The step checks only when the set holds
-   a level-1 part of the token's (shard, ingest_hour) bucket or step 6
-   found a pending erasure request (that LIST therefore completes before
-   this step). It then LISTs the bucket, loads its compaction records
-   (cached, as in step 2) and rewrite records, and leaves the input out when
-   a compaction or rewrite record of any status names it (a rewrite through
-   its effective inputs) and one of that record's output parts is in the
-   set, or when a live rewrite names it. Records are matched by the input
-   identities they hold, never by object key. Otherwise the input is added
-   as before. The check costs nothing beyond the commit-record GET when it
-   does not run, and otherwise one bucket LIST (more pages only past the
-   page size), one GET per compaction record the cache does not hold and
-   one GET per rewrite record. Metrics keep adding the input, since
-   query-time dedup collapses the overlap. Absent: fall back to GETting the
+   not added when the set already serves its rows from a replacement, when
+   a live rewrite replaced it, or when its bucket is tombstoned. A
+   compacted input's commit record stays present until the sweep, and logs
+   and spans have no query-time dedup, so adding it beside the part that
+   holds its rows would count each of its records twice. The step checks
+   only when the set holds a level-1 part of the token's (shard,
+   ingest_hour) bucket or step 6 found a pending erasure request (that LIST
+   therefore completes before this step). It then LISTs the bucket and, in
+   this order:
+
+   - a tombstone in the bucket: the input is not added, the answer the
+     absent-record path below gives (satisfied with zero segments);
+   - a compaction or rewrite record of any status names the input (a
+     rewrite through its effective inputs) and one of that record's own
+     output parts is in the set: nothing is added, since that part serves
+     the input's rows; a record naming the input whose parts are not in the
+     set does not keep it out. A served part of a superseded rewrite (a
+     stale HEAD) is checked before any live successor is added;
+   - a live rewrite names the input: that rewrite's output parts are added
+     in its place, the same parts the absent-record path serves once the
+     sweep deletes the commit record;
+   - otherwise the input is added as before.
+
+   Records are matched by the input identities they hold, never by object
+   key. Tokens whose commit record is absent are resolved first and present
+   ones after them, so a present token sees every part an absent token's
+   fallback added and the answer does not depend on token order. Metrics
+   keep adding the input, since query-time dedup collapses the overlap.
+   Cost, per present token: nothing beyond the commit-record GET when the
+   check does not run; otherwise one LIST of its bucket (more pages only
+   past the page size), one GET per compaction record the cache does not
+   hold and one GET per rewrite record, which no cache holds. Nothing is
+   shared across tokens, so N tokens whose check runs pay N LISTs even in
+   one bucket, and each re-fetches that bucket's rewrite records. While an
+   erasure request is pending, the check runs for every present token of a
+   signal other than metrics whose input is not already in the set, so each
+   pays that LIST and the rewrite GETs whether or not its bucket was
+   compacted or rewritten. Absent: fall back to GETting the
    bucket's compaction record(s) (cacheable, same as step 2) and check the
-   token's writer identity against each record's input list. Found in an input list: satisfied via
+   token's writer identity against each record's input list. Found in an
+   input list: satisfied via
    that record's parts. A rewrite record (ADR-0064) is treated the same:
    if the token's identity is among a live (non-superseded) rewrite's
    effective inputs, it is satisfied via that rewrite's erased output parts,

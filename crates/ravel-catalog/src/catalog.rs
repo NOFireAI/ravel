@@ -5090,7 +5090,6 @@ fn names_input(inputs: &[CompactionInputIdentity], identity: &(String, u64, u64)
     })
 }
 
-
 fn unsatisfiable_token(token: &CommitToken) -> CatalogError {
     CatalogError::UnsatisfiableToken {
         shard: token.shard,
