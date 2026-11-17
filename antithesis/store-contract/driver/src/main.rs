@@ -17,9 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use antithesis_sdk::{
-    assert_always, assert_always_or_unreachable, assert_reachable, assert_sometimes,
-};
+use antithesis_sdk::{assert_always, assert_always_or_unreachable, assert_reachable};
 use bytes::Bytes;
 use hegel::TestCase;
 use hegel::generators as gs;
@@ -215,19 +213,21 @@ impl Workload {
             "store: a version is never reused after a delete",
             &v.details
         );
+        let Some(sb) = &v.same_bytes else {
+            println!("{base}: same-bytes recreate inconclusive");
+            return;
+        };
         assert_always!(
-            v.same_bytes_ok,
-            "store: a CAS holding a pre-delete version fails after a same-bytes recreate",
+            sb.ok,
+            "store: a CAS holding a pre-delete version matches its effect after a same-bytes recreate",
             &v.details
         );
-        // On RustFS the ETag is content-derived, so the recreate reuses the
-        // pre-delete version; record that reuse rather than requiring the
-        // version to differ, which the TLA+ global counter would but S3Store
-        // as Ravel uses it does not (README "Versions on S3").
-        assert_sometimes!(
-            v.same_bytes_reused,
-            "store: a same-bytes recreate reuses the version",
-            &v.details
+        // On RustFS the ETag is content-derived, so the recreate may reuse the
+        // pre-delete version. The run records whether it did without depending
+        // on the answer (README "Versions on S3").
+        assert_reachable!(
+            "store: a same-bytes recreate ran",
+            &json!({ "reused": sb.reused, "details": v.details })
         );
     }
 
@@ -415,4 +415,55 @@ fn main(tc: TestCase) {
         .steps(i64::MAX)
         .max_concurrency(4)
         .run_concurrent(tc);
+}
+
+#[cfg(test)]
+mod tests {
+    const SOURCE: &str = include_str!("main.rs");
+    const README: &str = include_str!("../../README.md");
+    const TRACEABILITY: &str = include_str!("../../../../formal/tla/common/traceability.md");
+
+    /// The driver's own code: this file up to its test module.
+    fn driver_code() -> &'static str {
+        SOURCE.split("#[cfg(test)]").next().unwrap_or(SOURCE)
+    }
+
+    #[test]
+    fn no_sometimes_assertion_depends_on_what_the_store_does() {
+        // An assert_sometimes fails the whole run if its condition never holds;
+        // the driver records a store's choices with assert_reachable instead.
+        assert!(
+            !driver_code().contains("assert_sometimes!"),
+            "the driver carries an assert_sometimes"
+        );
+    }
+
+    #[test]
+    fn same_bytes_messages_name_what_is_checked_and_are_documented() {
+        const CHECKED: &str = "store: a CAS holding a pre-delete version matches its effect after a same-bytes recreate";
+        const RAN: &str = "store: a same-bytes recreate ran";
+        for message in [CHECKED, RAN] {
+            assert!(
+                driver_code().contains(&format!("\"{message}\"")),
+                "driver lacks {message:?}"
+            );
+            assert!(README.contains(message), "README lacks {message:?}");
+            assert!(
+                TRACEABILITY.contains(message),
+                "traceability.md lacks {message:?}"
+            );
+        }
+        // The CAS may apply when the store reuses the version, so no message
+        // may claim it fails.
+        for (name, text) in [
+            ("driver", driver_code()),
+            ("README", README),
+            ("traceability.md", TRACEABILITY),
+        ] {
+            assert!(
+                !text.contains("fails after a same-bytes recreate"),
+                "{name} still claims the same-bytes CAS fails"
+            );
+        }
+    }
 }

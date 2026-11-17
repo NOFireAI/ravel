@@ -38,13 +38,20 @@ pub struct Verdict {
     pub failed: bool,
     /// A write that failed was later found applied: a real lost response.
     pub failed_applied: bool,
-    /// The same-bytes recreate sub-check of [`versions_never_reused`] held: a
-    /// CAS holding a pre-delete version matched its effect after the key was
-    /// deleted and recreated with identical bytes.
-    pub same_bytes_ok: bool,
-    /// The same-bytes recreate minted the same version it had before the
-    /// delete: `S3Store`'s content-derived ETag reused. Recorded, not required.
-    pub same_bytes_reused: bool,
+    /// The same-bytes recreate of [`versions_never_reused`], `None` when a
+    /// fault left it inconclusive.
+    pub same_bytes: Option<SameBytes>,
+}
+
+/// The same-bytes recreate sub-check of [`versions_never_reused`].
+#[derive(Debug)]
+pub struct SameBytes {
+    /// A CAS holding the pre-delete version matched its effect after the key
+    /// was deleted and recreated with identical bytes.
+    pub ok: bool,
+    /// The recreate minted the version it had before the delete: `S3Store`'s
+    /// content-derived ETag reused. Recorded, not required.
+    pub reused: bool,
 }
 
 pub type Judged = Result<Verdict, String>;
@@ -379,9 +386,11 @@ pub async fn delete_idempotent(store: &BrokenStore, base: &str) -> Judged {
 /// version back. Under that reuse a CAS holding the pre-delete version targets
 /// the current version and may legitimately apply; the contract the driver can
 /// hold against a real store is only that the CAS outcome matches its effect
-/// (applied means the key holds the CAS bytes, refused means it holds the
-/// recreate). Issue #4389 tracks whether Ravel's own CAS targets can collide a
-/// version this way.
+/// (`Ok` means the version was reused and the key holds the CAS bytes; any
+/// other answer means the key holds the recreate, or, under reuse, the CAS
+/// bytes of a CAS that applied and lost its response). A fault in the
+/// same-bytes setup leaves only the sub-check inconclusive. Issue #4389 tracks
+/// whether Ravel's own CAS targets can collide a version this way.
 pub async fn versions_never_reused(store: &BrokenStore, base: &str) -> Judged {
     let key = format!("{base}/k");
     let (a, b, c) = (body(base, "a"), body(base, "b"), body(base, "c"));
@@ -404,59 +413,74 @@ pub async fn versions_never_reused(store: &BrokenStore, base: &str) -> Judged {
     let read = read_settled(store, &key).await?;
     let holds = second != first && !matches!(put, Put::Ok(_)) && read.holds(&b);
 
-    // Same-bytes recreate: create X, delete, create X again, then a CAS
-    // holding the first version.
-    let same_key = format!("{base}/same");
-    let (x, y) = (body(base, "x"), body(base, "y"));
-    let v1 = match store
-        .put(&same_key, x.clone(), PutOptions::create_if_absent())
-        .await
-    {
-        Ok(o) => o.version.0,
-        Err(e) => return Err(format!("same-bytes first create: {e}")),
-    };
-    store
-        .delete(&same_key)
-        .await
-        .map_err(|e| format!("same-bytes delete: {e}"))?;
-    let v2 = match store
-        .put(&same_key, x.clone(), PutOptions::create_if_absent())
-        .await
-    {
-        Ok(o) => o.version.0,
-        Err(e) => return Err(format!("same-bytes recreate: {e}")),
-    };
-    let same_cas = Put::of(store.put(&same_key, y.clone(), cas_opts(&v1)).await);
-    let same_read = read_settled(store, &same_key).await?;
-    let same_bytes_reused = v2 == v1;
-    // A CAS answered Ok is conformant only when the version was reused (so the
-    // held version equalled the current one) and the key holds the CAS bytes;
-    // a CAS answered otherwise must have left the recreate's bytes in place.
-    let same_bytes_ok = match &same_cas {
-        Put::Ok(_) => same_bytes_reused && same_read.holds(&y),
-        _ => same_read.holds(&x),
+    // The different-bytes verdict stands on its own: a fault in the same-bytes
+    // setup leaves only the sub-check inconclusive.
+    let (same_bytes, same_details) = match same_bytes_recreate(store, base).await {
+        Ok((sb, d)) => (Some(sb), d),
+        Err(e) => (None, json!({ "inconclusive": e })),
     };
     Ok(Verdict {
         holds,
-        same_bytes_ok,
-        same_bytes_reused,
+        same_bytes,
         details: json!({
             "base": base,
             "first": first,
             "second": second,
             "stale_cas": put.describe(),
             "read": read.describe(),
-            "same_bytes": {
-                "v1": v1,
-                "v2": v2,
-                "reused": same_bytes_reused,
-                "cas": same_cas.describe(),
-                "read": same_read.describe(),
-                "ok": same_bytes_ok,
-            },
+            "same_bytes": same_details,
         }),
         ..Verdict::default()
     })
+}
+
+/// Create X, delete, create X again, then a CAS of Y holding the first
+/// version V1.
+async fn same_bytes_recreate(
+    store: &BrokenStore,
+    base: &str,
+) -> Result<(SameBytes, Value), String> {
+    let key = format!("{base}/same");
+    let (x, y) = (body(base, "x"), body(base, "y"));
+    let v1 = match store
+        .put(&key, x.clone(), PutOptions::create_if_absent())
+        .await
+    {
+        Ok(o) => o.version.0,
+        Err(e) => return Err(format!("same-bytes first create: {e}")),
+    };
+    store
+        .delete(&key)
+        .await
+        .map_err(|e| format!("same-bytes delete: {e}"))?;
+    let v2 = match store
+        .put(&key, x.clone(), PutOptions::create_if_absent())
+        .await
+    {
+        Ok(o) => o.version.0,
+        Err(e) => return Err(format!("same-bytes recreate: {e}")),
+    };
+    let cas = Put::of(store.put(&key, y.clone(), cas_opts(&v1)).await);
+    let read = read_settled(store, &key).await?;
+    let reused = v2 == v1;
+    // With V2 == V1 the CAS held the current version, so it may apply, and one
+    // that applied but whose response was lost or retried is answered Failed
+    // or PreconditionFailed: Y in place is conformant whatever the answer,
+    // since Y is unique to this CAS. With V2 != V1 the CAS held a stale version
+    // and must leave X in place. A CAS answered Ok must hold Y.
+    let ok = match &cas {
+        Put::Ok(_) => reused && read.holds(&y),
+        _ => read.holds(&x) || (reused && read.holds(&y)),
+    };
+    let details = json!({
+        "v1": v1,
+        "v2": v2,
+        "reused": reused,
+        "cas": cas.describe(),
+        "read": read.describe(),
+        "ok": ok,
+    });
+    Ok((SameBytes { ok, reused }, details))
 }
 
 /// Whether `key` is invisible: absent to a read and to a listing of `prefix`.
@@ -680,9 +704,17 @@ mod tests {
     ///   retry of a CAS that already landed (a 5xx/409 retry) is.
     /// - `ContentVersion`: every put reports a content-derived version, so a
     ///   same-bytes recreate reuses the version an ETag backend would.
+    /// - `SameCasLandsThenAnswered`: a CAS on the same-bytes key applies as
+    ///   the store would (against content versions when `reuse`, else as an
+    ///   overwrite) and is then answered `answer()`, as a CAS whose response
+    ///   was lost or retried is. Every other put is stored as `reuse` selects.
     enum PutQuirk {
         AppliesThenRefusesFirstCas(AtomicUsize),
         ContentVersion,
+        SameCasLandsThenAnswered {
+            reuse: bool,
+            answer: fn() -> StoreError,
+        },
     }
 
     struct QuirkStore {
@@ -699,6 +731,39 @@ mod tests {
                 }),
                 None,
             ))
+        }
+
+        /// A put that reports a content-derived version and matches a held
+        /// version against the content version of what is stored, as an ETag
+        /// backend does, so a CAS against a reused version applies.
+        async fn content_put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            let version = content_version(&data);
+            let mode = match &opts.mode {
+                PutMode::CasVersion(Version(want)) => {
+                    match self.inner.get(key, GetRange::Full).await {
+                        Ok(o) if content_version(&o.data) == *want => PutMode::Overwrite,
+                        Ok(_) | Err(StoreError::NotFound) => {
+                            return Err(StoreError::PreconditionFailed);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                other => other.clone(),
+            };
+            let opts = PutOptions {
+                mode,
+                checksum: opts.checksum,
+            };
+            let out = self.inner.put(key, data, opts).await?;
+            Ok(PutOutcome {
+                version: Version(version),
+                ..out
+            })
         }
     }
 
@@ -724,38 +789,25 @@ mod tests {
                     }
                     self.inner.put(key, data, opts).await
                 }
-                PutQuirk::ContentVersion => {
-                    if let PutMode::CasVersion(Version(want)) = &opts.mode {
-                        // Match the held version against the content version of
-                        // what is stored, as an ETag backend does, so a CAS
-                        // against a reused version applies.
-                        let want = want.clone();
-                        match self.inner.get(key, GetRange::Full).await {
-                            Ok(o) if content_version(&o.data) == want => {
-                                let overwrite = PutOptions {
-                                    mode: PutMode::Overwrite,
-                                    checksum: opts.checksum,
-                                };
-                                let version = content_version(&data);
-                                let out = self.inner.put(key, data, overwrite).await?;
-                                return Ok(PutOutcome {
-                                    version: Version(version),
-                                    ..out
-                                });
-                            }
-                            Ok(_) => return Err(StoreError::PreconditionFailed),
-                            Err(StoreError::NotFound) => {
-                                return Err(StoreError::PreconditionFailed);
-                            }
-                            Err(e) => return Err(e),
-                        }
+                PutQuirk::ContentVersion => self.content_put(key, data, opts).await,
+                PutQuirk::SameCasLandsThenAnswered { reuse, answer } => {
+                    let same_cas =
+                        matches!(opts.mode, PutMode::CasVersion(_)) && key.ends_with("/same");
+                    let applied = if *reuse {
+                        self.content_put(key, data, opts).await
+                    } else if same_cas {
+                        let overwrite = PutOptions {
+                            mode: PutMode::Overwrite,
+                            checksum: opts.checksum,
+                        };
+                        self.inner.put(key, data, overwrite).await
+                    } else {
+                        self.inner.put(key, data, opts).await
+                    };
+                    match applied {
+                        Ok(_) if same_cas => Err(answer()),
+                        other => other,
                     }
-                    let version = content_version(&data);
-                    let out = self.inner.put(key, data, opts).await?;
-                    Ok(PutOutcome {
-                        version: Version(version),
-                        ..out
-                    })
                 }
             }
         }
@@ -841,7 +893,7 @@ mod tests {
             // not a content ETag), so the same-bytes recreate does not reuse
             // the version and its CAS sub-check holds.
             assert!(
-                v.holds && v.same_bytes_ok && !v.same_bytes_reused,
+                v.holds && v.same_bytes.as_ref().is_some_and(|sb| sb.ok && !sb.reused),
                 "{}",
                 v.details
             );
@@ -966,19 +1018,121 @@ mod tests {
         // outcome to the effect.
         let cv = QuirkStore::wrapped(PutQuirk::ContentVersion);
         let v = rt.block_on(versions_never_reused(&cv, "ver")).expect("ver");
-        assert!(v.same_bytes_reused, "reuse not observed: {}", v.details);
-        assert!(v.same_bytes_ok, "false red on reuse: {}", v.details);
+        let sb = v.same_bytes.expect("same-bytes conclusive");
+        assert!(sb.reused, "reuse not observed: {}", v.details);
+        assert!(sb.ok, "false red on reuse: {}", v.details);
+        assert_eq!(v.details["same_bytes"]["reused"], json!(true));
+        let fresh = memory(2, None);
+        let v = rt
+            .block_on(versions_never_reused(&fresh, "ver"))
+            .expect("ver");
+        assert_eq!(v.details["same_bytes"]["reused"], json!(false));
 
         // Accepting a stale CAS (common/cas-accepts-stale-version) breaks the
-        // sub-check: the CAS applies though the recreate minted a fresh version.
+        // sub-check when V2 != V1: the CAS applies though the recreate minted a
+        // fresh version.
         let m = memory(2, Some(inv_mutant!("common/cas-accepts-stale-version")));
         let v = rt.block_on(versions_never_reused(&m, "ver")).expect("ver");
+        let sb = v.same_bytes.expect("same-bytes conclusive");
         assert!(
-            !v.same_bytes_ok,
+            !sb.ok,
             "the sub-check held under the CAS mutant: {}",
             v.details
         );
-        assert!(!v.same_bytes_reused, "{}", v.details);
+        assert!(!sb.reused, "{}", v.details);
+
+        // When V2 == V1, as on RustFS, the mutant's overwrite is answered Ok
+        // and stores Y, which a valid CAS would too: the sub-check holds, and
+        // only the different-bytes check refutes the mutant.
+        let cvm = Arc::new(BrokenStore::new(
+            Arc::new(QuirkStore {
+                inner: Arc::new(MemoryStore::new()),
+                quirk: PutQuirk::ContentVersion,
+            }),
+            Some(inv_mutant!("common/cas-accepts-stale-version")),
+        ));
+        let v = rt
+            .block_on(versions_never_reused(&cvm, "ver"))
+            .expect("ver");
+        let sb = v.same_bytes.expect("same-bytes conclusive");
+        assert!(sb.reused && sb.ok, "{}", v.details);
+        assert_eq!(
+            v.details["same_bytes"]["cas"],
+            json!(format!("{:?}", Put::Ok(content_version(&body("ver", "y")))))
+        );
+        assert!(!v.holds, "{}", v.details);
+    }
+
+    #[test]
+    fn same_bytes_cas_that_landed_but_was_not_answered_ok_is_judged_by_reuse() {
+        let rt = rt();
+        type Answer = fn() -> StoreError;
+        let answers: [(&str, Answer); 2] = [
+            ("PreconditionFailed", || StoreError::PreconditionFailed),
+            ("Failed", || StoreError::Timeout),
+        ];
+        for (name, answer) in answers {
+            // V2 == V1, so CAS(V1, Y) is a valid CAS; it landed and its
+            // response was lost or retried. The key holds Y, which is
+            // conformant.
+            let s = QuirkStore::wrapped(PutQuirk::SameCasLandsThenAnswered {
+                reuse: true,
+                answer,
+            });
+            let v = rt.block_on(versions_never_reused(&s, "ver")).expect("ver");
+            let sb = v.same_bytes.expect("same-bytes conclusive");
+            assert!(sb.reused, "{name}: {}", v.details);
+            assert!(sb.ok, "{name}: false red on reuse: {}", v.details);
+            assert!(
+                v.details["same_bytes"]["cas"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with(name)),
+                "{name}: {}",
+                v.details
+            );
+            assert!(v.holds, "{name}: {}", v.details);
+
+            // V2 != V1: the CAS held a stale version, so a store that applied
+            // it is wrong whatever it answered.
+            let s = QuirkStore::wrapped(PutQuirk::SameCasLandsThenAnswered {
+                reuse: false,
+                answer,
+            });
+            let v = rt.block_on(versions_never_reused(&s, "ver")).expect("ver");
+            let sb = v.same_bytes.expect("same-bytes conclusive");
+            assert!(!sb.reused, "{name}: {}", v.details);
+            assert!(!sb.ok, "{name}: stale CAS applied but held: {}", v.details);
+        }
+    }
+
+    #[test]
+    fn a_fault_in_the_same_bytes_setup_keeps_the_different_bytes_verdict() {
+        let rt = rt();
+        for step in [Op::Put, Op::Delete] {
+            // The CAS mutant breaks the different-bytes check; a fault in the
+            // same-bytes setup that follows must not hide that violation.
+            let rule = Rule::new(step, ScriptedFault::Transient("injected".to_string()))
+                .with_key_contains("/same");
+            let faults = Arc::new(FaultStore::new(
+                MemoryStore::new(),
+                FaultPlan::empty().with_rule(rule),
+            ));
+            let s = BrokenStore::new(
+                faults.clone(),
+                Some(inv_mutant!("common/cas-accepts-stale-version")),
+            );
+            let v = rt
+                .block_on(versions_never_reused(&s, "ver"))
+                .expect("the different-bytes verdict is reported");
+            assert!(!v.holds, "{step:?}: {}", v.details);
+            assert!(v.same_bytes.is_none(), "{step:?}: {}", v.details);
+            assert!(
+                v.details["same_bytes"]["inconclusive"].is_string(),
+                "{step:?}: {}",
+                v.details
+            );
+            assert_eq!(faults.fault_count(step, FaultKind::Transient), 1);
+        }
     }
 
     #[test]
