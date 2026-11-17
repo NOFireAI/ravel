@@ -862,7 +862,8 @@ mod tests {
             .expect_err("no retry past the deadline");
         assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 1);
         assert!(
-            err.to_string().contains("after 1 attempt, and the startup deadline"),
+            err.to_string()
+                .contains("after 1 attempt, and the startup deadline"),
             "{err}"
         );
         assert!(clock.sleeps().is_empty());
@@ -975,14 +976,18 @@ mod tests {
         // Every kind `StoreError::is_retryable` accepts retries.
         let throttled = TenancyError::Store(StoreError::Throttled { retry_after_ms: 1 });
         assert!(chain_is_transient(&throttled));
-        assert!(chain_is_transient(&TenancyError::Store(StoreError::Timeout)));
-        let wrapped = anyhow::Error::new(TenancyError::Store(StoreError::Timeout))
-            .context("outer context");
+        assert!(chain_is_transient(&TenancyError::Store(
+            StoreError::Timeout
+        )));
+        let wrapped =
+            anyhow::Error::new(TenancyError::Store(StoreError::Timeout)).context("outer context");
         assert!(chain_is_transient(wrapped.as_ref()));
         assert!(!chain_is_transient(&TenancyError::Store(
             StoreError::AccessDenied("no".into())
         )));
-        assert!(!chain_is_transient(&TenancyError::Store(StoreError::NotFound)));
+        assert!(!chain_is_transient(&TenancyError::Store(
+            StoreError::NotFound
+        )));
         // The text names the variant; only the type counts.
         let text = std::io::Error::other("transient error: x");
         assert!(!chain_is_transient(&text));
@@ -1254,16 +1259,9 @@ mod tests {
                 .await
                 .expect("seed pre-ADR data");
         }
-        validate_static_provisioning(
-            &retry_on(clock.clone()),
-            &store,
-            &[tenant],
-            4,
-            Mode::All,
-            1,
-        )
-        .await
-        .expect("the retry finds the landed record");
+        validate_static_provisioning(&retry_on(clock.clone()), &store, &[tenant], 4, Mode::All, 1)
+            .await
+            .expect("the retry finds the landed record");
         assert_eq!(store.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
         // Only the faulted put ran: the passthrough step was never reached.
         assert_eq!(store.sequence_progress(0), 1);

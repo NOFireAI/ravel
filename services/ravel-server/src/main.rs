@@ -1071,6 +1071,42 @@ mod tests {
         );
     }
 
+    /// Issue #4325: `main` makes its startup store checks through the one
+    /// function `startup_store_retry_e2e` drives, and calls none of the
+    /// checks directly, so no site can lose its retry in `main` alone.
+    /// Needles built with `concat!` so this test's own source cannot match
+    /// itself.
+    #[test]
+    fn main_runs_its_startup_store_checks_through_one_function() {
+        const SRC: &str = include_str!("main.rs");
+        let main_src = &SRC[..SRC.find("\n#[cfg(test)]").expect("test module present")];
+        let combined = concat!("startup_retry::run_startup_", "store_checks(");
+        assert_eq!(main_src.matches(combined).count(), 1);
+        let start_at = main_src
+            .find(concat!(
+                "ravel_server::",
+                "start_with_heartbeat_and_ipcrypt("
+            ))
+            .expect("main starts the server");
+        assert!(main_src.find(combined).expect("call present") < start_at);
+        for direct in [
+            concat!("qualification::", "enforce("),
+            concat!("startup_retry::enforce_", "qualification("),
+            concat!("bucket_protection::enforce_", "at_startup_on("),
+            concat!("tenancy::resolve_", "and_pin("),
+            concat!("startup_retry::resolve_", "tenancy("),
+            concat!("install_tenant_", "hash_scheme("),
+            concat!("tenant_kms::configure_", "tenant_kms("),
+            concat!("startup_retry::configure_", "tenant_kms("),
+            concat!("provisioning::validate_", "static_provisioning("),
+            concat!("startup_retry::validate_", "static_provisioning("),
+            concat!("gc_config::", "bootstrap("),
+            concat!("gc_config::bootstrap_", "at_startup("),
+        ] {
+            assert_eq!(main_src.matches(direct).count(), 0, "{direct}");
+        }
+    }
+
     /// `main` stamps the memory gate once before any listener binds, and
     /// starts its sampler once, on the running server's own budget.
     #[test]

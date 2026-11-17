@@ -1,15 +1,21 @@
 //! Issue #4325 end to end: a store that fails transiently while the server
 //! starts delays startup instead of ending it.
 //!
-//! The startup reads run in `main`'s order through the same library calls
-//! `main` makes (`startup_retry::enforce_qualification`,
-//! `startup_retry::resolve_tenancy`, `startup_retry::validate_static_provisioning`,
-//! `gc_config::bootstrap_at_startup`, then `start_with_heartbeat_and_ipcrypt`,
-//! which reads the IPCrypt marker) over one `FaultStore` that fails the
-//! `sys/qualification` GET, the spans `s/l0/` listing of provisioning
-//! validation and the `sys/ipcrypt/policy` GET transiently a few times each.
-//! Time is a gated virtual clock: every retry sleep stops until the test has
-//! checked that the health listener's `/readyz` still answers 503.
+//! The test calls the function `main` calls for its startup store checks,
+//! `startup_retry::run_startup_store_checks`, then
+//! `start_with_heartbeat_and_ipcrypt`, which reads the IPCrypt marker. One
+//! `FaultStore` fails every retried site a few times: `sys/qualification`
+//! (with a transient error, a timeout and a throttle), `sys/tenancy`, the
+//! tenant key-epoch record, the spans `s/l0/` listing of provisioning
+//! validation, `sys/gc` and `sys/ipcrypt/policy`. A site that stopped
+//! retrying would refuse on its first fault and fail the test.
+//!
+//! Time is a gated virtual clock: every retry sleep stops until the test
+//! releases it. The `--listen-health` listener binds where `main` binds it,
+//! after the store checks and before `start`, and at every marker retry
+//! inside `start` the test checks that its `/readyz` answers 503. Nothing
+//! listens during the retries before that, in `main` or here, so those
+//! retries have no `/readyz` to probe.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -22,18 +28,36 @@ use ravel_object_store::conformance::{
 };
 use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, ScriptedFault, Sequence};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreMetrics};
+use ravel_object_store::{KmsRoutingStore, ObjectStoreBackend, PutOptions, StoreMetrics};
 use ravel_server::config::StoreKind;
 use ravel_server::health_listener::{HealthListener, Heartbeat};
-use ravel_server::startup_retry::{self, StartupClock, StartupRetry};
+use ravel_server::startup_retry::{
+    StartupClock, StartupRetry, StartupStoreInputs, StartupStoreState, run_startup_store_checks,
+};
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_types::{ConfiguredScheme, TenantHash, TenantId};
 use tokio::sync::{Semaphore, mpsc};
 
 const IPCRYPT_MARKER_KEY: &str = "sys/ipcrypt/policy";
-const QUALIFICATION_FAILURES: usize = 3;
+const TENANCY_KEY: &str = "sys/tenancy";
+const GC_KEY: &str = "sys/gc";
+const EPOCH_KEY: &str = "/enc";
+const LISTING_KEY: &str = "/s/l0/";
+const TENANCY_FAILURES: usize = 1;
+const EPOCH_FAILURES: usize = 1;
 const LISTING_FAILURES: usize = 2;
+const GC_FAILURES: usize = 1;
 const MARKER_FAILURES: usize = 2;
+/// The qualification read fails once with each retryable kind.
+fn qualification_faults() -> Vec<ScriptedFault> {
+    vec![
+        ScriptedFault::Transient("blip".into()),
+        ScriptedFault::Timeout,
+        ScriptedFault::Throttled {
+            retry_after_ms: 1000,
+        },
+    ]
+}
 
 /// Virtual time whose every sleep reports itself and then waits for the test
 /// to release it.
@@ -65,14 +89,51 @@ impl StartupClock for GatedClock {
             .expect("semaphore open")
             .forget();
     }
+
+    /// No store call here hangs, so no attempt is ever cut off.
+    async fn attempt_timer(&self, _duration: Duration) {
+        std::future::pending::<()>().await;
+    }
+}
+
+fn faults(op: Op, key: &str, faults: Vec<ScriptedFault>) -> Sequence {
+    let mut sequence = Sequence::new(op).with_key_contains(key);
+    for fault in faults {
+        sequence = sequence.then_fault(fault);
+    }
+    sequence.then_passthrough()
 }
 
 fn transient(op: Op, key: &str, failures: usize) -> Sequence {
-    let mut sequence = Sequence::new(op).with_key_contains(key);
-    for i in 0..failures {
-        sequence = sequence.then_fault(ScriptedFault::Transient(format!("blip {i}")));
-    }
-    sequence.then_passthrough()
+    faults(
+        op,
+        key,
+        (0..failures)
+            .map(|i| ScriptedFault::Transient(format!("blip {i}")))
+            .collect(),
+    )
+}
+
+fn kms_store() -> KmsRoutingStore {
+    KmsRoutingStore::new(
+        Arc::new(MemoryStore::new()),
+        ravel_object_store::s3::S3Config {
+            bucket: "ravel-test".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("http://localhost:0".to_string()),
+            access_key_id: "test".to_string(),
+            secret_access_key: "test".to_string(),
+            allow_http: true,
+            force_path_style: true,
+            kms_key_id: None,
+            session_token: None,
+            credentials_file: None,
+            auth: Default::default(),
+            instance_metadata_endpoint: None,
+        },
+        ravel_object_store::s3::S3HttpConfig::default(),
+        Arc::new(StoreMetrics::default()),
+    )
 }
 
 async fn seed_qualification(store: &dyn ObjectStoreBackend) {
@@ -164,43 +225,6 @@ fn server_config(
     }
 }
 
-/// `main`'s startup store reads, in its order, then `start`.
-async fn start_like_main(
-    store: Arc<dyn ObjectStoreBackend>,
-    retry: StartupRetry,
-    heartbeat: Heartbeat,
-) -> anyhow::Result<ravel_server::Running> {
-    startup_retry::enforce_qualification(&retry, store.as_ref(), StoreKind::S3, None).await?;
-    let tenancy =
-        startup_retry::resolve_tenancy(&retry, store.as_ref(), ConfiguredScheme::Unkeyed, 1)
-            .await?;
-    ravel_types::install_tenant_hash_scheme(tenancy.scheme)
-        .map_err(|_| anyhow::anyhow!("tenant-hash scheme was already installed"))?;
-    let fold_tenants = vec![TenantId::new("acme").hash()];
-    startup_retry::validate_static_provisioning(
-        &retry,
-        store.as_ref(),
-        &fold_tenants,
-        1,
-        Mode::All,
-        1,
-    )
-    .await?;
-    let gc =
-        ravel_server::gc_config::bootstrap_at_startup(store.clone(), 1, Mode::All, &retry).await?;
-    ravel_server::start_with_heartbeat_and_ipcrypt(
-        server_config(gc, fold_tenants),
-        store.clone(),
-        store,
-        Arc::new(StoreMetrics::default()),
-        None,
-        heartbeat,
-        ravel_server::ipcrypt::IpcryptPolicy::disabled(),
-        retry,
-    )
-    .await
-}
-
 async fn status(client: &reqwest::Client, url: String) -> u16 {
     client
         .get(url)
@@ -211,17 +235,39 @@ async fn status(client: &reqwest::Client, url: String) -> u16 {
         .as_u16()
 }
 
+/// Drive `future` to completion, releasing every retry sleep it reports.
+/// `at_retry` runs before each release; returns the result and the number
+/// of retries.
+async fn drive<T>(
+    future: impl std::future::Future<Output = T>,
+    clock: &GatedClock,
+    slept: &mut mpsc::UnboundedReceiver<Duration>,
+    mut at_retry: impl AsyncFnMut(usize),
+) -> (T, usize) {
+    tokio::pin!(future);
+    let mut retries = 0usize;
+    loop {
+        tokio::select! {
+            Some(_) = slept.recv() => {
+                retries += 1;
+                at_retry(retries).await;
+                clock.release.add_permits(1);
+            }
+            done = &mut future => return (done, retries),
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transient_store_failures_at_startup_delay_it_and_the_server_then_serves_readyz() {
     let fault = Arc::new(FaultStore::new(
         MemoryStore::new(),
         FaultPlan::empty()
-            .with_sequence(transient(
-                Op::Get,
-                QUALIFICATION_KEY,
-                QUALIFICATION_FAILURES,
-            ))
-            .with_sequence(transient(Op::List, "/s/l0/", LISTING_FAILURES))
+            .with_sequence(faults(Op::Get, QUALIFICATION_KEY, qualification_faults()))
+            .with_sequence(transient(Op::Get, TENANCY_KEY, TENANCY_FAILURES))
+            .with_sequence(transient(Op::Get, EPOCH_KEY, EPOCH_FAILURES))
+            .with_sequence(transient(Op::List, LISTING_KEY, LISTING_FAILURES))
+            .with_sequence(transient(Op::Get, GC_KEY, GC_FAILURES))
             .with_sequence(transient(Op::Get, IPCRYPT_MARKER_KEY, MARKER_FAILURES)),
     ));
     seed_qualification(fault.inner()).await;
@@ -235,38 +281,73 @@ async fn transient_store_failures_at_startup_delay_it_and_the_server_then_serves
     });
     let retry = StartupRetry::new(clock.clone(), Duration::from_secs(15), 1);
 
-    // `main` binds this listener later, after sys/gc, so during the earlier
-    // reads nothing listens at all; bound here, it shows /readyz is 503 at
-    // every retry, the marker retries inside `start` included.
+    let kms = kms_store();
+    let kms_config = ravel_server::tenant_kms::parse_tenant_kms_config(
+        "[tenants]\nacme = \"arn:aws:kms:us-east-1:111122223333:key/acme\"\n",
+    )
+    .expect("valid config");
+    let checks = run_startup_store_checks(
+        &retry,
+        StartupStoreInputs {
+            store: &store,
+            store_kind: StoreKind::S3,
+            backend_identity: None,
+            require_bucket_protection: false,
+            store_s3: None,
+            tenancy: ConfiguredScheme::Unkeyed,
+            tenant_kms: Some((&kms, &kms_config)),
+            shard_count: 1,
+            mode: Mode::All,
+        },
+        || vec![TenantId::new("acme").hash()],
+        || 1,
+    );
+    let (checked, check_retries) = drive(checks, &clock, &mut slept_rx, async |_| {}).await;
+    let StartupStoreState {
+        static_tenants, gc, ..
+    } = checked.expect("the startup store checks pass once the store recovers");
+    assert_eq!(
+        check_retries,
+        qualification_faults().len()
+            + TENANCY_FAILURES
+            + EPOCH_FAILURES
+            + LISTING_FAILURES
+            + GC_FAILURES
+    );
+
+    // Bound where `main` binds it: after the store checks, before `start`.
     let heartbeat = Heartbeat::new(Arc::new(ravel_ingest::SystemClock));
     let health = HealthListener::bind("127.0.0.1:0".parse().expect("addr"), heartbeat.clone())
         .expect("health listener binds");
     let health_readyz = format!("http://{}/readyz", health.local_addr());
     let client = reqwest::Client::new();
 
-    let startup = start_like_main(store, retry, heartbeat);
-    tokio::pin!(startup);
-    let mut retries = 0usize;
-    let running = loop {
-        tokio::select! {
-            Some(_) = slept_rx.recv() => {
-                retries += 1;
-                assert_eq!(
-                    status(&client, health_readyz.clone()).await,
-                    503,
-                    "/readyz must not be ready during startup retry {retries}"
-                );
-                clock.release.add_permits(1);
-            }
-            started = &mut startup => {
-                break started.expect("server starts once the store recovers");
-            }
-        }
-    };
+    let startup = ravel_server::start_with_heartbeat_and_ipcrypt(
+        server_config(gc, static_tenants),
+        store.clone(),
+        store,
+        Arc::new(StoreMetrics::default()),
+        None,
+        heartbeat,
+        ravel_server::ipcrypt::IpcryptPolicy::disabled(),
+        retry,
+    );
+    let (started, marker_retries) = drive(startup, &clock, &mut slept_rx, async |retry| {
+        assert_eq!(
+            status(&client, health_readyz.clone()).await,
+            503,
+            "/readyz must not be ready during marker retry {retry}"
+        );
+    })
+    .await;
+    let running = started.expect("server starts once the store recovers");
+    assert_eq!(marker_retries, MARKER_FAILURES);
 
+    assert_eq!(fault.fault_count(Op::Get, FaultKind::Timeout), 1);
+    assert_eq!(fault.fault_count(Op::Get, FaultKind::Throttled), 1);
     assert_eq!(
         fault.fault_count(Op::Get, FaultKind::Transient) as usize,
-        QUALIFICATION_FAILURES + MARKER_FAILURES
+        1 + TENANCY_FAILURES + EPOCH_FAILURES + GC_FAILURES + MARKER_FAILURES
     );
     assert_eq!(
         fault.fault_count(Op::List, FaultKind::Transient) as usize,
@@ -274,16 +355,21 @@ async fn transient_store_failures_at_startup_delay_it_and_the_server_then_serves
     );
     // Each sequence consumed its faults plus the passthrough: one attempt
     // more than its failures.
-    assert_eq!(
-        fault.sequence_progress(0) as usize,
-        QUALIFICATION_FAILURES + 1
-    );
-    assert_eq!(fault.sequence_progress(1) as usize, LISTING_FAILURES + 1);
-    assert_eq!(fault.sequence_progress(2) as usize, MARKER_FAILURES + 1);
-    assert_eq!(
-        retries,
-        QUALIFICATION_FAILURES + LISTING_FAILURES + MARKER_FAILURES
-    );
+    let expected_progress = [
+        qualification_faults().len(),
+        TENANCY_FAILURES,
+        EPOCH_FAILURES,
+        LISTING_FAILURES,
+        GC_FAILURES,
+        MARKER_FAILURES,
+    ];
+    for (index, failures) in expected_progress.into_iter().enumerate() {
+        assert_eq!(
+            fault.sequence_progress(index) as usize,
+            failures + 1,
+            "sequence {index}"
+        );
+    }
     assert!(clock.virtual_now() < Duration::from_secs(15));
 
     let readyz = format!("http://{}/readyz", running.http_addr);
