@@ -227,7 +227,7 @@ arrow-flight = { workspace = true, optional = true }
 # ADR-4326 assertion and mutant macros. The Antithesis SDK pin lives in
 # ravel-invariant; the `antithesis` feature below reaches it through that crate.
 # With no feature on every macro expands to nothing.
-ravel-invariant = { path = "../../crates/ravel-invariant", version = "0.33.0" }
+ravel-invariant = { workspace = true }
 # The coverage-instrumentation runtime shim, for the workloads under
 # antithesis/ (antithesis/README.md), linked only by the off-by-default
 # `antithesis` feature, which no published build enables. Pinned directly here

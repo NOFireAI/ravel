@@ -42,6 +42,9 @@ ravel-catalog = { path = "crates/ravel-catalog", version = "0.33.0" }
 ravel-cache = { path = "crates/ravel-cache", version = "0.33.0" }
 ravel-maintain = { path = "crates/ravel-maintain", version = "0.33.0" }
 ravel-fleet = { path = "crates/ravel-fleet", version = "0.33.0" }
+# ADR-4326 assertion and mutant macros; consumers turn on its features through
+# their own `antithesis`/`antithesis-mutants` forwards, not here.
+ravel-invariant = { path = "crates/ravel-invariant", version = "0.33.0" }
 ravel-otlp = { path = "crates/ravel-otlp", version = "0.33.0" }
 ravel-otap = { path = "crates/ravel-otap", version = "0.33.0" }
 ravel-remote-write = { path = "crates/ravel-remote-write", version = "0.33.0" }
