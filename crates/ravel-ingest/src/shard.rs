@@ -49,7 +49,7 @@ use uuid::Uuid;
 use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
 use crate::compat::{
-    CompatPublishRefusal, PublishGrant, PutAbort, STALE_VIEW_RETRY, warn_publish_refused,
+    CompatPublishRefusal, PublishGrant, PutAbort, stale_view_wait, warn_publish_refused,
 };
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LagCheck, MAX_FLUSH_ALL_PASSES,
@@ -2920,12 +2920,7 @@ impl ShardActor {
                     Ok(grant) => break (permit, grant),
                     Err(refused) if refused.is_view_stale() => {
                         drop(permit);
-                        let wait = clock.sleep(STALE_VIEW_RETRY);
-                        if ctx
-                            .bound_to_deadline(pinned.deadline_ns, wait)
-                            .await
-                            .is_none()
-                        {
+                        if !stale_view_wait(clock.as_ref(), pinned.deadline_ns).await {
                             ctx.abandon_compat(pinned, refused);
                             return;
                         }
@@ -6771,6 +6766,226 @@ mod tests {
         );
     }
 
+    /// How a router's shards reach their teardown flush.
+    #[derive(Debug, Clone, Copy)]
+    enum Teardown {
+        /// `shutdown()`: each actor's `Shutdown` drain, with the switch live.
+        Shutdown,
+        /// The router dropped: each actor's channel-closed drain, with the
+        /// switch gone, so the scan-set check answers `Unknown` and the floor
+        /// check `NoView` and only the drain's bypass passes open the flush.
+        Drop,
+    }
+
+    /// Tears `router` down as `teardown` says, in a task that ends once the
+    /// teardown call returns: after every shard's drain for `Shutdown`, at
+    /// once for `Drop`.
+    fn spawn_teardown(
+        router: Arc<IngestRouter>,
+        teardown: Teardown,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            match teardown {
+                Teardown::Shutdown => {
+                    Arc::try_unwrap(router)
+                        .ok()
+                        .expect("the test holds the only router handle")
+                        .shutdown()
+                        .await;
+                }
+                Teardown::Drop => drop(router),
+            }
+        })
+    }
+
+    /// One shard, one permit, and no age, size or arrival trigger inside the
+    /// test's clock steps, so the only flush of a buffered write is the one
+    /// the teardown drain opens.
+    fn teardown_only(max_flush_lifetime: Duration) -> IngestConfig {
+        IngestConfig {
+            max_flush_delay: Duration::from_secs(3600),
+            max_flush_delay_idle: Duration::from_secs(3600),
+            ..one_permit_one_queue(max_flush_lifetime)
+        }
+    }
+
+    /// Every key under `tenant`'s metrics prefix with its bytes, the
+    /// provisioning record included, in key order.
+    async fn tenant_objects(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+    ) -> Vec<(String, Bytes)> {
+        let mut keys = tenant_keys(store, tenant).await;
+        keys.sort();
+        let mut objects = Vec::new();
+        for key in keys {
+            let bytes = store.get(&key, GetRange::Full).await.expect("get").data;
+            objects.push((key, bytes));
+        }
+        objects
+    }
+
+    /// #4362 (ADR-4233 decision 4 as narrowed after the #4243 drill): after
+    /// an activation the teardown flush goes through the write policy like
+    /// every other flush. A buffered row acknowledged while the view was
+    /// fresh is still buffered when the view ages past the horizon (record
+    /// seen) and the router is torn down, by `shutdown()` and by a drop. The
+    /// teardown flush asks the view at grant, waits inside its
+    /// `max_flush_lifetime`, and is then refused `view_stale` and counted,
+    /// with nothing written: every key under the tenant, the fenced
+    /// provisioning record included, is byte for byte what it was. The
+    /// v0.33.0 bypass (publishing the teardown flush whatever the view says)
+    /// and a teardown that skips the grant on a dropped switch each store a
+    /// data object and a commit record; a grant that refuses a stale view at
+    /// once counts the refusal inside the lifetime.
+    #[tokio::test]
+    async fn a_teardown_flush_under_a_stale_view_after_an_activation_writes_nothing() {
+        for teardown in [Teardown::Shutdown, Teardown::Drop] {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let clock = TestClock::new(BASE_NS);
+            let compat_clock = CompatTestClock::at(BASE_NS);
+            let acme = TenantId::new("acme");
+            provision(store.as_ref(), &acme).await;
+            ravel_catalog::raise_compat_fence(
+                store.as_ref(),
+                &acme.hash(),
+                Signal::Metrics,
+                1,
+                BASE_NS,
+            )
+            .await
+            .expect("fence acme at the activation's epoch");
+            let view = compat_view(&store, &compat_clock, Some(compat_record(1, 7, 0))).await;
+            let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock.clone())
+                .with_family_versions(FormatFamily::Rseg, vec![7], 6);
+            let router = compat_router(
+                teardown_only(Duration::from_secs(60)),
+                &store,
+                &clock,
+                policy,
+            );
+            let metrics = router.metrics_handle();
+
+            spawn_write(&router, &acme, "h0", WriteMode::Buffered)
+                .await
+                .expect("write task")
+                .expect("acknowledged while the view is fresh");
+            until(|| metrics.snapshot().buffered_points_total >= 1).await;
+            let before = tenant_objects(store.as_ref(), &acme).await;
+            assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 0);
+            compat_clock.advance_ns(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS);
+
+            let torn_down = spawn_teardown(router, teardown);
+            until(|| metrics.snapshot().flushes_manual >= 1).await;
+            stale_retries(&clock, 30).await;
+            assert_eq!(
+                metrics.snapshot().compat_publish_refused.total(),
+                0,
+                "{teardown:?}: inside its lifetime the teardown flush waits"
+            );
+            assert_eq!(
+                objects(&tenant_keys(store.as_ref(), &acme).await),
+                0,
+                "{teardown:?}: no PUT while the view is stale"
+            );
+
+            stale_retries(&clock, 31).await;
+            assert!(
+                settles(|| metrics.snapshot().compat_publish_refused.view_stale == 1).await,
+                "{teardown:?}: {:?}",
+                metrics.snapshot().compat_publish_refused
+            );
+            tokio::time::timeout(Duration::from_secs(30), torn_down)
+                .await
+                .expect("the teardown ends")
+                .expect("teardown task");
+            let snapshot = metrics.snapshot();
+            assert_eq!(snapshot.compat_publish_refused.total(), 1, "{teardown:?}");
+            assert_eq!(snapshot.flushes_manual, 1, "{teardown:?}");
+            assert_eq!(snapshot.flushes_by_age, 0, "{teardown:?}");
+            assert_eq!(
+                tenant_objects(store.as_ref(), &acme).await,
+                before,
+                "{teardown:?}: the teardown wrote nothing"
+            );
+            assert_eq!(bucket_compat_epoch(store.as_ref(), &acme).await, 1);
+        }
+    }
+
+    /// #4362, ADR-4233 decision 1: on a store that never ran compat init the
+    /// teardown flush publishes the acknowledged buffered row at the
+    /// baseline, as v0.33.0 did, by `shutdown()` and by a drop, both when the
+    /// view read `sys/compat` absent and when it is blind (its only read
+    /// refused `AccessDenied`) and past the horizon. Nothing is refused, the
+    /// bucket stays unfenced, and no `sys/compat` object appears. A teardown
+    /// refused for want of a live switch, or one that treats a blind view as
+    /// stale, stores nothing.
+    #[tokio::test]
+    async fn a_teardown_flush_on_a_never_activated_store_publishes_at_the_baseline() {
+        for teardown in [Teardown::Shutdown, Teardown::Drop] {
+            for get in [CompatGet::Passthrough, CompatGet::AccessDenied] {
+                let case = format!("{teardown:?}, {get:?}");
+                let (compat_store, compat_clock, view) = view_after_one_refresh(get).await;
+                if get == CompatGet::AccessDenied {
+                    compat_clock.advance_ns(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS);
+                }
+                let store: Arc<dyn ObjectStoreBackend> = compat_store.clone();
+                let clock = TestClock::new(BASE_NS);
+                let acme = TenantId::new("acme");
+                let policy = crate::compat::IngestCompatPolicy::new(view, compat_clock);
+                let router = compat_router(
+                    teardown_only(Duration::from_secs(60)),
+                    &store,
+                    &clock,
+                    policy,
+                );
+                let metrics = router.metrics_handle();
+
+                spawn_write(&router, &acme, "h0", WriteMode::Buffered)
+                    .await
+                    .expect("write task")
+                    .expect("acknowledged");
+                until(|| metrics.snapshot().buffered_points_total >= 1).await;
+                assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 0);
+
+                let torn_down = spawn_teardown(router, teardown);
+                let mut stored = 0;
+                for _ in 0..20_000 {
+                    stored = objects(&tenant_keys(store.as_ref(), &acme).await);
+                    if stored == 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(stored, 2, "{case}: the teardown flush published");
+                tokio::time::timeout(Duration::from_secs(30), torn_down)
+                    .await
+                    .expect("the teardown ends")
+                    .expect("teardown task");
+                assert_eq!(
+                    committed_rseg_versions(store.as_ref(), &acme).await,
+                    vec![u32::from(crate::SEGMENT_FORMAT_VERSION)],
+                    "{case}"
+                );
+                let snapshot = metrics.snapshot();
+                assert_eq!(snapshot.compat_publish_refused.total(), 0, "{case}");
+                assert_eq!(snapshot.flushes_manual, 1, "{case}");
+                assert_eq!(
+                    bucket_compat_epoch(store.as_ref(), &acme).await,
+                    0,
+                    "{case}"
+                );
+                assert!(
+                    list_all(store.as_ref(), "sys/")
+                        .await
+                        .expect("list sys/")
+                        .is_empty(),
+                    "{case}: no sys/compat object"
+                );
+            }
+        }
+    }
+
     /// The view names an RSEG version this build cannot write: a strict and
     /// a buffered write are both refused at admission, retryably, counted,
     /// and nothing is buffered, charged or stored.
@@ -7134,20 +7349,24 @@ mod tests {
         }
     }
 
-    /// ADR-4233 decision 7: `sys/compat` lowers `max_publish_lifetime_ns`
-    /// below the router's `max_flush_lifetime` after the router was built.
-    /// The next write is refused at admission and the flush already
-    /// acknowledged is refused at grant, both `publish_lifetime_above_compat`
-    /// with nothing stored; a check made only when the policy was installed
-    /// publishes it.
+    /// ADR-4233 decision 7: `max_publish_lifetime_ns` is never lowered, so a
+    /// record whose bound is below a live router's `max_flush_lifetime` is
+    /// one `compat init` wrote while the router ran. A buffered write
+    /// acknowledged before init still publishes, at the baseline, inside the
+    /// router's own lifetime; only the write after init is refused, at
+    /// admission, `publish_lifetime_above_compat`. A grant that re-checks the
+    /// bound drops the acknowledged rows; an admission that does not check it
+    /// acknowledges the second write.
     #[tokio::test]
-    async fn a_publish_lifetime_lowered_below_the_router_is_refused_at_admission_and_grant() {
+    async fn compat_init_below_a_live_routers_lifetime_refuses_admission_and_publishes_admitted_rows()
+     {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let clock = TestClock::new(BASE_NS);
         let compat_clock = CompatTestClock::at(BASE_NS);
         let acme = TenantId::new("acme");
         provision(store.as_ref(), &acme).await;
-        let view = compat_view(&store, &compat_clock, Some(compat_record(1, 7, 0))).await;
+        let view = compat_view(&store, &compat_clock, None).await;
+        assert!(!view.record_seen());
         let policy = crate::compat::IngestCompatPolicy::new(view.clone(), compat_clock.clone());
         let router = compat_router(
             buffered_on_the_tick(Duration::from_secs(3600)),
@@ -7159,16 +7378,22 @@ mod tests {
         spawn_write(&router, &acme, "h0", WriteMode::Buffered)
             .await
             .expect("write task")
-            .expect("acknowledged under an unbounded record");
-        ravel_catalog::compat::update_compat(store.as_ref(), &compat_keys(), |record| {
-            record.max_publish_lifetime_ns = 60_000_000_000;
-            Ok(())
-        })
+            .expect("acknowledged before compat init");
+        let current = FormatFamily::Rseg.writable_version_under(None);
+        ravel_catalog::compat::create_compat(
+            store.as_ref(),
+            &compat_keys(),
+            compat_record(1, current, 60_000_000_000),
+        )
         .await
-        .expect("lower the publish lifetime");
-        view.refresh().await.expect("read sys/compat");
+        .expect("compat init");
+        assert!(view.refresh().await.expect("read sys/compat").present);
 
-        let above = |err: &WriteError| {
+        let err = spawn_write(&router, &acme, "h1", WriteMode::Buffered)
+            .await
+            .expect("write task")
+            .expect_err("refused at admission");
+        assert!(
             matches!(
                 err,
                 WriteError::CompatRefused(
@@ -7178,20 +7403,29 @@ mod tests {
                         max_publish_lifetime_ns: 60_000_000_000,
                     }
                 )
-            )
-        };
-        let err = spawn_write(&router, &acme, "h1", WriteMode::Buffered)
-            .await
-            .expect("write task")
-            .expect_err("refused at admission");
-        assert!(above(&err), "{err:?}");
-        assert_eq!(refused(&router).publish_lifetime_above_compat, 1);
+            ),
+            "{err:?}"
+        );
+        assert!(err.is_retryable());
+        assert_eq!(router.metrics().snapshot().buffered_points_total, 1);
 
         clock.advance_ns(TICK_ADVANCE_NS);
-        let settled = settles(|| refused(&router).publish_lifetime_above_compat == 2).await;
-        assert_eq!(objects(&tenant_keys(store.as_ref(), &acme).await), 0);
-        assert!(settled, "{:?}", refused(&router));
-        assert_eq!(refused(&router).total(), 2);
+        let mut stored = 0;
+        for _ in 0..20_000 {
+            stored = objects(&tenant_keys(store.as_ref(), &acme).await);
+            if stored == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(stored, 2, "the acknowledged flush published");
+        assert_eq!(
+            committed_rseg_versions(store.as_ref(), &acme).await,
+            vec![current]
+        );
+        assert_eq!(bucket_compat_epoch(store.as_ref(), &acme).await, 0);
+        assert_eq!(refused(&router).publish_lifetime_above_compat, 1);
+        assert_eq!(refused(&router).total(), 1);
         router.flush_all().await;
     }
 
