@@ -1,0 +1,23 @@
+# Local-loop overrides (scripts/local-run.sh), layered over
+# ../config/docker-compose.yaml. Kept outside the config directory so it never
+# reaches the config image.
+services:
+  ravel1:
+    environment:
+      ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl
+  ravel2:
+    environment:
+      ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl
+  maint1:
+    environment:
+      ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl
+  maint2:
+    environment:
+      ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl
+  driver:
+    environment:
+      ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl
+      WORKLOAD_INJECT_SWAPPED_RECORD: ${WORKLOAD_INJECT_SWAPPED_RECORD:-}
+      # The local loop has no ANTITHESIS_STOP_FAULTS and no fault-free phase,
+      # so the driver forces its eventually after this long (scripts/local-run.sh).
+      WORKLOAD_EVENTUALLY_AFTER_SECS: ${WORKLOAD_EVENTUALLY_AFTER_SECS:-240}
