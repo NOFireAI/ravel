@@ -16,14 +16,16 @@ and nothing is shared between clones. A first build writes 54 to 70 GB. A
 full disk stops commands in every session on the Mac, not only the
 sandbox.
 
-So `make brig-new`, `make brig`, `make brig-shell` and `make brig-update`
-refuse in these cases:
+So the make targets refuse in these cases:
 
-| Check | Refuses when | To run anyway |
-| --- | --- | --- |
-| Free disk, clone not built yet | less than 70 GB free | `RAVEL_BRIG_MIN_FREE_GB=<n>` |
-| Free disk, clone built before | less than 20 GB free | `RAVEL_BRIG_WARM_FREE_GB=<n>` |
-| Another Ravel sandbox | one is running, or `brig --json ls` fails | `RAVEL_BRIG_ALLOW_PARALLEL=1` |
+| Check | Targets | Refuses when | To run anyway |
+| --- | --- | --- | --- |
+| Free disk, clone not built yet | `brig-new`, `brig`, `brig-shell`, `brig-update` | less than 70 GB free | `RAVEL_BRIG_MIN_FREE_GB=<n>` |
+| Free disk, clone built before | `brig`, `brig-shell`, `brig-update` | less than 20 GB free | `RAVEL_BRIG_WARM_FREE_GB=<n>` |
+| Another Ravel sandbox | `brig`, `brig-shell`, `brig-update` | one is running, or `brig --json ls` fails | `RAVEL_BRIG_ALLOW_PARALLEL=1` |
+
+`make brig-new` boots nothing, so it makes a clone while another sandbox
+runs.
 
 Nothing removes a clone for you. When a ticket merges, remove its sandbox and
 its clone:

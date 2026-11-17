@@ -176,6 +176,13 @@ STUB_LS=$(ls_json running "${clone}") brig_sh run t1
 expect_code "this clone's own sandbox does not count" 0
 STUB_LS=$(ls_json running "${TMP}/elsewhere/project") brig_sh run t1
 expect_code "a sandbox of another project does not count" 0
+STUB_LS='{"data":{"sandboxes":null}}' brig_sh run t1
+expect_code "a null sandbox list counts as none" 0
+STUB_LS='{"data":{}}' brig_sh run t1
+expect_code "a missing sandbox list counts as none" 0
+STUB_LS=$(ls_json running "${clones}/other") brig_sh new t3
+expect_code "new makes a clone beside a running sandbox" 0
+expect_no_log "new does not list sandboxes" "--json ls"
 STUB_LS_FAIL=1 brig_sh run t1
 expect_code "a failed listing refuses" 1
 expect_out "the listing refusal says it could not check" "could not list sandboxes"

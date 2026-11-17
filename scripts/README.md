@@ -260,10 +260,11 @@ connection, a pushed-but-broken main).
   `new`, `run`, `shell` and `update` also exit 1 when the clone's volume
   has less than `RAVEL_BRIG_MIN_FREE_GB` free (default 70) for a clone
   with no `target/brig/` yet, or less than `RAVEL_BRIG_WARM_FREE_GB`
-  (default 20) for one that has built; and when another sandbox whose
-  project is under the clones directory is running, or `brig --json ls`
-  cannot say (`RAVEL_BRIG_ALLOW_PARALLEL=1` skips that check). `update`
-  checks before it removes anything.
+  (default 20) for one that has built. `run`, `shell` and `update`, not
+  `new`, also exit 1 when another sandbox whose project is under the
+  clones directory is running, or when `brig --json ls` cannot say
+  (`RAVEL_BRIG_ALLOW_PARALLEL=1` skips that check). `update` checks
+  before it removes anything.
   `update` passes on brig's exit code when `brig rm` fails with anything
   but 3 (no sandbox). `IMAGE=<ref>` runs another build of the guest
   image. It sets `BRIG_HYPERVISOR=hvi` on macOS, which the routes need.
