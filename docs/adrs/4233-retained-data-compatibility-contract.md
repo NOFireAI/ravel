@@ -270,7 +270,8 @@ message AdoptedVersion { string family = 1; uint32 version = 2; uint64 count = 3
 - **No capability evidence authorizes activation.** The command reports the
   live maintain heartbeats and query workers it can see, as information.
   Safety does not depend on them: decision 4 makes a process that cannot
-  read the new version fail closed whether or not it ever heartbeated.
+  read the new version fail closed whether or not it ever heartbeated
+  (narrowed for pre-baseline processes by the prerequisite amendment below).
 
 ### 4. Fencing: what stops a process that cannot read an activated version
 
@@ -313,7 +314,8 @@ fail closed, and wave 0 measures them against the released binary.
   record, which every pre-baseline write path already refuses above version
   3: the ingest flush (`GenerationSwitch`), first-touch provisioning, server
   startup for named tenants, the maintenance floor check, `migrate`, query
-  resolution, the fold and the CLI. `ProvisioningRecord` gains
+  resolution, the fold and the CLI (narrowed by the prerequisite amendment
+  below: the drill found v0.33.0 paths that never read it). `ProvisioningRecord` gains
   `uint64 compat_epoch = 8` and `sfixed64 compat_fenced_unix_ns = 9` (when
   that bucket's fence was raised to that epoch); a record carrying them is
   written at
@@ -341,7 +343,8 @@ fail closed, and wave 0 measures them against the released binary.
   `fence_complete_unix_ns` in the family's entry once the walk covered every
   bucket; buckets provisioned later are fenced by conditional publication.
   A pre-baseline process then refuses every write path into a fenced bucket
-  once its cached view expires. Its ingest router keeps answering from a
+  once its cached view expires (narrowed by the prerequisite amendment
+  below: the drill found v0.33.0 paths that never read the record). Its ingest router keeps answering from a
   cached view inside `GenerationSwitch`'s trust horizon after a failed
   refresh, so for up to that horizon it can still write the older version,
   which baseline readers read. A pre-baseline flush chooses its version
@@ -402,6 +405,8 @@ fail closed, and wave 0 measures them against the released binary.
 Wave 0 of the epic proves the provisioning and lease fences against the
 released v0.33.0 image (decision 9). If any v0.33.0 write path publishes
 into a fenced bucket after its grace horizon, this decision is reopened.
+The drill found such paths, and the decision was reopened and narrowed: see the
+prerequisite amendment below.
 
 ### 5. Rollback and downgrade
 
@@ -410,7 +415,7 @@ into a fenced bucket after its grace horizon, this decision is reopened.
 | Release B+1 installed, F not activated, roll back to B | yes | B+1 wrote only versions B reads |
 | F activated, no N+1 object published yet, roll back to B | the data is safe; F's writes stop | B reads `sys/compat`, sees F above what it writes, refuses F's publishes; activation is not undone, so F's ingest waits for a roll forward |
 | F activated and N+1 objects exist, roll back to B | no: unsupported downgrade | B refuses F's publishes and fails closed on N+1 objects (typed), so queries touching them fail; nothing is deleted (retention version hold); the remedy is to roll forward |
-| F activated, roll back to a pre-baseline release | no: outside the contract | excluded by the prerequisite; as defence in depth the provisioning and lease fences make its ingest, maintenance, fold, query and alerting fail closed on fenced buckets, and its audit writes are caught by the late-write pass |
+| F activated, roll back to a pre-baseline release | no: outside the contract | excluded by the prerequisite; as defence in depth the provisioning and lease fences make its request admission, folds and maintenance under `m`/`l`/`s`, queries and alert evaluation fail closed on fenced buckets; other paths (metadata, audit and alert retention deletes, teardown flushes) are covered only by the prerequisite (see the prerequisite amendment below) |
 | F certified, retired-reader release B+2 installed, roll back to B+1 | yes | B+1 reads N+1 |
 
 The irreversible step is the first activation of a version some deployed
@@ -466,8 +471,10 @@ For a class A family:
   over every provisioned bucket + G_pre) + clock_skew_allowance`, where a
   born-fenced bucket (`compat_fenced_unix_ns = 0`) is left out of the
   maximum. Decisions 3 and 4 define the terms. After that no in-contract
-  writer, and no pre-baseline writer on a fenced bucket, can still land N,
-  except a process paused between its check and its PUT.
+  writer, and no pre-baseline writer on a fenced bucket, can still land N
+  (see the prerequisite amendment below), except a process paused between
+  its check and its PUT. For pre-baseline writers this rests on the
+  prerequisite: a v0.33.0 teardown flush has no time bound.
 - **The time precondition gates `S`.** `certify` refuses to start a census,
   and so to record `S`, before the bound above has passed; a resumed run
   keeps its `S`, which already satisfied the activation term. The per-bucket
@@ -488,7 +495,8 @@ For a class A family:
   and the legal-hold writer gain the same abandon-at-`P` rule. A process
   configured with a `max_flush_lifetime` or `max_compaction_lifetime` above
   the recorded `P` refuses publishes with `PublishLifetimeAboveCompat`
-  rather than outliving the bound.
+  rather than outliving the bound (for ingest, at admission only: see the
+  prerequisite amendment below).
 - **Population.** For every tenant (strict discovery listing), every signal
   the family carries (RLOG: logs, alerts, audit; RSEG: metrics; RSPAN:
   spans), every shard in the generation history: live L0 records, the parts
@@ -564,8 +572,10 @@ For a class A family:
   `H + P + T_req`, and once F is certified `--write-below-format-floor` is
   refused for F. Pre-baseline writers are excluded by the prerequisite and
   mostly fenced (decision 4). What remains (a paused process, the audit
-  writer of a pre-baseline process that outlived the rollout) is caught by
-  the late-write pass above rather than prevented.
+  writer of a pre-baseline process that outlived the rollout, and a v0.33.0
+  teardown flush) is caught by the late-write pass above rather than
+  prevented. Metadata, idempotency markers and retention deletions are not
+  caught: see the prerequisite amendment below.
 - **Restores.** A restore of a noncurrent object version from bucket
   versioning (ADR-0072) can bring back an N object after certification.
   That is a restore into a state the certificate does not describe: the
@@ -673,7 +683,8 @@ For a class A family:
   and whose alert lease was parked by the baseline code, including a run
   where v0.33.0 holds the lease when it is parked. The drill lists the
   bucket before and after and asserts that no object or record lands in a
-  fenced bucket after `G_pre` and that the evaluator stops writing
+  fenced bucket after `G_pre` (replaced by the prerequisite amendment's
+  drill verdict below) and that the evaluator stops writing
   transitions; it records every write it observes.
 - **Previous-release lane.** From the release after the baseline on, CI runs
   the previous release's published image against a store the release under
@@ -708,6 +719,9 @@ flowchart LR
     Cert[compat certify] -->|strict census + trailer GET| C
     C -->|certificate at startup| R[retired-reader release]
 ```
+
+The diagram's pre-baseline CLI arrow is narrowed by the prerequisite
+amendment below: several v0.33.0 CLI write paths never read the record.
 
 ## Compatibility matrix (the contract)
 
@@ -765,7 +779,9 @@ holding versions outside B's read set (decision 1).
   an advisory cursor and takes `--budget-records`, the `migrate` cost
   control.
 - **External prerequisites.** Every pre-baseline process is terminated
-  before the first activation above the baseline. Clocks are inside
+  before the first activation above the baseline; `compat activate` must
+  refuse without the operator's attestation of it (see the prerequisite amendment
+  below). Clocks are inside
   `clock_skew_allowance`. Restores from bucket versioning after
   certification follow decision 7's restore procedure.
 - **Residual risk.** A pre-baseline query process that outlives the rollout
@@ -775,7 +791,7 @@ holding versions outside B's read set (decision 1).
   land a late write. All are readable until retirement, and after
   retirement the late-write pass (decision 7) finds them; none is a silent
   wrong answer or a deletion (narrowed by the audit retention amendment
-  below).
+  and the prerequisite amendment below: alert history deletion).
 - **Cost of the late-write pass.** One LIST of every commit page of the
   retired family's signals per daily pass, plus one GET per record whose
   `LastModified` is after the persisted watermark. Startup reads only
@@ -821,3 +837,87 @@ Consequences sentence that no residual is a deletion therefore holds for
 the other residuals it lists and for the audit records such a process
 writes, not for its audit retention. The prerequisite is the only control
 over this residual; no fence and no pass detects it.
+
+## Amendment (2026-11-17): the pre-baseline fence is defence in depth; the prerequisite is the guarantee (issue #4243)
+
+<!-- amendment-applies: sections="4. Fencing: what stops a process that cannot read an activated version|5. Rollback and downgrade|7. Retiring a reader requires a certificate that stays checkable|9. Evidence: an executable compatibility matrix and a frozen corpus|Consequences" pointer="prerequisite amendment" -->
+<!-- amendment-supersedes: phrase="refuses every write path into a fenced bucket" pointer="prerequisite amendment" -->
+<!-- amendment-supersedes: phrase="no pre-baseline writer on a fenced bucket" pointer="prerequisite amendment" -->
+<!-- amendment-supersedes: phrase="fenced bucket after `G_pre`" pointer="prerequisite amendment" -->
+
+Decision 4's kill criterion fired. The released-binary drill (decision 9,
+wave 0; two runs, recorded on issue #4243) ran the signed v0.33.0 release
+binary against isolated buckets and found v0.33.0 write paths that never
+consult the provisioning record or the generation trust view, so they
+publish into a fenced bucket after any horizon:
+
+- the admission reconciler rewrites `t/<h>/{m,l,s}/admission/<pid>.snapshot`
+  every 10 s;
+- maintain scrub writes `t/<h>/{m,l,s}/maint/scrub/<shard>.cursor`, and its
+  provisioning read fails open;
+- the ingest teardown pass writes a held buffer in place at process stop, a
+  data object and its commit record, with no time bound (the hold is the
+  same one issue #4363 tracks for baseline-or-later processes);
+- the metadata sink writes `t/<h>/m/meta`, and idempotency markers ride the
+  teardown flush;
+- audit maintenance (`u/`), alert retention deletes and sweep (which never
+  read the alert lease), `t/<h>/enc` at startup with tenant KMS, and the CLI
+  paths that rebuild a key index, reconstruct commit records, submit
+  erasures or write tenant config.
+
+The decision is narrowed as follows, by owner decision (delegated):
+
+- **The prerequisite is the guarantee.** Every pre-baseline process is
+  terminated before the first activation above the baseline, and
+  `compat activate` must refuse unless the operator attests it with
+  `--pre-baseline-processes-terminated`. The attestation is recorded in
+  the family entry's existing `activated_by` field; no field is added to
+  `sys/compat`.
+- **The fence is defence in depth, with a narrowed claim.** Against a
+  pre-baseline process that outlives the rollout anyway, the provisioning
+  and lease fences claim exactly this: its request admission refuses once
+  its trust view lapses, its folds and its maintenance under `m`, `l` and
+  `s` refuse, its queries refuse, and its alert evaluator stops at the
+  parked lease. Every fence-scope row of the second drill run passed, warm
+  and cold, and reads of a v0.33.0-written store were identical on v0.33.0 and
+  the baseline.
+- **Exempt advisory writes.** `admission/<pid>.snapshot` and
+  `maint/scrub/<shard>.cursor` carry no data; a baseline build reads the
+  same snapshot version, counts a stale sibling only until it ages out, and
+  resumes from or overwrites a cursor. They are exempt.
+- **Covered only by the prerequisite.** `m/meta`, the teardown flush and its
+  idempotency markers, audit maintenance, alert retention deletes and sweep,
+  `t/<h>/enc`, `t/<h>/config`, and the CLI paths above. A teardown data
+  object lands at the version v0.33.0 writes, and `certify`'s census and
+  the late-write pass flag it (the deterministic test in
+  `crates/ravel-compat-tests` pins this). The irreversible residual is a
+  pre-baseline maintain process deleting alert history, and audit objects,
+  by age with no version hold after an activation; no fence and no pass
+  detects a deletion, so the prerequisite is its only control. `compat
+  activate`'s help and the operator procedure must name this residual next to
+  the attestation flag.
+- **The baseline's own writers.** The baseline's metadata sink,
+  idempotency markers and `enc` writer carry no compat gate. That is safe
+  only because none of those formats is an activation family in this ADR
+  (decision 8); any future bump of one of them must add the gate first.
+- **Drill verdict.** The drill no longer asserts that no object lands after
+  `G_pre`. It fails on any 2xx ingest after the trust limit, any
+  non-teardown `l0`/`c` write under `m`, `l` or `s` after the horizon, any
+  fold, compaction, retention or sweep write or removal there, any teardown
+  data object at a version v0.33.0 does not write, any query served from a
+  fenced bucket, any alert lease or alert history write after the alerts
+  horizon, any read mismatch, a positive control at zero, or any write that
+  matches no class; it records and classifies everything else. Its census
+  row became the deterministic test above, because `certify`'s time gate
+  opens about 6 h after the fence, past any drill run.
+- **Ingest publish lifetime.** A baseline ingest router whose
+  `max_flush_lifetime` is above the recorded `P` refuses at admission;
+  rows it acknowledged before it saw that `P` publish within the router's
+  own lifetime rather than being dropped. `P` is recorded by `compat init`
+  and only raised later, so this window exists only when `init` records a
+  `P` below a live router's lifetime.
+
+The replacement kill criterion: if a pre-baseline process that outlives
+the rollout writes into a fenced bucket on any path outside the classes
+above, or any fence-scope row of the drill fails, this decision is reopened
+again.
