@@ -140,11 +140,19 @@ a bill ([guides/cost-model.md](guides/cost-model.md)).
 ### Startup store reads
 
 Before any listener binds, a server reads the store to check that it may
-start: `sys/qualification`, `sys/tenancy`, the key-epoch records of the
-tenants in `--tenant-kms-config`, the `shard_count` provisioning records of
-the statically known tenants, and `sys/gc`. `start` then reads the
-`sys/ipcrypt/policy` marker in the `all` and `gateway` modes. Each of these
-reads refuses to start when its answer is wrong.
+start: `sys/qualification`, the retired-reader gate's reads, `sys/tenancy`,
+the key-epoch records of the tenants in `--tenant-kms-config`, the
+`shard_count` provisioning records of the statically known tenants, and
+`sys/gc`. `start` then reads the `sys/ipcrypt/policy` marker in the `all` and
+`gateway` modes. Each of these reads refuses to start when its answer is
+wrong.
+
+The retired-reader gate (ADR-4233 decision 7) runs in every mode, after the
+bucket-protection read and before `sys/tenancy` is pinned, because pinning
+writes `sys/tenancy` on a fresh store and the gate tells a fresh store from
+an unadopted one by that marker's absence. It reads `sys/compat` and, when
+that is absent, `sys/tenancy`. A build that retires no reader, which is
+every build today, sends no request here.
 
 A transient store error does not count as a wrong answer. A transient store
 error is a store error that `StoreError::is_retryable` accepts: `Transient`,
@@ -180,7 +188,12 @@ retry bound off.
 Any other error refuses at once, with the same message as before retry
 existed. Examples are an absent or stale qualification record, a corrupt
 marker, a scheme, key or policy mismatch, pre-ADR data that the configured
-`--shards` would hide, and a refused credential. A marker or record that the
+`--shards` would hide, a refused credential, and every retired-reader gate
+refusal: a family with no certificate or one below the oldest version the
+build reads, a contradicted certificate, a late-write watermark not past the
+census, `sys/compat` present with no deployment key to authenticate it, and
+`sys/tenancy` present without `sys/compat`. A transient store error inside
+the gate, on its HEADs or on the `sys/compat` read, retries like any other. A marker or record that the
 server creates during these reads is written create-if-absent or under
 compare-and-swap, and every retry starts again from the read. So a write
 that landed before an ambiguous failure reads back as present on the next
