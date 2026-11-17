@@ -148,12 +148,19 @@ pub fn parse_inspect(text: &str) -> Inspected {
     out
 }
 
-/// The part key from `catalog inspect`'s `failed to fetch part <key>: ...`
-/// error: HEAD names an object the store could not return.
+/// The part key from `catalog inspect`'s
+/// `Error: failed to fetch part <key>: object not found` (anyhow's report of a
+/// `StoreError::NotFound`): HEAD names a part the store does not hold. `None`
+/// for any other cause (a transient or skew error, a timeout); the audit
+/// then has no verdict for that pass.
 pub fn unfetched_part(stderr: &str) -> Option<String> {
-    let rest = &stderr[stderr.find("failed to fetch part ")? + "failed to fetch part ".len()..];
-    let key = rest.split([':', ' ', '\n']).next()?;
-    (!key.is_empty()).then(|| key.to_string())
+    stderr.lines().find_map(|line| {
+        let (key, cause) = line
+            .trim()
+            .strip_prefix("Error: failed to fetch part ")?
+            .split_once(": ")?;
+        (!key.is_empty() && cause.trim() == "object not found").then(|| key.to_string())
+    })
 }
 
 /// The data object key from `rlog footprint`'s
@@ -179,8 +186,83 @@ pub fn unfetched_object(stderr: &str, tenant_prefix: &str) -> Option<String> {
 }
 
 /// The suffix of every data object key Ravel writes, level 0 and level 1
-/// alike (`ravel_commit::keys::DATA_SUFFIX`).
+/// alike: `.` followed by `ravel_commit::keys::DATA_SUFFIX` (`rseg`).
 pub const DATA_SUFFIX: &str = ".rseg";
+
+/// The keys of one level-0 input a compaction record names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputKeys {
+    /// The input's commit record, in the compaction record's own directory.
+    pub commit: String,
+    /// The input's data object key up to its content hash, which the record
+    /// does not carry: `<tenant_prefix>l/l0/<shard>/<writer>.<epoch>.<seq>.`.
+    pub data_prefix: String,
+}
+
+/// The inputs of the compaction record at `record_key`, from what `ravel-cli
+/// commit decode-compaction` printed for it. The keys follow
+/// `ravel_commit::keys::commit_key` and `data_key`. `None` when the record
+/// key is not a logs compaction record under `tenant_prefix`, or the output
+/// lists another number of `writer_id=` lines than its `inputs:` count.
+pub fn compaction_inputs(
+    tenant_prefix: &str,
+    record_key: &str,
+    decoded: &str,
+) -> Option<Vec<InputKeys>> {
+    let rest = record_key
+        .strip_prefix(tenant_prefix)?
+        .strip_prefix("l/c/")?;
+    let (dir, name) = record_key.rsplit_once('/')?;
+    if !(name.starts_with("l1.") && name.ends_with(".cmt")) {
+        return None;
+    }
+    let shard = rest.split('/').next().filter(|s| !s.is_empty())?;
+    let mut count = None;
+    let mut inputs = Vec::new();
+    for line in decoded.lines() {
+        let line = line.trim();
+        if let Some(n) = line.strip_prefix("inputs: ") {
+            count = Some(n.trim().parse::<usize>().ok()?);
+            continue;
+        }
+        let Some(fields) = line.strip_prefix("writer_id=") else {
+            continue;
+        };
+        let mut it = fields.split_whitespace();
+        let writer = it.next()?;
+        let epoch: u64 = it.next()?.strip_prefix("writer_epoch=")?.parse().ok()?;
+        let seq: u64 = it.next()?.strip_prefix("writer_seq=")?.parse().ok()?;
+        let id = format!("{writer}.{epoch}.{seq:020}");
+        inputs.push(InputKeys {
+            commit: format!("{dir}/{id}.cmt"),
+            data_prefix: format!("{tenant_prefix}l/l0/{shard}/{id}."),
+        });
+    }
+    (count? == inputs.len()).then_some(inputs)
+}
+
+/// The input keys of `inputs` that an earlier LIST held (`seen`) and
+/// `listed` does not: the input's commit record, and every data object
+/// under its data prefix ending in [`DATA_SUFFIX`].
+pub fn swept_inputs(
+    inputs: &[InputKeys],
+    seen: &BTreeSet<String>,
+    listed: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut gone = Vec::new();
+    for input in inputs {
+        if seen.contains(&input.commit) && !listed.contains(&input.commit) {
+            gone.push(input.commit.clone());
+        }
+        gone.extend(
+            seen.range(input.data_prefix.clone()..)
+                .take_while(|k| k.starts_with(&input.data_prefix))
+                .filter(|k| k.ends_with(DATA_SUFFIX) && !listed.contains(*k))
+                .cloned(),
+        );
+    }
+    gone
+}
 
 /// The keys HEAD names that the listing does not hold.
 pub fn missing_named(named: &[String], listed: &BTreeSet<String>) -> Vec<String> {
@@ -424,13 +506,124 @@ parts: 1
     }
 
     #[test]
-    fn an_unfetched_part_is_named() {
-        let err = "Error: failed to fetch part t/0a0b/catalog/l/snap/1.aa.csnap: not found\n";
+    fn a_part_not_found_is_named() {
+        let err =
+            "Error: failed to fetch part t/0a0b/catalog/l/snap/1.aa.csnap: object not found\n";
         assert_eq!(
             unfetched_part(err).as_deref(),
             Some("t/0a0b/catalog/l/snap/1.aa.csnap")
         );
         assert_eq!(unfetched_part("Error: HEAD at k is corrupt: bad"), None);
+    }
+
+    #[test]
+    fn a_part_fetch_failing_otherwise_has_no_verdict() {
+        for cause in [
+            "transient error: connection reset",
+            "timeout",
+            "throttled, retry after 1000 ms",
+            "access denied: RequestTimeTooSkewed",
+            "not found",
+        ] {
+            let err =
+                format!("Error: failed to fetch part t/0a0b/catalog/l/snap/1.aa.csnap: {cause}\n");
+            assert_eq!(unfetched_part(&err), None, "{cause}");
+        }
+    }
+
+    const RECORD_KEY: &str = "t/0a0b/l/c/0002/20261117T16/l1.00112233aabbccdd.cmt";
+    const DECODED: &str = "\
+format_version: 1
+tenant_hash: 0a0b
+signal: 2
+shard: 2
+ingest_hour_bucket: 490001
+level: 1
+input_set_hash: 00112233aabbccdd
+created_unix_ns: 1764000000000000000
+inputs: 2
+  writer_id=5f0c6a2e-8b1d-4c3a-9e7f-112233445566 writer_epoch=1 writer_seq=7
+  writer_id=5f0c6a2e-8b1d-4c3a-9e7f-112233445566 writer_epoch=1 writer_seq=8
+parts: 1
+  part_index=0 first_series_id=00 last_series_id=ff content_hash=aa object_size=1 sample_count=1 series_count=1 run_count=1 min_event_ts_ns=0 max_event_ts_ns=1 segment_format_version=1
+";
+
+    #[test]
+    fn compaction_inputs_name_the_commit_record_and_data_prefix() {
+        let inputs = compaction_inputs("t/0a0b/", RECORD_KEY, DECODED).expect("inputs");
+        assert_eq!(
+            inputs,
+            vec![
+                InputKeys {
+                    commit: "t/0a0b/l/c/0002/20261117T16/\
+                        5f0c6a2e-8b1d-4c3a-9e7f-112233445566.1.00000000000000000007.cmt"
+                        .to_string(),
+                    data_prefix: "t/0a0b/l/l0/0002/\
+                        5f0c6a2e-8b1d-4c3a-9e7f-112233445566.1.00000000000000000007."
+                        .to_string(),
+                },
+                InputKeys {
+                    commit: "t/0a0b/l/c/0002/20261117T16/\
+                        5f0c6a2e-8b1d-4c3a-9e7f-112233445566.1.00000000000000000008.cmt"
+                        .to_string(),
+                    data_prefix: "t/0a0b/l/l0/0002/\
+                        5f0c6a2e-8b1d-4c3a-9e7f-112233445566.1.00000000000000000008."
+                        .to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn compaction_inputs_refuse_a_short_or_foreign_decode() {
+        // One input line lost: the count no longer matches.
+        let short = DECODED.replace(
+            "  writer_id=5f0c6a2e-8b1d-4c3a-9e7f-112233445566 writer_epoch=1 writer_seq=8\n",
+            "",
+        );
+        assert_eq!(compaction_inputs("t/0a0b/", RECORD_KEY, &short), None);
+        // No count at all.
+        let uncounted = DECODED.replace("inputs: 2\n", "");
+        assert_eq!(compaction_inputs("t/0a0b/", RECORD_KEY, &uncounted), None);
+        // Another tenant, another signal, a level-0 record.
+        assert_eq!(compaction_inputs("t/ffff/", RECORD_KEY, DECODED), None);
+        let metrics = RECORD_KEY.replace("/l/c/", "/m/c/");
+        assert_eq!(compaction_inputs("t/0a0b/", &metrics, DECODED), None);
+        let l0 = "t/0a0b/l/c/0002/20261117T16/\
+            5f0c6a2e-8b1d-4c3a-9e7f-112233445566.1.00000000000000000007.cmt";
+        assert_eq!(compaction_inputs("t/0a0b/", l0, DECODED), None);
+    }
+
+    #[test]
+    fn a_swept_input_is_one_an_earlier_list_held() {
+        let inputs = compaction_inputs("t/0a0b/", RECORD_KEY, DECODED).expect("inputs");
+        let commit7 = inputs[0].commit.clone();
+        let data7 = format!("{}0011223344556677.rseg", inputs[0].data_prefix);
+        let commit8 = inputs[1].commit.clone();
+        let data8 = format!("{}8899aabbccddeeff.rseg", inputs[1].data_prefix);
+        // Seq 70 of the same writer and epoch, which a prefix without the
+        // padded seq and its trailing dot would match.
+        let seq70 = "t/0a0b/l/l0/0002/\
+            5f0c6a2e-8b1d-4c3a-9e7f-112233445566.1.00000000000000000070.0011223344556677.rseg"
+            .to_string();
+        let seen: BTreeSet<String> = [&commit7, &data7, &commit8, &data8, &seq70]
+            .into_iter()
+            .cloned()
+            .collect();
+        // Nothing gone yet.
+        assert!(swept_inputs(&inputs, &seen, &seen).is_empty());
+        // Input 7's record and data object swept; seq 70 swept too, but it
+        // is no input.
+        let listed: BTreeSet<String> = [&commit8, &data8, &RECORD_KEY.to_string()]
+            .into_iter()
+            .cloned()
+            .collect();
+        assert_eq!(
+            swept_inputs(&inputs, &seen, &listed),
+            vec![commit7.clone(), data7]
+        );
+        // A key never listed before is no evidence of a delete.
+        assert!(swept_inputs(&inputs, &BTreeSet::new(), &listed).is_empty());
     }
 
     #[test]

@@ -26,19 +26,25 @@ SECS="${2:-240}"
 # start around it.
 SETUP_LIMIT=900
 # The eventually waits up to 300 s for recovery, then jumps the clocks, folds,
-# compacts, audits and reads; 1500 s bounds all of it.
-END_LIMIT=$((SECS + 1500))
+# compacts and audits, takes the two sweep jumps (each with its reread and
+# serving waits), sweeps, folds, audits again and reads; 2400 s bounds all of
+# it.
+END_LIMIT=$((SECS + 2400))
 SERVERS="ravel1 ravel2 maint1 maint2"
 MULTISET="catalog: compaction preserves the acked multiset"
 UPPER="catalog: no scan shows a phantom or an excess copy"
 # Reachable in every plain local run: the clock jump, the sealing it exists
-# for, and the compaction the sealing enables (ADR-4326 decision 5).
+# for, the compaction the sealing enables (ADR-4326 decision 5), and the sweep
+# jumps, sweep and deletion of a superseded input the compaction enables.
 REQUIRED=(
     "catalog: the workload starts"
     "clock: the driver's clock jumped forward"
     "catalog: a sealed seeded hour was folded into HEAD"
     "clock: an hour ingested live was sealed by a fold"
     "catalog: a compaction record was published"
+    "clock: the clocks jumped past the sweep's protection horizon and pinned-query window"
+    "catalog: an on-demand sweep succeeded"
+    "catalog: sweep deleted a superseded compaction input"
 )
 mkdir -p "$OUT"
 export COMPOSE_FILE="$WL/config/docker-compose.yaml:$WL/local/docker-compose.local.yaml"
@@ -126,14 +132,23 @@ for svc in faketime init; do
 done
 
 # The clock probe: each running container's wall clock, against the host's,
-# must be ahead by the jump less the driver's allowed shortfall (60 s).
-# rustfs is read twice, by `date` in its container and by the Last-Modified
-# the rustfs process stamps on a PUT. A reading that is empty or not a number
-# is a probe failure.
-jump=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' driver | sed -n 's/^CLOCK_JUMP_SECS=//p')
-case "$jump" in
-    '' | *[!0-9]*) fail "could not read CLOCK_JUMP_SECS from the driver container ('$jump')"; jump=0 ;;
-esac
+# must be ahead by the total offset the three jumps add up to (the sealing
+# jump, then the sweep's horizon and window jumps), less the driver's allowed
+# shortfall (60 s). The offset file must hold that total. rustfs is read
+# twice, by `date` in its container and by the Last-Modified the rustfs
+# process stamps on a PUT. A reading that is empty or not a number is a probe
+# failure.
+driver_env=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' driver)
+jump=0
+for var in CLOCK_JUMP_SECS CLOCK_SWEEP_HORIZON_JUMP_SECS CLOCK_SWEEP_WINDOW_JUMP_SECS; do
+    secs=$(printf '%s\n' "$driver_env" | sed -n "s/^$var=//p")
+    case "$secs" in
+        '' | *[!0-9]*) fail "could not read $var from the driver container ('$secs')" ;;
+        *) jump=$((jump + secs)) ;;
+    esac
+done
+offset=$(docker compose exec -T ravel1 cat /faketime/offset 2>/dev/null | tr -d '[:space:]')
+[ "$offset" = "+$jump" ] || fail "the offset file holds '$offset', not the +${jump} the three jumps add up to"
 host_now=$(date +%s)
 {
     for svc in rustfs $SERVERS; do
