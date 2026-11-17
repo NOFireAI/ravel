@@ -7,11 +7,11 @@
 # every key written or removed under the tenant after the fence against the
 # revised pre-registration on issue #4243: each event falls in exactly one
 # class of drill_post_fence_class (scripts/compat/drill-lib.sh), the
-# fail-row classes stay at zero, no ingest is accepted after the trust limit,
-# no query is answered after the fence, and every data-bearing write (teardown
-# l0/c, idem) is at the version v0.33.0 writes (RSEG 7, RLOG 5, RSPAN 5) and
-# flagged by main's certify census or late-write pass (drill_census, an
-# example of crates/ravel-compat-tests). Never point it at a shared or
+# fail-row classes stay at zero, no ingest is accepted after a router's trust
+# limit (from its last provisioning refresh before the fence, bounded by
+# drill_trust_table), no query is answered after the fence, and every
+# data-bearing write (teardown l0/c, idem) is at the version v0.33.0 writes
+# (RSEG 7, RLOG 5, RSPAN 5). Never point it at a shared or
 # production bucket: it creates its own RustFS data directory and buckets
 # under $DRILL_RUN.
 #
@@ -22,10 +22,10 @@
 #   warm-fence   (b)+(d) fence the warm bucket while the driver runs
 #   warm-snap    list the warm bucket while it runs (repeat at will)
 #   warm-finish  (d) after the horizon plus one scrub rotation: listings,
-#                graceful stop, verdict, census. DRILL_WARM_EARLY=1 stops
+#                graceful stop, verdict. DRILL_WARM_EARLY=1 stops
 #                sooner and fails the warm observation row
 #   cold         (a)+(b)+(c) a second bucket, fenced, then a cold restart
-#   cold-judge   the cold restart's verdict and census from its listings
+#   cold-judge   the cold restart's verdict from its listings
 #   read         (e) v0.33.0 and main read the unfenced v0.33.0 copy
 #   all          every phase above in order, waiting out the warm horizon
 #   verdict      print the horizon, every figure and every verdict row; exit
@@ -38,8 +38,6 @@
 #   DRILL_V033      v0.33.0 asset directory [.dd-tools/v033]
 #   DRILL_RUSTFS    RustFS binary [.dd-tools/rustfs/rustfs]
 #   DRILL_FENCE     compat_fence_bucket example binary
-#   DRILL_CENSUS    drill_census example binary (cargo build --manifest-path
-#                   crates/ravel-compat-tests/Cargo.toml --example drill_census)
 #   DRILL_MAIN      main ravel-server binary (cargo build --release -p ravel-server --features sql)
 #   DRILL_MAIN_SHA  the commit DRILL_MAIN was built from [HEAD]
 #   DRILL_PORT      first of the local ports the drill binds [39410]
@@ -75,7 +73,6 @@ RUSTFS=${DRILL_RUSTFS:-$ROOT/.dd-tools/rustfs/rustfs}
 TARGET=${CARGO_TARGET_DIR:-$ROOT/target}
 FENCE=${DRILL_FENCE:-$TARGET/debug/examples/compat_fence_bucket}
 MAIN=${DRILL_MAIN:-$TARGET/release/ravel-server}
-CENSUS=${DRILL_CENSUS:-$ROOT/crates/ravel-compat-tests/target/debug/examples/drill_census}
 PORT=${DRILL_PORT:-39410}
 COLD_SECS=${DRILL_COLD_SECS:-240}
 # The cold and read phases each need a bucket nothing wrote before; a rerun
@@ -274,25 +271,26 @@ row() {
 }
 
 # The revised pre-registration's rows for one fenced run, after its
-# processes stopped. Arguments: dir, bucket, tag, the second the fence began
-# (the drill activation time the census records), the fence second, ingest
-# horizon, alerts horizon, ingest trust limit, the post-stop listing, then the
-# running listings in time order (the first is the listing taken right after
-# the fence, the last the one taken after the driver stopped).
+# processes stopped. Arguments: dir, bucket, tag, the fence second, ingest
+# horizon, alerts horizon, ingest trust table file (drill_trust_table), the
+# post-stop listing, then the running listings in time order (the first is
+# the listing taken right after the fence, the last the one taken after the
+# driver stopped).
 #   classes      every post-fence t/<h>/ event in one class, each class's
 #                count present once and in its band (unclassified,
 #                l0c-after-horizon, maintenance and alerts-late at 0)
-#   ingest       2xx ingest responses requested after the trust limit: 0
+#   ingest       2xx ingest responses requested after their router's trust
+#                limit: 0
 #   queries      2xx queries requested after the fence: 0
 #   data-version teardown-data and idem keys at the release's versions
-#   census       the same keys each flagged by main's certify census or
-#                late-write pass (examples/drill_census.rs in
-#                crates/ravel-compat-tests); the ingest-grace keys are judged
-#                too and recorded, not failed
+# Whether main's certify census and late-write pass flag a v0.33.0 teardown
+# pair is not a drill row: certify's time gate opens hours after the fence,
+# so crates/ravel-compat-tests/tests/certify_flags_teardown_pair.rs tests it
+# with an injected clock instead.
 judge_run() {
-  local dir=$1 bucket=$2 tag=$3 fence_start=$4 fence=$5 ingest_h=$6 alerts_h=$7 trust=$8 stopped=$9
-  shift 9
-  local h report=$dir/report.$tag c n key lm data last
+  local dir=$1 bucket=$2 tag=$3 fence=$4 ingest_h=$5 alerts_h=$6 trust=$7 stopped=$8
+  shift 8
+  local h report=$dir/report.$tag c n key lm data last sig kinds floor limit limits
   h=$(cat "$RUN/tenant.hash")
   last=${*: -1}
   : > "$report"
@@ -304,17 +302,25 @@ judge_run() {
   sed 's/^/  /' "$dir/classes-check.$tag"
   row "$c" "classes-$tag" "events=$(grep -c . "$dir/classes.$tag" || true)"
 
-  echo "figure ingest_2xx_after_trust_$tag $(drill_count_2xx_after "$dir/drive.log" "$trust" 'otlp-metrics|otlp-logs|otlp-traces|remote-write' 30)" >> "$report"
+  limits=""
+  while IFS=$'\t' read -r sig kinds floor limit; do
+    case "$floor" in
+      none) limits="$limits $sig=none" ;;
+      cold) limits="$limits $sig=$(date -u -d "@$limit" +%FT%TZ)(cold)" ;;
+      *) limits="$limits $sig=$(date -u -d "@$limit" +%FT%TZ)(refresh_floor=$(date -u -d "@$floor" +%FT%TZ))" ;;
+    esac
+  done < "$trust"
+  n=$(drill_ingest_2xx_after_trust "$dir/drive.log" "$trust" 30) || n=missing
+  echo "figure ingest_2xx_after_trust_$tag $n" >> "$report"
   c=0
   drill_check_figure "$report" "ingest_2xx_after_trust_$tag" 0 0 || c=$?
-  row "$c" "ingest-$tag" "trust_limit=$(date -u -d "@$trust" +%FT%TZ)"
+  row "$c" "ingest-$tag" "fence=$(date -u -d "@$fence" +%FT%TZ)$limits"
   echo "figure query_2xx_after_fence_$tag $(drill_count_2xx_after "$dir/drive.log" "$fence" promql 30)" >> "$report"
   c=0
   drill_check_figure "$report" "query_2xx_after_fence_$tag" 0 0 || c=$?
   row "$c" "queries-$tag" "fence=$(date -u -d "@$fence" +%FT%TZ)"
 
   awk -F'\t' '$1 == "teardown-data" || $1 == "idem" { print $3 }' "$dir/classes.$tag" > "$dir/data-keys.$tag"
-  awk -F'\t' '$1 == "ingest-grace" { print $3 }' "$dir/classes.$tag" > "$dir/grace-keys.$tag"
   : > "$dir/trailers.$tag"
   : > "$dir/versions.$tag"
   while IFS= read -r key; do
@@ -334,29 +340,6 @@ judge_run() {
   c=0
   drill_check_figure "$report" "data_bad_version_$tag" 0 0 || c=$?
   row "$c" "data-version-$tag" "keys=$(grep -c . "$dir/data-keys.$tag" || true)"
-
-  cat "$dir/data-keys.$tag" "$dir/grace-keys.$tag" > "$dir/census-keys.$tag"
-  c=0
-  if [ -x "$CENSUS" ]; then
-    "$CENSUS" --endpoint "$S3_ENDPOINT" --bucket "$bucket" --tenant-hash-key-file "$RUN/tenant.key" \
-      --activated-unix-s "$fence_start" --fence-complete-unix-s "$fence" \
-      --keys "$dir/census-keys.$tag" > "$dir/census.$tag" 2>&1 || say "drill_census on $bucket exited non-zero (see $dir/census.$tag)"
-    grep -v '^key ' "$dir/census.$tag" | sed 's/^/  /'
-    drill_census_check "$dir/data-keys.$tag" "$dir/census.$tag" > "$dir/census-check.$tag" || true
-    drill_census_check "$dir/grace-keys.$tag" "$dir/census.$tag" > "$dir/census-grace.$tag" || true
-    n=$(grep -vc '^flagged ' "$dir/census-check.$tag" || true)
-  else
-    say "no drill_census binary at $CENSUS"
-    : > "$dir/census-check.$tag"
-    : > "$dir/census-grace.$tag"
-    n=$(grep -c . "$dir/data-keys.$tag" || true)
-    [ "$n" -gt 0 ] || n=missing
-  fi
-  echo "figure data_not_flagged_$tag $n" >> "$report"
-  echo "figure grace_not_flagged_$tag $(grep -vc '^flagged ' "$dir/census-grace.$tag" || true)" >> "$report"
-  drill_check_figure "$report" "data_not_flagged_$tag" 0 0 || c=$?
-  drill_check_figure "$report" "grace_not_flagged_$tag" 0 1000000 > /dev/null || c=1
-  row "$c" "census-$tag" "data_keys=$(grep -c . "$dir/data-keys.$tag" || true) grace_keys=$(grep -c . "$dir/grace-keys.$tag" || true)"
 }
 
 phase_preflight() {
@@ -497,9 +480,12 @@ phase_warm_finish() {
   # Unix seconds of one width, so the glob's order is time order.
   local snaps=("$d"/snap-*.list)
   [ -e "${snaps[0]}" ] || snaps=()
+  # A router without a 2xx write before the fence gets no limit, and the
+  # ingest row fails on it.
+  drill_trust_table "$d/drive.log" "$(cat "$d/fence.start")" "$REFRESH_S" 30 > "$d/trust.warm" || true
   {
-    judge_run "$d" drill-warm warm "$(cat "$d/fence.start")" "$w" "$horizon" "$alerts_h" \
-      "$(drill_trust_limit "$w")" "$d/teardown.list" "$d/fenced.list" \
+    judge_run "$d" drill-warm warm "$w" "$horizon" "$alerts_h" \
+      "$d/trust.warm" "$d/teardown.list" "$d/fenced.list" \
       "${snaps[@]}" "$d/after.list" "$d/running.list"
     stopped=$(cut -d' ' -f2 "$d/server.stop")
     c=0
@@ -515,7 +501,8 @@ phase_warm_finish() {
 judge_cold() {
   local d=$RUN/cold c=$RUN/cold/restart w
   w=$(cat "$d/fence.epoch")
-  judge_run "$c" "$COLD_BUCKET" cold "$(cat "$d/fence.start")" "$w" "$w" "$w" "$w" \
+  drill_trust_table_cold "$w" > "$c/trust.cold"
+  judge_run "$c" "$COLD_BUCKET" cold "$w" "$w" "$w" "$c/trust.cold" \
     "$c/after.list" "$d/fenced.list" "$c/mid.list" "$c/running.list" | tee "$c/verdict"
 }
 

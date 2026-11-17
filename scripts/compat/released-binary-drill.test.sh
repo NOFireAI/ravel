@@ -35,12 +35,51 @@ h2=$(drill_ingest_horizon "$(date -u -d 2026-11-16T20:00:00Z +%s)" 0)
 h3=$(drill_ingest_horizon "$(date -u -d 2026-11-16T19:59:59Z +%s)" 0)
 [ "$h3" -eq "$(date -u -d 2026-11-16T22:00:00Z +%s)" ] && ok "horizon of a 19:59:59 fence is 22:00:00" || bad "horizon 19:59:59 gave $h3"
 
-# Trust limit: (hour of the fence + 2) hours, no margin.
-[ "$TRUST" -eq "$(date -u -d 2026-11-16T21:00:00Z +%s)" ] && ok "trust limit of a 19:40:18 fence is 21:00:00" || bad "trust 19:40:18 gave $TRUST"
+# Trust limit: (hour of the last refresh R + 2) hours, no margin.
+[ "$TRUST" -eq "$(date -u -d 2026-11-16T21:00:00Z +%s)" ] && ok "trust limit of a 19:40:18 refresh is 21:00:00" || bad "trust 19:40:18 gave $TRUST"
 t2=$(drill_trust_limit "$(date -u -d 2026-11-16T20:00:00Z +%s)")
-[ "$t2" -eq "$(date -u -d 2026-11-16T22:00:00Z +%s)" ] && ok "trust limit of a 20:00:00 fence is 22:00:00" || bad "trust 20:00:00 gave $t2"
+[ "$t2" -eq "$(date -u -d 2026-11-16T22:00:00Z +%s)" ] && ok "trust limit of a 20:00:00 refresh is 22:00:00" || bad "trust 20:00:00 gave $t2"
 t3=$(drill_trust_limit "$(date -u -d 2026-11-16T19:59:59Z +%s)")
-[ "$t3" -eq "$(date -u -d 2026-11-16T21:00:00Z +%s)" ] && ok "trust limit of a 19:59:59 fence is 21:00:00" || bad "trust 19:59:59 gave $t3"
+[ "$t3" -eq "$(date -u -d 2026-11-16T21:00:00Z +%s)" ] && ok "trust limit of a 19:59:59 refresh is 21:00:00" || bad "trust 19:59:59 gave $t3"
+
+# The last refresh before the fence, bounded from the drive log: the last
+# 2xx write of the router's kinds ending at or before the fence start, minus
+# the refresh interval and the curl bound. Run 2's shape: the fence began
+# at 23:00:20, the last metrics write before it ended at 23:00:19, so R is
+# at or after 22:58:49 and the router stops trusting at 00:00, not 01:00.
+FS=$(date -u -d 2026-11-16T23:00:20Z +%s)
+printf '%s\t%s\t%s\n' \
+  $((FS - 61)) otlp-metrics 200 \
+  $((FS - 1)) otlp-metrics 200 \
+  $((FS - 1)) otlp-logs 200 \
+  $((FS + 5)) otlp-metrics 200 \
+  $((FS - 40)) otlp-traces 200 \
+  $((FS - 2)) otlp-traces 503 \
+  $((FS - 1)) remote-write 000 \
+  $((FS - 1)) promql 200 > "$TMP/refresh"
+floor=$(drill_last_refresh_floor "$TMP/refresh" "$FS" 'otlp-metrics|remote-write' 60 30)
+[ "$floor" -eq "$(date -u -d 2026-11-16T22:58:49Z +%s)" ] && ok "refresh floor is the last 2xx write before the fence minus 90 s" || bad "floor gave $floor"
+[ "$(drill_trust_limit "$floor")" -eq "$(date -u -d 2026-11-17T00:00:00Z +%s)" ] \
+  && ok "run 2: a refresh before 23:00 stops trust at 00:00" || bad "run 2 trust gave $(drill_trust_limit "$floor")"
+[ "$(drill_trust_limit "$floor")" -lt "$(drill_trust_limit "$FS")" ] \
+  && ok "the refresh-based limit is an hour before the fence-based one in run 2" || bad "run 2 limit not below the fence-hour limit"
+floor=$(drill_last_refresh_floor "$TMP/refresh" "$FS" otlp-traces 60 30)
+[ "$floor" -eq $((FS - 40 - 90)) ] && ok "a 503 is not a refresh witness" || bad "traces floor gave $floor"
+floor=$(drill_last_refresh_floor "$TMP/refresh" "$FS" otlp 60 30) && bad "kind matched a prefix: $floor" || ok "kind must match whole for the floor"
+drill_last_refresh_floor "$TMP/refresh" "$FS" remote-write 60 30 > /dev/null && bad "a 000 remote write gave a floor" || ok "no 2xx write before the fence has no floor"
+drill_last_refresh_floor "$TMP/refresh" $((FS - 62)) otlp-metrics 60 30 > /dev/null && bad "a write after the fence start gave a floor" || ok "a write after the fence start is not a witness"
+
+# Trust table: one line per router, the metrics router covering remote write.
+printf '%s\t%s\t%s\n' $((FS - 3)) remote-write 204 >> "$TMP/refresh"
+drill_trust_table "$TMP/refresh" "$FS" 60 30 > "$TMP/trust" && ok "every router has a floor" || bad "trust table: $(cat "$TMP/trust")"
+[ "$(cut -f1,3,4 "$TMP/trust" | tr '\t\n' ' ')" = "metrics $((FS - 91)) $(date -u -d 2026-11-17T00:00:00Z +%s) logs $((FS - 91)) $(date -u -d 2026-11-17T00:00:00Z +%s) spans $((FS - 130)) $(date -u -d 2026-11-17T00:00:00Z +%s) " ] \
+  && ok "trust table rows per router" || bad "trust table: $(cat "$TMP/trust")"
+grep -v otlp-traces "$TMP/refresh" > "$TMP/refresh-nospans"
+drill_trust_table "$TMP/refresh-nospans" "$FS" 60 30 > "$TMP/trust-nospans" && bad "a router with no witness passed" || ok "a router with no 2xx before the fence fails the table"
+grep -qxF "spans	otlp-traces	none	none" "$TMP/trust-nospans" && ok "missing floor named" || bad "nospans table: $(cat "$TMP/trust-nospans")"
+drill_trust_table_cold "$FENCE" > "$TMP/trust-cold"
+[ "$(cut -f4 "$TMP/trust-cold" | sort -u)" = "$FENCE" ] && [ "$(grep -c . "$TMP/trust-cold")" -eq 3 ] \
+  && ok "cold table: the fence is every router's limit" || bad "cold table: $(cat "$TMP/trust-cold")"
 
 # The shipped exempt list, read from the drill itself.
 eval "$(grep '^EXEMPT_PATTERNS=' "$HERE/released-binary-drill.sh")"
@@ -132,9 +171,13 @@ remove m/maint/scrub/0000.cursor $R running maintenance
 write m/admission/x/p.snapshot $R running maintenance
 write m/meta $R running prerequisite-only
 write l/meta $R running maintenance
-write u/l0/0001/x.rseg 2026-11-16T23:30:00.000Z running prerequisite-only
-write u/c/0001/20261116T23/x.cmt 2026-11-16T23:30:00.000Z teardown prerequisite-only
+write u/l0/0001/x.rseg 2026-11-16T23:30:00.000Z running audit-unfenced
+write u/c/0001/20261116T23/x.cmt 2026-11-16T23:30:00.000Z teardown audit-unfenced
+remove u/l0/0001/x.rseg $R running prerequisite-only
+remove u/c/0001/20261116T23/x.cmt $R running prerequisite-only
+write u/l1/0001/x.rseg $R running prerequisite-only
 write u/maint/0001/cursor $R running prerequisite-only
+write u/l0x/0001/x.rseg $R running prerequisite-only
 remove a/l0/0000/x.rseg $R running prerequisite-only
 write enc $R running prerequisite-only
 write config $R running prerequisite-only
@@ -168,6 +211,7 @@ cat > "$TMP/ev-pass" << EOF
 write	sys/maintain/workers/x	$R	running
 write	t/$H/m/admission/p.snapshot	$R	running
 write	t/$H/m/meta	$R	running
+write	t/$H/u/l0/0001/x.rseg	$R	running
 write	t/$H/a/alert-lease	2026-11-16T19:41:00.000Z	running
 write	t/$H/m/l0/0000/x.rseg	$R	running
 write	t/$H/m/l0/0000/y.rseg	$R	teardown
@@ -179,7 +223,9 @@ if drill_classify_events "$TMP/ev-pass" "$TMP/cls" "$TMP/cls-report" warm "$H" "
 else
   bad "recorded classes failed: $(cat "$TMP/cls-out")"
 fi
-[ "$(grep -c '^band-ok ' "$TMP/cls-out")" -eq 11 ] && ok "eleven class figures checked" || bad "class figures: $(cat "$TMP/cls-out")"
+[ "$(grep -c '^band-ok ' "$TMP/cls-out")" -eq 12 ] && ok "twelve class figures checked" || bad "class figures: $(cat "$TMP/cls-out")"
+grep -qxF "figure class_audit-unfenced_warm 1" "$TMP/cls-report" && grep -qxF "figure class_prerequisite-only_warm 1" "$TMP/cls-report" \
+  && ok "a per-query audit record counts as audit-unfenced, not prerequisite-only" || bad "audit class report: $(cat "$TMP/cls-report")"
 grep -qxF "figure class_teardown-data_warm 1" "$TMP/cls-report" && grep -qxF "figure class_unclassified_warm 0" "$TMP/cls-report" \
   && ok "class counts written as figures, zero included" || bad "class report: $(cat "$TMP/cls-report")"
 grep -qxF "teardown-data	write	t/$H/m/l0/0000/y.rseg	$R	teardown" "$TMP/cls" \
@@ -222,6 +268,26 @@ printf '%s\t%s\t%s\n' \
 [ "$(drill_count_2xx_after "$TMP/drive-pass" $((TRUST + 1)) promql 30)" -eq 0 ] && ok "a query that may predate the limit counts 0" || bad "query inside the curl bound counted"
 [ "$(drill_count_2xx_after "$TMP/drive-fail" "$TRUST" 'remote' 30)" -eq 0 ] && ok "kind must match whole" || bad "kind matched a prefix"
 
+# Ingest 2xx against each router's own limit: logs trusted an hour longer
+# than metrics, so a log write that metrics' limit would fail passes.
+printf 'metrics\totlp-metrics|remote-write\t%s\t%s\nlogs\totlp-logs\t%s\t%s\nspans\totlp-traces\t%s\t%s\n' \
+  "$FENCE" "$TRUST" "$FENCE" $((TRUST + 3600)) "$FENCE" "$TRUST" > "$TMP/trust-split"
+printf '%s\t%s\t%s\n' $((TRUST + 100)) otlp-logs 200 $((TRUST + 5)) otlp-metrics 200 > "$TMP/drive-split"
+[ "$(drill_ingest_2xx_after_trust "$TMP/drive-split" "$TMP/trust-split" 30)" -eq 0 ] \
+  && ok "a log write inside the logs router's later limit counts 0" || bad "split pass case counted"
+printf '%s\t%s\t%s\n' $((TRUST + 100)) remote-write 204 >> "$TMP/drive-split"
+[ "$(drill_ingest_2xx_after_trust "$TMP/drive-split" "$TMP/trust-split" 30)" -eq 1 ] \
+  && ok "a remote write after the metrics router's limit counts 1" || bad "split fail case not counted"
+drill_ingest_2xx_after_trust "$TMP/drive-split" "$TMP/trust-nospans" 30 > "$TMP/split-out" \
+  && bad "a table with no spans limit passed" || ok "a router with no limit fails the count"
+grep -qxF missing "$TMP/split-out" && ok "missing limit printed as missing" || bad "missing limit: $(cat "$TMP/split-out")"
+grep -v '^logs' "$TMP/trust-split" > "$TMP/trust-short"
+drill_ingest_2xx_after_trust "$TMP/drive-split" "$TMP/trust-short" 30 > /dev/null && bad "a table missing a router passed" || ok "a table missing a router fails"
+{ cat "$TMP/trust-split"; grep '^logs' "$TMP/trust-split"; } > "$TMP/trust-dup"
+drill_ingest_2xx_after_trust "$TMP/drive-split" "$TMP/trust-dup" 30 > /dev/null && bad "a router listed twice passed" || ok "a router listed twice fails"
+[ "$(drill_ingest_2xx_after_trust "$TMP/drive-split" "$TMP/trust-cold" 30)" -eq 3 ] \
+  && ok "against the cold table every ingest 2xx after the fence counts" || bad "cold count gave $(drill_ingest_2xx_after_trust "$TMP/drive-split" "$TMP/trust-cold" 30)"
+
 # Data-bearing versions.
 DM="t/$H/m/l0/0000/w.1.00000000000000000007.0011223344556677.rseg"
 CM="t/$H/m/c/0000/20261116T22/w.1.00000000000000000007.cmt"
@@ -255,29 +321,6 @@ grep -qxF "bad commit $CL $T no single paired data object" "$TMP/dv" && ok "unpa
 drill_data_version "t/$H/l/idem/k.20261116T22.idm" "$T" "$H" "$TMP/dv-listing" "$TMP/dv-trailers" > "$TMP/dv" \
   && bad "idem object passed with no trailer rule" || ok "idem object has no version rule and fails"
 grep -qxF "bad other t/$H/l/idem/k.20261116T22.idm $T no version rule covers this key" "$TMP/dv" && ok "idem named" || bad "idem line: $(cat "$TMP/dv")"
-
-# Census: every judged key named once and flagged.
-printf '%s\n' "$DM" "$CM" "$DL" > "$TMP/cn-keys"
-cat > "$TMP/cn-out" << EOF
-certify family=rseg target=8 report=Contradicted
-key $DM flagged=contradicted
-key $CM flagged=late-write
-key $DL flagged=held
-census keys=3 flagged=3 not_flagged=0
-EOF
-drill_census_check "$TMP/cn-keys" "$TMP/cn-out" > "$TMP/cn" && ok "every key flagged passes" || bad "flagged census failed: $(cat "$TMP/cn")"
-grep -qxF "flagged held $DL" "$TMP/cn" && ok "flag kind recorded" || bad "census lines: $(cat "$TMP/cn")"
-sed "s#^key $CM flagged=late-write#key $CM flagged=no#" "$TMP/cn-out" > "$TMP/cn-no"
-drill_census_check "$TMP/cn-keys" "$TMP/cn-no" > "$TMP/cn" && bad "unflagged key passed" || ok "one unflagged key fails"
-grep -qxF "not-flagged $CM" "$TMP/cn" && ok "unflagged key named" || bad "census lines: $(cat "$TMP/cn")"
-grep -v "^key $DL " "$TMP/cn-out" > "$TMP/cn-missing"
-drill_census_check "$TMP/cn-keys" "$TMP/cn-missing" > "$TMP/cn" && bad "unjudged key passed" || ok "a key the census never printed fails"
-{ cat "$TMP/cn-out"; echo "key $DM flagged=contradicted"; } > "$TMP/cn-dup"
-drill_census_check "$TMP/cn-keys" "$TMP/cn-dup" > /dev/null && bad "key printed twice passed" || ok "a key printed twice fails"
-printf 'key %s flagged=maybe\n' "$DM" > "$TMP/cn-odd"
-printf '%s\n' "$DM" > "$TMP/cn-one"
-drill_census_check "$TMP/cn-one" "$TMP/cn-odd" > /dev/null && bad "unknown flag passed" || ok "an unknown flag value fails"
-drill_census_check /dev/null "$TMP/cn-out" > /dev/null && ok "no data-bearing keys passes" || bad "empty key list failed"
 
 # Warm observation: tail, a scrub cursor after the horizon, graceful stops.
 printf 'exempt-advisory\twrite\tt/%s/m/maint/scrub/0000.cursor\t2026-11-16T22:40:00.000Z\trunning\n' "$H" > "$TMP/wo-cls"
