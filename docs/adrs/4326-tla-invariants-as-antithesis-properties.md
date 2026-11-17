@@ -138,7 +138,8 @@ before setup complete: the maintain workers and the driver's fold and compact
 actions start only once the load has finished, which the driver signals by
 writing a marker the workers' entrypoints wait for. Rows that need the clock to
 move (a live hour sealing, reshard activation, erasure completion) get one
-spike in the local loop: libfaketime with one offset in every container. If
+spike in the local loop: libfaketime with one offset in every container (the
+clock-jump amendment below moves it into the Antithesis config). If
 it fails, those rows are recorded `none: needs clock control`. This ADR adds
 no clock seam to production code.
 
@@ -265,3 +266,46 @@ Decision 6 is narrowed as #4330 implements it:
   the `.tsv`.
 - Only the row directly under a table's header may be its separator; any
   later row of pipes, spaces, dashes and colons is a data row and fails.
+
+## Amendment (2026-11-17): the clock jump runs in the Antithesis config (#4334)
+
+<!-- amendment-applies: sections="5. Whole hours inside a short run" pointer="clock-jump amendment" -->
+<!-- amendment-supersedes: phrase="recorded `none: needs clock control`" pointer="clock-jump amendment" -->
+
+Decision 5 put the clock spike in the local loop only. That leaves the
+Antithesis run unable to reach compaction: `ravel-cli load` writes one object
+per (shard, hour), and compaction skips a bucket with fewer than two inputs,
+so a seeded hour folds but never compacts. Only hours ingested live, which
+the short flush cadence fills with many level-0 objects, give compaction its
+inputs, and a live hour seals only once its end plus `max_flush_lifetime +
+clock_skew_allowance + fold_safety_margin` (4800 s with the defaults) has
+passed. A timeline does not last that long, so the clock has to move where
+the faults are.
+
+For the catalog-maintenance workload and its lifecycle and reshard profiles,
+the clock jump therefore runs in the Antithesis config itself, not only in
+the local loop:
+
+- Every container, the object store included, runs under libfaketime and
+  reads one offset file on a shared volume. The offset starts at `+0`; each
+  process rereads it at most every `FAKETIME_CACHE_DURATION` (2 s), so once
+  a jump has landed the clocks agree to within that. Monotonic clocks are
+  not faked.
+- After seeding and some acknowledged live writes, the driver moves every
+  clock forward once per timeline, as one of its actions, and records the
+  jump in its assertions. The jump is at least one hour plus
+  `max_flush_lifetime + clock_skew_allowance + fold_safety_margin`, 8400 s
+  with the defaults, which seals the ingest hour of every write acknowledged
+  before it, wherever in its hour the write landed. The config uses 9000 s.
+- It fails closed. A container whose binary libfaketime cannot reach (a
+  statically linked one) or that cannot read the offset file refuses to
+  start, so setup never completes over a clock that would not move, and a
+  row that needs the clock fails instead of being recorded as `none: needs
+  clock control`. The store therefore runs RustFS's glibc build; its default
+  build is a static-pie musl binary that no preload reaches.
+- `clock: an hour ingested live was sealed by a fold` and `catalog: a
+  compaction record was published` are reachable in a plain run, and the
+  local loop gates on both.
+
+Production code still has no clock seam: the jump is test infrastructure
+around unmodified binaries.
