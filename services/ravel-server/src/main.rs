@@ -160,8 +160,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to build object store backend")?;
 
     // Inputs of the startup store checks below, parsed first so a flag error
-    // refuses before any store request. None of these hash a tenant: the
-    // tenant-hash scheme is installed inside the checks.
+    // refuses before any of those checks runs. None of these hash a tenant:
+    // the tenant-hash scheme is installed inside the checks.
     let tenancy_config = cli.resolve_tenancy_config()?;
     let tenant_kms_config = cli.parse_tenant_kms_config()?;
     // Parsed once: the fold tenants, the federation mapping check, shard-count
