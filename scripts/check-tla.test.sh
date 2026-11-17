@@ -1639,7 +1639,7 @@ $ROW6_SUT"
 printf 'ack-before-commit\tnone:out of scope\n' >> "$FORMAL_DIR/enr/antithesis-mutants.tsv"
 expect_trace ba2 enr fail "antithesis-mutants.tsv:3: none: needs a space before its reason: 'none:out of scope'"
 
-echo "--- (at) traceability: the real tree has no enrolled area and passes five-column"
+echo "--- (at) traceability: the real commit area is unenrolled and passes five-column"
 REPO_ROOT="$orig_repo_root_ai"
 FORMAL_DIR="$orig_formal_dir_ai"
 atout="$(check_traceability commit 2>&1)"; atcode=$?
