@@ -2148,11 +2148,8 @@ pub(crate) struct EntryKeyIndexRead {
     /// Whether a GET failed, as opposed to the object's bytes not yielding a
     /// section.
     pub(crate) get_failed: bool,
-    /// `cost.gets()`.
-    pub(crate) gets: u64,
-    /// `cost.bytes()`.
-    pub(crate) bytes: u64,
-    /// The same GETs and bytes split by phase.
+    /// The GETs and bytes by phase; `cost.gets()` and `cost.bytes()` are the
+    /// totals.
     pub(crate) cost: KeyIdxReadCost,
 }
 
@@ -2267,8 +2264,6 @@ pub(crate) async fn read_entry_key_index(
     EntryKeyIndexRead {
         fields,
         get_failed,
-        gets: cost.gets(),
-        bytes: cost.bytes(),
         cost,
     }
 }
@@ -3863,8 +3858,6 @@ pub(crate) async fn build_part_key_index(
                                 Some(fields) => EntryKeyIndexRead {
                                     fields,
                                     get_failed: false,
-                                    gets: 0,
-                                    bytes: 0,
                                     cost: KeyIdxReadCost::default(),
                                 },
                                 None => {
@@ -3880,16 +3873,16 @@ pub(crate) async fn build_part_key_index(
                     let (ordinal, key, _) = &targets[next];
                     let ordinal = *ordinal;
                     next += 1;
-                    counters.get_requests += read.gets;
-                    counters.key_index_ranged_gets += read.gets;
-                    counters.key_index_bytes_read += read.bytes;
+                    counters.get_requests += read.cost.gets();
+                    counters.key_index_ranged_gets += read.cost.gets();
+                    counters.key_index_bytes_read += read.cost.bytes();
                     counters.key_index_footer_gets += read.cost.footer_gets;
                     counters.key_index_footer_bytes_read += read.cost.footer_bytes;
                     counters.key_index_section_gets += read.cost.section_gets;
                     counters.key_index_section_bytes_read += read.cost.section_bytes;
                     counters.key_index_sections_read += 1;
                     if previously_covered[ordinal as usize] {
-                        counters.key_index_unchanged_section_gets += read.gets;
+                        counters.key_index_unchanged_section_gets += read.cost.gets();
                     }
                     let sections = match &read.fields {
                         Ok(sections) => sections,

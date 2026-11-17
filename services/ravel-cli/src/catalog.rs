@@ -982,9 +982,12 @@ pub fn render_rebuild_report(
     Ok(out)
 }
 
-/// `name=count` pairs joined by commas, in field name order; empty for an
+/// `name=count` pairs joined by commas, in field name order; `none` for an
 /// empty map.
 fn field_counts(counts: &std::collections::BTreeMap<String, u64>) -> String {
+    if counts.is_empty() {
+        return "none".to_string();
+    }
     counts
         .iter()
         .map(|(field, count)| format!("{field}={count}"))
