@@ -829,6 +829,151 @@ check_contains "refs/pull head: names the file" "src/new.rs: struct ServerConfig
 check_eq       "refs/pull head: temporary ref removed" "" \
   "$(git -C "${r}" for-each-ref --format='%(refname)' 'refs/remotes/origin/struct-literals-check-*')"
 
+# --- trait impls: methods of `impl Trait for Type` are not changed functions ---
+# A repository whose main holds a trait Store with one method and a pre-fork
+# caller, `feature` forked from it, and a post-fork file on main with calls.
+new_trait_repo() {
+  local dir
+  dir="$(new_repo)"
+  put "${dir}" src/store.rs 'pub trait Store {
+    fn get(&self, k: &str) -> u64;
+}'
+  put "${dir}" src/old_use.rs 'fn o(s: &dyn Store) { s.get("a"); }'
+  put "${dir}" src/rec.rs 'struct Other;
+impl Other {
+    fn get(&self, k: u64) -> u64 { 0 }
+    fn put(&self, k: u64, v: u64) {}
+}'
+  commit_on "${dir}" main 'feat: store trait'
+  git -C "${dir}" branch -f feature main
+  put "${dir}" src/new_use.rs 'fn n(x: &dyn Store) { x.get("b"); x.get("c"); }'
+  commit_on "${dir}" main 'feat: more store calls'
+  printf '%s' "${dir}"
+}
+
+# Case A: the branch adds an impl of the unchanged trait.
+r="$(new_trait_repo)"
+put "${r}" src/rec.rs 'struct Other;
+impl Other {
+    fn get(&self, k: u64) -> u64 { 0 }
+    fn put(&self, k: u64, v: u64) {}
+}
+struct Rec;
+impl Store for Rec {
+    fn get(&self, k: &str) -> u64 { 0 }
+}'
+commit_on "${r}" feature 'test: add a recording store'
+run "${r}" feature origin/main
+check_eq "trait impl added, trait unchanged: exits 0" "0" "${rc}"
+check_absent "trait impl added: no call reported" "call " "${out}"
+
+# Case B: the same with a multi-line header and two methods.
+r="$(new_trait_repo)"
+put "${r}" src/rec.rs 'struct Other;
+impl Other {
+    fn get(&self, k: u64) -> u64 { 0 }
+    fn put(&self, k: u64, v: u64) {}
+}
+struct Rec<T>(T);
+impl<T>
+    Store
+    for Rec<T>
+where
+    T: Clone,
+{
+    fn get(&self, k: &str) -> u64 { 0 }
+    fn put(&self, k: &str, v: u64) {}
+}'
+commit_on "${r}" feature 'test: add a generic recording store'
+run "${r}" feature origin/main
+check_eq "multi-line trait impl header: exits 0" "0" "${rc}"
+
+# Case C: an inherent impl with a higher-ranked bound in its generics keeps
+# reporting a real signature change.
+r="$(new_repo)"
+put "${r}" src/wrap.rs "pub struct Wrap<F>(F);
+impl<F: for<'a> Fn(&'a str)> Wrap<F> {
+    pub fn run(&self) {}
+}"
+commit_on "${r}" main 'feat: wrap'
+git -C "${r}" branch -f feature main
+put "${r}" src/wrap.rs "pub struct Wrap<F>(F);
+impl<F: for<'a> Fn(&'a str)> Wrap<F> {
+    pub fn run(&self, n: u64) {}
+}"
+commit_on "${r}" feature 'feat: run takes a count'
+put "${r}" src/wuse.rs 'fn w(w: &W) { w.run(); w.run(); }'
+commit_on "${r}" main 'feat: call run'
+run "${r}" feature origin/main
+check_eq "inherent impl with for<'a> bound, param added: exits 1" "1" "${rc}"
+check_contains "inherent impl with for<'a> bound: names the file" "src/wuse.rs" "${out}"
+
+# Case C2: a `where F: for<'a> ..` clause on an inherent impl is no trait impl.
+r="$(new_repo)"
+put "${r}" src/wrap.rs "pub struct Wrap<F>(F);
+impl<F> Wrap<F>
+where
+    F: for<'a> Fn(&'a str),
+{
+    pub fn run(&self) {}
+}"
+commit_on "${r}" main 'feat: wrap'
+git -C "${r}" branch -f feature main
+put "${r}" src/wrap.rs "pub struct Wrap<F>(F);
+impl<F> Wrap<F>
+where
+    F: for<'a> Fn(&'a str),
+{
+    pub fn run(&self, n: u64) {}
+}"
+commit_on "${r}" feature 'feat: run takes a count'
+put "${r}" src/wuse.rs 'fn w(w: &W) { w.run(); }'
+commit_on "${r}" main 'feat: call run'
+run "${r}" feature origin/main
+check_eq "inherent impl with for<'a> in where, param added: exits 1" "1" "${rc}"
+
+# Case D: the trait's own declaration changes, and the impl follows it.
+r="$(new_trait_repo)"
+put "${r}" src/store.rs 'pub trait Store {
+    fn get(&self, k: &str, n: u64) -> u64;
+}'
+put "${r}" src/rec.rs 'struct Other;
+impl Other {
+    fn get(&self, k: u64) -> u64 { 0 }
+    fn put(&self, k: u64, v: u64) {}
+}
+struct Rec;
+impl Store for Rec {
+    fn get(&self, k: &str, n: u64) -> u64 { 0 }
+}'
+commit_on "${r}" feature 'feat: get takes a count'
+run "${r}" feature origin/main
+check_eq "trait declaration signature changed: exits 1" "1" "${rc}"
+check_contains "trait declaration changed: names the post-fork file" "src/new_use.rs" "${out}"
+
+# Case E: a trait impl body holding braces and a nested fn does not leak the
+# scan: an inherent signature change after it is still read.
+r="$(new_repo)"
+put "${r}" src/mix.rs 'impl Show for Thing {
+    fn show(&self) { if x { y(); } }
+}
+impl Thing {
+    pub fn size(&self, a: u64) {}
+}'
+commit_on "${r}" main 'feat: mix'
+git -C "${r}" branch -f feature main
+put "${r}" src/mix.rs 'impl Show for Thing {
+    fn show(&self) { if x { y(); } }
+}
+impl Thing {
+    pub fn size(&self, a: u64, b: u64) {}
+}'
+commit_on "${r}" feature 'feat: size takes two'
+put "${r}" src/muse.rs 'fn m(t: &Thing) { t.size(1); }'
+commit_on "${r}" main 'feat: call size'
+run "${r}" feature origin/main
+check_eq "inherent change after a trait impl: exits 1" "1" "${rc}"
+
 # --- could not answer: 2, never 0 ---
 r="$(new_repo)"
 branch_makes_option "${r}"
