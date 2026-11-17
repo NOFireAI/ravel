@@ -1,0 +1,4 @@
+# negative cfg stem	mutant (inv_mutant! in antithesis/store-contract/driver)	property it must make false
+cas-accepts-stale-version	common/cas-accepts-stale-version	store: a CAS outcome matches its effect
+list-never-progresses	common/list-never-progresses	store: a paged list ends complete within its page bound
+lost-response-not-applied	common/lost-response-not-applied	store: a lost-response overwrite took effect
