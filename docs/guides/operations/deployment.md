@@ -91,15 +91,19 @@ error is a timeout, a throttle (a 429 or 503 answer) or another error the
 store marks retryable, such as a dropped connection. The server retries it,
 like every other store read that startup refuses on, and logs one warning
 per retry. `--startup-store-deadline` (default `15s`, measured from process
-start) bounds the retries and each attempt. An attempt still running at the
-deadline is cut off and refuses, naming the read and saying the deadline
-passed. No retry starts once its wait would reach the deadline; the server
-then refuses, naming the read and the number of attempts. With the default,
-every bounded attempt ends 10 s before the operator's liveness probe can
-first restart the pod, at 25 s. Outside the operator, keep it below the
-earliest restart your own liveness or startup probe allows. `0s` turns retry
-and the attempt bound off. Any other error, such as an absent or stale
-record, refuses at once.
+start) bounds the retries and each attempt. Each attempt runs for at most the
+time left before the deadline or 5 s, whichever is longer; one still running
+then is cut off and refuses, naming the read and the bound. No retry starts
+once its wait would reach the deadline; the server then refuses, naming the
+read and the number of attempts. A read first reached after the deadline gets
+one attempt, bounded by 5 s, and no retry. So a read whose attempt starts by
+the deadline refuses by the deadline plus 5 s, and a read first reached later
+refuses within 5 s of being reached. With the default, a read that starts by
+the deadline refuses by 20 s, 5 s before the operator's liveness probe can
+first restart the pod, at 25 s. Outside the operator, keep the deadline plus
+5 s below the earliest restart your own liveness or startup probe allows.
+`0s` turns retry and the attempt bound off. Any other error, such as an
+absent or stale record, refuses at once.
 
 The retry covers the reads that
 [Startup store reads](../../architecture.md#startup-store-reads) lists:
@@ -107,8 +111,11 @@ The retry covers the reads that
 records, the `shard_count` provisioning records, `sys/gc` and the
 `sys/ipcrypt/policy` marker. It does not cover the Azure store construction
 request, the `--require-bucket-protection` read or the
-`--format-window-check` reads. Each of those still refuses on its first
-error.
+`--format-window-check` reads, and none of those retries. The Azure request
+refuses on its first error. The bucket-protection read never refuses on a
+read error: a failed or timed-out read leaves its conditions unknown, which
+warns and starts. A failed format-window read refuses under
+`--format-window-check refuse` and warns and starts under `warn`.
 
 While the suite runs, `store qualify` also writes scratch objects under
 `sys/qualify/<run-id>/`. The suite leaves them in place. Each of the two
@@ -329,12 +336,13 @@ The bucket-configuration read is bounded to 10 seconds:
 - The bound covers the bucket-configuration read only. The
   `sys/qualification` read runs before it, on the store's ordinary retrying
   path, and `--startup-store-deadline` bounds it: the store's own request
-  timeout and retries end each attempt, and an attempt still running at the
-  deadline is cut off.
+  timeout and retries end each attempt, and an attempt still running after
+  the time left before the deadline or 5 s, whichever is longer, is cut off.
 - An endpoint that stalls every request stops startup at the
   `sys/qualification` read. The store's request timeout ends each attempt,
   `--startup-store-deadline` ends the retries, and the read refuses by the
-  deadline. The bound helps when only the three configuration GETs stall.
+  deadline plus 5 s. The bound helps when only the three configuration GETs
+  stall.
 
 The check sets `ravel_bucket_protection_conditions_failed`,
 `ravel_bucket_protection_conditions_unknown` and
