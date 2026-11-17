@@ -127,6 +127,33 @@ pub fn is_valid_family_name(family: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// Whether a certificate written at `certified_unix_ns` is still waiting on a
+/// late-write pass: uncontradicted, with the watermark not strictly past
+/// `certified_unix_ns`. This is the retired-reader gate's
+/// `WatermarkNotPastCensus` refusal (ADR-4233 decision 7), and `certify`
+/// reports `FinalizationPending` only in this state. A contradicted
+/// certificate is not pending: the gate refuses it as contradicted, and
+/// `certify` drops its finalizing cursor instead of finishing floor raises.
+pub fn certificate_finalization_pending(
+    contradicted: bool,
+    watermark_unix_ns: i64,
+    certified_unix_ns: i64,
+) -> bool {
+    !contradicted && watermark_unix_ns <= certified_unix_ns
+}
+
+/// [`certificate_finalization_pending`] for a `sys/compat` family entry;
+/// `false` when the entry carries no certificate.
+pub fn finalization_pending(entry: &sysproto::CompatFamily) -> bool {
+    entry.certificate.as_ref().is_some_and(|certificate| {
+        certificate_finalization_pending(
+            entry.contradicted,
+            entry.late_writes_verified_through_unix_ns,
+            certificate.certified_unix_ns,
+        )
+    })
+}
+
 /// The `sys/compat` MAC keys: one per configured file key, each
 /// `blake3::derive_key(`[`COMPAT_RECORD_KEY_CONTEXT`]`, file_key)`. The first
 /// mints; a MAC verifies under any of them. Never empty.
@@ -1005,6 +1032,30 @@ mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
 
     const T0: i64 = 1_800_000_000_000_000_000;
+
+    /// Pending until the watermark is strictly past the certificate, never
+    /// when contradicted, never without a certificate.
+    #[test]
+    fn finalization_pending_boundary_and_contradicted() {
+        let entry =
+            |certificate: bool, watermark: i64, contradicted: bool| sysproto::CompatFamily {
+                family: FAMILY_RSEG.to_string(),
+                certificate: certificate.then(|| sysproto::Certificate {
+                    version: 8,
+                    certified_unix_ns: T0,
+                    ..Default::default()
+                }),
+                late_writes_verified_through_unix_ns: watermark,
+                contradicted,
+                ..Default::default()
+            };
+        assert!(finalization_pending(&entry(true, T0 - 1, false)));
+        assert!(finalization_pending(&entry(true, T0, false)));
+        assert!(!finalization_pending(&entry(true, T0 + 1, false)));
+        assert!(!finalization_pending(&entry(true, T0 - 1, true)));
+        assert!(!finalization_pending(&entry(true, T0, true)));
+        assert!(!finalization_pending(&entry(false, T0 - 1, false)));
+    }
 
     #[derive(Debug)]
     struct ManualClock(AtomicI64);
