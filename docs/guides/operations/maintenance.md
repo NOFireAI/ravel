@@ -2058,10 +2058,16 @@ The procedure, for family F from version N to N+1:
    writes the provisioning records the fence walk raises and puts and
    deletes the certify cursor under `sys/maintain/certify/`. An `rlog`
    activation's walk also writes each tenant's `t/<tenant>/a/alert-lease`,
-   which the shipped Admin role does not grant: add that grant to the
-   credential that runs an `rlog` activation, or its walk stops at the
-   first lease and exits 4. The maintain role runs the late-write pass,
-   certify finalization and the background migration. The
+   which the shipped Admin role grants. The maintain role runs the
+   late-write pass, certify finalization and the background migration.
+   Certify reads the provisioning records of every signal of the family,
+   including `t/<tenant>/a/prov` and `t/<tenant>/u/prov`, which never
+   exist, and the cursor under `sys/maintain/certify/`, which is absent
+   once a run finishes. S3 answers a GET of an absent key with
+   `AccessDenied`, not `NotFound`, unless the role may list that prefix, so
+   the shipped maintain role grants `s3:ListBucket` on
+   `t/<tenant>/a/prov`, `t/<tenant>/u/prov` and `sys/maintain/certify/*`
+   beside its reads. The
    credential each `ravel-cli` command takes, and the `sys/compat` and
    `sys/maintain/certify/*` rows, are in
    [the IAM templates' README](../../../deploy/iam/README.md), sections
@@ -2102,17 +2108,20 @@ The procedure, for family F from version N to N+1:
      family;
    - `Unreadable`, `UnknownBucketEntry` or `NoFamilyForSignal`: an object
      the census found cannot be read or classified;
-   - `OutsideReadSet`: objects at a version this build does not read,
-     grouped by tenant, signal, family and version. Re-ingest or discard
-     them; the retention version hold keeps them meanwhile;
+   - `OutsideReadSet`: objects at a version this build does not read. The
+     census groups them by tenant, signal, family and version, and the
+     message gives the number of groups and the first group in full (its
+     tenant, signal, family, version, object count and one sample key). Re-ingest or discard them; the
+     retention version hold keeps them meanwhile;
    - `ProvisioningFenced`: a provisioning record already carries a
      `compat_epoch`, so `sys/compat` existed and was lost. Restore it from
      bucket versioning instead;
    - `RecordDiffers`: `sys/compat` exists and differs from the record
      `init` would write.
 
-   A failed listing or GET, or a key under a census prefix that cannot be
-   addressed, exits 1; rerun once the store is reachable.
+   A failed listing or GET, a key under a census prefix that cannot be
+   addressed, or an entry under `t/` that is not a tenant, exits 1; rerun
+   once the store is reachable, or remove the stray entry.
 4. **Roll out the release that introduces N+1** everywhere, with a plain
    rolling update. It writes N until step 6, so rolling back to the
    baseline is still safe.
@@ -2133,9 +2142,13 @@ The procedure, for family F from version N to N+1:
      loop deletes alert history and audit objects by age with no version
      hold. No fence and no pass sees a deletion; this step is the only
      control over it.
-   - What it cannot do: make a reader return a wrong answer. Everything it
-     writes is at a version the baseline reads, and once the older reader
-     is retired such an object fails closed with a typed error.
+   - What it cannot do: make a reader return a wrong answer from a data
+     object it writes. Every data object it writes is at a version the
+     baseline reads, and once the older reader is retired such an object
+     fails closed with a typed error. Its unfenced rewrites of
+     `t/<tenant>/config`, `t/<tenant>/m/meta` and `t/<tenant>/enc`, and
+     its deletion of alert history, which changes the alert state a
+     rebuild produces, are not covered by this.
 
    Step 6's `--pre-baseline-processes-terminated` flag is the attestation
    that this step is done.
