@@ -4,9 +4,10 @@
 //! the parent of the policy work published, the bucket is fenced before the
 //! first PUT of a version above the baseline, a view that ages past the
 //! horizon after grant holds the flush before its next attempt until a
-//! refresh or the end of its lifetime, and a view
-//! no read has succeeded for publishes only while its latest refresh was
-//! refused with `AccessDenied`.
+//! refresh or the end of its lifetime, a `sys/compat` outage after an absent
+//! read refuses admission and holds an already acknowledged flush at grant
+//! the same way, and a view no read has succeeded for publishes only while
+//! its latest refresh was refused with `AccessDenied`.
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;
