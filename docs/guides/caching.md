@@ -553,14 +553,23 @@ produce the identical `Ok(None)`, and neither case alone is a failure worth a
 warning.
 
 Do not expect a `warn!` from this path on a normal warmup pass. A
-tenant/signal combination can produce only two `warn!` lines: the `"error"`
-case, and the "has parts but none warmed" line of `cache_warm`.
+tenant/signal combination can produce three `warn!` lines: the `"error"`
+case, the "has parts but none warmed" line of `cache_warm`, and, for a logs
+signal whose segments above the bound were left to the metadata pass and
+every read the pass started for them failed, the "metadata pass warmed none"
+line.
 
-When the metadata pass runs, it logs one `cache warmup: warmed tenant logs
-metadata` line per tenant that has a log segment it plans to read. The line
-carries `metadata_objects_warmed` and `metadata_bytes_warmed`: the log
-segments whose footer and directories the pass read for that tenant, and the
-bytes it fetched from storage for them.
+When the metadata pass runs, it logs one line per tenant that has a log
+segment it plans to read. Unless every read it started for that tenant failed,
+it logs `cache warmup: warmed tenant logs metadata` at `info!`, carrying
+`metadata_objects_warmed` and `metadata_bytes_warmed`: the log segments whose
+footer and directories the pass read for that tenant, and the bytes it fetched
+from storage for them. When it started at least one read for the tenant and
+every one failed, it logs a `warn!` instead (`cache warmup: tenant has logs parts above the plan
+bound but the metadata pass warmed none`). That `warn!` carries the failure a
+tenant whose segments are all above the bound would otherwise hide, because the
+per-(tenant, signal) line stays at `info!` for segments above the bound and the
+per-read failures are logged only at `debug!`.
 
 One final `info!`, `cache warmup: pass complete`, carries the total
 `parts_warmed` across every tenant and signal, the total
