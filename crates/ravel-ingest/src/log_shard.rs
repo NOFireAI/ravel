@@ -1474,8 +1474,12 @@ impl LogFlushCtx {
             match self.bound_to_deadline(deadline_ns, call).await {
                 Some(Ok(token)) => {
                     // After the race, so the instrumented build's evidence
-                    // read cannot abandon a landed commit.
-                    publish::assert_commit_has_data(self.store.as_ref(), record).await;
+                    // read cannot abandon a landed commit, and bounded so it
+                    // cannot hold the ack either.
+                    publish::assert_commit_has_data_unless(self.store.as_ref(), record, || {
+                        self.clock.sleep(publish::EVIDENCE_HEAD_TIMEOUT)
+                    })
+                    .await;
                     return Ok(token);
                 }
                 Some(Err(PublishError::SplitBrain { this, stored })) => {

@@ -853,6 +853,53 @@ pub struct IngestConfig {
     /// fire the backstop on every buffer regardless of size). `ravel-server`
     /// threads this in from `--flush-object-backstop-multiple`.
     pub flush_object_backstop_multiple: usize,
+    /// The catalog fold's seal margin, which only the instrumented build's
+    /// NoPublishAfterAbandon check reads. Default: ravel-catalog's
+    /// `CatalogConfig` defaults; `ravel-server` sets it from the
+    /// `CatalogConfig` its catalog is built from.
+    pub fold_seal: FoldSealMargin,
+}
+
+/// The three `CatalogConfig` values ravel-catalog's `sealed_watermark_hour`
+/// seals an ingest hour behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldSealMargin {
+    pub max_flush_lifetime_ns: i64,
+    pub clock_skew_allowance_ns: i64,
+    pub fold_safety_margin_ns: i64,
+}
+
+impl FoldSealMargin {
+    /// The first instant a fold seals `ingest_hour_bucket`: `end(H) +
+    /// max_flush_lifetime + clock_skew_allowance + fold_safety_margin`, the
+    /// `sealed_watermark_hour` formula.
+    pub(crate) fn sealed_at_ns(&self, ingest_hour_bucket: u32) -> i64 {
+        (i64::from(ingest_hour_bucket) + 1)
+            .saturating_mul(NS_PER_HOUR)
+            .saturating_add(self.max_flush_lifetime_ns)
+            .saturating_add(self.clock_skew_allowance_ns)
+            .saturating_add(self.fold_safety_margin_ns)
+    }
+}
+
+impl From<&ravel_catalog::CatalogConfig> for FoldSealMargin {
+    fn from(config: &ravel_catalog::CatalogConfig) -> Self {
+        FoldSealMargin {
+            max_flush_lifetime_ns: config.max_flush_lifetime_ns,
+            clock_skew_allowance_ns: config.clock_skew_allowance_ns,
+            fold_safety_margin_ns: config.fold_safety_margin_ns,
+        }
+    }
+}
+
+impl Default for FoldSealMargin {
+    fn default() -> Self {
+        FoldSealMargin {
+            max_flush_lifetime_ns: ravel_catalog::DEFAULT_MAX_FLUSH_LIFETIME_NS,
+            clock_skew_allowance_ns: ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+            fold_safety_margin_ns: ravel_catalog::DEFAULT_FOLD_SAFETY_MARGIN_NS,
+        }
+    }
 }
 
 impl Default for IngestConfig {
@@ -911,6 +958,7 @@ impl Default for IngestConfig {
             rlog_page_choice: PageChoice::Estimated,
             max_pending_strict_acks: 8_192,
             flush_object_backstop_multiple: OBJECT_BACKSTOP_TARGET_MULTIPLE,
+            fold_seal: FoldSealMargin::default(),
         }
     }
 }

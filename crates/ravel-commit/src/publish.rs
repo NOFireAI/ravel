@@ -149,17 +149,66 @@ async fn put_commit_record(
     }
 }
 
+/// How long an instrumented build's evidence HEAD may run before it gives up
+/// and evaluates nothing: [`assert_commit_has_data_unless`]'s callers in
+/// ravel-ingest pass a sleep of this length, so a stalled store cannot hold a
+/// landed commit's ack or a flush permit for longer.
+pub const EVIDENCE_HEAD_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// NoCommitWithoutData, for a record that [`publish_deferring_evidence`] (or
 /// [`publish`]) just reported published: the record exists at its key, so
 /// its data object must already be in the store. Only a HEAD answering
 /// NotFound is evidence of absence. The default build compiles the HEAD out.
 pub async fn assert_commit_has_data(store: &dyn ObjectStoreBackend, record: &CommitRecord) {
-    let _ = (store, record);
+    assert_commit_has_data_unless(store, record, std::future::pending).await;
+}
+
+/// [`assert_commit_has_data`], with the HEAD raced against the future
+/// `give_up` returns: a HEAD that loses the race evaluates nothing. The
+/// default build calls neither.
+pub async fn assert_commit_has_data_unless<G, F>(
+    store: &dyn ObjectStoreBackend,
+    record: &CommitRecord,
+    give_up: G,
+) where
+    G: FnOnce() -> F,
+    F: std::future::Future<Output = ()>,
+{
+    let _ = (store, record, &give_up);
+    ravel_invariant::inv_sometimes!(
+        judge_commit_has_data(store, record, give_up).await,
+        "commit: a commit's data-object evidence read completes before it gives up",
+        std::collections::BTreeMap::from([(
+            "commit_key",
+            keys::commit_key_for_record(record).unwrap_or_default()
+        )])
+    );
+}
+
+/// Evaluates NoCommitWithoutData unless `give_up`'s future completes first,
+/// and returns whether it evaluated. Only an invariant condition calls this.
+#[allow(dead_code)]
+async fn judge_commit_has_data<G, F>(
+    store: &dyn ObjectStoreBackend,
+    record: &CommitRecord,
+    give_up: G,
+) -> bool
+where
+    G: FnOnce() -> F,
+    F: std::future::Future<Output = ()>,
+{
+    let has_data = match keys::reconstruct_data_key(record) {
+        Ok(data_key) => {
+            let give_up = give_up();
+            tokio::select! {
+                head = store.head(&data_key) => !matches!(head, Err(StoreError::NotFound)),
+                () = give_up => return false,
+            }
+        }
+        Err(_) => false,
+    };
     ravel_invariant::inv_always!(
-        match keys::reconstruct_data_key(record) {
-            Ok(data_key) => !matches!(store.head(&data_key).await, Err(StoreError::NotFound)),
-            Err(_) => false,
-        },
+        has_data,
         "commit: a commit record never exists without its data object",
         std::collections::BTreeMap::from([
             (
@@ -172,6 +221,7 @@ pub async fn assert_commit_has_data(store: &dyn ObjectStoreBackend, record: &Com
             ),
         ])
     );
+    true
 }
 
 async fn resolve_already_exists(

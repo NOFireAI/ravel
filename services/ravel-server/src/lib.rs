@@ -2740,6 +2740,11 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // before the policy existed. Installed below with `with_compat_policy`,
     // which refuses to start a router whose `max_flush_lifetime` exceeds the
     // record's `max_publish_lifetime_ns` (decision 7).
+    // The seal margin of the catalog `query::build_catalog_for_server` builds
+    // below, so each ingest router judges an abandoned commit against the hour
+    // seal this process's fold applies.
+    let fold_seal = (&query::server_catalog_config_base()).into();
+
     let ingest_compat_policy = compat_view.clone().map(|view| {
         Arc::new(
             ravel_ingest::IngestCompatPolicy::new(view, compat_clock.clone())
@@ -2771,6 +2776,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                     config.max_flush_delay,
                 )
                 .saturating_add(ravel_ingest::STRICT_VISIBILITY_RESERVE_NS),
+                fold_seal,
                 ..IngestConfig::default()
             },
             Signal::Metrics,
@@ -2857,6 +2863,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 max_flush_delay_idle: config.max_flush_delay_idle,
                 min_flush_bytes: config.min_flush_bytes,
                 idle_flush_byte_floor: config.idle_flush_byte_floor,
+                fold_seal,
                 ..IngestConfig::default()
             },
             Signal::Logs,
@@ -2895,6 +2902,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 max_flush_delay_idle: config.max_flush_delay_idle,
                 min_flush_bytes: config.min_flush_bytes,
                 idle_flush_byte_floor: config.idle_flush_byte_floor,
+                fold_seal,
                 ..IngestConfig::default()
             },
             Signal::Spans,
