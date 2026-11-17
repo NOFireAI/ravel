@@ -96,6 +96,7 @@ pub mod service;
 pub mod sql;
 #[cfg(feature = "flight-sql")]
 pub mod sql_distrib;
+pub mod startup_retry;
 pub mod store;
 pub mod store_probe;
 pub mod tenancy;
@@ -2571,6 +2572,7 @@ pub async fn start_with_ipcrypt(
         cache,
         heartbeat,
         ipcrypt,
+        startup_retry::StartupRetry::disabled(),
     )
     .await?;
     running.runtime_heartbeat_task = Some(task);
@@ -2596,6 +2598,7 @@ pub async fn start_with_heartbeat(
         cache,
         heartbeat,
         ipcrypt::IpcryptPolicy::disabled(),
+        startup_retry::StartupRetry::disabled(),
     )
     .await
 }
@@ -2626,7 +2629,11 @@ fn spawn_decoded_cache_sweeper(cache: &Arc<ravel_logseg::decoded_cache::DecodedC
 /// In the `all` and `gateway` modes this checks the policy's fingerprint
 /// against the bucket's `sys/ipcrypt/policy` marker before anything is
 /// built or bound, and refuses to start on a mismatch or a failed read
-/// (ADR-2993 decision 9); see [`ipcrypt::check_startup_marker`].
+/// (ADR-2993 decision 9); see [`ipcrypt::check_startup_marker`]. A read that
+/// fails with a transient store error is retried under `startup_retry`, the
+/// policy the binary's other startup store reads share (issue #4325); the
+/// other `start` variants pass [`startup_retry::StartupRetry::disabled`].
+#[allow(clippy::too_many_arguments)]
 pub async fn start_with_heartbeat_and_ipcrypt(
     mut config: ServerConfig,
     store: Arc<dyn ObjectStoreBackend>,
@@ -2635,6 +2642,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     cache: Option<ravel_query::ReadCache>,
     heartbeat: health_listener::Heartbeat,
     ipcrypt: Arc<ipcrypt::IpcryptPolicy>,
+    startup_retry: startup_retry::StartupRetry,
 ) -> anyhow::Result<Running> {
     validate_idle_flush_byte_floor(&config)?;
     // The same checks, in the same order, as `Cli::validate`.
@@ -2667,7 +2675,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // first), so the result is discarded.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    ipcrypt::check_startup_marker(store.as_ref(), config.mode, &ipcrypt).await?;
+    ipcrypt::check_startup_marker(store.as_ref(), config.mode, &ipcrypt, &startup_retry).await?;
 
     // The one `sys/compat` view this process holds (ADR-4233 decision 3), in
     // every mode, read once here before any writer starts and then every

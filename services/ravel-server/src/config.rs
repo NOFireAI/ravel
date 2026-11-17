@@ -1452,6 +1452,50 @@ pub struct StartupCheckArgs {
         env = "RAVEL_FORMAT_WINDOW_CHECK_TIMEOUT"
     )]
     pub format_window_check_timeout: Duration,
+
+    /// How long, from process start, startup keeps retrying a store read that
+    /// fails with a transient store error (a store error of kind Transient,
+    /// Timeout or Throttled), as a humantime duration (issue #4325). Covers
+    /// sys/qualification, sys/tenancy, the --tenant-kms-config key-epoch
+    /// records, the shard_count provisioning records, sys/gc and the
+    /// sys/ipcrypt/policy marker. Not covered, and not retried: the Azure
+    /// store construction request, which refuses on its first error; the
+    /// --require-bucket-protection read, which never refuses on a read error
+    /// (a failed or timed-out read leaves the conditions unknown, which warns
+    /// and starts); and the --format-window-check reads, where a failed read
+    /// refuses under --format-window-check refuse and warns and starts under
+    /// warn. The last two have their own bounds. The wait between attempts
+    /// doubles from 100 ms to a 2 s cap and is jittered down to half of that,
+    /// each retry logs one warning naming the read, and /readyz is not ready
+    /// while they run. A read's first attempt is not bounded by this flag:
+    /// the store's own request timeout and retries end it, so a slow but
+    /// healthy store still starts. Each retry is bounded by the time left
+    /// before the deadline or 5 s, whichever is longer: one still running
+    /// then is cut off and refuses naming the read and the bound. No retry
+    /// starts once its wait would reach the deadline; the transient failure
+    /// then refuses naming the read and the attempt count, so a first
+    /// attempt that fails transiently after the deadline refuses at once. A
+    /// read whose first attempt fails transiently before the deadline
+    /// therefore refuses by the deadline plus 5 s, 20 s with the default
+    /// 15s; a first attempt that hangs ends when the store's own request
+    /// timeout and retries give up. Any other error refuses at once, as
+    /// before. The whole
+    /// startup before the listener binds can outlast the operator's
+    /// liveness probe (earliest restart 25 s); the operations guide's
+    /// deployment page says what to set. `0s` turns retry and the retry
+    /// bound off.
+    #[arg(
+        long = "startup-store-deadline",
+        value_name = "DURATION",
+        default_value = "15s",
+        value_parser = parse_startup_store_deadline,
+        env = "RAVEL_STARTUP_STORE_DEADLINE"
+    )]
+    pub startup_store_deadline: Duration,
+}
+
+fn parse_startup_store_deadline(value: &str) -> Result<Duration, String> {
+    humantime::parse_duration(value).map_err(|err| err.to_string())
 }
 
 /// The query-audit pipeline (ADR-0062).

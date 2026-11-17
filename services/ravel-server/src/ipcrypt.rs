@@ -15,13 +15,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 use ravel_ipcrypt::fingerprint::{EMPTY_POLICY_FINGERPRINT, policy_fingerprint};
-use ravel_ipcrypt::marker::{CheckOutcome, check_marker};
+use ravel_ipcrypt::marker::{CheckError, CheckOutcome, MarkerError, check_marker};
 use ravel_ipcrypt::policy::PolicyFile;
 use ravel_ipcrypt::rules::{ResolveError, TenantRules};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{TenantHash, TenantId};
 
 use crate::config::Mode;
+use crate::startup_retry::{SITE_IPCRYPT_MARKER, StartupRetry, store_error_is_transient};
 
 /// The metric label sanitizer rule keys are matched through on metric
 /// surfaces (ADR-2993 decision 1): the one the OTLP metric normalizer applies
@@ -217,22 +218,35 @@ fn rule_key_of(err: &ResolveError) -> String {
 /// nothing a policy governs and do not read the marker (`Ok(None)`). The
 /// modes that read it are the ones that build the ingest routers,
 /// [`Mode::holds_ingest_buffer`].
+///
+/// A check that fails with a transient store error is retried under `retry`
+/// (issue #4325). The marker create is create-if-absent and a retry starts
+/// from the read, so a create that landed before an ambiguous failure reads
+/// back as this policy's own marker and matches.
 pub async fn check_startup_marker(
     store: &dyn ObjectStoreBackend,
     mode: Mode,
     policy: &IpcryptPolicy,
+    retry: &StartupRetry,
 ) -> anyhow::Result<Option<CheckOutcome>> {
     if !mode.holds_ingest_buffer() {
         return Ok(None);
     }
     let local = hex::encode(policy.fingerprint());
-    let outcome = check_marker(store, policy.fingerprint())
+    let outcome = retry
+        .run(
+            SITE_IPCRYPT_MARKER,
+            || check_marker(store, policy.fingerprint()),
+            check_error_is_transient,
+        )
         .await
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "refusing to start: the IPCrypt policy marker check failed (local policy \
-                 fingerprint {local}): {err}"
-            )
+        .map_err(|failure| {
+            failure.into_anyhow(|err| {
+                anyhow::anyhow!(
+                    "refusing to start: the IPCrypt policy marker check failed (local policy \
+                     fingerprint {local}): {err}"
+                )
+            })
         })?;
     tracing::info!(
         fingerprint = %local,
@@ -240,6 +254,17 @@ pub async fn check_startup_marker(
         "IPCrypt policy marker checked"
     );
     Ok(Some(outcome))
+}
+
+/// `CheckError::Create` holds its store error in a field that is not a
+/// source, so each variant is matched by type.
+fn check_error_is_transient(err: &CheckError) -> bool {
+    match err {
+        CheckError::Create(store) | CheckError::Marker(MarkerError::Store(store)) => {
+            store_error_is_transient(store)
+        }
+        CheckError::Mismatch { .. } | CheckError::Marker(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -408,11 +433,11 @@ mod tests {
     async fn marker_mismatch_refuses_naming_both_fingerprints() {
         let store = MemoryStore::new();
         let first = IpcryptPolicy::new(defaults_policy(&["client.ip"]), Some(&KEY)).expect("a");
-        check_startup_marker(&store, Mode::All, &first)
+        check_startup_marker(&store, Mode::All, &first, &StartupRetry::disabled())
             .await
             .expect("first start creates the marker");
         let second = IpcryptPolicy::new(defaults_policy(&["peer.ip"]), Some(&KEY)).expect("b");
-        let err = check_startup_marker(&store, Mode::Gateway, &second)
+        let err = check_startup_marker(&store, Mode::Gateway, &second, &StartupRetry::disabled())
             .await
             .expect_err("a different policy refuses");
         let text = format!("{err:#}");
@@ -429,9 +454,14 @@ mod tests {
         let store = FaultStore::new(MemoryStore::new(), plan);
         // An empty policy: an implementation that read the failure as an
         // absent marker would proceed here without writing.
-        let err = check_startup_marker(&store, Mode::All, &IpcryptPolicy::empty())
-            .await
-            .expect_err("a read failure refuses");
+        let err = check_startup_marker(
+            &store,
+            Mode::All,
+            &IpcryptPolicy::empty(),
+            &StartupRetry::disabled(),
+        )
+        .await
+        .expect_err("a read failure refuses");
         assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 1);
         let text = format!("{err:#}");
         assert!(
@@ -444,9 +474,14 @@ mod tests {
     #[tokio::test]
     async fn no_marker_and_empty_policy_starts_and_writes_nothing() {
         let store = MemoryStore::new();
-        let outcome = check_startup_marker(&store, Mode::All, &IpcryptPolicy::empty())
-            .await
-            .expect("starts");
+        let outcome = check_startup_marker(
+            &store,
+            Mode::All,
+            &IpcryptPolicy::empty(),
+            &StartupRetry::disabled(),
+        )
+        .await
+        .expect("starts");
         assert_eq!(outcome, Some(CheckOutcome::ProceededNoMarker));
         let listed = ravel_object_store::list_all(&store, "")
             .await
@@ -458,16 +493,17 @@ mod tests {
     async fn no_marker_and_non_empty_policy_creates_it() {
         let store = MemoryStore::new();
         let policy = IpcryptPolicy::new(defaults_policy(&["client.ip"]), Some(&KEY)).expect("a");
-        let outcome = check_startup_marker(&store, Mode::Gateway, &policy)
-            .await
-            .expect("starts");
+        let outcome =
+            check_startup_marker(&store, Mode::Gateway, &policy, &StartupRetry::disabled())
+                .await
+                .expect("starts");
         assert_eq!(outcome, Some(CheckOutcome::Created));
         let (stored, _) = ravel_ipcrypt::marker::read_marker(&store)
             .await
             .expect("read")
             .expect("present");
         assert_eq!(stored.fingerprint, policy.fingerprint());
-        let again = check_startup_marker(&store, Mode::All, &policy)
+        let again = check_startup_marker(&store, Mode::All, &policy, &StartupRetry::disabled())
             .await
             .expect("restart matches");
         assert_eq!(again, Some(CheckOutcome::Matched));
@@ -491,9 +527,14 @@ mod tests {
                 )
                 .await
                 .expect("seed");
-            let outcome = check_startup_marker(&store, mode, &IpcryptPolicy::empty())
-                .await
-                .expect("not checked");
+            let outcome = check_startup_marker(
+                &store,
+                mode,
+                &IpcryptPolicy::empty(),
+                &StartupRetry::disabled(),
+            )
+            .await
+            .expect("not checked");
             assert_eq!(outcome, None);
             assert_eq!(
                 store.fault_count(Op::Get, FaultKind::Transient),
@@ -501,6 +542,114 @@ mod tests {
                 "{mode:?} issued a GET on {IPCRYPT_POLICY_KEY}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn marker_check_retries_transient_failures_then_starts() {
+        use crate::startup_retry::test_support::{ManualClock, retry_on, transient_then_ok};
+        let clock = Arc::new(ManualClock::default());
+        let store = FaultStore::new(
+            MemoryStore::new(),
+            transient_then_ok(Op::Get, IPCRYPT_POLICY_KEY, 3),
+        );
+        let outcome = check_startup_marker(
+            &store,
+            Mode::All,
+            &IpcryptPolicy::empty(),
+            &retry_on(clock.clone()),
+        )
+        .await
+        .expect("starts once the store answers");
+        assert_eq!(outcome, Some(CheckOutcome::ProceededNoMarker));
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 3);
+        assert_eq!(store.sequence_progress(0), 4);
+        assert_eq!(clock.sleeps().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn marker_create_retries_a_transient_failure_then_matches() {
+        use crate::startup_retry::test_support::{ManualClock, retry_on, transient_then_ok};
+        let clock = Arc::new(ManualClock::default());
+        let store = FaultStore::new(
+            MemoryStore::new(),
+            transient_then_ok(Op::Put, IPCRYPT_POLICY_KEY, 2),
+        );
+        let policy = IpcryptPolicy::new(defaults_policy(&["client.ip"]), Some(&KEY)).expect("a");
+        let outcome = check_startup_marker(&store, Mode::Gateway, &policy, &retry_on(clock))
+            .await
+            .expect("starts once the create lands");
+        assert_eq!(outcome, Some(CheckOutcome::Created));
+        assert_eq!(store.fault_count(Op::Put, FaultKind::Transient), 2);
+        assert_eq!(store.sequence_progress(0), 3);
+    }
+
+    /// A create that landed but answered `Transient` reads back on the retry
+    /// as this policy's own marker and matches; nothing is written twice.
+    #[tokio::test]
+    async fn marker_create_whose_ack_was_lost_reads_back_and_matches() {
+        use crate::startup_retry::test_support::{ManualClock, ack_lost_then_ok, retry_on};
+        let clock = Arc::new(ManualClock::default());
+        let store = FaultStore::new(MemoryStore::new(), ack_lost_then_ok(IPCRYPT_POLICY_KEY));
+        let policy = IpcryptPolicy::new(defaults_policy(&["client.ip"]), Some(&KEY)).expect("a");
+        let outcome = check_startup_marker(&store, Mode::All, &policy, &retry_on(clock.clone()))
+            .await
+            .expect("the retry finds the landed marker");
+        assert_eq!(outcome, Some(CheckOutcome::Matched));
+        assert_eq!(store.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
+        assert_eq!(store.sequence_progress(0), 1);
+        // One retry: the read that found the landed marker.
+        assert_eq!(clock.sleeps().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn marker_check_transient_past_the_deadline_refuses_naming_the_site() {
+        use crate::startup_retry::test_support::{
+            DEADLINE, ManualClock, always_transient, assert_deadline_refusal, retry_on,
+        };
+        let clock = Arc::new(ManualClock::default());
+        let store = FaultStore::new(
+            MemoryStore::new(),
+            always_transient(Op::Get, IPCRYPT_POLICY_KEY),
+        );
+        let err = check_startup_marker(
+            &store,
+            Mode::All,
+            &IpcryptPolicy::empty(),
+            &retry_on(clock.clone()),
+        )
+        .await
+        .expect_err("refuses once the deadline passes");
+        let attempts = store.fault_count(Op::Get, FaultKind::Transient);
+        assert_deadline_refusal(&err, SITE_IPCRYPT_MARKER, attempts);
+        assert!(clock.virtual_now() < DEADLINE);
+        assert!(format!("{err:#}").contains("IPCrypt policy marker check failed"));
+    }
+
+    #[tokio::test]
+    async fn marker_check_non_transient_error_refuses_on_the_first_attempt() {
+        use crate::startup_retry::test_support::{ManualClock, always_permanent, retry_on};
+        let clock = Arc::new(ManualClock::default());
+        let store = FaultStore::new(
+            MemoryStore::new(),
+            always_permanent(Op::Get, IPCRYPT_POLICY_KEY),
+        );
+        let err = check_startup_marker(
+            &store,
+            Mode::All,
+            &IpcryptPolicy::empty(),
+            &retry_on(clock.clone()),
+        )
+        .await
+        .expect_err("refuses at once");
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
+        assert!(
+            err.to_string().starts_with(
+                "refusing to start: the IPCrypt policy marker check failed (local policy \
+                 fingerprint "
+            ),
+            "{err}"
+        );
+        assert!(clock.sleeps().is_empty());
     }
 
     /// Every `.rs` file under `dir`, recursively.
