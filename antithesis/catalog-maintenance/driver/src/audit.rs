@@ -160,19 +160,27 @@ pub fn unfetched_part(stderr: &str) -> Option<String> {
 /// `Error: failed to fetch <key>: object not found` (anyhow's report of a
 /// `StoreError::NotFound`): the catalog resolved a data object the store does
 /// not hold. `None` for any other failure, including a fetch of `sys/tenancy`
-/// or a HEAD, a key outside `<tenant_prefix>l/` or not an `.rlog`, and any
-/// store error other than not-found; the audit then has no verdict.
+/// or a HEAD, a key outside `<tenant_prefix>l/l0/` and `<tenant_prefix>l/l1/`
+/// or not ending in [`DATA_SUFFIX`], and any store error other than
+/// not-found; the audit then has no verdict.
 pub fn unfetched_object(stderr: &str, tenant_prefix: &str) -> Option<String> {
-    let data = format!("{tenant_prefix}l/");
+    let l0 = format!("{tenant_prefix}l/l0/");
+    let l1 = format!("{tenant_prefix}l/l1/");
     stderr.lines().find_map(|line| {
         let (key, cause) = line
             .trim()
             .strip_prefix("Error: failed to fetch ")?
             .split_once(": ")?;
-        (key.starts_with(&data) && key.ends_with(".rlog") && cause.trim() == "object not found")
+        ((key.starts_with(&l0) || key.starts_with(&l1))
+            && key.ends_with(DATA_SUFFIX)
+            && cause.trim() == "object not found")
             .then(|| key.to_string())
     })
 }
+
+/// The suffix of every data object key Ravel writes, level 0 and level 1
+/// alike (`ravel_commit::keys::DATA_SUFFIX`).
+pub const DATA_SUFFIX: &str = ".rseg";
 
 /// The keys HEAD names that the listing does not hold.
 pub fn missing_named(named: &[String], listed: &BTreeSet<String>) -> Vec<String> {
@@ -330,24 +338,31 @@ parts: 1
 
     #[test]
     fn footprint_objects_are_parsed() {
-        let json = r#"{"total":{},"objects":[{"key":"t/0a0b/l/l0/0/a.rlog","level":0},
-                       {"key":"t/0a0b/l/l1/0/1/b.rlog","level":1}]}"#;
+        let json = format!(
+            r#"{{"total":{{}},"objects":[{{"key":"{L0_KEY}","level":0}},
+                {{"key":"{L1_KEY}","level":1}}]}}"#
+        );
         assert_eq!(
-            footprint_keys(json),
-            Some(vec![
-                "t/0a0b/l/l0/0/a.rlog".to_string(),
-                "t/0a0b/l/l1/0/1/b.rlog".to_string()
-            ])
+            footprint_keys(&json),
+            Some(vec![L0_KEY.to_string(), L1_KEY.to_string()])
         );
         assert_eq!(footprint_keys("object_count: 2"), None);
     }
 
-    const DATA_KEY: &str = "t/0a0b/l/l0/0/w1.1.7.00112233aabbccdd.rlog";
+    /// Shapes from `ravel_commit::keys::data_key` and `l1_part_key`.
+    const TENANT: &str = "t/7d3c0f5e9a1b2c4d6e8f00112233aabb/";
+    const L0_KEY: &str = "t/7d3c0f5e9a1b2c4d6e8f00112233aabb/l/l0/0003/\
+        5f0c6a2e-8b1d-4c3a-9e7f-112233445566.1.00000000000000000007.00112233aabbccdd.rseg";
+    const L1_KEY: &str = "t/7d3c0f5e9a1b2c4d6e8f00112233aabb/l/l1/0001/20261117T16/\
+        0f6eeb04e9886d29.0000.592aa104ca6bae9c.rseg";
+    const DATA_KEY: &str = L0_KEY;
 
     #[test]
     fn a_data_object_not_found_under_the_tenant_is_missing() {
-        let err = format!("Error: failed to fetch {DATA_KEY}: object not found\n");
-        assert_eq!(unfetched_object(&err, "t/0a0b/").as_deref(), Some(DATA_KEY));
+        for key in [L0_KEY, L1_KEY] {
+            let err = format!("Error: failed to fetch {key}: object not found\n");
+            assert_eq!(unfetched_object(&err, TENANT).as_deref(), Some(key));
+        }
     }
 
     #[test]
@@ -375,17 +390,24 @@ parts: 1
             "access denied: RequestTimeTooSkewed",
         ] {
             let err = format!("Error: failed to fetch {DATA_KEY}: {cause}\n");
-            assert_eq!(unfetched_object(&err, "t/0a0b/"), None, "{cause}");
+            assert_eq!(unfetched_object(&err, TENANT), None, "{cause}");
         }
     }
 
     #[test]
     fn a_not_found_outside_the_tenant_data_prefix_has_no_verdict() {
-        let other = "t/ffff/l/l0/0/w1.1.7.00112233aabbccdd.rlog";
-        let err = format!("Error: failed to fetch {other}: object not found\n");
-        assert_eq!(unfetched_object(&err, "t/0a0b/"), None);
+        let err = format!("Error: failed to fetch {DATA_KEY}: object not found\n");
+        assert_eq!(
+            unfetched_object(&err, "t/ffffffffffffffffffffffffffffffff/"),
+            None
+        );
         let err = "Error: failed to fetch t/0a0b/catalog/l/idx/1.bb.cstat: object not found\n";
         assert_eq!(unfetched_object(err, "t/0a0b/"), None);
+        let commit = format!(
+            "{TENANT}l/c/0003/20261117T16/5f0c6a2e-8b1d-4c3a-9e7f-112233445566.1.00000000000000000007.cmt"
+        );
+        let err = format!("Error: failed to fetch {commit}: object not found\n");
+        assert_eq!(unfetched_object(&err, TENANT), None);
     }
 
     #[test]
@@ -425,22 +447,25 @@ parts: 1
         let p = tenant_prefix("t/0a0b/catalog/l/HEAD").expect("prefix");
         assert_eq!(p, "t/0a0b/");
         let listed: Vec<String> = [
-            "t/0a0b/l/c/0/490001/w1.1.7.cmt",
-            "t/0a0b/l/c/0/490001/l1.00112233aabbccdd.cmt",
-            "t/0a0b/l/c/0/490001/rw.00112233aabbccdd.cmt",
-            "t/0a0b/l/c/0/490001/retire.tmb",
-            "t/0a0b/m/c/0/490001/l1.00112233aabbccdd.cmt",
+            "t/0a0b/l/c/0000/20261117T16/5f0c6a2e-8b1d-4c3a-9e7f-112233445566.1.00000000000000000007.cmt",
+            "t/0a0b/l/c/0000/20261117T16/l1.00112233aabbccdd.cmt",
+            "t/0a0b/l/c/0000/20261117T16/rw.00112233aabbccdd.cmt",
+            "t/0a0b/l/c/0000/20261117T16/retire.tmb",
+            "t/0a0b/l/l0/0000/5f0c6a2e-8b1d-4c3a-9e7f-112233445566.1.00000000000000000007.00112233aabbccdd.rseg",
+            "t/0a0b/m/c/0000/20261117T16/l1.00112233aabbccdd.cmt",
         ]
         .iter()
         .map(|s| s.to_string())
         .collect();
         assert_eq!(
             compaction_records(&p, &listed),
-            vec!["t/0a0b/l/c/0/490001/l1.00112233aabbccdd.cmt"]
+            vec!["t/0a0b/l/c/0000/20261117T16/l1.00112233aabbccdd.cmt"]
         );
         assert_eq!(
             l0_commit_records(&p, &listed),
-            vec!["t/0a0b/l/c/0/490001/w1.1.7.cmt"]
+            vec![
+                "t/0a0b/l/c/0000/20261117T16/5f0c6a2e-8b1d-4c3a-9e7f-112233445566.1.00000000000000000007.cmt"
+            ]
         );
     }
 }
