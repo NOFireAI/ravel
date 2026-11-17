@@ -6,15 +6,18 @@
 # container starts through that wrapper (/faketime/run), which refuses to
 # start unless libfaketime is preloaded and moves the clock of the binary the
 # container runs, so all seven containers read one wall-clock offset. The
-# driver rewrites the offset once per timeline, after seeding and some live
-# writes, to move every clock forward together by CLOCK_JUMP_SECS (9000 s,
-# above the 8400 s that seals the ingest hour of every write acked before it;
-# README.md, "The clock jump"). libfaketime rereads the file at most every
-# FAKETIME_CACHE_DURATION (2 s) per process, so the jump lands in every
-# process within about 2 s. Inside that window a process that has not reread
-# is 9000 s behind one that has, beyond SigV4's 900 s skew limit, so a request
-# between them (a server's background request to rustfs included) may fail;
-# the driver holds its write gate across the jump and the reread interval.
+# driver rewrites the offset after seeding and some live writes, to move every
+# clock forward together by CLOCK_JUMP_SECS (9000 s, above the 8400 s that
+# seals the ingest hour of every write acked before it; README.md, "The clock
+# jump"). Once a compaction record is seen it moves every clock twice more, by
+# CLOCK_SWEEP_HORIZON_JUMP_SECS and CLOCK_SWEEP_WINDOW_JUMP_SECS, so a sweep
+# can delete a superseded compaction input (README.md, "The sweep jumps").
+# libfaketime rereads the file at most every FAKETIME_CACHE_DURATION (2 s) per
+# process, so each jump lands in every process within about 2 s. Inside that
+# window a process that has not reread is a whole jump behind one that has,
+# beyond SigV4's 900 s skew limit, so a request between them (a server's
+# background request to rustfs included) may fail; the driver holds its write
+# gate across every jump and its reread interval.
 # Monotonic clocks stay real, so timers, timeouts and leases measured on them
 # are untouched.
 #
@@ -207,9 +210,15 @@ services:
       SEED_HOUR_STRIDE: "2"
       SEED_RECORDS_PER_HOUR: "50"
       WORKLOAD_MAX_WRITES: "3000"
-      # The driver alone writes the offset file, once per timeline.
+      # The driver alone writes the offset file: once to seal the live hours,
+      # then, once a compaction record is seen, twice more so a sweep can
+      # delete a superseded input (README.md, "The sweep jumps"). Each sweep
+      # jump is at least the shipped default it passes: protection horizon
+      # 90300 s, pinned-query window 4830 s.
       CLOCK_JUMP_FILE: /faketime/offset
       CLOCK_JUMP_SECS: "9000"
+      CLOCK_SWEEP_HORIZON_JUMP_SECS: "91200"
+      CLOCK_SWEEP_WINDOW_JUMP_SECS: "5400"
     # Read-write: the driver is the one writer of the offset file.
     volumes: ["faketime:/faketime"]
     depends_on:
