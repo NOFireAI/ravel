@@ -6157,11 +6157,25 @@ impl Catalog {
                     // only if the store holds this very HEAD. A failed read, a
                     // HEAD that does not decode where the digest is compared,
                     // and an acked overwrite whose HEAD is gone cannot tell.
+                    // A CAS conditioned on a Corrupt HEAD's version also cannot
+                    // tell: the catalog-maintenance driver corrupts HEAD by
+                    // writing a fixed body, and on a store that derives the
+                    // version from content (a RustFS ETag; #4389) the same
+                    // corrupt bytes recur the same version. So a re-read
+                    // returning the conditioned version after our acked apply
+                    // can mean the driver re-corrupted with identical bytes
+                    // between the CAS and the re-read, not that the write
+                    // failed to land. A Valid HEAD's bytes carry folder_id and
+                    // created_unix_ns, so its version does not recur.
                     ravel_invariant::inv_always_if_known!(
                         match self.store().get(&head_key, GetRange::Full).await {
                             Ok(got) if cas_acked => match &put_mode {
                                 PutMode::CasVersion(conditioned) => {
-                                    Some(got.version != *conditioned)
+                                    if matches!(head_state, HeadState::Corrupt { .. }) {
+                                        None
+                                    } else {
+                                        Some(got.version != *conditioned)
+                                    }
                                 }
                                 PutMode::CreateIfAbsent | PutMode::Overwrite => Some(true),
                             },
@@ -13791,9 +13805,210 @@ pub(crate) mod tests {
             found[0].0,
             "a lower watermark under a later version holds: {found:?}"
         );
-        let found = evaluations(FOLDED_HEAD_HELD, &rival.to_string());
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert!(found[0].0, "{found:?}");
+        // The rival's own CAS was conditioned on the corrupt HEAD it read, so
+        // its re-read cannot tell a recurring corrupt version apart from a
+        // lost write: the version arm gives no evaluation (#4389).
+        assert!(
+            evaluations(FOLDED_HEAD_HELD, &rival.to_string()).is_empty(),
+            "a CAS conditioned on a corrupt HEAD records no evaluation"
+        );
+    }
+
+    /// A store double whose version is a content hash: identical bytes always
+    /// get the same version, as a RustFS content-derived ETag does (#4389).
+    /// Only HEAD is held here, with content-derived versions and CAS
+    /// semantics; every other key delegates to the inner `MemoryStore`.
+    /// `corrupt` writes a fixed corrupt body directly (the
+    /// catalog-maintenance driver's corruption); a CAS the store applies arms
+    /// a re-corruption with that same body before the next HEAD read,
+    /// reproducing the ETag-reuse schedule of #4389.
+    struct ContentVersionHeadStore {
+        inner: Arc<MemoryStore>,
+        head: std::sync::Mutex<Option<Bytes>>,
+        corrupt_body: Bytes,
+        recorrupt_on_next_get: std::sync::atomic::AtomicBool,
+    }
+
+    impl ContentVersionHeadStore {
+        fn content_version(data: &[u8]) -> Version {
+            Version(blake3::hash(data).to_hex().to_string())
+        }
+
+        fn is_head(key: &str) -> bool {
+            key.contains("HEAD")
+        }
+
+        /// The driver's corruption: overwrite HEAD with a fixed body whose
+        /// content-derived version recurs for identical bytes.
+        fn corrupt(&self) {
+            *self.head.lock().expect("head") = Some(self.corrupt_body.clone());
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for ContentVersionHeadStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            if !Self::is_head(key) {
+                return self.inner.put(key, data, opts).await;
+            }
+            let acked = {
+                let mut head = self.head.lock().expect("head");
+                match &opts.mode {
+                    PutMode::CreateIfAbsent => {
+                        if head.is_some() {
+                            return Err(StoreError::AlreadyExists);
+                        }
+                        *head = Some(data.clone());
+                        false
+                    }
+                    PutMode::CasVersion(conditioned) => {
+                        let current = head.as_ref().ok_or(StoreError::PreconditionFailed)?;
+                        if Self::content_version(current) != *conditioned {
+                            return Err(StoreError::PreconditionFailed);
+                        }
+                        *head = Some(data.clone());
+                        true
+                    }
+                    PutMode::Overwrite => {
+                        *head = Some(data.clone());
+                        false
+                    }
+                }
+            };
+            // An applied CAS arms the driver's second corruption, landed
+            // before the fold's re-read by the matching `get` below.
+            if acked {
+                self.recorrupt_on_next_get
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let version = Self::content_version(&data);
+            Ok(ravel_object_store::PutOutcome {
+                etag: ravel_object_store::Etag(version.0.clone()),
+                version,
+            })
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            if !Self::is_head(key) {
+                return self.inner.get(key, range).await;
+            }
+            if self
+                .recorrupt_on_next_get
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.corrupt();
+            }
+            let data = self
+                .head
+                .lock()
+                .expect("head")
+                .as_ref()
+                .ok_or(StoreError::NotFound)?
+                .clone();
+            let version = Self::content_version(&data);
+            Ok(ravel_object_store::GetOutcome {
+                total_size: data.len() as u64,
+                data,
+                etag: ravel_object_store::Etag(version.0.clone()),
+                version,
+            })
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Issue #4335 round 3: the fold CASes over a Corrupt HEAD, whose version
+    /// on a content-addressed store (#4389) recurs for identical corrupt
+    /// bytes. The maintenance driver corrupts HEAD, a fold rebuilds it and its
+    /// CAS (If-Match the corrupt version) is acked, then the driver
+    /// re-corrupts with the same body before the fold's re-read. The re-read
+    /// returns the very version the CAS was conditioned on even though the
+    /// write landed. Because that version came from a Corrupt HEAD, the
+    /// property gives no evaluation rather than a false one.
+    #[tokio::test]
+    async fn an_acked_cas_over_a_corrupt_head_recorrupted_to_the_same_bytes_gives_no_evaluation() {
+        if !capturing() {
+            return;
+        }
+        let inner = Arc::new(MemoryStore::new());
+        let store = Arc::new(ContentVersionHeadStore {
+            inner: inner.clone(),
+            head: std::sync::Mutex::new(None),
+            corrupt_body: Bytes::from_static(b"not a HEAD"),
+            recorrupt_on_next_get: Default::default(),
+        });
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        publish_segment(
+            &inner,
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now_at_seal(10) - NS_PER_HOUR,
+        )
+        .await;
+
+        // The driver corrupts HEAD with a fixed body; its content-derived
+        // version is E_G.
+        store.corrupt();
+
+        let acked = Uuid::new_v4();
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                acked,
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("the fold rebuilds the corrupt HEAD and its CAS is acked");
+        assert!(report.rebuilt, "a corrupt HEAD rebuilds: {report:?}");
+        assert_eq!(report.watermark_hour, Some(10));
+
+        // The re-read saw the corrupt version the CAS was conditioned on,
+        // because the driver re-corrupted with identical bytes before it. A
+        // version from a Corrupt HEAD gives no evaluation, not a false one;
+        // on 911a3c2fa the version arm evaluated the property false here.
+        assert!(
+            evaluations(FOLDED_HEAD_HELD, &acked.to_string()).is_empty(),
+            "a CAS conditioned on a corrupt HEAD's recurring version must not evaluate the property"
+        );
     }
 
     /// Regression for issue #587: a fold used to skip postings entirely the

@@ -291,6 +291,19 @@ stored HEAD is this fold's. A failed re-read, a HEAD that does not decode
 where it is compared, and no HEAD after an acknowledged overwrite cannot
 tell, and record nothing.
 
+This property assumes a store does not reuse a version for a different write.
+A CAS conditioned on a corrupt HEAD breaks that assumption and so records
+nothing (the `None` arm): the catalog-maintenance driver corrupts HEAD with a
+fixed body, and RustFS reuses a content-derived ETag for identical bytes
+(#4389), so when the driver re-corrupts with the same body between the acked
+CAS and the re-read, the re-read returns the very version the CAS was
+conditioned on even though the write landed. A Valid HEAD's bytes carry the
+fold's `folder_id` and `created_unix_ns`, so its version does not recur and
+its arm still evaluates. One case stays uncovered: a retry within a single
+fold call that rewrites byte-identical HEAD bytes over its own applied write
+could still read as not applied; closing it needs a nonce in the HEAD, a
+format change that is out of scope here.
+
 Decision 3's catalog row has five mutants, not four. The model has two
 compaction switches, and each breaks a different invariant
 (`formal/tla/catalog/results.md`):
