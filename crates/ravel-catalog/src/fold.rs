@@ -6122,8 +6122,62 @@ impl Catalog {
             // Counted unconditionally, before matching the outcome: this is
             // a request-issued counter, not a request-succeeded one (#1598).
             counters.put_requests += 1;
+            let cas_acked = head_put_result.is_ok();
             match head_put_result {
-                Ok(_) => {
+                // Another folder's HEAD CAS won first. Re-GET HEAD next
+                // iteration: if the winner's watermark already covers ours,
+                // the top-of-loop no-op check stops cleanly; otherwise we
+                // rebase onto the winner's parts and retry.
+                Err(StoreError::PreconditionFailed) | Err(StoreError::AlreadyExists)
+                    if !ravel_invariant::inv_mutant!("catalog/lost-cas-proceeds") =>
+                {
+                    ravel_invariant::inv_reachable!(
+                        "catalog: fold HEAD CAS lost",
+                        std::collections::BTreeMap::from([
+                            ("head_key", head_key.clone()),
+                            ("folder_id", folder_id.to_string()),
+                            ("attempt", attempt.to_string()),
+                        ])
+                    );
+                    attempt += 1;
+                    if attempt >= MAX_HEAD_CAS_ATTEMPTS {
+                        return Err(CatalogError::FoldCasRetriesExhausted {
+                            attempts: attempt,
+                            watermark_hour,
+                        });
+                    }
+                }
+                Ok(_) | Err(StoreError::PreconditionFailed) | Err(StoreError::AlreadyExists) => {
+                    // The store refused the CAS only under the mutant; then
+                    // the HEAD the store holds decides, read back here.
+                    ravel_invariant::inv_always!(
+                        cas_acked
+                            || match self.store().get(&head_key, GetRange::Full).await {
+                                Ok(got) => snapshot_format::decode_head(&got.data)
+                                    .ok()
+                                    .and_then(|stored| canonical_head_digest(&stored).ok())
+                                    .is_some_and(|stored| stored == head_digest),
+                                Err(_) => false,
+                            },
+                        "catalog: a fold reports as folded only a HEAD the store holds",
+                        std::collections::BTreeMap::from([
+                            ("head_key", head_key.clone()),
+                            ("folder_id", folder_id.to_string()),
+                            ("cas_acked", cas_acked.to_string()),
+                            ("head_digest", head_digest.clone()),
+                            ("watermark_hour", watermark_hour.to_string()),
+                        ])
+                    );
+                    if cas_acked {
+                        ravel_invariant::inv_reachable!(
+                            "catalog: fold HEAD CAS won",
+                            std::collections::BTreeMap::from([
+                                ("head_key", head_key.clone()),
+                                ("folder_id", folder_id.to_string()),
+                                ("watermark_hour", watermark_hour.to_string()),
+                            ])
+                        );
+                    }
                     // Only a fold that reached its committed HEAD contributes
                     // to the process-global coverage totals, so an attempt
                     // abandoned to a CAS loss and retried from zero above is
@@ -6193,19 +6247,6 @@ impl Catalog {
                         head_digest,
                         retired_hours: parts_retired_hours(&part_refs),
                     });
-                }
-                // Another folder's HEAD CAS won first. Re-GET HEAD next
-                // iteration: if the winner's watermark already covers ours,
-                // the top-of-loop no-op check stops cleanly; otherwise we
-                // rebase onto the winner's parts and retry.
-                Err(StoreError::PreconditionFailed) | Err(StoreError::AlreadyExists) => {
-                    attempt += 1;
-                    if attempt >= MAX_HEAD_CAS_ATTEMPTS {
-                        return Err(CatalogError::FoldCasRetriesExhausted {
-                            attempts: attempt,
-                            watermark_hour,
-                        });
-                    }
                 }
                 Err(e) => return Err(CatalogError::Store(e)),
             }
@@ -13171,6 +13212,251 @@ pub(crate) mod tests {
             !entries.iter().any(|e| e.content_hash == seg_a.content_hash),
             "the published fold must not name the swept input"
         );
+    }
+
+    const FOLDED_HEAD_HELD: &str = "catalog: a fold reports as folded only a HEAD the store holds";
+
+    /// True in the invariants lane, where assertion sites record evaluations.
+    fn capturing() -> bool {
+        let on = std::cell::Cell::new(false);
+        ravel_invariant::inv_sometimes!(
+            {
+                on.set(true);
+                true
+            },
+            "ravel-catalog test: evaluations are captured",
+            ""
+        );
+        on.get()
+    }
+
+    /// Selects mutant `name` on this thread until the returned guard drops;
+    /// `None` outside the invariants lane, where no mutant is compiled in.
+    fn scoped_mutant(name: &'static str) -> Option<Box<dyn std::any::Any>> {
+        let guard: std::cell::RefCell<Option<Box<dyn std::any::Any>>> = Default::default();
+        let _ = name;
+        ravel_invariant::inv_sometimes!(
+            {
+                let scoped = ravel_invariant::mutant::scoped(name).expect("a registered mutant");
+                *guard.borrow_mut() = Some(Box::new(scoped));
+                true
+            },
+            "ravel-catalog test: a mutant is scoped",
+            ""
+        );
+        guard.into_inner()
+    }
+
+    /// `(condition, details)` of every captured evaluation of `message` whose
+    /// details mention `needle`; empty outside the invariants lane.
+    fn evaluations(message: &'static str, needle: &str) -> Vec<(bool, String)> {
+        let found = std::cell::RefCell::new(Vec::new());
+        let _ = (message, needle);
+        ravel_invariant::inv_sometimes!(
+            {
+                found.borrow_mut().extend(
+                    ravel_invariant::capture::evaluations_of(message)
+                        .into_iter()
+                        .filter(|e| e.details.contains(needle))
+                        .map(|e| (e.condition, e.details)),
+                );
+                true
+            },
+            "ravel-catalog test: evaluations are read",
+            ""
+        );
+        found.into_inner()
+    }
+
+    /// Fold `loser` lists hour 10 and is held before its HEAD create; fold
+    /// `winner` then creates HEAD through hour 11, and the held create is
+    /// released into an `AlreadyExists`. Runs on the test's own thread, so a
+    /// scoped mutant applies to both folds.
+    async fn race_a_lost_head_create(
+        loser: Uuid,
+        winner: Uuid,
+    ) -> (
+        Arc<FaultStore<MemoryStore>>,
+        Result<FoldReport, CatalogError>,
+        FoldReport,
+    ) {
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let catalog_loser = Catalog::new(store.clone(), config(1)).expect("catalog loser");
+        let catalog_winner = Catalog::new(store.clone(), config(1)).expect("catalog winner");
+        publish_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now_at_seal(10) - NS_PER_HOUR,
+        )
+        .await;
+        let tenant = tenant();
+        let gate = store.hold(Op::Put, Some("HEAD".to_string()), Occurrence::Nth(1));
+        let lost = catalog_loser.fold(&tenant, Signal::Metrics, loser, now_at_seal(10), &[], None);
+        let win = async {
+            gate.wait_until_held(1).await;
+            publish_segment(
+                store.inner(),
+                0,
+                Uuid::new_v4(),
+                1,
+                11,
+                now_at_seal(11) - NS_PER_HOUR,
+            )
+            .await;
+            let report = catalog_winner
+                .fold(&tenant, Signal::Metrics, winner, now_at_seal(11), &[], None)
+                .await
+                .expect("the unheld fold creates HEAD");
+            for id in gate.held() {
+                gate.release(id);
+            }
+            report
+        };
+        let (lost, won) = tokio::join!(lost, win);
+        (store, lost, won)
+    }
+
+    #[tokio::test]
+    async fn mutant_lost_cas_proceeds_breaks_no_live_commit_omitted() {
+        let Some(_mutant) = scoped_mutant("catalog/lost-cas-proceeds") else {
+            return;
+        };
+        let (loser, winner) = (Uuid::new_v4(), Uuid::new_v4());
+        let (store, lost, won) = race_a_lost_head_create(loser, winner).await;
+        let found = evaluations(FOLDED_HEAD_HELD, &loser.to_string());
+        assert!(
+            found.iter().any(|(held, _)| !held),
+            "the property is evaluated false for the fold that lost: {found:?}"
+        );
+        let lost = lost.expect("the mutant proceeds past the refused create");
+        assert!(!lost.no_op, "the mutant reports its own HEAD as folded");
+        assert_eq!(lost.watermark_hour, Some(10));
+        assert_ne!(lost.head_digest, won.head_digest);
+        assert_eq!(read_head(store.inner()).await.watermark_hour, 11);
+    }
+
+    #[tokio::test]
+    async fn a_fold_that_loses_its_head_cas_reports_only_the_head_the_store_holds() {
+        if !capturing() {
+            return;
+        }
+        let (loser, winner) = (Uuid::new_v4(), Uuid::new_v4());
+        let (store, lost, won) = race_a_lost_head_create(loser, winner).await;
+        let lost = lost.expect("the loser rebases onto the winner's HEAD");
+        assert!(lost.no_op, "{lost:?}");
+        assert_eq!(lost.head_digest, won.head_digest);
+        assert_eq!(read_head(store.inner()).await.watermark_hour, 11);
+
+        let lost_cas = evaluations("catalog: fold HEAD CAS lost", &loser.to_string());
+        assert_eq!(lost_cas.len(), 1, "{lost_cas:?}");
+        assert!(
+            evaluations(FOLDED_HEAD_HELD, &loser.to_string()).is_empty(),
+            "a fold that lost its CAS reports nothing as folded"
+        );
+        let found = evaluations(FOLDED_HEAD_HELD, &winner.to_string());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].0, "{found:?}");
+        let won_cas = evaluations("catalog: fold HEAD CAS won", &winner.to_string());
+        assert_eq!(won_cas.len(), 1, "{won_cas:?}");
+    }
+
+    /// The HEAD create lands and its response is lost: the fold surfaces the
+    /// error without reporting a fold, the next fold re-reads the landed
+    /// HEAD, and a later fold's CAS from it is the one evaluation.
+    #[tokio::test]
+    async fn a_lost_head_cas_response_leaves_the_landed_head_for_the_next_fold() {
+        if !capturing() {
+            return;
+        }
+        let store = Arc::new(FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Put, ScriptedFault::DuplicateDelivery)
+                    .with_key_contains("HEAD")
+                    .with_occurrence(Occurrence::Nth(1)),
+            ),
+        ));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let seg_10 = publish_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now_at_seal(10) - NS_PER_HOUR,
+        )
+        .await;
+
+        let unacked = Uuid::new_v4();
+        let err = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                unacked,
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect_err("the lost response surfaces");
+        assert!(matches!(err, CatalogError::Store(_)), "{err:?}");
+        assert_eq!(store.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
+        assert!(evaluations(FOLDED_HEAD_HELD, &unacked.to_string()).is_empty());
+        let landed = read_head(store.inner()).await;
+        assert_eq!(landed.watermark_hour, 10);
+        assert_eq!(landed.folder_id, unacked.into_bytes().to_vec());
+
+        let reread = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("the next fold re-reads the landed HEAD");
+        assert!(reread.no_op, "{reread:?}");
+        assert_eq!(
+            reread.head_digest,
+            canonical_head_digest(&landed).expect("digest")
+        );
+
+        let seg_11 = publish_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            11,
+            now_at_seal(11) - NS_PER_HOUR,
+        )
+        .await;
+        let next = Uuid::new_v4();
+        let advanced = catalog
+            .fold(&tenant(), Signal::Metrics, next, now_at_seal(11), &[], None)
+            .await
+            .expect("a CAS from the landed HEAD wins");
+        assert!(!advanced.no_op);
+        assert_eq!(advanced.previous_watermark_hour, Some(10));
+        let found = evaluations(FOLDED_HEAD_HELD, &next.to_string());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].0, "{found:?}");
+        assert_eq!(store.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
+
+        let head = read_head(store.inner()).await;
+        let hashes: BTreeSet<[u8; 32]> = collect_head_entries(store.inner(), &head)
+            .await
+            .iter()
+            .map(|e| <[u8; 32]>::try_from(e.content_hash.as_slice()).expect("32-byte hash"))
+            .collect();
+        for seg in [&seg_10, &seg_11] {
+            let hash = <[u8; 32]>::try_from(seg.content_hash.as_slice()).expect("32-byte hash");
+            assert!(hashes.contains(&hash), "HEAD names every folded commit");
+        }
     }
 
     /// Regression for issue #587: a fold used to skip postings entirely the
