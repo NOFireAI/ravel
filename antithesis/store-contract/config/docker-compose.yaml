@@ -1,0 +1,68 @@
+# Ravel store-contract workload for Antithesis
+# (antithesis/store-contract/README.md).
+#
+# rustfs is the store under test. init creates the bucket, then exits. driver
+# issues the object-store contract's operations through Ravel's S3Store and
+# judges each result against what it wrote; it is the only container excluded
+# from faults. No ravel-server runs.
+#
+# No service has a restart policy: Antithesis restarts the containers it
+# kills or stops, and a policy would restart them early and cancel the fault.
+
+x-ravel-store: &ravel-store
+  RAVEL_S3_ENDPOINT: http://rustfs:9000
+  RAVEL_S3_ALLOW_HTTP: "true"
+  RAVEL_S3_BUCKET: ravel
+  RAVEL_S3_REGION: us-east-1
+  RAVEL_S3_ACCESS_KEY: ravel
+  RAVEL_S3_SECRET_KEY: ravel-dev-secret
+
+services:
+  rustfs:
+    container_name: rustfs
+    hostname: rustfs
+    # The same RustFS release and digest the repository's own compose stacks,
+    # CI contract lane and the ingest-durability workload run.
+    image: ghcr.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+    platform: linux/amd64
+    command: ["/data"]
+    user: "0:0"
+    environment:
+      RUSTFS_ACCESS_KEY: ravel
+      RUSTFS_SECRET_KEY: ravel-dev-secret
+      # Fsync every acknowledged write before its 200, so a killed rustfs
+      # container never loses an acked PUT.
+      RUSTFS_DURABILITY_MODE: strict
+      RUSTFS_DRIVE_SYNC_ENABLE: "true"
+
+  # The workload's own image is named without a registry: snouty pushes a
+  # local-only image into the tenant registry, but skips one served by another
+  # registry. scripts/build.sh and scripts/import-images.sh tag it.
+  init:
+    container_name: init
+    hostname: init
+    image: ravel-antithesis-driver:store-contract
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/store-contract-init"]
+    environment:
+      <<: *ravel-store
+    depends_on: [rustfs]
+
+  driver:
+    container_name: driver
+    hostname: driver
+    image: ravel-antithesis-driver:store-contract
+    platform: linux/amd64
+    environment:
+      <<: *ravel-store
+      # Two keys per listing page, so a 3 to 9 key listing takes several pages.
+      STORE_LIST_PAGE_SIZE: "2"
+      # The request timeout of the store the transient action writes through:
+      # short enough that some of its writes fail mid-flight.
+      STORE_HURRIED_TIMEOUT_MS: "5"
+      # Empty runs the real store. common/<stem> turns one broken switch on
+      # (README.md, "Mutants"); any other value refuses to start.
+      RAVEL_ANTITHESIS_MUTANT: ${RAVEL_ANTITHESIS_MUTANT:-}
+    depends_on:
+      init:
+        condition: service_completed_successfully
