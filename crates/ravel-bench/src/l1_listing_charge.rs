@@ -113,7 +113,22 @@ pub const DEFAULT_SCRAPE_SECS: i64 = 15;
 pub const MIN_FULL_PARTS: usize = 2;
 
 /// The band the peak charge per sample must fall in, in bytes.
-pub const PEAK_PER_SAMPLE_BAND: (f64, f64) = (1.0, 200.0);
+///
+/// The bench exists to show that every sample's provenance is charged in full:
+/// [`PROVENANCE_COLUMN_BYTES_PER_SAMPLE`] (64 B) of decoded columns plus a
+/// [`SAMPLE_PROVENANCE_BYTES`] (32 B) record, 96 B a sample, on top of the
+/// catalog decode and the wire bytes the GETs hold. The floor is that 96 B: a
+/// part that dropped the 64 B columns and charged only the 32 B record would
+/// peak near 34 B a sample (measured 97.8 B minus 64 B), and one carrying no
+/// per-sample provenance at all near the catalog decode length alone (~20 B a
+/// sample), both below 96. The ceiling catches a provenance charged twice,
+/// which would peak near 193 B a sample (96 B above the real figure). Measured
+/// 2026-11-17 on this tree: 97.8 B a sample at the default 1-64 MiB caps (97.81
+/// at the 1 MiB cap, 2,500 series over 8 h) and up to 108.5 B at the 64 KiB
+/// smoke cap (120 series over 8 h), where the catalog decode and the
+/// whole-object hold amortise over far fewer samples; the ceiling of 130 B
+/// clears that spread while staying well below the doubled 193 B.
+pub const PEAK_PER_SAMPLE_BAND: (f64, f64) = (96.0, 130.0);
 
 /// The figures every cap entry of the report carries, each exactly once.
 pub const CAP_FIGURES: [&str; 12] = [
@@ -1077,9 +1092,11 @@ pub fn report_table(report: &RunReport) -> String {
 ///
 /// - peak per sample in [`PEAK_PER_SAMPLE_BAND`];
 /// - the largest refused limit below the peak and within 1 % of it;
-/// - the peak at or below [`listing_bound`]: compared to it directly, and
-///   cross-checked that a listing under exactly that limit succeeded and that
-///   no limit the search refused reaches it;
+/// - the peak at or below [`listing_bound`]: the largest limit the search
+///   refused sits below that bound and a listing under exactly that bound
+///   succeeded, which bracket the true peak at or below it (the reported peak
+///   itself overshoots by up to the search's 1 % resolution, so it is not the
+///   figure compared);
 /// - the peak non-decreasing as samples per part grow.
 ///
 /// Returns every violation.
@@ -1156,19 +1173,20 @@ pub fn check_report(text: &str, caps: &[u64]) -> Result<(), Vec<String>> {
                          1 % bracket"
                     ));
                 }
+                // "The peak sits at or below the listing bound" is checked
+                // directly against the bound from both sides: the largest
+                // budget the search proved insufficient must fall below the
+                // bound (`refused < bound`), and a listing under a budget of
+                // exactly the bound must succeed (`listing_bound_succeeds`),
+                // which together put the true peak in `(refused, bound]`. The
+                // reported `peak` (`succeeds_at`) is not compared: it is the
+                // smallest budget the search *probed* that succeeded, so it
+                // overshoots the true peak by up to the search's 1 %
+                // resolution and lands above a tight bound on every real run.
                 if refused >= bound {
                     failures.push(format!(
                         "cap {cap}: a {refused} B budget was refused, at or above the listing \
                          bound {bound} B"
-                    ));
-                }
-                // The two checks above are proxies for "the peak sits at or
-                // below the bound"; compare the peak to the bound directly so a
-                // violation narrower than the 1 % search bracket cannot slip
-                // through them.
-                if peak > bound {
-                    failures.push(format!(
-                        "cap {cap}: the peak {peak} B is above the listing bound {bound} B"
                     ));
                 }
                 rows.push((cap, samples, peak));
