@@ -245,6 +245,18 @@ impl StartupRetry {
             } else {
                 self.remaining()
             };
+            // A wait that overran the deadline: the retry does not start.
+            if bound.is_none()
+                && !self.deadline.is_zero()
+                && let Some(err) = last.take()
+            {
+                return Err(StartupReadFailure::DeadlinePassed {
+                    site,
+                    attempts: attempt.saturating_sub(1),
+                    deadline: self.deadline,
+                    last: err,
+                });
+            }
             let outcome = match bound {
                 None => op().await,
                 Some(remaining) => {
@@ -598,6 +610,7 @@ pub(crate) mod test_support {
         now: Mutex<Duration>,
         sleeps: Mutex<Vec<Duration>>,
         cut_offs: Mutex<Vec<Duration>>,
+        overshoot: Mutex<Duration>,
     }
 
     impl ManualClock {
@@ -608,6 +621,11 @@ pub(crate) mod test_support {
         /// The bounds of the attempts the timer cut off.
         pub(crate) fn cut_offs(&self) -> Vec<Duration> {
             self.cut_offs.lock().expect("cut-offs lock").clone()
+        }
+
+        /// Make every later sleep end `by` past the time it asked for.
+        pub(crate) fn overshoot_sleeps_by(&self, by: Duration) {
+            *self.overshoot.lock().expect("overshoot lock") = by;
         }
 
         /// Move the virtual time forward without a recorded sleep.
@@ -628,7 +646,8 @@ pub(crate) mod test_support {
         }
 
         async fn sleep(&self, duration: Duration) {
-            *self.now.lock().expect("clock lock") += duration;
+            let overshoot = *self.overshoot.lock().expect("overshoot lock");
+            *self.now.lock().expect("clock lock") += duration + overshoot;
             self.sleeps.lock().expect("sleeps lock").push(duration);
         }
 
@@ -848,6 +867,33 @@ mod tests {
         assert_eq!(sleeps.len(), 1);
         assert_eq!(clock.cut_offs(), vec![DEADLINE - sleeps[0]]);
         assert_eq!(clock.virtual_now(), DEADLINE);
+    }
+
+    /// A wait that ends past the deadline starts no retry, bounded or not.
+    #[tokio::test]
+    async fn a_wait_that_overruns_the_deadline_starts_no_retry() {
+        let clock = Arc::new(ManualClock::default());
+        clock.overshoot_sleeps_by(DEADLINE);
+        let mut calls = 0u32;
+        let result: Result<(), _> = retry_on(clock.clone())
+            .run(
+                "test",
+                || {
+                    calls += 1;
+                    async { Err(StoreError::Transient("down".into())) }
+                },
+                store_error_is_transient,
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(StartupReadFailure::DeadlinePassed { attempts: 1, .. })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(clock.sleeps().len(), 1);
     }
 
     /// A site first reached after the deadline gets one attempt and no retry.
