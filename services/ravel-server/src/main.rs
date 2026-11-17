@@ -191,6 +191,25 @@ async fn main() -> anyhow::Result<()> {
     // listener binds, so a wrong key is a failed deploy rather than a silent
     // parallel namespace.
     let tenancy_config = cli.resolve_tenancy_config()?;
+
+    // Retired-reader gate (ADR-4233 decision 7). Before `resolve_and_pin`,
+    // which writes `sys/tenancy` on a fresh store: a release that retired a
+    // reader tells a fresh store from an unadopted one by that marker's
+    // absence. Read-only, and sends no request while no reader is retired.
+    let gate_key = match &tenancy_config {
+        ravel_server::tenancy::ConfiguredScheme::Keyed(key) => Some(key.as_ref()),
+        _ => None,
+    };
+    let gate = ravel_server::compat_gate::enforce(
+        store.as_ref(),
+        gate_key,
+        ravel_server::compat_gate::RETIRED_READERS,
+        now_unix_ns(),
+    )
+    .await
+    .context("retired-reader gate (sys/compat) refused startup")?;
+    tracing::debug!(outcome = ?gate, "retired-reader gate passed");
+
     let resolved_tenancy =
         ravel_server::tenancy::resolve_and_pin(store.as_ref(), tenancy_config, now_unix_ns())
             .await

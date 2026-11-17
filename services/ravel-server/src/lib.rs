@@ -38,6 +38,7 @@ pub mod bucket_protection;
 pub mod cache_warm;
 pub mod cli_reference;
 pub mod compat;
+pub mod compat_gate;
 pub mod config;
 pub mod cpu_gates;
 #[cfg(feature = "sql")]
