@@ -8,9 +8,10 @@
 //! twice. The step now LISTs the token's bucket when the snapshot already
 //! holds a level-1 part of it (or an erasure is pending) and leaves L out
 //! when the bucket is tombstoned, when a record naming L has an output part
-//! in the snapshot, or when a live rewrite names L, whose parts it adds
-//! instead. Tokens whose commit record is absent run first, so the answer
-//! does not depend on token order.
+//! in the snapshot, or when a live rewrite names L and the snapshot holds
+//! nothing else that rewrite replaced, whose parts it adds instead. Tokens
+//! whose commit record is absent run first, so the answer does not depend
+//! on token order.
 //!
 //! Rows are counted as the sum of `sample_count` over the snapshot: a logs
 //! or spans compaction concatenates its inputs, so a part carries the sum of
@@ -1332,4 +1333,32 @@ async fn present_token_raises_the_sibling_alarm_and_serves_the_first_live_rewrit
     let (swept, _) = resolve_counted_on(&swept_catalog, Signal::Logs, window, &[token(&l)]).await;
     assert_eq!(swept_catalog.rewrite_sibling_conflicts(), 1);
     assert_eq!(sorted_keys(&swept), sorted_keys(&snapshot));
+}
+
+/// The bucket is tombstoned, but the set holds no level-1 part of it and no
+/// erasure is pending, so the step does not check the bucket: L is added as
+/// before, at the commit-record GET alone, and is the only object serving
+/// its rows.
+#[tokio::test]
+async fn token_in_a_tombstoned_bucket_without_the_check_is_added() {
+    let store = Arc::new(MemoryStore::new());
+    let l = l0(Signal::Logs, 1, HOUR, hour_start(HOUR), L_ROWS);
+    put_l0(store.as_ref(), &l).await;
+    fold_hour(&store, Signal::Logs).await;
+    put_tombstone(store.as_ref(), Signal::Logs, 0, HOUR).await;
+
+    let window = (late_window().0, sealed_window().1);
+    let (plain, plain_reads) = resolve_counted(&store, Signal::Logs, window, &[]).await;
+    assert!(plain.segments.is_empty());
+    let (snapshot, reads) = resolve_counted(&store, Signal::Logs, window, &[token(&l)]).await;
+    assert_eq!(sorted_keys(&snapshot), vec![l0_key(&l)]);
+    assert_eq!(rows(&snapshot), L_ROWS);
+    assert_eq!(
+        reads,
+        Reads {
+            lists: plain_reads.lists,
+            gets: plain_reads.gets + 1,
+            total: plain_reads.total + 1,
+        }
+    );
 }

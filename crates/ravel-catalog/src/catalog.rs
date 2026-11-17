@@ -4651,13 +4651,17 @@ impl Catalog {
     ///   names the input (a rewrite through its effective inputs) and `out`
     ///   holds one of that record's output parts, which serves the input's
     ///   rows already: nothing is added;
-    /// - otherwise, a live rewrite names the input: that rewrite's parts are
-    ///   added, as the missing-record fallback adds them.
+    /// - otherwise, a live rewrite names the input (the one the
+    ///   missing-record fallback picks) and `out` holds nothing that rewrite
+    ///   replaced: its parts are added, as the missing-record fallback adds
+    ///   them. When `out` does hold an object it replaced, the input itself
+    ///   is added, since the rewrite's parts would serve that object's rows a
+    ///   second time.
     ///
     /// The check runs only when `out` holds an output part of the bucket or
     /// an erasure request is pending (a live rewrite's `.dreq` outlives its
     /// inputs' commit records), so with neither the answer is `None` at no
-    /// store read. Otherwise the
+    /// store read, tombstone or not. Otherwise the
     /// bucket is LISTed and its compaction (cached) and rewrite records
     /// loaded, as the missing-record fallback does. Metrics dedup at query
     /// time and always get `None`.

@@ -3378,16 +3378,20 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
 5. For each `min_token`: reconstruct its commit key and GET it directly
    (never by re-listing). Present: ensure it is in the snapshot set (its
    event range might not overlap; include it anyway so read-your-write
-   holds), with one exception for every signal but metrics: the input is
-   not added when the set already serves its rows from a replacement, when
-   a live rewrite replaced it, or when its bucket is tombstoned. A
+   holds), with one exception for every signal but metrics: when the check
+   below runs, the input is not added when the set already serves its rows
+   from a replacement, when a live rewrite replaced it and the set holds
+   nothing else that rewrite replaced, or when its bucket is tombstoned. A
    compacted input's commit record stays present until the sweep, and logs
    and spans have no query-time dedup, so adding it beside the part that
    holds its rows would count each of its records twice. The step checks
    only when the set holds a level-1 part of the token's (shard,
    ingest_hour) bucket or step 6 found a pending erasure request (that LIST
-   therefore completes before this step). It then LISTs the bucket and, in
-   this order:
+   therefore completes before this step). Without either, the input is
+   added as before, even when its bucket is tombstoned; its rows are not
+   counted twice there, because the set then holds no level-1 part of the
+   bucket that could also hold them. When the check runs, it LISTs the
+   bucket and, in this order:
 
    - a tombstone in the bucket: the input is not added, the answer the
      absent-record path below gives (satisfied with zero segments);
@@ -3397,9 +3401,21 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      the input's rows; a record naming the input whose parts are not in the
      set does not keep it out. A served part of a superseded rewrite (a
      stale HEAD) is checked before any live successor is added;
-   - a live rewrite names the input: that rewrite's output parts are added
-     in its place, the same parts the absent-record path serves once the
-     sweep deletes the commit record;
+   - a live rewrite names the input (the first in listing order, the one
+     the absent-record path picks, after the same sibling-rewrite alarm
+     that path raises) and the set holds no object it replaced: no input
+     among its effective inputs, and no part of a record its supersession
+     chain replaced or of another compaction or rewrite record naming one
+     of those inputs. Its output parts are added in the input's place, the
+     same parts the absent-record path serves once the sweep deletes the
+     commit record;
+   - a live rewrite names the input but the set holds an object it
+     replaced (a stale HEAD still names another of its inputs, or a
+     compaction of one): the input itself is added, since the rewrite's
+     parts would serve that object's rows a second time. The sweep keeps
+     the rewrite's `.dreq` while an input it superseded is still
+     resolvable through HEAD (ADR-0064, `.dreq` release amendment), so the
+     request is pending here and its filter drops the input's erased rows;
    - otherwise the input is added as before.
 
    Records are matched by the input identities they hold, never by object
