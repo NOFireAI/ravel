@@ -10,8 +10,9 @@
 #                                          formal/tla/common/antithesis-mutants.tsv
 #                                          was violated.
 #   WORKLOAD_MAX_ACTIONS=N                 the driver ends the timeline after N
-#                                          actions; the run then waits for it to
-#                                          exit instead of sleeping.
+#                                          actions; the run then waits up to
+#                                          [seconds] for it to exit 0 instead of
+#                                          sleeping, and fails if it does not.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WL="$(cd "$HERE/.." && pwd)"
@@ -46,23 +47,44 @@ until docker compose exec -T driver grep -qs antithesis_setup /tmp/sdk.jsonl; do
 done
 echo "setup complete after $(( $(date +%s) - start ))s"
 
-# The driver's self-exit code, gated below. Only meaningful when the driver
-# exits on its own (WORKLOAD_MAX_ACTIONS); in the sleep branch it is still
-# running and `docker compose stop` would set a signal code, so leave it empty.
-driver_exit=""
+# Why the driver's run is invalid, gated below; empty when it is valid. The
+# state is read before `docker compose stop`, which would set a signal code.
+# Bounded (WORKLOAD_MAX_ACTIONS): the driver must have exited 0 by the
+# deadline. Sleep mode: a driver still running at the end is expected, and one
+# that is no longer running must have exited 0.
+driver_fail=""
+driver_state() { docker inspect -f '{{.State.Running}}' driver 2>/dev/null; }
+check_exited_zero() {
+    local code
+    code=$(docker inspect -f '{{.State.ExitCode}}' driver 2>/dev/null)
+    echo "driver exit code ${code:-unknown}"
+    [ "$code" = 0 ] || driver_fail="driver exited ${code:-with an unknown code}$1"
+}
 if [ -n "${WORKLOAD_MAX_ACTIONS:-}" ]; then
     deadline=$(( $(date +%s) + SECS ))
-    while [ "$(docker inspect -f '{{.State.Running}}' driver)" = true ]; do
-        [ "$(date +%s)" -lt "$deadline" ] || { echo "driver still running after ${SECS}s"; break; }
+    while [ "$(driver_state)" = true ] && [ "$(date +%s)" -lt "$deadline" ]; do
         sleep 5
     done
-    if [ "$(docker inspect -f '{{.State.Running}}' driver)" = false ]; then
-        driver_exit=$(docker inspect -f '{{.State.ExitCode}}' driver)
-    fi
-    echo "driver exit code ${driver_exit:-still running}"
 else
     sleep "$SECS"
 fi
+running=$(driver_state)
+case "$running" in
+    true)
+        if [ -n "${WORKLOAD_MAX_ACTIONS:-}" ]; then
+            driver_fail="driver still running after ${SECS}s with WORKLOAD_MAX_ACTIONS=$WORKLOAD_MAX_ACTIONS"
+        fi
+        ;;
+    false)
+        if [ -n "${WORKLOAD_MAX_ACTIONS:-}" ]; then
+            check_exited_zero ""
+        else
+            check_exited_zero " before the ${SECS}s run ended"
+        fi
+        ;;
+    *) driver_fail="could not read the driver container's state" ;;
+esac
+[ -z "$driver_fail" ] || echo "$driver_fail"
 
 docker compose exec -T driver sh -c 'curl --version | head -1; jq --version' \
     > "$OUT/debug-tools.txt" 2>&1
@@ -103,10 +125,10 @@ if [ ! -s "$OUT/assertions.tsv" ]; then
     echo "FAIL: no assertions collected (see $OUT/missing-sdk.txt)"
     exit 1
 fi
-# A driver that crashed or misconfigured (non-zero self-exit) invalidates the
-# run whether or not any assertion was collected; gate it for both run kinds.
-if [ -n "$driver_exit" ] && [ "$driver_exit" != 0 ]; then
-    echo "FAIL: driver exited $driver_exit"
+# A driver that crashed, misconfigured, or overran its bounded run invalidates
+# the run whatever assertions were collected; gate it for every run kind.
+if [ -n "$driver_fail" ]; then
+    echo "FAIL: $driver_fail"
     exit 1
 fi
 if [ -n "$MUTANT" ]; then
