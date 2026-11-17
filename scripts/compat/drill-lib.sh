@@ -37,13 +37,85 @@ drill_ingest_horizon() {
   echo $(( (fence / 3600 + 3) * 3600 + margin ))
 }
 
-# The last second a running v0.33.0 router may still accept ingest for a
-# fence written at Unix second $1: its cached view is trusted until
-# hour_of(R) + 2 with R <= the fence, so (hour_of(fence) + 2) * 3600 bounds
-# every R. A process started after the fence has no view to trust; its limit
-# is the fence itself, which the caller passes instead.
+# The last second a running v0.33.0 router may still accept ingest when R,
+# Unix second $1, is its last successful provisioning refresh before the
+# fence: it trusts that cached view until the hour hour_of(R) + 2
+# (min_lead_hours of the 60 s refresh interval, v0.33.0 ravel-ingest
+# generation.rs). A process started after the fence has no view to trust;
+# its limit is the fence itself, which the caller passes instead.
 drill_trust_limit() {
   echo $(( ($1 / 3600 + 2) * 3600 ))
+}
+
+# A lower bound on R for the routers serving kinds $3 (a regex over the drive
+# log's kind column), from drive log $1 and the second the fence began, $2.
+# A router refreshes its view on the first write after the view is older
+# than the refresh interval $4, so the view that served the last 2xx write
+# ending at or before $2 was refreshed at most $4 seconds before that request
+# began, and the request began at most $5 seconds (the driver's curl -m)
+# before it ended. Prints that end second minus $4 minus $5; returns 1 when
+# no such write exists. v0.33.0 does not log its refreshes, so a later R is
+# possible and the limit drill_trust_limit gives for this bound may be an hour
+# early, never late.
+drill_last_refresh_floor() {
+  awk -F'\t' -v t="$2" -v k="^($3)\$" -v r="$4" -v m="$5" \
+    '$1 <= t && $2 ~ k && $3 ~ /^2[0-9][0-9]$/ && $1 > last { last = $1 }
+     END { if (last == "") exit 1; print last - r - m }' "$1"
+}
+
+# The drive log's kinds per signal router of v0.33.0: remote write lands in
+# the metrics router.
+DRILL_INGEST_ROUTERS="metrics:otlp-metrics|remote-write logs:otlp-logs spans:otlp-traces"
+
+# Trust table for a running process: one "<signal>\t<kinds>\t<R floor>\t<limit>"
+# line per router in DRILL_INGEST_ROUTERS, from drive log $1, the second the
+# fence began $2, refresh interval $3 and request bound $4. A router with no
+# 2xx write before the fence gets "none" for both and the table returns 1.
+drill_trust_table() {
+  local log=$1 start=$2 refresh=$3 margin=$4 r sig kinds floor rc=0
+  for r in $DRILL_INGEST_ROUTERS; do
+    sig=${r%%:*}
+    kinds=${r#*:}
+    if floor=$(drill_last_refresh_floor "$log" "$start" "$kinds" "$refresh" "$margin"); then
+      printf '%s\t%s\t%s\t%s\n' "$sig" "$kinds" "$floor" "$(drill_trust_limit "$floor")"
+    else
+      printf '%s\t%s\tnone\tnone\n' "$sig" "$kinds"
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+# Trust table for a process started after the fence, Unix second $1: every
+# router's limit is the fence, and its floor column is "cold".
+drill_trust_table_cold() {
+  local r
+  for r in $DRILL_INGEST_ROUTERS; do
+    printf '%s\t%s\tcold\t%s\n' "${r%%:*}" "${r#*:}" "$1"
+  done
+}
+
+# Ingest 2xx responses in drive log $1 requested after their router's limit
+# in trust table $2, request bound $3 (drill_count_2xx_after). Prints the
+# total; returns 1 unless the table holds exactly one line per router of
+# DRILL_INGEST_ROUTERS, each with an integer limit.
+drill_ingest_2xx_after_trust() {
+  local log=$1 table=$2 margin=$3 r sig kinds n limit total=0
+  for r in $DRILL_INGEST_ROUTERS; do
+    sig=${r%%:*}
+    kinds=${r#*:}
+    n=$(awk -F'\t' -v s="$sig" -v k="$kinds" '$1 == s && $2 == k { n++ } END { print n + 0 }' "$table")
+    limit=$(awk -F'\t' -v s="$sig" -v k="$kinds" '$1 == s && $2 == k { print $4 }' "$table")
+    case "$n:$limit" in
+      1:'' | 1:*[!0-9]*) n=0 ;;
+    esac
+    if [ "$n" -ne 1 ]; then
+      echo "missing"
+      return 1
+    fi
+    total=$((total + $(drill_count_2xx_after "$log" "$limit" "$kinds" "$margin")))
+  done
+  echo "$total"
 }
 
 # Count of keys in listing $1 whose key starts with $2.
@@ -179,8 +251,12 @@ drill_post_fence_events() {
 #   root                  not under t/<h>/: recorded, outside the fenced scope
 #   exempt-advisory       a write matching $8, or a remove of an admission
 #                         snapshot (the sibling DELETE)
-#   prerequisite-only     m/meta, u/... (audit), a/... removals (alert
-#                         retention and sweep), enc, config
+#   audit-unfenced        u/l0/... and u/c/... written: per-query audit
+#                         records, the "audit: unfenced by design" class
+#                         (decision 4 does not fence audit); recorded
+#   prerequisite-only     m/meta, any other u/... event (u/l1, u/maint,
+#                         audit removals), a/... removals (alert retention
+#                         and sweep), enc, config
 #   alerts-grace          a/alert-lease, a/state/, a/l0/, a/c/ written up to
 #                         the alerts horizon
 #   alerts-late           the same written after it                    (fails)
@@ -207,6 +283,8 @@ drill_post_fence_class() {
   if { [ "$op" = write ] && drill_exempt "$key" "$h" "$exempt"; } \
     || { [ "$op" = remove ] && [[ $rel =~ ^[mls]/admission/[^/]+\.snapshot$ ]]; }; then
     echo exempt-advisory
+  elif [ "$op" = write ] && [[ $rel =~ ^u/(l0|c)/ ]]; then
+    echo audit-unfenced
   elif [ "$rel" = m/meta ] || [ "$rel" = enc ] || [ "$rel" = config ] || [[ $rel == u/* ]] \
     || { [ "$op" = remove ] && [[ $rel == a/* ]]; }; then
     echo prerequisite-only
@@ -231,7 +309,7 @@ drill_post_fence_class() {
 
 # Every class drill_post_fence_class prints, and the band its count must sit
 # in: the fail rows at [0, 0], the recorded classes at [0, 1000000].
-DRILL_CLASS_BANDS="root:0:1000000 exempt-advisory:0:1000000 prerequisite-only:0:1000000 alerts-grace:0:1000000 alerts-late:0:0 ingest-grace:0:1000000 l0c-after-horizon:0:0 teardown-data:0:1000000 idem:0:1000000 maintenance:0:0 unclassified:0:0"
+DRILL_CLASS_BANDS="root:0:1000000 exempt-advisory:0:1000000 audit-unfenced:0:1000000 prerequisite-only:0:1000000 alerts-grace:0:1000000 alerts-late:0:0 ingest-grace:0:1000000 l0c-after-horizon:0:0 teardown-data:0:1000000 idem:0:1000000 maintenance:0:0 unclassified:0:0"
 
 # Classifies events file $1 (drill_post_fence_events output) into $2 as
 # "<class>\t<op>\t<key>\t<LastModified>\t<phase>", appends one
@@ -330,31 +408,5 @@ drill_warm_observation() {
   drill_check_figure "$report" warm_tail_s "$tail" 1000000000 || rc=1
   drill_check_figure "$report" warm_scrub_cursor_after_horizon 1 1000000 || rc=1
   drill_check_figure "$report" warm_graceful_stops "$#" "$#" || rc=1
-  return "$rc"
-}
-
-# Census check: every key of keys file $1 has exactly one
-# "key <key> flagged=<how>" line in drill_census output $2, and <how> is not
-# "no". Prints "flagged <how> <key>", "not-flagged <key>" or "unjudged <key>"
-# per key; returns 1 unless every key is flagged.
-drill_census_check() {
-  local keys=$1 out=$2 key n how rc=0
-  while IFS= read -r key; do
-    [ -n "$key" ] || continue
-    n=$(awk -v k="$key" '$1 == "key" && $2 == k { n++ } END { print n + 0 }' "$out")
-    if [ "$n" -ne 1 ]; then
-      echo "unjudged $key lines=$n"
-      rc=1
-      continue
-    fi
-    how=$(awk -v k="$key" '$1 == "key" && $2 == k { sub(/^flagged=/, "", $3); print $3 }' "$out")
-    case "$how" in
-      contradicted | held | late-write) echo "flagged $how $key" ;;
-      *)
-        echo "not-flagged $key"
-        rc=1
-        ;;
-    esac
-  done < "$keys"
   return "$rc"
 }
