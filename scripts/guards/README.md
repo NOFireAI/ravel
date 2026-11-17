@@ -554,6 +554,23 @@ than passing for "no pull request open".
   branch allowlist, because a guard with a cutoff stops being one. Wired into
   ci.yml's `doc-scripts` job with the pull request's base SHA. Cases in
   `scripts/guards/check-changelog-touched.test.sh`.
+- `scripts/guards/check-compat-corpus-append-only.sh <base-ref> [head-ref]`:
+  exits 1 when a published fixture under
+  `crates/ravel-compat-tests/corpus/` is MODIFIED or DELETED in the range
+  (naming each file and its change kind), and 0 when the range only ADDS
+  corpus files or touches none. A published corpus is frozen evidence of
+  what a released build wrote (ADR-4233 decision 9): a later release opens
+  it and asserts exact query results, so an edit would compare the current
+  build against bytes it was free to change. Exit 2 is could-not-answer
+  (missing argument, an unresolvable ref, a git failure), never a pass. The
+  range is taken from the MERGE BASE of the two refs, like
+  `check-changelog-touched.sh`, so a corpus edit that landed on the base
+  branch is not attributed here. Rename detection is OFF, so a renamed
+  fixture reads as a deletion of its old published path and fails. Wired
+  into `gates.sh` (range check only when `origin/main` is available; the
+  cases always run) and ci.yml's `doc-scripts` job with the pull request's
+  base SHA. Cases in
+  `scripts/guards/check-compat-corpus-append-only.test.sh`.
 - `scripts/guards/check-amendment-integrity.sh [dir]`: exits non-zero when an
   ADR amendment heading's own marker claims something the document does not
   back up: a named section that does not carry the amendment's pointer, or a
