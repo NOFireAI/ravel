@@ -1,12 +1,5 @@
-baseline candidate written by HEAD at 3182fcedc776ea3adc30d1f3a45566bae41b20bb; verified byte-identical against the v0.34.0 tag at release
-
-source commit (metrics: manifest.txt, objects/, expected.txt):
-  3182fcedc776ea3adc30d1f3a45566bae41b20bb
-  test(compat): add the frozen v0.34.0 baseline corpus
-
-appended on the #4249 fix round, from the same product code (no product
-crate changed between that commit and the append):
-  samples.txt, logs/, spans/
+baseline candidate for v0.34.0, written by generate_corpus from the product
+crate trees below. To be verified byte-identical against the v0.34.0 tag; the result is recorded in a new file appended at release.
 
 generator command (writes only files the directory lacks, never overwrites
 one, and asserts the metrics objects already here are byte-identical to
@@ -14,3 +7,13 @@ what the running build writes):
   RAVEL_COMPAT_CORPUS_RELEASE=v0.34.0 cargo test \
     --manifest-path crates/ravel-compat-tests/Cargo.toml \
     --test corpus -- --ignored generate_corpus
+
+product crate trees (git rev-parse HEAD:crates/<crate>) whose writers
+produced a fixture:
+  ravel-segment   1779f4e1b2e7a22b58b6e2c1ae216e00d5db6a8a  RSEG L0 objects
+  ravel-maintain  f341260015bb937a81ad9e69575c5fb20e39f985  RSEG L1 compaction
+  ravel-logseg    077992fab41df8b0996a48b7e015d4845754f15f  logs/ RLOG object
+  ravel-rspan     4357919064eedf06da3a0f1a645aad06fcab8520  spans/ RSPAN object
+
+configuration source (IngestConfig::default(), the RLOG writer settings):
+  ravel-ingest    004e807f3c659094dab6b9c4f08bcac611e081b6

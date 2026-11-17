@@ -1,15 +1,16 @@
 //! The frozen baseline corpus (ADR-4233 decision 9, "Frozen corpus").
 //!
 //! Each directory `crates/ravel-compat-tests/corpus/<release>/` holds objects
-//! written by the real write paths of the build its `PROVENANCE` file names,
-//! with the exact expected results recorded beside them. Corpora are
-//! append-only (the `check-compat-corpus-append-only.sh` guard enforces it);
-//! [`reads_every_frozen_corpus`] opens every directory under `corpus/` and
-//! asserts exact results against the current build.
+//! written by the real write paths of the product code its `PROVENANCE` file
+//! identifies, with the exact expected results recorded beside them. Corpora
+//! are append-only (the `check-compat-corpus-append-only.sh` guard enforces
+//! it); [`reads_every_frozen_corpus`] opens every directory under `corpus/`
+//! and asserts exact results against the current build.
 //!
-//! `corpus/v0.34.0/` is the baseline candidate: written by HEAD at the commit
-//! its `PROVENANCE` names, before the v0.34.0 tag exists. The byte-identity
-//! check against the tagged build is a release step, not this test.
+//! `corpus/v0.34.0/` is the baseline candidate, written before the v0.34.0
+//! tag exists. Its `PROVENANCE` records the git tree of each product crate
+//! that wrote a fixture; the byte-identity check against the tagged build is
+//! a release step, not this test, and its result goes in a new file.
 //!
 //! On-disk shape of one release directory:
 //!   - `manifest.txt`, `objects/<NNNN>.bin`, `expected.txt`: metrics. Two RSEG
@@ -20,10 +21,22 @@
 //!   - `samples.txt`: for every RSEG object, one line per series with its
 //!     labels, `SeriesId` and every `(ts_ns, value.to_bits())`. The lines come
 //!     from the generator's inputs, never from the reader under test.
-//!   - `logs/` and `spans/`: one RLOG and one RSPAN L0 object written by the
-//!     codec and config the ingest log and span flushes use, with commit
-//!     records, and `expected.txt` holding every row.
-//!   - `PROVENANCE`: the source commit and the generator command.
+//!   - `logs/` and `spans/`: one RLOG and one RSPAN L0 object with their
+//!     commit records, and `expected.txt` holding every row. The RSPAN object
+//!     is written as the ingest span flush writes it, with
+//!     `RspanConfig::default()`. The RLOG object is written with the ingest
+//!     flush's `RlogConfig` built from `IngestConfig::default()` (zstd level,
+//!     group size, chunk order and the `Estimated` page choice), through the
+//!     row `push` path and without the flush's indexed fields, key-index
+//!     fields, sort descriptor or bloom scope.
+//!   - `versions.txt` in each of the three object sets: every data object's
+//!     key and trailer version, as the generating build stamped it in the
+//!     object's commit record or compaction part. The read test asserts each
+//!     trailer and each stamp against this file, never against the current
+//!     build's write version.
+//!   - `PROVENANCE`: the generator command, the git tree of each product
+//!     crate whose writer produced a fixture, and the tree of ravel-ingest,
+//!     whose `IngestConfig::default()` supplies the RLOG configuration.
 //!
 //! The read test loads each object set into a `MemoryStore` under its real keys.
 //! (A disk `ScratchStore` is not used: it clears its directory on open, which
@@ -32,6 +45,7 @@
 //! `generate_corpus` (`#[ignore]`, run by hand) writes every file a release
 //! directory lacks and never overwrites one; where the metrics objects already
 //! exist it regenerates them in memory and asserts they are byte-identical.
+//! It does not write `PROVENANCE`.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -43,6 +57,8 @@ use std::path::{Path, PathBuf};
 use ravel_catalog::{AbsentPolicy, validate_or_adopt};
 use ravel_commit::keys;
 use ravel_commit::record::{self, NewCommitRecord};
+use ravel_ingest::IngestConfig;
+use ravel_logseg::PageChoice;
 use ravel_logseg::reader::RlogReader;
 use ravel_logseg::record::{LogRecord, Predicate, stream_attrs_bytes};
 use ravel_logseg::writer::{RlogConfig, RlogWriter};
@@ -340,17 +356,11 @@ struct Facts {
     l1_series_count: u64,
 }
 
-/// Every RSEG data object opens at version 7, the L0 commit records sum to the
-/// recorded counts, and the compaction record's parts carry the conserved
-/// sample count at version 7.
+/// The RSEG data object count, the L0 commit records' summed counts, and the
+/// compaction record's parts' summed counts. Versions are checked against
+/// `versions.txt` by [`assert_versions`].
 async fn compute_facts(store: &dyn ObjectStoreBackend) -> Facts {
-    let mut rseg_data_objects = 0;
-    for key in common::data_keys(store).await {
-        let bytes = store.get(&key, GetRange::Full).await.expect("get").data;
-        let loc = open_from_full(&bytes, ReaderLimits::default()).expect("open rseg");
-        assert_eq!(loc.version, VERSION_V7, "{key}");
-        rseg_data_objects += 1;
-    }
+    let rseg_data_objects = common::data_keys(store).await.len() as u64;
 
     let listing = read::list_bucket(store, &bucket())
         .await
@@ -359,7 +369,6 @@ async fn compute_facts(store: &dyn ObjectStoreBackend) -> Facts {
     for key in &listing.commit_keys {
         let bytes = store.get(key, GetRange::Full).await.expect("get").data;
         let rec = record::decode(&bytes).expect("decode commit");
-        assert_eq!(rec.segment_format_version, u32::from(VERSION_V7), "{key}");
         l0_sample_count += rec.sample_count;
         l0_series_count += rec.series_count;
     }
@@ -368,7 +377,6 @@ async fn compute_facts(store: &dyn ObjectStoreBackend) -> Facts {
         let bytes = store.get(key, GetRange::Full).await.expect("get").data;
         let rec = record::decode_compaction(&bytes).expect("decode compaction");
         for part in &rec.parts {
-            assert_eq!(part.segment_format_version, u32::from(VERSION_V7), "{key}");
             l1_sample_count += part.sample_count;
             l1_series_count += part.series_count;
         }
@@ -578,18 +586,33 @@ fn span_records() -> Vec<SpanRecord> {
 const LOGS_SEQ: u64 = 3;
 const SPANS_SEQ: u64 = 4;
 
-/// One RLOG L0 object and its commit record. The writer is the one the ingest
-/// log flush uses, with `RlogConfig::default()` (the flush overrides only the
-/// zstd level, group size, chunk order and page choice from `IngestConfig`);
-/// the commit record carries what the flush records: `series_count` the stream
-/// count and the event bounds the row timestamps.
+/// The `RlogConfig` an ingest log flush writes with (`flush_rlog_config` in
+/// ravel-ingest's `log_shard.rs`), from `IngestConfig::default()`: the zstd
+/// level, group size, chunk order and `Estimated` page choice over
+/// `RlogConfig::default()`.
+fn flush_rlog_config() -> RlogConfig {
+    let ingest = IngestConfig::default();
+    RlogConfig {
+        zstd_level: ingest.rlog_zstd_level.get(),
+        group_target_blocks: ingest.rlog_group_target_blocks.get(),
+        chunk_order: ingest.rlog_chunk_order.get(),
+        page_choice: ingest.rlog_page_choice,
+        ..RlogConfig::default()
+    }
+}
+
+/// One RLOG L0 object and its commit record, written with
+/// [`flush_rlog_config`]. The commit record carries what the flush records:
+/// `series_count` the stream count and the event bounds the row timestamps.
 /// Returns the store and the object's key.
 async fn build_logs_store() -> (MemoryStore, String) {
     let store = MemoryStore::with_page_size(2);
     let (writer_id, epoch, _) = writer_identity(LOGS_SEQ);
     let records = log_records();
+    let config = flush_rlog_config();
+    assert_eq!(config.page_choice, PageChoice::Estimated);
     let mut writer = RlogWriter::new(
-        RlogConfig::default(),
+        config,
         ravel_logseg::writer::ObjectIdentity {
             tenant_hash: hash().0,
             shard: SHARD,
@@ -668,23 +691,15 @@ fn rspan_trailer_version(bytes: &[u8]) -> u16 {
 }
 
 /// Every row of every RLOG object in `store`, decoded through `RlogReader`,
-/// as sorted `expected.txt` lines. Each object's trailer and commit record are
-/// checked at the baseline RLOG version on the way.
+/// as sorted `expected.txt` lines.
 async fn decoded_log_lines(store: &dyn ObjectStoreBackend) -> Vec<String> {
     let mut lines = Vec::new();
-    let baseline = ravel_logseg::WriteVersion::CURRENT.number();
     for key in common::data_keys(store).await {
         let bytes = store.get(&key, GetRange::Full).await.expect("get").data;
-        assert_eq!(
-            ravel_logseg::footer::trailer_version(&bytes).expect("RLOG trailer"),
-            baseline,
-            "{key}"
-        );
         let reader = RlogReader::new(&bytes, &RlogConfig::default()).expect("open RLOG");
         let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
         lines.extend(rows.iter().map(|r| log_line(&key, r)));
     }
-    assert_commit_versions(store, baseline).await;
     lines.sort();
     lines
 }
@@ -693,41 +708,149 @@ async fn decoded_log_lines(store: &dyn ObjectStoreBackend) -> Vec<String> {
 /// as sorted `expected.txt` lines.
 async fn decoded_span_lines(store: &dyn ObjectStoreBackend) -> Vec<String> {
     let mut lines = Vec::new();
-    let baseline = ravel_rspan::footer::WriteVersion::CURRENT.number();
     for key in common::data_keys(store).await {
         let bytes = store.get(&key, GetRange::Full).await.expect("get").data;
-        assert_eq!(rspan_trailer_version(&bytes), baseline, "{key}");
         let reader = RspanReader::new(&bytes, &RspanConfig::default()).expect("open RSPAN");
         let (rows, _) = reader
             .scan(&SpanQuery::ts_range(i64::MIN, i64::MAX))
             .expect("scan");
         lines.extend(rows.iter().map(|s| span_line(&key, s)));
     }
-    assert_commit_versions(store, baseline).await;
     lines.sort();
     lines
 }
 
-async fn assert_commit_versions(store: &dyn ObjectStoreBackend, version: u16) {
-    let mut records = 0;
-    for meta in list_all(store, "").await.expect("list") {
-        if meta.key.ends_with(".cmt") {
-            let bytes = store
-                .get(&meta.key, GetRange::Full)
-                .await
-                .expect("get")
-                .data;
-            let rec = record::decode(&bytes).expect("decode commit");
-            assert_eq!(
-                rec.segment_format_version,
-                u32::from(version),
-                "{}",
-                meta.key
-            );
-            records += 1;
+// === Recorded versions =======================================================
+
+/// The format family of one object set's data objects.
+#[derive(Clone, Copy, Debug)]
+enum Family {
+    Rseg,
+    Rlog,
+    Rspan,
+}
+
+impl Family {
+    fn signal(self) -> Signal {
+        match self {
+            Family::Rseg => Signal::Metrics,
+            Family::Rlog => Signal::Logs,
+            Family::Rspan => Signal::Spans,
         }
     }
-    assert_eq!(records, 1, "one commit record per logs/spans object set");
+
+    /// The version field of the object's trailer.
+    fn trailer_version(self, bytes: &[u8]) -> u32 {
+        u32::from(match self {
+            Family::Rseg => {
+                open_from_full(bytes, ReaderLimits::default())
+                    .expect("open RSEG")
+                    .version
+            }
+            Family::Rlog => ravel_logseg::footer::trailer_version(bytes).expect("RLOG trailer"),
+            Family::Rspan => rspan_trailer_version(bytes),
+        })
+    }
+}
+
+/// One `segment_format_version` stamp: the record that carries it, the
+/// content hash of the object it describes, and the version.
+struct Stamp {
+    record_key: String,
+    content_hash: Vec<u8>,
+    version: u32,
+}
+
+/// Every version stamp in the family's bucket: each L0 commit record's, and
+/// each compaction record part's.
+async fn version_stamps(store: &dyn ObjectStoreBackend, family: Family) -> Vec<Stamp> {
+    let listing = read::list_bucket(store, &Bucket::new(hash(), family.signal(), SHARD, HOUR))
+        .await
+        .expect("list bucket");
+    let mut stamps = Vec::new();
+    for key in &listing.commit_keys {
+        let bytes = store.get(key, GetRange::Full).await.expect("get").data;
+        let rec = record::decode(&bytes).expect("decode commit");
+        stamps.push(Stamp {
+            record_key: key.clone(),
+            content_hash: rec.content_hash,
+            version: rec.segment_format_version,
+        });
+    }
+    for key in &listing.compaction_record_keys {
+        let bytes = store.get(key, GetRange::Full).await.expect("get").data;
+        let rec = record::decode_compaction(&bytes).expect("decode compaction");
+        stamps.extend(rec.parts.into_iter().map(|part| Stamp {
+            record_key: key.clone(),
+            content_hash: part.content_hash,
+            version: part.segment_format_version,
+        }));
+    }
+    stamps
+}
+
+/// The one stamp describing the object `bytes`.
+fn stamp_of<'a>(stamps: &'a [Stamp], key: &str, bytes: &[u8]) -> &'a Stamp {
+    let content_hash = blake3_hash(bytes);
+    let mine: Vec<&Stamp> = stamps
+        .iter()
+        .filter(|s| s.content_hash == content_hash)
+        .collect();
+    assert_eq!(mine.len(), 1, "{key}: one record stamps this object");
+    mine[0]
+}
+
+/// The generator's `versions.txt`: each data object's key and the version
+/// the generating build stamped in its record.
+async fn versions_from_stamps(store: &dyn ObjectStoreBackend, family: Family) -> String {
+    let stamps = version_stamps(store, family).await;
+    let mut out = String::new();
+    for key in common::data_keys(store).await {
+        let bytes = store.get(&key, GetRange::Full).await.expect("get").data;
+        let version = stamp_of(&stamps, &key, &bytes).version;
+        out.push_str(&format!("{key}\t{version}\n"));
+    }
+    out
+}
+
+/// Each data object's trailer, and the one record stamp describing it, equal
+/// the version `versions.txt` records for it; `versions.txt` names every data
+/// object and every stamp describes one.
+async fn assert_versions(store: &dyn ObjectStoreBackend, family: Family, dir: &Path) {
+    let name = dir.display();
+    let recorded: BTreeMap<String, u32> = lines_of(&dir.join("versions.txt"))
+        .iter()
+        .map(|line| {
+            let (key, version) = line.split_once('\t').expect("versions.txt line");
+            (key.to_string(), version.parse().expect("version number"))
+        })
+        .collect();
+    let keys = common::data_keys(store).await;
+    assert_eq!(
+        keys.iter().collect::<Vec<_>>(),
+        recorded.keys().collect::<Vec<_>>(),
+        "{name}: versions.txt names every data object"
+    );
+    let stamps = version_stamps(store, family).await;
+    for key in &keys {
+        let bytes = store.get(key, GetRange::Full).await.expect("get").data;
+        assert_eq!(
+            family.trailer_version(&bytes),
+            recorded[key],
+            "{name}: {key} trailer version"
+        );
+        let stamp = stamp_of(&stamps, key, &bytes);
+        assert_eq!(
+            stamp.version, recorded[key],
+            "{name}: {} stamps {key}",
+            stamp.record_key
+        );
+    }
+    assert_eq!(
+        stamps.len(),
+        keys.len(),
+        "{name}: every record stamp describes a data object"
+    );
 }
 
 // === On-disk object sets =====================================================
@@ -789,14 +912,27 @@ async fn freeze_set(store: &dyn ObjectStoreBackend, dir: &Path) {
     create_new(&dir.join("manifest.txt"), manifest.as_bytes());
 }
 
-/// Assert one release directory reads back exactly: the metrics counts and
-/// every decoded sample, every log row and every span.
+/// A release directory's three object sets and the family of each.
+fn object_sets(dir: &Path) -> [(PathBuf, Family); 3] {
+    [
+        (dir.to_path_buf(), Family::Rseg),
+        (dir.join("logs"), Family::Rlog),
+        (dir.join("spans"), Family::Rspan),
+    ]
+}
+
+/// Assert one release directory reads back exactly: every object's recorded
+/// version, the metrics counts and every decoded sample, every log row and
+/// every span.
 async fn assert_release_reads_exactly(dir: &Path) {
     let name = dir.display();
     assert!(
         dir.join("PROVENANCE").is_file(),
-        "{name}: a corpus records its source commit in PROVENANCE"
+        "{name}: a corpus records where it came from in PROVENANCE"
     );
+    for (set, family) in object_sets(dir) {
+        assert_versions(&load_set(&set).await, family, &set).await;
+    }
 
     let metrics = load_set(dir).await;
     let facts = compute_facts(&metrics).await;
@@ -932,6 +1068,16 @@ async fn generate_corpus() {
             &dir.join("spans").join("expected.txt"),
             format!("{}\n", lines.join("\n")).as_bytes(),
         );
+    }
+
+    for (set, family) in object_sets(&dir) {
+        if !set.join("versions.txt").exists() {
+            let frozen = load_set(&set).await;
+            create_new(
+                &set.join("versions.txt"),
+                versions_from_stamps(&frozen, family).await.as_bytes(),
+            );
+        }
     }
 
     assert_release_reads_exactly(&dir).await;

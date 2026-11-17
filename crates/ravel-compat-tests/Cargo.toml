@@ -17,6 +17,9 @@ publish = false
 [dev-dependencies]
 ravel-catalog = { path = "../ravel-catalog", version = "0.33.0" }
 ravel-commit = { path = "../ravel-commit", version = "0.33.0" }
+# `IngestConfig::default()`, the RLOG writer configuration the corpus's log
+# object is written with. Already a dependency of ravel-maintain.
+ravel-ingest = { path = "../ravel-ingest", version = "0.33.0" }
 ravel-maintain = { path = "../ravel-maintain", version = "0.33.0" }
 ravel-object-store = { path = "../ravel-object-store", version = "0.33.0" }
 ravel-proto = { path = "../ravel-proto", version = "0.33.0" }
