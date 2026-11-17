@@ -398,7 +398,9 @@ So decision 6's six items, plus one, are settled as follows:
 - The write gate (#4211) is held until the decoder is off the critical
   path, then re-measured.
 - Estimated page choice (#4212) stays, after #4210: its win is small and
-  its stored-byte and cold-read cost is inside the bands.
+  its stored-byte and cold-read cost is inside the bands. (Reversed for the
+  `ravel-cli load` default by the page choice reversal amendment below: hot
+  Q24 and Q28 doubled, #4388.)
 - Deriving loader shards, cursors and flush concurrency from cores (#4214)
   stays, after #4210, and is not measured yet: Stage 0 ran on one machine
   size, and the metal load (562 s against 581 s on c6a.4xlarge) is the
@@ -546,3 +548,29 @@ entry's binary:
 |---|---|---|
 | stock cold total | at or under 0.93x | predicted |
 | stock hot total | at or under 0.75x | predicted |
+
+## Amendment (2026-11-17): page choice reversal for the load default
+
+<!-- amendment-applies: sections="Amendment (2026-11-14): Stage 0 outcomes" pointer="page choice reversal amendment" -->
+
+**Decision.** `ravel-cli load` defaults to `--page-choice exhaustive` again
+(#4409). `estimated` stays available as an opt-in value. Neither page-choice
+algorithm changes, and the server's logs ingest keeps its own setting.
+
+**Why.** The Stage 0 reading that estimated page choice "stays" rested on
+cold reads and stored bytes only. Hot reads were not banded. The #4388
+bisect showed that the estimated default roughly doubled hot ClickBench Q24
+(0.485 s to 0.955 s) and Q28 (0.590 s to 1.151 s) on c6a.4xlarge, against
+the published v0.32.0 row. Both statements decode `URL`, the tenant's
+longest string column. On the same binary, a load with
+`--page-choice exhaustive` restored them (0.476 s and 0.593 s). The M4
+readout had recorded hot total 32.0 s against 30.2 s (+6%) for the estimated
+tenant without judging it, because it was not pre-registered.
+
+**Cost.** The load-time gain of #4212: load wall time returns from about
+x0.894 to the exhaustive baseline (441.1 s against 493.5 s in M4).
+
+**Follow-up.** A per-column rule that keeps exhaustive choice for long
+string columns and uses the estimate elsewhere could recover the gain
+without the URL regression. Its bands must include hot reads of every
+URL-heavy statement as well as load time.

@@ -1,4 +1,5 @@
-//! `ravel-cli load --page-choice` (issue #4212, ADR-4203 decisions 6 and 7):
+//! `ravel-cli load --page-choice` (issue #4212; default per ADR-4203's page
+//! choice reversal amendment, #4409):
 //! how the RLOG writer of every flush a logs load runs picks each page's
 //! encoding.
 
