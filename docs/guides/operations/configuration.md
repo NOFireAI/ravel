@@ -2272,6 +2272,70 @@ and `--no-key-index-leaves` to every `ravel-cli catalog fold`. The
 [catalog spec](../../catalog-and-mvcc.md#upgrading-to-the-default-leaf-build)
 states the rule and the cost.
 
+### Key-index repair cost and budget
+
+`ravel-cli catalog fold --rebuild-key-index [--field <name>] [--batch-entries
+<n>]` attaches key-index leaves to parts the regular fold never re-encodes: a
+sealed, compacted historical part with no erasure pending. Run it after
+declaring a new key-index field, to repair the retained sealed days the next
+regular fold will not touch. It accepts `--key-index-build-max-pairs` as its
+pair budget, the same flag and the same per-field share rule the fold's leaf
+build uses (see "Key-index leaf build budget" above and
+[the catalog spec's pair budget](../../catalog-and-mvcc.md#per-part-key-index-leaves-adr-2707)).
+
+**What drives the cost.** Each build pass re-reads every entry's KEY_IDX
+section. A field's passes are `ceil(its pairs / its share)`, and the share is
+the budget divided by the fields the repair builds for that part: one new
+field on a part that carries no other leaf gets the whole budget, but one
+new field on a part that already carries other declared fields' leaves only
+gets a fraction of it. A part's passes, section reads and GETs follow its
+slowest field.
+
+**Measured (real S3, c6a.4xlarge; source in [Background](#background)).** One sealed logs day, 548
+entries, two missing fields (`request_id` 100,000,000 pairs, `trace_id`
+20,000,000 pairs):
+
+| `--key-index-build-max-pairs` | passes | ranged GETs | section reads | peak RSS | wall time |
+|---|---|---|---|---|---|
+| 8,000,000 (default) | 25 | 27,400 | 28.8 GB | 0.66 GB | 589 s |
+| 16,000,000 | 13 | 14,248 | 15.0 GB | 1.24 GB | 426 s |
+
+One sealed spans day, 800 entries, one missing field (`trace_id`):
+
+| `--key-index-build-max-pairs` | passes | section reads | peak RSS | wall time |
+|---|---|---|---|---|
+| 8,000,000 (default) | 3 | 0.58 GB | 0.86 GB | 70 s |
+| 16,000,000 | 2 | 0.39 GB | 1.69 GB | 53 s |
+
+GET spend for the 8,000,000 logs repair: 27,400 x $0.0004 / 1,000, about one
+cent; in-region bytes are not billed.
+
+**Budget to run it at.** Run repairs at `--key-index-build-max-pairs
+16000000`, on a host with about 1.7 GB of memory headroom for the repair
+process. It halves the logs day's passes and section reads against the
+default (25 to 13 passes, 28.8 GB to 15.0 GB of section reads) and cuts its
+wall time from 589 s to 426 s. The headroom to plan for is 1.7 GB, not the
+logs day's 1.24 GB peak: a repair that builds only one field for a part
+gives that field the whole budget, and the spans day above, repairing its
+one field alone, peaked at 1.69 GB at 16,000,000. Keep the default
+8,000,000 on a host without that headroom.
+
+**Thirty retained days.** Derived from the one measured logs day above, not
+separately measured: 30 sealed logs days at the default budget cost about
+30 x 589 s, about 4.9 hours; at 16,000,000, about 30 x 426 s, about 3.5
+hours.
+
+**Days that predate the field.** A KEY_IDX section whose header does not
+name the field it is asked to index -- because the entry was written before
+the field was declared, or after it was de-declared -- reads as uncovered
+for that field, and a field with no covered entry in a part writes no leaf
+([catalog spec](../../catalog-and-mvcc.md#per-part-key-index-leaves-adr-2707),
+which states that this uncovered-entry accounting is shared by the fold's
+leaf build and the repair). A day sealed entirely before the field's
+declaration therefore costs the same ranged GETs to repair -- it still reads
+every entry's section -- but publishes no ref for that field, since the
+repair finds nothing in any section to index.
+
 ### Metrics label-value leaves
 
 With the leaf build on (the default; `--no-fold-key-index-leaves` for
@@ -2701,3 +2765,6 @@ Decision records behind the choices on this page:
 [operator-configurable query budgets](../../adrs/0088-operator-configurable-query-budgets.md),
 [who may run DDL](../../adrs/2040-parquet-tables-queried-in-place.md),
 and [who may call the IPCrypt SQL functions](../../adrs/2993-ipcrypt-attribute-pseudonymization.md).
+
+The key-index repair cost figures under "Key-index repair cost and budget"
+are measured on issue #4347.
