@@ -319,6 +319,67 @@ Re-verify the content-addressed chain for a tenant at rest (both signals): every
 | `--tenant` |  |  |  |
 | `--versioning-aware` |  |  | Also list noncurrent (prior) versions under the tenant's keys and report "deleted but recoverable as prior version" as a distinct anomaly class (ADR-0064 §7, S4-12). The ObjectStoreBackend contract exposes no versioned listing, so against a real backend this reports an honest gap rather than an anomaly |
 
+## compat
+
+Operate the retained-data compatibility contract `sys/compat` (ADR-4233): adopt a store at the baseline, activate a version, certify a reader retirement, and report the contract state. Every subcommand signs and verifies `sys/compat` under the global `--tenant-hash-key-file` deployment key
+
+_No flags._
+
+### compat init
+
+Adopt the store at the baseline (ADR-4233 decision 1): run the census over every tenant and signal and, only on a clean result, create `sys/compat`. Refuses an unkeyed store, any object outside the baseline read set, and a store whose `sys/compat` already differs
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--baseline-major` |  | `0` | The baseline release the store is adopted at (expected v0.34.0) |
+| `--baseline-minor` |  | `34` |  |
+| `--json` |  |  | Emit the report as JSON |
+| `--max-publish-lifetime` |  | `1h` | `P`, the longest a publish may run, recorded in `sys/compat` and only ever raised later (ADR-4233 decision 7). A humantime duration |
+
+### compat activate
+
+Activate a family's next write version (ADR-4233 decision 3), CASing the active version and the store-wide epoch up and fencing every provisioned bucket. The irreversible step is the first activation of a version some deployed binary cannot read, not the binary install
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--activated-by` |  | `operator` | The operator identity recorded in `activated_by` |
+| `--alert-rule-tenant` |  |  | A tenant hash named by the alert rules file whose lease is parked on an rlog activation even before it holds an alert key. Repeatable |
+| `--clock-skew-allowance` |  | `1m` | The deployment's clock skew allowance. A humantime duration |
+| `--family` |  |  | The family to activate: rseg, rlog, rspan, a catalog family, or a record family |
+| `--json` |  |  | Emit the report as JSON |
+| `--pre-baseline-processes-terminated` |  |  | Attest that every pre-baseline (v0.33.x) process is terminated (ADR-4233 decision 4). Required; recorded in `activated_by` |
+
+### compat certify
+
+Certify a class-A family's reader retirement (ADR-4233 decision 7): after the time gate and a strict census with trailer checks, write the certificate a reader-retiring release accepts. Refuses before the time precondition, reports a contradiction or a held member, and resumes a budget-stopped run from its cursor
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--budget-records` |  |  | Cap the (tenant, signal, shard) units one run covers; the run resumes from its cursor. Unset is no cap |
+| `--clock-skew-allowance` |  | `1m` | The deployment's clock skew allowance, a humantime duration |
+| `--family` |  |  | A class-A family: rseg, rlog or rspan |
+| `--json` |  |  | Emit the report as JSON |
+| `--max-flush-lifetime` |  | `1h` | `max_flush_lifetime` for the G_pre bound, a humantime duration |
+| `--t-req` |  | `30s` | The store request timeout `T_req`, a humantime duration |
+
+### compat verify
+
+Run the late-write pass and report the contract state (ADR-4233 decision 7): for each class-A family with a certificate, GET the records landed since the watermark and set `contradicted` on a late write, then print every family's active version, epoch, fence-complete time, certificate, contradicted flag and watermark
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--clock-skew-allowance` |  | `1m` | The deployment's clock skew allowance, a humantime duration |
+| `--family` |  |  | Limit the late-write pass to one class-A family. Unset runs it for every class-A family that carries a certificate |
+| `--json` |  |  | Emit the report as JSON |
+
+### compat status
+
+Print the contract state from `sys/compat` without running a pass: every family's active version, epoch, fence-complete time, certificate, contradicted flag and watermark
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--json` |  |  | Emit the report as JSON |
+
 ## store
 
 Object store backend qualification (ADR-0050 section 6)
