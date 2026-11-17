@@ -292,12 +292,20 @@ horizon is tested where the routed rows' flush can open, not at routing time:
 the switch routes only when `hour_of(now_ns + flush_trigger_age_bound) <
 hour_of(view.refreshed_at_ns) + min_lead_hours(C)`, where
 `flush_trigger_age_bound` is the largest age a buffer reaches before its flush
-trigger fires (the largest of the flush delays, plus one flush tick; about 40 s
-at the defaults). A row routed later would be acknowledged in buffered mode
-and then reach a flush that opens past the horizon, where the scan-set check
-below holds it and finally drops it, so in the last
-`flush_trigger_age_bound` before the horizon a write is refused with the
-retryable `StaleProvisioningView` (503) and nothing is buffered. The grace
+trigger fires when the flush is not deferred and the buffer is not held below
+the idle byte floor (the largest of the flush delays, plus one flush tick;
+about 40 s at the defaults). A row routed later would be acknowledged in
+buffered mode although its undeferred flush trigger would open past the
+horizon, where the scan-set check below holds the flush and finally drops it,
+so in the last `flush_trigger_age_bound` before the horizon a write is refused
+with the retryable `StaleProvisioningView` (503) and nothing is buffered. That
+refusal covers only the undeferred trigger. A buffer held below
+`--idle-flush-byte-floor` (the ADR-1737 sub-floor hold, about
+`max_flush_lifetime`, 1 h by default) or whose flush is deferred (by the
+tenant flush share or the queued-flush cap, for the flush deferral cap,
+3,559.8 s at the defaults, or longer) can still open past the horizon after its rows
+were acknowledged; it is then held and dropped under the bounded stale-view
+hold (docs/consistency-model.md, acknowledgement case nine). The grace
 window degrades cost under
 store latency, it never converts a genuine shard-count change into silent
 wrong-routing. A router routing through this window increments
