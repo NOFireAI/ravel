@@ -300,8 +300,12 @@ pub enum MaintainError {
     )]
     ClaimLost { at: &'static str },
     /// An input object's reader refused its trailer format version
-    /// (`UnsupportedVersion` from RSEG, RLOG or RSPAN), with the object's key
-    /// and the content hash its commit record holds. Compaction checks the
+    /// (`UnsupportedVersion` from RSEG, RLOG or RSPAN), or the version of an
+    /// RLOG section it reads (`UnsupportedSectionVersion`, ADR-4233 hazard
+    /// H5), with the object's key and the content hash its commit record
+    /// holds. `section` is `None` for a trailer version and names the section
+    /// for a section version; `version` is the version of whichever was
+    /// refused. Compaction checks the
     /// object's bytes against that hash and holds the bucket
     /// ([`crate::compact::CompactionOutcome::HeldOutOfWindow`]) on a match, or
     /// fails with `source` on a mismatch, since the readers check the version
@@ -314,9 +318,15 @@ pub enum MaintainError {
     InputOutOfWindow {
         object_key: String,
         version: u16,
+        section: Option<&'static str>,
         content_hash: Vec<u8>,
         source: Box<MaintainError>,
     },
+    /// A compaction part's bytes do not hash to the content hash its record
+    /// holds: the object changed after it was written. No build can serve it
+    /// as recorded, so the re-encode refuses it as corrupt input.
+    #[error("part {object_key} does not match its record's content hash")]
+    PartContentHashMismatch { object_key: String },
     /// A renewal at a cancellation checkpoint failed with a genuine store
     /// error (ADR-1029 decision 3): distinct from [`MaintainError::ClaimLost`],
     /// which means the claim was stolen or is gone. Not internal plumbing
@@ -689,6 +699,18 @@ impl PartIndexRefusalKind {
     }
 }
 
+/// A version an RSEG, RLOG or RSPAN reader refused
+/// ([`MaintainError::unsupported_version`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefusedVersion {
+    /// The refused version: the trailer format version, or the section's own
+    /// version when `section` is set.
+    pub version: u16,
+    /// The RLOG section whose version was refused, `None` for a trailer
+    /// version.
+    pub section: Option<&'static str>,
+}
+
 impl MaintainError {
     /// The trailer (or RLOG section) version an RSEG, RLOG or RSPAN reader
     /// refused, when this error is that refusal.
@@ -698,16 +720,38 @@ impl MaintainError {
     /// version this build cannot read is "cannot read this object", the same
     /// class as an out-of-window trailer, so it maps to out of window and not
     /// to a corrupt input. Its `version` is the section version the reader
-    /// refused.
-    pub(crate) fn unsupported_version(&self) -> Option<u16> {
+    /// refused, and `section` names the section.
+    pub(crate) fn unsupported_version(&self) -> Option<RefusedVersion> {
         match self {
             MaintainError::Segment(SegmentError::UnsupportedVersion(v))
             | MaintainError::LogSeg(LogSegError::UnsupportedVersion(v))
-            | MaintainError::LogSeg(LogSegError::UnsupportedSectionVersion {
-                version: v, ..
-            })
-            | MaintainError::SpanSeg(SpanSegError::UnsupportedVersion(v)) => Some(*v),
+            | MaintainError::SpanSeg(SpanSegError::UnsupportedVersion(v)) => Some(RefusedVersion {
+                version: *v,
+                section: None,
+            }),
+            MaintainError::LogSeg(LogSegError::UnsupportedSectionVersion { section, version }) => {
+                Some(RefusedVersion {
+                    version: *version,
+                    section: Some(section),
+                })
+            }
             _ => None,
+        }
+    }
+
+    /// This error as [`MaintainError::InputOutOfWindow`] for the object at
+    /// `object_key` recorded with `content_hash`, when it is a reader's version
+    /// refusal; unchanged otherwise.
+    pub(crate) fn noting_version(self, object_key: &str, content_hash: &[u8]) -> Self {
+        match self.unsupported_version() {
+            Some(RefusedVersion { version, section }) => MaintainError::InputOutOfWindow {
+                object_key: object_key.to_string(),
+                version,
+                section,
+                content_hash: content_hash.to_vec(),
+                source: Box::new(self),
+            },
+            None => self,
         }
     }
 
@@ -766,14 +810,21 @@ mod tests {
     /// section version here, so the loader wraps it as
     /// [`MaintainError::InputOutOfWindow`] and the migrate walk holds the bucket
     /// as out of window, not as corrupt input. Before the H5 fix this returned
-    /// `None` and the refusal fell through to the `corrupt_input` hold.
+    /// `None` and the refusal fell through to the `corrupt_input` hold. The
+    /// section rides with the version so no report calls 9 a trailer version.
     #[test]
     fn logseg_unsupported_section_version_reports_its_version() {
         let err = MaintainError::LogSeg(LogSegError::UnsupportedSectionVersion {
             section: "POSTINGS",
             version: 9,
         });
-        assert_eq!(err.unsupported_version(), Some(9));
+        assert_eq!(
+            err.unsupported_version(),
+            Some(RefusedVersion {
+                version: 9,
+                section: Some("POSTINGS"),
+            })
+        );
     }
 
     /// The companion: a LogSeg trailer-version refusal already reported here,
@@ -784,7 +835,10 @@ mod tests {
     fn logseg_trailer_version_reports_but_corruption_does_not() {
         assert_eq!(
             MaintainError::LogSeg(LogSegError::UnsupportedVersion(7)).unsupported_version(),
-            Some(7)
+            Some(RefusedVersion {
+                version: 7,
+                section: None,
+            })
         );
         assert_eq!(
             MaintainError::LogSeg(LogSegError::Corrupted("bad".into())).unsupported_version(),

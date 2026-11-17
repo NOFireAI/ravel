@@ -954,6 +954,12 @@ Compaction then reads the whole object and compares its blake3 hash with the
   Only the content hash tells them apart. A mismatch is corruption, and the
   scan fails with the reader's own error, as for any other undecodable input.
 
+For an RLOG input the refused version can also be a section's own version: a
+trailer this build reads whose POSTINGS or KEY_IDX section carries a version
+this build cannot read. Compaction treats it the same
+way, hash check included, and the hold names the section next to that
+section's version.
+
 For metrics, a newer writer also stamps its own version on the commit record,
 and compaction refuses a record stamped newer than this build writes before it
 loads any input. Compaction then asks that input's reader as well. If the
@@ -1017,7 +1023,9 @@ tombstoned, so for it the hold ends when a build that reads the object runs
 here, or when the query-audit age sweep deletes the held record.
 
 `ravel-cli maintain compact-tenant` prints `outcome=HeldOutOfWindow
-version=<n>` for a held bucket, counts it on the summary's
+version=<n>` for a held bucket, with ` section=<name>` appended when `<n>` is
+the version of an RLOG section the reader refused rather than the object's
+trailer format version, counts it on the summary's
 `held_out_of_window` line, and treats it as a success, not a failure.
 `compact-bucket` prints `outcome: HeldOutOfWindow`. Neither moves a server
 counter. A bucket held for unknown section kinds (below) prints
@@ -1524,8 +1532,9 @@ Some buckets cannot be carried forward by this build. The walk holds such a
 bucket: it writes nothing there, logs a warning, and goes on to the next
 bucket. Each hold has one of three reasons:
 
-- `input_out_of_window`: an input data object's format version is outside
-  this build's reader window.
+- `input_out_of_window`: an input data object's format version, or the
+  version of an RLOG section it carries, is outside this build's reader
+  window.
 - `newer_than_writable`: a metrics input's commit record, or, for any
   signal, a part of the compaction record that `--reencode-compaction-parts`
   would re-encode, is recorded at a format version above the one this build
@@ -1541,7 +1550,9 @@ held: shard 0 hour 100 reason=newer_than_writable record_key="t/.../l1.d060aa3a8
 ```
 
 The detail after the reason is `object_key=` and `version=` for
-`input_out_of_window`, `record_key=` and `version=` for
+`input_out_of_window`, followed by `section=<name>` when the version is that
+RLOG section's and not the object's trailer format version, `record_key=` and
+`version=` for
 `newer_than_writable`, and `detail=` for `corrupt_input`.
 
 Every listing the walk and its re-audit plan from is strict, including the
@@ -1554,8 +1565,9 @@ checkpoint: that listing is shared with compaction and the erasure rewrite,
 both of which plan from non-strict listings, and it stays non-strict to match
 them. It is not the listing a migration decision rests on, only a last check
 that the record set did not change under the pass, so a short re-list cannot
-certify a floor; the strict planning listing already refused the bucket before
-the claim.
+certify a floor. An unaddressable key that lands after the strict planning
+listing is caught by the walk's strict re-audit, which runs before any floor
+is raised.
 
 A cursor stored under a tag this build does not know, such as one written by
 a newer build, is left in place. The run walks from the beginning, writes no

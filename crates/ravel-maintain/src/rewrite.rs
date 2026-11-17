@@ -319,16 +319,11 @@ async fn load_input_catalog_noting_version<C: SegmentCodec>(
     input: &crate::read::InputRecord,
 ) -> Result<C::Catalog> {
     match C::load_input_catalog(store, config, input).await {
-        Err(err) => match err.unsupported_version() {
-            Some(version) => Err(MaintainError::InputOutOfWindow {
-                object_key: keys::reconstruct_data_key(&input.record)?,
-                version,
-                content_hash: input.record.content_hash.clone(),
-                source: Box::new(err),
-            }),
-            None => Err(err),
-        },
-        ok => ok,
+        Err(err) if err.unsupported_version().is_some() => Err(err.noting_version(
+            &keys::reconstruct_data_key(&input.record)?,
+            &input.record.content_hash,
+        )),
+        other => other,
     }
 }
 
@@ -356,11 +351,13 @@ async fn refusal_noting_version<C: SegmentCodec>(
         Err(MaintainError::InputOutOfWindow {
             object_key,
             version,
+            section,
             content_hash,
             source: _,
         }) => MaintainError::InputOutOfWindow {
             object_key,
             version,
+            section,
             content_hash,
             source: Box::new(refusal),
         },
@@ -1552,8 +1549,19 @@ async fn reencode_and_publish(
             reencode_rseg_parts(store, config, bucket, predecessor, &part_keys, &hash).await?
         }
         Signal::Logs => {
-            let catalogs =
-                crate::rlog::load_catalogs_by_key(store, config, &part_keys, true).await?;
+            let pending = predecessor
+                .parts
+                .iter()
+                .zip(&part_keys)
+                .map(|(part, key)| async move {
+                    crate::rlog::load_catalog_from_object(store, config, key.clone(), true)
+                        .await
+                        .map_err(|err| err.noting_version(key, &part.content_hash))
+                });
+            let catalogs: Vec<_> = stream_iter(pending)
+                .buffered(config.input_read_concurrency.max(1))
+                .try_collect()
+                .await?;
             let mut indexed_fields: Vec<String> = catalogs
                 .iter()
                 .flat_map(|c| c.indexed_fields.iter().cloned())
@@ -1577,8 +1585,19 @@ async fn reencode_and_publish(
             .parts
         }
         Signal::Spans => {
-            let catalogs =
-                crate::rspan_codec::load_catalogs_by_key(store, config, &part_keys).await?;
+            let pending = predecessor
+                .parts
+                .iter()
+                .zip(&part_keys)
+                .map(|(part, key)| async move {
+                    crate::rspan_codec::load_catalog_from_object(store, config, key.clone())
+                        .await
+                        .map_err(|err| err.noting_version(key, &part.content_hash))
+                });
+            let catalogs: Vec<_> = stream_iter(pending)
+                .buffered(config.input_read_concurrency.max(1))
+                .try_collect()
+                .await?;
             crate::rspan_codec::merge(
                 store,
                 config,
@@ -1660,9 +1679,9 @@ async fn reencode_rseg_parts(
         note_get(ledger, RequestPhase::BlockRead, &got);
         let object = got?.data;
         if blake3::hash(&object).as_bytes().as_slice() != part.content_hash.as_slice() {
-            return Err(MaintainError::Invariant(format!(
-                "part {key} does not match its record's content hash"
-            )));
+            return Err(MaintainError::PartContentHashMismatch {
+                object_key: key.clone(),
+            });
         }
         let mut new_part = reencode_rseg_part(
             bucket,
@@ -1723,21 +1742,9 @@ fn reencode_rseg_part(
     // routes it through [`crate::migrate::MigrateHoldReason::from_refusal`] as
     // `input_out_of_window` rather than `corrupt_input`, so a re-encode holds
     // such a part for a later build instead of calling it damaged.
-    let loc = match open_from_full(object, limits) {
-        Ok(loc) => loc,
-        Err(err) => {
-            let err = MaintainError::from(err);
-            return Err(match err.unsupported_version() {
-                Some(version) => MaintainError::InputOutOfWindow {
-                    object_key: object_key.to_string(),
-                    version,
-                    content_hash: part.content_hash.clone(),
-                    source: Box::new(err),
-                },
-                None => err,
-            });
-        }
-    };
+    // The RLOG and RSPAN re-encodes wrap their catalog loads the same way.
+    let loc = open_from_full(object, limits)
+        .map_err(|err| MaintainError::from(err).noting_version(object_key, &part.content_hash))?;
     crate::compat_policy::refuse_unknown_sections(
         object_key,
         &loc.unknown_section_kinds,
@@ -2969,5 +2976,66 @@ mod tests {
             })
         );
         assert_eq!(refused(), before_count + 1);
+    }
+
+    /// A key under the bucket's commit prefix that the census cannot address,
+    /// beside one readable L0 record, so a non-strict listing would plan the
+    /// bucket without it.
+    async fn seed_with_unaddressable_key(store: &MemoryStore) -> String {
+        seed(store, 1, vec![series("alpha", &[(10, 1.0)])]).await;
+        let prefix = keys::commit_shard_hour_prefix(&tenant_hash(), Signal::Metrics, SHARD, HOUR)
+            .expect("bucket prefix");
+        let foreign = format!("{prefix}bad%key.cmt");
+        store.insert_foreign(&foreign, Bytes::from_static(b"foreign"));
+        foreign
+    }
+
+    fn assert_unaddressable<T: std::fmt::Debug>(result: Result<T>, foreign: &str) {
+        match result {
+            Err(MaintainError::UnaddressableKey { key, count, .. }) => {
+                assert_eq!(key, foreign, "the error names the key");
+                assert_eq!(count, 1, "the error counts the key");
+            }
+            other => panic!("expected UnaddressableKey, got {other:?}"),
+        }
+    }
+
+    /// ADR-4233 decision 6: the per-bucket listing an L0 migration plans from
+    /// is strict. Called on the scoped body directly, so no walk listing runs
+    /// first. Planning from `list_bucket_with_ledger` instead migrates the
+    /// readable record and returns `Rewritten`.
+    #[tokio::test]
+    async fn an_l0_migration_refuses_an_unaddressable_key_in_its_bucket() {
+        let store = MemoryStore::new();
+        let foreign = seed_with_unaddressable_key(&store).await;
+        let result = migrate_bucket_format_scoped(
+            &store,
+            &FixedClock::new(sealed_now_ns()),
+            &CompactorConfig::default(),
+            &bucket(),
+            FUTURE_VERSION,
+        )
+        .await;
+        assert_unaddressable(result, &foreign);
+        assert_eq!(read_record(&store).await, None, "nothing is published");
+    }
+
+    /// The force 2 re-encode's per-bucket listing is strict too. Planning from
+    /// `list_bucket_with_ledger` instead finds no compaction record and returns
+    /// an outcome, not the error.
+    #[tokio::test]
+    async fn a_reencode_refuses_an_unaddressable_key_in_its_bucket() {
+        let store = MemoryStore::new();
+        let foreign = seed_with_unaddressable_key(&store).await;
+        let result = reencode_compaction_parts_scoped(
+            &store,
+            &FixedClock::new(sealed_now_ns()),
+            &CompactorConfig::default(),
+            &bucket(),
+            None,
+        )
+        .await;
+        assert_unaddressable(result, &foreign);
+        assert_eq!(read_record(&store).await, None, "nothing is published");
     }
 }
