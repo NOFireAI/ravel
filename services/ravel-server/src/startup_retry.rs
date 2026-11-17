@@ -1,9 +1,9 @@
 //! Bounded retry of the store reads startup refuses on (issue #4325).
 //!
 //! Every gate that reads the store before a listener binds (qualification,
-//! tenancy pinning, tenant key epochs, provisioning validation, `sys/gc`, the
-//! IPCrypt policy marker) used to refuse to start on the first store error,
-//! even one the store contract marks retryable.
+//! the retired-reader gate, tenancy pinning, tenant key epochs, provisioning
+//! validation, `sys/gc`, the IPCrypt policy marker) used to refuse to start on
+//! the first store error, even one the store contract marks retryable.
 //!
 //! [`StartupRetry::run`] runs one such read and retries it only while it fails
 //! with a transient store error: a [`StoreError`] that
@@ -38,6 +38,7 @@ use ravel_object_store::s3::S3Store;
 use ravel_object_store::{KmsRoutingStore, ObjectStoreBackend, StoreError};
 use ravel_types::{ConfiguredScheme, TenantHash};
 
+use crate::compat_gate::{CompatGateError, GateOutcome, RetiredReader};
 use crate::config::{Mode, StoreKind};
 use crate::tenancy::{ResolvedTenancy, TenancyError};
 use crate::tenant_kms::{TenantKmsConfig, TenantKmsError};
@@ -65,6 +66,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Site names, as they appear in the retry log line and the deadline error.
 pub const SITE_QUALIFICATION: &str = "sys/qualification";
+pub const SITE_RETIRED_READER_GATE: &str = "the retired-reader gate (sys/compat, sys/tenancy)";
 pub const SITE_TENANCY: &str = "sys/tenancy";
 pub const SITE_TENANT_KMS: &str = "tenant key-epoch records (t/<tenant_hash>/enc)";
 pub const SITE_PROVISIONING: &str = "shard_count provisioning records";
@@ -426,6 +428,40 @@ pub async fn enforce_qualification(
         })
 }
 
+/// The retired-reader gate (ADR-4233 decision 7), retried. The gate is
+/// read-only, so a retry repeats its reads from the start. A store error the
+/// gate wraps, in [`CompatGateError::Store`] or through
+/// [`CompatGateError::CompatUnreadable`], retries when it is transient; every
+/// refusal the gate decides from what it read refuses on the first attempt.
+/// It sends no request while `retired` is empty. The deployment key comes
+/// from the configured scheme, as `--tenant-hash-key-file` gives it.
+pub async fn enforce_retired_reader_gate(
+    retry: &StartupRetry,
+    store: &dyn ObjectStoreBackend,
+    configured: &ConfiguredScheme,
+    retired: &[RetiredReader],
+    now_ns: i64,
+) -> anyhow::Result<GateOutcome> {
+    let deployment_key = match configured {
+        ConfiguredScheme::Keyed(key) => Some(key.as_ref()),
+        ConfiguredScheme::Unkeyed | ConfiguredScheme::Unspecified => None,
+    };
+    let outcome = retry
+        .run(
+            SITE_RETIRED_READER_GATE,
+            || crate::compat_gate::enforce(store, deployment_key, retired, now_ns),
+            |err: &CompatGateError| chain_is_transient(err),
+        )
+        .await
+        .map_err(|failure| {
+            failure.into_anyhow(|err| {
+                anyhow::Error::new(err).context("retired-reader gate (sys/compat) refused startup")
+            })
+        })?;
+    tracing::debug!(outcome = ?outcome, "retired-reader gate passed");
+    Ok(outcome)
+}
+
 /// Tenant-hash scheme resolution and marker bootstrap (ADR-0050 section 3),
 /// retried. The marker write is create-if-absent and a retry starts from the
 /// read, so a write that landed before an ambiguous failure is found by the
@@ -534,6 +570,9 @@ pub struct StartupStoreInputs<'a> {
     /// The concrete S3 store the bucket-protection read goes through.
     pub store_s3: Option<&'a S3Store>,
     pub tenancy: ConfiguredScheme,
+    /// The readers this build retired, which the retired-reader gate checks:
+    /// `compat_gate::RETIRED_READERS` in `main`.
+    pub retired_readers: &'a [RetiredReader],
     /// The KMS routing store and `--tenant-kms-config`, when that flag set
     /// up per-tenant SSE-KMS routing.
     pub tenant_kms: Option<(&'a KmsRoutingStore, &'a TenantKmsConfig)>,
@@ -544,6 +583,8 @@ pub struct StartupStoreInputs<'a> {
 
 /// What the startup store checks resolved.
 pub struct StartupStoreState {
+    /// Why the retired-reader gate let the process start.
+    pub retired_reader_gate: GateOutcome,
     pub tenancy: ResolvedTenancy,
     /// The statically known tenants, hashed under the installed scheme.
     pub static_tenants: Vec<TenantHash>,
@@ -551,10 +592,12 @@ pub struct StartupStoreState {
 }
 
 /// Every startup store check `main` makes before a listener binds, in order:
-/// qualification, the bucket-protection gate, tenancy pinning (and the scheme
-/// install), tenant key epochs, provisioning validation for the tenants
-/// `static_tenants` returns once the scheme is installed, and the `sys/gc`
-/// bootstrap. Every check but the bucket-protection gate, which has its own
+/// qualification, the bucket-protection gate, the retired-reader gate (before
+/// tenancy pinning, which writes `sys/tenancy` on a fresh store, because the
+/// gate tells a fresh store from an unadopted one by that marker's absence),
+/// tenancy pinning (and the scheme install), tenant key epochs, provisioning
+/// validation for the tenants `static_tenants` returns once the scheme is
+/// installed, and the `sys/gc` bootstrap. Every check but the bucket-protection gate, which has its own
 /// bound, runs under `retry`. The IPCrypt marker check is the one site left,
 /// inside `start`. `now_unix_ns` stamps the records the checks write.
 pub async fn run_startup_store_checks(
@@ -575,6 +618,14 @@ pub async fn run_startup_store_checks(
         inputs.require_bucket_protection,
         inputs.store_s3,
         store.as_ref(),
+    )
+    .await?;
+    let retired_reader_gate = enforce_retired_reader_gate(
+        retry,
+        store.as_ref(),
+        &inputs.tenancy,
+        inputs.retired_readers,
+        now_unix_ns(),
     )
     .await?;
     let tenancy = resolve_tenancy(retry, store.as_ref(), inputs.tenancy, now_unix_ns()).await?;
@@ -601,6 +652,7 @@ pub async fn run_startup_store_checks(
     )
     .await?;
     Ok(StartupStoreState {
+        retired_reader_gate,
         tenancy,
         static_tenants,
         gc,
