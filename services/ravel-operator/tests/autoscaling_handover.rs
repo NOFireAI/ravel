@@ -59,6 +59,12 @@ struct Scenario {
     hpa_delete_fails: bool,
     /// The HorizontalPodAutoscaler list answers 500.
     hpa_list_fails: bool,
+    /// Every listed HPA has since been deleted and recreated at the same name
+    /// by someone else, with a new uid: a DELETE preconditioned on the listed
+    /// uid answers 409, and an unconditioned one deletes the new HPA.
+    hpa_recreated_after_list: bool,
+    /// The RavelCluster's `metadata.generation`.
+    generation: i64,
 }
 
 impl Default for Scenario {
@@ -74,6 +80,8 @@ impl Default for Scenario {
             handover_conflicts: false,
             hpa_delete_fails: false,
             hpa_list_fails: false,
+            hpa_recreated_after_list: false,
+            generation: 1,
         }
     }
 }
@@ -119,7 +127,7 @@ fn cluster(scenario: &Scenario) -> Value {
             "namespace": NAMESPACE,
             "uid": CLUSTER_UID,
             "resourceVersion": "1",
-            "generation": 1,
+            "generation": scenario.generation,
         },
         "spec": spec,
         "status": status,
@@ -305,6 +313,7 @@ fn hpa_list_path() -> String {
 /// `desired_hpa` renders it.
 fn owned_hpa(component: &str) -> Value {
     let mut hpa = labelled_user_hpa(component);
+    hpa["metadata"]["uid"] = json!(listed_hpa_uid(component));
     hpa["metadata"]["ownerReferences"] = json!([{
         "apiVersion": "ravel.nofire.ai/v1alpha1",
         "kind": "RavelCluster",
@@ -313,6 +322,11 @@ fn owned_hpa(component: &str) -> Value {
         "controller": true,
     }]);
     hpa
+}
+
+/// The uid the HPA list reports for the operator's `component` HPA.
+fn listed_hpa_uid(component: &str) -> String {
+    format!("hpa-uid-{component}")
 }
 
 /// A user-created HPA at the colliding `<instance>-<component>` name that
@@ -468,6 +482,27 @@ async fn apiserver(
                 )
             } else {
                 json_response(StatusCode::OK, &hpa_list(&fake.scenario))
+            }
+        }
+        // The owned-HPA watch's initial list.
+        (&Method::GET, "/apis/autoscaling/v2/horizontalpodautoscalers") => json_response(
+            StatusCode::OK,
+            &empty_list("HorizontalPodAutoscalerList", "autoscaling/v2"),
+        ),
+        // The listed HPA was replaced by a same-named one with a new uid: the
+        // apiserver refuses a DELETE whose uid precondition names the old one.
+        (&Method::DELETE, p)
+            if fake.scenario.hpa_recreated_after_list
+                && p.starts_with(&format!("{}/", hpa_list_path())) =>
+        {
+            if body["preconditions"]["uid"].is_string() {
+                json_response(StatusCode::CONFLICT, &failure(409, "Conflict"))
+            } else {
+                json_response(
+                    StatusCode::OK,
+                    &json!({ "apiVersion": "v1", "kind": "Status", "metadata": {},
+                             "status": "Success", "code": 200 }),
+                )
             }
         }
         // Every HPA DELETE fails, to exercise the turn-off path failing before
@@ -752,6 +787,8 @@ async fn enabling_autoscaling_hands_replicas_over_before_dropping_them() {
         hpa["metadata"]["ownerReferences"][0]["kind"],
         "RavelCluster"
     );
+    // The uid is what makes the HPA the operator's on the next pass's list.
+    assert_eq!(hpa["metadata"]["ownerReferences"][0]["uid"], CLUSTER_UID);
     assert_eq!(
         hpa["metadata"]["labels"]["app.kubernetes.io/component"],
         "gateway"
@@ -1529,4 +1566,188 @@ async fn a_labelled_hpa_without_this_clusters_owner_reference_is_left_alone() {
             pass.summary()
         );
     }
+}
+
+/// The operator's HPA was replaced, between the pass's list and its delete, by
+/// a same-named HPA someone else created. Each delete of an owned HPA carries
+/// the uid the list read as a precondition, so the apiserver answers 409 and
+/// the new HPA survives; the 409 fails the pass like any failed delete. At
+/// turn-off that means no forced apply and the `autoscaledTiers` entry kept;
+/// in the orphan sweep, a `Degraded` pass. Fails against an unconditioned
+/// delete (`DeleteParams::default()`), which the fake answers by deleting the
+/// new HPA, after which the turn-off applies.
+#[tokio::test]
+async fn an_hpa_recreated_after_the_list_is_not_deleted() {
+    let turn_off = one_pass(Scenario {
+        gateway: json!({ "replicas": 1 }),
+        status: json!({ "autoscaledTiers": [entry("gateway", 1)] }),
+        live: BTreeMap::from([("gateway", live("gateway", 9, ReplicasOwner::Kubectl))]),
+        hpas: vec![owned_hpa("gateway")],
+        hpa_recreated_after_list: true,
+        ..Scenario::default()
+    })
+    .await;
+    let sweep = one_pass(Scenario {
+        gateway: json!({ "replicas": 3 }),
+        live: BTreeMap::from([("gateway", live("gateway", 3, ReplicasOwner::Operator))]),
+        hpas: vec![owned_hpa("gateway")],
+        hpa_recreated_after_list: true,
+        ..Scenario::default()
+    })
+    .await;
+    for (case, pass) in [("turn-off", &turn_off), ("orphan sweep", &sweep)] {
+        let deletes = pass.hpa_deletes("gateway");
+        let [(_, delete)] = deletes.as_slice() else {
+            panic!("{case}: one HPA delete expected: {:#?}", pass.summary());
+        };
+        assert_eq!(
+            delete.body["preconditions"],
+            json!({ "uid": listed_hpa_uid("gateway") }),
+            "{case}: the delete is conditioned on the listed uid"
+        );
+        let degraded = condition(pass.final_status(), "Degraded").expect("Degraded");
+        assert_eq!(degraded["status"], "True", "{case}");
+    }
+    assert!(
+        turn_off.applies("gateway").is_empty(),
+        "no forced apply after the refused delete: {:#?}",
+        turn_off.summary()
+    );
+    assert_eq!(
+        turn_off.final_status()["autoscaledTiers"],
+        json!([entry("gateway", 1)]),
+        "the entry is kept for the next pass"
+    );
+}
+
+/// An owned HPA the list returned without a uid: the delete cannot be
+/// conditioned on the listed uid, so it is not sent. At turn-off the tier
+/// fails before its forced apply and keeps its `autoscaledTiers` entry; in the
+/// orphan sweep the pass is `Degraded`. Both report reason
+/// `AutoscalingHpaUidMissing`. Fails against an implementation that sends an
+/// unconditioned delete when the uid is missing.
+#[tokio::test]
+async fn an_owned_hpa_listed_without_a_uid_is_not_deleted() {
+    let uid_less = || {
+        let mut hpa = owned_hpa("gateway");
+        if let Some(metadata) = hpa["metadata"].as_object_mut() {
+            metadata.remove("uid");
+        }
+        hpa
+    };
+    let turn_off = one_pass(Scenario {
+        gateway: json!({ "replicas": 1 }),
+        status: json!({ "autoscaledTiers": [entry("gateway", 1)] }),
+        live: BTreeMap::from([("gateway", live("gateway", 9, ReplicasOwner::Kubectl))]),
+        hpas: vec![uid_less()],
+        ..Scenario::default()
+    })
+    .await;
+    let sweep = one_pass(Scenario {
+        gateway: json!({ "replicas": 3 }),
+        live: BTreeMap::from([("gateway", live("gateway", 3, ReplicasOwner::Operator))]),
+        hpas: vec![uid_less()],
+        ..Scenario::default()
+    })
+    .await;
+    for (case, pass) in [("turn-off", &turn_off), ("orphan sweep", &sweep)] {
+        assert!(
+            pass.hpa_deletes("gateway").is_empty(),
+            "{case}: no HPA DELETE: {:#?}",
+            pass.summary()
+        );
+        let degraded = condition(pass.final_status(), "Degraded").expect("Degraded");
+        assert_eq!(degraded["reason"], "AutoscalingHpaUidMissing", "{case}");
+    }
+    assert!(
+        turn_off.applies("gateway").is_empty(),
+        "no forced apply: {:#?}",
+        turn_off.summary()
+    );
+    assert_eq!(
+        turn_off.final_status()["autoscaledTiers"],
+        json!([entry("gateway", 1)]),
+        "the entry is kept for the next pass"
+    );
+}
+
+/// A failed HPA list keeps the stored `hpaReplicas` and `AutoscalingDegraded`
+/// as they were, the condition's observedGeneration included, on a pass at a
+/// later generation. Fails against an implementation that rebuilds the
+/// condition from the stored message, which stamps generation 2.
+#[tokio::test]
+async fn a_failed_hpa_list_keeps_the_stored_hpa_report() {
+    let stored_degraded = json!({
+        "type": "AutoscalingDegraded", "status": "True", "observedGeneration": 1,
+        "lastTransitionTime": "2026-11-16T00:00:00Z",
+        "reason": "HorizontalPodAutoscalerNotScaling",
+        "message": "a HorizontalPodAutoscaler the operator renders reports it cannot scale \
+                    its tier: gateway: ScalingActive=False reason FailedGetResourceMetric: x",
+    });
+    let stored_replicas =
+        json!([{ "tier": "gateway", "desiredReplicas": 4, "currentReplicas": 3 }]);
+    let pass = one_pass(Scenario {
+        gateway: json!({ "replicas": 3, "resources": cpu_request(), "autoscaling": managed(2, 6) }),
+        status: json!({
+            "autoscaledTiers": [entry("gateway", 3)],
+            "hpaReplicas": stored_replicas,
+            "conditions": [stored_degraded],
+        }),
+        live: BTreeMap::from([("gateway", live("gateway", 3, ReplicasOwner::Kubectl))]),
+        hpas: vec![owned_hpa("gateway")],
+        hpa_list_fails: true,
+        generation: 2,
+        ..Scenario::default()
+    })
+    .await;
+    let status = pass.final_status();
+    assert_eq!(
+        condition(status, "Degraded").expect("Degraded")["reason"],
+        "AutoscalingHpaListFailed"
+    );
+    assert_eq!(
+        condition(status, "AutoscalingDegraded"),
+        Some(&stored_degraded),
+        "{status}"
+    );
+    assert_eq!(status["hpaReplicas"], stored_replicas, "{status}");
+}
+
+/// A cluster that has never used autoscaling (no block, no `autoscaledTiers`
+/// entry) does not need the HPA list, so a failing list changes nothing: every
+/// tier gets the same Deployment apply as on a pass whose list succeeds, at
+/// its declared count, no HPA is written, and the pass is not `Degraded`.
+#[tokio::test]
+async fn a_failed_hpa_list_leaves_a_cluster_without_autoscaling_untouched() {
+    let scenario = |hpa_list_fails| Scenario {
+        gateway: json!({ "replicas": 3 }),
+        query: json!({ "replicas": 2 }),
+        maintain: json!({ "replicas": 1 }),
+        live: BTreeMap::from([("gateway", live("gateway", 3, ReplicasOwner::Operator))]),
+        hpa_list_fails,
+        ..Scenario::default()
+    };
+    let listed = one_pass(scenario(false)).await;
+    let failed = one_pass(scenario(true)).await;
+    assert!(
+        !failed.find("GET", &hpa_list_path()).is_empty(),
+        "the pass listed HPAs: {:#?}",
+        failed.summary()
+    );
+    for (component, replicas) in [("gateway", 3), ("query", 2), ("maintain", 1)] {
+        let (_, apply) = failed.apply(component);
+        assert_forced_replicas(apply, replicas);
+        assert_eq!(
+            apply.body,
+            listed.apply(component).1.body,
+            "{component}: the same apply as with a working list"
+        );
+        assert!(failed.hpa_patches(component).is_empty());
+        assert!(failed.hpa_deletes(component).is_empty());
+    }
+    let status = failed.final_status();
+    assert!(condition(status, "Degraded").is_none(), "{status}");
+    assert_eq!(status["autoscaledTiers"], Value::Null);
+    assert_eq!(status["hpaReplicas"], Value::Null);
+    assert!(condition(status, "AutoscalingDegraded").is_none());
 }

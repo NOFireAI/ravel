@@ -12,15 +12,15 @@ use std::collections::BTreeMap;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::{
     CrossVersionObjectReference, HPAScalingPolicy, HPAScalingRules, HorizontalPodAutoscaler,
-    HorizontalPodAutoscalerBehavior, HorizontalPodAutoscalerSpec, MetricSpec, MetricTarget,
-    ResourceMetricSource,
+    HorizontalPodAutoscalerBehavior, HorizontalPodAutoscalerSpec, HorizontalPodAutoscalerStatus,
+    MetricSpec, MetricTarget, ResourceMetricSource,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde_json::{Value, json};
 
 use crate::crd::{
-    AffinityBackend, AutoscaledTier, AutoscalingMode, AutoscalingSpec, RavelClusterSpec,
-    RavelClusterStatus, ReplicaAdoption, ResourceRequirementsSpec, ScalableTier,
+    AffinityBackend, AutoscaledTier, AutoscalingMode, AutoscalingSpec, Condition, HpaReplicas,
+    RavelClusterSpec, RavelClusterStatus, ReplicaAdoption, ResourceRequirementsSpec, ScalableTier,
 };
 use crate::reconcile::{DeploymentTier, child_name, labels};
 
@@ -137,9 +137,18 @@ fn has_cpu_request(resources: Option<&ResourceRequirementsSpec>) -> bool {
         .any(|m| m.as_ref().is_some_and(|m| m.contains_key("cpu")))
 }
 
+/// Whether the tier is the maintain tier with `enabled: false`: the operator
+/// deletes its Deployment, so it is not autoscaled whatever its block says.
+fn tier_disabled(spec: &RavelClusterSpec, tier: DeploymentTier) -> bool {
+    tier == DeploymentTier::Maintain && !spec.maintain.enabled
+}
+
 /// Why the tier's `autoscaling` block is withheld, or `None` when the tier
-/// has no block or the block can apply.
+/// has no block, is disabled, or the block can apply.
 pub fn withheld_reason(spec: &RavelClusterSpec, tier: DeploymentTier) -> Option<WithheldReason> {
+    if tier_disabled(spec, tier) {
+        return None;
+    }
     let autoscaling = tier_autoscaling(spec, tier)?;
     let ingress_nginx = tier == DeploymentTier::Gateway
         && spec
@@ -173,7 +182,8 @@ pub fn tier_withheld_reason(
     withheld_reason(spec, tier).or_else(|| {
         let managed =
             tier_autoscaling(spec, tier).is_some_and(|a| a.mode == AutoscalingMode::Managed);
-        (managed && hpa_name_taken).then_some(WithheldReason::HpaNameTaken)
+        (managed && hpa_name_taken && !tier_disabled(spec, tier))
+            .then_some(WithheldReason::HpaNameTaken)
     })
 }
 
@@ -398,6 +408,15 @@ pub struct AutoscalingState {
     /// for the `AutoscalingWithheld` condition. Observed each pass, never
     /// persisted.
     hpa_name_taken: Vec<DeploymentTier>,
+    /// What the operator's own HPAs report: seeded from the stored
+    /// `hpaReplicas` and `AutoscalingDegraded` message, replaced when the
+    /// pass's HPA list succeeds, so a failed list keeps the previous report.
+    hpa_report: HpaReport,
+    /// The stored `AutoscalingDegraded` condition, written back unchanged
+    /// (observedGeneration included) while no listing has replaced the report.
+    stored_degraded: Option<Condition>,
+    /// Whether this pass's HPA list replaced the report.
+    hpa_report_listed: bool,
 }
 
 impl AutoscalingState {
@@ -411,7 +430,52 @@ impl AutoscalingState {
                 .and_then(|s| s.replica_adoptions.clone())
                 .unwrap_or_default(),
             hpa_name_taken: Vec::new(),
+            hpa_report: HpaReport {
+                replicas: status
+                    .and_then(|s| s.hpa_replicas.clone())
+                    .unwrap_or_default(),
+                degraded: status.and_then(|s| {
+                    s.conditions
+                        .iter()
+                        .find(|c| c.r#type == AUTOSCALING_DEGRADED_CONDITION && c.status == "True")
+                        .map(|c| c.message.clone())
+                }),
+            },
+            stored_degraded: status.and_then(|s| {
+                s.conditions
+                    .iter()
+                    .find(|c| c.r#type == AUTOSCALING_DEGRADED_CONDITION)
+                    .cloned()
+            }),
+            hpa_report_listed: false,
         }
+    }
+
+    /// Record what the pass's HPA list found the operator's own HPAs report.
+    pub fn set_hpa_report(&mut self, report: HpaReport) {
+        self.hpa_report = report;
+        self.hpa_report_listed = true;
+    }
+
+    /// The stored `AutoscalingDegraded` condition to write back as it was,
+    /// `None` once this pass's HPA list replaced the report (or when none is
+    /// stored).
+    pub fn kept_degraded_condition(&self) -> Option<&Condition> {
+        if self.hpa_report_listed {
+            None
+        } else {
+            self.stored_degraded.as_ref()
+        }
+    }
+
+    /// The `AutoscalingDegraded` message for this pass, `None` to clear it.
+    pub fn degraded_message(&self) -> Option<&str> {
+        self.hpa_report.degraded.as_deref()
+    }
+
+    /// `status.hpaReplicas`: `None` when empty, which clears it.
+    pub fn hpa_replicas(&self) -> Option<Vec<HpaReplicas>> {
+        (!self.hpa_report.replicas.is_empty()).then(|| self.hpa_report.replicas.clone())
     }
 
     /// Record the tiers this pass finds their HPA name taken on.
@@ -520,29 +584,48 @@ pub enum HpaAtName {
     Foreign,
 }
 
+/// One listed HPA. The uid and status are kept only for an HPA this
+/// RavelCluster owns: nothing else is read from another HPA.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ListedHpa {
+    owned: bool,
+    uid: Option<String>,
+    status: Option<HorizontalPodAutoscalerStatus>,
+}
+
 /// The namespace's HorizontalPodAutoscalers as one pass's list read them: each
-/// name and whether this RavelCluster owns it. Every HPA delete, and the check
-/// before a `Managed` HPA apply, is decided from this, never from the name
-/// alone.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// name and whether this RavelCluster owns it, plus the uid and status of each
+/// owned one. Every HPA delete, and the check before a `Managed` HPA apply, is
+/// decided from this, never from the name alone.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct HpaListing {
-    by_name: BTreeMap<String, bool>,
+    by_name: BTreeMap<String, ListedHpa>,
 }
 
 impl HpaListing {
     /// The listing of `hpas` for the RavelCluster `instance` with uid
     /// `cluster_uid`. With no uid nothing is owned.
     pub fn new<'a>(
-        hpas: impl IntoIterator<Item = &'a ObjectMeta>,
+        hpas: impl IntoIterator<Item = &'a HorizontalPodAutoscaler>,
         instance: &str,
         cluster_uid: Option<&str>,
     ) -> Self {
         let by_name = hpas
             .into_iter()
-            .filter_map(|meta| {
+            .filter_map(|hpa| {
+                let meta = &hpa.metadata;
                 let owned =
                     cluster_uid.is_some_and(|uid| hpa_is_operator_owned(meta, instance, uid));
-                meta.name.clone().map(|name| (name, owned))
+                let listed = if owned {
+                    ListedHpa {
+                        owned,
+                        uid: meta.uid.clone(),
+                        status: hpa.status.clone(),
+                    }
+                } else {
+                    ListedHpa::default()
+                };
+                meta.name.clone().map(|name| (name, listed))
             })
             .collect();
         Self { by_name }
@@ -552,18 +635,146 @@ impl HpaListing {
     pub fn at(&self, name: &str) -> HpaAtName {
         match self.by_name.get(name) {
             None => HpaAtName::Absent,
-            Some(true) => HpaAtName::Owned,
-            Some(false) => HpaAtName::Foreign,
+            Some(listed) if listed.owned => HpaAtName::Owned,
+            Some(_) => HpaAtName::Foreign,
         }
+    }
+
+    /// The uid the listing read for the owned HPA `name`, the delete
+    /// precondition that keeps a same-named HPA created after the list from
+    /// being deleted in its place.
+    pub fn owned_uid(&self, name: &str) -> Option<&str> {
+        self.by_name
+            .get(name)
+            .filter(|listed| listed.owned)
+            .and_then(|listed| listed.uid.as_deref())
     }
 
     /// The names of the HPAs this RavelCluster owns.
     pub fn owned(&self) -> impl Iterator<Item = &str> {
         self.by_name
             .iter()
-            .filter(|(_, owned)| **owned)
+            .filter(|(_, listed)| listed.owned)
             .map(|(name, _)| name.as_str())
     }
+
+    /// The status of each of `tiers`' HPAs that this RavelCluster owns
+    /// (ADR-4314 decision 5). A tier whose HPA is absent or not owned
+    /// contributes nothing.
+    pub fn report(
+        &self,
+        instance: &str,
+        tiers: impl IntoIterator<Item = DeploymentTier>,
+    ) -> HpaReport {
+        let mut replicas = Vec::new();
+        let mut problems = Vec::new();
+        for tier in tiers {
+            let Some(listed) = self
+                .by_name
+                .get(&hpa_name(instance, tier))
+                .filter(|listed| listed.owned)
+            else {
+                continue;
+            };
+            let status = listed.status.as_ref();
+            replicas.push(HpaReplicas {
+                tier: tier.into(),
+                desired_replicas: status.map(|s| s.desired_replicas),
+                current_replicas: status.and_then(|s| s.current_replicas),
+            });
+            let conditions = status
+                .and_then(|s| s.conditions.as_deref())
+                .unwrap_or_default();
+            problems.extend(
+                conditions
+                    .iter()
+                    .filter(|c| {
+                        HPA_CANNOT_SCALE_CONDITIONS.contains(&c.type_.as_str())
+                            && c.status == "False"
+                    })
+                    .map(|c| {
+                        format!(
+                            "{}: {}=False reason {}: {}",
+                            tier.component(),
+                            c.type_,
+                            c.reason.as_deref().unwrap_or("(none)"),
+                            c.message.as_deref().unwrap_or("(none)"),
+                        )
+                    }),
+            );
+        }
+        HpaReport {
+            replicas,
+            degraded: (!problems.is_empty()).then(|| {
+                format!(
+                    "a HorizontalPodAutoscaler the operator renders reports it cannot scale \
+                     its tier: {}",
+                    problems.join("; ")
+                )
+            }),
+        }
+    }
+}
+
+/// The HPA conditions that, `False`, mean the HPA is not scaling its tier:
+/// `ScalingActive=False` (it cannot compute a count, typically because it
+/// cannot read metrics) and `AbleToScale=False` (it cannot read or update the
+/// scale target). `ScalingLimited` is not one of them: it is `True` when the
+/// computed count is held to `minReplicas` or `maxReplicas`, which is normal.
+const HPA_CANNOT_SCALE_CONDITIONS: [&str; 2] = ["ScalingActive", "AbleToScale"];
+
+/// The predicate key of the owned-HPA watch: a hash of what the operator
+/// reports from or acts on, so an HPA event triggers a reconcile only when
+/// one of these changes. `metadata.generation`, `status.desiredReplicas`,
+/// `status.currentReplicas`, the type and status of the `ScalingActive` and
+/// `AbleToScale` conditions, and a condition's reason while its status is not
+/// `True` ([`HpaListing::report`] reads it at `False`). A `True` condition's
+/// reason is left out: the HPA controller moves `AbleToScale=True` between
+/// `ReadyForNewScale`, `ScaleUpStabilized` and `ScaleDownStabilized` on its
+/// syncs with nothing reported changing. So are the `currentMetrics` and
+/// `lastScaleTime` it rewrites on its syncs, and a condition's message: a
+/// message-only change reaches status at the next pass that reads the HPAs.
+/// The API server sets and bumps an HPA's generation only where its
+/// `HPAGeneration` feature gate is on; elsewhere a spec edit moves no key
+/// field and is reverted by the next pass that renders the HPA.
+pub fn hpa_report_key(hpa: &HorizontalPodAutoscaler) -> Option<u64> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let status = hpa.status.as_ref();
+    let mut conditions: Vec<(&str, &str, Option<&str>)> = status
+        .and_then(|s| s.conditions.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .filter(|c| HPA_CANNOT_SCALE_CONDITIONS.contains(&c.type_.as_str()))
+        .map(|c| {
+            let reason = c.reason.as_deref().filter(|_| c.status != "True");
+            (c.type_.as_str(), c.status.as_str(), reason)
+        })
+        .collect();
+    conditions.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    (
+        hpa.metadata.generation,
+        status.map(|s| s.desired_replicas),
+        status.and_then(|s| s.current_replicas),
+        conditions,
+    )
+        .hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// The `AutoscalingDegraded` condition type (ADR-4314 decision 5).
+pub const AUTOSCALING_DEGRADED_CONDITION: &str = "AutoscalingDegraded";
+
+/// What the operator's own HPAs report: the `status.hpaReplicas` entries and
+/// the `AutoscalingDegraded` message, `None` when none reports
+/// `ScalingActive=False` or `AbleToScale=False`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HpaReport {
+    /// One entry per tier with an owned HPA, in tier order.
+    pub replicas: Vec<HpaReplicas>,
+    /// The `AutoscalingDegraded` message.
+    pub degraded: Option<String>,
 }
 
 /// The `Managed` HPA for a tier (ADR-4314 decision 4), or `None` when the
@@ -1110,6 +1321,7 @@ mod tests {
             name: Some("rc-query".to_string()),
             ..ObjectMeta::default()
         };
+        let (owned, user) = (with_meta(owned), with_meta(user));
         let listing = HpaListing::new([&owned, &user], "rc", Some("uid-rc"));
         assert_eq!(listing.at("rc-gateway"), HpaAtName::Owned);
         assert_eq!(listing.at("rc-query"), HpaAtName::Foreign);
@@ -1119,6 +1331,282 @@ mod tests {
         let no_uid = HpaListing::new([&owned], "rc", None);
         assert_eq!(no_uid.at("rc-gateway"), HpaAtName::Foreign);
         assert_eq!(no_uid.owned().count(), 0);
+    }
+
+    fn with_meta(metadata: ObjectMeta) -> HorizontalPodAutoscaler {
+        HorizontalPodAutoscaler {
+            metadata,
+            ..HorizontalPodAutoscaler::default()
+        }
+    }
+
+    /// An HPA at `<rc>-<component>` with `status` (JSON), owned by uid-rc when
+    /// `owned`.
+    fn listed(component: &str, owned: bool, status: Value) -> HorizontalPodAutoscaler {
+        let mut hpa = with_meta(ObjectMeta {
+            name: Some(format!("rc-{component}")),
+            uid: Some(format!("hpa-uid-{component}")),
+            labels: Some(labels("rc", component)),
+            owner_references: owned.then(|| {
+                vec![OwnerReference {
+                    uid: "uid-rc".to_string(),
+                    ..OwnerReference::default()
+                }]
+            }),
+            ..ObjectMeta::default()
+        });
+        hpa.status = serde_json::from_value(status).expect("HPA status parses");
+        hpa
+    }
+
+    fn hpa_condition(kind: &str, status: &str, reason: &str) -> Value {
+        json!({ "type": kind, "status": status, "reason": reason, "message": format!("{kind} says {reason}") })
+    }
+
+    #[test]
+    fn listing_keeps_the_uid_of_owned_hpas_only() {
+        let owned = listed("gateway", true, Value::Null);
+        let user = listed("query", false, Value::Null);
+        let listing = HpaListing::new([&owned, &user], "rc", Some("uid-rc"));
+        assert_eq!(listing.owned_uid("rc-gateway"), Some("hpa-uid-gateway"));
+        assert_eq!(listing.owned_uid("rc-query"), None);
+        assert_eq!(listing.owned_uid("rc-maintain"), None);
+    }
+
+    #[test]
+    fn report_reads_owned_hpas_and_only_the_two_cannot_scale_conditions() {
+        let gateway = listed(
+            "gateway",
+            true,
+            json!({ "desiredReplicas": 4, "currentReplicas": 3, "conditions": [
+                hpa_condition("AbleToScale", "True", "SucceededGetScale"),
+                hpa_condition("ScalingActive", "False", "FailedGetResourceMetric"),
+                hpa_condition("ScalingLimited", "True", "TooManyReplicas"),
+            ]}),
+        );
+        // At maxReplicas: ScalingLimited=True and nothing else wrong.
+        let query = listed(
+            "query",
+            true,
+            json!({ "desiredReplicas": 6, "currentReplicas": 6, "conditions": [
+                hpa_condition("AbleToScale", "True", "ReadyForNewScale"),
+                hpa_condition("ScalingActive", "True", "ValidMetricFound"),
+                hpa_condition("ScalingLimited", "True", "TooManyReplicas"),
+            ]}),
+        );
+        // Not owned: never read, whatever it reports.
+        let maintain = listed(
+            "maintain",
+            false,
+            json!({ "desiredReplicas": 1, "conditions": [
+                hpa_condition("AbleToScale", "False", "FailedGetScale"),
+            ]}),
+        );
+        let listing = HpaListing::new([&gateway, &query, &maintain], "rc", Some("uid-rc"));
+        let report = listing.report("rc", TIERS);
+        assert_eq!(
+            report.replicas,
+            vec![
+                HpaReplicas {
+                    tier: ScalableTier::Gateway,
+                    desired_replicas: Some(4),
+                    current_replicas: Some(3),
+                },
+                HpaReplicas {
+                    tier: ScalableTier::Query,
+                    desired_replicas: Some(6),
+                    current_replicas: Some(6),
+                },
+            ]
+        );
+        assert_eq!(
+            report.degraded.as_deref(),
+            Some(
+                "a HorizontalPodAutoscaler the operator renders reports it cannot scale its \
+                 tier: gateway: ScalingActive=False reason FailedGetResourceMetric: \
+                 ScalingActive says FailedGetResourceMetric"
+            )
+        );
+
+        // AbleToScale=False on an owned HPA counts; a tier left out of
+        // `tiers` is not reported.
+        let stuck = listed(
+            "maintain",
+            true,
+            json!({ "desiredReplicas": 2, "conditions": [
+                hpa_condition("AbleToScale", "False", "FailedGetScale"),
+            ]}),
+        );
+        let listing = HpaListing::new([&stuck], "rc", Some("uid-rc"));
+        let report = listing.report("rc", [DeploymentTier::Maintain]);
+        let message = report.degraded.expect("AbleToScale=False degrades");
+        assert!(
+            message.contains("maintain: AbleToScale=False reason FailedGetScale"),
+            "{message}"
+        );
+        assert_eq!(report.replicas[0].current_replicas, None);
+        assert_eq!(listing.report("rc", [GATEWAY]), HpaReport::default());
+    }
+
+    /// An owned HPA as the watch sees it under load: both reported
+    /// conditions, a `ScalingLimited` one, and the per-sync fields.
+    fn watched_hpa() -> Value {
+        json!({
+            "metadata": { "name": "rc-gateway", "uid": "hpa-uid-gateway", "generation": 1 },
+            "status": {
+                "desiredReplicas": 4,
+                "currentReplicas": 3,
+                "lastScaleTime": "2026-11-17T00:00:00Z",
+                "currentMetrics": [{ "type": "Resource", "resource": { "name": "cpu",
+                    "current": { "averageUtilization": 71, "averageValue": "355m" } } }],
+                "conditions": [
+                    hpa_condition("AbleToScale", "True", "ReadyForNewScale"),
+                    hpa_condition("ScalingActive", "True", "ValidMetricFound"),
+                    hpa_condition("ScalingLimited", "False", "DesiredWithinRange"),
+                ],
+            },
+        })
+    }
+
+    fn report_key(hpa: &Value) -> Option<u64> {
+        hpa_report_key(&serde_json::from_value(hpa.clone()).expect("HPA parses"))
+    }
+
+    /// A named edit to [`watched_hpa`].
+    type HpaEdit = (&'static str, fn(&mut Value));
+
+    /// The owned-HPA watch's predicate key ignores what the HPA controller
+    /// rewrites on its syncs (`currentMetrics`, `lastScaleTime`, the reason
+    /// of a `True` `AbleToScale` or `ScalingActive`), a reported condition's
+    /// message and the `ScalingLimited` condition, and moves with the
+    /// generation, both replica counts, the status of `ScalingActive` and
+    /// `AbleToScale`, and their reason while it is not `True`.
+    #[test]
+    fn hpa_report_key_moves_only_with_what_the_operator_reports() {
+        let base = report_key(&watched_hpa());
+        assert!(base.is_some(), "every HPA has a key");
+        let unchanged: [HpaEdit; 7] = [
+            ("currentMetrics", |h| {
+                h["status"]["currentMetrics"][0]["resource"]["current"]["averageUtilization"] =
+                    json!(93);
+            }),
+            ("lastScaleTime", |h| {
+                h["status"]["lastScaleTime"] = json!("2026-11-17T00:05:00Z");
+            }),
+            ("ScalingActive message", |h| {
+                h["status"]["conditions"][1]["message"] = json!("a different message");
+            }),
+            ("AbleToScale=True reason", |h| {
+                h["status"]["conditions"][0]["reason"] = json!("ScaleDownStabilized");
+            }),
+            ("ScalingActive=True reason", |h| {
+                h["status"]["conditions"][1]["reason"] = json!("ValidMetricFoundAgain");
+            }),
+            ("ScalingLimited status", |h| {
+                h["status"]["conditions"][2]["status"] = json!("True");
+                h["status"]["conditions"][2]["reason"] = json!("TooManyReplicas");
+            }),
+            ("conditions reordered", |h| {
+                let conditions = h["status"]["conditions"]
+                    .as_array_mut()
+                    .expect("conditions");
+                conditions.swap(0, 1);
+            }),
+        ];
+        for (case, change) in unchanged {
+            let mut hpa = watched_hpa();
+            change(&mut hpa);
+            assert_eq!(report_key(&hpa), base, "{case} must not move the key");
+        }
+        let changed: [HpaEdit; 5] = [
+            ("generation", |h| h["metadata"]["generation"] = json!(2)),
+            ("desiredReplicas", |h| {
+                h["status"]["desiredReplicas"] = json!(5)
+            }),
+            ("currentReplicas", |h| {
+                h["status"]["currentReplicas"] = json!(4)
+            }),
+            ("ScalingActive status True to False", |h| {
+                h["status"]["conditions"][1]["status"] = json!("False");
+            }),
+            ("AbleToScale status True to False", |h| {
+                h["status"]["conditions"][0]["status"] = json!("False");
+            }),
+        ];
+        for (case, change) in changed {
+            let mut hpa = watched_hpa();
+            change(&mut hpa);
+            assert_ne!(report_key(&hpa), base, "{case} must move the key");
+        }
+
+        // With both conditions `False`, a reason change is a change in what
+        // `AutoscalingDegraded` reports.
+        let mut failing = watched_hpa();
+        failing["status"]["conditions"][0] =
+            hpa_condition("AbleToScale", "False", "FailedGetScale");
+        failing["status"]["conditions"][1] =
+            hpa_condition("ScalingActive", "False", "FailedGetResourceMetric");
+        let failing_key = report_key(&failing);
+        let false_reason: [HpaEdit; 2] = [
+            ("AbleToScale=False reason", |h| {
+                h["status"]["conditions"][0]["reason"] = json!("FailedUpdateScale");
+            }),
+            ("ScalingActive=False reason", |h| {
+                h["status"]["conditions"][1]["reason"] = json!("InvalidMetricSourceType");
+            }),
+        ];
+        for (case, change) in false_reason {
+            let mut hpa = failing.clone();
+            change(&mut hpa);
+            assert_ne!(report_key(&hpa), failing_key, "{case} must move the key");
+        }
+    }
+
+    #[test]
+    fn state_keeps_the_stored_report_until_a_listing_replaces_it() {
+        let status: RavelClusterStatus = serde_json::from_value(json!({
+            "hpaReplicas": [{ "tier": "gateway", "desiredReplicas": 2, "currentReplicas": 2 }],
+            "conditions": [{ "type": AUTOSCALING_DEGRADED_CONDITION, "status": "True",
+                "reason": "r", "message": "gateway: stuck" }],
+        }))
+        .expect("status parses");
+        let mut state = AutoscalingState::from_status(Some(&status));
+        assert_eq!(state.degraded_message(), Some("gateway: stuck"));
+        assert_eq!(state.hpa_replicas(), status.hpa_replicas);
+        assert_eq!(state.kept_degraded_condition(), status.conditions.first());
+        state.set_hpa_report(HpaReport::default());
+        assert_eq!(state.degraded_message(), None);
+        assert_eq!(state.hpa_replicas(), None);
+        assert_eq!(state.kept_degraded_condition(), None);
+    }
+
+    /// A disabled maintain tier is not autoscaled, so neither its spec nor a
+    /// taken HPA name names it in `AutoscalingWithheld`.
+    #[test]
+    fn a_disabled_maintain_tier_is_never_withheld() {
+        let maintain = json!({
+            "enabled": false,
+            "resources": { "requests": { "memory": "1Gi" } },
+            "autoscaling": managed(),
+        });
+        let disabled = spec_with(json!({}), maintain.clone());
+        assert_eq!(withheld_reason(&disabled, DeploymentTier::Maintain), None);
+        assert_eq!(
+            tier_withheld_reason(&disabled, DeploymentTier::Maintain, true),
+            None
+        );
+        assert_eq!(
+            withheld_message(&disabled, &[DeploymentTier::Maintain]),
+            None
+        );
+        // The same block on an enabled tier is withheld.
+        let mut enabled_maintain = maintain;
+        enabled_maintain["enabled"] = json!(true);
+        let enabled = spec_with(json!({}), enabled_maintain);
+        assert_eq!(
+            withheld_reason(&enabled, DeploymentTier::Maintain),
+            Some(WithheldReason::NoCpuRequest)
+        );
     }
 
     #[test]
