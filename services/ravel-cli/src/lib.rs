@@ -8,6 +8,7 @@
 pub mod agents;
 pub mod catalog;
 pub mod cli_profiling;
+pub mod compat;
 pub mod erase;
 pub mod export;
 #[cfg(test)]
