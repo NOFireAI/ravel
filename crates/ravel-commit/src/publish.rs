@@ -165,7 +165,7 @@ pub async fn assert_commit_has_data(store: &dyn ObjectStoreBackend, record: &Com
 
 /// [`assert_commit_has_data`], with the HEAD raced against the future
 /// `give_up` returns: a HEAD that loses the race evaluates nothing. The
-/// default build calls neither.
+/// default build compiles the HEAD out.
 pub async fn assert_commit_has_data_unless<G, F>(
     store: &dyn ObjectStoreBackend,
     record: &CommitRecord,
@@ -207,6 +207,7 @@ where
         }
         Err(_) => false,
     };
+    let _ = has_data;
     ravel_invariant::inv_always!(
         has_data,
         "commit: a commit record never exists without its data object",
