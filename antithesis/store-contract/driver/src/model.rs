@@ -684,6 +684,7 @@ mod tests {
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{
         Capabilities, DelimitedList, GetOutcome, ListPage, MultipartUpload, ObjectMeta,
+        UploadChecksum,
     };
 
     use super::*;
@@ -698,7 +699,7 @@ mod tests {
         format!("cv-{:016x}", h.finish())
     }
 
-    /// A `MemoryStore` with one `put` quirk, to model a real backend's edge:
+    /// A `MemoryStore` with one quirk, to model a real backend's edge:
     /// - `AppliesThenRefusesFirstCas`: the first `CasVersion` put applies its
     ///   bytes and is then answered `PreconditionFailed`, as object_store's
     ///   retry of a CAS that already landed (a 5xx/409 retry) is.
@@ -708,6 +709,13 @@ mod tests {
     ///   the store would (against content versions when `reuse`, else as an
     ///   overwrite) and is then answered `answer()`, as a CAS whose response
     ///   was lost or retried is. Every other put is stored as `reuse` selects.
+    /// - `MintsUnreadableVersion`: every put stores its bytes but reports a
+    ///   version a following get never returns, modelling a store that violates
+    ///   read-after-write on the version alone (the bytes round-trip).
+    /// - `LeaksMultipartPart`: `put_multipart` returns an upload that publishes
+    ///   each staged part under the key before `complete`, modelling a store
+    ///   that violates multipart's invisible-until-complete contract. `put` is
+    ///   unquirked.
     enum PutQuirk {
         AppliesThenRefusesFirstCas(AtomicUsize),
         ContentVersion,
@@ -715,6 +723,8 @@ mod tests {
             reuse: bool,
             answer: fn() -> StoreError,
         },
+        MintsUnreadableVersion,
+        LeaksMultipartPart,
     }
 
     struct QuirkStore {
@@ -809,6 +819,14 @@ mod tests {
                         other => other,
                     }
                 }
+                PutQuirk::MintsUnreadableVersion => {
+                    let out = self.inner.put(key, data, opts).await?;
+                    Ok(PutOutcome {
+                        version: Version(format!("phantom-{}", out.version.0)),
+                        ..out
+                    })
+                }
+                PutQuirk::LeaksMultipartPart => self.inner.put(key, data, opts).await,
             }
         }
 
@@ -820,7 +838,15 @@ mod tests {
             &'a self,
             key: &str,
         ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
-            self.inner.put_multipart(key).await
+            let inner = self.inner.put_multipart(key).await?;
+            match &self.quirk {
+                PutQuirk::LeaksMultipartPart => Ok(Box::new(LeakyUpload {
+                    inner,
+                    store: self.inner.as_ref(),
+                    key: key.to_string(),
+                })),
+                _ => Ok(inner),
+            }
         }
 
         async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
@@ -845,6 +871,39 @@ mod tests {
 
         fn capabilities(&self) -> Capabilities {
             self.inner.capabilities()
+        }
+    }
+
+    /// A multipart upload that publishes each part under the key as it is
+    /// staged, before `complete`, so a staged part is visible to a read and a
+    /// listing. `complete` and `abort` still delegate to the real upload, so
+    /// the only contract it breaks is invisible-until-complete.
+    struct LeakyUpload<'a> {
+        inner: Box<dyn MultipartUpload + 'a>,
+        store: &'a MemoryStore,
+        key: String,
+    }
+
+    #[async_trait]
+    impl MultipartUpload for LeakyUpload<'_> {
+        async fn put_part(
+            &mut self,
+            data: Bytes,
+            checksum: Option<UploadChecksum>,
+        ) -> Result<(), StoreError> {
+            self.inner.put_part(data.clone(), checksum).await?;
+            self.store
+                .put(&self.key, data, PutOptions::default())
+                .await?;
+            Ok(())
+        }
+
+        async fn complete(&mut self) -> Result<PutOutcome, StoreError> {
+            self.inner.complete().await
+        }
+
+        async fn abort(&mut self) -> Result<(), StoreError> {
+            self.inner.abort().await
         }
     }
 
@@ -948,6 +1007,50 @@ mod tests {
         assert!(!v.holds, "{}", v.details);
         assert_eq!(v.details["ended"], json!(false));
         assert_eq!(v.details["pages"], json!(4));
+    }
+
+    #[test]
+    fn a_version_a_read_does_not_return_is_caught() {
+        let rt = rt();
+        // The store stores each put's bytes but reports a version the following
+        // get never returns. The bytes round-trip, so read_after_write reds on
+        // the version comparison alone: dropping that comparison from its `ok`
+        // turns this case green, so this test fails against that inversion.
+        let s = QuirkStore::wrapped(PutQuirk::MintsUnreadableVersion);
+        let v = rt
+            .block_on(read_after_write(&s, "raw", 3))
+            .expect("read_after_write conclusive");
+        assert!(
+            !v.holds,
+            "read-after-write held though put's version was never read back: {}",
+            v.details
+        );
+        // The bytes did round-trip: only the version differs, so the red is the
+        // version comparison and nothing else.
+        assert_eq!(v.details["checked"][0]["read"]["data"], json!("raw/w0"));
+    }
+
+    #[test]
+    fn a_multipart_part_visible_before_complete_is_caught() {
+        let rt = rt();
+        // The upload publishes its one staged part under the key before
+        // complete, so the staged part is visible to a read and a listing.
+        // complete still assembles the whole object, so `end` is ok and the red
+        // is invisible_before alone: dropping invisible_before from `holds`
+        // turns this case green, so this test fails against that inversion.
+        let s = QuirkStore::wrapped(PutQuirk::LeaksMultipartPart);
+        let small = vec![Bytes::from_static(b"leaked part")];
+        let v = rt
+            .block_on(multipart(&s, "mp", &small, true))
+            .expect("multipart conclusive");
+        assert!(
+            !v.holds,
+            "multipart held though a staged part was visible before complete: {}",
+            v.details
+        );
+        assert_eq!(v.details["invisible_after_each_part"], json!([false]));
+        // The completed object is still whole, so only invisible_before reds.
+        assert_eq!(v.details["end"]["ok"], json!(true));
     }
 
     #[test]
