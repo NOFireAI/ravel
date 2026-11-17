@@ -6,25 +6,6 @@
 # A listing file holds one key per line: "<key>\t<LastModified>\t<size>",
 # LastModified as ISO 8601 UTC (what ListObjectsV2 returns).
 
-# Class of a key for tenant hash $2:
-#   fenced  t/<h>/{m,l,s}/... and t/<h>/catalog/{m,l,s}/...: a provisioned
-#           (tenant, signal) whose record the drill raises to version 4
-#   alerts  t/<h>/a/...: fenced by the parked alert lease
-#   audit   t/<h>/u/...: not fenced (ADR-4233 decision 4, "audit: not fenced")
-#   tenant  any other t/<h>/... key
-#   other   everything else (sys/, other tenants)
-drill_classify() {
-  local key=$1 h=$2
-  case "$key" in
-    "t/$h/m/"* | "t/$h/l/"* | "t/$h/s/"*) echo fenced ;;
-    "t/$h/catalog/m/"* | "t/$h/catalog/l/"* | "t/$h/catalog/s/"*) echo fenced ;;
-    "t/$h/a/"*) echo alerts ;;
-    "t/$h/u/"*) echo audit ;;
-    "t/$h/"*) echo tenant ;;
-    *) echo other ;;
-  esac
-}
-
 # Keys written between two listings: present in $2 and absent from $1, or
 # present in both with a different LastModified or size (an overwrite).
 # Prints "<key>\t<LastModified>\t<size>" lines from $2.
@@ -54,6 +35,15 @@ drill_epoch() {
 drill_ingest_horizon() {
   local fence=$1 margin=$2
   echo $(( (fence / 3600 + 3) * 3600 + margin ))
+}
+
+# The last second a running v0.33.0 router may still accept ingest for a
+# fence written at Unix second $1: its cached view is trusted until
+# hour_of(R) + 2 with R <= the fence, so (hour_of(fence) + 2) * 3600 bounds
+# every R. A process started after the fence has no view to trust; its limit
+# is the fence itself, which the caller passes instead.
+drill_trust_limit() {
+  echo $(( ($1 / 3600 + 2) * 3600 ))
 }
 
 # Count of keys in listing $1 whose key starts with $2.
@@ -104,38 +94,6 @@ drill_exempt() {
   return 1
 }
 
-# Late writes: from the written-keys file $1 (drill_written_keys output),
-# every key of class fenced or alerts for tenant hash $2 whose LastModified is
-# strictly after Unix second $3 (fenced) or $4 (alerts), unless it matches an
-# exempt pattern of $5. Prints "late <class> <key> <LastModified>" per late
-# write and "exempt <class> <key> <LastModified> after|within" per exempt
-# write of either class (recorded, never a failure); returns 1 when any late
-# write exists.
-drill_late_writes() {
-  local written=$1 h=$2 fenced_after=$3 alerts_after=$4 exempt=${5:-} key lm size class t limit found=0
-  while IFS=$'\t' read -r key lm size; do
-    [ -n "$key" ] || continue
-    class=$(drill_classify "$key" "$h")
-    case "$class" in
-      fenced) limit=$fenced_after ;;
-      alerts) limit=$alerts_after ;;
-      *) continue ;;
-    esac
-    t=$(drill_epoch "$lm")
-    if drill_exempt "$key" "$h" "$exempt"; then
-      if [ "$t" -gt "$limit" ]; then
-        echo "exempt $class $key $lm after"
-      else
-        echo "exempt $class $key $lm within"
-      fi
-    elif [ "$t" -gt "$limit" ]; then
-      echo "late $class $key $lm"
-      found=1
-    fi
-  done < "$written"
-  return "$found"
-}
-
 # Trailer the release writes for a data object under signal prefix $1:
 # "<magic> <version>". RSEG 7 for metrics, RLOG 5 for logs and alerts,
 # RSPAN 5 for spans (v0.33.0 ravel-ingest config.rs).
@@ -164,77 +122,6 @@ drill_commit_data_key() {
      END { exit n == 1 ? 0 : 1 }' "$listing"
 }
 
-# Teardown writes: the keys of written-keys file $1 (drill_written_keys
-# between the last running listing and the one after the processes stopped)
-# for tenant hash $2. $3 is the post-stop listing, $4 a trailer file of
-# "<key>\t<magic>\t<version>" lines, $5 the exempt patterns. Every fenced or
-# alerts key must be one of:
-#   exempt          an exempt pattern: recorded
-#   data object     <sig>/l0/.../*.rseg whose trailer is the release's
-#   commit record   <sig>/c/.../*.cmt whose paired data object (in $3) has
-#                   the release's trailer
-# Anything else fails, since no version rule covers it. Prints one
-# "teardown-ok|teardown-exempt|teardown-bad <what> <key> <LastModified> ..."
-# line per key; returns 1 when any line is teardown-bad.
-drill_teardown_check() {
-  local written=$1 h=$2 listing=$3 trailers=$4 exempt=${5:-} key lm size class rel sig want got data found=0
-  while IFS=$'\t' read -r key lm size; do
-    [ -n "$key" ] || continue
-    class=$(drill_classify "$key" "$h")
-    case "$class" in
-      fenced | alerts) ;;
-      *) continue ;;
-    esac
-    if drill_exempt "$key" "$h" "$exempt"; then
-      echo "teardown-exempt $class $key $lm"
-      continue
-    fi
-    rel=${key#"t/$h/"}
-    case "$rel" in
-      catalog/*) sig="" ;;
-      *) sig=${rel%%/*} ;;
-    esac
-    case "$rel" in
-      */l0/*.rseg)
-        data=$key
-        ;;
-      */c/*.cmt)
-        if ! data=$(drill_commit_data_key "$key" "$listing"); then
-          echo "teardown-bad commit $key $lm no single paired data object"
-          found=1
-          continue
-        fi
-        ;;
-      *)
-        echo "teardown-bad other $key $lm no version rule covers this key"
-        found=1
-        continue
-        ;;
-    esac
-    want=$(drill_release_trailer "$sig") || {
-      echo "teardown-bad other $key $lm no release trailer for signal '$sig'"
-      found=1
-      continue
-    }
-    got=$(awk -F'\t' -v k="$data" '$1 == k { print $2 " " $3; n++ } END { exit n == 1 ? 0 : 1 }' "$trailers") || {
-      echo "teardown-bad data $key $lm trailer of $data not read"
-      found=1
-      continue
-    }
-    if [ "$got" = "$want" ]; then
-      if [ "$data" = "$key" ]; then
-        echo "teardown-ok data $key $lm $got"
-      else
-        echo "teardown-ok commit $key $lm data=$data $got"
-      fi
-    else
-      echo "teardown-bad version $key $lm data=$data trailer '$got' want '$want'"
-      found=1
-    fi
-  done < "$written"
-  return "$found"
-}
-
 # Positive control (a): every write path the drill drives landed keys, per
 # prefix under t/<h>/. Appends "figure <name> <count>" lines to report $3
 # and checks each is present once and at least 1; returns 1 otherwise.
@@ -257,4 +144,217 @@ pc_ready() {
   for p in $PC_PREFIXES; do
     [ "$(drill_count_prefix "$listing" "t/$h/$p")" -ge 1 ] || return 1
   done
+}
+
+# Post-fence events over a chain of listings taken in time order: $1 is the
+# phase name (running or teardown), $2 the fence's Unix second, $3.. the
+# listings. Prints "<op>\t<key>\t<LastModified>\t<phase>" once per distinct
+# event: op "write" for a key some pair shows written with a LastModified
+# after the fence, "remove" (LastModified of the last listing that held it)
+# for a key some pair shows removed. A key written and removed between two
+# listings is invisible here, which is why the drill lists the warm bucket
+# more than once while it runs.
+drill_post_fence_events() {
+  local phase=$1 fence=$2 prev="" cur key lm size
+  shift 2
+  for cur in "$@"; do
+    if [ -n "$prev" ]; then
+      drill_written_keys "$prev" "$cur" | while IFS=$'\t' read -r key lm size; do
+        if [ "$(drill_epoch "$lm")" -gt "$fence" ]; then
+          printf 'write\t%s\t%s\t%s\n' "$key" "$lm" "$phase"
+        fi
+      done
+      drill_removed_keys "$prev" "$cur" | while IFS=$'\t' read -r key lm size; do
+        printf 'remove\t%s\t%s\t%s\n' "$key" "$lm" "$phase"
+      done
+    fi
+    prev=$cur
+  done | awk '!seen[$0]++'
+}
+
+# Class of one post-fence event (ADR-4233 decision 4 enumeration on issue
+# #4243, revised pre-registration): op $1, key $2, LastModified $3, phase $4,
+# tenant hash $5, ingest horizon $6, alerts horizon $7 (Unix seconds), exempt
+# patterns $8 (drill_exempt globs).
+#   root                  not under t/<h>/: recorded, outside the fenced scope
+#   exempt-advisory       a write matching $8, or a remove of an admission
+#                         snapshot (the sibling DELETE)
+#   prerequisite-only     m/meta, u/... (audit), a/... removals (alert
+#                         retention and sweep), enc, config
+#   alerts-grace          a/alert-lease, a/state/, a/l0/, a/c/ written up to
+#                         the alerts horizon
+#   alerts-late           the same written after it                    (fails)
+#   ingest-grace          <sig>/l0/...rseg, <sig>/c/...cmt written while
+#                         running, up to the ingest horizon
+#   l0c-after-horizon     the same written while running, after it     (fails)
+#   teardown-data         the same written at the graceful stop  (data-bearing)
+#   idem                  l/idem/<k>.<hour>.idm, s/idem/...      (data-bearing)
+#   maintenance           any other write or remove under <sig>/ or
+#                         catalog/<sig>/: fold, compaction, retention,
+#                         sweep, rewrite, maint cursor, .unn          (fails)
+#   unclassified          any other t/<h>/ event                       (fails)
+# <sig> is m, l or s.
+drill_post_fence_class() {
+  local op=$1 key=$2 lm=$3 phase=$4 h=$5 ingest_h=$6 alerts_h=$7 exempt=$8 rel t
+  case "$key" in
+    "t/$h/"*) rel=${key#"t/$h/"} ;;
+    *)
+      echo root
+      return
+      ;;
+  esac
+  t=$(drill_epoch "$lm")
+  if { [ "$op" = write ] && drill_exempt "$key" "$h" "$exempt"; } \
+    || { [ "$op" = remove ] && [[ $rel =~ ^[mls]/admission/[^/]+\.snapshot$ ]]; }; then
+    echo exempt-advisory
+  elif [ "$rel" = m/meta ] || [ "$rel" = enc ] || [ "$rel" = config ] || [[ $rel == u/* ]] \
+    || { [ "$op" = remove ] && [[ $rel == a/* ]]; }; then
+    echo prerequisite-only
+  elif [ "$op" = write ] && { [ "$rel" = a/alert-lease ] || [[ $rel =~ ^a/(state|l0|c)/ ]]; }; then
+    if [ "$t" -gt "$alerts_h" ]; then echo alerts-late; else echo alerts-grace; fi
+  elif [ "$op" = write ] && [[ $rel =~ ^[mls]/(l0/.*\.rseg|c/.*\.cmt)$ ]]; then
+    if [ "$phase" = teardown ]; then
+      echo teardown-data
+    elif [ "$t" -gt "$ingest_h" ]; then
+      echo l0c-after-horizon
+    else
+      echo ingest-grace
+    fi
+  elif [ "$op" = write ] && [[ $rel =~ ^[ls]/idem/[^/]+\.idm$ ]]; then
+    echo idem
+  elif [[ $rel =~ ^(catalog/)?[mls]/ ]]; then
+    echo maintenance
+  else
+    echo unclassified
+  fi
+}
+
+# Every class drill_post_fence_class prints, and the band its count must sit
+# in: the fail rows at [0, 0], the recorded classes at [0, 1000000].
+DRILL_CLASS_BANDS="root:0:1000000 exempt-advisory:0:1000000 prerequisite-only:0:1000000 alerts-grace:0:1000000 alerts-late:0:0 ingest-grace:0:1000000 l0c-after-horizon:0:0 teardown-data:0:1000000 idem:0:1000000 maintenance:0:0 unclassified:0:0"
+
+# Classifies events file $1 (drill_post_fence_events output) into $2 as
+# "<class>\t<op>\t<key>\t<LastModified>\t<phase>", appends one
+# "figure class_<class>_<tag> <n>" line per class in DRILL_CLASS_BANDS to
+# report $3 ($4 is the tag) and checks each. $5..$8: tenant hash, ingest
+# horizon, alerts horizon, exempt patterns. Returns 1 when any count misses
+# its band.
+drill_classify_events() {
+  local events=$1 out=$2 report=$3 tag=$4 h=$5 ingest_h=$6 alerts_h=$7 exempt=$8 op key lm phase c b name lo hi rc=0
+  : > "$out"
+  while IFS=$'\t' read -r op key lm phase; do
+    [ -n "$key" ] || continue
+    c=$(drill_post_fence_class "$op" "$key" "$lm" "$phase" "$h" "$ingest_h" "$alerts_h" "$exempt")
+    printf '%s\t%s\t%s\t%s\t%s\n' "$c" "$op" "$key" "$lm" "$phase" >> "$out"
+  done < "$events"
+  for b in $DRILL_CLASS_BANDS; do
+    IFS=: read -r name lo hi <<< "$b"
+    echo "figure class_${name}_$tag $(awk -F'\t' -v c="$name" '$1 == c { n++ } END { print n + 0 }' "$out")" >> "$report"
+  done
+  for b in $DRILL_CLASS_BANDS; do
+    IFS=: read -r name lo hi <<< "$b"
+    drill_check_figure "$report" "class_${name}_$tag" "$lo" "$hi" || rc=1
+  done
+  return "$rc"
+}
+
+# Responses of kinds $3 (a regex over the drive log's kind column) with a 2xx
+# status whose end second is more than $4 seconds after Unix second $2, in
+# drive log $1 ("<end second>\t<kind>\t<status>"). The driver bounds every
+# request at $4 seconds (curl -m), so such a response was requested after $2.
+drill_count_2xx_after() {
+  awk -F'\t' -v t="$2" -v k="^($3)\$" -v m="$4" \
+    '$1 > t + m && $2 ~ k && $3 ~ /^2[0-9][0-9]$/ { n++ } END { print n + 0 }' "$1"
+}
+
+# Version check of one data-bearing key $1 (LastModified $2) for tenant hash
+# $3 against listing $4 and trailer file $5 ("<key>\t<magic>\t<version>"): a
+# data object must carry the release's trailer for its signal, a commit
+# record's single paired data object must, and an idem object has no trailer
+# rule so it fails. Prints one "ok|bad <what> <key> <LastModified> ..." line
+# and returns 1 on bad.
+drill_data_version() {
+  local key=$1 lm=$2 h=$3 listing=$4 trailers=$5 rel sig data want got
+  rel=${key#"t/$h/"}
+  sig=${rel%%/*}
+  case "$rel" in
+    [mls]/l0/*.rseg) data=$key ;;
+    [mls]/c/*.cmt)
+      data=$(drill_commit_data_key "$key" "$listing") || {
+        echo "bad commit $key $lm no single paired data object"
+        return 1
+      }
+      ;;
+    *)
+      echo "bad other $key $lm no version rule covers this key"
+      return 1
+      ;;
+  esac
+  want=$(drill_release_trailer "$sig")
+  got=$(awk -F'\t' -v k="$data" '$1 == k { print $2 " " $3; n++ } END { exit n == 1 ? 0 : 1 }' "$trailers") || {
+    echo "bad data $key $lm trailer of $data not read"
+    return 1
+  }
+  if [ "$got" != "$want" ]; then
+    echo "bad version $key $lm data=$data trailer '$got' want '$want'"
+    return 1
+  fi
+  if [ "$data" = "$key" ]; then
+    echo "ok data $key $lm $got"
+  else
+    echo "ok commit $key $lm data=$data $got"
+  fi
+}
+
+# Warm observation row: one full scrub rotation after the ingest horizon $3
+# and a graceful stop. Appends to report $1, from classes file $2
+# (drill_classify_events output) and the stop records $5.. (stop_pid's
+# "<how> <Unix second>" files, the server's first):
+#   warm_tail_s                       server stop second minus $3, >= $4
+#   warm_scrub_cursor_after_horizon   exempt scrub cursor writes after $3, >= 1
+#   warm_graceful_stops               "graceful" stop records, all of them
+# Returns 1 when any misses its band.
+drill_warm_observation() {
+  local report=$1 classes=$2 horizon=$3 tail=$4 stopped n lm rc=0
+  shift 4
+  stopped=$(cut -d' ' -f2 "$1")
+  n=0
+  while IFS= read -r lm; do
+    if [ "$(drill_epoch "$lm")" -gt "$horizon" ]; then n=$((n + 1)); fi
+  done < <(awk -F'\t' '$1 == "exempt-advisory" && $2 == "write" && $3 ~ /\/maint\/scrub\/[^\/]+\.cursor$/ { print $4 }' "$classes")
+  {
+    echo "figure warm_tail_s $((stopped - horizon))"
+    echo "figure warm_scrub_cursor_after_horizon $n"
+    echo "figure warm_graceful_stops $(cat "$@" | grep -c '^graceful ' || true)"
+  } >> "$report"
+  drill_check_figure "$report" warm_tail_s "$tail" 1000000000 || rc=1
+  drill_check_figure "$report" warm_scrub_cursor_after_horizon 1 1000000 || rc=1
+  drill_check_figure "$report" warm_graceful_stops "$#" "$#" || rc=1
+  return "$rc"
+}
+
+# Census check: every key of keys file $1 has exactly one
+# "key <key> flagged=<how>" line in drill_census output $2, and <how> is not
+# "no". Prints "flagged <how> <key>", "not-flagged <key>" or "unjudged <key>"
+# per key; returns 1 unless every key is flagged.
+drill_census_check() {
+  local keys=$1 out=$2 key n how rc=0
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    n=$(awk -v k="$key" '$1 == "key" && $2 == k { n++ } END { print n + 0 }' "$out")
+    if [ "$n" -ne 1 ]; then
+      echo "unjudged $key lines=$n"
+      rc=1
+      continue
+    fi
+    how=$(awk -v k="$key" '$1 == "key" && $2 == k { sub(/^flagged=/, "", $3); print $3 }' "$out")
+    case "$how" in
+      contradicted | held | late-write) echo "flagged $how $key" ;;
+      *)
+        echo "not-flagged $key"
+        rc=1
+        ;;
+    esac
+  done < "$keys"
+  return "$rc"
 }
