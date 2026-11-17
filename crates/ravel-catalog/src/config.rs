@@ -402,6 +402,24 @@ pub const DEFAULT_FOLD_BUCKET_CONCURRENCY: usize = 8;
 /// [`CatalogConfig::key_index_build_max_pairs`] for the bound a pass holds
 /// under it; ADR-3692 decision 5).
 pub const DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS: u64 = 8_000_000;
+/// The fold's 2 GB peak RSS band (ADR-3939, A1), which the repair's default
+/// section hold cap leaves room for under the pair budget.
+const KEY_INDEX_REPAIR_RSS_BAND_BYTES: u64 = 2_000_000_000;
+/// The upper-bound estimate of one held one-block pair's bytes
+/// (docs/catalog-and-mvcc.md, "Pair budget"; see
+/// [`CatalogConfig::key_index_build_max_pairs`]).
+const KEY_INDEX_HELD_PAIR_BYTES: u64 = 88;
+
+/// The default repair section hold cap for the pair budget `max_pairs`: the
+/// 2 GB RSS band less 88 B for each pair a pass may hold,
+/// `max(0, 2,000,000,000 - 88 x max_pairs)` bytes, so the held sections and
+/// the pairs at the 88 B estimate stay within the band together.
+/// 1,296,000,000 at the default 8,000,000 pairs, 592,000,000 at 16,000,000,
+/// and 0 from 22,727,273 pairs up.
+pub fn derived_key_index_repair_hold_bytes(max_pairs: u64) -> u64 {
+    KEY_INDEX_REPAIR_RSS_BAND_BYTES
+        .saturating_sub(max_pairs.saturating_mul(KEY_INDEX_HELD_PAIR_BYTES))
+}
 /// Default `metrics_label_index_max_ratio_ppm`: 10,000 parts per million, a
 /// ratio of 0.01: ADR-3694 decision 2's `KEY_INDEX_LEAF_BYTES_CAP` of 1% of
 /// a part's data bytes. The ADR-3694 Stage 1 acceptance amendment (row 7)
@@ -750,6 +768,18 @@ pub struct CatalogConfig {
     /// encoded leaves until their PUTs; and per-entry bookkeeping. Default
     /// [`DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`]; 0 is read as 1.
     pub key_index_build_max_pairs: u64,
+    /// The most bytes of KEY_IDX sections the `--rebuild-key-index` repair
+    /// (`Catalog::rebuild_key_index`) keeps for one part across that part's
+    /// build passes, so a held entry's section is read once rather than in
+    /// every pass (issue #4376). Entries are held in part order until the
+    /// next one would take the held bytes past this, and each held section
+    /// is also reserved against the catalog's memory budget, a refusal ending
+    /// the holding the same way; an entry not held is read by range in every
+    /// pass. `Some(0)` holds nothing. `None`, the default, is
+    /// [`Self::key_index_repair_hold_cap`]'s derivation from
+    /// [`Self::key_index_build_max_pairs`]. The fold's own build holds no
+    /// section and ignores this.
+    pub key_index_repair_hold_bytes: Option<u64>,
     /// ADR-3694 decision 2's switch: whether the fold also builds the metrics
     /// `label_value` key-index leaf, keyed by key8 of every LABEL_DICT string
     /// (label names and values) of each metrics object, read by range (a
@@ -872,6 +902,17 @@ impl CatalogConfig {
         self.record_cache_share_bytes_per_tenant()
     }
 
+    /// The repair's section hold cap:
+    /// [`key_index_repair_hold_bytes`](Self::key_index_repair_hold_bytes)
+    /// when set, otherwise [`derived_key_index_repair_hold_bytes`] of
+    /// [`key_index_build_max_pairs`](Self::key_index_build_max_pairs), at
+    /// least 1.
+    pub fn key_index_repair_hold_cap(&self) -> u64 {
+        self.key_index_repair_hold_bytes.unwrap_or_else(|| {
+            derived_key_index_repair_hold_bytes(self.key_index_build_max_pairs.max(1))
+        })
+    }
+
     /// Byte budget the L1 compaction-record cache is held to, per tenant: the
     /// other share of the same budget
     /// ([`record_cache_share_bytes_per_tenant`](Self::record_cache_share_bytes_per_tenant)).
@@ -917,6 +958,7 @@ impl Default for CatalogConfig {
             fold_bucket_concurrency: DEFAULT_FOLD_BUCKET_CONCURRENCY,
             build_key_index_leaves: false,
             key_index_build_max_pairs: DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+            key_index_repair_hold_bytes: None,
             metrics_label_index: true,
             metrics_label_index_max_ratio_ppm: DEFAULT_METRICS_LABEL_INDEX_MAX_RATIO_PPM,
             fold_reconcile_window_hours: DEFAULT_FOLD_RECONCILE_WINDOW_HOURS,
@@ -933,6 +975,34 @@ mod tests {
     use super::*;
 
     use ravel_types::Signal;
+
+    /// Issue #4376: the repair's default section hold cap is
+    /// `max(0, 2,000,000,000 - 88 x key_index_build_max_pairs)`:
+    /// 1,296,000,000 B at the default 8,000,000 pairs and 592,000,000 B at
+    /// 16,000,000, 64 B at the last budget that leaves room and 0 past it,
+    /// with no overflow at `u64::MAX`. An explicit setting wins, 0 included,
+    /// and a budget of 0 is read as 1.
+    #[test]
+    fn the_repair_hold_cap_derives_from_the_pair_budget() {
+        assert_eq!(derived_key_index_repair_hold_bytes(8_000_000), 1_296_000_000);
+        assert_eq!(derived_key_index_repair_hold_bytes(16_000_000), 592_000_000);
+        assert_eq!(derived_key_index_repair_hold_bytes(22_727_272), 64);
+        assert_eq!(derived_key_index_repair_hold_bytes(22_727_273), 0);
+        assert_eq!(derived_key_index_repair_hold_bytes(u64::MAX), 0);
+        assert_eq!(
+            CatalogConfig::default().key_index_repair_hold_cap(),
+            1_296_000_000
+        );
+        let at = |max_pairs, hold| CatalogConfig {
+            key_index_build_max_pairs: max_pairs,
+            key_index_repair_hold_bytes: hold,
+            ..CatalogConfig::default()
+        };
+        assert_eq!(at(16_000_000, None).key_index_repair_hold_cap(), 592_000_000);
+        assert_eq!(at(0, None).key_index_repair_hold_cap(), 1_999_999_912);
+        assert_eq!(at(16_000_000, Some(0)).key_index_repair_hold_cap(), 0);
+        assert_eq!(at(16_000_000, Some(7)).key_index_repair_hold_cap(), 7);
+    }
 
     /// Pins the derivation at the shipped ingest defaults (`shard_count` 4,
     /// `max_flush_delay` 2s, issue #1735): `4 shards * 6 signals * ceil(3600

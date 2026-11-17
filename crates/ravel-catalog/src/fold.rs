@@ -36,6 +36,7 @@ use ravel_types::{METRIC_NAME_LABEL, Signal, TenantHash};
 use uuid::Uuid;
 
 use crate::catalog::Catalog;
+use crate::charged::DecodeReserver;
 use crate::column_stats_build;
 use crate::compat;
 use crate::config::CatalogConfig;
@@ -2028,6 +2029,128 @@ pub(crate) fn take_held_label_dict_log_for_test() -> HeldLabelDictLog {
     HELD_LABEL_DICT_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
 }
 
+/// The `--rebuild-key-index` repair's hold of one part's KEY_IDX sections
+/// across the part's build passes (issue #4376): an entry's section is kept
+/// from the pass that read it and decoded from memory in each later pass, at
+/// no GET. Entries are offered in part order, and each is held while the
+/// held bytes stay at or under `cap` and the catalog's memory budget grants
+/// a reservation for it; the first entry refused either way ends the holding
+/// for the part, so it and every later entry are read by range in every
+/// pass. [`build_part_key_index`] releases everything held when the part's
+/// build ends, whatever the outcome. Metrics LABEL_DICT sections are never
+/// held.
+pub(crate) struct KeyIndexSectionHold<'a> {
+    cap: u64,
+    reserver: &'a dyn DecodeReserver,
+    by_ordinal: BTreeMap<u64, (KeyIdxSectionBytes, Reservation)>,
+    held_bytes: u64,
+    /// An entry of the current part was not held, so no later one is.
+    closed: bool,
+    /// Entries held, summed over the parts built.
+    entries_held: u64,
+    /// The most bytes held at once.
+    peak_held_bytes: u64,
+}
+
+impl<'a> KeyIndexSectionHold<'a> {
+    pub(crate) fn new(cap: u64, reserver: &'a dyn DecodeReserver) -> Self {
+        Self {
+            cap,
+            reserver,
+            by_ordinal: BTreeMap::new(),
+            held_bytes: 0,
+            closed: false,
+            entries_held: 0,
+            peak_held_bytes: 0,
+        }
+    }
+
+    pub(crate) fn entries_held(&self) -> u64 {
+        self.entries_held
+    }
+
+    pub(crate) fn peak_held_bytes(&self) -> u64 {
+        self.peak_held_bytes
+    }
+
+    fn get(&self, ordinal: u64) -> Option<&KeyIdxSectionBytes> {
+        self.by_ordinal.get(&ordinal).map(|(section, _)| section)
+    }
+
+    /// Holds part entry `ordinal`'s section unless the part's holding has
+    /// ended, the section would take the held bytes past the cap, or the
+    /// memory budget refuses it.
+    fn offer(&mut self, ordinal: u64, section: KeyIdxSectionBytes) {
+        if self.closed || self.by_ordinal.contains_key(&ordinal) {
+            return;
+        }
+        let len = section.data.len() as u64;
+        let Some(total) = self
+            .held_bytes
+            .checked_add(len)
+            .filter(|&total| total <= self.cap)
+        else {
+            self.closed = true;
+            return;
+        };
+        let reservation = match self.reserver.reserve_decoded(len, u64::MAX) {
+            Ok(reservation) => reservation,
+            Err(refused) => {
+                tracing::warn!(
+                    requested = refused.requested,
+                    reserved = refused.reserved,
+                    limit = refused.limit,
+                    "the memory budget refused a KEY_IDX section hold; the repair reads this part's remaining entries by range in every pass"
+                );
+                self.closed = true;
+                return;
+            }
+        };
+        self.held_bytes = total;
+        self.peak_held_bytes = self.peak_held_bytes.max(total);
+        self.entries_held += 1;
+        self.by_ordinal.insert(ordinal, (section, reservation));
+    }
+
+    /// Drops every held section and its reservation, and reopens the hold for
+    /// the next part.
+    fn release(&mut self) {
+        self.by_ordinal.clear();
+        self.held_bytes = 0;
+        self.closed = false;
+    }
+}
+
+/// Releases a [`KeyIndexSectionHold`] when the part's build ends, on every
+/// return path.
+struct ReleaseSectionHold<'h, 'a>(&'h mut KeyIndexSectionHold<'a>);
+
+impl Drop for ReleaseSectionHold<'_, '_> {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        let held_before = self.0.held_bytes;
+        self.0.release();
+        #[cfg(test)]
+        SECTION_HOLD_LOG.with(|log| {
+            log.borrow_mut()
+                .push((held_before, self.0.held_bytes, self.0.by_ordinal.len()))
+        });
+    }
+}
+
+// Test-only: per part build, the bytes the section hold held when the build
+// ended, then the bytes and sections it still held after the release.
+#[cfg(test)]
+thread_local! {
+    static SECTION_HOLD_LOG: std::cell::RefCell<Vec<(u64, u64, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_section_hold_log_for_test() -> Vec<(u64, u64, usize)> {
+    SECTION_HOLD_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
+}
+
 /// Reads a metrics object's `label_value` field by range: a suffix GET for
 /// the RSEG footer (a second footer GET only when the footer is longer than
 /// [`KEY_INDEX_FOOTER_SUFFIX_LEN`]), then one GET of LABEL_DICT.
@@ -2253,19 +2376,59 @@ pub(crate) async fn read_entry_key_index(
     key: &str,
     object_size: u64,
 ) -> EntryKeyIndexRead {
+    read_entry_key_index_keeping(store, tenant, signal, key, object_size)
+        .await
+        .0
+}
+
+/// [`read_entry_key_index`], also returning the KEY_IDX section it read and
+/// decoded, for [`KeyIndexSectionHold`] to keep. `None` when the read failed
+/// or the signal is metrics, whose LABEL_DICT is never held.
+async fn read_entry_key_index_keeping(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    key: &str,
+    object_size: u64,
+) -> (EntryKeyIndexRead, Option<KeyIdxSectionBytes>) {
     let mut cost = KeyIdxReadCost::default();
     let read =
         read_entry_key_index_counted(store, tenant, signal, key, object_size, &mut cost).await;
-    let (fields, get_failed) = match read {
-        Ok(fields) => (Ok(fields), false),
-        Err(KeyIdxReadError::Get(reason)) => (Err(reason), true),
-        Err(KeyIdxReadError::Invalid(reason)) => (Err(reason), false),
+    let (fields, get_failed, section) = match read {
+        Ok((fields, section)) => (Ok(fields), false, section),
+        Err(KeyIdxReadError::Get(reason)) => (Err(reason), true, None),
+        Err(KeyIdxReadError::Invalid(reason)) => (Err(reason), false, None),
     };
+    (
+        EntryKeyIndexRead {
+            fields,
+            get_failed,
+            cost,
+        },
+        section,
+    )
+}
+
+/// One entry's read from a section [`KeyIndexSectionHold`] holds: the same
+/// decode and checks as a ranged read, at no GET.
+fn read_held_key_index_section(signal: Signal, section: &KeyIdxSectionBytes) -> EntryKeyIndexRead {
+    let fields = decode_key_idx_section(signal, section).map_err(|err| match err {
+        KeyIdxReadError::Get(reason) | KeyIdxReadError::Invalid(reason) => reason,
+    });
     EntryKeyIndexRead {
         fields,
-        get_failed,
-        cost,
+        get_failed: false,
+        cost: KeyIdxReadCost::default(),
     }
+}
+
+/// A data object's KEY_IDX section as read and crc-checked, with what its
+/// decode needs from the footer.
+#[derive(Debug, Clone)]
+pub(crate) struct KeyIdxSectionBytes {
+    block_count: u64,
+    prefix_len: u32,
+    data: Bytes,
 }
 
 async fn read_entry_key_index_counted(
@@ -2275,10 +2438,27 @@ async fn read_entry_key_index_counted(
     key: &str,
     object_size: u64,
     cost: &mut KeyIdxReadCost,
-) -> Result<Vec<KeyIdxFieldEntries>, KeyIdxReadError> {
+) -> Result<(Vec<KeyIdxFieldEntries>, Option<KeyIdxSectionBytes>), KeyIdxReadError> {
     if signal == Signal::Metrics {
-        return read_metrics_label_value_counted(store, tenant, key, object_size, cost).await;
+        return read_metrics_label_value_counted(store, tenant, key, object_size, cost)
+            .await
+            .map(|fields| (fields, None));
     }
+    let section = read_key_idx_section_counted(store, tenant, signal, key, object_size, cost).await?;
+    let fields = decode_key_idx_section(signal, &section)?;
+    Ok((fields, Some(section)))
+}
+
+/// The footer and section GETs of a logs or spans KEY_IDX read, up to the
+/// section's crc check.
+async fn read_key_idx_section_counted(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    key: &str,
+    object_size: u64,
+    cost: &mut KeyIdxReadCost,
+) -> Result<KeyIdxSectionBytes, KeyIdxReadError> {
     if object_size == 0 {
         return Err("entry names a zero-byte object".to_string().into());
     }
@@ -2330,7 +2510,20 @@ async fn read_entry_key_index_counted(
     if section.data.len() as u64 != len || crc32c::crc32c(&section.data) != crc {
         return Err("KEY_IDX section crc mismatch".to_string().into());
     }
-    let fields = decode_key_idx(&section.data, prefix_len).map_err(|e| e.to_string())?;
+    Ok(KeyIdxSectionBytes {
+        block_count: footer.block_count,
+        prefix_len,
+        data: section.data,
+    })
+}
+
+/// Decodes a logs or spans KEY_IDX section and checks it against what the
+/// reader accepts.
+fn decode_key_idx_section(
+    signal: Signal,
+    section: &KeyIdxSectionBytes,
+) -> Result<Vec<KeyIdxFieldEntries>, KeyIdxReadError> {
+    let fields = decode_key_idx(&section.data, section.prefix_len).map_err(|e| e.to_string())?;
     // A leaf answers a logs probe, so it may only carry keys the reader's
     // resolution rule produced; a version 1 RLOG section's entry is uncovered.
     if signal == Signal::Logs {
@@ -2346,11 +2539,11 @@ async fn read_entry_key_index_counted(
         if let Some((_, block)) = field
             .entries
             .iter()
-            .find(|(_, block)| u64::from(*block) >= footer.block_count)
+            .find(|(_, block)| u64::from(*block) >= section.block_count)
         {
             return Err(format!(
                 "KEY_IDX field {:?} names block {block}, object has {} blocks",
-                field.name, footer.block_count
+                field.name, section.block_count
             )
             .into());
         }
@@ -3593,6 +3786,11 @@ pub(crate) enum KeyIndexBuildCaller {
 /// repair, which passes no source and nothing held: the passes are the same,
 /// but only `declared` is indexed and a failed ranged GET stops the build
 /// ([`BuiltPartKeyIndex::stopped_on_failed_get`]).
+///
+/// `section_hold`, which only the repair passes, keeps the KEY_IDX sections
+/// its first read of each entry returns for the part's later passes
+/// ([`KeyIndexSectionHold`]), and is released when this returns, on every
+/// path. The leaves are the same with or without it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_part_key_index(
     store: &dyn ObjectStoreBackend,
@@ -3604,10 +3802,12 @@ pub(crate) async fn build_part_key_index(
     declared: &[(String, KeyType)],
     sources: &[&CarrySource],
     held: HeldPart<'_>,
+    section_hold: Option<&mut KeyIndexSectionHold<'_>>,
     limits: &KeyIndexBuildLimits,
     caller: KeyIndexBuildCaller,
     counters: &mut RequestCounters,
 ) -> Result<BuiltPartKeyIndex, CatalogError> {
+    let mut section_hold = section_hold.map(ReleaseSectionHold);
     let n = part_entries.len();
     let part_entry_count = n as u64;
     let max_pairs = limits.max_pairs.max(1);
@@ -3832,11 +4032,19 @@ pub(crate) async fn build_part_key_index(
                 #[cfg(test)]
                 record_key_index_carry(carried);
             }
-            let targets: Vec<(u64, String, u64)> = to_read
+            let keeping = section_hold.is_some();
+            // Each target with the section the repair's hold kept for it, if
+            // any, cloned (a reference count) so the reads below can offer
+            // new sections to the hold while the stream runs.
+            let targets: Vec<(u64, String, u64, Option<KeyIdxSectionBytes>)> = to_read
                 .iter()
                 .filter_map(|&o| {
                     let key = data_keys[o as usize].as_ref().ok()?;
-                    Some((o, key.clone(), part_entries[o as usize].object_size))
+                    let kept = section_hold
+                        .as_ref()
+                        .and_then(|hold| hold.0.get(o))
+                        .cloned();
+                    Some((o, key.clone(), part_entries[o as usize].object_size, kept))
                 })
                 .collect();
             let mut failed: HashSet<u64> = HashSet::new();
@@ -3849,30 +4057,55 @@ pub(crate) async fn build_part_key_index(
                 // `Send` bound the server's spawned fold loop needs.
                 let mut reads = stream::iter(0..targets.len())
                     .map(move |i| {
-                        let (ordinal, key, object_size) = &targets_ref[i];
+                        let (ordinal, key, object_size, kept) = &targets_ref[i];
                         let held = held.get(*ordinal).cloned();
+                        let kept = kept.clone();
                         async move {
-                            match held {
+                            match (held, kept) {
                                 // Read from object bytes the fold already
                                 // holds: no GET.
-                                Some(fields) => EntryKeyIndexRead {
-                                    fields,
-                                    get_failed: false,
-                                    cost: KeyIdxReadCost::default(),
-                                },
-                                None => {
-                                    read_entry_key_index(store, tenant, signal, key, *object_size)
-                                        .await
+                                (Some(fields), _) => (
+                                    EntryKeyIndexRead {
+                                        fields,
+                                        get_failed: false,
+                                        cost: KeyIdxReadCost::default(),
+                                    },
+                                    None,
+                                ),
+                                // Decoded from the section the repair kept
+                                // from an earlier pass: no GET.
+                                (None, Some(section)) => {
+                                    (read_held_key_index_section(signal, &section), None)
                                 }
+                                (None, None) if keeping => {
+                                    read_entry_key_index_keeping(
+                                        store,
+                                        tenant,
+                                        signal,
+                                        key,
+                                        *object_size,
+                                    )
+                                    .await
+                                }
+                                (None, None) => (
+                                    read_entry_key_index(store, tenant, signal, key, *object_size)
+                                        .await,
+                                    None,
+                                ),
                             }
                         }
                     })
                     .buffered(limits.concurrency.max(1));
                 let mut next = 0usize;
-                while let Some(read) = reads.next().await {
-                    let (ordinal, key, _) = &targets[next];
+                while let Some((read, section)) = reads.next().await {
+                    let (ordinal, key, _, _) = &targets[next];
                     let ordinal = *ordinal;
                     next += 1;
+                    if let (Some(hold), Some(section), Ok(_)) =
+                        (section_hold.as_mut(), section, &read.fields)
+                    {
+                        hold.0.offer(ordinal, section);
+                    }
                     counters.get_requests += read.cost.gets();
                     counters.key_index_ranged_gets += read.cost.gets();
                     counters.key_index_bytes_read += read.cost.bytes();
@@ -5858,6 +6091,7 @@ impl Catalog {
                                 declared,
                                 &sources,
                                 held_label_dicts.part(span.start),
+                                None,
                                 &KeyIndexBuildLimits {
                                     leaf: key_index_leaf_limits(),
                                     max_pairs: self.config().key_index_build_max_pairs,

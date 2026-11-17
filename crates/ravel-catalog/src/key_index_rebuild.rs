@@ -33,7 +33,8 @@ use crate::catalog::Catalog;
 use crate::config::DEFAULT_SNAPSHOT_PART_MAX_ENTRIES;
 use crate::error::CatalogError;
 use crate::fold::{
-    HeadState, HeldLabelDicts, KeyIndexBuildCaller, KeyIndexBuildLimits, MAX_HEAD_CAS_ATTEMPTS,
+    HeadState, HeldLabelDicts, KeyIndexBuildCaller, KeyIndexBuildLimits, KeyIndexSectionHold,
+    MAX_HEAD_CAS_ATTEMPTS,
     RequestCounters, build_part_key_index, declared_key_index_fields, head_object_key,
     key_index_leaf_limits, metrics_label_index_leaf_bytes_cap, newer_leaf_refusal,
 };
@@ -162,6 +163,21 @@ pub struct KeyIndexRebuildReport {
     /// at least 1. Set once the requested fields are known, before HEAD is
     /// read.
     pub key_index_build_max_pairs: u64,
+    /// The most KEY_IDX section bytes the run kept for one part across the
+    /// part's passes:
+    /// [`CatalogConfig::key_index_repair_hold_cap`](crate::CatalogConfig::key_index_repair_hold_cap).
+    /// 0 keeps none, so every pass reads every section by range. Set with
+    /// `key_index_build_max_pairs`.
+    pub section_hold_cap_bytes: u64,
+    /// Entries whose section was kept after its first read, summed over the
+    /// parts read, a deferred part's and a failed build's included. Each
+    /// costs its footer and section GETs once rather than once per pass.
+    /// Always 0 on metrics, whose LABEL_DICT sections are not kept.
+    pub section_hold_entries: u64,
+    /// The most section bytes kept at once, as read: the largest part's
+    /// kept total, since a part's sections are released when its build
+    /// ends. At most `section_hold_cap_bytes`.
+    pub section_hold_peak_bytes: u64,
     /// Build passes, summed over the parts read, a deferred part's and a
     /// failed build's included. One pass serves every field the part builds
     /// and reads each of the part's entries' sections once, so when every
@@ -468,6 +484,7 @@ impl Catalog {
         let mut report = KeyIndexRebuildReport {
             fields: requested.iter().map(|(name, _)| name.clone()).collect(),
             key_index_build_max_pairs: self.config().key_index_build_max_pairs.max(1),
+            section_hold_cap_bytes: self.config().key_index_repair_hold_cap(),
             ..KeyIndexRebuildReport::default()
         };
 
@@ -724,6 +741,11 @@ impl Catalog {
         // A part the rebuild visits has no leaf for these fields, or only a
         // refused one, so there is nothing to carry and no held dictionary.
         let no_held = HeldLabelDicts::new(Vec::new(), 0);
+        // Charged to the catalog's memory budget like the part decode above
+        // each build; a cap of 0 holds nothing and builds exactly as with no
+        // hold.
+        let mut section_hold = (report.section_hold_cap_bytes > 0)
+            .then(|| KeyIndexSectionHold::new(report.section_hold_cap_bytes, self));
         for target in batch {
             // A part an earlier batch's CAS loss showed replaced, or already
             // given the refs by someone else, costs nothing.
@@ -765,6 +787,9 @@ impl Catalog {
             // The fold's own passes under the pair budget: each field holds at
             // most its share of `key_index_build_max_pairs` at a time.
             let before = counters;
+            let entries_held_before = section_hold
+                .as_ref()
+                .map_or(0, KeyIndexSectionHold::entries_held);
             let built_part = build_part_key_index(
                 self.store(),
                 tenant,
@@ -775,6 +800,7 @@ impl Catalog {
                 &missing,
                 &[],
                 no_held.part(0),
+                section_hold.as_mut(),
                 &KeyIndexBuildLimits {
                     leaf: key_index_leaf_limits(),
                     max_pairs: self.config().key_index_build_max_pairs,
@@ -813,6 +839,11 @@ impl Catalog {
             report.leaves_written += leaf_puts;
             report.leaf_bytes_written +=
                 counters.key_index_leaf_bytes_put - before.key_index_leaf_bytes_put;
+            if let Some(hold) = &section_hold {
+                report.section_hold_entries += hold.entries_held() - entries_held_before;
+                report.section_hold_peak_bytes =
+                    report.section_hold_peak_bytes.max(hold.peak_held_bytes());
+            }
             let leaves = built_part?;
             for (field, passes) in &leaves.field_passes {
                 *report.passes_per_field.entry(field.clone()).or_insert(0) += passes;
