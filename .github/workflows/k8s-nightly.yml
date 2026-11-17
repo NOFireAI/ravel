@@ -169,6 +169,8 @@ jobs:
           scripts/kind-up.sh
       - name: OTLP round trip through the gateway and query Services
         run: scripts/kind-demo.sh
+      - name: ADR-4314 replicas handover across autoscaling modes and turn-off
+        run: scripts/kind-autoscaling-check.sh
       - name: Dump cluster diagnostics on failure
         if: failure()
         run: |
