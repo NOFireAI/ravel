@@ -1250,28 +1250,16 @@ async fn yield_rounds() {
     }
 }
 
-/// A flush held closed because no trusted provisioning view arrives is held
-/// for exactly `max_flush_lifetime` from the first enforced hold, then dropped
-/// unwritten: every byte is refunded, the drop is counted once, and shutdown
-/// writes nothing (issue #4363).
-///
-/// Guards: `stale_view_hold_spent` and its call in each actor's
-/// `ScanCheck::Unknown` arm. Never dropping leaves the counter at 0 and the
-/// bytes charged one tick past the bound, and shutdown then writes the rows
-/// in place on its bypass pass. Dropping one tick early (`>` for `>=` read the
-/// other way, or a bound short by a tick) counts at the
-/// `since + lifetime - tick` step. Counting the drop per tick instead of once
-/// moves the counter past 1 on the ticks after the drop, and resetting
-/// `stale_view_since_ns` on each hold never drops.
-async fn an_untrusted_view_hold_is_dropped_at_the_flush_lifetime<P: Pipe>() {
-    let HeldView {
-        world,
-        keys: _,
-        since_ns,
-    } = hold_on_an_untrusted_view::<P>(NEVER).await;
-    let inner = world.fault.inner();
+/// The longest the switch backs off between failed provisioning reads.
+const READ_BACKOFF_CAP_NS: i64 = 30_000_000_000;
 
-    world.clock.set_ns(since_ns + STALE_LIFETIME_NS - TICK_NS);
+/// Moves the clock to `spent_ns`, where a hold's bound runs out, and on until
+/// the buffer is dropped, returning the clock reading at the drop. Asserts the
+/// buffer is held one tick inside the bound and at the spend itself, and is
+/// dropped only after a provisioning read failed past the spend, within one
+/// read backoff of it and before the spend's own deadline.
+async fn drop_after_a_failed_post_spend_read<P: Pipe>(world: &World<P>, spent_ns: i64) -> i64 {
+    world.clock.set_ns(spent_ns - TICK_NS);
     yield_rounds().await;
     assert_eq!(
         world.router.counters().abandoned_stale,
@@ -1282,24 +1270,78 @@ async fn an_untrusted_view_hold_is_dropped_at_the_flush_lifetime<P: Pipe>() {
         world.budget.in_flight_bytes() > 0,
         "the rows are still charged"
     );
+    let faults_at_spend = world.fault.fault_count(Op::Get, FaultKind::Transient);
+
+    world.clock.set_ns(spent_ns);
+    yield_rounds().await;
     assert_eq!(
-        keys_under_shard(inner, &world.deferred, P::SIGNAL, HELD_VIEW_SHARD).await,
+        world.router.counters().abandoned_stale,
+        0,
+        "held at the spend: no read issued since has failed yet"
+    );
+    assert!(world.budget.in_flight_bytes() > 0);
+
+    for _ in 0..(2 * STALE_LIFETIME_NS / 100_000_000) {
+        if world.router.counters().abandoned_stale > 0 {
+            break;
+        }
+        world.clock.advance_ns(100_000_000);
+        yield_rounds().await;
+    }
+    let dropped_ns = world.clock.now();
+    assert_eq!(
+        world.router.counters().abandoned_stale,
+        1,
+        "dropped and counted once, counters {:?}",
+        world.router.counters()
+    );
+    assert!(
+        world.fault.fault_count(Op::Get, FaultKind::Transient) > faults_at_spend,
+        "a provisioning read issued after the spend failed before the drop"
+    );
+    assert!(
+        dropped_ns - spent_ns <= READ_BACKOFF_CAP_NS + 1_000_000_000,
+        "dropped within one read backoff of the spend, {} ns after it",
+        dropped_ns - spent_ns
+    );
+    assert_eq!(world.budget.in_flight_bytes(), 0, "every byte is refunded");
+    dropped_ns
+}
+
+/// A flush held closed because no trusted provisioning view arrives is held
+/// for `max_flush_lifetime` from the first enforced hold, kept while the
+/// provisioning read issued after that is outstanding, and dropped unwritten
+/// once that read fails: every byte is refunded, the drop is counted once,
+/// and shutdown writes nothing (issue #4363).
+///
+/// Guards: `StaleViewHold::advance` and its call in each actor's
+/// `ScanCheck::Unknown` arm. Never dropping leaves the counter at 0 and the
+/// bytes charged, and shutdown then writes the rows in place on its bypass
+/// pass. Dropping at the spend without waiting for a read issued after it
+/// (the pre-fix rule) counts at the spend tick. Dropping only at the spend's
+/// deadline, ignoring the failed read, drops a full bound after the spend,
+/// past the backoff assertion. Counting the drop per tick instead of once
+/// moves the counter past 1 on the ticks after the drop, and restarting the
+/// hold on each attempt never drops.
+async fn an_untrusted_view_hold_is_dropped_at_the_flush_lifetime<P: Pipe>() {
+    let HeldView {
+        world,
+        keys: _,
+        since_ns,
+    } = hold_on_an_untrusted_view::<P>(NEVER).await;
+    assert_eq!(
+        keys_under_shard(
+            world.fault.inner(),
+            &world.deferred,
+            P::SIGNAL,
+            HELD_VIEW_SHARD
+        )
+        .await,
         Vec::<String>::new(),
         "nothing is written while the view is untrusted"
     );
 
-    ticks(&world.clock, 1).await;
-    assert_eq!(
-        world.router.counters().abandoned_stale,
-        1,
-        "dropped and counted at the bound, counters {:?}",
-        world.router.counters()
-    );
-    assert_eq!(world.budget.in_flight_bytes(), 0, "every byte is refunded");
-    assert!(
-        world.fault.fault_count(Op::Get, FaultKind::Transient) >= 2,
-        "the router kept re-reading through the hold"
-    );
+    drop_after_a_failed_post_spend_read(&world, since_ns + STALE_LIFETIME_NS).await;
 
     ticks(&world.clock, 50).await;
     assert_eq!(
@@ -1329,7 +1371,7 @@ async fn an_untrusted_view_hold_is_dropped_at_the_flush_lifetime<P: Pipe>() {
 /// the re-read view and every acknowledged row is published once, with
 /// nothing dropped.
 ///
-/// Guards: the `stale_view_since_ns` start at the first enforced hold rather
+/// Guards: the `StaleViewHold` start at the first enforced hold rather
 /// than at buffer creation or the ack (either is past the bound once the
 /// clock jumps two hours, so the buffer is dropped at the first hold), and
 /// the recovery path through the `InScanSet` arm.
@@ -1368,12 +1410,13 @@ async fn an_untrusted_view_that_recovers_inside_the_bound_publishes<P: Pipe>() {
 /// The store recovers while no flush attempt runs for longer than the bound,
 /// as for a trigger deferred at the queued-flush cap or the tenant's flush
 /// share, which returns before the scan-set check and reads nothing. The first
-/// attempt past the bound reads the record once more before it would drop the
-/// buffer, finds a trusted view and publishes every row (issue #4363).
+/// attempt past the bound keeps the buffer and requests a read, which finds a
+/// trusted view, and the next attempt publishes every row (issue #4363).
 ///
-/// Guard: the re-read in `held_view_check`. Without it that attempt finds
-/// the hold spent and drops the buffer without asking the store, which now
-/// answers.
+/// Guard: the read `StaleViewHold::step` requests once the hold is spent, and
+/// the rule that only a failed read issued after the spend drops the buffer.
+/// Dropping at the spend, or on the failures from before it, drops the buffer
+/// without asking the store, which now answers.
 async fn a_store_that_recovers_with_no_attempt_publishes_past_the_bound<P: Pipe>() {
     let HeldView {
         world,
@@ -1416,8 +1459,9 @@ async fn a_store_that_recovers_with_no_attempt_publishes_past_the_bound<P: Pipe>
 /// restarts the hold through the real router's view stamp: the reads fail as
 /// the hold starts, one passes, and they fail again from then on. The first
 /// attempt once that view is past its own trust horizon is long past the
-/// first hold's bound and drops nothing; the hold restarts there and the
-/// buffer is dropped exactly one bound later (issue #4363).
+/// first hold's bound and drops nothing; the hold restarts there, is spent
+/// one bound later, and the buffer is dropped once a read issued after that
+/// fails (issue #4363).
 ///
 /// Guard: `SwitchScope::view_refreshed_at` returning the stamp of the read
 /// behind the cached view. Returning `None`, or the view's last-touch stamp
@@ -1451,21 +1495,7 @@ async fn a_read_that_succeeds_mid_hold_restarts_it<P: Pipe>() {
     );
     assert!(world.budget.in_flight_bytes() > 0);
 
-    world.clock.set_ns(restart_ns + STALE_LIFETIME_NS - TICK_NS);
-    yield_rounds().await;
-    assert_eq!(
-        world.router.counters().abandoned_stale,
-        0,
-        "held one tick inside the restarted bound"
-    );
-    ticks(&world.clock, 1).await;
-    assert_eq!(
-        world.router.counters().abandoned_stale,
-        1,
-        "dropped one bound after the restart, counters {:?}",
-        world.router.counters()
-    );
-    assert_eq!(world.budget.in_flight_bytes(), 0);
+    drop_after_a_failed_post_spend_read(&world, restart_ns + STALE_LIFETIME_NS).await;
     assert_eq!(
         keys_under_shard(
             world.fault.inner(),
@@ -1484,7 +1514,7 @@ async fn a_read_that_succeeds_mid_hold_restarts_it<P: Pipe>() {
 /// so nothing acknowledged is dropped by a drain.
 ///
 /// Guard: the bound check in each actor's `ScanCheck::Unknown` arm being
-/// reached with `stale_view_since_ns` set only by enforced holds. Dropping at
+/// reached with the `StaleViewHold` started only by enforced holds. Dropping at
 /// teardown regardless of the bound, or counting the teardown's first
 /// sighting as the start and the drain's age as spent, counts a drop and
 /// leaves the rows unwritten.
