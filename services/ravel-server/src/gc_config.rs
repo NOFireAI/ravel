@@ -476,6 +476,20 @@ mod tests {
             assert_eq!(store.sequence_progress(0), 3);
         }
 
+        /// A create that landed but answered `Transient` is read back by the
+        /// retry; nothing is written a second time.
+        #[tokio::test]
+        async fn reads_back_an_object_whose_create_ack_was_lost() {
+            let clock = Arc::new(ManualClock::default());
+            let store = faulted(ack_lost_then_ok(GC_KEY));
+            bootstrap_at_startup(store.clone(), 1, Mode::Maintain, &retry_on(clock.clone()))
+                .await
+                .expect("the retry finds the landed object");
+            assert_eq!(store.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
+            assert_eq!(store.sequence_progress(0), 1);
+            assert_eq!(clock.sleeps().len(), 1);
+        }
+
         #[tokio::test]
         async fn transient_past_the_deadline_refuses_naming_the_site() {
             let clock = Arc::new(ManualClock::default());

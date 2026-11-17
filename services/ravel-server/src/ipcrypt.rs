@@ -583,6 +583,22 @@ mod tests {
         assert_eq!(store.sequence_progress(0), 3);
     }
 
+    /// A create that landed but answered `Transient` reads back on the retry
+    /// as this policy's own marker and matches; nothing is written twice.
+    #[tokio::test]
+    async fn marker_create_whose_ack_was_lost_reads_back_and_matches() {
+        use crate::startup_retry::test_support::{ManualClock, ack_lost_then_ok, retry_on};
+        let clock = Arc::new(ManualClock::default());
+        let store = FaultStore::new(MemoryStore::new(), ack_lost_then_ok(IPCRYPT_POLICY_KEY));
+        let policy = IpcryptPolicy::new(defaults_policy(&["client.ip"]), Some(&KEY)).expect("a");
+        let outcome = check_startup_marker(&store, Mode::All, &policy, &retry_on(clock))
+            .await
+            .expect("the retry finds the landed marker");
+        assert_eq!(outcome, Some(CheckOutcome::Matched));
+        assert_eq!(store.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
+        assert_eq!(store.sequence_progress(0), 1);
+    }
+
     #[tokio::test]
     async fn marker_check_transient_past_the_deadline_refuses_naming_the_site() {
         use crate::startup_retry::test_support::{

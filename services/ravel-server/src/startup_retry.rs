@@ -444,6 +444,17 @@ pub(crate) mod test_support {
         FaultPlan::empty().with_sequence(sequence.then_passthrough())
     }
 
+    /// The first `put` on `key` lands but answers `Transient` (a lost
+    /// acknowledgement); later puts pass through.
+    pub(crate) fn ack_lost_then_ok(key: &str) -> FaultPlan {
+        FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Put)
+                .with_key_contains(key)
+                .then_fault(ScriptedFault::DuplicateDelivery)
+                .then_passthrough(),
+        )
+    }
+
     /// Fails transiently on every (`op`, `key`) call.
     pub(crate) fn always_transient(op: Op, key: &str) -> FaultPlan {
         FaultPlan::empty().with_rule(
@@ -778,6 +789,27 @@ mod tests {
             .expect("the marker landed");
     }
 
+    /// A marker write that landed but answered `Transient` is read back by
+    /// the retry and validated; nothing is written a second time.
+    #[tokio::test]
+    async fn tenancy_reads_back_a_marker_whose_write_ack_was_lost() {
+        let clock = Arc::new(ManualClock::default());
+        let store = faulted(ack_lost_then_ok(crate::tenancy::TENANCY_MARKER_KEY));
+        let resolved = resolve_tenancy(
+            &retry_on(clock.clone()),
+            &store,
+            ConfiguredScheme::Unkeyed,
+            1,
+        )
+        .await
+        .expect("the retry finds the landed marker");
+        assert!(matches!(resolved.scheme, TenantHashScheme::V1Unkeyed));
+        assert_eq!(store.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
+        // Only the faulted put ran: the passthrough step was never reached.
+        assert_eq!(store.sequence_progress(0), 1);
+        assert_eq!(clock.sleeps().len(), 1);
+    }
+
     #[tokio::test]
     async fn tenancy_transient_past_the_deadline_refuses_naming_the_site() {
         let clock = Arc::new(ManualClock::default());
@@ -930,6 +962,38 @@ mod tests {
         .expect("starts once the store answers");
         assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 2);
         assert_eq!(store.sequence_progress(0), 3);
+    }
+
+    /// Epoch 0 lands but its acknowledgement is lost: the retry reads the
+    /// unfinished bootstrap back and appends epoch 1 once, so the record ends
+    /// with exactly the two epochs a clean start writes.
+    #[tokio::test]
+    async fn tenant_kms_completes_a_bootstrap_whose_first_write_ack_was_lost() {
+        let clock = Arc::new(ManualClock::default());
+        let store = faulted(ack_lost_then_ok("/enc"));
+        configure_tenant_kms(
+            &retry_on(clock.clone()),
+            &kms_store(),
+            &store,
+            &kms_config(),
+            1,
+        )
+        .await
+        .expect("the retry completes the bootstrap");
+        assert_eq!(store.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
+        assert_eq!(store.sequence_progress(0), 2);
+        let epochs = ravel_catalog::read_epochs_from_store(&store, &TenantId::new("acme").hash())
+            .await
+            .expect("read epochs")
+            .expect("record present");
+        let keys: Vec<(u32, &str)> = epochs
+            .iter()
+            .map(|e| (e.epoch, e.key_arn.as_str()))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![(0, ""), (1, "arn:aws:kms:us-east-1:111122223333:key/acme")]
+        );
     }
 
     #[tokio::test]
