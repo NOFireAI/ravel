@@ -2408,11 +2408,13 @@ pub enum BackgroundMigrateOutcome {
 /// One background `migrate` maintenance unit for one `(tenant, signal,
 /// family)` (ADR-4233 decision 6, `--background-migrate`): [`migrate_family`]'s
 /// walk toward the family's active write version, resumed from the advisory
-/// cursor and bounded by `budget`. It runs only when the family's format floor
-/// is below the active version, the one case in which a live object can be
-/// below it; the walk itself rewrites only buckets that serve such an object,
-/// and raises the floor once it drains clean, after which the unit is a single
-/// provisioning-record GET. It spawns nothing; the caller schedules it.
+/// cursor and bounded by `budget`. It runs when the family's format floor is
+/// below the active version, or when `sys/compat` marks the family's
+/// certificate contradicted (a late write below the floor was found, so the
+/// floor no longer proves the bucket clean); the walk itself rewrites only
+/// buckets that serve an object below the active version, and raises the floor
+/// once it drains clean, after which the unit is a single provisioning-record
+/// GET. It spawns nothing; the caller schedules it.
 #[allow(clippy::too_many_arguments)]
 pub async fn background_migrate_unit(
     store: &dyn ObjectStoreBackend,
@@ -2424,11 +2426,10 @@ pub async fn background_migrate_unit(
     configured_shards: u32,
     budget: MigrateBudget,
 ) -> Result<BackgroundMigrateOutcome> {
-    let Some(active_version) = config
-        .compat_policy
-        .as_ref()
-        .and_then(|policy| policy.active_version(family))
-    else {
+    let Some(policy) = config.compat_policy.as_ref() else {
+        return Ok(BackgroundMigrateOutcome::NoPolicy);
+    };
+    let Some(active_version) = policy.active_version(family) else {
         return Ok(BackgroundMigrateOutcome::NoPolicy);
     };
     let floor = current_floor_from_store(store, &tenant_hash, signal, family)
@@ -2436,6 +2437,7 @@ pub async fn background_migrate_unit(
         .map_err(|err| MaintainError::Provisioning(err.to_string()))?;
     if let Some(floor) = floor
         && floor >= u32::from(active_version)
+        && !family_contradicted(policy, family)
     {
         return Ok(BackgroundMigrateOutcome::UpToDate {
             active_version,
@@ -2471,6 +2473,18 @@ pub async fn background_migrate_unit(
         }
         Err(err) => Err(err),
     }
+}
+
+/// Whether the view's last `sys/compat` read marks `family`'s certificate
+/// contradicted: a late write below the certified version was found after the
+/// floor was raised, so the floor no longer proves no live object is below it.
+fn family_contradicted(policy: &crate::compat_policy::MaintainCompatPolicy, family: &str) -> bool {
+    policy.view().last_record().is_some_and(|record| {
+        record
+            .families
+            .iter()
+            .any(|entry| entry.family == family && entry.contradicted)
+    })
 }
 
 /// The `raised_by` a floor raised by [`background_migrate_unit`] records.
@@ -6815,6 +6829,115 @@ mod tests {
                 active_version: 7,
                 floor: 7
             }
+        );
+        assert_eq!(store_snapshot(store.as_ref()).await, before);
+    }
+
+    /// A contradicted certificate means a late write below the floor exists,
+    /// so the floor no longer proves the bucket clean: the background unit
+    /// walks a floored bucket while the family is contradicted, rewrites the
+    /// late object, and rests again once the flag clears.
+    #[tokio::test]
+    async fn the_background_unit_walks_a_floored_bucket_while_contradicted() {
+        use crate::compat_policy::test_support::{
+            ManualClock, T0, activate, family, keys, policy, write_compat,
+        };
+        use ravel_catalog::compat::{FAMILY_RSEG, update_compat};
+
+        let store = Arc::new(MemoryStore::new());
+        write_compat(store.as_ref(), vec![family(FAMILY_RSEG, 6)], NS_PER_HOUR).await;
+        provision(store.as_ref(), 1).await;
+        seed_at(store.as_ref(), 0, 100, 1, "alpha", 6).await;
+        activate(store.as_ref(), FAMILY_RSEG, 7).await;
+        let clock = FixedClock::new(sealed_now_ns_for(101));
+        let config = CompactorConfig {
+            compat_policy: Some(
+                policy(store.clone(), ManualClock::at(T0))
+                    .await
+                    .with_family(FAMILY_RSEG, two_rseg()),
+            ),
+            ..CompactorConfig::default()
+        };
+        let unit = || {
+            background_migrate_unit(
+                store.as_ref(),
+                &clock,
+                &config,
+                tenant_hash(),
+                Signal::Metrics,
+                FAMILY,
+                1,
+                MigrateBudget::unlimited(),
+            )
+        };
+        assert!(
+            matches!(
+                unit().await.expect("first walk"),
+                BackgroundMigrateOutcome::Walked { .. }
+            ),
+            "the first walk raises the floor"
+        );
+        assert_eq!(
+            current_floor_from_store(store.as_ref(), &tenant_hash(), Signal::Metrics, FAMILY)
+                .await
+                .expect("floor"),
+            Some(7)
+        );
+
+        // A late writer from a release still writing 6 lands under the floor.
+        seed_at(store.as_ref(), 0, 101, 1, "alpha", 6).await;
+        assert!(
+            matches!(
+                unit().await.expect("floored, not contradicted"),
+                BackgroundMigrateOutcome::UpToDate { .. }
+            ),
+            "the floor alone hides the late object"
+        );
+
+        let set_contradicted = |value: bool| {
+            let store = store.clone();
+            async move {
+                update_compat(store.as_ref(), &keys(), |record| {
+                    for entry in &mut record.families {
+                        if entry.family == FAMILY_RSEG {
+                            entry.contradicted = value;
+                        }
+                    }
+                    Ok(())
+                })
+                .await
+                .expect("update sys/compat");
+            }
+        };
+        set_contradicted(true).await;
+        let view = config.compat_policy.as_ref().expect("policy").view();
+        view.refresh().await.expect("refresh");
+
+        let BackgroundMigrateOutcome::Walked {
+            active_version,
+            report,
+            held,
+        } = unit().await.expect("contradicted walk")
+        else {
+            panic!("a contradicted family's floored bucket is walked");
+        };
+        assert_eq!(active_version, 7);
+        assert!(held.is_empty(), "{held:?}");
+        assert_eq!(report.buckets_migrated, 1, "{report:?}");
+        assert_eq!(
+            compacted_versions(store.as_ref(), 0, 101).await,
+            vec![(7, 7)]
+        );
+
+        set_contradicted(false).await;
+        view.refresh().await.expect("refresh");
+        let before = store_snapshot(store.as_ref()).await;
+        assert!(
+            matches!(
+                unit().await.expect("rests again"),
+                BackgroundMigrateOutcome::UpToDate { floor: 7, .. }
+            ),
+            "the floor shortcut returns once the flag clears"
         );
         assert_eq!(store_snapshot(store.as_ref()).await, before);
     }
