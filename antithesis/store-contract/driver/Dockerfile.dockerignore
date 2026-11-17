@@ -1,0 +1,11 @@
+# BuildKit reads this file instead of the repository-root .dockerignore when
+# it builds driver/Dockerfile. The context is the repository root; the build
+# reads only the root manifest (for the workspace fields ravel-object-store
+# inherits), that crate, and this driver. rust-toolchain.toml stays out: the
+# base image already pins the same toolchain.
+*
+!Cargo.toml
+!crates/ravel-object-store/
+!antithesis/store-contract/driver/
+antithesis/store-contract/driver/target/
+crates/ravel-object-store/target/
