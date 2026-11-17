@@ -1671,7 +1671,8 @@ for the part when no key8 run exceeds a share. For a logs day at the
 default budget, two fields at a share of 4,000,000, that is at most
 8,000,002 pairs, 8,000,002 x 88 B = 704,000,176 B, about 0.70 GB at the
 88 B upper-bound estimate, where the one-pass build held about 6.8 GB
-(ADR-3939, "Decision 2, clarified"). The rest of the list above still adds
+(predicted, never measured: see the measured repair amendment at the end;
+ADR-3939, "Decision 2, clarified"). The rest of the list above still adds
 to it: sections in flight, the encoded leaves of one pass, per-entry
 bookkeeping, and a key8 run over its share. Parts are built one at a time,
 so a batch of parts holds no more than its largest part.
@@ -1696,13 +1697,14 @@ Refs: #4018, #4297
 ## Amendment (issue #4350): the pair-budget repair measured
 
 <!-- amendment-applies: sections="Amendment (issues #4018 and #4297): the key-index repair builds under the pair budget" pointer="measured repair amendment" -->
+<!-- amendment-supersedes: phrase="the one-pass build held about 6.8 GB" pointer="measured repair amendment" -->
 
 Date: 2026-11-17. Real S3, c6a.4xlarge, main a8a3be09d. One sealed logs
 part, E = 548 entries, request_id 100,000,000 and trace_id 20,000,000
 pairs, both fields missing (#4347 comment 6942022692). This measures
-this amendment's predicted 25 passes, 27,600 GETs and 30.2 GB of section
-bytes at E = 552; the measured entry count and per-read size differ
-slightly from that prediction's basis.
+the pair-budget repair amendment's predicted 25 passes, 27,600 GETs and
+30.2 GB of section bytes at E = 552; the measured entry count and
+per-read size differ slightly from that prediction's basis.
 
 At the default budget (8,000,000): 25 passes (request_id 25, trace_id
 5), 27,400 ranged GETs (13,700 footer + 13,700 section), 28,820,377,200 B
@@ -1713,5 +1715,13 @@ wall 426.4 s. Spans, E = 800, trace_id only: 3 passes at 8,000,000
 (581,789,508 B, peak RSS 864,022,528 B, wall 70.4 s) and 2 at 16,000,000
 (387,859,672 B, peak RSS 1,685,831,680 B, wall 52.5 s). ADR-3939 carries
 the same figures in its own measured repair amendment.
+
+The pair-budget repair amendment's "the one-pass build held about 6.8 GB"
+is a prediction of held pairs from ADR-3939's "Decision 2, clarified", and
+no run measured the pairs that build held. What was measured is the
+one-pass repair's peak RSS on box D: 8,831,176,704 B for logs and
+2,214,277,120 B for spans (#3692 comment 6700944105). RSS also counts the
+sections in flight, the encoded leaves and allocator overhead, so it
+neither confirms nor refutes the 6.8 GB pairs figure.
 
 Refs: #4350, #4347

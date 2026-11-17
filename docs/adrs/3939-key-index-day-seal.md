@@ -459,9 +459,9 @@ and 31.4 GB for a logs day, which A3 forbids. Declaring a key-index field
 for a tenant with the switch on is therefore followed by the repair over
 its sealed days. The repair builds in one pass today, about 6.8 GB of
 pairs for a logs day, over the 2 GB band; #4018 gives it the pair budget
-(done: see the repair pair-budget amendment at the end; the 6.8 GB figure
-was a prediction, never measured, see the measured repair amendment at
-the end).
+(done: see the repair pair-budget amendment at the end; the 6.8 GB of
+pairs was a prediction, never measured, see the measured repair amendment
+at the end).
 
 ### Acceptance (added rows; predicted, a figure outside its band is a miss)
 
@@ -529,7 +529,9 @@ An uncovered day on these states is read against 384 first.
 **Two states.** A 7-day state at box D's logs rate, for A5, W4, W6, W7, F1
 and F3 on W4. A 30-day state at a reduced rate per day, for A7, W5, F2 and
 F3 on W5,
-because 30 days at box D's rate cost about 4 hours of fold and about 20
+because 30 days at box D's rate cost about 4 hours of fold (restated as
+about 5.2 hours for logs alone, projected, in the measured repair
+amendment at the end) and about 20
 hours of corpus generation, which no single run's deadline holds. At the
 reduced rate the per-day figures follow the slices the run stamps: with
 `S` the most slices one day part carries for `request_id` (the harness's
@@ -766,8 +768,9 @@ Date: 2026-11-16. "Decision 2, clarified", in the multi-day lookups
 amendment, says the `--rebuild-key-index`
 repair that follows a new key-index field's declaration builds a sealed
 day in one pass, about 6.8 GB of pairs for a logs day, over the 2 GB RSS
-band. That is retired; the 6.8 GB figure was itself a prediction, see the
-measured repair amendment at the end for the measured one-pass RSS. The
+band. That is retired; the 6.8 GB of pairs was itself a prediction,
+never measured (the measured repair amendment at the end gives the
+one-pass repair's measured peak RSS, which is a different quantity). The
 repair (`Catalog::rebuild_key_index`) runs the
 fold's leaf build under `key_index_build_max_pairs`, in the same passes,
 one part at a time, and `ravel-cli catalog fold --rebuild-key-index` takes
@@ -792,13 +795,13 @@ explicit and operator-driven, not a fold, so A3, which bounds the fold,
 does not apply to it. ADR-3692's pair-budget repair amendment states
 the same bound. The measured repair amendment at the end restates the
 pass count, GET count and section bytes above as measured against real
-S3.
+S3, and gives the measured peak RSS.
 
 Refs: #4018, #4297
 
 ## Amendment (issue #4350): the pair-budget repair measured, and the superseded one-pass RSS corrected
 
-<!-- amendment-applies: sections="Amendment (issue #3939, multi-day lookups): the carry source, retention under leaf-bearing parts, and the week merge gate|Amendment (issues #4018 and #4297): the repair builds under the pair budget" pointer="measured repair amendment" -->
+<!-- amendment-applies: sections="Amendment (issue #3939, multi-day lookups): the carry source, retention under leaf-bearing parts, and the week merge gate|Amendment (issue #3939, harness states): how Stage 2 builds day parts, which binary measures W2, and W5 and A7 at a reduced rate|Amendment (issues #4018 and #4297): the repair builds under the pair budget" pointer="measured repair amendment" -->
 
 Date: 2026-11-17. Real S3, c6a.4xlarge, main a8a3be09d. One sealed logs
 part, E = 548 entries, request_id 100,000,000 and trace_id 20,000,000
@@ -819,8 +822,19 @@ section reads, peak RSS 864,022,528 B, wall 70.4 s) and 2 passes at
 16,000,000 (387,859,672 B, peak RSS 1,685,831,680 B, wall 52.5 s).
 
 "Decision 2, clarified"'s "about 6.8 GB of pairs" for the retired
-one-pass repair was itself a prediction, never measured. The real
-one-pass repair (pre-#4018/#4297) measured 8.83 GB RSS for logs and
-2.21 GB for spans (#3692 comment 6700944105).
+one-pass repair was a prediction of held pairs, and no run measured the
+pairs that repair held. What was measured is its peak RSS: the one-pass
+repair (before #4018 and #4297) peaked at 8,831,176,704 B for logs and
+2,214,277,120 B for spans on box D, c6a.4xlarge, build af3986e92 (#3692
+comment 6700944105). RSS also counts the sections in flight, the encoded
+leaves and allocator overhead, so it neither confirms nor refutes the
+6.8 GB pairs figure.
+
+The harness states amendment's "about 4 hours of fold" for 30 days at box
+D's rate is restated as a projection for logs alone. Run D's first fold of
+a 7-day logs state at box D's rate took 4,344 s (#3692 comment
+6847040976); scaled linearly to 30 days that is 4,344 x 30 / 7, about
+18,600 s or 5.2 hours. No 30-day fold at that rate was measured. The
+reason for the reduced 30-day rate stands.
 
 Refs: #4350, #4347

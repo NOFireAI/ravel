@@ -413,7 +413,8 @@ flowchart LR
     entry's footer suffix and KEY_IDX section (the two ranged GETs per
     entry of decision 4's leaf build; no longer one pass only, the repair
     now runs under the pair budget in as many passes as the field needs,
-    see ADR-3692's pair-budget repair amendment), writes the leaves, and publishes a
+    see ADR-3692's pair-budget repair amendment), writes the leaves, and
+    publishes a
     HEAD whose part refs are the current ones with `key_index` attached
     (`SnapshotHead.parts` carries the refs inline, so the publish is the
     HEAD CAS and nothing else). The part objects, their blake3 and their
