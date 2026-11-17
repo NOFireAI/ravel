@@ -1643,6 +1643,26 @@ budget that cannot hold them refuses the decode with the same typed
 `FetchMemoryExhausted` before the columns are decoded
 (`crates/ravel-query/tests/l1_read_memory.rs`).
 
+A series listing does not decode them. Its catalog decode
+(`SegmentFetcher::list_series_phase_accounted`, see "Series held by a
+discovery read" below) reads series ids and labels only, so its
+`CatalogCharge` answers `false` to `decodes_provenance`, and the decoder passes
+over the four sample-major columns by their `block_len` prefixes: they are
+neither allocated nor charged, and the entries carry no provenance. The decoder
+still decodes and validates the run-major presence column and checks each
+column's `Enc` tag. A column payload that does not decode, an out-of-range
+created time or in-page index, and the section cap on the decoded footprint
+are not checked there, since they belong to a decode the listing does not run;
+a sample read of the same object still reports them. The listing's charge is
+then what it fetches plus the inflated catalog sections, and what still grows
+with samples is stored bytes: the encoded columns inside the inflated
+SERIES_META, and the page bytes of an object small enough to be fetched whole.
+On a 288,000-sample L1 object of 19,474 bytes that is 324,364 bytes, about 1.13
+per sample, where the decode with provenance charges 27,972,364
+(`crates/ravel-query/tests/listing_skips_provenance.rs`). Every other catalog
+decode, the PromQL and SQL sample paths and `fetch_series` among them, decodes
+and charges provenance as above.
+
 Once the matchers have run, `decode_selected` exchanges the whole-catalog
 reservation for one sized to the entries that survived, measured over their
 structs, label strings, runs and provenance. A selective query on a large object therefore
@@ -1687,7 +1707,12 @@ copy per series id, and reserve
 each series they add against the same budget: its id, its label set and each
 label's two strings (`retained_series_len` in `engine.rs`). A series appears
 in every object it wrote to, so keeping each segment's entries until the last
-fetch held one copy per object. This holds per `match[]` selector: a
+fetch held one copy per object. Each object's catalog decode skips the
+per-sample provenance extension (see "Per-sample provenance" above), so an L1
+object's provenance is neither decoded nor charged by these reads. They return
+the series, labels and erasure exclusions the decode that materializes it
+gives, so the map receives the same series and its `max_series` check and
+`retained_series_len` charge are unchanged. This holds per `match[]` selector: a
 selector whose retained series do not fit is refused with the same 422
 `FetchMemoryExhausted`, against the budget's limit, and `max_series` is
 checked as each series is added, so a selector over it is refused before its

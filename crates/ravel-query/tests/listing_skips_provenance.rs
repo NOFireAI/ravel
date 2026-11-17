@@ -384,9 +384,9 @@ fn predicate(window_start_ns: i64, window_end_ns: i64) -> ErasurePredicate {
 /// byte-identical to the reference decode that materializes provenance:
 /// the same series, the same labels, the same erasure exclusions.
 ///
-/// FLIP: a skip that drops the entries whose runs carried provenance (every
-/// series of the L1 parts) leaves `listing` empty against 200 and 4,100
-/// reference series.
+/// FLIP: a decode that drops the entries whose provenance it skipped (every
+/// series of the L1 parts) returns an empty listing, which fails the
+/// comparison with the reference.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_listing_matches_the_provenance_decode_over_l0_and_l1_with_erasure() {
     let windowed = (hour_start() + NS_PER_HOUR, hour_start() + 2 * NS_PER_HOUR);

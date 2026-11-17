@@ -213,7 +213,7 @@ mod without_provenance_tests {
     /// FLIPS: the skip branch in `parse_series_meta_tail_v4` or
     /// `decode_chunk_frame` calling the full parser with an uncharged ledger
     /// reads `5 * extensions` blocks instead of `extensions`; dropping the
-    /// entries of runs it skipped fails the entry comparison.
+    /// entries whose provenance it skipped fails the series count.
     fn assert_skips(decode: &Decode<'_>, series: usize, extensions: u64, flagged: u64, what: &str) {
         let (with, with_blocks, with_ledger) = run(decode, true);
         let (without, without_blocks, without_ledger) = run(decode, false);
