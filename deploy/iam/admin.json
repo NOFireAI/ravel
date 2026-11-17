@@ -38,7 +38,8 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/*/del/*.dreq",
         "arn:aws:s3:::my-ravel-bucket/t/*/config",
         "arn:aws:s3:::my-ravel-bucket/t/*/pq/grants",
-        "arn:aws:s3:::my-ravel-bucket/sys/pq-probe/*"
+        "arn:aws:s3:::my-ravel-bucket/sys/pq-probe/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/a/alert-lease"
       ]
     },
     {

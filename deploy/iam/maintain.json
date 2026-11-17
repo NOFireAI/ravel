@@ -148,7 +148,8 @@
         "arn:aws:s3:::my-ravel-bucket/sys/maintain/workers/*",
         "arn:aws:s3:::my-ravel-bucket/sys/query/workers/*",
         "arn:aws:s3:::my-ravel-bucket/quarantine/t/*/*/l0/*",
-        "arn:aws:s3:::my-ravel-bucket/t/*/pq/t/*"
+        "arn:aws:s3:::my-ravel-bucket/t/*/pq/t/*",
+        "arn:aws:s3:::my-ravel-bucket/sys/maintain/certify/*"
       ]
     },
     {
