@@ -956,7 +956,7 @@ Compaction then reads the whole object and compares its blake3 hash with the
 
 For an RLOG input the refused version can also be a section's own version: a
 trailer this build reads whose POSTINGS or KEY_IDX section carries a version
-this build cannot read (ADR-4233 hazard H5). Compaction treats it the same
+this build cannot read. Compaction treats it the same
 way, hash check included, and the hold names the section next to that
 section's version.
 
