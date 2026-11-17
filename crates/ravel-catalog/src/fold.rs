@@ -2444,7 +2444,8 @@ async fn read_entry_key_index_counted(
             .await
             .map(|fields| (fields, None));
     }
-    let section = read_key_idx_section_counted(store, tenant, signal, key, object_size, cost).await?;
+    let section =
+        read_key_idx_section_counted(store, tenant, signal, key, object_size, cost).await?;
     let fields = decode_key_idx_section(signal, &section)?;
     Ok((fields, Some(section)))
 }

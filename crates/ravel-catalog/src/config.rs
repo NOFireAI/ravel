@@ -984,7 +984,10 @@ mod tests {
     /// and a budget of 0 is read as 1.
     #[test]
     fn the_repair_hold_cap_derives_from_the_pair_budget() {
-        assert_eq!(derived_key_index_repair_hold_bytes(8_000_000), 1_296_000_000);
+        assert_eq!(
+            derived_key_index_repair_hold_bytes(8_000_000),
+            1_296_000_000
+        );
         assert_eq!(derived_key_index_repair_hold_bytes(16_000_000), 592_000_000);
         assert_eq!(derived_key_index_repair_hold_bytes(22_727_272), 64);
         assert_eq!(derived_key_index_repair_hold_bytes(22_727_273), 0);
@@ -998,7 +1001,10 @@ mod tests {
             key_index_repair_hold_bytes: hold,
             ..CatalogConfig::default()
         };
-        assert_eq!(at(16_000_000, None).key_index_repair_hold_cap(), 592_000_000);
+        assert_eq!(
+            at(16_000_000, None).key_index_repair_hold_cap(),
+            592_000_000
+        );
         assert_eq!(at(0, None).key_index_repair_hold_cap(), 1_999_999_912);
         assert_eq!(at(16_000_000, Some(0)).key_index_repair_hold_cap(), 0);
         assert_eq!(at(16_000_000, Some(7)).key_index_repair_hold_cap(), 7);
