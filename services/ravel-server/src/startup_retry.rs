@@ -72,15 +72,15 @@ pub const SITE_GC_CONFIG: &str = "sys/gc";
 pub const SITE_IPCRYPT_MARKER: &str = "sys/ipcrypt/policy";
 
 /// Elapsed time since process start, the wait between attempts and the bound
-/// on one attempt, injected so a test drives the deadline without waiting.
+/// on one retry, injected so a test drives the deadline without waiting.
 #[async_trait::async_trait]
 pub trait StartupClock: Send + Sync {
     /// Time since process start.
     fn elapsed(&self) -> Duration;
     /// The wait between two attempts.
     async fn sleep(&self, duration: Duration);
-    /// Completes once `duration` has passed; an attempt still running then
-    /// is cut off.
+    /// Completes once `duration` has passed; a retry still running then is
+    /// cut off.
     async fn attempt_timer(&self, duration: Duration);
 }
 
@@ -194,8 +194,8 @@ pub struct StartupRetry {
 
 impl StartupRetry {
     /// `deadline` is measured on `clock` from its zero, which the production
-    /// clock places at process start. A zero `deadline` turns retry and the
-    /// attempt bound off: the first error of any kind refuses, unchanged.
+    /// clock places at process start. A zero `deadline` turns retry, and with it
+    /// the retry bound, off: the first error of any kind refuses, unchanged.
     /// `seed` feeds the jitter.
     pub fn new(clock: Arc<dyn StartupClock>, deadline: Duration, seed: u64) -> Self {
         StartupRetry {

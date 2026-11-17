@@ -346,7 +346,7 @@ another before a listener binds:
 
 | Phase | Bound | Before `--listen-health` binds |
 |---|---|---|
-| The startup store reads `sys/qualification`, `sys/tenancy`, the key-epoch records, the provisioning records and `sys/gc` | A first attempt is not bounded by the server; the store's own request timeout (20 s) and retries end it. Once a read has failed transiently, its retries end by the `--startup-store-deadline` plus 5 s, 20 s from process start with the default. | Yes |
+| The startup store reads `sys/qualification`, `sys/tenancy`, the key-epoch records, the provisioning records and `sys/gc` | A first attempt is not bounded by the server; the store's own request timeout (20 s by default) and retries end it. Once a read has failed transiently, its retries end by the `--startup-store-deadline` plus 5 s, 20 s from process start with the default. | Yes |
 | The bucket-protection read (`--require-bucket-protection`, off by default), right after `sys/qualification` | 10 s, not retried. The deadline is measured from process start, so this time also uses up the deadline left for the reads after it. | Yes |
 | The format-window check (`--format-window-check`, off by default) | `--format-window-check-timeout`, 20 s by default. | Yes |
 | The `sys/ipcrypt/policy` read | As the other startup store reads. | No |
