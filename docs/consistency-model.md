@@ -163,23 +163,40 @@ Buffered mode (opt-in per request, named "buffered"):
   the same error and are never acknowledged. `--write-below-format-floor`
   turns both refusals into a counted write. Eight: the `sys/compat`
   activation policy (ADR-4233 decision 3) refuses the flush at permit grant,
-  or before any PUT attempt of its retry loop -- the process's view of
-  `sys/compat` is stale past its horizon, the active write version for the
-  family is one this build does not write, or the record is missing under a
-  bucket that carries an activation. The flush is dropped, any strict waiter
-  is acked with the retryable `CompatRefused` (503), and
+  or before a PUT attempt of its retry loop. A stale view (the last
+  successful read of `sys/compat` is 10 minutes old, or there has been none
+  and the view is not blind) is waited out, not refused: the flush asks again
+  every second and is refused `view_stale` only once its `max_flush_lifetime`,
+  counted from the first grant, has passed. Every other refusal is immediate:
+  `active_version_not_writable` (the active write version for the family is
+  one this build does not write), `compat_record_missing` (the record is
+  absent under a bucket or a view that has seen an activation),
+  `publish_lifetime_above_compat` at grant (the record's
+  `max_publish_lifetime_ns`, ADR-4233 decision 7, was lowered below this
+  router's `max_flush_lifetime` after the rows were admitted),
+  `fence_failed` (the bucket fence a write above the baseline needs was not
+  established), and `active_version_moved` before a PUT attempt (the active
+  version moved off the one granted). The flush is dropped, any strict
+  waiter is acked with the retryable `CompatRefused` (503), and
   `ravel_compat_publish_refused_total{family,reason}` counts it; no commit
   record is published by the refused attempt, and a data object already
   stored before a later-attempt refusal is left for orphan GC. Like case
   seven this drops acknowledged buffered rows, and for the same reason it is
   deliberate: a build that cannot write the family's active format version
   must not publish rows a reader at that activation would reject (ADR-4233
-  decision 1). The one exception is a router dropped without `shutdown()`:
-  its teardown flush reads the per-tenant compat-epoch cache its shards hold
-  by `Arc` even after the router's switch is gone, so it grants and fences
-  from the cached epoch instead of being refused `no_bucket_view`, and those
-  acknowledged rows publish rather than being lost (the loss this list is
-  about). The
+  decision 1). Admission applies the same view first, stale included, so
+  rows that arrive once the view is stale or the record refuses are never
+  acknowledged. On a store that never ran compat init (no `sys/compat`
+  and no `compat_epoch` on any bucket) none of the immediate refusals can
+  fire: there is no activation, no lifetime bound and no fence, and every
+  family writes its baseline. Only `view_stale` can, and only for rows
+  acknowledged before the view went stale, when reads of `sys/compat` keep
+  failing past the 10 minute horizon until the flush's `max_flush_lifetime`
+  runs out. A
+  router dropped without `shutdown()` adds no case: its teardown flush reads
+  the per-tenant compat-epoch cache its shards hold by `Arc` even after the
+  router's switch is gone, so it is granted, fenced and refused exactly as
+  above, and the `no_bucket_view` reason is never raised. The
   ADR-1685 store-clock lag check is not a case of its own: a teardown drain's
   bypass passes disable that check precisely so it cannot drop acknowledged
   rows, and what it costs instead is visibility until a HEAD rebuild (see

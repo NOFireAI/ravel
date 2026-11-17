@@ -2679,8 +2679,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // every mode, read once here before any writer starts and then every
     // `DEFAULT_COMPAT_REFRESH_INTERVAL` by one task. Every writer reads it:
     // first-touch provisioning, the catalog fold (through the catalog), the
-    // alert evaluator, the ingest routers (#4244) and the maintenance
-    // compactor (#4245) below. One clock stamps the view's reads and judges
+    // alert evaluator, the ingest routers (#4244), the maintenance
+    // compactor (#4245) and the query audit pipeline below. One clock stamps the view's reads and judges
     // staleness for every policy built over it. `None` on an unkeyed bucket.
     let compat_clock: Arc<dyn ravel_catalog::compat::CompatClock> =
         Arc::new(compat::SystemCompatClock);
@@ -3708,10 +3708,17 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         // audit family, and shutdown has nothing to drain.
         let audit_sink: Arc<dyn ravel_maintain::QueryAuditSink> = match &config.audit_pipeline {
             Some(audit_config) => {
-                let audit_pipeline_handle = Arc::new(ravel_maintain::AuditPipeline::spawn(
-                    store.clone(),
-                    audit_config.clone(),
-                ));
+                // The audit RLOG is a published object like any other, so it
+                // is written under the `sys/compat` policy (ADR-4233).
+                let audit_pipeline_handle =
+                    Arc::new(ravel_maintain::AuditPipeline::spawn_with_compat(
+                        store.clone(),
+                        audit_config.clone(),
+                        Arc::new(ravel_commit::rng::SystemRng),
+                        compat_view.clone().map(|view| {
+                            ravel_maintain::MaintainCompatPolicy::new(view, compat_clock.clone())
+                        }),
+                    ));
                 // `/metrics` reads the pipeline's counters at scrape time, so
                 // it takes a counters handle rather than a snapshot taken here.
                 metrics_state.audit_pipeline = Some(metrics::AuditPipelineCounters::new(

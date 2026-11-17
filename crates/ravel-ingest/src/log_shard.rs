@@ -65,7 +65,9 @@ use uuid::Uuid;
 
 use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
-use crate::compat::{CompatPublishRefusal, PublishGrant, PutAbort, warn_publish_refused};
+use crate::compat::{
+    CompatPublishRefusal, PublishGrant, PutAbort, STALE_VIEW_RETRY, warn_publish_refused,
+};
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LagCheck, MAX_FLUSH_ALL_PASSES,
     MAX_FLUSH_CLOCK_HOLD_NS, StoreClockLag, checked_ingest_hour_bucket, duration_nanos_saturating,
@@ -1417,7 +1419,10 @@ impl LogFlushCtx {
     ) -> Result<(), PutAbort> {
         let mut attempt: u32 = 0;
         loop {
-            grant.check_attempt().map_err(PutAbort::Refused)?;
+            grant
+                .attempt_when_fresh(self.clock.as_ref(), deadline_ns)
+                .await
+                .map_err(PutAbort::Refused)?;
             let call = publish::put_data_object(self.store.as_ref(), key, bytes.clone());
             match self.bound_to_deadline(deadline_ns, call).await {
                 Some(Ok(())) => return Ok(()),
@@ -1460,7 +1465,10 @@ impl LogFlushCtx {
         };
         let mut attempt: u32 = 0;
         loop {
-            grant.check_attempt().map_err(PutAbort::Refused)?;
+            grant
+                .attempt_when_fresh(self.clock.as_ref(), deadline_ns)
+                .await
+                .map_err(PutAbort::Refused)?;
             let call = publish::publish(self.store.as_ref(), record, &single_attempt);
             match self.bound_to_deadline(deadline_ns, call).await {
                 Some(Ok(token)) => return Ok(token),
@@ -3158,53 +3166,73 @@ impl LogShardActor {
                 // `max_inflight_flushes` is the binding window on a bulk load (issue
                 // #800): it stays at zero unless a shard is actually asked for a
                 // second concurrent flush.
-                let permit_wait_start_ns = clock.now_ns();
-                #[cfg(test)]
-                ctx.on_phase(FlushPhase::PermitWait);
-                // The tenant's share permit is taken first (ADR-2708 D3).
-                let permit = match slot.acquire(&semaphore).await {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        panic!(
-                            "ravel-ingest: log flush semaphore closed unexpectedly on shard {shard}"
-                        )
-                    }
-                };
-                let permit_wait_ns =
-                    clock.now_ns().saturating_sub(permit_wait_start_ns).max(0) as u64;
-                metrics.record_shard_flush_permit_wait_ns(shard, permit_wait_ns);
-                metrics.record_flush_phase(FlushPhase::PermitWait, permit_wait_ns);
-                let _permit = permit;
-                // Issue #1739 part 1: re-derive the abandonment deadline from the
-                // moment the permit is granted, not from flush-open. A flush that
-                // queued behind a stalled prefix must get its full
-                // `max_flush_lifetime` for its own store calls; pinning at flush-open
-                // spent that budget in the queue and dropped already-acked buffered
-                // rows with no PUT. The re-derived value only ever moves the deadline
-                // later (grant is at or after open), so it never shortens a flush's
-                // store budget.
-                //
-                // ADR-2708 D3 clamps it to the pinned hour's end plus
-                // `max_flush_lifetime` and abandons a flush granted past that bound
-                // without a PUT. The hour is not re-pinned.
-                pinned.deadline_ns = match grant_deadline_ns(
-                    clock.now_ns(),
-                    pinned.ingest_hour_bucket,
-                    ctx.config.max_flush_lifetime,
-                ) {
-                    Some(deadline_ns) => deadline_ns,
-                    None => {
-                        ctx.abandon_hour_bound(pinned);
-                        return;
-                    }
-                };
-                // ADR-4233 decision 2: the version is chosen here, at grant,
-                // as in the metrics shard.
-                let grant = match scope.compat_grant(pinned.tenant_hash, FormatFamily::Rlog) {
-                    Ok(grant) => grant,
-                    Err(refused) => {
-                        ctx.abandon_compat(pinned, refused);
-                        return;
+                let mut first_grant_deadline_ns = None;
+                let (_permit, grant) = loop {
+                    let permit_wait_start_ns = clock.now_ns();
+                    #[cfg(test)]
+                    ctx.on_phase(FlushPhase::PermitWait);
+                    // The tenant's share permit is taken first (ADR-2708 D3).
+                    let permit = match slot.acquire(&semaphore).await {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            panic!(
+                                "ravel-ingest: log flush semaphore closed unexpectedly on shard {shard}"
+                            )
+                        }
+                    };
+                    let permit_wait_ns =
+                        clock.now_ns().saturating_sub(permit_wait_start_ns).max(0) as u64;
+                    metrics.record_shard_flush_permit_wait_ns(shard, permit_wait_ns);
+                    metrics.record_flush_phase(FlushPhase::PermitWait, permit_wait_ns);
+                    // Issue #1739 part 1: re-derive the abandonment deadline from the
+                    // moment the permit is granted, not from flush-open. A flush that
+                    // queued behind a stalled prefix must get its full
+                    // `max_flush_lifetime` for its own store calls; pinning at flush-open
+                    // spent that budget in the queue and dropped already-acked buffered
+                    // rows with no PUT. The re-derived value only ever moves the deadline
+                    // later (grant is at or after open), so it never shortens a flush's
+                    // store budget. A flush requeued for a stale view keeps the
+                    // deadline of its first grant.
+                    //
+                    // ADR-2708 D3 clamps it to the pinned hour's end plus
+                    // `max_flush_lifetime` and abandons a flush granted past that bound
+                    // without a PUT. The hour is not re-pinned.
+                    pinned.deadline_ns = match first_grant_deadline_ns {
+                        Some(deadline_ns) => deadline_ns,
+                        None => match grant_deadline_ns(
+                            clock.now_ns(),
+                            pinned.ingest_hour_bucket,
+                            ctx.config.max_flush_lifetime,
+                        ) {
+                            Some(deadline_ns) => deadline_ns,
+                            None => {
+                                ctx.abandon_hour_bound(pinned);
+                                return;
+                            }
+                        },
+                    };
+                    first_grant_deadline_ns = Some(pinned.deadline_ns);
+                    // ADR-4233 decision 2: the version is chosen here, at grant,
+                    // as in the metrics shard, and a stale view requeues the
+                    // flush until its deadline the same way.
+                    match scope.compat_grant(pinned.tenant_hash, FormatFamily::Rlog) {
+                        Ok(grant) => break (permit, grant),
+                        Err(refused) if refused.is_view_stale() => {
+                            drop(permit);
+                            let wait = clock.sleep(STALE_VIEW_RETRY);
+                            if ctx
+                                .bound_to_deadline(pinned.deadline_ns, wait)
+                                .await
+                                .is_none()
+                            {
+                                ctx.abandon_compat(pinned, refused);
+                                return;
+                            }
+                        }
+                        Err(refused) => {
+                            ctx.abandon_compat(pinned, refused);
+                            return;
+                        }
                     }
                 };
                 if u32::from(grant.version()) != open_version {
