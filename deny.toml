@@ -132,6 +132,22 @@ ignore = [
   "RUSTSEC-2026-0391",
   "RUSTSEC-2026-0398",
   "RUSTSEC-2026-0403",
+  # RUSTSEC-2026-0543 (chrono 0.4.45) and RUSTSEC-2026-0555 (chrono-tz
+  # 0.10.4): both crates are unmaintained. These are maintenance notices,
+  # not vulnerabilities. No workspace crate depends on either directly:
+  # chrono comes in through arrow, parquet, datafusion, object_store,
+  # promql-parser, rmcp and schemars, and chrono-tz through arrow-array
+  # and datafusion-functions. Remove these when those dependencies move
+  # off chrono.
+  "RUSTSEC-2026-0543",
+  "RUSTSEC-2026-0555",
+  # RUSTSEC-2026-0542: humantime 2.4.0 is unmaintained, a maintenance
+  # notice, not a vulnerability. Six workspace crates use it directly to
+  # parse durations and RFC 3339 timestamps (ravel-query's HTTP params,
+  # ravel-cli's flags, ravel-mcp) and to format durations; object_store
+  # also depends on it. Replacing the direct uses is tracked separately;
+  # remove this entry once that lands and object_store no longer pulls it.
+  "RUSTSEC-2026-0542",
 ]
 
 [licenses]
