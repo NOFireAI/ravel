@@ -349,7 +349,8 @@ deployment_ready() {
 # so assert_replicas_handed_over can reject co-ownership.
 replicas_field_managers() {
   local dep="$1"
-  kubectl get -n "${NAMESPACE}" "deployment/${dep}" -o json |
+  # kubectl omits metadata.managedFields from -o json unless asked.
+  kubectl get -n "${NAMESPACE}" "deployment/${dep}" -o json --show-managed-fields |
     jq -r '[.metadata.managedFields[]? |
       select(.fieldsV1 != null
         and (.fieldsV1 | has("f:spec"))

@@ -286,9 +286,13 @@ case "${verb}" in
   get)
     resource="${args[1]:-}"
     output=""
+    show_managed_fields=""
     # kubectl's own `-o jsonpath=...` arrives as one token (-o then the
     # value), and `-o json` the same way; scan positionally.
     for ((i=2; i<${#args[@]}; i++)); do
+      if [[ "${args[$i]}" == "--show-managed-fields" ]]; then
+        show_managed_fields=1
+      fi
       if [[ "${args[$i]}" == "-o" ]]; then
         nextv="${args[$((i+1))]:-}"
         if [[ "${nextv}" == jsonpath=* ]]; then
@@ -399,6 +403,12 @@ case "${verb}" in
             # inject the two failure shapes assert_replicas_handed_over must
             # catch: ravel-operator co-owning the field beside the handover
             # manager, and no manager owning it at all.
+            # Like a real kubectl (1.21 and later), `-o json` omits
+            # metadata.managedFields unless --show-managed-fields is passed.
+            if [[ -z "${show_managed_fields}" ]]; then
+              jq -n '{"metadata":{}}'
+              exit 0
+            fi
             base_manager="$(jq -r --arg d "${dep}" '.deployments[$d].manager' "${WORLD}")"
             if [[ -n "${STUB_NO_REPLICAS_OWNER:-}" && "${dep}" == "${STUB_NO_REPLICAS_OWNER}" ]]; then
               # A managedFields entry that owns something other than
