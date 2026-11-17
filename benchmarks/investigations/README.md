@@ -881,7 +881,7 @@ reports `missing stamps/<name>` for any it needs and does not find;
 | `STATE.logs.fold_binary.json` | `retired_hour` and each `day_parts_N`: the fold binary's `sha`, run.toml's `c1_sha` and `r2_sha` resolved, and `carries_c1` and `carries_r2` by git ancestry |
 | `STATE.logs.fold_watermark.json` | `retired_hour` and `retired_hour_drop`: the retention fold's `previous_watermark_hour` and `watermark_hour` from its `--json` report, `no_op`, and `advanced`; the state fails when it is false |
 | `STATE.logs.tombstone.json` | `retired_hour` and `retired_hour_drop`: the tombstoned `hour` (D0) and `first_hour` to `last_hour` in unix hours, the retention window and the tombstone-check output |
-| `repair_arms_B.SIG.preconditions.json` | `repair_arms`, per arm and signal, before the repair: the declared `fields`, their `leaf_refs` and `declared_leaf_refs`, `parts`, `parts_unindexed`, `largest_unindexed_part_entries` (E), `key_index_build_max_pairs`, and the `ravel_cli` path, `ravel_cli_sha256` and `sha` the repair runs on |
+| `repair_arms_B.SIG.preconditions.json` | `repair_arms`, per arm and signal, before the repair: the declared `fields`, their `leaf_refs` and `declared_leaf_refs`, `parts`, `parts_missing_declared_leaves` (every part lacking a leaf of some declared field; not the repair report's own `parts_unindexed`, which skips empty parts and counts a refused-leaf-version part separately), `largest_unindexed_part_entries` (E), `key_index_build_max_pairs`, and the `ravel_cli` path, `ravel_cli_sha256` and `sha` the repair runs on |
 | `needle_blocks.json` | the logs needles' block counts as `rlog inspect` reads them, beside the generator's |
 | `compaction.jsonl`, `erasure.jsonl`, `not_run.jsonl` | the compaction child's reports, the erase submit and status, and each state recorded not-run |
 | `failed_states.jsonl` | each state a failed command stopped: the step, the command's exit code and the `out/logs/` path of its log |
@@ -1687,7 +1687,8 @@ python3 benchmarks/investigations/investigations_cases.py --refresh-local-smoke
 ## Tests
 
 `bash benchmarks/investigations/investigations.test.sh`, in CI's
-`doc-scripts` job: no AWS, no server, under two minutes. It runs `bash -n`
+`doc-scripts` job: no AWS, no server, about 11 minutes (the Box suite alone
+about 504 s). It runs `bash -n`
 over every script, generator recounts at 1,000 traces and at 5,000 (where
 the logs reach 4 blocks of 8,192 rows and the needle-block recount applies,
 also at scale 10), the shape of `statements.toml` and `bands.toml` (the IN

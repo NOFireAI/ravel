@@ -187,10 +187,10 @@ retired_hour = 10
 # Each repair_arms arm, checked once before the arm starts, since part of an
 # arm measures nothing. From issue #4347's pre-registration: the arm's two
 # loads take about 6 minutes, the leaf-off folds about 25 minutes for the two
-# arms' tenants (13 for one), and the repair at most 620 s on logs at
-# 8,000,000 pairs and 300 s on spans: 6 + 13 + 10.3 + 5 = 34.3, rounded up to
-# 35. Two arms take 70 minutes of run.max_minutes.
-repair_arms = 35
+# arms' tenants (13 for one), and the repair at the bands' ceilings, 700 s on
+# logs and 300 s on spans: 6 + 13 + 11.7 + 5 = 35.7, rounded up with margin to
+# 37. Two arms take 74 minutes of run.max_minutes.
+repair_arms = 37
 
 # Every price evaluate.py multiplies by, with the source it was read from.
 # A price without a source is reported missing.
