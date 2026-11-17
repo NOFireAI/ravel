@@ -10,6 +10,11 @@ license = "Apache-2.0"
 # hegel and the driver's other dependencies stay out of the root Cargo.lock.
 [workspace]
 
+# The model and the OTLP/SQL client, shared with the catalog-maintenance
+# driver through a path dependency.
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "driver"
 path = "src/main.rs"

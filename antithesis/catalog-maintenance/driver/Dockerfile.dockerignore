@@ -1,0 +1,4 @@
+# BuildKit reads this for driver/Dockerfile (context antithesis/): keep both
+# drivers' local cargo target directories out of the build context.
+**/target
+**/.gate-logs

@@ -1,0 +1,217 @@
+# Ravel catalog-maintenance workload for Antithesis
+# (antithesis/catalog-maintenance/README.md, ADR-4326).
+#
+# faketime runs first and exits: it puts libfaketime, the run wrapper and the
+# clock offset file (+0) on the shared `faketime` volume. Every other
+# container starts through that wrapper (/faketime/run), which refuses to
+# start unless libfaketime is preloaded and moves the clock of the binary the
+# container runs, so all seven containers read one wall-clock offset. The
+# driver rewrites the offset once per timeline, after seeding and some live
+# writes, to move every clock forward together by CLOCK_JUMP_SECS (9000 s,
+# above the 8400 s that seals the ingest hour of every write acked before it;
+# README.md, "The clock jump"). libfaketime rereads the file at most every
+# FAKETIME_CACHE_DURATION (2 s) per process, so the clocks agree to within
+# that once the jump has landed. Monotonic clocks stay real, so timers,
+# timeouts and leases measured on them are untouched.
+#
+# rustfs is the one durable component. init creates the bucket and qualifies
+# it, then exits. The driver then seeds the tenant through `ravel-cli load` and
+# writes the seed marker; every ravel-server entrypoint waits for that marker.
+# ravel1 and ravel2 are `--mode all`: each ingests, serves queries and runs the
+# scheduled fold, but runs no compaction, retention or sweep (those run only in
+# `--mode maintain`). maint1 and maint2 are `--mode maintain`: each folds,
+# compacts, applies retention and sweeps, sharing the work through the
+# maintain-worker registry. driver is the workload and is the only container
+# excluded from faults.
+#
+# No service has a restart policy: Antithesis restarts the containers it
+# kills or stops, and a policy would restart them early and cancel the fault.
+
+x-ravel-store: &ravel-store
+  RAVEL_S3_ENDPOINT: http://rustfs:9000
+  RAVEL_S3_ALLOW_HTTP: "true"
+  RAVEL_S3_BUCKET: ravel
+  RAVEL_S3_REGION: us-east-1
+  RAVEL_S3_ACCESS_KEY: ravel
+  RAVEL_S3_SECRET_KEY: ravel-dev-secret
+
+# The environment every clock-jumped container carries. libfaketime reads the
+# offset from FAKETIME_TIMESTAMP_FILE; FAKETIME_CHECK_BINARY (set per service)
+# names the binary the run wrapper checks is dynamically linked.
+x-faketime-env: &faketime-env
+  LD_PRELOAD: /faketime/libfaketimeMT.so.1
+  FAKETIME_TIMESTAMP_FILE: /faketime/offset
+  FAKETIME_CACHE_DURATION: "2"
+  FAKETIME_DONT_FAKE_MONOTONIC: "1"
+
+x-faketime-done: &faketime-done
+  condition: service_completed_successfully
+
+# The workload's own images are named without a registry, as in the
+# ingest-durability workload: snouty pushes a local-only image into the tenant
+# registry. scripts/build.sh and scripts/import-images.sh tag them.
+x-ravel-server: &ravel-server
+  image: ravel-antithesis-server:catalog-maintenance
+  platform: linux/amd64
+  entrypoint: ["/faketime/run", "/usr/local/bin/ravel-antithesis-entrypoint"]
+  environment:
+    <<: [*ravel-store, *faketime-env]
+    FAKETIME_CHECK_BINARY: /usr/local/bin/ravel-server
+    RUST_LOG: info
+  volumes: ["faketime:/faketime:ro"]
+  depends_on:
+    faketime: *faketime-done
+    init:
+      condition: service_completed_successfully
+
+services:
+  faketime:
+    container_name: faketime
+    hostname: faketime
+    image: ravel-antithesis-server:catalog-maintenance
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/ravel-antithesis-faketime-setup"]
+    volumes: ["faketime:/faketime"]
+
+  rustfs:
+    container_name: rustfs
+    hostname: rustfs
+    # RustFS 1.0.0, the release the repository's own compose stacks and CI
+    # contract lane run (deploy/docker-compose/rustfs.yml), in its glibc
+    # build: the default build is a static-pie musl binary, which no
+    # LD_PRELOAD reaches, so its clock could not jump with the others and
+    # SigV4 would refuse every request once the skew passed 900 s.
+    image: ghcr.io/rustfs/rustfs:1.0.0-glibc@sha256:bffcab0c9d647aab0055d1c69d340b202d0909966b385932d4ead1aeb7602858
+    platform: linux/amd64
+    entrypoint: ["/faketime/run", "/entrypoint.sh"]
+    command: ["/data"]
+    user: "0:0"
+    environment:
+      <<: *faketime-env
+      FAKETIME_CHECK_BINARY: /usr/bin/rustfs
+      RUSTFS_ACCESS_KEY: ravel
+      RUSTFS_SECRET_KEY: ravel-dev-secret
+      # Fsync every acknowledged write before its 200, so a killed rustfs
+      # container never loses an acked PUT.
+      RUSTFS_DURABILITY_MODE: strict
+      RUSTFS_DRIVE_SYNC_ENABLE: "true"
+    volumes: ["faketime:/faketime:ro"]
+    depends_on:
+      faketime: *faketime-done
+
+  init:
+    container_name: init
+    hostname: init
+    image: ravel-antithesis-server:catalog-maintenance
+    platform: linux/amd64
+    entrypoint: ["/faketime/run", "/usr/local/bin/ravel-antithesis-init"]
+    environment:
+      <<: [*ravel-store, *faketime-env]
+      FAKETIME_CHECK_BINARY: /usr/local/bin/ravel-cli
+    volumes: ["faketime:/faketime:ro"]
+    depends_on:
+      faketime: *faketime-done
+      rustfs:
+        condition: service_started
+
+  ravel1:
+    <<: *ravel-server
+    container_name: ravel1
+    hostname: ravel1
+    command: &all-command
+      - "--mode"
+      - "all"
+      - "--store"
+      - "s3"
+      - "--listen-http"
+      - "0.0.0.0:4318"
+      - "--listen-grpc"
+      - "0.0.0.0:4317"
+      - "--shards"
+      - "4"
+      - "--tenant-token"
+      - "cm-token=cm-tenant"
+      - "--tenant-hash-unkeyed"
+      # A short flush cadence puts many level-0 objects into each live hour,
+      # so a sealed live hour has the two inputs compaction needs.
+      - "--max-flush-delay"
+      - "500ms"
+      - "--max-flush-delay-idle"
+      - "5s"
+      - "--min-flush-bytes"
+      - "262144"
+      # Fold every 15 s rather than every 300 s, so a timeline sees many
+      # scheduled folds race the driver's on-demand ones.
+      - "--fold-interval-secs"
+      - "15"
+
+  ravel2:
+    <<: *ravel-server
+    container_name: ravel2
+    hostname: ravel2
+    command: *all-command
+
+  maint1:
+    <<: *ravel-server
+    container_name: maint1
+    hostname: maint1
+    command: &maintain-command
+      - "--mode"
+      - "maintain"
+      - "--store"
+      - "s3"
+      - "--listen-http"
+      - "0.0.0.0:4318"
+      - "--shards"
+      - "4"
+      # The tenant this process maintains; maintain mode serves no ingest, so
+      # it takes no tenant token.
+      - "--maintain-tenant"
+      - "cm-tenant"
+      - "--tenant-hash-unkeyed"
+      # Generated into the image at build time (ravel/Dockerfile); both
+      # maintain containers run the same image, so they share the key.
+      - "--maintain-key-file"
+      - "/etc/ravel/maintain.key"
+      - "--maintain-interval-secs"
+      - "20"
+      - "--fold-interval-secs"
+      - "15"
+
+  maint2:
+    <<: *ravel-server
+    container_name: maint2
+    hostname: maint2
+    command: *maintain-command
+
+  driver:
+    container_name: driver
+    hostname: driver
+    image: ravel-antithesis-driver:catalog-maintenance
+    platform: linux/amd64
+    entrypoint: ["/faketime/run"]
+    command: ["/usr/local/bin/driver"]
+    environment:
+      <<: [*ravel-store, *faketime-env]
+      FAKETIME_CHECK_BINARY: /usr/local/bin/driver
+      RAVEL_NODES: http://ravel1:4318,http://ravel2:4318
+      RAVEL_MAINTAIN_NODES: http://maint1:4318,http://maint2:4318
+      RAVEL_TOKEN: cm-token
+      RAVEL_TENANT: cm-tenant
+      # Six seeded hours two hours apart, 50 records each.
+      SEED_HOURS: "6"
+      SEED_HOUR_STRIDE: "2"
+      SEED_RECORDS_PER_HOUR: "50"
+      WORKLOAD_MAX_WRITES: "3000"
+      # The driver alone writes the offset file, once per timeline.
+      CLOCK_JUMP_FILE: /faketime/offset
+      CLOCK_JUMP_SECS: "9000"
+    # Read-write: the driver is the one writer of the offset file.
+    volumes: ["faketime:/faketime"]
+    depends_on:
+      faketime: *faketime-done
+      init:
+        condition: service_completed_successfully
+
+volumes:
+  faketime: {}
