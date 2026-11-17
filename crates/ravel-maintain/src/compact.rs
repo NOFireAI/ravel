@@ -57,8 +57,13 @@ pub enum CompactionOutcome {
     /// window, and its bytes match its commit record's content hash, so it is
     /// intact data another build can read (ADR-2708 D5b). The bucket is left
     /// as it is and retried on every pass; it is not done, so a cursored scan
-    /// does not advance past it.
-    HeldOutOfWindow { version: u16 },
+    /// does not advance past it. `version` is the input's trailer format
+    /// version when `section` is `None`, and otherwise the version of the RLOG
+    /// section `section` names (ADR-4233 hazard H5).
+    HeldOutOfWindow {
+        version: u16,
+        section: Option<&'static str>,
+    },
     /// An input's directory names section kinds this build does not know, so
     /// re-encoding it would drop them (ADR-4233 hazard H6). `version` is the
     /// input's trailer version and `kinds` the unknown kinds. Nothing was
@@ -450,10 +455,11 @@ async fn hold_out_of_window_input(
     config: &CompactorConfig,
     bucket: &Bucket,
     object_key: &str,
-    version: u16,
+    refused: crate::error::RefusedVersion,
     content_hash: &[u8],
     reader_error: MaintainError,
 ) -> Result<CompactionOutcome> {
+    let crate::error::RefusedVersion { version, section } = refused;
     let whole = store.get(object_key, GetRange::Full).await;
     note_get(
         config.request_ledger.as_ref(),
@@ -478,10 +484,11 @@ async fn hold_out_of_window_input(
         ingest_hour_bucket = bucket.ingest_hour_bucket,
         object_key,
         version,
+        section = section.unwrap_or("trailer"),
         "compaction held a bucket: an input's format version is outside this build's reader \
          window and its bytes match its content hash; later hours still compact (ADR-2708 D5b)"
     );
-    Ok(CompactionOutcome::HeldOutOfWindow { version })
+    Ok(CompactionOutcome::HeldOutOfWindow { version, section })
 }
 
 /// Hold a bucket whose input carries section kinds this build does not know
@@ -816,6 +823,7 @@ async fn compact_bucket_scoped(
         Err(MaintainError::InputOutOfWindow {
             object_key,
             version,
+            section,
             content_hash,
             source,
         }) => {
@@ -824,7 +832,7 @@ async fn compact_bucket_scoped(
                 &run_config,
                 bucket,
                 &object_key,
-                version,
+                crate::error::RefusedVersion { version, section },
                 &content_hash,
                 *source,
             )

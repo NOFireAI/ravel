@@ -554,11 +554,13 @@ where
 
 /// Activate `version` for `family`: raise its `active_write_version` by
 /// exactly one and the store-wide `compat_epoch` by one, recording the new
-/// epoch, `now_ns` and `activated_by` in the family entry. Refuses an absent
-/// record, a family without an entry, an equal or lower version, and a jump
-/// of more than one. The certificate and fence fields are kept: the fence of
-/// this activation is complete once `fence_complete_unix_ns` is at or after
-/// `activated_unix_ns`.
+/// epoch and `activated_by` in the family entry. Refuses an absent record, a
+/// family without an entry, an equal or lower version, and a jump of more
+/// than one. The certificate and fence fields are kept: the fence of this
+/// activation is complete once `fence_complete_unix_ns` is at or after
+/// `activated_unix_ns`, so the entry is stamped `now_ns` or one past the
+/// `fence_complete_unix_ns` of the record the CAS replaces, whichever is
+/// later.
 pub async fn activate_family(
     store: &dyn ObjectStoreBackend,
     keys: &CompatKeys,
@@ -604,7 +606,7 @@ pub async fn activate_family(
         }
         entry.active_write_version = version;
         entry.activated_epoch = epoch;
-        entry.activated_unix_ns = now_ns;
+        entry.activated_unix_ns = now_ns.max(entry.fence_complete_unix_ns.saturating_add(1));
         entry.activated_by = activated_by.to_string();
         record.compat_epoch = epoch;
         Ok(())
@@ -2068,6 +2070,35 @@ mod tests {
         assert_eq!(record.families[1].activated_epoch, 2);
         assert_eq!(record.families[0].activated_epoch, 1);
         assert_eq!(record.families[0].active_write_version, 8);
+    }
+
+    #[tokio::test]
+    async fn activation_is_stamped_after_the_fence_complete_it_replaces() {
+        let store = MemoryStore::new();
+        let mut start = baseline_record();
+        start.compat_epoch = 1;
+        start.families[0].activated_epoch = 1;
+        start.families[0].activated_unix_ns = T0 + 40;
+        start.families[0].fence_complete_unix_ns = T0 + 50;
+        create_compat(&store, &keys(), start).await.expect("create");
+
+        // A clock behind the stored fence_complete is stamped one past it;
+        // a family with no fence_complete takes the clock as it is.
+        let (record, _) = activate_family(&store, &keys(), FAMILY_RSEG, 8, "op", T0)
+            .await
+            .expect("activate rseg 8");
+        assert_eq!(record.families[0].activated_unix_ns, T0 + 51);
+        assert_eq!(record.families[0].fence_complete_unix_ns, T0 + 50);
+        let (record, _) = activate_family(&store, &keys(), FAMILY_RLOG, 6, "op", T0)
+            .await
+            .expect("activate rlog 6");
+        assert_eq!(record.families[1].activated_unix_ns, T0);
+
+        // A clock past it is kept.
+        let (record, _) = activate_family(&store, &keys(), FAMILY_RSEG, 9, "op", T0 + 100)
+            .await
+            .expect("activate rseg 9");
+        assert_eq!(record.families[0].activated_unix_ns, T0 + 100);
     }
 
     #[tokio::test]
