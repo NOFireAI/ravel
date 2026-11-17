@@ -1420,9 +1420,11 @@ Enabling the scrubber requires no storage-policy change:
 
 `sys/compat` records which format version each family is written at.
 `ravel-maintain` reads it through a compat policy,
-`CompactorConfig::compat_policy`. No shipping binary installs one yet, and
-`ravel-server` does not yet export the counters below. With no policy, every
-maintenance writer writes exactly the bytes it wrote before the policy
+`CompactorConfig::compat_policy`. `ravel-server --mode maintain` installs
+one on a keyed bucket (one started with `--tenant-hash-key-file`) and
+renders the counters below on `/metrics`. `ravel-cli maintain migrate` and
+the other `ravel-cli` maintenance commands install none. With no policy,
+every maintenance writer writes exactly the bytes it wrote before the policy
 existed, except that an input with unknown section kinds is held (see
 [An input with section kinds this build does not know](#an-input-with-section-kinds-this-build-does-not-know)).
 
@@ -2004,38 +2006,161 @@ migration target:
 
 ### Rolling a format bump
 
-The four steps below apply from the v1.0 release onward, when the reader
-window widens to N/N-1. Ravel has not reached v1.0.
+A new format version is activated, never just deployed. Installing a build
+that can write version N+1 of a family changes nothing it writes: every
+writer takes its version from `sys/compat`, and the family stays at N until
+you activate N+1. The procedure is activate, migrate, certify, retire, in
+that order. The [compatibility contract](../../compatibility.md) states which
+releases may run beside each other, which families follow which regime, and
+which upgrade and downgrade paths are supported.
 
-**Before v1.0, a format bump is a forward-only data-migration event that you
-cannot roll back.** The reader window holds one version. A bump deletes the
-version-N reader in the same change that introduces N+1:
+**What this release can run.** `ravel-cli` in this release has no `compat`
+subcommand. The steps that create, activate and certify `sys/compat` exist
+only as `ravel-maintain` library entry points (`init_compat`, `activate`,
+`certify` and `late_write_pass`), and no shipped binary calls `init_compat`,
+`activate` or `certify`. Until a release ships those commands, steps 3, 5
+and 7 below cannot be run from a shipped binary, no store can be adopted or
+activated, and every family stays at its baseline version. Because no
+`compat` command ships, there are no command exit codes to document; each
+step below lists the typed refusals the library returns. What does run in
+shipped binaries:
 
-- Backward compatibility can break outright.
-- No fleet ever reads both versions.
-- Objects left at version N become unreadable and cannot be converged.
+- the `sys/compat` write policy, in every `ravel-server` mode on a keyed
+  bucket (see [Writer versions under `sys/compat`](#writer-versions-under-syscompat));
+- the hourly compat maintenance task of a `--mode maintain` process, which
+  acts only on a family that already carries a certificate (see
+  [Compat maintenance units](#compat-maintenance-units));
+- `--background-migrate`, and the
+  [retired-reader startup gate](#retired-reader-startup-gate), whose reader
+  set is empty in this release.
 
-On a pre-v1.0 build the whole sequence is one step. Deploy the new build
-everywhere, and re-ingest or discard whatever was written at version N.
+On this release only `compaction-record` has a writable version above its
+baseline (2, for `--reencode-compaction-parts`); `rseg`, `rlog` and `rspan`
+each write one version.
 
-When a release bumps a bulk data-object format from version N to N+1, roll the
-fleet in this order and never the reverse:
+The procedure, for family F from version N to N+1:
 
-1. Deploy the release that **reads** N+1 to every process that opens objects,
-   which is query, maintenance and the catalog fold. Confirm that it is live
-   fleet-wide. Writers must never lead. A process that writes N+1 before its
-   peers can read it produces objects that the rest of the fleet fails closed
-   on, with a typed unsupported version error and not a silent misread.
-2. Only then enable writing N+1, so that compaction and flush emit the new
-   version. From this point new and rewritten objects are N+1. Existing N
-   objects stay readable for as long as the reader window covers them.
-3. Converge the existing N objects. Retention ages them out at no cost, and
-   `migrate` rewrites the rest and raises each format floor once a fresh
-   re-audit confirms that nothing below N+1 survives. Watch `audit-versions`
-   for the remaining below-target population.
-4. Delete the reader for the retired version N only once every bucket's
-   recorded floor is at or above N+1. The floors that `migrate` raised make
-   that a checkable fact. Do it in its own later reviewed change.
+1. **Grant the read, before anything else.** Every role that runs a
+   `ravel-server` mode needs `s3:GetObject` on `sys/compat`. The shipped
+   roles in `deploy/iam/` grant it to the gateway, query and maintain
+   roles. A process whose role lacks it never sees an activation: on a
+   fenced bucket its writers refuse as stale, and the audit and legal-hold
+   writers, which write to no provisioned bucket, keep writing version N.
+   Whatever runs the `sys/compat` steps needs `s3:PutObject` on
+   `sys/compat` too, and so does a maintain role whose process runs the
+   late-write pass and certify finalization, since both write the record.
+   The shipped roles grant no role `s3:PutObject` on `sys/compat`. Every
+   process also needs `--tenant-hash-key-file`: on an unkeyed bucket a
+   process builds no view of `sys/compat` and every writer emits its
+   built-in version.
+2. **Roll out the baseline release** with a plain rolling update. No
+   activation is needed, and v0.33.x processes may run beside it until step
+   5.
+3. **Adopt the store** with `init_compat`, once. It runs a census of every
+   tenant's config, provisioning records, catalog objects, bucket records
+   and data trailers, and on a clean result creates `sys/compat` at this
+   build's baseline versions with `compat_epoch` 0, the configured publish
+   lifetime `P` (default 1 hour), and the version histogram it found. It
+   lists only `t/<tenant>/`, so objects under `quarantine/` are not
+   checked. An identical existing record is a no-op. It refuses, writing
+   nothing, with:
+   - `Unkeyed`: no file key is configured;
+   - `List`: a listing failed, or a key under a census prefix cannot be
+     addressed;
+   - `Get` or `Unreadable`: an object could not be read;
+   - `OutsideReadSet`: objects at a version this build does not read,
+     grouped by tenant, signal, family and version. Re-ingest or discard
+     them; the retention version hold keeps them meanwhile;
+   - `ProvisioningFenced`: a provisioning record already carries a
+     `compat_epoch`, so `sys/compat` existed and was lost. Restore it from
+     bucket versioning instead;
+   - `RecordDiffers`: `sys/compat` exists and differs from the record
+     `init_compat` would write.
+4. **Roll out the release that introduces N+1** everywhere, with a plain
+   rolling update. It writes N until step 6, so rolling back to the
+   baseline is still safe.
+5. **Terminate every pre-baseline process.** Before the first activation
+   above the baseline, stop every v0.33.x process that can reach the
+   bucket, including pods outside the operator's Deployments and any
+   `ravel-cli` run. Confirm it with the deployment's own inventory of
+   everything holding the bucket's credentials: the operator's Deployment
+   rollout status is necessary, not sufficient. The ravel-operator does
+   not perform or verify this step.
+   - What a missed process can do: write audit records at the older RLOG
+     version, which the late-write pass finds later, marking the
+     certificate contradicted and so blocking retirement; land a data
+     object from its teardown flush, which the certify census and the
+     late-write pass flag; and write metadata, idempotency markers,
+     `t/<tenant>/enc` and `t/<tenant>/config` with no fence at all.
+   - **What a missed process can do that nothing detects:** its maintain
+     loop deletes alert history and audit objects by age with no version
+     hold. No fence and no pass sees a deletion; this step is the only
+     control over it.
+   - What it cannot do: make a reader return a wrong answer. Everything it
+     writes is at a version the baseline reads, and once the older reader
+     is retired such an object fails closed with a typed error.
+
+   The attestation flag `--pre-baseline-processes-terminated`, which the
+   activation is specified to require next to this deletion residual, does
+   not exist in this release: no shipped command takes it, and `activate`
+   checks only the writer-role attestation of step 6. Do this step
+   regardless.
+6. **Activate N+1** with `activate`, giving the family, the version, who
+   activates it, the alert-rule tenants, the clock-skew allowance, and the
+   attestation that every writer role can read `sys/compat` (step 1). It
+   raises the family's active version and the store-wide `compat_epoch`
+   together in one conditional write, retrying a lost race up to 8 times.
+   Then it walks every tenant: it fences each provisioning record at the
+   family's activation epoch and, for `rlog`, parks every discoverable
+   tenant's alert lease. It records `fence_complete_unix_ns` only after a
+   walk with no failure; a failed walk returns a cursor to resume from, and
+   calling `activate` again for a family whose walk is pending resumes that
+   walk instead of activating again. It refuses before any write with:
+   - `Unkeyed`: no file key is configured;
+   - `WriterRolesCannotReadCompat`: the writer-role attestation is absent;
+   - `RecordAbsent`: run step 3 first;
+   - `FamilyNotInRecord`: `sys/compat` has no entry for the family;
+   - `NotWritable`: this build does not write the requested version;
+   - `NotAboveActive` or `VersionJump`: the version is not exactly one above
+     the active version. No step lowers a version;
+   - `Contended`: every one of the 8 attempts lost the conditional write.
+
+   Writers pick the activation up on their next `sys/compat` read, within
+   60 seconds, and a writer whose last successful read is 10 minutes old
+   refuses to publish. From the activation on, a build that cannot write
+   N+1 refuses the family's publishes, so rolling back to it stops those
+   writes; once an N+1 object exists, that rollback is a downgrade. See
+   [Rollback versus downgrade](../../compatibility.md#rollback-versus-downgrade).
+7. **Migrate** the objects still at N. Retention ages some out at no cost.
+   Run `ravel-server --mode maintain --background-migrate` to walk every
+   owned tenant's metrics, logs and spans buckets toward the active version
+   under the policy, or see [Format migration](#format-migration) for
+   `ravel-cli maintain migrate`, its holds and its exit codes. That command
+   installs no `sys/compat` policy and writes this build's current version.
+   A held bucket blocks certification.
+8. **Certify** with `certify`, for `rseg`, `rlog` or `rspan` only. It
+   refuses to start its census before the activation plus `H + P + T_req`
+   and before every provisioned bucket's own fence time plus `G_pre`, each
+   plus the clock-skew allowance; `H` is 10 minutes and `G_pre` is
+   `3 h + 2 × max_flush_lifetime + P + T_req`. The census reads every live
+   member object's trailer and refuses on any member below N+1, any member
+   it cannot read, any trailer that disagrees with its record's stamp, and
+   any incomplete listing. It resumes from the cursor
+   `sys/maintain/certify/<family>/cursor`. On a clean census it writes the
+   certificate, sets the late-write watermark to the census start, and then
+   raises the format floors.
+9. **Verify late writes.** A `--mode maintain` process runs the late-write
+   pass for every certified family once a day, and the retired-reader
+   release starts only once the watermark is past the certified time. See
+   [Compat maintenance units](#compat-maintenance-units) for the pass and
+   its gauges. A late write below N+1 marks the certificate contradicted:
+   roll back to the release that reads both versions, migrate, and certify
+   again.
+10. **Retire** the N reader in a later release. That release starts only on
+    an uncontradicted certificate at or above N+1 with the watermark past
+    the certified time, and refuses a store that has `sys/tenancy` but no
+    `sys/compat` (see [Retired-reader startup gate](#retired-reader-startup-gate)).
+    Rolling back from it to the release that reads both versions is safe.
 
 ### A writer below a recorded format floor
 
