@@ -197,7 +197,11 @@ than passing for "no pull request open".
   in-flight state on the primary checkout at any moment, and an edit or a
   stray `git checkout -- .` / `git reset --hard` there clobbers it
   silently; the workspace-isolation rule has no doc-only/one-file
-  exception.
+  exception. It also passes inside a Brig sandbox clone, but only from
+  within that clone's own guest: the clone carries
+  `ravel.sandboxCheckout=true` (set by `scripts/brig.sh new`) and is the
+  project `BRIG_PROJECT` names. On the host the same clone is refused.
+  `assert-worktree.test.sh` holds the cases.
 - `scripts/guards/check-disk-headroom.sh [dir] [min_gb]`: exits non-zero
   when the volume backing `dir` has less than `min_gb` free (default 20).
   Run it before any cold `--all-targets`/`--workspace`/feature-lane build

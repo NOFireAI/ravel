@@ -33,6 +33,13 @@ executors.
   or branch: the fleet harness collects only the dispatched checkout's
   HEAD as the result, and work committed anywhere else is lost when the
   workdir is destroyed.
+- Exception: a session inside a Brig sandbox works in the sandbox clone
+  `make brig-new` made for its ticket (docs/internal/dev-in-brig.md). A
+  linked worktree cannot work there, because its `.git` file names a
+  directory the guest does not mount, and the clone is already the one
+  checkout for that unit of work. `assert-worktree.sh` accepts the clone
+  only from inside its own guest. On the host, never run git or `make` in
+  a sandbox clone: the guest can rewrite its hooks and scripts.
 
 ## Merging fleet results
 
