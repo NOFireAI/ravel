@@ -199,7 +199,7 @@ mkdir -p "${TMP}/home"
 brig_dev() { # brig_dev PROJECT <args...>; sets $code, $out
   local project="$1"
   shift
-  out=$(HOME="${TMP}/home" BRIG_PROJECT="${project}" bash "${dev}" "$@" 2>&1)
+  out=$(env -u CARGO_BUILD_JOBS -u CARGO_TARGET_DIR HOME="${TMP}/home" BRIG_PROJECT="${project}" bash "${dev}" "$@" 2>&1)
   code=$?
 }
 
