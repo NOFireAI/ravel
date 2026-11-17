@@ -76,7 +76,7 @@ site holding and each mutant breaking it.
 | Area | In scope | Out of scope, and why |
 |---|---|---|
 | commit (21 rows) | SUT: `NoCommitWithoutData`, `OneIdentityOneContent`, `MarkerImpliesAllShardsDurable`, `NoPublishAfterAbandon`, `TokenNeverServesStale`. Driver (exists): `StrictAckImpliesDurable`, the duplicate and deadline obligations. Reachable: the put, retry, ack, abandon and marker actions | `TombstoneBucket`, `SupersedeRecord` (maintain, area 2); token identity and `PinFlush` (pure values, unit tested) |
-| catalog (25) | Driver model: `CompactionPreservesMultiset`. Store audit: `HeadNamedObjectNeverDeleted`, `HeadNamesOnlyCompleteParts`. SUT: `NoLiveCommitOmittedByLostCas`, `CorruptHeadFailsClosedOnDeletePaths`, `CompactionRecordImmutable` | Query rows and `SignalDedupContract` (differential tests own them); the offline oracle row |
+| catalog (25) | Driver model: `CompactionPreservesMultiset`. Store audit: `HeadNamedObjectNeverDeleted` (also an SUT site at the sweep, see the #4335 amendment below), `HeadNamesOnlyCompleteParts`. SUT: `NoLiveCommitOmittedByLostCas`, `CorruptHeadFailsClosedOnDeletePaths`, `CompactionRecordImmutable` | Query rows and `SignalDedupContract` (differential tests own them); the offline oracle row |
 | common (9) | All nine, from a raw S3 contract driver against RustFS | none |
 | lifecycle (29) | SUT and audit: the delete gates, hold, refresh-failure, rewrite and completion rows, including `CompletionImpliesNoPreRewriteExposure`. Driver: `ErasedSubjectNeverServedAfterRequest` | Flight ticket and cached-HEAD pin rows (the driver holds no long-pinned query); the horizon `ASSUME` (startup validation) |
 | resharding (19) | SUT: `OneCasWinner`, `CasAppendNeverDiscards`, the reader fence. With clock control (decision 5): `StaleWriterFailsClosed`, `EveryAdmittedWriteInScanSet`, `TokenResolvesAcrossReshards` | constants and CLI lead enforcement (unit tested) |
@@ -99,7 +99,7 @@ as it does `format-drill`.
 | Area | Mutants (negative cfg stem); each also runs in Antithesis |
 |---|---|
 | commit | `ack-before-commit`, `commit-before-data`, `mismatched-identity-idempotent` (also pins the identity RNG), `marker-before-all-shards` |
-| catalog | `lost-cas-proceeds`, `compaction-swaps-record`, `sweep-superseded-no-head-gate`, `corrupt-head-ignores-delete-gate` |
+| catalog | `lost-cas-proceeds`, `compaction-swaps-record`, `sweep-superseded-no-head-gate`, `corrupt-head-ignores-delete-gate`; the #4335 amendment below adds `compaction-loser-overwrites` and names the property each compaction mutant breaks |
 | common | `lost-response-not-applied`, `cas-accepts-stale-version`, `list-never-progresses` (bounded page count), in a driver-side broken store, since RustFS cannot be mutated |
 | lifecycle | `refresh-failure-is-no-hold`, `delete-before-horizon`, `rewrite-keeps-erased-records`, `complete-ignores-served-set` |
 | resharding, maintenance | `mo-diverge-overwrites-record`, `mo-missing-part-reports-converged`, `no-writer-fence`, `token-validated-against-count` |
@@ -183,7 +183,8 @@ A cap is not a hard ceiling: the billed hours of both runs so far came in about
 one hour above it. Twenty-nine runs at that rate cost about 29 hours beyond
 their caps, so the rerun reserve is 15 hours, not 24, and the epic plans to the
 whole of the raised budget. A further rerun beyond that reserve needs the
-owner's go.
+owner's go. The #4335 amendment below brings the mutant count to 20; the
+twentieth mutant's Antithesis run is not priced here.
 
 Runs are priced per workload config, of which decision 4 defines five
 (ingest-durability; catalog-maintenance and its lifecycle and reshard
@@ -265,3 +266,39 @@ Decision 6 is narrowed as #4330 implements it:
   the `.tsv`.
 - Only the row directly under a table's header may be its separator; any
   later row of pipes, spaces, dashes and colons is a data row and fails.
+
+## Amendment (2026-11-17): #4335 catalog mutants and the sweep site
+
+<!-- amendment-applies: sections="2. Rows in scope|3. Mutant controls|7. Budget" pointer="#4335 amendment" -->
+
+#4335, the catalog task, corrects the catalog rows of decisions 2 and 3 to
+match the TLA model's negative configs and the sites it shipped.
+
+Decision 3's catalog row has five mutants, not four. The model has two
+compaction switches, and each breaks a different invariant
+(`formal/tla/catalog/results.md`):
+
+| Mutant | Model switch | Property it makes false |
+|---|---|---|
+| `compaction-swaps-record` | `CompactionSwapsRecord` | `CompactionPreservesMultiset`, the driver property "catalog: compaction preserves the acked multiset" |
+| `compaction-loser-overwrites` | `CompactionLoserOverwrites` | `CompactionRecordImmutable`, the SUT property "catalog: a published compaction record is never replaced" |
+
+`compaction-swaps-record` replaces one input identity in the published record
+with one no input carries, keeping the identity count and every sample count,
+so the counts-only conservation gate in `ravel-maintain`'s publish path passes
+it and only the driver's multiset check sees it. `compaction-loser-overwrites`
+is the switch an earlier draft shipped under the `compaction-swaps-record`
+name: a publisher that loses the record's create-only PUT writes its own
+payload over the winner's.
+
+Decision 2's catalog row lists `HeadNamedObjectNeverDeleted` under the store
+audit. It also has an SUT site, "catalog: a sweep never deletes an object the
+current HEAD names", in the superseded sweep of `ravel-maintain`, judged from
+one fresh HEAD read per cleared group before that group's first delete; the
+`sweep-superseded-no-head-gate` mutant makes it false there. The store audit
+stays.
+
+Decision 7 prices 19 mutant runs. With this correction there are 20, and the
+twentieth run (a 12-hour cap and about one hour of overshoot) is not in the
+plan of about 452 hours. It comes out of the rerun reserve or needs the
+owner's go, as a rerun beyond the reserve does.

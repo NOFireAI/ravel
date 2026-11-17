@@ -7469,8 +7469,8 @@ mod tests {
                 .await
                 .expect("the pass decided from two HEADs that decoded");
 
+        let head_reads = store.head_get_count();
         assert_eq!(outcome.deleted, 2);
-        assert_eq!(store.head_get_count(), 2, "no HEAD read per delete");
         let stored = store
             .get(&head_key, GetRange::Full)
             .await
@@ -7486,6 +7486,7 @@ mod tests {
             assert_eq!(found.len(), 1, "one evaluation per delete: {found:?}");
             assert!(found[0].0, "{found:?}");
         }
+        assert_eq!(head_reads, 2, "no HEAD read per delete");
     }
 
     /// A compaction record stamped a future `format_version` in a bucket is
