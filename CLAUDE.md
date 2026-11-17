@@ -77,8 +77,10 @@ executors.
     record carried inside such an object, such as a `.csnap` entry or part
     header, follows the proto-record bullet below instead (ADR-0873 added
     `SnapshotEntry` field 15 that way, with no bump).
-  - The catalog HEAD bumps its version on any change (ADR-4233, H2): an
-    older build's HEAD rebuild would otherwise strip the new field.
+  - A catalog HEAD change raises the HEAD version for a HEAD that carries
+    the new field (ADR-4233, H2). The version is a function of content
+    (`head_format_version_for`, as `retired_hours` does): an older build's
+    HEAD rebuild would otherwise strip the field.
   - Series identity and commit tokens get a new domain string.
   - The object key layout gets a new prefix.
   - Any other proto record may add a field with a new field number and no
