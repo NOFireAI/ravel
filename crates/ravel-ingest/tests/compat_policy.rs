@@ -300,10 +300,11 @@ async fn a_span_write_under_an_rspan_version_this_build_cannot_write_is_refused_
     );
 }
 
-/// Admission refuses a write while the view is stale: nothing is buffered,
+/// Admission refuses a buffered write while the view is stale: the write
+/// gets the typed error instead of an acknowledgement, nothing is buffered,
 /// no flush is opened, no object is stored, and the refusal is counted once
-/// under `view_stale`. A refusal at grant instead would open an arrival
-/// flush first.
+/// under `view_stale`. An admission that leaves the stale view to the grant
+/// acknowledges the write.
 #[tokio::test]
 async fn a_log_write_on_a_stale_view_is_refused_at_admission() {
     let acme = tenant("acme");
@@ -323,7 +324,7 @@ async fn a_log_write_on_a_stale_view_is_refused_at_admission() {
         .write(
             acme.clone(),
             vec![log_record()],
-            WriteMode::StrictArrival,
+            WriteMode::Buffered,
             ACK_DEADLINE,
         )
         .await
@@ -362,7 +363,7 @@ async fn a_span_write_on_a_stale_view_is_refused_at_admission() {
         .write(
             acme.clone(),
             vec![span()],
-            WriteMode::StrictArrival,
+            WriteMode::Buffered,
             ACK_DEADLINE,
         )
         .await
