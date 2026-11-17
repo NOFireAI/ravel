@@ -1183,7 +1183,7 @@ exactly five places:
   with `SegmentWriter`. The flush takes the writer's page choice from the
   ingest setting `rlog_page_choice` (ADR-3492 decision 1): `Estimated` for the
   server's logs ingest, the default. `ravel-cli load` sets it from
-  `--page-choice exhaustive|estimated`, default `estimated` (ADR-4203
+  `--page-choice exhaustive|estimated`, default `exhaustive` (ADR-4203
   decisions 6 and 7), for every flush of the load, on the columnar and the row path
   alike; the load summary's `page choice` line and the report JSON's
   `page_choice` field name the value used. `exhaustive` seals every

@@ -11,11 +11,11 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum LoadPageChoice {
     /// Seal every candidate encoding of each page and keep the one with the
-    /// fewest stored bytes.
+    /// fewest stored bytes. The default.
+    #[default]
     Exhaustive,
     /// Seal one candidate per page, picked from the page's statistics:
     /// cheaper to write, slightly larger objects.
-    #[default]
     Estimated,
 }
 

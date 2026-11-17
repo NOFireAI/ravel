@@ -758,7 +758,7 @@ writer configuration (no hash-map iteration order reaches the bytes), and
 the row-major and columnar write paths produce the same bytes. Which writers
 use which: the server's logs ingest flush writes `Estimated` (the ingest
 setting `rlog_page_choice`, whose default is `Estimated`); `ravel-cli load`
-writes through the same flush, `Estimated` unless `--page-choice exhaustive`;
+writes through the same flush, `Exhaustive` unless `--page-choice estimated`;
 compaction and the erasure rewrite write `Estimated`. Readers are
 unaffected: an object decodes the same way whichever choice wrote it.
 
