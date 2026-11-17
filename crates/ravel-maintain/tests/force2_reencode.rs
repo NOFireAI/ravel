@@ -1344,3 +1344,157 @@ async fn an_erasure_rewrite_that_publishes_mid_reencode_stops_it_at_the_relist()
         "the plan and the re-list"
     );
 }
+
+/// Compact `signal`'s fixture, record its one part below the target, replace
+/// the part object with `rewrite(bytes)`, and run the re-encode. Returns its
+/// error, the part's key and the record's content hash for the part.
+async fn reencode_rewritten_part(
+    signal: Signal,
+    rewrite: impl Fn(Vec<u8>) -> Vec<u8>,
+) -> (ravel_maintain::MaintainError, String, Vec<u8>) {
+    let store = MemoryStore::new();
+    let b = seed_compacted(&store, signal).await;
+    let (_, rec) = stamp_parts_below_target(&store, &b).await;
+    assert_eq!(rec.parts.len(), 1, "one part to rewrite: {rec:?}");
+    let part_key = keys::reconstruct_l1_part_key(&rec, &rec.parts[0]).expect("part key");
+    let bytes = rewrite(get_full(&store, &part_key).await.to_vec());
+    store
+        .put(&part_key, bytes.into(), PutOptions::default())
+        .await
+        .expect("replace the part");
+    let err = reencode_compaction_parts(
+        &store,
+        &FixedClock::new(sealed_now_ns() + 1_000),
+        &reencode_cfg(),
+        &b,
+    )
+    .await
+    .expect_err("the part is refused");
+    assert_eq!(
+        compaction_records(&store, &b).await.len(),
+        1,
+        "nothing is published"
+    );
+    (err, part_key, rec.parts[0].content_hash.clone())
+}
+
+/// `bytes` with its 16-byte RLOG or RSPAN trailer's version field set to
+/// `version`. Both readers check the version before the footer CRC.
+fn with_trailer_version(mut bytes: Vec<u8>, version: u16) -> Vec<u8> {
+    let at = bytes.len() - 16 + 8;
+    bytes[at..at + 2].copy_from_slice(&version.to_le_bytes());
+    bytes
+}
+
+/// ADR-4233 decision 6 on the RLOG and RSPAN re-encodes: a part whose trailer
+/// version this build cannot read is refused as `InputOutOfWindow` naming the
+/// part, its trailer version and its recorded content hash, as the RSEG
+/// re-encode does, so the migrate walk holds it as `input_out_of_window`
+/// rather than `corrupt_input`.
+///
+/// Dropping the `noting_version` wrap from either loader in
+/// `reencode_and_publish` returns the reader's bare `UnsupportedVersion` and
+/// fails the match for that signal.
+#[tokio::test]
+async fn an_out_of_window_logs_or_spans_part_is_refused_as_out_of_window() {
+    for (signal, version) in [
+        (Signal::Logs, ravel_logseg::footer::VERSION + 7),
+        (Signal::Spans, ravel_rspan::footer::VERSION + 7),
+    ] {
+        let (err, part_key, hash) =
+            reencode_rewritten_part(signal, |bytes| with_trailer_version(bytes, version)).await;
+        match err {
+            ravel_maintain::MaintainError::InputOutOfWindow {
+                object_key,
+                version: got,
+                section,
+                content_hash,
+                ..
+            } => {
+                assert_eq!(object_key, part_key, "{signal:?}");
+                assert_eq!(got, version, "{signal:?}");
+                assert_eq!(section, None, "a trailer version: {signal:?}");
+                assert_eq!(content_hash, hash, "{signal:?}");
+            }
+            other => panic!("{signal:?}: expected InputOutOfWindow, got {other:?}"),
+        }
+    }
+}
+
+/// A one-record RLOG object indexing `service.name`, whose POSTINGS section's
+/// version byte is one above what this build reads while its trailer version
+/// is in window (ADR-4233 hazard H5). The section's CRC and the footer are
+/// resealed, as a newer writer would have written them, so only the version
+/// is refused.
+fn rlog_with_unreadable_postings() -> Vec<u8> {
+    use ravel_logseg::footer::kind;
+    use ravel_logseg::postings::POSTINGS_VERSION;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{AttrValue, RlogConfig, RlogWriter};
+
+    let mut record = log_record(0, 10, "alpha");
+    record.attrs = vec![("service.name".to_string(), AttrValue::Str("svc0".into()))];
+    let mut writer = RlogWriter::new(
+        RlogConfig::default(),
+        ObjectIdentity {
+            tenant_hash: tenant_hash().0,
+            shard: SHARD,
+            writer_id: [1; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        },
+    )
+    .with_indexed_fields(vec!["service.name".to_string()]);
+    writer.push(record).expect("push log record");
+    let mut bytes = writer.finish().expect("finish rlog");
+    let mut footer = ravel_logseg::footer::open(&bytes).expect("open");
+    let trailer_start = bytes.len() - ravel_logseg::footer::TRAILER_LEN;
+    let footer_len = u32::from_le_bytes(
+        bytes[trailer_start..trailer_start + 4]
+            .try_into()
+            .expect("footer_len"),
+    );
+    let footer_start = trailer_start - footer_len as usize;
+    let desc = footer
+        .sections
+        .iter_mut()
+        .find(|s| s.kind == kind::POSTINGS)
+        .expect("postings section");
+    let (at, end) = (desc.offset as usize, (desc.offset + desc.len) as usize);
+    bytes[at] = POSTINGS_VERSION + 1;
+    desc.crc32c = crc32c::crc32c(&bytes[at..end]);
+    bytes.truncate(footer_start);
+    ravel_logseg::footer::write_footer_and_trailer(&mut bytes, &footer);
+    bytes
+}
+
+/// The H5 case on the logs re-encode: an RLOG part whose POSTINGS section
+/// version this build cannot read is refused as `InputOutOfWindow` carrying
+/// the section's name and its version, not the trailer's.
+///
+/// Dropping the logs loader's `noting_version` wrap returns the bare
+/// `UnsupportedSectionVersion` and fails the match; reporting the section
+/// version without its name fails the `section` assertion.
+#[tokio::test]
+async fn a_logs_part_with_an_unreadable_postings_section_is_refused_as_out_of_window() {
+    let (err, part_key, hash) =
+        reencode_rewritten_part(Signal::Logs, |_| rlog_with_unreadable_postings()).await;
+    match err {
+        ravel_maintain::MaintainError::InputOutOfWindow {
+            object_key,
+            version,
+            section,
+            content_hash,
+            ..
+        } => {
+            assert_eq!(object_key, part_key);
+            assert_eq!(
+                version,
+                u16::from(ravel_logseg::postings::POSTINGS_VERSION + 1)
+            );
+            assert_eq!(section, Some("POSTINGS"));
+            assert_eq!(content_hash, hash);
+        }
+        other => panic!("expected InputOutOfWindow, got {other:?}"),
+    }
+}

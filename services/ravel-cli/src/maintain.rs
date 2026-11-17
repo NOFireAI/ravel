@@ -748,10 +748,22 @@ pub async fn compact_to(
             out,
             "outcome: BelowMinInputs (only {count} L0 record(s); nothing to do)"
         )?,
-        CompactionOutcome::HeldOutOfWindow { version } => writeln!(
+        CompactionOutcome::HeldOutOfWindow {
+            version,
+            section: None,
+        } => writeln!(
             out,
             "outcome: HeldOutOfWindow (an input is format version {version}, outside \
              this build's reader window; held until a build that reads it runs)"
+        )?,
+        CompactionOutcome::HeldOutOfWindow {
+            version,
+            section: Some(section),
+        } => writeln!(
+            out,
+            "outcome: HeldOutOfWindow (an input carries {section} section version \
+             {version}, outside this build's reader window; held until a build that \
+             reads it runs)"
         )?,
         CompactionOutcome::HeldUnknownSection { version, kinds } => writeln!(
             out,
@@ -1463,11 +1475,12 @@ fn emit_bucket_outcome(
             report.rewrite_present += 1;
             writeln!(out, "shard={shard} hour={hour} outcome=RewritePresent")?;
         }
-        Ok(CompactionOutcome::HeldOutOfWindow { version }) => {
+        Ok(CompactionOutcome::HeldOutOfWindow { version, section }) => {
             report.held_out_of_window += 1;
             writeln!(
                 out,
-                "shard={shard} hour={hour} outcome=HeldOutOfWindow version={version}"
+                "shard={shard} hour={hour} outcome=HeldOutOfWindow version={version}{}",
+                section_detail(section)
             )?;
         }
         Ok(CompactionOutcome::HeldUnknownSection { version, kinds }) => {
@@ -2502,9 +2515,9 @@ enum NotMigratedRetry {
     /// The walk drained and cleared its cursor, and the fresh re-audit refused
     /// the floor: the next run starts over and reaches every one of them.
     NextRun,
-    /// The run stopped on its budget with the cursor persisted past them: the
-    /// next run resumes after them, and only a walk that starts over reaches
-    /// them again.
+    /// The run stopped on its budget. The cursor it persisted can sit before
+    /// some of them (it stops before the first held bucket), so the next run
+    /// reaches those; only a walk that starts over reaches the rest again.
     AfterTheWalkDrains,
     /// The walk drained and the fresh re-audit raised the floor: another writer
     /// carried each of them to the target after this run passed it.
@@ -2560,9 +2573,10 @@ fn not_migrated_report(buckets: &[NotMigratedBucket], retry: NotMigratedRetry) -
         }
         NotMigratedRetry::AfterTheWalkDrains => {
             "# Each not_migrated bucket published nothing this run. This run stopped on its \
-             budget with the cursor past them, so the next run resumes after them: they are \
-             retried by the first run after the walk drains, which starts over from the \
-             beginning.\n"
+             budget, and the next run resumes after the stored cursor (cursor_advanced_to; \
+             with none it starts from the beginning). That run retries every not_migrated \
+             bucket after the cursor; the rest are retried by the first run after the walk \
+             drains, which starts over from the beginning.\n"
         }
         NotMigratedRetry::Resolved => {
             "# Each not_migrated bucket published nothing this run, and the fresh re-audit found \
@@ -2727,9 +2741,10 @@ fn migrate_report_text(
 ///
 /// "Until a later run migrates it" below is the next run when this one drained
 /// the walk, since a drained walk clears its cursor. After a budget stop the
-/// cursor is persisted past every bucket this run examined, so the next run
-/// resumes after them, and a bucket this run skipped is reached again only by
-/// the first run after the walk drains.
+/// next run resumes after the persisted cursor, which stops before the first
+/// bucket this run held unless this run migrated nothing from where it
+/// started. A bucket this run skipped at or before that cursor is reached
+/// again only by the first run after the walk drains.
 ///
 /// `target_version` defaults to the signal's current supported version
 /// ([`signal_current_version`]); `family` defaults to the signal's canonical
@@ -2884,6 +2899,12 @@ pub async fn migrate_to(
     migrate_verdict(out, tenant, sig, &family, target, budget_records, &report)
 }
 
+/// ` section=<name>` when an out-of-window `version` is an RLOG section's
+/// version (ADR-4233 hazard H5), empty when it is the trailer's.
+fn section_detail(section: Option<&str>) -> String {
+    section.map(|s| format!(" section={s}")).unwrap_or_default()
+}
+
 /// One `held:` line per bucket a migrate walk held (ADR-4233 decision 6), with
 /// the reason's name and what it names.
 fn held_bucket_report(held: &[MigrateHeldBucket]) -> String {
@@ -2893,7 +2914,11 @@ fn held_bucket_report(held: &[MigrateHeldBucket]) -> String {
             MigrateHoldReason::InputOutOfWindow {
                 object_key,
                 version,
-            } => format!("object_key={object_key:?} version={version}"),
+                section,
+            } => format!(
+                "object_key={object_key:?} version={version}{}",
+                section_detail(*section)
+            ),
             MigrateHoldReason::NewerThanWritable {
                 commit_key,
                 version,
@@ -3780,6 +3805,16 @@ mod tests {
                 reason: MigrateHoldReason::InputOutOfWindow {
                     object_key: "t/a/d/0.rseg".to_string(),
                     version: 3,
+                    section: None,
+                },
+            },
+            MigrateHeldBucket {
+                shard: 0,
+                ingest_hour: 100,
+                reason: MigrateHoldReason::InputOutOfWindow {
+                    object_key: "t/a/d/0.rlog".to_string(),
+                    version: 2,
+                    section: Some("POSTINGS"),
                 },
             },
             MigrateHeldBucket {
@@ -3811,6 +3846,8 @@ mod tests {
             held_bucket_report(&held),
             "held: shard 0 hour 100 reason=input_out_of_window object_key=\"t/a/d/0.rseg\" \
              version=3\n\
+             held: shard 0 hour 100 reason=input_out_of_window object_key=\"t/a/d/0.rlog\" \
+             version=2 section=POSTINGS\n\
              held: shard 1 hour 101 reason=newer_than_writable record_key=\"t/a/c/1.cmt\" \
              version=9\n\
              held: shard 2 hour 102 reason=corrupt_input detail=\"bad magic\"\n\
@@ -4384,8 +4421,8 @@ mod tests {
 
     /// A run that stopped on its budget exits zero for every reason it can
     /// leave a bucket below the target, and still prints the bucket's line and
-    /// the budget-stop note; a not_migrated bucket also gets the note saying it
-    /// is retried by the first run after the walk drains.
+    /// the budget-stop note; a not_migrated bucket also gets the note saying
+    /// which later run retries it.
     ///
     /// Non-vacuity: make the `if !report.walk_complete` block of
     /// `migrate_verdict` return an error when `reencode_blocked` holds a
@@ -4409,8 +4446,9 @@ mod tests {
             if !report.not_migrated.is_empty() {
                 assert!(
                     text.contains(
-                        "they are retried by the first run after the walk drains, which starts \
-                         over from the beginning."
+                        "That run retries every not_migrated bucket after the cursor; the rest \
+                         are retried by the first run after the walk drains, which starts over \
+                         from the beginning."
                     ),
                     "{text}"
                 );

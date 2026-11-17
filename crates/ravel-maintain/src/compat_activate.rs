@@ -99,6 +99,10 @@ pub struct ActivateRequest {
     /// Tenants named by the alert rules file. Their leases are parked on an
     /// `rlog` activation even when no alert key exists for them yet.
     pub alert_rule_tenants: Vec<TenantHash>,
+    /// The deployment's clock skew allowance. An activation stamped further
+    /// than this past the local clock is reported in
+    /// [`ActivateReport::stamp_ahead_of_clock_ns`].
+    pub clock_skew_allowance_ns: i64,
     /// Where an interrupted walk stopped. Ignored unless its epoch is the
     /// `activated_epoch` of the walk this call runs.
     pub resume_from: Option<FenceCursor>,
@@ -183,8 +187,10 @@ pub struct FenceWalkReport {
     pub leases_already_parked: u64,
     /// Every item was fenced.
     pub complete: bool,
-    /// The value this walk wrote to `fence_complete_unix_ns`; `None` when the
-    /// walk failed or a later activation of the family superseded it.
+    /// The family's `fence_complete_unix_ns` for this epoch once the walk
+    /// finished: the value this walk wrote, or the one a concurrent walk of
+    /// the same epoch recorded first. `None` when the walk failed or a later
+    /// activation of the family superseded it.
     pub fence_complete_unix_ns: Option<i64>,
     /// Where to resume after a failure; `None` means from the start.
     pub resume_from: Option<FenceCursor>,
@@ -208,6 +214,14 @@ pub struct ActivateReport {
     pub family: String,
     /// The family's active write version after the call.
     pub active_write_version: u32,
+    /// How far past this process's clock the activation was stamped, when
+    /// that is more than [`ActivateRequest::clock_skew_allowance_ns`]. An
+    /// activation is stamped after the family's previous
+    /// `fence_complete_unix_ns`, so a value here means the process that
+    /// recorded that value, or an earlier activation it was stamped after,
+    /// had a clock ahead of this one by more than the allowance. `None` when
+    /// within it or when nothing was activated.
+    pub stamp_ahead_of_clock_ns: Option<i64>,
     pub walk: FenceWalkReport,
 }
 
@@ -267,20 +281,15 @@ fn family_entry<'a>(
 ///
 /// `sys/compat` carries no fenced epoch, and ravel-catalog defines a walk as
 /// finished once `fence_complete_unix_ns` is at or after `activated_unix_ns`.
-/// [`activation_stamp`] stamps every activation strictly after the family's
-/// previous `fence_complete_unix_ns`, so that rule holds for the current
-/// `activated_epoch` only, whatever the clocks of the processes involved.
+/// [`activate_family`] stamps every activation, inside its CAS, strictly
+/// after the `fence_complete_unix_ns` it replaces, and
+/// [`record_fence_complete`] moves that field only while the walk is pending,
+/// so the rule holds for the current `activated_epoch` only, whatever the
+/// clocks of the processes involved.
 fn fence_pending(entry: &sysproto::CompatFamily) -> bool {
     entry.activated_epoch > 0
         && (entry.fence_complete_unix_ns == 0
             || entry.fence_complete_unix_ns < entry.activated_unix_ns)
-}
-
-/// The `activated_unix_ns` for a new activation of `entry`'s family: `now`,
-/// or one past the previous walk's `fence_complete_unix_ns` when a clock
-/// behind that walk's would otherwise read the new walk as already finished.
-fn activation_stamp(now: i64, entry: &sysproto::CompatFamily) -> i64 {
-    now.max(entry.fence_complete_unix_ns.saturating_add(1))
 }
 
 /// Activate `request.version` for `request.family`, or resume the family's
@@ -298,6 +307,7 @@ pub async fn activate(
     }
     let family = request.family.as_str();
     let mut attempts = 0;
+    let mut stamp_ahead_of_clock_ns = None;
     let (outcome, entry) = loop {
         let Some((record, _)) = read_compat(store, keys).await? else {
             return Err(ActivateError::RecordAbsent);
@@ -330,18 +340,30 @@ pub async fn activate(
             });
         }
         attempts += 1;
+        let now = clock.now_unix_ns();
         match activate_family(
             store,
             keys,
             family,
             request.version,
             &request.activated_by,
-            activation_stamp(clock.now_unix_ns(), entry),
+            now,
         )
         .await
         {
             Ok((record, _)) => {
                 let entry = family_entry(&record, family)?.clone();
+                let ahead = entry.activated_unix_ns.saturating_sub(now);
+                if ahead > request.clock_skew_allowance_ns {
+                    stamp_ahead_of_clock_ns = Some(ahead);
+                    tracing::warn!(
+                        family,
+                        activated_unix_ns = entry.activated_unix_ns,
+                        now_unix_ns = now,
+                        ahead_ns = ahead,
+                        "compat activate: activation stamped past this clock by more than the clock skew allowance"
+                    );
+                }
                 break (
                     ActivateOutcome::Activated {
                         previous_version: active,
@@ -365,6 +387,7 @@ pub async fn activate(
         outcome,
         family: family.to_string(),
         active_write_version: entry.active_write_version,
+        stamp_ahead_of_clock_ns,
         walk,
     })
 }
@@ -482,8 +505,9 @@ async fn fence_walk(
             report.fence_complete_unix_ns = written;
         }
         Err(err) => {
-            // Every item is fenced; a resumed walk re-reads them all and
-            // retries only this write.
+            // Every item is fenced. The cursor stays where this walk started,
+            // so a resumed walk re-checks every item from there, each already
+            // fenced, before it retries this write.
             fail(&mut report, None, FenceFailure::FenceComplete(err));
         }
     }
@@ -520,7 +544,10 @@ async fn has_alert_prefix(
 }
 
 /// Set the family's `fence_complete_unix_ns` when its activation is still
-/// the one at `epoch`. `Ok(None)` when a later activation superseded it.
+/// the one at `epoch` and its walk is still pending, and return the value
+/// the record then holds: this walk's, or the one a concurrent walk of the
+/// same epoch recorded first. `Ok(None)` when a later activation superseded
+/// it.
 async fn record_fence_complete(
     store: &dyn ObjectStoreBackend,
     keys: &CompatKeys,
@@ -548,19 +575,28 @@ async fn record_fence_complete(
             return Ok(Some(entry.fence_complete_unix_ns));
         }
         let complete_ns = clock.now_unix_ns().max(entry.activated_unix_ns);
+        // The record the CAS replaces may already hold another walker's
+        // fence_complete for this epoch; moving it again could pass a later
+        // activation's stamp.
         let result = update_compat(store, keys, |record| {
             if let Some(entry) = record
                 .families
                 .iter_mut()
-                .find(|f| f.family == family && f.activated_epoch == epoch)
+                .find(|f| f.family == family && f.activated_epoch == epoch && fence_pending(f))
             {
-                entry.fence_complete_unix_ns = entry.fence_complete_unix_ns.max(complete_ns);
+                entry.fence_complete_unix_ns = complete_ns;
             }
             Ok(())
         })
         .await;
         match result {
-            Ok(_) => return Ok(Some(complete_ns)),
+            Ok((record, _)) => {
+                return Ok(record
+                    .families
+                    .iter()
+                    .find(|f| f.family == family && f.activated_epoch == epoch)
+                    .map(|f| f.fence_complete_unix_ns));
+            }
             Err(err) if err.is_retryable() && attempts < ACTIVATE_MAX_ATTEMPTS => {}
             Err(err) => return Err(err),
         }
@@ -634,8 +670,19 @@ mod tests {
             writer_roles_can_read_compat: true,
             // Tenant 4 is named only by the rules file and has no keys.
             alert_rule_tenants: vec![tenant(4)],
+            clock_skew_allowance_ns: crate::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
             resume_from: None,
         }
+    }
+
+    fn failing_first_list(inner: Arc<MemoryStore>) -> FaultStore<Arc<MemoryStore>> {
+        FaultStore::new(
+            inner,
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::List, ScriptedFault::Transient("list down".into()))
+                    .with_occurrence(Occurrence::Nth(1)),
+            ),
+        )
     }
 
     async fn entry(store: &dyn ObjectStoreBackend, family: &str) -> sysproto::CompatFamily {
@@ -1303,6 +1350,143 @@ mod tests {
                 prov_epoch(mem.as_ref(), tenant(1), Signal::Metrics).await,
                 2
             );
+        }
+    }
+
+    /// Walker A finishes epoch 1 while walker B, which read epoch 1 as
+    /// pending, is held at its CAS read; activation C reads epoch 1 as
+    /// fenced and is held at its own CAS read until B's write lands.
+    #[tokio::test]
+    async fn a_late_walker_of_a_finished_epoch_cannot_mark_the_next_activation_fenced() {
+        let mem = initialized().await;
+        let keys = test_keys();
+        let base = baseline(FAMILY_RSEG);
+        let writable =
+            WritableVersions::current().with_family(FAMILY_RSEG, vec![base, base + 1, base + 2]);
+        let first_store = failing_first_list(mem.clone());
+        let first = activate(
+            &first_store,
+            Some(&keys),
+            &TestClock(T0 + 10),
+            &writable,
+            &request(FAMILY_RSEG),
+        )
+        .await
+        .expect("activate epoch 1");
+        assert_eq!(first_store.fault_count(Op::List, FaultKind::Transient), 1);
+        assert!(!first.walk.complete);
+
+        let store_b = FaultStore::new(mem.clone(), FaultPlan::empty());
+        let gate_b = store_b.hold(Op::Get, Some(COMPAT_KEY.to_string()), Occurrence::Nth(2));
+        let store_c = failing_first_list(mem.clone());
+        let gate_c = store_c.hold(Op::Get, Some(COMPAT_KEY.to_string()), Occurrence::Nth(2));
+        let request_c = ActivateRequest {
+            version: base + 2,
+            ..request(FAMILY_RSEG)
+        };
+        let (clock_a, clock_b, clock_c) =
+            (TestClock(T0 + 20), TestClock(T0 + 100), TestClock(T0 + 30));
+        let b_done = tokio::sync::Notify::new();
+        let b = async {
+            let got = record_fence_complete(&store_b, &keys, &clock_b, FAMILY_RSEG, 1).await;
+            b_done.notify_one();
+            got
+        };
+        let rest = async {
+            gate_b.wait_until_held(1).await;
+            let a = record_fence_complete(mem.as_ref(), &keys, &clock_a, FAMILY_RSEG, 1)
+                .await
+                .expect("walker a");
+            assert_eq!(a, Some(T0 + 20));
+            let c = activate(&store_c, Some(&keys), &clock_c, &writable, &request_c);
+            let drive = async {
+                gate_c.wait_until_held(1).await;
+                for id in gate_b.held() {
+                    assert!(gate_b.release(id));
+                }
+                b_done.notified().await;
+                for id in gate_c.held() {
+                    assert!(gate_c.release(id));
+                }
+            };
+            let (c, ()) = tokio::join!(c, drive);
+            c
+        };
+        let (b, c) = tokio::join!(b, rest);
+
+        // B found epoch 1 already fenced and left A's value in place.
+        assert_eq!(b.expect("walker b"), Some(T0 + 20));
+        let c = c.expect("activation c");
+        assert_eq!(
+            c.outcome,
+            ActivateOutcome::Activated {
+                previous_version: base + 1,
+                version: base + 2
+            }
+        );
+        assert_eq!(store_c.fault_count(Op::List, FaultKind::Transient), 1);
+        assert!(!c.walk.complete);
+        let rseg = entry(mem.as_ref(), FAMILY_RSEG).await;
+        assert_eq!(rseg.activated_epoch, 2);
+        assert_eq!(rseg.fence_complete_unix_ns, T0 + 20);
+        assert_eq!(rseg.activated_unix_ns, T0 + 30);
+        assert!(fence_pending(&rseg));
+
+        // A crash after C's failed walk resumes it rather than refusing.
+        let resumed = activate(
+            mem.as_ref(),
+            Some(&keys),
+            &TestClock(T0 + 40),
+            &writable,
+            &request_c,
+        )
+        .await
+        .expect("resume epoch 2");
+        assert_eq!(resumed.outcome, ActivateOutcome::ResumedPendingWalk);
+        assert!(resumed.walk.complete);
+        assert_eq!(resumed.walk.compat_epoch, 2);
+    }
+
+    #[tokio::test]
+    async fn an_activation_stamped_past_the_clock_skew_allowance_is_reported() {
+        const ALLOWANCE: i64 = 3;
+        for (behind, reported) in [(0, None), (2, None), (3, Some(4))] {
+            let mem = initialized().await;
+            let base = baseline(FAMILY_RLOG);
+            let writable = WritableVersions::current()
+                .with_family(FAMILY_RLOG, vec![base, base + 1, base + 2]);
+            let skewed = |version| ActivateRequest {
+                version,
+                clock_skew_allowance_ns: ALLOWANCE,
+                ..request(FAMILY_RLOG)
+            };
+            let first = activate(
+                mem.as_ref(),
+                Some(&test_keys()),
+                &TestClock(T0 + 10),
+                &writable,
+                &skewed(base + 1),
+            )
+            .await
+            .expect("first activation");
+            assert_eq!(first.stamp_ahead_of_clock_ns, None);
+            assert_eq!(first.walk.fence_complete_unix_ns, Some(T0 + 10));
+
+            // Stamped at T0 + 11, `behind + 1` past this clock.
+            let second = activate(
+                mem.as_ref(),
+                Some(&test_keys()),
+                &TestClock(T0 + 10 - behind),
+                &writable,
+                &skewed(base + 2),
+            )
+            .await
+            .expect("second activation");
+            assert_eq!(
+                entry(mem.as_ref(), FAMILY_RLOG).await.activated_unix_ns,
+                T0 + 11
+            );
+            assert_eq!(second.stamp_ahead_of_clock_ns, reported, "behind {behind}");
         }
     }
 

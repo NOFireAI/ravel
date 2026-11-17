@@ -354,8 +354,14 @@ pub struct MigrateHeldBucket {
 /// Why the walk held a [`MigrateHeldBucket`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrateHoldReason {
-    /// The input's trailer version is outside this build's reader window.
-    InputOutOfWindow { object_key: String, version: u16 },
+    /// The input's trailer version, or with `section` set the version of that
+    /// RLOG section (ADR-4233 hazard H5), is outside this build's reader
+    /// window.
+    InputOutOfWindow {
+        object_key: String,
+        version: u16,
+        section: Option<&'static str>,
+    },
     /// The input's commit record is stamped at a format version above the one
     /// this build writes, or, on the re-encode path, the bucket's compaction
     /// record (named by `commit_key`) names a part stamped above it.
@@ -390,10 +396,12 @@ impl MigrateHoldReason {
             MaintainError::InputOutOfWindow {
                 object_key,
                 version,
+                section,
                 ..
             } => Some(MigrateHoldReason::InputOutOfWindow {
                 object_key: object_key.clone(),
                 version: *version,
+                section: *section,
             }),
             MaintainError::NewerThanWritable {
                 commit_key,
@@ -412,7 +420,10 @@ impl MigrateHoldReason {
                 version: *recorded_version,
                 kinds: kinds.clone(),
             }),
-            MaintainError::Segment(_) | MaintainError::LogSeg(_) | MaintainError::SpanSeg(_) => {
+            MaintainError::Segment(_)
+            | MaintainError::LogSeg(_)
+            | MaintainError::SpanSeg(_)
+            | MaintainError::PartContentHashMismatch { .. } => {
                 Some(MigrateHoldReason::CorruptInput {
                     detail: err.to_string(),
                 })
@@ -428,9 +439,19 @@ impl std::fmt::Display for MigrateHoldReason {
             MigrateHoldReason::InputOutOfWindow {
                 object_key,
                 version,
+                section: None,
             } => write!(
                 f,
                 "{}: {object_key:?} is at format version {version}, outside this build's reader window",
+                self.name()
+            ),
+            MigrateHoldReason::InputOutOfWindow {
+                object_key,
+                version,
+                section: Some(section),
+            } => write!(
+                f,
+                "{}: {object_key:?} carries {section} section version {version}, outside this build's reader window",
                 self.name()
             ),
             MigrateHoldReason::NewerThanWritable {
@@ -5337,7 +5358,10 @@ mod tests {
         let mut bytes = got.data.to_vec();
         let trailer_start = bytes.len() - ravel_logseg::footer::TRAILER_LEN;
         let at = bytes.len() / 2;
-        assert!(at + 8 <= trailer_start, "corruption must land before the trailer");
+        assert!(
+            at + 8 <= trailer_start,
+            "corruption must land before the trailer"
+        );
         for b in &mut bytes[at..at + 8] {
             *b ^= 0xFF;
         }
@@ -5593,6 +5617,7 @@ mod tests {
                 reason: MigrateHoldReason::InputOutOfWindow {
                     object_key: held_key.clone(),
                     version,
+                    section: None,
                 },
             }]
         );
@@ -6049,13 +6074,15 @@ mod tests {
 
     /// Compact `(0, 100)`, then rewrite its one compaction record so the part it
     /// names is at `target - 1` (a re-encode candidate under the target) and the
-    /// part object stored at its key is mangled by `break_part`. The part's
-    /// `content_hash` is realigned to the mangled bytes so the re-encode's hash
-    /// gate passes and the reader, not the gate, is what refuses the object.
-    /// Returns the compaction record's key.
+    /// part object stored at its key is mangled by `break_part`. With
+    /// `realign_hash` the part's `content_hash` is realigned to the mangled
+    /// bytes so the re-encode's hash gate passes and the reader, not the gate,
+    /// is what refuses the object; without it the record keeps the hash of the
+    /// bytes compaction wrote. Returns the compaction record's key.
     async fn seed_reencode_with_broken_part(
         store: &dyn ObjectStoreBackend,
         target: u32,
+        realign_hash: bool,
         break_part: impl Fn(&mut Vec<u8>),
     ) -> String {
         seed_at(store, 0, 100, 1, "alpha", target).await;
@@ -6098,12 +6125,14 @@ mod tests {
             .to_vec();
         break_part(&mut part_bytes);
 
-        // Point the record at a below-target part whose content hash matches the
-        // mangled object, and store that object at the key the new hash
-        // reconstructs. The record key itself does not depend on the parts, so
-        // it is re-put in place.
+        // Point the record at a below-target part (whose content hash matches the
+        // mangled object when realigned), and store that object at the key the
+        // record now reconstructs. The record key itself does not depend on the
+        // parts, so it is re-put in place.
         rec.parts[0].segment_format_version = target - 1;
-        rec.parts[0].content_hash = blake3::hash(&part_bytes).as_bytes().to_vec();
+        if realign_hash {
+            rec.parts[0].content_hash = blake3::hash(&part_bytes).as_bytes().to_vec();
+        }
         let new_part_key =
             keys::reconstruct_l1_part_key(&rec, &rec.parts[0]).expect("new part key");
         store
@@ -6132,6 +6161,7 @@ mod tests {
     async fn run_reencode_broken_part(
         store: &MemoryStore,
         target: u32,
+        realign_hash: bool,
         break_part: impl Fn(&mut Vec<u8>),
     ) -> (String, MigrateHoldReason) {
         provision(store, 1).await;
@@ -6140,7 +6170,7 @@ mod tests {
             target,
             "the fixture's target is the version re-encode writes"
         );
-        seed_reencode_with_broken_part(store, target, break_part).await;
+        seed_reencode_with_broken_part(store, target, realign_hash, break_part).await;
         seed_at(store, 0, 101, 3, "gamma", target - 1).await;
         let config = CompactorConfig {
             reencode_writer_enabled: true,
@@ -6198,7 +6228,7 @@ mod tests {
     async fn a_reencode_out_of_window_part_holds_bucket_and_walk_continues() {
         let store = MemoryStore::new();
         let target = VERSION_V7 as u32;
-        let (message, reason) = run_reencode_broken_part(&store, target, |bytes| {
+        let (message, reason) = run_reencode_broken_part(&store, target, true, |bytes| {
             let at = bytes.len() - ravel_segment::TRAILER_LEN as usize + 8;
             bytes[at..at + 2].copy_from_slice(&out_of_window_rseg_version().to_le_bytes());
         })
@@ -6225,7 +6255,7 @@ mod tests {
     async fn a_reencode_corrupt_part_holds_bucket_and_walk_continues() {
         let store = MemoryStore::new();
         let target = VERSION_V7 as u32;
-        let (message, reason) = run_reencode_broken_part(&store, target, |bytes| {
+        let (message, reason) = run_reencode_broken_part(&store, target, true, |bytes| {
             let trailer_start = bytes.len() - ravel_segment::TRAILER_LEN as usize;
             let at = bytes.len() / 2;
             assert!(
@@ -6240,6 +6270,39 @@ mod tests {
         assert!(
             matches!(reason, MigrateHoldReason::CorruptInput { .. }),
             "a corrupt part is held as corrupt_input: {reason:?}"
+        );
+        assert!(
+            message.contains("corrupt_input") && message.contains("shard 0 hour 100"),
+            "{message}"
+        );
+    }
+
+    /// A re-encode part whose bytes no longer match its record's content hash
+    /// holds its bucket as `corrupt_input`, and the walk continues. The record
+    /// keeps the hash compaction wrote, so the gate refuses the part before any
+    /// reader sees it, even though the change made is an out-of-window trailer
+    /// version: only an intact object is out of window.
+    ///
+    /// Distinguishing: the gate's former `MaintainError::Invariant` is not a
+    /// refusal `from_refusal` routes, so the run ends with that error instead
+    /// of `MigrateHeld` and the helper's `expected MigrateHeld` panics. Moving
+    /// the gate after the reader holds the part as `input_out_of_window` and
+    /// fails the `CorruptInput` match.
+    #[tokio::test]
+    async fn a_reencode_part_not_matching_its_hash_holds_as_corrupt_input() {
+        let store = MemoryStore::new();
+        let target = VERSION_V7 as u32;
+        let (message, reason) = run_reencode_broken_part(&store, target, false, |bytes| {
+            let at = bytes.len() - ravel_segment::TRAILER_LEN as usize + 8;
+            bytes[at..at + 2].copy_from_slice(&out_of_window_rseg_version().to_le_bytes());
+        })
+        .await;
+        let MigrateHoldReason::CorruptInput { detail } = &reason else {
+            panic!("a part that fails its hash is corrupt_input: {reason:?}");
+        };
+        assert!(
+            detail.contains("does not match its record's content hash"),
+            "{detail}"
         );
         assert!(
             message.contains("corrupt_input") && message.contains("shard 0 hour 100"),
