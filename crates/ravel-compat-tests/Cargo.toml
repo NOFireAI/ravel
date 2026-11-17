@@ -1,0 +1,35 @@
+[package]
+name = "ravel-compat-tests"
+version = "0.33.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.97"
+publish = false
+
+# Sits in the root manifest's `exclude`, so it is its own workspace: no
+# `cargo test --workspace` or `cargo clippy --workspace --all-targets` builds
+# the segment crates with the drill window this crate turns on (ADR-4233
+# decision 9). Build it with `--manifest-path crates/ravel-compat-tests/Cargo.toml`.
+[workspace]
+
+[dependencies]
+
+[dev-dependencies]
+ravel-catalog = { path = "../ravel-catalog", version = "0.33.0" }
+ravel-maintain = { path = "../ravel-maintain", version = "0.33.0" }
+ravel-object-store = { path = "../ravel-object-store", version = "0.33.0" }
+ravel-proto = { path = "../ravel-proto", version = "0.33.0" }
+# The drill versions (RSEG 8, RLOG 6, RSPAN 6), test-only. This table is the
+# one place scripts/guards/check-release-profile.sh rule 5 allows them.
+ravel-segment = { path = "../ravel-segment", version = "0.33.0", features = ["format-drill"] }
+ravel-logseg = { path = "../ravel-logseg", version = "0.33.0", features = ["format-drill"] }
+ravel-rspan = { path = "../ravel-rspan", version = "0.33.0", features = ["format-drill"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }
+hex = "0.4"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

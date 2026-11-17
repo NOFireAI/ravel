@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "services/*"]
+# Its own workspace, so no workspace build unifies the format-drill feature its
+# dev-dependencies turn on (ADR-4233 decision 9).
+exclude = ["crates/ravel-compat-tests"]
 
 [workspace.package]
 version = "0.33.0"
