@@ -364,10 +364,8 @@ async fn run_background_migrate(
             }
             // A signal the tenant never provisioned has no floor to raise; any
             // other HEAD failure is left to the unit, which reports it.
-            if let Err(StoreError::NotFound) = ctx
-                .store
-                .head(&provisioning_key(&tenant, signal))
-                .await
+            if let Err(StoreError::NotFound) =
+                ctx.store.head(&provisioning_key(&tenant, signal)).await
             {
                 continue;
             }
