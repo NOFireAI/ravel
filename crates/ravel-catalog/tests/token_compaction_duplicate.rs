@@ -1202,3 +1202,134 @@ async fn pending_erasure_charges_each_token_a_list_and_the_rewrite_gets() {
         }
     );
 }
+
+/// HEAD folded the bucket before an erasure rewrite R landed over M's object
+/// and P's, so HEAD still names an input R replaced and the `.dreq` stays
+/// pending. The query covers M's events but not P's and carries P's token:
+/// the set holds `held` (M's raw object, or the part of a compaction of M)
+/// but not P's input. R's part also carries M's surviving rows, so it is not
+/// added beside `held`; P's own input is, and the pending erasure filters
+/// its erased rows at scan time.
+async fn token_beside_an_input_its_live_rewrite_replaced_adds_its_own_input(compacted_m: bool) {
+    let store = Arc::new(MemoryStore::new());
+    let start = hour_start(HOUR);
+    let p = l0(Signal::Logs, 1, HOUR, start, L_ROWS);
+    let m = l0(Signal::Logs, 2, HOUR, start + 2_000_000, M_ROWS);
+    put_l0(store.as_ref(), &p).await;
+    put_l0(store.as_ref(), &m).await;
+    let held = if compacted_m {
+        let mut c = compaction(Signal::Logs, &[&m], 0x11, 0xc1, M_ROWS);
+        c.parts[0].min_event_ts_ns = m.min_event_ts_ns;
+        c.parts[0].max_event_ts_ns = m.max_event_ts_ns;
+        put_compaction(store.as_ref(), &c).await;
+        part_key(&c)
+    } else {
+        l0_key(&m)
+    };
+    fold_hour(&store, Signal::Logs).await;
+    let request_id = Uuid::from_u128(0xd4418);
+    put_dreq(store.as_ref(), Signal::Logs, request_id).await;
+    let rw = put_rewrite(
+        store.as_ref(),
+        Signal::Logs,
+        &[&p, &m],
+        request_id,
+        start,
+        L_ROWS + M_ROWS - 1,
+    )
+    .await;
+
+    let window = (late_window().0, sealed_window().1);
+    let (plain, plain_reads) = resolve_counted(&store, Signal::Logs, window, &[]).await;
+    assert_eq!(sorted_keys(&plain), vec![held.clone()], "HEAD is stale");
+    let (snapshot, reads) = resolve_counted(&store, Signal::Logs, window, &[token(&p)]).await;
+    let mut expected = vec![held, l0_key(&p)];
+    expected.sort();
+    assert_eq!(
+        sorted_keys(&snapshot),
+        expected,
+        "R's part would serve M's rows a second time beside the held object"
+    );
+    assert!(!sorted_keys(&snapshot).contains(&rewrite_part_key(&rw)));
+    assert_eq!(rows(&snapshot), L_ROWS + M_ROWS, "each record counted once");
+    assert_eq!(
+        snapshot.pending_erasure.len(),
+        1,
+        "P's erased rows filtered"
+    );
+    // The commit-record GET, one LIST of the bucket, one GET of the rewrite,
+    // which no cache holds, and one of the compaction, if any, which no
+    // listing loaded on this path.
+    let compaction_gets = u64::from(compacted_m);
+    assert_eq!(
+        reads,
+        Reads {
+            lists: plain_reads.lists + 1,
+            gets: plain_reads.gets + 2 + compaction_gets,
+            total: plain_reads.total + 3 + compaction_gets,
+        }
+    );
+}
+
+#[tokio::test]
+async fn token_beside_a_raw_input_its_live_rewrite_replaced_adds_its_own_input() {
+    token_beside_an_input_its_live_rewrite_replaced_adds_its_own_input(false).await;
+}
+
+#[tokio::test]
+async fn token_beside_a_compaction_its_live_rewrite_replaced_adds_its_own_input() {
+    token_beside_an_input_its_live_rewrite_replaced_adds_its_own_input(true).await;
+}
+
+/// Two live rewrites, neither superseding the other, both name L. A present
+/// token checks the siblings and picks the rewrite exactly as a swept one
+/// does: the alarm is raised and the first rewrite in listing order serves L.
+#[tokio::test]
+async fn present_token_raises_the_sibling_alarm_and_serves_the_first_live_rewrite() {
+    let store = Arc::new(MemoryStore::new());
+    let start = hour_start(HOUR);
+    let l = l0(Signal::Logs, 1, HOUR, start, L_ROWS);
+    put_l0(store.as_ref(), &l).await;
+    fold_hour(&store, Signal::Logs).await;
+    let mut siblings = Vec::new();
+    for request in [0xd4418u128, 0xd4419] {
+        let request_id = Uuid::from_u128(request);
+        put_dreq(store.as_ref(), Signal::Logs, request_id).await;
+        let rw = put_rewrite(
+            store.as_ref(),
+            Signal::Logs,
+            &[&l],
+            request_id,
+            start,
+            L_ROWS - 1,
+        )
+        .await;
+        siblings.push((keys::rewrite_record_key_for(&rw).expect("key"), rw));
+    }
+    siblings.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let window = (late_window().0, sealed_window().1);
+    let catalog = catalog(&store);
+    let (plain, _) = resolve_counted_on(&catalog, Signal::Logs, window, &[]).await;
+    assert!(plain.segments.is_empty());
+    assert_eq!(
+        catalog.rewrite_sibling_conflicts(),
+        0,
+        "HEAD serves the hour"
+    );
+    let (snapshot, _) = resolve_counted_on(&catalog, Signal::Logs, window, &[token(&l)]).await;
+    assert_eq!(catalog.rewrite_sibling_conflicts(), 1);
+    assert_eq!(
+        sorted_keys(&snapshot),
+        vec![rewrite_part_key(&siblings[0].1)]
+    );
+
+    store
+        .delete(&keys::commit_key_for_record(&l).expect("commit key"))
+        .await
+        .expect("sweep L's commit record");
+    let swept_catalog = catalog_on(store.clone(), 1);
+    let (swept, _) = resolve_counted_on(&swept_catalog, Signal::Logs, window, &[token(&l)]).await;
+    assert_eq!(swept_catalog.rewrite_sibling_conflicts(), 1);
+    assert_eq!(sorted_keys(&swept), sorted_keys(&snapshot));
+}

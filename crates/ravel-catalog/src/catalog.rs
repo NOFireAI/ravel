@@ -4699,8 +4699,6 @@ impl Catalog {
         }
         // A served part of a superseded rewrite (a stale HEAD) is checked
         // before a live successor is added, which would serve its rows twice.
-        let superseded_records = bucket.supersession()?.superseded_records;
-        let mut live_rewrite: Option<(&str, &RewriteRecord)> = None;
         for (rkey, record) in &bucket.rewrite_records {
             if !bucket
                 .rewrite_effective_inputs(rkey, record)?
@@ -4713,13 +4711,25 @@ impl Catalog {
                     return Ok(Some(Vec::new()));
                 }
             }
-            if live_rewrite.is_none() && !superseded_records.contains(rkey) {
-                live_rewrite = Some((rkey, record));
-            }
         }
-        let Some((rkey, record)) = live_rewrite else {
+        let superseded_records = bucket.supersession()?.superseded_records;
+        self.check_rewrite_siblings(
+            token.shard,
+            token.ingest_hour_bucket,
+            &bucket.rewrite_records,
+            &superseded_records,
+        );
+        let Some((rkey, record)) = bucket.live_rewrite_naming(&superseded_records, &identity)?
+        else {
             return Ok(None);
         };
+        // The rewrite's parts also carry the rows of every other input it
+        // replaced. While the set still serves one of those from a stale
+        // HEAD, its `.dreq` stays pending, so the token's own input is added
+        // and the erasure filter drops its erased rows.
+        if bucket.set_holds_a_replaced_object(rkey, record, token, out)? {
+            return Ok(None);
+        }
         record
             .parts
             .iter()
@@ -4846,27 +4856,21 @@ impl Catalog {
         // through `superseded_record_key`) cover the token: serve its erased
         // output parts. This is the read-your-write answer after an erasure
         // rewrite absorbed the token's flush.
-        for (rkey, record) in &bucket.rewrite_records {
-            if superseded_records.contains(rkey) {
-                continue;
-            }
-            if bucket
-                .rewrite_effective_inputs(rkey, record)?
-                .contains(&token_identity)
-            {
-                for part in &record.parts {
-                    let segment_ref = build_rewrite_l1_segment_ref(record, part, rkey)?;
-                    if !out.contains_key(&segment_ref.data_object_key) {
-                        origin_by_key.insert(
-                            segment_ref.data_object_key.clone(),
-                            SegmentOrigin::TokenResolved,
-                        );
-                    }
-                    out.entry(segment_ref.data_object_key.clone())
-                        .or_insert(segment_ref);
+        if let Some((rkey, record)) =
+            bucket.live_rewrite_naming(&superseded_records, &token_identity)?
+        {
+            for part in &record.parts {
+                let segment_ref = build_rewrite_l1_segment_ref(record, part, rkey)?;
+                if !out.contains_key(&segment_ref.data_object_key) {
+                    origin_by_key.insert(
+                        segment_ref.data_object_key.clone(),
+                        SegmentOrigin::TokenResolved,
+                    );
                 }
-                return Ok(());
+                out.entry(segment_ref.data_object_key.clone())
+                    .or_insert(segment_ref);
             }
+            return Ok(());
         }
 
         Err(unsatisfiable_token(token))
@@ -5043,9 +5047,21 @@ impl TokenBucketRecords {
         rkey: &str,
         record: &RewriteRecord,
     ) -> Result<HashSet<(String, u64, u64)>, CatalogError> {
+        self.rewrite_chain(rkey, record)
+            .map(|(effective_inputs, _)| effective_inputs)
+    }
+
+    /// A rewrite's effective inputs and the keys of the records its
+    /// `superseded_record_key` chain replaced as a whole.
+    #[allow(clippy::type_complexity)]
+    fn rewrite_chain(
+        &self,
+        rkey: &str,
+        record: &RewriteRecord,
+    ) -> Result<(HashSet<(String, u64, u64)>, HashSet<String>), CatalogError> {
         let (compaction_by_key, rewrite_by_key) = self.records_by_key();
         let mut effective_inputs: HashSet<(String, u64, u64)> = HashSet::new();
-        let mut discard_superseded: HashSet<String> = HashSet::new();
+        let mut chain: HashSet<String> = HashSet::new();
         resolve_rewrite_supersession(
             rkey,
             record,
@@ -5053,9 +5069,95 @@ impl TokenBucketRecords {
             &compaction_by_key,
             &rewrite_by_key,
             &mut effective_inputs,
-            &mut discard_superseded,
+            &mut chain,
         )?;
-        Ok(effective_inputs)
+        Ok((effective_inputs, chain))
+    }
+
+    /// The first rewrite, in listing order, that no live rewrite superseded
+    /// and whose effective inputs hold `identity`: the rewrite the token step
+    /// serves for an input, whether its commit record is present or swept.
+    fn live_rewrite_naming(
+        &self,
+        superseded_records: &HashSet<String>,
+        identity: &(String, u64, u64),
+    ) -> Result<Option<(&str, &RewriteRecord)>, CatalogError> {
+        for (rkey, record) in &self.rewrite_records {
+            if superseded_records.contains(rkey) {
+                continue;
+            }
+            if self
+                .rewrite_effective_inputs(rkey, record)?
+                .contains(identity)
+            {
+                return Ok(Some((rkey, record)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether `out` holds an object whose rows the rewrite at `rkey` also
+    /// serves: a level-0 input of the token's bucket among its effective
+    /// inputs, or an output part of a record its chain replaced or of any
+    /// other compaction or rewrite record naming one of those inputs.
+    fn set_holds_a_replaced_object(
+        &self,
+        rkey: &str,
+        record: &RewriteRecord,
+        token: &CommitToken,
+        out: &HashMap<String, SegmentRef>,
+    ) -> Result<bool, CatalogError> {
+        let (effective_inputs, chain) = self.rewrite_chain(rkey, record)?;
+        let held_input = out.values().any(|segment| {
+            segment.level == SegmentLevel::L0
+                && segment.shard == token.shard
+                && segment.ingest_hour_bucket == token.ingest_hour_bucket
+                && effective_inputs.contains(&(
+                    segment.writer_id.to_string(),
+                    segment.writer_epoch,
+                    segment.writer_seq,
+                ))
+        });
+        if held_input {
+            return Ok(true);
+        }
+        let names_effective_input = |inputs: &[CompactionInputIdentity]| {
+            inputs.iter().any(|input| {
+                effective_inputs.contains(&(
+                    input.writer_id.clone(),
+                    input.writer_epoch,
+                    input.writer_seq,
+                ))
+            })
+        };
+        for (ckey, compaction) in &self.compaction_records {
+            if !chain.contains(ckey) && !names_effective_input(&compaction.inputs) {
+                continue;
+            }
+            for part in &compaction.parts {
+                if out.contains_key(&keys::reconstruct_l1_part_key(compaction, part)?) {
+                    return Ok(true);
+                }
+            }
+        }
+        for (other_key, other) in &self.rewrite_records {
+            if other_key == rkey {
+                continue;
+            }
+            if !chain.contains(other_key)
+                && self
+                    .rewrite_effective_inputs(other_key, other)?
+                    .is_disjoint(&effective_inputs)
+            {
+                continue;
+            }
+            for part in &other.parts {
+                if out.contains_key(&keys::reconstruct_rewrite_part_key(other, part)?) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     #[allow(clippy::type_complexity)]
