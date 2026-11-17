@@ -245,7 +245,9 @@ Services in the namespace of each `RavelCluster`. Its ClusterRole grants:
   `storage.azure`,
 - `get`/`list`/`watch`/`create`/`patch`/`delete` on `autoscaling`
   HorizontalPodAutoscalers, for the per-tier HPA under
-  [autoscaling](#autoscaling) mode `Managed`,
+  [autoscaling](#autoscaling) mode `Managed` and the watch on the HPAs the
+  operator owns (apply this before upgrading the operator; see
+  [autoscaling](#autoscaling)),
 - `RavelCluster` and its status subresource,
 - `get` on Secrets,
 - `get`/`list`/`watch` on `endpointslices` (needed to create the router's own
@@ -1188,13 +1190,52 @@ The operator counts an HPA as its own only when the HPA carries the
 `app.kubernetes.io/instance` label naming this cluster, and an
 ownerReference whose uid is this RavelCluster's uid. Copying the labels onto
 your own HPA does not make it the operator's. The operator reads the
-namespace's HPAs once at the start of each pass to decide this, so an HPA
-created at a `Managed` tier's name after that read and before the
-operator's HPA apply in the same pass is not seen, and is overwritten. If
-the read fails, every tier whose pass might apply or delete an HPA fails
-for that pass before anything is written to it, and is reported through
-`Degraded` with reason `AutoscalingHpaListFailed`; the next pass tries
-again.
+namespace's HPAs once per pass, before the tier Deployments are applied, to
+decide this, so an HPA created at a `Managed` tier's name after that read
+and before the operator's HPA apply in the same pass is not seen, and is
+overwritten. An HPA the operator deletes is deleted on the condition that
+its uid is still the one that read returned, so an HPA recreated at the
+same name after the read is left in place: the apiserver refuses the delete,
+and the pass fails like any other failed delete. At a tier's turn-off that
+tier fails before its replica count is applied; in the sweep of HPAs the
+operator no longer renders, which runs after the tiers are applied, the pass
+is reported `Degraded`. An HPA of the operator's that the read returns
+without a uid is not deleted at all, and fails the tier or the sweep the
+same way, with `Degraded` reason `AutoscalingHpaUidMissing`.
+
+If the read fails, the pass applies tiers in its usual order until it
+reaches the first tier whose pass might apply or delete an HPA (a tier with
+an `autoscaling` block, or one listed in `status.autoscaledTiers`). That
+tier fails before anything is written to it, and the pass stops there: the
+tiers after it in that order are not applied either, and the sweep of HPAs
+the operator no longer renders does not run. The pass is reported through
+`Degraded` with reason `AutoscalingHpaListFailed`, and the next pass tries
+again. A pass for a cluster with no `autoscaling` block and no
+`autoscaledTiers` entry does not need the read, so a read that fails in
+that pass changes nothing it applies.
+
+The operator also watches the HPAs it owns from the moment it starts, for
+every cluster, whether or not any of them autoscales. The read and the watch
+need `list` and `watch` on `horizontalpodautoscalers` in the `autoscaling`
+API group, which the operator's ClusterRole in
+`deploy/k8s/operator/rbac.yaml` grants. When you upgrade an existing
+install, apply the updated ClusterRole before you upgrade the operator to
+this version. If the operator starts without those grants, the watch fails
+with 403 Forbidden and keeps retrying, and the operator logs a
+`reconcile stream error` warning for each attempt. Each failure holds back
+the events that start a pass, for every RavelCluster and not only an
+autoscaled one, for up to about a minute: the hold starts under a second
+and doubles up to 30 seconds, plus a random addition of up to its own
+length, so a steady-state hold lasts from 30 seconds to just under 60. A
+spec edit or a change to a Deployment the operator owns takes that much
+longer to be acted on. The passes the operator schedules itself are not
+held back: 30 seconds after a pass that failed, 10 seconds after a pass
+held by the `sys/gc` bootstrap or by store qualification (at the retry
+time instead while a failed qualification backs off), and five minutes
+after any other pass. A pass that needs the read also fails at its first
+autoscaled tier, as above. Applying
+the ClusterRole ends both without a restart: the next retry of the watch
+and the next pass's read succeed.
 
 The admission rules are `minReplicas` at least 1, `maxReplicas` at least
 `minReplicas`, `targetCPUUtilizationPercentage` from 1 to 100, and
@@ -1280,8 +1321,69 @@ kubectl get -n ravel-system ravelcluster dev \
   per tier that kept its live count at turn-off. The operator applies
   `adoptedReplicas` while the tier's `replicas` equals `declaredReplicas`,
   and removes the record once it differs.
+- `hpaReplicas`: one `{tier, desiredReplicas, currentReplicas}` entry per
+  tier whose `Managed` HPA the operator owns and renders, copied from that
+  HPA's `status.desiredReplicas` and `status.currentReplicas`. A tier
+  scaled by an HPA the operator does not own (your own, in `External`
+  mode) has no entry.
 
-Both are absent when empty.
+All three are absent when empty. The operator watches the HPAs it owns, and
+a pass starts when one of them changes what the operator reports from it:
+`status.desiredReplicas`, `status.currentReplicas`, the status of its
+`ScalingActive` or `AbleToScale` condition, or the reason of either while
+that condition is not `True`. The reason of a `True` condition starts no
+pass: the HPA moves `AbleToScale=True` between `ReadyForNewScale`,
+`ScaleUpStabilized` and `ScaleDownStabilized` as it stabilizes, with
+nothing new to report. A change to an HPA's spec starts a pass where the
+API server bumps its `metadata.generation`, which it does only with the
+`HPAGeneration` feature gate on; elsewhere a spec edit to an HPA the
+operator owns starts no pass by itself, and the next pass that renders the
+HPA reverts it. The metrics and scale time the HPA rewrites on its regular
+syncs start no pass (except that after an hour with no event from an HPA,
+its next event starts one), and neither does a change to a condition's
+message alone: a new message reaches `AutoscalingDegraded` at the next pass
+that reads the HPAs. Deleting an HPA the operator owns usually starts no
+pass either: it does only when the deleted HPA's last state changed one of
+the fields above, or after an hour with no event from it. The operator
+creates it again at the next pass that applies the tiers. A pass whose
+HPA read fails, or that is held for store qualification and so reads no
+HPA, keeps the previous `hpaReplicas` and `AutoscalingDegraded` as they
+were, including the condition's `observedGeneration`.
+
+`AutoscalingDegraded=True` (reason `HorizontalPodAutoscalerNotScaling`) is
+set while an HPA the operator owns and renders reports `ScalingActive=False`
+or `AbleToScale=False`, and removed once none does. HPAs that are not the
+operator's are not read for it. Its message names, for each such HPA, the
+tier, the HPA condition, and that condition's reason and message, for
+example:
+
+```text
+a HorizontalPodAutoscaler the operator renders reports it cannot scale its tier:
+gateway: ScalingActive=False reason FailedGetResourceMetric: the HPA was unable
+to compute the replica count: ...
+```
+
+What to check:
+
+- `ScalingActive=False` with reason `FailedGetResourceMetric`: the HPA cannot
+  read CPU from the resource metrics API, most often because metrics-server
+  is not installed. Check `kubectl get apiservice v1beta1.metrics.k8s.io` and
+  `kubectl top pods -n ravel-system`. Until it can read metrics the HPA
+  leaves the replica count where it is.
+- `AbleToScale=False`: the HPA cannot read or update the tier Deployment's
+  scale subresource. Its reason (for example `FailedGetScale` or
+  `FailedUpdateScale`) and `kubectl describe hpa -n ravel-system
+  dev-gateway` say which.
+
+`ScalingLimited=True` does not set the condition: the HPA reports it when
+the count it computed is held to `minReplicas` or `maxReplicas`, which is
+normal for a tier at either bound.
+
+To read the replica counts and the condition:
+
+```sh
+kubectl get -n ravel-system ravelcluster dev -o jsonpath='{.status.hpaReplicas}{"\n"}{.status.conditions[?(@.type=="AutoscalingDegraded")]}{"\n"}'
+```
 
 #### Scale-down pacing
 

@@ -143,6 +143,10 @@ async fn apiserver(
             StatusCode::OK,
             &empty_list("IngressList", "networking.k8s.io/v1"),
         ),
+        (&Method::GET, "/apis/autoscaling/v2/horizontalpodautoscalers") => json_response(
+            StatusCode::OK,
+            &empty_list("HorizontalPodAutoscalerList", "autoscaling/v2"),
+        ),
         (&Method::GET, p) if p == secret => json_response(
             StatusCode::OK,
             &json!({

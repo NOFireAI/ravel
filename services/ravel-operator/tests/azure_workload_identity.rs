@@ -152,6 +152,10 @@ async fn apiserver(
             StatusCode::OK,
             &empty_list("IngressList", "networking.k8s.io/v1"),
         ),
+        (&Method::GET, "/apis/autoscaling/v2/horizontalpodautoscalers") => json_response(
+            StatusCode::OK,
+            &empty_list("HorizontalPodAutoscalerList", "autoscaling/v2"),
+        ),
         (&Method::GET, p) if p == job => json_response(StatusCode::NOT_FOUND, &not_found()),
         (&Method::PATCH, p) if p.starts_with(&service_accounts) || p == job || p == status => {
             fake.writes

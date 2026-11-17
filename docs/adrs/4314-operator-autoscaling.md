@@ -292,7 +292,15 @@ a third refusal: in `Managed` mode, when an HPA the operator does not own
 already exists at `<instance>-<tier>`, the tier is withheld like the other
 two, with forced replicas, no handover and no HPA, and the
 `AutoscalingWithheld` condition names it. The operator sends that HPA no
-patch and no delete.
+patch and no delete. The delete of an owned HPA carries the uid the pass's
+read returned as a precondition, so a user HPA created at the name after
+that read is not deleted: the apiserver answers 409. In the turn-off delete
+of section 2 the tier then fails for the pass, before its forced apply; in
+the orphan sweep, which runs after the tiers are applied, no tier fails and
+the pass is reported `Degraded`. An owned HPA the read returned without a
+uid is not deleted at all, with the same two outcomes. One race remains: a user HPA created at a `Managed` tier's name
+after the read and before the operator's HPA apply in the same pass is not
+seen, and the apply overwrites it.
 
 How ownership is decided: an HPA is the operator's when it carries the
 labels `app.kubernetes.io/managed-by=ravel-operator` and
@@ -300,6 +308,8 @@ labels `app.kubernetes.io/managed-by=ravel-operator` and
 this RavelCluster's uid. Labels alone are not enough, since a user can copy
 them. The operator reads the namespace's HPAs once per pass and decides the
 refusal, the turn-off delete of section 2 and the orphan sweep from that
-read. When the read fails, nothing is withheld on its account: every tier
-whose pass might apply or delete an HPA fails for that pass before any
-write, keeping its `autoscaledTiers` entry, and the orphan sweep is skipped.
+read. When the read fails, nothing is withheld on its account: the pass
+applies tiers in order until the first tier whose pass might apply or
+delete an HPA, which fails before any write, keeping its `autoscaledTiers`
+entry. That failure ends the pass, so the tiers after it in the apply order
+are not applied either and the orphan sweep does not run.

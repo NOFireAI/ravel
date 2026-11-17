@@ -1381,6 +1381,22 @@ pub struct ReplicaAdoption {
     pub declared_replicas: i32,
 }
 
+/// The replica counts a tier's `Managed` HorizontalPodAutoscaler reports, as
+/// the operator's HPA list read them.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HpaReplicas {
+    /// The tier.
+    pub tier: ScalableTier,
+    /// The HPA's `status.desiredReplicas`. Absent before the HPA has
+    /// reported a status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_replicas: Option<i32>,
+    /// The HPA's `status.currentReplicas`. Absent while the HPA reports none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_replicas: Option<i32>,
+}
+
 /// Default gateway request when `spec.gateway.resources` is omitted (#1726).
 /// Sized to keep the `kind` dev lane -- three tiers plus RustFS and floci on
 /// one node -- schedulable without every operator having to size it by hand.
@@ -1521,10 +1537,19 @@ pub struct RavelClusterStatus {
     #[serde(default)]
     pub replica_adoptions: Option<Vec<ReplicaAdoption>>,
 
+    /// One entry per tier whose `Managed` HorizontalPodAutoscaler the operator
+    /// owns and renders (ADR-4314 decision 5), with that HPA's
+    /// `desiredReplicas` and `currentReplicas`. Read from the HPA list each
+    /// pass makes; a pass whose list fails keeps the previous value.
+    /// Serialized even when absent (as explicit `null`) so the status merge
+    /// patch clears it.
+    #[serde(default)]
+    pub hpa_replicas: Option<Vec<HpaReplicas>>,
+
     /// Status conditions the operator actually sets: `Available`, `Degraded`,
     /// `StoreQualified`, `KubernetesVersionUnsupported`,
     /// `IngestAffinityBackendDeprecated`, `HealthProbeOnMainHttpPort`,
-    /// `AutoscalingWithheld`,
+    /// `AutoscalingWithheld`, `AutoscalingDegraded`,
     /// `BucketProtectionVerified` (on a `storage.azure` cluster only, False
     /// with reason NotImplementedForAzure: no bucket-protection check runs
     /// there). The operator emits no `Progressing` condition.

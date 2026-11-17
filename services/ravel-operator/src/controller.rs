@@ -23,7 +23,7 @@ use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::apimachinery::pkg::version::Info;
-use kube::api::{DeleteParams, ListParams, Patch, PatchParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, Preconditions};
 use kube::core::DynamicObject;
 use kube::{Api, Client, Resource, ResourceExt};
 use kube_runtime::controller::{Action, Controller};
@@ -38,8 +38,9 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use crate::autoscaling::{
-    AutoscalingState, HANDOVER_FIELD_MANAGER, HpaAtName, HpaListing, LiveTier, PlanError, Replicas,
-    TIERS, desired_hpa, handover_patch, hpa_name, needs_live, plan_tier, withheld_message,
+    AUTOSCALING_DEGRADED_CONDITION, AutoscalingState, HANDOVER_FIELD_MANAGER, HpaAtName,
+    HpaListing, LiveTier, PlanError, Replicas, TIERS, desired_hpa, handover_patch, hpa_name,
+    hpa_report_key, needs_live, plan_tier, withheld_message,
 };
 use crate::health::{self, HealthState};
 use crate::metrics::{ReconcileMetrics, ReconcileResult};
@@ -228,6 +229,19 @@ pub enum Error {
         tier: &'static str,
         /// The list error.
         message: String,
+    },
+
+    /// The pass's HPA list showed `name` as the operator's own but carried no
+    /// uid, so the delete cannot be conditioned on it and is not sent. The
+    /// tier (or the sweep of HPAs the operator no longer renders) fails
+    /// instead. Surfaced as `Degraded` with reason `AutoscalingHpaUidMissing`.
+    #[error(
+        "HorizontalPodAutoscaler {name} was listed without a uid, so it is not deleted: \
+         the delete is conditioned on the listed uid"
+    )]
+    AutoscalingHpaUidMissing {
+        /// The HPA that was not deleted.
+        name: String,
     },
 }
 
@@ -1439,6 +1453,41 @@ where
     Ok(())
 }
 
+/// [`DeleteParams`] for an HPA the pass's list showed as the operator's own:
+/// preconditioned on the uid that list read, so the apiserver refuses (409)
+/// to delete an HPA recreated at the same name since.
+fn listed_hpa_delete_params(uid: &str) -> DeleteParams {
+    DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: Some(uid.to_string()),
+            ..Preconditions::default()
+        }),
+        ..DeleteParams::default()
+    }
+}
+
+/// Delete the listed HPA `name` with [`listed_hpa_delete_params`], treating a
+/// 404 as success. A precondition failure is an error like any other. With no
+/// listed uid nothing is sent: an unconditioned delete could remove an HPA
+/// recreated at the name, so the caller fails instead.
+async fn delete_listed_hpa(
+    api: &Api<HorizontalPodAutoscaler>,
+    name: &str,
+    uid: Option<&str>,
+) -> Result<(), Error> {
+    let Some(uid) = uid else {
+        return Err(Error::AutoscalingHpaUidMissing {
+            name: name.to_string(),
+        });
+    };
+    if let Err(err) = api.delete(name, &listed_hpa_delete_params(uid)).await
+        && !is_not_found(&err)
+    {
+        return Err(err.into());
+    }
+    Ok(())
+}
+
 /// Converge the fragment-port NetworkPolicy around the Deployment applies.
 ///
 /// `held`, the policy to keep present while the query rollout is in flight, is
@@ -1726,7 +1775,7 @@ async fn reconcile_timed(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Ac
             let qualification_passed = proceed_hash.is_some();
             let mut degraded_conditions =
                 degraded_extra_conditions(extra_conditions, store_qualified_condition);
-            apply_pass_autoscaling_withheld(
+            apply_pass_autoscaling_conditions(
                 &mut degraded_conditions,
                 &obj.spec,
                 &autoscaling,
@@ -1994,6 +2043,15 @@ async fn reconcile_inner(
                 },
             )
             .await?;
+
+            // No HPA list runs before this gate, so this keeps the stored
+            // `AutoscalingDegraded` as the failed-list path does.
+            apply_pass_autoscaling_conditions(
+                &mut extra_conditions,
+                &obj.spec,
+                autoscaling,
+                obj.metadata.generation,
+            );
 
             // Report the readiness a prior pass recorded, so a cluster already
             // serving through a re-qualification keeps `Available=True` instead of
@@ -2367,12 +2425,13 @@ async fn reconcile_inner(
     // ownership (ADR-4314 amendment 2026-11-16) rather than the fixed
     // `<instance>-<tier>` name a user's `kubectl autoscale` also writes.
     //
-    // A failed list fails each tier whose plan renders or deletes its HPA
-    // (`apply_tier`), before any write for it; the other tiers and the orphan
-    // sweep below do not need it.
+    // A failed list fails the first tier in the apply sequence whose plan
+    // renders or deletes its HPA (`apply_tier`), before any write for it, and
+    // that error ends the pass: later tiers and the orphan sweep do not run.
+    // Tiers that need no HPA write do not need the list.
     let hpa_listing: Result<HpaListing, String> = match hpas.list(&ListParams::default()).await {
         Ok(list) => Ok(HpaListing::new(
-            list.iter().map(|hpa| &hpa.metadata),
+            list.iter(),
             instance,
             obj.metadata.uid.as_deref(),
         )),
@@ -2400,6 +2459,19 @@ async fn reconcile_inner(
         .filter(|&tier| desired_hpa(&obj.spec, instance, tier).is_some())
         .map(|tier| hpa_name(instance, tier))
         .collect();
+    // ADR-4314 decision 5: what the HPAs the operator owns and renders this
+    // pass report. Only the listing's owned entries are read. A failed list
+    // leaves the previous report in place.
+    if let Ok(listing) = &hpa_listing {
+        autoscaling.set_hpa_report(
+            listing.report(
+                instance,
+                TIERS
+                    .into_iter()
+                    .filter(|&tier| desired_hpa(&obj.spec, instance, tier).is_some()),
+            ),
+        );
+    }
     // The fragment-port NetworkPolicy (ADR-1689 decision 4) converges around
     // the Deployment applies: see `converge_query_network_policy` for the order.
     let network_policies: Api<NetworkPolicy> = Api::namespaced(client.clone(), namespace);
@@ -2472,7 +2544,7 @@ async fn reconcile_inner(
     if let Ok(listing) = &hpa_listing {
         for name in listing.owned() {
             if !desired_hpas.contains(name) && !tiers.deleted_hpas.contains(name) {
-                delete_if_present(&hpas, name).await?;
+                delete_listed_hpa(&hpas, name, listing.owned_uid(name)).await?;
             }
         }
     }
@@ -2574,7 +2646,7 @@ async fn reconcile_inner(
         extra_conditions.push(c);
     }
 
-    apply_pass_autoscaling_withheld(
+    apply_pass_autoscaling_conditions(
         &mut extra_conditions,
         &obj.spec,
         autoscaling,
@@ -2876,9 +2948,16 @@ impl TierDeployments {
         // here, before the apply, with its `autoscaledTiers` entry kept, so the
         // next pass takes the turn-off again: it reads the live count anew and
         // records that, which is still the scaler's count because the HPA
-        // survived.
+        // survived. The delete is conditioned on the uid the listing read, so
+        // a same-named HPA created since the list is answered with a 409 and
+        // the tier fails here the same way.
         if plan.delete_hpa && hpa_at_name == HpaAtName::Owned {
-            delete_if_present(ctx.hpas, &hpa).await?;
+            let uid = ctx
+                .hpa_listing
+                .as_ref()
+                .ok()
+                .and_then(|listing| listing.owned_uid(&hpa));
+            delete_listed_hpa(ctx.hpas, &hpa, uid).await?;
             self.deleted_hpas.insert(hpa.clone());
         }
 
@@ -3045,6 +3124,14 @@ pub(crate) const CONDITION_TYPE_AUTOSCALING_WITHHELD: &str = "AutoscalingWithhel
 /// The `AutoscalingWithheld=True` reason.
 pub(crate) const AUTOSCALING_WITHHELD_REASON: &str = "AutoscalingPrerequisiteMissing";
 
+/// `status.conditions[].type` value naming every tier whose HPA, owned and
+/// rendered by the operator, reports `ScalingActive=False` or
+/// `AbleToScale=False` (ADR-4314 decision 5).
+pub(crate) const CONDITION_TYPE_AUTOSCALING_DEGRADED: &str = AUTOSCALING_DEGRADED_CONDITION;
+
+/// The `AutoscalingDegraded=True` reason.
+pub(crate) const AUTOSCALING_DEGRADED_REASON: &str = "HorizontalPodAutoscalerNotScaling";
+
 /// `status.conditions[].type` value saying whether the container's
 /// protection (blob versioning paired with a lifecycle rule that deletes
 /// previous versions; soft delete with a bounded retention; an immutability
@@ -3078,6 +3165,7 @@ pub(crate) const CONDITION_TYPES: &[&str] = &[
     CONDITION_TYPE_INGEST_AFFINITY_BACKEND_DEPRECATED,
     CONDITION_TYPE_HEALTH_PROBE_ON_MAIN_HTTP_PORT,
     CONDITION_TYPE_AUTOSCALING_WITHHELD,
+    CONDITION_TYPE_AUTOSCALING_DEGRADED,
     CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED,
 ];
 
@@ -3331,8 +3419,11 @@ fn kubernetes_version_condition(
 /// Rewrites the `AutoscalingWithheld` entry of `conditions` from what the pass
 /// found: [`spec_conditions`] sees only the spec, and a Managed tier whose HPA
 /// name is taken by an HPA this RavelCluster does not own is withheld too. An
-/// existing entry keeps its position.
-fn apply_pass_autoscaling_withheld(
+/// existing entry keeps its position. Sets or removes `AutoscalingDegraded`
+/// from what the operator's own HPAs report ([`AutoscalingState`]); a pass
+/// whose HPA list did not run or did not succeed writes the stored entry back
+/// unchanged.
+fn apply_pass_autoscaling_conditions(
     conditions: &mut Vec<Condition>,
     spec: &RavelClusterSpec,
     autoscaling: &AutoscalingState,
@@ -3347,13 +3438,34 @@ fn apply_pass_autoscaling_withheld(
             &message,
         )
     });
-    let existing = conditions
-        .iter_mut()
-        .find(|c| c.r#type == CONDITION_TYPE_AUTOSCALING_WITHHELD);
+    replace_condition(conditions, CONDITION_TYPE_AUTOSCALING_WITHHELD, fresh);
+    let degraded = match autoscaling.kept_degraded_condition() {
+        Some(kept) => Some(kept.clone()),
+        None => autoscaling.degraded_message().map(|message| {
+            condition(
+                CONDITION_TYPE_AUTOSCALING_DEGRADED,
+                true,
+                observed_generation,
+                AUTOSCALING_DEGRADED_REASON,
+                message,
+            )
+        }),
+    };
+    replace_condition(conditions, CONDITION_TYPE_AUTOSCALING_DEGRADED, degraded);
+}
+
+/// Set the `condition_type` entry of `conditions` to `fresh`, keeping an
+/// existing entry's position, or remove it when `fresh` is `None`.
+fn replace_condition(
+    conditions: &mut Vec<Condition>,
+    condition_type: &str,
+    fresh: Option<Condition>,
+) {
+    let existing = conditions.iter_mut().find(|c| c.r#type == condition_type);
     match (fresh, existing) {
         (Some(fresh), Some(slot)) => *slot = fresh,
         (Some(fresh), None) => conditions.push(fresh),
-        (None, Some(_)) => conditions.retain(|c| c.r#type != CONDITION_TYPE_AUTOSCALING_WITHHELD),
+        (None, Some(_)) => conditions.retain(|c| c.r#type != condition_type),
         (None, None) => {}
     }
 }
@@ -3477,6 +3589,7 @@ fn build_status(
         pod_identity_service_accounts: persisted.pod_identity_service_accounts,
         autoscaled_tiers: persisted.autoscaling.autoscaled_tiers(),
         replica_adoptions: persisted.autoscaling.replica_adoptions(),
+        hpa_replicas: persisted.autoscaling.hpa_replicas(),
         conditions,
     }
 }
@@ -3524,6 +3637,7 @@ fn build_degraded_status(
         pod_identity_service_accounts: persisted.pod_identity_service_accounts,
         autoscaled_tiers: persisted.autoscaling.autoscaled_tiers(),
         replica_adoptions: persisted.autoscaling.replica_adoptions(),
+        hpa_replicas: persisted.autoscaling.hpa_replicas(),
         conditions,
     }
 }
@@ -3710,6 +3824,9 @@ fn degraded_reason(err: &Error) -> (String, String) {
         ),
         Error::AutoscalingHpaListFailed { .. } => {
             ("AutoscalingHpaListFailed".to_string(), err.to_string())
+        }
+        Error::AutoscalingHpaUidMissing { .. } => {
+            ("AutoscalingHpaUidMissing".to_string(), err.to_string())
         }
         other => ("ReconcileError".to_string(), other.to_string()),
     }
@@ -4076,6 +4193,24 @@ pub async fn run(
     .await
 }
 
+/// The owned-HPA watch's triggers: it copies a `Managed` HPA's report into
+/// `status.hpaReplicas` and `AutoscalingDegraded` without waiting for the
+/// resync. The HPA controller rewrites `currentMetrics` on nearly every sync,
+/// so an event passes only when [`hpa_report_key`] moves. A deletion carries
+/// the HPA's last state and is usually dropped too, passing only when that
+/// state moved the key or the HPA's previous event was more than an hour
+/// earlier (the predicate's cache TTL); a deleted owned HPA is recreated by
+/// the next pass that applies the tiers.
+fn owned_hpa_triggers(
+    events: impl futures::Stream<Item = Result<watcher::Event<HorizontalPodAutoscaler>, watcher::Error>>
+    + Send
+    + 'static,
+) -> impl futures::Stream<Item = Result<HorizontalPodAutoscaler, watcher::Error>> + Send + 'static {
+    events
+        .touched_objects()
+        .predicate_filter(hpa_report_key, Default::default())
+}
+
 /// The part of [`run`] after the listener is bound and the client and
 /// apiserver version are resolved: serves `listener`, then runs the
 /// controller until its stream ends. Public so an integration test can drive
@@ -4096,6 +4231,7 @@ pub async fn run_on(
     let deployments: Api<Deployment> = Api::all(client.clone());
     let services: Api<Service> = Api::all(client.clone());
     let ingresses: Api<Ingress> = Api::all(client.clone());
+    let hpas: Api<HorizontalPodAutoscaler> = Api::all(client.clone());
     let metrics = Arc::new(ReconcileMetrics::new());
     let context = Arc::new(Context {
         client,
@@ -4110,6 +4246,8 @@ pub async fn run_on(
     // Deployment and Service in the cluster; the selector keeps only the ones
     // this operator manages.
     let managed = watcher::Config::default().labels("app.kubernetes.io/managed-by=ravel-operator");
+
+    let hpa_events = owned_hpa_triggers(watcher(hpas, managed.clone()));
 
     // Drop status-only updates on the primary `RavelCluster` watch. Every
     // reconcile pass rewrites `.status`; without this filter each write
@@ -4157,6 +4295,7 @@ pub async fn run_on(
             .owns(deployments, managed.clone())
             .owns(services, managed.clone())
             .owns(ingresses, managed)
+            .owns_stream(hpa_events)
             .run(reconcile, error_policy, context)
             .for_each(|result| async move {
                 match result {
@@ -4784,6 +4923,26 @@ mod tests {
             vec![CONDITION_TYPE_AUTOSCALING_WITHHELD]
         );
         produced.push(CONDITION_TYPE_AUTOSCALING_WITHHELD);
+
+        // AutoscalingDegraded: apply_pass_autoscaling_conditions with an
+        // owned HPA reporting it cannot scale.
+        let mut degraded_state = AutoscalingState::default();
+        degraded_state.set_hpa_report(crate::autoscaling::HpaReport {
+            replicas: Vec::new(),
+            degraded: Some("gateway: ScalingActive=False".to_string()),
+        });
+        let mut autoscaling_conditions = Vec::new();
+        apply_pass_autoscaling_conditions(
+            &mut autoscaling_conditions,
+            &spec_with_affinity(None),
+            &degraded_state,
+            Some(1),
+        );
+        assert_eq!(
+            condition_types(&autoscaling_conditions),
+            vec![CONDITION_TYPE_AUTOSCALING_DEGRADED]
+        );
+        produced.push(CONDITION_TYPE_AUTOSCALING_DEGRADED);
 
         let mut produced_sorted = produced.clone();
         produced_sorted.sort_unstable();
@@ -7733,6 +7892,129 @@ mod tests {
             "the status-only event at generation 1 must be dropped and the \
              generation-2 event kept"
         );
+    }
+
+    /// The owned-HPA watch's triggers as [`run_on`] builds them: an HPA status
+    /// write that only moves `currentMetrics` queues no reconcile, one that
+    /// moves `desiredReplicas` does, a recreated HPA (new uid) passes as a new
+    /// object, and a deletion passes only when the deleted HPA's last state
+    /// moved the key.
+    #[tokio::test]
+    async fn hpa_watch_drops_metric_only_status_writes() {
+        use futures::stream;
+        use watcher::Event;
+
+        let hpa = |uid: &str, desired: i32, utilization: i32| -> HorizontalPodAutoscaler {
+            serde_json::from_value(serde_json::json!({
+                "metadata": { "name": "rc-gateway", "namespace": "default", "uid": uid },
+                "status": { "desiredReplicas": desired, "currentMetrics": [{
+                    "type": "Resource", "resource": { "name": "cpu",
+                        "current": { "averageUtilization": utilization } } }] },
+            }))
+            .expect("HPA parses")
+        };
+        let events: Vec<Result<Event<HorizontalPodAutoscaler>, watcher::Error>> = vec![
+            Ok(Event::Init),
+            Ok(Event::InitApply(hpa("a", 3, 50))),
+            Ok(Event::InitDone),
+            Ok(Event::Apply(hpa("a", 3, 61))),
+            Ok(Event::Apply(hpa("a", 3, 72))),
+            Ok(Event::Apply(hpa("a", 4, 72))),
+            Ok(Event::Delete(hpa("a", 4, 72))),
+            Ok(Event::Apply(hpa("b", 4, 72))),
+            Ok(Event::Delete(hpa("b", 5, 72))),
+        ];
+        let passed: Vec<(String, i32)> = owned_hpa_triggers(stream::iter(events))
+            .filter_map(|r| async move { r.ok() })
+            .map(|hpa| {
+                (
+                    hpa.metadata.uid.unwrap_or_default(),
+                    hpa.status.map(|s| s.desired_replicas).unwrap_or_default(),
+                )
+            })
+            .collect()
+            .await;
+        assert_eq!(
+            passed,
+            vec![
+                ("a".to_string(), 3),
+                ("a".to_string(), 4),
+                ("b".to_string(), 4),
+                ("b".to_string(), 5),
+            ]
+        );
+    }
+
+    /// An owned HPA the list returned without a uid is not deleted: no
+    /// request is sent (the client points at a port nothing serves, so a sent
+    /// request would fail as a `Kube` error instead), and the error surfaces
+    /// as `Degraded` reason `AutoscalingHpaUidMissing`.
+    #[tokio::test]
+    async fn an_owned_hpa_listed_without_a_uid_is_not_deleted() {
+        let hpas: Api<HorizontalPodAutoscaler> = Api::namespaced(unreachable_client(), "default");
+        let err = delete_listed_hpa(&hpas, "rc-gateway", None)
+            .await
+            .expect_err("a uid-less delete fails");
+        assert!(
+            matches!(&err, Error::AutoscalingHpaUidMissing { name } if name == "rc-gateway"),
+            "{err:?}"
+        );
+        let (reason, message) = degraded_reason(&err);
+        assert_eq!(reason, "AutoscalingHpaUidMissing");
+        assert!(message.contains("rc-gateway"), "{message}");
+        assert!(
+            matches!(
+                delete_listed_hpa(&hpas, "rc-gateway", Some("hpa-uid")).await,
+                Err(Error::Kube(_))
+            ),
+            "with a uid the delete is sent"
+        );
+    }
+
+    /// A pass whose HPA list did not replace the report writes the stored
+    /// `AutoscalingDegraded` back as it was, its observedGeneration included;
+    /// once a listing replaces the report the condition carries the pass's
+    /// generation.
+    #[test]
+    fn a_failed_hpa_list_keeps_the_stored_degraded_condition() {
+        let stored = Condition {
+            r#type: CONDITION_TYPE_AUTOSCALING_DEGRADED.to_string(),
+            status: "True".to_string(),
+            observed_generation: Some(3),
+            last_transition_time: Some("2026-11-16T00:00:00Z".to_string()),
+            reason: AUTOSCALING_DEGRADED_REASON.to_string(),
+            message: "gateway: ScalingActive=False".to_string(),
+        };
+        let status = RavelClusterStatus {
+            conditions: vec![stored.clone()],
+            ..RavelClusterStatus::default()
+        };
+        let mut state = AutoscalingState::from_status(Some(&status));
+        let mut conditions = Vec::new();
+        apply_pass_autoscaling_conditions(
+            &mut conditions,
+            &spec_with_affinity(None),
+            &state,
+            Some(7),
+        );
+        assert_eq!(conditions, vec![stored.clone()]);
+
+        state.set_hpa_report(crate::autoscaling::HpaReport {
+            replicas: Vec::new(),
+            degraded: Some(stored.message.clone()),
+        });
+        let mut conditions = Vec::new();
+        apply_pass_autoscaling_conditions(
+            &mut conditions,
+            &spec_with_affinity(None),
+            &state,
+            Some(7),
+        );
+        let [fresh] = conditions.as_slice() else {
+            panic!("one condition expected: {conditions:?}");
+        };
+        assert_eq!(fresh.observed_generation, Some(7));
+        assert_eq!(fresh.message, stored.message);
     }
 
     /// A repeated pass with identical inputs leaves each condition's
