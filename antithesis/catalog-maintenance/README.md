@@ -10,11 +10,15 @@ written.
 
 | Service | Role |
 |---|---|
-| `rustfs` | The object store, and the only durable component. Same image pin as ingest-durability. |
+| `faketime` | Copies libfaketime, the run wrapper and the clock offset file (`+0`) onto the shared `faketime` volume, then exits. |
+| `rustfs` | The object store, and the only durable component. RustFS 1.0.0, the release ingest-durability runs, in its glibc build (`1.0.0-glibc`, pinned by digest): the default build is static-pie musl, which no `LD_PRELOAD` reaches. |
 | `init` | Creates the bucket and runs `ravel-cli store qualify`, then exits. |
 | `ravel1`, `ravel2` | `ravel-server --mode all`: ingest, SQL, and the scheduled fold every 15 s. |
 | `maint1`, `maint2` | `ravel-server --mode maintain`: the scheduled fold every 15 s, and compaction, retention and the sweep every 20 s. |
-| `driver` | The workload. The only container excluded from faults. |
+| `driver` | The workload. The only container excluded from faults, and the only writer of the clock offset file. |
+
+Every container except `faketime` starts through `/faketime/run`, under
+libfaketime; see "The clock jump" below.
 
 Does `--mode all` run maintenance? Only the fold. `Mode::runs_scheduled_fold`
 is true for `all` and `maintain`. Compaction, retention and the sweep
@@ -49,9 +53,10 @@ During setup, before any ravel-server starts, the driver:
    4 --batch-rows <per hour> --ingest-hour-stride <SEED_HOUR_STRIDE>
    --ingest-hour-start <unix hour>` on the fresh tenant `cm-tenant`. Batch `i`
    lands in ingest hour `start + i * stride`. The start is chosen so the last
-   batch is three hours before the driver's current hour, so every seeded hour
-   is sealed already.
-3. Records every seeded `(write, record)` in its model.
+   batch's hour lies `stride + 3` hours before the driver's current hour, so
+   every seeded hour is sealed already.
+3. Checks that the load's report names the planned rows and hours; any other
+   report fails setup. Records every seeded `(write, record)` in its model.
 4. PUTs the seed marker `antithesis/catalog-maintenance/seeded`.
 
 Every ravel-server entrypoint (`ravel/entrypoint.sh`) waits for that marker
@@ -65,9 +70,10 @@ with fewer than two inputs (`DEFAULT_MIN_COMPACTION_INPUTS`). So seeded hours
 fold but never compact. Compaction happens on the live hours: the driver's
 strict OTLP writes go into the same tenant, and the 500 ms flush cadence
 gives each live hour many level-0 objects. A live hour seals only once its
-end plus the one-hour maximum flush lifetime and the skew allowance have
-passed. So a run that must see a compaction either runs for hours or uses
-the clock spike below.
+end plus the one-hour maximum flush lifetime, the skew allowance and the
+fold safety margin have passed. So a run that must see a compaction either
+runs for hours or jumps the clock, which this workload does once per
+timeline (below).
 
 ## Driver rules
 
@@ -75,11 +81,27 @@ the clock spike below.
 |---|---|
 | `write_logs` | A strict OTLP log write to `ravel1` or `ravel2`, retried on no response, 429 or 503. |
 | `fold` | `ravel-cli catalog fold --tenant cm-tenant --signal logs --shards 4`, then `catalog inspect --json`. |
-| `compact` | `ravel-cli maintain compact-tenant --tenant cm-tenant --signal logs --shards 4`, then the multiset check. |
+| `compact` | `ravel-cli maintain compact-tenant --tenant cm-tenant --signal logs --shards 4`, then the upper-bound check on one node. |
 | `sweep` | `ravel-cli maintain sweep --tenant cm-tenant --signal logs --shard <0..3>`. |
+| `jump_clock` | Rarely, once at least `CLOCK_JUMP_MIN_ACKED` (20) live writes are acked and no write is in flight, moves every clock forward by `CLOCK_JUMP_SECS`. Once per timeline. |
 | `corrupt_head` | Rarely, PUTs garbage over the HEAD through raw S3. A read then falls back to listing and the next fold rebuilds HEAD. |
 | `audit` | The store audit below. |
-| `check_multiset` | The multiset check below, on one node. |
+| `check_bounds` | The upper-bound check below, on one node. |
+| `eventually` | Rarely (and always after `WORKLOAD_EVENTUALLY_AFTER_SECS` when that is set): stops faults, waits up to 300 s for every node to serve, jumps the clocks if no rule did, folds, compacts, audits, runs the full multiset check and ends the timeline. |
+
+### The multiset checks
+
+A no-token SQL scan's freshness is bounded by listing, and a commit landing
+in an hour already sealed stays out of it (docs/consistency-model.md). So
+while faults run, a scan proves only upper bounds: no seeded record stored
+more than once, no live record stored more often than its attempts allow, no
+row naming a record that was never written. Absences are not judged then.
+
+After faults stop, `eventually` checks the whole multiset: a no-token scan of
+each node, re-read for up to two minutes while its only finding is absent
+records, must hold every seeded record exactly once, and a read of every
+acked live write with its commit tokens must find each at least once. A read
+that fails for two minutes counts as a violation, not as a pass.
 
 ### The store audit
 
@@ -89,20 +111,32 @@ the clock spike below.
    7): key=`) and each key-index leaf (`field=... key=`). It then fetches
    and decodes every part. A part it cannot fetch fails the command with
    `failed to fetch part <key>`, and the audit counts that key as named.
-3. LIST the tenant prefix (`t/<tenant hash>/`).
-4. `catalog inspect --json` again. If HEAD changed during steps 1 to 4, or
+3. `ravel-cli rlog footprint --tenant cm-tenant --shards 4 --json` lists
+   every data object the catalog resolves for the tenant and fetches each. An
+   object it cannot fetch fails the command with `failed to fetch <key>`, and
+   the audit counts that key as resolved.
+4. LIST the tenant prefix (`t/<tenant hash>/`). A page counts only when curl
+   exited 0 and the body ends with `</ListBucketResult>`; a page that does
+   not is requested again, and a listing that still fails gives no verdict,
+   never an empty bucket.
+5. `catalog inspect --json` again. If HEAD changed during steps 1 to 5, or
    is corrupt or absent, the audit skips this pass.
-5. Decode one listed compaction record (`l1.<hash>.cmt`) with `ravel-cli
+6. Cross-check the text parse against the JSON form of the same HEAD: the
+   same part keys in the same order and the same number of key-index leaves.
+   A parse that found nothing or a different set fails the audit, since it
+   would otherwise check nothing and pass.
+7. Decode one listed compaction record (`l1.<hash>.cmt`) with `ravel-cli
    commit decode-compaction <key>`, and one level-0 commit record with
    `ravel-cli commit decode <key>`.
 
-Missing decoder: no `ravel-cli` command prints the entries of a snapshot
-part, which are the commit records and data objects the part names. `catalog
-inspect` decodes each part but prints only its entry count. So the audit
-checks every object HEAD and its part refs name (parts, `.cstat`, `.kidx`
-leaves). It does not check the data objects or commit records inside a part.
-Closing that gap needs a `ravel-cli catalog inspect --entries` (or similar)
-decoder. The driver does not decode parts itself.
+Missing decoder: no `ravel-cli` command prints the commit-record entries of
+a snapshot part. `catalog inspect` decodes each part but prints only its
+entry count, and `rlog footprint` reports data objects, not commit records.
+So the audit checks every object HEAD and its part refs name (parts,
+`.cstat`, `.kidx` leaves) and every data object the catalog resolves, but
+not the commit records inside a part. Closing that gap needs a `ravel-cli
+catalog inspect --entries` (or similar) decoder. The driver does not decode
+parts itself.
 
 ## Properties
 
@@ -110,43 +144,61 @@ Every literal starts with `catalog: ` or `clock: `.
 
 | Literal | Type | Where | Holds when |
 |---|---|---|---|
-| `catalog: a sealed seeded hour was folded into HEAD` | sometimes | every `catalog inspect --json` | HEAD's `watermark_hour` is at or above some seeded hour. |
+| `catalog: no scan shows a phantom or an excess copy` | always | `compact`, `check_bounds` | A no-token scan, while faults may run, stores no seeded record more than once, no live record more often than its attempts allow, and no record that was never written. |
+| `catalog: every object HEAD names exists` | always | `audit` | Every key the stable HEAD names is in the LIST taken while HEAD did not change, and the text parse of that HEAD matches its JSON form. |
+| `catalog: every data object the catalog resolves exists` | always | `audit` | Every data object `rlog footprint` reports is in that LIST. |
+| `catalog: the system recovers once faults stop` | always | `eventually` | Every node is ready and answers SQL, and every maintenance node is ready, within 300 s of faults stopping. |
+| `catalog: compaction preserves the acked multiset` | always | `eventually` | After faults stop, a fold and a compaction: each seeded record is stored exactly once, each acked live record at least once (read with its commit tokens), no live record more often than its attempts allow, no row names a record that was never written, and every read answered. |
+| `catalog: a sealed seeded hour was folded into HEAD` | sometimes | every `catalog inspect --json` | A part of HEAD with entries covers some seeded hour (inside its `min_hour..=watermark_hour`, not retired). |
+| `clock: an hour ingested live was sealed by a fold` | sometimes | every `catalog inspect --json` | A part of HEAD with entries covers the hour of some acked live write. |
 | `catalog: a compaction record was published` | sometimes | `audit` | A listed `l1.*.cmt` record decoded through `commit decode-compaction`. |
-| `catalog: every object HEAD names exists` | always | `audit` | Every key the stable HEAD names is in the LIST taken while HEAD did not change. |
-| `catalog: compaction preserves the acked multiset` | always | `compact`, `check_multiset` | Each seeded record is stored exactly once. Each acked live record is stored at least once. No live record is stored more often than its attempts allow. No row names a record that was never written. A verdict whose only finding is absent records is re-read for up to two minutes first. |
-| `clock: an hour ingested live was sealed by a fold` | sometimes | every `catalog inspect --json` | HEAD's `watermark_hour` is at or above the hour of some acked live write. |
+| `catalog: the audit checked the data objects the catalog resolves` | sometimes | `audit` | `rlog footprint` reported at least one data object. |
+| `catalog: a listed commit record decoded through ravel-cli` | sometimes | `audit` | A listed level-0 commit record decoded through `commit decode`. |
+| `clock: the driver jumped every clock forward` | reachable | `jump_clock`, `eventually` | The jump reached the driver's own clock. |
+| `catalog: the workload starts` | reachable | startup | |
+| `catalog: an on-demand fold succeeded` | reachable | `fold` | |
+| `catalog: HEAD was overwritten with garbage through raw S3` | reachable | `corrupt_head` | |
+| `catalog: inspect reported a corrupt HEAD` | reachable | every `catalog inspect --json` | |
+| `clock: the driver could not write the clock offset` | unreachable | `jump_clock` | |
+| `clock: the clock jump did not reach the driver` | unreachable | `jump_clock` | The driver's clock did not move by the jump within one reread plus 30 s. |
+| `catalog: the seeded load was refused` | unreachable | setup | |
+| `catalog: the seeded load reported other rows than planned` | unreachable | setup | |
 
-The driver also reports these, for coverage only:
+## The clock jump
 
-- `catalog: the workload starts` (reachable).
-- `catalog: an on-demand fold succeeded` (reachable).
-- `catalog: HEAD was overwritten with garbage through raw S3` (reachable).
-- `catalog: inspect reported a corrupt HEAD` (reachable).
-- `catalog: a listed commit record decoded through ravel-cli` (sometimes).
-- `catalog: the seeded load was refused` (unreachable).
+A live hour seals only `max_flush_lifetime + clock_skew_allowance +
+fold_safety_margin` (3600 + 300 + 900 s) after it ends, and compaction needs
+a sealed hour with two or more inputs. A timeline is far shorter than that,
+so every container runs under libfaketime with one wall-clock offset and the
+driver moves it forward once per timeline (ADR-4326, clock-jump amendment).
 
-## Clock spike
+- The `faketime` service puts `libfaketimeMT.so.1` (libfaketime 0.9.13,
+  built in `ravel/Dockerfile` from a tarball pinned by sha256), the run
+  wrapper and the offset file `/faketime/offset` (`+0`) on a shared volume.
+  rustfs loads the library from there without shipping it.
+- Every other container starts through `/faketime/run`, which exits 70
+  unless the library is preloaded, the offset file is readable, a `+1d`
+  probe moves `date` by a day, and the container's binary
+  (`FAKETIME_CHECK_BINARY`) is dynamically linked against glibc. A container
+  whose clock could not jump never starts, so setup fails rather than the
+  run passing without the jump.
+- The driver refuses to start if `CLOCK_JUMP_SECS` is below 8400 s (3600 s
+  for an hour acked at its first second, plus the sealing delay above) or
+  the offset file does not hold `+0`. The config jumps 9000 s.
+- `jump_clock` writes the new offset by replacing the file whole. libfaketime
+  rereads it at most every `FAKETIME_CACHE_DURATION` (2 s) per process; the
+  driver waits until its own clock moved, then one more reread for the rest.
+- Monotonic clocks are not faked, so timeouts and leases measured on them
+  are untouched. Shell waits in the entrypoints use `/proc/uptime`.
 
-`local/docker-compose.faketime.yaml` runs every container, rustfs included,
-under libfaketime with one wall-clock offset, read from the shared file
-`/faketime/offset` (initially `+0`). A `faketime` service copies
-`libfaketimeMT.so.1` from the server image into a shared volume, so rustfs can load it
-without shipping it. Monotonic clocks are not faked.
-
-`scripts/clock-spike.sh <out-dir> [before] [after] [offset]` does the
-following:
-
-1. Runs the local loop with that override.
-2. After `before` seconds, writes `offset` (default `+4h`) to the file.
-3. Checks that each container's clock moved by at least two hours. rustfs is
-   checked through the `Last-Modified` it stamps on a probe PUT.
-4. Lets the workload run `after` more seconds.
-5. Exits 0 only if `clock: an hour ingested live was sealed by a fold` held at
-   least once.
-
-If any clock did not move, for example because the rustfs image ignores
-`LD_PRELOAD`, the script exits 2 and prints `none: needs clock control`. The
-rows that need the spike are then recorded that way.
+`scripts/clock-spike.sh <out-dir> [seconds]` runs the local loop and reports
+on the jump alone. It writes `<out-dir>/clock-spike-result.txt` and exits 0
+only if `local-run.sh` passed; `clock: the driver jumped every clock
+forward`, `clock: an hour ingested live was sealed by a fold` and `catalog: a
+compaction record was published` held; and all six clock probes (`date` in
+rustfs, ravel1, ravel2, maint1 and maint2, and the `Last-Modified` rustfs
+stamps on a probe PUT) read at least the jump minus 60 s ahead of the host.
+The last line is `clock jump: PASS` or `clock jump: FAIL`.
 
 ## Build, run locally, launch
 
@@ -155,18 +207,36 @@ The same steps as ingest-durability, from this directory's `scripts/`:
 - `scripts/build.sh [server|driver|all]`. The driver's build context is
   `antithesis/` and it copies `ravel-cli` from the server image, so build the
   server first.
-- `scripts/local-run.sh <out-dir> [seconds]`. Exits 0 when no always-type
-  assertion was violated.
+- `scripts/local-run.sh <out-dir> [seconds]` starts the stack under the
+  run's compose file, runs the workload for `seconds` (default 240) before
+  the driver's forced `eventually`, and exits 0 only if all of these hold:
+  - `faketime` and `init` exited 0, and setup completed within 900 s;
+  - the driver was still running after setup, then exited 0 having logged
+    `eventually: ending the timeline`;
+  - every other container is running or exited 0;
+  - every clock probe read a number at least the jump minus 60 s ahead of
+    the host (`clock-probe.txt`);
+  - every container's SDK output was collected;
+  - no always-type assertion was violated (`violated.tsv`), and none that
+    must be hit was never hit (`never-hit.tsv`);
+  - `catalog: the workload starts`, `clock: the driver jumped every clock
+    forward`, `catalog: a sealed seeded hour was folded into HEAD`, `clock:
+    an hour ingested live was sealed by a fold` and `catalog: a compaction
+    record was published` each held.
 - `WORKLOAD_INJECT_SWAPPED_RECORD=1 scripts/local-run.sh <out-dir>` is the
   self-check. The model expects one seeded record moved to another write, so
   `catalog: compaction preserves the acked multiset` must appear in
-  `violated.tsv`. The script exits 0 only if it does.
-- `scripts/clock-spike.sh <out-dir>`.
+  `violated.tsv`, and no assertion other than it and `catalog: no scan shows
+  a phantom or an excess copy` may. The other gates still apply.
+- `scripts/clock-spike.sh <out-dir> [seconds]` (above).
 - `scripts/export-images.sh`, `scripts/import-images.sh`, `scripts/launch.sh
-  <hours>`.
+  <hours>`. `launch.sh` validates and launches with a 15-minute setup
+  timeout, above the driver's own 600 s setup budget.
 
 ## New external dependencies
 
-The driver adds `arrow-array`, `arrow-schema` and `parquet` (59, the versions
-the repository's own Cargo.lock pins) to write the seed file. It reuses the
-ingest-durability driver's model and client through a path dependency.
+The driver adds `arrow-array`, `arrow-schema` and `parquet` (major version
+59, the major the repository root's Cargo.lock pins at 59.3.0) to write the
+seed file. The driver has its own Cargo.lock, which resolves them to 59.3.3.
+It reuses the ingest-durability driver's model and client through a path
+dependency.

@@ -156,12 +156,22 @@ pub fn unfetched_part(stderr: &str) -> Option<String> {
     (!key.is_empty()).then(|| key.to_string())
 }
 
-/// The object key from `rlog footprint`'s `failed to fetch <key>: ...` error:
-/// the catalog resolved a data object the store could not return.
-pub fn unfetched_object(stderr: &str) -> Option<String> {
-    let rest = &stderr[stderr.find("failed to fetch ")? + "failed to fetch ".len()..];
-    let key = rest.split([':', ' ', '\n']).next()?;
-    (!key.is_empty() && key != "part").then(|| key.to_string())
+/// The data object key from `rlog footprint`'s
+/// `Error: failed to fetch <key>: object not found` (anyhow's report of a
+/// `StoreError::NotFound`): the catalog resolved a data object the store does
+/// not hold. `None` for any other failure, including a fetch of `sys/tenancy`
+/// or a HEAD, a key outside `<tenant_prefix>l/` or not an `.rlog`, and any
+/// store error other than not-found; the audit then has no verdict.
+pub fn unfetched_object(stderr: &str, tenant_prefix: &str) -> Option<String> {
+    let data = format!("{tenant_prefix}l/");
+    stderr.lines().find_map(|line| {
+        let (key, cause) = line
+            .trim()
+            .strip_prefix("Error: failed to fetch ")?
+            .split_once(": ")?;
+        (key.starts_with(&data) && key.ends_with(".rlog") && cause.trim() == "object not found")
+            .then(|| key.to_string())
+    })
 }
 
 /// The keys HEAD names that the listing does not hold.
@@ -319,23 +329,63 @@ parts: 1
     }
 
     #[test]
-    fn footprint_objects_and_fetch_failures_are_parsed() {
-        let json = r#"{"total":{},"objects":[{"key":"t/0a0b/l/d/0/1/a.rlog","level":0},
-                       {"key":"t/0a0b/l/d/0/1/b.rlog","level":1}]}"#;
+    fn footprint_objects_are_parsed() {
+        let json = r#"{"total":{},"objects":[{"key":"t/0a0b/l/l0/0/a.rlog","level":0},
+                       {"key":"t/0a0b/l/l1/0/1/b.rlog","level":1}]}"#;
         assert_eq!(
             footprint_keys(json),
             Some(vec![
-                "t/0a0b/l/d/0/1/a.rlog".to_string(),
-                "t/0a0b/l/d/0/1/b.rlog".to_string()
+                "t/0a0b/l/l0/0/a.rlog".to_string(),
+                "t/0a0b/l/l1/0/1/b.rlog".to_string()
             ])
         );
         assert_eq!(footprint_keys("object_count: 2"), None);
-        assert_eq!(
-            unfetched_object("Error: failed to fetch t/0a0b/l/d/0/1/a.rlog: not found\n")
-                .as_deref(),
-            Some("t/0a0b/l/d/0/1/a.rlog")
-        );
-        assert_eq!(unfetched_object("Error: failed to fetch part k: x"), None);
+    }
+
+    const DATA_KEY: &str = "t/0a0b/l/l0/0/w1.1.7.00112233aabbccdd.rlog";
+
+    #[test]
+    fn a_data_object_not_found_under_the_tenant_is_missing() {
+        let err = format!("Error: failed to fetch {DATA_KEY}: object not found\n");
+        assert_eq!(unfetched_object(&err, "t/0a0b/").as_deref(), Some(DATA_KEY));
+    }
+
+    #[test]
+    fn a_sys_tenancy_failure_has_no_verdict() {
+        let err = "Error: failed to fetch sys/tenancy: transient error: 503 Slow Down\n";
+        assert_eq!(unfetched_object(err, "t/0a0b/"), None);
+        let err = "Error: failed to fetch sys/tenancy: object not found\n";
+        assert_eq!(unfetched_object(err, "t/0a0b/"), None);
+    }
+
+    #[test]
+    fn a_head_fetch_failure_has_no_verdict() {
+        let err = "Error: failed to fetch HEAD t/0a0b/catalog/l/HEAD: timeout\n";
+        assert_eq!(unfetched_object(err, "t/0a0b/"), None);
+        let err = "Error: failed to fetch part t/0a0b/catalog/l/snap/1.aa.csnap: object not found";
+        assert_eq!(unfetched_object(err, "t/0a0b/"), None);
+    }
+
+    #[test]
+    fn a_transient_error_on_a_data_object_has_no_verdict() {
+        for cause in [
+            "transient error: connection reset",
+            "timeout",
+            "throttled, retry after 1000 ms",
+            "access denied: RequestTimeTooSkewed",
+        ] {
+            let err = format!("Error: failed to fetch {DATA_KEY}: {cause}\n");
+            assert_eq!(unfetched_object(&err, "t/0a0b/"), None, "{cause}");
+        }
+    }
+
+    #[test]
+    fn a_not_found_outside_the_tenant_data_prefix_has_no_verdict() {
+        let other = "t/ffff/l/l0/0/w1.1.7.00112233aabbccdd.rlog";
+        let err = format!("Error: failed to fetch {other}: object not found\n");
+        assert_eq!(unfetched_object(&err, "t/0a0b/"), None);
+        let err = "Error: failed to fetch t/0a0b/catalog/l/idx/1.bb.cstat: object not found\n";
+        assert_eq!(unfetched_object(err, "t/0a0b/"), None);
     }
 
     #[test]

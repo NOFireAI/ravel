@@ -598,6 +598,10 @@ impl Shared {
             println!("audit: catalog inspect: {}", text.summary());
             return;
         }
+        let Some(prefix) = audit::tenant_prefix(&before.head_key) else {
+            println!("audit: unexpected HEAD key {}", before.head_key);
+            return;
+        };
         let footprint = self.cli.run(
             &[
                 "rlog",
@@ -617,17 +621,18 @@ impl Shared {
             }
             keys
         } else {
-            match audit::unfetched_object(&footprint.stderr) {
+            // Only a not-found on a data object under the tenant is a
+            // verdict; any other failure leaves this pass without one.
+            match audit::unfetched_object(&footprint.stderr, &prefix) {
                 Some(key) => Some(vec![key]),
                 None => {
-                    println!("audit: rlog footprint: {}", footprint.summary());
+                    println!(
+                        "audit: no verdict on resolved data objects, rlog footprint: {}",
+                        footprint.summary()
+                    );
                     None
                 }
             }
-        };
-        let Some(prefix) = audit::tenant_prefix(&before.head_key) else {
-            println!("audit: unexpected HEAD key {}", before.head_key);
-            return;
         };
         let listed: BTreeSet<String> = match self.store.list(&prefix) {
             Ok(keys) => keys.into_iter().collect(),
