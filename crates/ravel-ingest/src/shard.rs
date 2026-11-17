@@ -7875,7 +7875,11 @@ mod tests {
     }
 
     const NO_PUBLISH_AFTER_ABANDON: &str =
-        "commit: no commit record is published after its flush's deadline";
+        "commit: no commit record is published after its flush was abandoned";
+    const ABSENT_AT_ABANDON: &str =
+        "commit: an abandoned flush's commit record is absent at the abandon";
+    const NO_COMMIT_WITHOUT_DATA: &str =
+        "commit: a commit record never exists without its data object";
 
     /// Drives the injected clock in backoff-sized steps until `write` ends.
     async fn retry_until_finished<T>(clock: &TestClock, write: &tokio::task::JoinHandle<T>) {
@@ -7887,30 +7891,135 @@ mod tests {
         }
     }
 
-    /// NoPublishAfterAbandon over two flushes on one shard. The first
-    /// flush's commit PUT is throttled once and its retry publishes inside
-    /// the lifetime; the property is evaluated on that publish and holds. The
-    /// second flush's commit PUT is throttled on every attempt, so the flush
-    /// is abandoned at its deadline: no commit record of it exists and no
-    /// evaluation names it.
+    /// The prefix of `tenant`'s metrics commit records.
+    fn commit_prefix(tenant: &TenantId) -> String {
+        format!(
+            "t/{}/{}/c/",
+            tenant.hash().to_hex(),
+            Signal::Metrics.key_prefix()
+        )
+    }
+
+    /// A one-shard router over `store` whose flushes end at the
+    /// `lifetime` deadline, never on the attempt budget.
+    fn deadline_bounded_router(
+        store: &Arc<dyn ObjectStoreBackend>,
+        clock: &Arc<TestClock>,
+        lifetime: Duration,
+    ) -> Arc<IngestRouter> {
+        Arc::new(
+            IngestRouter::with_rng(
+                IngestConfig {
+                    put_retry_max_attempts: u32::MAX,
+                    ..one_permit_one_queue(lifetime)
+                },
+                Arc::clone(store),
+                Signal::Metrics,
+                clock.clone(),
+                Arc::new(FullJitter),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+            )
+            .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+        )
+    }
+
+    /// A store whose PUTs run on their own task: a caller that stops waiting
+    /// does not cancel the PUT, which completes when the store lets it, as a
+    /// request already sent to a real object store does.
+    struct DetachedPutStore(Arc<FaultStore<MemoryStore>>);
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for DetachedPutStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            let inner = Arc::clone(&self.0);
+            let key = key.to_owned();
+            tokio::spawn(async move { inner.put(&key, data, opts).await })
+                .await
+                .unwrap_or_else(|e| Err(ravel_object_store::StoreError::Transient(e.to_string())))
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            self.0.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+        {
+            self.0.put_multipart(key).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.0.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.0.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.0.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.0.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.0.capabilities()
+        }
+    }
+
+    /// NoPublishAfterAbandon when no abandoned commit lands later. Four
+    /// flushes on one shard:
+    /// 1. `retried`: the commit PUT is throttled once and its retry publishes.
+    /// 2. `abandoned`: every commit PUT is throttled until the deadline. The
+    ///    record is absent at the abandon, so its key is re-read by every
+    ///    later flush, and it stays absent.
+    /// 3. `landed`: the first commit PUT applies but its response is lost,
+    ///    then every retry is throttled until the deadline. The record landed
+    ///    before the abandon, the documented ambiguity: it is found at the
+    ///    abandon, so its key is never re-read and nothing evaluates false,
+    ///    although the record exists.
+    /// 4. `retried` again, whose flush re-reads the abandoned key.
     #[tokio::test]
-    async fn no_publish_after_abandon_holds_under_fault_store() {
-        use ravel_object_store::fault::{FaultKind, Rule, ScriptedFault};
+    async fn no_publish_after_abandon_holds_when_no_abandoned_commit_lands_later() {
+        use ravel_object_store::fault::{FaultKind, Rule, ScriptedFault, Sequence};
 
         if !crate::router::invariant_capture::capturing() {
             return;
         }
         let retried = TenantId::new("no-publish-after-abandon-retried");
         let abandoned = TenantId::new("no-publish-after-abandon-abandoned");
-        let commits = |tenant: &TenantId| {
-            format!(
-                "t/{}/{}/c/",
-                tenant.hash().to_hex(),
-                Signal::Metrics.key_prefix()
-            )
-        };
+        let landed = TenantId::new("no-publish-after-abandon-landed");
+        let commits = commit_prefix;
         let throttled = || ScriptedFault::Throttled { retry_after_ms: 0 };
         let plan = FaultPlan::empty()
+            .with_sequence(
+                Sequence::new(Op::Put)
+                    .with_key_contains(commits(&landed))
+                    .then_fault(ScriptedFault::DuplicateDelivery),
+            )
             .with_rule(
                 Rule::new(Op::Put, throttled())
                     .with_key_contains(commits(&retried))
@@ -7920,29 +8029,20 @@ mod tests {
                 Rule::new(Op::Put, throttled())
                     .with_key_contains(commits(&abandoned))
                     .with_occurrence(Occurrence::Always),
+            )
+            .with_rule(
+                Rule::new(Op::Put, throttled())
+                    .with_key_contains(commits(&landed))
+                    .with_occurrence(Occurrence::Always),
             );
         let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
         let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
         provision(store.as_ref(), &retried).await;
         provision(store.as_ref(), &abandoned).await;
+        provision(store.as_ref(), &landed).await;
         let lifetime = Duration::from_secs(1);
         let clock = TestClock::new(BASE_NS);
-        let router = Arc::new(
-            IngestRouter::with_rng(
-                IngestConfig {
-                    // The deadline, not the attempt budget, ends the second
-                    // flush.
-                    put_retry_max_attempts: u32::MAX,
-                    ..one_permit_one_queue(lifetime)
-                },
-                Arc::clone(&store),
-                Signal::Metrics,
-                clock.clone(),
-                Arc::new(FullJitter),
-                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
-            )
-            .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
-        );
+        let router = deadline_bounded_router(&store, &clock, lifetime);
 
         let write = spawn_write(&router, &retried, "h0", WriteMode::Strict);
         until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
@@ -7959,16 +8059,7 @@ mod tests {
             "the first flush's commit PUT was throttled once"
         );
         assert_eq!(router.metrics().snapshot().put_retries, 1);
-        let evaluations = crate::router::invariant_capture::evaluations(
-            NO_PUBLISH_AFTER_ABANDON,
-            &commits(&retried),
-        );
-        assert_eq!(evaluations.len(), 1, "{evaluations:?}");
-        assert!(evaluations[0].0, "{evaluations:?}");
-        assert!(
-            evaluations[0].1.contains(&receipt.tokens[0].encode()),
-            "{evaluations:?}"
-        );
+        assert!(!receipt.tokens.is_empty());
 
         let opened_ns = clock.now_ns();
         let write = spawn_write(&router, &abandoned, "h1", WriteMode::Strict);
@@ -7997,22 +8088,185 @@ mod tests {
             !keys.iter().any(|k| k.contains("/c/")),
             "no commit record of the abandoned flush exists: {keys:?}"
         );
+        let absent =
+            crate::router::invariant_capture::evaluations(ABSENT_AT_ABANDON, &commits(&abandoned));
+        assert_eq!(absent.len(), 1, "{absent:?}");
+        assert!(absent[0].0, "{absent:?}");
+        let abandon_site = crate::router::invariant_capture::evaluations(
+            "commit: flush abandoned",
+            &abandoned.hash().to_hex(),
+        );
+        assert_eq!(abandon_site.len(), 1, "{abandon_site:?}");
+        assert!(abandon_site[0].1.contains("commit put"), "{abandon_site:?}");
 
-        let none = crate::router::invariant_capture::evaluations(
+        let write = spawn_write(&router, &landed, "h2", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 3).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        retry_until_finished(&clock, &write).await;
+        let err = write
+            .await
+            .expect("write task")
+            .expect_err("every commit PUT after the lost response is throttled");
+        assert!(matches!(err, WriteError::Abandoned(_)), "{err:?}");
+        assert_eq!(
+            fault_store.fault_count(Op::Put, FaultKind::DuplicateDelivery),
+            1,
+            "the landed flush's first commit PUT applied and lost its response"
+        );
+        assert_eq!(router.metrics().snapshot().abandoned_retry_exhausted, 2);
+        let keys = tenant_keys(store.as_ref(), &landed).await;
+        assert!(
+            keys.iter().any(|k| k.contains("/c/")),
+            "the lost-response commit record exists: {keys:?}"
+        );
+        let found =
+            crate::router::invariant_capture::evaluations(ABSENT_AT_ABANDON, &commits(&landed));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            !found[0].0,
+            "the record was found at the abandon: {found:?}"
+        );
+
+        let write = spawn_write(&router, &retried, "h3", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 4).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        retry_until_finished(&clock, &write).await;
+        write
+            .await
+            .expect("write task")
+            .expect("the last flush commits");
+
+        let rechecked = crate::router::invariant_capture::evaluations(
             NO_PUBLISH_AFTER_ABANDON,
             &commits(&abandoned),
         );
-        assert!(none.is_empty(), "the abandoned flush published: {none:?}");
-        let retried_again = crate::router::invariant_capture::evaluations(
-            NO_PUBLISH_AFTER_ABANDON,
-            &commits(&retried),
-        );
-        assert_eq!(retried_again, evaluations);
         assert!(
-            !crate::router::invariant_capture::evaluations("commit: flush abandoned", "commit put")
-                .is_empty(),
-            "the abandon site was reached"
+            !rechecked.is_empty(),
+            "no later flush re-read the abandoned key"
         );
+        assert!(rechecked.iter().all(|(held, _)| *held), "{rechecked:?}");
+        let never = crate::router::invariant_capture::evaluations(
+            NO_PUBLISH_AFTER_ABANDON,
+            &commits(&landed),
+        );
+        assert!(never.is_empty(), "{never:?}");
+        router.flush_all().await;
+    }
+
+    /// A commit PUT the flush stopped waiting for, which completes after the
+    /// flush was abandoned: the record is absent at the abandon and present
+    /// when the next flush on the shard re-reads its key, so
+    /// NoPublishAfterAbandon evaluates false.
+    #[tokio::test]
+    async fn a_commit_record_landing_after_the_abandon_breaks_no_publish_after_abandon() {
+        if !crate::router::invariant_capture::capturing() {
+            return;
+        }
+        let late = TenantId::new("no-publish-after-abandon-late");
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = fault_store.hold(Op::Put, Some(commit_prefix(&late)), Occurrence::Nth(1));
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(DetachedPutStore(Arc::clone(&fault_store)));
+        provision(store.as_ref(), &late).await;
+        let clock = TestClock::new(BASE_NS);
+        let router = deadline_bounded_router(&store, &clock, Duration::from_secs(1));
+
+        let write = spawn_write(&router, &late, "h0", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        gate.wait_until_held(1).await;
+        let (_, _, commit_key) = gate.held_details()[0].clone();
+        retry_until_finished(&clock, &write).await;
+        let err = write
+            .await
+            .expect("write task")
+            .expect_err("the held commit PUT outlives the deadline");
+        assert!(matches!(err, WriteError::Abandoned(_)), "{err:?}");
+        let absent = crate::router::invariant_capture::evaluations(ABSENT_AT_ABANDON, &commit_key);
+        assert_eq!(absent.len(), 1, "{absent:?}");
+        assert!(absent[0].0, "{absent:?}");
+
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        for _ in 0..10_000 {
+            if fault_store.inner().head(&commit_key).await.is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            fault_store.inner().head(&commit_key).await.is_ok(),
+            "the released PUT stored the commit record"
+        );
+
+        let write = spawn_write(&router, &late, "h1", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 2).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        write
+            .await
+            .expect("write task")
+            .expect("the next flush commits");
+        let evaluations =
+            crate::router::invariant_capture::evaluations(NO_PUBLISH_AFTER_ABANDON, &commit_key);
+        assert!(
+            evaluations.iter().any(|(held, _)| !held),
+            "NoPublishAfterAbandon never evaluated false on a record landing after the abandon: \
+             {evaluations:?}"
+        );
+        router.flush_all().await;
+    }
+
+    /// The NoCommitWithoutData evidence read runs after the commit PUT's
+    /// deadline race: a HEAD held past the flush deadline delays the ack of a
+    /// landed commit but does not abandon it.
+    #[tokio::test]
+    async fn a_slow_evidence_read_does_not_abandon_a_landed_commit() {
+        if !crate::router::invariant_capture::capturing() {
+            return;
+        }
+        let slow = TenantId::new("no-commit-without-data-slow-head");
+        let data_prefix = format!(
+            "t/{}/{}/l0/",
+            slow.hash().to_hex(),
+            Signal::Metrics.key_prefix()
+        );
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = fault_store.hold(Op::Head, Some(data_prefix.clone()), Occurrence::Nth(1));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        provision(store.as_ref(), &slow).await;
+        let clock = TestClock::new(BASE_NS);
+        let lifetime = Duration::from_secs(1);
+        let router = deadline_bounded_router(&store, &clock, lifetime);
+
+        let write = spawn_write(&router, &slow, "h0", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        gate.wait_until_held(1).await;
+        assert!(
+            tenant_keys(store.as_ref(), &slow)
+                .await
+                .iter()
+                .any(|k| k.contains("/c/")),
+            "the commit record landed before the evidence read"
+        );
+        clock.advance_ns(2 * i64::try_from(lifetime.as_nanos()).expect("fits"));
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        let receipt = write
+            .await
+            .expect("write task")
+            .expect("the landed commit is acked although its evidence read outlived the deadline");
+        assert_eq!(receipt.tokens.len(), 1);
+        assert_eq!(router.metrics().snapshot().abandoned_retry_exhausted, 0);
+        let evaluations =
+            crate::router::invariant_capture::evaluations(NO_COMMIT_WITHOUT_DATA, &data_prefix);
+        assert_eq!(evaluations.len(), 1, "{evaluations:?}");
+        assert!(evaluations[0].0, "{evaluations:?}");
         router.flush_all().await;
     }
 }

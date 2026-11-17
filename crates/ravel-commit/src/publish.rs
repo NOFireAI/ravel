@@ -609,9 +609,10 @@ mod tests {
         assert!(evaluations[0].0, "{evaluations:?}");
         assert!(!evaluations[1].0, "{evaluations:?}");
         assert!(
-            evaluations[1]
-                .1
-                .contains(&format!("\"stored\": \"{}\"", hex::encode(first.content_hash))),
+            evaluations[1].1.contains(&format!(
+                "\"stored\": \"{}\"",
+                hex::encode(first.content_hash)
+            )),
             "the split-brain evaluation names the stored record's hash: {evaluations:?}"
         );
     }

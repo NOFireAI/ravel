@@ -216,7 +216,8 @@ pub(crate) async fn commit_records_exist(
 
 /// The writer identity under the `commit/mismatched-identity-idempotent`
 /// mutant: every writer that draws one shares it.
-const MUTANT_WRITER_ID: uuid::Uuid = uuid::Uuid::from_u128(0x4326_0003_0000_0000_0000_0000_0000_0001);
+const MUTANT_WRITER_ID: uuid::Uuid =
+    uuid::Uuid::from_u128(0x4326_0003_0000_0000_0000_0000_0000_0001);
 const MUTANT_WRITER_EPOCH: u64 = 1;
 
 /// The `(writer_id, epoch)` a new shard actor writes under: a fresh id from
@@ -1760,7 +1761,8 @@ mod tests {
     const STRICT_METRICS_ACK: &str = "commit: a strict metrics ack names a durable commit record";
 
     /// A one-shard strict-mode router over `store` that flushes on every
-    /// write.
+    /// write, on a clock that never moves on its own: no flush deadline or
+    /// age trigger can fire during a test.
     fn flush_every_write(store: Arc<dyn ObjectStoreBackend>) -> IngestRouter {
         IngestRouter::new(
             IngestConfig {
@@ -1770,10 +1772,15 @@ mod tests {
             },
             store,
             Signal::Metrics,
-            Arc::new(crate::clock::SystemClock),
+            crate::compat_signal_tests::ManualClock::new(),
             Arc::new(PendingAckBudget::new(0)),
         )
     }
+
+    /// The router's ack wait is on the tokio timer, not the injected clock. A
+    /// write that must ack while its commit PUT is held gets this bound, so a
+    /// build that waits for the commit fails in seconds.
+    const HELD_COMMIT_ACK_BOUND: Duration = Duration::from_secs(2);
 
     #[tokio::test]
     async fn strict_metrics_ack_names_a_durable_commit_record() {
@@ -1822,7 +1829,7 @@ mod tests {
                 tenant.clone(),
                 vec![test_point(&tenant, "cpu", 1_000, 1.0)],
                 WriteMode::Strict,
-                Duration::from_secs(30),
+                HELD_COMMIT_ACK_BOUND,
             )
             .await;
 

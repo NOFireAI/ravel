@@ -3846,3 +3846,209 @@ mod tests {
         assert_eq!(latency.strict_ack(StrictAckPhase::Queued).count(), 1);
     }
 }
+
+/// The commit-area Antithesis properties at the logs router's sites
+/// (ADR-4326), against the capture record of the invariants lane.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod invariant_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use ravel_object_store::ObjectStoreBackend;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_otlp::logs_normalize::NormalizedLogRecord;
+    use ravel_types::{CommitToken, TenantId};
+    use tokio::sync::oneshot;
+
+    use super::LogIngestRouter;
+    use crate::clock::Clock;
+    use crate::compat_signal_tests::ManualClock;
+    use crate::router::invariant_capture;
+    use crate::{IngestConfig, PendingAckBudget, WriteMode};
+
+    const STRICT_LOGS_ACK: &str = "commit: a strict logs ack names a durable commit record";
+    const ONE_IDENTITY_ONE_CONTENT: &str = "commit: one commit identity holds one content hash";
+    const ACK_BOUND: Duration = Duration::from_secs(30);
+
+    /// A one-shard strict logs router that flushes on every write, with the
+    /// production identity source.
+    fn one_shard_logs(
+        store: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<ManualClock>,
+    ) -> LogIngestRouter {
+        LogIngestRouter::new(
+            IngestConfig {
+                shard_count: 1,
+                target_bytes: 1,
+                max_flush_delay: Duration::from_secs(3600),
+                ..IngestConfig::default()
+            },
+            store,
+            clock,
+            Arc::new(PendingAckBudget::new(0)),
+        )
+    }
+
+    /// One log record on one stream, with `body`.
+    fn record(body: &str) -> NormalizedLogRecord {
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+        let res = vec![("host".to_string(), AttrValue::Str("h0".to_string()))];
+        NormalizedLogRecord {
+            stream_id: log_stream_id(&res, "scope", "", &[]),
+            stream_attrs: ravel_logseg::stream_attrs_bytes(&res, "scope", "", &[]).into(),
+            ts_ns: 1_000,
+            observed_ts_ns: 1_000,
+            severity_num: 9,
+            severity_text: "INFO".to_string(),
+            body: body.to_string(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        }
+    }
+
+    /// The router returns whatever token a shard acks; the property reads the
+    /// store. A real commit's ack holds it; an ack naming a seq the shard
+    /// never committed makes it false although the receipt is Ok.
+    #[tokio::test]
+    async fn a_strict_logs_ack_naming_no_commit_record_breaks_the_strict_ack_property() {
+        if !invariant_capture::capturing() {
+            return;
+        }
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let clock = ManualClock::new();
+        let router = one_shard_logs(Arc::clone(&store), Arc::clone(&clock));
+        let tenant = TenantId::new("strict-logs-ack-broken");
+        let receipt = router
+            .write(
+                tenant.clone(),
+                vec![record("committed")],
+                WriteMode::Strict,
+                ACK_BOUND,
+            )
+            .await
+            .expect("strict write");
+        let committed = receipt.tokens[0].clone();
+
+        let broken = CommitToken {
+            seq: committed.seq + 1,
+            ..committed.clone()
+        };
+        let (ack, ack_rx) = oneshot::channel();
+        ack.send(Ok(broken.clone())).expect("ack sent");
+        let acked = router
+            .await_strict_acks(
+                &Arc::new(Vec::new()),
+                tenant.hash(),
+                vec![0],
+                vec![ack_rx],
+                ACK_BOUND,
+                clock.now_ns(),
+            )
+            .await
+            .expect("the router returns what the shard acked");
+        assert_eq!(acked.tokens, vec![broken.clone()]);
+
+        let evaluations = invariant_capture::evaluations(STRICT_LOGS_ACK, &tenant.hash().to_hex());
+        assert_eq!(evaluations.len(), 2, "{evaluations:?}");
+        assert!(evaluations[0].0, "{evaluations:?}");
+        assert!(
+            evaluations[0].1.contains(&committed.encode()),
+            "{evaluations:?}"
+        );
+        assert!(!evaluations[1].0, "{evaluations:?}");
+        assert!(
+            evaluations[1].1.contains(&broken.encode()),
+            "{evaluations:?}"
+        );
+        router.shutdown().await;
+    }
+
+    /// Two routers over one store, each with the production identity source,
+    /// commit two different records for one tenant and shard: each writer
+    /// draws its own identity, so the records land under distinct commit keys
+    /// and no commit PUT finds its key present.
+    #[tokio::test]
+    async fn two_routers_draw_distinct_writer_identities() {
+        if !invariant_capture::capturing() {
+            return;
+        }
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let clock = ManualClock::new();
+        let first = one_shard_logs(Arc::clone(&store), Arc::clone(&clock));
+        let second = one_shard_logs(Arc::clone(&store), Arc::clone(&clock));
+        let tenant = TenantId::new("one-identity-two-routers-holds");
+        let a = first
+            .write(
+                tenant.clone(),
+                vec![record("first")],
+                WriteMode::Strict,
+                ACK_BOUND,
+            )
+            .await
+            .expect("the first router commits");
+        let b = second
+            .write(
+                tenant.clone(),
+                vec![record("second")],
+                WriteMode::Strict,
+                ACK_BOUND,
+            )
+            .await
+            .expect("the second router commits");
+        assert_ne!(a.tokens[0].writer_id, b.tokens[0].writer_id);
+        let evaluations =
+            invariant_capture::evaluations(ONE_IDENTITY_ONE_CONTENT, &tenant.hash().to_hex());
+        assert!(evaluations.is_empty(), "{evaluations:?}");
+        first.shutdown().await;
+        second.shutdown().await;
+    }
+
+    /// `commit/mismatched-identity-idempotent` pins the writer identity where
+    /// the router draws it and skips the hash compare. Two routers with the
+    /// production identity source and no test-side pin then commit different
+    /// records under one commit key, and the second is told it published.
+    #[tokio::test]
+    async fn mutant_pinned_writer_identity_breaks_one_identity_one_content_across_two_routers() {
+        let Some(_mutant) =
+            invariant_capture::scoped_mutant("commit/mismatched-identity-idempotent")
+        else {
+            return;
+        };
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let clock = ManualClock::new();
+        let first = one_shard_logs(Arc::clone(&store), Arc::clone(&clock));
+        let second = one_shard_logs(Arc::clone(&store), Arc::clone(&clock));
+        let tenant = TenantId::new("one-identity-two-routers-mutant");
+        let a = first
+            .write(
+                tenant.clone(),
+                vec![record("first")],
+                WriteMode::Strict,
+                ACK_BOUND,
+            )
+            .await
+            .expect("the first router commits");
+        let b = second
+            .write(
+                tenant.clone(),
+                vec![record("second")],
+                WriteMode::Strict,
+                ACK_BOUND,
+            )
+            .await
+            .expect("the mutant reports the second content published");
+        assert_eq!(a.tokens, b.tokens, "both routers wrote under one identity");
+
+        let evaluations =
+            invariant_capture::evaluations(ONE_IDENTITY_ONE_CONTENT, &tenant.hash().to_hex());
+        assert!(
+            evaluations.iter().any(|(held, _)| !held),
+            "OneIdentityOneContent never evaluated false under the mutant: {evaluations:?}"
+        );
+        first.shutdown().await;
+        second.shutdown().await;
+    }
+}
