@@ -2612,14 +2612,24 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // table manifests and deletes the superseded ones, and reads none of them.
     // Asserted by maintain_template_covers_every_parquet_sweep_call.
     //
-    // sys/maintain/certify/* appears on the delete axis because the maintain
-    // process's own scheduled compat job also finishes a certify run
+    // sys/maintain/certify/* appears on the list and delete axes because the
+    // maintain process's own scheduled compat job also finishes a certify run
     // (`services/ravel-server/src/compat_maintain.rs`, which calls
-    // `ravel_maintain::certify`), and certify's finalization deletes the
-    // store-wide census cursor (`delete_cursor`,
-    // `crates/ravel-maintain/src/compat_certify.rs`). The get and put are
-    // already covered by the wider `sys/maintain/*` read and write grants.
-    // Asserted by maintain_template_covers_the_certify_cursor.
+    // `ravel_maintain::certify`): `read_certify_cursor` GETs the store-wide
+    // census cursor at the start of every run, absent between runs, and
+    // certify's finalization deletes it (`delete_cursor`,
+    // `crates/ravel-maintain/src/compat_certify.rs`). Without the list grant
+    // the absent-cursor GET answers 403, not 404
+    // (deploy/iam/README.md, "Bootstrap keys"). The get and put are already
+    // covered by the wider `sys/maintain/*` read and write grants. Asserted by
+    // maintain_template_covers_the_certify_cursor and
+    // every_bootstrap_read_is_admitted_by_its_roles_list_grant.
+    //
+    // t/*/a/prov and t/*/u/prov join MaintainListTenantBootstrapKeys for the
+    // same reason: compat-certify's `provisioning_fence` GETs every tenant's
+    // alerts and audit provisioning record, which a tenant that never
+    // provisions those signals never writes
+    // (crates/ravel-maintain/src/compat_certify.rs).
     ExpectedRolePatterns {
         role: "maintain",
         list_prefixes: &[
@@ -2634,6 +2644,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/catalog/*/idx/*",
             "sys/maintain/workers/*",
             "sys/maintain/memo/*",
+            "sys/maintain/certify/*",
             "sys/query/workers/*",
             "quarantine/t/*/*/l0/*",
             "t/*/a/",
@@ -2651,6 +2662,8 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             PROV_M_PATTERN,
             PROV_L_PATTERN,
             PROV_S_PATTERN,
+            PROV_A_PATTERN,
+            PROV_U_PATTERN,
             BOOTSTRAP_HEAD_M_PATTERN,
             BOOTSTRAP_HEAD_L_PATTERN,
             BOOTSTRAP_HEAD_S_PATTERN,
@@ -7216,21 +7229,10 @@ fn deletable_reads_without_a_list_grant_per_server_role() {
     for (reader, expected) in [
         ("gateway", idem_witnesses),
         ("query", Vec::new()),
-        // `AdminCertifyCursor` (deploy/iam/admin.json) is a deleter of
-        // `sys/maintain/certify/*`; maintain already reads the whole
-        // `sys/maintain/*` tree (`MaintainRead`) but its list grants cover
-        // only `sys/maintain/workers/*` and `sys/maintain/memo/*`, not the
-        // certify cursor, so the cursor joins this role's existing gap. This
-        // holds even now that `MaintainDelete` also deletes the cursor
-        // itself: `others` below excludes the reader, so maintain's own new
-        // grant does not remove the entry, only admin's does.
-        (
-            "maintain",
-            vec![
-                "sys/maintain/certify/rlog/cursor".to_string(),
-                admission_snapshot_key(Signal::Audit),
-            ],
-        ),
+        // `MaintainList` now carries `sys/maintain/certify/*`, so the certify
+        // cursor no longer joins this gap even though `AdminCertifyCursor`
+        // (deploy/iam/admin.json) deletes it.
+        ("maintain", vec![admission_snapshot_key(Signal::Audit)]),
     ] {
         let (_, policy) = policies
             .iter()
@@ -11975,6 +11977,8 @@ const EXPECTED_BOOTSTRAP_GRANTS: [ExpectedBootstrapGrants; 3] = [
             PROV_M_PATTERN,
             PROV_L_PATTERN,
             PROV_S_PATTERN,
+            PROV_A_PATTERN,
+            PROV_U_PATTERN,
             BOOTSTRAP_HEAD_M_PATTERN,
             BOOTSTRAP_HEAD_L_PATTERN,
             BOOTSTRAP_HEAD_S_PATTERN,
@@ -12125,6 +12129,31 @@ fn bootstrap_reads() -> Vec<BootstrapRead> {
             "MaintainListTenantBootstrapKeys",
         );
     }
+    // `provisioning_fence` in the RLOG family's census and finalization
+    // (`certify`, crates/ravel-maintain/src/compat_certify.rs) reads every
+    // tenant's provisioning record for each of `family_signals(FAMILY_RLOG)`:
+    // logs, alerts and audit. Alerts and audit buckets are never provisioned,
+    // so their record is absent on every tenant.
+    for signal in [Signal::Alerts, Signal::Audit] {
+        add(
+            "maintain",
+            format!("t/{hex}/{}/prov", signal.key_prefix()),
+            "provisioning_fence in certify (crates/ravel-maintain/src/compat_certify.rs), the \
+             compat-certify census and finalization over the RLOG family's signals",
+            "MaintainListTenantBootstrapKeys",
+        );
+    }
+    // The compat-certify census cursor (`certify_cursor_key`,
+    // crates/ravel-maintain/src/compat_certify.rs): `read_certify_cursor` GETs
+    // it at the start of every `certify` call, absent between runs and once a
+    // completed run has deleted it.
+    add(
+        "maintain",
+        "sys/maintain/certify/rlog/cursor".to_string(),
+        "read_certify_cursor in certify (crates/ravel-maintain/src/compat_certify.rs), run from \
+         the maintain tick's compat finalization (services/ravel-server/src/compat_maintain.rs)",
+        "MaintainList",
+    );
     // `read_marker` GETs the exact marker key for each hour of the dedup
     // window on every keyed log or span write; absent is a miss.
     for signal in IDEM_SIGNALS {
@@ -12511,7 +12540,6 @@ fn bootstrap_list_grants_admit_no_other_key() {
         if expected.role == "maintain" {
             refused.push("sys/auth".to_string());
             refused.push(metrics_meta_key());
-            refused.push(format!("t/{hex}/a/prov"));
         }
         if expected.role == "gateway" {
             refused.push(alert_state_memo_key());
