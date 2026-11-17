@@ -538,6 +538,41 @@ mod tests {
         assert!(!selected, "inv_mutant! is false without the feature");
     }
 
+    // Invokes each assertion macro once under `antithesis` so a build with that
+    // feature (and without `capture`) expands and type-checks every
+    // `__inv_sdk!` arm; without this, no gate compiles the always,
+    // always_or_unreachable or sometimes arms. The SDK no-ops outside an
+    // Antithesis run, so this need not assert.
+    #[cfg(feature = "antithesis")]
+    #[test]
+    fn antithesis_sdk_arms_type_check() {
+        let one = 1;
+        inv_always!(
+            one == 1,
+            "ravel-invariant test: antithesis always arm",
+            serde_json::json!({ "one": one })
+        );
+        inv_always_or_unreachable!(
+            one == 1,
+            "ravel-invariant test: antithesis always-or-unreachable arm",
+            serde_json::json!({ "one": one })
+        );
+        inv_sometimes!(
+            one == 1,
+            "ravel-invariant test: antithesis sometimes arm",
+            serde_json::json!({ "one": one })
+        );
+        inv_reachable!(
+            "ravel-invariant test: antithesis reachable arm",
+            serde_json::json!({ "one": one })
+        );
+        inv_unreachable!(
+            "ravel-invariant test: antithesis unreachable arm",
+            serde_json::json!({ "one": one })
+        );
+        let _selected = inv_mutant!("commit/commit-before-data");
+    }
+
     #[cfg(feature = "capture")]
     #[test]
     fn capture_records_a_false_always() {
