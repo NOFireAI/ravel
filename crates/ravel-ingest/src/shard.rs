@@ -5389,7 +5389,7 @@ mod tests {
     /// with no flush attempt in between (as when its flushes are deferred);
     /// the hold starts over there and is spent one bound later.
     ///
-    /// Guard: the `refreshed_at_ns` filter in `stale_view_hold_since`.
+    /// Guard: the `refreshed_at_ns` restart at the top of `StaleViewHold::step`.
     /// Without it, and with a hold restarted at the refresh time instead of
     /// the flush, the flush at t0 + 2 bounds drops the buffer; a hold cleared
     /// whenever any view is cached never drops it.
@@ -5408,7 +5408,7 @@ mod tests {
     /// A view refreshed before the hold began does not restart it: the buffer
     /// is dropped one bound after its first hold.
     ///
-    /// Guard: the `at < since` comparison in `stale_view_hold_since`. A hold
+    /// Guard: the `at >= since` comparison in `StaleViewHold::step`. A hold
     /// cleared whenever any view is cached is still held at the bound.
     #[tokio::test]
     async fn a_read_from_before_a_stale_view_hold_does_not_restart_it() {
@@ -5445,7 +5445,7 @@ mod tests {
         assert_dropped_one_bound_later(rig).await;
     }
 
-    /// Guard: `buf.stale_view_since_ns = None` where `hand_back` returns kept
+    /// Guard: `buf.stale_view_hold.clear()` where `hand_back` returns kept
     /// rows. Without it the flush at the first hold's bound drops the buffer.
     #[tokio::test]
     async fn a_hand_back_to_a_dead_target_restarts_the_stale_view_hold() {
@@ -5453,7 +5453,7 @@ mod tests {
     }
 
     /// Guard: the refused rows return in a new `TenantBuf` that carries no
-    /// hold, and the clear above. Carrying `stale_view_since_ns` into that
+    /// hold, and the clear above. Carrying `stale_view_hold` into that
     /// buffer with the clear removed drops it at the first hold's bound.
     #[tokio::test]
     async fn a_hand_back_to_a_full_mailbox_restarts_the_stale_view_hold() {
@@ -5464,7 +5464,7 @@ mod tests {
     /// A held buffer whose flush opens on a scan-set verdict, and is then
     /// held by the format-floor check, restarts its stale-view hold.
     ///
-    /// Guard: `buf.stale_view_since_ns = None` in the `InScanSet` arm.
+    /// Guard: `buf.stale_view_hold.clear()` in the `InScanSet` arm.
     /// Without it the flush at the first hold's bound drops the buffer.
     #[tokio::test]
     async fn a_scan_set_verdict_restarts_the_stale_view_hold() {
@@ -5485,7 +5485,7 @@ mod tests {
     /// opens in place (and is then held by the format-floor check), restarts
     /// its stale-view hold.
     ///
-    /// Guard: `buf.stale_view_since_ns = None` in the retry-spent arm.
+    /// Guard: `buf.stale_view_hold.clear()` in the retry-spent arm.
     /// Without it the flush one second after it drops the buffer, a deferral
     /// cap after the hold began.
     #[tokio::test]
