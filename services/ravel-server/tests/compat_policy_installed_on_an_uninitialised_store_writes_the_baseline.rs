@@ -56,7 +56,9 @@ use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_logseg::{AttrValue, LogRecord, ObjectIdentity, RlogConfig, RlogWriter};
-use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, ScriptedFault, Sequence};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, ScriptedFault, Sequence,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
 use ravel_proto::sys::v1 as sysproto;
@@ -642,8 +644,12 @@ async fn compat_policy_installed_on_an_uninitialised_store_writes_the_baseline()
 /// The metrics tenant was provisioned by an earlier v0.33.0 writer, so its
 /// write passes first touch and is refused by the ingest router's admission;
 /// the log tenant is new and is refused at first touch. Both answer 503,
-/// count `view_stale` under their family and write nothing. Once a read
-/// succeeds and finds no record the same writes land at the baseline.
+/// count `view_stale` under their family and write nothing. The refusal
+/// wakes the refresh loop, which reads `sys/compat` again at once instead of
+/// on its 60 s tick; that read is held here, so the view stays unread for
+/// both requests. Once it is let through it finds no record, the view is
+/// fresh with no refresh by the test, and the same writes land at the
+/// baseline (#4362).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_5xx_at_startup_refuses_until_a_refresh_then_writes_the_baseline() {
     let _serial = SERIAL.lock().await;
@@ -682,6 +688,7 @@ async fn a_5xx_at_startup_refuses_until_a_refresh_then_writes_the_baseline() {
         1,
         "the startup read of sys/compat failed with a 5xx"
     );
+    let woken_read = faults.hold(Op::Get, Some(COMPAT_KEY.to_string()), Occurrence::Nth(1));
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
     for (path, body, family) in [
@@ -713,12 +720,20 @@ async fn a_5xx_at_startup_refuses_until_a_refresh_then_writes_the_baseline() {
         "nothing is written while the view is unread"
     );
 
-    running
-        .compat_view()
-        .expect("a keyed bucket builds a view")
-        .refresh()
+    tokio::time::timeout(Duration::from_secs(5), woken_read.wait_until_held(1))
         .await
-        .expect("the read after the outage succeeds");
+        .expect("the refusal woke a sys/compat read well before the 60 s tick");
+    for id in woken_read.held() {
+        assert!(woken_read.release(id));
+    }
+    let view = running.compat_view().expect("a keyed bucket builds a view");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while view.last_read_unix_ns().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the woken read succeeds and the view is fresh with no test refresh");
     let before = scrape(running.http_addr).await;
     for (path, body) in [
         ("/v1/metrics", metrics_body()),

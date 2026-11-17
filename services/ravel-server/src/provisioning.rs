@@ -170,13 +170,46 @@ pub enum FirstTouchError {
         signal: Signal,
         refusal: CompatRefusal,
     },
+    /// `sys/compat` bounds every writer's publish lifetime below this
+    /// process's ingest `max_flush_lifetime` (ADR-4233 decision 7), so the
+    /// ingest router refuses the write at admission; the first touch refuses
+    /// it first, rather than create a record for a write that is then
+    /// refused. Raised only when the record is absent; nothing is written.
+    /// Retryable, as the router's own refusal is.
+    #[error(
+        "first touch of {signal:?} refused, retry later: max_flush_lifetime is \
+         {max_flush_lifetime_ns} ns, above the {max_publish_lifetime_ns} ns \
+         max_publish_lifetime_ns in sys/compat (ADR-4233 decision 7)"
+    )]
+    PublishLifetimeAboveCompat {
+        signal: Signal,
+        max_flush_lifetime_ns: i64,
+        max_publish_lifetime_ns: i64,
+    },
 }
 
 impl FirstTouchError {
-    /// Whether a client retry can succeed without operator action.
+    /// Whether the transports answer it as a retryable `sys/compat` refusal
+    /// (HTTP 503, gRPC `UNAVAILABLE`), as the ingest router answers the same
+    /// refusals at admission, rather than as a provisioning failure. A stale
+    /// view clears with no operator; a lifetime bound clears once
+    /// `sys/compat`'s bound is raised.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, FirstTouchError::CompatViewStale { .. })
+        matches!(
+            self,
+            FirstTouchError::CompatViewStale { .. }
+                | FirstTouchError::PublishLifetimeAboveCompat { .. }
+        )
     }
+}
+
+/// Why a first touch may read a provisioning record but not create one.
+enum CreateRefusal {
+    Stale(CompatRefusal),
+    LifetimeAbove {
+        max_flush_lifetime_ns: i64,
+        max_publish_lifetime_ns: i64,
+    },
 }
 
 /// The data family a first touch of `signal` precedes, under which a refusal
@@ -227,6 +260,12 @@ pub struct ProvisioningRecordWriter {
     /// (`compat_epoch > 0`), a record this writer creates is born fenced at
     /// that epoch (ADR-4233 decision 4).
     compat: Option<CompatView>,
+    /// Notified when a first touch is refused for a stale view, so the
+    /// process's refresh loop re-reads `sys/compat` early.
+    compat_refresh_wake: Option<Arc<tokio::sync::Notify>>,
+    /// The ingest routers' `max_flush_lifetime`: a record is not created
+    /// while `sys/compat` bounds publishes below it.
+    max_flush_lifetime: Option<std::time::Duration>,
 }
 
 impl ProvisioningRecordWriter {
@@ -238,7 +277,27 @@ impl ProvisioningRecordWriter {
             read_backoff: Mutex::new(ReadBackoff::new()),
             hard_failures: Mutex::new(HashMap::new()),
             compat: None,
+            compat_refresh_wake: None,
+            max_flush_lifetime: None,
         }
+    }
+
+    /// Notify `wake` each time a first touch is refused for a stale view.
+    pub fn with_compat_refresh_wake(mut self, wake: Arc<tokio::sync::Notify>) -> Self {
+        self.compat_refresh_wake = Some(wake);
+        self
+    }
+
+    /// Refuse to create a record while `sys/compat`'s
+    /// `max_publish_lifetime_ns` is below `max_flush_lifetime`, the lifetime
+    /// the ingest routers this writer provisions for are built with: their
+    /// admission refuses the write that follows (ADR-4233 decision 7), so the
+    /// first touch refuses it first, with
+    /// [`FirstTouchError::PublishLifetimeAboveCompat`]. A present record is
+    /// read and adopted as usual.
+    pub fn with_max_flush_lifetime(mut self, max_flush_lifetime: std::time::Duration) -> Self {
+        self.max_flush_lifetime = Some(max_flush_lifetime);
+        self
     }
 
     /// Create records born fenced once `view` has seen an activation: the
@@ -259,15 +318,27 @@ impl ProvisioningRecordWriter {
     /// The view must be fresh under [`CompatView::check_fresh`] with a bucket
     /// `compat_epoch` of 0, since a new record has none: a stale view may
     /// have missed an activation, and a record created unfenced after one
-    /// lets a writer publish at the baseline past the activation.
+    /// lets a writer publish at the baseline past the activation. The
+    /// record's `max_publish_lifetime_ns`, when set, must not be below
+    /// [`Self::with_max_flush_lifetime`]'s lifetime.
     fn born_fenced_epoch(
         &self,
         now_ns: i64,
-    ) -> Result<Option<std::num::NonZeroU64>, CompatRefusal> {
+    ) -> Result<Option<std::num::NonZeroU64>, CreateRefusal> {
         let Some(view) = &self.compat else {
             return Ok(None);
         };
-        view.check_fresh(now_ns, 0)?;
+        view.check_fresh(now_ns, 0).map_err(CreateRefusal::Stale)?;
+        if let (Some(lifetime), Some(record)) = (self.max_flush_lifetime, view.last_record()) {
+            let max_flush_lifetime_ns = i64::try_from(lifetime.as_nanos()).unwrap_or(i64::MAX);
+            let max_publish_lifetime_ns = record.max_publish_lifetime_ns;
+            if max_publish_lifetime_ns > 0 && max_flush_lifetime_ns > max_publish_lifetime_ns {
+                return Err(CreateRefusal::LifetimeAbove {
+                    max_flush_lifetime_ns,
+                    max_publish_lifetime_ns,
+                });
+            }
+        }
         Ok(std::num::NonZeroU64::new(view.seen_epoch()))
     }
 
@@ -294,8 +365,13 @@ impl ProvisioningRecordWriter {
     /// a present record is validated and adopted as on a fresh view, and an
     /// absent one is refused with [`FirstTouchError::CompatViewStale`],
     /// counted in `ravel_compat_publish_refused_total` under the signal's data
-    /// family. The refusal caches nothing and starts no backoff, so the next
-    /// request checks again.
+    /// family, and wakes the refresh loop ([`Self::with_compat_refresh_wake`]).
+    /// A record `sys/compat`'s publish bound forbids this process's ingest
+    /// lifetime ([`Self::with_max_flush_lifetime`]) is read the same way and
+    /// never created: an absent one is refused with
+    /// [`FirstTouchError::PublishLifetimeAboveCompat`], counted under
+    /// `publish_lifetime_above_compat`. Neither refusal caches anything or
+    /// starts a backoff, so the next request checks again.
     pub async fn ensure(
         &self,
         tenant_hash: &TenantHash,
@@ -324,9 +400,10 @@ impl ProvisioningRecordWriter {
             }
         }
         // A stale view leaves only the epoch of a record created now unknown,
-        // so it reads without creating: a present record is validated and
-        // adopted as on a fresh view, and an absent one is refused.
-        let (absent_policy, born_fenced, stale) = match self.born_fenced_epoch(now_ns) {
+        // and a lifetime bound refuses only the write that follows, so both
+        // read without creating: a present record is validated and adopted
+        // as on a fresh view, and an absent one is refused.
+        let (absent_policy, born_fenced, refused) = match self.born_fenced_epoch(now_ns) {
             Ok(epoch) => (AbsentPolicy::CreateFromConfig, epoch, None),
             Err(refusal) => (AbsentPolicy::CheckOnly, None, Some(refusal)),
         };
@@ -342,21 +419,10 @@ impl ProvisioningRecordWriter {
         .await
         {
             Ok(check) => {
-                if let Some(refusal) = stale
+                if let Some(refused) = refused
                     && !matches!(check, ProvisioningCheck::RecordPresent { .. })
                 {
-                    if let Some(family) = first_touch_family(signal) {
-                        crate::compat::record_publish_refusal(family, &refusal);
-                    }
-                    tracing::warn!(
-                        %refusal,
-                        tenant_hash = %tenant_hash.to_hex(),
-                        signal = signal.key_prefix(),
-                        "provisioning record creation refused: the sys/compat view is stale, \
-                         so the epoch a new record is born fenced at is unknown; retried on \
-                         the next request"
-                    );
-                    return Err(FirstTouchError::CompatViewStale { signal, refusal });
+                    return Err(self.refuse_creation(tenant_hash, signal, refused));
                 }
                 self.seen.lock().insert(key);
                 self.read_backoff.lock().clear(&key);
@@ -391,6 +457,62 @@ impl ProvisioningRecordWriter {
                      while it cannot read the record"
                 );
                 Ok(())
+            }
+        }
+    }
+
+    /// The error of a first touch that found no record and may not create
+    /// one: counted in `ravel_compat_publish_refused_total` under the
+    /// signal's data family, logged, and for a stale view, the refresh loop
+    /// woken.
+    fn refuse_creation(
+        &self,
+        tenant_hash: &TenantHash,
+        signal: Signal,
+        refused: CreateRefusal,
+    ) -> FirstTouchError {
+        match refused {
+            CreateRefusal::Stale(refusal) => {
+                if let Some(family) = first_touch_family(signal) {
+                    crate::compat::record_publish_refusal(family, &refusal);
+                }
+                if let Some(wake) = &self.compat_refresh_wake {
+                    wake.notify_one();
+                }
+                tracing::warn!(
+                    %refusal,
+                    tenant_hash = %tenant_hash.to_hex(),
+                    signal = signal.key_prefix(),
+                    "provisioning record creation refused: the sys/compat view is stale, \
+                     so the epoch a new record is born fenced at is unknown; retried on \
+                     the next request"
+                );
+                FirstTouchError::CompatViewStale { signal, refusal }
+            }
+            CreateRefusal::LifetimeAbove {
+                max_flush_lifetime_ns,
+                max_publish_lifetime_ns,
+            } => {
+                if let Some(family) = first_touch_family(signal) {
+                    crate::compat::record_publish_refusal_reason(
+                        family,
+                        crate::compat::CompatRefusalReason::PublishLifetimeAboveCompat,
+                    );
+                }
+                tracing::warn!(
+                    tenant_hash = %tenant_hash.to_hex(),
+                    signal = signal.key_prefix(),
+                    max_flush_lifetime_ns,
+                    max_publish_lifetime_ns,
+                    "provisioning record creation refused: sys/compat bounds publishes \
+                     below this process's ingest max_flush_lifetime, so the ingest router \
+                     refuses the write (ADR-4233 decision 7)"
+                );
+                FirstTouchError::PublishLifetimeAboveCompat {
+                    signal,
+                    max_flush_lifetime_ns,
+                    max_publish_lifetime_ns,
+                }
             }
         }
     }
@@ -1341,8 +1463,11 @@ mod tests {
         .expect("an activation the view does not read");
 
         let th = TenantId::new("stale-first-touch").hash();
-        let writer =
-            ProvisioningRecordWriter::new(store.clone(), 4).with_compat_view(Some(view.clone()));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let writer = ProvisioningRecordWriter::new(store.clone(), 4)
+            .with_compat_view(Some(view.clone()))
+            .with_compat_refresh_wake(Arc::clone(&wake));
+        let woken = || futures::FutureExt::now_or_never(wake.notified()).is_some();
         let stale_at = T0 + COMPAT_VIEW_HORIZON_NS;
         let before = spans_view_stale_refusals();
         for attempt in 0..2 {
@@ -1365,6 +1490,8 @@ mod tests {
                 ),
                 other => panic!("attempt {attempt}: expected CompatViewStale, got {other:?}"),
             }
+            assert!(woken(), "attempt {attempt}: the refusal wakes the refresh");
+            assert!(!woken(), "attempt {attempt}: one wake per refusal");
             assert!(
                 matches!(
                     crate::traces_ingest::SpanIngestRequestError::from(err),
@@ -1436,6 +1563,104 @@ mod tests {
             spans_record(faulted.as_ref(), &th).await,
             Err(StoreError::NotFound)
         ));
+    }
+
+    fn logs_lifetime_refusals() -> u64 {
+        crate::compat::publish_refusals_snapshot()
+            .into_iter()
+            .find(|(family, reason, _)| {
+                family.as_str() == ravel_catalog::compat::FAMILY_RLOG
+                    && *reason == crate::compat::CompatRefusalReason::PublishLifetimeAboveCompat
+            })
+            .map(|(_, _, count)| count)
+            .expect("the rlog publish_lifetime_above_compat series always renders")
+    }
+
+    /// #4362: on a store where `compat init` recorded a
+    /// `max_publish_lifetime_ns` below the ingest routers' lifetime, with a
+    /// fresh view, the router refuses the write at admission, so the first
+    /// touch that precedes it refuses first and creates no record: typed,
+    /// retryable (503 on the transports), counted under
+    /// `rlog`/`publish_lifetime_above_compat`, nothing cached. A record that
+    /// exists is adopted as usual, and a lifetime within the bound creates
+    /// the record. A first touch that ignores the bound PUTs a record for a
+    /// write the router then refuses.
+    #[tokio::test]
+    async fn first_touch_refuses_to_create_a_record_under_a_publish_bound_below_the_lifetime() {
+        use ravel_catalog::compat::CompatKeys;
+        const T0: i64 = 1_700_000_000_000_000_000;
+        let store = store();
+        let keys = CompatKeys::from_file_keys(&[[0x21; 32]]).expect("key");
+        ravel_catalog::compat::create_compat(
+            store.as_ref(),
+            &keys,
+            sysproto::CompatRecord {
+                compat_epoch: 1,
+                max_publish_lifetime_ns: 60_000_000_000,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("compat init");
+        let clock = Arc::new(SteppedCompatClock(std::sync::atomic::AtomicI64::new(T0)));
+        let view = CompatView::new(Arc::clone(&store), keys, clock);
+        view.refresh().await.expect("a fresh read");
+        let writer = ProvisioningRecordWriter::new(store.clone(), 4)
+            .with_compat_view(Some(view.clone()))
+            .with_max_flush_lifetime(std::time::Duration::from_secs(3600));
+
+        let th = TenantId::new("bounded-first-touch").hash();
+        let before = logs_lifetime_refusals();
+        let err = writer
+            .ensure(&th, Signal::Logs, T0)
+            .await
+            .expect_err("the bound is below the lifetime");
+        assert!(
+            matches!(
+                err,
+                FirstTouchError::PublishLifetimeAboveCompat {
+                    signal: Signal::Logs,
+                    max_flush_lifetime_ns: 3_600_000_000_000,
+                    max_publish_lifetime_ns: 60_000_000_000,
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(err.is_retryable());
+        assert!(matches!(
+            crate::logs_ingest::LogIngestRequestError::from(err),
+            crate::logs_ingest::LogIngestRequestError::CompatRefused(_)
+        ));
+        assert_eq!(logs_lifetime_refusals() - before, 1);
+        assert!(
+            matches!(
+                store
+                    .get(&provisioning_key(&th, Signal::Logs), GetRange::Full)
+                    .await,
+                Err(StoreError::NotFound)
+            ),
+            "a refused first touch writes no record"
+        );
+        assert!(!writer.seen.lock().contains(&(th, Signal::Logs)));
+        assert!(writer.read_backoff.lock().is_empty());
+
+        let existing = TenantId::new("bounded-existing").hash();
+        seed_record(store.as_ref(), &existing, Signal::Logs, 4).await;
+        writer
+            .ensure(&existing, Signal::Logs, T0)
+            .await
+            .expect("an existing record is adopted");
+        assert!(writer.seen.lock().contains(&(existing, Signal::Logs)));
+
+        let within = ProvisioningRecordWriter::new(store.clone(), 4)
+            .with_compat_view(Some(view))
+            .with_max_flush_lifetime(std::time::Duration::from_secs(60));
+        within
+            .ensure(&th, Signal::Logs, T0)
+            .await
+            .expect("a lifetime at the bound creates the record");
+        assert_eq!(stored_record(store.as_ref(), &th).await.compat_epoch, 1);
+        assert_eq!(logs_lifetime_refusals() - before, 1);
     }
 
     /// A view that read an activation and then went a horizon without a read

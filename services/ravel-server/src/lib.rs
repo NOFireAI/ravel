@@ -2692,10 +2692,16 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     if let Some(view) = &compat_view {
         compat::refresh_once(view).await;
     }
+    // Notified by every ingest admission, grant or attempt the view answers
+    // `view_stale`, and by a first touch refused for a stale view, so the
+    // refresh loop re-reads `sys/compat` within about a second instead of on
+    // its next tick.
+    let compat_refresh_wake = Arc::new(tokio::sync::Notify::new());
     let compat_refresh_task = compat_view.clone().map(|view| {
         AbortOnDrop(compat::spawn_refresh_loop(
             view,
             compat::DEFAULT_COMPAT_REFRESH_INTERVAL,
+            Arc::clone(&compat_refresh_wake),
         ))
     });
 
@@ -2741,10 +2747,10 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // which refuses to start a router whose `max_flush_lifetime` exceeds the
     // record's `max_publish_lifetime_ns` (decision 7).
     let ingest_compat_policy = compat_view.clone().map(|view| {
-        Arc::new(ravel_ingest::IngestCompatPolicy::new(
-            view,
-            compat_clock.clone(),
-        ))
+        Arc::new(
+            ravel_ingest::IngestCompatPolicy::new(view, compat_clock.clone())
+                .with_refresh_wake(Arc::clone(&compat_refresh_wake)),
+        )
     });
 
     let ingest_router = if config.mode.holds_ingest_buffer() {
@@ -2956,7 +2962,11 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     let provisioning_writer = if matches!(config.mode, Mode::All | Mode::Gateway) {
         Some(Arc::new(
             provisioning::ProvisioningRecordWriter::new(store.clone(), config.shard_count)
-                .with_compat_view(compat_view.clone()),
+                .with_compat_view(compat_view.clone())
+                .with_compat_refresh_wake(Arc::clone(&compat_refresh_wake))
+                // Every ingest router of this process keeps the default
+                // lifetime, the one their admission checks sys/compat with.
+                .with_max_flush_lifetime(IngestConfig::default().max_flush_lifetime),
         ))
     } else {
         None
