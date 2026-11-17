@@ -147,10 +147,11 @@ baseline to activate.
   with no time bound, so a credential without the grant does not stop
   writers on a store that was never activated. A refresh that fails any
   other way before the first success suspends the exemption until a later
-  refresh succeeds or is refused with `AccessDenied` again. The writers of
-  the alerts and audit signals carry no provisioning record, so for them
-  the exemption has no fence to end it: a role without the grant never
-  observes an activation. That is why activation refuses unless the
+  refresh succeeds or is refused with `AccessDenied` again. A role without
+  the grant never observes an activation: on a fenced bucket its writers
+  refuse as stale, but the audit and legal-hold writers carry no
+  provisioning record, so for them no fence ends the exemption and they
+  keep writing the baseline version. That is why activation refuses unless the
   operator attests that every writer role can read `sys/compat` (ADR-4233
   blind-view amendment).
 - **A build that cannot write the active version** refuses that family's
