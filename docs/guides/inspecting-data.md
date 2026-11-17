@@ -671,10 +671,14 @@ marker fails with the specific reason, not a generic error or a report that
 looks `valid`.
 
 The command decodes through the one decoder for this format, the function
-that the ingest path uses. Its verdict therefore always matches what a retried
-request experiences. A marker that this command reports as corrupt is one that
-the ingest path also treats as a miss (fail-open to at-least-once), never the
-reverse.
+that the ingest path uses. A marker whose version is above the one this build
+reads is the exception: the command fails on it with the unsupported-version
+reason, but the ingest path does not treat it as a miss. A newer build wrote
+it, so the request may already have landed, and a keyed request that finds it
+is refused with a retryable error (HTTP 503, gRPC `UNAVAILABLE`) and counted
+on `ravel_ingest_idempotency_newer_marker_refusals_total`. Any other marker
+that this command reports as corrupt is one that the ingest path treats as a
+miss (fail-open to at-least-once), never the reverse.
 
 ## `sql explain`
 

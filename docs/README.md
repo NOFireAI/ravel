@@ -170,6 +170,11 @@ protocol or byte layout, or when you are changing the code.
 
 - [catalog-and-mvcc.md](catalog-and-mvcc.md): the object key layout, the
   commit protocol, commit tokens, catalog folds and snapshot resolution.
+- [compatibility.md](compatibility.md): the retained-data compatibility
+  contract: every persisted format's read set and written version, the
+  regime each format family follows, which releases run beside each other,
+  the supported upgrade paths, rollback versus downgrade, the refusals and
+  exit codes of the `ravel-cli compat` commands, and the residuals.
 - [agents.md](agents.md): Ravel Agents storage: the key layout under
   `t/<tenant>/ag/`, the HEAD record, the publication rule, operation states,
   the typed errors, and the matrix of every promised behaviour with its

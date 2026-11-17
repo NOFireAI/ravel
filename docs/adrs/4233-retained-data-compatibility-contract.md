@@ -74,7 +74,7 @@ other than fail closed:
 | Id | Site | What happens |
 |---|---|---|
 | H1 | catalog fold, previous `.csnap`/`.npost`/`.cstat`/`.kidx` part | any decode error, a newer version included, rebuilds from commit records and CAS-replaces HEAD; the catalog sweep then deletes the newer peer's parts |
-| H3 | alert evaluator history fold | an RLOG object at an unreadable version is skipped and counted (`alerting.rs`, `AlertHistorySkipReason::UnsupportedVersion`), so the alert state is rebuilt without it |
+| H3 | alert evaluator history fold | an RLOG object at an unreadable version is skipped and counted (`alerting.rs`, `AlertHistorySkipReason::UnsupportedVersion`), so the alert state is rebuilt without it; only a newer version is the hazard (see the H3 amendment below) |
 | H5 | RLOG POSTINGS and KEY_IDX nested sections | a newer section version reads as `Corrupted`; the trailer probe the retention hold uses never sees it |
 | H6 | re-encode (compaction, migrate, erasure, force 2) | the readers skip a section kind they do not know, so a re-encode of such an input writes an output without that section (the drop is inferred from the skip rule in `crates/ravel-segment/src/format.rs` and the POSTINGS rules, not observed) |
 | H7 | audit retention | deletes by age with no version hold |
@@ -104,7 +104,7 @@ corruption in reports only).
 | rewrite record, erasure request, completion | `rw.`, `del/` | {1} | 1 | C, immutable | erasure rewrite, CLI |
 | retention tombstone | `retire.tmb` | {1} | 1 | C, immutable | retention |
 | catalog HEAD | `catalog/<sig>/HEAD` | {1,2} | by content | B | fold |
-| `.csnap` `.npost` `.cstat` `.kidx` | catalog parts | {1} {1} {3} {1,2} | 1 1 3 2 | B | fold |
+| `.csnap` `.npost` `.cstat` `.kidx` | catalog parts | {1} {1} {3} {1,2} (`.kidx` corrected to {1,2,3} by the kidx read-set amendment below) | 1 1 3 2 | B | fold |
 | provisioning | `t/<h>/<sig>/prov` | {1,2,3} | 3 | C, CAS-mutable | ingest first touch, reshard, migrate floor raise |
 | tenant config | `t/<h>/config` | {1..4} | 2 (3, 4 behind `ReadersRolledOut`) | C, CAS-mutable | CLI, operator |
 | metric metadata, key epoch, `sys/auth`, `sys/gc` | various | small closed sets | newest | C | ingest, CLI, maintain |
@@ -127,7 +127,7 @@ the contract (decision 9, the inventory-completeness row).
 ### 1. The contract starts at a baseline release
 
 The **baseline release** is the first release that ships decisions 2 to 5
-(expected v0.34.0). The contract covers stores and processes from the
+(expected v0.34.0; see the baseline-release amendment below). The contract covers stores and processes from the
 baseline onward. It replaces ADR-0531 decisions 1 and 2: the window policy
 starts at the baseline, not at v1.0.
 
@@ -177,7 +177,8 @@ Replaces ADR-0066 decision 1's "writers always emit N".
 - Every writer takes its emitted version from a `WritePolicy` resolved from
   `sys/compat` (decision 3), never from a constant. Before activation the
   policy names N, so a newly installed binary writes what the deployed
-  readers read. This covers every producer: the three ingest flushes,
+  readers read. For a family whose version follows content, the active
+  version is a ceiling (see the ceiling amendment below). This covers every producer: the three ingest flushes,
   compaction, `migrate`, the force-2 re-encode, the erasure rewrite, the
   audit writer, the alert evaluator, the legal-hold writer, and the catalog
   fold's part and HEAD writers.
@@ -222,7 +223,11 @@ message AdoptedVersion { string family = 1; uint32 version = 2; uint64 count = 3
 - **Activation.** `ravel-cli compat activate --family F --version N+1` CASes
   `active_write_version` up and the store-wide `compat_epoch` up. It refuses unless `sys/compat`
   exists, the CLI's own build reads and writes N+1, and N+1 is exactly one
-  above the current active version. It never lowers a version.
+  above the current active version. It never lowers a version. It also
+  refuses without the operator's attestation that every writer role can
+  read `sys/compat`, and for a content-versioned family the activated
+  version is a ceiling, not the version every writer emits (see the
+  blind-view amendment and the ceiling amendment below).
 - **One store-wide epoch.** `CompatRecord` carries `uint64 compat_epoch`,
   raised by every activation of any family; each family records the epoch
   at which it was activated. Every comparison below uses this one counter.
@@ -248,7 +253,9 @@ message AdoptedVersion { string family = 1; uint32 version = 2; uint64 count = 3
   in-contract writer can land a pre-activation version is
   `activated + H + P + T_req`, which decision 7 waits out. A process paused
   between its last check and a PUT is not bounded by any timer; that
-  residual is detected, not prevented (decision 7).
+  residual is detected, not prevented (decision 7). A view that has never
+  read the record because its role lacks the grant is exempt from the
+  horizon on an unfenced bucket (see the blind-view amendment below).
 - **Monotone views.** Activation only raises versions, so a view can only be
   behind, never ahead. A process never lowers a version it has seen in this
   run. A process that finds `sys/compat` absent while a bucket's
@@ -296,7 +303,7 @@ fail closed, and wave 0 measures them against the released binary.
 | Id | Baseline behaviour |
 |---|---|
 | H1 | the fold classifies a previous part or HEAD whose version is above its read set as newer (a new typed classification; today only the HEAD has one), fails its cycle, writes nothing, and never rebuilds over it |
-| H3 | the alert evaluator refuses its tick on an unreadable-version history object (counted), keeping the previous state and writing no transition |
+| H3 | the alert evaluator refuses its tick on an unreadable-version history object (counted), keeping the previous state and writing no transition (narrowed by the H3 amendment below to a version newer than the read set) |
 | H5 | POSTINGS and KEY_IDX return a typed `UnsupportedSectionVersion`; the retention probe and `certify` treat it like a trailer version outside the window |
 | H6 | every re-encode (compaction, migrate, erasure, force 2) refuses an input carrying a section kind it does not know and holds the bucket, instead of dropping the section |
 | H7 | audit retention applies the retention version hold |
@@ -590,7 +597,8 @@ For a class A family:
   a test that the token and identity encodings of the fixture corpus
   (decision 9) resolve unchanged.
 - Catalog parts and HEAD (class B) go through activation like bulk families:
-  the fold emits the active version, and from the baseline on it refuses its
+  the fold emits the active version (a ceiling: see the ceiling amendment
+  below), and from the baseline on it refuses its
   cycle on a newer previous part instead of rebuilding over it (H1).
 - Immutable class C records (commit, compaction, rewrite, tombstone) are
   activation families too: the force-2 compaction record version 2, today
@@ -921,3 +929,139 @@ The replacement kill criterion: if a pre-baseline process that outlives
 the rollout writes into a fenced bucket on any path outside the classes
 above, or any fence-scope row of the drill fails, this decision is reopened
 again.
+
+## Amendment (2026-11-17): H3 refuses only a version newer than the read set (issue #4250)
+
+<!-- amendment-applies: sections="Where a newer version is taken for corruption or absence|4. Fencing: what stops a process that cannot read an activated version" pointer="H3 amendment" -->
+<!-- amendment-supersedes: phrase="on an unreadable-version history object" pointer="H3 amendment" -->
+
+Decision 4's H3 row said the alert evaluator refuses its tick on an
+"unreadable-version" history object. The hazard is a version newer than the
+evaluator reads: rebuilding alert state without an object a newer build
+wrote. An object older than the reader window is the ADR-2708 decision D6
+case, left over from before a format bump, and skipping it is that
+decision's intended behaviour. The shipped evaluator splits the two by
+which side of the RLOG reader window the version falls on, for an object
+whose bytes match its commit record's content hash:
+
+- **Newer than the read set:** the tick is refused, counted in
+  `ravel_alert_history_newer_version_refusals_total`, the previous durable
+  state is kept and no transition is written.
+- **Older than the read set:** the object is skipped and counted in
+  `ravel_alert_history_records_skipped_total`, as before the baseline.
+
+An object whose bytes do not match the content hash is corrupt and aborts
+the read without moving either counter. The Context row for H3 describes
+the pre-baseline behaviour, which treated both sides alike.
+
+## Amendment (2026-11-17): the active version is a ceiling for content-versioned families (issue #4250)
+
+<!-- amendment-applies: sections="2. A release ships reader and writer for two versions, and emits the older until activated|3. Activation is a durable, monotone record, not a binary install|8. Commit tokens, identities and metadata families" pointer="ceiling amendment" -->
+<!-- amendment-supersedes: phrase="the fold emits the active version" pointer="ceiling amendment" -->
+
+Decisions 2, 3 and 8 say writers emit the activated version. For a family
+whose emitted version follows the object's content, that would force every
+writer to the highest version even when the content does not need it. Two
+families on `main` are such families: `catalog-head`, which a fold writes at
+2 only when a part ref carries a retired hour (the H2 rule), and
+`compaction-record`, which compaction and `migrate` write at 2 only for a
+`--reencode-compaction-parts` run. For those families, and for every
+catalog family the fold writes, the active version is a ceiling:
+
+- A writer refuses when the active version is not one its build can write
+  (`ActiveVersionNotWritable`).
+- Otherwise it emits the version its content needs, at or below the active
+  one.
+
+The fold checks every catalog family (`catalog-head`, `csnap`, `npost`,
+`cstat`, `kidx`) once per cycle, before it reads anything, against the
+highest version a fold of that signal can emit, and refuses the whole
+cycle, writing nothing, when that version is above the active one or the
+active version is outside its read set. On `main` the fold writes `.kidx`
+leaves at 2 for every signal, so the `kidx` ceiling is the same for every
+signal. Compaction and `migrate` check `compaction-record` as a ceiling: a
+plain compaction writes version 1 records whatever the active version, a
+ceiling owes the bucket no fence, and a run that would write version 2 is
+refused unless `compaction-record` is active at 2. Families with one write
+version (`rseg`, `rlog`, `rspan`, `commit-record`, `rewrite-record`,
+`retention-tombstone`) emit the active version as decision 2 says.
+
+## Amendment (2026-11-17): the blind-view exemption and the writer-role attestation (issue #4250)
+
+<!-- amendment-applies: sections="3. Activation is a durable, monotone record, not a binary install" pointer="blind-view amendment" -->
+
+Decision 3 refuses every publish once a process's last successful read of
+`sys/compat` is older than `H`, or when there has been none. Applied to a
+role that was never granted the read, that rule would stop every writer of
+a store that was never activated. The shipped view therefore exempts a
+blind view. A view is blind while no read of `sys/compat` has succeeded, no
+GET of it has returned an object, and the refresh that finished last, if
+any, failed with `AccessDenied`. A blind view writing to a bucket whose
+provisioning record carries no `compat_epoch` answers the baseline version
+with no time bound. A refresh that fails any other way (a 5xx, a timeout,
+throttling) before the first success suspends the exemption until a later
+refresh succeeds or fails with `AccessDenied` again, and a read that returned
+an object ends it for the rest of the run.
+
+The residual: a role without the grant can never observe an activation. On
+a fenced bucket (one whose provisioning record carries a `compat_epoch`)
+its writers refuse as stale. On a write path with no provisioning record
+(the audit and legal-hold writers) no fence ever ends the exemption, so
+such a writer keeps writing the baseline version after an activation, and
+only the certify census or the late-write pass finds what it wrote. A blind
+gateway's first write to a bucket that has no provisioning record yet, made
+after the activation's fence walk, passes `check_fresh` (the bucket carries
+no `compat_epoch`), and `born_fenced_epoch` returns no epoch for a view
+whose `seen_epoch` is 0 (`services/ravel-server/src/provisioning.rs`,
+around lines 324-342), so the gateway creates an unfenced provisioning
+record and keeps writing the baseline version to that bucket until
+`compat certify`'s census fences buckets provisioned after the walk
+(`fence_bucket`, `crates/ravel-maintain/src/compat_certify.rs` around line
+981); from then on its writes there refuse as stale. A blind alert
+evaluator's `rlog_policy` calls `write_policy` with no bucket
+(`services/ravel-server/src/alerting.rs`, around lines 1265-1295), so it
+answers the baseline, unparked, at epoch 0. On a tenant whose lease the
+walk parked, the evaluator refreshes, still sees epoch 0, and does not act
+on the lease that tick, every tick. On a tenant with no lease it creates an
+unparked lease at epoch 0 and writes alert history at the baseline
+version, which only the certify census or the late-write pass finds.
+
+The exemption, this residual and the attestation requirement change decision 3 by owner decision (delegated), ruled on 2026-11-17 by the approver the owner delegated ADR-4233 and its amendments to; the behaviour shipped earlier under issue #4287, and this amendment is its decision record.
+
+That is why `compat activate` requires the operator to attest that every
+writer role's credentials can read `sys/compat`, and refuses
+(`WriterRolesCannotReadCompat`) without the attestation. `ravel-cli compat
+activate` takes it from `--pre-baseline-processes-terminated`, the flag
+that also attests the termination prerequisite; it has no separate flag
+for it. The shipped roles in `deploy/iam` grant `s3:GetObject` on
+`sys/compat` to the gateway, query and maintain roles.
+
+## Amendment (2026-11-17): the kidx read set is {1,2,3} (issue #4250)
+
+<!-- amendment-applies: sections="Persisted-format inventory" pointer="kidx read-set amendment" -->
+<!-- amendment-supersedes: phrase="{1} {1} {3} {1,2}" pointer="kidx read-set amendment" -->
+
+The inventory gave the `.kidx` leaf read set as {1,2}. The build reads
+{1,2,3} (`KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN`): version 3 is the metrics
+posting leaf of ADR-4146, which carries a header entry kind. Whether a
+parsed leaf may answer for its signal is narrower: version 2 for every
+signal, version 1 for every signal except logs, and version 3 for metrics
+only (`key_index_leaf_version_accepted`). The fold writes version 2 for
+every signal. The baseline version `compat init` records for `kidx` is 2.
+
+## Amendment (2026-11-17): the baseline release is the release that ships the compat commands (issue #4250)
+
+<!-- amendment-applies: sections="1. The contract starts at a baseline release" pointer="baseline-release amendment" -->
+<!-- amendment-supersedes: phrase="expected v0.34.0" pointer="baseline-release amendment" -->
+
+Decision 1 named the baseline release as "expected v0.34.0". The baseline
+is the first release that ships decisions 2 to 5 together with the
+`ravel-cli compat` commands that create and activate `sys/compat`; without
+the commands no store can be adopted or activated. As of this amendment no
+release is the baseline: v0.33.0 (2026-11-13) is the newest release, and
+the commands, `ravel-cli compat init`, `activate`, `certify`, `verify` and
+`status`, wrap the `ravel-maintain` entry points (`init_compat`,
+`activate`, `certify` and the late-write pass) and ship in no release yet.
+The baseline release a store records is whatever `compat init` is told
+(`InitConfig::baseline_release_major` and `baseline_release_minor`), so the
+release that ships the commands is the one on record, whatever its number.
