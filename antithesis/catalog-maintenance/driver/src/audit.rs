@@ -150,9 +150,9 @@ pub fn parse_inspect(text: &str) -> Inspected {
 
 /// The part key from `catalog inspect`'s
 /// `Error: failed to fetch part <key>: object not found` (anyhow's report of a
-/// `StoreError::NotFound`): HEAD names a part the store does not hold. `None`
-/// for any other cause (a transient or skew error, a timeout); the audit
-/// then has no verdict for that pass.
+/// `StoreError::NotFound`), and `None` for any other cause, as for
+/// [`unfetched_object`]: only a not-found means HEAD names a part the store
+/// does not hold.
 pub fn unfetched_part(stderr: &str) -> Option<String> {
     stderr.lines().find_map(|line| {
         let (key, cause) = line
@@ -262,6 +262,41 @@ pub fn swept_inputs(
         );
     }
     gone
+}
+
+/// What the sweep check has learned across audits: every key a LIST held,
+/// and the swept inputs a GET confirmed gone. Keys are never reused, so a
+/// confirmed key stays gone and counts once.
+#[derive(Debug, Default)]
+pub struct SweepLedger {
+    seen: BTreeSet<String>,
+    confirmed: BTreeSet<String>,
+}
+
+impl SweepLedger {
+    /// Record the keys of one LIST.
+    pub fn observe(&mut self, keys: impl IntoIterator<Item = String>) {
+        self.seen.extend(keys);
+    }
+
+    /// The [`swept_inputs`] of `inputs` against `listed` that no earlier
+    /// pass confirmed.
+    pub fn unconfirmed(&self, inputs: &[InputKeys], listed: &BTreeSet<String>) -> Vec<String> {
+        swept_inputs(inputs, &self.seen, listed)
+            .into_iter()
+            .filter(|k| !self.confirmed.contains(k))
+            .collect()
+    }
+
+    /// Record a key a GET found absent; `false` when it was already counted.
+    pub fn confirm(&mut self, key: &str) -> bool {
+        self.confirmed.insert(key.to_string())
+    }
+
+    /// How many distinct swept inputs were confirmed.
+    pub fn confirmed(&self) -> usize {
+        self.confirmed.len()
+    }
 }
 
 /// The keys HEAD names that the listing does not hold.
@@ -624,6 +659,26 @@ parts: 1
         );
         // A key never listed before is no evidence of a delete.
         assert!(swept_inputs(&inputs, &BTreeSet::new(), &listed).is_empty());
+    }
+
+    #[test]
+    fn two_audits_after_one_deletion_count_it_once() {
+        let inputs = compaction_inputs("t/0a0b/", RECORD_KEY, DECODED).expect("inputs");
+        let commit7 = inputs[0].commit.clone();
+        let commit8 = inputs[1].commit.clone();
+        let mut ledger = SweepLedger::default();
+        ledger.observe([commit7.clone(), commit8.clone()]);
+        // commit7 is deleted; two later audits list the same bucket.
+        let listed: BTreeSet<String> = [commit8].into_iter().collect();
+        for _ in 0..2 {
+            for key in ledger.unconfirmed(&inputs, &listed) {
+                ledger.confirm(&key);
+            }
+            ledger.observe(listed.iter().cloned());
+        }
+        assert_eq!(ledger.confirmed(), 1);
+        assert!(ledger.unconfirmed(&inputs, &listed).is_empty());
+        assert!(!ledger.confirm(&commit7));
     }
 
     #[test]

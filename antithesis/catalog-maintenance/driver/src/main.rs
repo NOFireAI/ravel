@@ -21,7 +21,7 @@ mod seed;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -203,14 +203,13 @@ struct Shared {
     sweep_jump_started: AtomicBool,
     /// The horizon and window jumps, once both reached the driver.
     sweep_jump: Mutex<Option<(Jump, Jump)>>,
-    /// Every key an audit or the sweep jump has listed. Keys are never
-    /// reused, so one listed here and absent from a later LIST was deleted.
-    seen: Mutex<BTreeSet<String>>,
+    /// Every key an audit or the sweep jump has listed, and the swept
+    /// inputs confirmed gone. Keys are never reused, so one listed here and
+    /// absent from a later LIST was deleted.
+    sweeps: Mutex<audit::SweepLedger>,
     /// The inputs of each compaction record decoded so far; records are
     /// immutable, so each is decoded once.
     inputs_of: Mutex<BTreeMap<String, Vec<InputKeys>>>,
-    /// Swept compaction inputs the audits confirmed gone.
-    swept: AtomicUsize,
     /// Every rule holds a read guard while it acts; the clock jump and the
     /// eventually take the write guard.
     gate: RwLock<()>,
@@ -572,7 +571,7 @@ impl Shared {
         // A deleted input counts only if a LIST held it before the delete.
         match self.tenant_prefix() {
             Some(prefix) => match self.store.list(&prefix) {
-                Ok(keys) => lock(&self.seen).extend(keys),
+                Ok(keys) => lock(&self.sweeps).observe(keys),
                 Err(e) => println!("sweep jump: the listing before the jump failed: {e}"),
             },
             None => println!("sweep jump: no HEAD key known, so nothing listed before the jump"),
@@ -686,7 +685,8 @@ impl Shared {
 
     /// The sweep property, over one LIST of the tenant prefix: an input of a
     /// listed compaction record that an earlier LIST held is gone, and a GET
-    /// of it finds nothing. Then the LIST joins `seen`.
+    /// of it finds nothing. Each such key counts once across audits. Then
+    /// the LIST joins the keys seen.
     fn check_swept(&self, prefix: &str, listed: &BTreeSet<String>) {
         let records = audit::compaction_records(prefix, listed);
         let todo: Vec<String> = {
@@ -717,12 +717,13 @@ impl Shared {
         let mut decoded = 0;
         {
             let known = lock(&self.inputs_of);
-            let seen = lock(&self.seen);
+            let sweeps = lock(&self.sweeps);
             for record in &records {
                 if let Some(inputs) = known.get(record) {
                     decoded += 1;
                     gone.extend(
-                        audit::swept_inputs(inputs, &seen, listed)
+                        sweeps
+                            .unconfirmed(inputs, listed)
                             .into_iter()
                             .map(|key| (record.clone(), key)),
                     );
@@ -733,11 +734,11 @@ impl Shared {
         let confirmed: Vec<String> = gone
             .iter()
             .filter(|(_, key)| matches!(self.store.get(key), Ok(None)))
+            .filter(|(_, key)| lock(&self.sweeps).confirm(key))
             .take(5)
             .map(|(record, key)| format!("{key} (input of {record})"))
             .collect();
-        self.swept.fetch_add(confirmed.len(), Ordering::SeqCst);
-        lock(&self.seen).extend(listed.iter().cloned());
+        lock(&self.sweeps).observe(listed.iter().cloned());
         if decoded > 0 {
             assert_sometimes!(
                 !confirmed.is_empty(),
@@ -777,16 +778,25 @@ impl Shared {
         out.ok()
     }
 
+    /// The audit, then the sweep check over its LIST.
+    fn audit(&self, choose: &dyn Fn(usize) -> usize) {
+        if let Some((prefix, listed)) = self.audit_head(choose) {
+            self.check_swept(&prefix, &listed);
+        }
+    }
+
     /// Inspect, list, inspect again: the audit judges only a HEAD that did
     /// not change while the bucket was listed. `choose(n)` picks which of
-    /// `n` listed commit records to decode.
-    fn audit(&self, choose: &dyn Fn(usize) -> usize) {
+    /// `n` listed commit records to decode. Returns the tenant prefix and
+    /// the LIST for [`Shared::check_swept`], which runs after the second
+    /// inspect so that it does not widen the window HEAD must hold still in.
+    fn audit_head(&self, choose: &dyn Fn(usize) -> usize) -> Option<(String, BTreeSet<String>)> {
         let Some(before) = self.inspect_json() else {
-            return;
+            return None;
         };
         if before.created_unix_ns.is_none() {
             println!("audit: no HEAD yet");
-            return;
+            return None;
         }
         let text = self
             .cli
@@ -799,11 +809,11 @@ impl Shared {
         };
         if !text.ok() && unfetched.is_none() {
             println!("audit: catalog inspect: {}", text.summary());
-            return;
+            return None;
         }
         let Some(prefix) = audit::tenant_prefix(&before.head_key) else {
             println!("audit: unexpected HEAD key {}", before.head_key);
-            return;
+            return None;
         };
         let footprint = self.cli.run(
             &[
@@ -841,18 +851,17 @@ impl Shared {
             Ok(keys) => keys.into_iter().collect(),
             Err(e) => {
                 println!("audit: no verdict, the listing failed: {e}");
-                return;
+                return None;
             }
         };
-        self.check_swept(&prefix, &listed);
         let Some(after) = self.inspect_json() else {
-            return;
+            return Some((prefix, listed));
         };
         if after.created_unix_ns != before.created_unix_ns
             || inspected.created_unix_ns != before.created_unix_ns
         {
             println!("audit: HEAD moved while listing; skipped");
-            return;
+            return Some((prefix, listed));
         }
         // A text parse that found nothing, or other parts than the JSON
         // form lists, would check nothing and pass.
@@ -933,6 +942,7 @@ impl Shared {
                 &json!({ "commit_records": l0.len() })
             );
         }
+        Some((prefix, listed))
     }
 
     /// A no-token scan of `node` after faults stopped, re-read for up to two
@@ -1082,10 +1092,17 @@ impl Workload {
     #[rule(groups = ["main"], weight = 2)]
     fn audit(&self, tc: TestCase) {
         let s = &self.0;
-        let Some(_g) = s.enter() else {
-            return;
+        let listing = {
+            let Some(_g) = s.enter() else {
+                return;
+            };
+            s.audit_head(&|n| draw_node(&tc, n))
         };
-        s.audit(&|n| draw_node(&tc, n));
+        // The sweep check reads only the shared ledger and the store, so it
+        // runs without the gate and does not hold off a clock jump.
+        if let Some((prefix, listed)) = listing {
+            s.check_swept(&prefix, &listed);
+        }
     }
 
     #[rule(groups = ["main"], weight = 2)]
@@ -1243,7 +1260,7 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
                 "reached_driver": j.reached_driver,
             })),
             "sweep_jump_after_ns": sweep_jump.map(|(_, w)| w.after_ns),
-            "sweep_deleted_inputs": s.swept.load(Ordering::SeqCst),
+            "sweep_deleted_inputs": lock(&s.sweeps).confirmed(),
             "rows_per_node": rows,
             "acked_live_writes": acked.len(),
             "seeded_missing": first(&seeded_missing),
@@ -1451,9 +1468,8 @@ fn main(tc: TestCase) {
         jump: Mutex::new(None),
         sweep_jump_started: AtomicBool::new(false),
         sweep_jump: Mutex::new(None),
-        seen: Mutex::new(BTreeSet::new()),
+        sweeps: Mutex::new(audit::SweepLedger::default()),
         inputs_of: Mutex::new(BTreeMap::new()),
-        swept: AtomicUsize::new(0),
         gate: RwLock::new(()),
         stopping: AtomicBool::new(false),
         eventually_lock: Mutex::new(()),
