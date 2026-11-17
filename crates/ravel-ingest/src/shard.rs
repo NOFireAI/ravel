@@ -550,14 +550,15 @@ struct FlushCtx {
 struct AbandonedCommit {
     tenant_hash: TenantHash,
     commit_key: String,
-    /// The open time the flush's deadline was derived from: the deadline less
-    /// `max_flush_lifetime`.
-    opened_ns: i64,
-    /// `opened_ns + max_flush_lifetime + clock_skew_allowance +
-    /// fold_safety_margin`, the fold's seal margin (ravel-catalog
-    /// `sealed_watermark_hour`) measured from the open: a record the store
-    /// stamps later than this landed where a fold may already have sealed.
-    late_after_ns: i64,
+    ingest_hour_bucket: u32,
+    /// [`FoldSealMargin::sealed_at_ns`] of the record's hour, under
+    /// [`IngestConfig::fold_seal`]. A fold re-reads a sealed hour's buckets
+    /// only for a compaction record, tombstone or rewrite record (ravel-catalog
+    /// fold.rs `reconcile_one_bucket`, the seal lemma), so a commit record the
+    /// store stamps at or after this instant may never be folded: lost.
+    ///
+    /// [`FoldSealMargin::sealed_at_ns`]: crate::config::FoldSealMargin::sealed_at_ns
+    sealed_at_ns: i64,
 }
 
 /// The most abandoned commit keys a shard keeps for re-reading; the oldest is
@@ -877,8 +878,7 @@ impl FlushCtx {
                 // The HEAD runs in the condition, so the default build never
                 // issues it and records nothing.
                 ravel_invariant::inv_sometimes!(
-                    self.note_abandoned_commit(tenant_hash, &record, deadline_ns)
-                        .await,
+                    self.note_abandoned_commit(tenant_hash, &record).await,
                     "commit: an abandoned flush's commit record is absent at the abandon",
                     std::collections::BTreeMap::from([
                         ("tenant", tenant_hash.to_hex()),
@@ -899,12 +899,7 @@ impl FlushCtx {
     /// not a violation; a HEAD error is no evidence either way. Only an
     /// invariant condition calls this.
     #[allow(dead_code)]
-    async fn note_abandoned_commit(
-        &self,
-        tenant_hash: TenantHash,
-        record: &CommitRecord,
-        deadline_ns: i64,
-    ) -> bool {
+    async fn note_abandoned_commit(&self, tenant_hash: TenantHash, record: &CommitRecord) -> bool {
         let Ok(commit_key) = keys::commit_key_for_record(record) else {
             return false;
         };
@@ -912,12 +907,8 @@ impl FlushCtx {
             Err(ravel_object_store::StoreError::NotFound) => {}
             Ok(_) | Err(_) => return false,
         }
-        let lifetime_ns = duration_nanos_saturating(self.config.max_flush_lifetime);
-        let opened_ns = deadline_ns.saturating_sub(lifetime_ns);
-        let late_after_ns = opened_ns
-            .saturating_add(lifetime_ns)
-            .saturating_add(ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS)
-            .saturating_add(ravel_catalog::DEFAULT_FOLD_SAFETY_MARGIN_NS);
+        let ingest_hour_bucket = record.ingest_hour_bucket;
+        let sealed_at_ns = self.config.fold_seal.sealed_at_ns(ingest_hour_bucket);
         let mut abandoned = self
             .abandoned_commits
             .lock()
@@ -928,21 +919,23 @@ impl FlushCtx {
         abandoned.push_back(AbandonedCommit {
             tenant_hash,
             commit_key,
-            opened_ns,
-            late_after_ns,
+            ingest_hour_bucket,
+            sealed_at_ns,
         });
         true
     }
 
     /// NoPublishAfterAbandon (formal/tla/commit), judged from store evidence:
     /// an abandoned flush's commit record may still land (a PUT the flush
-    /// stopped waiting for), but never with a store `last_modified` past
-    /// [`AbandonedCommit::late_after_ns`]. Re-reads at most
+    /// stopped waiting for), but never with a store `last_modified` at or
+    /// past [`AbandonedCommit::sealed_at_ns`]. Re-reads at most
     /// [`MAX_ABANDONED_RECHECKS_PER_FLUSH`] keys, oldest first. A record found
     /// is evaluated once and forgotten; an absent one is evaluated and kept
     /// until the clock passes its bound by another `max_flush_lifetime`; a
-    /// HEAD error evaluates nothing and keeps the key. Only the instrumented
-    /// build remembers abandoned keys, so the default build finds none here.
+    /// HEAD error, or a HEAD still running after
+    /// [`publish::EVIDENCE_HEAD_TIMEOUT`], evaluates nothing and keeps the
+    /// key. Only the instrumented build remembers abandoned keys, so the
+    /// default build finds none here.
     async fn recheck_abandoned_commits(&self) {
         let due: Vec<AbandonedCommit> = {
             let mut abandoned = self
@@ -958,7 +951,14 @@ impl FlushCtx {
         let lifetime_ns = duration_nanos_saturating(self.config.max_flush_lifetime);
         let mut kept = Vec::with_capacity(due.len());
         for abandoned in due {
-            let landed_ms = match self.store.head(&abandoned.commit_key).await {
+            let head = tokio::select! {
+                head = self.store.head(&abandoned.commit_key) => head,
+                () = self.clock.sleep(publish::EVIDENCE_HEAD_TIMEOUT) => {
+                    kept.push(abandoned);
+                    continue;
+                }
+            };
+            let landed_ms = match head {
                 Ok(meta) => Some(meta.last_modified_unix_ms),
                 Err(ravel_object_store::StoreError::NotFound) => None,
                 Err(_) => {
@@ -968,13 +968,16 @@ impl FlushCtx {
             };
             let checked_ns = self.clock.now_ns();
             ravel_invariant::inv_always_or_unreachable!(
-                landed_ms.is_none_or(|ms| ms.saturating_mul(1_000_000) <= abandoned.late_after_ns),
+                landed_ms.is_none_or(|ms| ms.saturating_mul(1_000_000) < abandoned.sealed_at_ns),
                 "commit: an abandoned flush's commit record never lands past the fold's seal margin",
                 std::collections::BTreeMap::from([
                     ("tenant", abandoned.tenant_hash.to_hex()),
                     ("commit_key", abandoned.commit_key.clone()),
-                    ("opened_ns", abandoned.opened_ns.to_string()),
-                    ("late_after_ns", abandoned.late_after_ns.to_string()),
+                    (
+                        "ingest_hour_bucket",
+                        abandoned.ingest_hour_bucket.to_string()
+                    ),
+                    ("sealed_at_ns", abandoned.sealed_at_ns.to_string()),
                     (
                         "last_modified_unix_ms",
                         landed_ms.map_or_else(|| "absent".to_owned(), |ms| ms.to_string()),
@@ -983,7 +986,7 @@ impl FlushCtx {
                 ])
             );
             if landed_ms.is_none()
-                && checked_ns <= abandoned.late_after_ns.saturating_add(lifetime_ns)
+                && checked_ns <= abandoned.sealed_at_ns.saturating_add(lifetime_ns)
             {
                 kept.push(abandoned);
             }
@@ -1283,8 +1286,12 @@ impl FlushCtx {
             match outcome {
                 Some(Ok(token)) => {
                     // After the race and the RTT sample, so the instrumented
-                    // build's evidence read cannot abandon a landed commit.
-                    publish::assert_commit_has_data(self.store.as_ref(), record).await;
+                    // build's evidence read cannot abandon a landed commit,
+                    // and bounded so it cannot hold the ack either.
+                    publish::assert_commit_has_data_unless(self.store.as_ref(), record, || {
+                        self.clock.sleep(publish::EVIDENCE_HEAD_TIMEOUT)
+                    })
+                    .await;
                     return Ok(token);
                 }
                 Some(Err(PublishError::SplitBrain { this, stored })) => {
@@ -7929,6 +7936,27 @@ mod tests {
         "commit: an abandoned flush's commit record is absent at the abandon";
     const NO_COMMIT_WITHOUT_DATA: &str =
         "commit: a commit record never exists without its data object";
+    const EVIDENCE_COMPLETES: &str =
+        "commit: a commit's data-object evidence read completes before it gives up";
+
+    const NS_PER_MINUTE: i64 = 60 * 1_000_000_000;
+
+    /// A fold whose margins differ from each other, from the catalog
+    /// defaults, and from the flush lifetime the routers below run with, so
+    /// a bound built from any other source reads a different instant.
+    const TEST_FOLD_SEAL: crate::config::FoldSealMargin = crate::config::FoldSealMargin {
+        max_flush_lifetime_ns: 7 * NS_PER_MINUTE,
+        clock_skew_allowance_ns: 3 * NS_PER_MINUTE,
+        fold_safety_margin_ns: 11 * NS_PER_MINUTE,
+    };
+
+    /// One minute into the hour that ends at `BOUNDARY_NS`.
+    const EARLY_NS: i64 = BOUNDARY_NS - NS_PER_HOUR + NS_PER_MINUTE;
+
+    /// The instant a fold under `TEST_FOLD_SEAL` seals the hour holding
+    /// `EARLY_NS`: that hour's end plus 7 + 3 + 11 minutes, restated here
+    /// rather than read from the code under test.
+    const EARLY_HOUR_SEALED_AT_NS: i64 = BOUNDARY_NS + 21 * NS_PER_MINUTE;
 
     /// Drives the injected clock in backoff-sized steps until `write` ends.
     async fn retry_until_finished<T>(clock: &TestClock, write: &tokio::task::JoinHandle<T>) {
@@ -7960,7 +7988,7 @@ mod tests {
     }
 
     /// A one-shard router over `store` whose flushes retry a failed PUT
-    /// `retries` times before abandoning.
+    /// `retries` times before abandoning, under `TEST_FOLD_SEAL`.
     fn attempt_bounded_router(
         store: &Arc<dyn ObjectStoreBackend>,
         clock: &Arc<TestClock>,
@@ -7971,6 +7999,7 @@ mod tests {
             IngestRouter::with_rng(
                 IngestConfig {
                     put_retry_max_attempts: retries,
+                    fold_seal: TEST_FOLD_SEAL,
                     ..one_permit_one_queue(lifetime)
                 },
                 Arc::clone(store),
@@ -8230,8 +8259,9 @@ mod tests {
 
     /// One flush of `tenant` whose commit PUT is reported timed out while the
     /// PUT itself is held, so the flush abandons on its attempt budget well
-    /// inside its lifetime. Returns the router, the fault store, the clock,
-    /// and the held PUT's gate and commit key.
+    /// inside its lifetime. The flush is granted at `EARLY_NS`, early in its
+    /// ingest hour. Returns the router, the fault store, the clock, and the
+    /// held PUT's gate and commit key.
     async fn abandon_on_a_reported_failure(
         tenant: &TenantId,
         next: &TenantId,
@@ -8251,7 +8281,7 @@ mod tests {
         ));
         provision(store.as_ref(), tenant).await;
         provision(store.as_ref(), next).await;
-        let clock = TestClock::new(BASE_NS);
+        let clock = TestClock::new(EARLY_NS);
         let router = attempt_bounded_router(&store, &clock, Duration::from_secs(60), 0);
 
         let write = spawn_write(&router, tenant, "h0", WriteMode::Strict);
@@ -8324,45 +8354,35 @@ mod tests {
 
     /// A commit PUT reported failed that still lands after the abandon. The
     /// abandoning flush's own re-read finds the record absent; once the PUT
-    /// lands with store `last_modified` at `landed_ms(late_after_ns)`, the
-    /// next flush's re-read evaluates NoPublishAfterAbandon on it. Returns
-    /// that evaluation.
-    async fn abandoned_record_landing_at(
-        name: &str,
-        landed_ms: impl FnOnce(i64) -> i64,
-    ) -> (bool, String) {
+    /// lands with store `last_modified` at `landed_ms`, the next flush's
+    /// re-read evaluates NoPublishAfterAbandon on it. Returns that
+    /// evaluation.
+    async fn abandoned_record_landing_at(name: &str, landed_ms: i64) -> (bool, String) {
         let tenant = TenantId::new(format!("no-publish-after-abandon-{name}"));
         let next = TenantId::new(format!("no-publish-after-abandon-{name}-next"));
         let (router, fault_store, clock, gate, commit_key) =
             abandon_on_a_reported_failure(&tenant, &next, FaultPlan::empty()).await;
+        assert!(
+            clock.now_ns() < EARLY_NS + NS_PER_MINUTE,
+            "the flush abandoned early in its hour, long before the hour's end"
+        );
 
         let absent =
             crate::router::invariant_capture::evaluations(NO_PUBLISH_AFTER_ABANDON, &commit_key);
         assert_eq!(absent.len(), 1, "{absent:?}");
         assert!(absent[0].0, "{absent:?}");
         assert_eq!(detail(&absent[0].1, "last_modified_unix_ms"), "absent");
-        let opened_ns: i64 = detail(&absent[0].1, "opened_ns")
-            .parse()
-            .expect("opened_ns");
-        let late_after_ns: i64 = detail(&absent[0].1, "late_after_ns")
-            .parse()
-            .expect("late_after_ns");
-        let lifetime_ns = 60 * 1_000_000_000;
-        assert!(
-            (BASE_NS..=clock.now_ns()).contains(&opened_ns),
-            "the open time is the grant time: {absent:?}"
-        );
-        assert!(
-            clock.now_ns() - opened_ns < lifetime_ns,
-            "the flush abandoned on its attempt budget, inside its lifetime"
+        assert_eq!(
+            detail(&absent[0].1, "ingest_hour_bucket"),
+            (EARLY_NS / NS_PER_HOUR).to_string(),
+            "{absent:?}"
         );
         assert_eq!(
-            late_after_ns - opened_ns,
-            lifetime_ns + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS + DEFAULT_FOLD_SAFETY_MARGIN_NS,
-            "the bound is fold.rs's seal margin from the open"
+            detail(&absent[0].1, "sealed_at_ns"),
+            EARLY_HOUR_SEALED_AT_NS.to_string(),
+            "the bound is the fold's seal point of the record's hour: {absent:?}"
         );
 
-        let landed_ms = landed_ms(late_after_ns);
         land_held_put(&fault_store, &gate, &commit_key, landed_ms).await;
         commit_one_flush(&router, &clock, &next, "h1", 2).await;
 
@@ -8378,29 +8398,29 @@ mod tests {
         evaluations[1].clone()
     }
 
-    /// A commit PUT reported failed that lands after the abandon, with store
-    /// `last_modified` at the last millisecond inside the fold's seal margin:
+    /// A commit PUT granted early in its hour, reported failed, that lands
+    /// with store `last_modified` one millisecond before the fold seals that
+    /// hour, nearly an hour after the flush's own deadline:
     /// NoPublishAfterAbandon holds.
     #[tokio::test]
-    async fn an_abandoned_commit_landing_inside_the_seal_margin_holds() {
+    async fn an_abandoned_commit_landing_just_before_the_seal_point_holds() {
         if !crate::router::invariant_capture::capturing() {
             return;
         }
         let (held, details) =
-            abandoned_record_landing_at("inside", |late_after_ns| late_after_ns / 1_000_000).await;
+            abandoned_record_landing_at("inside", EARLY_HOUR_SEALED_AT_NS / 1_000_000 - 1).await;
         assert!(held, "{details}");
     }
 
-    /// The same PUT landing one millisecond past the fold's seal margin:
-    /// NoPublishAfterAbandon evaluates false.
+    /// The same PUT landing at the seal point itself, when a fold may
+    /// already have sealed the hour: NoPublishAfterAbandon evaluates false.
     #[tokio::test]
-    async fn an_abandoned_commit_landing_past_the_seal_margin_breaks_no_publish_after_abandon() {
+    async fn an_abandoned_commit_landing_at_the_seal_point_breaks_no_publish_after_abandon() {
         if !crate::router::invariant_capture::capturing() {
             return;
         }
         let (held, details) =
-            abandoned_record_landing_at("past", |late_after_ns| late_after_ns / 1_000_000 + 1)
-                .await;
+            abandoned_record_landing_at("past", EARLY_HOUR_SEALED_AT_NS / 1_000_000).await;
         assert!(!held, "{details}");
     }
 
@@ -8440,12 +8460,7 @@ mod tests {
         };
         erring(1);
 
-        let late_ms = (clock.now_ns()
-            + 60 * 1_000_000_000
-            + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
-            + DEFAULT_FOLD_SAFETY_MARGIN_NS)
-            / 1_000_000
-            + 1_000;
+        let late_ms = EARLY_HOUR_SEALED_AT_NS / 1_000_000 + 1_000;
         land_held_put(&fault_store, &gate, &commit_key, late_ms).await;
         commit_one_flush(&router, &clock, &next, "h1", 2).await;
         erring(2);
@@ -8599,7 +8614,9 @@ mod tests {
         let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
         provision(store.as_ref(), &slow).await;
         let clock = TestClock::new(BASE_NS);
-        let lifetime = Duration::from_secs(1);
+        // Twice this stays inside `EVIDENCE_HEAD_TIMEOUT`, so the held read
+        // still completes and evaluates.
+        let lifetime = Duration::from_millis(500);
         let router = deadline_bounded_router(&store, &clock, lifetime);
 
         let write = spawn_write(&router, &slow, "h0", WriteMode::Strict);
@@ -8630,6 +8647,160 @@ mod tests {
             crate::router::invariant_capture::evaluations(NO_COMMIT_WITHOUT_DATA, &data_prefix);
         assert_eq!(evaluations.len(), 1, "{evaluations:?}");
         assert!(evaluations[0].0, "{evaluations:?}");
+        router.flush_all().await;
+    }
+
+    /// A NoCommitWithoutData evidence read that never answers holds the ack
+    /// only until `EVIDENCE_HEAD_TIMEOUT` on the injected clock, and its
+    /// expiry evaluates nothing.
+    #[tokio::test]
+    async fn a_stalled_evidence_read_gives_up_at_the_timeout() {
+        if !crate::router::invariant_capture::capturing() {
+            return;
+        }
+        let stalled = TenantId::new("no-commit-without-data-stalled-head");
+        let data_prefix = format!(
+            "t/{}/{}/l0/",
+            stalled.hash().to_hex(),
+            Signal::Metrics.key_prefix()
+        );
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = fault_store.hold(Op::Head, Some(data_prefix.clone()), Occurrence::Nth(1));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        provision(store.as_ref(), &stalled).await;
+        let clock = TestClock::new(BASE_NS);
+        let router = deadline_bounded_router(&store, &clock, Duration::from_secs(60));
+
+        let write = spawn_write(&router, &stalled, "h0", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_until_held(1))
+            .await
+            .expect("the commit's evidence read reached the store");
+        assert!(
+            !settles(|| write.is_finished()).await,
+            "the ack waits for the evidence read until the timeout"
+        );
+        clock.advance_ns(i64::try_from(publish::EVIDENCE_HEAD_TIMEOUT.as_nanos()).expect("fits"));
+        let receipt = tokio::time::timeout(Duration::from_secs(10), write)
+            .await
+            .expect("the ack follows the evidence timeout")
+            .expect("write task")
+            .expect("the landed commit is acked");
+        assert_eq!(receipt.tokens.len(), 1);
+        assert_eq!(gate.held_count(), 1, "the evidence read is still held");
+        assert_eq!(router.metrics().snapshot().abandoned_retry_exhausted, 0);
+        let evaluations =
+            crate::router::invariant_capture::evaluations(NO_COMMIT_WITHOUT_DATA, &data_prefix);
+        assert!(evaluations.is_empty(), "{evaluations:?}");
+        let completed = crate::router::invariant_capture::evaluations(
+            EVIDENCE_COMPLETES,
+            &commit_prefix(&stalled),
+        );
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        assert!(!completed[0].0, "{completed:?}");
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        router.flush_all().await;
+    }
+
+    /// An abandoned-key re-read HEAD that never answers holds the flush's
+    /// permit only until `EVIDENCE_HEAD_TIMEOUT` on the injected clock: a
+    /// flush queued behind that permit then runs. The expiry evaluates
+    /// nothing and keeps the key, which the queued flush re-reads.
+    #[tokio::test]
+    async fn a_stalled_re_read_does_not_hold_a_queued_flush_past_the_timeout() {
+        use ravel_object_store::fault::{Rule, ScriptedFault};
+
+        if !crate::router::invariant_capture::capturing() {
+            return;
+        }
+        let abandoned = TenantId::new("abandoned-re-read-stalled");
+        let next = TenantId::new("abandoned-re-read-stalled-next");
+        // A tenant with no flush in flight, so its flush is spawned and waits
+        // for the permit rather than deferring at the queued-flush cap.
+        let third = TenantId::new("abandoned-re-read-stalled-third");
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Throttled { retry_after_ms: 0 })
+                .with_key_contains(commit_prefix(&abandoned))
+                .with_occurrence(Occurrence::Always),
+        );
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        // HEAD 1 is the abandon's own, HEAD 2 the abandoning flush's re-read,
+        // HEAD 3 the second flush's re-read, HEAD 4 the queued flush's.
+        let gate = fault_store.hold(
+            Op::Head,
+            Some(commit_prefix(&abandoned)),
+            Occurrence::Nth(3),
+        );
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        provision(store.as_ref(), &abandoned).await;
+        provision(store.as_ref(), &next).await;
+        provision(store.as_ref(), &third).await;
+        let clock = TestClock::new(BASE_NS);
+        let router = attempt_bounded_router(&store, &clock, Duration::from_secs(60), 0);
+
+        let write = spawn_write(&router, &abandoned, "h0", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        retry_until_finished(&clock, &write).await;
+        let err = write
+            .await
+            .expect("write task")
+            .expect_err("the throttled commit PUT has no retry left");
+        assert!(matches!(err, WriteError::Abandoned(_)), "{err:?}");
+
+        let write = spawn_write(&router, &next, "h1", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 2).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_until_held(1))
+            .await
+            .expect("the second flush re-read the abandoned key");
+        tokio::time::timeout(Duration::from_secs(10), write)
+            .await
+            .expect("the second flush's ack does not wait for its re-read")
+            .expect("write task")
+            .expect("the second flush commits");
+
+        let queued = spawn_write(&router, &third, "h2", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 3).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        assert!(
+            settles(|| queued_gauge(&router) == 2).await,
+            "the third flush's task is spawned beside the re-reading one"
+        );
+        assert!(
+            !settles(|| queued.is_finished()).await,
+            "the third flush waits for the permit the held re-read keeps"
+        );
+        clock.advance_ns(i64::try_from(publish::EVIDENCE_HEAD_TIMEOUT.as_nanos()).expect("fits"));
+        let receipt = tokio::time::timeout(Duration::from_secs(10), queued)
+            .await
+            .expect("the queued flush runs once the re-read times out")
+            .expect("write task")
+            .expect("the queued flush commits");
+        assert_eq!(receipt.tokens.len(), 1);
+        assert_eq!(gate.held_count(), 1, "the timed-out re-read is still held");
+
+        let rechecks = || {
+            crate::router::invariant_capture::evaluations(
+                NO_PUBLISH_AFTER_ABANDON,
+                &commit_prefix(&abandoned),
+            )
+        };
+        // The queued flush re-reads after its ack.
+        settles(|| rechecks().len() >= 2).await;
+        let evaluations = rechecks();
+        assert_eq!(
+            evaluations.len(),
+            2,
+            "HEAD 2 and HEAD 4 evaluate, the timed-out HEAD 3 does not: {evaluations:?}"
+        );
+        assert!(evaluations.iter().all(|(held, _)| *held), "{evaluations:?}");
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
         router.flush_all().await;
     }
 }

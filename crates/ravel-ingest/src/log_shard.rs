@@ -1474,8 +1474,12 @@ impl LogFlushCtx {
             match self.bound_to_deadline(deadline_ns, call).await {
                 Some(Ok(token)) => {
                     // After the race, so the instrumented build's evidence
-                    // read cannot abandon a landed commit.
-                    publish::assert_commit_has_data(self.store.as_ref(), record).await;
+                    // read cannot abandon a landed commit, and bounded so it
+                    // cannot hold the ack either.
+                    publish::assert_commit_has_data_unless(self.store.as_ref(), record, || {
+                        self.clock.sleep(publish::EVIDENCE_HEAD_TIMEOUT)
+                    })
+                    .await;
                     return Ok(token);
                 }
                 Some(Err(PublishError::SplitBrain { this, stored })) => {
@@ -4527,7 +4531,9 @@ mod tests {
         let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
         let gate = fault.hold(Op::Head, Some(data_prefix.clone()), Occurrence::Nth(1));
         let store: Arc<dyn ObjectStoreBackend> = fault.clone();
-        let lifetime = Duration::from_secs(1);
+        // Twice this stays inside `EVIDENCE_HEAD_TIMEOUT`, so the held read
+        // still completes and evaluates.
+        let lifetime = Duration::from_millis(500);
         let h = Harness::spawn_with_store(
             IngestConfig {
                 max_flush_lifetime: lifetime,
@@ -4575,6 +4581,82 @@ mod tests {
         );
         assert_eq!(evaluations.len(), 1, "{evaluations:?}");
         assert!(evaluations[0].0, "{evaluations:?}");
+        h.shutdown().await;
+    }
+
+    /// A NoCommitWithoutData evidence read that never answers holds the ack
+    /// only until `EVIDENCE_HEAD_TIMEOUT` on the injected clock, and its
+    /// expiry evaluates nothing.
+    #[tokio::test]
+    async fn a_stalled_evidence_read_gives_up_at_the_timeout_for_logs() {
+        if !crate::router::invariant_capture::capturing() {
+            return;
+        }
+        let tenant = TenantId::new("no-commit-without-data-stalled-log-head");
+        let data_prefix = format!(
+            "t/{}/{}/l0/",
+            tenant.hash().to_hex(),
+            Signal::Logs.key_prefix()
+        );
+        let commit_prefix = format!(
+            "t/{}/{}/c/",
+            tenant.hash().to_hex(),
+            Signal::Logs.key_prefix()
+        );
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = fault.hold(Op::Head, Some(data_prefix.clone()), Occurrence::Nth(1));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let h = Harness::spawn_with_store(
+            IngestConfig {
+                max_flush_lifetime: Duration::from_secs(60),
+                ..flush_on_first()
+            },
+            Arc::clone(&store),
+        );
+
+        let (ack_tx, mut ack_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::Write {
+            arrival: false,
+            tenant: tenant.clone(),
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")].into(),
+            ack: Some(ack_tx),
+            charge: None,
+        })
+        .await
+        .expect("send write");
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_until_held(1))
+            .await
+            .expect("the commit's evidence read reached the store");
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            ack_rx.try_recv().is_err(),
+            "the ack waits for the evidence read until the timeout"
+        );
+        h.clock
+            .advance_ns(i64::try_from(publish::EVIDENCE_HEAD_TIMEOUT.as_nanos()).expect("fits"));
+        tokio::time::timeout(Duration::from_secs(10), ack_rx)
+            .await
+            .expect("the ack follows the evidence timeout")
+            .expect("ack sender not dropped")
+            .expect("the landed commit is acked");
+        assert_eq!(gate.held_count(), 1, "the evidence read is still held");
+        assert_eq!(h.metrics.snapshot().abandoned_retry_exhausted, 0);
+        let evaluations = crate::router::invariant_capture::evaluations(
+            "commit: a commit record never exists without its data object",
+            &data_prefix,
+        );
+        assert!(evaluations.is_empty(), "{evaluations:?}");
+        let completed = crate::router::invariant_capture::evaluations(
+            "commit: a commit's data-object evidence read completes before it gives up",
+            &commit_prefix,
+        );
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        assert!(!completed[0].0, "{completed:?}");
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
         h.shutdown().await;
     }
 
