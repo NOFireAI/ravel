@@ -5,21 +5,52 @@ description: Use before changing any persistent format - RSEG layout, proto sche
 
 # Changing a persistent format
 
-Persistent formats outlive processes and deployments. Readability across
-versions follows one of two regimes, and the format's ADR must say which:
+Persistent formats outlive processes and deployments. ADR-4233 is the
+retained-data compatibility contract and docs/compatibility.md is its
+normative statement: read both before you start. Two regimes apply by
+release, and the format's ADR must say which:
 
-- Pre-v1.0, the regime in force today (ADR-0027, and ADR-0032/0045/0054
-  for RLOG/RSPAN): a single supported version. Backward compatibility may
-  break at a bump; old-format objects are wiped or re-ingested and no dual
-  reader is kept. This is temporary and expires at the v1.0 release, which
-  is what "first public release" denotes in the lifecycle ADRs (ADR-0531;
-  it is not the 0.9.0 release).
-- From v1.0 onward (ADR-0066 decision 1): an N/N-1 window for the bulk
-  data-object formats (Class A below). Writers always emit the current
-  version N; readers accept N and N-1. Data written today is readable by
-  the next version, not by every future version: N-1 support is deleted
-  once every bucket's recorded format floor (ADR-0066 decision 3) is >= N,
-  and that deletion is its own reviewed change citing the floors.
+- Pre-baseline (v0.33.x and earlier): a single supported version per
+  family. No pre-baseline release is a target for new format work.
+- From the ADR-4233 baseline release onward: a two-version window with
+  activation and certification. A release that introduces N+1 of a family
+  ships the reader AND the writer for N and N+1, and never two new versions
+  of one family. **A new format version is activated, never just
+  deployed**: every writer takes its version from `sys/compat`
+  (`ravel_catalog::compat`), so installing the release changes nothing it
+  writes until an operator activates N+1. A writer that emits a
+  compile-time constant instead of the policy's version is a contract
+  violation. Releases before v0.33 are outside the contract.
+
+Within the window, each `sys/compat` family follows one regime
+(`KNOWN_FAMILIES`; docs/compatibility.md "Regimes by family"):
+
+- **Class A, certified** (`rseg`, `rlog`, `rspan`): writers emit the active
+  version. The N reader is retired only by a later release that starts on
+  a `compat certify` certificate (ADR-4233 decision 7). That release's ADR
+  adds its own corpus and a boundary lane with the previous release's
+  image.
+- **Class B, catalog** (`catalog-head`, `csnap`, `npost`, `cstat`, `kidx`):
+  no certificate. The fold checks the active version as a ceiling, and a
+  release that drops a catalog version rebuilds parts below its window
+  from commit records on its first fold; its ADR states that rebuild cost.
+- **Content-versioned ceilings** (`catalog-head`, `compaction-record`):
+  the active version is a ceiling, not the emitted version. A writer
+  refuses when the active version is not one its build can write, and
+  otherwise emits the version its content needs, at or below the active
+  one (ADR-4233 ceiling amendment).
+- **Immutable records, single version** (`commit-record`,
+  `rewrite-record`, `retention-tombstone`): never rewritten, so their old
+  readers are never retired under ADR-4233; retiring one needs its own ADR.
+
+A format that is not a `sys/compat` family (CAS-mutable sys records, the
+provisioning record, tenant config, metadata, idempotency markers, `enc`)
+keeps ADR-0066 R1's readers-first rule. The baseline's metadata sink,
+idempotency markers and `enc` writer carry no `sys/compat` gate: a bump of
+any of them must add the gate first (ADR-4233 prerequisite amendment).
+
+Every new exported format-version constant gets a row in
+docs/compatibility.md's inventory in the same change.
 
 The frozen contracts:
 
@@ -64,13 +95,17 @@ The frozen contracts:
    writer, the reader gate, `audit-versions`, `migrate`, and the compactor's
    `OUTPUT_FORMAT_VERSION` all read them, so a bump edits one constant, not
    the sixteen hand-mirrored sites ADR-0049 measured.
-3. Answer the dual-reader question in the ADR. For a Class A format
-   post-release, this is ADR-0066 decision 1's readers-before-writers
-   rule: land the N-1 reader (and roll the fleet onto it) before any
-   release writes N+1; a version bump ships the reader window first. The
-   reader keeps both paths until every bucket's format floor reaches N;
-   deleting the N-1 reader is a separate reviewed change that cites those
-   floors (ADR-0066 decision 3), never a wipe-and-hope.
+3. Answer the dual-reader question in the ADR. For a `sys/compat` family
+   from the baseline on: the release that introduces N+1 widens the
+   reader window and the writable set to {N, N+1}, its writers keep
+   emitting N until `compat activate`, and every producer of the family
+   (ingest flushes, compaction, migrate, the force-2 re-encode, erasure,
+   audit, alerts, legal hold, the fold) reads its version from the policy.
+   Retiring the N reader is a separate later release: for class A it
+   starts only on an uncontradicted certificate with the late-write
+   watermark past it (ADR-4233 decision 7); for class B it rebuilds from
+   commit records. Never a wipe-and-hope. The operator procedure is
+   docs/guides/operations/maintenance.md, "Rolling a format bump".
 4. Review checksum coverage. Every byte a reader interprets must be under
    a checksum the reader can afford to verify on its access path (ADR-0010
    section 4 is the precedent: a page crc that skipped the encoding byte
