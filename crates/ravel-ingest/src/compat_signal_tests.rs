@@ -481,13 +481,13 @@ async fn a_span_flush_above_the_baseline_fences_the_bucket_before_its_first_put(
 
 /// A clock the test moves by hand; a `sleep` on it completes once the test
 /// advances it past the sleep's end.
-struct ManualClock {
+pub(crate) struct ManualClock {
     now_ns: AtomicI64,
     wake: tokio::sync::watch::Sender<()>,
 }
 
 impl ManualClock {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(ManualClock {
             now_ns: AtomicI64::new(BASE_NS),
             wake: tokio::sync::watch::channel(()).0,
@@ -497,14 +497,20 @@ impl ManualClock {
     /// Moves the clock one [`crate::compat::STALE_VIEW_RETRY`] at a time,
     /// `steps` times, letting a flush waiting out a stale view ask again
     /// after each.
-    async fn step(&self, steps: usize) {
+    pub(crate) async fn step(&self, steps: usize) {
         let step = i64::try_from(crate::compat::STALE_VIEW_RETRY.as_nanos()).expect("fits");
         for _ in 0..steps {
-            self.now_ns.fetch_add(step, Ordering::SeqCst);
-            let _ = self.wake.send(());
-            for _ in 0..50 {
-                tokio::task::yield_now().await;
-            }
+            self.advance_ns(step).await;
+        }
+    }
+
+    /// Moves the clock `delta_ns` forward, then yields so every sleep it
+    /// ended runs.
+    pub(crate) async fn advance_ns(&self, delta_ns: i64) {
+        self.now_ns.fetch_add(delta_ns, Ordering::SeqCst);
+        let _ = self.wake.send(());
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
         }
     }
 }

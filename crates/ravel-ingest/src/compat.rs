@@ -847,6 +847,11 @@ mod tests {
     /// A policy whose view read a `sys/compat` naming `rseg` the active RSEG
     /// version, with RSEG's writable set lowered to `[7]` over baseline 6.
     async fn policy(rseg: u32) -> IngestCompatPolicy {
+        policy_and_clock(rseg).await.0
+    }
+
+    /// [`policy`] and the clock its view is read at.
+    async fn policy_and_clock(rseg: u32) -> (IngestCompatPolicy, Arc<FixedClock>) {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let keys = || CompatKeys::from_file_keys(&[[5; 32]]).expect("one key");
         let family = |name: &str, version: u32| sysproto::CompatFamily {
@@ -872,7 +877,123 @@ mod tests {
         let clock = Arc::new(FixedClock(AtomicI64::new(BASE_NS)));
         let view = CompatView::new(store, keys(), clock.clone());
         view.refresh().await.expect("read sys/compat");
-        IngestCompatPolicy::new(view, clock).with_family_versions(FormatFamily::Rseg, vec![7], 6)
+        let policy = IngestCompatPolicy::new(view, clock.clone()).with_family_versions(
+            FormatFamily::Rseg,
+            vec![7],
+            6,
+        );
+        (policy, clock)
+    }
+
+    /// A bucket whose cached provisioning record carries `compat_epoch` 1.
+    struct FencedBucket;
+
+    impl BucketCompat for FencedBucket {
+        fn bucket_compat_epoch(&self, _tenant: TenantHash) -> Option<u64> {
+            Some(1)
+        }
+
+        fn note_compat_fence(&self, _tenant: TenantHash, _compat_epoch: u64) {}
+    }
+
+    /// Whether `wake` holds a stored permit, taking it.
+    fn woken(wake: &Notify) -> bool {
+        futures::FutureExt::now_or_never(wake.notified()).is_some()
+    }
+
+    /// A flush waiting out a stale view before an attempt asks the view once
+    /// more at its deadline, not one whole [`STALE_VIEW_RETRY`] before it:
+    /// with 1.5 s left, the view is stale at 0 s and at 1 s and fresh again
+    /// at 1.5 s, and the attempt goes ahead. A wait that ends at the deadline
+    /// without asking refuses it `view_stale` at 1.5 s. With the view still
+    /// stale at the deadline the attempt is refused `view_stale` then, and
+    /// not before.
+    #[tokio::test]
+    async fn a_stale_view_wait_asks_once_more_at_the_deadline() {
+        for recover in [true, false] {
+            let (policy, compat_clock) = policy_and_clock(7).await;
+            let view = policy.view().clone();
+            let tenant = ravel_types::TenantId::new("acme").hash();
+            let grant = PublishGrant::at_grant(
+                Some(InstalledPolicy {
+                    policy: Arc::new(policy),
+                    max_flush_lifetime: Duration::from_secs(60),
+                }),
+                FormatFamily::Rseg,
+                tenant,
+                Some(Arc::new(FencedBucket)),
+            )
+            .ok()
+            .expect("granted on a fresh view");
+            compat_clock
+                .0
+                .fetch_add(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS, Ordering::SeqCst);
+            assert!(grant.check_attempt().is_err_and(|r| r.is_view_stale()));
+
+            let clock = crate::compat_signal_tests::ManualClock::new();
+            let deadline_ns = clock.now_ns() + 1_500_000_000;
+            let attempt = tokio::spawn({
+                let clock = Arc::clone(&clock);
+                async move { grant.attempt_when_fresh(clock.as_ref(), deadline_ns).await }
+            });
+            clock.advance_ns(1_000_000_000).await;
+            assert!(!attempt.is_finished(), "recover={recover}: 1 s in");
+            if recover {
+                view.refresh().await.expect("read sys/compat");
+            }
+            clock.advance_ns(500_000_000).await;
+            let outcome = tokio::time::timeout(Duration::from_secs(30), attempt)
+                .await
+                .expect("the attempt ends at the deadline")
+                .expect("attempt task");
+            if recover {
+                assert_eq!(outcome, Ok(()));
+            } else {
+                assert!(
+                    outcome.as_ref().is_err_and(|r| r.is_view_stale()),
+                    "{outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// Every `view_stale` answer stores one wake permit on the policy's
+    /// refresh notifier, at admission and before an attempt alike; a fresh
+    /// answer, and a refusal other than `view_stale`, store none.
+    #[tokio::test]
+    async fn a_view_stale_answer_wakes_the_refresh() {
+        let lifetime = Duration::from_secs(60);
+        let wake = Arc::new(Notify::new());
+        let (policy, compat_clock) = policy_and_clock(7).await;
+        let policy = policy.with_refresh_wake(Arc::clone(&wake));
+        assert_eq!(policy.admit(FormatFamily::Rseg, Some(1), lifetime), Ok(()));
+        assert!(!woken(&wake), "a fresh view does not wake the refresh");
+
+        compat_clock
+            .0
+            .fetch_add(ravel_catalog::compat::COMPAT_VIEW_HORIZON_NS, Ordering::SeqCst);
+        let refused = policy
+            .admit(FormatFamily::Rseg, Some(1), lifetime)
+            .expect_err("stale");
+        assert!(refused.is_view_stale(), "{refused:?}");
+        assert!(woken(&wake), "admission's view_stale wakes the refresh");
+        assert!(!woken(&wake), "one permit per answer, taken once");
+        assert!(policy.write_version(FormatFamily::Rseg, Some(1)).is_err());
+        assert!(woken(&wake), "an attempt's view_stale wakes it too");
+
+        let wake = Arc::new(Notify::new());
+        let unwritable = policy_and_clock(8)
+            .await
+            .0
+            .with_refresh_wake(Arc::clone(&wake));
+        let refused = unwritable
+            .admit(FormatFamily::Rseg, Some(1), lifetime)
+            .expect_err("not writable");
+        assert_eq!(
+            refused.reason(),
+            CompatRefusalReason::ActiveVersionNotWritable
+        );
+        assert!(!woken(&wake), "only view_stale wakes the refresh");
     }
 
     #[tokio::test]

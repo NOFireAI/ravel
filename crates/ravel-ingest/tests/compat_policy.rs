@@ -1,7 +1,8 @@
 //! The activation policy on the log and span write paths (ADR-4233
 //! decisions 2 and 3), through the public router API: a view naming a version
 //! this build cannot write refuses at admission, a view that went stale
-//! before the flush's permit grant refuses the flush with no PUT, and a fresh
+//! before the write arrived refuses it at admission with nothing buffered
+//! and no flush opened, and a fresh
 //! view at the baseline publishes at the writer's `CURRENT` version. Every
 //! refusal is counted on the router's own metrics snapshot under its reason.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -299,11 +300,12 @@ async fn a_span_write_under_an_rspan_version_this_build_cannot_write_is_refused_
     );
 }
 
-/// Admission lets a stale view through (the flush re-asks at permit grant),
-/// and the grant refuses it: no object is stored and the refusal is counted
-/// under `view_stale`.
+/// Admission refuses a write while the view is stale: nothing is buffered,
+/// no flush is opened, no object is stored, and the refusal is counted once
+/// under `view_stale`. A refusal at grant instead would open an arrival
+/// flush first.
 #[tokio::test]
-async fn a_log_flush_granted_on_a_stale_view_is_refused_without_a_put() {
+async fn a_log_write_on_a_stale_view_is_refused_at_admission() {
     let acme = tenant("acme");
     let (store, compat_clock, policy) = setup(
         &acme,
@@ -325,16 +327,16 @@ async fn a_log_flush_granted_on_a_stale_view_is_refused_without_a_put() {
             ACK_DEADLINE,
         )
         .await
-        .expect_err("the view is past the horizon at grant");
+        .expect_err("the view is past the horizon at admission");
     assert!(
         matches!(&err, LogWriteError::CompatRefused(r) if stale(r, FormatFamily::Rlog)),
         "{err:?}"
     );
     assert!(err.is_retryable());
-    assert_eq!(
-        only(router.metrics_snapshot().compat_publish_refused).view_stale,
-        1
-    );
+    let snapshot = router.metrics_snapshot();
+    assert_eq!(only(snapshot.compat_publish_refused).view_stale, 1);
+    assert_eq!(snapshot.buffered_records_total, 0, "nothing buffered");
+    assert_eq!(snapshot.flushes_by_arrival, 0, "no flush opened");
     assert_eq!(
         objects(&store, &acme, Signal::Logs).await,
         Vec::<String>::new()
@@ -342,7 +344,7 @@ async fn a_log_flush_granted_on_a_stale_view_is_refused_without_a_put() {
 }
 
 #[tokio::test]
-async fn a_span_flush_granted_on_a_stale_view_is_refused_without_a_put() {
+async fn a_span_write_on_a_stale_view_is_refused_at_admission() {
     let acme = tenant("acme");
     let (store, compat_clock, policy) = setup(
         &acme,
@@ -364,16 +366,16 @@ async fn a_span_flush_granted_on_a_stale_view_is_refused_without_a_put() {
             ACK_DEADLINE,
         )
         .await
-        .expect_err("the view is past the horizon at grant");
+        .expect_err("the view is past the horizon at admission");
     assert!(
         matches!(&err, SpanWriteError::CompatRefused(r) if stale(r, FormatFamily::Rspan)),
         "{err:?}"
     );
     assert!(err.is_retryable());
-    assert_eq!(
-        only(router.metrics_snapshot().compat_publish_refused).view_stale,
-        1
-    );
+    let snapshot = router.metrics_snapshot();
+    assert_eq!(only(snapshot.compat_publish_refused).view_stale, 1);
+    assert_eq!(snapshot.buffered_spans_total, 0, "nothing buffered");
+    assert_eq!(snapshot.flushes_by_arrival, 0, "no flush opened");
     assert_eq!(
         objects(&store, &acme, Signal::Spans).await,
         Vec::<String>::new()
