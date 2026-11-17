@@ -1534,12 +1534,17 @@ bucket. Each hold has one of three reasons:
 
 - `input_out_of_window`: an input data object's format version, or the
   version of an RLOG section it carries, is outside this build's reader
-  window.
+  window. A part that `--reencode-compaction-parts` would re-encode is held
+  under this reason only when its bytes match the content hash its record
+  carries.
 - `newer_than_writable`: a metrics input's commit record, or, for any
   signal, a part of the compaction record that `--reencode-compaction-parts`
   would re-encode, is recorded at a format version above the one this build
   writes.
-- `corrupt_input`: an input data object fails to decode.
+- `corrupt_input`: an input data object fails to decode, or a part that
+  `--reencode-compaction-parts` would re-encode fails its content hash
+  check. The re-encode checks the hash of every metrics part, and of a logs
+  or spans part when the reader refuses its version.
 
 A run that held any bucket does not re-audit and does not raise the floor,
 whatever the rest of the walk found. It prints its report, then one line per
