@@ -55,6 +55,11 @@ unattributable.
 | `churn` | 50,000 concurrent | 8,640 | 15 s | 36 h | 20%/h | 432,000,000 |
 | `ci` | 1,000 | 120 | 15 s | 30 m | none | 120,000 |
 
+Total points counts scalar samples and native histograms together, as the
+manifest's `total_samples` field does; the ingest report splits them into
+`accepted_samples` and `accepted_histograms` (see "Compare a profile's ingest
+volume" below).
+
 The `ci` profile is marked non-comparable **in the artifact**, as a typed
 `comparability` field carrying the reason:
 
