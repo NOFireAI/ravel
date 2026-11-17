@@ -219,7 +219,8 @@ Supported:
 3. On B+1: terminate every pre-baseline process, activate F at N+1 with
    `ravel-cli compat activate --pre-baseline-processes-terminated`,
    migrate with `ravel-server --mode maintain --background-migrate`,
-   certify with `ravel-cli compat certify`, and let the maintain process
+   certify with `ravel-cli compat certify`, and let the maintain process,
+   under a role with the grants the maintenance guide's step 1 lists,
    run the late-write pass (or run `ravel-cli compat verify`).
 4. B+1 to B+2: a rolling upgrade, which B+2 permits only on F's certificate.
 
@@ -272,8 +273,9 @@ rolled-back `sys/compat` is restored from bucket versioning.
 
 The `ravel-cli compat` subcommands (`init`, `activate`, `certify`,
 `verify`, `status`) share one set of exit codes: 0 done; 1 an error (a
-store, listing or `sys/compat` fault, or an `activate` that lost all 8
-conditional-write attempts), printed to stderr; 2 refused, with
+store, listing or `sys/compat` fault, or an `activate` whose 8 attempts
+all lost the conditional write or met a retryable store error), printed to
+stderr; 2 refused, with
 `sys/compat` unchanged and the reason printed (a command-line error also
 exits 2); 3 contradicted; 4 pending, rerun the same command. The
 [maintenance guide](guides/operations/maintenance.md#rolling-a-format-bump)
@@ -281,11 +283,13 @@ gives each command's flags and report fields.
 
 - **`ravel-cli compat init`** exits 2, writing nothing, on: an unkeyed
   store; a publish lifetime that is not positive; an object it cannot read
-  or classify; any object outside this build's read sets (named per
-  tenant, signal, family and version); a provisioning record that already
-  carries a `compat_epoch`; and an existing `sys/compat` that differs from
-  the record it would write. A listing error, a key it cannot address, or
-  a failed GET exits 1. An identical existing record is a no-op, exit 0.
+  or classify; any object outside this build's read sets (the message
+  gives the number of tenant, signal, family and version groups and the
+  first group in full); a provisioning record that already carries a
+  `compat_epoch`; and an existing `sys/compat` that differs from the
+  record it would write. A listing error, a key it cannot address, an
+  entry under `t/` that is not a tenant, or a failed GET exits 1. An
+  identical existing record is a no-op, exit 0.
 - **`ravel-cli compat activate`** exits 2 before any read without
   `--pre-baseline-processes-terminated`, and before any write on: an
   unkeyed store; an absent `sys/compat`; a family with no entry; a version
@@ -294,16 +298,25 @@ gives each command's flags and report fields.
   but the fence walk stopped; a rerun resumes the walk.
 - **`ravel-cli compat certify`** exits 2 for any family but `rseg`, `rlog`
   and `rspan`, and before its census until `activated + H + P + T_req` and
-  every provisioned bucket's `compat_fenced_unix_ns + G_pre` (plus the
-  clock-skew allowance) have passed, or while the activation's fence walk
-  is incomplete. Its census exits 3 on a member below the target, and 2 on
-  a member it cannot read, a trailer that disagrees with its record's
-  stamp, or an incomplete listing. It exits 4 when `--budget-records`
-  stopped it or when a written certificate waits for a late-write pass to
-  finish its floor raises.
+  the newest `compat_fenced_unix_ns + G_pre` (plus the clock-skew
+  allowance) have passed, or while the activation's fence walk is
+  incomplete. The newest fence time is taken over the provisioned buckets
+  of the family's own signals, and a fence time of 0 (a bucket born
+  fenced) is skipped. The census fences, at the activation epoch, any
+  bucket provisioned unfenced after the walk, so certify writes
+  provisioning records, and such a bucket then refuses the run with
+  `BucketRecentlyFenced` until its new fence time plus `G_pre` (6 h 0 m
+  30 s with the defaults) and the skew allowance. Its census exits 3 on a
+  member below the target, and 2 on a member it cannot read, a trailer
+  that disagrees with its record's stamp, or an incomplete listing; an
+  entry under `t/` that is not a tenant exits 1. It exits 4 when
+  `--budget-records` stopped it or when a written certificate waits for a
+  late-write pass to finish its floor raises.
 - **`ravel-cli compat verify`** exits 3 when its late-write pass finds a
   record below the certified version, which also marks the certificate
-  `contradicted`, or when any family is already `contradicted`.
+  `contradicted`, or when any family is already `contradicted`. When the
+  certificate is replaced while the pass runs, the pass marks nothing, so
+  a late write it found exits 3 with `contradicted` still `false`.
 - **The retired-reader startup gate.** A release that drops a class A
   reader starts, in every mode, only when the family carries an
   uncontradicted certificate at or above the oldest version it reads with
