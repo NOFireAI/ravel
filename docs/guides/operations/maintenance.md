@@ -2002,7 +2002,7 @@ migration target:
 |---|---|---|
 | Metric segments | v7 | Every other version, including v6. |
 | Log segments | v5 | Every other version, including v4. |
-| Span segments | v4 | Every other version. |
+| Span segments | v5 | Every other version, including v4. |
 
 ### Rolling a format bump
 
@@ -2179,12 +2179,15 @@ The procedure, for family F from version N to N+1:
    key.
 
    The command raises the family's active version and the store-wide
-   `compat_epoch` together in one conditional write, retrying a lost race
-   up to 8 times. Then it walks every tenant: it fences each provisioning
-   record at the family's activation epoch and, for `rlog`, parks every
-   discoverable tenant's alert lease. It records `fence_complete_unix_ns`
-   only after a walk with no failure. Exit codes:
-   - 0, `outcome` `activated`, `fence_walk.complete` `true`: done.
+   `compat_epoch` together in one conditional write, making up to 8
+   attempts in all (7 retries) when it loses the race or the store returns
+   a retryable error. Then it walks every tenant: it fences each
+   provisioning record at the family's activation epoch and, for `rlog`,
+   parks every discoverable tenant's alert lease. It records
+   `fence_complete_unix_ns` only after a walk with no failure. Exit codes:
+   - 0, `fence_walk.complete` `true`: done. `outcome` is `activated`, or
+     `resumed-pending-walk` when this run finished a walk an earlier run
+     left pending.
    - 4, `fence_walk.complete` `false`: the version is active but the walk
      stopped; `fence_walk.failure` says where. Fix the cause and rerun the
      same command. A family whose walk is pending is resumed, not
@@ -2198,8 +2201,8 @@ The procedure, for family F from version N to N+1:
      `NotWritable` (this build does not write the requested version), or
      `NotAboveActive` or `VersionJump` (the version is not exactly one
      above the active version; no step lowers a version).
-   - 1: a store or `sys/compat` fault, or `Contended`, every one of the 8
-     attempts lost the conditional write. Rerun.
+   - 1: a store or `sys/compat` fault, or `Contended`: all 8 attempts
+     lost the conditional write or met a retryable store error. Rerun.
 
    The JSON report carries `family`, `active_write_version`,
    `stamp_ahead_of_clock_ns` and `fence_walk` (`tenants`,
@@ -2264,9 +2267,13 @@ The procedure, for family F from version N to N+1:
    ```
 
    It refuses to start its census before the activation plus
-   `H + P + T_req` and before every provisioned bucket's own fence time
-   plus `G_pre`, each plus the clock-skew allowance; `H` is 10 minutes and
-   `G_pre` is `3 h + 2 × max_flush_lifetime + P + T_req`.
+   `H + P + T_req` and before the newest fence time plus `G_pre`, each
+   plus the clock-skew allowance; `H` is 10 minutes and `G_pre` is
+   `3 h + 2 × max_flush_lifetime + P + T_req`. The newest fence time is
+   taken over the provisioned buckets of the family's own signals only
+   (metrics for `rseg`, logs for `rlog`, spans for `rspan`; alerts and
+   audit are never provisioned), and a bucket born fenced, whose fence
+   time is 0, is left out.
    `--max-flush-lifetime` (default `1h`) is raised to the value `sys/gc`
    records when that is larger, and `--t-req` (default `30s`) is the store
    request timeout. With the defaults and `P` of 1 hour, `G_pre` is
@@ -2278,7 +2285,14 @@ The procedure, for family F from version N to N+1:
    `(tenant, signal, shard)` units one run covers (unset is no cap); a run
    saves its progress to the cursor `sys/maintain/certify/<family>/cursor`
    when the budget stops it and when its census finishes, and the next run
-   resumes from there. On a clean census it writes the
+   resumes from there. The census also fences, at the activation epoch,
+   every provisioned bucket it reaches that is still unfenced, such as one
+   a blind or lagging gateway provisioned after the activation's walk, so
+   certify can write provisioning records. A bucket it fences that way has
+   a fence time of now, and the recheck after the census then refuses
+   with `BucketRecentlyFenced` until that time plus `G_pre` and the
+   clock-skew allowance, about 6 hours with the defaults; rerun then. On a
+   clean census it writes the
    certificate, sets the late-write watermark to the census start, raises
    the format floors, and deletes the cursor. Exit codes, by `outcome`:
    - 0, `certified`: the certificate is written. The report carries
@@ -2302,10 +2316,13 @@ The procedure, for family F from version N to N+1:
      the activation epoch, a tenant set that changed during the census, an
      incomplete listing, a member absent, corrupt or whose trailer
      disagrees with its stamp, `sys/compat` changed or replaced during the
-     run (rerun), another certify run holding the cursor, a family that
-     is not class A, and a family already certified at or above the
-     target.
-   - 1: a store or decode fault. Rerun; units examined since the last
+     run (rerun), `ConcurrentCertify` (this run lost the conditional write
+     of the cursor to another run; nothing holds the cursor, and a rerun
+     resumes from whatever cursor a crashed or finished run left), a
+     family that is not class A, and a family already certified at or
+     above the target.
+   - 1: a store or decode fault, or an entry under `t/` that is not a
+     tenant (remove it). Rerun; units examined since the last
      saved cursor are examined again, so a large store is cheaper to
      certify in `--budget-records` steps.
 9. **Verify late writes.** A `--mode maintain` process started with
@@ -2325,18 +2342,24 @@ The procedure, for family F from version N to N+1:
    `verify` runs the pass for `--family`, or for every class-A family that
    carries a certificate; a `--family` that is not `rseg`, `rlog` or
    `rspan` runs no pass. It exits 3 when a pass found a late write or any
-   family is `contradicted`, and 0 otherwise. Its report adds
-   `late_write_passes`, one per family the pass ran for (`family`,
-   `examined`, `certified`, `certificate_replaced`, `watermark_unix_ns`,
-   and `late_writes`, each a `record_key` and `version`). `status` runs no
-   pass and exits 0. Both print, per family, `active_write_version`,
+   family is `contradicted`, and 0 otherwise. A pass whose certificate was
+   replaced while it ran (`certificate_replaced` `true`) marks nothing
+   `contradicted`, so a late write it found exits 3 with that family's
+   `contradicted` still `false`; rerun `verify` against the new
+   certificate. Its JSON report adds `late_write_passes`, one per family
+   the pass ran for (`family`, `examined`, `certified`,
+   `certificate_replaced`, `watermark_unix_ns`, and `late_writes`, each a
+   `record_key` and `version`). `status` runs no pass and exits 0. With
+   `--json` both print, per family, `active_write_version`,
    `activated_epoch`, `activated_unix_ns`, `activated_by`,
    `fence_complete_unix_ns`, `contradicted`, `watermark_unix_ns`,
    `finalization_pending` and `certificate` (`version`,
    `certified_unix_ns`, `member_count`, `newest_created_unix_ns`,
    `buckets_scanned`, or `null`), beside the record's
    `baseline_release_major`, `baseline_release_minor`, `compat_epoch` and
-   `max_publish_lifetime_ns`. A store with no `sys/compat` prints
+   `max_publish_lifetime_ns`. The text output, without `--json`, omits
+   `activated_unix_ns`, `activated_by`, `newest_created_unix_ns` and
+   `late_write_passes`. A store with no `sys/compat` prints
    `outcome` `absent` and exits 0; an unkeyed run exits 2, and a fault
    exits 1. `finalization_pending` is `true` from the certify run until
    the first late-write pass after it, while the watermark is below
