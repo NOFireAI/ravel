@@ -1183,6 +1183,54 @@ mod tests {
         assert_eq!(SRC.matches(concat!("worker_record_", "keys:")).count(), 1);
     }
 
+    /// ADR-4233 decision 7: the retired-reader gate runs on this build's
+    /// retired set, in every mode, before `resolve_and_pin` writes
+    /// `sys/tenancy` on a fresh store (after it, a fresh store would read as
+    /// one with `sys/tenancy` and no `sys/compat`) and before the server
+    /// starts. Asserted over this file's source, like the tests above: `main`
+    /// cannot be called from a test. Needles built with `concat!` so this
+    /// test's own source cannot match itself.
+    #[test]
+    fn the_retired_reader_gate_runs_before_the_tenancy_marker_is_written() {
+        const SRC: &str = include_str!("main.rs");
+        let gate = concat!("compat_gate::", "enforce(");
+        assert_eq!(SRC.matches(gate).count(), 1);
+        let at = SRC.find(gate).expect("main runs the gate");
+        let call = &SRC[at..at + 200];
+        assert!(
+            call.contains(concat!("compat_gate::", "RETIRED_READERS,")),
+            "the gate checks this build's retired set: {call}"
+        );
+        let pin = SRC
+            .find(concat!("tenancy::", "resolve_and_pin("))
+            .expect("main pins the tenancy scheme");
+        let start = SRC
+            .find(concat!(
+                "ravel_server::",
+                "start_with_heartbeat_and_ipcrypt("
+            ))
+            .expect("main starts the server");
+        assert!(at < pin && at < start);
+    }
+
+    /// `--background-migrate` reaches the maintenance config as the background
+    /// migrate budget, and nothing else sets that field. Whitespace is
+    /// stripped so the needle survives rustfmt's line breaks.
+    #[test]
+    fn the_background_migrate_flag_reaches_the_compat_maintenance_config() {
+        let src: String = include_str!("main.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let assigned = concat!(
+            "background_",
+            "migrate:cli.background_migrate",
+            ".then_some(ravel_server::compat_maintain::BACKGROUND_MIGRATE_BUDGET),"
+        );
+        assert_eq!(src.matches(assigned).count(), 1);
+        assert_eq!(src.matches(concat!("background_", "migrate:")).count(), 1);
+    }
+
     /// the modes that build a query engine (and therefore spawn the alert
     /// evaluator) must not warn; the modes that do not, must warn when rules are
     /// present. With no rules there is nothing to warn about in any mode.
