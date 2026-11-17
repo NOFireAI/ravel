@@ -1152,12 +1152,24 @@ fn stale_view_config() -> IngestConfig {
 /// The deferred tenant's provisioning GETs pass `PROV_READS_BEFORE` times,
 /// then fail `failures` times, then pass again.
 fn provisioning_outage<P: Pipe>(failures: usize) -> FaultPlan {
+    provisioning_outages::<P>(failures, 0)
+}
+
+/// [`provisioning_outage`] with one more read passing after the `failures`,
+/// then `relapse` more failing.
+fn provisioning_outages<P: Pipe>(failures: usize, relapse: usize) -> FaultPlan {
     let key = ravel_catalog::provisioning_key(&tenant("globex").hash(), P::SIGNAL);
     let mut reads = Sequence::new(Op::Get).with_key_contains(key);
     for _ in 0..PROV_READS_BEFORE {
         reads = reads.then_passthrough();
     }
     for _ in 0..failures {
+        reads = reads.then_fault(ScriptedFault::Transient("provisioning read down".into()));
+    }
+    if relapse > 0 {
+        reads = reads.then_passthrough();
+    }
+    for _ in 0..relapse {
         reads = reads.then_fault(ScriptedFault::Transient("provisioning read down".into()));
     }
     FaultPlan::empty().with_sequence(reads)
@@ -1181,8 +1193,12 @@ struct HeldView<P> {
 /// provisioning GETs fail `failures` times, and returns once the flush has
 /// been held closed and a re-read has failed.
 async fn hold_on_an_untrusted_view<P: Pipe>(failures: usize) -> HeldView<P> {
-    let world =
-        World::<P>::with_plan(stale_view_config(), provisioning_outage::<P>(failures)).await;
+    hold_under::<P>(provisioning_outage::<P>(failures)).await
+}
+
+/// [`hold_on_an_untrusted_view`] over the provisioning reads `plan` scripts.
+async fn hold_under<P: Pipe>(plan: FaultPlan) -> HeldView<P> {
+    let world = World::<P>::with_plan(stale_view_config(), plan).await;
     let keys = rows_on::<P>(&world.deferred, HELD_VIEW_SHARD, 1, 3);
     world.defer(HELD_VIEW_SHARD, &keys).await;
     let horizon = start_of(H0 + 2);
@@ -1346,6 +1362,120 @@ async fn an_untrusted_view_that_recovers_inside_the_bound_publishes<P: Pipe>() {
         scanned_rows::<P>(world.fault.inner(), &world.deferred, H0..=H0 + 3).await,
         expected(&keys),
         "every acknowledged row is published once"
+    );
+}
+
+/// The store recovers while no flush attempt runs for longer than the bound,
+/// as for a trigger deferred at the queued-flush cap or the tenant's flush
+/// share, which returns before the scan-set check and reads nothing. The first
+/// attempt past the bound reads the record once more before it would drop the
+/// buffer, finds a trusted view and publishes every row (issue #4363).
+///
+/// Guard: the re-read in `held_view_check`. Without it that attempt finds
+/// the hold spent and drops the buffer without asking the store, which now
+/// answers.
+async fn a_store_that_recovers_with_no_attempt_publishes_past_the_bound<P: Pipe>() {
+    let HeldView {
+        world,
+        keys,
+        since_ns,
+    } = hold_under::<P>(provisioning_outages::<P>(1, NEVER)).await;
+    assert_eq!(
+        world.fault.sequence_progress(0),
+        PROV_READS_BEFORE + 1,
+        "no read has succeeded since the hold began"
+    );
+    assert!(world.budget.in_flight_bytes() > 0);
+
+    world.clock.set_ns(since_ns + 2 * STALE_LIFETIME_NS);
+    yield_rounds().await;
+    assert_eq!(
+        world.router.counters().abandoned_stale,
+        0,
+        "not dropped, counters {:?}",
+        world.router.counters()
+    );
+    assert!(
+        drive(&world.clock, || world.budget.in_flight_bytes() == 0).await,
+        "the held flush lands"
+    );
+    assert_eq!(world.router.counters().abandoned_stale, 0);
+    assert_eq!(
+        world.fault.sequence_progress(0),
+        PROV_READS_BEFORE + 2,
+        "the one read that passes is the last read before the drop"
+    );
+    assert_eq!(
+        scanned_rows::<P>(world.fault.inner(), &world.deferred, H0..=H0 + 3).await,
+        expected(&keys),
+        "every acknowledged row is published once"
+    );
+}
+
+/// A provisioning read that succeeds mid-hold, while no flush attempt runs,
+/// restarts the hold through the real router's view stamp: the reads fail as
+/// the hold starts, one passes, and they fail again from then on. The first
+/// attempt once that view is past its own trust horizon is long past the
+/// first hold's bound and drops nothing; the hold restarts there and the
+/// buffer is dropped exactly one bound later (issue #4363).
+///
+/// Guard: `SwitchScope::view_refreshed_at` returning the stamp of the read
+/// behind the cached view. Returning `None`, or the view's last-touch stamp
+/// (which only writes and the router's own installs move), never restarts the
+/// hold, so the first attempt past the trust horizon drops the buffer.
+async fn a_read_that_succeeds_mid_hold_restarts_it<P: Pipe>() {
+    let HeldView { world, keys: _, .. } = hold_under::<P>(provisioning_outages::<P>(1, NEVER)).await;
+    assert!(
+        drive(&world.clock, || world.fault.sequence_progress(0)
+            == PROV_READS_BEFORE + 2)
+        .await,
+        "a re-read passes"
+    );
+    yield_rounds().await;
+    assert_eq!(world.router.counters().abandoned_stale, 0);
+    assert!(
+        world.budget.in_flight_bytes() > 0,
+        "the attempt that issued the read was held"
+    );
+
+    // The read was issued in hour H0 + 2, so its view is trusted through
+    // H0 + 3. No attempt runs until H0 + 4.
+    let restart_ns = start_of(H0 + 4) + 1_000_000_000;
+    world.clock.set_ns(restart_ns);
+    yield_rounds().await;
+    assert_eq!(
+        world.router.counters().abandoned_stale,
+        0,
+        "the read restarted the hold, counters {:?}",
+        world.router.counters()
+    );
+    assert!(world.budget.in_flight_bytes() > 0);
+
+    world.clock.set_ns(restart_ns + STALE_LIFETIME_NS - TICK_NS);
+    yield_rounds().await;
+    assert_eq!(
+        world.router.counters().abandoned_stale,
+        0,
+        "held one tick inside the restarted bound"
+    );
+    ticks(&world.clock, 1).await;
+    assert_eq!(
+        world.router.counters().abandoned_stale,
+        1,
+        "dropped one bound after the restart, counters {:?}",
+        world.router.counters()
+    );
+    assert_eq!(world.budget.in_flight_bytes(), 0);
+    assert_eq!(
+        keys_under_shard(
+            world.fault.inner(),
+            &world.deferred,
+            P::SIGNAL,
+            HELD_VIEW_SHARD
+        )
+        .await,
+        Vec::<String>::new(),
+        "nothing is written"
     );
 }
 
@@ -2149,6 +2279,8 @@ scan_set_cases!(
     metrics_a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone => a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone,
     metrics_an_untrusted_view_hold_is_dropped_at_the_flush_lifetime => an_untrusted_view_hold_is_dropped_at_the_flush_lifetime,
     metrics_an_untrusted_view_that_recovers_inside_the_bound_publishes => an_untrusted_view_that_recovers_inside_the_bound_publishes,
+    metrics_a_store_that_recovers_with_no_attempt_publishes_past_the_bound => a_store_that_recovers_with_no_attempt_publishes_past_the_bound,
+    metrics_a_read_that_succeeds_mid_hold_restarts_it => a_read_that_succeeds_mid_hold_restarts_it,
     metrics_a_teardown_inside_the_bound_writes_the_held_flush => a_teardown_inside_the_bound_writes_the_held_flush,
     metrics_a_teardown_past_the_bound_drops_the_held_flush => a_teardown_past_the_bound_drops_the_held_flush,
 );
@@ -2171,6 +2303,8 @@ scan_set_cases!(
     logs_a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone => a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone,
     logs_an_untrusted_view_hold_is_dropped_at_the_flush_lifetime => an_untrusted_view_hold_is_dropped_at_the_flush_lifetime,
     logs_an_untrusted_view_that_recovers_inside_the_bound_publishes => an_untrusted_view_that_recovers_inside_the_bound_publishes,
+    logs_a_store_that_recovers_with_no_attempt_publishes_past_the_bound => a_store_that_recovers_with_no_attempt_publishes_past_the_bound,
+    logs_a_read_that_succeeds_mid_hold_restarts_it => a_read_that_succeeds_mid_hold_restarts_it,
     logs_a_teardown_inside_the_bound_writes_the_held_flush => a_teardown_inside_the_bound_writes_the_held_flush,
     logs_a_teardown_past_the_bound_drops_the_held_flush => a_teardown_past_the_bound_drops_the_held_flush,
 );
@@ -2193,6 +2327,8 @@ scan_set_cases!(
     spans_a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone => a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone,
     spans_an_untrusted_view_hold_is_dropped_at_the_flush_lifetime => an_untrusted_view_hold_is_dropped_at_the_flush_lifetime,
     spans_an_untrusted_view_that_recovers_inside_the_bound_publishes => an_untrusted_view_that_recovers_inside_the_bound_publishes,
+    spans_a_store_that_recovers_with_no_attempt_publishes_past_the_bound => a_store_that_recovers_with_no_attempt_publishes_past_the_bound,
+    spans_a_read_that_succeeds_mid_hold_restarts_it => a_read_that_succeeds_mid_hold_restarts_it,
     spans_a_teardown_inside_the_bound_writes_the_held_flush => a_teardown_inside_the_bound_writes_the_held_flush,
     spans_a_teardown_past_the_bound_drops_the_held_flush => a_teardown_past_the_bound_drops_the_held_flush,
 );

@@ -538,6 +538,7 @@ pub(crate) async fn held_view_check<M>(
         u64::try_from(deadline_ns.saturating_sub(clock.now_ns())).unwrap_or(0),
     );
     tokio::select! {
+        biased;
         verdict = reread_and_check(scope, clock, remaining, tenant, shard, hour, now_ns) => verdict,
         () = clock.sleep(remaining) => ScanCheck::Unknown,
     }
@@ -2472,6 +2473,85 @@ mod tests {
         fn now_ns(&self) -> i64 {
             self.0.load(std::sync::atomic::Ordering::SeqCst)
         }
+    }
+
+    /// A write-path install of a read issued before the cached view's read
+    /// keeps the cached history and stamp, so a slow router read does not set
+    /// a stale-view hold's restart evidence back (issue #4363).
+    ///
+    /// Guard: the `cached.refreshed_at_ns > now_ns` filter in `refresh_view`.
+    /// Without it the stamp moves back to the older read's issue time and the
+    /// older history routes at 8 shards.
+    #[test]
+    fn an_older_read_does_not_replace_a_newer_view() {
+        let sw = index_switch(4, DEFAULT_REFRESH_INTERVAL_NS);
+        let t = tenant(9);
+        let (older, newer) = (10 * NS_PER_HOUR, 10 * NS_PER_HOUR + 5);
+        sw.refresh(t, vec![gen0(4)], newer);
+        let set = sw.refresh(t, vec![gen0(8)], older);
+        assert_eq!(sw.view_refreshed_at(t), Some(newer));
+        assert_eq!(set.len(), 4, "the newer read's history routes");
+        let set = sw.refresh(t, vec![gen0(8)], newer);
+        assert_eq!(set.len(), 8, "a read issued at the same instant installs");
+    }
+
+    /// The hold check of a flush that found no trusted view (issue #4363):
+    /// inside the bound it re-reads nothing; once spent it re-reads the record
+    /// once, and a read that installs a trusted view returns its verdict
+    /// instead of a drop. A drain that already re-read the tenant does not
+    /// read again.
+    ///
+    /// Guard: the re-read in `held_view_check`. Without it the spent hold
+    /// returns `Unknown` (a drop) though the store answers.
+    #[tokio::test]
+    async fn a_spent_stale_view_hold_reads_once_more_before_the_drop() {
+        const BOUND: Duration = Duration::from_secs(60);
+        let bound_ns = 60_000_000_000;
+        let t0 = 10 * NS_PER_HOUR;
+        let scope = ScriptedScope::<()>::new(ScanCheck::Unknown, None);
+        let clock = SetClock(std::sync::atomic::AtomicI64::new(t0));
+        async fn check_at(
+            scope: &ScriptedScope<()>,
+            clock: &SetClock,
+            now_ns: i64,
+            since: &mut Option<i64>,
+            drain: bool,
+        ) -> ScanCheck {
+            clock.0.store(now_ns, std::sync::atomic::Ordering::SeqCst);
+            held_view_check(
+                scope, clock, BOUND, tenant(1), 0, 10, now_ns, since, true, drain,
+            )
+            .await
+        }
+
+        let mut since = None;
+        assert_eq!(check_at(&scope, &clock, t0, &mut since, false).await, ScanCheck::Unknown);
+        assert_eq!(since, Some(t0), "the hold starts");
+        assert_eq!(
+            check_at(&scope, &clock, t0 + bound_ns - 1, &mut since, false).await,
+            ScanCheck::Unknown
+        );
+        assert_eq!(scope.rereads(), 0, "no re-read inside the bound");
+
+        assert_eq!(
+            check_at(&scope, &clock, t0 + bound_ns, &mut since, true).await,
+            ScanCheck::Unknown
+        );
+        assert_eq!(scope.rereads(), 0, "the drain already re-read");
+
+        assert_eq!(
+            check_at(&scope, &clock, t0 + bound_ns, &mut since, false).await,
+            ScanCheck::Unknown
+        );
+        assert_eq!(scope.rereads(), 1, "a failed last read");
+
+        scope.set_reread(Some(ScanCheck::InScanSet));
+        assert_eq!(
+            check_at(&scope, &clock, t0 + 2 * bound_ns, &mut since, false).await,
+            ScanCheck::InScanSet
+        );
+        assert_eq!(scope.rereads(), 2);
+        assert_eq!(since, Some(t0), "the caller ends the hold");
     }
 
     /// The flush-open background re-read ([`GenerationSwitch::reread`]) merges
