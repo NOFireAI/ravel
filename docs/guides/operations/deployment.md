@@ -332,9 +332,9 @@ The bucket-configuration read is bounded to 10 seconds:
   timeout and retries end each attempt, and an attempt still running at the
   deadline is cut off.
 - An endpoint that stalls every request stops startup at the
-  `sys/qualification` read, which refuses at `--startup-store-deadline`
-  (under `0s`, it holds there until the liveness probe restarts the pod).
-  The bound helps when only the three configuration GETs stall.
+  `sys/qualification` read. The store's request timeout ends each attempt,
+  `--startup-store-deadline` ends the retries, and the read refuses by the
+  deadline. The bound helps when only the three configuration GETs stall.
 
 The check sets `ravel_bucket_protection_conditions_failed`,
 `ravel_bucket_protection_conditions_unknown` and
