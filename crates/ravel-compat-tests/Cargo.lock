@@ -1687,6 +1687,7 @@ dependencies = [
  "ravel-codec",
  "ravel-commit",
  "ravel-cpu-gate",
+ "ravel-invariant",
  "ravel-logseg",
  "ravel-memory",
  "ravel-object-store",
@@ -1723,6 +1724,7 @@ dependencies = [
  "hex",
  "prost",
  "rand 0.10.2",
+ "ravel-invariant",
  "ravel-object-store",
  "ravel-proto",
  "ravel-types",
@@ -1765,6 +1767,7 @@ dependencies = [
  "futures",
  "hex",
  "prost",
+ "ravel-invariant",
  "ravel-object-store",
  "ravel-proto",
  "ravel-types",
@@ -1788,6 +1791,7 @@ dependencies = [
  "ravel-catalog",
  "ravel-commit",
  "ravel-cpu-gate",
+ "ravel-invariant",
  "ravel-logseg",
  "ravel-object-store",
  "ravel-otlp",
@@ -1800,6 +1804,10 @@ dependencies = [
  "tracing",
  "uuid",
 ]
+
+[[package]]
+name = "ravel-invariant"
+version = "0.33.0"
 
 [[package]]
 name = "ravel-ipcrypt"
@@ -1851,6 +1859,7 @@ dependencies = [
  "ravel-cpu-gate",
  "ravel-fleet",
  "ravel-ingest",
+ "ravel-invariant",
  "ravel-logseg",
  "ravel-object-store",
  "ravel-proto",
