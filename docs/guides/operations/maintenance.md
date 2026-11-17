@@ -1502,9 +1502,9 @@ landed below the floor, so the floor no longer proves the bucket clean.
 ### Compat maintenance units
 
 A `--mode maintain` process started with `--tenant-hash-key-file` runs one
-`sys/compat` maintenance task beside the maintenance loop (ADR-4233
-decisions 6 and 7). The task waits until the process is in the maintain
-live set, then ticks once an hour, starting at once. Each tick reads
+`sys/compat` maintenance task beside the maintenance loop. The task waits
+until the process is in the maintain live set, then ticks once an hour,
+starting at once. Each tick reads
 `sys/compat` and, for each of `rseg`, `rlog` and `rspan` whose entry
 carries a certificate, runs two steps. One live maintain process owns each
 family, through the unit key `compat-late-write/<family>`:
@@ -1518,9 +1518,8 @@ family, through the unit key `compat-late-write/<family>`:
    and on a clean result CAS-advances the watermark to its own start. A
    record below the
    certified version sets `contradicted` on the family entry and logs an
-   `ERROR` line naming up to five record keys. The remedy is the one
-   ADR-4233 states: roll back to the release that reads both versions,
-   `migrate`, and re-certify.
+   `ERROR` line naming up to five record keys. The remedy: roll back to
+   the release that reads both versions, `migrate`, and re-certify.
 2. **Certify finalization**, on an uncontradicted family. A `certify` run
    whose certificate CAS landed but whose format-floor raises did not
    finish reports `FinalizationPending` until a late-write pass that
@@ -2223,8 +2222,8 @@ serve with part of its catalog unreadable.
 
 A release that drops the reader for an older version of `rseg`, `rlog` or
 `rspan` checks `sys/compat` before it resolves the tenancy marker, in every
-mode (ADR-4233 decision 7). For each family whose reader it retired, it
-starts only when the family entry carries a certificate at or above the
+mode. For each family whose reader it retired, it starts only when the
+family entry carries a certificate at or above the
 oldest version it reads, the certificate is not `contradicted`, and the
 late-write watermark is past the certified time. Otherwise the process
 exits before serving, with an error naming the family and the remedy. A

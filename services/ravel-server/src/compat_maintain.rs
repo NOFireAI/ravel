@@ -37,6 +37,7 @@ use futures::FutureExt;
 use ravel_catalog::compat::{
     CompatKeys, CompatView, FAMILY_RLOG, FAMILY_RSEG, FAMILY_RSPAN, read_compat,
 };
+use ravel_catalog::provisioning_key;
 use ravel_maintain::compat_policy::part_family;
 use ravel_maintain::worker_set::owns;
 use ravel_maintain::{
@@ -44,7 +45,7 @@ use ravel_maintain::{
     CompactorConfig, LateWriteReport, MigrateBudget, WorkerSet, background_migrate_unit, certify,
     late_write_pass,
 };
-use ravel_object_store::ObjectStoreBackend;
+use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_types::{Signal, TenantHash};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
@@ -355,12 +356,22 @@ async fn run_background_migrate(
             let Some(family) = part_family(signal) else {
                 continue;
             };
-            if ctx
+            if !ctx
                 .worker
                 .owns_unit(live_set, &tenant, signal, FOLD_UNIT_SHARD)
             {
-                units.push((tenant, signal, family));
+                continue;
             }
+            // A signal the tenant never provisioned has no floor to raise; any
+            // other HEAD failure is left to the unit, which reports it.
+            if let Err(StoreError::NotFound) = ctx
+                .store
+                .head(&provisioning_key(&tenant, signal))
+                .await
+            {
+                continue;
+            }
+            units.push((tenant, signal, family));
         }
     }
     if units.is_empty() {
@@ -1046,6 +1057,55 @@ mod tests {
         ] {
             assert!(!body.contains(name), "{name} rendered outside maintain");
         }
+    }
+
+    /// With `--background-migrate`, a tick runs the background migrate unit
+    /// for each discovered tenant's provisioned signals whose fold unit this
+    /// process owns: the metrics walk raises the unraised floor to the active
+    /// version, and the unprovisioned logs and spans run no unit (one would
+    /// fail on the missing provisioning record every tick). A process that
+    /// owns no fold unit runs none.
+    #[tokio::test]
+    async fn a_tick_runs_background_migrate_for_owned_tenants() {
+        let store = Arc::new(MemoryStore::with_page_size(2));
+        seed_rseg(&store).await;
+        let clock = FixedClock::new(NOW1);
+        let mut ctx = context(store.clone(), &clock);
+        crate::compat::refresh_once(&ctx.view).await;
+        ctx.compactor = Arc::new(CompactorConfig {
+            compat_policy: Some(ravel_maintain::MaintainCompatPolicy::new(
+                ctx.view.clone(),
+                Arc::new(ViewClock(clock.clone())),
+            )),
+            ..CompactorConfig::default()
+        });
+        ctx.background_migrate = Some(BACKGROUND_MIGRATE_BUDGET);
+        assert_eq!(floor(store.as_ref()).await, None);
+
+        let other = Uuid::from_u128(0xfeed);
+        let report = run_tick(&ctx, &[other]).await;
+        assert!(report.migrate.is_empty(), "{report:?}");
+        assert_eq!(report.migrate_error, None);
+        assert_eq!(floor(store.as_ref()).await, None);
+
+        let report = run_tick(&ctx, &[ctx.worker.process_id()]).await;
+        assert_eq!(report.migrate_error, None);
+        let [unit] = report.migrate.as_slice() else {
+            panic!("one provisioned signal, one unit: {report:?}");
+        };
+        assert_eq!(
+            (unit.tenant, unit.signal, unit.family),
+            (tenant(), Signal::Metrics, FAMILY_RSEG)
+        );
+        assert!(
+            matches!(
+                unit.outcome,
+                Ok(BackgroundMigrateOutcome::Walked { ref held, .. }) if held.is_empty()
+            ),
+            "{:?}",
+            unit.outcome
+        );
+        assert_eq!(floor(store.as_ref()).await, Some(V_SEG));
     }
 
     /// A contradicted certificate is never finalization-pending, even with its
