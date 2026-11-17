@@ -1817,6 +1817,42 @@ def cmd_advance_check(args):
             f"state would not measure an advanced tail")
 
 
+def repair_preconditions(catalog, fields):
+    """What a key-index repair of one signal starts from, by its catalog
+    stamp: each declared field's leaf refs over every part, the parts lacking
+    a leaf of some declared field (the repair's parts_unindexed), and the
+    largest such part's entry count (E; null when one of them has no integer
+    entry count, 0 when no part is unindexed)."""
+    parts = catalog.get("parts")
+    if not isinstance(parts, list):
+        raise ValueError("the catalog stamp lists no parts")
+    refs = {f: sum(1 for p in parts for lf in p.get("leaves", []) if lf.get("field") == f) for f in fields}
+    unindexed = [p for p in parts if not set(fields) <= {lf.get("field") for lf in p.get("leaves", [])}]
+    counts = [p.get("entry_count") for p in unindexed]
+    exact = all(isinstance(c, int) and not isinstance(c, bool) for c in counts)
+    return {"fields": list(fields), "leaf_refs": refs, "declared_leaf_refs": sum(refs.values()),
+            "parts": len(parts), "parts_unindexed": len(unindexed),
+            "largest_unindexed_part_entries": max(counts, default=0) if exact else None}
+
+
+def cmd_repair_preconditions(args):
+    """stamps/STATE.LABEL.preconditions.json of one repair_arms arm (README
+    "repair_arms"): repair_preconditions over the state's catalog stamp,
+    beside the arm's budget and the ravel-cli path, SHA-256 and build SHA the
+    repair runs on. Exit 0 once written; 1 when the catalog stamp cannot be
+    read or lists no parts."""
+    try:
+        with open(args.catalog) as f:
+            catalog = json.load(f)
+        doc = repair_preconditions(catalog, args.fields.split(","))
+    except (OSError, ValueError) as e:
+        die(f"repair-preconditions: {args.catalog}: {e}")
+    write_json(args.out, {"state": catalog.get("state"), "tenant": catalog.get("tenant"),
+                          "signal": catalog.get("signal"), "label": catalog.get("label"),
+                          "key_index_build_max_pairs": args.budget, "ravel_cli": args.cli_bin,
+                          "ravel_cli_sha256": args.cli_sha256, "sha": args.sha, **doc})
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd_name", required=True)
@@ -1827,6 +1863,16 @@ def main():
     ac.add_argument("--check-label", default="logs")
     ac.add_argument("--check-field", default="request_id")
     ac.set_defaults(fn=cmd_advance_check)
+
+    rp = sub.add_parser("repair-preconditions")
+    rp.add_argument("--catalog", required=True)
+    rp.add_argument("--fields", required=True, help="the declared fields, comma-separated")
+    rp.add_argument("--budget", type=int, required=True)
+    rp.add_argument("--cli-bin", required=True)
+    rp.add_argument("--cli-sha256", required=True)
+    rp.add_argument("--sha", required=True)
+    rp.add_argument("--out", required=True)
+    rp.set_defaults(fn=cmd_repair_preconditions)
 
     st = sub.add_parser("stamp")
     st.add_argument("--file", required=True)

@@ -329,11 +329,16 @@ its keyIndex GETs at 2 x that count.
 - `day_parts_7`, `day_parts_30` and `retired_hour`: ADR-3939's multi-day
   states, listed only by a run that measures that ADR ("day_parts_N and
   retired_hour" below).
+- `repair_arms`: issue #4347's key-index repair at several pair budgets,
+  one arm per `[repair] budgets` entry, each on a leafless tenant of its
+  own; listed only by a run that measures it ("repair_arms" below). No
+  statement runs in it.
 
 `mixed` is followed by `fold_advance`, `compaction_in_flight` by
 `compaction_done`, `day_parts_N` by `day_parts_N_advance` and
 `retired_hour` by `retired_hour_drop`; each derived state is live exactly
-when its parent is. A
+when its parent is. `repair_arms` stamps the transitions `repair_arms_B`
+and `leaf_rebuild_B` for each budget B; they are not states. A
 state the run lists and does not reach is `not-run` with the reason, and a
 state absent from both the results and the not-run list is a missing figure.
 
@@ -706,6 +711,65 @@ cases under "Tests"), for three reasons:
   `retired_hour.wait_minutes` (20) per step, and then for the next ingest
   hour, once per step.
 
+### repair_arms
+
+Issue #4347 measures `catalog fold --rebuild-key-index` (the repair of a
+tenant whose parts carry no key-index leaf) at two pair budgets, arm A at
+`--key-index-build-max-pairs 8000000` and arm B at 16,000,000, in one
+launch on one binary. The pre-registration is issue #4347 comment
+6931731499; `bands.toml` row `issue4347_repair` (R1) transcribes it.
+
+`run.toml` `[repair] budgets` lists the budgets, one arm each, in that
+order: distinct positive whole numbers. It is read only when `run.states`
+lists `repair_arms`, and run.sh and evaluate.py both refuse such a run
+when it is absent or empty. A run that does not list `repair_arms` runs
+exactly the commands it ran before the key existed, whatever `budgets`
+holds: `rebuild_leaves` passes `--key-index-build-max-pairs` only when it is
+given a budget, and only `repair_arms` gives one
+(`test_repair_budgets_unread_without_repair_arms`). #4347's launch appends
+`repair_arms` to `run.example.toml`'s states; the default list does not
+hold it.
+
+The arm's tenant is `server.tenant` and the budget run together (`invr8000000`
+and `invr16000000`), declared with the base tenant's columns and key index
+in the `declare` step. A repair leaves its tenant indexed, so no two arms
+share one. For each budget B, in order, `state_repair_arms`:
+
+1. checks that the deadline leaves `step_estimate_minutes.repair_arms`
+   (35 in `run.example.toml`, derived there) for the whole arm, and records
+   the state not-run otherwise;
+2. loads the base corpus's spans and logs into the arm's tenant (loads
+   stamped under `repair_arms_B`);
+3. folds both signals with `--writers-stopped` and the leaf-off flag, as
+   `folded_no_leaves` does, stamped as transition `repair_arms_B` (the
+   evaluator's leaf-off check covers it);
+4. stamps the census and the catalog, object and tenant stamps under
+   `repair_arms_B`;
+5. writes `stamps/repair_arms_B.SIG.preconditions.json` per signal
+   (`inv.py repair-preconditions`, from the catalog stamp): each declared
+   field's leaf refs, the parts lacking a leaf of a declared field, the
+   largest such part's entry count E (null when one has no integer entry
+   count), the budget, and the ravel-cli path, SHA-256 and build SHA the
+   repair runs on;
+6. runs `catalog fold --rebuild-key-index --json
+   --key-index-build-max-pairs B` once per signal, each a fresh ravel-cli
+   process under `inv.py measure`, stamped in `folds.jsonl` as transition
+   `leaf_rebuild_B` with the `--json` report and the measure (wall, CPU,
+   peak RSS);
+7. stamps transition `leaf_rebuild_B`.
+
+After the last arm it stamps transition `repair_arms`. A failed command
+fails the state, as in any other state.
+
+R1's figures read each arm's preconditions stamp (`stamp.preconditions`,
+transition `repair_arms_B`) and its repair's report and measure
+(`fold.<tenant>.<signal>.<field>`, transition `leaf_rebuild_B`), including
+nested report keys such as `passes_per_field.request_id`. A figure absent
+from the report, or a fold stamp present twice, is `missing` or
+`duplicate` and fails the run, never a 0. Peak RSS and wall are timing
+figures, judged on the s3 lane only. Two derived figures compare the arms:
+section bytes per pass within 1% and leaf bytes within 2%.
+
 ### Placeholders
 
 A statement's SQL names planted keys as `{placeholders}`, filled from
@@ -744,8 +808,10 @@ records what the warmup loaded.
 `memory_budget_bytes`, `extra_flags`), `[hits]`, `[many_parts]`
 (`traces_per_hour`, `snapshot_part_max_entries`), `[day_parts]`
 (`traces_per_day_7`, `traces_per_day_30`), `[retired_hour]` (`c1_sha`,
-`r2_sha`, `maintain_interval_secs`, `wait_minutes`), `[prices]` and
-`[cost]`.
+`r2_sha`, `maintain_interval_secs`, `wait_minutes`), `[repair]`
+(`budgets`, read only when `run.states` lists `repair_arms`; "repair_arms"
+above), `[step_estimate_minutes]` (`default` and per state, `repair_arms`
+per arm), `[prices]` and `[cost]`.
 
 `[day_parts]` is read only when `run.states` lists a `day_parts_N` state.
 The 7-day rate defaults to 19,999,992 traces a day, which is 24 x 833,333:
@@ -815,6 +881,7 @@ reports `missing stamps/<name>` for any it needs and does not find;
 | `STATE.logs.fold_binary.json` | `retired_hour` and each `day_parts_N`: the fold binary's `sha`, run.toml's `c1_sha` and `r2_sha` resolved, and `carries_c1` and `carries_r2` by git ancestry |
 | `STATE.logs.fold_watermark.json` | `retired_hour` and `retired_hour_drop`: the retention fold's `previous_watermark_hour` and `watermark_hour` from its `--json` report, `no_op`, and `advanced`; the state fails when it is false |
 | `STATE.logs.tombstone.json` | `retired_hour` and `retired_hour_drop`: the tombstoned `hour` (D0) and `first_hour` to `last_hour` in unix hours, the retention window and the tombstone-check output |
+| `repair_arms_B.SIG.preconditions.json` | `repair_arms`, per arm and signal, before the repair: the declared `fields`, their `leaf_refs` and `declared_leaf_refs`, `parts`, `parts_unindexed`, `largest_unindexed_part_entries` (E), `key_index_build_max_pairs`, and the `ravel_cli` path, `ravel_cli_sha256` and `sha` the repair runs on |
 | `needle_blocks.json` | the logs needles' block counts as `rlog inspect` reads them, beside the generator's |
 | `compaction.jsonl`, `erasure.jsonl`, `not_run.jsonl` | the compaction child's reports, the erase submit and status, and each state recorded not-run |
 | `failed_states.jsonl` | each state a failed command stopped: the step, the command's exit code and the `out/logs/` path of its log |
@@ -911,8 +978,13 @@ tries; `<m>` from the call's stats phases and members, such as `total_gets`,
 buckets), `stamp.slices.<label>.<field>` (the most leaves one part carries
 for the field), `leaf_share.<label>.<field>`,
 `census.<tenant>.<signal>.objects|bytes|objects_over_512k`,
-`fold.<tenant>.<label>.<field>`, `truth.<path>` (an integer `truth.json`
-holds), and `derived` figures over those. A stamp field the inspector did
+`stamp.preconditions.<label>.<field>` (a `repair_arms` arm's
+preconditions stamp, the band's `transition` naming the arm),
+`fold.<tenant>.<label>.<field>` (a dotted field such as
+`passes_per_field.request_id` is that key of the report's map, `missing`
+when the map lacks it; `peak_rss_bytes` and `wall_s` are the fold stamp's
+measure), `truth.<path>` (an integer `truth.json` holds), and `derived`
+figures over those. A stamp field the inspector did
 not print is `missing`, never 0.
 
 Some bands, as transcribed:
@@ -1812,6 +1884,53 @@ the file and line it changes):
 - `test_new_states_dry_run_plan`: the s3 lane's dry run with all three
   states listed, every step pinned in order. Wrong version: the drop
   retiring through hour 22 ("the drop leaving the day's last hour").
+
+`repair_arms` and row R1 have cases of their own, over canned repair
+reports in `fixtures/repair-arms/` (arm A and B, logs and spans, the
+pretty `--json` report after a line of other output, as ravel-cli prints
+it), each with the wrong versions it must reject:
+
+- `test_repair_arms_pass`: both arms in band on the s3 lane, all 74 R1
+  figures pass, nested keys (`passes_per_field.request_id` 26 and 13,
+  `field_pairs.request_id` 100,000,000) and the measure's peak RSS and wall
+  read exactly. Wrong version: the measure's wall read from the report
+  ("the measure stamp's wall read from the report").
+- `test_repair_arms_out_of_band`: arm B at 15 request_id passes misses and
+  the run exits 1. Wrong band: B's request_id passes allowed 15.
+- `test_repair_arms_absent`: a report without `passes_per_field.request_id`
+  or `attempt_count` is `missing` naming the fold and field. Wrong
+  versions: an absent nested key, or an absent field, read as 0.
+- `test_repair_arms_twice`: arm B's spans repair stamped twice is the
+  problem `duplicate stamps/folds.jsonl` and its figures `duplicate`, the
+  other arm still judged. Wrong version: a fold stamped twice read as 0.
+- `test_repair_arms_cross_arm`: arm ratios of 1.005 and 1.015 pass, 1.015
+  and 1.03 miss both derived figures while every per-arm figure passes.
+  Wrong bands: the per-pass section bytes compared at 2% and the leaf
+  bytes at 5%.
+- `test_repair_arms_slow_arm_misses` (2.1 GB peak RSS and 701 s wall on
+  arm A's logs miss), `test_repair_arms_timing_judged_on_s3_only`,
+  `test_repair_arms_budgets_required` (absent, empty and repeated budgets
+  are a problem and no arm stamp is asked for) and
+  `test_repair_arms_not_listed` (the row not requested, no problem).
+- `test_repair_budgets_unread_without_repair_arms`: with `repair_arms`
+  not listed, the s3 dry run is identical with `run.example.toml`'s
+  budgets, with none and with `[]`, every rebuild line ends
+  `--rebuild-key-index --json`, and no arm tenant appears. Wrong version:
+  every rebuild given a pair budget.
+- `test_repair_arms_dry_run_plan`: the s3 dry run with `repair_arms`
+  listed, both arms' steps pinned in order, on their own tenants, the
+  budget on the four repair lines only. Wrong versions: the repair at the
+  default budget, both arms on the run's tenant, the fold and repair on the
+  base tenant, the preconditions stamped after the repair, the arm folded
+  with leaves.
+- `test_repair_budgets_refused_by_load_config`: absent, empty, repeated,
+  zero and non-integer budgets each refused with the key named.
+- `test_repair_preconditions`: `inv.py repair-preconditions` counts a part
+  carrying one of two declared fields' leaves as unindexed, takes E over
+  the unindexed parts, reads E null when one lacks an entry count, and
+  exits 1 writing nothing on an unreadable catalog stamp. Wrong versions: a
+  part with one declared field's leaf taken as indexed, a part without an
+  entry count left out of E.
 
 The box scripts target bash 3.2 as well as 5: run
 `/path/to/bash-3.2 benchmarks/investigations/investigations.test.sh` and

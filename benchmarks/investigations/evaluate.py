@@ -78,6 +78,11 @@ REFOLDS = {"day_parts_7_refold": "day_parts_7", "retired_hour_refold": "retired_
 # dp7's oldest sealed day (box/run.sh state_day_parts, state_retired_hour).
 MULTI_DAY_STATES = ("day_parts_7", "day_parts_30", "retired_hour")
 DAY_PARTS_TENANTS = {"day_parts_7": "dp7", "day_parts_30": "dp30"}
+# Issue #4347's key-index repair at several pair budgets (box/run.sh
+# state_repair_arms): one arm per run.toml repair.budgets entry B, on its own
+# tenant (repair_tenant), stamped as transitions repair_arms_B (the leaf-off
+# fold) and leaf_rebuild_B (the repair). No statement runs in it.
+REPAIR_STATE = "repair_arms"
 # The states run.sh plans --temp prefold calls in: each statement sent
 # against the loaded tenant before its fold.
 PREFOLD_STATES = ("day_parts_7", "day_parts_30")
@@ -85,7 +90,7 @@ INFLIGHT_STATES = ("compaction_in_flight",)
 SIGNALS = ("spans", "logs")
 # The fold transitions box/run.sh runs with the leaf-off flag
 # (stamps/fold_flags.json folds), each meant to build no key-index leaf.
-LEAF_OFF_FOLD = re.compile(r"folded_no_leaves|many_parts_[1-9][0-9]*")
+LEAF_OFF_FOLD = re.compile(r"folded_no_leaves|many_parts_[1-9][0-9]*|repair_arms_[1-9][0-9]*")
 
 # The only stats fields this build does not report. A successful call lacking
 # one of them reads unsupported-on-this-build; lacking anything else, missing.
@@ -253,7 +258,16 @@ def load_cfg(run_dir, problems):
         "tenant": doc.get("server", {}).get("tenant", "inv"),
         "prices": doc.get("prices", {}),
         "cost": doc.get("cost", {}),
+        "budgets": [],
     }
+    if REPAIR_STATE in cfg["states"]:
+        budgets = doc.get("repair", {}).get("budgets")
+        if (not isinstance(budgets, list) or not budgets or len(set(budgets)) != len(budgets)
+                or any(isinstance(b, bool) or not isinstance(b, int) or b < 1 for b in budgets)):
+            problems.add("missing", "run.toml repair.budgets (distinct positive pair budgets, one per "
+                                    "repair_arms arm)")
+        else:
+            cfg["budgets"] = budgets
     for k in ("lane", "cold_runs"):
         if cfg[k] is None:
             problems.add("missing", f"run.toml run.{k}")
@@ -320,6 +334,11 @@ def tenant_of(state, label, cfg):
     if base in DAY_PARTS_TENANTS:
         return DAY_PARTS_TENANTS[base]
     return "hits" if label == "hits" else cfg["tenant"]
+
+
+def repair_tenant(cfg, budget):
+    """The repair_arms arm's tenant at BUDGET (box/run.sh repair_tenant)."""
+    return f"{cfg['tenant']}r{budget}"
 
 
 def labels_of(state, cfg):
@@ -1005,6 +1024,8 @@ def required_stamps(run_dir, cfg, live, problems):
     erasure = jsonl("erasure.jsonl", ()) if live.get("erasure_in_flight") is None else {}
     on = [s for s, r in sorted(live.items()) if r is None]
     tenant = cfg["tenant"]
+    # repair_arms's arms, each stamped under its own transitions and tenant.
+    arms = cfg["budgets"] if REPAIR_STATE in on else []
 
     want_loads = [("base", tenant, s) for s in SIGNALS]
     if "mixed" in on:
@@ -1017,6 +1038,7 @@ def required_stamps(run_dir, cfg, live, problems):
             want_loads += [(s, tenant_of(s, lab, cfg), lab) for lab in labels_of(s, cfg)]
         if f"{s}_advance" in on:
             want_loads += [(f"{s}_tail", tenant_of(s, lab, cfg), lab) for lab in labels_of(s, cfg)]
+    want_loads += [(f"{REPAIR_STATE}_{b}", repair_tenant(cfg, b), s) for b in arms for s in SIGNALS]
     for k in want_loads:
         line = loads.get(k, "absent")
         if line == "absent":
@@ -1047,6 +1069,8 @@ def required_stamps(run_dir, cfg, live, problems):
                        "retired_hour_drop_refold"):
         if REFOLDS.get(transition, transition) in on:
             want_folds += [(transition, tenant_of(transition, lab, cfg), lab) for lab in labels_of(transition, cfg)]
+    want_folds += [(f"{transition}_{b}", repair_tenant(cfg, b), lab) for b in arms
+                   for transition in (REPAIR_STATE, "leaf_rebuild") for lab in SIGNALS]
     for k in want_folds:
         line = folds.get(k, "absent")
         if line == "absent":
@@ -1076,7 +1100,7 @@ def required_stamps(run_dir, cfg, live, problems):
 
     st = Stamps(run_dir)
     for s in on:
-        if s != "compaction_in_flight":
+        if s not in ("compaction_in_flight", REPAIR_STATE):
             if (s,) not in census:
                 problems.add("missing", f"stamps/census.jsonl {s}")
             for lab in labels_of(s, cfg):
@@ -1086,6 +1110,19 @@ def required_stamps(run_dir, cfg, live, problems):
                 problems.add("missing", f"stamps/{s}.server.json")
         if (s,) not in transitions:
             problems.add("missing", f"stamps/transitions.jsonl {s}")
+    for b in arms:
+        arm = f"{REPAIR_STATE}_{b}"
+        if (arm,) not in census:
+            problems.add("missing", f"stamps/census.jsonl {arm}")
+        for lab in SIGNALS:
+            for kind in ("catalog", "preconditions"):
+                if st.doc(arm, lab, kind) is None:
+                    problems.add("missing", f"stamps/{arm}.{lab}.{kind}.json")
+        if not os.path.exists(os.path.join(stamps, f"{arm}.server.json")):
+            problems.add("missing", f"stamps/{arm}.server.json")
+        for transition in (arm, f"leaf_rebuild_{b}"):
+            if (transition,) not in transitions:
+                problems.add("missing", f"stamps/transitions.jsonl {transition}")
     return docs, loads, folds, census, restarts, st, compaction
 
 
@@ -1279,6 +1316,18 @@ def stamp_figure(stamps, census, cfg, state, metric):
         if not any(counts):
             return "missing", None, f"stamps/{state}.{label}.catalog.json names no {field} leaf"
         return "value", max(counts), ""
+    if what == "preconditions":
+        # stamp.preconditions.<label>.<field>: a repair_arms arm's
+        # stamps/STATE.LABEL.preconditions.json, STATE the arm's
+        # repair_arms_B transition.
+        label, _, field = label.partition(".")
+        doc = stamps.doc(state, label, "preconditions")
+        name = f"stamps/{state}.{label}.preconditions.json"
+        if doc is None:
+            return "missing", None, f"no {name}"
+        if doc.get(field) is None:
+            return "missing", None, f"{name} has no {field}"
+        return "value", doc[field], ""
     if what == "footer_len":
         doc = stamps.doc(state, label, "object")
         if doc is None:
@@ -1403,9 +1452,14 @@ def drop_parts_holding_hour(stamps, state, label):
 
 
 def fold_field(report, field):
+    """A report field by FOLD_FIELDS name; a dotted one (passes_per_field.request_id) is that key of the
+    report's map, None when the map lacks it."""
     for name in FOLD_FIELDS.get(field, (field,)):
         if name in report:
             return report[name]
+    head, dot, key = field.partition(".")
+    if dot and isinstance(report.get(head), dict):
+        return report[head].get(key)
     return None
 
 
@@ -1447,8 +1501,8 @@ def fold_figure(folds, transition, tenant, label, field):
         return "duplicate", None, f"two fold stamps for {transition}/{tenant}/{label}"
     if field in ("key_index_g_low", "key_index_g_high"):
         return fold_g(line.get("report") or {}, f"{transition}/{tenant}/{label}", field.rsplit("_", 1)[1])
-    if field == "peak_rss_bytes":
-        v = (line.get("measure") or {}).get("peak_rss_bytes")
+    if field in ("peak_rss_bytes", "wall_s"):
+        v = (line.get("measure") or {}).get(field)
         return ("value", v, "") if v is not None else ("missing", None, "fold stamp has no measure")
     v = fold_field(line.get("report") or {}, field)
     if v is None:
@@ -1554,7 +1608,7 @@ def day_part_bound(s, factor=1):
 
 
 EXPR_BUILTINS = {"min": min, "max": max, "day_part_bound": day_part_bound, "isinstance": isinstance, "str": str,
-                 "len": len}
+                 "int": int, "len": len}
 
 
 def evaluate_expr(expr, v, m):
@@ -1580,6 +1634,8 @@ def derived_value(expr, figures_by_id, cycle=()):
         if ref["status"] in PASSED_ON:
             return ref["status"], None, f"{e.args[0]} is {ref['status']}: {ref['reason']}"
         return "missing", None, f"{e.args[0]} has no value ({ref['status']})"
+    except ZeroDivisionError:
+        return "missing", None, "divides by a figure whose value is 0"
     return "value", rnd(v), ""
 
 
@@ -1663,7 +1719,7 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
                 if gap:
                     entry["not_requested"] = gap
         elif metric.startswith(("stamp.", "leaf_share.", "census.")):
-            status, value, why = stamp_figure(stamps, census, cfg, fig["state"], metric)
+            status, value, why = stamp_figure(stamps, census, cfg, fig.get("transition", fig["state"]), metric)
             if status == "not-run":
                 # A build the row is not measured on: not asked of this run.
                 entry["gated"] = True
@@ -2080,7 +2136,8 @@ def main(argv):
     for state, line in failed.items():
         not_run[state] = failed_reason(line)
     query_states = sorted({s for st in statements.values() for s in st.get("states", [])})
-    all_states = sorted(set(query_states) | set(DERIVED) | set(MULTI_DAY_STATES) | set(cfg["states"]))
+    all_states = sorted(set(query_states) | set(DERIVED) | set(MULTI_DAY_STATES) | {REPAIR_STATE}
+                        | set(cfg["states"]))
     live = live_states(cfg, not_run, all_states)
 
     calls = Calls(calls_raw, problems, statements)

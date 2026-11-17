@@ -1,0 +1,51 @@
+{
+  "store": "s3 bucket ravel-inv",
+  "signal": "spans",
+  "largest_unindexed_part_entries": 40,
+  "fields": [
+    "trace_id"
+  ],
+  "parts_unindexed": 1,
+  "parts_with_refused_leaves": 0,
+  "leaf_prefix_gets": 0,
+  "leaf_prefix_bytes_read": 0,
+  "parts_rebuilt": 1,
+  "parts_deferred": 0,
+  "leaves_written": 2,
+  "leaf_bytes_written": 201000000,
+  "section_bytes_read": 17655360,
+  "ranged_gets": 160,
+  "footer_phase_ranged_gets": 80,
+  "footer_phase_bytes_read": 655360,
+  "section_phase_ranged_gets": 80,
+  "section_phase_bytes_read": 17000000,
+  "key_index_build_max_pairs": 16000000,
+  "passes": 2,
+  "passes_per_field": {
+    "trace_id": 2
+  },
+  "sections_read": 80,
+  "field_pairs": {
+    "trace_id": 20000000
+  },
+  "uncovered_entries": 0,
+  "parts_over_cap": 0,
+  "parts_erasure_gated": 0,
+  "erasure_list_requests": 0,
+  "erasure_get_requests": 0,
+  "attempt_count": 1,
+  "attempts": [
+    {
+      "parts": 1,
+      "part_gets": 1,
+      "ranged_gets": 160,
+      "footer_phase_ranged_gets": 80,
+      "section_phase_ranged_gets": 80,
+      "passes": 2,
+      "sections_read": 80,
+      "leaf_puts": 2,
+      "head_cas_tries": 1,
+      "parts_published": 1
+    }
+  ]
+}
