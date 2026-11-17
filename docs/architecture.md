@@ -137,6 +137,81 @@ The cost of disposability is that every durable step is a network round trip.
 The floor on visibility latency is object-store latency, and request count is
 a bill ([guides/cost-model.md](guides/cost-model.md)).
 
+### Startup store reads
+
+Before any listener binds, a server reads the store to check that it may
+start: `sys/qualification`, the retired-reader gate's reads, `sys/tenancy`,
+the key-epoch records of the tenants in `--tenant-kms-config`, the
+`shard_count` provisioning records of the statically known tenants, and
+`sys/gc`. `start` then reads the `sys/ipcrypt/policy` marker in the `all` and
+`gateway` modes. Each of these reads refuses to start when its answer is
+wrong.
+
+The retired-reader gate (ADR-4233 decision 7) runs in every mode, after the
+bucket-protection read and before `sys/tenancy` is pinned, because pinning
+writes `sys/tenancy` on a fresh store and the gate tells a fresh store from
+an unadopted one by that marker's absence. It reads `sys/compat` and, when
+that is absent, `sys/tenancy`. A build that retires no reader, which is
+every build today, sends no request here.
+
+A transient store error does not count as a wrong answer. A transient store
+error is a store error that `StoreError::is_retryable` accepts: `Transient`,
+`Timeout` or `Throttled`. The S3 adapter maps a refused or dropped connection
+to `Transient`, a request timeout to `Timeout`, and a 429 or 503 answer to
+`Throttled`. A read that fails with one is retried. The wait between attempts
+doubles from 100 ms to a 2 s cap, and jitter draws each wait between half and
+all of that step. Each retry logs one warning that names the read, the
+attempt number and the error.
+
+`--startup-store-deadline` (default `15s`) is measured from process start and
+shared by every read. It bounds the retries and each retry, not a read's
+first attempt. A first attempt runs until it answers or the store's own
+request timeout and retries give up, so a slow but healthy store still
+starts. Each retry runs for at most the time left before the deadline or 5 s
+(`MIN_STARTUP_ATTEMPT`), whichever is longer, so a healthy retry that starts
+just before the deadline is not cut off. A retry still running at the end of
+its bound is cut off, counts as one attempt, and refuses to start with an
+error that names the read and the bound. No retry starts once its wait would
+reach the deadline; the transient failure then refuses to start, and the
+error names the read and the number of attempts. A first attempt that fails
+transiently after the deadline has passed therefore refuses at once. A read
+whose first attempt fails transiently before the deadline refuses by the
+deadline plus 5 s, 20 s with the default; a first attempt that hangs ends
+only when the store gives up on it. The other work before a listener binds
+(the bucket-protection read, the format-window check, the read-cache
+warm-up) has its own bounds, and the sum can outlast the operator's liveness
+probe;
+[the deployment guide](guides/operations/deployment.md#startup-time-before-the-listener-binds)
+gives the budget and the probe settings it needs. `0s` turns retry and the
+retry bound off.
+
+Any other error refuses at once, with the same message as before retry
+existed. Examples are an absent or stale qualification record, a corrupt
+marker, a scheme, key or policy mismatch, pre-ADR data that the configured
+`--shards` would hide, a refused credential, and every retired-reader gate
+refusal: a family with no certificate or one below the oldest version the
+build reads, a contradicted certificate, a late-write watermark not past the
+census, `sys/compat` present with no deployment key to authenticate it, and
+`sys/tenancy` present without `sys/compat`. A transient store error inside
+the gate, on its HEADs or on the `sys/compat` read, retries like any other. A marker or record that the
+server creates during these reads is written create-if-absent or under
+compare-and-swap, and every retry starts again from the read. So a write
+that landed before an ambiguous failure reads back as present on the next
+attempt. That read does not repeat the log line or counter of an adoption,
+because it cannot tell its own write from a concurrent process's.
+
+Other store requests made before a listener binds do not retry. The Azure
+store construction request refuses on its first error, as before. The
+`--require-bucket-protection` read never refuses on a read error: a failed or
+timed-out read leaves its conditions unknown, which warns and starts. A
+failed `--format-window-check` read refuses under `--format-window-check
+refuse` and warns and starts under `warn`. The last two have bounds of their
+own.
+
+`/readyz` is never ready during a retry. The main listener binds only after
+every read has passed. The `--listen-health` listener, when it is set, binds
+after `sys/gc` and answers 503 until `start` returns.
+
 ### Health and readiness routes
 
 Two HTTP routes exist on every mode so that an orchestrator can act on this

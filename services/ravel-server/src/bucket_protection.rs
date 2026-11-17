@@ -24,15 +24,14 @@
 //! - An unknown condition (no API for the call, an access denial, or a
 //!   response the reader cannot parse) never refuses: it logs one warning and
 //!   raises the `ravel_bucket_protection_unknown` gauge.
-//! - The bucket-configuration read is bounded by [`STARTUP_DEADLINE`]. A read
-//!   that has not finished by then makes every checked condition unknown, so
-//!   control-plane GETs that stall warn and start instead of holding startup,
-//!   together with the read-cache warm-up's own bound, past the operator's
-//!   earliest liveness restart. The bound covers this read
-//!   only: the `sys/qualification` read that runs before it goes through the
-//!   retrying store path and is bounded only by the store's own request
-//!   timeout and retries, so an endpoint that stalls every request holds
-//!   startup there first.
+//! - The bucket-configuration read is bounded by [`STARTUP_DEADLINE`] and is
+//!   not retried. A read that has not finished by then makes every checked
+//!   condition unknown, so control-plane GETs that stall warn and start
+//!   instead of holding startup indefinitely. The bound covers this read
+//!   only: the `sys/qualification` read that runs before it goes through
+//!   [`crate::startup_retry`], whose first attempt is bounded only by the
+//!   store's own request timeout and retries, so an endpoint that stalls every
+//!   request holds startup there first.
 //!
 //! Each check sets three gauges: `ravel_bucket_protection_conditions_failed`
 //! and `ravel_bucket_protection_conditions_unknown` count the checked
@@ -67,14 +66,15 @@ use ravel_object_store::conformance::{
 };
 use ravel_object_store::s3::S3Store;
 
-/// Bound on the whole startup read of the protection report. Its GETs run
-/// before any listener binds, one after another, each bounded only by the
-/// store's request timeout (20 s by default). The operator's liveness probe
-/// restarts a pod on its third consecutive failure, which lands between about
-/// 25 s and 35 s after the pod starts depending on the probe's tick phase.
-/// The read-cache warm-up also runs before the main HTTP listener binds and
-/// is bounded by its own 10 s, so 10 s here leaves at least 5 s of the
-/// earliest restart for the rest of startup.
+/// Bound on the whole startup read of the protection report, which is not
+/// retried. Its GETs run before any listener binds, one after another, each
+/// bounded only by the store's request timeout (20 s by default). The time
+/// passes on the same clock as `--startup-store-deadline`, measured from
+/// process start, so it also shortens the deadline left for the startup store
+/// reads after it. This bound, the startup store reads' retries (up to the
+/// deadline plus 5 s) and the read-cache warm-up's 10 s can together outlast
+/// the operator's earliest liveness restart at 25 s; the deployment guide
+/// gives the budget and the probe settings that cover it.
 pub const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Count of checked conditions the last [`enforce`] call observed failed.

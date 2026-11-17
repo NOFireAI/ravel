@@ -86,6 +86,48 @@ two cases, and each case has its own named error:
 No server process creates the qualification record, and no option skips the
 check. `--store memory` is exempt and never needs qualification.
 
+A transient store error on this read is not a refusal. A transient store
+error is a timeout, a throttle (a 429 or 503 answer) or another error the
+store marks retryable, such as a dropped connection. The server retries it,
+like every other store read that startup refuses on, and logs one warning
+per retry. `--startup-store-deadline` (default `15s`, measured from process
+start) bounds the retries, not a read's first attempt. The first attempt runs
+until it answers or the store's own request timeout (20 s by default) and
+retries give up, so a slow but healthy store still starts. Each retry runs
+for at most the time left before the deadline or 5 s, whichever is longer;
+one still running then is cut off and refuses, naming the read and the bound.
+No retry starts once its wait would reach the deadline; the server then
+refuses, naming the read and the number of attempts. A first attempt that
+fails transiently after the deadline therefore refuses at once. So a read
+whose first attempt fails transiently before the deadline refuses by the
+deadline plus 5 s, 20 s with the default, and a first attempt that hangs
+ends only when the store gives up on it. These reads are not the only work
+before the listener binds; see
+[Startup time before the listener binds](#startup-time-before-the-listener-binds)
+for the whole budget and the probe settings it needs. `0s` turns retry and
+the retry bound off. Any other error, such as an absent or stale record,
+refuses at once.
+
+The retry covers the reads that
+[Startup store reads](../../architecture.md#startup-store-reads) lists:
+`sys/qualification`, the retired-reader gate's reads of `sys/compat` and
+`sys/tenancy` (see
+[Retired-reader startup gate](maintenance.md#retired-reader-startup-gate); a
+build that retires no reader, which is every build today, sends none),
+`sys/tenancy`, the `--tenant-kms-config`
+key-epoch records, the `shard_count` provisioning records, `sys/gc` and the
+`sys/ipcrypt/policy` marker. A retired-reader gate refusal, such as a family
+with no current certificate, a contradicted certificate, a late-write
+watermark not past the census, or `sys/tenancy` present without
+`sys/compat`, refuses on the first attempt; only a transient store error
+inside the gate retries. It does not cover the Azure store construction
+request, the `--require-bucket-protection` read or the
+`--format-window-check` reads, and none of those retries. The Azure request
+refuses on its first error. The bucket-protection read never refuses on a
+read error: a failed or timed-out read leaves its conditions unknown, which
+warns and starts. A failed format-window read refuses under
+`--format-window-check refuse` and warns and starts under `warn`.
+
 While the suite runs, `store qualify` also writes scratch objects under
 `sys/qualify/<run-id>/`. The suite leaves them in place. Each of the two
 listing probes writes two keys more than the declared page size. A run at the
@@ -293,21 +335,43 @@ The server has no expected `E_v`, so it does not compare a covering rule's
 `ravel-cli store verify-protection --expected-noncurrent-days` checks the
 value.
 
-The bucket-configuration read is bounded to 10 seconds:
+The bucket-configuration read is bounded to 10 seconds. A read that is not
+complete at the bound leaves every condition unknown, which warns and starts.
+The bound covers the three configuration GETs only, and the read is not
+retried. An endpoint that stalls every request holds startup at the
+`sys/qualification` read before it instead; see below.
 
-- The Kubernetes operator's liveness probe restarts a pod on its third
-  consecutive failure, between about 25 and 35 seconds after the pod starts.
-- The read-cache warm-up also runs before the main HTTP listener binds, and
-  has its own bound of 10 seconds. The two bounds together leave at least 5
-  seconds for the rest of startup.
-- A read that is not complete at the bound leaves every condition unknown,
-  which warns and starts.
-- The bound covers the bucket-configuration read only. The
-  `sys/qualification` read runs before it, on the store's ordinary retrying
-  path. Only the store's own request timeout and retries bound that read.
-- An endpoint that stalls every request holds startup at the
-  `sys/qualification` read, where the liveness probe can restart the pod. The
-  bound helps when only the three configuration GETs stall.
+#### Startup time before the listener binds
+
+The Kubernetes operator gives a ravel-server pod a liveness probe on
+`/healthz` with `initialDelaySeconds: 5`, `periodSeconds: 10` and
+`failureThreshold: 3`, and no startup probe, so the kubelet can restart the
+pod as early as 25 s after the container starts. The probe fails until the
+listener it targets binds. With `spec.probes.dedicatedHealthPort: true`, the
+CRD's default for a new cluster, that is the `--listen-health` listener;
+with `false` it is the main HTTP listener. These phases run one after
+another before a listener binds:
+
+| Phase | Bound | Before `--listen-health` binds |
+|---|---|---|
+| The startup store reads `sys/qualification`, the retired-reader gate's reads (none while the build retires no reader), `sys/tenancy`, the key-epoch records, the provisioning records and `sys/gc` | A first attempt is not bounded by the server; the store's own request timeout (20 s by default) and retries end it. Once a read has failed transiently, its retries end by the `--startup-store-deadline` plus 5 s, 20 s from process start with the default. | Yes |
+| The bucket-protection read (`--require-bucket-protection`, off by default), right after `sys/qualification` | 10 s, not retried. The deadline is measured from process start, so this time also uses up the deadline left for the reads after it. | Yes |
+| The format-window check (`--format-window-check`, off by default) | `--format-window-check-timeout`, 20 s by default. | Yes |
+| The `sys/ipcrypt/policy` read | As the other startup store reads. | No |
+| The read-cache warm-up (the read cache is on by default) | 10 s. | No |
+
+The bounds do not fit inside the liveness probe's 25 s. A store read that
+fails once and succeeds on a retry just before 20 s, followed by the
+bucket-protection read, binds the `--listen-health` listener at about 30 s,
+and at about 50 s with the format-window check on. The main HTTP listener
+also waits for the warm-up, so about 40 s and 60 s. A first attempt against
+a store that hangs adds up to the store's own timeout and retries on top.
+None of these phases has an overall bound, so the probe has to allow for
+the sum. In a pod spec you control, add a startup probe on `/healthz` whose
+`failureThreshold` times `periodSeconds` covers the sum for the flags you
+set, for example `periodSeconds: 10` and `failureThreshold: 6` for 60 s, or
+raise the liveness probe's `initialDelaySeconds` so that it plus two periods
+exceeds the sum. The Kubernetes operator sets neither today.
 
 The check sets `ravel_bucket_protection_conditions_failed`,
 `ravel_bucket_protection_conditions_unknown` and
