@@ -128,17 +128,37 @@ pub async fn publish_record_with_conservation(
     start_ns: i64,
     conservation: impl ConservationPredicate,
 ) -> Result<PublishOutcome> {
-    let mut identities: Vec<CompactionInputIdentity> = inputs
-        .iter()
-        .map(|i| CompactionInputIdentity {
-            writer_id: i.record.writer_id.clone(),
-            writer_epoch: i.record.writer_epoch,
-            writer_seq: i.record.writer_seq,
-        })
-        .collect();
-    if ravel_invariant::inv_mutant!("catalog/compaction-swaps-record") {
-        swap_one_identity(&mut identities);
-    }
+    publish_identities_with_conservation(
+        store,
+        config,
+        clock,
+        bucket,
+        inputs,
+        input_identities(inputs),
+        input_set_hash,
+        parts,
+        start_ns,
+        conservation,
+    )
+    .await
+}
+
+/// [`publish_record_with_conservation`] with the record's input identities
+/// given: `identities` is what the record names, one per entry of `inputs`,
+/// whose sample counts the parts must conserve.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish_identities_with_conservation(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    clock: &dyn Clock,
+    bucket: &Bucket,
+    inputs: &[InputRecord],
+    identities: Vec<CompactionInputIdentity>,
+    input_set_hash: &[u8; 32],
+    parts: &[BuiltPart],
+    start_ns: i64,
+    conservation: impl ConservationPredicate,
+) -> Result<PublishOutcome> {
     publish_compaction_record(
         store,
         config,
@@ -386,18 +406,26 @@ async fn verify_already_existed_parts(
     Ok(())
 }
 
-/// The `catalog/compaction-swaps-record` mutant: the last identity becomes one
-/// no input carries, under the same writer. The identity count and every
-/// sample count are unchanged, so the counts-only conservation gate passes.
-fn swap_one_identity(identities: &mut [CompactionInputIdentity]) {
-    let spare_seq = identities
+/// The identity of each input, in input order: what a version 1 record names
+/// and its `input_set_hash` covers.
+pub(crate) fn input_identities(inputs: &[InputRecord]) -> Vec<CompactionInputIdentity> {
+    inputs
         .iter()
-        .map(|i| i.writer_seq)
-        .max()
-        .unwrap_or(0)
-        .wrapping_add(1);
+        .map(|i| CompactionInputIdentity {
+            writer_id: i.record.writer_id.clone(),
+            writer_epoch: i.record.writer_epoch,
+            writer_seq: i.record.writer_seq,
+        })
+        .collect()
+}
+
+/// The `catalog/compaction-swaps-record` mutant: the last identity moves to
+/// the max UUID, a writer id no writer is issued (`ravel_commit::rng` hands
+/// writers version 4 UUIDs). It still sorts last, so the list stays in
+/// canonical order.
+pub(crate) fn swap_one_identity(identities: &mut [CompactionInputIdentity]) {
     if let Some(last) = identities.last_mut() {
-        last.writer_seq = spare_seq;
+        last.writer_id = uuid::Uuid::max().to_string();
     }
 }
 
@@ -937,28 +965,6 @@ pub(crate) mod tests {
     async fn a_published_record_names_exactly_its_inputs() {
         let (identities, record) = publish_and_read_record().await;
         assert_eq!(record.inputs, identities);
-    }
-
-    /// The mutant passes the counts-only gate: the record names as many
-    /// identities as there are inputs and its parts carry the inputs' 17
-    /// records, but one identity is not an input's. The property it breaks,
-    /// that compaction preserves the acked multiset, is the
-    /// catalog-maintenance driver's.
-    #[tokio::test]
-    async fn mutant_compaction_swaps_record_keeps_counts_and_changes_identities() {
-        let Some(_mutant) = scoped_mutant("catalog/compaction-swaps-record") else {
-            return;
-        };
-        let (identities, record) = publish_and_read_record().await;
-        assert_eq!(record.inputs.len(), identities.len());
-        assert_eq!(record.parts.iter().map(|p| p.sample_count).sum::<u64>(), 17);
-        assert_eq!(record.inputs[0], identities[0]);
-        assert_ne!(record.inputs[1], identities[1]);
-        assert!(
-            !identities.contains(&record.inputs[1]),
-            "{:?} is no input's identity",
-            record.inputs[1]
-        );
     }
 
     proptest! {

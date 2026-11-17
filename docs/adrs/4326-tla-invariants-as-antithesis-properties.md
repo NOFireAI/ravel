@@ -56,7 +56,9 @@ flowchart LR
   itself produce: the store call's result or a re-read, never a flag the same
   code just set. `assert_always` also fails when never reached, so it is the
   default. `inv_always_or_unreachable!` is allowed only on a guard that only a
-  fault reaches, and its row then also names an `inv_reachable!`.
+  fault reaches, and its row then also names an `inv_reachable!`. A site
+  whose re-read can fail to tell uses `inv_always_if_known!` (see the #4335
+  amendment below).
 - **Driver.** An invariant that no single site sees is checked in the driver:
   against the acked-record model, or by a store audit that lists the bucket
   and decodes HEAD, parts and records through `ravel-cli`.
@@ -174,10 +176,10 @@ occurs as a literal in Rust and a property the table carries, or `none:
 |---|---|---|---|
 | Clean smoke, per workload config (5) | 12 | completes; every guarantee passes; every new SUT assertion reached | predicted; the 12-hour smoke run 4d85276e32085a10291c9eddd59d34b3-67-0 billed 13.0 compute hours over 16 minutes of billable time (`snouty runs usage`), measured 2026-11-16 |
 | Overshoot above the cap, per run | about 1 | billed hours within cap + 1 | measured 2026-11-16: run 4d85276e32085a10291c9eddd59d34b3-67-0 billed 13.0 under a cap of 12, run 5bafcae0c50b1efc354cb19c89294955-67-0 billed 25.0 under a cap of 24 (`snouty runs usage`) |
-| Mutant control in Antithesis, every mutant (19) | 12 each | named property fails with a counterexample | predicted |
+| Mutant control in Antithesis, every mutant (19; 20 per the #4335 amendment below) | 12 each | named property fails with a counterexample | predicted |
 | Mutant control, local loop, every mutant | 0 | named property false in the SDK's local output | predicted |
 | Long run, per workload config (5) | 24 | no new guarantee failure, or one issue per failure | predicted |
-| Whole epic | caps of 423, plus about 29 overshoot, about 452 of about 452 remaining | 5 smokes (60), 19 mutant runs (228), 5 long runs (120), 15 for reruns; 29 runs at about 1 hour of overshoot each; one smoke and one long run per workload config, not per area | predicted; budget raised by the owner 2026-11-16 from 200 to about 490; 38 compute hours billed before this epic (13.0 and 25.0), measured 2026-11-16 (`snouty runs usage`, runs.md) |
+| Whole epic | caps of 423, plus about 29 overshoot, about 452 of about 452 remaining | 5 smokes (60), 19 mutant runs (228; the twentieth the #4335 amendment below adds is not priced), 5 long runs (120), 15 for reruns; 29 runs at about 1 hour of overshoot each; one smoke and one long run per workload config, not per area | predicted; budget raised by the owner 2026-11-16 from 200 to about 490; 38 compute hours billed before this epic (13.0 and 25.0), measured 2026-11-16 (`snouty runs usage`, runs.md) |
 
 A cap is not a hard ceiling: the billed hours of both runs so far came in about
 one hour above it. Twenty-nine runs at that rate cost about 29 hours beyond
@@ -269,10 +271,25 @@ Decision 6 is narrowed as #4330 implements it:
 
 ## Amendment (2026-11-17): #4335 catalog mutants and the sweep site
 
-<!-- amendment-applies: sections="2. Rows in scope|3. Mutant controls|7. Budget" pointer="#4335 amendment" -->
+<!-- amendment-applies: sections="1. One invariant, one carrier|2. Rows in scope|3. Mutant controls|7. Budget" pointer="#4335 amendment" -->
 
 #4335, the catalog task, corrects the catalog rows of decisions 2 and 3 to
-match the TLA model's negative configs and the sites it shipped.
+match the TLA model's negative configs and the sites it shipped, and adds one
+macro to decision 1.
+
+Decision 1 gains `inv_always_if_known!`, an always-property over an
+`Option<bool>`: `Some` is evaluated as `inv_always!` evaluates its condition,
+`None` records nothing, and without the feature it expands to nothing. It
+carries `NoLiveCommitOmittedByLostCas`, "catalog: a fold reports as folded
+only a HEAD the store holds", in `ravel-catalog`'s fold, which re-reads HEAD
+after its CAS. After an acknowledged CAS the property is false only when the
+re-read returns the version the CAS was conditioned on, or no HEAD after an
+acknowledged create; any other version is this write or a later one, such as
+a rebuild over a corrupted HEAD, whatever watermark it holds. After a refused
+CAS, reached only under the `lost-cas-proceeds` mutant, it holds only when the
+stored HEAD is this fold's. A failed re-read, a HEAD that does not decode
+where it is compared, and no HEAD after an acknowledged overwrite cannot
+tell, and record nothing.
 
 Decision 3's catalog row has five mutants, not four. The model has two
 compaction switches, and each breaks a different invariant
@@ -283,10 +300,17 @@ compaction switches, and each breaks a different invariant
 | `compaction-swaps-record` | `CompactionSwapsRecord` | `CompactionPreservesMultiset`, the driver property "catalog: compaction preserves the acked multiset" |
 | `compaction-loser-overwrites` | `CompactionLoserOverwrites` | `CompactionRecordImmutable`, the SUT property "catalog: a published compaction record is never replaced" |
 
-`compaction-swaps-record` replaces one input identity in the published record
-with one no input carries, keeping the identity count and every sample count,
-so the counts-only conservation gate in `ravel-maintain`'s publish path passes
-it and only the driver's multiset check sees it. `compaction-loser-overwrites`
+`compaction-swaps-record` moves the last input identity of a compaction to the
+writer id `ffffffff-ffff-ffff-ffff-ffffffffffff`, which no writer is issued
+(writers get version 4 UUIDs), before the parts are built. The record and its
+parts are built under the hash of the identities it names, so it decodes, its
+key matches, its declared `input_set_hash` is the hash of its own inputs (the
+seal-divergence check passes), every part footer carries that hash (the query
+path's L1 identity check passes), and the identity count and every sample
+count are kept (the counts-only conservation gate in `ravel-maintain`'s
+publish path passes). Only the driver's check of the acked multiset sees it.
+The mutant is compaction's: a format migration rewrite, which publishes
+through the same path, is untouched. `compaction-loser-overwrites`
 is the switch an earlier draft shipped under the `compaction-swaps-record`
 name: a publisher that loses the record's create-only PUT writes its own
 payload over the winner's.

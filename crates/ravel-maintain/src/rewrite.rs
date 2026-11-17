@@ -48,7 +48,7 @@
 //! The primitive generalizes the read side and the conservation check, never
 //! the publish/durability side. [`crate::build::build_parts`] still PUTs every
 //! part `CreateIfAbsent` under a content-addressed key, and
-//! [`crate::publish::publish_record_with_conservation`] still runs the
+//! [`crate::publish::publish_record_with_conservation`]'s protocol still runs the
 //! abandonment deadline, the single-winner record PUT, and the racing-loser
 //! convergence/repair unchanged. A crashed rewrite re-run from scratch rebuilds
 //! the identical content-addressed parts and converges at the record's
@@ -92,7 +92,7 @@ use crate::codec::{RsegCodec, SegmentCodec};
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::publish::{
-    ConservationPredicate, PublishOutcome, conserve_exact, publish_record_with_conservation,
+    ConservationPredicate, PublishOutcome, conserve_exact, publish_identities_with_conservation,
     publish_superseding_record,
 };
 use crate::read::{
@@ -610,6 +610,17 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
         }
     }
 
+    let mut identities = crate::publish::input_identities(&inputs);
+    // `Skip` is compaction's; format migration, which shares this path, fails
+    // instead. The swapped list is hashed like a real one, so the parts and
+    // the record are built under the hash of the identities the record names.
+    if unwritable == UnwritableInputs::Skip
+        && ravel_invariant::inv_mutant!("catalog/compaction-swaps-record")
+    {
+        crate::publish::swap_one_identity(&mut identities);
+        hash = ravel_commit::erasure::compute_compaction_input_set_hash(&identities);
+    }
+
     let parts = C::build_parts(store, config, bucket, &inputs, catalogs, &hash).await?;
 
     // Cancellation checkpoint 5 (ADR-1029 decision 3): the last quiescent
@@ -629,12 +640,13 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
         return Ok(FencedRewrite::RecordSetChanged(now));
     }
 
-    let publish = publish_record_with_conservation(
+    let publish = publish_identities_with_conservation(
         store,
         config,
         clock,
         bucket,
         &inputs,
+        identities,
         &hash,
         &parts,
         start_ns,
@@ -2472,6 +2484,39 @@ mod tests {
         assert!(
             read_record(&store).await.is_none(),
             "an aborted publish writes no compaction record; the L0 inputs stay live"
+        );
+    }
+
+    /// The `catalog/compaction-swaps-record` mutant is compaction's: a format
+    /// migration rewrite, which publishes through the same path, still names
+    /// exactly its inputs with the mutant selected.
+    #[tokio::test]
+    async fn mutant_compaction_swaps_record_leaves_a_migration_rewrite_alone() {
+        let Some(_mutant) = crate::publish::tests::scoped_mutant("catalog/compaction-swaps-record")
+        else {
+            return;
+        };
+        let store = MemoryStore::new();
+        seed(&store, 1, vec![series("alpha", &[(10, 1.0)])]).await;
+        seed(&store, 2, vec![series("beta", &[(20, 2.0)])]).await;
+        let listing = list_bucket(&store, &bucket()).await.expect("list");
+        let outcome = rewrite_and_publish::<RsegCodec>(
+            &store,
+            &FixedClock::new(sealed_now_ns()),
+            &CompactorConfig::default(),
+            &bucket(),
+            &listing.commit_keys,
+            conserve_exact(),
+            sealed_now_ns(),
+        )
+        .await
+        .expect("rewrite");
+        assert_eq!(outcome.publish, PublishOutcome::Published);
+        let record = read_record(&store).await.expect("record");
+        assert_eq!(record.inputs, vec![input_identity(1), input_identity(2)]);
+        assert_eq!(
+            record.input_set_hash,
+            erasure::compute_compaction_input_set_hash(&record.inputs).to_vec()
         );
     }
 

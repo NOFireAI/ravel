@@ -6114,7 +6114,7 @@ impl Catalog {
                     &head_key,
                     Bytes::from(head_bytes),
                     PutOptions {
-                        mode: put_mode,
+                        mode: put_mode.clone(),
                         checksum: Some(UploadChecksum::Crc32c(head_crc)),
                     },
                 )
@@ -6148,29 +6148,40 @@ impl Catalog {
                     }
                 }
                 Ok(_) | Err(StoreError::PreconditionFailed) | Err(StoreError::AlreadyExists) => {
-                    // Judged from HEAD read back here. After an acked CAS the
-                    // stored watermark is at least ours, since a later fold
-                    // only raises it; a refused CAS, reached only under the
-                    // mutant, holds only if the store holds this very HEAD.
-                    // A HEAD that does not decode (the driver corrupts it),
-                    // an acked HEAD that is gone, or a failed read cannot
-                    // tell.
-                    ravel_invariant::inv_always!(
+                    // Judged from HEAD read back here. An acked write failed
+                    // to apply only if the store still holds the version the
+                    // CAS was conditioned on, or still no HEAD after an acked
+                    // create; any other version is this write or a later one
+                    // (a corruption, a rebuild), whatever watermark it holds.
+                    // A refused write, reached only under the mutant, holds
+                    // only if the store holds this very HEAD. A failed read, a
+                    // HEAD that does not decode where the digest is compared,
+                    // and an acked overwrite whose HEAD is gone cannot tell.
+                    ravel_invariant::inv_always_if_known!(
                         match self.store().get(&head_key, GetRange::Full).await {
-                            Ok(got) => match snapshot_format::decode_head(&got.data) {
-                                Ok(stored) if cas_acked => stored.watermark_hour >= watermark_hour,
-                                Ok(stored) => canonical_head_digest(&stored)
-                                    .is_ok_and(|stored| stored == head_digest),
-                                Err(_) => true,
+                            Ok(got) if cas_acked => match &put_mode {
+                                PutMode::CasVersion(conditioned) => {
+                                    Some(got.version != *conditioned)
+                                }
+                                PutMode::CreateIfAbsent | PutMode::Overwrite => Some(true),
                             },
-                            Err(StoreError::NotFound) => cas_acked,
-                            Err(_) => true,
+                            Ok(got) => snapshot_format::decode_head(&got.data)
+                                .ok()
+                                .map(|stored| canonical_head_digest(&stored)
+                                    .is_ok_and(|digest| digest == head_digest)),
+                            Err(StoreError::NotFound) if cas_acked => match &put_mode {
+                                PutMode::CreateIfAbsent => Some(false),
+                                PutMode::CasVersion(_) | PutMode::Overwrite => None,
+                            },
+                            Err(StoreError::NotFound) => Some(false),
+                            Err(_) => None,
                         },
                         "catalog: a fold reports as folded only a HEAD the store holds",
                         std::collections::BTreeMap::from([
                             ("head_key", head_key.clone()),
                             ("folder_id", folder_id.to_string()),
                             ("cas_acked", cas_acked.to_string()),
+                            ("put_mode", format!("{put_mode:?}")),
                             ("head_digest", head_digest.clone()),
                             ("watermark_hour", watermark_hour.to_string()),
                         ])
@@ -13602,6 +13613,187 @@ pub(crate) mod tests {
             !found[0].0,
             "the stored HEAD is behind the reported fold: {found:?}"
         );
+    }
+
+    /// After the next HEAD PUT once [`Self::arm`] is called, the first read of
+    /// that HEAD first corrupts it and lets a rival fold whose clock is an
+    /// hour behind rebuild it: the corrupt-then-rebuild-lower schedule.
+    /// Every call delegates.
+    struct RebuildLowerAfterHeadPutStore {
+        inner: Arc<MemoryStore>,
+        armed: std::sync::atomic::AtomicBool,
+        pending: std::sync::Mutex<Option<String>>,
+        rival: Uuid,
+        rival_report: std::sync::Mutex<Option<FoldReport>>,
+    }
+
+    impl RebuildLowerAfterHeadPutStore {
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for RebuildLowerAfterHeadPutStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            let put = self.inner.put(key, data, opts).await;
+            if key.contains("HEAD") && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                *self.pending.lock().expect("pending") = Some(key.to_string());
+            }
+            put
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            let interleave = {
+                let mut pending = self.pending.lock().expect("pending");
+                if pending.as_deref() == Some(key) {
+                    pending.take()
+                } else {
+                    None
+                }
+            };
+            if interleave.is_some() {
+                self.inner
+                    .put(
+                        key,
+                        Bytes::from_static(b"not a HEAD"),
+                        PutOptions::default(),
+                    )
+                    .await?;
+                let rival = Catalog::new(self.inner.clone(), config(1))
+                    .expect("rival catalog")
+                    .fold(
+                        &tenant(),
+                        Signal::Metrics,
+                        self.rival,
+                        now_at_seal(10),
+                        &[],
+                        None,
+                    )
+                    .await
+                    .expect("the rival rebuilds the corrupt HEAD");
+                *self.rival_report.lock().expect("rival report") = Some(rival);
+            }
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A fold's acked CAS lands at hour 11; before its re-read the driver
+    /// corrupts HEAD and a rival whose clock is behind rebuilds it through
+    /// hour 10. The re-read sees a lower watermark under a version the CAS
+    /// was not conditioned on: a later write, so the property holds.
+    #[tokio::test]
+    async fn an_acked_head_cas_rebuilt_lower_after_corruption_keeps_no_live_commit_omitted() {
+        if !capturing() {
+            return;
+        }
+        let inner = Arc::new(MemoryStore::new());
+        let rival = Uuid::new_v4();
+        let store = Arc::new(RebuildLowerAfterHeadPutStore {
+            inner: inner.clone(),
+            armed: Default::default(),
+            pending: Default::default(),
+            rival,
+            rival_report: Default::default(),
+        });
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        for hour in [10, 11] {
+            publish_segment(
+                &inner,
+                0,
+                Uuid::new_v4(),
+                1,
+                hour,
+                now_at_seal(hour) - NS_PER_HOUR,
+            )
+            .await;
+        }
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("the first fold creates HEAD");
+
+        store.arm();
+        let acked = Uuid::new_v4();
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                acked,
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect("the CAS is acked and applied");
+        assert_eq!(report.watermark_hour, Some(11));
+        assert_eq!(report.previous_watermark_hour, Some(10));
+        let rebuilt = store
+            .rival_report
+            .lock()
+            .expect("rival report")
+            .clone()
+            .expect("the rival ran between the CAS and the re-read");
+        assert!(rebuilt.rebuilt, "{rebuilt:?}");
+        assert_eq!(
+            rebuilt.previous_watermark_hour, None,
+            "it read a corrupt HEAD"
+        );
+        assert_eq!(rebuilt.watermark_hour, Some(10));
+        assert_eq!(read_head(inner.as_ref()).await.watermark_hour, 10);
+
+        let found = evaluations(FOLDED_HEAD_HELD, &acked.to_string());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].0,
+            "a lower watermark under a later version holds: {found:?}"
+        );
+        let found = evaluations(FOLDED_HEAD_HELD, &rival.to_string());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].0, "{found:?}");
     }
 
     /// Regression for issue #587: a fold used to skip postings entirely the
