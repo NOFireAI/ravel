@@ -865,6 +865,7 @@ mod tests {
             .expect("a first attempt answering 21 s after it starts is not cut off");
         releaser.await.expect("releaser task");
         assert_eq!(gate.held_count(), 0);
+        // hygiene-allow: wall-clock -- tokio::time::Instant under start_paused is the paused virtual clock the code under test also reads
         assert_eq!(
             started.elapsed(),
             answer_after,
@@ -978,6 +979,7 @@ mod tests {
             .expect("a read answering 3 s after it starts is not cut off");
         releaser.await.expect("releaser task");
         assert_eq!(gate.held_count(), 0);
+        // hygiene-allow: wall-clock -- tokio::time::Instant under start_paused is the paused virtual clock the code under test also reads
         assert_eq!(
             started.elapsed(),
             DEADLINE + Duration::from_secs(2),
@@ -1008,6 +1010,7 @@ mod tests {
             .expect("a first attempt after the deadline is not cut off");
         releaser.await.expect("releaser task");
         assert_eq!(gate.held_count(), 0);
+        // hygiene-allow: wall-clock -- tokio::time::Instant under start_paused is the paused virtual clock the code under test also reads
         assert_eq!(started.elapsed(), reached + answer_after);
     }
 
@@ -1044,6 +1047,7 @@ mod tests {
         );
         // The one wait is the first backoff step, jittered into [50, 100] ms.
         let waited = started.elapsed() - reached - MIN_STARTUP_ATTEMPT;
+        // hygiene-allow: wall-clock -- tokio::time::Instant under start_paused is the paused virtual clock the code under test also reads
         assert!(
             waited >= INITIAL_BACKOFF / 2 && waited <= INITIAL_BACKOFF,
             "{waited:?}"
