@@ -26,6 +26,10 @@ ravel-types = { path = "../ravel-types", version = "0.33.0" }
 ravel-segment = { path = "../ravel-segment", version = "0.33.0", features = ["format-drill"] }
 ravel-logseg = { path = "../ravel-logseg", version = "0.33.0", features = ["format-drill"] }
 ravel-rspan = { path = "../ravel-rspan", version = "0.33.0", features = ["format-drill"] }
+# Decoding the on-store ProvisioningRecord/CompatRecord in the matrix tests,
+# to assert format_version and the compat fence fields. Already a transitive
+# dependency through ravel-proto; pinned here for the test's direct use.
+prost = "0.14"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }
 uuid = "1.24"
 
