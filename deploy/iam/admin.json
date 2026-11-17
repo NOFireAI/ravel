@@ -72,6 +72,12 @@
       }
     },
     {
+      "Sid": "AdminCertifyCursor",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::my-ravel-bucket/sys/maintain/certify/*"
+    },
+    {
       "Sid": "AdminQualifyDelete",
       "Effect": "Allow",
       "Action": "s3:DeleteObject",

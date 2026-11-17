@@ -207,13 +207,18 @@ fn quarantine_witness_keys() -> Vec<String> {
 /// about `t/**` tenant data and must keep reading `representative_keys` alone).
 /// Every one carries a `/`, so a pattern such as `*/*` still matches all of
 /// them and is still vacuous.
-const NON_TENANT_WITNESS_KEYS: [&str; 6] = [
+const NON_TENANT_WITNESS_KEYS: [&str; 7] = [
     "sys/tenancy",
     "sys/qualification",
     "sys/gc",
     IPCRYPT_MARKER_KEY,
     "sys/qualify/run-0/probe",
     "admission/query/query-0",
+    // The compat-certify census cursor (`certify_cursor_key`,
+    // `crates/ravel-maintain/src/compat_certify.rs`), private to
+    // `ravel-maintain` and so a literal here for the same reason
+    // `sys/qualify/run-0/probe` is.
+    "sys/maintain/certify/rlog/cursor",
 ];
 
 /// The process id every fleet witness key below is built for. Any UUID works;
@@ -2728,14 +2733,16 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
         kms_resources: &[("MaintainTenantKms", &[TENANT_KMS_KEY_ARN])],
     },
     // Admin: broad read, narrow create-only writes, and the delete grants on
-    // the two scratch prefixes ADMIN_SCRATCH_DELETES names. Decrypt-only on
+    // the three scratch prefixes ADMIN_SCRATCH_DELETES names. Decrypt-only on
     // KMS. The sys/auth write is ravel-cli's tenant token upsert and revoke
     // (admin_template_covers_every_auth_map_write_call), the t/*/config
     // write is ravel-cli's tenant config record writes
-    // (admin_template_covers_every_tenant_config_write_call), and the
+    // (admin_template_covers_every_tenant_config_write_call), the
     // t/*/pq/grants and sys/pq-probe/* writes are ravel-cli tenant
     // parquet-grant's record write and bucket probe
-    // (admin_template_covers_every_parquet_grant_call).
+    // (admin_template_covers_every_parquet_grant_call), and the
+    // sys/maintain/certify/* put and delete are `compat certify`'s store-wide
+    // census cursor (admin_template_covers_the_certify_cursor).
     ExpectedRolePatterns {
         role: "admin",
         list_prefixes: &["t/*", "sys/*"],
@@ -2762,17 +2769,25 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             PROV_M_PATTERN,
             PROV_L_PATTERN,
             PROV_S_PATTERN,
+            "sys/maintain/certify/*",
         ],
-        // AdminWrite, then AdminProvCreate (create-only, provision adopt) and
-        // AdminProvCas (CAS-only, provision reshard).
-        put_actions: &["s3:PutObject", "s3:PutObject", "s3:PutObject"],
+        // AdminWrite, then AdminProvCreate (create-only, provision adopt),
+        // AdminProvCas (CAS-only, provision reshard), then AdminCertifyCursor
+        // (the compat-certify census cursor, put side).
+        put_actions: &[
+            "s3:PutObject",
+            "s3:PutObject",
+            "s3:PutObject",
+            "s3:PutObject",
+        ],
         deletes: ADMIN_SCRATCH_DELETES,
         // Narrower than the Deny, which names both operations. Legitimate, and
         // the reason the overlap property is asserted as containment rather than
         // equality: admin's delete grant and its Deny cover no key in common, and
         // where they did, a Deny naming MORE than the Allow grants is safe.
-        // One entry per statement: AdminQualifyDelete, then AdminProbeDelete.
-        delete_actions: &["s3:DeleteObject", "s3:DeleteObject"],
+        // One entry per statement: AdminCertifyCursor (delete side), then
+        // AdminQualifyDelete, then AdminProbeDelete.
+        delete_actions: &["s3:DeleteObject", "s3:DeleteObject", "s3:DeleteObject"],
         protected_deletes: PROTECTED_DELETE_KEYS,
         protected_delete_actions: PROTECTED_DELETE_ACTIONS,
         kms_actions: &["kms:Decrypt"],
@@ -5732,6 +5747,76 @@ fn is_parquet_subkey(key: &str, sub: &str) -> bool {
             .is_some_and(|rest| rest == sub || rest.starts_with(&format!("{sub}/")))
 }
 
+/// `ravel-cli compat certify` keeps a store-wide census cursor at
+/// `sys/maintain/certify/<family>/cursor` (`certify_cursor_key`,
+/// `crates/ravel-maintain/src/compat_certify.rs`): `put_certify_cursor` PUTs
+/// it every pass that does not finish in one run, and `delete_cursor` GETs
+/// and DELETEs it once the certificate and floor raises are written. Neither
+/// is scoped to a tenant: the cursor lives under `sys/maintain`, not under
+/// `t/<hash>/`.
+#[test]
+fn admin_template_covers_the_certify_cursor() {
+    let admin = load_policy("admin");
+    let puts = key_patterns_for(&admin, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&admin, "Allow");
+    let cursor = "sys/maintain/certify/rlog/cursor".to_string();
+
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &cursor)),
+        "admin: no PutObject Allow reaches the certify cursor {cursor:?}; every \
+         compat certify pass that does not finish in one run is refused at its \
+         cursor write. Grants: {puts:?}"
+    );
+    assert!(
+        deletes.iter().any(|p| glob_matches(p, &cursor)),
+        "admin: no delete Allow reaches the certify cursor {cursor:?}; a \
+         completed census leaves its cursor behind for every later run to \
+         find. Grants: {deletes:?}"
+    );
+    assert_reaches_nothing_outside(
+        "admin",
+        "s3:PutObject Allow",
+        &puts,
+        &cursor,
+        "sys/maintain/certify/",
+    );
+    assert_reaches_nothing_outside(
+        "admin",
+        "delete Allow",
+        &deletes,
+        &cursor,
+        "sys/maintain/certify/",
+    );
+
+    // Neither gateway nor query touches the cursor: certify runs only under
+    // the Admin credential (it is not one of the seven Maintain-credential
+    // commands).
+    for role in ["gateway", "query"] {
+        let policy = load_policy(role);
+        let puts = key_patterns_for(&policy, &["s3:PutObject"], Some("Allow"));
+        let deletes = delete_key_patterns(&policy, "Allow");
+        assert!(
+            !puts.iter().any(|p| glob_matches(p, &cursor))
+                && !deletes.iter().any(|p| glob_matches(p, &cursor)),
+            "{role}: a PutObject or delete Allow reaches the certify cursor \
+             {cursor:?}; only ravel-cli under Admin runs compat certify. \
+             Put: {puts:?}; delete: {deletes:?}"
+        );
+    }
+    // Maintain cannot delete the cursor (its delete grants stop at
+    // `sys/maintain/workers/*` and `sys/query/workers/*`); its PutObject
+    // grant already covers the whole `sys/maintain/*` tree (`MaintainWrite`,
+    // deploy/iam/maintain.json) for unrelated reasons predating this fix, so
+    // the put axis is not checked here.
+    let maintain = load_policy("maintain");
+    let maintain_deletes = delete_key_patterns(&maintain, "Allow");
+    assert!(
+        !maintain_deletes.iter().any(|p| glob_matches(p, &cursor)),
+        "maintain: a delete Allow reaches the certify cursor {cursor:?}; only \
+         ravel-cli under Admin runs compat certify. Delete: {maintain_deletes:?}"
+    );
+}
+
 /// `ravel-cli tenant parquet-grant add` and `remove`
 /// (`services/ravel-cli/src/parquet_grant.rs`) write the location grants record
 /// `t/<hash>/pq/grants` through `replace_whole` in
@@ -7048,7 +7133,18 @@ fn deletable_reads_without_a_list_grant_per_server_role() {
     for (reader, expected) in [
         ("gateway", idem_witnesses),
         ("query", Vec::new()),
-        ("maintain", vec![admission_snapshot_key(Signal::Audit)]),
+        // `AdminCertifyCursor` (deploy/iam/admin.json) is a new deleter of
+        // `sys/maintain/certify/*`; maintain already reads the whole
+        // `sys/maintain/*` tree (`MaintainRead`) but its list grants cover
+        // only `sys/maintain/workers/*` and `sys/maintain/memo/*`, not the
+        // certify cursor, so the cursor now joins this role's existing gap.
+        (
+            "maintain",
+            vec![
+                "sys/maintain/certify/rlog/cursor".to_string(),
+                admission_snapshot_key(Signal::Audit),
+            ],
+        ),
     ] {
         let (_, policy) = policies
             .iter()
@@ -8083,9 +8179,11 @@ fn admin_has_no_kms_generate_data_key() {
 /// rejects from one that does not.
 ///
 /// Scratch means a prefix whose objects are transient, hold no tenant data and
-/// anchor nothing: the qualification run's `sys/qualify/<run-id>/` and the
-/// Parquet bucket probe's `sys/pq-probe/<random>`, which the probe deletes
-/// before it returns. Both are in `ADMIN_SCRATCH_DELETES`.
+/// anchor nothing: the compat-certify census cursor
+/// `sys/maintain/certify/<family>/cursor`, the qualification run's
+/// `sys/qualify/<run-id>/`, and the Parquet bucket probe's
+/// `sys/pq-probe/<random>`, which the probe deletes before it returns. All
+/// three are in `ADMIN_SCRATCH_DELETES`.
 fn assert_admin_delete_grant_is_scratch_only(policy: &Policy) {
     let deletes = delete_key_patterns(policy, "Allow");
     assert_eq!(
@@ -8136,9 +8234,12 @@ fn assert_admin_delete_grant_is_scratch_only(policy: &Policy) {
 
 /// Admin's delete grants, in template order: the scratch prefixes
 /// `assert_admin_delete_grant_is_scratch_only` accepts and nothing else.
-const ADMIN_SCRATCH_DELETES: &[&str] = &["sys/qualify/*", "sys/pq-probe/*"];
+const ADMIN_SCRATCH_DELETES: &[&str] =
+    &["sys/maintain/certify/*", "sys/qualify/*", "sys/pq-probe/*"];
 
-/// Admin's only `s3:DeleteObject` grants are two transient scratch prefixes:
+/// Admin's only `s3:DeleteObject` grants are three transient scratch prefixes:
+/// `sys/maintain/certify/*`, so `ravel-cli compat certify` can delete the
+/// store-wide census cursor (`certify_cursor_key`) once a census finishes;
 /// `sys/qualify/*`, so `ravel-cli store qualify` can run ADR-0050's
 /// delete-visibility probe (which deletes a key under `sys/qualify/<run-id>/`)
 /// on a fresh bucket without failing closed, and `sys/pq-probe/*`, so the
@@ -8146,7 +8247,7 @@ const ADMIN_SCRATCH_DELETES: &[&str] = &["sys/qualify/*", "sys/pq-probe/*"];
 /// the object it wrote. Admin holds no delete on tenant data (`t/**`) or on any
 /// key the same policy's `DenyDeleteProtected` block covers, so ADR-0055's
 /// property "Admin never deletes tenant data or a protected key" still holds.
-/// Widen the grant beyond those two prefixes, or drop either, and this test
+/// Widen the grant beyond those three prefixes, or drop any one, and this test
 /// fails.
 #[test]
 fn admin_delete_grant_is_scratch_only() {
@@ -8292,8 +8393,14 @@ fn wildcard_or_out_of_bucket_delete_grant_is_not_a_bypass() {
             role: "fixture",
             statements: serde_json::json!([
                 // The shipped scratch deletes. The pre-fix exact action match
-                // sees these two, so the pre-fix delete set is non-empty and
+                // sees these three, so the pre-fix delete set is non-empty and
                 // equal to what the guard demands.
+                {
+                    "Sid": "AdminCertifyScratchDelete",
+                    "Effect": "Allow",
+                    "Action": "s3:DeleteObject",
+                    "Resource": format!("{BUCKET_KEY_PREFIX}sys/maintain/certify/*"),
+                },
                 {
                     "Sid": "AdminQualifyScratchDelete",
                     "Effect": "Allow",
@@ -8324,7 +8431,7 @@ fn wildcard_or_out_of_bucket_delete_grant_is_not_a_bypass() {
                 },
             ]),
         };
-        let permissive = &policy_statements(&policy)[1];
+        let permissive = &policy_statements(&policy)[2];
         let actions = statement_actions(permissive);
 
         // Observation 1 (load-bearing): under the pre-fix derivation the delete
