@@ -10,9 +10,13 @@
 # writes, to move every clock forward together by CLOCK_JUMP_SECS (9000 s,
 # above the 8400 s that seals the ingest hour of every write acked before it;
 # README.md, "The clock jump"). libfaketime rereads the file at most every
-# FAKETIME_CACHE_DURATION (2 s) per process, so the clocks agree to within
-# that once the jump has landed. Monotonic clocks stay real, so timers,
-# timeouts and leases measured on them are untouched.
+# FAKETIME_CACHE_DURATION (2 s) per process, so the jump lands in every
+# process within about 2 s. Inside that window a process that has not reread
+# is 9000 s behind one that has, beyond SigV4's 900 s skew limit, so a request
+# between them (a server's background request to rustfs included) may fail;
+# the driver holds its write gate across the jump and the reread interval.
+# Monotonic clocks stay real, so timers, timeouts and leases measured on them
+# are untouched.
 #
 # rustfs is the one durable component. init creates the bucket and qualifies
 # it, then exits. The driver then seeds the tenant through `ravel-cli load` and

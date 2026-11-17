@@ -33,7 +33,7 @@ check() {
 
 "$HERE/local-run.sh" "$OUT" "$SECS"
 rc=$?
-check "local-run.sh exited 0 (exit $rc)" test "$rc" -eq 0
+check "local-run.sh exit code is 0 (got $rc)" test "$rc" -eq 0
 
 held() {
     local hits
@@ -41,7 +41,7 @@ held() {
     hits=$(awk -F '\t' -v m="$1" '$4 == m { print $3 }' "$OUT/assertions.tsv")
     [ -n "$hits" ] && [ "$hits" -gt 0 ]
 }
-for m in "clock: the driver jumped every clock forward" \
+for m in "clock: the driver's clock jumped forward" \
     "clock: an hour ingested live was sealed by a fold" \
     "catalog: a compaction record was published"; do
     check "held at least once: $m" held "$m"

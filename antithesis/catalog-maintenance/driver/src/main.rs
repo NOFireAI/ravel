@@ -541,7 +541,7 @@ impl Shared {
             assert_unreachable!("clock: the clock jump did not reach the driver", &details);
             return;
         }
-        assert_reachable!("clock: the driver jumped every clock forward", &details);
+        assert_reachable!("clock: the driver's clock jumped forward", &details);
         // Every other process picks the offset up within one reread too.
         std::thread::sleep(Duration::from_secs(self.clock.reread_s + 1));
         if let Err(e) = self.wait_serving(Duration::from_secs(120), "clock jump") {
