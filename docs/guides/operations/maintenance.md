@@ -2607,7 +2607,23 @@ oldest version it reads, the certificate is not `contradicted`, and the
 late-write watermark is past the certified time. Otherwise the process
 exits before serving, with an error naming the family and the remedy. A
 bucket with neither `sys/compat` nor `sys/tenancy` and nothing under `t/`
-is a fresh store and starts. A bucket with `sys/tenancy` and no
+is a fresh store and starts. On a fresh store with `--tenant-hash-key-file`
+configured, the process creates `sys/compat` before it writes anything else,
+`sys/tenancy` included. The record is the one `ravel-cli compat init` writes
+on an empty store (every family at this release's baseline write version,
+`compat_epoch` 0, baseline release v0.34, a `max_publish_lifetime` of 1h),
+plus, for each family whose reader the release retired, a certificate at
+that family's write version over the empty census and a late-write
+watermark one nanosecond past it. The next start of the same release is
+then certified instead of refused, and the daily late-write pass checks
+every write after the census. The write is create-only: when two processes
+start on one fresh store, one creates the record and the other finds it,
+checks it with the gate's rules, and starts on it only if it passes. A start
+whose create fails exits before writing `sys/tenancy`, so the next start
+finds the store fresh again. Without a deployment key nothing can
+authenticate `sys/compat`, so an unkeyed fresh store gets none: the first
+start pins `sys/tenancy`, and the next start of the same release is refused
+for `sys/tenancy` without `sys/compat`. A bucket with `sys/tenancy` and no
 `sys/compat`, or with data under `t/` and neither marker (a bucket written
 before the tenancy marker existed), is refused with an error naming
 `ravel-cli compat init`, which adopts the store from the release that reads
@@ -2620,7 +2636,8 @@ authenticated. A watermark more than 7 days old logs a `WARN` line and
 still starts.
 
 No current release has retired a reader: the gate's reader set is empty,
-and it returns without a request to the store.
+and it returns without a request to the store, so no current release
+creates `sys/compat` at startup.
 
 ## Legal hold
 

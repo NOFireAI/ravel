@@ -545,3 +545,56 @@ async fn the_bootstrap_sends_no_request_without_a_retired_reader_or_a_key() {
     assert!(store.counters_snapshot().is_empty());
     assert_eq!(every_object(store.inner()).await, Vec::new());
 }
+
+/// A start that stopped after its create and before pinning `sys/tenancy`
+/// leaves a store the next start reads as adopted and starts on.
+#[tokio::test]
+async fn a_start_stopped_before_tenancy_pinning_leaves_an_adopted_store() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    assert_eq!(
+        bootstrap_fresh_store(store.as_ref(), Some(&KEY), &retired(), NOW_NS)
+            .await
+            .expect("create"),
+        Bootstrap::Created
+    );
+    assert!(matches!(
+        store.head(TENANCY_KEY).await,
+        Err(StoreError::NotFound)
+    ));
+    let next = start(&store, keyed(), NOW_NS + HOUR_NS)
+        .await
+        .expect("next start");
+    assert_eq!(next.retired_reader_gate, certified_at(NOW_NS));
+    assert!(store.head(TENANCY_KEY).await.is_ok());
+}
+
+/// A release that reads nothing at its own baseline write version cannot
+/// certify a fresh store: it refuses before writing.
+#[tokio::test]
+async fn a_record_the_gate_would_refuse_is_never_written() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let baseline = baseline_version(FAMILY_RSEG).expect("baseline");
+    let above_baseline = [RetiredReader {
+        family: FAMILY_RSEG,
+        oldest_readable: baseline + 1,
+    }];
+    let err = refusal(
+        start_with(
+            &StartupRetry::disabled(),
+            &store,
+            keyed(),
+            &above_baseline,
+            NOW_NS,
+        )
+        .await,
+    );
+    assert!(
+        matches!(
+            err.downcast_ref::<CompatGateError>(),
+            Some(CompatGateError::CertificateBelow { certified, oldest_readable, .. })
+                if *certified == baseline && *oldest_readable == baseline + 1
+        ),
+        "{err:?}"
+    );
+    assert_eq!(every_object(store.as_ref()).await, Vec::new());
+}
