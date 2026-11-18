@@ -2,9 +2,23 @@
 //! for use with a yielding [`super::tap::TapStore`]: every store call returns
 //! `Pending` once, and the seed picks which task to poll next.
 
+use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
+
+thread_local! {
+    /// The task index `drive` is currently polling, for a tap store to tag
+    /// the calls it receives with. `None` outside a `drive`/`block_on` poll.
+    static CURRENT_TASK: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// The task index the calling store call was entered under, if a `drive` poll
+/// is on the stack. Single-threaded, cooperative polling makes this exact:
+/// only one task's future ever runs between two calls into a store.
+pub fn current_task() -> Option<usize> {
+    CURRENT_TASK.with(Cell::get)
+}
 
 /// Polls before a schedule counts as stuck; a full schedule takes a few
 /// hundred.
@@ -61,7 +75,10 @@ pub fn drive<T>(
         let pick = rng.below(live.len());
         let task = live[pick];
         let before = calls();
-        match tasks[task].as_mut().poll(&mut cx) {
+        CURRENT_TASK.with(|c| c.set(Some(task)));
+        let polled = tasks[task].as_mut().poll(&mut cx);
+        CURRENT_TASK.with(|c| c.set(None));
+        match polled {
             Poll::Ready(done) => {
                 out[task] = Some(done);
                 live.remove(pick);

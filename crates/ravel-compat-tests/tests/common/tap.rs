@@ -21,6 +21,10 @@ use ravel_object_store::{
 pub struct Write {
     pub op: Op,
     pub key: String,
+    /// The call ordinal (`TapStore::calls()` just before this write) and the
+    /// `sched::current_task` index that made it, when driven by `drive`.
+    pub ordinal: usize,
+    pub task: Option<usize>,
 }
 
 type CrashWhen = Box<dyn Fn() -> bool + Send + Sync>;
@@ -29,6 +33,11 @@ pub struct TapStore<S> {
     inner: S,
     yield_each_call: bool,
     writes: Mutex<Vec<Write>>,
+    /// The `sched::current_task` tag entering every call, write or not, in
+    /// call order: `call_log[ordinal - 1]` is the tag for call `ordinal`.
+    /// This is what lets a test prove two tasks' store calls actually
+    /// interleaved, rather than only that both eventually wrote something.
+    call_log: Mutex<Vec<Option<usize>>>,
     crash_when: Option<CrashWhen>,
     crashed: AtomicBool,
     calls: AtomicUsize,
@@ -41,6 +50,7 @@ impl<S: ObjectStoreBackend> TapStore<S> {
             inner,
             yield_each_call: false,
             writes: Mutex::new(Vec::new()),
+            call_log: Mutex::new(Vec::new()),
             crash_when: None,
             crashed: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
@@ -82,8 +92,18 @@ impl<S: ObjectStoreBackend> TapStore<S> {
         self.calls.load(Ordering::SeqCst)
     }
 
+    /// The task tag logged for every call, in call order (1-indexed by
+    /// `calls()`): `call_log()[0]` is the tag for the first call entered.
+    pub fn call_log(&self) -> Vec<Option<usize>> {
+        self.call_log.lock().expect("call log lock").clone()
+    }
+
     async fn enter(&self) -> Result<(), StoreError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.call_log
+            .lock()
+            .expect("call log lock")
+            .push(super::sched::current_task());
         if self.yield_each_call {
             YieldOnce(false).await;
         }
@@ -104,6 +124,8 @@ impl<S: ObjectStoreBackend> TapStore<S> {
         self.writes.lock().expect("writes lock").push(Write {
             op,
             key: key.to_string(),
+            ordinal: self.calls(),
+            task: super::sched::current_task(),
         });
     }
 }

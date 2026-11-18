@@ -120,35 +120,86 @@ async fn compacted_inputs(store: &dyn ObjectStoreBackend) -> BTreeMap<String, Ve
         .collect()
 }
 
+/// Task indices as `one_seed` builds them, for `tasks_overlapped`.
+const MIGRATE_TASK: usize = 0;
+const COMPACT_TASK: usize = 1;
+
 #[derive(Debug, Default)]
 struct Tally {
     certified: usize,
     contradicted: usize,
-    /// Seeds where both `migrate` and the compaction attempted a compaction
-    /// record PUT to this bucket's hour, proving the two tasks actually
-    /// overlapped at the publish step rather than one finishing before the
-    /// other started.
+    /// Seeds where `migrate` and the compaction both reached the publish
+    /// step for this bucket's hour (`compaction_record_publish_attempts`
+    /// sees 2 or more) AND their store calls actually overlapped in time
+    /// (`tasks_overlapped`), rather than one task's calls running entirely
+    /// before the other's. Attempt count alone cannot tell these apart: both
+    /// tasks reach the publish step regardless of scheduling, so a seed
+    /// where `migrate` runs to completion before `compact_bucket` starts
+    /// still shows 2 attempts. Only the call-ordinal overlap proves the
+    /// scheduler actually interleaved them.
     overlapping_publish: usize,
 }
 
-/// Attempted (not necessarily successful) compaction-record PUTs to
-/// `bucket`'s hour in `writes`. Neither `migrate_bucket_format` nor
+/// Attempted (not necessarily successful) PUTs toward publishing a level-1
+/// compaction record for `bucket`'s hour in `writes`: the record's own
+/// `create_if_absent` CAS (`keys::parse_compaction_record_key`), plus the
+/// part object that precedes it (`keys::l1_part_key`'s directory), which a
+/// publisher writes unconditionally before it re-lists and decides whether
+/// to attempt the CAS at all. Neither `migrate_bucket_format` nor
 /// `compact_bucket` retries a failed publish, and nothing else in this test
-/// writes a compaction record key, so a count of 2 or more means one
-/// attempt came from each task.
+/// writes under either path, so two or more attempts, from the part prefix
+/// alone or combined with the record CAS, means both tasks reached the
+/// publish step for this bucket -- even when only one of them goes on to
+/// win the record CAS.
 fn compaction_record_publish_attempts(writes: &[Write], bucket: &Bucket) -> usize {
+    let part_prefix = format!(
+        "t/{}/{}/l1/{:04}/{}/",
+        bucket.tenant_hash.to_hex(),
+        bucket.signal.key_prefix(),
+        bucket.shard,
+        keys::ingest_hour_string(bucket.ingest_hour_bucket),
+    );
     writes
         .iter()
         .filter(|w| w.op == Op::Put)
         .filter(|w| {
-            keys::parse_compaction_record_key(&w.key).is_ok_and(|parsed| {
-                parsed.tenant_hash == bucket.tenant_hash
-                    && parsed.signal == bucket.signal
-                    && parsed.shard == bucket.shard
-                    && parsed.ingest_hour_bucket == bucket.ingest_hour_bucket
-            })
+            w.key.starts_with(&part_prefix)
+                || keys::parse_compaction_record_key(&w.key).is_ok_and(|parsed| {
+                    parsed.tenant_hash == bucket.tenant_hash
+                        && parsed.signal == bucket.signal
+                        && parsed.shard == bucket.shard
+                        && parsed.ingest_hour_bucket == bucket.ingest_hour_bucket
+                })
         })
         .count()
+}
+
+/// Whether task `a`'s and task `b`'s store calls actually overlapped in
+/// `call_log` (`TapStore::call_log`, one task tag per call in call order):
+/// the ordinal range from each task's first call to its last intersects the
+/// other's. A count of attempts from both tasks (as
+/// `compaction_record_publish_attempts` gives) is true whether or not the
+/// scheduler ever interleaved them -- a seed where `migrate` finishes every
+/// one of its calls before `compact_bucket` makes its first still shows both
+/// tasks reaching the publish step. Only this ordinal check tells that case
+/// apart from a seed where the scheduler actually wove the two tasks'
+/// calls together.
+fn tasks_overlapped(call_log: &[Option<usize>], a: usize, b: usize) -> bool {
+    let range = |task: usize| -> Option<(usize, usize)> {
+        let positions: Vec<usize> = call_log
+            .iter()
+            .enumerate()
+            .filter(|(_, tag)| **tag == Some(task))
+            .map(|(i, _)| i)
+            .collect();
+        positions.first().copied().zip(positions.last().copied())
+    };
+    match (range(a), range(b)) {
+        (Some((a_first, a_last)), Some((b_first, b_last))) => {
+            a_first.max(b_first) <= a_last.min(b_last)
+        }
+        _ => false,
+    }
 }
 
 async fn one_seed(seed: u64, tally: &mut Tally) {
@@ -196,7 +247,9 @@ async fn one_seed(seed: u64, tally: &mut Tally) {
     ];
     let (done, order) = drive(seed, &|| tap.calls(), tasks);
     let raw_writes = tap.take_writes();
-    if compaction_record_publish_attempts(&raw_writes, &bucket) >= 2 {
+    if compaction_record_publish_attempts(&raw_writes, &bucket) >= 2
+        && tasks_overlapped(&tap.call_log(), MIGRATE_TASK, COMPACT_TASK)
+    {
         tally.overlapping_publish += 1;
     }
     let writes: Vec<String> = raw_writes
