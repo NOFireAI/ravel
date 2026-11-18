@@ -4,6 +4,9 @@
 
 #![allow(dead_code, clippy::expect_used, clippy::unwrap_used)]
 
+pub mod pipeline;
+pub mod tap;
+
 use std::collections::BTreeMap;
 use std::fmt;
 
