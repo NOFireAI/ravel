@@ -16,17 +16,18 @@
 //!
 //! The gate is a no-op on a build that retires no reader: [`RETIRED_READERS`]
 //! is empty today and [`enforce`] sends no request for an empty set. A store
-//! with neither `sys/compat` nor `sys/tenancy` is fresh and starts; one with
-//! `sys/tenancy` and no `sys/compat` is refused, which is how an unsupported
-//! upgrade path (skipping the release that carried both readers) is refused
-//! before it modifies anything.
+//! with neither `sys/compat` nor `sys/tenancy` and no `t/` data is fresh and
+//! starts; one with `sys/tenancy` and no `sys/compat`, or with `t/` data and
+//! neither marker (a pre-ADR-0050 bucket), is refused, which is how an
+//! unsupported upgrade path (skipping the release that carried both readers)
+//! is refused before it modifies anything.
 
 use ravel_catalog::compat::{
     COMPAT_KEY, CompatError, CompatKeys, finalization_pending, read_compat,
 };
 use ravel_object_store::{ObjectStoreBackend, StoreError};
 
-use crate::tenancy::TENANCY_MARKER_KEY;
+use crate::tenancy::{TENANCY_MARKER_KEY, TENANT_PREFIX, bucket_has_tenant_data};
 
 /// A family whose reader this build retired: it reads no version below
 /// `oldest_readable`.
@@ -49,8 +50,9 @@ pub const WATERMARK_WARN_AGE_NS: i64 = 7 * 24 * 3_600 * 1_000_000_000;
 pub enum GateOutcome {
     /// This build retires no reader; nothing was read.
     NoRetiredReader,
-    /// Neither `sys/compat` nor `sys/tenancy` exists: a fresh store, which
-    /// this build bootstraps at its own versions.
+    /// Neither `sys/compat` nor `sys/tenancy` exists and the store holds no
+    /// `t/` data: a fresh store, which this build bootstraps at its own
+    /// versions.
     Fresh,
     /// Every retired family carries a current certificate.
     Certified { families: Vec<CertifiedFamily> },
@@ -78,6 +80,13 @@ pub enum CompatGateError {
          certify (ADR-4233 decision 7)"
     )]
     TenancyWithoutCompat,
+    #[error(
+        "the store holds {TENANT_PREFIX} data but neither {TENANCY_MARKER_KEY} nor {COMPAT_KEY}: \
+         this release retired a reader, so it starts only on a store adopted into the \
+         compatibility contract; run `ravel-cli compat init` from the release that reads both \
+         versions, then migrate and certify (ADR-4233 decision 7)"
+    )]
+    TenantDataWithoutMarkers,
     #[error(
         "{COMPAT_KEY} exists but no deployment key (--tenant-hash-key-file) is configured, so \
          its certificates cannot be authenticated; this release retired a reader and refuses \
@@ -149,10 +158,7 @@ pub async fn enforce(
         return Ok(GateOutcome::NoRetiredReader);
     }
     if !exists(store, COMPAT_KEY).await? {
-        if exists(store, TENANCY_MARKER_KEY).await? {
-            return Err(CompatGateError::TenancyWithoutCompat);
-        }
-        return Ok(GateOutcome::Fresh);
+        return without_compat(store).await;
     }
     let Some(key) = deployment_key else {
         return Err(CompatGateError::Unkeyed);
@@ -163,11 +169,8 @@ pub async fn enforce(
         .map_err(CompatGateError::CompatUnreadable)?
     else {
         // Deleted between the HEAD and the GET: the record is gone, and
-        // sys/tenancy decides fresh or refused exactly as above.
-        if exists(store, TENANCY_MARKER_KEY).await? {
-            return Err(CompatGateError::TenancyWithoutCompat);
-        }
-        return Ok(GateOutcome::Fresh);
+        // fresh or refused is decided exactly as above.
+        return without_compat(store).await;
     };
 
     let mut families = Vec::with_capacity(retired.len());
@@ -222,6 +225,25 @@ pub async fn enforce(
         });
     }
     Ok(GateOutcome::Certified { families })
+}
+
+/// The outcome for a store without `sys/compat`: fresh only when it also has
+/// no `sys/tenancy` and no `t/` data.
+async fn without_compat(store: &dyn ObjectStoreBackend) -> Result<GateOutcome, CompatGateError> {
+    if exists(store, TENANCY_MARKER_KEY).await? {
+        return Err(CompatGateError::TenancyWithoutCompat);
+    }
+    let has_tenant_data =
+        bucket_has_tenant_data(store)
+            .await
+            .map_err(|source| CompatGateError::Store {
+                key: TENANT_PREFIX,
+                source,
+            })?;
+    if has_tenant_data {
+        return Err(CompatGateError::TenantDataWithoutMarkers);
+    }
+    Ok(GateOutcome::Fresh)
 }
 
 async fn exists(
@@ -487,6 +509,68 @@ mod tests {
             "{err:?}"
         );
         assert!(err.to_string().contains("`ravel-cli compat init`"), "{err}");
+    }
+
+    async fn every_object(store: &MemoryStore) -> Vec<(String, String, String)> {
+        let mut objects = Vec::new();
+        let mut page = None;
+        loop {
+            let listed = store.list("", page).await.expect("list");
+            objects.extend(listed.objects.into_iter().map(|meta| {
+                (
+                    meta.key,
+                    format!("{:?}", meta.etag),
+                    format!("{:?}", meta.version),
+                )
+            }));
+            match listed.next {
+                Some(next) => page = Some(next),
+                None => return objects,
+            }
+        }
+    }
+
+    /// A pre-ADR-0050 bucket (tenant data, no `sys/tenancy`, no `sys/compat`)
+    /// is not fresh: a retired-reader release refuses it before writing
+    /// anything, so its data is never read by a build that cannot read it.
+    #[tokio::test]
+    async fn a_bucket_with_tenant_data_and_no_markers_is_refused_by_a_retired_reader_release() {
+        let store = MemoryStore::new();
+        store
+            .put(
+                "t/acme/m/commits/00000001",
+                Bytes::from_static(b"commit"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put tenant data");
+        let before = every_object(&store).await;
+        let err = gate(&store).await.expect_err("refused");
+        assert!(
+            matches!(err, CompatGateError::TenantDataWithoutMarkers),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("`ravel-cli compat init`"), "{err}");
+        assert_eq!(every_object(&store).await, before);
+        assert_eq!(before.len(), 1);
+    }
+
+    /// A failed tenant-data LIST refuses rather than reading as an empty
+    /// bucket.
+    #[tokio::test]
+    async fn a_failed_tenant_data_list_refuses() {
+        let plan = FaultPlan {
+            rules: vec![Rule::new(Op::List, ScriptedFault::Timeout)],
+            ..FaultPlan::empty()
+        };
+        let store = FaultStore::new(MemoryStore::new(), plan);
+        assert!(matches!(
+            enforce(&store, Some(&KEY), &[RSEG_8], NOW_NS).await,
+            Err(CompatGateError::Store {
+                key: TENANT_PREFIX,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

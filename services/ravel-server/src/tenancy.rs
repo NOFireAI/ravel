@@ -44,7 +44,7 @@ pub const TENANCY_MARKER_KEY: &str = "sys/tenancy";
 /// Prefix every tenant's objects live under. A non-empty listing here means
 /// the bucket already holds data, which decides fresh-bucket vs pre-ADR-bucket
 /// adoption.
-const TENANT_PREFIX: &str = "t/";
+pub(crate) const TENANT_PREFIX: &str = "t/";
 
 /// Key-derivation context for the recovery-manifest AEAD key (ADR-0050
 /// section 3). Domain-separated from the hashing key and the fingerprint so
@@ -214,7 +214,9 @@ async fn write_marker(
 /// Cheap existence check: does the bucket hold any `t/` data at all? Only the
 /// first listing page is inspected, since existence, not enumeration, is all
 /// that decides fresh-bucket vs pre-ADR adoption.
-async fn bucket_has_tenant_data(store: &dyn ObjectStoreBackend) -> Result<bool, TenancyError> {
+pub(crate) async fn bucket_has_tenant_data(
+    store: &dyn ObjectStoreBackend,
+) -> Result<bool, StoreError> {
     let page = store.list(TENANT_PREFIX, None).await?;
     // A non-empty first page means data exists. `next.is_some()` is cheap
     // insurance for a backend that could return an empty first page with a

@@ -31,6 +31,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::FutureExt;
@@ -182,6 +183,9 @@ pub enum FinalizeStep {
     /// The family is contradicted: nothing to finalize, and a certify call
     /// would start a census.
     Contradicted,
+    /// The certificate changed while this tick's late-write pass ran, so the
+    /// version this tick read is stale; the next tick finalizes the new one.
+    CertificateReplaced,
     Ran(CertifyReport),
     Failed(String),
 }
@@ -308,6 +312,8 @@ async fn run_family(
 
     let finalize = if state.contradicted {
         FinalizeStep::Contradicted
+    } else if matches!(&late_write, LateWriteStep::Ran(pass) if pass.certificate_replaced) {
+        FinalizeStep::CertificateReplaced
     } else {
         match certify(
             ctx.store.as_ref(),
@@ -401,37 +407,63 @@ async fn run_background_migrate(
         crate::maintain::claiming(&unclaimed, ctx.migrate_claim_process_id, ctx.clock.clone())
             .into_owned();
     let runtime = tokio::runtime::Handle::current();
+    // Dropping this tick (at shutdown) does not stop the blocking thread, so
+    // the guard tells the walk to stop before its next unit.
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = CancelOnDrop(cancelled.clone());
     let walked = tokio::task::spawn_blocking(move || {
-        runtime.block_on(async move {
-            let mut reports = Vec::with_capacity(units.len());
-            for (tenant, signal, family) in units {
-                let outcome = background_migrate_unit(
-                    job.store.as_ref(),
-                    job.clock.as_ref(),
-                    &compactor,
-                    tenant,
-                    signal,
-                    family,
-                    job.shard_count,
-                    budget,
-                )
-                .await
-                .map_err(|err| err.to_string());
-                reports.push(MigrateUnitReport {
-                    tenant,
-                    signal,
-                    family,
-                    outcome,
-                });
-            }
-            reports
-        })
+        runtime.block_on(walk_units(&job, &compactor, units, budget, &cancelled))
     })
     .await;
     match walked {
         Ok(reports) => report.migrate = reports,
         Err(err) => report.migrate_error = Some(format!("the walk task failed: {err}")),
     }
+}
+
+/// Sets its flag when dropped.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Run `units` in order, stopping before the next unit once `cancelled` is
+/// set. A unit already running finishes; its cursor resumes the walk later.
+async fn walk_units(
+    ctx: &CompatMaintainContext,
+    compactor: &CompactorConfig,
+    units: Vec<(TenantHash, Signal, &'static str)>,
+    budget: MigrateBudget,
+    cancelled: &AtomicBool,
+) -> Vec<MigrateUnitReport> {
+    let mut reports = Vec::with_capacity(units.len());
+    for (tenant, signal, family) in units {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let outcome = background_migrate_unit(
+            ctx.store.as_ref(),
+            ctx.clock.as_ref(),
+            compactor,
+            tenant,
+            signal,
+            family,
+            ctx.shard_count,
+            budget,
+        )
+        .await
+        .map_err(|err| err.to_string());
+        reports.push(MigrateUnitReport {
+            tenant,
+            signal,
+            family,
+            outcome,
+        });
+    }
+    reports
 }
 
 /// Log `report`: one line per family and per background migrate unit that did
@@ -476,7 +508,7 @@ pub fn log_report(report: &CompatMaintainReport) {
             ),
         }
         match &unit.finalize {
-            FinalizeStep::Contradicted => {}
+            FinalizeStep::Contradicted | FinalizeStep::CertificateReplaced => {}
             FinalizeStep::Ran(CertifyReport::Certified { version, .. }) => tracing::info!(
                 family,
                 version,
@@ -525,6 +557,18 @@ pub fn log_report(report: &CompatMaintainReport) {
         let signal = unit.signal.key_prefix();
         match &unit.outcome {
             Ok(BackgroundMigrateOutcome::NoPolicy | BackgroundMigrateOutcome::UpToDate { .. }) => {}
+            Ok(BackgroundMigrateOutcome::DrainedUnderContradiction {
+                active_version,
+                floor,
+            }) => tracing::debug!(
+                tenant,
+                signal,
+                family = unit.family,
+                active_version,
+                floor,
+                "background migrate: contradicted family already walked clean under this \
+                 certificate and watermark; skipped"
+            ),
             Ok(BackgroundMigrateOutcome::Walked {
                 active_version,
                 report,
@@ -622,7 +666,9 @@ mod tests {
     };
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_maintain::FixedClock;
-    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{GetRange, PutOptions};
     use ravel_proto::sys::v1 as sysproto;
@@ -979,6 +1025,67 @@ mod tests {
         assert!(cursor_present(store.as_ref()).await, "no certify call");
     }
 
+    /// A certificate replaced while the tick's late-write pass ran is not
+    /// finalized that tick: the version and certification time the tick read
+    /// are stale, so the certify call is skipped and the next tick finalizes
+    /// the new certificate.
+    ///
+    /// DISTINGUISHING: a unit that finalizes after a replaced pass calls
+    /// certify with the stale version, and its step reports the certify
+    /// outcome instead of `CertificateReplaced`.
+    #[tokio::test]
+    async fn a_certificate_replaced_during_the_pass_skips_finalization() {
+        let store = Arc::new(MemoryStore::with_page_size(2));
+        seed_rseg(&store).await;
+        certify_unfinalized(&store).await;
+        let held_key = seed_commit(&store, V_SEG, NOW1 + HOUR).await;
+        let clock = FixedClock::new(NOW1 + 2 * HOUR);
+        let faulted = Arc::new(FaultStore::new(store.clone(), FaultPlan::empty()));
+        let gate = faulted.hold(Op::Get, Some(held_key), Occurrence::Nth(1));
+        let mut ctx = context(store.clone(), &clock);
+        ctx.store = faulted.clone();
+
+        let replace = async {
+            gate.wait_until_held(1).await;
+            ravel_catalog::compat::update_compat(store.as_ref(), &ckeys(), |record| {
+                let entry = record
+                    .families
+                    .iter_mut()
+                    .find(|f| f.family == FAMILY_RSEG)
+                    .expect("rseg");
+                if let Some(certificate) = entry.certificate.as_mut() {
+                    certificate.certified_unix_ns += 1;
+                }
+                Ok(())
+            })
+            .await
+            .expect("replace the certificate");
+            for id in gate.held() {
+                assert!(gate.release(id));
+            }
+        };
+        let live = [ctx.worker.process_id()];
+        let (report, ()) = tokio::join!(run_tick(&ctx, &live), replace);
+
+        let unit = only_family(&report);
+        match &unit.late_write {
+            LateWriteStep::Ran(pass) => assert!(pass.certificate_replaced, "{pass:?}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            matches!(unit.finalize, FinalizeStep::CertificateReplaced),
+            "{unit:?}"
+        );
+        let entry = rseg_entry(store.as_ref()).await;
+        assert_eq!(
+            entry.certificate.map(|c| c.certified_unix_ns),
+            Some(NOW1 + 1)
+        );
+        assert!(entry.late_writes_verified_through_unix_ns <= NOW1);
+        assert_eq!(floor(store.as_ref()).await, None);
+        assert!(cursor_present(store.as_ref()).await);
+    }
+
     /// Only the live-set owner of `compat-late-write/rseg` runs the unit.
     #[tokio::test]
     async fn a_process_that_does_not_own_the_family_runs_nothing() {
@@ -1042,6 +1149,13 @@ mod tests {
             )]
         );
         assert_eq!(
+            sample(&body, "ravel_compat_late_write_watermark_age_seconds"),
+            vec![
+                "ravel_compat_late_write_watermark_age_seconds{mode=\"maintain\",family=\"rseg\"} 7200"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
             sample(&body, "ravel_compat_certificate_contradicted"),
             vec!["ravel_compat_certificate_contradicted{mode=\"maintain\",family=\"rseg\"} 0"]
         );
@@ -1060,6 +1174,14 @@ mod tests {
                 certified_seconds + 2 * 3_600
             )]
         );
+        // The pass advanced the watermark to its own start, the tick's now.
+        assert_eq!(
+            sample(&body, "ravel_compat_late_write_watermark_age_seconds"),
+            vec![
+                "ravel_compat_late_write_watermark_age_seconds{mode=\"maintain\",family=\"rseg\"} 0"
+                    .to_string()
+            ]
+        );
         assert_eq!(
             sample(&body, "ravel_compat_certificate_contradicted"),
             vec!["ravel_compat_certificate_contradicted{mode=\"maintain\",family=\"rseg\"} 1"]
@@ -1072,11 +1194,96 @@ mod tests {
         let body = render(crate::config::Mode::All);
         for name in [
             "ravel_compat_late_write_watermark_seconds",
+            "ravel_compat_late_write_watermark_age_seconds",
             "ravel_compat_certificate_contradicted",
             "ravel_compat_certify_finalization_pending",
         ] {
             assert!(!body.contains(name), "{name} rendered outside maintain");
         }
+    }
+
+    /// The real `/metrics` handler of a maintain process renders the
+    /// watermark age as the scrape's wall-clock time minus the watermark, and
+    /// a gateway process over the same view does not render it.
+    #[tokio::test]
+    async fn the_metrics_handler_renders_the_watermark_age_at_scrape_time() {
+        let store = Arc::new(MemoryStore::with_page_size(2));
+        seed_rseg(&store).await;
+        certify_unfinalized(&store).await;
+        let clock = FixedClock::new(NOW1 + 2 * HOUR);
+        let ctx = context(store.clone(), &clock);
+        crate::compat::refresh_once(&ctx.view).await;
+        assert_eq!(
+            rseg_entry(store.as_ref())
+                .await
+                .late_writes_verified_through_unix_ns,
+            NOW1
+        );
+        let catalog = |view: &CompatView| {
+            Arc::new(
+                ravel_catalog::Catalog::new(store.clone(), ravel_catalog::CatalogConfig::default())
+                    .expect("catalog")
+                    .with_compat_policy(Some(view.clone())),
+            )
+        };
+        let series =
+            "ravel_compat_late_write_watermark_age_seconds{mode=\"maintain\",family=\"rseg\"} ";
+
+        let before_ns = crate::compat::SystemCompatClock.now_unix_ns();
+        let body = crate::metrics::scrape_test_support::scrape_catalog(
+            crate::config::Mode::Maintain,
+            catalog(&ctx.view),
+        )
+        .await;
+        let after_ns = crate::compat::SystemCompatClock.now_unix_ns();
+        let ages: Vec<f64> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix(series))
+            .map(|value| value.parse().expect("float sample"))
+            .collect();
+        assert_eq!(ages.len(), 1, "{body}");
+        let lowest = (before_ns - NOW1) as f64 / 1e9;
+        let highest = (after_ns - NOW1) as f64 / 1e9;
+        assert!(
+            ages[0] >= lowest - 1e-3 && ages[0] <= highest + 1e-3,
+            "age {} outside [{lowest}, {highest}]",
+            ages[0]
+        );
+
+        let body = crate::metrics::scrape_test_support::scrape_catalog(
+            crate::config::Mode::Gateway,
+            catalog(&ctx.view),
+        )
+        .await;
+        assert!(body.contains("ravel_compat_epoch"), "{body}");
+        assert!(
+            !body.contains("ravel_compat_late_write_watermark_age_seconds"),
+            "{body}"
+        );
+    }
+
+    /// A family without a certificate renders no watermark age sample, even
+    /// in `--mode maintain`.
+    #[tokio::test]
+    async fn the_watermark_age_is_absent_without_a_certificate() {
+        let store = Arc::new(MemoryStore::with_page_size(2));
+        seed_rseg(&store).await;
+        let clock = FixedClock::new(NOW1 + 2 * HOUR);
+        let ctx = context(store.clone(), &clock);
+        crate::compat::refresh_once(&ctx.view).await;
+        assert!(ctx.view.last_record().is_some());
+        let mut body = String::new();
+        crate::metrics::render_compat_family(
+            &mut body,
+            crate::config::Mode::Maintain,
+            &crate::metrics::CompatSnapshot::of(&ctx.view, clock.now_ns()),
+        );
+        assert!(
+            !body
+                .lines()
+                .any(|line| line.starts_with("ravel_compat_late_write_watermark_age_seconds{")),
+            "{body}"
+        );
     }
 
     /// With `--background-migrate`, a tick runs the background migrate unit
@@ -1124,6 +1331,69 @@ mod tests {
             ),
             "{:?}",
             unit.outcome
+        );
+        assert_eq!(floor(store.as_ref()).await, Some(V_SEG));
+    }
+
+    /// A walk whose tick is dropped stops before its next unit, and the unit
+    /// already running finishes: here the tick's guard drops while the first
+    /// unit's provisioning GET is held.
+    ///
+    /// DISTINGUISHING: a walk that does not check the flag between units runs
+    /// the second unit too and reports two.
+    #[tokio::test]
+    async fn a_cancelled_walk_stops_before_its_next_unit() {
+        let store = Arc::new(MemoryStore::with_page_size(2));
+        seed_rseg(&store).await;
+        let clock = FixedClock::new(NOW1);
+        let faulted = Arc::new(FaultStore::new(store.clone(), FaultPlan::empty()));
+        let gate = faulted.hold(
+            Op::Get,
+            Some(provisioning_key(&tenant(), Signal::Metrics)),
+            Occurrence::Nth(1),
+        );
+        let mut ctx = context(store.clone(), &clock);
+        crate::compat::refresh_once(&ctx.view).await;
+        ctx.store = faulted.clone();
+        let compactor = CompactorConfig {
+            compat_policy: Some(ravel_maintain::MaintainCompatPolicy::new(
+                ctx.view.clone(),
+                Arc::new(ViewClock(clock.clone())),
+            )),
+            ..CompactorConfig::default()
+        };
+        let unit = (tenant(), Signal::Metrics, FAMILY_RSEG);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let guard = CancelOnDrop(cancelled.clone());
+
+        let cancel = async {
+            gate.wait_until_held(1).await;
+            drop(guard);
+            for id in gate.held() {
+                assert!(gate.release(id));
+            }
+        };
+        let (reports, ()) = tokio::join!(
+            walk_units(
+                &ctx,
+                &compactor,
+                vec![unit, unit],
+                BACKGROUND_MIGRATE_BUDGET,
+                &cancelled
+            ),
+            cancel
+        );
+
+        let [only] = reports.as_slice() else {
+            panic!("the second unit ran after the cancel: {reports:?}");
+        };
+        assert!(
+            matches!(
+                only.outcome,
+                Ok(BackgroundMigrateOutcome::Walked { ref held, .. }) if held.is_empty()
+            ),
+            "{:?}",
+            only.outcome
         );
         assert_eq!(floor(store.as_ref()).await, Some(V_SEG));
     }

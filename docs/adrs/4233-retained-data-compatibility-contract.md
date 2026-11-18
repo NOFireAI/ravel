@@ -542,8 +542,9 @@ For a class A family:
     `late_writes_verified_through_unix_ns`, set to `S` by `certify`. A pass
     that completes CAS-writes its start time there only when that is later
     than the stored value, so the watermark never moves back when passes
-    finish out of order. A pass interrupted by its budget and resumed keeps
-    the start of its first run, the earliest, like `certify`'s `S`.
+    finish out of order. A pass interrupted by its budget and resumed
+    (withdrawn by the late-write budget correction below) keeps the start of
+    its first run, the earliest, like `certify`'s `S`.
   - The late-write pass lists the commit prefixes (commit, compaction and
     rewrite records) of every signal of F and GETs only the records whose
     `LastModified` is after the watermark minus `clock_skew_allowance`; every
@@ -553,7 +554,8 @@ For a class A family:
     and the bucket's writes are refused; `compat verify` reports it.
   - The pass runs as a daily maintenance unit (any maintain process; the
     CAS makes concurrent passes harmless) and on demand as `ravel-cli compat
-    verify`, under `--compat-check-budget`. It costs one LIST of every
+    verify`, under `--compat-check-budget` (there is no such flag: see the
+    late-write budget correction below). It costs one LIST of every
     commit page of those signals and one GET per record landed since the
     watermark.
   - The retired-reader release at startup refuses when the certificate is
@@ -561,7 +563,9 @@ For a class A family:
     advanced past `S` (the procedure runs `compat verify` from the release
     that reads both versions before installing it). A watermark older than
     7 days only warns and sets `ravel_compat_late_write_watermark_age_seconds`,
-    so a long maintenance outage does not stop processes from restarting.
+    so a long maintenance outage does not stop processes from restarting
+    (the gauge is rendered in maintain mode only: see the late-write budget
+    correction below).
   - A late write is never a silent wrong answer: its object fails closed
     typed at read time and the retention version hold keeps it. The remedy
     is to roll back to the release that reads both versions, `migrate`, and
@@ -1127,3 +1131,25 @@ attestation (the writer-role attestation amendment above). Neither change
 touches `sys/compat` or any persisted version, so a store adopted by
 v0.34.0 is held to the same contract by every later release, and the
 baseline does not move.
+
+## Amendment (2026-11-18): correction to decision 7, the late-write pass budget and gauge (issue #4399)
+
+<!-- amendment-applies: sections="7. Retiring a reader requires a certificate that stays checkable" pointer="late-write budget correction" -->
+<!-- amendment-supersedes: phrase="interrupted by its budget and resumed" pointer="late-write budget correction" -->
+<!-- amendment-supersedes: phrase="under `--compat-check-budget`" pointer="late-write budget correction" -->
+
+Correction to decision 7 (late-write pass budget and gauge). There is no
+'--compat-check-budget'. A late-write pass is not resumable: it runs to
+completion or writes nothing, and only a completed pass advances the
+watermark, to its own start time. The sentence about a pass interrupted by
+its budget is withdrawn. The maintain unit runs the pass per certified
+family on the first tick after a certificate and then once the watermark is
+a day old; a failed pass leaves the watermark, so it reruns from the start
+on the next tick. Each attempt costs one LIST of every commit page of the
+family's signals plus one GET per record whose 'LastModified' is after the
+watermark minus 'clock_skew_allowance'. No object is read twice within a
+pass, and unexamined records never fall behind the watermark. Operators
+watch 'ravel_compat_late_write_watermark_age_seconds{family}': now minus
+the watermark, computed at scrape time, rendered in maintain mode only,
+absent without a certificate. The startup gate in other modes only logs the
+7-day warning.

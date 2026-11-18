@@ -332,7 +332,7 @@ Adopt the store at the baseline (ADR-4233 decision 1): run the census over every
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
-| `--baseline-major` |  | `0` | The baseline release the store is adopted at (expected v0.34.0) |
+| `--baseline-major` |  | `0` | The baseline release the store is adopted at; v0.34.0, the baseline release, by default |
 | `--baseline-minor` |  | `34` |  |
 | `--json` |  |  | Emit the report as JSON |
 | `--max-publish-lifetime` |  | `1h` | `P`, the longest a publish may run, recorded in `sys/compat` and only ever raised later (ADR-4233 decision 7). A humantime duration |
@@ -373,7 +373,7 @@ Run the late-write pass and report the contract state (ADR-4233 decision 7): for
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
 | `--clock-skew-allowance` |  | `1m` | The deployment's clock skew allowance, a humantime duration |
-| `--family` |  |  | Limit the late-write pass to one class-A family. Unset runs it for every class-A family that carries a certificate |
+| `--family` |  |  | Limit the late-write pass to one class-A family; any other family is refused. Unset runs it for every class-A family that carries a certificate |
 | `--json` |  |  | Emit the report as JSON |
 
 ### compat status
