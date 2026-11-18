@@ -56,7 +56,9 @@ flowchart LR
   itself produce: the store call's result or a re-read, never a flag the same
   code just set. `assert_always` also fails when never reached, so it is the
   default. `inv_always_or_unreachable!` is allowed only on a guard that only a
-  fault reaches, and its row then also names an `inv_reachable!`.
+  fault reaches, and its row then also names an `inv_reachable!`. A site
+  whose re-read can fail to tell uses `inv_always_if_known!` (see the #4335
+  amendment below).
 - **Driver.** An invariant that no single site sees is checked in the driver:
   against the acked-record model, or by a store audit that lists the bucket
   and decodes HEAD, parts and records through `ravel-cli`.
@@ -76,7 +78,7 @@ site holding and each mutant breaking it.
 | Area | In scope | Out of scope, and why |
 |---|---|---|
 | commit (21 rows) | SUT: `NoCommitWithoutData`, `OneIdentityOneContent`, `MarkerImpliesAllShardsDurable`, `NoPublishAfterAbandon`, `TokenNeverServesStale`. Driver (exists): `StrictAckImpliesDurable`, the duplicate and deadline obligations. Reachable: the put, retry, ack, abandon and marker actions | `TombstoneBucket`, `SupersedeRecord` (maintain, area 2); token identity and `PinFlush` (pure values, unit tested) |
-| catalog (25) | Driver model: `CompactionPreservesMultiset`. Store audit: `HeadNamedObjectNeverDeleted`, `HeadNamesOnlyCompleteParts`. SUT: `NoLiveCommitOmittedByLostCas`, `CorruptHeadFailsClosedOnDeletePaths`, `CompactionRecordImmutable` | Query rows and `SignalDedupContract` (differential tests own them); the offline oracle row |
+| catalog (25) | Driver model: `CompactionPreservesMultiset`. Store audit: `HeadNamedObjectNeverDeleted` (also an SUT site at the sweep, see the #4335 amendment below), `HeadNamesOnlyCompleteParts`. SUT: `NoLiveCommitOmittedByLostCas`, `CorruptHeadFailsClosedOnDeletePaths`, `CompactionRecordImmutable` | Query rows and `SignalDedupContract` (differential tests own them); the offline oracle row |
 | common (9) | All nine, from a raw S3 contract driver against RustFS | none |
 | lifecycle (29) | SUT and audit: the delete gates, hold, refresh-failure, rewrite and completion rows, including `CompletionImpliesNoPreRewriteExposure`. Driver: `ErasedSubjectNeverServedAfterRequest` | Flight ticket and cached-HEAD pin rows (the driver holds no long-pinned query); the horizon `ASSUME` (startup validation) |
 | resharding (19) | SUT: `OneCasWinner`, `CasAppendNeverDiscards`, the reader fence. With clock control (decision 5): `StaleWriterFailsClosed`, `EveryAdmittedWriteInScanSet`, `TokenResolvesAcrossReshards` | constants and CLI lead enforcement (unit tested) |
@@ -99,7 +101,7 @@ as it does `format-drill`.
 | Area | Mutants (negative cfg stem); each also runs in Antithesis |
 |---|---|
 | commit | `ack-before-commit`, `commit-before-data`, `mismatched-identity-idempotent` (also pins the identity RNG), `marker-before-all-shards` |
-| catalog | `lost-cas-proceeds`, `compaction-swaps-record`, `sweep-superseded-no-head-gate`, `corrupt-head-ignores-delete-gate` |
+| catalog | `lost-cas-proceeds`, `compaction-swaps-record`, `sweep-superseded-no-head-gate`, `corrupt-head-ignores-delete-gate`; the #4335 amendment below adds `compaction-loser-overwrites` and names the property each compaction mutant breaks |
 | common | `lost-response-not-applied`, `cas-accepts-stale-version`, `list-never-progresses` (bounded page count), in a driver-side broken store, since RustFS cannot be mutated |
 | lifecycle | `refresh-failure-is-no-hold`, `delete-before-horizon`, `rewrite-keeps-erased-records`, `complete-ignores-served-set` |
 | resharding, maintenance | `mo-diverge-overwrites-record`, `mo-missing-part-reports-converged`, `no-writer-fence`, `token-validated-against-count` |
@@ -175,16 +177,17 @@ occurs as a literal in Rust and a property the table carries, or `none:
 |---|---|---|---|
 | Clean smoke, per workload config (5) | 12 | completes; every guarantee passes; every new SUT assertion reached | predicted; the 12-hour smoke run 4d85276e32085a10291c9eddd59d34b3-67-0 billed 13.0 compute hours over 16 minutes of billable time (`snouty runs usage`), measured 2026-11-16 |
 | Overshoot above the cap, per run | about 1 | billed hours within cap + 1 | measured 2026-11-16: run 4d85276e32085a10291c9eddd59d34b3-67-0 billed 13.0 under a cap of 12, run 5bafcae0c50b1efc354cb19c89294955-67-0 billed 25.0 under a cap of 24 (`snouty runs usage`) |
-| Mutant control in Antithesis, every mutant (19) | 12 each | named property fails with a counterexample | predicted |
+| Mutant control in Antithesis, every mutant (19; 20 per the #4335 amendment below) | 12 each | named property fails with a counterexample | predicted |
 | Mutant control, local loop, every mutant | 0 | named property false in the SDK's local output | predicted |
 | Long run, per workload config (5) | 24 | no new guarantee failure, or one issue per failure | predicted |
-| Whole epic | caps of 423, plus about 29 overshoot, about 452 of about 452 remaining | 5 smokes (60), 19 mutant runs (228), 5 long runs (120), 15 for reruns; 29 runs at about 1 hour of overshoot each; one smoke and one long run per workload config, not per area | predicted; budget raised by the owner 2026-11-16 from 200 to about 490; 38 compute hours billed before this epic (13.0 and 25.0), measured 2026-11-16 (`snouty runs usage`, runs.md) |
+| Whole epic | caps of 423, plus about 29 overshoot, about 452 of about 452 remaining | 5 smokes (60), 19 mutant runs (228; the twentieth the #4335 amendment below adds is not priced), 5 long runs (120), 15 for reruns; 29 runs at about 1 hour of overshoot each; one smoke and one long run per workload config, not per area | predicted; budget raised by the owner 2026-11-16 from 200 to about 490; 38 compute hours billed before this epic (13.0 and 25.0), measured 2026-11-16 (`snouty runs usage`, runs.md) |
 
 A cap is not a hard ceiling: the billed hours of both runs so far came in about
 one hour above it. Twenty-nine runs at that rate cost about 29 hours beyond
 their caps, so the rerun reserve is 15 hours, not 24, and the epic plans to the
 whole of the raised budget. A further rerun beyond that reserve needs the
-owner's go.
+owner's go. The #4335 amendment below brings the mutant count to 20; the
+twentieth mutant's Antithesis run is not priced here.
 
 Runs are priced per workload config, of which decision 4 defines five
 (ingest-durability; catalog-maintenance and its lifecycle and reshard
@@ -327,3 +330,74 @@ the local loop:
 
 Production code still has no clock seam: the jump is test infrastructure
 around unmodified binaries.
+
+## Amendment (2026-11-17): #4335 catalog mutants and the sweep site
+
+<!-- amendment-applies: sections="1. One invariant, one carrier|2. Rows in scope|3. Mutant controls|7. Budget" pointer="#4335 amendment" -->
+
+#4335, the catalog task, corrects the catalog rows of decisions 2 and 3 to
+match the TLA model's negative configs and the sites it shipped, and adds one
+macro to decision 1.
+
+Decision 1 gains `inv_always_if_known!`, an always-property over an
+`Option<bool>`: `Some` is evaluated as `inv_always!` evaluates its condition,
+`None` records nothing, and without the feature it expands to nothing. It
+carries `NoLiveCommitOmittedByLostCas`, "catalog: a fold reports as folded
+only a HEAD the store holds", in `ravel-catalog`'s fold, which re-reads HEAD
+after its CAS. After an acknowledged CAS the property is false only when the
+re-read returns the version the CAS was conditioned on, or no HEAD after an
+acknowledged create; any other version is this write or a later one, such as
+a rebuild over a corrupted HEAD, whatever watermark it holds. After a refused
+CAS, reached only under the `lost-cas-proceeds` mutant, it holds only when the
+stored HEAD is this fold's. A failed re-read, a HEAD that does not decode
+where it is compared, and no HEAD after an acknowledged overwrite cannot
+tell, and record nothing.
+
+This property assumes a store does not reuse a version for a different write.
+A CAS conditioned on a corrupt HEAD breaks that assumption and so records
+nothing (the `None` arm): the catalog-maintenance driver corrupts HEAD with a
+fixed body, and RustFS reuses a content-derived ETag for identical bytes
+(#4389), so when the driver re-corrupts with the same body between the acked
+CAS and the re-read, the re-read returns the very version the CAS was
+conditioned on even though the write landed. A Valid HEAD's bytes carry the
+fold's `folder_id` and `created_unix_ns`, so its version does not recur and
+its arm still evaluates. One case stays uncovered: a retry within a single
+fold call that rewrites byte-identical HEAD bytes over its own applied write
+could still read as not applied; closing it needs a nonce in the HEAD, a
+format change that is out of scope here.
+
+Decision 3's catalog row has five mutants, not four. The model has two
+compaction switches, and each breaks a different invariant
+(`formal/tla/catalog/results.md`):
+
+| Mutant | Model switch | Property it makes false |
+|---|---|---|
+| `compaction-swaps-record` | `CompactionSwapsRecord` | `CompactionPreservesMultiset`, the driver property "catalog: compaction preserves the acked multiset" |
+| `compaction-loser-overwrites` | `CompactionLoserOverwrites` | `CompactionRecordImmutable`, the SUT property "catalog: a published compaction record is never replaced" |
+
+`compaction-swaps-record` moves the last input identity of a compaction to the
+writer id `ffffffff-ffff-ffff-ffff-ffffffffffff`, which no writer is issued
+(writers get version 4 UUIDs), before the parts are built. The record and its
+parts are built under the hash of the identities it names, so it decodes, its
+key matches, its declared `input_set_hash` is the hash of its own inputs (the
+seal-divergence check passes), every part footer carries that hash (the query
+path's L1 identity check passes), and the identity count and every sample
+count are kept (the counts-only conservation gate in `ravel-maintain`'s
+publish path passes). Only the driver's check of the acked multiset sees it.
+The mutant is compaction's: a format migration rewrite, which publishes
+through the same path, is untouched. `compaction-loser-overwrites`
+is the switch an earlier draft shipped under the `compaction-swaps-record`
+name: a publisher that loses the record's create-only PUT writes its own
+payload over the winner's.
+
+Decision 2's catalog row lists `HeadNamedObjectNeverDeleted` under the store
+audit. It also has an SUT site, "catalog: a sweep never deletes an object the
+current HEAD names", in the superseded sweep of `ravel-maintain`, judged from
+one fresh HEAD read per cleared group before that group's first delete; the
+`sweep-superseded-no-head-gate` mutant makes it false there. The store audit
+stays.
+
+Decision 7 prices 19 mutant runs. With this correction there are 20, and the
+twentieth run (a 12-hour cap and about one hour of overshoot) is not in the
+plan of about 452 hours. It comes out of the rerun reserve or needs the
+owner's go, as a rerun beyond the reserve does.

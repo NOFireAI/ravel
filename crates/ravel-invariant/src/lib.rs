@@ -4,6 +4,8 @@
 //!
 //! - [`inv_always!`], [`inv_always_or_unreachable!`] and [`inv_sometimes!`]
 //!   take a condition, a message literal and a details expression;
+//!   [`inv_always_if_known!`] takes an `Option<bool>` in place of the
+//!   condition and evaluates nothing for `None`;
 //!   [`inv_reachable!`] and [`inv_unreachable!`] take the message and the
 //!   details. The message is the property's name in Antithesis and in the
 //!   traceability column, so it is a literal.
@@ -162,6 +164,30 @@ macro_rules! inv_always {
 #[macro_export]
 macro_rules! inv_always {
     ($condition:expr, $message:literal, $details:expr $(,)?) => {};
+}
+
+/// [`inv_always!`] over a verdict that may be unknown: `verdict` is an
+/// `Option<bool>`, evaluated as `inv_always!` evaluates its condition when it
+/// is `Some`, and not evaluated at all when it is `None` (the site could not
+/// tell, which is neither a pass nor a failure).
+#[cfg(any(feature = "antithesis", feature = "capture"))]
+#[macro_export]
+macro_rules! inv_always_if_known {
+    ($verdict:expr, $message:literal, $details:expr $(,)?) => {{
+        let verdict: ::std::option::Option<bool> = $verdict;
+        if let ::std::option::Option::Some(condition) = verdict {
+            $crate::__inv_assert!(always, Always, condition, $message, $details)
+        }
+    }};
+}
+/// [`inv_always!`] over a verdict that may be unknown: `verdict` is an
+/// `Option<bool>`, evaluated as `inv_always!` evaluates its condition when it
+/// is `Some`, and not evaluated at all when it is `None` (the site could not
+/// tell, which is neither a pass nor a failure).
+#[cfg(not(any(feature = "antithesis", feature = "capture")))]
+#[macro_export]
+macro_rules! inv_always_if_known {
+    ($verdict:expr, $message:literal, $details:expr $(,)?) => {};
 }
 
 /// `condition` holds every time this site runs; a run that never reaches it
@@ -352,6 +378,7 @@ pub mod mutant {
         "commit/marker-before-all-shards",
         "catalog/lost-cas-proceeds",
         "catalog/compaction-swaps-record",
+        "catalog/compaction-loser-overwrites",
         "catalog/sweep-superseded-no-head-gate",
         "catalog/corrupt-head-ignores-delete-gate",
         "lifecycle/refresh-failure-is-no-hold",
@@ -520,6 +547,14 @@ mod tests {
             "ravel-invariant test: a sometimes is not evaluated",
             evaluated.set(evaluated.get() + 1)
         );
+        inv_always_if_known!(
+            {
+                evaluated.set(evaluated.get() + 1);
+                Some(false)
+            },
+            "ravel-invariant test: an always-if-known is not evaluated",
+            evaluated.set(evaluated.get() + 1)
+        );
         inv_reachable!(
             "ravel-invariant test: a reachable is not evaluated",
             evaluated.set(evaluated.get() + 1)
@@ -555,6 +590,11 @@ mod tests {
         inv_always_or_unreachable!(
             one == 1,
             "ravel-invariant test: antithesis always-or-unreachable arm",
+            serde_json::json!({ "one": one })
+        );
+        inv_always_if_known!(
+            Some(one == 1),
+            "ravel-invariant test: antithesis always-if-known arm",
             serde_json::json!({ "one": one })
         );
         inv_sometimes!(
@@ -610,6 +650,51 @@ mod tests {
         );
         assert!(broken[0].details.contains('2'), "{}", broken[0].details);
         assert_eq!(broken[0].file, file!());
+    }
+
+    // `None` records nothing; `Some` records exactly what `inv_always!` does
+    // with the same condition, kind included.
+    #[cfg(feature = "capture")]
+    #[test]
+    fn capture_records_an_always_if_known_only_when_known() {
+        use crate::capture::{Kind, evaluations_of};
+
+        const UNKNOWN: &str = "ravel-invariant test: an unknown always-if-known";
+        const HELD: &str = "ravel-invariant test: a held always-if-known";
+        const FALSE: &str = "ravel-invariant test: a false always-if-known";
+        let details_evaluated = std::cell::Cell::new(0u32);
+        inv_always_if_known!(
+            None,
+            "ravel-invariant test: an unknown always-if-known",
+            details_evaluated.set(details_evaluated.get() + 1)
+        );
+        inv_always_if_known!(
+            Some(true),
+            "ravel-invariant test: a held always-if-known",
+            serde_json::json!({ "known": true })
+        );
+        inv_always_if_known!(
+            Some(false),
+            "ravel-invariant test: a false always-if-known",
+            serde_json::json!({ "known": false })
+        );
+
+        assert_eq!(evaluations_of(UNKNOWN), Vec::new());
+        assert_eq!(details_evaluated.get(), 0, "None evaluates no details");
+        let held = evaluations_of(HELD);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].kind, Kind::Always);
+        assert!(held[0].condition && !held[0].is_violation());
+        assert_eq!(held[0].file, file!());
+        let broken = evaluations_of(FALSE);
+        assert_eq!(broken.len(), 1, "{broken:?}");
+        assert_eq!(broken[0].kind, Kind::Always);
+        assert!(!broken[0].condition && broken[0].is_violation());
+        assert!(
+            broken[0].details.contains("\"known\""),
+            "{}",
+            broken[0].details
+        );
     }
 
     #[cfg(feature = "capture")]
