@@ -302,9 +302,12 @@ async fn one_seed(seed: u64, tally: &mut Tally) {
 fn seeded_interleavings_of_migrate_ingest_compaction_and_a_late_write() {
     let mut tally = Tally::default();
     for seed in 0..SEEDS {
-        common::with_seed_context(seed, std::panic::AssertUnwindSafe(|| {
-            block_on(seed, one_seed(seed, &mut tally));
-        }));
+        common::with_seed_context(
+            seed,
+            std::panic::AssertUnwindSafe(|| {
+                block_on(seed, one_seed(seed, &mut tally));
+            }),
+        );
     }
     assert!(
         tally.certified > 0 && tally.contradicted > 0,
