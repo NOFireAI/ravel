@@ -111,6 +111,7 @@
 //! (L0 keys carry no ingest-hour component); see [`sweep_shard_zoned`]'s doc
 //! for that deviation.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use bytes::Bytes;
@@ -1815,11 +1816,11 @@ async fn sweep_superseded_impl(
     let mut deletes_succeeded = 0usize;
     let mut data_bytes = 0u64;
     let mut first_refusal: Option<StoreError> = None;
-    // Per cleared group, whether a fresh HEAD read names one of its objects:
-    // read once, before the group's first delete, by the assertion below,
-    // which compiles out of a default build.
-    #[allow(unused_mut, unused_variables)]
-    let mut head_names_group: Vec<Option<bool>> = vec![None; cleared.len()];
+    // Per cleared group index, whether a fresh HEAD read names one of its
+    // objects: read once, before the group's first delete, by the assertion
+    // below. Only that assertion fills or reads it, so where assertions
+    // compile out it stays empty and never allocates.
+    let _head_names_group: RefCell<HashMap<usize, bool>> = RefCell::default();
     for delete_loop in [
         DeleteLoop::InputRecords,
         DeleteLoop::Data,
@@ -1839,24 +1840,27 @@ async fn sweep_superseded_impl(
                     // afresh, not the one the gate above planned from. A HEAD
                     // that cannot be read then proves nothing either way.
                     ravel_invariant::inv_always!(
-                        !match head_names_group[index] {
-                            Some(named) => named,
-                            None => {
-                                let named = matches!(
-                                    SnapshotReachability::new()
-                                        .with_read_gate(config.read_gate.clone())
-                                        .object_gate(
-                                            store,
-                                            tenant,
-                                            signal,
-                                            group.ingest_hour_bucket,
-                                            &group.objects,
-                                        )
-                                        .await,
-                                    Ok(SnapshotGate::Blocked(SnapshotBlock::Named))
-                                );
-                                head_names_group[index] = Some(named);
-                                named
+                        !{
+                            let cached = _head_names_group.borrow().get(&index).copied();
+                            match cached {
+                                Some(named) => named,
+                                None => {
+                                    let named = matches!(
+                                        SnapshotReachability::new()
+                                            .with_read_gate(config.read_gate.clone())
+                                            .object_gate(
+                                                store,
+                                                tenant,
+                                                signal,
+                                                group.ingest_hour_bucket,
+                                                &group.objects,
+                                            )
+                                            .await,
+                                        Ok(SnapshotGate::Blocked(SnapshotBlock::Named))
+                                    );
+                                    _head_names_group.borrow_mut().insert(index, named);
+                                    named
+                                }
                             }
                         },
                         "catalog: a sweep never deletes an object the current HEAD names",
