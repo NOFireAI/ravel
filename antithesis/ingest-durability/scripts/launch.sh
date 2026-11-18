@@ -9,17 +9,38 @@
 #       MUTANTS=1), with the named mutant switched on in ravel1 and ravel2. The
 #       name must be a mutant in formal/tla/commit/antithesis-mutants.tsv; the
 #       run should make that line's property fail (README.md, Mutants).
+#   CONFIG=config-coverage  launch the coverage variant (README.md, Coverage
+#       variant) from config-coverage/ on the same images, as test
+#       ravel-ingest-durability-coverage with attrs.variant=coverage. Not
+#       with a mutant.
 set -euo pipefail
 HOURS="${1:?max compute hours}"
 DESC="${2:-ravel ingest durability}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WL="$(cd "$HERE/.." && pwd)"
-CONFIG="$WL/config"
+VARIANT_CONFIG="${CONFIG:-config}"
 CHECKOUT=$(git -C "$HERE" rev-parse HEAD)
 MUTANT="${RAVEL_ANTITHESIS_MUTANT:-}"
 TSV="$WL/../../formal/tla/commit/antithesis-mutants.tsv"
 TAG=ingest-durability
 TEST_NAME=ravel-ingest-durability
+VARIANT_PARAMS=()
+case "$VARIANT_CONFIG" in
+    config) ;;
+    config-coverage)
+        if [ -n "$MUTANT" ]; then
+            echo "refused: mutant runs use the base config; unset CONFIG or RAVEL_ANTITHESIS_MUTANT" >&2
+            exit 1
+        fi
+        TEST_NAME=ravel-ingest-durability-coverage
+        VARIANT_PARAMS=(--param attrs.variant=coverage)
+        DESC="$DESC (coverage variant)"
+        ;;
+    *)
+        echo "refused: CONFIG must be config or config-coverage, not '$VARIANT_CONFIG'" >&2
+        exit 1 ;;
+esac
+CONFIG="$WL/$VARIANT_CONFIG"
 
 if [ -n "$MUTANT" ]; then
     # Only a commit mutant listed in the TSV. ravel-server refuses an unknown
@@ -103,4 +124,5 @@ snouty launch --launcher basic_test --config "$CONFIG" \
     --param attrs.workload=ingest-durability \
     --param attrs.ravel_ref="$REF" \
     --param attrs.mutant="${MUTANT:-none}" \
-    --param attrs.plugin_version=0.1.1
+    --param attrs.plugin_version=0.1.1 \
+    ${VARIANT_PARAMS[@]+"${VARIANT_PARAMS[@]}"}

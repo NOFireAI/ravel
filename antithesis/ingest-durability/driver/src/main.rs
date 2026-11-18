@@ -7,6 +7,9 @@
 //! The driver is a hegel concurrent state machine. Each rule sends one write
 //! or one query to a ravel-server node and records the outcome in the model
 //! (`model.rs`). See antithesis/ingest-durability/README.md for the properties.
+//! `WORKLOAD_COVERAGE=1` turns on the coverage variant (`coverage.rs`).
+
+mod coverage;
 
 use ravel_antithesis_driver::{model, otlp, ravel};
 
@@ -23,6 +26,7 @@ use serde_json::json;
 
 use antithesis_instrumentation as _;
 
+use coverage::Coverage;
 use model::{Attempt, Mode, Model, Signal, Write};
 use otlp::{METRIC_SERIES, PartialSuccess, Sample, VALUE_STRIDE};
 use ravel::{Ravel, Reply, SqlFailure};
@@ -91,6 +95,8 @@ struct Shared {
     max_writes: usize,
     /// `WORKLOAD_INJECT_MISSING_RECORD=1`: the local loop's self-check.
     inject_missing: bool,
+    /// The coverage variant's state; `None` in the base variant.
+    cov: Option<Coverage>,
 }
 
 struct Workload(Arc<Shared>);
@@ -343,6 +349,20 @@ impl Shared {
         }
     }
 
+    /// Classify one write response and run every assertion on it, before its
+    /// outcome is recorded in the model.
+    fn judge_reply(&self, w: &Write, node: usize, reply: &Reply) -> Attempt {
+        let mut attempt = classify(w.signal, w.mode, reply);
+        if let Some(cov) = &self.cov {
+            attempt = cov.reclassify(w, reply, attempt);
+        }
+        self.observe_write(w, node, reply, &attempt);
+        if let Some(cov) = &self.cov {
+            cov.observe(w, node, reply, &attempt);
+        }
+        attempt
+    }
+
     /// Send a registered write, retrying an attempt with no definite outcome
     /// the way an OTLP exporter does, then sometimes replay an acknowledged
     /// keyed write with the same key.
@@ -371,8 +391,7 @@ impl Shared {
                 gzip,
                 timeout,
             );
-            let attempt = classify(w.signal, w.mode, &reply);
-            self.observe_write(w, node, &reply, &attempt);
+            let attempt = self.judge_reply(w, node, &reply);
             self.finish_attempt(w.id, k, attempt.clone());
             let retryable = match &attempt {
                 Attempt::NoResponse => true,
@@ -415,8 +434,7 @@ impl Shared {
             gzip,
             WRITE_TIMEOUT,
         );
-        let attempt = classify(w.signal, w.mode, &reply);
-        self.observe_write(w, node, &reply, &attempt);
+        let attempt = self.judge_reply(w, node, &reply);
         self.finish_attempt(w.id, k, attempt.clone());
         if let Attempt::Acked { header } = &attempt {
             if *header == original {
@@ -492,6 +510,9 @@ impl Shared {
             .sql(node, &logs_query(None), start, end, &[], READ_TIMEOUT)?;
         let counts = model::log_counts(ravel::rows(&value)).map_err(SqlFailure::BadBody)?;
         let m = lock(&self.model);
+        if let Some(cov) = &self.cov {
+            cov.check_log_rows(&m, &counts, node);
+        }
         Ok(model::judge_logs(&m, &counts, expect))
     }
 
@@ -510,6 +531,9 @@ impl Shared {
             .sql(node, &metrics_query(None), start, end, &[], READ_TIMEOUT)?;
         let rows = model::metric_rows(ravel::rows(&value)).map_err(SqlFailure::BadBody)?;
         let m = lock(&self.model);
+        if let Some(cov) = &self.cov {
+            cov.check_metric_rows(&m, &rows, node);
+        }
         Ok(model::judge_metrics(&m, &rows, expect))
     }
 
@@ -569,22 +593,28 @@ fn first(lines: &[String]) -> serde_json::Value {
     json!({ "count": lines.len(), "first": lines.iter().take(5).collect::<Vec<_>>() })
 }
 
-#[hegel::concurrent_state_machine]
-impl Workload {
-    #[rule(groups = ["main"], weight = 6)]
-    fn write_logs(&self, tc: TestCase) {
-        let s = &self.0;
+/// The rules, shared by the base and the coverage machines.
+impl Shared {
+    fn write_logs(&self, tc: &TestCase) {
+        let s = self;
         let Some(_guard) = s.enter() else {
             return;
         };
         let records = tc.draw(gs::integers::<u32>().min_value(1).max_value(8));
         let streams = tc.draw(gs::integers::<u32>().min_value(1).max_value(4));
-        let mode = draw_mode(&tc);
+        let mode = draw_mode(tc);
         let keyed = tc.draw(gs::weighted_booleans(0.5));
         let gzip = tc.draw(gs::weighted_booleans(0.3));
+        let poison = s
+            .cov
+            .as_ref()
+            .map_or(0, |c| c.draw_log_poison(tc, mode, keyed));
         let Some(w) = s.register(Signal::Logs, mode, records, 0, 0, keyed) else {
             return;
         };
+        if let Some(cov) = &s.cov {
+            cov.set_poison(w.id, poison);
+        }
         // The local loop's self-check: the model expects one record more than
         // is sent, so the presence assertions must fail.
         if s.inject_missing
@@ -593,13 +623,16 @@ impl Workload {
         {
             m.records += 1;
         }
-        let body = otlp::logs_request(w.id, records, streams, w.ts_ns);
-        s.send(&tc, &w, &body, gzip);
+        let body = if poison > 0 {
+            coverage::logs_request(w.id, records, streams, w.ts_ns, poison)
+        } else {
+            otlp::logs_request(w.id, records, streams, w.ts_ns)
+        };
+        s.send(tc, &w, &body, gzip);
     }
 
-    #[rule(groups = ["main"], weight = 3)]
-    fn write_metrics(&self, tc: TestCase) {
-        let s = &self.0;
+    fn write_metrics(&self, tc: &TestCase) {
+        let s = self;
         let Some(_guard) = s.enter() else {
             return;
         };
@@ -609,18 +642,27 @@ impl Workload {
                 .min_value(0)
                 .max_value(METRIC_SERIES - 1),
         );
-        let mode = draw_mode(&tc);
+        let mode = draw_mode(tc);
         let gzip = tc.draw(gs::weighted_booleans(0.3));
+        let poison = s
+            .cov
+            .as_ref()
+            .map_or(0, |c| c.draw_metric_poison(tc, mode));
         let Some(w) = s.register(Signal::Metrics, mode, 0, samples, offset, false) else {
             return;
         };
-        let body = otlp::metrics_request(&w.samples);
-        s.send(&tc, &w, &body, gzip);
+        let body = match &s.cov {
+            Some(cov) if poison > 0 => {
+                cov.set_poison(w.id, poison);
+                coverage::metrics_request(&w, poison)
+            }
+            _ => otlp::metrics_request(&w.samples),
+        };
+        s.send(tc, &w, &body, gzip);
     }
 
-    #[rule(groups = ["main"], weight = 3)]
-    fn read_with_tokens(&self, tc: TestCase) {
-        let s = &self.0;
+    fn read_with_tokens(&self, tc: &TestCase) {
+        let s = self;
         let Some(_guard) = s.enter() else {
             return;
         };
@@ -642,7 +684,7 @@ impl Workload {
                 None => return,
             }
         };
-        let node = draw_node(&tc, s.ravel.nodes.len());
+        let node = draw_node(tc, s.ravel.nodes.len());
         let details = |e: &dyn std::fmt::Display| json!({ "write": w.id, "node": node, "error": e.to_string() });
         if logs {
             match s.token_read_logs(node, std::slice::from_ref(&w)) {
@@ -653,6 +695,9 @@ impl Workload {
                         &json!({ "write": w.id, "node": node, "missing": first(&j.missing), "attempts": format!("{:?}", w.attempts) })
                     );
                     Shared::check_log_rows(&j, node, "token");
+                    if let Some(cov) = &s.cov {
+                        cov.note_token_read(&w);
+                    }
                 }
                 Err(SqlFailure::Status(503, e)) => {
                     assert_reachable!(
@@ -671,6 +716,9 @@ impl Workload {
                         &json!({ "write": w.id, "node": node, "missing": first(&j.missing), "attempts": format!("{:?}", w.attempts) })
                     );
                     Shared::check_metric_rows(&j, node, "token");
+                    if let Some(cov) = &s.cov {
+                        cov.note_token_read(&w);
+                    }
                 }
                 Err(SqlFailure::Status(503, e)) => {
                     assert_reachable!(
@@ -683,13 +731,12 @@ impl Workload {
         }
     }
 
-    #[rule(groups = ["main"], weight = 1)]
-    fn scan_without_token(&self, tc: TestCase) {
-        let s = &self.0;
+    fn scan_without_token(&self, tc: &TestCase) {
+        let s = self;
         let Some(_guard) = s.enter() else {
             return;
         };
-        let node = draw_node(&tc, s.ravel.nodes.len());
+        let node = draw_node(tc, s.ravel.nodes.len());
         if tc.draw(gs::weighted_booleans(0.6)) {
             match s.scan_logs(node, &[]) {
                 Ok(j) => {
@@ -729,9 +776,8 @@ impl Workload {
         }
     }
 
-    #[rule(groups = ["main"])]
-    fn eventually(&self, tc: TestCase) {
-        let s = &self.0;
+    fn eventually(&self, tc: &TestCase) {
+        let s = self;
         if !s.eventually_on || s.stopping.load(Ordering::SeqCst) {
             return;
         }
@@ -739,6 +785,81 @@ impl Workload {
             return;
         }
         run_eventually(s, "drawn");
+    }
+
+    /// The coverage variant's drain rule.
+    fn drain(&self, tc: &TestCase) {
+        let Some(cov) = &self.cov else {
+            return;
+        };
+        let Some(_guard) = self.enter() else {
+            return;
+        };
+        cov.drain_step(tc, &self.ravel.nodes);
+    }
+}
+
+#[hegel::concurrent_state_machine]
+impl Workload {
+    #[rule(groups = ["main"], weight = 6)]
+    fn write_logs(&self, tc: TestCase) {
+        self.0.write_logs(&tc);
+    }
+
+    #[rule(groups = ["main"], weight = 3)]
+    fn write_metrics(&self, tc: TestCase) {
+        self.0.write_metrics(&tc);
+    }
+
+    #[rule(groups = ["main"], weight = 3)]
+    fn read_with_tokens(&self, tc: TestCase) {
+        self.0.read_with_tokens(&tc);
+    }
+
+    #[rule(groups = ["main"], weight = 1)]
+    fn scan_without_token(&self, tc: TestCase) {
+        self.0.scan_without_token(&tc);
+    }
+
+    #[rule(groups = ["main"])]
+    fn eventually(&self, tc: TestCase) {
+        self.0.eventually(&tc);
+    }
+}
+
+/// The coverage variant's machine: the base rules, plus graceful drains.
+struct CoverageWorkload(Arc<Shared>);
+
+#[hegel::concurrent_state_machine]
+impl CoverageWorkload {
+    #[rule(groups = ["main"], weight = 6)]
+    fn write_logs(&self, tc: TestCase) {
+        self.0.write_logs(&tc);
+    }
+
+    #[rule(groups = ["main"], weight = 3)]
+    fn write_metrics(&self, tc: TestCase) {
+        self.0.write_metrics(&tc);
+    }
+
+    #[rule(groups = ["main"], weight = 3)]
+    fn read_with_tokens(&self, tc: TestCase) {
+        self.0.read_with_tokens(&tc);
+    }
+
+    #[rule(groups = ["main"], weight = 1)]
+    fn scan_without_token(&self, tc: TestCase) {
+        self.0.scan_without_token(&tc);
+    }
+
+    #[rule(groups = ["main"], weight = 1)]
+    fn drain(&self, tc: TestCase) {
+        self.0.drain(&tc);
+    }
+
+    #[rule(groups = ["main"])]
+    fn eventually(&self, tc: TestCase) {
+        self.0.eventually(&tc);
     }
 }
 
@@ -940,6 +1061,7 @@ fn main(tc: TestCase) {
         eventually_on: cfg.eventually_on,
         max_writes: cfg.max_writes,
         inject_missing: std::env::var("WORKLOAD_INJECT_MISSING_RECORD").is_ok_and(|v| v == "1"),
+        cov: Coverage::from_env(),
     });
 
     for node in 0..shared.ravel.nodes.len() {
@@ -963,8 +1085,15 @@ fn main(tc: TestCase) {
         });
     }
 
-    machine(Workload(shared))
-        .steps(i64::MAX)
-        .max_concurrency(4)
-        .run_concurrent(tc);
+    if shared.cov.is_some() {
+        machine(CoverageWorkload(shared))
+            .steps(i64::MAX)
+            .max_concurrency(4)
+            .run_concurrent(tc);
+    } else {
+        machine(Workload(shared))
+            .steps(i64::MAX)
+            .max_concurrency(4)
+            .run_concurrent(tc);
+    }
 }
