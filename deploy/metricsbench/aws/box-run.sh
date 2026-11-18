@@ -11,7 +11,9 @@
 # STAGE1_ARMS, CONTROL_IMAGE and CONTROL_SOURCE_COMMIT reach the measured run
 # alone, as MB_STAGE1_ARMS, MB_CONTROL_IMAGE and MB_CONTROL_SOURCE_COMMIT: the
 # arms wait for hours to pass or seal, which the ci smoke has no use for. The
-# control image is pulled beside the main one.
+# control image is pulled beside the main one. L1_MAX_PART_BYTES reaches the
+# measured run alone as MB_L1_MAX_PART_BYTES, and RAVEL_ONLY=1 runs it with
+# --ravel-only and no --rss-band; the ci smoke stays a full four-engine run.
 # Exit codes beyond each step's own: 21 STAGE1=1 with no band file for the
 # measured profile (before anything is built), 22 the ci smoke's band check
 # failed, 23 the measured run exited 0 and its band check failed.
@@ -40,6 +42,26 @@ stage1_check() {
   local code=0
   deploy/metricsbench/stage1-check.sh "$2" "$1" >"$1/stage1-check.txt" 2>&1 || code=$?
   return "$code"
+}
+
+# ci_smoke ARGS...: the ci smoke's run.sh, a full four-engine run whatever
+# the measured run's shape; ARGS are its store flags.
+ci_smoke() {
+  deploy/metricsbench/run.sh --profile ci --ravel-image "$RAVEL_IMAGE" --ravel-source-commit "$RAVEL_SOURCE_COMMIT" \
+    --bin-dir target/release --out-dir /mb/out-ci "$@"
+}
+
+# measured_run ARGS...: the measured profile's run.sh with the Stage 1 arms
+# and, with RAVEL_ONLY=1, --ravel-only in place of --rss-band, which it
+# refuses; ARGS are its store flags.
+measured_run() {
+  local shape=(--rss-band "$RSS_BAND")
+  [ "${RAVEL_ONLY:-}" != 1 ] || shape=(--ravel-only)
+  MB_STAGE1_ARMS="${STAGE1_ARMS:-}" MB_CONTROL_IMAGE="${CONTROL_IMAGE:-}" \
+    MB_CONTROL_SOURCE_COMMIT="${CONTROL_SOURCE_COMMIT:-}" MB_L1_MAX_PART_BYTES="${L1_MAX_PART_BYTES:-}" \
+    deploy/metricsbench/run.sh --profile "$PROFILE" --ravel-image "$RAVEL_IMAGE" --ravel-source-commit "$RAVEL_SOURCE_COMMIT" \
+    --bin-dir target/release --out-dir /mb/out-run --anchor-ms "$ANCHOR_MS" \
+    "${shape[@]}" --ravel-objects-band "$OBJECTS_BAND" "$@"
 }
 
 # Sourced by deploy/metricsbench/tests/run.test.sh for the functions above.
@@ -97,8 +119,7 @@ if [ -n "$REAL_S3_PREFIX" ]; then
 fi
 stage "ci smoke"
 code=0
-deploy/metricsbench/run.sh --profile ci --ravel-image "$RAVEL_IMAGE" --ravel-source-commit "$RAVEL_SOURCE_COMMIT" \
-  --bin-dir target/release --out-dir /mb/out-ci ${ci_args[@]+"${ci_args[@]}"} || code=$?
+ci_smoke ${ci_args[@]+"${ci_args[@]}"} || code=$?
 up /mb/out-ci out-ci
 status_line ci "$code"
 [ "$code" -eq 0 ] || finish 20 30
@@ -133,11 +154,7 @@ live=$!
 stage "$PROFILE"
 status_line "${PROFILE}-start" 0
 code=0
-MB_STAGE1_ARMS="${STAGE1_ARMS:-}" MB_CONTROL_IMAGE="${CONTROL_IMAGE:-}" \
-  MB_CONTROL_SOURCE_COMMIT="${CONTROL_SOURCE_COMMIT:-}" \
-  deploy/metricsbench/run.sh --profile "$PROFILE" --ravel-image "$RAVEL_IMAGE" --ravel-source-commit "$RAVEL_SOURCE_COMMIT" \
-  --bin-dir target/release --out-dir /mb/out-run --anchor-ms "$ANCHOR_MS" \
-  --rss-band "$RSS_BAND" --ravel-objects-band "$OBJECTS_BAND" ${store_args[@]+"${store_args[@]}"} || code=$?
+measured_run ${store_args[@]+"${store_args[@]}"} || code=$?
 kill "$met" "$cpu" "$live"
 stage "$PROFILE exit ${code}"
 up /mb/out-run out-run
