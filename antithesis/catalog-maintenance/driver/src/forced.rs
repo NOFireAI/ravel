@@ -192,7 +192,10 @@ mod tests {
     fn the_compaction_gets_what_is_left_before_the_release() {
         assert_eq!(cli_budget(Duration::ZERO), RELEASE_BY);
         assert_eq!(cli_budget(MAX_HELD_AGE), RELEASE_BY - MAX_HELD_AGE);
-        assert_eq!(cli_budget(RELEASE_BY + Duration::from_secs(1)), Duration::ZERO);
+        assert_eq!(
+            cli_budget(RELEASE_BY + Duration::from_secs(1)),
+            Duration::ZERO
+        );
         // The freshest PUT the race takes still leaves the compaction most
         // of the window.
         assert!(cli_budget(MAX_HELD_AGE) >= Duration::from_secs(8));

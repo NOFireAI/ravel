@@ -46,8 +46,8 @@ use ravel_antithesis_driver::ravel::{self, Ravel, Reply, SqlFailure};
 use ravel_antithesis_catalog_driver::{keys, proxy};
 
 use audit::{InputKeys, JsonPart};
-use forced::Held;
 use cli::Cli;
+use forced::Held;
 use s3::Store;
 use seed::Plan;
 
@@ -187,8 +187,7 @@ impl Config {
                 reread_s: env_u64("FAKETIME_CACHE_DURATION", 2),
                 min_acked: usize::try_from(env_u32("CLOCK_JUMP_MIN_ACKED", 20)).unwrap_or(20),
             },
-            proxy: std::env::var("S3_PROXY_CONTROL")
-                .unwrap_or_else(|_| "s3proxy:9001".to_string()),
+            proxy: std::env::var("S3_PROXY_CONTROL").unwrap_or_else(|_| "s3proxy:9001".to_string()),
         }
     }
 }
@@ -1255,7 +1254,12 @@ impl Shared {
     }
 
     /// [`Shared::unfolded_sweep`] once the proxy refuses record PUTs.
-    fn unfolded_sweep_refused(&self, prefix: &str, (hour, shard): (u64, u32), reason: &str) -> bool {
+    fn unfolded_sweep_refused(
+        &self,
+        prefix: &str,
+        (hour, shard): (u64, u32),
+        reason: &str,
+    ) -> bool {
         let now_s = now_ns() / NS_PER_SECOND;
         let nudge_s = clock::seal_nudge_s(now_s, hour, clock::seal_margin_s());
         if !self.nudge(nudge_s, "unfolded sweep: fold seal") {
@@ -1361,7 +1365,10 @@ impl Shared {
         lock(&self.sweeps).observe(before.iter().cloned());
         let present = forced::present_inputs(&inputs, &before);
         self.unfolded_started.store(true, Ordering::SeqCst);
-        if !self.nudge(self.clock.horizon_jump_s, "unfolded sweep: protection horizon") {
+        if !self.nudge(
+            self.clock.horizon_jump_s,
+            "unfolded sweep: protection horizon",
+        ) {
             return false;
         }
         std::thread::sleep(UNFOLDED_PASS_WAIT);
@@ -1622,7 +1629,9 @@ impl Workload {
         };
         let records = tc.draw(gs::integers::<u32>().min_value(1).max_value(8));
         let streams = tc.draw(gs::integers::<u32>().min_value(1).max_value(4));
-        s.write(records, streams, &mut || draw_node(&tc, s.ravel.nodes.len()));
+        s.write(records, streams, &mut || {
+            draw_node(&tc, s.ravel.nodes.len())
+        });
     }
 
     #[rule(groups = ["main"], weight = 1)]

@@ -391,7 +391,10 @@ mod tests {
         let after = now + seal_nudge_s(now, hour, seal_margin_s());
         assert_eq!(sealed_watermark_hour(after * NS_PER_SECOND), Some(hour));
         // Already sealed: no move.
-        assert_eq!(seal_nudge_s(end + 7200, hour, compaction_seal_margin_s()), 0);
+        assert_eq!(
+            seal_nudge_s(end + 7200, hour, compaction_seal_margin_s()),
+            0
+        );
     }
 
     #[test]

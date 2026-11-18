@@ -62,7 +62,10 @@ impl Rules {
     /// Apply one control command and return the reply line.
     pub fn apply(&self, command: &str) -> String {
         let mut s = self.lock();
-        let (verb, arg) = command.trim().split_once(' ').unwrap_or((command.trim(), ""));
+        let (verb, arg) = command
+            .trim()
+            .split_once(' ')
+            .unwrap_or((command.trim(), ""));
         match (verb, arg) {
             ("pass", "") => {
                 *s = State {
@@ -154,7 +157,9 @@ pub fn read_head(r: &mut impl BufRead) -> io::Result<Option<Head>> {
     let mut lines = Vec::new();
     loop {
         let mut line = Vec::new();
-        let n = r.take((MAX_HEAD + 1 - raw.len()) as u64).read_until(b'\n', &mut line)?;
+        let n = r
+            .take((MAX_HEAD + 1 - raw.len()) as u64)
+            .read_until(b'\n', &mut line)?;
         if n == 0 {
             if raw.is_empty() {
                 return Ok(None);
@@ -438,10 +443,14 @@ mod tests {
 
     #[test]
     fn request_heads_frame_their_bodies() {
-        let h = head("PUT /ravel/a/b HTTP/1.1\r\nHost: s3proxy:9000\r\nContent-Length: 5\r\n\r\nhello")
-            .expect("parses")
-            .expect("a head");
-        assert_eq!((h.method.as_str(), h.target.as_str()), ("PUT", "/ravel/a/b"));
+        let h =
+            head("PUT /ravel/a/b HTTP/1.1\r\nHost: s3proxy:9000\r\nContent-Length: 5\r\n\r\nhello")
+                .expect("parses")
+                .expect("a head");
+        assert_eq!(
+            (h.method.as_str(), h.target.as_str()),
+            ("PUT", "/ravel/a/b")
+        );
         assert_eq!(h.body, Body::Length(5));
         assert!(h.raw.ends_with(b"\r\n\r\n"));
         assert!(!h.raw.ends_with(b"hello"));
@@ -481,7 +490,10 @@ mod tests {
     #[test]
     fn keys_come_from_path_style_targets() {
         assert_eq!(key_of(&format!("/ravel/{RECORD}"), "ravel"), RECORD);
-        assert_eq!(key_of(&format!("/ravel/{RECORD}?x-id=PutObject"), "ravel"), RECORD);
+        assert_eq!(
+            key_of(&format!("/ravel/{RECORD}?x-id=PutObject"), "ravel"),
+            RECORD
+        );
         assert_eq!(key_of("/ravel/a%2Fb%3D", "ravel"), "a/b=");
         assert_eq!(key_of("/ravel?list-type=2&prefix=t%2F", "ravel"), "");
         assert_eq!(key_of("/ravelx/a", "ravel"), "");
@@ -496,13 +508,25 @@ mod tests {
         assert_eq!(rules.apply("refuse-records"), "ok");
         assert_eq!(rules.admit("PUT", RECORD, cap), Admit::Refuse);
         assert_eq!(rules.admit("GET", RECORD, cap), Admit::Forward);
-        assert_eq!(rules.admit("PUT", "t/0a0b/catalog/logs/HEAD", cap), Admit::Forward);
+        assert_eq!(
+            rules.admit("PUT", "t/0a0b/catalog/logs/HEAD", cap),
+            Admit::Forward
+        );
         assert_eq!(rules.apply("refuse-key t/0a0b/catalog/logs/HEAD"), "ok");
-        assert_eq!(rules.admit("PUT", "t/0a0b/catalog/logs/HEAD", cap), Admit::Refuse);
-        assert_eq!(rules.admit("DELETE", "t/0a0b/catalog/logs/HEAD", cap), Admit::Forward);
+        assert_eq!(
+            rules.admit("PUT", "t/0a0b/catalog/logs/HEAD", cap),
+            Admit::Refuse
+        );
+        assert_eq!(
+            rules.admit("DELETE", "t/0a0b/catalog/logs/HEAD", cap),
+            Admit::Forward
+        );
         assert_eq!(rules.apply("pass"), "ok");
         assert_eq!(rules.admit("PUT", RECORD, cap), Admit::Forward);
-        assert_eq!(rules.admit("PUT", "t/0a0b/catalog/logs/HEAD", cap), Admit::Forward);
+        assert_eq!(
+            rules.admit("PUT", "t/0a0b/catalog/logs/HEAD", cap),
+            Admit::Forward
+        );
         assert!(rules.apply("refuse-key").starts_with("error"));
         assert!(rules.apply("bogus").starts_with("error"));
     }
@@ -541,7 +565,10 @@ mod tests {
         let rules = Rules::default();
         rules.apply("hold-record");
         let started = Instant::now();
-        assert_eq!(rules.admit("PUT", RECORD, Duration::from_millis(50)), Admit::Forward);
+        assert_eq!(
+            rules.admit("PUT", RECORD, Duration::from_millis(50)),
+            Admit::Forward
+        );
         assert!(started.elapsed() >= Duration::from_millis(50));
         assert_eq!(rules.apply("held"), "none");
     }

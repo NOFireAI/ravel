@@ -3,9 +3,10 @@
 #
 # faketime runs first and exits: it puts libfaketime, the run wrapper and the
 # clock offset file (+0) on the shared `faketime` volume. Every other
-# container starts through that wrapper (/faketime/run), which refuses to
-# start unless libfaketime is preloaded and moves the clock of the binary the
-# container runs, so all seven containers read one wall-clock offset. The
+# container but s3proxy starts through that wrapper (/faketime/run), which
+# refuses to start unless libfaketime is preloaded and moves the clock of the
+# binary the container runs, so those seven containers read one wall-clock
+# offset. The
 # driver rewrites the offset after seeding and some live writes, to move every
 # clock forward together by CLOCK_JUMP_SECS (9000 s, above the 8400 s that
 # seals the ingest hour of every write acked before it; README.md, "The clock
@@ -30,6 +31,15 @@
 # compacts, applies retention and sweeps, sharing the work through the
 # maintain-worker registry. driver is the workload and is the only container
 # excluded from faults.
+#
+# Every ravel-server container reaches rustfs through s3proxy, which forwards
+# every byte unchanged until the driver sets a rule over its control port: hold
+# one compaction record PUT, or refuse record PUTs or one key's PUTs, for the
+# forced races (README.md, "The forced races"). init, the driver and its
+# ravel-cli reach rustfs directly. s3proxy signs nothing and keeps no
+# wall-clock state, so it runs on the real clock; a killed s3proxy is a
+# network outage between the servers and the store, and restarts with no
+# rules.
 #
 # No service has a restart policy: Antithesis restarts the containers it
 # kills or stops, and a policy would restart them early and cancel the fault.
@@ -63,6 +73,7 @@ x-ravel-server: &ravel-server
   entrypoint: ["/faketime/run", "/usr/local/bin/ravel-antithesis-entrypoint"]
   environment:
     <<: [*ravel-store, *faketime-env]
+    RAVEL_S3_ENDPOINT: http://s3proxy:9000
     FAKETIME_CHECK_BINARY: /usr/local/bin/ravel-server
     RUST_LOG: info
     # Empty selects no mutant. scripts/mutant-config.sh writes a copy of this
@@ -74,6 +85,8 @@ x-ravel-server: &ravel-server
     faketime: *faketime-done
     init:
       condition: service_completed_successfully
+    s3proxy:
+      condition: service_started
 
 services:
   faketime:
@@ -122,6 +135,21 @@ services:
     volumes: ["faketime:/faketime:ro"]
     depends_on:
       faketime: *faketime-done
+      rustfs:
+        condition: service_started
+
+  s3proxy:
+    container_name: s3proxy
+    hostname: s3proxy
+    image: ravel-antithesis-driver:catalog-maintenance
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/s3-proxy"]
+    environment:
+      S3_PROXY_LISTEN: 0.0.0.0:9000
+      S3_PROXY_CONTROL: 0.0.0.0:9001
+      S3_PROXY_UPSTREAM: rustfs:9000
+      RAVEL_S3_BUCKET: ravel
+    depends_on:
       rustfs:
         condition: service_started
 
@@ -209,6 +237,8 @@ services:
       RAVEL_MAINTAIN_NODES: http://maint1:4318,http://maint2:4318
       RAVEL_TOKEN: cm-token
       RAVEL_TENANT: cm-tenant
+      # The control port of the proxy the servers' store traffic passes.
+      S3_PROXY_CONTROL: s3proxy:9001
       # Six seeded hours two hours apart, 50 records each.
       SEED_HOURS: "6"
       SEED_HOUR_STRIDE: "2"
@@ -218,7 +248,9 @@ services:
       # then, once a compaction record is seen, twice more so a sweep can
       # delete a superseded input (README.md, "The sweep jumps"). Each sweep
       # jump is at least the shipped default it passes: protection horizon
-      # 90300 s, pinned-query window 4830 s.
+      # 90300 s, pinned-query window 4830 s. The forced races move every
+      # clock further, each move printed on its own line (README.md, "The
+      # forced races").
       CLOCK_JUMP_FILE: /faketime/offset
       CLOCK_JUMP_SECS: "9000"
       CLOCK_SWEEP_HORIZON_JUMP_SECS: "91200"

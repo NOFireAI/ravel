@@ -75,17 +75,25 @@ fi
 # this bound and launch.sh's --setup-timeout add room for the containers to
 # start around it.
 SETUP_LIMIT=900
-# The eventually waits up to 300 s for recovery, then jumps the clocks, folds,
-# compacts and audits, takes the two sweep jumps (each with its reread and
-# serving waits), sweeps, folds, audits again and reads; 2400 s bounds all of
-# it.
-END_LIMIT=$((SECS + 2400))
+# The eventually waits up to 300 s for recovery, then jumps the clocks, runs
+# up to six fold races, three record races and one unfolded-record sweep
+# (README.md, "The forced races"; about 1600 s between them at their waits'
+# bounds), folds, compacts and audits, takes the two sweep jumps (each with
+# its reread and serving waits), sweeps, folds, audits again and reads;
+# 4200 s bounds all of it.
+END_LIMIT=$((SECS + 4200))
 SERVERS="ravel1 ravel2 maint1 maint2"
 MULTISET="catalog: compaction preserves the acked multiset"
 UPPER="catalog: no scan shows a phantom or an excess copy"
 # Reachable in every plain local run: the clock jump, the sealing it exists
 # for, the compaction the sealing enables (ADR-4326 decision 5), and the sweep
 # jumps, sweep and deletion of a superseded input the compaction enables.
+# Then each forced race (README.md, "The forced races") reaching the
+# situation it forces: a server fold losing its HEAD CAS, a server's
+# compaction record PUT losing to a concurrent compaction, and the clocks
+# passing a record's protection horizon and pinned-query window while HEAD
+# had not folded it. Each is the situation one silent mutant needs; a run
+# that never reaches it cannot tell that mutant from clean code.
 REQUIRED=(
     "catalog: the workload starts"
     "clock: the driver's clock jumped forward"
@@ -95,6 +103,10 @@ REQUIRED=(
     "clock: the clocks jumped past the sweep's protection horizon and pinned-query window"
     "catalog: an on-demand sweep succeeded"
     "catalog: sweep deleted a superseded compaction input"
+    "catalog: fold HEAD CAS lost"
+    "catalog: a server fold lost its HEAD CAS to a fold one sealed hour ahead"
+    "catalog: a server's compaction record PUT lost to a concurrent compaction"
+    "catalog: the clocks passed a compaction record's protection horizon and pinned-query window while HEAD had not folded it"
 )
 mkdir -p "$OUT"
 export COMPOSE_FILE="$COMPOSE_BASE:$WL/local/docker-compose.local.yaml"
@@ -153,12 +165,15 @@ while read -r _ st code <<< "$(container_state driver)" && [ "${st:-}" = running
     sleep 10
 done
 read -r _ st code <<< "$(container_state driver)"
+# Read whatever the driver's state: the clock probe below adds up the moves
+# its log reports.
+driver_log=1
+docker compose logs --no-color driver > "$OUT/driver.log" 2>&1 || driver_log=""
+[ -n "$driver_log" ] || fail "could not read the driver's logs"
 if [ "${st:-}" = exited ]; then
     if [ "${code:-}" != 0 ]; then
         fail "the driver died after setup (exit ${code:-unknown})"
-    elif ! docker compose logs --no-color driver > "$OUT/driver.log" 2>&1; then
-        fail "could not read the driver's logs"
-    elif ! grep -q 'eventually: ending the timeline' "$OUT/driver.log"; then
+    elif [ -n "$driver_log" ] && ! grep -q 'eventually: ending the timeline' "$OUT/driver.log"; then
         fail "the driver exited 0 without ending the timeline through the eventually"
     fi
 elif [ "${st:-}" != running ]; then
@@ -167,7 +182,7 @@ fi
 
 # Every container: the setup ones exited 0, the rest still running or exited 0.
 : > "$OUT/containers.txt"
-for svc in faketime init rustfs $SERVERS driver; do
+for svc in faketime init rustfs s3proxy $SERVERS driver; do
     line=$(container_state "$svc")
     echo "${line:-$svc unreadable}" >> "$OUT/containers.txt"
     read -r _ st code <<< "$line"
@@ -182,10 +197,12 @@ for svc in faketime init; do
 done
 
 # The clock probe: each running container's wall clock, against the host's,
-# must be ahead by the total offset the three jumps add up to (the sealing
-# jump, then the sweep's horizon and window jumps), less the driver's allowed
-# shortfall (60 s). The offset file must hold that total. rustfs is read
-# twice, by `date` in its container and by the Last-Modified the rustfs
+# must be ahead by the total offset the three planned jumps (the sealing
+# jump, then the sweep's horizon and window jumps) and every move the forced
+# races made add up to, less the driver's allowed shortfall (60 s). The
+# driver prints each such move as `clock: moved forward by <N> s outside the
+# planned jumps (<reason>)`. The offset file must hold that total. rustfs is
+# read twice, by `date` in its container and by the Last-Modified the rustfs
 # process stamps on a PUT. A reading that is empty or not a number is a probe
 # failure.
 driver_env=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' driver)
@@ -197,8 +214,16 @@ for var in CLOCK_JUMP_SECS CLOCK_SWEEP_HORIZON_JUMP_SECS CLOCK_SWEEP_WINDOW_JUMP
         *) jump=$((jump + secs)) ;;
     esac
 done
+nudges=0
+if [ -n "$driver_log" ]; then
+    while IFS= read -r secs; do
+        nudges=$((nudges + 1))
+        jump=$((jump + secs))
+    done < <(sed -n 's/.*clock: moved forward by \([0-9][0-9]*\) s outside the planned jumps (.*/\1/p' "$OUT/driver.log")
+fi
 offset=$(docker compose exec -T ravel1 cat /faketime/offset 2>/dev/null | tr -d '[:space:]')
-[ "$offset" = "+$jump" ] || fail "the offset file holds '$offset', not the +${jump} the three jumps add up to"
+[ "$offset" = "+$jump" ] \
+    || fail "the offset file holds '$offset', not the +${jump} the three jumps and $nudges forced-race moves add up to"
 host_now=$(date +%s)
 {
     for svc in rustfs $SERVERS; do
