@@ -687,8 +687,8 @@ fn certify_refusal_reason(refusal: &CertifyRefusal) -> String {
 // ---------------------------------------------------------------------------
 
 /// `compat verify` (ADR-4233 decision 7). Runs the late-write pass for the
-/// class-A families that carry a certificate (or only `--family` when given),
-/// then prints every family's active version, epoch, fence-complete time,
+/// class-A families that carry a certificate (or only `--family` when given;
+/// a family outside class A is refused, as `certify` refuses it), then prints every family's active version, epoch, fence-complete time,
 /// certificate, contradicted flag and watermark. Exits [`EXIT_CONTRADICTED`]
 /// when any family is contradicted or a pass found a late write.
 pub async fn verify(
@@ -701,6 +701,11 @@ pub async fn verify(
     let Some(keys) = keys else {
         return Ok(CompatOutcome::refused(UNKEYED_READ_REFUSAL));
     };
+    if let Some(f) = family.as_ref().filter(|f| !is_class_a(f)) {
+        return Ok(CompatOutcome::refused(certify_refusal_reason(
+            &CertifyRefusal::NotClassAFamily { family: f.clone() },
+        )));
+    }
 
     // Pick the class-A families to run the pass over: the one named, or every
     // class-A family that carries a certificate.
@@ -708,8 +713,7 @@ pub async fn verify(
         return Ok(render_absent("verify"));
     };
     let targets: Vec<String> = match &family {
-        Some(f) if is_class_a(f) => vec![f.clone()],
-        Some(_) => Vec::new(),
+        Some(f) => vec![f.clone()],
         None => record
             .families
             .iter()
@@ -1318,15 +1322,34 @@ mod tests {
                 st.text
             );
 
-            // A non-class-A filter runs no pass, so verify renders the same
-            // record through its own path.
-            let vf = verify(store, Some(keys()), T0, Some("csnap".to_string()), 0)
+            // A class-A family with no entry runs a pass that changes
+            // nothing, so verify renders the same record through its own path.
+            let vf = verify(store, Some(keys()), T0, Some("rlog".to_string()), 0)
                 .await
                 .expect("verify");
             assert_eq!(
                 vf.json()["families"][0]["finalization_pending"],
                 pending,
                 "{label}"
+            );
+        }
+    }
+
+    /// `verify --family` with a family outside class A refuses naming it, as
+    /// `certify` does, and runs no pass.
+    #[tokio::test]
+    async fn verify_refuses_a_family_outside_class_a() {
+        for family in ["csnap", "rseg-typo"] {
+            let store = certified_store(CERTIFIED + 1, false).await;
+            let out = verify(store, Some(keys()), T0, Some(family.to_string()), 0)
+                .await
+                .expect("verify returns a refusal");
+            assert_eq!(out.exit_code, EXIT_REFUSED, "{family}");
+            assert!(
+                out.text
+                    .contains(&format!("{family} is not a class-A data family")),
+                "{family}: {}",
+                out.text
             );
         }
     }

@@ -185,7 +185,7 @@ pub async fn list_tenants_strict(
 /// What `init` records beside the versions, all from configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitConfig {
-    /// The release the store is adopted at (expected v0.34.0).
+    /// The release the store is adopted at: v0.34.0, the baseline release.
     pub baseline_release_major: u32,
     pub baseline_release_minor: u32,
     /// `P`, the longest a publish may run (ADR-4233 decision 3). Positive.
@@ -398,9 +398,8 @@ pub fn baseline_version(family: &str) -> Result<u32, CompatInitError> {
         family: family.to_string(),
     };
     match family {
-        // The leaf version the fold writes for every signal. Not
-        // `fold_write_version`, which names a higher metrics version than
-        // the fold emits.
+        // The leaf version the fold writes for every signal, the value
+        // `fold_write_version` also returns for this family.
         FAMILY_KIDX => Ok(KEY_INDEX_LEAF_FORMAT_VERSION),
         FAMILY_CATALOG_HEAD | FAMILY_CSNAP | FAMILY_NPOST | FAMILY_CSTAT => {
             let mut versions = SIGNALS

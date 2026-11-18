@@ -112,6 +112,16 @@ const MIGRATE_CURSOR_TAG: u8 = 1;
 /// Length of a well-formed cursor payload: tag + shard (u32 LE) + hour (u32 LE).
 const MIGRATE_CURSOR_LEN: usize = 9;
 
+/// Tag of the payload [`background_migrate_unit`] leaves at the cursor key
+/// after a contradicted family's walk drained clean: the [`ContradictionStamp`]
+/// it drained under, which holds back the next walk until `sys/compat` moves.
+/// A build that does not know the tag leaves it in place and walks (H9).
+const MIGRATE_DRAINED_TAG: u8 = 2;
+
+/// Length of a well-formed drained payload: tag + certificate version (u32 LE)
+/// + certified time (i64 LE) + watermark (i64 LE).
+const MIGRATE_DRAINED_LEN: usize = 21;
+
 /// The per-invocation work budget for [`migrate_family`], counted in L0 records:
 /// those an L0 migration rewrote, and the inputs a re-encoded compaction record
 /// names, for every rewrite that built its parts and then published, converged,
@@ -735,6 +745,13 @@ enum StoredCursor {
     Unrecognized {
         version: Version,
     },
+    /// A contradicted family's walk drained clean under `stamp`. No position:
+    /// a walk starts from the beginning and CAS-overwrites it like
+    /// [`Self::Unrecognized`].
+    Drained {
+        stamp: ContradictionStamp,
+        version: Version,
+    },
     /// Another build's tag (ADR-4233 decision 4, H9): the run starts from the
     /// beginning and leaves it in place, writing and deleting nothing.
     ForeignTag {
@@ -749,6 +766,15 @@ async fn read_cursor(store: &dyn ObjectStoreBackend, key: &str) -> Result<Stored
         Ok(got) => {
             let data = got.data;
             match data.first() {
+                Some(&MIGRATE_DRAINED_TAG) => Ok(match ContradictionStamp::decode(&data) {
+                    Some(stamp) => StoredCursor::Drained {
+                        stamp,
+                        version: got.version,
+                    },
+                    None => StoredCursor::Unrecognized {
+                        version: got.version,
+                    },
+                }),
                 Some(&tag) if tag != MIGRATE_CURSOR_TAG => Ok(StoredCursor::ForeignTag { tag }),
                 Some(_) if data.len() == MIGRATE_CURSOR_LEN => {
                     let shard = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
@@ -790,6 +816,57 @@ async fn write_cursor(
     };
     let opts = PutOptions {
         mode,
+        checksum: Some(UploadChecksum::Crc32c(crc32c::crc32c(&payload))),
+    };
+    match store.put(key, payload.into(), opts).await {
+        Ok(_) | Err(StoreError::AlreadyExists) | Err(StoreError::PreconditionFailed) => Ok(()),
+        Err(e) => Err(MaintainError::Store(e)),
+    }
+}
+
+/// The `sys/compat` state of a contradicted family: its certificate's version
+/// and certified time and its late-write watermark. A re-certification or a
+/// completed late-write pass changes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContradictionStamp {
+    certificate_version: u32,
+    certified_unix_ns: i64,
+    watermark_unix_ns: i64,
+}
+
+impl ContradictionStamp {
+    fn encode(&self) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(MIGRATE_DRAINED_LEN);
+        payload.push(MIGRATE_DRAINED_TAG);
+        payload.extend_from_slice(&self.certificate_version.to_le_bytes());
+        payload.extend_from_slice(&self.certified_unix_ns.to_le_bytes());
+        payload.extend_from_slice(&self.watermark_unix_ns.to_le_bytes());
+        payload
+    }
+
+    fn decode(data: &[u8]) -> Option<ContradictionStamp> {
+        if data.len() != MIGRATE_DRAINED_LEN || data.first() != Some(&MIGRATE_DRAINED_TAG) {
+            return None;
+        }
+        Some(ContradictionStamp {
+            certificate_version: u32::from_le_bytes(data.get(1..5)?.try_into().ok()?),
+            certified_unix_ns: i64::from_le_bytes(data.get(5..13)?.try_into().ok()?),
+            watermark_unix_ns: i64::from_le_bytes(data.get(13..21)?.try_into().ok()?),
+        })
+    }
+}
+
+/// Leave `stamp` at the migrate-cursor key after a drained walk deleted the
+/// cursor. `CreateIfAbsent`: a cursor a concurrent walk wrote since wins, and
+/// the stamp is advisory, so a lost race is not an error.
+async fn write_drained_stamp(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+    stamp: ContradictionStamp,
+) -> Result<()> {
+    let payload = stamp.encode();
+    let opts = PutOptions {
+        mode: PutMode::CreateIfAbsent,
         checksum: Some(UploadChecksum::Crc32c(crc32c::crc32c(&payload))),
     };
     match store.put(key, payload.into(), opts).await {
@@ -1873,9 +1950,10 @@ fn record_reencode(
 /// [`Verification::FloorRaised`] with the existing floor rather than surfacing
 /// that refusal as an error.
 ///
-/// This is the entry point `ravel-cli maintain migrate` calls (the server
-/// maintain loop does not run migrations); it takes only a store, an injected
-/// clock, and plain parameters, matching the per-`(tenant, signal)` shape of
+/// This is the entry point `ravel-cli maintain migrate` calls, and the walk
+/// [`background_migrate_unit`] runs for the server maintain loop under
+/// `--background-migrate`; it takes only a store, an injected clock, and plain
+/// parameters, matching the per-`(tenant, signal)` shape of
 /// the crate's other maintenance drivers ([`crate::scan::scan_and_maintain`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn migrate_family(
@@ -1912,7 +1990,9 @@ pub async fn migrate_family(
         match read_cursor(store, &cursor_key).await? {
             StoredCursor::Absent => (None, None, true),
             StoredCursor::Usable { position, version } => (Some(position), Some(version), true),
-            StoredCursor::Unrecognized { version } => (None, Some(version), true),
+            StoredCursor::Unrecognized { version } | StoredCursor::Drained { version, .. } => {
+                (None, Some(version), true)
+            }
             StoredCursor::ForeignTag { tag } => {
                 tracing::warn!(
                     tenant = %tenant_hash.to_hex(),
@@ -2389,6 +2469,11 @@ pub enum BackgroundMigrateOutcome {
     /// The family's format floor is already at or above its active version,
     /// so no live object is below it; nothing listed or written.
     UpToDate { active_version: u16, floor: u32 },
+    /// The family is contradicted and its floor is at or above its active
+    /// version, and a walk already drained clean under the same certificate
+    /// and watermark: one cursor GET, nothing listed or written. A
+    /// re-certification or a completed late-write pass walks it again.
+    DrainedUnderContradiction { active_version: u16, floor: u32 },
     /// The compat policy refused a run before its claim (already counted
     /// under `ravel_compat_publish_refused_total`): no run, and the cursor
     /// resumes from where the walk stopped next time.
@@ -2414,7 +2499,10 @@ pub enum BackgroundMigrateOutcome {
 /// floor no longer proves the bucket clean); the walk itself rewrites only
 /// buckets that serve an object below the active version, and raises the floor
 /// once it drains clean, after which the unit is a single provisioning-record
-/// GET. It spawns nothing; the caller schedules it.
+/// GET. A contradicted family's walk that drains clean leaves the certificate
+/// and watermark it ran under at the cursor key, and the unit walks it again
+/// only once either changes; until then it is a provisioning-record GET and a
+/// cursor GET. It spawns nothing; the caller schedules it.
 #[allow(clippy::too_many_arguments)]
 pub async fn background_migrate_unit(
     store: &dyn ObjectStoreBackend,
@@ -2435,14 +2523,26 @@ pub async fn background_migrate_unit(
     let floor = current_floor_from_store(store, &tenant_hash, signal, family)
         .await
         .map_err(|err| MaintainError::Provisioning(err.to_string()))?;
+    let contradiction = family_contradiction(policy, family);
+    let cursor_key = migrate_cursor_key(&tenant_hash, signal, family);
     if let Some(floor) = floor
         && floor >= u32::from(active_version)
-        && !family_contradicted(policy, family)
     {
-        return Ok(BackgroundMigrateOutcome::UpToDate {
-            active_version,
-            floor,
-        });
+        let Some(stamp) = contradiction else {
+            return Ok(BackgroundMigrateOutcome::UpToDate {
+                active_version,
+                floor,
+            });
+        };
+        if let StoredCursor::Drained { stamp: drained, .. } =
+            read_cursor(store, &cursor_key).await?
+            && drained == stamp
+        {
+            return Ok(BackgroundMigrateOutcome::DrainedUnderContradiction {
+                active_version,
+                floor,
+            });
+        }
     }
     let walked = migrate_family(
         store,
@@ -2458,11 +2558,27 @@ pub async fn background_migrate_unit(
     )
     .await;
     match walked {
-        Ok(report) => Ok(BackgroundMigrateOutcome::Walked {
-            active_version,
-            report: Box::new(report),
-            held: Vec::new(),
-        }),
+        Ok(report) => {
+            if let Some(stamp) = contradiction
+                && report.walk_complete
+                && matches!(report.verification, Some(Verification::FloorRaised { .. }))
+                && let Err(err) = write_drained_stamp(store, &cursor_key, stamp).await
+            {
+                tracing::warn!(
+                    tenant = %tenant_hash.to_hex(),
+                    signal = ?signal,
+                    family,
+                    error = %err,
+                    "background migrate: could not record the contradicted walk as drained; \
+                     the next tick walks the family again"
+                );
+            }
+            Ok(BackgroundMigrateOutcome::Walked {
+                active_version,
+                report: Box::new(report),
+                held: Vec::new(),
+            })
+        }
         Err(MaintainError::MigrateHeld { held, report }) => Ok(BackgroundMigrateOutcome::Walked {
             active_version,
             report,
@@ -2475,15 +2591,24 @@ pub async fn background_migrate_unit(
     }
 }
 
-/// Whether the view's last `sys/compat` read marks `family`'s certificate
-/// contradicted: a late write below the certified version was found after the
-/// floor was raised, so the floor no longer proves no live object is below it.
-fn family_contradicted(policy: &crate::compat_policy::MaintainCompatPolicy, family: &str) -> bool {
-    policy.view().last_record().is_some_and(|record| {
-        record
-            .families
-            .iter()
-            .any(|entry| entry.family == family && entry.contradicted)
+/// The contradiction the view's last `sys/compat` read records for `family`,
+/// or `None` when its certificate is not contradicted. Contradicted means a
+/// late write below the certified version was found after the floor was
+/// raised, so the floor no longer proves no live object is below it.
+fn family_contradiction(
+    policy: &crate::compat_policy::MaintainCompatPolicy,
+    family: &str,
+) -> Option<ContradictionStamp> {
+    let record = policy.view().last_record()?;
+    let entry = record
+        .families
+        .iter()
+        .find(|entry| entry.family == family && entry.contradicted)?;
+    let certificate = entry.certificate.as_ref();
+    Some(ContradictionStamp {
+        certificate_version: certificate.map_or(0, |c| c.version),
+        certified_unix_ns: certificate.map_or(0, |c| c.certified_unix_ns),
+        watermark_unix_ns: entry.late_writes_verified_through_unix_ns,
     })
 }
 
@@ -6940,6 +7065,122 @@ mod tests {
             "the floor shortcut returns once the flag clears"
         );
         assert_eq!(store_snapshot(store.as_ref()).await, before);
+    }
+
+    /// A contradicted family is walked once per certificate and watermark: a
+    /// walk that drains clean records what it ran under at the cursor key, the
+    /// next unit call sends no LIST, and a re-certification or a completed
+    /// late-write pass (a moved watermark) walks it again.
+    #[tokio::test]
+    async fn a_contradicted_family_is_walked_once_per_certificate_and_watermark() {
+        use crate::compat_policy::test_support::{
+            ManualClock, T0, activate, family, keys, policy, write_compat,
+        };
+        use ravel_catalog::compat::{FAMILY_RSEG, update_compat};
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Sequence};
+
+        async fn unit(
+            store: &dyn ObjectStoreBackend,
+            clock: &FixedClock,
+            config: &CompactorConfig,
+        ) -> BackgroundMigrateOutcome {
+            background_migrate_unit(
+                store,
+                clock,
+                config,
+                tenant_hash(),
+                Signal::Metrics,
+                FAMILY,
+                1,
+                MigrateBudget::unlimited(),
+            )
+            .await
+            .expect("background unit")
+        }
+
+        let store = Arc::new(MemoryStore::new());
+        write_compat(store.as_ref(), vec![family(FAMILY_RSEG, 6)], NS_PER_HOUR).await;
+        provision(store.as_ref(), 1).await;
+        seed_at(store.as_ref(), 0, 100, 1, "alpha", 6).await;
+        activate(store.as_ref(), FAMILY_RSEG, 7).await;
+        let clock = FixedClock::new(sealed_now_ns_for(103));
+        let config = CompactorConfig {
+            compat_policy: Some(
+                policy(store.clone(), ManualClock::at(T0))
+                    .await
+                    .with_family(FAMILY_RSEG, two_rseg()),
+            ),
+            ..CompactorConfig::default()
+        };
+        let view = config.compat_policy.as_ref().expect("policy").view();
+        assert!(matches!(
+            unit(store.as_ref(), &clock, &config).await,
+            BackgroundMigrateOutcome::Walked { .. }
+        ));
+
+        let contradict = |certified_unix_ns: i64, watermark_unix_ns: i64| {
+            let store = store.clone();
+            async move {
+                update_compat(store.as_ref(), &keys(), |record| {
+                    for entry in &mut record.families {
+                        if entry.family == FAMILY_RSEG {
+                            entry.contradicted = true;
+                            entry.certificate = Some(ravel_proto::sys::v1::Certificate {
+                                version: 7,
+                                certified_unix_ns,
+                                ..Default::default()
+                            });
+                            entry.late_writes_verified_through_unix_ns = watermark_unix_ns;
+                        }
+                    }
+                    Ok(())
+                })
+                .await
+                .expect("update sys/compat");
+            }
+        };
+        let mut steps = Sequence::new(Op::List);
+        for _ in 0..10_000 {
+            steps = steps.then_passthrough();
+        }
+        let counted = FaultStore::new(store.clone(), FaultPlan::empty().with_sequence(steps));
+        let lists = || counted.sequence_progress(0);
+
+        let mut hour = 100;
+        for (round, (certified, watermark)) in [(T0, T0 + 1), (T0 + 2, T0 + 1), (T0 + 2, T0 + 3)]
+            .into_iter()
+            .enumerate()
+        {
+            // A late writer still writing 6 lands under the floor.
+            hour += 1;
+            seed_at(store.as_ref(), 0, hour, 1, "alpha", 6).await;
+            contradict(certified, watermark).await;
+            view.refresh().await.expect("refresh");
+
+            let before = lists();
+            let BackgroundMigrateOutcome::Walked { report, held, .. } =
+                unit(&counted, &clock, &config).await
+            else {
+                panic!("round {round}: the contradicted family is walked");
+            };
+            assert!(held.is_empty(), "round {round}: {held:?}");
+            assert_eq!(report.buckets_migrated, 1, "round {round}: {report:?}");
+            assert!(lists() > before, "round {round}: the walk lists");
+
+            let before = lists();
+            let snapshot = store_snapshot(store.as_ref()).await;
+            let rested = unit(&counted, &clock, &config).await;
+            assert_eq!(lists(), before, "round {round}: no LIST once drained");
+            assert!(
+                matches!(
+                    rested,
+                    BackgroundMigrateOutcome::DrainedUnderContradiction { floor: 7, .. }
+                ),
+                "round {round}: drained under the same certificate and watermark: {rested:?}"
+            );
+            assert_eq!(store_snapshot(store.as_ref()).await, snapshot);
+        }
+        assert!(lists() < 10_000, "the sequence counted every LIST");
     }
 
     /// An active version this build cannot write makes the background unit a
