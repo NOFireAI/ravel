@@ -5,7 +5,9 @@
 #
 # With no real-s3-prefix the box runs the portable s3s-fs lane; with one it runs
 # a `ci` smoke on <prefix>-ci-* buckets and then the measured profile on
-# <prefix>-* buckets (create both sets first with make-buckets.sh).
+# <prefix>-* buckets (create both sets first with make-buckets.sh). With
+# MB_RAVEL_ONLY=1 the measured run uses <prefix>-ravel alone
+# (make-buckets.sh --ravel-only <prefix>); the ci smoke still needs all four.
 #
 # Required environment: MB_RESULTS_BUCKET, MB_SUBNET_ID, MB_SECURITY_GROUP_ID,
 # MB_INSTANCE_PROFILE. Optional: MB_PROFILE (cardinality), MB_INSTANCE_TYPE
@@ -20,8 +22,8 @@
 # measured run only; each needs MB_STAGE1=1), MB_L1_MAX_PART_BYTES (a positive
 # integer, with l1 in MB_STAGE1_ARMS; the measured run only), MB_RAVEL_ONLY (1
 # runs the measured profile as run.sh --ravel-only: history or ci, with
-# MB_STAGE1=1 MB_STAGE1_ARMS=l1 and MB_OBJECTS_BAND, without MB_RSS_BAND,
-# MB_CONTROL_IMAGE or a real-s3-prefix; the ci smoke stays a full run).
+# MB_STAGE1=1 MB_STAGE1_ARMS=l1 and MB_OBJECTS_BAND, without MB_RSS_BAND or
+# MB_CONTROL_IMAGE, on either lane; the ci smoke stays a full run).
 # MB_STAGE1=1 on history needs MB_RAVEL_ONLY=1. AWS_PROFILE and AWS_REGION
 # select the account and region as for any aws CLI call.
 set -euo pipefail
@@ -57,7 +59,6 @@ case "$ravel_only" in
        echo "MB_RAVEL_ONLY=1 with MB_CONTROL_IMAGE: the control arm compares two Ravel builds over passes the Ravel-only shape does not run" >&2
        exit 64
      fi
-     [ -z "$real_s3_prefix" ] || { echo "MB_RAVEL_ONLY=1 with a real-s3-prefix: run.sh --ravel-only refuses the real-S3 lane" >&2; exit 64; }
      [ -z "${MB_RSS_BAND:-}" ] || { echo "MB_RAVEL_ONLY=1 with MB_RSS_BAND: run.sh --ravel-only refuses --rss-band" >&2; exit 64; }
      [ -n "${MB_OBJECTS_BAND:-}" ] || { echo "MB_RAVEL_ONLY=1 with MB_PROFILE=$profile needs MB_OBJECTS_BAND set for it; the default is cardinality's" >&2; exit 64; }
      # The shipped ci Stage 1 band file is pre-registered for a four-engine
