@@ -205,6 +205,7 @@ async fn a_fold_with_the_leaf_switch_off_reads_no_label_dict_and_writes_no_leaf(
         let (report, _) = fold_metrics(store.clone(), false, no_metrics_label_index)
             .await
             .expect("a fold without leaves is not refused");
+        assert!(!report.no_op, "{report:?}");
         assert_eq!(report.entry_count, 2, "{report:?}");
         assert_eq!(report.key_index_leaves_written, 0, "{report:?}");
         assert_eq!(report.key_index_sections_read, 0, "{report:?}");
@@ -217,7 +218,12 @@ async fn a_fold_with_the_leaf_switch_off_reads_no_label_dict_and_writes_no_leaf(
         get_requests[0], get_requests[1],
         "the default fold without leaves issues the opt-out's GETs"
     );
-    assert_eq!(get_requests[0], 7, "{get_requests:?}");
+    // A fold that publishes HEAD reaches the CAS outcome arm that evaluates
+    // "catalog: a fold reports as folded only a HEAD the store holds" exactly
+    // once, since that arm returns; its HEAD re-read is a GET the fold issues,
+    // so it counts whenever the invariant macros evaluate.
+    let head_rereads = u64::from(ravel_invariant::EVALUATES);
+    assert_eq!(get_requests[0], 7 + head_rereads, "{get_requests:?}");
 }
 
 /// `--rebuild-key-index --signal metrics` attaches the `label_value` leaf to
