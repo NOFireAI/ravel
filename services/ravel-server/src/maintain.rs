@@ -1488,6 +1488,7 @@ pub fn spawn(
         &store,
         &compactor,
         &worker,
+        rng.new_uuid(),
         &clock,
         &fallback_allow,
     );
@@ -1546,6 +1547,7 @@ fn compat_maintain_context(
     store: &Arc<dyn ObjectStoreBackend>,
     compactor: &Arc<CompactorConfig>,
     worker: &Arc<WorkerSet>,
+    migrate_claim_process_id: Uuid,
     clock: &Arc<dyn Clock>,
     fallback_allow: &Option<Vec<TenantHash>>,
 ) -> Option<crate::compat_maintain::CompatMaintainContext> {
@@ -1558,12 +1560,20 @@ fn compat_maintain_context(
         }
         return None;
     };
+    if config.compat.background_migrate.is_some() {
+        tracing::info!(
+            process_id = %worker.process_id(),
+            %migrate_claim_process_id,
+            "background migrate takes bucket claims under its own process id"
+        );
+    }
     Some(crate::compat_maintain::CompatMaintainContext {
         store: store.clone(),
         keys: keys.clone(),
         view: policy.view().clone(),
         compactor: compactor.clone(),
         worker: worker.clone(),
+        migrate_claim_process_id,
         clock: clock.clone(),
         shard_count: config.shard_count,
         fallback_allow: fallback_allow.clone(),
@@ -2441,18 +2451,22 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
     .await
 }
 
-/// `compactor` taking bucket claims as this process (`worker`'s process id) on
-/// `clock`, or unchanged when `--maintain-claims off` set coordination off or
-/// the caller already installed a participant. The maintenance tick and the
-/// background migrate both build their configuration here, from the one
-/// process clock, so a compaction, an erasure rewrite and a migration of one
-/// bucket all contend for its claim (ADR-1029, the 2026-10-03 amendment).
-pub(crate) fn claiming<'a>(
-    compactor: &'a CompactorConfig,
-    worker: &WorkerSet,
+/// `compactor` taking bucket claims as `process_id` on `clock`, or unchanged
+/// when `--maintain-claims off` set coordination off or the caller already
+/// installed a participant. The maintenance tick and the background migrate
+/// both build their configuration here, from the one process clock, so a
+/// compaction, an erasure rewrite and a migration of one bucket all contend
+/// for its claim (ADR-1029, the 2026-10-03 amendment).
+///
+/// The two run concurrently, so each passes its own `process_id`: a
+/// participant reclaims a claim held under its own id without waiting for it
+/// to expire, and a shared id would let one take a bucket the other holds.
+pub(crate) fn claiming(
+    compactor: &CompactorConfig,
+    process_id: Uuid,
     clock: Arc<dyn Clock>,
-) -> std::borrow::Cow<'a, CompactorConfig> {
-    compactor.with_claim_participant(ClaimParticipant::new(worker.process_id(), clock))
+) -> std::borrow::Cow<'_, CompactorConfig> {
+    compactor.with_claim_participant(ClaimParticipant::new(process_id, clock))
 }
 
 /// [`run_tick_with_clock`], also handing the scheduled fold the hours this
@@ -2495,7 +2509,7 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
     // It is installed only with coordination on and the slot empty, on a clone
     // of this tick's own clock, so the claim decisions read the same time as
     // the rest of the tick.
-    let compactor = claiming(compactor, worker, Arc::new(clock.clone()));
+    let compactor = claiming(compactor, worker.process_id(), Arc::new(clock.clone()));
     let compactor = compactor.as_ref();
 
     // Record this tenant's owned units from the ownership gate alone, before

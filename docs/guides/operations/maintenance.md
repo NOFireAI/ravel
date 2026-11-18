@@ -726,8 +726,10 @@ A claim does two jobs:
   costs more than wasted work.
 
 The background supervisor's per-unit tick takes claims. So does the server's
-background migrate (`--background-migrate`), with the same process id, clock
-and lease as the tick, so the two never merge one bucket at once. So do
+background migrate (`--background-migrate`), on the same clock and lease as
+the tick but under its own process id, so each stands down for a bucket the
+other holds. The server logs that id at startup, beside its own, in the line
+`background migrate takes bucket claims under its own process id`. So do
 `ravel-cli maintain compact-bucket`, `compact-tenant` and
 `migrate`. `--no-claim` on the
 CLI and `--maintain-claims off` on the server are the two ways to opt a run
