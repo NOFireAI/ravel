@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use ravel_commit::rng::{RngSource, SystemRng};
-use ravel_object_store::ObjectStoreBackend;
+use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_otlp::NormalizedPoint;
-use ravel_types::{CommitToken, Signal, TenantId, shard_for};
+use ravel_types::{CommitToken, Signal, TenantHash, TenantId, shard_for};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::budget::{BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit};
@@ -82,6 +82,9 @@ enum SubmittedState {
         ack_rxs: Vec<oneshot::Receiver<Result<CommitToken, WriteError>>>,
         ack_deadline: Duration,
         set: Arc<Vec<ShardHandle>>,
+        /// The written tenant, which names the commit records the acks' tokens
+        /// point at.
+        tenant_hash: TenantHash,
         /// Held until `acks()` resolves, its deadline elapses, or this value
         /// is dropped; never read directly.
         _permit: Option<PendingAckPermit>,
@@ -100,15 +103,16 @@ impl Submitted<'_> {
     /// immediately: there was never anything to await.
     pub async fn acks(self) -> Result<WriteReceipt, WriteError> {
         let router = self.router;
-        let (ack_shards, ack_rxs, ack_deadline, set, _permit) = match self.state {
+        let (ack_shards, ack_rxs, ack_deadline, set, tenant_hash, _permit) = match self.state {
             SubmittedState::Done(receipt) => return Ok(receipt),
             SubmittedState::Pending {
                 ack_shards,
                 ack_rxs,
                 ack_deadline,
                 set,
+                tenant_hash,
                 _permit,
-            } => (ack_shards, ack_rxs, ack_deadline, set, _permit),
+            } => (ack_shards, ack_rxs, ack_deadline, set, tenant_hash, _permit),
         };
 
         // `join_all` preserves input order, so `joined[i]` is `ack_shards[i]`.
@@ -148,6 +152,20 @@ impl Submitted<'_> {
             }
         }
 
+        // Every token about to reach the caller names a commit record in the
+        // store; a HEAD is the evidence, not the shard's ack. The default
+        // build compiles the assertion out, leaving `tenant_hash` unread.
+        let _ = tenant_hash;
+        ravel_invariant::inv_always!(
+            commit_records_exist(router.store.as_ref(), &tenant_hash, router.signal, &durable)
+                .await,
+            "commit: a strict metrics ack names a durable commit record",
+            std::collections::BTreeMap::from([
+                ("tenant", tenant_hash.to_hex()),
+                ("tokens", encode_tokens(&durable)),
+            ])
+        );
+
         if let Some(inner) = first_error {
             // Observe the death only when the first failure in shard order is
             // a dropped ack (a resolved shard-level error is not a death).
@@ -173,6 +191,57 @@ impl Submitted<'_> {
 
         Ok(WriteReceipt { tokens: durable })
     }
+}
+
+/// Whether every token's commit record is in `store`: a HEAD of its key that
+/// does not answer NotFound. Only invariant conditions call this, and the
+/// default build compiles those out.
+#[allow(dead_code)]
+pub(crate) async fn commit_records_exist(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    tokens: &[CommitToken],
+) -> bool {
+    for token in tokens {
+        let Ok(key) = ravel_commit::keys::commit_key_for_token(tenant_hash, signal, token) else {
+            return false;
+        };
+        if matches!(store.head(&key).await, Err(StoreError::NotFound)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The writer identity under the `commit/mismatched-identity-idempotent`
+/// mutant: every writer that draws one shares it.
+const MUTANT_WRITER_ID: uuid::Uuid =
+    uuid::Uuid::from_u128(0x4326_0003_0000_0000_0000_0000_0000_0001);
+const MUTANT_WRITER_EPOCH: u64 = 1;
+
+/// The `(writer_id, epoch)` a new shard actor writes under: a fresh id from
+/// `rng` and the current second on `clock`. Under the
+/// `commit/mismatched-identity-idempotent` mutant every draw returns one fixed
+/// identity, so two writers on one shard index reuse a commit key with
+/// different content.
+pub(crate) fn draw_writer_identity(rng: &dyn RngSource, clock: &dyn Clock) -> (uuid::Uuid, u64) {
+    if ravel_invariant::inv_mutant!("commit/mismatched-identity-idempotent") {
+        return (MUTANT_WRITER_ID, MUTANT_WRITER_EPOCH);
+    }
+    let writer_id = rng.new_uuid();
+    let epoch = u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
+    (writer_id, epoch)
+}
+
+/// `tokens` encoded and comma-joined, for an invariant's details.
+#[allow(dead_code)]
+pub(crate) fn encode_tokens(tokens: &[CommitToken]) -> String {
+    tokens
+        .iter()
+        .map(CommitToken::encode)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The router's live handle to one shard actor. Interior-mutable because a
@@ -907,7 +976,8 @@ impl IngestRouter {
         // and failing closed if that read cannot complete (ADR-0052 section 3).
         #[cfg(feature = "stage-timing")]
         let route_start = std::time::Instant::now();
-        let set = self.active_set(tenant.hash(), self.clock.now_ns()).await?;
+        let tenant_hash = tenant.hash();
+        let set = self.active_set(tenant_hash, self.clock.now_ns()).await?;
         // ADR-1746 decision 4: a write whose object would sit below the
         // tenant's recorded RSEG floor is refused here, on the view just
         // routed with, before any shard buffers it. This is the only refusal a
@@ -1047,6 +1117,7 @@ impl IngestRouter {
                 ack_rxs,
                 ack_deadline,
                 set,
+                tenant_hash,
                 _permit: permit,
             },
         })
@@ -1114,9 +1185,7 @@ impl IngestRouter {
         cap_flag: DeferralCapFlag,
         scope: Arc<dyn FlushScope<ShardMsg>>,
     ) -> mpsc::Sender<ShardMsg> {
-        let writer_id = self.rng.new_uuid();
-        let epoch =
-            u64::try_from(self.clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
+        let (writer_id, epoch) = draw_writer_identity(self.rng.as_ref(), self.clock.as_ref());
         let (tx, rx) = mpsc::channel(self.config.channel_depth);
         let actor = ShardActor::new(
             shard,
@@ -1759,5 +1828,159 @@ mod tests {
                 .expect("the shard survives and the next write commits");
             assert_eq!(router.metrics().snapshot().flush_gate_faults, 1);
         }
+    }
+
+    const STRICT_METRICS_ACK: &str = "commit: a strict metrics ack names a durable commit record";
+
+    /// A one-shard strict-mode router over `store` that flushes on every
+    /// write, on a clock that never moves on its own: no flush deadline or
+    /// age trigger can fire during a test.
+    fn flush_every_write(store: Arc<dyn ObjectStoreBackend>) -> IngestRouter {
+        IngestRouter::new(
+            IngestConfig {
+                shard_count: 1,
+                target_bytes: 1,
+                ..IngestConfig::default()
+            },
+            store,
+            Signal::Metrics,
+            crate::compat_signal_tests::ManualClock::new(),
+            Arc::new(PendingAckBudget::new(0)),
+        )
+    }
+
+    /// The router's ack wait is on the tokio timer, not the injected clock. A
+    /// write that must ack while its commit PUT is held gets this bound, so a
+    /// build that waits for the commit fails in seconds.
+    const HELD_COMMIT_ACK_BOUND: Duration = Duration::from_secs(2);
+
+    #[tokio::test]
+    async fn strict_metrics_ack_names_a_durable_commit_record() {
+        if !invariant_capture::capturing() {
+            return;
+        }
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router = flush_every_write(Arc::clone(&store));
+        let tenant = TenantId::new("strict-ack-holds");
+        let receipt = router
+            .write(
+                tenant.clone(),
+                vec![test_point(&tenant, "cpu", 1_000, 1.0)],
+                WriteMode::Strict,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("strict write");
+        assert_eq!(receipt.tokens.len(), 1);
+
+        let evaluations =
+            invariant_capture::evaluations(STRICT_METRICS_ACK, &tenant.hash().to_hex());
+        assert_eq!(evaluations.len(), 1, "{evaluations:?}");
+        assert!(evaluations[0].0, "{evaluations:?}");
+        assert!(evaluations[0].1.contains(&receipt.tokens[0].encode()));
+        router.flush_all().await;
+    }
+
+    /// `commit/ack-before-commit`: the flush acks its waiters as soon as it
+    /// starts, so the strict write returns while its commit PUT is held. The
+    /// property's HEAD of the token's commit key answers NotFound.
+    #[tokio::test]
+    async fn mutant_ack_at_enqueue_acks_before_the_commit_exists() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+
+        let Some(_mutant) = invariant_capture::scoped_mutant("commit/ack-before-commit") else {
+            return;
+        };
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = fault_store.hold(Op::Put, Some("/c/".to_owned()), Occurrence::Nth(1));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let router = flush_every_write(Arc::clone(&store));
+        let tenant = TenantId::new("strict-ack-mutant");
+        let outcome = router
+            .write(
+                tenant.clone(),
+                vec![test_point(&tenant, "cpu", 1_000, 1.0)],
+                WriteMode::Strict,
+                HELD_COMMIT_ACK_BOUND,
+            )
+            .await;
+
+        let evaluations =
+            invariant_capture::evaluations(STRICT_METRICS_ACK, &tenant.hash().to_hex());
+        assert!(
+            evaluations.iter().any(|(held, _)| !held),
+            "the strict-ack property never evaluated false under the mutant: {evaluations:?}"
+        );
+        outcome.expect("the mutant acks the write before its commit PUT");
+        assert_eq!(gate.held_count(), 1, "the commit PUT is still held");
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        router.flush_all().await;
+    }
+}
+
+/// Test access to ravel-invariant's capture record and mutant selection.
+/// This crate has no feature of its own that forwards
+/// `ravel-invariant/capture` or `ravel-invariant/antithesis-mutants`, so the
+/// gate is an assertion macro: its condition is compiled and run only when
+/// ravel-invariant records evaluations, and the default build expands it to
+/// nothing.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) mod invariant_capture {
+    use std::any::Any;
+    use std::cell::{Cell, RefCell};
+
+    /// True in the invariants lane, where evaluations are recorded.
+    pub(crate) fn capturing() -> bool {
+        let on = Cell::new(false);
+        ravel_invariant::inv_sometimes!(
+            {
+                on.set(true);
+                true
+            },
+            "ravel-ingest test: evaluations are captured",
+            ""
+        );
+        on.get()
+    }
+
+    /// Selects mutant `name` on this thread until the returned guard drops;
+    /// `None` outside the invariants lane.
+    pub(crate) fn scoped_mutant(name: &'static str) -> Option<Box<dyn Any>> {
+        let guard: RefCell<Option<Box<dyn Any>>> = RefCell::new(None);
+        let _ = name;
+        ravel_invariant::inv_sometimes!(
+            {
+                let scoped = ravel_invariant::mutant::scoped(name).expect("a registered mutant");
+                *guard.borrow_mut() = Some(Box::new(scoped));
+                true
+            },
+            "ravel-ingest test: a mutant is scoped",
+            ""
+        );
+        guard.into_inner()
+    }
+
+    /// `(condition, details)` of every captured evaluation of `message` whose
+    /// details mention `needle`; empty outside the invariants lane.
+    pub(crate) fn evaluations(message: &'static str, needle: &str) -> Vec<(bool, String)> {
+        let found = RefCell::new(Vec::new());
+        let _ = (message, needle);
+        ravel_invariant::inv_sometimes!(
+            {
+                found.borrow_mut().extend(
+                    ravel_invariant::capture::evaluations_of(message)
+                        .into_iter()
+                        .filter(|e| e.details.contains(needle))
+                        .map(|e| (e.condition, e.details)),
+                );
+                true
+            },
+            "ravel-ingest test: evaluations are read",
+            ""
+        );
+        found.into_inner()
     }
 }
