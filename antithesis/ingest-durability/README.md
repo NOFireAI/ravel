@@ -123,7 +123,8 @@ Some of these may stay unreached even in long runs, so read their absence as
 coverage, not as a finding. The 429 shed needs a process-wide budget to fill.
 `ShardUnavailable` needs a dead shard actor. An unclean drain needs a stop
 fault during a store outage. A partial success needs a clock skip larger than
-the 10 minute future-skew bound in the middle of a request.
+the 10 minute future-skew bound in the middle of a request. The coverage
+variant (below) reaches the 429 shed, partial successes and drains on purpose.
 
 The flush, retry and abandon logic itself lives in `ravel-ingest`. It carries
 no assertion sites yet, so its outcomes are observed at the handler instead.
@@ -132,6 +133,82 @@ feature, which also reaches ravel-commit, ravel-ingest, ravel-catalog,
 ravel-maintain and ravel-fleet through `ravel-invariant` (ADR-4326), so an
 assertion site added in one of those crates reports from this workload without
 an image change.
+
+## Coverage variant
+
+`config-coverage/docker-compose.yaml` runs the same images in a config that
+reaches outcomes the base config almost never does. Ravel itself is
+unchanged; three levers do it:
+
+- `--max-pending-strict-acks 2` on ravel1 and ravel2. The driver runs four
+  rules at once, so a third strict write to one node is shed with 429 at the
+  request head, before its body is read (logs and metrics).
+- Poison records. With `WORKLOAD_COVERAGE=1`, about one strict, unkeyed log
+  write in five also carries one or two records whose body is over the 64 KiB
+  log body limit, and about one strict metrics write in five carries a point
+  with a label value over the 4096-byte limit. Ravel rejects those records one
+  by one, with an OTLP partial success, and stores the others. A poison record
+  has a record index (logs) or a value index (metrics) past the write's own
+  records, so if one is ever stored, the existing phantom and foreign-sample
+  assertions fail. Poison writes are never keyed, because a keyed retry can
+  replay the first receipt, which carries no partial success.
+- Graceful drains. ravel1 and ravel2 run under `ravel/supervise.sh`
+  (`/usr/local/bin/ravel-antithesis-supervise`), which starts ravel-server
+  as its child. About once a minute, the driver's `drain` rule writes a
+  nonce to `/control/drain-<host>`, a volume shared with the nodes. Once the
+  child has been ready for 2 s, the supervisor sends it SIGTERM, writes the
+  exit code to `/control/drained-<host>`, and starts it again. A stop or kill
+  of the container is passed on to ravel-server, and any exit the supervisor
+  did not ask for ends it with ravel-server's exit code, as in the base
+  config. The driver keeps one drain in flight at a time and drops a request
+  that gets no answer within 180 s, such as one whose container was killed.
+
+A strict 2xx whose partial success rejected exactly the poison records, with
+a commit token, counts as an acknowledgement of the write's other records:
+the poison is rejected for its size alone, so the count names exactly those
+records. A partial success that rejected more (a clock skip can also reject
+good records) stays an outcome-unknown attempt, as in the base config.
+
+Properties added by the variant. They are reported only when
+`WORKLOAD_COVERAGE=1`: the driver sends them through `assert_raw` and
+catalogues them at startup, so a base run's property list does not change.
+
+| Assertion message | Kind | Contract |
+|---|---|---|
+| a write shed at the request head on every attempt stores nothing | always | Rejection: a head-of-request 429 (pending strict-ack bound, in-flight ceiling) touches no shard; checked against every no-token scan |
+| a strict write's partial success rejects every poison record | always | Rejection, per record |
+| a strict partial success that rejected only the poison records carries a commit token | always | Acknowledgement semantics (strict): the accepted records are committed |
+| a write answered with an error status carries no commit token | always | Acknowledgement semantics: only a commit issues a token |
+| a driver-requested drain exits with status 0 or 1 | always | Graceful shutdown: a drain completes, or reports its failure and exits 1 |
+| a driver-requested drain exited cleanly | sometimes | same |
+| a strict write with poison records was acknowledged with commit tokens | reachable | |
+| a token read checked an acknowledged write that carried poison records | reachable | |
+| a metrics write was answered 429 | reachable | |
+
+The flush deferral cap's 429 is left out of the head-shed property: a log
+write that spans several shards can commit on one shard before another
+refuses it. Exit code 143 from a drain would mean SIGTERM reached
+ravel-server before its handler was installed, which the 2 s wait after
+readiness is there to prevent.
+
+`CONFIG=config-coverage` selects the variant in `scripts/local-run.sh` and
+`scripts/launch.sh`. A run is named `ravel-ingest-durability-coverage`
+with `attrs.variant=coverage`; mutant runs stay on the base config. The
+local loop then also fails unless every `required` assertion in
+`local/coverage-required.tsv` was hit with its condition true. The `phase-b`
+lines there (a partial multi-shard commit, `ShardUnavailable`, metrics
+`Abandoned`) need fault switches inside Ravel that are not built yet; the
+loop reports them and does not gate on them.
+
+```sh
+CONFIG=config-coverage WORKLOAD_EVENTUALLY_AFTER_SECS=600 \
+    antithesis/ingest-durability/scripts/local-run.sh out/coverage1 900
+CONFIG=config-coverage antithesis/ingest-durability/scripts/launch.sh <max-compute-hours> "<description>"
+```
+
+`LOCAL_COMPOSE_OVERRIDE=<file>` layers one more compose file over a local
+run, for example to name image tags other than `:ingest-durability` on a
+build host that other work shares.
 
 ## Patterns
 
