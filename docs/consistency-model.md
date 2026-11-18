@@ -249,7 +249,8 @@ Buffered mode (opt-in per request, named "buffered"):
   the buffer in place (the first exception under "Online resharding" below). Like case one this
   is a store that cannot be read for an hour: no provisioning read succeeded
   for `max_flush_lifetime`, deferred flushes included, and a read issued
-  after the hold was spent did not confirm the view; the alternative, holding the
+  after the hold was spent failed, or `max_flush_lifetime` more passed with no
+  read confirming the view, or a teardown drain did not confirm it; the alternative, holding the
   rows and their budget charge without limit, turns a lasting outage into an
   unbounded memory and budget hold on every router. The
   ADR-1685 store-clock lag check is not a case of its own: a teardown drain's
@@ -741,7 +742,9 @@ onward routes with the new count. Guarantees:
   flush and keeps the rows until `max_flush_lifetime` has passed with no
   provisioning read succeeding since the hold began (a successful read
   restarts it), after which it drops them unwritten once a read issued after
-  the hold was spent did not confirm the view (acknowledgement case nine). A strict write still waiting on handed-back rows
+  the hold was spent failed, or `max_flush_lifetime` more passed with no read
+  confirming the view, or a teardown drain did not confirm it
+  (acknowledgement case nine). A strict write still waiting on handed-back rows
   is answered `Abandoned` (503, outcome unknown) before the rows are sent:
   they are written by a target shard or, if none can take them, by the shard
   that held them. A target shard that is dead or condemned, or whose mailbox

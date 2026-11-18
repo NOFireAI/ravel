@@ -1307,8 +1307,9 @@ impl SpanShardActor {
     }
 
     /// Drops a buffer held closed on an untrusted generation view for
-    /// `max_flush_lifetime` once a read issued after that did not confirm the
-    /// view; see `shard::ShardActor::drop_stale_view_flush`.
+    /// `max_flush_lifetime` once a read issued after the hold was spent
+    /// failed, or `max_flush_lifetime` more passed with no read confirming the
+    /// view, or a teardown drain did not confirm it; see `shard::ShardActor::drop_stale_view_flush`.
     fn drop_stale_view_flush(
         &self,
         tenant_hash: TenantHash,
