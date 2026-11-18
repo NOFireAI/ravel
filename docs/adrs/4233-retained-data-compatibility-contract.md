@@ -574,7 +574,8 @@ For a class A family:
   reader for F no longer admits N treats a store with no `sys/compat` and
   no `sys/tenancy` as fresh and bootstraps it (see the unmarked-bucket
   amendment below: such a store that holds data under `t/` is refused, and
-  nothing writes `sys/compat` on a fresh store yet, issue #4483), and
+  nothing writes `sys/compat` on a fresh store yet, issue #4483, until the
+  fresh-store bootstrap amendment below), and
   refuses to start on one with `sys/tenancy` and no `sys/compat`. This is
   how an unsupported upgrade path, including skipping the release that
   carried both readers, is refused before it modifies anything. The
@@ -1173,6 +1174,66 @@ the `sys/tenancy` without `sys/compat` refusal. A store with neither marker
 and nothing under `t/` is still fresh and starts.
 
 This amendment narrows which stores are fresh; it does not change what
-happens to one. Nothing writes `sys/compat` on a fresh outcome today, so a
+happens to one. Nothing writes `sys/compat` on a fresh outcome today (the
+fresh-store bootstrap amendment below changes that), so a
 fresh store is not yet bootstrapped into the contract as the paragraph says;
-issue #4483 tracks that bootstrap.
+issue #4483 tracks that bootstrap, which the fresh-store bootstrap amendment
+below describes.
+
+## Amendment (2026-11-19): the fresh-store bootstrap (issue #4483)
+
+<!-- amendment-applies: sections="7. Retiring a reader requires a certificate that stays checkable|Amendment (2026-11-18): the unmarked-bucket refusal (issue #4399)" pointer="fresh-store bootstrap amendment" -->
+<!-- amendment-supersedes: phrase="nothing writes `sys/compat` on a fresh store yet" pointer="fresh-store bootstrap amendment" -->
+<!-- amendment-supersedes: phrase="Nothing writes `sys/compat` on a fresh outcome today" pointer="fresh-store bootstrap amendment" -->
+
+Decision 7's "Fresh stores" paragraph says a retired-reader release
+bootstraps a fresh store, and nothing did: the gate returned fresh, tenancy
+pinning wrote `sys/tenancy`, and the next start of the same release found
+`sys/tenancy` without `sys/compat` and refused. The bootstrap is now this.
+
+- **When.** Only a release whose retired-reader set is non-empty, only on
+  the fresh outcome (no `sys/compat`, no `sys/tenancy`, nothing under `t/`),
+  and only with a deployment key. A release that retires no reader reaches
+  no fresh outcome and writes nothing new; every release today is one.
+- **Order.** It runs right after the gate and before tenancy pinning, so
+  `sys/compat` is the first object a fresh start writes. A start that stops
+  between the two leaves `sys/compat` and no `sys/tenancy`, which the next
+  start reads as adopted; it never leaves `sys/tenancy` without
+  `sys/compat`, which the gate refuses. A start whose create fails exits
+  before writing anything.
+- **The record.** What `ravel-cli compat init` writes on an empty store:
+  every known family at this release's baseline write version, never
+  activated, `compat_epoch` 0, baseline release v0.34 and `P` at its default
+  of 1h (the defaults of `compat init`), no adopted histogram. On top of
+  that, for each retired family F, what `compat certify` and a late-write
+  pass leave on an empty store: a certificate at F's active version over an
+  empty census (no members, no buckets scanned, the digest of the empty
+  tenant set), dated `S`, the time the gate took before the `t/` LIST that
+  found the store empty, and a late-write watermark of `S` plus one
+  nanosecond. The gate's rules are unchanged; without the certificate, the
+  record `compat init` alone writes would be refused for an absent
+  certificate on the very next start. The watermark is the least the gate
+  accepts and claims nothing about writes after the census: the maintain
+  unit's daily late-write pass checks them, as it does after any certify.
+- **The write.** Create-if-absent. Before it, the process checks the record
+  it built with the gate's family rules and refuses without writing if it
+  fails them (a release whose baseline write version is below the oldest
+  version it reads). A create that finds `sys/compat` present, because a
+  concurrent fresh start won or because an earlier attempt of this start
+  landed and its acknowledgement was lost, leaves the existing record
+  untouched, GETs it, and starts only if the gate's family rules accept it;
+  a record the GET finds absent refuses. A transient store error retries
+  under the startup retry bound like the other startup sites.
+- **Unkeyed stores.** Without a deployment key nothing can MAC
+  `sys/compat`, so nothing is written and startup proceeds exactly as
+  before this amendment: the first start pins an unkeyed `sys/tenancy` and
+  the next start of the same release refuses it for `sys/tenancy` without
+  `sys/compat`.
+
+No persisted format changes: the record uses only fields `sys/compat`
+already carries.
+
+Rejected: letting the gate accept a family with no certificate when its
+entry was never activated. That would also admit a store adopted by
+`compat init` while v0.33.0 writers were still running, whose objects below
+the oldest readable version no census has ruled out.

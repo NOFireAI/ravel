@@ -334,8 +334,16 @@ gives each command's flags and report fields.
   the late-write watermark past the certified time. It treats a store with
   neither `sys/compat` nor `sys/tenancy` and nothing under `t/` as fresh,
   and refuses one with `sys/tenancy` and no `sys/compat`, or with data
-  under `t/` and neither marker. No current release has retired a reader,
-  so the gate's reader set is empty.
+  under `t/` and neither marker. On a fresh store with a deployment key it
+  then creates `sys/compat`, create-only and before any other write: the
+  record `ravel-cli compat init` writes on an empty store, plus, for each
+  retired family, a certificate over the empty census and a late-write
+  watermark one nanosecond past it, so the next start is certified. A
+  process that loses that create starts only if the record it finds passes
+  the gate. An unkeyed fresh store gets no `sys/compat`, and its next start
+  is refused for `sys/tenancy` without `sys/compat`. No current release has
+  retired a reader, so the gate's reader set is empty and nothing creates
+  `sys/compat` at startup.
 - **Readers** fail closed with a typed error on a version they do not
   admit. ADR-4233 decision 4's hazard table lists, site by site, how the
   baseline refuses or holds an object written by a newer build instead of

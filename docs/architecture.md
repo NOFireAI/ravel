@@ -155,8 +155,15 @@ that is absent, HEADs `sys/tenancy` and, when that is absent too, LISTs the
 first page of `t/`. When `sys/compat` is present and the process has a
 deployment key, it GETs `sys/compat`, and when `sys/compat` was deleted
 between that HEAD and the GET, it sends the `sys/tenancy` HEAD and the `t/`
-LIST too; without a deployment key it refuses before the GET. A build that retires no reader, which is every build
-today, sends no request here.
+LIST too; without a deployment key it refuses before the GET. When the gate
+finds the store fresh and the process has a deployment key, startup PUTs
+`sys/compat` with create-if-absent before it pins `sys/tenancy`, so
+`sys/compat` is the first object a fresh start writes; the record is compat
+init's empty-store record with an empty-census certificate and a watermark
+one nanosecond past it for each retired family. A create that finds the
+object already there GETs it and starts only if the gate's family rules
+accept it. Without a deployment key nothing is written. A build that
+retires no reader, which is every build today, sends no request here.
 
 A transient store error does not count as a wrong answer. A transient store
 error is a store error that `StoreError::is_retryable` accepts: `Transient`,

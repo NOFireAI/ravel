@@ -38,7 +38,7 @@ use ravel_object_store::s3::S3Store;
 use ravel_object_store::{KmsRoutingStore, ObjectStoreBackend, StoreError};
 use ravel_types::{ConfiguredScheme, TenantHash};
 
-use crate::compat_gate::{CompatGateError, GateOutcome, RetiredReader};
+use crate::compat_gate::{Bootstrap, CompatGateError, GateOutcome, RetiredReader};
 use crate::config::{Mode, StoreKind};
 use crate::tenancy::{ResolvedTenancy, TenancyError};
 use crate::tenant_kms::{TenantKmsConfig, TenantKmsError};
@@ -67,6 +67,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(2);
 /// Site names, as they appear in the retry log line and the deadline error.
 pub const SITE_QUALIFICATION: &str = "sys/qualification";
 pub const SITE_RETIRED_READER_GATE: &str = "the retired-reader gate (sys/compat, sys/tenancy)";
+pub const SITE_COMPAT_BOOTSTRAP: &str = "the fresh-store sys/compat bootstrap";
 pub const SITE_TENANCY: &str = "sys/tenancy";
 pub const SITE_TENANT_KMS: &str = "tenant key-epoch records (t/<tenant_hash>/enc)";
 pub const SITE_PROVISIONING: &str = "shard_count provisioning records";
@@ -462,6 +463,47 @@ pub async fn enforce_retired_reader_gate(
     Ok(outcome)
 }
 
+/// The fresh-store `sys/compat` bootstrap that follows a
+/// [`GateOutcome::Fresh`], retried. The create is create-only and a retry
+/// starts from the create, so a record that landed before an ambiguous
+/// failure is found by the next attempt, re-read, and checked like a
+/// concurrent start's record. `census_unix_ns` is the time the gate was
+/// given.
+pub async fn bootstrap_fresh_compat(
+    retry: &StartupRetry,
+    store: &dyn ObjectStoreBackend,
+    configured: &ConfiguredScheme,
+    retired: &[RetiredReader],
+    census_unix_ns: i64,
+) -> anyhow::Result<Bootstrap> {
+    let deployment_key = match configured {
+        ConfiguredScheme::Keyed(key) => Some(key.as_ref()),
+        ConfiguredScheme::Unkeyed | ConfiguredScheme::Unspecified => None,
+    };
+    let bootstrap = retry
+        .run(
+            SITE_COMPAT_BOOTSTRAP,
+            || {
+                crate::compat_gate::bootstrap_fresh_store(
+                    store,
+                    deployment_key,
+                    retired,
+                    census_unix_ns,
+                )
+            },
+            |err: &CompatGateError| chain_is_transient(err),
+        )
+        .await
+        .map_err(|failure| {
+            failure.into_anyhow(|err| {
+                anyhow::Error::new(err)
+                    .context("could not bring a fresh store under sys/compat; refusing to start")
+            })
+        })?;
+    tracing::info!(outcome = ?bootstrap, "fresh-store sys/compat bootstrap");
+    Ok(bootstrap)
+}
+
 /// Tenant-hash scheme resolution and marker bootstrap (ADR-0050 section 3),
 /// retried. The marker write is create-if-absent and a retry starts from the
 /// read, so a write that landed before an ambiguous failure is found by the
@@ -585,27 +627,35 @@ pub struct StartupStoreInputs<'a> {
 pub struct StartupStoreState {
     /// Why the retired-reader gate let the process start.
     pub retired_reader_gate: GateOutcome,
+    /// What the fresh-store bootstrap did; `None` unless the gate found the
+    /// store fresh.
+    pub compat_bootstrap: Option<Bootstrap>,
     pub tenancy: ResolvedTenancy,
     /// The statically known tenants, hashed under the installed scheme.
     pub static_tenants: Vec<TenantHash>,
     pub gc: GcConfigValues,
 }
 
-/// Every startup store check `main` makes before a listener binds, in order:
-/// qualification, the bucket-protection gate, the retired-reader gate (before
-/// tenancy pinning, which writes `sys/tenancy` on a fresh store, because the
-/// gate tells a fresh store from an unadopted one by that marker's absence),
-/// tenancy pinning (and the scheme install), tenant key epochs, provisioning
-/// validation for the tenants `static_tenants` returns once the scheme is
-/// installed, and the `sys/gc` bootstrap. Every check but the bucket-protection gate, which has its own
-/// bound, runs under `retry`. The IPCrypt marker check is the one site left,
-/// inside `start`. `now_unix_ns` stamps the records the checks write.
-pub async fn run_startup_store_checks(
+/// What [`run_startup_store_gates`] resolved.
+#[derive(Debug)]
+pub struct StartupStoreGates {
+    pub retired_reader_gate: GateOutcome,
+    pub compat_bootstrap: Option<Bootstrap>,
+    pub tenancy: ResolvedTenancy,
+}
+
+/// The startup checks up to and including tenancy pinning, none of which
+/// touch process-global state: qualification, the bucket-protection gate,
+/// the retired-reader gate, the fresh-store `sys/compat` bootstrap when the
+/// gate found the store fresh, and tenancy pinning. The bootstrap runs
+/// before tenancy pinning so `sys/compat` is the first object a fresh start
+/// writes: a start that stops between the two then finds `sys/compat` and no
+/// `sys/tenancy`, never the reverse, which the gate refuses.
+pub async fn run_startup_store_gates(
     retry: &StartupRetry,
-    inputs: StartupStoreInputs<'_>,
-    static_tenants: impl FnOnce() -> Vec<TenantHash>,
-    now_unix_ns: impl Fn() -> i64,
-) -> anyhow::Result<StartupStoreState> {
+    inputs: &StartupStoreInputs<'_>,
+    now_unix_ns: &impl Fn() -> i64,
+) -> anyhow::Result<StartupStoreGates> {
     let store = inputs.store;
     enforce_qualification(
         retry,
@@ -620,15 +670,59 @@ pub async fn run_startup_store_checks(
         store.as_ref(),
     )
     .await?;
+    let census_unix_ns = now_unix_ns();
     let retired_reader_gate = enforce_retired_reader_gate(
         retry,
         store.as_ref(),
         &inputs.tenancy,
         inputs.retired_readers,
-        now_unix_ns(),
+        census_unix_ns,
     )
     .await?;
-    let tenancy = resolve_tenancy(retry, store.as_ref(), inputs.tenancy, now_unix_ns()).await?;
+    let compat_bootstrap = match retired_reader_gate {
+        GateOutcome::Fresh => Some(
+            bootstrap_fresh_compat(
+                retry,
+                store.as_ref(),
+                &inputs.tenancy,
+                inputs.retired_readers,
+                census_unix_ns,
+            )
+            .await?,
+        ),
+        GateOutcome::NoRetiredReader | GateOutcome::Certified { .. } => None,
+    };
+    let tenancy =
+        resolve_tenancy(retry, store.as_ref(), inputs.tenancy.clone(), now_unix_ns()).await?;
+    Ok(StartupStoreGates {
+        retired_reader_gate,
+        compat_bootstrap,
+        tenancy,
+    })
+}
+
+/// Every startup store check `main` makes before a listener binds, in order:
+/// qualification, the bucket-protection gate, the retired-reader gate (before
+/// tenancy pinning, which writes `sys/tenancy` on a fresh store, because the
+/// gate tells a fresh store from an unadopted one by that marker's absence),
+/// the fresh-store `sys/compat` bootstrap, tenancy pinning (and the scheme
+/// install), tenant key epochs, provisioning
+/// validation for the tenants `static_tenants` returns once the scheme is
+/// installed, and the `sys/gc` bootstrap. Every check but the bucket-protection gate, which has its own
+/// bound, runs under `retry`. The IPCrypt marker check is the one site left,
+/// inside `start`. `now_unix_ns` stamps the records the checks write.
+pub async fn run_startup_store_checks(
+    retry: &StartupRetry,
+    inputs: StartupStoreInputs<'_>,
+    static_tenants: impl FnOnce() -> Vec<TenantHash>,
+    now_unix_ns: impl Fn() -> i64,
+) -> anyhow::Result<StartupStoreState> {
+    let store = inputs.store;
+    let StartupStoreGates {
+        retired_reader_gate,
+        compat_bootstrap,
+        tenancy,
+    } = run_startup_store_gates(retry, &inputs, &now_unix_ns).await?;
     ravel_types::install_tenant_hash_scheme(tenancy.scheme.clone())
         .map_err(|_| anyhow::anyhow!("tenant-hash scheme was already installed"))?;
     if let Some((kms, config)) = inputs.tenant_kms {
@@ -653,6 +747,7 @@ pub async fn run_startup_store_checks(
     .await?;
     Ok(StartupStoreState {
         retired_reader_gate,
+        compat_bootstrap,
         tenancy,
         static_tenants,
         gc,
