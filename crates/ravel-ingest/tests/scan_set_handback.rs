@@ -1312,7 +1312,10 @@ async fn drop_after_a_failed_post_spend_read<P: Pipe>(world: &World<P>, spent_ns
 /// for `max_flush_lifetime` from the first enforced hold, kept while the
 /// provisioning read issued after that is outstanding, and dropped unwritten
 /// once that read fails: every byte is refunded, the drop is counted once,
-/// and shutdown writes nothing (issue #4363).
+/// and shutdown writes nothing (issue #4363). This pins the failed-read cause
+/// only: a spent hold is also dropped once `max_flush_lifetime` more passes
+/// with no read confirming the view, or when a teardown drain does not
+/// confirm it (`a_teardown_past_the_bound_drops_the_held_flush`).
 ///
 /// Guards: `StaleViewHold::advance` and its call in each actor's
 /// `ScanCheck::Unknown` arm. Never dropping leaves the counter at 0 and the
@@ -1461,7 +1464,7 @@ async fn a_store_that_recovers_with_no_attempt_publishes_past_the_bound<P: Pipe>
 /// attempt once that view is past its own trust horizon is long past the
 /// first hold's bound and drops nothing; the hold restarts there, is spent
 /// one bound later, and the buffer is dropped once a read issued after that
-/// fails (issue #4363).
+/// fails, the one drop cause this test drives (issue #4363).
 ///
 /// Guard: `SwitchScope::view_refreshed_at` returning the stamp of the read
 /// behind the cached view. Returning `None`, or the view's last-touch stamp

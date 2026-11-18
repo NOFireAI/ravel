@@ -634,8 +634,9 @@ on what it installed, so one drain flushes every buffer the re-read confirms.
 Only a re-read that fails or times out keeps the buffer. Nothing is written on
 an unknown view, except at teardown (below). The hold is bounded by
 `max_flush_lifetime` with no provisioning read succeeding, and the buffer is
-then dropped only once a read issued after the hold was spent did not confirm
-the view (see the stale-view hold amendment below).
+then dropped only once a read issued after the hold was spent failed, or
+`max_flush_lifetime` more passed with no read confirming the view, or a
+teardown drain did not confirm it (see the stale-view hold amendment below).
 
 **What happens to the rows.** When the check fails, nothing is written under
 that shard index. The actor routes the buffer's rows under the tenant's

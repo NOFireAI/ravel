@@ -1308,8 +1308,10 @@ pub struct IngestPipelineSnapshot {
     /// `end(pinned hour) + max_flush_lifetime` (ADR-2708 D3).
     pub abandoned_hour_bound: u64,
     /// Buffers dropped because their provisioning view stayed untrusted for
-    /// `max_flush_lifetime` with no provisioning read succeeding, and a read
-    /// issued after the hold was spent did not confirm the view (issue #4363).
+    /// `max_flush_lifetime` with no provisioning read succeeding, and then a
+    /// read issued after the hold was spent failed, or `max_flush_lifetime`
+    /// more passed with no read confirming the view, or a teardown drain did
+    /// not confirm it (issue #4363).
     pub abandoned_stale_provisioning: u64,
     pub abandoned_input_rejected: u64,
     /// Flushes whose ADR-1702 write gate encode returned no result (the job
@@ -1910,9 +1912,10 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
         "ravel_ingest_abandoned_stale_provisioning_total",
         "Buffers dropped unwritten because their flush stayed closed on a shard-generation \
          view the router cannot trust for the flush lifetime with no provisioning read \
-         succeeding, and a read issued after the hold was spent did not confirm the view, by \
-         signal. Strict writers were answered 503 and their bytes refunded; buffered-mode rows \
-         in them are lost.",
+         succeeding, and then a read issued after the hold was spent failed, or \
+         max_flush_lifetime more passed with no read confirming the view, or a teardown \
+         drain did not confirm it, by signal. Strict writers were answered 503 and their \
+         bytes refunded; buffered-mode rows in them are lost.",
         "counter",
     );
     for pipeline in pipelines {
@@ -5624,6 +5627,9 @@ pub struct CompatSnapshot {
 pub struct CompatCertificateGauges {
     pub family: crate::compat::CompatFamilyLabel,
     pub state: crate::compat_maintain::CertificateState,
+    /// The snapshot time minus the watermark, in seconds. Negative when the
+    /// watermark is ahead of this process's clock.
+    pub watermark_age_seconds: f64,
 }
 
 impl CompatSnapshot {
@@ -5648,6 +5654,10 @@ impl CompatSnapshot {
                         CompatCertificateGauges {
                             family: crate::compat::CompatFamilyLabel::of(&f.family),
                             state,
+                            watermark_age_seconds: now_unix_ns
+                                .saturating_sub(state.watermark_unix_ns)
+                                as f64
+                                / 1e9,
                         }
                     })
                 })
@@ -5783,6 +5793,20 @@ pub(crate) fn render_compat_family(out: &mut String, mode: Mode, snapshot: &Comp
     }
     write_header(
         out,
+        "ravel_compat_late_write_watermark_age_seconds",
+        "Seconds from the late-write watermark to the scrape: the scrape time minus ravel_compat_late_write_watermark_seconds, computed at scrape time, per certified format family (ADR-4233 decision 7 and its late-write budget correction). A completed pass sets the watermark to its own start time and the next pass runs once it is a day old, so a value above 25 hours means passes are not completing; a failed pass leaves the watermark, and the next tick reruns it from the start.",
+        "gauge",
+    );
+    for certificate in &snapshot.certificates {
+        write_sample_f64(
+            out,
+            "ravel_compat_late_write_watermark_age_seconds",
+            &[Label::Mode(mode), Label::CompatFamily(certificate.family)],
+            certificate.watermark_age_seconds,
+        );
+    }
+    write_header(
+        out,
         "ravel_compat_certificate_contradicted",
         "1 when the late-write pass found a record below the certified version after certify, so the certificate no longer holds and a reader that drops the old version must not start; 0 otherwise, per certified format family (ADR-4233 decision 7).",
         "gauge",
@@ -5798,7 +5822,7 @@ pub(crate) fn render_compat_family(out: &mut String, mode: Mode, snapshot: &Comp
     write_header(
         out,
         "ravel_compat_certify_finalization_pending",
-        "1 when an uncontradicted certificate's watermark is not yet past its certified time, so certify's floor raises wait on a late-write pass; 0 otherwise, per certified format family (ADR-4233 decision 7).",
+        "1 when an uncontradicted certificate's watermark is not yet past its certified time, as this process last read sys/compat: no late-write pass that started after certify has completed, so the retired-reader gate refuses and certify's floor raises wait; 0 otherwise, per certified format family (ADR-4233 decision 7). It reads sys/compat only: 0 does not report that finalization has run, which the maintain unit logs.",
         "gauge",
     );
     for certificate in &snapshot.certificates {
@@ -10928,12 +10952,27 @@ pub(crate) mod scrape_test_support {
         let catalog = Arc::new(
             Catalog::new(Arc::new(MemoryStore::new()), CatalogConfig::default()).expect("catalog"),
         );
+        scrape(Mode::Gateway, catalog, Some(logs), Some(spans)).await
+    }
+
+    /// The `/metrics` body of a `mode` process over `catalog`, with no ingest
+    /// pipeline and every other source left absent.
+    pub(crate) async fn scrape_catalog(mode: Mode, catalog: Arc<Catalog>) -> String {
+        scrape(mode, catalog, None, None).await
+    }
+
+    async fn scrape(
+        mode: Mode,
+        catalog: Arc<Catalog>,
+        logs: Option<Arc<LogIngestRouter>>,
+        spans: Option<Arc<SpanIngestRouter>>,
+    ) -> String {
         let state = MetricsState {
-            mode: Mode::Gateway,
+            mode,
             store_metrics: Arc::new(StoreMetrics::default()),
             ingest_router: None,
-            log_ingest_router: Some(logs),
-            span_ingest_router: Some(spans),
+            log_ingest_router: logs,
+            span_ingest_router: spans,
             catalog,
             tenant_discovery: None,
             maintenance_safety: None,
@@ -13138,8 +13177,8 @@ mod tests {
     /// snapshots, so a conversion that dropped the field or swapped two
     /// signals fails here. The HELP text is pinned whole: one that still says
     /// the drop follows the flush lifetime alone, without the read issued
-    /// after the hold was spent, or that drops the no-successful-read
-    /// condition, fails too.
+    /// after the hold was spent, that drops the no-successful-read
+    /// condition, or that leaves out the teardown drain, fails too.
     #[test]
     fn abandoned_stale_provisioning_counter_renders_for_every_signal() {
         let ingest = vec![
@@ -13194,9 +13233,11 @@ mod tests {
         let family = "ravel_ingest_abandoned_stale_provisioning_total";
         let help = "Buffers dropped unwritten because their flush stayed closed on a \
                     shard-generation view the router cannot trust for the flush lifetime with \
-                    no provisioning read succeeding, and a read issued after the hold was \
-                    spent did not confirm the view, by signal. Strict writers were answered \
-                    503 and their bytes refunded; buffered-mode rows in them are lost.";
+                    no provisioning read succeeding, and then a read issued after the hold \
+                    was spent failed, or max_flush_lifetime more passed with no read \
+                    confirming the view, or a teardown drain did not confirm it, by signal. \
+                    Strict writers were answered 503 and their bytes refunded; \
+                    buffered-mode rows in them are lost.";
         assert_eq!(
             body.matches(&format!("# HELP {family} {help}\n")).count(),
             1,

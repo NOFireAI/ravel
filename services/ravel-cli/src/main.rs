@@ -2388,7 +2388,8 @@ enum CompatCommand {
     /// `sys/compat`. Refuses an unkeyed store, any object outside the baseline
     /// read set, and a store whose `sys/compat` already differs.
     Init {
-        /// The baseline release the store is adopted at (expected v0.34.0).
+        /// The baseline release the store is adopted at; v0.34.0, the
+        /// baseline release, by default.
         #[arg(long, default_value_t = 0)]
         baseline_major: u32,
         #[arg(long, default_value_t = 34)]
@@ -2490,8 +2491,9 @@ enum CompatCommand {
     /// print every family's active version, epoch, fence-complete time,
     /// certificate, contradicted flag and watermark.
     Verify {
-        /// Limit the late-write pass to one class-A family. Unset runs it for
-        /// every class-A family that carries a certificate.
+        /// Limit the late-write pass to one class-A family; any other family
+        /// is refused. Unset runs it for every class-A family that carries a
+        /// certificate.
         #[arg(long)]
         family: Option<String>,
         /// The deployment's clock skew allowance, a humantime duration.
@@ -6835,6 +6837,8 @@ mod tests {
                 true,
             ),
             (&["ravel", "hold", "list", "--tenant", "t"], false),
+            (&["ravel", "compat", "init"], false),
+            (&["ravel", "compat", "status"], false),
             (
                 &[
                     "ravel",
